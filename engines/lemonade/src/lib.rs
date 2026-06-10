@@ -31,8 +31,11 @@ const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_MODEL: &str = "Qwen3-4B-Instruct-2507-GGUF";
 const DEFAULT_MODEL_REPO_DIR: &str = "models--unsloth--Qwen3-4B-Instruct-2507-GGUF";
 const DEFAULT_MODEL_GGUF: &str = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
-const ROCM_BACKEND_RECIPE: &str = "llamacpp";
+const LLAMACPP_RECIPE: &str = "llamacpp";
 const ROCM_BACKEND_NAME: &str = "rocm";
+/// Preferred llama.cpp backends, best first. Lemonade reports per-GPU support;
+/// we pick the highest-priority backend it considers supported on this host.
+const LLAMACPP_BACKEND_PRIORITY: [&str; 3] = ["rocm", "vulkan", "cpu"];
 const DEFAULT_LOG_TAIL_LINES: usize = 200;
 
 const EMBEDDABLE_WINDOWS_ARCHIVE_NAME: &str = "lemonade-embeddable-10.6.0-windows-x64.zip";
@@ -312,7 +315,8 @@ fn capabilities() -> EngineCapabilities {
         multi_gpu: true,
         openai_compatible: true,
         tool_calling: true,
-        quantized_models: "GGUF through Lemonade llamacpp:rocm".to_owned(),
+        quantized_models: "GGUF through Lemonade llama.cpp (ROCm/Vulkan/CPU auto-selected)"
+            .to_owned(),
         distributed_serving: false,
         reasoning_parser: false,
     }
@@ -327,7 +331,10 @@ fn detect_response() -> DetectResponse {
             runtime.manifest.version,
             runtime.manifest.runtime_dir.display()
         ));
-        notes.push("Lemonade is configured for llamacpp:rocm; no CPU fallback is used".to_owned());
+        notes.push(format!(
+            "Lemonade llama.cpp backend selected for this GPU: {}:{}",
+            runtime.manifest.backend_recipe, runtime.manifest.backend_name
+        ));
     } else {
         notes.push(
             "Lemonade embeddable is not installed yet; run `rocm engines install lemonade`"
@@ -369,9 +376,9 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
         .env_root
         .as_deref()
         .map(normalize_runtime_path_for_host);
-    let manifest = prepare_embeddable(&paths, env_root.as_deref(), request.reinstall)?;
-    eprintln!("Checking Lemonade ROCm backend support...");
-    install_rocm_backend(&manifest)?;
+    let mut manifest = prepare_embeddable(&paths, env_root.as_deref(), request.reinstall)?;
+    eprintln!("Detecting best supported Lemonade llama.cpp backend...");
+    install_best_llamacpp_backend(&mut manifest)?;
     write_manifest(&paths, &manifest)?;
     Ok(InstallResponse {
         env_id: manifest.env_id.clone(),
@@ -382,13 +389,16 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
         managed_env: Some(true),
         installed_packages: vec![
             format!("lemonade-embeddable=={}", manifest.version),
-            "lemonade-backend=llamacpp:rocm".to_owned(),
+            format!("lemonade-backend={}:{}", manifest.backend_recipe, manifest.backend_name),
         ],
         capabilities: capabilities(),
         lock_hash: manifest_lock_hash(&manifest),
         warnings: vec![
             "Lemonade is installed as a rocm-cli managed embeddable runtime".to_owned(),
-            "Only the ROCm GPU backend is accepted; no CPU fallback is used".to_owned(),
+            format!(
+                "Selected the best supported llama.cpp backend for this GPU: {}:{}",
+                manifest.backend_recipe, manifest.backend_name
+            ),
         ],
     })
 }
@@ -402,7 +412,7 @@ fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelRe
         task: "chat-completions".to_owned(),
         source: "lemonade".to_owned(),
         revision: "main".to_owned(),
-        loader: "llamacpp:rocm".to_owned(),
+        loader: "llamacpp".to_owned(),
         trust_remote_code: false,
         chat_template_mode: "lemonade".to_owned(),
         dtype: "gguf".to_owned(),
@@ -415,7 +425,7 @@ fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelRe
         }),
         engine_recipe,
         warnings: vec![
-            "Lemonade serving is GPU-required in rocm-cli; CPU, Vulkan, and NPU backends are not selected automatically".to_owned(),
+            "Lemonade auto-selects the best supported llama.cpp backend for this GPU (ROCm, then Vulkan, then CPU)".to_owned(),
         ],
     })
 }
@@ -517,11 +527,19 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
         &process_env,
     )
     .context("Lemonade server did not become ready")?;
+    let backend = ensure_best_llamacpp_backend(
+        &runtime.manifest,
+        &request.host,
+        request.port,
+        &process_env,
+    )
+    .context("failed to select a supported Lemonade llama.cpp backend")?;
     let load_result = run_lemonade_model_load(
         &runtime.manifest,
         &request.host,
         request.port,
         &request.model_ref,
+        &backend,
         log_path,
         &process_env,
     );
@@ -529,6 +547,7 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
         && query_loaded_model_endpoint(
             &endpoint_url(&request.host, request.port),
             &request.model_ref,
+            &backend,
         )
         .unwrap_or(false)
         && query_chat_smoke_endpoint(&request.host, request.port, &request.model_ref)
@@ -547,14 +566,15 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
         }
         return Err(error).with_context(|| {
             format!(
-                "failed to load {} with Lemonade llamacpp:rocm; no CPU or Vulkan fallback is allowed",
+                "failed to load {} with Lemonade {LLAMACPP_RECIPE}:{backend}",
                 request.model_ref
             )
         });
     }
     if !router_ready {
-        let error =
-            anyhow!("Lemonade load completed but the endpoint did not report a ROCm-loaded model");
+        let error = anyhow!(
+            "Lemonade load completed but the endpoint did not report a {LLAMACPP_RECIPE}:{backend}-loaded model"
+        );
         if runtime_is_linux() && direct_llama_server_path(&runtime.manifest).is_file() {
             let _ = terminate_pid(child.id(), true);
             let _ = child.wait();
@@ -568,7 +588,7 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
         }
         return Err(error).with_context(|| {
             format!(
-                "failed to verify {} with Lemonade llamacpp:rocm; no CPU or Vulkan fallback is allowed",
+                "failed to verify {} with Lemonade {LLAMACPP_RECIPE}:{backend}",
                 request.model_ref
             )
         });
@@ -579,12 +599,12 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
             "status": "ready",
             "server_pid": child.id(),
             "backend_state": "ready",
-            "backend_requested": ROCM_BACKEND_NAME,
+            "backend_requested": backend,
             "load_response": {
                 "status": "loaded",
                 "method": "lemonade-cli",
                 "model_name": request.model_ref,
-                "llamacpp_backend": ROCM_BACKEND_NAME
+                "llamacpp_backend": backend
             },
         }),
     )?;
@@ -636,6 +656,7 @@ fn ensure_direct_llama_model_available(
             DEFAULT_HOST,
             download_port,
             &request.model_ref,
+            ROCM_BACKEND_NAME,
             log_path,
             process_env,
         );
@@ -668,11 +689,15 @@ fn healthcheck_service(request: HealthcheckRequest) -> Result<HealthcheckRespons
             value_string(value, "canonical_model_id").or_else(|| value_string(value, "model_ref"))
         })
         .unwrap_or_default();
+    let backend = state
+        .as_ref()
+        .and_then(|value| value_string(value, "backend_requested"))
+        .unwrap_or_else(|| ROCM_BACKEND_NAME.to_owned());
     let ready = state_status == "ready"
         && !model_ref.is_empty()
         && endpoint_url
             .as_deref()
-            .map(|endpoint| query_loaded_model_endpoint(endpoint, &model_ref))
+            .map(|endpoint| query_loaded_model_endpoint(endpoint, &model_ref, &backend))
             .transpose()
             .unwrap_or(None)
             .unwrap_or(false);
@@ -792,18 +817,19 @@ fn prepare_embeddable(
         runtime_dir,
         lemond,
         lemonade,
-        backend_recipe: ROCM_BACKEND_RECIPE.to_owned(),
+        backend_recipe: LLAMACPP_RECIPE.to_owned(),
+        // Resolved during install once Lemonade reports per-GPU backend support.
         backend_name: ROCM_BACKEND_NAME.to_owned(),
         installed_at_unix_ms: current_unix_millis(),
     })
 }
 
-fn install_rocm_backend(manifest: &LemonadeInstallManifest) -> Result<()> {
+fn install_best_llamacpp_backend(manifest: &mut LemonadeInstallManifest) -> Result<()> {
     let port = free_local_port()?;
     let log_path = manifest.runtime_dir.join("install-lemond.log");
     let process_env = lemonade_process_environment()?;
     let mut child = spawn_lemond(manifest, DEFAULT_HOST, port, Some(&log_path), &process_env)?;
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<String> {
         wait_for_lemonade_cli_status(
             manifest,
             DEFAULT_HOST,
@@ -811,12 +837,135 @@ fn install_rocm_backend(manifest: &LemonadeInstallManifest) -> Result<()> {
             Duration::from_secs(30),
             &process_env,
         )?;
-        eprintln!("Installing Lemonade llamacpp:rocm backend...");
-        run_lemonade_backend_install(manifest, DEFAULT_HOST, port, &process_env)
+        ensure_best_llamacpp_backend(manifest, DEFAULT_HOST, port, &process_env)
     })();
     let _ = terminate_pid(child.id(), true);
     let _ = child.wait();
+    manifest.backend_name = result?;
+    Ok(())
+}
+
+/// Ask Lemonade which llama.cpp backends it supports on this GPU, choose the best
+/// one (`LLAMACPP_BACKEND_PRIORITY`), install it if necessary, and return its name.
+fn ensure_best_llamacpp_backend(
+    manifest: &LemonadeInstallManifest,
+    host: &str,
+    port: u16,
+    process_env: &LemonadeProcessEnvironment,
+) -> Result<String> {
+    let listing = run_lemonade_backends_list(manifest, process_env)?;
+    let backends = parse_llamacpp_backend_statuses(&listing);
+    let Some((backend, already_installed)) = select_best_llamacpp_backend(&backends) else {
+        bail!(
+            "Lemonade reports no supported llama.cpp backend for this GPU (status: {})",
+            describe_llamacpp_backends(&backends)
+        );
+    };
+    if already_installed {
+        eprintln!("Using installed Lemonade {LLAMACPP_RECIPE}:{backend} backend.");
+    } else {
+        eprintln!("Installing Lemonade {LLAMACPP_RECIPE}:{backend} backend...");
+        run_lemonade_backend_install(manifest, host, port, &backend, process_env)?;
+    }
+    Ok(backend)
+}
+
+/// Parse `lemonade backends` table output into `(backend, status)` pairs for the
+/// `llamacpp` recipe only. Status is one of `installed`/`installable`/`unsupported`.
+fn parse_llamacpp_backend_statuses(output: &str) -> Vec<(String, String)> {
+    const RECIPES: [&str; 8] = [
+        "flm",
+        "kokoro",
+        "llamacpp",
+        "ryzenai-llm",
+        "sd-cpp",
+        "vllm",
+        "whispercpp",
+        "embeddings",
+    ];
+    const STATUSES: [&str; 3] = ["installed", "installable", "unsupported"];
+    let mut current_recipe = "";
+    let mut result = Vec::new();
+    for line in output.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let Some(&first) = tokens.first() else {
+            continue;
+        };
+        if first == "Recipe" || first.starts_with("---") {
+            continue;
+        }
+        // A row either starts with a recipe name (recipe + its first backend) or,
+        // for grouped recipes, with a backend name continuing the previous recipe.
+        let (backend, rest) = if RECIPES.contains(&first) {
+            current_recipe = match RECIPES.iter().find(|r| **r == first) {
+                Some(r) => r,
+                None => current_recipe,
+            };
+            match tokens.get(1) {
+                Some(backend) => (*backend, &tokens[2..]),
+                None => continue,
+            }
+        } else {
+            (first, &tokens[1..])
+        };
+        if current_recipe != LLAMACPP_RECIPE {
+            continue;
+        }
+        if let Some(status) = rest.iter().find(|t| STATUSES.contains(t)) {
+            result.push((backend.to_owned(), (*status).to_owned()));
+        }
+    }
     result
+}
+
+/// Choose the highest-priority backend Lemonade considers usable (installed or
+/// installable). Returns `(backend, already_installed)`.
+fn select_best_llamacpp_backend(backends: &[(String, String)]) -> Option<(String, bool)> {
+    for candidate in LLAMACPP_BACKEND_PRIORITY {
+        if let Some((name, status)) = backends
+            .iter()
+            .find(|(b, s)| b == candidate && (s == "installed" || s == "installable"))
+        {
+            return Some((name.clone(), status == "installed"));
+        }
+    }
+    None
+}
+
+fn describe_llamacpp_backends(backends: &[(String, String)]) -> String {
+    if backends.is_empty() {
+        return "none reported".to_owned();
+    }
+    backends
+        .iter()
+        .map(|(b, s)| format!("{b}={s}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn run_lemonade_backends_list(
+    manifest: &LemonadeInstallManifest,
+    process_env: &LemonadeProcessEnvironment,
+) -> Result<String> {
+    let mut command = ProcessCommand::new(&manifest.lemonade);
+    command
+        .arg("backends")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    apply_lemonade_process_environment(&mut command, process_env)?;
+    hide_child_console_window(&mut command);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run {}", manifest.lemonade.display()))?;
+    if !output.status.success() {
+        bail!(
+            "Lemonade backends query failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn resolve_runtime() -> Result<LemonadeRuntime> {
@@ -1232,6 +1381,7 @@ fn run_lemonade_backend_install(
     manifest: &LemonadeInstallManifest,
     host: &str,
     port: u16,
+    backend: &str,
     process_env: &LemonadeProcessEnvironment,
 ) -> Result<()> {
     let mut command = ProcessCommand::new(&manifest.lemonade);
@@ -1242,8 +1392,7 @@ fn run_lemonade_backend_install(
         .arg(port.to_string())
         .arg("backends")
         .arg("install")
-        .arg(format!("{ROCM_BACKEND_RECIPE}:{ROCM_BACKEND_NAME}"))
-        .arg("--force")
+        .arg(format!("{LLAMACPP_RECIPE}:{backend}"))
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -1263,12 +1412,13 @@ fn run_lemonade_model_load(
     host: &str,
     port: u16,
     model_ref: &str,
+    backend: &str,
     log_path: Option<&Path>,
     process_env: &LemonadeProcessEnvironment,
 ) -> Result<()> {
     let mut command = ProcessCommand::new(&manifest.lemonade);
     command
-        .args(lemonade_model_load_args(host, port, model_ref))
+        .args(lemonade_model_load_args(host, port, model_ref, backend))
         .stdin(Stdio::null());
     if let Some(log_path) = log_path {
         let log = fs::OpenOptions::new()
@@ -1527,7 +1677,7 @@ fn models_payload_has_loaded_model(value: &Value, model_ref: &str) -> bool {
         })
 }
 
-fn lemonade_model_load_args(host: &str, port: u16, model_ref: &str) -> Vec<String> {
+fn lemonade_model_load_args(host: &str, port: u16, model_ref: &str, backend: &str) -> Vec<String> {
     vec![
         "--host".to_owned(),
         host.to_owned(),
@@ -1536,7 +1686,7 @@ fn lemonade_model_load_args(host: &str, port: u16, model_ref: &str) -> Vec<Strin
         "load".to_owned(),
         model_ref.to_owned(),
         "--llamacpp".to_owned(),
-        ROCM_BACKEND_NAME.to_owned(),
+        backend.to_owned(),
         "--save-options".to_owned(),
     ]
 }
@@ -1548,11 +1698,11 @@ fn query_health_json(host: &str, port: u16) -> Result<Value> {
     serde_json::from_str(&body).context("failed to parse Lemonade health JSON")
 }
 
-fn query_loaded_model_endpoint(endpoint_url: &str, model_ref: &str) -> Result<bool> {
+fn query_loaded_model_endpoint(endpoint_url: &str, model_ref: &str, backend: &str) -> Result<bool> {
     let (host, port) = parse_http_endpoint(endpoint_url)
         .with_context(|| format!("unsupported endpoint URL `{endpoint_url}`"))?;
     match query_health_json(&host, port) {
-        Ok(health) => Ok(health_has_loaded_model(&health, model_ref)),
+        Ok(health) => Ok(health_has_loaded_model(&health, model_ref, backend)),
         Err(_) => {
             let endpoint = format_http_base_url(&host, port);
             let body = http_get_text(&endpoint, "/v1/models", Duration::from_secs(3))
@@ -1600,7 +1750,7 @@ fn query_chat_smoke_endpoint(host: &str, port: u16, model_ref: &str) -> Result<b
     Ok(status_line.contains(" 200 "))
 }
 
-fn health_has_loaded_model(health: &Value, model_ref: &str) -> bool {
+fn health_has_loaded_model(health: &Value, model_ref: &str, backend: &str) -> bool {
     let model_ref = model_ref.trim();
     if model_ref.is_empty() {
         return false;
@@ -1615,12 +1765,12 @@ fn health_has_loaded_model(health: &Value, model_ref: &str) -> bool {
                 .into_iter()
                 .filter_map(|field| model.get(field).and_then(Value::as_str))
                 .any(|loaded| model_names_match(loaded, model_ref));
-            let backend_is_rocm = model
+            let backend_matches = model
                 .get("recipe_options")
                 .and_then(|options| options.get("llamacpp_backend"))
                 .and_then(Value::as_str)
-                .is_some_and(lemonade_backend_is_rocm);
-            name_matches && backend_is_rocm
+                .is_some_and(|loaded| lemonade_backend_matches(loaded, backend));
+            name_matches && backend_matches
         })
 }
 
@@ -1629,11 +1779,11 @@ fn model_names_match(left: &str, right: &str) -> bool {
         || resolve_lemonade_model_ref(left).eq_ignore_ascii_case(&resolve_lemonade_model_ref(right))
 }
 
-fn lemonade_backend_is_rocm(value: &str) -> bool {
+fn lemonade_backend_matches(value: &str, backend: &str) -> bool {
     value
         .trim()
         .to_ascii_lowercase()
-        .starts_with(ROCM_BACKEND_NAME)
+        .starts_with(&backend.to_ascii_lowercase())
 }
 
 fn serve_http_command_args(request: &ServeHttpRequest) -> Vec<String> {
@@ -2021,8 +2171,8 @@ mod tests {
     }
 
     #[test]
-    fn lemonade_model_load_uses_rocm_backend() {
-        let args = lemonade_model_load_args("127.0.0.1", 11435, DEFAULT_MODEL);
+    fn lemonade_model_load_uses_selected_backend() {
+        let args = lemonade_model_load_args("127.0.0.1", 11435, DEFAULT_MODEL, "vulkan");
         assert_eq!(
             args,
             vec![
@@ -2033,10 +2183,80 @@ mod tests {
                 "load",
                 DEFAULT_MODEL,
                 "--llamacpp",
-                "rocm",
+                "vulkan",
                 "--save-options",
             ]
         );
+    }
+
+    #[test]
+    fn parses_llamacpp_backends_from_table() {
+        let output = "\
+Recipe              Backend     Status          Message/Version                               Action
+----------------------------------------------------------------------------------------------------
+kokoro              cpu         installable     Backend is supported but not installed.       lemonade backends install kokoro:cpu
+                    metal       unsupported     Requires macOS                                -
+llamacpp            cpu         installable     Backend is supported but not installed.       lemonade backends install llamacpp:cpu
+                    metal       unsupported     Requires macOS                                -
+                    rocm        unsupported     Unsupported GPU                               -
+                    system      unsupported     Requires Linux                               -
+                    vulkan      installable     Backend is supported but not installed.       lemonade backends install llamacpp:vulkan
+vllm                rocm        unsupported     Requires Linux                               -
+";
+        let backends = parse_llamacpp_backend_statuses(output);
+        assert_eq!(
+            backends,
+            vec![
+                ("cpu".to_owned(), "installable".to_owned()),
+                ("metal".to_owned(), "unsupported".to_owned()),
+                ("rocm".to_owned(), "unsupported".to_owned()),
+                ("system".to_owned(), "unsupported".to_owned()),
+                ("vulkan".to_owned(), "installable".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn selects_vulkan_when_rocm_unsupported() {
+        let backends = vec![
+            ("cpu".to_owned(), "installable".to_owned()),
+            ("rocm".to_owned(), "unsupported".to_owned()),
+            ("vulkan".to_owned(), "installable".to_owned()),
+        ];
+        assert_eq!(
+            select_best_llamacpp_backend(&backends),
+            Some(("vulkan".to_owned(), false))
+        );
+    }
+
+    #[test]
+    fn prefers_installed_rocm_when_supported() {
+        let backends = vec![
+            ("rocm".to_owned(), "installed".to_owned()),
+            ("vulkan".to_owned(), "installable".to_owned()),
+        ];
+        assert_eq!(
+            select_best_llamacpp_backend(&backends),
+            Some(("rocm".to_owned(), true))
+        );
+    }
+
+    #[test]
+    fn selects_cpu_when_no_gpu_backend() {
+        let backends = vec![
+            ("rocm".to_owned(), "unsupported".to_owned()),
+            ("cpu".to_owned(), "installable".to_owned()),
+        ];
+        assert_eq!(
+            select_best_llamacpp_backend(&backends),
+            Some(("cpu".to_owned(), false))
+        );
+    }
+
+    #[test]
+    fn selects_nothing_when_all_unsupported() {
+        let backends = vec![("rocm".to_owned(), "unsupported".to_owned())];
+        assert_eq!(select_best_llamacpp_backend(&backends), None);
     }
 
     #[test]
@@ -2112,7 +2332,7 @@ mod tests {
             "model_loaded": null,
             "all_models_loaded": []
         });
-        assert!(!health_has_loaded_model(&unloaded, DEFAULT_MODEL));
+        assert!(!health_has_loaded_model(&unloaded, DEFAULT_MODEL, "vulkan"));
 
         let loaded = json!({
             "status": "ok",
@@ -2121,10 +2341,11 @@ mod tests {
                 "model_name": DEFAULT_MODEL,
                 "recipe": "llamacpp",
                 "recipe_options": {
-                    "llamacpp_backend": "rocm"
+                    "llamacpp_backend": "vulkan"
                 }
             }]
         });
-        assert!(health_has_loaded_model(&loaded, "lemonade-qwen"));
+        assert!(health_has_loaded_model(&loaded, "lemonade-qwen", "vulkan"));
+        assert!(!health_has_loaded_model(&loaded, "lemonade-qwen", "rocm"));
     }
 }
