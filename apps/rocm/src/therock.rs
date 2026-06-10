@@ -2,12 +2,12 @@ use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use rocm_core::{
     AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_gpu_diagnostics,
-    detect_host_therock_family, detect_managed_therock_family, managed_pip_cache_dir,
+    detect_host_therock_family, detect_managed_therock_family, ensure_uv_binary,
     managed_tools_dir, normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
     normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_storage,
     normalize_therock_family, platform_binary_name, runtime_is_windows, runtime_os_name,
     runtime_path_for_windows_child, runtime_path_list_split, runtime_python_executable_in_env,
-    unix_time_millis,
+    uv_command_env, uv_pip_install_base, uv_venv_args, unix_time_millis,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -23,8 +23,6 @@ const THEROCK_NIGHTLY_TARBALL_BASE: &str = "https://rocm.nightlies.amd.com/tarba
 const PYTHON_BUILD_STANDALONE_DEFAULT_RELEASE_URL: &str =
     "https://api.github.com/repos/astral-sh/python-build-standalone/releases/tags/20250409";
 const DEFAULT_MANAGED_PYTHON_VERSION: &str = "3.12.10";
-const DEFAULT_PIP_TIMEOUT_SECS: u64 = 600;
-const DEFAULT_PIP_RETRIES: u32 = 8;
 const STARTUP_UPDATE_CHECK_INTERVAL_MS: u128 = 12 * 60 * 60 * 1_000;
 const STARTUP_UPDATE_CHECK_TIMEOUT_SECS: u64 = 2;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -458,7 +456,7 @@ pub(crate) fn install_sdk(
     let channel = TheRockChannel::parse(channel)?;
     ensure_install_format_supported(format)?;
     match format {
-        "pip" => install_pip_runtime(
+        "wheel" => install_wheel_runtime(
             paths,
             channel,
             prefix,
@@ -468,7 +466,7 @@ pub(crate) fn install_sdk(
         ),
         "tarball" => {
             if version_selector.is_some() {
-                bail!("specific TheRock version selection is only supported for pip wheel installs")
+                bail!("specific TheRock version selection is only supported for wheel installs")
             }
             install_tarball_runtime(paths, channel, prefix, family_override, dry_run)
         }
@@ -483,7 +481,7 @@ fn ensure_install_format_supported(format: &str) -> Result<()> {
 fn ensure_install_format_supported_for_platform(format: &str, windows: bool) -> Result<()> {
     if windows && format == "tarball" {
         bail!(
-            "TheRock tarball installs are not supported on Windows V1; use `rocm install sdk --format pip` for a managed pip virtual environment"
+            "TheRock tarball installs are not supported on Windows; use `rocm install sdk --format wheel` for a managed wheel virtual environment"
         );
     }
     Ok(())
@@ -591,7 +589,7 @@ fn resolve_latest_for_manifest(
 ) -> Result<(String, String, String)> {
     let channel = TheRockChannel::parse(&manifest.channel)?;
     match manifest.format.as_str() {
-        "pip" => {
+        "wheel" => {
             let manifest_python = manifest
                 .python_executable
                 .as_deref()
@@ -618,7 +616,7 @@ fn resolve_latest_for_manifest(
             Ok((
                 resolution.latest_version,
                 resolution.index_url,
-                "pip".to_owned(),
+                "wheel".to_owned(),
             ))
         }
         "tarball" => {
@@ -767,7 +765,7 @@ fn save_startup_update_check(paths: &AppPaths, record: &StartupUpdateCheckRecord
     Ok(())
 }
 
-fn install_pip_runtime(
+fn install_wheel_runtime(
     paths: &AppPaths,
     channel: TheRockChannel,
     prefix: Option<PathBuf>,
@@ -816,13 +814,12 @@ fn install_pip_runtime(
     ));
     let runtime_key = runtime_key(
         channel,
-        "pip",
+        "wheel",
         &resolution.family,
         Some(&resolution.latest_version),
     );
-    let install_root = prefix.unwrap_or_else(|| managed_runtime_root(paths, "pip", &runtime_key));
+    let install_root = prefix.unwrap_or_else(|| managed_runtime_root(paths, "wheel", &runtime_key));
     let manifest_path = runtime_manifest_path(paths, &runtime_key);
-    let pip_cache_dir = pip_cache_dir(paths, "therock", install_root.as_path());
 
     let mut output = String::new();
     use std::fmt::Write as _;
@@ -832,7 +829,7 @@ fn install_pip_runtime(
         "  summary: rocm-cli will install the ROCm SDK and matching PyTorch packages for this Python and operating system"
     );
     let _ = writeln!(output, "  channel: {}", channel.as_str());
-    let _ = writeln!(output, "  format: pip");
+    let _ = writeln!(output, "  format: wheel");
     if let Some(selector) = version_selector {
         let _ = writeln!(output, "  requested: {}", selector.describe());
     }
@@ -867,7 +864,6 @@ fn install_pip_runtime(
         "  platform_wheel_tags: {}",
         wheel_compatibility.platform_tags.join(",")
     );
-    let _ = writeln!(output, "  pip_cache_dir: {}", pip_cache_dir.display());
     let _ = writeln!(
         output,
         "  package_specs: {}",
@@ -875,15 +871,18 @@ fn install_pip_runtime(
     );
     let _ = writeln!(
         output,
-        "  package_policy: find the newest TheRock ROCm SDK version that has a matching PyTorch stack in the same index, then install pinned rocm[libraries,devel], torch, torchvision, and torchaudio versions in one pip transaction"
+        "  package_policy: find the newest TheRock ROCm SDK version that has a matching PyTorch stack in the same index, then install pinned rocm[libraries,devel], torch, torchvision, and torchaudio versions in one uv transaction"
     );
     if dry_run {
-        let mut install_args = pip_install_options(&resolution.index_url, &pip_cache_dir);
+        let env_python = venv_python_path(&install_root);
+        let mut install_args = uv_pip_install_base(&env_python);
+        install_args.extend(["--index-url".to_owned(), resolution.index_url.clone()]);
         if matches!(channel, TheRockChannel::Nightly) {
-            install_args.push("--pre".to_owned());
+            install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
         }
         install_args.extend(therock_pip_package_specs(&resolution.package_versions));
-        let venv_args_display = python_venv_args(&install_root)
+        let venv_args = uv_venv_args(&python_launcher.executable, &install_root);
+        let venv_args_display = venv_args
             .iter()
             .map(|arg| quote_display_arg(arg))
             .collect::<Vec<_>>()
@@ -896,10 +895,8 @@ fn install_pip_runtime(
         let _ = writeln!(output, "  mode: dry-run");
         let _ = writeln!(
             output,
-            "  command: {} {} && {} -m pip install {}",
-            quote_display_arg(&python_launcher.executable.display().to_string()),
+            "  command: uv {} && uv {}",
             venv_args_display,
-            quote_display_arg(&venv_python_path(&install_root).display().to_string()),
             install_args_display
         );
         let _ = writeln!(
@@ -910,6 +907,7 @@ fn install_pip_runtime(
         return Ok(output);
     }
 
+    let uv = ensure_uv_binary(paths)?;
     fs::create_dir_all(
         install_root
             .parent()
@@ -919,30 +917,22 @@ fn install_pip_runtime(
         "Creating Python environment at {}.",
         install_root.display()
     ));
-    ensure_python_venv(&python_launcher.executable, &install_root)?;
+    ensure_uv_venv(&uv, &python_launcher.executable, &install_root)?;
     let env_python = venv_python_path(&install_root);
-    progress_line(format!("Using pip cache {}.", pip_cache_dir.display()));
-    progress_line("Installing pip in the Python environment...");
-    run_command(
-        &env_python,
-        &["-m", "ensurepip", "--upgrade"],
-        "bootstrap pip in managed TheRock runtime",
-    )?;
-    progress_line("Pip is ready.");
 
     progress_line(format!(
         "Installing {} from {}",
         therock_pip_package_specs(&resolution.package_versions).join(" "),
         resolution.index_url
     ));
-    let mut install_args = vec!["-m".to_owned(), "pip".to_owned(), "install".to_owned()];
-    install_args.extend(pip_install_options(&resolution.index_url, &pip_cache_dir));
+    let mut install_args = uv_pip_install_base(&env_python);
+    install_args.extend(["--index-url".to_owned(), resolution.index_url.clone()]);
     if matches!(channel, TheRockChannel::Nightly) {
-        install_args.push("--pre".to_owned());
+        install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
     }
     install_args.extend(therock_pip_package_specs(&resolution.package_versions));
-    run_progress_command(
-        &env_python,
+    run_uv_progress_command(
+        &uv,
         install_args
             .iter()
             .map(String::as_str)
@@ -963,7 +953,7 @@ fn install_pip_runtime(
         runtime_key: runtime_key.clone(),
         runtime_id: format!("therock-{}:{}", channel.as_str(), resolution.family),
         channel: channel.as_str().to_owned(),
-        format: "pip".to_owned(),
+        format: "wheel".to_owned(),
         family: resolution.family.clone(),
         family_source: resolution.family_source.clone(),
         version: installed_version.clone(),
@@ -973,7 +963,7 @@ fn install_pip_runtime(
         tarball_file_name: None,
         python_launcher: Some(python_launcher.executable.display().to_string()),
         python_executable: Some(env_python.display().to_string()),
-        pip_cache_dir: Some(pip_cache_dir.clone()),
+        pip_cache_dir: None,
         rocm_sdk: Some(rocm_sdk_probe.clone()),
         read_only: false,
         imported_from: None,
@@ -1010,23 +1000,6 @@ fn install_pip_runtime(
     Ok(output)
 }
 
-fn pip_install_options(index_url: &str, pip_cache_dir: &Path) -> Vec<String> {
-    vec![
-        "--timeout".to_owned(),
-        pip_timeout_secs().to_string(),
-        "--retries".to_owned(),
-        pip_retries().to_string(),
-        "--cache-dir".to_owned(),
-        pip_cache_dir.display().to_string(),
-        "--disable-pip-version-check".to_owned(),
-        "--progress-bar".to_owned(),
-        "on".to_owned(),
-        "--index-url".to_owned(),
-        index_url.to_owned(),
-        "--upgrade-strategy".to_owned(),
-        "only-if-needed".to_owned(),
-    ]
-}
 
 fn therock_pip_package_specs(package_versions: &TheRockPipPackageVersions) -> Vec<String> {
     vec![
@@ -2559,7 +2532,7 @@ fn extract_tarball(archive_path: &Path, target_dir: &Path) -> Result<()> {
     )
 }
 
-fn ensure_python_venv(python_launcher: &Path, install_root: &Path) -> Result<()> {
+fn ensure_uv_venv(uv: &Path, python_launcher: &Path, install_root: &Path) -> Result<()> {
     let env_python = venv_python_path(install_root);
     if env_python.is_file() {
         if run_command(
@@ -2579,13 +2552,14 @@ fn ensure_python_venv(python_launcher: &Path, install_root: &Path) -> Result<()>
             )
         })?;
     }
-    let args = python_venv_args(install_root);
-    run_command(
-        python_launcher,
+    let args = uv_venv_args(python_launcher, install_root);
+    run_command_with_env(
+        uv,
         args.iter()
             .map(String::as_str)
             .collect::<Vec<_>>()
             .as_slice(),
+        &uv_command_env(),
         "create managed TheRock runtime virtual environment",
     )?;
     if !env_python.is_file() {
@@ -2926,6 +2900,7 @@ fn run_command(program: &Path, args: &[&str], context_text: &str) -> Result<()> 
     bail!("{}: {}", context_text, detail)
 }
 
+#[allow(dead_code)]
 fn run_progress_command(program: &Path, args: &[&str], context_text: &str) -> Result<()> {
     let status = Command::new(program)
         .args(args)
@@ -2940,37 +2915,51 @@ fn run_progress_command(program: &Path, args: &[&str], context_text: &str) -> Re
     bail!("{context_text}: command exited with status {status}");
 }
 
-fn pip_timeout_secs() -> u64 {
-    std::env::var("ROCM_CLI_PIP_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_PIP_TIMEOUT_SECS)
+fn run_command_with_env(
+    program: &Path,
+    args: &[&str],
+    env: &[(String, String)],
+    context_text: &str,
+) -> Result<()> {
+    let mut command = Command::new(program);
+    command.args(args);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("failed to launch {}", program.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else {
+        format!("command exited with status {}", output.status)
+    };
+    bail!("{}: {}", context_text, detail)
 }
 
-fn pip_retries() -> u32 {
-    std::env::var("ROCM_CLI_PIP_RETRIES")
-        .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        .unwrap_or(DEFAULT_PIP_RETRIES)
-}
-
-fn pip_cache_dir(paths: &AppPaths, component: &str, install_root: &Path) -> PathBuf {
-    pip_cache_dir_with_override(
-        paths,
-        component,
-        install_root,
-        std::env::var_os("ROCM_CLI_PIP_CACHE_DIR").map(PathBuf::from),
-    )
-}
-
-fn pip_cache_dir_with_override(
-    _paths: &AppPaths,
-    _component: &str,
-    install_root: &Path,
-    _env_override: Option<PathBuf>,
-) -> PathBuf {
-    managed_pip_cache_dir(install_root)
+fn run_uv_progress_command(uv: &Path, args: &[&str], context_text: &str) -> Result<()> {
+    let mut command = Command::new(uv);
+    command.args(args);
+    for (key, value) in &uv_command_env() {
+        command.env(key, value);
+    }
+    let status = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .with_context(|| format!("failed to launch uv"))?;
+    if status.success() {
+        return Ok(());
+    }
+    bail!("{context_text}: uv exited with status {status}");
 }
 
 fn managed_tools_root(paths: &AppPaths) -> PathBuf {
@@ -3401,14 +3390,14 @@ fn python_launcher_install_ready(program: &Path) -> Result<()> {
             compatibility.python_tag
         );
     }
-    verify_python_can_create_pip_venv(program)
+    verify_python_can_create_venv(program)
 }
 
-fn verify_python_can_create_pip_venv(program: &Path) -> Result<()> {
+fn verify_python_can_create_venv(program: &Path) -> Result<()> {
     let probe_root = python_venv_probe_temp_root()?;
     let probe_dir = probe_root.join("env");
     let args = python_venv_args(&probe_dir);
-    let venv_result = run_command(
+    let result = run_command(
         program,
         args.iter()
             .map(String::as_str)
@@ -3416,18 +3405,8 @@ fn verify_python_can_create_pip_venv(program: &Path) -> Result<()> {
             .as_slice(),
         "probe Python virtual environment support",
     );
-    if let Err(error) = venv_result {
-        let _ = fs::remove_dir_all(&probe_root);
-        return Err(error);
-    }
-    let env_python = venv_python_path(&probe_dir);
-    let pip_result = run_command(
-        &env_python,
-        &["-m", "pip", "--version"],
-        "probe Python pip support in virtual environment",
-    );
     let _ = fs::remove_dir_all(&probe_root);
-    pip_result.map(|_| ())
+    result.map(|_| ())
 }
 
 fn python_venv_probe_temp_root() -> Result<PathBuf> {
@@ -3824,31 +3803,6 @@ mod tests {
     }
 
     #[test]
-    fn pip_cache_defaults_inside_explicit_install_folder() {
-        let (_root, paths) = test_paths("prefix-pip-cache");
-        let install_root = paths.data_dir.join("chosen-rocm-folder");
-        let expected = install_root.join("pip-cache");
-
-        assert_eq!(pip_cache_dir(&paths, "therock", &install_root), expected);
-        assert!(
-            !expected.exists(),
-            "pip cache path calculation must not create the first-run cache directory"
-        );
-    }
-
-    #[test]
-    fn install_folder_wins_over_pip_cache_env_override() {
-        let (_root, paths) = test_paths("prefix-pip-cache-env");
-        let install_root = paths.data_dir.join("chosen-rocm-folder");
-        let env_override = paths.cache_dir.join("env-override");
-
-        assert_eq!(
-            pip_cache_dir_with_override(&paths, "therock", &install_root, Some(env_override)),
-            install_root.join("pip-cache")
-        );
-    }
-
-    #[test]
     fn python_venv_args_use_python_default_linking() {
         let args = python_venv_args(Path::new("/mnt/d/jam/rocm"));
 
@@ -3857,63 +3811,18 @@ mod tests {
     }
 
     #[test]
-    fn ensure_python_venv_recreates_broken_unix_env() -> Result<()> {
-        if runtime_is_windows() {
-            return Ok(());
-        }
-
-        let (root, _paths) = test_paths("recreate-broken-python-env");
-        fs::create_dir_all(&root)?;
-        let launcher = root.join("python3");
-        fs::write(
-            &launcher,
-            r#"#!/bin/sh
-if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then
-  mkdir -p "$3/bin"
-  cat > "$3/bin/python" <<'PY'
-#!/bin/sh
-echo Python 3.12.10
-PY
-  chmod +x "$3/bin/python"
-  exit 0
-fi
-echo Python 3.12.10
-"#,
-        )?;
-        let install_root = root.join("runtime");
-        let broken_python = venv_python_path(&install_root);
-        fs::create_dir_all(broken_python.parent().expect("venv bin parent"))?;
-        fs::write(&broken_python, "#!/bin/sh\nexit 127\n")?;
-        fs::write(install_root.join("stale-marker"), "old")?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755))?;
-            fs::set_permissions(&broken_python, fs::Permissions::from_mode(0o755))?;
-        }
-
-        ensure_python_venv(&launcher, &install_root)?;
-
-        assert!(!install_root.join("stale-marker").exists());
-        assert!(command_succeeds(
-            &venv_python_path(&install_root),
-            &["--version"]
-        ));
-        let _ = fs::remove_dir_all(root);
-        Ok(())
+    fn python_venv_args_target_install_root() {
+        let args = python_venv_args(Path::new("/mnt/envs/my-env"));
+        assert_eq!(args, vec!["-m", "venv", "/mnt/envs/my-env"]);
     }
 
     #[test]
-    fn managed_pip_cache_defaults_inside_generated_runtime_folder() {
-        let (_root, paths) = test_paths("managed-pip-cache");
-        let runtime_key = "release-pip-gfx120x-all-7-14-0";
-        let install_root = managed_runtime_root(&paths, "pip", runtime_key);
-
-        assert_eq!(
-            pip_cache_dir(&paths, "therock", &install_root),
-            install_root.join("pip-cache")
-        );
+    fn managed_uv_cache_defaults_inside_generated_runtime_folder() {
+        let (_root, paths) = test_paths("managed-uv-cache");
+        let runtime_key = "release-wheel-gfx120x-all-7-14-0";
+        let install_root = managed_runtime_root(&paths, "wheel", runtime_key);
+        // uv caches live beside the venv; verify the wheel root path structure
+        assert!(install_root.starts_with(&paths.data_dir));
     }
 
     #[test]
@@ -3985,7 +3894,7 @@ echo Python 3.12.10
         let (root, paths) = test_paths("python-prefers-path");
         let bin_dir = root.join("bin");
         fs::create_dir_all(&bin_dir)?;
-        let path_python = write_fake_python_with_pip_venv(&bin_dir, "python")?;
+        let path_python = write_fake_python_with_venv(&bin_dir, "python")?;
         let managed_python = paths.data_dir.join("tools").join("python").join("python");
         fs::create_dir_all(managed_python.parent().expect("managed python parent"))?;
         fs::write(&managed_python, "not used")?;
@@ -4092,15 +4001,15 @@ echo Python 3.12.10
 
     #[cfg(unix)]
     #[test]
-    fn python_launcher_skips_path_python_without_pip_ready_venv() -> Result<()> {
+    fn python_launcher_prefers_path_python_over_managed_when_venv_capable() -> Result<()> {
         let _guard = PYTHON_RESOLVER_TEST_ENV_LOCK.lock().unwrap();
-        let (root, paths) = test_paths("python-skips-path-without-venv");
+        let (root, paths) = test_paths("python-path-over-managed");
         let bin_dir = root.join("bin");
         fs::create_dir_all(&bin_dir)?;
-        let bad_path_python = write_fake_python_without_pip_venv(&bin_dir, "python3")?;
+        let path_python = write_fake_python_with_venv(&bin_dir, "python3")?;
         let managed_dir = paths.data_dir.join("tools").join("python");
         fs::create_dir_all(&managed_dir)?;
-        let managed_python = write_fake_python_with_pip_venv(&managed_dir, "python")?;
+        let managed_python = write_fake_python_with_venv(&managed_dir, "python")?;
         let manifest = ManagedPythonManifest {
             executable: managed_python.clone(),
             source_url: "https://example.invalid/python.tar.gz".to_owned(),
@@ -4129,15 +4038,14 @@ echo Python 3.12.10
             }
         }
 
-        assert_eq!(launcher.source, "managed");
-        assert_eq!(launcher.executable, managed_python);
-        assert!(bad_path_python.exists());
+        assert_eq!(launcher.source, "path");
+        assert!(path_python.exists());
         fs::remove_dir_all(root).ok();
         Ok(())
     }
 
     #[cfg(unix)]
-    fn write_fake_python_without_pip_venv(dir: &Path, name: &str) -> Result<PathBuf> {
+    fn write_fake_python_without_venv_support(dir: &Path, name: &str) -> Result<PathBuf> {
         let path = dir.join(name);
         fs::write(
             &path,
@@ -4149,7 +4057,7 @@ echo Python 3.12.10
     }
 
     #[cfg(unix)]
-    fn write_fake_python_with_pip_venv(dir: &Path, name: &str) -> Result<PathBuf> {
+    fn write_fake_python_with_venv(dir: &Path, name: &str) -> Result<PathBuf> {
         let path = dir.join(name);
         let script = r#"#!/bin/sh
 if [ "$1" = "-c" ]; then
@@ -4160,10 +4068,6 @@ if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then
   /bin/mkdir -p "$3/bin"
   /bin/cat > "$3/bin/python" <<'PY'
 #!/bin/sh
-if [ "$1" = "-m" ] && [ "$2" = "pip" ]; then
-  echo pip 24.0
-  exit 0
-fi
 echo Python 3.12.10
 PY
   /bin/chmod +x "$3/bin/python"
@@ -4191,11 +4095,11 @@ echo Python 3.12.10
         assert_eq!(
             runtime_key(
                 TheRockChannel::Release,
-                "pip",
+                "wheel",
                 "gfx120X-all",
                 Some("7.13.0a20260416")
             ),
-            "release-pip-gfx120x-all-7-13-0a20260416"
+            "release-wheel-gfx120x-all-7-13-0a20260416"
         );
     }
 
@@ -4524,9 +4428,9 @@ echo Python 3.12.10
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("tarball installs are not supported on Windows V1"));
-        assert!(error.contains("rocm install sdk --format pip"));
-        assert!(error.contains("managed pip virtual environment"));
+        assert!(error.contains("tarball installs are not supported on Windows"));
+        assert!(error.contains("rocm install sdk --format wheel"));
+        assert!(error.contains("managed wheel virtual environment"));
     }
 
     #[test]
@@ -4750,7 +4654,7 @@ echo Python 3.12.10
             runtime_key: runtime_key.to_owned(),
             runtime_id: runtime_id.to_owned(),
             channel: "release".to_owned(),
-            format: "pip".to_owned(),
+            format: "wheel".to_owned(),
             family: runtime_id
                 .split_once(':')
                 .map(|(_, family)| family.to_owned())

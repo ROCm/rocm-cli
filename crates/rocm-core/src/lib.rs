@@ -23,6 +23,11 @@ use windows_sys::Win32::System::Threading::{
 };
 
 pub mod runtime;
+pub mod uv;
+pub use uv::{
+    DEFAULT_UV_TIMEOUT_SECS, ensure_uv_binary, uv_binary_name, uv_command_env,
+    uv_http_timeout_secs, uv_pip_freeze_args, uv_pip_install_base, uv_venv_args,
+};
 #[cfg(test)]
 use runtime::home_rocm_dir;
 pub use runtime::{

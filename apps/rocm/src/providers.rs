@@ -1108,7 +1108,7 @@ fn rocm_openai_tool_definitions() -> Vec<serde_json::Value> {
                 "type": "object",
                 "properties": {
                     "channel": { "type": "string", "enum": ["release", "nightly"] },
-                    "format": { "type": "string", "enum": ["pip", "tarball"] },
+                    "format": { "type": "string", "enum": ["wheel", "tarball"] },
                     "prefix": { "type": "string" },
                     "version": { "type": "string" },
                     "build_date": { "type": "string" }
@@ -1782,7 +1782,7 @@ mod tests {
                     "name": "install_sdk_dry_run",
                     "input": {
                         "channel": "release",
-                        "format": "pip"
+                        "format": "wheel"
                     }
                 }
             ]

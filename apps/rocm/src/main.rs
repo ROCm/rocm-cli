@@ -279,7 +279,7 @@ enum InstallTarget {
         #[arg(long, default_value = "release")]
         channel: String,
         /// Package format to install.
-        #[arg(long, default_value = "pip")]
+        #[arg(long, default_value = "wheel")]
         format: InstallFormat,
         /// Full folder path where the ROCm Python environment should be created.
         #[arg(long)]
@@ -563,7 +563,7 @@ enum SetupCommand {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum InstallFormat {
-    Pip,
+    Wheel,
     Tarball,
 }
 
@@ -1759,7 +1759,7 @@ fn render_codex_bridge_instructions(
     writeln!(&mut text, "- `rocm doctor`").ok();
     writeln!(
         &mut text,
-        "- `rocm install sdk --channel release|nightly [--format pip|tarball] [--build-date YYYY-MM-DD|--version VERSION]`"
+        "- `rocm install sdk --channel release|nightly [--format wheel|tarball] [--build-date YYYY-MM-DD|--version VERSION]`"
     )
     .ok();
     writeln!(&mut text, "- `rocm update`").ok();
@@ -2005,7 +2005,7 @@ fn install(target: InstallTarget) -> Result<()> {
             dry_run,
         } => {
             let format_name = match format {
-                InstallFormat::Pip => "pip",
+                InstallFormat::Wheel => "wheel",
                 InstallFormat::Tarball => "tarball",
             };
             let version_selector = therock_install_version_selector(version, build_date)?;
@@ -3424,7 +3424,7 @@ fn active_pytorch_runtime(
 }
 
 fn pytorch_runtime_ready(manifest: &therock::InstalledRuntimeManifest) -> bool {
-    manifest.format == "pip"
+    manifest.format == "wheel"
         && validate_runtime_manifest_for_activation(manifest).is_ok()
         && manifest
             .rocm_sdk
@@ -4701,7 +4701,7 @@ pub(crate) fn render_runtimes_text(paths: &AppPaths, config: &RocmCliConfig) -> 
         let _ = writeln!(output, "  installed: none");
         let _ = writeln!(
             output,
-            "  next step: rocm install sdk --channel release --format pip"
+            "  next step: rocm install sdk --channel release --format wheel"
         );
         return Ok(output);
     }
@@ -5338,7 +5338,7 @@ fn adopt_runtime_from_probe(
         runtime_key: request.runtime_key,
         runtime_id: request.runtime_id,
         channel,
-        format: "pip".to_owned(),
+        format: "wheel".to_owned(),
         family,
         family_source: "runtime_id".to_owned(),
         version,
@@ -5585,13 +5585,13 @@ fn validate_runtime_manifest_for_activation(
     }
 
     match manifest.format.as_str() {
-        "pip" => validate_pip_runtime_manifest(manifest),
+        "wheel" => validate_wheel_runtime_manifest(manifest),
         "tarball" => validate_tarball_runtime_manifest(manifest),
         other => bail!("unsupported runtime format in manifest: {other}"),
     }
 }
 
-fn validate_pip_runtime_manifest(manifest: &therock::InstalledRuntimeManifest) -> Result<()> {
+fn validate_wheel_runtime_manifest(manifest: &therock::InstalledRuntimeManifest) -> Result<()> {
     let python_executable = manifest
         .python_executable
         .as_deref()
@@ -6671,7 +6671,7 @@ fn fallback_rocm_tool_call_for_prompt(prompt: &str) -> Option<providers::ChatToo
             "--channel".to_owned(),
             "release".to_owned(),
             "--format".to_owned(),
-            "pip".to_owned(),
+            "wheel".to_owned(),
             "--prefix".to_owned(),
             prefix,
         ];
@@ -6854,7 +6854,7 @@ pub(crate) fn install_sdk_chat_approval_for_prompt(
             "release".to_owned()
         },
         "--format".to_owned(),
-        "pip".to_owned(),
+        "wheel".to_owned(),
     ];
     if let Some(prefix) = requested_install_prefix_from_prompt(prompt) {
         args.push("--prefix".to_owned());
@@ -7489,11 +7489,11 @@ fn validate_chat_install_sdk_tool_call(call: &providers::ChatToolCall) -> Result
     if !matches!(channel.as_str(), "release" | "nightly") {
         bail!("local assistant requested unsupported TheRock channel `{channel}`");
     }
-    let format = json_string(object, "format").unwrap_or_else(|| "pip".to_owned());
-    if !matches!(format.as_str(), "pip" | "tarball") {
+    let format = json_string(object, "format").unwrap_or_else(|| "wheel".to_owned());
+    if !matches!(format.as_str(), "wheel" | "tarball") {
         bail!("local assistant requested unsupported TheRock install format `{format}`");
     }
-    if rocm_core::runtime_is_windows() && format != "pip" {
+    if rocm_core::runtime_is_windows() && format != "wheel" {
         bail!("local assistant cannot request `{format}` installs on Windows; use pip");
     }
     let version = json_string(object, "version");
@@ -7501,7 +7501,7 @@ fn validate_chat_install_sdk_tool_call(call: &providers::ChatToolCall) -> Result
     if version.is_some() && build_date.is_some() {
         bail!("local assistant cannot request both `version` and `build_date`");
     }
-    if format != "pip" && (version.is_some() || build_date.is_some()) {
+    if format != "wheel" && (version.is_some() || build_date.is_some()) {
         bail!("local assistant can only request specific TheRock wheel versions for pip installs");
     }
     if let Some(version) = version {
@@ -7901,7 +7901,7 @@ fn validate_chat_rocm_command_safety(args: &[String]) -> Result<()> {
     {
         if rocm_core::runtime_is_windows()
             && chat_cli_arg_value(args, "--format")
-                .is_some_and(|value| !value.eq_ignore_ascii_case("pip"))
+                .is_some_and(|value| !value.eq_ignore_ascii_case("wheel"))
         {
             bail!("local assistant cannot request non-pip ROCm installs on Windows");
         }
@@ -7911,8 +7911,8 @@ fn validate_chat_rocm_command_safety(args: &[String]) -> Result<()> {
             bail!("local assistant cannot request both --version and --build-date");
         }
         if version.is_some() || build_date.is_some() {
-            let format = chat_cli_arg_value(args, "--format").unwrap_or("pip");
-            if !format.eq_ignore_ascii_case("pip") {
+            let format = chat_cli_arg_value(args, "--format").unwrap_or("wheel");
+            if !format.eq_ignore_ascii_case("wheel") {
                 bail!(
                     "local assistant can only request specific TheRock wheel versions for pip installs"
                 );
@@ -9074,7 +9074,7 @@ fn parse_optional_lines(args: &[String]) -> Result<usize> {
 
 fn render_install_sdk_dry_run_for_args(paths: &AppPaths, args: &[String]) -> Result<String> {
     let channel = chat_cli_arg_value(args, "--channel").unwrap_or("release");
-    let format = chat_cli_arg_value(args, "--format").unwrap_or("pip");
+    let format = chat_cli_arg_value(args, "--format").unwrap_or("wheel");
     let prefix = chat_cli_arg_value(args, "--prefix").map(PathBuf::from);
     let version = chat_cli_arg_value(args, "--version").map(str::to_owned);
     let build_date = chat_cli_arg_value(args, "--build-date").map(str::to_owned);
@@ -9126,7 +9126,7 @@ fn internal_mcp_install_sdk_args(
     dry_run: bool,
 ) -> Result<Vec<String>> {
     let channel = json_string(arguments, "channel").unwrap_or_else(|| "release".to_owned());
-    let format = json_string(arguments, "format").unwrap_or_else(|| "pip".to_owned());
+    let format = json_string(arguments, "format").unwrap_or_else(|| "wheel".to_owned());
     let mut argv = vec![
         "install".to_owned(),
         "sdk".to_owned(),
@@ -9448,7 +9448,7 @@ fn rocm_chat_tool_requested_args(call: &providers::ChatToolCall) -> Option<Vec<S
                 "--channel".to_owned(),
                 json_string(object, "channel").unwrap_or_else(|| "release".to_owned()),
                 "--format".to_owned(),
-                json_string(object, "format").unwrap_or_else(|| "pip".to_owned()),
+                json_string(object, "format").unwrap_or_else(|| "wheel".to_owned()),
             ];
             if let Some(prefix) = json_string(object, "prefix") {
                 args.push("--prefix".to_owned());
@@ -11702,7 +11702,7 @@ fn select_runtime_update_source<'a>(
     }
     match manifests {
         [] => bail!(
-            "no managed runtimes are registered; run `rocm install sdk --channel release --format pip` first"
+            "no managed runtimes are registered; run `rocm install sdk --channel release --format wheel` first"
         ),
         [only] => Ok(only),
         _ => bail!(
@@ -12816,7 +12816,7 @@ fn build_freeform_plan_with_recipes(
         let Some(prefix) = requested_install_prefix_from_prompt(trimmed) else {
             let mut parsed = vec![
                 ("channel".to_owned(), channel.to_owned()),
-                ("format".to_owned(), "pip".to_owned()),
+                ("format".to_owned(), "wheel".to_owned()),
             ];
             if let Some(build_date) = build_date.as_deref() {
                 parsed.push(("build_date".to_owned(), build_date.to_owned()));
@@ -12843,7 +12843,7 @@ fn build_freeform_plan_with_recipes(
             "--channel".to_owned(),
             channel.to_owned(),
             "--format".to_owned(),
-            "pip".to_owned(),
+            "wheel".to_owned(),
             "--prefix".to_owned(),
             prefix.clone(),
         ];
@@ -12853,7 +12853,7 @@ fn build_freeform_plan_with_recipes(
         }
         let mut parsed = vec![
             ("channel".to_owned(), channel.to_owned()),
-            ("format".to_owned(), "pip".to_owned()),
+            ("format".to_owned(), "wheel".to_owned()),
             ("prefix".to_owned(), prefix),
         ];
         if let Some(build_date) = build_date.as_deref() {
@@ -15092,7 +15092,7 @@ mod tests {
                         "--channel".to_owned(),
                         "nightly".to_owned(),
                         "--format".to_owned(),
-                        "pip".to_owned(),
+                        "wheel".to_owned(),
                         "--prefix".to_owned(),
                         "D:\\jam\\temp\\therock_venvs".to_owned(),
                     ]
@@ -15121,7 +15121,7 @@ mod tests {
                         "--channel".to_owned(),
                         "release".to_owned(),
                         "--format".to_owned(),
-                        "pip".to_owned(),
+                        "wheel".to_owned(),
                         "--prefix".to_owned(),
                         "D:\\jam\\temp\\therock_venvs".to_owned(),
                         "--build-date".to_owned(),
@@ -15548,7 +15548,7 @@ mod tests {
                 "--channel".to_owned(),
                 "release".to_owned(),
                 "--format".to_owned(),
-                "pip".to_owned(),
+                "wheel".to_owned(),
             ],
         };
         let error = validate_provider_planner_tool_call(&call)
@@ -15608,7 +15608,7 @@ mod tests {
             name: "install_sdk".to_owned(),
             arguments: serde_json::json!({
                 "channel": "release",
-                "format": "pip",
+                "format": "wheel",
                 "prefix": "D:\\jam\\temp\\therock_venvs"
             }),
         };
@@ -15618,7 +15618,7 @@ mod tests {
         assert_eq!(
             rocm_chat_tool_requested_command(&call).as_deref(),
             Some(
-                "rocm install sdk --channel release --format pip --prefix D:\\jam\\temp\\therock_venvs"
+                "rocm install sdk --channel release --format wheel --prefix D:\\jam\\temp\\therock_venvs"
             )
         );
         let approval = chat_tool_approval_request(
@@ -15640,7 +15640,7 @@ mod tests {
                 "--channel".to_owned(),
                 "release".to_owned(),
                 "--format".to_owned(),
-                "pip".to_owned(),
+                "wheel".to_owned(),
                 "--prefix".to_owned(),
                 "D:\\jam\\temp\\therock_venvs".to_owned(),
             ]
@@ -15653,7 +15653,7 @@ mod tests {
             id: Some("call-date".to_owned()),
             name: "rocm_command".to_owned(),
             arguments: serde_json::json!({
-                "args": ["install", "sdk", "--channel", "release", "--format", "pip", "--prefix", "D:\\jam\\temp\\therock_venvs", "--build-date", "06052026"],
+                "args": ["install", "sdk", "--channel", "release", "--format", "wheel", "--prefix", "D:\\jam\\temp\\therock_venvs", "--build-date", "06052026"],
                 "reason": "The user asked for the TheRock build from 2026-06-05."
             }),
         };
@@ -15663,7 +15663,7 @@ mod tests {
         assert_eq!(
             rocm_chat_tool_requested_command(&call).as_deref(),
             Some(
-                "rocm install sdk --channel release --format pip --prefix D:\\jam\\temp\\therock_venvs --build-date 06052026"
+                "rocm install sdk --channel release --format wheel --prefix D:\\jam\\temp\\therock_venvs --build-date 06052026"
             )
         );
         let approval =
@@ -15678,7 +15678,7 @@ mod tests {
                 "--channel".to_owned(),
                 "release".to_owned(),
                 "--format".to_owned(),
-                "pip".to_owned(),
+                "wheel".to_owned(),
                 "--prefix".to_owned(),
                 "D:\\jam\\temp\\therock_venvs".to_owned(),
                 "--build-date".to_owned(),
@@ -15694,7 +15694,7 @@ mod tests {
             name: "install_sdk".to_owned(),
             arguments: serde_json::json!({
                 "channel": "release",
-                "format": "pip"
+                "format": "wheel"
             }),
         };
         let error = validate_chat_tool_call(&structured)
@@ -15706,7 +15706,7 @@ mod tests {
             id: Some("call-command-missing-prefix".to_owned()),
             name: "rocm_command".to_owned(),
             arguments: serde_json::json!({
-                "args": ["install", "sdk", "--channel", "release", "--format", "pip"],
+                "args": ["install", "sdk", "--channel", "release", "--format", "wheel"],
                 "reason": "Install ROCm."
             }),
         };
@@ -16041,12 +16041,12 @@ model recipes
                     name: "install_sdk".to_owned(),
                     arguments: serde_json::json!({
                         "channel": "release",
-                        "format": "pip",
+                        "format": "wheel",
                         "prefix": "D:\\jam\\temp\\therock_venvs"
                     }),
                 },
                 Some(
-                    "rocm install sdk --channel release --format pip --prefix D:\\jam\\temp\\therock_venvs",
+                    "rocm install sdk --channel release --format wheel --prefix D:\\jam\\temp\\therock_venvs",
                 ),
                 false,
             ),
@@ -16477,7 +16477,7 @@ model recipes
                 name: "install_sdk".to_owned(),
                 arguments: serde_json::json!({
                     "channel": "release",
-                    "format": "pip",
+                    "format": "wheel",
                     "prefix": "D:\\jam\\temp\\therock_venvs"
                 }),
             }],
@@ -16676,7 +16676,7 @@ model recipes
                 "--channel".to_owned(),
                 "release".to_owned(),
                 "--format".to_owned(),
-                "pip".to_owned(),
+                "wheel".to_owned(),
             ]
         );
         assert!(!chat_tool_call_is_read_only(&call));
@@ -16701,7 +16701,7 @@ model recipes
                     "--channel".to_owned(),
                     "release".to_owned(),
                     "--format".to_owned(),
-                    "pip".to_owned(),
+                    "wheel".to_owned(),
                     "--prefix".to_owned(),
                     expected_prefix.to_owned(),
                 ]
@@ -16732,7 +16732,7 @@ model recipes
                     "--channel".to_owned(),
                     "release".to_owned(),
                     "--format".to_owned(),
-                    "pip".to_owned(),
+                    "wheel".to_owned(),
                     "--prefix".to_owned(),
                     expected_prefix.to_owned(),
                     "--build-date".to_owned(),
@@ -16759,7 +16759,7 @@ model recipes
                 "--channel".to_owned(),
                 "release".to_owned(),
                 "--format".to_owned(),
-                "pip".to_owned(),
+                "wheel".to_owned(),
                 "--build-date".to_owned(),
                 "2026-06-05".to_owned(),
             ]
@@ -16795,7 +16795,7 @@ model recipes
                     "--channel".to_owned(),
                     "release".to_owned(),
                     "--format".to_owned(),
-                    "pip".to_owned(),
+                    "wheel".to_owned(),
                 ],
                 "{prompt}"
             );
@@ -16878,7 +16878,7 @@ install therock";
                 "--channel".to_owned(),
                 "release".to_owned(),
                 "--format".to_owned(),
-                "pip".to_owned(),
+                "wheel".to_owned(),
                 "--prefix".to_owned(),
                 "D:\\jam\\temp\\therock_venvs".to_owned(),
             ]
@@ -16900,7 +16900,7 @@ install therock";
                 "--channel".to_owned(),
                 "release".to_owned(),
                 "--format".to_owned(),
-                "pip".to_owned(),
+                "wheel".to_owned(),
                 "--prefix".to_owned(),
                 "D:\\jam\\temp\\therock_venvs".to_owned(),
                 "--version".to_owned(),
@@ -17701,7 +17701,7 @@ install therock";
             "--channel",
             "release",
             "--format",
-            "pip",
+            "wheel",
             "--prefix",
             "D:\\jam\\temp\\therock_venvs",
             "--family",
@@ -20275,7 +20275,7 @@ VERSION_ID="41"
         let install_root = paths
             .data_dir
             .join("runtimes")
-            .join("pip")
+            .join("wheel")
             .join(runtime_key);
         let scripts_dir = install_root.join(if cfg!(windows) { "Scripts" } else { "bin" });
         let python_executable = scripts_dir.join(if cfg!(windows) {
@@ -20305,7 +20305,7 @@ VERSION_ID="41"
             runtime_key: runtime_key.to_owned(),
             runtime_id: runtime_id.to_owned(),
             channel: "release".to_owned(),
-            format: "pip".to_owned(),
+            format: "wheel".to_owned(),
             family: "gfx120X-all".to_owned(),
             family_source: "test".to_owned(),
             version: version.to_owned(),
@@ -20315,7 +20315,7 @@ VERSION_ID="41"
             tarball_file_name: None,
             python_launcher: Some("python".to_owned()),
             python_executable: Some(python_executable.display().to_string()),
-            pip_cache_dir: Some(paths.cache_dir.join("pip").join("therock")),
+            pip_cache_dir: Some(paths.cache_dir.join("uv").join("therock")),
             rocm_sdk: Some(therock::RocmSdkPythonProbe {
                 import_ok: true,
                 root_path: Some(sdk_root.clone()),
@@ -20361,7 +20361,7 @@ VERSION_ID="41"
             runtime_key: runtime_key.to_owned(),
             runtime_id: runtime_id.to_owned(),
             channel: "release".to_owned(),
-            format: "pip".to_owned(),
+            format: "wheel".to_owned(),
             family: family.to_owned(),
             family_source: "test".to_owned(),
             version: version.to_owned(),

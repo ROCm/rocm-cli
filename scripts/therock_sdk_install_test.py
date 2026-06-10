@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Opt-in acceptance test for managed TheRock SDK pip installs.
+"""Opt-in acceptance test for managed TheRock SDK wheel installs.
 
 This test creates an isolated rocm-cli state root, creates a local bootstrap
-Python venv, runs `rocm install sdk --format pip`, and verifies the installed
+Python venv, runs `rocm install sdk --format wheel`, and verifies the installed
 TheRock SDK venv with `python -m rocm_sdk` commands.
 
 It downloads TheRock wheels and can take a while, so it is not part of the
@@ -257,7 +257,7 @@ def verify_manifest(
     manifest: dict[str, Any],
     expected_pip_cache_dir: Path,
 ) -> tuple[Path, Path, Path, Path]:
-    if manifest.get("format") != "pip":
+    if manifest.get("format") != "wheel"":
         fail(f"expected pip runtime manifest, got: {manifest.get('format')}")
     python = Path(str(manifest.get("python_executable") or ""))
     if not python.is_file():
@@ -429,7 +429,7 @@ def main() -> int:
     doctor = run("rocm doctor before SDK install", [str(rocm), "doctor"], env=env, timeout=120)
     assert_contains(doctor, "rocm doctor", "doctor")
 
-    install_argv = [str(rocm), "install", "sdk", "--channel", args.channel, "--format", "pip"]
+    install_argv = [str(rocm), "install", "sdk", "--channel", args.channel, "--format", "wheel"]
     if args.prefix is not None:
         install_argv.extend(["--prefix", str(args.prefix)])
     if args.dry_run:
@@ -446,7 +446,7 @@ def main() -> int:
         "summary: rocm-cli will install the ROCm SDK and matching PyTorch packages",
         "sdk install",
     )
-    assert_contains(install_output, "format: pip", "sdk install")
+    assert_contains(install_output, "format: wheel", "sdk install")
     assert_contains(install_output, "pip_cache_dir:", "sdk install")
     assert_contains(install_output, "latest_compatible_version:", "sdk install")
     assert_contains(install_output, "python_wheel_tag:", "sdk install")
