@@ -17,4 +17,4 @@ rocm-core = { path = "../../crates/rocm-core" }
 rocm-engine-protocol = { path = "../../crates/rocm-engine-protocol" }
 serde.workspace = true
 serde_json.workspace = true
-ureq = { version = "2.12", features = ["json"] }
+ureq = { version = "2.12", features = ["json", "native-certs"] }
