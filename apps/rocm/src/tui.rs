@@ -14459,33 +14459,20 @@ fn onboarding_install_current_step(app: &App) -> String {
     if lower.contains("checking therock") || lower.contains("found therock package") {
         "Checking ROCm packages...".to_owned()
     } else if lower.contains("checking python for")
-        || lower.contains("checking managed python package metadata")
-        || lower.contains("checking python package metadata")
         || lower.contains("using python from")
-        || lower.contains("using existing managed python")
         || lower.contains("using existing python")
-        || lower.contains("using downloaded python package")
-        || lower.contains("using downloaded python")
-        || lower.contains("managed python is ready")
-        || lower.contains("python 3.12.10 is ready")
+        || lower.contains("python") && lower.contains("is ready at")
+        || lower.contains("finding python")
+        || lower.contains("preparing python")
     {
         "Checking Python...".to_owned()
-    } else if lower.contains("downloading python package")
-        || lower.contains("downloading python 3.12.10 package")
-    {
-        "Downloading Python...".to_owned()
-    } else if lower.contains("installing managed python")
-        || lower.contains("installing python 3.12.10")
-        || lower.contains("extracting managed python")
-    {
+    } else if lower.contains("installing python") && lower.contains("via uv") {
         "Installing Python...".to_owned()
     } else if lower.contains("creating virtual environment")
         || lower.contains("creating python environment")
         || lower.contains("-m venv")
     {
         "Setting up Python...".to_owned()
-    } else if lower.contains("installing pip") {
-        "Preparing the installer...".to_owned()
     } else if lower.contains("collecting") || lower.contains("looking in indexes") {
         "Finding ROCm and PyTorch packages...".to_owned()
     } else if lower.contains("downloading") {
@@ -37744,31 +37731,20 @@ Full log
                 "Checking Python for the ROCm install...",
                 "Checking Python...",
             ),
-            ("Checking Python package metadata...", "Checking Python..."),
+            ("Preparing Python 3.12...", "Checking Python..."),
             (
-                "Using existing Python 3.12.10 at C:\\Users\\jam\\.rocm\\tools\\python\\python.exe.",
+                "Using existing Python 3.12 at C:\\Users\\jam\\.rocm\\tools\\python\\python.exe.",
                 "Checking Python...",
             ),
             (
-                "Using downloaded Python 3.12.10 package C:\\Users\\jam\\.rocm\\cache\\tools\\python\\cpython.tar.gz.",
+                "Python 3.12 is ready at C:\\Users\\jam\\.rocm\\tools\\python\\python.exe.",
                 "Checking Python...",
             ),
-            (
-                "Python 3.12.10 is ready at C:\\Users\\jam\\.rocm\\tools\\python\\python.exe.",
-                "Checking Python...",
-            ),
-            (
-                "Downloading Python 3.12.10 package cpython-3.12.10.tar.gz.",
-                "Downloading Python...",
-            ),
-            ("Installing Python 3.12.10...", "Installing Python..."),
+            ("Finding Python 3.12...", "Checking Python..."),
+            ("Installing Python 3.12 via uv...", "Installing Python..."),
             (
                 "Creating Python environment at C:\\Users\\jam\\.rocm\\envs\\default.",
                 "Setting up Python...",
-            ),
-            (
-                "Installing pip in the Python environment...",
-                "Preparing the installer...",
             ),
             (
                 "Installing rocm[libraries,devel]==7.13.0a20260513 torch==2.10.0+rocm7.13.0a20260513 torchvision==0.25.0+rocm7.13.0a20260513 torchaudio==2.10.0+rocm7.13.0a20260513 from https://rocm.nightlies.amd.com/v2/gfx120X-all",

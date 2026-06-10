@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, bail};
-use flate2::read::GzDecoder;
 use rocm_core::{
     AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_gpu_diagnostics,
     detect_host_therock_family, detect_managed_therock_family, ensure_uv_binary,
@@ -20,9 +19,7 @@ use std::time::Duration;
 const THEROCK_PIP_INDEX_BASE: &str = "https://rocm.nightlies.amd.com/v2";
 const THEROCK_RELEASE_TARBALL_BASE: &str = "https://repo.amd.com/rocm/tarball/";
 const THEROCK_NIGHTLY_TARBALL_BASE: &str = "https://rocm.nightlies.amd.com/tarball/";
-const PYTHON_BUILD_STANDALONE_DEFAULT_RELEASE_URL: &str =
-    "https://api.github.com/repos/astral-sh/python-build-standalone/releases/tags/20250409";
-const DEFAULT_MANAGED_PYTHON_VERSION: &str = "3.12.10";
+const DEFAULT_MANAGED_PYTHON_VERSION: &str = "3.12";
 const STARTUP_UPDATE_CHECK_INTERVAL_MS: u128 = 12 * 60 * 60 * 1_000;
 const STARTUP_UPDATE_CHECK_TIMEOUT_SECS: u64 = 2;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,23 +174,8 @@ struct PythonLauncher {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManagedPythonManifest {
     executable: PathBuf,
-    source_url: String,
-    release_tag: String,
-    asset_name: String,
     version: String,
     installed_at_unix_ms: u128,
-}
-
-#[derive(Debug, Deserialize)]
-struct PythonStandaloneRelease {
-    tag_name: String,
-    assets: Vec<PythonStandaloneAsset>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct PythonStandaloneAsset {
-    name: String,
-    browser_download_url: String,
 }
 
 #[derive(Debug)]
@@ -3019,168 +3001,6 @@ fn managed_python_bootstrap_disabled() -> bool {
         .unwrap_or(false)
 }
 
-fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
-    progress_line(format!("Preparing Python {}...", managed_python_version()));
-    progress_line("Checking Python package metadata...");
-    let release = fetch_python_standalone_release()?;
-    let asset = select_python_standalone_asset(&release)?;
-    let platform = python_standalone_platform_triple()?;
-    let install_dir = managed_tools_root(paths)
-        .join("python")
-        .join(slugify(&format!("{}-{platform}", release.tag_name)));
-    if let Some(executable) = find_python_executable(&install_dir) {
-        if python_launcher_install_ready(&executable).is_ok() {
-            progress_line(format!(
-                "Using existing Python {} at {}.",
-                managed_python_version(),
-                executable.display()
-            ));
-            let manifest = ManagedPythonManifest {
-                executable: executable.clone(),
-                source_url: asset.browser_download_url.clone(),
-                release_tag: release.tag_name.clone(),
-                asset_name: asset.name.clone(),
-                version: managed_python_version(),
-                installed_at_unix_ms: unix_time_millis(),
-            };
-            save_managed_python_manifest(paths, &manifest)?;
-            let _ = record_managed_python_config(paths, &executable);
-            return Ok(PythonLauncher {
-                executable,
-                source: "managed",
-            });
-        }
-        progress_line(format!(
-            "Existing managed Python at {} cannot create a pip-ready environment; reinstalling Python {}.",
-            executable.display(),
-            managed_python_version()
-        ));
-        let _ = fs::remove_dir_all(&install_dir);
-    }
-
-    let archive_path = paths
-        .cache_dir
-        .join("tools")
-        .join("python")
-        .join(&release.tag_name)
-        .join(&asset.name);
-    if !archive_path.is_file() {
-        progress_line(format!(
-            "Downloading Python {} package {}.",
-            managed_python_version(),
-            asset.name
-        ));
-        download_file(&asset.browser_download_url, &archive_path)
-            .with_context(|| format!("failed to download managed Python {}", asset.name))?;
-    } else {
-        progress_line(format!(
-            "Using downloaded Python {} package {}.",
-            managed_python_version(),
-            archive_path.display()
-        ));
-    }
-    progress_line(format!("Installing Python {}...", managed_python_version()));
-    extract_managed_python_archive(&archive_path, &install_dir)?;
-    let executable = find_python_executable(&install_dir).with_context(|| {
-        format!(
-            "Python package did not contain a Python executable under {}",
-            install_dir.display()
-        )
-    })?;
-    progress_line(format!("Checking Python {}...", managed_python_version()));
-    python_launcher_install_ready(&executable).with_context(|| {
-        format!(
-            "Python {} could not create a pip-ready virtual environment after extraction: {}",
-            managed_python_version(),
-            executable.display()
-        )
-    })?;
-    let manifest = ManagedPythonManifest {
-        executable: executable.clone(),
-        source_url: asset.browser_download_url.clone(),
-        release_tag: release.tag_name.clone(),
-        asset_name: asset.name.clone(),
-        version: managed_python_version(),
-        installed_at_unix_ms: unix_time_millis(),
-    };
-    save_managed_python_manifest(paths, &manifest)?;
-    let _ = record_managed_python_config(paths, &executable);
-    progress_line(format!(
-        "Python {} is ready at {}.",
-        managed_python_version(),
-        executable.display()
-    ));
-    Ok(PythonLauncher {
-        executable,
-        source: "managed",
-    })
-}
-
-fn fetch_python_standalone_release() -> Result<PythonStandaloneRelease> {
-    let url = std::env::var("ROCM_CLI_MANAGED_PYTHON_RELEASE_JSON_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| PYTHON_BUILD_STANDALONE_DEFAULT_RELEASE_URL.to_owned());
-    let response = http_get(&url, &[], Some(60))?;
-    if response.status != 200 {
-        bail!(
-            "HTTP {} while fetching managed Python release metadata",
-            response.status
-        );
-    }
-    serde_json::from_slice(&response.body)
-        .context("failed to parse managed Python release metadata")
-}
-
-fn select_python_standalone_asset(
-    release: &PythonStandaloneRelease,
-) -> Result<PythonStandaloneAsset> {
-    if let Some(url) = std::env::var("ROCM_CLI_MANAGED_PYTHON_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    {
-        return Ok(release
-            .assets
-            .iter()
-            .find(|asset| asset.browser_download_url == url || asset.name == url)
-            .cloned()
-            .unwrap_or_else(|| PythonStandaloneAsset {
-                name: url
-                    .rsplit('/')
-                    .next()
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or("managed-python.tar.gz")
-                    .to_owned(),
-                browser_download_url: url,
-            }));
-    }
-    let platform = python_standalone_platform_triple()?;
-    let version_prefix = managed_python_asset_version_prefix();
-    let exact_suffix = "-install_only.tar.gz";
-    release
-        .assets
-        .iter()
-        .find(|asset| {
-            asset.name.starts_with(&version_prefix)
-                && asset.name.contains(platform)
-                && asset.name.ends_with(exact_suffix)
-        })
-        .or_else(|| {
-            release.assets.iter().find(|asset| {
-                asset.name.starts_with(&version_prefix)
-                    && asset.name.contains(platform)
-                    && asset.name.ends_with("-install_only_stripped.tar.gz")
-            })
-        })
-        .cloned()
-        .with_context(|| {
-            format!(
-                "no python-build-standalone asset found for CPython {} on {platform}; set ROCM_CLI_MANAGED_PYTHON_VERSION or ROCM_CLI_PYTHON",
-                managed_python_version()
-            )
-        })
-}
-
 fn managed_python_version() -> String {
     std::env::var("ROCM_CLI_MANAGED_PYTHON_VERSION")
         .ok()
@@ -3188,98 +3008,87 @@ fn managed_python_version() -> String {
         .unwrap_or_else(|| DEFAULT_MANAGED_PYTHON_VERSION.to_owned())
 }
 
-fn managed_python_asset_version_prefix() -> String {
-    let value = managed_python_version();
-    if value.matches('.').count() >= 2 {
-        format!("cpython-{value}+")
-    } else {
-        format!("cpython-{value}.")
-    }
-}
+fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
+    let version = managed_python_version();
+    progress_line(format!("Preparing Python {version}..."));
 
-fn python_standalone_platform_triple() -> Result<&'static str> {
-    match (runtime_os_name(), std::env::consts::ARCH) {
-        ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
-        ("linux", "x86_64") => Ok("x86_64-unknown-linux-gnu"),
-        ("linux", "aarch64") => Ok("aarch64-unknown-linux-gnu"),
-        ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
-        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
-        (os, arch) => bail!("managed Python bootstrap is not available for {os}/{arch}"),
-    }
-}
+    let uv = ensure_uv_binary(paths)?;
 
-fn extract_managed_python_archive(archive_path: &Path, install_dir: &Path) -> Result<()> {
-    let parent = install_dir
-        .parent()
-        .context("managed Python install dir has no parent directory")?;
-    fs::create_dir_all(parent)?;
-    let temp_dir = install_dir.with_extension(format!("tmp-{}", unix_time_millis()));
-    let _ = fs::remove_dir_all(&temp_dir);
-    fs::create_dir_all(&temp_dir)?;
-    let archive = fs::File::open(archive_path)
-        .with_context(|| format!("failed to open {}", archive_path.display()))?;
-    let decoder = GzDecoder::new(archive);
-    let mut archive = tar::Archive::new(decoder);
-    archive
-        .unpack(&temp_dir)
-        .with_context(|| format!("failed to extract {}", archive_path.display()))?;
-    let _ = fs::remove_dir_all(install_dir);
-    fs::rename(&temp_dir, install_dir).or_else(|_| {
-        let _ = fs::remove_dir_all(install_dir);
-        fs::rename(&temp_dir, install_dir)
+    // Check the manifest first — if the recorded executable is still usable, skip the install.
+    if let Ok(Some(manifest)) = load_managed_python_manifest(paths) {
+        if manifest.version == version && manifest.executable.is_file()
+            && python_launcher_install_ready(&manifest.executable).is_ok()
+        {
+            progress_line(format!(
+                "Using existing Python {version} at {}.",
+                manifest.executable.display()
+            ));
+            let _ = record_managed_python_config(paths, &manifest.executable);
+            return Ok(PythonLauncher {
+                executable: manifest.executable,
+                source: "managed",
+            });
+        }
+    }
+
+    progress_line(format!("Installing Python {version} via uv..."));
+    let status = Command::new(&uv)
+        .args(["python", "install", &version])
+        .envs(uv_command_env())
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("failed to launch uv python install")?;
+    if !status.success() {
+        bail!("uv python install {version} failed with {status}");
+    }
+
+    progress_line(format!("Finding Python {version}..."));
+    let output = Command::new(&uv)
+        .args(["python", "find", &version])
+        .envs(uv_command_env())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .context("failed to launch uv python find")?;
+    if !output.status.success() {
+        bail!("uv python find {version} failed after install");
+    }
+    let executable = PathBuf::from(
+        String::from_utf8(output.stdout)
+            .context("uv python find output was not valid UTF-8")?
+            .trim(),
+    );
+    if !executable.is_file() {
+        bail!(
+            "uv python find returned a path that does not exist: {}",
+            executable.display()
+        );
+    }
+
+    python_launcher_install_ready(&executable).with_context(|| {
+        format!(
+            "Python {version} at {} could not create a virtual environment",
+            executable.display()
+        )
     })?;
-    Ok(())
-}
 
-fn find_python_executable(root: &Path) -> Option<PathBuf> {
-    let candidates = if runtime_is_windows() {
-        vec![
-            root.join("python").join("python.exe"),
-            root.join("python.exe"),
-        ]
-    } else {
-        vec![
-            root.join("python").join("bin").join("python3"),
-            root.join("python").join("bin").join("python"),
-            root.join("bin").join("python3"),
-            root.join("bin").join("python"),
-        ]
+    let manifest = ManagedPythonManifest {
+        executable: executable.clone(),
+        version: version.clone(),
+        installed_at_unix_ms: unix_time_millis(),
     };
-    candidates
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-        .or_else(|| find_python_executable_recursive(root, 0))
+    save_managed_python_manifest(paths, &manifest)?;
+    let _ = record_managed_python_config(paths, &executable);
+    progress_line(format!("Python {version} is ready at {}.", executable.display()));
+    Ok(PythonLauncher {
+        executable,
+        source: "managed",
+    })
 }
 
-fn find_python_executable_recursive(root: &Path, depth: usize) -> Option<PathBuf> {
-    if depth > 4 {
-        return None;
-    }
-    let entries = fs::read_dir(root).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file()
-            && path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .is_some_and(|name| {
-                    if runtime_is_windows() {
-                        name.eq_ignore_ascii_case("python.exe")
-                    } else {
-                        name == "python" || name == "python3"
-                    }
-                })
-        {
-            return Some(path);
-        }
-        if path.is_dir()
-            && let Some(found) = find_python_executable_recursive(&path, depth + 1)
-        {
-            return Some(found);
-        }
-    }
-    None
-}
 
 fn resolve_python_launcher(paths: &AppPaths) -> Result<PythonLauncher> {
     if let Ok(value) = std::env::var("ROCM_CLI_PYTHON") {
@@ -3307,7 +3116,7 @@ fn resolve_python_launcher(paths: &AppPaths) -> Result<PythonLauncher> {
     }
     if skipped_path_python {
         progress_line(
-            "Python from PATH cannot create a pip-ready virtual environment; using ROCm CLI's managed Python.",
+            "Python from PATH cannot create a virtual environment; using ROCm CLI's managed Python.",
         );
     }
 
@@ -3321,7 +3130,7 @@ fn resolve_python_launcher(paths: &AppPaths) -> Result<PythonLauncher> {
             });
         }
         progress_line(
-            "Saved managed Python cannot create a pip-ready virtual environment; preparing Python again.",
+            "Saved managed Python cannot create a virtual environment; preparing Python again.",
         );
     }
 
@@ -3826,40 +3635,8 @@ mod tests {
     }
 
     #[test]
-    fn managed_python_asset_selector_prefers_install_only_for_host_platform() -> Result<()> {
-        let platform = python_standalone_platform_triple()?;
-        let release = PythonStandaloneRelease {
-            tag_name: "20250409".to_owned(),
-            assets: vec![
-                PythonStandaloneAsset {
-                    name: format!(
-                        "cpython-3.12.10+20250409-{platform}-install_only_stripped.tar.gz"
-                    ),
-                    browser_download_url: "https://example.invalid/stripped.tar.gz".to_owned(),
-                },
-                PythonStandaloneAsset {
-                    name: format!("cpython-3.12.10+20250409-{platform}-install_only.tar.gz"),
-                    browser_download_url: "https://example.invalid/install.tar.gz".to_owned(),
-                },
-            ],
-        };
-
-        let asset = select_python_standalone_asset(&release)?;
-
-        assert_eq!(
-            asset.browser_download_url,
-            "https://example.invalid/install.tar.gz"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn managed_python_defaults_target_pinned_31210_release() {
-        assert_eq!(DEFAULT_MANAGED_PYTHON_VERSION, "3.12.10");
-        assert_eq!(
-            PYTHON_BUILD_STANDALONE_DEFAULT_RELEASE_URL,
-            "https://api.github.com/repos/astral-sh/python-build-standalone/releases/tags/20250409"
-        );
+    fn managed_python_defaults_to_312() {
+        assert_eq!(DEFAULT_MANAGED_PYTHON_VERSION, "3.12");
     }
 
     #[test]
@@ -3871,10 +3648,7 @@ mod tests {
                 .join("tools")
                 .join("python")
                 .join("python.exe"),
-            source_url: "https://example.invalid/python.tar.gz".to_owned(),
-            release_tag: "20260510".to_owned(),
-            asset_name: "python.tar.gz".to_owned(),
-            version: "3.12.10".to_owned(),
+            version: "3.12".to_owned(),
             installed_at_unix_ms: 123,
         };
 
@@ -3883,7 +3657,7 @@ mod tests {
 
         fs::remove_dir_all(root).ok();
         assert_eq!(loaded.executable, manifest.executable);
-        assert_eq!(loaded.release_tag, "20260510");
+        assert_eq!(loaded.version, "3.12");
         Ok(())
     }
 
@@ -3900,10 +3674,7 @@ mod tests {
         fs::write(&managed_python, "not used")?;
         let manifest = ManagedPythonManifest {
             executable: managed_python,
-            source_url: "https://example.invalid/python.tar.gz".to_owned(),
-            release_tag: "20260510".to_owned(),
-            asset_name: "python.tar.gz".to_owned(),
-            version: "3.12.10".to_owned(),
+            version: "3.12".to_owned(),
             installed_at_unix_ms: 123,
         };
         save_managed_python_manifest(&paths, &manifest)?;
@@ -4012,10 +3783,7 @@ mod tests {
         let managed_python = write_fake_python_with_venv(&managed_dir, "python")?;
         let manifest = ManagedPythonManifest {
             executable: managed_python.clone(),
-            source_url: "https://example.invalid/python.tar.gz".to_owned(),
-            release_tag: "20260510".to_owned(),
-            asset_name: "python.tar.gz".to_owned(),
-            version: "3.12.10".to_owned(),
+            version: "3.12".to_owned(),
             installed_at_unix_ms: 123,
         };
         save_managed_python_manifest(&paths, &manifest)?;
