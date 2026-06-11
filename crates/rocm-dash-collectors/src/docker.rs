@@ -11,9 +11,9 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use bollard::Docker;
 use bollard::container::{InspectContainerOptions, ListContainersOptions};
 use bollard::secret::ContainerInspectResponse;
-use bollard::Docker;
 use rocm_dash_core::traits::{CollectorError, DiscoveredService, Result, ServiceDiscovery};
 use tokio::time::timeout;
 use tracing::{debug, warn};
@@ -182,30 +182,31 @@ fn glob_match(s: &str, pat: &str) -> bool {
 pub(crate) fn parse_env(env: &[String]) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for entry in env {
-        if let Some(eq) = entry.find('=') {
-            if eq > 0 {
-                out.insert(entry[..eq].to_string(), entry[eq + 1..].to_string());
-            }
+        if let Some(eq) = entry.find('=')
+            && eq > 0
+        {
+            out.insert(entry[..eq].to_string(), entry[eq + 1..].to_string());
         }
     }
     out
 }
 
 pub(crate) fn extract_gpu_ids(env: &BTreeMap<String, String>) -> Vec<String> {
-    if let Some(v) = env.get("HIP_VISIBLE_DEVICES") {
-        if v != "all" && !v.is_empty() {
-            return split_csv(v);
-        }
+    if let Some(v) = env.get("HIP_VISIBLE_DEVICES")
+        && v != "all"
+        && !v.is_empty()
+    {
+        return split_csv(v);
     }
     for k in [
         "AMD_VISIBLE_DEVICES",
         "ROCR_VISIBLE_DEVICES",
         "CUDA_VISIBLE_DEVICES",
     ] {
-        if let Some(v) = env.get(k) {
-            if !v.is_empty() {
-                return split_csv(v);
-            }
+        if let Some(v) = env.get(k)
+            && !v.is_empty()
+        {
+            return split_csv(v);
         }
     }
     Vec::new()
@@ -221,10 +222,10 @@ fn split_csv(s: &str) -> Vec<String> {
 pub(crate) fn extract_tensor_parallel(cmd: &[String]) -> u32 {
     let pairs = [("--tensor-parallel-size", 1u32), ("-tp", 1)];
     for (flag, default) in pairs {
-        if let Some(i) = cmd.iter().position(|a| a == flag) {
-            if let Some(v) = cmd.get(i + 1) {
-                return v.parse().unwrap_or(default);
-            }
+        if let Some(i) = cmd.iter().position(|a| a == flag)
+            && let Some(v) = cmd.get(i + 1)
+        {
+            return v.parse().unwrap_or(default);
         }
     }
     1
@@ -305,10 +306,10 @@ fn extract_first_host_port(inspect: &ContainerInspectResponse) -> Option<u16> {
     let ports = inspect.network_settings.as_ref()?.ports.as_ref()?;
     for bindings in ports.values().flatten() {
         for b in bindings {
-            if let Some(host_port) = &b.host_port {
-                if let Ok(p) = host_port.parse() {
-                    return Some(p);
-                }
+            if let Some(host_port) = &b.host_port
+                && let Ok(p) = host_port.parse()
+            {
+                return Some(p);
             }
         }
     }

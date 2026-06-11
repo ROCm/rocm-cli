@@ -438,9 +438,11 @@ mod tests {
         );
         assert_eq!(linux.version, "10.6.0");
         assert_eq!(linux.server_bin, "lemond");
-        assert!(linux
-            .url
-            .starts_with("https://github.com/lemonade-sdk/lemonade/releases/download/v10.6.0/"));
+        assert!(
+            linux
+                .url
+                .starts_with("https://github.com/lemonade-sdk/lemonade/releases/download/v10.6.0/")
+        );
 
         let win = pick_embeddable_asset(RELEASE_FIXTURE, "windows", "x86_64").expect("windows");
         assert_eq!(

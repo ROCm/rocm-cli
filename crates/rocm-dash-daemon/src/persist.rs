@@ -10,7 +10,7 @@
 //! One file per session means each file is self-contained and trivially
 //! shareable / portable.
 
-use std::fs::{create_dir_all, File, OpenOptions};
+use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -76,13 +76,15 @@ mod tests {
         let dir = tmp_dir("new");
         let writer = SessionWriter::new(&dir).expect("create");
         assert!(writer.path().exists());
-        assert!(writer
-            .path()
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("session-"));
+        assert!(
+            writer
+                .path()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("session-")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

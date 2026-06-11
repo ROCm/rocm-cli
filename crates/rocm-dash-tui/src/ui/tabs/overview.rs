@@ -1,11 +1,11 @@
 //! Overview tab — the original 60/40 split layout. Preserved verbatim so
 //! switching tabs always lands back on the familiar view.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Frame;
 
 use crate::app::{AppState, ConnState};
 use crate::ui::core_bars::CoreBars;
@@ -103,14 +103,14 @@ fn draw_cpu(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .gradient(theme.ok, theme.warn, theme.err);
     f.render_widget(spark, split[0]);
 
-    if split.len() == 2 {
-        if let Some(s) = state.latest.as_ref() {
-            let bars = CoreBars::new(&s.host.cpu_per_core_pct)
-                .max(100.0)
-                .style(Style::default().fg(theme.ok))
-                .gradient(theme.ok, theme.warn, theme.err);
-            f.render_widget(bars, split[1]);
-        }
+    if split.len() == 2
+        && let Some(s) = state.latest.as_ref()
+    {
+        let bars = CoreBars::new(&s.host.cpu_per_core_pct)
+            .max(100.0)
+            .style(Style::default().fg(theme.ok))
+            .gradient(theme.ok, theme.warn, theme.err);
+        f.render_widget(bars, split[1]);
     }
 }
 

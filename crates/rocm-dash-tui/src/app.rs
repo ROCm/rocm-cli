@@ -10,11 +10,11 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use futures::StreamExt;
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use std::collections::HashMap;
 
 use rocm_dash_core::bench_schema::BenchmarkRow;
@@ -929,7 +929,7 @@ async fn detect_local_chat() -> Option<crate::llm::LlmConfig> {
 /// Uses [`default_config_path`] (a `--config` override is not honored by this
 /// in-TUI save; that's a documented limitation). All I/O lives here.
 fn persist_chat_endpoint(base_url: &str, model: &str) -> Result<std::path::PathBuf, String> {
-    use rocm_dash_core::config::{default_config_path, Config};
+    use rocm_dash_core::config::{Config, default_config_path};
     let path = default_config_path().ok_or_else(|| "no config path available".to_string())?;
     let cfg = Config::load(&path).unwrap_or_default();
     let next = config_with_chat(cfg, base_url, model);
@@ -1079,23 +1079,23 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
 /// is needed (last drawn areas, active tab, current modal).
 fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
     if let MouseEventKind::Down(MouseButton::Left) = me.kind {
-        if let Some(area) = state.last_tab_bar_area {
-            if let Some(tab) = tab_bar_hit(area, me.column, me.row) {
-                return KeyAction::SwitchTab(tab);
-            }
+        if let Some(area) = state.last_tab_bar_area
+            && let Some(tab) = tab_bar_hit(area, me.column, me.row)
+        {
+            return KeyAction::SwitchTab(tab);
         }
-        if state.modal == Modal::None {
-            if let Some(area) = state.last_body_area {
-                let action = match state.active_tab {
-                    ActiveTab::Instances => {
-                        ui::tabs::instances::hit_test(area, me.column, me.row, state)
-                    }
-                    ActiveTab::Bench => ui::tabs::bench::hit_test(area, me.column, me.row, state),
-                    _ => None,
-                };
-                if let Some(a) = action {
-                    return a;
+        if state.modal == Modal::None
+            && let Some(area) = state.last_body_area
+        {
+            let action = match state.active_tab {
+                ActiveTab::Instances => {
+                    ui::tabs::instances::hit_test(area, me.column, me.row, state)
                 }
+                ActiveTab::Bench => ui::tabs::bench::hit_test(area, me.column, me.row, state),
+                _ => None,
+            };
+            if let Some(a) = action {
+                return a;
             }
         }
         return KeyAction::Nothing;

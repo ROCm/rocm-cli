@@ -17,7 +17,7 @@ use std::time::Duration;
 use reqwest::Client;
 use rocm_dash_core::metrics::Instance;
 use rocm_dash_core::traits::{
-    merge_instance, CollectorError, DiscoveredService, InstanceSample, Result,
+    CollectorError, DiscoveredService, InstanceSample, Result, merge_instance,
 };
 use serde::Deserialize;
 

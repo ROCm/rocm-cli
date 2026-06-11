@@ -15,10 +15,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use clap::Parser;
+use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier};
-use ratatui::Terminal;
 use rocm_dash_core::persist::PersistedEntry;
 use rocm_dash_core::protocol::Event;
 use rocm_dash_tui::app::{ActiveTab, AppState, ConnState, Modal};

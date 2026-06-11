@@ -256,7 +256,7 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color {
 /// 16-color ANSI palettes. Hex values from each project's canonical source;
 /// the catalogue itself is inspired by <https://ansicolor.com/>.
 mod palettes {
-    use super::{rgb, Palette16};
+    use super::{Palette16, rgb};
 
     /// Solarized Dark — Ethan Schoonover, <https://ethanschoonover.com/solarized/>.
     pub const SOLARIZED_DARK: Palette16 = Palette16 {

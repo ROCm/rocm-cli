@@ -3,19 +3,19 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use rocm_dash_core::protocol::{Command, Event, PROTOCOL_VERSION};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
+use crate::DAEMON_VERSION;
 use crate::bench_ring::BenchRing;
 use crate::persist::SessionWriter;
 use crate::runner::{self, RunnerOptions};
 use crate::snapshot_ring::SnapshotRing;
 use crate::transport::{read_line, write_line};
-use crate::DAEMON_VERSION;
 
 /// Broadcast capacity. A slow client that lags more than this many ticks will
 /// receive `RecvError::Lagged` and skip ahead (no crash).

@@ -4,11 +4,11 @@
 //! module) or by `draw_help` here. This module owns the geometry and the
 //! Clear-then-block pattern so the underlying body shows through the gaps.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
-use ratatui::Frame;
 
 use crate::app::ActiveTab;
 use crate::ui::gradient::GradientGauge;

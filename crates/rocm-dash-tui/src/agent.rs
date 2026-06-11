@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
@@ -35,8 +35,7 @@ pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 const MAX_TOOL_TURNS: usize = 5;
 
 /// Default system preamble for the dashboard assistant.
-const DEFAULT_PREAMBLE: &str =
-    "You are the rocm-dash assistant, embedded in a terminal dashboard for AMD \
+const DEFAULT_PREAMBLE: &str = "You are the rocm-dash assistant, embedded in a terminal dashboard for AMD \
      Instinct GPU telemetry and benchmarks. Use the provided tools (gpu_status, \
      list_instances, bench_summary, tokens_per_watt) to answer questions about \
      live GPU, serving instance, and benchmark state. Prefer short, direct answers.";
@@ -830,9 +829,10 @@ mod tests {
             .await
             .expect("plan ok");
         let plan = out["plan"].as_array().unwrap();
-        assert!(plan
-            .iter()
-            .any(|l| l.as_str().unwrap().contains("lemonade-sdk")));
+        assert!(
+            plan.iter()
+                .any(|l| l.as_str().unwrap().contains("lemonade-sdk"))
+        );
         // Unknown skill → graceful error object, not a panic.
         let miss = plan_tool
             .call(SkillPlanArgs {

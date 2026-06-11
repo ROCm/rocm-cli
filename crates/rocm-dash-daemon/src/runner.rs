@@ -20,9 +20,9 @@ use rocm_dash_collectors::vllm_prom::VllmPrometheusCollector;
 use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo, Instance, InstanceStatus, Snapshot};
 use rocm_dash_core::protocol::Event;
 use rocm_dash_core::state::{State, StateEvent};
-use rocm_dash_core::traits::{merge_instance, BenchTailer, DiscoveredService, InstanceSample};
+use rocm_dash_core::traits::{BenchTailer, DiscoveredService, InstanceSample, merge_instance};
 use tokio::sync::broadcast;
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{MissedTickBehavior, interval};
 use tracing::{info, trace, warn};
 
 /// Refresh GPU system info (versions, partition modes) every N seconds.
@@ -194,98 +194,98 @@ pub async fn run_loop(
             }
         };
 
-        if gpu.is_some() && tick_count.saturating_sub(last_sysinfo_refresh) >= sysinfo_refresh_ticks
+        if gpu.is_some()
+            && tick_count.saturating_sub(last_sysinfo_refresh) >= sysinfo_refresh_ticks
+            && let Some(g) = &gpu
         {
-            if let Some(g) = &gpu {
-                gpu_system_info = Some(g.system_info().await);
-                last_sysinfo_refresh = tick_count;
-            }
+            gpu_system_info = Some(g.system_info().await);
+            last_sysinfo_refresh = tick_count;
         }
 
         // Service discovery — every DISCOVERY_TICKS ticks, diff vs known set,
         // emit Discovered/Gone events, and update reducer state.
-        if let Some(d) = docker.as_ref() {
-            if tick_count == 1 || tick_count % discovery_ticks == 0 {
-                match d.discover_async().await {
-                    Ok(svcs) => {
-                        let seen: HashSet<String> =
-                            svcs.iter().map(|s| s.container_id.clone()).collect();
-                        for svc in &svcs {
-                            let inst = instance_from_discovered(svc);
-                            runner
-                                .state
-                                .apply(StateEvent::InstanceUpserted(inst.clone()));
-                            if !known_instances.contains(&svc.container_id) {
-                                info!(
-                                    id = %svc.container_id,
-                                    name = %svc.container_name,
-                                    model = %svc.model_name,
-                                    "instance discovered"
-                                );
-                                broadcast_and_persist(
-                                    &tx,
-                                    persist.as_ref(),
-                                    Event::InstanceDiscovered(inst),
-                                );
-                            }
-                        }
-                        for gone in known_instances.difference(&seen) {
-                            info!(id = %gone, "instance gone");
-                            prev_gen_tokens.remove(gone);
-                            runner
-                                .state
-                                .apply(StateEvent::InstanceRemoved(gone.clone()));
-                            broadcast_and_persist(
-                                &tx,
-                                persist.as_ref(),
-                                Event::InstanceGone {
-                                    container_id: gone.clone(),
-                                },
-                            );
-                        }
-                        known_instances = seen;
-                    }
-                    Err(e) => warnings.push(format!("docker discover: {e}")),
-                }
-            }
-        }
-
-        // Lemonade discovery — probe the endpoint on the discovery cadence; add a
-        // Lemonade Instance when reachable, emit Gone when it disappears, and stay
-        // a clean no-op (no warning/panic) when no endpoint is configured.
-        if let Some(l) = lemonade.as_ref() {
-            if tick_count == 1 || tick_count % discovery_ticks == 0 {
-                match l.discover().await {
-                    Some(svc) => {
-                        let inst = instance_from_discovered(&svc);
+        if let Some(d) = docker.as_ref()
+            && (tick_count == 1 || tick_count.is_multiple_of(discovery_ticks))
+        {
+            match d.discover_async().await {
+                Ok(svcs) => {
+                    let seen: HashSet<String> =
+                        svcs.iter().map(|s| s.container_id.clone()).collect();
+                    for svc in &svcs {
+                        let inst = instance_from_discovered(svc);
                         runner
                             .state
                             .apply(StateEvent::InstanceUpserted(inst.clone()));
-                        if lemonade_id.as_deref() != Some(svc.container_id.as_str()) {
+                        if !known_instances.contains(&svc.container_id) {
                             info!(
                                 id = %svc.container_id,
+                                name = %svc.container_name,
                                 model = %svc.model_name,
-                                "lemonade instance discovered"
+                                "instance discovered"
                             );
                             broadcast_and_persist(
                                 &tx,
                                 persist.as_ref(),
                                 Event::InstanceDiscovered(inst),
                             );
-                            lemonade_id = Some(svc.container_id.clone());
                         }
                     }
-                    None => {
-                        if let Some(id) = lemonade_id.take() {
-                            info!(id = %id, "lemonade instance gone");
-                            prev_gen_tokens.remove(&id);
-                            runner.state.apply(StateEvent::InstanceRemoved(id.clone()));
-                            broadcast_and_persist(
-                                &tx,
-                                persist.as_ref(),
-                                Event::InstanceGone { container_id: id },
-                            );
-                        }
+                    for gone in known_instances.difference(&seen) {
+                        info!(id = %gone, "instance gone");
+                        prev_gen_tokens.remove(gone);
+                        runner
+                            .state
+                            .apply(StateEvent::InstanceRemoved(gone.clone()));
+                        broadcast_and_persist(
+                            &tx,
+                            persist.as_ref(),
+                            Event::InstanceGone {
+                                container_id: gone.clone(),
+                            },
+                        );
+                    }
+                    known_instances = seen;
+                }
+                Err(e) => warnings.push(format!("docker discover: {e}")),
+            }
+        }
+
+        // Lemonade discovery — probe the endpoint on the discovery cadence; add a
+        // Lemonade Instance when reachable, emit Gone when it disappears, and stay
+        // a clean no-op (no warning/panic) when no endpoint is configured.
+        if let Some(l) = lemonade.as_ref()
+            && (tick_count == 1 || tick_count.is_multiple_of(discovery_ticks))
+        {
+            match l.discover().await {
+                Some(svc) => {
+                    let inst = instance_from_discovered(&svc);
+                    runner
+                        .state
+                        .apply(StateEvent::InstanceUpserted(inst.clone()));
+                    if lemonade_id.as_deref() != Some(svc.container_id.as_str()) {
+                        info!(
+                            id = %svc.container_id,
+                            model = %svc.model_name,
+                            "lemonade instance discovered"
+                        );
+                        broadcast_and_persist(
+                            &tx,
+                            persist.as_ref(),
+                            Event::InstanceDiscovered(inst),
+                        );
+                        lemonade_id = Some(svc.container_id.clone());
+                    }
+                }
+                None => {
+                    if let Some(id) = lemonade_id.take() {
+                        info!(id = %id, "lemonade instance gone");
+                        prev_gen_tokens.remove(&id);
+                        runner.state.apply(StateEvent::InstanceRemoved(id.clone()));
+                        broadcast_and_persist(
+                            &tx,
+                            persist.as_ref(),
+                            Event::InstanceGone { container_id: id },
+                        );
                     }
                 }
             }
@@ -294,93 +294,94 @@ pub async fn run_loop(
         // Per-instance vLLM metric scrape, parallel, on its own cadence. The
         // Lemonade instance (if any) is scraped via its own collector below, so
         // exclude it from the vLLM Prometheus targets.
-        if let Some(prom) = vllm.as_ref() {
-            if !runner.state.instances.is_empty() && tick_count % instance_ticks == 0 {
-                let targets: Vec<(String, u16)> = runner
-                    .state
-                    .instances
-                    .values()
-                    .filter(|i| Some(i.container_id.as_str()) != lemonade_id.as_deref())
-                    .filter_map(|i| i.port.map(|p| (i.container_id.clone(), p)))
-                    .collect();
+        if let Some(prom) = vllm.as_ref()
+            && !runner.state.instances.is_empty()
+            && tick_count.is_multiple_of(instance_ticks)
+        {
+            let targets: Vec<(String, u16)> = runner
+                .state
+                .instances
+                .values()
+                .filter(|i| Some(i.container_id.as_str()) != lemonade_id.as_deref())
+                .filter_map(|i| i.port.map(|p| (i.container_id.clone(), p)))
+                .collect();
+            let prom = prom.clone();
+            let results = parallel_scrape(targets, move |(id, port)| {
                 let prom = prom.clone();
-                let results = parallel_scrape(targets, move |(id, port)| {
-                    let prom = prom.clone();
-                    async move {
-                        let svc = DiscoveredService {
-                            container_id: id.clone(),
-                            port: Some(port),
-                            ..Default::default()
-                        };
-                        prom.fetch_async(&svc).await
-                    }
-                })
-                .await;
-                let mut fail_count: usize = 0;
-                let mut last_err: Option<String> = None;
-                for ((id, _port), fetch) in results {
-                    match fetch {
-                        Ok(sample) => {
-                            // Difference the cumulative token counter into a live
-                            // rate; first reading (or a restart) yields None.
-                            let gen_tps = sample.gen_tokens_total.and_then(|cur| {
-                                let now = Utc::now();
-                                let prev = prev_gen_tokens.insert(id.clone(), (cur, now));
-                                gen_tps_from_delta(prev, cur, now)
-                            });
-                            if let Some(mut inst) = runner.state.instances.get(&id).cloned() {
-                                inst.kv_cache_usage_pct = sample.kv_cache_usage_pct;
-                                inst.running_reqs = sample.running_reqs;
-                                inst.waiting_reqs = sample.waiting_reqs;
-                                inst.gen_tps = gen_tps;
-                                runner.state.apply(StateEvent::InstanceUpserted(inst));
-                            }
+                async move {
+                    let svc = DiscoveredService {
+                        container_id: id.clone(),
+                        port: Some(port),
+                        ..Default::default()
+                    };
+                    prom.fetch_async(&svc).await
+                }
+            })
+            .await;
+            let mut fail_count: usize = 0;
+            let mut last_err: Option<String> = None;
+            for ((id, _port), fetch) in results {
+                match fetch {
+                    Ok(sample) => {
+                        // Difference the cumulative token counter into a live
+                        // rate; first reading (or a restart) yields None.
+                        let gen_tps = sample.gen_tokens_total.and_then(|cur| {
+                            let now = Utc::now();
+                            let prev = prev_gen_tokens.insert(id.clone(), (cur, now));
+                            gen_tps_from_delta(prev, cur, now)
+                        });
+                        if let Some(mut inst) = runner.state.instances.get(&id).cloned() {
+                            inst.kv_cache_usage_pct = sample.kv_cache_usage_pct;
+                            inst.running_reqs = sample.running_reqs;
+                            inst.waiting_reqs = sample.waiting_reqs;
+                            inst.gen_tps = gen_tps;
+                            runner.state.apply(StateEvent::InstanceUpserted(inst));
                         }
-                        Err(e) => {
-                            fail_count += 1;
-                            let msg = format!("{e}");
-                            trace!(id = %id, error = %msg, "vllm scrape failed");
-                            last_err = Some(msg);
-                            // Don't let a dead instance show a frozen rate: clear
-                            // throughput and drop the baseline so recovery re-bases.
-                            prev_gen_tokens.remove(&id);
-                            if let Some(mut inst) = runner.state.instances.get(&id).cloned() {
-                                if inst.gen_tps.is_some() {
-                                    inst.gen_tps = None;
-                                    runner.state.apply(StateEvent::InstanceUpserted(inst));
-                                }
-                            }
+                    }
+                    Err(e) => {
+                        fail_count += 1;
+                        let msg = format!("{e}");
+                        trace!(id = %id, error = %msg, "vllm scrape failed");
+                        last_err = Some(msg);
+                        // Don't let a dead instance show a frozen rate: clear
+                        // throughput and drop the baseline so recovery re-bases.
+                        prev_gen_tokens.remove(&id);
+                        if let Some(mut inst) = runner.state.instances.get(&id).cloned()
+                            && inst.gen_tps.is_some()
+                        {
+                            inst.gen_tps = None;
+                            runner.state.apply(StateEvent::InstanceUpserted(inst));
                         }
                     }
                 }
-                if fail_count > 0 {
-                    warnings.push(match last_err {
-                        Some(e) => format!("vllm scrape: {fail_count} failed (last: {e})"),
-                        None => format!("vllm scrape: {fail_count} failed"),
-                    });
-                }
+            }
+            if fail_count > 0 {
+                warnings.push(match last_err {
+                    Some(e) => format!("vllm scrape: {fail_count} failed (last: {e})"),
+                    None => format!("vllm scrape: {fail_count} failed"),
+                });
             }
         }
 
         // Lemonade per-instance scrape — reports an instantaneous rate directly
         // (`gen_tps`), so no counter-differencing. A scrape failure leaves the
         // last-known fields and warns; it never panics.
-        if let (Some(l), Some(id)) = (lemonade.as_ref(), lemonade_id.clone()) {
-            if tick_count % instance_ticks == 0 {
-                match l.fetch_stats().await {
-                    Ok(sample) => {
-                        if let Some(mut inst) = runner.state.instances.get(&id).cloned() {
-                            inst.gen_tps = sample.gen_tps;
-                            inst.kv_cache_usage_pct = sample.kv_cache_usage_pct;
-                            inst.running_reqs = sample.running_reqs;
-                            inst.waiting_reqs = sample.waiting_reqs;
-                            runner.state.apply(StateEvent::InstanceUpserted(inst));
-                        }
+        if let (Some(l), Some(id)) = (lemonade.as_ref(), lemonade_id.clone())
+            && tick_count.is_multiple_of(instance_ticks)
+        {
+            match l.fetch_stats().await {
+                Ok(sample) => {
+                    if let Some(mut inst) = runner.state.instances.get(&id).cloned() {
+                        inst.gen_tps = sample.gen_tps;
+                        inst.kv_cache_usage_pct = sample.kv_cache_usage_pct;
+                        inst.running_reqs = sample.running_reqs;
+                        inst.waiting_reqs = sample.waiting_reqs;
+                        runner.state.apply(StateEvent::InstanceUpserted(inst));
                     }
-                    Err(e) => {
-                        trace!(id = %id, error = %e, "lemonade scrape failed");
-                        warnings.push(format!("lemonade scrape: {e}"));
-                    }
+                }
+                Err(e) => {
+                    trace!(id = %id, error = %e, "lemonade scrape failed");
+                    warnings.push(format!("lemonade scrape: {e}"));
                 }
             }
         }
@@ -391,20 +392,21 @@ pub async fn run_loop(
         // the device-summed fallback still applies. `procs_nonempty` gates the
         // fallback warning so we only warn on a real (non-empty) scrape.
         let mut procs_nonempty = false;
-        if let Some(g) = &gpu {
-            if !runner.state.instances.is_empty() && tick_count % instance_ticks == 0 {
-                match g.processes().await {
-                    Ok(procs) => {
-                        procs_nonempty = !procs.is_empty();
-                        per_container_used = rocm_dash_core::vram::aggregate_process_vram(
-                            &procs,
-                            rocm_dash_collectors::cgroup::container_id_for_pid,
-                        );
-                    }
-                    Err(e) => {
-                        // Keep the last-known map; device fallback covers the gap.
-                        trace!(error = %e, "amd-smi process scrape failed");
-                    }
+        if let Some(g) = &gpu
+            && !runner.state.instances.is_empty()
+            && tick_count.is_multiple_of(instance_ticks)
+        {
+            match g.processes().await {
+                Ok(procs) => {
+                    procs_nonempty = !procs.is_empty();
+                    per_container_used = rocm_dash_core::vram::aggregate_process_vram(
+                        &procs,
+                        rocm_dash_collectors::cgroup::container_id_for_pid,
+                    );
+                }
+                Err(e) => {
+                    // Keep the last-known map; device fallback covers the gap.
+                    trace!(error = %e, "amd-smi process scrape failed");
                 }
             }
         }
@@ -532,12 +534,11 @@ fn broadcast_and_persist(
     persist: Option<&Arc<Mutex<SessionWriter>>>,
     ev: Event,
 ) {
-    if let Some(w) = persist {
-        if let Ok(mut writer) = w.lock() {
-            if let Err(e) = writer.append(&ev) {
-                warn!(error = %e, "session persist failed");
-            }
-        }
+    if let Some(w) = persist
+        && let Ok(mut writer) = w.lock()
+        && let Err(e) = writer.append(&ev)
+    {
+        warn!(error = %e, "session persist failed");
     }
     let _ = tx.send(ev);
 }
