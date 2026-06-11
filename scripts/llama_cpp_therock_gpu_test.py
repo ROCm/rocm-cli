@@ -9,13 +9,11 @@ import json
 import os
 import platform
 import subprocess
-import sys
 import tempfile
 import time
 import urllib.request
 from pathlib import Path
 from typing import Any
-
 
 DEFAULT_MODEL_URL = (
     "https://huggingface.co/ggml-org/tiny-llamas/resolve/main/stories260K.gguf"
@@ -266,16 +264,8 @@ def rocm_cli_state_paths() -> tuple[Path, Path]:
     config_dir = os.environ.get("ROCM_CLI_CONFIG_DIR")
     data_dir = os.environ.get("ROCM_CLI_DATA_DIR")
     if config_dir or data_dir:
-        config_base = (
-            Path(config_dir)
-            if config_dir
-            else default_rocm_cli_config_dir()
-        )
-        data_base = (
-            Path(data_dir)
-            if data_dir
-            else default_rocm_cli_data_dir()
-        )
+        config_base = Path(config_dir) if config_dir else default_rocm_cli_config_dir()
+        data_base = Path(data_dir) if data_dir else default_rocm_cli_data_dir()
         return (
             config_base / "config.json",
             data_base / "runtimes" / "registry",
@@ -294,19 +284,23 @@ def default_rocm_cli_data_dir() -> Path:
 
 
 def run_self_test() -> int:
-    scratch_root = Path(__file__).resolve().parents[1] / ".rocm-work" / "script-self-tests"
+    scratch_root = (
+        Path(__file__).resolve().parents[1] / ".rocm-work" / "script-self-tests"
+    )
     scratch_root.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(
-        prefix="llama-cpp-", dir=scratch_root
-    ) as temp:
+    with tempfile.TemporaryDirectory(prefix="llama-cpp-", dir=scratch_root) as temp:
         root = Path(temp)
         config_dir = root / "config"
         data_dir = root / "data"
         registry_dir = data_dir / "runtimes" / "registry"
         registry_dir.mkdir(parents=True)
         config_dir.mkdir(parents=True)
-        write_runtime_manifest(registry_dir, "runtime-old", "therock-release:gfx120X-all")
-        write_runtime_manifest(registry_dir, "runtime-new", "therock-release:gfx120X-all")
+        write_runtime_manifest(
+            registry_dir, "runtime-old", "therock-release:gfx120X-all"
+        )
+        write_runtime_manifest(
+            registry_dir, "runtime-new", "therock-release:gfx120X-all"
+        )
         write_runtime_manifest(registry_dir, "runtime-other", "therock-release:gfx1151")
         write_config(
             config_dir,
@@ -351,7 +345,9 @@ def run_self_test() -> int:
     return 0
 
 
-def write_runtime_manifest(registry_dir: Path, runtime_key: str, runtime_id: str) -> None:
+def write_runtime_manifest(
+    registry_dir: Path, runtime_key: str, runtime_id: str
+) -> None:
     (registry_dir / f"{runtime_key}.json").write_text(
         json.dumps({"runtime_key": runtime_key, "runtime_id": runtime_id}),
         encoding="utf-8",
@@ -380,7 +376,9 @@ def ensure_model(path: Path, url: str) -> None:
         raise RuntimeError(f"downloaded empty GGUF model: {path}")
 
 
-def run_json(command: list[str], *, env: dict[str, str], timeout: int) -> dict[str, Any]:
+def run_json(
+    command: list[str], *, env: dict[str, str], timeout: int
+) -> dict[str, Any]:
     completed = subprocess.run(
         command,
         env=env,

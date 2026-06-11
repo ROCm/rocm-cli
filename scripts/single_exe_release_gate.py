@@ -16,10 +16,13 @@ import sys
 import tempfile
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INTERNAL_ARTIFACT = (
-    REPO_ROOT / ".rocm-work" / "tests" / "rust-cosmopolitan" / "rocm-rust-cosmo-release.exe"
+    REPO_ROOT
+    / ".rocm-work"
+    / "tests"
+    / "rust-cosmopolitan"
+    / "rocm-rust-cosmo-release.exe"
 )
 DEFAULT_RELEASE_ARTIFACT = REPO_ROOT / ".rocm-work" / "single-exe-release" / "rocm.exe"
 
@@ -122,23 +125,43 @@ def run_windows_smoke(artifact: Path) -> None:
         require("rocm " in version, "Windows version smoke did not print rocm version")
         doctor = run([str(artifact), "doctor"], env=env)
         require("os: windows" in doctor, "Windows doctor did not report os: windows")
-        require("detected_gfx_target:" in doctor, "Windows doctor did not report GPU target")
+        require(
+            "detected_gfx_target:" in doctor, "Windows doctor did not report GPU target"
+        )
         run_windows_safe_command_smokes(artifact, env)
-        run([sys.executable, "scripts/tui_e2e_smoke.py", "--rocm", str(artifact)], env=env)
+        run(
+            [sys.executable, "scripts/tui_e2e_smoke.py", "--rocm", str(artifact)],
+            env=env,
+        )
 
 
 def run_windows_safe_command_smokes(artifact: Path, env: dict[str, str]) -> None:
     print("[single-exe-gate] running Windows safe command smokes")
     services = run([str(artifact), "services", "list"], env=env)
-    require("No local servers are running." in services, "services list did not use the empty-state text")
+    require(
+        "No local servers are running." in services,
+        "services list did not use the empty-state text",
+    )
     services_all = run([str(artifact), "services", "list", "--all"], env=env)
-    require("No local server records yet." in services_all, "services list --all did not use the empty all-records text")
+    require(
+        "No local server records yet." in services_all,
+        "services list --all did not use the empty all-records text",
+    )
     runtimes = run([str(artifact), "runtimes", "list"], env=env)
-    require("installed: none" in runtimes, "runtimes list did not report the empty install state")
+    require(
+        "installed: none" in runtimes,
+        "runtimes list did not report the empty install state",
+    )
     comfyui = run([str(artifact), "comfyui", "status"], env=env)
-    require("installed: no" in comfyui, "comfyui status did not report the empty install state")
+    require(
+        "installed: no" in comfyui,
+        "comfyui status did not report the empty install state",
+    )
     engines = run([str(artifact), "engines", "list"], env=env)
-    require("lemonade" in engines and "default embedded Lemonade" in engines, "engines list did not report Lemonade")
+    require(
+        "lemonade" in engines and "default embedded Lemonade" in engines,
+        "engines list did not report Lemonade",
+    )
 
 
 def run_wsl_smoke(artifact: Path) -> None:
@@ -147,7 +170,19 @@ def run_wsl_smoke(artifact: Path) -> None:
         "python3 scripts/rust_cosmopolitan_spike.py smoke-wsl-linux-path "
         f"--release --artifact {shell_quote(wsl_path(artifact))}"
     )
-    run(["wsl", "-u", "jam", "--cd", "/mnt/d/jam/rocm-cli", "--", "bash", "-lc", command])
+    run(
+        [
+            "wsl",
+            "-u",
+            "jam",
+            "--cd",
+            "/mnt/d/jam/rocm-cli",
+            "--",
+            "bash",
+            "-lc",
+            command,
+        ]
+    )
 
 
 def run_live_assistant(args: argparse.Namespace, artifact: Path) -> None:
@@ -182,7 +217,9 @@ def run_live_comfyui(args: argparse.Namespace, artifact: Path) -> None:
         str(args.timeout),
     ]
     if args.generate_cat:
-        command.extend(["--generate-cat", "--output-dir", ".rocm-work/tests/comfyui-cat"])
+        command.extend(
+            ["--generate-cat", "--output-dir", ".rocm-work/tests/comfyui-cat"]
+        )
     run(command, timeout=args.timeout + 120)
 
 
@@ -215,7 +252,9 @@ def run(
     if completed.stderr:
         output += completed.stderr
     if completed.returncode != 0:
-        raise GateError(f"command failed ({completed.returncode}): {format_command(command)}\n{output}")
+        raise GateError(
+            f"command failed ({completed.returncode}): {format_command(command)}\n{output}"
+        )
     return output
 
 

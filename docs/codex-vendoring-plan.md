@@ -519,4 +519,3 @@ If that slice works, the rest of the migration becomes practical.
 - approvals work for privileged operations
 - `rocmd` is the backend authority for sessions, tools, and watchers
 - direct CLI commands still work for scripts and CI
-

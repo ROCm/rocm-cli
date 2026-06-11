@@ -59,7 +59,9 @@ def collect_gpu_inventory() -> dict[str, Any]:
         inventory["cuda_available"] = True
         inventory["gpu_count"] = len(per_gpu_mem_gb)
         inventory["per_gpu_mem_gb"] = per_gpu_mem_gb
-        inventory["max_single_gpu_mem_gb"] = max(per_gpu_mem_gb) if per_gpu_mem_gb else None
+        inventory["max_single_gpu_mem_gb"] = (
+            max(per_gpu_mem_gb) if per_gpu_mem_gb else None
+        )
         inventory["total_gpu_mem_gb"] = sum(per_gpu_mem_gb)
         return inventory
     except Exception:
@@ -72,7 +74,9 @@ def detect_device(
 ) -> tuple[str, dict[str, Any], str | None, str]:
     inventory = collect_gpu_inventory()
     if policy == "cpu_only":
-        raise RuntimeError("PyTorch CPU serving is not offered by rocm-cli; no CPU fallback is used")
+        raise RuntimeError(
+            "PyTorch CPU serving is not offered by rocm-cli; no CPU fallback is used"
+        )
 
     if not inventory["cuda_available"]:
         message = "torch.cuda.is_available() is false"
@@ -139,7 +143,7 @@ def parse_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
     content_parts: list[str] = []
     cursor = 0
     for match in TOOL_CALL_PATTERN.finditer(text):
-        content_parts.append(text[cursor:match.start()])
+        content_parts.append(text[cursor : match.start()])
         cursor = match.end()
         raw_call = match.group(1).strip()
         try:
@@ -216,8 +220,8 @@ def build_max_memory_map(inventory: dict[str, Any]) -> dict[Any, str] | None:
 class Runtime:
     def __init__(self, args: argparse.Namespace):
         self.args = args
-        self.device, self.gpu_inventory, self.device_note, self.placement_mode = detect_device(
-            args.device_policy, args.min_gpu_mem_gb
+        self.device, self.gpu_inventory, self.device_note, self.placement_mode = (
+            detect_device(args.device_policy, args.min_gpu_mem_gb)
         )
         self.gpu_mem_gb = self.gpu_inventory.get("max_single_gpu_mem_gb")
         self.total_gpu_mem_gb = self.gpu_inventory.get("total_gpu_mem_gb")
@@ -237,7 +241,9 @@ class Runtime:
         tokenizer_kwargs: dict[str, Any] = {
             "trust_remote_code": self.trust_remote_code,
         }
-        self.tokenizer = AutoTokenizer.from_pretrained(args.model_ref, **tokenizer_kwargs)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            args.model_ref, **tokenizer_kwargs
+        )
         if self.tokenizer.pad_token is None and self.tokenizer.eos_token is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -255,7 +261,9 @@ class Runtime:
             if max_memory is not None:
                 model_kwargs["max_memory"] = max_memory
 
-        self.model = AutoModelForCausalLM.from_pretrained(args.model_ref, **model_kwargs)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            args.model_ref, **model_kwargs
+        )
         self.model.eval()
         if self.device == "cpu":
             self.model = self.model.to("cpu")
@@ -360,10 +368,7 @@ class Runtime:
 
     def encode_prompt(self, prompt: str) -> dict[str, torch.Tensor]:
         encoded = self.tokenizer(prompt, return_tensors="pt")
-        return {
-            key: value.to(self.model_device())
-            for key, value in encoded.items()
-        }
+        return {key: value.to(self.model_device()) for key, value in encoded.items()}
 
     def generation_kwargs(
         self,
@@ -397,7 +402,9 @@ class Runtime:
 
         prompt_tokens = encoded["input_ids"].shape[-1]
         completion_tokens = output[0][prompt_tokens:]
-        return self.tokenizer.decode(completion_tokens, skip_special_tokens=True).strip()
+        return self.tokenizer.decode(
+            completion_tokens, skip_special_tokens=True
+        ).strip()
 
     def generate_stream(
         self,
@@ -528,7 +535,9 @@ def create_app(runtime: Runtime) -> FastAPI:
     async def chat_completions(request: dict[str, Any]):
         messages = request.get("messages") or []
         if not isinstance(messages, list) or not messages:
-            raise HTTPException(status_code=400, detail="messages must be a non-empty list")
+            raise HTTPException(
+                status_code=400, detail="messages must be a non-empty list"
+            )
 
         stream = bool(request.get("stream"))
         max_tokens = request.get("max_tokens")
@@ -639,7 +648,9 @@ def main() -> int:
                 "traceback": traceback.format_exc(),
             },
         )
-        print(f"[rocm-engine-pytorch] startup failed: {exc}", file=sys.stderr, flush=True)
+        print(
+            f"[rocm-engine-pytorch] startup failed: {exc}", file=sys.stderr, flush=True
+        )
         traceback.print_exc()
         return 1
 

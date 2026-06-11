@@ -40,7 +40,9 @@ def main() -> int:
         return run_self_test()
 
     if platform.system() == "Windows":
-        raise SystemExit("ATOM GPU acceptance is Linux/WSL only; no CPU fallback is allowed")
+        raise SystemExit(
+            "ATOM GPU acceptance is Linux/WSL only; no CPU fallback is allowed"
+        )
 
     repo_root = Path(__file__).resolve().parents[1]
     engine = resolve_path(args.engine, repo_root)
@@ -55,7 +57,9 @@ def main() -> int:
     detect = run_json([str(engine), "detect"], env=env, timeout=args.timeout)
     assert_atom_gpu_detected(detect)
 
-    capabilities = run_json([str(engine), "capabilities"], env=env, timeout=args.timeout)
+    capabilities = run_json(
+        [str(engine), "capabilities"], env=env, timeout=args.timeout
+    )
     if capabilities.get("cpu"):
         raise RuntimeError("ATOM capabilities unexpectedly report CPU support")
     if not capabilities.get("rocm_gpu"):
@@ -247,10 +251,13 @@ def assert_atom_cpu_policy_rejected(
     )
     output = completed.stdout + completed.stderr
     if completed.returncode == 0:
-        raise RuntimeError("ATOM accepted cpu_only during GPU acceptance; no fallback is allowed")
+        raise RuntimeError(
+            "ATOM accepted cpu_only during GPU acceptance; no fallback is allowed"
+        )
     if "no CPU fallback is used" not in output:
         raise RuntimeError(
-            "ATOM cpu_only rejection did not include the no-fallback explanation:\n" + output
+            "ATOM cpu_only rejection did not include the no-fallback explanation:\n"
+            + output
         )
 
 
@@ -367,7 +374,9 @@ def start_launch(
 
 
 def run_self_test() -> int:
-    scratch_root = Path(__file__).resolve().parents[1] / ".rocm-work" / "script-self-tests"
+    scratch_root = (
+        Path(__file__).resolve().parents[1] / ".rocm-work" / "script-self-tests"
+    )
     scratch_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="atom-", dir=scratch_root) as temp:
         root = Path(temp)
@@ -376,8 +385,12 @@ def run_self_test() -> int:
         registry_dir = data_dir / "runtimes" / "registry"
         registry_dir.mkdir(parents=True)
         config_dir.mkdir(parents=True)
-        write_runtime_manifest(registry_dir, "runtime-old", "therock-release:gfx120X-all")
-        write_runtime_manifest(registry_dir, "runtime-new", "therock-release:gfx120X-all")
+        write_runtime_manifest(
+            registry_dir, "runtime-old", "therock-release:gfx120X-all"
+        )
+        write_runtime_manifest(
+            registry_dir, "runtime-new", "therock-release:gfx120X-all"
+        )
         write_runtime_manifest(registry_dir, "runtime-other", "therock-release:gfx1151")
         write_config(
             config_dir,
@@ -419,7 +432,9 @@ def run_self_test() -> int:
                 raise AssertionError("external ATOM override did not fail")
             os.environ.pop("ROCM_CLI_ATOM_COMMAND", None)
 
-            write_config(config_dir, {"default_runtime_id": "therock-release:gfx120X-all"})
+            write_config(
+                config_dir, {"default_runtime_id": "therock-release:gfx120X-all"}
+            )
             try:
                 resolve_runtime_id(None)
             except RuntimeError as exc:

@@ -14,7 +14,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-
 HIP_MODULE = "libamdhip64"
 DEFAULT_MATH_MODULES = ["libhipblas", "libhipblaslt", "librocblas"]
 
@@ -53,7 +52,9 @@ def main() -> int:
     detect = run_json([str(engine), "detect"], env=env, timeout=args.timeout)
     assert_vllm_gpu_detected(detect)
 
-    capabilities = run_json([str(engine), "capabilities"], env=env, timeout=args.timeout)
+    capabilities = run_json(
+        [str(engine), "capabilities"], env=env, timeout=args.timeout
+    )
     if capabilities.get("cpu"):
         raise RuntimeError("vLLM capabilities unexpectedly report CPU support")
     if not capabilities.get("rocm_gpu"):
@@ -289,15 +290,9 @@ def rocm_cli_state_paths() -> tuple[Path, Path]:
     config_dir = os.environ.get("ROCM_CLI_CONFIG_DIR")
     data_dir = os.environ.get("ROCM_CLI_DATA_DIR")
     if config_dir or data_dir:
-        config_base = (
-            Path(config_dir)
-            if config_dir
-            else default_rocm_cli_config_dir()
-        )
+        config_base = Path(config_dir) if config_dir else default_rocm_cli_config_dir()
         data_base = (
-            Path(data_dir)
-            if data_dir
-            else default_rocm_cli_data_dir(config_base)
+            Path(data_dir) if data_dir else default_rocm_cli_data_dir(config_base)
         )
         return (
             config_base / "config.json",
@@ -305,7 +300,9 @@ def rocm_cli_state_paths() -> tuple[Path, Path]:
         )
     return (
         default_rocm_cli_config_dir() / "config.json",
-        default_rocm_cli_data_dir(default_rocm_cli_config_dir()) / "runtimes" / "registry",
+        default_rocm_cli_data_dir(default_rocm_cli_config_dir())
+        / "runtimes"
+        / "registry",
     )
 
 
@@ -328,19 +325,23 @@ def default_rocm_cli_data_dir(config_base: Path) -> Path:
 
 
 def run_self_test() -> int:
-    scratch_root = Path(__file__).resolve().parents[1] / ".rocm-work" / "script-self-tests"
+    scratch_root = (
+        Path(__file__).resolve().parents[1] / ".rocm-work" / "script-self-tests"
+    )
     scratch_root.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(
-        prefix="vllm-", dir=scratch_root
-    ) as temp:
+    with tempfile.TemporaryDirectory(prefix="vllm-", dir=scratch_root) as temp:
         root = Path(temp)
         config_dir = root / "config"
         data_dir = root / "data"
         registry_dir = data_dir / "runtimes" / "registry"
         registry_dir.mkdir(parents=True)
         config_dir.mkdir(parents=True)
-        write_runtime_manifest(registry_dir, "runtime-old", "therock-release:gfx120X-all")
-        write_runtime_manifest(registry_dir, "runtime-new", "therock-release:gfx120X-all")
+        write_runtime_manifest(
+            registry_dir, "runtime-old", "therock-release:gfx120X-all"
+        )
+        write_runtime_manifest(
+            registry_dir, "runtime-new", "therock-release:gfx120X-all"
+        )
         write_runtime_manifest(registry_dir, "runtime-other", "therock-release:gfx1151")
         write_config(
             config_dir,
@@ -406,7 +407,9 @@ def run_self_test() -> int:
     return 0
 
 
-def write_runtime_manifest(registry_dir: Path, runtime_key: str, runtime_id: str) -> None:
+def write_runtime_manifest(
+    registry_dir: Path, runtime_key: str, runtime_id: str
+) -> None:
     (registry_dir / f"{runtime_key}.json").write_text(
         json.dumps({"runtime_key": runtime_key, "runtime_id": runtime_id}),
         encoding="utf-8",
@@ -425,7 +428,9 @@ def restore_env(values: dict[str, str | None]) -> None:
             os.environ[key] = value
 
 
-def run_json(command: list[str], *, env: dict[str, str], timeout: int) -> dict[str, Any]:
+def run_json(
+    command: list[str], *, env: dict[str, str], timeout: int
+) -> dict[str, Any]:
     completed = subprocess.run(
         command,
         env=env,
@@ -543,7 +548,10 @@ def wait_health(host: str, port: int, timeout: int) -> dict[str, Any]:
         try:
             status, body = http_request(host, port, "GET", "/health", None, timeout=3)
             if status < 400:
-                return {"status_code": status, "body": body.decode("utf-8", errors="replace")}
+                return {
+                    "status_code": status,
+                    "body": body.decode("utf-8", errors="replace"),
+                }
         except Exception as exc:  # noqa: BLE001
             last_error = exc
         time.sleep(0.5)
@@ -619,7 +627,9 @@ def verify_managed_env(state: dict[str, Any]) -> dict[str, str]:
     runtime_root = runtime_env.get("root")
     runtime_bin = runtime_env.get("bin")
     if not pid or not runtime_root:
-        raise RuntimeError("state is missing server_pid/pid or therock_runtime_env.root")
+        raise RuntimeError(
+            "state is missing server_pid/pid or therock_runtime_env.root"
+        )
     environ_path = Path("/proc") / str(int(pid)) / "environ"
     if not environ_path.is_file():
         raise RuntimeError(f"process environ file was not found: {environ_path}")
@@ -651,12 +661,16 @@ def verify_managed_env(state: dict[str, Any]) -> dict[str, str]:
     return {key: env[key] for key in expected if key in env}
 
 
-def verify_loaded_modules(state: dict[str, Any], math_modules: list[str]) -> dict[str, str]:
+def verify_loaded_modules(
+    state: dict[str, Any], math_modules: list[str]
+) -> dict[str, str]:
     pid = state.get("server_pid") or state.get("pid")
     runtime_env = state.get("therock_runtime_env") or {}
     runtime_root = runtime_env.get("root")
     if not pid or not runtime_root:
-        raise RuntimeError("state is missing server_pid/pid or therock_runtime_env.root")
+        raise RuntimeError(
+            "state is missing server_pid/pid or therock_runtime_env.root"
+        )
     maps_path = Path("/proc") / str(int(pid)) / "maps"
     if not maps_path.is_file():
         raise RuntimeError(f"process maps file was not found: {maps_path}")
@@ -674,7 +688,9 @@ def verify_loaded_modules(state: dict[str, Any], math_modules: list[str]) -> dic
         raise RuntimeError(f"missing loaded HIP module: {HIP_MODULE}")
     math_loaded = sorted(set(math_modules) & set(module_paths))
     if not math_loaded:
-        raise RuntimeError(f"missing loaded ROCm math module; expected one of {math_modules}")
+        raise RuntimeError(
+            f"missing loaded ROCm math module; expected one of {math_modules}"
+        )
 
     roots = managed_therock_module_roots(Path(runtime_root))
     for module, path in module_paths.items():
