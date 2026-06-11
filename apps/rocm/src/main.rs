@@ -11635,8 +11635,15 @@ fn apply_runtime_update(
 
     if dry_run {
         let _ = writeln!(output, "  mode: dry-run");
-        let install_plan =
-            therock::install_sdk(paths, &source.channel, &source.format, None, None, None, true)?;
+        let install_plan = therock::install_sdk(
+            paths,
+            &source.channel,
+            &source.format,
+            None,
+            None,
+            None,
+            true,
+        )?;
         let _ = writeln!(output, "  install_plan:");
         for line in install_plan.lines() {
             let _ = writeln!(output, "    {line}");
@@ -11644,8 +11651,15 @@ fn apply_runtime_update(
         return Ok(output);
     }
 
-    let install_output =
-        therock::install_sdk(paths, &source.channel, &source.format, None, None, None, false)?;
+    let install_output = therock::install_sdk(
+        paths,
+        &source.channel,
+        &source.format,
+        None,
+        None,
+        None,
+        false,
+    )?;
     let manifests_after = therock::load_runtime_manifests(paths)?;
     let installed = select_installed_update_runtime(&manifests_after, source, &plan.latest_version)
         .context("updated runtime install completed but the new runtime manifest was not found")?;

@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
+#[cfg(windows)]
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{IsTerminal, Read, Write, stdin, stdout};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
