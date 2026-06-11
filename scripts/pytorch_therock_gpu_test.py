@@ -15,7 +15,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-
 DEFAULT_MODEL_REF = "hf-internal-testing/tiny-random-gpt2"
 WINDOWS_MODULE_PREFIXES = ("amdhip64", "hipblas", "rocblas", "torch_hip")
 LINUX_MODULE_PREFIXES = ("libamdhip64", "libhipblas", "librocblas", "libtorch_hip")
@@ -64,7 +63,9 @@ def main() -> int:
     print(f"Log file: {log_path}", flush=True)
 
     try:
-        health = wait_health(args.host, args.port, args.timeout, process, state_path, log_path)
+        health = wait_health(
+            args.host, args.port, args.timeout, process, state_path, log_path
+        )
         print_step("PyTorch is running on the AMD GPU. Sending a tiny prompt...")
         models = get_json(args.host, args.port, "/v1/models", timeout=args.timeout)
         completion = post_json(
@@ -125,7 +126,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=11441)
     parser.add_argument("--timeout", type=int, default=180)
-    parser.add_argument("--env-id", help="managed PyTorch env id; defaults to engine detect")
+    parser.add_argument(
+        "--env-id", help="managed PyTorch env id; defaults to engine detect"
+    )
     parser.add_argument(
         "--runtime-id",
         help=(
@@ -163,7 +166,9 @@ def exe_name(name: str) -> str:
     return f"{name}.exe" if platform.system() == "Windows" else name
 
 
-def run_json(command: list[str], *, env: dict[str, str], timeout: int) -> dict[str, Any]:
+def run_json(
+    command: list[str], *, env: dict[str, str], timeout: int
+) -> dict[str, Any]:
     completed = subprocess.run(
         command,
         env=env,
@@ -351,7 +356,9 @@ def print_state_progress(state_path: Path) -> None:
         return
     status = state.get("status")
     if status == "starting":
-        print_step("The test server is starting. This can take a little while on first run.")
+        print_step(
+            "The test server is starting. This can take a little while on first run."
+        )
     elif status:
         print_step(f"Current status: {status}")
 
@@ -363,7 +370,14 @@ def failure_context(state_path: Path, log_path: Path) -> str:
             state = json.loads(state_path.read_text(encoding="utf-8"))
             visible_state = {
                 key: state.get(key)
-                for key in ["status", "error", "device", "device_policy", "runtime_id", "env_id"]
+                for key in [
+                    "status",
+                    "error",
+                    "device",
+                    "device_policy",
+                    "runtime_id",
+                    "env_id",
+                ]
                 if key in state
             }
             parts.append("state: " + json.dumps(visible_state, indent=2))
@@ -545,8 +559,14 @@ def runtime_keys_text(manifests: list[dict[str, str]]) -> str:
 def rocm_cli_state_paths() -> tuple[Path, Path]:
     config_dir = os.environ.get("ROCM_CLI_CONFIG_DIR")
     data_dir = os.environ.get("ROCM_CLI_DATA_DIR")
-    config_base = Path(config_dir).expanduser() if config_dir else default_rocm_cli_dir()
-    data_base = Path(data_dir).expanduser() if data_dir else default_rocm_cli_data_dir(config_base)
+    config_base = (
+        Path(config_dir).expanduser() if config_dir else default_rocm_cli_dir()
+    )
+    data_base = (
+        Path(data_dir).expanduser()
+        if data_dir
+        else default_rocm_cli_data_dir(config_base)
+    )
     return config_base / "config.json", data_base / "runtimes" / "registry"
 
 
@@ -559,7 +579,9 @@ def rocm_cli_data_dir() -> Path:
     if override:
         return Path(override).expanduser()
     config_dir = os.environ.get("ROCM_CLI_CONFIG_DIR")
-    config_base = Path(config_dir).expanduser() if config_dir else default_rocm_cli_dir()
+    config_base = (
+        Path(config_dir).expanduser() if config_dir else default_rocm_cli_dir()
+    )
     return default_rocm_cli_data_dir(config_base)
 
 
@@ -626,11 +648,11 @@ def resolve_engine_env_for_runtime(runtime_id: str) -> tuple[str, dict[str, Any]
 
 
 def run_self_test() -> int:
-    scratch_root = Path(__file__).resolve().parents[1] / ".rocm-work" / "script-self-tests"
+    scratch_root = (
+        Path(__file__).resolve().parents[1] / ".rocm-work" / "script-self-tests"
+    )
     scratch_root.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(
-        prefix="pytorch-", dir=scratch_root
-    ) as temp:
+    with tempfile.TemporaryDirectory(prefix="pytorch-", dir=scratch_root) as temp:
         root = Path(temp)
         config_dir = root / "config"
         data_dir = root / "data"
@@ -642,8 +664,12 @@ def run_self_test() -> int:
         env_root.mkdir(parents=True)
         config_dir.mkdir(parents=True)
 
-        write_runtime_manifest(registry_dir, "runtime-old", "therock-release:gfx120X-all")
-        write_runtime_manifest(registry_dir, "runtime-new", "therock-release:gfx120X-all")
+        write_runtime_manifest(
+            registry_dir, "runtime-old", "therock-release:gfx120X-all"
+        )
+        write_runtime_manifest(
+            registry_dir, "runtime-new", "therock-release:gfx120X-all"
+        )
         write_runtime_manifest(registry_dir, "runtime-other", "therock-release:gfx1151")
         write_engine_manifest(manifest_dir, env_root, "env-old", "runtime-old")
         write_engine_manifest(manifest_dir, env_root, "env-new", "runtime-new")
@@ -672,7 +698,9 @@ def run_self_test() -> int:
             assert resolve_runtime_id("runtime-new") == "runtime-new"
             assert resolve_runtime_id("therock-release:gfx1151") == "runtime-other"
             try:
-                assert_env_matches_runtime(load_engine_manifest("env-new"), "runtime-old")
+                assert_env_matches_runtime(
+                    load_engine_manifest("env-new"), "runtime-old"
+                )
             except RuntimeError as exc:
                 assert "selected ROCm runtime" in str(exc)
             else:
@@ -702,7 +730,9 @@ def run_self_test() -> int:
     return 0
 
 
-def write_runtime_manifest(registry_dir: Path, runtime_key: str, runtime_id: str) -> None:
+def write_runtime_manifest(
+    registry_dir: Path, runtime_key: str, runtime_id: str
+) -> None:
     (registry_dir / f"{runtime_key}.json").write_text(
         json.dumps({"runtime_key": runtime_key, "runtime_id": runtime_id}),
         encoding="utf-8",
