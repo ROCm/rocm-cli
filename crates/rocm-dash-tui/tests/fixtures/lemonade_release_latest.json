@@ -1,0 +1,45 @@
+{
+  "tag_name": "v10.6.0",
+  "name": "Lemonade v10.6.0",
+  "html_url": "https://github.com/lemonade-sdk/lemonade/releases/tag/v10.6.0",
+  "draft": false,
+  "prerelease": false,
+  "assets": [
+    {
+      "name": "Lemonade-10.6.0-Darwin.pkg",
+      "content_type": "application/octet-stream",
+      "size": 9868497,
+      "browser_download_url": "https://github.com/lemonade-sdk/lemonade/releases/download/v10.6.0/Lemonade-10.6.0-Darwin.pkg"
+    },
+    {
+      "name": "lemonade-embeddable-10.6.0-macos-arm64.tar.gz",
+      "content_type": "application/gzip",
+      "size": 2827730,
+      "browser_download_url": "https://github.com/lemonade-sdk/lemonade/releases/download/v10.6.0/lemonade-embeddable-10.6.0-macos-arm64.tar.gz"
+    },
+    {
+      "name": "lemonade-embeddable-10.6.0-ubuntu-x64.tar.gz",
+      "content_type": "application/gzip",
+      "size": 3425958,
+      "browser_download_url": "https://github.com/lemonade-sdk/lemonade/releases/download/v10.6.0/lemonade-embeddable-10.6.0-ubuntu-x64.tar.gz"
+    },
+    {
+      "name": "lemonade-embeddable-10.6.0-windows-x64.zip",
+      "content_type": "application/zip",
+      "size": 2891846,
+      "browser_download_url": "https://github.com/lemonade-sdk/lemonade/releases/download/v10.6.0/lemonade-embeddable-10.6.0-windows-x64.zip"
+    },
+    {
+      "name": "lemonade-server-10.6.0-fc44.x86_64.rpm",
+      "content_type": "application/x-redhat-package-manager",
+      "size": 3879912,
+      "browser_download_url": "https://github.com/lemonade-sdk/lemonade/releases/download/v10.6.0/lemonade-server-10.6.0-fc44.x86_64.rpm"
+    },
+    {
+      "name": "lemonade.msi",
+      "content_type": "application/x-msdownload",
+      "size": 8052736,
+      "browser_download_url": "https://github.com/lemonade-sdk/lemonade/releases/download/v10.6.0/lemonade.msi"
+    }
+  ]
+}

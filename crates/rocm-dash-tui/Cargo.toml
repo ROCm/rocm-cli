@@ -1,0 +1,47 @@
+[package]
+name = "rocm-dash-tui"
+version.workspace = true
+# Transplanted from rocm-dash (EAI-6871). Held at edition 2021 for the initial
+# green transplant; migrated to the workspace edition (2024) as a separate step.
+edition = "2021"
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "rocm_dash_tui"
+path = "src/lib.rs"
+
+[dependencies]
+rocm-dash-core = { path = "../rocm-dash-core" }
+# Unified dashboard TUI base (EAI-6871 / D1): ratatui 0.30 + crossterm 0.28 stay
+# confined to this crate. The frozen rocm-cli tui.rs keeps ratatui 0.29; the two
+# majors coexist in the tree, each confined to its own crate.
+ratatui = "0.30"
+crossterm = { version = "0.28", features = ["event-stream"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+color-eyre = "0.6"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+# Skill manifests are TOML (the external-team contribution contract).
+toml = "0.8"
+async-trait = "0.1"
+# Header types for the custom auth header some gateways require (e.g. APIM's
+# `Ocp-Apim-Subscription-Key`). `http` is the types-only crate Rig already uses.
+http = "1"
+# Rig — the chat agent backend. Pinned EXACT, default features OFF so the
+# optional `epub` (GPL-3.0) and other heavy/GPL deps stay out (crate is
+# MIT-clean). Only the minimal OpenAI provider feature is enabled. reqwest
+# 0.13 arrives transitively here (TUI crate only); collectors keep 0.12.
+rig = { package = "rig-core", version = "=0.38.1", default-features = false, features = ["reqwest", "rustls"] }
+# Direct reqwest for the in-TUI local-engine `/v1/models` query. Pinned to the
+# same 0.13 line Rig already pulls in (TUI crate only) so the tree keeps one
+# reqwest version; `json` for response parsing, `rustls-tls` to match Rig's stack.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
