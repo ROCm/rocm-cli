@@ -8,11 +8,11 @@ pub mod hardware;
 pub mod instances;
 pub mod overview;
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::app::ActiveTab;
 use crate::ui::theme::Theme;

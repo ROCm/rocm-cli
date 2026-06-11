@@ -11,11 +11,11 @@ pub mod tabs;
 pub mod theme;
 pub mod widgets;
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Frame;
 
 use crate::app::{ActiveTab, AppState, ConnState, Modal};
 use crate::ui::theme::Theme;

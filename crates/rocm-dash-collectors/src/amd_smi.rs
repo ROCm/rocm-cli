@@ -258,18 +258,18 @@ pub fn parse_system_info(
             .map(str::to_owned);
     }
 
-    if let Some(s) = stat {
-        if let Some(gpus) = s.get("gpu_data").and_then(|x| x.as_array()) {
-            info.physical_gpu_count = gpus.len() as u32;
-            info.logical_gpu_count = info.physical_gpu_count;
-            if let Some(first) = gpus.first() {
-                info.gpu_model = nested(first, &["asic", "market_name"])
-                    .and_then(|x| x.as_str())
-                    .filter(|s| *s != "N/A")
-                    .or_else(|| nested(first, &["board", "product_name"]).and_then(|x| x.as_str()))
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| "Unknown".into());
-            }
+    if let Some(s) = stat
+        && let Some(gpus) = s.get("gpu_data").and_then(|x| x.as_array())
+    {
+        info.physical_gpu_count = gpus.len() as u32;
+        info.logical_gpu_count = info.physical_gpu_count;
+        if let Some(first) = gpus.first() {
+            info.gpu_model = nested(first, &["asic", "market_name"])
+                .and_then(|x| x.as_str())
+                .filter(|s| *s != "N/A")
+                .or_else(|| nested(first, &["board", "product_name"]).and_then(|x| x.as_str()))
+                .map(str::to_owned)
+                .unwrap_or_else(|| "Unknown".into());
         }
     }
 

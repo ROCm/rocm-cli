@@ -3,7 +3,7 @@
 
 use std::io;
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 pub async fn write_line<W, T>(w: &mut W, value: &T) -> io::Result<()>

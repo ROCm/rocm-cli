@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use rocm_dash_core::protocol::{Command, Event, PROTOCOL_VERSION};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;

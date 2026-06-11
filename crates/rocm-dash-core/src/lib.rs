@@ -19,7 +19,7 @@ pub mod state;
 pub mod traits;
 pub mod vram;
 
-pub use bench_rollup::{rollup_pass_n, row_verdict, PassNRollup};
+pub use bench_rollup::{PassNRollup, rollup_pass_n, row_verdict};
 pub use bench_schema::BenchmarkRow;
 pub use metrics::{GpuMetrics, Instance, Snapshot, SystemMetrics};
 pub use partition::{ComputePartitionMode, MemoryPartitionMode};

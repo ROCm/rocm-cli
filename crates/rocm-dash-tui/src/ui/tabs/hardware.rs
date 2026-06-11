@@ -7,11 +7,11 @@
 //! 3. Per-GPU panels (remaining): one bordered block per GPU with stats,
 //!    firmware/partition info, and a util sparkline.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Frame;
 
 use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo, Snapshot};
 
@@ -22,8 +22,8 @@ use crate::ui::gradient::GradientGauge;
 use crate::ui::sparkline::BrailleSparkline;
 use crate::ui::theme::Theme;
 use crate::ui::widgets::{
-    gpu_stats_line, instances_on_gpu, node_efficiency, power_style, temperature_style, trunc,
-    POWER_CRIT_W,
+    POWER_CRIT_W, gpu_stats_line, instances_on_gpu, node_efficiency, power_style,
+    temperature_style, trunc,
 };
 
 /// Rows consumed above the GPU section in [`draw`] (CPU 10 + mem/swap 3 + I/O 3).
@@ -834,8 +834,8 @@ pub fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 mod tests {
     use super::*;
     use crate::app::{ActiveTab, AppState};
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use rocm_dash_core::metrics::{GpuSystemInfo, SystemMetrics};
     use rocm_dash_core::partition::{ComputePartitionMode, MemoryPartitionMode};
 

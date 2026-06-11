@@ -3,11 +3,11 @@
 //! `AgentClient` trait. The transcript and input buffer are plain TUI state on
 //! `AppState` (`rocm-dash-core` carries no chat types).
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use ratatui::Frame;
 
 use crate::app::{AppState, ChatConsent, ChatRole};
 use crate::ui::theme::Theme;
@@ -363,8 +363,8 @@ mod tests {
     #[test]
     fn draw_does_not_panic_across_consent_states() {
         use crate::app::ChatConsent;
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
         let render = |s: &AppState| {
             let backend = TestBackend::new(80, 24);
             let mut term = Terminal::new(backend).unwrap();
@@ -399,8 +399,8 @@ mod tests {
     }
 
     fn render_str(s: &AppState) -> String {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, f.area(), s, &s.theme)).unwrap();

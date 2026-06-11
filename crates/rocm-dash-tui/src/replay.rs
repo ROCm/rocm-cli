@@ -509,10 +509,10 @@ mod tests {
                 .await
                 .expect("timed out waiting for resume")
                 .unwrap();
-            if let ClientMsg::Event(ev) = &msg {
-                if matches!(**ev, Event::Bye) {
-                    break;
-                }
+            if let ClientMsg::Event(ev) = &msg
+                && matches!(**ev, Event::Bye)
+            {
+                break;
             }
         }
         let _ = std::fs::remove_file(&path);
@@ -555,7 +555,7 @@ mod tests {
         ctl.pause();
         tokio::time::sleep(Duration::from_millis(50)).await;
         ctl.jump(-10); // way before 0 → clamps to first_ts_us
-                       // Expect a ReplaySeek somewhere in the next few messages.
+        // Expect a ReplaySeek somewhere in the next few messages.
         let mut saw_seek = false;
         for _ in 0..6 {
             match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {

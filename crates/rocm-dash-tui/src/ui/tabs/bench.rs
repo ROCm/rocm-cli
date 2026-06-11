@@ -1,12 +1,12 @@
 //! Bench tab — full-screen bench browser with Pass^N / Pass@N rollups + sparkline.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use ratatui::Frame;
 
-use rocm_dash_core::bench_rollup::{rollup_pass_n, row_verdict, PassNRollup};
+use rocm_dash_core::bench_rollup::{PassNRollup, rollup_pass_n, row_verdict};
 use rocm_dash_core::bench_schema::{BenchmarkRow, PassFail};
 
 use crate::app::{AppState, KeyAction};

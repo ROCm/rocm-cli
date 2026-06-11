@@ -1,11 +1,11 @@
 //! Instances tab — full-screen instance grid with kv-cache / requests / args,
 //! plus a detail modal showing model / partition / launch_args / env / log.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use ratatui::Frame;
 
 use rocm_dash_core::metrics::{Instance, InstanceStatus};
 
@@ -190,11 +190,7 @@ fn sorted_instances(instances: &std::collections::HashMap<String, Instance>) -> 
 
 /// Clamp a selection index into `[0, len)`. Returns 0 for an empty list.
 fn clamp_sel(sel: usize, len: usize) -> usize {
-    if len == 0 {
-        0
-    } else {
-        sel.min(len - 1)
-    }
+    if len == 0 { 0 } else { sel.min(len - 1) }
 }
 
 fn status_meta(status: InstanceStatus, theme: &Theme) -> (ratatui::style::Color, &'static str) {
@@ -975,8 +971,8 @@ mod tests {
 
     #[test]
     fn render_shows_quantization_and_vram_for_populated_instance() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         // Populate the previously-dead fields: quantization + per-instance VRAM.
         let mut inst = mk_inst("vllm");

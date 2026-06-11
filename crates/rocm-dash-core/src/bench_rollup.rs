@@ -133,11 +133,7 @@ where
 }
 
 fn mean(sum: f64, n: usize) -> Option<f64> {
-    if n > 0 {
-        Some(sum / n as f64)
-    } else {
-        None
-    }
+    if n > 0 { Some(sum / n as f64) } else { None }
 }
 
 #[cfg(test)]

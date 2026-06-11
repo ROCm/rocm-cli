@@ -1,9 +1,8 @@
 [package]
 name = "rocm-dash-tui"
 version.workspace = true
-# Transplanted from rocm-dash (EAI-6871). Held at edition 2021 for the initial
-# green transplant; migrated to the workspace edition (2024) as a separate step.
-edition = "2021"
+# Transplanted from rocm-dash (EAI-6871); migrated to the workspace edition (2024).
+edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
