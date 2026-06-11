@@ -169,10 +169,12 @@ path_expr_for_profile() {
   path="$1"
   case "$path" in
     "$HOME")
+      # Emit the literal string $HOME so the user's shell expands it later.
+      # shellcheck disable=SC2016
       printf '%s\n' '$HOME'
       ;;
     "$HOME"/*)
-      printf '%s\n' "\$HOME/${path#$HOME/}"
+      printf '%s\n' "\$HOME/${path#"$HOME"/}"
       ;;
     *)
       printf '%s\n' "$path"

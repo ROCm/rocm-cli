@@ -9,15 +9,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import platform
 import shutil
 import subprocess
-import sys
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
-
 
 LINUX_COLLECTOR = r"""
 import glob
@@ -235,7 +231,10 @@ def collect_state(distro: str | None) -> dict[str, Any]:
         return collect_from_windows(distro)
     if platform.system() == "Linux":
         return collect_local_linux()
-    return {"collector": platform.system().lower(), "error": "only Windows and Linux are supported"}
+    return {
+        "collector": platform.system().lower(),
+        "error": "only Windows and Linux are supported",
+    }
 
 
 def evaluate(
@@ -248,33 +247,55 @@ def evaluate(
 
     paths = state.get("paths") if isinstance(state.get("paths"), dict) else {}
     tools = state.get("tools") if isinstance(state.get("tools"), dict) else {}
-    os_release = state.get("os_release") if isinstance(state.get("os_release"), dict) else {}
+    os_release = (
+        state.get("os_release") if isinstance(state.get("os_release"), dict) else {}
+    )
     ldconfig = state.get("ldconfig") if isinstance(state.get("ldconfig"), dict) else {}
     sdk_headers = state.get("windows_sdk_headers") or []
 
     version_id = str(os_release.get("VERSION_ID") or "")
-    supported_ubuntu = os_release.get("ID") == "ubuntu" and version_id in {"22.04", "24.04", "26.04"}
-    build_tools = all(tools.get(name) for name in ["git", "cmake", "gcc", "g++", "make"])
+    supported_ubuntu = os_release.get("ID") == "ubuntu" and version_id in {
+        "22.04",
+        "24.04",
+        "26.04",
+    }
+    build_tools = all(
+        tools.get(name) for name in ["git", "cmake", "gcc", "g++", "make"]
+    )
 
     checks = [
         Check("wsl", bool(state.get("is_wsl")), "WSL marker or /dev/dxg detected"),
-        Check("ubuntu", supported_ubuntu, f"Ubuntu VERSION_ID={version_id or '<unknown>'}"),
+        Check(
+            "ubuntu", supported_ubuntu, f"Ubuntu VERSION_ID={version_id or '<unknown>'}"
+        ),
         Check("dxg_device", bool(paths.get("/dev/dxg")), "/dev/dxg"),
-        Check("dxcore", bool(paths.get("/usr/lib/wsl/lib/libdxcore.so")), "/usr/lib/wsl/lib/libdxcore.so"),
+        Check(
+            "dxcore",
+            bool(paths.get("/usr/lib/wsl/lib/libdxcore.so")),
+            "/usr/lib/wsl/lib/libdxcore.so",
+        ),
         Check(
             "windows_sdk",
             bool(sdk_headers),
             "Windows SDK dxcore headers visible from WSL",
             required=require_build_tools,
         ),
-        Check("librocdxg", bool(paths.get("/opt/rocm/lib/librocdxg.so")), "/opt/rocm/lib/librocdxg.so"),
+        Check(
+            "librocdxg",
+            bool(paths.get("/opt/rocm/lib/librocdxg.so")),
+            "/opt/rocm/lib/librocdxg.so",
+        ),
         Check(
             "rocdxg_dids",
             bool(paths.get("/opt/rocm/share/rocdxg/dids.conf")),
             "/opt/rocm/share/rocdxg/dids.conf (not shipped by rocdxg-roct 1.2.0)",
             required=False,
         ),
-        Check("ldconfig_librocdxg", bool(ldconfig.get("librocdxg")), "librocdxg visible through ldconfig -p"),
+        Check(
+            "ldconfig_librocdxg",
+            bool(ldconfig.get("librocdxg")),
+            "librocdxg visible through ldconfig -p",
+        ),
         Check(
             "build_tools",
             build_tools,
@@ -288,7 +309,12 @@ def evaluate(
             "rocminfo command after ROCm/TheRock activation",
             required=require_rocm_tools,
         ),
-        Check("cargo", bool(tools.get("cargo")), "cargo for building rocm-cli in WSL", required=False),
+        Check(
+            "cargo",
+            bool(tools.get("cargo")),
+            "cargo for building rocm-cli in WSL",
+            required=False,
+        ),
     ]
     return checks
 
@@ -299,14 +325,18 @@ def render_human(state: dict[str, Any], checks: list[Check]) -> str:
         lines.append(f"  distro: {state['distro']}")
     if state.get("kernel"):
         lines.append(f"  kernel: {state['kernel']}")
-    os_release = state.get("os_release") if isinstance(state.get("os_release"), dict) else {}
+    os_release = (
+        state.get("os_release") if isinstance(state.get("os_release"), dict) else {}
+    )
     if os_release.get("PRETTY_NAME"):
         lines.append(f"  os: {os_release['PRETTY_NAME']}")
     if state.get("error"):
         lines.append(f"  error: {state['error']}")
     lines.append("  checks:")
     for check in checks:
-        status = "ok" if check.ok else ("missing" if check.required else "optional-missing")
+        status = (
+            "ok" if check.ok else ("missing" if check.required else "optional-missing")
+        )
         lines.append(f"    {check.name}: {status} ({check.detail})")
     if any(not check.ok and check.required for check in checks):
         lines.append("  next:")
@@ -316,7 +346,9 @@ def render_human(state: dict[str, Any], checks: list[Check]) -> str:
 
 
 def self_test() -> None:
-    distros = parse_wsl_list("  NAME      STATE           VERSION\n* Ubuntu    Stopped         2\n")
+    distros = parse_wsl_list(
+        "  NAME      STATE           VERSION\n* Ubuntu    Stopped         2\n"
+    )
     assert distros == ["Ubuntu"], distros
     distros = parse_wsl_list(
         "  NAME      STATE           VERSION\n* Ubuntu    Running         2\n  Debian    Stopped         2\n"
@@ -333,7 +365,15 @@ def self_test() -> None:
             "/opt/rocm/share/rocdxg/dids.conf": False,
         },
         "ldconfig": {"librocdxg": False},
-        "tools": {"git": "/usr/bin/git", "cmake": "/usr/bin/cmake", "gcc": "/usr/bin/gcc", "g++": "/usr/bin/g++", "make": "/usr/bin/make", "rocminfo": None, "cargo": None},
+        "tools": {
+            "git": "/usr/bin/git",
+            "cmake": "/usr/bin/cmake",
+            "gcc": "/usr/bin/gcc",
+            "g++": "/usr/bin/g++",
+            "make": "/usr/bin/make",
+            "rocminfo": None,
+            "cargo": None,
+        },
         "python_venv": True,
         "windows_sdk_headers": ["/mnt/c/sdk/shared/dxcore_interface.h"],
     }
@@ -350,16 +390,30 @@ def self_test() -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--distro", help="WSL distribution name when running from Windows")
-    parser.add_argument("--json", action="store_true", help="print machine-readable JSON")
-    parser.add_argument("--require-ready", action="store_true", help="exit non-zero unless WSL and ROCDXG are ready")
-    parser.add_argument("--require-rocm-tools", action="store_true", help="also require rocminfo")
+    parser.add_argument(
+        "--distro", help="WSL distribution name when running from Windows"
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="print machine-readable JSON"
+    )
+    parser.add_argument(
+        "--require-ready",
+        action="store_true",
+        help="exit non-zero unless WSL and ROCDXG are ready",
+    )
+    parser.add_argument(
+        "--require-rocm-tools", action="store_true", help="also require rocminfo"
+    )
     parser.add_argument(
         "--require-build-tools",
         action="store_true",
         help="also require source-build tools such as the Windows SDK and CMake toolchain",
     )
-    parser.add_argument("--self-test", action="store_true", help="run parser/status self-tests without touching WSL")
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="run parser/status self-tests without touching WSL",
+    )
     args = parser.parse_args()
 
     if args.self_test:

@@ -22,7 +22,6 @@ import tarfile
 import zipfile
 from pathlib import Path
 
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 
@@ -53,7 +52,9 @@ def run(args: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> Non
     print("+ " + " ".join(args))
     completed = subprocess.run(args, cwd=cwd, env=env, text=True, check=False)
     if completed.returncode != 0:
-        raise ReleaseBuildError(f"command failed with exit {completed.returncode}: {' '.join(args)}")
+        raise ReleaseBuildError(
+            f"command failed with exit {completed.returncode}: {' '.join(args)}"
+        )
 
 
 def sha256_file(path: Path) -> str:
@@ -84,14 +85,20 @@ def cargo_build_release(repo_root: Path, jobs: int | None) -> None:
     env = os.environ.copy()
     if jobs is not None:
         env["CARGO_BUILD_JOBS"] = str(jobs)
-    run(["cargo", "build", "--release", "--workspace", "--bins"], cwd=repo_root, env=env)
+    run(
+        ["cargo", "build", "--release", "--workspace", "--bins"], cwd=repo_root, env=env
+    )
 
 
 def cargo_build_rocm_release(repo_root: Path, jobs: int | None) -> None:
     env = os.environ.copy()
     if jobs is not None:
         env["CARGO_BUILD_JOBS"] = str(jobs)
-    run(["cargo", "build", "--release", "-p", "rocm", "--bin", "rocm"], cwd=repo_root, env=env)
+    run(
+        ["cargo", "build", "--release", "-p", "rocm", "--bin", "rocm"],
+        cwd=repo_root,
+        env=env,
+    )
 
 
 def strip_tool_for(platform: str) -> str | None:
@@ -165,7 +172,9 @@ def platform_install_script(platform: str) -> str:
 
 def create_zip(root: Path, archive: Path) -> None:
     archive.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as package:
+    with zipfile.ZipFile(
+        archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
+    ) as package:
         for path in sorted(root.rglob("*")):
             if path.is_dir():
                 continue
@@ -184,7 +193,9 @@ def reset_tar_info(info: tarfile.TarInfo) -> tarfile.TarInfo:
 def create_tar_gz(root: Path, archive: Path) -> None:
     archive.parent.mkdir(parents=True, exist_ok=True)
     with archive.open("wb") as raw:
-        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, compresslevel=9, mtime=0) as gz:
+        with gzip.GzipFile(
+            filename="", mode="wb", fileobj=raw, compresslevel=9, mtime=0
+        ) as gz:
             with tarfile.open(fileobj=gz, mode="w") as package:
                 package.add(root, arcname=root.name, filter=reset_tar_info)
 
@@ -201,7 +212,9 @@ def assert_no_codex(archive: Path) -> None:
         raise ReleaseBuildError(f"unsupported archive type: {archive}")
     offenders = [name for name in names if "rocm-codex" in name or "/codex" in name]
     if offenders:
-        raise ReleaseBuildError(f"Codex binary leaked into release archive: {offenders[:3]}")
+        raise ReleaseBuildError(
+            f"Codex binary leaked into release archive: {offenders[:3]}"
+        )
 
 
 def stage_platform_release(
@@ -237,7 +250,9 @@ def stage_platform_release(
     for name in ["README.md", "LICENSE", platform_install_script(platform)]:
         copy_required(repo_root / name, staging_root / name)
 
-    archive = output_dir / (f"{dist_name}.zip" if platform == "windows-amd64" else f"{dist_name}.tar.gz")
+    archive = output_dir / (
+        f"{dist_name}.zip" if platform == "windows-amd64" else f"{dist_name}.tar.gz"
+    )
     if archive.exists():
         archive.unlink()
     if platform == "windows-amd64":
@@ -274,7 +289,9 @@ def build_standalone_release(
 
     binary = standalone_binary(platform)
     source = repo_root / "target" / "release" / binary
-    destination = output.resolve() if output is not None else output_dir.resolve() / binary
+    destination = (
+        output.resolve() if output is not None else output_dir.resolve() / binary
+    )
     copy_required(source, destination)
     if strip_binary:
         maybe_strip(destination, platform=platform)
@@ -334,26 +351,42 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    standalone = subparsers.add_parser("standalone", help="Build the standalone rocm-cli binary.")
+    standalone = subparsers.add_parser(
+        "standalone", help="Build the standalone rocm-cli binary."
+    )
     standalone.add_argument("--repo-root", type=Path, default=REPO_ROOT)
-    standalone.add_argument("--output-dir", type=Path, default=REPO_ROOT / ".rocm-work" / "standalone-release")
+    standalone.add_argument(
+        "--output-dir",
+        type=Path,
+        default=REPO_ROOT / ".rocm-work" / "standalone-release",
+    )
     standalone.add_argument("--output", type=Path)
-    standalone.add_argument("--platform", choices=sorted(PLATFORMS), default=current_platform())
+    standalone.add_argument(
+        "--platform", choices=sorted(PLATFORMS), default=current_platform()
+    )
     standalone.add_argument("--skip-cargo-build", action="store_true")
     standalone.add_argument("--no-strip", action="store_true")
     standalone.add_argument("--write-sha256", action="store_true")
     standalone.add_argument("--jobs", type=int, default=96)
 
-    stage = subparsers.add_parser("stage-platform", help="Build and archive the current platform payload.")
+    stage = subparsers.add_parser(
+        "stage-platform", help="Build and archive the current platform payload."
+    )
     stage.add_argument("--repo-root", type=Path, default=REPO_ROOT)
-    stage.add_argument("--output-dir", type=Path, default=REPO_ROOT / ".rocm-work" / "platform-release")
+    stage.add_argument(
+        "--output-dir", type=Path, default=REPO_ROOT / ".rocm-work" / "platform-release"
+    )
     stage.add_argument("--version", default="0.2.0")
-    stage.add_argument("--platform", choices=sorted(PLATFORMS), default=current_platform())
+    stage.add_argument(
+        "--platform", choices=sorted(PLATFORMS), default=current_platform()
+    )
     stage.add_argument("--skip-cargo-build", action="store_true")
     stage.add_argument("--no-strip", action="store_true")
     stage.add_argument("--jobs", type=int, default=96)
 
-    self_test = subparsers.add_parser("self-test", help="Run offline archive policy tests.")
+    self_test = subparsers.add_parser(
+        "self-test", help="Run offline archive policy tests."
+    )
     self_test.add_argument(
         "--root",
         type=Path,

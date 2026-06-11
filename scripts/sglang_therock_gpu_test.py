@@ -65,7 +65,9 @@ def main() -> int:
     detect = run_json([str(engine), "detect"], env=env, timeout=args.timeout)
     assert_sglang_gpu_detected(detect)
 
-    capabilities = run_json([str(engine), "capabilities"], env=env, timeout=args.timeout)
+    capabilities = run_json(
+        [str(engine), "capabilities"], env=env, timeout=args.timeout
+    )
     if capabilities.get("cpu"):
         raise RuntimeError("SGLang capabilities unexpectedly report CPU support")
     if not capabilities.get("rocm_gpu"):
@@ -137,7 +139,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--engine", default=str(default_engine))
     parser.add_argument(
         "--model",
-        default=os.environ.get("ROCM_CLI_SGLANG_TEST_MODEL", "Qwen/Qwen2.5-1.5B-Instruct"),
+        default=os.environ.get(
+            "ROCM_CLI_SGLANG_TEST_MODEL", "Qwen/Qwen2.5-1.5B-Instruct"
+        ),
         help="small Hugging Face model id or local model path served by SGLang",
     )
     parser.add_argument(
@@ -205,7 +209,9 @@ def wait_sglang_openai_ready(host: str, port: int, timeout: int) -> dict[str, An
         except Exception as exc:  # noqa: BLE001
             last_error = exc
         time.sleep(0.5)
-    raise RuntimeError(f"SGLang OpenAI model endpoint did not become ready: {last_error}")
+    raise RuntimeError(
+        f"SGLang OpenAI model endpoint did not become ready: {last_error}"
+    )
 
 
 def resolve_runtime_id(explicit: str | None) -> str:
@@ -261,7 +267,9 @@ def load_runtime_registry_manifests(registry_dir: Path) -> list[dict[str, str]]:
 
 
 def run_self_test() -> int:
-    scratch_root = Path(__file__).resolve().parents[1] / ".rocm-work" / "script-self-tests"
+    scratch_root = (
+        Path(__file__).resolve().parents[1] / ".rocm-work" / "script-self-tests"
+    )
     scratch_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="sglang-", dir=scratch_root) as temp:
         root = Path(temp)
@@ -270,8 +278,12 @@ def run_self_test() -> int:
         registry_dir = data_dir / "runtimes" / "registry"
         registry_dir.mkdir(parents=True)
         config_dir.mkdir(parents=True)
-        write_runtime_manifest(registry_dir, "runtime-old", "therock-release:gfx120X-all")
-        write_runtime_manifest(registry_dir, "runtime-new", "therock-release:gfx120X-all")
+        write_runtime_manifest(
+            registry_dir, "runtime-old", "therock-release:gfx120X-all"
+        )
+        write_runtime_manifest(
+            registry_dir, "runtime-new", "therock-release:gfx120X-all"
+        )
         write_runtime_manifest(registry_dir, "runtime-other", "therock-release:gfx1151")
         write_config(
             config_dir,
@@ -313,7 +325,9 @@ def run_self_test() -> int:
                 raise AssertionError("external SGLang override did not fail")
             os.environ.pop("ROCM_CLI_SGLANG_COMMAND", None)
 
-            write_config(config_dir, {"default_runtime_id": "therock-release:gfx120X-all"})
+            write_config(
+                config_dir, {"default_runtime_id": "therock-release:gfx120X-all"}
+            )
             try:
                 resolve_runtime_id(None)
             except RuntimeError as exc:
@@ -434,7 +448,9 @@ def verify_managed_env(state: dict[str, Any]) -> dict[str, str]:
     runtime_root = runtime_env.get("root")
     runtime_bin = runtime_env.get("bin")
     if not pid or not runtime_root:
-        raise RuntimeError("state is missing server_pid/pid or therock_runtime_env.root")
+        raise RuntimeError(
+            "state is missing server_pid/pid or therock_runtime_env.root"
+        )
     environ_path = Path("/proc") / str(int(pid)) / "environ"
     if not environ_path.is_file():
         raise RuntimeError(f"process environ file was not found: {environ_path}")
@@ -463,16 +479,22 @@ def verify_managed_env(state: dict[str, Any]) -> dict[str, str]:
             )
     expected_runtime_id = runtime_env.get("runtime_id")
     if env.get("ROCM_CLI_THEROCK_RUNTIME_ID") != expected_runtime_id:
-        raise RuntimeError("ROCM_CLI_THEROCK_RUNTIME_ID does not match managed runtime state")
+        raise RuntimeError(
+            "ROCM_CLI_THEROCK_RUNTIME_ID does not match managed runtime state"
+        )
     return {key: env[key] for key in expected if key in env}
 
 
-def verify_loaded_modules(state: dict[str, Any], math_modules: list[str]) -> dict[str, str]:
+def verify_loaded_modules(
+    state: dict[str, Any], math_modules: list[str]
+) -> dict[str, str]:
     pid = state.get("server_pid") or state.get("pid")
     runtime_env = state.get("therock_runtime_env") or {}
     runtime_root = runtime_env.get("root")
     if not pid or not runtime_root:
-        raise RuntimeError("state is missing server_pid/pid or therock_runtime_env.root")
+        raise RuntimeError(
+            "state is missing server_pid/pid or therock_runtime_env.root"
+        )
     maps_path = Path("/proc") / str(int(pid)) / "maps"
     if not maps_path.is_file():
         raise RuntimeError(f"process maps file was not found: {maps_path}")
@@ -490,7 +512,9 @@ def verify_loaded_modules(state: dict[str, Any], math_modules: list[str]) -> dic
         raise RuntimeError(f"missing loaded HIP module: {HIP_MODULE}")
     math_loaded = sorted(set(math_modules) & set(module_paths))
     if not math_loaded:
-        raise RuntimeError(f"missing loaded ROCm math module; expected one of {math_modules}")
+        raise RuntimeError(
+            f"missing loaded ROCm math module; expected one of {math_modules}"
+        )
 
     roots = managed_therock_module_roots(Path(runtime_root))
     for module, path in module_paths.items():

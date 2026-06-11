@@ -18,15 +18,14 @@ import os
 import platform
 import re
 import shutil
-import tempfile
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 18188
@@ -146,17 +145,22 @@ def main() -> int:
             generated_image = generate_cat_image(args, checkpoint_name, repo_root)
             print_step(f"Generated image: {generated_image}")
 
-        print_step("Success: ComfyUI is reachable through ROCm CLI with AMD GPU checks.")
-        print(json.dumps(
-            {
-                "ok": True,
-                "url": f"http://{args.host}:{args.port}",
-                "pid": started_pid,
-                "installed": not args.skip_install,
-                "generated_image": str(generated_image) if generated_image else None,
-            },
-            indent=2,
+        print_step(
+            "Success: ComfyUI is reachable through ROCm CLI with AMD GPU checks."
         )
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "url": f"http://{args.host}:{args.port}",
+                    "pid": started_pid,
+                    "installed": not args.skip_install,
+                    "generated_image": str(generated_image)
+                    if generated_image
+                    else None,
+                },
+                indent=2,
+            )
         )
     finally:
         if started_service and not args.keep_running:
@@ -259,7 +263,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="fail if the requested checkpoint is not already present",
     )
-    parser.add_argument("--output-dir", help="folder for the downloaded generated image")
+    parser.add_argument(
+        "--output-dir", help="folder for the downloaded generated image"
+    )
     parser.add_argument("--seed", type=int, default=20260605)
     parser.add_argument("--width", type=int, default=DEFAULT_IMAGE_WIDTH)
     parser.add_argument("--height", type=int, default=DEFAULT_IMAGE_HEIGHT)
@@ -497,7 +503,9 @@ def wait_comfyui_endpoint(host: str, port: int, timeout: int) -> dict[str, Any]:
 def assert_comfyui_reports_gpu(stats: dict[str, Any]) -> None:
     devices = stats.get("devices")
     if not isinstance(devices, list) or not devices:
-        raise RuntimeError(f"ComfyUI did not report any devices:\n{json.dumps(stats, indent=2)}")
+        raise RuntimeError(
+            f"ComfyUI did not report any devices:\n{json.dumps(stats, indent=2)}"
+        )
 
     gpu_devices = []
     cpu_devices = []
@@ -593,11 +601,7 @@ def download_file(url: str, destination: Path, expected_size: int) -> None:
                     print_step(
                         "Checkpoint download "
                         f"{format_bytes(downloaded)}"
-                        + (
-                            f" / {format_bytes(total_size)}"
-                            if total_size > 0
-                            else ""
-                        )
+                        + (f" / {format_bytes(total_size)}" if total_size > 0 else "")
                     )
                     last_report = now
     part.replace(destination)
@@ -738,11 +742,7 @@ def checkpoint_choices_from_object_info(info: dict[str, Any]) -> list[str]:
     if not isinstance(required, dict):
         return []
     ckpt_info = required.get("ckpt_name")
-    if (
-        isinstance(ckpt_info, list)
-        and ckpt_info
-        and isinstance(ckpt_info[0], list)
-    ):
+    if isinstance(ckpt_info, list) and ckpt_info and isinstance(ckpt_info[0], list):
         return [str(value) for value in ckpt_info[0]]
     return []
 
@@ -758,7 +758,9 @@ def queue_prompt(host: str, port: int, workflow: dict[str, Any]) -> str:
     )
     node_errors = response.get("node_errors")
     if node_errors:
-        raise RuntimeError(f"ComfyUI rejected the workflow:\n{json.dumps(response, indent=2)}")
+        raise RuntimeError(
+            f"ComfyUI rejected the workflow:\n{json.dumps(response, indent=2)}"
+        )
     prompt_id = response.get("prompt_id")
     if not isinstance(prompt_id, str) or not prompt_id:
         raise RuntimeError(f"ComfyUI /prompt did not return a prompt_id:\n{response}")
@@ -812,7 +814,11 @@ def prompt_failed(status: Any) -> bool:
         return False
     status_text = str(status.get("status_str", "")).lower()
     completed = status.get("completed")
-    return status_text in {"error", "failed"} or completed is False and "error" in status_text
+    return (
+        status_text in {"error", "failed"}
+        or completed is False
+        and "error" in status_text
+    )
 
 
 def extract_output_images(history_entry: dict[str, Any]) -> list[dict[str, str]]:
@@ -864,7 +870,9 @@ def download_generated_image(
     destination = output_dir / Path(image["filename"]).name
     destination.write_bytes(data)
     if not data.startswith(b"\x89PNG") and not data.startswith(b"\xff\xd8"):
-        raise RuntimeError(f"downloaded output does not look like an image: {destination}")
+        raise RuntimeError(
+            f"downloaded output does not look like an image: {destination}"
+        )
     return destination
 
 
@@ -1016,12 +1024,13 @@ def run_self_test() -> int:
     else:
         raise AssertionError("CPU fallback output was incorrectly accepted")
 
-    assert parse_comfyui_root("ComfyUI\n  folder: /tmp/ComfyUI\n") == Path("/tmp/ComfyUI")
-    with tempfile.TemporaryDirectory(
-        prefix="rocm-cli-comfyui-copy-source-"
-    ) as src_text, tempfile.TemporaryDirectory(
-        prefix="rocm-cli-comfyui-copy-dest-"
-    ) as dst_text:
+    assert parse_comfyui_root("ComfyUI\n  folder: /tmp/ComfyUI\n") == Path(
+        "/tmp/ComfyUI"
+    )
+    with (
+        tempfile.TemporaryDirectory(prefix="rocm-cli-comfyui-copy-source-") as src_text,
+        tempfile.TemporaryDirectory(prefix="rocm-cli-comfyui-copy-dest-") as dst_text,
+    ):
         source = Path(src_text)
         dest = Path(dst_text)
         (source / "runtimes" / "registry").mkdir(parents=True)

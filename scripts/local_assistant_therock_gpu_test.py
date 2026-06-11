@@ -21,9 +21,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from urllib.parse import urlparse
 from typing import Any
-
+from urllib.parse import urlparse
 
 DEFAULT_MODEL = "qwen"
 DEFAULT_ENGINE = "lemonade"
@@ -118,21 +117,25 @@ def run_live_acceptance(
 
         summary = {
             "ok": True,
-        "message": "Success: local assistant reached a managed ROCm GPU service.",
+            "message": "Success: local assistant reached a managed ROCm GPU service.",
             "service_id": service_id,
             "model": chat_model,
             "endpoint": manifest.get("endpoint_url"),
             "runtime_id": manifest.get("runtime_id"),
             "env_id": manifest.get("env_id"),
             "device_policy": manifest.get("device_policy"),
-            "manifest_path": str(manifest_path or service_manifest_path(data_dir, service_id)),
+            "manifest_path": str(
+                manifest_path or service_manifest_path(data_dir, service_id)
+            ),
         }
         print_step("Success: local assistant used the managed local service.")
         print(json.dumps(summary, indent=2))
     finally:
         if started_service and not args.keep_running and service_id:
             print_step(f"Stopping managed service {service_id}.")
-            stop_cmd = build_rocm_command(args, rocm, "services", "stop", service_id, "--yes")
+            stop_cmd = build_rocm_command(
+                args, rocm, "services", "stop", service_id, "--yes"
+            )
             stop_output = run_text(stop_cmd, env=env, timeout=args.timeout, check=False)
             print(stop_output, end="" if stop_output.endswith("\n") else "\n")
 
@@ -369,7 +372,9 @@ def service_manifest_path(data_dir: Path, service_id: str) -> Path:
     return data_dir / "services" / f"{service_id}.json"
 
 
-def wait_ready_manifest(data_dir: Path, service_id: str, timeout: int) -> dict[str, Any]:
+def wait_ready_manifest(
+    data_dir: Path, service_id: str, timeout: int
+) -> dict[str, Any]:
     path = service_manifest_path(data_dir, service_id)
     return wait_ready_manifest_path(path, timeout)
 
@@ -414,13 +419,17 @@ def runtime_path_to_host_path(value: str) -> Path:
             and normalized[1].isalpha()
             and normalized[2] == "/"
         ):
-            return Path(f"{normalized[1].upper()}:\\" + normalized[3:].replace("/", "\\"))
+            return Path(
+                f"{normalized[1].upper()}:\\" + normalized[3:].replace("/", "\\")
+            )
     return Path(value)
 
 
 def assert_service_manifest(manifest: dict[str, Any], *, expected_engine: str) -> None:
     if manifest.get("engine") != expected_engine:
-        raise RuntimeError(f"expected {expected_engine} service, got {manifest.get('engine')}")
+        raise RuntimeError(
+            f"expected {expected_engine} service, got {manifest.get('engine')}"
+        )
     if manifest.get("device_policy") != "gpu_required":
         raise RuntimeError(
             "managed service did not record gpu_required device policy; "
@@ -450,9 +459,7 @@ def wait_local_endpoint(manifest: dict[str, Any], timeout: int) -> None:
     if not isinstance(engine_state, dict):
         engine_state = {}
     lemonade_direct_rocm = engine == "lemonade" and str(
-        engine_state.get("backend_requested")
-        or manifest.get("backend_requested")
-        or ""
+        engine_state.get("backend_requested") or manifest.get("backend_requested") or ""
     ).strip().lower().startswith("rocm")
     probes = (
         [("/v1/health", "health"), ("/v1/models", "models")]
@@ -514,7 +521,9 @@ def endpoint_payload_has_loaded_model(
     if not isinstance(entries, list):
         return False
     return any(
-        payload_entry_matches_model(entry, model_names, require_rocm_backend=require_rocm_backend)
+        payload_entry_matches_model(
+            entry, model_names, require_rocm_backend=require_rocm_backend
+        )
         for entry in entries
         if isinstance(entry, dict)
     )
@@ -527,8 +536,7 @@ def payload_entry_matches_model(
     require_rocm_backend: bool,
 ) -> bool:
     loaded_names = [
-        str(entry.get(field) or "")
-        for field in ("model_name", "id", "model", "name")
+        str(entry.get(field) or "") for field in ("model_name", "id", "model", "name")
     ]
     name_matches = any(
         service_model_names_match(loaded, expected)
@@ -593,8 +601,7 @@ def assert_chat_output(output: str, *, require_tool_call: bool) -> None:
         if "ROCm checks used" not in output or "none requested" in output:
             raise RuntimeError(
                 "local assistant did not request a ROCm tool call; retry without "
-                "--require-tool-call or choose a tool-calling model/prompt.\n"
-                + output
+                "--require-tool-call or choose a tool-calling model/prompt.\n" + output
             )
 
 
@@ -654,7 +661,9 @@ def find_latest_service_id(data_dir: Path, model: str, engine: str) -> str:
         service_id = manifest.get("service_id")
         if not isinstance(service_id, str) or not service_id:
             continue
-        created = int(manifest.get("created_at_unix_ms") or path.stat().st_mtime_ns // 1_000_000)
+        created = int(
+            manifest.get("created_at_unix_ms") or path.stat().st_mtime_ns // 1_000_000
+        )
         matches.append((created, service_id))
     if not matches:
         raise RuntimeError(
@@ -666,7 +675,9 @@ def find_latest_service_id(data_dir: Path, model: str, engine: str) -> str:
 
 
 def localize_huggingface_cache(env: dict[str, str], repo_root: Path) -> None:
-    cache_root = Path(env.get("ROCM_CLI_CACHE_DIR", repo_root / "target" / "test-cache"))
+    cache_root = Path(
+        env.get("ROCM_CLI_CACHE_DIR", repo_root / "target" / "test-cache")
+    )
     hf_root = cache_root / "huggingface"
     env.setdefault("HF_HOME", str(hf_root))
     env.setdefault("HUGGINGFACE_HUB_CACHE", str(hf_root / "hub"))
@@ -695,11 +706,14 @@ def run_self_test() -> int:
     assert chat[:2] == ["sh", str(fake_rocm)]
     assert "--tools" in chat
     assert "--provider" in chat and "local" in chat
-    assert parse_service_id("managed service launched\n  service_id: svc-qwen\n") == "svc-qwen"
-    assert parse_service_id("managed service launched\n") is None
-    assert parse_manifest_path("managed service launched\n  manifest_path: /tmp/svc.json\n") == Path(
-        "/tmp/svc.json"
+    assert (
+        parse_service_id("managed service launched\n  service_id: svc-qwen\n")
+        == "svc-qwen"
     )
+    assert parse_service_id("managed service launched\n") is None
+    assert parse_manifest_path(
+        "managed service launched\n  manifest_path: /tmp/svc.json\n"
+    ) == Path("/tmp/svc.json")
     with tempfile.TemporaryDirectory() as temp:
         data_dir = Path(temp)
         services = data_dir / "services"
@@ -752,8 +766,13 @@ def run_self_test() -> int:
         )
         assert find_ready_service_id(data_dir, "qwen", "lemonade") == "svc-qwen"
         assert find_latest_service_id(data_dir, "qwen", "lemonade") == "svc-qwen"
-    assert rocm_cli_data_dir({"ROCM_CLI_DATA_DIR": "custom-data"}) == Path("custom-data")
-    with tempfile.TemporaryDirectory() as src_text, tempfile.TemporaryDirectory() as dst_text:
+    assert rocm_cli_data_dir({"ROCM_CLI_DATA_DIR": "custom-data"}) == Path(
+        "custom-data"
+    )
+    with (
+        tempfile.TemporaryDirectory() as src_text,
+        tempfile.TemporaryDirectory() as dst_text,
+    ):
         source = Path(src_text)
         dest = Path(dst_text)
         (source / "runtimes" / "registry").mkdir(parents=True)
