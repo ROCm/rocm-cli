@@ -1,0 +1,122 @@
+//! Live metric types. snake_case + units encoded in field names.
+//! See `../wiki/concepts/metric-registry.md` and `../wiki/data/metric-field-index.md`.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::partition::{ComputePartitionMode, MemoryPartitionMode};
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Snapshot {
+    pub timestamp: DateTime<Utc>,
+    pub host: SystemMetrics,
+    pub gpus: Vec<GpuMetrics>,
+    pub gpu_system_info: Option<GpuSystemInfo>,
+    pub instances: Vec<Instance>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SystemMetrics {
+    pub cpu_overall_pct: f32,
+    pub cpu_per_core_pct: Vec<f32>,
+    pub memory_used_mb: u64,
+    pub memory_total_mb: u64,
+    pub swap_used_mb: u64,
+    pub swap_total_mb: u64,
+    pub disk_read_bps: u64,
+    pub disk_write_bps: u64,
+    pub net_rx_bps: u64,
+    pub net_tx_bps: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GpuMetrics {
+    pub device_id: String,
+    pub vram_used_mb: u64,
+    pub vram_total_mb: u64,
+    pub gpu_utilization_pct: f32,
+    pub temperature_c: f32,
+    pub power_w: f32,
+    pub clock_mhz: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GpuSystemInfo {
+    pub rocm_version: Option<String>,
+    pub driver_version: Option<String>,
+    pub gpu_model: String,
+    pub physical_gpu_count: u32,
+    pub logical_gpu_count: u32,
+    pub partition_mode: ComputePartitionMode,
+    pub memory_partition_mode: MemoryPartitionMode,
+    pub compute_partition_mode: ComputePartitionMode,
+    pub vram_per_logical_gpu_mb: u64,
+    pub lemond_version: Option<String>,
+    pub llama_server_build: Option<String>,
+    pub ccr_version: Option<String>,
+    pub llamacpp_backend: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum InstanceStatus {
+    Running,
+    Starting,
+    Stopped,
+    Error,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Instance {
+    pub container_id: String,
+    pub container_name: String,
+    pub status: InstanceStatus,
+    pub model_name: String,
+    pub gpu_ids: Vec<String>,
+    pub partition_info: Option<String>,
+    pub quantization: Option<String>,
+    pub tensor_parallel_size: u32,
+    pub port: Option<u16>,
+    pub vram_used_mb: u64,
+    pub vram_total_mb: u64,
+    pub kv_cache_usage_pct: Option<f32>,
+    pub running_reqs: Option<u32>,
+    pub waiting_reqs: Option<u32>,
+    /// Live generation throughput (tokens/s), derived from the vLLM
+    /// `generation_tokens_total` counter rate. `None` until two scrapes seen.
+    #[serde(default)]
+    pub gen_tps: Option<f64>,
+    /// Efficiency: `gen_tps` ÷ summed power (W) of the GPUs this instance
+    /// occupies. `None` when throughput or GPU power telemetry is unavailable.
+    #[serde(default)]
+    pub tokens_per_watt: Option<f64>,
+    pub launch_args: Vec<String>,
+    pub env_vars: std::collections::BTreeMap<String, String>,
+    pub log_file: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn instance_deserializes_without_efficiency_fields() {
+        // Replay back-compat: NDJSON sessions recorded before tokens_per_watt
+        // existed must still load, defaulting the new fields to None.
+        let legacy = r#"{
+            "container_id": "c1", "container_name": "vllm-a", "status": "running",
+            "model_name": "deepseek-r1", "gpu_ids": ["0"], "partition_info": null,
+            "quantization": null, "tensor_parallel_size": 1, "port": 8000,
+            "vram_used_mb": 0, "vram_total_mb": 0, "kv_cache_usage_pct": 42.0,
+            "running_reqs": 3, "waiting_reqs": 0, "launch_args": [], "env_vars": {},
+            "log_file": null
+        }"#;
+        let inst: Instance = serde_json::from_str(legacy).expect("legacy instance must parse");
+        assert_eq!(inst.gen_tps, None);
+        assert_eq!(inst.tokens_per_watt, None);
+        assert_eq!(inst.kv_cache_usage_pct, Some(42.0));
+    }
+}
