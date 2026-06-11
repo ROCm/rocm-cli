@@ -1,0 +1,11 @@
+.gitattributes text eol=lf
+.gitignore text eol=lf
+/*.toml text eol=lf
+/*.md text eol=lf
+/apps/** text eol=lf
+/crates/** text eol=lf
+/docs/** text eol=lf
+/engines/** text eol=lf
+/plans/** text eol=lf
+/scripts/** text eol=lf
+*.sh text eol=lf

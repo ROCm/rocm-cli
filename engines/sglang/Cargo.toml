@@ -1,0 +1,19 @@
+[package]
+name = "rocm-engine-sglang"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rocm-engine-sglang"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rocm-core = { path = "../../crates/rocm-core" }
+rocm-engine-protocol = { path = "../../crates/rocm-engine-protocol" }
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,12 @@
+/target
+/target-codex-*
+/target-rocm-*
+/.worktrees/
+/.rocm-work/
+/dist
+/.idea
+/.vscode
+*.log
+active-implementation-log.md
+current-user-asks.md
+__pycache__/

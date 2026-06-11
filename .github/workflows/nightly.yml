@@ -1,0 +1,252 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  nightly:
+    name: Build Linux nightly assets
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+      date: ${{ steps.meta.outputs.date }}
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+      staging_tag: ${{ steps.staging.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check for changes since last nightly
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          LAST=$(gh release view nightly --json createdAt --jq .createdAt 2>/dev/null || echo "1970-01-01T00:00:00Z")
+          COMMITS=$(git log --since="${LAST}" --oneline | wc -l)
+          echo "commits=${COMMITS}" >> "$GITHUB_OUTPUT"
+          if [ "${COMMITS}" -eq 0 ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "No new commits since last nightly — skipping"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "${COMMITS} new commit(s) since last nightly"
+          fi
+
+      - name: Build release binaries
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          docker run --rm \
+            -u "$(id -u):$(id -g)" \
+            -e HOME=/tmp/rocm-cli-home \
+            -v "$PWD":/work \
+            -w /work \
+            quay.io/pypa/manylinux2014_x86_64 \
+            /bin/bash -lc '
+              set -euo pipefail
+              mkdir -p "$HOME"
+              yum install -y pkgconfig libcap-devel
+              curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+              export PATH="$HOME/.cargo/bin:$PATH"
+              cargo build --release --workspace
+              chmod +x scripts/build-vendored-codex.sh
+              ./scripts/build-vendored-codex.sh release
+            '
+
+      - name: Set nightly metadata
+        id: meta
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Package nightly bundle
+        if: steps.check.outputs.skip != 'true'
+        env:
+          ROCM_CLI_SIGNING_PRIVATE_KEY_PEM: ${{ secrets.ROCM_CLI_SIGNING_PRIVATE_KEY_PEM }}
+          ROCM_CLI_REQUIRE_SIGNATURE: "1"
+        run: |
+          DATE="${{ steps.meta.outputs.date }}"
+          SHORT_SHA="${{ steps.meta.outputs.short_sha }}"
+          DIST="rocm-cli-nightly-${DATE}-${SHORT_SHA}-linux-amd64"
+
+          chmod +x install.sh scripts/package-linux-release.sh
+          ./scripts/package-linux-release.sh "${DIST}"
+
+          cp "dist/${DIST}.tar.gz" dist/rocm-cli-nightly-linux-amd64.tar.gz
+          (cd dist && sha256sum rocm-cli-nightly-linux-amd64.tar.gz > rocm-cli-nightly-linux-amd64.tar.gz.sha256)
+          if [ -f "dist/${DIST}.tar.gz.sig" ]; then
+            cp "dist/${DIST}.tar.gz.sig" dist/rocm-cli-nightly-linux-amd64.tar.gz.sig
+          else
+            echo "nightly signature was not produced" >&2
+            exit 1
+          fi
+          python scripts/release_readiness.py \
+            --dist dist \
+            --require-signatures \
+            --require-rocm-asset-names \
+            --require-exact-assets \
+            --asset "${DIST}.tar.gz" \
+            --asset rocm-cli-nightly-linux-amd64.tar.gz
+
+          echo "DIST=${DIST}" >> "$GITHUB_ENV"
+          echo "DATE=${DATE}" >> "$GITHUB_ENV"
+          echo "SHORT_SHA=${SHORT_SHA}" >> "$GITHUB_ENV"
+
+      - name: Create staging nightly release
+        id: staging
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          STAGING_TAG="nightly-staging-${DATE}-${SHORT_SHA}"
+          gh release delete "${STAGING_TAG}" --yes --cleanup-tag 2>/dev/null || true
+
+          gh release create "${STAGING_TAG}" \
+            --draft \
+            --title "rocm-cli nightly (${DATE} · ${SHORT_SHA})" \
+            --notes "$(cat <<EOF
+          Automated nightly build from \`main\` at $(date -u +"%Y-%m-%d %H:%M UTC").
+
+          Commit: [\`${SHORT_SHA}\`](https://github.com/${{ github.repository }}/commit/$(git rev-parse HEAD))
+
+          ${{ steps.check.outputs.commits }} commit(s) since the previous nightly.
+
+          Install the latest nightly on Linux x86_64:
+
+          \`\`\`bash
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh -s -- nightly
+          \`\`\`
+
+          Install the latest nightly on Windows x86_64 from PowerShell:
+
+          \`\`\`powershell
+          \$script = "\$env:TEMP\install-rocm-cli.ps1"; irm https://raw.githubusercontent.com/${{ github.repository }}/main/install.ps1 -OutFile \$script; powershell -ExecutionPolicy Bypass -File \$script nightly
+          \`\`\`
+          EOF
+          )" \
+            --prerelease \
+            dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.sig
+
+          echo "tag=${STAGING_TAG}" >> "$GITHUB_OUTPUT"
+
+  windows-nightly:
+    name: Build and upload Windows nightly
+    runs-on: windows-latest
+    needs: nightly
+    if: needs.nightly.outputs.skip != 'true'
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binaries
+        shell: pwsh
+        run: cargo build --release --workspace
+
+      - name: Package Windows bundle
+        shell: pwsh
+        env:
+          ROCM_CLI_SIGNING_PRIVATE_KEY_PEM: ${{ secrets.ROCM_CLI_SIGNING_PRIVATE_KEY_PEM }}
+          ROCM_CLI_REQUIRE_SIGNATURE: "1"
+        run: |
+          $date = "${{ needs.nightly.outputs.date }}"
+          $shortSha = "${{ needs.nightly.outputs.short_sha }}"
+          $dist = "rocm-cli-nightly-$date-$shortSha-windows-amd64"
+          .\scripts\package-windows-release.ps1 $dist
+          Copy-Item "dist\$dist.zip" "dist\rocm-cli-nightly-windows-amd64.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath "dist\rocm-cli-nightly-windows-amd64.zip").Hash.ToLowerInvariant()
+          Set-Content -LiteralPath "dist\rocm-cli-nightly-windows-amd64.zip.sha256" -Value "$hash  rocm-cli-nightly-windows-amd64.zip" -Encoding ascii
+          if (Test-Path "dist\$dist.zip.sig") {
+            Copy-Item "dist\$dist.zip.sig" "dist\rocm-cli-nightly-windows-amd64.zip.sig"
+          } else {
+            throw "nightly signature was not produced"
+          }
+          python .\scripts\release_readiness.py `
+            --dist dist `
+            --require-signatures `
+            --require-rocm-asset-names `
+            --require-exact-assets `
+            --asset "$dist.zip" `
+            --asset rocm-cli-nightly-windows-amd64.zip
+
+      - name: Upload Windows nightly assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $stagingTag = "${{ needs.nightly.outputs.staging_tag }}"
+          if (-not $stagingTag) {
+            throw "nightly staging release tag was not produced"
+          }
+          if (-not (Get-ChildItem dist -File -Include *.sig -Recurse)) {
+            throw "nightly signatures are required"
+          }
+          $assets = Get-ChildItem dist -File -Include *.zip,*.sha256,*.sig -Recurse | ForEach-Object { $_.FullName }
+          gh release upload $stagingTag @assets --clobber
+
+  publish-nightly:
+    name: Publish nightly
+    runs-on: ubuntu-latest
+    needs:
+      - nightly
+      - windows-nightly
+    if: needs.nightly.outputs.skip != 'true'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Publish staged nightly
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          STAGING_TAG="${{ needs.nightly.outputs.staging_tag }}"
+          DATE="${{ needs.nightly.outputs.date }}"
+          SHORT_SHA="${{ needs.nightly.outputs.short_sha }}"
+          ASSET_DIR="$(mktemp -d)"
+          if [ -z "${STAGING_TAG}" ]; then
+            echo "nightly staging release tag was not produced" >&2
+            exit 1
+          fi
+
+          gh release download "${STAGING_TAG}" --dir "${ASSET_DIR}"
+          python scripts/release_readiness.py \
+            --dist "${ASSET_DIR}" \
+            --require-signatures \
+            --require-rocm-asset-names \
+            --require-exact-assets \
+            --asset "rocm-cli-nightly-${DATE}-${SHORT_SHA}-linux-amd64.tar.gz" \
+            --asset rocm-cli-nightly-linux-amd64.tar.gz \
+            --asset "rocm-cli-nightly-${DATE}-${SHORT_SHA}-windows-amd64.zip" \
+            --asset rocm-cli-nightly-windows-amd64.zip
+
+          TITLE="$(gh release view "${STAGING_TAG}" --json name -q .name)"
+          NOTES="$(gh release view "${STAGING_TAG}" --json body -q .body)"
+
+          gh release delete nightly --yes --cleanup-tag 2>/dev/null || true
+          gh release create nightly \
+            --title "${TITLE}" \
+            --notes "${NOTES}" \
+            --prerelease \
+            "${ASSET_DIR}"/*
+          gh release delete "${STAGING_TAG}" --yes --cleanup-tag
+
+  cleanup-staging-nightly:
+    name: Clean failed nightly staging release
+    runs-on: ubuntu-latest
+    needs:
+      - nightly
+      - windows-nightly
+    if: always() && needs.nightly.outputs.skip != 'true' && needs.windows-nightly.result != 'success' && needs.nightly.outputs.staging_tag != ''
+    steps:
+      - name: Delete staging release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release delete "${{ needs.nightly.outputs.staging_tag }}" --yes --cleanup-tag 2>/dev/null || true

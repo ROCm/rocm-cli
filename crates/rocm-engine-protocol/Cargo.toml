@@ -1,0 +1,12 @@
+[package]
+name = "rocm-engine-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rocm-core = { path = "../rocm-core" }
+serde.workspace = true
+serde_json.workspace = true

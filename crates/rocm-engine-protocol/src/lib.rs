@@ -1,0 +1,578 @@
+use serde::Deserialize;
+use serde::Serialize;
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+pub const ENGINE_PROTOCOL_VERSION: &str = "0.1.0";
+pub const ENGINE_RECIPE_CONTRACT_VERSION: &str = "0.1.0";
+pub const ENGINE_PLUGIN_BINARY_PREFIX: &str = "rocm-engine-";
+pub const DEFAULT_LOG_TAIL_LINES: usize = 80;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnginePluginDescriptor {
+    pub id: String,
+    pub executable_path: PathBuf,
+}
+
+pub fn platform_engine_plugin_binary_name(engine_id: &str) -> String {
+    let binary_name = format!(
+        "{ENGINE_PLUGIN_BINARY_PREFIX}{}",
+        engine_id_to_plugin_binary_component(engine_id)
+    );
+    rocm_core::platform_binary_name(&binary_name)
+}
+
+fn engine_id_to_plugin_binary_component(engine_id: &str) -> &str {
+    match engine_id {
+        "llama.cpp" => "llama-cpp",
+        other => other,
+    }
+}
+
+pub fn engine_id_from_plugin_binary_name(name: &str) -> Option<String> {
+    if name.contains('/') || name.contains('\\') {
+        return None;
+    }
+    let name = strip_optional_exe_suffix(name);
+    let engine_id = name.strip_prefix(ENGINE_PLUGIN_BINARY_PREFIX)?;
+    let engine_id = match engine_id {
+        "llama-cpp" => "llama.cpp",
+        other => other,
+    };
+    is_valid_engine_id(engine_id).then(|| engine_id.to_owned())
+}
+
+pub fn discover_engine_plugins<I, P>(plugin_dirs: I) -> std::io::Result<Vec<EnginePluginDescriptor>>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
+    let mut plugins = Vec::new();
+    for plugin_dir in plugin_dirs {
+        let plugin_dir = plugin_dir.as_ref();
+        if !plugin_dir.is_dir() {
+            continue;
+        }
+
+        for entry in fs::read_dir(plugin_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let Some(id) = engine_id_from_plugin_binary_name(name) else {
+                continue;
+            };
+            if plugins
+                .iter()
+                .any(|plugin: &EnginePluginDescriptor| plugin.id == id)
+            {
+                continue;
+            }
+            plugins.push(EnginePluginDescriptor {
+                id,
+                executable_path: path,
+            });
+        }
+    }
+    plugins.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.executable_path.cmp(&right.executable_path))
+    });
+    Ok(plugins)
+}
+
+fn strip_optional_exe_suffix(name: &str) -> &str {
+    if name
+        .get(name.len().saturating_sub(4)..)
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".exe"))
+    {
+        &name[..name.len() - 4]
+    } else {
+        name
+    }
+}
+
+fn is_valid_engine_id(engine_id: &str) -> bool {
+    !engine_id.is_empty()
+        && engine_id != "."
+        && engine_id != ".."
+        && engine_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineMethod {
+    Detect,
+    Install,
+    Capabilities,
+    ResolveModel,
+    Launch,
+    Healthcheck,
+    Endpoint,
+    Stop,
+    Logs,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DevicePolicy {
+    GpuRequired,
+    GpuPreferred,
+    CpuOnly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineRequestEnvelope {
+    pub method: EngineMethod,
+    #[serde(default)]
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineErrorDetail {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineResponseEnvelope {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<EngineErrorDetail>,
+}
+
+impl EngineResponseEnvelope {
+    pub fn success<T>(data: T) -> Self
+    where
+        T: Serialize,
+    {
+        Self {
+            ok: true,
+            data: Some(serde_json::to_value(data).expect("serializable response")),
+            error: None,
+        }
+    }
+
+    pub fn failure(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            data: None,
+            error: Some(EngineErrorDetail {
+                code: code.into(),
+                message: message.into(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DetectRequest {
+    pub runtime_id: Option<String>,
+    pub device_filter: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallRequest {
+    pub runtime_id: String,
+    pub python_version: Option<String>,
+    #[serde(default)]
+    pub reinstall: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveModelRequest {
+    pub model_ref: String,
+    pub runtime_id: Option<String>,
+    pub device_policy: Option<DevicePolicy>,
+    pub recipe_override: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_recipe: Option<EngineRecipeHint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaunchRequest {
+    pub service_id: String,
+    pub env_id: Option<String>,
+    pub runtime_id: Option<String>,
+    pub model_ref: String,
+    pub host: String,
+    pub port: u16,
+    pub device_policy: Option<DevicePolicy>,
+    pub endpoint_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_recipe: Option<EngineRecipeHint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthcheckRequest {
+    pub service_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EndpointRequest {
+    pub service_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StopRequest {
+    pub service_id: String,
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogsRequest {
+    pub service_id: String,
+    pub tail_lines: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineDeviceAvailability {
+    pub kind: String,
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineCapabilities {
+    pub cpu: bool,
+    pub rocm_gpu: bool,
+    pub multi_gpu: bool,
+    pub openai_compatible: bool,
+    pub tool_calling: bool,
+    pub quantized_models: String,
+    pub distributed_serving: bool,
+    pub reasoning_parser: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectResponse {
+    pub installed: bool,
+    pub env_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_executable: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_env: Option<bool>,
+    pub python_version: Option<String>,
+    pub torch_version: Option<String>,
+    pub transformers_version: Option<String>,
+    pub available_devices: Vec<EngineDeviceAvailability>,
+    pub capabilities: EngineCapabilities,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallResponse {
+    pub env_id: String,
+    pub env_path: String,
+    pub python_executable: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_executable: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_env: Option<bool>,
+    pub installed_packages: Vec<String>,
+    pub capabilities: EngineCapabilities,
+    pub lock_hash: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveModelResponse {
+    pub canonical_model_id: String,
+    pub task: String,
+    pub source: String,
+    pub revision: String,
+    pub loader: String,
+    pub trust_remote_code: bool,
+    pub chat_template_mode: String,
+    pub dtype: String,
+    pub device_policy: DevicePolicy,
+    pub estimated_memory: String,
+    pub launch_defaults: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_recipe: Option<EngineRecipeHint>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EngineRecipeHint {
+    pub contract_version: String,
+    pub engine: String,
+    #[serde(default)]
+    pub required_flags: Vec<String>,
+    #[serde(default)]
+    pub parser_settings: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_endpoint: Option<EngineRecipeEndpointHint>,
+    #[serde(default)]
+    pub unsupported_combinations: Vec<EngineRecipeUnsupportedCombinationHint>,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EngineRecipeEndpointHint {
+    pub endpoint_mode: String,
+    #[serde(default)]
+    pub settings: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EngineRecipeUnsupportedCombinationHint {
+    pub combination: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaunchResponse {
+    pub service_id: String,
+    pub pid: u32,
+    pub endpoint_url: String,
+    pub log_path: String,
+    pub state_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthcheckResponse {
+    pub status: String,
+    pub model_loaded: bool,
+    pub device: String,
+    pub uptime_sec: u64,
+    pub queue_depth: u32,
+    pub last_error: Option<String>,
+    pub tokens_per_sec: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EndpointResponse {
+    pub endpoint_url: String,
+    pub api_style: String,
+    pub supported_routes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StopResponse {
+    pub stopped: bool,
+    pub graceful: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogsResponse {
+    pub log_path: String,
+    pub recent_lines: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_roundtrip_preserves_method() {
+        let envelope = EngineRequestEnvelope {
+            method: EngineMethod::Detect,
+            payload: serde_json::json!({ "runtime_id": "therock-release" }),
+        };
+
+        let serialized = serde_json::to_string(&envelope).unwrap();
+        let parsed: EngineRequestEnvelope = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed.method, EngineMethod::Detect);
+    }
+
+    #[test]
+    fn engine_recipe_hint_roundtrips_through_resolve_request() {
+        let request = ResolveModelRequest {
+            model_ref: "Qwen/Test".to_owned(),
+            runtime_id: None,
+            device_policy: Some(DevicePolicy::GpuRequired),
+            recipe_override: None,
+            engine_recipe: Some(EngineRecipeHint {
+                contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+                engine: "vllm".to_owned(),
+                required_flags: vec!["--enable-auto-tool-choice".to_owned()],
+                parser_settings: BTreeMap::from([(
+                    "reasoning_parser".to_owned(),
+                    "qwen3".to_owned(),
+                )]),
+                preferred_endpoint: Some(EngineRecipeEndpointHint {
+                    endpoint_mode: "openai".to_owned(),
+                    settings: BTreeMap::from([("streaming".to_owned(), "true".to_owned())]),
+                }),
+                unsupported_combinations: vec![EngineRecipeUnsupportedCombinationHint {
+                    combination: "native Windows GPU serving".to_owned(),
+                    reason: "vLLM ROCm serving is Linux/WSL only".to_owned(),
+                }],
+                notes: vec!["signed recipe metadata".to_owned()],
+            }),
+        };
+
+        let serialized = serde_json::to_string(&request).unwrap();
+        let parsed: ResolveModelRequest = serde_json::from_str(&serialized).unwrap();
+
+        let hint = parsed.engine_recipe.expect("hint should roundtrip");
+        assert_eq!(hint.contract_version, ENGINE_RECIPE_CONTRACT_VERSION);
+        assert_eq!(hint.engine, "vllm");
+        assert_eq!(hint.required_flags, vec!["--enable-auto-tool-choice"]);
+        assert_eq!(
+            hint.parser_settings
+                .get("reasoning_parser")
+                .map(String::as_str),
+            Some("qwen3")
+        );
+        assert_eq!(
+            hint.preferred_endpoint
+                .as_ref()
+                .map(|endpoint| endpoint.endpoint_mode.as_str()),
+            Some("openai")
+        );
+        assert_eq!(hint.unsupported_combinations.len(), 1);
+        assert_eq!(hint.notes, vec!["signed recipe metadata"]);
+    }
+
+    #[test]
+    fn engine_recipe_hint_roundtrips_through_launch_request() {
+        let request = LaunchRequest {
+            service_id: "svc".to_owned(),
+            env_id: None,
+            runtime_id: Some("runtime".to_owned()),
+            model_ref: "Qwen/Test".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 11435,
+            device_policy: Some(DevicePolicy::GpuRequired),
+            endpoint_mode: Some("openai".to_owned()),
+            engine_recipe: Some(EngineRecipeHint {
+                contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+                engine: "vllm".to_owned(),
+                required_flags: vec!["--enable-auto-tool-choice".to_owned()],
+                parser_settings: BTreeMap::new(),
+                preferred_endpoint: None,
+                unsupported_combinations: Vec::new(),
+                notes: Vec::new(),
+            }),
+        };
+
+        let serialized = serde_json::to_string(&request).unwrap();
+        let parsed: LaunchRequest = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(
+            parsed
+                .engine_recipe
+                .expect("hint should roundtrip")
+                .required_flags,
+            vec!["--enable-auto-tool-choice"]
+        );
+    }
+
+    #[test]
+    fn plugin_binary_names_normalize_to_engine_ids() {
+        assert_eq!(
+            engine_id_from_plugin_binary_name("rocm-engine-pytorch"),
+            Some("pytorch".to_owned())
+        );
+        assert_eq!(
+            engine_id_from_plugin_binary_name("rocm-engine-llama-cpp.EXE"),
+            Some("llama.cpp".to_owned())
+        );
+        assert_eq!(engine_id_from_plugin_binary_name("rocm-engine-"), None);
+        assert_eq!(engine_id_from_plugin_binary_name("rocm"), None);
+        assert_eq!(
+            engine_id_from_plugin_binary_name("rocm-engine-bad id"),
+            None
+        );
+        assert_eq!(
+            engine_id_from_plugin_binary_name("nested/rocm-engine-pytorch"),
+            None
+        );
+    }
+
+    #[test]
+    fn discover_engine_plugins_returns_sorted_unique_plugin_binaries() {
+        let root = unique_temp_dir("discover");
+        let first_dir = root.join("first");
+        let second_dir = root.join("second");
+        fs::create_dir_all(&first_dir).unwrap();
+        fs::create_dir_all(&second_dir).unwrap();
+
+        let first_pytorch = first_dir.join(platform_engine_plugin_binary_name("pytorch"));
+        let first_vllm = first_dir.join(platform_engine_plugin_binary_name("vllm"));
+        let second_atom = second_dir.join(platform_engine_plugin_binary_name("atom"));
+        let second_pytorch = second_dir.join(platform_engine_plugin_binary_name("pytorch"));
+        fs::write(&first_pytorch, b"pytorch").unwrap();
+        fs::write(&first_vllm, b"vllm").unwrap();
+        fs::write(&second_atom, b"atom").unwrap();
+        fs::write(&second_pytorch, b"duplicate pytorch").unwrap();
+        fs::write(first_dir.join("not-an-engine"), b"ignore").unwrap();
+        fs::create_dir_all(first_dir.join(platform_engine_plugin_binary_name("sglang"))).unwrap();
+
+        let plugins =
+            discover_engine_plugins([root.join("missing"), first_dir.clone(), second_dir]).unwrap();
+        let ids = plugins
+            .iter()
+            .map(|plugin| plugin.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["atom", "pytorch", "vllm"]);
+        assert_eq!(
+            plugins
+                .iter()
+                .find(|plugin| plugin.id == "pytorch")
+                .unwrap()
+                .executable_path,
+            first_pytorch
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn logs_payload_roundtrip_preserves_tail_request_and_lines() {
+        let request = LogsRequest {
+            service_id: "svc_qwen35_primary".to_owned(),
+            tail_lines: Some(DEFAULT_LOG_TAIL_LINES),
+        };
+
+        let serialized = serde_json::to_string(&request).unwrap();
+        let parsed: LogsRequest = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed.service_id, "svc_qwen35_primary");
+        assert_eq!(parsed.tail_lines, Some(DEFAULT_LOG_TAIL_LINES));
+
+        let response = LogsResponse {
+            log_path: "/tmp/service.log".to_owned(),
+            recent_lines: vec!["ready".to_owned(), "listening".to_owned()],
+        };
+        let serialized = serde_json::to_string(&response).unwrap();
+        let parsed: LogsResponse = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed.log_path, "/tmp/service.log");
+        assert_eq!(
+            parsed.recent_lines,
+            vec!["ready".to_owned(), "listening".to_owned()]
+        );
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "rocm-engine-protocol-{label}-{}-{unique}",
+            std::process::id()
+        ))
+    }
+}
