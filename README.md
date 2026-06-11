@@ -63,6 +63,30 @@ Install a serving engine:
 rocm engines install pytorch
 ```
 
+## Contributing
+
+This repo uses [prek](https://github.com/j178/prek) (a fast, drop-in
+replacement for `pre-commit`) to run the same checks locally that CI enforces:
+`cargo fmt`/`clippy`/`test`, `ruff` (Python), `shellcheck` (shell),
+PowerShell syntax, and assorted file hygiene.
+
+Install prek and enable the hooks once after cloning:
+
+```bash
+uv tool install prek        # or: cargo install --locked prek
+prek install                # fast checks on commit (fmt, ruff, shellcheck, ...)
+prek install -t pre-push    # heavier checks on push (clippy, cargo test)
+```
+
+Run every hook against the whole tree on demand:
+
+```bash
+prek run --all-files
+```
+
+The hook configuration lives in `.pre-commit-config.yaml`; `clippy` and the test
+suite run on `pre-push` to keep commits fast.
+
 ## More Docs
 
 - Testing and verification: `docs/testing.md`
