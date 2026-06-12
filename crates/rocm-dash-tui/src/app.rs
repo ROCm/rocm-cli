@@ -1067,13 +1067,24 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
             };
         }
         KeyAction::CloseModal => state.modal = Modal::None,
+        // The three operational overlays are mutually exclusive. The open keys
+        // are only reachable when all overlays are closed, but each arm also
+        // clears its siblings defensively so a future open path (mouse, effect)
+        // can never leave two overlays Some at once (the draw/route chains would
+        // then disagree silently).
         KeyAction::OpenServices => {
+            state.serve_wizard = None;
+            state.engine_manager = None;
             state.services = Some(crate::ui::services_manager::ServicesManagerState::default());
         }
         KeyAction::OpenServeWizard => {
+            state.services = None;
+            state.engine_manager = None;
             state.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState::default());
         }
         KeyAction::OpenEngineManager => {
+            state.services = None;
+            state.serve_wizard = None;
             state.engine_manager = Some(crate::ui::engine_manager::EngineManagerState::default());
         }
         KeyAction::OpenThemePicker => state.open_theme_picker(),
@@ -1542,6 +1553,48 @@ mod tests {
             KeyAction::SelectLast
         );
         assert_eq!(hk(KeyCode::Enter, ActiveTab::Bench), KeyAction::OpenDetail);
+    }
+
+    #[test]
+    fn operational_open_keys_are_tab_scoped() {
+        // `s` opens services only on Instances; Nothing elsewhere.
+        assert_eq!(
+            hk(KeyCode::Char('s'), ActiveTab::Instances),
+            KeyAction::OpenServices
+        );
+        assert_eq!(
+            hk(KeyCode::Char('s'), ActiveTab::Overview),
+            KeyAction::Nothing
+        );
+        // `w` / `e` open from Overview + Instances; Nothing on other tabs.
+        assert_eq!(
+            hk(KeyCode::Char('w'), ActiveTab::Overview),
+            KeyAction::OpenServeWizard
+        );
+        assert_eq!(
+            hk(KeyCode::Char('e'), ActiveTab::Instances),
+            KeyAction::OpenEngineManager
+        );
+        assert_eq!(
+            hk(KeyCode::Char('w'), ActiveTab::Hardware),
+            KeyAction::Nothing
+        );
+        assert_eq!(hk(KeyCode::Char('e'), ActiveTab::Bench), KeyAction::Nothing);
+        // On the Chat tab the operational keys are never hijacked.
+        assert_eq!(hk(KeyCode::Char('w'), ActiveTab::Chat), KeyAction::Nothing);
+        assert_eq!(hk(KeyCode::Char('e'), ActiveTab::Chat), KeyAction::Nothing);
+    }
+
+    #[test]
+    fn opening_an_overlay_closes_the_others() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        apply_action(&mut s, KeyAction::OpenServices);
+        assert!(s.services.is_some() && s.serve_wizard.is_none() && s.engine_manager.is_none());
+        // Opening another overlay (defensive path) clears the prior one.
+        apply_action(&mut s, KeyAction::OpenServeWizard);
+        assert!(s.serve_wizard.is_some() && s.services.is_none() && s.engine_manager.is_none());
+        apply_action(&mut s, KeyAction::OpenEngineManager);
+        assert!(s.engine_manager.is_some() && s.services.is_none() && s.serve_wizard.is_none());
     }
 
     #[test]
