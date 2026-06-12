@@ -32,7 +32,7 @@ use crate::ui::theme::Theme;
 pub const ENGINE_CATALOG: &[(&str, &str)] = &[
     (
         "lemonade",
-        "default embedded Lemonade server (ROCm llama.cpp backend)",
+        "default embedded Lemonade server with ROCm llama.cpp backend",
     ),
     ("pytorch", "TheRock PyTorch local serving engine"),
     ("llama.cpp", "external GGUF serving engine for llama-server"),
@@ -147,6 +147,8 @@ pub fn on_key(
                 if jobs.job(&job_id).map(|j| j.is_terminal()).unwrap_or(true) =>
             {
                 em.active_job = None;
+                // Clear any stale "already running" notice on return to the list.
+                em.message = None;
             }
             _ => {}
         }
@@ -373,6 +375,35 @@ mod tests {
             em.as_ref().unwrap().active_job.as_deref(),
             Some("engine-reinstall-llama-cpp")
         );
+    }
+
+    #[test]
+    fn relaunch_while_prior_job_running_surfaces_message() {
+        // The reducer no-ops a StartJob for a still-running id. spawn_engine_op
+        // must NOT set active_job; it surfaces a message instead.
+        let mut jobs = State::default();
+        let mut em1 = Some(EngineManagerState::default());
+        on_key(&mut em1, &mut jobs, key(KeyCode::Char('i'))); // lemonade install
+        on_key(&mut em1, &mut jobs, key(KeyCode::Char('y')));
+        assert_eq!(
+            em1.as_ref().unwrap().active_job.as_deref(),
+            Some("engine-install-lemonade")
+        );
+
+        // Fresh overlay, same engine+action while the prior job still runs.
+        let mut em2 = Some(EngineManagerState::default());
+        on_key(&mut em2, &mut jobs, key(KeyCode::Char('i')));
+        let fx = on_key(&mut em2, &mut jobs, key(KeyCode::Char('y')));
+        assert!(fx.is_empty(), "no double-spawn for a running id");
+        let s = em2.as_ref().unwrap();
+        assert!(s.active_job.is_none(), "must not point at the stale job");
+        assert!(
+            s.message
+                .as_deref()
+                .unwrap_or("")
+                .contains("already running")
+        );
+        assert_eq!(jobs.jobs.len(), 1);
     }
 
     #[test]
