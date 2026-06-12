@@ -793,6 +793,7 @@ impl AppPaths {
             &self.data_dir.join("services"),
             &self.data_dir.join("models"),
             &self.data_dir.join("runtimes"),
+            &self.telemetry_state_dir(),
         ] {
             fs::create_dir_all(dir)
                 .with_context(|| format!("failed to create {}", dir.display()))?;
@@ -877,6 +878,23 @@ impl AppPaths {
     pub fn service_engine_state_path(&self, engine: &str, service_id: &str) -> PathBuf {
         self.engine_state_dir(engine)
             .join(format!("{service_id}.json"))
+    }
+
+    /// Directory holding rocm-dash telemetry daemon state (EAI-6871 D6).
+    /// (G3 rocm-cli maintainer sign-off pending — engineering implementation only.)
+    pub fn telemetry_state_dir(&self) -> PathBuf {
+        self.data_dir.join("telemetry")
+    }
+
+    /// Log file for the rocm-dash telemetry daemon, under the shared logs dir
+    /// (EAI-6871 D6). (G3 sign-off pending.)
+    ///
+    /// Deliberately under the canonical `AppPaths` data root
+    /// (`~/.rocm/logs/rocmdashd.log`), NOT the legacy standalone rocm-dash XDG
+    /// state path (`~/.local/state/rocm-dash/`). D6 unifies the dual-dir split
+    /// onto `~/.rocm`; do not "restore" the old XDG location.
+    pub fn daemon_log_path(&self) -> PathBuf {
+        self.data_dir.join("logs").join("rocmdashd.log")
     }
 }
 
@@ -3797,6 +3815,203 @@ pub struct RocmCliConfig {
     pub engines: BTreeMap<String, EngineUserConfig>,
     #[serde(default)]
     pub automations: AutomationsConfig,
+    /// rocm-dash telemetry/dashboard knobs (EAI-6871 D6). Nested as a sub-config
+    /// so it never collides with the rocm-cli `telemetry` analytics policy on
+    /// rebase. Every field defaults, so the section is fully optional.
+    #[serde(default)]
+    pub dashboard: DashboardConfig,
+}
+
+// ===== rocm-dash dashboard sub-config (EAI-6871 D6) =====
+//
+// Additive nesting under the canonical `RocmCliConfig`. The rocm-cli
+// `TelemetryConfig { mode }` is an analytics opt-in *policy*; this
+// `DashboardConfig` is the operational *spec* (listen address + tick cadence +
+// chat endpoint). They are deliberately separate axes and never share a field.
+// Pure `with_*()` transforms are scoped to this sub-config only — rocm-cli's own
+// config keeps its in-place `&mut` mutation convention untouched.
+
+fn default_dashboard_listen() -> String {
+    "unix:/tmp/rocmdashd.sock".to_owned()
+}
+
+fn default_dashboard_connect() -> String {
+    "unix:/tmp/rocmdashd.sock".to_owned()
+}
+
+fn default_dashboard_theme() -> String {
+    "default-dark".to_owned()
+}
+
+fn default_gpu_tick_secs() -> f64 {
+    1.0
+}
+
+fn default_discovery_tick_secs() -> f64 {
+    5.0
+}
+
+fn default_instance_tick_secs() -> f64 {
+    2.0
+}
+
+/// Telemetry daemon operational spec. Tick cadences are stored as f64 seconds in
+/// the unified JSON config; use the `*_tick()` accessors for `Duration`s.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DashboardDaemonConfig {
+    /// `unix:/path/to.sock` or `tcp:host:port`.
+    #[serde(default = "default_dashboard_listen")]
+    pub listen: String,
+    /// Optional shared secret. Required for TCP, ignored for Unix sockets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    #[serde(default = "default_gpu_tick_secs")]
+    pub gpu_tick_secs: f64,
+    #[serde(default = "default_discovery_tick_secs")]
+    pub discovery_tick_secs: f64,
+    #[serde(default = "default_instance_tick_secs")]
+    pub instance_tick_secs: f64,
+    /// Watch this directory for new normalized benchmark CSVs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bench_results_dir: Option<PathBuf>,
+}
+
+impl Default for DashboardDaemonConfig {
+    fn default() -> Self {
+        Self {
+            listen: default_dashboard_listen(),
+            token: None,
+            gpu_tick_secs: default_gpu_tick_secs(),
+            discovery_tick_secs: default_discovery_tick_secs(),
+            instance_tick_secs: default_instance_tick_secs(),
+            bench_results_dir: None,
+        }
+    }
+}
+
+impl DashboardDaemonConfig {
+    pub fn gpu_tick(&self) -> Duration {
+        Duration::from_secs_f64(self.gpu_tick_secs)
+    }
+
+    pub fn discovery_tick(&self) -> Duration {
+        Duration::from_secs_f64(self.discovery_tick_secs)
+    }
+
+    pub fn instance_tick(&self) -> Duration {
+        Duration::from_secs_f64(self.instance_tick_secs)
+    }
+}
+
+/// Dashboard TUI spec. The chat endpoint URL / model / auth-header *name* are
+/// plain data; the auth-header *value* (API key) is always env-only and never
+/// stored here (AMD gateway invariant).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DashboardTuiConfig {
+    #[serde(default = "default_dashboard_connect")]
+    pub connect: String,
+    #[serde(default = "default_dashboard_theme")]
+    pub theme: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_auth_header: Option<String>,
+}
+
+impl Default for DashboardTuiConfig {
+    fn default() -> Self {
+        Self {
+            connect: default_dashboard_connect(),
+            theme: default_dashboard_theme(),
+            chat_url: None,
+            chat_model: None,
+            chat_auth_header: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DashboardConfig {
+    #[serde(default)]
+    pub daemon: DashboardDaemonConfig,
+    #[serde(default)]
+    pub tui: DashboardTuiConfig,
+}
+
+impl DashboardConfig {
+    /// Return a copy with the chat endpoint base URL + model set and the custom
+    /// auth header cleared (mirrors the rocm-dash `config_with_chat` behavior).
+    /// Immutable transform — scoped to the dashboard sub-config only.
+    pub fn with_chat_endpoint(
+        mut self,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        self.tui.chat_url = Some(base_url.into());
+        self.tui.chat_model = Some(model.into());
+        self.tui.chat_auth_header = None;
+        self
+    }
+
+    /// Return a copy with the dashboard theme set.
+    pub fn with_theme(mut self, theme: impl Into<String>) -> Self {
+        self.tui.theme = theme.into();
+        self
+    }
+
+    /// Return a copy with the telemetry daemon listen address set.
+    pub fn with_daemon_listen(mut self, listen: impl Into<String>) -> Self {
+        self.daemon.listen = listen.into();
+        self
+    }
+}
+
+/// Legacy rocm-dash TOML config shape (`~/.config/rocm-dash/config.toml`),
+/// parsed for one-shot migration into the unified JSON config. Every field is
+/// optional so partial/legacy files parse cleanly; only the carried-forward
+/// fields are mirrored.
+#[derive(Debug, Default, Deserialize)]
+struct LegacyDashToml {
+    #[serde(default)]
+    default_engine: Option<String>,
+    #[serde(default)]
+    daemon: LegacyDashDaemon,
+    #[serde(default)]
+    tui: LegacyDashTui,
+    #[serde(default)]
+    engines: BTreeMap<String, EngineUserConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LegacyDashDaemon {
+    #[serde(default)]
+    listen: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    gpu_tick: Option<f64>,
+    #[serde(default)]
+    discovery_tick: Option<f64>,
+    #[serde(default)]
+    instance_tick: Option<f64>,
+    #[serde(default)]
+    bench_results_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LegacyDashTui {
+    #[serde(default)]
+    connect: Option<String>,
+    #[serde(default)]
+    theme: Option<String>,
+    #[serde(default)]
+    chat_url: Option<String>,
+    #[serde(default)]
+    chat_model: Option<String>,
+    #[serde(default)]
+    chat_auth_header: Option<String>,
 }
 
 impl RocmCliConfig {
@@ -3873,6 +4088,82 @@ impl RocmCliConfig {
         self.watcher_config(watcher.id)
             .and_then(|cfg| cfg.mode)
             .unwrap_or(watcher.default_mode)
+    }
+
+    /// Location of the legacy rocm-dash TOML config, honoring `XDG_CONFIG_HOME`
+    /// (`~/.config/rocm-dash/config.toml` on Linux).
+    fn legacy_dashboard_toml_path() -> Option<PathBuf> {
+        directories::BaseDirs::new()
+            .map(|dirs| dirs.config_dir().join("rocm-dash").join("config.toml"))
+    }
+
+    /// One-shot migration of a legacy rocm-dash `config.toml` into the unified
+    /// JSON config. If no `config.json` exists yet **and** a legacy TOML is
+    /// present, its knobs are mapped into `dashboard` (and the canonical
+    /// `default_engine`/`engines`), `config.json` is written once, and the
+    /// migrated legacy path is returned so the caller can print a notice. The
+    /// TOML is left untouched. Returns `Ok(None)` when there is nothing to do
+    /// (already on the unified config, or no legacy file) — never clobbers an
+    /// existing `config.json`.
+    pub fn migrate_legacy_dashboard_toml(paths: &AppPaths) -> Result<Option<PathBuf>> {
+        let Some(legacy) = Self::legacy_dashboard_toml_path() else {
+            return Ok(None);
+        };
+        Self::migrate_legacy_dashboard_toml_from(paths, &legacy)
+    }
+
+    /// Testable core of [`migrate_legacy_dashboard_toml`] with an explicit legacy
+    /// path. Same one-shot, non-clobbering semantics.
+    pub fn migrate_legacy_dashboard_toml_from(
+        paths: &AppPaths,
+        legacy: &Path,
+    ) -> Result<Option<PathBuf>> {
+        if paths.config_path().is_file() || !legacy.is_file() {
+            return Ok(None);
+        }
+
+        let raw = fs::read_to_string(legacy)
+            .with_context(|| format!("failed to read {}", legacy.display()))?;
+        let parsed: LegacyDashToml = toml::from_str(&raw)
+            .with_context(|| format!("failed to parse legacy config {}", legacy.display()))?;
+
+        let mut config = Self::default();
+
+        // Dashboard-specific knobs map into the new sub-config.
+        let d = &parsed.daemon;
+        if let Some(v) = &d.listen {
+            config.dashboard.daemon.listen = v.clone();
+        }
+        config.dashboard.daemon.token = d.token.clone();
+        if let Some(v) = d.gpu_tick {
+            config.dashboard.daemon.gpu_tick_secs = v;
+        }
+        if let Some(v) = d.discovery_tick {
+            config.dashboard.daemon.discovery_tick_secs = v;
+        }
+        if let Some(v) = d.instance_tick {
+            config.dashboard.daemon.instance_tick_secs = v;
+        }
+        config.dashboard.daemon.bench_results_dir = d.bench_results_dir.clone();
+
+        let t = &parsed.tui;
+        if let Some(v) = &t.connect {
+            config.dashboard.tui.connect = v.clone();
+        }
+        if let Some(v) = &t.theme {
+            config.dashboard.tui.theme = v.clone();
+        }
+        config.dashboard.tui.chat_url = t.chat_url.clone();
+        config.dashboard.tui.chat_model = t.chat_model.clone();
+        config.dashboard.tui.chat_auth_header = t.chat_auth_header.clone();
+
+        // `default_engine` / `engines` map onto the canonical rocm-cli fields
+        // (identical shape) — not a second source of truth inside `dashboard`.
+        config.default_engine = parsed.default_engine.clone();
+        config.engines = parsed.engines.clone();
+
+        config.save(paths)?;
+        Ok(Some(legacy.to_path_buf()))
     }
 }
 
@@ -7021,6 +7312,162 @@ Class Name:                Display
                 fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
             }
         }
+        Ok(())
+    }
+
+    // ===== D6 dashboard sub-config + migration (EAI-6871) =====
+
+    #[test]
+    fn dashboard_config_defaults_and_json_round_trip() {
+        let cfg = DashboardConfig::default();
+        assert_eq!(cfg.daemon.listen, "unix:/tmp/rocmdashd.sock");
+        assert_eq!(cfg.daemon.gpu_tick_secs, 1.0);
+        assert_eq!(cfg.daemon.discovery_tick_secs, 5.0);
+        assert_eq!(cfg.daemon.instance_tick_secs, 2.0);
+        assert_eq!(cfg.tui.theme, "default-dark");
+        assert_eq!(cfg.tui.chat_url, None);
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: DashboardConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn rocm_cli_config_dashboard_section_is_optional() {
+        // A config.json with no `dashboard` key parses to the default sub-config.
+        let json = r#"{"default_engine":"vllm"}"#;
+        let cfg: RocmCliConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.default_engine.as_deref(), Some("vllm"));
+        assert_eq!(cfg.dashboard, DashboardConfig::default());
+    }
+
+    #[test]
+    fn dashboard_with_transforms_are_immutable_and_scoped() {
+        let base = DashboardConfig::default();
+        let chat = base
+            .clone()
+            .with_chat_endpoint("http://127.0.0.1:8000", "llama-3.1-8b");
+        // Original is untouched (immutable transform).
+        assert_eq!(base.tui.chat_url, None);
+        assert_eq!(chat.tui.chat_url.as_deref(), Some("http://127.0.0.1:8000"));
+        assert_eq!(chat.tui.chat_model.as_deref(), Some("llama-3.1-8b"));
+        assert_eq!(chat.tui.chat_auth_header, None);
+
+        let themed = base.clone().with_theme("nord");
+        assert_eq!(base.tui.theme, "default-dark");
+        assert_eq!(themed.tui.theme, "nord");
+
+        let relisten = base.clone().with_daemon_listen("tcp:127.0.0.1:9000");
+        assert_eq!(base.daemon.listen, "unix:/tmp/rocmdashd.sock");
+        assert_eq!(relisten.daemon.listen, "tcp:127.0.0.1:9000");
+    }
+
+    #[test]
+    fn dashboard_daemon_tick_accessors_map_secs_to_duration() {
+        let mut d = DashboardDaemonConfig::default();
+        d.gpu_tick_secs = 0.5;
+        d.discovery_tick_secs = 10.0;
+        d.instance_tick_secs = 3.0;
+        assert_eq!(d.gpu_tick(), Duration::from_secs_f64(0.5));
+        assert_eq!(d.discovery_tick(), Duration::from_secs(10));
+        assert_eq!(d.instance_tick(), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn app_paths_expose_telemetry_and_daemon_log_paths() -> Result<()> {
+        let (root, paths) = temp_app_paths("telemetry-paths");
+        assert_eq!(
+            paths.telemetry_state_dir(),
+            paths.data_dir.join("telemetry")
+        );
+        assert_eq!(
+            paths.daemon_log_path(),
+            paths.data_dir.join("logs").join("rocmdashd.log")
+        );
+        // ensure() creates the telemetry state dir alongside the others.
+        paths.ensure()?;
+        assert!(paths.telemetry_state_dir().is_dir());
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_legacy_dashboard_toml_maps_knobs_and_is_one_shot() -> Result<()> {
+        let (root, paths) = temp_app_paths("migrate-dash");
+        paths.ensure()?;
+        let legacy = root.join("legacy-config.toml");
+        fs::write(
+            &legacy,
+            r#"
+default_engine = "vllm"
+
+[daemon]
+listen = "unix:/tmp/custom.sock"
+token = "secret"
+gpu_tick = 0.5
+discovery_tick = 10
+instance_tick = 3
+
+[tui]
+connect = "unix:/tmp/custom.sock"
+theme = "nord"
+chat_url = "http://127.0.0.1:8000"
+chat_model = "llama-3.1-8b"
+
+[engines.vllm]
+preferred_env_id = "env-1"
+last_installed_runtime_id = "therock-release"
+"#,
+        )?;
+
+        // First migration writes config.json once and reports the legacy path.
+        let migrated = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy)?;
+        assert_eq!(migrated.as_deref(), Some(legacy.as_path()));
+        assert!(paths.config_path().is_file());
+        // The legacy TOML is left untouched.
+        assert!(legacy.is_file());
+
+        // The written config maps every knob into the dashboard sub-config and
+        // the canonical engine fields.
+        let loaded = RocmCliConfig::load(&paths)?;
+        assert_eq!(loaded.dashboard.daemon.listen, "unix:/tmp/custom.sock");
+        assert_eq!(loaded.dashboard.daemon.token.as_deref(), Some("secret"));
+        assert_eq!(loaded.dashboard.daemon.gpu_tick_secs, 0.5);
+        assert_eq!(loaded.dashboard.daemon.discovery_tick_secs, 10.0);
+        assert_eq!(loaded.dashboard.daemon.instance_tick_secs, 3.0);
+        assert_eq!(loaded.dashboard.tui.connect, "unix:/tmp/custom.sock");
+        assert_eq!(loaded.dashboard.tui.theme, "nord");
+        assert_eq!(
+            loaded.dashboard.tui.chat_url.as_deref(),
+            Some("http://127.0.0.1:8000")
+        );
+        assert_eq!(
+            loaded.dashboard.tui.chat_model.as_deref(),
+            Some("llama-3.1-8b")
+        );
+        assert_eq!(loaded.default_engine.as_deref(), Some("vllm"));
+        assert_eq!(
+            loaded.engines["vllm"].preferred_env_id.as_deref(),
+            Some("env-1")
+        );
+
+        // Second call is a no-op (config.json already exists — never clobbers).
+        let again = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy)?;
+        assert_eq!(again, None);
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_legacy_dashboard_toml_without_legacy_is_noop() -> Result<()> {
+        let (root, paths) = temp_app_paths("migrate-dash-absent");
+        paths.ensure()?;
+        let legacy = root.join("does-not-exist.toml");
+        let migrated = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy)?;
+        assert_eq!(migrated, None);
+        assert!(!paths.config_path().is_file());
+        let _ = fs::remove_dir_all(&root);
         Ok(())
     }
 }

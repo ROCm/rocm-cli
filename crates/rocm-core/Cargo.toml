@@ -12,6 +12,7 @@ directories.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml = "0.8"
 ureq = { version = "2.12", features = ["native-certs"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]

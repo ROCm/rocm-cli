@@ -610,6 +610,8 @@ impl TelemetryModeArg {
 }
 
 fn main() -> Result<()> {
+    maybe_migrate_legacy_dashboard_config();
+
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     if raw_args.is_empty() {
         return launch_default();
@@ -629,6 +631,28 @@ fn main() -> Result<()> {
     }
 
     dispatch(Cli::parse())
+}
+
+/// One-shot, best-effort migration of a legacy rocm-dash `config.toml` into the
+/// unified `config.json` (EAI-6871 D6). Prints a notice when a migration runs;
+/// never fails startup if the legacy file is malformed.
+fn maybe_migrate_legacy_dashboard_config() {
+    let Ok(paths) = AppPaths::discover() else {
+        return;
+    };
+    match RocmCliConfig::migrate_legacy_dashboard_toml(&paths) {
+        Ok(Some(legacy)) => {
+            eprintln!(
+                "rocm: migrated legacy dashboard config from {} into {} (the original TOML was left untouched)",
+                legacy.display(),
+                paths.config_path().display()
+            );
+        }
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!("rocm: skipped legacy dashboard config migration: {err:#}");
+        }
+    }
 }
 
 fn launch_default() -> Result<()> {
