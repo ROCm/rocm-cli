@@ -1,9 +1,12 @@
+pub mod approval;
 pub mod bench;
 pub mod core_bars;
+pub mod folder_browser;
 pub mod format;
 pub mod gradient;
 pub mod heatmap;
 pub mod instance_list;
+pub mod job_console;
 pub mod modal;
 pub mod monitor;
 pub mod sparkline;
