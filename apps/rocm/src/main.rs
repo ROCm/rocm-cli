@@ -1,9 +1,17 @@
+mod automations;
 mod bootstrap;
 mod comfyui;
 mod provider_keys;
 mod providers;
 mod therock;
 mod tui;
+mod uninstall;
+
+// EAI-6871 D5: per-command handler fns mechanically relocated into modules.
+// Dispatch call sites stay byte-identical via these re-imports (upstream-sync
+// mergeability); only the fn definitions moved out of main.rs.
+use crate::automations::automations;
+use crate::uninstall::uninstall;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -5191,59 +5199,6 @@ fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) ->
             path.display()
         )
     })?;
-    Ok(())
-}
-
-fn automations(command: Option<AutomationsCommand>) -> Result<()> {
-    let paths = AppPaths::discover()?;
-    let mut config = RocmCliConfig::load(&paths)?;
-    match command.unwrap_or(AutomationsCommand::List) {
-        AutomationsCommand::List => {
-            print!("{}", render_automations_text(&paths, &config)?);
-        }
-        AutomationsCommand::Enable { watcher, mode } => {
-            let Some(spec) = builtin_watcher(&watcher) else {
-                bail!("unknown watcher: {watcher}");
-            };
-            let entry = config.watcher_config_mut(spec.id);
-            entry.enabled = true;
-            if let Some(mode) = mode {
-                entry.mode = Some(mode.into());
-            }
-            config.automations.daemon_enabled = true;
-            config.save(&paths)?;
-            println!("automation watcher enabled");
-            println!("  watcher: {}", spec.id);
-            println!("  mode: {}", config.effective_watcher_mode(spec).as_str());
-            println!("  trigger: {}", spec.trigger);
-            if let Some(note) = watcher_policy_note(spec.id) {
-                println!("  policy: {note}");
-            }
-            println!("  config: {}", paths.config_path().display());
-            println!(
-                "  next step: run `rocmd run --automations-enabled` to start the persistent watcher loop"
-            );
-        }
-        AutomationsCommand::Disable { watcher } => {
-            let Some(spec) = builtin_watcher(&watcher) else {
-                bail!("unknown watcher: {watcher}");
-            };
-            let entry = config.watcher_config_mut(spec.id);
-            entry.enabled = false;
-            if !config
-                .automations
-                .watchers
-                .values()
-                .any(|watcher| watcher.enabled)
-            {
-                config.automations.daemon_enabled = false;
-            }
-            config.save(&paths)?;
-            println!("automation watcher disabled");
-            println!("  watcher: {}", spec.id);
-            println!("  config: {}", paths.config_path().display());
-        }
-    }
     Ok(())
 }
 
@@ -13066,34 +13021,6 @@ struct UninstallPlan {
     actions: Vec<UninstallPlanEntry>,
     skipped: Vec<String>,
     warnings: Vec<String>,
-}
-
-fn uninstall(options: UninstallOptions) -> Result<()> {
-    let paths = AppPaths::discover()?;
-    let plan = build_uninstall_plan(&paths, &options)?;
-    print!("{}", render_uninstall_plan(&plan, &options));
-
-    if plan.actions.is_empty() || options.dry_run {
-        return Ok(());
-    }
-
-    if !options.yes {
-        if !interactive_terminal() {
-            bail!("uninstall requires --yes outside an interactive terminal");
-        }
-        if !confirm_uninstall()? {
-            println!("uninstall cancelled");
-            return Ok(());
-        }
-    }
-
-    for entry in &plan.actions {
-        remove_path(&entry.path)
-            .with_context(|| format!("failed to remove {}", entry.path.display()))?;
-        println!("removed {} {}", entry.kind, entry.path.display());
-    }
-    println!("uninstall complete");
-    Ok(())
 }
 
 fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<UninstallPlan> {

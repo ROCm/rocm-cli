@@ -38,10 +38,13 @@ Diagnosed 2026-06-11; none are GPU-related, none are merge regressions:
    → both use an in-process **fake HTTP chat server** with a 5 s `recv_timeout`; they are
    **parallelism/timing flakes** — they **pass when run single-threaded** (`--test-threads=1`).
 3. `therock::tests::python_launcher_prefers_path_python_before_saved_managed_python`
-   → **environmental**: `resolve_python_launcher` executes a generated fake-python stub to check it
-   can build a pip venv; on a host where the stub can't run, the resolver skips it. Fails
-   deterministically on this machine **independent of the merge** (guarded by
-   `PYTHON_RESOLVER_TEST_ENV_LOCK`, i.e. the authors already treat these as env-sensitive).
+   **and** `therock::tests::python_launcher_skips_path_python_without_pip_ready_venv`
+   → **environmental** (two tests, same root cause): `resolve_python_launcher` executes a generated
+   fake-python stub to check it can build a pip venv; on a host where the stub can't run, the
+   resolver skips it. Both fail deterministically on this machine **independent of the merge**
+   (guarded by `PYTHON_RESOLVER_TEST_ENV_LOCK`, i.e. the authors already treat these as
+   env-sensitive). (Originally only the first was named here; verified 2026-06-11 that both fail on
+   the pre-merge HEAD, so the honest pre-existing count is **4**: 2 flaky chat + 2 env python-launcher.)
 
 These belong to the rocm-cli side and predate the merge. Do **not** treat them as merge regressions.
 
