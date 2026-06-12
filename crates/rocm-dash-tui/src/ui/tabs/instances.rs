@@ -793,6 +793,7 @@ mod tests {
             last_tab_bar_area: None,
             jobs: rocm_dash_core::state::State::default(),
             services: None,
+            serve_wizard: None,
         }
     }
 

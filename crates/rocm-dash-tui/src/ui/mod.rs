@@ -1,6 +1,7 @@
 pub mod approval;
 pub mod bench;
 pub mod core_bars;
+pub mod exec;
 pub mod folder_browser;
 pub mod format;
 pub mod gradient;
@@ -9,6 +10,7 @@ pub mod instance_list;
 pub mod job_console;
 pub mod modal;
 pub mod monitor;
+pub mod serve_wizard;
 pub mod services_manager;
 pub mod sparkline;
 pub mod tabs;
@@ -69,8 +71,8 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         ),
     }
 
-    // Operational overlay (Phase 3 Wave 1): the services manager sits above the
-    // tab body + modals when open.
+    // Operational overlays (Phase 3 Wave 1): only one is open at a time. They
+    // sit above the tab body + modals when open.
     if let Some(sm) = &state.services {
         services_manager::draw_services_manager(
             f,
@@ -80,6 +82,8 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
             &state.jobs,
             &theme,
         );
+    } else if let Some(w) = &state.serve_wizard {
+        serve_wizard::draw_serve_wizard(f, outer[2], w, &state.jobs, &theme);
     }
 }
 
@@ -180,6 +184,15 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         spans.push(Span::raw(" select  "));
         spans.push(chip("Enter"));
         spans.push(Span::raw(" detail  "));
+    }
+    // Operational-screen entry points (Phase 3 Wave 1).
+    if matches!(state.active_tab, ActiveTab::Overview | ActiveTab::Instances) {
+        spans.push(chip("w"));
+        spans.push(Span::raw(" serve  "));
+    }
+    if state.active_tab == ActiveTab::Instances {
+        spans.push(chip("s"));
+        spans.push(Span::raw(" services  "));
     }
     if state.replay.is_some() {
         spans.push(chip("Space"));
