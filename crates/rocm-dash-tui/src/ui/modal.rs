@@ -61,6 +61,27 @@ pub fn draw_popup_frame(f: &mut Frame, area: Rect, title: &str, theme: &Theme) -
     inner
 }
 
+/// Shared chrome: a titled popup whose body is a scrollable block of `lines`.
+/// Centralizes the `draw_modal_*` pattern so operational screens don't rebuild
+/// it (Phase 3 Wave 0). `scroll` is the first visible line offset.
+pub fn draw_scrollable_lines(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    lines: Vec<Line>,
+    scroll: u16,
+    theme: &Theme,
+) {
+    let inner = draw_popup_frame(f, area, title, theme);
+    if inner.height == 0 {
+        return;
+    }
+    let p = Paragraph::new(lines)
+        .scroll((scroll, 0))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, inner);
+}
+
 /// Render the Help modal for the active tab.
 pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
     let popup = centered_rect(70, 70, 80, 22, area);

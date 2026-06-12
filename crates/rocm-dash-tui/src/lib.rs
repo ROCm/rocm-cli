@@ -9,6 +9,7 @@
 pub mod agent;
 pub mod app;
 pub mod client;
+pub mod jobs;
 pub mod llm;
 pub mod reconnect;
 pub mod replay;
