@@ -23,6 +23,9 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(5);
 const INSPECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 const DEFAULT_IMAGE_PATTERNS: &[&str] = &["vllm/*", "rocm/vllm*"];
+/// Fallback vLLM port for container discovery when Docker exposes no host-port
+/// binding. The discovered binding is the authority; for managed services the
+/// registry `ManagedServiceRecord.port` is authoritative (EAI-6871 D7).
 const DEFAULT_VLLM_PORT: u16 = 8000;
 
 #[derive(Debug)]

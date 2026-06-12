@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use rocm_dash_collectors::amd_smi::AmdSmiCollector;
 use rocm_dash_collectors::bench_tail::CsvBenchTailer;
 use rocm_dash_collectors::docker::DockerDiscovery;
+use rocm_dash_collectors::engine_registry::EngineKind;
 use rocm_dash_collectors::host::HostCollector;
 use rocm_dash_collectors::lemonade::LemonadeCollector;
 use rocm_dash_collectors::parallel::parallel_scrape;
@@ -52,6 +53,12 @@ pub struct RunnerOptions {
     /// When set, every broadcast Event is appended to
     /// `{persist_dir}/session-{ts}.ndjson` for offline replay.
     pub persist_dir: Option<PathBuf>,
+    /// rocm-cli managed-service registry directory (`AppPaths::services_dir()`).
+    /// When set, the daemon reads `ManagedServiceRecord`s each discovery tick and
+    /// surfaces live ones as scrape targets (port from the registry), so a model
+    /// served via `rocm serve` appears in the dashboard with live `gen_tps`
+    /// without Docker discovery (EAI-6871 D7). Off by default.
+    pub services_dir: Option<PathBuf>,
 }
 
 impl Default for RunnerOptions {
@@ -69,6 +76,7 @@ impl Default for RunnerOptions {
             lemonade_host: "127.0.0.1".into(),
             lemonade_port: rocm_dash_collectors::lemonade::LEMONADE_PORT,
             persist_dir: None,
+            services_dir: None,
         }
     }
 }
@@ -150,6 +158,11 @@ pub async fn run_loop(
         None
     };
     let mut known_instances: HashSet<String> = HashSet::new();
+    // Managed-service registry (EAI-6871 D7): ids surfaced from the rocm-cli
+    // `serve` registry, and the subset whose engine is NOT vLLM (excluded from
+    // the vLLM Prometheus scrape so they aren't mis-parsed).
+    let mut known_services: HashSet<String> = HashSet::new();
+    let mut managed_non_vllm: HashSet<String> = HashSet::new();
     // Previous `generation_tokens_total` reading per instance, for rate calc.
     let mut prev_gen_tokens: HashMap<String, (f64, DateTime<Utc>)> = HashMap::new();
     // Per-container VRAM (MB) from the last amd-smi `process` scrape. Refreshed
@@ -291,9 +304,60 @@ pub async fn run_loop(
             }
         }
 
+        // Managed-service registry discovery (EAI-6871 D7) — read the rocm-cli
+        // `serve` records and surface live ones as scrape targets. The port is
+        // the registry's authority; non-vLLM engines are tracked so the vLLM
+        // scrape below skips them. A model served via `rocm serve` thus appears
+        // in the dashboard and is scraped for `gen_tps` without Docker.
+        if let Some(services_dir) = opts.services_dir.as_ref()
+            && (tick_count == 1 || tick_count.is_multiple_of(discovery_ticks))
+        {
+            let records = crate::registry::load_service_records(services_dir);
+            let mut seen: HashSet<String> = HashSet::new();
+            managed_non_vllm.clear();
+            for record in &records {
+                let Some(svc) = crate::registry::discovered_from_record(record) else {
+                    continue;
+                };
+                seen.insert(svc.container_id.clone());
+                if crate::registry::engine_kind_for(record) != Some(EngineKind::Vllm) {
+                    managed_non_vllm.insert(svc.container_id.clone());
+                }
+                let inst = instance_from_discovered(&svc);
+                runner
+                    .state
+                    .apply(StateEvent::InstanceUpserted(inst.clone()));
+                if !known_services.contains(&svc.container_id) {
+                    info!(
+                        id = %svc.container_id,
+                        engine = %record.engine,
+                        port = record.port,
+                        "managed service discovered"
+                    );
+                    broadcast_and_persist(&tx, persist.as_ref(), Event::InstanceDiscovered(inst));
+                }
+            }
+            for gone in known_services.difference(&seen) {
+                info!(id = %gone, "managed service gone");
+                prev_gen_tokens.remove(gone);
+                runner
+                    .state
+                    .apply(StateEvent::InstanceRemoved(gone.clone()));
+                broadcast_and_persist(
+                    &tx,
+                    persist.as_ref(),
+                    Event::InstanceGone {
+                        container_id: gone.clone(),
+                    },
+                );
+            }
+            known_services = seen;
+        }
+
         // Per-instance vLLM metric scrape, parallel, on its own cadence. The
         // Lemonade instance (if any) is scraped via its own collector below, so
-        // exclude it from the vLLM Prometheus targets.
+        // exclude it from the vLLM Prometheus targets. Managed non-vLLM services
+        // are excluded too (their engine uses a different parser).
         if let Some(prom) = vllm.as_ref()
             && !runner.state.instances.is_empty()
             && tick_count.is_multiple_of(instance_ticks)
@@ -303,6 +367,7 @@ pub async fn run_loop(
                 .instances
                 .values()
                 .filter(|i| Some(i.container_id.as_str()) != lemonade_id.as_deref())
+                .filter(|i| !managed_non_vllm.contains(&i.container_id))
                 .filter_map(|i| i.port.map(|p| (i.container_id.clone(), p)))
                 .collect();
             let prom = prom.clone();
@@ -559,7 +624,7 @@ const MAX_RATE_INTERVAL_S: f64 = 60.0;
 /// stale interval (backwards/forward clock jump, scrape outage), or a counter
 /// reset (`cur < prev`, e.g. the vLLM process restarted) — so the rate is
 /// never negative, stale, or otherwise bogus.
-fn gen_tps_from_delta(
+pub(crate) fn gen_tps_from_delta(
     prev: Option<(f64, DateTime<Utc>)>,
     cur: f64,
     now: DateTime<Utc>,

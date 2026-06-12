@@ -9,6 +9,7 @@
 pub mod bench_ring;
 pub mod demo;
 pub mod persist;
+pub mod registry;
 pub mod runner;
 pub mod server;
 pub mod snapshot_ring;
