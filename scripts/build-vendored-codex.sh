@@ -28,6 +28,45 @@ need_cmd() {
 
 need_cmd cargo
 
+# ---------------------------------------------------------------------------
+# Prebuilt binary fast path.
+#
+# Set ROCM_CODEX_PREBUILT_BINARY to an absolute path of an already-compiled
+# `codex` binary to skip the full Cargo build.  The binary is still installed
+# into the same ROCM_PROFILE_DIR location as the compiled one, so the rest of
+# the packaging pipeline is unaffected.
+#
+# In CI this lets the acceptance step reuse the binary that was produced by the
+# earlier release build step instead of compiling the large vendored Codex
+# workspace a second time.
+# ---------------------------------------------------------------------------
+if [[ -n "${ROCM_CODEX_PREBUILT_BINARY:-}" ]]; then
+  if [[ ! -f "${ROCM_CODEX_PREBUILT_BINARY}" ]]; then
+    echo "ROCM_CODEX_PREBUILT_BINARY is set but file not found: ${ROCM_CODEX_PREBUILT_BINARY}" >&2
+    exit 1
+  fi
+  if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+    if [[ "${CARGO_TARGET_DIR}" = /* ]]; then
+      ROCM_TARGET_DIR="${CARGO_TARGET_DIR}"
+    else
+      ROCM_TARGET_DIR="${REPO_ROOT}/${CARGO_TARGET_DIR}"
+    fi
+  else
+    ROCM_TARGET_DIR="${REPO_ROOT}/target"
+  fi
+  if [[ -n "${TARGET_TRIPLE}" ]]; then
+    ROCM_PROFILE_DIR="${ROCM_TARGET_DIR}/${TARGET_TRIPLE}/${PROFILE}"
+  else
+    ROCM_PROFILE_DIR="${ROCM_TARGET_DIR}/${PROFILE}"
+  fi
+  mkdir -p "${ROCM_PROFILE_DIR}"
+  install -m 0755 "${ROCM_CODEX_PREBUILT_BINARY}" "${ROCM_PROFILE_DIR}/rocm-codex"
+  echo "using prebuilt vendored Codex binary"
+  echo "  source: ${ROCM_CODEX_PREBUILT_BINARY}"
+  echo "  installed wrapper binary: ${ROCM_PROFILE_DIR}/rocm-codex"
+  exit 0
+fi
+
 if [[ "$(uname -s)" == "Linux" ]]; then
   need_cmd pkg-config
   LOCAL_DEV_SYSROOT="${ROCM_CLI_PORTABLE_BUILD_DEPS_ROOT:-${REPO_ROOT}/.rocm-work/tools/wsl-build-deps}/root"

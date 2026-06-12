@@ -108,6 +108,24 @@ expect_failure() {
 echo "acceptance: build release binaries"
 (cd "${REPO_ROOT}" && cargo build --release -p rocm -p rocmd -p rocm-engine-pytorch -p rocm-engine-llama-cpp -p rocm-engine-lemonade -p rocm-engine-atom -p rocm-engine-vllm -p rocm-engine-sglang)
 
+# Resolve the prebuilt Codex binary location so packaging can skip a second
+# full compilation of the large vendored Codex workspace.  The binary is built
+# once during the main CI build step (which uses the same CARGO_TARGET_DIR)
+# and reused here.  If the binary is not present (e.g. first local run) the
+# packaging script will compile it normally.
+CODEX_CANDIDATE="${REPO_ROOT}/target/release/rocm-codex"
+if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+  if [[ "${CARGO_TARGET_DIR}" = /* ]]; then
+    CODEX_CANDIDATE="${CARGO_TARGET_DIR}/release/rocm-codex"
+  else
+    CODEX_CANDIDATE="${REPO_ROOT}/${CARGO_TARGET_DIR}/release/rocm-codex"
+  fi
+fi
+if [[ -x "${CODEX_CANDIDATE}" ]]; then
+  export ROCM_CODEX_PREBUILT_BINARY="${CODEX_CANDIDATE}"
+  echo "acceptance: reusing prebuilt rocm-codex at ${CODEX_CANDIDATE}"
+fi
+
 echo "acceptance: generate signing key"
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "${SIGNING_PRIVATE_KEY}" >/dev/null 2>&1 \
   || fail "failed to generate acceptance signing private key"

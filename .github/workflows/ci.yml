@@ -38,6 +38,12 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-targets
 
+      - name: Pre-build release binaries and codex for acceptance step
+        if: github.event_name == 'push'
+        run: |
+          cargo build --release -p rocm -p rocmd -p rocm-engine-pytorch -p rocm-engine-llama-cpp -p rocm-engine-lemonade -p rocm-engine-atom -p rocm-engine-vllm -p rocm-engine-sglang
+          bash scripts/build-vendored-codex.sh release
+
       - name: Local no-fallback smoke
         run: python scripts/smoke_local.py --skip-build
 
