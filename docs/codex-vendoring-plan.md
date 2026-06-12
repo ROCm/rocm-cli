@@ -1,5 +1,13 @@
 # Codex TUI Vendoring Plan For `rocm-cli`
 
+> **SUPERSEDED (EAI-6912 / EAI-6913).** The vendored Codex approach has been
+> dropped. The ~70-crate vendored tree caused the Linux CI timeout and shipped
+> no essential functionality (it was reachable only via the hidden
+> `--experimental-codex-tui` flag spawning a separate `rocm-codex` binary). The
+> interactive agentic TUI will instead be delivered via an ACP client driving
+> the Goose binary, with ROCm tools exposed over MCP. Retained for historical
+> context only.
+
 ## Goal
 
 Replace the current in-tree `rocm` TUI with a fully vendored Codex TUI stack from `openai/codex`, while retrofitting ROCm-specific semantics, tools, approvals, and background automation into the Codex interaction model.

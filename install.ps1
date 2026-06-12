@@ -413,7 +413,7 @@ try {
     $bundleDir = Find-BundleDir $extractDir
     $bundleBin = Join-Path $bundleDir "bin"
 
-    foreach ($required in @("rocm.exe", "rocmd.exe", "rocm-engine-pytorch.exe", "rocm-engine-llama-cpp.exe", "rocm-engine-lemonade.exe", "rocm-engine-atom.exe", "rocm-engine-vllm.exe", "rocm-engine-sglang.exe", "rocm-codex.exe")) {
+    foreach ($required in @("rocm.exe", "rocmd.exe", "rocm-engine-pytorch.exe", "rocm-engine-llama-cpp.exe", "rocm-engine-lemonade.exe", "rocm-engine-atom.exe", "rocm-engine-vllm.exe", "rocm-engine-sglang.exe")) {
         if (-not (Test-Path -LiteralPath (Join-Path $bundleBin $required) -PathType Leaf)) {
             Fail "bundle did not contain bin/$required"
         }

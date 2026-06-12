@@ -30,7 +30,6 @@ LINUX_REQUIRED = (
     "bin/rocm-engine-atom",
     "bin/rocm-engine-vllm",
     "bin/rocm-engine-sglang",
-    "bin/rocm-codex",
     "README.md",
     "LICENSE",
     "install.sh",
@@ -44,7 +43,6 @@ WINDOWS_REQUIRED = (
     "bin/rocm-engine-atom.exe",
     "bin/rocm-engine-vllm.exe",
     "bin/rocm-engine-sglang.exe",
-    "bin/rocm-codex.exe",
     "README.md",
     "LICENSE",
     "install.ps1",
@@ -58,7 +56,6 @@ LINUX_EXECUTABLES = (
     "bin/rocm-engine-atom",
     "bin/rocm-engine-vllm",
     "bin/rocm-engine-sglang",
-    "bin/rocm-codex",
     "install.sh",
 )
 PRODUCTION_TRUST_ENV_NAMES = (

@@ -24,15 +24,6 @@ rm -rf "${ROOT_DIR}"
 rm -f "${ARCHIVE_PATH}" "${ARCHIVE_PATH}.sha256" "${ARCHIVE_PATH}.sig" "${TAR_PATH}"
 mkdir -p "${ROOT_DIR}/bin"
 
-if [[ ! -x "${BINARY_DIR}/rocm-codex" ]]; then
-  chmod +x scripts/build-vendored-codex.sh
-  PROFILE="release"
-  if [[ "${BINARY_DIR}" == *"/debug" ]]; then
-    PROFILE="debug"
-  fi
-  ./scripts/build-vendored-codex.sh "${PROFILE}" "${TARGET_TRIPLE}"
-fi
-
 cp "${BINARY_DIR}/rocm" "${ROOT_DIR}/bin/"
 cp "${BINARY_DIR}/rocmd" "${ROOT_DIR}/bin/"
 cp "${BINARY_DIR}/rocm-engine-pytorch" "${ROOT_DIR}/bin/"
@@ -41,7 +32,6 @@ cp "${BINARY_DIR}/rocm-engine-lemonade" "${ROOT_DIR}/bin/"
 cp "${BINARY_DIR}/rocm-engine-atom" "${ROOT_DIR}/bin/"
 cp "${BINARY_DIR}/rocm-engine-vllm" "${ROOT_DIR}/bin/"
 cp "${BINARY_DIR}/rocm-engine-sglang" "${ROOT_DIR}/bin/"
-cp "${BINARY_DIR}/rocm-codex" "${ROOT_DIR}/bin/"
 cp README.md LICENSE install.sh "${ROOT_DIR}/"
 
 (cd "${OUTPUT_DIR}" && tar -cf "${DIST_NAME}.tar" "${DIST_NAME}")
