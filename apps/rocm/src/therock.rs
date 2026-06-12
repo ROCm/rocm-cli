@@ -4000,11 +4000,10 @@ echo Python 3.12.10
         save_managed_python_manifest(&paths, &manifest)?;
         let old_path = std::env::var_os("PATH");
         let old_rocm_cli_python = std::env::var_os("ROCM_CLI_PYTHON");
-        let mut path_entries = vec![bin_dir.clone()];
-        if let Some(old_path) = old_path.as_ref() {
-            path_entries.extend(std::env::split_paths(old_path));
-        }
-        let joined_path = std::env::join_paths(path_entries)?;
+        // Keep PATH hermetic: appending the real PATH lets a genuine cp312
+        // python (present on CI) win over the fake one and breaks the
+        // executable assertion. The fake on PATH is all this test needs.
+        let joined_path = std::env::join_paths([bin_dir.clone()])?;
         unsafe {
             std::env::set_var("PATH", joined_path);
             std::env::remove_var("ROCM_CLI_PYTHON");
