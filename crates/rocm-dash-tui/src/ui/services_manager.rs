@@ -26,6 +26,7 @@ use rocm_dash_core::state::{SideEffect, State, StateEvent};
 use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
 };
+use crate::ui::exec::{exe_label, resolve_exe};
 use crate::ui::format;
 use crate::ui::job_console::draw_job_console;
 use crate::ui::modal::{centered_rect, draw_popup_frame};
@@ -223,20 +224,6 @@ fn spawn_lifecycle(
     });
     sm.active_job = Some(id);
     fx
-}
-
-/// The `rocm` binary to invoke: this process's own path, or the bare name
-/// (PATH lookup) if `current_exe()` is unavailable — never a no-op.
-fn resolve_exe() -> String {
-    std::env::current_exe()
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "rocm".to_string())
-}
-
-/// Short, human-readable basename of a resolved command for the approval preview.
-fn exe_label(cmd: &str) -> &str {
-    cmd.rsplit(['/', '\\']).next().unwrap_or(cmd)
 }
 
 fn port_str(port: Option<u16>) -> String {

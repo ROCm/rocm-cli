@@ -320,6 +320,8 @@ pub struct AppState {
     pub jobs: rocm_dash_core::state::State,
     /// Services manager overlay (Phase 3 Wave 1). `None` = closed.
     pub services: Option<crate::ui::services_manager::ServicesManagerState>,
+    /// Serve wizard overlay (Phase 3 Wave 1). `None` = closed.
+    pub serve_wizard: Option<crate::ui::serve_wizard::ServeWizardState>,
 }
 
 impl AppState {
@@ -362,6 +364,7 @@ impl AppState {
             last_tab_bar_area: None,
             jobs: rocm_dash_core::state::State::default(),
             services: None,
+            serve_wizard: None,
         }
     }
 
@@ -851,6 +854,16 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         );
                         crate::jobs::run_effects(fx, &job_tx);
                     }
+                    // The serve-wizard overlay, when open, owns all keys (and may
+                    // spawn a launch job through the job-bridge).
+                    Some(Ok(CtEvent::Key(k))) if state.serve_wizard.is_some() => {
+                        let fx = crate::ui::serve_wizard::on_key(
+                            &mut state.serve_wizard,
+                            &mut state.jobs,
+                            k,
+                        );
+                        crate::jobs::run_effects(fx, &job_tx);
+                    }
                     Some(Ok(CtEvent::Key(k))) => {
                         let chat_ctx = ChatKeyCtx {
                             focused: state.chat_focused,
@@ -1044,6 +1057,10 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
         KeyAction::OpenServices => {
             state.services = Some(crate::ui::services_manager::ServicesManagerState::default());
         }
+        KeyAction::OpenServeWizard => {
+            state.serve_wizard =
+                Some(crate::ui::serve_wizard::ServeWizardState::default());
+        }
         KeyAction::OpenThemePicker => state.open_theme_picker(),
         KeyAction::ApplyThemePick => state.apply_theme_pick(),
         KeyAction::ScrollModal(d) => {
@@ -1182,6 +1199,8 @@ pub enum KeyAction {
     ChatScroll(i16),
     /// Open the services-manager overlay (Phase 3 Wave 1).
     OpenServices,
+    /// Open the serve-wizard overlay (Phase 3 Wave 1).
+    OpenServeWizard,
 }
 
 fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) -> KeyAction {
@@ -1324,6 +1343,12 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         KeyCode::Char('G') | KeyCode::End => KeyAction::SelectLast,
         // Services manager: open from the Instances tab (where servers live).
         KeyCode::Char('s') if current == ActiveTab::Instances => KeyAction::OpenServices,
+        // Serve wizard: launch a model from the Overview or Instances tab.
+        KeyCode::Char('w')
+            if matches!(current, ActiveTab::Overview | ActiveTab::Instances) =>
+        {
+            KeyAction::OpenServeWizard
+        }
         KeyCode::Enter => KeyAction::OpenDetail,
         _ => KeyAction::Nothing,
     }
