@@ -144,11 +144,14 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   gpu-smoke:
-    name: GPU Smoke (MI300X)
-    runs-on: [self-hosted, mi300x]
+    name: GPU Smoke (gfx1151)
+    runs-on: [self-hosted, windows-gfx1151-gpu-rocm]
     needs: [build-and-test, fmt, clippy]
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - uses: actions/checkout@v6
 
@@ -158,37 +161,37 @@ jobs:
         run: cargo build --workspace --all-targets
 
       - name: Host detection
-        run: ./target/debug/rocm doctor
+        run: .\target\debug\rocm.exe doctor
 
       - name: Engine detection
-        run: ./target/debug/rocm-engine-pytorch detect
+        run: .\target\debug\rocm-engine-pytorch.exe detect
 
       - name: Engine capabilities
-        run: ./target/debug/rocm-engine-pytorch capabilities
+        run: .\target\debug\rocm-engine-pytorch.exe capabilities
 
       - name: llama.cpp adapter detection
-        run: ./target/debug/rocm-engine-llama-cpp detect
+        run: .\target\debug\rocm-engine-llama-cpp.exe detect
 
       - name: llama.cpp adapter capabilities
-        run: ./target/debug/rocm-engine-llama-cpp capabilities
+        run: .\target\debug\rocm-engine-llama-cpp.exe capabilities
 
       - name: ATOM adapter detection
-        run: ./target/debug/rocm-engine-atom detect
+        run: .\target\debug\rocm-engine-atom.exe detect
 
       - name: ATOM adapter capabilities
-        run: ./target/debug/rocm-engine-atom capabilities
+        run: .\target\debug\rocm-engine-atom.exe capabilities
 
       - name: vLLM adapter detection
-        run: ./target/debug/rocm-engine-vllm detect
+        run: .\target\debug\rocm-engine-vllm.exe detect
 
       - name: vLLM adapter capabilities
-        run: ./target/debug/rocm-engine-vllm capabilities
+        run: .\target\debug\rocm-engine-vllm.exe capabilities
 
       - name: SGLang adapter detection
-        run: ./target/debug/rocm-engine-sglang detect
+        run: .\target\debug\rocm-engine-sglang.exe detect
 
       - name: SGLang adapter capabilities
-        run: ./target/debug/rocm-engine-sglang capabilities
+        run: .\target\debug\rocm-engine-sglang.exe capabilities
 
       - name: Resolve large-model recipe
-        run: ./target/debug/rocm-engine-pytorch resolve-model qwen32b
+        run: .\target\debug\rocm-engine-pytorch.exe resolve-model qwen32b
