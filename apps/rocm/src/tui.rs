@@ -313,6 +313,24 @@ fn fallback_terminal_size_from_env() -> Option<Size> {
     )
 }
 
+/// Best-effort terminal dimensions for layout math performed outside the draw
+/// loop (e.g. resolving a follow-the-bottom scroll before the first paint).
+/// Falls back to the COLUMNS/LINES env or a sane default when the real terminal
+/// size is unavailable, such as in a headless/no-TTY process (CI).
+fn effective_terminal_size() -> (u16, u16) {
+    if let Ok((width, height)) = size()
+        && width > 1
+        && height > 1
+    {
+        return (width, height);
+    }
+    let fallback = fallback_terminal_size_from_env().unwrap_or(Size {
+        width: FALLBACK_TERMINAL_COLUMNS,
+        height: FALLBACK_TERMINAL_ROWS,
+    });
+    (fallback.width, fallback.height)
+}
+
 fn fallback_terminal_size_from_values(columns: Option<&str>, lines: Option<&str>) -> Option<Size> {
     let width = parse_terminal_dimension(columns?)?;
     let height = parse_terminal_dimension(lines?)?;
@@ -8012,9 +8030,7 @@ impl App {
         if let Some(area) = self.command_screen_last_area.get() {
             return bounded_chat_session_scroll(&command_screen_detail_text(self), area, u16::MAX);
         }
-        let Ok((terminal_width, terminal_height)) = size() else {
-            return CHAT_SESSION_FOLLOW_SCROLL;
-        };
+        let (terminal_width, terminal_height) = effective_terminal_size();
         let area = main_content_area(self, terminal_width, terminal_height);
         bounded_chat_session_scroll(&command_screen_detail_text(self), area, u16::MAX)
     }
@@ -8047,9 +8063,7 @@ impl App {
             self.scroll_command_screen_detail(lines);
             return;
         }
-        let Ok((terminal_width, terminal_height)) = size() else {
-            return;
-        };
+        let (terminal_width, terminal_height) = effective_terminal_size();
         let input_height = chat_input_area_height(self, terminal_width, terminal_height);
         let max_scroll = bounded_chat_input_scroll(
             &self.input,
@@ -44564,12 +44578,10 @@ Full log
     }
 
     fn workspace_test_artifact_dir() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join(".rocm-work")
-            .join("tests")
-            .join("tui")
+        // Use the system temp dir rather than a path under the workspace: the
+        // latter is long enough (especially on CI checkouts) that rendered
+        // install paths wrap inside the TUI panels, breaking snapshot assertions.
+        std::env::temp_dir().join("rocm-cli-tests").join("tui")
     }
 
     #[cfg(unix)]
