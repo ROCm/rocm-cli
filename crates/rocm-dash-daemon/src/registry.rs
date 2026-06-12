@@ -18,11 +18,21 @@
 //! (`ServiceRecord.port`), never a hardcoded default. The engine defaults
 //! (`EngineKind::default_port`, `docker.rs`, `lemonade.rs`) remain only as a
 //! fallback for *unmanaged/external* discovery.
+//!
+//! **Co-located scope (known limitation):** scrape targets carry only a port;
+//! the runner's vLLM collector scrapes `opts.vllm_metrics_host` (default
+//! `127.0.0.1`), so `record.host` is honored only for the co-located daemon
+//! (the same assumption the Docker-discovery path already makes). A managed
+//! service on a non-loopback host is surfaced but its metrics are scraped at the
+//! local address. Per-host scrape targeting is tracked as a D7 follow-up.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
+use crate::runner::instance_from_discovered;
 use rocm_dash_collectors::engine_registry::EngineKind;
+use rocm_dash_core::metrics::Instance;
 use rocm_dash_core::traits::DiscoveredService;
 use serde::Deserialize;
 
@@ -98,6 +108,11 @@ pub fn discovered_from_record(record: &ServiceRecord) -> Option<DiscoveredServic
     if !is_scrapeable_status(&record.status) {
         return None;
     }
+    // A `#[serde(default)]` u16 missing from the JSON deserializes to 0; an
+    // unbound/malformed port is not a real scrape target (would poll :0 forever).
+    if record.port == 0 {
+        return None;
+    }
     let model_name = if record.model_ref.is_empty() {
         record.canonical_model_id.clone()
     } else {
@@ -117,6 +132,41 @@ pub fn discovered_from_record(record: &ServiceRecord) -> Option<DiscoveredServic
 /// Lemonade JSON) for a managed service.
 pub fn engine_kind_for(record: &ServiceRecord) -> Option<EngineKind> {
     EngineKind::from_label(&record.engine)
+}
+
+/// The result of turning a batch of registry records into dashboard instances:
+/// the live instances to upsert, their ids (`seen`), and the subset whose engine
+/// is NOT vLLM (`non_vllm`, excluded from the vLLM Prometheus scrape so they are
+/// not mis-parsed). Pure — the runner applies it (upsert/broadcast/Gone-diff).
+#[derive(Debug, Default)]
+pub struct ManagedDiscovery {
+    pub instances: Vec<Instance>,
+    pub seen: HashSet<String>,
+    pub non_vllm: HashSet<String>,
+}
+
+/// Convert the loaded registry records into a [`ManagedDiscovery`] — the pure
+/// core of the daemon's managed-service discovery tick. Non-scrapeable records
+/// (bad status / port 0) are dropped; vLLM-engine services flow to the
+/// Prometheus scrape, others are flagged in `non_vllm`.
+///
+/// NOTE: gen_tps for managed **non-vLLM** engines (e.g. Lemonade) is not yet
+/// wired — they appear in the dashboard but are excluded from the vLLM scrape
+/// and not routed to a per-engine collector here. vLLM (the Phase-2 acceptance
+/// target) is fully wired. Non-vLLM managed scraping is a D7 follow-up.
+pub fn discover_managed_services(records: &[ServiceRecord]) -> ManagedDiscovery {
+    let mut out = ManagedDiscovery::default();
+    for record in records {
+        let Some(svc) = discovered_from_record(record) else {
+            continue;
+        };
+        out.seen.insert(svc.container_id.clone());
+        if engine_kind_for(record) != Some(EngineKind::Vllm) {
+            out.non_vllm.insert(svc.container_id.clone());
+        }
+        out.instances.push(instance_from_discovered(&svc));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -238,6 +288,56 @@ mod tests {
                 "status {live:?} must be scraped"
             );
         }
+    }
+
+    #[test]
+    fn discovered_skips_zero_port() {
+        // A record whose port field is absent (serde default 0) is not a real
+        // scrape target even when its status is live.
+        let rec: ServiceRecord =
+            serde_json::from_str(&record_json("svc", "vllm", 0, "running", 1)).unwrap();
+        assert!(discovered_from_record(&rec).is_none());
+        // A missing `port` key entirely → default 0 → also skipped.
+        let rec: ServiceRecord =
+            serde_json::from_str(r#"{"service_id":"x","engine":"vllm","status":"running"}"#)
+                .unwrap();
+        assert_eq!(rec.port, 0);
+        assert!(discovered_from_record(&rec).is_none());
+    }
+
+    #[test]
+    fn discover_managed_services_classifies_and_filters() {
+        let records: Vec<ServiceRecord> = [
+            record_json("svc-vllm", "vllm", 8000, "running", 3),
+            record_json("svc-lemon", "lemonade", 13305, "ready", 2),
+            record_json("svc-dead", "vllm", 9000, "stopped", 1),
+            record_json("svc-noport", "vllm", 0, "running", 0),
+        ]
+        .iter()
+        .map(|j| serde_json::from_str(j).unwrap())
+        .collect();
+
+        let disc = discover_managed_services(&records);
+        // Two live, scrapeable instances (dead + zero-port dropped).
+        assert_eq!(disc.instances.len(), 2);
+        assert!(disc.seen.contains("svc-vllm"));
+        assert!(disc.seen.contains("svc-lemon"));
+        assert!(!disc.seen.contains("svc-dead"));
+        assert!(!disc.seen.contains("svc-noport"));
+        // Only the Lemonade service is excluded from the vLLM scrape.
+        assert!(disc.non_vllm.contains("svc-lemon"));
+        assert!(!disc.non_vllm.contains("svc-vllm"));
+        // Instances carry the registry port + Running status.
+        let vllm = disc
+            .instances
+            .iter()
+            .find(|i| i.container_id == "svc-vllm")
+            .unwrap();
+        assert_eq!(vllm.port, Some(8000));
+        assert_eq!(
+            vllm.status,
+            rocm_dash_core::metrics::InstanceStatus::Running
+        );
     }
 
     /// Deterministic end-to-end of the registry→scrape→dashboard data path (no
