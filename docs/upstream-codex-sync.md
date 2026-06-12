@@ -1,5 +1,10 @@
 # Upstream Codex Sync Notes
 
+> **SUPERSEDED (EAI-6912 / EAI-6913).** The vendored Codex tree
+> (`third_party/openai-codex`) has been removed from rocm-cli, so there is no
+> longer an upstream Codex subtree to sync. Retained for historical context
+> only.
+
 ## Current Pin
 
 - upstream repo: `https://github.com/openai/codex`
