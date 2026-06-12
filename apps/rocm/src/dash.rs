@@ -1,0 +1,175 @@
+//! `rocm dash` — launch the unified telemetry dashboard (EAI-6871 Phase 3 / D5).
+//!
+//! Folds the rocm-dash launch verb into the `rocm` binary. It builds the
+//! telemetry daemon's [`RunnerOptions`] — wiring `services_dir =
+//! AppPaths::services_dir()` so the managed services that `rocm serve --managed`
+//! writes there surface live in the dashboard (the D7 registry→scrape→`gen_tps`
+//! seam) — auto-starts an embedded daemon when none is already listening, and
+//! runs the ratatui dashboard TUI.
+//!
+//! The rest of `rocm` is synchronous; the async daemon/TUI run on a tokio
+//! runtime built here. The two ratatui majors (0.29 in `tui.rs`, 0.30 in
+//! `rocm-dash-tui`) coexist, each confined to its crate.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use rocm_core::{AppPaths, RocmCliConfig};
+use rocm_dash_daemon::runner::RunnerOptions;
+use rocm_dash_tui::app::{ActiveTab, ResolvedArgs};
+
+/// Build the telemetry-daemon options from the unified dashboard config.
+///
+/// `services_dir` is the load-bearing wire: pointing it at
+/// [`AppPaths::services_dir`] makes the daemon discover managed services written
+/// by `rocm serve --managed` and surface their `gen_tps` in the dashboard.
+pub fn runner_options(
+    config: &RocmCliConfig,
+    paths: &AppPaths,
+    enable_docker: bool,
+) -> RunnerOptions {
+    let d = &config.dashboard.daemon;
+    RunnerOptions {
+        bench_csv: d.bench_results_dir.clone(),
+        enable_docker,
+        image_patterns: None,
+        gpu_tick: Duration::from_secs_f64(d.gpu_tick_secs),
+        discovery_tick: Duration::from_secs_f64(d.discovery_tick_secs),
+        instance_tick: Duration::from_secs_f64(d.instance_tick_secs),
+        disable_vllm_metrics: false,
+        vllm_metrics_host: "127.0.0.1".into(),
+        // Lemonade discovery stays opt-in (mirrors a no-flag embedded daemon).
+        enable_lemonade: false,
+        lemonade_host: "127.0.0.1".into(),
+        lemonade_port: 13305,
+        persist_dir: Some(paths.telemetry_state_dir()),
+        // D7 seam consumer: managed services from `rocm serve --managed`.
+        services_dir: Some(paths.services_dir()),
+    }
+}
+
+/// API key precedence — sourced from the environment ONLY (never TOML/CLI/source/
+/// logs); see the chat invariant.
+fn chat_api_key_from_env() -> Option<String> {
+    ["ROCMDASH_CHAT_API_KEY", "AMD_LLM_API_KEY", "OPENAI_API_KEY"]
+        .into_iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+}
+
+/// Resolve the TUI args from the unified config + environment.
+pub fn resolved_args(config: &RocmCliConfig, initial_tab: ActiveTab) -> ResolvedArgs {
+    let t = &config.dashboard.tui;
+    ResolvedArgs {
+        connect: t.connect.clone(),
+        token: config.dashboard.daemon.token.clone(),
+        theme: t.theme.clone(),
+        replay: None,
+        initial_tab,
+        chat_url: t.chat_url.clone(),
+        chat_model: t.chat_model.clone(),
+        chat_auth_header: t.chat_auth_header.clone(),
+        chat_env_url: std::env::var("OPENAI_BASE_URL")
+            .ok()
+            .filter(|v| !v.is_empty()),
+        chat_api_key: chat_api_key_from_env(),
+        chat_auto_consent: false,
+        chat_mock: false,
+    }
+}
+
+/// Entry point for `rocm dash`. Builds a tokio runtime and runs the dashboard.
+pub fn run() -> Result<()> {
+    let paths = AppPaths::discover()?;
+    let config = RocmCliConfig::load(&paths)?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime for the dashboard")?;
+    rt.block_on(run_async(config, paths))
+}
+
+async fn run_async(config: RocmCliConfig, paths: AppPaths) -> Result<()> {
+    let args = resolved_args(&config, ActiveTab::Overview);
+    let embedded = maybe_spawn_embedded_daemon(&args.connect, &config, &paths).await;
+
+    let result = rocm_dash_tui::app::run(args)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()));
+
+    // Tidy up the embedded daemon on exit (best-effort).
+    if let Some((handle, socket)) = embedded {
+        handle.abort();
+        if let Some(path) = socket {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    result
+}
+
+/// Auto-start an embedded telemetry daemon when no local one is already
+/// listening, so `rocm dash` works without a separate `rocm daemon` terminal.
+/// Returns the task handle + socket to clean up on exit, or `None` when an
+/// existing daemon was found (we connect to it instead).
+async fn maybe_spawn_embedded_daemon(
+    connect: &str,
+    config: &RocmCliConfig,
+    paths: &AppPaths,
+) -> Option<(tokio::task::JoinHandle<()>, Option<PathBuf>)> {
+    // Only auto-manage a LOCAL unix-socket daemon.
+    let target = connect.strip_prefix("unix:")?;
+    if tokio::net::UnixStream::connect(target).await.is_ok() {
+        return None; // a daemon already answers here
+    }
+
+    let opts = runner_options(config, paths, false);
+    let listen = connect.to_string();
+    let socket = Some(PathBuf::from(target));
+    let token = config.dashboard.daemon.token.clone();
+
+    let handle = tokio::spawn(async move {
+        if let Err(e) = rocm_dash_daemon::server::run(&listen, token.as_deref(), opts).await {
+            eprintln!("rocm: embedded telemetry daemon exited: {e:#}");
+        }
+    });
+    // Give it a moment to bind before the TUI client dials in.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    Some((handle, socket))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> RocmCliConfig {
+        RocmCliConfig::default()
+    }
+
+    fn paths() -> AppPaths {
+        AppPaths {
+            config_dir: PathBuf::from("/tmp/rocm-cfg"),
+            data_dir: PathBuf::from("/tmp/rocm-data"),
+            cache_dir: PathBuf::from("/tmp/rocm-cache"),
+        }
+    }
+
+    #[test]
+    fn runner_options_wires_services_dir_to_registry() {
+        let p = paths();
+        let opts = runner_options(&cfg(), &p, false);
+        // The serve→dashboard wire: daemon reads the managed-service registry.
+        assert_eq!(opts.services_dir, Some(p.services_dir()));
+        assert_eq!(opts.persist_dir, Some(p.telemetry_state_dir()));
+        assert!(!opts.enable_docker);
+    }
+
+    #[test]
+    fn resolved_args_take_connect_and_theme_from_config() {
+        let c = cfg();
+        let args = resolved_args(&c, ActiveTab::Overview);
+        assert_eq!(args.connect, c.dashboard.tui.connect);
+        assert_eq!(args.theme, c.dashboard.tui.theme);
+        assert!(!args.chat_mock);
+        assert!(args.replay.is_none());
+    }
+}
