@@ -157,7 +157,7 @@ jobs:
   gpu-smoke:
     name: GPU Smoke (gfx1151)
     runs-on: [self-hosted, windows-gfx1151-gpu-rocm]
-    needs: [build-and-test, fmt, clippy]
+    needs: [windows-build-and-test, fmt, clippy]
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 30
     defaults:
