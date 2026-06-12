@@ -28,7 +28,10 @@ impl EngineKind {
         }
     }
 
-    /// The engine's conventional local port.
+    /// The engine's conventional local port. **Fallback only** — for managed
+    /// services the bound port comes from the registry
+    /// (`ManagedServiceRecord.port`, EAI-6871 D7); this default is used only for
+    /// unmanaged/external discovery where no registry record exists.
     pub fn default_port(self) -> u16 {
         match self {
             EngineKind::Vllm => 8000,
