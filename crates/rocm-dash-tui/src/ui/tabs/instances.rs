@@ -794,6 +794,7 @@ mod tests {
             jobs: rocm_dash_core::state::State::default(),
             services: None,
             serve_wizard: None,
+            engine_manager: None,
         }
     }
 
