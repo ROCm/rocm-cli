@@ -1058,8 +1058,7 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
             state.services = Some(crate::ui::services_manager::ServicesManagerState::default());
         }
         KeyAction::OpenServeWizard => {
-            state.serve_wizard =
-                Some(crate::ui::serve_wizard::ServeWizardState::default());
+            state.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState::default());
         }
         KeyAction::OpenThemePicker => state.open_theme_picker(),
         KeyAction::ApplyThemePick => state.apply_theme_pick(),
@@ -1344,9 +1343,7 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         // Services manager: open from the Instances tab (where servers live).
         KeyCode::Char('s') if current == ActiveTab::Instances => KeyAction::OpenServices,
         // Serve wizard: launch a model from the Overview or Instances tab.
-        KeyCode::Char('w')
-            if matches!(current, ActiveTab::Overview | ActiveTab::Instances) =>
-        {
+        KeyCode::Char('w') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
             KeyAction::OpenServeWizard
         }
         KeyCode::Enter => KeyAction::OpenDetail,

@@ -37,7 +37,12 @@ pub const ENGINES: &[&str] = &["lemonade", "pytorch", "llama.cpp", "vllm", "sgla
 
 /// Device-policy choices. Index 0 omits `--device` entirely (engine default);
 /// the rest mirror `rocm-core`'s validated `gpu_required|gpu_preferred|cpu_only`.
-pub const DEVICES: &[&str] = &["(engine default)", "gpu_required", "gpu_preferred", "cpu_only"];
+pub const DEVICES: &[&str] = &[
+    "(engine default)",
+    "gpu_required",
+    "gpu_preferred",
+    "cpu_only",
+];
 
 /// Mirrors `rocm-core::DEFAULT_LOCAL_HOST` / `DEFAULT_LOCAL_PORT` (TUI-local to
 /// avoid the dep; the CLI re-applies its own defaults if these are cleared).
@@ -182,11 +187,15 @@ impl ServeWizardState {
         }
         let port = self.port.trim();
         if !port.is_empty() {
-            if port.parse::<u16>().is_err() {
-                return Err(format!("port `{port}` is not a valid 1–65535 value"));
+            // u16 accepts 0, but 0 is not a bindable listen port — reject it so
+            // the error surfaces in the form, not as a downstream bind failure.
+            match port.parse::<u16>() {
+                Ok(p) if p > 0 => {
+                    args.push("--port".to_string());
+                    args.push(p.to_string());
+                }
+                _ => return Err(format!("port `{port}` is not a valid 1–65535 value")),
             }
-            args.push("--port".to_string());
-            args.push(port.to_string());
         }
         // Managed (default) hands supervision to the daemon → it shows up in the
         // services manager + dashboard gen_tps. Foreground runs in this job.
@@ -210,7 +219,11 @@ fn cycle_idx(cur: usize, len: usize, delta: isize) -> usize {
 /// Handle a key while the wizard is open. Mirrors the services-manager seam:
 /// mutates the overlay + job model in place and returns reducer side effects
 /// (e.g. `SpawnJob`) for the event loop to drive through the job-bridge.
-pub fn on_key(wizard: &mut Option<ServeWizardState>, jobs: &mut State, key: KeyEvent) -> Vec<SideEffect> {
+pub fn on_key(
+    wizard: &mut Option<ServeWizardState>,
+    jobs: &mut State,
+    key: KeyEvent,
+) -> Vec<SideEffect> {
     let Some(w) = wizard.as_mut() else {
         return Vec::new();
     };
@@ -340,6 +353,14 @@ fn spawn_serve(
         cmd: pending.cmd,
         args: pending.args,
     });
+    // The reducer is idempotent: a `StartJob` for an id that is already running
+    // (not terminal) no-ops and returns no effects. If that happens, do NOT
+    // point `active_job` at the stale job and claim success — surface it and
+    // leave the form so the user can wait, cancel, or rename.
+    if fx.is_empty() {
+        w.message = Some(format!("a job for “{}” is already running", w.model.trim()));
+        return fx;
+    }
     w.active_job = Some(id);
     fx
 }
@@ -394,7 +415,7 @@ pub fn draw_serve_wizard(
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑↓ field · ←→ change · Tab browse (model) · Enter launch · Esc close",
+            "↑↓ field · ←→ change · Tab browse (model) · Enter next/launch · Esc close",
             Style::default().fg(theme.muted),
         ))),
         rows[2],
@@ -409,16 +430,34 @@ pub fn draw_serve_wizard(
     }
 }
 
-fn field_line<'a>(field: Field, selected: bool, w: &'a ServeWizardState, theme: &Theme) -> Line<'a> {
+fn field_line<'a>(
+    field: Field,
+    selected: bool,
+    w: &'a ServeWizardState,
+    theme: &Theme,
+) -> Line<'a> {
     let (label, value): (&str, String) = match field {
-        Field::Model => ("Model", display_value(&w.model, "(type a name / path, or Tab to browse)")),
-        Field::Engine => ("Engine", ENGINES[w.engine_idx.min(ENGINES.len() - 1)].to_string()),
-        Field::Device => ("Device", DEVICES[w.device_idx.min(DEVICES.len() - 1)].to_string()),
+        Field::Model => (
+            "Model",
+            display_value(&w.model, "(type a name / path, or Tab to browse)"),
+        ),
+        Field::Engine => (
+            "Engine",
+            ENGINES[w.engine_idx.min(ENGINES.len() - 1)].to_string(),
+        ),
+        Field::Device => (
+            "Device",
+            DEVICES[w.device_idx.min(DEVICES.len() - 1)].to_string(),
+        ),
         Field::Host => ("Host", display_value(&w.host, "(engine default)")),
         Field::Port => ("Port", display_value(&w.port, "(engine default)")),
         Field::Mode => (
             "Mode",
-            if w.managed { "managed".to_string() } else { "foreground".to_string() },
+            if w.managed {
+                "managed".to_string()
+            } else {
+                "foreground".to_string()
+            },
         ),
         Field::Launch => ("", String::new()),
     };
@@ -437,7 +476,9 @@ fn field_line<'a>(field: Field, selected: bool, w: &'a ServeWizardState, theme: 
 
     let marker = if selected { "▶ " } else { "  " };
     let label_style = if selected {
-        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(theme.muted)
     };
@@ -507,7 +548,14 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "serve", "qwen", "--engine", "lemonade", "--host", "127.0.0.1", "--port", "11435",
+                "serve",
+                "qwen",
+                "--engine",
+                "lemonade",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "11435",
                 "--managed",
             ]
         );
@@ -532,6 +580,18 @@ mod tests {
         let w = ServeWizardState {
             model: "m".into(),
             port: "99999".into(),
+            ..Default::default()
+        };
+        assert!(w.build_args().unwrap_err().contains("port"));
+    }
+
+    #[test]
+    fn build_args_rejects_port_zero() {
+        // u16 parses 0, but it is not a bindable listen port — must be rejected
+        // in the form, matching the "1–65535" message.
+        let w = ServeWizardState {
+            model: "m".into(),
+            port: "0".into(),
             ..Default::default()
         };
         assert!(w.build_args().unwrap_err().contains("port"));
@@ -623,6 +683,74 @@ mod tests {
         assert!(wiz.as_ref().unwrap().active_job.is_some());
         on_key(&mut wiz, &mut jobs, key(KeyCode::Char('q')));
         assert!(wiz.is_none(), "q must close the overlay even mid-job");
+    }
+
+    #[test]
+    fn esc_is_ignored_while_job_is_running_then_dismisses_when_terminal() {
+        let mut wiz = Some(ServeWizardState::default());
+        let mut jobs = State::default();
+        wiz.as_mut().unwrap().model = "m".into();
+        wiz.as_mut().unwrap().field = FIELDS.iter().position(|f| *f == Field::Launch).unwrap();
+        on_key(&mut wiz, &mut jobs, key(KeyCode::Enter));
+        on_key(&mut wiz, &mut jobs, key(KeyCode::Char('y')));
+        let job_id = wiz.as_ref().unwrap().active_job.clone().unwrap();
+        // Job is Running: Esc must NOT dismiss the console or close the overlay.
+        on_key(&mut wiz, &mut jobs, key(KeyCode::Esc));
+        assert_eq!(wiz.as_ref().unwrap().active_job.as_ref(), Some(&job_id));
+        assert!(wiz.is_some());
+        // Once terminal, Esc dismisses the console back to the form.
+        jobs.apply(StateEvent::JobDone {
+            id: job_id,
+            code: 0,
+        });
+        on_key(&mut wiz, &mut jobs, key(KeyCode::Esc));
+        assert!(wiz.as_ref().unwrap().active_job.is_none());
+        assert!(
+            wiz.is_some(),
+            "dismissing the console keeps the wizard open"
+        );
+    }
+
+    #[test]
+    fn relaunch_while_prior_job_running_surfaces_message_not_stale_console() {
+        // The reducer no-ops a StartJob for a still-running id. spawn_serve must
+        // NOT claim success (set active_job) when no SpawnJob was emitted.
+        let mut wiz = Some(ServeWizardState::default());
+        let mut jobs = State::default();
+        let launch = FIELDS.iter().position(|f| *f == Field::Launch).unwrap();
+
+        // First launch of "qwen": real spawn.
+        for k in typed("qwen") {
+            on_key(&mut wiz, &mut jobs, k);
+        }
+        wiz.as_mut().unwrap().field = launch;
+        on_key(&mut wiz, &mut jobs, key(KeyCode::Enter));
+        on_key(&mut wiz, &mut jobs, key(KeyCode::Char('y')));
+        assert_eq!(
+            wiz.as_ref().unwrap().active_job.as_deref(),
+            Some("serve-qwen")
+        );
+
+        // Simulate the user closing + reopening the overlay (fresh state) while
+        // the "serve-qwen" job is still Running in the shared job model.
+        let mut wiz2 = Some(ServeWizardState::default());
+        for k in typed("qwen") {
+            on_key(&mut wiz2, &mut jobs, k);
+        }
+        wiz2.as_mut().unwrap().field = launch;
+        on_key(&mut wiz2, &mut jobs, key(KeyCode::Enter));
+        let fx = on_key(&mut wiz2, &mut jobs, key(KeyCode::Char('y')));
+        // No new SpawnJob, no stale console, an informative message instead.
+        assert!(fx.is_empty(), "no double-spawn for a running id");
+        let w = wiz2.as_ref().unwrap();
+        assert!(w.active_job.is_none(), "must not point at the stale job");
+        assert!(
+            w.message
+                .as_deref()
+                .unwrap_or("")
+                .contains("already running")
+        );
+        assert_eq!(jobs.jobs.len(), 1, "still just the one job");
     }
 
     #[test]
