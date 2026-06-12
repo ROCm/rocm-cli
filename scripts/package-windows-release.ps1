@@ -111,7 +111,6 @@ $binaryDir = if ([string]::IsNullOrWhiteSpace($TargetTriple)) {
 $archivePath = Join-Path $outputRoot "$DistName.zip"
 $cargoHome = Resolve-CargoHome
 $cargoExe = Resolve-CommandPath "cargo" (Join-Path $cargoHome "bin\cargo.exe")
-$codexBuildTargetDir = Join-Path $cargoHome "target\rocm-cli-codex"
 
 New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
 Remove-Item -LiteralPath $rootDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -119,49 +118,6 @@ Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath "$archivePath.sha256" -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath "$archivePath.sig" -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path (Join-Path $rootDir "bin") | Out-Null
-
-$codexTarget = Join-Path $binaryDir "rocm-codex.exe"
-if (-not (Test-Path -LiteralPath $codexTarget -PathType Leaf)) {
-    $codexManifest = Join-Path $repoRoot "third_party\openai-codex\codex-rs\Cargo.toml"
-    if (-not (Test-Path -LiteralPath $codexManifest -PathType Leaf)) {
-        Fail "vendored Codex manifest not found: $codexManifest"
-    }
-
-    Write-Host "building vendored Codex TUI"
-    Write-Host "  manifest: $codexManifest"
-    Write-Host "  profile: release"
-    Write-Host "  target_dir: $codexBuildTargetDir"
-    if (-not [string]::IsNullOrWhiteSpace($TargetTriple)) {
-        Write-Host "  target: $TargetTriple"
-    }
-
-    $buildArgs = @("build", "--manifest-path", $codexManifest, "-p", "codex-cli", "--bin", "codex", "--release")
-    if (-not [string]::IsNullOrWhiteSpace($TargetTriple)) {
-        $buildArgs += @("--target", $TargetTriple)
-    }
-
-    $previousCargoTargetDir = $env:CARGO_TARGET_DIR
-    try {
-        $env:CARGO_TARGET_DIR = $codexBuildTargetDir
-        & $cargoExe @buildArgs
-        if ($LASTEXITCODE -ne 0) {
-            Fail "vendored Codex build failed"
-        }
-    } finally {
-        if ([string]::IsNullOrWhiteSpace($previousCargoTargetDir)) {
-            Remove-Item Env:\CARGO_TARGET_DIR -ErrorAction SilentlyContinue
-        } else {
-            $env:CARGO_TARGET_DIR = $previousCargoTargetDir
-        }
-    }
-
-    $codexSource = if ([string]::IsNullOrWhiteSpace($TargetTriple)) {
-        Join-Path $codexBuildTargetDir "release\codex.exe"
-    } else {
-        Join-Path $codexBuildTargetDir "$TargetTriple\release\codex.exe"
-    }
-    Copy-RequiredFile $codexSource $codexTarget
-}
 
 $bundleBin = Join-Path $rootDir "bin"
 Copy-RequiredFile (Join-Path $binaryDir "rocm.exe") (Join-Path $bundleBin "rocm.exe")
@@ -172,7 +128,6 @@ Copy-RequiredFile (Join-Path $binaryDir "rocm-engine-lemonade.exe") (Join-Path $
 Copy-RequiredFile (Join-Path $binaryDir "rocm-engine-atom.exe") (Join-Path $bundleBin "rocm-engine-atom.exe")
 Copy-RequiredFile (Join-Path $binaryDir "rocm-engine-vllm.exe") (Join-Path $bundleBin "rocm-engine-vllm.exe")
 Copy-RequiredFile (Join-Path $binaryDir "rocm-engine-sglang.exe") (Join-Path $bundleBin "rocm-engine-sglang.exe")
-Copy-RequiredFile (Join-Path $binaryDir "rocm-codex.exe") (Join-Path $bundleBin "rocm-codex.exe")
 Copy-RequiredFile (Join-Path $repoRoot "README.md") (Join-Path $rootDir "README.md")
 Copy-RequiredFile (Join-Path $repoRoot "LICENSE") (Join-Path $rootDir "LICENSE")
 Copy-RequiredFile (Join-Path $repoRoot "install.ps1") (Join-Path $rootDir "install.ps1")

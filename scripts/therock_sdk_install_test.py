@@ -267,7 +267,7 @@ def verify_manifest(
     manifest: dict[str, Any],
     expected_pip_cache_dir: Path,
 ) -> tuple[Path, Path, Path, Path]:
-    if manifest.get("format") != "wheel"":
+    if manifest.get("format") != "wheel":
         fail(f"expected pip runtime manifest, got: {manifest.get('format')}")
     python = Path(str(manifest.get("python_executable") or ""))
     if not python.is_file():
