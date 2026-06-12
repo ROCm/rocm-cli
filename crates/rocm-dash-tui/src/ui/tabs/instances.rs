@@ -791,6 +791,8 @@ mod tests {
             replay: None,
             last_body_area: None,
             last_tab_bar_area: None,
+            jobs: rocm_dash_core::state::State::default(),
+            services: None,
         }
     }
 

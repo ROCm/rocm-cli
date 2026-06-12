@@ -315,6 +315,11 @@ pub struct AppState {
     pub last_body_area: Option<ratatui::layout::Rect>,
     /// Same for the tab bar, used for click-to-switch-tab.
     pub last_tab_bar_area: Option<ratatui::layout::Rect>,
+    /// Background-job model for operational screens (Phase 3 Wave 1). The
+    /// job-bridge runtime streams `StateEvent`s into this from the event loop.
+    pub jobs: rocm_dash_core::state::State,
+    /// Services manager overlay (Phase 3 Wave 1). `None` = closed.
+    pub services: Option<crate::ui::services_manager::ServicesManagerState>,
 }
 
 impl AppState {
@@ -355,6 +360,8 @@ impl AppState {
             replay: None,
             last_body_area: None,
             last_tab_bar_area: None,
+            jobs: rocm_dash_core::state::State::default(),
+            services: None,
         }
     }
 
@@ -716,6 +723,9 @@ pub async fn run(args: ResolvedArgs) -> color_eyre::Result<()> {
 
 async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+    // Job-bridge channel (Phase 3 Wave 1): the async runtime streams
+    // `StateEvent`s (JobLine/JobDone/JobErr) for operational screens here.
+    let (job_tx, mut job_rx) = mpsc::unbounded_channel::<rocm_dash_core::state::StateEvent>();
     // Retain a sender for chat replies BEFORE `tx` is moved into the client /
     // replay task below — the spawned agent task feeds replies back through the
     // same `rx.recv()` arm the daemon events already use (no new plumbing).
@@ -821,8 +831,26 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                     None => break,
                 }
             }
+            // Job-bridge events feed the operational-screen job model (Wave 1).
+            maybe_job = job_rx.recv() => {
+                if let Some(ev) = maybe_job {
+                    let fx = state.jobs.apply(ev);
+                    crate::jobs::run_effects(fx, &job_tx);
+                }
+            }
             maybe_ev = events.next() => {
                 match maybe_ev {
+                    // The services-manager overlay, when open, owns all keys
+                    // (and may spawn lifecycle jobs through the job-bridge).
+                    Some(Ok(CtEvent::Key(k))) if state.services.is_some() => {
+                        let fx = crate::ui::services_manager::on_key(
+                            &mut state.services,
+                            &mut state.jobs,
+                            &state.instances,
+                            k,
+                        );
+                        crate::jobs::run_effects(fx, &job_tx);
+                    }
                     Some(Ok(CtEvent::Key(k))) => {
                         let chat_ctx = ChatKeyCtx {
                             focused: state.chat_focused,
@@ -1013,6 +1041,9 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
             };
         }
         KeyAction::CloseModal => state.modal = Modal::None,
+        KeyAction::OpenServices => {
+            state.services = Some(crate::ui::services_manager::ServicesManagerState::default());
+        }
         KeyAction::OpenThemePicker => state.open_theme_picker(),
         KeyAction::ApplyThemePick => state.apply_theme_pick(),
         KeyAction::ScrollModal(d) => {
@@ -1149,6 +1180,8 @@ pub enum KeyAction {
     ChatDetectDismiss,
     /// Chat: scroll the transcript by N lines (positive = down).
     ChatScroll(i16),
+    /// Open the services-manager overlay (Phase 3 Wave 1).
+    OpenServices,
 }
 
 fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) -> KeyAction {
@@ -1289,6 +1322,8 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         KeyCode::Char('k') | KeyCode::Up => KeyAction::Move(-1),
         KeyCode::Char('g') | KeyCode::Home => KeyAction::SelectFirst,
         KeyCode::Char('G') | KeyCode::End => KeyAction::SelectLast,
+        // Services manager: open from the Instances tab (where servers live).
+        KeyCode::Char('s') if current == ActiveTab::Instances => KeyAction::OpenServices,
         KeyCode::Enter => KeyAction::OpenDetail,
         _ => KeyAction::Nothing,
     }
