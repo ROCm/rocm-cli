@@ -9,6 +9,7 @@ pub mod instance_list;
 pub mod job_console;
 pub mod modal;
 pub mod monitor;
+pub mod services_manager;
 pub mod sparkline;
 pub mod tabs;
 pub mod theme;
@@ -66,6 +67,19 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
             &state.theme_name,
             &theme,
         ),
+    }
+
+    // Operational overlay (Phase 3 Wave 1): the services manager sits above the
+    // tab body + modals when open.
+    if let Some(sm) = &state.services {
+        services_manager::draw_services_manager(
+            f,
+            outer[2],
+            sm,
+            &state.instances,
+            &state.jobs,
+            &theme,
+        );
     }
 }
 
