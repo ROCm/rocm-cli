@@ -13,7 +13,6 @@ use chrono::{DateTime, Utc};
 use rocm_dash_collectors::amd_smi::AmdSmiCollector;
 use rocm_dash_collectors::bench_tail::CsvBenchTailer;
 use rocm_dash_collectors::docker::DockerDiscovery;
-use rocm_dash_collectors::engine_registry::EngineKind;
 use rocm_dash_collectors::host::HostCollector;
 use rocm_dash_collectors::lemonade::LemonadeCollector;
 use rocm_dash_collectors::parallel::parallel_scrape;
@@ -313,31 +312,20 @@ pub async fn run_loop(
             && (tick_count == 1 || tick_count.is_multiple_of(discovery_ticks))
         {
             let records = crate::registry::load_service_records(services_dir);
-            let mut seen: HashSet<String> = HashSet::new();
-            managed_non_vllm.clear();
-            for record in &records {
-                let Some(svc) = crate::registry::discovered_from_record(record) else {
-                    continue;
-                };
-                seen.insert(svc.container_id.clone());
-                if crate::registry::engine_kind_for(record) != Some(EngineKind::Vllm) {
-                    managed_non_vllm.insert(svc.container_id.clone());
-                }
-                let inst = instance_from_discovered(&svc);
+            let disc = crate::registry::discover_managed_services(&records);
+            managed_non_vllm = disc.non_vllm;
+            for inst in disc.instances {
+                let is_new = !known_services.contains(&inst.container_id);
+                let id = inst.container_id.clone();
                 runner
                     .state
                     .apply(StateEvent::InstanceUpserted(inst.clone()));
-                if !known_services.contains(&svc.container_id) {
-                    info!(
-                        id = %svc.container_id,
-                        engine = %record.engine,
-                        port = record.port,
-                        "managed service discovered"
-                    );
+                if is_new {
+                    info!(id = %id, "managed service discovered");
                     broadcast_and_persist(&tx, persist.as_ref(), Event::InstanceDiscovered(inst));
                 }
             }
-            for gone in known_services.difference(&seen) {
+            for gone in known_services.difference(&disc.seen) {
                 info!(id = %gone, "managed service gone");
                 prev_gen_tokens.remove(gone);
                 runner
@@ -351,7 +339,7 @@ pub async fn run_loop(
                     },
                 );
             }
-            known_services = seen;
+            known_services = disc.seen;
         }
 
         // Per-instance vLLM metric scrape, parallel, on its own cadence. The
@@ -561,7 +549,7 @@ pub async fn run_loop(
 
 /// Build an `Instance` from a `DiscoveredService` with no live KV/req sample yet.
 /// vLLM Prometheus scraping will fill these fields in a later collector.
-fn instance_from_discovered(svc: &DiscoveredService) -> Instance {
+pub(crate) fn instance_from_discovered(svc: &DiscoveredService) -> Instance {
     let mut inst = merge_instance(svc, &InstanceSample::default(), 0, 0);
     inst.status = InstanceStatus::Running;
     inst
