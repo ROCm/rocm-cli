@@ -44169,7 +44169,7 @@ Full log
                 if request_line.starts_with("GET /v1/models ") {
                     let response = serde_json::json!({ "data": [{ "id": model_id }] }).to_string();
                     let header = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
                         response.len()
                     );
                     let _ = stream.write_all(header.as_bytes());
@@ -44223,7 +44223,7 @@ Full log
                     });
                     let response_body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
                     let header = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
                         response_body.len()
                     );
                     let _ = stream.write_all(header.as_bytes());
@@ -44231,7 +44231,7 @@ Full log
                 } else {
                     let response = response.to_string();
                     let header = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
                         response.len()
                     );
                     let _ = stream.write_all(header.as_bytes());
@@ -44243,7 +44243,12 @@ Full log
     }
 
     fn poll_app_until_idle(app: &mut App) {
-        for _ in 0..500 {
+        // A chat turn issues up to two sequential HTTP requests, each with a 30s
+        // client timeout. On a CPU-saturated runner (the Windows CI box) the
+        // fake-server thread and the worker thread can be starved well past a
+        // few seconds, so the budget must exceed the worst-case request time;
+        // otherwise the job is still running when we assert and the test flakes.
+        for _ in 0..6_000 {
             app.poll_running_job();
             if app.running_job.is_none() {
                 return;
