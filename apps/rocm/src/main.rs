@@ -1,6 +1,7 @@
 mod automations;
 mod bootstrap;
 mod comfyui;
+mod dash;
 mod provider_keys;
 mod providers;
 mod therock;
@@ -248,6 +249,8 @@ enum Command {
     },
     /// Start the background helper in the foreground.
     Daemon,
+    /// Launch the unified telemetry dashboard (TUI) with an embedded daemon.
+    Dash,
     /// Remove ROCm CLI-managed files from this computer.
     Uninstall {
         /// Do not ask for interactive confirmation.
@@ -1292,6 +1295,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             print!("{}", render_daemon_text(&paths, &config));
             Ok(())
         }
+        Some(Command::Dash) => dash::run(),
         Some(Command::Uninstall {
             yes,
             dry_run,
