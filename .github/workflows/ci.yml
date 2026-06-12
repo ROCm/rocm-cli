@@ -158,7 +158,10 @@ jobs:
     name: GPU Smoke (gfx1151)
     runs-on: [self-hosted, windows-gfx1151-gpu-rocm]
     needs: [windows-build-and-test, fmt, clippy]
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    # Temporarily disabled: the gfx1151 self-hosted runner isn't picking up the job / GPU smoke isn't working yet.
+    # To re-enable, restore:
+    # if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    if: false
     timeout-minutes: 30
     defaults:
       run:
