@@ -322,6 +322,8 @@ pub struct AppState {
     pub services: Option<crate::ui::services_manager::ServicesManagerState>,
     /// Serve wizard overlay (Phase 3 Wave 1). `None` = closed.
     pub serve_wizard: Option<crate::ui::serve_wizard::ServeWizardState>,
+    /// Engine manager overlay (Phase 3 Wave 1). `None` = closed.
+    pub engine_manager: Option<crate::ui::engine_manager::EngineManagerState>,
 }
 
 impl AppState {
@@ -365,6 +367,7 @@ impl AppState {
             jobs: rocm_dash_core::state::State::default(),
             services: None,
             serve_wizard: None,
+            engine_manager: None,
         }
     }
 
@@ -864,6 +867,16 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         );
                         crate::jobs::run_effects(fx, &job_tx);
                     }
+                    // The engine-manager overlay, when open, owns all keys (and
+                    // may stream an install job through the job-bridge).
+                    Some(Ok(CtEvent::Key(k))) if state.engine_manager.is_some() => {
+                        let fx = crate::ui::engine_manager::on_key(
+                            &mut state.engine_manager,
+                            &mut state.jobs,
+                            k,
+                        );
+                        crate::jobs::run_effects(fx, &job_tx);
+                    }
                     Some(Ok(CtEvent::Key(k))) => {
                         let chat_ctx = ChatKeyCtx {
                             focused: state.chat_focused,
@@ -1060,6 +1073,9 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
         KeyAction::OpenServeWizard => {
             state.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState::default());
         }
+        KeyAction::OpenEngineManager => {
+            state.engine_manager = Some(crate::ui::engine_manager::EngineManagerState::default());
+        }
         KeyAction::OpenThemePicker => state.open_theme_picker(),
         KeyAction::ApplyThemePick => state.apply_theme_pick(),
         KeyAction::ScrollModal(d) => {
@@ -1200,6 +1216,8 @@ pub enum KeyAction {
     OpenServices,
     /// Open the serve-wizard overlay (Phase 3 Wave 1).
     OpenServeWizard,
+    /// Open the engine-manager overlay (Phase 3 Wave 1).
+    OpenEngineManager,
 }
 
 fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) -> KeyAction {
@@ -1345,6 +1363,10 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         // Serve wizard: launch a model from the Overview or Instances tab.
         KeyCode::Char('w') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
             KeyAction::OpenServeWizard
+        }
+        // Engine manager: use/install/reinstall serving engines.
+        KeyCode::Char('e') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
+            KeyAction::OpenEngineManager
         }
         KeyCode::Enter => KeyAction::OpenDetail,
         _ => KeyAction::Nothing,

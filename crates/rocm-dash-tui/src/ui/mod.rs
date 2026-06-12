@@ -1,6 +1,7 @@
 pub mod approval;
 pub mod bench;
 pub mod core_bars;
+pub mod engine_manager;
 pub mod exec;
 pub mod folder_browser;
 pub mod format;
@@ -84,6 +85,8 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         );
     } else if let Some(w) = &state.serve_wizard {
         serve_wizard::draw_serve_wizard(f, outer[2], w, &state.jobs, &theme);
+    } else if let Some(em) = &state.engine_manager {
+        engine_manager::draw_engine_manager(f, outer[2], em, &state.jobs, &theme);
     }
 }
 
@@ -189,6 +192,8 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     if matches!(state.active_tab, ActiveTab::Overview | ActiveTab::Instances) {
         spans.push(chip("w"));
         spans.push(Span::raw(" serve  "));
+        spans.push(chip("e"));
+        spans.push(Span::raw(" engines  "));
     }
     if state.active_tab == ActiveTab::Instances {
         spans.push(chip("s"));
