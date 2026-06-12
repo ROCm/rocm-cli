@@ -307,6 +307,8 @@ set +e
 (
   sleep 1
   printf 'q'
+  sleep 1
+  printf 'y'
 ) | timeout 20s script -q -e -f -c "${tui_command}" "${TUI_LOG}"
 tui_status=$?
 set -e
