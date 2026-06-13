@@ -28,7 +28,7 @@ use crate::ui::approval::{
 };
 use crate::ui::exec::{exe_label, resolve_exe};
 use crate::ui::format;
-use crate::ui::job_console::draw_job_console;
+use crate::ui::job_console::{ConsoleOutcome, draw_job_console, on_console_key};
 use crate::ui::modal::{centered_rect, draw_popup_frame};
 use crate::ui::theme::Theme;
 
@@ -133,24 +133,11 @@ pub fn on_key(
 
     // 2) A lifecycle job is showing in the console.
     if let Some(job_id) = sm.active_job.clone() {
-        match key.code {
-            KeyCode::Char('c')
-                if key
-                    .modifiers
-                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
-            {
-                return jobs.apply(StateEvent::CancelJob(job_id));
-            }
-            // `q` always closes the whole overlay so the user is never trapped
-            // while a job runs (it keeps running in the background).
-            KeyCode::Char('q') => *services = None,
-            // Dismiss the console once the job is terminal; otherwise ignore.
-            KeyCode::Esc | KeyCode::Enter
-                if jobs.job(&job_id).map(|j| j.is_terminal()).unwrap_or(true) =>
-            {
-                sm.active_job = None;
-            }
-            _ => {}
+        match on_console_key(&job_id, jobs, key) {
+            ConsoleOutcome::Cancelled(fx) => return fx,
+            ConsoleOutcome::Closed => *services = None,
+            ConsoleOutcome::Dismissed => sm.active_job = None,
+            ConsoleOutcome::Unhandled => {}
         }
         return Vec::new();
     }

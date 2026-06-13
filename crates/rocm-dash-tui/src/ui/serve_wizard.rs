@@ -13,7 +13,7 @@
 //! by the render+event seam; the CLI owns the actual launch — the read-only
 //! chat invariant is untouched.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -27,7 +27,7 @@ use crate::ui::approval::{
 };
 use crate::ui::exec::{exe_label, resolve_exe};
 use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browser};
-use crate::ui::job_console::draw_job_console;
+use crate::ui::job_console::{ConsoleOutcome, draw_job_console, on_console_key};
 use crate::ui::modal::{centered_rect, draw_popup_frame};
 use crate::ui::model_picker::{ModelPicker, ModelRecipeSummary, PickerOutcome, draw_model_picker};
 use crate::ui::theme::Theme;
@@ -284,19 +284,11 @@ pub fn on_key(
 
     // 3) A launch job is showing in the console.
     if let Some(job_id) = w.active_job.clone() {
-        match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return jobs.apply(StateEvent::CancelJob(job_id));
-            }
-            // `q` always closes the whole overlay so the user is never trapped
-            // while a job runs (it keeps running in the background).
-            KeyCode::Char('q') => *wizard = None,
-            KeyCode::Esc | KeyCode::Enter
-                if jobs.job(&job_id).map(|j| j.is_terminal()).unwrap_or(true) =>
-            {
-                w.active_job = None;
-            }
-            _ => {}
+        match on_console_key(&job_id, jobs, key) {
+            ConsoleOutcome::Cancelled(fx) => return fx,
+            ConsoleOutcome::Closed => *wizard = None,
+            ConsoleOutcome::Dismissed => w.active_job = None,
+            ConsoleOutcome::Unhandled => {}
         }
         return Vec::new();
     }

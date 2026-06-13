@@ -5,7 +5,7 @@
 //! `--apply --activate` actions that route through the approval gate first.
 //! This is the report-with-gated-apply archetype.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -18,7 +18,7 @@ use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
 };
 use crate::ui::exec::{exe_label, resolve_exe};
-use crate::ui::job_console::draw_job_console;
+use crate::ui::job_console::{ConsoleOutcome, draw_job_console, on_console_key};
 use crate::ui::modal::{centered_rect, draw_popup_frame};
 use crate::ui::theme::Theme;
 
@@ -128,18 +128,14 @@ pub fn on_key(
 
     // 2) A job is showing in the console.
     if let Some(job_id) = u.active_job.clone() {
-        match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return jobs.apply(StateEvent::CancelJob(job_id));
-            }
-            KeyCode::Char('q') => *update = None,
-            KeyCode::Esc | KeyCode::Enter
-                if jobs.job(&job_id).map(|j| j.is_terminal()).unwrap_or(true) =>
-            {
+        match on_console_key(&job_id, jobs, key) {
+            ConsoleOutcome::Cancelled(fx) => return fx,
+            ConsoleOutcome::Closed => *update = None,
+            ConsoleOutcome::Dismissed => {
                 u.active_job = None;
                 u.message = None;
             }
-            _ => {}
+            ConsoleOutcome::Unhandled => {}
         }
         return Vec::new();
     }
@@ -238,7 +234,11 @@ pub fn draw_update_manager(
     let items: Vec<ListItem> = ACTIONS
         .iter()
         .map(|a| {
-            let tag = if a.is_mutating() { " (gated)" } else { "" };
+            let tag = if a.is_mutating() {
+                " (needs approval)"
+            } else {
+                ""
+            };
             ListItem::new(Line::from(vec![
                 Span::styled(a.label().to_string(), Style::default().fg(theme.fg)),
                 Span::styled(tag, Style::default().fg(theme.warn)),
@@ -412,6 +412,32 @@ mod tests {
             .collect();
         assert!(out.contains("Update"));
         assert!(out.contains("Check for updates"));
-        assert!(out.contains("gated"));
+        assert!(out.contains("needs approval"));
+    }
+
+    #[test]
+    fn relaunch_while_job_running_surfaces_message_not_stale_console() {
+        // Mirrors engine_manager: a StartJob for a still-running id no-ops, so
+        // spawn_update must surface a message and NOT point active_job at it.
+        let mut jobs = State::default();
+        let mut u1 = Some(UpdateManagerState::default()); // Check
+        on_key(&mut u1, &mut jobs, key(KeyCode::Enter));
+        assert_eq!(
+            u1.as_ref().unwrap().active_job.as_deref(),
+            Some("update-check")
+        );
+        // Fresh overlay, same read-only Check while the prior one still runs.
+        let mut u2 = Some(UpdateManagerState::default());
+        let fx = on_key(&mut u2, &mut jobs, key(KeyCode::Enter));
+        assert!(fx.is_empty(), "no double-spawn for a running id");
+        let s = u2.as_ref().unwrap();
+        assert!(s.active_job.is_none(), "must not point at the stale job");
+        assert!(
+            s.message
+                .as_deref()
+                .unwrap_or("")
+                .contains("already running")
+        );
+        assert_eq!(jobs.jobs.len(), 1);
     }
 }
