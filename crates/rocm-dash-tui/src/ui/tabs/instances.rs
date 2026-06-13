@@ -800,6 +800,7 @@ mod tests {
             install_manager: None,
             logs_view: None,
             runtime_manager: None,
+            onboarding: None,
             model_recipes: Vec::new(),
             runtimes: Vec::new(),
         }
