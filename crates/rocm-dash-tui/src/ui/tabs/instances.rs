@@ -795,6 +795,8 @@ mod tests {
             services: None,
             serve_wizard: None,
             engine_manager: None,
+            doctor_manager: None,
+            update_manager: None,
             model_recipes: Vec::new(),
         }
     }
