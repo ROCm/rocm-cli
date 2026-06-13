@@ -52,6 +52,18 @@ fn parse_args(input: &str) -> Vec<String> {
     input.split_whitespace().map(str::to_string).collect()
 }
 
+/// Whether the argv looks like it carries (or sets) a secret — so the approval
+/// modal can warn that a key passed as an argument would be exposed in the
+/// process argv and the job log. Defends the env-only key invariant at the one
+/// place the TUI accepts freeform text: the escape hatch never *stores* a key,
+/// but it should not let one slip through unflagged.
+fn looks_secret_bearing(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        let a = a.to_ascii_lowercase();
+        a.contains("key") || a.contains("token") || a.contains("secret") || a.contains("password")
+    })
+}
+
 /// Handle a key while the overlay is open.
 pub fn on_key(
     cs: &mut Option<CommandScreenState>,
@@ -114,14 +126,21 @@ fn request_run(c: &mut CommandScreenState) -> Vec<SideEffect> {
         return Vec::new();
     }
     let cmd = resolve_exe();
-    let request = ApprovalRequest::new(
-        "run command".to_string(),
-        vec![
-            format!("{} {}", exe_label(&cmd), args.join(" ")),
-            String::new(),
-            "This runs the command above through ROCm CLI.".to_string(),
-        ],
-    );
+    let mut body = vec![
+        format!("{} {}", exe_label(&cmd), args.join(" ")),
+        String::new(),
+        "This runs the command above through ROCm CLI.".to_string(),
+    ];
+    if looks_secret_bearing(&args) {
+        body.push(String::new());
+        body.push(
+            "Warning: this looks like it carries a secret. Anything passed as an \
+             argument is visible in the process list and the job log — prefer the \
+             environment for API keys."
+                .to_string(),
+        );
+    }
+    let request = ApprovalRequest::new("run command".to_string(), body);
     c.message = None;
     c.approval = Some(PendingCommand {
         cmd,
@@ -312,6 +331,45 @@ mod tests {
         assert!(fx.is_empty());
         assert!(cs.as_ref().unwrap().approval.is_none());
         assert!(jobs.jobs.is_empty());
+    }
+
+    #[test]
+    fn q_escapes_overlay_while_job_runs() {
+        let mut cs = Some(CommandScreenState::default());
+        let mut jobs = State::default();
+        type_str(&mut cs, &mut jobs, "doctor");
+        on_key(&mut cs, &mut jobs, key(KeyCode::Enter)); // stage
+        on_key(&mut cs, &mut jobs, key(KeyCode::Char('y'))); // spawn
+        on_key(&mut cs, &mut jobs, key(KeyCode::Char('q')));
+        assert!(cs.is_none(), "q closes the overlay while a job runs");
+    }
+
+    #[test]
+    fn secret_bearing_command_gets_a_warning_in_the_approval() {
+        let mut cs = Some(CommandScreenState::default());
+        let mut jobs = State::default();
+        type_str(&mut cs, &mut jobs, "config set-provider-key anthropic");
+        on_key(&mut cs, &mut jobs, key(KeyCode::Enter));
+        let pending = cs.as_ref().unwrap().approval.as_ref().unwrap();
+        assert!(
+            pending
+                .request
+                .body
+                .iter()
+                .any(|l| l.contains("carries a secret")),
+            "secret-shaped argv must surface a warning"
+        );
+        // A plain command does NOT get the warning.
+        let mut cs2 = Some(CommandScreenState::default());
+        type_str(&mut cs2, &mut jobs, "doctor");
+        on_key(&mut cs2, &mut jobs, key(KeyCode::Enter));
+        let p2 = cs2.as_ref().unwrap().approval.as_ref().unwrap();
+        assert!(
+            !p2.request
+                .body
+                .iter()
+                .any(|l| l.contains("carries a secret"))
+        );
     }
 
     #[test]

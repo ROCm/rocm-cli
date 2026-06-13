@@ -476,6 +476,34 @@ mod tests {
     }
 
     #[test]
+    fn relaunch_toggle_while_running_surfaces_message_not_stale_console() {
+        // The mutating enable/disable job has the same no-op guard as refresh.
+        let mut jobs = State::default();
+        let ws = automations();
+        let mut a1 = Some(AutomationsManagerState::default()); // row 0 disabled → enable
+        on_key(&mut a1, &ws, &mut jobs, key(KeyCode::Enter)); // stage
+        on_key(&mut a1, &ws, &mut jobs, key(KeyCode::Char('y'))); // spawn enable
+        assert_eq!(
+            a1.as_ref().unwrap().active_job.as_deref(),
+            Some("automations-enable")
+        );
+        // Fresh overlay, same enable while the prior job still runs.
+        let mut a2 = Some(AutomationsManagerState::default());
+        on_key(&mut a2, &ws, &mut jobs, key(KeyCode::Enter));
+        let fx = on_key(&mut a2, &ws, &mut jobs, key(KeyCode::Char('y')));
+        assert!(fx.is_empty(), "no double-spawn for a running toggle id");
+        let s = a2.as_ref().unwrap();
+        assert!(s.active_job.is_none(), "must not point at the stale job");
+        assert!(
+            s.message
+                .as_deref()
+                .unwrap_or("")
+                .contains("already running")
+        );
+        assert_eq!(jobs.jobs.len(), 1);
+    }
+
+    #[test]
     fn snapshot_lists_watchers_with_badges() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -497,5 +525,8 @@ mod tests {
         assert!(out.contains("Automations"));
         assert!(out.contains("therock-update"));
         assert!(out.contains("server-recover"));
+        // The enabled/disabled badges actually render (per the function name).
+        assert!(out.contains("on"), "enabled watcher shows an on badge");
+        assert!(out.contains("off"), "disabled watcher shows an off badge");
     }
 }
