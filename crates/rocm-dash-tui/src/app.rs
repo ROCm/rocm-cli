@@ -61,6 +61,10 @@ pub struct ResolvedArgs {
     /// Adapted by the bin (`apps/rocm`, which has `rocm-core`) so this crate
     /// needs no `rocm-core` dep. Empty when none are available.
     pub model_recipes: Vec<crate::ui::model_picker::ModelRecipeSummary>,
+    /// Registered ROCm runtimes for the runtime manager (Phase 3 Wave 2).
+    /// Adapted by the bin (`apps/rocm`, which has `rocm-core`) so this crate
+    /// needs no `rocm-core` dep. Empty when none are available.
+    pub runtimes: Vec<crate::ui::runtime_manager::RuntimeSummary>,
 }
 
 type Tui = Terminal<CrosstermBackend<io::Stdout>>;
@@ -336,9 +340,14 @@ pub struct AppState {
     pub install_manager: Option<crate::ui::install_manager::InstallManagerState>,
     /// Logs overlay (Phase 3 Wave 3). `None` = closed.
     pub logs_view: Option<crate::ui::logs_view::LogsViewState>,
+    /// Runtime manager overlay (Phase 3 Wave 2). `None` = closed.
+    pub runtime_manager: Option<crate::ui::runtime_manager::RuntimeManagerState>,
     /// Built-in model recipes for the serve wizard's picker. Set from
     /// `ResolvedArgs` in the event loop; empty by default.
     pub model_recipes: Vec<crate::ui::model_picker::ModelRecipeSummary>,
+    /// Registered ROCm runtimes for the runtime manager. Set from
+    /// `ResolvedArgs` in the event loop; empty by default.
+    pub runtimes: Vec<crate::ui::runtime_manager::RuntimeSummary>,
 }
 
 impl AppState {
@@ -387,7 +396,9 @@ impl AppState {
             update_manager: None,
             install_manager: None,
             logs_view: None,
+            runtime_manager: None,
             model_recipes: Vec::new(),
+            runtimes: Vec::new(),
         }
     }
 
@@ -402,6 +413,7 @@ impl AppState {
         self.update_manager = None;
         self.install_manager = None;
         self.logs_view = None;
+        self.runtime_manager = None;
     }
 
     /// Open the theme picker modal, positioning the cursor on the active theme.
@@ -791,6 +803,8 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     state.active_tab = args.initial_tab;
     // Serve-wizard recipe picker source (Phase 3 Wave 1), adapted by the bin.
     state.model_recipes = args.model_recipes.clone();
+    // Runtime manager source (Phase 3 Wave 2), adapted by the bin.
+    state.runtimes = args.runtimes.clone();
     state.replay = replay_controller.map(ReplayState::new);
 
     // Resolve the chat backend. `--chat-mock` short-circuits detection with a
@@ -948,6 +962,17 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                     Some(Ok(CtEvent::Key(k))) if state.logs_view.is_some() => {
                         let fx = crate::ui::logs_view::on_key(
                             &mut state.logs_view,
+                            &mut state.jobs,
+                            k,
+                        );
+                        crate::jobs::run_effects(fx, &job_tx);
+                    }
+                    // The runtime manager, when open, owns all keys (refresh
+                    // read-only; activate/rollback/uninstall/adopt/import gated).
+                    Some(Ok(CtEvent::Key(k))) if state.runtime_manager.is_some() => {
+                        let fx = crate::ui::runtime_manager::on_key(
+                            &mut state.runtime_manager,
+                            &state.runtimes,
                             &mut state.jobs,
                             k,
                         );
@@ -1175,6 +1200,11 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
             state.close_overlays();
             state.logs_view = Some(crate::ui::logs_view::LogsViewState::default());
         }
+        KeyAction::OpenRuntimes => {
+            state.close_overlays();
+            state.runtime_manager =
+                Some(crate::ui::runtime_manager::RuntimeManagerState::default());
+        }
         KeyAction::OpenThemePicker => state.open_theme_picker(),
         KeyAction::ApplyThemePick => state.apply_theme_pick(),
         KeyAction::ScrollModal(d) => {
@@ -1323,6 +1353,8 @@ pub enum KeyAction {
     OpenUpdate,
     /// Open the install overlay (Phase 3 Wave 2).
     OpenInstall,
+    /// Open the runtime manager overlay.
+    OpenRuntimes,
     /// Open the logs overlay (Phase 3 Wave 3).
     OpenLogs,
 }
@@ -1490,6 +1522,10 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         // Logs: browse recent ROCm CLI logs.
         KeyCode::Char('l') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
             KeyAction::OpenLogs
+        }
+        // Runtimes: list/activate/adopt/import ROCm runtimes.
+        KeyCode::Char('r') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
+            KeyAction::OpenRuntimes
         }
         KeyCode::Enter => KeyAction::OpenDetail,
         _ => KeyAction::Nothing,
