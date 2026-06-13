@@ -65,6 +65,9 @@ pub struct ResolvedArgs {
     /// Adapted by the bin (`apps/rocm`, which has `rocm-core`) so this crate
     /// needs no `rocm-core` dep. Empty when none are available.
     pub runtimes: Vec<crate::ui::runtime_manager::RuntimeSummary>,
+    /// Background checks for the automations manager (Phase 3 Wave 3). Adapted
+    /// by the bin. Empty when none are available.
+    pub automations: Vec<crate::ui::automations_manager::AutomationSummary>,
 }
 
 type Tui = Terminal<CrosstermBackend<io::Stdout>>;
@@ -344,12 +347,21 @@ pub struct AppState {
     pub runtime_manager: Option<crate::ui::runtime_manager::RuntimeManagerState>,
     /// Onboarding wizard overlay (Phase 3 Wave 2). `None` = closed.
     pub onboarding: Option<crate::ui::onboarding::OnboardingState>,
+    /// Automations manager overlay (Phase 3 Wave 3). `None` = closed.
+    pub automations_manager: Option<crate::ui::automations_manager::AutomationsManagerState>,
+    /// Command runner overlay (Phase 3 Wave 3). `None` = closed.
+    pub command_screen: Option<crate::ui::command_screen::CommandScreenState>,
+    /// Config & provider manager overlay (Phase 3 Wave 3). `None` = closed.
+    pub config_manager: Option<crate::ui::config_manager::ConfigManagerState>,
     /// Built-in model recipes for the serve wizard's picker. Set from
     /// `ResolvedArgs` in the event loop; empty by default.
     pub model_recipes: Vec<crate::ui::model_picker::ModelRecipeSummary>,
     /// Registered ROCm runtimes for the runtime manager. Set from
     /// `ResolvedArgs` in the event loop; empty by default.
     pub runtimes: Vec<crate::ui::runtime_manager::RuntimeSummary>,
+    /// Background checks for the automations manager. Set from `ResolvedArgs`
+    /// in the event loop; empty by default.
+    pub automations: Vec<crate::ui::automations_manager::AutomationSummary>,
 }
 
 impl AppState {
@@ -400,8 +412,12 @@ impl AppState {
             logs_view: None,
             runtime_manager: None,
             onboarding: None,
+            automations_manager: None,
+            command_screen: None,
+            config_manager: None,
             model_recipes: Vec::new(),
             runtimes: Vec::new(),
+            automations: Vec::new(),
         }
     }
 
@@ -418,6 +434,9 @@ impl AppState {
         self.logs_view = None;
         self.runtime_manager = None;
         self.onboarding = None;
+        self.automations_manager = None;
+        self.command_screen = None;
+        self.config_manager = None;
     }
 
     /// Open the theme picker modal, positioning the cursor on the active theme.
@@ -809,6 +828,8 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     state.model_recipes = args.model_recipes.clone();
     // Runtime manager source (Phase 3 Wave 2), adapted by the bin.
     state.runtimes = args.runtimes.clone();
+    // Automations manager source (Phase 3 Wave 3), adapted by the bin.
+    state.automations = args.automations.clone();
     state.replay = replay_controller.map(ReplayState::new);
 
     // Resolve the chat backend. `--chat-mock` short-circuits detection with a
@@ -987,6 +1008,37 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                     Some(Ok(CtEvent::Key(k))) if state.onboarding.is_some() => {
                         let fx = crate::ui::onboarding::on_key(
                             &mut state.onboarding,
+                            &mut state.jobs,
+                            k,
+                        );
+                        crate::jobs::run_effects(fx, &job_tx);
+                    }
+                    // The automations manager, when open, owns all keys (refresh
+                    // read-only; enable/disable gated → job-bridge).
+                    Some(Ok(CtEvent::Key(k))) if state.automations_manager.is_some() => {
+                        let fx = crate::ui::automations_manager::on_key(
+                            &mut state.automations_manager,
+                            &state.automations,
+                            &mut state.jobs,
+                            k,
+                        );
+                        crate::jobs::run_effects(fx, &job_tx);
+                    }
+                    // The command runner, when open, owns all keys (every
+                    // command gated → job-bridge).
+                    Some(Ok(CtEvent::Key(k))) if state.command_screen.is_some() => {
+                        let fx = crate::ui::command_screen::on_key(
+                            &mut state.command_screen,
+                            &mut state.jobs,
+                            k,
+                        );
+                        crate::jobs::run_effects(fx, &job_tx);
+                    }
+                    // The config & provider manager, when open, owns all keys
+                    // (show read-only; provider toggles gated → job-bridge).
+                    Some(Ok(CtEvent::Key(k))) if state.config_manager.is_some() => {
+                        let fx = crate::ui::config_manager::on_key(
+                            &mut state.config_manager,
                             &mut state.jobs,
                             k,
                         );
@@ -1223,6 +1275,19 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
             state.close_overlays();
             state.onboarding = Some(crate::ui::onboarding::OnboardingState::default());
         }
+        KeyAction::OpenAutomations => {
+            state.close_overlays();
+            state.automations_manager =
+                Some(crate::ui::automations_manager::AutomationsManagerState::default());
+        }
+        KeyAction::OpenCommand => {
+            state.close_overlays();
+            state.command_screen = Some(crate::ui::command_screen::CommandScreenState::default());
+        }
+        KeyAction::OpenConfig => {
+            state.close_overlays();
+            state.config_manager = Some(crate::ui::config_manager::ConfigManagerState::default());
+        }
         KeyAction::OpenThemePicker => state.open_theme_picker(),
         KeyAction::ApplyThemePick => state.apply_theme_pick(),
         KeyAction::ScrollModal(d) => {
@@ -1375,6 +1440,12 @@ pub enum KeyAction {
     OpenRuntimes,
     /// Open the onboarding wizard overlay.
     OpenOnboarding,
+    /// Open the automations manager overlay.
+    OpenAutomations,
+    /// Open the command runner overlay.
+    OpenCommand,
+    /// Open the config & provider manager overlay.
+    OpenConfig,
     /// Open the logs overlay (Phase 3 Wave 3).
     OpenLogs,
 }
@@ -1550,6 +1621,18 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         // Onboarding: first-run setup wizard (install / adopt).
         KeyCode::Char('n') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
             KeyAction::OpenOnboarding
+        }
+        // Automations: list/enable/disable background checks.
+        KeyCode::Char('a') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
+            KeyAction::OpenAutomations
+        }
+        // Command runner: run any ROCm CLI subcommand (gated).
+        KeyCode::Char('c') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
+            KeyAction::OpenCommand
+        }
+        // Config & providers.
+        KeyCode::Char('p') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
+            KeyAction::OpenConfig
         }
         KeyCode::Enter => KeyAction::OpenDetail,
         _ => KeyAction::Nothing,
@@ -1811,6 +1894,12 @@ mod tests {
         assert!(s.runtime_manager.is_some() && s.logs_view.is_none());
         apply_action(&mut s, KeyAction::OpenOnboarding);
         assert!(s.onboarding.is_some() && s.runtime_manager.is_none());
+        apply_action(&mut s, KeyAction::OpenAutomations);
+        assert!(s.automations_manager.is_some() && s.onboarding.is_none());
+        apply_action(&mut s, KeyAction::OpenCommand);
+        assert!(s.command_screen.is_some() && s.automations_manager.is_none());
+        apply_action(&mut s, KeyAction::OpenConfig);
+        assert!(s.config_manager.is_some() && s.command_screen.is_none());
     }
 
     #[test]

@@ -1,5 +1,8 @@
 pub mod approval;
+pub mod automations_manager;
 pub mod bench;
+pub mod command_screen;
+pub mod config_manager;
 pub mod core_bars;
 pub mod doctor_manager;
 pub mod engine_manager;
@@ -113,6 +116,19 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         );
     } else if let Some(o) = &state.onboarding {
         onboarding::draw_onboarding(f, outer[2], o, &state.jobs, &theme);
+    } else if let Some(am) = &state.automations_manager {
+        automations_manager::draw_automations_manager(
+            f,
+            outer[2],
+            am,
+            &state.automations,
+            &state.jobs,
+            &theme,
+        );
+    } else if let Some(c) = &state.command_screen {
+        command_screen::draw_command_screen(f, outer[2], c, &state.jobs, &theme);
+    } else if let Some(cm) = &state.config_manager {
+        config_manager::draw_config_manager(f, outer[2], cm, &state.jobs, &theme);
     }
 }
 
