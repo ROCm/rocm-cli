@@ -197,9 +197,26 @@ mod tests {
 
     #[test]
     fn model_recipe_summaries_carry_id_and_engine() {
+        let records = builtin_model_recipes();
         let summaries = model_recipe_summaries();
         assert!(!summaries.is_empty());
+        assert_eq!(summaries.len(), records.len(), "no recipes dropped");
         // Every summary has a non-empty canonical id (the serve argv target).
         assert!(summaries.iter().all(|s| !s.id.is_empty()));
+        // The preferred engine is actually plumbed (not zeroed) — at least one
+        // recipe declares one, and the first summary mirrors its record.
+        assert!(
+            summaries.iter().any(|s| s.preferred_engine.is_some()),
+            "preferred_engine forwarded"
+        );
+        let first = &records[0];
+        let first_summary = &summaries[0];
+        assert_eq!(first_summary.id, first.canonical_model_id);
+        assert_eq!(first_summary.aliases, first.aliases);
+        assert_eq!(first_summary.task, first.task);
+        assert_eq!(
+            first_summary.preferred_engine.as_ref(),
+            first.preferred_engines.first()
+        );
     }
 }
