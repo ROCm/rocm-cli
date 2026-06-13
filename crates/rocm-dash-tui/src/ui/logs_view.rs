@@ -47,6 +47,10 @@ pub fn on_key(
         return Vec::new();
     }
 
+    // Search box (read-only-with-input archetype): Esc closes; printable chars
+    // — including `q` — are captured as search text, not treated as a close key
+    // (the same form-field tradeoff as serve_wizard's Model field). From the
+    // running console, `q` closes via on_console_key above.
     match key.code {
         KeyCode::Esc => *logs = None,
         KeyCode::Enter => return run_logs(l, jobs),
@@ -184,6 +188,27 @@ mod tests {
         on_key(&mut l, &mut jobs, key(KeyCode::Enter));
         on_key(&mut l, &mut jobs, key(KeyCode::Char('q')));
         assert!(l.is_none(), "q closes the overlay from the console view");
+    }
+
+    #[test]
+    fn second_enter_while_running_reattaches_to_console() {
+        // Single stable id: a second view while the prior job still runs re-uses
+        // the same console (read-only re-attach, like doctor) — never an error.
+        let mut l = Some(LogsViewState::default());
+        let mut jobs = State::default();
+        on_key(&mut l, &mut jobs, key(KeyCode::Enter));
+        assert_eq!(l.as_ref().unwrap().active_job.as_deref(), Some("logs"));
+        // Dismiss is unreachable while running; simulate re-entry from a fresh
+        // overlay against the same still-running job.
+        let mut l2 = Some(LogsViewState::default());
+        let fx = on_key(&mut l2, &mut jobs, key(KeyCode::Enter));
+        assert!(fx.is_empty(), "no second spawn for the running id");
+        assert_eq!(
+            l2.as_ref().unwrap().active_job.as_deref(),
+            Some("logs"),
+            "re-attaches to the live console"
+        );
+        assert_eq!(jobs.jobs.len(), 1);
     }
 
     #[test]
