@@ -207,7 +207,9 @@ pub fn on_key(
         return Vec::new();
     }
 
-    // 4) Form editing.
+    // 4) Form editing. Form archetype (like serve_wizard): Esc closes; text
+    // fields (Channel/Prefix) capture printable chars including `q` — `q` is not
+    // a close key here (Esc is). Non-text fields ignore typed chars.
     match key.code {
         KeyCode::Esc => *install = None,
         KeyCode::Up => i.move_field(-1),
@@ -340,7 +342,7 @@ pub fn draw_install_manager(
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑↓ field · ←→ change · Tab browse (prefix) · Enter next/launch · Esc close",
+            "↑↓ field · ←→ cycle (Format/Mode) · Tab browse (prefix) · Enter next/launch · Esc close",
             Style::default().fg(theme.muted),
         ))),
         rows[2],
@@ -547,6 +549,35 @@ mod tests {
         let mut jobs = State::default();
         on_key(&mut ins, &mut jobs, key(KeyCode::Esc));
         assert!(ins.is_none());
+    }
+
+    #[test]
+    fn relaunch_while_job_running_surfaces_message_not_stale_console() {
+        // Mirrors the sibling screens: a StartJob for a still-running id no-ops,
+        // so spawn_install must surface a message and NOT set active_job.
+        let mut jobs = State::default();
+        let launch = FIELDS.iter().position(|f| *f == Field::Launch).unwrap();
+        let mut i1 = Some(InstallManagerState::default()); // dry-run
+        i1.as_mut().unwrap().field = launch;
+        on_key(&mut i1, &mut jobs, key(KeyCode::Enter));
+        assert_eq!(
+            i1.as_ref().unwrap().active_job.as_deref(),
+            Some("install-sdk-dryrun")
+        );
+        // Fresh overlay, same dry-run while the prior job still runs.
+        let mut i2 = Some(InstallManagerState::default());
+        i2.as_mut().unwrap().field = launch;
+        let fx = on_key(&mut i2, &mut jobs, key(KeyCode::Enter));
+        assert!(fx.is_empty(), "no double-spawn for a running id");
+        let s = i2.as_ref().unwrap();
+        assert!(s.active_job.is_none(), "must not point at the stale job");
+        assert!(
+            s.message
+                .as_deref()
+                .unwrap_or("")
+                .contains("already running")
+        );
+        assert_eq!(jobs.jobs.len(), 1);
     }
 
     #[test]
