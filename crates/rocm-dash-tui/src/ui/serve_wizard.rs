@@ -238,7 +238,8 @@ pub fn on_key(
         match picker.on_key(key.code, recipes) {
             PickerOutcome::Chosen(summary) => {
                 w.model = summary.id;
-                // Pre-select the recipe's preferred engine when we ship it.
+                // Pre-select the recipe's preferred engine when it is one this
+                // wizard lists; otherwise leave the engine choice untouched.
                 if let Some(eng) = summary.preferred_engine
                     && let Some(idx) = ENGINES.iter().position(|e| *e == eng)
                 {
@@ -319,7 +320,12 @@ pub fn on_key(
             } else if w.current_field() == Field::Model && !recipes.is_empty() {
                 // On the Model field, Enter opens the recipe picker (the
                 // model_picker sub-step); free-text typing + Tab-browse remain.
-                w.picker = Some(ModelPicker::default());
+                // Seed the filter with anything already typed so the picker
+                // opens pre-narrowed (e.g. typed "qwen" → Qwen recipes).
+                w.picker = Some(ModelPicker {
+                    query: w.model.trim().to_string(),
+                    selected: 0,
+                });
             } else {
                 w.move_field(1);
             }
@@ -426,10 +432,11 @@ pub fn draw_serve_wizard(
         ])
         .split(inner);
 
+    let has_recipes = !recipes.is_empty();
     let lines: Vec<Line> = FIELDS
         .iter()
         .enumerate()
-        .map(|(i, field)| field_line(*field, i == w.field, w, theme))
+        .map(|(i, field)| field_line(*field, i == w.field, w, has_recipes, theme))
         .collect();
     f.render_widget(Paragraph::new(lines), rows[0]);
 
@@ -471,13 +478,16 @@ fn field_line<'a>(
     field: Field,
     selected: bool,
     w: &'a ServeWizardState,
+    has_recipes: bool,
     theme: &Theme,
 ) -> Line<'a> {
+    let model_placeholder = if has_recipes {
+        "(Enter to pick a recipe · type a name · Tab to browse)"
+    } else {
+        "(type a name / path, or Tab to browse)"
+    };
     let (label, value): (&str, String) = match field {
-        Field::Model => (
-            "Model",
-            display_value(&w.model, "(type a name / path, or Tab to browse)"),
-        ),
+        Field::Model => ("Model", display_value(&w.model, model_placeholder)),
         Field::Engine => (
             "Engine",
             ENGINES[w.engine_idx.min(ENGINES.len() - 1)].to_string(),
@@ -844,6 +854,60 @@ mod tests {
         on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Enter));
         assert!(wiz.as_ref().unwrap().picker.is_none());
         assert_eq!(wiz.as_ref().unwrap().field, 1, "Enter advances to Engine");
+    }
+
+    #[test]
+    fn recipe_with_unknown_preferred_engine_leaves_engine_idx() {
+        // Pins the silent-fallback contract: a preferred_engine the wizard does
+        // not list must NOT crash and must leave the engine choice untouched
+        // (model still filled). Guards future ENGINES vs rocm-core divergence.
+        let recipes = vec![ModelRecipeSummary {
+            id: "some-model".into(),
+            aliases: vec![],
+            task: "chat".into(),
+            preferred_engine: Some("not-in-engines-list".into()),
+        }];
+        let mut wiz = Some(ServeWizardState::default()); // engine_idx 0 = lemonade
+        let mut jobs = State::default();
+        on_key(&mut wiz, &mut jobs, &recipes, key(KeyCode::Enter)); // open picker
+        on_key(&mut wiz, &mut jobs, &recipes, key(KeyCode::Enter)); // choose first
+        let w = wiz.as_ref().unwrap();
+        assert_eq!(w.model, "some-model");
+        assert_eq!(
+            w.engine_idx, 0,
+            "unknown preferred engine leaves the choice"
+        );
+    }
+
+    #[test]
+    fn picker_opens_pre_filtered_by_typed_model_text() {
+        let recipes = vec![
+            ModelRecipeSummary {
+                id: "Qwen3-4B".into(),
+                aliases: vec!["qwen".into()],
+                task: "chat".into(),
+                preferred_engine: None,
+            },
+            ModelRecipeSummary {
+                id: "GLM-4".into(),
+                aliases: vec!["glm".into()],
+                task: "chat".into(),
+                preferred_engine: None,
+            },
+        ];
+        let mut wiz = Some(ServeWizardState::default());
+        let mut jobs = State::default();
+        // Type "qwen" on the Model field, then Enter to open the picker.
+        for k in typed("qwen") {
+            on_key(&mut wiz, &mut jobs, &recipes, k);
+        }
+        on_key(&mut wiz, &mut jobs, &recipes, key(KeyCode::Enter));
+        let picker = wiz.as_ref().unwrap().picker.as_ref().unwrap();
+        assert_eq!(picker.query, "qwen");
+        assert_eq!(picker.filtered(&recipes).len(), 1, "pre-narrowed to Qwen");
+        // Enter chooses the single match.
+        on_key(&mut wiz, &mut jobs, &recipes, key(KeyCode::Enter));
+        assert_eq!(wiz.as_ref().unwrap().model, "Qwen3-4B");
     }
 
     #[test]
