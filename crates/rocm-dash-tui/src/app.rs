@@ -874,12 +874,35 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             probe_ok,
         );
         state.set_chat_config(llm, args.chat_auto_consent);
-        // A build failure leaves `agent` None; a submit surfaces an error turn.
-        match &state.chat_llm {
-            Some(cfg) => crate::agent::RigAgentClient::new(cfg.clone())
-                .ok()
-                .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>),
-            None => None,
+        // No reachable local endpoint AND no key/url configured → the no-key
+        // ChatGPT OAuth default (device-code login surfaced in the chat tab).
+        // This restores the no-key login the vendored Codex path provided; it
+        // takes NO api_key (env-only invariant untouched — OAuth, not a key).
+        let no_key_no_endpoint = !probe_ok
+            && args.chat_api_key.is_none()
+            && args.chat_url.is_none()
+            && args.chat_env_url.is_none();
+        if no_key_no_endpoint {
+            let oauth_tx = chat_tx.clone();
+            crate::agent::ChatGptAgentClient::new(args.chat_model.clone(), move |url, code| {
+                let _ = oauth_tx.send(ClientMsg::ChatReply {
+                    text: format!(
+                        "To enable chat, sign in to ChatGPT: open {url} and enter the code {code}"
+                    ),
+                });
+            })
+            .ok()
+            .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
+        } else {
+            // A build failure leaves `agent` None; a submit surfaces an error turn.
+            match &state.chat_llm {
+                Some(cfg) => crate::agent::RigAgentClient::new(cfg.clone())
+                    .ok()
+                    .map(|c| {
+                        std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>
+                    }),
+                None => None,
+            }
         }
     };
 
