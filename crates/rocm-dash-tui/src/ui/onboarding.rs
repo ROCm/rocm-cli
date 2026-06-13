@@ -9,9 +9,12 @@
 //! - **Adopt existing folder** — pick an existing ROCm env with the Wave-0
 //!   [`FolderBrowser`], then approve `rocm runtimes adopt`.
 //!
-//! Reinstall / uninstall / show-log sub-modals (the full frozen onboarding) are
-//! documented fast-follows. Both paths run through the approval gate and the
-//! job-bridge — zero `std::thread::spawn`/`try_recv`.
+//! Reinstall / uninstall / show-log sub-modals (the full frozen onboarding),
+//! first-run auto-trigger + `onboarding_dismissed` persistence, and the frozen
+//! flow's post-install `reconcile_onboarding_engine_preference` are documented
+//! fast-follows — this overlay is additive and key-triggered (`n`), so it never
+//! touches the frozen tui.rs first-run gate. Both paths run through the approval
+//! gate and the job-bridge — zero `std::thread::spawn`/`try_recv`.
 
 use std::path::Path;
 
@@ -22,7 +25,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
-use rocm_dash_core::state::{SideEffect, State, StateEvent};
+use rocm_dash_core::state::{JobStatus, SideEffect, State, StateEvent};
 
 use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
@@ -176,10 +179,24 @@ pub fn on_key(
             ConsoleOutcome::Cancelled(fx) => return fx,
             ConsoleOutcome::Closed => *ob = None,
             ConsoleOutcome::Dismissed => {
-                // The setup job finished — advance to the closing step.
+                // Only a clean exit (code 0) advances to Done. A failed or
+                // cancelled job returns to the Choose step with an honest
+                // message so the wizard never claims success it didn't earn.
+                let ok = jobs
+                    .job(&job_id)
+                    .map(|j| matches!(j.status, JobStatus::Done { code: 0 }))
+                    .unwrap_or(false);
                 o.active_job = None;
-                o.message = None;
-                o.step = OnboardingStep::Done;
+                if ok {
+                    o.message = None;
+                    o.step = OnboardingStep::Done;
+                } else {
+                    o.message = Some(
+                        "That step didn't finish cleanly — review the output, then try again."
+                            .to_string(),
+                    );
+                    o.step = OnboardingStep::Choose;
+                }
             }
             ConsoleOutcome::Unhandled => {}
         }
@@ -366,7 +383,7 @@ pub fn draw_onboarding(
     );
 
     let hint = match o.step {
-        OnboardingStep::Welcome => "Enter continue · Esc skip",
+        OnboardingStep::Welcome => "Enter continue · Esc close",
         OnboardingStep::Choose => "↑↓ select · Enter run · Esc close",
         OnboardingStep::Done => "Enter/Esc close",
     };
@@ -496,6 +513,34 @@ mod tests {
         // Enter on Done closes the wizard.
         on_key(&mut ob, &mut jobs, key(KeyCode::Enter));
         assert!(ob.is_none());
+    }
+
+    #[test]
+    fn failed_job_returns_to_choose_with_honest_message_not_done() {
+        let mut ob = Some(OnboardingState {
+            step: OnboardingStep::Choose,
+            ..Default::default()
+        });
+        let mut jobs = State::default();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Enter)); // stage install
+        on_key(&mut ob, &mut jobs, key(KeyCode::Char('y'))); // spawn
+        let id = ob.as_ref().unwrap().active_job.clone().unwrap();
+        // The install FAILED (non-zero exit). Dismiss must NOT claim success.
+        jobs.apply(StateEvent::JobDone { id, code: 1 });
+        on_key(&mut ob, &mut jobs, key(KeyCode::Enter));
+        let s = ob.as_ref().unwrap();
+        assert!(s.active_job.is_none());
+        assert_eq!(
+            s.step,
+            OnboardingStep::Choose,
+            "failure must not reach Done"
+        );
+        assert!(
+            s.message
+                .as_deref()
+                .unwrap_or("")
+                .contains("didn't finish cleanly")
+        );
     }
 
     #[test]
