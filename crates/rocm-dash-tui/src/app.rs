@@ -1783,6 +1783,8 @@ mod tests {
         assert!(s.install_manager.is_some() && s.update_manager.is_none());
         apply_action(&mut s, KeyAction::OpenLogs);
         assert!(s.logs_view.is_some() && s.install_manager.is_none());
+        apply_action(&mut s, KeyAction::OpenRuntimes);
+        assert!(s.runtime_manager.is_some() && s.logs_view.is_none());
     }
 
     #[test]
