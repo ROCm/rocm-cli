@@ -57,6 +57,10 @@ pub struct ResolvedArgs {
     /// Use the offline `MockAgentClient` for chat (`--chat-mock`) — a
     /// deterministic, fully-offline demo with no live LLM.
     pub chat_mock: bool,
+    /// Built-in model recipes for the serve wizard's picker (Phase 3 Wave 1).
+    /// Adapted by the bin (`apps/rocm`, which has `rocm-core`) so this crate
+    /// needs no `rocm-core` dep. Empty when none are available.
+    pub model_recipes: Vec<crate::ui::model_picker::ModelRecipeSummary>,
 }
 
 type Tui = Terminal<CrosstermBackend<io::Stdout>>;
@@ -324,6 +328,9 @@ pub struct AppState {
     pub serve_wizard: Option<crate::ui::serve_wizard::ServeWizardState>,
     /// Engine manager overlay (Phase 3 Wave 1). `None` = closed.
     pub engine_manager: Option<crate::ui::engine_manager::EngineManagerState>,
+    /// Built-in model recipes for the serve wizard's picker. Set from
+    /// `ResolvedArgs` in the event loop; empty by default.
+    pub model_recipes: Vec<crate::ui::model_picker::ModelRecipeSummary>,
 }
 
 impl AppState {
@@ -368,6 +375,7 @@ impl AppState {
             services: None,
             serve_wizard: None,
             engine_manager: None,
+            model_recipes: Vec::new(),
         }
     }
 
@@ -756,6 +764,8 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     let mut state = AppState::new(connect_label, args.theme.clone());
     // Honor the chat-first vs dashboard launch choice (rocm-cli semantics).
     state.active_tab = args.initial_tab;
+    // Serve-wizard recipe picker source (Phase 3 Wave 1), adapted by the bin.
+    state.model_recipes = args.model_recipes.clone();
     state.replay = replay_controller.map(ReplayState::new);
 
     // Resolve the chat backend. `--chat-mock` short-circuits detection with a
@@ -863,6 +873,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         let fx = crate::ui::serve_wizard::on_key(
                             &mut state.serve_wizard,
                             &mut state.jobs,
+                            &state.model_recipes,
                             k,
                         );
                         crate::jobs::run_effects(fx, &job_tx);

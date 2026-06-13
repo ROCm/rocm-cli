@@ -795,6 +795,7 @@ mod tests {
             services: None,
             serve_wizard: None,
             engine_manager: None,
+            model_recipes: Vec::new(),
         }
     }
 

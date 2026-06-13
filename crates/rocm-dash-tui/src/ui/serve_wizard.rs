@@ -29,6 +29,7 @@ use crate::ui::exec::{exe_label, resolve_exe};
 use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browser};
 use crate::ui::job_console::draw_job_console;
 use crate::ui::modal::{centered_rect, draw_popup_frame};
+use crate::ui::model_picker::{ModelPicker, ModelRecipeSummary, PickerOutcome, draw_model_picker};
 use crate::ui::theme::Theme;
 
 /// Engine inventory — names mirror `apps/rocm` `engine_inventory()`. Kept
@@ -96,6 +97,8 @@ pub struct ServeWizardState {
     pub managed: bool,
     /// Local-path picker (Wave-0 primitive); `Some` while browsing.
     pub browser: Option<FolderBrowser>,
+    /// Model-recipe picker sub-step; `Some` while choosing a recipe.
+    pub picker: Option<ModelPicker>,
     /// Approval modal; `Some` while a launch is gated.
     pub approval: Option<PendingServe>,
     /// In-flight (or just-finished) launch job id.
@@ -115,6 +118,7 @@ impl Default for ServeWizardState {
             port: DEFAULT_PORT.to_string(),
             managed: true,
             browser: None,
+            picker: None,
             approval: None,
             active_job: None,
             message: None,
@@ -222,13 +226,33 @@ fn cycle_idx(cur: usize, len: usize, delta: isize) -> usize {
 pub fn on_key(
     wizard: &mut Option<ServeWizardState>,
     jobs: &mut State,
+    recipes: &[ModelRecipeSummary],
     key: KeyEvent,
 ) -> Vec<SideEffect> {
     let Some(w) = wizard.as_mut() else {
         return Vec::new();
     };
 
-    // 1) Folder browser (local model path) has focus.
+    // 1) Model-recipe picker sub-step has focus.
+    if let Some(picker) = w.picker.as_mut() {
+        match picker.on_key(key.code, recipes) {
+            PickerOutcome::Chosen(summary) => {
+                w.model = summary.id;
+                // Pre-select the recipe's preferred engine when we ship it.
+                if let Some(eng) = summary.preferred_engine
+                    && let Some(idx) = ENGINES.iter().position(|e| *e == eng)
+                {
+                    w.engine_idx = idx;
+                }
+                w.picker = None;
+            }
+            PickerOutcome::Cancelled => w.picker = None,
+            PickerOutcome::None => {}
+        }
+        return Vec::new();
+    }
+
+    // 2) Folder browser (local model path) has focus.
     if let Some(fb) = w.browser.as_mut() {
         match fb.on_key(key.code) {
             FolderOutcome::Chosen(path) => {
@@ -292,6 +316,10 @@ pub fn on_key(
         KeyCode::Enter => {
             if w.current_field() == Field::Launch {
                 request_launch(w);
+            } else if w.current_field() == Field::Model && !recipes.is_empty() {
+                // On the Model field, Enter opens the recipe picker (the
+                // model_picker sub-step); free-text typing + Tab-browse remain.
+                w.picker = Some(ModelPicker::default());
             } else {
                 w.move_field(1);
             }
@@ -372,6 +400,7 @@ pub fn draw_serve_wizard(
     area: Rect,
     w: &ServeWizardState,
     jobs: &State,
+    recipes: &[ModelRecipeSummary],
     theme: &Theme,
 ) {
     // The job console takes over while a launch is in flight / finished.
@@ -413,15 +442,23 @@ pub fn draw_serve_wizard(
         rows[1],
     );
 
+    let hint = if recipes.is_empty() {
+        "↑↓ field · ←→ change · Tab browse (model) · Enter next/launch · Esc close"
+    } else {
+        "↑↓ field · ←→ change · Enter pick (model)/next/launch · Tab browse · Esc close"
+    };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑↓ field · ←→ change · Tab browse (model) · Enter next/launch · Esc close",
+            hint,
             Style::default().fg(theme.muted),
         ))),
         rows[2],
     );
 
-    // Folder browser / approval sit on top of the form when active.
+    // Picker / folder browser / approval sit on top of the form when active.
+    if let Some(picker) = &w.picker {
+        draw_model_picker(f, area, picker, recipes, theme);
+    }
     if let Some(fb) = &w.browser {
         draw_folder_browser(f, area, fb, theme);
     }
@@ -617,19 +654,19 @@ mod tests {
         let mut jobs = State::default();
         // Fill the model by typing on the Model field (field 0 by default).
         for k in typed("qwen") {
-            on_key(&mut wiz, &mut jobs, k);
+            on_key(&mut wiz, &mut jobs, &[], k);
         }
         assert_eq!(wiz.as_ref().unwrap().model, "qwen");
         // Jump to Launch and press Enter → approval staged, NO job yet.
         let launch_idx = FIELDS.iter().position(|f| *f == Field::Launch).unwrap();
         wiz.as_mut().unwrap().field = launch_idx;
-        let fx = on_key(&mut wiz, &mut jobs, key(KeyCode::Enter));
+        let fx = on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Enter));
         assert!(fx.is_empty(), "launch must not run before approval");
         assert!(wiz.as_ref().unwrap().approval.is_some());
         assert!(jobs.jobs.is_empty());
 
         // Approve → exactly one SpawnJob, job registered, console active.
-        let fx = on_key(&mut wiz, &mut jobs, key(KeyCode::Char('y')));
+        let fx = on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('y')));
         assert_eq!(fx.len(), 1);
         assert!(matches!(fx[0], SideEffect::SpawnJob { .. }));
         let w = wiz.as_ref().unwrap();
@@ -644,7 +681,7 @@ mod tests {
         let mut jobs = State::default();
         let launch_idx = FIELDS.iter().position(|f| *f == Field::Launch).unwrap();
         wiz.as_mut().unwrap().field = launch_idx;
-        let fx = on_key(&mut wiz, &mut jobs, key(KeyCode::Enter));
+        let fx = on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Enter));
         assert!(fx.is_empty());
         let w = wiz.as_ref().unwrap();
         assert!(w.approval.is_none());
@@ -657,8 +694,8 @@ mod tests {
         let mut jobs = State::default();
         wiz.as_mut().unwrap().model = "m".into();
         wiz.as_mut().unwrap().field = FIELDS.iter().position(|f| *f == Field::Launch).unwrap();
-        on_key(&mut wiz, &mut jobs, key(KeyCode::Enter));
-        let fx = on_key(&mut wiz, &mut jobs, key(KeyCode::Char('n')));
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Enter));
+        let fx = on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('n')));
         assert!(fx.is_empty());
         assert!(wiz.as_ref().unwrap().approval.is_none());
         assert!(jobs.jobs.is_empty());
@@ -668,7 +705,7 @@ mod tests {
     fn esc_closes_when_idle() {
         let mut wiz = Some(ServeWizardState::default());
         let mut jobs = State::default();
-        on_key(&mut wiz, &mut jobs, key(KeyCode::Esc));
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Esc));
         assert!(wiz.is_none());
     }
 
@@ -678,10 +715,10 @@ mod tests {
         let mut jobs = State::default();
         wiz.as_mut().unwrap().model = "m".into();
         wiz.as_mut().unwrap().field = FIELDS.iter().position(|f| *f == Field::Launch).unwrap();
-        on_key(&mut wiz, &mut jobs, key(KeyCode::Enter));
-        on_key(&mut wiz, &mut jobs, key(KeyCode::Char('y')));
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Enter));
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('y')));
         assert!(wiz.as_ref().unwrap().active_job.is_some());
-        on_key(&mut wiz, &mut jobs, key(KeyCode::Char('q')));
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('q')));
         assert!(wiz.is_none(), "q must close the overlay even mid-job");
     }
 
@@ -691,11 +728,11 @@ mod tests {
         let mut jobs = State::default();
         wiz.as_mut().unwrap().model = "m".into();
         wiz.as_mut().unwrap().field = FIELDS.iter().position(|f| *f == Field::Launch).unwrap();
-        on_key(&mut wiz, &mut jobs, key(KeyCode::Enter));
-        on_key(&mut wiz, &mut jobs, key(KeyCode::Char('y')));
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Enter));
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('y')));
         let job_id = wiz.as_ref().unwrap().active_job.clone().unwrap();
         // Job is Running: Esc must NOT dismiss the console or close the overlay.
-        on_key(&mut wiz, &mut jobs, key(KeyCode::Esc));
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Esc));
         assert_eq!(wiz.as_ref().unwrap().active_job.as_ref(), Some(&job_id));
         assert!(wiz.is_some());
         // Once terminal, Esc dismisses the console back to the form.
@@ -703,7 +740,7 @@ mod tests {
             id: job_id,
             code: 0,
         });
-        on_key(&mut wiz, &mut jobs, key(KeyCode::Esc));
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Esc));
         assert!(wiz.as_ref().unwrap().active_job.is_none());
         assert!(
             wiz.is_some(),
@@ -721,11 +758,11 @@ mod tests {
 
         // First launch of "qwen": real spawn.
         for k in typed("qwen") {
-            on_key(&mut wiz, &mut jobs, k);
+            on_key(&mut wiz, &mut jobs, &[], k);
         }
         wiz.as_mut().unwrap().field = launch;
-        on_key(&mut wiz, &mut jobs, key(KeyCode::Enter));
-        on_key(&mut wiz, &mut jobs, key(KeyCode::Char('y')));
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Enter));
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('y')));
         assert_eq!(
             wiz.as_ref().unwrap().active_job.as_deref(),
             Some("serve-qwen")
@@ -735,11 +772,11 @@ mod tests {
         // the "serve-qwen" job is still Running in the shared job model.
         let mut wiz2 = Some(ServeWizardState::default());
         for k in typed("qwen") {
-            on_key(&mut wiz2, &mut jobs, k);
+            on_key(&mut wiz2, &mut jobs, &[], k);
         }
         wiz2.as_mut().unwrap().field = launch;
-        on_key(&mut wiz2, &mut jobs, key(KeyCode::Enter));
-        let fx = on_key(&mut wiz2, &mut jobs, key(KeyCode::Char('y')));
+        on_key(&mut wiz2, &mut jobs, &[], key(KeyCode::Enter));
+        let fx = on_key(&mut wiz2, &mut jobs, &[], key(KeyCode::Char('y')));
         // No new SpawnJob, no stale console, an informative message instead.
         assert!(fx.is_empty(), "no double-spawn for a running id");
         let w = wiz2.as_ref().unwrap();
@@ -757,10 +794,10 @@ mod tests {
     fn tab_on_model_opens_folder_browser() {
         let mut wiz = Some(ServeWizardState::default());
         let mut jobs = State::default();
-        on_key(&mut wiz, &mut jobs, key(KeyCode::Tab));
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Tab));
         assert!(wiz.as_ref().unwrap().browser.is_some());
         // Esc inside the browser closes the browser, not the overlay.
-        on_key(&mut wiz, &mut jobs, key(KeyCode::Esc));
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Esc));
         assert!(wiz.as_ref().unwrap().browser.is_none());
         assert!(wiz.is_some());
     }
@@ -770,10 +807,61 @@ mod tests {
         let mut wiz = Some(ServeWizardState::default());
         let mut jobs = State::default();
         wiz.as_mut().unwrap().field = FIELDS.iter().position(|f| *f == Field::Engine).unwrap();
-        on_key(&mut wiz, &mut jobs, key(KeyCode::Right));
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Right));
         assert_eq!(wiz.as_ref().unwrap().engine_idx, 1);
-        on_key(&mut wiz, &mut jobs, key(KeyCode::Left));
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Left));
         assert_eq!(wiz.as_ref().unwrap().engine_idx, 0);
+    }
+
+    #[test]
+    fn enter_on_model_opens_picker_and_choice_fills_model_and_engine() {
+        let recipes = vec![ModelRecipeSummary {
+            id: "GLM-4".into(),
+            aliases: vec!["glm".into()],
+            task: "chat".into(),
+            preferred_engine: Some("vllm".into()),
+        }];
+        let mut wiz = Some(ServeWizardState::default()); // field 0 = Model
+        let mut jobs = State::default();
+        // Enter on Model opens the picker when recipes exist.
+        on_key(&mut wiz, &mut jobs, &recipes, key(KeyCode::Enter));
+        assert!(wiz.as_ref().unwrap().picker.is_some());
+        // Enter in the picker chooses the (only) recipe → fills model + engine.
+        on_key(&mut wiz, &mut jobs, &recipes, key(KeyCode::Enter));
+        let w = wiz.as_ref().unwrap();
+        assert!(w.picker.is_none());
+        assert_eq!(w.model, "GLM-4");
+        assert_eq!(
+            ENGINES[w.engine_idx], "vllm",
+            "preferred engine pre-selected"
+        );
+    }
+
+    #[test]
+    fn enter_on_model_advances_when_no_recipes() {
+        let mut wiz = Some(ServeWizardState::default());
+        let mut jobs = State::default();
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Enter));
+        assert!(wiz.as_ref().unwrap().picker.is_none());
+        assert_eq!(wiz.as_ref().unwrap().field, 1, "Enter advances to Engine");
+    }
+
+    #[test]
+    fn picker_esc_returns_to_form_without_changing_model() {
+        let recipes = vec![ModelRecipeSummary {
+            id: "GLM-4".into(),
+            aliases: vec![],
+            task: "chat".into(),
+            preferred_engine: None,
+        }];
+        let mut wiz = Some(ServeWizardState::default());
+        let mut jobs = State::default();
+        on_key(&mut wiz, &mut jobs, &recipes, key(KeyCode::Enter));
+        on_key(&mut wiz, &mut jobs, &recipes, key(KeyCode::Esc));
+        let w = wiz.as_ref().unwrap();
+        assert!(w.picker.is_none());
+        assert!(w.model.is_empty());
+        assert!(wiz.is_some(), "picker Esc keeps the wizard open");
     }
 
     fn render(w: &ServeWizardState, jobs: &State) -> String {
@@ -782,7 +870,7 @@ mod tests {
         let theme = Theme::from_name("default-dark");
         let backend = TestBackend::new(120, 30);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| draw_serve_wizard(f, f.area(), w, jobs, &theme))
+        term.draw(|f| draw_serve_wizard(f, f.area(), w, jobs, &[], &theme))
             .unwrap();
         let buf = term.backend().buffer().clone();
         buf.content().iter().map(|c| c.symbol()).collect()
@@ -804,7 +892,7 @@ mod tests {
         let mut jobs = State::default();
         wiz.as_mut().unwrap().model = "qwen".into();
         wiz.as_mut().unwrap().field = FIELDS.iter().position(|f| *f == Field::Launch).unwrap();
-        on_key(&mut wiz, &mut jobs, key(KeyCode::Enter));
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Enter));
         let out = render(wiz.as_ref().unwrap(), &jobs);
         assert!(out.contains("Review:"), "approval modal shown");
         assert!(out.contains("serve"), "describes the gated launch");

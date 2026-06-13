@@ -15,9 +15,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rocm_core::{AppPaths, RocmCliConfig};
+use rocm_core::{AppPaths, RocmCliConfig, builtin_model_recipes};
 use rocm_dash_daemon::runner::RunnerOptions;
 use rocm_dash_tui::app::{ActiveTab, ResolvedArgs};
+use rocm_dash_tui::ui::model_picker::ModelRecipeSummary;
 
 /// Build the telemetry-daemon options from the unified dashboard config.
 ///
@@ -57,6 +58,21 @@ fn chat_api_key_from_env() -> Option<String> {
         .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
 }
 
+/// Adapt the built-in `rocm-core` model recipes into the TUI-local summaries the
+/// serve-wizard picker consumes (the bin owns the `rocm-core` dependency so the
+/// dash crates stay free of it).
+fn model_recipe_summaries() -> Vec<ModelRecipeSummary> {
+    builtin_model_recipes()
+        .into_iter()
+        .map(|r| ModelRecipeSummary {
+            id: r.canonical_model_id,
+            aliases: r.aliases,
+            task: r.task,
+            preferred_engine: r.preferred_engines.into_iter().next(),
+        })
+        .collect()
+}
+
 /// Resolve the TUI args from the unified config + environment.
 pub fn resolved_args(config: &RocmCliConfig, initial_tab: ActiveTab) -> ResolvedArgs {
     let t = &config.dashboard.tui;
@@ -75,6 +91,7 @@ pub fn resolved_args(config: &RocmCliConfig, initial_tab: ActiveTab) -> Resolved
         chat_api_key: chat_api_key_from_env(),
         chat_auto_consent: false,
         chat_mock: false,
+        model_recipes: model_recipe_summaries(),
     }
 }
 
@@ -171,5 +188,18 @@ mod tests {
         assert_eq!(args.theme, c.dashboard.tui.theme);
         assert!(!args.chat_mock);
         assert!(args.replay.is_none());
+        // The serve-wizard recipe picker is fed from the built-in recipes.
+        assert!(
+            !args.model_recipes.is_empty(),
+            "built-in model recipes flow through to the wizard"
+        );
+    }
+
+    #[test]
+    fn model_recipe_summaries_carry_id_and_engine() {
+        let summaries = model_recipe_summaries();
+        assert!(!summaries.is_empty());
+        // Every summary has a non-empty canonical id (the serve argv target).
+        assert!(summaries.iter().all(|s| !s.id.is_empty()));
     }
 }
