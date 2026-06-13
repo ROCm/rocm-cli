@@ -10,7 +10,7 @@
 //! CLI owns the actual mutation (`rocm config set-default-engine` /
 //! `rocm engines install [--reinstall]`) — the read-only chat invariant stands.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -23,7 +23,7 @@ use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
 };
 use crate::ui::exec::{exe_label, resolve_exe};
-use crate::ui::job_console::draw_job_console;
+use crate::ui::job_console::{ConsoleOutcome, draw_job_console, on_console_key};
 use crate::ui::modal::{centered_rect, draw_popup_frame};
 use crate::ui::theme::Theme;
 
@@ -137,20 +137,15 @@ pub fn on_key(
 
     // 2) A job is showing in the console.
     if let Some(job_id) = em.active_job.clone() {
-        match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return jobs.apply(StateEvent::CancelJob(job_id));
-            }
-            // `q` always closes the whole overlay so the user is never trapped.
-            KeyCode::Char('q') => *engines = None,
-            KeyCode::Esc | KeyCode::Enter
-                if jobs.job(&job_id).map(|j| j.is_terminal()).unwrap_or(true) =>
-            {
+        match on_console_key(&job_id, jobs, key) {
+            ConsoleOutcome::Cancelled(fx) => return fx,
+            ConsoleOutcome::Closed => *engines = None,
+            ConsoleOutcome::Dismissed => {
                 em.active_job = None;
                 // Clear any stale "already running" notice on return to the list.
                 em.message = None;
             }
-            _ => {}
+            ConsoleOutcome::Unhandled => {}
         }
         return Vec::new();
     }

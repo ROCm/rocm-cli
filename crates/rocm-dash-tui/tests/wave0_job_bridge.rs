@@ -179,5 +179,5 @@ fn approval_snapshot_renders_request_and_buttons() {
     assert!(out.contains("rocm serve llama3"), "command preview shown");
     assert!(out.contains("Approve"), "approve button");
     assert!(out.contains("Deny"), "deny button");
-    assert!(out.contains("Esc cancel"), "cancel hint");
+    assert!(out.contains("Esc/q cancel"), "cancel hint");
 }

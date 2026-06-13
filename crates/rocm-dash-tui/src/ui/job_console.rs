@@ -5,16 +5,53 @@
 //! operational screen reuses instead of the frozen rocm-cli `running_job`
 //! modal. The widget is read-only over the reducer's job model.
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use rocm_dash_core::state::{JobState, JobStatus};
+use rocm_dash_core::state::{JobState, JobStatus, SideEffect, State, StateEvent};
 
 use crate::ui::modal::{centered_rect, draw_popup_frame};
 use crate::ui::theme::Theme;
+
+/// What a console keypress means to the owning screen. The shared seam every
+/// operational overlay routes its `active_job` keys through, so the
+/// Ctrl+C/`q`/Esc-Enter behavior is defined once instead of per screen.
+#[derive(Debug)]
+pub enum ConsoleOutcome {
+    /// Ctrl+C cancelled the running job — the caller runs these effects.
+    Cancelled(Vec<SideEffect>),
+    /// `q` — the caller closes the whole overlay.
+    Closed,
+    /// Esc/Enter on a terminal job — the caller dismisses the console (returns
+    /// to the screen body), and may clear any transient message.
+    Dismissed,
+    /// Not a console key — the caller may handle it (e.g. a screen-specific
+    /// re-run shortcut).
+    Unhandled,
+}
+
+/// Interpret a key while a job console is showing `job_id`. Pure except for the
+/// `CancelJob` reducer apply (which only mutates the in-memory job model).
+pub fn on_console_key(job_id: &str, jobs: &mut State, key: KeyEvent) -> ConsoleOutcome {
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            ConsoleOutcome::Cancelled(jobs.apply(StateEvent::CancelJob(job_id.to_string())))
+        }
+        // `q` always closes the overlay so the user is never trapped mid-job
+        // (the job keeps running in the background).
+        KeyCode::Char('q') => ConsoleOutcome::Closed,
+        KeyCode::Esc | KeyCode::Enter
+            if jobs.job(job_id).map(|j| j.is_terminal()).unwrap_or(true) =>
+        {
+            ConsoleOutcome::Dismissed
+        }
+        _ => ConsoleOutcome::Unhandled,
+    }
+}
 
 /// Human-readable status label + the color it should render in.
 pub fn status_label(job: &JobState, theme: &Theme) -> (String, ratatui::style::Color) {
@@ -96,6 +133,57 @@ mod tests {
 
     fn theme() -> Theme {
         Theme::from_name("default")
+    }
+
+    fn k(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn console_key_outcomes() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut s = State::default();
+        s.apply(StateEvent::StartJob {
+            id: "j".into(),
+            cmd: "sleep".into(),
+            args: vec!["1".into()],
+        });
+        // Ctrl+C cancels (returns effects).
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(matches!(
+            on_console_key("j", &mut s, ctrl_c),
+            ConsoleOutcome::Cancelled(_)
+        ));
+        // `q` closes regardless of job state.
+        assert!(matches!(
+            on_console_key("j", &mut s, k(KeyCode::Char('q'))),
+            ConsoleOutcome::Closed
+        ));
+        // Esc on a RUNNING job is not a dismiss (Unhandled).
+        let mut s2 = State::default();
+        s2.apply(StateEvent::StartJob {
+            id: "j".into(),
+            cmd: "x".into(),
+            args: vec![],
+        });
+        assert!(matches!(
+            on_console_key("j", &mut s2, k(KeyCode::Esc)),
+            ConsoleOutcome::Unhandled
+        ));
+        // Esc on a TERMINAL job dismisses.
+        s2.apply(StateEvent::JobDone {
+            id: "j".into(),
+            code: 0,
+        });
+        assert!(matches!(
+            on_console_key("j", &mut s2, k(KeyCode::Esc)),
+            ConsoleOutcome::Dismissed
+        ));
+        // A missing job id is treated as terminal → Esc dismisses.
+        assert!(matches!(
+            on_console_key("gone", &mut s2, k(KeyCode::Enter)),
+            ConsoleOutcome::Dismissed
+        ));
     }
 
     #[test]

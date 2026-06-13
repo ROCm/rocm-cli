@@ -77,7 +77,11 @@ pub fn approval_key(
         KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab => (choice.toggle(), None),
         KeyCode::Char('y') | KeyCode::Char('Y') => (choice, Some(ApprovalVerdict::Approve)),
         KeyCode::Char('n') | KeyCode::Char('N') => (choice, Some(ApprovalVerdict::Deny)),
-        KeyCode::Esc => (choice, Some(ApprovalVerdict::Cancel)),
+        // Esc and `q` both cancel — `q` must never be silently swallowed while a
+        // modal is up, so the user is never trapped on any screen.
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+            (choice, Some(ApprovalVerdict::Cancel))
+        }
         KeyCode::Enter => {
             let verdict = match choice {
                 ApprovalChoice::Approve => ApprovalVerdict::Approve,
@@ -132,7 +136,7 @@ fn buttons_line<'a>(choice: ApprovalChoice, theme: &Theme) -> Paragraph<'a> {
         theme,
     );
     let help = Span::styled(
-        "   Tab move · Enter confirm · Esc cancel",
+        "   Tab move · Enter confirm · Esc/q cancel",
         Style::default().fg(theme.muted),
     );
     Paragraph::new(Line::from(vec![approve, Span::raw("  "), deny, help]))
@@ -196,9 +200,18 @@ mod tests {
     }
 
     #[test]
-    fn esc_cancels() {
+    fn esc_and_q_cancel() {
         assert_eq!(
             approval_key(KeyCode::Esc, ApprovalChoice::Approve).1,
+            Some(ApprovalVerdict::Cancel)
+        );
+        // `q` must cancel too — never silently swallowed while the modal is up.
+        assert_eq!(
+            approval_key(KeyCode::Char('q'), ApprovalChoice::Approve).1,
+            Some(ApprovalVerdict::Cancel)
+        );
+        assert_eq!(
+            approval_key(KeyCode::Char('Q'), ApprovalChoice::Deny).1,
             Some(ApprovalVerdict::Cancel)
         );
     }
