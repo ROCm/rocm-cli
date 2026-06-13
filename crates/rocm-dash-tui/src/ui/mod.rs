@@ -10,6 +10,7 @@ pub mod heatmap;
 pub mod instance_list;
 pub mod job_console;
 pub mod modal;
+pub mod model_picker;
 pub mod monitor;
 pub mod serve_wizard;
 pub mod services_manager;
@@ -84,7 +85,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
             &theme,
         );
     } else if let Some(w) = &state.serve_wizard {
-        serve_wizard::draw_serve_wizard(f, outer[2], w, &state.jobs, &theme);
+        serve_wizard::draw_serve_wizard(f, outer[2], w, &state.jobs, &state.model_recipes, &theme);
     } else if let Some(em) = &state.engine_manager {
         engine_manager::draw_engine_manager(f, outer[2], em, &state.jobs, &theme);
     }
