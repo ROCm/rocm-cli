@@ -1,6 +1,7 @@
 pub mod approval;
 pub mod bench;
 pub mod core_bars;
+pub mod doctor_manager;
 pub mod engine_manager;
 pub mod exec;
 pub mod folder_browser;
@@ -17,6 +18,7 @@ pub mod services_manager;
 pub mod sparkline;
 pub mod tabs;
 pub mod theme;
+pub mod update_manager;
 pub mod widgets;
 
 use ratatui::Frame;
@@ -88,6 +90,10 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         serve_wizard::draw_serve_wizard(f, outer[2], w, &state.jobs, &state.model_recipes, &theme);
     } else if let Some(em) = &state.engine_manager {
         engine_manager::draw_engine_manager(f, outer[2], em, &state.jobs, &theme);
+    } else if let Some(d) = &state.doctor_manager {
+        doctor_manager::draw_doctor_manager(f, outer[2], d, &state.jobs, &theme);
+    } else if let Some(u) = &state.update_manager {
+        update_manager::draw_update_manager(f, outer[2], u, &state.jobs, &theme);
     }
 }
 
@@ -195,6 +201,10 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         spans.push(Span::raw(" serve  "));
         spans.push(chip("e"));
         spans.push(Span::raw(" engines  "));
+        spans.push(chip("d"));
+        spans.push(Span::raw(" doctor  "));
+        spans.push(chip("u"));
+        spans.push(Span::raw(" update  "));
     }
     if state.active_tab == ActiveTab::Instances {
         spans.push(chip("s"));

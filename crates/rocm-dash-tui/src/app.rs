@@ -328,6 +328,10 @@ pub struct AppState {
     pub serve_wizard: Option<crate::ui::serve_wizard::ServeWizardState>,
     /// Engine manager overlay (Phase 3 Wave 1). `None` = closed.
     pub engine_manager: Option<crate::ui::engine_manager::EngineManagerState>,
+    /// Doctor overlay (Phase 3 Wave 2). `None` = closed.
+    pub doctor_manager: Option<crate::ui::doctor_manager::DoctorManagerState>,
+    /// Update overlay (Phase 3 Wave 2). `None` = closed.
+    pub update_manager: Option<crate::ui::update_manager::UpdateManagerState>,
     /// Built-in model recipes for the serve wizard's picker. Set from
     /// `ResolvedArgs` in the event loop; empty by default.
     pub model_recipes: Vec<crate::ui::model_picker::ModelRecipeSummary>,
@@ -375,8 +379,21 @@ impl AppState {
             services: None,
             serve_wizard: None,
             engine_manager: None,
+            doctor_manager: None,
+            update_manager: None,
             model_recipes: Vec::new(),
         }
+    }
+
+    /// Close every operational overlay. The overlays are mutually exclusive
+    /// (only one is routed/drawn at a time), so opening any one first clears the
+    /// rest — no open path can leave two `Some` at once.
+    fn close_overlays(&mut self) {
+        self.services = None;
+        self.serve_wizard = None;
+        self.engine_manager = None;
+        self.doctor_manager = None;
+        self.update_manager = None;
     }
 
     /// Open the theme picker modal, positioning the cursor on the active theme.
@@ -888,6 +905,26 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         );
                         crate::jobs::run_effects(fx, &job_tx);
                     }
+                    // The doctor overlay, when open, owns all keys (read-only
+                    // `rocm doctor` job through the job-bridge).
+                    Some(Ok(CtEvent::Key(k))) if state.doctor_manager.is_some() => {
+                        let fx = crate::ui::doctor_manager::on_key(
+                            &mut state.doctor_manager,
+                            &mut state.jobs,
+                            k,
+                        );
+                        crate::jobs::run_effects(fx, &job_tx);
+                    }
+                    // The update overlay, when open, owns all keys (check/preview
+                    // read-only; apply gated → job-bridge).
+                    Some(Ok(CtEvent::Key(k))) if state.update_manager.is_some() => {
+                        let fx = crate::ui::update_manager::on_key(
+                            &mut state.update_manager,
+                            &mut state.jobs,
+                            k,
+                        );
+                        crate::jobs::run_effects(fx, &job_tx);
+                    }
                     Some(Ok(CtEvent::Key(k))) => {
                         let chat_ctx = ChatKeyCtx {
                             focused: state.chat_focused,
@@ -1078,25 +1115,28 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
             };
         }
         KeyAction::CloseModal => state.modal = Modal::None,
-        // The three operational overlays are mutually exclusive. The open keys
-        // are only reachable when all overlays are closed, but each arm also
-        // clears its siblings defensively so a future open path (mouse, effect)
-        // can never leave two overlays Some at once (the draw/route chains would
-        // then disagree silently).
+        // The operational overlays are mutually exclusive: opening any one first
+        // closes the rest (see `close_overlays`), so no open path — key, mouse,
+        // or effect — can ever leave two `Some` at once.
         KeyAction::OpenServices => {
-            state.serve_wizard = None;
-            state.engine_manager = None;
+            state.close_overlays();
             state.services = Some(crate::ui::services_manager::ServicesManagerState::default());
         }
         KeyAction::OpenServeWizard => {
-            state.services = None;
-            state.engine_manager = None;
+            state.close_overlays();
             state.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState::default());
         }
         KeyAction::OpenEngineManager => {
-            state.services = None;
-            state.serve_wizard = None;
+            state.close_overlays();
             state.engine_manager = Some(crate::ui::engine_manager::EngineManagerState::default());
+        }
+        KeyAction::OpenDoctor => {
+            state.close_overlays();
+            state.doctor_manager = Some(crate::ui::doctor_manager::DoctorManagerState::default());
+        }
+        KeyAction::OpenUpdate => {
+            state.close_overlays();
+            state.update_manager = Some(crate::ui::update_manager::UpdateManagerState::default());
         }
         KeyAction::OpenThemePicker => state.open_theme_picker(),
         KeyAction::ApplyThemePick => state.apply_theme_pick(),
@@ -1240,6 +1280,10 @@ pub enum KeyAction {
     OpenServeWizard,
     /// Open the engine-manager overlay (Phase 3 Wave 1).
     OpenEngineManager,
+    /// Open the doctor overlay (Phase 3 Wave 2).
+    OpenDoctor,
+    /// Open the update overlay (Phase 3 Wave 2).
+    OpenUpdate,
 }
 
 fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) -> KeyAction {
@@ -1389,6 +1433,14 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         // Engine manager: use/install/reinstall serving engines.
         KeyCode::Char('e') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
             KeyAction::OpenEngineManager
+        }
+        // Doctor: read-only environment check.
+        KeyCode::Char('d') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
+            KeyAction::OpenDoctor
+        }
+        // Update: check/preview/apply ROCm package updates.
+        KeyCode::Char('u') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
+            KeyAction::OpenUpdate
         }
         KeyCode::Enter => KeyAction::OpenDetail,
         _ => KeyAction::Nothing,
@@ -1591,9 +1643,21 @@ mod tests {
             KeyAction::Nothing
         );
         assert_eq!(hk(KeyCode::Char('e'), ActiveTab::Bench), KeyAction::Nothing);
+        // Doctor / update open from Overview + Instances.
+        assert_eq!(
+            hk(KeyCode::Char('d'), ActiveTab::Overview),
+            KeyAction::OpenDoctor
+        );
+        assert_eq!(
+            hk(KeyCode::Char('u'), ActiveTab::Instances),
+            KeyAction::OpenUpdate
+        );
+        assert_eq!(hk(KeyCode::Char('d'), ActiveTab::Bench), KeyAction::Nothing);
         // On the Chat tab the operational keys are never hijacked.
         assert_eq!(hk(KeyCode::Char('w'), ActiveTab::Chat), KeyAction::Nothing);
         assert_eq!(hk(KeyCode::Char('e'), ActiveTab::Chat), KeyAction::Nothing);
+        assert_eq!(hk(KeyCode::Char('d'), ActiveTab::Chat), KeyAction::Nothing);
+        assert_eq!(hk(KeyCode::Char('u'), ActiveTab::Chat), KeyAction::Nothing);
     }
 
     #[test]
@@ -1606,6 +1670,11 @@ mod tests {
         assert!(s.serve_wizard.is_some() && s.services.is_none() && s.engine_manager.is_none());
         apply_action(&mut s, KeyAction::OpenEngineManager);
         assert!(s.engine_manager.is_some() && s.services.is_none() && s.serve_wizard.is_none());
+        // Wave 2 overlays join the mutual-exclusion set.
+        apply_action(&mut s, KeyAction::OpenDoctor);
+        assert!(s.doctor_manager.is_some() && s.engine_manager.is_none());
+        apply_action(&mut s, KeyAction::OpenUpdate);
+        assert!(s.update_manager.is_some() && s.doctor_manager.is_none());
     }
 
     #[test]
