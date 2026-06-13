@@ -19,6 +19,9 @@ use rocm_core::{AppPaths, RocmCliConfig, builtin_model_recipes};
 use rocm_dash_daemon::runner::RunnerOptions;
 use rocm_dash_tui::app::{ActiveTab, ResolvedArgs};
 use rocm_dash_tui::ui::model_picker::ModelRecipeSummary;
+use rocm_dash_tui::ui::runtime_manager::RuntimeSummary;
+
+use crate::therock;
 
 /// Build the telemetry-daemon options from the unified dashboard config.
 ///
@@ -73,8 +76,55 @@ fn model_recipe_summaries() -> Vec<ModelRecipeSummary> {
         .collect()
 }
 
+/// Adapt the registered ROCm runtimes into the TUI-local summaries the runtime
+/// manager consumes (the bin owns `rocm-core` / `therock`, so the dash crates
+/// stay free of them). Tolerant: a load failure yields an empty list rather
+/// than blocking the dashboard launch — the in-TUI refresh re-reads live.
+fn runtime_summaries(paths: &AppPaths, config: &RocmCliConfig) -> Vec<RuntimeSummary> {
+    let Ok(manifests) = therock::load_runtime_manifests(paths) else {
+        return Vec::new();
+    };
+    let active_key = config.active_runtime_key.as_deref();
+    let prev_key = config.previous_runtime_key.as_deref();
+    let default_id = config.default_runtime_id.as_deref();
+    // Mirror `render_runtimes_text`: a runtime is active by an explicit
+    // active_runtime_key, or — absent one — by being the single manifest whose
+    // runtime_id matches the configured default_runtime_id.
+    let default_matches: Vec<&str> = manifests
+        .iter()
+        .filter(|m| Some(m.runtime_id.as_str()) == default_id)
+        .map(|m| m.runtime_key.as_str())
+        .collect();
+    let single_default_key = if active_key.is_none() && default_matches.len() == 1 {
+        Some(default_matches[0].to_string())
+    } else {
+        None
+    };
+    manifests
+        .iter()
+        .map(|m| {
+            let active = active_key == Some(m.runtime_key.as_str())
+                || single_default_key.as_deref() == Some(m.runtime_key.as_str());
+            let rollback = prev_key == Some(m.runtime_key.as_str());
+            RuntimeSummary {
+                key: m.runtime_key.clone(),
+                id: m.runtime_id.clone(),
+                channel: m.channel.clone(),
+                version: m.version.clone(),
+                root: m.install_root.display().to_string(),
+                active,
+                rollback,
+            }
+        })
+        .collect()
+}
+
 /// Resolve the TUI args from the unified config + environment.
-pub fn resolved_args(config: &RocmCliConfig, initial_tab: ActiveTab) -> ResolvedArgs {
+pub fn resolved_args(
+    config: &RocmCliConfig,
+    paths: &AppPaths,
+    initial_tab: ActiveTab,
+) -> ResolvedArgs {
     let t = &config.dashboard.tui;
     ResolvedArgs {
         connect: t.connect.clone(),
@@ -92,6 +142,7 @@ pub fn resolved_args(config: &RocmCliConfig, initial_tab: ActiveTab) -> Resolved
         chat_auto_consent: false,
         chat_mock: false,
         model_recipes: model_recipe_summaries(),
+        runtimes: runtime_summaries(paths, config),
     }
 }
 
@@ -107,7 +158,7 @@ pub fn run() -> Result<()> {
 }
 
 async fn run_async(config: RocmCliConfig, paths: AppPaths) -> Result<()> {
-    let args = resolved_args(&config, ActiveTab::Overview);
+    let args = resolved_args(&config, &paths, ActiveTab::Overview);
     let embedded = maybe_spawn_embedded_daemon(&args.connect, &config, &paths).await;
 
     let result = rocm_dash_tui::app::run(args)
@@ -183,7 +234,7 @@ mod tests {
     #[test]
     fn resolved_args_take_connect_and_theme_from_config() {
         let c = cfg();
-        let args = resolved_args(&c, ActiveTab::Overview);
+        let args = resolved_args(&c, &paths(), ActiveTab::Overview);
         assert_eq!(args.connect, c.dashboard.tui.connect);
         assert_eq!(args.theme, c.dashboard.tui.theme);
         assert!(!args.chat_mock);
