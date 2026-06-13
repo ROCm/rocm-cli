@@ -797,6 +797,8 @@ mod tests {
             engine_manager: None,
             doctor_manager: None,
             update_manager: None,
+            install_manager: None,
+            logs_view: None,
             model_recipes: Vec::new(),
         }
     }

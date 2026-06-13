@@ -8,8 +8,10 @@ pub mod folder_browser;
 pub mod format;
 pub mod gradient;
 pub mod heatmap;
+pub mod install_manager;
 pub mod instance_list;
 pub mod job_console;
+pub mod logs_view;
 pub mod modal;
 pub mod model_picker;
 pub mod monitor;
@@ -94,6 +96,10 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         doctor_manager::draw_doctor_manager(f, outer[2], d, &state.jobs, &theme);
     } else if let Some(u) = &state.update_manager {
         update_manager::draw_update_manager(f, outer[2], u, &state.jobs, &theme);
+    } else if let Some(im) = &state.install_manager {
+        install_manager::draw_install_manager(f, outer[2], im, &state.jobs, &theme);
+    } else if let Some(lv) = &state.logs_view {
+        logs_view::draw_logs_view(f, outer[2], lv, &state.jobs, &theme);
     }
 }
 
@@ -205,6 +211,10 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         spans.push(Span::raw(" doctor  "));
         spans.push(chip("u"));
         spans.push(Span::raw(" update  "));
+        spans.push(chip("i"));
+        spans.push(Span::raw(" install  "));
+        spans.push(chip("l"));
+        spans.push(Span::raw(" logs  "));
     }
     if state.active_tab == ActiveTab::Instances {
         spans.push(chip("s"));
