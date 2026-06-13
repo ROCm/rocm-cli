@@ -332,6 +332,10 @@ pub struct AppState {
     pub doctor_manager: Option<crate::ui::doctor_manager::DoctorManagerState>,
     /// Update overlay (Phase 3 Wave 2). `None` = closed.
     pub update_manager: Option<crate::ui::update_manager::UpdateManagerState>,
+    /// Install overlay (Phase 3 Wave 2). `None` = closed.
+    pub install_manager: Option<crate::ui::install_manager::InstallManagerState>,
+    /// Logs overlay (Phase 3 Wave 3). `None` = closed.
+    pub logs_view: Option<crate::ui::logs_view::LogsViewState>,
     /// Built-in model recipes for the serve wizard's picker. Set from
     /// `ResolvedArgs` in the event loop; empty by default.
     pub model_recipes: Vec<crate::ui::model_picker::ModelRecipeSummary>,
@@ -381,6 +385,8 @@ impl AppState {
             engine_manager: None,
             doctor_manager: None,
             update_manager: None,
+            install_manager: None,
+            logs_view: None,
             model_recipes: Vec::new(),
         }
     }
@@ -394,6 +400,8 @@ impl AppState {
         self.engine_manager = None;
         self.doctor_manager = None;
         self.update_manager = None;
+        self.install_manager = None;
+        self.logs_view = None;
     }
 
     /// Open the theme picker modal, positioning the cursor on the active theme.
@@ -925,6 +933,26 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         );
                         crate::jobs::run_effects(fx, &job_tx);
                     }
+                    // The install overlay, when open, owns all keys (dry-run
+                    // read-only; install gated → job-bridge).
+                    Some(Ok(CtEvent::Key(k))) if state.install_manager.is_some() => {
+                        let fx = crate::ui::install_manager::on_key(
+                            &mut state.install_manager,
+                            &mut state.jobs,
+                            k,
+                        );
+                        crate::jobs::run_effects(fx, &job_tx);
+                    }
+                    // The logs overlay, when open, owns all keys (read-only
+                    // `rocm logs` through the job-bridge).
+                    Some(Ok(CtEvent::Key(k))) if state.logs_view.is_some() => {
+                        let fx = crate::ui::logs_view::on_key(
+                            &mut state.logs_view,
+                            &mut state.jobs,
+                            k,
+                        );
+                        crate::jobs::run_effects(fx, &job_tx);
+                    }
                     Some(Ok(CtEvent::Key(k))) => {
                         let chat_ctx = ChatKeyCtx {
                             focused: state.chat_focused,
@@ -1138,6 +1166,15 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
             state.close_overlays();
             state.update_manager = Some(crate::ui::update_manager::UpdateManagerState::default());
         }
+        KeyAction::OpenInstall => {
+            state.close_overlays();
+            state.install_manager =
+                Some(crate::ui::install_manager::InstallManagerState::default());
+        }
+        KeyAction::OpenLogs => {
+            state.close_overlays();
+            state.logs_view = Some(crate::ui::logs_view::LogsViewState::default());
+        }
         KeyAction::OpenThemePicker => state.open_theme_picker(),
         KeyAction::ApplyThemePick => state.apply_theme_pick(),
         KeyAction::ScrollModal(d) => {
@@ -1284,6 +1321,10 @@ pub enum KeyAction {
     OpenDoctor,
     /// Open the update overlay (Phase 3 Wave 2).
     OpenUpdate,
+    /// Open the install overlay (Phase 3 Wave 2).
+    OpenInstall,
+    /// Open the logs overlay (Phase 3 Wave 3).
+    OpenLogs,
 }
 
 fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) -> KeyAction {
@@ -1441,6 +1482,14 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         // Update: check/preview/apply ROCm package updates.
         KeyCode::Char('u') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
             KeyAction::OpenUpdate
+        }
+        // Install: ROCm SDK (TheRock) install / dry-run.
+        KeyCode::Char('i') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
+            KeyAction::OpenInstall
+        }
+        // Logs: browse recent ROCm CLI logs.
+        KeyCode::Char('l') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
+            KeyAction::OpenLogs
         }
         KeyCode::Enter => KeyAction::OpenDetail,
         _ => KeyAction::Nothing,
@@ -1653,11 +1702,30 @@ mod tests {
             KeyAction::OpenUpdate
         );
         assert_eq!(hk(KeyCode::Char('d'), ActiveTab::Bench), KeyAction::Nothing);
-        // On the Chat tab the operational keys are never hijacked.
-        assert_eq!(hk(KeyCode::Char('w'), ActiveTab::Chat), KeyAction::Nothing);
-        assert_eq!(hk(KeyCode::Char('e'), ActiveTab::Chat), KeyAction::Nothing);
-        assert_eq!(hk(KeyCode::Char('d'), ActiveTab::Chat), KeyAction::Nothing);
-        assert_eq!(hk(KeyCode::Char('u'), ActiveTab::Chat), KeyAction::Nothing);
+        // Install / logs open from Overview + Instances.
+        assert_eq!(
+            hk(KeyCode::Char('i'), ActiveTab::Overview),
+            KeyAction::OpenInstall
+        );
+        assert_eq!(
+            hk(KeyCode::Char('l'), ActiveTab::Instances),
+            KeyAction::OpenLogs
+        );
+        // On the Chat tab none of these open an overlay (the operational keys
+        // are guarded to Overview/Instances). `i` is the one that means
+        // something else on Chat — insert mode — never OpenInstall.
+        for c in ['w', 'e', 'd', 'u', 'l'] {
+            assert_eq!(
+                hk(KeyCode::Char(c), ActiveTab::Chat),
+                KeyAction::Nothing,
+                "key {c} must not open an overlay from Chat"
+            );
+        }
+        assert_eq!(
+            hk(KeyCode::Char('i'), ActiveTab::Chat),
+            KeyAction::ChatFocus,
+            "i is chat-insert on Chat, never OpenInstall"
+        );
     }
 
     #[test]
@@ -1670,11 +1738,15 @@ mod tests {
         assert!(s.serve_wizard.is_some() && s.services.is_none() && s.engine_manager.is_none());
         apply_action(&mut s, KeyAction::OpenEngineManager);
         assert!(s.engine_manager.is_some() && s.services.is_none() && s.serve_wizard.is_none());
-        // Wave 2 overlays join the mutual-exclusion set.
+        // Wave 2/3 overlays join the mutual-exclusion set.
         apply_action(&mut s, KeyAction::OpenDoctor);
         assert!(s.doctor_manager.is_some() && s.engine_manager.is_none());
         apply_action(&mut s, KeyAction::OpenUpdate);
         assert!(s.update_manager.is_some() && s.doctor_manager.is_none());
+        apply_action(&mut s, KeyAction::OpenInstall);
+        assert!(s.install_manager.is_some() && s.update_manager.is_none());
+        apply_action(&mut s, KeyAction::OpenLogs);
+        assert!(s.logs_view.is_some() && s.install_manager.is_none());
     }
 
     #[test]
