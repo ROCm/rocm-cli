@@ -550,6 +550,114 @@ impl AgentClient for RigAgentClient {
     }
 }
 
+/// No-key ChatGPT backend over Rig's native `chatgpt` OAuth provider — the
+/// no-key default that restores the ChatGPT device-login the vendored Codex
+/// path provided. It takes NO api_key (the env-only key invariant is untouched:
+/// this path authenticates with an OAuth device-code flow, not a key). The
+/// `on_device_code` callback surfaces the verification URL + user code so the
+/// chat tab can show the operator how to sign in; the resulting token is
+/// persisted by the provider so re-launches don't re-prompt.
+pub struct ChatGptAgentClient {
+    client: rig::providers::chatgpt::Client,
+    model: String,
+    preamble: String,
+}
+
+impl ChatGptAgentClient {
+    /// Build the OAuth client. `model` defaults to the provider's Codex model.
+    /// `on_device_code(verification_uri, user_code)` is invoked during the first
+    /// `authorize()` (device-code flow). No network I/O happens here — login is
+    /// deferred to the first `complete()`.
+    pub fn new<F>(model: Option<String>, on_device_code: F) -> Result<Self, AgentError>
+    where
+        F: Fn(String, String) + Send + Sync + 'static,
+    {
+        use rig::providers::chatgpt;
+        // The closure param is the provider's `DeviceCodePrompt` (its `auth`
+        // module is private, so we let inference name it); its `verification_uri`
+        // and `user_code` fields are public.
+        let client = chatgpt::Client::builder()
+            .oauth()
+            .on_device_code(move |p| on_device_code(p.verification_uri, p.user_code))
+            .build()
+            .map_err(|e| AgentError::Build(e.to_string()))?;
+        Ok(Self {
+            client,
+            model: model.unwrap_or_else(|| chatgpt::GPT_5_3_CODEX.to_string()),
+            preamble: DEFAULT_PREAMBLE.to_string(),
+        })
+    }
+}
+
+#[async_trait]
+impl AgentClient for ChatGptAgentClient {
+    async fn complete(
+        &self,
+        history: &[ChatTurn],
+        snapshot: StateSnapshot,
+    ) -> Result<String, AgentError> {
+        use rig::agent::AgentBuilder;
+        use rig::completion::Prompt;
+        use rig::providers::chatgpt::ResponsesCompletionModel;
+        use std::future::IntoFuture;
+
+        let Some((last, prior)) = history.split_last() else {
+            return Err(AgentError::Empty);
+        };
+
+        // Device-code login on first use; the provider caches the token after.
+        self.client
+            .authorize()
+            .await
+            .map_err(|e| AgentError::Build(e.to_string()))?;
+
+        let snap = Arc::new(snapshot);
+        let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
+        let model = ResponsesCompletionModel::new(self.client.clone(), self.model.clone());
+        let agent = AgentBuilder::new(model)
+            .preamble(&self.preamble)
+            .max_tokens(1024)
+            .tool(GpuStatusTool {
+                snap: snap.clone(),
+                fired: fired.clone(),
+            })
+            .tool(ListInstancesTool {
+                snap: snap.clone(),
+                fired: fired.clone(),
+            })
+            .tool(BenchSummaryTool {
+                snap: snap.clone(),
+                fired: fired.clone(),
+            })
+            .tool(TokensPerWattTool {
+                snap: snap.clone(),
+                fired: fired.clone(),
+            })
+            // Read-only Skills registry tools (list + dry-run plan; never execute).
+            .tool(ListSkillsTool {
+                fired: fired.clone(),
+            })
+            .tool(SkillPlanTool {
+                fired: fired.clone(),
+            })
+            .build();
+
+        let req = agent
+            .prompt(last.content.clone())
+            .max_turns(MAX_TOOL_TURNS)
+            .with_history(build_messages(prior));
+
+        let reply = match tokio::time::timeout(REQUEST_TIMEOUT, req.into_future()).await {
+            Err(_) => return Err(AgentError::Timeout),
+            Ok(Ok(reply)) => reply,
+            Ok(Err(e)) => return Err(AgentError::Request(e.to_string())),
+        };
+
+        let skills = fired.lock().map(|g| g.clone()).unwrap_or_default();
+        Ok(annotate_reply(reply, &skills))
+    }
+}
+
 /// Deterministic in-memory client for tests and the offline demo. Never touches
 /// the network. Can emit a canned tool-calling-style answer (cites a Skill).
 pub struct MockAgentClient {
@@ -941,6 +1049,52 @@ mod tests {
             .await
             .expect("gateway reply");
         eprintln!("AMD gateway reply: {reply}");
+        assert!(!reply.is_empty());
+    }
+
+    #[test]
+    fn chatgpt_oauth_client_builds_offline_without_taking_a_key() {
+        // Construction is offline (login is deferred to authorize() in
+        // complete()); the device-code callback is wired but not yet invoked.
+        // Crucially, the constructor signature takes NO api_key — the env-only
+        // key invariant is structurally preserved on the no-key path.
+        let fired = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = fired.clone();
+        let client =
+            ChatGptAgentClient::new(Some("gpt-5.3-codex".to_string()), move |url, code| {
+                // Would surface in the chat tab during a real device-code login.
+                sink.lock().unwrap().push(format!("{url}|{code}"));
+            })
+            .expect("build chatgpt oauth client");
+        assert_eq!(client.model, "gpt-5.3-codex");
+        // No network happened, so the handler has not fired yet.
+        assert!(fired.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn chatgpt_oauth_client_defaults_model_when_none() {
+        let client =
+            ChatGptAgentClient::new(None, |_url, _code| {}).expect("build chatgpt oauth client");
+        assert!(!client.model.is_empty(), "a default model is chosen");
+    }
+
+    /// Live no-key device-code round-trip against ChatGPT. NOT run in CI
+    /// (interactive OAuth + network). Run with:
+    /// `cargo test -p rocm-dash-tui --lib chatgpt_oauth_round_trip -- --ignored --nocapture`
+    /// then complete the device login in a browser.
+    #[tokio::test]
+    #[ignore = "interactive ChatGPT OAuth device-code login + network"]
+    async fn chatgpt_oauth_round_trip() {
+        let client = ChatGptAgentClient::new(None, |url, code| {
+            eprintln!("Sign in: open {url} and enter code {code}");
+        })
+        .expect("build chatgpt oauth client");
+        let history = vec![ChatTurn::user("Reply with exactly: oauth ok")];
+        let reply = client
+            .complete(&history, fixture_snapshot())
+            .await
+            .expect("oauth reply");
+        eprintln!("ChatGPT OAuth reply: {reply}");
         assert!(!reply.is_empty());
     }
 }
