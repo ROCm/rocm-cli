@@ -15,6 +15,7 @@ pub mod logs_view;
 pub mod modal;
 pub mod model_picker;
 pub mod monitor;
+pub mod onboarding;
 pub mod runtime_manager;
 pub mod serve_wizard;
 pub mod services_manager;
@@ -110,6 +111,8 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
             &state.jobs,
             &theme,
         );
+    } else if let Some(o) = &state.onboarding {
+        onboarding::draw_onboarding(f, outer[2], o, &state.jobs, &theme);
     }
 }
 

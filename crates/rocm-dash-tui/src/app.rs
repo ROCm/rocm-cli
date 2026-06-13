@@ -342,6 +342,8 @@ pub struct AppState {
     pub logs_view: Option<crate::ui::logs_view::LogsViewState>,
     /// Runtime manager overlay (Phase 3 Wave 2). `None` = closed.
     pub runtime_manager: Option<crate::ui::runtime_manager::RuntimeManagerState>,
+    /// Onboarding wizard overlay (Phase 3 Wave 2). `None` = closed.
+    pub onboarding: Option<crate::ui::onboarding::OnboardingState>,
     /// Built-in model recipes for the serve wizard's picker. Set from
     /// `ResolvedArgs` in the event loop; empty by default.
     pub model_recipes: Vec<crate::ui::model_picker::ModelRecipeSummary>,
@@ -397,6 +399,7 @@ impl AppState {
             install_manager: None,
             logs_view: None,
             runtime_manager: None,
+            onboarding: None,
             model_recipes: Vec::new(),
             runtimes: Vec::new(),
         }
@@ -414,6 +417,7 @@ impl AppState {
         self.install_manager = None;
         self.logs_view = None;
         self.runtime_manager = None;
+        self.onboarding = None;
     }
 
     /// Open the theme picker modal, positioning the cursor on the active theme.
@@ -978,6 +982,16 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         );
                         crate::jobs::run_effects(fx, &job_tx);
                     }
+                    // The onboarding wizard, when open, owns all keys (install /
+                    // adopt gated → job-bridge).
+                    Some(Ok(CtEvent::Key(k))) if state.onboarding.is_some() => {
+                        let fx = crate::ui::onboarding::on_key(
+                            &mut state.onboarding,
+                            &mut state.jobs,
+                            k,
+                        );
+                        crate::jobs::run_effects(fx, &job_tx);
+                    }
                     Some(Ok(CtEvent::Key(k))) => {
                         let chat_ctx = ChatKeyCtx {
                             focused: state.chat_focused,
@@ -1205,6 +1219,10 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
             state.runtime_manager =
                 Some(crate::ui::runtime_manager::RuntimeManagerState::default());
         }
+        KeyAction::OpenOnboarding => {
+            state.close_overlays();
+            state.onboarding = Some(crate::ui::onboarding::OnboardingState::default());
+        }
         KeyAction::OpenThemePicker => state.open_theme_picker(),
         KeyAction::ApplyThemePick => state.apply_theme_pick(),
         KeyAction::ScrollModal(d) => {
@@ -1355,6 +1373,8 @@ pub enum KeyAction {
     OpenInstall,
     /// Open the runtime manager overlay.
     OpenRuntimes,
+    /// Open the onboarding wizard overlay.
+    OpenOnboarding,
     /// Open the logs overlay (Phase 3 Wave 3).
     OpenLogs,
 }
@@ -1526,6 +1546,10 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         // Runtimes: list/activate/adopt/import ROCm runtimes.
         KeyCode::Char('r') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
             KeyAction::OpenRuntimes
+        }
+        // Onboarding: first-run setup wizard (install / adopt).
+        KeyCode::Char('n') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
+            KeyAction::OpenOnboarding
         }
         KeyCode::Enter => KeyAction::OpenDetail,
         _ => KeyAction::Nothing,
@@ -1785,6 +1809,8 @@ mod tests {
         assert!(s.logs_view.is_some() && s.install_manager.is_none());
         apply_action(&mut s, KeyAction::OpenRuntimes);
         assert!(s.runtime_manager.is_some() && s.logs_view.is_none());
+        apply_action(&mut s, KeyAction::OpenOnboarding);
+        assert!(s.onboarding.is_some() && s.runtime_manager.is_none());
     }
 
     #[test]
