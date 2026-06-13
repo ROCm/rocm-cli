@@ -801,8 +801,12 @@ mod tests {
             logs_view: None,
             runtime_manager: None,
             onboarding: None,
+            automations_manager: None,
+            command_screen: None,
+            config_manager: None,
             model_recipes: Vec::new(),
             runtimes: Vec::new(),
+            automations: Vec::new(),
         }
     }
 

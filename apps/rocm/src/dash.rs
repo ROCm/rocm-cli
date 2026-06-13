@@ -15,9 +15,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rocm_core::{AppPaths, RocmCliConfig, builtin_model_recipes};
+use rocm_core::{AppPaths, RocmCliConfig, builtin_model_recipes, builtin_watchers};
 use rocm_dash_daemon::runner::RunnerOptions;
 use rocm_dash_tui::app::{ActiveTab, ResolvedArgs};
+use rocm_dash_tui::ui::automations_manager::AutomationSummary;
 use rocm_dash_tui::ui::model_picker::ModelRecipeSummary;
 use rocm_dash_tui::ui::runtime_manager::RuntimeSummary;
 
@@ -119,6 +120,21 @@ fn runtime_summaries(paths: &AppPaths, config: &RocmCliConfig) -> Vec<RuntimeSum
         .collect()
 }
 
+/// Adapt the built-in background checks into the TUI-local summaries the
+/// automations manager consumes (enabled-state + effective mode come from the
+/// unified config; the bin owns `rocm-core`).
+fn automation_summaries(config: &RocmCliConfig) -> Vec<AutomationSummary> {
+    builtin_watchers()
+        .iter()
+        .map(|w| AutomationSummary {
+            id: w.id.to_string(),
+            summary: w.summary.to_string(),
+            enabled: config.watcher_enabled(w),
+            mode: config.effective_watcher_mode(w).as_str().to_string(),
+        })
+        .collect()
+}
+
 /// Resolve the TUI args from the unified config + environment.
 pub fn resolved_args(
     config: &RocmCliConfig,
@@ -143,6 +159,7 @@ pub fn resolved_args(
         chat_mock: false,
         model_recipes: model_recipe_summaries(),
         runtimes: runtime_summaries(paths, config),
+        automations: automation_summaries(config),
     }
 }
 
