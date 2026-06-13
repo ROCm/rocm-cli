@@ -49,6 +49,8 @@ pub enum AgentError {
     Empty,
     #[error("failed to build chat client: {0}")]
     Build(String),
+    #[error("chat sign-in failed: {0}")]
+    Auth(String),
     #[error("request timed out after {}s", REQUEST_TIMEOUT.as_secs())]
     Timeout,
     #[error("chat request failed: {0}")]
@@ -606,10 +608,12 @@ impl AgentClient for ChatGptAgentClient {
         };
 
         // Device-code login on first use; the provider caches the token after.
+        // A failed/declined sign-in is an Auth error (distinct from a build
+        // failure), surfaced as a clear error turn — never leaks the token.
         self.client
             .authorize()
             .await
-            .map_err(|e| AgentError::Build(e.to_string()))?;
+            .map_err(|e| AgentError::Auth(e.to_string()))?;
 
         let snap = Arc::new(snapshot);
         let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
@@ -1075,7 +1079,11 @@ mod tests {
     fn chatgpt_oauth_client_defaults_model_when_none() {
         let client =
             ChatGptAgentClient::new(None, |_url, _code| {}).expect("build chatgpt oauth client");
-        assert!(!client.model.is_empty(), "a default model is chosen");
+        assert_eq!(
+            client.model,
+            rig::providers::chatgpt::GPT_5_3_CODEX,
+            "the no-key default uses the provider's Codex model"
+        );
     }
 
     /// Live no-key device-code round-trip against ChatGPT. NOT run in CI
