@@ -26,10 +26,6 @@ use windows_sys::Win32::System::Threading::{
 
 pub mod runtime;
 pub mod uv;
-pub use uv::{
-    DEFAULT_UV_TIMEOUT_SECS, ensure_uv_binary, uv_binary_name, uv_command_env,
-    uv_http_timeout_secs, uv_pip_freeze_args, uv_pip_install_base, uv_venv_args,
-};
 #[cfg(test)]
 use runtime::home_rocm_dir;
 pub use runtime::{
@@ -50,6 +46,10 @@ pub use runtime::{
     runtime_rocm_library_filename, runtime_tcp_timeouts_are_supported, shell_command_for_host,
 };
 use runtime::{env_path_override, runtime_path_for_child_process};
+pub use uv::{
+    DEFAULT_UV_TIMEOUT_SECS, ensure_uv_binary, uv_binary_name, uv_command_env,
+    uv_http_timeout_secs, uv_pip_freeze_args, uv_pip_install_base, uv_venv_args,
+};
 
 pub const DEFAULT_LOCAL_PORT: u16 = 11_435;
 pub const DEFAULT_LOCAL_HOST: &str = "127.0.0.1";
@@ -1195,7 +1195,7 @@ impl DoctorSummary {
             return "none";
         }
         if self.managed_runtime_count == 0 {
-            return "legacy ROCm detected; install a managed TheRock runtime with `rocm install sdk --channel release --format pip` and keep legacy ROCm unmanaged";
+            return "legacy ROCm detected; install a managed TheRock runtime with `rocm install sdk --channel release --format wheel` and keep legacy ROCm unmanaged";
         }
         "legacy ROCm detected; keep it side-by-side and use rocm-cli managed TheRock runtimes for local engines"
     }
@@ -6094,7 +6094,7 @@ Class Name:                Display
         assert!(rendered.contains(
             "legacy_rocm_guidance: legacy ROCm detected; install a managed TheRock runtime"
         ));
-        assert!(rendered.contains("rocm install sdk --channel release --format pip"));
+        assert!(rendered.contains("rocm install sdk --channel release --format wheel"));
     }
 
     #[test]

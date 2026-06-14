@@ -1,12 +1,12 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use rocm_core::{
-    AppPaths, DEFAULT_LOCAL_PORT, ModelRecipeRecord, detect_host_therock_family,
-    ensure_uv_binary, extract_first_gfx_token, format_host_port, format_http_base_url,
-    interactive_terminal, normalize_runtime_path_for_host, normalize_runtime_path_text_for_host,
+    AppPaths, DEFAULT_LOCAL_PORT, ModelRecipeRecord, detect_host_therock_family, ensure_uv_binary,
+    extract_first_gfx_token, format_host_port, format_http_base_url, interactive_terminal,
+    normalize_runtime_path_for_host, normalize_runtime_path_text_for_host,
     normalize_therock_family, require_nonempty,
-    resolve_model_recipe as resolve_shared_model_recipe, runtime_is_windows, uv_command_env,
-    uv_pip_freeze_args, uv_pip_install_base, uv_venv_args, unix_time_millis,
+    resolve_model_recipe as resolve_shared_model_recipe, runtime_is_windows, unix_time_millis,
+    uv_command_env, uv_pip_freeze_args, uv_pip_install_base, uv_venv_args,
 };
 use rocm_engine_protocol::{
     DetectRequest, DetectResponse, DevicePolicy, ENGINE_RECIPE_CONTRACT_VERSION, EndpointRequest,
@@ -2829,8 +2829,7 @@ where
         .output()
         .with_context(|| format!("failed to launch uv for {context_text}"))?;
     if output.status.success() {
-        return String::from_utf8(output.stdout)
-            .context("uv output was not valid UTF-8");
+        return String::from_utf8(output.stdout).context("uv output was not valid UTF-8");
     }
     bail!("{context_text}: uv exited with {}", output.status)
 }
@@ -3608,7 +3607,10 @@ mod tests {
         let args = uv_pip_install_base(&python);
         assert_eq!(args[0], "pip");
         assert_eq!(args[1], "install");
-        assert!(args.windows(2).any(|pair| pair == ["--python", "/envs/pytorch/bin/python"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--python", "/envs/pytorch/bin/python"])
+        );
     }
 
     #[test]

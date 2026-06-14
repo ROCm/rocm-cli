@@ -402,7 +402,7 @@ def main() -> int:
         )
         assert_contains(
             tarball,
-            "TheRock tarball installs are not supported on Windows V1",
+            "TheRock tarball installs are not supported on Windows",
             "windows tarball rejection",
         )
 

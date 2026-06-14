@@ -1,12 +1,12 @@
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_gpu_diagnostics,
-    detect_host_therock_family, detect_managed_therock_family, ensure_uv_binary,
-    managed_tools_dir, normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
+    detect_host_therock_family, detect_managed_therock_family, ensure_uv_binary, managed_tools_dir,
+    normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
     normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_storage,
     normalize_therock_family, platform_binary_name, runtime_is_windows, runtime_os_name,
     runtime_path_for_windows_child, runtime_path_list_split, runtime_python_executable_in_env,
-    uv_command_env, uv_pip_install_base, uv_venv_args, unix_time_millis,
+    unix_time_millis, uv_command_env, uv_pip_install_base, uv_venv_args,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -878,8 +878,7 @@ fn install_wheel_runtime(
         let _ = writeln!(
             output,
             "  command: uv {} && uv {}",
-            venv_args_display,
-            install_args_display
+            venv_args_display, install_args_display
         );
         let _ = writeln!(
             output,
@@ -981,7 +980,6 @@ fn install_wheel_runtime(
     let _ = writeln!(output, "  manifest: {}", manifest_path.display());
     Ok(output)
 }
-
 
 fn therock_pip_package_specs(package_versions: &TheRockPipPackageVersions) -> Vec<String> {
     vec![
@@ -2937,7 +2935,7 @@ fn run_uv_progress_command(uv: &Path, args: &[&str], context_text: &str) -> Resu
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .with_context(|| format!("failed to launch uv"))?;
+        .with_context(|| "failed to launch uv".to_string())?;
     if status.success() {
         return Ok(());
     }
@@ -3015,20 +3013,20 @@ fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
     let uv = ensure_uv_binary(paths)?;
 
     // Check the manifest first — if the recorded executable is still usable, skip the install.
-    if let Ok(Some(manifest)) = load_managed_python_manifest(paths) {
-        if manifest.version == version && manifest.executable.is_file()
-            && python_launcher_install_ready(&manifest.executable).is_ok()
-        {
-            progress_line(format!(
-                "Using existing Python {version} at {}.",
-                manifest.executable.display()
-            ));
-            let _ = record_managed_python_config(paths, &manifest.executable);
-            return Ok(PythonLauncher {
-                executable: manifest.executable,
-                source: "managed",
-            });
-        }
+    if let Ok(Some(manifest)) = load_managed_python_manifest(paths)
+        && manifest.version == version
+        && manifest.executable.is_file()
+        && python_launcher_install_ready(&manifest.executable).is_ok()
+    {
+        progress_line(format!(
+            "Using existing Python {version} at {}.",
+            manifest.executable.display()
+        ));
+        let _ = record_managed_python_config(paths, &manifest.executable);
+        return Ok(PythonLauncher {
+            executable: manifest.executable,
+            source: "managed",
+        });
     }
 
     progress_line(format!("Installing Python {version} via uv..."));
@@ -3082,13 +3080,15 @@ fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
     };
     save_managed_python_manifest(paths, &manifest)?;
     let _ = record_managed_python_config(paths, &executable);
-    progress_line(format!("Python {version} is ready at {}.", executable.display()));
+    progress_line(format!(
+        "Python {version} is ready at {}.",
+        executable.display()
+    ));
     Ok(PythonLauncher {
         executable,
         source: "managed",
     })
 }
-
 
 fn resolve_python_launcher(paths: &AppPaths) -> Result<PythonLauncher> {
     if let Ok(value) = std::env::var("ROCM_CLI_PYTHON") {
@@ -3224,18 +3224,6 @@ fn python_venv_probe_temp_root() -> Result<PathBuf> {
     } else {
         linux_temp_dir("rocm-cli-python-venv-probe")
     }
-}
-
-#[cfg(test)]
-fn command_succeeds(program: &Path, args: &[&str]) -> bool {
-    Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
 }
 
 fn parse_tarball_index_html(html: &str) -> Result<Vec<TarballIndexFile>> {
@@ -3812,18 +3800,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn write_fake_python_without_venv_support(dir: &Path, name: &str) -> Result<PathBuf> {
-        let path = dir.join(name);
-        fs::write(
-            &path,
-            "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then echo cp312; else echo Python 3.12.10; fi\n",
-        )?;
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
-        Ok(path)
-    }
-
-    #[cfg(unix)]
     fn write_fake_python_with_venv(dir: &Path, name: &str) -> Result<PathBuf> {
         let path = dir.join(name);
         let script = r#"#!/bin/sh
@@ -4337,8 +4313,8 @@ echo Python 3.12.10
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("tarball installs are not supported on Windows V1"));
-        assert!(error.contains("rocm install sdk --format pip"));
+        assert!(error.contains("tarball installs are not supported on Windows"));
+        assert!(error.contains("rocm install sdk --format wheel"));
     }
 
     fn test_paths(name: &str) -> (PathBuf, AppPaths) {
