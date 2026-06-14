@@ -1734,7 +1734,7 @@ fn rocm_mcp_tools() -> Vec<Value> {
                     },
                     "format": {
                         "type": "string",
-                        "enum": ["pip", "tarball"]
+                        "enum": ["wheel", "tarball"]
                     },
                     "prefix": {
                         "type": "string"
@@ -1763,7 +1763,7 @@ fn rocm_mcp_tools() -> Vec<Value> {
                     },
                     "format": {
                         "type": "string",
-                        "enum": ["pip", "tarball"]
+                        "enum": ["wheel", "tarball"]
                     },
                     "prefix": {
                         "type": "string"
@@ -2402,7 +2402,7 @@ fn build_install_sdk_args(
     let format = arguments
         .get("format")
         .and_then(Value::as_str)
-        .unwrap_or("pip");
+        .unwrap_or("wheel");
     let prefix = arguments.get("prefix").and_then(Value::as_str);
     let version = arguments.get("version").and_then(Value::as_str);
     let build_date = arguments.get("build_date").and_then(Value::as_str);
@@ -5293,7 +5293,7 @@ mod tests {
                 "--channel".to_owned(),
                 "release".to_owned(),
                 "--format".to_owned(),
-                "pip".to_owned(),
+                "wheel".to_owned(),
                 "--build-date".to_owned(),
                 "2026-06-05".to_owned(),
                 "--dry-run".to_owned(),

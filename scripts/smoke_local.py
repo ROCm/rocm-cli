@@ -616,8 +616,8 @@ def main() -> int:
     )
 
     assert_path_missing(
-        smoke_root / "rocm-cache" / "pip",
-        "first-run smoke pip cache",
+        smoke_root / "rocm-cache" / "uv",
+        "first-run smoke uv cache",
     )
     assert_path_missing(
         smoke_root / "rocm-data" / "runtimes" / "registry",

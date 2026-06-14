@@ -2,10 +2,10 @@ use crate::{format_structured_tool_call, runtime_usability_status, therock};
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use rocm_core::{
-    AppPaths, RocmCliConfig, download_file_to_path, format_http_base_url, managed_pip_cache_dir,
+    AppPaths, RocmCliConfig, download_file_to_path, ensure_uv_binary, format_http_base_url,
     runtime_is_cosmopolitan_windows, runtime_is_linux, runtime_is_windows,
     runtime_path_for_windows_child, runtime_path_list_join, runtime_path_list_split,
-    runtime_paths_equivalent, unix_time_millis,
+    runtime_paths_equivalent, uv_command_env, uv_pip_install_base, unix_time_millis,
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -51,7 +51,7 @@ struct ComfyUiManifest {
     source_url: String,
     source_path: PathBuf,
     requirements_path: PathBuf,
-    pip_cache_dir: PathBuf,
+    pip_cache_dir: Option<PathBuf>,
     log_path: PathBuf,
     torch_version: Option<String>,
     torch_cuda_available: bool,
@@ -374,7 +374,6 @@ pub(crate) fn install(
     let runtime = select_runtime(paths, config, options.runtime_id.as_deref())?;
     let app_root = runtime_app_root(&runtime.manifest);
     let source_path = source_path_from_app_root(&app_root);
-    let pip_cache = managed_pip_cache_dir(&app_root);
     let log_path = install_log_path_from_app_root(&app_root);
     let requirements_path = source_path.join("requirements.txt");
     let models_folder = models_folder_for_source(&source_path);
@@ -390,7 +389,6 @@ pub(crate) fn install(
     )?;
     writeln!(output, "  folder: {}", app_root.display())?;
     writeln!(output, "  models path: {}", models_folder.display())?;
-    writeln!(output, "  pip cache: {}", pip_cache.display())?;
 
     if options.dry_run {
         writeln!(output, "  mode: dry-run")?;
@@ -448,14 +446,14 @@ pub(crate) fn install(
         "Installing {} ComfyUI dependency specs.",
         packages.len()
     )?;
-    fs::create_dir_all(&pip_cache)
-        .with_context(|| format!("failed to create {}", pip_cache.display()))?;
     if !packages.is_empty() {
         println!("Installing ComfyUI dependencies...");
         let _ = io::stdout().flush();
-        run_logged_command(
-            &runtime.python,
-            pip_install_args(&pip_cache, &packages),
+        let uv = ensure_uv_binary(paths)
+            .context("failed to acquire uv binary for ComfyUI dependency install")?;
+        run_uv_logged_command(
+            &uv,
+            uv_install_args(&runtime.python, &packages),
             Some(&runtime_env),
             &mut log,
             "install ComfyUI dependencies",
@@ -478,7 +476,7 @@ pub(crate) fn install(
         source_url: COMFYUI_SOURCE_ARCHIVE_URL.to_owned(),
         source_path: source_path.clone(),
         requirements_path: requirements_path.clone(),
-        pip_cache_dir: pip_cache.clone(),
+        pip_cache_dir: None,
         log_path: log_path.clone(),
         torch_version: probe.torch_version.clone(),
         torch_cuda_available: probe.torch_cuda_available,
@@ -1149,7 +1147,7 @@ fn select_runtime(
             runtime_usability_status(&manifest)
         );
     }
-    if manifest.format != "pip" {
+    if manifest.format != "wheel" {
         bail!("ComfyUI installs require a rocm-cli managed Python ROCm install.");
     }
     let python = manifest
@@ -1521,21 +1519,15 @@ fn requirement_package_name(spec: &str) -> Option<String> {
     (end > 0).then(|| trimmed[..end].replace('_', "-").to_ascii_lowercase())
 }
 
-fn pip_install_args(pip_cache: &Path, packages: &[String]) -> Vec<String> {
-    let mut args = vec![
-        "-m".to_owned(),
-        "pip".to_owned(),
-        "install".to_owned(),
-        "--upgrade".to_owned(),
-        "--cache-dir".to_owned(),
-        pip_cache.display().to_string(),
-    ];
+fn uv_install_args(venv_python: &Path, packages: &[String]) -> Vec<String> {
+    let mut args = uv_pip_install_base(venv_python);
+    args.push("--upgrade".to_owned());
     args.extend(packages.iter().cloned());
     args
 }
 
-fn run_logged_command(
-    program: &Path,
+fn run_uv_logged_command(
+    uv: &Path,
     args: Vec<String>,
     runtime_env: Option<&ComfyUiRuntimeEnvironment>,
     log: &mut fs::File,
@@ -1544,24 +1536,27 @@ fn run_logged_command(
     writeln!(
         log,
         "command: {} {}",
-        program.display(),
+        uv.display(),
         args.iter()
             .map(|arg| quote_log_arg(arg))
             .collect::<Vec<_>>()
             .join(" ")
     )?;
-    let mut command = Command::new(program);
+    let mut command = Command::new(uv);
     command
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (key, value) in uv_command_env() {
+        command.env(key, value);
+    }
     if let Some(runtime_env) = runtime_env {
         apply_runtime_environment(&mut command, runtime_env)?;
     }
     let mut child = command
         .spawn()
-        .with_context(|| format!("{context_text}: failed to run {}", program.display()))?;
+        .with_context(|| format!("{context_text}: failed to run {}", uv.display()))?;
     let stdout = child
         .stdout
         .take()
@@ -1582,7 +1577,7 @@ fn run_logged_command(
         thread::spawn(move || stream_logged_output(stderr, stderr_log, OutputTarget::Stderr));
     let status = child
         .wait()
-        .with_context(|| format!("{context_text}: failed waiting for {}", program.display()))?;
+        .with_context(|| format!("{context_text}: failed waiting for {}", uv.display()))?;
     stdout_thread
         .join()
         .map_err(|_| anyhow::anyhow!("{context_text}: stdout reader failed"))?
@@ -1594,8 +1589,9 @@ fn run_logged_command(
     if status.success() {
         return Ok(());
     }
-    bail!("{context_text}: command exited with status {status}")
+    bail!("{context_text}: uv exited with {status}");
 }
+
 
 enum OutputTarget {
     Stdout,
@@ -1872,7 +1868,6 @@ mod tests {
 
         let runtime_app = runtime_app_root(&runtime);
         assert!(rendered.contains(&runtime_app.display().to_string()));
-        assert!(rendered.contains(&runtime_app.join("pip-cache").display().to_string()));
         assert!(!rendered.contains(&app_root(&paths).display().to_string()));
         Ok(())
     }
@@ -1898,7 +1893,7 @@ mod tests {
                 source_url: COMFYUI_SOURCE_ARCHIVE_URL.to_owned(),
                 source_path: source_path(&paths),
                 requirements_path: source_path(&paths).join("requirements.txt"),
-                pip_cache_dir: app_root(&paths).join("pip-cache"),
+                pip_cache_dir: None,
                 log_path: install_log.clone(),
                 torch_version: Some("2.10.0".to_owned()),
                 torch_cuda_available: true,
@@ -2066,7 +2061,7 @@ mod tests {
                 source_url: COMFYUI_SOURCE_ARCHIVE_URL.to_owned(),
                 source_path: source_path(&paths),
                 requirements_path: source_path(&paths).join("requirements.txt"),
-                pip_cache_dir: app_root(&paths).join("pip-cache"),
+                pip_cache_dir: None,
                 log_path: install_log.clone(),
                 torch_version: Some("2.10.0".to_owned()),
                 torch_cuda_available: true,
@@ -2132,7 +2127,7 @@ mod tests {
             runtime_key: "release-pip-gfx120x-all-7-13-0a20260511".to_owned(),
             runtime_id: "therock-release:gfx120X-all".to_owned(),
             channel: "release".to_owned(),
-            format: "pip".to_owned(),
+            format: "wheel".to_owned(),
             family: "gfx120X-all".to_owned(),
             family_source: "test".to_owned(),
             version: "7.13.0a20260511".to_owned(),
@@ -2204,7 +2199,7 @@ mod tests {
             runtime_key: "therock-release-gfx120x-all".to_owned(),
             runtime_id: "therock-release:gfx120X-all".to_owned(),
             channel: "release".to_owned(),
-            format: "pip".to_owned(),
+            format: "wheel".to_owned(),
             family: "gfx120X-all".to_owned(),
             family_source: "test".to_owned(),
             version: "7.13.0a20260511".to_owned(),
@@ -2293,7 +2288,7 @@ mod tests {
             runtime_key: runtime_key.to_owned(),
             runtime_id: "therock-release:gfx120X-all".to_owned(),
             channel: "release".to_owned(),
-            format: "pip".to_owned(),
+            format: "wheel".to_owned(),
             family: "gfx120X-all".to_owned(),
             family_source: "test".to_owned(),
             version: "7.13.0a20260511".to_owned(),

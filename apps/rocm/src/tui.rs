@@ -1075,14 +1075,14 @@ impl InstallSdkChannel {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InstallSdkFormat {
-    Pip,
+    Wheel,
     Tarball,
 }
 
 impl InstallSdkFormat {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Pip => "pip",
+            Self::Wheel => "wheel",
             Self::Tarball => "tarball",
         }
     }
@@ -3071,7 +3071,7 @@ impl App {
             .to_string();
         self.open_install_sdk_form_with(
             InstallSdkChannel::Release,
-            InstallSdkFormat::Pip,
+            InstallSdkFormat::Wheel,
             folder,
             message,
         );
@@ -6717,13 +6717,13 @@ impl App {
             "--channel".to_owned(),
             "release".to_owned(),
             "--format".to_owned(),
-            "pip".to_owned(),
+            "wheel".to_owned(),
         ];
         let venv_path = setup_install_root(&self.paths, &self.config);
         args.push("--prefix".to_owned());
         args.push(venv_path.display().to_string());
         let mut display_command =
-            "/install sdk --channel release --format pip --prefix ".to_owned();
+            "/install sdk --channel release --format wheel --prefix ".to_owned();
         display_command.push_str(&quote_tui_arg(&venv_path.display().to_string()));
         let reason = if title == "Reinstall" {
             "Reinstall ROCm into the selected folder."
@@ -14459,33 +14459,20 @@ fn onboarding_install_current_step(app: &App) -> String {
     if lower.contains("checking therock") || lower.contains("found therock package") {
         "Checking ROCm packages...".to_owned()
     } else if lower.contains("checking python for")
-        || lower.contains("checking managed python package metadata")
-        || lower.contains("checking python package metadata")
         || lower.contains("using python from")
-        || lower.contains("using existing managed python")
         || lower.contains("using existing python")
-        || lower.contains("using downloaded python package")
-        || lower.contains("using downloaded python")
-        || lower.contains("managed python is ready")
-        || lower.contains("python 3.12.10 is ready")
+        || lower.contains("python") && lower.contains("is ready at")
+        || lower.contains("finding python")
+        || lower.contains("preparing python")
     {
         "Checking Python...".to_owned()
-    } else if lower.contains("downloading python package")
-        || lower.contains("downloading python 3.12.10 package")
-    {
-        "Downloading Python...".to_owned()
-    } else if lower.contains("installing managed python")
-        || lower.contains("installing python 3.12.10")
-        || lower.contains("extracting managed python")
-    {
+    } else if lower.contains("installing python") && lower.contains("via uv") {
         "Installing Python...".to_owned()
     } else if lower.contains("creating virtual environment")
         || lower.contains("creating python environment")
         || lower.contains("-m venv")
     {
         "Setting up Python...".to_owned()
-    } else if lower.contains("installing pip") {
-        "Preparing the installer...".to_owned()
     } else if lower.contains("collecting") || lower.contains("looking in indexes") {
         "Finding ROCm and PyTorch packages...".to_owned()
     } else if lower.contains("downloading") {
@@ -15141,7 +15128,7 @@ fn parse_install_sdk_form_args(args: &[&str]) -> Result<InstallSdkFormOptions> {
         bail!("internal error: SDK install parser received a non-SDK command");
     }
     let mut channel = InstallSdkChannel::Release;
-    let mut format = InstallSdkFormat::Pip;
+    let mut format = InstallSdkFormat::Wheel;
     let mut folder = None;
     let mut seen = Vec::new();
     let mut index = 1;
@@ -15167,7 +15154,7 @@ fn parse_install_sdk_form_args(args: &[&str]) -> Result<InstallSdkFormOptions> {
                 }
                 let value = option_argument_value(option_name, inline_value, args, &mut index)?;
                 format = match value.as_str() {
-                    "pip" => InstallSdkFormat::Pip,
+                    "wheel" => InstallSdkFormat::Wheel,
                     "tarball" => InstallSdkFormat::Tarball,
                     _ => bail!("install type must be pip or tarball"),
                 };
@@ -15445,7 +15432,7 @@ fn install_argument_candidates(arg_index: usize, parts: &[String]) -> Vec<String
 fn install_sdk_argument_candidates(arg_index: usize, parts: &[String]) -> Vec<String> {
     match parts.get(arg_index).map(String::as_str) {
         Some("--channel") => return vec!["release".to_owned(), "nightly".to_owned()],
-        Some("--format") => return vec!["pip".to_owned(), "tarball".to_owned()],
+        Some("--format") => return vec!["wheel".to_owned(), "tarball".to_owned()],
         Some("--prefix") => return Vec::new(),
         _ => {}
     }
@@ -15777,7 +15764,7 @@ fn slash_argument_completion_label(
             .is_some_and(|value| value == "--format")
     {
         return match candidate {
-            "pip" => install_sdk_format_label(InstallSdkFormat::Pip).to_owned(),
+            "wheel" => install_sdk_format_label(InstallSdkFormat::Wheel).to_owned(),
             "tarball" => install_sdk_format_label(InstallSdkFormat::Tarball).to_owned(),
             _ => candidate.to_owned(),
         };
@@ -21648,7 +21635,7 @@ fn install_sdk_choice_index(choice: InstallSdkChoice) -> usize {
 
 fn install_sdk_format_label(format: InstallSdkFormat) -> &'static str {
     match format {
-        InstallSdkFormat::Pip => "Recommended Python install",
+        InstallSdkFormat::Wheel => "Recommended Python install",
         InstallSdkFormat::Tarball => "Advanced archive install",
     }
 }
@@ -22772,7 +22759,7 @@ fn help_topic_detail(topic: HelpTopic) -> String {
             "",
             "From a terminal:",
             "  rocm setup reset",
-            "  rocm install sdk --channel release --format pip --prefix D:\\jam\\temp\\therock_venvs",
+            "  rocm install sdk --channel release --format wheel --prefix D:\\jam\\temp\\therock_venvs",
             "  rocm runtimes list",
             "  rocm runtimes activate <runtime_key>",
             "",
@@ -22849,7 +22836,7 @@ fn help_topic_detail(topic: HelpTopic) -> String {
             "  rocm",
             "  rocm doctor",
             "  rocm setup reset",
-            "  rocm install sdk --channel release --format pip --prefix <folder>",
+            "  rocm install sdk --channel release --format wheel --prefix <folder>",
             "  rocm runtimes list",
             "  rocm runtimes activate <runtime_key>",
             "  rocm engine list",
@@ -23608,7 +23595,7 @@ fn install_sdk_detail_text(app: &App) -> String {
     );
     let _ = writeln!(output);
     let _ = writeln!(output, "Choices");
-    if *channel == InstallSdkChannel::Release && *format == InstallSdkFormat::Pip {
+    if *channel == InstallSdkChannel::Release && *format == InstallSdkFormat::Wheel {
         let _ = writeln!(output, "  Using: Recommended Python install");
     } else {
         let _ = writeln!(output, "  Advanced settings from command:");
@@ -25128,7 +25115,7 @@ fn plain_cli_approval_lines_with_gpu(
             }
             if let Some(folder) = cli_arg_value(args, "--prefix") {
                 lines.push(format!("Folder: {folder}"));
-                if cli_arg_value(args, "--format").unwrap_or("pip") == "pip" {
+                if cli_arg_value(args, "--format").unwrap_or("wheel") == "wheel" {
                     lines.push(format!(
                         "Downloaded files: {}",
                         display_runtime_folder_path(&managed_pip_cache_dir(Path::new(folder)))
@@ -28324,7 +28311,7 @@ mod tests {
             app.paths
                 .data_dir
                 .join("runtimes")
-                .join("pip")
+                .join("wheel")
                 .join("release-pip-gfx120x-all-7-14-0"),
         );
 
@@ -28364,7 +28351,7 @@ mod tests {
             .paths
             .data_dir
             .join("runtimes")
-            .join("pip")
+            .join("wheel")
             .join(runtime_key);
         app.config.setup.therock_venv = Some(install_root);
         app.config.save(&app.paths)?;
@@ -30249,7 +30236,7 @@ mod tests {
             .paths
             .data_dir
             .join("runtimes")
-            .join("pip")
+            .join("wheel")
             .join(runtime_key);
         app.config.setup.therock_venv = Some(install_root);
         app.config.active_runtime_key = Some(runtime_key.to_owned());
@@ -30280,7 +30267,7 @@ mod tests {
             .paths
             .data_dir
             .join("runtimes")
-            .join("pip")
+            .join("wheel")
             .join(runtime_key);
         app.config.setup.therock_venv = Some(install_root);
         app.config.active_runtime_key = Some(runtime_key.to_owned());
@@ -30471,7 +30458,7 @@ mod tests {
             .paths
             .data_dir
             .join("runtimes")
-            .join("pip")
+            .join("wheel")
             .join(runtime_key);
 
         assert!(app.handle_command("runtimes"));
@@ -30493,13 +30480,13 @@ mod tests {
             .paths
             .data_dir
             .join("runtimes")
-            .join("pip")
+            .join("wheel")
             .join(old_key);
         let new_root = app
             .paths
             .data_dir
             .join("runtimes")
-            .join("pip")
+            .join("wheel")
             .join(new_key);
 
         assert!(app.handle_command("runtimes"));
@@ -30526,7 +30513,7 @@ mod tests {
             .paths
             .data_dir
             .join("runtimes")
-            .join("pip")
+            .join("wheel")
             .join(runtime_key);
         fs::remove_dir_all(install_root.join("_rocm_sdk_devel"))?;
 
@@ -31094,7 +31081,7 @@ mod tests {
                     "--channel".to_owned(),
                     "release".to_owned(),
                     "--format".to_owned(),
-                    "pip".to_owned(),
+                    "wheel".to_owned(),
                     "--prefix".to_owned(),
                     folder.display().to_string(),
                 ]
@@ -32767,7 +32754,7 @@ mod tests {
             .paths
             .data_dir
             .join("runtimes")
-            .join("pip")
+            .join("wheel")
             .join(runtime_key);
         app.config.onboarding_dismissed = true;
         app.config.setup.completed = true;
@@ -34159,7 +34146,7 @@ mod tests {
                     }]
                 }),
                 "Install ROCm",
-                "rocm install sdk --channel release --format pip --prefix D:\\jam\\temp\\therock_venvs --build-date 2026-06-05",
+                "rocm install sdk --channel release --format wheel --prefix D:\\jam\\temp\\therock_venvs --build-date 2026-06-05",
             ),
             (
                 "install TheRock version 7.13.0a20260605 into D:\\jam\\temp\\therock_venvs",
@@ -34180,7 +34167,7 @@ mod tests {
                     }]
                 }),
                 "Install ROCm",
-                "rocm install sdk --channel release --format pip --prefix D:\\jam\\temp\\therock_venvs --version 7.13.0a20260605",
+                "rocm install sdk --channel release --format wheel --prefix D:\\jam\\temp\\therock_venvs --version 7.13.0a20260605",
             ),
         ] {
             let mut app = test_app();
@@ -34828,9 +34815,9 @@ Full log
                 "--channel".to_owned(),
                 "release".to_owned(),
                 "--format".to_owned(),
-                "pip".to_owned(),
+                "wheel".to_owned(),
             ],
-            Some("rocm install sdk --channel release --format pip".to_owned()),
+            Some("rocm install sdk --channel release --format wheel".to_owned()),
             Some("The assistant thinks ROCm needs to be installed.".to_owned()),
         );
 
@@ -35787,10 +35774,10 @@ Full log
                         "--channel".to_owned(),
                         "release".to_owned(),
                         "--format".to_owned(),
-                        "pip".to_owned(),
+                        "wheel".to_owned(),
                     ],
                     display_command: Some(
-                        "rocm install sdk --channel release --format pip".to_owned(),
+                        "rocm install sdk --channel release --format wheel".to_owned(),
                     ),
                     explanation: Some(
                         "ROCm is missing, so I need to install TheRock before serving models."
@@ -35855,12 +35842,12 @@ Full log
                         "--channel".to_owned(),
                         "release".to_owned(),
                         "--format".to_owned(),
-                        "pip".to_owned(),
+                        "wheel".to_owned(),
                         "--prefix".to_owned(),
                         prefix.display().to_string(),
                     ],
                     display_command: Some(format!(
-                        "rocm install sdk --channel release --format pip --prefix {}",
+                        "rocm install sdk --channel release --format wheel --prefix {}",
                         prefix.display()
                     )),
                     explanation: Some("Install TheRock in the requested folder.".to_owned()),
@@ -35891,7 +35878,7 @@ Full log
                     "--channel".to_owned(),
                     "release".to_owned(),
                     "--format".to_owned(),
-                    "pip".to_owned(),
+                    "wheel".to_owned(),
                     "--prefix".to_owned(),
                     prefix.display().to_string(),
                 ]
@@ -36137,7 +36124,7 @@ Full log
                     "--channel".to_owned(),
                     "release".to_owned(),
                     "--format".to_owned(),
-                    "pip".to_owned(),
+                    "wheel".to_owned(),
                     "--prefix".to_owned(),
                     app.paths.data_dir.join("envs").join("default").display().to_string(),
                 ]
@@ -36394,7 +36381,7 @@ Full log
             .paths
             .data_dir
             .join("runtimes")
-            .join("pip")
+            .join("wheel")
             .join(runtime_key);
         app.config.onboarding_dismissed = true;
         app.config.setup.completed = true;
@@ -36444,7 +36431,7 @@ Full log
             .paths
             .data_dir
             .join("runtimes")
-            .join("pip")
+            .join("wheel")
             .join(runtime_key);
         app.config.setup.therock_venv = Some(install_root);
         app.config.save(&app.paths)?;
@@ -36480,7 +36467,7 @@ Full log
             .paths
             .data_dir
             .join("runtimes")
-            .join("pip")
+            .join("wheel")
             .join(runtime_key);
         let log_path = app
             .paths
@@ -36550,7 +36537,7 @@ Full log
             .paths
             .data_dir
             .join("runtimes")
-            .join("pip")
+            .join("wheel")
             .join(runtime_key);
         fs::remove_dir_all(install_root.join("_rocm_sdk_devel"))?;
         app.config.setup.therock_venv = Some(install_root.clone());
@@ -36582,7 +36569,7 @@ Full log
                     "--channel".to_owned(),
                     "release".to_owned(),
                     "--format".to_owned(),
-                    "pip".to_owned(),
+                    "wheel".to_owned(),
                     "--prefix".to_owned(),
                     install_root.display().to_string(),
                 ]
@@ -36602,7 +36589,7 @@ Full log
             .paths
             .data_dir
             .join("runtimes")
-            .join("pip")
+            .join("wheel")
             .join(runtime_key);
         app.config.setup.therock_venv = Some(install_root.clone());
         app.config.save(&app.paths)?;
@@ -36625,7 +36612,7 @@ Full log
                     "--channel".to_owned(),
                     "release".to_owned(),
                     "--format".to_owned(),
-                    "pip".to_owned(),
+                    "wheel".to_owned(),
                     "--prefix".to_owned(),
                     install_root.display().to_string(),
                 ]
@@ -36652,7 +36639,7 @@ Full log
             .paths
             .data_dir
             .join("runtimes")
-            .join("pip")
+            .join("wheel")
             .join(runtime_key);
         app.config.setup.therock_venv = Some(install_root);
         app.config.active_runtime_key = Some(runtime_key.to_owned());
@@ -36699,7 +36686,7 @@ Full log
             .paths
             .data_dir
             .join("runtimes")
-            .join("pip")
+            .join("wheel")
             .join(runtime_key);
         let registry_path = app
             .paths
@@ -36754,7 +36741,7 @@ Full log
             .paths
             .data_dir
             .join("runtimes")
-            .join("pip")
+            .join("wheel")
             .join(runtime_key);
         app.config.setup.therock_venv = Some(install_root.clone());
         app.config.save(&app.paths)?;
@@ -36832,7 +36819,7 @@ Full log
                     "--channel".to_owned(),
                     "release".to_owned(),
                     "--format".to_owned(),
-                    "pip".to_owned(),
+                    "wheel".to_owned(),
                     "--prefix".to_owned(),
                     install_root.display().to_string(),
                     "--family".to_owned(),
@@ -36945,12 +36932,12 @@ Full log
                 "--channel".to_owned(),
                 "release".to_owned(),
                 "--format".to_owned(),
-                "pip".to_owned(),
+                "wheel".to_owned(),
                 "--prefix".to_owned(),
                 folder.to_owned(),
             ],
             Some(format!(
-                "/install sdk --channel release --format pip --prefix {folder}"
+                "/install sdk --channel release --format wheel --prefix {folder}"
             )),
             Some("Install ROCm/TheRock into the folder the user selected.".to_owned()),
         );
@@ -36989,7 +36976,7 @@ Full log
                 "--channel".to_owned(),
                 "release".to_owned(),
                 "--format".to_owned(),
-                "pip".to_owned(),
+                "wheel".to_owned(),
                 "--prefix".to_owned(),
                 folder.to_owned(),
             ],
@@ -37744,31 +37731,20 @@ Full log
                 "Checking Python for the ROCm install...",
                 "Checking Python...",
             ),
-            ("Checking Python package metadata...", "Checking Python..."),
+            ("Preparing Python 3.12...", "Checking Python..."),
             (
-                "Using existing Python 3.12.10 at C:\\Users\\jam\\.rocm\\tools\\python\\python.exe.",
+                "Using existing Python 3.12 at C:\\Users\\jam\\.rocm\\tools\\python\\python.exe.",
                 "Checking Python...",
             ),
             (
-                "Using downloaded Python 3.12.10 package C:\\Users\\jam\\.rocm\\cache\\tools\\python\\cpython.tar.gz.",
+                "Python 3.12 is ready at C:\\Users\\jam\\.rocm\\tools\\python\\python.exe.",
                 "Checking Python...",
             ),
-            (
-                "Python 3.12.10 is ready at C:\\Users\\jam\\.rocm\\tools\\python\\python.exe.",
-                "Checking Python...",
-            ),
-            (
-                "Downloading Python 3.12.10 package cpython-3.12.10.tar.gz.",
-                "Downloading Python...",
-            ),
-            ("Installing Python 3.12.10...", "Installing Python..."),
+            ("Finding Python 3.12...", "Checking Python..."),
+            ("Installing Python 3.12 via uv...", "Installing Python..."),
             (
                 "Creating Python environment at C:\\Users\\jam\\.rocm\\envs\\default.",
                 "Setting up Python...",
-            ),
-            (
-                "Installing pip in the Python environment...",
-                "Preparing the installer...",
             ),
             (
                 "Installing rocm[libraries,devel]==7.13.0a20260513 torch==2.10.0+rocm7.13.0a20260513 torchvision==0.25.0+rocm7.13.0a20260513 torchaudio==2.10.0+rocm7.13.0a20260513 from https://rocm.nightlies.amd.com/v2/gfx120X-all",
@@ -38457,7 +38433,7 @@ Full log
         let install_root = paths
             .data_dir
             .join("runtimes")
-            .join("pip")
+            .join("wheel")
             .join(runtime_key);
         let local_manifest_path = install_root.join(".rocm-cli-runtime.json");
         let mut manifest: Value = serde_json::from_slice(&fs::read(&local_manifest_path)?)?;
@@ -38487,7 +38463,7 @@ Full log
         let install_root = paths
             .data_dir
             .join("runtimes")
-            .join("pip")
+            .join("wheel")
             .join(runtime_key);
         let scripts_dir = install_root.join(if cfg!(windows) { "Scripts" } else { "bin" });
         fs::create_dir_all(&scripts_dir)?;
@@ -38898,12 +38874,12 @@ Full log
             !menu
                 .items
                 .iter()
-                .any(|item| item == "pip" || item == "tarball")
+                .any(|item| item == "wheel" || item == "tarball")
         );
         assert_eq!(
             menu.replacements,
             vec![
-                Some("/install sdk --format pip ".to_owned()),
+                Some("/install sdk --format wheel ".to_owned()),
                 Some("/install sdk --format tarball ".to_owned()),
             ]
         );
@@ -40240,7 +40216,7 @@ Full log
             "--channel".to_owned(),
             "release".to_owned(),
             "--format".to_owned(),
-            "pip".to_owned(),
+            "wheel".to_owned(),
         ]);
 
         let rendered = render_test_terminal(&app, 120, 32);
@@ -40454,7 +40430,7 @@ Full log
             "--channel".to_owned(),
             "release".to_owned(),
             "--format".to_owned(),
-            "pip".to_owned(),
+            "wheel".to_owned(),
         ]);
 
         handle_key(&mut app, key_event(KeyCode::Char('d'), KeyModifiers::NONE));
@@ -41279,7 +41255,7 @@ Full log
             .paths
             .data_dir
             .join("runtimes")
-            .join("pip")
+            .join("wheel")
             .join(runtime_key);
         app.config.setup.therock_venv = Some(install_root);
         app.config.save(&app.paths)?;
@@ -42128,7 +42104,7 @@ Full log
             "--channel",
             "release",
             "--format",
-            "pip",
+            "wheel",
             "--prefix",
             folder_text.as_str(),
         ]);
@@ -44652,7 +44628,7 @@ Full log
         let install_root = paths
             .data_dir
             .join("runtimes")
-            .join("pip")
+            .join("wheel")
             .join(runtime_key);
         let scripts_dir = install_root.join(if cfg!(windows) { "Scripts" } else { "bin" });
         let python_executable = scripts_dir.join(if cfg!(windows) {
@@ -44694,7 +44670,7 @@ Full log
                 ]
             },
             "channel": "release",
-            "format": "pip",
+            "format": "wheel",
             "family": runtime_id.split(':').next_back().unwrap_or("gfx120X-all"),
             "family_source": "test",
             "version": "6.4.0",

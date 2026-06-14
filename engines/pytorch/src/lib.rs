@@ -2,10 +2,11 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use rocm_core::{
     AppPaths, DEFAULT_LOCAL_PORT, ModelRecipeRecord, detect_host_therock_family,
-    extract_first_gfx_token, format_host_port, format_http_base_url, interactive_terminal,
-    normalize_runtime_path_for_host, normalize_runtime_path_text_for_host,
+    ensure_uv_binary, extract_first_gfx_token, format_host_port, format_http_base_url,
+    interactive_terminal, normalize_runtime_path_for_host, normalize_runtime_path_text_for_host,
     normalize_therock_family, require_nonempty,
-    resolve_model_recipe as resolve_shared_model_recipe, runtime_is_windows, unix_time_millis,
+    resolve_model_recipe as resolve_shared_model_recipe, runtime_is_windows, uv_command_env,
+    uv_pip_freeze_args, uv_pip_install_base, uv_venv_args, unix_time_millis,
 };
 use rocm_engine_protocol::{
     DetectRequest, DetectResponse, DevicePolicy, ENGINE_RECIPE_CONTRACT_VERSION, EndpointRequest,
@@ -30,8 +31,6 @@ const ENGINE_NAME: &str = "pytorch";
 const DEFAULT_RUNTIME_ID: &str = "therock-release";
 const THEROCK_SIMPLE_INDEX_BASE: &str = "https://rocm.nightlies.amd.com/v2";
 const PYTHON_WORKER_SOURCE: &str = include_str!("python_worker.py");
-const DEFAULT_PIP_TIMEOUT_SECS: u64 = 600;
-const DEFAULT_PIP_RETRIES: u32 = 8;
 const ENGINE_DEPENDENCIES: &[&str] = &[
     "fastapi",
     "uvicorn",
@@ -1335,9 +1334,6 @@ fn create_or_update_env_manifest(request: &InstallRequest) -> Result<EngineEnvMa
     fs::create_dir_all(&engine_envs_dir)?;
     fs::create_dir_all(paths.engine_locks_dir(ENGINE_NAME))?;
     fs::create_dir_all(paths.engine_manifests_dir(ENGINE_NAME))?;
-    let pip_cache_dir = pip_cache_dir(&paths, ENGINE_NAME);
-    fs::create_dir_all(&pip_cache_dir)
-        .with_context(|| format!("failed to create {}", pip_cache_dir.display()))?;
 
     let runtime_python_executable = if request.python_version.is_none() {
         runtime_python_executable_for_selector(&paths, &request.runtime_id)?
@@ -1382,31 +1378,27 @@ fn create_or_update_env_manifest(request: &InstallRequest) -> Result<EngineEnvMa
         effective_python_version.as_deref(),
         runtime_python_executable.as_deref(),
     )?;
-    let env_path_string = env_path.to_string_lossy().to_string();
-    run_command(
-        &launcher.program,
-        launcher
-            .args
-            .iter()
-            .map(String::as_str)
-            .chain(["-m", "venv", env_path_string.as_str()]),
+    let uv = ensure_uv_binary(&paths)?;
+    let launcher_path = PathBuf::from(&launcher.program);
+    let venv_args = uv_venv_args(&launcher_path, &env_path);
+    run_uv_command(
+        &uv,
+        venv_args.iter().map(String::as_str),
         "create managed pytorch venv",
     )?;
 
     let python_executable = venv_python_path(&env_path);
-    let python_executable_string = python_executable.to_string_lossy().to_string();
-    ensure_pip_available(&python_executable_string)?;
-    let engine_dependency_pip_args = pip_install_network_args(&paths);
-    run_progress_command(
-        &python_executable_string,
-        std::iter::once("-m")
-            .chain(std::iter::once("pip"))
-            .chain(std::iter::once("install"))
-            .chain(engine_dependency_pip_args.iter().map(String::as_str))
-            .chain(ENGINE_DEPENDENCIES.iter().copied()),
+
+    let mut engine_dep_args = uv_pip_install_base(&python_executable);
+    engine_dep_args.extend(["--only-binary".to_owned(), ":all:".to_owned()]);
+    engine_dep_args.extend(ENGINE_DEPENDENCIES.iter().map(|s| s.to_string()));
+    run_uv_progress_command(
+        &uv,
+        engine_dep_args.iter().map(String::as_str),
         "install managed pytorch engine dependencies",
     )?;
 
+    let python_executable_string = python_executable.to_string_lossy().to_string();
     let mut warnings = Vec::new();
     let mut therock_channel = None;
     let mut therock_family = None;
@@ -1415,26 +1407,25 @@ fn create_or_update_env_manifest(request: &InstallRequest) -> Result<EngineEnvMa
     let maybe_torch_spec = std::env::var("ROCM_CLI_PYTORCH_PACKAGE_SPEC").ok();
     let maybe_extra_index = std::env::var("ROCM_CLI_PYTORCH_EXTRA_INDEX_URL").ok();
     if let Some(torch_spec) = maybe_torch_spec.as_deref() {
-        let mut args = vec!["-m".to_owned(), "pip".to_owned(), "install".to_owned()];
-        args.extend(pip_install_network_args(&paths));
+        let mut args = uv_pip_install_base(&python_executable);
+        args.push("--only-binary".to_owned());
+        args.push(":all:".to_owned());
         if let Some(extra_index) = maybe_extra_index.as_deref() {
             args.push("--extra-index-url".to_owned());
             args.push(extra_index.to_owned());
         }
         args.push(torch_spec.to_owned());
-        run_progress_command(
-            &python_executable_string,
+        run_uv_progress_command(
+            &uv,
             args.iter().map(String::as_str),
             "install torch package into managed pytorch env",
         )?;
-        let stack_pip_args = pip_install_network_args(&paths);
-        run_progress_command(
-            &python_executable_string,
-            std::iter::once("-m")
-                .chain(std::iter::once("pip"))
-                .chain(std::iter::once("install"))
-                .chain(stack_pip_args.iter().map(String::as_str))
-                .chain(TORCH_STACK_DEPENDENCIES.iter().copied()),
+        let mut stack_args = uv_pip_install_base(&python_executable);
+        stack_args.extend(["--only-binary".to_owned(), ":all:".to_owned()]);
+        stack_args.extend(TORCH_STACK_DEPENDENCIES.iter().map(|s| s.to_string()));
+        run_uv_progress_command(
+            &uv,
+            stack_args.iter().map(String::as_str),
             "install pytorch engine runtime dependencies",
         )?;
         warnings.push(
@@ -1443,15 +1434,13 @@ fn create_or_update_env_manifest(request: &InstallRequest) -> Result<EngineEnvMa
     } else {
         match therock_resolution {
             Some(resolution) => {
-                install_therock_torch_packages(&python_executable_string, &resolution, &paths)?;
-                let stack_pip_args = pip_install_network_args(&paths);
-                run_progress_command(
-                    &python_executable_string,
-                    std::iter::once("-m")
-                        .chain(std::iter::once("pip"))
-                        .chain(std::iter::once("install"))
-                        .chain(stack_pip_args.iter().map(String::as_str))
-                        .chain(TORCH_STACK_DEPENDENCIES.iter().copied()),
+                install_therock_torch_packages(&uv, &python_executable, &resolution)?;
+                let mut stack_args = uv_pip_install_base(&python_executable);
+                stack_args.extend(["--only-binary".to_owned(), ":all:".to_owned()]);
+                stack_args.extend(TORCH_STACK_DEPENDENCIES.iter().map(|s| s.to_string()));
+                run_uv_progress_command(
+                    &uv,
+                    stack_args.iter().map(String::as_str),
                     "install pytorch engine runtime dependencies",
                 )?;
                 therock_channel = Some(resolution.channel.as_str().to_owned());
@@ -1475,9 +1464,10 @@ fn create_or_update_env_manifest(request: &InstallRequest) -> Result<EngineEnvMa
         installed_package_specs_from_runtime_metadata(&python_executable_string)
             .context("capture managed pytorch env lockfile from package metadata")?
     } else {
-        let freeze = capture_command(
-            &python_executable_string,
-            ["-m", "pip", "freeze"],
+        let freeze_args = uv_pip_freeze_args(&python_executable);
+        let freeze = capture_uv_command(
+            &uv,
+            freeze_args.iter().map(String::as_str),
             "capture managed pytorch env lockfile",
         )?;
         freeze
@@ -1554,7 +1544,7 @@ fn create_or_update_env_manifest(request: &InstallRequest) -> Result<EngineEnvMa
         lock_path,
         installed_packages,
         lock_hash,
-        pip_cache_dir: Some(pip_cache_dir),
+        pip_cache_dir: None,
         therock_channel,
         therock_family,
         therock_index_url,
@@ -1710,7 +1700,7 @@ fn runtime_python_executable_for_selector(
     let Some(manifest) = load_runtime_registry_manifest(paths, selector)? else {
         return Ok(None);
     };
-    if manifest.format != "pip" {
+    if manifest.format != "wheel" {
         return Ok(None);
     }
     Ok(manifest.python_executable)
@@ -2316,7 +2306,7 @@ fn resolve_therock_torch_resolution(
     let runtime_request = parse_therock_runtime_request(runtime_id);
 
     if let Some(manifest) = load_runtime_registry_manifest(paths, runtime_id)? {
-        if manifest.format != "pip" {
+        if manifest.format != "wheel" {
             return Ok(None);
         }
         let family = normalize_therock_family(&manifest.family)
@@ -2631,22 +2621,19 @@ fn parse_torch_package_version_specs(output: &str) -> Result<Vec<String>> {
 }
 
 fn install_therock_torch_packages(
-    python_executable: &str,
+    uv: &Path,
+    python_executable: &Path,
     resolution: &TheRockTorchResolution,
-    paths: &AppPaths,
 ) -> Result<()> {
-    let mut args = vec!["-m".to_owned(), "pip".to_owned(), "install".to_owned()];
-    args.extend(pip_install_network_args_allow_source(paths));
+    let mut args = uv_pip_install_base(python_executable);
     args.push("--index-url".to_owned());
     args.push(resolution.index_url.clone());
-    args.push("--upgrade-strategy".to_owned());
-    args.push("only-if-needed".to_owned());
     if matches!(resolution.channel, TheRockChannel::Nightly) {
-        args.push("--pre".to_owned());
+        args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
     }
     args.extend(resolution.packages.iter().cloned());
-    run_progress_command(
-        python_executable,
+    run_uv_progress_command(
+        uv,
         args.iter().map(String::as_str),
         "install TheRock torch packages into managed pytorch env",
     )
@@ -2789,77 +2776,66 @@ except Exception as exc:
     }))
 "#;
 
-fn ensure_pip_available(python_executable: &str) -> Result<()> {
-    if command_succeeds(python_executable, ["-m", "pip", "--version"])? {
+fn run_uv_command<'a, I>(uv: &Path, args: I, context_text: &str) -> Result<()>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let args: Vec<_> = args.into_iter().collect();
+    let output = Command::new(uv)
+        .args(&args)
+        .envs(uv_command_env())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("failed to launch uv for {context_text}"))?;
+    if output.status.success() {
         return Ok(());
     }
-
-    run_command(
-        python_executable,
-        ["-m", "ensurepip", "--upgrade"],
-        "bootstrap pip in managed pytorch env",
-    )?;
-    run_command(
-        python_executable,
-        ["-m", "pip", "--version"],
-        "verify pip in managed pytorch env",
-    )
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    bail!("{context_text}: uv exited with {}: {stderr}", output.status)
 }
 
-fn pip_timeout_secs() -> u64 {
-    std::env::var("ROCM_CLI_PIP_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_PIP_TIMEOUT_SECS)
+fn run_uv_progress_command<'a, I>(uv: &Path, args: I, context_text: &str) -> Result<()>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let args: Vec<_> = args.into_iter().collect();
+    let status = Command::new(uv)
+        .args(&args)
+        .envs(uv_command_env())
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .with_context(|| format!("failed to launch uv for {context_text}"))?;
+    if status.success() {
+        return Ok(());
+    }
+    bail!("{context_text}: uv exited with {status}")
 }
 
-fn pip_retries() -> u32 {
-    std::env::var("ROCM_CLI_PIP_RETRIES")
-        .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        .unwrap_or(DEFAULT_PIP_RETRIES)
+fn capture_uv_command<'a, I>(uv: &Path, args: I, context_text: &str) -> Result<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let args: Vec<_> = args.into_iter().collect();
+    let output = Command::new(uv)
+        .args(&args)
+        .envs(uv_command_env())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .with_context(|| format!("failed to launch uv for {context_text}"))?;
+    if output.status.success() {
+        return String::from_utf8(output.stdout)
+            .context("uv output was not valid UTF-8");
+    }
+    bail!("{context_text}: uv exited with {}", output.status)
 }
 
-fn pip_install_network_args(paths: &AppPaths) -> Vec<String> {
-    let mut args = vec![
-        "--timeout".to_owned(),
-        pip_timeout_secs().to_string(),
-        "--retries".to_owned(),
-        pip_retries().to_string(),
-        "--only-binary".to_owned(),
-        ":all:".to_owned(),
-        "--disable-pip-version-check".to_owned(),
-        "--progress-bar".to_owned(),
-        "on".to_owned(),
-    ];
-    args.push("--cache-dir".to_owned());
-    args.push(pip_cache_dir(paths, ENGINE_NAME).display().to_string());
-    args
-}
-
-fn pip_install_network_args_allow_source(paths: &AppPaths) -> Vec<String> {
-    let mut args = vec![
-        "--timeout".to_owned(),
-        pip_timeout_secs().to_string(),
-        "--retries".to_owned(),
-        pip_retries().to_string(),
-        "--disable-pip-version-check".to_owned(),
-        "--progress-bar".to_owned(),
-        "on".to_owned(),
-    ];
-    args.push("--cache-dir".to_owned());
-    args.push(pip_cache_dir(paths, ENGINE_NAME).display().to_string());
-    args
-}
-
-fn pip_cache_dir(paths: &AppPaths, component: &str) -> PathBuf {
-    std::env::var_os("ROCM_CLI_PIP_CACHE_DIR")
-        .filter(|value| !value.as_os_str().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| paths.cache_dir.join("pip").join(component))
-}
-
+#[allow(dead_code)]
 fn command_succeeds<'a, I>(program: &str, args: I) -> Result<bool>
 where
     I: IntoIterator<Item = &'a str>,
@@ -2999,6 +2975,7 @@ fn flag_arg(flag: &str, enabled: bool) -> Vec<String> {
     }
 }
 
+#[allow(dead_code)]
 fn run_command<'a, I>(program: &str, args: I, context_label: &str) -> Result<()>
 where
     I: IntoIterator<Item = &'a str>,
@@ -3017,6 +2994,7 @@ where
     }
 }
 
+#[allow(dead_code)]
 fn run_progress_command<'a, I>(program: &str, args: I, context_label: &str) -> Result<()>
 where
     I: IntoIterator<Item = &'a str>,
@@ -3041,10 +3019,12 @@ where
     run_command(program, args.iter().map(String::as_str), context_label)
 }
 
+#[allow(dead_code)]
 fn engine_progress_stderr_enabled() -> bool {
     env_value_truthy(std::env::var("ROCM_ENGINE_PROGRESS_STDERR").ok().as_deref())
 }
 
+#[allow(dead_code)]
 fn env_value_truthy(value: Option<&str>) -> bool {
     matches!(
         value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
@@ -3052,6 +3032,7 @@ fn env_value_truthy(value: Option<&str>) -> bool {
     )
 }
 
+#[allow(dead_code)]
 fn run_progress_command_forwarded(
     program: &str,
     args: &[String],
@@ -3093,6 +3074,7 @@ fn run_progress_command_forwarded(
     );
 }
 
+#[allow(dead_code)]
 fn forward_child_output_to_stderr<R>(mut reader: R) -> thread::JoinHandle<Vec<u8>>
 where
     R: Read + Send + 'static,
@@ -3621,40 +3603,12 @@ mod tests {
     }
 
     #[test]
-    fn pip_install_network_args_are_wheel_only() {
-        let paths = AppPaths {
-            config_dir: PathBuf::from("config"),
-            data_dir: PathBuf::from("data"),
-            cache_dir: PathBuf::from("cache"),
-        };
-        let args = pip_install_network_args(&paths);
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--only-binary", ":all:"])
-        );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair[0] == "--cache-dir" && pair[1].contains("pytorch"))
-        );
-    }
-
-    #[test]
-    fn therock_pip_args_allow_rocm_source_package() {
-        let paths = AppPaths {
-            config_dir: PathBuf::from("config"),
-            data_dir: PathBuf::from("data"),
-            cache_dir: PathBuf::from("cache"),
-        };
-        let args = pip_install_network_args_allow_source(&paths);
-        assert!(
-            !args
-                .windows(2)
-                .any(|pair| pair == ["--only-binary", ":all:"])
-        );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair[0] == "--cache-dir" && pair[1].contains("pytorch"))
-        );
+    fn uv_install_base_targets_venv_python() {
+        let python = PathBuf::from("/envs/pytorch/bin/python");
+        let args = uv_pip_install_base(&python);
+        assert_eq!(args[0], "pip");
+        assert_eq!(args[1], "install");
+        assert!(args.windows(2).any(|pair| pair == ["--python", "/envs/pytorch/bin/python"]));
     }
 
     #[test]
