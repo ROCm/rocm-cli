@@ -25,7 +25,7 @@ use crate::ui::modal::{centered_rect, draw_popup_frame};
 use crate::ui::theme::Theme;
 
 /// Package formats — mirrors `apps/rocm` `InstallFormat` (clap value-enum).
-pub const FORMATS: &[&str] = &["pip", "tarball"];
+pub const FORMATS: &[&str] = &["wheel", "tarball"];
 
 /// Default install channel (mirrors the `rocm install sdk --channel` default).
 const DEFAULT_CHANNEL: &str = "release";
@@ -438,11 +438,11 @@ mod tests {
     }
 
     #[test]
-    fn default_is_dry_run_release_pip() {
+    fn default_is_dry_run_release_wheel() {
         let i = InstallManagerState::default();
         assert!(i.dry_run);
         assert_eq!(i.channel, "release");
-        assert_eq!(FORMATS[i.format_idx], "pip");
+        assert_eq!(FORMATS[i.format_idx], "wheel");
     }
 
     #[test]
@@ -457,7 +457,7 @@ mod tests {
                 "--channel",
                 "release",
                 "--format",
-                "pip",
+                "wheel",
                 "--dry-run"
             ]
         );

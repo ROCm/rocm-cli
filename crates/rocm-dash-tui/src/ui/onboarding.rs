@@ -5,7 +5,7 @@
 //! runtime two ways —
 //!
 //! - **Install ROCm SDK** — a one-shot gated `rocm install sdk --channel release
-//!   --format pip`.
+//!   --format wheel`.
 //! - **Adopt existing folder** — pick an existing ROCm env with the Wave-0
 //!   [`FolderBrowser`], then approve `rocm runtimes adopt`.
 //!
@@ -238,7 +238,7 @@ fn activate_choice(o: &mut OnboardingState) -> Vec<SideEffect> {
                 "--channel".to_string(),
                 "release".to_string(),
                 "--format".to_string(),
-                "pip".to_string(),
+                "wheel".to_string(),
             ];
             stage_approval(o, OnboardingChoice::InstallSdk, args);
         }
@@ -443,7 +443,14 @@ mod tests {
         assert_eq!(pending.choice, OnboardingChoice::InstallSdk);
         assert_eq!(
             pending.args,
-            vec!["install", "sdk", "--channel", "release", "--format", "pip"]
+            vec![
+                "install",
+                "sdk",
+                "--channel",
+                "release",
+                "--format",
+                "wheel"
+            ]
         );
         assert!(jobs.jobs.is_empty());
         // Approve → spawns.
