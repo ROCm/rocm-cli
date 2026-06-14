@@ -16971,15 +16971,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         (_, KeyCode::F(5)) => {
             app.refresh_status();
         }
-        (_, KeyCode::Tab) => {
-            if !app.cycle_completion(CompletionDirection::Next) {
-                app.status = "No completion menu available.".to_owned();
-            }
+        (_, KeyCode::Tab) if !app.cycle_completion(CompletionDirection::Next) => {
+            app.status = "No completion menu available.".to_owned();
         }
-        (_, KeyCode::BackTab) => {
-            if !app.cycle_completion(CompletionDirection::Previous) {
-                app.status = "No completion menu available.".to_owned();
-            }
+        (_, KeyCode::BackTab) if !app.cycle_completion(CompletionDirection::Previous) => {
+            app.status = "No completion menu available.".to_owned();
         }
         (_, KeyCode::Char('y' | 'Y')) if app.pending_approval.is_some() && app.input.is_empty() => {
             app.approve_focused_action();
@@ -17024,15 +17020,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         }
         (_, KeyCode::Left) => app.move_input_left(),
         (_, KeyCode::Right) => app.move_input_right(),
-        (_, KeyCode::Up) => {
-            if !app.cycle_completion(CompletionDirection::Previous) {
-                app.previous_history();
-            }
+        (_, KeyCode::Up) if !app.cycle_completion(CompletionDirection::Previous) => {
+            app.previous_history();
         }
-        (_, KeyCode::Down) => {
-            if !app.cycle_completion(CompletionDirection::Next) {
-                app.next_history();
-            }
+        (_, KeyCode::Down) if !app.cycle_completion(CompletionDirection::Next) => {
+            app.next_history();
         }
         (_, KeyCode::PageUp) => {
             app.scroll_up(10);

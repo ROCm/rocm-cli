@@ -161,10 +161,7 @@ pub fn ensure_uv_binary(paths: &AppPaths) -> Result<PathBuf> {
         )
     })?;
     if !uv_binary_is_usable(&binary) {
-        bail!(
-            "downloaded uv at {} is not runnable",
-            binary.display()
-        );
+        bail!("downloaded uv at {} is not runnable", binary.display());
     }
 
     let manifest = ManagedUvManifest {
@@ -207,7 +204,11 @@ fn uv_asset_name() -> Result<String> {
         ("macos", "aarch64") => "aarch64-apple-darwin",
         (os, arch) => bail!("unsupported platform for uv download: {os}/{arch}"),
     };
-    let extension = if runtime_is_windows() { "zip" } else { "tar.gz" };
+    let extension = if runtime_is_windows() {
+        "zip"
+    } else {
+        "tar.gz"
+    };
     Ok(format!("uv-{triple}.{extension}"))
 }
 
@@ -250,8 +251,7 @@ fn find_binary_in(dir: &Path, name: &str) -> Option<PathBuf> {
             && let Some(found) = find_binary_in(&path, name)
         {
             return Some(found);
-        } else if path.is_file()
-            && path.file_name().and_then(|value| value.to_str()) == Some(name)
+        } else if path.is_file() && path.file_name().and_then(|value| value.to_str()) == Some(name)
         {
             return Some(path);
         }
@@ -322,7 +322,10 @@ mod tests {
     fn asset_name_has_archive_extension() {
         // Whatever the host, the asset is one of the two known archive kinds.
         let asset = uv_asset_name().expect("supported host platform for tests");
-        assert!(asset.ends_with(".tar.gz") || asset.ends_with(".zip"), "{asset}");
+        assert!(
+            asset.ends_with(".tar.gz") || asset.ends_with(".zip"),
+            "{asset}"
+        );
         assert!(asset.starts_with("uv-"), "{asset}");
     }
 
@@ -345,7 +348,10 @@ mod tests {
     #[test]
     fn venv_args_target_python_and_root() {
         let args = uv_venv_args(Path::new("/py/bin/python3"), Path::new("/envs/run"));
-        assert_eq!(args, vec!["venv", "--python", "/py/bin/python3", "/envs/run"]);
+        assert_eq!(
+            args,
+            vec!["venv", "--python", "/py/bin/python3", "/envs/run"]
+        );
     }
 
     #[test]
