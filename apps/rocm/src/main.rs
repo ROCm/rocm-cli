@@ -14118,6 +14118,7 @@ fn treat_as_natural_language(args: &[String]) -> bool {
         "config",
         "logs",
         "daemon",
+        "dash",
         "uninstall",
         "help",
         "--help",
