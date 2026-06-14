@@ -2,12 +2,15 @@
 //! forwards everything (including connect/disconnect transitions) to the app loop
 //! via an mpsc channel.
 
+// On Windows the connection is a #[cfg(unix)] stub, so the unix-socket imports
+// below are only used on unix; silence the resulting unused-import noise there.
+#![cfg_attr(windows, allow(unused_imports))]
+
 use std::path::PathBuf;
 
 use anyhow::{Context, anyhow};
 use rocm_dash_core::protocol::{Command, Event, PROTOCOL_VERSION};
 use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{info, warn};
 
@@ -75,7 +78,10 @@ pub fn spawn(connect: String, tx: UnboundedSender<ClientMsg>) {
     });
 }
 
+#[cfg(unix)]
 async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyhow::Result<()> {
+    use tokio::net::UnixStream;
+
     let (scheme, target) = connect
         .split_once(':')
         .ok_or_else(|| anyhow!("connect must be `unix:/path/to.sock`"))?;
@@ -138,4 +144,12 @@ async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyho
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+async fn connect_and_run(connect: &str, _tx: UnboundedSender<ClientMsg>) -> anyhow::Result<()> {
+    Err(anyhow!(
+        "rocm-dash TUI requires Unix domain sockets; not supported on Windows yet (connect={})",
+        connect
+    ))
 }

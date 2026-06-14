@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 
 /// Drive a real long-running command through the bridge, stream a few lines,
 /// then cancel it. The job must end `Cancelled` with output captured.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn long_job_streams_then_cancels() {
     let (tx, mut rx) = mpsc::unbounded_channel::<StateEvent>();
@@ -97,6 +98,7 @@ async fn missing_binary_fails_cleanly() {
 
 /// A short command that exits on its own reaches `Done { code: 0 }` and all of
 /// its output is drained before completion is reported.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn short_job_completes_with_all_output() {
     let (tx, mut rx) = mpsc::unbounded_channel::<StateEvent>();

@@ -29,6 +29,9 @@ use crate::therock;
 /// `services_dir` is the load-bearing wire: pointing it at
 /// [`AppPaths::services_dir`] makes the daemon discover managed services written
 /// by `rocm serve --managed` and surface their `gen_tps` in the dashboard.
+// Used by the #[cfg(unix)] embedded-daemon path and by tests; on Windows the
+// non-test build never calls it (the daemon is unix-only), so allow dead_code there.
+#[cfg_attr(windows, allow(dead_code))]
 pub fn runner_options(
     config: &RocmCliConfig,
     paths: &AppPaths,
@@ -201,25 +204,33 @@ async fn maybe_spawn_embedded_daemon(
     config: &RocmCliConfig,
     paths: &AppPaths,
 ) -> Option<(tokio::task::JoinHandle<()>, Option<PathBuf>)> {
-    // Only auto-manage a LOCAL unix-socket daemon.
-    let target = connect.strip_prefix("unix:")?;
-    if tokio::net::UnixStream::connect(target).await.is_ok() {
-        return None; // a daemon already answers here
-    }
-
-    let opts = runner_options(config, paths, false);
-    let listen = connect.to_string();
-    let socket = Some(PathBuf::from(target));
-    let token = config.dashboard.daemon.token.clone();
-
-    let handle = tokio::spawn(async move {
-        if let Err(e) = rocm_dash_daemon::server::run(&listen, token.as_deref(), opts).await {
-            eprintln!("rocm: embedded telemetry daemon exited: {e:#}");
+    #[cfg(unix)]
+    {
+        // Only auto-manage a LOCAL unix-socket daemon.
+        let target = connect.strip_prefix("unix:")?;
+        if tokio::net::UnixStream::connect(target).await.is_ok() {
+            return None; // a daemon already answers here
         }
-    });
-    // Give it a moment to bind before the TUI client dials in.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    Some((handle, socket))
+
+        let opts = runner_options(config, paths, false);
+        let listen = connect.to_string();
+        let socket = Some(PathBuf::from(target));
+        let token = config.dashboard.daemon.token.clone();
+
+        let handle = tokio::spawn(async move {
+            if let Err(e) = rocm_dash_daemon::server::run(&listen, token.as_deref(), opts).await {
+                eprintln!("rocm: embedded telemetry daemon exited: {e:#}");
+            }
+        });
+        // Give it a moment to bind before the TUI client dials in.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        Some((handle, socket))
+    }
+    #[cfg(windows)]
+    {
+        let _ = (connect, config, paths);
+        None
+    }
 }
 
 #[cfg(test)]

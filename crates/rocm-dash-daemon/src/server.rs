@@ -1,12 +1,15 @@
 //! Listener + per-client task loop + runner-to-clients broadcast.
 
+// On Windows the listener/handler are #[cfg(unix)] stubs, so these imports are
+// only used on unix; silence the resulting unused-import noise there.
+#![cfg_attr(windows, allow(unused_imports))]
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, anyhow};
 use rocm_dash_core::protocol::{Command, Event, PROTOCOL_VERSION};
 use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
@@ -39,7 +42,10 @@ pub async fn run(listen: &str, _token: Option<&str>, opts: RunnerOptions) -> any
     }
 }
 
+#[cfg(unix)]
 async fn run_unix(path: PathBuf, opts: RunnerOptions) -> anyhow::Result<()> {
+    use tokio::net::UnixListener;
+
     if path.exists() {
         std::fs::remove_file(&path).with_context(|| format!("removing stale socket {path:?}"))?;
     }
@@ -96,8 +102,16 @@ async fn run_unix(path: PathBuf, opts: RunnerOptions) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(windows)]
+async fn run_unix(_path: PathBuf, _opts: RunnerOptions) -> anyhow::Result<()> {
+    Err(anyhow!(
+        "rocm-dash daemon requires Unix domain sockets; not supported on Windows yet"
+    ))
+}
+
+#[cfg(unix)]
 async fn handle_client(
-    stream: UnixStream,
+    stream: tokio::net::UnixStream,
     mut rx: broadcast::Receiver<Event>,
     ring: Arc<Mutex<SnapshotRing>>,
     bench_ring: Arc<Mutex<BenchRing>>,
