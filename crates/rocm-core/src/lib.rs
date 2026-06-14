@@ -7364,10 +7364,12 @@ Class Name:                Display
 
     #[test]
     fn dashboard_daemon_tick_accessors_map_secs_to_duration() {
-        let mut d = DashboardDaemonConfig::default();
-        d.gpu_tick_secs = 0.5;
-        d.discovery_tick_secs = 10.0;
-        d.instance_tick_secs = 3.0;
+        let d = DashboardDaemonConfig {
+            gpu_tick_secs: 0.5,
+            discovery_tick_secs: 10.0,
+            instance_tick_secs: 3.0,
+            ..Default::default()
+        };
         assert_eq!(d.gpu_tick(), Duration::from_secs_f64(0.5));
         assert_eq!(d.discovery_tick(), Duration::from_secs(10));
         assert_eq!(d.instance_tick(), Duration::from_secs(3));
