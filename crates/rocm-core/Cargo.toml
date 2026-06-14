@@ -12,7 +12,7 @@ directories.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-ureq = "2.12"
+ureq = { version = "2.12", features = ["native-certs"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading"] }
