@@ -403,6 +403,7 @@ struct App {
     onboarding_cancel_install_confirm: bool,
     onboarding_cancel_install_selection: usize,
     onboarding_success_modal: bool,
+    onboarding_channel: InstallSdkChannel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1089,6 +1090,13 @@ impl InstallSdkChannel {
             Self::Nightly => "nightly",
         }
     }
+
+    fn toggle(self) -> Self {
+        match self {
+            Self::Release => Self::Nightly,
+            Self::Nightly => Self::Release,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1108,6 +1116,7 @@ impl InstallSdkFormat {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InstallSdkChoice {
+    Channel,
     Folder,
     Install,
     Back,
@@ -2149,6 +2158,7 @@ impl App {
             onboarding_cancel_install_confirm: false,
             onboarding_cancel_install_selection: 0,
             onboarding_success_modal: false,
+            onboarding_channel: InstallSdkChannel::Release,
         };
         app.push_default_intro();
         if app.should_show_onboarding() {
@@ -3194,6 +3204,17 @@ impl App {
             "Install folder changed. Press Enter to browse, or Left/Right for another.".to_owned();
     }
 
+    fn toggle_install_sdk_channel(&mut self) {
+        if let Some(state) = self.install_manager.as_mut()
+            && let InstallManagerScreen::Sdk { channel, .. } = &mut state.screen
+        {
+            *channel = channel.toggle();
+            state.message = None;
+            state.detail_scroll = 0;
+        }
+        self.status = "ROCm channel changed. release is stable, nightly is preview.".to_owned();
+    }
+
     fn open_install_sdk_form_folder_browser(&mut self) {
         if self.running_job_blocks_action() {
             return;
@@ -3359,6 +3380,7 @@ impl App {
             },
             InstallManagerScreen::Sdk { selected, .. } => {
                 match install_sdk_choices().get(*selected).copied() {
+                    Some(InstallSdkChoice::Channel) => self.toggle_install_sdk_channel(),
                     Some(InstallSdkChoice::Folder) => self.open_install_sdk_form_folder_browser(),
                     Some(InstallSdkChoice::Install) => self.request_install_sdk_from_form(),
                     Some(InstallSdkChoice::Back) | None => self.close_install_sdk_form(),
@@ -6712,11 +6734,12 @@ impl App {
     fn request_onboarding_install(&mut self, title: &str) {
         self.reset_onboarding_install_output();
         self.rebase_paths_to_saved_setup_folder();
+        let channel = self.onboarding_channel.as_str();
         let mut args = vec![
             "install".to_owned(),
             "sdk".to_owned(),
             "--channel".to_owned(),
-            "release".to_owned(),
+            channel.to_owned(),
             "--format".to_owned(),
             "wheel".to_owned(),
         ];
@@ -6724,7 +6747,7 @@ impl App {
         args.push("--prefix".to_owned());
         args.push(venv_path.display().to_string());
         let mut display_command =
-            "/install sdk --channel release --format wheel --prefix ".to_owned();
+            format!("/install sdk --channel {channel} --format wheel --prefix ");
         display_command.push_str(&quote_tui_arg(&venv_path.display().to_string()));
         let reason = if title == "Reinstall" {
             "Reinstall ROCm into the selected folder."
@@ -6785,6 +6808,11 @@ impl App {
 
     fn perform_onboarding_selected_action(&mut self) {
         match self.selected_onboarding_choice() {
+            OnboardingMenuChoice::Channel => {
+                self.onboarding_channel = self.onboarding_channel.toggle();
+                self.status =
+                    "ROCm channel changed. release is stable, nightly is preview.".to_owned();
+            }
             OnboardingMenuChoice::Folder if self.pending_approval.is_none() => {
                 self.open_onboarding_install_folder_browser();
             }
@@ -13359,6 +13387,7 @@ enum OnboardingAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OnboardingMenuChoice {
+    Channel,
     Folder,
     Primary,
     Reinstall,
@@ -14294,6 +14323,7 @@ fn onboarding_menu_choices(app: &App) -> Vec<OnboardingMenuChoice> {
     if setup_venv_ready(&app.paths, &app.config) {
         let mut choices = vec![
             OnboardingMenuChoice::Folder,
+            OnboardingMenuChoice::Channel,
             OnboardingMenuChoice::Primary,
             OnboardingMenuChoice::Reinstall,
             OnboardingMenuChoice::Uninstall,
@@ -14305,6 +14335,7 @@ fn onboarding_menu_choices(app: &App) -> Vec<OnboardingMenuChoice> {
     if setup_has_current_install(&app.paths, &app.config) {
         let mut choices = vec![
             OnboardingMenuChoice::Folder,
+            OnboardingMenuChoice::Channel,
             OnboardingMenuChoice::Primary,
             OnboardingMenuChoice::Uninstall,
         ];
@@ -14313,12 +14344,20 @@ fn onboarding_menu_choices(app: &App) -> Vec<OnboardingMenuChoice> {
         return choices;
     }
     if onboarding_can_return(app) {
-        let mut choices = vec![OnboardingMenuChoice::Folder, OnboardingMenuChoice::Primary];
+        let mut choices = vec![
+            OnboardingMenuChoice::Folder,
+            OnboardingMenuChoice::Channel,
+            OnboardingMenuChoice::Primary,
+        ];
         choices.extend(maybe_show_log);
         choices.push(OnboardingMenuChoice::Back);
         return choices;
     }
-    let mut choices = vec![OnboardingMenuChoice::Folder, OnboardingMenuChoice::Primary];
+    let mut choices = vec![
+        OnboardingMenuChoice::Folder,
+        OnboardingMenuChoice::Channel,
+        OnboardingMenuChoice::Primary,
+    ];
     choices.extend(maybe_show_log);
     choices.push(OnboardingMenuChoice::Quit);
     choices
@@ -14359,6 +14398,9 @@ fn onboarding_selected_choice(app: &App) -> OnboardingMenuChoice {
 
 fn onboarding_selection_status(app: &App) -> String {
     match onboarding_selected_choice(app) {
+        OnboardingMenuChoice::Channel => {
+            "Press Enter or Left/Right to switch between stable (release) and nightly.".to_owned()
+        }
         OnboardingMenuChoice::Folder => {
             "Press Enter to choose a folder, Left/Right for quick choices, or T to type.".to_owned()
         }
@@ -14401,6 +14443,15 @@ fn onboarding_selection_status(app: &App) -> String {
 
 fn onboarding_menu_label(app: &App, choice: OnboardingMenuChoice) -> String {
     match choice {
+        OnboardingMenuChoice::Channel => format!(
+            "{:<14} {}",
+            "Release",
+            if matches!(app.onboarding_channel, InstallSdkChannel::Release) {
+                "Stable (default)"
+            } else {
+                "Nightly (preview)"
+            }
+        ),
         OnboardingMenuChoice::Folder => {
             let folder = display_runtime_folder_path(&setup_install_root(&app.paths, &app.config));
             format!("Install folder: {folder}")
@@ -17696,6 +17747,7 @@ fn handle_install_manager_key(app: &mut App, key: KeyEvent) -> bool {
         }
         (_, KeyCode::Left) => {
             match app.selected_install_sdk_choice() {
+                InstallSdkChoice::Channel => app.toggle_install_sdk_channel(),
                 InstallSdkChoice::Folder => {
                     app.cycle_install_sdk_folder_preset(CompletionDirection::Previous);
                 }
@@ -17707,6 +17759,7 @@ fn handle_install_manager_key(app: &mut App, key: KeyEvent) -> bool {
         }
         (_, KeyCode::Right) => {
             match app.selected_install_sdk_choice() {
+                InstallSdkChoice::Channel => app.toggle_install_sdk_channel(),
                 InstallSdkChoice::Folder => {
                     app.cycle_install_sdk_folder_preset(CompletionDirection::Next);
                 }
@@ -19041,6 +19094,22 @@ fn handle_onboarding_key(app: &mut App, key: KeyEvent) -> bool {
         }
         (_, KeyCode::PageDown) => {
             app.scroll_onboarding_install_log(LogPageDirection::Next);
+        }
+        (_, KeyCode::Left)
+            if app.pending_approval.is_none()
+                && app.running_job.is_none()
+                && app.selected_onboarding_choice() == OnboardingMenuChoice::Channel =>
+        {
+            app.onboarding_channel = app.onboarding_channel.toggle();
+            app.status = "ROCm channel changed. release is stable, nightly is preview.".to_owned();
+        }
+        (_, KeyCode::Right)
+            if app.pending_approval.is_none()
+                && app.running_job.is_none()
+                && app.selected_onboarding_choice() == OnboardingMenuChoice::Channel =>
+        {
+            app.onboarding_channel = app.onboarding_channel.toggle();
+            app.status = "ROCm channel changed. release is stable, nightly is preview.".to_owned();
         }
         (_, KeyCode::Left)
             if app.pending_approval.is_none()
@@ -20493,7 +20562,10 @@ fn draw_install_manager(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 .collect::<Vec<_>>(),
         ),
         InstallManagerScreen::Sdk {
-            selected, folder, ..
+            selected,
+            channel,
+            folder,
+            ..
         } => (
             format!(
                 "ROCm Install {}/{}",
@@ -20503,7 +20575,7 @@ fn draw_install_manager(frame: &mut Frame<'_>, app: &App, area: Rect) {
             *selected,
             install_sdk_choices()
                 .iter()
-                .map(|choice| ListItem::new(install_sdk_choice_label(*choice, folder)))
+                .map(|choice| ListItem::new(install_sdk_choice_label(*choice, *channel, folder)))
                 .collect::<Vec<_>>(),
         ),
     };
@@ -21562,6 +21634,7 @@ const fn install_menu_label(choice: InstallMenuChoice) -> &'static str {
 
 const fn install_sdk_choices() -> &'static [InstallSdkChoice] {
     &[
+        InstallSdkChoice::Channel,
         InstallSdkChoice::Folder,
         InstallSdkChoice::Install,
         InstallSdkChoice::Back,
@@ -21586,8 +21659,21 @@ const fn install_sdk_format_label(format: InstallSdkFormat) -> &'static str {
     }
 }
 
-fn install_sdk_choice_label(choice: InstallSdkChoice, folder: &str) -> String {
+fn install_sdk_choice_label(
+    choice: InstallSdkChoice,
+    channel: InstallSdkChannel,
+    folder: &str,
+) -> String {
     match choice {
+        InstallSdkChoice::Channel => format!(
+            "{:<14} {}",
+            "Release",
+            if matches!(channel, InstallSdkChannel::Release) {
+                "Stable (default)"
+            } else {
+                "Nightly (preview)"
+            }
+        ),
         InstallSdkChoice::Folder => {
             if folder.trim().is_empty() {
                 "Install folder: choose".to_owned()
@@ -23566,6 +23652,13 @@ fn install_sdk_detail_text(app: &App) -> String {
         .copied()
         .unwrap_or(InstallSdkChoice::Install)
     {
+        InstallSdkChoice::Channel => {
+            let _ = writeln!(
+                output,
+                "  Left/Right or Enter switches release and nightly."
+            );
+            let _ = writeln!(output, "  release is stable and selected by default.");
+        }
         InstallSdkChoice::Folder => {
             if *editing_folder {
                 let _ = writeln!(
@@ -23588,6 +23681,10 @@ fn install_sdk_detail_text(app: &App) -> String {
     let _ = writeln!(output);
     let _ = writeln!(output, "Controls");
     let _ = writeln!(output, "  Up/Down chooses a row.");
+    let _ = writeln!(
+        output,
+        "  On the Release row, Enter or Left/Right switches channel."
+    );
     let _ = writeln!(
         output,
         "  On the Folder row, Enter browses and Left/Right changes common folders."
@@ -27899,9 +27996,9 @@ mod tests {
     use std::fmt::Write as _;
 
     use super::{
-        App, ChatToolApprovalRequest, GpuMonitorCard, GpuTelemetry, LOG_FOLLOW_REFRESH_INTERVAL,
-        TuiMode, handle_key, load_gpu_monitor_cards_from_json, load_gpu_static_cards_from_json,
-        render_serve_command_plan,
+        App, ChatToolApprovalRequest, GpuMonitorCard, GpuTelemetry, InstallSdkChannel,
+        LOG_FOLLOW_REFRESH_INTERVAL, TuiMode, handle_key, load_gpu_monitor_cards_from_json,
+        load_gpu_static_cards_from_json, render_serve_command_plan,
     };
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseEvent,
@@ -30924,9 +31021,9 @@ mod tests {
         assert!(rendered.contains("Install ROCm"));
         assert!(rendered.contains("Install folder"));
         assert!(rendered.contains("Recommended Python install"));
-        assert!(!rendered.contains("Channel"));
+        assert!(rendered.contains("Stable (default)"));
         assert!(!rendered.contains("Advanced archive install"));
-        assert_eq!(super::install_sdk_choices().len(), 3);
+        assert_eq!(super::install_sdk_choices().len(), 4);
         let detail = super::install_manager_detail_text(&app);
         assert!(detail.contains("Left/Right changes common folders"));
         assert!(detail.contains("Enter opens the folder picker"));
@@ -36705,7 +36802,7 @@ Full log
         app.reset_onboarding_selection();
         let original = super::setup_install_root(&app.paths, &app.config);
 
-        super::handle_onboarding_key(&mut app, key_event(KeyCode::Up, KeyModifiers::NONE));
+        app.select_onboarding_choice(super::OnboardingMenuChoice::Folder);
         assert_eq!(
             app.selected_onboarding_choice(),
             super::OnboardingMenuChoice::Folder
@@ -36979,7 +37076,7 @@ Full log
         fs::create_dir_all(&app.paths.data_dir)?;
         let folder = app.paths.data_dir.join("custom-rocm-folder");
 
-        super::handle_onboarding_key(&mut app, key_event(KeyCode::Up, KeyModifiers::NONE));
+        app.select_onboarding_choice(super::OnboardingMenuChoice::Folder);
         super::handle_onboarding_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.folder_browser.is_some());
         app.use_folder_browser_path(folder.clone());
@@ -37013,7 +37110,7 @@ Full log
         fs::create_dir_all(&app.paths.data_dir)?;
         let folder = app.paths.data_dir.join("custom-rocm-folder");
 
-        super::handle_onboarding_key(&mut app, key_event(KeyCode::Up, KeyModifiers::NONE));
+        app.select_onboarding_choice(super::OnboardingMenuChoice::Folder);
         assert_eq!(
             app.selected_onboarding_choice(),
             super::OnboardingMenuChoice::Folder
@@ -37053,7 +37150,7 @@ Full log
         app.onboarding_active = true;
         app.reset_onboarding_selection();
 
-        super::handle_onboarding_key(&mut app, key_event(KeyCode::Up, KeyModifiers::NONE));
+        app.select_onboarding_choice(super::OnboardingMenuChoice::Folder);
         assert_eq!(
             app.selected_onboarding_choice(),
             super::OnboardingMenuChoice::Folder
@@ -37076,7 +37173,7 @@ Full log
         fs::create_dir_all(&app.paths.data_dir)?;
         let folder = app.paths.data_dir.join("top-level-custom-rocm-folder");
 
-        handle_key(&mut app, key_event(KeyCode::Up, KeyModifiers::NONE));
+        app.select_onboarding_choice(super::OnboardingMenuChoice::Folder);
         assert_eq!(
             app.selected_onboarding_choice(),
             super::OnboardingMenuChoice::Folder
@@ -37105,7 +37202,7 @@ Full log
             .data_dir
             .join("custom-folder-while-reviewing-quit");
 
-        handle_key(&mut app, key_event(KeyCode::Up, KeyModifiers::NONE));
+        app.select_onboarding_choice(super::OnboardingMenuChoice::Folder);
         handle_key(&mut app, key_event(KeyCode::Char('t'), KeyModifiers::NONE));
         assert!(app.onboarding_path_editing);
         app.set_input(folder.display().to_string());
@@ -37162,7 +37259,7 @@ Full log
         let file_path = app.paths.data_dir.join("not-a-folder.txt");
         fs::write(&file_path, "not a folder")?;
 
-        super::handle_onboarding_key(&mut app, key_event(KeyCode::Up, KeyModifiers::NONE));
+        app.select_onboarding_choice(super::OnboardingMenuChoice::Folder);
         super::handle_onboarding_key(&mut app, key_event(KeyCode::Char('t'), KeyModifiers::NONE));
         app.set_input(file_path.display().to_string());
         super::handle_onboarding_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
@@ -37184,7 +37281,7 @@ Full log
             .join("missing-parent")
             .join("rocm-folder");
 
-        super::handle_onboarding_key(&mut app, key_event(KeyCode::Up, KeyModifiers::NONE));
+        app.select_onboarding_choice(super::OnboardingMenuChoice::Folder);
         super::handle_onboarding_key(&mut app, key_event(KeyCode::Char('t'), KeyModifiers::NONE));
         app.set_input(folder.display().to_string());
         super::handle_onboarding_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
@@ -37243,10 +37340,26 @@ Full log
         super::handle_onboarding_key(&mut app, key_event(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(
             app.selected_onboarding_choice(),
+            super::OnboardingMenuChoice::Channel
+        );
+        let rendered = render_test_terminal(&app, 120, 24);
+        assert!(rendered.contains("> Release"));
+
+        super::handle_onboarding_key(&mut app, key_event(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            app.selected_onboarding_choice(),
             super::OnboardingMenuChoice::Folder
         );
         let rendered = render_test_terminal(&app, 120, 24);
         assert!(rendered.contains("> Install folder:"));
+
+        super::handle_onboarding_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            app.selected_onboarding_choice(),
+            super::OnboardingMenuChoice::Channel
+        );
+        let rendered = render_test_terminal(&app, 120, 24);
+        assert!(rendered.contains("> Release"));
 
         super::handle_onboarding_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(
@@ -37342,6 +37455,22 @@ Full log
         assert_eq!(
             app.selected_onboarding_choice(),
             super::OnboardingMenuChoice::Folder
+        );
+
+        app.folder_browser = None;
+        app.select_onboarding_choice(super::OnboardingMenuChoice::Primary);
+
+        super::handle_onboarding_key(&mut app, key_event(KeyCode::Char('2'), KeyModifiers::NONE));
+
+        assert!(app.pending_approval.is_none());
+        assert!(app.folder_browser.is_none());
+        assert!(matches!(
+            app.onboarding_channel,
+            super::InstallSdkChannel::Nightly
+        ));
+        assert_eq!(
+            app.selected_onboarding_choice(),
+            super::OnboardingMenuChoice::Channel
         );
     }
 
@@ -37965,7 +38094,7 @@ Full log
             .unwrap();
         app.poll_running_job();
 
-        let rendered = render_test_terminal(&app, 120, 32);
+        let rendered = render_test_terminal(&app, 120, 36);
         assert!(app.running_job.is_none());
         assert!(rendered.contains("Install failed"));
         assert!(rendered.contains("ROCm packages were not available"));
@@ -40167,9 +40296,14 @@ Full log
         app.reset_onboarding_selection();
 
         let rendered = render_test_terminal(&app, 120, 32);
-        let selected_display = super::display_runtime_folder_path(&selected);
         assert!(rendered.contains("Set Up ROCm"), "{rendered}");
-        assert!(rendered.contains(&selected_display), "{rendered}");
+        assert!(rendered.contains("Install location"), "{rendered}");
+        assert!(rendered.contains("Folder:"), "{rendered}");
+        assert!(rendered.contains("therock"), "{rendered}");
+        assert!(rendered.contains("venvs"), "{rendered}");
+        assert!(rendered.contains("pip-cache"), "{rendered}");
+        assert!(rendered.contains("Release"), "{rendered}");
+        assert!(rendered.contains("Stable (default)"), "{rendered}");
         assert!(!rendered.contains("Install folder: selected"), "{rendered}");
         assert!(
             !rendered.contains("Install folder: recommended"),
@@ -42037,8 +42171,11 @@ Full log
             folder_text.as_str(),
         ]);
 
-        let row_label =
-            super::install_sdk_choice_label(super::InstallSdkChoice::Folder, &folder_text);
+        let row_label = super::install_sdk_choice_label(
+            super::InstallSdkChoice::Folder,
+            super::InstallSdkChannel::Release,
+            &folder_text,
+        );
         assert_eq!(
             row_label,
             format!(
@@ -43882,6 +44019,7 @@ Full log
             onboarding_cancel_install_confirm: false,
             onboarding_cancel_install_selection: 0,
             onboarding_success_modal: false,
+            onboarding_channel: InstallSdkChannel::Release,
             tui_owned_service_ids: std::collections::BTreeSet::new(),
             tui_started_comfyui: false,
         }
