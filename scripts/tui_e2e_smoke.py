@@ -24,7 +24,6 @@ from typing import Iterable
 
 import pyte
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -62,8 +61,8 @@ class TuiSession:
         else:
             import fcntl
             import pty
-            import termios
             import struct
+            import termios
 
             master_fd, slave_fd = pty.openpty()
             winsize = struct.pack("HHHH", rows, columns, 0, 0)
@@ -234,8 +233,13 @@ def run_setup_smoke(rocm: Path, args: argparse.Namespace) -> None:
             rows=args.rows,
         )
         try:
-            screen = session.wait_for(["Set Up ROCm", "Install folder:", "Install ROCm"])
-            require("Message" not in screen, "setup screen should not show the chat prompt box")
+            screen = session.wait_for(
+                ["Set Up ROCm", "Install folder:", "Install ROCm"]
+            )
+            require(
+                "Message" not in screen,
+                "setup screen should not show the chat prompt box",
+            )
             session.write("\x1b[A")
             session.wait_for("Install folder:")
             session.write("\r")
@@ -262,7 +266,10 @@ def run_main_tui_smoke(rocm: Path, args: argparse.Namespace) -> None:
         )
         try:
             screen = session.wait_for(["ROCm CLI", "Choose"])
-            require("Message" not in screen, "main menu should not show a chat prompt before chat starts")
+            require(
+                "Message" not in screen,
+                "main menu should not show a chat prompt before chat starts",
+            )
             session.write("\x1bOP")
             session.wait_for(["Help", "Keyboard"])
             session.write("\x1b[6~")

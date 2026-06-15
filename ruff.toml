@@ -1,0 +1,7 @@
+# Ruff configuration for the Python helper scripts (scripts/) and engine workers.
+# Formatting uses Ruff's defaults (88-column, double quotes), which the
+# `ruff-format` pre-commit hook enforces.
+
+[lint]
+# Ruff's default rule set (E4, E7, E9, F) plus import sorting.
+extend-select = ["I"]

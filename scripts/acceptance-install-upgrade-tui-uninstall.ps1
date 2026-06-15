@@ -428,7 +428,6 @@ try {
     Assert-File (Join-Path $InstallDir "rocm-engine-atom.exe")
     Assert-File (Join-Path $InstallDir "rocm-engine-vllm.exe")
     Assert-File (Join-Path $InstallDir "rocm-engine-sglang.exe")
-    Assert-File (Join-Path $InstallDir "rocm-codex.exe")
     Assert-File (Join-Path $InstallDir ".rocm-cli-manifest")
 
     Write-Host "acceptance: simulate stale prior install entry and reinstall"
@@ -477,7 +476,6 @@ try {
     Assert-Missing (Join-Path $InstallDir "rocm-engine-atom.exe")
     Assert-Missing (Join-Path $InstallDir "rocm-engine-vllm.exe")
     Assert-Missing (Join-Path $InstallDir "rocm-engine-sglang.exe")
-    Assert-Missing (Join-Path $InstallDir "rocm-codex.exe")
     Assert-Missing (Join-Path $InstallDir ".rocm-cli-manifest")
     if (-not (Select-String -LiteralPath $UninstallLog -Pattern "skipping running executable on Windows" -Quiet)) {
         Fail "uninstall did not report the expected running executable skip"

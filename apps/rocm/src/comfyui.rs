@@ -5,7 +5,7 @@ use rocm_core::{
     AppPaths, RocmCliConfig, download_file_to_path, ensure_uv_binary, format_http_base_url,
     runtime_is_cosmopolitan_windows, runtime_is_linux, runtime_is_windows,
     runtime_path_for_windows_child, runtime_path_list_join, runtime_path_list_split,
-    runtime_paths_equivalent, uv_command_env, uv_pip_install_base, unix_time_millis,
+    runtime_paths_equivalent, unix_time_millis, uv_command_env, uv_pip_install_base,
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -1591,7 +1591,6 @@ fn run_uv_logged_command(
     }
     bail!("{context_text}: uv exited with {status}");
 }
-
 
 enum OutputTarget {
     Stdout,

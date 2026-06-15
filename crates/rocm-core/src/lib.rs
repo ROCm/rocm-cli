@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
+#[cfg(windows)]
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{IsTerminal, Read, Write, stdin, stdout};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
@@ -24,10 +26,6 @@ use windows_sys::Win32::System::Threading::{
 
 pub mod runtime;
 pub mod uv;
-pub use uv::{
-    DEFAULT_UV_TIMEOUT_SECS, ensure_uv_binary, uv_binary_name, uv_command_env,
-    uv_http_timeout_secs, uv_pip_freeze_args, uv_pip_install_base, uv_venv_args,
-};
 #[cfg(test)]
 use runtime::home_rocm_dir;
 pub use runtime::{
@@ -48,13 +46,19 @@ pub use runtime::{
     runtime_rocm_library_filename, runtime_tcp_timeouts_are_supported, shell_command_for_host,
 };
 use runtime::{env_path_override, runtime_path_for_child_process};
+pub use uv::{
+    DEFAULT_UV_TIMEOUT_SECS, ensure_uv_binary, uv_binary_name, uv_command_env,
+    uv_http_timeout_secs, uv_pip_freeze_args, uv_pip_install_base, uv_venv_args,
+};
 
 pub const DEFAULT_LOCAL_PORT: u16 = 11_435;
 pub const DEFAULT_LOCAL_HOST: &str = "127.0.0.1";
 const OPTIONAL_COMMAND_TIMEOUT: Duration = Duration::from_millis(1_500);
 const WINDOWS_INVENTORY_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT: &str = r#"$gpus = Get-CimInstance -ClassName Win32_VideoController -Property Name,DriverVersion,PNPDeviceID,AdapterCompatibility | Where-Object { $_.PNPDeviceID -match 'VEN_1002' -or $_.AdapterCompatibility -match 'AMD|Advanced Micro Devices' -or $_.Name -match 'AMD|Radeon|Instinct' }; foreach ($gpu in $gpus) { "GPU`t$($gpu.Name)`t$($gpu.DriverVersion)`t$($gpu.PNPDeviceID)" }"#;
+#[cfg(any(windows, target_vendor = "cosmo"))]
 const WINDOWS_PNP_ENTITY_INVENTORY_SCRIPT: &str = r#"$displayGuid = '{4d36e968-e325-11ce-bfc1-08002be10318}'; $gpus = Get-CimInstance -ClassName Win32_PnPEntity -Property Name,DeviceID,PNPClass,ClassGuid,Manufacturer | Where-Object { (($_.PNPClass -eq 'Display' -or $_.ClassGuid -eq $displayGuid) -and ($_.DeviceID -match 'VEN_1002' -or $_.Name -match 'AMD|Radeon|Instinct|Graphics' -or $_.Manufacturer -match 'AMD|Advanced Micro Devices')) -or ($_.DeviceID -match 'PCI\\VEN_1002' -and $_.Name -match 'Radeon|Instinct|Graphics') }; foreach ($gpu in $gpus) { "GPU`t$($gpu.Name)`t`t$($gpu.DeviceID)" }"#;
+#[cfg(any(windows, target_vendor = "cosmo"))]
 const WINDOWS_SYSTEM_INVENTORY_SCRIPT: &str = r#"$cpu = Get-CimInstance -ClassName Win32_Processor -Property Name | Select-Object -First 1 -ExpandProperty Name; if ($cpu) { "CPU`t$cpu" }; $ram = Get-CimInstance -ClassName Win32_ComputerSystem -Property TotalPhysicalMemory | Select-Object -First 1 -ExpandProperty TotalPhysicalMemory; if ($ram) { "RAM`t$ram" }"#;
 
 pub fn format_host_for_url(host: &str) -> String {
@@ -982,10 +986,12 @@ struct WindowsDisplayAdapter {
 }
 
 impl WindowsDoctorInventory {
+    #[cfg(any(windows, target_vendor = "cosmo"))]
     fn is_empty(&self) -> bool {
         self.cpu_model.is_none() && self.system_ram_gib.is_none() && self.displays.is_empty()
     }
 
+    #[cfg(any(windows, target_vendor = "cosmo"))]
     fn merge_missing_from(&mut self, mut other: WindowsDoctorInventory) {
         if self.cpu_model.is_none() {
             self.cpu_model = other.cpu_model.take();
@@ -1189,7 +1195,7 @@ impl DoctorSummary {
             return "none";
         }
         if self.managed_runtime_count == 0 {
-            return "legacy ROCm detected; install a managed TheRock runtime with `rocm install sdk --channel release --format pip` and keep legacy ROCm unmanaged";
+            return "legacy ROCm detected; install a managed TheRock runtime with `rocm install sdk --channel release --format wheel` and keep legacy ROCm unmanaged";
         }
         "legacy ROCm detected; keep it side-by-side and use rocm-cli managed TheRock runtimes for local engines"
     }
@@ -1954,12 +1960,14 @@ fn append_windows_probe_diagnostics(
     append_diagnostic_stream(output, "stderr", &result.stderr);
 }
 
+#[cfg(any(windows, target_vendor = "cosmo"))]
 fn empty_as_unknown(value: &str) -> &str {
     let value = value.trim();
     if value.is_empty() { "<unknown>" } else { value }
 }
 
 #[derive(Debug)]
+#[cfg(any(windows, target_vendor = "cosmo"))]
 struct DiagnosticCommandResult {
     program: Option<PathBuf>,
     status: Option<String>,
@@ -1969,6 +1977,7 @@ struct DiagnosticCommandResult {
     timed_out: bool,
 }
 
+#[cfg(any(windows, target_vendor = "cosmo"))]
 fn capture_diagnostic_command(
     program: &str,
     args: &[&str],
@@ -2072,6 +2081,7 @@ fn capture_diagnostic_command(
     }
 }
 
+#[cfg(any(windows, target_vendor = "cosmo"))]
 fn append_diagnostic_stream(output: &mut String, name: &str, text: &str) {
     use std::fmt::Write as _;
     let mut lines = text
@@ -2091,6 +2101,7 @@ fn append_diagnostic_stream(output: &mut String, name: &str, text: &str) {
     }
 }
 
+#[cfg(any(windows, target_vendor = "cosmo"))]
 fn truncate_diagnostic_line(line: &str, max_chars: usize) -> String {
     let mut chars = line.chars();
     let truncated = chars.by_ref().take(max_chars).collect::<String>();
@@ -6083,7 +6094,7 @@ Class Name:                Display
         assert!(rendered.contains(
             "legacy_rocm_guidance: legacy ROCm detected; install a managed TheRock runtime"
         ));
-        assert!(rendered.contains("rocm install sdk --channel release --format pip"));
+        assert!(rendered.contains("rocm install sdk --channel release --format wheel"));
     }
 
     #[test]

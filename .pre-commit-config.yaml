@@ -1,0 +1,73 @@
+# Git hooks for rocm-cli, managed with prek (https://github.com/j178/prek),
+# a fast, drop-in replacement for pre-commit.
+#
+# Setup:
+#   uv tool install prek        # or: cargo install --locked prek
+#   prek install                # install the pre-commit hook
+#   prek install -t pre-push    # install the pre-push hook (clippy + tests)
+#
+# Run against everything on demand:
+#   prek run --all-files
+#
+# NOTE: the `repo: builtin` block uses prek's native Rust hooks and is therefore
+# NOT compatible with the classic `pre-commit` tool. Everything else is standard.
+
+default_install_hook_types: [pre-commit, pre-push]
+
+# Vendored sources are checked into third_party/ and must not be reformatted or
+# linted by our hooks.
+exclude: '^third_party/'
+
+repos:
+  # Fast, zero-setup hygiene hooks implemented natively by prek (no clone, no venv).
+  - repo: builtin
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+        args: [--fix=lf] # repo standardises on LF endings (see .gitattributes)
+
+  # Python: lint + format the helper scripts and engine workers.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.16
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  # Shell scripts (install.sh, scripts/*.sh).
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1
+    hooks:
+      - id: shellcheck
+
+  # Rust + PowerShell: mirror the CI checks using the local toolchain.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push] # compiles the workspace; too slow for every commit
+      - id: cargo-test
+        name: cargo test
+        entry: cargo test --workspace --all-targets
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
+      - id: powershell-syntax
+        name: powershell syntax check
+        entry: python scripts/check_powershell_syntax.py
+        language: system
+        files: \.ps1$

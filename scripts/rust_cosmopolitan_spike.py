@@ -26,7 +26,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_WORK_ROOT = REPO_ROOT / ".rocm-work" / "tests" / "rust-cosmopolitan"
@@ -35,7 +34,9 @@ DEFAULT_RUSTUP_HOME = REPO_ROOT / ".rocm-work" / "tools" / "rustup"
 DEFAULT_CARGO_HOME = REPO_ROOT / ".rocm-work" / "tools" / "cargo"
 DEFAULT_COSMOCC_NATIVE_ROOT = REPO_ROOT / ".rocm-work" / "tools" / "cosmocc"
 DEFAULT_COSMOCC_WSL_ELF_ROOT = REPO_ROOT / ".rocm-work" / "tools" / "cosmocc-wsl-elf"
-DEFAULT_COSMOPOLITAN_SOURCE_ROOT = REPO_ROOT / ".rocm-work" / "tools" / "cosmopolitan-src"
+DEFAULT_COSMOPOLITAN_SOURCE_ROOT = (
+    REPO_ROOT / ".rocm-work" / "tools" / "cosmopolitan-src"
+)
 DEFAULT_TOOLCHAIN = "nightly"
 
 
@@ -72,7 +73,9 @@ def run_capture(
         stderr=subprocess.PIPE,
         check=False,
     )
-    result = CommandResult(args, completed.returncode, completed.stdout, completed.stderr)
+    result = CommandResult(
+        args, completed.returncode, completed.stdout, completed.stderr
+    )
     if check and result.returncode != 0:
         raise RustCosmoError(format_command_failure(result))
     return result
@@ -372,7 +375,10 @@ def archive_exports_symbol(library: Path, symbol: str) -> bool:
 
 
 def cosmopolitan_exports_symbol(cosmocc_root: Path, symbol: str) -> bool:
-    return any(archive_exports_symbol(library, symbol) for library in cosmopolitan_libraries(cosmocc_root))
+    return any(
+        archive_exports_symbol(library, symbol)
+        for library in cosmopolitan_libraries(cosmocc_root)
+    )
 
 
 def ensure_cosmopolitan_source(args: argparse.Namespace) -> Path:
@@ -402,14 +408,19 @@ def patch_cosmopolitan_waitid_source(source_root: Path) -> Path:
         raise RustCosmoError(f"Cosmopolitan calls.h was not found: {calls_header}")
     header_text = calls_header.read_text(encoding="utf-8")
     if "struct siginfo;" not in header_text:
-        header_text = header_text.replace("typedef int sig_atomic_t;\n", "typedef int sig_atomic_t;\nstruct siginfo;\n", 1)
+        header_text = header_text.replace(
+            "typedef int sig_atomic_t;\n",
+            "typedef int sig_atomic_t;\nstruct siginfo;\n",
+            1,
+        )
     if "int waitid(int, int, struct siginfo *, int)" not in header_text:
         anchor = "int wait(int *) libcesque __write_only(1);\n"
         if anchor not in header_text:
             raise RustCosmoError(f"could not locate wait() anchor in {calls_header}")
         header_text = header_text.replace(
             anchor,
-            anchor + "int waitid(int, int, struct siginfo *, int) libcesque __write_only(3);\n",
+            anchor
+            + "int waitid(int, int, struct siginfo *, int) libcesque __write_only(3);\n",
             1,
         )
     calls_header.write_text(header_text, encoding="utf-8", newline="\n")
@@ -421,7 +432,9 @@ def patch_cosmopolitan_waitid_source(source_root: Path) -> Path:
     return source_path
 
 
-def compile_cosmopolitan_waitid_object(args: argparse.Namespace, source_path: Path) -> Path:
+def compile_cosmopolitan_waitid_object(
+    args: argparse.Namespace, source_path: Path
+) -> Path:
     work_root = args.work_root.resolve()
     object_path = work_root / "cosmopolitan-source-patch" / "waitid.o"
     object_path.parent.mkdir(parents=True, exist_ok=True)
@@ -463,11 +476,16 @@ def ensure_cosmopolitan_waitid(args: argparse.Namespace) -> None:
         backup = library.with_suffix(library.suffix + ".before-waitid-source-patch")
         if not backup.is_file():
             shutil.copy2(library, backup)
-        result = run_capture([path_text(ar), "rcs", path_text(library), path_text(object_path)], cwd=REPO_ROOT)
+        result = run_capture(
+            [path_text(ar), "rcs", path_text(library), path_text(object_path)],
+            cwd=REPO_ROOT,
+        )
         if result.returncode != 0:
             raise RustCosmoError(format_command_failure(result))
         if not archive_exports_symbol(library, "waitid"):
-            raise RustCosmoError(f"patched Cosmopolitan archive still does not export waitid: {library}")
+            raise RustCosmoError(
+                f"patched Cosmopolitan archive still does not export waitid: {library}"
+            )
 
 
 def rust_sysroot(args: argparse.Namespace) -> Path:
@@ -780,14 +798,16 @@ def patch_rust_std_for_cosmopolitan(args: argparse.Namespace) -> None:
         if anchor not in text:
             raise RustCosmoError(f"could not locate is_interrupted anchor in {path}")
         text = text.replace(anchor, cosmo_errno_std_patch() + "\n" + anchor, 1)
-    old_interrupted = "pub fn is_interrupted(errno: i32) -> bool {\n    errno == libc::EINTR\n}\n"
+    old_interrupted = (
+        "pub fn is_interrupted(errno: i32) -> bool {\n    errno == libc::EINTR\n}\n"
+    )
     new_interrupted = (
         "pub fn is_interrupted(errno: i32) -> bool {\n"
-        "    #[cfg(target_vendor = \"cosmo\")]\n"
+        '    #[cfg(target_vendor = "cosmo")]\n'
         "    {\n"
         "        return is_cosmo_interrupted(errno);\n"
         "    }\n"
-        "    #[cfg(not(target_vendor = \"cosmo\"))]\n"
+        '    #[cfg(not(target_vendor = "cosmo"))]\n'
         "    {\n"
         "        errno == libc::EINTR\n"
         "    }\n"
@@ -801,7 +821,7 @@ def patch_rust_std_for_cosmopolitan(args: argparse.Namespace) -> None:
     new_decode = (
         "pub fn decode_error_kind(errno: i32) -> io::ErrorKind {\n"
         "    use io::ErrorKind::*;\n"
-        "    #[cfg(target_vendor = \"cosmo\")]\n"
+        '    #[cfg(target_vendor = "cosmo")]\n'
         "    if let Some(kind) = decode_cosmo_error_kind(errno) {\n"
         "        return kind;\n"
         "    }\n"
@@ -815,27 +835,37 @@ def patch_rust_std_for_cosmopolitan(args: argparse.Namespace) -> None:
 
     random_path = rust_std_linux_random_path(args)
     if not random_path.is_file():
-        raise RustCosmoError(f"rust-src std linux random file was not found: {random_path}")
+        raise RustCosmoError(
+            f"rust-src std linux random file was not found: {random_path}"
+        )
     random_text = random_path.read_text(encoding="utf-8")
     if "ROCM_CLI_COSMO_RANDOM_PATCH_BEGIN" in random_text:
         start = random_text.index("// ROCM_CLI_COSMO_RANDOM_PATCH_BEGIN")
         end_marker = "// ROCM_CLI_COSMO_RANDOM_PATCH_END"
         end = random_text.index(end_marker, start) + len(end_marker)
-        random_text = random_text[:start] + cosmo_random_std_patch().rstrip() + random_text[end:]
+        random_text = (
+            random_text[:start] + cosmo_random_std_patch().rstrip() + random_text[end:]
+        )
     else:
         anchor = "use crate::sys::pal::weak::syscall;\n"
         if anchor not in random_text:
-            raise RustCosmoError(f"could not locate random import anchor in {random_path}")
-        random_text = random_text.replace(anchor, anchor + "\n" + cosmo_random_std_patch(), 1)
-    old_fill = "pub fn fill_bytes(bytes: &mut [u8]) {\n    getrandom(bytes, false);\n}\n"
+            raise RustCosmoError(
+                f"could not locate random import anchor in {random_path}"
+            )
+        random_text = random_text.replace(
+            anchor, anchor + "\n" + cosmo_random_std_patch(), 1
+        )
+    old_fill = (
+        "pub fn fill_bytes(bytes: &mut [u8]) {\n    getrandom(bytes, false);\n}\n"
+    )
     new_fill = (
         "pub fn fill_bytes(bytes: &mut [u8]) {\n"
-        "    #[cfg(target_vendor = \"cosmo\")]\n"
+        '    #[cfg(target_vendor = "cosmo")]\n'
         "    {\n"
         "        cosmo_fill_random_bytes(bytes);\n"
         "        return;\n"
         "    }\n"
-        "    #[cfg(not(target_vendor = \"cosmo\"))]\n"
+        '    #[cfg(not(target_vendor = "cosmo"))]\n'
         "    {\n"
         "        getrandom(bytes, false);\n"
         "    }\n"
@@ -857,9 +887,9 @@ def patch_rust_std_for_cosmopolitan(args: argparse.Namespace) -> None:
     new_hashmap = (
         "pub fn hashmap_random_keys() -> (u64, u64) {\n"
         "    let mut bytes = [0; 16];\n"
-        "    #[cfg(target_vendor = \"cosmo\")]\n"
+        '    #[cfg(target_vendor = "cosmo")]\n'
         "    cosmo_fill_random_bytes(&mut bytes);\n"
-        "    #[cfg(not(target_vendor = \"cosmo\"))]\n"
+        '    #[cfg(not(target_vendor = "cosmo"))]\n'
         "    getrandom(&mut bytes, true);\n"
         "    let k1 = u64::from_ne_bytes(bytes[..8].try_into().unwrap());\n"
         "    let k2 = u64::from_ne_bytes(bytes[8..].try_into().unwrap());\n"
@@ -874,11 +904,13 @@ def patch_rust_std_for_cosmopolitan(args: argparse.Namespace) -> None:
 
     kernel_copy_path = rust_std_kernel_copy_mod_path(args)
     if not kernel_copy_path.is_file():
-        raise RustCosmoError(f"rust-src std kernel_copy module was not found: {kernel_copy_path}")
+        raise RustCosmoError(
+            f"rust-src std kernel_copy module was not found: {kernel_copy_path}"
+        )
     kernel_copy_text = kernel_copy_path.read_text(encoding="utf-8")
     old_kernel_copy = (
         "cfg_select! {\n"
-        "    any(target_os = \"linux\", target_os = \"android\") => {\n"
+        '    any(target_os = "linux", target_os = "android") => {\n'
         "        mod linux;\n"
         "        pub use linux::kernel_copy;\n"
         "    }\n"
@@ -886,7 +918,7 @@ def patch_rust_std_for_cosmopolitan(args: argparse.Namespace) -> None:
     )
     new_kernel_copy = (
         "cfg_select! {\n"
-        "    target_vendor = \"cosmo\" => {\n"
+        '    target_vendor = "cosmo" => {\n'
         "        use crate::io::{Result, Read, Write};\n"
         "\n"
         "        pub fn kernel_copy<R: ?Sized, W: ?Sized>(_reader: &mut R, _writer: &mut W) -> Result<CopyState>\n"
@@ -897,7 +929,7 @@ def patch_rust_std_for_cosmopolitan(args: argparse.Namespace) -> None:
         "            Ok(CopyState::Fallback(0))\n"
         "        }\n"
         "    }\n"
-        "    any(target_os = \"linux\", target_os = \"android\") => {\n"
+        '    any(target_os = "linux", target_os = "android") => {\n'
         "        mod linux;\n"
         "        pub use linux::kernel_copy;\n"
         "    }\n"
@@ -906,7 +938,9 @@ def patch_rust_std_for_cosmopolitan(args: argparse.Namespace) -> None:
     if old_kernel_copy in kernel_copy_text:
         kernel_copy_text = kernel_copy_text.replace(old_kernel_copy, new_kernel_copy, 1)
     elif new_kernel_copy not in kernel_copy_text:
-        raise RustCosmoError(f"could not patch kernel_copy fallback in {kernel_copy_path}")
+        raise RustCosmoError(
+            f"could not patch kernel_copy fallback in {kernel_copy_path}"
+        )
     kernel_copy_path.write_text(kernel_copy_text, encoding="utf-8", newline="\n")
 
     socket_path = rust_std_socket_mod_path(args)
@@ -914,7 +948,7 @@ def patch_rust_std_for_cosmopolitan(args: argparse.Namespace) -> None:
         raise RustCosmoError(f"rust-src std socket module was not found: {socket_path}")
     socket_text = socket_path.read_text(encoding="utf-8")
     old_socket = "#[cfg(not(windows))]\n            unsafe {\n                setsockopt(&sock, c::SOL_SOCKET, c::SO_REUSEADDR, 1 as c_int)?\n            };"
-    new_socket = "#[cfg(not(any(windows, target_vendor = \"cosmo\")))]\n            unsafe {\n                setsockopt(&sock, c::SOL_SOCKET, c::SO_REUSEADDR, 1 as c_int)?\n            };"
+    new_socket = '#[cfg(not(any(windows, target_vendor = "cosmo")))]\n            unsafe {\n                setsockopt(&sock, c::SOL_SOCKET, c::SO_REUSEADDR, 1 as c_int)?\n            };'
     if old_socket in socket_text:
         socket_text = socket_text.replace(old_socket, new_socket, 1)
     elif new_socket not in socket_text:
@@ -984,12 +1018,18 @@ def rustup(args: argparse.Namespace, rustup_args: Iterable[str]) -> CommandResul
 
 def toolchain_usable(args: argparse.Namespace) -> bool:
     env = spike_env(args)
-    cargo_result = run_capture(["cargo", f"+{args.toolchain}", "--version"], cwd=REPO_ROOT, env=env)
-    rustc_result = run_capture(["rustc", f"+{args.toolchain}", "--version"], cwd=REPO_ROOT, env=env)
+    cargo_result = run_capture(
+        ["cargo", f"+{args.toolchain}", "--version"], cwd=REPO_ROOT, env=env
+    )
+    rustc_result = run_capture(
+        ["rustc", f"+{args.toolchain}", "--version"], cwd=REPO_ROOT, env=env
+    )
     return cargo_result.returncode == 0 and rustc_result.returncode == 0
 
 
-def cargo(args: argparse.Namespace, cargo_args: Iterable[str], *, cwd: Path) -> CommandResult:
+def cargo(
+    args: argparse.Namespace, cargo_args: Iterable[str], *, cwd: Path
+) -> CommandResult:
     env = spike_env(args)
     return run_capture(["cargo", *cargo_args], cwd=cwd, env=env)
 
@@ -1011,7 +1051,9 @@ def ensure_toolchain(args: argparse.Namespace) -> None:
     if result.returncode != 0:
         if not toolchain_usable(args):
             raise RustCosmoError(format_command_failure(result))
-        print("rust-cosmopolitan spike: rustup returned a non-zero status, but the requested toolchain is usable")
+        print(
+            "rust-cosmopolitan spike: rustup returned a non-zero status, but the requested toolchain is usable"
+        )
     print(f"rust-cosmopolitan spike: toolchain ready: {args.toolchain}")
 
 
@@ -1048,9 +1090,15 @@ def build_hello(args: argparse.Namespace) -> Path:
     artifact_dir = project_dir / "target" / "x86_64-unknown-linux-cosmo" / profile
     candidates = sorted(artifact_dir.glob("rocm-rust-cosmo-hello*.com.dbg"))
     if not candidates:
-        raise RustCosmoError(f"Cargo build finished but no .com.dbg artifact was found in {artifact_dir}")
+        raise RustCosmoError(
+            f"Cargo build finished but no .com.dbg artifact was found in {artifact_dir}"
+        )
     artifact = candidates[0]
-    ape = work_root / ("rocm-rust-cosmo-hello-release.exe" if args.release else "rocm-rust-cosmo-hello.exe")
+    ape = work_root / (
+        "rocm-rust-cosmo-hello-release.exe"
+        if args.release
+        else "rocm-rust-cosmo-hello.exe"
+    )
     apelink = args.cosmocc_root.resolve() / "bin" / "apelink"
     ape_loader = args.cosmocc_root.resolve() / "bin" / "ape-x86_64.elf"
     result = run_capture(
@@ -1115,9 +1163,13 @@ def build_rocm(args: argparse.Namespace) -> Path:
     profile = "release" if args.release else "debug"
     elf = target_dir / "x86_64-unknown-linux-cosmo" / profile / "rocm.com.dbg"
     if not elf.is_file():
-        raise RustCosmoError(f"Cargo build finished but no rocm ELF artifact was found at {elf}")
+        raise RustCosmoError(
+            f"Cargo build finished but no rocm ELF artifact was found at {elf}"
+        )
 
-    ape = work_root / ("rocm-rust-cosmo-release.exe" if args.release else "rocm-rust-cosmo.exe")
+    ape = work_root / (
+        "rocm-rust-cosmo-release.exe" if args.release else "rocm-rust-cosmo.exe"
+    )
     apelink = args.cosmocc_root.resolve() / "bin" / "apelink"
     ape_loader = args.cosmocc_root.resolve() / "bin" / "ape-x86_64.elf"
     link_result = run_capture(
@@ -1178,7 +1230,11 @@ def probe(args: argparse.Namespace) -> None:
     ]
     for name, command in commands:
         result = run_capture(command, cwd=REPO_ROOT, env=env)
-        status = result.stdout.strip() or result.stderr.strip() or f"exit {result.returncode}"
+        status = (
+            result.stdout.strip()
+            or result.stderr.strip()
+            or f"exit {result.returncode}"
+        )
         print(f"  {name}: {status}")
 
 
@@ -1190,7 +1246,11 @@ def expected_rocm_ape(args: argparse.Namespace, release: bool) -> Path:
 
 def smoke_wsl_linux_path(args: argparse.Namespace) -> None:
     require_posix_host()
-    artifact = args.artifact.resolve() if args.artifact else expected_rocm_ape(args, args.release)
+    artifact = (
+        args.artifact.resolve()
+        if args.artifact
+        else expected_rocm_ape(args, args.release)
+    )
     if not artifact.is_file():
         raise RustCosmoError(f"single-file rocm APE was not found: {artifact}")
 
@@ -1209,14 +1269,20 @@ def smoke_wsl_linux_path(args: argparse.Namespace) -> None:
             }
         )
         env.pop("VIRTUAL_ENV", None)
-        result = run_capture(["sh", path_text(artifact), "doctor"], cwd=temp_root, env=env)
+        result = run_capture(
+            ["sh", path_text(artifact), "doctor"], cwd=temp_root, env=env
+        )
         combined = result.stdout + result.stderr
         if result.returncode != 0:
             raise RustCosmoError(format_command_failure(result))
         if "os: linux" not in combined:
-            raise RustCosmoError(f"WSL/Linux smoke did not report the Linux runtime path:\n{combined}")
+            raise RustCosmoError(
+                f"WSL/Linux smoke did not report the Linux runtime path:\n{combined}"
+            )
         if "os: windows" in combined:
-            raise RustCosmoError(f"WSL/Linux smoke accidentally reported the Windows runtime path:\n{combined}")
+            raise RustCosmoError(
+                f"WSL/Linux smoke accidentally reported the Windows runtime path:\n{combined}"
+            )
         if host_is_wsl() and "wsl: true" not in combined:
             raise RustCosmoError(f"WSL smoke did not identify WSL:\n{combined}")
 
@@ -1248,7 +1314,9 @@ def run_self_test() -> None:
     assert "eventfd" not in waitid_text
     create_hello_project(with_dir / "hello")
     assert (with_dir / "hello" / "Cargo.toml").is_file()
-    assert "[workspace]" in (with_dir / "hello" / "Cargo.toml").read_text(encoding="utf-8")
+    assert "[workspace]" in (with_dir / "hello" / "Cargo.toml").read_text(
+        encoding="utf-8"
+    )
     expected_cosmocc_root = (
         DEFAULT_COSMOCC_WSL_ELF_ROOT
         if host_is_wsl() or cosmocc_root_has_minimal_tools(DEFAULT_COSMOCC_WSL_ELF_ROOT)
@@ -1263,7 +1331,11 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rustup-home", type=Path, default=DEFAULT_RUSTUP_HOME)
     parser.add_argument("--cargo-home", type=Path, default=DEFAULT_CARGO_HOME)
     parser.add_argument("--cosmocc-root", type=Path, default=default_cosmocc_root())
-    parser.add_argument("--cosmopolitan-source-root", type=Path, default=DEFAULT_COSMOPOLITAN_SOURCE_ROOT)
+    parser.add_argument(
+        "--cosmopolitan-source-root",
+        type=Path,
+        default=DEFAULT_COSMOPOLITAN_SOURCE_ROOT,
+    )
     parser.add_argument("--toolchain", default=DEFAULT_TOOLCHAIN)
 
 
@@ -1271,18 +1343,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    probe_parser = subparsers.add_parser("probe", help="Print local spike environment details.")
+    probe_parser = subparsers.add_parser(
+        "probe", help="Print local spike environment details."
+    )
     add_common_args(probe_parser)
 
-    install = subparsers.add_parser("install-toolchain", help="Install nightly + rust-src into the configured local rustup home.")
+    install = subparsers.add_parser(
+        "install-toolchain",
+        help="Install nightly + rust-src into the configured local rustup home.",
+    )
     add_common_args(install)
 
-    build = subparsers.add_parser("build-hello", help="Build the Rust std hello APE fixture.")
+    build = subparsers.add_parser(
+        "build-hello", help="Build the Rust std hello APE fixture."
+    )
     add_common_args(build)
     build.add_argument("--release", action="store_true")
     build.add_argument("--clean", action="store_true")
 
-    build_rocm_parser = subparsers.add_parser("build-rocm", help="Attempt to build the real rocm binary as a Rust APE.")
+    build_rocm_parser = subparsers.add_parser(
+        "build-rocm", help="Attempt to build the real rocm binary as a Rust APE."
+    )
     add_common_args(build_rocm_parser)
     build_rocm_parser.add_argument("--release", action="store_true")
     build_rocm_parser.add_argument("--clean", action="store_true")
@@ -1296,7 +1377,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     smoke_wsl.add_argument("--artifact", type=Path)
     smoke_wsl.add_argument("--release", action="store_true")
 
-    run = subparsers.add_parser("run-hello", help="Build and run the Rust std hello APE fixture.")
+    run = subparsers.add_parser(
+        "run-hello", help="Build and run the Rust std hello APE fixture."
+    )
     add_common_args(run)
     run.add_argument("--release", action="store_true")
     run.add_argument("--clean", action="store_true")

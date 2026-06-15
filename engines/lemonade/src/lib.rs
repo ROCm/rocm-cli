@@ -389,7 +389,10 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
         managed_env: Some(true),
         installed_packages: vec![
             format!("lemonade-embeddable=={}", manifest.version),
-            format!("lemonade-backend={}:{}", manifest.backend_recipe, manifest.backend_name),
+            format!(
+                "lemonade-backend={}:{}",
+                manifest.backend_recipe, manifest.backend_name
+            ),
         ],
         capabilities: capabilities(),
         lock_hash: manifest_lock_hash(&manifest),
@@ -527,13 +530,9 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
         &process_env,
     )
     .context("Lemonade server did not become ready")?;
-    let backend = ensure_best_llamacpp_backend(
-        &runtime.manifest,
-        &request.host,
-        request.port,
-        &process_env,
-    )
-    .context("failed to select a supported Lemonade llama.cpp backend")?;
+    let backend =
+        ensure_best_llamacpp_backend(&runtime.manifest, &request.host, request.port, &process_env)
+            .context("failed to select a supported Lemonade llama.cpp backend")?;
     let load_result = run_lemonade_model_load(
         &runtime.manifest,
         &request.host,

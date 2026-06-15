@@ -113,7 +113,9 @@ def resolve_cargo() -> str:
     fallback = Path.home() / ".cargo" / "bin" / exe_name("cargo")
     if fallback.is_file():
         return str(fallback)
-    fail("missing developer build command: cargo\n  Build rocm first and rerun this test with --skip-build.")
+    fail(
+        "missing developer build command: cargo\n  Build rocm first and rerun this test with --skip-build."
+    )
 
 
 def require_command(name: str, install_hint: str | None = None) -> None:
@@ -147,12 +149,20 @@ def report_windows_tool_hints() -> None:
         if not found:
             missing.append(command)
     if missing:
-        print("  note: this SDK wheel install test does not require the source-build tools above.")
-        print("  TheRock's Windows source-build docs suggest winget/manual installs for them.")
-        print("  rocm-cli should avoid installing global tools unless the user explicitly asks.")
+        print(
+            "  note: this SDK wheel install test does not require the source-build tools above."
+        )
+        print(
+            "  TheRock's Windows source-build docs suggest winget/manual installs for them."
+        )
+        print(
+            "  rocm-cli should avoid installing global tools unless the user explicitly asks."
+        )
 
 
-def isolated_env(test_root: Path, python_executable: Path, family: str | None) -> dict[str, str]:
+def isolated_env(
+    test_root: Path, python_executable: Path, family: str | None
+) -> dict[str, str]:
     env = os.environ.copy()
     env["ROCM_CLI_UPDATE_USER_PATH"] = "0"
     env["ROCM_CLI_CONFIG_DIR"] = str(test_root / "rocm-config")
@@ -257,7 +267,7 @@ def verify_manifest(
     manifest: dict[str, Any],
     expected_pip_cache_dir: Path,
 ) -> tuple[Path, Path, Path, Path]:
-    if manifest.get("format") != "wheel"":
+    if manifest.get("format") != "wheel":
         fail(f"expected pip runtime manifest, got: {manifest.get('format')}")
     python = Path(str(manifest.get("python_executable") or ""))
     if not python.is_file():
@@ -342,7 +352,9 @@ def verify_rocm_manifest_packages(manifest: dict[str, Any]) -> None:
     }
     missing = [name for name in THEROCK_RUNTIME_PACKAGES if name not in names]
     if missing:
-        fail(f"manifest rocm_sdk packages missed runtime dependencies: {', '.join(missing)}")
+        fail(
+            f"manifest rocm_sdk packages missed runtime dependencies: {', '.join(missing)}"
+        )
     if not any(name.lower().startswith("rocm-sdk-libraries") for name in names):
         fail("manifest rocm_sdk packages missed the family-specific ROCm library wheel")
 
@@ -374,8 +386,12 @@ def verify_rocm_runtime_libraries(
             fail(f"rocm_sdk.find_libraries did not resolve {name}: {libraries!r}")
         for path in paths:
             if not Path(str(path)).is_file():
-                fail(f"rocm_sdk.find_libraries returned missing path for {name}: {path}")
-    return {str(name): [str(path) for path in paths] for name, paths in libraries.items()}
+                fail(
+                    f"rocm_sdk.find_libraries returned missing path for {name}: {path}"
+                )
+    return {
+        str(name): [str(path) for path in paths] for name, paths in libraries.items()
+    }
 
 
 def main() -> int:
@@ -383,14 +399,28 @@ def main() -> int:
     parser.add_argument("--profile", choices=["debug", "release"], default="debug")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--target-dir", type=Path)
-    parser.add_argument("--root", type=Path, default=repo_root() / "target" / "therock-sdk-install")
-    parser.add_argument("--fresh", action="store_true", help="delete the test root before running")
+    parser.add_argument(
+        "--root", type=Path, default=repo_root() / "target" / "therock-sdk-install"
+    )
+    parser.add_argument(
+        "--fresh", action="store_true", help="delete the test root before running"
+    )
     parser.add_argument("--channel", choices=["release", "nightly"], default="release")
-    parser.add_argument("--family", help="override ROCM_CLI_THEROCK_FAMILY, e.g. gfx120X-all")
-    parser.add_argument("--python", help="Python executable used by rocm-cli to create the SDK venv")
-    parser.add_argument("--prefix", type=Path, help="explicit ROCm runtime folder to pass to rocm-cli")
+    parser.add_argument(
+        "--family", help="override ROCM_CLI_THEROCK_FAMILY, e.g. gfx120X-all"
+    )
+    parser.add_argument(
+        "--python", help="Python executable used by rocm-cli to create the SDK venv"
+    )
+    parser.add_argument(
+        "--prefix", type=Path, help="explicit ROCm runtime folder to pass to rocm-cli"
+    )
     parser.add_argument("--check-windows-tools", action="store_true")
-    parser.add_argument("--dry-run", action="store_true", help="resolve the install plan without downloading wheels")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="resolve the install plan without downloading wheels",
+    )
     parser.add_argument("--timeout", type=int, default=2400)
     args = parser.parse_args()
 
@@ -426,10 +456,20 @@ def main() -> int:
     bootstrap_python = ensure_bootstrap_python(test_root, args.python)
     env = isolated_env(test_root, bootstrap_python, args.family)
 
-    doctor = run("rocm doctor before SDK install", [str(rocm), "doctor"], env=env, timeout=120)
+    doctor = run(
+        "rocm doctor before SDK install", [str(rocm), "doctor"], env=env, timeout=120
+    )
     assert_contains(doctor, "rocm doctor", "doctor")
 
-    install_argv = [str(rocm), "install", "sdk", "--channel", args.channel, "--format", "wheel"]
+    install_argv = [
+        str(rocm),
+        "install",
+        "sdk",
+        "--channel",
+        args.channel,
+        "--format",
+        "wheel",
+    ]
     if args.prefix is not None:
         install_argv.extend(["--prefix", str(args.prefix)])
     if args.dry_run:
@@ -509,8 +549,12 @@ def main() -> int:
         fail("rocm_sdk targets returned empty output")
     runtime_libraries = verify_rocm_runtime_libraries(runtime_python, env)
 
-    torch_versions = verify_python_distributions(runtime_python, THEROCK_TORCH_PACKAGES, env)
-    runtime_versions = verify_python_distributions(runtime_python, THEROCK_RUNTIME_PACKAGES, env)
+    torch_versions = verify_python_distributions(
+        runtime_python, THEROCK_TORCH_PACKAGES, env
+    )
+    runtime_versions = verify_python_distributions(
+        runtime_python, THEROCK_RUNTIME_PACKAGES, env
+    )
     verify_rocm_manifest_packages(manifest)
 
     llama_detect = run(

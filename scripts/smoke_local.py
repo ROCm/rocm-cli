@@ -116,7 +116,9 @@ def isolated_env(smoke_root: Path) -> dict[str, str]:
     return env
 
 
-def binary_paths(root: Path, profile: str, target_dir: Path | None = None) -> dict[str, Path]:
+def binary_paths(
+    root: Path, profile: str, target_dir: Path | None = None
+) -> dict[str, Path]:
     binary_dir = (target_dir if target_dir is not None else root / "target") / profile
     return {
         "rocm": binary_dir / exe_name("rocm"),
@@ -198,15 +200,13 @@ with socketserver.TCPServer((host, port), Handler) as httpd:
     if platform.system() == "Windows":
         path = fake_dir / "llama-server.cmd"
         path.write_text(
-            "@echo off\r\n"
-            f'"{sys.executable}" "{server_py}" %*\r\n',
+            f'@echo off\r\n"{sys.executable}" "{server_py}" %*\r\n',
             encoding="utf-8",
         )
     else:
         path = fake_dir / "llama-server"
         path.write_text(
-            "#!/usr/bin/env sh\n"
-            f'exec "{sys.executable}" "{server_py}" "$@"\n',
+            f'#!/usr/bin/env sh\nexec "{sys.executable}" "{server_py}" "$@"\n',
             encoding="utf-8",
         )
         path.chmod(0o755)
@@ -322,7 +322,9 @@ def main() -> int:
         [rocm, "is rocm installed?"],
         env=env,
     )
-    assert_contains(freeform_status, "ROCm status", "rocm freeform installed status question")
+    assert_contains(
+        freeform_status, "ROCm status", "rocm freeform installed status question"
+    )
     assert_contains(
         freeform_status,
         "Nothing was changed.",
@@ -339,7 +341,9 @@ def main() -> int:
         [rocm, "how do i setup comfyui"],
         env=env,
     )
-    assert_contains(freeform_comfy_help, "ComfyUI status", "rocm freeform comfyui help question")
+    assert_contains(
+        freeform_comfy_help, "ComfyUI status", "rocm freeform comfyui help question"
+    )
     assert_contains(
         freeform_comfy_help,
         "Nothing was changed.",
@@ -398,15 +402,21 @@ def main() -> int:
         )
         assert_contains(
             tarball,
-            "TheRock tarball installs are not supported on Windows V1",
+            "TheRock tarball installs are not supported on Windows",
             "windows tarball rejection",
         )
 
     status = run("rocmd status", [rocmd, "status"], env=env)
     assert_contains(status, "rocmd status", "rocmd status")
 
-    bridge = parse_json(run("rocmd bridge snapshot", [rocmd, "bridge-snapshot"], env=env), "bridge snapshot")
-    if not isinstance(bridge, dict) or bridge.get("protocol") != "rocmd-codex-bridge-v0":
+    bridge = parse_json(
+        run("rocmd bridge snapshot", [rocmd, "bridge-snapshot"], env=env),
+        "bridge snapshot",
+    )
+    if (
+        not isinstance(bridge, dict)
+        or bridge.get("protocol") != "rocmd-codex-bridge-v0"
+    ):
         fail(f"unexpected bridge snapshot protocol: {bridge}")
 
     sandbox_doctor = parse_json(
@@ -445,17 +455,25 @@ def main() -> int:
         env=env,
         expect_failure=True,
     )
-    assert_contains(prefetch_failure, "prefetch_artifact requires", "sandbox prefetch validation")
+    assert_contains(
+        prefetch_failure, "prefetch_artifact requires", "sandbox prefetch validation"
+    )
 
     parse_json(run("pytorch detect", [pytorch, "detect"], env=env), "pytorch detect")
     pytorch_capabilities = parse_json(
         run("pytorch capabilities", [pytorch, "capabilities"], env=env),
         "pytorch capabilities",
     )
-    if not isinstance(pytorch_capabilities, dict) or not pytorch_capabilities.get("openai_compatible"):
-        fail(f"pytorch capabilities did not report OpenAI-compatible serving: {pytorch_capabilities}")
+    if not isinstance(pytorch_capabilities, dict) or not pytorch_capabilities.get(
+        "openai_compatible"
+    ):
+        fail(
+            f"pytorch capabilities did not report OpenAI-compatible serving: {pytorch_capabilities}"
+        )
 
-    pytorch_model = run("pytorch resolve qwen", [pytorch, "resolve-model", "qwen"], env=env)
+    pytorch_model = run(
+        "pytorch resolve qwen", [pytorch, "resolve-model", "qwen"], env=env
+    )
     assert_contains(pytorch_model, "Qwen/Qwen2.5-1.5B-Instruct", "pytorch resolve qwen")
     qwen35_failure = run(
         "pytorch reject qwen3.5",
@@ -469,7 +487,11 @@ def main() -> int:
         "pytorch reject qwen3.5",
     )
     tiny_pytorch = parse_json(
-        run("pytorch resolve tiny gpu recipe", [pytorch, "resolve-model", "tiny-gpt2"], env=env),
+        run(
+            "pytorch resolve tiny gpu recipe",
+            [pytorch, "resolve-model", "tiny-gpt2"],
+            env=env,
+        ),
         "pytorch resolve tiny-gpt2",
     )
     if (
@@ -478,7 +500,9 @@ def main() -> int:
         or tiny_pytorch.get("device_policy") != "gpu_required"
         or tiny_pytorch.get("dtype") != "float16"
     ):
-        fail(f"pytorch tiny-gpt2 did not resolve as GPU-required recipe: {tiny_pytorch}")
+        fail(
+            f"pytorch tiny-gpt2 did not resolve as GPU-required recipe: {tiny_pytorch}"
+        )
 
     parse_json(run("llama.cpp detect", [llama, "detect"], env=env), "llama.cpp detect")
     llama_capabilities = parse_json(
@@ -490,9 +514,13 @@ def main() -> int:
         or not llama_capabilities.get("openai_compatible")
         or llama_capabilities.get("quantized_models") != "gguf"
     ):
-        fail(f"llama.cpp capabilities did not report expected GGUF/OpenAI support: {llama_capabilities}")
+        fail(
+            f"llama.cpp capabilities did not report expected GGUF/OpenAI support: {llama_capabilities}"
+        )
 
-    llama_model = run("llama.cpp resolve gguf", [llama, "resolve-model", "tiny.gguf"], env=env)
+    llama_model = run(
+        "llama.cpp resolve gguf", [llama, "resolve-model", "tiny.gguf"], env=env
+    )
     assert_contains(llama_model, "tiny.gguf", "llama.cpp resolve gguf")
     llama_cpu = run(
         "llama.cpp reject cpu",
@@ -512,7 +540,9 @@ def main() -> int:
         or not atom_capabilities.get("openai_compatible")
         or atom_capabilities.get("cpu")
     ):
-        fail(f"atom capabilities did not report GPU-only OpenAI serving: {atom_capabilities}")
+        fail(
+            f"atom capabilities did not report GPU-only OpenAI serving: {atom_capabilities}"
+        )
 
     atom_model = run("atom resolve qwen", [atom, "resolve-model", "qwen"], env=env)
     assert_contains(atom_model, "qwen", "atom resolve qwen")
@@ -534,7 +564,9 @@ def main() -> int:
         or not vllm_capabilities.get("openai_compatible")
         or vllm_capabilities.get("cpu")
     ):
-        fail(f"vllm capabilities did not report GPU-only OpenAI serving: {vllm_capabilities}")
+        fail(
+            f"vllm capabilities did not report GPU-only OpenAI serving: {vllm_capabilities}"
+        )
 
     vllm_model = run("vllm resolve qwen", [vllm, "resolve-model", "qwen"], env=env)
     assert_contains(vllm_model, "qwen", "vllm resolve qwen")
@@ -556,9 +588,13 @@ def main() -> int:
         or not sglang_capabilities.get("openai_compatible")
         or sglang_capabilities.get("cpu")
     ):
-        fail(f"sglang capabilities did not report GPU-only OpenAI serving: {sglang_capabilities}")
+        fail(
+            f"sglang capabilities did not report GPU-only OpenAI serving: {sglang_capabilities}"
+        )
 
-    sglang_model = run("sglang resolve qwen", [sglang, "resolve-model", "qwen"], env=env)
+    sglang_model = run(
+        "sglang resolve qwen", [sglang, "resolve-model", "qwen"], env=env
+    )
     assert_contains(sglang_model, "qwen", "sglang resolve qwen")
     sglang_cpu = run(
         "sglang reject cpu",

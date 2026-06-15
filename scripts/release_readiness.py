@@ -16,7 +16,6 @@ import tarfile
 import zipfile
 from pathlib import Path
 
-
 ARCHIVE_SUFFIXES = (".tar.gz", ".zip")
 ROCM_RELEASE_ASSET_RE = re.compile(
     r"^rocm-cli-(?:(?:v[0-9][A-Za-z0-9._+-]*|nightly(?:-[0-9]{8}-[0-9A-Fa-f]+)?)-)?"
@@ -31,7 +30,6 @@ LINUX_REQUIRED = (
     "bin/rocm-engine-atom",
     "bin/rocm-engine-vllm",
     "bin/rocm-engine-sglang",
-    "bin/rocm-codex",
     "README.md",
     "LICENSE",
     "install.sh",
@@ -45,7 +43,6 @@ WINDOWS_REQUIRED = (
     "bin/rocm-engine-atom.exe",
     "bin/rocm-engine-vllm.exe",
     "bin/rocm-engine-sglang.exe",
-    "bin/rocm-codex.exe",
     "README.md",
     "LICENSE",
     "install.ps1",
@@ -59,7 +56,6 @@ LINUX_EXECUTABLES = (
     "bin/rocm-engine-atom",
     "bin/rocm-engine-vllm",
     "bin/rocm-engine-sglang",
-    "bin/rocm-codex",
     "install.sh",
 )
 PRODUCTION_TRUST_ENV_NAMES = (
@@ -103,7 +99,9 @@ def validate_requested_asset_name(name: str) -> None:
     if "/" in name or "\\" in name:
         raise ReadinessError(f"asset name must not contain path separators: {name}")
     if ":" in name:
-        raise ReadinessError(f"asset name must not contain drive or URI separators: {name}")
+        raise ReadinessError(
+            f"asset name must not contain drive or URI separators: {name}"
+        )
     if Path(name).name != name:
         raise ReadinessError(f"asset name must be a plain file name: {name}")
     if not is_archive(Path(name)):
@@ -183,13 +181,19 @@ def sha256_hex(path: Path) -> str:
 def parse_sha256_sidecar(path: Path) -> tuple[str, str | None]:
     if not path.is_file():
         raise ReadinessError(f"missing checksum sidecar: {path}")
-    lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    lines = [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
     if not lines:
         raise ReadinessError(f"checksum sidecar is empty: {path}")
     parts = lines[0].split()
     digest = parts[0].lower()
     if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
-        raise ReadinessError(f"checksum sidecar does not start with a sha256 digest: {path}")
+        raise ReadinessError(
+            f"checksum sidecar does not start with a sha256 digest: {path}"
+        )
     recorded_name = parts[1] if len(parts) > 1 else None
     return digest, recorded_name
 
@@ -221,7 +225,9 @@ def validate_top_level(paths: set[str], archive: Path) -> str:
     top_levels = {path.split("/", 1)[0] for path in paths}
     if len(top_levels) != 1:
         joined = ", ".join(sorted(top_levels))
-        raise ReadinessError(f"{archive.name} must contain exactly one top-level directory; found {joined}")
+        raise ReadinessError(
+            f"{archive.name} must contain exactly one top-level directory; found {joined}"
+        )
     return next(iter(top_levels))
 
 
@@ -243,14 +249,20 @@ def validate_tar_archive(archive: Path) -> list[str]:
             for member in package.getmembers():
                 normalized = normalized_archive_name(member.name)
                 if normalized in all_paths:
-                    raise ReadinessError(f"{archive.name} contains duplicate path: {normalized}")
+                    raise ReadinessError(
+                        f"{archive.name} contains duplicate path: {normalized}"
+                    )
                 all_paths.add(normalized)
                 if member.isdev() or member.issym() or member.islnk():
-                    raise ReadinessError(f"{archive.name} contains unsupported special entry: {normalized}")
+                    raise ReadinessError(
+                        f"{archive.name} contains unsupported special entry: {normalized}"
+                    )
                 if member.isfile():
                     files[normalized] = member
     except tarfile.TarError as error:
-        raise ReadinessError(f"failed to read tar archive {archive.name}: {error}") from error
+        raise ReadinessError(
+            f"failed to read tar archive {archive.name}: {error}"
+        ) from error
 
     top_level = validate_top_level(all_paths, archive)
     bundle_files: dict[str, tarfile.TarInfo] = {}
@@ -264,13 +276,17 @@ def validate_tar_archive(archive: Path) -> list[str]:
         if member is None:
             raise ReadinessError(f"{archive.name} is missing {required_file}")
         if member.size <= 0:
-            raise ReadinessError(f"{archive.name} contains empty required file {required_file}")
+            raise ReadinessError(
+                f"{archive.name} contains empty required file {required_file}"
+            )
     for executable in executables:
         member = bundle_files.get(executable)
         if member is None:
             continue
         if member.mode & 0o111 == 0:
-            raise ReadinessError(f"{archive.name} required executable is not executable: {executable}")
+            raise ReadinessError(
+                f"{archive.name} required executable is not executable: {executable}"
+            )
     return [f"bundle contents ok: {archive.name}"]
 
 
@@ -287,14 +303,20 @@ def validate_zip_archive(archive: Path) -> list[str]:
             for info in package.infolist():
                 normalized = normalized_archive_name(info.filename)
                 if normalized in all_paths:
-                    raise ReadinessError(f"{archive.name} contains duplicate path: {normalized}")
+                    raise ReadinessError(
+                        f"{archive.name} contains duplicate path: {normalized}"
+                    )
                 all_paths.add(normalized)
                 if zip_entry_is_symlink(info):
-                    raise ReadinessError(f"{archive.name} contains unsupported symlink entry: {normalized}")
+                    raise ReadinessError(
+                        f"{archive.name} contains unsupported symlink entry: {normalized}"
+                    )
                 if not info.is_dir():
                     files[normalized] = info
     except zipfile.BadZipFile as error:
-        raise ReadinessError(f"failed to read zip archive {archive.name}: {error}") from error
+        raise ReadinessError(
+            f"failed to read zip archive {archive.name}: {error}"
+        ) from error
 
     top_level = validate_top_level(all_paths, archive)
     bundle_files: dict[str, zipfile.ZipInfo] = {}
@@ -308,7 +330,9 @@ def validate_zip_archive(archive: Path) -> list[str]:
         if info is None:
             raise ReadinessError(f"{archive.name} is missing {required_file}")
         if info.file_size <= 0:
-            raise ReadinessError(f"{archive.name} contains empty required file {required_file}")
+            raise ReadinessError(
+                f"{archive.name} contains empty required file {required_file}"
+            )
     return [f"bundle contents ok: {archive.name}"]
 
 
@@ -345,7 +369,9 @@ def verify_signature(archive: Path, signature: Path, public_key: Path) -> None:
     if completed.returncode != 0:
         detail = completed.stdout.strip()
         suffix = f": {detail}" if detail else ""
-        raise ReadinessError(f"signature verification failed for {archive.name}{suffix}")
+        raise ReadinessError(
+            f"signature verification failed for {archive.name}{suffix}"
+        )
 
 
 def validate_archive(
@@ -405,7 +431,9 @@ def discover_archives(dist: Path, asset_names: list[str]) -> list[Path]:
         return [dist / name for name in asset_names]
     if not dist.is_dir():
         raise ReadinessError(f"dist directory does not exist: {dist}")
-    archives = sorted(path for path in dist.iterdir() if path.is_file() and is_archive(path))
+    archives = sorted(
+        path for path in dist.iterdir() if path.is_file() and is_archive(path)
+    )
     if not archives:
         raise ReadinessError(f"no release archives found in {dist}")
     return archives
@@ -449,16 +477,24 @@ def validate_production_trust() -> list[str]:
         "the release signing public key",
         ["ROCM_CLI_SIGNING_PUBLIC_KEY_PATH", "ROCM_CLI_SIGNING_PUBLIC_KEY_PEM"],
     )
-    if (path := env_path("ROCM_CLI_SIGNING_PUBLIC_KEY_PATH")) is not None and not path.is_file():
-        raise ReadinessError(f"ROCM_CLI_SIGNING_PUBLIC_KEY_PATH does not point to a file: {path}")
+    if (
+        path := env_path("ROCM_CLI_SIGNING_PUBLIC_KEY_PATH")
+    ) is not None and not path.is_file():
+        raise ReadinessError(
+            f"ROCM_CLI_SIGNING_PUBLIC_KEY_PATH does not point to a file: {path}"
+        )
     messages.append("release signing public key configured")
 
     require_any(
         "the runtime metadata public key",
         ["ROCM_CLI_METADATA_PUBLIC_KEY_PATH", "ROCM_CLI_METADATA_PUBLIC_KEY_PEM"],
     )
-    if (path := env_path("ROCM_CLI_METADATA_PUBLIC_KEY_PATH")) is not None and not path.is_file():
-        raise ReadinessError(f"ROCM_CLI_METADATA_PUBLIC_KEY_PATH does not point to a file: {path}")
+    if (
+        path := env_path("ROCM_CLI_METADATA_PUBLIC_KEY_PATH")
+    ) is not None and not path.is_file():
+        raise ReadinessError(
+            f"ROCM_CLI_METADATA_PUBLIC_KEY_PATH does not point to a file: {path}"
+        )
     messages.append("runtime metadata public key configured")
 
     index_path = require_existing_env_path("ROCM_CLI_MODEL_RECIPE_INDEX_PATH")
@@ -466,7 +502,9 @@ def validate_production_trust() -> list[str]:
     if signature_path is None:
         signature_path = Path(f"{index_path}.sig")
     if not signature_path.is_file():
-        raise ReadinessError(f"model recipe index signature is missing: {signature_path}")
+        raise ReadinessError(
+            f"model recipe index signature is missing: {signature_path}"
+        )
     require_existing_env_path("ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH")
     messages.append("model recipe index, signature, and public key configured")
 
@@ -511,10 +549,14 @@ def validate_release(
 
 def write_sha(path: Path, *, archive_name: str | None = None) -> None:
     target = archive_name or path.name
-    Path(f"{path}.sha256").write_text(f"{sha256_hex(path)}  {target}\n", encoding="ascii")
+    Path(f"{path}.sha256").write_text(
+        f"{sha256_hex(path)}  {target}\n", encoding="ascii"
+    )
 
 
-def add_tar_file(package: tarfile.TarFile, root: str, relative: str, executable: bool = False) -> None:
+def add_tar_file(
+    package: tarfile.TarFile, root: str, relative: str, executable: bool = False
+) -> None:
     data = f"test content for {relative}\n".encode("utf-8")
     info = tarfile.TarInfo(f"{root}/{relative}")
     info.size = len(data)
@@ -529,7 +571,9 @@ def create_test_tar(path: Path, root: str) -> None:
         root_info.mode = 0o755
         package.addfile(root_info)
         for required in LINUX_REQUIRED:
-            add_tar_file(package, root, required, executable=required in LINUX_EXECUTABLES)
+            add_tar_file(
+                package, root, required, executable=required in LINUX_EXECUTABLES
+            )
 
 
 def create_test_zip(path: Path, root: str) -> None:
@@ -631,7 +675,9 @@ def run_self_test(root: Path) -> None:
         Path(f"{stale_archive}.sig").unlink()
 
         orphan_sidecar = exact_dist / "rocm-cli-v9.9.9-windows-amd64.zip.sha256"
-        orphan_sidecar.write_text(f"{'0' * 64}  rocm-cli-v9.9.9-windows-amd64.zip\n", encoding="ascii")
+        orphan_sidecar.write_text(
+            f"{'0' * 64}  rocm-cli-v9.9.9-windows-amd64.zip\n", encoding="ascii"
+        )
         expect_failure(
             "orphan publishable sidecar",
             lambda: validate_release(
@@ -648,11 +694,15 @@ def run_self_test(root: Path) -> None:
 
         strict_linux_archive = dist / "rocm-cli-v1.2.3-linux-amd64.tar.gz"
         strict_windows_archive = dist / "rocm-cli-v1.2.3-windows-amd64.zip"
-        strict_nightly_archive = dist / "rocm-cli-nightly-20260602-abcdef0-linux-amd64.tar.gz"
+        strict_nightly_archive = (
+            dist / "rocm-cli-nightly-20260602-abcdef0-linux-amd64.tar.gz"
+        )
         strict_nightly_alias = dist / "rocm-cli-nightly-windows-amd64.zip"
         create_test_tar(strict_linux_archive, "rocm-cli-v1.2.3-linux-amd64")
         create_test_zip(strict_windows_archive, "rocm-cli-v1.2.3-windows-amd64")
-        create_test_tar(strict_nightly_archive, "rocm-cli-nightly-20260602-abcdef0-linux-amd64")
+        create_test_tar(
+            strict_nightly_archive, "rocm-cli-nightly-20260602-abcdef0-linux-amd64"
+        )
         create_test_zip(strict_nightly_alias, "rocm-cli-nightly-windows-amd64")
         for archive in (
             strict_linux_archive,
@@ -773,7 +823,9 @@ def run_self_test(root: Path) -> None:
             recipe_index_signature,
             recipe_index_public_key,
         ):
-            path.write_text(f"self-test placeholder for {path.name}\n", encoding="ascii")
+            path.write_text(
+                f"self-test placeholder for {path.name}\n", encoding="ascii"
+            )
         run_with_env(
             {
                 **{name: None for name in PRODUCTION_TRUST_ENV_NAMES},
@@ -799,7 +851,10 @@ def run_self_test(root: Path) -> None:
             "missing explicit asset",
             lambda: validate_release(
                 dist,
-                assets=["rocm-cli-test-linux-amd64.tar.gz", "missing-installer-alias.tar.gz"],
+                assets=[
+                    "rocm-cli-test-linux-amd64.tar.gz",
+                    "missing-installer-alias.tar.gz",
+                ],
                 require_signatures=True,
                 public_key=None,
                 require_production_trust=False,
@@ -842,7 +897,9 @@ def run_self_test(root: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dist", default="dist", help="Directory containing release archives.")
+    parser.add_argument(
+        "--dist", default="dist", help="Directory containing release archives."
+    )
     parser.add_argument(
         "--asset",
         action="append",
@@ -897,7 +954,9 @@ def main() -> None:
             fail(str(error))
         return
 
-    require_signatures = args.require_signatures or truthy(os.environ.get("ROCM_CLI_REQUIRE_SIGNATURE"))
+    require_signatures = args.require_signatures or truthy(
+        os.environ.get("ROCM_CLI_REQUIRE_SIGNATURE")
+    )
     require_production_trust = args.require_production_trust or truthy(
         os.environ.get("ROCM_CLI_REQUIRE_PRODUCTION_TRUST")
     )

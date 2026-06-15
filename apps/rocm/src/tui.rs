@@ -313,6 +313,24 @@ fn fallback_terminal_size_from_env() -> Option<Size> {
     )
 }
 
+/// Best-effort terminal dimensions for layout math performed outside the draw
+/// loop (e.g. resolving a follow-the-bottom scroll before the first paint).
+/// Falls back to the COLUMNS/LINES env or a sane default when the real terminal
+/// size is unavailable, such as in a headless/no-TTY process (CI).
+fn effective_terminal_size() -> (u16, u16) {
+    if let Ok((width, height)) = size()
+        && width > 1
+        && height > 1
+    {
+        return (width, height);
+    }
+    let fallback = fallback_terminal_size_from_env().unwrap_or(Size {
+        width: FALLBACK_TERMINAL_COLUMNS,
+        height: FALLBACK_TERMINAL_ROWS,
+    });
+    (fallback.width, fallback.height)
+}
+
 fn fallback_terminal_size_from_values(columns: Option<&str>, lines: Option<&str>) -> Option<Size> {
     let width = parse_terminal_dimension(columns?)?;
     let height = parse_terminal_dimension(lines?)?;
@@ -8012,9 +8030,7 @@ impl App {
         if let Some(area) = self.command_screen_last_area.get() {
             return bounded_chat_session_scroll(&command_screen_detail_text(self), area, u16::MAX);
         }
-        let Ok((terminal_width, terminal_height)) = size() else {
-            return CHAT_SESSION_FOLLOW_SCROLL;
-        };
+        let (terminal_width, terminal_height) = effective_terminal_size();
         let area = main_content_area(self, terminal_width, terminal_height);
         bounded_chat_session_scroll(&command_screen_detail_text(self), area, u16::MAX)
     }
@@ -8047,9 +8063,7 @@ impl App {
             self.scroll_command_screen_detail(lines);
             return;
         }
-        let Ok((terminal_width, terminal_height)) = size() else {
-            return;
-        };
+        let (terminal_width, terminal_height) = effective_terminal_size();
         let input_height = chat_input_area_height(self, terminal_width, terminal_height);
         let max_scroll = bounded_chat_input_scroll(
             &self.input,
@@ -16957,15 +16971,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         (_, KeyCode::F(5)) => {
             app.refresh_status();
         }
-        (_, KeyCode::Tab) => {
-            if !app.cycle_completion(CompletionDirection::Next) {
-                app.status = "No completion menu available.".to_owned();
-            }
+        (_, KeyCode::Tab) if !app.cycle_completion(CompletionDirection::Next) => {
+            app.status = "No completion menu available.".to_owned();
         }
-        (_, KeyCode::BackTab) => {
-            if !app.cycle_completion(CompletionDirection::Previous) {
-                app.status = "No completion menu available.".to_owned();
-            }
+        (_, KeyCode::BackTab) if !app.cycle_completion(CompletionDirection::Previous) => {
+            app.status = "No completion menu available.".to_owned();
         }
         (_, KeyCode::Char('y' | 'Y')) if app.pending_approval.is_some() && app.input.is_empty() => {
             app.approve_focused_action();
@@ -17010,15 +17020,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         }
         (_, KeyCode::Left) => app.move_input_left(),
         (_, KeyCode::Right) => app.move_input_right(),
-        (_, KeyCode::Up) => {
-            if !app.cycle_completion(CompletionDirection::Previous) {
-                app.previous_history();
-            }
+        (_, KeyCode::Up) if !app.cycle_completion(CompletionDirection::Previous) => {
+            app.previous_history();
         }
-        (_, KeyCode::Down) => {
-            if !app.cycle_completion(CompletionDirection::Next) {
-                app.next_history();
-            }
+        (_, KeyCode::Down) if !app.cycle_completion(CompletionDirection::Next) => {
+            app.next_history();
         }
         (_, KeyCode::PageUp) => {
             app.scroll_up(10);
@@ -44155,7 +44161,7 @@ Full log
                 if request_line.starts_with("GET /v1/models ") {
                     let response = serde_json::json!({ "data": [{ "id": model_id }] }).to_string();
                     let header = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
                         response.len()
                     );
                     let _ = stream.write_all(header.as_bytes());
@@ -44209,7 +44215,7 @@ Full log
                     });
                     let response_body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
                     let header = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
                         response_body.len()
                     );
                     let _ = stream.write_all(header.as_bytes());
@@ -44217,7 +44223,7 @@ Full log
                 } else {
                     let response = response.to_string();
                     let header = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
                         response.len()
                     );
                     let _ = stream.write_all(header.as_bytes());
@@ -44229,7 +44235,12 @@ Full log
     }
 
     fn poll_app_until_idle(app: &mut App) {
-        for _ in 0..500 {
+        // A chat turn issues up to two sequential HTTP requests, each with a 30s
+        // client timeout. On a CPU-saturated runner (the Windows CI box) the
+        // fake-server thread and the worker thread can be starved well past a
+        // few seconds, so the budget must exceed the worst-case request time;
+        // otherwise the job is still running when we assert and the test flakes.
+        for _ in 0..6_000 {
             app.poll_running_job();
             if app.running_job.is_none() {
                 return;
@@ -44564,12 +44575,10 @@ Full log
     }
 
     fn workspace_test_artifact_dir() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join(".rocm-work")
-            .join("tests")
-            .join("tui")
+        // Use the system temp dir rather than a path under the workspace: the
+        // latter is long enough (especially on CI checkouts) that rendered
+        // install paths wrap inside the TUI panels, breaking snapshot assertions.
+        std::env::temp_dir().join("rocm-cli-tests").join("tui")
     }
 
     #[cfg(unix)]

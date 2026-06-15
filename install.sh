@@ -169,10 +169,12 @@ path_expr_for_profile() {
   path="$1"
   case "$path" in
     "$HOME")
+      # Emit the literal string $HOME so the user's shell expands it later.
+      # shellcheck disable=SC2016
       printf '%s\n' '$HOME'
       ;;
     "$HOME"/*)
-      printf '%s\n' "\$HOME/${path#$HOME/}"
+      printf '%s\n' "\$HOME/${path#"$HOME"/}"
       ;;
     *)
       printf '%s\n' "$path"
@@ -336,7 +338,6 @@ bundle_dir="$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d | head -n1)"
 [ -f "${bundle_dir}/bin/rocm-engine-atom" ] || fail "bundle did not contain bin/rocm-engine-atom"
 [ -f "${bundle_dir}/bin/rocm-engine-vllm" ] || fail "bundle did not contain bin/rocm-engine-vllm"
 [ -f "${bundle_dir}/bin/rocm-engine-sglang" ] || fail "bundle did not contain bin/rocm-engine-sglang"
-[ -f "${bundle_dir}/bin/rocm-codex" ] || fail "bundle did not contain bin/rocm-codex"
 
 mkdir -p "$INSTALL_DIR"
 write_minimal_config_if_missing

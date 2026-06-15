@@ -54,8 +54,8 @@ normalize_pkg_config_libdirs() {
 normalize_openssl_headers() {
   local multiarch_openssl_dir
   multiarch_openssl_dir="$(
-    find "${EXTRACT_DIR}/usr/include" -path '*/openssl/opensslconf.h' -print -quit 2>/dev/null \
-      | xargs -r dirname
+    find "${EXTRACT_DIR}/usr/include" -path '*/openssl/opensslconf.h' -print0 -quit 2>/dev/null \
+      | xargs -0 -r dirname
   )"
   if [[ -z "${multiarch_openssl_dir}" || "${multiarch_openssl_dir}" == "${EXTRACT_DIR}/usr/include/openssl" ]]; then
     return

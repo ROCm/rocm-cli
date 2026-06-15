@@ -17,7 +17,6 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 COSMO_TARGET_KEYWORDS = ("cosmo", "cosmopolitan", "ape")
@@ -73,17 +72,24 @@ def rust_target_list(rustc: str) -> tuple[str, list[str]]:
     result = run_capture([rustc, "--print", "target-list"], env=env)
     label = rustc
     if result.returncode != 0 and "no default is configured" in result.stderr.lower():
-        fallback = run_capture([rustc, f"+{DEFAULT_TOOLCHAIN}", "--print", "target-list"], env=env)
+        fallback = run_capture(
+            [rustc, f"+{DEFAULT_TOOLCHAIN}", "--print", "target-list"], env=env
+        )
         if fallback.returncode == 0:
             result = fallback
             label = f"{rustc} +{DEFAULT_TOOLCHAIN}"
     if result.returncode != 0:
-        raise FeasibilityError(result.stderr.strip() or result.stdout.strip() or "rustc target-list failed")
+        raise FeasibilityError(
+            result.stderr.strip() or result.stdout.strip() or "rustc target-list failed"
+        )
     return label, [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
 def has_builtin_cosmopolitan_target(targets: list[str]) -> bool:
-    return any(any(keyword in target.lower() for keyword in COSMO_TARGET_KEYWORDS) for target in targets)
+    return any(
+        any(keyword in target.lower() for keyword in COSMO_TARGET_KEYWORDS)
+        for target in targets
+    )
 
 
 def matching_cosmopolitan_targets(targets: list[str]) -> list[str]:
@@ -108,7 +114,12 @@ def find_cosmocc(configured: str | None) -> str | None:
     for candidate in (
         REPO_ROOT / ".rocm-work" / "tools" / "cosmocc-wsl-elf" / "bin" / "cosmocc",
         REPO_ROOT / ".rocm-work" / "tools" / "cosmocc" / "bin" / "cosmocc",
-        REPO_ROOT / ".rocm-work" / "tools" / "cosmocc" / "bin" / "x86_64-unknown-cosmo-cc",
+        REPO_ROOT
+        / ".rocm-work"
+        / "tools"
+        / "cosmocc"
+        / "bin"
+        / "x86_64-unknown-cosmo-cc",
     ):
         if candidate.is_file():
             return str(candidate)
@@ -133,16 +144,29 @@ def compile_minimal_c_ape(compiler: str, work_dir: Path) -> Path:
 
 
 def repo_contract_messages() -> list[str]:
-    release_script = (REPO_ROOT / "scripts" / "build_single_exe_release.py").read_text(encoding="utf-8")
+    release_script = (REPO_ROOT / "scripts" / "build_single_exe_release.py").read_text(
+        encoding="utf-8"
+    )
     messages: list[str] = []
     if "Cosmopolitan universal-binary release path" in release_script:
-        messages.append("platform-native release helper is explicitly not the universal-binary path")
+        messages.append(
+            "platform-native release helper is explicitly not the universal-binary path"
+        )
     else:
-        raise FeasibilityError("native release helper wording does not distinguish platform-native from universal")
-    if "rust_cosmopolitan_spike.py" in release_script and "single_exe_release_gate.py" in release_script:
-        messages.append("release helper points universal builds to the Rust/Cosmopolitan scripts")
+        raise FeasibilityError(
+            "native release helper wording does not distinguish platform-native from universal"
+        )
+    if (
+        "rust_cosmopolitan_spike.py" in release_script
+        and "single_exe_release_gate.py" in release_script
+    ):
+        messages.append(
+            "release helper points universal builds to the Rust/Cosmopolitan scripts"
+        )
     else:
-        raise FeasibilityError("release helper does not point universal builds to the Rust/Cosmopolitan scripts")
+        raise FeasibilityError(
+            "release helper does not point universal builds to the Rust/Cosmopolitan scripts"
+        )
     return messages
 
 
@@ -156,7 +180,9 @@ def print_probe(args: argparse.Namespace) -> None:
     if matches:
         print(f"  matching targets: {', '.join(matches)}")
     else:
-        print("  next step: use a pinned custom target/build-std spike or port the bootstrap/core to C/C++")
+        print(
+            "  next step: use a pinned custom target/build-std spike or port the bootstrap/core to C/C++"
+        )
     print()
 
     print("Repo release shape")
@@ -168,10 +194,14 @@ def print_probe(args: argparse.Namespace) -> None:
     print("Cosmopolitan C probe")
     if not compiler:
         print("  cosmocc: not found")
-        print("  next step: run scripts/setup-cosmocc.sh from WSL/Linux or pass --compiler")
+        print(
+            "  next step: run scripts/setup-cosmocc.sh from WSL/Linux or pass --compiler"
+        )
         return
     print(f"  compiler: {compiler}")
-    print(f"  compiler name check: {'cosmopolitan-looking' if compiler_looks_cosmopolitan(compiler) else 'not cosmopolitan-looking'}")
+    print(
+        f"  compiler name check: {'cosmopolitan-looking' if compiler_looks_cosmopolitan(compiler) else 'not cosmopolitan-looking'}"
+    )
     if args.compile_c:
         with tempfile.TemporaryDirectory(prefix="rocm-cosmo-probe-") as temp:
             output = compile_minimal_c_ape(compiler, Path(temp))
@@ -181,12 +211,14 @@ def print_probe(args: argparse.Namespace) -> None:
 
 
 def run_self_test() -> None:
-    assert not has_builtin_cosmopolitan_target(["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"])
+    assert not has_builtin_cosmopolitan_target(
+        ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
+    )
     assert has_builtin_cosmopolitan_target(["x86_64-unknown-cosmo"])
     assert has_builtin_cosmopolitan_target(["x86_64-unknown-ape"])
-    assert matching_cosmopolitan_targets(["x86_64-unknown-linux-gnu", "x86_64-unknown-cosmo"]) == [
-        "x86_64-unknown-cosmo"
-    ]
+    assert matching_cosmopolitan_targets(
+        ["x86_64-unknown-linux-gnu", "x86_64-unknown-cosmo"]
+    ) == ["x86_64-unknown-cosmo"]
     assert compiler_looks_cosmopolitan("cosmocc")
     assert compiler_looks_cosmopolitan("x86_64-unknown-cosmo-cc")
     assert not compiler_looks_cosmopolitan("clang.exe")
@@ -198,10 +230,16 @@ def run_self_test() -> None:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    probe = subparsers.add_parser("probe", help="Inspect local Rust/Cosmopolitan feasibility.")
+    probe = subparsers.add_parser(
+        "probe", help="Inspect local Rust/Cosmopolitan feasibility."
+    )
     probe.add_argument("--rustc", default="rustc")
     probe.add_argument("--compiler", help="Path to cosmocc or x86_64-unknown-cosmo-cc.")
-    probe.add_argument("--compile-c", action="store_true", help="Compile a minimal C APE with the selected compiler.")
+    probe.add_argument(
+        "--compile-c",
+        action="store_true",
+        help="Compile a minimal C APE with the selected compiler.",
+    )
     subparsers.add_parser("self-test", help="Run offline parser/contract checks.")
     return parser.parse_args(argv)
 
