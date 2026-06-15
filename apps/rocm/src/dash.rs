@@ -167,19 +167,45 @@ pub fn resolved_args(
 }
 
 /// Entry point for `rocm dash`. Builds a tokio runtime and runs the dashboard.
-pub fn run() -> Result<()> {
+pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths)?;
+    // `--demo` writes a deterministic synthetic session and replays it, so the
+    // dashboard shows populated data with no GPU and no daemon.
+    let replay = if demo {
+        let path = std::env::temp_dir().join("rocm-dash-demo.ndjson");
+        rocm_dash_daemon::demo::generate_file(
+            &rocm_dash_daemon::demo::DemoOptions::default(),
+            &path,
+        )
+        .context("generating the demo session")?;
+        Some(path)
+    } else {
+        replay
+    };
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("building tokio runtime for the dashboard")?;
-    rt.block_on(run_async(config, paths))
+    rt.block_on(run_async(config, paths, replay, chat_mock))
 }
 
-async fn run_async(config: RocmCliConfig, paths: AppPaths) -> Result<()> {
-    let args = resolved_args(&config, &paths, ActiveTab::Overview);
-    let embedded = maybe_spawn_embedded_daemon(&args.connect, &config, &paths).await;
+async fn run_async(
+    config: RocmCliConfig,
+    paths: AppPaths,
+    replay: Option<PathBuf>,
+    chat_mock: bool,
+) -> Result<()> {
+    let mut args = resolved_args(&config, &paths, ActiveTab::Overview);
+    args.replay = replay.clone();
+    args.chat_mock = chat_mock;
+    // A live daemon is only needed when connecting; replay/demo feeds events
+    // straight into the TUI, so skip the embedded daemon in that mode.
+    let embedded = if replay.is_none() {
+        maybe_spawn_embedded_daemon(&args.connect, &config, &paths).await
+    } else {
+        None
+    };
 
     let result = rocm_dash_tui::app::run(args)
         .await

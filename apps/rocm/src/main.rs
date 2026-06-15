@@ -250,7 +250,17 @@ enum Command {
     /// Start the background helper in the foreground.
     Daemon,
     /// Launch the unified telemetry dashboard (TUI) with an embedded daemon.
-    Dash,
+    Dash {
+        /// Replay a recorded session NDJSON instead of connecting to a live daemon.
+        #[arg(long, value_name = "FILE")]
+        replay: Option<PathBuf>,
+        /// Show a deterministic synthetic demo session (no GPU or daemon needed).
+        #[arg(long, conflicts_with = "replay")]
+        demo: bool,
+        /// Use the offline mock chat backend (no live LLM).
+        #[arg(long)]
+        chat_mock: bool,
+    },
     /// Remove ROCm CLI-managed files from this computer.
     Uninstall {
         /// Do not ask for interactive confirmation.
@@ -1295,7 +1305,11 @@ fn dispatch(cli: Cli) -> Result<()> {
             print!("{}", render_daemon_text(&paths, &config));
             Ok(())
         }
-        Some(Command::Dash) => dash::run(),
+        Some(Command::Dash {
+            replay,
+            demo,
+            chat_mock,
+        }) => dash::run(replay, demo, chat_mock),
         Some(Command::Uninstall {
             yes,
             dry_run,
