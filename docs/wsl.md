@@ -176,7 +176,7 @@ Safe tests that do not mutate global WSL state:
 - `python scripts/wsl_preflight.py --self-test`
 - `python scripts/wsl_preflight.py --json`
 - `python scripts/wsl_preflight.py --require-ready` on a prepared WSL machine
-- `rocm install sdk --channel release --format pip --dry-run` inside WSL with
+- `rocm install sdk --channel release --format wheel --dry-run` inside WSL with
   isolated `ROCM_CLI_*` directories
 
 Gated tests that require explicit opt-in because they may download packages or

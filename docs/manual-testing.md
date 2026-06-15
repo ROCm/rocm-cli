@@ -103,7 +103,7 @@ Expected result:
 This tests the command-line install path without using the TUI:
 
 ```powershell
-rocm install sdk --channel release --format pip --prefix .\.rocm-work\data\envs\default
+rocm install sdk --channel release --format wheel --prefix .\.rocm-work\data\envs\default
 rocm runtimes list
 rocm runtimes activate <runtime_key>
 rocm doctor

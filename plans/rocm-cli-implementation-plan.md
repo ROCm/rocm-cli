@@ -265,7 +265,7 @@ use these surfaces instead:
 ### Primary Commands
 - `rocm`
 - `rocm doctor`
-- `rocm install sdk --channel release|nightly [--format pip|tarball] [--prefix PATH]`
+- `rocm install sdk --channel release|nightly [--format wheel|tarball] [--prefix PATH]`
 - `rocm install driver --dkms`
 - `rocm update`
 - `rocm model`
@@ -273,6 +273,7 @@ use these surfaces instead:
 - `rocm engines install <engine>`
 - `rocm serve <model>`
 - `rocm chat --provider local|anthropic|openai`
+- `rocm dash [--demo | --replay <FILE> | --chat-mock]`
 - `rocm automations list`
 - `rocm automations enable <watcher>`
 - `rocm logs`

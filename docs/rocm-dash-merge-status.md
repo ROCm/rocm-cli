@@ -1,10 +1,14 @@
 # rocm-dash → rocm-cli merge — status & handoff (EAI-6871)
 
-> Branch: `integration/rocm-dash-merge` (local; **never pushed** to the ROCm org).
+> Branch: `our-spec` (current working branch; supersedes the earlier
+> `integration/rocm-dash-merge`).
 > Base: `837067f` ("Import rocm-cli"). Source: `~/git/rocm-dash/app` @ `main`.
-> Scope of this branch: **Phase 1 (foundation)** of `wiki/plans/rocm-cli-unification.md`
-> (that plan lives in the rocm-dash repo). Pure-engineering; governance/legal gates
-> (G1 license, G3/G4/G5) are tracked out-of-band.
+> Scope of this branch: **Phase 1 (foundation) + Phase 2 (fold) COMPLETE** of
+> `wiki/plans/rocm-cli-unification.md` (that plan lives in the rocm-dash repo). The
+> standalone rocm-dash has been folded into the `rocm` binary: `rocm dash` launches the
+> unified dashboard TUI (tabs: Overview / Hardware / Instances / Bench / Chat) backed by
+> an embedded daemon. Pure-engineering; governance/legal gates (G1 license, G3/G4/G5) are
+> tracked out-of-band.
 
 ## What landed (Phase 1 — green)
 
@@ -25,7 +29,10 @@ The four rocm-dash **library** crates are first-class workspace members under `c
   `rocm-dash-collectors` (0.12) + `rocm-dash-tui` (0.13, via Rig).
 - **Vendor not promoted:** the rocm-dash `crates/vendor/*` (stale March snapshot) and the rocm-dash
   `rocm` bin were intentionally **not** copied. `apps/rocm` remains the sole `rocm` bin. The bin's
-  vendor→real-crate reconcile + verb fold is **Phase 2**.
+  vendor→real-crate reconcile + verb fold (now **Phase 2, complete**): `rocm dash` launches the
+  unified telemetry dashboard (tabs Overview / Hardware / Instances / Bench / Chat) backed by an
+  embedded daemon. Note: bare `rocm` and `rocm chat` still launch the legacy chat-first assistant
+  (`apps/rocm/src/tui.rs`); its retirement is deferred.
 - Verified: `cargo build --workspace --all-targets` green; the 4 crates at **exact parity** with rocm-dash.
 
 ## Pre-existing `apps/rocm` test failures (NOT caused by this merge)
@@ -53,5 +60,8 @@ These belong to the rocm-cli side and predate the merge. Do **not** treat them a
 - **crossterm 0.28→0.29 unification** + port `app.rs` off the crossterm-0.28 `EventStream`. The two
   versions coexist cleanly today; unification is a nicety, sequenced with the TUI work.
 - **collectors reqwest 0.12→0.13 unification** (cosmetic; both coexist).
-- Everything in **Phase 2** (config/engines/daemon/dispatch + bin fold + vendor→real reconcile) and
-  **Phase 3** (unified-TUI screen merge + chat split). See `wiki/plans/rocm-cli-unification*.md`.
+- **Phase 2** (config/engines/daemon/dispatch + bin fold + vendor→real reconcile) is now
+  **complete** — `rocm dash` is live (Unix-only for the live socket transport; `--demo`/`--replay`
+  also run on Windows). **Phase 3** (unified-TUI screen merge + chat split) has also landed (no-key
+  ChatGPT OAuth chat backend; config unified into `config.json` with legacy `config.toml`
+  auto-migration). See `wiki/plans/rocm-cli-unification*.md`.
