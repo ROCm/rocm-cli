@@ -60,7 +60,7 @@ Completed behavior:
 
 - `rocm doctor` should report a compatible TheRock family when Windows GPU
   inventory is available.
-- `rocm install sdk --format pip` should use that detected compatible family.
+- `rocm install sdk --format wheel` should use that detected compatible family.
 - `ROCM_CLI_THEROCK_FAMILY` or `--family gfx120X-all` should appear only in
   deterministic test instructions, not normal quick-start instructions.
 

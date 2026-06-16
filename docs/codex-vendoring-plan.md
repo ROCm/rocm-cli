@@ -1,6 +1,6 @@
 # Codex TUI Vendoring Plan For `rocm-cli`
 
-> **SUPERSEDED (EAI-6912 / EAI-6913).** The vendored Codex approach has been
+> **SUPERSEDED.** The vendored Codex approach has been
 > dropped. The ~70-crate vendored tree caused the Linux CI timeout and shipped
 > no essential functionality (it was reachable only via the hidden
 > `--experimental-codex-tui` flag spawning a separate `rocm-codex` binary). The

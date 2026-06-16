@@ -117,6 +117,46 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  coverage:
+    name: Coverage (rocm-dash crates, ratcheted)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install native build deps
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libcap-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-cov-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-cov-
+
+      # Ratcheted, fail-on-regression floor scoped to the transplanted rocm-dash
+      # crates (the clean anchor) — deliberately NOT the whole workspace, so the
+      # gate does not over-claim coverage of the large untyped rocm-cli core
+      # Baseline measured 2026-06-11: 73.7% lines across the four
+      # crates. Floor set just below measured; ratchet upward as the larger TUI
+      # tab files (bench/overview/modal) gain tests.
+      - name: Coverage gate (rocm-dash crates, >= 70% lines)
+        run: |
+          cargo llvm-cov --no-cfg-coverage \
+            -p rocm-dash-core -p rocm-dash-collectors \
+            -p rocm-dash-daemon -p rocm-dash-tui \
+            --fail-under-lines 70
+
   gpu-smoke:
     name: GPU Smoke (gfx1151)
     runs-on: [self-hosted, windows-gfx1151-gpu-rocm]

@@ -14,6 +14,13 @@ flate2 = "1.1"
 keyring-core.workspace = true
 ratatui.workspace = true
 rocm-core = { path = "../../crates/rocm-core" }
+# rocm-dash unified dashboard launch. The
+# telemetry daemon + ratatui-0.30 TUI are launched from the `dash` verb; tokio
+# drives the async daemon/TUI from the otherwise-sync `rocm` binary.
+# (rocm-dash-core is pulled in transitively by the two below — not a direct dep.)
+rocm-dash-daemon = { path = "../../crates/rocm-dash-daemon" }
+rocm-dash-tui = { path = "../../crates/rocm-dash-tui" }
+tokio = { workspace = true }
 rocm-engine-atom = { path = "../../engines/atom" }
 rocm-engine-lemonade = { path = "../../engines/lemonade" }
 rocm-engine-llama-cpp = { path = "../../engines/llama-cpp" }

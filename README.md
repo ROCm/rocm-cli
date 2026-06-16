@@ -40,12 +40,29 @@ Serve a local model:
 rocm serve qwen --engine lemonade --managed
 ```
 
+Open the live telemetry dashboard — GPU utilization, serving instances,
+benchmarks, and a chat tab:
+
+```bash
+rocm dash
+```
+
+No GPU handy? Try the built-in demo — a deterministic synthetic session that
+needs no GPU or daemon:
+
+```bash
+rocm dash --demo
+```
+
+> The live dashboard currently requires Unix domain sockets (Linux/WSL); the
+> `--demo` and `--replay <file>` modes work on every platform.
+
 ## Developer Checks
 
 Command-line ROCm install:
 
 ```bash
-rocm install sdk --channel release --format pip
+rocm install sdk --channel release --format wheel
 rocm runtimes list
 ```
 
