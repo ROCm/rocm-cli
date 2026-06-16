@@ -9,6 +9,7 @@ opt-in because they need an already installed managed TheRock runtime.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import shutil
 import subprocess
@@ -99,10 +100,8 @@ def stage_release_artifact(source: Path, destination: Path) -> Path:
         return destination
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, destination)
-    try:
+    with contextlib.suppress(OSError):
         destination.chmod(destination.stat().st_mode | 0o755)
-    except OSError:
-        pass
     print(f"[single-exe-gate] staged release artifact: {destination}")
     return destination
 
@@ -285,4 +284,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except (GateError, subprocess.SubprocessError, OSError) as error:
         print(f"[single-exe-gate] failed: {error}", file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from error

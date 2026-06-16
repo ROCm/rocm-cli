@@ -45,4 +45,53 @@ sha2 = { version = "0.10", features = ["oid"] }
 tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# `deny` (not `forbid`) so the few functions doing platform FFI can opt back in
+# with a documented `#[allow(unsafe_code)]`; everything else is denied.
+# (`unreachable_pub` is intentionally NOT enabled: this workspace is dominated by
+# binary crates where every `pub` item is unreachable, so it only adds noise.)
+unsafe_code = "deny"
+
+# Strictest *practical* clippy config. Lint groups are enabled at warn with a
+# lowered priority so the targeted `allow`s below win. CI promotes warnings to
+# errors via `cargo clippy ... -D warnings`.
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# Documented allow-list: high-noise / low-value lints whose findings would force
+# large, mechanical, or risky churn for little benefit on this codebase. Each is
+# centralized here so it can be re-enabled and burned down later.
+#
+# Docs / naming / metadata churn:
+missing_errors_doc = "allow"      # would require `# Errors` docs on every fallible fn
+missing_panics_doc = "allow"      # would require `# Panics` docs on every fn that can panic
+must_use_candidate = "allow"      # `#[must_use]` on every getter-style fn is noise here
+too_many_lines = "allow"          # long fns (TUI/install flows) are deliberate, not split-worthy
+module_name_repetitions = "allow" # `engine::EngineConfig` naming is intentional and clear
+doc_markdown = "allow"            # flags product names (ROCm, GPU ids) as needing backticks
+similar_names = "allow"           # short domain names (gfx/gpu, src/dst) are intentionally alike
+struct_excessive_bools = "allow"  # flat config/probe-result records use bool fields by design
+multiple_crate_versions = "allow" # unactionable: duplicate versions come from transitive deps
+cargo_common_metadata = "allow"   # internal-only crates don't need description/keywords
+#
+# Signature/API churn (changing these ripples through many call sites for little gain):
+needless_pass_by_value = "allow"     # taking `&T` everywhere would churn many signatures + callers
+trivially_copy_pass_by_ref = "allow" # mirror of the above for small Copy types
+unnecessary_wraps = "allow"          # several fns keep `Result`/`Option` for API consistency
+#
+# Deliberate numeric casts (values are known-in-range; `as` is intentional here):
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+#
+# Nursery lints (still unstable / frequently reduce readability or are micro-opts):
+assigning_clones = "allow"           # `clone_into` micro-opt across 500+ sites; not worth the churn
+option_if_let_else = "allow"         # the rewrite is often less readable than the `if let`
+branches_sharing_code = "allow"      # hoisting shared branch code often hurts clarity
+significant_drop_tightening = "allow" # lock-scope rewrites are subtle; opt in deliberately
+redundant_pub_crate = "allow"        # `pub(crate)` in private modules is intentional/harmless here
+useless_let_if_seq = "allow"         # has false positives; several flags are set across multiple `if`s
+#
+# Style preference: explicit match arms are clearer than merging here.
+match_same_arms = "allow"

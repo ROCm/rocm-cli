@@ -107,11 +107,11 @@ struct ComfyUiRunReport {
     endpoint_reachable: bool,
 }
 
-pub(crate) fn default_host() -> &'static str {
+pub(crate) const fn default_host() -> &'static str {
     COMFYUI_DEFAULT_HOST
 }
 
-pub(crate) fn default_port() -> u16 {
+pub(crate) const fn default_port() -> u16 {
     COMFYUI_DEFAULT_PORT
 }
 
@@ -120,70 +120,64 @@ pub(crate) fn render_status(paths: &AppPaths, config: &RocmCliConfig) -> Result<
     writeln!(output, "{APP_NAME}")?;
     writeln!(output)?;
 
-    match load_manifest(paths)? {
-        Some(manifest) => {
-            writeln!(output, "  installed: yes")?;
-            writeln!(
-                output,
-                "  ROCm install: {}",
-                therock::runtime_version_display(&manifest.runtime_version)
-            )?;
-            writeln!(output, "  folder: {}", manifest.runtime_root.display())?;
-            writeln!(
-                output,
-                "  models path: {}",
-                models_folder_for_manifest(&manifest).display()
-            )?;
-            writeln!(
-                output,
-                "  AMD GPU check: {}",
-                if manifest.torch_cuda_available {
-                    "ready"
-                } else {
-                    "failed"
-                }
-            )?;
-        }
-        None => {
-            writeln!(output, "  installed: no")?;
-            writeln!(output, "  next step: rocm comfyui install")?;
-        }
+    if let Some(manifest) = load_manifest(paths)? {
+        writeln!(output, "  installed: yes")?;
+        writeln!(
+            output,
+            "  ROCm install: {}",
+            therock::runtime_version_display(&manifest.runtime_version)
+        )?;
+        writeln!(output, "  folder: {}", manifest.runtime_root.display())?;
+        writeln!(
+            output,
+            "  models path: {}",
+            models_folder_for_manifest(&manifest).display()
+        )?;
+        writeln!(
+            output,
+            "  AMD GPU check: {}",
+            if manifest.torch_cuda_available {
+                "ready"
+            } else {
+                "failed"
+            }
+        )?;
+    } else {
+        writeln!(output, "  installed: no")?;
+        writeln!(output, "  next step: rocm comfyui install")?;
     }
 
-    match load_state(paths)? {
-        Some(state) => {
-            let run_report = evaluate_running_state(&state);
-            writeln!(output)?;
-            writeln!(output, "Running")?;
-            writeln!(
-                output,
-                "  status: {}",
-                comfyui_run_state_cli_label(run_report.state)
-            )?;
-            writeln!(output, "  url: {}", state.url)?;
-            match run_report.state {
-                ComfyUiRunState::Running => {}
-                ComfyUiRunState::Starting => {
-                    writeln!(output, "  note: starting")?;
-                }
-                ComfyUiRunState::Stopped => {
-                    writeln!(output, "  next step: rocm comfyui start")?;
-                }
+    if let Some(state) = load_state(paths)? {
+        let run_report = evaluate_running_state(&state);
+        writeln!(output)?;
+        writeln!(output, "Running")?;
+        writeln!(
+            output,
+            "  status: {}",
+            comfyui_run_state_cli_label(run_report.state)
+        )?;
+        writeln!(output, "  url: {}", state.url)?;
+        match run_report.state {
+            ComfyUiRunState::Running => {}
+            ComfyUiRunState::Starting => {
+                writeln!(output, "  note: starting")?;
+            }
+            ComfyUiRunState::Stopped => {
+                writeln!(output, "  next step: rocm comfyui start")?;
             }
         }
-        None => {
-            writeln!(output)?;
-            writeln!(output, "Running")?;
-            if let Some(url) = default_unmanaged_running_url() {
-                writeln!(output, "  status: running outside rocm-cli")?;
-                writeln!(output, "  url: {url}")?;
-                writeln!(
-                    output,
-                    "  note: ROCm CLI did not start this ComfyUI process"
-                )?;
-            } else {
-                writeln!(output, "  status: not started by rocm-cli")?;
-            }
+    } else {
+        writeln!(output)?;
+        writeln!(output, "Running")?;
+        if let Some(url) = default_unmanaged_running_url() {
+            writeln!(output, "  status: running outside rocm-cli")?;
+            writeln!(output, "  url: {url}")?;
+            writeln!(
+                output,
+                "  note: ROCm CLI did not start this ComfyUI process"
+            )?;
+        } else {
+            writeln!(output, "  status: not started by rocm-cli")?;
         }
     }
 
@@ -205,66 +199,60 @@ pub(crate) fn render_tui_status(paths: &AppPaths, config: &RocmCliConfig) -> Res
     let mut output = String::new();
     writeln!(output, "{APP_NAME}")?;
     writeln!(output)?;
-    match load_manifest(paths)? {
-        Some(manifest) => {
-            writeln!(output, "Installed")?;
-            writeln!(output, "  status: ready")?;
-            writeln!(
-                output,
-                "  ROCm install: {}",
-                therock::runtime_version_display(&manifest.runtime_version)
-            )?;
-            writeln!(
-                output,
-                "  models path: {}",
-                models_folder_for_manifest(&manifest).display()
-            )?;
-            writeln!(
-                output,
-                "  AMD GPU check: {}",
-                if manifest.torch_cuda_available {
-                    "ready"
-                } else {
-                    "needs attention"
-                }
-            )?;
-        }
-        None => {
-            writeln!(output, "Not installed yet")?;
-            writeln!(output, "  Choose Install ComfyUI below.")?;
-        }
+    if let Some(manifest) = load_manifest(paths)? {
+        writeln!(output, "Installed")?;
+        writeln!(output, "  status: ready")?;
+        writeln!(
+            output,
+            "  ROCm install: {}",
+            therock::runtime_version_display(&manifest.runtime_version)
+        )?;
+        writeln!(
+            output,
+            "  models path: {}",
+            models_folder_for_manifest(&manifest).display()
+        )?;
+        writeln!(
+            output,
+            "  AMD GPU check: {}",
+            if manifest.torch_cuda_available {
+                "ready"
+            } else {
+                "needs attention"
+            }
+        )?;
+    } else {
+        writeln!(output, "Not installed yet")?;
+        writeln!(output, "  Choose Install ComfyUI below.")?;
     }
 
     writeln!(output)?;
-    match load_state(paths)? {
-        Some(state) => {
-            let run_report = evaluate_running_state(&state);
-            writeln!(output, "Running")?;
-            match run_report.state {
-                ComfyUiRunState::Running => {
-                    writeln!(output, "  status: running")?;
-                    writeln!(output, "  URL: {}", state.url)?;
-                }
-                ComfyUiRunState::Starting => {
-                    writeln!(output, "  status: starting")?;
-                    writeln!(output, "  URL: {}", state.url)?;
-                    writeln!(output, "  Waiting for the browser page to answer.")?;
-                }
-                ComfyUiRunState::Stopped => {
-                    writeln!(output, "  status: stopped")?;
-                    writeln!(output, "  Choose Start ComfyUI below to run it again.")?;
-                }
+    if let Some(state) = load_state(paths)? {
+        let run_report = evaluate_running_state(&state);
+        writeln!(output, "Running")?;
+        match run_report.state {
+            ComfyUiRunState::Running => {
+                writeln!(output, "  status: running")?;
+                writeln!(output, "  URL: {}", state.url)?;
+            }
+            ComfyUiRunState::Starting => {
+                writeln!(output, "  status: starting")?;
+                writeln!(output, "  URL: {}", state.url)?;
+                writeln!(output, "  Waiting for the browser page to answer.")?;
+            }
+            ComfyUiRunState::Stopped => {
+                writeln!(output, "  status: stopped")?;
+                writeln!(output, "  Choose Start ComfyUI below to run it again.")?;
             }
         }
-        None => {
-            writeln!(output, "Running")?;
-            if let Some(url) = default_unmanaged_running_url() {
-                writeln!(output, "  status: running outside rocm-cli")?;
-                writeln!(output, "  URL: {url}")?;
-                writeln!(output, "  ROCm CLI did not start this ComfyUI process.")?;
-            } else {
-                writeln!(output, "  status: not started")?;
-            }
+    } else {
+        writeln!(output, "Running")?;
+        if let Some(url) = default_unmanaged_running_url() {
+            writeln!(output, "  status: running outside rocm-cli")?;
+            writeln!(output, "  URL: {url}")?;
+            writeln!(output, "  ROCm CLI did not start this ComfyUI process.")?;
+        } else {
+            writeln!(output, "  status: not started")?;
         }
     }
 
@@ -401,7 +389,7 @@ pub(crate) fn install(
                     "comfyui".to_owned(),
                     "install".to_owned(),
                     "--runtime-id".to_owned(),
-                    runtime.manifest.runtime_key.clone(),
+                    runtime.manifest.runtime_key,
                 ],
             )
         )?;
@@ -424,11 +412,7 @@ pub(crate) fn install(
         fs::remove_dir_all(&source_path)
             .with_context(|| format!("failed to remove {}", source_path.display()))?;
     }
-    if !source_path.exists() {
-        println!("Downloading ComfyUI source...");
-        let _ = io::stdout().flush();
-        download_and_extract_source(&app_root, &source_path, &mut log)?;
-    } else {
+    if source_path.exists() {
         println!("Using existing ComfyUI source folder...");
         let _ = io::stdout().flush();
         writeln!(
@@ -436,6 +420,10 @@ pub(crate) fn install(
             "Using existing ComfyUI folder at {}.",
             source_path.display()
         )?;
+    } else {
+        println!("Downloading ComfyUI source...");
+        let _ = io::stdout().flush();
+        download_and_extract_source(&app_root, &source_path, &mut log)?;
     }
     fs::create_dir_all(&models_folder)
         .with_context(|| format!("failed to create {}", models_folder.display()))?;
@@ -475,9 +463,9 @@ pub(crate) fn install(
         python_executable: runtime.python.clone(),
         source_url: COMFYUI_SOURCE_ARCHIVE_URL.to_owned(),
         source_path: source_path.clone(),
-        requirements_path: requirements_path.clone(),
+        requirements_path,
         pip_cache_dir: None,
-        log_path: log_path.clone(),
+        log_path,
         torch_version: probe.torch_version.clone(),
         torch_cuda_available: probe.torch_cuda_available,
         installed_at_unix_ms: unix_time_millis(),
@@ -535,12 +523,12 @@ pub(crate) fn start(paths: &AppPaths, options: ComfyUiStartOptions) -> Result<St
         port: options.port,
         pid,
         source_path: manifest.source_path.clone(),
-        python_executable: manifest.python_executable.clone(),
+        python_executable: manifest.python_executable,
         log_path: log_path.clone(),
         started_at_unix_ms: unix_time_millis(),
     };
     save_state(paths, &state)?;
-    let run_report = wait_for_running_state(&state, Duration::from_secs(180));
+    let run_report = wait_for_running_state(&state, Duration::from_mins(3));
     if run_report.state == ComfyUiRunState::Stopped {
         bail!(
             "ComfyUI stopped before the local URL was ready. Check the log at {}",
@@ -799,8 +787,10 @@ fn start_log_path_for_manifest(manifest: &ComfyUiManifest) -> PathBuf {
     manifest
         .source_path
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| manifest.runtime_root.join("apps").join(APP_ID))
+        .map_or_else(
+            || manifest.runtime_root.join("apps").join(APP_ID),
+            Path::to_path_buf,
+        )
         .join("logs")
         .join(format!("start-{}.log", unix_time_millis()))
 }
@@ -948,7 +938,7 @@ fn wait_for_running_state(state: &ComfyUiState, timeout: Duration) -> ComfyUiRun
     last_report
 }
 
-fn comfyui_run_state_cli_label(state: ComfyUiRunState) -> &'static str {
+const fn comfyui_run_state_cli_label(state: ComfyUiRunState) -> &'static str {
     match state {
         ComfyUiRunState::Running => "running",
         ComfyUiRunState::Starting => "starting",
@@ -1026,8 +1016,7 @@ fn unix_process_is_running(pid: u32) -> bool {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .is_ok_and(|status| status.success())
 }
 
 fn wait_until_stopped(pid: u32) {
@@ -1405,15 +1394,15 @@ fn download_and_extract_source(
             .parent()
             .context("ComfyUI archive path has no parent directory")?,
     )?;
-    if !archive_path.is_file() {
-        writeln!(log, "Downloading {COMFYUI_SOURCE_ARCHIVE_URL}.")?;
-        download_file(COMFYUI_SOURCE_ARCHIVE_URL, &archive_path)?;
-    } else {
+    if archive_path.is_file() {
         writeln!(
             log,
             "Using downloaded source archive {}.",
             archive_path.display()
         )?;
+    } else {
+        writeln!(log, "Downloading {COMFYUI_SOURCE_ARCHIVE_URL}.")?;
+        download_file(COMFYUI_SOURCE_ARCHIVE_URL, &archive_path)?;
     }
     let extract_root = app_root
         .join("extract")
@@ -1475,7 +1464,7 @@ fn copy_dir_all(from: &Path, to: &Path) -> Result<()> {
 }
 
 fn download_file(url: &str, destination: &Path) -> Result<()> {
-    download_file_to_path(url, destination, Duration::from_secs(120))
+    download_file_to_path(url, destination, Duration::from_mins(2))
 }
 
 fn filtered_requirement_specs(requirements_path: &Path) -> Result<Vec<String>> {
@@ -1484,8 +1473,7 @@ fn filtered_requirement_specs(requirements_path: &Path) -> Result<Vec<String>> {
     let mut output = Vec::new();
     for token in requirement_tokens(&text) {
         if requirement_package_name(&token)
-            .map(|name| matches!(name.as_str(), "torch" | "torchvision" | "torchaudio"))
-            .unwrap_or(false)
+            .is_some_and(|name| matches!(name.as_str(), "torch" | "torchvision" | "torchaudio"))
         {
             continue;
         }
@@ -1637,7 +1625,7 @@ fn probe_comfyui(
     let script = format!(
         r#"
 import json, sys
-sys.path.insert(0, {source})
+sys.path.insert(0, {source_literal})
 import torch
 result = {{
     "torch_version": getattr(torch, "__version__", None),
@@ -1647,8 +1635,7 @@ result = {{
 }}
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(result, handle)
-"#,
-        source = source_literal
+"#
     );
     fs::write(&probe_path, script)
         .with_context(|| format!("failed to write {}", probe_path.display()))?;
@@ -1740,7 +1727,7 @@ fn create_temp_dir_under(root: &Path, label: &str) -> Result<PathBuf> {
         ));
         match fs::create_dir(&path) {
             Ok(()) => return Ok(path),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => {
                 return Err(error).with_context(|| format!("failed to create {}", path.display()));
             }
@@ -1827,9 +1814,9 @@ mod tests {
         let kept = requirement_tokens(text)
             .into_iter()
             .filter(|token| {
-                !requirement_package_name(token)
-                    .map(|name| matches!(name.as_str(), "torch" | "torchvision" | "torchaudio"))
-                    .unwrap_or(false)
+                !requirement_package_name(token).is_some_and(|name| {
+                    matches!(name.as_str(), "torch" | "torchvision" | "torchaudio")
+                })
             })
             .collect::<Vec<_>>();
         assert_eq!(kept, vec!["numpy>=1.25".to_owned(), "aiohttp".to_owned()]);
@@ -2139,8 +2126,8 @@ mod tests {
             pip_cache_dir: None,
             rocm_sdk: Some(therock::RocmSdkPythonProbe {
                 import_ok: true,
-                root_path: Some(sdk_root.clone()),
-                bin_path: Some(sdk_bin.clone()),
+                root_path: Some(sdk_root),
+                bin_path: Some(sdk_bin),
                 resolved_libraries: vec![
                     therock::RocmSdkLibraryProbe {
                         shortname: "amdhip64".to_owned(),
@@ -2213,7 +2200,7 @@ mod tests {
                 import_ok: true,
                 root_path: Some(sdk_root.clone()),
                 bin_path: Some(sdk_bin.clone()),
-                runtime_roots: vec![runtime_root.clone()],
+                runtime_roots: vec![runtime_root],
                 bin_paths: vec![sdk_bin.clone()],
                 library_paths: vec![sdk_lib.clone()],
                 ..Default::default()
@@ -2300,7 +2287,7 @@ mod tests {
             pip_cache_dir: None,
             rocm_sdk: Some(therock::RocmSdkPythonProbe {
                 import_ok: true,
-                root_path: Some(sdk_root.clone()),
+                root_path: Some(sdk_root),
                 bin_path: Some(sdk_bin),
                 resolved_libraries: vec![
                     therock::RocmSdkLibraryProbe {

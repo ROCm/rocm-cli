@@ -13,6 +13,7 @@ use rocm_core::{
 use rocm_core::{generate_rsa_signing_keypair, sign_rsa_pkcs1_sha256_signature};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -83,14 +84,14 @@ impl TheRockChannel {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Release => "release",
             Self::Nightly => "nightly",
         }
     }
 
-    fn tarball_base_url(self) -> &'static str {
+    const fn tarball_base_url(self) -> &'static str {
         match self {
             Self::Release => THEROCK_RELEASE_TARBALL_BASE,
             Self::Nightly => THEROCK_NIGHTLY_TARBALL_BASE,
@@ -475,7 +476,6 @@ fn ensure_install_format_supported_for_platform(format: &str, windows: bool) -> 
 pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
     let manifests = load_runtime_manifests(paths)?;
     let mut output = String::new();
-    use std::fmt::Write as _;
     let _ = writeln!(output, "update");
     let _ = writeln!(
         output,
@@ -659,7 +659,7 @@ fn startup_update_check_disabled() -> bool {
     std::env::var_os("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK").is_some()
 }
 
-fn startup_update_check_due(previous_unix_ms: u128, now_unix_ms: u128) -> bool {
+const fn startup_update_check_due(previous_unix_ms: u128, now_unix_ms: u128) -> bool {
     now_unix_ms.saturating_sub(previous_unix_ms) >= STARTUP_UPDATE_CHECK_INTERVAL_MS
 }
 
@@ -807,7 +807,6 @@ fn install_wheel_runtime(
     let manifest_path = runtime_manifest_path(paths, &runtime_key);
 
     let mut output = String::new();
-    use std::fmt::Write as _;
     let _ = writeln!(output, "sdk install");
     let _ = writeln!(
         output,
@@ -880,8 +879,7 @@ fn install_wheel_runtime(
         let _ = writeln!(output, "  mode: dry-run");
         let _ = writeln!(
             output,
-            "  command: uv {} && uv {}",
-            venv_args_display, install_args_display
+            "  command: uv {venv_args_display} && uv {install_args_display}"
         );
         let _ = writeln!(
             output,
@@ -1025,7 +1023,6 @@ fn install_tarball_runtime(
     let cache_path = paths.cache_dir.join("therock").join(&artifact.file_name);
 
     let mut output = String::new();
-    use std::fmt::Write as _;
     let _ = writeln!(output, "sdk install");
     let _ = writeln!(output, "  channel: {}", channel.as_str());
     let _ = writeln!(output, "  format: tarball");
@@ -1145,9 +1142,7 @@ fn resolve_pip_runtime_with_timeout(
         version_selector,
     )
     .with_context(|| {
-        let requested = version_selector
-            .map(RuntimeVersionSelector::describe)
-            .unwrap_or_else(|| "latest compatible version".to_owned());
+        let requested = version_selector.map_or_else(|| "latest compatible version".to_owned(), RuntimeVersionSelector::describe);
         format!(
             "no mutually compatible TheRock rocm[libraries,devel], torch, torchvision, and torchaudio versions were found for {requested} in {index_url}"
         )
@@ -1320,9 +1315,7 @@ fn channel_rocm_candidates(versions: &[String], channel: TheRockChannel) -> Vec<
         let stable = all
             .iter()
             .filter(|version| {
-                parse_version(version)
-                    .map(|parsed| parsed.stage == VersionStage::Stable)
-                    .unwrap_or(false)
+                parse_version(version).is_some_and(|parsed| parsed.stage == VersionStage::Stable)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -1341,9 +1334,7 @@ fn select_latest_stack_package(
     let mut candidates = package_versions_matching_rocm(versions, rocm_version)
         .into_iter()
         .filter(|version| {
-            parse_package_base_version(version)
-                .map(|base| matches_stack(&base))
-                .unwrap_or(false)
+            parse_package_base_version(version).is_some_and(|base| matches_stack(&base))
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| compare_version_strings(left, right));
@@ -1429,7 +1420,7 @@ fn normalize_requested_build_date(value: &str) -> Result<String> {
     }
     let digits = trimmed
         .chars()
-        .filter(|ch| ch.is_ascii_digit())
+        .filter(char::is_ascii_digit)
         .collect::<String>();
     if digits.len() != 8 {
         bail!("TheRock build date `{trimmed}` must use YYYY-MM-DD, YYYYMMDD, or MMDDYYYY");
@@ -1480,7 +1471,7 @@ fn validate_date_components(year: u32, month: u32, day: u32) -> Result<()> {
     Ok(())
 }
 
-fn days_in_month(year: u32, month: u32) -> u32 {
+const fn days_in_month(year: u32, month: u32) -> u32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
@@ -1490,7 +1481,7 @@ fn days_in_month(year: u32, month: u32) -> u32 {
     }
 }
 
-fn is_leap_year(year: u32) -> bool {
+const fn is_leap_year(year: u32) -> bool {
     (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
@@ -1655,10 +1646,7 @@ fn select_latest_version(versions: &[String], channel: TheRockChannel) -> Option
     let mut all = versions.to_vec();
     all.sort_by(|left, right| compare_version_strings(left, right));
     for version in versions {
-        if parse_version(version)
-            .map(|parsed| parsed.stage == VersionStage::Stable)
-            .unwrap_or(false)
-        {
+        if parse_version(version).is_some_and(|parsed| parsed.stage == VersionStage::Stable) {
             stable.push(version.clone());
         }
     }
@@ -1678,7 +1666,7 @@ impl MetadataSignaturePolicy {
         }
     }
 
-    fn active(&self) -> bool {
+    const fn active(&self) -> bool {
         self.required || self.public_key_path.is_some() || self.public_key_pem.is_some()
     }
 
@@ -1705,15 +1693,12 @@ impl MetadataSignaturePolicy {
 }
 
 fn truthy_env(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim(),
-                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
-            )
-        })
-        .unwrap_or(false)
+    std::env::var(name).ok().is_some_and(|value| {
+        matches!(
+            value.trim(),
+            "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+        )
+    })
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
@@ -2022,8 +2007,7 @@ fn http_get(
     }
     let timeout = max_time_secs
         .filter(|value| *value > 0)
-        .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(600));
+        .map_or_else(|| Duration::from_mins(10), Duration::from_secs);
     let agent = ureq::AgentBuilder::new().timeout(timeout).build();
     let mut request = agent.get(url).set("User-Agent", "rocm-cli");
     for (name, value) in headers {
@@ -2057,11 +2041,11 @@ fn http_get(
     })
 }
 
-fn use_curl_http() -> bool {
+const fn use_curl_http() -> bool {
     cfg!(target_vendor = "cosmo")
 }
 
-fn use_windows_powershell_http() -> bool {
+const fn use_windows_powershell_http() -> bool {
     runtime_is_windows() && !cfg!(target_vendor = "cosmo")
 }
 
@@ -2364,7 +2348,7 @@ fn linux_temp_dir(prefix: &str) -> Result<PathBuf> {
         let dir = root.join(format!("{base}-{attempt}"));
         match fs::create_dir(&dir) {
             Ok(()) => return Ok(dir),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {
                 return Err(error).with_context(|| format!("failed to create {}", dir.display()));
             }
@@ -2383,7 +2367,7 @@ fn windows_temp_dir(prefix: &str) -> Result<PathBuf> {
         let dir = root.join(format!("{base}-{attempt}"));
         match fs::create_dir(&dir) {
             Ok(()) => return Ok(dir),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {
                 return Err(error).with_context(|| format!("failed to create {}", dir.display()));
             }
@@ -2416,11 +2400,10 @@ fn windows_child_status_success(status: std::process::ExitStatus) -> bool {
 fn windows_http_keep_temp() -> bool {
     std::env::var("ROCM_CLI_DEBUG_WINDOWS_HTTP")
         .ok()
-        .map(|value| {
+        .is_some_and(|value| {
             let value = value.trim().to_ascii_lowercase();
             matches!(value.as_str(), "1" | "true" | "yes" | "on")
         })
-        .unwrap_or(false)
 }
 
 fn windows_http_failure_temp_note(temp_dir: &Path) -> String {
@@ -2431,7 +2414,7 @@ fn windows_http_failure_temp_note(temp_dir: &Path) -> String {
     }
 }
 
-fn windows_http_get_script() -> &'static str {
+const fn windows_http_get_script() -> &'static str {
     r#"
 param(
   [Parameter(Mandatory=$true)][string]$Url,
@@ -2874,7 +2857,7 @@ fn run_command(program: &Path, args: &[&str], context_text: &str) -> Result<()> 
     } else {
         format!("command exited with status {}", output.status)
     };
-    bail!("{}: {}", context_text, detail)
+    bail!("{context_text}: {detail}")
 }
 
 #[allow(dead_code)]
@@ -2913,12 +2896,12 @@ fn run_command_with_env(
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    let detail = if !stderr.is_empty() {
-        stderr
-    } else {
+    let detail = if stderr.is_empty() {
         format!("command exited with status {}", output.status)
+    } else {
+        stderr
     };
-    bail!("{}: {}", context_text, detail)
+    bail!("{context_text}: {detail}")
 }
 
 fn run_uv_progress_command(uv: &Path, args: &[&str], context_text: &str) -> Result<()> {
@@ -2989,11 +2972,10 @@ fn record_managed_python_config(paths: &AppPaths, python: &Path) -> Result<()> {
 fn managed_python_bootstrap_disabled() -> bool {
     std::env::var("ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP")
         .ok()
-        .map(|value| {
+        .is_some_and(|value| {
             let value = value.trim().to_ascii_lowercase();
             matches!(value.as_str(), "1" | "true" | "yes" | "on")
         })
-        .unwrap_or(false)
 }
 
 fn managed_python_version() -> String {
@@ -3212,7 +3194,7 @@ fn verify_python_can_create_venv(program: &Path) -> Result<()> {
         "probe Python virtual environment support",
     );
     let _ = fs::remove_dir_all(&probe_root);
-    result.map(|_| ())
+    result
 }
 
 fn python_venv_probe_temp_root() -> Result<PathBuf> {
@@ -3254,7 +3236,7 @@ fn parse_version(value: &str) -> Option<ParsedVersion> {
 
     let patch_len = patch_and_rest
         .chars()
-        .take_while(|ch| ch.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
         .count();
     if patch_len == 0 {
         return None;
@@ -3285,7 +3267,7 @@ fn therock_index_url(family: &str) -> String {
     format!("{THEROCK_PIP_INDEX_BASE}/{family}")
 }
 
-fn platform_tarball_token() -> &'static str {
+const fn platform_tarball_token() -> &'static str {
     if runtime_is_windows() {
         "windows"
     } else {
@@ -3648,6 +3630,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     fn python_launcher_prefers_path_python_before_saved_managed_python() -> Result<()> {
         let _guard = PYTHON_RESOLVER_TEST_ENV_LOCK.lock().unwrap();
         let (root, paths) = test_paths("python-prefers-path");
@@ -3668,7 +3651,7 @@ mod tests {
         // Keep PATH hermetic: appending the real PATH lets a genuine cp312
         // python (present on CI) win over the fake one and breaks the
         // executable assertion. The fake on PATH is all this test needs.
-        let joined_path = std::env::join_paths([bin_dir.clone()])?;
+        let joined_path = std::env::join_paths([bin_dir])?;
         unsafe {
             std::env::set_var("PATH", joined_path);
             std::env::remove_var("ROCM_CLI_PYTHON");
@@ -3706,6 +3689,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     fn python_venv_probe_temp_root_uses_windows_temp_env() -> Result<()> {
         if !runtime_is_windows() {
             return Ok(());
@@ -3756,6 +3740,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     fn python_launcher_prefers_path_python_over_managed_when_venv_capable() -> Result<()> {
         let _guard = PYTHON_RESOLVER_TEST_ENV_LOCK.lock().unwrap();
         let (root, paths) = test_paths("python-path-over-managed");
@@ -3766,14 +3751,14 @@ mod tests {
         fs::create_dir_all(&managed_dir)?;
         let managed_python = write_fake_python_with_venv(&managed_dir, "python")?;
         let manifest = ManagedPythonManifest {
-            executable: managed_python.clone(),
+            executable: managed_python,
             version: "3.12".to_owned(),
             installed_at_unix_ms: 123,
         };
         save_managed_python_manifest(&paths, &manifest)?;
         let old_path = std::env::var_os("PATH");
         let old_rocm_cli_python = std::env::var_os("ROCM_CLI_PYTHON");
-        let joined_path = std::env::join_paths([bin_dir.clone()])?;
+        let joined_path = std::env::join_paths([bin_dir])?;
         unsafe {
             std::env::set_var("PATH", joined_path);
             std::env::remove_var("ROCM_CLI_PYTHON");
@@ -3798,6 +3783,7 @@ mod tests {
 
     #[cfg(unix)]
     fn write_fake_python_with_venv(dir: &Path, name: &str) -> Result<PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
         let script = r#"#!/bin/sh
 if [ "$1" = "-c" ]; then
@@ -3816,7 +3802,6 @@ fi
 echo Python 3.12.10
 "#;
         fs::write(&path, script)?;
-        use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
         Ok(path)
     }
@@ -4124,7 +4109,7 @@ echo Python 3.12.10
                 format: manifest.format.clone(),
                 family: manifest.family.clone(),
                 installed_version: manifest.version.clone(),
-                latest_version: Some(manifest.version.clone()),
+                latest_version: Some(manifest.version),
                 status: "up_to_date".to_owned(),
                 message: None,
                 checked_at_unix_ms: 2_000,
@@ -4366,8 +4351,7 @@ echo Python 3.12.10
             format: "wheel".to_owned(),
             family: runtime_id
                 .split_once(':')
-                .map(|(_, family)| family.to_owned())
-                .unwrap_or_else(|| "gfx120X-all".to_owned()),
+                .map_or_else(|| "gfx120X-all".to_owned(), |(_, family)| family.to_owned()),
             family_source: "test".to_owned(),
             version: "7.13.0a20260416".to_owned(),
             install_root: PathBuf::from("runtime-root"),

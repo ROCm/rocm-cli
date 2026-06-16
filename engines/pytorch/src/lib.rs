@@ -168,7 +168,7 @@ enum TheRockChannel {
 }
 
 impl TheRockChannel {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Release => "release",
             Self::Nightly => "nightly",
@@ -484,6 +484,7 @@ where
 }
 
 fn detect_response() -> DetectResponse {
+    use std::fmt::Write as _;
     let manifest = latest_env_manifest().ok().flatten();
     let installed = manifest.is_some();
     let detected_family = detect_host_therock_family();
@@ -567,13 +568,12 @@ fn detect_response() -> DetectResponse {
 
     let rocm_gpu_available = torch_probe
         .as_ref()
-        .map(|probe| probe.cuda_available)
-        .unwrap_or_else(|| detected_family.is_some());
+        .map_or_else(|| detected_family.is_some(), |probe| probe.cuda_available);
     let rocm_gpu_reason = match torch_probe.as_ref() {
         Some(probe) if probe.cuda_available => {
             let mut reason = format!("torch.cuda reports {} device(s)", probe.device_count);
             if !probe.devices.is_empty() {
-                reason.push_str(&format!(": {}", probe.devices.join(", ")));
+                let _ = write!(reason, ": {}", probe.devices.join(", "));
             }
             Some(reason)
         }
@@ -665,7 +665,7 @@ fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelRe
         loader: recipe.loader.to_owned(),
         trust_remote_code: recipe.trust_remote_code,
         chat_template_mode: recipe.chat_template_mode.to_owned(),
-        dtype: recipe.preferred_dtype.to_owned(),
+        dtype: recipe.preferred_dtype.clone(),
         device_policy,
         estimated_memory: recipe.estimated_memory,
         launch_defaults: json!({
@@ -909,7 +909,7 @@ fn stop_service(request: StopRequest) -> Result<StopResponse> {
         });
     let already_terminal = matches!(
         state_status.as_deref(),
-        Some("stopped") | Some("failed") | Some("exited")
+        Some("stopped" | "failed" | "exited")
     );
     let stopped = stopped_any || (had_pid && !failed_any) || (!had_pid && already_terminal);
     if stopped {
@@ -932,8 +932,7 @@ fn service_files(service_id: &str) -> Result<ServiceFiles> {
     let record_matches_engine = record
         .as_ref()
         .and_then(|record| record.engine.as_deref())
-        .map(|engine| engine == ENGINE_NAME)
-        .unwrap_or_else(|| record.is_some());
+        .map_or_else(|| record.is_some(), |engine| engine == ENGINE_NAME);
     let state_path = record
         .as_ref()
         .filter(|_| record_matches_engine)
@@ -1016,17 +1015,16 @@ fn build_healthcheck_response(
         .and_then(|value| value_string(value, "status"))
         .unwrap_or_else(|| "unknown".to_owned());
     let health_status = health_payload.and_then(|value| value_string(value, "status"));
-    let mut status = if health_status.as_deref() == Some("ok") {
-        "ready".to_owned()
-    } else {
-        state_status.clone()
-    };
-    if matches!(state_status.as_str(), "ready" | "running")
+    let status = if matches!(state_status.as_str(), "ready" | "running")
         && health_payload.is_none()
         && probe_error.is_some()
     {
-        status = "unreachable".to_owned();
-    }
+        "unreachable".to_owned()
+    } else if health_status.as_deref() == Some("ok") {
+        "ready".to_owned()
+    } else {
+        state_status
+    };
 
     let device = health_payload
         .and_then(|value| value_string(value, "device"))
@@ -1280,9 +1278,7 @@ fn remove_managed_env_dir_with_retry(env_path: &Path) -> Result<()> {
         }
     }
 
-    let error = last_error
-        .map(|error| error.to_string())
-        .unwrap_or_else(|| "unknown error".to_owned());
+    let error = last_error.map_or_else(|| "unknown error".to_owned(), |error| error.to_string());
     bail!(
         "failed to remove managed PyTorch env {} after {} attempts. Close any ROCm, Python, or model server process using this folder and try again. Last error: {error}",
         env_path.display(),
@@ -1315,22 +1311,21 @@ fn clear_readonly_recursive(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn clear_readonly_recursive(_path: &Path) -> Result<()> {
+const fn clear_readonly_recursive(_path: &Path) -> Result<()> {
     Ok(())
 }
 
 fn create_or_update_env_manifest(request: &InstallRequest) -> Result<EngineEnvManifest> {
     let paths = AppPaths::discover()?;
     paths.ensure()?;
-    let engine_envs_dir = request
-        .env_root
-        .as_ref()
-        .map(|root| {
+    let engine_envs_dir = request.env_root.as_ref().map_or_else(
+        || paths.engine_envs_dir(ENGINE_NAME),
+        |root| {
             normalize_runtime_path_for_host(root)
                 .join(ENGINE_NAME)
                 .join("envs")
-        })
-        .unwrap_or_else(|| paths.engine_envs_dir(ENGINE_NAME));
+        },
+    );
     fs::create_dir_all(&engine_envs_dir)?;
     fs::create_dir_all(paths.engine_locks_dir(ENGINE_NAME))?;
     fs::create_dir_all(paths.engine_manifests_dir(ENGINE_NAME))?;
@@ -1365,7 +1360,7 @@ fn create_or_update_env_manifest(request: &InstallRequest) -> Result<EngineEnvMa
     };
 
     if !request.reinstall
-        && let Some(manifest) = existing_manifest.clone()
+        && let Some(manifest) = existing_manifest
         && manifest.env_path.is_dir()
         && (manifest_has_torch(&manifest) || therock_resolution.is_none())
     {
@@ -1391,7 +1386,11 @@ fn create_or_update_env_manifest(request: &InstallRequest) -> Result<EngineEnvMa
 
     let mut engine_dep_args = uv_pip_install_base(&python_executable);
     engine_dep_args.extend(["--only-binary".to_owned(), ":all:".to_owned()]);
-    engine_dep_args.extend(ENGINE_DEPENDENCIES.iter().map(|s| s.to_string()));
+    engine_dep_args.extend(
+        ENGINE_DEPENDENCIES
+            .iter()
+            .map(std::string::ToString::to_string),
+    );
     run_uv_progress_command(
         &uv,
         engine_dep_args.iter().map(String::as_str),
@@ -1422,7 +1421,11 @@ fn create_or_update_env_manifest(request: &InstallRequest) -> Result<EngineEnvMa
         )?;
         let mut stack_args = uv_pip_install_base(&python_executable);
         stack_args.extend(["--only-binary".to_owned(), ":all:".to_owned()]);
-        stack_args.extend(TORCH_STACK_DEPENDENCIES.iter().map(|s| s.to_string()));
+        stack_args.extend(
+            TORCH_STACK_DEPENDENCIES
+                .iter()
+                .map(std::string::ToString::to_string),
+        );
         run_uv_progress_command(
             &uv,
             stack_args.iter().map(String::as_str),
@@ -1437,7 +1440,11 @@ fn create_or_update_env_manifest(request: &InstallRequest) -> Result<EngineEnvMa
                 install_therock_torch_packages(&uv, &python_executable, &resolution)?;
                 let mut stack_args = uv_pip_install_base(&python_executable);
                 stack_args.extend(["--only-binary".to_owned(), ":all:".to_owned()]);
-                stack_args.extend(TORCH_STACK_DEPENDENCIES.iter().map(|s| s.to_string()));
+                stack_args.extend(
+                    TORCH_STACK_DEPENDENCIES
+                        .iter()
+                        .map(std::string::ToString::to_string),
+                );
                 run_uv_progress_command(
                     &uv,
                     stack_args.iter().map(String::as_str),
@@ -1515,8 +1522,7 @@ fn create_or_update_env_manifest(request: &InstallRequest) -> Result<EngineEnvMa
                     if !probe
                         .torch_rocm_init
                         .as_ref()
-                        .map(|init| init.present)
-                        .unwrap_or(false)
+                        .is_some_and(|init| init.present)
                     {
                         warnings.push(
                         "torch._rocm_init was not found; TheRock library preloading may be unavailable"
@@ -1859,19 +1865,12 @@ fn serve_http(
         let current_status = read_service_state(&state_path)
             .0
             .and_then(|value| value_string(&value, "status"));
-        if matches!(
-            current_status.as_deref(),
-            Some("stopped") | Some("stopping")
-        ) {
+        if matches!(current_status.as_deref(), Some("stopped" | "stopping")) {
             mark_json_status(&state_path, "stopped")?;
             return Ok(());
         }
         mark_json_status(&state_path, "failed")?;
-        bail!(
-            "pytorch worker exited with status {} for service {}",
-            status,
-            service_id
-        )
+        bail!("pytorch worker exited with status {status} for service {service_id}")
     }
 }
 
@@ -2240,7 +2239,7 @@ fn normalize_pytorch_device_policy(policy: DevicePolicy) -> Result<DevicePolicy>
     }
 }
 
-fn device_policy_name(policy: &DevicePolicy) -> &'static str {
+const fn device_policy_name(policy: &DevicePolicy) -> &'static str {
     match policy {
         DevicePolicy::GpuRequired => "gpu_required",
         DevicePolicy::GpuPreferred => "gpu_preferred",
@@ -2268,7 +2267,7 @@ fn managed_env_id(runtime_id: &str, python_version: Option<&str>) -> String {
     )
 }
 
-fn default_python_version() -> &'static str {
+const fn default_python_version() -> &'static str {
     "3.12"
 }
 
@@ -2441,8 +2440,7 @@ fn pinned_torch_package_specs_from_runtime(python_executable: &str) -> Result<Ve
     }
 
     let code = format!(
-        "import importlib.metadata as md, json; names = {names:?}; print(json.dumps({{name: md.version(name) for name in names}}, sort_keys=True))",
-        names = THEROCK_TORCH_PACKAGES
+        "import importlib.metadata as md, json; names = {THEROCK_TORCH_PACKAGES:?}; print(json.dumps({{name: md.version(name) for name in names}}, sort_keys=True))"
     );
     let output = capture_command(
         python_executable,
@@ -2496,38 +2494,34 @@ fn site_packages_candidates_for_python(python_executable: &str) -> Vec<PathBuf> 
         if parent
             .file_name()
             .and_then(|value| value.to_str())
-            .map(|value| value.eq_ignore_ascii_case("scripts"))
-            .unwrap_or(false)
+            .is_some_and(|value| value.eq_ignore_ascii_case("scripts"))
             && let Some(env_root) = parent.parent()
         {
             candidates.push(env_root.join("Lib").join("site-packages"));
         }
         candidates.push(parent.join("Lib").join("site-packages"));
-    } else {
-        if parent
-            .file_name()
-            .and_then(|value| value.to_str())
-            .map(|value| value == "bin")
-            .unwrap_or(false)
-            && let Some(env_root) = parent.parent()
-        {
-            let lib_dir = env_root.join("lib");
-            if let Ok(entries) = fs::read_dir(&lib_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    let name = entry.file_name();
-                    let name = name.to_string_lossy();
-                    if name.starts_with("python") {
-                        candidates.push(path.join("site-packages"));
-                    }
+    } else if parent
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value == "bin")
+        && let Some(env_root) = parent.parent()
+    {
+        let lib_dir = env_root.join("lib");
+        if let Ok(entries) = fs::read_dir(&lib_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with("python") {
+                    candidates.push(path.join("site-packages"));
                 }
             }
-            candidates.push(
-                lib_dir
-                    .join(format!("python{}", default_python_version()))
-                    .join("site-packages"),
-            );
         }
+        candidates.push(
+            lib_dir
+                .join(format!("python{}", default_python_version()))
+                .join("site-packages"),
+        );
     }
     candidates.sort();
     candidates.dedup();
@@ -2544,8 +2538,7 @@ fn installed_package_specs_from_dist_info_dir(site_packages: &Path) -> Result<Ve
         let is_dist_info = path
             .file_name()
             .and_then(|value| value.to_str())
-            .map(|value| value.to_ascii_lowercase().ends_with(".dist-info"))
-            .unwrap_or(false);
+            .is_some_and(|value| value.to_ascii_lowercase().ends_with(".dist-info"));
         if !path.is_dir() || !is_dist_info {
             continue;
         }
@@ -2858,7 +2851,7 @@ fn ensure_service_env(runtime_id: Option<&str>, env_id: Option<&str>) -> Result<
         }
         return create_or_update_env_manifest(&InstallRequest {
             runtime_id: manifest.runtime_id.clone(),
-            python_version: manifest.requested_python_version.clone(),
+            python_version: manifest.requested_python_version,
             env_root: None,
             reinstall: true,
         });
@@ -3128,7 +3121,7 @@ fn command_path(path: &Path) -> String {
     normalize_runtime_path_text_for_host(&path.display().to_string())
 }
 
-fn cosmo_windows_host() -> bool {
+const fn cosmo_windows_host() -> bool {
     runtime_is_windows() && !cfg!(windows)
 }
 
@@ -3192,9 +3185,9 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 impl From<DevicePolicyArg> for DevicePolicy {
     fn from(value: DevicePolicyArg) -> Self {
         match value {
-            DevicePolicyArg::GpuRequired => DevicePolicy::GpuRequired,
-            DevicePolicyArg::GpuPreferred => DevicePolicy::GpuPreferred,
-            DevicePolicyArg::CpuOnly => DevicePolicy::CpuOnly,
+            DevicePolicyArg::GpuRequired => Self::GpuRequired,
+            DevicePolicyArg::GpuPreferred => Self::GpuPreferred,
+            DevicePolicyArg::CpuOnly => Self::CpuOnly,
         }
     }
 }
@@ -3208,7 +3201,7 @@ mod tests {
             contract_version: contract_version.to_owned(),
             engine: engine.to_owned(),
             required_flags: vec!["--trust-remote-code=false".to_owned()],
-            parser_settings: Default::default(),
+            parser_settings: BTreeMap::default(),
             preferred_endpoint: None,
             unsupported_combinations: Vec::new(),
             notes: vec!["test recipe".to_owned()],

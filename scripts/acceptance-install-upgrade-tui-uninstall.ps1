@@ -117,7 +117,7 @@ function Resolve-CommandPath {
     Fail "missing required command: $Name"
 }
 
-function Test-PathListContains {
+function Test-PathInList {
     param(
         [string] $PathList,
         [string] $Path
@@ -240,7 +240,7 @@ try {
         )
         Invoke-Checked "acceptance: PATH-updating install" $psExe $pathUpdateInstallArgs $PathUpdateInstallLog
         $updatedUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-        if (-not (Test-PathListContains $updatedUserPath $PathUpdateInstallDir)) {
+        if (-not (Test-PathInList $updatedUserPath $PathUpdateInstallDir)) {
             Fail "installer did not add install dir to the user PATH"
         }
         if (-not (Select-String -LiteralPath $PathUpdateInstallLog -Pattern "user PATH updated" -Quiet)) {

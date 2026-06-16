@@ -37,11 +37,14 @@ repos:
         args: [--fix]
       - id: ruff-format
 
-  # Shell scripts (install.sh, scripts/*.sh).
+  # Shell scripts (install.sh, scripts/*.sh). `--enable=all` turns on every
+  # optional check; SC2310/SC2312 (set -e suppression in conditionals) are
+  # excluded as they require risky restructuring of these setup scripts.
   - repo: https://github.com/shellcheck-py/shellcheck-py
     rev: v0.11.0.1
     hooks:
       - id: shellcheck
+        args: [--enable=all, --exclude=SC2310,SC2312]
 
   # Rust + PowerShell: mirror the CI checks using the local toolchain.
   - repo: local
@@ -69,5 +72,11 @@ repos:
       - id: powershell-syntax
         name: powershell syntax check
         entry: python scripts/check_powershell_syntax.py
+        language: system
+        files: \.ps1$
+      - id: powershell-script-analyzer
+        name: PSScriptAnalyzer
+        # Requires PowerShell (pwsh) + the PSScriptAnalyzer module installed locally.
+        entry: pwsh -NoProfile -Command "$r = $args | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Settings ./PSScriptAnalyzerSettings.psd1 }; if ($r) { $r | Format-Table -AutoSize; exit 1 }"
         language: system
         files: \.ps1$

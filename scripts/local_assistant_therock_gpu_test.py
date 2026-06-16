@@ -10,6 +10,7 @@ CPU fallback.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import http.client
 import json
 import os
@@ -492,10 +493,8 @@ def wait_local_endpoint(manifest: dict[str, Any], timeout: int) -> None:
             except OSError as error:
                 last_error = str(error)
             finally:
-                try:
+                with contextlib.suppress(Exception):
                     conn.close()  # type: ignore[name-defined]
-                except Exception:
-                    pass
         time.sleep(2)
     raise RuntimeError(
         "managed service endpoint did not report the requested loaded model "
@@ -597,12 +596,13 @@ def assert_chat_output(output: str, *, require_tool_call: bool) -> None:
     for needle in forbidden:
         if needle in output:
             raise RuntimeError(f"chat output contained forbidden `{needle}`:\n{output}")
-    if require_tool_call:
-        if "ROCm checks used" not in output or "none requested" in output:
-            raise RuntimeError(
-                "local assistant did not request a ROCm tool call; retry without "
-                "--require-tool-call or choose a tool-calling model/prompt.\n" + output
-            )
+    if require_tool_call and (
+        "ROCm checks used" not in output or "none requested" in output
+    ):
+        raise RuntimeError(
+            "local assistant did not request a ROCm tool call; retry without "
+            "--require-tool-call or choose a tool-calling model/prompt.\n" + output
+        )
 
 
 def find_ready_service_id(data_dir: Path, model: str, engine: str) -> str:

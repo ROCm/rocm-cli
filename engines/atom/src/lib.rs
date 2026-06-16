@@ -358,8 +358,7 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
     let env_path = runtime
         .command
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     Ok(InstallResponse {
         env_id: runtime.env_id.clone(),
         env_path: env_path.display().to_string(),
@@ -764,9 +763,10 @@ fn runtime_from_python(
     let version = probe_atom_version(&python)
         .with_context(|| format!("ATOM package not found in {}", python.display()))?
         .unwrap_or_else(|| "unknown".to_owned());
-    let (command, launcher) = atom_command_from_python(&python)
-        .map(|command| (command, AtomLauncher::Command))
-        .unwrap_or_else(|| (python.clone(), AtomLauncher::PythonModule));
+    let (command, launcher) = atom_command_from_python(&python).map_or_else(
+        || (python.clone(), AtomLauncher::PythonModule),
+        |command| (command, AtomLauncher::Command),
+    );
     Ok(AtomRuntime {
         runtime_id: runtime_id.to_owned(),
         env_id: format!("external-atom-{}", stable_id_component(runtime_id)),
@@ -821,24 +821,22 @@ fn resolve_managed_runtime(runtime_id: Option<&str>) -> Result<Option<AtomRuntim
             .as_deref()
             .unwrap_or("therock-atom-runtime")
             .to_owned();
-        let source = manifest
-            .runtime_key
-            .as_deref()
-            .map(|key| format!("managed_runtime_manifest:{key}"))
-            .unwrap_or_else(|| "managed_runtime_manifest".to_owned());
+        let source = manifest.runtime_key.as_deref().map_or_else(
+            || "managed_runtime_manifest".to_owned(),
+            |key| format!("managed_runtime_manifest:{key}"),
+        );
         let (sdk_root, sdk_bin, sdk_bin_paths, sdk_library_paths) = manifest
             .rocm_sdk
             .as_ref()
             .filter(|probe| probe.import_ok)
-            .map(|probe| {
+            .map_or((None, None, Vec::new(), Vec::new()), |probe| {
                 (
                     probe.root_path.clone(),
                     probe.bin_path.clone(),
                     probe.bin_paths.clone(),
                     probe.library_paths.clone(),
                 )
-            })
-            .unwrap_or((None, None, Vec::new(), Vec::new()));
+            });
         if let Ok(runtime) = runtime_from_python(
             python,
             &runtime_id,
@@ -1243,7 +1241,7 @@ fn current_unix_millis() -> u128 {
         .as_millis()
 }
 
-fn windows_unsupported_message() -> &'static str {
+const fn windows_unsupported_message() -> &'static str {
     "ATOM ROCm serving is supported by rocm-cli only on Linux/WSL; native Windows ATOM is not enabled. No CPU fallback is used."
 }
 
@@ -1272,7 +1270,7 @@ mod tests {
             contract_version: contract_version.to_owned(),
             engine: engine.to_owned(),
             required_flags: vec!["--reasoning-parser".to_owned(), "qwen3".to_owned()],
-            parser_settings: Default::default(),
+            parser_settings: std::collections::BTreeMap::default(),
             preferred_endpoint: None,
             unsupported_combinations: Vec::new(),
             notes: vec!["test recipe".to_owned()],

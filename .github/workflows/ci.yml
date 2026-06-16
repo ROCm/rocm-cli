@@ -157,6 +157,42 @@ jobs:
             -p rocm-dash-daemon -p rocm-dash-tui \
             --fail-under-lines 70
 
+  lint:
+    name: Lint (Python / Shell / PowerShell)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Ruff (lint + format)
+        uses: astral-sh/ruff-action@v3
+        with:
+          version: 0.15.16
+          args: check scripts engines
+      - name: Ruff format check
+        uses: astral-sh/ruff-action@v3
+        with:
+          version: 0.15.16
+          args: format --check scripts engines
+
+      - name: ShellCheck (all optional checks)
+        uses: ludeeus/action-shellcheck@master
+        env:
+          SHELLCHECK_OPTS: --enable=all --exclude=SC2310,SC2312
+        with:
+          scandir: '.'
+          ignore_paths: third_party
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          $files = Get-ChildItem -Recurse -Filter *.ps1 |
+            Where-Object { $_.FullName -notmatch 'third_party' }
+          $findings = $files | ForEach-Object {
+            Invoke-ScriptAnalyzer -Path $_.FullName -Settings ./PSScriptAnalyzerSettings.psd1
+          }
+          if ($findings) { $findings | Format-Table -AutoSize; exit 1 }
+
   gpu-smoke:
     name: GPU Smoke (gfx1151)
     runs-on: [self-hosted, windows-gfx1151-gpu-rocm]

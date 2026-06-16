@@ -192,12 +192,14 @@ def reset_tar_info(info: tarfile.TarInfo) -> tarfile.TarInfo:
 
 def create_tar_gz(root: Path, archive: Path) -> None:
     archive.parent.mkdir(parents=True, exist_ok=True)
-    with archive.open("wb") as raw:
-        with gzip.GzipFile(
+    with (
+        archive.open("wb") as raw,
+        gzip.GzipFile(
             filename="", mode="wb", fileobj=raw, compresslevel=9, mtime=0
-        ) as gz:
-            with tarfile.open(fileobj=gz, mode="w") as package:
-                package.add(root, arcname=root.name, filter=reset_tar_info)
+        ) as gz,
+        tarfile.open(fileobj=gz, mode="w") as package,
+    ):
+        package.add(root, arcname=root.name, filter=reset_tar_info)
 
 
 def assert_no_codex(archive: Path) -> None:

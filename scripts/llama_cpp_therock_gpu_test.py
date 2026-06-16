@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import http.client
 import json
 import os
@@ -508,7 +509,7 @@ def wait_health(host: str, port: int, timeout: int) -> dict[str, Any]:
             health = get_json(host, port, "/health", timeout=3)
             if health.get("status") == "ok":
                 return health
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             last_error = exc
         time.sleep(0.5)
     raise RuntimeError(f"llama-server did not become healthy: {last_error}")
@@ -657,10 +658,8 @@ def add_module_root(roots: set[str], value: Any) -> None:
         return
     path = Path(value)
     roots.add(str(path).lower())
-    try:
+    with contextlib.suppress(OSError):
         roots.add(str(path.resolve()).lower())
-    except OSError:
-        pass
 
 
 def stop_service(process: subprocess.Popen[bytes] | None, state_path: Path) -> None:

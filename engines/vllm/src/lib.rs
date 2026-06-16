@@ -352,8 +352,7 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
     let env_path = runtime
         .command
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     Ok(InstallResponse {
         env_id: runtime.env_id.clone(),
         env_path: env_path.display().to_string(),
@@ -786,24 +785,22 @@ fn resolve_managed_runtime(runtime_id: Option<&str>) -> Result<Option<VllmRuntim
             .as_deref()
             .unwrap_or("therock-vllm-runtime")
             .to_owned();
-        let source = manifest
-            .runtime_key
-            .as_deref()
-            .map(|key| format!("managed_runtime_manifest:{key}"))
-            .unwrap_or_else(|| "managed_runtime_manifest".to_owned());
+        let source = manifest.runtime_key.as_deref().map_or_else(
+            || "managed_runtime_manifest".to_owned(),
+            |key| format!("managed_runtime_manifest:{key}"),
+        );
         let (sdk_root, sdk_bin, sdk_bin_paths, sdk_library_paths) = manifest
             .rocm_sdk
             .as_ref()
             .filter(|probe| probe.import_ok)
-            .map(|probe| {
+            .map_or((None, None, Vec::new(), Vec::new()), |probe| {
                 (
                     probe.root_path.clone(),
                     probe.bin_path.clone(),
                     probe.bin_paths.clone(),
                     probe.library_paths.clone(),
                 )
-            })
-            .unwrap_or((None, None, Vec::new(), Vec::new()));
+            });
         if let Ok(runtime) = runtime_from_python(
             python,
             &runtime_id,
@@ -1216,7 +1213,7 @@ fn current_unix_millis() -> u128 {
         .as_millis()
 }
 
-fn windows_unsupported_message() -> &'static str {
+const fn windows_unsupported_message() -> &'static str {
     "vLLM ROCm serving is supported by rocm-cli only on Linux/WSL; native Windows vLLM is skipped. No CPU fallback is used."
 }
 
@@ -1245,7 +1242,7 @@ mod tests {
             contract_version: contract_version.to_owned(),
             engine: engine.to_owned(),
             required_flags: vec!["--enable-auto-tool-choice".to_owned()],
-            parser_settings: Default::default(),
+            parser_settings: std::collections::BTreeMap::default(),
             preferred_endpoint: None,
             unsupported_combinations: Vec::new(),
             notes: vec!["test recipe".to_owned()],

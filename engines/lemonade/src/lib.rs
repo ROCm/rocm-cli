@@ -165,7 +165,7 @@ pub fn run_cli() -> Result<()> {
                 device_policy: None,
                 recipe_override: None,
                 engine_recipe: None,
-            })?)?
+            })?)?;
         }
         CommandKind::Launch {
             service_id,
@@ -781,11 +781,11 @@ fn prepare_embeddable(
     let downloads = root.join("downloads");
     let archive = downloads.join(archive_name);
     fs::create_dir_all(&downloads)?;
-    if !archive.is_file() {
+    if archive.is_file() {
+        eprintln!("Using cached {archive_name}.");
+    } else {
         eprintln!("Downloading {archive_name}...");
         download_file(archive_url, &archive)?;
-    } else {
-        eprintln!("Using cached {archive_name}.");
     }
     let runtime_dir = runtime_dir_in(&root);
     if reinstall || !lemond_path_in(&runtime_dir).is_file() {
@@ -984,9 +984,10 @@ fn manifest_path(paths: &AppPaths) -> PathBuf {
 }
 
 fn lemonade_root(paths: &AppPaths, env_root: Option<&Path>) -> PathBuf {
-    env_root
-        .map(|root| normalize_runtime_path_for_host(root).join(ENGINE_NAME))
-        .unwrap_or_else(|| paths.engine_dir(ENGINE_NAME))
+    env_root.map_or_else(
+        || paths.engine_dir(ENGINE_NAME),
+        |root| normalize_runtime_path_for_host(root).join(ENGINE_NAME),
+    )
 }
 
 fn runtime_dir_in(root: &Path) -> PathBuf {
@@ -1024,7 +1025,7 @@ fn platform_binary_name(name: &str) -> String {
     }
 }
 
-fn embeddable_archive_name() -> &'static str {
+const fn embeddable_archive_name() -> &'static str {
     if runtime_is_windows() {
         EMBEDDABLE_WINDOWS_ARCHIVE_NAME
     } else {
@@ -1032,7 +1033,7 @@ fn embeddable_archive_name() -> &'static str {
     }
 }
 
-fn embeddable_url() -> &'static str {
+const fn embeddable_url() -> &'static str {
     if runtime_is_windows() {
         EMBEDDABLE_WINDOWS_URL
     } else {
@@ -1041,7 +1042,7 @@ fn embeddable_url() -> &'static str {
 }
 
 fn download_file(url: &str, destination: &Path) -> Result<()> {
-    download_file_to_path(url, destination, Duration::from_secs(900))
+    download_file_to_path(url, destination, Duration::from_mins(15))
 }
 
 fn extract_archive(archive: &Path, destination: &Path) -> Result<()> {
@@ -1097,7 +1098,7 @@ fn windows_child_path(path: &Path) -> String {
     raw
 }
 
-fn runtime_is_cosmopolitan_windows() -> bool {
+const fn runtime_is_cosmopolitan_windows() -> bool {
     runtime_is_windows() && std::path::MAIN_SEPARATOR == '/'
 }
 
@@ -1258,7 +1259,7 @@ struct LemondExitStatus {
 }
 
 impl LemondExitStatus {
-    fn success(&self) -> bool {
+    const fn success(&self) -> bool {
         self.success
     }
 }
@@ -1278,7 +1279,7 @@ fn hide_child_console_window(command: &mut ProcessCommand) {
 }
 
 #[cfg(not(windows))]
-fn hide_child_console_window(_command: &mut ProcessCommand) {}
+const fn hide_child_console_window(_command: &mut ProcessCommand) {}
 
 fn child_process_path(path: &Path) -> String {
     if runtime_is_windows() {
@@ -1527,7 +1528,7 @@ fn serve_direct_rocm_llama_server(
         &request.host,
         request.port,
         &request.model_ref,
-        Duration::from_secs(120),
+        Duration::from_mins(2),
     )?;
     if !query_chat_smoke_endpoint(&request.host, request.port, &request.model_ref)? {
         bail!("Lemonade packaged llama-server did not pass a chat-completion smoke test");
@@ -1700,18 +1701,15 @@ fn query_health_json(host: &str, port: u16) -> Result<Value> {
 fn query_loaded_model_endpoint(endpoint_url: &str, model_ref: &str, backend: &str) -> Result<bool> {
     let (host, port) = parse_http_endpoint(endpoint_url)
         .with_context(|| format!("unsupported endpoint URL `{endpoint_url}`"))?;
-    match query_health_json(&host, port) {
-        Ok(health) => Ok(health_has_loaded_model(&health, model_ref, backend)),
-        Err(_) => {
-            let endpoint = format_http_base_url(&host, port);
-            let body = http_get_text(&endpoint, "/v1/models", Duration::from_secs(3))
-                .with_context(|| {
-                    format!("failed to query Lemonade models at {endpoint}/v1/models")
-                })?;
-            let models = serde_json::from_str::<Value>(&body)
-                .context("failed to parse Lemonade /v1/models JSON")?;
-            Ok(models_payload_has_loaded_model(&models, model_ref))
-        }
+    if let Ok(health) = query_health_json(&host, port) {
+        Ok(health_has_loaded_model(&health, model_ref, backend))
+    } else {
+        let endpoint = format_http_base_url(&host, port);
+        let body = http_get_text(&endpoint, "/v1/models", Duration::from_secs(3))
+            .with_context(|| format!("failed to query Lemonade models at {endpoint}/v1/models"))?;
+        let models = serde_json::from_str::<Value>(&body)
+            .context("failed to parse Lemonade /v1/models JSON")?;
+        Ok(models_payload_has_loaded_model(&models, model_ref))
     }
 }
 
@@ -2016,7 +2014,7 @@ fn parse_device_policy_arg(value: Option<&str>) -> Result<DevicePolicy> {
     }
 }
 
-fn device_policy_name(policy: &DevicePolicy) -> &'static str {
+const fn device_policy_name(policy: &DevicePolicy) -> &'static str {
     match policy {
         DevicePolicy::GpuRequired => "gpu_required",
         DevicePolicy::GpuPreferred => "gpu_preferred",

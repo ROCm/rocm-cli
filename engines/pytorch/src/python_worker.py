@@ -5,8 +5,9 @@ import re
 import sys
 import time
 import traceback
+from collections.abc import Iterator
 from threading import Thread
-from typing import Any, Iterator
+from typing import Any
 
 import torch
 import uvicorn

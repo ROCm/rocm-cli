@@ -42,7 +42,7 @@ struct ManagedUvManifest {
 }
 
 /// The platform-specific file name of the `uv` executable.
-pub fn uv_binary_name() -> &'static str {
+pub const fn uv_binary_name() -> &'static str {
     if runtime_is_windows() { "uv.exe" } else { "uv" }
 }
 
@@ -280,8 +280,7 @@ fn uv_binary_is_usable(path: &Path) -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .is_ok_and(|status| status.success())
 }
 
 fn write_uv_manifest(paths: &AppPaths, manifest: &ManagedUvManifest) {
@@ -319,6 +318,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::case_sensitive_file_extension_comparisons)] // asset names are internally generated and always lowercase
     fn asset_name_has_archive_extension() {
         // Whatever the host, the asset is one of the two known archive kinds.
         let asset = uv_asset_name().expect("supported host platform for tests");
