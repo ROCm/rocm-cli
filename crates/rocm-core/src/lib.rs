@@ -4603,6 +4603,25 @@ pub fn model_recipe_index_signature_path(index_path: &Path) -> PathBuf {
     PathBuf::from(signature)
 }
 
+/// Normalize a PEM document the way the OpenSSL CLI tolerated input, so keys
+/// produced or copied through other tooling still parse with the strict RFC 7468
+/// reader. Strips a leading UTF-8 BOM, accepts any line-ending style (CRLF, lone
+/// CR, or LF), and drops trailing whitespace from each line — Windows tooling
+/// (e.g. PowerShell `Set-Content`) can introduce CRLF or a stray trailing space
+/// on the `-----BEGIN ...-----` boundary that the parser would otherwise reject.
+fn normalize_pem(pem: &str) -> String {
+    let without_bom = pem.strip_prefix('\u{feff}').unwrap_or(pem);
+    let unified = without_bom.replace("\r\n", "\n").replace('\r', "\n");
+    let mut normalized: String = unified
+        .split('\n')
+        .map(|line| line.trim_end_matches([' ', '\t']))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    normalized.push('\n');
+    normalized
+}
+
 /// Verify an RSASSA-PKCS#1 v1.5 signature over SHA-256 using a pure-Rust
 /// implementation, with no external `openssl` process.
 ///
@@ -4623,7 +4642,7 @@ pub fn verify_rsa_pkcs1_sha256_signature(
     use rsa::signature::Verifier;
     use sha2::Sha256;
 
-    let public_key = RsaPublicKey::from_public_key_pem(public_key_pem)
+    let public_key = RsaPublicKey::from_public_key_pem(&normalize_pem(public_key_pem))
         .with_context(|| format!("{label} public key is not a valid RSA public key"))?;
     let signature = Signature::try_from(signature)
         .with_context(|| format!("{label} signature is malformed"))?;
@@ -4646,7 +4665,7 @@ pub fn sign_rsa_pkcs1_sha256_signature(private_key_pem: &str, payload: &[u8]) ->
     use rsa::signature::{SignatureEncoding, Signer};
     use sha2::Sha256;
 
-    let private_key = RsaPrivateKey::from_pkcs8_pem(private_key_pem)
+    let private_key = RsaPrivateKey::from_pkcs8_pem(&normalize_pem(private_key_pem))
         .context("signing private key is not a valid PKCS#8 RSA private key")?;
     let signature = SigningKey::<Sha256>::new(private_key)
         .try_sign(payload)
@@ -6797,6 +6816,31 @@ Class Name:                Display
     }
 
     #[test]
+    fn signing_tolerates_crlf_and_trailing_whitespace_pems() -> Result<()> {
+        // Windows tooling (PowerShell Set-Content, editors) can rewrite a PEM with
+        // CRLF endings, a stray trailing space on the boundary line, or a UTF-8 BOM.
+        // The OpenSSL CLI accepted these, so the Rust path must too.
+        let (private_pem, public_pem) = generate_rsa_signing_keypair()?;
+        let payload = b"version = 1\n";
+
+        let crlf_private = private_pem.replace('\n', "\r\n");
+        let trailing_ws_private = private_pem
+            .lines()
+            .map(|line| format!("{line} "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let bom_public = format!("\u{feff}{public_pem}");
+
+        for variant in [crlf_private, trailing_ws_private] {
+            let signature = sign_rsa_pkcs1_sha256_signature(&variant, payload)?;
+            verify_rsa_pkcs1_sha256_signature(&public_pem, payload, &signature, "metadata")?;
+        }
+        let signature = sign_rsa_pkcs1_sha256_signature(&private_pem, payload)?;
+        verify_rsa_pkcs1_sha256_signature(&bom_public, payload, &signature, "metadata")?;
+        Ok(())
+    }
+
+    #[test]
     fn rsa_sign_verify_round_trips_in_pure_rust() -> Result<()> {
         let (private_pem, public_pem) = generate_rsa_signing_keypair()?;
         let payload = b"version = 1\n";
@@ -6821,7 +6865,9 @@ Class Name:                Display
         let Some((private_key_pem, public_key_pem, payload, openssl_signature)) =
             openssl_signed_vector(&root)
         else {
-            eprintln!("skipping openssl interop check: openssl CLI unavailable");
+            eprintln!(
+                "skipping openssl interop check: openssl CLI unavailable or failed to produce a signature"
+            );
             fs::remove_dir_all(&root).ok();
             return Ok(());
         };
