@@ -58,7 +58,7 @@ jobs:
               set -euo pipefail
               mkdir -p "$HOME"
               yum install -y pkgconfig libcap-devel
-              curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+              curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
               export PATH="$HOME/.cargo/bin:$PATH"
               cargo build --release --workspace
             '
@@ -127,7 +127,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Build release binaries
         shell: pwsh
