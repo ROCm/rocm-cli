@@ -50,8 +50,8 @@ if [[ "${SIGNATURE_REQUIRED}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ && "${SIGNATURE_A
 fi
 
 if [[ "${SIGNATURE_AVAILABLE}" -eq 1 ]]; then
-  command -v openssl >/dev/null 2>&1 || {
-    echo "missing required command for signing: openssl" >&2
+  command -v cargo >/dev/null 2>&1 || {
+    echo "missing required command for signing: cargo" >&2
     exit 1
   }
   SIGNING_TMP_DIR="${OUTPUT_DIR}/.signing-tmp-$$"
@@ -63,7 +63,10 @@ if [[ "${SIGNATURE_AVAILABLE}" -eq 1 ]]; then
     SIGNING_PRIVATE_KEY="${SIGNING_TMP_DIR}/rocm-cli-signing-private-key.pem"
     printf '%s\n' "${ROCM_CLI_SIGNING_PRIVATE_KEY_PEM}" > "${SIGNING_PRIVATE_KEY}"
   fi
-  openssl dgst -sha256 -sign "${SIGNING_PRIVATE_KEY}" -out "${ARCHIVE_PATH}.sig" "${ARCHIVE_PATH}"
+  cargo xtask sign \
+    --private-key "${SIGNING_PRIVATE_KEY}" \
+    --in "${ARCHIVE_PATH}" \
+    --out "${ARCHIVE_PATH}.sig"
   rm -rf "${SIGNING_TMP_DIR}"
 fi
 

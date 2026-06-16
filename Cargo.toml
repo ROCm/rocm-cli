@@ -10,6 +10,7 @@ members = [
   "engines/lemonade",
   "engines/sglang",
   "engines/vllm",
+  "xtask",
 ]
 resolver = "2"
 
@@ -29,10 +30,13 @@ crossterm = { version = "0.29", features = ["libc", "use-dev-tty"] }
 directories = "6.0"
 keyring-core = "1.0.0"
 libc = "0.2"
+rand = "0.8"
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 rpassword = "7.5"
+rsa = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = { version = "0.10", features = ["oid"] }
 tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
 [workspace.lints.rust]

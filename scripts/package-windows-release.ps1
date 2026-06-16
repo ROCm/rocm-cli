@@ -82,10 +82,17 @@ function Write-ArchiveSignature {
     if ([string]::IsNullOrWhiteSpace($PrivateKeyPath)) {
         return
     }
-    $openssl = Resolve-CommandPath "openssl"
-    & $openssl dgst -sha256 -sign $PrivateKeyPath -out "$ArchivePath.sig" $ArchivePath
-    if ($LASTEXITCODE -ne 0) {
-        Fail "failed to sign $ArchivePath"
+    # Run from the repo root so the `cargo xtask` alias in .cargo/config.toml resolves
+    # regardless of the caller's working directory.
+    Push-Location $repoRoot
+    try {
+        & $cargoExe xtask sign --private-key $PrivateKeyPath --in $ArchivePath --out "$ArchivePath.sig"
+        if ($LASTEXITCODE -ne 0) {
+            Fail "failed to sign $ArchivePath"
+        }
+    }
+    finally {
+        Pop-Location
     }
 }
 
