@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -96,6 +100,130 @@ jobs:
       - name: Acceptance install lifecycle
         shell: pwsh
         run: .\scripts\acceptance-install-upgrade-tui-uninstall.ps1
+
+  win11-build-and-test:
+    name: Pure Windows 11 build and test
+    runs-on: [self-hosted, windows-gfx1151-gpu-rocm]
+    # Self-hosted runners must not execute untrusted fork PRs.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-win11-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-win11-
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace --all-targets
+
+  wsl-ubuntu-build-and-test:
+    name: Ubuntu on WSL build and test (primary)
+    runs-on: [self-hosted, wsl, ubuntu]
+    # Self-hosted runners must not execute untrusted fork PRs.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build and test in WSL Ubuntu
+        run: |
+          $ErrorActionPreference = "Stop"
+          $wp = (wsl -d Ubuntu wslpath "'$($PWD.Path)'").Trim()
+          $script = @"
+          set -euo pipefail
+          cd '$wp'
+          export CARGO_TARGET_DIR="`$HOME/.cache/rocm-cli-target"
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+            export PATH="`$HOME/.cargo/bin:`$PATH"
+          fi
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y pkg-config libcap-dev build-essential
+          fi
+          cargo build --workspace --all-targets
+          cargo test --workspace --all-targets
+          "@
+          wsl -d Ubuntu -- bash -lc $script
+          if ($LASTEXITCODE -ne 0) { throw "WSL Ubuntu build/test failed with exit code $LASTEXITCODE" }
+
+  wsl-fedora-build-and-test:
+    name: Fedora on WSL build and test (secondary)
+    runs-on: [self-hosted, wsl, fedora]
+    # Secondary target: failures must not block the PR.
+    continue-on-error: true
+    # Self-hosted runners must not execute untrusted fork PRs.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build and test in WSL Fedora
+        run: |
+          $ErrorActionPreference = "Stop"
+          $wp = (wsl -d Fedora wslpath "'$($PWD.Path)'").Trim()
+          $script = @"
+          set -euo pipefail
+          cd '$wp'
+          export CARGO_TARGET_DIR="`$HOME/.cache/rocm-cli-target"
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+            export PATH="`$HOME/.cargo/bin:`$PATH"
+          fi
+          if command -v dnf >/dev/null 2>&1; then
+            sudo dnf install -y pkgconf-pkg-config libcap-devel gcc gcc-c++ make
+          fi
+          cargo build --workspace --all-targets
+          cargo test --workspace --all-targets
+          "@
+          wsl -d Fedora -- bash -lc $script
+          if ($LASTEXITCODE -ne 0) { throw "WSL Fedora build/test failed with exit code $LASTEXITCODE" }
+
+  instinct-linux-build-and-test:
+    name: Ubuntu Instinct bare-metal build and test
+    runs-on: [self-hosted, linux, instinct, rocm]
+    # Self-hosted runners must not execute untrusted fork PRs.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-instinct-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-instinct-
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace --all-targets
 
   fmt:
     runs-on: ubuntu-latest

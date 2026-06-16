@@ -1,0 +1,8 @@
+self-hosted-runner:
+  labels:
+    - windows-gfx1151-gpu-rocm
+    - wsl
+    - ubuntu
+    - fedora
+    - instinct
+    - rocm
