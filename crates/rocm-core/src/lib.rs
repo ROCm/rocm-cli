@@ -4603,6 +4603,35 @@ pub fn model_recipe_index_signature_path(index_path: &Path) -> PathBuf {
     PathBuf::from(signature)
 }
 
+/// Verify an RSASSA-PKCS#1 v1.5 signature over SHA-256 using a pure-Rust
+/// implementation, with no external `openssl` process.
+///
+/// `public_key_pem` is a SubjectPublicKeyInfo PEM (`-----BEGIN PUBLIC KEY-----`),
+/// exactly what `openssl rsa -pubout` emits and what `openssl dgst -sha256 -verify`
+/// consumes, so verification is byte-compatible with that command. `label` names the
+/// artifact being checked (e.g. `"metadata"`); on a bad signature the error reads
+/// `"<label> signature verification failed"` to preserve existing diagnostics.
+pub fn verify_rsa_pkcs1_sha256_signature(
+    public_key_pem: &str,
+    payload: &[u8],
+    signature: &[u8],
+    label: &str,
+) -> Result<()> {
+    use rsa::RsaPublicKey;
+    use rsa::pkcs1v15::{Signature, VerifyingKey};
+    use rsa::pkcs8::DecodePublicKey;
+    use rsa::signature::Verifier;
+    use sha2::Sha256;
+
+    let public_key = RsaPublicKey::from_public_key_pem(public_key_pem)
+        .with_context(|| format!("{label} public key is not a valid RSA public key"))?;
+    let signature = Signature::try_from(signature)
+        .with_context(|| format!("{label} signature is malformed"))?;
+    VerifyingKey::<Sha256>::new(public_key)
+        .verify(payload, &signature)
+        .map_err(|error| anyhow::anyhow!("{label} signature verification failed: {error}"))
+}
+
 pub fn verify_model_recipe_index_signature(
     index_path: &Path,
     signature_path: &Path,
@@ -4620,31 +4649,25 @@ pub fn verify_model_recipe_index_signature(
             public_key_path.display()
         );
     }
-    let output = Command::new("openssl")
-        .args([
-            "dgst",
-            "-sha256",
-            "-verify",
-            public_key_path.to_string_lossy().as_ref(),
-            "-signature",
-            signature_path.to_string_lossy().as_ref(),
-            index_path.to_string_lossy().as_ref(),
-        ])
-        .stderr(Stdio::piped())
-        .output()
-        .context("failed to launch openssl for model recipe index signature verification")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "model recipe index signature verification failed{}",
-            if stderr.trim().is_empty() {
-                String::new()
-            } else {
-                format!(": {}", stderr.trim())
-            }
-        );
-    }
-    Ok(())
+    let public_key_pem = fs::read_to_string(public_key_path).with_context(|| {
+        format!(
+            "failed to read model recipe index public key: {}",
+            public_key_path.display()
+        )
+    })?;
+    let signature = fs::read(signature_path).with_context(|| {
+        format!(
+            "failed to read model recipe index signature: {}",
+            signature_path.display()
+        )
+    })?;
+    let payload = fs::read(index_path).with_context(|| {
+        format!(
+            "failed to read model recipe index: {}",
+            index_path.display()
+        )
+    })?;
+    verify_rsa_pkcs1_sha256_signature(&public_key_pem, &payload, &signature, "model recipe index")
 }
 
 fn validate_model_device_policy(policy: &str) -> Result<()> {
@@ -6678,49 +6701,98 @@ Class Name:                Display
         Ok(())
     }
 
+    // Static interop vector produced once, offline, by the OpenSSL CLI:
+    //   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out priv.pem
+    //   openssl rsa -in priv.pem -pubout -out pub.pem
+    //   printf 'version = 1\n' > payload.txt
+    //   openssl dgst -sha256 -sign priv.pem -out sig.bin payload.txt
+    // It pins byte-compatibility between our pure-Rust verifier and `openssl dgst
+    // -sha256 -verify`, without launching openssl (the prior flake source).
+    const OPENSSL_INTEROP_PUBLIC_KEY_PEM: &str = r#"-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtROm7eG3halAPysSr653
+sYPohfc+KCauLYkv7zOGTngTCV8OMbJZ/qekYx/zbXHEcmK3z+8oRJOzn/fA8QRc
+eoo5kzkduKgjEqDfHWLJc1Avj430bhTZ6Auyq9VqFECEh0vG3qJP8QJ/3mfxleSj
+lnhfuLajbYMZpQUtAkft3EZrUIcN6QWYBNGxF3lwqz8C8uvcxvrTQIRZ8fTLWB08
+x82+ak8iDklbCaS2qM4777QO0QTTxQK/RSTQCtUc3JQ04J3A1+HUwAxKIGixSIbU
+xqmWq3nXB+SpalmzwaNbRUdXiHeB7PHArypGtZ23/xT3XAGMN84kUIjfL5d1Q0ep
+hwIDAQAB
+-----END PUBLIC KEY-----
+"#;
+    const OPENSSL_INTEROP_PAYLOAD: &[u8] = b"version = 1\n";
+    const OPENSSL_INTEROP_SIGNATURE: &[u8] = &[
+        59, 31, 252, 39, 212, 110, 136, 175, 76, 219, 249, 31, 98, 216, 248, 219, 123, 104, 156,
+        104, 226, 35, 107, 61, 224, 102, 153, 92, 157, 74, 134, 197, 124, 224, 159, 247, 152, 253,
+        77, 107, 89, 104, 93, 27, 95, 43, 255, 8, 236, 146, 121, 82, 123, 163, 171, 33, 29, 78,
+        129, 212, 190, 70, 42, 143, 202, 156, 123, 31, 146, 26, 251, 245, 214, 6, 249, 3, 72, 127,
+        67, 176, 83, 38, 0, 29, 186, 110, 13, 98, 78, 208, 1, 233, 198, 150, 186, 57, 231, 111, 14,
+        173, 248, 27, 180, 163, 5, 23, 126, 142, 216, 247, 95, 210, 156, 77, 61, 134, 32, 181, 162,
+        210, 203, 233, 88, 53, 189, 189, 248, 87, 67, 53, 222, 236, 165, 153, 24, 103, 74, 81, 98,
+        110, 92, 255, 119, 227, 239, 215, 72, 50, 33, 248, 88, 252, 200, 255, 197, 190, 65, 251,
+        246, 209, 132, 89, 204, 185, 227, 27, 134, 152, 173, 159, 52, 160, 154, 178, 148, 208, 209,
+        164, 217, 199, 79, 216, 253, 243, 109, 198, 17, 238, 167, 237, 187, 176, 121, 245, 102,
+        160, 231, 3, 111, 55, 77, 56, 15, 51, 221, 118, 55, 35, 164, 228, 85, 48, 116, 75, 180,
+        187, 94, 81, 249, 125, 7, 81, 37, 92, 237, 42, 161, 151, 78, 14, 142, 149, 165, 196, 225,
+        112, 199, 11, 217, 197, 168, 122, 234, 35, 239, 209, 153, 211, 254, 217, 253, 27, 177, 182,
+        170, 7,
+    ];
+
+    #[test]
+    fn rsa_verifier_is_byte_compatible_with_openssl_output() {
+        verify_rsa_pkcs1_sha256_signature(
+            OPENSSL_INTEROP_PUBLIC_KEY_PEM,
+            OPENSSL_INTEROP_PAYLOAD,
+            OPENSSL_INTEROP_SIGNATURE,
+            "metadata",
+        )
+        .expect("pure-Rust verifier must accept an openssl-produced signature");
+
+        let mut tampered = OPENSSL_INTEROP_PAYLOAD.to_vec();
+        tampered[0] ^= 0x01;
+        let error = verify_rsa_pkcs1_sha256_signature(
+            OPENSSL_INTEROP_PUBLIC_KEY_PEM,
+            &tampered,
+            OPENSSL_INTEROP_SIGNATURE,
+            "metadata",
+        )
+        .expect_err("a tampered payload must be rejected")
+        .to_string();
+        assert!(error.contains("metadata signature verification failed"));
+    }
+
     fn generate_test_signing_key(private_key: &Path, public_key: &Path) -> Result<()> {
-        run_test_openssl(&[
-            "genpkey",
-            "-algorithm",
-            "RSA",
-            "-pkeyopt",
-            "rsa_keygen_bits:2048",
-            "-out",
-            private_key.to_string_lossy().as_ref(),
-        ])?;
-        run_test_openssl(&[
-            "rsa",
-            "-in",
-            private_key.to_string_lossy().as_ref(),
-            "-pubout",
-            "-out",
-            public_key.to_string_lossy().as_ref(),
-        ])
+        use rsa::RsaPrivateKey;
+        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+
+        let mut rng = rand::thread_rng();
+        let key = RsaPrivateKey::new(&mut rng, 2048)
+            .context("failed to generate test RSA signing key")?;
+        let private_pem = key
+            .to_pkcs8_pem(LineEnding::LF)
+            .context("failed to encode test private key")?;
+        fs::write(private_key, private_pem.as_bytes())?;
+        let public_pem = rsa::RsaPublicKey::from(&key)
+            .to_public_key_pem(LineEnding::LF)
+            .context("failed to encode test public key")?;
+        fs::write(public_key, public_pem.as_bytes())?;
+        Ok(())
     }
 
     fn sign_test_payload(private_key: &Path, payload: &Path, signature: &Path) -> Result<()> {
-        run_test_openssl(&[
-            "dgst",
-            "-sha256",
-            "-sign",
-            private_key.to_string_lossy().as_ref(),
-            "-out",
-            signature.to_string_lossy().as_ref(),
-            payload.to_string_lossy().as_ref(),
-        ])
-    }
+        use rsa::RsaPrivateKey;
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::pkcs8::DecodePrivateKey;
+        use rsa::signature::{SignatureEncoding, Signer};
+        use sha2::Sha256;
 
-    fn run_test_openssl(args: &[&str]) -> Result<()> {
-        let output = Command::new("openssl")
-            .args(args)
-            .output()
-            .context("failed to launch openssl for model recipe signature test")?;
-        if !output.status.success() {
-            bail!(
-                "openssl model recipe signature test command failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
+        let private_pem = fs::read_to_string(private_key)?;
+        let key = RsaPrivateKey::from_pkcs8_pem(&private_pem)
+            .context("failed to parse test private key")?;
+        let payload_bytes = fs::read(payload)?;
+        let signing_key = SigningKey::<Sha256>::new(key);
+        let produced = signing_key
+            .try_sign(&payload_bytes)
+            .context("failed to sign test payload")?;
+        fs::write(signature, produced.to_bytes())?;
         Ok(())
     }
 

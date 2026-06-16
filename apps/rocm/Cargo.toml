@@ -27,6 +27,11 @@ serde_json.workspace = true
 tar = "0.4"
 ureq = { version = "2.12", features = ["native-certs"] }
 
+[dev-dependencies]
+rand.workspace = true
+rsa.workspace = true
+sha2.workspace = true
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-native-keyring-store = "1.1"
 

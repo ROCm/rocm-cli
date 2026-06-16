@@ -7,6 +7,7 @@ use rocm_core::{
     normalize_therock_family, platform_binary_name, runtime_is_windows, runtime_os_name,
     runtime_path_for_windows_child, runtime_path_list_split, runtime_python_executable_in_env,
     unix_time_millis, uv_command_env, uv_pip_install_base, uv_venv_args,
+    verify_rsa_pkcs1_sha256_signature,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -1775,7 +1776,7 @@ fn fetch_and_verify_metadata_signature(
     download_signature_file(&signature_url, signature_path, max_time_secs)?;
     let public_key_source =
         with_metadata_public_key(policy, temp_key_path, |public_key, source| {
-            verify_signature_with_openssl(payload_path, signature_path, public_key)?;
+            verify_metadata_signature(payload_path, signature_path, public_key)?;
             Ok(source.to_owned())
         })?
         .context("metadata signature policy was active but no public key was resolved")?;
@@ -1802,7 +1803,7 @@ fn verify_cached_metadata_signature(
         );
     }
     with_metadata_public_key(policy, temp_key_path, |public_key, _source| {
-        verify_signature_with_openssl(payload_path, signature_path, public_key)
+        verify_metadata_signature(payload_path, signature_path, public_key)
     })?;
     Ok(())
 }
@@ -1828,36 +1829,30 @@ fn download_signature_file(
     Ok(())
 }
 
-fn verify_signature_with_openssl(
+fn verify_metadata_signature(
     payload_path: &Path,
     signature_path: &Path,
     public_key_path: &Path,
 ) -> Result<()> {
-    let output = capture_command_output(
-        Path::new("openssl"),
-        &[
-            "dgst",
-            "-sha256",
-            "-verify",
-            public_key_path.to_string_lossy().as_ref(),
-            "-signature",
-            signature_path.to_string_lossy().as_ref(),
-            payload_path.to_string_lossy().as_ref(),
-        ],
-    )
-    .context("failed to launch openssl for metadata signature verification")?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        bail!(
-            "metadata signature verification failed{}",
-            if detail.is_empty() {
-                String::new()
-            } else {
-                format!(": {detail}")
-            }
-        );
-    }
-    Ok(())
+    let public_key_pem = fs::read_to_string(public_key_path).with_context(|| {
+        format!(
+            "failed to read metadata public key: {}",
+            public_key_path.display()
+        )
+    })?;
+    let signature = fs::read(signature_path).with_context(|| {
+        format!(
+            "failed to read metadata signature: {}",
+            signature_path.display()
+        )
+    })?;
+    let payload = fs::read(payload_path).with_context(|| {
+        format!(
+            "failed to read metadata payload: {}",
+            payload_path.display()
+        )
+    })?;
+    verify_rsa_pkcs1_sha256_signature(&public_key_pem, &payload, &signature, "metadata")
 }
 
 fn metadata_cache_can_revalidate(
@@ -4343,48 +4338,39 @@ echo Python 3.12.10
     }
 
     fn generate_test_signing_key(private_key: &Path, public_key: &Path) -> Result<()> {
-        run_test_openssl(&[
-            "genpkey",
-            "-algorithm",
-            "RSA",
-            "-pkeyopt",
-            "rsa_keygen_bits:2048",
-            "-out",
-            private_key.to_string_lossy().as_ref(),
-        ])?;
-        run_test_openssl(&[
-            "rsa",
-            "-in",
-            private_key.to_string_lossy().as_ref(),
-            "-pubout",
-            "-out",
-            public_key.to_string_lossy().as_ref(),
-        ])
+        use rsa::RsaPrivateKey;
+        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+
+        let mut rng = rand::thread_rng();
+        let key = RsaPrivateKey::new(&mut rng, 2048)
+            .context("failed to generate test RSA signing key")?;
+        let private_pem = key
+            .to_pkcs8_pem(LineEnding::LF)
+            .context("failed to encode test private key")?;
+        fs::write(private_key, private_pem.as_bytes())?;
+        let public_pem = rsa::RsaPublicKey::from(&key)
+            .to_public_key_pem(LineEnding::LF)
+            .context("failed to encode test public key")?;
+        fs::write(public_key, public_pem.as_bytes())?;
+        Ok(())
     }
 
     fn sign_test_payload(private_key: &Path, payload: &Path, signature: &Path) -> Result<()> {
-        run_test_openssl(&[
-            "dgst",
-            "-sha256",
-            "-sign",
-            private_key.to_string_lossy().as_ref(),
-            "-out",
-            signature.to_string_lossy().as_ref(),
-            payload.to_string_lossy().as_ref(),
-        ])
-    }
+        use rsa::RsaPrivateKey;
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::pkcs8::DecodePrivateKey;
+        use rsa::signature::{SignatureEncoding, Signer};
+        use sha2::Sha256;
 
-    fn run_test_openssl(args: &[&str]) -> Result<()> {
-        let output = Command::new("openssl")
-            .args(args)
-            .output()
-            .context("failed to launch openssl for signature test")?;
-        if !output.status.success() {
-            bail!(
-                "openssl signature test command failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
+        let private_pem = fs::read_to_string(private_key)?;
+        let key = RsaPrivateKey::from_pkcs8_pem(&private_pem)
+            .context("failed to parse test private key")?;
+        let payload_bytes = fs::read(payload)?;
+        let signing_key = SigningKey::<Sha256>::new(key);
+        let produced = signing_key
+            .try_sign(&payload_bytes)
+            .context("failed to sign test payload")?;
+        fs::write(signature, produced.to_bytes())?;
         Ok(())
     }
 
