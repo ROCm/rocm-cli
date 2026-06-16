@@ -1,9 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
-#[cfg(not(target_vendor = "cosmo"))]
 use keyring_core::api::CredentialStoreApi;
 use keyring_core::{Entry, Error as KeyringError};
 
-#[cfg(not(target_vendor = "cosmo"))]
 const PROVIDER_KEY_SERVICE: &str = "powderluv.rocm-cli.provider-key";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -233,9 +231,6 @@ fn with_native_entry<T>(provider: &str, action: impl FnOnce(&Entry) -> Result<T>
 }
 
 fn native_entry(provider: &str) -> Result<Entry> {
-    #[cfg(target_vendor = "cosmo")]
-    let _ = provider;
-
     #[cfg(target_os = "windows")]
     {
         let store = windows_native_keyring_store::Store::new().map_err(keyring_anyhow)?;
@@ -255,10 +250,7 @@ fn native_entry(provider: &str) -> Result<Entry> {
             .map_err(keyring_anyhow)
     }
 
-    #[cfg(all(
-        any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"),
-        not(target_vendor = "cosmo"),
-    ))]
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
     {
         let store = zbus_secret_service_keyring_store::Store::new_with_configuration(
             &std::collections::HashMap::new(),
@@ -269,23 +261,18 @@ fn native_entry(provider: &str) -> Result<Entry> {
             .map_err(keyring_anyhow)
     }
 
-    #[cfg(any(
-        target_vendor = "cosmo",
-        not(any(
-            target_os = "windows",
-            target_os = "macos",
-            target_os = "linux",
-            target_os = "freebsd",
-            target_os = "openbsd",
-        )),
-    ))]
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "openbsd",
+    )))]
     bail!("this platform does not have a supported secure credential store")
 }
 
 fn native_store_label() -> &'static str {
-    if cfg!(target_vendor = "cosmo") {
-        "secure credential store"
-    } else if cfg!(target_os = "windows") {
+    if cfg!(target_os = "windows") {
         "Windows Credential Manager"
     } else if cfg!(target_os = "macos") {
         "macOS Keychain"

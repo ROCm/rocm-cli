@@ -42,7 +42,7 @@ not require a managed runtime, and verifies:
 - GPU-required paths fail loudly instead of silently falling back
 - no first-run pip cache or runtime registry is created
 
-Build the current standalone single-file release artifact:
+Build the platform-native release artifact:
 
 ```bash
 python scripts/build_single_exe_release.py standalone
@@ -54,92 +54,18 @@ itself, not a self-extracting launcher and not a model bundle. Running it with
 no arguments opens normal rocm-cli; if setup is not complete, the first-time
 setup wizard appears automatically.
 
-The current cross-OS release target is the Rust/Cosmopolitan universal binary,
-not the platform-native standalone copy above. Use the universal artifact for
-release-style end-to-end tests unless a test is explicitly about native
-development builds.
-
-Run the true no-extract Cosmopolitan feasibility probe when working on the
-universal-binary plan:
+rocm-cli ships native per-OS binaries; there is no cross-OS universal binary.
+Build and test the binary natively on each supported target (native Windows,
+Ubuntu/Fedora on WSL, and Linux on server/bare-metal):
 
 ```bash
-python scripts/cosmopolitan_feasibility.py self-test
-python scripts/cosmopolitan_feasibility.py probe
+cargo build --workspace --release
+cargo test --workspace
 ```
 
-This probe reports whether the local Rust toolchain exposes a Cosmopolitan/APE
-target, whether a `cosmocc` compiler is available, and whether repo wording
-still separates platform-native helper artifacts from the true no-extract
-Rust/Cosmopolitan APE.
-
-Run the current clean Rust/Cosmopolitan APE rebuild when working on the true
-single-file rocm-cli artifact:
-
-```bash
-rm -rf .rocm-work
-scripts/setup-cosmocc.sh
-python3 scripts/rust_cosmopolitan_spike.py install-toolchain
-python3 scripts/rust_cosmopolitan_spike.py build-rocm --release --clean --jobs 96
-python3 scripts/rust_cosmopolitan_spike.py smoke-wsl-linux-path --release
-```
-
-The release artifact is:
-
-```text
-.rocm-work/tests/rust-cosmopolitan/rocm-rust-cosmo-release.exe
-```
-
-On Windows, run that file directly. On WSL/Linux, run the same file through the
-APE/Linux path so WSLInterop does not launch the Windows side:
-
-```bash
-sh .rocm-work/tests/rust-cosmopolitan/rocm-rust-cosmo-release.exe doctor
-```
-
-Run the production single-exe gate for safe isolated checks:
-
-```bash
-python scripts/single_exe_release_gate.py
-```
-
-When a managed TheRock runtime already exists and you want live GPU checks,
-copy only runtime state into a temporary root:
-
-```bash
-python scripts/single_exe_release_gate.py \
-  --runtime-state ~/.rocm \
-  --live-assistant \
-  --live-comfyui \
-  --generate-cat
-```
-
-Latest local checkpoint, 2026-06-06:
-
-- `cargo test --workspace` passed.
-- Windows universal-binary TUI smoke passed.
-- WSL universal-binary TUI smoke passed through `sh <same file>`.
-- Windows universal-binary Lemonade local-assistant E2E passed.
-- Windows universal-binary PyTorch local-assistant E2E passed.
-- Windows universal-binary ComfyUI install/start/status/stop E2E passed.
-- WSL universal-binary Lemonade local-assistant E2E passed.
-- WSL universal-binary PyTorch local-assistant E2E passed.
-- WSL universal-binary ComfyUI install/start/status/stop E2E passed.
-
-On native Windows, run it directly. For WSL validation, launch the same file
-through a POSIX path so WSLInterop cannot treat the `MZ` header as a Windows
-program before rocm-cli starts:
-
-```bash
-sh .rocm-work/tests/rust-cosmopolitan/rocm-rust-cosmo-release.exe doctor
-
-.rocm-work/tools/cosmocc-wsl-elf/bin/ape-x86_64.elf \
-  .rocm-work/tests/rust-cosmopolitan/rocm-rust-cosmo-release.exe doctor
-```
-
-The WSL output must include `os: linux` and `wsl: true`, and must not include
-`os: windows`. Direct `./rocm` may be intercepted by WSLInterop even without a
-`.exe` extension because WSL matches the file header, so the smoke test uses
-`sh <same file>` and fails if the command reports Windows.
+On WSL/Linux, build and run the native Linux binary directly (no APE launcher
+prefix is required). The doctor output on WSL must include `os: linux` and
+`wsl: true`, and must not include `os: windows`.
 
 Use isolated `ROCM_CLI_CONFIG_DIR`, `ROCM_CLI_DATA_DIR`, and
 `ROCM_CLI_CACHE_DIR` roots for smoke tests, then delete those roots after the
@@ -957,8 +883,8 @@ binary smoke checks set isolated config/data/cache directories inside those
 roots and fail if `rocm doctor` reads the real user `.rocm` state.
 
 For historical platform-bundle acceptance, the Linux bundle still verifies the
-vendored `rocm-codex` binary. The current Rust/Cosmopolitan universal binary
-does not include a vendored Codex binary or require it as a sidecar. If the host
+vendored `rocm-codex` binary. The native rocm-cli binary does not include a
+vendored Codex binary or require it as a sidecar. If the host
 does not have `libcap-dev` or `libssl-dev`, the Linux acceptance script
 downloads the Ubuntu development packages into `.rocm-work/tools/wsl-build-deps`,
 extracts only the headers, libraries, and pkg-config metadata there, and points

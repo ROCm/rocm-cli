@@ -12,16 +12,6 @@ pub enum RuntimePlatform {
 
 impl RuntimePlatform {
     pub fn current() -> Self {
-        #[cfg(target_vendor = "cosmo")]
-        {
-            if cosmo_hostos_has(COSMO_HOST_WINDOWS) {
-                return Self::Windows;
-            }
-            if cosmo_hostos_has(COSMO_HOST_LINUX) {
-                return Self::Linux;
-            }
-        }
-
         if cfg!(windows) {
             Self::Windows
         } else if cfg!(target_os = "linux") {
@@ -51,14 +41,12 @@ impl RuntimePlatform {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct RuntimeHost {
     platform: RuntimePlatform,
-    cosmopolitan: bool,
 }
 
 impl RuntimeHost {
     pub fn current() -> Self {
         Self {
             platform: RuntimePlatform::current(),
-            cosmopolitan: cfg!(target_vendor = "cosmo"),
         }
     }
 
@@ -77,14 +65,6 @@ impl RuntimeHost {
     pub fn is_linux(self) -> bool {
         self.platform.is_linux()
     }
-
-    pub fn is_cosmopolitan(self) -> bool {
-        self.cosmopolitan
-    }
-
-    pub fn uses_unix_path_separator_on_windows(self) -> bool {
-        self.is_windows() && std::path::MAIN_SEPARATOR == '/'
-    }
 }
 
 pub fn runtime_is_windows() -> bool {
@@ -97,14 +77,6 @@ pub fn runtime_is_linux() -> bool {
 
 pub fn runtime_os_name() -> &'static str {
     RuntimeHost::current().os_name()
-}
-
-pub fn runtime_is_cosmopolitan_windows() -> bool {
-    RuntimeHost::current().uses_unix_path_separator_on_windows()
-}
-
-pub fn runtime_tcp_timeouts_are_supported() -> bool {
-    !runtime_is_cosmopolitan_windows()
 }
 
 pub fn runtime_exe_suffix() -> &'static str {
@@ -432,49 +404,12 @@ impl RuntimePathSeparator {
     }
 }
 
-#[cfg(target_vendor = "cosmo")]
-const COSMO_HOST_LINUX: i32 = 1;
-
-#[cfg(target_vendor = "cosmo")]
-const COSMO_HOST_WINDOWS: i32 = 4;
-
-#[cfg(target_vendor = "cosmo")]
-unsafe extern "C" {
-    static __hostos: i32;
-}
-
-#[cfg(target_vendor = "cosmo")]
-fn cosmo_hostos_has(mask: i32) -> bool {
-    // Cosmopolitan exposes the active host through libc/dce.h. Calling it
-    // directly keeps the Rust APE tied to Cosmopolitan's runtime instead of a
-    // repo-local C compatibility shim.
-    unsafe { (__hostos & mask) != 0 }
-}
-
 pub fn current_executable_path() -> Result<PathBuf> {
-    if cfg!(target_vendor = "cosmo")
-        && let Ok(path) = current_executable_path_from_argv0()
-    {
-        return Ok(path);
-    }
     match std::env::current_exe() {
-        Ok(path) if current_exe_is_cosmopolitan_loader(&path) => {
-            current_executable_path_from_argv0().or(Ok(path))
-        }
         Ok(path) => Ok(path),
         Err(current_exe_error) => current_executable_path_from_argv0()
             .with_context(|| format!("failed to discover current executable: {current_exe_error}")),
     }
-}
-
-fn current_exe_is_cosmopolitan_loader(path: &Path) -> bool {
-    if !cfg!(target_vendor = "cosmo") {
-        return false;
-    }
-    path.file_name()
-        .and_then(|value| value.to_str())
-        .map(|name| matches!(name, "ape" | "ape-x86_64.elf" | "ape-aarch64.elf"))
-        .unwrap_or(false)
 }
 
 fn current_executable_path_from_argv0() -> Result<PathBuf> {
@@ -487,7 +422,7 @@ fn current_executable_path_from_argv0() -> Result<PathBuf> {
         argv0.as_os_str(),
         current_dir.as_deref(),
         Some(path_var.as_os_str()),
-        cfg!(target_vendor = "cosmo"),
+        false,
     )
 }
 
@@ -851,35 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn cosmopolitan_argv0_resolution_prefers_launched_file_before_path() -> Result<()> {
-        let root = std::env::temp_dir().join(format!(
-            "rocm-current-exe-resolution-{}",
-            crate::unix_time_millis()
-        ));
-        let current_dir = root.join("cwd");
-        let path_dir = root.join("bin");
-        fs::create_dir_all(&current_dir)?;
-        fs::create_dir_all(&path_dir)?;
-        let local_binary = current_dir.join("install");
-        let path_binary = path_dir.join("install");
-        fs::write(&local_binary, b"local")?;
-        fs::write(&path_binary, b"path")?;
-        let path_var = std::env::join_paths([path_dir.as_os_str()])?;
-
-        let resolved = current_executable_path_from_argv0_value(
-            std::ffi::OsStr::new("install"),
-            Some(&current_dir),
-            Some(path_var.as_os_str()),
-            true,
-        )?;
-
-        assert_eq!(resolved, local_binary);
-        fs::remove_dir_all(root).ok();
-        Ok(())
-    }
-
-    #[test]
-    fn argv0_resolution_uses_path_when_not_cosmopolitan_preferred() -> Result<()> {
+    fn argv0_resolution_uses_path_by_default() -> Result<()> {
         let root = std::env::temp_dir().join(format!(
             "rocm-current-exe-path-resolution-{}",
             crate::unix_time_millis()

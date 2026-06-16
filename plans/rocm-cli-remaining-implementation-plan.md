@@ -23,7 +23,7 @@ path is unavailable.
 
 | Phase | Status | What Exists | Main Remaining Plan-Derived Gaps |
 |---|---:|---|---|
-| Phase 0: Product Skeleton | Partial | Rust workspace, app/crate layout, config/state dirs, deterministic first-time setup/bootstrap, bootstrap installers that verify signatures/checksums, seed a minimal config without overwriting user settings, require no preinstalled ROCm/Python/Rust/Cargo, and set PATH automatically for future terminals plus the current directly-invoked Windows PowerShell process, expanded bounded-latency `rocm doctor` host/driver/runtime/cache report, fast setup/Doctor GPU detection through native Windows registry/system APIs, native Linux KFD/sysfs/IP discovery, and one-shot WSL host display probing when needed, WSL managed-TheRock SDK gfx detection when sysfs/PATH tools are unavailable, active runtime state with explicit ambiguous-runtime reporting, adapter/plugin inventory, registered runtime inventory, CLI lifecycle audit records plus text lifecycle logs for update/install/runtime/engine/service actions, quiet bounded startup update check, optional signed metadata cache verification, and a workspace-local Rust/Cosmopolitan single-file rocm-cli artifact that runs directly on Windows and through the Linux path on WSL via `sh <artifact>` without sibling rocm-cli helper binaries | Production signed metadata publication, promotion of the Rust/Cosmopolitan build into the release pipeline, native-Linux validation, and direct WSL execution hardening if WSLInterop intercepts `./rocm` |
+| Phase 0: Product Skeleton | Partial | Rust workspace, app/crate layout, config/state dirs, deterministic first-time setup/bootstrap, bootstrap installers that verify signatures/checksums, seed a minimal config without overwriting user settings, require no preinstalled ROCm/Python/Rust/Cargo, and set PATH automatically for future terminals plus the current directly-invoked Windows PowerShell process, expanded bounded-latency `rocm doctor` host/driver/runtime/cache report, fast setup/Doctor GPU detection through native Windows registry/system APIs, native Linux KFD/sysfs/IP discovery, and one-shot WSL host display probing when needed, WSL managed-TheRock SDK gfx detection when sysfs/PATH tools are unavailable, active runtime state with explicit ambiguous-runtime reporting, adapter/plugin inventory, registered runtime inventory, CLI lifecycle audit records plus text lifecycle logs for update/install/runtime/engine/service actions, quiet bounded startup update check, optional signed metadata cache verification, and native per-OS rocm-cli binaries that run directly on Windows and Linux/WSL with first-party engines and the `rocmd` helper surface linked into `rocm` | Production signed metadata publication and native-Linux server/bare-metal (Instinct) validation |
 | Phase 1: Runtime Management | Partial | TheRock release/nightly resolution, pip venv installs using a single TheRock-index pinned `rocm[libraries,devel]` plus `torch`/`torchvision`/`torchaudio` transaction selected by exact ROCm wheel suffix for the current Python/platform, Windows pip-only enforcement, tarball flow on non-Windows, localized pip cache, cached TheRock index metadata with ETag, optional detached metadata signature verification, quiet freshness-gated startup update check, explicit runtime update apply/dry-run flow, versioned side-by-side runtime keys, active runtime activation marker, previous-runtime validation, read-only import/adopt, legacy ROCm migration guidance, explicit `rocm update` report with CLI/engine/recipe surface inventory | Production metadata public key and signed sidecar publication |
 | Phase 2: TUI Foundation | Implemented | Ratatui shell, typed transcript/status/prompt/sidebar, first-view `/home` dashboard with arrow-key status/action cards, internal activity buffer seeded from persisted lifecycle logs, first-time setup flow with visible arrow-key/folder-change guidance, sidebar mode state (`ask`, `act`, `serve`, `logs`, `automations`), vertical slash completion with cycling/scrolling, plain command-shaped prompt inputs route to navigable command screens before natural-language planning, `/engine` singular surface, `/runtimes` ROCm install picker with list/activate/uninstall/import/adopt and legacy typed rollback guidance back to explicit install selection, `/update --apply` approval/preview flow, streamed command output, overlapping running-progress cards for contained CLI/proposal/service work, idle Ctrl-C quit confirmation, unknown slash-command help cards, overlapping approval cards with Enter/Y approval plus edit/cancel flow for mutating commands and queued review requests, `/reviews` review-request alias with hidden legacy `/proposals` compatibility, provider-key entry/clear screens with safe default cancel, `/logs` action-log listing, lifecycle tail, hidden-by-default file locations, detail scrolling, bounded query search, stateful arrow-key/Left-Right/PageUp/PageDown pagination, and `/logs follow [query]` live refreshed log following over recent lifecycle/action logs | None known within V1 plan constraints |
 | Phase 3: Engine Plugin MVP | Implemented | Protocol types, PyTorch engine binary, `llama.cpp` adapter binary, Lemonade adapter for strict ROCm serving, `vllm` external-runtime adapter for Linux/WSL ROCm GPU serving, `detect/install/capabilities/resolve_model/launch/endpoint/healthcheck/stop/logs`, first-party stdio protocol routing coverage, foreground/managed launch, plugin-directory discovery helper, external plugin directory policy surfaced in CLI/TUI/docs, non-TUI `rocm services` list/logs/stop/restart parity with living services shown by default and failed/stopped history available through `--all`, active runtime wiring, shared recipe resolver before default engine selection, TheRock SDK env propagation for non-PyTorch HIP apps, explicit CPU-policy rejection for PyTorch/vLLM/Lemonade without implicit CPU fallback, Windows and WSL PyTorch GPU smoke coverage, Windows and WSL llama.cpp GPU smoke coverage, Windows and WSL Lemonade ROCm smoke coverage, WSL vLLM TheRock GPU smoke coverage, and in-process first-party engine/helper routes for the single-file universal binary | None known within V1 plan constraints |
@@ -32,12 +32,12 @@ path is unavailable.
 | Phase 6: Driver Management | Partial | `install driver` plan/preflight surface with explicit root/`sudo -v` availability checks for Linux DKMS plans, Windows validate-only driver detection/reporting, WSL ROCDXG preflight/setup helper, AMD-documented Ubuntu/Debian/RHEL/Oracle Linux/Rocky/SLES package-manager DKMS plans, TUI approval-to-`--yes` execution boundary, driver execution state/reboot marker, post-reboot reconciliation command, persisted passive post-check summary | Live privileged install acceptance coverage on supported Linux hosts |
 | Phase 7: Expanded Engine Plugins | Partial | Packaged `atom`, `vllm`, and `sglang` adapters for Linux/WSL external runtimes; installer bundle validation requires `atom`, `vllm`, and `sglang`; inventory and model-runtime text for `atom`, `vllm`, and `sglang`; Windows runtime gating fails explicitly without CPU fallback; live WSL vLLM GPU acceptance against a rocm-cli managed TheRock runtime; ATOM adapter launches the upstream `atom.entrypoints.openai_server` module and propagates TheRock SDK env/library paths for non-PyTorch HIP apps; ATOM now has an opt-in GPU acceptance harness with offline exact-runtime selector self-tests; SGLang managed-runtime parity records managed TheRock env and now has an offline exact-runtime selector acceptance harness; live SGLang on this WSL `gfx1201` host is blocked by upstream SGLang ROCm kernel support (`gfx942`/`gfx950` only in `sgl-kernel/setup_rocm.py`) | Live ATOM GPU acceptance on supported Linux/WSL hardware/runtime, live SGLang GPU acceptance on supported SGLang ROCm hardware or after upstream adds host gfx support |
 | Phase 8: Automations and Watchers | Partial | Built-in `therock-update`, `server-recover`, read-only `gpu-metrics`, reviewed `gpu-thermal-protect`, reviewed `cache-warm`, and reviewed `driver-upgrade`, enable/disable/list, daemon tick loop, automation trigger-event substrate for existing schedule, manifest, healthcheck, endpoint-health, bounded local GPU telemetry, exact `gpu.thermal_pressure` / `gpu.memory_pressure` reviewed stop proposals, exact `cache.warm` registry-verified prefetch proposal events with reviewed source-policy edit fields, exact `update.available` driver-plan proposal events or contained restricted dry-run driver plans, and loopback-only local webhook sources, automation events JSONL, audit mirroring, provider chat/stream usage audit records, proposal lifecycle JSONL, TUI proposal review/approve/reject/edit, sandbox runner, restricted internal tool API, contained read-only TheRock update checks with `notify_if_newer` notification audit records, recovery policy for failed/exited/unreachable and stale starting/recovering services, explicit watcher mode-to-policy routing for existing watchers | Broader event-source coverage beyond existing watchers and richer contained-mode execution for future mutating actions |
-| Phase 9: Hardening and Release | Partial | Linux/Windows package scripts, release/nightly assets, SHA-256 verification, detached signature generation/verification, stable release CI signature enforcement, pre-upload release-readiness verification of stable and nightly bundle contents/checksum/signature sidecars plus installer-facing aliases and exact dist asset sets, staged nightly publication that preserves the previous public nightly until Linux and Windows assets are ready, Windows and Linux acceptance signature rejection before activation including missing sidecars and required-signature-without-public-key failures, generated private-key PEM packaging and public-key PEM installer verification, installer minimal-config seeding/no-overwrite acceptance, first-install PATH setup acceptance, previous-runtime validation tests, explicit local/off telemetry policy config, optional Rust signed metadata cache verification with generated-key tamper coverage, signed model recipe index verification with generated-key tamper coverage, cross-platform local no-fallback smoke coverage, Linux/Windows CI all-target test coverage, CI release-readiness and Python acceptance-harness self-test coverage, CI clippy with warnings denied, self-hosted GPU CI adapter detect/capabilities coverage for all first-party engines, and workspace-local Rust/Cosmopolitan universal-binary build plus release-gate scripts | Repository-owned signing and metadata key publication, broader GPU CI coverage, native-Linux single-exe validation, and wiring the universal-binary release gate into production publishing |
+| Phase 9: Hardening and Release | Partial | Linux/Windows package scripts, release/nightly assets, SHA-256 verification, detached signature generation/verification, stable release CI signature enforcement, pre-upload release-readiness verification of stable and nightly bundle contents/checksum/signature sidecars plus installer-facing aliases and exact dist asset sets, staged nightly publication that preserves the previous public nightly until Linux and Windows assets are ready, Windows and Linux acceptance signature rejection before activation including missing sidecars and required-signature-without-public-key failures, generated private-key PEM packaging and public-key PEM installer verification, installer minimal-config seeding/no-overwrite acceptance, first-install PATH setup acceptance, previous-runtime validation tests, explicit local/off telemetry policy config, optional Rust signed metadata cache verification with generated-key tamper coverage, signed model recipe index verification with generated-key tamper coverage, cross-platform local no-fallback smoke coverage, Linux/Windows CI all-target test coverage, CI release-readiness and Python acceptance-harness self-test coverage, CI clippy with warnings denied, self-hosted GPU CI adapter detect/capabilities coverage for all first-party engines, and native per-OS release/nightly binary builds | Repository-owned signing and metadata key publication, broader GPU CI coverage, and native-Linux server/bare-metal (Instinct) validation |
 
 ## Current Remaining Gates
 
 Audited on 2026-06-06 after the Windows and WSL TheRock/PyTorch/Lemonade/
-ComfyUI acceptance checkpoints, the Rust/Cosmopolitan universal-binary
+ComfyUI acceptance checkpoints, the native per-OS release-build
 checkpoint, the TUI slash-command navigability follow-ups, the
 installer/driver/ATOM packaging follow-up, the CI hardening follow-up, the
 focused runtime import/adopt plus sandbox/contained automation
@@ -50,15 +50,10 @@ Qwen3.5 PyTorch launches before service startup.
 
 Open release caveats from the current working tree:
 
-- The current single-file artifact is
-  `.rocm-work/tests/rust-cosmopolitan/rocm-rust-cosmo-release.exe`; release
-  packaging should expose it as `rocm.exe` on Windows and the same bytes as
-  `rocm` for Linux/WSL.
-- Windows smoke passes by running the artifact directly.
-- WSL Linux-path smoke passes through `sh ./rocm`. Direct renamed `./rocm`
-  inside WSL can still be intercepted by WSLInterop before rocm-cli starts.
-- Native Linux validation and production release-pipeline promotion remain
-  open.
+- Release artifacts are native per-OS binaries built by `cargo build --release`:
+  `rocm.exe` on Windows and `rocm` on Linux/WSL.
+- Windows and WSL/Linux smoke pass by running the native binary directly.
+- Native Linux server/bare-metal (Instinct) validation remains open.
 - TUI first-view output must stay minimal. Only active foreground pip/install
   progress cards may be verbose; finished engine/service/assistant screens
   should not dump recent logs unless the user opens details.
@@ -73,7 +68,7 @@ Locally implemented and recently verified:
 - PyTorch engine install and GPU smoke tests on Windows and WSL using exact
   TheRock torch stack pins from the selected managed runtime.
 - Lemonade is now the default local assistant/server engine. Windows and WSL
-  Lemonade ROCm serving have live no-fallback acceptance through the universal
+  Lemonade ROCm serving have live no-fallback acceptance through the native
   binary. On WSL, rocm-cli uses Lemonade-packaged ROCm `llama-server` directly
   rather than Lemonade's router when the router cannot detect `/dev/dxg`.
 - `llama.cpp` GPU serving on Windows and WSL with `gpu_required`, verifying
@@ -92,11 +87,10 @@ Locally implemented and recently verified:
   acceptance harness with an offline CI self-test. The live harness now submits
   a real safetensors-backed cat image workflow through the ComfyUI HTTP API and
   passes on Windows and WSL.
-- The single-file Rust/Cosmopolitan artifact
-  `.rocm-work/tests/rust-cosmopolitan/rocm-rust-cosmo-release.exe` has passed
-  Windows direct smoke, WSL Linux-path smoke through `sh ./rocm`, TUI smoke,
-  PyTorch local-assistant E2E, Lemonade local-assistant E2E, and ComfyUI
-  install/start/status/stop E2E using temporary state roots.
+- The native per-OS rocm-cli binary has passed Windows direct smoke, WSL
+  Linux-path smoke, TUI smoke, PyTorch local-assistant E2E, Lemonade
+  local-assistant E2E, and ComfyUI install/start/status/stop E2E using temporary
+  state roots.
 - WSL ROCDXG readiness, WSL doctor gfx/family detection, and WSL acceptance
   commands with isolated workspace-local state.
 - TUI slash-command surfaces are navigable instead of transcript dumps; the
@@ -251,8 +245,8 @@ These are narrow plan-derived fixes that unblock truthful V1 status.
    - Status: completed for this branch.
    - Result: historical Windows package/install scripts verify the complete
      platform bundle lifecycle, including vendored Codex when that bundle shape
-     is used. The current Rust/Cosmopolitan universal binary does not require a
-     `rocm-codex.exe` sidecar.
+     is used. The native rocm-cli binary does not require a `rocm-codex.exe`
+     sidecar.
 
 3. Add `rocm logs --service <id>`.
    - Plan source: PyTorch engine spec expects service log access by service id.
@@ -272,7 +266,7 @@ These are narrow plan-derived fixes that unblock truthful V1 status.
 
 - Windows PowerShell installer/package support from the prior round remains verified by the acceptance lifecycle.
 - Historical Windows platform-bundle acceptance still covers vendored Codex
-  packaging and uninstall matching; the universal binary path has no Codex
+  packaging and uninstall matching; the native binary path has no Codex
   sidecar requirement.
 - Windows V1 rejects TheRock tarball runtime installs and points users to managed pip venv installs.
 - `rocm logs --service <id>` tails managed service logs.

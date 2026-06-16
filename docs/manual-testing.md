@@ -7,22 +7,16 @@ the same commands in a shell.
 For normal users, keep the flow simple: install rocm-cli, run `rocm`, choose a
 ROCm folder, approve setup, and then use the main TUI.
 
-When validating release behavior, use the single universal binary:
-
-```text
-.rocm-work/tests/rust-cosmopolitan/rocm-rust-cosmo-release.exe
-```
-
-On Windows, run it directly. On WSL/Linux, copy or rename the same file to
-`rocm` and run it through `sh` so the Linux path is used:
+When validating release behavior, build and use the native per-OS binary for
+the target you are testing:
 
 ```bash
-sh ./rocm doctor
+cargo build --workspace --release
 ```
 
-Current caveat: direct `./rocm` inside WSL can still be intercepted by
-WSLInterop as a Windows executable before rocm-cli starts. The WSL release
-smoke must report `os: linux` through `sh ./rocm`.
+This writes `target/release/rocm.exe` on Windows and `target/release/rocm` on
+Linux/WSL. Run the binary directly on each platform. On WSL/Linux the doctor
+output must report `os: linux` and `wsl: true`.
 
 Do not set `ROCM_CLI_THEROCK_FAMILY` during normal setup tests. rocm-cli should
 detect the right TheRock package family or tell the user what is missing.

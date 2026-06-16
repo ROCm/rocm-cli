@@ -2,10 +2,8 @@
 """Build platform-native rocm-cli release artifacts.
 
 This helper copies or archives the native `rocm`/`rocm.exe` binary for the
-current platform. It is useful for development packages, but it is not the
-Cosmopolitan universal-binary release path. Use
-`scripts/rust_cosmopolitan_spike.py build-rocm --release` and
-`scripts/single_exe_release_gate.py` for the true no-extract universal binary.
+current platform via `cargo build --release`. rocm-cli ships native per-OS
+binaries; there is no cross-OS universal binary.
 """
 
 from __future__ import annotations

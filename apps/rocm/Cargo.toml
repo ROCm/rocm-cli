@@ -40,8 +40,5 @@ windows-native-keyring-store = "1.1"
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1.0", features = ["keychain"] }
 
-[target.'cfg(all(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"), not(target_vendor = "cosmo")))'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))'.dependencies]
 zbus-secret-service-keyring-store = { version = "1.0", features = ["rt-tokio-crypto-rust"] }
-
-[target.'cfg(target_vendor = "cosmo")'.dependencies]
-crossterm_028 = { package = "crossterm", version = "0.28.1", features = ["libc", "use-dev-tty"] }
