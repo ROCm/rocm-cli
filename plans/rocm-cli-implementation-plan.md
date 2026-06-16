@@ -21,17 +21,13 @@ live tracker.
   Doctor reports, service records/logs/actions, the model registry CLI/TUI,
   provider adapters, PyTorch/llama.cpp/Lemonade/vLLM engine adapters,
   automation proposals/sandbox runner, packaging scripts, installer
-  verification, release-readiness self-tests, and the Rust/Cosmopolitan
-  no-extract universal-binary path.
-- Bootstrap/setup now has two supported shapes:
-  - normal install scripts for clean machines with no ROCm, Python, Rust, or
-    Cargo installed; these seed minimal config, verify before activation, and
-    set PATH automatically.
-  - the experimental Rust/Cosmopolitan single-file artifact, which runs the
-    real rocm-cli program as one executable on Windows and WSL/Linux without
-    extracting sibling `rocm`, `rocm.exe`, `rocmd`, or `rocm-engine-*` files.
-    It still installs TheRock wheels, Python environments, models, ComfyUI, and
-    app caches on disk only after the user chooses a folder and approves setup.
+  verification, release-readiness self-tests, and native per-OS release builds.
+- Bootstrap/setup uses normal install scripts for clean machines with no ROCm,
+  Python, Rust, or Cargo installed; these seed minimal config, verify before
+  activation, and set PATH automatically. rocm-cli ships native per-OS binaries
+  (with first-party engines and the `rocmd` helper surface linked into `rocm`);
+  it installs TheRock wheels, Python environments, models, ComfyUI, and app
+  caches on disk only after the user chooses a folder and approves setup.
 - TheRock installs now use a single pinned TheRock-index transaction for
   `rocm[libraries,devel]`, `torch`, `torchvision`, and `torchaudio`, with the
   exact ROCm wheel suffix selected for the current Python/platform.
@@ -49,9 +45,8 @@ live tracker.
 - Remaining gates are mostly owner/upstream/infrastructure items: production
   signing keys and hosted indexes, native-Linux release validation beyond WSL,
   privileged Linux driver acceptance, live ATOM/SGLang acceptance on supported
-  upstream GPU targets, broader GPU-family CI, a production AMD driver-update
-  source, and graduating the Rust/Cosmopolitan build from spike script to the
-  release pipeline.
+  upstream GPU targets, broader GPU-family CI, and a production AMD
+  driver-update source.
 
 ### Done vs Left Snapshot
 
@@ -78,8 +73,8 @@ Done locally:
   points. PyTorch and llama.cpp remain explicit engine choices with GPU-required
   validation.
 - Packaging, release-readiness checks, generated-key signature verification,
-  installer lifecycle acceptance, first-install PATH setup acceptance, and the
-  true Rust/Cosmopolitan single-file artifact.
+  installer lifecycle acceptance, first-install PATH setup acceptance, and
+  native per-OS release builds.
 
 Left or externally gated:
 
@@ -93,8 +88,6 @@ Left or externally gated:
   self-hosted adapter detect/capabilities coverage.
 - Define a production AMD driver-update feed before wiring real driver-update
   event detection.
-- Promote the Rust/Cosmopolitan universal-binary build and release gate from
-  workspace-local scripts into the production publishing pipeline.
 
 ## Summary
 - Build `rocm-cli` as the ROCm AI Command Center CLI for AMD systems. It should install and manage TheRock runtimes on Linux and Windows, optionally install Linux DKMS drivers through official AMD flows, run local model servers, and provide a chat-first terminal experience for ROCm/TheRock operations.

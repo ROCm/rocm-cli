@@ -4,10 +4,9 @@ use rocm_core::{
     detect_host_therock_family, detect_managed_therock_family, ensure_uv_binary, managed_tools_dir,
     normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
     normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_storage,
-    normalize_therock_family, platform_binary_name, runtime_is_windows, runtime_os_name,
-    runtime_path_for_windows_child, runtime_path_list_split, runtime_python_executable_in_env,
-    unix_time_millis, uv_command_env, uv_pip_install_base, uv_venv_args,
-    verify_rsa_pkcs1_sha256_signature,
+    normalize_therock_family, runtime_is_windows, runtime_os_name, runtime_path_for_windows_child,
+    runtime_path_list_split, runtime_python_executable_in_env, unix_time_millis, uv_command_env,
+    uv_pip_install_base, uv_venv_args, verify_rsa_pkcs1_sha256_signature,
 };
 #[cfg(test)]
 use rocm_core::{generate_rsa_signing_keypair, sign_rsa_pkcs1_sha256_signature};
@@ -1981,9 +1980,6 @@ fn download_file(url: &str, destination: &Path) -> Result<()> {
         .parent()
         .context("download destination has no parent directory")?;
     fs::create_dir_all(parent)?;
-    if use_curl_http() {
-        return download_file_windows_curl(url, destination, None);
-    }
     if use_windows_powershell_http() {
         return download_file_windows_powershell(url, destination, None);
     }
@@ -1999,9 +1995,6 @@ fn http_get(
     headers: &[(&str, &str)],
     max_time_secs: Option<u64>,
 ) -> Result<HttpResponseBody> {
-    if use_curl_http() {
-        return http_get_windows_curl(url, headers, max_time_secs);
-    }
     if use_windows_powershell_http() {
         return http_get_windows_powershell(url, headers, max_time_secs);
     }
@@ -2041,12 +2034,8 @@ fn http_get(
     })
 }
 
-const fn use_curl_http() -> bool {
-    cfg!(target_vendor = "cosmo")
-}
-
 const fn use_windows_powershell_http() -> bool {
-    runtime_is_windows() && !cfg!(target_vendor = "cosmo")
+    runtime_is_windows()
 }
 
 #[derive(Deserialize)]
@@ -2055,144 +2044,6 @@ struct WindowsHttpMetadata {
     status_code: u16,
     #[serde(rename = "Headers")]
     headers: String,
-}
-
-fn http_get_windows_curl(
-    url: &str,
-    headers: &[(&str, &str)],
-    max_time_secs: Option<u64>,
-) -> Result<HttpResponseBody> {
-    let temp_dir = windows_http_temp_dir()?;
-    let body_path = temp_dir.join("body.bin");
-    let headers_path = temp_dir.join("headers.txt");
-    let status_path = temp_dir.join("status.txt");
-    let stderr_path = temp_dir.join("stderr.txt");
-    run_windows_curl_request(
-        url,
-        headers,
-        max_time_secs,
-        &body_path,
-        &headers_path,
-        &status_path,
-        &stderr_path,
-    )?;
-    let headers = fs::read_to_string(&headers_path).unwrap_or_default();
-    let status = read_curl_status(&status_path, &headers)?;
-    let body = fs::read(&body_path).unwrap_or_default();
-    let _ = fs::remove_dir_all(&temp_dir);
-    Ok(HttpResponseBody {
-        status,
-        headers,
-        body,
-    })
-}
-
-fn download_file_windows_curl(
-    url: &str,
-    destination: &Path,
-    max_time_secs: Option<u64>,
-) -> Result<()> {
-    let parent = destination
-        .parent()
-        .context("download destination has no parent directory")?;
-    fs::create_dir_all(parent)?;
-    let temp_dir = windows_http_temp_dir()?;
-    let download_path = temp_dir.join("download.bin");
-    let headers_path = temp_dir.join("headers.txt");
-    let status_path = temp_dir.join("status.txt");
-    let stderr_path = temp_dir.join("stderr.txt");
-    run_windows_curl_request(
-        url,
-        &[],
-        max_time_secs,
-        &download_path,
-        &headers_path,
-        &status_path,
-        &stderr_path,
-    )?;
-    let headers = fs::read_to_string(&headers_path).unwrap_or_default();
-    let status = read_curl_status(&status_path, &headers)?;
-    if status != 200 {
-        let _ = fs::remove_dir_all(&temp_dir);
-        bail!("HTTP {status} while fetching {url}");
-    }
-    fs::copy(&download_path, destination).with_context(|| {
-        format!(
-            "failed to copy downloaded file to {}",
-            destination.display()
-        )
-    })?;
-    let _ = fs::remove_dir_all(&temp_dir);
-    Ok(())
-}
-
-fn run_windows_curl_request(
-    url: &str,
-    headers: &[(&str, &str)],
-    max_time_secs: Option<u64>,
-    body_path: &Path,
-    headers_path: &Path,
-    status_path: &Path,
-    stderr_path: &Path,
-) -> Result<()> {
-    let timeout = max_time_secs.filter(|value| *value > 0).unwrap_or(600);
-    let stdout_file = fs::File::create(status_path)
-        .with_context(|| format!("failed to create {}", status_path.display()))?;
-    let stderr_file = fs::File::create(stderr_path)
-        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
-    let curl_command = platform_binary_name("curl");
-    let mut command = Command::new(curl_command);
-    command
-        .args(["-sS", "-L", "--max-time", &timeout.to_string()])
-        .args(["-A", "rocm-cli"])
-        .arg("-D")
-        .arg(curl_child_path(headers_path))
-        .arg("-o")
-        .arg(curl_child_path(body_path))
-        .args(["-w", "%{http_code}"]);
-    for (name, value) in headers {
-        command.arg("-H").arg(format!("{name}: {value}"));
-    }
-    let status = command
-        .arg(url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
-        .status()
-        .with_context(|| format!("failed to launch curl HTTP request for {url}"))?;
-    if !windows_child_status_success(status) {
-        let stderr = fs::read_to_string(stderr_path).unwrap_or_default();
-        bail!(
-            "curl HTTP request failed for {url} (status {status}): {}",
-            stderr.trim()
-        );
-    }
-    Ok(())
-}
-
-fn read_curl_status(path: &Path, headers: &str) -> Result<u16> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("failed to read curl status {}", path.display()))?;
-    let text = text.trim();
-    if !text.is_empty() {
-        return text
-            .parse::<u16>()
-            .with_context(|| format!("failed to parse curl HTTP status from {text}"));
-    }
-    parse_final_http_status(headers).context("failed to parse curl HTTP status from headers")
-}
-
-fn parse_final_http_status(headers: &str) -> Option<u16> {
-    headers
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if !line.starts_with("HTTP/") {
-                return None;
-            }
-            line.split_whitespace().nth(1)?.parse::<u16>().ok()
-        })
-        .next_back()
 }
 
 fn http_get_windows_powershell(
@@ -4011,32 +3862,10 @@ echo Python 3.12.10
     }
 
     #[test]
-    fn parse_final_http_status_uses_last_header_block() {
-        let headers =
-            "HTTP/1.1 200 OK\r\netag: old\r\n\r\nHTTP/1.1 304 Not Modified\r\netag: new\r\n";
-
-        assert_eq!(parse_final_http_status(headers), Some(304));
-    }
-
-    #[test]
-    fn windows_child_path_maps_ape_drive_paths() {
-        assert_eq!(
-            windows_child_path(Path::new("/D/jam/rocm-cli/file.ps1")),
-            r"D:\jam\rocm-cli\file.ps1"
-        );
-        assert_eq!(windows_child_path(Path::new("/c")), r"C:\");
-    }
-
-    #[test]
-    fn cosmopolitan_build_uses_direct_http_not_windows_shell_http() {
-        if cfg!(target_vendor = "cosmo") {
-            assert!(use_curl_http());
-            assert!(!use_windows_powershell_http());
-        } else if runtime_is_windows() {
-            assert!(!use_curl_http());
+    fn windows_http_uses_powershell_backend() {
+        if runtime_is_windows() {
             assert!(use_windows_powershell_http());
         } else {
-            assert!(!use_curl_http());
             assert!(!use_windows_powershell_http());
         }
     }

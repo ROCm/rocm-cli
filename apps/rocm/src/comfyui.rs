@@ -3,9 +3,9 @@ use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use rocm_core::{
     AppPaths, RocmCliConfig, download_file_to_path, ensure_uv_binary, format_http_base_url,
-    runtime_is_cosmopolitan_windows, runtime_is_linux, runtime_is_windows,
-    runtime_path_for_windows_child, runtime_path_list_join, runtime_path_list_split,
-    runtime_paths_equivalent, unix_time_millis, uv_command_env, uv_pip_install_base,
+    runtime_is_linux, runtime_is_windows, runtime_path_for_windows_child, runtime_path_list_join,
+    runtime_path_list_split, runtime_paths_equivalent, unix_time_millis, uv_command_env,
+    uv_pip_install_base,
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -947,35 +947,12 @@ const fn comfyui_run_state_cli_label(state: ComfyUiRunState) -> &'static str {
 }
 
 fn endpoint_is_reachable(host: &str, port: u16) -> bool {
-    if runtime_is_cosmopolitan_windows() {
-        return http_endpoint_is_reachable_with_download(host, port);
-    }
     let Ok(addresses) = (host, port).to_socket_addrs() else {
         return false;
     };
     addresses
         .into_iter()
         .any(|address| TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok())
-}
-
-fn http_endpoint_is_reachable_with_download(host: &str, port: u16) -> bool {
-    let url = format!("{}/system_stats", format_http_base_url(host, port));
-    let script = format!(
-        "$ProgressPreference = 'SilentlyContinue'; try {{ $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 -Uri {}; if ($r.StatusCode -eq 200 -and $r.Content.Length -gt 0) {{ Write-Output 'ready'; exit 0 }} exit 1 }} catch {{ exit 1 }}",
-        powershell_quote(&url)
-    );
-    let mut command = Command::new("powershell.exe");
-    command
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-Command")
-        .arg(script);
-    let Ok(output) = capture_configured_command(command, "check ComfyUI HTTP endpoint") else {
-        return false;
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    output.status.success() || stdout.contains("ready")
 }
 
 fn process_is_running(pid: u32) -> bool {
