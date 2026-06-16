@@ -9,6 +9,8 @@ use rocm_core::{
     unix_time_millis, uv_command_env, uv_pip_install_base, uv_venv_args,
     verify_rsa_pkcs1_sha256_signature,
 };
+#[cfg(test)]
+use rocm_core::{generate_rsa_signing_keypair, sign_rsa_pkcs1_sha256_signature};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fs;
@@ -4338,39 +4340,17 @@ echo Python 3.12.10
     }
 
     fn generate_test_signing_key(private_key: &Path, public_key: &Path) -> Result<()> {
-        use rsa::RsaPrivateKey;
-        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
-
-        let mut rng = rand::thread_rng();
-        let key = RsaPrivateKey::new(&mut rng, 2048)
-            .context("failed to generate test RSA signing key")?;
-        let private_pem = key
-            .to_pkcs8_pem(LineEnding::LF)
-            .context("failed to encode test private key")?;
+        let (private_pem, public_pem) = generate_rsa_signing_keypair()?;
         fs::write(private_key, private_pem.as_bytes())?;
-        let public_pem = rsa::RsaPublicKey::from(&key)
-            .to_public_key_pem(LineEnding::LF)
-            .context("failed to encode test public key")?;
         fs::write(public_key, public_pem.as_bytes())?;
         Ok(())
     }
 
     fn sign_test_payload(private_key: &Path, payload: &Path, signature: &Path) -> Result<()> {
-        use rsa::RsaPrivateKey;
-        use rsa::pkcs1v15::SigningKey;
-        use rsa::pkcs8::DecodePrivateKey;
-        use rsa::signature::{SignatureEncoding, Signer};
-        use sha2::Sha256;
-
         let private_pem = fs::read_to_string(private_key)?;
-        let key = RsaPrivateKey::from_pkcs8_pem(&private_pem)
-            .context("failed to parse test private key")?;
         let payload_bytes = fs::read(payload)?;
-        let signing_key = SigningKey::<Sha256>::new(key);
-        let produced = signing_key
-            .try_sign(&payload_bytes)
-            .context("failed to sign test payload")?;
-        fs::write(signature, produced.to_bytes())?;
+        let produced = sign_rsa_pkcs1_sha256_signature(&private_pem, &payload_bytes)?;
+        fs::write(signature, produced)?;
         Ok(())
     }
 

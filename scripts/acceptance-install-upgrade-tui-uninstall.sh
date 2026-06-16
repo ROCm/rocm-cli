@@ -106,13 +106,13 @@ expect_failure() {
 }
 
 echo "acceptance: build release binaries"
-(cd "${REPO_ROOT}" && cargo build --release -p rocm -p rocmd -p rocm-engine-pytorch -p rocm-engine-llama-cpp -p rocm-engine-lemonade -p rocm-engine-atom -p rocm-engine-vllm -p rocm-engine-sglang)
+(cd "${REPO_ROOT}" && cargo build --release -p rocm -p rocmd -p rocm-engine-pytorch -p rocm-engine-llama-cpp -p rocm-engine-lemonade -p rocm-engine-atom -p rocm-engine-vllm -p rocm-engine-sglang -p xtask)
 
 echo "acceptance: generate signing key"
-openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "${SIGNING_PRIVATE_KEY}" >/dev/null 2>&1 \
-  || fail "failed to generate acceptance signing private key"
-openssl rsa -in "${SIGNING_PRIVATE_KEY}" -pubout -out "${SIGNING_PUBLIC_KEY}" >/dev/null 2>&1 \
-  || fail "failed to generate acceptance signing public key"
+(cd "${REPO_ROOT}" && cargo xtask keygen \
+  --private-out "${SIGNING_PRIVATE_KEY}" \
+  --public-out "${SIGNING_PUBLIC_KEY}") \
+  || fail "failed to generate acceptance signing keypair"
 
 echo "acceptance: package local release bundle"
 (cd "${REPO_ROOT}" && \

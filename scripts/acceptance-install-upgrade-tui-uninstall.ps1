@@ -157,23 +157,24 @@ try {
     $psExe = $psCommand.Source
 
     $cargoExe = Resolve-CommandPath "cargo" (Join-Path $env:USERPROFILE ".cargo\bin\cargo.exe")
-    $opensslExe = Resolve-CommandPath "openssl"
 
     $signingPrivateKey = Join-Path $AcceptanceRoot "signing-private.pem"
     $signingPublicKey = Join-Path $AcceptanceRoot "signing-public.pem"
-    & $opensslExe genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out $signingPrivateKey | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Fail "failed to generate acceptance signing private key"
+    Push-Location $RepoRoot
+    try {
+        & $cargoExe xtask keygen --private-out $signingPrivateKey --public-out $signingPublicKey | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Fail "failed to generate acceptance signing keypair"
+        }
     }
-    & $opensslExe rsa -in $signingPrivateKey -pubout -out $signingPublicKey | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Fail "failed to generate acceptance signing public key"
+    finally {
+        Pop-Location
     }
 
     Write-Host "acceptance: build release binaries"
     Push-Location $RepoRoot
     try {
-        & $cargoExe build --release -p rocm -p rocmd -p rocm-engine-pytorch -p rocm-engine-llama-cpp -p rocm-engine-lemonade -p rocm-engine-atom -p rocm-engine-vllm -p rocm-engine-sglang
+        & $cargoExe build --release -p rocm -p rocmd -p rocm-engine-pytorch -p rocm-engine-llama-cpp -p rocm-engine-lemonade -p rocm-engine-atom -p rocm-engine-vllm -p rocm-engine-sglang -p xtask
         if ($LASTEXITCODE -ne 0) {
             Fail "cargo build failed"
         }

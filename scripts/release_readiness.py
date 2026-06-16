@@ -16,6 +16,7 @@ import tarfile
 import zipfile
 from pathlib import Path
 
+
 ARCHIVE_SUFFIXES = (".tar.gz", ".zip")
 ROCM_RELEASE_ASSET_RE = re.compile(
     r"^rocm-cli-(?:(?:v[0-9][A-Za-z0-9._+-]*|nightly(?:-[0-9]{8}-[0-9A-Fa-f]+)?)-)?"
@@ -347,20 +348,22 @@ def validate_archive_contents(archive: Path) -> list[str]:
 def verify_signature(archive: Path, signature: Path, public_key: Path) -> None:
     if not public_key.is_file():
         raise ReadinessError(f"public key does not exist: {public_key}")
-    openssl = shutil.which("openssl")
-    if openssl is None:
-        raise ReadinessError("openssl is required for signature verification")
+    cargo = shutil.which("cargo")
+    if cargo is None:
+        raise ReadinessError("cargo is required for signature verification")
     completed = subprocess.run(
         [
-            openssl,
-            "dgst",
-            "-sha256",
-            "-verify",
+            cargo,
+            "xtask",
+            "verify",
+            "--public-key",
             str(public_key),
-            "-signature",
-            str(signature),
+            "--in",
             str(archive),
+            "--signature",
+            str(signature),
         ],
+        cwd=repo_root(),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,

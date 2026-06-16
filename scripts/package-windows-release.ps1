@@ -82,8 +82,7 @@ function Write-ArchiveSignature {
     if ([string]::IsNullOrWhiteSpace($PrivateKeyPath)) {
         return
     }
-    $openssl = Resolve-CommandPath "openssl"
-    & $openssl dgst -sha256 -sign $PrivateKeyPath -out "$ArchivePath.sig" $ArchivePath
+    & cargo xtask sign --private-key $PrivateKeyPath --in $ArchivePath --out "$ArchivePath.sig"
     if ($LASTEXITCODE -ne 0) {
         Fail "failed to sign $ArchivePath"
     }

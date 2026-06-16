@@ -10,6 +10,7 @@ members = [
   "engines/lemonade",
   "engines/sglang",
   "engines/vllm",
+  "xtask",
 ]
 resolver = "2"
 

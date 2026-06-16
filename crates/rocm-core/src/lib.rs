@@ -4632,6 +4632,48 @@ pub fn verify_rsa_pkcs1_sha256_signature(
         .map_err(|error| anyhow::anyhow!("{label} signature verification failed: {error}"))
 }
 
+/// Produce an RSASSA-PKCS#1 v1.5 signature over SHA-256 with a pure-Rust
+/// implementation, with no external `openssl` process.
+///
+/// `private_key_pem` is a PKCS#8 private-key PEM (`-----BEGIN PRIVATE KEY-----`),
+/// as emitted by `openssl genpkey`. The signature is deterministic and
+/// byte-identical to `openssl dgst -sha256 -sign`, so artifacts signed here verify
+/// with either implementation.
+pub fn sign_rsa_pkcs1_sha256_signature(private_key_pem: &str, payload: &[u8]) -> Result<Vec<u8>> {
+    use rsa::RsaPrivateKey;
+    use rsa::pkcs1v15::SigningKey;
+    use rsa::pkcs8::DecodePrivateKey;
+    use rsa::signature::{SignatureEncoding, Signer};
+    use sha2::Sha256;
+
+    let private_key = RsaPrivateKey::from_pkcs8_pem(private_key_pem)
+        .context("signing private key is not a valid PKCS#8 RSA private key")?;
+    let signature = SigningKey::<Sha256>::new(private_key)
+        .try_sign(payload)
+        .context("failed to produce RSA signature")?;
+    Ok(signature.to_bytes().into_vec())
+}
+
+/// Generate a fresh 2048-bit RSA signing keypair, returned as
+/// `(PKCS#8 private-key PEM, SubjectPublicKeyInfo public-key PEM)` — the same
+/// formats `openssl genpkey` / `openssl rsa -pubout` produce.
+pub fn generate_rsa_signing_keypair() -> Result<(String, String)> {
+    use rsa::RsaPrivateKey;
+    use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+
+    let mut rng = rand::thread_rng();
+    let private_key =
+        RsaPrivateKey::new(&mut rng, 2048).context("failed to generate RSA signing key")?;
+    let private_pem = private_key
+        .to_pkcs8_pem(LineEnding::LF)
+        .context("failed to encode private key")?
+        .to_string();
+    let public_pem = rsa::RsaPublicKey::from(&private_key)
+        .to_public_key_pem(LineEnding::LF)
+        .context("failed to encode public key")?;
+    Ok((private_pem, public_pem))
+}
+
 pub fn verify_model_recipe_index_signature(
     index_path: &Path,
     signature_path: &Path,
@@ -6701,98 +6743,133 @@ Class Name:                Display
         Ok(())
     }
 
-    // Static interop vector produced once, offline, by the OpenSSL CLI:
-    //   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out priv.pem
-    //   openssl rsa -in priv.pem -pubout -out pub.pem
-    //   printf 'version = 1\n' > payload.txt
-    //   openssl dgst -sha256 -sign priv.pem -out sig.bin payload.txt
-    // It pins byte-compatibility between our pure-Rust verifier and `openssl dgst
-    // -sha256 -verify`, without launching openssl (the prior flake source).
-    const OPENSSL_INTEROP_PUBLIC_KEY_PEM: &str = r#"-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtROm7eG3halAPysSr653
-sYPohfc+KCauLYkv7zOGTngTCV8OMbJZ/qekYx/zbXHEcmK3z+8oRJOzn/fA8QRc
-eoo5kzkduKgjEqDfHWLJc1Avj430bhTZ6Auyq9VqFECEh0vG3qJP8QJ/3mfxleSj
-lnhfuLajbYMZpQUtAkft3EZrUIcN6QWYBNGxF3lwqz8C8uvcxvrTQIRZ8fTLWB08
-x82+ak8iDklbCaS2qM4777QO0QTTxQK/RSTQCtUc3JQ04J3A1+HUwAxKIGixSIbU
-xqmWq3nXB+SpalmzwaNbRUdXiHeB7PHArypGtZ23/xT3XAGMN84kUIjfL5d1Q0ep
-hwIDAQAB
------END PUBLIC KEY-----
-"#;
-    const OPENSSL_INTEROP_PAYLOAD: &[u8] = b"version = 1\n";
-    const OPENSSL_INTEROP_SIGNATURE: &[u8] = &[
-        59, 31, 252, 39, 212, 110, 136, 175, 76, 219, 249, 31, 98, 216, 248, 219, 123, 104, 156,
-        104, 226, 35, 107, 61, 224, 102, 153, 92, 157, 74, 134, 197, 124, 224, 159, 247, 152, 253,
-        77, 107, 89, 104, 93, 27, 95, 43, 255, 8, 236, 146, 121, 82, 123, 163, 171, 33, 29, 78,
-        129, 212, 190, 70, 42, 143, 202, 156, 123, 31, 146, 26, 251, 245, 214, 6, 249, 3, 72, 127,
-        67, 176, 83, 38, 0, 29, 186, 110, 13, 98, 78, 208, 1, 233, 198, 150, 186, 57, 231, 111, 14,
-        173, 248, 27, 180, 163, 5, 23, 126, 142, 216, 247, 95, 210, 156, 77, 61, 134, 32, 181, 162,
-        210, 203, 233, 88, 53, 189, 189, 248, 87, 67, 53, 222, 236, 165, 153, 24, 103, 74, 81, 98,
-        110, 92, 255, 119, 227, 239, 215, 72, 50, 33, 248, 88, 252, 200, 255, 197, 190, 65, 251,
-        246, 209, 132, 89, 204, 185, 227, 27, 134, 152, 173, 159, 52, 160, 154, 178, 148, 208, 209,
-        164, 217, 199, 79, 216, 253, 243, 109, 198, 17, 238, 167, 237, 187, 176, 121, 245, 102,
-        160, 231, 3, 111, 55, 77, 56, 15, 51, 221, 118, 55, 35, 164, 228, 85, 48, 116, 75, 180,
-        187, 94, 81, 249, 125, 7, 81, 37, 92, 237, 42, 161, 151, 78, 14, 142, 149, 165, 196, 225,
-        112, 199, 11, 217, 197, 168, 122, 234, 35, 239, 209, 153, 211, 254, 217, 253, 27, 177, 182,
-        170, 7,
-    ];
+    /// Produce a `(private-key PEM, SPKI public-key PEM, payload, signature)`
+    /// tuple with the OpenSSL CLI, the same tool the installers and release
+    /// signing use (`install.sh`, `scripts/package-linux-release.sh`). Returns
+    /// `None` when openssl is unavailable or its spawn fails, so this interop
+    /// guard never reintroduces the build-failing flake we removed: the pure-Rust
+    /// sign/verify path is fully covered by the round-trip test, and this only
+    /// adds cross-checking against real openssl output where openssl exists.
+    fn openssl_signed_vector(dir: &Path) -> Option<(String, String, Vec<u8>, Vec<u8>)> {
+        let private_key = dir.join("interop-private.pem");
+        let public_key = dir.join("interop-public.pem");
+        let payload_path = dir.join("interop-payload.bin");
+        let signature_path = dir.join("interop.sig");
+        fs::write(&payload_path, b"version = 1\n").ok()?;
+
+        let run = |args: &[&str]| -> Option<()> {
+            let output = Command::new("openssl").args(args).output().ok()?;
+            output.status.success().then_some(())
+        };
+        run(&[
+            "genpkey",
+            "-algorithm",
+            "RSA",
+            "-pkeyopt",
+            "rsa_keygen_bits:2048",
+            "-out",
+            private_key.to_string_lossy().as_ref(),
+        ])?;
+        run(&[
+            "rsa",
+            "-in",
+            private_key.to_string_lossy().as_ref(),
+            "-pubout",
+            "-out",
+            public_key.to_string_lossy().as_ref(),
+        ])?;
+        run(&[
+            "dgst",
+            "-sha256",
+            "-sign",
+            private_key.to_string_lossy().as_ref(),
+            "-out",
+            signature_path.to_string_lossy().as_ref(),
+            payload_path.to_string_lossy().as_ref(),
+        ])?;
+
+        Some((
+            fs::read_to_string(&private_key).ok()?,
+            fs::read_to_string(&public_key).ok()?,
+            fs::read(&payload_path).ok()?,
+            fs::read(&signature_path).ok()?,
+        ))
+    }
 
     #[test]
-    fn rsa_verifier_is_byte_compatible_with_openssl_output() {
+    fn rsa_sign_verify_round_trips_in_pure_rust() -> Result<()> {
+        let (private_pem, public_pem) = generate_rsa_signing_keypair()?;
+        let payload = b"version = 1\n";
+
+        let signature = sign_rsa_pkcs1_sha256_signature(&private_pem, payload)?;
+        verify_rsa_pkcs1_sha256_signature(&public_pem, payload, &signature, "metadata")?;
+
+        let mut tampered = payload.to_vec();
+        tampered[0] ^= 0x01;
+        let error =
+            verify_rsa_pkcs1_sha256_signature(&public_pem, &tampered, &signature, "metadata")
+                .expect_err("a tampered payload must be rejected")
+                .to_string();
+        assert!(error.contains("metadata signature verification failed"));
+        Ok(())
+    }
+
+    #[test]
+    fn rsa_verifier_is_byte_compatible_with_openssl_output() -> Result<()> {
+        let (root, _paths) = temp_app_paths("openssl-interop-vector");
+        fs::create_dir_all(&root)?;
+        let Some((private_key_pem, public_key_pem, payload, openssl_signature)) =
+            openssl_signed_vector(&root)
+        else {
+            eprintln!("skipping openssl interop check: openssl CLI unavailable");
+            fs::remove_dir_all(&root).ok();
+            return Ok(());
+        };
+
+        // Our verifier accepts a signature produced by the openssl CLI.
         verify_rsa_pkcs1_sha256_signature(
-            OPENSSL_INTEROP_PUBLIC_KEY_PEM,
-            OPENSSL_INTEROP_PAYLOAD,
-            OPENSSL_INTEROP_SIGNATURE,
+            &public_key_pem,
+            &payload,
+            &openssl_signature,
             "metadata",
         )
         .expect("pure-Rust verifier must accept an openssl-produced signature");
 
-        let mut tampered = OPENSSL_INTEROP_PAYLOAD.to_vec();
+        // Our signer is byte-identical to `openssl dgst -sha256 -sign`, so artifacts
+        // signed by the Rust xtask verify with the openssl-based installers and vice-versa.
+        let rust_signature = sign_rsa_pkcs1_sha256_signature(&private_key_pem, &payload)?;
+        assert_eq!(
+            rust_signature, openssl_signature,
+            "Rust signature must match openssl byte-for-byte"
+        );
+
+        let mut tampered = payload.clone();
         tampered[0] ^= 0x01;
         let error = verify_rsa_pkcs1_sha256_signature(
-            OPENSSL_INTEROP_PUBLIC_KEY_PEM,
+            &public_key_pem,
             &tampered,
-            OPENSSL_INTEROP_SIGNATURE,
+            &openssl_signature,
             "metadata",
         )
         .expect_err("a tampered payload must be rejected")
         .to_string();
         assert!(error.contains("metadata signature verification failed"));
+        fs::remove_dir_all(&root).ok();
+        Ok(())
     }
 
     fn generate_test_signing_key(private_key: &Path, public_key: &Path) -> Result<()> {
-        use rsa::RsaPrivateKey;
-        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
-
-        let mut rng = rand::thread_rng();
-        let key = RsaPrivateKey::new(&mut rng, 2048)
-            .context("failed to generate test RSA signing key")?;
-        let private_pem = key
-            .to_pkcs8_pem(LineEnding::LF)
-            .context("failed to encode test private key")?;
+        let (private_pem, public_pem) = generate_rsa_signing_keypair()?;
         fs::write(private_key, private_pem.as_bytes())?;
-        let public_pem = rsa::RsaPublicKey::from(&key)
-            .to_public_key_pem(LineEnding::LF)
-            .context("failed to encode test public key")?;
         fs::write(public_key, public_pem.as_bytes())?;
         Ok(())
     }
 
     fn sign_test_payload(private_key: &Path, payload: &Path, signature: &Path) -> Result<()> {
-        use rsa::RsaPrivateKey;
-        use rsa::pkcs1v15::SigningKey;
-        use rsa::pkcs8::DecodePrivateKey;
-        use rsa::signature::{SignatureEncoding, Signer};
-        use sha2::Sha256;
-
         let private_pem = fs::read_to_string(private_key)?;
-        let key = RsaPrivateKey::from_pkcs8_pem(&private_pem)
-            .context("failed to parse test private key")?;
         let payload_bytes = fs::read(payload)?;
-        let signing_key = SigningKey::<Sha256>::new(key);
-        let produced = signing_key
-            .try_sign(&payload_bytes)
-            .context("failed to sign test payload")?;
-        fs::write(signature, produced.to_bytes())?;
+        let produced = sign_rsa_pkcs1_sha256_signature(&private_pem, &payload_bytes)?;
+        fs::write(signature, produced)?;
         Ok(())
     }
 
