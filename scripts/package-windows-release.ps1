@@ -86,7 +86,7 @@ function Write-ArchiveSignature {
     # regardless of the caller's working directory.
     Push-Location $repoRoot
     try {
-        & cargo xtask sign --private-key $PrivateKeyPath --in $ArchivePath --out "$ArchivePath.sig"
+        & $cargoExe xtask sign --private-key $PrivateKeyPath --in $ArchivePath --out "$ArchivePath.sig"
         if ($LASTEXITCODE -ne 0) {
             Fail "failed to sign $ArchivePath"
         }

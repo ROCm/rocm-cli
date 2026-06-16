@@ -5,7 +5,7 @@
 //! `openssl` CLI. Run via the workspace alias `cargo xtask <command>`.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
@@ -59,6 +59,36 @@ enum Command {
     },
 }
 
+/// Write a private-key PEM, restricting it to owner-only (`0o600`) on Unix so the
+/// key is never group- or world-readable. On Unix the file is created with the
+/// restricted mode up front, and any pre-existing file is tightened too.
+fn write_private_key(path: &Path, pem: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        // `.mode()` only applies when creating the file; tighten an existing one too.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to restrict permissions on {}", path.display()))?;
+        file.write_all(pem.as_bytes())
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, pem.as_bytes())
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn run() -> Result<()> {
     match Cli::parse().command {
         Command::Keygen {
@@ -66,8 +96,7 @@ fn run() -> Result<()> {
             public_out,
         } => {
             let (private_pem, public_pem) = generate_rsa_signing_keypair()?;
-            fs::write(&private_out, private_pem.as_bytes())
-                .with_context(|| format!("failed to write {}", private_out.display()))?;
+            write_private_key(&private_out, &private_pem)?;
             fs::write(&public_out, public_pem.as_bytes())
                 .with_context(|| format!("failed to write {}", public_out.display()))?;
         }
