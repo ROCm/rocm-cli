@@ -95,7 +95,8 @@ fn run() -> Result<()> {
                 fs::read(&input).with_context(|| format!("failed to read {}", input.display()))?;
             let signature_bytes = fs::read(&signature)
                 .with_context(|| format!("failed to read {}", signature.display()))?;
-            verify_rsa_pkcs1_sha256_signature(&public_pem, &payload, &signature_bytes, "artifact")?;
+            let label = input.display().to_string();
+            verify_rsa_pkcs1_sha256_signature(&public_pem, &payload, &signature_bytes, &label)?;
         }
     }
     Ok(())

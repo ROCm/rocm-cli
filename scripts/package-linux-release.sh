@@ -50,6 +50,10 @@ if [[ "${SIGNATURE_REQUIRED}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ && "${SIGNATURE_A
 fi
 
 if [[ "${SIGNATURE_AVAILABLE}" -eq 1 ]]; then
+  command -v cargo >/dev/null 2>&1 || {
+    echo "missing required command for signing: cargo" >&2
+    exit 1
+  }
   SIGNING_TMP_DIR="${OUTPUT_DIR}/.signing-tmp-$$"
   rm -rf "${SIGNING_TMP_DIR}"
   mkdir -p "${SIGNING_TMP_DIR}"
