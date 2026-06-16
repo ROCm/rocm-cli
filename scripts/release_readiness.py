@@ -351,17 +351,20 @@ def verify_signature(archive: Path, signature: Path, public_key: Path) -> None:
     cargo = shutil.which("cargo")
     if cargo is None:
         raise ReadinessError("cargo is required for signature verification")
+    # Resolve to absolute paths because the subprocess runs from the repo root
+    # (so the `cargo xtask` alias resolves); relative paths would otherwise be
+    # interpreted against the repo root rather than the caller's working directory.
     completed = subprocess.run(
         [
             cargo,
             "xtask",
             "verify",
             "--public-key",
-            str(public_key),
+            str(public_key.resolve()),
             "--in",
-            str(archive),
+            str(archive.resolve()),
             "--signature",
-            str(signature),
+            str(signature.resolve()),
         ],
         cwd=repo_root(),
         stdout=subprocess.PIPE,
