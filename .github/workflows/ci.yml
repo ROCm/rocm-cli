@@ -18,10 +18,14 @@ env:
 
 jobs:
   build-and-test:
-    # Pin to 22.04 (glibc 2.35) so the uploaded linux-binaries run on a lower
-    # glibc baseline than ubuntu-latest (24.04, glibc 2.39) would produce — the
-    # Instinct/WSL hardware-test runners consume this artifact directly.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
+    # This job is also the source of the linux-binaries artifact. It targets
+    # ubuntu-latest's glibc, so any hardware-test runner that downloads it
+    # (Instinct, WSL Ubuntu) must have a compatible (>=) glibc; a runner on an
+    # older distro should build in-place instead, as wsl-fedora-test does.
+    # NOTE: don't pin this job to an older image to lower the baseline — the
+    # shared cargo cache is keyed on runner.os ("Linux") and can't tell distros
+    # apart, so cross-distro artifacts get reused and fail to link/load.
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
     needs: [fmt, clippy]
     steps:
