@@ -3829,15 +3829,15 @@ fn default_dashboard_theme() -> String {
     "default-dark".to_owned()
 }
 
-fn default_gpu_tick_secs() -> f64 {
+const fn default_gpu_tick_secs() -> f64 {
     1.0
 }
 
-fn default_discovery_tick_secs() -> f64 {
+const fn default_discovery_tick_secs() -> f64 {
     5.0
 }
 
-fn default_instance_tick_secs() -> f64 {
+const fn default_instance_tick_secs() -> f64 {
     2.0
 }
 
@@ -3892,7 +3892,7 @@ impl DashboardDaemonConfig {
 /// Dashboard TUI spec. The chat endpoint URL / model / auth-header *name* are
 /// plain data; the auth-header *value* (API key) is always env-only and never
 /// stored here (AMD gateway invariant).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DashboardTuiConfig {
     #[serde(default = "default_dashboard_connect")]
     pub connect: String,
@@ -3930,6 +3930,7 @@ impl DashboardConfig {
     /// Return a copy with the chat endpoint base URL + model set and the custom
     /// auth header cleared (mirrors the rocm-dash `config_with_chat` behavior).
     /// Immutable transform — scoped to the dashboard sub-config only.
+    #[must_use]
     pub fn with_chat_endpoint(
         mut self,
         base_url: impl Into<String>,
@@ -3942,12 +3943,14 @@ impl DashboardConfig {
     }
 
     /// Return a copy with the dashboard theme set.
+    #[must_use]
     pub fn with_theme(mut self, theme: impl Into<String>) -> Self {
         self.tui.theme = theme.into();
         self
     }
 
     /// Return a copy with the telemetry daemon listen address set.
+    #[must_use]
     pub fn with_daemon_listen(mut self, listen: impl Into<String>) -> Self {
         self.daemon.listen = listen.into();
         self
@@ -7498,6 +7501,7 @@ Class Name:                Display
     // ===== Dashboard sub-config + migration =====
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn dashboard_config_defaults_and_json_round_trip() {
         let cfg = DashboardConfig::default();
         assert_eq!(cfg.daemon.listen, "unix:/tmp/rocmdashd.sock");
@@ -7574,6 +7578,7 @@ Class Name:                Display
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn migrate_legacy_dashboard_toml_maps_knobs_and_is_one_shot() -> Result<()> {
         let (root, paths) = temp_app_paths("migrate-dash");
         paths.ensure()?;
