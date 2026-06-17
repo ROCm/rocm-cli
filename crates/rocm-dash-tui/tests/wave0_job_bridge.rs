@@ -132,7 +132,10 @@ fn render<F: FnOnce(&mut ratatui::Frame)>(cols: u16, rows: u16, draw: F) -> Stri
     let mut term = Terminal::new(backend).unwrap();
     term.draw(|f| draw(f)).unwrap();
     let buf = term.backend().buffer().clone();
-    buf.content().iter().map(ratatui::buffer::Cell::symbol).collect()
+    buf.content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect()
 }
 
 #[test]

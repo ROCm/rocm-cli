@@ -141,7 +141,10 @@ mod tests {
         Instance {
             container_name: name.into(),
             model_name: name.into(),
-            gpu_ids: gpu_ids.iter().map(std::string::ToString::to_string).collect(),
+            gpu_ids: gpu_ids
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             gen_tps,
             ..Default::default()
         }

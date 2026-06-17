@@ -9,7 +9,8 @@
 /// `current_exe()` is unavailable — never a silent no-op.
 pub fn resolve_exe() -> String {
     std::env::current_exe()
-        .ok().map_or_else(|| "rocm".to_string(), |p| p.to_string_lossy().into_owned())
+        .ok()
+        .map_or_else(|| "rocm".to_string(), |p| p.to_string_lossy().into_owned())
 }
 
 /// Short, human-readable basename of a resolved command, for approval previews.

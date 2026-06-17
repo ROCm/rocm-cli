@@ -256,7 +256,8 @@ fn draw_rows_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         let ptps = format::tps_opt(r.prompt_tps);
         let gtps = format::tps_opt(r.gen_tps);
         let mrun = r
-            .max_running_reqs.map_or_else(|| "-".into(), |v| v.to_string());
+            .max_running_reqs
+            .map_or_else(|| "-".into(), |v| v.to_string());
         let v_text = verdict_label(r);
         let v_color = verdict_color(r, theme);
 
@@ -362,7 +363,13 @@ fn draw_sparkline(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 ///
 /// Row 0 of `rows_table_inner` is the header; rows 1..=visible are data
 /// lines mapped to `[start, end)` in order.
-const fn row_hit(rows_table_inner: Rect, start: usize, end: usize, x: u16, y: u16) -> Option<usize> {
+const fn row_hit(
+    rows_table_inner: Rect,
+    start: usize,
+    end: usize,
+    x: u16,
+    y: u16,
+) -> Option<usize> {
     if rows_table_inner.width == 0 || rows_table_inner.height == 0 {
         return None;
     }

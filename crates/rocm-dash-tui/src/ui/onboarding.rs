@@ -82,12 +82,8 @@ impl OnboardingChoice {
 
     const fn explanation(self) -> &'static str {
         match self {
-            Self::InstallSdk => {
-                "This downloads and installs TheRock ROCm wheels on this machine."
-            }
-            Self::AdoptExisting => {
-                "This registers an existing ROCm folder without modifying it."
-            }
+            Self::InstallSdk => "This downloads and installs TheRock ROCm wheels on this machine.",
+            Self::AdoptExisting => "This registers an existing ROCm folder without modifying it.",
         }
     }
 }

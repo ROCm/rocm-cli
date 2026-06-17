@@ -339,7 +339,10 @@ pub fn draw_theme_preview(f: &mut Frame, area: Rect, preview_theme: &Theme, acti
         .map(|i| {
             let t = i as f64 / f64::from(rows[2].width.max(1));
             // Two-bump curve so the gradient sweeps through all three stops.
-            let v = (t * std::f64::consts::PI * 2.0).sin().mul_add(40.0, 60.0).max(2.0);
+            let v = (t * std::f64::consts::PI * 2.0)
+                .sin()
+                .mul_add(40.0, 60.0)
+                .max(2.0);
             v as u64
         })
         .collect();

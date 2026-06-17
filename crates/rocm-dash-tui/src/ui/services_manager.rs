@@ -81,7 +81,9 @@ pub struct ServiceRow {
 }
 
 /// Build the sorted service list from the daemon-surfaced instances.
-pub fn service_rows<S: ::std::hash::BuildHasher>(instances: &HashMap<String, Instance, S>) -> Vec<ServiceRow> {
+pub fn service_rows<S: ::std::hash::BuildHasher>(
+    instances: &HashMap<String, Instance, S>,
+) -> Vec<ServiceRow> {
     let mut rows: Vec<ServiceRow> = instances
         .values()
         .map(|i| ServiceRow {
@@ -435,7 +437,10 @@ mod tests {
         term.draw(|f| draw_services_manager(f, f.area(), sm, insts, jobs, &theme))
             .unwrap();
         let buf = term.backend().buffer().clone();
-        buf.content().iter().map(ratatui::buffer::Cell::symbol).collect()
+        buf.content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
     }
 
     #[test]

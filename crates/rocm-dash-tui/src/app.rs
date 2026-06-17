@@ -457,7 +457,8 @@ impl AppState {
         if len == 0 {
             return;
         }
-        let next = (self.theme_picker_sel.cast_signed() + delta).clamp(0, len.cast_signed() - 1) as usize;
+        let next =
+            (self.theme_picker_sel.cast_signed() + delta).clamp(0, len.cast_signed() - 1) as usize;
         self.theme_picker_sel = next;
     }
 
@@ -803,7 +804,9 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     // replay task below — the spawned agent task feeds replies back through the
     // same `rx.recv()` arm the daemon events already use (no new plumbing).
     let chat_tx = tx.clone();
-    let replay_controller = if let Some(path) = args.replay.clone() { Some(crate::replay::spawn(path, tx)) } else {
+    let replay_controller = if let Some(path) = args.replay.clone() {
+        Some(crate::replay::spawn(path, tx))
+    } else {
         client::spawn(args.connect.clone(), tx);
         None
     };

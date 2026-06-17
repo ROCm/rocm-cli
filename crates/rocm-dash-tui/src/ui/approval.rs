@@ -80,9 +80,7 @@ pub const fn approval_key(
         KeyCode::Char('n' | 'N') => (choice, Some(ApprovalVerdict::Deny)),
         // Esc and `q` both cancel — `q` must never be silently swallowed while a
         // modal is up, so the user is never trapped on any screen.
-        KeyCode::Esc | KeyCode::Char('q' | 'Q') => {
-            (choice, Some(ApprovalVerdict::Cancel))
-        }
+        KeyCode::Esc | KeyCode::Char('q' | 'Q') => (choice, Some(ApprovalVerdict::Cancel)),
         KeyCode::Enter => {
             let verdict = match choice {
                 ApprovalChoice::Approve => ApprovalVerdict::Approve,

@@ -404,7 +404,10 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, f.area(), s, &s.theme)).unwrap();
         let buf = term.backend().buffer().clone();
-        buf.content().iter().map(ratatui::buffer::Cell::symbol).collect()
+        buf.content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
     }
 
     #[test]

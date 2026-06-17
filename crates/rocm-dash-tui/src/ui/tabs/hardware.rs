@@ -842,7 +842,10 @@ mod tests {
         term.draw(|f| draw(f, f.area(), state, &state.theme))
             .unwrap();
         let buf = term.backend().buffer().clone();
-        buf.content().iter().map(ratatui::buffer::Cell::symbol).collect()
+        buf.content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
     }
 
     fn state_with_snapshot(snap: Snapshot) -> AppState {
@@ -1019,9 +1022,15 @@ mod tests {
         // an observed value above the floor wins
         assert_eq!(semantic_max(HEATMAP_TEMP_MAX_C, &[60.0, 110.0]), 110.0);
         // power: below critical → floor (POWER_CRIT_W)
-        assert_eq!(semantic_max(f64::from(POWER_CRIT_W), &[400.0, 690.0]), 700.0);
+        assert_eq!(
+            semantic_max(f64::from(POWER_CRIT_W), &[400.0, 690.0]),
+            700.0
+        );
         // power: above critical → observed
-        assert_eq!(semantic_max(f64::from(POWER_CRIT_W), &[400.0, 760.0]), 760.0);
+        assert_eq!(
+            semantic_max(f64::from(POWER_CRIT_W), &[400.0, 760.0]),
+            760.0
+        );
         // empty data → floor
         assert_eq!(semantic_max(f64::from(POWER_CRIT_W), &[]), 700.0);
     }
@@ -1075,7 +1084,11 @@ mod tests {
         term.draw(|f| draw_detail(f, f.area(), &s, &s.theme))
             .unwrap();
         let buf = term.backend().buffer().clone();
-        let out: String = buf.content().iter().map(ratatui::buffer::Cell::symbol).collect();
+        let out: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
         assert!(out.contains("detail"), "missing detail title: {out:?}");
         assert!(out.contains("power W"), "missing power heatmap row");
     }
@@ -1088,7 +1101,10 @@ mod tests {
         rocm_dash_core::metrics::Instance {
             container_name: name.into(),
             model_name: name.into(),
-            gpu_ids: gpu_ids.iter().map(std::string::ToString::to_string).collect(),
+            gpu_ids: gpu_ids
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             gen_tps,
             ..Default::default()
         }

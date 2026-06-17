@@ -930,7 +930,10 @@ mod tests {
         term.draw(|f| draw_serve_wizard(f, f.area(), w, jobs, &[], &theme))
             .unwrap();
         let buf = term.backend().buffer().clone();
-        buf.content().iter().map(ratatui::buffer::Cell::symbol).collect()
+        buf.content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
     }
 
     #[test]

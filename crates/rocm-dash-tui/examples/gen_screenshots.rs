@@ -324,7 +324,10 @@ fn buffer_to_svg(buf: &Buffer, default_bg: Color) -> String {
             let rx = f64::from(start) * CELL_W;
             let ry = f64::from(y) * CELL_H;
             let rw = f64::from(end - start) * CELL_W;
-            let _ = write!(out, r#"<rect x="{rx:.2}" y="{ry:.2}" width="{rw:.2}" height="{CELL_H}" fill="{bg_hex_run}"/>"#);
+            let _ = write!(
+                out,
+                r#"<rect x="{rx:.2}" y="{ry:.2}" width="{rw:.2}" height="{CELL_H}" fill="{bg_hex_run}"/>"#
+            );
             x = end;
         }
     }

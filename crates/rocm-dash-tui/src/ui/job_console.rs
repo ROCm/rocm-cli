@@ -46,7 +46,9 @@ pub fn on_console_key(job_id: &str, jobs: &mut State, key: KeyEvent) -> ConsoleO
         // (the job keeps running in the background).
         KeyCode::Char('q') => ConsoleOutcome::Closed,
         KeyCode::Esc | KeyCode::Enter
-            if jobs.job(job_id).is_none_or(rocm_dash_core::state::JobState::is_terminal) =>
+            if jobs
+                .job(job_id)
+                .is_none_or(rocm_dash_core::state::JobState::is_terminal) =>
         {
             ConsoleOutcome::Dismissed
         }

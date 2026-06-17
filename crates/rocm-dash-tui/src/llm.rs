@@ -59,7 +59,8 @@ pub fn resolve_llm_config(
 
     // model precedence: CLI > config > built-in default.
     let model = cli_model
-        .or(cfg_model).map_or_else(|| DEFAULT_CHAT_MODEL.to_string(), str::to_string);
+        .or(cfg_model)
+        .map_or_else(|| DEFAULT_CHAT_MODEL.to_string(), str::to_string);
 
     Some(LlmConfig {
         base_url,

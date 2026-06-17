@@ -34,10 +34,7 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     draw_memory(f, left[1], state, theme);
     draw_host(f, left[2], state, theme);
 
-    let n_gpus = state
-        .latest
-        .as_ref()
-        .map_or(1, |s| s.gpus.len().max(1));
+    let n_gpus = state.latest.as_ref().map_or(1, |s| s.gpus.len().max(1));
     let gpu_height = (n_gpus as u16 * 4 + 2).clamp(8, 20);
     let right = Layout::default()
         .direction(Direction::Vertical)
@@ -320,8 +317,7 @@ fn draw_instances(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         };
         let name = trunc(&inst.container_name, 18);
         let model = trunc(&inst.model_name, 20);
-        let port = inst
-            .port.map_or_else(|| "-".into(), |p| p.to_string());
+        let port = inst.port.map_or_else(|| "-".into(), |p| p.to_string());
         let gpus = if inst.gpu_ids.is_empty() {
             "-".to_string()
         } else {

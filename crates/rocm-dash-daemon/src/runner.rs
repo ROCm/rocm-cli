@@ -189,13 +189,15 @@ pub async fn run_loop(
         tick_count += 1;
 
         let mut warnings = Vec::new();
-        let gpus = if let Some(g) = &gpu { match g.metrics().await {
-            Ok(v) => v,
-            Err(e) => {
-                warnings.push(format!("amd-smi metric: {e}"));
-                Vec::new()
+        let gpus = if let Some(g) = &gpu {
+            match g.metrics().await {
+                Ok(v) => v,
+                Err(e) => {
+                    warnings.push(format!("amd-smi metric: {e}"));
+                    Vec::new()
+                }
             }
-        } } else {
+        } else {
             warnings.push("amd-smi unavailable (no /dev/kfd or binary missing)".into());
             Vec::new()
         };
@@ -680,7 +682,10 @@ mod tests {
     fn inst(container_id: &str, gpu_ids: &[&str]) -> Instance {
         Instance {
             container_id: container_id.into(),
-            gpu_ids: gpu_ids.iter().map(std::string::ToString::to_string).collect(),
+            gpu_ids: gpu_ids
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             ..Instance::default()
         }
     }

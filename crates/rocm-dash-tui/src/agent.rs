@@ -111,9 +111,7 @@ pub fn annotate_reply(reply: String, skills: &[String]) -> String {
 // ---------------------------------------------------------------------------
 
 fn gpus_of(snap: &StateSnapshot) -> &[GpuMetrics] {
-    snap.latest
-        .as_ref()
-        .map_or(&[], |s| s.gpus.as_slice())
+    snap.latest.as_ref().map_or(&[], |s| s.gpus.as_slice())
 }
 
 fn gpu_json(g: &GpuMetrics) -> Value {

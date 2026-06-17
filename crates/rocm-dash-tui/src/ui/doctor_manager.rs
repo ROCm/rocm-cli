@@ -44,7 +44,9 @@ pub fn on_key(
             ConsoleOutcome::Unhandled => {
                 // `r` re-runs after a terminal result.
                 if key.code == KeyCode::Char('r')
-                    && jobs.job(&job_id).is_none_or(rocm_dash_core::state::JobState::is_terminal)
+                    && jobs
+                        .job(&job_id)
+                        .is_none_or(rocm_dash_core::state::JobState::is_terminal)
                 {
                     d.active_job = None;
                     return run_doctor(d, jobs);

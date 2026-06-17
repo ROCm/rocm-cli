@@ -440,7 +440,10 @@ mod tests {
         term.draw(|f| draw_engine_manager(f, f.area(), em, jobs, &theme))
             .unwrap();
         let buf = term.backend().buffer().clone();
-        buf.content().iter().map(ratatui::buffer::Cell::symbol).collect()
+        buf.content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
     }
 
     #[test]

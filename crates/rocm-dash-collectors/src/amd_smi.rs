@@ -121,7 +121,10 @@ pub fn parse_metrics(v: &Value) -> Vec<GpuMetrics> {
     };
     gpus.iter()
         .map(|g| {
-            let id = g.get("gpu").and_then(serde_json::Value::as_u64).unwrap_or(0);
+            let id = g
+                .get("gpu")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
             // Prefer hotspot — edge is N/A on MI300X SR-IOV.
             let temperature_c = val_f32(nested(g, &["temperature", "hotspot", "value"]))
                 .or_else(|| val_f32(nested(g, &["temperature", "edge", "value"])))
@@ -212,7 +215,10 @@ pub fn parse_processes(v: &Value) -> Vec<GpuProcess> {
 
     let mut out = Vec::new();
     for g in entries {
-        let id = g.get("gpu").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let id = g
+            .get("gpu")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
         let device_id = format!("gpu-{id}");
         let plist = g
             .get("process_list")
@@ -267,7 +273,8 @@ pub fn parse_system_info(
             info.gpu_model = nested(first, &["asic", "market_name"])
                 .and_then(|x| x.as_str())
                 .filter(|s| *s != "N/A")
-                .or_else(|| nested(first, &["board", "product_name"]).and_then(|x| x.as_str())).map_or_else(|| "Unknown".into(), str::to_owned);
+                .or_else(|| nested(first, &["board", "product_name"]).and_then(|x| x.as_str()))
+                .map_or_else(|| "Unknown".into(), str::to_owned);
         }
     }
 

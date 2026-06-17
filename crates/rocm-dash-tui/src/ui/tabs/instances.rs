@@ -193,7 +193,10 @@ fn clamp_sel(sel: usize, len: usize) -> usize {
     if len == 0 { 0 } else { sel.min(len - 1) }
 }
 
-const fn status_meta(status: InstanceStatus, theme: &Theme) -> (ratatui::style::Color, &'static str) {
+const fn status_meta(
+    status: InstanceStatus,
+    theme: &Theme,
+) -> (ratatui::style::Color, &'static str) {
     match status {
         InstanceStatus::Running => (theme.ok, "RUNNING"),
         InstanceStatus::Starting => (theme.warn, "STARTING"),
@@ -262,8 +265,7 @@ fn draw_card(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, selected
         return;
     }
 
-    let port_str = inst
-        .port.map_or_else(|| "-".into(), |p| p.to_string());
+    let port_str = inst.port.map_or_else(|| "-".into(), |p| p.to_string());
     let gpus_str = if inst.gpu_ids.is_empty() {
         "-".to_string()
     } else if inst.gpu_ids.len() == 1 {
@@ -377,8 +379,7 @@ fn draw_card(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, selected
 
 fn compact_line<'a>(inst: &'a Instance, theme: &Theme, max_w: usize) -> Line<'a> {
     let (status_color, _) = status_meta(inst.status, theme);
-    let port = inst
-        .port.map_or_else(|| "-".into(), |p| p.to_string());
+    let port = inst.port.map_or_else(|| "-".into(), |p| p.to_string());
     let gpus = if inst.gpu_ids.is_empty() {
         "-".to_string()
     } else {
@@ -515,8 +516,7 @@ fn render_summary(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme) {
     let container_id = trunc(&inst.container_id, id_w);
     let partition = inst.partition_info.as_deref().unwrap_or("-");
     let quant = inst.quantization.as_deref().unwrap_or("-");
-    let port = inst
-        .port.map_or_else(|| "-".into(), |p| p.to_string());
+    let port = inst.port.map_or_else(|| "-".into(), |p| p.to_string());
     let gpus = if inst.gpu_ids.is_empty() {
         "-".to_string()
     } else {

@@ -109,10 +109,7 @@ pub fn generate_to_writer<W: Write>(opts: &DemoOptions, w: &mut W) -> anyhow::Re
         }
 
         // Any bench rows scheduled at this second.
-        while bench_iter
-            .peek()
-            .is_some_and(|(t_off, _)| *t_off == t)
-        {
+        while bench_iter.peek().is_some_and(|(t_off, _)| *t_off == t) {
             let (_t_off, row) = bench_iter.next().unwrap();
             let ev = PersistedEntry {
                 ts_us: ts_us + 500_000, // half a tick after the snapshot
@@ -459,11 +456,14 @@ fn build_host(t_s: f64, seed: &mut u64) -> SystemMetrics {
         // Each core's load is the aggregate ± a per-core offset so the
         // CoreBars widget shows visible variation across cores.
         let off = osc(t_s, 7.0 + (i as f64 % 11.0), i as f64 * 0.7, 0.0, 18.0);
-        let v = (jitter(seed) - 0.5).mul_add(6.0, agg + off).clamp(0.0, 100.0);
+        let v = (jitter(seed) - 0.5)
+            .mul_add(6.0, agg + off)
+            .clamp(0.0, 100.0);
         per_core.push(v);
     }
 
-    let mem_used = (MEMORY_TOTAL_MB as f64 * 0.42 * 0.02f64.mul_add((t_s / 31.0).sin(), 1.0)) as u64;
+    let mem_used =
+        (MEMORY_TOTAL_MB as f64 * 0.42 * 0.02f64.mul_add((t_s / 31.0).sin(), 1.0)) as u64;
 
     SystemMetrics {
         cpu_overall_pct: agg,
@@ -490,8 +490,16 @@ fn build_gpu(idx: usize, t_s: f64, seed: &mut u64) -> GpuMetrics {
         })
         .map_or((20.0, 5.0, 0.0), |c| (c.util_mean, c.util_amp, c.phase_s));
 
-    let util =
-        (jitter(seed) - 0.5).mul_add(5.0, osc(t_s, 11.0, (idx as f64).mul_add(1.3, phase), util_mean, util_amp));
+    let util = (jitter(seed) - 0.5).mul_add(
+        5.0,
+        osc(
+            t_s,
+            11.0,
+            (idx as f64).mul_add(1.3, phase),
+            util_mean,
+            util_amp,
+        ),
+    );
     let util = util.clamp(0.0, 100.0);
 
     // Temp tracks util with thermal lag — small offset, narrower swing.
@@ -499,8 +507,8 @@ fn build_gpu(idx: usize, t_s: f64, seed: &mut u64) -> GpuMetrics {
     // Power tracks util more linearly. MI355X TDP ~ 750W.
     let power = (jitter(seed) - 0.5).mul_add(18.0, 5.2f32.mul_add(util, 220.0));
     // VRAM is mostly the model weights once loaded.
-    let vram_used =
-        (f64::from(jitter(seed)) * VRAM_TOTAL_MB as f64).mul_add(0.02, VRAM_TOTAL_MB as f64 * 0.74) as u64;
+    let vram_used = (f64::from(jitter(seed)) * VRAM_TOTAL_MB as f64)
+        .mul_add(0.02, VRAM_TOTAL_MB as f64 * 0.74) as u64;
 
     GpuMetrics {
         device_id: format!("gpu-{idx}"),
@@ -535,7 +543,8 @@ fn build_instances(t_s: f64, seed: &mut u64) -> Vec<Instance> {
     CONTAINERS
         .iter()
         .map(|c| {
-            let kv = (jitter(seed) - 0.5).mul_add(4.0, osc(t_s, 13.0, c.phase_s, c.kv_mean, c.kv_amp));
+            let kv =
+                (jitter(seed) - 0.5).mul_add(4.0, osc(t_s, 13.0, c.phase_s, c.kv_mean, c.kv_amp));
             let kv = kv.clamp(0.0, 100.0);
             let running = ((c.req_mean as f32
                 + osc(t_s, 17.0, c.phase_s, 0.0, c.req_mean as f32 * 0.6))
@@ -560,8 +569,9 @@ fn build_instances(t_s: f64, seed: &mut u64) -> Vec<Instance> {
             // Generation throughput scales with the instance's GPU count and
             // oscillates with load; tokens_per_watt is filled in build_snapshot
             // once GPU power is known (mirrors the runner's assembly step).
-            let gen_tps =
-                (c.gpu_ids.len() as f64 * f64::from(osc(t_s, 19.0, c.phase_s, 180.0, 90.0))).max(0.0);
+            let gen_tps = (c.gpu_ids.len() as f64
+                * f64::from(osc(t_s, 19.0, c.phase_s, 180.0, 90.0)))
+            .max(0.0);
 
             Instance {
                 container_id: c.container_id.into(),
