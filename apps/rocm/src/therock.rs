@@ -2259,7 +2259,7 @@ fn windows_http_keep_temp() -> bool {
 
 fn windows_http_failure_temp_note(temp_dir: &Path) -> String {
     if windows_http_keep_temp() {
-        format!("; temp files kept at {}", curl_child_path(temp_dir))
+        format!("; temp files kept at {}", display_child_path(temp_dir))
     } else {
         String::new()
     }
@@ -2305,7 +2305,7 @@ fn windows_child_path(path: &Path) -> String {
     runtime_path_for_windows_child(path)
 }
 
-fn curl_child_path(path: &Path) -> String {
+fn display_child_path(path: &Path) -> String {
     if runtime_is_windows() {
         windows_child_path(path)
     } else {
