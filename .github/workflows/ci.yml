@@ -30,6 +30,22 @@ jobs:
       - name: Build
         run: cargo build --workspace --all-targets
 
+      - name: Upload Linux binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-binaries
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            target/debug/rocm
+            target/debug/rocmd
+            target/debug/rocm-engine-pytorch
+            target/debug/rocm-engine-llama-cpp
+            target/debug/rocm-engine-lemonade
+            target/debug/rocm-engine-atom
+            target/debug/rocm-engine-vllm
+            target/debug/rocm-engine-sglang
+
       - name: Test
         run: cargo test --workspace --all-targets
 
@@ -67,6 +83,22 @@ jobs:
         shell: pwsh
         run: cargo build --workspace --all-targets
 
+      - name: Upload Windows binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-binaries
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            target/debug/rocm.exe
+            target/debug/rocmd.exe
+            target/debug/rocm-engine-pytorch.exe
+            target/debug/rocm-engine-llama-cpp.exe
+            target/debug/rocm-engine-lemonade.exe
+            target/debug/rocm-engine-atom.exe
+            target/debug/rocm-engine-vllm.exe
+            target/debug/rocm-engine-sglang.exe
+
       - name: Test
         shell: pwsh
         run: cargo test --workspace --all-targets
@@ -100,138 +132,6 @@ jobs:
       - name: Acceptance install lifecycle
         shell: pwsh
         run: .\scripts\acceptance-install-upgrade-tui-uninstall.ps1
-
-  win11-build-and-test:
-    name: Pure Windows 11 build and test
-    runs-on: [self-hosted, windows-gfx1151-gpu-rocm]
-    # Self-hosted runners must not execute untrusted fork PRs.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry and build
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-win11-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-win11-
-
-      - name: Build
-        run: cargo build --workspace --all-targets
-
-      - name: Test
-        run: cargo test --workspace --all-targets
-
-  wsl-ubuntu-build-and-test:
-    name: Ubuntu on WSL build and test (primary)
-    runs-on: [self-hosted, wsl, ubuntu]
-    # Opt-in until the [wsl, ubuntu] runner fleet is online: set repo/org
-    # variable ENABLE_WSL_UBUNTU_CI=true to enable. Non-blocking for now.
-    continue-on-error: true
-    # Self-hosted runners must not execute untrusted fork PRs.
-    if: vars.ENABLE_WSL_UBUNTU_CI == 'true' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Build and test in WSL Ubuntu
-        run: |
-          $ErrorActionPreference = "Stop"
-          $wp = (wsl -d Ubuntu wslpath "'$($PWD.Path)'").Trim()
-          $script = @"
-          set -euo pipefail
-          cd '$wp'
-          export CARGO_TARGET_DIR="`$HOME/.cache/rocm-cli-target"
-          if ! command -v cargo >/dev/null 2>&1; then
-            curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-            export PATH="`$HOME/.cargo/bin:`$PATH"
-          fi
-          if command -v apt-get >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y pkg-config libcap-dev build-essential
-          fi
-          cargo build --workspace --all-targets
-          cargo test --workspace --all-targets
-          "@
-          wsl -d Ubuntu -- bash -lc $script
-          if ($LASTEXITCODE -ne 0) { throw "WSL Ubuntu build/test failed with exit code $LASTEXITCODE" }
-
-  wsl-fedora-build-and-test:
-    name: Fedora on WSL build and test (secondary)
-    runs-on: [self-hosted, wsl, fedora]
-    # Secondary target: failures must not block the PR.
-    continue-on-error: true
-    # Opt-in until the [wsl, fedora] runner fleet is online: set repo/org
-    # variable ENABLE_WSL_FEDORA_CI=true to enable.
-    # Self-hosted runners must not execute untrusted fork PRs.
-    if: vars.ENABLE_WSL_FEDORA_CI == 'true' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Build and test in WSL Fedora
-        run: |
-          $ErrorActionPreference = "Stop"
-          $wp = (wsl -d Fedora wslpath "'$($PWD.Path)'").Trim()
-          $script = @"
-          set -euo pipefail
-          cd '$wp'
-          export CARGO_TARGET_DIR="`$HOME/.cache/rocm-cli-target"
-          if ! command -v cargo >/dev/null 2>&1; then
-            curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-            export PATH="`$HOME/.cargo/bin:`$PATH"
-          fi
-          if command -v dnf >/dev/null 2>&1; then
-            sudo dnf install -y pkgconf-pkg-config libcap-devel gcc gcc-c++ make
-          fi
-          cargo build --workspace --all-targets
-          cargo test --workspace --all-targets
-          "@
-          wsl -d Fedora -- bash -lc $script
-          if ($LASTEXITCODE -ne 0) { throw "WSL Fedora build/test failed with exit code $LASTEXITCODE" }
-
-  instinct-linux-build-and-test:
-    name: Ubuntu Instinct bare-metal build and test
-    runs-on: [self-hosted, linux, instinct, rocm]
-    # Opt-in until the [linux, instinct, rocm] runner fleet is online: set
-    # repo/org variable ENABLE_INSTINCT_CI=true to enable. Non-blocking for now.
-    continue-on-error: true
-    # Self-hosted runners must not execute untrusted fork PRs.
-    if: vars.ENABLE_INSTINCT_CI == 'true' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry and build
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-instinct-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-instinct-
-
-      - name: Build
-        run: cargo build --workspace --all-targets
-
-      - name: Test
-        run: cargo test --workspace --all-targets
 
   fmt:
     runs-on: ubuntu-latest
@@ -293,58 +193,157 @@ jobs:
             -p rocm-dash-daemon -p rocm-dash-tui \
             --fail-under-lines 70
 
-  gpu-smoke:
-    name: GPU Smoke (gfx1151)
+  # ---------------------------------------------------------------------------
+  # Optional hardware tests on dedicated self-hosted runners.
+  #
+  # These do NOT build: they download the exact binaries produced by the hosted
+  # build jobs above and exercise the parts hosted runners cannot (real AMD GPU,
+  # real WSL). Each is opt-in via a repo/org variable and continue-on-error, so
+  # an offline/busy dedicated runner never blocks a PR. Enable a fleet by setting
+  # its variable to "true" once the matching runners are online:
+  #   ENABLE_WIN11_GPU_CI / ENABLE_INSTINCT_CI /
+  #   ENABLE_WSL_UBUNTU_CI / ENABLE_WSL_FEDORA_CI
+  # ---------------------------------------------------------------------------
+
+  win11-gpu-test:
+    name: Windows gfx1151 GPU test (artifact)
     runs-on: [self-hosted, windows-gfx1151-gpu-rocm]
-    needs: [windows-build-and-test, fmt, clippy]
-    # Temporarily disabled: the gfx1151 self-hosted runner isn't picking up the job / GPU smoke isn't working yet.
-    # To re-enable, restore:
-    # if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-    if: false
+    needs: [windows-build-and-test]
+    continue-on-error: true
+    # Opt-in + fork-safety (self-hosted runners must not run untrusted fork PRs).
+    if: vars.ENABLE_WIN11_GPU_CI == 'true' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
     timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
     defaults:
       run:
         shell: pwsh
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-
-      - name: Build workspace
-        run: cargo build --workspace --all-targets
+      - name: Download Windows binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-binaries
+          path: target/debug
 
       - name: Host detection
         run: .\target\debug\rocm.exe doctor
 
-      - name: Engine detection
-        run: .\target\debug\rocm-engine-pytorch.exe detect
+      - name: Engine detection and capabilities
+        run: |
+          .\target\debug\rocm-engine-pytorch.exe detect
+          .\target\debug\rocm-engine-pytorch.exe capabilities
+          .\target\debug\rocm-engine-llama-cpp.exe detect
+          .\target\debug\rocm-engine-llama-cpp.exe capabilities
 
-      - name: Engine capabilities
-        run: .\target\debug\rocm-engine-pytorch.exe capabilities
+      - name: Local no-fallback smoke (prebuilt)
+        run: python .\scripts\smoke_local.py --skip-build
 
-      - name: llama.cpp adapter detection
-        run: .\target\debug\rocm-engine-llama-cpp.exe detect
+      - name: PyTorch GPU end-to-end
+        run: python .\scripts\pytorch_therock_gpu_test.py --engine .\target\debug\rocm-engine-pytorch.exe
 
-      - name: llama.cpp adapter capabilities
-        run: .\target\debug\rocm-engine-llama-cpp.exe capabilities
+  instinct-gpu-test:
+    name: Instinct bare-metal GPU test (artifact)
+    runs-on: [self-hosted, linux, instinct, rocm]
+    needs: [build-and-test]
+    continue-on-error: true
+    if: vars.ENABLE_INSTINCT_CI == 'true' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v6
 
-      - name: ATOM adapter detection
-        run: .\target\debug\rocm-engine-atom.exe detect
+      - name: Download Linux binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-binaries
+          path: target/debug
 
-      - name: ATOM adapter capabilities
-        run: .\target\debug\rocm-engine-atom.exe capabilities
+      - name: Restore executable bits
+        run: chmod +x target/debug/rocm target/debug/rocmd target/debug/rocm-engine-*
 
-      - name: vLLM adapter detection
-        run: .\target\debug\rocm-engine-vllm.exe detect
+      - name: Host detection
+        run: ./target/debug/rocm doctor
 
-      - name: vLLM adapter capabilities
-        run: .\target\debug\rocm-engine-vllm.exe capabilities
+      - name: Local no-fallback smoke (prebuilt)
+        run: python3 scripts/smoke_local.py --skip-build
 
-      - name: SGLang adapter detection
-        run: .\target\debug\rocm-engine-sglang.exe detect
+      - name: PyTorch GPU end-to-end
+        run: python3 scripts/pytorch_therock_gpu_test.py --engine ./target/debug/rocm-engine-pytorch
+      # Expand later (once first runs are green): vLLM/SGLang/ATOM GPU harnesses.
 
-      - name: SGLang adapter capabilities
-        run: .\target\debug\rocm-engine-sglang.exe capabilities
+  wsl-ubuntu-test:
+    name: WSL Ubuntu GPU test (artifact)
+    runs-on: [self-hosted, wsl, ubuntu]
+    needs: [build-and-test]
+    continue-on-error: true
+    if: vars.ENABLE_WSL_UBUNTU_CI == 'true' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
 
-      - name: Resolve large-model recipe
-        run: .\target\debug\rocm-engine-pytorch.exe resolve-model qwen32b
+      - name: Download Linux binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-binaries
+          path: target/debug
+
+      - name: Test prebuilt binaries in WSL Ubuntu
+        run: |
+          $ErrorActionPreference = "Stop"
+          $wp = (wsl -d Ubuntu wslpath "'$($PWD.Path)'").Trim()
+          $script = @"
+          set -euo pipefail
+          cd '$wp'
+          chmod +x target/debug/rocm target/debug/rocmd target/debug/rocm-engine-*
+          python3 scripts/smoke_local.py --skip-build
+          python3 scripts/pytorch_therock_gpu_test.py --engine ./target/debug/rocm-engine-pytorch
+          "@
+          wsl -d Ubuntu -- bash -lc $script
+          if ($LASTEXITCODE -ne 0) { throw "WSL Ubuntu hardware test failed with exit code $LASTEXITCODE" }
+
+  wsl-fedora-test:
+    name: WSL Fedora GPU test (build-in-WSL, secondary)
+    runs-on: [self-hosted, wsl, fedora]
+    # Secondary: builds inside WSL Fedora instead of reusing the ubuntu-latest
+    # artifact, to avoid cross-distro glibc mismatch. Non-blocking.
+    continue-on-error: true
+    if: vars.ENABLE_WSL_FEDORA_CI == 'true' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build and GPU-test in WSL Fedora
+        run: |
+          $ErrorActionPreference = "Stop"
+          $wp = (wsl -d Fedora wslpath "'$($PWD.Path)'").Trim()
+          $script = @"
+          set -euo pipefail
+          cd '$wp'
+          export CARGO_TARGET_DIR="`$HOME/.cache/rocm-cli-target"
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+            export PATH="`$HOME/.cargo/bin:`$PATH"
+          fi
+          if command -v dnf >/dev/null 2>&1; then
+            sudo dnf install -y pkgconf-pkg-config libcap-devel gcc gcc-c++ make
+          fi
+          cargo build --workspace --all-targets
+          python3 scripts/smoke_local.py --skip-build --target-dir "`$CARGO_TARGET_DIR"
+          python3 scripts/pytorch_therock_gpu_test.py --engine "`$CARGO_TARGET_DIR/debug/rocm-engine-pytorch"
+          "@
+          wsl -d Fedora -- bash -lc $script
+          if ($LASTEXITCODE -ne 0) { throw "WSL Fedora hardware test failed with exit code $LASTEXITCODE" }
