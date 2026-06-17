@@ -18,7 +18,10 @@ env:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    # Pin to 22.04 (glibc 2.35) so the uploaded linux-binaries run on a lower
+    # glibc baseline than ubuntu-latest (24.04, glibc 2.39) would produce — the
+    # Instinct/WSL hardware-test runners consume this artifact directly.
+    runs-on: ubuntu-22.04
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
     needs: [fmt, clippy]
     steps:
@@ -32,12 +35,17 @@ jobs:
       - name: Build
         run: cargo build --workspace --all-targets
 
+      - name: Test
+        run: cargo test --workspace --all-targets
+
+      # Upload after Build+Test so the stored artifact always corresponds to a
+      # validated build. (Hardware jobs gate on this job's success via needs.)
       - name: Upload Linux binaries
         uses: actions/upload-artifact@v4
         with:
           name: linux-binaries
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 7
           path: |
             target/debug/rocm
             target/debug/rocmd
@@ -47,9 +55,6 @@ jobs:
             target/debug/rocm-engine-atom
             target/debug/rocm-engine-vllm
             target/debug/rocm-engine-sglang
-
-      - name: Test
-        run: cargo test --workspace --all-targets
 
       - name: Local no-fallback smoke
         run: python scripts/smoke_local.py --skip-build
@@ -93,12 +98,18 @@ jobs:
           cargo build --workspace --all-targets
           cargo build --release -p rocm -p rocmd -p rocm-engine-pytorch -p rocm-engine-llama-cpp -p rocm-engine-lemonade -p rocm-engine-atom -p rocm-engine-vllm -p rocm-engine-sglang -p xtask
 
+      - name: Test
+        shell: pwsh
+        run: cargo test --workspace --all-targets
+
+      # Upload after Build+Test so the stored artifact always corresponds to a
+      # validated build. (Hardware jobs gate on this job's success via needs.)
       - name: Upload Windows binaries
         uses: actions/upload-artifact@v4
         with:
           name: windows-binaries
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 7
           path: |
             target/debug/rocm.exe
             target/debug/rocmd.exe
@@ -108,10 +119,6 @@ jobs:
             target/debug/rocm-engine-atom.exe
             target/debug/rocm-engine-vllm.exe
             target/debug/rocm-engine-sglang.exe
-
-      - name: Test
-        shell: pwsh
-        run: cargo test --workspace --all-targets
 
       - name: Local no-fallback smoke
         shell: pwsh
@@ -350,6 +357,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $wp = (wsl -d Ubuntu wslpath "'$($PWD.Path)'").Trim()
+          if ($wp -match "'") { throw "Working directory path contains a single quote; cannot safely pass to bash" }
           $script = @"
           set -euo pipefail
           cd '$wp'
@@ -381,6 +389,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $wp = (wsl -d Fedora wslpath "'$($PWD.Path)'").Trim()
+          if ($wp -match "'") { throw "Working directory path contains a single quote; cannot safely pass to bash" }
           $script = @"
           set -euo pipefail
           cd '$wp'

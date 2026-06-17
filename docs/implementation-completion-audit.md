@@ -110,7 +110,7 @@ python scripts\comfyui_therock_gpu_test.py --rocm target\release\rocm.exe
 WSL verification should run from the WSL filesystem when possible for better IO:
 
 ```bash
-export CARGO_TARGET_DIR=/home/jam/.cache/rocm-cli-target
+export CARGO_TARGET_DIR=/home/user/.cache/rocm-cli-target
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 python3 scripts/smoke_local.py --skip-build
@@ -123,10 +123,10 @@ python3 scripts/local_assistant_therock_gpu_test.py --self-test
 For WSL/Linux, build and run the native Linux binary directly:
 
 ```bash
-/home/jam/rocm-cli-e2e/bin/rocm doctor
-python3 scripts/local_assistant_therock_gpu_test.py --rocm /home/jam/rocm-cli-e2e/bin/rocm --engine lemonade --model qwen --require-tool-call
-python3 scripts/local_assistant_therock_gpu_test.py --rocm /home/jam/rocm-cli-e2e/bin/rocm --engine pytorch --model qwen --require-tool-call
-python3 scripts/comfyui_therock_gpu_test.py --rocm /home/jam/rocm-cli-e2e/bin/rocm
+/home/user/rocm-cli-e2e/bin/rocm doctor
+python3 scripts/local_assistant_therock_gpu_test.py --rocm /home/user/rocm-cli-e2e/bin/rocm --engine lemonade --model qwen --require-tool-call
+python3 scripts/local_assistant_therock_gpu_test.py --rocm /home/user/rocm-cli-e2e/bin/rocm --engine pytorch --model qwen --require-tool-call
+python3 scripts/comfyui_therock_gpu_test.py --rocm /home/user/rocm-cli-e2e/bin/rocm
 ```
 
 ## Regression Rules
