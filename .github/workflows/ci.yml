@@ -134,8 +134,11 @@ jobs:
   wsl-ubuntu-build-and-test:
     name: Ubuntu on WSL build and test (primary)
     runs-on: [self-hosted, wsl, ubuntu]
+    # Opt-in until the [wsl, ubuntu] runner fleet is online: set repo/org
+    # variable ENABLE_WSL_UBUNTU_CI=true to enable. Non-blocking for now.
+    continue-on-error: true
     # Self-hosted runners must not execute untrusted fork PRs.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    if: vars.ENABLE_WSL_UBUNTU_CI == 'true' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
     defaults:
       run:
         shell: pwsh
@@ -169,8 +172,10 @@ jobs:
     runs-on: [self-hosted, wsl, fedora]
     # Secondary target: failures must not block the PR.
     continue-on-error: true
+    # Opt-in until the [wsl, fedora] runner fleet is online: set repo/org
+    # variable ENABLE_WSL_FEDORA_CI=true to enable.
     # Self-hosted runners must not execute untrusted fork PRs.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    if: vars.ENABLE_WSL_FEDORA_CI == 'true' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
     defaults:
       run:
         shell: pwsh
@@ -201,8 +206,11 @@ jobs:
   instinct-linux-build-and-test:
     name: Ubuntu Instinct bare-metal build and test
     runs-on: [self-hosted, linux, instinct, rocm]
+    # Opt-in until the [linux, instinct, rocm] runner fleet is online: set
+    # repo/org variable ENABLE_INSTINCT_CI=true to enable. Non-blocking for now.
+    continue-on-error: true
     # Self-hosted runners must not execute untrusted fork PRs.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    if: vars.ENABLE_INSTINCT_CI == 'true' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
     steps:
       - uses: actions/checkout@v6
 
