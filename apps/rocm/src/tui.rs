@@ -3211,8 +3211,13 @@ impl App {
             *channel = channel.toggle();
             state.message = None;
             state.detail_scroll = 0;
+            self.status = channel_changed_status().to_owned();
         }
-        self.status = "ROCm channel changed. release is stable, nightly is preview.".to_owned();
+    }
+
+    fn toggle_onboarding_channel(&mut self) {
+        self.onboarding_channel = self.onboarding_channel.toggle();
+        self.status = channel_changed_status().to_owned();
     }
 
     fn open_install_sdk_form_folder_browser(&mut self) {
@@ -6808,11 +6813,7 @@ impl App {
 
     fn perform_onboarding_selected_action(&mut self) {
         match self.selected_onboarding_choice() {
-            OnboardingMenuChoice::Channel => {
-                self.onboarding_channel = self.onboarding_channel.toggle();
-                self.status =
-                    "ROCm channel changed. release is stable, nightly is preview.".to_owned();
-            }
+            OnboardingMenuChoice::Channel => self.toggle_onboarding_channel(),
             OnboardingMenuChoice::Folder if self.pending_approval.is_none() => {
                 self.open_onboarding_install_folder_browser();
             }
@@ -14445,12 +14446,8 @@ fn onboarding_menu_label(app: &App, choice: OnboardingMenuChoice) -> String {
     match choice {
         OnboardingMenuChoice::Channel => format!(
             "{:<14} {}",
-            "Release",
-            if matches!(app.onboarding_channel, InstallSdkChannel::Release) {
-                "Stable (default)"
-            } else {
-                "Nightly (preview)"
-            }
+            "Channel:",
+            install_sdk_channel_summary(app.onboarding_channel)
         ),
         OnboardingMenuChoice::Folder => {
             let folder = display_runtime_folder_path(&setup_install_root(&app.paths, &app.config));
@@ -19095,21 +19092,12 @@ fn handle_onboarding_key(app: &mut App, key: KeyEvent) -> bool {
         (_, KeyCode::PageDown) => {
             app.scroll_onboarding_install_log(LogPageDirection::Next);
         }
-        (_, KeyCode::Left)
+        (_, KeyCode::Left | KeyCode::Right)
             if app.pending_approval.is_none()
                 && app.running_job.is_none()
                 && app.selected_onboarding_choice() == OnboardingMenuChoice::Channel =>
         {
-            app.onboarding_channel = app.onboarding_channel.toggle();
-            app.status = "ROCm channel changed. release is stable, nightly is preview.".to_owned();
-        }
-        (_, KeyCode::Right)
-            if app.pending_approval.is_none()
-                && app.running_job.is_none()
-                && app.selected_onboarding_choice() == OnboardingMenuChoice::Channel =>
-        {
-            app.onboarding_channel = app.onboarding_channel.toggle();
-            app.status = "ROCm channel changed. release is stable, nightly is preview.".to_owned();
+            app.toggle_onboarding_channel();
         }
         (_, KeyCode::Left)
             if app.pending_approval.is_none()
@@ -21667,12 +21655,8 @@ fn install_sdk_choice_label(
     match choice {
         InstallSdkChoice::Channel => format!(
             "{:<14} {}",
-            "Release",
-            if matches!(channel, InstallSdkChannel::Release) {
-                "Stable (default)"
-            } else {
-                "Nightly (preview)"
-            }
+            "Channel:",
+            install_sdk_channel_summary(channel)
         ),
         InstallSdkChoice::Folder => {
             if folder.trim().is_empty() {
@@ -21695,6 +21679,18 @@ const fn update_menu_choices() -> &'static [UpdateMenuChoice] {
         UpdateMenuChoice::ApplyAndUse,
         UpdateMenuChoice::Back,
     ]
+}
+
+fn install_sdk_channel_summary(channel: InstallSdkChannel) -> &'static str {
+    if matches!(channel, InstallSdkChannel::Release) {
+        "Stable (default)"
+    } else {
+        "Nightly (preview)"
+    }
+}
+
+fn channel_changed_status() -> &'static str {
+    "ROCm channel changed. Release is stable, Nightly is preview."
 }
 
 const fn update_menu_label(choice: UpdateMenuChoice) -> &'static str {
@@ -23655,9 +23651,9 @@ fn install_sdk_detail_text(app: &App) -> String {
         InstallSdkChoice::Channel => {
             let _ = writeln!(
                 output,
-                "  Left/Right or Enter switches release and nightly."
+                "  Left/Right or Enter switches Release and Nightly."
             );
-            let _ = writeln!(output, "  release is stable and selected by default.");
+            let _ = writeln!(output, "  Release is stable and selected by default.");
         }
         InstallSdkChoice::Folder => {
             if *editing_folder {
@@ -23683,7 +23679,7 @@ fn install_sdk_detail_text(app: &App) -> String {
     let _ = writeln!(output, "  Up/Down chooses a row.");
     let _ = writeln!(
         output,
-        "  On the Release row, Enter or Left/Right switches channel."
+        "  On the Channel row, Enter or Left/Right switches channel."
     );
     let _ = writeln!(
         output,
@@ -37343,7 +37339,7 @@ Full log
             super::OnboardingMenuChoice::Channel
         );
         let rendered = render_test_terminal(&app, 120, 24);
-        assert!(rendered.contains("> Release"));
+        assert!(rendered.contains("> Channel:"));
 
         super::handle_onboarding_key(&mut app, key_event(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(
@@ -37359,7 +37355,7 @@ Full log
             super::OnboardingMenuChoice::Channel
         );
         let rendered = render_test_terminal(&app, 120, 24);
-        assert!(rendered.contains("> Release"));
+        assert!(rendered.contains("> Channel:"));
 
         super::handle_onboarding_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(
@@ -37460,6 +37456,7 @@ Full log
         app.folder_browser = None;
         app.select_onboarding_choice(super::OnboardingMenuChoice::Primary);
 
+        // '2' jumps directly to the second actionable onboarding row, which toggles the channel.
         super::handle_onboarding_key(&mut app, key_event(KeyCode::Char('2'), KeyModifiers::NONE));
 
         assert!(app.pending_approval.is_none());
@@ -38094,7 +38091,7 @@ Full log
             .unwrap();
         app.poll_running_job();
 
-        let rendered = render_test_terminal(&app, 120, 36);
+        let rendered = render_test_terminal(&app, 120, 32);
         assert!(app.running_job.is_none());
         assert!(rendered.contains("Install failed"));
         assert!(rendered.contains("ROCm packages were not available"));
@@ -40302,7 +40299,7 @@ Full log
         assert!(rendered.contains("therock"), "{rendered}");
         assert!(rendered.contains("venvs"), "{rendered}");
         assert!(rendered.contains("pip-cache"), "{rendered}");
-        assert!(rendered.contains("Release"), "{rendered}");
+        assert!(rendered.contains("Channel:"), "{rendered}");
         assert!(rendered.contains("Stable (default)"), "{rendered}");
         assert!(!rendered.contains("Install folder: selected"), "{rendered}");
         assert!(
@@ -42133,7 +42130,7 @@ Full log
         let rendered = render_test_terminal(&app, 120, 24);
         assert!(rendered.contains("ROCm Install"));
         assert!(rendered.contains("Install ROCm"));
-        assert!(!rendered.contains("Channel"));
+        assert!(rendered.contains("Channel:"));
         assert!(!rendered.contains("Advanced archive install"));
         assert!(!rendered.contains("Review this change"));
 
@@ -42196,6 +42193,36 @@ Full log
             "{details}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn install_sdk_channel_row_uses_neutral_label_for_all_channels() {
+        assert_eq!(
+            super::install_sdk_choice_label(
+                super::InstallSdkChoice::Channel,
+                super::InstallSdkChannel::Release,
+                ""
+            ),
+            format!("{:<14} {}", "Channel:", "Stable (default)")
+        );
+        assert_eq!(
+            super::install_sdk_choice_label(
+                super::InstallSdkChoice::Channel,
+                super::InstallSdkChannel::Nightly,
+                ""
+            ),
+            format!("{:<14} {}", "Channel:", "Nightly (preview)")
+        );
+    }
+
+    #[test]
+    fn install_sdk_channel_toggle_does_not_report_success_outside_sdk_screen() {
+        let mut app = test_app();
+        app.status = "unchanged".to_owned();
+
+        app.toggle_install_sdk_channel();
+
+        assert_eq!(app.status, "unchanged");
     }
 
     #[test]

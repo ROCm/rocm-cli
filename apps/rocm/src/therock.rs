@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
-const THEROCK_PIP_INDEX_BASE: &str = "https://rocm.nightlies.amd.com/v2";
+const THEROCK_NIGHTLY_PIP_INDEX_BASE: &str = "https://rocm.nightlies.amd.com/v2";
+const THEROCK_RELEASE_PIP_INDEX_BASE: &str = "https://repo.amd.com/rocm/whl";
+const THEROCK_RELEASE_PIP_MULTI_ARCH_INDEX_BASE: &str = "https://repo.amd.com/rocm/whl-multi-arch";
 const THEROCK_RELEASE_TARBALL_BASE: &str = "https://repo.amd.com/rocm/tarball/";
 const THEROCK_NIGHTLY_TARBALL_BASE: &str = "https://rocm.nightlies.amd.com/tarball/";
 const DEFAULT_MANAGED_PYTHON_VERSION: &str = "3.12";
@@ -1109,26 +1111,67 @@ fn resolve_pip_runtime_with_timeout(
     download_timeout_secs: Option<u64>,
 ) -> Result<PipRuntimeResolution> {
     let family_resolution = resolve_family(paths, family_override)?;
-    let index_url = therock_index_url(&family_resolution.family);
+    let index_urls = therock_index_urls(channel, &family_resolution.family);
+    let mut errors = Vec::new();
+    for index_url in index_urls {
+        match resolve_pip_runtime_from_index(
+            paths,
+            channel,
+            &family_resolution,
+            &index_url,
+            wheel_compatibility,
+            version_selector,
+            download_timeout_secs,
+        ) {
+            Ok(resolution) => return Ok(resolution),
+            Err(error) => errors.push(format!("{index_url}: {error}")),
+        }
+    }
+    bail!(
+        "failed to resolve TheRock {} wheel runtime from candidate indexes:\n  - {}",
+        channel.as_str(),
+        errors.join("\n  - ")
+    )
+}
+
+fn resolve_pip_runtime_from_index(
+    paths: &AppPaths,
+    channel: TheRockChannel,
+    family_resolution: &FamilyResolution,
+    index_url: &str,
+    wheel_compatibility: &WheelCompatibility,
+    version_selector: Option<&RuntimeVersionSelector>,
+    download_timeout_secs: Option<u64>,
+) -> Result<PipRuntimeResolution> {
     let rocm_versions =
-        load_simple_index_versions(paths, &index_url, "rocm", None, download_timeout_secs)?;
+        load_simple_index_versions(paths, index_url, "rocm", None, download_timeout_secs)?;
+    if matches!(channel, TheRockChannel::Release)
+        && version_selector.is_none()
+        && !rocm_versions
+            .iter()
+            .any(|version| is_stable_runtime_version(version))
+    {
+        bail!(
+            "release channel only installs stable TheRock wheel versions, but no stable `rocm` package versions were found in {index_url}; try `rocm install sdk --channel release --format tarball` for stable release artifacts, or use `--channel nightly --format wheel` for preview builds"
+        );
+    }
     let torch_versions = load_simple_index_versions(
         paths,
-        &index_url,
+        index_url,
         "torch",
         Some(wheel_compatibility),
         download_timeout_secs,
     )?;
     let torchvision_versions = load_simple_index_versions(
         paths,
-        &index_url,
+        index_url,
         "torchvision",
         Some(wheel_compatibility),
         download_timeout_secs,
     )?;
     let torchaudio_versions = load_simple_index_versions(
         paths,
-        &index_url,
+        index_url,
         "torchaudio",
         Some(wheel_compatibility),
         download_timeout_secs,
@@ -1149,9 +1192,9 @@ fn resolve_pip_runtime_with_timeout(
     })?;
     let latest_version = package_versions.rocm.clone();
     Ok(PipRuntimeResolution {
-        family: family_resolution.family,
-        family_source: family_resolution.source,
-        index_url,
+        family: family_resolution.family.clone(),
+        family_source: family_resolution.source.clone(),
+        index_url: index_url.to_owned(),
         latest_version,
         package_versions,
     })
@@ -1312,18 +1355,19 @@ fn channel_rocm_candidates(versions: &[String], channel: TheRockChannel) -> Vec<
     let mut all = versions.to_vec();
     all.sort_by(|left, right| compare_version_strings(left, right));
     if matches!(channel, TheRockChannel::Release) {
-        let stable = all
+        return all
             .iter()
-            .filter(|version| {
-                parse_version(version).is_some_and(|parsed| parsed.stage == VersionStage::Stable)
-            })
+            .filter(|version| is_stable_runtime_version(version))
             .cloned()
             .collect::<Vec<_>>();
-        if !stable.is_empty() {
-            return stable;
-        }
     }
     all
+}
+
+fn is_stable_runtime_version(version: &str) -> bool {
+    parse_version(version)
+        .map(|parsed| parsed.stage == VersionStage::Stable)
+        .unwrap_or(false)
 }
 
 fn select_latest_stack_package(
@@ -1646,13 +1690,13 @@ fn select_latest_version(versions: &[String], channel: TheRockChannel) -> Option
     let mut all = versions.to_vec();
     all.sort_by(|left, right| compare_version_strings(left, right));
     for version in versions {
-        if parse_version(version).is_some_and(|parsed| parsed.stage == VersionStage::Stable) {
+        if is_stable_runtime_version(version) {
             stable.push(version.clone());
         }
     }
     stable.sort_by(|left, right| compare_version_strings(left, right));
     match channel {
-        TheRockChannel::Release => stable.pop().or_else(|| all.pop()),
+        TheRockChannel::Release => stable.pop(),
         TheRockChannel::Nightly => all.pop(),
     }
 }
@@ -3263,8 +3307,14 @@ fn parse_version(value: &str) -> Option<ParsedVersion> {
     })
 }
 
-fn therock_index_url(family: &str) -> String {
-    format!("{THEROCK_PIP_INDEX_BASE}/{family}")
+fn therock_index_urls(channel: TheRockChannel, family: &str) -> Vec<String> {
+    match channel {
+        TheRockChannel::Release => vec![
+            format!("{THEROCK_RELEASE_PIP_INDEX_BASE}/{family}"),
+            format!("{THEROCK_RELEASE_PIP_MULTI_ARCH_INDEX_BASE}/{family}"),
+        ],
+        TheRockChannel::Nightly => vec![format!("{THEROCK_NIGHTLY_PIP_INDEX_BASE}/{family}")],
+    }
 }
 
 const fn platform_tarball_token() -> &'static str {
@@ -3417,6 +3467,15 @@ mod tests {
         assert_eq!(
             select_latest_version(&versions, TheRockChannel::Release),
             Some("7.12.0".to_owned())
+        );
+    }
+
+    #[test]
+    fn release_channel_rejects_prerelease_only_versions() {
+        let versions = vec!["7.13.0a20260326".to_owned(), "7.14.0rc1".to_owned()];
+        assert_eq!(
+            select_latest_version(&versions, TheRockChannel::Release),
+            None
         );
     }
 
