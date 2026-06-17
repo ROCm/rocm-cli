@@ -39,21 +39,59 @@ jobs:
             echo "${COMMITS} new commit(s) since last nightly"
           fi
 
+      - name: Cache Cargo home and build artifacts
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/registry/src
+            ~/.cargo/rustup
+            target
+          key: Linux-manylinux-release-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            Linux-manylinux-release-
+
       - name: Build release binaries
         if: steps.check.outputs.skip != 'true'
         run: |
+          # The bind-mount source must exist and be owned by the runner user;
+          # Docker would otherwise create it as root, leaving the non-root
+          # container user unable to write into CARGO_HOME/RUSTUP_HOME.
+          mkdir -p "$HOME/.cargo"
+
+          # Install system build deps as root: yum needs to write to
+          # /var/cache/yum and the RPM db, which a non-root container user
+          # cannot do. These land in the container's ephemeral layer (not the
+          # bind mount), so this runs every time; only the Cargo/rustup state
+          # below is cached.
           docker run --rm \
-            -u "$(id -u):$(id -g)" \
-            -e HOME=/tmp/rocm-cli-home \
             -v "$PWD":/work \
             -w /work \
             quay.io/pypa/manylinux2014_x86_64 \
             /bin/bash -lc '
               set -euo pipefail
-              mkdir -p "$HOME"
               yum install -y pkgconfig libcap-devel
-              curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
-              export PATH="$HOME/.cargo/bin:$PATH"
+            '
+
+          # Build as the runner user so cached Cargo/rustup files are owned by
+          # the runner (the host-side cache save step must be able to read them).
+          docker run --rm \
+            -u "$(id -u):$(id -g)" \
+            -e CARGO_HOME=/host-cargo \
+            -e RUSTUP_HOME=/host-cargo/rustup \
+            -v "$HOME/.cargo":/host-cargo \
+            -v "$PWD":/work \
+            -w /work \
+            quay.io/pypa/manylinux2014_x86_64 \
+            /bin/bash -lc '
+              set -euo pipefail
+              if [ ! -f /host-cargo/bin/cargo ]; then
+                curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+              fi
+              export PATH="/host-cargo/bin:$PATH"
               cargo build --release --workspace
             '
 
