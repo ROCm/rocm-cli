@@ -19,7 +19,7 @@ use std::collections::{VecDeque, hash_map::DefaultHasher};
 use std::ffi::OsString;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, Read, Seek, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
@@ -37,6 +37,10 @@ const ROCM_BACKEND_NAME: &str = "rocm";
 /// we pick the highest-priority backend it considers supported on this host.
 const LLAMACPP_BACKEND_PRIORITY: [&str; 3] = ["rocm", "vulkan", "cpu"];
 const DEFAULT_LOG_TAIL_LINES: usize = 200;
+const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
+/// Maximum bytes to read from the end of a log file when extracting tail lines.
+/// Prevents reading entire gigabyte-sized logs on startup timeout.
+const MAX_TAIL_READ: u64 = 4 * 1024 * 1024; // 4MB
 
 const EMBEDDABLE_WINDOWS_ARCHIVE_NAME: &str = "lemonade-embeddable-10.6.0-windows-x64.zip";
 const EMBEDDABLE_LINUX_ARCHIVE_NAME: &str = "lemonade-embeddable-10.6.0-ubuntu-x64.tar.gz";
@@ -527,6 +531,7 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
         &request.host,
         request.port,
         Duration::from_secs(30),
+        log_path,
         &process_env,
     )
     .context("Lemonade server did not become ready")?;
@@ -648,6 +653,7 @@ fn ensure_direct_llama_model_available(
             DEFAULT_HOST,
             download_port,
             Duration::from_secs(30),
+            log_path,
             process_env,
         )?;
         let _ = run_lemonade_model_load(
@@ -825,15 +831,17 @@ fn prepare_embeddable(
 
 fn install_best_llamacpp_backend(manifest: &mut LemonadeInstallManifest) -> Result<()> {
     let port = free_local_port()?;
-    let log_path = manifest.runtime_dir.join("install-lemond.log");
+    let log_path_buf = manifest.runtime_dir.join("install-lemond.log");
+    let log_path = Some(log_path_buf.as_path());
     let process_env = lemonade_process_environment()?;
-    let mut child = spawn_lemond(manifest, DEFAULT_HOST, port, Some(&log_path), &process_env)?;
+    let mut child = spawn_lemond(manifest, DEFAULT_HOST, port, log_path, &process_env)?;
     let result = (|| -> Result<String> {
         wait_for_lemonade_cli_status(
             manifest,
             DEFAULT_HOST,
             port,
             Duration::from_secs(30),
+            log_path,
             &process_env,
         )?;
         ensure_best_llamacpp_backend(manifest, DEFAULT_HOST, port, &process_env)
@@ -1332,6 +1340,7 @@ fn wait_for_lemonade_cli_status(
     host: &str,
     port: u16,
     timeout: Duration,
+    log_path: Option<&Path>,
     process_env: &LemonadeProcessEnvironment,
 ) -> Result<()> {
     let start = std::time::Instant::now();
@@ -1356,10 +1365,35 @@ fn wait_for_lemonade_cli_status(
         }
         std::thread::sleep(Duration::from_millis(500));
     }
+    let startup_log_summary = summarize_startup_log_tail(log_path, STARTUP_FAILURE_LOG_TAIL_LINES);
     bail!(
-        "Lemonade server did not become ready: {}",
-        last_status.unwrap_or_else(|| "not checked".to_owned())
+        "Lemonade server did not become ready: {}; {}",
+        last_status.unwrap_or_else(|| "not checked".to_owned()),
+        startup_log_summary
     )
+}
+
+fn summarize_startup_log_tail(log_path: Option<&Path>, limit: usize) -> String {
+    let Some(log_path) = log_path else {
+        return "no Lemonade startup log path was configured".to_owned();
+    };
+    if !log_path.is_file() {
+        return format!("Lemonade startup log not found at {}", log_path.display());
+    }
+    match tail_lines(log_path, limit) {
+        Ok(lines) if lines.is_empty() => {
+            format!("Lemonade startup log {} is empty", log_path.display())
+        }
+        Ok(lines) => format!(
+            "Lemonade startup log tail ({}):\n{}",
+            log_path.display(),
+            lines.join("\n")
+        ),
+        Err(error) => format!(
+            "failed to read Lemonade startup log {}: {error}",
+            log_path.display()
+        ),
+    }
 }
 
 fn run_lemonade_backend_install(
@@ -1939,10 +1973,42 @@ fn tail_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
     }
     let file =
         fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to stat {}", path.display()))?;
+    let file_size = metadata.len();
+
+    // For small files, read normally to preserve exact line count.
+    if file_size <= MAX_TAIL_READ {
+        let reader = std::io::BufReader::new(file);
+        let mut lines = VecDeque::with_capacity(limit);
+        for line in reader.lines() {
+            let line = line.with_context(|| format!("failed to read {}", path.display()))?;
+            if lines.len() == limit {
+                lines.pop_front();
+            }
+            lines.push_back(line);
+        }
+        return Ok(lines.into_iter().collect());
+    }
+
+    // For large files, seek near the end and read only the final chunk.
+    // This prevents reading multi-gigabyte logs during timeout errors.
+    let mut file = file;
+    let seek_pos = file_size.saturating_sub(MAX_TAIL_READ);
+    file.seek(std::io::SeekFrom::Start(seek_pos))
+        .with_context(|| format!("failed to seek in {}", path.display()))?;
+
     let reader = std::io::BufReader::new(file);
     let mut lines = VecDeque::with_capacity(limit);
+    let mut skipped_first = seek_pos == 0;
     for line in reader.lines() {
         let line = line.with_context(|| format!("failed to read {}", path.display()))?;
+        // Skip the first line after seeking, as it may be partial.
+        if !skipped_first {
+            skipped_first = true;
+            continue;
+        }
         if lines.len() == limit {
             lines.pop_front();
         }
