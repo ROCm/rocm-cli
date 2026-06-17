@@ -31,7 +31,7 @@ No runtime behavior changes — this is tooling/quality-gate work, so no accepta
     `module_name_repetitions`, `doc_markdown`, `multiple_crate_versions`, `cargo_common_metadata`.
     (These are the dominant noise sources; `doc_markdown` may instead be fixed if cheap.)
 - Keep `[workspace.lints.rust]` `unsafe_code = "forbid"`; add `rust_2018_idioms = "warn"` and `unreachable_pub = "warn"` (skip `missing_debug_implementations` if it proves noisy).
-- Add `lints.workspace = true` to all 10 crate manifests: `apps/{rocm,rocmd}`, `crates/{rocm-core,rocm-engine-protocol}`, `engines/{llama-cpp,atom,pytorch,lemonade,sglang,vllm}`.
+- Add `lints.workspace = true` to all 14 crate manifests: `apps/{rocm,rocmd}`, `crates/{rocm-core,rocm-engine-protocol,rocm-dash-core,rocm-dash-collectors,rocm-dash-daemon,rocm-dash-tui}`, `engines/{llama-cpp,atom,pytorch,lemonade,sglang,vllm}`.
 
 ### 2. Burn down Rust findings
 - Run `cargo clippy --workspace --all-targets --fix --allow-dirty` iteratively (resolves the bulk: `uninlined_format_args`, `semicolon_if_nothing_returned`, `assigning_clones`, `redundant_closure_for_method_calls`, `use_self`, …).
