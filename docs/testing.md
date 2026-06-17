@@ -235,7 +235,7 @@ Focused TheRock metadata cache coverage:
 cargo test -p rocm --bin rocm metadata_cache
 cargo test -p rocm --bin rocm metadata_signature_verification_accepts_generated_key_and_rejects_tamper
 cargo test -p rocm --bin rocm http_header_value
-rocm install sdk --channel release --format pip --dry-run
+rocm install sdk --channel release --format wheel --dry-run
 ```
 
 ## TheRock SDK Install Test
@@ -243,7 +243,7 @@ rocm install sdk --channel release --format pip --dry-run
 The live SDK acceptance test creates an isolated test root under `target/`, creates a local bootstrap Python venv, runs:
 
 ```bash
-rocm install sdk --channel release --format pip
+rocm install sdk --channel release --format wheel
 ```
 
 Then it verifies:
@@ -329,7 +329,7 @@ runtime unambiguously.
 Developer direct path:
 
 ```bash
-rocm install sdk --channel release --format pip
+rocm install sdk --channel release --format wheel
 rocm runtimes activate <runtime_key from install output>
 rocm engines install pytorch
 python scripts/pytorch_therock_gpu_test.py

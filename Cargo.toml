@@ -4,6 +4,11 @@ members = [
   "apps/rocmd",
   "crates/rocm-core",
   "crates/rocm-engine-protocol",
+  # rocm-dash telemetry/dashboard libraries (rocm-dash merge).
+  "crates/rocm-dash-core",
+  "crates/rocm-dash-collectors",
+  "crates/rocm-dash-daemon",
+  "crates/rocm-dash-tui",
   "engines/llama-cpp",
   "engines/atom",
   "engines/pytorch",
