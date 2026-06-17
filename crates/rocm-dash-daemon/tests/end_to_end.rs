@@ -209,3 +209,47 @@ async fn bench_ring_accumulates_rows_for_replay() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+/// Verify the unix socket is created with mode 0o600 (not world-accessible).
+#[cfg(unix)]
+#[tokio::test]
+async fn socket_is_created_with_restricted_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sock_path = dir.path().join("test.sock");
+    let listen = format!("unix:{}", sock_path.display());
+
+    let handle = tokio::spawn({
+        let listen = listen.clone();
+        async move {
+            // Run until aborted; ignore the resulting error on abort.
+            let _ =
+                rocm_dash_daemon::run(&listen, rocm_dash_daemon::runner::RunnerOptions::default())
+                    .await;
+        }
+    });
+
+    // Poll until the socket exists *and* its mode is 0o600. Polling for
+    // existence alone is racy: set_permissions runs after UnixListener::bind,
+    // so the file can appear before the mode is restricted.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mode = loop {
+        if let Ok(meta) = std::fs::metadata(&sock_path) {
+            let m = meta.permissions().mode() & 0o777;
+            if m == 0o600 {
+                break m;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("daemon did not create socket with mode 0o600 within 5 s");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    handle.abort();
+    // Await the handle so the task is fully cancelled and has released the
+    // socket before the TempDir destructor removes the directory.
+    let _ = handle.await;
+    assert_eq!(mode, 0o600, "socket must not be group- or world-accessible");
+}

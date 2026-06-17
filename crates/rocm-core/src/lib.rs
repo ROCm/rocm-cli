@@ -3817,12 +3817,62 @@ pub struct RocmCliConfig {
 // Pure `with_*()` transforms are scoped to this sub-config only — rocm-cli's own
 // config keeps its in-place `&mut` mutation convention untouched.
 
+fn default_dashboard_socket() -> String {
+    // Choose a socket location whose *parent* directory is always user-owned so
+    // that run_unix can tighten it to 0o700 without EPERM. Precedence:
+    //
+    // 1. $XDG_RUNTIME_DIR  — already mode 0700 on systemd systems, ideal.
+    // 2. $HOME/.rocm/data/telemetry — standard per-user data dir.
+    // 3. temp_dir()/rocmdashd-<user> — user-named subdir so the parent is
+    //    something we create and own, not /tmp itself.
+    use std::path::PathBuf;
+    let path = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|v| !v.is_empty())
+        .map(|d| PathBuf::from(d).join("rocmdashd.sock"))
+        .or_else(|| {
+            std::env::var_os("HOME").filter(|v| !v.is_empty()).map(|h| {
+                PathBuf::from(h)
+                    .join(".rocm")
+                    .join("data")
+                    .join("telemetry")
+                    .join("rocmdashd.sock")
+            })
+        })
+        .unwrap_or_else(|| {
+            let raw = std::env::var("USER")
+                .or_else(|_| std::env::var("LOGNAME"))
+                .unwrap_or_else(|_| "user".to_owned());
+            // Sanitize: keep only alphanumeric, hyphen, and underscore so
+            // that path separators or '..' in a user-controlled env var
+            // cannot escape the intended subdirectory.
+            let user: String = raw
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            let user = if user.is_empty() {
+                "user".to_owned()
+            } else {
+                user
+            };
+            std::env::temp_dir()
+                .join(format!("rocmdashd-{user}"))
+                .join("rocmdashd.sock")
+        });
+    format!("unix:{}", path.display())
+}
+
 fn default_dashboard_listen() -> String {
-    "unix:/tmp/rocmdashd.sock".to_owned()
+    default_dashboard_socket()
 }
 
 fn default_dashboard_connect() -> String {
-    "unix:/tmp/rocmdashd.sock".to_owned()
+    default_dashboard_socket()
 }
 
 fn default_dashboard_theme() -> String {
@@ -3876,16 +3926,22 @@ impl Default for DashboardDaemonConfig {
 }
 
 impl DashboardDaemonConfig {
+    fn secs_to_duration(s: f64, fallback: Duration) -> Duration {
+        // try_from_secs_f64 rejects NaN, negative, inf, and values that
+        // overflow Duration (extremely large finite f64).
+        Duration::try_from_secs_f64(s).unwrap_or(fallback)
+    }
+
     pub fn gpu_tick(&self) -> Duration {
-        Duration::from_secs_f64(self.gpu_tick_secs)
+        Self::secs_to_duration(self.gpu_tick_secs, Duration::from_secs(1))
     }
 
     pub fn discovery_tick(&self) -> Duration {
-        Duration::from_secs_f64(self.discovery_tick_secs)
+        Self::secs_to_duration(self.discovery_tick_secs, Duration::from_secs(5))
     }
 
     pub fn instance_tick(&self) -> Duration {
-        Duration::from_secs_f64(self.instance_tick_secs)
+        Self::secs_to_duration(self.instance_tick_secs, Duration::from_secs(2))
     }
 }
 
@@ -7504,7 +7560,11 @@ Class Name:                Display
     #[allow(clippy::float_cmp)]
     fn dashboard_config_defaults_and_json_round_trip() {
         let cfg = DashboardConfig::default();
-        assert_eq!(cfg.daemon.listen, "unix:/tmp/rocmdashd.sock");
+        assert!(
+            cfg.daemon.listen.starts_with("unix:") && cfg.daemon.listen.ends_with("rocmdashd.sock"),
+            "default listen must be a unix socket path ending with rocmdashd.sock, got: {}",
+            cfg.daemon.listen
+        );
         assert_eq!(cfg.daemon.gpu_tick_secs, 1.0);
         assert_eq!(cfg.daemon.discovery_tick_secs, 5.0);
         assert_eq!(cfg.daemon.instance_tick_secs, 2.0);
@@ -7542,7 +7602,10 @@ Class Name:                Display
         assert_eq!(themed.tui.theme, "nord");
 
         let relisten = base.clone().with_daemon_listen("tcp:127.0.0.1:9000");
-        assert_eq!(base.daemon.listen, "unix:/tmp/rocmdashd.sock");
+        assert!(
+            base.daemon.listen.starts_with("unix:"),
+            "default listen must use unix scheme"
+        );
         assert_eq!(relisten.daemon.listen, "tcp:127.0.0.1:9000");
     }
 
