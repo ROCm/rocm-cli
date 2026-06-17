@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn second_enter_while_running_reattaches_to_console() {
         // Single stable id: a second view while the prior job still runs re-uses
-        // the same console (read-only re-attach, like doctor) — never an error.
+        // the same console (read-only re-attach, like examine) — never an error.
         let mut l = Some(LogsViewState::default());
         let mut jobs = State::default();
         on_key(&mut l, &mut jobs, key(KeyCode::Enter));

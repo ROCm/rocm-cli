@@ -12,7 +12,7 @@ use rocm_core::engine_plugin_dirs;
 use rocm_core::{
     AppPaths, AuditEventRecord, AutomationEventRecord, AutomationProposalRecord,
     AutomationRuntimeState, AutomationTriggerEvent, CodexBridgeEngine, CodexBridgeGpuSnapshot,
-    CodexBridgeSnapshot, DEFAULT_LOCAL_HOST, DoctorSummary, ManagedServiceRecord,
+    CodexBridgeSnapshot, DEFAULT_LOCAL_HOST, ExamineSummary, ManagedServiceRecord,
     ModelRecipeArtifactRecord, RocmCliConfig, WatcherMode, WatcherRuntimeSnapshot,
     append_audit_event, append_automation_event, append_automation_proposal, builtin_watcher,
     builtin_watchers, daemon_binary_path, default_engine_for_platform, format_host_port,
@@ -168,7 +168,7 @@ enum Command {
 enum SandboxToolArg {
     CheckUpdates,
     DriverPlan,
-    DoctorSnapshot,
+    ExamineSnapshot,
     ListServers,
     RestartServer,
     StopServer,
@@ -181,7 +181,7 @@ impl SandboxToolArg {
         match self {
             Self::CheckUpdates => "check_updates",
             Self::DriverPlan => "driver_plan",
-            Self::DoctorSnapshot => "doctor_snapshot",
+            Self::ExamineSnapshot => "examine_snapshot",
             Self::ListServers => "list_servers",
             Self::RestartServer => "restart_server",
             Self::StopServer => "stop_server",
@@ -396,7 +396,7 @@ fn build_bridge_snapshot(paths: &AppPaths) -> Result<CodexBridgeSnapshot> {
     Ok(CodexBridgeSnapshot {
         protocol: "rocmd-codex-bridge-v0".to_owned(),
         generated_at_unix_ms: unix_time_millis(),
-        doctor: DoctorSummary::gather()?,
+        examine: ExamineSummary::gather()?,
         gpu: gather_gpu_snapshot_for_config(&config),
         config,
         automation_runtime: AutomationRuntimeState::load(paths)?,
@@ -563,13 +563,13 @@ fn run_sandbox_tool(
             )?;
             Ok(sandbox_driver_plan_value(output))
         }
-        SandboxToolArg::DoctorSnapshot => {
-            let doctor = DoctorSummary::gather()?;
+        SandboxToolArg::ExamineSnapshot => {
+            let examine = ExamineSummary::gather()?;
             Ok(json!({
                 "tool": tool.as_cli_value(),
                 "status": "captured",
                 "mutating": false,
-                "doctor": doctor,
+                "examine": examine,
             }))
         }
         SandboxToolArg::ListServers => {
@@ -1583,7 +1583,7 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 fn rocm_mcp_tools() -> Vec<Value> {
     vec![
         rocm_mcp_tool(
-            "doctor",
+            "examine",
             "Read the current ROCm AI Command Center host summary.",
             json!({
                 "type": "object",
@@ -1595,7 +1595,7 @@ fn rocm_mcp_tools() -> Vec<Value> {
         ),
         rocm_mcp_tool(
             "bridge_snapshot",
-            "Read the full ROCm bridge snapshot including doctor data, engines, services, automations, and gpu telemetry.",
+            "Read the full ROCm bridge snapshot including examine data, engines, services, automations, and gpu telemetry.",
             json!({
                 "type": "object",
                 "properties": {},
@@ -1959,17 +1959,17 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
         .unwrap_or_default();
 
     match name {
-        "doctor" => {
-            let doctor = DoctorSummary::gather()?;
-            let output = run_rocm_capture(&["doctor"])?;
+        "examine" => {
+            let examine = ExamineSummary::gather()?;
+            let output = run_rocm_capture(&["examine"])?;
             let text = command_capture_text(&output);
             if output.exit_status == 0 {
-                Ok(tool_success(text, json!(doctor)))
+                Ok(tool_success(text, json!(examine)))
             } else {
                 Ok(tool_error(
                     text,
                     json!({
-                        "doctor": doctor,
+                        "examine": examine,
                         "argv": output.argv,
                         "exit_status": output.exit_status,
                         "stderr": output.stderr,
@@ -1982,7 +1982,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
             Ok(tool_success(
                 format!(
                     "Captured bridge snapshot for {} / {} with default engine `{}`.",
-                    snapshot.doctor.os, snapshot.doctor.arch, snapshot.doctor.default_engine
+                    snapshot.examine.os, snapshot.examine.arch, snapshot.examine.default_engine
                 ),
                 json!(snapshot),
             ))
@@ -2372,7 +2372,7 @@ fn ensure_rocm_command_is_read_only(args: &[String]) -> Result<()> {
     let first = args.first().map(|value| value.to_ascii_lowercase());
     let second = args.get(1).map(|value| value.to_ascii_lowercase());
     let read_only = match first.as_deref() {
-        Some("doctor" | "version" | "model" | "models" | "daemon" | "logs") => true,
+        Some("examine" | "version" | "model" | "models" | "daemon" | "logs") => true,
         Some("update") => !args.iter().any(|arg| arg == "--apply"),
         Some("runtimes") => second.as_deref().is_none_or(|value| value == "list"),
         Some("engines") => second.as_deref().is_some_and(|value| value == "list"),
@@ -5104,7 +5104,7 @@ mod tests {
 
     #[test]
     fn direct_mcp_call_guard_blocks_mutation_without_explicit_ack() {
-        ensure_direct_mcp_call_allowed("doctor", false)
+        ensure_direct_mcp_call_allowed("examine", false)
             .expect("read-only direct MCP helper calls should not need mutation approval");
 
         let error = ensure_direct_mcp_call_allowed("install_sdk", false)
@@ -7201,7 +7201,7 @@ mod tests {
             &event,
             |_paths| {
                 Ok(json!({
-                    "tool": "doctor_snapshot",
+                    "tool": "examine_snapshot",
                     "status": "captured",
                     "mutating": false,
                 }))
@@ -7372,7 +7372,7 @@ mod tests {
     fn sandbox_tool_cli_values_cover_restricted_plan_api() {
         let names = [
             SandboxToolArg::CheckUpdates,
-            SandboxToolArg::DoctorSnapshot,
+            SandboxToolArg::ExamineSnapshot,
             SandboxToolArg::ListServers,
             SandboxToolArg::RestartServer,
             SandboxToolArg::StopServer,
@@ -7386,7 +7386,7 @@ mod tests {
 
         for expected in [
             "check_updates",
-            "doctor_snapshot",
+            "examine_snapshot",
             "list_servers",
             "restart_server",
             "stop_server",
@@ -7399,11 +7399,11 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_tool_doctor_snapshot_is_read_only() -> Result<()> {
-        let (root, paths) = temp_app_paths("sandbox-doctor-snapshot");
+    fn sandbox_tool_examine_snapshot_is_read_only() -> Result<()> {
+        let (root, paths) = temp_app_paths("sandbox-examine-snapshot");
         let value = run_sandbox_tool(
             &paths,
-            SandboxToolArg::DoctorSnapshot,
+            SandboxToolArg::ExamineSnapshot,
             None,
             None,
             None,
@@ -7413,14 +7413,14 @@ mod tests {
 
         assert_eq!(
             value.get("tool").and_then(Value::as_str),
-            Some("doctor_snapshot")
+            Some("examine_snapshot")
         );
         assert_eq!(
             value.get("status").and_then(Value::as_str),
             Some("captured")
         );
         assert_eq!(value.get("mutating").and_then(Value::as_bool), Some(false));
-        assert!(value.get("doctor").is_some());
+        assert!(value.get("examine").is_some());
         Ok(())
     }
 

@@ -26,7 +26,7 @@ $MissingSignatureLog = Join-Path $AcceptanceRoot "missing-signature-failure.log"
 $NoPublicKeyLog = Join-Path $AcceptanceRoot "no-public-key-failure.log"
 $PemInstallLog = Join-Path $AcceptanceRoot "pem-install.log"
 $PathUpdateInstallLog = Join-Path $AcceptanceRoot "path-update-install.log"
-$DoctorLog = Join-Path $AcceptanceRoot "doctor.log"
+$ExamineLog = Join-Path $AcceptanceRoot "examine.log"
 $UninstallLog = Join-Path $AcceptanceRoot "uninstall.log"
 
 function Fail {
@@ -446,18 +446,18 @@ try {
     $env:LOCALAPPDATA = $LocalAppDataDir
 
     Invoke-Checked "acceptance: installed rocm version" $rocmExe @("version")
-    Invoke-Checked "acceptance: installed rocm doctor" $rocmExe @("doctor") $DoctorLog
-    if (-not (Select-String -LiteralPath $DoctorLog -SimpleMatch -Pattern $ConfigDir -Quiet)) {
-        Fail "installed rocm doctor did not use the isolated config dir"
+    Invoke-Checked "acceptance: installed rocm examine" $rocmExe @("examine") $ExamineLog
+    if (-not (Select-String -LiteralPath $ExamineLog -SimpleMatch -Pattern $ConfigDir -Quiet)) {
+        Fail "installed rocm examine did not use the isolated config dir"
     }
-    if (-not (Select-String -LiteralPath $DoctorLog -SimpleMatch -Pattern $DataDir -Quiet)) {
-        Fail "installed rocm doctor did not use the isolated data dir"
+    if (-not (Select-String -LiteralPath $ExamineLog -SimpleMatch -Pattern $DataDir -Quiet)) {
+        Fail "installed rocm examine did not use the isolated data dir"
     }
-    if (-not (Select-String -LiteralPath $DoctorLog -SimpleMatch -Pattern $CacheDir -Quiet)) {
-        Fail "installed rocm doctor did not use the isolated cache dir"
+    if (-not (Select-String -LiteralPath $ExamineLog -SimpleMatch -Pattern $CacheDir -Quiet)) {
+        Fail "installed rocm examine did not use the isolated cache dir"
     }
-    if (Select-String -LiteralPath $DoctorLog -SimpleMatch -Pattern $RealUserRocmDir -Quiet) {
-        Fail "installed rocm doctor read the real user rocm state"
+    if (Select-String -LiteralPath $ExamineLog -SimpleMatch -Pattern $RealUserRocmDir -Quiet) {
+        Fail "installed rocm examine read the real user rocm state"
     }
     Invoke-Checked "acceptance: installed rocm engines list" $rocmExe @("engines", "list")
     Invoke-Checked "acceptance: installed rocmd status" $rocmdExe @("status")

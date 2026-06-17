@@ -115,11 +115,11 @@ These guidelines are project constraints for user-facing ROCm CLI flows.
   as install, update, engine setup, service lifecycle, or automation approval.
   Keep live progress visible until the command finishes, then let the user
   leave.
-- Passive background checks, such as Doctor refresh, may be closed while they
+- Passive background checks, such as Examine refresh, may be closed while they
   finish as long as they do not block later setup actions or dump output into
   the transcript.
-- Doctor must not interrupt an active install, update, service action, chat,
-  plan, or approval. Keep the current screen visible and explain that Doctor
+- Examine must not interrupt an active install, update, service action, chat,
+  plan, or approval. Keep the current screen visible and explain that Examine
   can run after the active work finishes.
 - Usage/error text in the TUI should be a plain fix in the relevant screen.
   Reserve raw command syntax for explicit help or non-TUI command output.
@@ -137,7 +137,7 @@ not append raw command reports to the transcript as the primary experience.
 Hidden compatibility aliases should follow the same navigability rules when
 typed, even when they are intentionally left out of completions and help.
 
-Current navigable surfaces include `/home`, `/doctor`, `/setup`, `/permissions`,
+Current navigable surfaces include `/home`, `/examine`, `/setup`, `/permissions`,
 `/runtimes`, `/engine`, `/model`, `/plan`, `/config`, `/automations`,
 `/reviews`, `/approve`, `/reject`, `/edit`, `/install`, `/services`, `/logs`,
 `/gpu`, `/update`, `/daemon`, `/chat`, `/provider`, `/uninstall`, `/comfyui`,
@@ -156,7 +156,7 @@ Command navigability follow-up notes:
   provider-key, Logs/service detail, all-command navigability, model-picker,
   install-completion, Shift+Tab reverse-navigation, completion simplification,
   default-runtime validation, progress-label, engine-detail, setup-cancel,
-  body-visible error, and async Doctor background-blocking follow-ups.
+  body-visible error, and async Examine background-blocking follow-ups.
 - Keep primary panes free of raw backend labels after new command surfaces are
   added; raw command output belongs in Logs or explicit help/debug views.
 - Hide advanced file locations in TUI first views by default and expose them

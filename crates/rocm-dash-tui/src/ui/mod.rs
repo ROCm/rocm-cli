@@ -4,8 +4,8 @@ pub mod bench;
 pub mod command_screen;
 pub mod config_manager;
 pub mod core_bars;
-pub mod doctor_manager;
 pub mod engine_manager;
+pub mod examine_manager;
 pub mod exec;
 pub mod folder_browser;
 pub mod format;
@@ -96,8 +96,8 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         serve_wizard::draw_serve_wizard(f, outer[2], w, &state.jobs, &state.model_recipes, &theme);
     } else if let Some(em) = &state.engine_manager {
         engine_manager::draw_engine_manager(f, outer[2], em, &state.jobs, &theme);
-    } else if let Some(d) = &state.doctor_manager {
-        doctor_manager::draw_doctor_manager(f, outer[2], d, &state.jobs, &theme);
+    } else if let Some(d) = &state.examine_manager {
+        examine_manager::draw_examine_manager(f, outer[2], d, &state.jobs, &theme);
     } else if let Some(u) = &state.update_manager {
         update_manager::draw_update_manager(f, outer[2], u, &state.jobs, &theme);
     } else if let Some(im) = &state.install_manager {
@@ -236,7 +236,7 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         spans.push(chip("e"));
         spans.push(Span::raw(" engines  "));
         spans.push(chip("d"));
-        spans.push(Span::raw(" doctor  "));
+        spans.push(Span::raw(" examine  "));
         spans.push(chip("u"));
         spans.push(Span::raw(" update  "));
         spans.push(chip("i"));

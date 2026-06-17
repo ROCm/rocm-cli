@@ -968,7 +968,7 @@ fn openai_chat_request_body_with_stream(
 fn rocm_openai_tool_definitions() -> Vec<serde_json::Value> {
     vec![
         rocm_openai_tool(
-            "doctor",
+            "examine",
             "Read the current ROCm host, GPU, runtime, driver, and engine status.",
             serde_json::json!({
                 "type": "object",
@@ -978,7 +978,7 @@ fn rocm_openai_tool_definitions() -> Vec<serde_json::Value> {
         ),
         rocm_openai_tool(
             "bridge_snapshot",
-            "Read a full ROCm snapshot including doctor data, engines, services, automations, and GPU telemetry.",
+            "Read a full ROCm snapshot including examine data, engines, services, automations, and GPU telemetry.",
             serde_json::json!({
                 "type": "object",
                 "properties": {},
@@ -2241,7 +2241,7 @@ mod tests {
             listener,
             "tiny.gguf",
             move |stream, _request| {
-                let body = r#"{"choices":[{"message":{"content":"I will check first.","tool_calls":[{"id":"call-1","type":"function","function":{"name":"doctor","arguments":"{}"}}]}}]}"#;
+                let body = r#"{"choices":[{"message":{"content":"I will check first.","tool_calls":[{"id":"call-1","type":"function","function":{"name":"examine","arguments":"{}"}}]}}]}"#;
                 write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -2287,10 +2287,10 @@ mod tests {
 
         assert!(request.contains("\"tools\""));
         assert!(request.contains("\"tool_choice\":\"auto\""));
-        assert!(request.contains("\"name\":\"doctor\""));
+        assert!(request.contains("\"name\":\"examine\""));
         assert_eq!(response.content, "I will check first.");
         assert_eq!(response.tool_calls.len(), 1);
-        assert_eq!(response.tool_calls[0].name, "doctor");
+        assert_eq!(response.tool_calls[0].name, "examine");
         Ok(())
     }
 

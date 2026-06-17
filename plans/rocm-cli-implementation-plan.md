@@ -18,7 +18,7 @@ live tracker.
 
 - Implemented locally: the Rust CLI/TUI, first-time setup, TheRock managed
   `pip` venv installs, runtime activation/import/adopt/uninstall, bounded
-  Doctor reports, service records/logs/actions, the model registry CLI/TUI,
+  Examine reports, service records/logs/actions, the model registry CLI/TUI,
   provider adapters, PyTorch/llama.cpp/Lemonade/vLLM engine adapters,
   automation proposals/sandbox runner, packaging scripts, installer
   verification, release-readiness self-tests, and native per-OS release builds.
@@ -53,13 +53,13 @@ live tracker.
 Done locally:
 
 - TUI, first-time setup, setup reset, navigable command screens, overlapping
-  approval/progress/detail cards, logs, Doctor, services, runtimes, update, and
+  approval/progress/detail cards, logs, Examine, services, runtimes, update, and
   provider/local-chat surfaces.
 - Managed TheRock wheel runtime installs with rocm-cli-owned venvs, local pip
   cache, exact TheRock torch/runtime selection, runtime activation, import,
   adopt, uninstall, and list-based install selection.
-- Fast setup/Doctor host detection: setup shows detected GPU name/target/package
-  without running full Doctor; Windows Doctor uses native registry/system probes
+- Fast setup/Examine host detection: setup shows detected GPU name/target/package
+  without running full Examine; Windows Examine uses native registry/system probes
   instead of PowerShell/CIM on the common path; native Linux uses KFD/sysfs/IP
   discovery before any ROCm userland tool; WSL avoids duplicate host display
   probes.
@@ -151,7 +151,7 @@ Left or externally gated:
 - Interactive TTY:
   - `rocm` launches the full-screen TUI.
 - Non-interactive shell or explicit subcommand:
-  - `rocm doctor`
+  - `rocm examine`
   - `rocm install sdk --channel release`
   - `rocm serve qwen3.5 --engine vllm`
 - On startup, `rocm` should:
@@ -180,7 +180,7 @@ use these surfaces instead:
 - First-time setup: a dedicated setup screen before Home, with arrow-key folder
   choices, plain approval cards, live progress, and visible install output.
 - Home and slash-command screens: stable left-side choices plus a plain-English
-  detail pane. Commands such as `/doctor`, `/runtimes`, `/engine`, `/services`,
+  detail pane. Commands such as `/examine`, `/runtimes`, `/engine`, `/services`,
   `/logs`, `/comfyui`, and `/serve` should open navigable screens, not append
   command dumps to a transcript.
 - Focused work: approvals, install/update progress, log details, connection
@@ -220,7 +220,7 @@ use these surfaces instead:
 
 ### TUI Commands and Shortcuts
 - Slash commands:
-  - `/doctor`
+  - `/examine`
   - `/install sdk`
   - `/install driver`
   - `/update`
@@ -257,7 +257,7 @@ use these surfaces instead:
 
 ### Primary Commands
 - `rocm`
-- `rocm doctor`
+- `rocm examine`
 - `rocm install sdk --channel release|nightly [--format wheel|tarball] [--prefix PATH]`
 - `rocm install driver --dkms`
 - `rocm update`
@@ -376,7 +376,7 @@ use these surfaces instead:
 - The bootstrap should not install drivers or large runtimes by default.
 
 ### Host Detection
-- `rocm doctor` should detect:
+- `rocm examine` should detect:
   - OS, kernel, distro, architecture
   - CPU features
   - AMD GPU presence and GPU family
@@ -422,7 +422,7 @@ use these surfaces instead:
   - silent kernel changes
 - Windows:
   - assume an AMD driver is already installed
-  - detect and report driver presence and compatibility in `doctor`
+  - detect and report driver presence and compatibility in `examine`
   - defer any Windows driver installation or upgrade flow to a later phase
 
 ### Existing Installations
@@ -431,7 +431,7 @@ use these surfaces instead:
   - import into managed state
   - leave unmanaged and use read-only
 - If only a legacy ROCm runtime is found, `rocm-cli` should:
-  - report it in `doctor`
+  - report it in `examine`
   - warn that management and upgrades are out of scope
   - still allow CPU-only or provider-backed chat flows
 
@@ -590,7 +590,7 @@ use these surfaces instead:
 - Sandboxed jobs should not receive raw shell access.
 - They should invoke a restricted internal tool API such as:
   - `check_updates`
-  - `doctor_snapshot`
+  - `examine_snapshot`
   - `list_servers`
   - `restart_server`
   - `stop_server`
@@ -662,7 +662,7 @@ mode = "propose"
 | Capability | Windows V1 status | Notes |
 |------------|-------------------|-------|
 | `rocm` CLI and TUI | Supported | Native Windows terminal experience is in scope |
-| `rocm doctor` | Supported | Detect host, GPU family, driver presence, and TheRock runtime state |
+| `rocm examine` | Supported | Detect host, GPU family, driver presence, and TheRock runtime state |
 | TheRock runtime install | Supported | `pip` venv only |
 | TheRock tarball install | Deferred | Do not target `Program Files`-style system installs in V1 |
 | Windows driver install/upgrade | Deferred | Assume driver already installed; report compatibility only |
@@ -690,9 +690,9 @@ mode = "propose"
 ### Phase 0: Product Skeleton
 - Create the repo layout and Rust workspace.
 - Implement config loading, state directories, logging, and signed manifest fetch.
-- Implement `rocm doctor` with host detection and a plain CLI output path.
+- Implement `rocm examine` with host detection and a plain CLI output path.
 - Exit criteria:
-  - `rocm doctor` works on supported Linux and Windows hosts
+  - `rocm examine` works on supported Linux and Windows hosts
   - bootstrap install downloads and runs the launcher
 
 ### Phase 1: Runtime Management
@@ -775,7 +775,7 @@ mode = "propose"
 
 ## MVP Definition
 - `rocm` launches a TUI on Linux and Windows.
-- `rocm doctor` detects host and runtime state.
+- `rocm examine` detects host and runtime state.
 - `rocm install sdk --channel release|nightly` installs a managed TheRock runtime.
 - `rocm update` prompts for newer CLI/runtime versions.
 - `rocm serve` can launch:

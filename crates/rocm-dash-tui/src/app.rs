@@ -337,8 +337,8 @@ pub struct AppState {
     pub serve_wizard: Option<crate::ui::serve_wizard::ServeWizardState>,
     /// Engine manager overlay (Phase 3 Wave 1). `None` = closed.
     pub engine_manager: Option<crate::ui::engine_manager::EngineManagerState>,
-    /// Doctor overlay (Phase 3 Wave 2). `None` = closed.
-    pub doctor_manager: Option<crate::ui::doctor_manager::DoctorManagerState>,
+    /// Examine overlay (Phase 3 Wave 2). `None` = closed.
+    pub examine_manager: Option<crate::ui::examine_manager::ExamineManagerState>,
     /// Update overlay (Phase 3 Wave 2). `None` = closed.
     pub update_manager: Option<crate::ui::update_manager::UpdateManagerState>,
     /// Install overlay (Phase 3 Wave 2). `None` = closed.
@@ -408,7 +408,7 @@ impl AppState {
             services: None,
             serve_wizard: None,
             engine_manager: None,
-            doctor_manager: None,
+            examine_manager: None,
             update_manager: None,
             install_manager: None,
             logs_view: None,
@@ -430,7 +430,7 @@ impl AppState {
         self.services = None;
         self.serve_wizard = None;
         self.engine_manager = None;
-        self.doctor_manager = None;
+        self.examine_manager = None;
         self.update_manager = None;
         self.install_manager = None;
         self.logs_view = None;
@@ -974,11 +974,11 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         );
                         crate::jobs::run_effects(fx, &job_tx);
                     }
-                    // The doctor overlay, when open, owns all keys (read-only
-                    // `rocm doctor` job through the job-bridge).
-                    Some(Ok(CtEvent::Key(k))) if state.doctor_manager.is_some() => {
-                        let fx = crate::ui::doctor_manager::on_key(
-                            &mut state.doctor_manager,
+                    // The examine overlay, when open, owns all keys (read-only
+                    // `rocm examine` job through the job-bridge).
+                    Some(Ok(CtEvent::Key(k))) if state.examine_manager.is_some() => {
+                        let fx = crate::ui::examine_manager::on_key(
+                            &mut state.examine_manager,
                             &mut state.jobs,
                             k,
                         );
@@ -1271,9 +1271,10 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
             state.close_overlays();
             state.engine_manager = Some(crate::ui::engine_manager::EngineManagerState::default());
         }
-        KeyAction::OpenDoctor => {
+        KeyAction::OpenExamine => {
             state.close_overlays();
-            state.doctor_manager = Some(crate::ui::doctor_manager::DoctorManagerState::default());
+            state.examine_manager =
+                Some(crate::ui::examine_manager::ExamineManagerState::default());
         }
         KeyAction::OpenUpdate => {
             state.close_overlays();
@@ -1452,8 +1453,8 @@ pub enum KeyAction {
     OpenServeWizard,
     /// Open the engine-manager overlay (Phase 3 Wave 1).
     OpenEngineManager,
-    /// Open the doctor overlay (Phase 3 Wave 2).
-    OpenDoctor,
+    /// Open the examine overlay (Phase 3 Wave 2).
+    OpenExamine,
     /// Open the update overlay (Phase 3 Wave 2).
     OpenUpdate,
     /// Open the install overlay (Phase 3 Wave 2).
@@ -1620,9 +1621,9 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         KeyCode::Char('e') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
             KeyAction::OpenEngineManager
         }
-        // Doctor: read-only environment check.
+        // Examine: read-only environment check.
         KeyCode::Char('d') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
-            KeyAction::OpenDoctor
+            KeyAction::OpenExamine
         }
         // Update: check/preview/apply ROCm package updates.
         KeyCode::Char('u') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
@@ -1857,10 +1858,10 @@ mod tests {
             KeyAction::Nothing
         );
         assert_eq!(hk(KeyCode::Char('e'), ActiveTab::Bench), KeyAction::Nothing);
-        // Doctor / update open from Overview + Instances.
+        // Examine / update open from Overview + Instances.
         assert_eq!(
             hk(KeyCode::Char('d'), ActiveTab::Overview),
-            KeyAction::OpenDoctor
+            KeyAction::OpenExamine
         );
         assert_eq!(
             hk(KeyCode::Char('u'), ActiveTab::Instances),
@@ -1904,10 +1905,10 @@ mod tests {
         apply_action(&mut s, KeyAction::OpenEngineManager);
         assert!(s.engine_manager.is_some() && s.services.is_none() && s.serve_wizard.is_none());
         // Wave 2/3 overlays join the mutual-exclusion set.
-        apply_action(&mut s, KeyAction::OpenDoctor);
-        assert!(s.doctor_manager.is_some() && s.engine_manager.is_none());
+        apply_action(&mut s, KeyAction::OpenExamine);
+        assert!(s.examine_manager.is_some() && s.engine_manager.is_none());
         apply_action(&mut s, KeyAction::OpenUpdate);
-        assert!(s.update_manager.is_some() && s.doctor_manager.is_none());
+        assert!(s.update_manager.is_some() && s.examine_manager.is_none());
         apply_action(&mut s, KeyAction::OpenInstall);
         assert!(s.install_manager.is_some() && s.update_manager.is_none());
         apply_action(&mut s, KeyAction::OpenLogs);

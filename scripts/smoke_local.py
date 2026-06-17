@@ -258,11 +258,11 @@ def main() -> int:
     version = run("rocm version", [rocm, "version"], env=env)
     assert_contains(version, "rocm ", "rocm version")
 
-    doctor = run("rocm doctor", [rocm, "doctor"], env=env)
-    assert_contains(doctor, "rocm doctor", "rocm doctor")
-    assert_contains(doctor, "default_engine:", "rocm doctor")
-    assert_contains(doctor, "managed_runtimes: 0", "rocm doctor first-run state")
-    assert_contains(doctor, "managed_services: 0", "rocm doctor first-run state")
+    examine = run("rocm examine", [rocm, "examine"], env=env)
+    assert_contains(examine, "rocm examine", "rocm examine")
+    assert_contains(examine, "default_engine:", "rocm examine")
+    assert_contains(examine, "managed_runtimes: 0", "rocm examine first-run state")
+    assert_contains(examine, "managed_services: 0", "rocm examine first-run state")
 
     engines = run("rocm engines list", [rocm, "engines", "list"], env=env)
     assert_contains(engines, "llama.cpp", "rocm engines list")
@@ -419,20 +419,20 @@ def main() -> int:
     ):
         fail(f"unexpected bridge snapshot protocol: {bridge}")
 
-    sandbox_doctor = parse_json(
+    sandbox_examine = parse_json(
         run(
-            "rocmd sandbox doctor snapshot",
-            [rocmd, "sandbox-run", "doctor_snapshot", "--allow-native-fallback"],
+            "rocmd sandbox examine snapshot",
+            [rocmd, "sandbox-run", "examine_snapshot", "--allow-native-fallback"],
             env=env,
         ),
-        "sandbox doctor snapshot",
+        "sandbox examine snapshot",
     )
     if (
-        not isinstance(sandbox_doctor, dict)
-        or sandbox_doctor.get("tool") != "doctor_snapshot"
-        or not sandbox_doctor.get("ok")
+        not isinstance(sandbox_examine, dict)
+        or sandbox_examine.get("tool") != "examine_snapshot"
+        or not sandbox_examine.get("ok")
     ):
-        fail(f"unexpected sandbox doctor result: {sandbox_doctor}")
+        fail(f"unexpected sandbox examine result: {sandbox_examine}")
 
     sandbox_servers = parse_json(
         run(

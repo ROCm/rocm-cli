@@ -834,7 +834,7 @@ fn env_flag(name: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DoctorSummary {
+pub struct ExamineSummary {
     pub os: String,
     pub arch: String,
     pub kernel: Option<String>,
@@ -895,7 +895,7 @@ pub struct HostGpuSummary {
 }
 
 #[derive(Debug, Clone, Default)]
-struct WindowsDoctorInventory {
+struct WindowsExamineInventory {
     cpu_model: Option<String>,
     system_ram_gib: Option<f64>,
     displays: Vec<WindowsDisplayAdapter>,
@@ -908,14 +908,14 @@ struct WindowsDisplayAdapter {
     pnp_device_id: Option<String>,
 }
 
-impl WindowsDoctorInventory {
+impl WindowsExamineInventory {
     #[cfg(windows)]
     fn is_empty(&self) -> bool {
         self.cpu_model.is_none() && self.system_ram_gib.is_none() && self.displays.is_empty()
     }
 
     #[cfg(windows)]
-    fn merge_missing_from(&mut self, mut other: WindowsDoctorInventory) {
+    fn merge_missing_from(&mut self, mut other: WindowsExamineInventory) {
         if self.cpu_model.is_none() {
             self.cpu_model = other.cpu_model.take();
         }
@@ -1014,12 +1014,12 @@ impl WindowsDoctorInventory {
     }
 }
 
-impl DoctorSummary {
+impl ExamineSummary {
     pub fn gather() -> Result<Self> {
         let paths = AppPaths::discover()?;
-        let windows_inventory = detect_windows_doctor_inventory();
+        let windows_inventory = detect_windows_examine_inventory();
         let wsl = detect_wsl_summary();
-        let detected_gfx_target = detect_doctor_gfx_target_fast(windows_inventory.as_ref());
+        let detected_gfx_target = detect_examine_gfx_target_fast(windows_inventory.as_ref());
         let compatible_therock_family = detected_gfx_target
             .as_deref()
             .and_then(normalize_therock_family);
@@ -1068,7 +1068,7 @@ impl DoctorSummary {
         };
         let wsl = self.wsl.as_ref();
         format!(
-            "rocm doctor\n  os: {}\n  arch: {}\n  kernel: {}\n  distro: {}\n  cpu: {}\n  system_ram: {}\n  interactive_terminal: {}\n  default_engine: {}\n  detected_gfx_target: {}\n  compatible_therock_family: {}\n  detected_therock_family: {}\n  driver_policy: {}\n  driver_status: {}\n  driver_detail: {}\n  legacy_rocm_status: {}\n  legacy_rocm_paths: {}\n  legacy_rocm_detail: {}\n  legacy_rocm_guidance: {}\n  wsl: {}\n  wsl_dxg_device: {}\n  wsl_dxcore: {}\n  wsl_librocdxg: {}\n  wsl_rocdxg_dids: {}\n  wsl_ldconfig_librocdxg: {}\n  wsl_global_rocminfo: {}\n  wsl_cargo: {}\n  wsl_detail: {}\n  managed_runtimes: {}\n  managed_services: {}\n  model_cache_entries: {}\n  config_dir: {}\n  data_dir: {}\n  cache_dir: {}\n",
+            "rocm examine\n  os: {}\n  arch: {}\n  kernel: {}\n  distro: {}\n  cpu: {}\n  system_ram: {}\n  interactive_terminal: {}\n  default_engine: {}\n  detected_gfx_target: {}\n  compatible_therock_family: {}\n  detected_therock_family: {}\n  driver_policy: {}\n  driver_status: {}\n  driver_detail: {}\n  legacy_rocm_status: {}\n  legacy_rocm_paths: {}\n  legacy_rocm_detail: {}\n  legacy_rocm_guidance: {}\n  wsl: {}\n  wsl_dxg_device: {}\n  wsl_dxcore: {}\n  wsl_librocdxg: {}\n  wsl_rocdxg_dids: {}\n  wsl_ldconfig_librocdxg: {}\n  wsl_global_rocminfo: {}\n  wsl_cargo: {}\n  wsl_detail: {}\n  managed_runtimes: {}\n  managed_services: {}\n  model_cache_entries: {}\n  config_dir: {}\n  data_dir: {}\n  cache_dir: {}\n",
             self.os,
             self.arch,
             self.kernel.as_deref().unwrap_or("<unknown>"),
@@ -1164,7 +1164,7 @@ fn parse_os_release_pretty_name(text: &str) -> Option<String> {
 }
 
 fn detect_cpu_model_with_windows_inventory(
-    windows_inventory: Option<&WindowsDoctorInventory>,
+    windows_inventory: Option<&WindowsExamineInventory>,
 ) -> Option<String> {
     if runtime_is_windows()
         && let Some(inventory) = windows_inventory
@@ -1210,7 +1210,7 @@ fn detect_cpu_model() -> Option<String> {
 }
 
 fn detect_system_ram_gib_with_windows_inventory(
-    windows_inventory: Option<&WindowsDoctorInventory>,
+    windows_inventory: Option<&WindowsExamineInventory>,
 ) -> Option<f64> {
     if runtime_is_windows()
         && let Some(inventory) = windows_inventory
@@ -1321,12 +1321,12 @@ fn detect_wsl_summary() -> Option<WslSummary> {
 }
 
 fn detect_driver_summary_with_windows_inventory(
-    windows_inventory: Option<&WindowsDoctorInventory>,
+    windows_inventory: Option<&WindowsExamineInventory>,
     wsl: Option<&WslSummary>,
 ) -> DriverSummary {
     if runtime_is_windows() {
         let detail = windows_inventory
-            .and_then(WindowsDoctorInventory::amd_display_driver_detail)
+            .and_then(WindowsExamineInventory::amd_display_driver_detail)
             .or_else(|| {
                 if windows_inventory.is_none() {
                     detect_windows_amd_display_driver()
@@ -1495,21 +1495,21 @@ const fn detect_windows_amd_display_driver() -> Option<String> {
 }
 
 #[cfg(windows)]
-fn detect_windows_doctor_inventory() -> Option<WindowsDoctorInventory> {
+fn detect_windows_examine_inventory() -> Option<WindowsExamineInventory> {
     if !runtime_is_windows() {
         return None;
     }
-    let mut inventory = WindowsDoctorInventory::default();
-    if let Some(pnp_util) = detect_windows_doctor_inventory_from_pnputil() {
+    let mut inventory = WindowsExamineInventory::default();
+    if let Some(pnp_util) = detect_windows_examine_inventory_from_pnputil() {
         inventory.merge_missing_from(pnp_util);
     }
     if inventory.displays.is_empty()
-        && let Some(video) = detect_windows_doctor_inventory_from_video_controller()
+        && let Some(video) = detect_windows_examine_inventory_from_video_controller()
     {
         inventory.merge_missing_from(video);
     }
     if inventory.displays.is_empty()
-        && let Some(pnp) = detect_windows_doctor_inventory_from_pnp_entity()
+        && let Some(pnp) = detect_windows_examine_inventory_from_pnp_entity()
     {
         inventory.merge_missing_from(pnp);
     }
@@ -1523,7 +1523,7 @@ fn detect_windows_doctor_inventory() -> Option<WindowsDoctorInventory> {
 }
 
 #[cfg(windows)]
-fn detect_windows_doctor_inventory_from_pnputil() -> Option<WindowsDoctorInventory> {
+fn detect_windows_examine_inventory_from_pnputil() -> Option<WindowsExamineInventory> {
     if !runtime_is_windows() {
         return None;
     }
@@ -1536,7 +1536,7 @@ fn detect_windows_doctor_inventory_from_pnputil() -> Option<WindowsDoctorInvento
 }
 
 #[cfg(windows)]
-fn detect_windows_doctor_inventory_from_video_controller() -> Option<WindowsDoctorInventory> {
+fn detect_windows_examine_inventory_from_video_controller() -> Option<WindowsExamineInventory> {
     if !runtime_is_windows() {
         return None;
     }
@@ -1551,11 +1551,11 @@ fn detect_windows_doctor_inventory_from_video_controller() -> Option<WindowsDoct
         ],
         WINDOWS_INVENTORY_QUERY_TIMEOUT,
     )
-    .map(|output| parse_windows_doctor_inventory(&output))
+    .map(|output| parse_windows_examine_inventory(&output))
 }
 
 #[cfg(windows)]
-fn detect_windows_system_inventory_from_cim() -> Option<WindowsDoctorInventory> {
+fn detect_windows_system_inventory_from_cim() -> Option<WindowsExamineInventory> {
     if !runtime_is_windows() {
         return None;
     }
@@ -1570,11 +1570,11 @@ fn detect_windows_system_inventory_from_cim() -> Option<WindowsDoctorInventory> 
         ],
         OPTIONAL_COMMAND_TIMEOUT,
     )
-    .map(|output| parse_windows_doctor_inventory(&output))
+    .map(|output| parse_windows_examine_inventory(&output))
 }
 
 #[cfg(windows)]
-fn detect_windows_doctor_inventory_from_pnp_entity() -> Option<WindowsDoctorInventory> {
+fn detect_windows_examine_inventory_from_pnp_entity() -> Option<WindowsExamineInventory> {
     if !runtime_is_windows() {
         return None;
     }
@@ -1589,11 +1589,11 @@ fn detect_windows_doctor_inventory_from_pnp_entity() -> Option<WindowsDoctorInve
         ],
         WINDOWS_INVENTORY_QUERY_TIMEOUT,
     )
-    .map(|output| parse_windows_doctor_inventory(&output))
+    .map(|output| parse_windows_examine_inventory(&output))
 }
 
 #[cfg(not(windows))]
-const fn detect_windows_doctor_inventory() -> Option<WindowsDoctorInventory> {
+const fn detect_windows_examine_inventory() -> Option<WindowsExamineInventory> {
     None
 }
 
@@ -1605,8 +1605,8 @@ fn clean_windows_display_name(value: &str) -> String {
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
-fn parse_windows_doctor_inventory(text: &str) -> WindowsDoctorInventory {
-    let mut inventory = WindowsDoctorInventory::default();
+fn parse_windows_examine_inventory(text: &str) -> WindowsExamineInventory {
+    let mut inventory = WindowsExamineInventory::default();
 
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
         let mut fields = line.split('\t');
@@ -1650,8 +1650,8 @@ fn parse_windows_doctor_inventory(text: &str) -> WindowsDoctorInventory {
 }
 
 #[cfg(any(windows, test))]
-fn parse_windows_pnputil_display_inventory(text: &str) -> WindowsDoctorInventory {
-    let mut inventory = WindowsDoctorInventory::default();
+fn parse_windows_pnputil_display_inventory(text: &str) -> WindowsExamineInventory {
+    let mut inventory = WindowsExamineInventory::default();
     let mut name: Option<String> = None;
     let mut instance_id: Option<String> = None;
     let mut driver_version: Option<String> = None;
@@ -1700,7 +1700,7 @@ fn parse_windows_pnputil_display_inventory(text: &str) -> WindowsDoctorInventory
 
 #[cfg(any(windows, test))]
 fn push_windows_pnputil_display(
-    inventory: &mut WindowsDoctorInventory,
+    inventory: &mut WindowsExamineInventory,
     name: &mut Option<String>,
     instance_id: &mut Option<String>,
     driver_version: &mut Option<String>,
@@ -1802,7 +1802,7 @@ fn append_windows_gpu_probe_diagnostics(output: &mut String) {
             WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT,
         ],
         WINDOWS_INVENTORY_QUERY_TIMEOUT,
-        parse_windows_doctor_inventory,
+        parse_windows_examine_inventory,
     );
     append_windows_probe_diagnostics(
         output,
@@ -1816,7 +1816,7 @@ fn append_windows_gpu_probe_diagnostics(output: &mut String) {
             WINDOWS_PNP_ENTITY_INVENTORY_SCRIPT,
         ],
         WINDOWS_INVENTORY_QUERY_TIMEOUT,
-        parse_windows_doctor_inventory,
+        parse_windows_examine_inventory,
     );
 }
 
@@ -1830,7 +1830,7 @@ fn append_windows_probe_diagnostics(
     program: &str,
     args: &[&str],
     timeout: Duration,
-    parse: fn(&str) -> WindowsDoctorInventory,
+    parse: fn(&str) -> WindowsExamineInventory,
 ) {
     use std::fmt::Write as _;
     let result = capture_diagnostic_command(program, args, timeout);
@@ -2061,12 +2061,12 @@ pub fn detect_host_gpu_summary(paths: Option<&AppPaths>) -> HostGpuSummary {
 
 #[cfg(windows)]
 fn detect_host_gpu_summary_fast(_paths: Option<&AppPaths>) -> HostGpuSummary {
-    let windows_inventory = detect_windows_doctor_inventory();
+    let windows_inventory = detect_windows_examine_inventory();
     let gfx_target = detect_windows_display_gfx_target_with_inventory(windows_inventory.as_ref());
     let therock_family = gfx_target.as_deref().and_then(normalize_therock_family);
     let name = windows_inventory
         .as_ref()
-        .and_then(WindowsDoctorInventory::amd_display_name);
+        .and_then(WindowsExamineInventory::amd_display_name);
     HostGpuSummary {
         name,
         gfx_target,
@@ -2077,13 +2077,13 @@ fn detect_host_gpu_summary_fast(_paths: Option<&AppPaths>) -> HostGpuSummary {
 #[cfg(target_os = "linux")]
 fn detect_host_gpu_summary_fast(_paths: Option<&AppPaths>) -> HostGpuSummary {
     if runtime_is_windows() {
-        let windows_inventory = detect_windows_doctor_inventory();
+        let windows_inventory = detect_windows_examine_inventory();
         let gfx_target =
             detect_windows_display_gfx_target_with_inventory(windows_inventory.as_ref());
         let therock_family = gfx_target.as_deref().and_then(normalize_therock_family);
         let name = windows_inventory
             .as_ref()
-            .and_then(WindowsDoctorInventory::amd_display_name);
+            .and_then(WindowsExamineInventory::amd_display_name);
         return HostGpuSummary {
             name,
             gfx_target,
@@ -2123,7 +2123,7 @@ fn detect_host_gpu_summary_fast(_paths: Option<&AppPaths>) -> HostGpuSummary {
 
 #[allow(dead_code)]
 fn detect_host_gpu_summary_full(paths: Option<&AppPaths>) -> HostGpuSummary {
-    let windows_inventory = detect_windows_doctor_inventory();
+    let windows_inventory = detect_windows_examine_inventory();
     let wsl = detect_wsl_summary();
     let gfx_target =
         detect_host_gfx_target_with_context(windows_inventory.as_ref(), wsl.as_ref(), paths);
@@ -2137,11 +2137,11 @@ fn detect_host_gpu_summary_full(paths: Option<&AppPaths>) -> HostGpuSummary {
 }
 
 fn detect_host_gpu_name_with_context(
-    windows_inventory: Option<&WindowsDoctorInventory>,
+    windows_inventory: Option<&WindowsExamineInventory>,
     wsl: Option<&WslSummary>,
 ) -> Option<String> {
     windows_inventory
-        .and_then(WindowsDoctorInventory::amd_display_name)
+        .and_then(WindowsExamineInventory::amd_display_name)
         .or_else(detect_linux_primary_gpu_name)
         .or_else(|| detect_wsl_windows_display_name(wsl))
 }
@@ -2535,8 +2535,8 @@ pub fn detect_host_gfx_target() -> Option<String> {
     detect_host_gpu_summary_fast(paths.as_ref()).gfx_target
 }
 
-fn detect_doctor_gfx_target_fast(
-    windows_inventory: Option<&WindowsDoctorInventory>,
+fn detect_examine_gfx_target_fast(
+    windows_inventory: Option<&WindowsExamineInventory>,
 ) -> Option<String> {
     if runtime_is_windows() {
         return detect_windows_display_gfx_target_with_inventory(windows_inventory);
@@ -2551,7 +2551,7 @@ fn detect_doctor_gfx_target_fast(
 
 #[allow(dead_code)]
 fn detect_host_gfx_target_with_context(
-    windows_inventory: Option<&WindowsDoctorInventory>,
+    windows_inventory: Option<&WindowsExamineInventory>,
     wsl: Option<&WslSummary>,
     paths: Option<&AppPaths>,
 ) -> Option<String> {
@@ -2848,7 +2848,7 @@ fn detect_windows_display_gfx_target() -> Option<String> {
         ],
         WINDOWS_INVENTORY_QUERY_TIMEOUT,
     )
-    .map(|output| parse_windows_doctor_inventory(&output).display_gfx_probe_text())
+    .map(|output| parse_windows_examine_inventory(&output).display_gfx_probe_text())
     .and_then(|output| parse_windows_display_gfx_target(&output))
 }
 
@@ -2858,11 +2858,11 @@ const fn detect_windows_display_gfx_target() -> Option<String> {
 }
 
 fn detect_windows_display_gfx_target_with_inventory(
-    windows_inventory: Option<&WindowsDoctorInventory>,
+    windows_inventory: Option<&WindowsExamineInventory>,
 ) -> Option<String> {
     if runtime_is_windows() {
         return windows_inventory
-            .and_then(WindowsDoctorInventory::display_gfx_target)
+            .and_then(WindowsExamineInventory::display_gfx_target)
             .or_else(|| {
                 if windows_inventory.is_none() {
                     detect_windows_display_gfx_target()
@@ -2920,7 +2920,7 @@ fn detect_wsl_windows_display_probe_text() -> Option<String> {
         WINDOWS_INVENTORY_QUERY_TIMEOUT,
     )
     .map(|output| {
-        parse_windows_doctor_inventory(&output)
+        parse_windows_examine_inventory(&output)
             .display_gfx_probe_text()
             .trim()
             .to_owned()
@@ -5614,7 +5614,7 @@ impl ManagedServiceRecord {
 pub struct CodexBridgeSnapshot {
     pub protocol: String,
     pub generated_at_unix_ms: u128,
-    pub doctor: DoctorSummary,
+    pub examine: ExamineSummary,
     pub gpu: CodexBridgeGpuSnapshot,
     pub config: RocmCliConfig,
     #[serde(default)]
@@ -6086,8 +6086,8 @@ mod tests {
     }
 
     #[test]
-    fn windows_doctor_inventory_parser_feeds_cpu_driver_and_gfx_detection() {
-        let inventory = parse_windows_doctor_inventory(
+    fn windows_examine_inventory_parser_feeds_cpu_driver_and_gfx_detection() {
+        let inventory = parse_windows_examine_inventory(
             "CPU\t  AMD Ryzen 9 9950X  16-Core Processor  \nRAM\t68719476736\nGPU\tAMD Radeon RX 9070 XT\t32.0.13031.9001\tPCI\\VEN_1002&DEV_7550&SUBSYS_2435148C&REV_C0\n",
         );
 
@@ -6138,8 +6138,8 @@ Class Name:                Display
     }
 
     #[test]
-    fn windows_doctor_inventory_prefers_real_gpu_over_noisy_amd_pnp_entries() {
-        let inventory = parse_windows_doctor_inventory(
+    fn windows_examine_inventory_prefers_real_gpu_over_noisy_amd_pnp_entries() {
+        let inventory = parse_windows_examine_inventory(
             "GPU\tAMD Bluetooth Capture Audio Device\t\t{2101C4C0-2C15-4035-A0D0-EEC3C2277B11}\\CAPTURE&CP_111215637\nGPU\tAMD-OpenGL User Mode Driver\t\tSWD\\DRIVERENUM\\AMDOGL&5&BAA66E4&0\nGPU\tAMD Radeon 780M Graphics\t\tPCI\\VEN_1002&DEV_1900&SUBSYS_50EE17AA&REV_D0\\4&EB5E2B6&0&0041\n",
         );
 
@@ -6151,11 +6151,11 @@ Class Name:                Display
     }
 
     #[test]
-    fn windows_doctor_gfx_detection_uses_inventory_without_rocm_tools() {
+    fn windows_examine_gfx_detection_uses_inventory_without_rocm_tools() {
         if !cfg!(windows) {
             return;
         }
-        let inventory = parse_windows_doctor_inventory(
+        let inventory = parse_windows_examine_inventory(
             "GPU\tAMD Radeon RX 9070 XT\t32.0.23033.1002\tPCI\\VEN_1002&DEV_7550",
         );
 
@@ -6246,8 +6246,8 @@ Class Name:                Display
     }
 
     #[test]
-    fn counts_json_files_and_model_cache_entries_for_doctor() -> Result<()> {
-        let (root, paths) = temp_app_paths("doctor-counts");
+    fn counts_json_files_and_model_cache_entries_for_examine() -> Result<()> {
+        let (root, paths) = temp_app_paths("examine-counts");
         let registry = paths.data_dir.join("runtimes").join("registry");
         let models = paths.data_dir.join("models");
         fs::create_dir_all(&registry)?;
@@ -6407,8 +6407,8 @@ Class Name:                Display
     }
 
     #[test]
-    fn doctor_render_includes_driver_and_state_counts() {
-        let summary = DoctorSummary {
+    fn examine_render_includes_driver_and_state_counts() {
+        let summary = ExamineSummary {
             os: "windows".to_owned(),
             arch: "x86_64".to_owned(),
             kernel: Some("10.0.26100".to_owned()),
@@ -6459,8 +6459,8 @@ Class Name:                Display
     }
 
     #[test]
-    fn doctor_render_guides_managed_runtime_install_when_only_legacy_rocm_exists() {
-        let summary = DoctorSummary {
+    fn examine_render_guides_managed_runtime_install_when_only_legacy_rocm_exists() {
+        let summary = ExamineSummary {
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
             kernel: None,

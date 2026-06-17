@@ -4,7 +4,7 @@ use crate::{
     format_structured_tool_call, freeform_plan_next_action_with_context,
     freeform_plan_uses_provider, load_managed_services, logs_browser_page_count,
     managed_service_is_live, managed_service_sidebar_counts, provider_keys,
-    render_automations_text, render_chat_text, render_daemon_text, render_doctor_text,
+    render_automations_text, render_chat_text, render_daemon_text, render_examine_text,
     render_freeform_plan, render_logs_browser_page_text_for_tui, render_service_logs_text_for_tui,
     render_sidebar_text, render_uninstall_dry_run, render_update_text, runtime_usability_status,
     therock,
@@ -131,8 +131,8 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         usage: "/?",
     },
     SlashCommandSpec {
-        name: "doctor",
-        usage: "/doctor",
+        name: "examine",
+        usage: "/examine",
     },
     SlashCommandSpec {
         name: "setup",
@@ -371,7 +371,7 @@ struct App {
     running_job_log_scroll: usize,
     running_job_output: VecDeque<String>,
     running_job_cancel_requested: Option<Arc<AtomicBool>>,
-    doctor_manager: Option<DoctorManagerState>,
+    examine_manager: Option<ExamineManagerState>,
     logs_view: Option<LogsViewState>,
     runtime_manager: Option<RuntimeManagerState>,
     install_manager: Option<InstallManagerState>,
@@ -418,7 +418,7 @@ enum TuiMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HomeDashboardAction {
     Setup,
-    Doctor,
+    Examine,
     Serve,
     Chat,
     ComfyUi,
@@ -443,8 +443,8 @@ fn tui_mode_for_command(head: &str, has_args: bool) -> TuiMode {
     }
 }
 
-fn is_doctor_command_input(command: &str) -> bool {
-    let Some(rest) = command.strip_prefix("doctor") else {
+fn is_examine_command_input(command: &str) -> bool {
+    let Some(rest) = command.strip_prefix("examine") else {
         return false;
     };
     rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace)
@@ -619,7 +619,7 @@ struct LogsViewState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DoctorManagerState {
+struct ExamineManagerState {
     selected: usize,
     detail_scroll: u16,
     report: String,
@@ -627,7 +627,7 @@ struct DoctorManagerState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DoctorManagerChoice {
+enum ExamineManagerChoice {
     Overview,
     Gpu,
     Runtimes,
@@ -1268,7 +1268,7 @@ struct RunningJob {
 #[derive(Debug, Clone)]
 enum RunningJobKind {
     Cli,
-    DoctorRefresh,
+    ExamineRefresh,
     Chat {
         provider: String,
         rocm_tools: bool,
@@ -2126,7 +2126,7 @@ impl App {
             running_job_log_scroll: 0,
             running_job_output: VecDeque::new(),
             running_job_cancel_requested: None,
-            doctor_manager: None,
+            examine_manager: None,
             logs_view: None,
             runtime_manager: None,
             install_manager: None,
@@ -2210,7 +2210,7 @@ impl App {
     }
 
     fn running_job_blocks_screen_close(&mut self) -> bool {
-        self.discard_background_doctor_refresh();
+        self.discard_background_examine_refresh();
         let Some(job) = self.running_job.as_ref() else {
             return false;
         };
@@ -2222,7 +2222,7 @@ impl App {
     }
 
     fn running_job_blocks_screen_switch(&mut self) -> bool {
-        self.discard_background_doctor_refresh();
+        self.discard_background_examine_refresh();
         let Some(job) = self.running_job.as_ref() else {
             return false;
         };
@@ -2234,7 +2234,7 @@ impl App {
     }
 
     fn running_job_blocks_action(&mut self) -> bool {
-        self.discard_background_doctor_refresh();
+        self.discard_background_examine_refresh();
         if self.running_job.is_some() {
             self.status = "A command is already running; wait for it to finish.".to_owned();
             true
@@ -2243,28 +2243,28 @@ impl App {
         }
     }
 
-    fn doctor_blocked_by_current_workflow(&mut self) -> bool {
+    fn examine_blocked_by_current_workflow(&mut self) -> bool {
         if let Some(title) = self
             .pending_approval
             .as_ref()
             .map(|pending| pending.title.clone())
         {
             self.set_active_screen_message(format!(
-                "{title} is waiting for your review.\n\nApprove it, cancel it, or go Back before opening Doctor."
+                "{title} is waiting for your review.\n\nApprove it, cancel it, or go Back before opening Examine."
             ));
-            self.status = "Finish the current approval before opening Doctor.".to_owned();
+            self.status = "Finish the current approval before opening Examine.".to_owned();
             return true;
         }
 
-        let Some((title, is_doctor_refresh)) = self.running_job.as_ref().map(|job| {
+        let Some((title, is_examine_refresh)) = self.running_job.as_ref().map(|job| {
             (
                 job.title.clone(),
-                matches!(job.kind, RunningJobKind::DoctorRefresh),
+                matches!(job.kind, RunningJobKind::ExamineRefresh),
             )
         }) else {
             return false;
         };
-        if is_doctor_refresh {
+        if is_examine_refresh {
             return false;
         }
 
@@ -2274,14 +2274,14 @@ impl App {
             title.as_str()
         };
         self.set_active_screen_message(format!(
-            "{running_label} is still running.\n\nDoctor can check this computer after it finishes. Keep this screen open so progress and results stay visible."
+            "{running_label} is still running.\n\nExamine can check this computer after it finishes. Keep this screen open so progress and results stay visible."
         ));
         self.status =
-            format!("{running_label} is still running. Doctor can run after it finishes.");
+            format!("{running_label} is still running. Examine can run after it finishes.");
         true
     }
 
-    fn open_doctor_manager(&mut self) {
+    fn open_examine_manager(&mut self) {
         self.refresh_config();
         self.logs_view = None;
         self.runtime_manager = None;
@@ -2295,85 +2295,85 @@ impl App {
         self.config_manager = None;
         self.services_manager = None;
         self.command_screen = None;
-        self.doctor_manager = Some(DoctorManagerState {
+        self.examine_manager = Some(ExamineManagerState {
             selected: 0,
             detail_scroll: 0,
             report: String::new(),
             message: Some("Checking this computer...\n\nYou can keep using the arrow keys while ROCm CLI checks the GPU, ROCm installs, engines, driver, WSL, and folders.".to_owned()),
         });
-        self.status = "Doctor opened. Checking this computer...".to_owned();
-        self.start_doctor_refresh_job();
+        self.status = "Examine opened. Checking this computer...".to_owned();
+        self.start_examine_refresh_job();
     }
 
-    fn close_doctor_manager(&mut self) {
+    fn close_examine_manager(&mut self) {
         if self
             .running_job
             .as_ref()
-            .is_some_and(|job| matches!(job.kind, RunningJobKind::DoctorRefresh))
+            .is_some_and(|job| matches!(job.kind, RunningJobKind::ExamineRefresh))
         {
-            self.doctor_manager = None;
+            self.examine_manager = None;
             self.return_to_home_after_surface_close(
-                "Doctor closed. The check will finish in the background.",
+                "Examine closed. The check will finish in the background.",
             );
             return;
         }
         if self.running_job_blocks_screen_close() {
             return;
         }
-        self.doctor_manager = None;
-        self.return_to_home_after_surface_close("Doctor closed.");
+        self.examine_manager = None;
+        self.return_to_home_after_surface_close("Examine closed.");
     }
 
-    fn refresh_doctor_manager(&mut self) {
+    fn refresh_examine_manager(&mut self) {
         let selected = self
-            .doctor_manager
+            .examine_manager
             .as_ref()
             .map_or(0, |state| state.selected);
-        if let Some(state) = self.doctor_manager.as_mut() {
-            state.selected = selected.min(doctor_manager_choices().len().saturating_sub(1));
+        if let Some(state) = self.examine_manager.as_mut() {
+            state.selected = selected.min(examine_manager_choices().len().saturating_sub(1));
             state.detail_scroll = 0;
             state.message = Some(
                 "Checking this computer again...\n\nYou can keep using the arrow keys while ROCm CLI refreshes the checks."
                     .to_owned(),
             );
         } else {
-            self.doctor_manager = Some(DoctorManagerState {
-                selected: selected.min(doctor_manager_choices().len().saturating_sub(1)),
+            self.examine_manager = Some(ExamineManagerState {
+                selected: selected.min(examine_manager_choices().len().saturating_sub(1)),
                 detail_scroll: 0,
                 report: String::new(),
                 message: Some("Checking this computer...".to_owned()),
             });
         }
-        self.status = "Doctor refresh started.".to_owned();
-        self.start_doctor_refresh_job();
+        self.status = "Examine refresh started.".to_owned();
+        self.start_examine_refresh_job();
     }
 
-    fn move_doctor_manager_selection(&mut self, direction: CompletionDirection) {
-        let Some(state) = self.doctor_manager.as_mut() else {
+    fn move_examine_manager_selection(&mut self, direction: CompletionDirection) {
+        let Some(state) = self.examine_manager.as_mut() else {
             return;
         };
         state.message = None;
-        state.selected = cycle_index(state.selected, doctor_manager_choices().len(), direction);
+        state.selected = cycle_index(state.selected, examine_manager_choices().len(), direction);
         state.detail_scroll = 0;
-        self.status = match self.selected_doctor_manager_choice() {
-            DoctorManagerChoice::Back => "Press Enter to go back.".to_owned(),
-            _ => "Doctor check selected.".to_owned(),
+        self.status = match self.selected_examine_manager_choice() {
+            ExamineManagerChoice::Back => "Press Enter to go back.".to_owned(),
+            _ => "Examine check selected.".to_owned(),
         };
     }
 
-    fn selected_doctor_manager_choice(&self) -> DoctorManagerChoice {
+    fn selected_examine_manager_choice(&self) -> ExamineManagerChoice {
         let selected = self
-            .doctor_manager
+            .examine_manager
             .as_ref()
             .map_or(0, |state| state.selected);
-        doctor_manager_choices()
+        examine_manager_choices()
             .get(selected)
             .copied()
-            .unwrap_or(DoctorManagerChoice::Overview)
+            .unwrap_or(ExamineManagerChoice::Overview)
     }
 
-    const fn scroll_doctor_manager_detail(&mut self, lines: i16) {
-        let Some(state) = self.doctor_manager.as_mut() else {
+    const fn scroll_examine_manager_detail(&mut self, lines: i16) {
+        let Some(state) = self.examine_manager.as_mut() else {
             return;
         };
         if lines < 0 {
@@ -2383,9 +2383,9 @@ impl App {
         }
     }
 
-    fn perform_doctor_manager_selected_action(&mut self) {
-        match self.selected_doctor_manager_choice() {
-            DoctorManagerChoice::Back => self.close_doctor_manager(),
+    fn perform_examine_manager_selected_action(&mut self) {
+        match self.selected_examine_manager_choice() {
+            ExamineManagerChoice::Back => self.close_examine_manager(),
             _ => {
                 self.status = "Use Up/Down to choose another check, F5 to refresh, Esc to go back."
                     .to_owned();
@@ -2395,7 +2395,7 @@ impl App {
 
     fn open_runtime_manager(&mut self) {
         self.refresh_config();
-        self.doctor_manager = None;
+        self.examine_manager = None;
         self.install_manager = None;
         self.engine_manager = None;
         self.model_picker = None;
@@ -3026,7 +3026,7 @@ impl App {
     }
 
     fn open_install_manager(&mut self) {
-        self.doctor_manager = None;
+        self.examine_manager = None;
         self.runtime_manager = None;
         self.engine_manager = None;
         self.model_picker = None;
@@ -3396,7 +3396,7 @@ impl App {
 
     fn open_engine_manager(&mut self) {
         self.refresh_config();
-        self.doctor_manager = None;
+        self.examine_manager = None;
         self.runtime_manager = None;
         self.install_manager = None;
         self.model_picker = None;
@@ -3622,7 +3622,7 @@ impl App {
 
     fn open_model_picker(&mut self) {
         self.refresh_config();
-        self.doctor_manager = None;
+        self.examine_manager = None;
         self.runtime_manager = None;
         self.install_manager = None;
         self.engine_manager = None;
@@ -3746,7 +3746,7 @@ impl App {
 
     fn open_serve_wizard(&mut self) {
         self.refresh_config();
-        self.doctor_manager = None;
+        self.examine_manager = None;
         self.runtime_manager = None;
         self.install_manager = None;
         self.engine_manager = None;
@@ -4346,7 +4346,7 @@ impl App {
     }
 
     fn open_update_manager(&mut self) {
-        self.doctor_manager = None;
+        self.examine_manager = None;
         self.runtime_manager = None;
         self.install_manager = None;
         self.engine_manager = None;
@@ -4508,7 +4508,7 @@ impl App {
 
     fn open_automations_manager(&mut self) {
         self.refresh_config();
-        self.doctor_manager = None;
+        self.examine_manager = None;
         self.logs_view = None;
         self.runtime_manager = None;
         self.install_manager = None;
@@ -4982,7 +4982,7 @@ impl App {
     }
 
     fn open_provider_manager(&mut self) {
-        self.doctor_manager = None;
+        self.examine_manager = None;
         self.logs_view = None;
         self.runtime_manager = None;
         self.install_manager = None;
@@ -5013,7 +5013,7 @@ impl App {
 
     fn open_config_manager(&mut self) {
         self.refresh_config();
-        self.doctor_manager = None;
+        self.examine_manager = None;
         self.logs_view = None;
         self.runtime_manager = None;
         self.install_manager = None;
@@ -5210,7 +5210,7 @@ impl App {
     }
 
     fn open_onboarding_after_setup_reset(&mut self) {
-        self.doctor_manager = None;
+        self.examine_manager = None;
         self.logs_view = None;
         self.runtime_manager = None;
         self.install_manager = None;
@@ -5775,7 +5775,7 @@ impl App {
 
     fn open_services_manager(&mut self) {
         self.remember_current_chat_session();
-        self.doctor_manager = None;
+        self.examine_manager = None;
         self.logs_view = None;
         self.runtime_manager = None;
         self.install_manager = None;
@@ -6957,7 +6957,7 @@ impl App {
     const fn should_draw_home_dashboard(&self) -> bool {
         self.home_dashboard_visible
             && !self.onboarding_active
-            && self.doctor_manager.is_none()
+            && self.examine_manager.is_none()
             && self.logs_view.is_none()
             && self.runtime_manager.is_none()
             && self.install_manager.is_none()
@@ -7018,7 +7018,7 @@ impl App {
         if self.running_job_blocks_screen_switch() {
             return;
         }
-        self.doctor_manager = None;
+        self.examine_manager = None;
         self.logs_view = None;
         self.runtime_manager = None;
         self.install_manager = None;
@@ -7146,7 +7146,7 @@ impl App {
         self.remember_current_chat_session();
         self.command_screen_last_area.set(None);
         self.overlay_card = None;
-        self.doctor_manager = None;
+        self.examine_manager = None;
         self.logs_view = None;
         self.runtime_manager = None;
         self.install_manager = None;
@@ -7283,7 +7283,7 @@ impl App {
         if let Some(job) = self
             .running_job
             .as_ref()
-            .filter(|job| !matches!(job.kind, RunningJobKind::DoctorRefresh))
+            .filter(|job| !matches!(job.kind, RunningJobKind::ExamineRefresh))
         {
             self.status = format!(
                 "{} is still running. Wait for it to finish before quitting.",
@@ -8919,7 +8919,7 @@ impl App {
         let (rendered, page, page_count) =
             self.render_logs_browser_view(query.as_deref(), page, follow, false);
         self.remember_current_chat_session();
-        self.doctor_manager = None;
+        self.examine_manager = None;
         self.runtime_manager = None;
         self.install_manager = None;
         self.engine_manager = None;
@@ -8963,7 +8963,7 @@ impl App {
         let rendered = render_service_logs_text_for_tui(&self.paths, &service_id, false)
             .unwrap_or_else(|error| format!("Service log lookup failed.\n\n{error}"));
         self.remember_current_chat_session();
-        self.doctor_manager = None;
+        self.examine_manager = None;
         self.runtime_manager = None;
         self.install_manager = None;
         self.engine_manager = None;
@@ -9606,20 +9606,20 @@ impl App {
         if self
             .running_job
             .as_ref()
-            .is_some_and(|job| matches!(job.kind, RunningJobKind::DoctorRefresh))
+            .is_some_and(|job| matches!(job.kind, RunningJobKind::ExamineRefresh))
         {
-            self.discard_background_doctor_refresh();
+            self.discard_background_examine_refresh();
         }
 
         if self
             .running_job
             .as_ref()
-            .is_some_and(|job| !matches!(job.kind, RunningJobKind::DoctorRefresh))
+            .is_some_and(|job| !matches!(job.kind, RunningJobKind::ExamineRefresh))
             && input
                 .strip_prefix('/')
-                .is_some_and(|command| is_doctor_command_input(command.trim_start()))
+                .is_some_and(|command| is_examine_command_input(command.trim_start()))
         {
-            self.doctor_blocked_by_current_workflow();
+            self.examine_blocked_by_current_workflow();
             return;
         }
 
@@ -9739,7 +9739,7 @@ impl App {
             None,
             vec![
                 CommandScreenAction::OpenCommand("setup"),
-                CommandScreenAction::OpenCommand("doctor"),
+                CommandScreenAction::OpenCommand("examine"),
                 CommandScreenAction::OpenCommand("serve"),
                 CommandScreenAction::OpenCommand("help"),
                 CommandScreenAction::Back,
@@ -9756,7 +9756,7 @@ impl App {
             None,
             vec![
                 CommandScreenAction::OpenCommand("setup"),
-                CommandScreenAction::OpenCommand("doctor"),
+                CommandScreenAction::OpenCommand("examine"),
                 CommandScreenAction::OpenCommand("serve"),
                 CommandScreenAction::OpenCommand("help"),
                 CommandScreenAction::Back,
@@ -9798,8 +9798,8 @@ impl App {
         if !head.is_empty() {
             self.mode = tui_mode_for_command(head, !args.is_empty());
         }
-        if !matches!(head, "" | "doctor") {
-            self.discard_background_doctor_refresh();
+        if !matches!(head, "" | "examine") {
+            self.discard_background_examine_refresh();
         }
 
         match head {
@@ -9812,9 +9812,9 @@ impl App {
                 self.open_help_overlay();
                 true
             }
-            "doctor" => {
-                if !self.doctor_blocked_by_current_workflow() {
-                    self.open_doctor_manager();
+            "examine" => {
+                if !self.examine_blocked_by_current_workflow() {
+                    self.open_examine_manager();
                 }
                 true
             }
@@ -10796,18 +10796,18 @@ impl App {
         self.start_cli_command_with_kind(title, args, RunningJobKind::Cli, None);
     }
 
-    fn start_doctor_refresh_job(&mut self) -> bool {
+    fn start_examine_refresh_job(&mut self) -> bool {
         if self.running_job.is_some() {
             let message = if self
                 .running_job
                 .as_ref()
-                .is_some_and(|job| matches!(job.kind, RunningJobKind::DoctorRefresh))
+                .is_some_and(|job| matches!(job.kind, RunningJobKind::ExamineRefresh))
             {
-                "Doctor is already checking this computer.\n\nYou can keep using the arrow keys while it finishes."
+                "Examine is already checking this computer.\n\nYou can keep using the arrow keys while it finishes."
             } else {
-                "Another action is already running.\n\nWait for it to finish, then refresh Doctor again."
+                "Another action is already running.\n\nWait for it to finish, then refresh Examine again."
             };
-            if let Some(state) = self.doctor_manager.as_mut() {
+            if let Some(state) = self.examine_manager.as_mut() {
                 state.message = Some(message.to_owned());
             }
             self.status = "A command is already running; wait for it to finish.".to_owned();
@@ -10815,7 +10815,7 @@ impl App {
         }
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = render_doctor_text()
+            let result = render_examine_text()
                 .map(|rendered| CommandOutput {
                     ok: true,
                     rendered,
@@ -10825,8 +10825,8 @@ impl App {
             let _ = sender.send(RunningJobEvent::Finished(result));
         });
         self.running_job = Some(RunningJob {
-            title: "Doctor".to_owned(),
-            kind: RunningJobKind::DoctorRefresh,
+            title: "Examine".to_owned(),
+            kind: RunningJobKind::ExamineRefresh,
             receiver,
             started_at: Instant::now(),
             streamed_lines: 0,
@@ -10836,20 +10836,20 @@ impl App {
         self.running_job_log_scroll = 0;
         self.running_job_output.clear();
         self.running_job_cancel_requested = None;
-        self.record_activity("doctor check started");
+        self.record_activity("examine check started");
         self.status = "Checking this computer...".to_owned();
         true
     }
 
-    fn discard_background_doctor_refresh(&mut self) {
+    fn discard_background_examine_refresh(&mut self) {
         if self
             .running_job
             .as_ref()
-            .is_some_and(|job| matches!(job.kind, RunningJobKind::DoctorRefresh))
+            .is_some_and(|job| matches!(job.kind, RunningJobKind::ExamineRefresh))
         {
             self.running_job = None;
             self.running_job_cancel_requested = None;
-            self.record_activity("doctor check superseded");
+            self.record_activity("examine check superseded");
         }
     }
 
@@ -10869,7 +10869,7 @@ impl App {
         kind: RunningJobKind,
         display_command: Option<String>,
     ) -> bool {
-        self.discard_background_doctor_refresh();
+        self.discard_background_examine_refresh();
         if self.running_job.is_some() {
             self.status = "A command is already running; wait for it to finish.".to_owned();
             return false;
@@ -10917,7 +10917,7 @@ impl App {
     }
 
     fn active_screen_handles_command_output(&self, title: &str) -> bool {
-        (self.doctor_manager.is_some() && title == "Doctor")
+        (self.examine_manager.is_some() && title == "Examine")
             || (self.runtime_manager.is_some() && matches!(title, "Runtimes" | "Install"))
             || (self.install_manager.is_some() && matches!(title, "Install" | "Install Preview"))
             || (self.engine_manager.is_some() && title == "Engine")
@@ -10943,7 +10943,7 @@ impl App {
         args: Vec<String>,
         kind: RunningJobKind,
     ) -> bool {
-        self.discard_background_doctor_refresh();
+        self.discard_background_examine_refresh();
         if self.running_job.is_some() {
             self.status = "A command is already running; wait for it to finish.".to_owned();
             return false;
@@ -10992,7 +10992,7 @@ impl App {
         rocm_tools: bool,
         model: Option<String>,
     ) -> bool {
-        self.discard_background_doctor_refresh();
+        self.discard_background_examine_refresh();
         if self.running_job.is_some() {
             self.status = "A command is already running; wait for it to finish.".to_owned();
             return false;
@@ -11058,7 +11058,7 @@ impl App {
     }
 
     fn start_planner_job(&mut self, title: &str, request: &str) -> bool {
-        self.discard_background_doctor_refresh();
+        self.discard_background_examine_refresh();
         if self.running_job.is_some() {
             self.status = "A command is already running; wait for it to finish.".to_owned();
             return false;
@@ -11517,35 +11517,35 @@ impl App {
         let mut advance_onboarding_after_job = false;
         let mut chat_auto_follow_up = false;
         match (kind, result) {
-            (RunningJobKind::DoctorRefresh, Ok(output)) => {
-                if let Some(state) = self.doctor_manager.as_mut() {
+            (RunningJobKind::ExamineRefresh, Ok(output)) => {
+                if let Some(state) = self.examine_manager.as_mut() {
                     if output.ok {
                         state.report = output.rendered;
                         state.message = None;
                         state.detail_scroll = 0;
                     } else {
                         state.message =
-                            Some(format!("Doctor check failed.\n\n{}", output.rendered));
+                            Some(format!("Examine check failed.\n\n{}", output.rendered));
                     }
                 }
                 self.status = if output.ok {
-                    "Doctor refreshed.".to_owned()
+                    "Examine refreshed.".to_owned()
                 } else {
-                    "Doctor check failed.".to_owned()
+                    "Examine check failed.".to_owned()
                 };
                 self.record_activity(if output.ok {
-                    "doctor check completed".to_owned()
+                    "examine check completed".to_owned()
                 } else {
-                    "doctor check failed".to_owned()
+                    "examine check failed".to_owned()
                 });
             }
-            (RunningJobKind::DoctorRefresh, Err(error)) => {
-                if let Some(state) = self.doctor_manager.as_mut() {
-                    state.message = Some(format!("Doctor check failed.\n\n{error}"));
+            (RunningJobKind::ExamineRefresh, Err(error)) => {
+                if let Some(state) = self.examine_manager.as_mut() {
+                    state.message = Some(format!("Examine check failed.\n\n{error}"));
                     state.detail_scroll = 0;
                 }
-                self.status = "Doctor check failed.".to_owned();
-                self.record_activity("doctor check failed");
+                self.status = "Examine check failed.".to_owned();
+                self.record_activity("examine check failed");
             }
             (RunningJobKind::Cli, Ok(output)) => {
                 let rendered = output.rendered.clone();
@@ -12935,7 +12935,7 @@ fn should_parse_plain_input_as_command(input: &str) -> bool {
     };
     let args = parts.iter().skip(1).map(String::as_str).collect::<Vec<_>>();
     match head {
-        "home" | "help" | "?" | "doctor" | "setup" | "permissions" | "runtimes" | "engine"
+        "home" | "help" | "?" | "examine" | "setup" | "permissions" | "runtimes" | "engine"
         | "model" | "plan" | "config" | "automations" | "reviews" | "proposals" | "approve"
         | "reject" | "edit" | "services" | "logs" | "gpu" | "daemon" | "chat" | "provider"
         | "clear" | "quit" | "exit" => true,
@@ -12997,7 +12997,7 @@ fn is_plain_casual_input(input: &str) -> bool {
 fn is_plain_inspection_request(lower: &str) -> bool {
     let inspectish = lower
         .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.')
-        .any(|word| matches!(word, "inspect" | "check" | "status" | "doctor"))
+        .any(|word| matches!(word, "inspect" | "check" | "status" | "examine"))
         || lower.contains("what is installed")
         || lower.contains("what's installed")
         || lower.contains("is installed");
@@ -15866,7 +15866,7 @@ fn matching_slash_commands(prefix: &str) -> Vec<&'static SlashCommandSpec> {
 fn slash_command_completion_label(command: &SlashCommandSpec) -> String {
     let description = match command.name {
         "help" | "?" => "choose a command",
-        "doctor" => "check this computer",
+        "examine" => "check this computer",
         "setup" => "set up ROCm",
         "permissions" => "change approvals",
         "runtimes" => "choose ROCm install",
@@ -16671,8 +16671,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         app.scroll_logs_view_detail_modal(lines);
         return;
     }
-    if app.doctor_manager.is_some() {
-        app.scroll_doctor_manager_detail(lines);
+    if app.examine_manager.is_some() {
+        app.scroll_examine_manager_detail(lines);
     } else if app.logs_view.is_some() {
         app.scroll_logs_view_detail(lines);
     } else if app.runtime_manager.is_some()
@@ -16893,7 +16893,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    if app.doctor_manager.is_some() && handle_doctor_manager_key(app, key) {
+    if app.examine_manager.is_some() && handle_examine_manager_key(app, key) {
         return;
     }
 
@@ -17232,7 +17232,7 @@ fn clear_prompt_for_active_surface_action(app: &mut App, key: KeyEvent) {
     }
 
     if app.onboarding_active
-        || app.doctor_manager.is_some()
+        || app.examine_manager.is_some()
         || app.logs_view.is_some()
         || app.runtime_manager.is_some()
         || app.install_manager.is_some()
@@ -17487,7 +17487,7 @@ fn handle_running_job_modal_key(app: &mut App, key: KeyEvent) -> bool {
     true
 }
 
-fn handle_doctor_manager_key(app: &mut App, key: KeyEvent) -> bool {
+fn handle_examine_manager_key(app: &mut App, key: KeyEvent) -> bool {
     if active_surface_should_defer_to_prompt(app, key) {
         return false;
     }
@@ -17495,50 +17495,50 @@ fn handle_doctor_manager_key(app: &mut App, key: KeyEvent) -> bool {
     match (key.modifiers, key.code) {
         (KeyModifiers::CONTROL, KeyCode::Char('c')) => false,
         (_, KeyCode::Up | KeyCode::BackTab) => {
-            app.move_doctor_manager_selection(CompletionDirection::Previous);
+            app.move_examine_manager_selection(CompletionDirection::Previous);
             true
         }
         (_, KeyCode::Down | KeyCode::Tab) => {
-            app.move_doctor_manager_selection(CompletionDirection::Next);
+            app.move_examine_manager_selection(CompletionDirection::Next);
             true
         }
         (_, KeyCode::PageUp) => {
-            app.scroll_doctor_manager_detail(-10);
+            app.scroll_examine_manager_detail(-10);
             true
         }
         (_, KeyCode::PageDown) => {
-            app.scroll_doctor_manager_detail(10);
+            app.scroll_examine_manager_detail(10);
             true
         }
         (_, KeyCode::Home) => {
-            if let Some(state) = app.doctor_manager.as_mut() {
+            if let Some(state) = app.examine_manager.as_mut() {
                 state.selected = 0;
                 state.message = None;
                 state.detail_scroll = 0;
             }
-            app.status = "Moved to first doctor check.".to_owned();
+            app.status = "Moved to first examine check.".to_owned();
             true
         }
         (_, KeyCode::End) => {
-            if let Some(state) = app.doctor_manager.as_mut() {
-                state.selected = doctor_manager_choices().len().saturating_sub(1);
+            if let Some(state) = app.examine_manager.as_mut() {
+                state.selected = examine_manager_choices().len().saturating_sub(1);
                 state.message = None;
                 state.detail_scroll = 0;
             }
-            app.status = "Moved to last doctor choice.".to_owned();
+            app.status = "Moved to last examine choice.".to_owned();
             true
         }
         (_, KeyCode::F(5)) => {
-            app.refresh_doctor_manager();
+            app.refresh_examine_manager();
             true
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
         | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => {
-            app.perform_doctor_manager_selected_action();
+            app.perform_examine_manager_selected_action();
             true
         }
         (_, KeyCode::Esc | KeyCode::Char('q' | 'Q')) => {
-            app.close_doctor_manager();
+            app.close_examine_manager();
             true
         }
         _ => false,
@@ -19257,8 +19257,8 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         .constraints([Constraint::Min(60), Constraint::Length(sidebar_width)])
         .split(layout[0]);
 
-    if app.doctor_manager.is_some() {
-        draw_doctor_manager(frame, app, body[0]);
+    if app.examine_manager.is_some() {
+        draw_examine_manager(frame, app, body[0]);
     } else if app.logs_view.is_some() {
         draw_logs_view(frame, app, body[0]);
     } else if app.runtime_manager.is_some() {
@@ -19403,7 +19403,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
             .is_some_and(|state| state.detail_modal.is_some())
     {
         "Up/Down scroll | PageUp/PageDown scroll | Esc close"
-    } else if app.doctor_manager.is_some() {
+    } else if app.examine_manager.is_some() {
         "Up/Down choose | Enter select | PageUp/PageDown scroll | F5 refresh | Esc back"
     } else if app.runtime_manager.is_some() && app.pending_approval.is_none() {
         "Up/Down choose | Enter use highlighted row | PageUp/PageDown scroll | Esc back"
@@ -19577,7 +19577,7 @@ fn should_draw_prompt_box(app: &App) -> bool {
     {
         return true;
     }
-    app.doctor_manager.is_none()
+    app.examine_manager.is_none()
         && app.logs_view.is_none()
         && app.runtime_manager.is_none()
         && app.install_manager.is_none()
@@ -19797,7 +19797,7 @@ fn render_home_dashboard_detail_text(app: &App) -> String {
         HomeDashboardAction::Setup => {
             "Install ROCm into a Python folder managed by rocm-cli.\n\nThis is the first thing to do on a new machine."
         }
-        HomeDashboardAction::Doctor => {
+        HomeDashboardAction::Examine => {
             "Check your GPU, ROCm install, model runner, driver, and useful folders.\n\nThis does not change your computer."
         }
         HomeDashboardAction::Serve => {
@@ -19850,7 +19850,7 @@ fn home_dashboard_actions(app: &App) -> Vec<HomeDashboardAction> {
             HomeDashboardAction::Chat,
             HomeDashboardAction::ComfyUi,
             HomeDashboardAction::Services,
-            HomeDashboardAction::Doctor,
+            HomeDashboardAction::Examine,
             HomeDashboardAction::Engine,
             HomeDashboardAction::Help,
             HomeDashboardAction::Quit,
@@ -19858,7 +19858,7 @@ fn home_dashboard_actions(app: &App) -> Vec<HomeDashboardAction> {
     } else {
         vec![
             HomeDashboardAction::Setup,
-            HomeDashboardAction::Doctor,
+            HomeDashboardAction::Examine,
             HomeDashboardAction::Permissions,
             HomeDashboardAction::Help,
             HomeDashboardAction::Quit,
@@ -19869,7 +19869,7 @@ fn home_dashboard_actions(app: &App) -> Vec<HomeDashboardAction> {
 const fn home_dashboard_action_label(action: HomeDashboardAction) -> &'static str {
     match action {
         HomeDashboardAction::Setup => "Set up ROCm",
-        HomeDashboardAction::Doctor => "Run setup check",
+        HomeDashboardAction::Examine => "Run setup check",
         HomeDashboardAction::Serve => "Start a local model",
         HomeDashboardAction::Chat => "Chat with assistant",
         HomeDashboardAction::ComfyUi => "Open ComfyUI",
@@ -19884,7 +19884,7 @@ const fn home_dashboard_action_label(action: HomeDashboardAction) -> &'static st
 const fn home_dashboard_action_status(action: HomeDashboardAction) -> &'static str {
     match action {
         HomeDashboardAction::Setup => "Set up ROCm selected. Press Enter.",
-        HomeDashboardAction::Doctor => "Setup check selected. Press Enter.",
+        HomeDashboardAction::Examine => "Setup check selected. Press Enter.",
         HomeDashboardAction::Serve => "Start a local model selected. Press Enter.",
         HomeDashboardAction::Chat => "Local assistant selected. Press Enter.",
         HomeDashboardAction::ComfyUi => "ComfyUI selected. Press Enter.",
@@ -19899,7 +19899,7 @@ const fn home_dashboard_action_status(action: HomeDashboardAction) -> &'static s
 const fn home_dashboard_action_command(action: HomeDashboardAction) -> &'static str {
     match action {
         HomeDashboardAction::Setup => "setup",
-        HomeDashboardAction::Doctor => "doctor",
+        HomeDashboardAction::Examine => "examine",
         HomeDashboardAction::Serve => "serve",
         HomeDashboardAction::Chat => "chat --tools",
         HomeDashboardAction::ComfyUi => "comfyui",
@@ -20465,23 +20465,23 @@ fn modal_detail_scroll(app: &App) -> u16 {
         .map_or(0, |pending| pending.detail_scroll)
 }
 
-fn draw_doctor_manager(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let Some(state) = app.doctor_manager.as_ref() else {
+fn draw_examine_manager(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some(state) = app.examine_manager.as_ref() else {
         return;
     };
     let panes = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(34), Constraint::Min(38)])
         .split(area);
-    let choices = doctor_manager_choices();
+    let choices = examine_manager_choices();
     let items = choices
         .iter()
-        .map(|choice| ListItem::new(doctor_manager_label(*choice)))
+        .map(|choice| ListItem::new(examine_manager_label(*choice)))
         .collect::<Vec<_>>();
     let mut list_state = ListState::default();
     list_state.select(Some(state.selected.min(items.len().saturating_sub(1))));
     let title = format!(
-        "Doctor {}/{}",
+        "Examine {}/{}",
         state.selected.saturating_add(1).min(choices.len()),
         choices.len()
     );
@@ -20493,7 +20493,7 @@ fn draw_doctor_manager(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     draw_scrollable_text_with_block(
         frame,
-        doctor_manager_detail_text(app),
+        examine_manager_detail_text(app),
         panes[1],
         detail_block("Details"),
         Style::default().fg(THEME_TEXT).bg(THEME_PANEL),
@@ -21072,27 +21072,27 @@ fn draw_logs_view_detail_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-const fn doctor_manager_choices() -> &'static [DoctorManagerChoice] {
+const fn examine_manager_choices() -> &'static [ExamineManagerChoice] {
     &[
-        DoctorManagerChoice::Overview,
-        DoctorManagerChoice::Gpu,
-        DoctorManagerChoice::Runtimes,
-        DoctorManagerChoice::Engines,
-        DoctorManagerChoice::DriverAndWsl,
-        DoctorManagerChoice::Folders,
-        DoctorManagerChoice::Back,
+        ExamineManagerChoice::Overview,
+        ExamineManagerChoice::Gpu,
+        ExamineManagerChoice::Runtimes,
+        ExamineManagerChoice::Engines,
+        ExamineManagerChoice::DriverAndWsl,
+        ExamineManagerChoice::Folders,
+        ExamineManagerChoice::Back,
     ]
 }
 
-const fn doctor_manager_label(choice: DoctorManagerChoice) -> &'static str {
+const fn examine_manager_label(choice: ExamineManagerChoice) -> &'static str {
     match choice {
-        DoctorManagerChoice::Overview => "Overview",
-        DoctorManagerChoice::Gpu => "GPU",
-        DoctorManagerChoice::Runtimes => "ROCm installs",
-        DoctorManagerChoice::Engines => "Engines",
-        DoctorManagerChoice::DriverAndWsl => "Driver and WSL",
-        DoctorManagerChoice::Folders => "Folders",
-        DoctorManagerChoice::Back => "Back",
+        ExamineManagerChoice::Overview => "Overview",
+        ExamineManagerChoice::Gpu => "GPU",
+        ExamineManagerChoice::Runtimes => "ROCm installs",
+        ExamineManagerChoice::Engines => "Engines",
+        ExamineManagerChoice::DriverAndWsl => "Driver and WSL",
+        ExamineManagerChoice::Folders => "Folders",
+        ExamineManagerChoice::Back => "Back",
     }
 }
 
@@ -22431,7 +22431,7 @@ fn config_manager_detail_text(app: &App) -> String {
                 "",
                 &format!("Current: {mode}"),
                 "",
-                "When this is on, rocm-cli reads local AMD GPU status for doctor and model-fit screens.",
+                "When this is on, rocm-cli reads local AMD GPU status for examine and model-fit screens.",
                 "No cloud service is used.",
                 "",
                 "Press Enter to toggle this.",
@@ -22743,7 +22743,7 @@ fn help_topic_detail(topic: HelpTopic) -> String {
             "- Start a local model.",
             "- Chat with the assistant.",
             "- Open ComfyUI.",
-            "- Check this computer with Doctor.",
+            "- Check this computer with Examine.",
             "",
             "ROCm CLI keeps settings in ~/.rocm.",
             "The pip cache stays inside the ROCm install folder you choose.",
@@ -22858,7 +22858,7 @@ fn help_topic_detail(topic: HelpTopic) -> String {
             "",
             "Common commands:",
             "  rocm",
-            "  rocm doctor",
+            "  rocm examine",
             "  rocm setup reset",
             "  rocm install sdk --channel release --format wheel --prefix <folder>",
             "  rocm runtimes list",
@@ -22873,7 +22873,7 @@ fn help_topic_detail(topic: HelpTopic) -> String {
             "",
             "Inside the TUI, slash commands still work:",
             "  /setup",
-            "  /doctor",
+            "  /examine",
             "  /engine",
             "  /serve",
             "  /comfyui",
@@ -22925,7 +22925,7 @@ fn help_topic_detail(topic: HelpTopic) -> String {
             "- Use F5 to refresh setup status.",
             "",
             "If GPU checks fail:",
-            "- Run rocm doctor.",
+            "- Run rocm examine.",
             "- On Windows, make sure the AMD driver is installed.",
             "- On WSL, run from the Linux filesystem when possible, not /mnt.",
             "",
@@ -22963,7 +22963,7 @@ fn help_command_screen_actions() -> Vec<CommandScreenAction> {
     [
         "home",
         "setup",
-        "doctor",
+        "examine",
         "install",
         "runtimes",
         "engine",
@@ -23000,7 +23000,7 @@ fn help_command_label(command: &str) -> &'static str {
         "home" => "Home dashboard",
         "help" => "Command list",
         "setup" => "Set up ROCm",
-        "doctor" => "Check this computer",
+        "examine" => "Check this computer",
         "install" => "Install ROCm",
         "runtimes" => "Choose ROCm install",
         "engine" => "Choose engine",
@@ -23049,7 +23049,7 @@ fn help_command_detail(command: &str) -> String {
             "Set up ROCm",
             "Install ROCm into a Python folder managed by rocm-cli. This is the first screen new users see.",
         ),
-        "doctor" => (
+        "examine" => (
             "Check this computer",
             "Inspect GPU detection, driver state, ROCm installs, engines, WSL, and folders.",
         ),
@@ -23687,41 +23687,41 @@ fn install_sdk_detail_text(app: &App) -> String {
     output.trim_end().to_owned()
 }
 
-fn doctor_manager_detail_text(app: &App) -> String {
-    let Some(state) = app.doctor_manager.as_ref() else {
+fn examine_manager_detail_text(app: &App) -> String {
+    let Some(state) = app.examine_manager.as_ref() else {
         return String::new();
     };
     if let Some(message) = state.message.as_deref() {
         return message.to_owned();
     }
     let report = &state.report;
-    match doctor_manager_choices()
+    match examine_manager_choices()
         .get(state.selected)
         .copied()
-        .unwrap_or(DoctorManagerChoice::Overview)
+        .unwrap_or(ExamineManagerChoice::Overview)
     {
-        DoctorManagerChoice::Overview => doctor_overview_text(report),
-        DoctorManagerChoice::Gpu => doctor_gpu_text(report),
-        DoctorManagerChoice::Runtimes => doctor_runtimes_text(report),
-        DoctorManagerChoice::Engines => doctor_engines_text(report),
-        DoctorManagerChoice::DriverAndWsl => doctor_driver_wsl_text(report),
-        DoctorManagerChoice::Folders => doctor_folders_text(report),
-        DoctorManagerChoice::Back => "Return to the main screen.".to_owned(),
+        ExamineManagerChoice::Overview => examine_overview_text(report),
+        ExamineManagerChoice::Gpu => examine_gpu_text(report),
+        ExamineManagerChoice::Runtimes => examine_runtimes_text(report),
+        ExamineManagerChoice::Engines => examine_engines_text(report),
+        ExamineManagerChoice::DriverAndWsl => examine_driver_wsl_text(report),
+        ExamineManagerChoice::Folders => examine_folders_text(report),
+        ExamineManagerChoice::Back => "Return to the main screen.".to_owned(),
     }
 }
 
-fn doctor_overview_text(report: &str) -> String {
-    let os = doctor_report_value(report, "os");
-    let arch = doctor_report_value(report, "arch");
-    let distro = doctor_report_value(report, "distro");
-    let cpu = doctor_report_value(report, "cpu");
-    let ram = doctor_report_value(report, "system_ram");
-    let gfx = doctor_report_value(report, "detected_gfx_target");
-    let family = doctor_report_value(report, "compatible_therock_family");
-    let installed_family = doctor_report_value(report, "detected_therock_family");
-    let runtime_status = doctor_report_value(report, "active_runtime_status");
-    let driver_status = doctor_report_value(report, "driver_status");
-    let default_engine = doctor_report_value(report, "effective_default_engine");
+fn examine_overview_text(report: &str) -> String {
+    let os = examine_report_value(report, "os");
+    let arch = examine_report_value(report, "arch");
+    let distro = examine_report_value(report, "distro");
+    let cpu = examine_report_value(report, "cpu");
+    let ram = examine_report_value(report, "system_ram");
+    let gfx = examine_report_value(report, "detected_gfx_target");
+    let family = examine_report_value(report, "compatible_therock_family");
+    let installed_family = examine_report_value(report, "detected_therock_family");
+    let runtime_status = examine_report_value(report, "active_runtime_status");
+    let driver_status = examine_report_value(report, "driver_status");
+    let default_engine = examine_report_value(report, "effective_default_engine");
     let mut output = String::new();
     let _ = writeln!(output, "ROCm check");
     let _ = writeln!(output);
@@ -23732,7 +23732,7 @@ fn doctor_overview_text(report: &str) -> String {
     let _ = writeln!(output, "  Memory: {ram}");
     let _ = writeln!(output);
     let _ = writeln!(output, "GPU");
-    let _ = writeln!(output, "  AMD GPU: {}", doctor_gpu_display_name(report));
+    let _ = writeln!(output, "  AMD GPU: {}", examine_gpu_display_name(report));
     let _ = writeln!(output, "  Target: {gfx}");
     let _ = writeln!(output, "  ROCm package: {family}");
     let _ = writeln!(output, "  Installed ROCm package: {installed_family}");
@@ -23757,16 +23757,16 @@ fn doctor_overview_text(report: &str) -> String {
     output.trim_end().to_owned()
 }
 
-fn doctor_gpu_text(report: &str) -> String {
-    let gfx = doctor_report_value(report, "detected_gfx_target");
-    let family = doctor_report_value(report, "compatible_therock_family");
-    let installed_family = doctor_report_value(report, "detected_therock_family");
-    let driver_status = doctor_report_value(report, "driver_status");
+fn examine_gpu_text(report: &str) -> String {
+    let gfx = examine_report_value(report, "detected_gfx_target");
+    let family = examine_report_value(report, "compatible_therock_family");
+    let installed_family = examine_report_value(report, "detected_therock_family");
+    let driver_status = examine_report_value(report, "driver_status");
     let mut output = String::new();
     let _ = writeln!(output, "GPU");
     let _ = writeln!(output);
     let _ = writeln!(output, "Detected AMD GPU");
-    let _ = writeln!(output, "  {}", doctor_gpu_display_name(report));
+    let _ = writeln!(output, "  {}", examine_gpu_display_name(report));
     let _ = writeln!(output);
     let _ = writeln!(output, "Target");
     let _ = writeln!(output, "  {gfx}");
@@ -23789,26 +23789,26 @@ fn doctor_gpu_text(report: &str) -> String {
     output.trim_end().to_owned()
 }
 
-fn doctor_gpu_display_name(report: &str) -> String {
-    let detail = doctor_report_value(report, "driver_detail");
+fn examine_gpu_display_name(report: &str) -> String {
+    let detail = examine_report_value(report, "driver_detail");
     if detail != "not checked" && detail != "not detected" && detail != "none found" {
         return detail;
     }
-    let gfx = doctor_report_value(report, "detected_gfx_target");
+    let gfx = examine_report_value(report, "detected_gfx_target");
     if gfx != "not checked" && gfx != "not detected" && gfx != "none found" {
         return "detected AMD GPU".to_owned();
     }
     "not detected yet".to_owned()
 }
 
-fn doctor_runtimes_text(report: &str) -> String {
-    let count = doctor_report_value(report, "managed_runtimes");
-    let active_id = doctor_report_value(report, "active_runtime_id");
-    let active_status = doctor_report_value(report, "active_runtime_status");
-    let active_root = doctor_report_value(report, "active_runtime_root");
-    let active_version = doctor_report_value(report, "active_runtime_version");
-    let active_family = doctor_report_value(report, "active_runtime_family");
-    let registered = doctor_report_value(report, "registered_runtime_keys");
+fn examine_runtimes_text(report: &str) -> String {
+    let count = examine_report_value(report, "managed_runtimes");
+    let active_id = examine_report_value(report, "active_runtime_id");
+    let active_status = examine_report_value(report, "active_runtime_status");
+    let active_root = examine_report_value(report, "active_runtime_root");
+    let active_version = examine_report_value(report, "active_runtime_version");
+    let active_family = examine_report_value(report, "active_runtime_family");
+    let registered = examine_report_value(report, "registered_runtime_keys");
     let mut output = String::new();
     let _ = writeln!(output, "ROCm installs");
     let _ = writeln!(output);
@@ -23835,10 +23835,10 @@ fn doctor_runtimes_text(report: &str) -> String {
     output.trim_end().to_owned()
 }
 
-fn doctor_engines_text(report: &str) -> String {
-    let configured = doctor_report_value(report, "configured_default_engine");
-    let effective = doctor_report_value(report, "effective_default_engine");
-    let services = doctor_report_value(report, "managed_services");
+fn examine_engines_text(report: &str) -> String {
+    let configured = examine_report_value(report, "configured_default_engine");
+    let effective = examine_report_value(report, "effective_default_engine");
+    let services = examine_report_value(report, "managed_services");
     let mut output = String::new();
     let _ = writeln!(output, "Engines");
     let _ = writeln!(output);
@@ -23857,17 +23857,17 @@ fn doctor_engines_text(report: &str) -> String {
     output.trim_end().to_owned()
 }
 
-fn doctor_driver_wsl_text(report: &str) -> String {
-    let driver_policy = doctor_report_value(report, "driver_policy");
-    let driver_status = doctor_report_value(report, "driver_status");
-    let driver_detail = doctor_report_value(report, "driver_detail");
-    let wsl = doctor_report_bool_value(report, "wsl");
-    let dxg = doctor_report_bool_value(report, "wsl_dxg_device");
-    let dxcore = doctor_report_bool_value(report, "wsl_dxcore");
-    let librocdxg = doctor_report_bool_value(report, "wsl_librocdxg");
-    let dids = doctor_report_bool_value(report, "wsl_rocdxg_dids");
-    let cargo = doctor_report_bool_value(report, "wsl_cargo");
-    let detail = doctor_report_value(report, "wsl_detail");
+fn examine_driver_wsl_text(report: &str) -> String {
+    let driver_policy = examine_report_value(report, "driver_policy");
+    let driver_status = examine_report_value(report, "driver_status");
+    let driver_detail = examine_report_value(report, "driver_detail");
+    let wsl = examine_report_bool_value(report, "wsl");
+    let dxg = examine_report_bool_value(report, "wsl_dxg_device");
+    let dxcore = examine_report_bool_value(report, "wsl_dxcore");
+    let librocdxg = examine_report_bool_value(report, "wsl_librocdxg");
+    let dids = examine_report_bool_value(report, "wsl_rocdxg_dids");
+    let cargo = examine_report_bool_value(report, "wsl_cargo");
+    let detail = examine_report_value(report, "wsl_detail");
     let mut output = String::new();
     let _ = writeln!(output, "Driver and WSL");
     let _ = writeln!(output);
@@ -23891,23 +23891,23 @@ fn doctor_driver_wsl_text(report: &str) -> String {
     output.trim_end().to_owned()
 }
 
-fn doctor_folders_text(report: &str) -> String {
-    let config = doctor_report_value(report, "config_dir");
-    let data = doctor_report_value(report, "data_dir");
-    let cache = doctor_report_value(report, "cache_dir");
-    let rocm_downloads = doctor_report_raw_value(report, "active_runtime_pip_cache_dir")
-        .or_else(|| doctor_report_raw_value(report, "setup_runtime_pip_cache_dir"))
+fn examine_folders_text(report: &str) -> String {
+    let config = examine_report_value(report, "config_dir");
+    let data = examine_report_value(report, "data_dir");
+    let cache = examine_report_value(report, "cache_dir");
+    let rocm_downloads = examine_report_raw_value(report, "active_runtime_pip_cache_dir")
+        .or_else(|| examine_report_raw_value(report, "setup_runtime_pip_cache_dir"))
         .map_or_else(
             || "choose a ROCm install folder first".to_owned(),
-            friendly_doctor_value,
+            friendly_examine_value,
         );
-    let models = doctor_report_value(report, "model_cache_entries");
-    let active_status = doctor_report_value(report, "active_runtime_status");
-    let active_install = doctor_report_raw_value(report, "active_runtime_root")
-        .or_else(|| doctor_report_raw_value(report, "setup_runtime_root"))
+    let models = examine_report_value(report, "model_cache_entries");
+    let active_status = examine_report_value(report, "active_runtime_status");
+    let active_install = examine_report_raw_value(report, "active_runtime_root")
+        .or_else(|| examine_report_raw_value(report, "setup_runtime_root"))
         .map_or_else(
             || friendly_runtime_status(&active_status),
-            friendly_doctor_value,
+            friendly_examine_value,
         );
     let mut output = String::new();
     let _ = writeln!(output, "Folders");
@@ -23926,12 +23926,12 @@ fn doctor_folders_text(report: &str) -> String {
     output.trim_end().to_owned()
 }
 
-fn doctor_report_value(report: &str, key: &str) -> String {
-    doctor_report_raw_value(report, key)
-        .map_or_else(|| "not checked".to_owned(), friendly_doctor_value)
+fn examine_report_value(report: &str, key: &str) -> String {
+    examine_report_raw_value(report, key)
+        .map_or_else(|| "not checked".to_owned(), friendly_examine_value)
 }
 
-fn doctor_report_raw_value<'a>(report: &'a str, key: &str) -> Option<&'a str> {
+fn examine_report_raw_value<'a>(report: &'a str, key: &str) -> Option<&'a str> {
     let prefix = format!("{key}:");
     report.lines().find_map(|line| {
         let trimmed = line.trim();
@@ -23942,8 +23942,8 @@ fn doctor_report_raw_value<'a>(report: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
-fn doctor_report_bool_value(report: &str, key: &str) -> &'static str {
-    match doctor_report_raw_value(report, key) {
+fn examine_report_bool_value(report: &str, key: &str) -> &'static str {
+    match examine_report_raw_value(report, key) {
         Some("true") => "yes",
         Some("false") => "no",
         Some(_) => "not checked",
@@ -23951,7 +23951,7 @@ fn doctor_report_bool_value(report: &str, key: &str) -> &'static str {
     }
 }
 
-fn friendly_doctor_value(value: &str) -> String {
+fn friendly_examine_value(value: &str) -> String {
     match value {
         "" | "<unknown>" => "not checked".to_owned(),
         "<unset>" => "not set".to_owned(),
@@ -27721,7 +27721,7 @@ fn proposal_sandbox_args(proposal: &AutomationProposalRecord) -> Result<Vec<Stri
             args.push("--message".to_owned());
             args.push(proposal.message.clone());
         }
-        "check_updates" | "driver_plan" | "doctor_snapshot" | "list_servers" => {}
+        "check_updates" | "driver_plan" | "examine_snapshot" | "list_servers" => {}
         _ => bail!(
             "review request `{}` cannot be run; it asks for an unsupported action",
             proposal.proposal_id
@@ -28507,17 +28507,17 @@ mod tests {
         let mut app = test_app();
 
         app.complete_running_job(
-            "Doctor".to_owned(),
+            "Examine".to_owned(),
             super::RunningJobKind::Cli,
             Ok(super::CommandOutput {
                 ok: true,
-                rendered: "doctor ok".to_owned(),
+                rendered: "examine ok".to_owned(),
                 chat_approval: None,
             }),
             super::StreamedOutputCounts::default(),
         );
 
-        assert!(app.activity_text().contains("completed: Doctor"));
+        assert!(app.activity_text().contains("completed: Examine"));
     }
 
     #[test]
@@ -28949,22 +28949,22 @@ mod tests {
     fn push_block_scrolls_to_new_block_header() {
         let mut app = test_app();
         app.push_block("Old", "one\ntwo");
-        app.push_block("Doctor", "summary\nmore");
+        app.push_block("Examine", "summary\nmore");
 
-        let doctor_line = app
+        let examine_line = app
             .transcript
             .iter()
-            .position(|line| line == "[Doctor]")
-            .expect("doctor block should be present");
-        assert_eq!(usize::from(app.transcript_scroll), doctor_line);
+            .position(|line| line == "[Examine]")
+            .expect("examine block should be present");
+        assert_eq!(usize::from(app.transcript_scroll), examine_line);
     }
 
     #[test]
     fn typed_transcript_records_line_kinds() {
         let mut app = test_app();
 
-        app.push_user_input("/doctor");
-        app.push_block("Doctor", "summary");
+        app.push_user_input("/examine");
+        app.push_block("Examine", "summary");
         app.push_stream_line(super::CommandOutputStream::Stdout, "line");
 
         assert!(matches!(
@@ -28973,11 +28973,11 @@ mod tests {
         ));
         assert!(matches!(
             &app.transcript[2].kind,
-            super::TranscriptLineKind::BlockHeader { title } if title == "Doctor"
+            super::TranscriptLineKind::BlockHeader { title } if title == "Examine"
         ));
         assert!(matches!(
             &app.transcript[3].kind,
-            super::TranscriptLineKind::BlockBody { title } if title == "Doctor"
+            super::TranscriptLineKind::BlockBody { title } if title == "Examine"
         ));
         assert!(matches!(
             app.transcript.last().map(|line| &line.kind),
@@ -29004,26 +29004,26 @@ mod tests {
     #[test]
     fn enter_accepts_unique_slash_completion() {
         let mut app = test_app();
-        app.input = "/doc".to_owned();
+        app.input = "/exa".to_owned();
 
         handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
 
-        assert_eq!(app.input, "/doctor ");
+        assert_eq!(app.input, "/examine ");
         assert_eq!(app.status, "Accepted completion.");
     }
 
     #[test]
     fn exact_command_enter_submits_without_completion_menu() {
         let mut app = test_app();
-        app.input = "/doctor".to_owned();
+        app.input = "/examine".to_owned();
 
         handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
 
-        assert!(app.doctor_manager.is_some());
+        assert!(app.examine_manager.is_some());
         assert!(app.command_screen.is_none());
-        assert!(!app.transcript.iter().any(|line| line == "[Doctor]"));
+        assert!(!app.transcript.iter().any(|line| line == "[Examine]"));
         let rendered = render_test_terminal(&app, 120, 24);
-        assert!(rendered.contains("Doctor"));
+        assert!(rendered.contains("Examine"));
         assert!(rendered.contains("Overview"));
         assert!(rendered.contains("ROCm installs"));
         assert!(!rendered.contains("runtime_state:"));
@@ -29033,23 +29033,23 @@ mod tests {
     }
 
     #[test]
-    fn doctor_screen_is_arrow_key_navigable() {
+    fn examine_screen_is_arrow_key_navigable() {
         let mut app = test_app();
-        assert!(app.handle_command("doctor"));
+        assert!(app.handle_command("examine"));
 
         assert!(matches!(
             app.running_job.as_ref().map(|job| &job.kind),
-            Some(super::RunningJobKind::DoctorRefresh)
+            Some(super::RunningJobKind::ExamineRefresh)
         ));
         assert_eq!(
-            app.doctor_manager.as_ref().map(|state| state.selected),
+            app.examine_manager.as_ref().map(|state| state.selected),
             Some(0)
         );
         let rendered = render_test_terminal(&app, 120, 24);
         assert!(rendered.contains("Checking this computer"));
         handle_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(
-            app.doctor_manager.as_ref().map(|state| state.selected),
+            app.examine_manager.as_ref().map(|state| state.selected),
             Some(1)
         );
 
@@ -29059,14 +29059,14 @@ mod tests {
     }
 
     #[test]
-    fn doctor_background_completion_updates_report_without_transcript() {
+    fn examine_background_completion_updates_report_without_transcript() {
         let mut app = test_app();
-        assert!(app.handle_command("doctor"));
+        assert!(app.handle_command("examine"));
         app.running_job = None;
 
         app.complete_running_job(
-            "Doctor".to_owned(),
-            super::RunningJobKind::DoctorRefresh,
+            "Examine".to_owned(),
+            super::RunningJobKind::ExamineRefresh,
             Ok(super::CommandOutput {
                 ok: true,
                 rendered: "os: windows\narch: x86_64\ndetected_gfx_target: gfx1201\ncompatible_therock_family: gfx120X-all\ndetected_therock_family: <not detected>\nactive_runtime_status: ready\ndriver_status: ready\neffective_default_engine: llama.cpp".to_owned(),
@@ -29076,9 +29076,9 @@ mod tests {
         );
 
         assert!(app.transcript.is_empty());
-        assert_eq!(app.status, "Doctor refreshed.");
+        assert_eq!(app.status, "Examine refreshed.");
         assert_eq!(
-            app.doctor_manager
+            app.examine_manager
                 .as_ref()
                 .and_then(|state| state.message.as_deref()),
             None
@@ -29090,7 +29090,7 @@ mod tests {
     }
 
     #[test]
-    fn doctor_folders_separates_app_data_from_custom_rocm_install_folder() {
+    fn examine_folders_separates_app_data_from_custom_rocm_install_folder() {
         let report = [
             r"config_dir: C:\Users\jam\.rocm",
             r"data_dir: C:\Users\jam\.rocm",
@@ -29102,7 +29102,7 @@ mod tests {
         ]
         .join("\n");
 
-        let rendered = super::doctor_folders_text(&report);
+        let rendered = super::examine_folders_text(&report);
 
         assert!(rendered.contains(r"Settings: C:\Users\jam\.rocm"));
         assert!(rendered.contains(r"Logs and app data: C:\Users\jam\.rocm"));
@@ -29114,7 +29114,7 @@ mod tests {
     }
 
     #[test]
-    fn doctor_folders_uses_setup_folder_for_rocm_downloads_before_activation() {
+    fn examine_folders_uses_setup_folder_for_rocm_downloads_before_activation() {
         let report = [
             r"config_dir: C:\Users\jam\.rocm",
             r"data_dir: C:\Users\jam\.rocm",
@@ -29126,7 +29126,7 @@ mod tests {
         ]
         .join("\n");
 
-        let rendered = super::doctor_folders_text(&report);
+        let rendered = super::examine_folders_text(&report);
 
         assert!(rendered.contains(r"App metadata cache: C:\Users\jam\.rocm\cache"));
         assert!(rendered.contains(r"ROCm install downloads: D:\jam\temp\therock_venvs\pip-cache"));
@@ -29134,9 +29134,9 @@ mod tests {
     }
 
     #[test]
-    fn hidden_doctor_refresh_does_not_block_next_prompt_commands() -> anyhow::Result<()> {
+    fn hidden_examine_refresh_does_not_block_next_prompt_commands() -> anyhow::Result<()> {
         let mut app = test_app();
-        open_hidden_doctor_refresh_from_prompt(&mut app);
+        open_hidden_examine_refresh_from_prompt(&mut app);
         submit_prompt_command(&mut app, "/install");
         assert!(app.install_manager.is_some());
         handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
@@ -29144,10 +29144,10 @@ mod tests {
             app.install_manager.as_ref().map(|state| &state.screen),
             Some(super::InstallManagerScreen::Sdk { .. })
         ));
-        assert_no_background_doctor_block(&app, "install");
+        assert_no_background_examine_block(&app, "install");
 
         let mut app = test_app();
-        open_hidden_doctor_refresh_from_prompt(&mut app);
+        open_hidden_examine_refresh_from_prompt(&mut app);
         submit_prompt_command(&mut app, "/runtimes");
         assert!(app.runtime_manager.is_some());
         handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
@@ -29155,10 +29155,10 @@ mod tests {
             app.install_manager.as_ref().map(|state| &state.screen),
             Some(super::InstallManagerScreen::Sdk { .. })
         ));
-        assert_no_background_doctor_block(&app, "runtimes");
+        assert_no_background_examine_block(&app, "runtimes");
 
         let mut app = test_app();
-        open_hidden_doctor_refresh_from_prompt(&mut app);
+        open_hidden_examine_refresh_from_prompt(&mut app);
         submit_prompt_command(&mut app, "/update");
         assert!(app.update_manager.is_some());
         handle_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
@@ -29169,7 +29169,7 @@ mod tests {
             Some(super::ApprovalAction::CliCommand { args, .. })
                 if args == &vec!["update".to_owned(), "--apply".to_owned()]
         ));
-        assert_no_background_doctor_block(&app, "update");
+        assert_no_background_examine_block(&app, "update");
 
         let mut app = test_app();
         let mut record = ManagedServiceRecord::new(
@@ -29188,7 +29188,7 @@ mod tests {
         );
         record.status = "ready".to_owned();
         record.write()?;
-        open_hidden_doctor_refresh_from_prompt(&mut app);
+        open_hidden_examine_refresh_from_prompt(&mut app);
         submit_prompt_command(&mut app, "/services");
         assert!(app.services_manager.is_some());
         let stop_index = app
@@ -29223,86 +29223,86 @@ mod tests {
                     } if service_id == "svc-qwen"
                 )
         ));
-        assert_no_background_doctor_block(&app, "services");
+        assert_no_background_examine_block(&app, "services");
 
         let mut app = test_app();
-        open_hidden_doctor_refresh_from_prompt(&mut app);
+        open_hidden_examine_refresh_from_prompt(&mut app);
         submit_prompt_command(&mut app, "/clear");
         assert_eq!(
             app.overlay_card.as_ref().map(|state| state.title.as_str()),
             Some("Clear")
         );
-        assert_no_background_doctor_block(&app, "clear");
+        assert_no_background_examine_block(&app, "clear");
 
         let mut app = test_app();
-        open_hidden_doctor_refresh_from_prompt(&mut app);
+        open_hidden_examine_refresh_from_prompt(&mut app);
         submit_prompt_command(&mut app, "/quit");
         assert_eq!(
             app.overlay_card.as_ref().map(|state| state.title.as_str()),
             Some("Quit")
         );
-        assert_no_background_doctor_block(&app, "quit");
+        assert_no_background_examine_block(&app, "quit");
 
         Ok(())
     }
 
     #[test]
-    fn doctor_command_does_not_steal_running_workflow_screens() -> anyhow::Result<()> {
+    fn examine_command_does_not_steal_running_workflow_screens() -> anyhow::Result<()> {
         let mut app = test_app();
         assert!(app.handle_command("install"));
         let sender = attach_running_job(&mut app, "Install", super::RunningJobKind::Cli);
 
-        submit_prompt_command(&mut app, "/doctor");
+        submit_prompt_command(&mut app, "/examine");
 
         assert!(app.install_manager.is_some());
-        assert!(app.doctor_manager.is_none());
+        assert!(app.examine_manager.is_none());
         assert!(
             super::active_screen_message_text(&app).is_some_and(|message| {
                 message.contains("Install is still running")
-                    && message.contains("Doctor can check this computer after it finishes")
+                    && message.contains("Examine can check this computer after it finishes")
             })
         );
         finish_running_job(&mut app, sender, "install finished");
         assert!(app.install_manager.is_some());
-        assert!(app.doctor_manager.is_none());
+        assert!(app.examine_manager.is_none());
         assert!(app.transcript.is_empty());
 
         let mut app = test_app();
         assert!(app.handle_command("install"));
         let sender = attach_running_job(&mut app, "Install", super::RunningJobKind::Cli);
 
-        assert!(app.handle_command("doctor"));
+        assert!(app.handle_command("examine"));
 
         assert!(app.install_manager.is_some());
-        assert!(app.doctor_manager.is_none());
+        assert!(app.examine_manager.is_none());
         assert!(
             super::active_screen_message_text(&app).is_some_and(|message| {
                 message.contains("Install is still running")
-                    && message.contains("Doctor can check this computer after it finishes")
+                    && message.contains("Examine can check this computer after it finishes")
             })
         );
         finish_running_job(&mut app, sender, "install finished");
         assert!(app.install_manager.is_some());
-        assert!(app.doctor_manager.is_none());
+        assert!(app.examine_manager.is_none());
         assert!(app.transcript.is_empty());
 
         let mut app = test_app();
         assert!(app.handle_command("update"));
         let sender = attach_running_job(&mut app, "Update", super::RunningJobKind::Cli);
 
-        assert!(app.handle_command("doctor"));
+        assert!(app.handle_command("examine"));
 
         assert!(app.update_manager.is_some());
-        assert!(app.doctor_manager.is_none());
+        assert!(app.examine_manager.is_none());
         assert!(
             super::active_screen_message_text(&app).is_some_and(|message| {
                 message.contains("Update is still running")
-                    && message.contains("Doctor can check this computer after it finishes")
+                    && message.contains("Examine can check this computer after it finishes")
             })
         );
         finish_running_job(&mut app, sender, "update finished");
         assert!(app.update_manager.is_some());
-        assert!(app.doctor_manager.is_none());
+        assert!(app.examine_manager.is_none());
         assert!(app.transcript.is_empty());
 
         let mut app = test_app();
@@ -29332,19 +29332,19 @@ mod tests {
             },
         );
 
-        assert!(app.handle_command("doctor"));
+        assert!(app.handle_command("examine"));
 
         assert!(app.services_manager.is_some());
-        assert!(app.doctor_manager.is_none());
+        assert!(app.examine_manager.is_none());
         assert!(
             super::active_screen_message_text(&app).is_some_and(|message| {
                 message.contains("Service action is still running")
-                    && message.contains("Doctor can check this computer after it finishes")
+                    && message.contains("Examine can check this computer after it finishes")
             })
         );
         finish_running_job(&mut app, sender, "service stopped");
         assert!(app.services_manager.is_some());
-        assert!(app.doctor_manager.is_none());
+        assert!(app.examine_manager.is_none());
         assert!(app.transcript.is_empty());
 
         let mut app = test_app();
@@ -29363,7 +29363,7 @@ mod tests {
             },
         );
 
-        assert!(app.handle_command("doctor"));
+        assert!(app.handle_command("examine"));
 
         assert_eq!(
             app.command_screen
@@ -29371,11 +29371,11 @@ mod tests {
                 .map(|state| state.title.as_str()),
             Some("Chat")
         );
-        assert!(app.doctor_manager.is_none());
+        assert!(app.examine_manager.is_none());
         assert!(
             super::active_screen_message_text(&app).is_some_and(|message| {
                 message.contains("Chat is still running")
-                    && message.contains("Doctor can check this computer after it finishes")
+                    && message.contains("Examine can check this computer after it finishes")
             })
         );
         finish_running_job(&mut app, sender, "provider: local");
@@ -29385,7 +29385,7 @@ mod tests {
                 .map(|state| state.title.as_str()),
             Some("Chat")
         );
-        assert!(app.doctor_manager.is_none());
+        assert!(app.examine_manager.is_none());
         assert!(app.transcript.is_empty());
 
         let mut app = test_app();
@@ -29404,7 +29404,7 @@ mod tests {
             },
         );
 
-        assert!(app.handle_command("doctor"));
+        assert!(app.handle_command("examine"));
 
         assert_eq!(
             app.command_screen
@@ -29412,11 +29412,11 @@ mod tests {
                 .map(|state| state.title.as_str()),
             Some("Plan")
         );
-        assert!(app.doctor_manager.is_none());
+        assert!(app.examine_manager.is_none());
         assert!(
             super::active_screen_message_text(&app).is_some_and(|message| {
                 message.contains("Planning is still running")
-                    && message.contains("Doctor can check this computer after it finishes")
+                    && message.contains("Examine can check this computer after it finishes")
             })
         );
         finish_running_job(&mut app, sender, "plan ready");
@@ -29426,33 +29426,33 @@ mod tests {
                 .map(|state| state.title.as_str()),
             Some("Plan")
         );
-        assert!(app.doctor_manager.is_none());
+        assert!(app.examine_manager.is_none());
         assert!(app.transcript.is_empty());
 
         let mut app = test_app();
         app.open_serve_wizard();
         let sender = attach_running_job(&mut app, "Serve", super::RunningJobKind::Cli);
 
-        assert!(app.handle_command("doctor"));
+        assert!(app.handle_command("examine"));
 
         assert!(app.serve_wizard.is_some());
-        assert!(app.doctor_manager.is_none());
+        assert!(app.examine_manager.is_none());
         assert!(
             super::active_screen_message_text(&app).is_some_and(|message| {
                 message.contains("Serve is still running")
-                    && message.contains("Doctor can check this computer after it finishes")
+                    && message.contains("Examine can check this computer after it finishes")
             })
         );
         finish_running_job(&mut app, sender, "serve finished");
         assert!(app.serve_wizard.is_some());
-        assert!(app.doctor_manager.is_none());
+        assert!(app.examine_manager.is_none());
         assert!(app.transcript.is_empty());
 
         Ok(())
     }
 
     #[test]
-    fn doctor_command_does_not_hide_pending_approval() -> anyhow::Result<()> {
+    fn examine_command_does_not_hide_pending_approval() -> anyhow::Result<()> {
         let mut app = test_app();
         fs::create_dir_all(app.paths.data_dir.join("envs"))?;
         assert!(app.handle_command("runtimes"));
@@ -29461,15 +29461,15 @@ mod tests {
         handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.pending_approval.is_some());
 
-        assert!(app.handle_command("doctor"));
+        assert!(app.handle_command("examine"));
 
         assert!(app.install_manager.is_some());
-        assert!(app.doctor_manager.is_none());
+        assert!(app.examine_manager.is_none());
         assert!(app.pending_approval.is_some());
         assert!(
             super::active_screen_message_text(&app).is_some_and(|message| {
                 message.contains("Install ROCm is waiting for your review")
-                    && message.contains("before opening Doctor")
+                    && message.contains("before opening Examine")
             })
         );
         handle_key(&mut app, key_event(KeyCode::Esc, KeyModifiers::NONE));
@@ -29481,25 +29481,29 @@ mod tests {
     }
 
     #[test]
-    fn doctor_page_keys_scroll_details_without_moving_selection() {
+    fn examine_page_keys_scroll_details_without_moving_selection() {
         let mut app = test_app();
-        assert!(app.handle_command("doctor"));
+        assert!(app.handle_command("examine"));
         handle_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
-        let selected = app.doctor_manager.as_ref().map(|state| state.selected);
+        let selected = app.examine_manager.as_ref().map(|state| state.selected);
 
         handle_key(&mut app, key_event(KeyCode::PageDown, KeyModifiers::NONE));
         assert_eq!(
-            app.doctor_manager.as_ref().map(|state| state.selected),
+            app.examine_manager.as_ref().map(|state| state.selected),
             selected
         );
         assert_eq!(
-            app.doctor_manager.as_ref().map(|state| state.detail_scroll),
+            app.examine_manager
+                .as_ref()
+                .map(|state| state.detail_scroll),
             Some(10)
         );
 
         handle_key(&mut app, key_event(KeyCode::PageUp, KeyModifiers::NONE));
         assert_eq!(
-            app.doctor_manager.as_ref().map(|state| state.detail_scroll),
+            app.examine_manager
+                .as_ref()
+                .map(|state| state.detail_scroll),
             Some(0)
         );
     }
@@ -29514,7 +29518,7 @@ mod tests {
             .expect("slash input should render suggestions");
 
         assert_eq!(menu.title, "Completions");
-        assert!(menu.items.iter().any(|item| item.contains("/doctor")));
+        assert!(menu.items.iter().any(|item| item.contains("/examine")));
         assert!(menu.items.iter().any(|item| item.contains("/help")));
         assert!(menu.items.iter().any(|item| item.contains("/reviews")));
         assert!(!menu.items.iter().any(|item| item.starts_with("/proposals")));
@@ -29525,17 +29529,17 @@ mod tests {
     #[test]
     fn friendly_slash_completion_inserts_exact_command() {
         let mut app = test_app();
-        app.input = "/do".to_owned();
+        app.input = "/ex".to_owned();
         app.input_cursor = app.input_len_chars();
 
         let menu = app
             .slash_completion_menu()
-            .expect("/do should render the /doctor suggestion");
+            .expect("/ex should render the /examine suggestion");
         assert!(menu.items[menu.selected].contains("check this computer"));
 
         assert!(app.accept_completion());
 
-        assert_eq!(app.input, "/doctor ");
+        assert_eq!(app.input, "/examine ");
         assert_eq!(app.input_cursor, app.input_len_chars());
     }
 
@@ -29569,17 +29573,17 @@ mod tests {
         assert!(super::surface_command_prompt_active(&app));
         let rendered = render_test_terminal(&app, 120, 30);
         assert!(rendered.contains("Command"));
-        assert!(rendered.contains("/doctor"));
+        assert!(rendered.contains("/examine"));
         assert!(!rendered.contains("Prompt"));
 
-        for ch in "doctor".chars() {
+        for ch in "examine".chars() {
             handle_key(&mut app, key_event(KeyCode::Char(ch), KeyModifiers::NONE));
         }
-        assert_eq!(app.input, "/doctor");
+        assert_eq!(app.input, "/examine");
 
         handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
 
-        assert!(app.doctor_manager.is_some());
+        assert!(app.examine_manager.is_some());
         assert!(app.input.is_empty());
         assert!(app.overlay_card.is_none());
     }
@@ -30203,17 +30207,17 @@ mod tests {
             height: 30,
         };
         let list = super::home_dashboard_list_inner_rect(&app, area).expect("home list");
-        let doctor_row = 1;
+        let examine_row = 1;
 
         assert!(super::click_home_dashboard(
             &mut app,
             list.x,
-            list.y + doctor_row,
+            list.y + examine_row,
             area.width,
             area.height,
         ));
 
-        assert!(app.doctor_manager.is_some());
+        assert!(app.examine_manager.is_some());
         assert!(!app.should_draw_home_dashboard());
         assert!(app.transcript.is_empty());
     }
@@ -30242,7 +30246,7 @@ mod tests {
     #[test]
     fn home_dashboard_preserves_transcript_when_reopened() {
         let mut app = test_app();
-        app.push_block("Doctor", "GPU check output");
+        app.push_block("Examine", "GPU check output");
 
         assert!(!app.should_draw_home_dashboard());
         assert!(app.transcript_text().contains("GPU check output"));
@@ -31268,12 +31272,12 @@ mod tests {
         assert!(rendered.contains("Model type recommended model"));
 
         let mut app = test_app();
-        assert!(app.handle_command("doctor"));
-        assert!(app.doctor_manager.is_some());
+        assert!(app.handle_command("examine"));
+        assert!(app.examine_manager.is_some());
         assert!(app.command_screen.is_none());
         assert!(app.transcript.is_empty());
         let rendered = render_test_terminal(&app, 120, 24);
-        assert!(rendered.contains("Doctor"));
+        assert!(rendered.contains("Examine"));
         assert!(rendered.contains("Overview"));
         assert!(!rendered.contains("> Refresh"));
         assert!(!rendered.contains("  Refresh"));
@@ -31301,7 +31305,7 @@ mod tests {
         handle_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
         handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
 
-        assert!(app.doctor_manager.is_some());
+        assert!(app.examine_manager.is_some());
         assert!(app.command_screen.is_none());
         assert!(app.overlay_card.is_none());
         assert!(app.transcript.is_empty());
@@ -32394,7 +32398,7 @@ mod tests {
 
     #[test]
     fn static_command_screens_page_keys_scroll_details_without_changing_selection() {
-        for command in ["doctor", "logs", "help", "permissions"] {
+        for command in ["examine", "logs", "help", "permissions"] {
             let mut app = test_app();
 
             assert!(app.handle_command(command), "{command}");
@@ -33929,7 +33933,7 @@ mod tests {
                 assert!(app.command_screen_is_chat_session(), "{prompt}");
                 assert!(app.transcript.is_empty(), "{prompt}");
                 assert!(app.services_manager.is_none(), "{prompt}");
-                assert!(app.doctor_manager.is_none(), "{prompt}");
+                assert!(app.examine_manager.is_none(), "{prompt}");
                 assert!(app.install_manager.is_none(), "{prompt}");
                 poll_app_until_idle(&mut app);
             } else {
@@ -34338,7 +34342,7 @@ mod tests {
             app.open_local_rocm_tools_chat_session(Some(record));
             app.push_chat_session_turn(
                 super::ChatSessionRole::Assistant,
-                "Use /doctor to refresh actual GPU memory fit before starting anything large.\nNative Windows note: Qwen/Qwen3.5-4B uses WSL/Linux through Windows.",
+                "Use /examine to refresh actual GPU memory fit before starting anything large.\nNative Windows note: Qwen/Qwen3.5-4B uses WSL/Linux through Windows.",
             );
 
             app.set_input(prompt.to_owned());
@@ -34598,7 +34602,7 @@ chat response
 
 Assistant is checking ROCm first.
 ROCm checks used
-  Doctor: ok
+  Examine: ok
     os: windows
     data_dir: C:\\Users\\jam\\.rocm
     cache_dir: C:\\Users\\jam\\.rocm\\cache
@@ -34627,7 +34631,7 @@ chat response
 
 Assistant is checking ROCm first.
 ROCm checks used
-  Doctor: ok
+  Examine: ok
     os: windows
     data_dir: C:\\Users\\jam\\.rocm
 
@@ -34867,7 +34871,7 @@ Full log
     fn chat_session_approved_command_result_uses_detail_card_without_auto_followup()
     -> anyhow::Result<()> {
         let mut app = test_app();
-        let (port, request_receiver) = spawn_fake_local_chat_server("Next, run Doctor.")?;
+        let (port, request_receiver) = spawn_fake_local_chat_server("Next, run Examine.")?;
         let mut record = ManagedServiceRecord::new(
             &app.paths,
             "svc-qwen",
@@ -38768,7 +38772,7 @@ Full log
     #[test]
     fn history_navigation_does_not_replace_footer_status() {
         let mut app = test_app();
-        app.history = vec!["/doctor".to_owned(), "/gpu".to_owned()];
+        app.history = vec!["/examine".to_owned(), "/gpu".to_owned()];
         app.status = "Ready.".to_owned();
         app.home_dashboard_visible = false;
 
@@ -38786,7 +38790,7 @@ Full log
     #[test]
     fn arrow_keys_cycle_completion_instead_of_history_when_menu_is_open() {
         let mut app = test_app();
-        app.history = vec!["/doctor".to_owned()];
+        app.history = vec!["/examine".to_owned()];
         app.set_input("/".to_owned());
 
         handle_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
@@ -38824,23 +38828,23 @@ Full log
     fn prompt_supports_midline_editing() {
         let mut app = test_app();
         app.home_dashboard_visible = false;
-        app.set_input("/dctor".to_owned());
-        app.input_cursor = 2;
+        app.set_input("/exmine".to_owned());
+        app.input_cursor = 3;
 
-        handle_key(&mut app, key_event(KeyCode::Char('o'), KeyModifiers::NONE));
+        handle_key(&mut app, key_event(KeyCode::Char('a'), KeyModifiers::NONE));
 
-        assert_eq!(app.input, "/doctor");
-        assert_eq!(app.input_cursor, 3);
+        assert_eq!(app.input, "/examine");
+        assert_eq!(app.input_cursor, 4);
 
         handle_key(&mut app, key_event(KeyCode::Left, KeyModifiers::NONE));
         handle_key(&mut app, key_event(KeyCode::Backspace, KeyModifiers::NONE));
 
-        assert_eq!(app.input, "/octor");
-        assert_eq!(app.input_cursor, 1);
+        assert_eq!(app.input, "/eamine");
+        assert_eq!(app.input_cursor, 2);
 
         handle_key(&mut app, key_event(KeyCode::Delete, KeyModifiers::NONE));
 
-        assert_eq!(app.input, "/ctor");
+        assert_eq!(app.input, "/emine");
     }
 
     #[test]
@@ -39774,7 +39778,7 @@ Full log
         let mut app = test_app();
         let (sender, receiver) = mpsc::channel();
         app.running_job = Some(super::RunningJob {
-            title: "Doctor".to_owned(),
+            title: "Examine".to_owned(),
             kind: super::RunningJobKind::Cli,
             receiver,
             started_at: Instant::now(),
@@ -39798,7 +39802,7 @@ Full log
         sender
             .send(super::RunningJobEvent::Finished(Ok(super::CommandOutput {
                 ok: true,
-                rendered: "doctor ok".to_owned(),
+                rendered: "examine ok".to_owned(),
                 chat_approval: None,
             })))
             .unwrap();
@@ -39812,7 +39816,7 @@ Full log
                 .any(|line| line == "checking runtime")
         );
         assert!(app.running_job_output.iter().any(|line| line == "warning"));
-        assert!(app.transcript.iter().any(|line| line == "[Doctor]"));
+        assert!(app.transcript.iter().any(|line| line == "[Examine]"));
         assert!(!app.transcript.iter().any(|line| line == "stdout:"));
         assert!(
             app.transcript
@@ -39824,7 +39828,7 @@ Full log
                 .iter()
                 .any(|line| line == "streamed_stderr: 1 line(s) shown in live output while it ran")
         );
-        assert!(app.activity_text().contains("completed: Doctor"));
+        assert!(app.activity_text().contains("completed: Examine"));
     }
 
     #[test]
@@ -40529,7 +40533,7 @@ Full log
         let mut app = test_app();
         let (sender, receiver) = mpsc::channel();
         app.running_job = Some(super::RunningJob {
-            title: "Doctor".to_owned(),
+            title: "Examine".to_owned(),
             kind: super::RunningJobKind::Cli,
             receiver,
             started_at: Instant::now(),
@@ -40549,7 +40553,7 @@ Full log
         sender
             .send(super::RunningJobEvent::Finished(Ok(super::CommandOutput {
                 ok: true,
-                rendered: "doctor ok".to_owned(),
+                rendered: "examine ok".to_owned(),
                 chat_approval: None,
             })))
             .unwrap();
@@ -40569,7 +40573,7 @@ Full log
         app.poll_running_job();
 
         assert!(app.running_job.is_none());
-        assert!(app.transcript.iter().any(|line| line == "[Doctor]"));
+        assert!(app.transcript.iter().any(|line| line == "[Examine]"));
     }
 
     #[test]
@@ -40605,7 +40609,7 @@ Full log
         app.transcript_scroll = 0;
         let (sender, receiver) = mpsc::channel();
         app.running_job = Some(super::RunningJob {
-            title: "Doctor".to_owned(),
+            title: "Examine".to_owned(),
             kind: super::RunningJobKind::Cli,
             receiver,
             started_at: Instant::now(),
@@ -40616,7 +40620,7 @@ Full log
         sender
             .send(super::RunningJobEvent::Finished(Ok(super::CommandOutput {
                 ok: true,
-                rendered: "command: rocm doctor\nstatus: ok\n\nstdout:\nready".to_owned(),
+                rendered: "command: rocm examine\nstatus: ok\n\nstdout:\nready".to_owned(),
                 chat_approval: None,
             })))
             .unwrap();
@@ -40624,7 +40628,7 @@ Full log
         app.poll_running_job();
 
         assert_eq!(app.transcript_scroll, 0);
-        assert!(app.transcript.iter().any(|line| line == "[Doctor]"));
+        assert!(app.transcript.iter().any(|line| line == "[Examine]"));
     }
 
     #[test]
@@ -41033,7 +41037,7 @@ Full log
         assert!(screen.detail.contains("Run: review and start this action"));
         assert!(matches!(
             screen.plan_action.as_ref().map(|action| action.args.as_slice()),
-            Some(args) if args.len() == 1 && args[0] == "doctor"
+            Some(args) if args.len() == 1 && args[0] == "examine"
         ));
     }
 
@@ -44023,7 +44027,7 @@ Full log
             running_job_log_scroll: 0,
             running_job_output: std::collections::VecDeque::new(),
             running_job_cancel_requested: None,
-            doctor_manager: None,
+            examine_manager: None,
             logs_view: None,
             runtime_manager: None,
             install_manager: None,
@@ -44144,19 +44148,19 @@ Full log
             .engine_index = index;
     }
 
-    fn open_hidden_doctor_refresh_from_prompt(app: &mut App) {
-        submit_prompt_command(app, "/doctor");
+    fn open_hidden_examine_refresh_from_prompt(app: &mut App) {
+        submit_prompt_command(app, "/examine");
         assert!(matches!(
             app.running_job.as_ref().map(|job| &job.kind),
-            Some(super::RunningJobKind::DoctorRefresh)
+            Some(super::RunningJobKind::ExamineRefresh)
         ));
 
         handle_key(app, key_event(KeyCode::Esc, KeyModifiers::NONE));
 
-        assert!(app.doctor_manager.is_none());
+        assert!(app.examine_manager.is_none());
         assert!(matches!(
             app.running_job.as_ref().map(|job| &job.kind),
-            Some(super::RunningJobKind::DoctorRefresh)
+            Some(super::RunningJobKind::ExamineRefresh)
         ));
         assert!(app.transcript.is_empty());
     }
@@ -44380,18 +44384,18 @@ Full log
         assert!(app.running_job.is_none());
     }
 
-    fn assert_no_background_doctor_block(app: &App, command: &str) {
+    fn assert_no_background_examine_block(app: &App, command: &str) {
         assert!(
             !app.status.contains("already running")
                 && !app.status.contains("still running. Wait for it to finish"),
-            "{command} should not be blocked by a hidden Doctor refresh: {}",
+            "{command} should not be blocked by a hidden Examine refresh: {}",
             app.status
         );
         assert!(
             app.running_job
                 .as_ref()
-                .is_none_or(|job| !matches!(job.kind, super::RunningJobKind::DoctorRefresh)),
-            "{command} should discard hidden Doctor refresh before continuing"
+                .is_none_or(|job| !matches!(job.kind, super::RunningJobKind::ExamineRefresh)),
+            "{command} should discard hidden Examine refresh before continuing"
         );
         assert!(
             app.transcript.is_empty(),
@@ -44404,7 +44408,7 @@ Full log
             return 1;
         }
         [
-            app.doctor_manager.is_some(),
+            app.examine_manager.is_some(),
             app.logs_view.is_some(),
             app.runtime_manager.is_some(),
             app.install_manager.is_some(),
@@ -44447,11 +44451,11 @@ Full log
                 row_count: state.actions.len(),
             });
         }
-        if let Some(state) = app.doctor_manager.as_ref() {
+        if let Some(state) = app.examine_manager.as_ref() {
             return Some(SurfaceSelection {
-                surface: "doctor",
+                surface: "examine",
                 selected: state.selected,
-                row_count: super::doctor_manager_choices().len(),
+                row_count: super::examine_manager_choices().len(),
             });
         }
         if let Some(state) = app.logs_view.as_ref() {
@@ -44594,7 +44598,7 @@ Full log
         if let Some(state) = app.overlay_card.as_ref() {
             return Some(state.detail_scroll);
         }
-        if let Some(state) = app.doctor_manager.as_ref() {
+        if let Some(state) = app.examine_manager.as_ref() {
             return Some(state.detail_scroll);
         }
         if let Some(state) = app.logs_view.as_ref() {

@@ -136,9 +136,9 @@ For `rocm-cli`, the command itself should resolve the managed runtime manifest
 and apply that environment before launching non-PyTorch HIP apps such as
 `llama.cpp`. Users should not have to hand-export these values.
 
-## Doctor And Install UX Recommendations
+## Examine And Install UX Recommendations
 
-`rocm doctor` should detect WSL cheaply and report:
+`rocm examine` should detect WSL cheaply and report:
 
 - `wsl: true`
 - WSL distro/version

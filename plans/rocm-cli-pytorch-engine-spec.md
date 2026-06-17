@@ -330,7 +330,7 @@ Output:
 ### Windows GPU Detection
 - The engine should treat Windows GPU usability as a runtime fact, not an assumption.
 - Detection path:
-  - validate installed driver in `rocm doctor`
+  - validate installed driver in `rocm examine`
   - import `torch`
   - query `torch.cuda.is_available()`
   - inspect device properties through the PyTorch HIP-compatible API surface
@@ -613,7 +613,7 @@ compile = "off"
 ### Product Integration
 - `rocm` TUI can resolve `pytorch` when the user chooses or requests it.
 - `rocmd` can restart a crashed `pytorch` service.
-- `rocm logs` and `rocm doctor` reflect engine state accurately.
+- `rocm logs` and `rocm examine` reflect engine state accurately.
 
 ## Deferred Work
 - embeddings

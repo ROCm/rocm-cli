@@ -16,7 +16,7 @@ records the intended design so it can be reviewed and wired up as a unit.
    `windows-build-and-test` (Windows) jobs publish their per-OS binaries
    (`rocm`, `rocmd`, `rocm-engine-*`) as workflow artifacts.
 2. **Test on dedicated self-hosted runners.** Hardware-test jobs download those
-   exact artifacts and run only the checks hosted runners cannot: `rocm doctor`
+   exact artifacts and run only the checks hosted runners cannot: `rocm examine`
    host/GPU detection, engine `detect`/`capabilities`, the no-CPU-fallback
    smoke (`scripts/smoke_local.py --skip-build`), and the
    `scripts/*_therock_gpu_test.py` end-to-end GPU harnesses.

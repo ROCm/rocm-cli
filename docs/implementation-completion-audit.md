@@ -20,7 +20,7 @@ The branch currently has local implementations for the V1 product surfaces:
 - First-time TUI setup with an arrow-key folder picker, approval cards, live
   setup logs, local pip cache under the selected ROCm install folder, and
   persisted settings under `~/.rocm`.
-- Fast host/GPU checks for setup and Doctor: native Windows registry/system
+- Fast host/GPU checks for setup and Examine: native Windows registry/system
   probes avoid PowerShell/CIM on the common path, native Linux uses sysfs/KFD/IP
   discovery first, and WSL collapses host display lookup to one bridge query
   only when Linux-side sysfs cannot answer.
@@ -30,7 +30,7 @@ The branch currently has local implementations for the V1 product surfaces:
 - Runtime list, activate, uninstall, import, adopt, active-runtime markers, and
   previous-runtime validation. User-facing selection is list-based, not
   rollback-first.
-- Doctor, GPU detection, managed runtime inventory, services inventory, logs,
+- Examine, GPU detection, managed runtime inventory, services inventory, logs,
   update reports, and bounded startup update checks.
 - PyTorch and `llama.cpp` GPU serving with managed TheRock library propagation.
   The `llama.cpp` adapter is backed by upstream `llama-server`.
@@ -123,7 +123,7 @@ python3 scripts/local_assistant_therock_gpu_test.py --self-test
 For WSL/Linux, build and run the native Linux binary directly:
 
 ```bash
-/home/user/rocm-cli-e2e/bin/rocm doctor
+/home/user/rocm-cli-e2e/bin/rocm examine
 python3 scripts/local_assistant_therock_gpu_test.py --rocm /home/user/rocm-cli-e2e/bin/rocm --engine lemonade --model qwen --require-tool-call
 python3 scripts/local_assistant_therock_gpu_test.py --rocm /home/user/rocm-cli-e2e/bin/rocm --engine pytorch --model qwen --require-tool-call
 python3 scripts/comfyui_therock_gpu_test.py --rocm /home/user/rocm-cli-e2e/bin/rocm
