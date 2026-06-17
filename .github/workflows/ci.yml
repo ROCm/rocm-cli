@@ -175,7 +175,7 @@ jobs:
           args: format --check scripts engines
 
       - name: ShellCheck (all optional checks)
-        uses: ludeeus/action-shellcheck@master
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38 # v2.0.0
         env:
           SHELLCHECK_OPTS: --enable=all --exclude=SC2310,SC2312
         with:
@@ -185,7 +185,7 @@ jobs:
       - name: PSScriptAnalyzer
         shell: pwsh
         run: |
-          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -RequiredVersion 1.25.0
           $files = Get-ChildItem -Recurse -Filter *.ps1 |
             Where-Object { $_.FullName -notmatch 'third_party' }
           $findings = $files | ForEach-Object {
