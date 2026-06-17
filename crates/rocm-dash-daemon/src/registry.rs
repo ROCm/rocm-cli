@@ -36,8 +36,9 @@ use rocm_dash_core::metrics::Instance;
 use rocm_dash_core::traits::DiscoveredService;
 use serde::Deserialize;
 
-/// Minimal read-only view of a rocm-cli `ManagedServiceRecord` on disk. Mirrors
-/// the stable subset the scrape seam needs; unknown fields (manifest paths,
+/// Minimal read-only view of a rocm-cli `ManagedServiceRecord` on disk.
+///
+/// Mirrors the stable subset the scrape seam needs; unknown fields (manifest paths,
 /// pids, recipe json, …) are ignored. Every field defaults so partial/older
 /// records still parse.
 #[derive(Debug, Clone, Deserialize)]
@@ -60,9 +61,10 @@ pub struct ServiceRecord {
     pub created_at_unix_ms: u128,
 }
 
-/// Service statuses worth scraping. Matches the live set the rocm-cli supervisor
-/// overlays onto a record (`ready`/`running`/`starting`); a `failed`/`stopped`
-/// record is skipped so we never poll a dead port.
+/// Service statuses worth scraping.
+///
+/// Matches the live set the rocm-cli supervisor overlays onto a record (`ready`/`running`/`starting`);
+/// a `failed`/`stopped` record is skipped so we never poll a dead port.
 pub fn is_scrapeable_status(status: &str) -> bool {
     matches!(
         status.trim().to_ascii_lowercase().as_str(),
@@ -134,8 +136,9 @@ pub fn engine_kind_for(record: &ServiceRecord) -> Option<EngineKind> {
     EngineKind::from_label(&record.engine)
 }
 
-/// The result of turning a batch of registry records into dashboard instances:
-/// the live instances to upsert, their ids (`seen`), and the subset whose engine
+/// The result of turning a batch of registry records into dashboard instances.
+///
+/// Contains the live instances to upsert, their ids (`seen`), and the subset whose engine
 /// is NOT vLLM (`non_vllm`, excluded from the vLLM Prometheus scrape so they are
 /// not mis-parsed). Pure — the runner applies it (upsert/broadcast/Gone-diff).
 #[derive(Debug, Default)]
@@ -145,9 +148,9 @@ pub struct ManagedDiscovery {
     pub non_vllm: HashSet<String>,
 }
 
-/// Convert the loaded registry records into a [`ManagedDiscovery`] — the pure
-/// core of the daemon's managed-service discovery tick. Non-scrapeable records
-/// (bad status / port 0) are dropped; vLLM-engine services flow to the
+/// Convert the loaded registry records into a [`ManagedDiscovery`] — the pure core of the daemon's managed-service discovery tick.
+///
+/// Non-scrapeable records (bad status / port 0) are dropped; vLLM-engine services flow to the
 /// Prometheus scrape, others are flagged in `non_vllm`.
 ///
 /// NOTE: gen_tps for managed **non-vLLM** engines (e.g. Lemonade) is not yet

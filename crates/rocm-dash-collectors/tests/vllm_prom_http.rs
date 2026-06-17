@@ -45,7 +45,7 @@ async fn fetch_async_against_local_mock_server() {
         let _ = sock.shutdown().await;
     });
 
-    let collector = VllmPrometheusCollector::new("127.0.0.1", Duration::from_millis(2000));
+    let collector = VllmPrometheusCollector::new("127.0.0.1", Duration::from_secs(2));
     let svc = DiscoveredService {
         container_id: "test".into(),
         port: Some(port),
@@ -76,7 +76,7 @@ async fn fetch_async_propagates_non_200() {
         let _ = sock.shutdown().await;
     });
 
-    let collector = VllmPrometheusCollector::new("127.0.0.1", Duration::from_millis(2000));
+    let collector = VllmPrometheusCollector::new("127.0.0.1", Duration::from_secs(2));
     let svc = DiscoveredService {
         container_id: "test".into(),
         port: Some(port),

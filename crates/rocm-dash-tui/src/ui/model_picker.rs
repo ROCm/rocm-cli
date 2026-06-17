@@ -87,8 +87,7 @@ impl ModelPicker {
             KeyCode::Enter => self
                 .filtered(recipes)
                 .get(self.selected)
-                .map(|r| PickerOutcome::Chosen((*r).clone()))
-                .unwrap_or(PickerOutcome::None),
+                .map_or(PickerOutcome::None, |r| PickerOutcome::Chosen((*r).clone())),
             KeyCode::Backspace => {
                 self.query.pop();
                 self.selected = 0;
@@ -310,7 +309,7 @@ mod tests {
         term.draw(|f| draw_model_picker(f, f.area(), &p, &rs, &theme))
             .unwrap();
         let buf = term.backend().buffer().clone();
-        let out: String = buf.content().iter().map(|c| c.symbol()).collect();
+        let out: String = buf.content().iter().map(ratatui::buffer::Cell::symbol).collect();
         assert!(out.contains("Pick a model recipe"));
         assert!(out.contains("Qwen3-4B-Instruct"));
         assert!(out.contains("engine"));

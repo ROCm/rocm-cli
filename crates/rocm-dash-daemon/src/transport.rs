@@ -5,6 +5,7 @@ use std::io;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+#[allow(clippy::future_not_send)]
 pub async fn write_line<W, T>(w: &mut W, value: &T) -> io::Result<()>
 where
     W: AsyncWriteExt + Unpin,

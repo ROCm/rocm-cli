@@ -82,6 +82,7 @@ pub fn si(value: f64) -> String {
 }
 
 /// Byte-rate (bytes per second), SI-suffixed: `512/s`, `1.20 k/s`, `1.20 M/s`.
+///
 /// Used for disk and network throughput on the Hardware tab. Reuses [`si`], so
 /// the magnitude suffix (k/M/B) carries the scale and `/s` marks it as a rate;
 /// the unit is bytes-per-second by context (the panel labels say disk / net).
@@ -134,7 +135,7 @@ pub fn duration(seconds: f64) -> String {
 /// Request counter rendered with SI suffix for big numbers and `-` for None.
 pub fn reqs_opt(value: Option<u32>) -> String {
     match value {
-        Some(v) if v >= 1_000 => si(v as f64),
+        Some(v) if v >= 1_000 => si(f64::from(v)),
         Some(v) => v.to_string(),
         None => "-".to_string(),
     }

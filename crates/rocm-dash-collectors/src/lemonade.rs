@@ -56,8 +56,9 @@ pub struct LemonadeHealth {
     pub model_loaded: Option<String>,
 }
 
-/// PURE: parse a `/api/v1/stats` body into an [`InstanceSample`]. Lemonade reports
-/// an instantaneous `tokens_per_second` rate (mapped to `gen_tps`) rather than a
+/// PURE: parse a `/api/v1/stats` body into an [`InstanceSample`].
+///
+/// Lemonade reports an instantaneous `tokens_per_second` rate (mapped to `gen_tps`) rather than a
 /// cumulative counter; it exposes no KV-cache / running / waiting metrics, so
 /// those stay `None`. Malformed/empty JSON → an all-`None` default, never panics.
 pub fn parse_stats(body: &str) -> InstanceSample {
@@ -121,8 +122,9 @@ pub fn lemonade_service(host: &str, port: u16, model_name: &str) -> DiscoveredSe
     }
 }
 
-/// PURE: build a finished `Instance` from a Lemonade `/health` model name + a
-/// `/stats` body — the fixture→Instance anchor (no network). `gen_tps` flows from
+/// PURE: build a finished `Instance` from a Lemonade `/health` model name + a `/stats` body.
+///
+/// This is the fixture→Instance anchor (no network). `gen_tps` flows from
 /// `tokens_per_second`; KV/req fields stay `None` (Lemonade does not report them).
 pub fn lemonade_instance(host: &str, port: u16, model_name: &str, stats_body: &str) -> Instance {
     let svc = lemonade_service(host, port, model_name);

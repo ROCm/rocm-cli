@@ -1,7 +1,8 @@
-//! Pure VRAM attribution helpers. No I/O, no rendering — the `/proc` read and
-//! the amd-smi subprocess that feed these live in the collectors/daemon; here
-//! we only do the math that turns per-process VRAM + device totals into a
-//! per-instance `(used, total)` pair.
+//! Pure VRAM attribution helpers. No I/O, no rendering.
+//!
+//! The `/proc` read and the amd-smi subprocess that feed these live in the
+//! collectors/daemon; here we only do the math that turns per-process VRAM +
+//! device totals into a per-instance `(used, total)` pair.
 //!
 //! The attribution has two paths, in priority order:
 //!  1. **Per-process** — sum the VRAM of the GPU processes that resolve (via an
@@ -58,11 +59,11 @@ pub fn aggregate_process_vram<F: Fn(u32) -> Option<String>>(
 /// `total` is always the device-summed total over `gpu_ids`. `used` is the
 /// per-container value from `per_container_used` when present (the per-process
 /// path) and otherwise the device-summed used over `gpu_ids` (the fallback).
-pub fn resolve_instance_vram(
+pub fn resolve_instance_vram<S: std::hash::BuildHasher>(
     container_id: &str,
     gpu_ids: &[String],
     gpus: &[GpuMetrics],
-    per_container_used: &HashMap<String, u64>,
+    per_container_used: &HashMap<String, u64, S>,
 ) -> (u64, u64) {
     let (device_used, total) = device_vram(gpu_ids, gpus);
     let used = match per_container_used.get(container_id) {

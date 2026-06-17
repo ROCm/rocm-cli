@@ -30,12 +30,14 @@ impl<'a> BrailleSparkline<'a> {
         }
     }
 
+    #[must_use]
     pub fn max(mut self, m: u64) -> Self {
         self.max = m.max(1);
         self
     }
 
-    pub fn style(mut self, s: Style) -> Self {
+    #[must_use]
+    pub const fn style(mut self, s: Style) -> Self {
         self.style = s;
         self
     }
@@ -44,7 +46,8 @@ impl<'a> BrailleSparkline<'a> {
     /// across the gradient (low value = stops[0], peak = stops[2]). When
     /// set, overrides `style.fg` per cell. Leaves `style.fg` as the fallback
     /// for empty/zero cells.
-    pub fn gradient(mut self, start: Color, mid: Color, end: Color) -> Self {
+    #[must_use]
+    pub const fn gradient(mut self, start: Color, mid: Color, end: Color) -> Self {
         self.gradient = Some([start, mid, end]);
         self
     }
@@ -124,7 +127,7 @@ fn lit_dots(value: Option<u64>, max: u64, total_dot_rows: usize, row_top: usize)
 ///     3 ●            6 ●        bits 0x04 / 0x20
 ///     7 ●            8 ●        bits 0x40 / 0x80
 /// ```
-fn braille_char(left: u8, right: u8) -> char {
+const fn braille_char(left: u8, right: u8) -> char {
     let mut code = 0u32;
     if left & 0b0001 != 0 {
         code |= 0x01;

@@ -17,8 +17,9 @@ use rocm_dash_core::state::{JobState, JobStatus, SideEffect, State, StateEvent};
 use crate::ui::modal::{centered_rect, draw_popup_frame};
 use crate::ui::theme::Theme;
 
-/// What a console keypress means to the owning screen. The shared seam every
-/// operational overlay routes its `active_job` keys through, so the
+/// What a console keypress means to the owning screen.
+///
+/// The shared seam every operational overlay routes its `active_job` keys through, so the
 /// Ctrl+C/`q`/Esc-Enter behavior is defined once instead of per screen.
 #[derive(Debug)]
 pub enum ConsoleOutcome {
@@ -45,7 +46,7 @@ pub fn on_console_key(job_id: &str, jobs: &mut State, key: KeyEvent) -> ConsoleO
         // (the job keeps running in the background).
         KeyCode::Char('q') => ConsoleOutcome::Closed,
         KeyCode::Esc | KeyCode::Enter
-            if jobs.job(job_id).map(|j| j.is_terminal()).unwrap_or(true) =>
+            if jobs.job(job_id).is_none_or(rocm_dash_core::state::JobState::is_terminal) =>
         {
             ConsoleOutcome::Dismissed
         }

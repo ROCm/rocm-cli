@@ -113,7 +113,7 @@ async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyho
             }
             (host, daemon_version)
         }
-        Some(other) => return Err(anyhow!("expected Welcome, got {:?}", other)),
+        Some(other) => return Err(anyhow!("expected Welcome, got {other:?}")),
         None => return Err(anyhow!("connection closed before Welcome")),
     };
 

@@ -6,7 +6,7 @@ use rocm_dash_core::traits::{CollectorError, DiscoveredService, Result, ServiceD
 pub struct ProcDiscovery;
 
 impl ProcDiscovery {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 }

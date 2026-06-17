@@ -44,39 +44,39 @@ pub const ACTIONS: &[UpdateAction] = &[
 ];
 
 impl UpdateAction {
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
-            UpdateAction::Check => "Check for updates",
-            UpdateAction::Preview => "Preview the update (dry-run)",
-            UpdateAction::Apply => "Apply the update",
-            UpdateAction::ApplyActivate => "Apply and use as default",
+            Self::Check => "Check for updates",
+            Self::Preview => "Preview the update (dry-run)",
+            Self::Apply => "Apply the update",
+            Self::ApplyActivate => "Apply and use as default",
         }
     }
 
     /// `rocm` argv (after the binary) for this action.
     fn args(self) -> Vec<String> {
         match self {
-            UpdateAction::Check => vec!["update".into()],
-            UpdateAction::Preview => vec!["update".into(), "--apply".into(), "--dry-run".into()],
-            UpdateAction::Apply => vec!["update".into(), "--apply".into()],
-            UpdateAction::ApplyActivate => {
+            Self::Check => vec!["update".into()],
+            Self::Preview => vec!["update".into(), "--apply".into(), "--dry-run".into()],
+            Self::Apply => vec!["update".into(), "--apply".into()],
+            Self::ApplyActivate => {
                 vec!["update".into(), "--apply".into(), "--activate".into()]
             }
         }
     }
 
     /// Whether this action changes the system (and so needs approval).
-    fn is_mutating(self) -> bool {
-        matches!(self, UpdateAction::Apply | UpdateAction::ApplyActivate)
+    const fn is_mutating(self) -> bool {
+        matches!(self, Self::Apply | Self::ApplyActivate)
     }
 
     /// Stable job id (one console per action kind).
     fn job_id(self) -> String {
         match self {
-            UpdateAction::Check => "update-check",
-            UpdateAction::Preview => "update-preview",
-            UpdateAction::Apply => "update-apply",
-            UpdateAction::ApplyActivate => "update-apply-activate",
+            Self::Check => "update-check",
+            Self::Preview => "update-preview",
+            Self::Apply => "update-apply",
+            Self::ApplyActivate => "update-apply-activate",
         }
         .to_string()
     }
@@ -120,7 +120,7 @@ pub fn on_key(
                     return spawn_update(u, jobs, pending.action, pending.cmd);
                 }
             }
-            Some(ApprovalVerdict::Deny) | Some(ApprovalVerdict::Cancel) => u.approval = None,
+            Some(ApprovalVerdict::Deny | ApprovalVerdict::Cancel) => u.approval = None,
             None => {}
         }
         return Vec::new();
@@ -408,7 +408,7 @@ mod tests {
             .buffer()
             .content()
             .iter()
-            .map(|c| c.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(out.contains("Update"));
         assert!(out.contains("Check for updates"));

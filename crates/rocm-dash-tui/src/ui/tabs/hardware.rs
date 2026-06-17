@@ -35,23 +35,20 @@ const GPU_HEADER_H: u16 = 1;
 const FULL_PANEL_MIN_H: u16 = 6;
 
 pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let snap = match state.latest.as_ref() {
-        Some(s) => s,
-        None => {
-            let p = Paragraph::new(Line::from(Span::styled(
-                "waiting for first snapshot…",
-                Style::default().fg(theme.muted),
-            )))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Hardware ")
-                    .border_style(theme.border_style())
-                    .title_style(theme.title_style()),
-            );
-            f.render_widget(p, area);
-            return;
-        }
+    let Some(snap) = state.latest.as_ref() else {
+        let p = Paragraph::new(Line::from(Span::styled(
+            "waiting for first snapshot…",
+            Style::default().fg(theme.muted),
+        )))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Hardware ")
+                .border_style(theme.border_style())
+                .title_style(theme.title_style()),
+        );
+        f.render_widget(p, area);
+        return;
     };
 
     let rows = Layout::default()
@@ -240,16 +237,16 @@ fn draw_gauge_block(
 
 fn draw_gpus(f: &mut Frame, area: Rect, state: &AppState, snap: &Snapshot, theme: &Theme) {
     if snap.gpus.is_empty() {
-        let lines: Vec<Line> = if !snap.warnings.is_empty() {
-            snap.warnings
-                .iter()
-                .map(|w| Line::from(Span::styled(w.clone(), Style::default().fg(theme.warn))))
-                .collect()
-        } else {
+        let lines: Vec<Line> = if snap.warnings.is_empty() {
             vec![Line::from(Span::styled(
                 "no GPUs reported",
                 Style::default().fg(theme.muted),
             ))]
+        } else {
+            snap.warnings
+                .iter()
+                .map(|w| Line::from(Span::styled(w.clone(), Style::default().fg(theme.warn))))
+                .collect()
         };
         let p = Paragraph::new(lines).block(
             Block::default()
@@ -311,7 +308,7 @@ fn gpu_section_header(snap: &Snapshot, theme: &Theme) -> Line<'static> {
             ));
         }
     }
-    let total_power: f64 = snap.gpus.iter().map(|g| g.power_w as f64).sum();
+    let total_power: f64 = snap.gpus.iter().map(|g| f64::from(g.power_w)).sum();
     spans.push(Span::styled(
         format!("  ·  {:.1} kW", total_power / 1000.0),
         Style::default().fg(theme.fg),
@@ -346,6 +343,7 @@ fn plan_gpu_rows(section_h: u16, n: usize) -> (bool, usize) {
 }
 
 /// Visible compact-row count for the Hardware tab given the full body height.
+///
 /// Used by `AppState` to keep `gpu_scroll` in sync on navigation. Accounts for
 /// both the rows above the GPU section and the section's own header row.
 pub fn gpu_visible_count(body_h: u16, n: usize) -> usize {
@@ -360,7 +358,7 @@ pub fn gpu_visible_count(body_h: u16, n: usize) -> usize {
 
 /// Advance/clamp a scroll offset so index `sel` lies within
 /// `[scroll, scroll + visible)`.
-pub fn scroll_to_show(sel: usize, scroll: usize, visible: usize) -> usize {
+pub const fn scroll_to_show(sel: usize, scroll: usize, visible: usize) -> usize {
     if visible == 0 {
         0
     } else if sel < scroll {
@@ -672,27 +670,25 @@ fn detail_now_line(g: &GpuMetrics, theme: &Theme) -> Line<'static> {
     ])
 }
 
-/// Full-screen detail for the currently-selected GPU. Pulls per-tick samples
-/// out of `state.history` to build a metric × time heatmap (util, temp,
+/// Full-screen detail for the currently-selected GPU.
+///
+/// Pulls per-tick samples out of `state.history` to build a metric × time heatmap (util, temp,
 /// power, vram%) alongside a summary header and a footer hint.
 pub fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     use crate::ui::heatmap::{Heatmap, HeatmapRow};
     use crate::ui::modal::{centered_rect, draw_popup_frame};
 
     let popup = centered_rect(85, 85, 140, 32, area);
-    let snap = match state.latest.as_ref() {
-        Some(s) => s,
-        None => {
-            let inner = draw_popup_frame(f, popup, "GPU detail", theme);
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    "no snapshot yet",
-                    Style::default().fg(theme.muted),
-                ))),
-                inner,
-            );
-            return;
-        }
+    let Some(snap) = state.latest.as_ref() else {
+        let inner = draw_popup_frame(f, popup, "GPU detail", theme);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "no snapshot yet",
+                Style::default().fg(theme.muted),
+            ))),
+            inner,
+        );
+        return;
     };
     if snap.gpus.is_empty() {
         let inner = draw_popup_frame(f, popup, "GPU detail", theme);
@@ -729,7 +725,7 @@ pub fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .split(inner);
 
     let sysinfo = snap.gpu_system_info.as_ref();
-    let model = sysinfo.map(|si| si.gpu_model.as_str()).unwrap_or("?");
+    let model = sysinfo.map_or("?", |si| si.gpu_model.as_str());
     let rocm = sysinfo
         .and_then(|si| si.rocm_version.as_deref())
         .unwrap_or("?");
@@ -779,15 +775,15 @@ pub fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let history = &state.history;
     let util: Vec<f64> = history
         .iter()
-        .filter_map(|s| s.gpus.get(i).map(|gpu| gpu.gpu_utilization_pct as f64))
+        .filter_map(|s| s.gpus.get(i).map(|gpu| f64::from(gpu.gpu_utilization_pct)))
         .collect();
     let temp: Vec<f64> = history
         .iter()
-        .filter_map(|s| s.gpus.get(i).map(|gpu| gpu.temperature_c as f64))
+        .filter_map(|s| s.gpus.get(i).map(|gpu| f64::from(gpu.temperature_c)))
         .collect();
     let power: Vec<f64> = history
         .iter()
-        .filter_map(|s| s.gpus.get(i).map(|gpu| gpu.power_w as f64))
+        .filter_map(|s| s.gpus.get(i).map(|gpu| f64::from(gpu.power_w)))
         .collect();
     let vram: Vec<f64> = history
         .iter()
@@ -806,7 +802,7 @@ pub fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // "near the limit", not "near the largest value seen this session". The
     // row still grows if telemetry ever exceeds the redline.
     let max_temp = semantic_max(HEATMAP_TEMP_MAX_C, &temp);
-    let max_power = semantic_max(POWER_CRIT_W as f64, &power);
+    let max_power = semantic_max(f64::from(POWER_CRIT_W), &power);
     let rows_vec = vec![
         HeatmapRow::new("util %", util, 100.0).stops(theme.ok, theme.warn, theme.err),
         HeatmapRow::new("temp °C", temp, max_temp).stops(theme.ok, theme.warn, theme.err),
@@ -846,7 +842,7 @@ mod tests {
         term.draw(|f| draw(f, f.area(), state, &state.theme))
             .unwrap();
         let buf = term.backend().buffer().clone();
-        buf.content().iter().map(|c| c.symbol()).collect()
+        buf.content().iter().map(ratatui::buffer::Cell::symbol).collect()
     }
 
     fn state_with_snapshot(snap: Snapshot) -> AppState {
@@ -974,7 +970,7 @@ mod tests {
             .iter()
             .find(|s| s.content.contains("°C"))
             .unwrap();
-        let pow_span = line.spans.iter().find(|s| s.content.contains("W")).unwrap();
+        let pow_span = line.spans.iter().find(|s| s.content.contains('W')).unwrap();
         assert_eq!(temp_span.style.fg, Some(theme.err));
         assert_eq!(pow_span.style.fg, Some(theme.err));
         // wide → vram segment included
@@ -1016,17 +1012,18 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn semantic_max_uses_floor_then_grows() {
         // all temps below the redline → max is the semantic floor
         assert_eq!(semantic_max(HEATMAP_TEMP_MAX_C, &[60.0, 78.0, 95.0]), 100.0);
         // an observed value above the floor wins
         assert_eq!(semantic_max(HEATMAP_TEMP_MAX_C, &[60.0, 110.0]), 110.0);
         // power: below critical → floor (POWER_CRIT_W)
-        assert_eq!(semantic_max(POWER_CRIT_W as f64, &[400.0, 690.0]), 700.0);
+        assert_eq!(semantic_max(f64::from(POWER_CRIT_W), &[400.0, 690.0]), 700.0);
         // power: above critical → observed
-        assert_eq!(semantic_max(POWER_CRIT_W as f64, &[400.0, 760.0]), 760.0);
+        assert_eq!(semantic_max(f64::from(POWER_CRIT_W), &[400.0, 760.0]), 760.0);
         // empty data → floor
-        assert_eq!(semantic_max(POWER_CRIT_W as f64, &[]), 700.0);
+        assert_eq!(semantic_max(f64::from(POWER_CRIT_W), &[]), 700.0);
     }
 
     #[test]
@@ -1078,7 +1075,7 @@ mod tests {
         term.draw(|f| draw_detail(f, f.area(), &s, &s.theme))
             .unwrap();
         let buf = term.backend().buffer().clone();
-        let out: String = buf.content().iter().map(|c| c.symbol()).collect();
+        let out: String = buf.content().iter().map(ratatui::buffer::Cell::symbol).collect();
         assert!(out.contains("detail"), "missing detail title: {out:?}");
         assert!(out.contains("power W"), "missing power heatmap row");
     }
@@ -1091,7 +1088,7 @@ mod tests {
         rocm_dash_core::metrics::Instance {
             container_name: name.into(),
             model_name: name.into(),
-            gpu_ids: gpu_ids.iter().map(|s| s.to_string()).collect(),
+            gpu_ids: gpu_ids.iter().map(std::string::ToString::to_string).collect(),
             gen_tps,
             ..Default::default()
         }

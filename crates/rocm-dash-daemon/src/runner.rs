@@ -143,15 +143,12 @@ pub async fn run_loop(
     });
 
     let docker = if opts.enable_docker {
-        match DockerDiscovery::detect(opts.image_patterns.clone()).await {
-            Some(d) => {
-                info!("docker discovery enabled");
-                Some(d)
-            }
-            None => {
-                warn!("docker discovery requested but daemon unreachable; disabled");
-                None
-            }
+        if let Some(d) = DockerDiscovery::detect(opts.image_patterns.clone()).await {
+            info!("docker discovery enabled");
+            Some(d)
+        } else {
+            warn!("docker discovery requested but daemon unreachable; disabled");
+            None
         }
     } else {
         None
@@ -192,18 +189,15 @@ pub async fn run_loop(
         tick_count += 1;
 
         let mut warnings = Vec::new();
-        let gpus = match &gpu {
-            Some(g) => match g.metrics().await {
-                Ok(v) => v,
-                Err(e) => {
-                    warnings.push(format!("amd-smi metric: {e}"));
-                    Vec::new()
-                }
-            },
-            None => {
-                warnings.push("amd-smi unavailable (no /dev/kfd or binary missing)".into());
+        let gpus = if let Some(g) = &gpu { match g.metrics().await {
+            Ok(v) => v,
+            Err(e) => {
+                warnings.push(format!("amd-smi metric: {e}"));
                 Vec::new()
             }
+        } } else {
+            warnings.push("amd-smi unavailable (no /dev/kfd or binary missing)".into());
+            Vec::new()
         };
 
         if gpu.is_some()
@@ -686,7 +680,7 @@ mod tests {
     fn inst(container_id: &str, gpu_ids: &[&str]) -> Instance {
         Instance {
             container_id: container_id.into(),
-            gpu_ids: gpu_ids.iter().map(|s| s.to_string()).collect(),
+            gpu_ids: gpu_ids.iter().map(std::string::ToString::to_string).collect(),
             ..Instance::default()
         }
     }

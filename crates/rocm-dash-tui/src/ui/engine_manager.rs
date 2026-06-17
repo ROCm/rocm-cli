@@ -62,24 +62,24 @@ pub enum EngineAction {
 }
 
 impl EngineAction {
-    pub fn verb(self) -> &'static str {
+    pub const fn verb(self) -> &'static str {
         match self {
-            EngineAction::Use => "use",
-            EngineAction::Install => "install",
-            EngineAction::Reinstall => "reinstall",
+            Self::Use => "use",
+            Self::Install => "install",
+            Self::Reinstall => "reinstall",
         }
     }
 
     /// The `rocm` argv (after the binary) for this action on `engine`.
     fn args(self, engine: &str) -> Vec<String> {
         match self {
-            EngineAction::Use => vec![
+            Self::Use => vec![
                 "config".into(),
                 "set-default-engine".into(),
                 engine.to_string(),
             ],
-            EngineAction::Install => vec!["engines".into(), "install".into(), engine.to_string()],
-            EngineAction::Reinstall => vec![
+            Self::Install => vec!["engines".into(), "install".into(), engine.to_string()],
+            Self::Reinstall => vec![
                 "engines".into(),
                 "install".into(),
                 engine.to_string(),
@@ -129,7 +129,7 @@ pub fn on_key(
                     return spawn_engine_op(em, jobs, pending);
                 }
             }
-            Some(ApprovalVerdict::Deny) | Some(ApprovalVerdict::Cancel) => em.approval = None,
+            Some(ApprovalVerdict::Deny | ApprovalVerdict::Cancel) => em.approval = None,
             None => {}
         }
         return Vec::new();
@@ -440,7 +440,7 @@ mod tests {
         term.draw(|f| draw_engine_manager(f, f.area(), em, jobs, &theme))
             .unwrap();
         let buf = term.backend().buffer().clone();
-        buf.content().iter().map(|c| c.symbol()).collect()
+        buf.content().iter().map(ratatui::buffer::Cell::symbol).collect()
     }
 
     #[test]

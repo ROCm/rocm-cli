@@ -40,12 +40,12 @@ impl Step {
     /// One-line, human-readable rendering for a plan.
     pub fn describe(&self) -> String {
         match self {
-            Step::Check { command } => format!("check: {command}"),
-            Step::Run { cmd, args } => format!("run: {cmd} {}", args.join(" "))
+            Self::Check { command } => format!("check: {command}"),
+            Self::Run { cmd, args } => format!("run: {cmd} {}", args.join(" "))
                 .trim_end()
                 .to_string(),
-            Step::Download { url, dest } => format!("download: {url} -> {dest}"),
-            Step::WriteConfig { key, value } => format!("write-config: {key} = {value}"),
+            Self::Download { url, dest } => format!("download: {url} -> {dest}"),
+            Self::WriteConfig { key, value } => format!("write-config: {key} = {value}"),
         }
     }
 }
@@ -126,8 +126,9 @@ pub fn build_plan(m: &SkillManifest) -> Vec<String> {
 // manifests in the user skills dir; discovery merges them in (in the binary).
 // ---------------------------------------------------------------------------
 
-/// install-lemonade: install AMD's Lemonade local LLM server from the official
-/// **embeddable SDK** release (the `lemond` server + `lemonade` CLI), not pip.
+/// install-lemonade: install AMD's Lemonade local LLM server from the official **embeddable SDK** release.
+///
+/// Installs the `lemond` server + `lemonade` CLI, not pip.
 /// The real apply path is special-cased + `--apply`-gated in the binary
 /// (`apply_install_lemonade`): it queries the latest GitHub release, picks the
 /// per-OS embeddable archive, downloads + extracts it into a rocm-owned dir, and
@@ -162,8 +163,9 @@ key = "default_engine"
 value = "lemonade"
 "#;
 
-/// auto-config-endpoint: detect a running local LLM endpoint (Lemonade/vLLM) and
-/// set `default_engine` for `serve`. Chat keeps the user's configured backend
+/// auto-config-endpoint: detect a running local LLM endpoint (Lemonade/vLLM) and set `default_engine` for `serve`.
+///
+/// Chat keeps the user's configured backend
 /// (e.g. the LLM gateway); `tui.chat_url` is filled only when it is unset.
 pub const AUTO_CONFIG_ENDPOINT_TOML: &str = r#"
 name = "auto-config-endpoint"
@@ -303,8 +305,9 @@ pub fn embeddable_artifact(os: &str, arch: &str, version: &str) -> Option<Embedd
     })
 }
 
-/// PURE: pick the embeddable asset from a GitHub `releases/latest` JSON body for
-/// the host `(os, arch)`. Reads `tag_name` + `assets[].{name, browser_download_url}`
+/// PURE: pick the embeddable asset from a GitHub `releases/latest` JSON body for the host `(os, arch)`.
+///
+/// Reads `tag_name` + `assets[].{name, browser_download_url}`
 /// and matches the `lemonade-embeddable-*-<os-arch>.<ext>` asset, skipping the
 /// `.pkg`/`.rpm`/`.msi` decoys. Returns `None` for an unsupported triple, malformed
 /// JSON, or a missing asset/url. Never panics. The release publishes no checksum
@@ -360,7 +363,7 @@ pub struct AutoConfigPlan {
 
 impl AutoConfigPlan {
     /// True when applying this plan would write nothing.
-    pub fn is_noop(&self) -> bool {
+    pub const fn is_noop(&self) -> bool {
         self.set_chat_url.is_none() && self.set_default_engine.is_none()
     }
 }

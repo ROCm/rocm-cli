@@ -13,6 +13,7 @@ pub enum PassFail {
 }
 
 /// The canonical row from a benchmark run.
+///
 /// Fields are a superset of the 30-col CSV from `csv_emitter.py` plus the expanded fields
 /// from `normalize-results.py`. Optional where upstream sets defaults from `UNKNOWN_DEFAULTS`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

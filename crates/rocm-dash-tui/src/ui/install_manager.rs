@@ -94,8 +94,8 @@ impl InstallManagerState {
     }
 
     fn move_field(&mut self, delta: isize) {
-        let max = FIELDS.len() as isize - 1;
-        self.field = (self.field as isize + delta).clamp(0, max) as usize;
+        let max = FIELDS.len().cast_signed() - 1;
+        self.field = (self.field.cast_signed() + delta).clamp(0, max) as usize;
     }
 
     fn cycle(&mut self) {
@@ -187,7 +187,7 @@ pub fn on_key(
                     return spawn_install(i, jobs, pending.cmd, pending.args);
                 }
             }
-            Some(ApprovalVerdict::Deny) | Some(ApprovalVerdict::Cancel) => i.approval = None,
+            Some(ApprovalVerdict::Deny | ApprovalVerdict::Cancel) => i.approval = None,
             None => {}
         }
         return Vec::new();
@@ -596,7 +596,7 @@ mod tests {
             .buffer()
             .content()
             .iter()
-            .map(|c| c.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(out.contains("Install"));
         assert!(out.contains("Channel"));

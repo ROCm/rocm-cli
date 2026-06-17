@@ -51,17 +51,17 @@ pub enum AutomationAction {
 }
 
 impl AutomationAction {
-    fn verb(self) -> &'static str {
+    const fn verb(self) -> &'static str {
         match self {
-            AutomationAction::Enable => "enable",
-            AutomationAction::Disable => "disable",
+            Self::Enable => "enable",
+            Self::Disable => "disable",
         }
     }
 
-    fn job_id(self) -> &'static str {
+    const fn job_id(self) -> &'static str {
         match self {
-            AutomationAction::Enable => "automations-enable",
-            AutomationAction::Disable => "automations-disable",
+            Self::Enable => "automations-enable",
+            Self::Disable => "automations-disable",
         }
     }
 }
@@ -107,7 +107,7 @@ pub fn on_key(
                     return spawn_toggle(a, jobs, pending.action, pending.cmd, pending.args);
                 }
             }
-            Some(ApprovalVerdict::Deny) | Some(ApprovalVerdict::Cancel) => a.approval = None,
+            Some(ApprovalVerdict::Deny | ApprovalVerdict::Cancel) => a.approval = None,
             None => {}
         }
         return Vec::new();
@@ -520,7 +520,7 @@ mod tests {
             .buffer()
             .content()
             .iter()
-            .map(|c| c.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(out.contains("Automations"));
         assert!(out.contains("therock-update"));

@@ -121,7 +121,7 @@ pub fn parse_metrics(v: &Value) -> Vec<GpuMetrics> {
     };
     gpus.iter()
         .map(|g| {
-            let id = g.get("gpu").and_then(|x| x.as_u64()).unwrap_or(0);
+            let id = g.get("gpu").and_then(serde_json::Value::as_u64).unwrap_or(0);
             // Prefer hotspot — edge is N/A on MI300X SR-IOV.
             let temperature_c = val_f32(nested(g, &["temperature", "hotspot", "value"]))
                 .or_else(|| val_f32(nested(g, &["temperature", "edge", "value"])))
@@ -212,7 +212,7 @@ pub fn parse_processes(v: &Value) -> Vec<GpuProcess> {
 
     let mut out = Vec::new();
     for g in entries {
-        let id = g.get("gpu").and_then(|x| x.as_u64()).unwrap_or(0);
+        let id = g.get("gpu").and_then(serde_json::Value::as_u64).unwrap_or(0);
         let device_id = format!("gpu-{id}");
         let plist = g
             .get("process_list")
@@ -267,9 +267,7 @@ pub fn parse_system_info(
             info.gpu_model = nested(first, &["asic", "market_name"])
                 .and_then(|x| x.as_str())
                 .filter(|s| *s != "N/A")
-                .or_else(|| nested(first, &["board", "product_name"]).and_then(|x| x.as_str()))
-                .map(str::to_owned)
-                .unwrap_or_else(|| "Unknown".into());
+                .or_else(|| nested(first, &["board", "product_name"]).and_then(|x| x.as_str())).map_or_else(|| "Unknown".into(), str::to_owned);
         }
     }
 
@@ -343,13 +341,14 @@ mod tests {
         let g = &m[0];
         assert_eq!(g.device_id, "gpu-0");
         assert_eq!(g.vram_used_mb, 1234);
-        assert_eq!(g.vram_total_mb, 196608);
+        assert_eq!(g.vram_total_mb, 196_608);
         assert!((g.gpu_utilization_pct - 42.5).abs() < 0.01);
         assert!((g.temperature_c - 68.0).abs() < 0.01);
         assert!((g.power_w - 410.5).abs() < 0.01);
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn missing_fields_default_safely() {
         let v: Value = serde_json::from_str(r#"{ "gpu_data": [ { "gpu": 7 } ] }"#).unwrap();
         let m = parse_metrics(&v);

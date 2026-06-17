@@ -58,7 +58,7 @@ pub fn power_style(w: f32, theme: &Theme) -> Style {
 /// Trailing run of ASCII digits in `s` (e.g. `"gpu-3"` → `"3"`, `"3"` → `"3"`).
 /// Returns `None` when `s` has no trailing digits.
 fn trailing_digits(s: &str) -> Option<&str> {
-    let start = s.len() - s.chars().rev().take_while(|c| c.is_ascii_digit()).count();
+    let start = s.len() - s.chars().rev().take_while(char::is_ascii_digit).count();
     if start == s.len() {
         None
     } else {
@@ -87,13 +87,14 @@ pub fn instances_on_gpu<'a>(device_id: &str, instances: &'a [Instance]) -> Vec<&
         .collect()
 }
 
-/// Node-level energy efficiency: total generation throughput divided by total
-/// board power, in tokens per watt. `None` when there is no traffic
+/// Node-level energy efficiency: total generation throughput divided by total board power, in tokens per watt.
+///
+/// `None` when there is no traffic
 /// (`sum gen_tps == 0`) or no power telemetry (`sum power_w == 0`), or when the
 /// result is non-finite.
 pub fn node_efficiency(snap: &Snapshot) -> Option<f64> {
     let tps: f64 = snap.instances.iter().filter_map(|i| i.gen_tps).sum();
-    let power: f64 = snap.gpus.iter().map(|g| g.power_w as f64).sum();
+    let power: f64 = snap.gpus.iter().map(|g| f64::from(g.power_w)).sum();
     if tps > 0.0 && power > 0.0 {
         let eff = tps / power;
         eff.is_finite().then_some(eff)
@@ -140,7 +141,7 @@ mod tests {
         Instance {
             container_name: name.into(),
             model_name: name.into(),
-            gpu_ids: gpu_ids.iter().map(|s| s.to_string()).collect(),
+            gpu_ids: gpu_ids.iter().map(std::string::ToString::to_string).collect(),
             gen_tps,
             ..Default::default()
         }

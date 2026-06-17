@@ -47,9 +47,9 @@ async fn run_unix(path: PathBuf, opts: RunnerOptions) -> anyhow::Result<()> {
     use tokio::net::UnixListener;
 
     if path.exists() {
-        std::fs::remove_file(&path).with_context(|| format!("removing stale socket {path:?}"))?;
+        std::fs::remove_file(&path).with_context(|| format!("removing stale socket {}", path.display()))?;
     }
-    let listener = UnixListener::bind(&path).with_context(|| format!("binding {path:?}"))?;
+    let listener = UnixListener::bind(&path).with_context(|| format!("binding {}", path.display()))?;
     info!(socket = %path.display(), "listening");
 
     let (snap_tx, _) = broadcast::channel::<Event>(BROADCAST_CAP);

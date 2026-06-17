@@ -40,7 +40,8 @@ impl HeatmapRow {
         }
     }
 
-    pub fn stops(mut self, start: Color, mid: Color, end: Color) -> Self {
+    #[must_use]
+    pub const fn stops(mut self, start: Color, mid: Color, end: Color) -> Self {
         self.stops = Some([start, mid, end]);
         self
     }
@@ -78,22 +79,26 @@ impl<'a> Heatmap<'a> {
         }
     }
 
-    pub fn stops(mut self, start: Color, mid: Color, end: Color) -> Self {
+    #[must_use]
+    pub const fn stops(mut self, start: Color, mid: Color, end: Color) -> Self {
         self.stops = [start, mid, end];
         self
     }
 
-    pub fn track_bg(mut self, c: Color) -> Self {
+    #[must_use]
+    pub const fn track_bg(mut self, c: Color) -> Self {
         self.track_bg = c;
         self
     }
 
-    pub fn label_style(mut self, s: Style) -> Self {
+    #[must_use]
+    pub const fn label_style(mut self, s: Style) -> Self {
         self.label_style = s;
         self
     }
 
-    pub fn label_width(mut self, w: u16) -> Self {
+    #[must_use]
+    pub const fn label_width(mut self, w: u16) -> Self {
         self.label_width = w;
         self
     }

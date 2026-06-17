@@ -62,6 +62,7 @@ pub fn draw_popup_frame(f: &mut Frame, area: Rect, title: &str, theme: &Theme) -
 }
 
 /// Shared chrome: a titled popup whose body is a scrollable block of `lines`.
+///
 /// Centralizes the `draw_modal_*` pattern so operational screens don't rebuild
 /// it (Phase 3 Wave 0). `scroll` is the first visible line offset.
 pub fn draw_scrollable_lines(
@@ -336,9 +337,9 @@ pub fn draw_theme_preview(f: &mut Frame, area: Rect, preview_theme: &Theme, acti
     // preview is visually rich and stable.
     let data: Vec<u64> = (0..rows[2].width as usize)
         .map(|i| {
-            let t = i as f64 / rows[2].width.max(1) as f64;
+            let t = i as f64 / f64::from(rows[2].width.max(1));
             // Two-bump curve so the gradient sweeps through all three stops.
-            let v = ((t * std::f64::consts::PI * 2.0).sin() * 40.0 + 60.0).max(2.0);
+            let v = (t * std::f64::consts::PI * 2.0).sin().mul_add(40.0, 60.0).max(2.0);
             v as u64
         })
         .collect();

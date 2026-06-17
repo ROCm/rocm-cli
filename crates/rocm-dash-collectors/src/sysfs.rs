@@ -7,7 +7,7 @@ use rocm_dash_core::traits::{CollectorError, GpuCollector, GpuDevice, GpuProcess
 pub struct SysfsGpuCollector;
 
 impl SysfsGpuCollector {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 }

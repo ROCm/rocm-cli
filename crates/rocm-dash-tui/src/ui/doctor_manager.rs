@@ -44,7 +44,7 @@ pub fn on_key(
             ConsoleOutcome::Unhandled => {
                 // `r` re-runs after a terminal result.
                 if key.code == KeyCode::Char('r')
-                    && jobs.job(&job_id).map(|j| j.is_terminal()).unwrap_or(true)
+                    && jobs.job(&job_id).is_none_or(rocm_dash_core::state::JobState::is_terminal)
                 {
                     d.active_job = None;
                     return run_doctor(d, jobs);
@@ -233,7 +233,7 @@ mod tests {
             .buffer()
             .content()
             .iter()
-            .map(|c| c.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(out.contains("Doctor"));
         assert!(out.contains("rocm doctor"));

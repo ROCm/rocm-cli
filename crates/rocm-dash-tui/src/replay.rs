@@ -195,7 +195,7 @@ async fn run(
                 break;
             }
             tokio::select! {
-                _ = tokio::time::sleep_until(target) => break,
+                () = tokio::time::sleep_until(target) => break,
                 maybe = ctl.recv() => match maybe {
                     Some(c) => {
                         let jumped = handle_control(c, &mut paused, &mut speed, &mut cursor,
@@ -450,6 +450,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn next_speed_walks_steps_and_caps_at_max() {
         assert_eq!(next_speed(0.25), 0.5);
         assert_eq!(next_speed(1.0), 2.0);
@@ -458,6 +459,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn prev_speed_walks_steps_and_floors_at_min() {
         assert_eq!(prev_speed(8.0), 4.0);
         assert_eq!(prev_speed(0.25), 0.25);
@@ -563,7 +565,7 @@ mod tests {
                     saw_seek = true;
                     break;
                 }
-                Ok(Some(_)) => continue,
+                Ok(Some(_)) => {}
                 _ => break,
             }
         }
@@ -612,7 +614,7 @@ mod tests {
                     saw_seek = true;
                     break;
                 }
-                Ok(Some(_)) => continue,
+                Ok(Some(_)) => {}
                 _ => break,
             }
         }

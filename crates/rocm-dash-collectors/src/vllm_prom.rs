@@ -27,7 +27,7 @@ pub struct VllmPrometheusCollector {
 
 impl Default for VllmPrometheusCollector {
     fn default() -> Self {
-        Self::new("127.0.0.1", Duration::from_millis(2000))
+        Self::new("127.0.0.1", Duration::from_secs(2))
     }
 }
 
@@ -163,7 +163,7 @@ vllm:generation_tokens_total{model=\"deepseek-r1\"} 1234567.0
         assert_eq!(s.waiting_reqs, Some(3));
         let kv = s.kv_cache_usage_pct.unwrap();
         assert!((kv - 42.31).abs() < 0.01, "kv was {kv}");
-        assert_eq!(s.gen_tokens_total, Some(1234567.0));
+        assert_eq!(s.gen_tokens_total, Some(1_234_567.0));
     }
 
     #[test]

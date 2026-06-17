@@ -1,5 +1,6 @@
-//! Engine registry seam — one place that maps a discovered serving engine to its
-//! per-engine sample parser, so the daemon can pick a backend per service instead
+//! Engine registry seam — one place that maps a discovered serving engine to its per-engine sample parser.
+//!
+//! The daemon can pick a backend per service instead
 //! of hard-coding vLLM. The existing vLLM Prometheus parser
 //! (`vllm_prom::parse`) is reachable through this seam **unchanged**; Lemonade
 //! adds a second parser. This is a focused seam, not a rewrite.
@@ -20,11 +21,11 @@ pub enum EngineKind {
 
 impl EngineKind {
     /// Stable lowercase label (matches `rocm engines` / config engine names).
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
-            EngineKind::Vllm => "vllm",
-            EngineKind::Lemonade => "lemonade",
-            EngineKind::LlamaCpp => "llama.cpp",
+            Self::Vllm => "vllm",
+            Self::Lemonade => "lemonade",
+            Self::LlamaCpp => "llama.cpp",
         }
     }
 
@@ -32,11 +33,11 @@ impl EngineKind {
     /// services the bound port comes from the registry
     /// (`ManagedServiceRecord.port`); this default is used only for
     /// unmanaged/external discovery where no registry record exists.
-    pub fn default_port(self) -> u16 {
+    pub const fn default_port(self) -> u16 {
         match self {
-            EngineKind::Vllm => 8000,
-            EngineKind::Lemonade => crate::lemonade::LEMONADE_PORT, // 13305
-            EngineKind::LlamaCpp => 8080,
+            Self::Vllm => 8000,
+            Self::Lemonade => crate::lemonade::LEMONADE_PORT, // 13305
+            Self::LlamaCpp => 8080,
         }
     }
 
@@ -44,9 +45,9 @@ impl EngineKind {
     /// accepts the `llama.cpp` / `llamacpp` / `llama_cpp` spellings.
     pub fn from_label(label: &str) -> Option<Self> {
         match label.trim().to_ascii_lowercase().as_str() {
-            "vllm" => Some(EngineKind::Vllm),
-            "lemonade" => Some(EngineKind::Lemonade),
-            "llama.cpp" | "llamacpp" | "llama_cpp" => Some(EngineKind::LlamaCpp),
+            "vllm" => Some(Self::Vllm),
+            "lemonade" => Some(Self::Lemonade),
+            "llama.cpp" | "llamacpp" | "llama_cpp" => Some(Self::LlamaCpp),
             _ => None,
         }
     }
@@ -57,9 +58,9 @@ impl EngineKind {
     /// return an empty sample (never panic).
     pub fn parse_sample(self, body: &str) -> InstanceSample {
         match self {
-            EngineKind::Vllm => crate::vllm_prom::parse(body),
-            EngineKind::Lemonade => crate::lemonade::parse_stats(body),
-            EngineKind::LlamaCpp => InstanceSample::default(),
+            Self::Vllm => crate::vllm_prom::parse(body),
+            Self::Lemonade => crate::lemonade::parse_stats(body),
+            Self::LlamaCpp => InstanceSample::default(),
         }
     }
 }

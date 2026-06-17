@@ -132,8 +132,8 @@ impl ServeWizardState {
     }
 
     fn move_field(&mut self, delta: isize) {
-        let max = FIELDS.len() as isize - 1;
-        self.field = (self.field as isize + delta).clamp(0, max) as usize;
+        let max = FIELDS.len().cast_signed() - 1;
+        self.field = (self.field.cast_signed() + delta).clamp(0, max) as usize;
     }
 
     fn cycle(&mut self, delta: isize) {
@@ -212,16 +212,17 @@ impl ServeWizardState {
     }
 }
 
-fn cycle_idx(cur: usize, len: usize, delta: isize) -> usize {
+const fn cycle_idx(cur: usize, len: usize, delta: isize) -> usize {
     if len == 0 {
         return 0;
     }
-    let n = len as isize;
-    (((cur as isize + delta) % n + n) % n) as usize
+    let n = len.cast_signed();
+    (((cur.cast_signed() + delta) % n + n) % n) as usize
 }
 
-/// Handle a key while the wizard is open. Mirrors the services-manager seam:
-/// mutates the overlay + job model in place and returns reducer side effects
+/// Handle a key while the wizard is open.
+///
+/// Mirrors the services-manager seam: mutates the overlay + job model in place and returns reducer side effects
 /// (e.g. `SpawnJob`) for the event loop to drive through the job-bridge.
 pub fn on_key(
     wizard: &mut Option<ServeWizardState>,
@@ -276,7 +277,7 @@ pub fn on_key(
                     return spawn_serve(w, jobs, pending);
                 }
             }
-            Some(ApprovalVerdict::Deny) | Some(ApprovalVerdict::Cancel) => w.approval = None,
+            Some(ApprovalVerdict::Deny | ApprovalVerdict::Cancel) => w.approval = None,
             None => {}
         }
         return Vec::new();
@@ -929,7 +930,7 @@ mod tests {
         term.draw(|f| draw_serve_wizard(f, f.area(), w, jobs, &[], &theme))
             .unwrap();
         let buf = term.backend().buffer().clone();
-        buf.content().iter().map(|c| c.symbol()).collect()
+        buf.content().iter().map(ratatui::buffer::Cell::symbol).collect()
     }
 
     #[test]

@@ -84,7 +84,7 @@ pub fn on_key(
                     return spawn_command(c, jobs, pending.cmd, pending.args);
                 }
             }
-            Some(ApprovalVerdict::Deny) | Some(ApprovalVerdict::Cancel) => c.approval = None,
+            Some(ApprovalVerdict::Deny | ApprovalVerdict::Cancel) => c.approval = None,
             None => {}
         }
         return Vec::new();
@@ -416,7 +416,7 @@ mod tests {
             .buffer()
             .content()
             .iter()
-            .map(|c| c.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(out.contains("Run a command"));
         assert!(out.contains("rocm doctor"));

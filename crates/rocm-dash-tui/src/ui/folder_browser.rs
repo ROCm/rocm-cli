@@ -90,8 +90,8 @@ impl FolderBrowser {
         if self.entries.is_empty() {
             return;
         }
-        let max = self.entries.len() as isize - 1;
-        self.selected = (self.selected as isize + delta).clamp(0, max) as usize;
+        let max = self.entries.len().cast_signed() - 1;
+        self.selected = (self.selected.cast_signed() + delta).clamp(0, max) as usize;
     }
 
     fn navigate_to(&mut self, dir: PathBuf) {

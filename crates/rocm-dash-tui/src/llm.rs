@@ -1,5 +1,6 @@
-//! Chat LLM configuration: a pure precedence resolver plus a std-only TCP
-//! liveness probe. No HTTP client here — the Rig-built `AgentClient` (Phase 3)
+//! Chat LLM configuration: a pure precedence resolver plus a std-only TCP liveness probe.
+//!
+//! No HTTP client here — the Rig-built `AgentClient` (Phase 3)
 //! lives in `agent.rs`. Keeping detection in the TUI crate preserves the
 //! core's render/async-free boundary.
 
@@ -58,9 +59,7 @@ pub fn resolve_llm_config(
 
     // model precedence: CLI > config > built-in default.
     let model = cli_model
-        .or(cfg_model)
-        .map(str::to_string)
-        .unwrap_or_else(|| DEFAULT_CHAT_MODEL.to_string());
+        .or(cfg_model).map_or_else(|| DEFAULT_CHAT_MODEL.to_string(), str::to_string);
 
     Some(LlmConfig {
         base_url,
@@ -98,8 +97,9 @@ pub fn parse_host_port(base_url: &str) -> Option<(String, u16)> {
     }
 }
 
-/// Best-effort TCP liveness probe for a candidate endpoint. Returns `true`
-/// only if a connection to the parsed host:port succeeds within `timeout`.
+/// Best-effort TCP liveness probe for a candidate endpoint.
+///
+/// Returns `true` only if a connection to the parsed host:port succeeds within `timeout`.
 /// Never panics; any parse/DNS/connect failure yields `false`.
 pub fn probe_endpoint(base_url: &str, timeout: Duration) -> bool {
     let Some((host, port)) = parse_host_port(base_url) else {
@@ -116,9 +116,9 @@ pub fn probe_endpoint(base_url: &str, timeout: Duration) -> bool {
     false
 }
 
-/// Probe the known local serving endpoints in priority order (Lemonade, then
-/// vLLM) and return the first reachable one. Used by the TUI's in-app
-/// "detect a local engine" action so the user need not run the CLI skill first.
+/// Probe the known local serving endpoints in priority order (Lemonade, then vLLM) and return the first reachable one.
+///
+/// Used by the TUI's in-app "detect a local engine" action so the user need not run the CLI skill first.
 /// TCP-only (no HTTP); never blocks longer than [`PROBE_TIMEOUT`] per candidate.
 pub fn detect_local_endpoint() -> Option<&'static str> {
     [
@@ -129,8 +129,9 @@ pub fn detect_local_endpoint() -> Option<&'static str> {
     .find(|ep| probe_endpoint(ep, PROBE_TIMEOUT))
 }
 
-/// Pick the first model id from an OpenAI-compatible `/v1/models` response
-/// (`{"data":[{"id":"…"}]}`). Pure — no HTTP. `None` when the shape is missing,
+/// Pick the first model id from an OpenAI-compatible `/v1/models` response (`{"data":[{"id":"…"}]}`).
+///
+/// Pure — no HTTP. `None` when the shape is missing,
 /// empty, or malformed, so the caller can fall back to [`DEFAULT_CHAT_MODEL`].
 pub fn pick_first_model(models_json: &serde_json::Value) -> Option<String> {
     models_json

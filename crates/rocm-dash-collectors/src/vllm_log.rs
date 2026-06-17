@@ -12,6 +12,7 @@ pub struct VllmPeaks {
     pub n_requests: u32,
 }
 
+#[allow(clippy::struct_field_names)] // `_re` suffix is meaningful (these are Regex fields)
 pub struct VllmLogSlicer {
     prompt_tps_re: Regex,
     gen_tps_re: Regex,
@@ -71,7 +72,7 @@ mod tests {
 
     #[test]
     fn parses_throughput_peaks_and_request_count() {
-        let log = r#"
+        let log = r"
 [2026-05-26 10:00:00] Avg prompt throughput: 1234.5 tokens/s
 [2026-05-26 10:00:01] Avg generation throughput: 67.8 tokens/s
 [2026-05-26 10:00:02] Running: 8, Waiting: 2
@@ -82,7 +83,7 @@ INFO POST /v1/chat/completions 200
 INFO POST /v1/completions 200
 INFO POST /v1/messages 200
 INFO POST /v1/chat/completions 200
-"#;
+";
         let slicer = VllmLogSlicer::new();
         let peaks = slicer.parse_slice(log);
         assert_eq!(peaks.prompt_tps, Some(2000.1));

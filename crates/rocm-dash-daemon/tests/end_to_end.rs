@@ -123,9 +123,7 @@ async fn ring_accumulates_snapshots_for_replay() {
         if n >= 3 {
             break;
         }
-        if Instant::now() > deadline {
-            panic!("ring never reached 3 snapshots; len={n}");
-        }
+        assert!(Instant::now() <= deadline, "ring never reached 3 snapshots; len={n}");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
@@ -194,9 +192,7 @@ async fn bench_ring_accumulates_rows_for_replay() {
         if n >= 1 {
             break;
         }
-        if Instant::now() > deadline {
-            panic!("bench ring never accumulated a row; len={n}");
-        }
+        assert!(Instant::now() <= deadline, "bench ring never accumulated a row; len={n}");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 

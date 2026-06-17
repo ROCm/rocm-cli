@@ -66,9 +66,10 @@ pub struct Config {
     pub engines: BTreeMap<String, EngineConfig>,
 }
 
-/// Per-engine user preferences. Plain data only (mirrors rocm-cli's
-/// `EngineUserConfig`); no I/O or behavior lives in core. Immutable config
-/// transforms + persistence live in the `rocm` binary, off the core boundary.
+/// Per-engine user preferences. Plain data only (mirrors rocm-cli's `EngineUserConfig`).
+///
+/// No I/O or behavior lives in core. Immutable config transforms + persistence
+/// live in the `rocm` binary, off the core boundary.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EngineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -240,6 +241,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn load_overrides_only_specified_fields() {
         let mut p = std::env::temp_dir();
         p.push(format!(

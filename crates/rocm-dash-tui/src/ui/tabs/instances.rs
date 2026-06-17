@@ -161,7 +161,7 @@ pub(crate) fn build_kv_heatmap_rows(
                 snap.instances
                     .iter()
                     .find(|i| &i.container_id == id)
-                    .and_then(|i| i.kv_cache_usage_pct.map(|v| v as f64))
+                    .and_then(|i| i.kv_cache_usage_pct.map(f64::from))
                     .unwrap_or(0.0)
             })
             .collect();
@@ -170,7 +170,7 @@ pub(crate) fn build_kv_heatmap_rows(
     out
 }
 
-fn pick_cols(width: u16) -> usize {
+const fn pick_cols(width: u16) -> usize {
     if width >= 160 {
         3
     } else if width >= 100 {
@@ -193,7 +193,7 @@ fn clamp_sel(sel: usize, len: usize) -> usize {
     if len == 0 { 0 } else { sel.min(len - 1) }
 }
 
-fn status_meta(status: InstanceStatus, theme: &Theme) -> (ratatui::style::Color, &'static str) {
+const fn status_meta(status: InstanceStatus, theme: &Theme) -> (ratatui::style::Color, &'static str) {
     match status {
         InstanceStatus::Running => (theme.ok, "RUNNING"),
         InstanceStatus::Starting => (theme.warn, "STARTING"),
@@ -263,9 +263,7 @@ fn draw_card(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, selected
     }
 
     let port_str = inst
-        .port
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| "-".into());
+        .port.map_or_else(|| "-".into(), |p| p.to_string());
     let gpus_str = if inst.gpu_ids.is_empty() {
         "-".to_string()
     } else if inst.gpu_ids.len() == 1 {
@@ -380,9 +378,7 @@ fn draw_card(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, selected
 fn compact_line<'a>(inst: &'a Instance, theme: &Theme, max_w: usize) -> Line<'a> {
     let (status_color, _) = status_meta(inst.status, theme);
     let port = inst
-        .port
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| "-".into());
+        .port.map_or_else(|| "-".into(), |p| p.to_string());
     let gpus = if inst.gpu_ids.is_empty() {
         "-".to_string()
     } else {
@@ -399,6 +395,7 @@ fn compact_line<'a>(inst: &'a Instance, theme: &Theme, max_w: usize) -> Line<'a>
 }
 
 /// Detail modal: summary + launch_args + env_vars + log footer.
+///
 /// Resolve a click at `(x, y)` inside the Instances tab body. Returns a
 /// `KeyAction` to dispatch, or `None` when the click misses everything
 /// actionable.
@@ -449,7 +446,7 @@ pub fn hit_test(area: Rect, x: u16, y: u16, state: &AppState) -> Option<KeyActio
                 if idx == sel {
                     return Some(KeyAction::OpenDetail);
                 }
-                let delta = idx as isize - sel as isize;
+                let delta = idx.cast_signed() - sel.cast_signed();
                 return Some(KeyAction::Move(delta));
             }
         }
@@ -459,7 +456,7 @@ pub fn hit_test(area: Rect, x: u16, y: u16, state: &AppState) -> Option<KeyActio
 
 /// Pure point-in-rect check using half-open coordinates (right/bottom edges
 /// are exclusive), matching ratatui's own rect semantics.
-fn point_in_rect(r: Rect, x: u16, y: u16) -> bool {
+const fn point_in_rect(r: Rect, x: u16, y: u16) -> bool {
     x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
 
@@ -519,9 +516,7 @@ fn render_summary(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme) {
     let partition = inst.partition_info.as_deref().unwrap_or("-");
     let quant = inst.quantization.as_deref().unwrap_or("-");
     let port = inst
-        .port
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| "-".into());
+        .port.map_or_else(|| "-".into(), |p| p.to_string());
     let gpus = if inst.gpu_ids.is_empty() {
         "-".to_string()
     } else {
@@ -896,6 +891,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn heatmap_rows_track_kv_cache_per_snapshot() {
         let i_a = mk_inst_kv("a", "alpha", Some(10.0));
         let i_b = mk_inst_kv("b", "beta", Some(20.0));
@@ -994,7 +990,7 @@ mod tests {
         let mut inst = mk_inst("vllm");
         inst.quantization = Some("fp8".into());
         inst.vram_used_mb = 49152;
-        inst.vram_total_mb = 196608; // mib_pair → "48.0 / 192.0 GiB"
+        inst.vram_total_mb = 196_608; // mib_pair → "48.0 / 192.0 GiB"
         let vram = format::mib_pair(inst.vram_used_mb, inst.vram_total_mb);
         assert_eq!(vram, "48.0 / 192.0 GiB"); // sanity on the expected string
 

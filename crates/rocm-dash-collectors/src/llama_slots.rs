@@ -8,7 +8,7 @@ use rocm_dash_core::traits::{
 pub struct LlamaSlotsCollector;
 
 impl LlamaSlotsCollector {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 }
