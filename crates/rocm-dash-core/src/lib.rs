@@ -5,8 +5,6 @@
 //!
 //! See `../wiki/concepts/tea-reducer-pattern.md` for the architectural pattern.
 
-#![allow(dead_code)] // scaffold; remove as modules flesh out
-
 pub mod bench_rollup;
 pub mod bench_schema;
 pub mod config;

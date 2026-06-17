@@ -3,8 +3,6 @@
 //! Every collector implements one of the traits in `rocm_dash_core::traits`.
 //! Stubs return `CollectorError::Unsupported` so the daemon can start with nothing wired.
 
-#![allow(dead_code)]
-
 pub mod amd_smi;
 pub mod bench_tail;
 pub mod cgroup;
