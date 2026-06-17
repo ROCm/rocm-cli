@@ -3504,21 +3504,21 @@ mod tests {
     #[test]
     fn pip_runtime_selects_latest_common_rocm_suffix_not_latest_rocm_package() {
         let rocm_versions = vec![
-            "7.13.0a20260512".to_owned(),
-            "7.13.0a20260513".to_owned(),
-            "7.14.0a20260602".to_owned(),
+            "7.13.0".to_owned(),
+            "7.13.1".to_owned(),
+            "7.14.0".to_owned(),
         ];
         let torch_versions = vec![
-            "2.9.1+rocm7.13.0a20260513".to_owned(),
-            "2.10.0+rocm7.13.0a20260513".to_owned(),
+            "2.9.1+rocm7.13.1".to_owned(),
+            "2.10.0+rocm7.13.1".to_owned(),
         ];
         let torchvision_versions = vec![
-            "0.24.0+rocm7.13.0a20260513".to_owned(),
-            "0.25.0+rocm7.13.0a20260513".to_owned(),
+            "0.24.0+rocm7.13.1".to_owned(),
+            "0.25.0+rocm7.13.1".to_owned(),
         ];
         let torchaudio_versions = vec![
-            "2.9.0+rocm7.13.0a20260513".to_owned(),
-            "2.10.0+rocm7.13.0a20260513".to_owned(),
+            "2.9.0+rocm7.13.1".to_owned(),
+            "2.10.0+rocm7.13.1".to_owned(),
         ];
 
         let selected = select_matching_pip_package_versions(
@@ -3531,10 +3531,10 @@ mod tests {
         )
         .expect("expected compatible package set");
 
-        assert_eq!(selected.rocm, "7.13.0a20260513");
-        assert_eq!(selected.torch, "2.10.0+rocm7.13.0a20260513");
-        assert_eq!(selected.torchvision, "0.25.0+rocm7.13.0a20260513");
-        assert_eq!(selected.torchaudio, "2.10.0+rocm7.13.0a20260513");
+        assert_eq!(selected.rocm, "7.13.1");
+        assert_eq!(selected.torch, "2.10.0+rocm7.13.1");
+        assert_eq!(selected.torchvision, "0.25.0+rocm7.13.1");
+        assert_eq!(selected.torchaudio, "2.10.0+rocm7.13.1");
     }
 
     #[test]
