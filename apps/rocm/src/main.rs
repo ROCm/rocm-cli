@@ -1779,6 +1779,25 @@ fn install(target: InstallTarget) -> Result<()> {
                     print!("{output}");
                     if let Some(finalized) = finalized {
                         print_sdk_install_success(&finalized);
+                        if let Err(error) = maybe_auto_install_sdk_preferred_engine(&paths, &finalized)
+                        {
+                            record_cli_audit_event(
+                                &paths,
+                                "engine",
+                                "engine_auto_install",
+                                "error",
+                                format!(
+                                    "auto-install failed engine=vllm runtime_id={} family={}: {error}",
+                                    finalized.runtime_key, finalized.family
+                                ),
+                                None,
+                            );
+                            eprintln!("warning: automatic vLLM install failed: {error}");
+                            eprintln!(
+                                "warning: SDK install completed; you can run `rocm engines install vllm --runtime-id {}` after vLLM is available in that runtime",
+                                finalized.runtime_key
+                            );
+                        }
                     }
                     record_cli_audit_event(
                         &paths,
@@ -4894,10 +4913,87 @@ fn import_runtime_manifest(
 struct SdkInstallFinalization {
     runtime_key: String,
     install_root: PathBuf,
+    family: String,
 }
 
 fn print_sdk_install_success(finalized: &SdkInstallFinalization) {
     print!("{}", render_sdk_install_success(finalized));
+}
+
+fn preferred_engine_for_sdk_family(family: &str) -> Option<&'static str> {
+    let summary = rocm_core::HostGpuSummary {
+        therock_family: Some(family.to_owned()),
+        ..rocm_core::HostGpuSummary::default()
+    };
+    preferred_serve_engine_for_host_gpu_summary(&summary)
+}
+
+fn maybe_auto_install_sdk_preferred_engine(
+    paths: &AppPaths,
+    finalized: &SdkInstallFinalization,
+) -> Result<()> {
+    let Some(engine) = preferred_engine_for_sdk_family(&finalized.family) else {
+        return Ok(());
+    };
+    if engine != "vllm" {
+        return Ok(());
+    }
+
+    println!("engine auto-install");
+    println!(
+        "  reason: detected ROCm GPU family prefers vLLM ({})",
+        finalized.family
+    );
+    println!("  engine: {engine}");
+    println!("  runtime_id: {}", finalized.runtime_key);
+
+    let mut config = RocmCliConfig::load(paths)?;
+    let env_root =
+        env_root_for_engine_install(paths, &config, engine, &finalized.runtime_key)?;
+    let response = engine_request_with_env_root::<_, InstallResponse>(
+        Some(paths),
+        engine,
+        EngineMethod::Install,
+        &InstallRequest {
+            runtime_id: finalized.runtime_key.clone(),
+            python_version: None,
+            reinstall: false,
+            env_root: env_root.clone(),
+        },
+        env_root.as_deref(),
+    )?;
+    println!("  reinstall: false");
+    println!("  env_id: {}", response.env_id);
+    println!("  env_path: {}", response.env_path);
+    for warning in response.warnings {
+        println!("  warning: {warning}");
+    }
+
+    if response.managed_env == Some(false) {
+        println!("  note: external runtime");
+    } else {
+        let engine_config = config.engine_config_mut(engine);
+        engine_config.last_installed_runtime_id = Some(finalized.runtime_key.clone());
+        engine_config.last_installed_env_id = Some(response.env_id.clone());
+        if engine_config.preferred_runtime_id.is_none() && engine_config.preferred_env_id.is_none()
+        {
+            engine_config.preferred_env_id = Some(response.env_id.clone());
+        }
+        config.save(paths)?;
+    }
+
+    record_cli_audit_event(
+        paths,
+        "engine",
+        "engine_auto_install",
+        "info",
+        format!(
+            "auto-installed engine={} runtime_id={} env_id={} family={}",
+            engine, finalized.runtime_key, response.env_id, finalized.family
+        ),
+        None,
+    );
+    Ok(())
 }
 
 fn render_sdk_install_success(finalized: &SdkInstallFinalization) -> String {
@@ -4940,6 +5036,7 @@ fn finalize_successful_sdk_install(paths: &AppPaths) -> Result<Option<SdkInstall
     Ok(Some(SdkInstallFinalization {
         runtime_key: activation.runtime_key,
         install_root: manifest.install_root,
+        family: manifest.family,
     }))
 }
 
@@ -18514,6 +18611,16 @@ install therock";
                 source: "detected ROCm GPU family prefers vLLM",
             }
         );
+    }
+
+    #[test]
+    fn sdk_install_auto_engine_selection_prefers_vllm_for_supported_families() {
+        assert_eq!(preferred_engine_for_sdk_family("gfx90a"), Some("vllm"));
+        assert_eq!(
+            preferred_engine_for_sdk_family("gfx94X-dcgpu"),
+            Some("vllm")
+        );
+        assert_eq!(preferred_engine_for_sdk_family("gfx120X-all"), None);
     }
 
     #[test]
