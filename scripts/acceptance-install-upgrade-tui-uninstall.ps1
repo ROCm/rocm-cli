@@ -174,7 +174,7 @@ try {
     Write-Host "acceptance: build release binaries"
     Push-Location $RepoRoot
     try {
-        & $cargoExe build --release -p rocm -p rocmd -p rocm-engine-pytorch -p rocm-engine-llama-cpp -p rocm-engine-lemonade -p rocm-engine-atom -p rocm-engine-vllm -p rocm-engine-sglang -p xtask
+        & $cargoExe build --release -p rocm -p rocmd -p xtask
         if ($LASTEXITCODE -ne 0) {
             Fail "cargo build failed"
         }
@@ -423,12 +423,6 @@ try {
     }
     Assert-File (Join-Path $InstallDir "rocm.exe")
     Assert-File (Join-Path $InstallDir "rocmd.exe")
-    Assert-File (Join-Path $InstallDir "rocm-engine-pytorch.exe")
-    Assert-File (Join-Path $InstallDir "rocm-engine-llama-cpp.exe")
-    Assert-File (Join-Path $InstallDir "rocm-engine-lemonade.exe")
-    Assert-File (Join-Path $InstallDir "rocm-engine-atom.exe")
-    Assert-File (Join-Path $InstallDir "rocm-engine-vllm.exe")
-    Assert-File (Join-Path $InstallDir "rocm-engine-sglang.exe")
     Assert-File (Join-Path $InstallDir ".rocm-cli-manifest")
 
     Write-Host "acceptance: simulate stale prior install entry and reinstall"
@@ -471,12 +465,6 @@ try {
     Invoke-Checked "acceptance: uninstall from the installed binary" $rocmExe @("uninstall", "--yes", "--keep-config", "--keep-data", "--keep-cache") $UninstallLog
 
     Assert-Missing (Join-Path $InstallDir "rocmd.exe")
-    Assert-Missing (Join-Path $InstallDir "rocm-engine-pytorch.exe")
-    Assert-Missing (Join-Path $InstallDir "rocm-engine-llama-cpp.exe")
-    Assert-Missing (Join-Path $InstallDir "rocm-engine-lemonade.exe")
-    Assert-Missing (Join-Path $InstallDir "rocm-engine-atom.exe")
-    Assert-Missing (Join-Path $InstallDir "rocm-engine-vllm.exe")
-    Assert-Missing (Join-Path $InstallDir "rocm-engine-sglang.exe")
     Assert-Missing (Join-Path $InstallDir ".rocm-cli-manifest")
     if (-not (Select-String -LiteralPath $UninstallLog -Pattern "skipping running executable on Windows" -Quiet)) {
         Fail "uninstall did not report the expected running executable skip"

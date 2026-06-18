@@ -21,15 +21,12 @@ ROCM_RELEASE_ASSET_RE = re.compile(
     r"^rocm-cli-(?:(?:v[0-9][A-Za-z0-9._+-]*|nightly(?:-[0-9]{8}-[0-9A-Fa-f]+)?)-)?"
     r"(?P<os>linux|windows)-amd64(?P<suffix>\.tar\.gz|\.zip)$"
 )
+# First-party engines are built into rocm/rocm.exe (run in-process); the
+# standalone rocm-engine-* binaries are an external plugin fallback and are not
+# part of the shipped bundle.
 LINUX_REQUIRED = (
     "bin/rocm",
     "bin/rocmd",
-    "bin/rocm-engine-pytorch",
-    "bin/rocm-engine-llama-cpp",
-    "bin/rocm-engine-lemonade",
-    "bin/rocm-engine-atom",
-    "bin/rocm-engine-vllm",
-    "bin/rocm-engine-sglang",
     "README.md",
     "LICENSE",
     "install.sh",
@@ -37,12 +34,6 @@ LINUX_REQUIRED = (
 WINDOWS_REQUIRED = (
     "bin/rocm.exe",
     "bin/rocmd.exe",
-    "bin/rocm-engine-pytorch.exe",
-    "bin/rocm-engine-llama-cpp.exe",
-    "bin/rocm-engine-lemonade.exe",
-    "bin/rocm-engine-atom.exe",
-    "bin/rocm-engine-vllm.exe",
-    "bin/rocm-engine-sglang.exe",
     "README.md",
     "LICENSE",
     "install.ps1",
@@ -50,12 +41,6 @@ WINDOWS_REQUIRED = (
 LINUX_EXECUTABLES = (
     "bin/rocm",
     "bin/rocmd",
-    "bin/rocm-engine-pytorch",
-    "bin/rocm-engine-llama-cpp",
-    "bin/rocm-engine-lemonade",
-    "bin/rocm-engine-atom",
-    "bin/rocm-engine-vllm",
-    "bin/rocm-engine-sglang",
     "install.sh",
 )
 PRODUCTION_TRUST_ENV_NAMES = (

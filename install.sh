@@ -330,14 +330,10 @@ tar -xzf "${archive_path}" -C "${extract_dir}"
 bundle_dir="$(find "${extract_dir}" -mindepth 1 -maxdepth 1 -type d | head -n1)"
 [ -n "${bundle_dir}" ] || fail "unable to locate extracted bundle directory"
 
+# First-party engines are built into rocm and run in-process; the standalone
+# rocm-engine-* binaries are an external plugin fallback, not shipped here.
 [ -f "${bundle_dir}/bin/rocm" ] || fail "bundle did not contain bin/rocm"
 [ -f "${bundle_dir}/bin/rocmd" ] || fail "bundle did not contain bin/rocmd"
-[ -f "${bundle_dir}/bin/rocm-engine-pytorch" ] || fail "bundle did not contain bin/rocm-engine-pytorch"
-[ -f "${bundle_dir}/bin/rocm-engine-llama-cpp" ] || fail "bundle did not contain bin/rocm-engine-llama-cpp"
-[ -f "${bundle_dir}/bin/rocm-engine-lemonade" ] || fail "bundle did not contain bin/rocm-engine-lemonade"
-[ -f "${bundle_dir}/bin/rocm-engine-atom" ] || fail "bundle did not contain bin/rocm-engine-atom"
-[ -f "${bundle_dir}/bin/rocm-engine-vllm" ] || fail "bundle did not contain bin/rocm-engine-vllm"
-[ -f "${bundle_dir}/bin/rocm-engine-sglang" ] || fail "bundle did not contain bin/rocm-engine-sglang"
 
 mkdir -p "${INSTALL_DIR}"
 write_minimal_config_if_missing

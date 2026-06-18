@@ -127,14 +127,11 @@ Remove-Item -LiteralPath "$archivePath.sig" -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path (Join-Path $rootDir "bin") | Out-Null
 
 $bundleBin = Join-Path $rootDir "bin"
+# First-party engines are built into rocm.exe and run in-process; the
+# standalone rocm-engine-*.exe binaries are only an external plugin fallback,
+# so they are not shipped.
 Copy-RequiredFile (Join-Path $binaryDir "rocm.exe") (Join-Path $bundleBin "rocm.exe")
 Copy-RequiredFile (Join-Path $binaryDir "rocmd.exe") (Join-Path $bundleBin "rocmd.exe")
-Copy-RequiredFile (Join-Path $binaryDir "rocm-engine-pytorch.exe") (Join-Path $bundleBin "rocm-engine-pytorch.exe")
-Copy-RequiredFile (Join-Path $binaryDir "rocm-engine-llama-cpp.exe") (Join-Path $bundleBin "rocm-engine-llama-cpp.exe")
-Copy-RequiredFile (Join-Path $binaryDir "rocm-engine-lemonade.exe") (Join-Path $bundleBin "rocm-engine-lemonade.exe")
-Copy-RequiredFile (Join-Path $binaryDir "rocm-engine-atom.exe") (Join-Path $bundleBin "rocm-engine-atom.exe")
-Copy-RequiredFile (Join-Path $binaryDir "rocm-engine-vllm.exe") (Join-Path $bundleBin "rocm-engine-vllm.exe")
-Copy-RequiredFile (Join-Path $binaryDir "rocm-engine-sglang.exe") (Join-Path $bundleBin "rocm-engine-sglang.exe")
 Copy-RequiredFile (Join-Path $repoRoot "README.md") (Join-Path $rootDir "README.md")
 Copy-RequiredFile (Join-Path $repoRoot "LICENSE") (Join-Path $rootDir "LICENSE")
 Copy-RequiredFile (Join-Path $repoRoot "install.ps1") (Join-Path $rootDir "install.ps1")
