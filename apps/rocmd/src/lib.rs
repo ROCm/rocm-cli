@@ -16,8 +16,8 @@ use rocm_core::{
     ModelRecipeArtifactRecord, RocmCliConfig, WatcherMode, WatcherRuntimeSnapshot,
     append_audit_event, append_automation_event, append_automation_proposal, builtin_watcher,
     builtin_watchers, daemon_binary_path, default_engine_for_platform, format_host_port,
-    load_recent_automation_events, model_artifact_cache_status, resolve_model_recipe_artifact,
-    unix_time_millis,
+    load_recent_automation_events, model_artifact_cache_status, resolve_amd_smi_binary,
+    resolve_model_recipe_artifact, unix_time_millis,
 };
 #[cfg(test)]
 use rocm_engine_protocol::EnginePluginDescriptor;
@@ -1328,7 +1328,8 @@ fn gather_gpu_snapshot_for_config(config: &RocmCliConfig) -> CodexBridgeGpuSnaps
 }
 
 fn capture_amd_smi_json(args: &[&str]) -> Result<Value> {
-    let mut command = ProcessCommand::new("amd-smi");
+    let amd_smi_binary = resolve_amd_smi_binary();
+    let mut command = ProcessCommand::new(&amd_smi_binary);
     command
         .args(args)
         .stdin(Stdio::null())

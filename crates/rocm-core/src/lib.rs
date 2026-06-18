@@ -5870,6 +5870,79 @@ pub fn daemon_binary_path() -> Result<PathBuf> {
     Ok(current_exe)
 }
 
+pub fn resolve_amd_smi_binary() -> OsString {
+    if let Some(path) = default_data_dir()
+        .map(|data_dir| data_dir.join("runtimes").join("registry"))
+        .and_then(|registry_dir| resolve_amd_smi_binary_in_registry(&registry_dir))
+    {
+        return path;
+    }
+    resolve_amd_smi_binary_in_home(runtime_home_dir().as_deref())
+}
+
+/// Locate `amd-smi` inside the bin directories of the newest managed ROCm SDK
+/// runtime recorded in the registry. The binary ships with the TheRock wheel
+/// (under the SDK `bin_path` and/or the venv `install_root/bin`) and is not on
+/// `PATH`, so the home-directory fallbacks below never find it.
+fn resolve_amd_smi_binary_in_registry(registry_dir: &Path) -> Option<OsString> {
+    let mut records = managed_therock_environment_records(registry_dir);
+    records.sort_by_key(|(_, record)| std::cmp::Reverse(record.installed_at_unix_ms.unwrap_or(0)));
+    records.into_iter().find_map(|(_, record)| {
+        amd_smi_bin_dirs_for_record(&record)
+            .iter()
+            .find_map(|bin_dir| managed_sdk_tool_path(bin_dir, "amd-smi"))
+            .map(PathBuf::into_os_string)
+    })
+}
+
+fn amd_smi_bin_dirs_for_record(record: &TheRockFamilyManifest) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(sdk) = record.rocm_sdk.as_ref() {
+        if let Some(bin_path) = sdk.bin_path.as_ref() {
+            dirs.push(bin_path.clone());
+        }
+        for bin_path in &sdk.bin_paths {
+            if !dirs.contains(bin_path) {
+                dirs.push(bin_path.clone());
+            }
+        }
+    }
+    if let Some(install_root) = record.install_root.as_ref() {
+        let install_bin = install_root.join("bin");
+        if !dirs.contains(&install_bin) {
+            dirs.push(install_bin);
+        }
+    }
+    dirs
+}
+
+fn resolve_amd_smi_binary_in_home(home_dir: Option<&Path>) -> OsString {
+    if let Some(home_rocm_dir) = home_dir.map(Path::to_path_buf).map(|dir| dir.join(".rocm")) {
+        let amd_smi_path = home_rocm_dir.join("bin").join("amd-smi");
+        if amd_smi_path.is_file() {
+            return amd_smi_path.into();
+        }
+    }
+
+    if let Some(home_dir) = home_dir {
+        let amd_smi_path = home_dir
+            .join("rocm_venvs")
+            .join("default")
+            .join("bin")
+            .join("amd-smi");
+        if amd_smi_path.is_file() {
+            return amd_smi_path.into();
+        }
+
+        let legacy_rocm_path = home_dir.join(".rocm").join("bin").join("amd-smi");
+        if legacy_rocm_path.is_file() {
+            return legacy_rocm_path.into();
+        }
+    }
+
+    "amd-smi".into()
+}
+
 pub fn generate_service_id(engine: &str, model_ref: &str) -> String {
     let model_slug = sanitize_component(model_ref)
         .trim_matches('-')
@@ -5904,6 +5977,8 @@ pub fn unix_time_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::Path;
 
     #[test]
     fn openai_models_endpoint_has_model_checks_loaded_model_ids() -> Result<()> {
@@ -5944,6 +6019,68 @@ mod tests {
 
         let request = server.join().expect("server thread should not panic")?;
         assert!(request.starts_with("GET /v1/models HTTP/1.1"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_amd_smi_binary_prefers_home_rocm_venv_path() -> Result<()> {
+        let temp_root = std::env::temp_dir().join(format!("rocm-cli-amd-smi-{}", unix_time_millis()));
+        let bin_dir = temp_root.join("rocm_venvs/default/bin");
+        fs::create_dir_all(&bin_dir)?;
+        let amd_smi_path = bin_dir.join("amd-smi");
+        fs::write(&amd_smi_path, b"#!/bin/sh\nexit 0\n")?;
+
+        let resolved = resolve_amd_smi_binary_in_home(Some(Path::new(&temp_root)));
+
+        let _ = fs::remove_file(&amd_smi_path);
+        let _ = fs::remove_dir_all(&temp_root);
+
+        assert_eq!(resolved, amd_smi_path.into_os_string());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_amd_smi_binary_in_registry_uses_newest_runtime_sdk_bin() -> Result<()> {
+        let temp_root = std::env::temp_dir()
+            .join(format!("rocm-cli-amd-smi-registry-{}", unix_time_millis()));
+        let registry_dir = temp_root.join("runtimes/registry");
+        fs::create_dir_all(&registry_dir)?;
+
+        // Older runtime: amd-smi only under the venv install_root/bin.
+        let old_root = temp_root.join("release-wheel-gfx94x-dcgpu-7-13-0");
+        let old_bin = old_root.join("bin");
+        fs::create_dir_all(&old_bin)?;
+        fs::write(old_bin.join("amd-smi"), b"#!/bin/sh\nexit 0\n")?;
+        fs::write(
+            registry_dir.join("old.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "runtime_id": "therock-stable:gfx94X-dcgpu",
+                "install_root": old_root,
+                "installed_at_unix_ms": 1_000_u128,
+                "rocm_sdk": { "import_ok": true },
+            }))?,
+        )?;
+
+        // Newer runtime: amd-smi under the SDK devel bin_path.
+        let new_bin = temp_root
+            .join("release-wheel-gfx94x-dcgpu-7-14-0a20260611/_rocm_sdk_devel/bin");
+        fs::create_dir_all(&new_bin)?;
+        let new_amd_smi = new_bin.join("amd-smi");
+        fs::write(&new_amd_smi, b"#!/bin/sh\nexit 0\n")?;
+        fs::write(
+            registry_dir.join("new.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "runtime_id": "therock-stable:gfx94X-dcgpu",
+                "installed_at_unix_ms": 2_000_u128,
+                "rocm_sdk": { "import_ok": true, "bin_path": new_bin },
+            }))?,
+        )?;
+
+        let resolved = resolve_amd_smi_binary_in_registry(&registry_dir);
+
+        let _ = fs::remove_dir_all(&temp_root);
+
+        assert_eq!(resolved, Some(new_amd_smi.into_os_string()));
         Ok(())
     }
 

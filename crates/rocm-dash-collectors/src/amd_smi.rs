@@ -29,20 +29,29 @@ impl AmdSmiCollector {
     /// The KFD pre-flight is mandatory: without it, `amd-smi` blocks in
     /// uninterruptible kernel sleep (D-state) that no signal can escape.
     pub async fn detect() -> Option<Self> {
+        Self::detect_with_binary("amd-smi").await
+    }
+
+    /// Like [`detect`](Self::detect) but uses an explicit `amd-smi` binary path.
+    ///
+    /// The managed ROCm SDK ships `amd-smi` inside the runtime wheel's bin
+    /// directory rather than on `PATH`, so callers resolve the absolute path
+    /// (via `rocm_core::resolve_amd_smi_binary`) and pass it here.
+    pub async fn detect_with_binary(binary: impl Into<String>) -> Option<Self> {
         if !kfd_accessible() {
             return None;
         }
         let me = Self {
-            binary: "amd-smi".into(),
+            binary: binary.into(),
         };
         match timeout(DETECT_TIMEOUT, me.run(&["version"])).await {
             Ok(Ok(_)) => Some(me),
             Ok(Err(e)) => {
-                warn!(error = %e, "amd-smi present but `version` failed");
+                warn!(error = %e, binary = %me.binary, "amd-smi present but `version` failed");
                 None
             }
             Err(_) => {
-                warn!("amd-smi `version` timed out");
+                warn!(binary = %me.binary, "amd-smi `version` timed out");
                 None
             }
         }
