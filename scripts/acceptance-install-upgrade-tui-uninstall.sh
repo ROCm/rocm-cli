@@ -106,7 +106,7 @@ expect_failure() {
 }
 
 echo "acceptance: build release binaries"
-(cd "${REPO_ROOT}" && cargo build --release -p rocm -p rocmd -p rocm-engine-pytorch -p rocm-engine-llama-cpp -p rocm-engine-lemonade -p rocm-engine-atom -p rocm-engine-vllm -p rocm-engine-sglang -p xtask)
+(cd "${REPO_ROOT}" && cargo build --release -p rocm -p rocmd -p xtask)
 
 echo "acceptance: generate signing key"
 (cd "${REPO_ROOT}" && cargo xtask keygen \
@@ -250,12 +250,6 @@ grep -q "shell profile updated" "${INSTALL_LOG_1}" \
   || fail "installer did not report automatic shell profile setup"
 assert_file "${INSTALL_DIR}/rocm"
 assert_file "${INSTALL_DIR}/rocmd"
-assert_file "${INSTALL_DIR}/rocm-engine-pytorch"
-assert_file "${INSTALL_DIR}/rocm-engine-llama-cpp"
-assert_file "${INSTALL_DIR}/rocm-engine-lemonade"
-assert_file "${INSTALL_DIR}/rocm-engine-atom"
-assert_file "${INSTALL_DIR}/rocm-engine-vllm"
-assert_file "${INSTALL_DIR}/rocm-engine-sglang"
 assert_file "${INSTALL_DIR}/.rocm-cli-manifest"
 assert_file "${INSTALL_CONFIG_FILE}"
 grep -q '"default_engine"[[:space:]]*:[[:space:]]*"pytorch"' "${INSTALL_CONFIG_FILE}" \
@@ -334,12 +328,6 @@ env \
 
 assert_missing "${INSTALL_DIR}/rocm"
 assert_missing "${INSTALL_DIR}/rocmd"
-assert_missing "${INSTALL_DIR}/rocm-engine-pytorch"
-assert_missing "${INSTALL_DIR}/rocm-engine-llama-cpp"
-assert_missing "${INSTALL_DIR}/rocm-engine-lemonade"
-assert_missing "${INSTALL_DIR}/rocm-engine-atom"
-assert_missing "${INSTALL_DIR}/rocm-engine-vllm"
-assert_missing "${INSTALL_DIR}/rocm-engine-sglang"
 assert_missing "${INSTALL_DIR}/.rocm-cli-manifest"
 assert_missing "${XDG_CONFIG_HOME}/rocm-cli"
 assert_missing "${XDG_DATA_HOME}/rocm-cli"

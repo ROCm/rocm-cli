@@ -271,6 +271,27 @@ jobs:
             --notes "${NOTES}" \
             --prerelease \
             "${ASSET_DIR}"/*
+
+          # Convenience assets for quick curl-and-run, attached after the
+          # readiness gate (NOT part of the signed exact-asset set):
+          #   rocm / rocm.exe        - standalone CLI binaries
+          #   linux-binaries.tar.gz  - byte-identical alias of the signed
+          #                            rocm-cli-nightly-linux-amd64.tar.gz bundle
+          #   windows-binaries.zip   - byte-identical alias of the signed
+          #                            rocm-cli-nightly-windows-amd64.zip bundle
+          # Integrity-conscious users should prefer the signed *-amd64 archives.
+          EXTRA="$(mktemp -d)"
+          mkdir -p "${EXTRA}/lin" "${EXTRA}/win"
+          tar -xzf "${ASSET_DIR}/rocm-cli-nightly-linux-amd64.tar.gz" -C "${EXTRA}/lin"
+          unzip -o -q "${ASSET_DIR}/rocm-cli-nightly-windows-amd64.zip" -d "${EXTRA}/win"
+          cp "$(find "${EXTRA}/lin" -type f -name rocm)" "${EXTRA}/rocm"
+          cp "$(find "${EXTRA}/win" -type f -name rocm.exe)" "${EXTRA}/rocm.exe"
+          cp "${ASSET_DIR}/rocm-cli-nightly-linux-amd64.tar.gz" "${EXTRA}/linux-binaries.tar.gz"
+          cp "${ASSET_DIR}/rocm-cli-nightly-windows-amd64.zip" "${EXTRA}/windows-binaries.zip"
+          gh release upload nightly \
+            "${EXTRA}/rocm" "${EXTRA}/rocm.exe" \
+            "${EXTRA}/linux-binaries.tar.gz" "${EXTRA}/windows-binaries.zip" --clobber
+
           gh release delete "${STAGING_TAG}" --yes --cleanup-tag
 
   cleanup-staging-nightly:
