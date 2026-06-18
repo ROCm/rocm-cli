@@ -11,18 +11,28 @@ llama.cpp, Lemonade, ATOM, vLLM, and SGLang.
 
 ## Installation
 
+This repository is currently private. Install the [GitHub CLI](https://cli.github.com/) and authenticate once before downloading:
+
+```bash
+gh auth login
+```
+
 **Linux / WSL x86_64**:
 
 ```bash
-curl -fsSL https://github.com/ROCm/rocm-cli/releases/download/nightly/rocm -o ~/.local/bin/rocm
+gh release download nightly --repo ROCm/rocm-cli --pattern rocm --output ~/.local/bin/rocm
 chmod +x ~/.local/bin/rocm
 ```
+
+Direct link: <https://github.com/ROCm/rocm-cli/releases/download/nightly/rocm>
 
 **Windows x86_64** (PowerShell):
 
 ```powershell
-irm https://github.com/ROCm/rocm-cli/releases/download/nightly/rocm.exe -OutFile "$env:LOCALAPPDATA\Microsoft\WindowsApps\rocm.exe"
+gh release download nightly --repo ROCm/rocm-cli --pattern rocm.exe --output "$env:LOCALAPPDATA\Microsoft\WindowsApps\rocm.exe"
 ```
+
+Direct link: <https://github.com/ROCm/rocm-cli/releases/download/nightly/rocm.exe>
 
 Rerun the same command to upgrade to the latest nightly.
 
