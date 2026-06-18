@@ -11681,12 +11681,10 @@ impl App {
                                 state.selected.min(state.actions.len().saturating_sub(1));
                         }
                     }
-                    if output_ok
-                        && title == "ComfyUI"
-                        && keyed_output_value(&rendered, "URL").is_some()
-                    {
-                        self.tui_started_comfyui = true;
-                    }
+                }
+                if output_ok && title == "ComfyUI" && keyed_output_value(&rendered, "URL").is_some()
+                {
+                    self.tui_started_comfyui = true;
                 }
                 if self.command_screen_is_chat_session()
                     && chat_session_owns_command_title(title.as_str())
@@ -28014,10 +28012,12 @@ mod tests {
     use std::path::Path;
     use std::sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     };
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    static TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Default)]
     struct TestProviderKeyStore {
@@ -36000,7 +36000,8 @@ Full log
     fn assistant_comfyui_start_result_shows_url_models_and_quit_prompt() -> anyhow::Result<()> {
         let mut app = test_app();
         app.open_local_rocm_tools_chat_session(None);
-        let port = 18188;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
         let url = format!("http://127.0.0.1:{port}");
         write_comfyui_running_state_for_test(&app, port)?;
         let sender = attach_running_job(&mut app, "ComfyUI", super::RunningJobKind::Cli);
@@ -36040,6 +36041,7 @@ Full log
         let overlay = app.overlay_card.as_ref().expect("quit overlay should open");
         assert_eq!(overlay.title, "Quit");
         assert!(overlay.detail.contains(&format!("ComfyUI at {url}")));
+        drop(listener);
         Ok(())
     }
 
@@ -37994,15 +37996,20 @@ Full log
 
         let root = workspace_test_artifact_dir().join(format!(
             "rocm-cli-cancel-test-{}",
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+            next_test_unique_suffix()
         ));
         fs::create_dir_all(&root)?;
         let marker = root.join("child-alive");
         let script = root.join("spawn-child.sh");
+        let sleep_bin = if std::path::Path::new("/bin/sleep").exists() {
+            "/bin/sleep"
+        } else {
+            "sleep"
+        };
         fs::write(
             &script,
             format!(
-                "#!/bin/sh\n(sleep 30; echo alive > '{}') &\nwait\n",
+                "#!/bin/sh\n({sleep_bin} 30; echo alive > '{}') &\nwait\n",
                 marker.display()
             ),
         )?;
@@ -43980,10 +43987,7 @@ Full log
     }
 
     fn test_app() -> App {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be after unix epoch")
-            .as_nanos();
+        let unique = next_test_unique_suffix();
         let root = workspace_test_artifact_dir().join(format!("rocm-cli-tui-test-{unique}"));
         let paths = AppPaths {
             config_dir: root.join("config"),
@@ -44647,10 +44651,7 @@ Full log
     }
 
     fn test_paths(name: &str) -> (std::path::PathBuf, AppPaths) {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be after unix epoch")
-            .as_nanos();
+        let unique = next_test_unique_suffix();
         let root = workspace_test_artifact_dir().join(format!("rocm-cli-tui-test-{name}-{unique}"));
         let paths = AppPaths {
             config_dir: root.join("config"),
@@ -44658,6 +44659,15 @@ Full log
             cache_dir: root.join("cache"),
         };
         (root, paths)
+    }
+
+    fn next_test_unique_suffix() -> String {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let seq = TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{timestamp}-{seq}")
     }
 
     fn workspace_test_artifact_dir() -> std::path::PathBuf {
