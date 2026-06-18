@@ -1365,9 +1365,7 @@ fn channel_rocm_candidates(versions: &[String], channel: TheRockChannel) -> Vec<
 }
 
 fn is_stable_runtime_version(version: &str) -> bool {
-    parse_version(version)
-        .map(|parsed| parsed.stage == VersionStage::Stable)
-        .unwrap_or(false)
+    parse_version(version).is_some_and(|parsed| parsed.stage == VersionStage::Stable)
 }
 
 fn select_latest_stack_package(

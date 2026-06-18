@@ -1091,7 +1091,7 @@ impl InstallSdkChannel {
         }
     }
 
-    fn toggle(self) -> Self {
+    const fn toggle(self) -> Self {
         match self {
             Self::Release => Self::Nightly,
             Self::Nightly => Self::Release,
@@ -21679,7 +21679,7 @@ const fn update_menu_choices() -> &'static [UpdateMenuChoice] {
     ]
 }
 
-fn install_sdk_channel_summary(channel: InstallSdkChannel) -> &'static str {
+const fn install_sdk_channel_summary(channel: InstallSdkChannel) -> &'static str {
     if matches!(channel, InstallSdkChannel::Release) {
         "Stable (default)"
     } else {
@@ -21687,7 +21687,7 @@ fn install_sdk_channel_summary(channel: InstallSdkChannel) -> &'static str {
     }
 }
 
-fn channel_changed_status() -> &'static str {
+const fn channel_changed_status() -> &'static str {
     "ROCm channel changed. Release is stable, Nightly is preview."
 }
 
@@ -38071,6 +38071,8 @@ Full log
     #[test]
     fn onboarding_failed_install_shows_reason_and_retry_menu() {
         let mut app = test_app();
+        app.config.setup.therock_venv = Some(short_test_install_root());
+        app.reset_onboarding_selection();
         let (sender, receiver) = mpsc::channel();
         app.onboarding_active = true;
         app.running_job = Some(super::RunningJob {
@@ -40295,8 +40297,8 @@ Full log
     fn setup_snapshot_is_quiet_and_path_specific() {
         let mut app = test_app();
         app.onboarding_active = true;
-        let selected = app.paths.data_dir.join("therock_venvs");
-        app.config.setup.therock_venv = Some(selected.clone());
+        let selected = short_test_install_root();
+        app.config.setup.therock_venv = Some(selected);
         app.reset_onboarding_selection();
 
         let rendered = render_test_terminal(&app, 120, 32);
@@ -44659,6 +44661,17 @@ Full log
             cache_dir: root.join("cache"),
         };
         (root, paths)
+    }
+
+    fn short_test_install_root() -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            std::path::PathBuf::from(r"D:\t\therock_venvs")
+        }
+        #[cfg(not(windows))]
+        {
+            std::path::PathBuf::from("/t/therock_venvs")
+        }
     }
 
     fn next_test_unique_suffix() -> String {
