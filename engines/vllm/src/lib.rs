@@ -34,6 +34,7 @@ const HEALTHCHECK_TIMEOUT_MS: u64 = 700;
 const DEFAULT_GPU_MEMORY_UTILIZATION: &str = "0.80";
 const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
 const MAX_TAIL_READ: u64 = 4 * 1024 * 1024;
+const VLLM_ROCM_EXTRA_INDEX_URL: &str = "https://wheels.vllm.ai/rocm/0.23.0/rocm723";
 
 #[derive(Parser, Debug)]
 #[command(name = "rocm-engine-vllm", about = "rocm-cli vLLM engine adapter")]
@@ -142,6 +143,13 @@ struct RocmSdkRuntimeProbe {
 struct ServiceFiles {
     state_path: PathBuf,
     log_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedRuntimePython {
+    runtime_id: String,
+    source: String,
+    python_executable: PathBuf,
 }
 
 pub fn run_cli() -> Result<()> {
@@ -370,7 +378,27 @@ fn capabilities() -> EngineCapabilities {
 }
 
 fn install_response(request: InstallRequest) -> Result<InstallResponse> {
-    let runtime = resolve_vllm_runtime(Some(&request.runtime_id))?;
+    let runtime = match resolve_vllm_runtime(Some(&request.runtime_id)) {
+        Ok(runtime) if !request.reinstall => runtime,
+        Ok(_) | Err(_) => {
+            let managed = resolve_managed_runtime_python(Some(&request.runtime_id))?.with_context(
+                || {
+                    format!(
+                        "runtime `{}` did not resolve to a managed TheRock Python environment for automatic vLLM install",
+                        request.runtime_id
+                    )
+                },
+            )?;
+            install_vllm_with_uv(&managed.python_executable)?;
+            resolve_vllm_runtime(Some(&managed.runtime_id)).with_context(|| {
+                format!(
+                    "vLLM install completed in {}, but runtime `{}` still could not be resolved",
+                    managed.python_executable.display(),
+                    managed.runtime_id
+                )
+            })?
+        }
+    };
     let env_path = runtime
         .command
         .parent()
@@ -407,9 +435,9 @@ fn runtime_is_managed(runtime: &VllmRuntime) -> bool {
 
 fn vllm_runtime_warnings(runtime: &VllmRuntime) -> Vec<String> {
     let runtime_scope = if runtime_is_managed(runtime) {
-        "rocm-cli records this vLLM command from a managed TheRock runtime; it does not pip install vLLM automatically"
+        "rocm-cli records this vLLM command from a managed TheRock runtime; `rocm engines install vllm` can install vLLM into that runtime"
     } else {
-        "rocm-cli records this as an external vLLM runtime; it does not pip install vLLM automatically"
+        "rocm-cli records this as an external vLLM runtime; install/upgrade vLLM in that environment manually"
     };
     vec![
         runtime_scope.to_owned(),
@@ -788,11 +816,83 @@ fn runtime_from_python(
     })
 }
 
+fn install_vllm_with_uv(python: &Path) -> Result<()> {
+    let output = ProcessCommand::new("uv")
+        .arg("pip")
+        .arg("install")
+        .arg("--python")
+        .arg(python)
+        .arg("vllm")
+        .arg("--extra-index-url")
+        .arg(VLLM_ROCM_EXTRA_INDEX_URL)
+        .output()
+        .context("failed to launch `uv pip install` for vLLM")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        "no output".to_owned()
+    };
+    bail!(
+        "`uv pip install vllm --extra-index-url {}` failed for {}: {}",
+        VLLM_ROCM_EXTRA_INDEX_URL,
+        python.display(),
+        detail
+    )
+}
+
 fn resolve_managed_runtime(runtime_id: Option<&str>) -> Result<Option<VllmRuntime>> {
+    let candidates = collect_managed_runtime_candidates(runtime_id)?;
+    for candidate in candidates {
+        if let Ok(runtime) = runtime_from_python(
+            candidate.python_executable,
+            &candidate.runtime_id,
+            &candidate.source,
+            candidate.sdk_root,
+            candidate.sdk_bin,
+            candidate.sdk_bin_paths,
+            candidate.sdk_library_paths,
+        ) {
+            return Ok(Some(runtime));
+        }
+    }
+    Ok(None)
+}
+
+fn resolve_managed_runtime_python(runtime_id: Option<&str>) -> Result<Option<ManagedRuntimePython>> {
+    let mut candidates = collect_managed_runtime_candidates(runtime_id)?;
+    let Some(candidate) = candidates.drain(..).next() else {
+        return Ok(None);
+    };
+    Ok(Some(ManagedRuntimePython {
+        runtime_id: candidate.runtime_id,
+        source: candidate.source,
+        python_executable: candidate.python_executable,
+    }))
+}
+
+#[derive(Debug, Clone)]
+struct ManagedRuntimeCandidate {
+    runtime_id: String,
+    source: String,
+    python_executable: PathBuf,
+    sdk_root: Option<PathBuf>,
+    sdk_bin: Option<PathBuf>,
+    sdk_bin_paths: Vec<PathBuf>,
+    sdk_library_paths: Vec<PathBuf>,
+}
+
+fn collect_managed_runtime_candidates(runtime_id: Option<&str>) -> Result<Vec<ManagedRuntimeCandidate>> {
     let paths = AppPaths::discover()?;
     let registry = paths.data_dir.join("runtimes").join("registry");
     if !registry.is_dir() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let mut manifests = Vec::new();
     for entry in
@@ -814,6 +914,7 @@ fn resolve_managed_runtime(runtime_id: Option<&str>) -> Result<Option<VllmRuntim
     }
     manifests.sort_by_key(|(installed_at, _)| std::cmp::Reverse(*installed_at));
 
+    let mut candidates = Vec::new();
     for (_, manifest) in manifests {
         let Some(python) = manifest
             .python_executable
@@ -843,19 +944,17 @@ fn resolve_managed_runtime(runtime_id: Option<&str>) -> Result<Option<VllmRuntim
                     probe.library_paths.clone(),
                 )
             });
-        if let Ok(runtime) = runtime_from_python(
-            python,
-            &runtime_id,
-            &source,
+        candidates.push(ManagedRuntimeCandidate {
+            runtime_id,
+            source,
+            python_executable: python,
             sdk_root,
             sdk_bin,
             sdk_bin_paths,
             sdk_library_paths,
-        ) {
-            return Ok(Some(runtime));
-        }
+        });
     }
-    Ok(None)
+    Ok(candidates)
 }
 
 fn runtime_matches(manifest: &TheRockRuntimeManifest, requested: Option<&str>) -> bool {
