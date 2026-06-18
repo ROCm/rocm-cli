@@ -38072,6 +38072,7 @@ Full log
     fn onboarding_failed_install_shows_reason_and_retry_menu() {
         let mut app = test_app();
         app.config.setup.therock_venv = Some(short_test_install_root());
+        app.config.save(&app.paths).expect("config should save");
         app.reset_onboarding_selection();
         let (sender, receiver) = mpsc::channel();
         app.onboarding_active = true;
