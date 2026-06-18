@@ -43,8 +43,9 @@ use rocm_core::{
     daemon_binary_path, default_engine_for_platform, detect_host_gpu_summary,
     find_automation_proposal, format_host_for_url, format_host_port, format_http_base_url,
     load_model_recipe_registry, load_recent_automation_proposals, managed_pip_cache_dir,
-    managed_service_endpoint_model_ready, replace_automation_proposal, resolve_amd_smi_binary,
-    runtime_directory_label, runtime_drive_root_for_key, runtime_drive_roots, runtime_is_windows,
+    managed_service_endpoint_model_ready, preferred_serve_engine_for_host_gpu_summary,
+    replace_automation_proposal, resolve_amd_smi_binary, runtime_directory_label,
+    runtime_drive_root_for_key, runtime_drive_roots, runtime_is_windows,
     runtime_path_is_same_or_inside, runtime_path_sort_key, sanitize_component, unix_time_millis,
     update_automation_proposal_status,
 };
@@ -3776,8 +3777,11 @@ impl App {
         match load_model_recipe_registry() {
             Ok(registry) => {
                 let recipes = tui_recommended_assistant_recipes(registry.recipes);
-                let engine_index =
-                    serve_wizard_preferred_engine_index(&recipes).unwrap_or(default_engine_index);
+                let engine_index = serve_wizard_preferred_engine_index(
+                    &self.host_gpu_summary,
+                    &recipes,
+                )
+                .unwrap_or(default_engine_index);
                 let message = recipes.is_empty().then(|| {
                     format!(
                         "The recommended assistant model was not found.\n\nExpected: {VALIDATED_LOCAL_ASSISTANT_MODEL}\n\nNo unverified model will be used automatically."
@@ -6027,7 +6031,11 @@ impl App {
         if let Some(model) = model {
             self.open_serve_wizard_from_plan(ServeCommandPlan {
                 model: Some(model),
-                engine: Some(default_engine_for_platform().to_owned()),
+                engine: Some(
+                    preferred_serve_engine_for_host_gpu_summary(&self.host_gpu_summary)
+                        .unwrap_or(default_engine_for_platform())
+                        .to_owned(),
+                ),
                 device: Some("gpu_required".to_owned()),
                 managed: true,
                 ..ServeCommandPlan::default()
@@ -21390,8 +21398,16 @@ fn tui_recommended_assistant_recipes(recipes: Vec<ModelRecipeRecord>) -> Vec<Mod
         .collect()
 }
 
-fn serve_wizard_preferred_engine_index(recipes: &[ModelRecipeRecord]) -> Option<usize> {
+fn serve_wizard_preferred_engine_index(
+    host_gpu_summary: &HostGpuSummary,
+    recipes: &[ModelRecipeRecord],
+) -> Option<usize> {
     let engines = serve_wizard_engine_names();
+    if let Some(engine) = preferred_serve_engine_for_host_gpu_summary(host_gpu_summary)
+        && let Some(index) = engines.iter().position(|candidate| candidate == engine)
+    {
+        return Some(index);
+    }
     recipes.first().and_then(|recipe| {
         recipe
             .preferred_engines
