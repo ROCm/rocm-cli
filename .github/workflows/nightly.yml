@@ -92,7 +92,7 @@ jobs:
                 curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
               fi
               export PATH="/host-cargo/bin:$PATH"
-              cargo build --release --workspace
+              cargo build --release -p rocm -p rocmd -p xtask
             '
 
       - name: Set nightly metadata
@@ -184,7 +184,7 @@ jobs:
 
       - name: Build release binaries
         shell: pwsh
-        run: cargo build --release --workspace
+        run: cargo build --release -p rocm -p rocmd -p xtask
 
       - name: Package Windows bundle
         shell: pwsh
