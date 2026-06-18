@@ -23,7 +23,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsString;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -32,6 +32,8 @@ const ENGINE_NAME: &str = "vllm";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const HEALTHCHECK_TIMEOUT_MS: u64 = 700;
 const DEFAULT_GPU_MEMORY_UTILIZATION: &str = "0.80";
+const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
+const MAX_TAIL_READ: u64 = 4 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(name = "rocm-engine-vllm", about = "rocm-cli vLLM engine adapter")]
@@ -205,18 +207,24 @@ pub fn run_cli() -> Result<()> {
             env_id,
             state_path,
             engine_recipe_json,
-        } => serve_http(ServeHttpRequest {
-            service_id,
-            model_ref,
-            host,
-            port,
-            device_policy: parse_device_policy_arg(Some(&device_policy))?,
-            gpu_indices: parse_gpu_indices_arg(gpu.as_deref())?,
-            runtime_id,
-            env_id,
-            state_path,
-            engine_recipe: parse_engine_recipe_json(engine_recipe_json)?,
-        })?,
+        } => {
+            let log_path = AppPaths::discover()?
+                .engine_logs_dir(ENGINE_NAME)
+                .join(format!("{}.log", service_id));
+            serve_http(ServeHttpRequest {
+                service_id,
+                model_ref,
+                host,
+                port,
+                device_policy: parse_device_policy_arg(Some(&device_policy))?,
+                gpu_indices: parse_gpu_indices_arg(gpu.as_deref())?,
+                runtime_id,
+                env_id,
+                state_path,
+                log_path: Some(log_path),
+                engine_recipe: parse_engine_recipe_json(engine_recipe_json)?,
+            })?
+        },
     }
     Ok(())
 }
@@ -236,6 +244,7 @@ pub fn builtin_serve_http(
     runtime_id: Option<String>,
     env_id: Option<String>,
     state_path: PathBuf,
+    log_path: Option<PathBuf>,
     engine_recipe: Option<EngineRecipeHint>,
 ) -> Result<()> {
     serve_http(ServeHttpRequest {
@@ -248,6 +257,7 @@ pub fn builtin_serve_http(
         runtime_id,
         env_id,
         state_path,
+        log_path,
         engine_recipe,
     })
 }
@@ -474,6 +484,9 @@ fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
     let state_path = AppPaths::discover()?
         .engine_state_dir(ENGINE_NAME)
         .join(format!("{}.json", request.service_id));
+    let log_path = AppPaths::discover()?
+        .engine_logs_dir(ENGINE_NAME)
+        .join(format!("{}.log", request.service_id));
     let serve_request = ServeHttpRequest {
         service_id: request.service_id.clone(),
         model_ref: request.model_ref.clone(),
@@ -484,11 +497,9 @@ fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
         runtime_id: request.runtime_id.clone(),
         env_id: request.env_id.clone(),
         state_path: state_path.clone(),
+        log_path: Some(log_path.clone()),
         engine_recipe,
     };
-    let log_path = AppPaths::discover()?
-        .engine_logs_dir(ENGINE_NAME)
-        .join(format!("{}.log", request.service_id));
     let child = spawn_vllm_server(&serve_request, &runtime, Some(&log_path))?;
     let pid = child.id();
     write_running_state(&serve_request, &runtime, pid)?;
@@ -512,13 +523,28 @@ struct ServeHttpRequest {
     runtime_id: Option<String>,
     env_id: Option<String>,
     state_path: PathBuf,
+    log_path: Option<PathBuf>,
     engine_recipe: Option<EngineRecipeHint>,
 }
 
 fn serve_http(request: ServeHttpRequest) -> Result<()> {
     let runtime = resolve_vllm_runtime(request.runtime_id.as_deref())?;
-    let mut child = spawn_vllm_server(&request, &runtime, None)?;
+    let mut child = spawn_vllm_server(&request, &runtime, request.log_path.as_deref())?;
     write_running_state(&request, &runtime, child.id())?;
+    
+    // Wait for the server to become ready, with comprehensive error logging
+    if let Err(e) = wait_for_vllm_ready(
+        &request.host,
+        request.port,
+        &request.model_ref,
+        Duration::from_secs(300),
+        request.log_path.as_deref(),
+    ) {
+        let _ = child.kill();
+        write_terminal_state(&request.state_path, "failed")?;
+        return Err(e);
+    }
+    
     let status = child.wait().context("failed waiting for vLLM server")?;
     write_terminal_state(
         &request.state_path,
@@ -1191,26 +1217,6 @@ fn terminate_pid(pid: u32, _force: bool) -> bool {
     rocm_core::terminate_process(pid).is_ok()
 }
 
-fn tail_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
-    let text =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(tail_lines_from_text(&text, limit))
-}
-
-fn tail_lines_from_text(text: &str, limit: usize) -> Vec<String> {
-    if limit == 0 {
-        return Vec::new();
-    }
-    let mut lines = text
-        .lines()
-        .rev()
-        .take(limit)
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    lines.reverse();
-    lines
-}
-
 fn value_string(value: &Value, key: &str) -> Option<String> {
     value.get(key)?.as_str().map(str::to_owned)
 }
@@ -1261,6 +1267,98 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
     serde_json::to_writer_pretty(&mut handle, value)?;
     writeln!(&mut handle)?;
     Ok(())
+}
+
+/// Polls the vLLM endpoint until it reports the model is loaded, or times out.
+/// If the server fails to become ready, returns an error with log tail summary.
+fn wait_for_vllm_ready(
+    host: &str,
+    port: u16,
+    model_ref: &str,
+    timeout: Duration,
+    log_path: Option<&Path>,
+) -> Result<()> {
+    let start = SystemTime::now();
+    let endpoint = format!("http://{}:{}", host, port);
+    let poll_interval = Duration::from_millis(500);
+
+    loop {
+        if start.elapsed().unwrap_or(timeout) > timeout {
+            let summary = log_path
+                .and_then(|p| summarize_startup_log_tail(p, STARTUP_FAILURE_LOG_TAIL_LINES).ok())
+                .unwrap_or_default();
+            let log_context = if summary.is_empty() {
+                String::new()
+            } else {
+                format!("\n\nLast {} lines of startup log:\n{}", STARTUP_FAILURE_LOG_TAIL_LINES, summary)
+            };
+            bail!(
+                "vLLM server at {}:{} failed to become ready within {} seconds{}",
+                host,
+                port,
+                timeout.as_secs(),
+                log_context
+            );
+        }
+
+        match query_loaded_model_endpoint(&endpoint, Some(model_ref)) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                std::thread::sleep(poll_interval);
+                continue;
+            }
+            Err(_) => {
+                std::thread::sleep(poll_interval);
+                continue;
+            }
+        }
+    }
+}
+
+/// Reads the last N lines from a log file and returns them as a formatted string.
+/// Handles large files by seeking to near the end and reading backwards.
+fn summarize_startup_log_tail(log_path: &Path, limit: usize) -> Result<String> {
+    let lines = tail_lines(log_path, limit)?;
+    if lines.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(lines.join("\n"))
+}
+
+/// Reads the last N lines from a file efficiently by seeking.
+/// For files larger than MAX_TAIL_READ, seeks to MAX_TAIL_READ from the end.
+fn tail_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("failed to open log file {}", path.display()))?;
+    let metadata = file.metadata()
+        .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+    let file_size = metadata.len();
+
+    // For large files, seek to MAX_TAIL_READ from the end
+    if file_size > MAX_TAIL_READ {
+        let seek_pos = file_size.saturating_sub(MAX_TAIL_READ);
+        file.seek(SeekFrom::Start(seek_pos))
+            .with_context(|| format!("failed to seek in log file {}", path.display()))?;
+    }
+
+    let buffered = BufReader::new(file);
+    let mut lines: Vec<String> = buffered
+        .lines()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to read lines from {}", path.display()))?;
+
+    // Skip the first partial line (result of seeking in the middle of a line)
+    if lines.len() > 1 && !lines[0].is_empty() && file_size > MAX_TAIL_READ {
+        lines.remove(0);
+    }
+
+    // Return only the last `limit` lines
+    let start_idx = if lines.len() > limit {
+        lines.len() - limit
+    } else {
+        0
+    };
+    Ok(lines.into_iter().skip(start_idx).collect())
 }
 
 #[cfg(test)]
@@ -1607,6 +1705,7 @@ mod tests {
             runtime_id: Some("runtime-key-gfx120x".to_owned()),
             env_id: None,
             state_path: state_path.clone(),
+            log_path: None,
             engine_recipe: None,
         };
         let runtime = VllmRuntime {
