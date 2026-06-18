@@ -56,7 +56,7 @@ use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -3722,6 +3722,30 @@ fn attach_background_stdio(command: &mut ProcessCommand, log_path: Option<&Path>
     Ok(())
 }
 
+
+fn managed_engine_startup_failure_detail(status: ExitStatus, log_path: &Path) -> String {
+    let mut recent_lines = read_optional_tail_lines(log_path, 80, "service log");
+    if recent_lines.is_empty() {
+        for _ in 0..5 {
+            thread::sleep(Duration::from_millis(120));
+            recent_lines = read_optional_tail_lines(log_path, 80, "service log");
+            if !recent_lines.is_empty() {
+                break;
+            }
+        }
+    }
+    if recent_lines.is_empty() {
+        return format!(
+            "managed engine exited immediately with status {status}; inspect {}",
+            log_path.display()
+        );
+    }
+    format!(
+        "managed engine exited immediately with status {status}; inspect {}\n\nrecent startup log output:\n{}",
+        log_path.display(),
+        recent_lines.join("\n")
+    )
+}
 #[cfg(not(windows))]
 fn managed_service_process_command(program: &Path, args: &[String]) -> ProcessCommand {
     let mut command = ProcessCommand::new(program);
@@ -3843,9 +3867,8 @@ fn start_managed_service(
             .context("failed to check managed engine startup state")?
         {
             bail!(
-                "managed engine exited immediately with status {}; inspect {}",
-                status,
-                record.log_path.display()
+                "{}",
+                managed_engine_startup_failure_detail(status, &record.log_path)
             );
         }
         child_pid
@@ -11304,9 +11327,8 @@ fn restart_internal_managed_service(
             record.status = "failed".to_owned();
             record.write()?;
             bail!(
-                "managed engine exited immediately with status {}; inspect {}",
-                status,
-                record.log_path.display()
+                "{}",
+                managed_engine_startup_failure_detail(status, &record.log_path)
             );
         }
         child.id()
@@ -14100,6 +14122,7 @@ fn run_builtin_engine_serve_http(
             runtime_id,
             env_id,
             state_path,
+            log_path,
             engine_recipe,
         ),
         other => bail!("engine `{other}` is not built into this rocm binary"),

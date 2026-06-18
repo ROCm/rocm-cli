@@ -5936,6 +5936,17 @@ impl App {
         self.open_log_output_card("Service Logs", detail);
     }
 
+    fn managed_service_failure_message(
+        &self,
+        record: &ManagedServiceRecord,
+        summary: &str,
+        next_step: &str,
+    ) -> String {
+        let detail = render_service_logs_text_for_tui(&self.paths, &record.service_id, false)
+            .unwrap_or_else(|error| format!("Service log lookup failed.\n\n{error}"));
+        truncate_command_output(&format!("{summary}\n\n{detail}\n\n{next_step}"))
+    }
+
     fn open_selected_service_chat(&mut self) {
         if self.running_job_blocks_screen_switch() {
             return;
@@ -5949,12 +5960,14 @@ impl App {
             return;
         };
         if !managed_service_is_chat_ready(&record) {
+            let failure_message = self.managed_service_failure_message(
+                &record,
+                "This server did not start.",
+                "Restart selected server after fixing the problem, or open the full logs from Services.",
+            );
             if let Some(state) = self.services_manager.as_mut() {
                 state.message = Some(match record.status.as_str() {
-                    "failed" | "unreachable" | "exited" => {
-                        "This server did not start.\n\nOpen logs to see why, or choose Restart selected server after fixing the problem."
-                            .to_owned()
-                    }
+                    "failed" | "unreachable" | "exited" => failure_message,
                     _ => {
                         "This server is still starting.\n\nOpen logs to watch progress, or press F5 until it is ready."
                             .to_owned()
@@ -5963,7 +5976,8 @@ impl App {
             }
             self.status = match record.status.as_str() {
                 "failed" | "unreachable" | "exited" => {
-                    "Selected server failed before chat could start.".to_owned()
+                    "Selected server failed before chat could start. Recent log output is shown above."
+                        .to_owned()
                 }
                 _ => "Selected server is not ready for chat yet.".to_owned(),
             };
@@ -6161,11 +6175,17 @@ impl App {
             .as_ref()
             .map(|record| record.status.clone())
             .unwrap_or_default();
+        let failure_message = selected_record.as_ref().map(|record| {
+            self.managed_service_failure_message(
+                record,
+                "Local assistant did not start.",
+                "Open the full service logs or restart the service after fixing the problem.",
+            )
+        });
         if let Some(state) = self.services_manager.as_mut() {
             state.message = Some(match selected_status.as_str() {
-                "failed" | "unreachable" | "exited" => {
-                    "Local assistant did not start.\n\nOpen logs for the reason.".to_owned()
-                }
+                "failed" | "unreachable" | "exited" => failure_message
+                    .unwrap_or_else(|| "Local assistant did not start.".to_owned()),
                 _ => selected_record.as_ref().map_or_else(
                     || "Local assistant is starting.".to_owned(),
                     |record| format!("Starting at {}.", record.endpoint_url),
@@ -6174,7 +6194,7 @@ impl App {
         }
         self.status = match selected_status.as_str() {
             "failed" | "unreachable" | "exited" => {
-                "Local assistant failed to start. Open logs for the reason.".to_owned()
+                "Local assistant failed to start. Recent log output is shown above.".to_owned()
             }
             _ => selected_record.as_ref().map_or_else(
                 || "Local assistant is starting.".to_owned(),
@@ -27140,6 +27160,13 @@ fn plain_command_completion_text(
         return output.trim_end().to_owned();
     }
     let _ = writeln!(output, "{title} failed.");
+    if title == "Serve"
+        && let Some(detail) = plain_command_failure_detail(rendered, recent_output)
+    {
+        let _ = writeln!(output);
+        let _ = writeln!(output, "{detail}");
+        return output.trim_end().to_owned();
+    }
     if let Some(reason) = plain_command_failure_reason(rendered, recent_output) {
         let _ = writeln!(output);
         if reason.to_ascii_lowercase().starts_with("error:") {
@@ -27151,7 +27178,22 @@ fn plain_command_completion_text(
     output.trim_end().to_owned()
 }
 
+fn plain_command_failure_detail(rendered: &str, recent_output: Option<&str>) -> Option<String> {
+    let mut lines = plain_command_failure_lines(rendered, recent_output);
+    let first = lines.first_mut()?;
+    if !first.to_ascii_lowercase().starts_with("error:") {
+        *first = format!("Error: {first}");
+    }
+    Some(lines.join("\n"))
+}
+
 fn plain_command_failure_reason(rendered: &str, recent_output: Option<&str>) -> Option<String> {
+    plain_command_failure_lines(rendered, recent_output)
+        .into_iter()
+        .next()
+}
+
+fn plain_command_failure_lines(rendered: &str, recent_output: Option<&str>) -> Vec<String> {
     recent_output
         .filter(|recent| !recent.trim().is_empty())
         .into_iter()
@@ -27169,7 +27211,8 @@ fn plain_command_failure_reason(rendered: &str, recent_output: Option<&str>) -> 
                 && !line.eq_ignore_ascii_case("live output")
         })
         .map(display_stream_log_line)
-        .find(|line| !line.trim().is_empty())
+            .filter(|line| !line.trim().is_empty())
+            .collect()
 }
 
 fn terse_screen_command_success_text(
@@ -39719,6 +39762,32 @@ Full log
         let truncated = super::truncate_command_output(&long);
         assert!(truncated.contains("truncated"));
         assert!(truncated.lines().count() < 300);
+    }
+
+    #[test]
+    fn serve_failure_summary_keeps_multiline_log_output() {
+        let rendered = [
+            "error: vLLM server did not become ready within 30s",
+            "vLLM startup log tail (/tmp/vllm.log):",
+            "RuntimeError: HIP out of memory",
+            "trace line",
+        ]
+        .join("\n");
+
+        let summary = super::plain_command_completion_text(
+            "Serve",
+            false,
+            &rendered,
+            super::StreamedOutputCounts::default(),
+            None,
+            None,
+            None,
+        );
+
+        assert!(summary.contains("Serve failed."));
+        assert!(summary.contains("vLLM startup log tail"));
+        assert!(summary.contains("RuntimeError: HIP out of memory"));
+        assert!(summary.contains("trace line"));
     }
 
     #[test]
