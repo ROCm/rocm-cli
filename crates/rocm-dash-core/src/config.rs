@@ -152,13 +152,46 @@ mod duration_secs {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
         let secs = f64::deserialize(d)?;
-        Ok(Duration::from_secs_f64(secs))
+        // try_from_secs_f64 rejects NaN, negative, inf, and overflow.
+        Duration::try_from_secs_f64(secs)
+            .map_err(|e| serde::de::Error::custom(format!("invalid duration: {e}")))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn daemon_toml_with_gpu_tick(gpu_tick: &str) -> String {
+        format!(
+            "[daemon]\nlisten = \"unix:/tmp/test.sock\"\n\
+             discovery_tick = 5.0\ninstance_tick = 2.0\ngpu_tick = {gpu_tick}\n"
+        )
+    }
+
+    #[test]
+    fn duration_rejects_negative_gpu_tick() {
+        assert!(
+            toml::from_str::<Config>(&daemon_toml_with_gpu_tick("-1.0")).is_err(),
+            "negative gpu_tick must be rejected"
+        );
+    }
+
+    #[test]
+    fn duration_rejects_negative_discovery_tick() {
+        let toml = "[daemon]\nlisten = \"unix:/tmp/test.sock\"\n\
+                    gpu_tick = 1.0\ninstance_tick = 2.0\ndiscovery_tick = -0.001\n";
+        assert!(
+            toml::from_str::<Config>(toml).is_err(),
+            "negative discovery_tick must be rejected"
+        );
+    }
+
+    #[test]
+    fn duration_accepts_valid_positive() {
+        let c: Config = toml::from_str(&daemon_toml_with_gpu_tick("0.5")).unwrap();
+        assert_eq!(c.daemon.gpu_tick, std::time::Duration::from_millis(500));
+    }
 
     #[test]
     fn defaults_serialize_and_round_trip() {

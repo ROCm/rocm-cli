@@ -386,16 +386,8 @@ fn draw_bench(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             (p, _) => format!("{p:?}"),
         };
         let model = r.model.as_deref().unwrap_or("?");
-        let model_trunc = if model.len() > 20 {
-            &model[..20]
-        } else {
-            model
-        };
-        let cell = if r.cell.len() > 10 {
-            &r.cell[..10]
-        } else {
-            r.cell.as_str()
-        };
+        let model_trunc = trunc(model, 20);
+        let cell = trunc(&r.cell, 10);
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{cell:<10} {:>3} {model_trunc:<20} ", r.run),
@@ -413,4 +405,33 @@ fn draw_bench(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         ]));
     }
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ui::widgets::trunc;
+
+    #[test]
+    fn trunc_does_not_panic_on_multibyte_model_name() {
+        // Each Greek letter is 2 bytes; 20-char string is 40 bytes.
+        // Before the fix, &model[..20] would panic mid-codepoint.
+        let model = "αβγδεζηθικλμνξοπρστυ"; // 20 Greek letters = 40 bytes
+        let result = trunc(model, 20);
+        assert_eq!(result.chars().count(), 20);
+    }
+
+    #[test]
+    fn trunc_clips_multibyte_at_char_boundary() {
+        let model = "αβγδεζηθικλμνξοπρστυφ"; // 21 Greek letters
+        let result = trunc(model, 20);
+        assert_eq!(result.chars().count(), 20);
+        assert!(result.is_char_boundary(result.len()));
+    }
+
+    #[test]
+    fn trunc_does_not_panic_on_multibyte_cell_name() {
+        let cell = "日本語テスト"; // 6 CJK chars, each 3 bytes; fits in 10
+        let result = trunc(cell, 10);
+        assert_eq!(result, cell);
+    }
 }

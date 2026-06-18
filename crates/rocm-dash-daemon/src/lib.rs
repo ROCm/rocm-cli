@@ -4,8 +4,6 @@
 //! TUI clients over a Unix socket. The composition-root binary (`rocm`)
 //! drives this library via its `serve` subcommand.
 
-#![allow(dead_code)]
-
 pub mod bench_ring;
 pub mod demo;
 pub mod persist;

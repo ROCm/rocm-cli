@@ -20,7 +20,7 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// Fully-resolved chat endpoint configuration. `api_key` is sourced from the
 /// environment only — never from TOML/CLI/source (see `main.rs`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LlmConfig {
     pub base_url: String,
     pub model: String,
@@ -28,6 +28,17 @@ pub struct LlmConfig {
     /// Custom auth header NAME (e.g. `Ocp-Apim-Subscription-Key`). When set, the
     /// `api_key` value is sent in this header instead of `Authorization: Bearer`.
     pub auth_header: Option<String>,
+}
+
+impl std::fmt::Debug for LlmConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmConfig")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .field("auth_header", &self.auth_header)
+            .finish()
+    }
 }
 
 /// Resolve the chat endpoint by precedence: **CLI > config > env > probed

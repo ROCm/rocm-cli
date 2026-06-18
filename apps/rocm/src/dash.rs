@@ -241,15 +241,24 @@ async fn maybe_spawn_embedded_daemon(
         let opts = runner_options(config, paths, false);
         let listen = connect.to_string();
         let socket = Some(PathBuf::from(target));
-        let token = config.dashboard.daemon.token.clone();
 
         let handle = tokio::spawn(async move {
-            if let Err(e) = rocm_dash_daemon::server::run(&listen, token.as_deref(), opts).await {
+            if let Err(e) = rocm_dash_daemon::server::run(&listen, opts).await {
                 eprintln!("rocm: embedded telemetry daemon exited: {e:#}");
             }
         });
-        // Give it a moment to bind before the TUI client dials in.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Poll until the daemon has bound and is accepting connections.
+        // A fixed sleep is race-prone on slow or loaded systems.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if tokio::net::UnixStream::connect(target).await.is_ok() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break; // Proceed anyway; the TUI client will retry with backoff.
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         Some((handle, socket))
     }
     #[cfg(windows)]

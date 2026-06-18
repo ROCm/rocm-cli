@@ -574,11 +574,53 @@ impl ChatGptAgentClient {
         F: Fn(String, String) + Send + Sync + 'static,
     {
         use rig::providers::chatgpt;
+        // Store OAuth tokens in a user-owned directory so the plaintext
+        // access/refresh tokens are not readable by other local users.
+        // Refuse to fall back to a predictable temp path: a pre-existing
+        // directory there could be owned by another user.
+        let token_dir = std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty())) // Windows
+            .map(|h| {
+                std::path::PathBuf::from(h)
+                    .join(".rocm")
+                    .join("data")
+                    .join("chatgpt-tokens")
+            })
+            .ok_or_else(|| {
+                AgentError::Build(
+                    "home directory not found ($HOME/$USERPROFILE unset); \
+                     cannot safely store OAuth tokens"
+                        .to_string(),
+                )
+            })?;
+        #[cfg(unix)]
+        {
+            // Create with mode 0o700 up-front so the directory is never
+            // world-accessible even for the brief window before set_permissions.
+            // The subsequent set_permissions call tightens pre-existing dirs.
+            use std::os::unix::fs::DirBuilderExt;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&token_dir)
+                .map_err(|e| AgentError::Build(format!("cannot create token cache dir: {e}")))?;
+            if let Err(e) =
+                std::fs::set_permissions(&token_dir, std::fs::Permissions::from_mode(0o700))
+            {
+                tracing::warn!(dir = %token_dir.display(), error = %e, "could not restrict token cache dir permissions");
+            }
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(&token_dir)
+            .map_err(|e| AgentError::Build(format!("cannot create token cache dir: {e}")))?;
         // The closure param is the provider's `DeviceCodePrompt` (its `auth`
         // module is private, so we let inference name it); its `verification_uri`
         // and `user_code` fields are public.
         let client = chatgpt::Client::builder()
             .oauth()
+            .token_dir(token_dir)
             .on_device_code(move |p| on_device_code(p.verification_uri, p.user_code))
             .build()
             .map_err(|e| AgentError::Build(e.to_string()))?;

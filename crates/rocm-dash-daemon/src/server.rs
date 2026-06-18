@@ -22,15 +22,23 @@ use crate::transport::{read_line, write_line};
 
 /// Broadcast capacity. A slow client that lags more than this many ticks will
 /// receive `RecvError::Lagged` and skip ahead (no crash).
+#[cfg(unix)]
 const BROADCAST_CAP: usize = 64;
 
 /// Snapshot history kept for late-joining clients (~30s at 1Hz).
+#[cfg(unix)]
 const RING_CAP: usize = 30;
 
 /// Benchmark-row history kept for late-joining clients (matches TUI `BENCH_CAP`).
+#[cfg(unix)]
 const BENCH_RING_CAP: usize = 200;
 
-pub async fn run(listen: &str, _token: Option<&str>, opts: RunnerOptions) -> anyhow::Result<()> {
+/// Start the daemon on `listen` (e.g. `unix:/run/user/1000/rocmdashd.sock`).
+///
+/// Access control is enforced by filesystem permissions: the Unix socket is
+/// created with mode `0o600` so only the owning user can connect. The parent
+/// directory is created if it does not exist.
+pub async fn run(listen: &str, opts: RunnerOptions) -> anyhow::Result<()> {
     let (scheme, target) = listen
         .split_once(':')
         .ok_or_else(|| anyhow!("listen must be `unix:/path` or `tcp:host:port`"))?;
@@ -46,12 +54,42 @@ pub async fn run(listen: &str, _token: Option<&str>, opts: RunnerOptions) -> any
 async fn run_unix(path: PathBuf, opts: RunnerOptions) -> anyhow::Result<()> {
     use tokio::net::UnixListener;
 
+    if let Some(parent) = path.parent() {
+        // Skip hardening if parent is an empty path (relative socket target
+        // such as `unix:foo.sock`). Operating on `""` would target the CWD.
+        if !parent.as_os_str().is_empty() {
+            // Create the parent directory with mode 0o700 so other users cannot
+            // traverse into it. DirBuilder::mode only applies to directories it
+            // creates; pre-existing directories keep their current permissions,
+            // so we explicitly set_permissions afterwards to tighten them.
+            use std::os::unix::fs::DirBuilderExt;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .with_context(|| format!("creating socket directory {parent:?}"))?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).with_context(
+                || {
+                    format!(
+                        "restricting socket directory {parent:?} to mode 0700 — \
+                         check that the directory is owned by the current user \
+                         (EPERM means it is owned by another user or root)"
+                    )
+                },
+            )?;
+        }
+    }
     if path.exists() {
         std::fs::remove_file(&path)
             .with_context(|| format!("removing stale socket {}", path.display()))?;
     }
-    let listener =
-        UnixListener::bind(&path).with_context(|| format!("binding {}", path.display()))?;
+    let listener = UnixListener::bind(&path).with_context(|| format!("binding {path:?}"))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting permissions on {path:?}"))?;
+    }
     info!(socket = %path.display(), "listening");
 
     let (snap_tx, _) = broadcast::channel::<Event>(BROADCAST_CAP);
@@ -202,6 +240,7 @@ async fn handle_client(
     Ok(())
 }
 
+#[cfg(unix)]
 fn hostname() -> Option<String> {
     std::env::var("HOSTNAME").ok().or_else(|| {
         std::fs::read_to_string("/proc/sys/kernel/hostname")

@@ -17,7 +17,6 @@ pub mod job_console;
 pub mod logs_view;
 pub mod modal;
 pub mod model_picker;
-pub mod monitor;
 pub mod onboarding;
 pub mod runtime_manager;
 pub mod serve_wizard;

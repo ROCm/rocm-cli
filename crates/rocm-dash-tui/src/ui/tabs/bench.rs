@@ -489,13 +489,6 @@ fn fmt_opt<T: std::fmt::Display>(v: &Option<T>) -> String {
     }
 }
 
-fn fmt_opt_f64_4(v: Option<f64>) -> String {
-    match v {
-        Some(x) => format!("{x:.4}"),
-        None => "-".to_string(),
-    }
-}
-
 /// SI-formatted optional `u32` counter (`-` when None).
 fn fmt_opt_u32_si(v: Option<u32>) -> String {
     match v {

@@ -4,8 +4,6 @@
 //! the same modules are reachable as a library so examples (e.g. screenshot
 //! generation) can drive the UI in-process.
 
-#![allow(dead_code)]
-
 pub mod agent;
 pub mod app;
 pub mod client;
