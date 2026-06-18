@@ -369,7 +369,7 @@ jobs:
       - name: Test prebuilt binaries in WSL Ubuntu
         run: |
           $ErrorActionPreference = "Stop"
-          $wp = (wsl -d Ubuntu wslpath "'$($PWD.Path)'").Trim()
+          $wp = (wsl -d Ubuntu wslpath -u "$($PWD.Path)").Trim()
           if ($wp -match "'") { throw "Working directory path contains a single quote; cannot safely pass to bash" }
           $script = @"
           set -euo pipefail
@@ -401,7 +401,7 @@ jobs:
       - name: Build and GPU-test in WSL Fedora
         run: |
           $ErrorActionPreference = "Stop"
-          $wp = (wsl -d Fedora wslpath "'$($PWD.Path)'").Trim()
+          $wp = (wsl -d Fedora wslpath -u "$($PWD.Path)").Trim()
           if ($wp -match "'") { throw "Working directory path contains a single quote; cannot safely pass to bash" }
           $script = @"
           set -euo pipefail
