@@ -552,7 +552,7 @@ def wait_health(host: str, port: int, timeout: int) -> dict[str, Any]:
                     "status_code": status,
                     "body": body.decode("utf-8", errors="replace"),
                 }
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             last_error = exc
         time.sleep(0.5)
     raise RuntimeError(f"vLLM server did not become healthy: {last_error}")

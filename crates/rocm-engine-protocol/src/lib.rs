@@ -522,7 +522,7 @@ mod tests {
         fs::create_dir_all(first_dir.join(platform_engine_plugin_binary_name("sglang"))).unwrap();
 
         let plugins =
-            discover_engine_plugins([root.join("missing"), first_dir.clone(), second_dir]).unwrap();
+            discover_engine_plugins([root.join("missing"), first_dir, second_dir]).unwrap();
         let ids = plugins
             .iter()
             .map(|plugin| plugin.id.as_str())

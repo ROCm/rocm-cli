@@ -59,35 +59,31 @@ pub const CHOICES: &[OnboardingChoice] = &[
 ];
 
 impl OnboardingChoice {
-    fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
-            OnboardingChoice::InstallSdk => "Install ROCm SDK (release · pip)",
-            OnboardingChoice::AdoptExisting => "Adopt an existing ROCm folder",
+            Self::InstallSdk => "Install ROCm SDK (release · pip)",
+            Self::AdoptExisting => "Adopt an existing ROCm folder",
         }
     }
 
-    fn job_id(self) -> &'static str {
+    const fn job_id(self) -> &'static str {
         match self {
-            OnboardingChoice::InstallSdk => "onboard-install",
-            OnboardingChoice::AdoptExisting => "onboard-adopt",
+            Self::InstallSdk => "onboard-install",
+            Self::AdoptExisting => "onboard-adopt",
         }
     }
 
-    fn title(self) -> &'static str {
+    const fn title(self) -> &'static str {
         match self {
-            OnboardingChoice::InstallSdk => "install ROCm SDK",
-            OnboardingChoice::AdoptExisting => "adopt existing ROCm folder",
+            Self::InstallSdk => "install ROCm SDK",
+            Self::AdoptExisting => "adopt existing ROCm folder",
         }
     }
 
-    fn explanation(self) -> &'static str {
+    const fn explanation(self) -> &'static str {
         match self {
-            OnboardingChoice::InstallSdk => {
-                "This downloads and installs TheRock ROCm wheels on this machine."
-            }
-            OnboardingChoice::AdoptExisting => {
-                "This registers an existing ROCm folder without modifying it."
-            }
+            Self::InstallSdk => "This downloads and installs TheRock ROCm wheels on this machine.",
+            Self::AdoptExisting => "This registers an existing ROCm folder without modifying it.",
         }
     }
 }
@@ -167,7 +163,7 @@ pub fn on_key(
                     return spawn_onboard(o, jobs, pending.choice, pending.cmd, pending.args);
                 }
             }
-            Some(ApprovalVerdict::Deny) | Some(ApprovalVerdict::Cancel) => o.approval = None,
+            Some(ApprovalVerdict::Deny | ApprovalVerdict::Cancel) => o.approval = None,
             None => {}
         }
         return Vec::new();
@@ -184,8 +180,7 @@ pub fn on_key(
                 // message so the wizard never claims success it didn't earn.
                 let ok = jobs
                     .job(&job_id)
-                    .map(|j| matches!(j.status, JobStatus::Done { code: 0 }))
-                    .unwrap_or(false);
+                    .is_some_and(|j| matches!(j.status, JobStatus::Done { code: 0 }));
                 o.active_job = None;
                 if ok {
                     o.message = None;
@@ -629,7 +624,7 @@ mod tests {
             .buffer()
             .content()
             .iter()
-            .map(|c| c.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(out.contains("first-run setup"));
         assert!(out.contains("get ROCm set up"));
@@ -647,7 +642,7 @@ mod tests {
             .buffer()
             .content()
             .iter()
-            .map(|c| c.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(out.contains("Install ROCm SDK"));
         assert!(out.contains("Adopt an existing"));

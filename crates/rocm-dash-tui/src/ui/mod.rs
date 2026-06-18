@@ -158,7 +158,7 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         Span::raw("   "),
         Span::styled(status_text, Style::default().fg(status_color)),
     ];
-    let warning_count = state.latest.as_ref().map(|s| s.warnings.len()).unwrap_or(0);
+    let warning_count = state.latest.as_ref().map_or(0, |s| s.warnings.len());
     if warning_count > 0 {
         spans.push(Span::raw("   "));
         spans.push(Span::styled(

@@ -206,7 +206,7 @@ def wait_sglang_openai_ready(host: str, port: int, timeout: int) -> dict[str, An
             models = get_json(host, port, "/v1/models", timeout=3)
             first_model_id(models)
             return {"status_code": 200, "body": "v1/models ready"}
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             last_error = exc
         time.sleep(0.5)
     raise RuntimeError(

@@ -1,6 +1,7 @@
-//! Pure efficiency derivations (tokens-per-watt). No I/O, no rendering — this
-//! is the join that turns vLLM throughput + amd-smi power into a per-instance
-//! capacity number. See `../wiki/concepts/metric-registry.md`.
+//! Pure efficiency derivations (tokens-per-watt). No I/O, no rendering.
+//!
+//! This is the join that turns vLLM throughput + amd-smi power into a
+//! per-instance capacity number. See `../wiki/concepts/metric-registry.md`.
 
 use crate::metrics::GpuMetrics;
 
@@ -20,9 +21,11 @@ pub(crate) fn device_in(device_id: &str, gpu_ids: &[String]) -> bool {
     gpu_ids.iter().any(|id| normalize_gpu_id(id) == dev)
 }
 
-/// Whether any GPU in `gpus` belongs to `gpu_ids`. Distinguishes a failed id
-/// join (no overlap) from a successful join where power happens to be zero —
-/// used by the runner to warn when ids don't line up on real hardware.
+/// Whether any GPU in `gpus` belongs to `gpu_ids`.
+///
+/// Distinguishes a failed id join (no overlap) from a successful join where
+/// power happens to be zero — used by the runner to warn when ids don't line
+/// up on real hardware.
 pub fn gpu_ids_overlap(gpu_ids: &[String], gpus: &[GpuMetrics]) -> bool {
     gpus.iter().any(|g| device_in(&g.device_id, gpu_ids))
 }
@@ -43,7 +46,7 @@ pub fn tokens_per_watt(
     let total_w: f64 = gpus
         .iter()
         .filter(|g| device_in(&g.device_id, gpu_ids))
-        .map(|g| g.power_w as f64)
+        .map(|g| f64::from(g.power_w))
         .sum();
     if total_w > 0.0 {
         Some(tps / total_w)

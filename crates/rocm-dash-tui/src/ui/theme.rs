@@ -92,7 +92,7 @@ pub fn theme_names() -> Vec<&'static str> {
 impl Theme {
     // --- bespoke palettes (don't fit a clean ANSI mapping) -----------------
 
-    pub fn default_dark() -> Self {
+    pub const fn default_dark() -> Self {
         Self {
             bg: rgb(0x13, 0x14, 0x16),
             surface: rgb(0x1d, 0x1f, 0x21),
@@ -108,7 +108,7 @@ impl Theme {
         }
     }
 
-    pub fn default_light() -> Self {
+    pub const fn default_light() -> Self {
         Self {
             bg: rgb(0xfa, 0xfa, 0xfb),
             surface: rgb(0xf2, 0xf3, 0xf5),
@@ -124,46 +124,46 @@ impl Theme {
         }
     }
 
-    pub fn solarized_dark() -> Self {
+    pub const fn solarized_dark() -> Self {
         Self::from_palette(&palettes::SOLARIZED_DARK)
     }
 
     // --- imported via Palette16 -------------------------------------------
 
-    pub fn tokyo_night() -> Self {
+    pub const fn tokyo_night() -> Self {
         Self::from_palette(&palettes::TOKYO_NIGHT)
     }
-    pub fn tokyo_night_light() -> Self {
+    pub const fn tokyo_night_light() -> Self {
         Self::from_palette(&palettes::TOKYO_NIGHT_LIGHT)
     }
-    pub fn dracula() -> Self {
+    pub const fn dracula() -> Self {
         Self::from_palette(&palettes::DRACULA)
     }
-    pub fn gruvbox_dark() -> Self {
+    pub const fn gruvbox_dark() -> Self {
         Self::from_palette(&palettes::GRUVBOX_DARK)
     }
-    pub fn nord() -> Self {
+    pub const fn nord() -> Self {
         Self::from_palette(&palettes::NORD)
     }
-    pub fn one_dark() -> Self {
+    pub const fn one_dark() -> Self {
         Self::from_palette(&palettes::ONE_DARK)
     }
-    pub fn monokai() -> Self {
+    pub const fn monokai() -> Self {
         Self::from_palette(&palettes::MONOKAI)
     }
-    pub fn catppuccin_mocha() -> Self {
+    pub const fn catppuccin_mocha() -> Self {
         Self::from_palette(&palettes::CATPPUCCIN_MOCHA)
     }
-    pub fn catppuccin_latte() -> Self {
+    pub const fn catppuccin_latte() -> Self {
         Self::from_palette(&palettes::CATPPUCCIN_LATTE)
     }
-    pub fn ayu_dark() -> Self {
+    pub const fn ayu_dark() -> Self {
         Self::from_palette(&palettes::AYU_DARK)
     }
-    pub fn ayu_light() -> Self {
+    pub const fn ayu_light() -> Self {
         Self::from_palette(&palettes::AYU_LIGHT)
     }
-    pub fn github_dark() -> Self {
+    pub const fn github_dark() -> Self {
         Self::from_palette(&palettes::GITHUB_DARK)
     }
 
@@ -180,7 +180,7 @@ impl Theme {
     /// - `warn` — `yellow`
     /// - `err` — `red`
     /// - `border` — `br_black`
-    pub fn from_palette(p: &Palette16) -> Self {
+    pub const fn from_palette(p: &Palette16) -> Self {
         Self {
             bg: p.bg,
             surface: p.bg,
@@ -230,7 +230,7 @@ impl Theme {
         Style::default().fg(self.muted).add_modifier(Modifier::BOLD)
     }
 
-    pub fn tone_color(&self, tone: StatusTone) -> Color {
+    pub const fn tone_color(&self, tone: StatusTone) -> Color {
         match tone {
             StatusTone::Neutral => self.fg,
             StatusTone::Muted => self.muted,

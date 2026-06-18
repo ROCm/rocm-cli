@@ -16,7 +16,6 @@ import tarfile
 import zipfile
 from pathlib import Path
 
-
 ARCHIVE_SUFFIXES = (".tar.gz", ".zip")
 ROCM_RELEASE_ASSET_RE = re.compile(
     r"^rocm-cli-(?:(?:v[0-9][A-Za-z0-9._+-]*|nightly(?:-[0-9]{8}-[0-9A-Fa-f]+)?)-)?"
@@ -563,7 +562,7 @@ def write_sha(path: Path, *, archive_name: str | None = None) -> None:
 def add_tar_file(
     package: tarfile.TarFile, root: str, relative: str, executable: bool = False
 ) -> None:
-    data = f"test content for {relative}\n".encode("utf-8")
+    data = f"test content for {relative}\n".encode()
     info = tarfile.TarInfo(f"{root}/{relative}")
     info.size = len(data)
     info.mode = 0o755 if executable else 0o644
@@ -802,7 +801,7 @@ def run_self_test(root: Path) -> None:
         expect_failure(
             "missing production trust inputs",
             lambda: run_with_env(
-                {name: None for name in PRODUCTION_TRUST_ENV_NAMES},
+                dict.fromkeys(PRODUCTION_TRUST_ENV_NAMES),
                 lambda: validate_release(
                     dist,
                     assets=[],
@@ -834,7 +833,7 @@ def run_self_test(root: Path) -> None:
             )
         run_with_env(
             {
-                **{name: None for name in PRODUCTION_TRUST_ENV_NAMES},
+                **dict.fromkeys(PRODUCTION_TRUST_ENV_NAMES),
                 "ROCM_CLI_SIGNING_PUBLIC_KEY_PATH": release_public_key,
                 "ROCM_CLI_METADATA_PUBLIC_KEY_PATH": metadata_public_key,
                 "ROCM_CLI_MODEL_RECIPE_INDEX_PATH": recipe_index,

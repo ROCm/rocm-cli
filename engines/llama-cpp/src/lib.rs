@@ -194,7 +194,7 @@ pub fn run_cli() -> Result<()> {
                 device_policy: None,
                 recipe_override: None,
                 engine_recipe: None,
-            })?)?
+            })?)?;
         }
         CommandKind::Launch {
             service_id,
@@ -330,10 +330,7 @@ fn detect_response() -> DetectResponse {
     let server = resolve_llama_server().ok();
     let runtime_executable = server.as_ref().map(|server| server.program.clone());
     let runtime_env = resolve_therock_hip_runtime_env(None);
-    let rocm_gpu_available = server
-        .as_ref()
-        .map(llama_server_has_hip_backend)
-        .unwrap_or(false)
+    let rocm_gpu_available = server.as_ref().is_some_and(llama_server_has_hip_backend)
         && matches!(runtime_env.as_ref(), Ok(Some(_)));
     let mut notes = Vec::new();
     match server.as_ref() {
@@ -404,9 +401,8 @@ fn rocm_gpu_reason(
     server: Option<&LlamaServer>,
     runtime_env: Option<&Option<TheRockHipRuntimeEnv>>,
 ) -> String {
-    let server = match server {
-        Some(server) => server,
-        None => return "llama-server was not found".to_owned(),
+    let Some(server) = server else {
+        return "llama-server was not found".to_owned();
     };
     if !llama_server_has_hip_backend(server) {
         return "llama-server was found, but no sibling ggml-hip backend library was detected"
@@ -440,11 +436,8 @@ fn llama_server_has_hip_backend(server: &LlamaServer) -> bool {
 fn install_response(request: InstallRequest) -> Result<InstallResponse> {
     let server = resolve_llama_server().ok();
     let runtime_env = resolve_therock_hip_runtime_env(Some(&request.runtime_id))?;
-    let rocm_gpu_available = server
-        .as_ref()
-        .map(llama_server_has_hip_backend)
-        .unwrap_or(false)
-        && runtime_env.is_some();
+    let rocm_gpu_available =
+        server.as_ref().is_some_and(llama_server_has_hip_backend) && runtime_env.is_some();
     let paths = AppPaths::discover()?;
     let runtime_executable = server.as_ref().map(|server| server.program.clone());
     let mut installed_packages = server
@@ -483,10 +476,10 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
     Ok(InstallResponse {
         env_id: "external-llama.cpp".to_owned(),
         env_path: paths.engine_dir(ENGINE_NAME).display().to_string(),
-        python_executable: server
-            .as_ref()
-            .map(|server| server.display.clone())
-            .unwrap_or_else(|| "<external llama-server not found>".to_owned()),
+        python_executable: server.as_ref().map_or_else(
+            || "<external llama-server not found>".to_owned(),
+            |server| server.display.clone(),
+        ),
         runtime_kind: Some("external_llama_server".to_owned()),
         runtime_executable,
         managed_env: Some(false),
@@ -578,7 +571,7 @@ fn resolve_llama_model_ref(model_ref: &str, warnings: &mut Vec<String>) -> Strin
     let expanded = expand_home_path(trimmed);
     let mut candidates = Vec::new();
     if expanded.is_absolute() {
-        candidates.push(expanded.clone());
+        candidates.push(expanded);
     } else {
         if let Ok(current_dir) = std::env::current_dir() {
             candidates.push(current_dir.join(&expanded));
@@ -613,8 +606,10 @@ fn expand_home_path(value: &str) -> PathBuf {
     };
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(|home| PathBuf::from(home).join(rest))
-        .unwrap_or_else(|| PathBuf::from(value))
+        .map_or_else(
+            || PathBuf::from(value),
+            |home| PathBuf::from(home).join(rest),
+        )
 }
 
 fn launch_service(mut request: LaunchRequest) -> Result<LaunchResponse> {
@@ -1223,17 +1218,14 @@ fn validate_therock_windows_runtime_files(runtime_env: &TheRockHipRuntimeEnv) ->
     for filename in REQUIRED_WINDOWS_THEROCK_EXACT_DLLS {
         if find_runtime_bin_file(runtime_env, filename).is_none() {
             bail!(
-                "managed TheRock runtime is missing required llama.cpp HIP DLL {}; no CPU fallback is applied",
-                filename
+                "managed TheRock runtime is missing required llama.cpp HIP DLL {filename}; no CPU fallback is applied"
             );
         }
     }
     for (prefix, suffix) in REQUIRED_WINDOWS_THEROCK_VERSIONED_DLLS {
         if find_runtime_bin_file_by_prefix_suffix(runtime_env, prefix, suffix).is_none() {
             bail!(
-                "managed TheRock runtime is missing required llama.cpp HIP DLL matching {}*{}; no CPU fallback is applied",
-                prefix,
-                suffix
+                "managed TheRock runtime is missing required llama.cpp HIP DLL matching {prefix}*{suffix}; no CPU fallback is applied"
             );
         }
     }
@@ -1380,8 +1372,7 @@ fn staged_file_is_current(source: &Path, destination: &Path) -> bool {
 fn is_windows_dll(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .map(|extension| extension.eq_ignore_ascii_case("dll"))
-        .unwrap_or(false)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
 }
 
 fn safe_path_component(value: &str) -> String {
@@ -1542,10 +1533,10 @@ fn therock_env_from_manifest(
         .clone()
         .unwrap_or_else(|| "therock-runtime".to_owned());
     let runtime_key = manifest.runtime_key.clone();
-    let source = runtime_key
-        .as_deref()
-        .map(|key| format!("managed_runtime_manifest:{key}"))
-        .unwrap_or_else(|| "managed_runtime_manifest".to_owned());
+    let source = runtime_key.as_deref().map_or_else(
+        || "managed_runtime_manifest".to_owned(),
+        |key| format!("managed_runtime_manifest:{key}"),
+    );
 
     if let Some(probe) = manifest.rocm_sdk.as_ref()
         && probe.import_ok
@@ -1567,13 +1558,13 @@ fn therock_env_from_manifest(
             .cloned()
             .collect::<Vec<_>>();
         return Ok(Some(TheRockHipRuntimeEnv {
-            runtime_id: runtime_id.clone(),
-            runtime_key: runtime_key.clone(),
+            runtime_id,
+            runtime_key,
             root_path: root_path.clone(),
             bin_path: bin_path.clone(),
             bin_paths,
             library_paths,
-            source: source.clone(),
+            source,
         }));
     }
 
@@ -1765,7 +1756,7 @@ fn terminate_pid(pid: u32, _force: bool) -> bool {
     rocm_core::terminate_process(pid).is_ok()
 }
 
-fn device_policy_name(policy: &DevicePolicy) -> &'static str {
+const fn device_policy_name(policy: &DevicePolicy) -> &'static str {
     match policy {
         DevicePolicy::GpuRequired => "gpu_required",
         DevicePolicy::GpuPreferred => "gpu_preferred",
@@ -1814,7 +1805,7 @@ mod tests {
             contract_version: contract_version.to_owned(),
             engine: engine.to_owned(),
             required_flags: vec!["--jinja".to_owned()],
-            parser_settings: Default::default(),
+            parser_settings: std::collections::BTreeMap::default(),
             preferred_endpoint: None,
             unsupported_combinations: Vec::new(),
             notes: vec!["test recipe".to_owned()],

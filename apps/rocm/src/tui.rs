@@ -62,7 +62,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 const GPU_MONITOR_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-const GPU_STATIC_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+const GPU_STATIC_REFRESH_INTERVAL: Duration = Duration::from_mins(5);
 const GPU_ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const GPU_AMD_SMI_TIMEOUT: Duration = Duration::from_millis(1_500);
 const TUI_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -450,9 +450,9 @@ fn is_doctor_command_input(command: &str) -> bool {
 }
 
 fn tui_mode_for_cli_args(args: &[String]) -> TuiMode {
-    args.first()
-        .map(|head| tui_mode_for_command(head, args.len() > 1))
-        .unwrap_or(TuiMode::Ask)
+    args.first().map_or(TuiMode::Ask, |head| {
+        tui_mode_for_command(head, args.len() > 1)
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -519,7 +519,7 @@ impl TranscriptLine {
         }
     }
 
-    fn blank() -> Self {
+    const fn blank() -> Self {
         Self {
             kind: TranscriptLineKind::Blank,
             text: String::new(),
@@ -919,14 +919,14 @@ enum ServiceLifecycleAction {
 }
 
 impl ServiceLifecycleAction {
-    fn command_word(self) -> &'static str {
+    const fn command_word(self) -> &'static str {
         match self {
             Self::Stop => "stop",
             Self::Restart => "restart",
         }
     }
 
-    fn tool_name(self) -> &'static str {
+    const fn tool_name(self) -> &'static str {
         match self {
             Self::Stop => "stop_server",
             Self::Restart => "restart_server",
@@ -940,14 +940,14 @@ impl ServiceLifecycleAction {
         }
     }
 
-    fn success_title(self) -> &'static str {
+    const fn success_title(self) -> &'static str {
         match self {
             Self::Stop => "Service stopped.",
             Self::Restart => "Service restart started.",
         }
     }
 
-    fn failure_title(self) -> &'static str {
+    const fn failure_title(self) -> &'static str {
         match self {
             Self::Stop => "Service stop failed.",
             Self::Restart => "Service restart failed.",
@@ -1009,14 +1009,14 @@ enum RuntimeAdoptChannel {
 }
 
 impl RuntimeAdoptChannel {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Release => "release",
             Self::Nightly => "nightly",
         }
     }
 
-    fn toggle(self) -> Self {
+    const fn toggle(self) -> Self {
         match self {
             Self::Release => Self::Nightly,
             Self::Nightly => Self::Release,
@@ -1083,7 +1083,7 @@ enum InstallSdkChannel {
 }
 
 impl InstallSdkChannel {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Release => "release",
             Self::Nightly => "nightly",
@@ -1098,7 +1098,7 @@ enum InstallSdkFormat {
 }
 
 impl InstallSdkFormat {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Wheel => "wheel",
             Self::Tarball => "tarball",
@@ -1296,7 +1296,7 @@ enum CommandOutputStream {
 }
 
 impl CommandOutputStream {
-    fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
             Self::Stdout => "stdout",
             Self::Stderr => "stderr",
@@ -1555,7 +1555,6 @@ impl GpuTelemetry {
 
     fn sidebar_text(&self) -> String {
         let mut output = String::new();
-        use std::fmt::Write as _;
 
         let _ = writeln!(output, "GPU status:");
         if self.static_cards.is_empty() && self.monitor_cards.is_empty() {
@@ -1595,7 +1594,6 @@ impl GpuTelemetry {
 
     fn detail_text(&self) -> String {
         let mut output = String::new();
-        use std::fmt::Write as _;
 
         let _ = writeln!(output, "GPU status");
         if self.static_cards.is_empty() && self.monitor_cards.is_empty() {
@@ -1640,8 +1638,7 @@ impl GpuTelemetry {
                 "  Compute units: {}",
                 static_card
                     .and_then(|card| card.compute_units)
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unknown".to_owned())
+                    .map_or_else(|| "unknown".to_owned(), |value| value.to_string())
             );
             let _ = writeln!(
                 output,
@@ -2076,8 +2073,7 @@ fn format_activity_log_line(line: &str) -> String {
         .unwrap_or("unknown");
     let message = line
         .split_once(" message=")
-        .map(|(_, message)| message)
-        .unwrap_or(line);
+        .map_or(line, |(_, message)| message);
     truncate_activity_message(format!("log: {action} - {message}"))
 }
 
@@ -2199,7 +2195,7 @@ impl App {
         let _ = recover_setup_runtime_registration(&self.paths, &self.config);
     }
 
-    fn should_show_onboarding(&self) -> bool {
+    const fn should_show_onboarding(&self) -> bool {
         !self.config.onboarding_dismissed
     }
 
@@ -2322,8 +2318,7 @@ impl App {
         let selected = self
             .doctor_manager
             .as_ref()
-            .map(|state| state.selected)
-            .unwrap_or(0);
+            .map_or(0, |state| state.selected);
         if let Some(state) = self.doctor_manager.as_mut() {
             state.selected = selected.min(doctor_manager_choices().len().saturating_sub(1));
             state.detail_scroll = 0;
@@ -2360,15 +2355,14 @@ impl App {
         let selected = self
             .doctor_manager
             .as_ref()
-            .map(|state| state.selected)
-            .unwrap_or(0);
+            .map_or(0, |state| state.selected);
         doctor_manager_choices()
             .get(selected)
             .copied()
             .unwrap_or(DoctorManagerChoice::Overview)
     }
 
-    fn scroll_doctor_manager_detail(&mut self, lines: i16) {
+    const fn scroll_doctor_manager_detail(&mut self, lines: i16) {
         let Some(state) = self.doctor_manager.as_mut() else {
             return;
         };
@@ -2454,8 +2448,7 @@ impl App {
         let screen = self
             .runtime_manager
             .as_ref()
-            .map(|state| state.screen.clone())
-            .unwrap_or(RuntimeManagerScreen::List);
+            .map_or(RuntimeManagerScreen::List, |state| state.screen.clone());
         self.refresh_config();
         match runtime_manager_items(&self.paths, &self.config) {
             Ok(items) => {
@@ -2920,10 +2913,10 @@ impl App {
                 match self.selected_runtime_manager_action() {
                     Some(RuntimeManagerAction::Install) => self.request_runtime_manager_install(),
                     Some(RuntimeManagerAction::RemoveSelected) => {
-                        self.request_runtime_manager_uninstall()
+                        self.request_runtime_manager_uninstall();
                     }
                     Some(RuntimeManagerAction::AdvancedOptions) => {
-                        self.open_runtime_advanced_options()
+                        self.open_runtime_advanced_options();
                     }
                     None => self.request_runtime_manager_install(),
                 }
@@ -2938,7 +2931,7 @@ impl App {
             RuntimeManagerScreen::ImportManifest { selected, .. } => {
                 match runtime_import_choices().get(*selected).copied() {
                     Some(RuntimeImportChoice::ManifestPath) => {
-                        self.start_runtime_import_path_edit()
+                        self.start_runtime_import_path_edit();
                     }
                     Some(RuntimeImportChoice::Replace) => self.toggle_runtime_import_replace(),
                     Some(RuntimeImportChoice::Import) => self.request_runtime_import_from_form(),
@@ -3075,8 +3068,7 @@ impl App {
         let selected = self
             .install_manager
             .as_ref()
-            .map(|state| state.selected)
-            .unwrap_or(0);
+            .map_or(0, |state| state.selected);
         install_menu_choices()
             .get(selected)
             .copied()
@@ -3519,10 +3511,10 @@ impl App {
         match self.selected_engine_manager_action() {
             Some(EngineManagerAction::UseSelected) => self.request_selected_engine_default(),
             Some(EngineManagerAction::InstallSelected) => {
-                self.request_selected_engine_install(false)
+                self.request_selected_engine_install(false);
             }
             Some(EngineManagerAction::ReinstallSelected) => {
-                self.request_selected_engine_install(true)
+                self.request_selected_engine_install(true);
             }
             Some(EngineManagerAction::InstallRocm) => self.open_install_manager(),
             Some(EngineManagerAction::Back) => self.close_engine_manager(),
@@ -3647,23 +3639,20 @@ impl App {
         let Some(state) = self.model_picker.as_mut() else {
             return;
         };
-        match state
+        if let Some(index) = state
             .items
             .iter()
             .position(|recipe| recipe.matches_ref(query))
         {
-            Some(index) => {
-                state.selected = index;
-                state.detail_scroll = 0;
-                state.message = None;
-                self.status = "Model selected. Press Enter to start setup.".to_owned();
-            }
-            None => {
-                state.message = Some(format!(
-                    "I could not find `{query}` in the built-in model list.\n\nUse the arrow keys to choose a model, then press Enter."
-                ));
-                self.status = "Choose a model from the list.".to_owned();
-            }
+            state.selected = index;
+            state.detail_scroll = 0;
+            state.message = None;
+            self.status = "Model selected. Press Enter to start setup.".to_owned();
+        } else {
+            state.message = Some(format!(
+                "I could not find `{query}` in the built-in model list.\n\nUse the arrow keys to choose a model, then press Enter."
+            ));
+            self.status = "Choose a model from the list.".to_owned();
         }
     }
 
@@ -3833,8 +3822,7 @@ impl App {
         state.host = plan.host.unwrap_or_else(|| DEFAULT_LOCAL_HOST.to_owned());
         state.port = plan
             .port
-            .map(|port| port.to_string())
-            .unwrap_or_else(|| DEFAULT_LOCAL_PORT.to_string());
+            .map_or_else(|| DEFAULT_LOCAL_PORT.to_string(), |port| port.to_string());
         state.runtime_id = runtime_id;
         state.env_id = env_id;
         state.allow_public_bind = allow_public_bind;
@@ -3909,11 +3897,7 @@ impl App {
     }
 
     fn selected_serve_wizard_choice(&self) -> ServeWizardChoice {
-        let selected = self
-            .serve_wizard
-            .as_ref()
-            .map(|state| state.selected)
-            .unwrap_or(0);
+        let selected = self.serve_wizard.as_ref().map_or(0, |state| state.selected);
         serve_wizard_choices()
             .get(selected)
             .copied()
@@ -4076,7 +4060,7 @@ impl App {
             ServeWizardChoice::Source => self.toggle_serve_wizard_model_source(),
             ServeWizardChoice::Model => self.cycle_serve_wizard_model(CompletionDirection::Next),
             ServeWizardChoice::Engine | ServeWizardChoice::Device | ServeWizardChoice::Mode => {
-                self.cycle_serve_wizard_value(CompletionDirection::Next)
+                self.cycle_serve_wizard_value(CompletionDirection::Next);
             }
             ServeWizardChoice::LocalPath => {
                 if self
@@ -4087,14 +4071,14 @@ impl App {
                     self.status =
                         "Change Model type to my own model file before editing Path.".to_owned();
                 } else {
-                    self.start_serve_wizard_field_edit(ServeWizardEditField::LocalPath)
+                    self.start_serve_wizard_field_edit(ServeWizardEditField::LocalPath);
                 }
             }
             ServeWizardChoice::Host => {
-                self.start_serve_wizard_field_edit(ServeWizardEditField::Host)
+                self.start_serve_wizard_field_edit(ServeWizardEditField::Host);
             }
             ServeWizardChoice::Port => {
-                self.start_serve_wizard_field_edit(ServeWizardEditField::Port)
+                self.start_serve_wizard_field_edit(ServeWizardEditField::Port);
             }
             ServeWizardChoice::Review => self.review_serve_wizard_plan(),
             ServeWizardChoice::Back => self.close_serve_wizard(),
@@ -4400,8 +4384,7 @@ impl App {
         let selected = self
             .update_manager
             .as_ref()
-            .map(|state| state.selected)
-            .unwrap_or(0);
+            .map_or(0, |state| state.selected);
         update_menu_choices()
             .get(selected)
             .copied()
@@ -5065,8 +5048,7 @@ impl App {
         let selected = self
             .config_manager
             .as_ref()
-            .map(|state| state.selected)
-            .unwrap_or(0);
+            .map_or(0, |state| state.selected);
         config_menu_choices()
             .get(selected)
             .copied()
@@ -5540,7 +5522,7 @@ impl App {
             ConfigProviderChoice::ClearKey => self.start_clear_config_provider_key_confirmation(),
             ConfigProviderChoice::ConfirmClearKey => self.confirm_clear_config_provider_key(),
             ConfigProviderChoice::CancelClearKey => {
-                self.cancel_clear_config_provider_key_confirmation()
+                self.cancel_clear_config_provider_key_confirmation();
             }
             ConfigProviderChoice::Back => self.close_config_provider_settings(),
         }
@@ -5581,7 +5563,7 @@ impl App {
             ConfigMenuChoice::DefaultEngine => self.open_engine_manager(),
             ConfigMenuChoice::DefaultRuntime => self.open_runtime_manager(),
             ConfigMenuChoice::Permissions => {
-                self.open_command_screen_target(CommandScreenTarget::Permissions)
+                self.open_command_screen_target(CommandScreenTarget::Permissions);
             }
             ConfigMenuChoice::ShowSetupAgain => self.open_setup_again_confirmation(),
             ConfigMenuChoice::Back => self.close_config_manager(),
@@ -5591,7 +5573,7 @@ impl App {
     fn handle_config_command_args(&mut self, args: &[&str]) {
         self.open_config_manager();
         match args {
-            [] | ["show"] | ["status"] => {}
+            [] | ["show" | "status"] => {}
             ["set-telemetry", mode] if matches!(*mode, "local" | "off") => {
                 self.select_config_menu_choice(ConfigMenuChoice::Telemetry);
                 self.set_active_screen_message(format!(
@@ -6002,9 +5984,10 @@ impl App {
             state.chat_session = Some(session);
         }
         self.sync_chat_session_actions();
-        self.status = endpoint_url
-            .map(|url| format!("Local assistant ready at {url}."))
-            .unwrap_or_else(|| "Local assistant ready.".to_owned());
+        self.status = endpoint_url.map_or_else(
+            || "Local assistant ready.".to_owned(),
+            |url| format!("Local assistant ready at {url}."),
+        );
     }
 
     fn open_local_assistant_start_flow(&mut self, model: Option<String>) {
@@ -6120,7 +6103,7 @@ impl App {
                     state.chat_model = Some(record.canonical_model_id.clone());
                     session.model = Some(record.canonical_model_id.clone());
                     session.service_id = Some(record.service_id.clone());
-                    session.endpoint_url = Some(record.endpoint_url.clone());
+                    session.endpoint_url = Some(record.endpoint_url);
                 }
                 self.sync_chat_session_actions();
                 self.status = format!("Local assistant ready at {endpoint}.");
@@ -6144,20 +6127,20 @@ impl App {
                 "failed" | "unreachable" | "exited" => {
                     "Local assistant did not start.\n\nOpen logs for the reason.".to_owned()
                 }
-                _ => selected_record
-                    .as_ref()
-                    .map(|record| format!("Starting at {}.", record.endpoint_url))
-                    .unwrap_or_else(|| "Local assistant is starting.".to_owned()),
+                _ => selected_record.as_ref().map_or_else(
+                    || "Local assistant is starting.".to_owned(),
+                    |record| format!("Starting at {}.", record.endpoint_url),
+                ),
             });
         }
         self.status = match selected_status.as_str() {
             "failed" | "unreachable" | "exited" => {
                 "Local assistant failed to start. Open logs for the reason.".to_owned()
             }
-            _ => selected_record
-                .as_ref()
-                .map(|record| format!("Local assistant starting at {}.", record.endpoint_url))
-                .unwrap_or_else(|| "Local assistant is starting.".to_owned()),
+            _ => selected_record.as_ref().map_or_else(
+                || "Local assistant is starting.".to_owned(),
+                |record| format!("Local assistant starting at {}.", record.endpoint_url),
+            ),
         };
     }
 
@@ -6197,10 +6180,10 @@ impl App {
             Some(ServicesManagerAction::Chat) => self.open_selected_service_chat(),
             Some(ServicesManagerAction::OpenLogs) => self.open_selected_service_logs(),
             Some(ServicesManagerAction::Stop) => {
-                self.request_selected_service_lifecycle(ServiceLifecycleAction::Stop)
+                self.request_selected_service_lifecycle(ServiceLifecycleAction::Stop);
             }
             Some(ServicesManagerAction::Restart) => {
-                self.request_selected_service_lifecycle(ServiceLifecycleAction::Restart)
+                self.request_selected_service_lifecycle(ServiceLifecycleAction::Restart);
             }
             Some(ServicesManagerAction::Back) => self.close_services_manager(),
             None => self.open_selected_service_logs(),
@@ -6266,7 +6249,7 @@ impl App {
             [] | ["status"] => {
                 self.open_command_screen_target(CommandScreenTarget::Permissions);
             }
-            ["full-access"] | ["full"] => {
+            ["full-access" | "full"] => {
                 self.open_command_screen_target(CommandScreenTarget::Permissions);
                 if self.config.permissions.full_access_enabled() {
                     self.status = "Full access is already on.".to_owned();
@@ -6281,7 +6264,7 @@ impl App {
                         "Confirm full access with Enter/Y, or cancel with Esc/N.".to_owned();
                 }
             }
-            ["ask"] | ["reset"] => {
+            ["ask" | "reset"] => {
                 self.open_command_screen_target(CommandScreenTarget::Permissions);
                 if let Some(state) = self.command_screen.as_mut() {
                     if let Some(index) = state
@@ -6803,33 +6786,33 @@ impl App {
     fn perform_onboarding_selected_action(&mut self) {
         match self.selected_onboarding_choice() {
             OnboardingMenuChoice::Folder if self.pending_approval.is_none() => {
-                self.open_onboarding_install_folder_browser()
+                self.open_onboarding_install_folder_browser();
             }
             OnboardingMenuChoice::Primary if self.pending_approval.is_some() => {
                 self.approve_focused_action();
                 self.reset_onboarding_selection();
             }
             OnboardingMenuChoice::Primary if self.running_job.is_none() => {
-                self.perform_onboarding_primary_action()
+                self.perform_onboarding_primary_action();
             }
             OnboardingMenuChoice::Reinstall if self.pending_approval.is_none() => {
-                self.request_onboarding_reinstall()
+                self.request_onboarding_reinstall();
             }
             OnboardingMenuChoice::Uninstall if self.pending_approval.is_none() => {
-                self.request_onboarding_uninstall()
+                self.request_onboarding_uninstall();
             }
             OnboardingMenuChoice::ShowLog if self.pending_approval.is_none() => {
-                self.toggle_onboarding_log_file()
+                self.toggle_onboarding_log_file();
             }
             OnboardingMenuChoice::Back if self.pending_approval.is_some() => {
                 self.cancel_focused_action();
                 self.reset_onboarding_selection();
             }
             OnboardingMenuChoice::Back if self.running_job.is_none() => {
-                self.return_from_onboarding()
+                self.return_from_onboarding();
             }
             OnboardingMenuChoice::Quit if self.running_job.is_none() => {
-                self.request_quit_overlay_or_wait()
+                self.request_quit_overlay_or_wait();
             }
             _ => {}
         }
@@ -6942,7 +6925,7 @@ impl App {
         }
     }
 
-    fn should_draw_home_dashboard(&self) -> bool {
+    const fn should_draw_home_dashboard(&self) -> bool {
         self.home_dashboard_visible
             && !self.onboarding_active
             && self.doctor_manager.is_none()
@@ -7421,7 +7404,7 @@ impl App {
         self.status = "Use Enter to choose, or Esc to close this card.".to_owned();
     }
 
-    fn scroll_overlay_card_detail(&mut self, lines: i16) {
+    const fn scroll_overlay_card_detail(&mut self, lines: i16) {
         let Some(state) = self.overlay_card.as_mut() else {
             return;
         };
@@ -7686,7 +7669,7 @@ impl App {
     }
 
     fn finish_onboarding_install_folder_choice(&mut self, folder: PathBuf) {
-        self.config.setup.therock_venv = Some(folder.clone());
+        self.config.setup.therock_venv = Some(folder);
         match self.config.save(&self.paths) {
             Ok(()) => {
                 self.rebase_paths_to_saved_setup_folder();
@@ -7754,8 +7737,7 @@ impl App {
         let cpu_mode_not_offered = action.is_none() && plan_request_mentions_cpu_mode(request);
         self.mode = action
             .as_ref()
-            .map(|action| tui_mode_for_cli_args(&action.args))
-            .unwrap_or(TuiMode::Ask);
+            .map_or(TuiMode::Ask, |action| tui_mode_for_cli_args(&action.args));
         let detail = if cpu_mode_not_offered {
             render_plan_cpu_not_offered_text(request)
         } else {
@@ -7912,16 +7894,16 @@ impl App {
             }
             CommandScreenTarget::Gpu => {
                 self.refresh_config();
-                if !self.config.telemetry.local_inspection_enabled() {
-                    self.gpu_telemetry.clear();
-                    ("GPU".to_owned(), disabled_gpu_telemetry_text(&self.config))
-                } else {
+                if self.config.telemetry.local_inspection_enabled() {
                     if force_refresh {
                         self.gpu_telemetry.force_refresh();
                     } else {
                         self.gpu_telemetry.maybe_refresh();
                     }
                     ("GPU".to_owned(), self.gpu_telemetry.detail_text())
+                } else {
+                    self.gpu_telemetry.clear();
+                    ("GPU".to_owned(), disabled_gpu_telemetry_text(&self.config))
                 }
             }
             CommandScreenTarget::Daemon => {
@@ -8049,7 +8031,7 @@ impl App {
                     .saturating_sub(1)
     }
 
-    fn set_chat_session_follow_if_needed(&mut self, should_follow: bool) {
+    const fn set_chat_session_follow_if_needed(&mut self, should_follow: bool) {
         if should_follow
             && let Some(state) = self.command_screen.as_mut()
             && state.chat_session.is_some()
@@ -8120,7 +8102,7 @@ impl App {
         false
     }
 
-    fn active_manager_detail_scroll_mut(&mut self) -> Option<&mut u16> {
+    const fn active_manager_detail_scroll_mut(&mut self) -> Option<&mut u16> {
         if let Some(state) = self.runtime_manager.as_mut() {
             return Some(&mut state.detail_scroll);
         }
@@ -8154,7 +8136,7 @@ impl App {
         None
     }
 
-    fn scroll_active_manager_detail(&mut self, lines: i16) {
+    const fn scroll_active_manager_detail(&mut self, lines: i16) {
         let Some(scroll) = self.active_manager_detail_scroll_mut() else {
             return;
         };
@@ -8171,13 +8153,7 @@ impl App {
         };
         pending.selected = match direction {
             CompletionDirection::Next => (pending.selected + 1) % 2,
-            CompletionDirection::Previous => {
-                if pending.selected == 0 {
-                    1
-                } else {
-                    0
-                }
-            }
+            CompletionDirection::Previous => usize::from(pending.selected == 0),
         };
         self.set_pending_approval_selection_status();
     }
@@ -8186,7 +8162,7 @@ impl App {
         let Some(pending) = self.pending_approval.as_mut() else {
             return;
         };
-        pending.selected = if approve { 0 } else { 1 };
+        pending.selected = usize::from(!approve);
         self.set_pending_approval_selection_status();
     }
 
@@ -8322,8 +8298,7 @@ impl App {
         let rocm_tools = self
             .command_screen
             .as_ref()
-            .map(|state| state.chat_tools)
-            .unwrap_or(false);
+            .is_some_and(|state| state.chat_tools);
         if prompt.trim().is_empty() {
             if let Some(state) = self.command_screen.as_mut() {
                 state.message =
@@ -8356,8 +8331,7 @@ impl App {
         let rocm_tools = self
             .command_screen
             .as_ref()
-            .map(|state| state.chat_tools)
-            .unwrap_or(false);
+            .is_some_and(|state| state.chat_tools);
         self.close_command_screen();
         self.set_input(if prompt.trim().is_empty() {
             if rocm_tools {
@@ -8388,7 +8362,7 @@ impl App {
         if self.handle_pending_chat_install_folder(&prompt) {
             return true;
         }
-        if let Some(reply) = self.simple_chat_session_reply(&prompt) {
+        if let Some(reply) = Self::simple_chat_session_reply(&prompt) {
             self.push_chat_session_turn(ChatSessionRole::User, prompt);
             self.push_chat_session_turn(ChatSessionRole::Assistant, reply);
             if let Some(state) = self.command_screen.as_mut() {
@@ -8579,7 +8553,7 @@ impl App {
         self.request_screen_cli_approval_with_explanation(
             pending_title,
             command_title,
-            args.to_vec(),
+            args,
             Some(display_command),
             Some(reason.to_owned()),
         );
@@ -8675,7 +8649,7 @@ impl App {
         }
     }
 
-    fn simple_chat_session_reply(&self, prompt: &str) -> Option<String> {
+    fn simple_chat_session_reply(prompt: &str) -> Option<String> {
         if !is_plain_casual_input(prompt) {
             return None;
         }
@@ -8929,7 +8903,7 @@ impl App {
         self.services_manager = None;
         self.command_screen = None;
         self.logs_view = Some(LogsViewState {
-            query: query.clone(),
+            query,
             service_id: None,
             page,
             follow,
@@ -8943,7 +8917,7 @@ impl App {
                 0
             },
             detail_scroll: 0,
-            last_rendered: rendered.clone(),
+            last_rendered: rendered,
             last_refresh_at: Instant::now(),
             editing_search: false,
             detail_modal: None,
@@ -9022,7 +8996,7 @@ impl App {
             show_file_locations: false,
             selected: current.selected,
             detail_scroll: current.detail_scroll,
-            last_rendered: rendered.clone(),
+            last_rendered: rendered,
             last_refresh_at: Instant::now(),
             editing_search: false,
             detail_modal: None,
@@ -9130,7 +9104,7 @@ impl App {
         self.status = "Log action selected. Press Enter to continue.".to_owned();
     }
 
-    fn scroll_logs_view_detail(&mut self, lines: i16) {
+    const fn scroll_logs_view_detail(&mut self, lines: i16) {
         let Some(state) = self.logs_view.as_mut() else {
             return;
         };
@@ -9329,7 +9303,7 @@ impl App {
         }
     }
 
-    fn scroll_up(&mut self, lines: u16) {
+    const fn scroll_up(&mut self, lines: u16) {
         self.transcript_scroll = self.transcript_scroll.saturating_sub(lines);
     }
 
@@ -9340,7 +9314,7 @@ impl App {
             .min(self.max_scroll());
     }
 
-    fn reset_completion_selection(&mut self) {
+    const fn reset_completion_selection(&mut self) {
         self.completion_selection = 0;
     }
 
@@ -9375,8 +9349,7 @@ impl App {
         self.input
             .char_indices()
             .nth(self.input_cursor)
-            .map(|(index, _)| index)
-            .unwrap_or(self.input.len())
+            .map_or(self.input.len(), |(index, _)| index)
     }
 
     fn input_byte_index_for_char(&self, char_index: usize) -> usize {
@@ -9386,8 +9359,7 @@ impl App {
         self.input
             .char_indices()
             .nth(char_index)
-            .map(|(index, _)| index)
-            .unwrap_or(self.input.len())
+            .map_or(self.input.len(), |(index, _)| index)
     }
 
     fn insert_input_char(&mut self, ch: char) {
@@ -9430,7 +9402,7 @@ impl App {
         self.set_chat_session_follow_if_needed(should_follow_chat);
     }
 
-    fn move_input_left(&mut self) {
+    const fn move_input_left(&mut self) {
         self.input_cursor = self.input_cursor.saturating_sub(1);
     }
 
@@ -9441,7 +9413,7 @@ impl App {
             .min(self.input_len_chars());
     }
 
-    fn move_input_start(&mut self) {
+    const fn move_input_start(&mut self) {
         self.input_cursor = 0;
         self.chat_input_scroll = 0;
     }
@@ -9941,8 +9913,7 @@ impl App {
                         } else {
                             let engine = self
                                 .selected_engine_manager_item()
-                                .map(|item| item.name)
-                                .unwrap_or_else(|| args[1].to_owned());
+                                .map_or_else(|| args[1].to_owned(), |item| item.name);
                             self.request_engine_install(&engine, reinstall);
                         }
                     }
@@ -10235,25 +10206,22 @@ impl App {
                         return true;
                     };
                     let mode = if action == "enable" && args.len() > 2 {
-                        match args.as_slice() {
-                            ["enable", _, "--mode", mode] => match parse_watcher_mode(mode) {
-                                Some(mode) => Some(mode),
-                                None => {
-                                    self.set_active_screen_message(
-                                        "Choose one of these settings: observe, propose, contained.",
-                                    );
-                                    self.status =
-                                        "Automation setting was not recognized.".to_owned();
-                                    return true;
-                                }
-                            },
-                            _ => {
+                        if let ["enable", _, "--mode", mode] = args.as_slice() {
+                            if let Some(mode) = parse_watcher_mode(mode) {
+                                Some(mode)
+                            } else {
                                 self.set_active_screen_message(
-                                    "Choose an automation check with the arrow keys, then press Enter.",
+                                    "Choose one of these settings: observe, propose, contained.",
                                 );
-                                self.status = "Automation option was not recognized.".to_owned();
+                                self.status = "Automation setting was not recognized.".to_owned();
                                 return true;
                             }
+                        } else {
+                            self.set_active_screen_message(
+                                "Choose an automation check with the arrow keys, then press Enter.",
+                            );
+                            self.status = "Automation option was not recognized.".to_owned();
+                            return true;
                         }
                     } else if action == "disable" && args.len() > 2 {
                         self.set_active_screen_message(
@@ -10329,11 +10297,9 @@ impl App {
                 true
             }
             "comfyui" | "comfy" => {
-                let showing_logs = matches!(args.as_slice(), ["logs"] | ["log"]);
-                let showing_log_files = matches!(
-                    args.as_slice(),
-                    ["log-files"] | ["logs", "files"] | ["log", "files"]
-                );
+                let showing_logs = matches!(args.as_slice(), ["logs" | "log"]);
+                let showing_log_files =
+                    matches!(args.as_slice(), ["log-files"] | ["logs" | "log", "files"]);
                 if showing_logs || showing_log_files {
                     let (title, detail, status) = if showing_logs {
                         (
@@ -10361,7 +10327,7 @@ impl App {
                     self.status = status.to_owned();
                     return true;
                 }
-                let showing_models_path = matches!(args.as_slice(), ["models-path"] | ["models"]);
+                let showing_models_path = matches!(args.as_slice(), ["models-path" | "models"]);
                 let mut detail = if showing_models_path {
                     crate::comfyui::render_models_path(&self.paths)
                         .map(|path| format!("Models path\n\n{}", path.trim()))
@@ -10394,9 +10360,9 @@ impl App {
                 let selected_command = match args.as_slice() {
                     ["install"] => "comfyui install",
                     ["start"] => "comfyui start",
-                    ["models-path"] | ["models"] => "comfyui models-path",
-                    ["logs"] | ["log"] => "comfyui logs",
-                    ["log-files"] | ["logs", "files"] | ["log", "files"] => "comfyui log-files",
+                    ["models-path" | "models"] => "comfyui models-path",
+                    ["logs" | "log"] => "comfyui logs",
+                    ["log-files"] | ["logs" | "log", "files"] => "comfyui log-files",
                     _ => "comfyui start",
                 };
                 self.open_command_screen("ComfyUI", detail, None, actions);
@@ -10418,13 +10384,13 @@ impl App {
                     [] | ["status"] => {
                         self.status = "ComfyUI status shown.".to_owned();
                     }
-                    ["logs"] | ["log"] => {
+                    ["logs" | "log"] => {
                         self.status = "ComfyUI logs shown.".to_owned();
                     }
-                    ["log-files"] | ["logs", "files"] | ["log", "files"] => {
+                    ["log-files"] | ["logs" | "log", "files"] => {
                         self.status = "ComfyUI log file locations shown.".to_owned();
                     }
-                    ["models-path"] | ["models"] => {
+                    ["models-path" | "models"] => {
                         self.status = "ComfyUI models path shown.".to_owned();
                     }
                     ["install"] => {
@@ -10456,13 +10422,13 @@ impl App {
                 self.open_services_manager();
                 match args.as_slice() {
                     [] | ["list"] => {}
-                    ["logs"] | ["log"] => {
+                    ["logs" | "log"] => {
                         self.set_active_screen_message(
                             "Choose a service from this list, then press Enter to open its logs.",
                         );
                         self.status = "Choose a service from the list.".to_owned();
                     }
-                    ["logs", service_id] | ["log", service_id] => {
+                    ["logs" | "log", service_id] => {
                         if self.select_service_by_id(service_id) {
                             self.open_selected_service_logs();
                         } else {
@@ -10553,7 +10519,7 @@ impl App {
                         self.open_logs_browser(None, 0);
                         if let Some(state) = self.logs_view.as_mut() {
                             state.last_rendered =
-                                format!("{}\n\nUse the choices on the left, or press Back.", error);
+                                format!("{error}\n\nUse the choices on the left, or press Back.");
                             state.selected = 0;
                             state.detail_scroll = 0;
                         }
@@ -10885,7 +10851,7 @@ impl App {
         let (sender, receiver) = mpsc::channel();
         let cancel_requested = Arc::new(AtomicBool::new(false));
         let cancel_for_thread = Arc::clone(&cancel_requested);
-        let args_for_thread = args.clone();
+        let args_for_thread = args;
         let paths_for_thread = self.paths.clone();
         std::thread::spawn(move || {
             let result = run_cli_command_streaming(
@@ -10957,7 +10923,7 @@ impl App {
         let (sender, receiver) = mpsc::channel();
         let cancel_requested = Arc::new(AtomicBool::new(false));
         let cancel_for_thread = Arc::clone(&cancel_requested);
-        let args_for_thread = args.clone();
+        let args_for_thread = args;
         let paths_for_thread = self.paths.clone();
         std::thread::spawn(move || {
             let result = run_rocmd_command_streaming(
@@ -11018,7 +10984,7 @@ impl App {
             return false;
         }
         let request = ChatRequest {
-            model: model.clone(),
+            model,
             messages: vec![ChatMessage {
                 role: "user".to_owned(),
                 content: prompt.clone(),
@@ -11094,7 +11060,7 @@ impl App {
         self.running_job = Some(RunningJob {
             title: "Planning".to_owned(),
             kind: RunningJobKind::Planner {
-                title: title.clone(),
+                title,
                 request: request.clone(),
             },
             receiver,
@@ -11321,7 +11287,7 @@ impl App {
             } else {
                 session.turns.push(ChatSessionTurn {
                     role: ChatSessionRole::Assistant,
-                    content: content.clone(),
+                    content,
                     detail: None,
                 });
             }
@@ -11697,13 +11663,7 @@ impl App {
                     && chat_session_owns_command_title(title.as_str())
                 {
                     let should_follow = self.command_screen_chat_should_follow_latest();
-                    let recent_live_output = if !self.running_job_output.is_empty() {
-                        self.running_job_output
-                            .iter()
-                            .map(|line| format!("  {}", display_stream_log_line(line)))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    } else {
+                    let recent_live_output = if self.running_job_output.is_empty() {
                         recent_screen_output
                             .as_deref()
                             .unwrap_or_default()
@@ -11711,9 +11671,15 @@ impl App {
                             .map(|line| format!("  {}", display_stream_log_line(line.trim())))
                             .collect::<Vec<_>>()
                             .join("\n")
+                    } else {
+                        self.running_job_output
+                            .iter()
+                            .map(|line| format!("  {}", display_stream_log_line(line)))
+                            .collect::<Vec<_>>()
+                            .join("\n")
                     };
                     let mut summary_parts = Vec::new();
-                    if let Some(summary) = screen_summary.clone()
+                    if let Some(summary) = screen_summary
                         && !summary.trim().is_empty()
                     {
                         summary_parts.push(summary);
@@ -12546,8 +12512,7 @@ impl App {
         let title = self
             .pending_approval
             .as_ref()
-            .map(|pending| pending.title.clone())
-            .unwrap_or_else(|| "Approval".to_owned());
+            .map_or_else(|| "Approval".to_owned(), |pending| pending.title.clone());
         let stay_in_chat = self.command_screen_is_chat_session();
         let stay_in_setup = self.onboarding_active;
         self.cancel_focused_action();
@@ -12623,7 +12588,7 @@ impl App {
             "Review",
             args,
             RunningJobKind::Proposal {
-                proposal_id: proposal.proposal_id.clone(),
+                proposal_id: proposal.proposal_id,
             },
         );
         self.status = "Review approved; working on it.".to_owned();
@@ -12743,10 +12708,10 @@ impl App {
         let target_key = field
             .and_then(automation_prefetch_field_from_edit_name)
             .filter(|_| is_pending_prefetch_proposal(&proposal))
-            .map(|field| {
-                AutomationManagerRowKey::PrefetchField(proposal.proposal_id.clone(), field)
-            })
-            .unwrap_or_else(|| AutomationManagerRowKey::Review(proposal.proposal_id.clone()));
+            .map_or_else(
+                || AutomationManagerRowKey::Review(proposal.proposal_id.clone()),
+                |field| AutomationManagerRowKey::PrefetchField(proposal.proposal_id.clone(), field),
+            );
         if let Some(state) = self.automations_manager.as_mut() {
             if let Some(item) = state
                 .items
@@ -12967,6 +12932,7 @@ fn plain_install_input_is_command(args: &[&str]) -> bool {
             .is_some_and(|arg| matches!(*arg, "sdk" | "driver") || arg.starts_with("--"))
 }
 
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // `.gguf` heuristic on raw CLI args; behavior intentionally exact
 fn plain_serve_input_is_command(args: &[&str]) -> bool {
     args.iter().any(|arg| arg.starts_with("--"))
         || args
@@ -12994,10 +12960,10 @@ fn is_plain_casual_input(input: &str) -> bool {
                 && matches!(*second, "there" | "rocm")
     ) || matches!(
         words.as_slice(),
-        ["thank", "you"] | ["good", "morning"] | ["good", "afternoon"] | ["good", "evening"]
+        ["thank", "you"] | ["good", "morning" | "afternoon" | "evening"]
     ) || matches!(
         words.as_slice(),
-        ["can", "you", "hear", "me"] | ["are", "you", "there"] | ["testing"] | ["test"]
+        ["can", "you", "hear", "me"] | ["are", "you", "there"] | ["testing" | "test"]
     )
 }
 
@@ -13193,7 +13159,7 @@ fn flag_without_value(option_name: &str, inline_value: Option<&str>) -> Result<(
     Ok(())
 }
 
-fn serve_usage_text() -> &'static str {
+const fn serve_usage_text() -> &'static str {
     "Usage: /serve <model> [--engine <engine>] [--device gpu|gpu_required] [--managed]\n\nExamples:\n  /serve qwen with lemonade --managed\n  /serve qwen --engine lemonade --device gpu_required"
 }
 
@@ -13215,7 +13181,6 @@ fn render_serve_command_plan(plan: &ServeCommandPlan, config: &RocmCliConfig) ->
     let command = format_command_for_display("rocm", &plan.cli_args());
 
     let mut output = String::new();
-    use std::fmt::Write as _;
     let _ = writeln!(output, "serve plan");
     let _ = writeln!(output, "  requested model: {model}");
     let _ = writeln!(output, "  engine: {engine}");
@@ -13313,7 +13278,6 @@ fn render_serve_wizard_review(plan: &ServeCommandPlan, config: &RocmCliConfig) -
     let port = plan.port.unwrap_or(DEFAULT_LOCAL_PORT);
 
     let mut output = String::new();
-    use std::fmt::Write as _;
     let _ = writeln!(output, "Start local model");
     let _ = writeln!(output, "  model: {model}");
     let _ = writeln!(output, "  engine: {engine}");
@@ -13653,8 +13617,10 @@ fn default_setup_venv_path(paths: &AppPaths) -> PathBuf {
         return config_dir
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
-            .map(|parent| parent.join("rocm_venvs").join("default"))
-            .unwrap_or_else(|| config_dir.join("rocm_venvs").join("default"));
+            .map_or_else(
+                || config_dir.join("rocm_venvs").join("default"),
+                |parent| parent.join("rocm_venvs").join("default"),
+            );
     }
     paths.data_dir.join("envs").join("default")
 }
@@ -13786,7 +13752,7 @@ fn folder_browser_entries(current_dir: &Path) -> (Vec<FolderBrowserEntry>, Optio
     match fs::read_dir(&current_dir) {
         Ok(read_dir) => {
             let mut dirs = read_dir
-                .filter_map(|entry| entry.ok())
+                .filter_map(std::result::Result::ok)
                 .map(|entry| entry.path())
                 .filter(|path| path.is_dir())
                 .filter(|path| folder_browser_should_show_directory(&current_dir, path))
@@ -14358,7 +14324,7 @@ fn onboarding_menu_choices(app: &App) -> Vec<OnboardingMenuChoice> {
     choices
 }
 
-fn onboarding_cancel_install_choices() -> &'static [&'static str] {
+const fn onboarding_cancel_install_choices() -> &'static [&'static str] {
     &["Keep waiting", "Stop install"]
 }
 
@@ -14400,8 +14366,7 @@ fn onboarding_selection_status(app: &App) -> String {
             let title = app
                 .pending_approval
                 .as_ref()
-                .map(|pending| pending.title.as_str())
-                .unwrap_or("setup");
+                .map_or("setup", |pending| pending.title.as_str());
             if title == "Uninstall" {
                 "Press Enter to approve uninstall.".to_owned()
             } else if title == "Reinstall" {
@@ -14536,7 +14501,7 @@ fn read_saved_onboarding_log_lines(path: &Path) -> Result<Vec<String>> {
     Ok(text
         .lines()
         .map(|line| sanitize_terminal_text(line).replace(['\r', '\n'], " "))
-        .map(|line| truncate_stream_line(line.trim()).to_owned())
+        .map(|line| truncate_stream_line(line.trim()))
         .filter(|line| !line.is_empty())
         .collect())
 }
@@ -14739,7 +14704,7 @@ fn render_onboarding_screen_text_with_log_limit(app: &App, install_log_limit: us
     } else {
         "not installed"
     };
-    let _ = writeln!(output, "  {} ROCm: {}", marker, status);
+    let _ = writeln!(output, "  {marker} ROCm: {status}");
     if let Some(runtime) = current_runtime.as_ref()
         && let Some(version) = runtime.version.as_deref()
         && !version.trim().is_empty()
@@ -15459,8 +15424,7 @@ fn install_sdk_argument_candidates(arg_index: usize, parts: &[String]) -> Vec<St
 }
 
 fn install_driver_argument_candidates(parts: &[String]) -> Vec<String> {
-    ["--preview"]
-        .into_iter()
+    std::iter::once("--preview")
         .filter(|option| !slash_option_used(parts, option))
         .map(str::to_owned)
         .collect()
@@ -15792,7 +15756,7 @@ fn selected_completion_index(requested: usize, replacements: &[Option<String>]) 
     }
     if replacements
         .get(requested)
-        .is_some_and(|replacement| replacement.is_some())
+        .is_some_and(std::option::Option::is_some)
     {
         return requested;
     }
@@ -15929,7 +15893,7 @@ struct ScrollMetrics {
 }
 
 impl ScrollMetrics {
-    fn max_offset(self) -> usize {
+    const fn max_offset(self) -> usize {
         self.content_len.saturating_sub(self.viewport_len)
     }
 
@@ -15937,7 +15901,7 @@ impl ScrollMetrics {
         self.offset.min(u16::MAX as usize) as u16
     }
 
-    fn should_draw(self) -> bool {
+    const fn should_draw(self) -> bool {
         self.content_len > self.viewport_len
     }
 }
@@ -16028,7 +15992,7 @@ fn draw_completion_menu(frame: &mut Frame<'_>, menu: &CompletionMenu, area: Rect
             let style = if menu
                 .replacements
                 .get(index)
-                .is_some_and(|replacement| replacement.is_some())
+                .is_some_and(std::option::Option::is_some)
             {
                 Style::default()
             } else {
@@ -16041,7 +16005,7 @@ fn draw_completion_menu(frame: &mut Frame<'_>, menu: &CompletionMenu, area: Rect
     if menu
         .replacements
         .get(menu.selected)
-        .is_some_and(|replacement| replacement.is_some())
+        .is_some_and(std::option::Option::is_some)
     {
         state.select(Some(menu.selected.saturating_sub(visible_start)));
     }
@@ -16086,9 +16050,9 @@ fn draw_command_prompt_popup(
     if area.width < 12 || area.height < 8 {
         return;
     }
-    let completion_height = completion_menu
-        .map(|menu| menu.items.len().min(MAX_COMPLETION_MENU_ITEMS) as u16 + 2)
-        .unwrap_or(0);
+    let completion_height = completion_menu.map_or(0, |menu| {
+        menu.items.len().min(MAX_COMPLETION_MENU_ITEMS) as u16 + 2
+    });
     let wanted_width = area.width.saturating_sub(4).min(96).max(48.min(area.width));
     let wanted_height = completion_height
         .saturating_add(6)
@@ -16467,7 +16431,7 @@ fn read_fallback_sgr_mouse_sequence(
 fn read_fallback_x10_mouse_sequence(
     next_byte: &mut impl FnMut(Duration) -> Option<u8>,
 ) -> Option<Event> {
-    let code = next_byte(FALLBACK_ESCAPE_SEQUENCE_TIMEOUT)?.saturating_sub(32) as u16;
+    let code = u16::from(next_byte(FALLBACK_ESCAPE_SEQUENCE_TIMEOUT)?.saturating_sub(32));
     let column = u16::from(next_byte(FALLBACK_ESCAPE_SEQUENCE_TIMEOUT)?.saturating_sub(33));
     let row = u16::from(next_byte(FALLBACK_ESCAPE_SEQUENCE_TIMEOUT)?.saturating_sub(33));
     fallback_mouse_event(code, column, row, b'M')
@@ -16505,11 +16469,11 @@ fn fallback_mouse_modifiers(code: u16) -> KeyModifiers {
     modifiers
 }
 
-fn fallback_noop_event() -> Event {
+const fn fallback_noop_event() -> Event {
     Event::FocusGained
 }
 
-fn fallback_key(code: KeyCode) -> Event {
+const fn fallback_key(code: KeyCode) -> Event {
     Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
@@ -16560,7 +16524,7 @@ fn handle_terminal_event(app: &mut App, event: Event) {
             }
         }
         Event::Paste(text) if surface_command_prompt_active(app) || should_draw_prompt_box(app) => {
-            app.paste_text(&text)
+            app.paste_text(&text);
         }
         Event::Paste(_) => {
             app.status =
@@ -16744,10 +16708,9 @@ fn main_content_area(app: &App, width: u16, height: u16) -> Rect {
     let command_prompt_popup = surface_command_prompt_active(app);
     let prompt_box_visible = should_draw_prompt_box(app) && !command_prompt_popup;
     let completion_height = if prompt_box_visible {
-        app.slash_completion_menu()
-            .as_ref()
-            .map(|menu| menu.items.len().min(MAX_COMPLETION_MENU_ITEMS) as u16 + 2)
-            .unwrap_or(0)
+        app.slash_completion_menu().as_ref().map_or(0, |menu| {
+            menu.items.len().min(MAX_COMPLETION_MENU_ITEMS) as u16 + 2
+        })
     } else {
         0
     };
@@ -16816,7 +16779,7 @@ fn folder_browser_list_inner_rect(area: Rect) -> Option<Rect> {
     Some(rect_inner(panes[0]))
 }
 
-fn rect_inner(rect: Rect) -> Rect {
+const fn rect_inner(rect: Rect) -> Rect {
     Rect {
         x: rect.x.saturating_add(1),
         y: rect.y.saturating_add(1),
@@ -16825,7 +16788,7 @@ fn rect_inner(rect: Rect) -> Rect {
     }
 }
 
-fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
+const fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
     column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
 }
 
@@ -16984,8 +16947,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.reject_or_cancel_focused_action();
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => {
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => {
             if surface_command_prompt_active(app) && command_popup_should_submit_on_enter(app) {
                 app.submit();
                 return;
@@ -17068,11 +17030,11 @@ fn handle_home_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
             app.perform_home_dashboard_action();
             true
         }
-        (_, KeyCode::Down) | (_, KeyCode::Tab) => {
+        (_, KeyCode::Down | KeyCode::Tab) => {
             app.move_home_dashboard_selection(CompletionDirection::Next);
             true
         }
-        (_, KeyCode::Up) | (_, KeyCode::BackTab) => {
+        (_, KeyCode::Up | KeyCode::BackTab) => {
             app.move_home_dashboard_selection(CompletionDirection::Previous);
             true
         }
@@ -17177,7 +17139,7 @@ fn surface_command_prompt_active(app: &App) -> bool {
         && !should_draw_running_job_modal(app)
 }
 
-fn active_surface_navigation_key(key: KeyEvent) -> bool {
+const fn active_surface_navigation_key(key: KeyEvent) -> bool {
     active_surface_action_key(key)
         || matches!(
             key.code,
@@ -17196,12 +17158,11 @@ fn active_surface_navigation_key(key: KeyEvent) -> bool {
         )
 }
 
-fn active_surface_action_key(key: KeyEvent) -> bool {
+const fn active_surface_action_key(key: KeyEvent) -> bool {
     matches!(
         (key.modifiers, key.code),
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-            | (_, KeyCode::Char('\n' | '\r'))
-            | (_, KeyCode::Enter)
+            | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter)
     )
 }
 
@@ -17298,8 +17259,7 @@ fn handle_pending_approval_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => {
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => {
             app.perform_pending_approval_selection();
             true
         }
@@ -17347,8 +17307,7 @@ fn handle_overlay_card_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => {
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => {
             app.perform_overlay_card_action();
             true
         }
@@ -17422,8 +17381,7 @@ fn handle_folder_browser_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => {
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => {
             app.perform_folder_browser_selection();
             true
         }
@@ -17472,8 +17430,7 @@ fn handle_running_job_modal_key(app: &mut App, key: KeyEvent) -> bool {
             }
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => {
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => {
             app.status =
                 "Wait for the running work to finish before choosing another action.".to_owned();
         }
@@ -17530,12 +17487,11 @@ fn handle_doctor_manager_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => {
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => {
             app.perform_doctor_manager_selected_action();
             true
         }
-        (_, KeyCode::Esc) | (_, KeyCode::Char('q' | 'Q')) => {
+        (_, KeyCode::Esc | KeyCode::Char('q' | 'Q')) => {
             app.close_doctor_manager();
             true
         }
@@ -17628,7 +17584,7 @@ fn handle_runtime_manager_key(app: &mut App, key: KeyEvent) -> bool {
             }
             true
         }
-        (_, KeyCode::Char('u' | 'U')) | (_, KeyCode::Delete) => {
+        (_, KeyCode::Char('u' | 'U') | KeyCode::Delete) => {
             if app
                 .runtime_manager
                 .as_ref()
@@ -17641,12 +17597,11 @@ fn handle_runtime_manager_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => {
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => {
             app.perform_runtime_manager_selected_action();
             true
         }
-        (_, KeyCode::Esc) | (_, KeyCode::Char('q' | 'Q')) => {
+        (_, KeyCode::Esc | KeyCode::Char('q' | 'Q')) => {
             if app
                 .runtime_manager
                 .as_ref()
@@ -17672,8 +17627,7 @@ fn handle_runtime_manager_text_key(app: &mut App, key: KeyEvent) -> bool {
         (KeyModifiers::CONTROL, KeyCode::Char('u')) => app.clear_input(),
         (KeyModifiers::CONTROL, KeyCode::Char('w')) => app.delete_input_word_before_cursor(),
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => {
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => {
             let import_editing = app.runtime_manager.as_ref().is_some_and(|state| {
                 matches!(
                     state.screen,
@@ -17743,7 +17697,7 @@ fn handle_install_manager_key(app: &mut App, key: KeyEvent) -> bool {
         (_, KeyCode::Left) => {
             match app.selected_install_sdk_choice() {
                 InstallSdkChoice::Folder => {
-                    app.cycle_install_sdk_folder_preset(CompletionDirection::Previous)
+                    app.cycle_install_sdk_folder_preset(CompletionDirection::Previous);
                 }
                 _ => {
                     app.status = "Use Up and Down to choose an install option.".to_owned();
@@ -17754,7 +17708,7 @@ fn handle_install_manager_key(app: &mut App, key: KeyEvent) -> bool {
         (_, KeyCode::Right) => {
             match app.selected_install_sdk_choice() {
                 InstallSdkChoice::Folder => {
-                    app.cycle_install_sdk_folder_preset(CompletionDirection::Next)
+                    app.cycle_install_sdk_folder_preset(CompletionDirection::Next);
                 }
                 _ => {
                     app.status = "Use Up and Down to choose an install option.".to_owned();
@@ -17803,12 +17757,11 @@ fn handle_install_manager_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => {
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => {
             app.perform_install_manager_selected_action();
             true
         }
-        (_, KeyCode::Esc) | (_, KeyCode::Char('q' | 'Q')) => {
+        (_, KeyCode::Esc | KeyCode::Char('q' | 'Q')) => {
             if app
                 .install_manager
                 .as_ref()
@@ -17832,8 +17785,7 @@ fn handle_install_manager_text_key(app: &mut App, key: KeyEvent) -> bool {
         (KeyModifiers::CONTROL, KeyCode::Char('u')) => app.clear_input(),
         (KeyModifiers::CONTROL, KeyCode::Char('w')) => app.delete_input_word_before_cursor(),
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => app.commit_install_sdk_folder_edit(),
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => app.commit_install_sdk_folder_edit(),
         (_, KeyCode::Esc) => app.cancel_install_sdk_folder_edit(),
         (_, KeyCode::Backspace) => app.backspace_input(),
         (_, KeyCode::Delete) => app.delete_input_char(),
@@ -17906,12 +17858,11 @@ fn handle_engine_manager_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => {
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => {
             app.perform_engine_manager_selected_action();
             true
         }
-        (_, KeyCode::Esc) | (_, KeyCode::Char('q' | 'Q')) => {
+        (_, KeyCode::Esc | KeyCode::Char('q' | 'Q')) => {
             app.close_engine_manager();
             true
         }
@@ -17965,12 +17916,11 @@ fn handle_model_picker_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => {
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => {
             app.plan_selected_model_recipe();
             true
         }
-        (_, KeyCode::Esc) | (_, KeyCode::Char('q' | 'Q')) => {
+        (_, KeyCode::Esc | KeyCode::Char('q' | 'Q')) => {
             app.close_model_picker();
             true
         }
@@ -18035,12 +17985,11 @@ fn handle_serve_wizard_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => {
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => {
             app.perform_serve_wizard_selected_action();
             true
         }
-        (_, KeyCode::Esc) | (_, KeyCode::Char('q' | 'Q')) => {
+        (_, KeyCode::Esc | KeyCode::Char('q' | 'Q')) => {
             app.close_serve_wizard();
             true
         }
@@ -18056,8 +18005,7 @@ fn handle_serve_wizard_text_key(app: &mut App, key: KeyEvent) -> bool {
         (KeyModifiers::CONTROL, KeyCode::Char('u')) => app.clear_input(),
         (KeyModifiers::CONTROL, KeyCode::Char('w')) => app.delete_input_word_before_cursor(),
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => app.commit_serve_wizard_field_edit(),
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => app.commit_serve_wizard_field_edit(),
         (_, KeyCode::Esc) => app.cancel_serve_wizard_field_edit(),
         (_, KeyCode::Backspace) => app.backspace_input(),
         (_, KeyCode::Delete) => app.delete_input_char(),
@@ -18120,12 +18068,11 @@ fn handle_update_manager_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => {
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => {
             app.perform_update_manager_selected_action();
             true
         }
-        (_, KeyCode::Esc) | (_, KeyCode::Char('q' | 'Q')) => {
+        (_, KeyCode::Esc | KeyCode::Char('q' | 'Q')) => {
             app.close_update_manager();
             true
         }
@@ -18156,10 +18103,10 @@ fn handle_automations_manager_key(app: &mut App, key: KeyEvent) -> bool {
                 match field {
                     AutomationPrefetchField::AllowDownload
                     | AutomationPrefetchField::AllowHuggingFace => {
-                        app.update_prefetch_bool_field(proposal, field, false)
+                        app.update_prefetch_bool_field(proposal, field, false);
                     }
                     AutomationPrefetchField::MaxBytes => {
-                        app.cycle_prefetch_max_bytes(proposal, CompletionDirection::Previous)
+                        app.cycle_prefetch_max_bytes(proposal, CompletionDirection::Previous);
                     }
                 }
             } else {
@@ -18172,10 +18119,10 @@ fn handle_automations_manager_key(app: &mut App, key: KeyEvent) -> bool {
                 match field {
                     AutomationPrefetchField::AllowDownload
                     | AutomationPrefetchField::AllowHuggingFace => {
-                        app.update_prefetch_bool_field(proposal, field, true)
+                        app.update_prefetch_bool_field(proposal, field, true);
                     }
                     AutomationPrefetchField::MaxBytes => {
-                        app.cycle_prefetch_max_bytes(proposal, CompletionDirection::Next)
+                        app.cycle_prefetch_max_bytes(proposal, CompletionDirection::Next);
                     }
                 }
             } else {
@@ -18218,10 +18165,10 @@ fn handle_automations_manager_key(app: &mut App, key: KeyEvent) -> bool {
                 match field {
                     AutomationPrefetchField::AllowDownload
                     | AutomationPrefetchField::AllowHuggingFace => {
-                        app.update_prefetch_bool_field(proposal, field, true)
+                        app.update_prefetch_bool_field(proposal, field, true);
                     }
                     AutomationPrefetchField::MaxBytes => {
-                        app.start_prefetch_max_bytes_edit(&proposal)
+                        app.start_prefetch_max_bytes_edit(&proposal);
                     }
                 }
             } else if let Some(watcher) = app.selected_automation_watcher() {
@@ -18235,15 +18182,15 @@ fn handle_automations_manager_key(app: &mut App, key: KeyEvent) -> bool {
             }
             true
         }
-        (_, KeyCode::Char('n' | 'N')) | (_, KeyCode::Delete) => {
+        (_, KeyCode::Char('n' | 'N') | KeyCode::Delete) => {
             if let Some((proposal, field)) = app.selected_automation_prefetch_field() {
                 match field {
                     AutomationPrefetchField::AllowDownload
                     | AutomationPrefetchField::AllowHuggingFace => {
-                        app.update_prefetch_bool_field(proposal, field, false)
+                        app.update_prefetch_bool_field(proposal, field, false);
                     }
                     AutomationPrefetchField::MaxBytes => {
-                        app.status = "Press Enter to edit the max download.".to_owned()
+                        app.status = "Press Enter to edit the max download.".to_owned();
                     }
                 }
             } else if let Some(watcher) = app.selected_automation_watcher() {
@@ -18271,12 +18218,11 @@ fn handle_automations_manager_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => {
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => {
             app.perform_automations_manager_selected_action();
             true
         }
-        (_, KeyCode::Esc) | (_, KeyCode::Char('q' | 'Q')) => {
+        (_, KeyCode::Esc | KeyCode::Char('q' | 'Q')) => {
             app.close_automations_manager();
             true
         }
@@ -18292,8 +18238,7 @@ fn handle_automations_manager_text_key(app: &mut App, key: KeyEvent) -> bool {
         (KeyModifiers::CONTROL, KeyCode::Char('u')) => app.clear_input(),
         (KeyModifiers::CONTROL, KeyCode::Char('w')) => app.delete_input_word_before_cursor(),
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => app.commit_prefetch_max_bytes_edit(),
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => app.commit_prefetch_max_bytes_edit(),
         (_, KeyCode::Esc) => app.cancel_prefetch_max_bytes_edit(),
         (_, KeyCode::Backspace) => app.backspace_input(),
         (_, KeyCode::Delete) => app.delete_input_char(),
@@ -18383,12 +18328,11 @@ fn handle_config_manager_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => {
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => {
             app.perform_config_manager_selected_action();
             true
         }
-        (_, KeyCode::Esc) | (_, KeyCode::Char('q' | 'Q')) => {
+        (_, KeyCode::Esc | KeyCode::Char('q' | 'Q')) => {
             if app.config_manager_confirming_provider_clear() {
                 app.cancel_clear_config_provider_key_confirmation();
                 return true;
@@ -18416,8 +18360,7 @@ fn handle_config_manager_secret_key(app: &mut App, key: KeyEvent) -> bool {
         (KeyModifiers::CONTROL, KeyCode::Char('u')) => app.clear_input(),
         (KeyModifiers::CONTROL, KeyCode::Char('w')) => app.delete_input_word_before_cursor(),
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => app.commit_config_provider_key_edit(),
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => app.commit_config_provider_key_edit(),
         (_, KeyCode::Esc) => app.cancel_config_provider_key_edit(),
         (_, KeyCode::Backspace) => app.backspace_input(),
         (_, KeyCode::Delete) => app.delete_input_char(),
@@ -18478,12 +18421,11 @@ fn handle_provider_manager_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => {
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => {
             app.use_selected_provider();
             true
         }
-        (_, KeyCode::Esc) | (_, KeyCode::Char('q' | 'Q')) => {
+        (_, KeyCode::Esc | KeyCode::Char('q' | 'Q')) => {
             app.close_provider_manager();
             true
         }
@@ -18540,7 +18482,7 @@ fn handle_services_manager_key(app: &mut App, key: KeyEvent) -> bool {
             app.refresh_services_manager();
             true
         }
-        (_, KeyCode::Char('S')) | (_, KeyCode::Char('s')) | (_, KeyCode::Delete) => {
+        (_, KeyCode::Char('S' | 's') | KeyCode::Delete) => {
             app.request_selected_service_lifecycle(ServiceLifecycleAction::Stop);
             true
         }
@@ -18548,14 +18490,12 @@ fn handle_services_manager_key(app: &mut App, key: KeyEvent) -> bool {
             app.request_selected_service_lifecycle(ServiceLifecycleAction::Restart);
             true
         }
-        (_, KeyCode::Char('l' | 'L'))
-        | (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => {
+        (_, KeyCode::Char('l' | 'L' | '\n' | '\r') | KeyCode::Enter)
+        | (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm')) => {
             app.perform_services_manager_selected_action();
             true
         }
-        (_, KeyCode::Esc) | (_, KeyCode::Char('q' | 'Q')) => {
+        (_, KeyCode::Esc | KeyCode::Char('q' | 'Q')) => {
             app.close_services_manager();
             true
         }
@@ -18596,8 +18536,7 @@ fn handle_command_screen_key(app: &mut App, key: KeyEvent) -> bool {
                     true
                 }
                 (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-                | (_, KeyCode::Char('\n' | '\r'))
-                | (_, KeyCode::Enter) => {
+                | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => {
                     app.status = "Type a message, then press Enter.".to_owned();
                     true
                 }
@@ -18677,8 +18616,7 @@ fn handle_command_screen_key(app: &mut App, key: KeyEvent) -> bool {
                 true
             }
             (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-            | (_, KeyCode::Char('\n' | '\r'))
-            | (_, KeyCode::Enter) => {
+            | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => {
                 app.perform_command_screen_selected_action();
                 true
             }
@@ -18732,12 +18670,11 @@ fn handle_command_screen_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => {
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => {
             app.perform_command_screen_selected_action();
             true
         }
-        (_, KeyCode::Esc) | (_, KeyCode::Char('q' | 'Q')) => {
+        (_, KeyCode::Esc | KeyCode::Char('q' | 'Q')) => {
             app.close_command_screen();
             true
         }
@@ -18759,7 +18696,7 @@ fn handle_command_screen_detail_modal_key(app: &mut App, key: KeyEvent) -> bool 
             app.status = "Detail card is open. Press Esc to close it.".to_owned();
             true
         }
-        (_, KeyCode::Esc) | (_, KeyCode::Char('q' | 'Q')) => {
+        (_, KeyCode::Esc | KeyCode::Char('q' | 'Q')) => {
             app.close_command_screen_detail_modal();
             true
         }
@@ -18801,10 +18738,16 @@ fn handle_command_screen_detail_modal_key(app: &mut App, key: KeyEvent) -> bool 
             app.status = "Detail card moved to the bottom.".to_owned();
             true
         }
-        (_, KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab)
-        | (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => {
+        (
+            _,
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Char('\n' | '\r')
+            | KeyCode::Enter,
+        )
+        | (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm')) => {
             app.status = "Detail card is open. Press Esc to close it.".to_owned();
             true
         }
@@ -18908,12 +18851,11 @@ fn handle_logs_view_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => {
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => {
             app.perform_logs_view_selected_action();
             true
         }
-        (_, KeyCode::Esc) | (_, KeyCode::Char('q' | 'Q')) => {
+        (_, KeyCode::Esc | KeyCode::Char('q' | 'Q')) => {
             app.close_logs_browser();
             true
         }
@@ -18935,7 +18877,7 @@ fn handle_logs_view_detail_modal_key(app: &mut App, key: KeyEvent) -> bool {
             app.status = "File location card is open. Press Esc to close it.".to_owned();
             true
         }
-        (_, KeyCode::Esc) | (_, KeyCode::Char('q' | 'Q')) => {
+        (_, KeyCode::Esc | KeyCode::Char('q' | 'Q')) => {
             app.close_logs_view_detail_modal();
             true
         }
@@ -18977,10 +18919,16 @@ fn handle_logs_view_detail_modal_key(app: &mut App, key: KeyEvent) -> bool {
             app.status = "File location card moved to the bottom.".to_owned();
             true
         }
-        (_, KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab)
-        | (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => {
+        (
+            _,
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Char('\n' | '\r')
+            | KeyCode::Enter,
+        )
+        | (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm')) => {
             app.status = "File location card is open. Press Esc to close it.".to_owned();
             true
         }
@@ -18999,8 +18947,7 @@ fn handle_logs_view_text_key(app: &mut App, key: KeyEvent) -> bool {
         (KeyModifiers::CONTROL, KeyCode::Char('u')) => app.clear_input(),
         (KeyModifiers::CONTROL, KeyCode::Char('w')) => app.delete_input_word_before_cursor(),
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => app.commit_logs_search_edit(),
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => app.commit_logs_search_edit(),
         (_, KeyCode::Esc) => app.cancel_logs_search_edit(),
         (_, KeyCode::Backspace) => app.backspace_input(),
         (_, KeyCode::Delete) => app.delete_input_char(),
@@ -19030,14 +18977,14 @@ fn handle_onboarding_key(app: &mut App, key: KeyEvent) -> bool {
     if app.onboarding_cancel_install_confirm {
         match (key.modifiers, key.code) {
             (_, KeyCode::Char('y' | 'Y')) => app.cancel_onboarding_install(),
-            (_, KeyCode::Char('n' | 'N')) | (_, KeyCode::Esc) => {
-                app.keep_waiting_for_onboarding_install()
+            (_, KeyCode::Char('n' | 'N') | KeyCode::Esc) => {
+                app.keep_waiting_for_onboarding_install();
             }
             (_, KeyCode::Up | KeyCode::BackTab) => {
-                app.move_onboarding_cancel_install_selection(CompletionDirection::Previous)
+                app.move_onboarding_cancel_install_selection(CompletionDirection::Previous);
             }
             (_, KeyCode::Down | KeyCode::Tab) => {
-                app.move_onboarding_cancel_install_selection(CompletionDirection::Next)
+                app.move_onboarding_cancel_install_selection(CompletionDirection::Next);
             }
             (_, KeyCode::Home) => {
                 app.onboarding_cancel_install_selection = 0;
@@ -19050,8 +18997,9 @@ fn handle_onboarding_key(app: &mut App, key: KeyEvent) -> bool {
                     onboarding_cancel_install_status(app.onboarding_cancel_install_selection);
             }
             (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-            | (_, KeyCode::Char('\n' | '\r'))
-            | (_, KeyCode::Enter) => app.perform_onboarding_cancel_install_selection(),
+            | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => {
+                app.perform_onboarding_cancel_install_selection();
+            }
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                 app.status = "Choose Keep waiting or Stop install.".to_owned();
             }
@@ -19145,8 +19093,7 @@ fn handle_onboarding_key(app: &mut App, key: KeyEvent) -> bool {
             app.status = "Setup is open. Use Up/Down, then Enter.".to_owned();
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter)
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter)
             if app.pending_approval.is_none() && app.running_job.is_none() =>
         {
             app.perform_onboarding_selected_action();
@@ -19184,8 +19131,7 @@ fn handle_onboarding_path_key(app: &mut App, key: KeyEvent) -> bool {
         (KeyModifiers::CONTROL, KeyCode::Char('u')) => app.clear_input(),
         (KeyModifiers::CONTROL, KeyCode::Char('w')) => app.delete_input_word_before_cursor(),
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
-        | (_, KeyCode::Char('\n' | '\r'))
-        | (_, KeyCode::Enter) => app.commit_onboarding_path_edit(),
+        | (_, KeyCode::Char('\n' | '\r') | KeyCode::Enter) => app.commit_onboarding_path_edit(),
         (_, KeyCode::Esc) => app.cancel_onboarding_path_edit(),
         (_, KeyCode::Backspace) => app.backspace_input(),
         (_, KeyCode::Delete) => app.delete_input_char(),
@@ -19228,10 +19174,9 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     let completion_height = if command_prompt_popup {
         0
     } else {
-        completion_menu
-            .as_ref()
-            .map(|menu| menu.items.len().min(MAX_COMPLETION_MENU_ITEMS) as u16 + 2)
-            .unwrap_or(0)
+        completion_menu.as_ref().map_or(0, |menu| {
+            menu.items.len().min(MAX_COMPLETION_MENU_ITEMS) as u16 + 2
+        })
     };
     let input_height = if prompt_box_visible {
         chat_input_area_height(app, frame.area().width, frame.area().height)
@@ -19593,7 +19538,7 @@ fn should_draw_prompt_box(app: &App) -> bool {
         && !app.should_draw_home_dashboard()
 }
 
-fn transcript_title(app: &App) -> &'static str {
+const fn transcript_title(app: &App) -> &'static str {
     if app.transcript.is_empty() {
         "Home"
     } else {
@@ -19735,9 +19680,8 @@ fn home_dashboard_badge_line(label: &'static str, rest: &str, color: Color) -> L
 
 fn render_home_dashboard_overview_text(app: &App) -> String {
     let setup_ready = setup_runtime_ready_for_sidebar(&app.paths, &app.config);
-    let runtime_count = therock::load_runtime_manifests(&app.paths)
-        .map(|manifests| manifests.len())
-        .unwrap_or(0);
+    let runtime_count =
+        therock::load_runtime_manifests(&app.paths).map_or(0, |manifests| manifests.len());
     let services = load_visible_managed_services(&app.paths);
     let service_counts = managed_service_sidebar_counts(&services);
     let default_engine = app
@@ -19867,7 +19811,7 @@ fn home_dashboard_actions(app: &App) -> Vec<HomeDashboardAction> {
     }
 }
 
-fn home_dashboard_action_label(action: HomeDashboardAction) -> &'static str {
+const fn home_dashboard_action_label(action: HomeDashboardAction) -> &'static str {
     match action {
         HomeDashboardAction::Setup => "Set up ROCm",
         HomeDashboardAction::Doctor => "Run setup check",
@@ -19882,7 +19826,7 @@ fn home_dashboard_action_label(action: HomeDashboardAction) -> &'static str {
     }
 }
 
-fn home_dashboard_action_status(action: HomeDashboardAction) -> &'static str {
+const fn home_dashboard_action_status(action: HomeDashboardAction) -> &'static str {
     match action {
         HomeDashboardAction::Setup => "Set up ROCm selected. Press Enter.",
         HomeDashboardAction::Doctor => "Setup check selected. Press Enter.",
@@ -19897,7 +19841,7 @@ fn home_dashboard_action_status(action: HomeDashboardAction) -> &'static str {
     }
 }
 
-fn home_dashboard_action_command(action: HomeDashboardAction) -> &'static str {
+const fn home_dashboard_action_command(action: HomeDashboardAction) -> &'static str {
     match action {
         HomeDashboardAction::Setup => "setup",
         HomeDashboardAction::Doctor => "doctor",
@@ -19919,7 +19863,7 @@ fn selection_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-fn surface_block<'a>(title: &'a str, color: Color) -> Block<'a> {
+fn surface_block(title: &str, color: Color) -> Block<'_> {
     Block::default()
         .borders(Borders::ALL)
         .title(title)
@@ -19927,15 +19871,15 @@ fn surface_block<'a>(title: &'a str, color: Color) -> Block<'a> {
         .style(Style::default().bg(THEME_PANEL))
 }
 
-fn detail_block<'a>(title: &'a str) -> Block<'a> {
+fn detail_block(title: &str) -> Block<'_> {
     surface_block(title, THEME_BORDER)
 }
 
-fn draw_scrollable_text_with_block<'a>(
+fn draw_scrollable_text_with_block(
     frame: &mut Frame<'_>,
     text: String,
     area: Rect,
-    block: Block<'a>,
+    block: Block<'_>,
     style: Style,
     requested_scroll: u16,
 ) -> ScrollMetrics {
@@ -19978,11 +19922,11 @@ fn draw_scrollable_text(
     metrics
 }
 
-fn draw_scrollable_styled_text_with_block<'a>(
+fn draw_scrollable_styled_text_with_block(
     frame: &mut Frame<'_>,
     styled_text: Text<'static>,
     area: Rect,
-    block: Block<'a>,
+    block: Block<'_>,
     style: Style,
     requested_scroll: u16,
 ) -> ScrollMetrics {
@@ -20058,7 +20002,7 @@ fn sidebar_border_color(app: &App) -> Color {
     }
 }
 
-fn should_draw_modal_approval(_app: &App) -> bool {
+const fn should_draw_modal_approval(_app: &App) -> bool {
     true
 }
 
@@ -20463,8 +20407,7 @@ fn render_modal_approval(app: &App, pending: &PendingApproval) -> String {
 fn modal_detail_scroll(app: &App) -> u16 {
     app.pending_approval
         .as_ref()
-        .map(|pending| pending.detail_scroll)
-        .unwrap_or(0)
+        .map_or(0, |pending| pending.detail_scroll)
 }
 
 fn draw_doctor_manager(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -20597,8 +20540,7 @@ fn draw_engine_manager(frame: &mut Frame<'_>, app: &App, area: Rect) {
             EngineManagerRow::Item(index) => state
                 .items
                 .get(*index)
-                .map(engine_manager_row_label)
-                .unwrap_or_else(|| "Engine".to_owned()),
+                .map_or_else(|| "Engine".to_owned(), engine_manager_row_label),
             EngineManagerRow::Action(action) => engine_manager_action_label(*action).to_owned(),
         })
         .map(ListItem::new)
@@ -21072,7 +21014,7 @@ fn draw_logs_view_detail_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-fn doctor_manager_choices() -> &'static [DoctorManagerChoice] {
+const fn doctor_manager_choices() -> &'static [DoctorManagerChoice] {
     &[
         DoctorManagerChoice::Overview,
         DoctorManagerChoice::Gpu,
@@ -21084,7 +21026,7 @@ fn doctor_manager_choices() -> &'static [DoctorManagerChoice] {
     ]
 }
 
-fn doctor_manager_label(choice: DoctorManagerChoice) -> &'static str {
+const fn doctor_manager_label(choice: DoctorManagerChoice) -> &'static str {
     match choice {
         DoctorManagerChoice::Overview => "Overview",
         DoctorManagerChoice::Gpu => "GPU",
@@ -21129,7 +21071,7 @@ fn runtime_manager_actions(state: &RuntimeManagerState) -> Vec<RuntimeManagerAct
     actions
 }
 
-fn runtime_advanced_choices() -> &'static [RuntimeAdvancedChoice] {
+const fn runtime_advanced_choices() -> &'static [RuntimeAdvancedChoice] {
     &[
         RuntimeAdvancedChoice::AdoptExisting,
         RuntimeAdvancedChoice::ImportManifest,
@@ -21137,7 +21079,7 @@ fn runtime_advanced_choices() -> &'static [RuntimeAdvancedChoice] {
     ]
 }
 
-fn runtime_import_choices() -> &'static [RuntimeImportChoice] {
+const fn runtime_import_choices() -> &'static [RuntimeImportChoice] {
     &[
         RuntimeImportChoice::ManifestPath,
         RuntimeImportChoice::Replace,
@@ -21146,7 +21088,7 @@ fn runtime_import_choices() -> &'static [RuntimeImportChoice] {
     ]
 }
 
-fn runtime_adopt_choices() -> &'static [RuntimeAdoptChoice] {
+const fn runtime_adopt_choices() -> &'static [RuntimeAdoptChoice] {
     &[
         RuntimeAdoptChoice::PythonPath,
         RuntimeAdoptChoice::Channel,
@@ -21355,7 +21297,7 @@ fn engine_manager_choice_count(state: &EngineManagerState) -> usize {
     engine_manager_rows(state).len()
 }
 
-fn engine_manager_action_label(action: EngineManagerAction) -> &'static str {
+const fn engine_manager_action_label(action: EngineManagerAction) -> &'static str {
     match action {
         EngineManagerAction::UseSelected => "Use selected engine",
         EngineManagerAction::InstallSelected => "Install selected engine",
@@ -21368,8 +21310,7 @@ fn engine_manager_action_label(action: EngineManagerAction) -> &'static str {
 fn model_picker_row_label(recipe: &ModelRecipeRecord) -> String {
     let gpu = recipe
         .min_gpu_mem_gb
-        .map(|gb| format!("{gb}GB GPU"))
-        .unwrap_or_else(|| "small".to_owned());
+        .map_or_else(|| "small".to_owned(), |gb| format!("{gb}GB GPU"));
     format!("{:<10} {}", gpu, recipe.canonical_model_id)
 }
 
@@ -21397,7 +21338,7 @@ fn serve_wizard_preferred_engine_index(recipes: &[ModelRecipeRecord]) -> Option<
     })
 }
 
-fn serve_wizard_choices() -> &'static [ServeWizardChoice] {
+const fn serve_wizard_choices() -> &'static [ServeWizardChoice] {
     &[
         ServeWizardChoice::Source,
         ServeWizardChoice::Model,
@@ -21475,7 +21416,7 @@ fn next_enabled_serve_wizard_index(
     state.selected.min(choices.len().saturating_sub(1))
 }
 
-fn serve_wizard_device_options() -> &'static [&'static str] {
+const fn serve_wizard_device_options() -> &'static [&'static str] {
     &["gpu_required"]
 }
 
@@ -21486,7 +21427,7 @@ fn serve_wizard_engine_names() -> Vec<String> {
         .collect()
 }
 
-fn cycle_index(current: usize, len: usize, direction: CompletionDirection) -> usize {
+const fn cycle_index(current: usize, len: usize, direction: CompletionDirection) -> usize {
     if len == 0 {
         return 0;
     }
@@ -21525,7 +21466,7 @@ fn selected_serve_wizard_device(state: &ServeWizardState) -> &'static str {
         .unwrap_or("gpu_required")
 }
 
-fn serve_wizard_source_label(source: ServeModelSource) -> &'static str {
+const fn serve_wizard_source_label(source: ServeModelSource) -> &'static str {
     match source {
         ServeModelSource::BuiltInRecipe => "recommended model",
         ServeModelSource::LocalPath => "my own model file",
@@ -21554,11 +21495,10 @@ fn serve_wizard_row_label(app: &App, choice: ServeWizardChoice) -> String {
             "{:<10} {}",
             "Model",
             if state.model_source == ServeModelSource::BuiltInRecipe {
-                selected_serve_wizard_recipe(state)
-                    .map(|recipe| {
-                        format!("fixed {}", compact_model_label(&recipe.canonical_model_id))
-                    })
-                    .unwrap_or_else(|| "no recommended models".to_owned())
+                selected_serve_wizard_recipe(state).map_or_else(
+                    || "no recommended models".to_owned(),
+                    |recipe| format!("fixed {}", compact_model_label(&recipe.canonical_model_id)),
+                )
             } else {
                 "not used".to_owned()
             }
@@ -21604,7 +21544,7 @@ fn serve_wizard_device_label(device: &str) -> &'static str {
     }
 }
 
-fn install_menu_choices() -> &'static [InstallMenuChoice] {
+const fn install_menu_choices() -> &'static [InstallMenuChoice] {
     &[
         InstallMenuChoice::Runtime,
         InstallMenuChoice::DriverPreview,
@@ -21612,7 +21552,7 @@ fn install_menu_choices() -> &'static [InstallMenuChoice] {
     ]
 }
 
-fn install_menu_label(choice: InstallMenuChoice) -> &'static str {
+const fn install_menu_label(choice: InstallMenuChoice) -> &'static str {
     match choice {
         InstallMenuChoice::Runtime => "Install ROCm",
         InstallMenuChoice::DriverPreview => "Check driver setup",
@@ -21620,7 +21560,7 @@ fn install_menu_label(choice: InstallMenuChoice) -> &'static str {
     }
 }
 
-fn install_sdk_choices() -> &'static [InstallSdkChoice] {
+const fn install_sdk_choices() -> &'static [InstallSdkChoice] {
     &[
         InstallSdkChoice::Folder,
         InstallSdkChoice::Install,
@@ -21639,7 +21579,7 @@ fn install_sdk_choice_index(choice: InstallSdkChoice) -> usize {
         .unwrap_or(0)
 }
 
-fn install_sdk_format_label(format: InstallSdkFormat) -> &'static str {
+const fn install_sdk_format_label(format: InstallSdkFormat) -> &'static str {
     match format {
         InstallSdkFormat::Wheel => "Recommended Python install",
         InstallSdkFormat::Tarball => "Advanced archive install",
@@ -21661,7 +21601,7 @@ fn install_sdk_choice_label(choice: InstallSdkChoice, folder: &str) -> String {
     }
 }
 
-fn update_menu_choices() -> &'static [UpdateMenuChoice] {
+const fn update_menu_choices() -> &'static [UpdateMenuChoice] {
     &[
         UpdateMenuChoice::Refresh,
         UpdateMenuChoice::Preview,
@@ -21671,7 +21611,7 @@ fn update_menu_choices() -> &'static [UpdateMenuChoice] {
     ]
 }
 
-fn update_menu_label(choice: UpdateMenuChoice) -> &'static str {
+const fn update_menu_label(choice: UpdateMenuChoice) -> &'static str {
     match choice {
         UpdateMenuChoice::Refresh => "Check for updates",
         UpdateMenuChoice::Preview => "Preview update",
@@ -21681,7 +21621,7 @@ fn update_menu_label(choice: UpdateMenuChoice) -> &'static str {
     }
 }
 
-fn config_menu_choices() -> &'static [ConfigMenuChoice] {
+const fn config_menu_choices() -> &'static [ConfigMenuChoice] {
     &[
         ConfigMenuChoice::Telemetry,
         ConfigMenuChoice::PlannerProvider,
@@ -21695,7 +21635,7 @@ fn config_menu_choices() -> &'static [ConfigMenuChoice] {
     ]
 }
 
-fn config_provider_choices(confirming_clear: bool) -> &'static [ConfigProviderChoice] {
+const fn config_provider_choices(confirming_clear: bool) -> &'static [ConfigProviderChoice] {
     if confirming_clear {
         &[
             ConfigProviderChoice::CancelClearKey,
@@ -21842,7 +21782,7 @@ fn provider_label(provider: &str) -> &'static str {
     }
 }
 
-fn provider_options() -> &'static [ProviderOption] {
+const fn provider_options() -> &'static [ProviderOption] {
     &[
         ProviderOption {
             name: "local",
@@ -21945,7 +21885,7 @@ fn services_manager_choice_count(state: &ServicesManagerState) -> usize {
     state.items.len() + services_manager_actions(state).len()
 }
 
-fn services_manager_action_label(action: ServicesManagerAction) -> &'static str {
+const fn services_manager_action_label(action: ServicesManagerAction) -> &'static str {
     match action {
         ServicesManagerAction::Details => "Service details",
         ServicesManagerAction::Chat => "Chat with selected server",
@@ -22105,7 +22045,7 @@ fn automation_manager_row_label(
             } else {
                 item.proposal.title.as_str()
             };
-            format!("{:<18} {}", status, title)
+            format!("{status:<18} {title}")
         }
         AutomationManagerRow::PrefetchField(index, field) => {
             let Some(item) = state.items.get(index) else {
@@ -22123,7 +22063,7 @@ fn automation_manager_row_label(
     }
 }
 
-fn automation_prefetch_fields() -> &'static [AutomationPrefetchField] {
+const fn automation_prefetch_fields() -> &'static [AutomationPrefetchField] {
     &[
         AutomationPrefetchField::AllowDownload,
         AutomationPrefetchField::MaxBytes,
@@ -22212,8 +22152,7 @@ fn automation_prefetch_field_row_label(
             "  {:<16} {}",
             "Max download",
             proposal_u64_argument(proposal, "artifact_max_bytes")
-                .map(format_bytes_for_tui)
-                .unwrap_or_else(|| "not set".to_owned())
+                .map_or_else(|| "not set".to_owned(), format_bytes_for_tui)
         ),
         AutomationPrefetchField::AllowHuggingFace => format!(
             "  {:<16} {}",
@@ -22226,11 +22165,11 @@ fn automation_prefetch_field_row_label(
     }
 }
 
-fn yes_no_label(value: bool) -> &'static str {
+const fn yes_no_label(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
 
-fn automation_prefetch_field_status(field: AutomationPrefetchField) -> &'static str {
+const fn automation_prefetch_field_status(field: AutomationPrefetchField) -> &'static str {
     match field {
         AutomationPrefetchField::AllowDownload => {
             "Download setting selected. Press Enter or Left/Right to change it."
@@ -22244,7 +22183,7 @@ fn automation_prefetch_field_status(field: AutomationPrefetchField) -> &'static 
     }
 }
 
-fn automation_prefetch_field_saved_message(field: AutomationPrefetchField) -> &'static str {
+const fn automation_prefetch_field_saved_message(field: AutomationPrefetchField) -> &'static str {
     match field {
         AutomationPrefetchField::AllowDownload => "Download permission updated.",
         AutomationPrefetchField::MaxBytes => "Max download updated.",
@@ -22289,8 +22228,7 @@ fn render_prefetch_field_detail(
                 output,
                 "  Max download: {}",
                 proposal_u64_argument(proposal, "artifact_max_bytes")
-                    .map(format_bytes_for_tui)
-                    .unwrap_or_else(|| "not set".to_owned())
+                    .map_or_else(|| "not set".to_owned(), format_bytes_for_tui)
             );
             let _ = writeln!(
                 output,
@@ -22312,7 +22250,7 @@ fn render_prefetch_field_detail(
     output.trim_end().to_owned()
 }
 
-fn automation_watcher_mode_plain_label(mode: WatcherMode) -> &'static str {
+const fn automation_watcher_mode_plain_label(mode: WatcherMode) -> &'static str {
     match mode {
         WatcherMode::Observe => "record only",
         WatcherMode::Propose => "ask before taking action",
@@ -22609,7 +22547,7 @@ fn command_screen_action_label(action: CommandScreenAction) -> &'static str {
     }
 }
 
-fn overlay_action_from_command_screen_action(
+const fn overlay_action_from_command_screen_action(
     action: CommandScreenAction,
 ) -> Option<OverlayCardAction> {
     match action {
@@ -22693,7 +22631,7 @@ fn overlay_card_detail_text(state: &OverlayCardState) -> String {
     }
 }
 
-fn help_topic_label(topic: HelpTopic) -> &'static str {
+const fn help_topic_label(topic: HelpTopic) -> &'static str {
     match topic {
         HelpTopic::GettingStarted => "Start here",
         HelpTopic::TuiBasics => "Using the TUI",
@@ -23156,7 +23094,7 @@ fn help_command_detail(command: &str) -> String {
     format!("{title}\n\n{body}\n\nPress Enter to open this screen.")
 }
 
-fn logs_view_actions() -> &'static [LogsViewAction] {
+const fn logs_view_actions() -> &'static [LogsViewAction] {
     &[
         LogsViewAction::PreviousPage,
         LogsViewAction::NextPage,
@@ -23168,7 +23106,7 @@ fn logs_view_actions() -> &'static [LogsViewAction] {
     ]
 }
 
-fn logs_view_action_label(
+const fn logs_view_action_label(
     action: LogsViewAction,
     follow: bool,
     show_file_locations: bool,
@@ -23868,14 +23806,18 @@ fn doctor_folders_text(report: &str) -> String {
     let cache = doctor_report_value(report, "cache_dir");
     let rocm_downloads = doctor_report_raw_value(report, "active_runtime_pip_cache_dir")
         .or_else(|| doctor_report_raw_value(report, "setup_runtime_pip_cache_dir"))
-        .map(friendly_doctor_value)
-        .unwrap_or_else(|| "choose a ROCm install folder first".to_owned());
+        .map_or_else(
+            || "choose a ROCm install folder first".to_owned(),
+            friendly_doctor_value,
+        );
     let models = doctor_report_value(report, "model_cache_entries");
     let active_status = doctor_report_value(report, "active_runtime_status");
     let active_install = doctor_report_raw_value(report, "active_runtime_root")
         .or_else(|| doctor_report_raw_value(report, "setup_runtime_root"))
-        .map(friendly_doctor_value)
-        .unwrap_or_else(|| friendly_runtime_status(&active_status));
+        .map_or_else(
+            || friendly_runtime_status(&active_status),
+            friendly_doctor_value,
+        );
     let mut output = String::new();
     let _ = writeln!(output, "Folders");
     let _ = writeln!(output);
@@ -23895,8 +23837,7 @@ fn doctor_folders_text(report: &str) -> String {
 
 fn doctor_report_value(report: &str, key: &str) -> String {
     doctor_report_raw_value(report, key)
-        .map(friendly_doctor_value)
-        .unwrap_or_else(|| "not checked".to_owned())
+        .map_or_else(|| "not checked".to_owned(), friendly_doctor_value)
 }
 
 fn doctor_report_raw_value<'a>(report: &'a str, key: &str) -> Option<&'a str> {
@@ -24199,10 +24140,10 @@ fn model_picker_detail_text(app: &App) -> String {
     let _ = writeln!(
         output,
         "  GPU memory: {}",
-        recipe
-            .min_gpu_mem_gb
-            .map(|gb| format!("{gb} GB minimum"))
-            .unwrap_or_else(|| "not required".to_owned())
+        recipe.min_gpu_mem_gb.map_or_else(
+            || "not required".to_owned(),
+            |gb| format!("{gb} GB minimum")
+        )
     );
     if !recipe.preferred_engines.is_empty() {
         let _ = writeln!(output, "  engines: {}", recipe.preferred_engines.join(", "));
@@ -24349,28 +24290,28 @@ fn serve_wizard_detail_text(app: &App) -> String {
 fn model_recipe_fit_summary(recipe: &ModelRecipeRecord, total_vram_gib: Option<f64>) -> String {
     match (recipe.min_gpu_mem_gb, total_vram_gib) {
         (None, _) => "This recipe does not require GPU memory.".to_owned(),
-        (Some(required), Some(available)) if available >= (required as f64 + 2.0) => {
+        (Some(required), Some(available)) if available >= (f64::from(required) + 2.0) => {
             format!(
                 "Good fit: {} GPU memory available; recipe asks for {}.",
                 format_gib_for_tui(available),
-                format_gib_for_tui(required as f64)
+                format_gib_for_tui(f64::from(required))
             )
         }
-        (Some(required), Some(available)) if available >= required as f64 => {
+        (Some(required), Some(available)) if available >= f64::from(required) => {
             format!(
                 "Tight but usable: {} GPU memory available; recipe asks for {}.",
                 format_gib_for_tui(available),
-                format_gib_for_tui(required as f64)
+                format_gib_for_tui(f64::from(required))
             )
         }
         (Some(required), Some(available)) => format!(
             "Likely not enough GPU memory: {} available; recipe asks for {}.",
             format_gib_for_tui(available),
-            format_gib_for_tui(required as f64)
+            format_gib_for_tui(f64::from(required))
         ),
         (Some(required), None) => format!(
             "GPU memory is unknown; recipe asks for {}. Start may fail if this APU has too little shared memory.",
-            format_gib_for_tui(required as f64)
+            format_gib_for_tui(f64::from(required))
         ),
     }
 }
@@ -24914,51 +24855,48 @@ fn render_plan_review_text(request: &str, action: Option<&FreeformPlanAction>) -
     let _ = writeln!(output, "Request");
     let _ = writeln!(output, "  {}", request.trim());
     let _ = writeln!(output);
-    match action {
-        Some(action) => {
-            let _ = writeln!(output, "Ready action");
-            let _ = writeln!(output, "  {}", action.title);
-            for line in plan_action_summary_lines(action) {
-                let _ = writeln!(output, "  {line}");
-            }
-            let _ = writeln!(output);
-            if action.has_placeholders {
-                let _ = writeln!(output, "Needs more detail");
-                let _ = writeln!(
-                    output,
-                    "  Some values are still missing. Choose Edit request and be more specific."
-                );
-            } else if action.approval_required {
-                let _ = writeln!(output, "Before it runs");
-                let _ = writeln!(
-                    output,
-                    "  ROCm CLI will ask you to approve the change before it starts."
-                );
-            } else {
-                let _ = writeln!(output, "Before it runs");
-                let _ = writeln!(output, "  This action only reads local information.");
-            }
-            let _ = writeln!(output);
-            let _ = writeln!(output, "Controls");
-            let _ = writeln!(output, "  Run: review and start this action");
-            let _ = writeln!(output, "  Edit request: change the request text");
-            let _ = writeln!(output, "  Back: leave without running anything");
+    if let Some(action) = action {
+        let _ = writeln!(output, "Ready action");
+        let _ = writeln!(output, "  {}", action.title);
+        for line in plan_action_summary_lines(action) {
+            let _ = writeln!(output, "  {line}");
         }
-        None => {
+        let _ = writeln!(output);
+        if action.has_placeholders {
             let _ = writeln!(output, "Needs more detail");
             let _ = writeln!(
                 output,
-                "  I could not turn this into a supported ROCm CLI action yet."
+                "  Some values are still missing. Choose Edit request and be more specific."
             );
+        } else if action.approval_required {
+            let _ = writeln!(output, "Before it runs");
             let _ = writeln!(
                 output,
-                "  Choose Edit request and include the model, engine, or task you want."
+                "  ROCm CLI will ask you to approve the change before it starts."
             );
-            let _ = writeln!(output);
-            let _ = writeln!(output, "Controls");
-            let _ = writeln!(output, "  Edit request: change the request text");
-            let _ = writeln!(output, "  Back: leave without running anything");
+        } else {
+            let _ = writeln!(output, "Before it runs");
+            let _ = writeln!(output, "  This action only reads local information.");
         }
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Controls");
+        let _ = writeln!(output, "  Run: review and start this action");
+        let _ = writeln!(output, "  Edit request: change the request text");
+        let _ = writeln!(output, "  Back: leave without running anything");
+    } else {
+        let _ = writeln!(output, "Needs more detail");
+        let _ = writeln!(
+            output,
+            "  I could not turn this into a supported ROCm CLI action yet."
+        );
+        let _ = writeln!(
+            output,
+            "  Choose Edit request and include the model, engine, or task you want."
+        );
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Controls");
+        let _ = writeln!(output, "  Edit request: change the request text");
+        let _ = writeln!(output, "  Back: leave without running anything");
     }
     output.trim_end().to_owned()
 }
@@ -25645,8 +25583,7 @@ fn running_job_recent_output_visual_lines(app: &App, limit: usize, width: usize)
 fn display_stream_log_line(line: &str) -> String {
     line.strip_prefix("output:")
         .or_else(|| line.strip_prefix("Output:"))
-        .map(str::trim_start)
-        .unwrap_or(line)
+        .map_or(line, str::trim_start)
         .to_owned()
 }
 
@@ -26621,6 +26558,7 @@ fn chat_session_command_result_lines(
     kept
 }
 
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // `text` is already lowercased above
 fn looks_like_log_path(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.ends_with(".log")
@@ -26950,7 +26888,6 @@ fn render_command_output(
         "failed"
     });
     if let Some(code) = output.status.code() {
-        use std::fmt::Write as _;
         let _ = write!(rendered, " ({code})");
     }
     rendered.push('\n');
@@ -27350,7 +27287,6 @@ fn truncate_command_output(rendered: &str) -> String {
         return rendered.trim_end().to_owned();
     }
     let mut output = lines[..MAX_COMMAND_OUTPUT_LINES].join("\n");
-    use std::fmt::Write as _;
     let _ = write!(
         output,
         "\n... truncated {} line(s); use /logs or service logs for full output",
@@ -27445,7 +27381,6 @@ fn proposal_u64_argument(proposal: &AutomationProposalRecord, key: &str) -> Opti
 
 fn render_proposal_approval(proposal: &AutomationProposalRecord) -> String {
     let mut output = String::new();
-    use std::fmt::Write as _;
     let tool = proposal_tool_name(proposal);
     let _ = writeln!(output, "Review this request");
     let _ = writeln!(output, "  {}", proposal_plain_title(tool));
@@ -27722,8 +27657,8 @@ fn chat_install_sdk_approval_needs_prefix(args: &[String]) -> bool {
         && args.get(1).map(String::as_str) == Some("sdk")
         && cli_arg_value(args, "--prefix")
             .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .is_none()
+            .as_ref()
+            .is_none_or(|value| value.is_empty())
 }
 
 fn install_args_require_approval(args: &[&str]) -> Result<bool> {
@@ -27912,7 +27847,7 @@ where
     if count == 0 {
         None
     } else {
-        Some(sum / count as f64)
+        Some(sum / f64::from(count))
     }
 }
 
@@ -27931,27 +27866,19 @@ fn format_elapsed(duration: Duration) -> String {
 }
 
 fn format_optional_percent(value: Option<f64>) -> String {
-    value
-        .map(|value| format!("{value:.0}%"))
-        .unwrap_or_else(|| "--".to_owned())
+    value.map_or_else(|| "--".to_owned(), |value| format!("{value:.0}%"))
 }
 
 fn format_optional_watts(value: Option<f64>) -> String {
-    value
-        .map(|value| format!("{value:.0}W"))
-        .unwrap_or_else(|| "--".to_owned())
+    value.map_or_else(|| "--".to_owned(), |value| format!("{value:.0}W"))
 }
 
 fn format_optional_celsius(value: Option<f64>) -> String {
-    value
-        .map(|value| format!("{value:.0}C"))
-        .unwrap_or_else(|| "--".to_owned())
+    value.map_or_else(|| "--".to_owned(), |value| format!("{value:.0}C"))
 }
 
 fn format_optional_mhz(value: Option<f64>) -> String {
-    value
-        .map(|value| format!("{value:.0}MHz"))
-        .unwrap_or_else(|| "--".to_owned())
+    value.map_or_else(|| "--".to_owned(), |value| format!("{value:.0}MHz"))
 }
 
 fn format_vram_line(card: Option<&GpuMonitorCard>) -> String {
@@ -27968,6 +27895,8 @@ fn format_vram_line(card: Option<&GpuMonitorCard>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::{
         App, ChatToolApprovalRequest, GpuMonitorCard, GpuTelemetry, LOG_FOLLOW_REFRESH_INTERVAL,
         TuiMode, handle_key, load_gpu_monitor_cards_from_json, load_gpu_static_cards_from_json,
@@ -28511,7 +28440,7 @@ mod tests {
         let rendered = log.iter().cloned().collect::<Vec<_>>().join("\n");
         let display = {
             let mut app = test_app();
-            app.activity_log = log.clone();
+            app.activity_log = log;
             app.activity_text()
         };
 
@@ -33001,11 +32930,7 @@ mod tests {
             .iter()
             .position(|action| *action == super::LogsViewAction::ToggleFileLocations)
             .expect("file locations action should exist");
-        let current_index = app
-            .logs_view
-            .as_ref()
-            .map(|state| state.selected)
-            .unwrap_or(0);
+        let current_index = app.logs_view.as_ref().map_or(0, |state| state.selected);
         let steps = (file_locations_index + super::logs_view_actions().len() - current_index)
             % super::logs_view_actions().len();
         for _ in 0..steps {
@@ -33142,7 +33067,7 @@ mod tests {
         record.write()?;
         let mut log = String::new();
         for index in 1..=90 {
-            log.push_str(&format!("service-line-{index:03}\n"));
+            let _ = writeln!(log, "service-line-{index:03}");
         }
         fs::write(&record.log_path, log)?;
         assert!(app.handle_command("services"));
@@ -33541,8 +33466,7 @@ mod tests {
             .turns
             .iter()
             .find(|turn| turn.role == super::ChatSessionRole::Assistant)
-            .map(|turn| turn.content.as_str())
-            .unwrap_or("<missing>");
+            .map_or("<missing>", |turn| turn.content.as_str());
         assert!(
             assistant_content.contains("Here is what I found on this computer.")
                 && (assistant_content.contains("GPU:")
@@ -33902,35 +33826,32 @@ mod tests {
             app.set_input(prompt.to_owned());
             handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
 
-            match request_receiver.recv_timeout(Duration::from_millis(300)) {
-                Ok(request) => {
-                    assert_eq!(
-                        request.get("model").and_then(Value::as_str),
-                        Some(super::VALIDATED_LOCAL_ASSISTANT_MODEL),
-                        "{prompt}"
-                    );
-                    assert!(app.command_screen_is_chat_session(), "{prompt}");
-                    assert!(app.transcript.is_empty(), "{prompt}");
-                    assert!(app.services_manager.is_none(), "{prompt}");
-                    assert!(app.doctor_manager.is_none(), "{prompt}");
-                    assert!(app.install_manager.is_none(), "{prompt}");
-                    poll_app_until_idle(&mut app);
-                }
-                Err(_) => {
-                    let rendered = render_test_terminal(&app, 140, 32);
-                    assert!(
-                        app.pending_approval.is_some()
-                            || app.install_manager.is_some()
-                            || app.serve_wizard.is_some(),
-                        "{prompt}: {rendered}"
-                    );
-                    assert!(app.transcript.is_empty(), "{prompt}: {rendered}");
-                    assert!(!rendered.contains("I checked ROCm"), "{prompt}: {rendered}");
-                    assert!(
-                        !rendered.contains("ROCm CLI summary"),
-                        "{prompt}: {rendered}"
-                    );
-                }
+            if let Ok(request) = request_receiver.recv_timeout(Duration::from_millis(300)) {
+                assert_eq!(
+                    request.get("model").and_then(Value::as_str),
+                    Some(super::VALIDATED_LOCAL_ASSISTANT_MODEL),
+                    "{prompt}"
+                );
+                assert!(app.command_screen_is_chat_session(), "{prompt}");
+                assert!(app.transcript.is_empty(), "{prompt}");
+                assert!(app.services_manager.is_none(), "{prompt}");
+                assert!(app.doctor_manager.is_none(), "{prompt}");
+                assert!(app.install_manager.is_none(), "{prompt}");
+                poll_app_until_idle(&mut app);
+            } else {
+                let rendered = render_test_terminal(&app, 140, 32);
+                assert!(
+                    app.pending_approval.is_some()
+                        || app.install_manager.is_some()
+                        || app.serve_wizard.is_some(),
+                    "{prompt}: {rendered}"
+                );
+                assert!(app.transcript.is_empty(), "{prompt}: {rendered}");
+                assert!(!rendered.contains("I checked ROCm"), "{prompt}: {rendered}");
+                assert!(
+                    !rendered.contains("ROCm CLI summary"),
+                    "{prompt}: {rendered}"
+                );
             }
         }
 
@@ -37217,9 +37138,10 @@ Full log
     #[test]
     fn onboarding_folder_rejects_system_folder() {
         let system_path = if cfg!(windows) {
-            std::env::var_os("WINDIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
+            std::env::var_os("WINDIR").map_or_else(
+                || std::path::PathBuf::from(r"C:\Windows"),
+                std::path::PathBuf::from,
+            )
         } else {
             std::path::PathBuf::from("/usr")
         };
@@ -37449,7 +37371,7 @@ Full log
         assert!(rendered.contains("Install is working."));
         assert!(rendered.contains("Progress"));
         assert!(rendered.contains("Live output"));
-        assert!(rendered.contains("["));
+        assert!(rendered.contains('['));
         assert!(rendered.contains("Collecting torch"));
         assert_eq!(
             rendered.matches("Collecting torch").count(),
@@ -37707,7 +37629,7 @@ Full log
             streamed_stderr_lines: 0,
         });
 
-        for index in 0..(super::MAX_STREAM_EVENTS_PER_POLL + 1) {
+        for index in 0..=super::MAX_STREAM_EVENTS_PER_POLL {
             sender
                 .send(super::RunningJobEvent::Stream {
                     stream: super::CommandOutputStream::Stdout,
@@ -38216,7 +38138,7 @@ Full log
         app.onboarding_active = true;
         let mut stdout = String::new();
         for index in 1..=1_000 {
-            stdout.push_str(&format!("pip progress line {index:04}\n"));
+            let _ = writeln!(stdout, "pip progress line {index:04}");
         }
         let command_output = super::render_command_output(
             "rocm",
@@ -38752,7 +38674,7 @@ Full log
 
     #[test]
     fn input_viewport_follows_cursor_for_long_paths() {
-        let input = r#"/serve C:\models\very-long-folder\tiny.gguf --engine llama.cpp"#;
+        let input = r"/serve C:\models\very-long-folder\tiny.gguf --engine llama.cpp";
         let cursor = input.chars().count();
 
         let (visible, cursor_column) = super::input_viewport(input, cursor, 24);
@@ -38976,10 +38898,10 @@ Full log
 
     #[test]
     fn command_parser_preserves_windows_path_backslashes() {
-        let parts = super::split_command_line(r#"serve C:\models\tiny.gguf --engine llama.cpp"#)
+        let parts = super::split_command_line(r"serve C:\models\tiny.gguf --engine llama.cpp")
             .expect("windows path should parse");
 
-        assert_eq!(parts[1], r#"C:\models\tiny.gguf"#);
+        assert_eq!(parts[1], r"C:\models\tiny.gguf");
     }
 
     #[test]
@@ -38989,7 +38911,7 @@ Full log
         )
         .expect("quoted windows path should parse");
 
-        assert_eq!(parts[1], r#"C:\Users\jam\My Models\tiny.gguf"#);
+        assert_eq!(parts[1], r"C:\Users\jam\My Models\tiny.gguf");
     }
 
     #[test]
@@ -39064,7 +38986,7 @@ Full log
         for file_index in 0..3 {
             let mut body = String::new();
             for line_index in 0..12 {
-                body.push_str(&format!("entry-{file_index}-{line_index}\n"));
+                let _ = writeln!(body, "entry-{file_index}-{line_index}");
             }
             fs::write(action_dir.join(format!("test-{file_index}.log")), body)?;
         }
@@ -39130,11 +39052,7 @@ Full log
             .iter()
             .position(|action| *action == super::LogsViewAction::ToggleFileLocations)
             .expect("file locations action should exist");
-        let current_index = app
-            .logs_view
-            .as_ref()
-            .map(|state| state.selected)
-            .unwrap_or(0);
+        let current_index = app.logs_view.as_ref().map_or(0, |state| state.selected);
         let steps = (file_locations_index + super::logs_view_actions().len() - current_index)
             % super::logs_view_actions().len();
         for _ in 0..steps {
@@ -39222,8 +39140,11 @@ Full log
         app.logs_view
             .as_mut()
             .expect("follow state should be open")
-            .last_refresh_at =
-            Instant::now() - LOG_FOLLOW_REFRESH_INTERVAL - Duration::from_millis(1);
+            .last_refresh_at = Instant::now()
+            .checked_sub(LOG_FOLLOW_REFRESH_INTERVAL)
+            .unwrap()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
         app.refresh_following_logs();
 
         assert!(
@@ -39497,7 +39418,7 @@ Full log
                     if args == &vec![
                         "engines".to_owned(),
                         "install".to_owned(),
-                        target_name.clone(),
+                        target_name,
                     ]
             ),
             "{pending_action:?}"
@@ -43186,7 +43107,7 @@ Full log
         let rendered = render_test_terminal(&app, 120, 28);
         assert!(rendered.contains("I could not find that automation check"));
         assert!(rendered.contains("Choose one from this list"));
-        assert!(rendered.contains(">"));
+        assert!(rendered.contains('>'));
 
         assert!(app.handle_command("automations enable cache-warm --mode turbo"));
 
@@ -43911,7 +43832,7 @@ Full log
             provider_key_store: Arc::new(TestProviderKeyStore::default()),
             mode: TuiMode::Ask,
             host_gpu_summary: HostGpuSummary::default(),
-            gpu_telemetry: Default::default(),
+            gpu_telemetry: GpuTelemetry::default(),
             transcript: Vec::new(),
             transcript_scroll: 0,
             input: String::new(),
@@ -44190,7 +44111,7 @@ Full log
                 let request_value = serde_json::from_slice::<Value>(body).ok();
                 if let Some(value) = request_value.as_ref() {
                     let _ = sender.send(value.clone());
-                };
+                }
                 served_chat_responses += 1;
                 if request_value
                     .as_ref()
@@ -44296,8 +44217,7 @@ Full log
         assert!(
             app.running_job
                 .as_ref()
-                .map(|job| !matches!(job.kind, super::RunningJobKind::DoctorRefresh))
-                .unwrap_or(true),
+                .is_none_or(|job| !matches!(job.kind, super::RunningJobKind::DoctorRefresh)),
             "{command} should discard hidden Doctor refresh before continuing"
         );
         assert!(
@@ -44547,7 +44467,7 @@ Full log
         render_test_buffer(app, width, height)
             .content()
             .iter()
-            .map(|cell| cell.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect::<String>()
     }
 
@@ -44665,7 +44585,7 @@ Full log
         let manifest = serde_json::json!({
             "runtime_key": runtime_key,
             "runtime_id": runtime_id,
-            "install_root": install_root.clone(),
+            "install_root": install_root,
             "selected_artifact_url": "https://example.invalid/therock",
             "index_url": "https://example.invalid/therock",
             "python_executable": python_executable,

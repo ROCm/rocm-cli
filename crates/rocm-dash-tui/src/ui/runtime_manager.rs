@@ -34,8 +34,9 @@ use crate::ui::job_console::{ConsoleOutcome, draw_job_console, on_console_key};
 use crate::ui::modal::{centered_rect, draw_popup_frame};
 use crate::ui::theme::Theme;
 
-/// A flattened registered-runtime entry for the list. Mirrors the fields of the
-/// bin's `InstalledRuntimeManifest` (+ active/rollback status from config) that
+/// A flattened registered-runtime entry for the list.
+///
+/// Mirrors the fields of the bin's `InstalledRuntimeManifest` (+ active/rollback status from config) that
 /// the manager needs, with no `rocm-core` dependency.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeSummary {
@@ -67,33 +68,33 @@ pub enum RuntimeAction {
 
 impl RuntimeAction {
     /// Stable job id (one console per verb).
-    fn job_id(self) -> &'static str {
+    const fn job_id(self) -> &'static str {
         match self {
-            RuntimeAction::Activate => "runtimes-activate",
-            RuntimeAction::Rollback => "runtimes-rollback",
-            RuntimeAction::Uninstall => "runtimes-uninstall",
-            RuntimeAction::Adopt => "runtimes-adopt",
-            RuntimeAction::Import => "runtimes-import",
+            Self::Activate => "runtimes-activate",
+            Self::Rollback => "runtimes-rollback",
+            Self::Uninstall => "runtimes-uninstall",
+            Self::Adopt => "runtimes-adopt",
+            Self::Import => "runtimes-import",
         }
     }
 
-    fn title(self) -> &'static str {
+    const fn title(self) -> &'static str {
         match self {
-            RuntimeAction::Activate => "activate runtime",
-            RuntimeAction::Rollback => "roll back to previous runtime",
-            RuntimeAction::Uninstall => "uninstall runtime",
-            RuntimeAction::Adopt => "adopt existing ROCm folder",
-            RuntimeAction::Import => "import runtime manifest",
+            Self::Activate => "activate runtime",
+            Self::Rollback => "roll back to previous runtime",
+            Self::Uninstall => "uninstall runtime",
+            Self::Adopt => "adopt existing ROCm folder",
+            Self::Import => "import runtime manifest",
         }
     }
 
-    fn explanation(self) -> &'static str {
+    const fn explanation(self) -> &'static str {
         match self {
-            RuntimeAction::Activate => "This switches the default ROCm runtime for this machine.",
-            RuntimeAction::Rollback => "This restores the previously active ROCm runtime.",
-            RuntimeAction::Uninstall => "This removes the runtime record from ROCm CLI.",
-            RuntimeAction::Adopt => "This registers an existing ROCm folder without modifying it.",
-            RuntimeAction::Import => "This registers a runtime from a saved manifest file.",
+            Self::Activate => "This switches the default ROCm runtime for this machine.",
+            Self::Rollback => "This restores the previously active ROCm runtime.",
+            Self::Uninstall => "This removes the runtime record from ROCm CLI.",
+            Self::Adopt => "This registers an existing ROCm folder without modifying it.",
+            Self::Import => "This registers a runtime from a saved manifest file.",
         }
     }
 }
@@ -203,7 +204,7 @@ pub fn on_key(
                     return spawn_runtime(r, jobs, pending.action, pending.cmd, pending.args);
                 }
             }
-            Some(ApprovalVerdict::Deny) | Some(ApprovalVerdict::Cancel) => r.approval = None,
+            Some(ApprovalVerdict::Deny | ApprovalVerdict::Cancel) => r.approval = None,
             None => {}
         }
         return Vec::new();
@@ -754,7 +755,7 @@ mod tests {
             .buffer()
             .content()
             .iter()
-            .map(|c| c.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(out.contains("Runtimes"));
         assert!(out.contains("therock-release-gfx94"));
@@ -777,7 +778,7 @@ mod tests {
             .buffer()
             .content()
             .iter()
-            .map(|c| c.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(out.contains("No runtimes registered"));
     }

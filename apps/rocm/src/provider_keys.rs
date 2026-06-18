@@ -282,7 +282,7 @@ fn native_entry(provider: &str) -> Result<Entry> {
     bail!("this platform does not have a supported secure credential store")
 }
 
-fn native_store_label() -> &'static str {
+const fn native_store_label() -> &'static str {
     if cfg!(target_vendor = "cosmo") {
         "secure credential store"
     } else if cfg!(target_os = "windows") {

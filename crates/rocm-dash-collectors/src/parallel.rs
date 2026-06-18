@@ -71,7 +71,7 @@ impl WarningBus {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().map(|v| v.is_empty()).unwrap_or(true)
+        self.inner.lock().map_or(true, |v| v.is_empty())
     }
 }
 

@@ -27,7 +27,7 @@ function Fail {
     exit 1
 }
 
-function Need-Command {
+function Confirm-Command {
     param([string] $Name)
     if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
         Fail "missing required command: $Name"
@@ -95,7 +95,7 @@ function Resolve-SigningPublicKey {
     return ""
 }
 
-function Fetch-File {
+function Save-File {
     param(
         [string] $Url,
         [string] $OutputPath,
@@ -132,14 +132,14 @@ function Fetch-File {
     }
 }
 
-function Verify-ArchiveSignature {
+function Confirm-ArchiveSignature {
     param(
         [string] $ArchivePath,
         [string] $SignaturePath,
         [string] $PublicKeyPath
     )
 
-    Need-Command openssl
+    Confirm-Command openssl
     & openssl dgst -sha256 -verify $PublicKeyPath -signature $SignaturePath $ArchivePath | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Fail "signature verification failed"
@@ -211,7 +211,7 @@ function Expand-RocmArchive {
 
     if ($ArchivePath.EndsWith(".tar.gz", [System.StringComparison]::OrdinalIgnoreCase) -or
         $ArchivePath.EndsWith(".tgz", [System.StringComparison]::OrdinalIgnoreCase)) {
-        Need-Command tar
+        Confirm-Command tar
         & tar -xzf $ArchivePath -C $ExtractDir
         if ($LASTEXITCODE -ne 0) {
             Fail "failed to extract archive with tar"
@@ -236,7 +236,7 @@ function Find-BundleDir {
     Fail "unable to locate extracted bundle directory"
 }
 
-function Test-PathListContains {
+function Test-PathInList {
     param(
         [string] $PathList,
         [string] $Path
@@ -268,7 +268,7 @@ function Add-PathListEntry {
         [string] $Path
     )
 
-    if (Test-PathListContains $PathList $Path) {
+    if (Test-PathInList $PathList $Path) {
         return $PathList
     }
 
@@ -283,13 +283,13 @@ function Add-InstallDirToUserPath {
     param([string] $Path)
 
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    $userPathAlreadyConfigured = Test-PathListContains $userPath $Path
+    $userPathAlreadyConfigured = Test-PathInList $userPath $Path
     if (-not $userPathAlreadyConfigured) {
         $newUserPath = Add-PathListEntry $userPath $Path
         [Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
     }
 
-    $processPathAlreadyConfigured = Test-PathListContains $env:Path $Path
+    $processPathAlreadyConfigured = Test-PathInList $env:Path $Path
     if (-not $processPathAlreadyConfigured) {
         $env:Path = Add-PathListEntry $env:Path $Path
     }
@@ -366,8 +366,8 @@ $archiveUrl = "$DownloadBase/$assetBase"
 $shaUrl = "$archiveUrl.sha256"
 $sigUrl = "$archiveUrl.sig"
 
-Need-Command Expand-Archive
-Need-Command Get-FileHash
+Confirm-Command Expand-Archive
+Confirm-Command Get-FileHash
 
 if ($PSVersionTable.PSEdition -eq "Desktop") {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.ServicePointManager]::SecurityProtocol
@@ -391,8 +391,8 @@ try {
     Write-Host "  install_dir: $InstallDir"
     Write-Host "  download: $archiveUrl"
 
-    Fetch-File $archiveUrl $archivePath
-    Fetch-File $shaUrl $shaPath
+    Save-File $archiveUrl $archivePath
+    Save-File $shaUrl $shaPath
 
     $expected = Get-ExpectedSha256 $shaPath
     $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archivePath).Hash.ToLowerInvariant()
@@ -404,8 +404,8 @@ try {
         if ([string]::IsNullOrWhiteSpace($signingPublicKey)) {
             Fail "signature verification requires ROCM_CLI_SIGNING_PUBLIC_KEY_PATH, ROCM_CLI_SIGNING_PUBLIC_KEY_PEM, -SigningPublicKeyPath, or -SigningPublicKeyPem"
         }
-        Fetch-File $sigUrl $sigPath "required signature sidecar is missing or unavailable"
-        Verify-ArchiveSignature $archivePath $sigPath $signingPublicKey
+        Save-File $sigUrl $sigPath "required signature sidecar is missing or unavailable"
+        Confirm-ArchiveSignature $archivePath $sigPath $signingPublicKey
         Write-Host "signature verified"
     }
 
@@ -461,14 +461,14 @@ try {
 
     if ($updateUserPath) {
         Add-InstallDirToUserPath $InstallDir
-    } elseif (-not (Test-PathListContains $env:Path $InstallDir)) {
+    } elseif (-not (Test-PathInList $env:Path $InstallDir)) {
         Write-Host "note: $InstallDir is not on PATH"
         Write-Host "  add it to the user PATH or run:"
         Write-Host "  `$env:Path = `"$InstallDir;`$env:Path`""
     }
 
     Write-Host "run:"
-    if (Test-PathListContains $env:Path $InstallDir) {
+    if (Test-PathInList $env:Path $InstallDir) {
         Write-Host "  rocm doctor"
     } else {
         $rocmExe = Join-Path $InstallDir "rocm.exe"

@@ -12,6 +12,7 @@
 //! string. Frames overwrite in place (cursor home), so the cast plays back
 //! as a smooth animation rather than a scrolling log.
 
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -72,13 +73,10 @@ fn main() -> anyhow::Result<()> {
     // Snapshot events drive the animated widgets (sparklines, gauges). We
     // index them so the storyboard can advance the timeline a few snapshots
     // at a time between frames.
-    let snapshot_idxs: Vec<usize> = entries
+    let total_snaps = entries
         .iter()
-        .enumerate()
-        .filter(|(_, e)| matches!(e.event, Event::Snapshot(_)))
-        .map(|(i, _)| i)
-        .collect();
-    let total_snaps = snapshot_idxs.len();
+        .filter(|e| matches!(e.event, Event::Snapshot(_)))
+        .count();
     eprintln!("  {total_snaps} snapshots in timeline");
 
     let mut state = AppState::new("demo-mi355x-01".into(), "default-dark".into());
@@ -230,8 +228,7 @@ fn write_cast(args: &Args, frames: &[String]) -> anyhow::Result<()> {
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
 
     let header = serde_json::json!({
         "version": 2,
@@ -280,7 +277,7 @@ fn buffer_to_ansi(buf: &Buffer) -> String {
         let mut cur_fg: Option<(u8, u8, u8)> = None;
         let mut cur_bg: Option<(u8, u8, u8)> = None;
         let mut cur_bold = false;
-        out.push_str(&format!("\u{1b}[{};1H\u{1b}[0m", y + 1));
+        let _ = write!(out, "\u{1b}[{};1H\u{1b}[0m", y + 1);
 
         for x in 0..cols {
             let cell = buf.cell((x, y)).unwrap();
@@ -302,11 +299,11 @@ fn buffer_to_ansi(buf: &Buffer) -> String {
                 }
                 if Some(fg) != cur_fg {
                     let (r, g, b) = fg;
-                    out.push_str(&format!("\u{1b}[38;2;{r};{g};{b}m"));
+                    let _ = write!(out, "\u{1b}[38;2;{r};{g};{b}m");
                 }
                 if Some(bg) != cur_bg {
                     let (r, g, b) = bg;
-                    out.push_str(&format!("\u{1b}[48;2;{r};{g};{b}m"));
+                    let _ = write!(out, "\u{1b}[48;2;{r};{g};{b}m");
                 }
                 cur_fg = Some(fg);
                 cur_bg = Some(bg);
@@ -329,7 +326,7 @@ fn buffer_to_ansi(buf: &Buffer) -> String {
 
 /// Map a ratatui `Color` to a concrete RGB triple, falling back to `default`
 /// for `Reset`/indexed/named variants we don't translate.
-fn resolve_color(c: Option<Color>, default: (u8, u8, u8)) -> (u8, u8, u8) {
+const fn resolve_color(c: Option<Color>, default: (u8, u8, u8)) -> (u8, u8, u8) {
     match c {
         Some(Color::Rgb(r, g, b)) => (r, g, b),
         Some(Color::Black) => (0, 0, 0),

@@ -314,7 +314,7 @@ def wait_health(
             health = get_json(host, port, "/healthz", timeout=3)
             if health.get("status") == "ok":
                 return health
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             last_error = exc
         exit_code = process.poll()
         if exit_code is not None:
@@ -381,7 +381,7 @@ def failure_context(state_path: Path, log_path: Path) -> str:
                 if key in state
             }
             parts.append("state: " + json.dumps(visible_state, indent=2))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             parts.append(f"state could not be read: {exc}")
     if log_path.is_file():
         log_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -870,7 +870,7 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        raise SystemExit(130)
-    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(130) from None
+    except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from exc

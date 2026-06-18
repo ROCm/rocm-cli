@@ -11,7 +11,7 @@ pub enum RuntimePlatform {
 }
 
 impl RuntimePlatform {
-    pub fn current() -> Self {
+    pub const fn current() -> Self {
         #[cfg(target_vendor = "cosmo")]
         {
             if cosmo_hostos_has(COSMO_HOST_WINDOWS) {
@@ -31,7 +31,7 @@ impl RuntimePlatform {
         }
     }
 
-    pub fn os_name(self) -> &'static str {
+    pub const fn os_name(self) -> &'static str {
         match self {
             Self::Windows => "windows",
             Self::Linux => "linux",
@@ -39,11 +39,11 @@ impl RuntimePlatform {
         }
     }
 
-    pub fn is_windows(self) -> bool {
+    pub const fn is_windows(self) -> bool {
         matches!(self, Self::Windows)
     }
 
-    pub fn is_linux(self) -> bool {
+    pub const fn is_linux(self) -> bool {
         matches!(self, Self::Linux)
     }
 }
@@ -55,63 +55,63 @@ pub struct RuntimeHost {
 }
 
 impl RuntimeHost {
-    pub fn current() -> Self {
+    pub const fn current() -> Self {
         Self {
             platform: RuntimePlatform::current(),
             cosmopolitan: cfg!(target_vendor = "cosmo"),
         }
     }
 
-    pub fn platform(self) -> RuntimePlatform {
+    pub const fn platform(self) -> RuntimePlatform {
         self.platform
     }
 
-    pub fn os_name(self) -> &'static str {
+    pub const fn os_name(self) -> &'static str {
         self.platform.os_name()
     }
 
-    pub fn is_windows(self) -> bool {
+    pub const fn is_windows(self) -> bool {
         self.platform.is_windows()
     }
 
-    pub fn is_linux(self) -> bool {
+    pub const fn is_linux(self) -> bool {
         self.platform.is_linux()
     }
 
-    pub fn is_cosmopolitan(self) -> bool {
+    pub const fn is_cosmopolitan(self) -> bool {
         self.cosmopolitan
     }
 
-    pub fn uses_unix_path_separator_on_windows(self) -> bool {
+    pub const fn uses_unix_path_separator_on_windows(self) -> bool {
         self.is_windows() && std::path::MAIN_SEPARATOR == '/'
     }
 }
 
-pub fn runtime_is_windows() -> bool {
+pub const fn runtime_is_windows() -> bool {
     RuntimeHost::current().is_windows()
 }
 
-pub fn runtime_is_linux() -> bool {
+pub const fn runtime_is_linux() -> bool {
     RuntimeHost::current().is_linux()
 }
 
-pub fn runtime_os_name() -> &'static str {
+pub const fn runtime_os_name() -> &'static str {
     RuntimeHost::current().os_name()
 }
 
-pub fn runtime_is_cosmopolitan_windows() -> bool {
+pub const fn runtime_is_cosmopolitan_windows() -> bool {
     RuntimeHost::current().uses_unix_path_separator_on_windows()
 }
 
-pub fn runtime_tcp_timeouts_are_supported() -> bool {
+pub const fn runtime_tcp_timeouts_are_supported() -> bool {
     !runtime_is_cosmopolitan_windows()
 }
 
-pub fn runtime_exe_suffix() -> &'static str {
+pub const fn runtime_exe_suffix() -> &'static str {
     if runtime_is_windows() { ".exe" } else { "" }
 }
 
-pub fn runtime_python_bin_dir_name() -> &'static str {
+pub const fn runtime_python_bin_dir_name() -> &'static str {
     if runtime_is_windows() {
         "Scripts"
     } else {
@@ -119,7 +119,7 @@ pub fn runtime_python_bin_dir_name() -> &'static str {
     }
 }
 
-pub fn runtime_python_executable_name() -> &'static str {
+pub const fn runtime_python_executable_name() -> &'static str {
     if runtime_is_windows() {
         "python.exe"
     } else {
@@ -153,6 +153,9 @@ pub fn runtime_python_activation_hint(env_root: &Path) -> String {
     }
 }
 
+// `shortname` is always an internal, lowercase ROCm library name (never user
+// input), so the `.dll`/`.so` suffix checks are intentionally case-sensitive.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
 pub fn runtime_rocm_library_filename(shortname: &str) -> String {
     if runtime_is_windows() {
         match shortname {
@@ -422,11 +425,10 @@ enum RuntimePathSeparator {
 }
 
 impl RuntimePathSeparator {
-    fn separator(self) -> char {
+    const fn separator(self) -> char {
         match self {
             Self::Native if std::path::MAIN_SEPARATOR == '\\' => '\\',
-            Self::Native => '/',
-            Self::Slash => '/',
+            Self::Native | Self::Slash => '/',
             Self::Backslash => '\\',
         }
     }
@@ -439,11 +441,13 @@ const COSMO_HOST_LINUX: i32 = 1;
 const COSMO_HOST_WINDOWS: i32 = 4;
 
 #[cfg(target_vendor = "cosmo")]
+#[allow(unsafe_code)] // Cosmopolitan host-OS symbol
 unsafe extern "C" {
     static __hostos: i32;
 }
 
 #[cfg(target_vendor = "cosmo")]
+#[allow(unsafe_code)] // reads the Cosmopolitan __hostos extern static
 fn cosmo_hostos_has(mask: i32) -> bool {
     // Cosmopolitan exposes the active host through libc/dce.h. Calling it
     // directly keeps the Rust APE tied to Cosmopolitan's runtime instead of a
@@ -473,8 +477,7 @@ fn current_exe_is_cosmopolitan_loader(path: &Path) -> bool {
     }
     path.file_name()
         .and_then(|value| value.to_str())
-        .map(|name| matches!(name, "ape" | "ape-x86_64.elf" | "ape-aarch64.elf"))
-        .unwrap_or(false)
+        .is_some_and(|name| matches!(name, "ape" | "ape-x86_64.elf" | "ape-aarch64.elf"))
 }
 
 fn current_executable_path_from_argv0() -> Result<PathBuf> {

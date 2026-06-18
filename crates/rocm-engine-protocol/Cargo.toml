@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 rocm-core = { path = "../rocm-core" }
 serde.workspace = true

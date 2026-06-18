@@ -250,7 +250,7 @@ fn model_ref_basename(value: &str) -> &str {
         .trim()
         .rsplit(['/', '\\'])
         .next()
-        .unwrap_or(value.trim())
+        .unwrap_or_else(|| value.trim())
 }
 
 fn model_ref_family_matches(reported: &str, expected_family: &str) -> bool {
@@ -267,7 +267,7 @@ fn normalize_model_ref_family(value: &str) -> String {
     value
         .trim()
         .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .flat_map(char::to_lowercase)
         .collect()
 }
@@ -324,6 +324,7 @@ pub fn read_tcp_stream_to_string(stream: &mut TcpStream) -> Result<String> {
 }
 
 #[cfg(all(target_vendor = "cosmo", not(windows)))]
+#[allow(unsafe_code)] // libc socket FFI
 fn cosmo_send_all(stream: &TcpStream, mut bytes: &[u8]) -> Result<()> {
     let fd = stream.as_raw_fd();
     while !bytes.is_empty() {
@@ -344,6 +345,7 @@ fn cosmo_send_all(stream: &TcpStream, mut bytes: &[u8]) -> Result<()> {
 }
 
 #[cfg(all(target_vendor = "cosmo", not(windows)))]
+#[allow(unsafe_code)] // libc socket FFI
 fn cosmo_recv_to_string(stream: &TcpStream) -> Result<String> {
     let fd = stream.as_raw_fd();
     let mut response = Vec::new();
@@ -405,6 +407,7 @@ pub fn spawn_hidden_console_no_inherit(
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
 pub fn spawn_hidden_console_with_log(
     program: &Path,
     args: &[String],
@@ -478,6 +481,7 @@ pub fn spawn_hidden_console_with_log(
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
 pub fn wait_for_process_exit(pid: u32) -> Result<u32> {
     use windows_sys::Win32::Foundation::CloseHandle;
 
@@ -510,6 +514,7 @@ pub fn wait_for_process_exit(pid: u32) -> Result<u32> {
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
 pub fn terminate_process(pid: u32) -> Result<()> {
     use windows_sys::Win32::Foundation::CloseHandle;
 
@@ -534,8 +539,9 @@ pub fn terminate_process(pid: u32) -> Result<()> {
 }
 
 #[cfg(not(windows))]
+#[allow(unsafe_code)] // libc FFI
 pub fn terminate_process(pid: u32) -> Result<()> {
-    let status = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    let status = unsafe { libc::kill(pid.cast_signed(), libc::SIGTERM) };
     if status == 0 {
         Ok(())
     } else {
@@ -545,6 +551,7 @@ pub fn terminate_process(pid: u32) -> Result<()> {
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
 pub fn process_is_running(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
 
@@ -564,6 +571,7 @@ pub fn process_is_running(pid: u32) -> bool {
 }
 
 #[cfg(not(windows))]
+#[allow(unsafe_code)] // libc FFI
 pub fn process_is_running(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -579,6 +587,7 @@ pub fn process_is_running(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
+#[allow(unsafe_code)] // libc FFI (pre_exec/setsid)
 pub fn detach_command_session(command: &mut Command) {
     use std::os::unix::process::CommandExt;
 
@@ -597,6 +606,7 @@ pub fn detach_command_session(command: &mut Command) {
 pub fn detach_command_session(_command: &mut Command) {}
 
 #[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
 fn spawn_windows_no_inherit(
     program: &Path,
     args: &[String],
@@ -772,6 +782,7 @@ impl AppPaths {
         self
     }
 
+    #[must_use]
     pub fn with_managed_root(mut self, root: impl Into<PathBuf>, keep_cache_dir: bool) -> Self {
         self.data_dir = normalize_runtime_path_for_host(&root.into());
         if !keep_cache_dir {
@@ -814,9 +825,10 @@ impl AppPaths {
     }
 
     pub fn engine_envs_root(&self) -> PathBuf {
-        env_path_override("ROCM_CLI_ENGINE_ENVS_ROOT")
-            .map(|root| normalize_runtime_path_for_host(&root))
-            .unwrap_or_else(|| self.data_dir.join("engines"))
+        env_path_override("ROCM_CLI_ENGINE_ENVS_ROOT").map_or_else(
+            || self.data_dir.join("engines"),
+            |root| normalize_runtime_path_for_host(&root),
+        )
     }
 
     pub fn engine_envs_dir(&self, engine: &str) -> PathBuf {
@@ -917,14 +929,12 @@ pub fn engine_plugin_dirs(paths: &AppPaths) -> Vec<PathBuf> {
 }
 
 fn env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    std::env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1169,8 +1179,7 @@ impl DoctorSummary {
             self.distro.as_deref().unwrap_or("<unknown>"),
             self.cpu.as_deref().unwrap_or("<unknown>"),
             self.system_ram_gib
-                .map(format_gib_value)
-                .unwrap_or_else(|| "<unknown>".to_owned()),
+                .map_or_else(|| "<unknown>".to_owned(), format_gib_value),
             self.interactive_terminal,
             self.default_engine,
             self.detected_gfx_target.as_deref().unwrap_or("<unknown>"),
@@ -1187,15 +1196,14 @@ impl DoctorSummary {
             legacy_paths,
             self.legacy_rocm.detail.as_deref().unwrap_or("<unknown>"),
             self.legacy_rocm_guidance(),
-            wsl.map(|summary| summary.is_wsl).unwrap_or(false),
-            wsl.map(|summary| summary.dxg_device).unwrap_or(false),
-            wsl.map(|summary| summary.dxcore).unwrap_or(false),
-            wsl.map(|summary| summary.librocdxg).unwrap_or(false),
-            wsl.map(|summary| summary.rocdxg_dids).unwrap_or(false),
-            wsl.map(|summary| summary.ldconfig_librocdxg)
-                .unwrap_or(false),
-            wsl.map(|summary| summary.rocminfo).unwrap_or(false),
-            wsl.map(|summary| summary.cargo).unwrap_or(false),
+            wsl.is_some_and(|summary| summary.is_wsl),
+            wsl.is_some_and(|summary| summary.dxg_device),
+            wsl.is_some_and(|summary| summary.dxcore),
+            wsl.is_some_and(|summary| summary.librocdxg),
+            wsl.is_some_and(|summary| summary.rocdxg_dids),
+            wsl.is_some_and(|summary| summary.ldconfig_librocdxg),
+            wsl.is_some_and(|summary| summary.rocminfo),
+            wsl.is_some_and(|summary| summary.cargo),
             wsl.and_then(|summary| summary.detail.as_deref())
                 .unwrap_or("<not WSL>"),
             self.managed_runtime_count,
@@ -1207,7 +1215,7 @@ impl DoctorSummary {
         )
     }
 
-    fn legacy_rocm_guidance(&self) -> &'static str {
+    const fn legacy_rocm_guidance(&self) -> &'static str {
         if self.legacy_rocm.paths.is_empty() {
             return "none";
         }
@@ -1222,7 +1230,7 @@ pub fn interactive_terminal() -> bool {
     stdin().is_terminal() && stdout().is_terminal()
 }
 
-pub fn default_engine_for_platform() -> &'static str {
+pub const fn default_engine_for_platform() -> &'static str {
     "lemonade"
 }
 
@@ -1541,6 +1549,7 @@ fn detect_legacy_rocm_summary() -> LegacyRocmSummary {
     }
 }
 
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // ROCm installs the runtime DLL as lowercase `amdhip64.dll`
 fn legacy_rocm_candidate_exists(candidate: &Path) -> bool {
     if !candidate.exists() {
         return false;
@@ -1569,8 +1578,7 @@ fn legacy_rocm_candidate_exists(candidate: &Path) -> bool {
             entry
                 .file_name()
                 .to_str()
-                .map(|name| name.starts_with("amdhip64") && name.ends_with(".dll"))
-                .unwrap_or(false)
+                .is_some_and(|name| name.starts_with("amdhip64") && name.ends_with(".dll"))
         })
 }
 
@@ -1586,7 +1594,7 @@ fn detect_windows_amd_display_driver() -> Option<String> {
 }
 
 #[cfg(not(any(windows, target_vendor = "cosmo")))]
-fn detect_windows_amd_display_driver() -> Option<String> {
+const fn detect_windows_amd_display_driver() -> Option<String> {
     None
 }
 
@@ -1689,17 +1697,14 @@ fn detect_windows_doctor_inventory_from_pnp_entity() -> Option<WindowsDoctorInve
 }
 
 #[cfg(not(any(windows, target_vendor = "cosmo")))]
-fn detect_windows_doctor_inventory() -> Option<WindowsDoctorInventory> {
+const fn detect_windows_doctor_inventory() -> Option<WindowsDoctorInventory> {
     None
 }
 
 #[cfg(any(windows, target_vendor = "cosmo", test))]
 fn clean_windows_display_name(value: &str) -> String {
     let value = value.trim();
-    let value = value
-        .rsplit_once(';')
-        .map(|(_, name)| name)
-        .unwrap_or(value);
+    let value = value.rsplit_once(';').map_or(value, |(_, name)| name);
     value.trim().to_owned()
 }
 
@@ -1825,8 +1830,8 @@ fn push_windows_pnputil_display(
 }
 
 pub fn detect_host_gpu_diagnostics() -> String {
-    let mut output = String::new();
     use std::fmt::Write as _;
+    let mut output = String::new();
     let _ = writeln!(output, "GPU detection diagnostics");
     let _ = writeln!(output, "  runtime_os: {}", runtime_os_name());
     let summary = detect_host_gpu_summary(None);
@@ -1920,7 +1925,7 @@ fn append_windows_gpu_probe_diagnostics(output: &mut String) {
 }
 
 #[cfg(not(any(windows, target_vendor = "cosmo")))]
-fn append_windows_gpu_probe_diagnostics(_output: &mut String) {}
+const fn append_windows_gpu_probe_diagnostics(_output: &mut String) {}
 
 #[cfg(any(windows, target_vendor = "cosmo"))]
 fn append_windows_probe_diagnostics(
@@ -2140,9 +2145,7 @@ fn count_json_files(dir: &Path) -> usize {
 }
 
 fn count_dir_entries(dir: &Path) -> usize {
-    fs::read_dir(dir)
-        .map(|entries| entries.flatten().count())
-        .unwrap_or(0)
+    fs::read_dir(dir).map_or(0, |entries| entries.flatten().count())
 }
 
 pub fn require_nonempty(value: &str, field_name: &str) -> Result<()> {
@@ -2300,7 +2303,7 @@ fn newest_therock_family_in_manifest_dir(path: &Path) -> Option<(u128, String)> 
 fn detect_managed_therock_sdk_gfx_target(paths: &AppPaths) -> Option<String> {
     managed_therock_sdk_probe_candidates(&paths.data_dir.join("runtimes").join("registry"))
         .into_iter()
-        .filter_map(|candidate| {
+        .find_map(|candidate| {
             let tool = managed_sdk_tool_path(&candidate.bin_path, "rocm_agent_enumerator")?;
             let mut envs = Vec::new();
             if let Some(ld_library_path) = managed_sdk_ld_library_path(&candidate) {
@@ -2309,7 +2312,6 @@ fn detect_managed_therock_sdk_gfx_target(paths: &AppPaths) -> Option<String> {
             capture_optional_path_command_with_env(&tool, &[], &envs, OPTIONAL_COMMAND_TIMEOUT)
                 .and_then(|output| extract_first_gfx_token(&output))
         })
-        .next()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2601,9 +2603,8 @@ fn newer_therock_family(
 ) -> Option<(u128, String)> {
     match (left, right) {
         (Some(left), Some(right)) if left.0 > right.0 => Some(left),
-        (Some(_), Some(right)) => Some(right),
+        (Some(_) | None, Some(right)) => Some(right),
         (Some(left), None) => Some(left),
-        (None, Some(right)) => Some(right),
         (None, None) => None,
     }
 }
@@ -2642,8 +2643,7 @@ impl TheRockFamilyManifest {
             || self
                 .runtime_id
                 .as_deref()
-                .map(|runtime_id| runtime_id.to_ascii_lowercase().starts_with("therock-"))
-                .unwrap_or(false)
+                .is_some_and(|runtime_id| runtime_id.to_ascii_lowercase().starts_with("therock-"))
     }
 }
 
@@ -2833,10 +2833,9 @@ fn capture_optional_command_candidate_with_timeout(
                     .unwrap_or_default();
                 if status.success() {
                     return String::from_utf8(bytes).ok();
-                } else {
-                    debug_command_capture_failure(program, "exit", &format!("status {status}"));
-                    return None;
                 }
+                debug_command_capture_failure(program, "exit", &format!("status {status}"));
+                return None;
             }
             Ok(None) if start.elapsed() < timeout => {
                 thread::sleep(Duration::from_millis(25));
@@ -2894,12 +2893,9 @@ fn capture_optional_path_command_with_env(
     for (key, value) in envs {
         command.env(key, value);
     }
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(_) => {
-            let _ = fs::remove_file(&output_path);
-            return None;
-        }
+    let Ok(mut child) = command.spawn() else {
+        let _ = fs::remove_file(&output_path);
+        return None;
     };
 
     let start = Instant::now();
@@ -2917,13 +2913,7 @@ fn capture_optional_path_command_with_env(
             Ok(None) if start.elapsed() < timeout => {
                 thread::sleep(Duration::from_millis(25));
             }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = fs::remove_file(&output_path);
-                return None;
-            }
-            Err(_) => {
+            Ok(None) | Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = fs::remove_file(&output_path);
@@ -2934,15 +2924,13 @@ fn capture_optional_path_command_with_env(
 }
 
 fn tool_on_path(program: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path).any(|dir| {
-                tool_path_candidates(program)
-                    .into_iter()
-                    .any(|name| dir.join(name).is_file())
-            })
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            tool_path_candidates(program)
+                .into_iter()
+                .any(|name| dir.join(name).is_file())
         })
-        .unwrap_or(false)
+    })
 }
 
 fn tool_path_candidates(program: &str) -> Vec<String> {
@@ -3008,7 +2996,7 @@ fn detect_windows_display_gfx_target() -> Option<String> {
 }
 
 #[cfg(not(any(windows, target_vendor = "cosmo")))]
-fn detect_windows_display_gfx_target() -> Option<String> {
+const fn detect_windows_display_gfx_target() -> Option<String> {
     None
 }
 
@@ -3089,8 +3077,7 @@ fn is_wsl_environment_fast() -> bool {
     }
     Path::new("/dev/dxg").exists()
         || fs::read_to_string("/proc/version")
-            .map(|text| text.to_ascii_lowercase().contains("microsoft"))
-            .unwrap_or(false)
+            .is_ok_and(|text| text.to_ascii_lowercase().contains("microsoft"))
 }
 
 #[cfg(target_os = "linux")]
@@ -3163,7 +3150,7 @@ fn amd_pci_device_id_from_pnp_id(pnp_id: &str) -> Option<String> {
     let start = upper.find("DEV_")? + "DEV_".len();
     let device_id = upper[start..]
         .chars()
-        .take_while(|ch| ch.is_ascii_hexdigit())
+        .take_while(char::is_ascii_hexdigit)
         .take(4)
         .collect::<String>();
     if device_id.len() == 4 {
@@ -3586,7 +3573,7 @@ pub enum WatcherMode {
 }
 
 impl WatcherMode {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Observe => "observe",
             Self::Propose => "propose",
@@ -3649,7 +3636,7 @@ const BUILTIN_WATCHERS: &[BuiltinWatcherSpec] = &[
     },
 ];
 
-pub fn builtin_watchers() -> &'static [BuiltinWatcherSpec] {
+pub const fn builtin_watchers() -> &'static [BuiltinWatcherSpec] {
     BUILTIN_WATCHERS
 }
 
@@ -3842,15 +3829,15 @@ fn default_dashboard_theme() -> String {
     "default-dark".to_owned()
 }
 
-fn default_gpu_tick_secs() -> f64 {
+const fn default_gpu_tick_secs() -> f64 {
     1.0
 }
 
-fn default_discovery_tick_secs() -> f64 {
+const fn default_discovery_tick_secs() -> f64 {
     5.0
 }
 
-fn default_instance_tick_secs() -> f64 {
+const fn default_instance_tick_secs() -> f64 {
     2.0
 }
 
@@ -3905,7 +3892,7 @@ impl DashboardDaemonConfig {
 /// Dashboard TUI spec. The chat endpoint URL / model / auth-header *name* are
 /// plain data; the auth-header *value* (API key) is always env-only and never
 /// stored here (AMD gateway invariant).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DashboardTuiConfig {
     #[serde(default = "default_dashboard_connect")]
     pub connect: String,
@@ -3943,6 +3930,7 @@ impl DashboardConfig {
     /// Return a copy with the chat endpoint base URL + model set and the custom
     /// auth header cleared (mirrors the rocm-dash `config_with_chat` behavior).
     /// Immutable transform — scoped to the dashboard sub-config only.
+    #[must_use]
     pub fn with_chat_endpoint(
         mut self,
         base_url: impl Into<String>,
@@ -3955,12 +3943,14 @@ impl DashboardConfig {
     }
 
     /// Return a copy with the dashboard theme set.
+    #[must_use]
     pub fn with_theme(mut self, theme: impl Into<String>) -> Self {
         self.tui.theme = theme.into();
         self
     }
 
     /// Return a copy with the telemetry daemon listen address set.
+    #[must_use]
     pub fn with_daemon_listen(mut self, listen: impl Into<String>) -> Self {
         self.daemon.listen = listen.into();
         self
@@ -4058,8 +4048,7 @@ impl RocmCliConfig {
         provider.eq_ignore_ascii_case("local")
             || self
                 .provider_config(provider)
-                .map(|cfg| cfg.enabled)
-                .unwrap_or(false)
+                .is_some_and(|cfg| cfg.enabled)
     }
 
     pub fn watcher_config(&self, watcher: &str) -> Option<&WatcherUserConfig> {
@@ -4079,8 +4068,7 @@ impl RocmCliConfig {
 
     pub fn watcher_enabled(&self, watcher: &BuiltinWatcherSpec) -> bool {
         self.watcher_config(watcher.id)
-            .map(|cfg| cfg.enabled)
-            .unwrap_or(false)
+            .is_some_and(|cfg| cfg.enabled)
     }
 
     pub fn effective_watcher_mode(&self, watcher: &BuiltinWatcherSpec) -> WatcherMode {
@@ -4234,7 +4222,7 @@ pub struct AutomationEventRecord {
     pub service_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AutomationTriggerEvent {
     pub at_unix_ms: u128,
     pub kind: String,
@@ -4413,7 +4401,7 @@ pub fn update_automation_proposal_status(
     else {
         bail!("automation proposal `{proposal_id}` not found");
     };
-    proposal.status = status.to_owned();
+    status.clone_into(&mut proposal.status);
     if status != "pending" {
         proposal.reviewed_at_unix_ms = Some(unix_time_millis());
     }
@@ -5648,13 +5636,13 @@ impl ManagedServiceRecord {
         };
 
         let previous = self.status.clone();
-        self.status = status.to_owned();
+        status.clone_into(&mut self.status);
         if let Some(endpoint_url) = state
             .get("endpoint_url")
             .and_then(serde_json::Value::as_str)
             .filter(|value| !value.trim().is_empty())
         {
-            self.endpoint_url = endpoint_url.to_owned();
+            endpoint_url.clone_into(&mut self.endpoint_url);
         }
         if let Some(runtime_id) = state
             .get("runtime_id")
@@ -7179,7 +7167,7 @@ Class Name:                Display
             "Rust signature must match openssl byte-for-byte"
         );
 
-        let mut tampered = payload.clone();
+        let mut tampered = payload;
         tampered[0] ^= 0x01;
         let error = verify_rsa_pkcs1_sha256_signature(
             &public_key_pem,
@@ -7339,6 +7327,7 @@ Class Name:                Display
     }
 
     #[test]
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     fn engine_envs_dir_honors_dedicated_root_override() {
         let (root, paths) = temp_app_paths("engine-envs-root-override");
         let override_root = root.join("runtime").join("engines");
@@ -7512,6 +7501,7 @@ Class Name:                Display
     // ===== Dashboard sub-config + migration =====
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn dashboard_config_defaults_and_json_round_trip() {
         let cfg = DashboardConfig::default();
         assert_eq!(cfg.daemon.listen, "unix:/tmp/rocmdashd.sock");
@@ -7588,6 +7578,7 @@ Class Name:                Display
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn migrate_legacy_dashboard_toml_maps_knobs_and_is_one_shot() -> Result<()> {
         let (root, paths) = temp_app_paths("migrate-dash");
         paths.ensure()?;

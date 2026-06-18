@@ -54,7 +54,7 @@ pub struct JobState {
 
 impl JobState {
     /// `true` once the job has reached any terminal status.
-    pub fn is_terminal(&self) -> bool {
+    pub const fn is_terminal(&self) -> bool {
         !matches!(self.status, JobStatus::Running)
     }
 
@@ -285,6 +285,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_wrap)]
     fn history_caps_at_ring_size() {
         let mut s = State::default();
         for i in 0..(SNAPSHOT_RING_CAP + 5) as i64 {
@@ -420,9 +421,8 @@ mod tests {
         let mut s = State::default();
         let fx = start(&mut s, "j1");
         // Grab the runtime's cancel handle from the emitted effect.
-        let cancel = match fx.into_iter().next().unwrap() {
-            SideEffect::SpawnJob { cancel, .. } => cancel,
-            _ => unreachable!(),
+        let SideEffect::SpawnJob { cancel, .. } = fx.into_iter().next().unwrap() else {
+            unreachable!()
         };
         s.apply(StateEvent::CancelJob("j1".into()));
         assert_eq!(s.job("j1").unwrap().status, JobStatus::Cancelled);

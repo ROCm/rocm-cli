@@ -34,11 +34,7 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     draw_memory(f, left[1], state, theme);
     draw_host(f, left[2], state, theme);
 
-    let n_gpus = state
-        .latest
-        .as_ref()
-        .map(|s| s.gpus.len().max(1))
-        .unwrap_or(1);
+    let n_gpus = state.latest.as_ref().map_or(1, |s| s.gpus.len().max(1));
     let gpu_height = (n_gpus as u16 * 4 + 2).clamp(8, 20);
     let right = Layout::default()
         .direction(Direction::Vertical)
@@ -58,8 +54,7 @@ fn draw_cpu(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let n_cores = state
         .latest
         .as_ref()
-        .map(|s| s.host.cpu_per_core_pct.len())
-        .unwrap_or(0);
+        .map_or(0, |s| s.host.cpu_per_core_pct.len());
     let title = match state.latest.as_ref() {
         Some(s) => format!(
             " CPU · {} · {} cores ",
@@ -201,29 +196,26 @@ fn draw_gpu(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         return;
     }
 
-    let snap = match state.latest.as_ref() {
-        Some(s) => s,
-        None => {
-            let p = Paragraph::new(Line::from(Span::styled(
-                "waiting for first snapshot…",
-                Style::default().fg(theme.muted),
-            )));
-            f.render_widget(p, inner);
-            return;
-        }
+    let Some(snap) = state.latest.as_ref() else {
+        let p = Paragraph::new(Line::from(Span::styled(
+            "waiting for first snapshot…",
+            Style::default().fg(theme.muted),
+        )));
+        f.render_widget(p, inner);
+        return;
     };
 
     if snap.gpus.is_empty() {
-        let lines: Vec<Line> = if !snap.warnings.is_empty() {
-            snap.warnings
-                .iter()
-                .map(|w| Line::from(Span::styled(w.clone(), Style::default().fg(theme.warn))))
-                .collect()
-        } else {
+        let lines: Vec<Line> = if snap.warnings.is_empty() {
             vec![Line::from(Span::styled(
                 "no GPUs reported",
                 Style::default().fg(theme.muted),
             ))]
+        } else {
+            snap.warnings
+                .iter()
+                .map(|w| Line::from(Span::styled(w.clone(), Style::default().fg(theme.warn))))
+                .collect()
         };
         f.render_widget(Paragraph::new(lines), inner);
         return;
@@ -325,10 +317,7 @@ fn draw_instances(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         };
         let name = trunc(&inst.container_name, 18);
         let model = trunc(&inst.model_name, 20);
-        let port = inst
-            .port
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "-".into());
+        let port = inst.port.map_or_else(|| "-".into(), |p| p.to_string());
         let gpus = if inst.gpu_ids.is_empty() {
             "-".to_string()
         } else {

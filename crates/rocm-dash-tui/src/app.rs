@@ -106,31 +106,33 @@ pub enum ActiveTab {
 }
 
 impl ActiveTab {
-    pub fn next(self) -> Self {
+    #[must_use]
+    pub const fn next(self) -> Self {
         match self {
-            ActiveTab::Overview => ActiveTab::Hardware,
-            ActiveTab::Hardware => ActiveTab::Instances,
-            ActiveTab::Instances => ActiveTab::Bench,
-            ActiveTab::Bench => ActiveTab::Chat,
-            ActiveTab::Chat => ActiveTab::Overview,
+            Self::Overview => Self::Hardware,
+            Self::Hardware => Self::Instances,
+            Self::Instances => Self::Bench,
+            Self::Bench => Self::Chat,
+            Self::Chat => Self::Overview,
         }
     }
-    pub fn prev(self) -> Self {
+    #[must_use]
+    pub const fn prev(self) -> Self {
         match self {
-            ActiveTab::Overview => ActiveTab::Chat,
-            ActiveTab::Hardware => ActiveTab::Overview,
-            ActiveTab::Instances => ActiveTab::Hardware,
-            ActiveTab::Bench => ActiveTab::Instances,
-            ActiveTab::Chat => ActiveTab::Bench,
+            Self::Overview => Self::Chat,
+            Self::Hardware => Self::Overview,
+            Self::Instances => Self::Hardware,
+            Self::Bench => Self::Instances,
+            Self::Chat => Self::Bench,
         }
     }
-    pub fn from_digit(d: char) -> Option<Self> {
+    pub const fn from_digit(d: char) -> Option<Self> {
         match d {
-            '1' => Some(ActiveTab::Overview),
-            '2' => Some(ActiveTab::Hardware),
-            '3' => Some(ActiveTab::Instances),
-            '4' => Some(ActiveTab::Bench),
-            '5' => Some(ActiveTab::Chat),
+            '1' => Some(Self::Overview),
+            '2' => Some(Self::Hardware),
+            '3' => Some(Self::Instances),
+            '4' => Some(Self::Bench),
+            '5' => Some(Self::Chat),
             _ => None,
         }
     }
@@ -224,7 +226,7 @@ pub struct ReplayState {
 }
 
 impl ReplayState {
-    pub fn new(controller: crate::replay::ReplayController) -> Self {
+    pub const fn new(controller: crate::replay::ReplayController) -> Self {
         Self {
             controller,
             paused: false,
@@ -455,11 +457,12 @@ impl AppState {
         if len == 0 {
             return;
         }
-        let next = (self.theme_picker_sel as isize + delta).clamp(0, len as isize - 1) as usize;
+        let next =
+            (self.theme_picker_sel.cast_signed() + delta).clamp(0, len.cast_signed() - 1) as usize;
         self.theme_picker_sel = next;
     }
 
-    pub fn theme_picker_first(&mut self) {
+    pub const fn theme_picker_first(&mut self) {
         self.theme_picker_sel = 0;
     }
 
@@ -471,15 +474,15 @@ impl AppState {
     }
 
     /// Reset the bench-detail scroll offset (called when opening the modal).
-    pub fn reset_bench_detail_scroll(&mut self) {
+    pub const fn reset_bench_detail_scroll(&mut self) {
         self.bench_detail_scroll = 0;
     }
 
     /// Adjust the bench-detail scroll. `delta` is in lines; clamped at 0
     /// (no upper bound — the renderer clamps against the actual line count).
     pub fn scroll_bench_detail(&mut self, delta: i16) {
-        let cur = self.bench_detail_scroll as i32;
-        let next = (cur + delta as i32).max(0) as u16;
+        let cur = i32::from(self.bench_detail_scroll);
+        let next = (cur + i32::from(delta)).max(0) as u16;
         self.bench_detail_scroll = next;
     }
 
@@ -497,7 +500,7 @@ impl AppState {
 
     /// Accept the detected endpoint and enable chat. No-op when no endpoint is
     /// available. Focuses the input so the user can type immediately.
-    pub fn accept_chat_consent(&mut self) {
+    pub const fn accept_chat_consent(&mut self) {
         if self.chat_llm.is_some() {
             self.chat_consent = ChatConsent::Accepted;
             self.chat_focused = true;
@@ -505,7 +508,7 @@ impl AppState {
     }
 
     /// Decline the detected endpoint. Chat stays off (re-enable with `y`).
-    pub fn decline_chat_consent(&mut self) {
+    pub const fn decline_chat_consent(&mut self) {
         if self.chat_llm.is_some() {
             self.chat_consent = ChatConsent::Declined;
             self.chat_focused = false;
@@ -530,16 +533,13 @@ impl AppState {
     /// flag either way.
     pub fn set_detect_result(&mut self, offer: Option<crate::llm::LlmConfig>) {
         self.chat_detecting = false;
-        match offer {
-            Some(cfg) => {
-                self.chat_detect_msg = None;
-                self.chat_detect_offer = Some(cfg);
-            }
-            None => {
-                self.chat_detect_offer = None;
-                self.chat_detect_msg =
-                    Some("no local engine found (Lemonade :13305 / vLLM :8000)".into());
-            }
+        if let Some(cfg) = offer {
+            self.chat_detect_msg = None;
+            self.chat_detect_offer = Some(cfg);
+        } else {
+            self.chat_detect_offer = None;
+            self.chat_detect_msg =
+                Some("no local engine found (Lemonade :13305 / vLLM :8000)".into());
         }
     }
 
@@ -632,7 +632,7 @@ impl AppState {
         match self.active_tab {
             ActiveTab::Instances => self.instances.len(),
             ActiveTab::Bench => self.bench_rows.len(),
-            ActiveTab::Hardware => self.latest.as_ref().map(|s| s.gpus.len()).unwrap_or(0),
+            ActiveTab::Hardware => self.latest.as_ref().map_or(0, |s| s.gpus.len()),
             _ => 0,
         }
     }
@@ -644,7 +644,7 @@ impl AppState {
             return;
         }
         let sel = self.selection_for(self.active_tab);
-        let next = (sel as isize + delta).clamp(0, len as isize - 1) as usize;
+        let next = (sel.cast_signed() + delta).clamp(0, len.cast_signed() - 1) as usize;
         self.set_selection(self.active_tab, next);
     }
 
@@ -659,7 +659,7 @@ impl AppState {
         }
     }
 
-    fn selection_for(&self, tab: ActiveTab) -> usize {
+    const fn selection_for(&self, tab: ActiveTab) -> usize {
         match tab {
             ActiveTab::Instances => self.instance_sel,
             ActiveTab::Bench => self.bench_sel,
@@ -684,8 +684,8 @@ impl AppState {
     /// Derives the visible row count from the last rendered body area; with no
     /// prior draw it is a no-op (the renderer self-corrects on the next frame).
     fn sync_gpu_scroll(&mut self) {
-        let n = self.latest.as_ref().map(|s| s.gpus.len()).unwrap_or(0);
-        let body_h = self.last_body_area.map(|r| r.height).unwrap_or(0);
+        let n = self.latest.as_ref().map_or(0, |s| s.gpus.len());
+        let body_h = self.last_body_area.map_or(0, |r| r.height);
         let visible = crate::ui::tabs::hardware::gpu_visible_count(body_h, n);
         self.gpu_scroll =
             crate::ui::tabs::hardware::scroll_to_show(self.gpu_sel, self.gpu_scroll, visible);
@@ -694,17 +694,17 @@ impl AppState {
     /// Clamp both selectors after a state update that may have shrunk the
     /// underlying collection. Call after push_snapshot / instance changes.
     fn clamp_selectors(&mut self) {
-        if !self.instances.is_empty() {
-            self.instance_sel = self.instance_sel.min(self.instances.len() - 1);
-        } else {
+        if self.instances.is_empty() {
             self.instance_sel = 0;
-        }
-        if !self.bench_rows.is_empty() {
-            self.bench_sel = self.bench_sel.min(self.bench_rows.len() - 1);
         } else {
-            self.bench_sel = 0;
+            self.instance_sel = self.instance_sel.min(self.instances.len() - 1);
         }
-        let gpu_count = self.latest.as_ref().map(|s| s.gpus.len()).unwrap_or(0);
+        if self.bench_rows.is_empty() {
+            self.bench_sel = 0;
+        } else {
+            self.bench_sel = self.bench_sel.min(self.bench_rows.len() - 1);
+        }
+        let gpu_count = self.latest.as_ref().map_or(0, |s| s.gpus.len());
         if gpu_count > 0 {
             self.gpu_sel = self.gpu_sel.min(gpu_count - 1);
         } else {
@@ -804,12 +804,11 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     // replay task below — the spawned agent task feeds replies back through the
     // same `rx.recv()` arm the daemon events already use (no new plumbing).
     let chat_tx = tx.clone();
-    let replay_controller = match args.replay.clone() {
-        Some(path) => Some(crate::replay::spawn(path, tx)),
-        None => {
-            client::spawn(args.connect.clone(), tx);
-            None
-        }
+    let replay_controller = if let Some(path) = args.replay.clone() {
+        Some(crate::replay::spawn(path, tx))
+    } else {
+        client::spawn(args.connect.clone(), tx);
+        None
     };
 
     let mut events = EventStream::new();
@@ -1365,7 +1364,7 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
         KeyAction::ChatDetectSave => state.save_detect_offer(),
         KeyAction::ChatDetectDismiss => state.dismiss_detect_offer(),
         KeyAction::ChatScroll(d) => {
-            let next = (state.chat_scroll as i32 + d as i32).max(0) as u16;
+            let next = (i32::from(state.chat_scroll) + i32::from(d)).max(0) as u16;
             state.chat_scroll = next;
         }
         KeyAction::Nothing => {}
@@ -1376,7 +1375,7 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
 /// Translate a mouse event into a `KeyAction` using whatever state context
 /// is needed (last drawn areas, active tab, current modal).
 fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
-    if let MouseEventKind::Down(MouseButton::Left) = me.kind {
+    if me.kind == MouseEventKind::Down(MouseButton::Left) {
         if let Some(area) = state.last_tab_bar_area
             && let Some(tab) = tab_bar_hit(area, me.column, me.row)
         {
@@ -1486,13 +1485,13 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         // is wired with persistence.) Other keys fall through to the globals.
         if chat.offer_pending && chat.consent != ChatConsent::Accepted {
             match k.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
                     return KeyAction::ChatDetectAccept;
                 }
-                KeyCode::Char('s') | KeyCode::Char('S') => {
+                KeyCode::Char('s' | 'S') => {
                     return KeyAction::ChatDetectSave;
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                     return KeyAction::ChatDetectDismiss;
                 }
                 _ => {}
@@ -1526,13 +1525,13 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
                 // engine. Other keys (q, digits, Tab, ?) fall through to the
                 // globals so the user isn't trapped.
                 match k.code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
                         return KeyAction::ChatConsentAccept;
                     }
-                    KeyCode::Char('n') | KeyCode::Char('N') => {
+                    KeyCode::Char('n' | 'N') => {
                         return KeyAction::ChatConsentDecline;
                     }
-                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                    KeyCode::Char('d' | 'D') => {
                         return KeyAction::ChatDetect;
                     }
                     _ => {}
@@ -1540,7 +1539,7 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
             }
             // No endpoint configured: the only gate action is to detect one.
             ChatConsent::Unavailable => {
-                if let KeyCode::Char('d') | KeyCode::Char('D') = k.code {
+                if let KeyCode::Char('d' | 'D') = k.code {
                     return KeyAction::ChatDetect;
                 }
             }
@@ -1601,8 +1600,8 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         KeyCode::PageDown => KeyAction::Move(10),
         KeyCode::PageUp => KeyAction::Move(-10),
         KeyCode::Char(' ') => KeyAction::ReplayTogglePause,
-        KeyCode::Char('+') | KeyCode::Char('=') => KeyAction::ReplaySpeedUp,
-        KeyCode::Char('-') | KeyCode::Char('_') => KeyAction::ReplaySpeedDown,
+        KeyCode::Char('+' | '=') => KeyAction::ReplaySpeedUp,
+        KeyCode::Char('-' | '_') => KeyAction::ReplaySpeedDown,
         KeyCode::Char('[') => KeyAction::ReplayJump(-10),
         KeyCode::Char(']') => KeyAction::ReplayJump(10),
         KeyCode::Char('{') => KeyAction::ReplayJump(-60),

@@ -22,9 +22,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -69,8 +69,7 @@ def run_capture(
         cwd=cwd,
         env=env,
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         check=False,
     )
     result = CommandResult(
@@ -183,7 +182,7 @@ def write_text(path: Path, content: str) -> None:
 def target_json(linker: Path) -> str:
     # This intentionally remains a Linux-ish target. Existing Rust/Cosmo work
     # uses this shape; Windows behavior must be tested and fixed explicitly.
-    return """{
+    return f"""{{
   "llvm-target": "x86_64-unknown-linux-musl",
   "target-pointer-width": 64,
   "arch": "x86_64",
@@ -214,14 +213,14 @@ def target_json(linker: Path) -> str:
   "no-default-libraries": true,
   "max-atomic-width": 64,
   "linker-flavor": "gcc",
-  "linker": "%s",
-  "pre-link-args": {
+  "linker": "{path_text(linker)}",
+  "pre-link-args": {{
     "gcc": ["-static", "-pg", "-mnop-mcount"]
-  },
-  "stack-probes": { "kind": "none" },
+  }},
+  "stack-probes": {{ "kind": "none" }},
   "target-family": ["unix"]
-}
-""" % path_text(linker)
+}}
+"""
 
 
 def linker_wrapper() -> str:

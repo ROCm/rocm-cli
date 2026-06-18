@@ -22,8 +22,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -814,10 +815,8 @@ def prompt_failed(status: Any) -> bool:
         return False
     status_text = str(status.get("status_str", "")).lower()
     completed = status.get("completed")
-    return (
-        status_text in {"error", "failed"}
-        or completed is False
-        and "error" in status_text
+    return status_text in {"error", "failed"} or (
+        completed is False and "error" in status_text
     )
 
 

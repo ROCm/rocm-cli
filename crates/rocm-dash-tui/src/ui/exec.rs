@@ -1,5 +1,6 @@
-//! Shared helpers for launching `rocm` sub-commands from operational screens
-//! (Phase 3 Wave 1). Every screen that routes a mutating action through the
+//! Shared helpers for launching `rocm` sub-commands from operational screens (Phase 3 Wave 1).
+//!
+//! Every screen that routes a mutating action through the
 //! approval gate + job-bridge resolves the binary the same way, so the logic
 //! lives here once instead of being re-implemented per screen.
 
@@ -9,8 +10,7 @@
 pub fn resolve_exe() -> String {
     std::env::current_exe()
         .ok()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "rocm".to_string())
+        .map_or_else(|| "rocm".to_string(), |p| p.to_string_lossy().into_owned())
 }
 
 /// Short, human-readable basename of a resolved command, for approval previews.

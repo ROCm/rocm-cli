@@ -48,8 +48,7 @@ def run_capture(
         cwd=cwd,
         env=env,
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         check=False,
     )
     return CommandResult(args, completed.returncode, completed.stdout, completed.stderr)

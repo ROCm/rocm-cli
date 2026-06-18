@@ -612,7 +612,7 @@ enum SandboxToolArg {
 }
 
 impl SandboxToolArg {
-    fn as_cli_value(self) -> &'static str {
+    const fn as_cli_value(self) -> &'static str {
         match self {
             Self::ListServers => "list_servers",
             Self::RestartServer => "restart_server",
@@ -622,7 +622,7 @@ impl SandboxToolArg {
 }
 
 impl TelemetryModeArg {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Local => TELEMETRY_MODE_LOCAL,
             Self::Off => TELEMETRY_MODE_OFF,
@@ -924,56 +924,53 @@ fn render_freeform_doctor_answer(
         let _ = writeln!(output, "Target: {target}");
     }
 
-    match active {
-        Some(manifest) => {
-            let status = runtime_usability_status(manifest);
-            if status == "ready" {
-                let _ = writeln!(output, "ROCm/TheRock: installed and active for ROCm CLI");
-            } else {
-                let _ = writeln!(output, "ROCm/TheRock: found, but status is {status}");
-            }
-            let _ = writeln!(output, "Folder: {}", manifest.install_root.display());
+    if let Some(manifest) = active {
+        let status = runtime_usability_status(manifest);
+        if status == "ready" {
+            let _ = writeln!(output, "ROCm/TheRock: installed and active for ROCm CLI");
+        } else {
+            let _ = writeln!(output, "ROCm/TheRock: found, but status is {status}");
+        }
+        let _ = writeln!(output, "Folder: {}", manifest.install_root.display());
+        let _ = writeln!(
+            output,
+            "Version: {}",
+            therock::runtime_version_display(&manifest.version)
+        );
+        let _ = writeln!(output, "GPU package: {}", manifest.family);
+    } else {
+        let setup_root = config.setup.therock_venv.as_deref();
+        if let Some(root) = setup_root {
             let _ = writeln!(
                 output,
-                "Version: {}",
-                therock::runtime_version_display(&manifest.version)
+                "ROCm/TheRock: setup folder saved, but no active runtime is selected"
             );
-            let _ = writeln!(output, "GPU package: {}", manifest.family);
-        }
-        None => {
-            let setup_root = config.setup.therock_venv.as_deref();
-            if let Some(root) = setup_root {
-                let _ = writeln!(
-                    output,
-                    "ROCm/TheRock: setup folder saved, but no active runtime is selected"
-                );
-                let _ = writeln!(output, "Folder: {}", root.display());
-            } else if manifests.len() == 1 {
-                let manifest = &manifests[0];
-                let _ = writeln!(
-                    output,
-                    "ROCm/TheRock: installed, but not selected as the active runtime"
-                );
-                let _ = writeln!(output, "Folder: {}", manifest.install_root.display());
-                let _ = writeln!(output, "Runtime: {}", manifest.runtime_key);
-                let _ = writeln!(
-                    output,
-                    "Next step: rocm runtimes activate {}",
-                    manifest.runtime_key
-                );
-            } else if manifests.is_empty() {
-                let _ = writeln!(output, "ROCm/TheRock: not installed for ROCm CLI yet");
-                let _ = writeln!(
-                    output,
-                    "Next step: run `rocm` and choose Install ROCm, or ask to install TheRock into a folder you choose."
-                );
-            } else {
-                let _ = writeln!(
-                    output,
-                    "ROCm/TheRock: multiple installs found, but none is active"
-                );
-                let _ = writeln!(output, "Run `rocm runtimes list` to choose one.");
-            }
+            let _ = writeln!(output, "Folder: {}", root.display());
+        } else if manifests.len() == 1 {
+            let manifest = &manifests[0];
+            let _ = writeln!(
+                output,
+                "ROCm/TheRock: installed, but not selected as the active runtime"
+            );
+            let _ = writeln!(output, "Folder: {}", manifest.install_root.display());
+            let _ = writeln!(output, "Runtime: {}", manifest.runtime_key);
+            let _ = writeln!(
+                output,
+                "Next step: rocm runtimes activate {}",
+                manifest.runtime_key
+            );
+        } else if manifests.is_empty() {
+            let _ = writeln!(output, "ROCm/TheRock: not installed for ROCm CLI yet");
+            let _ = writeln!(
+                output,
+                "Next step: run `rocm` and choose Install ROCm, or ask to install TheRock into a folder you choose."
+            );
+        } else {
+            let _ = writeln!(
+                output,
+                "ROCm/TheRock: multiple installs found, but none is active"
+            );
+            let _ = writeln!(output, "Run `rocm runtimes list` to choose one.");
         }
     }
 
@@ -1032,7 +1029,7 @@ fn render_freeform_comfyui_status_answer(
 fn dispatch(cli: Cli) -> Result<()> {
     if !matches!(
         cli.command,
-        Some(Command::Update { .. }) | Some(Command::Bootstrap { .. })
+        Some(Command::Update { .. } | Command::Bootstrap { .. })
     ) {
         refresh_startup_update_check_quietly();
     }
@@ -1128,7 +1125,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                     "{}",
                     render_chat_prompt_text(
                         &paths,
-                        provider.map(provider_name).unwrap_or("local"),
+                        provider.map_or("local", provider_name),
                         model.as_deref(),
                         &prompt,
                         tools
@@ -1136,7 +1133,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 ),
                 None => print!(
                     "{}",
-                    render_chat_text(&paths, provider.map(provider_name).unwrap_or("local"))?
+                    render_chat_text(&paths, provider.map_or("local", provider_name))?
                 ),
             }
             Ok(())
@@ -1283,18 +1280,17 @@ fn dispatch(cli: Cli) -> Result<()> {
                     "`rocm logs` accepts either --search <query> or a positional query, not both"
                 );
             }
-            match service {
-                Some(service_id) => print!("{}", render_service_logs_text(&paths, &service_id)?),
-                None => {
-                    let query = if search.is_empty() {
-                        (!query.is_empty()).then(|| query.join(" "))
-                    } else {
-                        Some(search.join(" "))
-                    };
-                    match query.as_deref() {
-                        Some(query) => print!("{}", render_logs_browser_text(&paths, Some(query))),
-                        None => print!("{}", render_logs_text(&paths)),
-                    }
+            if let Some(service_id) = service {
+                print!("{}", render_service_logs_text(&paths, &service_id)?);
+            } else {
+                let query = if search.is_empty() {
+                    (!query.is_empty()).then(|| query.join(" "))
+                } else {
+                    Some(search.join(" "))
+                };
+                match query.as_deref() {
+                    Some(query) => print!("{}", render_logs_browser_text(&paths, Some(query))),
+                    None => print!("{}", render_logs_text(&paths)),
                 }
             }
             Ok(())
@@ -1390,7 +1386,7 @@ fn builtin_codex_bridge_engine_inventory() -> Vec<CodexBridgeEngine> {
         .collect()
 }
 
-fn builtin_engine_inventory() -> &'static [(&'static str, &'static str)] {
+const fn builtin_engine_inventory() -> &'static [(&'static str, &'static str)] {
     &[
         ("pytorch", "TheRock PyTorch local serving engine"),
         (
@@ -1564,14 +1560,13 @@ fn install(target: InstallTarget) -> Result<()> {
                 InstallFormat::Tarball => "tarball",
             };
             let version_selector = therock_install_version_selector(version, build_date)?;
-            let version_selector_display = version_selector
-                .as_ref()
-                .map(therock_install_version_selector_display)
-                .unwrap_or_else(|| "latest-compatible".to_owned());
+            let version_selector_display = version_selector.as_ref().map_or_else(
+                || "latest-compatible".to_owned(),
+                therock_install_version_selector_display,
+            );
             let prefix_display = prefix
                 .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "<managed>".to_owned());
+                .map_or_else(|| "<managed>".to_owned(), |path| path.display().to_string());
             match therock::install_sdk(
                 &paths,
                 &channel,
@@ -1794,13 +1789,7 @@ fn reconcile_driver_install(paths: &AppPaths) -> Result<String> {
     };
     let doctor = DoctorSummary::gather()?;
     let checks = passive_driver_checks();
-    reconcile_driver_install_state(
-        paths,
-        &mut state,
-        doctor.driver.clone(),
-        current_boot_id(),
-        checks,
-    )
+    reconcile_driver_install_state(paths, &mut state, doctor.driver, current_boot_id(), checks)
 }
 
 fn reconcile_driver_install_state(
@@ -1852,8 +1841,7 @@ fn render_driver_reconciliation(paths: &AppPaths, state: &DriverInstallState) ->
         "  executed_at_unix_ms: {}",
         state
             .executed_at_unix_ms
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "<not executed>".to_owned())
+            .map_or_else(|| "<not executed>".to_owned(), |value| value.to_string())
     );
     let _ = writeln!(output, "  reboot_required: {}", state.reboot_required);
     let _ = writeln!(output, "  reboot_observed: {}", state.reboot_observed);
@@ -1957,7 +1945,7 @@ fn passive_render_node_check() -> DriverPassiveCheck {
     let present = fs::read_dir("/dev/dri")
         .ok()
         .into_iter()
-        .flat_map(|entries| entries.filter_map(|entry| entry.ok()))
+        .flat_map(|entries| entries.filter_map(std::result::Result::ok))
         .any(|entry| {
             entry
                 .file_name()
@@ -2040,7 +2028,7 @@ struct DriverInstallError {
 }
 
 impl DriverInstallError {
-    fn new(source: anyhow::Error, executed: bool) -> Self {
+    const fn new(source: anyhow::Error, executed: bool) -> Self {
         Self { source, executed }
     }
 }
@@ -2555,7 +2543,7 @@ fn amdgpu_install_sles_rpm_url(repo_version_expr: &str, version_id: &str) -> Str
 fn dnf_repo_version_path(os_id: &str, version_id: &str) -> String {
     match (os_id, version_id) {
         ("rhel", "10.1" | "10.0") | ("ol", "10.1") => "10".to_owned(),
-        ("rhel", "8.10") | ("ol", "8.10") => "8".to_owned(),
+        ("rhel" | "ol", "8.10") => "8".to_owned(),
         _ => version_id.to_owned(),
     }
 }
@@ -2654,7 +2642,11 @@ fn render_driver_install_plan(plan: &DriverInstallPlan, yes: bool, dry_run: bool
     output
 }
 
-fn driver_plan_approval_label(plan: &DriverInstallPlan, yes: bool, dry_run: bool) -> &'static str {
+const fn driver_plan_approval_label(
+    plan: &DriverInstallPlan,
+    yes: bool,
+    dry_run: bool,
+) -> &'static str {
     if !plan.supported || !plan.mutating || dry_run {
         "not required"
     } else if yes {
@@ -2664,7 +2656,7 @@ fn driver_plan_approval_label(plan: &DriverInstallPlan, yes: bool, dry_run: bool
     }
 }
 
-fn empty_as_unknown(value: &str) -> &str {
+const fn empty_as_unknown(value: &str) -> &str {
     if value.is_empty() { "<unknown>" } else { value }
 }
 
@@ -2785,7 +2777,7 @@ fn engines(command: EnginesCommand) -> Result<()> {
                     "engine",
                     "engine_install",
                     "info",
-                    format!("ready engine={} runtime_id={}", engine, runtime_id),
+                    format!("ready engine={engine} runtime_id={runtime_id}"),
                     None,
                 );
                 return Ok(());
@@ -2797,7 +2789,7 @@ fn engines(command: EnginesCommand) -> Result<()> {
                 EngineMethod::Install,
                 &InstallRequest {
                     runtime_id: runtime_id.clone(),
-                    python_version: python_version.clone(),
+                    python_version,
                     reinstall,
                     env_root: env_root.clone(),
                 },
@@ -2812,7 +2804,9 @@ fn engines(command: EnginesCommand) -> Result<()> {
             for warning in response.warnings {
                 println!("  warning: {warning}");
             }
-            if response.managed_env != Some(false) {
+            if response.managed_env == Some(false) {
+                println!("  note: external runtime");
+            } else {
                 let engine_config = config.engine_config_mut(&engine);
                 engine_config.last_installed_runtime_id = Some(runtime_id.clone());
                 engine_config.last_installed_env_id = Some(response.env_id.clone());
@@ -2825,8 +2819,6 @@ fn engines(command: EnginesCommand) -> Result<()> {
                 }
                 config.save(&paths)?;
                 let _ = seeded_preference;
-            } else {
-                println!("  note: external runtime");
             }
             record_cli_audit_event(
                 &paths,
@@ -3287,8 +3279,10 @@ fn serve_model_ref_for_engine(
 ) -> String {
     recipe
         .filter(|recipe| model_recipe_supports_engine(recipe, selected_engine))
-        .map(|recipe| recipe.canonical_model_id.clone())
-        .unwrap_or_else(|| model.to_owned())
+        .map_or_else(
+            || model.to_owned(),
+            |recipe| recipe.canonical_model_id.clone(),
+        )
 }
 
 fn serve_engine_selection_line(selection: &ServeEngineSelection) -> String {
@@ -3407,7 +3401,7 @@ fn serve(
         &ResolveModelRequest {
             model_ref: engine_model_ref,
             runtime_id: resolved_selection.runtime_id.clone(),
-            device_policy: Some(device_policy.clone()),
+            device_policy: Some(device_policy),
             recipe_override: None,
             engine_recipe,
         },
@@ -4074,8 +4068,7 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                     result
                         .removed_install_root
                         .as_ref()
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_else(|| "none".to_owned())
+                        .map_or_else(|| "none".to_owned(), |path| path.display().to_string())
                 ),
                 None,
             );
@@ -4569,9 +4562,7 @@ fn normalize_path_for_compare(path: &Path) -> PathBuf {
     if path.is_absolute() {
         return path.to_path_buf();
     }
-    std::env::current_dir()
-        .map(|cwd| cwd.join(path))
-        .unwrap_or_else(|_| path.to_path_buf())
+    std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
 }
 
 fn import_runtime_manifest(
@@ -5715,7 +5706,15 @@ pub(crate) fn render_chat_prompt_result_with_progress(
                 rocm_tools: false,
             },
         )?;
-        if !follow_up.tool_calls.is_empty() {
+        if follow_up.tool_calls.is_empty() {
+            let follow_up_content = visible_chat_content(&follow_up.content);
+            if local_follow_up_content_is_final(&follow_up) && !follow_up_content.trim().is_empty()
+            {
+                let _ = writeln!(output);
+                let _ = writeln!(output, "Assistant after ROCm checks");
+                let _ = writeln!(output, "{}", follow_up_content.trim());
+            }
+        } else {
             let _ = writeln!(output);
             let _ = writeln!(
                 output,
@@ -5725,14 +5724,6 @@ pub(crate) fn render_chat_prompt_result_with_progress(
                 output,
                 "rocm-cli stopped there so the answer is not based on another guess. Nothing was changed."
             );
-        } else {
-            let follow_up_content = visible_chat_content(&follow_up.content);
-            if local_follow_up_content_is_final(&follow_up) && !follow_up_content.trim().is_empty()
-            {
-                let _ = writeln!(output);
-                let _ = writeln!(output, "Assistant after ROCm checks");
-                let _ = writeln!(output, "{}", follow_up_content.trim());
-            }
         }
     } else if tool_result.read_only_tool_error {
         let _ = writeln!(output);
@@ -5772,8 +5763,7 @@ fn latest_user_chat_message(prompt: &str) -> &str {
     const MARKER: &str = "\nNew message:\n";
     prompt
         .rfind(MARKER)
-        .map(|index| &prompt[index + MARKER.len()..])
-        .unwrap_or(prompt)
+        .map_or(prompt, |index| &prompt[index + MARKER.len()..])
         .trim()
 }
 
@@ -6713,37 +6703,34 @@ pub(crate) fn local_chat_service_needed_text(
         "Recommended path:\n  run `rocm`, choose Start a local model, use the recommended assistant model, then start it"
     );
     let _ = writeln!(output);
-    match model.filter(|value| !value.trim().is_empty()) {
-        Some(model) => {
-            let args = vec![
-                "serve".to_owned(),
-                model.to_owned(),
-                "--device".to_owned(),
-                "gpu_required".to_owned(),
-                "--managed".to_owned(),
-            ];
-            let _ = writeln!(
-                output,
-                "Advanced manual command for the selected model:\n  {}",
-                format_structured_tool_call("rocm", &args)
-            );
-        }
-        None => {
-            let example_args = vec![
-                "serve".to_owned(),
-                providers::LEMONADE_ASSISTANT_MODEL_ID.to_owned(),
-                "--engine".to_owned(),
-                "lemonade".to_owned(),
-                "--device".to_owned(),
-                "gpu_required".to_owned(),
-                "--managed".to_owned(),
-            ];
-            let _ = writeln!(
-                output,
-                "Advanced manual command for the recommended assistant model:\n  {}",
-                format_structured_tool_call("rocm", &example_args)
-            );
-        }
+    if let Some(model) = model.filter(|value| !value.trim().is_empty()) {
+        let args = vec![
+            "serve".to_owned(),
+            model.to_owned(),
+            "--device".to_owned(),
+            "gpu_required".to_owned(),
+            "--managed".to_owned(),
+        ];
+        let _ = writeln!(
+            output,
+            "Advanced manual command for the selected model:\n  {}",
+            format_structured_tool_call("rocm", &args)
+        );
+    } else {
+        let example_args = vec![
+            "serve".to_owned(),
+            providers::LEMONADE_ASSISTANT_MODEL_ID.to_owned(),
+            "--engine".to_owned(),
+            "lemonade".to_owned(),
+            "--device".to_owned(),
+            "gpu_required".to_owned(),
+            "--managed".to_owned(),
+        ];
+        let _ = writeln!(
+            output,
+            "Advanced manual command for the recommended assistant model:\n  {}",
+            format_structured_tool_call("rocm", &example_args)
+        );
     }
     let mut chat_args = vec!["chat".to_owned()];
     if rocm_tools {
@@ -6839,7 +6826,7 @@ fn append_chat_tool_results(
             }
         } else {
             report_chat_tool_progress(progress, &format!("Review needed: {label}."));
-            let _ = writeln!(output, "  {}: needs your review", label);
+            let _ = writeln!(output, "  {label}: needs your review");
             let _ = writeln!(
                 output,
                 "    not run: review the approval card before anything runs"
@@ -7101,7 +7088,7 @@ fn validate_chat_port_status_tool_call(call: &providers::ChatToolCall) -> Result
     let Some(port) = object.get("port").and_then(serde_json::Value::as_u64) else {
         bail!("ROCm tool `port_status` requires integer `port`");
     };
-    if !(1..=u16::MAX as u64).contains(&port) {
+    if !(1..=u64::from(u16::MAX)).contains(&port) {
         bail!("ROCm tool `port_status` argument `port` must be between 1 and 65535");
     }
     Ok(())
@@ -7553,10 +7540,10 @@ fn deterministic_rocm_tool_summary(tool_text: &str) -> Option<String> {
             .filter(|value| value != "<unset>" && value != "<unknown>");
         let mut detail = "installed and active for ROCm CLI".to_owned();
         if let Some(family) = family {
-            detail.push_str(&format!(" ({family})"));
+            let _ = write!(detail, " ({family})");
         }
         if let Some(version) = version {
-            detail.push_str(&format!(", {version}"));
+            let _ = write!(detail, ", {version}");
         }
         lines.push(format!("  ROCm/TheRock: {detail}"));
         if let Some(root) = chat_tool_value(tool_text, "active_runtime_root")
@@ -7651,8 +7638,7 @@ fn deterministic_model_tool_summary(tool_text: &str) -> Option<String> {
             "    Fit: needs about {} GPU memory.",
             recipe
                 .min_gpu_mem_gib
-                .map(|value| format!("{value} GiB"))
-                .unwrap_or_else(|| "unknown".to_owned())
+                .map_or_else(|| "unknown".to_owned(), |value| format!("{value} GiB"))
         ));
         lines.push(format!(
             "    Engine: {}",
@@ -7685,9 +7671,7 @@ fn deterministic_model_tool_summary(tool_text: &str) -> Option<String> {
         lines.push(format!(
             "    Fit: asks for {}; this can be tight on APUs and depends on available shared GPU memory.",
             recipe
-                .min_gpu_mem_gib
-                .map(|value| format!("{value} GiB"))
-                .unwrap_or_else(|| "unknown GPU memory".to_owned())
+                .min_gpu_mem_gib.map_or_else(|| "unknown GPU memory".to_owned(), |value| format!("{value} GiB"))
         ));
         lines.push(format!(
             "    Engines: {}",
@@ -7703,10 +7687,10 @@ fn deterministic_model_tool_summary(tool_text: &str) -> Option<String> {
             format!(
                 "{} asks for {}",
                 recipe.canonical_id,
-                recipe
-                    .min_gpu_mem_gib
-                    .map(|value| format!("{value} GiB"))
-                    .unwrap_or_else(|| "more GPU memory".to_owned())
+                recipe.min_gpu_mem_gib.map_or_else(
+                    || "more GPU memory".to_owned(),
+                    |value| format!("{value} GiB")
+                )
             )
         })
         .collect::<Vec<_>>();
@@ -7824,7 +7808,7 @@ fn deterministic_engine_fit_summary(recipe: &DeterministicModelRecipe, engine: &
         .engine_statuses
         .iter()
         .find(|status| status.starts_with(&format!("{engine}:")))
-        .map(|status| status.as_str());
+        .map(std::string::String::as_str);
     match status {
         Some(status) if status.contains("unsupported_native_windows") => {
             format!("{engine}: WSL/Linux only on Windows")
@@ -8053,7 +8037,7 @@ fn deterministic_engine_inventory_tool_summary(tool_text: &str) -> Option<String
             empty_as_unknown(&row.runtime)
         );
         if !row.note.trim().is_empty() {
-            line.push_str(&format!(" ({})", row.note.trim()));
+            let _ = write!(line, " ({})", row.note.trim());
         }
         line.push('.');
         lines.push(line);
@@ -8252,11 +8236,11 @@ fn run_internal_mcp_call(
             let action = chat_rocm_command_action(&call)?;
             let output = match action {
                 ChatRocmCommandAction::ReadOnly(args) => {
-                    run_rocm_command_for_paths(paths, &args, Duration::from_secs(120))?
+                    run_rocm_command_for_paths(paths, &args, Duration::from_mins(2))?
                 }
                 ChatRocmCommandAction::Approval { args, .. } if allow_mutation => {
                     let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-                    run_rocm_capture_for_paths(paths, &refs, Duration::from_secs(120))?
+                    run_rocm_capture_for_paths(paths, &refs, Duration::from_mins(2))?
                 }
                 ChatRocmCommandAction::Approval { .. } => {
                     bail!("rocm_command changes local ROCm state and needs approval")
@@ -8270,7 +8254,7 @@ fn run_internal_mcp_call(
         }
         "update_check" => {
             let output =
-                run_rocm_command_for_paths(paths, &["update".to_owned()], Duration::from_secs(60))?;
+                run_rocm_command_for_paths(paths, &["update".to_owned()], Duration::from_mins(1))?;
             Ok(internal_mcp_tool_result_from_command(
                 "Ran `rocm update`.",
                 output,
@@ -8279,7 +8263,7 @@ fn run_internal_mcp_call(
         }
         "install_sdk_dry_run" => {
             let args = internal_mcp_install_sdk_args(&arguments, true)?;
-            let output = run_rocm_command_for_paths(paths, &args, Duration::from_secs(120))?;
+            let output = run_rocm_command_for_paths(paths, &args, Duration::from_mins(2))?;
             Ok(internal_mcp_tool_result_from_command(
                 "Ran `rocm install sdk --dry-run`.",
                 output,
@@ -8292,7 +8276,7 @@ fn run_internal_mcp_call(
             let args = rocm_chat_tool_requested_args(&call)
                 .with_context(|| format!("MCP tool `{name}` is missing required arguments"))?;
             let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = run_rocm_capture_for_paths(paths, &refs, Duration::from_secs(120))?;
+            let output = run_rocm_capture_for_paths(paths, &refs, Duration::from_mins(2))?;
             Ok(internal_mcp_tool_result_from_command(
                 "Ran approved `rocm` command.",
                 output,
@@ -8676,7 +8660,7 @@ fn run_chat_read_only_tool(
             let ChatRocmCommandAction::ReadOnly(args) = action else {
                 bail!("assistant read-only path cannot run mutating rocm_command");
             };
-            let output = run_rocm_command_for_paths(paths, &args, Duration::from_secs(120))?;
+            let output = run_rocm_command_for_paths(paths, &args, Duration::from_mins(2))?;
             Ok(internal_mcp_tool_result_from_command(
                 "Ran `rocm` command.",
                 output,
@@ -8685,7 +8669,7 @@ fn run_chat_read_only_tool(
         }
         "update_check" => {
             let output =
-                run_rocm_command_for_paths(paths, &["update".to_owned()], Duration::from_secs(60))?;
+                run_rocm_command_for_paths(paths, &["update".to_owned()], Duration::from_mins(1))?;
             Ok(internal_mcp_tool_result_from_command(
                 "Ran `rocm update`.",
                 output,
@@ -8695,7 +8679,7 @@ fn run_chat_read_only_tool(
         "install_sdk_dry_run" => {
             let arguments = internal_mcp_arguments(call.arguments.clone());
             let args = internal_mcp_install_sdk_args(&arguments, true)?;
-            let output = run_rocm_command_for_paths(paths, &args, Duration::from_secs(120))?;
+            let output = run_rocm_command_for_paths(paths, &args, Duration::from_mins(2))?;
             Ok(internal_mcp_tool_result_from_command(
                 "Ran `rocm install sdk --dry-run`.",
                 output,
@@ -8714,23 +8698,21 @@ fn run_chat_path_exists_tool(call: &providers::ChatToolCall) -> Result<serde_jso
     let path = json_string(object, "path").context("path_exists requires path")?;
     let path = Path::new(&path);
     let metadata = path.metadata().ok();
-    let path_kind = metadata
-        .as_ref()
-        .map(|metadata| {
-            if metadata.is_dir() {
-                "directory"
-            } else if metadata.is_file() {
-                "file"
-            } else {
-                "other"
-            }
-        })
-        .unwrap_or("missing");
+    let path_kind = metadata.as_ref().map_or("missing", |metadata| {
+        if metadata.is_dir() {
+            "directory"
+        } else if metadata.is_file() {
+            "file"
+        } else {
+            "other"
+        }
+    });
     let parent = path.parent();
     let parent_exists = parent.is_some_and(Path::exists);
-    let parent_display = parent
-        .map(|parent| parent.display().to_string())
-        .unwrap_or_else(|| "<none>".to_owned());
+    let parent_display = parent.map_or_else(
+        || "<none>".to_owned(),
+        |parent| parent.display().to_string(),
+    );
     let text = format!(
         "path: {}\nexists: {}\nkind: {}\nparent: {}\nparent_exists: {}",
         path.display(),
@@ -8852,7 +8834,7 @@ fn mcp_tool_result_is_error(value: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
-fn chat_read_only_tool_status_label(is_error: bool) -> &'static str {
+const fn chat_read_only_tool_status_label(is_error: bool) -> &'static str {
     if is_error {
         "reported an error"
     } else {
@@ -9315,10 +9297,10 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
 }
 
 fn model_recipe_memory_label(recipe: &ModelRecipeRecord) -> String {
-    recipe
-        .min_gpu_mem_gb
-        .map(|value| format!("{value} GiB GPU"))
-        .unwrap_or_else(|| "no GPU minimum".to_owned())
+    recipe.min_gpu_mem_gb.map_or_else(
+        || "no GPU minimum".to_owned(),
+        |value| format!("{value} GiB GPU"),
+    )
 }
 
 fn model_recipe_gpu_fit_label(
@@ -9326,7 +9308,7 @@ fn model_recipe_gpu_fit_label(
     aggregate_gpu_vram_gib: Option<f64>,
 ) -> &'static str {
     match (recipe.min_gpu_mem_gb, aggregate_gpu_vram_gib) {
-        (Some(required), Some(available)) if available >= required as f64 => "fits this GPU",
+        (Some(required), Some(available)) if available >= f64::from(required) => "fits this GPU",
         (Some(_), Some(_)) => "needs a larger GPU",
         (Some(_), None) => "GPU fit unknown",
         (None, _) => "fits",
@@ -9362,10 +9344,10 @@ pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
         } else {
             recipe.preferred_engines.join(", ")
         };
-        let memory = recipe
-            .min_gpu_mem_gb
-            .map(|value| format!("{value} GiB"))
-            .unwrap_or_else(|| "<not required>".to_owned());
+        let memory = recipe.min_gpu_mem_gb.map_or_else(
+            || "<not required>".to_owned(),
+            |value| format!("{value} GiB"),
+        );
         let _ = writeln!(
             output,
             "  {} aliases=[{}] task={} dtype={} device={} min_gpu_mem={} engines=[{}]",
@@ -9428,8 +9410,7 @@ fn append_model_recipe_metadata_lines(
         "      recommended_system_ram: {}",
         recipe
             .recommended_system_ram_gb
-            .map(|value| format!("{value} GiB"))
-            .unwrap_or_else(|| "<unknown>".to_owned())
+            .map_or_else(|| "<unknown>".to_owned(), |value| format!("{value} GiB"))
     );
     let _ = writeln!(
         output,
@@ -9448,20 +9429,18 @@ fn append_model_engine_recipe_settings_lines(output: &mut String, recipe: &Model
     }
     let _ = writeln!(
         output,
-        "      engine_recipes_policy: protocol_contract={} selected-engine hint is passed to adapters during model resolution and required flags are forwarded at launch",
-        ENGINE_RECIPE_CONTRACT_VERSION
+        "      engine_recipes_policy: protocol_contract={ENGINE_RECIPE_CONTRACT_VERSION} selected-engine hint is passed to adapters during model resolution and required flags are forwarded at launch"
     );
     for engine_recipe in &recipe.engine_recipes {
         let required_flags = format_list_or_none(&engine_recipe.required_flags);
         let parser_settings = format_string_map_or_none(&engine_recipe.parser_settings);
-        let endpoint = engine_recipe
-            .preferred_endpoint
-            .as_ref()
-            .map(|endpoint| {
+        let endpoint = engine_recipe.preferred_endpoint.as_ref().map_or_else(
+            || "<none>".to_owned(),
+            |endpoint| {
                 let settings = format_string_map_or_none(&endpoint.settings);
                 format!("mode={} settings=[{}]", endpoint.endpoint_mode, settings)
-            })
-            .unwrap_or_else(|| "<none>".to_owned());
+            },
+        );
         let unsupported = if engine_recipe.unsupported_combinations.is_empty() {
             "<none>".to_owned()
         } else {
@@ -9550,8 +9529,7 @@ fn append_model_artifact_lines(
         };
         let size = artifact
             .size_bytes
-            .map(format_bytes)
-            .unwrap_or_else(|| "<unknown>".to_owned());
+            .map_or_else(|| "<unknown>".to_owned(), format_bytes);
         let gated = artifact.gated.unwrap_or(false);
         let _ = writeln!(
             output,
@@ -9644,13 +9622,13 @@ fn append_model_host_ram_fit_lines(
     };
 
     match host_ram_gib {
-        Some(available) if available >= required as f64 => {
+        Some(available) if available >= f64::from(required) => {
             let _ = writeln!(output, "      system_ram_fit: supported");
             let _ = writeln!(
                 output,
                 "      system_ram_reason: host RAM {} meets recipe recommendation {}",
                 format_gib(available),
-                format_gib(required as f64)
+                format_gib(f64::from(required))
             );
         }
         Some(available) => {
@@ -9659,12 +9637,12 @@ fn append_model_host_ram_fit_lines(
                 output,
                 "      system_ram_reason: host RAM {} is below recipe recommendation {}",
                 format_gib(available),
-                format_gib(required as f64)
+                format_gib(f64::from(required))
             );
             let _ = writeln!(
                 output,
                 "      system_ram_action: consider a smaller recipe or a host with at least {} system RAM for smoother serving",
-                format_gib(required as f64)
+                format_gib(f64::from(required))
             );
         }
         None => {
@@ -9703,13 +9681,13 @@ fn append_model_fit_lines(
             );
         }
         Some(required) => match aggregate_gpu_vram_gib {
-            Some(available) if available >= required as f64 => {
+            Some(available) if available >= f64::from(required) => {
                 let _ = writeln!(output, "      gpu_fit: supported");
                 let _ = writeln!(
                     output,
                     "      reason: aggregate GPU VRAM {} meets recipe minimum {}",
                     format_gib(available),
-                    format_gib(required as f64)
+                    format_gib(f64::from(required))
                 );
                 let _ = writeln!(
                     output,
@@ -9724,13 +9702,13 @@ fn append_model_fit_lines(
                     output,
                     "      reason: aggregate GPU VRAM {} is below recipe minimum {}",
                     format_gib(available),
-                    format_gib(required as f64)
+                    format_gib(f64::from(required))
                 );
                 let _ = writeln!(
                     output,
                     "      action: choose a recipe with min_gpu_mem <= {} or use a GPU with at least {} before serving",
                     format_gib(available),
-                    format_gib(required as f64)
+                    format_gib(f64::from(required))
                 );
                 append_manual_alternative_lines(output, recipe, aggregate_gpu_vram_gib);
             }
@@ -9788,10 +9766,10 @@ fn manual_alternative_recommendations(
             format!(
                 "{} ({})",
                 candidate_ref,
-                candidate
-                    .min_gpu_mem_gb
-                    .map(|value| format!("{} min GPU", format_gib(value as f64)))
-                    .unwrap_or_else(|| "CPU-only".to_owned())
+                candidate.min_gpu_mem_gb.map_or_else(
+                    || "CPU-only".to_owned(),
+                    |value| format!("{} min GPU", format_gib(f64::from(value)))
+                )
             )
         })
         .collect::<Vec<_>>();
@@ -9813,7 +9791,7 @@ fn recipe_is_manual_fit(recipe: &ModelRecipeRecord, aggregate_gpu_vram_gib: Opti
     match recipe.min_gpu_mem_gb {
         None => true,
         Some(required) => {
-            aggregate_gpu_vram_gib.is_some_and(|available| available >= required as f64)
+            aggregate_gpu_vram_gib.is_some_and(|available| available >= f64::from(required))
         }
     }
 }
@@ -9886,7 +9864,7 @@ fn append_model_engine_support_lines(
 }
 
 #[allow(dead_code)]
-fn model_registry_adapter_availability_note(engine: &str) -> Option<&'static str> {
+const fn model_registry_adapter_availability_note(engine: &str) -> Option<&'static str> {
     if rocm_core::runtime_is_windows() && engine.eq_ignore_ascii_case("vllm") {
         Some(
             "runtime_status=unsupported_native_windows reason=native Windows skipped; use WSL/Linux vLLM ROCm; gpu_execution_required=true; run /engine for adapter details",
@@ -9909,8 +9887,7 @@ fn recipe_display_ref(recipe: &ModelRecipeRecord) -> &str {
     recipe
         .aliases
         .first()
-        .map(String::as_str)
-        .unwrap_or(recipe.canonical_model_id.as_str())
+        .map_or(recipe.canonical_model_id.as_str(), String::as_str)
 }
 
 #[allow(dead_code)]
@@ -9918,8 +9895,7 @@ fn preferred_engine_action_target(recipe: &ModelRecipeRecord) -> &str {
     recipe
         .preferred_engines
         .first()
-        .map(String::as_str)
-        .unwrap_or("<engine>")
+        .map_or("<engine>", String::as_str)
 }
 
 #[allow(dead_code)]
@@ -10956,8 +10932,7 @@ fn format_cli_lifecycle_tail_line(line: &str) -> String {
     let action = lifecycle_field(line, "action").unwrap_or("event");
     let message = line
         .split_once(" message=")
-        .map(|(_, message)| message)
-        .unwrap_or(line)
+        .map_or(line, |(_, message)| message)
         .trim();
     let label = lifecycle_event_label(category, action);
     if level == "info" {
@@ -11052,8 +11027,7 @@ fn append_update_surfaces(output: &mut String) {
         .join(",");
     let _ = writeln!(
         output,
-        "    engines: status=package_managed packaged=[{}] reason=first-party engine binaries update with the rocm-cli package; data-dir plugins are user-managed",
-        engine_ids
+        "    engines: status=package_managed packaged=[{engine_ids}] reason=first-party engine binaries update with the rocm-cli package; data-dir plugins are user-managed"
     );
     match load_model_recipe_registry() {
         Ok(registry) => match registry.source {
@@ -11094,8 +11068,7 @@ fn append_update_surfaces(output: &mut String) {
     };
     let _ = writeln!(
         output,
-        "    runtimes: status={} reason=TheRock runtime update checks above are the only live update checks in this build",
-        runtime_status
+        "    runtimes: status={runtime_status} reason=TheRock runtime update checks above are the only live update checks in this build"
     );
     let _ = writeln!(
         output,
@@ -11259,26 +11232,23 @@ pub(crate) fn render_automations_text(paths: &AppPaths, config: &RocmCliConfig) 
             "off"
         }
     );
-    match runtime_state.as_ref() {
-        Some(state) => {
-            let _ = writeln!(
-                output,
-                "  background service: {}",
-                if state.running { "running" } else { "stopped" }
-            );
-            let _ = writeln!(
-                output,
-                "  local event intake: {}",
-                state
-                    .local_webhook_endpoint
-                    .as_deref()
-                    .unwrap_or("disabled")
-            );
-        }
-        None => {
-            let _ = writeln!(output, "  background service: not running");
-            let _ = writeln!(output, "  local event intake: disabled");
-        }
+    if let Some(state) = runtime_state.as_ref() {
+        let _ = writeln!(
+            output,
+            "  background service: {}",
+            if state.running { "running" } else { "stopped" }
+        );
+        let _ = writeln!(
+            output,
+            "  local event intake: {}",
+            state
+                .local_webhook_endpoint
+                .as_deref()
+                .unwrap_or("disabled")
+        );
+    } else {
+        let _ = writeln!(output, "  background service: not running");
+        let _ = writeln!(output, "  local event intake: disabled");
     }
     for watcher in builtin_watchers() {
         let runtime_snapshot = runtime_state.as_ref().and_then(|state| {
@@ -11350,8 +11320,7 @@ pub(crate) fn render_automations_text(paths: &AppPaths, config: &RocmCliConfig) 
                     .arguments
                     .get("artifact_max_bytes")
                     .and_then(serde_json::Value::as_u64)
-                    .map(format_bytes_for_user)
-                    .unwrap_or_else(|| "not set".to_owned());
+                    .map_or_else(|| "not set".to_owned(), format_bytes_for_user);
                 let _ = writeln!(output, "      download: approved up to {limit}");
             } else if proposal_kind(&proposal) == ProposalKind::PrefetchArtifact {
                 let _ = writeln!(output, "      download: not approved yet");
@@ -11502,7 +11471,7 @@ fn format_bytes_for_user(bytes: u64) -> String {
     }
 }
 
-fn watcher_mode_plain_label(mode: WatcherMode) -> &'static str {
+const fn watcher_mode_plain_label(mode: WatcherMode) -> &'static str {
     match mode {
         WatcherMode::Observe => "record only",
         WatcherMode::Propose => "ask before taking action",
@@ -11658,7 +11627,7 @@ pub(crate) fn render_sidebar_text(
         .iter()
         .filter(|watcher| config.watcher_enabled(watcher))
         .count();
-    let _ = writeln!(output, "Background checks: {}", enabled_watchers);
+    let _ = writeln!(output, "Background checks: {enabled_watchers}");
     let _ = writeln!(
         output,
         "Background helper: {}",
@@ -12029,7 +11998,7 @@ enum PlannerIntent {
 }
 
 impl PlannerIntent {
-    fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
             Self::Ask => "ask",
             Self::Serve => "serve",
@@ -12052,7 +12021,7 @@ struct PlannedToolCall {
 }
 
 impl PlannedToolCall {
-    fn read_only(title: &'static str, args: Vec<String>, reason: &'static str) -> Self {
+    const fn read_only(title: &'static str, args: Vec<String>, reason: &'static str) -> Self {
         Self {
             title,
             tool: "rocm",
@@ -12062,7 +12031,11 @@ impl PlannedToolCall {
         }
     }
 
-    fn approval_required(title: &'static str, args: Vec<String>, reason: &'static str) -> Self {
+    const fn approval_required(
+        title: &'static str,
+        args: Vec<String>,
+        reason: &'static str,
+    ) -> Self {
         Self {
             title,
             tool: "rocm",
@@ -12637,11 +12610,10 @@ fn resolve_freeform_plan_with_provider(
 }
 
 fn build_provider_planner_prompt(request: &str, deterministic: &StructuredRequestPlan) -> String {
-    let next_tool_call = deterministic
-        .actions
-        .last()
-        .map(|action| format_structured_tool_call(action.tool, &action.args))
-        .unwrap_or_else(|| "rocm doctor".to_owned());
+    let next_tool_call = deterministic.actions.last().map_or_else(
+        || "rocm doctor".to_owned(),
+        |action| format_structured_tool_call(action.tool, &action.args),
+    );
     format!(
         "You are resolving an ambiguous rocm-cli request. Return only JSON with this shape: \
 {{\"intent\":\"serve|install_sdk|install_driver|update|uninstall|inspect\",\
@@ -13046,7 +13018,10 @@ struct UninstallPlan {
 fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<UninstallPlan> {
     let mut plan = UninstallPlan::default();
 
-    if !options.keep_binaries {
+    if options.keep_binaries {
+        plan.skipped
+            .push("binary removal disabled by --keep-binaries".to_owned());
+    } else {
         let current_exe =
             daemon_binary_path().context("failed to discover current rocm executable")?;
         if is_dev_binary_layout(&current_exe) && !options.force_dev_binaries {
@@ -13069,9 +13044,6 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
                 });
             }
         }
-    } else {
-        plan.skipped
-            .push("binary removal disabled by --keep-binaries".to_owned());
     }
 
     for (keep, kind, path) in [
@@ -13230,7 +13202,7 @@ fn remove_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn engine_inventory() -> &'static [(&'static str, &'static str)] {
+pub(crate) const fn engine_inventory() -> &'static [(&'static str, &'static str)] {
     &[
         ("pytorch", "TheRock PyTorch local serving engine"),
         ("llama.cpp", "external GGUF serving engine for llama-server"),
@@ -13281,7 +13253,7 @@ fn infer_model_from_request(request: &str) -> Option<&str> {
     (!model.is_empty()).then_some(model)
 }
 
-fn provider_name(provider: Provider) -> &'static str {
+const fn provider_name(provider: Provider) -> &'static str {
     match provider {
         Provider::Local => "local",
         Provider::Anthropic => "anthropic",
@@ -13304,7 +13276,7 @@ fn resolve_engine_binary_path_with_paths(engine: &str, paths: &AppPaths) -> Resu
     engine_binary_path(engine)
 }
 
-fn missing_packaged_engine_reason(_engine: &str) -> Option<String> {
+const fn missing_packaged_engine_reason(_engine: &str) -> Option<String> {
     None
 }
 
@@ -13323,9 +13295,9 @@ where
 impl From<WatcherModeArg> for WatcherMode {
     fn from(value: WatcherModeArg) -> Self {
         match value {
-            WatcherModeArg::Observe => WatcherMode::Observe,
-            WatcherModeArg::Propose => WatcherMode::Propose,
-            WatcherModeArg::Contained => WatcherMode::Contained,
+            WatcherModeArg::Observe => Self::Observe,
+            WatcherModeArg::Propose => Self::Propose,
+            WatcherModeArg::Contained => Self::Contained,
         }
     }
 }
@@ -13443,13 +13415,9 @@ where
     if !status.success() && stdout.is_empty() {
         let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
         if stderr.is_empty() {
-            bail!("engine stdio process exited with status {}", status);
+            bail!("engine stdio process exited with status {status}");
         }
-        bail!(
-            "engine stdio process exited with status {}: {}",
-            status,
-            stderr
-        );
+        bail!("engine stdio process exited with status {status}: {stderr}");
     }
     let envelope: EngineResponseEnvelope = serde_json::from_slice(&stdout).with_context(|| {
         let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
@@ -13467,10 +13435,10 @@ where
     R: DeserializeOwned,
 {
     if !envelope.ok {
-        let error = envelope
-            .error
-            .map(|value| format!("{}: {}", value.code, value.message))
-            .unwrap_or_else(|| "unknown engine error".to_owned());
+        let error = envelope.error.map_or_else(
+            || "unknown engine error".to_owned(),
+            |value| format!("{}: {}", value.code, value.message),
+        );
         bail!("{error}");
     }
     let data = envelope
@@ -13485,6 +13453,7 @@ struct ScopedEnvVar {
 }
 
 impl ScopedEnvVar {
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     fn set_path(key: &'static str, value: &Path) -> Self {
         let previous = std::env::var_os(key);
         unsafe {
@@ -13495,6 +13464,7 @@ impl ScopedEnvVar {
 }
 
 impl Drop for ScopedEnvVar {
+    #[allow(unsafe_code)] // std::env::set_var/remove_var are unsafe in edition 2024
     fn drop(&mut self) {
         unsafe {
             match self.previous.as_ref() {
@@ -13711,7 +13681,7 @@ fn parse_device_policy(value: Option<&str>) -> Result<DevicePolicy> {
     }
 }
 
-fn device_policy_name(policy: &DevicePolicy) -> &'static str {
+const fn device_policy_name(policy: &DevicePolicy) -> &'static str {
     match policy {
         DevicePolicy::GpuRequired => "gpu_required",
         DevicePolicy::GpuPreferred => "gpu_preferred",
@@ -16754,13 +16724,13 @@ install therock";
         fs::create_dir_all(paths.data_dir.join("logs").join("cli"))?;
         fs::write(
             cli_lifecycle_log_path(&paths),
-            (0..10)
-                .map(|index| {
-                    format!(
-                        "{index} level=info category=runtime action=install_sdk message=event-{index}\n"
-                    )
-                })
-                .collect::<String>(),
+            (0..10).fold(String::new(), |mut acc, index| {
+                let _ = writeln!(
+                    acc,
+                    "{index} level=info category=runtime action=install_sdk message=event-{index}"
+                );
+                acc
+            }),
         )?;
         fs::write(
             paths
@@ -16908,7 +16878,7 @@ install therock";
 
         let mut log = String::new();
         for index in 1..=90 {
-            log.push_str(&format!("entry-{index:03}\n"));
+            let _ = writeln!(log, "entry-{index:03}");
         }
         fs::write(&record.log_path, log)?;
 
@@ -18042,9 +18012,7 @@ VERSION_ID="41"
 
         let finalized = finalize_successful_sdk_install(&paths)?
             .context("sdk install finalization should select the installed runtime")?;
-        let rebased_paths = paths
-            .clone()
-            .with_managed_root(manifest.install_root.clone(), false);
+        let rebased_paths = paths.with_managed_root(manifest.install_root.clone(), false);
         let config = RocmCliConfig::load(&rebased_paths)?;
 
         assert_eq!(finalized.runtime_key, manifest.runtime_key);
@@ -18232,7 +18200,7 @@ VERSION_ID="41"
         )?;
         let config = RocmCliConfig {
             active_runtime_key: Some(manifest.runtime_key.clone()),
-            default_runtime_id: Some(manifest.runtime_id.clone()),
+            default_runtime_id: Some(manifest.runtime_id),
             ..RocmCliConfig::default()
         };
 
@@ -18477,7 +18445,7 @@ VERSION_ID="41"
         let adopted = adopt_runtime_from_probe(
             &paths,
             AdoptRuntimeRequest {
-                python_executable: python_executable.clone(),
+                python_executable,
                 install_root: external_root.clone(),
                 runtime_id: "therock-release:gfx120X-all".to_owned(),
                 runtime_key: "adopted-release-pip-gfx120x-all-7-13-0".to_owned(),
@@ -18488,9 +18456,9 @@ VERSION_ID="41"
                 rocm_sdk_version: Some("7.13.0".to_owned()),
                 root_path: Some(sdk_root.clone()),
                 bin_path: Some(sdk_bin.clone()),
-                runtime_roots: vec![sdk_root.clone()],
+                runtime_roots: vec![sdk_root],
                 bin_paths: vec![sdk_bin.clone()],
-                library_paths: vec![sdk_bin.clone()],
+                library_paths: vec![sdk_bin],
                 resolved_libraries: vec![
                     therock::RocmSdkLibraryProbe {
                         shortname: "amdhip64".to_owned(),
@@ -19255,7 +19223,7 @@ VERSION_ID="41"
                 engine_runtime_status_label("sglang", &detect),
                 "unsupported_native_windows"
             );
-            let mut atom_detect = detect.clone();
+            let mut atom_detect = detect;
             atom_detect.runtime_kind = Some("external_atom".to_owned());
             atom_detect.available_devices[0].reason = Some(
                 "ATOM ROCm serving is supported by rocm-cli only on Linux/WSL; native Windows ATOM is not enabled. No CPU fallback is used."
@@ -19522,7 +19490,7 @@ VERSION_ID="41"
         )?;
         let config = RocmCliConfig {
             default_runtime_id: Some(manifest.runtime_id.clone()),
-            active_runtime_key: Some(manifest.runtime_key.clone()),
+            active_runtime_key: Some(manifest.runtime_key),
             previous_runtime_key: Some("older-release".to_owned()),
             ..RocmCliConfig::default()
         };

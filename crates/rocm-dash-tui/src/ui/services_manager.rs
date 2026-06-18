@@ -40,10 +40,10 @@ pub enum LifecycleAction {
 }
 
 impl LifecycleAction {
-    pub fn verb(self) -> &'static str {
+    pub const fn verb(self) -> &'static str {
         match self {
-            LifecycleAction::Stop => "stop",
-            LifecycleAction::Restart => "restart",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
         }
     }
 }
@@ -81,7 +81,9 @@ pub struct ServiceRow {
 }
 
 /// Build the sorted service list from the daemon-surfaced instances.
-pub fn service_rows(instances: &HashMap<String, Instance>) -> Vec<ServiceRow> {
+pub fn service_rows<S: ::std::hash::BuildHasher>(
+    instances: &HashMap<String, Instance, S>,
+) -> Vec<ServiceRow> {
     let mut rows: Vec<ServiceRow> = instances
         .values()
         .map(|i| ServiceRow {
@@ -96,14 +98,15 @@ pub fn service_rows(instances: &HashMap<String, Instance>) -> Vec<ServiceRow> {
     rows
 }
 
-/// Handle a key while the overlay is open. Mutates the overlay + the job model
-/// in place and returns the reducer side effects (e.g. `SpawnJob`) for the
+/// Handle a key while the overlay is open.
+///
+/// Mutates the overlay + the job model in place and returns the reducer side effects (e.g. `SpawnJob`) for the
 /// event loop to run through the job-bridge. Returns `true` (via the closed
 /// state) — the caller checks `state.services` for closure.
-pub fn on_key(
+pub fn on_key<S: ::std::hash::BuildHasher>(
     services: &mut Option<ServicesManagerState>,
     jobs: &mut State,
-    instances: &HashMap<String, Instance>,
+    instances: &HashMap<String, Instance, S>,
     key: KeyEvent,
 ) -> Vec<SideEffect> {
     let rows = service_rows(instances);
@@ -123,7 +126,7 @@ pub fn on_key(
                     return spawn_lifecycle(sm, jobs, pending);
                 }
             }
-            Some(ApprovalVerdict::Deny) | Some(ApprovalVerdict::Cancel) => {
+            Some(ApprovalVerdict::Deny | ApprovalVerdict::Cancel) => {
                 sm.approval = None;
             }
             None => {}
@@ -214,16 +217,15 @@ fn spawn_lifecycle(
 }
 
 fn port_str(port: Option<u16>) -> String {
-    port.map(|p| p.to_string())
-        .unwrap_or_else(|| "—".to_string())
+    port.map_or_else(|| "—".to_string(), |p| p.to_string())
 }
 
 /// Render the overlay (list, or the approval modal, or the job console).
-pub fn draw_services_manager(
+pub fn draw_services_manager<S: ::std::hash::BuildHasher>(
     f: &mut Frame,
     area: Rect,
     sm: &ServicesManagerState,
-    instances: &HashMap<String, Instance>,
+    instances: &HashMap<String, Instance, S>,
     jobs: &State,
     theme: &Theme,
 ) {
@@ -435,7 +437,10 @@ mod tests {
         term.draw(|f| draw_services_manager(f, f.area(), sm, insts, jobs, &theme))
             .unwrap();
         let buf = term.backend().buffer().clone();
-        buf.content().iter().map(|c| c.symbol()).collect()
+        buf.content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
     }
 
     #[test]

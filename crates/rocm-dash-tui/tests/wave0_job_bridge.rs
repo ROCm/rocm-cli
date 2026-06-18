@@ -132,7 +132,10 @@ fn render<F: FnOnce(&mut ratatui::Frame)>(cols: u16, rows: u16, draw: F) -> Stri
     let mut term = Terminal::new(backend).unwrap();
     term.draw(|f| draw(f)).unwrap();
     let buf = term.backend().buffer().clone();
-    buf.content().iter().map(|c| c.symbol()).collect()
+    buf.content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect()
 }
 
 #[test]
@@ -171,7 +174,7 @@ fn approval_snapshot_renders_request_and_buttons() {
         ],
     );
     let out = render(120, 26, |f| {
-        draw_approval(f, f.area(), &req, ApprovalChoice::Approve, &theme)
+        draw_approval(f, f.area(), &req, ApprovalChoice::Approve, &theme);
     });
 
     assert!(

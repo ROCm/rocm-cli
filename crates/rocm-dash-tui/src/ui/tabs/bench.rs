@@ -58,7 +58,7 @@ fn compute_rollup_height(n_groups: usize) -> u16 {
 
 /// Compact `tp·dtype` config token, e.g. `4·fp8`. `-` for missing parts.
 fn cfg_token(r: &PassNRollup) -> String {
-    let tp = r.tp.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
+    let tp = r.tp.map_or_else(|| "-".into(), |v| v.to_string());
     let dtype = r.dtype.as_deref().unwrap_or("-");
     format!("{tp}·{dtype}")
 }
@@ -147,7 +147,7 @@ fn draw_rollup(f: &mut Frame, area: Rect, rows: &[PassNRollup], theme: &Theme) {
 
 // ---------- wide rows table ----------
 
-fn verdict_label(r: &BenchmarkRow) -> &'static str {
+const fn verdict_label(r: &BenchmarkRow) -> &'static str {
     match row_verdict(r) {
         PassFail::Pass => "Pass",
         PassFail::Fail => "Fail",
@@ -155,7 +155,7 @@ fn verdict_label(r: &BenchmarkRow) -> &'static str {
     }
 }
 
-fn verdict_color(r: &BenchmarkRow, theme: &Theme) -> Color {
+const fn verdict_color(r: &BenchmarkRow, theme: &Theme) -> Color {
     match row_verdict(r) {
         PassFail::Pass => theme.ok,
         PassFail::Fail => theme.err,
@@ -247,7 +247,7 @@ fn draw_rows_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     {
         let cell = trunc_str(&r.cell, 10);
         let model = trunc_str(r.model.as_deref().unwrap_or("?"), 20);
-        let tp = r.tp.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
+        let tp = r.tp.map_or_else(|| "-".into(), |v| v.to_string());
         let dtype = trunc_str(r.dtype.as_deref().unwrap_or("-"), 6);
         let wall = match r.wall_s {
             Some(v) => format::duration(v),
@@ -257,8 +257,7 @@ fn draw_rows_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         let gtps = format::tps_opt(r.gen_tps);
         let mrun = r
             .max_running_reqs
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "-".into());
+            .map_or_else(|| "-".into(), |v| v.to_string());
         let v_text = verdict_label(r);
         let v_color = verdict_color(r, theme);
 
@@ -364,7 +363,13 @@ fn draw_sparkline(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 ///
 /// Row 0 of `rows_table_inner` is the header; rows 1..=visible are data
 /// lines mapped to `[start, end)` in order.
-fn row_hit(rows_table_inner: Rect, start: usize, end: usize, x: u16, y: u16) -> Option<usize> {
+const fn row_hit(
+    rows_table_inner: Rect,
+    start: usize,
+    end: usize,
+    x: u16,
+    y: u16,
+) -> Option<usize> {
     if rows_table_inner.width == 0 || rows_table_inner.height == 0 {
         return None;
     }
@@ -421,7 +426,7 @@ pub fn hit_test(area: Rect, x: u16, y: u16, state: &AppState) -> Option<KeyActio
     if target == state.bench_sel {
         Some(KeyAction::OpenDetail)
     } else {
-        let delta = target as isize - state.bench_sel as isize;
+        let delta = target.cast_signed() - state.bench_sel.cast_signed();
         Some(KeyAction::Move(delta))
     }
 }
@@ -476,6 +481,7 @@ pub fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
 // ---------- detail body ----------
 
+#[allow(clippy::ref_option)]
 fn fmt_opt<T: std::fmt::Display>(v: &Option<T>) -> String {
     match v {
         Some(x) => x.to_string(),
@@ -493,7 +499,7 @@ fn fmt_opt_f64_4(v: Option<f64>) -> String {
 /// SI-formatted optional `u32` counter (`-` when None).
 fn fmt_opt_u32_si(v: Option<u32>) -> String {
     match v {
-        Some(x) => format::si(x as f64),
+        Some(x) => format::si(f64::from(x)),
         None => "-".to_string(),
     }
 }
@@ -513,7 +519,7 @@ fn fmt_opt_f32_4(v: Option<f32>) -> String {
     }
 }
 
-fn fmt_opt_bool(v: Option<bool>) -> &'static str {
+const fn fmt_opt_bool(v: Option<bool>) -> &'static str {
     match v {
         Some(true) => "true",
         Some(false) => "false",
@@ -535,7 +541,7 @@ fn verdict_span(v: PassFail, theme: &Theme) -> Span<'static> {
 
 fn section_header(title: &str, theme: &Theme) -> Line<'static> {
     Line::from(Span::styled(
-        format!("— {} —", title),
+        format!("— {title} —"),
         Style::default()
             .fg(theme.muted)
             .add_modifier(Modifier::BOLD),
@@ -585,9 +591,7 @@ fn build_detail_lines(row: &BenchmarkRow, theme: &Theme) -> Vec<Line<'static>> {
     lines.push(section_header("performance", theme));
     lines.push(kv_line(
         "wall_s",
-        row.wall_s
-            .map(format::duration)
-            .unwrap_or_else(|| "-".into()),
+        row.wall_s.map_or_else(|| "-".into(), format::duration),
         theme,
     ));
     lines.push(kv_line("n_requests", fmt_opt_u32_si(row.n_requests), theme));
@@ -677,7 +681,7 @@ mod tests {
             model: None,
             engine: None,
             tp,
-            dtype: dtype.map(|s| s.to_string()),
+            dtype: dtype.map(std::string::ToString::to_string),
             concurrency: None,
             n_trials: 0,
             n_passed: 0,

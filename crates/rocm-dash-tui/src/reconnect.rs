@@ -15,7 +15,7 @@ impl Default for Backoff {
 }
 
 impl Backoff {
-    pub fn new(initial: Duration, max: Duration, factor: u32) -> Self {
+    pub const fn new(initial: Duration, max: Duration, factor: u32) -> Self {
         Self {
             current: initial,
             max,

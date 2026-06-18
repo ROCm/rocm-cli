@@ -1,5 +1,6 @@
-//! Chat tab — a TUI-local conversation surface. Phase 1 is render-only with a
-//! local echo backend; later phases wire a Rig-built agent behind the
+//! Chat tab — a TUI-local conversation surface.
+//!
+//! Phase 1 is render-only with a local echo backend; later phases wire a Rig-built agent behind the
 //! `AgentClient` trait. The transcript and input buffer are plain TUI state on
 //! `AppState` (`rocm-dash-core` carries no chat types).
 
@@ -142,7 +143,7 @@ fn consent_gate_lines<'a>(
                 )),
                 Line::raw(""),
                 Line::from(Span::styled(
-                    endpoint.clone().unwrap_or_else(|| "(unknown)".into()),
+                    endpoint.unwrap_or_else(|| "(unknown)".into()),
                     Style::default()
                         .fg(theme.accent)
                         .add_modifier(Modifier::BOLD),
@@ -181,9 +182,7 @@ fn consent_gate_lines<'a>(
                         Style::default().fg(theme.ok).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        endpoint
-                            .map(|e| format!("enable {e}"))
-                            .unwrap_or_else(|| "enable".into()),
+                        endpoint.map_or_else(|| "enable".into(), |e| format!("enable {e}")),
                         Style::default().fg(theme.fg),
                     ),
                 ]),
@@ -405,7 +404,10 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, f.area(), s, &s.theme)).unwrap();
         let buf = term.backend().buffer().clone();
-        buf.content().iter().map(|c| c.symbol()).collect()
+        buf.content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
     }
 
     #[test]

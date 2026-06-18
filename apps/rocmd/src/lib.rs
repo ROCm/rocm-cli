@@ -54,7 +54,7 @@ const GPU_THERMAL_HOTSPOT_PRESSURE_C: f64 = 95.0;
 const GPU_THERMAL_MEMORY_PRESSURE_C: f64 = 95.0;
 const GPU_MEMORY_VRAM_PRESSURE_PERCENT: f64 = 95.0;
 const AMD_SMI_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-const ARTIFACT_PREFETCH_TIMEOUT: Duration = Duration::from_secs(600);
+const ARTIFACT_PREFETCH_TIMEOUT: Duration = Duration::from_mins(10);
 
 #[derive(Parser, Debug)]
 #[command(name = "rocmd", about = "rocm-cli local supervisor", version)]
@@ -177,7 +177,7 @@ enum SandboxToolArg {
 }
 
 impl SandboxToolArg {
-    fn as_cli_value(self) -> &'static str {
+    const fn as_cli_value(self) -> &'static str {
         match self {
             Self::CheckUpdates => "check_updates",
             Self::DriverPlan => "driver_plan",
@@ -191,7 +191,7 @@ impl SandboxToolArg {
     }
 
     #[cfg(target_os = "linux")]
-    fn writes_data(self) -> bool {
+    const fn writes_data(self) -> bool {
         matches!(
             self,
             Self::RestartServer | Self::StopServer | Self::NotifyUser
@@ -199,7 +199,7 @@ impl SandboxToolArg {
     }
 
     #[cfg(target_os = "linux")]
-    fn writes_cache(self) -> bool {
+    const fn writes_cache(self) -> bool {
         matches!(self, Self::CheckUpdates | Self::PrefetchArtifact)
     }
 }
@@ -494,7 +494,7 @@ fn run_bubblewrap_sandbox(
         policy,
     );
 
-    let output = run_process_with_timeout(command, Duration::from_secs(60))?;
+    let output = run_process_with_timeout(command, Duration::from_mins(1))?;
     let value = parse_sandbox_child_output(output, "bubblewrap sandbox")?;
     record_sandbox_audit(paths, tool, "bubblewrap", true, service_id.as_deref())?;
     Ok(sandbox_report(tool, "bubblewrap", value))
@@ -552,14 +552,14 @@ fn run_sandbox_tool(
 ) -> Result<Value> {
     match tool {
         SandboxToolArg::CheckUpdates => {
-            let output = run_rocm_capture_for_paths(paths, &["update"], Duration::from_secs(60))?;
+            let output = run_rocm_capture_for_paths(paths, &["update"], Duration::from_mins(1))?;
             Ok(sandbox_check_updates_value(output))
         }
         SandboxToolArg::DriverPlan => {
             let output = run_rocm_capture_for_paths(
                 paths,
                 &["install", "driver", "--dkms", "--dry-run"],
-                Duration::from_secs(60),
+                Duration::from_mins(1),
             )?;
             Ok(sandbox_driver_plan_value(output))
         }
@@ -896,13 +896,13 @@ fn declared_source_policy_block_message(artifact: &ModelRecipeArtifactRecord) ->
 
     match source_policy.policy.as_str() {
         "direct_https_sha256" => {
-            if !artifact.uri.starts_with("https://") {
+            if artifact.uri.starts_with("https://") {
+                None
+            } else {
                 Some(
                     "recipe source policy direct_https_sha256 requires an HTTPS artifact URI"
                         .to_owned(),
                 )
-            } else {
-                None
             }
         }
         "huggingface_public" => {
@@ -1029,7 +1029,9 @@ fn download_artifact_bytes(
     }
     let response = request.call().map_err(|error| match error {
         ureq::Error::Status(status, _) => anyhow::anyhow!("HTTP {status} while fetching {url}"),
-        other => anyhow::anyhow!("HTTP request failed for {url}: {other}"),
+        other @ ureq::Error::Transport(_) => {
+            anyhow::anyhow!("HTTP request failed for {url}: {other}")
+        }
     })?;
     let mut reader = response.into_reader().take(max_bytes.saturating_add(1));
     let mut bytes = Vec::new();
@@ -1043,11 +1045,12 @@ fn download_artifact_bytes(
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
     let digest = Sha256::digest(bytes);
-    digest
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>()
+    digest.iter().fold(String::new(), |mut acc, byte| {
+        let _ = write!(acc, "{byte:02x}");
+        acc
+    })
 }
 
 fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -1369,7 +1372,7 @@ fn bridge_engine_inventory() -> Vec<CodexBridgeEngine> {
         .collect()
 }
 
-fn rocmd_engine_inventory() -> &'static [(&'static str, &'static str)] {
+const fn rocmd_engine_inventory() -> &'static [(&'static str, &'static str)] {
     &[
         ("pytorch", "default local serving engine"),
         (
@@ -2241,7 +2244,7 @@ struct CommandCapture {
 
 fn run_rocm_capture(args: &[&str]) -> Result<CommandCapture> {
     let paths = AppPaths::discover()?;
-    run_rocm_capture_for_paths(&paths, args, Duration::from_secs(120))
+    run_rocm_capture_for_paths(&paths, args, Duration::from_mins(2))
 }
 
 fn run_rocm_capture_for_paths(
@@ -2591,9 +2594,10 @@ fn stop_managed_service(paths: &AppPaths, service_id: &str) -> Result<Value> {
         if !seen_pids.insert(pid) {
             continue;
         }
-        match terminate_process(pid)? {
-            true => signaled_pids.push(pid),
-            false => skipped_pids.push(pid),
+        if terminate_process(pid)? {
+            signaled_pids.push(pid);
+        } else {
+            skipped_pids.push(pid);
         }
     }
     let force_signaled_pids = force_terminate_remaining_processes(&signaled_pids)?;
@@ -2891,58 +2895,55 @@ async fn run_daemon(
                 state.write(paths)?;
             }
             event = receive_local_webhook_event(&mut local_webhook_receiver) => {
-                match event {
-                    Some(event) => {
-                        let config = RocmCliConfig::load(paths)?;
-                        reconcile_watcher_snapshots(&config, &mut state);
+                if let Some(event) = event {
+                    let config = RocmCliConfig::load(paths)?;
+                    reconcile_watcher_snapshots(&config, &mut state);
+                    record_event(
+                        paths,
+                        &mut state,
+                        "rocmd",
+                        "info",
+                        "local_webhook_event",
+                        &format!(
+                            "received local webhook event kind={} watcher_hint={}; dispatching through existing watcher policy; webhook payload grants no new action",
+                            event.kind,
+                            event.watcher_hint.as_deref().unwrap_or("<none>")
+                        ),
+                        event.service_id.clone(),
+                    )?;
+                    if let Err(error) =
+                        evaluate_watchers_for_events(paths, &config, &mut state, &[event])
+                    {
                         record_event(
                             paths,
                             &mut state,
                             "rocmd",
-                            "info",
-                            "local_webhook_event",
+                            "error",
+                            "local_webhook_dispatch_failed",
                             &format!(
-                                "received local webhook event kind={} watcher_hint={}; dispatching through existing watcher policy; webhook payload grants no new action",
-                                event.kind,
-                                event.watcher_hint.as_deref().unwrap_or("<none>")
+                                "local webhook event could not be dispatched through watcher policy: {error}"
                             ),
-                            event.service_id.clone(),
-                        )?;
-                        if let Err(error) =
-                            evaluate_watchers_for_events(paths, &config, &mut state, &[event])
-                        {
-                            record_event(
-                                paths,
-                                &mut state,
-                                "rocmd",
-                                "error",
-                                "local_webhook_dispatch_failed",
-                                &format!(
-                                    "local webhook event could not be dispatched through watcher policy: {error}"
-                                ),
-                                None,
-                            )?;
-                        }
-                        state.last_tick_unix_ms = unix_time_millis();
-                        state.write(paths)?;
-                    }
-                    None => {
-                        local_webhook_receiver = None;
-                        state.local_webhook_endpoint = None;
-                        record_event(
-                            paths,
-                            &mut state,
-                            "rocmd",
-                            "warn",
-                            "local_webhook_stopped",
-                            "local webhook source stopped; automation daemon continues without webhook ingestion",
                             None,
                         )?;
-                        state.write(paths)?;
                     }
+                    state.last_tick_unix_ms = unix_time_millis();
+                    state.write(paths)?;
+                } else {
+                    local_webhook_receiver = None;
+                    state.local_webhook_endpoint = None;
+                    record_event(
+                        paths,
+                        &mut state,
+                        "rocmd",
+                        "warn",
+                        "local_webhook_stopped",
+                        "local webhook source stopped; automation daemon continues without webhook ingestion",
+                        None,
+                    )?;
+                    state.write(paths)?;
                 }
             }
-            _ = &mut shutdown => {
+            () = &mut shutdown => {
                 break;
             }
         }
@@ -3060,7 +3061,7 @@ fn supervise_service(
         engine.clone(),
         model_ref,
         canonical_model_id.clone(),
-        host.clone(),
+        host,
         port,
         "managed",
         std::process::id(),
@@ -3096,7 +3097,7 @@ fn supervise_service(
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_file_err))
         .spawn()
-        .with_context(|| format!("failed to spawn engine supervisor child for {}", engine))?;
+        .with_context(|| format!("failed to spawn engine supervisor child for {engine}"))?;
 
     record.engine_pid = Some(child.id());
     record.status = "running".to_owned();
@@ -3107,7 +3108,7 @@ fn supervise_service(
         &record.service_id,
         &record.host,
         record.port,
-        Duration::from_secs(180),
+        Duration::from_mins(3),
     ) {
         record.status = "ready".to_owned();
         record.write()?;
@@ -3724,7 +3725,7 @@ fn restricted_check_updates_result(value: &Value) -> Result<RestrictedCheckUpdat
     let exit_status = value
         .get("exit_status")
         .and_then(Value::as_i64)
-        .unwrap_or(if status == "error" { 1 } else { 0 });
+        .unwrap_or_else(|| i64::from(status == "error"));
     Ok(RestrictedCheckUpdatesResult {
         status,
         update_available,
@@ -3766,8 +3767,7 @@ fn therock_update_due(state: &AutomationRuntimeState, now: u128) -> bool {
     };
     snapshot
         .last_event_unix_ms
-        .map(|last_event| now.saturating_sub(last_event) >= THEROCK_UPDATE_INTERVAL_MS)
-        .unwrap_or(true)
+        .is_none_or(|last_event| now.saturating_sub(last_event) >= THEROCK_UPDATE_INTERVAL_MS)
 }
 
 fn gpu_metrics_due(state: &AutomationRuntimeState, now: u128) -> bool {
@@ -3780,8 +3780,7 @@ fn gpu_metrics_due(state: &AutomationRuntimeState, now: u128) -> bool {
     };
     snapshot
         .last_event_unix_ms
-        .map(|last_event| now.saturating_sub(last_event) >= GPU_METRICS_INTERVAL_MS)
-        .unwrap_or(true)
+        .is_none_or(|last_event| now.saturating_sub(last_event) >= GPU_METRICS_INTERVAL_MS)
 }
 
 fn gpu_thermal_protect_due(state: &AutomationRuntimeState, now: u128) -> bool {
@@ -3794,8 +3793,7 @@ fn gpu_thermal_protect_due(state: &AutomationRuntimeState, now: u128) -> bool {
     };
     snapshot
         .last_event_unix_ms
-        .map(|last_event| now.saturating_sub(last_event) >= GPU_METRICS_INTERVAL_MS)
-        .unwrap_or(true)
+        .is_none_or(|last_event| now.saturating_sub(last_event) >= GPU_METRICS_INTERVAL_MS)
 }
 
 fn handle_gpu_metrics_event(
@@ -3943,8 +3941,7 @@ fn gpu_pressure_event(now: u128, reading: GpuPressureReading) -> Option<Automati
     };
     let gpu_label = reading
         .gpu_index
-        .map(|gpu| format!("GPU {gpu}"))
-        .unwrap_or_else(|| "the GPU".to_owned());
+        .map_or_else(|| "the GPU".to_owned(), |gpu| format!("GPU {gpu}"));
     let unit = if metric_label == "VRAM use" {
         "%"
     } else {
@@ -4439,7 +4436,7 @@ fn restricted_driver_plan_result(value: &Value) -> Result<RestrictedDriverPlanRe
     let exit_status = value
         .get("exit_status")
         .and_then(Value::as_i64)
-        .unwrap_or(if status == "error" { 1 } else { 0 });
+        .unwrap_or_else(|| i64::from(status == "error"));
     Ok(RestrictedDriverPlanResult {
         status,
         exit_status,
@@ -4638,8 +4635,7 @@ fn server_recover_due(state: &AutomationRuntimeState, now: u128) -> bool {
     };
     snapshot
         .last_event_unix_ms
-        .map(|last_event| now.saturating_sub(last_event) >= SERVER_RECOVER_BACKOFF_MS)
-        .unwrap_or(true)
+        .is_none_or(|last_event| now.saturating_sub(last_event) >= SERVER_RECOVER_BACKOFF_MS)
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -4649,7 +4645,7 @@ enum WatcherPolicyAction {
     RunContained,
 }
 
-fn watcher_policy_action(watcher_id: &str, mode: WatcherMode) -> WatcherPolicyAction {
+const fn watcher_policy_action(watcher_id: &str, mode: WatcherMode) -> WatcherPolicyAction {
     match (watcher_id, mode) {
         (_, WatcherMode::Observe) => WatcherPolicyAction::Observe,
         (_, WatcherMode::Propose) => WatcherPolicyAction::QueueProposal,
@@ -4841,13 +4837,12 @@ fn record_event(
             category: "automation".to_owned(),
             actor: audit_watcher_id
                 .as_deref()
-                .map(|id| format!("watcher:{id}"))
-                .unwrap_or_else(|| "rocmd".to_owned()),
+                .map_or_else(|| "rocmd".to_owned(), |id| format!("watcher:{id}")),
             level: level.to_owned(),
             action: action.to_owned(),
             message: message.to_owned(),
             watcher_id: audit_watcher_id,
-            service_id: event.service_id.clone(),
+            service_id: event.service_id,
         },
     )
 }
@@ -4890,7 +4885,7 @@ fn queue_proposal_with_arguments(
             title: title.to_owned(),
             message: message.to_owned(),
             status: "pending".to_owned(),
-            service_id: service_id.clone(),
+            service_id,
             tool: proposal_tool_for_action(action).map(str::to_owned),
             arguments,
             reviewed_at_unix_ms: None,
@@ -7624,7 +7619,7 @@ mod tests {
                 .and_then(Value::as_array)
                 .is_some_and(|pids| pids
                     .iter()
-                    .any(|pid| pid.as_u64() == Some(current_pid as u64)))
+                    .any(|pid| pid.as_u64() == Some(u64::from(current_pid))))
         );
         Ok(())
     }
@@ -8557,10 +8552,10 @@ where
     let envelope: EngineResponseEnvelope =
         serde_json::from_slice(&output.stdout).context("failed to parse engine response")?;
     if !envelope.ok {
-        let detail = envelope
-            .error
-            .map(|error| format!("{}: {}", error.code, error.message))
-            .unwrap_or_else(|| "unknown engine error".to_owned());
+        let detail = envelope.error.map_or_else(
+            || "unknown engine error".to_owned(),
+            |error| format!("{}: {}", error.code, error.message),
+        );
         bail!(detail);
     }
     let data = envelope

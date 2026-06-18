@@ -31,19 +31,22 @@ impl<'a> CoreBars<'a> {
         }
     }
 
+    #[must_use]
     pub fn max(mut self, m: f32) -> Self {
         self.max = if m > 0.0 { m } else { 1.0 };
         self
     }
 
-    pub fn style(mut self, s: Style) -> Self {
+    #[must_use]
+    pub const fn style(mut self, s: Style) -> Self {
         self.style = s;
         self
     }
 
     /// Color each bar by its fill ratio (low → stops[0], full → stops[2]).
     /// When set, overrides `style.fg` per column.
-    pub fn gradient(mut self, start: Color, mid: Color, end: Color) -> Self {
+    #[must_use]
+    pub const fn gradient(mut self, start: Color, mid: Color, end: Color) -> Self {
         self.gradient = Some([start, mid, end]);
         self
     }
@@ -63,7 +66,7 @@ impl Widget for CoreBars<'_> {
             let lit = ((v / self.max) * total_dot_rows as f32).round() as usize;
             let first_lit = total_dot_rows.saturating_sub(lit);
             let style = match self.gradient {
-                Some(stops) if v > 0.0 => self.style.fg(lerp3_t(stops, (v / self.max) as f64)),
+                Some(stops) if v > 0.0 => self.style.fg(lerp3_t(stops, f64::from(v / self.max))),
                 _ => self.style,
             };
             for cy in 0..rows {
@@ -86,7 +89,7 @@ impl Widget for CoreBars<'_> {
     }
 }
 
-fn braille_both_cols(mask: u8) -> char {
+const fn braille_both_cols(mask: u8) -> char {
     let mut code = 0u32;
     if mask & 0b0001 != 0 {
         code |= 0x01 | 0x08;

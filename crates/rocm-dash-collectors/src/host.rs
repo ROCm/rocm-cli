@@ -30,7 +30,12 @@ impl HostCollector {
         self.sys.refresh_memory();
 
         let cpu_overall_pct = self.sys.global_cpu_usage();
-        let cpu_per_core_pct: Vec<f32> = self.sys.cpus().iter().map(|c| c.cpu_usage()).collect();
+        let cpu_per_core_pct: Vec<f32> = self
+            .sys
+            .cpus()
+            .iter()
+            .map(sysinfo::Cpu::cpu_usage)
+            .collect();
 
         // sysinfo reports memory in bytes.
         let memory_used_mb = self.sys.used_memory() / 1024 / 1024;

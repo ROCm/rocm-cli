@@ -13,7 +13,7 @@
 
 /// Whether `c` is a lowercase hex digit (`0-9a-f`). Docker/containerd ids are
 /// lowercase hex; uppercase and other characters act as token delimiters.
-fn is_lower_hex(c: char) -> bool {
+const fn is_lower_hex(c: char) -> bool {
     c.is_ascii_digit() || matches!(c, 'a'..='f')
 }
 
@@ -36,8 +36,9 @@ pub fn parse_container_id_from_cgroup(contents: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Resolve the docker container id owning host process `pid` by reading
-/// `/proc/<pid>/cgroup`. Returns `None` on any read error (process gone,
+/// Resolve the docker container id owning host process `pid` by reading `/proc/<pid>/cgroup`.
+///
+/// Returns `None` on any read error (process gone,
 /// permission denied) or when the cgroup names no container — never panics.
 #[cfg(target_os = "linux")]
 pub fn container_id_for_pid(pid: u32) -> Option<String> {

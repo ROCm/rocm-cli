@@ -111,10 +111,7 @@ pub fn annotate_reply(reply: String, skills: &[String]) -> String {
 // ---------------------------------------------------------------------------
 
 fn gpus_of(snap: &StateSnapshot) -> &[GpuMetrics] {
-    snap.latest
-        .as_ref()
-        .map(|s| s.gpus.as_slice())
-        .unwrap_or(&[])
+    snap.latest.as_ref().map_or(&[], |s| s.gpus.as_slice())
 }
 
 fn gpu_json(g: &GpuMetrics) -> Value {
@@ -345,8 +342,9 @@ impl Tool for TokensPerWattTool {
     }
 }
 
-/// Read-only tool exposing the rocm-dash **skills** registry (auto-config /
-/// auto-install). The agent can list skills and fetch a skill's dry-run plan;
+/// Read-only tool exposing the rocm-dash **skills** registry (auto-config / auto-install).
+///
+/// The agent can list skills and fetch a skill's dry-run plan;
 /// it never executes a skill (execution is `--apply`-gated in the CLI).
 pub struct ListSkillsTool {
     pub fired: FiredLog,
@@ -552,8 +550,9 @@ impl AgentClient for RigAgentClient {
     }
 }
 
-/// No-key ChatGPT backend over Rig's native `chatgpt` OAuth provider — the
-/// no-key default that restores the ChatGPT device-login the vendored Codex
+/// No-key ChatGPT backend over Rig's native `chatgpt` OAuth provider.
+///
+/// This is the no-key default that restores the ChatGPT device-login the vendored Codex
 /// path provided. It takes NO api_key (the env-only key invariant is untouched:
 /// this path authenticates with an OAuth device-code flow, not a key). The
 /// `on_device_code` callback surfaces the verification URL + user code so the
@@ -691,7 +690,7 @@ impl MockAgentClient {
     }
 
     /// A mock whose `complete` always fails (to exercise the error path).
-    pub fn failing() -> Self {
+    pub const fn failing() -> Self {
         Self {
             reply: String::new(),
             fail: true,
@@ -732,7 +731,7 @@ mod tests {
                     temperature_c: 40.0,
                     power_w: 100.0,
                     vram_used_mb: 1000,
-                    vram_total_mb: 192000,
+                    vram_total_mb: 192_000,
                     ..Default::default()
                 },
                 GpuMetrics {
@@ -741,7 +740,7 @@ mod tests {
                     temperature_c: 60.0,
                     power_w: 200.0,
                     vram_used_mb: 50000,
-                    vram_total_mb: 192000,
+                    vram_total_mb: 192_000,
                     ..Default::default()
                 },
                 GpuMetrics {
@@ -750,7 +749,7 @@ mod tests {
                     temperature_c: 71.0,
                     power_w: 250.0,
                     vram_used_mb: 90000,
-                    vram_total_mb: 192000,
+                    vram_total_mb: 192_000,
                     ..Default::default()
                 },
             ],

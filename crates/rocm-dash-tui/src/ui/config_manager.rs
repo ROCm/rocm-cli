@@ -48,16 +48,16 @@ pub const ACTIONS: &[ConfigAction] = &[
 ];
 
 impl ConfigAction {
-    fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
-            ConfigAction::ShowConfig => "Show saved config",
-            ConfigAction::EnableProvider => "Enable provider",
-            ConfigAction::DisableProvider => "Disable provider",
+            Self::ShowConfig => "Show saved config",
+            Self::EnableProvider => "Enable provider",
+            Self::DisableProvider => "Disable provider",
         }
     }
 
-    fn is_mutating(self) -> bool {
-        !matches!(self, ConfigAction::ShowConfig)
+    const fn is_mutating(self) -> bool {
+        !matches!(self, Self::ShowConfig)
     }
 }
 
@@ -100,7 +100,7 @@ pub fn on_key(
                     return spawn_config(c, jobs, "config-provider", pending.cmd, pending.args);
                 }
             }
-            Some(ApprovalVerdict::Deny) | Some(ApprovalVerdict::Cancel) => c.approval = None,
+            Some(ApprovalVerdict::Deny | ApprovalVerdict::Cancel) => c.approval = None,
             None => {}
         }
         return Vec::new();
@@ -464,7 +464,7 @@ mod tests {
             .buffer()
             .content()
             .iter()
-            .map(|c| c.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(out.contains("Config & providers"));
         assert!(out.contains("Show saved config"));

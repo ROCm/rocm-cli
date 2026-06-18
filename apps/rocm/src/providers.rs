@@ -14,7 +14,7 @@ pub(crate) const LEMONADE_ASSISTANT_MODEL_ID: &str = "Qwen3-4B-Instruct-2507-GGU
 pub(crate) const BUILTIN_ASSISTANT_MODEL_ID: &str = LEMONADE_ASSISTANT_MODEL_ID;
 const LOCAL_PROVIDER_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCAL_SERVICE_READY_TIMEOUT: Duration = Duration::from_secs(2);
-const REMOTE_PROVIDER_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+const REMOTE_PROVIDER_HTTP_TIMEOUT: Duration = Duration::from_mins(1);
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct ProviderStatus {
@@ -467,9 +467,8 @@ fn select_local_chat_service(
             .into_iter()
             .next()
             .context("local provider has no ready managed service for this request");
-    } else {
-        services.retain(local_service_is_builtin_assistant);
     }
+    services.retain(local_service_is_builtin_assistant);
     services.sort_by_key(local_service_priority);
     services.into_iter().next()
         .with_context(|| {
@@ -479,11 +478,11 @@ fn select_local_chat_service(
         })
 }
 
-fn local_service_is_builtin_assistant(service: &ManagedServiceRecord) -> bool {
+const fn local_service_is_builtin_assistant(service: &ManagedServiceRecord) -> bool {
     local_service_priority(service) != usize::MAX
 }
 
-fn local_service_priority(service: &ManagedServiceRecord) -> usize {
+const fn local_service_priority(service: &ManagedServiceRecord) -> usize {
     let model = service.canonical_model_id.as_str();
     if model.eq_ignore_ascii_case(LEMONADE_ASSISTANT_MODEL_ID) {
         0
@@ -1591,7 +1590,7 @@ mod tests {
                     }
                 }
                 let request = String::from_utf8_lossy(&request_bytes).into_owned();
-                let body = format!(r#"{{"data":[{{"id":"{}"}}]}}"#, LEMONADE_ASSISTANT_MODEL_ID);
+                let body = format!(r#"{{"data":[{{"id":"{LEMONADE_ASSISTANT_MODEL_ID}"}}]}}"#);
                 write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

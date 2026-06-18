@@ -19,8 +19,8 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 import pyte
 
@@ -334,4 +334,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except (TuiSmokeError, OSError, subprocess.SubprocessError) as error:
         print(f"[tui-e2e-smoke] failed: {error}", file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from error

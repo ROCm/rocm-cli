@@ -11,6 +11,7 @@
 //! AppState configuration (tab + modal + theme). Cells get run-length
 //! coalesced per row so the SVG stays compact (~30-80 KB / view).
 
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::path::PathBuf;
 
@@ -53,6 +54,7 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<()> {
+    type BuildFn = Box<dyn Fn() -> AppState>;
     let args = Args::parse();
     fs::create_dir_all(&args.output_dir)?;
 
@@ -70,7 +72,6 @@ fn main() -> anyhow::Result<()> {
     // Each screenshot is (filename, mutator) — the mutator fork-edits a
     // clone of base_state for that view. Theme variants get a fresh state
     // with a different theme so the picker and gradients re-render.
-    type BuildFn = Box<dyn Fn() -> AppState>;
     let mut tasks: Vec<(&str, BuildFn)> = Vec::new();
     let make = |theme: &'static str| {
         let entries = entries.clone();
@@ -277,8 +278,8 @@ const FONT_FAMILY: &str = "ui-monospace, 'JetBrains Mono', 'Cascadia Code', \
 fn buffer_to_svg(buf: &Buffer, default_bg: Color) -> String {
     let cols = buf.area.width;
     let rows = buf.area.height;
-    let w_px = cols as f64 * CELL_W;
-    let h_px = rows as f64 * CELL_H;
+    let w_px = f64::from(cols) * CELL_W;
+    let h_px = f64::from(rows) * CELL_H;
     let bg_hex = color_to_hex(default_bg).unwrap_or_else(|| "#13141a".into());
 
     let mut out = String::with_capacity(rows as usize * cols as usize * 16);
@@ -294,9 +295,7 @@ fn buffer_to_svg(buf: &Buffer, default_bg: Color) -> String {
         ff = FONT_FAMILY,
         fs = FONT_PX,
     ));
-    out.push_str(&format!(
-        r#"<rect width="100%" height="100%" fill="{bg_hex}"/>"#
-    ));
+    let _ = write!(out, r#"<rect width="100%" height="100%" fill="{bg_hex}"/>"#);
 
     // Per-row background runs.
     for y in 0..rows {
@@ -308,12 +307,9 @@ fn buffer_to_svg(buf: &Buffer, default_bg: Color) -> String {
                 x += 1;
                 continue;
             }
-            let bg_hex_run = match color_to_hex(bg) {
-                Some(h) => h,
-                None => {
-                    x += 1;
-                    continue;
-                }
+            let Some(bg_hex_run) = color_to_hex(bg) else {
+                x += 1;
+                continue;
             };
             let start = x;
             let mut end = x + 1;
@@ -325,12 +321,13 @@ fn buffer_to_svg(buf: &Buffer, default_bg: Color) -> String {
                     break;
                 }
             }
-            let rx = start as f64 * CELL_W;
-            let ry = y as f64 * CELL_H;
-            let rw = (end - start) as f64 * CELL_W;
-            out.push_str(&format!(
+            let rx = f64::from(start) * CELL_W;
+            let ry = f64::from(y) * CELL_H;
+            let rw = f64::from(end - start) * CELL_W;
+            let _ = write!(
+                out,
                 r#"<rect x="{rx:.2}" y="{ry:.2}" width="{rw:.2}" height="{CELL_H}" fill="{bg_hex_run}"/>"#
-            ));
+            );
             x = end;
         }
     }
@@ -338,7 +335,7 @@ fn buffer_to_svg(buf: &Buffer, default_bg: Color) -> String {
     // Per-row foreground runs. Group by (fg, bold) and emit one <text> per run.
     for y in 0..rows {
         let mut x = 0u16;
-        let baseline = y as f64 * CELL_H + FONT_PX * 0.85;
+        let baseline = FONT_PX.mul_add(0.85, f64::from(y) * CELL_H);
         while x < cols {
             let cell = buf.cell((x, y)).unwrap();
             let sym = cell.symbol();
@@ -366,12 +363,12 @@ fn buffer_to_svg(buf: &Buffer, default_bg: Color) -> String {
                 text.push_str(&xml_escape(nsym));
                 end += 1;
             }
-            let tx = start as f64 * CELL_W;
+            let tx = f64::from(start) * CELL_W;
             let fg_hex = fg.unwrap_or_else(|| "#eaebec".into());
             let weight = if bold { "700" } else { "400" };
             // Render each glyph at its own x via `textLength` so coalesced
             // runs preserve monospace alignment regardless of font metrics.
-            let span_w = (end - start) as f64 * CELL_W;
+            let span_w = f64::from(end - start) * CELL_W;
             out.push_str(&format!(
                 concat!(
                     r#"<text x="{tx:.2}" y="{baseline:.2}" "#,

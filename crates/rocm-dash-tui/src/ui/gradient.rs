@@ -23,7 +23,7 @@ pub struct GradientGauge<'a> {
 }
 
 impl<'a> GradientGauge<'a> {
-    pub fn new(ratio: f64) -> Self {
+    pub const fn new(ratio: f64) -> Self {
         Self {
             ratio: ratio.clamp(0.0, 1.0),
             stops: [
@@ -37,22 +37,26 @@ impl<'a> GradientGauge<'a> {
         }
     }
 
-    pub fn stops(mut self, start: Color, mid: Color, end: Color) -> Self {
+    #[must_use]
+    pub const fn stops(mut self, start: Color, mid: Color, end: Color) -> Self {
         self.stops = [start, mid, end];
         self
     }
 
-    pub fn track_bg(mut self, c: Color) -> Self {
+    #[must_use]
+    pub const fn track_bg(mut self, c: Color) -> Self {
         self.track_bg = c;
         self
     }
 
-    pub fn label(mut self, label: &'a str) -> Self {
+    #[must_use]
+    pub const fn label(mut self, label: &'a str) -> Self {
         self.label = Some(label);
         self
     }
 
-    pub fn label_fg(mut self, c: Color) -> Self {
+    #[must_use]
+    pub const fn label_fg(mut self, c: Color) -> Self {
         self.label_fg = c;
         self
     }
@@ -133,13 +137,13 @@ fn lerp2(a: Color, b: Color, t: f64) -> Color {
     let (br, bg, bb) = rgb_of(b);
     let t = t.clamp(0.0, 1.0);
     let lerp = |x: u8, y: u8| -> u8 {
-        let v = x as f64 + (y as f64 - x as f64) * t;
+        let v = (f64::from(y) - f64::from(x)).mul_add(t, f64::from(x));
         v.round().clamp(0.0, 255.0) as u8
     };
     Color::Rgb(lerp(ar, br), lerp(ag, bg), lerp(ab, bb))
 }
 
-fn rgb_of(c: Color) -> (u8, u8, u8) {
+const fn rgb_of(c: Color) -> (u8, u8, u8) {
     match c {
         Color::Rgb(r, g, b) => (r, g, b),
         // Fallback: indexed / named colors aren't blendable without a

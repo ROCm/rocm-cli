@@ -51,10 +51,11 @@ pub enum ApprovalChoice {
 }
 
 impl ApprovalChoice {
-    pub fn toggle(self) -> Self {
+    #[must_use]
+    pub const fn toggle(self) -> Self {
         match self {
-            ApprovalChoice::Approve => ApprovalChoice::Deny,
-            ApprovalChoice::Deny => ApprovalChoice::Approve,
+            Self::Approve => Self::Deny,
+            Self::Deny => Self::Approve,
         }
     }
 }
@@ -69,19 +70,17 @@ pub enum ApprovalVerdict {
 
 /// Pure key handler. Returns the (possibly moved) cursor and an optional
 /// verdict. No side effects — the caller routes the verdict CLI-side.
-pub fn approval_key(
+pub const fn approval_key(
     key: KeyCode,
     choice: ApprovalChoice,
 ) -> (ApprovalChoice, Option<ApprovalVerdict>) {
     match key {
         KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab => (choice.toggle(), None),
-        KeyCode::Char('y') | KeyCode::Char('Y') => (choice, Some(ApprovalVerdict::Approve)),
-        KeyCode::Char('n') | KeyCode::Char('N') => (choice, Some(ApprovalVerdict::Deny)),
+        KeyCode::Char('y' | 'Y') => (choice, Some(ApprovalVerdict::Approve)),
+        KeyCode::Char('n' | 'N') => (choice, Some(ApprovalVerdict::Deny)),
         // Esc and `q` both cancel — `q` must never be silently swallowed while a
         // modal is up, so the user is never trapped on any screen.
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
-            (choice, Some(ApprovalVerdict::Cancel))
-        }
+        KeyCode::Esc | KeyCode::Char('q' | 'Q') => (choice, Some(ApprovalVerdict::Cancel)),
         KeyCode::Enter => {
             let verdict = match choice {
                 ApprovalChoice::Approve => ApprovalVerdict::Approve,

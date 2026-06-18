@@ -23,8 +23,7 @@ impl PersistedEntry {
     pub fn now(event: Event) -> Self {
         let ts_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_micros() as u64);
         Self { ts_us, event }
     }
 }

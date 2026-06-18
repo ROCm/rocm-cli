@@ -29,8 +29,9 @@ use tokio::sync::mpsc::UnboundedSender;
 /// How often the runtime wakes to re-check the cancel flag while idle.
 const CANCEL_POLL: Duration = Duration::from_millis(100);
 
-/// Drive a batch of reducer side effects, spawning a job task for each
-/// [`SideEffect::SpawnJob`]. Non-job effects are ignored here — the daemon owns
+/// Drive a batch of reducer side effects, spawning a job task for each [`SideEffect::SpawnJob`].
+///
+/// Non-job effects are ignored here — the daemon owns
 /// broadcast/persist; in the TUI the job-bridge only cares about `SpawnJob`.
 pub fn run_effects(effects: Vec<SideEffect>, tx: &UnboundedSender<StateEvent>) {
     for fx in effects {
@@ -138,7 +139,7 @@ async fn run_job(
 
             // Idle wake-up so cancellation is observed within CANCEL_POLL even
             // when the child produces no output.
-            _ = tokio::time::sleep(CANCEL_POLL) => {}
+            () = tokio::time::sleep(CANCEL_POLL) => {}
         }
     }
 }

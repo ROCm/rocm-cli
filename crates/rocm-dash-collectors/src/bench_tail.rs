@@ -18,7 +18,7 @@ pub struct CsvBenchTailer {
 }
 
 impl CsvBenchTailer {
-    pub fn new(path: PathBuf) -> Self {
+    pub const fn new(path: PathBuf) -> Self {
         Self { path, rows_seen: 0 }
     }
 }
@@ -131,7 +131,7 @@ mod tests {
         let dir = tempdir();
         let path = dir.join("results.csv");
         write(&path, "cell,run\nO-arch,7\n");
-        let mut t = CsvBenchTailer::new(path.clone());
+        let mut t = CsvBenchTailer::new(path);
         let rows = t.drain().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].cell, "O-arch");
@@ -142,13 +142,12 @@ mod tests {
     }
 
     fn tempdir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let mut p = std::env::temp_dir();
         let pid = std::process::id();
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        p.push(format!("rocm-dash-test-{pid}-{ts}"));
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        p.push(format!("rocm-dash-bench-tail-{pid}-{n}"));
         std::fs::create_dir_all(&p).unwrap();
         p
     }
