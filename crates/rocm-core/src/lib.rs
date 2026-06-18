@@ -1143,6 +1143,40 @@ pub const fn default_engine_for_platform() -> &'static str {
     "lemonade"
 }
 
+const VLLM_PREFERRED_THEROCK_FAMILIES: &[&str] = &["gfx906", "gfx908", "gfx90a"];
+
+pub fn preferred_serve_engine_for_host_gpu_summary(
+    summary: &HostGpuSummary,
+) -> Option<&'static str> {
+    preferred_serve_engine_for_therock_family(
+        summary
+            .therock_family
+            .as_deref()
+            .or(summary.gfx_target.as_deref()),
+    )
+}
+
+fn preferred_serve_engine_for_therock_family(family: Option<&str>) -> Option<&'static str> {
+    let family = family?.trim();
+    if family.is_empty() {
+        return None;
+    }
+
+    let family = normalize_therock_family(family)
+        .as_deref()
+        .unwrap_or(family)
+        .to_ascii_lowercase();
+    if family.ends_with("-dcgpu")
+        || VLLM_PREFERRED_THEROCK_FAMILIES
+            .iter()
+            .any(|candidate| *candidate == family)
+    {
+        Some("vllm")
+    } else {
+        None
+    }
+}
+
 fn detect_kernel_version() -> Option<String> {
     if runtime_is_windows() {
         capture_optional_command("cmd", &["/C", "ver"])
@@ -5988,6 +6022,35 @@ mod tests {
         assert_eq!(
             normalize_therock_family("gfx94X-dcgpu"),
             Some("gfx94X-dcgpu".to_owned())
+        );
+    }
+
+    #[test]
+    fn preferred_serve_engine_uses_vllm_for_supported_therock_families() {
+        assert_eq!(
+            preferred_serve_engine_for_host_gpu_summary(&HostGpuSummary {
+                therock_family: Some("gfx90a".to_owned()),
+                ..HostGpuSummary::default()
+            }),
+            Some("vllm")
+        );
+        assert_eq!(
+            preferred_serve_engine_for_host_gpu_summary(&HostGpuSummary {
+                gfx_target: Some("gfx950".to_owned()),
+                ..HostGpuSummary::default()
+            }),
+            Some("vllm")
+        );
+        assert_eq!(
+            preferred_serve_engine_for_host_gpu_summary(&HostGpuSummary {
+                therock_family: Some("gfx999-dcgpu".to_owned()),
+                ..HostGpuSummary::default()
+            }),
+            Some("vllm")
+        );
+        assert_eq!(
+            preferred_serve_engine_for_host_gpu_summary(&HostGpuSummary::default()),
+            None
         );
     }
 

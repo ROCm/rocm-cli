@@ -29,14 +29,16 @@ use rocm_core::{
     PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF,
     WatcherMode, append_audit_event, builtin_model_recipes, builtin_watcher, builtin_watchers,
     connect_tcp_stream, daemon_binary_path, default_engine_for_platform,
-    default_interactive_shell_program, engine_binary_path, engine_plugin_dirs, format_host_port,
-    format_http_base_url, generate_service_id, interactive_terminal, load_model_recipe_registry,
-    load_recent_audit_events, load_recent_automation_events, load_recent_automation_proposals,
-    managed_pip_cache_dir, managed_service_endpoint_model_ready, model_artifact_cache_status,
-    prepend_runtime_path, process_is_running, read_tcp_stream_to_string,
-    resolve_builtin_model_recipe, resolve_model_recipe, runtime_install_root_is_protected,
-    runtime_path_is_same_or_inside, runtime_python_activation_hint, runtime_python_env_bin_dir,
-    runtime_python_executable_in_env, shell_command_for_host, write_all_tcp_stream,
+    default_interactive_shell_program, detect_host_gpu_summary, engine_binary_path,
+    engine_plugin_dirs, format_host_port, format_http_base_url, generate_service_id,
+    interactive_terminal, load_model_recipe_registry, load_recent_audit_events,
+    load_recent_automation_events, load_recent_automation_proposals, managed_pip_cache_dir,
+    managed_service_endpoint_model_ready, model_artifact_cache_status,
+    preferred_serve_engine_for_host_gpu_summary, prepend_runtime_path, process_is_running,
+    read_tcp_stream_to_string, resolve_builtin_model_recipe, resolve_model_recipe,
+    runtime_install_root_is_protected, runtime_path_is_same_or_inside,
+    runtime_python_activation_hint, runtime_python_env_bin_dir, runtime_python_executable_in_env,
+    shell_command_for_host, write_all_tcp_stream,
 };
 use rocm_engine_protocol::{
     DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy,
@@ -3422,6 +3424,7 @@ fn select_serve_engine(
     explicit_engine: Option<&str>,
     configured_default: Option<&str>,
     recipe: Option<&ModelRecipeRecord>,
+    host_gpu_summary: Option<&rocm_core::HostGpuSummary>,
 ) -> ServeEngineSelection {
     if let Some(engine) = explicit_engine.filter(|value| !value.trim().is_empty()) {
         return ServeEngineSelection {
@@ -3434,6 +3437,15 @@ fn select_serve_engine(
         return ServeEngineSelection {
             engine: engine.to_owned(),
             source: "configured default_engine",
+        };
+    }
+
+    if let Some(engine) = host_gpu_summary
+        .and_then(preferred_serve_engine_for_host_gpu_summary)
+    {
+        return ServeEngineSelection {
+            engine: engine.to_owned(),
+            source: "detected ROCm GPU family prefers vLLM",
         };
     }
 
@@ -3550,11 +3562,13 @@ fn serve(
     validate_bind_host(&host, allow_public_bind)?;
     let paths = AppPaths::discover()?;
     let mut config = RocmCliConfig::load(&paths)?;
+    let host_gpu_summary = detect_host_gpu_summary(Some(&paths));
     let shared_recipe = resolve_model_recipe(&model)?;
     let serve_engine = select_serve_engine(
         engine.as_deref(),
         config.default_engine.as_deref(),
         shared_recipe.as_ref(),
+        Some(&host_gpu_summary),
     );
     let selected_engine = serve_engine.engine.clone();
     let engine_recipe = shared_recipe
@@ -18441,7 +18455,7 @@ install therock";
     fn serve_engine_selection_uses_shared_recipe_when_no_override_exists() {
         let recipe = resolve_builtin_model_recipe("qwen32b").expect("qwen32b recipe");
 
-        let selection = select_serve_engine(None, None, Some(&recipe));
+        let selection = select_serve_engine(None, None, Some(&recipe), None);
 
         assert_eq!(
             selection,
@@ -18457,6 +18471,25 @@ install therock";
         assert_eq!(
             serve_model_ref_for_engine("qwen32b", Some(&recipe), "vllm"),
             "Qwen/Qwen3-32B-FP8"
+        );
+    }
+
+    #[test]
+    fn serve_engine_selection_prefers_vllm_for_supported_gpus() {
+        let recipe = resolve_builtin_model_recipe("qwen").expect("qwen recipe");
+        let summary = rocm_core::HostGpuSummary {
+            therock_family: Some("gfx90a".to_owned()),
+            ..rocm_core::HostGpuSummary::default()
+        };
+
+        let selection = select_serve_engine(None, None, Some(&recipe), Some(&summary));
+
+        assert_eq!(
+            selection,
+            ServeEngineSelection {
+                engine: "vllm".to_owned(),
+                source: "detected ROCm GPU family prefers vLLM",
+            }
         );
     }
 
@@ -18478,8 +18511,8 @@ install therock";
     fn serve_engine_selection_respects_explicit_and_configured_engines() {
         let recipe = resolve_builtin_model_recipe("qwen32b").expect("qwen32b recipe");
 
-        let explicit = select_serve_engine(Some("llama.cpp"), Some("pytorch"), Some(&recipe));
-        let configured = select_serve_engine(None, Some("pytorch"), Some(&recipe));
+        let explicit = select_serve_engine(Some("llama.cpp"), Some("pytorch"), Some(&recipe), None);
+        let configured = select_serve_engine(None, Some("pytorch"), Some(&recipe), None);
 
         assert_eq!(
             explicit,
