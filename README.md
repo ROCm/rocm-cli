@@ -66,7 +66,7 @@ TUI shows live GPU utilization, active model servers, and a chat tab.
 ```
 rocm install sdk    [--channel release|nightly] [--format wheel|tarball]
                     [--version X.Y.Z | --build-date YYYY-MM-DD]
-                    [--family gfx110X-all] [--dry-run]
+                    [--family gfx110X-all] [--prefix PATH] [--dry-run]
 
 rocm install driver [--dkms] [--yes] [--dry-run] [--reconcile]
 
@@ -108,7 +108,7 @@ Start a local OpenAI-compatible model server:
 
 ```
 rocm serve <model> [--engine lemonade|pytorch|llama.cpp|atom|vllm|sglang]
-                   [--device gpu_required|cpu_only]
+                   [--device gpu_required|gpu_preferred|cpu_only]
                    [--runtime-id KEY | --env-id ID]
                    [--host HOST] [--port PORT]
                    [--foreground | --managed]
@@ -173,7 +173,7 @@ rocm comfyui models-path
 
 ```
 rocm automations list
-rocm automations enable <watcher-id>  [--mode auto|review]
+rocm automations enable <watcher-id>  [--mode observe|propose|contained]
 rocm automations disable <watcher-id>
 ```
 
