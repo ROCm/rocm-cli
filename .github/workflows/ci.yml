@@ -44,6 +44,14 @@ jobs:
 
       # Upload after Build+Test so the stored artifact always corresponds to a
       # validated build. (Hardware jobs gate on this job's success via needs.)
+      #
+      # Debug binaries are deliberate: the hardware-test jobs that consume this
+      # artifact are functional GPU smoke tests (device detection, engine
+      # launch/capabilities, no-CPU-fallback policy) — not performance
+      # benchmarks — so the debug-vs-release difference doesn't change what they
+      # assert, and debug keeps this required gate fast (release is ~3-5x slower
+      # to compile). Release-fidelity, optimized validation lives in the
+      # nightly/release pipeline, which builds manylinux (glibc 2.17) binaries.
       - name: Upload Linux binaries
         uses: actions/upload-artifact@v4
         with:
@@ -108,6 +116,7 @@ jobs:
 
       # Upload after Build+Test so the stored artifact always corresponds to a
       # validated build. (Hardware jobs gate on this job's success via needs.)
+      # Debug is deliberate here too — see the rationale on the Linux upload above.
       - name: Upload Windows binaries
         uses: actions/upload-artifact@v4
         with:
