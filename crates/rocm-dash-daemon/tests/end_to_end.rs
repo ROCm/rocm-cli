@@ -241,9 +241,10 @@ async fn socket_is_created_with_restricted_permissions() {
                 break m;
             }
         }
-        if std::time::Instant::now() >= deadline {
-            panic!("daemon did not create socket with mode 0o600 within 5 s");
-        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon did not create socket with mode 0o600 within 5 s"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
 
