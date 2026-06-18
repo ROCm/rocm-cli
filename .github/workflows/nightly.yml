@@ -92,7 +92,7 @@ jobs:
                 curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
               fi
               export PATH="/host-cargo/bin:$PATH"
-              cargo build --release --workspace
+              cargo build --release -p rocm -p rocmd -p xtask
             '
 
       - name: Set nightly metadata
@@ -184,7 +184,7 @@ jobs:
 
       - name: Build release binaries
         shell: pwsh
-        run: cargo build --release --workspace
+        run: cargo build --release -p rocm -p rocmd -p xtask
 
       - name: Package Windows bundle
         shell: pwsh
@@ -292,7 +292,9 @@ jobs:
             "${EXTRA}/rocm" "${EXTRA}/rocm.exe" \
             "${EXTRA}/linux-binaries.tar.gz" "${EXTRA}/windows-binaries.zip" --clobber
 
-          gh release delete "${STAGING_TAG}" --yes --cleanup-tag
+          # The staging release is a draft, which never creates a git tag, so
+          # --cleanup-tag would 422 on a nonexistent ref. Just delete the draft.
+          gh release delete "${STAGING_TAG}" --yes 2>/dev/null || true
 
   cleanup-staging-nightly:
     name: Clean failed nightly staging release
