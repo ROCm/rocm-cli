@@ -68,13 +68,14 @@ async fn run_unix(path: PathBuf, opts: RunnerOptions) -> anyhow::Result<()> {
                 .recursive(true)
                 .mode(0o700)
                 .create(parent)
-                .with_context(|| format!("creating socket directory {parent:?}"))?;
+                .with_context(|| format!("creating socket directory {}", parent.display()))?;
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).with_context(
                 || {
                     format!(
-                        "restricting socket directory {parent:?} to mode 0700 — \
+                        "restricting socket directory {} to mode 0700 — \
                          check that the directory is owned by the current user \
-                         (EPERM means it is owned by another user or root)"
+                         (EPERM means it is owned by another user or root)",
+                        parent.display()
                     )
                 },
             )?;
@@ -84,11 +85,12 @@ async fn run_unix(path: PathBuf, opts: RunnerOptions) -> anyhow::Result<()> {
         std::fs::remove_file(&path)
             .with_context(|| format!("removing stale socket {}", path.display()))?;
     }
-    let listener = UnixListener::bind(&path).with_context(|| format!("binding {path:?}"))?;
+    let listener =
+        UnixListener::bind(&path).with_context(|| format!("binding {}", path.display()))?;
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("setting permissions on {path:?}"))?;
+            .with_context(|| format!("setting permissions on {}", path.display()))?;
     }
     info!(socket = %path.display(), "listening");
 
