@@ -19,13 +19,6 @@ env:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
-    # This job is also the source of the linux-binaries artifact. It targets
-    # ubuntu-latest's glibc, so any hardware-test runner that downloads it
-    # (Instinct, WSL Ubuntu) must have a compatible (>=) glibc; a runner on an
-    # older distro should build in-place instead, as wsl-fedora-test does.
-    # NOTE: don't pin this job to an older image to lower the baseline — the
-    # shared cargo cache is keyed on runner.os ("Linux") and can't tell distros
-    # apart, so cross-distro artifacts get reused and fail to link/load.
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
     needs: [fmt, clippy]
     steps:
@@ -41,32 +34,6 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-targets
-
-      # Upload after Build+Test so the stored artifact always corresponds to a
-      # validated build. (Hardware jobs gate on this job's success via needs.)
-      #
-      # Debug binaries are deliberate: the hardware-test jobs that consume this
-      # artifact are functional GPU smoke tests (device detection, engine
-      # launch/capabilities, no-CPU-fallback policy) — not performance
-      # benchmarks — so the debug-vs-release difference doesn't change what they
-      # assert, and debug keeps this required gate fast (release is ~3-5x slower
-      # to compile). Release-fidelity, optimized validation lives in the
-      # nightly/release pipeline, which builds manylinux (glibc 2.17) binaries.
-      - name: Upload Linux binaries
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-binaries
-          if-no-files-found: error
-          retention-days: 7
-          path: |
-            target/debug/rocm
-            target/debug/rocmd
-            target/debug/rocm-engine-pytorch
-            target/debug/rocm-engine-llama-cpp
-            target/debug/rocm-engine-lemonade
-            target/debug/rocm-engine-atom
-            target/debug/rocm-engine-vllm
-            target/debug/rocm-engine-sglang
 
       - name: Local no-fallback smoke
         run: python scripts/smoke_local.py --skip-build
@@ -113,25 +80,6 @@ jobs:
       - name: Test
         shell: pwsh
         run: cargo test --workspace --all-targets
-
-      # Upload after Build+Test so the stored artifact always corresponds to a
-      # validated build. (Hardware jobs gate on this job's success via needs.)
-      # Debug is deliberate here too — see the rationale on the Linux upload above.
-      - name: Upload Windows binaries
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-binaries
-          if-no-files-found: error
-          retention-days: 7
-          path: |
-            target/debug/rocm.exe
-            target/debug/rocmd.exe
-            target/debug/rocm-engine-pytorch.exe
-            target/debug/rocm-engine-llama-cpp.exe
-            target/debug/rocm-engine-lemonade.exe
-            target/debug/rocm-engine-atom.exe
-            target/debug/rocm-engine-vllm.exe
-            target/debug/rocm-engine-sglang.exe
 
       - name: Local no-fallback smoke
         shell: pwsh
@@ -261,162 +209,7 @@ jobs:
           }
           if ($findings) { $findings | Format-Table -AutoSize; exit 1 }
 
-  # ---------------------------------------------------------------------------
-  # Optional hardware tests on dedicated self-hosted runners.
-  #
-  # These do NOT build: they download the exact binaries produced by the hosted
-  # build jobs above and exercise the parts hosted runners cannot (real AMD GPU,
-  # real WSL). Each is opt-in via a repo/org variable and continue-on-error, so
-  # an offline/busy dedicated runner never blocks a PR. Enable a fleet by setting
-  # its variable to "true" once the matching runners are online:
-  #   ENABLE_WIN11_GPU_CI / ENABLE_INSTINCT_CI /
-  #   ENABLE_WSL_UBUNTU_CI / ENABLE_WSL_FEDORA_CI
-  # ---------------------------------------------------------------------------
-
-  win11-gpu-test:
-    name: Windows gfx1151 GPU test (artifact)
-    runs-on: [self-hosted, windows-gfx1151-gpu-rocm]
-    needs: [windows-build-and-test]
-    continue-on-error: true
-    # Opt-in + fork-safety (self-hosted runners must not run untrusted fork PRs).
-    if: vars.ENABLE_WIN11_GPU_CI == 'true' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      actions: read
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Download Windows binaries
-        uses: actions/download-artifact@v4
-        with:
-          name: windows-binaries
-          path: target/debug
-
-      - name: Host detection
-        run: .\target\debug\rocm.exe doctor
-
-      - name: Engine detection and capabilities
-        run: |
-          .\target\debug\rocm-engine-pytorch.exe detect
-          .\target\debug\rocm-engine-pytorch.exe capabilities
-          .\target\debug\rocm-engine-llama-cpp.exe detect
-          .\target\debug\rocm-engine-llama-cpp.exe capabilities
-
-      - name: Local no-fallback smoke (prebuilt)
-        run: python .\scripts\smoke_local.py --skip-build
-
-      - name: PyTorch GPU end-to-end
-        run: python .\scripts\pytorch_therock_gpu_test.py --engine .\target\debug\rocm-engine-pytorch.exe
-
-  instinct-gpu-test:
-    name: Instinct bare-metal GPU test (artifact)
-    runs-on: [self-hosted, linux, instinct, rocm]
-    needs: [build-and-test]
-    continue-on-error: true
-    if: vars.ENABLE_INSTINCT_CI == 'true' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
-    timeout-minutes: 45
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Download Linux binaries
-        uses: actions/download-artifact@v4
-        with:
-          name: linux-binaries
-          path: target/debug
-
-      - name: Restore executable bits
-        run: chmod +x target/debug/rocm target/debug/rocmd target/debug/rocm-engine-*
-
-      - name: Host detection
-        run: ./target/debug/rocm doctor
-
-      - name: Local no-fallback smoke (prebuilt)
-        run: python3 scripts/smoke_local.py --skip-build
-
-      - name: PyTorch GPU end-to-end
-        run: python3 scripts/pytorch_therock_gpu_test.py --engine ./target/debug/rocm-engine-pytorch
-      # Expand later (once first runs are green): vLLM/SGLang/ATOM GPU harnesses.
-
-  wsl-ubuntu-test:
-    name: WSL Ubuntu GPU test (artifact)
-    runs-on: [self-hosted, wsl, ubuntu]
-    needs: [build-and-test]
-    continue-on-error: true
-    if: vars.ENABLE_WSL_UBUNTU_CI == 'true' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
-    timeout-minutes: 45
-    permissions:
-      contents: read
-      actions: read
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Download Linux binaries
-        uses: actions/download-artifact@v4
-        with:
-          name: linux-binaries
-          path: target/debug
-
-      - name: Test prebuilt binaries in WSL Ubuntu
-        run: |
-          $ErrorActionPreference = "Stop"
-          $wp = (wsl -d Ubuntu wslpath -u "$($PWD.Path)").Trim()
-          if ($wp -match "'") { throw "Working directory path contains a single quote; cannot safely pass to bash" }
-          $script = @"
-          set -euo pipefail
-          cd '$wp'
-          chmod +x target/debug/rocm target/debug/rocmd target/debug/rocm-engine-*
-          python3 scripts/smoke_local.py --skip-build
-          python3 scripts/pytorch_therock_gpu_test.py --engine ./target/debug/rocm-engine-pytorch
-          "@
-          wsl -d Ubuntu -- bash -lc $script
-          if ($LASTEXITCODE -ne 0) { throw "WSL Ubuntu hardware test failed with exit code $LASTEXITCODE" }
-
-  wsl-fedora-test:
-    name: WSL Fedora GPU test (build-in-WSL, secondary)
-    runs-on: [self-hosted, wsl, fedora]
-    # Builds in-WSL, so gate on the lint check too (don't burn the scarce
-    # Fedora runner if fmt/clippy are red).
-    needs: [fmt, clippy]
-    # Secondary: builds inside WSL Fedora instead of reusing the ubuntu-latest
-    # artifact, to avoid cross-distro glibc mismatch. Non-blocking.
-    continue-on-error: true
-    if: vars.ENABLE_WSL_FEDORA_CI == 'true' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
-    timeout-minutes: 60
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Build and GPU-test in WSL Fedora
-        run: |
-          $ErrorActionPreference = "Stop"
-          $wp = (wsl -d Fedora wslpath -u "$($PWD.Path)").Trim()
-          if ($wp -match "'") { throw "Working directory path contains a single quote; cannot safely pass to bash" }
-          $script = @"
-          set -euo pipefail
-          cd '$wp'
-          export CARGO_TARGET_DIR="`$HOME/.cache/rocm-cli-target"
-          if ! command -v cargo >/dev/null 2>&1; then
-            curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-            export PATH="`$HOME/.cargo/bin:`$PATH"
-          fi
-          if command -v dnf >/dev/null 2>&1; then
-            sudo dnf install -y pkgconf-pkg-config libcap-devel gcc gcc-c++ make
-          fi
-          cargo build --workspace --all-targets
-          python3 scripts/smoke_local.py --skip-build --target-dir "`$CARGO_TARGET_DIR"
-          python3 scripts/pytorch_therock_gpu_test.py --engine "`$CARGO_TARGET_DIR/debug/rocm-engine-pytorch"
-          "@
-          wsl -d Fedora -- bash -lc $script
-          if ($LASTEXITCODE -ne 0) { throw "WSL Fedora hardware test failed with exit code $LASTEXITCODE" }
+  # Hardware (real AMD GPU / WSL) smoke tests on dedicated self-hosted runners
+  # are intentionally not part of this workflow yet. See
+  # docs/ci-hardware-testing.md for the planned design; they will land in a
+  # follow-up PR.
