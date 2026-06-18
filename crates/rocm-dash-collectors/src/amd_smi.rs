@@ -3,6 +3,7 @@
 //! Field paths and the KFD pre-flight check are vendored from the TypeScript
 //! `AmdSmiProvider` in instinct-dash. See `../wiki/entities/amd-smi.md`.
 
+use std::ffi::OsString;
 use std::io;
 use std::time::Duration;
 
@@ -20,7 +21,7 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub struct AmdSmiCollector {
-    binary: String,
+    binary: OsString,
 }
 
 impl AmdSmiCollector {
@@ -35,9 +36,9 @@ impl AmdSmiCollector {
     /// Like [`detect`](Self::detect) but uses an explicit `amd-smi` binary path.
     ///
     /// The managed ROCm SDK ships `amd-smi` inside the runtime wheel's bin
-    /// directory rather than on `PATH`, so callers resolve the absolute path
-    /// (via `rocm_core::resolve_amd_smi_binary`) and pass it here.
-    pub async fn detect_with_binary(binary: impl Into<String>) -> Option<Self> {
+    /// directory rather than on `PATH`, so callers resolve the path or command
+    /// name (via `rocm_core::resolve_amd_smi_binary`) and pass it here.
+    pub async fn detect_with_binary(binary: impl Into<OsString>) -> Option<Self> {
         if !kfd_accessible() {
             return None;
         }
@@ -47,11 +48,11 @@ impl AmdSmiCollector {
         match timeout(DETECT_TIMEOUT, me.run(&["version"])).await {
             Ok(Ok(_)) => Some(me),
             Ok(Err(e)) => {
-                warn!(error = %e, binary = %me.binary, "amd-smi present but `version` failed");
+                warn!(error = %e, binary = ?me.binary, "amd-smi present but `version` failed");
                 None
             }
             Err(_) => {
-                warn!(binary = %me.binary, "amd-smi `version` timed out");
+                warn!(binary = ?me.binary, "amd-smi `version` timed out");
                 None
             }
         }

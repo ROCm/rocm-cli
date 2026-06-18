@@ -1,6 +1,7 @@
 //! Owner task: drives collectors on tick cadences and broadcasts Snapshots.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -58,11 +59,11 @@ pub struct RunnerOptions {
     /// served via `rocm serve` appears in the dashboard with live `gen_tps`
     /// without Docker discovery. Off by default.
     pub services_dir: Option<PathBuf>,
-    /// Absolute path to the `amd-smi` binary. The managed ROCm SDK ships it
-    /// inside the runtime wheel's bin directory rather than on `PATH`, so the
-    /// caller resolves it (via `rocm_core::resolve_amd_smi_binary`) and passes
-    /// it here. `None` falls back to looking up `amd-smi` on `PATH`.
-    pub amd_smi_binary: Option<String>,
+    /// Path or command name for the `amd-smi` binary. The managed ROCm SDK
+    /// ships it inside the runtime wheel's bin directory rather than on `PATH`,
+    /// so the caller resolves it (via `rocm_core::resolve_amd_smi_binary`) and
+    /// passes it here. `None` falls back to looking up `amd-smi` on `PATH`.
+    pub amd_smi_binary: Option<OsString>,
 }
 
 impl Default for RunnerOptions {

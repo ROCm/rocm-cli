@@ -55,12 +55,8 @@ pub fn runner_options(
         // D7 seam consumer: managed services from `rocm serve --managed`.
         services_dir: Some(paths.services_dir()),
         // amd-smi ships inside the managed runtime wheel's bin dir, not on PATH;
-        // resolve the absolute path so the GPU collector can find it.
-        amd_smi_binary: Some(
-            rocm_core::resolve_amd_smi_binary()
-                .to_string_lossy()
-                .into_owned(),
-        ),
+        // resolve the path so the GPU collector can find it.
+        amd_smi_binary: Some(rocm_core::resolve_amd_smi_binary()),
     }
 }
 

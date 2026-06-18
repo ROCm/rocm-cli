@@ -5917,26 +5917,15 @@ fn amd_smi_bin_dirs_for_record(record: &TheRockFamilyManifest) -> Vec<PathBuf> {
 }
 
 fn resolve_amd_smi_binary_in_home(home_dir: Option<&Path>) -> OsString {
-    if let Some(home_rocm_dir) = home_dir.map(Path::to_path_buf).map(|dir| dir.join(".rocm")) {
-        let amd_smi_path = home_rocm_dir.join("bin").join("amd-smi");
-        if amd_smi_path.is_file() {
-            return amd_smi_path.into();
-        }
-    }
-
     if let Some(home_dir) = home_dir {
-        let amd_smi_path = home_dir
-            .join("rocm_venvs")
-            .join("default")
-            .join("bin")
-            .join("amd-smi");
-        if amd_smi_path.is_file() {
-            return amd_smi_path.into();
+        let venv_bin = home_dir.join("rocm_venvs").join("default").join("bin");
+        if let Some(path) = managed_sdk_tool_path(&venv_bin, "amd-smi") {
+            return path.into_os_string();
         }
 
-        let legacy_rocm_path = home_dir.join(".rocm").join("bin").join("amd-smi");
-        if legacy_rocm_path.is_file() {
-            return legacy_rocm_path.into();
+        let legacy_bin = home_dir.join(".rocm").join("bin");
+        if let Some(path) = managed_sdk_tool_path(&legacy_bin, "amd-smi") {
+            return path.into_os_string();
         }
     }
 
@@ -6024,8 +6013,9 @@ mod tests {
 
     #[test]
     fn resolve_amd_smi_binary_prefers_home_rocm_venv_path() -> Result<()> {
-        let temp_root = std::env::temp_dir().join(format!("rocm-cli-amd-smi-{}", unix_time_millis()));
-        let bin_dir = temp_root.join("rocm_venvs/default/bin");
+        let temp_root =
+            std::env::temp_dir().join(format!("rocm-cli-amd-smi-{}", unix_time_millis()));
+        let bin_dir = temp_root.join("rocm_venvs").join("default").join("bin");
         fs::create_dir_all(&bin_dir)?;
         let amd_smi_path = bin_dir.join("amd-smi");
         fs::write(&amd_smi_path, b"#!/bin/sh\nexit 0\n")?;
@@ -6041,8 +6031,8 @@ mod tests {
 
     #[test]
     fn resolve_amd_smi_binary_in_registry_uses_newest_runtime_sdk_bin() -> Result<()> {
-        let temp_root = std::env::temp_dir()
-            .join(format!("rocm-cli-amd-smi-registry-{}", unix_time_millis()));
+        let temp_root =
+            std::env::temp_dir().join(format!("rocm-cli-amd-smi-registry-{}", unix_time_millis()));
         let registry_dir = temp_root.join("runtimes/registry");
         fs::create_dir_all(&registry_dir)?;
 
@@ -6062,8 +6052,8 @@ mod tests {
         )?;
 
         // Newer runtime: amd-smi under the SDK devel bin_path.
-        let new_bin = temp_root
-            .join("release-wheel-gfx94x-dcgpu-7-14-0a20260611/_rocm_sdk_devel/bin");
+        let new_bin =
+            temp_root.join("release-wheel-gfx94x-dcgpu-7-14-0a20260611/_rocm_sdk_devel/bin");
         fs::create_dir_all(&new_bin)?;
         let new_amd_smi = new_bin.join("amd-smi");
         fs::write(&new_amd_smi, b"#!/bin/sh\nexit 0\n")?;
