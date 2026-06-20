@@ -69,9 +69,7 @@ fn daemon_runs_real_foreground_loop() {
         let _ = tx.send(false);
     });
 
-    let saw_banner = rx
-        .recv_timeout(Duration::from_secs(20))
-        .unwrap_or(false);
+    let saw_banner = rx.recv_timeout(Duration::from_secs(20)).unwrap_or(false);
 
     // The foreground loop blocks; terminate it regardless of outcome.
     let _ = child.kill();
