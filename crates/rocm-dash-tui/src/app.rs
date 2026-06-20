@@ -68,6 +68,9 @@ pub struct ResolvedArgs {
     /// Background checks for the automations manager (Phase 3 Wave 3). Adapted
     /// by the bin. Empty when none are available.
     pub automations: Vec<crate::ui::automations_manager::AutomationSummary>,
+    /// Bin-injected tool-executor seam; None for demo/replay/mock — dash behaves
+    /// as today. Stored here (Phase 2 plumbing); Phase 3 will use it.
+    pub tool_executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
 }
 
 type Tui = Terminal<CrosstermBackend<io::Stdout>>;
@@ -364,6 +367,9 @@ pub struct AppState {
     /// Background checks for the automations manager. Set from `ResolvedArgs`
     /// in the event loop; empty by default.
     pub automations: Vec<crate::ui::automations_manager::AutomationSummary>,
+    /// Bin-injected tool-executor seam. Set from `ResolvedArgs` in the event
+    /// loop; `None` for demo/replay/mock and by default.
+    pub tool_executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
 }
 
 impl AppState {
@@ -420,6 +426,7 @@ impl AppState {
             model_recipes: Vec::new(),
             runtimes: Vec::new(),
             automations: Vec::new(),
+            tool_executor: None,
         }
     }
 
@@ -829,6 +836,9 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     state.runtimes = args.runtimes.clone();
     // Automations manager source (Phase 3 Wave 3), adapted by the bin.
     state.automations = args.automations.clone();
+    // Tool-executor seam (Phase 2 plumbing), injected by the bin; None for
+    // demo/replay/mock. Phase 3 will use it.
+    state.tool_executor = args.tool_executor.clone();
     state.replay = replay_controller.map(ReplayState::new);
 
     // Resolve the chat backend. `--chat-mock` short-circuits detection with a

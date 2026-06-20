@@ -166,6 +166,9 @@ pub fn resolved_args(
         model_recipes: model_recipe_summaries(),
         runtimes: runtime_summaries(paths, config),
         automations: automation_summaries(config),
+        // The real executor is injected in `run_async` for a live dash; None
+        // here keeps demo/replay/mock behaving exactly as today.
+        tool_executor: None,
     }
 }
 
