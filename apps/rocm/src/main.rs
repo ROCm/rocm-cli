@@ -1071,8 +1071,7 @@ fn render_freeform_comfyui_status_answer(
     Ok(output)
 }
 
-// pub(crate): used by the dash execution seam (dash_seam.rs)
-pub(crate) fn dispatch(cli: Cli) -> Result<()> {
+fn dispatch(cli: Cli) -> Result<()> {
     if !matches!(
         cli.command,
         Some(Command::Update { .. } | Command::Bootstrap { .. } | Command::Completions { .. })
