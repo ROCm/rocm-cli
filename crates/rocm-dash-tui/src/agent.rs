@@ -1280,6 +1280,72 @@ mod tests {
         assert!(SKILL_NAMES.contains(&"skill_plan"));
     }
 
+    /// Minimal executor that echoes a fixed JSON value for any tool call.
+    #[derive(Debug)]
+    struct FakeExec(serde_json::Value);
+    impl crate::tool_exec::RocmToolExecutor for FakeExec {
+        fn execute(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
+            RocmToolOutcome::Result(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_tool_round_trips_to_json() {
+        // chat → tool → executor → JSON: the tool forwards across the seam and
+        // returns the executor's payload verbatim.
+        let exec: SharedRocmToolExecutor = Arc::new(FakeExec(json!({ "ok": true })));
+        let tool = DoctorRocmTool {
+            executor: Some(exec),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        let out = tool.call(json!({})).await.expect("tool call ok");
+        assert_eq!(out, json!({ "ok": true }));
+        // The fired log records that the tool ran.
+        assert_eq!(tool.fired.lock().unwrap().as_slice(), &["doctor".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn read_only_tool_none_executor_is_graceful() {
+        // No seam (demo/replay/mock): a clear error object, never a panic.
+        let tool = EnginesRocmTool {
+            executor: None,
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        let out = tool.call(json!({})).await.expect("tool call ok");
+        assert!(out.get("error").and_then(Value::as_str).is_some());
+    }
+
+    #[test]
+    fn rocm_read_tool_names_are_complete_and_disjoint_from_skills() {
+        // Every expected read-only tool is registered…
+        for expected in [
+            "doctor",
+            "engines",
+            "services",
+            "service_logs",
+            "bridge_snapshot",
+            "gpu_snapshot",
+            "automations",
+            "path_exists",
+            "port_status",
+            "update_check",
+            "install_sdk_dry_run",
+            "rocm_command",
+        ] {
+            assert!(
+                ROCM_READ_TOOL_NAMES.contains(&expected),
+                "missing read tool: {expected}"
+            );
+        }
+        // …no mutating / planning tool leaked in (later phases).
+        assert!(!ROCM_READ_TOOL_NAMES.contains(&"natural_language_plan"));
+        // The telemetry/skill tools are still present and disjoint from the new set.
+        assert!(SKILL_NAMES.contains(&"gpu_status"));
+        for n in ROCM_READ_TOOL_NAMES {
+            assert!(!SKILL_NAMES.contains(&n), "name collision: {n}");
+        }
+    }
+
     #[test]
     fn annotate_reply_appends_deduped_skills() {
         let r = annotate_reply("hi".into(), &["gpu_status".into(), "gpu_status".into()]);

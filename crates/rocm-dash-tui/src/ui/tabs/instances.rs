@@ -807,6 +807,8 @@ mod tests {
             runtimes: Vec::new(),
             automations: Vec::new(),
             tool_executor: None,
+            should_quit: false,
+            slash_tool: None,
         }
     }
 

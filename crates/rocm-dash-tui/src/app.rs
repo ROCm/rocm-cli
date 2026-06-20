@@ -2693,6 +2693,140 @@ mod tests {
         assert!(s.chat_dispatch);
     }
 
+    // --- Slash-command dispatch (Phase 3 nav/session + read-only) ---
+
+    fn st() -> AppState {
+        AppState::new("t".into(), "default-dark".into())
+    }
+
+    #[test]
+    fn slash_help_opens_help_modal() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/help"), SlashOutcome::Handled);
+        assert_eq!(s.modal, Modal::Help);
+    }
+
+    #[test]
+    fn slash_question_mark_opens_help_modal() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/?"), SlashOutcome::Handled);
+        assert_eq!(s.modal, Modal::Help);
+    }
+
+    #[test]
+    fn slash_clear_empties_transcript() {
+        let mut s = st();
+        s.chat.push(ChatTurn::user("hi"));
+        s.chat.push(ChatTurn::agent("hello"));
+        assert_eq!(s.handle_slash_command("/clear"), SlashOutcome::Handled);
+        assert!(s.chat.is_empty());
+    }
+
+    #[test]
+    fn slash_quit_sets_should_quit() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/quit"), SlashOutcome::Handled);
+        assert!(s.should_quit);
+    }
+
+    #[test]
+    fn slash_exit_sets_should_quit() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/exit"), SlashOutcome::Handled);
+        assert!(s.should_quit);
+    }
+
+    #[test]
+    fn slash_home_switches_to_overview() {
+        let mut s = st();
+        s.active_tab = ActiveTab::Bench;
+        assert_eq!(s.handle_slash_command("/home"), SlashOutcome::Handled);
+        assert_eq!(s.active_tab, ActiveTab::Overview);
+    }
+
+    #[test]
+    fn slash_gpu_switches_to_hardware() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/gpu"), SlashOutcome::Handled);
+        assert_eq!(s.active_tab, ActiveTab::Hardware);
+    }
+
+    #[test]
+    fn slash_doctor_opens_overlay() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/doctor"), SlashOutcome::Handled);
+        assert!(s.examine_manager.is_some());
+    }
+
+    #[test]
+    fn slash_runtimes_opens_overlay() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/runtimes"), SlashOutcome::Handled);
+        assert!(s.runtime_manager.is_some());
+    }
+
+    #[test]
+    fn slash_config_opens_overlay() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/config"), SlashOutcome::Handled);
+        assert!(s.config_manager.is_some());
+    }
+
+    #[test]
+    fn slash_logs_opens_overlay() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/logs"), SlashOutcome::Handled);
+        assert!(s.logs_view.is_some());
+    }
+
+    #[test]
+    fn slash_model_raises_executor_request() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/model"), SlashOutcome::Handled);
+        let req = s.slash_tool.expect("model raises a slash_tool request");
+        assert_eq!(req.name, "rocm_command");
+        assert_eq!(req.args, serde_json::json!({ "args": ["model"] }));
+    }
+
+    #[test]
+    fn slash_daemon_raises_executor_request() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/daemon"), SlashOutcome::Handled);
+        let req = s.slash_tool.expect("daemon raises a slash_tool request");
+        assert_eq!(req.name, "rocm_command");
+        assert_eq!(req.args, serde_json::json!({ "args": ["daemon", "status"] }));
+    }
+
+    #[test]
+    fn slash_unknown_appends_error_turn_and_is_handled() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/zzz"), SlashOutcome::Handled);
+        assert_eq!(s.chat.len(), 1);
+        assert_eq!(s.chat[0].role, ChatRole::Error);
+        assert!(s.chat[0].content.contains("/zzz"));
+    }
+
+    #[test]
+    fn plain_text_is_not_a_command() {
+        let mut s = st();
+        assert_eq!(
+            s.handle_slash_command("what's GPU-2 doing?"),
+            SlashOutcome::NotCommand
+        );
+    }
+
+    #[test]
+    fn submit_routes_slash_command_away_from_the_agent() {
+        // A slash line through submit_chat must NOT raise the agent dispatch edge.
+        let mut s = st();
+        s.chat_input = "/help".into();
+        s.submit_chat();
+        assert_eq!(s.modal, Modal::Help);
+        assert!(!s.chat_dispatch, "slash command never dispatches to the LLM");
+        assert!(!s.chat_sending);
+        assert!(s.chat_input.is_empty());
+    }
+
     #[tokio::test]
     async fn chat_reply_path_appends_agent_turn_and_clears_sending() {
         // The wired ChatSubmit→reply path using the MockAgentClient (no LLM).
