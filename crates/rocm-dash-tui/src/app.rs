@@ -263,6 +263,42 @@ pub fn format_mmss(secs: u64) -> String {
     }
 }
 
+/// Which chat LLM backend is active. The dash can switch live via `/provider`
+/// (Phase 8); every backend calls the SAME ROCm tools through the seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ChatProvider {
+    /// The auto-detected local OpenAI-compatible endpoint (or the no-key ChatGPT
+    /// OAuth default). This is the launch default and reuses the inline build.
+    #[default]
+    Local,
+    /// OpenAI's hosted Chat Completions API (`OPENAI_API_KEY`).
+    Openai,
+    /// Anthropic's Claude API (`ANTHROPIC_API_KEY`).
+    Anthropic,
+}
+
+impl ChatProvider {
+    /// Parse the `/provider <name>` argument (case-insensitive). `None` for an
+    /// unrecognized name so the handler can hint instead of switching silently.
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "local" => Some(Self::Local),
+            "openai" => Some(Self::Openai),
+            "anthropic" => Some(Self::Anthropic),
+            _ => None,
+        }
+    }
+
+    /// The lowercase label used in turns and hints.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Openai => "openai",
+            Self::Anthropic => "anthropic",
+        }
+    }
+}
+
 /// Result of routing a chat-input line through the slash-command handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SlashOutcome {
@@ -450,6 +486,11 @@ pub struct AppState {
     /// A surfaced mutating-tool approval awaiting the operator's decision
     /// (Phase 4). `Some` ⇒ the approval modal is open and owns keyboard focus.
     pub(crate) approval: Option<PendingApproval>,
+    /// The chat LLM backend currently selected (Phase 8). Defaults to `Local`.
+    pub(crate) active_provider: ChatProvider,
+    /// Edge: a pending `/provider` switch. Raised by `handle_slash_command`,
+    /// drained once by the event loop which rebuilds the live `agent`.
+    pub(crate) provider_switch: Option<ChatProvider>,
 }
 
 impl AppState {
@@ -511,6 +552,8 @@ impl AppState {
             slash_tool: None,
             plan_request: None,
             approval: None,
+            active_provider: ChatProvider::default(),
+            provider_switch: None,
         }
     }
 
@@ -1113,6 +1156,49 @@ impl AppState {
                     self.plan_request = Some(request.to_string());
                 }
             }
+            // --- Group G: provider switch + chat entry (Phase 8) ---
+            // `/provider [local|openai|anthropic]` switches the live chat
+            // backend. A bare/unknown arg shows the current provider (or hints);
+            // a valid one raises the `provider_switch` edge for the event loop to
+            // rebuild the agent. Every backend calls the SAME ROCm tools.
+            "provider" => match rest.split_whitespace().nth(1) {
+                None => {
+                    self.chat.push(ChatTurn::agent(format!(
+                        "current provider: {} (usage: /provider [local|openai|anthropic])",
+                        self.active_provider.label()
+                    )));
+                }
+                Some(arg) => match ChatProvider::parse(arg) {
+                    Some(p) => {
+                        self.active_provider = p;
+                        self.provider_switch = Some(p);
+                    }
+                    None => {
+                        self.chat.push(ChatTurn::error(format!(
+                            "unknown provider `{arg}` (try local, openai, or anthropic)"
+                        )));
+                    }
+                },
+            },
+            // `/chat [prompt]`: with a prompt, send it to the agent (passthrough,
+            // exactly as a plain line would); bare `/chat` focuses the Chat tab.
+            "chat" => {
+                let prompt = rest
+                    .split_once(char::is_whitespace)
+                    .map(|(_, tail)| tail.trim())
+                    .unwrap_or_default();
+                if prompt.is_empty() {
+                    self.active_tab = ActiveTab::Chat;
+                    self.chat_focused = true;
+                } else if !self.chat_sending {
+                    // Mirror `submit_chat`'s dispatch tail (the slash already
+                    // consumed `chat_input`); guarded so an in-flight request is
+                    // never double-spawned.
+                    self.chat.push(ChatTurn::user(prompt.to_string()));
+                    self.chat_sending = true;
+                    self.chat_dispatch = true;
+                }
+            }
             // Unknown slash command: an error turn, never sent to the LLM.
             other => {
                 self.chat.push(ChatTurn::error(format!(
@@ -1413,6 +1499,60 @@ impl AppState {
     }
 }
 
+/// OpenAI's hosted Chat Completions base URL (the standard, no-gateway case).
+const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+/// Default OpenAI model when none is configured via `chat_model`.
+const OPENAI_DEFAULT_MODEL: &str = "gpt-5";
+
+/// Construct the chat backend for an explicitly-selected provider (Phase 8).
+///
+/// Construction only — NO network I/O happens here (rig clients defer the
+/// request to `complete()`). Handles ONLY `Openai` and `Anthropic`; `Local`
+/// returns `None` because its build (auto-detect probe → Rig/ChatGPT) is owned
+/// by `event_loop`'s inline path and can't be reproduced from `ResolvedArgs`
+/// alone. Keys come from `ResolvedArgs` (in-process seam), never argv. `None`
+/// signals "couldn't build" (e.g. a missing key) so the caller surfaces an
+/// actionable error turn instead of switching to a dead backend.
+fn build_chat_agent(
+    provider: ChatProvider,
+    args: &ResolvedArgs,
+    executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
+    approval_tx: mpsc::UnboundedSender<ClientMsg>,
+) -> Option<std::sync::Arc<dyn crate::agent::AgentClient>> {
+    match provider {
+        // Local is rebuilt by the caller's inline path (it needs the live probe).
+        ChatProvider::Local => None,
+        ChatProvider::Openai => {
+            let cfg = crate::llm::LlmConfig {
+                base_url: OPENAI_BASE_URL.to_string(),
+                model: args
+                    .chat_model
+                    .clone()
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or_else(|| OPENAI_DEFAULT_MODEL.to_string()),
+                api_key: args.chat_api_key.clone(),
+                auth_header: None,
+            };
+            crate::agent::RigAgentClient::new(cfg, executor, Some(approval_tx))
+                .ok()
+                .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
+        }
+        ChatProvider::Anthropic => {
+            // Leave base_url empty → the Anthropic backend uses rig's default
+            // host. model "" → CLAUDE_SONNET_4_6 (resolved inside the backend).
+            let cfg = crate::llm::LlmConfig {
+                base_url: String::new(),
+                model: args.chat_model.clone().unwrap_or_default(),
+                api_key: args.anthropic_api_key.clone(),
+                auth_header: None,
+            };
+            crate::agent::AnthropicAgentClient::new(cfg, executor, Some(approval_tx))
+                .ok()
+                .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
+        }
+    }
+}
+
 pub async fn run(args: ResolvedArgs) -> color_eyre::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1475,7 +1615,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     // deterministic offline MockAgentClient (no live LLM, no network); otherwise
     // we auto-detect the endpoint (the std-TCP probe runs once on a blocking
     // thread before the first frame) and build the Rig backend.
-    let agent: Option<std::sync::Arc<dyn crate::agent::AgentClient>> = if args.chat_mock {
+    let mut agent: Option<std::sync::Arc<dyn crate::agent::AgentClient>> = if args.chat_mock {
         state.set_chat_config(
             Some(crate::llm::LlmConfig {
                 base_url: "mock://offline-demo".to_string(),
@@ -1858,6 +1998,52 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                 }
                 None => {
                     state.on_slash_tool_reply("ROCm tools unavailable in this mode".to_string());
+                }
+            }
+        }
+
+        // Drain a `/provider` switch (Phase 8). Rebuild the live `agent` for the
+        // newly-selected backend. `Local` reuses whatever the inline launch path
+        // built (it owns the auto-detect probe). `Openai`/`Anthropic` are built
+        // from `ResolvedArgs` keys (in-process seam, never argv). A build failure
+        // (e.g. missing key) leaves `agent` unchanged and surfaces an actionable
+        // error turn. Construction only — no network until the next submit.
+        if let Some(target) = state.provider_switch.take() {
+            match target {
+                ChatProvider::Local => {
+                    state
+                        .chat
+                        .push(ChatTurn::agent("switched to local".to_string()));
+                }
+                ChatProvider::Openai | ChatProvider::Anthropic => {
+                    match build_chat_agent(
+                        target,
+                        args,
+                        state.tool_executor.clone(),
+                        chat_tx.clone(),
+                    ) {
+                        Some(new_agent) => {
+                            agent = Some(new_agent);
+                            state
+                                .chat
+                                .push(ChatTurn::agent(format!("switched to {}", target.label())));
+                        }
+                        None => {
+                            // Revert the optimistic `active_provider` set by the
+                            // slash handler so the displayed provider stays honest.
+                            state.active_provider = ChatProvider::Local;
+                            let hint = match target {
+                                ChatProvider::Anthropic => {
+                                    "anthropic requires ANTHROPIC_API_KEY in env or secure store"
+                                }
+                                _ => "openai requires OPENAI_API_KEY in the environment",
+                            };
+                            state.chat.push(ChatTurn::error(format!(
+                                "could not switch to {}: {hint}",
+                                target.label()
+                            )));
+                        }
+                    }
                 }
             }
         }
