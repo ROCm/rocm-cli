@@ -753,17 +753,53 @@ rocm_mutating_tool!(
         "required": ["service_id"]
     }
 );
+rocm_mutating_tool!(
+    WatcherEnableRocmTool,
+    "watcher_enable",
+    "Enable a background automation watcher, optionally choosing how far it may \
+     act (mode: observe | propose | contained). MUTATING — surfaced for operator \
+     approval before anything runs.",
+    {
+        "type": "object",
+        "properties": {
+            "watcher": { "type": "string", "description": "Watcher id to enable." },
+            "mode": {
+                "type": "string",
+                "enum": ["observe", "propose", "contained"],
+                "description": "Optional autonomy mode: observe (log only), propose (suggest), or contained (act within guardrails)."
+            }
+        },
+        "required": ["watcher"]
+    }
+);
+rocm_mutating_tool!(
+    WatcherDisableRocmTool,
+    "watcher_disable",
+    "Disable a background automation watcher by id. MUTATING — surfaced for \
+     operator approval before anything runs.",
+    {
+        "type": "object",
+        "properties": {
+            "watcher": { "type": "string", "description": "Watcher id to disable." }
+        },
+        "required": ["watcher"]
+    }
+);
 
 /// All mutating ROCm tool names (mirrors [`ROCM_READ_TOOL_NAMES`]).
 ///
 /// Used for uniqueness/registration checks and the parity map. Phase 4 ships
-/// exactly the install/engine/serve/services mutating set;
-/// update/comfyui/uninstall/setup and automations toggles are later phases.
-pub const ROCM_MUTATING_TOOL_NAMES: [&str; 4] = [
+/// the install/engine/serve/services mutating set; Phase 6 adds the automations
+/// (watcher) toggles. `proposal_action` (reviews approve/reject) is NOT a rig
+/// mutating tool — it routes via the slash seam only — so it is intentionally
+/// absent here. update/comfyui/uninstall/setup use the `rocm_command` tool.
+pub const ROCM_MUTATING_TOOL_NAMES: [&str; 6] = [
     InstallSdkRocmTool::NAME,
     InstallEngineRocmTool::NAME,
     LaunchServerRocmTool::NAME,
     StopServerRocmTool::NAME,
+    WatcherEnableRocmTool::NAME,
+    WatcherDisableRocmTool::NAME,
 ];
 
 /// Register every mutating ROCm tool on a Rig `AgentBuilder`, cloning the
@@ -797,6 +833,16 @@ where
             fired: fired.clone(),
         })
         .tool(StopServerRocmTool {
+            executor: executor.cloned(),
+            approval_tx: approval_tx.cloned(),
+            fired: fired.clone(),
+        })
+        .tool(WatcherEnableRocmTool {
+            executor: executor.cloned(),
+            approval_tx: approval_tx.cloned(),
+            fired: fired.clone(),
+        })
+        .tool(WatcherDisableRocmTool {
             executor: executor.cloned(),
             approval_tx: approval_tx.cloned(),
             fired: fired.clone(),
@@ -1591,6 +1637,8 @@ mod tests {
             "install_engine",
             "launch_server",
             "stop_server",
+            "watcher_enable",
+            "watcher_disable",
         ] {
             assert!(
                 ROCM_MUTATING_TOOL_NAMES.contains(&expected),
