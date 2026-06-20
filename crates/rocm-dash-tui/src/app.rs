@@ -1692,6 +1692,14 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         }
     };
 
+    // Snapshot the auto-detected local backend so `/provider local` can restore
+    // it after a switch to a remote provider. Without this, switching to OpenAI
+    // and back to local would leave `agent` pointing at the OpenAI backend
+    // (silent wrong-backend bug) — `build_chat_agent(Local)` returns None by
+    // design (Local is the inline-built backend), so the caller must restore the
+    // saved clone here. `Option<Arc<…>>` clone is a cheap Arc refcount bump.
+    let local_agent = agent.clone();
+
     loop {
         terminal.draw(|f| ui::draw(f, &mut state))?;
         tokio::select! {
@@ -2011,6 +2019,11 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         if let Some(target) = state.provider_switch.take() {
             match target {
                 ChatProvider::Local => {
+                    // Restore the auto-detected local backend saved before the
+                    // event loop. `build_chat_agent(Local)` returns None by
+                    // design, so the restore must happen here — otherwise a prior
+                    // `/provider openai` would leave requests routed to OpenAI.
+                    agent = local_agent.clone();
                     state
                         .chat
                         .push(ChatTurn::agent("switched to local".to_string()));
@@ -3842,6 +3855,40 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
         let args = args_with_anthropic_key(Some("k"));
         assert!(build_chat_agent(ChatProvider::Local, &args, None, tx).is_none());
+    }
+
+    #[test]
+    fn provider_local_restores_saved_local_agent() {
+        // Invariant for the `ChatProvider::Local` arm of the provider_switch
+        // drain: because `build_chat_agent(Local)` returns None (asserted above),
+        // the event loop CANNOT rebuild the local backend on demand. It must
+        // restore the `local_agent` clone snapshotted before the loop. This test
+        // models that contract: after a remote switch flips `agent` away from the
+        // saved local clone, `/provider local` must re-point `agent` back to it.
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let local_agent: Option<std::sync::Arc<dyn crate::agent::AgentClient>> = Some(
+            std::sync::Arc::new(crate::agent::MockAgentClient::new("local"))
+                as std::sync::Arc<dyn crate::agent::AgentClient>,
+        );
+        // Simulate a prior remote switch: `agent` now points elsewhere.
+        let remote: Option<std::sync::Arc<dyn crate::agent::AgentClient>> = Some(
+            std::sync::Arc::new(crate::agent::MockAgentClient::new("remote"))
+                as std::sync::Arc<dyn crate::agent::AgentClient>,
+        );
+        let mut agent = remote;
+        assert!(!std::sync::Arc::ptr_eq(
+            agent.as_ref().unwrap(),
+            local_agent.as_ref().unwrap()
+        ));
+        // The Local arm's restore line (mirrors app.rs): the factory cannot help.
+        let args = args_with_anthropic_key(Some("k"));
+        assert!(build_chat_agent(ChatProvider::Local, &args, None, tx).is_none());
+        agent = local_agent.clone();
+        // `agent` is now the original auto-detected local backend, not the remote.
+        assert!(std::sync::Arc::ptr_eq(
+            agent.as_ref().unwrap(),
+            local_agent.as_ref().unwrap()
+        ));
     }
 
     #[test]

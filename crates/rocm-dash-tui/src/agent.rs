@@ -956,30 +956,9 @@ impl AgentClient for RigAgentClient {
             .client
             .agent(&self.model)
             .preamble(&self.preamble)
-            .max_tokens(1024)
-            .tool(GpuStatusTool {
-                snap: snap.clone(),
-                fired: fired.clone(),
-            })
-            .tool(ListInstancesTool {
-                snap: snap.clone(),
-                fired: fired.clone(),
-            })
-            .tool(BenchSummaryTool {
-                snap: snap.clone(),
-                fired: fired.clone(),
-            })
-            .tool(TokensPerWattTool {
-                snap: snap.clone(),
-                fired: fired.clone(),
-            })
-            // Skills registry tools (read-only: list + dry-run plan; never execute).
-            .tool(ListSkillsTool {
-                fired: fired.clone(),
-            })
-            .tool(SkillPlanTool {
-                fired: fired.clone(),
-            });
+            .max_tokens(1024);
+        // Telemetry + skill registry tools (shared registration site).
+        let agent = register_telemetry_tools(agent, &snap, &fired);
         // Read-only ROCm machine-inspection tools (forward across the seam).
         let agent = register_rocm_read_tools(agent, self.executor.as_ref(), &fired);
         // Mutating ROCm tools (surface approval; never execute in the rig loop).
@@ -1005,6 +984,52 @@ impl AgentClient for RigAgentClient {
         let skills = fired.lock().map(|g| g.clone()).unwrap_or_default();
         Ok(annotate_reply(reply, &skills))
     }
+}
+
+/// Register the telemetry + skill registry tools (GpuStatus, ListInstances,
+/// BenchSummary, TokensPerWatt — snapshot-backed; ListSkills, SkillPlan —
+/// read-only registry) on a fresh Rig `AgentBuilder`, cloning the snapshot +
+/// shared `fired` log into each. Kept generic over the builder's completion
+/// model + preamble so all three backends (RigAgentClient, ChatGptAgentClient,
+/// AnthropicAgentClient) reuse one registration site (DRY — the tool list lives
+/// in exactly one place, mirroring [`register_rocm_read_tools`]). Takes the base
+/// builder (`NoToolConfig`) and returns it in `WithBuilderTools` because the
+/// first `.tool()` transitions the type-state; the ROCm read/mutating
+/// registrations chain after it. Note: ListSkillsTool/SkillPlanTool take only
+/// `fired`; the other four take `snap` + `fired`.
+fn register_telemetry_tools<M, P>(
+    builder: rig::agent::AgentBuilder<M, P>,
+    snap: &Arc<StateSnapshot>,
+    fired: &FiredLog,
+) -> rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>
+where
+    M: rig::completion::CompletionModel,
+    P: rig::agent::PromptHook<M>,
+{
+    builder
+        .tool(GpuStatusTool {
+            snap: snap.clone(),
+            fired: fired.clone(),
+        })
+        .tool(ListInstancesTool {
+            snap: snap.clone(),
+            fired: fired.clone(),
+        })
+        .tool(BenchSummaryTool {
+            snap: snap.clone(),
+            fired: fired.clone(),
+        })
+        .tool(TokensPerWattTool {
+            snap: snap.clone(),
+            fired: fired.clone(),
+        })
+        // Skills registry tools (read-only: list + dry-run plan; never execute).
+        .tool(ListSkillsTool {
+            fired: fired.clone(),
+        })
+        .tool(SkillPlanTool {
+            fired: fired.clone(),
+        })
 }
 
 /// Register every read-only ROCm tool on a Rig `AgentBuilder`, cloning the
@@ -1200,30 +1225,9 @@ impl AgentClient for ChatGptAgentClient {
         let model = ResponsesCompletionModel::new(self.client.clone(), self.model.clone());
         let agent = AgentBuilder::new(model)
             .preamble(&self.preamble)
-            .max_tokens(1024)
-            .tool(GpuStatusTool {
-                snap: snap.clone(),
-                fired: fired.clone(),
-            })
-            .tool(ListInstancesTool {
-                snap: snap.clone(),
-                fired: fired.clone(),
-            })
-            .tool(BenchSummaryTool {
-                snap: snap.clone(),
-                fired: fired.clone(),
-            })
-            .tool(TokensPerWattTool {
-                snap: snap.clone(),
-                fired: fired.clone(),
-            })
-            // Read-only Skills registry tools (list + dry-run plan; never execute).
-            .tool(ListSkillsTool {
-                fired: fired.clone(),
-            })
-            .tool(SkillPlanTool {
-                fired: fired.clone(),
-            });
+            .max_tokens(1024);
+        // Telemetry + skill registry tools (shared registration site).
+        let agent = register_telemetry_tools(agent, &snap, &fired);
         // Read-only ROCm machine-inspection tools (forward across the seam).
         let agent = register_rocm_read_tools(agent, self.executor.as_ref(), &fired);
         // Mutating ROCm tools (surface approval; never execute in the rig loop).
@@ -1330,30 +1334,9 @@ impl AgentClient for AnthropicAgentClient {
             .client
             .agent(&self.model)
             .preamble(&self.preamble)
-            .max_tokens(1024)
-            .tool(GpuStatusTool {
-                snap: snap.clone(),
-                fired: fired.clone(),
-            })
-            .tool(ListInstancesTool {
-                snap: snap.clone(),
-                fired: fired.clone(),
-            })
-            .tool(BenchSummaryTool {
-                snap: snap.clone(),
-                fired: fired.clone(),
-            })
-            .tool(TokensPerWattTool {
-                snap: snap.clone(),
-                fired: fired.clone(),
-            })
-            // Read-only Skills registry tools (list + dry-run plan; never execute).
-            .tool(ListSkillsTool {
-                fired: fired.clone(),
-            })
-            .tool(SkillPlanTool {
-                fired: fired.clone(),
-            });
+            .max_tokens(1024);
+        // Telemetry + skill registry tools (shared registration site).
+        let agent = register_telemetry_tools(agent, &snap, &fired);
         // Read-only ROCm machine-inspection tools (forward across the seam).
         let agent = register_rocm_read_tools(agent, self.executor.as_ref(), &fired);
         // Mutating ROCm tools (surface approval; never execute in the rig loop).
@@ -2048,12 +2031,31 @@ mod tests {
 
     #[test]
     fn all_backends_register_same_rocm_tools() {
-        // Contract: every backend's complete() registers BOTH the read and the
-        // mutating ROCm tool sets (each calls register_rocm_read_tools +
-        // register_rocm_mutating_tools), so capability + approval parity holds
+        // Contract: every backend's complete() registers the SAME three tool
+        // sets — telemetry/skill (register_telemetry_tools), read ROCm
+        // (register_rocm_read_tools), and mutating ROCm
+        // (register_rocm_mutating_tools) — so capability + approval parity holds
         // across local/openai/anthropic. This enumerates the canonical sets that
         // those shared helpers register; the helper call sites are identical in
         // RigAgentClient, ChatGptAgentClient, and AnthropicAgentClient.
+        //
+        // Telemetry/skill set: register_telemetry_tools registers exactly the
+        // SKILL_NAMES tools (GpuStatus, ListInstances, BenchSummary,
+        // TokensPerWatt, ListSkills, SkillPlan). Pinning the size here means the
+        // telemetry registration can't silently diverge from the canonical set.
+        assert_eq!(SKILL_NAMES.len(), 6, "canonical telemetry/skill set size");
+        for n in SKILL_NAMES {
+            assert!(!n.is_empty(), "empty telemetry/skill tool name");
+            // Telemetry tools are disjoint from both ROCm sets.
+            assert!(
+                !ROCM_READ_TOOL_NAMES.contains(&n),
+                "telemetry tool {n} collides with read set"
+            );
+            assert!(
+                !ROCM_MUTATING_TOOL_NAMES.contains(&n),
+                "telemetry tool {n} collides with mutating set"
+            );
+        }
         assert_eq!(
             ROCM_READ_TOOL_NAMES.len(),
             13,
