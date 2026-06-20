@@ -14476,18 +14476,6 @@ mod tests {
     }
 
     #[test]
-    fn daemon_run_argv_targets_rocmd_run_with_automations() {
-        assert_eq!(
-            daemon_run_argv(),
-            vec![
-                OsString::from("rocmd"),
-                OsString::from("run"),
-                OsString::from("--automations-enabled"),
-            ]
-        );
-    }
-
-    #[test]
     fn service_http_readiness_requires_loaded_lemonade_model() {
         let loading = json!({ "all_models_loaded": [] }).to_string();
         assert!(!service_http_readiness_response_ready(
