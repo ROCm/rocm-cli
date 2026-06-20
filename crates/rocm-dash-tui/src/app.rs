@@ -897,19 +897,26 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             && args.chat_env_url.is_none();
         if no_key_no_endpoint {
             let oauth_tx = chat_tx.clone();
-            crate::agent::ChatGptAgentClient::new(args.chat_model.clone(), move |url, code| {
-                let _ = oauth_tx.send(ClientMsg::ChatReply {
-                    text: format!(
-                        "To enable chat, sign in to ChatGPT: open {url} and enter the code {code}"
-                    ),
-                });
-            })
+            crate::agent::ChatGptAgentClient::new(
+                args.chat_model.clone(),
+                move |url, code| {
+                    let _ = oauth_tx.send(ClientMsg::ChatReply {
+                        text: format!(
+                            "To enable chat, sign in to ChatGPT: open {url} and enter the code {code}"
+                        ),
+                    });
+                },
+                state.tool_executor.clone(),
+            )
             .ok()
             .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
         } else {
             // A build failure leaves `agent` None; a submit surfaces an error turn.
             match &state.chat_llm {
-                Some(cfg) => crate::agent::RigAgentClient::new(cfg.clone())
+                Some(cfg) => crate::agent::RigAgentClient::new(
+                    cfg.clone(),
+                    state.tool_executor.clone(),
+                )
                     .ok()
                     .map(|c| {
                         std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>
