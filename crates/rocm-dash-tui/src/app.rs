@@ -665,6 +665,17 @@ impl AppState {
     /// [`SlashOutcome::Handled`]. Stays I/O-free: executor-backed commands raise
     /// the `slash_tool` edge for the event loop to drain off-thread.
     pub(crate) fn handle_slash_command(&mut self, text: &str) -> SlashOutcome {
+        /// Build a `rocm_command` slash-tool request from an argv slice and a
+        /// chat-turn label. Centralizes the repeated `name: "rocm_command"` +
+        /// `{"args": argv}` construction shared by the lifecycle read/mutate arms.
+        fn rocm_cmd_request(argv: &[&str], label: impl Into<String>) -> SlashToolRequest {
+            SlashToolRequest {
+                name: "rocm_command".to_string(),
+                args: serde_json::json!({ "args": argv }),
+                label: label.into(),
+            }
+        }
+
         let trimmed = text.trim();
         let Some(rest) = trimmed.strip_prefix('/') else {
             return SlashOutcome::NotCommand;
@@ -701,18 +712,10 @@ impl AppState {
             }
             // --- Group B: read-only executor-backed (no overlay; off-thread) ---
             "model" => {
-                self.slash_tool = Some(SlashToolRequest {
-                    name: "rocm_command".to_string(),
-                    args: serde_json::json!({ "args": ["model"] }),
-                    label: "model".to_string(),
-                });
+                self.slash_tool = Some(rocm_cmd_request(&["model"], "model"));
             }
             "daemon" => {
-                self.slash_tool = Some(SlashToolRequest {
-                    name: "rocm_command".to_string(),
-                    args: serde_json::json!({ "args": ["daemon", "status"] }),
-                    label: "daemon status".to_string(),
-                });
+                self.slash_tool = Some(rocm_cmd_request(&["daemon", "status"], "daemon status"));
             }
             // --- Group D: mutating ops (approval-gated; surfaced via the modal) ---
             // Each raises a `slash_tool` request whose `execute()` returns
@@ -828,11 +831,10 @@ impl AppState {
                 } else {
                     vec!["update"]
                 };
-                self.slash_tool = Some(SlashToolRequest {
-                    name: "rocm_command".to_string(),
-                    args: serde_json::json!({ "args": argv }),
-                    label: if apply { "update --apply" } else { "update" }.to_string(),
-                });
+                self.slash_tool = Some(rocm_cmd_request(
+                    &argv,
+                    if apply { "update --apply" } else { "update" },
+                ));
             }
             "comfyui" | "comfy" => {
                 // Bare `/comfyui` is read-only status. status/logs read; install/
@@ -840,18 +842,14 @@ impl AppState {
                 let sub = rest.split_whitespace().nth(1).map(str::to_lowercase);
                 match sub.as_deref() {
                     None | Some("status") => {
-                        self.slash_tool = Some(SlashToolRequest {
-                            name: "rocm_command".to_string(),
-                            args: serde_json::json!({ "args": ["comfyui", "status"] }),
-                            label: "comfyui status".to_string(),
-                        });
+                        self.slash_tool =
+                            Some(rocm_cmd_request(&["comfyui", "status"], "comfyui status"));
                     }
                     Some(action @ ("logs" | "install" | "start" | "stop")) => {
-                        self.slash_tool = Some(SlashToolRequest {
-                            name: "rocm_command".to_string(),
-                            args: serde_json::json!({ "args": ["comfyui", action] }),
-                            label: format!("comfyui {action}"),
-                        });
+                        self.slash_tool = Some(rocm_cmd_request(
+                            &["comfyui", action],
+                            format!("comfyui {action}"),
+                        ));
                     }
                     Some(other) => {
                         self.chat.push(ChatTurn::error(format!(
@@ -873,16 +871,14 @@ impl AppState {
                 } else {
                     vec!["uninstall", "--dry-run"]
                 };
-                self.slash_tool = Some(SlashToolRequest {
-                    name: "rocm_command".to_string(),
-                    args: serde_json::json!({ "args": argv }),
-                    label: if real {
+                self.slash_tool = Some(rocm_cmd_request(
+                    &argv,
+                    if real {
                         "uninstall"
                     } else {
                         "uninstall --dry-run"
-                    }
-                    .to_string(),
-                });
+                    },
+                ));
             }
             "setup" => {
                 // Bare `/setup` (or `/setup status`) reports first-time setup
@@ -891,18 +887,12 @@ impl AppState {
                 let sub = rest.split_whitespace().nth(1).map(str::to_lowercase);
                 match sub.as_deref() {
                     None | Some("status") => {
-                        self.slash_tool = Some(SlashToolRequest {
-                            name: "rocm_command".to_string(),
-                            args: serde_json::json!({ "args": ["setup", "status"] }),
-                            label: "setup status".to_string(),
-                        });
+                        self.slash_tool =
+                            Some(rocm_cmd_request(&["setup", "status"], "setup status"));
                     }
                     Some("reset") => {
-                        self.slash_tool = Some(SlashToolRequest {
-                            name: "rocm_command".to_string(),
-                            args: serde_json::json!({ "args": ["setup", "reset"] }),
-                            label: "setup reset".to_string(),
-                        });
+                        self.slash_tool =
+                            Some(rocm_cmd_request(&["setup", "reset"], "setup reset"));
                     }
                     Some(other) => {
                         self.chat.push(ChatTurn::error(format!(
@@ -3311,6 +3301,22 @@ mod tests {
     }
 
     #[test]
+    fn slash_comfy_alias_is_status() {
+        // `/comfy` is an alias for `/comfyui` and must map to the same
+        // read-only status argv.
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/comfy"), SlashOutcome::Handled);
+        let req = s
+            .slash_tool
+            .expect("comfy alias raises a slash_tool request");
+        assert_eq!(req.name, "rocm_command");
+        assert_eq!(
+            req.args,
+            serde_json::json!({ "args": ["comfyui", "status"] })
+        );
+    }
+
+    #[test]
     fn slash_comfyui_start_is_mutating() {
         let mut s = st();
         assert_eq!(
@@ -3347,6 +3353,10 @@ mod tests {
             serde_json::json!({ "args": ["uninstall", "--dry-run"] }),
             "bare /uninstall MUST default to a dry-run, not a real uninstall"
         );
+        assert_eq!(
+            req.label, "uninstall --dry-run",
+            "the dry-run label is the safety-critical user-visible string"
+        );
     }
 
     #[test]
@@ -3358,6 +3368,10 @@ mod tests {
         );
         let req = s.slash_tool.expect("uninstall --apply raises a request");
         assert_eq!(req.args, serde_json::json!({ "args": ["uninstall"] }));
+        assert_eq!(
+            req.label, "uninstall",
+            "the real-uninstall label is the safety-critical user-visible string"
+        );
     }
 
     #[test]

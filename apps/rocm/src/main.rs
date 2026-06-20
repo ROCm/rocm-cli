@@ -8740,6 +8740,15 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
         {
             render_uninstall_dry_run(paths)
         }
+        [command] if command.eq_ignore_ascii_case("setup") => {
+            render_setup_status_text(paths, &config)
+        }
+        [command, subcommand]
+            if command.eq_ignore_ascii_case("setup")
+                && subcommand.eq_ignore_ascii_case("status") =>
+        {
+            render_setup_status_text(paths, &config)
+        }
         _ => bail!(
             "unsupported in-process read-only rocm command: {}",
             format_structured_tool_call("rocm", args)
@@ -16149,6 +16158,27 @@ model recipes
             Some("rocm")
         );
         assert!(mcp_tool_result_text(&result).contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn setup_status_renders_in_process() {
+        let (_root, paths) = test_paths("setup-status-in-process");
+
+        for args in [
+            vec!["setup".to_owned()],
+            vec!["setup".to_owned(), "status".to_owned()],
+        ] {
+            let text = run_rocm_read_only_in_process(&paths, &args)
+                .expect("setup status read path should render in-process");
+            assert!(
+                !text.trim().is_empty(),
+                "setup status text should be non-empty for {args:?}"
+            );
+            assert!(
+                text.contains("ROCm setup"),
+                "setup status text should be reached for {args:?}: {text}"
+            );
+        }
     }
 
     #[test]
