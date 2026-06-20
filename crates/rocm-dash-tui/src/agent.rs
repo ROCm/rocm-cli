@@ -30,6 +30,7 @@ use rocm_dash_core::metrics::{GpuMetrics, Instance, Snapshot};
 
 use crate::app::{ChatRole, ChatTurn};
 use crate::llm::LlmConfig;
+use crate::tool_exec::{RocmToolOutcome, SharedRocmToolExecutor};
 
 /// One-shot request budget. A hung backend becomes a timeout error turn, never
 /// a frozen pane.
@@ -432,6 +433,201 @@ pub const SKILL_NAMES: [&str; 6] = [
     SkillPlanTool::NAME,
 ];
 
+// ---------------------------------------------------------------------------
+// Read-only ROCm machine-inspection tools (group B). These forward the model's
+// tool-call intent across the rocm-core-free [`crate::tool_exec`] seam to the
+// bin-supplied executor (live dash only). They are READ-ONLY: no mutating tool
+// is registered here (mutating tools + the approval UI land in Phase 4). The
+// boundary type (`SharedRocmToolExecutor`) is plain data — importing it does NOT
+// pull `rocm-core` into this crate; agent.rs stays the sole `rig` namer.
+// ---------------------------------------------------------------------------
+
+/// Shared body for every read-only ROCm tool: forward the intent to the injected
+/// executor (None ⇒ a clear "not available in this mode" message; ApprovalRequired
+/// ⇒ a "needs approval" note — read-only tools shouldn't hit it, handled defensively).
+fn run_rocm_read_tool(exec: Option<&SharedRocmToolExecutor>, name: &str, args: &Value) -> Value {
+    match exec {
+        None => json!({ "error": "ROCm tools are unavailable in this mode (demo/replay/mock)." }),
+        Some(e) => match e.execute(name, args) {
+            RocmToolOutcome::Result(v) => v,
+            RocmToolOutcome::Error(s) => json!({ "error": s }),
+            RocmToolOutcome::ApprovalRequired(_) => {
+                json!({ "error": "this action requires approval (interactive chat only)" })
+            }
+        },
+    }
+}
+
+/// Declare one zero-cost read-only ROCm tool type. Rig requires a `const NAME`
+/// per type, so a macro generates one struct per tool to keep them DRY: each
+/// holds the optional executor + the shared `fired` log and routes `call()`
+/// through [`run_rocm_read_tool`]. Args are accepted as raw JSON (the bin
+/// validates them), so every tool shares `type Args = serde_json::Value`.
+macro_rules! rocm_read_tool {
+    ($ty:ident, $name:literal, $desc:literal, $params:tt) => {
+        pub struct $ty {
+            pub executor: Option<SharedRocmToolExecutor>,
+            pub fired: FiredLog,
+        }
+        impl Tool for $ty {
+            const NAME: &'static str = $name;
+            type Error = ToolError;
+            type Args = serde_json::Value;
+            type Output = Value;
+            async fn definition(&self, _p: String) -> ToolDefinition {
+                ToolDefinition {
+                    name: $name.to_string(),
+                    description: $desc.to_string(),
+                    parameters: json!($params),
+                }
+            }
+            async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+                record(&self.fired, $name);
+                Ok(run_rocm_read_tool(self.executor.as_ref(), $name, &args))
+            }
+        }
+    };
+}
+
+rocm_read_tool!(
+    DoctorRocmTool,
+    "doctor",
+    "Run the rocm-dash environment doctor: detected AMD GPU/driver, active ROCm \
+     runtime status, and readiness checks. Read-only.",
+    { "type": "object", "properties": {} }
+);
+rocm_read_tool!(
+    EnginesRocmTool,
+    "engines",
+    "List the available inference engines (e.g. vLLM, llama.cpp, ComfyUI) and \
+     their install/availability status. Read-only.",
+    { "type": "object", "properties": {} }
+);
+rocm_read_tool!(
+    ServicesRocmTool,
+    "services",
+    "List managed services / serving instances and their current status. \
+     Read-only.",
+    { "type": "object", "properties": {} }
+);
+rocm_read_tool!(
+    ServiceLogsRocmTool,
+    "service_logs",
+    "Fetch recent log lines for a managed service by id. Read-only.",
+    {
+        "type": "object",
+        "properties": {
+            "service_id": { "type": "string", "description": "Service identifier whose logs to read." }
+        },
+        "required": ["service_id"]
+    }
+);
+rocm_read_tool!(
+    BridgeSnapshotRocmTool,
+    "bridge_snapshot",
+    "Return the current job-bridge state snapshot (background jobs and their \
+     status). Read-only.",
+    { "type": "object", "properties": {} }
+);
+rocm_read_tool!(
+    GpuSnapshotRocmTool,
+    "gpu_snapshot",
+    "Return a point-in-time hardware snapshot of the AMD GPUs as seen by the \
+     machine (distinct from the live telemetry gpu_status). Read-only.",
+    { "type": "object", "properties": {} }
+);
+rocm_read_tool!(
+    AutomationsRocmTool,
+    "automations",
+    "List the configured background automations / scheduled checks and their \
+     last status. Read-only.",
+    { "type": "object", "properties": {} }
+);
+rocm_read_tool!(
+    PathExistsRocmTool,
+    "path_exists",
+    "Check whether a filesystem path exists on the machine. Read-only.",
+    {
+        "type": "object",
+        "properties": {
+            "path": { "type": "string", "description": "Absolute or relative path to test." }
+        },
+        "required": ["path"]
+    }
+);
+rocm_read_tool!(
+    PortStatusRocmTool,
+    "port_status",
+    "Check whether a local TCP port is open / in use. Read-only.",
+    {
+        "type": "object",
+        "properties": {
+            "port": { "type": "integer", "description": "TCP port number to probe." }
+        },
+        "required": ["port"]
+    }
+);
+rocm_read_tool!(
+    UpdateCheckRocmTool,
+    "update_check",
+    "Check for an available rocm-cli update (current vs latest version). \
+     Read-only — does not install anything.",
+    { "type": "object", "properties": {} }
+);
+rocm_read_tool!(
+    InstallSdkDryRunRocmTool,
+    "install_sdk_dry_run",
+    "Show what installing the TheRock ROCm SDK WOULD do (the resolved wheels / \
+     steps) WITHOUT installing anything. Read-only dry run.",
+    {
+        "type": "object",
+        "properties": {
+            "channel": { "type": "string", "description": "Release channel, e.g. 'release'." },
+            "format": { "type": "string", "description": "Artifact format, e.g. 'wheel'." },
+            "prefix": { "type": "string", "description": "Optional install prefix to evaluate." },
+            "version": { "type": "string", "description": "Optional explicit version selector." },
+            "build_date": { "type": "string", "description": "Optional build-date selector." }
+        }
+    }
+);
+rocm_read_tool!(
+    RocmCommandRocmTool,
+    "rocm_command",
+    "Run a READ-ONLY rocm CLI subcommand and return its output. Allowed: \
+     model/models, config show, runtimes (list), logs, daemon status. Pass the \
+     argv as `args`, e.g. [\"model\"] or [\"config\",\"show\"]. Mutating \
+     subcommands are rejected.",
+    {
+        "type": "object",
+        "properties": {
+            "args": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Argv for the rocm subcommand, e.g. [\"model\"]."
+            }
+        },
+        "required": ["args"]
+    }
+);
+
+/// All read-only ROCm tool names (mirrors [`SKILL_NAMES`]). Used for
+/// uniqueness/registration checks and the parity map. Mutating tools and
+/// `natural_language_plan` are intentionally absent (later phases).
+pub const ROCM_READ_TOOL_NAMES: [&str; 12] = [
+    DoctorRocmTool::NAME,
+    EnginesRocmTool::NAME,
+    ServicesRocmTool::NAME,
+    ServiceLogsRocmTool::NAME,
+    BridgeSnapshotRocmTool::NAME,
+    GpuSnapshotRocmTool::NAME,
+    AutomationsRocmTool::NAME,
+    PathExistsRocmTool::NAME,
+    PortStatusRocmTool::NAME,
+    UpdateCheckRocmTool::NAME,
+    InstallSdkDryRunRocmTool::NAME,
+    RocmCommandRocmTool::NAME,
+];
+
 /// Live Rig-backed client for an OpenAI-compatible endpoint. The Rig client is
 /// constructed once; the agent + tools are rebuilt per request from the
 /// captured snapshot.
@@ -439,10 +635,12 @@ pub struct RigAgentClient {
     client: rig::providers::openai::CompletionsClient,
     model: String,
     preamble: String,
+    /// Bin-injected read-only tool executor (None for tests / no live seam).
+    executor: Option<SharedRocmToolExecutor>,
 }
 
 impl RigAgentClient {
-    pub fn new(cfg: LlmConfig) -> Result<Self, AgentError> {
+    pub fn new(cfg: LlmConfig, executor: Option<SharedRocmToolExecutor>) -> Result<Self, AgentError> {
         // Custom-auth gateway (e.g. Azure APIM `Ocp-Apim-Subscription-Key`):
         // the key goes in a custom header, NOT `Authorization: Bearer`. Rig
         // still requires an api_key, so pass a dummy Bearer the gateway ignores.
@@ -473,6 +671,7 @@ impl RigAgentClient {
             client,
             model: cfg.model,
             preamble: DEFAULT_PREAMBLE.to_string(),
+            executor,
         })
     }
 }
@@ -535,8 +734,9 @@ impl AgentClient for RigAgentClient {
             })
             .tool(SkillPlanTool {
                 fired: fired.clone(),
-            })
-            .build();
+            });
+        // Read-only ROCm machine-inspection tools (forward across the seam).
+        let agent = register_rocm_read_tools(agent, self.executor.as_ref(), &fired).build();
 
         let req = agent
             .prompt(last.content.clone())
@@ -554,6 +754,72 @@ impl AgentClient for RigAgentClient {
     }
 }
 
+/// Register every read-only ROCm tool on a Rig `AgentBuilder`, cloning the
+/// optional executor + the shared `fired` log into each. Kept generic over the
+/// builder's completion model + preamble so both the OpenAI-compatible and
+/// ChatGPT paths reuse one registration site (DRY — the tool list lives in
+/// exactly one place). The builder is already in the `WithBuilderTools` state
+/// because the telemetry/skill tools were registered first.
+fn register_rocm_read_tools<M, P>(
+    builder: rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>,
+    executor: Option<&SharedRocmToolExecutor>,
+    fired: &FiredLog,
+) -> rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>
+where
+    M: rig::completion::CompletionModel,
+    P: rig::agent::PromptHook<M>,
+{
+    builder
+        .tool(DoctorRocmTool {
+            executor: executor.cloned(),
+            fired: fired.clone(),
+        })
+        .tool(EnginesRocmTool {
+            executor: executor.cloned(),
+            fired: fired.clone(),
+        })
+        .tool(ServicesRocmTool {
+            executor: executor.cloned(),
+            fired: fired.clone(),
+        })
+        .tool(ServiceLogsRocmTool {
+            executor: executor.cloned(),
+            fired: fired.clone(),
+        })
+        .tool(BridgeSnapshotRocmTool {
+            executor: executor.cloned(),
+            fired: fired.clone(),
+        })
+        .tool(GpuSnapshotRocmTool {
+            executor: executor.cloned(),
+            fired: fired.clone(),
+        })
+        .tool(AutomationsRocmTool {
+            executor: executor.cloned(),
+            fired: fired.clone(),
+        })
+        .tool(PathExistsRocmTool {
+            executor: executor.cloned(),
+            fired: fired.clone(),
+        })
+        .tool(PortStatusRocmTool {
+            executor: executor.cloned(),
+            fired: fired.clone(),
+        })
+        .tool(UpdateCheckRocmTool {
+            executor: executor.cloned(),
+            fired: fired.clone(),
+        })
+        .tool(InstallSdkDryRunRocmTool {
+            executor: executor.cloned(),
+            fired: fired.clone(),
+        })
+        .tool(RocmCommandRocmTool {
+            executor: executor.cloned(),
+            fired: fired.clone(),
+        })
+}
+
 /// No-key ChatGPT backend over Rig's native `chatgpt` OAuth provider.
 ///
 /// This is the no-key default that restores the ChatGPT device-login the vendored Codex
@@ -566,6 +832,8 @@ pub struct ChatGptAgentClient {
     client: rig::providers::chatgpt::Client,
     model: String,
     preamble: String,
+    /// Bin-injected read-only tool executor (None for tests / no live seam).
+    executor: Option<SharedRocmToolExecutor>,
 }
 
 impl ChatGptAgentClient {
@@ -573,7 +841,11 @@ impl ChatGptAgentClient {
     /// `on_device_code(verification_uri, user_code)` is invoked during the first
     /// `authorize()` (device-code flow). No network I/O happens here — login is
     /// deferred to the first `complete()`.
-    pub fn new<F>(model: Option<String>, on_device_code: F) -> Result<Self, AgentError>
+    pub fn new<F>(
+        model: Option<String>,
+        on_device_code: F,
+        executor: Option<SharedRocmToolExecutor>,
+    ) -> Result<Self, AgentError>
     where
         F: Fn(String, String) + Send + Sync + 'static,
     {
@@ -632,6 +904,7 @@ impl ChatGptAgentClient {
             client,
             model: model.unwrap_or_else(|| chatgpt::GPT_5_3_CODEX.to_string()),
             preamble: DEFAULT_PREAMBLE.to_string(),
+            executor,
         })
     }
 }
@@ -688,8 +961,9 @@ impl AgentClient for ChatGptAgentClient {
             })
             .tool(SkillPlanTool {
                 fired: fired.clone(),
-            })
-            .build();
+            });
+        // Read-only ROCm machine-inspection tools (forward across the seam).
+        let agent = register_rocm_read_tools(agent, self.executor.as_ref(), &fired).build();
 
         let req = agent
             .prompt(last.content.clone())
@@ -1066,7 +1340,7 @@ mod tests {
             api_key: None,
             auth_header: None,
         };
-        let client = RigAgentClient::new(cfg).expect("build rig client");
+        let client = RigAgentClient::new(cfg, None).expect("build rig client");
         let history = vec![ChatTurn::user("What's GPU-2 doing? Use the tools.")];
         let reply = client
             .complete(&history, fixture_snapshot())
@@ -1097,7 +1371,7 @@ mod tests {
             api_key: Some(key),
             auth_header,
         };
-        let client = RigAgentClient::new(cfg).expect("build rig client");
+        let client = RigAgentClient::new(cfg, None).expect("build rig client");
         let history = vec![ChatTurn::user("Reply with exactly: gateway ok")];
         let reply = client
             .complete(&history, fixture_snapshot())
@@ -1115,10 +1389,14 @@ mod tests {
         let fired = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink = fired.clone();
         let client =
-            ChatGptAgentClient::new(Some("gpt-5.3-codex".to_string()), move |url, code| {
-                // Would surface in the chat tab during a real device-code login.
-                sink.lock().unwrap().push(format!("{url}|{code}"));
-            })
+            ChatGptAgentClient::new(
+                Some("gpt-5.3-codex".to_string()),
+                move |url, code| {
+                    // Would surface in the chat tab during a real device-code login.
+                    sink.lock().unwrap().push(format!("{url}|{code}"));
+                },
+                None,
+            )
             .expect("build chatgpt oauth client");
         assert_eq!(client.model, "gpt-5.3-codex");
         // No network happened, so the handler has not fired yet.
@@ -1128,7 +1406,8 @@ mod tests {
     #[test]
     fn chatgpt_oauth_client_defaults_model_when_none() {
         let client =
-            ChatGptAgentClient::new(None, |_url, _code| {}).expect("build chatgpt oauth client");
+            ChatGptAgentClient::new(None, |_url, _code| {}, None)
+                .expect("build chatgpt oauth client");
         assert_eq!(
             client.model,
             rig::providers::chatgpt::GPT_5_3_CODEX,
@@ -1143,9 +1422,13 @@ mod tests {
     #[tokio::test]
     #[ignore = "interactive ChatGPT OAuth device-code login + network"]
     async fn chatgpt_oauth_round_trip() {
-        let client = ChatGptAgentClient::new(None, |url, code| {
-            eprintln!("Sign in: open {url} and enter code {code}");
-        })
+        let client = ChatGptAgentClient::new(
+            None,
+            |url, code| {
+                eprintln!("Sign in: open {url} and enter code {code}");
+            },
+            None,
+        )
         .expect("build chatgpt oauth client");
         let history = vec![ChatTurn::user("Reply with exactly: oauth ok")];
         let reply = client
