@@ -909,6 +909,157 @@ impl AppState {
                     }
                 }
             }
+            // --- Group C: automations / reviews (read list; toggles + proposal
+            // actions are approval-gated via the Phase-4 modal) ---
+            "automations" => {
+                // Bare `/automations` (or `list`) lists configured automations
+                // (read-only). `enable`/`disable` toggle a watcher (approval-gated
+                // via the watcher_enable/watcher_disable mutating tools).
+                let mut words = rest.split_whitespace().skip(1);
+                match words.next().map(str::to_lowercase).as_deref() {
+                    None | Some("list") => {
+                        self.slash_tool =
+                            Some(rocm_cmd_request(&["automations", "list"], "automations"));
+                    }
+                    Some("enable") => match words.next() {
+                        Some(watcher) => {
+                            // Optional `--mode <m>`: when present, include it so the
+                            // validator can accept observe|propose|contained.
+                            let mode = match words.next() {
+                                Some("--mode") => words.next(),
+                                _ => None,
+                            };
+                            let args = match mode {
+                                Some(m) => {
+                                    serde_json::json!({ "watcher": watcher, "mode": m })
+                                }
+                                None => serde_json::json!({ "watcher": watcher }),
+                            };
+                            self.slash_tool = Some(SlashToolRequest {
+                                name: "watcher_enable".to_string(),
+                                args,
+                                label: format!("automations enable {watcher}"),
+                            });
+                        }
+                        None => {
+                            self.chat.push(ChatTurn::error(
+                                "usage: /automations enable <watcher> [--mode observe|propose|contained]"
+                                    .to_string(),
+                            ));
+                        }
+                    },
+                    Some("disable") => match words.next() {
+                        Some(watcher) => {
+                            self.slash_tool = Some(SlashToolRequest {
+                                name: "watcher_disable".to_string(),
+                                args: serde_json::json!({ "watcher": watcher }),
+                                label: format!("automations disable {watcher}"),
+                            });
+                        }
+                        None => {
+                            self.chat.push(ChatTurn::error(
+                                "usage: /automations disable <watcher>".to_string(),
+                            ));
+                        }
+                    },
+                    Some(other) => {
+                        self.chat.push(ChatTurn::error(format!(
+                            "unknown /automations action `{other}` (try list, enable, disable)"
+                        )));
+                    }
+                }
+            }
+            "reviews" => {
+                // Bare `/reviews` lists pending reviews (read-only, via the
+                // automations list). `/reviews <id>` shows one proposal's detail.
+                match rest.split_whitespace().nth(1) {
+                    None => {
+                        self.slash_tool =
+                            Some(rocm_cmd_request(&["automations", "list"], "reviews"));
+                    }
+                    Some(id) => {
+                        self.slash_tool = Some(SlashToolRequest {
+                            name: "proposal_action".to_string(),
+                            args: serde_json::json!({ "proposal_id": id, "action": "show" }),
+                            label: format!("reviews {id}"),
+                        });
+                    }
+                }
+            }
+            "approve" => match rest.split_whitespace().nth(1) {
+                Some(id) => {
+                    self.slash_tool = Some(SlashToolRequest {
+                        name: "proposal_action".to_string(),
+                        args: serde_json::json!({ "proposal_id": id, "action": "approve" }),
+                        label: format!("approve {id}"),
+                    });
+                }
+                None => {
+                    self.chat
+                        .push(ChatTurn::error("usage: /approve <proposal-id>".to_string()));
+                }
+            },
+            "reject" => match rest.split_whitespace().nth(1) {
+                Some(id) => {
+                    self.slash_tool = Some(SlashToolRequest {
+                        name: "proposal_action".to_string(),
+                        args: serde_json::json!({ "proposal_id": id, "action": "reject" }),
+                        label: format!("reject {id}"),
+                    });
+                }
+                None => {
+                    self.chat
+                        .push(ChatTurn::error("usage: /reject <proposal-id>".to_string()));
+                }
+            },
+            "edit" => match rest.split_whitespace().nth(1) {
+                Some(id) => {
+                    // Editing a proposal's CONTENT isn't supported by the bin; show
+                    // the proposal (read) so the operator can /approve or /reject.
+                    self.slash_tool = Some(SlashToolRequest {
+                        name: "proposal_action".to_string(),
+                        args: serde_json::json!({ "proposal_id": id, "action": "show" }),
+                        label: format!("edit {id}"),
+                    });
+                    self.chat.push(ChatTurn::agent(format!(
+                        "Editing a proposal's content isn't supported; showing {id}. Use /approve {id} or /reject {id}."
+                    )));
+                }
+                None => {
+                    self.chat
+                        .push(ChatTurn::error("usage: /edit <proposal-id>".to_string()));
+                }
+            },
+            // --- Group E: permissions (read status; escalation is approval-gated) ---
+            "permissions" => {
+                // Bare `/permissions` (or `status`) shows the current mode
+                // (read-only via `config show`). `full-access`/`ask` change the
+                // mode — escalation MUST route through the approval modal.
+                let sub = rest.split_whitespace().nth(1).map(str::to_lowercase);
+                match sub.as_deref() {
+                    None | Some("status") => {
+                        self.slash_tool =
+                            Some(rocm_cmd_request(&["config", "show"], "permissions"));
+                    }
+                    Some("full-access" | "full_access") => {
+                        self.slash_tool = Some(rocm_cmd_request(
+                            &["config", "set-permissions", "full_access"],
+                            "permissions full-access",
+                        ));
+                    }
+                    Some("ask") => {
+                        self.slash_tool = Some(rocm_cmd_request(
+                            &["config", "set-permissions", "ask"],
+                            "permissions ask",
+                        ));
+                    }
+                    Some(other) => {
+                        self.chat.push(ChatTurn::error(format!(
+                            "unknown /permissions action `{other}` (try status, full-access, ask)"
+                        )));
+                    }
+                }
+            }
             // Unknown slash command: an error turn, never sent to the LLM.
             other => {
                 self.chat.push(ChatTurn::error(format!(
@@ -3443,6 +3594,192 @@ mod tests {
             "unsupported /setup sub must NOT dispatch"
         );
         assert_eq!(s.chat.last().unwrap().role, ChatRole::Error);
+    }
+
+    // --- Phase 6: automations / reviews / approve / reject / edit / permissions ---
+
+    #[test]
+    fn slash_automations_bare_lists() {
+        let mut s = st();
+        assert_eq!(
+            s.handle_slash_command("/automations"),
+            SlashOutcome::Handled
+        );
+        let req = s
+            .slash_tool
+            .expect("automations raises a slash_tool request");
+        assert_eq!(req.name, "rocm_command");
+        assert_eq!(
+            req.args,
+            serde_json::json!({ "args": ["automations", "list"] })
+        );
+    }
+
+    #[test]
+    fn slash_automations_enable_raises_watcher_enable() {
+        let mut s = st();
+        assert_eq!(
+            s.handle_slash_command("/automations enable foo --mode observe"),
+            SlashOutcome::Handled
+        );
+        let req = s.slash_tool.expect("enable raises a request");
+        assert_eq!(req.name, "watcher_enable");
+        assert_eq!(
+            req.args,
+            serde_json::json!({ "watcher": "foo", "mode": "observe" })
+        );
+    }
+
+    #[test]
+    fn slash_automations_enable_without_mode_omits_field() {
+        let mut s = st();
+        assert_eq!(
+            s.handle_slash_command("/automations enable foo"),
+            SlashOutcome::Handled
+        );
+        let req = s.slash_tool.expect("enable raises a request");
+        assert_eq!(req.name, "watcher_enable");
+        assert_eq!(req.args, serde_json::json!({ "watcher": "foo" }));
+        assert!(req.args.get("mode").is_none(), "mode must be omitted");
+    }
+
+    #[test]
+    fn slash_automations_disable_raises_watcher_disable() {
+        let mut s = st();
+        assert_eq!(
+            s.handle_slash_command("/automations disable foo"),
+            SlashOutcome::Handled
+        );
+        let req = s.slash_tool.expect("disable raises a request");
+        assert_eq!(req.name, "watcher_disable");
+        assert_eq!(req.args, serde_json::json!({ "watcher": "foo" }));
+    }
+
+    #[test]
+    fn slash_automations_enable_without_watcher_hints() {
+        let mut s = st();
+        assert_eq!(
+            s.handle_slash_command("/automations enable"),
+            SlashOutcome::Handled
+        );
+        assert!(s.slash_tool.is_none(), "no dispatch without a watcher");
+        assert_eq!(s.chat.last().unwrap().role, ChatRole::Error);
+    }
+
+    #[test]
+    fn slash_reviews_bare_lists() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/reviews"), SlashOutcome::Handled);
+        let req = s.slash_tool.expect("reviews raises a request");
+        assert_eq!(req.name, "rocm_command");
+        assert_eq!(
+            req.args,
+            serde_json::json!({ "args": ["automations", "list"] })
+        );
+    }
+
+    #[test]
+    fn slash_reviews_id_shows_proposal() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/reviews p1"), SlashOutcome::Handled);
+        let req = s.slash_tool.expect("reviews <id> raises a request");
+        assert_eq!(req.name, "proposal_action");
+        assert_eq!(
+            req.args,
+            serde_json::json!({ "proposal_id": "p1", "action": "show" })
+        );
+    }
+
+    #[test]
+    fn slash_approve_id_raises_proposal_approve() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/approve p1"), SlashOutcome::Handled);
+        let req = s.slash_tool.expect("approve raises a request");
+        assert_eq!(req.name, "proposal_action");
+        assert_eq!(
+            req.args,
+            serde_json::json!({ "proposal_id": "p1", "action": "approve" })
+        );
+    }
+
+    #[test]
+    fn slash_approve_bare_hints() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/approve"), SlashOutcome::Handled);
+        assert!(s.slash_tool.is_none(), "no dispatch without a proposal id");
+        assert_eq!(s.chat.last().unwrap().role, ChatRole::Error);
+    }
+
+    #[test]
+    fn slash_reject_id_raises_proposal_reject() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/reject p1"), SlashOutcome::Handled);
+        let req = s.slash_tool.expect("reject raises a request");
+        assert_eq!(req.name, "proposal_action");
+        assert_eq!(
+            req.args,
+            serde_json::json!({ "proposal_id": "p1", "action": "reject" })
+        );
+    }
+
+    #[test]
+    fn slash_edit_id_shows_proposal_with_note() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/edit p1"), SlashOutcome::Handled);
+        let req = s.slash_tool.expect("edit raises a request");
+        assert_eq!(req.name, "proposal_action");
+        assert_eq!(
+            req.args,
+            serde_json::json!({ "proposal_id": "p1", "action": "show" })
+        );
+        // A one-line note directs the operator to /approve or /reject.
+        let last = s.chat.last().expect("edit pushes a note turn");
+        assert_eq!(last.role, ChatRole::Agent);
+        assert!(last.content.contains("/approve") && last.content.contains("/reject"));
+    }
+
+    #[test]
+    fn slash_permissions_bare_is_config_show() {
+        let mut s = st();
+        assert_eq!(
+            s.handle_slash_command("/permissions"),
+            SlashOutcome::Handled
+        );
+        let req = s.slash_tool.expect("permissions raises a request");
+        assert_eq!(req.name, "rocm_command");
+        assert_eq!(req.args, serde_json::json!({ "args": ["config", "show"] }));
+    }
+
+    #[test]
+    fn slash_permissions_full_access_is_mutating() {
+        // SAFETY: permission escalation must go through the approval modal — it is
+        // dispatched as an approval-classified rocm_command, never run inline.
+        let mut s = st();
+        assert_eq!(
+            s.handle_slash_command("/permissions full-access"),
+            SlashOutcome::Handled
+        );
+        let req = s.slash_tool.expect("full-access raises a request");
+        assert_eq!(req.name, "rocm_command");
+        assert_eq!(
+            req.args,
+            serde_json::json!({ "args": ["config", "set-permissions", "full_access"] })
+        );
+    }
+
+    #[test]
+    fn slash_permissions_ask_is_mutating() {
+        let mut s = st();
+        assert_eq!(
+            s.handle_slash_command("/permissions ask"),
+            SlashOutcome::Handled
+        );
+        let req = s.slash_tool.expect("ask raises a request");
+        assert_eq!(req.name, "rocm_command");
+        assert_eq!(
+            req.args,
+            serde_json::json!({ "args": ["config", "set-permissions", "ask"] })
+        );
     }
 
     /// Recording executor: mutating names surface `ApprovalRequired`; the
