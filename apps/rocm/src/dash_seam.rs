@@ -5,11 +5,9 @@
 //! rocm-core-free [`RocmToolExecutor`] boundary by reusing the existing bin
 //! engine functions. Plain data in/out only — no dash internals leak here.
 
-use clap::Parser;
 use rocm_core::AppPaths;
 use rocm_dash_tui::tool_exec::{ApprovalIntent, RocmToolExecutor, RocmToolOutcome};
 
-use crate::Cli;
 use crate::providers;
 
 /// Concrete tool executor injected into a live dash. Carries the resolved
@@ -55,17 +53,6 @@ impl RocmToolExecutor for BinToolExecutor {
                 }),
                 Err(e) => RocmToolOutcome::Error(e.to_string()),
             }
-        }
-    }
-
-    fn execute_approved(&self, args: &[String]) -> RocmToolOutcome {
-        let argv = std::iter::once("rocm".to_owned()).chain(args.iter().cloned());
-        match Cli::try_parse_from(argv) {
-            Ok(cli) => match crate::dispatch(cli) {
-                Ok(()) => RocmToolOutcome::Result(serde_json::json!({ "status": "ok" })),
-                Err(e) => RocmToolOutcome::Error(e.to_string()),
-            },
-            Err(e) => RocmToolOutcome::Error(e.to_string()),
         }
     }
 }
@@ -127,10 +114,10 @@ mod tests {
         );
         match outcome {
             RocmToolOutcome::ApprovalRequired(intent) => {
-                assert_eq!(
-                    &intent.args[..2],
-                    &["install".to_owned(), "sdk".to_owned()],
-                    "install_sdk approval args should start with [\"install\", \"sdk\"], got: {:?}",
+                assert!(
+                    intent.args.len() >= 2
+                        && intent.args[..2] == ["install".to_owned(), "sdk".to_owned()],
+                    "install_sdk approval args should start with [install, sdk], got: {:?}",
                     intent.args
                 );
             }

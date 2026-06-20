@@ -208,10 +208,9 @@ async fn run_async(
     // Inject the bin-side tool-execution seam for a live dash only. Demo/replay
     // and the offline chat mock keep `tool_executor = None` and behave as today.
     if !chat_mock && replay.is_none() {
-        args.tool_executor = Some(std::sync::Arc::new(crate::dash_seam::BinToolExecutor::new(
-            paths.clone(),
-        ))
-            as rocm_dash_tui::tool_exec::SharedRocmToolExecutor);
+        let executor: rocm_dash_tui::tool_exec::SharedRocmToolExecutor =
+            std::sync::Arc::new(crate::dash_seam::BinToolExecutor::new(paths.clone()));
+        args.tool_executor = Some(executor);
     }
     // A live daemon is only needed when connecting; replay/demo feeds events
     // straight into the TUI, so skip the embedded daemon in that mode.

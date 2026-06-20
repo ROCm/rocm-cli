@@ -16,6 +16,7 @@ pub struct ApprovalIntent {
 }
 
 /// Outcome of a tool-call intent executed by the bin across the seam.
+#[must_use]
 #[derive(Debug, Clone)]
 pub enum RocmToolOutcome {
     Result(serde_json::Value),
@@ -28,11 +29,17 @@ pub enum RocmToolOutcome {
 /// The bin implements this; the dash holds it as
 /// `Option<Arc<dyn RocmToolExecutor>>` (None for demo/replay/mock). The `Debug`
 /// supertrait keeps `ResolvedArgs`/`AppState` deriving Debug.
+///
+/// NOTE: the mutating "execute approved" path is intentionally deferred to
+/// Phase 4, where it will be added alongside the approval modal with proper
+/// stdout/stderr capture (TUI-safe), spawn_blocking off the async loop, and an
+/// approval-provenance barrier so only descriptors from `execute()`'s
+/// ApprovalRequired can be run.
 pub trait RocmToolExecutor: std::fmt::Debug + Send + Sync {
     /// Execute a tool-call intent: read-only → Result(json); mutating → ApprovalRequired; failure → Error.
+    /// (Return value carries `#[must_use]` via the `RocmToolOutcome` enum.)
     fn execute(&self, name: &str, args: &serde_json::Value) -> RocmToolOutcome;
-    /// Run a previously-approved set of CLI args in-process (the mutating "execute approved" path).
-    fn execute_approved(&self, args: &[String]) -> RocmToolOutcome;
 }
 
+/// Arc-wrapped executor as stored in `ResolvedArgs`/`AppState`.
 pub type SharedRocmToolExecutor = Arc<dyn RocmToolExecutor>;
