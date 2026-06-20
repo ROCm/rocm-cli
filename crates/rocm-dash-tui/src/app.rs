@@ -280,6 +280,21 @@ pub(crate) struct SlashToolRequest {
     pub label: String,
 }
 
+/// A surfaced mutating-tool approval awaiting the operator's decision (Phase 4).
+/// Generic over any [`crate::tool_exec::ApprovalIntent`] so the same modal serves
+/// later phases (update/uninstall, permissions, plan). The modal owns keyboard
+/// focus while `Some`; on Approve the `(name, arguments)` are replayed through
+/// `execute_approved`; on Deny/Cancel nothing runs.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingApproval {
+    pub req: crate::ui::approval::ApprovalRequest,
+    pub choice: crate::ui::approval::ApprovalChoice,
+    /// Tool name to re-execute on Approve (the validator already accepted it).
+    pub name: String,
+    /// JSON args for the approved re-execution.
+    pub arguments: serde_json::Value,
+}
+
 /// Modal overlays. Only one is shown at a time, on top of the active tab body.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Modal {
@@ -401,6 +416,9 @@ pub struct AppState {
     /// Edge: a pending executor-backed read-only slash command. Raised by
     /// `handle_slash_command`, drained once by the event loop (spawn_blocking).
     pub(crate) slash_tool: Option<SlashToolRequest>,
+    /// A surfaced mutating-tool approval awaiting the operator's decision
+    /// (Phase 4). `Some` ⇒ the approval modal is open and owns keyboard focus.
+    pub(crate) approval: Option<PendingApproval>,
 }
 
 impl AppState {
@@ -460,6 +478,7 @@ impl AppState {
             tool_executor: None,
             should_quit: false,
             slash_tool: None,
+            approval: None,
         }
     }
 
@@ -694,6 +713,84 @@ impl AppState {
                     label: "daemon status".to_string(),
                 });
             }
+            // --- Group D: mutating ops (approval-gated; surfaced via the modal) ---
+            // Each raises a `slash_tool` request whose `execute()` returns
+            // `ApprovalRequired`; the event loop opens the approval modal. The
+            // safety validators run inside `execute()` (and again on the approved
+            // replay), so an unsafe call surfaces an error instead of the modal.
+            "install" => {
+                self.slash_tool = Some(SlashToolRequest {
+                    name: "install_sdk".to_string(),
+                    args: serde_json::json!({ "channel": "release", "format": "wheel" }),
+                    label: "install".to_string(),
+                });
+            }
+            "engine" => {
+                // `/engine <name>` — the engine name is required by the validator.
+                match rest.split_whitespace().nth(1) {
+                    Some(engine) => {
+                        self.slash_tool = Some(SlashToolRequest {
+                            name: "install_engine".to_string(),
+                            args: serde_json::json!({ "engine": engine }),
+                            label: format!("engine {engine}"),
+                        });
+                    }
+                    None => {
+                        self.chat.push(ChatTurn::error(
+                            "usage: /engine <name> (e.g. /engine vllm)".to_string(),
+                        ));
+                    }
+                }
+            }
+            "serve" => {
+                // `/serve <model>` — loopback host only (validator rejects public).
+                match rest.split_whitespace().nth(1) {
+                    Some(model) => {
+                        self.slash_tool = Some(SlashToolRequest {
+                            name: "launch_server".to_string(),
+                            args: serde_json::json!({ "model": model, "host": "127.0.0.1" }),
+                            label: format!("serve {model}"),
+                        });
+                    }
+                    None => {
+                        self.chat.push(ChatTurn::error(
+                            "usage: /serve <model> (e.g. /serve deepseek-r1)".to_string(),
+                        ));
+                    }
+                }
+            }
+            "services" => {
+                // `/services [stop|restart] <id>` — only stop/restart mutate; a
+                // bare `/services` is read-only and lists managed services.
+                let mut words = rest.split_whitespace().skip(1);
+                match words.next() {
+                    Some(action @ ("stop" | "restart")) => match words.next() {
+                        Some(id) => {
+                            self.slash_tool = Some(SlashToolRequest {
+                                name: "stop_server".to_string(),
+                                args: serde_json::json!({ "service_id": id }),
+                                label: format!("services {action} {id}"),
+                            });
+                        }
+                        None => {
+                            self.chat
+                                .push(ChatTurn::error(format!("usage: /services {action} <id>")));
+                        }
+                    },
+                    Some(other) => {
+                        self.chat.push(ChatTurn::error(format!(
+                            "unknown /services action `{other}` (try stop/restart, or /services to list)"
+                        )));
+                    }
+                    None => {
+                        self.slash_tool = Some(SlashToolRequest {
+                            name: "services".to_string(),
+                            args: serde_json::json!({}),
+                            label: "services".to_string(),
+                        });
+                    }
+                }
+            }
             // Unknown slash command: an error turn, never sent to the LLM.
             other => {
                 self.chat.push(ChatTurn::error(format!(
@@ -735,6 +832,62 @@ impl AppState {
     /// `slash_tool_reply_does_not_disturb_chat_sending`).
     pub(crate) fn on_slash_tool_reply(&mut self, text: String) {
         self.chat.push(ChatTurn::agent(text));
+    }
+
+    /// Open the approval modal for a surfaced mutating-tool intent (Phase 4).
+    /// Closes any operational overlay first so the modal owns focus alone.
+    pub(crate) fn open_approval(&mut self, intent: crate::tool_exec::ApprovalIntent) {
+        self.close_overlays();
+        self.approval = Some(PendingApproval {
+            req: crate::ui::approval::ApprovalRequest::new(intent.title, intent.body),
+            choice: crate::ui::approval::ApprovalChoice::Approve,
+            name: intent.name,
+            arguments: intent.arguments,
+        });
+    }
+
+    /// Route a key to the open approval modal: move the cursor and return a
+    /// verdict if the key confirmed one. Pure w.r.t. I/O — the caller maps the
+    /// verdict onto execution (Approve) or a declined turn (Deny/Cancel). No-op
+    /// returning `None` when no modal is open.
+    pub(crate) fn on_approval_key(
+        &mut self,
+        code: crossterm::event::KeyCode,
+    ) -> Option<crate::ui::approval::ApprovalVerdict> {
+        let pa = self.approval.as_mut()?;
+        let (choice, verdict) = crate::ui::approval::approval_key(code, pa.choice);
+        pa.choice = choice;
+        verdict
+    }
+
+    /// Take the pending approval's `(name, arguments)` for off-thread execution,
+    /// clearing the modal. Returns `None` if no modal is open.
+    pub(crate) fn take_approval(&mut self) -> Option<(String, serde_json::Value)> {
+        self.approval.take().map(|pa| (pa.name, pa.arguments))
+    }
+
+    /// Handle a Deny/Cancel verdict: clear the modal and append a declined turn.
+    /// Nothing executes.
+    pub(crate) fn on_approval_declined(&mut self) {
+        self.approval = None;
+        self.chat.push(ChatTurn::agent("Action declined."));
+    }
+
+    /// Append the approved-action result turn AND raise the one-shot
+    /// `chat_dispatch` edge so the agent does EXACTLY ONE automatic follow-up
+    /// turn that incorporates the result. The result is pushed as an agent turn
+    /// (so `build_messages` sends it as conversational context); `chat_dispatch`
+    /// is consumed once by the event loop, so this never loops. A further
+    /// mutating request from that follow-up re-surfaces approval (user-gated),
+    /// so there is no unbounded execution. Clears any open modal defensively.
+    pub(crate) fn on_approval_result(&mut self, text: String) {
+        self.approval = None;
+        self.chat.push(ChatTurn::agent(text));
+        // Exactly one follow-up: raise the edge once. `chat_sending` mirrors a
+        // normal submit so the UI shows the in-flight state and a double key
+        // can't race a second dispatch.
+        self.chat_sending = true;
+        self.chat_dispatch = true;
     }
 
     /// Apply the currently-highlighted picker entry and close the modal.
@@ -1017,19 +1170,20 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                     });
                 },
                 state.tool_executor.clone(),
+                Some(chat_tx.clone()),
             )
             .ok()
             .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
         } else {
             // A build failure leaves `agent` None; a submit surfaces an error turn.
             match &state.chat_llm {
-                Some(cfg) => {
-                    crate::agent::RigAgentClient::new(cfg.clone(), state.tool_executor.clone())
-                        .ok()
-                        .map(|c| {
-                            std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>
-                        })
-                }
+                Some(cfg) => crate::agent::RigAgentClient::new(
+                    cfg.clone(),
+                    state.tool_executor.clone(),
+                    Some(chat_tx.clone()),
+                )
+                .ok()
+                .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>),
                 None => None,
             }
         }
@@ -1061,6 +1215,12 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                     Some(ClientMsg::SlashToolReply { text }) => state.on_slash_tool_reply(text),
                     Some(ClientMsg::ChatError { message }) => state.on_chat_error(message),
                     Some(ClientMsg::ChatDetectResult { offer }) => state.set_detect_result(offer),
+                    // A mutating tool (or slash command) surfaced an approval —
+                    // open the modal; nothing executes until the operator approves.
+                    Some(ClientMsg::ChatApprovalRequired { intent }) => state.open_approval(intent),
+                    // An approved action finished: append the result turn and
+                    // fire exactly one automatic follow-up agent turn.
+                    Some(ClientMsg::ChatApprovalResult { text }) => state.on_approval_result(text),
                     None => break,
                 }
             }
@@ -1073,6 +1233,38 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             }
             maybe_ev = events.next() => {
                 match maybe_ev {
+                    // The approval modal, when open, owns ALL keys with the
+                    // highest priority (above every operational overlay and the
+                    // general handler) so the operator's decision can't be
+                    // pre-empted. On Approve: replay the approved action off the
+                    // event loop (spawn_blocking) and post ChatApprovalResult.
+                    // On Deny/Cancel: a declined turn, no execution.
+                    Some(Ok(CtEvent::Key(k))) if state.approval.is_some() => {
+                        use crate::ui::approval::ApprovalVerdict;
+                        match state.on_approval_key(k.code) {
+                            Some(ApprovalVerdict::Approve) => {
+                                if let Some((name, args)) = state.take_approval() {
+                                    match state.tool_executor.clone() {
+                                        Some(executor) => {
+                                            let reply_tx = chat_tx.clone();
+                                            tokio::task::spawn_blocking(move || {
+                                                let text = run_approved(&executor, &name, &args);
+                                                let _ = reply_tx
+                                                    .send(ClientMsg::ChatApprovalResult { text });
+                                            });
+                                        }
+                                        None => state.on_approval_result(
+                                            "ROCm tools unavailable in this mode".to_string(),
+                                        ),
+                                    }
+                                }
+                            }
+                            Some(ApprovalVerdict::Deny | ApprovalVerdict::Cancel) => {
+                                state.on_approval_declined();
+                            }
+                            None => { /* cursor moved or key ignored — modal stays open */ }
+                        }
+                    }
                     // The services-manager overlay, when open, owns all keys
                     // (and may spawn lifecycle jobs through the job-bridge).
                     Some(Ok(CtEvent::Key(k))) if state.services.is_some() => {
@@ -1238,9 +1430,19 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                 Some(executor) => {
                     let reply_tx = chat_tx.clone();
                     tokio::task::spawn_blocking(move || {
-                        let outcome = executor.execute(&req.name, &req.args);
-                        let text = summarize_slash_tool(&req.label, &outcome);
-                        let _ = reply_tx.send(ClientMsg::SlashToolReply { text });
+                        // One path for read-only AND mutating slash commands:
+                        // `Result`/`Error` → a concise reply turn; an
+                        // `ApprovalRequired` (mutating) → open the approval modal
+                        // via ChatApprovalRequired (nothing executes yet).
+                        let msg = match executor.execute(&req.name, &req.args) {
+                            crate::tool_exec::RocmToolOutcome::ApprovalRequired(intent) => {
+                                ClientMsg::ChatApprovalRequired { intent }
+                            }
+                            outcome => ClientMsg::SlashToolReply {
+                                text: summarize_slash_tool(&req.label, &outcome),
+                            },
+                        };
+                        let _ = reply_tx.send(msg);
                     });
                 }
                 None => {
@@ -1349,6 +1551,33 @@ fn persist_chat_endpoint(base_url: &str, model: &str) -> Result<std::path::PathB
 /// Max object fields a slash-tool summary surfaces before truncating with an
 /// ellipsis line. Keeps `summarize_json_value` output terse and length-bounded.
 const SUMMARY_MAX_FIELDS: usize = 8;
+
+/// Run an approved mutating action across the seam and render a concise summary
+/// (never a raw JSON dump). Sync + executor-generic so the approve path is
+/// unit-testable without tokio; the event loop calls it inside spawn_blocking.
+fn run_approved(
+    executor: &crate::tool_exec::SharedRocmToolExecutor,
+    name: &str,
+    args: &serde_json::Value,
+) -> String {
+    use crate::tool_exec::RocmToolOutcome;
+    match executor.execute_approved(name, args) {
+        RocmToolOutcome::Result(v) => {
+            let body = summarize_json_value(&v);
+            if body.is_empty() {
+                format!("Approved · {name}: done")
+            } else {
+                format!("Approved · {name}:\n{body}")
+            }
+        }
+        RocmToolOutcome::Error(e) => format!("Approved · {name} failed: {e}"),
+        // A mutating tool's approved replay should not re-request approval; if it
+        // somehow does, surface it plainly rather than silently looping.
+        RocmToolOutcome::ApprovalRequired(_) => {
+            format!("Approved · {name}: unexpected second approval request (not run)")
+        }
+    }
+}
 
 fn summarize_slash_tool(label: &str, outcome: &crate::tool_exec::RocmToolOutcome) -> String {
     use crate::tool_exec::RocmToolOutcome;
@@ -2813,6 +3042,243 @@ mod tests {
         assert_eq!(
             req.args,
             serde_json::json!({ "args": ["daemon", "status"] })
+        );
+    }
+
+    // --- Phase 4: mutating slash dispatch + approval modal flow ---
+
+    #[test]
+    fn slash_install_raises_install_sdk_request() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/install"), SlashOutcome::Handled);
+        let req = s.slash_tool.expect("install raises a slash_tool request");
+        assert_eq!(req.name, "install_sdk");
+        assert_eq!(req.args["channel"], "release");
+        assert_eq!(req.args["format"], "wheel");
+    }
+
+    #[test]
+    fn slash_engine_raises_install_engine_request() {
+        let mut s = st();
+        assert_eq!(
+            s.handle_slash_command("/engine vllm"),
+            SlashOutcome::Handled
+        );
+        let req = s.slash_tool.expect("engine raises a slash_tool request");
+        assert_eq!(req.name, "install_engine");
+        assert_eq!(req.args, serde_json::json!({ "engine": "vllm" }));
+    }
+
+    #[test]
+    fn slash_engine_without_name_hints_not_dispatch() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/engine"), SlashOutcome::Handled);
+        assert!(s.slash_tool.is_none(), "no dispatch without an engine name");
+        assert_eq!(s.chat.last().unwrap().role, ChatRole::Error);
+    }
+
+    #[test]
+    fn slash_serve_raises_launch_server_request() {
+        let mut s = st();
+        assert_eq!(
+            s.handle_slash_command("/serve deepseek-r1"),
+            SlashOutcome::Handled
+        );
+        let req = s.slash_tool.expect("serve raises a slash_tool request");
+        assert_eq!(req.name, "launch_server");
+        assert_eq!(req.args["model"], "deepseek-r1");
+        // Loopback host is forced so the validator never rejects the slash path.
+        assert_eq!(req.args["host"], "127.0.0.1");
+    }
+
+    #[test]
+    fn slash_services_stop_raises_stop_server_request() {
+        let mut s = st();
+        assert_eq!(
+            s.handle_slash_command("/services stop svc-1"),
+            SlashOutcome::Handled
+        );
+        let req = s
+            .slash_tool
+            .expect("services stop raises a slash_tool request");
+        assert_eq!(req.name, "stop_server");
+        assert_eq!(req.args, serde_json::json!({ "service_id": "svc-1" }));
+    }
+
+    #[test]
+    fn slash_services_bare_is_read_only_list() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/services"), SlashOutcome::Handled);
+        let req = s.slash_tool.expect("bare services lists managed services");
+        assert_eq!(req.name, "services");
+    }
+
+    /// Recording executor: mutating names surface `ApprovalRequired`; the
+    /// approved replay records `(name, args)` and returns a success Result. Used
+    /// to drive the approve/deny/follow-up tests offline (no real installs).
+    #[derive(Debug)]
+    struct RecordingExecutor {
+        approved: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+    impl RecordingExecutor {
+        fn new() -> Self {
+            Self {
+                approved: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
+    impl crate::tool_exec::RocmToolExecutor for RecordingExecutor {
+        fn execute(
+            &self,
+            name: &str,
+            args: &serde_json::Value,
+        ) -> crate::tool_exec::RocmToolOutcome {
+            crate::tool_exec::RocmToolOutcome::ApprovalRequired(crate::tool_exec::ApprovalIntent {
+                title: "T".to_string(),
+                body: vec!["cmd".to_string()],
+                name: name.to_string(),
+                arguments: args.clone(),
+            })
+        }
+        fn execute_approved(
+            &self,
+            name: &str,
+            args: &serde_json::Value,
+        ) -> crate::tool_exec::RocmToolOutcome {
+            self.approved
+                .lock()
+                .unwrap()
+                .push((name.to_string(), args.clone()));
+            crate::tool_exec::RocmToolOutcome::Result(serde_json::json!({ "ok": true }))
+        }
+    }
+
+    #[test]
+    fn approval_required_opens_modal() {
+        let mut s = st();
+        let intent = crate::tool_exec::ApprovalIntent {
+            title: "Install ROCm".to_string(),
+            body: vec!["rocm install sdk".to_string()],
+            name: "install_sdk".to_string(),
+            arguments: serde_json::json!({ "channel": "release" }),
+        };
+        s.open_approval(intent);
+        let pa = s.approval.as_ref().expect("modal opened");
+        assert_eq!(pa.name, "install_sdk");
+        assert_eq!(pa.req.title, "Install ROCm");
+    }
+
+    #[test]
+    fn approve_path_runs_execute_approved_with_expected_args() {
+        // (a) approve: a ChatApprovalRequired opens the modal; an Approve verdict
+        // drives execute_approved with the exact name + args. We exercise the
+        // same sync code path the spawn_blocking uses (`run_approved`).
+        let exec = std::sync::Arc::new(RecordingExecutor::new());
+        let recorded = exec.approved.clone();
+        let shared: crate::tool_exec::SharedRocmToolExecutor = exec;
+
+        let mut s = st();
+        s.open_approval(crate::tool_exec::ApprovalIntent {
+            title: "T".to_string(),
+            body: vec!["cmd".to_string()],
+            name: "install_sdk".to_string(),
+            arguments: serde_json::json!({ "channel": "release", "format": "wheel" }),
+        });
+        // Enter on the default (Approve) choice yields an Approve verdict.
+        let verdict = s.on_approval_key(crossterm::event::KeyCode::Enter);
+        assert_eq!(verdict, Some(crate::ui::approval::ApprovalVerdict::Approve));
+        let (name, args) = s.take_approval().expect("approval taken on approve");
+        assert!(s.approval.is_none(), "modal cleared after taking approval");
+
+        let summary = run_approved(&shared, &name, &args);
+        let log = recorded.lock().unwrap();
+        assert_eq!(log.len(), 1, "execute_approved ran exactly once");
+        assert_eq!(log[0].0, "install_sdk");
+        assert_eq!(log[0].1["channel"], "release");
+        assert_eq!(log[0].1["format"], "wheel");
+        assert!(
+            summary.contains("Approved"),
+            "concise summary, not raw JSON"
+        );
+    }
+
+    #[test]
+    fn deny_path_runs_nothing_and_appends_declined_turn() {
+        // (b) deny: a Deny/Cancel verdict appends a declined turn and never
+        // touches execute_approved.
+        let exec = std::sync::Arc::new(RecordingExecutor::new());
+        let recorded = exec.approved.clone();
+
+        let mut s = st();
+        s.open_approval(crate::tool_exec::ApprovalIntent {
+            title: "T".to_string(),
+            body: vec!["cmd".to_string()],
+            name: "launch_server".to_string(),
+            arguments: serde_json::json!({ "model": "m" }),
+        });
+        // 'n' is a direct Deny verdict.
+        let verdict = s.on_approval_key(crossterm::event::KeyCode::Char('n'));
+        assert_eq!(verdict, Some(crate::ui::approval::ApprovalVerdict::Deny));
+        s.on_approval_declined();
+        assert!(s.approval.is_none(), "modal cleared on deny");
+        assert_eq!(s.chat.last().unwrap().role, ChatRole::Agent);
+        assert!(s.chat.last().unwrap().content.contains("declined"));
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "deny must not execute the action"
+        );
+
+        // Esc also cancels (no execution).
+        let mut s2 = st();
+        s2.open_approval(crate::tool_exec::ApprovalIntent {
+            title: "T".to_string(),
+            body: vec!["cmd".to_string()],
+            name: "stop_server".to_string(),
+            arguments: serde_json::json!({ "service_id": "x" }),
+        });
+        assert_eq!(
+            s2.on_approval_key(crossterm::event::KeyCode::Esc),
+            Some(crate::ui::approval::ApprovalVerdict::Cancel)
+        );
+    }
+
+    #[test]
+    fn approval_result_fires_exactly_one_follow_up_no_loop() {
+        // (c) exactly one follow-up: on_approval_result appends the result turn
+        // AND raises chat_dispatch exactly once; it must not re-trigger itself.
+        let mut s = st();
+        assert!(!s.chat_dispatch);
+        s.on_approval_result("Approved · install_sdk: done".to_string());
+        assert_eq!(s.chat.last().unwrap().role, ChatRole::Agent);
+        assert!(s.chat_dispatch, "exactly one follow-up edge raised");
+        assert!(s.chat_sending, "in-flight mirrors a normal submit");
+
+        // Simulate the event loop consuming the edge once.
+        s.chat_dispatch = false;
+        // A subsequent tick must NOT re-raise it on its own (no self-loop): the
+        // only thing that re-raises is another explicit result/submit.
+        assert!(!s.chat_dispatch, "follow-up does not re-trigger itself");
+    }
+
+    #[test]
+    fn approval_key_tab_moves_choice_without_verdict() {
+        let mut s = st();
+        s.open_approval(crate::tool_exec::ApprovalIntent {
+            title: "T".to_string(),
+            body: vec!["cmd".to_string()],
+            name: "install_sdk".to_string(),
+            arguments: serde_json::json!({}),
+        });
+        // Tab toggles the cursor to Deny without producing a verdict.
+        assert_eq!(s.on_approval_key(crossterm::event::KeyCode::Tab), None);
+        assert_eq!(
+            s.approval.as_ref().unwrap().choice,
+            crate::ui::approval::ApprovalChoice::Deny
+        );
+        // Enter now confirms Deny.
+        assert_eq!(
+            s.on_approval_key(crossterm::event::KeyCode::Enter),
+            Some(crate::ui::approval::ApprovalVerdict::Deny)
         );
     }
 

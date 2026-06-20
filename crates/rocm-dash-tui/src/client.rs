@@ -62,6 +62,19 @@ pub enum ClientMsg {
     ChatDetectResult {
         offer: Option<crate::llm::LlmConfig>,
     },
+    /// A mutating tool surfaced an approval request (Phase 4). Posted by the
+    /// mutating rig tool (or the slash-tool path) when `execute()` returns
+    /// `ApprovalRequired`; the app event loop opens the approval modal. The tool
+    /// itself does NOT execute — execution waits for the operator's Approve.
+    ChatApprovalRequired {
+        intent: crate::tool_exec::ApprovalIntent,
+    },
+    /// Result of an *approved* mutating action (Phase 4). Posted off-thread after
+    /// `execute_approved` runs; the app appends a concise result turn and fires
+    /// exactly one automatic follow-up agent turn.
+    ChatApprovalResult {
+        text: String,
+    },
 }
 
 pub fn spawn(connect: String, tx: UnboundedSender<ClientMsg>) {

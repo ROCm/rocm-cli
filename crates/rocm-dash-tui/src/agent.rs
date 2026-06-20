@@ -29,8 +29,11 @@ use rocm_dash_core::bench_schema::BenchmarkRow;
 use rocm_dash_core::metrics::{GpuMetrics, Instance, Snapshot};
 
 use crate::app::{ChatRole, ChatTurn};
+use crate::client::ClientMsg;
 use crate::llm::LlmConfig;
 use crate::tool_exec::{RocmToolOutcome, SharedRocmToolExecutor};
+
+use tokio::sync::mpsc::UnboundedSender;
 
 /// One-shot request budget. A hung backend becomes a timeout error turn, never
 /// a frozen pane.
@@ -628,6 +631,178 @@ pub const ROCM_READ_TOOL_NAMES: [&str; 12] = [
     RocmCommandRocmTool::NAME,
 ];
 
+// ---------------------------------------------------------------------------
+// Mutating ROCm tools (group D, Phase 4). These do NOT execute inside the rig
+// tool loop. `execute()` returns `ApprovalRequired(intent)` (a descriptor that
+// the bin's validators already accepted); the tool posts the intent to the app
+// via `approval_tx` (a `ClientMsg::ChatApprovalRequired`) and returns a
+// "surfaced for approval" note to the model. The actual action runs only after
+// the operator approves the modal, via `execute_approved` off the event loop.
+// agent.rs stays the sole `rig` namer; the seam types are plain data.
+// ---------------------------------------------------------------------------
+
+/// Declare one mutating ROCm tool type. Mirrors [`rocm_read_tool!`] but its
+/// `call()` surfaces the approval intent rather than executing: on
+/// `ApprovalRequired` it forwards the descriptor over `approval_tx` and returns
+/// a terse "surfaced" note (no execution, no retry); on `Error` it returns the
+/// validator error; a `Result` (shouldn't happen for a mutating tool, handled
+/// defensively) is passed through. Args are raw JSON (the bin validates them).
+macro_rules! rocm_mutating_tool {
+    ($ty:ident, $name:literal, $desc:literal, $params:tt) => {
+        pub struct $ty {
+            pub executor: Option<SharedRocmToolExecutor>,
+            pub approval_tx: Option<UnboundedSender<ClientMsg>>,
+            pub fired: FiredLog,
+        }
+        impl Tool for $ty {
+            const NAME: &'static str = $name;
+            type Error = ToolError;
+            type Args = serde_json::Value;
+            type Output = Value;
+            async fn definition(&self, _p: String) -> ToolDefinition {
+                ToolDefinition {
+                    name: $name.to_string(),
+                    description: $desc.to_string(),
+                    parameters: json!($params),
+                }
+            }
+            async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+                record(&self.fired, $name);
+                match self.executor.as_ref() {
+                    None => Ok(json!({ "error": "ROCm tools unavailable in this mode." })),
+                    Some(e) => match e.execute($name, &args) {
+                        RocmToolOutcome::ApprovalRequired(intent) => {
+                            if let Some(tx) = self.approval_tx.as_ref() {
+                                let _ = tx.send(ClientMsg::ChatApprovalRequired { intent });
+                            }
+                            Ok(json!({
+                                "status": "surfaced_for_approval",
+                                "note": "This action needs operator approval; it has been \
+                                         surfaced to the operator. Do not retry.",
+                            }))
+                        }
+                        RocmToolOutcome::Error(s) => Ok(json!({ "error": s })),
+                        RocmToolOutcome::Result(v) => Ok(v),
+                    },
+                }
+            }
+        }
+    };
+}
+
+rocm_mutating_tool!(
+    InstallSdkRocmTool,
+    "install_sdk",
+    "Install the TheRock ROCm SDK. MUTATING — this is surfaced for operator \
+     approval before anything runs; it does NOT install immediately. The user \
+     must supply an install `prefix` (folder); ask for it first.",
+    {
+        "type": "object",
+        "properties": {
+            "channel": { "type": "string", "description": "Release channel: 'release' or 'nightly'." },
+            "format": { "type": "string", "description": "Artifact format: 'wheel' or 'tarball'." },
+            "prefix": { "type": "string", "description": "Install folder (required; never a system path)." },
+            "version": { "type": "string", "description": "Optional explicit wheel version selector." }
+        }
+    }
+);
+rocm_mutating_tool!(
+    InstallEngineRocmTool,
+    "install_engine",
+    "Install an inference engine (e.g. vllm, llama-cpp, comfyui). MUTATING — \
+     surfaced for operator approval before anything runs.",
+    {
+        "type": "object",
+        "properties": {
+            "engine": { "type": "string", "description": "Engine to install, e.g. 'vllm'." },
+            "runtime_id": { "type": "string", "description": "Optional ROCm runtime id to target." },
+            "python_version": { "type": "string", "description": "Optional Python version for the engine env." },
+            "reinstall": { "type": "boolean", "description": "Reinstall even if already present." }
+        },
+        "required": ["engine"]
+    }
+);
+rocm_mutating_tool!(
+    LaunchServerRocmTool,
+    "launch_server",
+    "Start a local managed model server. MUTATING — surfaced for operator \
+     approval before anything runs. Host is loopback-only (no public bind); CPU \
+     execution is rejected (ROCm GPU required).",
+    {
+        "type": "object",
+        "properties": {
+            "model": { "type": "string", "description": "Model id/name to serve." },
+            "engine": { "type": "string", "description": "Optional engine, e.g. 'vllm'." },
+            "host": { "type": "string", "description": "Loopback host only (e.g. 127.0.0.1)." },
+            "port": { "type": "integer", "description": "Optional TCP port." },
+            "device": { "type": "string", "description": "GPU device selector (CPU is rejected)." }
+        },
+        "required": ["model"]
+    }
+);
+rocm_mutating_tool!(
+    StopServerRocmTool,
+    "stop_server",
+    "Stop a running local managed model server by service id. MUTATING — \
+     surfaced for operator approval before anything runs.",
+    {
+        "type": "object",
+        "properties": {
+            "service_id": { "type": "string", "description": "Managed service identifier to stop." }
+        },
+        "required": ["service_id"]
+    }
+);
+
+/// All mutating ROCm tool names (mirrors [`ROCM_READ_TOOL_NAMES`]).
+///
+/// Used for uniqueness/registration checks and the parity map. Phase 4 ships
+/// exactly the install/engine/serve/services mutating set;
+/// update/comfyui/uninstall/setup and automations toggles are later phases.
+pub const ROCM_MUTATING_TOOL_NAMES: [&str; 4] = [
+    InstallSdkRocmTool::NAME,
+    InstallEngineRocmTool::NAME,
+    LaunchServerRocmTool::NAME,
+    StopServerRocmTool::NAME,
+];
+
+/// Register every mutating ROCm tool on a Rig `AgentBuilder`, cloning the
+/// optional executor + approval channel + the shared `fired` log into each.
+/// Generic over the builder's model + preamble so both client paths reuse one
+/// registration site (DRY). Called after [`register_rocm_read_tools`].
+fn register_rocm_mutating_tools<M, P>(
+    builder: rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>,
+    executor: Option<&SharedRocmToolExecutor>,
+    approval_tx: Option<&UnboundedSender<ClientMsg>>,
+    fired: &FiredLog,
+) -> rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>
+where
+    M: rig::completion::CompletionModel,
+    P: rig::agent::PromptHook<M>,
+{
+    builder
+        .tool(InstallSdkRocmTool {
+            executor: executor.cloned(),
+            approval_tx: approval_tx.cloned(),
+            fired: fired.clone(),
+        })
+        .tool(InstallEngineRocmTool {
+            executor: executor.cloned(),
+            approval_tx: approval_tx.cloned(),
+            fired: fired.clone(),
+        })
+        .tool(LaunchServerRocmTool {
+            executor: executor.cloned(),
+            approval_tx: approval_tx.cloned(),
+            fired: fired.clone(),
+        })
+        .tool(StopServerRocmTool {
+            executor: executor.cloned(),
+            approval_tx: approval_tx.cloned(),
+            fired: fired.clone(),
+        })
+}
+
 /// Live Rig-backed client for an OpenAI-compatible endpoint. The Rig client is
 /// constructed once; the agent + tools are rebuilt per request from the
 /// captured snapshot.
@@ -635,14 +810,18 @@ pub struct RigAgentClient {
     client: rig::providers::openai::CompletionsClient,
     model: String,
     preamble: String,
-    /// Bin-injected read-only tool executor (None for tests / no live seam).
+    /// Bin-injected tool executor (None for tests / no live seam).
     executor: Option<SharedRocmToolExecutor>,
+    /// Channel to surface mutating-tool approval intents to the app (None for
+    /// tests / no live seam). Mutating tools post here instead of executing.
+    approval_tx: Option<UnboundedSender<ClientMsg>>,
 }
 
 impl RigAgentClient {
     pub fn new(
         cfg: LlmConfig,
         executor: Option<SharedRocmToolExecutor>,
+        approval_tx: Option<UnboundedSender<ClientMsg>>,
     ) -> Result<Self, AgentError> {
         // Custom-auth gateway (e.g. Azure APIM `Ocp-Apim-Subscription-Key`):
         // the key goes in a custom header, NOT `Authorization: Bearer`. Rig
@@ -675,6 +854,7 @@ impl RigAgentClient {
             model: cfg.model,
             preamble: DEFAULT_PREAMBLE.to_string(),
             executor,
+            approval_tx,
         })
     }
 }
@@ -739,7 +919,15 @@ impl AgentClient for RigAgentClient {
                 fired: fired.clone(),
             });
         // Read-only ROCm machine-inspection tools (forward across the seam).
-        let agent = register_rocm_read_tools(agent, self.executor.as_ref(), &fired).build();
+        let agent = register_rocm_read_tools(agent, self.executor.as_ref(), &fired);
+        // Mutating ROCm tools (surface approval; never execute in the rig loop).
+        let agent = register_rocm_mutating_tools(
+            agent,
+            self.executor.as_ref(),
+            self.approval_tx.as_ref(),
+            &fired,
+        )
+        .build();
 
         let req = agent
             .prompt(last.content.clone())
@@ -835,8 +1023,11 @@ pub struct ChatGptAgentClient {
     client: rig::providers::chatgpt::Client,
     model: String,
     preamble: String,
-    /// Bin-injected read-only tool executor (None for tests / no live seam).
+    /// Bin-injected tool executor (None for tests / no live seam).
     executor: Option<SharedRocmToolExecutor>,
+    /// Channel to surface mutating-tool approval intents to the app (None for
+    /// tests / no live seam).
+    approval_tx: Option<UnboundedSender<ClientMsg>>,
 }
 
 impl ChatGptAgentClient {
@@ -848,6 +1039,7 @@ impl ChatGptAgentClient {
         model: Option<String>,
         on_device_code: F,
         executor: Option<SharedRocmToolExecutor>,
+        approval_tx: Option<UnboundedSender<ClientMsg>>,
     ) -> Result<Self, AgentError>
     where
         F: Fn(String, String) + Send + Sync + 'static,
@@ -908,6 +1100,7 @@ impl ChatGptAgentClient {
             model: model.unwrap_or_else(|| chatgpt::GPT_5_3_CODEX.to_string()),
             preamble: DEFAULT_PREAMBLE.to_string(),
             executor,
+            approval_tx,
         })
     }
 }
@@ -966,7 +1159,15 @@ impl AgentClient for ChatGptAgentClient {
                 fired: fired.clone(),
             });
         // Read-only ROCm machine-inspection tools (forward across the seam).
-        let agent = register_rocm_read_tools(agent, self.executor.as_ref(), &fired).build();
+        let agent = register_rocm_read_tools(agent, self.executor.as_ref(), &fired);
+        // Mutating ROCm tools (surface approval; never execute in the rig loop).
+        let agent = register_rocm_mutating_tools(
+            agent,
+            self.executor.as_ref(),
+            self.approval_tx.as_ref(),
+            &fired,
+        )
+        .build();
 
         let req = agent
             .prompt(last.content.clone())
@@ -1290,6 +1491,9 @@ mod tests {
         fn execute(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
             RocmToolOutcome::Result(self.0.clone())
         }
+        fn execute_approved(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
+            RocmToolOutcome::Result(self.0.clone())
+        }
     }
 
     #[tokio::test]
@@ -1308,6 +1512,98 @@ mod tests {
             tool.fired.lock().unwrap().as_slice(),
             &["doctor".to_string()]
         );
+    }
+
+    /// Recording executor for the mutating-tool surfacing test: `execute`
+    /// returns `ApprovalRequired`; `execute_approved` records a call (which must
+    /// NOT happen during the rig tool loop).
+    #[derive(Debug)]
+    struct RecordingMutatingExec {
+        approved: Arc<Mutex<Vec<String>>>,
+    }
+    impl crate::tool_exec::RocmToolExecutor for RecordingMutatingExec {
+        fn execute(&self, name: &str, args: &Value) -> RocmToolOutcome {
+            RocmToolOutcome::ApprovalRequired(crate::tool_exec::ApprovalIntent {
+                title: "T".to_string(),
+                body: vec!["cmd".to_string()],
+                name: name.to_string(),
+                arguments: args.clone(),
+            })
+        }
+        fn execute_approved(&self, name: &str, _args: &Value) -> RocmToolOutcome {
+            self.approved.lock().unwrap().push(name.to_string());
+            RocmToolOutcome::Result(json!({ "ok": true }))
+        }
+    }
+
+    #[tokio::test]
+    async fn mutating_tool_surfaces_approval_not_execution() {
+        // (f) a mutating rig tool's call() posts ChatApprovalRequired over the
+        // approval channel and returns a "surfaced" note — it must NOT execute
+        // (execute_approved is never called from the rig loop).
+        let approved = Arc::new(Mutex::new(Vec::<String>::new()));
+        let exec: SharedRocmToolExecutor = Arc::new(RecordingMutatingExec {
+            approved: approved.clone(),
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ClientMsg>();
+        let tool = InstallSdkRocmTool {
+            executor: Some(exec),
+            approval_tx: Some(tx),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        let out = tool
+            .call(json!({ "channel": "release", "format": "wheel", "prefix": "/tmp/x" }))
+            .await
+            .expect("tool call ok");
+        assert_eq!(out["status"], "surfaced_for_approval");
+        // The intent was posted to the app (modal would open).
+        match rx.try_recv().expect("approval intent posted") {
+            ClientMsg::ChatApprovalRequired { intent } => {
+                assert_eq!(intent.name, "install_sdk");
+                assert_eq!(intent.arguments["channel"], "release");
+            }
+            other => panic!("expected ChatApprovalRequired, got {other:?}"),
+        }
+        // Crucially, nothing executed in the rig loop.
+        assert!(
+            approved.lock().unwrap().is_empty(),
+            "mutating tool must not execute in the rig loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutating_tool_none_executor_is_graceful() {
+        let tool = LaunchServerRocmTool {
+            executor: None,
+            approval_tx: None,
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        let out = tool.call(json!({ "model": "m" })).await.expect("ok");
+        assert!(out.get("error").and_then(Value::as_str).is_some());
+    }
+
+    #[test]
+    fn mutating_tool_names_are_complete_and_disjoint() {
+        for expected in [
+            "install_sdk",
+            "install_engine",
+            "launch_server",
+            "stop_server",
+        ] {
+            assert!(
+                ROCM_MUTATING_TOOL_NAMES.contains(&expected),
+                "missing mutating tool: {expected}"
+            );
+        }
+        // Disjoint from read-only + skill names.
+        for n in ROCM_MUTATING_TOOL_NAMES {
+            assert!(!SKILL_NAMES.contains(&n), "collision with skill: {n}");
+            // install_sdk_dry_run (read-only) must not clash with install_sdk.
+            assert!(
+                !ROCM_READ_TOOL_NAMES.contains(&n),
+                "collision with read tool: {n}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1412,7 +1708,7 @@ mod tests {
             api_key: None,
             auth_header: None,
         };
-        let client = RigAgentClient::new(cfg, None).expect("build rig client");
+        let client = RigAgentClient::new(cfg, None, None).expect("build rig client");
         let history = vec![ChatTurn::user("What's GPU-2 doing? Use the tools.")];
         let reply = client
             .complete(&history, fixture_snapshot())
@@ -1443,7 +1739,7 @@ mod tests {
             api_key: Some(key),
             auth_header,
         };
-        let client = RigAgentClient::new(cfg, None).expect("build rig client");
+        let client = RigAgentClient::new(cfg, None, None).expect("build rig client");
         let history = vec![ChatTurn::user("Reply with exactly: gateway ok")];
         let reply = client
             .complete(&history, fixture_snapshot())
@@ -1467,6 +1763,7 @@ mod tests {
                 sink.lock().unwrap().push(format!("{url}|{code}"));
             },
             None,
+            None,
         )
         .expect("build chatgpt oauth client");
         assert_eq!(client.model, "gpt-5.3-codex");
@@ -1476,7 +1773,7 @@ mod tests {
 
     #[test]
     fn chatgpt_oauth_client_defaults_model_when_none() {
-        let client = ChatGptAgentClient::new(None, |_url, _code| {}, None)
+        let client = ChatGptAgentClient::new(None, |_url, _code| {}, None, None)
             .expect("build chatgpt oauth client");
         assert_eq!(
             client.model,
@@ -1497,6 +1794,7 @@ mod tests {
             |url, code| {
                 eprintln!("Sign in: open {url} and enter code {code}");
             },
+            None,
             None,
         )
         .expect("build chatgpt oauth client");
