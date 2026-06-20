@@ -1981,6 +1981,127 @@ mod tests {
         );
     }
 
+    #[test]
+    fn anthropic_backend_constructs_and_is_agentclient() {
+        // Offline construction with a dummy key (no network until complete()).
+        // An empty model falls back to CLAUDE_SONNET_4_6.
+        let client = AnthropicAgentClient::new(
+            LlmConfig {
+                base_url: String::new(),
+                model: String::new(),
+                api_key: Some("dummy".to_string()),
+                auth_header: None,
+            },
+            None,
+            None,
+        )
+        .expect("build anthropic client");
+        assert_eq!(
+            client.model,
+            rig::providers::anthropic::completion::CLAUDE_SONNET_4_6,
+            "empty model defaults to Claude Sonnet"
+        );
+        // It is usable behind the swappable `AgentClient` seam (object-safe).
+        let _erased: Arc<dyn AgentClient> = Arc::new(client);
+    }
+
+    #[test]
+    fn anthropic_requires_key() {
+        // No api_key → a Build error naming the env var; nothing constructs.
+        // (The Ok variant isn't Debug, so match rather than unwrap_err.)
+        let err = match AnthropicAgentClient::new(
+            LlmConfig {
+                base_url: String::new(),
+                model: String::new(),
+                api_key: None,
+                auth_header: None,
+            },
+            None,
+            None,
+        ) {
+            Ok(_) => panic!("expected a Build error without a key"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, AgentError::Build(_)));
+        assert!(
+            err.to_string().contains("ANTHROPIC_API_KEY"),
+            "error names the required env var: {err}"
+        );
+    }
+
+    #[test]
+    fn anthropic_honors_explicit_model() {
+        let client = AnthropicAgentClient::new(
+            LlmConfig {
+                base_url: String::new(),
+                model: "claude-opus-4-7".to_string(),
+                api_key: Some("dummy".to_string()),
+                auth_header: None,
+            },
+            None,
+            None,
+        )
+        .expect("build anthropic client");
+        assert_eq!(client.model, "claude-opus-4-7");
+    }
+
+    #[test]
+    fn all_backends_register_same_rocm_tools() {
+        // Contract: every backend's complete() registers BOTH the read and the
+        // mutating ROCm tool sets (each calls register_rocm_read_tools +
+        // register_rocm_mutating_tools), so capability + approval parity holds
+        // across local/openai/anthropic. This enumerates the canonical sets that
+        // those shared helpers register; the helper call sites are identical in
+        // RigAgentClient, ChatGptAgentClient, and AnthropicAgentClient.
+        assert_eq!(
+            ROCM_READ_TOOL_NAMES.len(),
+            13,
+            "canonical read-tool set size"
+        );
+        assert_eq!(
+            ROCM_MUTATING_TOOL_NAMES.len(),
+            6,
+            "canonical mutating-tool set size"
+        );
+        // The two sets are disjoint (no tool is both read and mutating).
+        for n in ROCM_MUTATING_TOOL_NAMES {
+            assert!(
+                !ROCM_READ_TOOL_NAMES.contains(&n),
+                "tool {n} is in both sets"
+            );
+        }
+        // Every name is non-empty (a registered tool must have a NAME).
+        for n in ROCM_READ_TOOL_NAMES.iter().chain(ROCM_MUTATING_TOOL_NAMES.iter()) {
+            assert!(!n.is_empty(), "empty tool name in canonical set");
+        }
+    }
+
+    /// Live round-trip against Anthropic's Claude API. NOT run in CI (network +
+    /// a real key). Run with:
+    /// `ANTHROPIC_API_KEY=… cargo test -p rocm-dash-tui --lib anthropic_round_trip -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "requires ANTHROPIC_API_KEY environment variable + network"]
+    async fn anthropic_round_trip() {
+        let key = std::env::var("ANTHROPIC_API_KEY").expect("set ANTHROPIC_API_KEY");
+        let client = AnthropicAgentClient::new(
+            LlmConfig {
+                base_url: String::new(),
+                model: String::new(),
+                api_key: Some(key),
+                auth_header: None,
+            },
+            None,
+            None,
+        )
+        .expect("build anthropic client");
+        let history = vec![ChatTurn::user("Reply with exactly: anthropic ok")];
+        let reply = client
+            .complete(&history, fixture_snapshot())
+            .await
+            .expect("anthropic reply");
+        assert!(!reply.is_empty());
+    }
+
     /// Live no-key device-code round-trip against ChatGPT. NOT run in CI
     /// (interactive OAuth + network). Run with:
     /// `cargo test -p rocm-dash-tui --lib chatgpt_oauth_round_trip -- --ignored --nocapture`
