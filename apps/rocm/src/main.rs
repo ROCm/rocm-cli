@@ -8571,11 +8571,10 @@ pub(crate) fn run_internal_mcp_call(
             let action =
                 freeform_plan_next_action_with_context(&request, paths, &config).map(|action| {
                     serde_json::json!({
-                        "title": action.title,
                         "args": action.args,
                         "approval_required": action.approval_required,
                         "has_placeholders": action.has_placeholders,
-                        "reason": action.reason,
+                        "provider_assisted": action.provider_assisted,
                     })
                 });
             Ok(internal_mcp_tool_success(

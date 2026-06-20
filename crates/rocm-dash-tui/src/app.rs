@@ -296,6 +296,10 @@ pub struct PlannedAction {
     pub approval_required: bool,
     /// Whether any arg is still a `<placeholder>` (the plan is incomplete).
     pub has_placeholders: bool,
+    /// Whether a planner provider produced this plan. Provider-assisted plans
+    /// stay review-only (never auto-forwarded to execution), mirroring the
+    /// bin's `validate_freeform_execution_action` guard.
+    pub provider_assisted: bool,
 }
 
 /// A surfaced mutating-tool approval awaiting the operator's decision (Phase 4).
@@ -1089,7 +1093,12 @@ impl AppState {
             // posts `PlanReady`. The plan is rendered for review; a complete
             // mutating action is then handed to the Phase-4 approval modal.
             "plan" => {
-                let request = rest.strip_prefix("plan").map(str::trim).unwrap_or_default();
+                // Split off the command word (`plan`, any case) and take the
+                // free-form tail; case-insensitive, unlike `strip_prefix`.
+                let request = rest
+                    .split_once(char::is_whitespace)
+                    .map(|(_, tail)| tail.trim())
+                    .unwrap_or_default();
                 if request.is_empty() {
                     self.chat.push(ChatTurn::agent(
                         "usage: /plan <request> (e.g. /plan install rocm into /opt/rocm)"
@@ -1135,15 +1144,19 @@ impl AppState {
 
     /// Handle a completed natural-language plan (Phase 7). Pushes the rendered
     /// plan as a chat turn (the review). If the plan's next action is a complete
-    /// mutating action (`approval_required` AND NOT `has_placeholders`), hand its
-    /// argv to the Phase-4 approval flow via the `rocm_command` slash-tool edge
-    /// (execute → ApprovalRequired → modal). A placeholder/incomplete plan, or a
-    /// non-mutating one, stays plan-only: no approval focus, no execution.
+    /// mutating action (`approval_required` AND NOT `has_placeholders`) that is
+    /// NOT provider-assisted, hand its argv to the Phase-4 approval flow via the
+    /// `rocm_command` slash-tool edge (execute → ApprovalRequired → modal). A
+    /// placeholder/incomplete plan, a non-mutating one, or a provider-assisted
+    /// one stays plan-only: no approval focus, no execution. Provider-assisted
+    /// plans are review-only, mirroring the bin's
+    /// `validate_freeform_execution_action` guard.
     pub(crate) fn on_plan_ready(&mut self, text: String, action: Option<PlannedAction>) {
         self.chat.push(ChatTurn::agent(text));
         if let Some(action) = action
             && action.approval_required
             && !action.has_placeholders
+            && !action.provider_assisted
         {
             self.slash_tool = Some(SlashToolRequest {
                 name: "rocm_command".to_string(),
@@ -1990,6 +2003,10 @@ fn parse_plan_result(v: &serde_json::Value) -> Option<(String, Option<PlannedAct
                 .unwrap_or(false),
             has_placeholders: a
                 .get("has_placeholders")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            provider_assisted: a
+                .get("provider_assisted")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false),
         });
@@ -3499,6 +3516,14 @@ mod tests {
             SlashOutcome::Handled
         );
         assert_eq!(s.plan_request.as_deref(), Some("install rocm"));
+        // The command word is matched case-insensitively, and so must the arg
+        // extraction be: `/Plan` (mixed case) dispatches just like `/plan`.
+        let mut s_mixed = st();
+        assert_eq!(
+            s_mixed.handle_slash_command("/Plan install rocm"),
+            SlashOutcome::Handled
+        );
+        assert_eq!(s_mixed.plan_request.as_deref(), Some("install rocm"));
         // Bare `/plan` hints with a usage turn and raises no plan edge.
         let mut s2 = st();
         assert_eq!(s2.handle_slash_command("/plan"), SlashOutcome::Handled);
@@ -3530,6 +3555,7 @@ mod tests {
             ],
             approval_required: true,
             has_placeholders: false,
+            provider_assisted: false,
         };
         s.on_plan_ready("the plan".to_string(), Some(action));
         // The plan review is shown…
@@ -3558,6 +3584,7 @@ mod tests {
             ],
             approval_required: true,
             has_placeholders: true,
+            provider_assisted: false,
         };
         s.on_plan_ready("the plan".to_string(), Some(action));
         // The plan is shown for review, but an incomplete (placeholder) plan
@@ -3567,6 +3594,35 @@ mod tests {
         assert!(
             s.slash_tool.is_none(),
             "placeholder plan must stay plan-only (no approval, no execution)"
+        );
+        assert!(s.approval.is_none(), "no approval modal focus");
+    }
+
+    #[test]
+    fn on_plan_ready_provider_assisted_stays_plan_only() {
+        let mut s = st();
+        // A complete (no placeholders) mutating action that a planner provider
+        // produced. Even though approval_required && !has_placeholders, the
+        // provider_assisted flag keeps it review-only — mirrors the bin's
+        // `validate_freeform_execution_action` provider-assisted guard.
+        let action = PlannedAction {
+            args: vec![
+                "serve".to_string(),
+                "m".to_string(),
+                "--managed".to_string(),
+            ],
+            approval_required: true,
+            has_placeholders: false,
+            provider_assisted: true,
+        };
+        s.on_plan_ready("the plan".to_string(), Some(action));
+        // The plan text is rendered for review…
+        assert_eq!(s.chat.last().unwrap().role, ChatRole::Agent);
+        // …but the provider-assisted plan never focuses approval or executes:
+        // the user runs the displayed command manually.
+        assert!(
+            s.slash_tool.is_none(),
+            "provider-assisted plan must stay plan-only (no execution handoff)"
         );
         assert!(s.approval.is_none(), "no approval modal focus");
     }
