@@ -3456,7 +3456,7 @@ fn serve(
     }
 
     if managed {
-        return start_managed_service(
+        start_managed_service(
             &selected_engine,
             &service_id,
             &model,
@@ -3467,7 +3467,9 @@ fn serve(
             managed_runtime_id.as_deref(),
             managed_env_id.as_deref(),
             resolve.engine_recipe.as_ref(),
-        );
+        )?;
+        ensure_background_helper_running()?;
+        return Ok(());
     }
 
     if !foreground {
@@ -3664,6 +3666,45 @@ fn start_managed_service(
         ),
         Some(service_id),
     );
+    Ok(())
+}
+
+/// Start the background automation helper (`rocm daemon`) detached if it is not
+/// already running. Liveness is read from the file-based automation runtime
+/// state. A spawn failure is logged but never propagated to the caller, so
+/// enabling automations or launching a managed serve never hard-fails when the
+/// helper cannot start.
+fn ensure_background_helper_running() -> Result<()> {
+    let paths = AppPaths::discover()?;
+    if let Some(state) = AutomationRuntimeState::load(&paths)?
+        && state.running
+        && rocm_core::process_is_running(state.daemon_pid)
+    {
+        return Ok(());
+    }
+
+    let exe = managed_service_launcher_path()
+        .context("failed to resolve current rocm executable path")?;
+    let args = vec!["daemon".to_owned()];
+    #[cfg(windows)]
+    let spawn_result = {
+        let env_values = app_path_env_var_values(&paths, None);
+        let env_refs = app_path_env_var_refs(&env_values);
+        rocm_core::spawn_detached_no_inherit(&exe, &args, &env_refs).map(|_| ())
+    };
+    #[cfg(not(windows))]
+    let spawn_result = {
+        let mut command = managed_service_process_command(&exe, &args);
+        command.stdin(Stdio::null());
+        attach_background_stdio(&mut command, None)?;
+        detach_background_command(&mut command);
+        apply_app_path_env(&mut command, &paths);
+        command.spawn().map(|_| ())
+    };
+    match spawn_result {
+        Ok(()) => println!("  helper: started background automation daemon"),
+        Err(error) => println!("  helper: could not start background automation daemon: {error}"),
+    }
     Ok(())
 }
 
