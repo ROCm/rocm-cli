@@ -2,6 +2,7 @@ mod automations;
 mod bootstrap;
 mod comfyui;
 mod dash;
+mod dash_seam;
 mod provider_keys;
 mod providers;
 mod therock;
@@ -1066,7 +1067,8 @@ fn render_freeform_comfyui_status_answer(
     Ok(output)
 }
 
-fn dispatch(cli: Cli) -> Result<()> {
+// pub(crate): used by the dash execution seam (dash_seam.rs)
+pub(crate) fn dispatch(cli: Cli) -> Result<()> {
     if !matches!(
         cli.command,
         Some(Command::Update { .. } | Command::Bootstrap { .. } | Command::Completions { .. })
@@ -8308,7 +8310,8 @@ fn chat_tool_value(tool_text: &str, key: &str) -> Option<String> {
     })
 }
 
-fn run_internal_mcp_call(
+// pub(crate): used by the dash execution seam (dash_seam.rs)
+pub(crate) fn run_internal_mcp_call(
     paths: &AppPaths,
     name: &str,
     arguments: serde_json::Value,
