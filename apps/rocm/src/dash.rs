@@ -72,6 +72,17 @@ fn chat_api_key_from_env() -> Option<String> {
         .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
 }
 
+/// Anthropic API key for the dash chat seam — sourced env-first (`ANTHROPIC_API_KEY`)
+/// then the OS secure store, via the shared `provider_keys` resolver. The key
+/// rides in-process through `ResolvedArgs` (NEVER argv). A missing key or an
+/// unavailable store yields `None` (the dash still launches; switching to the
+/// Anthropic provider then surfaces an actionable error turn).
+fn anthropic_api_key_for_dash() -> Option<String> {
+    crate::provider_keys::resolve_provider_api_key("anthropic", "ANTHROPIC_API_KEY")
+        .ok()
+        .map(|k| k.value)
+}
+
 /// Adapt the built-in `rocm-core` model recipes into the TUI-local summaries the
 /// serve-wizard picker consumes (the bin owns the `rocm-core` dependency so the
 /// dash crates stay free of it).
@@ -165,6 +176,7 @@ pub fn resolved_args(
             .ok()
             .filter(|v| !v.is_empty()),
         chat_api_key: chat_api_key_from_env(),
+        anthropic_api_key: anthropic_api_key_for_dash(),
         chat_auto_consent: false,
         chat_mock: false,
         model_recipes: model_recipe_summaries(),

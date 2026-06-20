@@ -54,7 +54,12 @@ pub struct ResolvedArgs {
     /// A separate, lower-precedence tier than `chat_url`.
     pub chat_env_url: Option<String>,
     /// Chat api key, sourced from the environment ONLY (never TOML/CLI/source).
+    /// Used by the local/OpenAI backends.
     pub chat_api_key: Option<String>,
+    /// Anthropic API key, sourced by the bin (env-first then OS secure store —
+    /// NEVER argv) and carried in-process via this seam. `None` when absent;
+    /// the Anthropic backend then surfaces an actionable error on switch.
+    pub anthropic_api_key: Option<String>,
     /// Pre-consent to using the detected endpoint (`--chat-yes`), skipping the
     /// one-time in-TUI prompt for the demo.
     pub chat_auto_consent: bool,
