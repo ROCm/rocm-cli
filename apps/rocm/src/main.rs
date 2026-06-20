@@ -7275,8 +7275,11 @@ fn validate_chat_proposal_action_tool_call(call: &providers::ChatToolCall) -> Re
         .arguments
         .as_object()
         .context("proposal_action arguments must be a JSON object")?;
-    json_string(object, "proposal_id")
+    let proposal_id = json_string(object, "proposal_id")
         .context("proposal_action requires non-empty `proposal_id`")?;
+    if proposal_id.len() > 128 {
+        bail!("proposal_id too long");
+    }
     let action =
         json_string(object, "action").context("proposal_action requires non-empty `action`")?;
     if !matches!(action.as_str(), "show" | "approve" | "reject") {
@@ -7378,6 +7381,9 @@ fn validate_chat_watcher_tool_call(call: &providers::ChatToolCall, allow_mode: b
         .as_object()
         .context("watcher tool arguments must be a JSON object")?;
     let watcher = json_string(object, "watcher").context("watcher tool requires `watcher`")?;
+    if watcher.len() > 128 {
+        bail!("watcher id too long");
+    }
     if builtin_watcher(&watcher).is_none() {
         bail!("local assistant requested unknown watcher `{watcher}`");
     }
@@ -8612,7 +8618,9 @@ pub(crate) fn run_internal_mcp_call(
         "proposal_action" => {
             // Executes IN-PROCESS (no CLI subprocess): show loads a proposal;
             // approve/reject mutate its status (allow_mutation already enforced
-            // by the read-only split above). Must precede the subprocess arm.
+            // by the read-only split above). proposal_action executes in-process
+            // (via update_automation_proposal_status); it never delegates to the
+            // subprocess arm.
             let proposal_id = json_string(&arguments, "proposal_id")
                 .context("proposal_action requires `proposal_id`")?;
             let action =
@@ -15751,6 +15759,21 @@ mod tests {
             rocm_chat_tool_requested_command(&disable).as_deref(),
             Some("rocm automations disable server-recover")
         );
+    }
+
+    #[test]
+    fn proposal_action_rejects_over_long_proposal_id() {
+        let call = providers::ChatToolCall {
+            id: None,
+            name: "proposal_action".to_owned(),
+            arguments: serde_json::json!({
+                "proposal_id": "p".repeat(129),
+                "action": "show"
+            }),
+        };
+        let err = validate_chat_proposal_action_tool_call(&call)
+            .expect_err("over-long proposal_id must be rejected");
+        assert!(err.to_string().contains("proposal_id too long"));
     }
 
     #[test]
