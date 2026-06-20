@@ -640,7 +640,10 @@ pub struct RigAgentClient {
 }
 
 impl RigAgentClient {
-    pub fn new(cfg: LlmConfig, executor: Option<SharedRocmToolExecutor>) -> Result<Self, AgentError> {
+    pub fn new(
+        cfg: LlmConfig,
+        executor: Option<SharedRocmToolExecutor>,
+    ) -> Result<Self, AgentError> {
         // Custom-auth gateway (e.g. Azure APIM `Ocp-Apim-Subscription-Key`):
         // the key goes in a custom header, NOT `Authorization: Bearer`. Rig
         // still requires an api_key, so pass a dummy Bearer the gateway ignores.
@@ -1301,7 +1304,10 @@ mod tests {
         let out = tool.call(json!({})).await.expect("tool call ok");
         assert_eq!(out, json!({ "ok": true }));
         // The fired log records that the tool ran.
-        assert_eq!(tool.fired.lock().unwrap().as_slice(), &["doctor".to_string()]);
+        assert_eq!(
+            tool.fired.lock().unwrap().as_slice(),
+            &["doctor".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -1454,16 +1460,15 @@ mod tests {
         // key invariant is structurally preserved on the no-key path.
         let fired = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink = fired.clone();
-        let client =
-            ChatGptAgentClient::new(
-                Some("gpt-5.3-codex".to_string()),
-                move |url, code| {
-                    // Would surface in the chat tab during a real device-code login.
-                    sink.lock().unwrap().push(format!("{url}|{code}"));
-                },
-                None,
-            )
-            .expect("build chatgpt oauth client");
+        let client = ChatGptAgentClient::new(
+            Some("gpt-5.3-codex".to_string()),
+            move |url, code| {
+                // Would surface in the chat tab during a real device-code login.
+                sink.lock().unwrap().push(format!("{url}|{code}"));
+            },
+            None,
+        )
+        .expect("build chatgpt oauth client");
         assert_eq!(client.model, "gpt-5.3-codex");
         // No network happened, so the handler has not fired yet.
         assert!(fired.lock().unwrap().is_empty());
@@ -1471,9 +1476,8 @@ mod tests {
 
     #[test]
     fn chatgpt_oauth_client_defaults_model_when_none() {
-        let client =
-            ChatGptAgentClient::new(None, |_url, _code| {}, None)
-                .expect("build chatgpt oauth client");
+        let client = ChatGptAgentClient::new(None, |_url, _code| {}, None)
+            .expect("build chatgpt oauth client");
         assert_eq!(
             client.model,
             rig::providers::chatgpt::GPT_5_3_CODEX,

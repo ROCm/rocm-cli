@@ -1014,14 +1014,13 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         } else {
             // A build failure leaves `agent` None; a submit surfaces an error turn.
             match &state.chat_llm {
-                Some(cfg) => crate::agent::RigAgentClient::new(
-                    cfg.clone(),
-                    state.tool_executor.clone(),
-                )
-                    .ok()
-                    .map(|c| {
-                        std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>
-                    }),
+                Some(cfg) => {
+                    crate::agent::RigAgentClient::new(cfg.clone(), state.tool_executor.clone())
+                        .ok()
+                        .map(|c| {
+                            std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>
+                        })
+                }
                 None => None,
             }
         }
@@ -1233,8 +1232,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         let _ = reply_tx.send(ClientMsg::ChatReply { text });
                     });
                 }
-                None => state
-                    .on_chat_error("ROCm tools unavailable in this mode".to_string()),
+                None => state.on_chat_error("ROCm tools unavailable in this mode".to_string()),
             }
         }
 
@@ -2794,7 +2792,10 @@ mod tests {
         assert_eq!(s.handle_slash_command("/daemon"), SlashOutcome::Handled);
         let req = s.slash_tool.expect("daemon raises a slash_tool request");
         assert_eq!(req.name, "rocm_command");
-        assert_eq!(req.args, serde_json::json!({ "args": ["daemon", "status"] }));
+        assert_eq!(
+            req.args,
+            serde_json::json!({ "args": ["daemon", "status"] })
+        );
     }
 
     #[test]
@@ -2822,7 +2823,10 @@ mod tests {
         s.chat_input = "/help".into();
         s.submit_chat();
         assert_eq!(s.modal, Modal::Help);
-        assert!(!s.chat_dispatch, "slash command never dispatches to the LLM");
+        assert!(
+            !s.chat_dispatch,
+            "slash command never dispatches to the LLM"
+        );
         assert!(!s.chat_sending);
         assert!(s.chat_input.is_empty());
     }
