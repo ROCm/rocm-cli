@@ -2016,33 +2016,26 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         .push(ChatTurn::agent("switched to local".to_string()));
                 }
                 ChatProvider::Openai | ChatProvider::Anthropic => {
-                    match build_chat_agent(
-                        target,
-                        args,
-                        state.tool_executor.clone(),
-                        chat_tx.clone(),
-                    ) {
-                        Some(new_agent) => {
-                            agent = Some(new_agent);
-                            state
-                                .chat
-                                .push(ChatTurn::agent(format!("switched to {}", target.label())));
-                        }
-                        None => {
-                            // Revert the optimistic `active_provider` set by the
-                            // slash handler so the displayed provider stays honest.
-                            state.active_provider = ChatProvider::Local;
-                            let hint = match target {
-                                ChatProvider::Anthropic => {
-                                    "anthropic requires ANTHROPIC_API_KEY in env or secure store"
-                                }
-                                _ => "openai requires OPENAI_API_KEY in the environment",
-                            };
-                            state.chat.push(ChatTurn::error(format!(
-                                "could not switch to {}: {hint}",
-                                target.label()
-                            )));
-                        }
+                    if let Some(new_agent) =
+                        build_chat_agent(target, args, state.tool_executor.clone(), chat_tx.clone())
+                    {
+                        agent = Some(new_agent);
+                        state
+                            .chat
+                            .push(ChatTurn::agent(format!("switched to {}", target.label())));
+                    } else {
+                        // Revert the optimistic `active_provider` set by the
+                        // slash handler so the displayed provider stays honest.
+                        state.active_provider = ChatProvider::Local;
+                        let hint = if target == ChatProvider::Anthropic {
+                            "anthropic requires ANTHROPIC_API_KEY in env or secure store"
+                        } else {
+                            "openai requires OPENAI_API_KEY in the environment"
+                        };
+                        state.chat.push(ChatTurn::error(format!(
+                            "could not switch to {}: {hint}",
+                            target.label()
+                        )));
                     }
                 }
             }

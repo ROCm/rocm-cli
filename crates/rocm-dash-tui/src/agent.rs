@@ -1251,12 +1251,13 @@ impl AgentClient for ChatGptAgentClient {
     }
 }
 
-/// Live Rig-backed client for Anthropic's Claude API. Mirrors
-/// [`RigAgentClient`]: the Rig client is constructed once; the agent + the SAME
-/// ROCm read/mutating tool set are rebuilt per request from the captured
-/// snapshot, so tool + approval parity holds across every backend. The key
-/// rides in `x-api-key` (handled inside the provider) — never in `base_url` or
-/// the request path — so no key leaks into [`AgentError`] strings.
+/// Live Rig-backed client for Anthropic's Claude API.
+///
+/// Mirrors [`RigAgentClient`]: the Rig client is constructed once; the agent +
+/// the SAME ROCm read/mutating tool set are rebuilt per request from the
+/// captured snapshot, so tool + approval parity holds across every backend. The
+/// key rides in `x-api-key` (handled inside the provider) — never in `base_url`
+/// or the request path — so no key leaks into [`AgentError`] strings.
 pub struct AnthropicAgentClient {
     client: rig::providers::anthropic::Client,
     model: String,
@@ -1280,9 +1281,10 @@ impl AnthropicAgentClient {
         executor: Option<SharedRocmToolExecutor>,
         approval_tx: Option<UnboundedSender<ClientMsg>>,
     ) -> Result<Self, AgentError> {
-        let key = cfg.api_key.as_deref().ok_or_else(|| {
-            AgentError::Build("anthropic requires ANTHROPIC_API_KEY".to_string())
-        })?;
+        let key = cfg
+            .api_key
+            .as_deref()
+            .ok_or_else(|| AgentError::Build("anthropic requires ANTHROPIC_API_KEY".to_string()))?;
         // Builder typestate: `.api_key()` then `.build()`. Leave base_url at the
         // provider default so we never point Claude at a non-Anthropic host.
         let client = rig::providers::anthropic::Client::builder()
@@ -2008,8 +2010,8 @@ mod tests {
     #[test]
     fn anthropic_requires_key() {
         // No api_key → a Build error naming the env var; nothing constructs.
-        // (The Ok variant isn't Debug, so match rather than unwrap_err.)
-        let err = match AnthropicAgentClient::new(
+        // (The Ok variant isn't Debug, so let-else rather than unwrap_err.)
+        let Err(err) = AnthropicAgentClient::new(
             LlmConfig {
                 base_url: String::new(),
                 model: String::new(),
@@ -2018,9 +2020,8 @@ mod tests {
             },
             None,
             None,
-        ) {
-            Ok(_) => panic!("expected a Build error without a key"),
-            Err(e) => e,
+        ) else {
+            panic!("expected a Build error without a key");
         };
         assert!(matches!(err, AgentError::Build(_)));
         assert!(
@@ -2071,7 +2072,10 @@ mod tests {
             );
         }
         // Every name is non-empty (a registered tool must have a NAME).
-        for n in ROCM_READ_TOOL_NAMES.iter().chain(ROCM_MUTATING_TOOL_NAMES.iter()) {
+        for n in ROCM_READ_TOOL_NAMES
+            .iter()
+            .chain(ROCM_MUTATING_TOOL_NAMES.iter())
+        {
             assert!(!n.is_empty(), "empty tool name in canonical set");
         }
     }
