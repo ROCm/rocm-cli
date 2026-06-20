@@ -629,7 +629,7 @@ impl AppState {
         // Slash commands are handled locally (nav/overlays/read-only tools) and
         // never reach the LLM. A `/`-prefixed line is ALWAYS consumed here, even
         // when unknown (it gets an error turn) — only non-slash text is sent on.
-        if let SlashOutcome::Handled = self.handle_slash_command(&text) {
+        if self.handle_slash_command(&text) == SlashOutcome::Handled {
             self.chat_input.clear();
             return;
         }
