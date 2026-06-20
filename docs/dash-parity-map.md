@@ -27,7 +27,7 @@ Groups: **A** nav/session · **B** read-only · **C** approvals/automations ·
 | install | D | covered (Phase 4) | `/install` slash → `install_sdk` mutating tool → approval modal → `execute_approved` (captured subprocess); also LLM tool-call seam | `slash_install_raises_install_sdk_request` / `approve_path_runs_execute_approved` |
 | engine | D | covered (Phase 4) | `/engine <name>` slash → `install_engine` mutating tool → approval modal → `execute_approved`; also LLM tool-call seam | `slash_engine_raises_install_engine_request` |
 | serve | D | covered (Phase 4) | `/serve <model>` slash (loopback host) → `launch_server` mutating tool → approval modal → `execute_approved`; also LLM tool-call seam | `slash_serve_raises_launch_server_request` / `seam_execute_approved_rejects_unsafe_call_via_validator` |
-| services | D | covered (Phase 4) | `/services [stop\|restart] <id>` slash → `stop_server` mutating tool → approval modal → `execute_approved`; bare `/services` is read-only | `slash_services_stop_raises_stop_server_request` |
+| services | D | covered (Phase 4) | `/services stop <id>` slash → `stop_server` mutating tool → approval modal → `execute_approved`; `restart` is guided (not yet wired through the chat seam — points to stop + `/serve`); bare `/services` is read-only | `slash_services_stop_raises_stop_server_request` / `slash_services_restart_is_guided_not_stop` |
 | update | D | pending (Phase 5) | update overlay + mutating apply (approval-gated) | — |
 | comfyui | D | pending (Phase 5) | ComfyUI serve/launch flow (approval-gated) | — |
 | uninstall | D | pending (Phase 5) | uninstall flow (approval-gated) | — |

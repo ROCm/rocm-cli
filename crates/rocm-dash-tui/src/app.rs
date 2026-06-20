@@ -281,8 +281,8 @@ pub(crate) struct SlashToolRequest {
 }
 
 /// A surfaced mutating-tool approval awaiting the operator's decision (Phase 4).
-/// Generic over any [`crate::tool_exec::ApprovalIntent`] so the same modal serves
-/// later phases (update/uninstall, permissions, plan). The modal owns keyboard
+/// Reusable for any [`crate::tool_exec::ApprovalIntent`] (the same modal serves
+/// later phases: update/uninstall, permissions, plan). The modal owns keyboard
 /// focus while `Some`; on Approve the `(name, arguments)` are replayed through
 /// `execute_approved`; on Deny/Cancel nothing runs.
 #[derive(Debug, Clone)]
@@ -498,6 +498,7 @@ impl AppState {
         self.automations_manager = None;
         self.command_screen = None;
         self.config_manager = None;
+        self.approval = None;
     }
 
     /// Open the theme picker modal, positioning the cursor on the active theme.
@@ -719,11 +720,27 @@ impl AppState {
             // safety validators run inside `execute()` (and again on the approved
             // replay), so an unsafe call surfaces an error instead of the modal.
             "install" => {
-                self.slash_tool = Some(SlashToolRequest {
-                    name: "install_sdk".to_string(),
-                    args: serde_json::json!({ "channel": "release", "format": "wheel" }),
-                    label: "install".to_string(),
-                });
+                // `/install <prefix>` — the install folder is required by the
+                // validator (it never installs to a system path).
+                match rest.split_whitespace().nth(1) {
+                    Some(prefix) => {
+                        self.slash_tool = Some(SlashToolRequest {
+                            name: "install_sdk".to_string(),
+                            args: serde_json::json!({
+                                "channel": "release",
+                                "format": "wheel",
+                                "prefix": prefix,
+                            }),
+                            label: format!("install {prefix}"),
+                        });
+                    }
+                    None => {
+                        self.chat.push(ChatTurn::error(
+                            "usage: /install <prefix>  (install folder, e.g. /install ~/rocm)"
+                                .to_string(),
+                        ));
+                    }
+                }
             }
             "engine" => {
                 // `/engine <name>` — the engine name is required by the validator.
@@ -760,26 +777,34 @@ impl AppState {
                 }
             }
             "services" => {
-                // `/services [stop|restart] <id>` — only stop/restart mutate; a
+                // `/services stop <id>` mutates (stop_server, approval-gated); a
                 // bare `/services` is read-only and lists managed services.
+                // `restart` is NOT yet wired through the chat seam, so it is
+                // guided rather than silently running stop (a semantic lie).
                 let mut words = rest.split_whitespace().skip(1);
                 match words.next() {
-                    Some(action @ ("stop" | "restart")) => match words.next() {
+                    Some("stop") => match words.next() {
                         Some(id) => {
                             self.slash_tool = Some(SlashToolRequest {
                                 name: "stop_server".to_string(),
                                 args: serde_json::json!({ "service_id": id }),
-                                label: format!("services {action} {id}"),
+                                label: format!("services stop {id}"),
                             });
                         }
                         None => {
                             self.chat
-                                .push(ChatTurn::error(format!("usage: /services {action} <id>")));
+                                .push(ChatTurn::error("usage: /services stop <id>".to_string()));
                         }
                     },
+                    Some("restart") => {
+                        self.chat.push(ChatTurn::error(
+                            "services restart via chat is not supported yet; use /services stop <id> then /serve <model>"
+                                .to_string(),
+                        ));
+                    }
                     Some(other) => {
                         self.chat.push(ChatTurn::error(format!(
-                            "unknown /services action `{other}` (try stop/restart, or /services to list)"
+                            "unknown /services action `{other}` (try stop, or /services to list)"
                         )));
                     }
                     None => {
@@ -837,6 +862,12 @@ impl AppState {
     /// Open the approval modal for a surfaced mutating-tool intent (Phase 4).
     /// Closes any operational overlay first so the modal owns focus alone.
     pub(crate) fn open_approval(&mut self, intent: crate::tool_exec::ApprovalIntent) {
+        if self.approval.is_some() {
+            self.chat.push(ChatTurn::error(
+                "An action is already awaiting approval; the new request was discarded. Resolve the open approval first.",
+            ));
+            return;
+        }
         self.close_overlays();
         self.approval = Some(PendingApproval {
             req: crate::ui::approval::ApprovalRequest::new(intent.title, intent.body),
@@ -3050,11 +3081,28 @@ mod tests {
     #[test]
     fn slash_install_raises_install_sdk_request() {
         let mut s = st();
-        assert_eq!(s.handle_slash_command("/install"), SlashOutcome::Handled);
+        assert_eq!(
+            s.handle_slash_command("/install ~/rocm"),
+            SlashOutcome::Handled
+        );
         let req = s.slash_tool.expect("install raises a slash_tool request");
         assert_eq!(req.name, "install_sdk");
         assert_eq!(req.args["channel"], "release");
         assert_eq!(req.args["format"], "wheel");
+        // The validator REQUIRES a prefix; the slash path must supply one or the
+        // modal never opens.
+        assert_eq!(req.args["prefix"], "~/rocm");
+    }
+
+    #[test]
+    fn slash_install_without_prefix_hints_not_dispatch() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/install"), SlashOutcome::Handled);
+        assert!(
+            s.slash_tool.is_none(),
+            "no dispatch without an install folder"
+        );
+        assert_eq!(s.chat.last().unwrap().role, ChatRole::Error);
     }
 
     #[test]
@@ -3103,6 +3151,22 @@ mod tests {
             .expect("services stop raises a slash_tool request");
         assert_eq!(req.name, "stop_server");
         assert_eq!(req.args, serde_json::json!({ "service_id": "svc-1" }));
+    }
+
+    #[test]
+    fn slash_services_restart_is_guided_not_stop() {
+        // restart is NOT wired through the chat seam yet; it must guide the
+        // operator instead of silently running stop_server (a semantic lie).
+        let mut s = st();
+        assert_eq!(
+            s.handle_slash_command("/services restart svc-1"),
+            SlashOutcome::Handled
+        );
+        assert!(
+            s.slash_tool.is_none(),
+            "restart must NOT dispatch a stop_server request"
+        );
+        assert_eq!(s.chat.last().unwrap().role, ChatRole::Error);
     }
 
     #[test]
@@ -3166,6 +3230,46 @@ mod tests {
         let pa = s.approval.as_ref().expect("modal opened");
         assert_eq!(pa.name, "install_sdk");
         assert_eq!(pa.req.title, "Install ROCm");
+    }
+
+    #[test]
+    fn close_overlays_clears_pending_approval() {
+        // A stale approval modal must not survive close_overlays (focus trap).
+        let mut s = st();
+        s.open_approval(crate::tool_exec::ApprovalIntent {
+            title: "Install ROCm".to_string(),
+            body: vec!["rocm install sdk".to_string()],
+            name: "install_sdk".to_string(),
+            arguments: serde_json::json!({}),
+        });
+        assert!(s.approval.is_some(), "approval pending before close");
+        s.close_overlays();
+        assert!(s.approval.is_none(), "close_overlays must clear the modal");
+    }
+
+    #[test]
+    fn second_approval_request_is_discarded_while_one_pending() {
+        // Two mutating calls in one turn must not clobber: the operator could
+        // otherwise approve args they never saw.
+        let mut s = st();
+        let first = crate::tool_exec::ApprovalIntent {
+            title: "Install ROCm".to_string(),
+            body: vec!["rocm install sdk".to_string()],
+            name: "install_sdk".to_string(),
+            arguments: serde_json::json!({ "prefix": "~/rocm" }),
+        };
+        s.open_approval(first);
+        s.open_approval(crate::tool_exec::ApprovalIntent {
+            title: "Stop server".to_string(),
+            body: vec!["rocm services stop svc-1".to_string()],
+            name: "stop_server".to_string(),
+            arguments: serde_json::json!({ "service_id": "svc-1" }),
+        });
+        // The original intent survives intact; the second was discarded.
+        let pa = s.approval.as_ref().expect("first approval still pending");
+        assert_eq!(pa.name, "install_sdk");
+        assert_eq!(pa.arguments["prefix"], "~/rocm");
+        assert_eq!(s.chat.last().unwrap().role, ChatRole::Error);
     }
 
     #[test]

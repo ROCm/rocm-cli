@@ -1584,6 +1584,8 @@ mod tests {
 
     #[test]
     fn mutating_tool_names_are_complete_and_disjoint() {
+        // The registry is the source of truth: every entry is non-empty and the
+        // Phase 4 mutating set is present in full.
         for expected in [
             "install_sdk",
             "install_engine",
@@ -1595,7 +1597,7 @@ mod tests {
                 "missing mutating tool: {expected}"
             );
         }
-        // Disjoint from read-only + skill names.
+        // Disjoint from read-only + skill names (iterates the registry itself).
         for n in ROCM_MUTATING_TOOL_NAMES {
             assert!(!SKILL_NAMES.contains(&n), "collision with skill: {n}");
             // install_sdk_dry_run (read-only) must not clash with install_sdk.
