@@ -3669,12 +3669,13 @@ fn start_managed_service(
     Ok(())
 }
 
-/// Start the background automation helper (`rocm daemon`) detached if it is not
-/// already running. Liveness is read from the file-based automation runtime
-/// state. A spawn failure is logged but never propagated to the caller, so
-/// enabling automations or launching a managed serve never hard-fails when the
-/// helper cannot start.
-fn ensure_background_helper_running() -> Result<()> {
+/// Shared daemon-lifecycle entrypoint: ensures the background automation helper
+/// (`rocm daemon`) is running, spawning it detached if not. Liveness is read from
+/// the file-based automation runtime state. Intentionally `pub(crate)` — reused by
+/// both the `serve --managed` path and `automations enable`. Only the spawn result
+/// itself (`command.spawn()` / `spawn_detached_no_inherit`) is logged rather than
+/// propagated; setup errors (path discovery, stdio attach) still return `Err`.
+pub(crate) fn ensure_background_helper_running() -> Result<()> {
     let paths = AppPaths::discover()?;
     if let Some(state) = AutomationRuntimeState::load(&paths)?
         && state.running
@@ -14169,17 +14170,16 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn daemon_run_argv_targets_rocmd_run_with_automations() {
-        assert_eq!(
-            daemon_run_argv(),
-            vec![
-                OsString::from("rocmd"),
-                OsString::from("run"),
-                OsString::from("--automations-enabled"),
-            ]
-        );
-    }
+    // The previous `daemon_run_argv_targets_rocmd_run_with_automations` unit test
+    // only re-asserted the literals `daemon_run_argv()` returns, so it tested
+    // nothing real. The intended real behavior — that this argv actually drives
+    // `rocmd` into its `run --automations-enabled` foreground loop — is proven
+    // end-to-end by the `daemon_runs_real_foreground_loop` integration test in
+    // tests/daemon_run.rs. A non-tautological unit test would require parsing the
+    // argv through `rocmd::Cli`/`rocmd::Command`, but those clap structs are
+    // crate-private in rocmd and exposing them (plus their private field types
+    // like `SandboxToolArg`) is more than a trivial visibility change, so the
+    // tautological unit test is removed in favor of the integration coverage.
 
     #[test]
     fn service_http_readiness_requires_loaded_lemonade_model() {
