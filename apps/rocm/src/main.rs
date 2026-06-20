@@ -16393,7 +16393,9 @@ model recipes
                 ChatRocmCommandAction::Approval { command_title, .. } => {
                     assert_eq!(command_title, "Config");
                 }
-                other => panic!("config set-permissions {mode} must need approval, got {other:?}"),
+                other @ ChatRocmCommandAction::ReadOnly(_) => {
+                    panic!("config set-permissions {mode} must need approval, got {other:?}")
+                }
             }
         }
     }
