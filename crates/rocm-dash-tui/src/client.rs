@@ -51,6 +51,12 @@ pub enum ClientMsg {
     ChatError {
         message: String,
     },
+    /// Result of an executor-backed read-only slash command (`/model`,
+    /// `/daemon`). Appended as a plain chat turn; decoupled from the agent
+    /// in-flight state machine so it never touches `chat_sending`.
+    SlashToolReply {
+        text: String,
+    },
     /// Result of an in-TUI local-engine detect: `Some` base_url+model when an
     /// endpoint was reachable and queried, `None` when nothing was found.
     ChatDetectResult {

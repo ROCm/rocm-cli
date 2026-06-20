@@ -17,11 +17,11 @@ Groups: **A** nav/session · **B** read-only · **C** approvals/automations ·
 | clear | A | covered (Phase 3) | `/clear` slash → empties `chat` transcript | `slash_clear_empties_transcript` |
 | quit | A | covered (Phase 3) | `/quit` slash → `should_quit` (event loop breaks) | `slash_quit_sets_should_quit` |
 | exit | A | covered (Phase 3) | `/exit` slash → `should_quit` (event loop breaks) | `slash_exit_sets_should_quit` |
-| doctor | B | covered (Phase 3) | `/doctor` slash → doctor overlay; tool `doctor` via seam | `slash_doctor_opens_overlay` / `read_only_tool_round_trips_to_json` |
+| doctor | B | covered (Phase 3) | `/doctor` slash → opens the doctor overlay (`doctor_manager`); the read-only `doctor` tool is covered separately via the LLM tool-call seam | `slash_doctor_opens_overlay` / `read_only_tool_round_trips_to_json` |
 | runtimes | B | covered (Phase 3) | `/runtimes` slash → runtime-manager overlay | `slash_runtimes_opens_overlay` |
 | model | B | covered (Phase 3) | `/model` slash → `slash_tool` `rocm_command ["model"]` (off-thread) | `slash_model_raises_executor_request` |
 | config | B | covered (Phase 3) | `/config` slash → config-manager overlay | `slash_config_opens_overlay` |
-| logs | B | covered (Phase 3) | `/logs` slash → logs overlay; tool `service_logs` via seam | `slash_logs_opens_overlay` |
+| logs | B | covered (Phase 3) | `/logs` slash → opens the logs overlay (`logs_view`); the read-only `service_logs` tool is covered separately via the LLM tool-call seam | `slash_logs_opens_overlay` / `read_only_tool_round_trips_to_json` |
 | gpu | B | covered (Phase 3) | `/gpu` slash → `ActiveTab::Hardware`; tool `gpu_snapshot` via seam | `slash_gpu_switches_to_hardware` |
 | daemon | B | covered (Phase 3) | `/daemon` slash → `slash_tool` `rocm_command ["daemon","status"]` (off-thread) | `slash_daemon_raises_executor_request` |
 | install | D | pending (Phase 4) | install overlay + mutating tool (approval-gated) | — |

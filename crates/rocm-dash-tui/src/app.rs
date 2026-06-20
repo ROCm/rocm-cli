@@ -260,7 +260,7 @@ pub fn format_mmss(secs: u64) -> String {
 
 /// Result of routing a chat-input line through the slash-command handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SlashOutcome {
+pub(crate) enum SlashOutcome {
     /// The line was a slash command and was handled in-reducer (state mutated,
     /// or a slash-tool request raised). It must NOT be sent to the LLM.
     Handled,
@@ -271,7 +271,7 @@ pub enum SlashOutcome {
 /// A pending read-only slash command that needs the bin executor (no overlay).
 /// `submit_chat` sets it; the event loop drains it once, off the async thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SlashToolRequest {
+pub(crate) struct SlashToolRequest {
     /// Tool name to execute across the seam (e.g. `rocm_command`).
     pub name: String,
     /// JSON args for the tool (e.g. `{"args":["model"]}`).
@@ -397,10 +397,10 @@ pub struct AppState {
     /// loop; `None` for demo/replay/mock and by default.
     pub tool_executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
     /// Set by a `/quit` (or `/exit`) slash command; the event loop breaks on it.
-    pub should_quit: bool,
+    pub(crate) should_quit: bool,
     /// Edge: a pending executor-backed read-only slash command. Raised by
     /// `handle_slash_command`, drained once by the event loop (spawn_blocking).
-    pub slash_tool: Option<SlashToolRequest>,
+    pub(crate) slash_tool: Option<SlashToolRequest>,
 }
 
 impl AppState {
@@ -644,7 +644,7 @@ impl AppState {
     /// agent); otherwise handles it in-reducer and returns
     /// [`SlashOutcome::Handled`]. Stays I/O-free: executor-backed commands raise
     /// the `slash_tool` edge for the event loop to drain off-thread.
-    pub fn handle_slash_command(&mut self, text: &str) -> SlashOutcome {
+    pub(crate) fn handle_slash_command(&mut self, text: &str) -> SlashOutcome {
         let trimmed = text.trim();
         let Some(rest) = trimmed.strip_prefix('/') else {
             return SlashOutcome::NotCommand;
@@ -726,6 +726,15 @@ impl AppState {
     pub fn on_chat_error(&mut self, message: String) {
         self.chat.push(ChatTurn::error(message));
         self.chat_sending = false;
+    }
+
+    /// Handle an executor-backed slash-tool reply (`/model`, `/daemon`): append
+    /// the summary as an agent-role turn WITHOUT touching `chat_sending`. The
+    /// slash-tool path is independent of the agent in-flight state machine, so
+    /// this must never clear/modify that flag (proven by
+    /// `slash_tool_reply_does_not_disturb_chat_sending`).
+    pub(crate) fn on_slash_tool_reply(&mut self, text: String) {
+        self.chat.push(ChatTurn::agent(text));
     }
 
     /// Apply the currently-highlighted picker entry and close the modal.
@@ -1049,6 +1058,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         }
                     }
                     Some(ClientMsg::ChatReply { text }) => state.on_chat_reply(text),
+                    Some(ClientMsg::SlashToolReply { text }) => state.on_slash_tool_reply(text),
                     Some(ClientMsg::ChatError { message }) => state.on_chat_error(message),
                     Some(ClientMsg::ChatDetectResult { offer }) => state.set_detect_result(offer),
                     None => break,
@@ -1221,7 +1231,8 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         // Drain a pending executor-backed read-only slash command (`/model`,
         // `/daemon`). Off-thread (spawn_blocking) so the seam's synchronous
         // execute() never blocks the async event loop; the concise summary
-        // returns as a normal chat turn via ClientMsg::ChatReply.
+        // returns via ClientMsg::SlashToolReply — its own message variant, so
+        // the slash-tool path never disturbs the agent's `chat_sending` flag.
         if let Some(req) = state.slash_tool.take() {
             match state.tool_executor.clone() {
                 Some(executor) => {
@@ -1229,10 +1240,12 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                     tokio::task::spawn_blocking(move || {
                         let outcome = executor.execute(&req.name, &req.args);
                         let text = summarize_slash_tool(&req.label, &outcome);
-                        let _ = reply_tx.send(ClientMsg::ChatReply { text });
+                        let _ = reply_tx.send(ClientMsg::SlashToolReply { text });
                     });
                 }
-                None => state.on_chat_error("ROCm tools unavailable in this mode".to_string()),
+                None => {
+                    state.on_slash_tool_reply("ROCm tools unavailable in this mode".to_string());
+                }
             }
         }
 
@@ -1333,6 +1346,10 @@ fn persist_chat_endpoint(base_url: &str, model: &str) -> Result<std::path::PathB
 /// raw JSON transcript dump (per docs/ux-guidelines.md). Errors and approval
 /// notes are surfaced plainly; a success object is reduced to a short headline
 /// plus a few key/value lines, with arrays/objects collapsed to counts.
+/// Max object fields a slash-tool summary surfaces before truncating with an
+/// ellipsis line. Keeps `summarize_json_value` output terse and length-bounded.
+const SUMMARY_MAX_FIELDS: usize = 8;
+
 fn summarize_slash_tool(label: &str, outcome: &crate::tool_exec::RocmToolOutcome) -> String {
     use crate::tool_exec::RocmToolOutcome;
     match outcome {
@@ -1356,16 +1373,17 @@ fn summarize_slash_tool(label: &str, outcome: &crate::tool_exec::RocmToolOutcome
 /// counts); arrays show a length. Keeps slash-tool output terse and scannable.
 fn summarize_json_value(v: &serde_json::Value) -> String {
     use serde_json::Value;
-    /// Max object fields to surface before truncating with an ellipsis line.
-    const MAX_FIELDS: usize = 8;
     match v {
         Value::Object(map) => {
             let mut lines = Vec::new();
-            for (k, val) in map.iter().take(MAX_FIELDS) {
+            for (k, val) in map.iter().take(SUMMARY_MAX_FIELDS) {
                 lines.push(format!("  {k}: {}", scalar_or_shape(val)));
             }
-            if map.len() > MAX_FIELDS {
-                lines.push(format!("  … ({} more fields)", map.len() - MAX_FIELDS));
+            if map.len() > SUMMARY_MAX_FIELDS {
+                lines.push(format!(
+                    "  … ({} more fields)",
+                    map.len() - SUMMARY_MAX_FIELDS
+                ));
             }
             lines.join("\n")
         }
@@ -2796,6 +2814,44 @@ mod tests {
             req.args,
             serde_json::json!({ "args": ["daemon", "status"] })
         );
+    }
+
+    #[test]
+    fn slash_tool_reply_does_not_disturb_chat_sending() {
+        // The slash-tool reply path is decoupled from the agent state machine:
+        // appending a slash-tool summary must NOT touch `chat_sending`, even if
+        // an agent request happens to be in flight at the same time.
+        let mut s = st();
+        s.chat_sending = true;
+        let before = s.chat.len();
+        s.on_slash_tool_reply("x".into());
+        assert_eq!(s.chat.len(), before + 1, "slash-tool turn appended");
+        assert_eq!(s.chat.last().unwrap().role, ChatRole::Agent);
+        assert!(
+            s.chat_sending,
+            "chat_sending untouched by slash-tool reply (decoupled)"
+        );
+    }
+
+    #[test]
+    fn summarize_slash_tool_is_concise_not_raw_json() {
+        // A representative Result(json) must summarize to a terse, labelled,
+        // length-bounded blurb — never a raw JSON dump with braces-spam.
+        let outcome = crate::tool_exec::RocmToolOutcome::Result(serde_json::json!({
+            "status": "ok",
+            "model": "llama3",
+            "nested": { "a": 1, "b": 2, "c": 3 },
+        }));
+        let out = summarize_slash_tool("model", &outcome);
+        assert!(out.contains("/model"), "carries the slash label");
+        assert!(out.contains("status: ok"), "scalars shown inline");
+        // Nested containers collapse to a shape hint, not an inlined subtree.
+        assert!(out.contains("{3 fields}"), "nested object shown as shape");
+        assert!(
+            !out.contains("\"nested\""),
+            "no raw JSON keys / braces-spam in summary"
+        );
+        assert!(out.len() < 200, "summary stays length-bounded");
     }
 
     #[test]
