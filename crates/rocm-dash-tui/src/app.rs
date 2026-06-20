@@ -1088,10 +1088,7 @@ impl AppState {
             // posts `PlanReady`. The plan is rendered for review; a complete
             // mutating action is then handed to the Phase-4 approval modal.
             "plan" => {
-                let request = rest
-                    .strip_prefix("plan")
-                    .map(str::trim)
-                    .unwrap_or_default();
+                let request = rest.strip_prefix("plan").map(str::trim).unwrap_or_default();
                 if request.is_empty() {
                     self.chat.push(ChatTurn::agent(
                         "usage: /plan <request> (e.g. /plan install rocm into /opt/rocm)"
@@ -1819,8 +1816,9 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                             }
                             crate::tool_exec::RocmToolOutcome::ApprovalRequired(_) => {
                                 ClientMsg::SlashToolReply {
-                                    text: "/plan: planning is read-only and should not need approval"
-                                        .to_string(),
+                                    text:
+                                        "/plan: planning is read-only and should not need approval"
+                                            .to_string(),
                                 }
                             }
                         };

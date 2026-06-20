@@ -8568,8 +8568,8 @@ pub(crate) fn run_internal_mcp_call(
                 .context("natural_language_plan requires `request`")?;
             let config = RocmCliConfig::load(paths).unwrap_or_default();
             let text = render_freeform_plan(&request, paths, &config);
-            let action = freeform_plan_next_action_with_context(&request, paths, &config).map(
-                |action| {
+            let action =
+                freeform_plan_next_action_with_context(&request, paths, &config).map(|action| {
                     serde_json::json!({
                         "title": action.title,
                         "args": action.args,
@@ -8577,8 +8577,7 @@ pub(crate) fn run_internal_mcp_call(
                         "has_placeholders": action.has_placeholders,
                         "reason": action.reason,
                     })
-                },
-            );
+                });
             Ok(internal_mcp_tool_success(
                 "Planned the ROCm request.".to_owned(),
                 serde_json::json!({
