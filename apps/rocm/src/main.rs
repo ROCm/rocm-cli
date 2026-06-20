@@ -25,9 +25,10 @@ use rocm_core::{
     AppPaths, AuditEventRecord, AutomationEventRecord, AutomationProposalRecord,
     AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot,
     DEFAULT_LOCAL_HOST, ExamineSummary, ManagedServiceRecord, ModelRecipeRecord,
-    ModelRecipeRegistry, ModelRecipeRegistrySource, RocmCliConfig, TELEMETRY_MODE_LOCAL,
-    TELEMETRY_MODE_OFF, WatcherMode, append_audit_event, builtin_model_recipes, builtin_watcher,
-    builtin_watchers, connect_tcp_stream, daemon_binary_path, default_engine_for_platform,
+    ModelRecipeRegistry, ModelRecipeRegistrySource, PERMISSIONS_MODE_ASK,
+    PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF,
+    WatcherMode, append_audit_event, builtin_model_recipes, builtin_watcher, builtin_watchers,
+    connect_tcp_stream, daemon_binary_path, default_engine_for_platform,
     default_interactive_shell_program, engine_binary_path, engine_plugin_dirs, format_host_port,
     format_http_base_url, generate_service_id, interactive_terminal, load_model_recipe_registry,
     load_recent_audit_events, load_recent_automation_events, load_recent_automation_proposals,
@@ -585,6 +586,11 @@ enum ConfigCommand {
         /// Telemetry mode.
         mode: TelemetryModeArg,
     },
+    /// Choose the assistant permissions mode (ask vs full access).
+    SetPermissions {
+        /// Permissions mode.
+        mode: PermissionsModeArg,
+    },
     /// Choose the provider used for ambiguous natural-language plans.
     SetPlannerProvider {
         /// Provider name.
@@ -671,6 +677,21 @@ impl TelemetryModeArg {
         match self {
             Self::Local => TELEMETRY_MODE_LOCAL,
             Self::Off => TELEMETRY_MODE_OFF,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum PermissionsModeArg {
+    FullAccess,
+    Ask,
+}
+
+impl PermissionsModeArg {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::FullAccess => PERMISSIONS_MODE_FULL_ACCESS,
+            Self::Ask => PERMISSIONS_MODE_ASK,
         }
     }
 }
@@ -5503,6 +5524,19 @@ fn config(command: ConfigCommand) -> Result<()> {
             config.save(&paths)?;
             println!("telemetry mode set to {}", mode.as_str());
             println!("  policy: {}", telemetry_policy_summary(&config.telemetry));
+        }
+        ConfigCommand::SetPermissions { mode } => {
+            config.permissions.mode = mode.as_str().to_owned();
+            config.save(&paths)?;
+            record_cli_audit_event(
+                &paths,
+                "permissions",
+                "set_mode",
+                "info",
+                format!("permissions mode set to {}", mode.as_str()),
+                None,
+            );
+            println!("permissions mode set to {}", mode.as_str());
         }
         ConfigCommand::SetPlannerProvider { provider } => {
             let provider = provider_name(provider);
@@ -16341,6 +16375,50 @@ model recipes
             .is_err(),
             "showing a missing proposal must error"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn config_set_permissions_classifies_as_approval() {
+        // Permission escalation MUST route through approval — the classifier
+        // routes any `config <sub>` (catch-all) to Approval. Verify both modes.
+        for mode in ["full_access", "ask"] {
+            let action = chat_rocm_command_action_from_args(vec![
+                "config".to_owned(),
+                "set-permissions".to_owned(),
+                mode.to_owned(),
+            ])
+            .expect("config set-permissions classifies");
+            match action {
+                ChatRocmCommandAction::Approval { command_title, .. } => {
+                    assert_eq!(command_title, "Config");
+                }
+                other => panic!("config set-permissions {mode} must need approval, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn config_set_permissions_sets_mode() {
+        // The SetPermissions handler logic: set permissions.mode, save, reload.
+        let (root, paths) = test_paths("config-permissions");
+        let mut config = RocmCliConfig::load(&paths).expect("load default config");
+        assert_eq!(config.permissions.mode_label(), PERMISSIONS_MODE_ASK);
+        // Mirror the SetPermissions handler mutation.
+        config.permissions.mode = PermissionsModeArg::FullAccess.as_str().to_owned();
+        config.save(&paths).expect("save config");
+        let reloaded = RocmCliConfig::load(&paths).expect("reload config");
+        assert_eq!(
+            reloaded.permissions.mode_label(),
+            PERMISSIONS_MODE_FULL_ACCESS
+        );
+        assert!(reloaded.permissions.full_access_enabled());
+        // And back to ask.
+        let mut config = reloaded;
+        config.permissions.mode = PermissionsModeArg::Ask.as_str().to_owned();
+        config.save(&paths).expect("save config");
+        let reloaded = RocmCliConfig::load(&paths).expect("reload config");
+        assert_eq!(reloaded.permissions.mode_label(), PERMISSIONS_MODE_ASK);
         let _ = fs::remove_dir_all(&root);
     }
 
