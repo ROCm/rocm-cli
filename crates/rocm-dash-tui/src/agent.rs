@@ -612,11 +612,25 @@ rocm_read_tool!(
         "required": ["args"]
     }
 );
+rocm_read_tool!(
+    NaturalLanguagePlanRocmTool,
+    "natural_language_plan",
+    "Turn a natural-language ROCm request into a reviewed, structured plan \
+     (does not execute).",
+    {
+        "type": "object",
+        "properties": {
+            "request": { "type": "string", "description": "The natural-language ROCm request to plan." }
+        },
+        "required": ["request"]
+    }
+);
 
 /// All read-only ROCm tool names (mirrors [`SKILL_NAMES`]). Used for
-/// uniqueness/registration checks and the parity map. Mutating tools and
-/// `natural_language_plan` are intentionally absent (later phases).
-pub const ROCM_READ_TOOL_NAMES: [&str; 12] = [
+/// uniqueness/registration checks and the parity map. Mutating tools are
+/// intentionally absent. `natural_language_plan` is read-only: it plans but
+/// never executes (Phase 7).
+pub const ROCM_READ_TOOL_NAMES: [&str; 13] = [
     DoctorRocmTool::NAME,
     EnginesRocmTool::NAME,
     ServicesRocmTool::NAME,
@@ -629,6 +643,7 @@ pub const ROCM_READ_TOOL_NAMES: [&str; 12] = [
     UpdateCheckRocmTool::NAME,
     InstallSdkDryRunRocmTool::NAME,
     RocmCommandRocmTool::NAME,
+    NaturalLanguagePlanRocmTool::NAME,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1052,6 +1067,10 @@ where
             fired: fired.clone(),
         })
         .tool(RocmCommandRocmTool {
+            executor: executor.cloned(),
+            fired: fired.clone(),
+        })
+        .tool(NaturalLanguagePlanRocmTool {
             executor: executor.cloned(),
             fired: fired.clone(),
         })
@@ -1683,14 +1702,15 @@ mod tests {
             "update_check",
             "install_sdk_dry_run",
             "rocm_command",
+            "natural_language_plan",
         ] {
             assert!(
                 ROCM_READ_TOOL_NAMES.contains(&expected),
                 "missing read tool: {expected}"
             );
         }
-        // …no mutating / planning tool leaked in (later phases).
-        assert!(!ROCM_READ_TOOL_NAMES.contains(&"natural_language_plan"));
+        // natural_language_plan is read-only (plans, never executes) — Phase 7.
+        assert!(ROCM_READ_TOOL_NAMES.contains(&"natural_language_plan"));
         // The telemetry/skill tools are still present and disjoint from the new set.
         assert!(SKILL_NAMES.contains(&"gpu_status"));
         for n in ROCM_READ_TOOL_NAMES {
