@@ -23,9 +23,11 @@ pub enum RocmToolOutcome {
     Error(String),
 }
 
-/// rocm-core-free tool-executor boundary. The bin implements this; the dash holds
-/// it as `Option<Arc<dyn RocmToolExecutor>>` (None for demo/replay/mock).
-/// `Debug` supertrait so `ResolvedArgs`/`AppState` keep deriving Debug.
+/// rocm-core-free tool-executor boundary.
+///
+/// The bin implements this; the dash holds it as
+/// `Option<Arc<dyn RocmToolExecutor>>` (None for demo/replay/mock). The `Debug`
+/// supertrait keeps `ResolvedArgs`/`AppState` deriving Debug.
 pub trait RocmToolExecutor: std::fmt::Debug + Send + Sync {
     /// Execute a tool-call intent: read-only → Result(json); mutating → ApprovalRequired; failure → Error.
     fn execute(&self, name: &str, args: &serde_json::Value) -> RocmToolOutcome;

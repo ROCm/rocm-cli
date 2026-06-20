@@ -20,7 +20,7 @@ pub(crate) struct BinToolExecutor {
 }
 
 impl BinToolExecutor {
-    pub(crate) fn new(paths: AppPaths) -> Self {
+    pub(crate) const fn new(paths: AppPaths) -> Self {
         Self { paths }
     }
 }
@@ -87,8 +87,7 @@ mod tests {
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+                .map_or(0, |d| d.as_nanos())
         ));
         AppPaths {
             config_dir: root.join("config"),
@@ -107,8 +106,7 @@ mod tests {
                 assert!(
                     v.get("structuredContent")
                         .and_then(|d| d.get("engines"))
-                        .map(serde_json::Value::is_array)
-                        .unwrap_or(false),
+                        .is_some_and(serde_json::Value::is_array),
                     "engines result should carry an engines array, got: {v}"
                 );
             }

@@ -802,6 +802,7 @@ mod tests {
             model_recipes: Vec::new(),
             runtimes: Vec::new(),
             automations: Vec::new(),
+            tool_executor: None,
         }
     }
 
