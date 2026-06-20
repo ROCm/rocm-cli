@@ -626,9 +626,10 @@ rocm_read_tool!(
     }
 );
 
-/// All read-only ROCm tool names (mirrors [`SKILL_NAMES`]). Used for
-/// uniqueness/registration checks and the parity map. Mutating tools are
-/// intentionally absent. `natural_language_plan` is read-only: it plans but
+/// All read-only ROCm tool names (mirrors [`SKILL_NAMES`]).
+///
+/// Used for uniqueness/registration checks and the parity map. Mutating tools
+/// are intentionally absent. `natural_language_plan` is read-only: it plans but
 /// never executes (Phase 7).
 pub const ROCM_READ_TOOL_NAMES: [&str; 13] = [
     DoctorRocmTool::NAME,

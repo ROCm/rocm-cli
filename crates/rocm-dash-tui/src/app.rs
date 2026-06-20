@@ -280,9 +280,10 @@ pub(crate) struct SlashToolRequest {
     pub label: String,
 }
 
-/// The structured next action from a natural-language plan (Phase 7). Plain
-/// data mirrored from the bin's `freeform_plan_next_action_with_context` so the
-/// reducer can decide whether to hand a complete mutating action to the
+/// The structured next action from a natural-language plan (Phase 7).
+///
+/// Plain data mirrored from the bin's `freeform_plan_next_action_with_context`
+/// so the reducer can decide whether to hand a complete mutating action to the
 /// approval modal. A placeholder action (`has_placeholders`) stays plan-only.
 /// `pub` (not `pub(crate)`) because it is a payload of the `pub` [`ClientMsg`]
 /// enum (mirrors [`crate::tool_exec::ApprovalIntent`]); the reducer entrypoints
@@ -1140,14 +1141,15 @@ impl AppState {
     /// non-mutating one, stays plan-only: no approval focus, no execution.
     pub(crate) fn on_plan_ready(&mut self, text: String, action: Option<PlannedAction>) {
         self.chat.push(ChatTurn::agent(text));
-        if let Some(action) = action {
-            if action.approval_required && !action.has_placeholders {
-                self.slash_tool = Some(SlashToolRequest {
-                    name: "rocm_command".to_string(),
-                    args: serde_json::json!({ "args": action.args }),
-                    label: "plan action".to_string(),
-                });
-            }
+        if let Some(action) = action
+            && action.approval_required
+            && !action.has_placeholders
+        {
+            self.slash_tool = Some(SlashToolRequest {
+                name: "rocm_command".to_string(),
+                args: serde_json::json!({ "args": action.args }),
+                label: "plan action".to_string(),
+            });
         }
     }
 
@@ -1556,7 +1558,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                     // A `/plan` plan completed: render the review and (for a
                     // complete mutating action) hand it to the approval modal.
                     Some(ClientMsg::PlanReady { text, action }) => {
-                        state.on_plan_ready(text, action)
+                        state.on_plan_ready(text, action);
                     }
                     None => break,
                 }
