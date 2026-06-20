@@ -1251,6 +1251,134 @@ impl AgentClient for ChatGptAgentClient {
     }
 }
 
+/// Live Rig-backed client for Anthropic's Claude API. Mirrors
+/// [`RigAgentClient`]: the Rig client is constructed once; the agent + the SAME
+/// ROCm read/mutating tool set are rebuilt per request from the captured
+/// snapshot, so tool + approval parity holds across every backend. The key
+/// rides in `x-api-key` (handled inside the provider) — never in `base_url` or
+/// the request path — so no key leaks into [`AgentError`] strings.
+pub struct AnthropicAgentClient {
+    client: rig::providers::anthropic::Client,
+    model: String,
+    preamble: String,
+    /// Bin-injected tool executor (None for tests / no live seam).
+    executor: Option<SharedRocmToolExecutor>,
+    /// Channel to surface mutating-tool approval intents to the app (None for
+    /// tests / no live seam). Mutating tools post here instead of executing.
+    approval_tx: Option<UnboundedSender<ClientMsg>>,
+}
+
+impl AnthropicAgentClient {
+    /// Build the Anthropic client from an [`LlmConfig`]. `api_key` is required
+    /// (env / secure-store sourced by the bin and carried in-process via the
+    /// seam — never argv). `base_url` is intentionally ignored: the provider's
+    /// own default (`https://api.anthropic.com`) is used. An empty `model`
+    /// falls back to [`CLAUDE_SONNET_4_6`](rig::providers::anthropic::completion::CLAUDE_SONNET_4_6).
+    /// No network I/O happens here — the request is deferred to `complete()`.
+    pub fn new(
+        cfg: LlmConfig,
+        executor: Option<SharedRocmToolExecutor>,
+        approval_tx: Option<UnboundedSender<ClientMsg>>,
+    ) -> Result<Self, AgentError> {
+        let key = cfg.api_key.as_deref().ok_or_else(|| {
+            AgentError::Build("anthropic requires ANTHROPIC_API_KEY".to_string())
+        })?;
+        // Builder typestate: `.api_key()` then `.build()`. Leave base_url at the
+        // provider default so we never point Claude at a non-Anthropic host.
+        let client = rig::providers::anthropic::Client::builder()
+            .api_key(key)
+            .build()
+            .map_err(|e| AgentError::Build(e.to_string()))?;
+        let model = if cfg.model.is_empty() {
+            rig::providers::anthropic::completion::CLAUDE_SONNET_4_6.to_string()
+        } else {
+            cfg.model
+        };
+        Ok(Self {
+            client,
+            model,
+            preamble: DEFAULT_PREAMBLE.to_string(),
+            executor,
+            approval_tx,
+        })
+    }
+}
+
+#[async_trait]
+impl AgentClient for AnthropicAgentClient {
+    async fn complete(
+        &self,
+        history: &[ChatTurn],
+        snapshot: StateSnapshot,
+    ) -> Result<String, AgentError> {
+        use rig::client::CompletionClient;
+        use rig::completion::Prompt;
+        use std::future::IntoFuture;
+
+        let Some((last, prior)) = history.split_last() else {
+            return Err(AgentError::Empty);
+        };
+        let snap = Arc::new(snapshot);
+        let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
+
+        // Identical tool registration to RigAgentClient / ChatGptAgentClient:
+        // the SAME telemetry/skill tools + every ROCm read + mutating tool, so
+        // capability and approval behavior are uniform across backends.
+        let agent = self
+            .client
+            .agent(&self.model)
+            .preamble(&self.preamble)
+            .max_tokens(1024)
+            .tool(GpuStatusTool {
+                snap: snap.clone(),
+                fired: fired.clone(),
+            })
+            .tool(ListInstancesTool {
+                snap: snap.clone(),
+                fired: fired.clone(),
+            })
+            .tool(BenchSummaryTool {
+                snap: snap.clone(),
+                fired: fired.clone(),
+            })
+            .tool(TokensPerWattTool {
+                snap: snap.clone(),
+                fired: fired.clone(),
+            })
+            // Read-only Skills registry tools (list + dry-run plan; never execute).
+            .tool(ListSkillsTool {
+                fired: fired.clone(),
+            })
+            .tool(SkillPlanTool {
+                fired: fired.clone(),
+            });
+        // Read-only ROCm machine-inspection tools (forward across the seam).
+        let agent = register_rocm_read_tools(agent, self.executor.as_ref(), &fired);
+        // Mutating ROCm tools (surface approval; never execute in the rig loop).
+        let agent = register_rocm_mutating_tools(
+            agent,
+            self.executor.as_ref(),
+            self.approval_tx.as_ref(),
+            &fired,
+        )
+        .build();
+
+        let req = agent
+            .prompt(last.content.clone())
+            .max_turns(MAX_TOOL_TURNS)
+            .with_history(build_messages(prior));
+
+        let reply = match tokio::time::timeout(REQUEST_TIMEOUT, req.into_future()).await {
+            Err(_) => return Err(AgentError::Timeout),
+            Ok(Ok(reply)) => reply,
+            Ok(Err(e)) => return Err(AgentError::Request(e.to_string())),
+        };
+
+        let skills = fired.lock().map(|g| g.clone()).unwrap_or_default();
+        Ok(annotate_reply(reply, &skills))
+    }
+}
+
 /// Deterministic in-memory client for tests and the offline demo. Never touches
 /// the network. Can emit a canned tool-calling-style answer (cites a Skill).
 pub struct MockAgentClient {
