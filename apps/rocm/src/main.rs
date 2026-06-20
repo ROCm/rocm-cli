@@ -248,7 +248,11 @@ enum Command {
         query: Vec<String>,
     },
     /// Start the background helper in the foreground.
-    Daemon,
+    Daemon {
+        /// Print the automation status panel instead of running the helper loop.
+        #[arg(long)]
+        status: bool,
+    },
     /// Launch the unified telemetry dashboard (TUI) with an embedded daemon.
     Dash {
         /// Replay a recorded session NDJSON instead of connecting to a live daemon.
@@ -1295,11 +1299,15 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Daemon) => {
-            let paths = AppPaths::discover()?;
-            let config = RocmCliConfig::load(&paths)?;
-            print!("{}", render_daemon_text(&paths, &config));
-            Ok(())
+        Some(Command::Daemon { status }) => {
+            if status {
+                let paths = AppPaths::discover()?;
+                let config = RocmCliConfig::load(&paths)?;
+                print!("{}", render_daemon_text(&paths, &config));
+                Ok(())
+            } else {
+                rocmd::run_from_args(daemon_run_argv())
+            }
         }
         Some(Command::Dash {
             replay,
@@ -13869,6 +13877,16 @@ fn app_path_env_var_refs<'a>(vars: &'a [(&'static str, PathBuf)]) -> Vec<(&'stat
     vars.iter()
         .map(|(key, value)| (*key, value.as_path()))
         .collect()
+}
+
+/// Argv passed to the embedded `rocmd` library to run the real foreground
+/// automation loop (the same path as `rocmd run --automations-enabled`).
+fn daemon_run_argv() -> Vec<OsString> {
+    vec![
+        OsString::from("rocmd"),
+        OsString::from("run"),
+        OsString::from("--automations-enabled"),
+    ]
 }
 
 fn managed_service_launcher_path() -> Result<PathBuf> {
