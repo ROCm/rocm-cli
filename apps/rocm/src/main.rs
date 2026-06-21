@@ -1347,6 +1347,13 @@ fn dispatch(cli: Cli) -> Result<()> {
                 // honored only on the non-interactive render path below. The
                 // legacy `tui::run` assistant is retained but no longer invoked
                 // here (see docs/tui-retirement-checklist.md).
+                if provider.is_some() {
+                    // --provider isn't threaded into the interactive dash; say so
+                    // instead of dropping it silently — the user can switch live.
+                    eprintln!(
+                        "note: launching the dash chat; switch providers with /provider <name>"
+                    );
+                }
                 return dash::run_chat(chat_mock);
             }
             match prompt {
@@ -4216,6 +4223,16 @@ fn start_managed_service(
     Ok(())
 }
 
+/// The "should we spawn?" decision for [`ensure_background_helper_running`],
+/// factored out so it is testable hermetically (no spawn side effect). Returns
+/// `true` when the file-based runtime state says the daemon is `running` AND its
+/// recorded `daemon_pid` is a live process — i.e. a second spawn must be guarded.
+/// A missing state file, `running=false`, or a dead/zero pid returns `false`.
+pub(crate) fn background_helper_already_running(paths: &AppPaths) -> Result<bool> {
+    Ok(AutomationRuntimeState::load(paths)?
+        .is_some_and(|state| state.running && rocm_core::process_is_running(state.daemon_pid)))
+}
+
 /// Shared daemon-lifecycle entrypoint: ensures the background automation helper
 /// (`rocm daemon`) is running, spawning it detached if not. Liveness is read from
 /// the file-based automation runtime state. Intentionally `pub(crate)` — reused by
@@ -4224,10 +4241,7 @@ fn start_managed_service(
 /// propagated; setup errors (path discovery, stdio attach) still return `Err`.
 pub(crate) fn ensure_background_helper_running() -> Result<()> {
     let paths = AppPaths::discover()?;
-    if let Some(state) = AutomationRuntimeState::load(&paths)?
-        && state.running
-        && rocm_core::process_is_running(state.daemon_pid)
-    {
+    if background_helper_already_running(&paths)? {
         return Ok(());
     }
 
@@ -22263,6 +22277,64 @@ VERSION_ID="41"
         )
     }
 
+    /// Build an `AutomationRuntimeState` for the no-double-spawn guard tests.
+    fn runtime_state(running: bool, daemon_pid: u32) -> AutomationRuntimeState {
+        AutomationRuntimeState {
+            running,
+            automations_enabled: true,
+            daemon_pid,
+            started_at_unix_ms: 1,
+            last_tick_unix_ms: 1,
+            local_webhook_endpoint: None,
+            active_watchers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn background_helper_already_running_true_for_live_pid() {
+        // Phase-10 daemon no-double-spawn: a runtime-state.json with running=true
+        // and a LIVE daemon_pid (this very test process) means the helper is
+        // already up — the "should spawn?" decision must say NO (true ⇒ skip).
+        // Hermetic + offline: no spawn, just the file-based liveness check.
+        let (root, paths) = test_paths("helper-live-pid");
+        runtime_state(true, std::process::id())
+            .write(&paths)
+            .expect("write runtime state");
+        assert!(
+            background_helper_already_running(&paths).expect("liveness check ok"),
+            "live recorded pid + running=true ⇒ do not spawn a second daemon"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn background_helper_already_running_false_for_dead_or_missing() {
+        // The inverse guard cases — each must report NOT running (false ⇒ spawn):
+        // (1) no state file at all, (2) running=true but a dead/zero pid,
+        // (3) a live pid but running=false. None must spawn from this decision.
+        let (root, paths) = test_paths("helper-dead-or-missing");
+        // (1) No state file yet.
+        assert!(
+            !background_helper_already_running(&paths).expect("missing state ⇒ ok"),
+            "no runtime state ⇒ not running"
+        );
+        // (2) running=true but pid 0 is never a live process.
+        runtime_state(true, 0).write(&paths).expect("write state");
+        assert!(
+            !background_helper_already_running(&paths).expect("dead pid ⇒ ok"),
+            "running=true + dead pid ⇒ not running (spawn)"
+        );
+        // (3) live pid but running flag is false.
+        runtime_state(false, std::process::id())
+            .write(&paths)
+            .expect("write state");
+        assert!(
+            !background_helper_already_running(&paths).expect("not-running flag ⇒ ok"),
+            "running=false ⇒ not running even with a live pid"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     // ---- Phase 9: reroute dispatch (bare `rocm` + interactive `rocm chat`) ----
     //
     // The interactive branches require a real TTY (`interactive_terminal()`),
@@ -22401,6 +22473,24 @@ VERSION_ID="41"
         assert!(
             !body.contains("tui::run"),
             "Command::Chat handler must NOT call tui::run after the reroute; body:\n{body}"
+        );
+    }
+
+    #[test]
+    fn command_chat_interactive_notes_dropped_provider_flag() {
+        // Phase-9 polish: --provider on interactive `rocm chat` is no longer
+        // silently ignored — the handler emits a one-line note when provider is
+        // set before rerouting to the dash. Proven by reading the handler body
+        // (the interactive branch requires a TTY, unavailable in CI).
+        let src = main_rs_source();
+        let body = strip_line_comments(&command_chat_handler_body(&src));
+        assert!(
+            body.contains("provider.is_some()"),
+            "handler must gate the note on a set --provider; body:\n{body}"
+        );
+        assert!(
+            body.contains("/provider"),
+            "the note must point the user at /provider for live switching; body:\n{body}"
         );
     }
 
