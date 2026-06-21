@@ -1800,6 +1800,54 @@ mod tests {
         assert!(out.get("error").and_then(Value::as_str).is_some());
     }
 
+    /// Executor whose `execute`/`execute_approved` both return a seam-level
+    /// `Error`, exercising the recoverable error path (not None, not Approval).
+    #[derive(Debug)]
+    struct FakeErrorExec;
+    impl crate::tool_exec::RocmToolExecutor for FakeErrorExec {
+        fn execute(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
+            RocmToolOutcome::Error("boom".to_string())
+        }
+        fn execute_approved(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
+            RocmToolOutcome::Error("boom".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_tool_seam_error_is_recoverable() {
+        // Edge: the injected executor returns RocmToolOutcome::Error("boom").
+        // call() must return a Value carrying an `error` key (recoverable),
+        // never panic — the model can read and recover from it.
+        let exec: SharedRocmToolExecutor = Arc::new(FakeErrorExec);
+        let tool = DoctorRocmTool {
+            executor: Some(exec),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        let out = tool.call(json!({})).await.expect("tool call ok (no panic)");
+        assert_eq!(out.get("error").and_then(Value::as_str), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn mutating_tool_seam_error_is_recoverable() {
+        // Edge: a mutating tool whose executor returns Error("boom") on the
+        // validate step (e.g. bad args) returns the error as a recoverable
+        // Value — no approval surfaced, no panic.
+        let exec: SharedRocmToolExecutor = Arc::new(FakeErrorExec);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ClientMsg>();
+        let tool = LaunchServerRocmTool {
+            executor: Some(exec),
+            approval_tx: Some(tx),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        let out = tool
+            .call(json!({ "model": "m" }))
+            .await
+            .expect("tool call ok (no panic)");
+        assert_eq!(out.get("error").and_then(Value::as_str), Some("boom"));
+        // No approval intent is surfaced on the error path.
+        assert!(rx.try_recv().is_err(), "error path surfaces no approval");
+    }
+
     #[test]
     fn rocm_read_tool_names_are_complete_and_disjoint_from_skills() {
         // Every expected read-only tool is registered…
