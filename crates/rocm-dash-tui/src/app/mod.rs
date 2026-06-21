@@ -31,6 +31,16 @@ use crate::client::{self, ClientMsg};
 use crate::ui;
 use crate::ui::theme::Theme;
 
+// Submodules holding cohesive pieces of `AppState` + free fns split out of this
+// file to keep the core reducer + event loop focused (a file→dir module move:
+// `crate::app::*` paths are unchanged).
+mod chat;
+mod slash;
+mod summary;
+
+use chat::{build_chat_agent, detect_local_chat, persist_chat_endpoint};
+use summary::{parse_plan_result, summarize_json_value, summarize_slash_tool};
+
 /// Args after CLI + config resolution. Consumed by `run`.
 #[derive(Debug, Clone)]
 pub struct ResolvedArgs {
@@ -450,7 +460,7 @@ pub struct AppState {
     pub serve_wizard: Option<crate::ui::serve_wizard::ServeWizardState>,
     /// Engine manager overlay (Phase 3 Wave 1). `None` = closed.
     pub engine_manager: Option<crate::ui::engine_manager::EngineManagerState>,
-    /// Examine overlay (Phase 3 Wave 2). `None` = closed.
+    /// Doctor overlay (Phase 3 Wave 2). `None` = closed.
     pub examine_manager: Option<crate::ui::examine_manager::ExamineManagerState>,
     /// Update overlay (Phase 3 Wave 2). `None` = closed.
     pub update_manager: Option<crate::ui::update_manager::UpdateManagerState>,
@@ -643,15 +653,6 @@ impl AppState {
     /// Install the resolved chat endpoint and set the initial consent state.
     /// `None` → `Unavailable`; `Some` → `Accepted` when pre-consented (e.g.
     /// `--chat-yes`), otherwise `Pending` (the one-time in-TUI prompt).
-    pub fn set_chat_config(&mut self, llm: Option<crate::llm::LlmConfig>, pre_consent: bool) {
-        self.chat_consent = match (&llm, pre_consent) {
-            (None, _) => ChatConsent::Unavailable,
-            (Some(_), true) => ChatConsent::Accepted,
-            (Some(_), false) => ChatConsent::Pending,
-        };
-        self.chat_llm = llm;
-    }
-
     /// Accept the detected endpoint and enable chat. No-op when no endpoint is
     /// available. Focuses the input so the user can type immediately.
     pub const fn accept_chat_consent(&mut self) {
@@ -751,487 +752,6 @@ impl AppState {
         self.chat_input.clear();
         self.chat_sending = true;
         self.chat_dispatch = true;
-    }
-
-    /// Route a chat-input line that may be a slash command. Returns
-    /// [`SlashOutcome::NotCommand`] for plain text (caller dispatches to the
-    /// agent); otherwise handles it in-reducer and returns
-    /// [`SlashOutcome::Handled`]. Stays I/O-free: executor-backed commands raise
-    /// the `slash_tool` edge for the event loop to drain off-thread.
-    pub(crate) fn handle_slash_command(&mut self, text: &str) -> SlashOutcome {
-        /// Build a `rocm_command` slash-tool request from an argv slice and a
-        /// chat-turn label. Centralizes the repeated `name: "rocm_command"` +
-        /// `{"args": argv}` construction shared by the lifecycle read/mutate arms.
-        fn rocm_cmd_request(argv: &[&str], label: impl Into<String>) -> SlashToolRequest {
-            SlashToolRequest {
-                name: "rocm_command".to_string(),
-                args: serde_json::json!({ "args": argv }),
-                label: label.into(),
-            }
-        }
-
-        let trimmed = text.trim();
-        let Some(rest) = trimmed.strip_prefix('/') else {
-            return SlashOutcome::NotCommand;
-        };
-        // First whitespace-delimited word after '/', lowercased.
-        let cmd = rest.split_whitespace().next().unwrap_or("").to_lowercase();
-
-        match cmd.as_str() {
-            // --- Group A: nav / session (deterministic, no executor) ---
-            "home" => self.active_tab = ActiveTab::Overview,
-            "gpu" => self.active_tab = ActiveTab::Hardware,
-            "help" | "?" => self.modal = Modal::Help,
-            "clear" => self.chat.clear(),
-            "quit" | "exit" => self.should_quit = true,
-            // --- Group B: read-only overlays (mirror the keybind handlers) ---
-            "doctor" => {
-                self.close_overlays();
-                self.examine_manager =
-                    Some(crate::ui::examine_manager::ExamineManagerState::default());
-            }
-            "runtimes" => {
-                self.close_overlays();
-                self.runtime_manager =
-                    Some(crate::ui::runtime_manager::RuntimeManagerState::default());
-            }
-            "config" => {
-                self.close_overlays();
-                self.config_manager =
-                    Some(crate::ui::config_manager::ConfigManagerState::default());
-            }
-            "logs" => {
-                self.close_overlays();
-                self.logs_view = Some(crate::ui::logs_view::LogsViewState::default());
-            }
-            // --- Group B: read-only executor-backed (no overlay; off-thread) ---
-            "model" => {
-                self.slash_tool = Some(rocm_cmd_request(&["model"], "model"));
-            }
-            "daemon" => {
-                self.slash_tool = Some(rocm_cmd_request(&["daemon", "status"], "daemon status"));
-            }
-            // --- Group D: mutating ops (approval-gated; surfaced via the modal) ---
-            // Each raises a `slash_tool` request whose `execute()` returns
-            // `ApprovalRequired`; the event loop opens the approval modal. The
-            // safety validators run inside `execute()` (and again on the approved
-            // replay), so an unsafe call surfaces an error instead of the modal.
-            "install" => {
-                // `/install <prefix>` — the install folder is required by the
-                // validator (it never installs to a system path).
-                match rest.split_whitespace().nth(1) {
-                    Some(prefix) => {
-                        self.slash_tool = Some(SlashToolRequest {
-                            name: "install_sdk".to_string(),
-                            args: serde_json::json!({
-                                "channel": "release",
-                                "format": "wheel",
-                                "prefix": prefix,
-                            }),
-                            label: format!("install {prefix}"),
-                        });
-                    }
-                    None => {
-                        self.chat.push(ChatTurn::error(
-                            "usage: /install <prefix>  (install folder, e.g. /install ~/rocm)"
-                                .to_string(),
-                        ));
-                    }
-                }
-            }
-            "engine" => {
-                // `/engine <name>` — the engine name is required by the validator.
-                match rest.split_whitespace().nth(1) {
-                    Some(engine) => {
-                        self.slash_tool = Some(SlashToolRequest {
-                            name: "install_engine".to_string(),
-                            args: serde_json::json!({ "engine": engine }),
-                            label: format!("engine {engine}"),
-                        });
-                    }
-                    None => {
-                        self.chat.push(ChatTurn::error(
-                            "usage: /engine <name> (e.g. /engine vllm)".to_string(),
-                        ));
-                    }
-                }
-            }
-            "serve" => {
-                // `/serve <model>` — loopback host only (validator rejects public).
-                match rest.split_whitespace().nth(1) {
-                    Some(model) => {
-                        self.slash_tool = Some(SlashToolRequest {
-                            name: "launch_server".to_string(),
-                            args: serde_json::json!({ "model": model, "host": "127.0.0.1" }),
-                            label: format!("serve {model}"),
-                        });
-                    }
-                    None => {
-                        self.chat.push(ChatTurn::error(
-                            "usage: /serve <model> (e.g. /serve deepseek-r1)".to_string(),
-                        ));
-                    }
-                }
-            }
-            "services" => {
-                // `/services stop <id>` mutates (stop_server, approval-gated); a
-                // bare `/services` is read-only and lists managed services.
-                // `restart` is NOT yet wired through the chat seam, so it is
-                // guided rather than silently running stop (a semantic lie).
-                let mut words = rest.split_whitespace().skip(1);
-                match words.next() {
-                    Some("stop") => match words.next() {
-                        Some(id) => {
-                            self.slash_tool = Some(SlashToolRequest {
-                                name: "stop_server".to_string(),
-                                args: serde_json::json!({ "service_id": id }),
-                                label: format!("services stop {id}"),
-                            });
-                        }
-                        None => {
-                            self.chat
-                                .push(ChatTurn::error("usage: /services stop <id>".to_string()));
-                        }
-                    },
-                    Some("restart") => {
-                        self.chat.push(ChatTurn::error(
-                            "services restart via chat is not supported yet; use /services stop <id> then /serve <model>"
-                                .to_string(),
-                        ));
-                    }
-                    Some(other) => {
-                        self.chat.push(ChatTurn::error(format!(
-                            "unknown /services action `{other}` (try stop, or /services to list)"
-                        )));
-                    }
-                    None => {
-                        self.slash_tool = Some(SlashToolRequest {
-                            name: "services".to_string(),
-                            args: serde_json::json!({}),
-                            label: "services".to_string(),
-                        });
-                    }
-                }
-            }
-            // --- Group D-rest: lifecycle ops (read/mutate split via rocm_command) ---
-            // Read paths classify as ReadOnly in the bin and return a result turn;
-            // mutating paths classify as ApprovalRequired and open the Phase-4 modal.
-            "update" => {
-                // `/update` reports available updates (read-only); `/update --apply`
-                // applies them (approval-gated). Scan all tokens for the dash flag
-                // (matching `/uninstall`) so the trigger isn't position-sensitive.
-                let apply = rest.split_whitespace().skip(1).any(|tok| tok == "--apply");
-                let argv: Vec<&str> = if apply {
-                    vec!["update", "--apply"]
-                } else {
-                    vec!["update"]
-                };
-                self.slash_tool = Some(rocm_cmd_request(
-                    &argv,
-                    if apply { "update --apply" } else { "update" },
-                ));
-            }
-            "comfyui" | "comfy" => {
-                // Bare `/comfyui` is read-only status. status/logs read; install/
-                // start/stop mutate (approval-gated).
-                let sub = rest.split_whitespace().nth(1).map(str::to_lowercase);
-                match sub.as_deref() {
-                    None | Some("status") => {
-                        self.slash_tool =
-                            Some(rocm_cmd_request(&["comfyui", "status"], "comfyui status"));
-                    }
-                    Some(action @ ("logs" | "install" | "start" | "stop")) => {
-                        self.slash_tool = Some(rocm_cmd_request(
-                            &["comfyui", action],
-                            format!("comfyui {action}"),
-                        ));
-                    }
-                    Some(other) => {
-                        self.chat.push(ChatTurn::error(format!(
-                            "unknown /comfyui action `{other}` (try status, logs, install, start, stop)"
-                        )));
-                    }
-                }
-            }
-            "uninstall" => {
-                // SAFE default: bare `/uninstall` is a dry-run (read-only). A real
-                // uninstall needs `/uninstall --apply` and is approval-gated (the
-                // bin auto-adds --yes on approval).
-                let flags: Vec<&str> = rest.split_whitespace().skip(1).collect();
-                let saw_apply = flags.contains(&"--apply");
-                let saw_dry_run = flags.contains(&"--dry-run");
-                if saw_apply && saw_dry_run {
-                    self.chat.push(ChatTurn::error(
-                        "conflicting /uninstall flags: choose either --dry-run (safe) or --apply (real uninstall)"
-                            .to_string(),
-                    ));
-                } else {
-                    let real = saw_apply;
-                    let argv: Vec<&str> = if real {
-                        vec!["uninstall"]
-                    } else {
-                        vec!["uninstall", "--dry-run"]
-                    };
-                    self.slash_tool = Some(rocm_cmd_request(
-                        &argv,
-                        if real {
-                            "uninstall"
-                        } else {
-                            "uninstall --dry-run"
-                        },
-                    ));
-                }
-            }
-            "setup" => {
-                // Bare `/setup` (or `/setup status`) reports first-time setup
-                // (read-only); `/setup reset` re-arms it (approval-gated). The CLI
-                // only has status + reset — anything else is guided, not run.
-                let sub = rest.split_whitespace().nth(1).map(str::to_lowercase);
-                match sub.as_deref() {
-                    None | Some("status") => {
-                        self.slash_tool =
-                            Some(rocm_cmd_request(&["setup", "status"], "setup status"));
-                    }
-                    Some("reset") => {
-                        self.slash_tool =
-                            Some(rocm_cmd_request(&["setup", "reset"], "setup reset"));
-                    }
-                    Some(other) => {
-                        self.chat.push(ChatTurn::error(format!(
-                            "unknown /setup action `{other}` (try status or reset)"
-                        )));
-                    }
-                }
-            }
-            // --- Group C: automations / reviews (read list; toggles + proposal
-            // actions are approval-gated via the Phase-4 modal) ---
-            "automations" => {
-                // Bare `/automations` (or `list`) lists configured automations
-                // (read-only). `enable`/`disable` toggle a watcher (approval-gated
-                // via the watcher_enable/watcher_disable mutating tools).
-                let mut words = rest.split_whitespace().skip(1);
-                match words.next().map(str::to_lowercase).as_deref() {
-                    None | Some("list") => {
-                        self.slash_tool =
-                            Some(rocm_cmd_request(&["automations", "list"], "automations"));
-                    }
-                    Some("enable") => match words.next() {
-                        Some(watcher) => {
-                            // Optional `--mode <m>`: when present, include it so the
-                            // validator can accept observe|propose|contained.
-                            let mode = match words.next() {
-                                Some("--mode") => words.next(),
-                                _ => None,
-                            };
-                            let args = match mode {
-                                Some(m) => {
-                                    serde_json::json!({ "watcher": watcher, "mode": m })
-                                }
-                                None => serde_json::json!({ "watcher": watcher }),
-                            };
-                            self.slash_tool = Some(SlashToolRequest {
-                                name: "watcher_enable".to_string(),
-                                args,
-                                label: format!("automations enable {watcher}"),
-                            });
-                        }
-                        None => {
-                            self.chat.push(ChatTurn::error(
-                                "usage: /automations enable <watcher> [--mode observe|propose|contained]"
-                                    .to_string(),
-                            ));
-                        }
-                    },
-                    Some("disable") => match words.next() {
-                        Some(watcher) => {
-                            self.slash_tool = Some(SlashToolRequest {
-                                name: "watcher_disable".to_string(),
-                                args: serde_json::json!({ "watcher": watcher }),
-                                label: format!("automations disable {watcher}"),
-                            });
-                        }
-                        None => {
-                            self.chat.push(ChatTurn::error(
-                                "usage: /automations disable <watcher>".to_string(),
-                            ));
-                        }
-                    },
-                    Some(other) => {
-                        self.chat.push(ChatTurn::error(format!(
-                            "unknown /automations action `{other}` (try list, enable, disable)"
-                        )));
-                    }
-                }
-            }
-            "reviews" => {
-                // Bare `/reviews` lists pending reviews (read-only, via the
-                // automations list). `/reviews <id>` shows one proposal's detail.
-                match rest.split_whitespace().nth(1) {
-                    None => {
-                        self.slash_tool =
-                            Some(rocm_cmd_request(&["automations", "list"], "reviews"));
-                    }
-                    Some(id) => {
-                        self.slash_tool = Some(SlashToolRequest {
-                            name: "proposal_action".to_string(),
-                            args: serde_json::json!({ "proposal_id": id, "action": "show" }),
-                            label: format!("reviews {id}"),
-                        });
-                    }
-                }
-            }
-            "approve" => match rest.split_whitespace().nth(1) {
-                Some(id) => {
-                    self.slash_tool = Some(SlashToolRequest {
-                        name: "proposal_action".to_string(),
-                        args: serde_json::json!({ "proposal_id": id, "action": "approve" }),
-                        label: format!("approve {id}"),
-                    });
-                }
-                None => {
-                    self.chat
-                        .push(ChatTurn::error("usage: /approve <proposal-id>".to_string()));
-                }
-            },
-            "reject" => match rest.split_whitespace().nth(1) {
-                Some(id) => {
-                    self.slash_tool = Some(SlashToolRequest {
-                        name: "proposal_action".to_string(),
-                        args: serde_json::json!({ "proposal_id": id, "action": "reject" }),
-                        label: format!("reject {id}"),
-                    });
-                }
-                None => {
-                    self.chat
-                        .push(ChatTurn::error("usage: /reject <proposal-id>".to_string()));
-                }
-            },
-            "edit" => match rest.split_whitespace().nth(1) {
-                Some(id) => {
-                    // Editing a proposal's CONTENT isn't supported by the bin; show
-                    // the proposal (read) so the operator can /approve or /reject.
-                    self.slash_tool = Some(SlashToolRequest {
-                        name: "proposal_action".to_string(),
-                        args: serde_json::json!({ "proposal_id": id, "action": "show" }),
-                        label: format!("edit {id}"),
-                    });
-                    self.chat.push(ChatTurn::agent(format!(
-                        "Editing a proposal's content isn't supported; showing {id}. Use /approve {id} or /reject {id}."
-                    )));
-                }
-                None => {
-                    self.chat
-                        .push(ChatTurn::error("usage: /edit <proposal-id>".to_string()));
-                }
-            },
-            // --- Group E: permissions (read status; escalation is approval-gated) ---
-            "permissions" => {
-                // Bare `/permissions` (or `status`) shows the current mode
-                // (read-only via `config show`). `full-access`/`ask` change the
-                // mode — escalation MUST route through the approval modal.
-                let sub = rest.split_whitespace().nth(1).map(str::to_lowercase);
-                match sub.as_deref() {
-                    None | Some("status") => {
-                        self.slash_tool =
-                            Some(rocm_cmd_request(&["config", "show"], "permissions"));
-                    }
-                    Some("full-access" | "full_access") => {
-                        self.slash_tool = Some(rocm_cmd_request(
-                            &["config", "set-permissions", "full_access"],
-                            "permissions full-access",
-                        ));
-                    }
-                    Some("ask") => {
-                        self.slash_tool = Some(rocm_cmd_request(
-                            &["config", "set-permissions", "ask"],
-                            "permissions ask",
-                        ));
-                    }
-                    Some(other) => {
-                        self.chat.push(ChatTurn::error(format!(
-                            "unknown /permissions action `{other}` (try status, full-access, ask)"
-                        )));
-                    }
-                }
-            }
-            // --- Group F: natural-language planner (Ask→Plan→Review→Run) ---
-            // `/plan <request>` raises the `plan_request` edge; the event loop
-            // calls the read-only `natural_language_plan` tool off-thread and
-            // posts `PlanReady`. The plan is rendered for review; a complete
-            // mutating action is then handed to the Phase-4 approval modal.
-            "plan" => {
-                // Split off the command word (`plan`, any case) and take the
-                // free-form tail; case-insensitive, unlike `strip_prefix`.
-                let request = rest
-                    .split_once(char::is_whitespace)
-                    .map(|(_, tail)| tail.trim())
-                    .unwrap_or_default();
-                if request.is_empty() {
-                    self.chat.push(ChatTurn::agent(
-                        "usage: /plan <request> (e.g. /plan install rocm into /opt/rocm)"
-                            .to_string(),
-                    ));
-                } else {
-                    self.plan_request = Some(request.to_string());
-                }
-            }
-            // --- Group G: provider switch + chat entry (Phase 8) ---
-            // `/provider [local|openai|anthropic]` switches the live chat
-            // backend. A bare/unknown arg shows the current provider (or hints);
-            // a valid one raises the `provider_switch` edge for the event loop to
-            // rebuild the agent. Every backend calls the SAME ROCm tools.
-            "provider" => match rest.split_whitespace().nth(1) {
-                None => {
-                    self.chat.push(ChatTurn::agent(format!(
-                        "current provider: {} (usage: /provider [local|openai|anthropic])",
-                        self.active_provider.label()
-                    )));
-                }
-                Some(arg) => match ChatProvider::parse(arg) {
-                    Some(p) => {
-                        // Snapshot the prior provider BEFORE the optimistic set so
-                        // a failed switch (missing key) can revert to it.
-                        let previous = self.active_provider;
-                        self.active_provider = p;
-                        self.provider_switch = Some(ProviderSwitch {
-                            previous,
-                            target: p,
-                        });
-                    }
-                    None => {
-                        self.chat.push(ChatTurn::error(format!(
-                            "unknown provider `{arg}` (try local, openai, or anthropic)"
-                        )));
-                    }
-                },
-            },
-            // `/chat [prompt]`: with a prompt, send it to the agent (passthrough,
-            // exactly as a plain line would); bare `/chat` focuses the Chat tab.
-            "chat" => {
-                let prompt = rest
-                    .split_once(char::is_whitespace)
-                    .map(|(_, tail)| tail.trim())
-                    .unwrap_or_default();
-                if prompt.is_empty() {
-                    self.active_tab = ActiveTab::Chat;
-                    self.chat_focused = true;
-                } else if !self.chat_sending {
-                    // Mirror `submit_chat`'s dispatch tail (the slash already
-                    // consumed `chat_input`); guarded so an in-flight request is
-                    // never double-spawned.
-                    self.chat.push(ChatTurn::user(prompt.to_string()));
-                    self.chat_sending = true;
-                    self.chat_dispatch = true;
-                }
-            }
-            // Unknown slash command: an error turn, never sent to the LLM.
-            other => {
-                self.chat.push(ChatTurn::error(format!(
-                    "unknown command: /{other} (try /help)"
-                )));
-            }
-        }
-        SlashOutcome::Handled
     }
 
     /// Capture a read-only telemetry snapshot for the chat tools. Plain owned
@@ -1524,66 +1044,6 @@ impl AppState {
     }
 }
 
-/// OpenAI's hosted Chat Completions base URL (the standard, no-gateway case).
-const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
-/// Default OpenAI model when none is configured via `chat_model`.
-const OPENAI_DEFAULT_MODEL: &str = "gpt-5";
-
-/// Construct the chat backend for an explicitly-selected provider (Phase 8).
-///
-/// Construction only — NO network I/O happens here (rig clients defer the
-/// request to `complete()`). Handles ONLY `Openai` and `Anthropic`; `Local`
-/// returns `None` because its build (auto-detect probe → Rig/ChatGPT) is owned
-/// by `event_loop`'s inline path and can't be reproduced from `ResolvedArgs`
-/// alone. Keys come from `ResolvedArgs` (in-process seam), never argv. `None`
-/// signals "couldn't build" (e.g. a missing key) so the caller surfaces an
-/// actionable error turn instead of switching to a dead backend.
-fn build_chat_agent(
-    provider: ChatProvider,
-    args: &ResolvedArgs,
-    executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
-    approval_tx: mpsc::UnboundedSender<ClientMsg>,
-) -> Option<std::sync::Arc<dyn crate::agent::AgentClient>> {
-    match provider {
-        // Local is rebuilt by the caller's inline path (it needs the live probe).
-        ChatProvider::Local => None,
-        ChatProvider::Openai => {
-            // Require a real key. Without this, `RigAgentClient::new` falls back to
-            // a dummy `sk-no-key` bearer and still builds, so the switch reports
-            // success and then 401s at request time. Returning `None` here makes
-            // the caller surface an actionable error and stay on the current
-            // backend instead of switching to a dead one.
-            let api_key = args.chat_api_key.clone().filter(|k| !k.trim().is_empty())?;
-            let cfg = crate::llm::LlmConfig {
-                base_url: OPENAI_BASE_URL.to_string(),
-                model: args
-                    .chat_model
-                    .clone()
-                    .filter(|m| !m.is_empty())
-                    .unwrap_or_else(|| OPENAI_DEFAULT_MODEL.to_string()),
-                api_key: Some(api_key),
-                auth_header: None,
-            };
-            crate::agent::RigAgentClient::new(cfg, executor, Some(approval_tx))
-                .ok()
-                .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
-        }
-        ChatProvider::Anthropic => {
-            // Leave base_url empty → the Anthropic backend uses rig's default
-            // host. model "" → CLAUDE_SONNET_4_6 (resolved inside the backend).
-            let cfg = crate::llm::LlmConfig {
-                base_url: String::new(),
-                model: args.chat_model.clone().unwrap_or_default(),
-                api_key: args.anthropic_api_key.clone(),
-                auth_header: None,
-            };
-            crate::agent::AnthropicAgentClient::new(cfg, executor, Some(approval_tx))
-                .ok()
-                .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
-        }
-    }
-}
-
 pub async fn run(args: ResolvedArgs) -> color_eyre::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1848,8 +1308,8 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         );
                         crate::jobs::run_effects(fx, &job_tx);
                     }
-                    // The examine overlay, when open, owns all keys (read-only
-                    // `rocm examine` job through the job-bridge).
+                    // The doctor overlay, when open, owns all keys (read-only
+                    // `rocm doctor` job through the job-bridge).
                     Some(Ok(CtEvent::Key(k))) if state.examine_manager.is_some() => {
                         let fx = crate::ui::examine_manager::on_key(
                             &mut state.examine_manager,
@@ -2163,50 +1623,6 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     Ok(())
 }
 
-/// Probe for a local engine (TCP), then query its `/v1/models` to choose a
-/// model. Returns a ready-to-use [`LlmConfig`], or `None` when nothing is
-/// reachable. All I/O lives here, outside the reducer.
-async fn detect_local_chat() -> Option<crate::llm::LlmConfig> {
-    // TCP probe is blocking; keep it off the async reactor.
-    let base = tokio::task::spawn_blocking(crate::llm::detect_local_endpoint)
-        .await
-        .ok()
-        .flatten()?;
-
-    // Best-effort model query; fall back to the neutral default on any failure.
-    let model = fetch_first_model(base)
-        .await
-        .unwrap_or_else(|| crate::llm::DEFAULT_CHAT_MODEL.to_string());
-    Some(crate::llm::detected_llm_config(base, &model))
-}
-
-/// Persist an accepted local endpoint to the user's `config.toml`: load the
-/// existing config (or defaults), set `tui.chat_url`/`tui.chat_model`, and write
-/// it back. Best-effort — returns a human error string on failure.
-///
-/// Uses [`default_config_path`] (a `--config` override is not honored by this
-/// in-TUI save; that's a documented limitation). All I/O lives here.
-fn persist_chat_endpoint(base_url: &str, model: &str) -> Result<std::path::PathBuf, String> {
-    use rocm_dash_core::config::{Config, default_config_path};
-    let path = default_config_path().ok_or_else(|| "no config path available".to_string())?;
-    let cfg = Config::load(&path).unwrap_or_default();
-    let next = config_with_chat(cfg, base_url, model);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let toml = toml::to_string_pretty(&next).map_err(|e| e.to_string())?;
-    std::fs::write(&path, toml).map_err(|e| e.to_string())?;
-    Ok(path)
-}
-
-/// Render a CONCISE, human summary of a read-only slash-tool outcome — never a
-/// raw JSON transcript dump (per docs/ux-guidelines.md). Errors and approval
-/// notes are surfaced plainly; a success object is reduced to a short headline
-/// plus a few key/value lines, with arrays/objects collapsed to counts.
-/// Max object fields a slash-tool summary surfaces before truncating with an
-/// ellipsis line. Keeps `summarize_json_value` output terse and length-bounded.
-const SUMMARY_MAX_FIELDS: usize = 8;
-
 /// Run an approved mutating action across the seam and render a concise summary
 /// (never a raw JSON dump). Sync + executor-generic so the approve path is
 /// unit-testable without tokio; the event loop calls it inside spawn_blocking.
@@ -2232,127 +1648,6 @@ fn run_approved(
             format!("Approved · {name}: unexpected second approval request (not run)")
         }
     }
-}
-
-/// Parse the `natural_language_plan` tool result into the rendered plan text and
-/// the structured next action. The bin returns
-/// `structuredContent: { request, text, action: {...}|null }`; we surface the
-/// concise rendered `text` (the review) and map `action` to [`PlannedAction`].
-/// Returns `None` only when the structured payload is missing/unusable.
-fn parse_plan_result(v: &serde_json::Value) -> Option<(String, Option<PlannedAction>)> {
-    let text = v
-        .pointer("/structuredContent/text")
-        .and_then(serde_json::Value::as_str)?
-        .to_string();
-    let action = v
-        .pointer("/structuredContent/action")
-        .filter(|a| a.is_object())
-        .map(|a| PlannedAction {
-            args: a
-                .get("args")
-                .and_then(serde_json::Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|x| x.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            approval_required: a
-                .get("approval_required")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
-            has_placeholders: a
-                .get("has_placeholders")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
-            provider_assisted: a
-                .get("provider_assisted")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
-        });
-    Some((text, action))
-}
-
-fn summarize_slash_tool(label: &str, outcome: &crate::tool_exec::RocmToolOutcome) -> String {
-    use crate::tool_exec::RocmToolOutcome;
-    match outcome {
-        RocmToolOutcome::Error(e) => format!("/{label} failed: {e}"),
-        RocmToolOutcome::ApprovalRequired(_) => {
-            format!("/{label}: this action needs approval (read-only command did not expect it)")
-        }
-        RocmToolOutcome::Result(v) => {
-            let body = summarize_json_value(v);
-            if body.is_empty() {
-                format!("/{label}: done")
-            } else {
-                format!("/{label}:\n{body}")
-            }
-        }
-    }
-}
-
-/// Collapse a JSON value into at most a handful of readable lines. Scalars print
-/// inline; objects list their top-level fields (nested containers shown as
-/// counts); arrays show a length. Keeps slash-tool output terse and scannable.
-fn summarize_json_value(v: &serde_json::Value) -> String {
-    use serde_json::Value;
-    match v {
-        Value::Object(map) => {
-            let mut lines = Vec::new();
-            for (k, val) in map.iter().take(SUMMARY_MAX_FIELDS) {
-                lines.push(format!("  {k}: {}", scalar_or_shape(val)));
-            }
-            if map.len() > SUMMARY_MAX_FIELDS {
-                lines.push(format!(
-                    "  … ({} more fields)",
-                    map.len() - SUMMARY_MAX_FIELDS
-                ));
-            }
-            lines.join("\n")
-        }
-        Value::Array(arr) => format!("  {} item(s)", arr.len()),
-        other => format!("  {}", scalar_or_shape(other)),
-    }
-}
-
-/// A scalar's plain text, or a shape hint (`{N fields}` / `[N items]`) for a
-/// nested container — used so summaries never inline a whole subtree.
-fn scalar_or_shape(v: &serde_json::Value) -> String {
-    use serde_json::Value;
-    match v {
-        Value::String(s) => s.clone(),
-        Value::Null => "null".to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Number(n) => n.to_string(),
-        Value::Array(a) => format!("[{} items]", a.len()),
-        Value::Object(o) => format!("{{{} fields}}", o.len()),
-    }
-}
-
-/// Pure immutable transform: return a copy of `cfg` with the chat endpoint set
-/// to a local engine (base_url + model), clearing any gateway auth header since
-/// local engines need none.
-fn config_with_chat(
-    mut cfg: rocm_dash_core::config::Config,
-    base_url: &str,
-    model: &str,
-) -> rocm_dash_core::config::Config {
-    cfg.tui.chat_url = Some(base_url.to_string());
-    cfg.tui.chat_model = Some(model.to_string());
-    cfg.tui.chat_auth_header = None;
-    cfg
-}
-
-/// GET `{base}/models` and return the first served model id, or `None`.
-async fn fetch_first_model(base_url: &str) -> Option<String> {
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-        .ok()?;
-    let resp = client.get(&url).send().await.ok()?;
-    let json: serde_json::Value = resp.json().await.ok()?;
-    crate::llm::pick_first_model(&json)
 }
 
 /// Apply a `KeyAction` to mutable state. Returns `true` when the action
@@ -2418,8 +1713,7 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
         }
         KeyAction::OpenExamine => {
             state.close_overlays();
-            state.examine_manager =
-                Some(crate::ui::examine_manager::ExamineManagerState::default());
+            state.examine_manager = Some(crate::ui::examine_manager::ExamineManagerState::default());
         }
         KeyAction::OpenUpdate => {
             state.close_overlays();
@@ -2598,7 +1892,7 @@ pub enum KeyAction {
     OpenServeWizard,
     /// Open the engine-manager overlay (Phase 3 Wave 1).
     OpenEngineManager,
-    /// Open the examine overlay (Phase 3 Wave 2).
+    /// Open the doctor overlay (Phase 3 Wave 2).
     OpenExamine,
     /// Open the update overlay (Phase 3 Wave 2).
     OpenUpdate,
@@ -2766,7 +2060,7 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         KeyCode::Char('e') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
             KeyAction::OpenEngineManager
         }
-        // Examine: read-only environment check.
+        // Doctor: read-only environment check.
         KeyCode::Char('d') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
             KeyAction::OpenExamine
         }
@@ -3003,7 +2297,7 @@ mod tests {
             KeyAction::Nothing
         );
         assert_eq!(hk(KeyCode::Char('e'), ActiveTab::Bench), KeyAction::Nothing);
-        // Examine / update open from Overview + Instances.
+        // Doctor / update open from Overview + Instances.
         assert_eq!(
             hk(KeyCode::Char('d'), ActiveTab::Overview),
             KeyAction::OpenExamine
@@ -3505,7 +2799,7 @@ mod tests {
     fn config_with_chat_sets_local_endpoint_and_clears_auth() {
         let mut cfg = rocm_dash_core::config::Config::default();
         cfg.tui.chat_auth_header = Some("Ocp-Apim-Subscription-Key".into());
-        let next = config_with_chat(cfg, "http://localhost:8000/v1", "qwen");
+        let next = super::chat::config_with_chat(cfg, "http://localhost:8000/v1", "qwen");
         assert_eq!(
             next.tui.chat_url.as_deref(),
             Some("http://localhost:8000/v1")
