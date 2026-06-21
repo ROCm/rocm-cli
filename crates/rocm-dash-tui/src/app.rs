@@ -299,6 +299,12 @@ impl ChatProvider {
     }
 }
 
+/// Actionable empty-state shown when a chat is submitted with no agent built
+/// (no detected endpoint and no provider key). Surfaced as an error turn — never
+/// an error dump or a panic — and names the two concrete recovery actions.
+pub(crate) const NO_CHAT_BACKEND_MSG: &str = "no chat backend is configured. Press d to detect a local engine, or use \
+     /provider openai|anthropic with the matching API key set.";
+
 /// Result of routing a chat-input line through the slash-command handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SlashOutcome {
@@ -489,8 +495,21 @@ pub struct AppState {
     /// The chat LLM backend currently selected (Phase 8). Defaults to `Local`.
     pub(crate) active_provider: ChatProvider,
     /// Edge: a pending `/provider` switch. Raised by `handle_slash_command`,
-    /// drained once by the event loop which rebuilds the live `agent`.
-    pub(crate) provider_switch: Option<ChatProvider>,
+    /// drained once by the event loop which rebuilds the live `agent`. Carries
+    /// both the target and the provider that was active BEFORE the optimistic
+    /// switch, so a failed build (missing key) reverts to the prior provider
+    /// rather than unconditionally to `Local`.
+    pub(crate) provider_switch: Option<ProviderSwitch>,
+}
+
+/// A pending `/provider` switch edge: the `target` backend plus the `previous`
+/// provider captured before the optimistic `active_provider` set. The event-loop
+/// drain rebuilds the agent for `target`; on failure it reverts `active_provider`
+/// to `previous` (honest display) instead of forcing `Local`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProviderSwitch {
+    pub(crate) previous: ChatProvider,
+    pub(crate) target: ChatProvider,
 }
 
 impl AppState {
@@ -1170,8 +1189,14 @@ impl AppState {
                 }
                 Some(arg) => match ChatProvider::parse(arg) {
                     Some(p) => {
+                        // Snapshot the prior provider BEFORE the optimistic set so
+                        // a failed switch (missing key) can revert to it.
+                        let previous = self.active_provider;
                         self.active_provider = p;
-                        self.provider_switch = Some(p);
+                        self.provider_switch = Some(ProviderSwitch {
+                            previous,
+                            target: p,
+                        });
                     }
                     None => {
                         self.chat.push(ChatTurn::error(format!(
@@ -2037,7 +2062,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         // from `ResolvedArgs` keys (in-process seam, never argv). A build failure
         // (e.g. missing key) leaves `agent` unchanged and surfaces an actionable
         // error turn. Construction only — no network until the next submit.
-        if let Some(target) = state.provider_switch.take() {
+        if let Some(ProviderSwitch { previous, target }) = state.provider_switch.take() {
             match target {
                 ChatProvider::Local => {
                     // Restore the auto-detected local backend saved before the
@@ -2058,13 +2083,15 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                             .chat
                             .push(ChatTurn::agent(format!("switched to {}", target.label())));
                     } else {
-                        // Revert the optimistic `active_provider` set by the
-                        // slash handler so the displayed provider stays honest, and
-                        // reset the live `agent` to local too — otherwise a failed
-                        // switch from a remote backend would leave requests routed
-                        // to the old remote while the UI claims "local".
-                        state.active_provider = ChatProvider::Local;
-                        agent = local_agent.clone();
+                        // Revert the optimistic `active_provider` set by the slash
+                        // handler back to the provider active BEFORE the switch
+                        // attempt — not unconditionally Local — so the displayed
+                        // provider stays honest (e.g. a failed openai→anthropic
+                        // switch stays on openai). `agent` is never reassigned on a
+                        // failed build, so it already matches `previous`; the two
+                        // stay consistent (no stale-remote routing under a wrong
+                        // label).
+                        state.active_provider = previous;
                         let hint = if target == ChatProvider::Anthropic {
                             "anthropic requires ANTHROPIC_API_KEY in env or secure store"
                         } else {
@@ -2099,7 +2126,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         let _ = reply_tx.send(msg);
                     });
                 }
-                None => state.on_chat_error("chat backend unavailable".to_string()),
+                None => state.on_chat_error(NO_CHAT_BACKEND_MSG.to_string()),
             }
         }
 
@@ -3798,17 +3825,80 @@ mod tests {
             SlashOutcome::Handled
         );
         assert_eq!(s.active_provider, ChatProvider::Anthropic);
-        assert_eq!(s.provider_switch, Some(ChatProvider::Anthropic));
+        assert_eq!(
+            s.provider_switch,
+            Some(ProviderSwitch {
+                previous: ChatProvider::Local,
+                target: ChatProvider::Anthropic,
+            })
+        );
         // /provider openai → openai.
         let mut s2 = st();
         s2.handle_slash_command("/provider openai");
         assert_eq!(s2.active_provider, ChatProvider::Openai);
-        assert_eq!(s2.provider_switch, Some(ChatProvider::Openai));
+        assert_eq!(
+            s2.provider_switch,
+            Some(ProviderSwitch {
+                previous: ChatProvider::Local,
+                target: ChatProvider::Openai,
+            })
+        );
         // /provider local → local (matched case-insensitively).
         let mut s3 = st();
         s3.handle_slash_command("/Provider LOCAL");
         assert_eq!(s3.active_provider, ChatProvider::Local);
-        assert_eq!(s3.provider_switch, Some(ChatProvider::Local));
+        assert_eq!(
+            s3.provider_switch,
+            Some(ProviderSwitch {
+                previous: ChatProvider::Local,
+                target: ChatProvider::Local,
+            })
+        );
+    }
+
+    #[test]
+    fn slash_provider_switch_captures_previous_provider() {
+        // (Phase-8 polish) A failed switch must revert to the provider that was
+        // active BEFORE the attempt, not unconditionally to Local. Prove the
+        // slash handler snapshots the prior provider in the edge: switch to
+        // openai (optimistic), then attempt anthropic — the edge carries
+        // previous=Openai so the drain can revert there on a build failure.
+        let mut s = st();
+        s.handle_slash_command("/provider openai");
+        assert_eq!(s.active_provider, ChatProvider::Openai);
+        s.handle_slash_command("/provider anthropic");
+        assert_eq!(
+            s.provider_switch,
+            Some(ProviderSwitch {
+                previous: ChatProvider::Openai,
+                target: ChatProvider::Anthropic,
+            }),
+            "the failed-switch revert target is the prior provider, not Local"
+        );
+    }
+
+    #[test]
+    fn no_provider_no_key_chat_surfaces_actionable_message() {
+        // Edge: agent is None (no endpoint, no provider key). Submitting chat
+        // must surface a clear, ACTIONABLE message (the recovery affordances),
+        // routed through `on_chat_error` as an error turn — not an error dump,
+        // not a panic. This mirrors the event-loop None-agent branch, which
+        // emits exactly `NO_CHAT_BACKEND_MSG`.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.set_chat_config(None, false);
+        assert_eq!(s.chat_consent, ChatConsent::Unavailable);
+        // Drive the same surface the event loop uses for the None-agent case.
+        s.on_chat_error(NO_CHAT_BACKEND_MSG.to_string());
+        let last = s.chat.last().expect("an error turn was pushed");
+        assert_eq!(last.role, ChatRole::Error);
+        // Actionable: names both concrete recovery paths.
+        assert!(
+            last.content.contains("detect") && last.content.contains("/provider"),
+            "empty-state must be actionable, got: {}",
+            last.content
+        );
+        // Not a panic and not in-flight afterwards (sending cleared).
+        assert!(!s.chat_sending);
     }
 
     #[test]
@@ -4669,6 +4759,48 @@ mod tests {
             s2.on_approval_key(crossterm::event::KeyCode::Esc),
             Some(crate::ui::approval::ApprovalVerdict::Cancel)
         );
+    }
+
+    #[test]
+    fn approval_modal_escape_is_not_a_focus_trap() {
+        // Edge: the approval modal must be escapable — Esc and 'n' both yield a
+        // closing verdict, and routing that verdict through the deny/cancel path
+        // clears the modal (`approval` → None) without executing. The covered
+        // active tab is preserved across open → escape (the modal overlays it).
+        for key in [
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyCode::Char('n'),
+        ] {
+            let mut s = st();
+            s.active_tab = ActiveTab::Hardware;
+            s.open_approval(crate::tool_exec::ApprovalIntent {
+                title: "T".to_string(),
+                body: vec!["cmd".to_string()],
+                name: "stop_server".to_string(),
+                arguments: serde_json::json!({ "service_id": "x" }),
+            });
+            assert!(s.approval.is_some(), "modal open before escape");
+            let verdict = s.on_approval_key(key);
+            // Esc → Cancel, 'n' → Deny; both are closing (non-Approve) verdicts.
+            assert!(
+                matches!(
+                    verdict,
+                    Some(
+                        crate::ui::approval::ApprovalVerdict::Cancel
+                            | crate::ui::approval::ApprovalVerdict::Deny
+                    )
+                ),
+                "key {key:?} must yield a closing verdict, got {verdict:?}"
+            );
+            // The event loop routes Deny|Cancel through on_approval_declined.
+            s.on_approval_declined();
+            assert!(
+                s.approval.is_none(),
+                "escape must clear the modal (no focus trap) for {key:?}"
+            );
+            // The covered tab is preserved — the modal never navigated away.
+            assert_eq!(s.active_tab, ActiveTab::Hardware);
+        }
     }
 
     #[test]
