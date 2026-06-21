@@ -13,6 +13,12 @@ mod therock;
 mod tui;
 mod uninstall;
 
+// tui.rs is RETAINED pending human go/no-go deletion (see docs/tui-retirement-checklist.md).
+// bare `rocm` and `rocm chat` now route to the dash chat (parity reached, Phases 3-8).
+// This anchor keeps the frozen module compiling (referenced, never invoked) until deletion.
+#[allow(dead_code)]
+const _RETAINED_TUI_ENTRY: fn(Option<String>) -> anyhow::Result<()> = tui::run;
+
 // Per-command handler fns mechanically relocated into modules.
 // Dispatch call sites stay byte-identical via these re-imports (upstream-sync
 // mergeability); only the fn definitions moved out of main.rs.
@@ -216,6 +222,9 @@ echo \"Summarize this\" | rocm chat --provider anthropic")]
             help = "Allow an OpenAI-compatible provider to request ROCm tool calls."
         )]
         tools: bool,
+        /// Use the offline chat mock when launching the interactive dash chat.
+        #[arg(long)]
+        chat_mock: bool,
     },
     /// Install ROCm, drivers, or related local AI components.
     Install {
@@ -849,7 +858,10 @@ fn maybe_migrate_legacy_dashboard_config() {
 fn launch_default() -> Result<()> {
     refresh_startup_update_check_quietly();
     if interactive_terminal() {
-        return tui::run(None);
+        // Bare `rocm` routes to the unified dash chat (parity reached, Phases
+        // 3-8); the legacy `tui::run` assistant is retained but no longer the
+        // interactive entrypoint (see docs/tui-retirement-checklist.md).
+        return dash::run_chat(false);
     }
 
     let paths = AppPaths::discover()?;
@@ -1325,10 +1337,17 @@ fn dispatch(cli: Cli) -> Result<()> {
             model,
             prompt,
             tools,
+            chat_mock,
         }) => {
             let paths = AppPaths::discover()?;
             if interactive_terminal() && prompt.is_none() {
-                return tui::run(provider.map(provider_name).map(str::to_owned));
+                // Interactive `rocm chat` routes to the unified dash chat
+                // (parity reached, Phases 3-8). The dash auto-detects the
+                // provider and supports `/provider` switching; --provider is
+                // honored only on the non-interactive render path below. The
+                // legacy `tui::run` assistant is retained but no longer invoked
+                // here (see docs/tui-retirement-checklist.md).
+                return dash::run_chat(chat_mock);
             }
             match prompt {
                 Some(prompt) => print!(

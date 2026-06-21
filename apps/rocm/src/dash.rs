@@ -217,7 +217,20 @@ pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
         .enable_all()
         .build()
         .context("building tokio runtime for the dashboard")?;
-    rt.block_on(run_async(config, paths, replay, chat_mock))
+    rt.block_on(run_async(config, paths, replay, chat_mock, ActiveTab::Overview))
+}
+
+/// Entry point for bare `rocm` and interactive `rocm chat`. Opens the unified
+/// dashboard with the Chat tab focused. Thin wrapper over the same runtime/
+/// `run_async` path as [`run`]; no replay/demo, embedded daemon as usual.
+pub fn run_chat(chat_mock: bool) -> Result<()> {
+    let paths = AppPaths::discover()?;
+    let config = RocmCliConfig::load(&paths)?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime for the dashboard")?;
+    rt.block_on(run_async(config, paths, None, chat_mock, ActiveTab::Chat))
 }
 
 async fn run_async(
@@ -225,8 +238,9 @@ async fn run_async(
     paths: AppPaths,
     replay: Option<PathBuf>,
     chat_mock: bool,
+    initial_tab: ActiveTab,
 ) -> Result<()> {
-    let mut args = resolved_args(&config, &paths, ActiveTab::Overview);
+    let mut args = resolved_args(&config, &paths, initial_tab);
     args.replay = replay.clone();
     args.chat_mock = chat_mock;
     // Inject the bin-side tool-execution seam for a live dash only. Demo/replay
