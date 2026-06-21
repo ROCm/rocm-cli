@@ -22096,4 +22096,191 @@ VERSION_ID="41"
             },
         )
     }
+
+    // ---- Phase 9: reroute dispatch (bare `rocm` + interactive `rocm chat`) ----
+    //
+    // The interactive branches require a real TTY (`interactive_terminal()`),
+    // which is unavailable in CI, and the dash visuals are trust-prior. These
+    // tests instead PROVE the dispatch TARGET changed: the two interactive
+    // handlers now call `dash::run_chat` and no longer call `tui::run`. We read
+    // this source file at test time and assert on the handler bodies.
+
+    fn main_rs_source() -> String {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("main.rs");
+        fs::read_to_string(path).expect("read apps/rocm/src/main.rs")
+    }
+
+    /// Extract the body of `fn launch_default()` (brace-balanced).
+    fn launch_default_body(src: &str) -> String {
+        slice_braced_block(src, "fn launch_default() -> Result<()> {")
+    }
+
+    /// Extract the whole `Some(Command::Chat { .. }) => { .. }` handler arm,
+    /// brace-balanced from the destructure pattern through the block body, so
+    /// both the destructured fields (e.g. `chat_mock`) and the dispatch code are
+    /// visible. Restricts to the production handler (the `=> {` form), not the
+    /// variant declaration which has no `=>`.
+    fn command_chat_handler_body(src: &str) -> String {
+        // Anchor on the handler arm specifically: the destructure that is
+        // immediately followed (after the closing `}` + `)`) by `=> {`.
+        let arm = "Some(Command::Chat {";
+        let arm_at = src.find(arm).expect("Command::Chat handler present");
+        // Balance from the `{` of the destructure to capture the full arm,
+        // including the `=> { ... }` block that follows.
+        slice_braced_to_arm_end(&src[arm_at..])
+    }
+
+    /// Given a slice beginning at `Some(Command::Chat {`, return the text from
+    /// that point through the end of the arm's `=> { .. }` block.
+    fn slice_braced_to_arm_end(src: &str) -> String {
+        // 1. balance the destructure `{ .. }`.
+        let pat_open = src.find('{').expect("destructure open brace");
+        let bytes = src.as_bytes();
+        let mut depth = 0usize;
+        let mut pat_end = pat_open;
+        for (i, &b) in bytes.iter().enumerate().skip(pat_open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        pat_end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // 2. find the `=> {` block opener after the destructure and balance it.
+        let after = &src[pat_end..];
+        let block_rel = after.find("=> {").expect("arm block opener `=> {`");
+        let block_body = slice_braced_block(after, &after[block_rel..block_rel + 4]);
+        // Return destructure + block body together.
+        format!("{}{}", &src[pat_open..pat_end], block_body)
+    }
+
+    /// Return the brace-balanced block that follows `opener` (which must end in
+    /// `{`), including the contents but excluding the trailing brace's tail.
+    fn slice_braced_block(src: &str, opener: &str) -> String {
+        let start = src.find(opener).unwrap_or_else(|| {
+            panic!("opener not found: {opener}");
+        });
+        let brace_start = start + opener.len() - 1; // index of the `{`
+        let bytes = src.as_bytes();
+        let mut depth = 0usize;
+        let mut end = brace_start;
+        for (i, &b) in bytes.iter().enumerate().skip(brace_start) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        src[brace_start..end].to_string()
+    }
+
+    /// Strip `//` line comments so assertions key on real code, not the prose
+    /// comments that still mention `tui::run` for documentation.
+    fn strip_line_comments(block: &str) -> String {
+        block
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(idx) => &line[..idx],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn dash_run_chat_is_the_bare_and_chat_dispatch_target() {
+        // Symbol exists with the expected signature (bare `rocm` / `rocm chat`
+        // interactive target). Taking the fn pointer fails to compile if the
+        // entrypoint is removed or its signature drifts.
+        let _target: fn(bool) -> Result<()> = dash::run_chat;
+    }
+
+    #[test]
+    fn launch_default_routes_to_dash_run_chat_not_tui() {
+        let src = main_rs_source();
+        let body = strip_line_comments(&launch_default_body(&src));
+        assert!(
+            body.contains("dash::run_chat(false)"),
+            "bare `rocm` interactive branch must route to dash::run_chat; body:\n{body}"
+        );
+        assert!(
+            !body.contains("tui::run"),
+            "launch_default must NOT call tui::run after the reroute; body:\n{body}"
+        );
+    }
+
+    #[test]
+    fn command_chat_interactive_routes_to_dash_run_chat_not_tui() {
+        let src = main_rs_source();
+        let body = strip_line_comments(&command_chat_handler_body(&src));
+        assert!(
+            body.contains("dash::run_chat(chat_mock)"),
+            "interactive `rocm chat` must route to dash::run_chat(chat_mock); body:\n{body}"
+        );
+        assert!(
+            !body.contains("tui::run"),
+            "Command::Chat handler must NOT call tui::run after the reroute; body:\n{body}"
+        );
+    }
+
+    #[test]
+    fn command_chat_honors_chat_mock_and_keeps_prompt_passthrough() {
+        let src = main_rs_source();
+        let body = strip_line_comments(&command_chat_handler_body(&src));
+        // --chat-mock is forwarded into the dash reroute.
+        assert!(
+            body.contains("chat_mock,") || body.contains("chat_mock\n"),
+            "Command::Chat must destructure the --chat-mock field; body:\n{body}"
+        );
+        assert!(
+            body.contains("dash::run_chat(chat_mock)"),
+            "--chat-mock must drive run_chat(chat_mock); body:\n{body}"
+        );
+        // The scriptable prompt passthrough stays on the text render path,
+        // NOT the dash/TUI.
+        assert!(
+            body.contains("render_chat_prompt_text("),
+            "prompt passthrough must still call render_chat_prompt_text; body:\n{body}"
+        );
+        assert!(
+            body.contains("render_chat_text("),
+            "non-interactive no-prompt path must still call render_chat_text; body:\n{body}"
+        );
+    }
+
+    #[test]
+    fn tui_run_is_referenced_only_by_the_retention_anchor() {
+        // tui.rs is RETAINED (not deleted). The ONLY non-comment reference to
+        // `tui::run` in the PRODUCTION part of main.rs (before `mod tests`) must
+        // be the retention anchor; the interactive handlers must not invoke it.
+        // (The test module itself names `tui::run` in assertion strings.)
+        let full = main_rs_source();
+        let prod = full
+            .split("mod tests {")
+            .next()
+            .expect("production source before the tests module");
+        let src = strip_line_comments(prod);
+        let count = src.matches("tui::run").count();
+        assert_eq!(
+            count, 1,
+            "expected exactly one tui::run reference (the retention anchor), found {count}"
+        );
+        assert!(
+            src.contains("_RETAINED_TUI_ENTRY"),
+            "the retention anchor _RETAINED_TUI_ENTRY must keep tui::run reachable"
+        );
+    }
 }
