@@ -202,6 +202,16 @@ pub fn resolved_args(
     }
 }
 
+/// Build the multi-thread tokio runtime the async daemon/TUI run on. Shared by
+/// the synchronous [`run`] and [`run_chat`] entry points (the rest of `rocm` is
+/// synchronous; only the dashboard needs an async reactor).
+fn build_dashboard_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime for the dashboard")
+}
+
 /// Entry point for `rocm dash`. Builds a tokio runtime and runs the dashboard.
 pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
     let paths = AppPaths::discover()?;
@@ -222,10 +232,7 @@ pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
     // Resolve the Anthropic key before the runtime exists; the secure-store
     // fallback blocks on its own zbus runtime and would panic inside `run_async`.
     let anthropic_api_key = anthropic_api_key_for_dash();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("building tokio runtime for the dashboard")?;
+    let rt = build_dashboard_runtime()?;
     rt.block_on(run_async(
         config,
         paths,
@@ -245,10 +252,7 @@ pub fn run_chat(chat_mock: bool) -> Result<()> {
     // Resolve the Anthropic key before the runtime exists; the secure-store
     // fallback blocks on its own zbus runtime and would panic inside `run_async`.
     let anthropic_api_key = anthropic_api_key_for_dash();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("building tokio runtime for the dashboard")?;
+    let rt = build_dashboard_runtime()?;
     rt.block_on(run_async(
         config,
         paths,
