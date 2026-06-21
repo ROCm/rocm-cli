@@ -22203,9 +22203,11 @@ VERSION_ID="41"
     #[test]
     fn dash_run_chat_is_the_bare_and_chat_dispatch_target() {
         // Symbol exists with the expected signature (bare `rocm` / `rocm chat`
-        // interactive target). Taking the fn pointer fails to compile if the
-        // entrypoint is removed or its signature drifts.
-        let _target: fn(bool) -> Result<()> = dash::run_chat;
+        // interactive target). Coercing to the fn pointer fails to compile if
+        // the entrypoint is removed or its signature drifts; casting the pointer
+        // to an address gives the binding a real effect (no underscore-bind).
+        let target: fn(bool) -> Result<()> = dash::run_chat;
+        assert_ne!(target as usize, 0);
     }
 
     #[test]

@@ -217,7 +217,13 @@ pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
         .enable_all()
         .build()
         .context("building tokio runtime for the dashboard")?;
-    rt.block_on(run_async(config, paths, replay, chat_mock, ActiveTab::Overview))
+    rt.block_on(run_async(
+        config,
+        paths,
+        replay,
+        chat_mock,
+        ActiveTab::Overview,
+    ))
 }
 
 /// Entry point for bare `rocm` and interactive `rocm chat`. Opens the unified
