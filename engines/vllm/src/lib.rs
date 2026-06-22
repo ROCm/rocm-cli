@@ -5,8 +5,8 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use rocm_core::{
-    AppPaths, DEFAULT_LOCAL_PORT, format_http_base_url, openai_models_endpoint_has_model,
-    require_nonempty,
+    AppPaths, DEFAULT_LOCAL_PORT, ensure_uv_binary, format_http_base_url,
+    openai_models_endpoint_has_model, require_nonempty, uv_command_env, uv_pip_install_base,
 };
 use rocm_engine_protocol::{
     DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy,
@@ -144,7 +144,6 @@ struct ServiceFiles {
 #[derive(Debug, Clone)]
 struct ManagedRuntimePython {
     runtime_id: String,
-    source: String,
     python_executable: PathBuf,
 }
 
@@ -224,7 +223,7 @@ pub fn run_cli() -> Result<()> {
                 log_path: Some(log_path),
                 engine_recipe: parse_engine_recipe_json(engine_recipe_json)?,
             })?
-        },
+        }
     }
     Ok(())
 }
@@ -370,9 +369,14 @@ fn capabilities() -> EngineCapabilities {
 }
 
 fn install_response(request: InstallRequest) -> Result<InstallResponse> {
-    let runtime = match resolve_vllm_runtime(Some(&request.runtime_id)) {
-        Ok(runtime) if !request.reinstall => runtime,
-        Ok(_) | Err(_) => {
+    let already_installed = if request.reinstall {
+        None
+    } else {
+        resolve_vllm_runtime(Some(&request.runtime_id)).ok()
+    };
+    let runtime = match already_installed {
+        Some(runtime) => runtime,
+        None => {
             let managed = resolve_managed_runtime_python(Some(&request.runtime_id))?.with_context(
                 || {
                     format!(
@@ -548,7 +552,7 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
     let runtime = resolve_vllm_runtime(request.runtime_id.as_deref())?;
     let mut child = spawn_vllm_server(&request, &runtime, request.log_path.as_deref())?;
     write_running_state(&request, &runtime, child.id())?;
-    
+
     // Wait for the server to become ready, with comprehensive error logging
     if let Err(e) = wait_for_vllm_ready(
         &request.host,
@@ -557,11 +561,14 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
         Duration::from_secs(300),
         request.log_path.as_deref(),
     ) {
-        let _ = child.kill();
+        // Terminate the whole vLLM process tree so the EngineCore worker (which
+        // holds the GPU allocation) does not survive and leak device memory.
+        let _ = rocm_core::terminate_process_tree(child.id());
+        let _ = child.wait();
         write_terminal_state(&request.state_path, "failed")?;
         return Err(e);
     }
-    
+
     let status = child.wait().context("failed waiting for vLLM server")?;
     write_terminal_state(
         &request.state_path,
@@ -609,7 +616,15 @@ fn spawn_vllm_server(
         .arg("--port")
         .arg(request.port.to_string())
         .arg("--gpu-memory-utilization")
-        .arg(DEFAULT_GPU_MEMORY_UTILIZATION)
+        .arg(DEFAULT_GPU_MEMORY_UTILIZATION);
+    // vLLM's FULL CUDA-graph replay hangs ROCm gfx94x GPUs on the first decode
+    // (surfaces as `HW Exception ... reason :GPU Hang`, which kills the engine and
+    // drops every inference request). Eager mode disables CUDA graphs and keeps
+    // inference stable. Allow opting back in via env once a runtime ships a fix.
+    if vllm_enforce_eager_enabled() {
+        command.arg("--enforce-eager");
+    }
+    command
         .args(engine_recipe_launch_args(request.engine_recipe.as_ref()))
         .stdin(Stdio::null());
     apply_therock_env(&mut command, runtime)?;
@@ -805,16 +820,17 @@ fn runtime_from_python(
 }
 
 fn install_vllm_with_uv(python: &Path) -> Result<()> {
-    let output = ProcessCommand::new("uv")
-        .arg("pip")
-        .arg("install")
-        .arg("--python")
-        .arg(python)
-        .arg("vllm")
-        .arg("--extra-index-url")
-        .arg(VLLM_ROCM_EXTRA_INDEX_URL)
+    let paths = AppPaths::discover()?;
+    let uv = ensure_uv_binary(&paths).context("failed to acquire uv binary for vLLM install")?;
+    let mut args = uv_pip_install_base(python);
+    args.push("vllm".to_owned());
+    args.push("--extra-index-url".to_owned());
+    args.push(VLLM_ROCM_EXTRA_INDEX_URL.to_owned());
+    let output = ProcessCommand::new(&uv)
+        .args(args)
+        .envs(uv_command_env())
         .output()
-        .context("failed to launch `uv pip install` for vLLM")?;
+        .context("failed to launch uv pip install for vLLM")?;
     if output.status.success() {
         return Ok(());
     }
@@ -853,14 +869,15 @@ fn resolve_managed_runtime(runtime_id: Option<&str>) -> Result<Option<VllmRuntim
     Ok(None)
 }
 
-fn resolve_managed_runtime_python(runtime_id: Option<&str>) -> Result<Option<ManagedRuntimePython>> {
+fn resolve_managed_runtime_python(
+    runtime_id: Option<&str>,
+) -> Result<Option<ManagedRuntimePython>> {
     let mut candidates = collect_managed_runtime_candidates(runtime_id)?;
     let Some(candidate) = candidates.drain(..).next() else {
         return Ok(None);
     };
     Ok(Some(ManagedRuntimePython {
         runtime_id: candidate.runtime_id,
-        source: candidate.source,
         python_executable: candidate.python_executable,
     }))
 }
@@ -876,7 +893,9 @@ struct ManagedRuntimeCandidate {
     sdk_library_paths: Vec<PathBuf>,
 }
 
-fn collect_managed_runtime_candidates(runtime_id: Option<&str>) -> Result<Vec<ManagedRuntimeCandidate>> {
+fn collect_managed_runtime_candidates(
+    runtime_id: Option<&str>,
+) -> Result<Vec<ManagedRuntimeCandidate>> {
     let paths = AppPaths::discover()?;
     let registry = paths.data_dir.join("runtimes").join("registry");
     if !registry.is_dir() {
@@ -1116,6 +1135,22 @@ fn engine_recipe_launch_args(engine_recipe: Option<&EngineRecipeHint>) -> Vec<St
         .unwrap_or_default()
 }
 
+/// Whether to launch vLLM with `--enforce-eager` (CUDA graphs disabled).
+///
+/// Defaults to enabled because FULL CUDA-graph replay hangs ROCm gfx94x GPUs
+/// during decode. Set `ROCM_CLI_VLLM_ENFORCE_EAGER` to `0`/`false`/`no`/`off`
+/// to re-enable CUDA graphs on runtimes where the hang is fixed.
+fn vllm_enforce_eager_enabled() -> bool {
+    std::env::var("ROCM_CLI_VLLM_ENFORCE_EAGER")
+        .ok()
+        .is_none_or(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+}
+
 fn runtime_bin_paths(runtime: &VllmRuntime) -> Vec<PathBuf> {
     let mut entries = Vec::new();
     if let Some(bin) = runtime.sdk_bin.as_ref() {
@@ -1287,7 +1322,7 @@ fn pid_from_state(state: &Value) -> Option<u32> {
 }
 
 fn terminate_pid(pid: u32, _force: bool) -> bool {
-    rocm_core::terminate_process(pid).is_ok()
+    rocm_core::terminate_process_tree(pid).is_ok()
 }
 
 fn value_string(value: &Value, key: &str) -> Option<String> {
@@ -1363,7 +1398,10 @@ fn wait_for_vllm_ready(
             let log_context = if summary.is_empty() {
                 String::new()
             } else {
-                format!("\n\nLast {} lines of startup log:\n{}", STARTUP_FAILURE_LOG_TAIL_LINES, summary)
+                format!(
+                    "\n\nLast {} lines of startup log:\n{}",
+                    STARTUP_FAILURE_LOG_TAIL_LINES, summary
+                )
             };
             bail!(
                 "vLLM server at {}:{} failed to become ready within {} seconds{}",
@@ -1403,7 +1441,8 @@ fn summarize_startup_log_tail(log_path: &Path, limit: usize) -> Result<String> {
 fn tail_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
     let mut file = fs::File::open(path)
         .with_context(|| format!("failed to open log file {}", path.display()))?;
-    let metadata = file.metadata()
+    let metadata = file
+        .metadata()
         .with_context(|| format!("failed to read metadata for {}", path.display()))?;
     let file_size = metadata.len();
 

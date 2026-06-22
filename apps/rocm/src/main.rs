@@ -1779,7 +1779,8 @@ fn install(target: InstallTarget) -> Result<()> {
                     print!("{output}");
                     if let Some(finalized) = finalized {
                         print_sdk_install_success(&finalized);
-                        if let Err(error) = maybe_auto_install_sdk_preferred_engine(&paths, &finalized)
+                        if let Err(error) =
+                            maybe_auto_install_sdk_preferred_engine(&paths, &finalized)
                         {
                             record_cli_audit_event(
                                 &paths,
@@ -3459,13 +3460,19 @@ fn select_serve_engine(
         };
     }
 
-    if let Some(engine) = host_gpu_summary
-        .and_then(preferred_serve_engine_for_host_gpu_summary)
-    {
-        return ServeEngineSelection {
-            engine: engine.to_owned(),
-            source: "detected ROCm GPU family prefers vLLM",
-        };
+    if let Some(engine) = host_gpu_summary.and_then(preferred_serve_engine_for_host_gpu_summary) {
+        // Only honor the GPU preference when the model's recipe can actually run on
+        // that engine. A recipe that exists but does not support the preferred engine
+        // (for example a GGUF model that only Lemonade can serve) must fall through to
+        // its own preferred engine instead of being forced onto an incompatible engine.
+        let recipe_supports_preferred =
+            recipe.is_none_or(|recipe| model_recipe_supports_engine(recipe, engine));
+        if recipe_supports_preferred {
+            return ServeEngineSelection {
+                engine: engine.to_owned(),
+                source: "detected ROCm GPU family prefers vLLM",
+            };
+        }
     }
 
     if let Some(engine) = recipe
@@ -3500,12 +3507,21 @@ fn serve_model_ref_for_engine(
     recipe: Option<&ModelRecipeRecord>,
     selected_engine: &str,
 ) -> String {
-    recipe
-        .filter(|recipe| model_recipe_supports_engine(recipe, selected_engine))
-        .map_or_else(
-            || model.to_owned(),
-            |recipe| recipe.canonical_model_id.clone(),
-        )
+    let Some(recipe) =
+        recipe.filter(|recipe| model_recipe_supports_engine(recipe, selected_engine))
+    else {
+        return model.to_owned();
+    };
+    if let Some(override_id) = recipe
+        .engine_recipes
+        .iter()
+        .find(|engine_recipe| engine_recipe.engine.eq_ignore_ascii_case(selected_engine))
+        .and_then(|engine_recipe| engine_recipe.model_id_override.as_deref())
+        .filter(|value| !value.trim().is_empty())
+    {
+        return override_id.to_owned();
+    }
+    recipe.canonical_model_id.clone()
 }
 
 fn serve_engine_selection_line(selection: &ServeEngineSelection) -> String {
@@ -3740,7 +3756,6 @@ fn attach_background_stdio(command: &mut ProcessCommand, log_path: Option<&Path>
     }
     Ok(())
 }
-
 
 fn managed_engine_startup_failure_detail(status: ExitStatus, log_path: &Path) -> String {
     let mut recent_lines = read_optional_tail_lines(log_path, 80, "service log");
@@ -4948,8 +4963,7 @@ fn maybe_auto_install_sdk_preferred_engine(
     println!("  runtime_id: {}", finalized.runtime_key);
 
     let mut config = RocmCliConfig::load(paths)?;
-    let env_root =
-        env_root_for_engine_install(paths, &config, engine, &finalized.runtime_key)?;
+    let env_root = env_root_for_engine_install(paths, &config, engine, &finalized.runtime_key)?;
     let response = engine_request_with_env_root::<_, InstallResponse>(
         Some(paths),
         engine,
@@ -11121,7 +11135,8 @@ fn render_service_logs_text_with_options(
     show_file_locations: bool,
 ) -> Result<String> {
     let record = load_managed_service(paths, service_id)?;
-    let recent_lines = read_tail_lines(&record.log_path, DEFAULT_LOG_TAIL_LINES, "service log")?;
+    let recent_lines =
+        read_optional_tail_lines(&record.log_path, DEFAULT_LOG_TAIL_LINES, "service log");
 
     let mut output = String::new();
     let _ = writeln!(output, "Service Log");
@@ -11453,7 +11468,7 @@ fn restart_internal_managed_service(
 }
 
 fn signal_process_tree(pid: u32) -> Result<()> {
-    rocm_core::terminate_process(pid)?;
+    rocm_core::terminate_process_tree(pid)?;
     thread::sleep(Duration::from_millis(300));
     Ok(())
 }
@@ -12156,12 +12171,15 @@ pub(crate) fn render_sidebar_text(
     config: &RocmCliConfig,
     provider: &str,
     setup_ready: bool,
+    host_gpu_summary: Option<&rocm_core::HostGpuSummary>,
 ) -> String {
     let records = load_managed_services(paths).unwrap_or_default();
     let server_counts = managed_service_sidebar_counts(&records);
     let default_engine = config
         .default_engine
         .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| host_gpu_summary.and_then(preferred_serve_engine_for_host_gpu_summary))
         .unwrap_or(default_engine_for_platform());
     let mut output = String::new();
     let _ = writeln!(output, "ROCm CLI");
@@ -18596,7 +18614,28 @@ install therock";
 
     #[test]
     fn serve_engine_selection_prefers_vllm_for_supported_gpus() {
-        let recipe = resolve_builtin_model_recipe("qwen").expect("qwen recipe");
+        let summary = rocm_core::HostGpuSummary {
+            therock_family: Some("gfx90a".to_owned()),
+            ..rocm_core::HostGpuSummary::default()
+        };
+
+        let selection = select_serve_engine(None, None, None, Some(&summary));
+
+        assert_eq!(
+            selection,
+            ServeEngineSelection {
+                engine: "vllm".to_owned(),
+                source: "detected ROCm GPU family prefers vLLM",
+            }
+        );
+    }
+
+    #[test]
+    fn serve_engine_selection_keeps_recipe_engine_when_gpu_preference_is_incompatible() {
+        // qwen-smoke is a tiny GGUF model that only Lemonade can serve and has no vLLM
+        // recipe. Even on a vLLM-preferred GPU it must stay on Lemonade rather than being
+        // forced onto vLLM (which cannot load the GGUF and fails to locate the model).
+        let recipe = resolve_builtin_model_recipe("qwen-smoke").expect("qwen-smoke recipe");
         let summary = rocm_core::HostGpuSummary {
             therock_family: Some("gfx90a".to_owned()),
             ..rocm_core::HostGpuSummary::default()
@@ -18607,9 +18646,38 @@ install therock";
         assert_eq!(
             selection,
             ServeEngineSelection {
+                engine: "lemonade".to_owned(),
+                source: "recipe preferred engine; pass --engine <engine> to override; no automatic fallback",
+            }
+        );
+    }
+
+    #[test]
+    fn serve_qwen_uses_vllm_with_hf_repo_on_vllm_preferred_gpu() {
+        // The qwen alias serves the GGUF via Lemonade by default, but on a vLLM-preferred
+        // GPU it must serve the non-GGUF Hugging Face repo through vLLM.
+        let recipe = resolve_builtin_model_recipe("qwen").expect("qwen recipe");
+        let summary = rocm_core::HostGpuSummary {
+            therock_family: Some("gfx94X-dcgpu".to_owned()),
+            ..rocm_core::HostGpuSummary::default()
+        };
+
+        let selection = select_serve_engine(None, None, Some(&recipe), Some(&summary));
+        assert_eq!(
+            selection,
+            ServeEngineSelection {
                 engine: "vllm".to_owned(),
                 source: "detected ROCm GPU family prefers vLLM",
             }
+        );
+        assert_eq!(
+            serve_model_ref_for_engine("qwen", Some(&recipe), "vllm"),
+            "Qwen/Qwen3-4B-Instruct-2507"
+        );
+        // Lemonade keeps the GGUF canonical id.
+        assert_eq!(
+            serve_model_ref_for_engine("qwen", Some(&recipe), "lemonade"),
+            "Qwen3-4B-Instruct-2507-GGUF"
         );
     }
 
@@ -18682,6 +18750,7 @@ install therock";
                     },
                 ],
                 notes: vec!["adapter hint".to_owned()],
+                model_id_override: None,
             },
             rocm_core::ModelRecipeEngineRecord {
                 engine: "sglang".to_owned(),
@@ -18690,6 +18759,7 @@ install therock";
                 preferred_endpoint: None,
                 unsupported_combinations: Vec::new(),
                 notes: Vec::new(),
+                model_id_override: None,
             },
         ];
 
@@ -20433,7 +20503,7 @@ VERSION_ID="41"
             record.write()?;
         }
 
-        let rendered = render_sidebar_text(&paths, &RocmCliConfig::default(), "local", true);
+        let rendered = render_sidebar_text(&paths, &RocmCliConfig::default(), "local", true, None);
         let _ = fs::remove_dir_all(root);
 
         assert!(rendered.contains("Local servers: none ready"));
@@ -20723,6 +20793,7 @@ VERSION_ID="41"
                 reason: "vLLM ROCm serving is Linux/WSL only".to_owned(),
             }],
             notes: vec!["metadata only; not applied to launches yet".to_owned()],
+            model_id_override: None,
         }];
         let mut output = String::new();
 

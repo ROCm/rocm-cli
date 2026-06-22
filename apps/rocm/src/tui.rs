@@ -3777,11 +3777,9 @@ impl App {
         match load_model_recipe_registry() {
             Ok(registry) => {
                 let recipes = tui_recommended_assistant_recipes(registry.recipes);
-                let engine_index = serve_wizard_preferred_engine_index(
-                    &self.host_gpu_summary,
-                    &recipes,
-                )
-                .unwrap_or(default_engine_index);
+                let engine_index =
+                    serve_wizard_preferred_engine_index(&self.host_gpu_summary, &recipes)
+                        .unwrap_or(default_engine_index);
                 let message = recipes.is_empty().then(|| {
                     format!(
                         "The recommended assistant model was not found.\n\nExpected: {VALIDATED_LOCAL_ASSISTANT_MODEL}\n\nNo unverified model will be used automatically."
@@ -6184,8 +6182,9 @@ impl App {
         });
         if let Some(state) = self.services_manager.as_mut() {
             state.message = Some(match selected_status.as_str() {
-                "failed" | "unreachable" | "exited" => failure_message
-                    .unwrap_or_else(|| "Local assistant did not start.".to_owned()),
+                "failed" | "unreachable" | "exited" => {
+                    failure_message.unwrap_or_else(|| "Local assistant did not start.".to_owned())
+                }
                 _ => selected_record.as_ref().map_or_else(
                     || "Local assistant is starting.".to_owned(),
                     |record| format!("Starting at {}.", record.endpoint_url),
@@ -6912,6 +6911,7 @@ impl App {
             &self.config,
             &self.provider,
             setup_runtime_ready_for_sidebar(&self.paths, &self.config),
+            Some(&self.host_gpu_summary),
         );
         let gpu_text = if self.config.telemetry.local_inspection_enabled() {
             self.gpu_telemetry.sidebar_text()
@@ -27211,8 +27211,8 @@ fn plain_command_failure_lines(rendered: &str, recent_output: Option<&str>) -> V
                 && !line.eq_ignore_ascii_case("live output")
         })
         .map(display_stream_log_line)
-            .filter(|line| !line.trim().is_empty())
-            .collect()
+        .filter(|line| !line.trim().is_empty())
+        .collect()
 }
 
 fn terse_screen_command_success_text(
