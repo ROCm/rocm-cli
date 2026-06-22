@@ -1,6 +1,7 @@
 //! Owner task: drives collectors on tick cadences and broadcasts Snapshots.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -58,6 +59,11 @@ pub struct RunnerOptions {
     /// served via `rocm serve` appears in the dashboard with live `gen_tps`
     /// without Docker discovery. Off by default.
     pub services_dir: Option<PathBuf>,
+    /// Path or command name for the `amd-smi` binary. The managed ROCm SDK
+    /// ships it inside the runtime wheel's bin directory rather than on `PATH`,
+    /// so the caller resolves it (via `rocm_core::resolve_amd_smi_binary`) and
+    /// passes it here. `None` falls back to looking up `amd-smi` on `PATH`.
+    pub amd_smi_binary: Option<OsString>,
 }
 
 impl Default for RunnerOptions {
@@ -76,6 +82,7 @@ impl Default for RunnerOptions {
             lemonade_port: rocm_dash_collectors::lemonade::LEMONADE_PORT,
             persist_dir: None,
             services_dir: None,
+            amd_smi_binary: None,
         }
     }
 }
@@ -166,7 +173,10 @@ pub async fn run_loop(
     // stable between scrapes (mirrors how GPU power drives tokens_per_watt).
     let mut per_container_used: HashMap<String, u64> = HashMap::new();
 
-    let gpu = AmdSmiCollector::detect().await;
+    let gpu = match opts.amd_smi_binary.clone() {
+        Some(binary) => AmdSmiCollector::detect_with_binary(binary).await,
+        None => AmdSmiCollector::detect().await,
+    };
     let mut gpu_system_info: Option<GpuSystemInfo> = if let Some(g) = &gpu {
         let info = g.system_info().await;
         info!(

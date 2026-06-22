@@ -39,8 +39,8 @@ use rocm_core::{
     daemon_binary_path, default_engine_for_platform, detect_host_gpu_summary,
     find_automation_proposal, format_host_for_url, format_host_port, format_http_base_url,
     load_model_recipe_registry, load_recent_automation_proposals, managed_pip_cache_dir,
-    managed_service_endpoint_model_ready, replace_automation_proposal, runtime_directory_label,
-    runtime_drive_root_for_key, runtime_drive_roots, runtime_is_windows,
+    managed_service_endpoint_model_ready, replace_automation_proposal, resolve_amd_smi_binary,
+    runtime_directory_label, runtime_drive_root_for_key, runtime_drive_roots, runtime_is_windows,
     runtime_path_is_same_or_inside, runtime_path_sort_key, sanitize_component, unix_time_millis,
     update_automation_proposal_status,
 };
@@ -27792,7 +27792,8 @@ fn load_gpu_monitor_cards_from_json(output: &str) -> Result<BTreeMap<u32, GpuMon
 }
 
 fn run_amd_smi_json(args: &[&str]) -> Result<String> {
-    let mut child = ProcessCommand::new("amd-smi")
+    let amd_smi_binary = resolve_amd_smi_binary();
+    let mut child = ProcessCommand::new(&amd_smi_binary)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
