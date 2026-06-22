@@ -32,7 +32,7 @@ The smoke path is the cross-platform local no-fallback acceptance surface. It
 uses an isolated config/data/cache root, does not install TheRock wheels, does
 not require a managed runtime, and verifies:
 
-- first-run doctor and engine inventory state
+- first-run examine and engine inventory state
 - telemetry-off config behavior
 - GPU-required recipe planning for `tiny-gpt2`
 - exact-runtime rejection for `rocm engines install` before any runtime exists
@@ -64,19 +64,19 @@ cargo test --workspace
 ```
 
 On WSL/Linux, build and run the native Linux binary directly (no APE launcher
-prefix is required). The doctor output on WSL must include `os: linux` and
+prefix is required). The examine output on WSL must include `os: linux` and
 `wsl: true`, and must not include `os: windows`.
 
 Use isolated `ROCM_CLI_CONFIG_DIR`, `ROCM_CLI_DATA_DIR`, and
 `ROCM_CLI_CACHE_DIR` roots for smoke tests, then delete those roots after the
 test so the user's real `.rocm` state stays clean.
 
-Focused doctor guidance coverage:
+Focused examine guidance coverage:
 
 ```bash
-cargo test -p rocm-core doctor_render
+cargo test -p rocm-core examine_render
 cargo test -p rocm-core managed_sdk_probe
-cargo test -p rocm --bin rocm doctor_runtime_state_reports_ambiguous_default_runtime_id
+cargo test -p rocm --bin rocm examine_runtime_state_reports_ambiguous_default_runtime_id
 cargo test -p rocm --bin rocm engine_runtime_selection_rejects_ambiguous_default_runtime_id
 cargo test -p rocm --bin rocm first_run_shows_dedicated_setup_screen_when_rocm_is_not_installed
 cargo test -p rocm --bin rocm onboarding_enter_requests_rocm_install_with_folder_prefix
@@ -96,10 +96,10 @@ cargo test -p rocm tui::tests::slash_first_views_hide_backend_jargon -- --nocapt
 cargo test -p rocm tui::tests::install_sdk_bad_format_uses_friendly_labels_without_backend_jargon -- --nocapture
 cargo test -p rocm tui::tests::onboarding_ctrl_c_during_install_confirms_before_cancelling -- --nocapture
 cargo test -p rocm tui::tests::automations_review_actions_without_review_show_body_guidance -- --nocapture
-cargo test -p rocm tui::tests::doctor_background_completion_updates_report_without_transcript -- --nocapture
-cargo test -p rocm tui::tests::hidden_doctor_refresh_does_not_block_next_prompt_commands -- --nocapture
-cargo test -p rocm tui::tests::doctor_command_does_not_steal_running_workflow_screens -- --nocapture
-cargo test -p rocm tui::tests::doctor_command_does_not_hide_pending_approval -- --nocapture
+cargo test -p rocm tui::tests::examine_background_completion_updates_report_without_transcript -- --nocapture
+cargo test -p rocm tui::tests::hidden_examine_refresh_does_not_block_next_prompt_commands -- --nocapture
+cargo test -p rocm tui::tests::examine_command_does_not_steal_running_workflow_screens -- --nocapture
+cargo test -p rocm tui::tests::examine_command_does_not_hide_pending_approval -- --nocapture
 cargo test -p rocm tui::tests::daemon_status_uses_background_helper_language -- --nocapture
 cargo test -p rocm tui::tests::automations_bad_watcher_and_mode_stay_screen_local -- --nocapture
 cargo test -p rocm tui::tests::services_manager_stop_requests_rocmd_approval_without_transcript -- --nocapture
@@ -119,17 +119,17 @@ cargo test -p rocm tui::tests::tui_help_teaches_engine_not_engines -- --nocaptur
 ```
 
 Self-hosted GPU CI smoke is intentionally non-mutating. The MI300X job builds
-the workspace, runs `rocm doctor`, then runs `detect` and `capabilities` for
+the workspace, runs `rocm examine`, then runs `detect` and `capabilities` for
 all first-party engine adapters: PyTorch, llama.cpp, ATOM, vLLM, and SGLang.
 Live serving acceptance remains separate because it needs engine-specific
 runtime installs, model artifacts, and supported upstream GPU targets.
 
-WSL live doctor sanity after building with a Linux target directory:
+WSL live examine sanity after building with a Linux target directory:
 
 ```bash
 export CARGO_TARGET_DIR=/home/jam/.cache/rocm-cli-target
 cargo build --workspace
-rocm doctor
+rocm examine
 ```
 
 Expected WSL fields when a managed TheRock runtime is registered and ROCDXG is
@@ -562,7 +562,7 @@ Restricted sandbox tool API tests:
 
 ```bash
 cargo test -p rocmd sandbox_tool_cli_values_cover_restricted_plan_api
-cargo test -p rocmd sandbox_tool_doctor_snapshot_is_read_only
+cargo test -p rocmd sandbox_tool_examine_snapshot_is_read_only
 cargo test -p rocmd sandbox_tool_list_servers_returns_records
 cargo test -p rocmd sandbox_tool_list_servers_first_run_returns_empty_list
 cargo test -p rocmd sandbox_tool_requires_service_id_for_restart
@@ -576,7 +576,7 @@ cargo test -p rocm --bin rocm proposal_sandbox_args_support_update_check
 ```
 
 These cover the plan-listed restricted internal tool API: `check_updates`,
-`doctor_snapshot`, `list_servers`, `restart_server`, `stop_server`,
+`examine_snapshot`, `list_servers`, `restart_server`, `stop_server`,
 `prefetch_artifact`, and `notify_user`, plus the plan-derived `driver_plan`
 read-only extension. Read-only tools must report `mutating: false`;
 `notify_user` must record a local notification audit event; server restart/stop
@@ -587,7 +587,7 @@ a sandbox audit event.
 Manual restricted-tool smoke:
 
 ```bash
-rocmd sandbox-run doctor_snapshot --allow-native-fallback
+rocmd sandbox-run examine_snapshot --allow-native-fallback
 rocmd sandbox-run list_servers --allow-native-fallback
 rocmd sandbox-run notify_user --message "ROCm check complete" --allow-native-fallback
 ```
@@ -601,11 +601,11 @@ Direct MCP helper safety smoke:
 ```bash
 cargo test -p rocmd direct_mcp_call -- --nocapture
 cargo test -p rocmd rocm_mcp_tools -- --nocapture
-rocmd mcp-call doctor --arguments-json '{}'
+rocmd mcp-call examine --arguments-json '{}'
 rocmd mcp-call install_sdk --arguments-json '{}'
 ```
 
-The read-only `doctor` helper call should run. The `install_sdk` helper call
+The read-only `examine` helper call should run. The `install_sdk` helper call
 must fail unless `--allow-mutation` is supplied after an explicit user
 approval. User-facing TUI/chat flows should still route mutating tool calls
 through their normal approval cards rather than relying on this hidden helper
@@ -880,7 +880,7 @@ By default, the Windows script keeps temporary state under
 under `.rocm-work/acceptance-linux`. Both roots are cleaned up unless the script
 fails or `ROCM_CLI_KEEP_ACCEPTANCE_ROOT=1` is set for debugging. Installed
 binary smoke checks set isolated config/data/cache directories inside those
-roots and fail if `rocm doctor` reads the real user `.rocm` state.
+roots and fail if `rocm examine` reads the real user `.rocm` state.
 
 For historical platform-bundle acceptance, the Linux bundle still verifies the
 vendored `rocm-codex` binary. The native rocm-cli binary does not include a

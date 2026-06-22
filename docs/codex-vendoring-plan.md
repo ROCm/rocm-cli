@@ -186,7 +186,7 @@ The key shift is from command-oriented local CLI behavior to a session/tool/even
 
 The backend tool surface should include:
 
-- `doctor`
+- `examine`
 - `gpu_snapshot`
 - `list_gpus`
 - `list_runtimes`
@@ -299,7 +299,7 @@ The vendored TUI should be re-skinned and re-contextualized rather than rewritte
 
 ### Required slash commands
 
-- `/doctor`
+- `/examine`
 - `/gpu`
 - `/runtimes`
 - `/install`
@@ -330,7 +330,7 @@ Codex approval flows should be repurposed directly for ROCm operations.
 
 ### No approval required
 
-- `doctor`
+- `examine`
 - GPU telemetry
 - dry-run planning
 - runtime listing
@@ -404,7 +404,7 @@ Deliverables:
 
 Deliverables:
 
-- transcript can render `doctor`
+- transcript can render `examine`
 - transcript can render GPU snapshot
 - transcript can render config and engine inventory
 
@@ -508,7 +508,7 @@ Build this sequence first:
 2. compile vendored TUI in `rocm-cli` CI
 3. wrap launch from `rocm --experimental-codex-tui`
 4. implement backend bridge for:
-   - `doctor`
+   - `examine`
    - `gpu_snapshot`
    - `config_get`
    - `list_engines`

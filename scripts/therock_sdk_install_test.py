@@ -456,10 +456,10 @@ def main() -> int:
     bootstrap_python = ensure_bootstrap_python(test_root, args.python)
     env = isolated_env(test_root, bootstrap_python, args.family)
 
-    doctor = run(
-        "rocm doctor before SDK install", [str(rocm), "doctor"], env=env, timeout=120
+    examine = run(
+        "rocm examine before SDK install", [str(rocm), "examine"], env=env, timeout=120
     )
-    assert_contains(doctor, "rocm doctor", "doctor")
+    assert_contains(examine, "rocm examine", "examine")
 
     install_argv = [
         str(rocm),

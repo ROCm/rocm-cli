@@ -1,6 +1,6 @@
-//! Doctor overlay (Phase 3 Wave 2).
+//! Examine overlay (Phase 3 Wave 2).
 //!
-//! Runs `rocm doctor` — a read-only environment check — through the job-bridge
+//! Runs `rocm examine` — a read-only environment check — through the job-bridge
 //! and shows its streamed output in the shared job console. Read-only, so it
 //! needs no approval gate (the gate is for mutating actions only). This is the
 //! read-only-report archetype every diagnostic screen reuses.
@@ -21,25 +21,25 @@ use crate::ui::theme::Theme;
 
 /// Overlay state. `None` on `AppState` means the overlay is closed.
 #[derive(Debug, Clone, Default)]
-pub struct DoctorManagerState {
-    /// In-flight (or just-finished) `rocm doctor` job id.
+pub struct ExamineManagerState {
+    /// In-flight (or just-finished) `rocm examine` job id.
     pub active_job: Option<String>,
 }
 
 /// Handle a key while the overlay is open. Mirrors the operational-screen seam.
 pub fn on_key(
-    doctor: &mut Option<DoctorManagerState>,
+    examine: &mut Option<ExamineManagerState>,
     jobs: &mut State,
     key: KeyEvent,
 ) -> Vec<SideEffect> {
-    let Some(d) = doctor.as_mut() else {
+    let Some(d) = examine.as_mut() else {
         return Vec::new();
     };
 
     if let Some(job_id) = d.active_job.clone() {
         match on_console_key(&job_id, jobs, key) {
             ConsoleOutcome::Cancelled(fx) => return fx,
-            ConsoleOutcome::Closed => *doctor = None,
+            ConsoleOutcome::Closed => *examine = None,
             ConsoleOutcome::Dismissed => d.active_job = None,
             ConsoleOutcome::Unhandled => {
                 // `r` re-runs after a terminal result.
@@ -49,7 +49,7 @@ pub fn on_key(
                         .is_none_or(rocm_dash_core::state::JobState::is_terminal)
                 {
                     d.active_job = None;
-                    return run_doctor(d, jobs);
+                    return run_examine(d, jobs);
                 }
             }
         }
@@ -57,23 +57,23 @@ pub fn on_key(
     }
 
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => *doctor = None,
-        KeyCode::Enter | KeyCode::Char('r') => return run_doctor(d, jobs),
+        KeyCode::Esc | KeyCode::Char('q') => *examine = None,
+        KeyCode::Enter | KeyCode::Char('r') => return run_examine(d, jobs),
         _ => {}
     }
     Vec::new()
 }
 
-/// Spawn `rocm doctor` (read-only). A stable id replaces any prior console.
-fn run_doctor(d: &mut DoctorManagerState, jobs: &mut State) -> Vec<SideEffect> {
+/// Spawn `rocm examine` (read-only). A stable id replaces any prior console.
+fn run_examine(d: &mut ExamineManagerState, jobs: &mut State) -> Vec<SideEffect> {
     let cmd = resolve_exe();
-    let id = "doctor".to_string();
+    let id = "examine".to_string();
     let fx = jobs.apply(StateEvent::StartJob {
         id: id.clone(),
         cmd,
-        args: vec!["doctor".to_string()],
+        args: vec!["examine".to_string()],
     });
-    // Doctor uses a single stable id, so a no-op (a prior run still going)
+    // Examine uses a single stable id, so a no-op (a prior run still going)
     // means re-attach to that same console — intentional, unlike the
     // distinct-id screens (serve/engine/update) where a no-op surfaces an
     // "already running" message instead. Either way `active_job` points at the
@@ -83,10 +83,10 @@ fn run_doctor(d: &mut DoctorManagerState, jobs: &mut State) -> Vec<SideEffect> {
 }
 
 /// Render the overlay (intro card, or the job console once running).
-pub fn draw_doctor_manager(
+pub fn draw_examine_manager(
     f: &mut Frame,
     area: Rect,
-    d: &DoctorManagerState,
+    d: &ExamineManagerState,
     jobs: &State,
     theme: &Theme,
 ) {
@@ -98,7 +98,7 @@ pub fn draw_doctor_manager(
     }
 
     let popup = centered_rect(70, 50, 90, 14, area);
-    let inner = draw_popup_frame(f, popup, "Doctor — environment check", theme);
+    let inner = draw_popup_frame(f, popup, "Examine — environment check", theme);
     if inner.height == 0 {
         return;
     }
@@ -121,7 +121,7 @@ pub fn draw_doctor_manager(
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "  [ Enter: run `rocm doctor` ]  ",
+                "  [ Enter: run `rocm examine` ]  ",
                 Style::default()
                     .bg(theme.accent)
                     .fg(theme.bg)
@@ -150,18 +150,18 @@ mod tests {
     }
 
     #[test]
-    fn enter_runs_doctor_read_only_no_approval() {
-        let mut d = Some(DoctorManagerState::default());
+    fn enter_runs_examine_read_only_no_approval() {
+        let mut d = Some(ExamineManagerState::default());
         let mut jobs = State::default();
         let fx = on_key(&mut d, &mut jobs, key(KeyCode::Enter));
         assert_eq!(fx.len(), 1, "spawns one job, no approval step");
         assert!(matches!(fx[0], SideEffect::SpawnJob { .. }));
-        assert_eq!(d.as_ref().unwrap().active_job.as_deref(), Some("doctor"));
+        assert_eq!(d.as_ref().unwrap().active_job.as_deref(), Some("examine"));
     }
 
     #[test]
     fn esc_closes_when_idle() {
-        let mut d = Some(DoctorManagerState::default());
+        let mut d = Some(ExamineManagerState::default());
         let mut jobs = State::default();
         on_key(&mut d, &mut jobs, key(KeyCode::Esc));
         assert!(d.is_none());
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn q_escapes_overlay_while_job_runs() {
-        let mut d = Some(DoctorManagerState::default());
+        let mut d = Some(ExamineManagerState::default());
         let mut jobs = State::default();
         on_key(&mut d, &mut jobs, key(KeyCode::Enter));
         on_key(&mut d, &mut jobs, key(KeyCode::Char('q')));
@@ -178,32 +178,32 @@ mod tests {
 
     #[test]
     fn r_reruns_after_a_terminal_result() {
-        let mut d = Some(DoctorManagerState::default());
+        let mut d = Some(ExamineManagerState::default());
         let mut jobs = State::default();
         on_key(&mut d, &mut jobs, key(KeyCode::Enter)); // first run
         jobs.apply(StateEvent::JobDone {
-            id: "doctor".into(),
+            id: "examine".into(),
             code: 0,
         });
         // `r` on a terminal job re-runs (spawns again).
         let fx = on_key(&mut d, &mut jobs, key(KeyCode::Char('r')));
         assert_eq!(fx.len(), 1, "r re-runs after a terminal result");
         assert!(matches!(fx[0], SideEffect::SpawnJob { .. }));
-        assert_eq!(d.as_ref().unwrap().active_job.as_deref(), Some("doctor"));
+        assert_eq!(d.as_ref().unwrap().active_job.as_deref(), Some("examine"));
     }
 
     #[test]
-    fn r_at_idle_runs_doctor() {
-        let mut d = Some(DoctorManagerState::default());
+    fn r_at_idle_runs_examine() {
+        let mut d = Some(ExamineManagerState::default());
         let mut jobs = State::default();
         let fx = on_key(&mut d, &mut jobs, key(KeyCode::Char('r')));
         assert_eq!(fx.len(), 1);
-        assert_eq!(d.as_ref().unwrap().active_job.as_deref(), Some("doctor"));
+        assert_eq!(d.as_ref().unwrap().active_job.as_deref(), Some("examine"));
     }
 
     #[test]
     fn esc_dismisses_console_only_when_terminal() {
-        let mut d = Some(DoctorManagerState::default());
+        let mut d = Some(ExamineManagerState::default());
         let mut jobs = State::default();
         on_key(&mut d, &mut jobs, key(KeyCode::Enter));
         // Running: Esc does not dismiss.
@@ -211,7 +211,7 @@ mod tests {
         assert!(d.as_ref().unwrap().active_job.is_some());
         // Terminal: Esc returns to the intro card.
         jobs.apply(StateEvent::JobDone {
-            id: "doctor".into(),
+            id: "examine".into(),
             code: 0,
         });
         on_key(&mut d, &mut jobs, key(KeyCode::Esc));
@@ -226,9 +226,9 @@ mod tests {
         let theme = Theme::from_name("default-dark");
         let backend = TestBackend::new(100, 20);
         let mut term = Terminal::new(backend).unwrap();
-        let d = DoctorManagerState::default();
+        let d = ExamineManagerState::default();
         let jobs = State::default();
-        term.draw(|f| draw_doctor_manager(f, f.area(), &d, &jobs, &theme))
+        term.draw(|f| draw_examine_manager(f, f.area(), &d, &jobs, &theme))
             .unwrap();
         let out: String = term
             .backend()
@@ -237,7 +237,7 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect();
-        assert!(out.contains("Doctor"));
-        assert!(out.contains("rocm doctor"));
+        assert!(out.contains("Examine"));
+        assert!(out.contains("rocm examine"));
     }
 }

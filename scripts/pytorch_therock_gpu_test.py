@@ -206,7 +206,7 @@ def assert_rocm_gpu_detected(detect: dict[str, Any]) -> None:
     if not rocm_gpu or not rocm_gpu.get("available"):
         raise RuntimeError(
             "PyTorch could not see an AMD GPU. No CPU fallback is allowed.\n"
-            "Run `rocm doctor`, fix AMD driver/GPU detection there, then retry this test.\n"
+            "Run `rocm examine`, fix AMD driver/GPU detection there, then retry this test.\n"
             + json.dumps(detect, indent=2)
         )
 

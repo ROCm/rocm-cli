@@ -23,7 +23,7 @@ path is unavailable.
 
 | Phase | Status | What Exists | Main Remaining Plan-Derived Gaps |
 |---|---:|---|---|
-| Phase 0: Product Skeleton | Partial | Rust workspace, app/crate layout, config/state dirs, deterministic first-time setup/bootstrap, bootstrap installers that verify signatures/checksums, seed a minimal config without overwriting user settings, require no preinstalled ROCm/Python/Rust/Cargo, and set PATH automatically for future terminals plus the current directly-invoked Windows PowerShell process, expanded bounded-latency `rocm doctor` host/driver/runtime/cache report, fast setup/Doctor GPU detection through native Windows registry/system APIs, native Linux KFD/sysfs/IP discovery, and one-shot WSL host display probing when needed, WSL managed-TheRock SDK gfx detection when sysfs/PATH tools are unavailable, active runtime state with explicit ambiguous-runtime reporting, adapter/plugin inventory, registered runtime inventory, CLI lifecycle audit records plus text lifecycle logs for update/install/runtime/engine/service actions, quiet bounded startup update check, optional signed metadata cache verification, and native per-OS rocm-cli binaries that run directly on Windows and Linux/WSL with first-party engines and the `rocmd` helper surface linked into `rocm` | Production signed metadata publication and native-Linux server/bare-metal (Instinct) validation |
+| Phase 0: Product Skeleton | Partial | Rust workspace, app/crate layout, config/state dirs, deterministic first-time setup/bootstrap, bootstrap installers that verify signatures/checksums, seed a minimal config without overwriting user settings, require no preinstalled ROCm/Python/Rust/Cargo, and set PATH automatically for future terminals plus the current directly-invoked Windows PowerShell process, expanded bounded-latency `rocm examine` host/driver/runtime/cache report, fast setup/Examine GPU detection through native Windows registry/system APIs, native Linux KFD/sysfs/IP discovery, and one-shot WSL host display probing when needed, WSL managed-TheRock SDK gfx detection when sysfs/PATH tools are unavailable, active runtime state with explicit ambiguous-runtime reporting, adapter/plugin inventory, registered runtime inventory, CLI lifecycle audit records plus text lifecycle logs for update/install/runtime/engine/service actions, quiet bounded startup update check, optional signed metadata cache verification, and native per-OS rocm-cli binaries that run directly on Windows and Linux/WSL with first-party engines and the `rocmd` helper surface linked into `rocm` | Production signed metadata publication and native-Linux server/bare-metal (Instinct) validation |
 | Phase 1: Runtime Management | Partial | TheRock release/nightly resolution, pip venv installs using a single TheRock-index pinned `rocm[libraries,devel]` plus `torch`/`torchvision`/`torchaudio` transaction selected by exact ROCm wheel suffix for the current Python/platform, Windows pip-only enforcement, tarball flow on non-Windows, localized pip cache, cached TheRock index metadata with ETag, optional detached metadata signature verification, quiet freshness-gated startup update check, explicit runtime update apply/dry-run flow, versioned side-by-side runtime keys, active runtime activation marker, previous-runtime validation, read-only import/adopt, legacy ROCm migration guidance, explicit `rocm update` report with CLI/engine/recipe surface inventory | Production metadata public key and signed sidecar publication |
 | Phase 2: TUI Foundation | Implemented | Ratatui shell, typed transcript/status/prompt/sidebar, first-view `/home` dashboard with arrow-key status/action cards, internal activity buffer seeded from persisted lifecycle logs, first-time setup flow with visible arrow-key/folder-change guidance, sidebar mode state (`ask`, `act`, `serve`, `logs`, `automations`), vertical slash completion with cycling/scrolling, plain command-shaped prompt inputs route to navigable command screens before natural-language planning, `/engine` singular surface, `/runtimes` ROCm install picker with list/activate/uninstall/import/adopt and legacy typed rollback guidance back to explicit install selection, `/update --apply` approval/preview flow, streamed command output, overlapping running-progress cards for contained CLI/proposal/service work, idle Ctrl-C quit confirmation, unknown slash-command help cards, overlapping approval cards with Enter/Y approval plus edit/cancel flow for mutating commands and queued review requests, `/reviews` review-request alias with hidden legacy `/proposals` compatibility, provider-key entry/clear screens with safe default cancel, `/logs` action-log listing, lifecycle tail, hidden-by-default file locations, detail scrolling, bounded query search, stateful arrow-key/Left-Right/PageUp/PageDown pagination, and `/logs follow [query]` live refreshed log following over recent lifecycle/action logs | None known within V1 plan constraints |
 | Phase 3: Engine Plugin MVP | Implemented | Protocol types, PyTorch engine binary, `llama.cpp` adapter binary, Lemonade adapter for strict ROCm serving, `vllm` external-runtime adapter for Linux/WSL ROCm GPU serving, `detect/install/capabilities/resolve_model/launch/endpoint/healthcheck/stop/logs`, first-party stdio protocol routing coverage, foreground/managed launch, plugin-directory discovery helper, external plugin directory policy surfaced in CLI/TUI/docs, non-TUI `rocm services` list/logs/stop/restart parity with living services shown by default and failed/stopped history available through `--all`, active runtime wiring, shared recipe resolver before default engine selection, TheRock SDK env propagation for non-PyTorch HIP apps, explicit CPU-policy rejection for PyTorch/vLLM/Lemonade without implicit CPU fallback, Windows and WSL PyTorch GPU smoke coverage, Windows and WSL llama.cpp GPU smoke coverage, Windows and WSL Lemonade ROCm smoke coverage, WSL vLLM TheRock GPU smoke coverage, and in-process first-party engine/helper routes for the native per-OS binary | None known within V1 plan constraints |
@@ -91,7 +91,7 @@ Locally implemented and recently verified:
   Linux-path smoke, TUI smoke, PyTorch local-assistant E2E, Lemonade
   local-assistant E2E, and ComfyUI install/start/status/stop E2E using temporary
   state roots.
-- WSL ROCDXG readiness, WSL doctor gfx/family detection, and WSL acceptance
+- WSL ROCDXG readiness, WSL examine gfx/family detection, and WSL acceptance
   commands with isolated workspace-local state.
 - TUI slash-command surfaces are navigable instead of transcript dumps; the
   latest focused pass covers arrow-key selection after accidental typing,
@@ -122,7 +122,7 @@ Locally implemented and recently verified:
   installer PowerShell process; Linux/WSL writes the shell profile and explains
   the new-terminal step after `curl | sh`. Windows acceptance and focused WSL
   installer tests verify those paths.
-- `rocm doctor` and first-time setup now use fast host GPU detection on the
+- `rocm examine` and first-time setup now use fast host GPU detection on the
   normal path: Windows avoids PowerShell/CIM by reading registry/system APIs,
   native Linux uses sysfs/KFD/IP discovery before ROCm userland tools, and WSL
   uses a single host display bridge query only when Linux-side files cannot
@@ -162,7 +162,7 @@ Locally implemented and recently verified:
 - Live local-assistant acceptance now passes on Windows with the `qwen` alias:
   `scripts/local_assistant_therock_gpu_test.py --model qwen --require-tool-call`
   launched the managed PyTorch GPU-required service, reached the local
-  provider, required a ROCm tool call, and observed the model use `rocm doctor`
+  provider, required a ROCm tool call, and observed the model use `rocm examine`
   through the tool bridge before stopping the managed service.
 - Live local-assistant acceptance now also passes on WSL with the `qwen` alias
   after path propagation fixes for managed child processes:
@@ -177,7 +177,7 @@ Locally implemented and recently verified:
   detail card, Esc closes that card first, and ComfyUI start approval text uses
   the actual requested loopback address.
 - WSL lightweight acceptance currently passes for the Python self-tests plus
-  WSL `rocm doctor`, `rocm engines list`, `rocm comfyui status`, and
+  WSL `rocm examine`, `rocm engines list`, `rocm comfyui status`, and
   `rocm services list`. The first WSL sidecar found a stale `/mnt/d` debug
   binary that rejected newer `comfyui`/`services` subcommands; a forced rebuild
   into `/home/jam/.cache/rocm-cli-target` fixed the artifact and verified those
@@ -189,7 +189,7 @@ Locally implemented and recently verified:
   user-facing TUI/chat flows continue to route mutating calls through approval
   cards. Focused tests tie this guard to the current MCP tool annotations.
 - TheRock version strings with embedded dates now render with a readable build
-  date in install/update output, non-TUI runtime lists, Doctor runtime state,
+  date in install/update output, non-TUI runtime lists, Examine runtime state,
   the setup screen, and TUI ROCm install lists/details. The setup screen's
   `Show install log` row now opens a focused saved-log view on ready and failed
   setup screens, includes the backing file path or missing-file details, resets
@@ -274,7 +274,7 @@ These are narrow plan-derived fixes that unblock truthful V1 status.
 - `rocmd supervise` now prefers engine protocol health checks for readiness and keeps port probing as a compatibility fallback.
 - `server-recover` now uses protocol health status for running/ready managed services and can recover services whose endpoint is failed, unreachable, or exited.
 - TUI now accepts `/engine`, `/model`, and `/plan` commands using the existing inventory/planning paths.
-- `rocm doctor` now reports kernel, driver policy/status/detail, managed runtime count, managed service count, and model cache entry count.
+- `rocm examine` now reports kernel, driver policy/status/detail, managed runtime count, managed service count, and model cache entry count.
 - `rocm chat` now uses a provider status adapter surface for `local`, `openai`, and `anthropic`, including auth status, model list, and the shared ROCm tool schema id.
 - `rocm chat --prompt` now sends a non-interactive prompt through the provider contract; the local provider posts to a ready managed OpenAI-compatible service.
 - The local provider implements OpenAI-style SSE stream parsing and `stream: true` requests for managed local services.
@@ -325,7 +325,7 @@ These are narrow plan-derived fixes that unblock truthful V1 status.
 - Runtime activation and previous-runtime validation now use exact versioned runtime keys and an active runtime marker, so release/nightly or old/new installs can coexist.
 - Existing rocm-cli runtime manifests can be imported read-only, and existing TheRock Python environments can be adopted read-only after probing `rocm_sdk`.
 - TheRock pip and tarball metadata resolution now uses a rocm-cli metadata cache with ETag support.
-- `rocm doctor` now uses bounded optional probes, Windows display inventory before ROCm tools, and reports dedicated gfx target/compatible TheRock family without requiring an existing ROCm install.
+- `rocm examine` now uses bounded optional probes, Windows display inventory before ROCm tools, and reports dedicated gfx target/compatible TheRock family without requiring an existing ROCm install.
 - The TUI `/runtimes` flow now covers list/activate/uninstall/import/adopt with option-aware adopt validation and flag completions. Normal users switch ROCm installs by selecting an installed item from the list; legacy typed rollback commands are guided back to that picker instead of being advertised as a primary action.
 - WSL support now includes ROCDXG preflight/setup documentation and strict llama.cpp GPU E2E validation against managed TheRock libraries.
 - Deferred/unsupported expanded engines now fail with explicit no-fallback messages when no external plugin is installed.
@@ -335,7 +335,7 @@ These are narrow plan-derived fixes that unblock truthful V1 status.
   registry in non-TUI mode instead of falling through to natural-language
   planning.
 - Normal CLI startup now performs a quiet bounded TheRock update check when a managed runtime exists, using cached metadata, a freshness gate, and a hard metadata fetch timeout. First-run hosts with no managed runtimes are left untouched, and the localized pip wheel cache is not created.
-- `rocm doctor` now appends active runtime state and non-invasive engine adapter/plugin inventory without invoking engine protocol detection, preserving bounded doctor latency.
+- `rocm examine` now appends active runtime state and non-invasive engine adapter/plugin inventory without invoking engine protocol detection, preserving bounded examine latency.
 - CLI lifecycle actions now write both JSONL audit records and plain-text logs: a global `logs/cli-lifecycle.log` and per-action logs under `logs/cli`. `/logs` shows these paths for TUI/CLI inspection.
 - `/logs` now lists per-action CLI log files and tails recent lifecycle lines
   inline without creating first-run log directories.
@@ -358,7 +358,7 @@ These are narrow plan-derived fixes that unblock truthful V1 status.
 
 Goal: make the currently implemented CLI/TUI/runtime/engine skeleton honest, testable, and aligned with V1 constraints.
 
-- Expand `rocm doctor` with kernel, distro, CPU, runtime state, driver state, engine inventory, model cache, and legacy ROCm detection.
+- Expand `rocm examine` with kernel, distro, CPU, runtime state, driver state, engine inventory, model cache, and legacy ROCm detection.
 - Add basic logging paths and log writes for install/update/serve/automation lifecycle.
   - CLI audit events now cover update/install/runtime/engine/managed-service
     actions. TUI screen-owned commands now also persist full-output screen
@@ -366,7 +366,7 @@ Goal: make the currently implemented CLI/TUI/runtime/engine skeleton honest, tes
     visible log browser/search surface alongside lifecycle and CLI action logs.
 - Add bounded cached update checks on every `rocm` invocation.
   - Completed with a quiet, freshness-gated startup check that records status under the TheRock metadata cache and skips first-run/no-runtime hosts.
-- Complete deeper engine inventory and active runtime reporting in `rocm doctor`.
+- Complete deeper engine inventory and active runtime reporting in `rocm examine`.
   - Completed with `runtime_state` and `engine_inventory` sections that report active runtime keys/status and adapter/plugin availability without slow engine detect calls.
 - Complete per-command lifecycle log writes for install/update/serve/automation operations.
   - Completed for CLI lifecycle audit callers with global and action-specific
@@ -400,7 +400,7 @@ Goal: satisfy Phase 1 runtime exit criteria.
 - Add existing TheRock detection with adopt/import/read-only modes.
   - Completed for explicit import/adopt commands.
 - Report legacy ROCm installs as unmanaged with migration guidance.
-  - Completed in `rocm doctor`.
+  - Completed in `rocm examine`.
 
 ## Milestone 3: TUI, Chat, and Planning
 
@@ -497,7 +497,7 @@ Goal: satisfy Phase 3 and Phase 5 before expanded engines.
     expectations, and manual alternative recipe hints. `/model` renders these
     advisory checks and recommends alternatives only as explicit manual
     choices.
-  - `rocm doctor` now reports host system RAM, and TUI `/model` compares that
+  - `rocm examine` now reports host system RAM, and TUI `/model` compares that
     telemetry against each recipe's recommended system RAM.
   - Signed recipe index artifact descriptors can now render
     `metadata_available` or `blocked`.
@@ -564,7 +564,7 @@ Goal: satisfy Phase 6 without expanding beyond the plan.
     10.1/9.7/8.10, Rocky 9.7, and SLES 15.7. Unsupported Linux IDs remain
     non-mutating instead of guessing commands.
   - Remaining work: privileged live acceptance coverage on supported hosts.
-- Windows: add driver presence and compatibility reporting to `rocm doctor`; do not add Windows driver install or upgrade.
+- Windows: add driver presence and compatibility reporting to `rocm examine`; do not add Windows driver install or upgrade.
 
 ## Milestone 6: Automations, Sandbox, and Hardening
 
@@ -648,7 +648,7 @@ called out in the phase table and `Current Remaining Gates`.
 
 | Worker Lane | Owns | Current State |
 |---|---|---|
-| Runtime/Doctor | `apps/rocm/src/therock.rs`, doctor data in `crates/rocm-core` | Implemented locally; production metadata signing remains an owner publication gate |
+| Runtime/Examine | `apps/rocm/src/therock.rs`, examine data in `crates/rocm-core` | Implemented locally; production metadata signing remains an owner publication gate |
 | Engine Lifecycle | `crates/rocm-engine-protocol`, `engines/pytorch`, service log/status paths | Implemented locally for PyTorch/llama.cpp plus gated Linux/WSL adapters |
 | TUI/Planner | `apps/rocm/src/tui.rs`, planner code in `apps/rocm/src/main.rs` or a new planner module | Implemented locally with navigable screens, approvals, progress cards, and structured routing |
 | Providers | Provider modules plus config/key storage | Implemented locally for local/OpenAI/Anthropic providers and served-model ROCm tools |

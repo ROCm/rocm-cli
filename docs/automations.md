@@ -58,7 +58,7 @@ Automation actions never receive arbitrary shell access. Reviewed requests and
 contained watcher work can only call this restricted tool surface:
 
 - `check_updates`: run a read-only `rocm update` check.
-- `doctor_snapshot`: capture a read-only doctor summary.
+- `examine_snapshot`: capture a read-only examine summary.
 - `list_servers`: list rocm-cli managed servers.
 - `restart_server`: restart one explicit managed server.
 - `stop_server`: stop one explicit managed server.

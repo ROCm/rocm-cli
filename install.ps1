@@ -471,10 +471,10 @@ try {
 
     Write-Host "run:"
     if (Test-PathInList $env:Path $InstallDir) {
-        Write-Host "  rocm doctor"
+        Write-Host "  rocm examine"
     } else {
         $rocmExe = Join-Path $InstallDir "rocm.exe"
-        Write-Host "  & `"$rocmExe`" doctor"
+        Write-Host "  & `"$rocmExe`" examine"
     }
 } finally {
     if (Test-Path -LiteralPath $tempRoot) {

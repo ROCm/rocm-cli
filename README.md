@@ -51,7 +51,7 @@ TUI shows live GPU utilization, active model servers, and a chat tab.
 | Command | Description |
 |---|---|
 | `rocm` | Open the TUI (runs setup on first launch) |
-| `rocm doctor` | Check GPU, ROCm install, engines, and managed folders |
+| `rocm examine` | Check GPU, ROCm install, engines, and managed folders |
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
 | `rocm install driver` | Install the AMD kernel driver on Linux |
 | `rocm serve <model>` | Start a local OpenAI-compatible model server |

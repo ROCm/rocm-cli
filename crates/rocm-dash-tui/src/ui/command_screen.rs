@@ -212,7 +212,7 @@ pub fn draw_command_screen(
     );
 
     let shown = if c.input.is_empty() {
-        "(e.g. doctor · services list · version)".to_string()
+        "(e.g. examine · services list · version)".to_string()
     } else {
         format!("rocm {}", c.input)
     };
@@ -283,11 +283,11 @@ mod tests {
         let mut cs = Some(CommandScreenState::default());
         let mut jobs = State::default();
         // Even a read-only-looking command goes through approval (safe default).
-        type_str(&mut cs, &mut jobs, "doctor");
+        type_str(&mut cs, &mut jobs, "examine");
         let fx = on_key(&mut cs, &mut jobs, key(KeyCode::Enter));
         assert!(fx.is_empty(), "must not run before approval");
         let pending = cs.as_ref().unwrap().approval.as_ref().unwrap();
-        assert_eq!(pending.args, vec!["doctor"]);
+        assert_eq!(pending.args, vec!["examine"]);
         assert!(jobs.jobs.is_empty());
         let fx = on_key(&mut cs, &mut jobs, key(KeyCode::Char('y')));
         assert_eq!(fx.len(), 1);
@@ -337,7 +337,7 @@ mod tests {
     fn q_escapes_overlay_while_job_runs() {
         let mut cs = Some(CommandScreenState::default());
         let mut jobs = State::default();
-        type_str(&mut cs, &mut jobs, "doctor");
+        type_str(&mut cs, &mut jobs, "examine");
         on_key(&mut cs, &mut jobs, key(KeyCode::Enter)); // stage
         on_key(&mut cs, &mut jobs, key(KeyCode::Char('y'))); // spawn
         on_key(&mut cs, &mut jobs, key(KeyCode::Char('q')));
@@ -361,7 +361,7 @@ mod tests {
         );
         // A plain command does NOT get the warning.
         let mut cs2 = Some(CommandScreenState::default());
-        type_str(&mut cs2, &mut jobs, "doctor");
+        type_str(&mut cs2, &mut jobs, "examine");
         on_key(&mut cs2, &mut jobs, key(KeyCode::Enter));
         let p2 = cs2.as_ref().unwrap().approval.as_ref().unwrap();
         assert!(
@@ -376,7 +376,7 @@ mod tests {
     fn relaunch_while_job_running_surfaces_message_not_stale_console() {
         let mut jobs = State::default();
         let mut c1 = Some(CommandScreenState::default());
-        type_str(&mut c1, &mut jobs, "doctor");
+        type_str(&mut c1, &mut jobs, "examine");
         on_key(&mut c1, &mut jobs, key(KeyCode::Enter));
         on_key(&mut c1, &mut jobs, key(KeyCode::Char('y')));
         assert_eq!(c1.as_ref().unwrap().active_job.as_deref(), Some("command"));
@@ -405,7 +405,7 @@ mod tests {
         let backend = TestBackend::new(104, 24);
         let mut term = Terminal::new(backend).unwrap();
         let c = CommandScreenState {
-            input: "doctor".into(),
+            input: "examine".into(),
             ..Default::default()
         };
         let jobs = State::default();
@@ -419,6 +419,6 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(out.contains("Run a command"));
-        assert!(out.contains("rocm doctor"));
+        assert!(out.contains("rocm examine"));
     }
 }

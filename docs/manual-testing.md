@@ -15,7 +15,7 @@ cargo build --workspace --release
 ```
 
 This writes `target/release/rocm.exe` on Windows and `target/release/rocm` on
-Linux/WSL. Run the binary directly on each platform. On WSL/Linux the doctor
+Linux/WSL. Run the binary directly on each platform. On WSL/Linux the examine
 output must report `os: linux` and `wsl: true`.
 
 Do not set `ROCM_CLI_THEROCK_FAMILY` during normal setup tests. rocm-cli should
@@ -82,13 +82,13 @@ Quiet UI rule:
 After setup, check the machine state:
 
 ```powershell
-rocm doctor
+rocm examine
 rocm runtimes list
 ```
 
 Expected result:
 
-- `rocm doctor` shows a managed runtime.
+- `rocm examine` shows a managed runtime.
 - `rocm runtimes list` shows the runtime key for the installed TheRock venv.
 - The active runtime is ready, or the output gives one clear next command.
 
@@ -100,7 +100,7 @@ This tests the command-line install path without using the TUI:
 rocm install sdk --channel release --format wheel --prefix .\.rocm-work\data\envs\default
 rocm runtimes list
 rocm runtimes activate <runtime_key>
-rocm doctor
+rocm examine
 ```
 
 Replace `<runtime_key>` with the exact key printed by `rocm runtimes list`.
@@ -118,7 +118,7 @@ Expected result:
 - Runtime validation uses TheRock's runtime/devel package roots and
   `rocm_sdk.find_libraries`; `rocm-sdk path --root` is expected after the
   pinned `rocm[libraries,devel]` install succeeds.
-- `rocm doctor` reports the active runtime as ready.
+- `rocm examine` reports the active runtime as ready.
 
 Developer-only deterministic override:
 
@@ -277,7 +277,7 @@ Expected result:
 - `rocm config show` says the key is saved in the OS secure store, or that the
   current session is using `OPENAI_API_KEY`.
 - The key value itself is never printed.
-- `config.json`, logs, and doctor output do not contain the key.
+- `config.json`, logs, and examine output do not contain the key.
 
 To remove the saved key:
 

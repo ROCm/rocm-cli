@@ -790,7 +790,7 @@ mod tests {
             services: None,
             serve_wizard: None,
             engine_manager: None,
-            doctor_manager: None,
+            examine_manager: None,
             update_manager: None,
             install_manager: None,
             logs_view: None,
