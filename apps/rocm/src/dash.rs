@@ -166,15 +166,15 @@ fn automation_summaries(config: &RocmCliConfig) -> Vec<AutomationSummary> {
 
 /// Resolve the TUI args from the unified config + environment.
 ///
-/// `anthropic_api_key` is resolved by the caller *before* any tokio runtime is
-/// entered: the secure-store fallback uses a blocking zbus client that spins its
-/// own runtime, which panics ("cannot start a runtime from within a runtime") if
-/// invoked from inside `run_async`. See [`anthropic_api_key_for_dash`].
+/// MUST be called on a synchronous thread *before* any tokio runtime is entered:
+/// the Anthropic-key secure-store fallback ([`anthropic_api_key_for_dash`]) uses
+/// a blocking zbus client that spins its own runtime, which panics ("cannot
+/// start a runtime from within a runtime") if invoked from inside `run_async`.
+/// The sync entry points `run`/`run_chat` call this and pass the result in.
 pub fn resolved_args(
     config: &RocmCliConfig,
     paths: &AppPaths,
     initial_tab: ActiveTab,
-    anthropic_api_key: Option<String>,
 ) -> ResolvedArgs {
     let t = &config.dashboard.tui;
     ResolvedArgs {
@@ -190,7 +190,7 @@ pub fn resolved_args(
             .ok()
             .filter(|v| !v.is_empty()),
         chat_api_key: chat_api_key_from_env(),
-        anthropic_api_key,
+        anthropic_api_key: anthropic_api_key_for_dash(),
         chat_auto_consent: false,
         chat_mock: false,
         model_recipes: model_recipe_summaries(),
@@ -229,18 +229,15 @@ pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
     } else {
         replay
     };
-    // Resolve the Anthropic key before the runtime exists; the secure-store
-    // fallback blocks on its own zbus runtime and would panic inside `run_async`.
-    let anthropic_api_key = anthropic_api_key_for_dash();
+    // Resolve TUI args — including the OS secure-store (keyring) lookup for the
+    // Anthropic key — on this plain synchronous thread, BEFORE entering the tokio
+    // runtime. The secure-store path (`provider_keys` → secret-service) uses
+    // `zbus::blocking`, which builds its own runtime and `block_on`s internally;
+    // doing that on a dash runtime worker thread panics with "Cannot start a
+    // runtime from within a runtime". See `run_async`.
+    let args = resolved_args(&config, &paths, ActiveTab::Overview);
     let rt = build_dashboard_runtime()?;
-    rt.block_on(run_async(
-        config,
-        paths,
-        replay,
-        chat_mock,
-        ActiveTab::Overview,
-        anthropic_api_key,
-    ))
+    rt.block_on(run_async(config, paths, args, replay, chat_mock))
 }
 
 /// Entry point for bare `rocm` and interactive `rocm chat`. Opens the unified
@@ -249,29 +246,23 @@ pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
 pub fn run_chat(chat_mock: bool) -> Result<()> {
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths)?;
-    // Resolve the Anthropic key before the runtime exists; the secure-store
-    // fallback blocks on its own zbus runtime and would panic inside `run_async`.
-    let anthropic_api_key = anthropic_api_key_for_dash();
+    // See `run`: resolve args (incl. the keyring lookup) before the runtime so the
+    // secure-store `zbus::blocking` path never runs on a runtime worker thread.
+    let args = resolved_args(&config, &paths, ActiveTab::Chat);
     let rt = build_dashboard_runtime()?;
-    rt.block_on(run_async(
-        config,
-        paths,
-        None,
-        chat_mock,
-        ActiveTab::Chat,
-        anthropic_api_key,
-    ))
+    rt.block_on(run_async(config, paths, args, None, chat_mock))
 }
 
 async fn run_async(
     config: RocmCliConfig,
     paths: AppPaths,
+    mut args: ResolvedArgs,
     replay: Option<PathBuf>,
     chat_mock: bool,
-    initial_tab: ActiveTab,
-    anthropic_api_key: Option<String>,
 ) -> Result<()> {
-    let mut args = resolved_args(&config, &paths, initial_tab, anthropic_api_key);
+    // `args` is built by the synchronous caller (`run`/`run_chat`) so the keyring
+    // lookup inside `resolved_args` never runs on a runtime worker thread (it uses
+    // `zbus::blocking`, which would otherwise panic: runtime-within-a-runtime).
     args.replay = replay.clone();
     args.chat_mock = chat_mock;
     // Inject the bin-side tool-execution seam for a live dash only. Demo/replay
@@ -379,7 +370,7 @@ mod tests {
     #[test]
     fn resolved_args_take_connect_and_theme_from_config() {
         let c = cfg();
-        let args = resolved_args(&c, &paths(), ActiveTab::Overview, None);
+        let args = resolved_args(&c, &paths(), ActiveTab::Overview);
         assert_eq!(args.connect, c.dashboard.tui.connect);
         assert_eq!(args.theme, c.dashboard.tui.theme);
         assert!(!args.chat_mock);
