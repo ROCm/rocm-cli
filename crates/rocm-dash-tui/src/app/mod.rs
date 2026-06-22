@@ -38,7 +38,7 @@ mod chat;
 mod slash;
 mod summary;
 
-use chat::{build_chat_agent, detect_local_chat, persist_chat_endpoint};
+use chat::{build_chat_agent, detect_local_chat, detect_managed_chat, persist_chat_endpoint};
 use summary::{parse_plan_result, summarize_json_value, summarize_slash_tool};
 
 /// Args after CLI + config resolution. Consumed by `run`.
@@ -1127,26 +1127,44 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             )) as std::sync::Arc<dyn crate::agent::AgentClient>,
         )
     } else {
+        // An endpoint we launched ourselves (managed-services registry) takes
+        // priority over the well-known default port — this is how a tool-launched
+        // engine on a non-default port (e.g. vLLM on :11435) is found. It does
+        // NOT override an explicitly configured `chat_url`/env URL, so config
+        // precedence is preserved (we only consult the registry when neither is
+        // set, i.e. where the well-known default would otherwise be probed).
+        let managed = if args.chat_url.is_none() && args.chat_env_url.is_none() {
+            detect_managed_chat(state.tool_executor.clone()).await
+        } else {
+            None
+        };
         let probe_target = args
             .chat_url
             .clone()
             .or_else(|| args.chat_env_url.clone())
             .unwrap_or_else(|| crate::llm::DEFAULT_CHAT_BASE_URL.to_string());
-        let probe_ok = tokio::task::spawn_blocking(move || {
-            crate::llm::probe_endpoint(&probe_target, crate::llm::PROBE_TIMEOUT)
-        })
-        .await
-        .unwrap_or(false);
-        let llm = crate::llm::resolve_llm_config(
-            args.chat_url.as_deref(),
-            args.chat_model.as_deref(),
-            None,
-            None,
-            args.chat_api_key.as_deref(),
-            args.chat_env_url.as_deref(),
-            args.chat_auth_header.as_deref(),
-            probe_ok,
-        );
+        // A managed endpoint is already readiness-verified; otherwise TCP-probe.
+        let probe_ok = if managed.is_some() {
+            true
+        } else {
+            tokio::task::spawn_blocking(move || {
+                crate::llm::probe_endpoint(&probe_target, crate::llm::PROBE_TIMEOUT)
+            })
+            .await
+            .unwrap_or(false)
+        };
+        let llm = managed.or_else(|| {
+            crate::llm::resolve_llm_config(
+                args.chat_url.as_deref(),
+                args.chat_model.as_deref(),
+                None,
+                None,
+                args.chat_api_key.as_deref(),
+                args.chat_env_url.as_deref(),
+                args.chat_auth_header.as_deref(),
+                probe_ok,
+            )
+        });
         state.set_chat_config(llm, args.chat_auto_consent);
         // No reachable local endpoint AND no key/url configured → the no-key
         // ChatGPT OAuth default (device-code login surfaced in the chat tab).
@@ -1596,8 +1614,9 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         if state.chat_detect_dispatch {
             state.chat_detect_dispatch = false;
             let reply_tx = chat_tx.clone();
+            let executor = state.tool_executor.clone();
             tokio::spawn(async move {
-                let offer = detect_local_chat().await;
+                let offer = detect_local_chat(executor).await;
                 let _ = reply_tx.send(ClientMsg::ChatDetectResult { offer });
             });
         }
