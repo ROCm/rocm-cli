@@ -5727,7 +5727,7 @@ pub(crate) fn render_chat_prompt_result_with_progress(
         let _ = writeln!(output, "Assistant after ROCm checks");
         let _ = writeln!(
             output,
-            "I can install ROCm/TheRock, but I need the install folder first. Type the folder you want to use, for example D:\\jam\\temp\\therock_venvs. Nothing will download until ROCm CLI shows a review card and you approve it."
+            "I can install ROCm/TheRock, but I need the install folder first. Type the folder you want to use, for example D:\\ROCm\\therock_venvs. Nothing will download until ROCm CLI shows a review card and you approve it."
         );
     }
     if tool_result.approval.is_none()
@@ -12313,8 +12313,7 @@ fn build_freeform_plan_with_recipes(
                 actions: Vec::new(),
                 notes: vec![
                     "Choose a ROCm/TheRock install folder before approving an install.".to_owned(),
-                    "Say something like: install TheRock into D:\\jam\\temp\\therock_venvs."
-                        .to_owned(),
+                    "Say something like: install TheRock into D:\\ROCm\\therock_venvs.".to_owned(),
                 ],
             };
         };
@@ -14442,7 +14441,7 @@ mod tests {
     #[test]
     fn hybrid_planner_builds_nightly_therock_install_call() {
         let plan = build_freeform_plan(
-            "install the latest TheRock nightly for this GPU into D:\\jam\\temp\\therock_venvs",
+            "install the latest TheRock nightly for this GPU into D:\\ROCm\\therock_venvs",
             &RocmCliConfig::default(),
         );
 
@@ -14451,10 +14450,10 @@ mod tests {
             plan.parsed
                 .contains(&("channel".to_owned(), "nightly".to_owned()))
         );
-        assert!(plan.parsed.contains(&(
-            "prefix".to_owned(),
-            "D:\\jam\\temp\\therock_venvs".to_owned()
-        )));
+        assert!(
+            plan.parsed
+                .contains(&("prefix".to_owned(), "D:\\ROCm\\therock_venvs".to_owned()))
+        );
         assert!(plan.actions.iter().any(|action| {
             action.title == "Install TheRock SDK"
                 && action.approval == "required"
@@ -14467,7 +14466,7 @@ mod tests {
                         "--format".to_owned(),
                         "wheel".to_owned(),
                         "--prefix".to_owned(),
-                        "D:\\jam\\temp\\therock_venvs".to_owned(),
+                        "D:\\ROCm\\therock_venvs".to_owned(),
                     ]
         }));
     }
@@ -14475,7 +14474,7 @@ mod tests {
     #[test]
     fn hybrid_planner_builds_requested_therock_build_date_install_call() {
         let plan = build_freeform_plan(
-            "install the TheRock wheel from date 06052026 into D:\\jam\\temp\\therock_venvs",
+            "install the TheRock wheel from date 06052026 into D:\\ROCm\\therock_venvs",
             &RocmCliConfig::default(),
         );
 
@@ -14496,7 +14495,7 @@ mod tests {
                         "--format".to_owned(),
                         "wheel".to_owned(),
                         "--prefix".to_owned(),
-                        "D:\\jam\\temp\\therock_venvs".to_owned(),
+                        "D:\\ROCm\\therock_venvs".to_owned(),
                         "--build-date".to_owned(),
                         "2026-06-05".to_owned(),
                     ]
@@ -14982,7 +14981,7 @@ mod tests {
             arguments: serde_json::json!({
                 "channel": "release",
                 "format": "wheel",
-                "prefix": "D:\\jam\\temp\\therock_venvs"
+                "prefix": "D:\\ROCm\\therock_venvs"
             }),
         };
 
@@ -14991,7 +14990,7 @@ mod tests {
         assert_eq!(
             rocm_chat_tool_requested_command(&call).as_deref(),
             Some(
-                "rocm install sdk --channel release --format wheel --prefix D:\\jam\\temp\\therock_venvs"
+                "rocm install sdk --channel release --format wheel --prefix D:\\ROCm\\therock_venvs"
             )
         );
         let approval = chat_tool_approval_request(
@@ -15015,7 +15014,7 @@ mod tests {
                 "--format".to_owned(),
                 "wheel".to_owned(),
                 "--prefix".to_owned(),
-                "D:\\jam\\temp\\therock_venvs".to_owned(),
+                "D:\\ROCm\\therock_venvs".to_owned(),
             ]
         );
     }
@@ -15026,7 +15025,7 @@ mod tests {
             id: Some("call-date".to_owned()),
             name: "rocm_command".to_owned(),
             arguments: serde_json::json!({
-                "args": ["install", "sdk", "--channel", "release", "--format", "wheel", "--prefix", "D:\\jam\\temp\\therock_venvs", "--build-date", "06052026"],
+                "args": ["install", "sdk", "--channel", "release", "--format", "wheel", "--prefix", "D:\\ROCm\\therock_venvs", "--build-date", "06052026"],
                 "reason": "The user asked for the TheRock build from 2026-06-05."
             }),
         };
@@ -15036,7 +15035,7 @@ mod tests {
         assert_eq!(
             rocm_chat_tool_requested_command(&call).as_deref(),
             Some(
-                "rocm install sdk --channel release --format wheel --prefix D:\\jam\\temp\\therock_venvs --build-date 06052026"
+                "rocm install sdk --channel release --format wheel --prefix D:\\ROCm\\therock_venvs --build-date 06052026"
             )
         );
         let approval =
@@ -15053,7 +15052,7 @@ mod tests {
                 "--format".to_owned(),
                 "wheel".to_owned(),
                 "--prefix".to_owned(),
-                "D:\\jam\\temp\\therock_venvs".to_owned(),
+                "D:\\ROCm\\therock_venvs".to_owned(),
                 "--build-date".to_owned(),
                 "06052026".to_owned(),
             ]
@@ -15249,8 +15248,8 @@ examine:
   legacy_rocm_status: not_detected
 runtime_state:
   active_runtime_status: ready
-  active_runtime_root: D:\\jam\\temp\\therock_venvs
-  active_runtime_pip_cache_dir: D:\\jam\\temp\\therock_venvs\\pip-cache
+  active_runtime_root: D:\\ROCm\\therock_venvs
+  active_runtime_pip_cache_dir: D:\\ROCm\\therock_venvs\\pip-cache
   active_runtime_version: 7.13.0a20260511 (build 2026-05-11)
   active_runtime_family: gfx120X-all
 ",
@@ -15260,8 +15259,8 @@ runtime_state:
         assert!(summary.contains("GPU: AMD Radeon RX 9070 XT driver 32.0.23033.1002"));
         assert!(summary.contains("ROCm/TheRock: installed and active for ROCm CLI"));
         assert!(summary.contains("gfx120X-all"));
-        assert!(summary.contains(r"Install folder: D:\jam\temp\therock_venvs"));
-        assert!(summary.contains(r"Downloads/cache: D:\jam\temp\therock_venvs\pip-cache"));
+        assert!(summary.contains(r"Install folder: D:\ROCm\therock_venvs"));
+        assert!(summary.contains(r"Downloads/cache: D:\ROCm\therock_venvs\pip-cache"));
         assert!(summary.contains("no global legacy ROCm install was found"));
     }
 
@@ -15415,11 +15414,11 @@ model recipes
                     arguments: serde_json::json!({
                         "channel": "release",
                         "format": "wheel",
-                        "prefix": "D:\\jam\\temp\\therock_venvs"
+                        "prefix": "D:\\ROCm\\therock_venvs"
                     }),
                 },
                 Some(
-                    "rocm install sdk --channel release --format wheel --prefix D:\\jam\\temp\\therock_venvs",
+                    "rocm install sdk --channel release --format wheel --prefix D:\\ROCm\\therock_venvs",
                 ),
                 false,
             ),
@@ -15851,7 +15850,7 @@ model recipes
                 arguments: serde_json::json!({
                     "channel": "release",
                     "format": "wheel",
-                    "prefix": "D:\\jam\\temp\\therock_venvs"
+                    "prefix": "D:\\ROCm\\therock_venvs"
                 }),
             }],
         };
@@ -16059,10 +16058,10 @@ model recipes
     fn fallback_tool_call_preserves_requested_therock_install_prefix() {
         for (prompt, expected_prefix) in [
             (
-                "install TheRock for me in D:\\jam\\temp\\therock_venvs",
-                "D:\\jam\\temp\\therock_venvs",
+                "install TheRock for me in D:\\ROCm\\therock_venvs",
+                "D:\\ROCm\\therock_venvs",
             ),
-            ("install ROCm to D:\\jam\\temp", "D:\\jam\\temp"),
+            ("install ROCm to D:\\ROCm\\temp", "D:\\ROCm\\temp"),
         ] {
             let call = fallback_rocm_tool_call_for_prompt(prompt).unwrap();
             assert_eq!(call.name, "rocm_command");
@@ -16087,12 +16086,12 @@ model recipes
     fn fallback_tool_call_routes_requested_therock_build_date_install() {
         for (prompt, expected_prefix) in [
             (
-                "Install this specific TheRock wheel from date 06052026 into D:\\jam\\temp\\therock_venvs",
-                "D:\\jam\\temp\\therock_venvs",
+                "Install this specific TheRock wheel from date 06052026 into D:\\ROCm\\therock_venvs",
+                "D:\\ROCm\\therock_venvs",
             ),
             (
-                "install ROCm at D:\\jam\\temp with build date 2026-06-05",
-                "D:\\jam\\temp",
+                "install ROCm at D:\\ROCm\\temp with build date 2026-06-05",
+                "D:\\ROCm\\temp",
             ),
         ] {
             let call = fallback_rocm_tool_call_for_prompt(prompt).unwrap();
@@ -16240,7 +16239,7 @@ install therock";
     #[test]
     fn chat_install_intent_preserves_bare_folder_path() {
         let approval =
-            install_sdk_chat_approval_for_prompt("install therock D:\\jam\\temp\\therock_venvs")
+            install_sdk_chat_approval_for_prompt("install therock D:\\ROCm\\therock_venvs")
                 .expect("direct install prompt should be recognized");
 
         assert_eq!(
@@ -16253,7 +16252,7 @@ install therock";
                 "--format".to_owned(),
                 "wheel".to_owned(),
                 "--prefix".to_owned(),
-                "D:\\jam\\temp\\therock_venvs".to_owned(),
+                "D:\\ROCm\\therock_venvs".to_owned(),
             ]
         );
     }
@@ -16261,7 +16260,7 @@ install therock";
     #[test]
     fn fallback_tool_call_routes_requested_therock_exact_version_install() {
         let call = fallback_rocm_tool_call_for_prompt(
-            "Install the TheRock ROCm wheel version 7.13.0a20260605 into D:\\jam\\temp\\therock_venvs",
+            "Install the TheRock ROCm wheel version 7.13.0a20260605 into D:\\ROCm\\therock_venvs",
         )
         .unwrap();
         assert_eq!(call.name, "rocm_command");
@@ -16275,7 +16274,7 @@ install therock";
                 "--format".to_owned(),
                 "wheel".to_owned(),
                 "--prefix".to_owned(),
-                "D:\\jam\\temp\\therock_venvs".to_owned(),
+                "D:\\ROCm\\therock_venvs".to_owned(),
                 "--version".to_owned(),
                 "7.13.0a20260605".to_owned(),
             ]
@@ -16288,7 +16287,7 @@ install therock";
         let call = providers::ChatToolCall {
             id: Some("path-check".to_owned()),
             name: "path_exists".to_owned(),
-            arguments: serde_json::json!({ "path": "D:\\jam\\temp" }),
+            arguments: serde_json::json!({ "path": "D:\\ROCm\\temp" }),
         };
 
         validate_chat_tool_call(&call).unwrap();
@@ -16500,7 +16499,7 @@ install therock";
 
         let final_answer = providers::ChatResponse {
             tool_calls: Vec::new(),
-            content: "The runtime root is D:\\jam\\temp\\therock_venvs.".to_owned(),
+            content: "The runtime root is D:\\ROCm\\therock_venvs.".to_owned(),
             ..response
         };
         assert!(local_follow_up_content_is_final(&final_answer));
@@ -16510,9 +16509,9 @@ install therock";
     fn visible_chat_content_removes_reasoning_blocks() {
         assert_eq!(
             visible_chat_content(
-                "<think>\nchecking the tool output\n</think>\nThe runtime root is D:\\jam\\temp."
+                "<think>\nchecking the tool output\n</think>\nThe runtime root is D:\\ROCm\\temp."
             ),
-            "The runtime root is D:\\jam\\temp."
+            "The runtime root is D:\\ROCm\\temp."
         );
         assert_eq!(
             visible_chat_content("Before\n<THINK>hidden</THINK>\nAfter"),
@@ -17076,7 +17075,7 @@ install therock";
             "--format",
             "wheel",
             "--prefix",
-            "D:\\jam\\temp\\therock_venvs",
+            "D:\\ROCm\\therock_venvs",
             "--family",
             "gfx110X-all",
         ])
@@ -18915,21 +18914,21 @@ VERSION_ID="41"
     fn friendly_engine_detect_notes_hide_probe_and_path_noise() {
         let pytorch = friendly_engine_detect_notes(
             "pytorch",
-            &[r"torch probe: cuda_available=true device_count=1; managed env detected at C:\Users\jam\.rocm\engines\pytorch\envs\release; rocm_sdk: version=7.13".to_owned()],
+            &[r"torch probe: cuda_available=true device_count=1; managed env detected at C:\Users\user\.rocm\engines\pytorch\envs\release; rocm_sdk: version=7.13".to_owned()],
         )
         .expect("pytorch note");
         assert_eq!(pytorch, "PyTorch is ready on your AMD GPU.");
 
         let lemonade = friendly_engine_detect_notes(
             "lemonade",
-            &["Lemonade embeddable 10.6.0 is installed at D:/jam/temp/runtime; Lemonade is configured for llamacpp:rocm; no CPU fallback is used".to_owned()],
+            &["Lemonade embeddable 10.6.0 is installed at D:/ROCm/temp/runtime; Lemonade is configured for llamacpp:rocm; no CPU fallback is used".to_owned()],
         )
         .expect("lemonade note");
         assert_eq!(lemonade, "Lemonade is ready on your AMD GPU.");
 
         let llama = friendly_engine_detect_notes(
             "llama.cpp",
-            &["llama-server not found; TheRock HIP runtime env available: root=D:\\jam\\temp\\therock".to_owned()],
+            &["llama-server not found; TheRock HIP runtime env available: root=D:\\ROCm\\temp\\therock".to_owned()],
         )
         .expect("llama.cpp note");
         assert_eq!(llama, "llama.cpp server is not installed yet.");

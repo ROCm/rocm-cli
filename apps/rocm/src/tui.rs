@@ -22783,12 +22783,12 @@ fn help_topic_detail(topic: HelpTopic) -> String {
             "",
             "From a terminal:",
             "  rocm setup reset",
-            "  rocm install sdk --channel release --format wheel --prefix D:\\jam\\temp\\therock_venvs",
+            "  rocm install sdk --channel release --format wheel --prefix D:\\ROCm\\therock_venvs",
             "  rocm runtimes list",
             "  rocm runtimes activate <runtime_key>",
             "",
             "Use a full path for --prefix.",
-            "On Linux or WSL, use a Linux path such as /home/jam/rocm_venvs.",
+            "On Linux or WSL, use a Linux path such as /home/user/rocm_venvs.",
         ]
         .join("\n"),
         HelpTopic::LocalModels => [
@@ -26141,7 +26141,7 @@ fn render_local_rocm_tools_chat_intro(service: Option<&ManagedServiceRecord>) ->
     );
     let _ = writeln!(
         output,
-        "  Install the TheRock build from 06052026 into D:\\jam\\temp\\therock_venvs."
+        "  Install the TheRock build from 06052026 into D:\\ROCm\\therock_venvs."
     );
     let _ = writeln!(output, "  Start a small local model.");
     let _ = writeln!(output, "  What local models are running?");
@@ -29092,45 +29092,45 @@ mod tests {
     #[test]
     fn examine_folders_separates_app_data_from_custom_rocm_install_folder() {
         let report = [
-            r"config_dir: C:\Users\jam\.rocm",
-            r"data_dir: C:\Users\jam\.rocm",
-            r"cache_dir: C:\Users\jam\.rocm\cache",
+            r"config_dir: C:\Users\user\.rocm",
+            r"data_dir: C:\Users\user\.rocm",
+            r"cache_dir: C:\Users\user\.rocm\cache",
             r"active_runtime_status: ready",
-            r"active_runtime_root: D:\jam\temp\therock_venvs",
-            r"active_runtime_pip_cache_dir: D:\jam\temp\therock_venvs\pip-cache",
+            r"active_runtime_root: D:\ROCm\therock_venvs",
+            r"active_runtime_pip_cache_dir: D:\ROCm\therock_venvs\pip-cache",
             "model_cache_entries: 0",
         ]
         .join("\n");
 
         let rendered = super::examine_folders_text(&report);
 
-        assert!(rendered.contains(r"Settings: C:\Users\jam\.rocm"));
-        assert!(rendered.contains(r"Logs and app data: C:\Users\jam\.rocm"));
-        assert!(rendered.contains(r"App metadata cache: C:\Users\jam\.rocm\cache"));
-        assert!(rendered.contains(r"ROCm install downloads: D:\jam\temp\therock_venvs\pip-cache"));
-        assert!(rendered.contains(r"Active ROCm install: D:\jam\temp\therock_venvs"));
-        assert!(!rendered.contains(r"Downloaded files: C:\Users\jam\.rocm\cache"));
+        assert!(rendered.contains(r"Settings: C:\Users\user\.rocm"));
+        assert!(rendered.contains(r"Logs and app data: C:\Users\user\.rocm"));
+        assert!(rendered.contains(r"App metadata cache: C:\Users\user\.rocm\cache"));
+        assert!(rendered.contains(r"ROCm install downloads: D:\ROCm\therock_venvs\pip-cache"));
+        assert!(rendered.contains(r"Active ROCm install: D:\ROCm\therock_venvs"));
+        assert!(!rendered.contains(r"Downloaded files: C:\Users\user\.rocm\cache"));
         assert!(!rendered.contains("ROCm installs and logs"));
     }
 
     #[test]
     fn examine_folders_uses_setup_folder_for_rocm_downloads_before_activation() {
         let report = [
-            r"config_dir: C:\Users\jam\.rocm",
-            r"data_dir: C:\Users\jam\.rocm",
-            r"cache_dir: C:\Users\jam\.rocm\cache",
+            r"config_dir: C:\Users\user\.rocm",
+            r"data_dir: C:\Users\user\.rocm",
+            r"cache_dir: C:\Users\user\.rocm\cache",
             r"active_runtime_status: unset",
-            r"setup_runtime_root: D:\jam\temp\therock_venvs",
-            r"setup_runtime_pip_cache_dir: D:\jam\temp\therock_venvs\pip-cache",
+            r"setup_runtime_root: D:\ROCm\therock_venvs",
+            r"setup_runtime_pip_cache_dir: D:\ROCm\therock_venvs\pip-cache",
             "model_cache_entries: 0",
         ]
         .join("\n");
 
         let rendered = super::examine_folders_text(&report);
 
-        assert!(rendered.contains(r"App metadata cache: C:\Users\jam\.rocm\cache"));
-        assert!(rendered.contains(r"ROCm install downloads: D:\jam\temp\therock_venvs\pip-cache"));
-        assert!(rendered.contains(r"Active ROCm install: D:\jam\temp\therock_venvs"));
+        assert!(rendered.contains(r"App metadata cache: C:\Users\user\.rocm\cache"));
+        assert!(rendered.contains(r"ROCm install downloads: D:\ROCm\therock_venvs\pip-cache"));
+        assert!(rendered.contains(r"Active ROCm install: D:\ROCm\therock_venvs"));
     }
 
     #[test]
@@ -29721,7 +29721,7 @@ mod tests {
             super::RunningJobKind::Cli,
             Ok(super::CommandOutput {
                 ok: true,
-                rendered: "ComfyUI\n  status: running\n  URL: http://127.0.0.1:8188\n  models folder: D:\\jam\\temp\\ComfyUI\\models\n".to_owned(),
+                rendered: "ComfyUI\n  status: running\n  URL: http://127.0.0.1:8188\n  models folder: D:\\ROCm\\ComfyUI\\models\n".to_owned(),
                 chat_approval: None,
             }),
             super::StreamedOutputCounts {
@@ -29736,7 +29736,7 @@ mod tests {
         assert!(rendered.contains("Open this URL:"));
         assert!(rendered.contains("http://127.0.0.1:8188"));
         assert!(rendered.contains("Show models path"));
-        assert!(rendered.contains("D:\\jam\\temp\\ComfyUI\\models"));
+        assert!(rendered.contains("D:\\ROCm\\ComfyUI\\models"));
         assert!(rendered.contains("rocm comfyui models-path"));
         assert!(rendered.contains("Put models here:"));
         assert!(!rendered.contains("Status: ok"));
@@ -33724,7 +33724,7 @@ mod tests {
         assert!(!rendered.contains("I checked ROCm"), "{rendered}");
 
         handle_key(&mut app, key_event(KeyCode::Esc, KeyModifiers::NONE));
-        app.set_input("use D:\\jam\\temp\\therock_venvs".to_owned());
+        app.set_input("use D:\\ROCm\\therock_venvs".to_owned());
         handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
 
         assert!(
@@ -33747,9 +33747,9 @@ mod tests {
                     display_command: Some(display),
                     ..
                 } if args.windows(2).any(|pair| {
-                    pair[0] == "--prefix" && pair[1] == "D:\\jam\\temp\\therock_venvs"
+                    pair[0] == "--prefix" && pair[1] == "D:\\ROCm\\therock_venvs"
                 })
-                    && display.contains("D:\\jam\\temp\\therock_venvs")
+                    && display.contains("D:\\ROCm\\therock_venvs")
             ),
             "{pending:#?}"
         );
@@ -33757,10 +33757,7 @@ mod tests {
         assert!(rendered.contains("Install ROCm"), "{rendered}");
         assert!(!rendered.contains("Review this change"), "{rendered}");
         assert!(!rendered.contains("What will happen"), "{rendered}");
-        assert!(
-            rendered.contains("D:\\jam\\temp\\therock_venvs"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("D:\\ROCm\\therock_venvs"), "{rendered}");
         assert!(!rendered.contains("I checked ROCm"), "{rendered}");
         Ok(())
     }
@@ -34026,7 +34023,7 @@ mod tests {
     #[test]
     fn home_install_prompt_with_folder_opens_review_card_without_chat() {
         let mut app = test_app();
-        app.set_input("install therock into D:\\jam\\temp\\therock_venvs".to_owned());
+        app.set_input("install therock into D:\\ROCm\\therock_venvs".to_owned());
         handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
 
         assert!(app.install_manager.is_none());
@@ -34044,8 +34041,8 @@ mod tests {
                 display_command: Some(display),
                 ..
             } if args.windows(2).any(|pair| {
-                pair[0] == "--prefix" && pair[1] == "D:\\jam\\temp\\therock_venvs"
-            }) && display.contains("D:\\jam\\temp\\therock_venvs")
+                pair[0] == "--prefix" && pair[1] == "D:\\ROCm\\therock_venvs"
+            }) && display.contains("D:\\ROCm\\therock_venvs")
         ));
         let rendered = render_test_terminal(&app, 120, 32);
         assert!(rendered.contains("Install ROCm"), "{rendered}");
@@ -34153,7 +34150,7 @@ mod tests {
                 "rocm engines install lemonade",
             ),
             (
-                "install this specific TheRock wheel from date 06052026 into D:\\jam\\temp\\therock_venvs",
+                "install this specific TheRock wheel from date 06052026 into D:\\ROCm\\therock_venvs",
                 serde_json::json!({
                     "choices": [{
                         "message": {
@@ -34164,17 +34161,17 @@ mod tests {
                                 "type": "function",
                                 "function": {
                                     "name": "rocm_command",
-                                    "arguments": "{\"args\":[\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"pip\",\"--prefix\",\"D:\\\\jam\\\\temp\\\\therock_venvs\",\"--build-date\",\"2026-06-05\"],\"reason\":\"Install the requested TheRock build date into the user's folder.\"}"
+                                    "arguments": "{\"args\":[\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"pip\",\"--prefix\",\"D:\\\\ROCm\\\\therock_venvs\",\"--build-date\",\"2026-06-05\"],\"reason\":\"Install the requested TheRock build date into the user's folder.\"}"
                                 }
                             }]
                         }
                     }]
                 }),
                 "Install ROCm",
-                "rocm install sdk --channel release --format wheel --prefix D:\\jam\\temp\\therock_venvs --build-date 2026-06-05",
+                "rocm install sdk --channel release --format wheel --prefix D:\\ROCm\\therock_venvs --build-date 2026-06-05",
             ),
             (
-                "install TheRock version 7.13.0a20260605 into D:\\jam\\temp\\therock_venvs",
+                "install TheRock version 7.13.0a20260605 into D:\\ROCm\\therock_venvs",
                 serde_json::json!({
                     "choices": [{
                         "message": {
@@ -34185,14 +34182,14 @@ mod tests {
                                 "type": "function",
                                 "function": {
                                     "name": "rocm_command",
-                                    "arguments": "{\"args\":[\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"pip\",\"--prefix\",\"D:\\\\jam\\\\temp\\\\therock_venvs\",\"--version\",\"7.13.0a20260605\"],\"reason\":\"Install the requested exact TheRock version into the user's folder.\"}"
+                                    "arguments": "{\"args\":[\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"pip\",\"--prefix\",\"D:\\\\ROCm\\\\therock_venvs\",\"--version\",\"7.13.0a20260605\"],\"reason\":\"Install the requested exact TheRock version into the user's folder.\"}"
                                 }
                             }]
                         }
                     }]
                 }),
                 "Install ROCm",
-                "rocm install sdk --channel release --format wheel --prefix D:\\jam\\temp\\therock_venvs --version 7.13.0a20260605",
+                "rocm install sdk --channel release --format wheel --prefix D:\\ROCm\\therock_venvs --version 7.13.0a20260605",
             ),
         ] {
             let mut app = test_app();
@@ -34469,7 +34466,7 @@ mod tests {
                             "type": "function",
                             "function": {
                                 "name": "install_sdk",
-                                "arguments": "{\"channel\":\"release\",\"format\":\"pip\",\"prefix\":\"D:\\\\jam\\\\temp\\\\therock_venvs\"}"
+                                "arguments": "{\"channel\":\"release\",\"format\":\"pip\",\"prefix\":\"D:\\\\ROCm\\\\therock_venvs\"}"
                             }
                         }]
                     }
@@ -34496,7 +34493,7 @@ mod tests {
             model: Some("Qwen/Qwen3.5".to_owned()),
             messages: vec![crate::providers::ChatMessage {
                 role: "user".to_owned(),
-                content: "help me install ROCm in D:\\jam\\temp\\therock_venvs".to_owned(),
+                content: "help me install ROCm in D:\\ROCm\\therock_venvs".to_owned(),
             }],
             max_tokens: None,
             rocm_tools: true,
@@ -34604,8 +34601,8 @@ Assistant is checking ROCm first.
 ROCm checks used
   Examine: ok
     os: windows
-    data_dir: C:\\Users\\jam\\.rocm
-    cache_dir: C:\\Users\\jam\\.rocm\\cache
+    data_dir: C:\\Users\\user\\.rocm
+    cache_dir: C:\\Users\\user\\.rocm\\cache
 
 Assistant after ROCm checks
 ROCm is installed and ready.";
@@ -34633,13 +34630,13 @@ Assistant is checking ROCm first.
 ROCm checks used
   Examine: ok
     os: windows
-    data_dir: C:\\Users\\jam\\.rocm
+    data_dir: C:\\Users\\user\\.rocm
 
 ROCm CLI summary
   GPU: AMD Radeon RX 9070 XT
   ROCm/TheRock: installed and active for ROCm CLI (gfx120X-all), 7.13.0a20260511
-  Install folder: D:\\jam\\temp\\therock_venvs
-  Downloads/cache: D:\\jam\\temp\\therock_venvs\\pip-cache
+  Install folder: D:\\ROCm\\therock_venvs
+  Downloads/cache: D:\\ROCm\\therock_venvs\\pip-cache
   Note: no global legacy ROCm install was found; ROCm CLI is using its managed TheRock runtime.";
 
         let display = super::chat_session_display_text(rendered);
@@ -34647,8 +34644,8 @@ ROCm CLI summary
         assert!(display.contains("Here is what I found on this computer."));
         assert!(display.contains("AMD Radeon RX 9070 XT"));
         assert!(display.contains("installed and active for ROCm CLI"));
-        assert!(display.contains("D:\\jam\\temp\\therock_venvs"));
-        assert!(display.contains("D:\\jam\\temp\\therock_venvs\\pip-cache"));
+        assert!(display.contains("D:\\ROCm\\therock_venvs"));
+        assert!(display.contains("D:\\ROCm\\therock_venvs\\pip-cache"));
         assert!(!display.contains("I checked ROCm"));
         assert!(!display.contains("provider:"));
         assert!(!display.contains("data_dir:"));
@@ -34670,7 +34667,7 @@ Recent output
   Warning: pip is checking candidates
 
 Full log
-  C:\\Users\\jam\\.rocm\\logs\\tui\\123-install.log";
+  C:\\Users\\user\\.rocm\\logs\\tui\\123-install.log";
 
         let display = super::chat_session_command_result_text("Install", false, summary);
         let detail = super::chat_session_command_result_detail("Install", false, summary);
@@ -34680,21 +34677,21 @@ Full log
         assert!(!display.contains("Recent command output"));
         assert!(!display.contains("Output: resolving torch wheels"));
         assert!(!display.contains("Warning: pip is checking candidates"));
-        assert!(!display.contains("C:\\Users\\jam\\.rocm\\logs\\tui\\123-install.log"));
+        assert!(!display.contains("C:\\Users\\user\\.rocm\\logs\\tui\\123-install.log"));
 
         assert!(detail.contains("Error: No matching distribution found for torch"));
         assert!(detail.contains("Live output"));
         assert!(detail.contains("Output: resolving torch wheels"));
         assert!(detail.contains("Warning: pip is checking candidates"));
         assert!(detail.contains("More details are available in Logs."));
-        assert!(!detail.contains("C:\\Users\\jam\\.rocm\\logs\\tui\\123-install.log"));
+        assert!(!detail.contains("C:\\Users\\user\\.rocm\\logs\\tui\\123-install.log"));
     }
 
     #[test]
     fn chat_session_next_prompt_includes_rocm_command_result() {
         let mut app = test_app();
         app.open_local_rocm_tools_chat_session(None);
-        let summary = "Install finished.\n\nRecent output\n  Output: ROCm installed into D:\\jam\\temp\\therock_venvs\n\nFull log\n  C:\\Users\\jam\\.rocm\\logs\\tui\\123-install.log";
+        let summary = "Install finished.\n\nRecent output\n  Output: ROCm installed into D:\\ROCm\\therock_venvs\n\nFull log\n  C:\\Users\\user\\.rocm\\logs\\tui\\123-install.log";
         app.push_chat_session_turn_with_detail(
             super::ChatSessionRole::Tool,
             super::chat_session_command_result_text("Install", true, summary),
@@ -34706,10 +34703,10 @@ Full log
         let prompt = app.chat_session_request_prompt("what should I do next?");
 
         assert!(prompt.contains("ROCm command result: Install finished."));
-        assert!(prompt.contains("ROCm installed into D:\\jam\\temp\\therock_venvs"));
+        assert!(prompt.contains("ROCm installed into D:\\ROCm\\therock_venvs"));
         assert!(prompt.contains("ROCm command result details:"));
         assert!(prompt.contains("More details are available in Logs."));
-        assert!(!prompt.contains("C:\\Users\\jam\\.rocm\\logs\\tui\\123-install.log"));
+        assert!(!prompt.contains("C:\\Users\\user\\.rocm\\logs\\tui\\123-install.log"));
         assert!(prompt.contains("New message:"));
         assert!(prompt.contains("what should I do next?"));
     }
@@ -34894,7 +34891,7 @@ Full log
         sender
             .send(super::RunningJobEvent::Stream {
                 stream: super::CommandOutputStream::Stdout,
-                line: "ROCm installed into D:\\jam\\temp\\therock_venvs".to_owned(),
+                line: "ROCm installed into D:\\ROCm\\therock_venvs".to_owned(),
             })
             .unwrap();
         sender
@@ -34922,15 +34919,15 @@ Full log
         assert!(
             !tool_turn
                 .content
-                .contains("ROCm installed into D:\\jam\\temp\\therock_venvs")
+                .contains("ROCm installed into D:\\ROCm\\therock_venvs")
         );
         assert!(!tool_turn.content.contains("Choose ROCm result"));
         assert!(tool_turn.detail.as_deref().is_some_and(|detail| {
-            detail.contains("ROCm installed into D:\\jam\\temp\\therock_venvs")
+            detail.contains("ROCm installed into D:\\ROCm\\therock_venvs")
         }));
         assert!(
             super::latest_chat_session_tool_detail(session).is_some_and(
-                |detail| detail.contains("ROCm installed into D:\\jam\\temp\\therock_venvs")
+                |detail| detail.contains("ROCm installed into D:\\ROCm\\therock_venvs")
             )
         );
         assert!(
@@ -35972,7 +35969,7 @@ Full log
         sender
             .send(super::RunningJobEvent::Finished(Ok(super::CommandOutput {
                 ok: true,
-                rendered: "ComfyUI\n  status: installed\n  models path: C:\\Users\\jam\\.rocm\\apps\\comfyui\\source\\models\n  next step: rocm comfyui start\n".to_owned(),
+                rendered: "ComfyUI\n  status: installed\n  models path: C:\\Users\\user\\.rocm\\apps\\comfyui\\source\\models\n  next step: rocm comfyui start\n".to_owned(),
                 chat_approval: None,
             })))
             .unwrap();
@@ -35995,7 +35992,7 @@ Full log
         assert!(
             tool_turn
                 .content
-                .contains("C:\\Users\\jam\\.rocm\\apps\\comfyui\\source\\models")
+                .contains("C:\\Users\\user\\.rocm\\apps\\comfyui\\source\\models")
         );
         assert!(!tool_turn.content.contains("ComfyUI finished."));
     }
@@ -36013,7 +36010,7 @@ Full log
             .send(super::RunningJobEvent::Finished(Ok(super::CommandOutput {
                 ok: true,
                 rendered: format!(
-                    "ComfyUI\n  status: running\n  URL: {url}\n  models path: C:\\Users\\jam\\.rocm\\apps\\comfyui\\source\\models\n"
+                    "ComfyUI\n  status: running\n  URL: {url}\n  models path: C:\\Users\\user\\.rocm\\apps\\comfyui\\source\\models\n"
                 ),
                 chat_approval: None,
             })))
@@ -36036,7 +36033,7 @@ Full log
         assert!(
             tool_turn
                 .content
-                .contains("C:\\Users\\jam\\.rocm\\apps\\comfyui\\source\\models")
+                .contains("C:\\Users\\user\\.rocm\\apps\\comfyui\\source\\models")
         );
         assert!(!tool_turn.content.contains("ComfyUI finished."));
 
@@ -36949,7 +36946,7 @@ Full log
             gfx_target: Some("gfx1201".to_owned()),
             therock_family: Some("gfx120X-all".to_owned()),
         };
-        let folder = r"D:\jam\temp\therock_venvs";
+        let folder = r"D:\ROCm\therock_venvs";
         app.request_screen_cli_approval_with_explanation(
             "Install ROCm",
             "Install",
@@ -36992,7 +36989,7 @@ Full log
     fn full_access_still_reviews_rocm_install_and_remove() {
         let mut app = test_app();
         app.config.permissions.mode = PERMISSIONS_MODE_FULL_ACCESS.to_owned();
-        let folder = r"D:\jam\temp\therock_venvs";
+        let folder = r"D:\ROCm\therock_venvs";
 
         app.request_screen_cli_approval_with_explanation(
             "Install ROCm",
@@ -37794,17 +37791,17 @@ Full log
             ),
             ("Preparing Python 3.12...", "Checking Python..."),
             (
-                "Using existing Python 3.12 at C:\\Users\\jam\\.rocm\\tools\\python\\python.exe.",
+                "Using existing Python 3.12 at C:\\Users\\user\\.rocm\\tools\\python\\python.exe.",
                 "Checking Python...",
             ),
             (
-                "Python 3.12 is ready at C:\\Users\\jam\\.rocm\\tools\\python\\python.exe.",
+                "Python 3.12 is ready at C:\\Users\\user\\.rocm\\tools\\python\\python.exe.",
                 "Checking Python...",
             ),
             ("Finding Python 3.12...", "Checking Python..."),
             ("Installing Python 3.12 via uv...", "Installing Python..."),
             (
-                "Creating Python environment at C:\\Users\\jam\\.rocm\\envs\\default.",
+                "Creating Python environment at C:\\Users\\user\\.rocm\\envs\\default.",
                 "Setting up Python...",
             ),
             (
@@ -39048,11 +39045,11 @@ Full log
     #[test]
     fn command_parser_preserves_quoted_windows_path_backslashes() {
         let parts = super::split_command_line(
-            r#"serve "C:\Users\jam\My Models\tiny.gguf" --engine llama.cpp"#,
+            r#"serve "C:\Users\user\My Models\tiny.gguf" --engine llama.cpp"#,
         )
         .expect("quoted windows path should parse");
 
-        assert_eq!(parts[1], r"C:\Users\jam\My Models\tiny.gguf");
+        assert_eq!(parts[1], r"C:\Users\user\My Models\tiny.gguf");
     }
 
     #[test]
@@ -40086,7 +40083,7 @@ Full log
     fn chat_session_message_box_wraps_and_scrolls_long_prompt() {
         let mut app = test_app();
         app.open_local_rocm_tools_chat_session(None);
-        let prompt = "install ROCm into D:\\jam\\temp\\therock_venvs and then explain exactly what folder will be used before you do anything ".repeat(8);
+        let prompt = "install ROCm into D:\\ROCm\\therock_venvs and then explain exactly what folder will be used before you do anything ".repeat(8);
         app.set_input(prompt);
 
         assert!(
@@ -44079,12 +44076,12 @@ Full log
                 "runtime_id": "runtime",
                 "runtime_key": "release",
                 "runtime_version": "7.13.0a20260511",
-                "runtime_root": "D:\\jam\\temp\\therock_venvs",
+                "runtime_root": "D:\\ROCm\\therock_venvs",
                 "python_executable": "python",
                 "source_url": "https://github.com/comfyanonymous/ComfyUI/archive/refs/heads/master.tar.gz",
                 "source_path": source_path,
                 "requirements_path": "requirements.txt",
-                "pip_cache_dir": "D:\\jam\\temp\\therock_venvs\\pip-cache",
+                "pip_cache_dir": "D:\\ROCm\\therock_venvs\\pip-cache",
                 "log_path": log_path,
                 "torch_version": "2.10.0",
                 "torch_cuda_available": true,

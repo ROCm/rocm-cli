@@ -197,7 +197,7 @@ pub(crate) fn home_rocm_dir() -> Option<PathBuf> {
 }
 
 fn project_dirs() -> Option<ProjectDirs> {
-    ProjectDirs::from("com", "powderluv", "rocm-cli")
+    ProjectDirs::from("org", "ROCm", "rocm-cli")
 }
 
 pub fn default_config_dir() -> Option<PathBuf> {
@@ -663,13 +663,13 @@ mod tests {
             return;
         }
 
-        let path = normalize_windows_runtime_path_text(r"D:\/jam/temp/therock_venvs");
+        let path = normalize_windows_runtime_path_text(r"D:\/path/to/therock_venvs");
 
         assert!(windows_runtime_path_text_is_absolute(&path));
         if std::path::MAIN_SEPARATOR == '\\' {
-            assert_eq!(path, r"D:\jam\temp\therock_venvs");
+            assert_eq!(path, r"D:\path\to\therock_venvs");
         } else {
-            assert_eq!(path, "D:/jam/temp/therock_venvs");
+            assert_eq!(path, "D:/path/to/therock_venvs");
         }
     }
 
@@ -679,13 +679,13 @@ mod tests {
             return;
         }
 
-        let path = normalize_windows_runtime_path_text("/D/jam/temp/therock_venvs");
+        let path = normalize_windows_runtime_path_text("/D/path/to/therock_venvs");
 
         assert!(windows_runtime_path_text_is_absolute(&path));
         if std::path::MAIN_SEPARATOR == '\\' {
-            assert_eq!(path, r"D:\jam\temp\therock_venvs");
+            assert_eq!(path, r"D:\path\to\therock_venvs");
         } else {
-            assert_eq!(path, "D:/jam/temp/therock_venvs");
+            assert_eq!(path, "D:/path/to/therock_venvs");
         }
     }
 
@@ -696,12 +696,12 @@ mod tests {
         }
 
         assert_eq!(
-            normalize_runtime_path_text_for_storage("/D/jam/temp/therock_venvs"),
-            r"D:\jam\temp\therock_venvs"
+            normalize_runtime_path_text_for_storage("/D/path/to/therock_venvs"),
+            r"D:\path\to\therock_venvs"
         );
         assert_eq!(
-            normalize_runtime_path_text_for_storage("D:/jam/temp/therock_venvs"),
-            r"D:\jam\temp\therock_venvs"
+            normalize_runtime_path_text_for_storage("D:/path/to/therock_venvs"),
+            r"D:\path\to\therock_venvs"
         );
     }
 
@@ -720,9 +720,9 @@ mod tests {
     #[test]
     fn runtime_path_normalization_accepts_windows_drive_forms() {
         let cases = [
-            (r"D:\jam\temp\therock_venvs", "D:/jam/temp/therock_venvs"),
-            ("D:/jam/temp/therock_venvs", "D:/jam/temp/therock_venvs"),
-            (r"D:\/jam/temp/therock_venvs", "D:/jam/temp/therock_venvs"),
+            (r"D:\path\to\therock_venvs", "D:/path/to/therock_venvs"),
+            ("D:/path/to/therock_venvs", "D:/path/to/therock_venvs"),
+            (r"D:\/path/to/therock_venvs", "D:/path/to/therock_venvs"),
         ];
         for (input, expected) in cases {
             assert_eq!(
@@ -763,7 +763,7 @@ mod tests {
 
     #[test]
     fn runtime_path_normalization_keeps_wsl_paths_linux_native() {
-        let wsl_path = "/mnt/d/jam/temp/therock_venvs";
+        let wsl_path = "/mnt/d/path/to/therock_venvs";
         assert_eq!(
             normalize_runtime_path_text_for_platform(wsl_path, RuntimePlatform::Linux),
             wsl_path
@@ -776,7 +776,7 @@ mod tests {
 
     #[test]
     fn runtime_path_normalization_does_not_treat_windows_drive_as_linux_absolute() {
-        let windows_path = r"D:\jam\temp\therock_venvs";
+        let windows_path = r"D:\path\to\therock_venvs";
         assert_eq!(
             normalize_runtime_path_text_for_platform(windows_path, RuntimePlatform::Linux),
             windows_path

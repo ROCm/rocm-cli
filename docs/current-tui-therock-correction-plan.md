@@ -6,7 +6,7 @@ history. It is retained as historical context, not as an open task list.
 
 ## Status
 
-Completed on the current `jam/updates` branch.
+Completed on the main branch.
 
 - Normal Windows users do not need to set `ROCM_CLI_THEROCK_FAMILY`; detection
   chooses the compatible TheRock family where GPU inventory is available.
@@ -120,8 +120,8 @@ git diff --check
 Historical WSL verification commands:
 
 ```powershell
-wsl.exe --cd /mnt/d/jam/rocm-cli -e env -i HOME=/home/jam PATH=/home/jam/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin CARGO_TARGET_DIR=/home/jam/.cache/rocm-cli-target cargo test -p rocm --bin rocm setup
-wsl.exe --cd /mnt/d/jam/rocm-cli -e env -i HOME=/home/jam PATH=/home/jam/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin CARGO_TARGET_DIR=/home/jam/.cache/rocm-cli-target cargo build --workspace
+wsl.exe --cd /mnt/d/path/to/rocm-cli -e env -i HOME=/home/user PATH=/home/user/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin CARGO_TARGET_DIR=/home/user/.cache/rocm-cli-target cargo test -p rocm --bin rocm setup
+wsl.exe --cd /mnt/d/path/to/rocm-cli -e env -i HOME=/home/user PATH=/home/user/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin CARGO_TARGET_DIR=/home/user/.cache/rocm-cli-target cargo build --workspace
 ```
 
 ### 7. UX Review Gate

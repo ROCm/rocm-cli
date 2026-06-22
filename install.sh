@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO="${ROCM_CLI_GITHUB_REPO:-powderluv/rocm-cli}"
+REPO="${ROCM_CLI_GITHUB_REPO:-ROCm/rocm-cli}"
 CHANNEL="${1:-release}"
 INSTALL_DIR="${ROCM_CLI_INSTALL_DIR:-${HOME}/.local/bin}"
 UPDATE_SHELL_PATH="${ROCM_CLI_UPDATE_SHELL_PATH:-1}"

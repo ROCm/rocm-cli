@@ -127,7 +127,7 @@ runtime installs, model artifacts, and supported upstream GPU targets.
 WSL live examine sanity after building with a Linux target directory:
 
 ```bash
-export CARGO_TARGET_DIR=/home/jam/.cache/rocm-cli-target
+export CARGO_TARGET_DIR=/home/user/.cache/rocm-cli-target
 cargo build --workspace
 rocm examine
 ```
@@ -994,7 +994,7 @@ from the managed TheRock SDK wheel directories:
 
 ```bash
 python3 scripts/atom_therock_gpu_test.py \
-  --engine /home/jam/.cache/rocm-cli-target/debug/rocm-engine-atom \
+  --engine /home/user/.cache/rocm-cli-target/debug/rocm-engine-atom \
   --model Qwen/Qwen3-0.6B
 ```
 
@@ -1013,7 +1013,7 @@ python scripts/vllm_therock_gpu_test.py --self-test
 
 # On Linux/WSL with vLLM installed in the active rocm-cli managed TheRock venv:
 python3 scripts/vllm_therock_gpu_test.py \
-  --engine /home/jam/.cache/rocm-cli-target/debug/rocm-engine-vllm \
+  --engine /home/user/.cache/rocm-cli-target/debug/rocm-engine-vllm \
   --model facebook/opt-125m
 ```
 
@@ -1049,7 +1049,7 @@ wheel directories:
 
 ```bash
 python3 scripts/sglang_therock_gpu_test.py \
-  --engine /home/jam/.cache/rocm-cli-target/debug/rocm-engine-sglang \
+  --engine /home/user/.cache/rocm-cli-target/debug/rocm-engine-sglang \
   --model Qwen/Qwen2.5-1.5B-Instruct
 ```
 
@@ -1096,9 +1096,9 @@ WSL command shape, using the WSL-built adapter and server:
 
 ```bash
 python3 scripts/llama_cpp_therock_gpu_test.py \
-  --engine /home/jam/.cache/rocm-cli-target/debug/rocm-engine-llama-cpp \
-  --llama-server /home/jam/.cache/rocm-cli-llama.cpp-build-hip/bin/llama-server \
-  --model-path /mnt/d/jam/rocm-cli/target/models/stories260K.gguf \
+  --engine /home/user/.cache/rocm-cli-target/debug/rocm-engine-llama-cpp \
+  --llama-server /home/user/.cache/rocm-cli-llama.cpp-build-hip/bin/llama-server \
+  --model-path /mnt/d/path/to/rocm-cli/target/models/stories260K.gguf \
   --timeout 120
 ```
 

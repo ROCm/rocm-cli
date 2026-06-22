@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use keyring_core::api::CredentialStoreApi;
 use keyring_core::{Entry, Error as KeyringError};
 
-const PROVIDER_KEY_SERVICE: &str = "powderluv.rocm-cli.provider-key";
+const PROVIDER_KEY_SERVICE: &str = "org.rocm.rocm-cli.provider-key";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum ProviderKeyState {

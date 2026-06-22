@@ -313,7 +313,7 @@ function Add-InstallDirToUserPath {
 }
 
 if ([string]::IsNullOrWhiteSpace($Repo)) {
-    $Repo = "powderluv/rocm-cli"
+    $Repo = "ROCm/rocm-cli"
 }
 
 if ([string]::IsNullOrWhiteSpace($Channel)) {

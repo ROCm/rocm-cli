@@ -40,7 +40,7 @@ rocm-cli managed TheRock runtime:
 
 ```bash
 python3 scripts/atom_therock_gpu_test.py \
-  --engine /home/jam/.cache/rocm-cli-target/debug/rocm-engine-atom \
+  --engine /home/user/.cache/rocm-cli-target/debug/rocm-engine-atom \
   --model Qwen/Qwen3-0.6B
 ```
 

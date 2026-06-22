@@ -3488,10 +3488,10 @@ mod tests {
 
     #[test]
     fn python_venv_args_use_python_default_linking() {
-        let args = python_venv_args(Path::new("/mnt/d/jam/rocm"));
+        let args = python_venv_args(Path::new("/mnt/d/path/to/rocm"));
 
         assert!(!args.iter().any(|arg| arg == "--copies"));
-        assert_eq!(args.last().map(String::as_str), Some("/mnt/d/jam/rocm"));
+        assert_eq!(args.last().map(String::as_str), Some("/mnt/d/path/to/rocm"));
     }
 
     #[test]
@@ -3916,6 +3916,15 @@ echo Python 3.12.10
             http_header_value(headers, "last-modified").as_deref(),
             Some("today")
         );
+    }
+
+    #[test]
+    fn windows_child_path_maps_ape_drive_paths() {
+        assert_eq!(
+            windows_child_path(Path::new("/D/path/to/rocm-cli/file.ps1")),
+            r"D:\path\to\rocm-cli\file.ps1"
+        );
+        assert_eq!(windows_child_path(Path::new("/c")), r"C:\");
     }
 
     #[test]

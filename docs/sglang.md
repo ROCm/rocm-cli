@@ -79,7 +79,7 @@ On a supported ROCm target, run the live acceptance harness from the repo root:
 
 ```bash
 python3 scripts/sglang_therock_gpu_test.py \
-  --engine /home/jam/.cache/rocm-cli-target/debug/rocm-engine-sglang \
+  --engine /home/user/.cache/rocm-cli-target/debug/rocm-engine-sglang \
   --model Qwen/Qwen2.5-1.5B-Instruct
 ```
 
