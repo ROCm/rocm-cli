@@ -49,11 +49,10 @@ The branch currently has local implementations for the V1 product surfaces:
   read-only/mutating boundaries, lifecycle logs, and audit records.
 - TUI command surfaces that open navigable screens or focused overlapping modal
   cards instead of transcript dumps.
-- Rust/Cosmopolitan single-file rocm-cli artifact that runs the real CLI/TUI on
-  Windows and WSL/Linux without extracting sibling `rocm`, `rocm.exe`, `rocmd`,
-  or first-party `rocm-engine-*` helper binaries. TheRock wheels, Python envs,
-  ComfyUI, ROCm libraries, and model files remain user-approved runtime content
-  installed on disk.
+- Native per-OS rocm-cli binary that runs the real CLI/TUI on Windows and
+  WSL/Linux, with first-party engines and the `rocmd` helper surface linked into
+  `rocm`. TheRock wheels, Python envs, ComfyUI, ROCm libraries, and model files
+  remain user-approved runtime content installed on disk.
 - CI and local verification hooks for all-target tests, clippy with warnings
   denied, release-readiness self-tests, installer lifecycle tests, and
   acceptance-harness self-tests.
@@ -69,7 +68,7 @@ The branch currently has local implementations for the V1 product surfaces:
 | SGLang live GPU acceptance | Adapter packaging, managed-runtime parity, explicit Windows gate, and offline selector tests exist. | Current local `gfx1201` host is blocked by upstream SGLang ROCm kernel support. |
 | Broader GPU-family CI | Normal Linux/Windows CI, local no-fallback smoke, self-hosted adapter detect/capabilities smoke, and local RDNA4 Windows/WSL acceptance exist. | More live serving coverage needs additional CI hardware or lab machines. |
 | Production driver-update feed | Local update-available event handling and reviewed driver-plan proposals exist. | A real AMD driver update source/feed must be defined before wiring production event detection. |
-| Universal-binary release publishing | The workspace-local Rust/Cosmopolitan APE build runs on Windows and WSL/Linux and has live GPU E2E coverage on this host. | The build still needs to be promoted from spike scripts into production release publishing and validated on native Linux hardware outside WSL. |
+| Multi-target release publishing | Native per-OS Windows and Linux release/nightly bundles are built and published by CI. | Broader native Linux hardware coverage (server/bare-metal Instinct) still needs validation outside the current Windows/WSL hosts. |
 | Future contained mutating actions | Current contained read-only checks and reviewed mutating proposals exist. | Additional mutating automation actions need explicit product requirements before implementation. |
 
 ## Verification Anchors
@@ -85,7 +84,6 @@ python scripts/pytorch_therock_gpu_test.py --self-test
 python scripts/llama_cpp_therock_gpu_test.py --self-test
 python scripts/comfyui_therock_gpu_test.py --self-test
 python scripts/local_assistant_therock_gpu_test.py --self-test
-python scripts/single_exe_release_gate.py
 ```
 
 Live GPU acceptance is opt-in because it installs packages and launches local
@@ -99,19 +97,20 @@ python scripts/local_assistant_therock_gpu_test.py --model qwen --require-tool-c
 python scripts/comfyui_therock_gpu_test.py
 ```
 
-Universal-binary live acceptance should use only the single-file artifact:
+Live acceptance can target the native release binary built by
+`cargo build --workspace --release` (`target\release\rocm.exe` on Windows,
+`target/release/rocm` on Linux/WSL):
 
 ```powershell
-python scripts\single_exe_release_gate.py --live-assistant --live-comfyui --generate-cat
-python scripts\local_assistant_therock_gpu_test.py --rocm .rocm-work\tests\rust-cosmopolitan\rocm-rust-cosmo-release.exe --engine lemonade --model qwen --require-tool-call
-python scripts\local_assistant_therock_gpu_test.py --rocm .rocm-work\tests\rust-cosmopolitan\rocm-rust-cosmo-release.exe --engine pytorch --model qwen --require-tool-call
-python scripts\comfyui_therock_gpu_test.py --rocm .rocm-work\tests\rust-cosmopolitan\rocm-rust-cosmo-release.exe
+python scripts\local_assistant_therock_gpu_test.py --rocm target\release\rocm.exe --engine lemonade --model qwen --require-tool-call
+python scripts\local_assistant_therock_gpu_test.py --rocm target\release\rocm.exe --engine pytorch --model qwen --require-tool-call
+python scripts\comfyui_therock_gpu_test.py --rocm target\release\rocm.exe
 ```
 
 WSL verification should run from the WSL filesystem when possible for better IO:
 
 ```bash
-export CARGO_TARGET_DIR=/home/jam/.cache/rocm-cli-target
+export CARGO_TARGET_DIR=/home/user/.cache/rocm-cli-target
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 python3 scripts/smoke_local.py --skip-build
@@ -121,14 +120,13 @@ python3 scripts/llama_cpp_therock_gpu_test.py --self-test
 python3 scripts/local_assistant_therock_gpu_test.py --self-test
 ```
 
-For WSL, run the same universal binary through the APE/Linux path, not as a
-Windows process:
+For WSL/Linux, build and run the native Linux binary directly:
 
 ```bash
-sh /home/jam/rocm-cli-e2e/bin/rocm doctor
-python3 scripts/local_assistant_therock_gpu_test.py --rocm /home/jam/rocm-cli-e2e/bin/rocm --rocm-launch-prefix sh --engine lemonade --model qwen --require-tool-call
-python3 scripts/local_assistant_therock_gpu_test.py --rocm /home/jam/rocm-cli-e2e/bin/rocm --rocm-launch-prefix sh --engine pytorch --model qwen --require-tool-call
-python3 scripts/comfyui_therock_gpu_test.py --rocm /home/jam/rocm-cli-e2e/bin/rocm --rocm-launch-prefix sh
+/home/user/rocm-cli-e2e/bin/rocm doctor
+python3 scripts/local_assistant_therock_gpu_test.py --rocm /home/user/rocm-cli-e2e/bin/rocm --engine lemonade --model qwen --require-tool-call
+python3 scripts/local_assistant_therock_gpu_test.py --rocm /home/user/rocm-cli-e2e/bin/rocm --engine pytorch --model qwen --require-tool-call
+python3 scripts/comfyui_therock_gpu_test.py --rocm /home/user/rocm-cli-e2e/bin/rocm
 ```
 
 ## Regression Rules
@@ -144,6 +142,5 @@ python3 scripts/comfyui_therock_gpu_test.py --rocm /home/jam/rocm-cli-e2e/bin/ro
   first-visible TUI screens unless the user opens an explicit detail/debug view.
 - Do not claim production signing, production hosted indexes, privileged driver
   acceptance, ATOM/SGLang live acceptance, broader GPU CI, production driver
-  feeds, native-Linux universal-binary acceptance, or production universal-
-  binary publishing until the required owner, hardware, upstream, or
-  infrastructure input exists and has passed acceptance.
+  feeds, or native-Linux server/bare-metal acceptance until the required owner,
+  hardware, upstream, or infrastructure input exists and has passed acceptance.

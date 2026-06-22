@@ -3516,16 +3516,6 @@ fn attach_background_stdio(command: &mut ProcessCommand, log_path: Option<&Path>
 
 #[cfg(not(windows))]
 fn managed_service_process_command(program: &Path, args: &[String]) -> ProcessCommand {
-    #[cfg(all(target_vendor = "cosmo", not(windows)))]
-    {
-        if rocm_core::runtime_is_linux() {
-            let mut command = ProcessCommand::new("sh");
-            command.arg(program);
-            command.args(args);
-            return command;
-        }
-    }
-
     let mut command = ProcessCommand::new(program);
     command.args(args);
     command
@@ -13883,7 +13873,7 @@ fn app_path_env_var_refs<'a>(vars: &'a [(&'static str, PathBuf)]) -> Vec<(&'stat
 
 fn managed_service_launcher_path() -> Result<PathBuf> {
     let current_exe = daemon_binary_path()?;
-    if rocm_core::runtime_is_windows() && !rocm_core::runtime_is_cosmopolitan_windows() {
+    if rocm_core::runtime_is_windows() {
         return Ok(rocm_core::normalize_runtime_path_for_storage(&current_exe));
     }
     Ok(current_exe)

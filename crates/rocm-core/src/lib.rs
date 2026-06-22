@@ -7,8 +7,6 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{IsTerminal, Read, Write, stdin, stdout};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
-#[cfg(all(target_vendor = "cosmo", not(windows)))]
-use std::os::fd::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -26,6 +24,7 @@ use windows_sys::Win32::System::Threading::{
 
 pub mod runtime;
 pub mod uv;
+use runtime::env_path_override;
 #[cfg(test)]
 use runtime::home_rocm_dir;
 pub use runtime::{
@@ -36,16 +35,14 @@ pub use runtime::{
     normalize_runtime_path_text_for_platform, normalize_runtime_path_text_for_storage,
     platform_binary_name, prepend_runtime_path, runtime_directory_label,
     runtime_drive_root_for_key, runtime_drive_roots, runtime_exe_suffix, runtime_home_dir,
-    runtime_install_root_is_protected, runtime_is_cosmopolitan_windows, runtime_is_linux,
-    runtime_is_windows, runtime_os_name, runtime_path_for_child, runtime_path_for_windows_child,
-    runtime_path_is_same_or_inside, runtime_path_list_join, runtime_path_list_split,
-    runtime_path_sort_key, runtime_path_text_is_absolute_for_host,
-    runtime_path_text_is_absolute_for_platform, runtime_paths_equivalent,
-    runtime_python_activation_hint, runtime_python_activation_script, runtime_python_bin_dir_name,
-    runtime_python_env_bin_dir, runtime_python_executable_in_env, runtime_python_executable_name,
-    runtime_rocm_library_filename, runtime_tcp_timeouts_are_supported, shell_command_for_host,
+    runtime_install_root_is_protected, runtime_is_linux, runtime_is_windows, runtime_os_name,
+    runtime_path_for_child, runtime_path_for_windows_child, runtime_path_is_same_or_inside,
+    runtime_path_list_join, runtime_path_list_split, runtime_path_sort_key,
+    runtime_path_text_is_absolute_for_host, runtime_path_text_is_absolute_for_platform,
+    runtime_paths_equivalent, runtime_python_activation_hint, runtime_python_activation_script,
+    runtime_python_bin_dir_name, runtime_python_env_bin_dir, runtime_python_executable_in_env,
+    runtime_python_executable_name, runtime_rocm_library_filename, shell_command_for_host,
 };
-use runtime::{env_path_override, runtime_path_for_child_process};
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, ensure_uv_binary, uv_binary_name, uv_command_env,
     uv_http_timeout_secs, uv_pip_freeze_args, uv_pip_install_base, uv_venv_args,
@@ -56,9 +53,9 @@ pub const DEFAULT_LOCAL_HOST: &str = "127.0.0.1";
 const OPTIONAL_COMMAND_TIMEOUT: Duration = Duration::from_millis(1_500);
 const WINDOWS_INVENTORY_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT: &str = r#"$gpus = Get-CimInstance -ClassName Win32_VideoController -Property Name,DriverVersion,PNPDeviceID,AdapterCompatibility | Where-Object { $_.PNPDeviceID -match 'VEN_1002' -or $_.AdapterCompatibility -match 'AMD|Advanced Micro Devices' -or $_.Name -match 'AMD|Radeon|Instinct' }; foreach ($gpu in $gpus) { "GPU`t$($gpu.Name)`t$($gpu.DriverVersion)`t$($gpu.PNPDeviceID)" }"#;
-#[cfg(any(windows, target_vendor = "cosmo"))]
+#[cfg(windows)]
 const WINDOWS_PNP_ENTITY_INVENTORY_SCRIPT: &str = r#"$displayGuid = '{4d36e968-e325-11ce-bfc1-08002be10318}'; $gpus = Get-CimInstance -ClassName Win32_PnPEntity -Property Name,DeviceID,PNPClass,ClassGuid,Manufacturer | Where-Object { (($_.PNPClass -eq 'Display' -or $_.ClassGuid -eq $displayGuid) -and ($_.DeviceID -match 'VEN_1002' -or $_.Name -match 'AMD|Radeon|Instinct|Graphics' -or $_.Manufacturer -match 'AMD|Advanced Micro Devices')) -or ($_.DeviceID -match 'PCI\\VEN_1002' -and $_.Name -match 'Radeon|Instinct|Graphics') }; foreach ($gpu in $gpus) { "GPU`t$($gpu.Name)`t`t$($gpu.DeviceID)" }"#;
-#[cfg(any(windows, target_vendor = "cosmo"))]
+#[cfg(windows)]
 const WINDOWS_SYSTEM_INVENTORY_SCRIPT: &str = r#"$cpu = Get-CimInstance -ClassName Win32_Processor -Property Name | Select-Object -First 1 -ExpandProperty Name; if ($cpu) { "CPU`t$cpu" }; $ram = Get-CimInstance -ClassName Win32_ComputerSystem -Property TotalPhysicalMemory | Select-Object -First 1 -ExpandProperty TotalPhysicalMemory; if ($ram) { "RAM`t$ram" }"#;
 
 pub fn format_host_for_url(host: &str) -> String {
@@ -97,9 +94,6 @@ pub fn parse_http_endpoint(endpoint_url: &str) -> Option<(String, u16)> {
 }
 
 pub fn download_file_to_path(url: &str, destination: &Path, timeout: Duration) -> Result<()> {
-    if cfg!(target_vendor = "cosmo") {
-        return download_file_with_curl(url, destination, timeout);
-    }
     let response = ureq::get(url)
         .timeout(timeout)
         .call()
@@ -117,39 +111,6 @@ pub fn download_file_to_path(url: &str, destination: &Path, timeout: Duration) -
     std::io::copy(&mut reader, &mut file)
         .with_context(|| format!("failed to write {}", destination.display()))?;
     Ok(())
-}
-
-fn download_file_with_curl(url: &str, destination: &Path, timeout: Duration) -> Result<()> {
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let stderr_path = destination.with_extension("curl-stderr.txt");
-    let max_time = timeout.as_secs().max(1).to_string();
-    let curl_command = platform_binary_name("curl");
-    let status = Command::new(curl_command)
-        .args(["-fL", "--retry", "3", "--connect-timeout", "30"])
-        .args(["--max-time", &max_time])
-        .arg("--stderr")
-        .arg(runtime_path_for_child_process(&stderr_path))
-        .arg("-o")
-        .arg(runtime_path_for_child_process(destination))
-        .arg(url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .with_context(|| format!("failed to launch curl download for {url}"))?;
-    if status.success() {
-        let _ = fs::remove_file(stderr_path);
-        return Ok(());
-    }
-    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
-    let _ = fs::remove_file(stderr_path);
-    bail!(
-        "curl download failed for {url} with status {status}: {}",
-        stderr.trim()
-    )
 }
 
 pub fn http_get_text(endpoint_url: &str, path: &str, timeout: Duration) -> Result<String> {
@@ -290,88 +251,23 @@ pub fn connect_tcp_stream(host: &str, port: u16, timeout: Duration) -> Result<Tc
         .with_context(|| format!("no socket addresses resolved for {host}:{port}"))?;
     let stream =
         TcpStream::connect(addr).with_context(|| format!("failed to connect to {host}:{port}"))?;
-    if runtime_tcp_timeouts_are_supported() {
-        stream.set_read_timeout(Some(timeout)).ok();
-        stream.set_write_timeout(Some(timeout)).ok();
-    }
+    stream.set_read_timeout(Some(timeout)).ok();
+    stream.set_write_timeout(Some(timeout)).ok();
     Ok(stream)
 }
 
 pub fn write_all_tcp_stream(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
-    #[cfg(all(target_vendor = "cosmo", not(windows)))]
-    {
-        if runtime_is_windows() {
-            return cosmo_send_all(stream, bytes);
-        }
-    }
     stream
         .write_all(bytes)
         .context("failed to write to TCP stream")
 }
 
 pub fn read_tcp_stream_to_string(stream: &mut TcpStream) -> Result<String> {
-    #[cfg(all(target_vendor = "cosmo", not(windows)))]
-    {
-        if runtime_is_windows() {
-            return cosmo_recv_to_string(stream);
-        }
-    }
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
         .context("failed to read TCP stream")?;
     Ok(response)
-}
-
-#[cfg(all(target_vendor = "cosmo", not(windows)))]
-#[allow(unsafe_code)] // libc socket FFI
-fn cosmo_send_all(stream: &TcpStream, mut bytes: &[u8]) -> Result<()> {
-    let fd = stream.as_raw_fd();
-    while !bytes.is_empty() {
-        let sent = unsafe { libc::send(fd, bytes.as_ptr().cast::<libc::c_void>(), bytes.len(), 0) };
-        if sent < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error).context("failed to send TCP request");
-        }
-        if sent == 0 {
-            bail!("TCP send returned 0 bytes");
-        }
-        bytes = &bytes[sent as usize..];
-    }
-    Ok(())
-}
-
-#[cfg(all(target_vendor = "cosmo", not(windows)))]
-#[allow(unsafe_code)] // libc socket FFI
-fn cosmo_recv_to_string(stream: &TcpStream) -> Result<String> {
-    let fd = stream.as_raw_fd();
-    let mut response = Vec::new();
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let received = unsafe {
-            libc::recv(
-                fd,
-                buffer.as_mut_ptr().cast::<libc::c_void>(),
-                buffer.len(),
-                0,
-            )
-        };
-        if received < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error).context("failed to receive TCP response");
-        }
-        if received == 0 {
-            break;
-        }
-        response.extend_from_slice(&buffer[..received as usize]);
-    }
-    String::from_utf8(response).context("TCP response was not valid UTF-8")
 }
 
 #[cfg(windows)]
@@ -1013,12 +909,12 @@ struct WindowsDisplayAdapter {
 }
 
 impl WindowsDoctorInventory {
-    #[cfg(any(windows, target_vendor = "cosmo"))]
+    #[cfg(windows)]
     fn is_empty(&self) -> bool {
         self.cpu_model.is_none() && self.system_ram_gib.is_none() && self.displays.is_empty()
     }
 
-    #[cfg(any(windows, target_vendor = "cosmo"))]
+    #[cfg(windows)]
     fn merge_missing_from(&mut self, mut other: WindowsDoctorInventory) {
         if self.cpu_model.is_none() {
             self.cpu_model = other.cpu_model.take();
@@ -1582,7 +1478,7 @@ fn legacy_rocm_candidate_exists(candidate: &Path) -> bool {
         })
 }
 
-#[cfg(any(windows, target_vendor = "cosmo"))]
+#[cfg(windows)]
 fn detect_windows_amd_display_driver() -> Option<String> {
     if !runtime_is_windows() {
         return None;
@@ -1593,12 +1489,12 @@ fn detect_windows_amd_display_driver() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-#[cfg(not(any(windows, target_vendor = "cosmo")))]
+#[cfg(not(windows))]
 const fn detect_windows_amd_display_driver() -> Option<String> {
     None
 }
 
-#[cfg(any(windows, target_vendor = "cosmo"))]
+#[cfg(windows)]
 fn detect_windows_doctor_inventory() -> Option<WindowsDoctorInventory> {
     if !runtime_is_windows() {
         return None;
@@ -1617,16 +1513,16 @@ fn detect_windows_doctor_inventory() -> Option<WindowsDoctorInventory> {
     {
         inventory.merge_missing_from(pnp);
     }
-    if inventory.cpu_model.is_none() || inventory.system_ram_gib.is_none() {
-        if let Some(system) = detect_windows_system_inventory_from_cim() {
-            inventory.merge_missing_from(system);
-        }
+    if (inventory.cpu_model.is_none() || inventory.system_ram_gib.is_none())
+        && let Some(system) = detect_windows_system_inventory_from_cim()
+    {
+        inventory.merge_missing_from(system);
     }
 
     (!inventory.is_empty()).then_some(inventory)
 }
 
-#[cfg(any(windows, target_vendor = "cosmo"))]
+#[cfg(windows)]
 fn detect_windows_doctor_inventory_from_pnputil() -> Option<WindowsDoctorInventory> {
     if !runtime_is_windows() {
         return None;
@@ -1639,7 +1535,7 @@ fn detect_windows_doctor_inventory_from_pnputil() -> Option<WindowsDoctorInvento
     .map(|output| parse_windows_pnputil_display_inventory(&output))
 }
 
-#[cfg(any(windows, target_vendor = "cosmo"))]
+#[cfg(windows)]
 fn detect_windows_doctor_inventory_from_video_controller() -> Option<WindowsDoctorInventory> {
     if !runtime_is_windows() {
         return None;
@@ -1658,7 +1554,7 @@ fn detect_windows_doctor_inventory_from_video_controller() -> Option<WindowsDoct
     .map(|output| parse_windows_doctor_inventory(&output))
 }
 
-#[cfg(any(windows, target_vendor = "cosmo"))]
+#[cfg(windows)]
 fn detect_windows_system_inventory_from_cim() -> Option<WindowsDoctorInventory> {
     if !runtime_is_windows() {
         return None;
@@ -1677,7 +1573,7 @@ fn detect_windows_system_inventory_from_cim() -> Option<WindowsDoctorInventory> 
     .map(|output| parse_windows_doctor_inventory(&output))
 }
 
-#[cfg(any(windows, target_vendor = "cosmo"))]
+#[cfg(windows)]
 fn detect_windows_doctor_inventory_from_pnp_entity() -> Option<WindowsDoctorInventory> {
     if !runtime_is_windows() {
         return None;
@@ -1696,19 +1592,19 @@ fn detect_windows_doctor_inventory_from_pnp_entity() -> Option<WindowsDoctorInve
     .map(|output| parse_windows_doctor_inventory(&output))
 }
 
-#[cfg(not(any(windows, target_vendor = "cosmo")))]
+#[cfg(not(windows))]
 const fn detect_windows_doctor_inventory() -> Option<WindowsDoctorInventory> {
     None
 }
 
-#[cfg(any(windows, target_vendor = "cosmo", test))]
+#[cfg(any(windows, test))]
 fn clean_windows_display_name(value: &str) -> String {
     let value = value.trim();
     let value = value.rsplit_once(';').map_or(value, |(_, name)| name);
     value.trim().to_owned()
 }
 
-#[cfg_attr(all(not(windows), not(target_vendor = "cosmo")), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code))]
 fn parse_windows_doctor_inventory(text: &str) -> WindowsDoctorInventory {
     let mut inventory = WindowsDoctorInventory::default();
 
@@ -1753,7 +1649,7 @@ fn parse_windows_doctor_inventory(text: &str) -> WindowsDoctorInventory {
     inventory
 }
 
-#[cfg(any(windows, target_vendor = "cosmo", test))]
+#[cfg(any(windows, test))]
 fn parse_windows_pnputil_display_inventory(text: &str) -> WindowsDoctorInventory {
     let mut inventory = WindowsDoctorInventory::default();
     let mut name: Option<String> = None;
@@ -1802,7 +1698,7 @@ fn parse_windows_pnputil_display_inventory(text: &str) -> WindowsDoctorInventory
     inventory
 }
 
-#[cfg(any(windows, target_vendor = "cosmo", test))]
+#[cfg(any(windows, test))]
 fn push_windows_pnputil_display(
     inventory: &mut WindowsDoctorInventory,
     name: &mut Option<String>,
@@ -1884,7 +1780,7 @@ pub fn detect_host_gpu_diagnostics() -> String {
     output
 }
 
-#[cfg(any(windows, target_vendor = "cosmo"))]
+#[cfg(windows)]
 fn append_windows_gpu_probe_diagnostics(output: &mut String) {
     append_windows_probe_diagnostics(
         output,
@@ -1924,10 +1820,10 @@ fn append_windows_gpu_probe_diagnostics(output: &mut String) {
     );
 }
 
-#[cfg(not(any(windows, target_vendor = "cosmo")))]
+#[cfg(not(windows))]
 const fn append_windows_gpu_probe_diagnostics(_output: &mut String) {}
 
-#[cfg(any(windows, target_vendor = "cosmo"))]
+#[cfg(windows)]
 fn append_windows_probe_diagnostics(
     output: &mut String,
     label: &str,
@@ -1982,14 +1878,14 @@ fn append_windows_probe_diagnostics(
     append_diagnostic_stream(output, "stderr", &result.stderr);
 }
 
-#[cfg(any(windows, target_vendor = "cosmo"))]
+#[cfg(windows)]
 fn empty_as_unknown(value: &str) -> &str {
     let value = value.trim();
     if value.is_empty() { "<unknown>" } else { value }
 }
 
 #[derive(Debug)]
-#[cfg(any(windows, target_vendor = "cosmo"))]
+#[cfg(windows)]
 struct DiagnosticCommandResult {
     program: Option<PathBuf>,
     status: Option<String>,
@@ -1999,7 +1895,7 @@ struct DiagnosticCommandResult {
     timed_out: bool,
 }
 
-#[cfg(any(windows, target_vendor = "cosmo"))]
+#[cfg(windows)]
 fn capture_diagnostic_command(
     program: &str,
     args: &[&str],
@@ -2103,7 +1999,7 @@ fn capture_diagnostic_command(
     }
 }
 
-#[cfg(any(windows, target_vendor = "cosmo"))]
+#[cfg(windows)]
 fn append_diagnostic_stream(output: &mut String, name: &str, text: &str) {
     use std::fmt::Write as _;
     let mut lines = text
@@ -2123,7 +2019,7 @@ fn append_diagnostic_stream(output: &mut String, name: &str, text: &str) {
     }
 }
 
-#[cfg(any(windows, target_vendor = "cosmo"))]
+#[cfg(windows)]
 fn truncate_diagnostic_line(line: &str, max_chars: usize) -> String {
     let mut chars = line.chars();
     let truncated = chars.by_ref().take(max_chars).collect::<String>();
@@ -2356,10 +2252,6 @@ pub fn prepend_runtime_paths(
     entries: &[PathBuf],
     current: Option<OsString>,
 ) -> Result<Option<OsString>> {
-    if runtime_is_cosmopolitan_windows() {
-        return Ok(prepend_cosmopolitan_windows_runtime_paths(entries, current));
-    }
-
     let mut parts = Vec::new();
     for entry in entries {
         push_existing_runtime_path(&mut parts, entry.clone());
@@ -2377,41 +2269,6 @@ pub fn prepend_runtime_paths(
         std::env::join_paths(parts)
             .map(Some)
             .context("failed to join runtime environment paths")
-    }
-}
-
-fn prepend_cosmopolitan_windows_runtime_paths(
-    entries: &[PathBuf],
-    current: Option<OsString>,
-) -> Option<OsString> {
-    let mut parts = Vec::new();
-    for entry in entries {
-        if entry.exists() {
-            push_unique_text(
-                &mut parts,
-                normalize_runtime_path_text_for_storage(&entry.display().to_string()),
-            );
-        }
-    }
-    if let Some(current) = current.and_then(|value| value.into_string().ok()) {
-        for entry in current
-            .split(';')
-            .map(str::trim)
-            .filter(|entry| !entry.is_empty())
-        {
-            push_unique_text(&mut parts, normalize_runtime_path_text_for_storage(entry));
-        }
-    }
-    (!parts.is_empty()).then(|| OsString::from(parts.join(";")))
-}
-
-fn push_unique_text(parts: &mut Vec<String>, value: String) {
-    if !value.is_empty()
-        && !parts
-            .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(&value))
-    {
-        parts.push(value);
     }
 }
 
@@ -2975,7 +2832,7 @@ fn windows_absolute_tool_candidates(program: &str) -> Vec<String> {
     }
 }
 
-#[cfg(any(windows, target_vendor = "cosmo"))]
+#[cfg(windows)]
 fn detect_windows_display_gfx_target() -> Option<String> {
     if !runtime_is_windows() {
         return None;
@@ -2995,7 +2852,7 @@ fn detect_windows_display_gfx_target() -> Option<String> {
     .and_then(|output| parse_windows_display_gfx_target(&output))
 }
 
-#[cfg(not(any(windows, target_vendor = "cosmo")))]
+#[cfg(not(windows))]
 const fn detect_windows_display_gfx_target() -> Option<String> {
     None
 }
@@ -7533,25 +7390,6 @@ Class Name:                Display
             }
         }
         fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn cosmopolitan_windows_runtime_path_join_preserves_drive_colons() {
-        if !runtime_is_windows() {
-            return;
-        }
-
-        let joined = prepend_cosmopolitan_windows_runtime_paths(
-            &[],
-            Some(OsString::from(r"C:\Tools;D:\ROCm\bin")),
-        )
-        .expect("expected PATH text");
-        let joined = joined.to_string_lossy();
-
-        assert!(joined.contains(r"C:\Tools"));
-        assert!(joined.contains(r"D:\ROCm\bin"));
-        assert!(!joined.contains(r"C;\Tools"));
-        assert!(!joined.contains(r"D;\ROCm"));
     }
 
     #[test]

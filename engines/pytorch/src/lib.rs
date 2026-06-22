@@ -1467,10 +1467,7 @@ fn create_or_update_env_manifest(request: &InstallRequest) -> Result<EngineEnvMa
         }
     }
 
-    let installed_packages = if cosmo_windows_host() {
-        installed_package_specs_from_runtime_metadata(&python_executable_string)
-            .context("capture managed pytorch env lockfile from package metadata")?
-    } else {
+    let installed_packages = {
         let freeze_args = uv_pip_freeze_args(&python_executable);
         let freeze = capture_uv_command(
             &uv,
@@ -1487,12 +1484,7 @@ fn create_or_update_env_manifest(request: &InstallRequest) -> Result<EngineEnvMa
     fs::write(&lock_path, &freeze)
         .with_context(|| format!("failed to write {}", lock_path.display()))?;
     let lock_hash = simple_hash(&freeze);
-    let torch_runtime_probe = if cosmo_windows_host() {
-        warnings.push(
-            "managed PyTorch runtime probe deferred for the universal Windows launcher".to_owned(),
-        );
-        None
-    } else {
+    let torch_runtime_probe = {
         match probe_torch_runtime(&python_executable_string) {
             Ok(probe) => {
                 if therock_family.is_some() {
@@ -1713,9 +1705,6 @@ fn runtime_python_executable_for_selector(
 }
 
 fn runtime_python_major_minor(python_executable: &str) -> Result<String> {
-    if cosmo_windows_host() {
-        return Ok("3.12".to_owned());
-    }
     let output = capture_command(
         python_executable,
         [
@@ -1844,13 +1833,9 @@ fn serve_http(
         .env("PYTHONUNBUFFERED", "1")
         .env("TOKENIZERS_PARALLELISM", "false")
         .stdin(Stdio::null());
-    if cosmo_windows_host() {
-        worker_command.stdout(Stdio::null()).stderr(Stdio::null());
-    } else {
-        worker_command
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
-    }
+    worker_command
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
     let mut child = worker_command
         .spawn()
         .context("failed to start python worker for pytorch engine")?;
@@ -2431,12 +2416,8 @@ fn load_runtime_registry_manifest_path(path: &Path) -> Result<RuntimeRegistryMan
 }
 
 fn pinned_torch_package_specs_from_runtime(python_executable: &str) -> Result<Vec<String>> {
-    match pinned_torch_package_specs_from_runtime_metadata(python_executable) {
-        Ok(specs) => return Ok(specs),
-        Err(metadata_error) if cosmo_windows_host() => {
-            bail!("failed to inspect runtime package metadata: {metadata_error}");
-        }
-        Err(_) => {}
+    if let Ok(specs) = pinned_torch_package_specs_from_runtime_metadata(python_executable) {
+        return Ok(specs);
     }
 
     let code = format!(
@@ -2992,7 +2973,7 @@ where
     I: IntoIterator<Item = &'a str>,
 {
     let args = args.into_iter().map(ToOwned::to_owned).collect::<Vec<_>>();
-    if interactive_terminal() || cosmo_windows_host() {
+    if interactive_terminal() {
         let status = Command::new(command_program(program))
             .args(&args)
             .stdin(Stdio::null())
@@ -3119,10 +3100,6 @@ fn command_program(program: &str) -> String {
 
 fn command_path(path: &Path) -> String {
     normalize_runtime_path_text_for_host(&path.display().to_string())
-}
-
-const fn cosmo_windows_host() -> bool {
-    runtime_is_windows() && !cfg!(windows)
 }
 
 struct CapturedCommand {

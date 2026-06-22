@@ -19,6 +19,8 @@ env:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
+    needs: [fmt, clippy]
     steps:
       - uses: actions/checkout@v6
 
@@ -60,6 +62,8 @@ jobs:
     runs-on: windows-latest
     env:
       CARGO_INCREMENTAL: "0"
+    # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
+    needs: [fmt, clippy]
     steps:
       - uses: actions/checkout@v6
 
@@ -205,58 +209,7 @@ jobs:
           }
           if ($findings) { $findings | Format-Table -AutoSize; exit 1 }
 
-  gpu-smoke:
-    name: GPU Smoke (gfx1151)
-    runs-on: [self-hosted, windows-gfx1151-gpu-rocm]
-    needs: [windows-build-and-test, fmt, clippy]
-    # Temporarily disabled: the gfx1151 self-hosted runner isn't picking up the job / GPU smoke isn't working yet.
-    # To re-enable, restore:
-    # if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-    if: false
-    timeout-minutes: 30
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-
-      - name: Build workspace
-        run: cargo build --workspace --all-targets
-
-      - name: Host detection
-        run: .\target\debug\rocm.exe doctor
-
-      - name: Engine detection
-        run: .\target\debug\rocm-engine-pytorch.exe detect
-
-      - name: Engine capabilities
-        run: .\target\debug\rocm-engine-pytorch.exe capabilities
-
-      - name: llama.cpp adapter detection
-        run: .\target\debug\rocm-engine-llama-cpp.exe detect
-
-      - name: llama.cpp adapter capabilities
-        run: .\target\debug\rocm-engine-llama-cpp.exe capabilities
-
-      - name: ATOM adapter detection
-        run: .\target\debug\rocm-engine-atom.exe detect
-
-      - name: ATOM adapter capabilities
-        run: .\target\debug\rocm-engine-atom.exe capabilities
-
-      - name: vLLM adapter detection
-        run: .\target\debug\rocm-engine-vllm.exe detect
-
-      - name: vLLM adapter capabilities
-        run: .\target\debug\rocm-engine-vllm.exe capabilities
-
-      - name: SGLang adapter detection
-        run: .\target\debug\rocm-engine-sglang.exe detect
-
-      - name: SGLang adapter capabilities
-        run: .\target\debug\rocm-engine-sglang.exe capabilities
-
-      - name: Resolve large-model recipe
-        run: .\target\debug\rocm-engine-pytorch.exe resolve-model qwen32b
+  # Hardware (real AMD GPU / WSL) smoke tests on dedicated self-hosted runners
+  # are intentionally not part of this workflow yet. See
+  # docs/ci-hardware-testing.md for the planned design; they will land in a
+  # follow-up PR.

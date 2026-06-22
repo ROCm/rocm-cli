@@ -161,7 +161,7 @@ def parse_args() -> argparse.Namespace:
         "--rocm-launch-prefix",
         nargs="+",
         default=[],
-        help="prefix used to launch rocm, for example `sh` for WSL APE validation",
+        help="optional prefix used to launch rocm, for example a wrapper command",
     )
     parser.add_argument("--runtime-id", help="exact managed TheRock runtime key")
     parser.add_argument("--env-id", help="managed engine env id")

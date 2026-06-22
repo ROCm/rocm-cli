@@ -1049,20 +1049,9 @@ fn extract_archive(archive: &Path, destination: &Path) -> Result<()> {
     let stderr_path = destination.join("extract-stderr.txt");
     let stderr_file = fs::File::create(&stderr_path)
         .with_context(|| format!("failed to create {}", stderr_path.display()))?;
-    let mut command = if runtime_is_cosmopolitan_windows() {
-        ProcessCommand::new("tar.exe")
-    } else {
-        ProcessCommand::new("tar")
-    };
+    let mut command = ProcessCommand::new("tar");
     command.arg(if runtime_is_windows() { "-xf" } else { "-xzf" });
-    if runtime_is_cosmopolitan_windows() {
-        command
-            .arg(windows_child_path(archive))
-            .arg("-C")
-            .arg(windows_child_path(destination));
-    } else {
-        command.arg(archive).arg("-C").arg(destination);
-    }
+    command.arg(archive).arg("-C").arg(destination);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1096,10 +1085,6 @@ fn windows_child_path(path: &Path) -> String {
         return format!("{drive}:\\");
     }
     raw
-}
-
-const fn runtime_is_cosmopolitan_windows() -> bool {
-    runtime_is_windows() && std::path::MAIN_SEPARATOR == '/'
 }
 
 fn find_embeddable_root(extract_root: &Path) -> Result<PathBuf> {
@@ -2156,15 +2141,6 @@ mod tests {
             lemonade_root(&paths, Some(&engine_root)),
             normalize_runtime_path_for_host(&engine_root).join(ENGINE_NAME)
         );
-    }
-
-    #[test]
-    fn windows_child_path_maps_ape_drive_paths() {
-        assert_eq!(
-            windows_child_path(Path::new("/D/jam/rocm-cli/file.zip")),
-            r"D:\jam\rocm-cli\file.zip"
-        );
-        assert_eq!(windows_child_path(Path::new("/c")), r"C:\");
     }
 
     #[test]
