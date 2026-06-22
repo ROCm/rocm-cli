@@ -459,6 +459,88 @@ pub fn terminate_process(pid: u32) -> Result<()> {
     }
 }
 
+/// Terminate `pid` together with every transitive child process.
+///
+/// Long-running engines such as vLLM spawn helper subprocesses (for example the
+/// `EngineCore` worker that holds the GPU allocation). Signalling only the
+/// launcher PID leaves those workers reparented to init, where they keep the
+/// model resident and the device memory pinned. Walking the descendant tree and
+/// signalling each process avoids that leak.
+#[cfg(not(windows))]
+#[allow(unsafe_code)] // libc FFI
+pub fn terminate_process_tree(pid: u32) -> Result<()> {
+    let mut last_error: Option<(u32, std::io::Error)> = None;
+    for target in collect_process_tree(pid) {
+        let status = unsafe { libc::kill(target.cast_signed(), libc::SIGTERM) };
+        if status != 0 {
+            let error = std::io::Error::last_os_error();
+            // A process that already exited (ESRCH) is not a failure here.
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                last_error = Some((target, error));
+            }
+        }
+    }
+    if let Some((target, error)) = last_error {
+        return Err(error).with_context(|| format!("failed to terminate process {target}"));
+    }
+    Ok(())
+}
+
+/// Collect `root` plus all of its transitive descendants by reading `/proc`.
+///
+/// On platforms without `/proc` (for example macOS) only `root` is returned, so
+/// callers degrade to single-process termination rather than failing.
+#[cfg(not(windows))]
+fn collect_process_tree(root: u32) -> Vec<u32> {
+    let mut children: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            if let Some(ppid) = read_parent_pid(pid) {
+                children.entry(ppid).or_default().push(pid);
+            }
+        }
+    }
+
+    let mut order = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        order.push(pid);
+        if let Some(kids) = children.get(&pid) {
+            stack.extend(kids.iter().copied());
+        }
+    }
+    order
+}
+
+/// Read the parent PID of `pid` from `/proc/<pid>/stat`.
+///
+/// The `comm` field can contain spaces and parentheses, so the parent PID is
+/// parsed from the text after the final `)`.
+#[cfg(not(windows))]
+fn read_parent_pid(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.get(stat.rfind(')')? + 1..)?;
+    let mut fields = after_comm.split_whitespace();
+    let _state = fields.next()?;
+    fields.next()?.parse::<u32>().ok()
+}
+
+/// Terminate `pid` together with every transitive child process.
+///
+/// The Windows implementation falls back to terminating the single process; the
+/// engines that rely on descendant cleanup are Unix-only.
+#[cfg(windows)]
+pub fn terminate_process_tree(pid: u32) -> Result<()> {
+    terminate_process(pid)
+}
+
 #[cfg(windows)]
 #[allow(unsafe_code)] // Win32 FFI
 pub fn process_is_running(pid: u32) -> bool {
@@ -4527,6 +4609,11 @@ pub struct ModelRecipeEngineRecord {
     pub unsupported_combinations: Vec<ModelRecipeUnsupportedCombinationRecord>,
     #[serde(default)]
     pub notes: Vec<String>,
+    /// Overrides the recipe `canonical_model_id` when this engine serves the model.
+    /// Lets a single alias resolve to engine-specific artifacts (for example a GGUF
+    /// id for Lemonade versus a Hugging Face repo id for vLLM).
+    #[serde(default)]
+    pub model_id_override: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -5182,11 +5269,15 @@ fn validate_model_recipe_engine_record(
     for note in &engine_recipe.notes {
         require_nonempty(note, "engine recipe note")?;
     }
+    if let Some(model_id_override) = engine_recipe.model_id_override.as_deref() {
+        require_nonempty(model_id_override, "engine model id override")?;
+    }
     if engine_recipe.required_flags.is_empty()
         && engine_recipe.parser_settings.is_empty()
         && engine_recipe.preferred_endpoint.is_none()
         && engine_recipe.unsupported_combinations.is_empty()
         && engine_recipe.notes.is_empty()
+        && engine_recipe.model_id_override.is_none()
     {
         bail!(
             "engine recipe for `{}` on `{canonical_model_id}` must not be empty",
@@ -5284,7 +5375,11 @@ pub fn builtin_model_recipes() -> Vec<ModelRecipeRecord> {
                 "Lemonade model id resolved and downloaded by the Lemonade engine".to_owned(),
             ),
             artifacts: Vec::new(),
-            engine_recipes: Vec::new(),
+            engine_recipes: vec![ModelRecipeEngineRecord {
+                engine: "vllm".to_owned(),
+                model_id_override: Some("Qwen/Qwen3-4B-Instruct-2507".to_owned()),
+                ..ModelRecipeEngineRecord::default()
+            }],
             manual_alternatives: vec!["qwen-tiny".to_owned(), "llama-3.2-3b-instruct".to_owned()],
             chat_template_mode: "lemonade".to_owned(),
             preferred_engines: vec!["lemonade".to_owned()],
@@ -6839,6 +6934,7 @@ Class Name:                Display
                 reason: "vLLM ROCm serving is Linux/WSL only".to_owned(),
             }],
             notes: vec!["metadata only; adapter protocol does not consume this yet".to_owned()],
+            model_id_override: None,
         });
         let index = ModelRecipeIndexDocument {
             schema_version: 1,
