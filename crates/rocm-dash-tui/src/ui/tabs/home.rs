@@ -89,6 +89,34 @@ fn mini_spark(
     );
 }
 
+/// Hero card title in the mock's form: `Node throughput · N × MODEL · ROCm V`.
+/// Falls back to `Unknown GPU` when no GPU model is detected, and drops the
+/// count/ROCm segments that aren't known rather than inventing them.
+fn node_throughput_title(state: &AppState) -> String {
+    let info = state
+        .latest
+        .as_ref()
+        .and_then(|s| s.gpu_system_info.as_ref());
+    let n = state.latest.as_ref().map_or(0, |s| s.gpus.len());
+    let model = info
+        .map(|g| g.gpu_model.trim())
+        .filter(|m| !m.is_empty())
+        .map_or_else(
+            || "Unknown GPU".to_string(),
+            |m| {
+                if n > 1 {
+                    format!("{n} × {m}")
+                } else {
+                    m.to_string()
+                }
+            },
+        );
+    let rocm = info
+        .and_then(|g| g.rocm_version.as_ref())
+        .map_or_else(String::new, |v| format!(" · ROCm {v}"));
+    format!("Node throughput · {model}{rocm}")
+}
+
 /// A bento card: titled bordered block, returns the inner content rect.
 fn card(f: &mut Frame, area: Rect, title: &str, border: Style, theme: &Theme) -> Rect {
     let block = Block::default()
@@ -113,6 +141,69 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
     draw_hero_band(f, rows[0], state, theme);
     draw_tiles(f, rows[1], state, theme);
+    draw_activity(f, rows[2], state, theme);
+}
+
+/// "Activity · node" block: a node-load mini-spark over a recent-activity feed
+/// derived from live state (running services + recent jobs). Honest placeholder
+/// when there's nothing to show.
+fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    if area.height < 2 {
+        return;
+    }
+    let inner = card(f, area, "Activity · node", theme.border_style(), theme);
+    if inner.height == 0 {
+        return;
+    }
+    let load_hist = history(state, snap_util);
+    mini_spark(
+        f,
+        Rect::new(inner.x, inner.y, inner.width, 1),
+        "node load ",
+        if load_hist.is_empty() { "—" } else { "live" },
+        &load_hist,
+        false,
+        theme,
+    );
+    if inner.height < 3 {
+        return;
+    }
+    let feed = Rect::new(inner.x, inner.y + 2, inner.width, inner.height - 2);
+    let mut lines: Vec<Line> = Vec::new();
+    // Running services first (most relevant "what's live now").
+    for inst in state
+        .instances
+        .values()
+        .filter(|i| i.status == InstanceStatus::Running)
+        .take(feed.height as usize)
+    {
+        let port = inst.port.map_or_else(String::new, |p| format!(" on :{p}"));
+        lines.push(Line::from(vec![
+            Span::styled("● ", Style::default().fg(theme.ok)),
+            Span::styled(inst.model_name.clone(), Style::default().fg(theme.fg)),
+            Span::styled(format!("{port} serving"), Style::default().fg(theme.muted)),
+        ]));
+    }
+    // Then recent jobs (tools run), newest-relevant first.
+    for job in state.jobs.jobs.values().take(feed.height as usize) {
+        let (glyph, color) = match job.status {
+            rocm_dash_core::state::JobStatus::Failed { .. } => ("✗ ", theme.err),
+            rocm_dash_core::state::JobStatus::Done { .. } => ("✓ ", theme.ok),
+            _ => ("⋯ ", theme.muted),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(glyph, Style::default().fg(color)),
+            Span::styled(job.cmd.clone(), Style::default().fg(theme.fg)),
+        ]));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no recent activity — serve a model or run an action to populate this",
+            Style::default().fg(theme.muted),
+        )));
+    }
+    lines.truncate(feed.height as usize);
+    f.render_widget(Paragraph::new(lines), feed);
 }
 
 fn draw_hero_band(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -121,12 +212,8 @@ fn draw_hero_band(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
         .split(area);
 
-    let model = state
-        .latest
-        .as_ref()
-        .and_then(|s| s.gpu_system_info.as_ref())
-        .map_or_else(|| "GPU".to_string(), |g| g.gpu_model.clone());
-    let hero = card(f, top[0], &model, theme.border_style(), theme);
+    let title = node_throughput_title(state);
+    let hero = card(f, top[0], &title, theme.border_style(), theme);
     if hero.width >= 8 && hero.height >= 6 {
         let hcols = Layout::default()
             .direction(Direction::Horizontal)
@@ -479,6 +566,27 @@ mod tests {
         assert!(out.contains("Health"), "health tile missing");
         assert!(out.contains("Updates"), "updates tile missing");
         assert!(out.contains("Instinct MI355X"), "gpu model missing");
+        // Hero title is the node-throughput line (mock parity), not bare model.
+        assert!(
+            out.contains("Node throughput"),
+            "node-throughput title missing: {out:?}"
+        );
+        // Activity block present.
+        assert!(out.contains("Activity"), "activity block missing");
+    }
+
+    #[test]
+    fn node_throughput_title_formats_and_falls_back() {
+        // Multi-GPU + ROCm → "Node throughput · N × MODEL · ROCm V".
+        let s = state_with_gpu();
+        let t = node_throughput_title(&s);
+        assert!(t.starts_with("Node throughput · "), "prefix: {t}");
+        assert!(t.contains("Instinct MI355X"), "model: {t}");
+        assert!(t.contains("ROCm 6.2"), "rocm version: {t}");
+        // No telemetry → Unknown GPU, no fabricated count/version.
+        let empty = AppState::new("t".into(), "default-dark".into());
+        let t2 = node_throughput_title(&empty);
+        assert_eq!(t2, "Node throughput · Unknown GPU");
     }
 
     #[test]

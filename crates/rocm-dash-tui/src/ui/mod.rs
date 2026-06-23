@@ -48,119 +48,135 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Length(1),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
         .split(f.area());
-
-    state.last_tab_bar_area = Some(outer[1]);
-    state.last_body_area = Some(outer[2]);
+    let body = outer[1];
+    let footer_area = body;
 
     draw_header(f, outer[0], state, &theme);
-    tabs::draw_tab_bar(f, outer[1], state.active_tab, &theme);
 
-    // Wide triptych (Phase 6): width-gated GPU wall / center / right dock. The
-    // right dock is LOGS or CONTEXT — never a chat composer. Below the threshold
-    // the body stays single-column (byte-for-byte the pre-Phase-6 layout).
+    // The body is framed by the outlined folder-tab panel (the live chrome). On
+    // a wide screen the panel wraps only the CENTER column so the tabs read as
+    // belonging to it, with the GPU wall / dock rails beside it; below the
+    // threshold the panel spans the full width (single-column fallback).
+    let active_idx = tabs::active_index(state.active_tab);
+    let labels = tabs::tab_labels();
     let area = f.area();
-    let center = if dock::is_wide(area.width, area.height) {
-        if let Some((left, center, right)) = dock::triptych(outer[2]) {
+    let (panel_outer, chip_origin_x) = if dock::is_wide(area.width, area.height) {
+        if let Some((left, center_outer, right)) = wide_triptych(body) {
             dock::gpu_wall(f, left, state, &theme);
             dock::draw_right_dock(f, right, state, &theme);
-            center
+            (center_outer, center_outer.x + 2)
         } else {
-            outer[2]
+            (body, body.x + 2)
         }
     } else {
-        outer[2]
+        (body, body.x + 2)
     };
+    let center_inner = tabs::draw_tab_panel(f, panel_outer, &labels, active_idx, &theme);
+
+    // Tab hit-testing: the clickable folder row is the panel's label row, with
+    // chips starting at `chip_origin_x` (shared geometry with the renderer).
+    state.last_tab_bar_area = Some(Rect::new(
+        chip_origin_x,
+        panel_outer.y + 1,
+        panel_outer.width,
+        1,
+    ));
+    state.last_body_area = Some(center_inner);
+
     match state.active_tab {
-        ActiveTab::Home => tabs::home::draw(f, center, state, &theme),
-        ActiveTab::Action => tabs::action::draw(f, center, state, &theme),
-        ActiveTab::Observe => tabs::observe::draw(f, center, state, &theme),
-        ActiveTab::Chat => tabs::chat::draw(f, center, state, &theme),
+        ActiveTab::Home => tabs::home::draw(f, center_inner, state, &theme),
+        ActiveTab::Action => tabs::action::draw(f, center_inner, state, &theme),
+        ActiveTab::Observe => tabs::observe::draw(f, center_inner, state, &theme),
+        ActiveTab::Chat => tabs::chat::draw(f, center_inner, state, &theme),
     }
-    draw_footer(f, outer[3], state, &theme);
+    draw_footer(f, footer_area, state, &theme);
 
     // Modal overlay (rendered last so it sits on top of the body).
     match state.modal {
         Modal::None => {}
-        Modal::Help => modal::draw_help(f, outer[2], state.active_tab, &theme),
+        Modal::Help => modal::draw_help(f, body, state.active_tab, &theme),
         // Observe folds the telemetry tabs; its detail modal is the instance
         // detail (the selectable list on that surface).
         Modal::Detail => {
             if state.active_tab == ActiveTab::Observe {
-                tabs::instances::draw_detail(f, outer[2], state, &theme);
+                tabs::instances::draw_detail(f, body, state, &theme);
             }
         }
-        Modal::ThemePicker => modal::draw_theme_picker(
-            f,
-            outer[2],
-            state.theme_picker_sel,
-            &state.theme_name,
-            &theme,
-        ),
-        Modal::Menu => modal::draw_menu(f, outer[2], state.menu_sel, &theme),
-        Modal::Palette => modal::draw_palette(f, outer[2], state.palette_sel, &theme),
-        Modal::Options => modal::draw_options(f, outer[2], state, &theme),
-        Modal::GlobalHelp => modal::draw_global_help(f, outer[2], &theme),
+        Modal::ThemePicker => {
+            modal::draw_theme_picker(f, body, state.theme_picker_sel, &state.theme_name, &theme);
+        }
+        Modal::Menu => modal::draw_menu(f, body, state.menu_sel, &theme),
+        Modal::Palette => modal::draw_palette(f, body, state.palette_sel, &theme),
+        Modal::Options => modal::draw_options(f, body, state, &theme),
+        Modal::GlobalHelp => modal::draw_global_help(f, body, &theme),
     }
 
     // Operational overlays (Phase 3 Wave 1): only one is open at a time. They
     // sit above the tab body + modals when open.
     if let Some(sm) = &state.services {
-        services_manager::draw_services_manager(
-            f,
-            outer[2],
-            sm,
-            &state.instances,
-            &state.jobs,
-            &theme,
-        );
+        services_manager::draw_services_manager(f, body, sm, &state.instances, &state.jobs, &theme);
     } else if let Some(w) = &state.serve_wizard {
-        serve_wizard::draw_serve_wizard(f, outer[2], w, &state.jobs, &state.model_recipes, &theme);
+        serve_wizard::draw_serve_wizard(f, body, w, &state.jobs, &state.model_recipes, &theme);
     } else if let Some(em) = &state.engine_manager {
-        engine_manager::draw_engine_manager(f, outer[2], em, &state.jobs, &theme);
+        engine_manager::draw_engine_manager(f, body, em, &state.jobs, &theme);
     } else if let Some(d) = &state.examine_manager {
-        examine_manager::draw_examine_manager(f, outer[2], d, &state.jobs, &theme);
+        examine_manager::draw_examine_manager(f, body, d, &state.jobs, &theme);
     } else if let Some(u) = &state.update_manager {
-        update_manager::draw_update_manager(f, outer[2], u, &state.jobs, &theme);
+        update_manager::draw_update_manager(f, body, u, &state.jobs, &theme);
     } else if let Some(im) = &state.install_manager {
-        install_manager::draw_install_manager(f, outer[2], im, &state.jobs, &theme);
+        install_manager::draw_install_manager(f, body, im, &state.jobs, &theme);
     } else if let Some(lv) = &state.logs_view {
-        logs_view::draw_logs_view(f, outer[2], lv, &state.jobs, &theme);
+        logs_view::draw_logs_view(f, body, lv, &state.jobs, &theme);
     } else if let Some(rm) = &state.runtime_manager {
-        runtime_manager::draw_runtime_manager(
-            f,
-            outer[2],
-            rm,
-            &state.runtimes,
-            &state.jobs,
-            &theme,
-        );
+        runtime_manager::draw_runtime_manager(f, body, rm, &state.runtimes, &state.jobs, &theme);
     } else if let Some(o) = &state.onboarding {
-        onboarding::draw_onboarding(f, outer[2], o, &state.jobs, &theme);
+        onboarding::draw_onboarding(f, body, o, &state.jobs, &theme);
     } else if let Some(am) = &state.automations_manager {
         automations_manager::draw_automations_manager(
             f,
-            outer[2],
+            body,
             am,
             &state.automations,
             &state.jobs,
             &theme,
         );
     } else if let Some(c) = &state.command_screen {
-        command_screen::draw_command_screen(f, outer[2], c, &state.jobs, &theme);
+        command_screen::draw_command_screen(f, body, c, &state.jobs, &theme);
     } else if let Some(cm) = &state.config_manager {
-        config_manager::draw_config_manager(f, outer[2], cm, &state.jobs, &theme);
+        config_manager::draw_config_manager(f, body, cm, &state.jobs, &theme);
     }
 
     // Approval modal (Phase 4): drawn LAST so it sits on top of every overlay
     // and owns the screen while a mutating-tool approval is pending.
     if let Some(pa) = &state.approval {
-        approval::draw_approval(f, outer[2], &pa.req, pa.choice, &theme);
+        approval::draw_approval(f, body, &pa.req, pa.choice, &theme);
     }
+}
+
+/// Wide-layout geometry: GPU wall (left) / outlined-tab center panel / dock
+/// (right). The rails align with the center *content* panel — they start 2 rows
+/// below the tab tops — so the tab band reads as belonging to the center column.
+/// Returns `None` when the body is too narrow for both rails plus a usable
+/// center (single-column fallback).
+const fn wide_triptych(body: Rect) -> Option<(Rect, Rect, Rect)> {
+    let lw = dock::RAIL_W;
+    let rw = dock::DOCK_W;
+    let min_center = 44u16;
+    if body.width < lw + rw + min_center || body.height < 5 {
+        return None;
+    }
+    let rail_y = body.y + 2;
+    let rail_h = body.height - 2;
+    let left = Rect::new(body.x, rail_y, lw, rail_h);
+    let right = Rect::new(body.x + body.width - rw, rail_y, rw, rail_h);
+    let center_x = body.x + lw + 1;
+    let center_w = right.x - center_x - 1;
+    let center_outer = Rect::new(center_x, body.y, center_w, body.height);
+    Some((left, center_outer, right))
 }
 
 fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -300,4 +316,34 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     spans.push(chip("q"));
     spans.push(Span::raw(" quit"));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wide_triptych_aligns_tabs_with_center_not_far_left() {
+        // A wide body: tabs (over center_outer) must start to the RIGHT of the
+        // GPU wall, left-aligned with the center column — not at the far left.
+        let body = Rect::new(0, 3, 200, 47);
+        let (left, center_outer, right) = wide_triptych(body).expect("wide body splits");
+        assert_eq!(left.x, 0, "GPU wall hugs the left edge");
+        assert_eq!(left.width, dock::RAIL_W);
+        // Center (and thus the outlined tabs) begins past the left rail.
+        assert!(
+            center_outer.x >= dock::RAIL_W,
+            "tabs must align with center, got x={}",
+            center_outer.x
+        );
+        assert!(center_outer.x < right.x, "center sits between the rails");
+        // Rails align with the center content panel (2 rows below the tab tops).
+        assert_eq!(left.y, body.y + 2);
+        assert_eq!(center_outer.y, body.y);
+    }
+
+    #[test]
+    fn narrow_body_has_no_triptych() {
+        assert!(wide_triptych(Rect::new(0, 0, 100, 40)).is_none());
+    }
 }

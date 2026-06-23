@@ -31,6 +31,26 @@ pub const TAB_LABELS: [(ActiveTab, &str, char); 4] = [
     (ActiveTab::Chat, "Chat", '4'),
 ];
 
+/// The four tab labels in display order (for the outlined panel renderer).
+#[must_use]
+pub const fn tab_labels() -> [&'static str; 4] {
+    [
+        TAB_LABELS[0].1,
+        TAB_LABELS[1].1,
+        TAB_LABELS[2].1,
+        TAB_LABELS[3].1,
+    ]
+}
+
+/// Index of `tab` within [`TAB_LABELS`] (the active-folder index).
+#[must_use]
+pub fn active_index(tab: ActiveTab) -> usize {
+    TAB_LABELS
+        .iter()
+        .position(|(t, _, _)| *t == tab)
+        .unwrap_or(0)
+}
+
 /// A single tab chip's screen extent. `x_start..x_end` are absolute columns
 /// (end-exclusive) on the tab-bar row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,56 +60,49 @@ pub struct TabChip {
     pub x_end: u16,
 }
 
-/// Compute the per-chip bounding boxes for a tab bar starting at `bar_x`.
+/// Outlined-tab chip clickable spans starting at `origin_x`, one `(start, end)`
+/// (end-exclusive) per label. This is the SINGLE SOURCE of tab geometry: both
+/// [`draw_tab_panel`] (rendering) and [`compute_chip_layout`] (hit-testing)
+/// route through it so they cannot drift. The active marker (`●`) and the
+/// 1-based index are both a single cell, so widths are active-independent.
+fn outlined_chip_spans(origin_x: u16, labels: &[&str]) -> Vec<(u16, u16)> {
+    let mut out = Vec::with_capacity(labels.len());
+    let mut sx = origin_x;
+    for lab in labels {
+        let cw = lab.chars().count() as u16 + 4; // " X label "
+        let ex = sx + cw + 1; // right border column (inclusive)
+        out.push((sx, ex + 1)); // clickable span [sx, ex] → end-exclusive
+        sx = ex + 2; // 1-col gap between folders
+    }
+    out
+}
+
+/// Per-chip bounding boxes for the live tab panel.
 ///
-/// Mirrors `draw_tab_bar` exactly: a 3-char digit chip (" 1 "), then a
-/// `" Label "` chip (`label.len() + 2`), separated between chips by `" · "`
-/// (3 chars). Pure — both `draw_tab_bar` and `hit_test` route through this
-/// so they cannot drift.
+/// The first folder's left border is at `bar_x`. Mirrors [`draw_tab_panel`]'s
+/// outlined-folder geometry exactly (via [`outlined_chip_spans`]) so a click
+/// resolves to the tab drawn at that column.
 pub fn compute_chip_layout(bar_x: u16) -> [TabChip; 4] {
+    let labels = [
+        TAB_LABELS[0].1,
+        TAB_LABELS[1].1,
+        TAB_LABELS[2].1,
+        TAB_LABELS[3].1,
+    ];
+    let spans = outlined_chip_spans(bar_x, &labels);
     let mut out = [TabChip {
         tab: ActiveTab::Home,
         x_start: 0,
         x_end: 0,
     }; 4];
-    let mut x = bar_x;
-    for (i, (tab, label, _key)) in TAB_LABELS.iter().enumerate() {
-        if i > 0 {
-            x = x.saturating_add(3); // " · "
-        }
-        let chip_w = 3u16 + label.len() as u16 + 2; // " 1 " + " Label "
+    for (i, (start, end)) in spans.iter().enumerate() {
         out[i] = TabChip {
-            tab: *tab,
-            x_start: x,
-            x_end: x.saturating_add(chip_w),
+            tab: TAB_LABELS[i].0,
+            x_start: *start,
+            x_end: *end,
         };
-        x = x.saturating_add(chip_w);
     }
     out
-}
-
-/// Render the segmented tab bar. One row tall.
-pub fn draw_tab_bar(f: &mut Frame, area: Rect, active: ActiveTab, theme: &Theme) {
-    let mut spans: Vec<Span> = Vec::with_capacity(TAB_LABELS.len() * 3);
-    for (i, (tab, label, key)) in TAB_LABELS.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" · ", Style::default().fg(theme.muted)));
-        }
-        let style = if *tab == active {
-            Style::default()
-                .bg(theme.accent)
-                .fg(theme.surface_2)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.fg)
-        };
-        spans.push(Span::styled(
-            format!(" {key} "),
-            Style::default().fg(theme.muted),
-        ));
-        spans.push(Span::styled(format!(" {label} "), style));
-    }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Stamp a string at `(x, y)` if the row is on-screen. Mirror of the
@@ -115,11 +128,9 @@ fn hline(f: &mut Frame, x0: u16, x1: u16, y: u16, ch: &str, style: Style) {
 ///
 /// `outer` must be ≥3 rows tall (top edge / label row / panel line) + body.
 ///
-// ponytail: this is the painter only; it is NOT wired into `ui::draw` yet
-// (P2 adds Home behind it; P3 makes it the live chrome). Tab hit-testing stays
-// routed through the single-source-of-truth [`compute_chip_layout`] /
-// [`draw_tab_bar`] geometry until the live switch — no second offset table is
-// introduced here.
+/// This is the live tab chrome (`ui::draw`). Tab hit-testing routes through
+/// the same [`outlined_chip_spans`] geometry via [`compute_chip_layout`], so a
+/// click resolves to the folder painted at that column.
 #[must_use]
 pub fn draw_tab_panel(
     f: &mut Frame,
@@ -157,8 +168,8 @@ pub fn draw_tab_panel(
     put(f, x0, y_bot, "└", border);
     put(f, x1, y_bot, "┘", border);
 
-    // Tab folders along the top edge.
-    let mut sx = x0 + 2;
+    // Tab folders along the top edge — geometry from the shared single source.
+    let spans = outlined_chip_spans(x0 + 2, labels);
     for (i, lab) in labels.iter().enumerate() {
         let is_active = i == active;
         let content = if is_active {
@@ -166,8 +177,8 @@ pub fn draw_tab_panel(
         } else {
             format!(" {} {lab} ", i + 1)
         };
-        let cw = content.chars().count() as u16;
-        let ex = sx + cw + 1; // right border column (inclusive)
+        let (sx, end) = spans[i];
+        let ex = end.saturating_sub(1); // right border column (inclusive)
         if ex >= x1 {
             break; // out of horizontal room — stop cleanly rather than overflow
         }
@@ -190,7 +201,6 @@ pub fn draw_tab_panel(
             put(f, sx, y_line, "┴", style);
             put(f, ex, y_line, "┴", style);
         }
-        sx = ex + 2;
     }
 
     Rect::new(
@@ -224,20 +234,22 @@ mod tests {
 
     #[test]
     fn chip_layout_matches_draw_widths() {
+        // Outlined folders: chip width = label.len()+6 (┌ + " X label " + ┐),
+        // 1-col gap between. Home(4)/Action(6)/Observe(7)/Chat(4).
         let chips = compute_chip_layout(0);
-        // " 1 " (3) + " Home " (6) = 9
+        // " ● Home " (8) inside a box (10) → 0..10
         assert_eq!(chips[0].x_start, 0);
-        assert_eq!(chips[0].x_end, 9);
+        assert_eq!(chips[0].x_end, 10);
         assert_eq!(chips[0].tab, ActiveTab::Home);
-        // separator (3) then " 2 " (3) + " Action " (8) = 12..23
-        assert_eq!(chips[1].x_start, 12);
+        // gap then " 2 Action " (10) box (12) → 11..23
+        assert_eq!(chips[1].x_start, 11);
         assert_eq!(chips[1].x_end, 23);
-        // " 3 " + " Observe " (9) = 26..38
-        assert_eq!(chips[2].x_start, 26);
-        assert_eq!(chips[2].x_end, 38);
-        // separator (3) then " 4 " (3) + " Chat " (6) = 41..50
-        assert_eq!(chips[3].x_start, 41);
-        assert_eq!(chips[3].x_end, 50);
+        // " 3 Observe " (11) box (13) → 24..37
+        assert_eq!(chips[2].x_start, 24);
+        assert_eq!(chips[2].x_end, 37);
+        // " 4 Chat " (8) box (10) → 38..48
+        assert_eq!(chips[3].x_start, 38);
+        assert_eq!(chips[3].x_end, 48);
         assert_eq!(chips[3].tab, ActiveTab::Chat);
     }
 
@@ -245,8 +257,8 @@ mod tests {
     fn chip_layout_honors_bar_x_offset() {
         let chips = compute_chip_layout(100);
         assert_eq!(chips[0].x_start, 100);
-        // Full bar (Home start → Chat end) spans 50 columns.
-        assert_eq!(chips[3].x_end - chips[0].x_start, 50);
+        // Full panel (Home start → Chat end) spans 48 columns.
+        assert_eq!(chips[3].x_end - chips[0].x_start, 48);
     }
 
     #[test]
