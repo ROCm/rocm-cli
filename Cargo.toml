@@ -39,6 +39,7 @@ rand = "0.8"
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 rpassword = "7.5"
 rsa = "0.9"
+semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = { version = "0.10", features = ["oid"] }

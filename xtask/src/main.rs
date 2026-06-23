@@ -121,7 +121,19 @@ fn render_dependency_table(metadata: &Metadata) -> String {
             )
         })
         .collect();
-    rows.sort_unstable();
+    // Sort by name, then by semantic version. A plain string sort would order
+    // versions lexicographically (e.g. `0.10.1` before `0.9.4`), which is wrong;
+    // compare parsed semver instead. Versions from `cargo metadata` are always
+    // valid semver, but fall back to string order if parsing ever fails so the
+    // output stays deterministic.
+    rows.sort_unstable_by(|a, b| {
+        a.0.cmp(b.0).then_with(
+            || match (semver::Version::parse(a.1), semver::Version::parse(b.1)) {
+                (Ok(va), Ok(vb)) => va.cmp(&vb),
+                _ => a.1.cmp(b.1),
+            },
+        )
+    });
 
     let mut table = String::from("| Crate | Version | License |\n|-------|---------|---------|\n");
     for (name, version, license) in rows {

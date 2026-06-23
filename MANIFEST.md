@@ -101,8 +101,8 @@ repository.
 | concurrent-queue | 2.5.0 | Apache-2.0 OR MIT |
 | const-oid | 0.9.6 | Apache-2.0 OR MIT |
 | convert_case | 0.10.0 | MIT |
-| core-foundation | 0.10.1 | MIT OR Apache-2.0 |
 | core-foundation | 0.9.4 | MIT OR Apache-2.0 |
+| core-foundation | 0.10.1 | MIT OR Apache-2.0 |
 | core-foundation-sys | 0.8.7 | MIT OR Apache-2.0 |
 | cpufeatures | 0.2.17 | MIT OR Apache-2.0 |
 | crc32fast | 1.5.0 | MIT OR Apache-2.0 |
@@ -234,8 +234,8 @@ repository.
 | libm | 0.2.16 | MIT |
 | libredox | 0.1.15 | MIT |
 | line-clipping | 0.3.7 | MIT OR Apache-2.0 |
-| linux-raw-sys | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | linux-raw-sys | 0.4.15 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
+| linux-raw-sys | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | litemap | 0.8.2 | Unicode-3.0 |
 | litrs | 1.0.0 | MIT OR Apache-2.0 |
 | lock_api | 0.4.14 | MIT OR Apache-2.0 |
@@ -564,16 +564,20 @@ repository.
 
 ## Shipped Binaries
 
-No pre-built binaries are bundled in this repository. Two binary crates are
-built from source:
+No pre-built binaries are bundled in this repository. All binaries are built
+from the workspace source. The user-facing binaries are:
 
 - `rocm` (`apps/rocm`) — the main CLI binary; user-facing commands for SDK
   install, engine management, configuration, and the TUI dashboard
 - `rocmd` (`apps/rocmd`) — the engine daemon; spawned by `rocm` to host engine
   processes and expose a local HTTP API
 
-Both are compiled from the workspace source using the standard Cargo toolchain
-(see `rust-toolchain.toml` for the pinned toolchain version).
+In addition, each engine crate under `engines/` builds its own
+`rocm-engine-<name>` host binary (for example `rocm-engine-pytorch`,
+`rocm-engine-vllm`), spawned by `rocmd` to run a specific inference engine.
+
+All binaries are compiled from the workspace source using the standard Cargo
+toolchain (see `rust-toolchain.toml` for the pinned toolchain version).
 
 ## Runtime-Downloaded Assets
 
@@ -626,8 +630,8 @@ binary described above. Python packages are installed from the TheRock PyPI
 index and, where applicable, from public PyPI (`https://pypi.org`). No Python
 packages are bundled in the repository.
 
-The vLLM, SGLang, and ATOM engines do not install Python packages automatically;
-they record externally-provided runtimes supplied by the user.
+The vLLM, SGLang, ATOM, and llama.cpp engines do not install Python packages
+automatically; they record externally-provided runtimes supplied by the user.
 
 ## Repository Structure Notes
 

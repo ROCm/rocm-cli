@@ -14,5 +14,6 @@ workspace = true
 anyhow.workspace = true
 clap.workspace = true
 rocm-core = { path = "../crates/rocm-core" }
+semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

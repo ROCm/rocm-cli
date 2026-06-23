@@ -5487,6 +5487,7 @@ dependencies = [
  "anyhow",
  "clap",
  "rocm-core",
+ "semver",
  "serde",
  "serde_json",
 ]
