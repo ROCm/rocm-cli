@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Reusable folder browser (Phase 3 Wave 0).
 //!
 //! A shared input primitive: pick (or create-under) a directory. Dependency of

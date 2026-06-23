@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared helpers for launching `rocm` sub-commands from operational screens (Phase 3 Wave 1).
 //!
 //! Every screen that routes a mutating action through the

@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Docker service discovery via `bollard`.
 //!
 //! Field-extraction logic is vendored from instinct-dash `DockerService.ts`

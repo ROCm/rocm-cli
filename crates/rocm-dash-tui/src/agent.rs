@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! The chat agent backend, built on **Rig**, plus the read-only "Skills"
 //! (Rig Tools) the agent calls over cached telemetry.
 //!

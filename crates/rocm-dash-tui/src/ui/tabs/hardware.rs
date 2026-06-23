@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Hardware tab — full-screen detail of host CPU/memory + per-GPU panels.
 //!
 //! Layout (vertical):

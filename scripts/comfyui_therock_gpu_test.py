@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright Advanced Micro Devices, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """End-to-end ComfyUI GPU smoke test for rocm-cli managed TheRock runtimes.
 
 This opt-in test installs or reuses the rocm-cli managed ComfyUI app, starts it

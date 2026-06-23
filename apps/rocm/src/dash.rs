@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! `rocm dash` — launch the unified telemetry dashboard.
 //!
 //! Folds the rocm-dash launch verb into the `rocm` binary. It builds the

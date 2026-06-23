@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Approval-gate seam (Phase 3 Wave 0).
 //!
 //! This is a **render + event seam ONLY**. The decision *logic* — what an

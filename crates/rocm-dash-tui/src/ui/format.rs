@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Humanized number / unit formatters.
 //!
 //! Pure functions, no rendering deps. Used by every tab to keep numeric

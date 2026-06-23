@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! TOML config loaded from `~/.config/rocm-dash/config.toml`. Missing = defaults.
 
 use serde::{Deserialize, Serialize};

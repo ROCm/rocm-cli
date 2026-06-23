@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! 2-D heatmap widget.
 //!
 //! Each row is a series of `f64` values. Each cell renders as a single

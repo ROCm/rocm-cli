@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! NDJSON client task. Owns the connection, handshakes, reads events, and
 //! forwards everything (including connect/disconnect transitions) to the app loop
 //! via an mpsc channel.

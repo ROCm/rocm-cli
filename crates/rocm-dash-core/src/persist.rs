@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! On-disk session format. Used by the daemon to write each broadcast Event
 //! and by the TUI replay mode to read them back.
 //!

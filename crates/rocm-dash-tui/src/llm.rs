@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Chat LLM configuration: a pure precedence resolver plus a std-only TCP liveness probe.
 //!
 //! No HTTP client here — the Rig-built `AgentClient` (Phase 3)

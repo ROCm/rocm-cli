@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Listener + per-client task loop + runner-to-clients broadcast.
 
 // On Windows the listener/handler are #[cfg(unix)] stubs, so these imports are

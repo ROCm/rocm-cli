@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! rocm-dash-core
 //!
 //! Pure types, traits, schemas, and the reducer for rocm-dash.

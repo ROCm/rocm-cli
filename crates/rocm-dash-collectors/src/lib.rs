@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! IO-heavy collector implementations. Used by `rocm-dash-daemon`.
 //!
 //! Every collector implements one of the traits in `rocm_dash_core::traits`.

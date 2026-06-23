@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Synthetic-session generator (single source of truth for demo data).
 //!
 //! Simulates a single 8× AMD Instinct MI355X node serving inference traffic

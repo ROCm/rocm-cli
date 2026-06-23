@@ -1,0 +1,21 @@
+## hawkeye license-header enforcement configuration.
+## Run locally: hawkeye check
+## Docs: https://github.com/korandoru/hawkeye
+
+inlineHeader = """
+Copyright Advanced Micro Devices, Inc.
+
+SPDX-License-Identifier: Apache-2.0
+"""
+
+includes = [
+  "**/*.rs",
+  "**/*.py",
+  "**/*.sh",
+]
+
+excludes = [
+  "target/**",
+  ".claude/**",
+  "third_party/**",
+]

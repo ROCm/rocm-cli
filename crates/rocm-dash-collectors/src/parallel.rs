@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared primitives for async collectors that scrape N targets concurrently.
 //!
 //! Today: [[VllmPrometheusCollector]] uses this pattern hand-rolled in the

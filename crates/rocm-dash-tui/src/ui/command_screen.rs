@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Command runner overlay (Phase 3 Wave 3).
 //!
 //! A general escape hatch: type any `rocm …` subcommand and run it through the

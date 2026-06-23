@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Tabbed view modes. Each tab module exposes a single
 //! `pub fn draw(f, area, state, theme)` so they can be implemented in parallel
 //! without touching shared files.

@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;

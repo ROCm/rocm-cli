@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright Advanced Micro Devices, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """PTY-driven ROCm CLI TUI smoke tests.
 
 These checks exercise the real terminal UI in an isolated temporary ROCm CLI

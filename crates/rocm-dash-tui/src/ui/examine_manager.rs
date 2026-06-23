@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Examine overlay (Phase 3 Wave 2).
 //!
 //! Runs `rocm examine` — a read-only environment check — through the job-bridge

@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Runtime manager overlay (Phase 3 Wave 2).
 //!
 //! Lists the registered ROCm runtimes (plumbed in from the bin, which owns

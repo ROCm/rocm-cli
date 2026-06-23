@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright Advanced Micro Devices, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Live local-assistant acceptance for rocm-cli managed GPU services.
 
 This opt-in test starts a managed Lemonade service with GPU-required policy,

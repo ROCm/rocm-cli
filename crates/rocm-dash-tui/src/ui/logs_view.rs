@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Logs overlay (Phase 3 Wave 3).
 //!
 //! Browses recent ROCm CLI logs via `rocm logs [--search WORDS]` — read-only, so

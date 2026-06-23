@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Onboarding wizard (Phase 3 Wave 2, minimal).
 //!
 //! The first-run flow, rebuilt on the Wave-0 primitives. This is the **minimal**

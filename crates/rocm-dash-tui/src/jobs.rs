@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Async job-bridge runtime (Phase 3 Wave 0).
 //!
 //! Interprets [`SideEffect::SpawnJob`]: launches the child process, streams its

@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Automations manager overlay (Phase 3 Wave 3).
 //!
 //! Lists the background checks ("watchers", plumbed in from the bin which owns

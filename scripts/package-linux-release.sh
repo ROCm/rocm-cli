@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Copyright Advanced Micro Devices, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
 set -euo pipefail
 
 if [[ $# -lt 1 || $# -gt 3 ]]; then

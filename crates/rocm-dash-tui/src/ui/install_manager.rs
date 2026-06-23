@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Install overlay (Phase 3 Wave 2).
 //!
 //! A compact form that builds a `rocm install sdk …` invocation (TheRock ROCm

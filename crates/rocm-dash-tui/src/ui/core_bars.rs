@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Per-CPU-core vertical braille bars.
 //!
 //! Each core renders as one character column (2 dots wide) showing its current

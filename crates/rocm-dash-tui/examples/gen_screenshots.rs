@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Render the TUI against a synthetic session NDJSON and dump each view to
 //! a standalone SVG. The screenshots embed cleanly in the marketing page
 //! and demo decks — no live terminal, no manual capture, no drift.

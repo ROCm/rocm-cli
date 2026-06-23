@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! `rocm automations` command handler.
 //!
 //! Mechanically relocated from `main.rs` with no behavior change — the

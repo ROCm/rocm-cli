@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Live metric types. snake_case + units encoded in field names.
 //! See `../wiki/concepts/metric-registry.md` and `../wiki/data/metric-field-index.md`.
 

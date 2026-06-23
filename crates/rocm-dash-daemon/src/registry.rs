@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Managed-service registry → scrape-target seam.
 //!
 //! The rocm-cli `serve` lifecycle records every managed engine as a

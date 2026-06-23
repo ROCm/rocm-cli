@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Job console widget (Phase 3 Wave 0).
 //!
 //! Renders a [`JobState`] from the reducer: a status header, the streamed

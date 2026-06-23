@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! NDJSON command/event protocol between rocmdashd and rocmdash.
 //! See `../wiki/comparisons/ctux-vs-rocm-dash.md` (resolved decisions).
 

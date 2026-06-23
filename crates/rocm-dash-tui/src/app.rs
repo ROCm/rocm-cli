@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Event loop. Sets up the terminal, spawns the client task, drives renders.
 
 use std::collections::VecDeque;

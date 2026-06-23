@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Serve wizard overlay (Phase 3 Wave 1).
 //!
 //! The headline operational screen rebuilt on the Wave-0 primitives: a compact

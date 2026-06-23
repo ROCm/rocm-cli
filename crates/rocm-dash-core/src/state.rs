@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Pure reducer. `State::apply(StateEvent) -> Vec<SideEffect>`.
 //! See `../wiki/concepts/tea-reducer-pattern.md`.
 
