@@ -58,6 +58,7 @@ TUI shows live GPU utilization, active model servers, and a chat tab.
 | `rocm dash` | Open the full-screen telemetry dashboard |
 | `rocm setup status` | Show first-time setup state |
 | `rocm version` | Print the rocm-cli version |
+| `rocm completions <shell>` | Print a shell completion script (bash, zsh, fish, elvish, powershell) |
 
 ## Commands
 
@@ -204,6 +205,42 @@ rocm logs [--service <service-id>] [--search TERM ...]
 
 rocm uninstall [--yes] [--dry-run]
                [--keep-binaries] [--keep-config] [--keep-data] [--keep-cache]
+```
+
+### Shell completions
+
+`rocm completions <shell>` prints a completion script for the given shell to
+stdout. Supported shells are `bash`, `zsh`, `fish`, `elvish`, and `powershell`.
+
+```
+rocm completions <bash|zsh|fish|elvish|powershell>
+```
+
+Install the script for your shell:
+
+```
+# bash (per-user, no sudo; add this line to ~/.bashrc to persist)
+source <(rocm completions bash)
+# bash (system-wide; requires the bash-completion package)
+rocm completions bash | sudo tee /etc/bash_completion.d/rocm > /dev/null
+
+# zsh (per-user; the directory must be on $fpath and compinit must run)
+mkdir -p ~/.zsh/completions
+rocm completions zsh > ~/.zsh/completions/_rocm
+# then in ~/.zshrc, before `compinit`:
+#   fpath=(~/.zsh/completions $fpath)
+#   autoload -Uz compinit && compinit
+
+# fish
+mkdir -p ~/.config/fish/completions
+rocm completions fish > ~/.config/fish/completions/rocm.fish
+
+# elvish (run once; re-running appends a duplicate block to rc.elv)
+mkdir -p ~/.config/elvish
+rocm completions elvish >> ~/.config/elvish/rc.elv
+
+# powershell (current session only; to persist, append the output to $PROFILE)
+rocm completions powershell | Out-String | Invoke-Expression
 ```
 
 ## Contributing
