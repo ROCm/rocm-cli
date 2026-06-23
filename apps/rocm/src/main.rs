@@ -858,10 +858,12 @@ fn maybe_migrate_legacy_dashboard_config() {
 fn launch_default() -> Result<()> {
     refresh_startup_update_check_quietly();
     if interactive_terminal() {
-        // Bare `rocm` routes to the unified dash chat (parity reached, Phases
-        // 3-8); the legacy `tui::run` assistant is retained but no longer the
-        // interactive entrypoint (see docs/tui-retirement-checklist.md).
-        return dash::run_chat(false);
+        // Bare `rocm` opens the minimal launcher front door; "Open full
+        // dashboard" / `d` escalates into the unified dash, "Chat" reaches the
+        // Chat tab. `rocm dash` / `rocm chat` bypass the launcher. The legacy
+        // `tui::run` assistant is retained but not the entrypoint (see
+        // docs/tui-retirement-checklist.md).
+        return dash::run_launcher(false);
     }
 
     let paths = AppPaths::discover()?;
@@ -22453,8 +22455,8 @@ VERSION_ID="41"
         let src = main_rs_source();
         let body = strip_line_comments(&launch_default_body(&src));
         assert!(
-            body.contains("dash::run_chat(false)"),
-            "bare `rocm` interactive branch must route to dash::run_chat; body:\n{body}"
+            body.contains("dash::run_launcher(false)"),
+            "bare `rocm` interactive branch must route to the launcher; body:\n{body}"
         );
         assert!(
             !body.contains("tui::run"),

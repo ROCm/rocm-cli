@@ -240,9 +240,37 @@ pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
     rt.block_on(run_async(config, paths, args, replay, chat_mock))
 }
 
-/// Entry point for bare `rocm` and interactive `rocm chat`. Opens the unified
-/// dashboard with the Chat tab focused. Thin wrapper over the same runtime/
-/// `run_async` path as [`run`]; no replay/demo, embedded daemon as usual.
+/// Entry point for bare `rocm`: show the minimal launcher front door, then
+/// escalate into the existing dash/chat entry points based on the choice.
+///
+/// The launcher is a thin synchronous pre-screen (no daemon, no async runtime);
+/// `rocm dash` / `rocm chat` reach [`run`] / [`run_chat`] directly and are
+/// unaffected by this path.
+pub fn run_launcher(chat_mock: bool) -> Result<()> {
+    let paths = AppPaths::discover()?;
+    let config = RocmCliConfig::load(&paths).unwrap_or_default();
+    let theme = config.dashboard.tui.theme;
+    match rocm_dash_tui::ui::launcher::run_launcher(&theme)? {
+        None => Ok(()),
+        Some(choice) => {
+            use rocm_dash_tui::ui::launcher::LauncherChoice;
+            match choice {
+                LauncherChoice::Chat => run_chat(chat_mock),
+                // Serve / Set up / Diagnose / Open dashboard all escalate into
+                // the full dash (Home); the guided managers are reachable there
+                // via the Action tab + seam (ponytail: no separate routing yet).
+                LauncherChoice::Serve
+                | LauncherChoice::SetUp
+                | LauncherChoice::Diagnose
+                | LauncherChoice::OpenDashboard => run(None, false, chat_mock),
+            }
+        }
+    }
+}
+
+/// Entry point for interactive `rocm chat`. Opens the unified dashboard with the
+/// Chat tab focused. Thin wrapper over the same runtime/`run_async` path as
+/// [`run`]; no replay/demo, embedded daemon as usual.
 pub fn run_chat(chat_mock: bool) -> Result<()> {
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths)?;

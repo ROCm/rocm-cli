@@ -18,6 +18,7 @@ pub mod heatmap;
 pub mod install_manager;
 pub mod instance_list;
 pub mod job_console;
+pub mod launcher;
 pub mod logs_view;
 pub mod modal;
 pub mod model_picker;
