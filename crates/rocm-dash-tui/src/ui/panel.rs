@@ -117,25 +117,16 @@ fn put(f: &mut Frame, x: u16, y: u16, text: &str, style: Style) {
 /// Overlay the btop-style title onto the already-drawn rounded top border.
 ///
 /// Layout on the top row: `╭─╮ Title ╭───────╮` — the inner `╮`/`╭` are the label
-/// brackets (their arcs turn the line downward); when `descenders` is set a `│`
-/// hangs one row below each into the top-padding gap. The bracket glyphs take the
-/// role `border` color; the label text takes `text_fg` (a legible foreground) so
-/// the title stays readable over the faint tint on every theme.
-fn stamp_title(
-    f: &mut Frame,
-    area: Rect,
-    title: &str,
-    border: Color,
-    tint: Color,
-    text_fg: Color,
-    descenders: bool,
-) {
+/// brackets whose arcs turn the line downward, framing the title in a shallow
+/// notch. The bracket glyphs take the role `border` color; the label text takes
+/// `text_fg` (a legible foreground) so the title stays readable over the faint
+/// tint on every theme.
+fn stamp_title(f: &mut Frame, area: Rect, title: &str, border: Color, tint: Color, text_fg: Color) {
     let title = title.trim();
     if title.is_empty() {
         return;
     }
-    let label = format!(" {title} ");
-    let label_w = label.chars().count() as u16;
+    let label_w = title.chars().count() as u16;
     // corner(x0) + at least one dash, then the left bracket.
     let lb = area.x + 2;
     let rb = lb + 1 + label_w; // right bracket column
@@ -150,16 +141,11 @@ fn stamp_title(
         .bg(tint)
         .add_modifier(Modifier::BOLD);
 
+    // Brackets hug the label directly (no inner spaces); their own downward arc
+    // is the whole notch — a short half-cell turn, not a full descender.
     put(f, lb, y0, "╮", bracket);
-    put(f, lb + 1, y0, &label, text);
+    put(f, lb + 1, y0, title, text);
     put(f, rb, y0, "╭", bracket);
-
-    // Descenders one row in (the top-padding gap) so the line "turns down".
-    if descenders && area.height >= 3 {
-        let y1 = area.y + 1;
-        put(f, lb, y1, "│", bracket);
-        put(f, rb, y1, "│", bracket);
-    }
 }
 
 /// Core box renderer shared by [`bento`] and [`popup`].
@@ -202,7 +188,7 @@ fn render_box(
     f.render_widget(block, area);
 
     if let Some(t) = title {
-        stamp_title(f, area, t, border, tint, theme.fg, !compact);
+        stamp_title(f, area, t, border, tint, theme.fg);
     }
     inner
 }
@@ -276,9 +262,8 @@ mod tests {
     }
 
     #[test]
-    fn bento_title_notch_has_descenders() {
+    fn bento_title_notch_brackets_frame_the_label() {
         let theme = Theme::default_dark();
-        // Capture per-cell so we can check the descender row directly.
         let backend = TestBackend::new(40, 8);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| {
@@ -286,15 +271,23 @@ mod tests {
         })
         .unwrap();
         let buf = term.backend().buffer();
-        // Row 1 (just under the top border) must carry at least two interior
-        // descenders (the btop downward notch), beyond the two side walls.
+        // The downward-turn notch lives on the top border row (the brackets'
+        // own half-cell arc) — not as a full descender hanging into the box.
+        let top: String = (0..40)
+            .map(|x| buf.cell((x, 0)).unwrap().symbol())
+            .collect();
+        assert!(
+            top.contains("╮Logs╭"),
+            "title notch missing on top row: {top:?}"
+        );
+        // Row 1 is interior content only — just the two side walls, no descender.
         let row1: Vec<&str> = (0..40)
             .map(|x| buf.cell((x, 1)).unwrap().symbol())
             .collect();
         let verticals = row1.iter().filter(|s| **s == "│").count();
-        assert!(
-            verticals >= 3,
-            "expected descenders under the title, row={row1:?}"
+        assert_eq!(
+            verticals, 2,
+            "expected only the side walls on row 1, got {row1:?}"
         );
     }
 
