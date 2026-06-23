@@ -3597,13 +3597,27 @@ fn serve(
     validate_bind_host(&host, allow_public_bind)?;
     let paths = AppPaths::discover()?;
     let mut config = RocmCliConfig::load(&paths)?;
-    let host_gpu_summary = detect_host_gpu_summary(Some(&paths));
+    // Host GPU detection can involve sysfs/WSL probing, so only run it when engine
+    // selection would actually consult it: no explicit `--engine` and no non-empty
+    // configured `default_engine`.
+    let host_gpu_summary = if engine
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || config
+            .default_engine
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        None
+    } else {
+        Some(detect_host_gpu_summary(Some(&paths)))
+    };
     let shared_recipe = resolve_model_recipe(&model)?;
     let serve_engine = select_serve_engine(
         engine.as_deref(),
         config.default_engine.as_deref(),
         shared_recipe.as_ref(),
-        Some(&host_gpu_summary),
+        host_gpu_summary.as_ref(),
     );
     let selected_engine = serve_engine.engine.clone();
     let engine_recipe = shared_recipe

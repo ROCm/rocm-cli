@@ -26,7 +26,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const ENGINE_NAME: &str = "vllm";
 const DEFAULT_HOST: &str = "127.0.0.1";
@@ -210,7 +210,7 @@ pub fn run_cli() -> Result<()> {
         } => {
             let log_path = AppPaths::discover()?
                 .engine_logs_dir(ENGINE_NAME)
-                .join(format!("{}.log", service_id));
+                .join(format!("{service_id}.log"));
             serve_http(ServeHttpRequest {
                 service_id,
                 model_ref,
@@ -222,7 +222,7 @@ pub fn run_cli() -> Result<()> {
                 state_path,
                 log_path: Some(log_path),
                 engine_recipe: parse_engine_recipe_json(engine_recipe_json)?,
-            })?
+            })?;
         }
     }
     Ok(())
@@ -374,26 +374,25 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
     } else {
         resolve_vllm_runtime(Some(&request.runtime_id)).ok()
     };
-    let runtime = match already_installed {
-        Some(runtime) => runtime,
-        None => {
-            let managed = resolve_managed_runtime_python(Some(&request.runtime_id))?.with_context(
-                || {
-                    format!(
-                        "runtime `{}` did not resolve to a managed TheRock Python environment for automatic vLLM install",
-                        request.runtime_id
-                    )
-                },
-            )?;
-            install_vllm_with_uv(&managed.python_executable)?;
-            resolve_vllm_runtime(Some(&managed.runtime_id)).with_context(|| {
+    let runtime = if let Some(runtime) = already_installed {
+        runtime
+    } else {
+        let managed = resolve_managed_runtime_python(Some(&request.runtime_id))?.with_context(
+            || {
                 format!(
-                    "vLLM install completed in {}, but runtime `{}` still could not be resolved",
-                    managed.python_executable.display(),
-                    managed.runtime_id
+                    "runtime `{}` did not resolve to a managed TheRock Python environment for automatic vLLM install",
+                    request.runtime_id
                 )
-            })?
-        }
+            },
+        )?;
+        install_vllm_with_uv(&managed.python_executable)?;
+        resolve_vllm_runtime(Some(&managed.runtime_id)).with_context(|| {
+            format!(
+                "vLLM install completed in {}, but runtime `{}` still could not be resolved",
+                managed.python_executable.display(),
+                managed.runtime_id
+            )
+        })?
     };
     let env_path = runtime
         .command
@@ -555,10 +554,11 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
 
     // Wait for the server to become ready, with comprehensive error logging
     if let Err(e) = wait_for_vllm_ready(
+        &mut child,
         &request.host,
         request.port,
         &request.model_ref,
-        Duration::from_secs(300),
+        Duration::from_mins(5),
         request.log_path.as_deref(),
     ) {
         // Terminate the whole vLLM process tree so the EngineCore worker (which
@@ -872,8 +872,8 @@ fn resolve_managed_runtime(runtime_id: Option<&str>) -> Result<Option<VllmRuntim
 fn resolve_managed_runtime_python(
     runtime_id: Option<&str>,
 ) -> Result<Option<ManagedRuntimePython>> {
-    let mut candidates = collect_managed_runtime_candidates(runtime_id)?;
-    let Some(candidate) = candidates.drain(..).next() else {
+    let candidates = collect_managed_runtime_candidates(runtime_id)?;
+    let Some(candidate) = candidates.into_iter().next() else {
         return Ok(None);
     };
     Ok(Some(ManagedRuntimePython {
@@ -1377,51 +1377,59 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
     Ok(())
 }
 
+/// Builds a human-readable summary of the tail of the startup log, if available.
+/// Returns an empty string when no log is present or it cannot be read.
+fn startup_log_context(log_path: Option<&Path>) -> String {
+    let summary = log_path
+        .and_then(|p| summarize_startup_log_tail(p, STARTUP_FAILURE_LOG_TAIL_LINES).ok())
+        .unwrap_or_default();
+    if summary.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nLast {STARTUP_FAILURE_LOG_TAIL_LINES} lines of startup log:\n{summary}")
+    }
+}
+
 /// Polls the vLLM endpoint until it reports the model is loaded, or times out.
-/// If the server fails to become ready, returns an error with log tail summary.
+/// Uses a monotonic clock (`Instant`) so wall-clock adjustments cannot corrupt the
+/// timeout, and surfaces an early process exit immediately instead of waiting out
+/// the full readiness window.
 fn wait_for_vllm_ready(
+    child: &mut std::process::Child,
     host: &str,
     port: u16,
     model_ref: &str,
     timeout: Duration,
     log_path: Option<&Path>,
 ) -> Result<()> {
-    let start = SystemTime::now();
-    let endpoint = format!("http://{}:{}", host, port);
+    let start = Instant::now();
+    let endpoint = format!("http://{host}:{port}");
     let poll_interval = Duration::from_millis(500);
 
     loop {
-        if start.elapsed().unwrap_or(timeout) > timeout {
-            let summary = log_path
-                .and_then(|p| summarize_startup_log_tail(p, STARTUP_FAILURE_LOG_TAIL_LINES).ok())
-                .unwrap_or_default();
-            let log_context = if summary.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "\n\nLast {} lines of startup log:\n{}",
-                    STARTUP_FAILURE_LOG_TAIL_LINES, summary
-                )
-            };
+        // Surface an early process exit (bad model ref, missing deps, etc.)
+        // immediately instead of waiting out the full readiness timeout.
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to poll vLLM server process status")?
+        {
+            let log_context = startup_log_context(log_path);
             bail!(
-                "vLLM server at {}:{} failed to become ready within {} seconds{}",
-                host,
-                port,
-                timeout.as_secs(),
-                log_context
+                "vLLM server process exited before becoming ready (status: {status}){log_context}"
+            );
+        }
+
+        if start.elapsed() > timeout {
+            let log_context = startup_log_context(log_path);
+            bail!(
+                "vLLM server at {host}:{port} failed to become ready within {} seconds{log_context}",
+                timeout.as_secs()
             );
         }
 
         match query_loaded_model_endpoint(&endpoint, Some(model_ref)) {
             Ok(true) => return Ok(()),
-            Ok(false) => {
-                std::thread::sleep(poll_interval);
-                continue;
-            }
-            Err(_) => {
-                std::thread::sleep(poll_interval);
-                continue;
-            }
+            Ok(false) | Err(_) => std::thread::sleep(poll_interval),
         }
     }
 }
