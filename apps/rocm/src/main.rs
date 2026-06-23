@@ -1035,7 +1035,7 @@ fn render_freeform_comfyui_status_answer(
 fn dispatch(cli: Cli) -> Result<()> {
     if !matches!(
         cli.command,
-        Some(Command::Update { .. } | Command::Bootstrap { .. })
+        Some(Command::Update { .. } | Command::Bootstrap { .. } | Command::Completions { .. })
     ) {
         refresh_startup_update_check_quietly();
     }
