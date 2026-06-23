@@ -90,9 +90,15 @@ struct Package {
 }
 
 /// Run `cargo metadata` and deserialize the parts we need.
+///
+/// Deliberately does not pass `--locked`: the table reflects the resolved
+/// dependency graph, and `--locked` would make the command hard-fail whenever
+/// `Cargo.lock` needs even a trivial update (e.g. right after a dependency is
+/// added but before a build refreshes the lock). Letting cargo resolve normally
+/// keeps `cargo xtask manifest` usable in that window.
 fn load_metadata() -> Result<Metadata> {
     let output = ProcessCommand::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-        .args(["metadata", "--format-version", "1", "--locked"])
+        .args(["metadata", "--format-version", "1"])
         .output()
         .context("failed to run `cargo metadata`")?;
     if !output.status.success() {
