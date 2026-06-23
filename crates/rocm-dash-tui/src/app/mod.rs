@@ -381,6 +381,14 @@ pub enum Modal {
     Help,
     Detail,
     ThemePicker,
+    /// btop-style Esc main menu (Options / Help / Quit).
+    Menu,
+    /// "Go to…" command palette (tab/destination switch).
+    Palette,
+    /// Tabbed Options panel (General / CPU / GPU / Engines).
+    Options,
+    /// Global 2-column keyboard reference (distinct from the contextual `?`).
+    GlobalHelp,
 }
 
 pub struct AppState {
@@ -392,6 +400,12 @@ pub struct AppState {
     pub instances: HashMap<String, Instance>,
     pub active_tab: ActiveTab,
     pub modal: Modal,
+    /// Cursor into the Esc main-menu rows (Options / Help / Quit).
+    pub menu_sel: usize,
+    /// Cursor into the command-palette destination rows.
+    pub palette_sel: usize,
+    /// Active tab index in the Options panel (General / CPU / GPU / Engines).
+    pub options_tab: usize,
     /// Cursor into the Action tab's guided-verb list.
     pub action_sel: usize,
     /// Cursor into the sorted Instances grid.
@@ -537,6 +551,9 @@ impl AppState {
             instances: HashMap::new(),
             active_tab: ActiveTab::default(),
             modal: Modal::None,
+            menu_sel: 0,
+            palette_sel: 0,
+            options_tab: 0,
             action_sel: 0,
             instance_sel: 0,
             bench_sel: 0,
@@ -1661,6 +1678,15 @@ fn run_approved(
 
 /// Apply a `KeyAction` to mutable state. Returns `true` when the action
 /// requests application exit (Quit).
+/// Wrap a list cursor by `delta`, cycling within `0..len`. `len == 0` → 0.
+const fn wrap_cursor(cur: usize, delta: isize, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let n = len.cast_signed();
+    (cur.cast_signed() + delta).rem_euclid(n) as usize
+}
+
 fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
     match action {
         KeyAction::Quit => return true,
@@ -1765,6 +1791,47 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
         }
         KeyAction::OpenThemePicker => state.open_theme_picker(),
         KeyAction::ApplyThemePick => state.apply_theme_pick(),
+        KeyAction::OpenMenu => {
+            state.modal = Modal::Menu;
+            state.menu_sel = 0;
+        }
+        KeyAction::OpenPalette => {
+            state.modal = Modal::Palette;
+            state.palette_sel = 0;
+        }
+        KeyAction::MenuMove(d) => match state.modal {
+            Modal::Menu => {
+                state.menu_sel = wrap_cursor(state.menu_sel, d, crate::ui::modal::MENU_ITEMS);
+            }
+            Modal::Palette => {
+                state.palette_sel =
+                    wrap_cursor(state.palette_sel, d, crate::ui::modal::PALETTE_DESTS.len());
+            }
+            _ => {}
+        },
+        KeyAction::OptionsTab(d) => {
+            if state.modal == Modal::Options {
+                state.options_tab =
+                    wrap_cursor(state.options_tab, d, crate::ui::modal::OPTIONS_TABS.len());
+            }
+        }
+        KeyAction::MenuActivate => match state.modal {
+            Modal::Menu => match state.menu_sel {
+                0 => {
+                    state.modal = Modal::Options;
+                    state.options_tab = 0;
+                }
+                1 => state.modal = Modal::GlobalHelp,
+                _ => return true, // Quit
+            },
+            Modal::Palette => {
+                if let Some((_, tab)) = crate::ui::modal::PALETTE_DESTS.get(state.palette_sel) {
+                    state.active_tab = *tab;
+                }
+                state.modal = Modal::None;
+            }
+            _ => {}
+        },
         // ponytail: P3 folds Bench into Observe; the per-tab Bench detail modal
         // (the only scrollable detail) is no longer reachable, so modal scroll
         // is a no-op until/unless a scrollable Observe detail is wired.
@@ -1892,6 +1959,16 @@ pub enum KeyAction {
     ChatDetectDismiss,
     /// Chat: scroll the transcript by N lines (positive = down).
     ChatScroll(i16),
+    /// Open the btop-style Esc main menu (P4).
+    OpenMenu,
+    /// Open the "Go to…" command palette (P4).
+    OpenPalette,
+    /// Move the cursor within the active overlay (Menu / Palette) by N rows.
+    MenuMove(isize),
+    /// Cycle the Options panel's tab by N (left/right).
+    OptionsTab(isize),
+    /// Activate the highlighted row in the active overlay (Menu / Palette).
+    MenuActivate,
     /// Open the services-manager overlay (Phase 3 Wave 1).
     OpenServices,
     /// Open the serve-wizard overlay (Phase 3 Wave 1).
@@ -2026,9 +2103,50 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
             _ => KeyAction::Nothing,
         };
     }
+    // Global help overlay (opened from the Esc menu): close-only.
+    if *modal == Modal::GlobalHelp {
+        return match k.code {
+            KeyCode::Char('q') => KeyAction::Quit,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => KeyAction::CloseModal,
+            _ => KeyAction::Nothing,
+        };
+    }
+    // Esc main menu: ↑↓ cycle Options/Help/Quit, Enter activates, Esc closes.
+    if *modal == Modal::Menu {
+        return match k.code {
+            KeyCode::Esc => KeyAction::CloseModal,
+            KeyCode::Char('j') | KeyCode::Down => KeyAction::MenuMove(1),
+            KeyCode::Char('k') | KeyCode::Up => KeyAction::MenuMove(-1),
+            KeyCode::Enter => KeyAction::MenuActivate,
+            _ => KeyAction::Nothing,
+        };
+    }
+    // Command palette: ↑↓ choose destination, Enter goes, Esc closes.
+    if *modal == Modal::Palette {
+        return match k.code {
+            KeyCode::Esc => KeyAction::CloseModal,
+            KeyCode::Char('j') | KeyCode::Down => KeyAction::MenuMove(1),
+            KeyCode::Char('k') | KeyCode::Up => KeyAction::MenuMove(-1),
+            KeyCode::Enter => KeyAction::MenuActivate,
+            _ => KeyAction::Nothing,
+        };
+    }
+    // Options panel: ←→ switch settings tab, Esc closes.
+    if *modal == Modal::Options {
+        return match k.code {
+            KeyCode::Esc => KeyAction::CloseModal,
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::BackTab => KeyAction::OptionsTab(-1),
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Tab => KeyAction::OptionsTab(1),
+            _ => KeyAction::Nothing,
+        };
+    }
     match k.code {
         KeyCode::Char('q') => KeyAction::Quit,
-        KeyCode::Esc => KeyAction::Nothing, // Esc no longer quits; it closes modals.
+        // Esc opens the main menu when idle, except on Chat (where Esc keeps its
+        // existing chat meaning) — managers/approval are routed upstream.
+        KeyCode::Esc if current != ActiveTab::Chat => KeyAction::OpenMenu,
+        KeyCode::Esc => KeyAction::Nothing,
+        KeyCode::Char(':') => KeyAction::OpenPalette,
         KeyCode::Char('?') => KeyAction::ToggleHelp,
         KeyCode::Char('t') => KeyAction::OpenThemePicker,
         KeyCode::BackTab => KeyAction::SwitchTab(current.prev()),
@@ -2178,7 +2296,8 @@ mod tests {
     #[test]
     fn q_quits_esc_does_not() {
         assert_eq!(hk(KeyCode::Char('q'), ActiveTab::Home), KeyAction::Quit);
-        assert_eq!(hk(KeyCode::Esc, ActiveTab::Observe), KeyAction::Nothing);
+        // P4: Esc opens the main menu (it never quits); Chat keeps its own Esc.
+        assert_eq!(hk(KeyCode::Esc, ActiveTab::Observe), KeyAction::OpenMenu);
     }
 
     #[test]
@@ -2375,6 +2494,71 @@ mod tests {
         assert!(s.command_screen.is_some() && s.automations_manager.is_none());
         apply_action(&mut s, KeyAction::OpenConfig);
         assert!(s.config_manager.is_some() && s.command_screen.is_none());
+    }
+
+    #[test]
+    fn esc_opens_menu_when_idle_but_not_on_chat() {
+        // Idle (non-Chat) tabs: Esc opens the btop main menu.
+        assert_eq!(hk(KeyCode::Esc, ActiveTab::Home), KeyAction::OpenMenu);
+        assert_eq!(hk(KeyCode::Esc, ActiveTab::Observe), KeyAction::OpenMenu);
+        // Chat keeps its existing Esc meaning (no menu).
+        assert_eq!(hk(KeyCode::Esc, ActiveTab::Chat), KeyAction::Nothing);
+        // While an overlay modal owns the screen, Esc closes it (not OpenMenu).
+        assert_eq!(
+            handle_key(
+                press(KeyCode::Esc),
+                ActiveTab::Home,
+                &Modal::Menu,
+                ChatKeyCtx::default()
+            ),
+            KeyAction::CloseModal
+        );
+        assert_eq!(
+            handle_key(
+                press(KeyCode::Esc),
+                ActiveTab::Home,
+                &Modal::Options,
+                ChatKeyCtx::default()
+            ),
+            KeyAction::CloseModal
+        );
+    }
+
+    #[test]
+    fn colon_opens_command_palette() {
+        assert_eq!(
+            hk(KeyCode::Char(':'), ActiveTab::Home),
+            KeyAction::OpenPalette
+        );
+    }
+
+    #[test]
+    fn menu_navigation_and_activation() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        apply_action(&mut s, KeyAction::OpenMenu);
+        assert_eq!(s.modal, Modal::Menu);
+        // ↓ from Options(0) → Help(1); activate opens the global help.
+        apply_action(&mut s, KeyAction::MenuMove(1));
+        assert_eq!(s.menu_sel, 1);
+        apply_action(&mut s, KeyAction::MenuActivate);
+        assert_eq!(s.modal, Modal::GlobalHelp);
+        // Menu → Options activation opens the Options panel.
+        apply_action(&mut s, KeyAction::OpenMenu);
+        apply_action(&mut s, KeyAction::MenuActivate); // sel 0 = Options
+        assert_eq!(s.modal, Modal::Options);
+        // Options tab cycles and wraps.
+        apply_action(&mut s, KeyAction::OptionsTab(-1));
+        assert_eq!(s.options_tab, crate::ui::modal::OPTIONS_TABS.len() - 1);
+    }
+
+    #[test]
+    fn palette_activation_switches_tab() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        apply_action(&mut s, KeyAction::OpenPalette);
+        apply_action(&mut s, KeyAction::MenuMove(2)); // → Observe
+        apply_action(&mut s, KeyAction::MenuActivate);
+        assert_eq!(s.active_tab, ActiveTab::Observe);
+        assert_eq!(s.modal, Modal::None);
     }
 
     #[test]

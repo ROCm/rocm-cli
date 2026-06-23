@@ -83,6 +83,10 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
             &state.theme_name,
             &theme,
         ),
+        Modal::Menu => modal::draw_menu(f, outer[2], state.menu_sel, &theme),
+        Modal::Palette => modal::draw_palette(f, outer[2], state.palette_sel, &theme),
+        Modal::Options => modal::draw_options(f, outer[2], state, &theme),
+        Modal::GlobalHelp => modal::draw_global_help(f, outer[2], &theme),
     }
 
     // Operational overlays (Phase 3 Wave 1): only one is open at a time. They
@@ -207,6 +211,12 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     spans.push(Span::raw("   "));
     spans.push(Span::styled(
         format!("theme: {}", state.theme_name),
+        Style::default().fg(theme.muted),
+    ));
+    // Headline chrome hint (per the mocks): Esc menu · t theme · ? help.
+    spans.push(Span::raw("   "));
+    spans.push(Span::styled(
+        "Esc menu · t theme · ? help",
         Style::default().fg(theme.muted),
     ));
     let header = Paragraph::new(vec![Line::from(spans)]).block(

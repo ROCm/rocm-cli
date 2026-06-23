@@ -14,7 +14,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use crate::app::ActiveTab;
+use crate::app::{ActiveTab, AppState};
 use crate::ui::gradient::GradientGauge;
 use crate::ui::sparkline::BrailleSparkline;
 use crate::ui::theme::{self, Theme};
@@ -395,9 +395,251 @@ fn badge<'a>(label: &'a str, bg: ratatui::style::Color, preview_theme: &Theme) -
 }
 
 // ===========================================================================
+// P4 overlays: Esc menu, command palette, tabbed Options, global Help. They
+// compose the Phase-1 chrome helpers (grey_overlay / draw_logo / opt_row /
+// draw_tab_panel) over the stable 4-tab body.
+// ===========================================================================
+
+/// Esc-menu rows: Options / Help / Quit.
+pub const MENU_ITEMS: usize = 3;
+
+/// Command-palette destinations (label, tab).
+pub const PALETTE_DESTS: &[(&str, ActiveTab)] = &[
+    ("Home", ActiveTab::Home),
+    ("Action", ActiveTab::Action),
+    ("Observe", ActiveTab::Observe),
+    ("Chat", ActiveTab::Chat),
+];
+
+/// Options panel tabs.
+pub const OPTIONS_TABS: &[&str] = &["General", "CPU", "GPU", "Engines"];
+
+/// Esc main menu: Home backdrop dimmed by `grey_overlay`, a double-border modal
+/// with the btop `draw_logo` and the Options/Help/Quit list.
+pub fn draw_menu(f: &mut Frame, area: Rect, sel: usize, theme: &Theme) {
+    grey_overlay(f);
+    let modal = centered_rect(50, 70, 60, 17, area);
+    f.render_widget(Clear, modal);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Double)
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.surface));
+    let inner = block.inner(modal);
+    f.render_widget(block, modal);
+    if inner.height < 6 || inner.width < 31 {
+        return;
+    }
+    let logo_w = 31u16;
+    let cx = inner.x + inner.width.saturating_sub(logo_w) / 2;
+    draw_logo(f, cx, inner.y + 1, theme);
+
+    let items = ["Options", "Help", "Quit"];
+    let mx = inner.x + 4;
+    for (i, label) in items.iter().enumerate() {
+        let y = inner.y + 8 + i as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let focused = i == sel;
+        let (cur, st) = if focused {
+            (
+                "▸ ",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            ("  ", Style::default().fg(theme.fg))
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(cur, Style::default().fg(theme.accent)),
+                Span::styled(*label, st),
+            ])),
+            Rect::new(mx, y, inner.width.saturating_sub(4), 1),
+        );
+    }
+}
+
+/// Command palette: dimmed backdrop + centered "Go to…" card with a `:` filter
+/// line and the destination rows.
+pub fn draw_palette(f: &mut Frame, area: Rect, sel: usize, theme: &Theme) {
+    grey_overlay(f);
+    let modal = centered_rect(50, 60, 54, 12, area);
+    let inner = draw_popup_frame(f, modal, "Go to…", theme);
+    if inner.height == 0 {
+        return;
+    }
+    f.render_widget(Clear, inner);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            ": type to filter",
+            Style::default().fg(theme.muted),
+        ))),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    for (i, (label, _)) in PALETTE_DESTS.iter().enumerate() {
+        let y = inner.y + 2 + i as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let focused = i == sel;
+        let (cur, st) = if focused {
+            (
+                "▸ ",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            ("  ", Style::default().fg(theme.fg))
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(cur, Style::default().fg(theme.accent)),
+                Span::styled(*label, st),
+            ])),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+    }
+}
+
+/// Tabbed Options panel reusing the outlined tab renderer + `opt_row`.
+pub fn draw_options(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    grey_overlay(f);
+    let modal = centered_rect(80, 80, 112, 26, area);
+    f.render_widget(Clear, modal);
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme.surface)),
+        modal,
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " ⚙  Options",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        Rect::new(modal.x + 2, modal.y, modal.width.saturating_sub(2), 1),
+    );
+    let panel = Rect::new(
+        modal.x + 1,
+        modal.y + 1,
+        modal.width.saturating_sub(2),
+        modal.height.saturating_sub(2),
+    );
+    let inner = crate::ui::tabs::draw_tab_panel(f, panel, OPTIONS_TABS, state.options_tab, theme);
+    if inner.height == 0 {
+        return;
+    }
+    // Render a few representative rows for the active settings tab. Real config
+    // is wired where it exists; net-new toggles are display-with-intent.
+    let rows: &[(&str, String, &str)] = match state.options_tab {
+        0 => &[
+            ("Theme", state.theme_name.clone(), "◂ t ▸"),
+            // ponytail: telemetry/refresh toggles are display-with-intent — no
+            // new persisted config store is invented this run.
+            ("Telemetry", "local-only".to_string(), "—"),
+            ("Refresh", "1s".to_string(), "—"),
+        ],
+        1 => &[("Per-core bars", "on".to_string(), "—")],
+        2 => &[("Gradient gauges", "on".to_string(), "—")],
+        _ => &[("Default engine", "auto".to_string(), "—")],
+    };
+    for (i, (label, value, control)) in rows.iter().enumerate() {
+        let y = inner.y + 1 + i as u16 * 2;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        opt_row(
+            f,
+            Rect::new(inner.x + 2, y, inner.width.saturating_sub(4), 1),
+            label,
+            value,
+            control,
+            i == 0,
+            theme,
+        );
+    }
+}
+
+/// Global 2-column keyboard reference (NAVIGATE / OVERLAYS / ACTIONS / CHAT /
+/// GLOBAL). Distinct from the contextual per-tab `?` help (`draw_help`).
+pub fn draw_global_help(f: &mut Frame, area: Rect, theme: &Theme) {
+    grey_overlay(f);
+    let modal = centered_rect(80, 80, 100, 26, area);
+    let inner = draw_popup_frame(f, modal, "Keyboard", theme);
+    if inner.height == 0 {
+        return;
+    }
+    f.render_widget(Clear, inner);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner);
+    let left: &[(&str, &[(&str, &str)])] = &[
+        (
+            "NAVIGATE",
+            &[
+                ("Tab / ⇧Tab", "next / prev tab"),
+                ("1 .. 4", "jump to tab"),
+                ("j / k", "select"),
+            ],
+        ),
+        (
+            "OVERLAYS",
+            &[
+                ("Esc", "main menu"),
+                (":", "command palette"),
+                ("? ", "this help"),
+                ("t", "theme picker"),
+            ],
+        ),
+    ];
+    let right: &[(&str, &[(&str, &str)])] = &[
+        (
+            "ACTIONS",
+            &[
+                ("w / e / d", "serve / engines / doctor"),
+                ("u / i / l", "update / install / logs"),
+                ("Enter", "open / detail"),
+            ],
+        ),
+        (
+            "CHAT / GLOBAL",
+            &[("i / Enter", "focus chat input"), ("q", "quit")],
+        ),
+    ];
+    render_help_groups(f, cols[0], left, theme);
+    render_help_groups(f, cols[1], right, theme);
+}
+
+fn render_help_groups(
+    f: &mut Frame,
+    area: Rect,
+    groups: &[(&str, &[(&str, &str)])],
+    theme: &Theme,
+) {
+    let mut lines: Vec<Line> = Vec::new();
+    for (title, rows) in groups {
+        lines.push(Line::from(Span::styled(
+            *title,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for (k, desc) in *rows {
+            lines.push(key_line(k, desc, theme));
+        }
+        lines.push(Line::raw(""));
+    }
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+// ===========================================================================
 // btop-style chrome helpers ported from `examples/gen_mockups.rs` (Phase 1).
-// Pure draw fns, no wiring this phase — the Esc menu / Options overlays compose
-// them in Phase 4. Hit-testing / state are added with the live wiring.
+// Pure draw fns composed by the P4 overlays above.
 // ===========================================================================
 
 /// Stamp a string at `(x, y)` if the row is on-screen. Mirror of the
@@ -545,6 +787,51 @@ mod ported_chrome_tests {
             buf.content().iter().all(|c| c.style().bg == Some(wash)),
             "overlay did not wash every cell"
         );
+    }
+
+    #[test]
+    fn p4_overlays_render_key_content() {
+        use crate::app::{ActiveTab, AppState};
+        let theme = Theme::from_name("default-dark");
+        let area = ratatui::layout::Rect::new(0, 0, 120, 30);
+
+        let render = |draw: &dyn Fn(&mut ratatui::Frame)| -> String {
+            let backend = TestBackend::new(120, 30);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| draw(f)).unwrap();
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect()
+        };
+
+        let menu = render(&|f| super::draw_menu(f, area, 0, &theme));
+        assert!(menu.contains("Options"), "menu missing Options: {menu:?}");
+        assert!(menu.contains("Quit"), "menu missing Quit");
+
+        let palette = render(&|f| super::draw_palette(f, area, 0, &theme));
+        assert!(
+            palette.contains("Go to"),
+            "palette missing Go to: {palette:?}"
+        );
+
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        let options = render(&|f| super::draw_options(f, area, &s, &theme));
+        assert!(
+            options.contains("Options"),
+            "options missing title: {options:?}"
+        );
+        assert!(options.contains("General"), "options missing tab label");
+
+        let help = render(&|f| super::draw_global_help(f, area, &theme));
+        assert!(
+            help.contains("Keyboard"),
+            "global help missing title: {help:?}"
+        );
+        assert!(help.contains("NAVIGATE"), "global help missing group");
     }
 
     #[test]
