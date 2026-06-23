@@ -119,6 +119,42 @@ fn chat_tab_renders_key_labels() {
 }
 
 #[test]
+fn wide_layout_shows_logs_or_context_dock_not_composer() {
+    // Operational tab → LOGS dock; the dock must never be a chat composer.
+    let observe = render(&mut state_on(ActiveTab::Observe), 200, 50);
+    assert!(
+        observe.contains("LOGS"),
+        "wide Observe missing LOGS dock: {observe:?}"
+    );
+    // Home → CONTEXT rail (RUNNING SERVICES section).
+    let home = render(&mut state_on(ActiveTab::Home), 200, 50);
+    assert!(
+        home.contains("CONTEXT") && home.contains("RUNNING SERVICES"),
+        "wide Home missing CONTEXT rail: {home:?}"
+    );
+    // Neither dock leaks the chat composer.
+    assert!(
+        !observe.contains("press i to type"),
+        "composer in Observe dock"
+    );
+    assert!(!home.contains("press i to type"), "composer in Home dock");
+}
+
+#[test]
+fn narrow_layout_is_single_column_no_dock() {
+    // Below the 180×45 threshold there is no LOGS/CONTEXT dock (fallback path).
+    let out = render(&mut state_on(ActiveTab::Observe), 160, 44);
+    assert!(
+        !out.contains("LOGS"),
+        "narrow layout must not show the dock: {out:?}"
+    );
+    assert!(
+        !out.contains("CONTEXT"),
+        "narrow layout must not show CONTEXT dock"
+    );
+}
+
+#[test]
 fn every_tab_survives_squeezed_height() {
     // The body rect can collapse to 0–1 inner rows on a short terminal; assert
     // no tab panics when squeezed (the historical ActiveTab footgun).

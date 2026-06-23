@@ -8,6 +8,7 @@ pub mod bench;
 pub mod command_screen;
 pub mod config_manager;
 pub mod core_bars;
+pub mod dock;
 pub mod engine_manager;
 pub mod examine_manager;
 pub mod exec;
@@ -58,11 +59,27 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
 
     draw_header(f, outer[0], state, &theme);
     tabs::draw_tab_bar(f, outer[1], state.active_tab, &theme);
+
+    // Wide triptych (Phase 6): width-gated GPU wall / center / right dock. The
+    // right dock is LOGS or CONTEXT — never a chat composer. Below the threshold
+    // the body stays single-column (byte-for-byte the pre-Phase-6 layout).
+    let area = f.area();
+    let center = if dock::is_wide(area.width, area.height) {
+        if let Some((left, center, right)) = dock::triptych(outer[2]) {
+            dock::gpu_wall(f, left, state, &theme);
+            dock::draw_right_dock(f, right, state, &theme);
+            center
+        } else {
+            outer[2]
+        }
+    } else {
+        outer[2]
+    };
     match state.active_tab {
-        ActiveTab::Home => tabs::home::draw(f, outer[2], state, &theme),
-        ActiveTab::Action => tabs::action::draw(f, outer[2], state, &theme),
-        ActiveTab::Observe => tabs::observe::draw(f, outer[2], state, &theme),
-        ActiveTab::Chat => tabs::chat::draw(f, outer[2], state, &theme),
+        ActiveTab::Home => tabs::home::draw(f, center, state, &theme),
+        ActiveTab::Action => tabs::action::draw(f, center, state, &theme),
+        ActiveTab::Observe => tabs::observe::draw(f, center, state, &theme),
+        ActiveTab::Chat => tabs::chat::draw(f, center, state, &theme),
     }
     draw_footer(f, outer[3], state, &theme);
 
