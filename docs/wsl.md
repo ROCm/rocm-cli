@@ -115,7 +115,7 @@ still useful for compatibility checks while the WSL path is being hardened.
 ## TheRock Runtime Env In WSL
 
 `rocm-cli` should continue to own the Python venv. Do not rely on an externally
-created venv such as `D:\jam\venv`.
+created venv such as `D:\ROCm\venv`.
 
 The WSL activation environment for HIP applications that do not preload ROCm
 the way PyTorch does must include the managed TheRock runtime package paths and

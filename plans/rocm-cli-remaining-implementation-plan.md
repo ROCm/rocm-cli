@@ -167,9 +167,9 @@ Locally implemented and recently verified:
 - Live local-assistant acceptance now also passes on WSL with the `qwen` alias
   after path propagation fixes for managed child processes:
   `scripts/local_assistant_therock_gpu_test.py --rocm
-  /home/jam/.cache/rocm-cli-target/debug/rocm --model qwen --require-tool-call`
+  /home/user/.cache/rocm-cli-target/debug/rocm --model qwen --require-tool-call`
   launched the managed PyTorch GPU-required service, wrote its service
-  manifest under `/home/jam/.rocm/services`, required a ROCm tool call, and
+  manifest under `/home/user/.rocm/services`, required a ROCm tool call, and
   stopped the managed service cleanly.
 - ComfyUI TUI logs/file-location polish is now covered by regression tests:
   `/comfyui logs` and `/comfyui log-files` keep the user on a navigable
@@ -180,7 +180,7 @@ Locally implemented and recently verified:
   WSL `rocm examine`, `rocm engines list`, `rocm comfyui status`, and
   `rocm services list`. The first WSL sidecar found a stale `/mnt/d` debug
   binary that rejected newer `comfyui`/`services` subcommands; a forced rebuild
-  into `/home/jam/.cache/rocm-cli-target` fixed the artifact and verified those
+  into `/home/user/.cache/rocm-cli-target` fixed the artifact and verified those
   subcommands. Live WSL PyTorch local-assistant serving now passes, and live WSL
   ComfyUI now passes an opt-in install/start/status/logs/generate-cat/stop flow
   from the ext4 worktree.

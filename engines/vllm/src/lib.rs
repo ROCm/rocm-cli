@@ -1283,7 +1283,7 @@ mod tests {
             command: PathBuf::from(if cfg!(windows) {
                 r"C:\venv\Scripts\vllm.exe"
             } else {
-                "/home/jam/.venv/bin/vllm"
+                "/home/user/.venv/bin/vllm"
             }),
             python_executable: None,
             version: Some("test".to_owned()),
@@ -1572,7 +1572,7 @@ mod tests {
             command: PathBuf::from(if cfg!(windows) {
                 r"C:\venv\Scripts\vllm.exe"
             } else {
-                "/home/jam/.venv/bin/vllm"
+                "/home/user/.venv/bin/vllm"
             }),
             python_executable: None,
             version: Some("test".to_owned()),
@@ -1580,22 +1580,22 @@ mod tests {
             sdk_root: Some(PathBuf::from(if cfg!(windows) {
                 r"C:\rocm-sdk"
             } else {
-                "/home/jam/.venv/lib/python/site-packages/rocm_sdk"
+                "/home/user/.venv/lib/python/site-packages/rocm_sdk"
             })),
             sdk_bin: Some(PathBuf::from(if cfg!(windows) {
                 r"C:\rocm-sdk\bin"
             } else {
-                "/home/jam/.venv/lib/python/site-packages/rocm_sdk/bin"
+                "/home/user/.venv/lib/python/site-packages/rocm_sdk/bin"
             })),
             sdk_bin_paths: vec![PathBuf::from(if cfg!(windows) {
                 r"C:\rocm-sdk\extra-bin"
             } else {
-                "/home/jam/.venv/lib/python/site-packages/_rocm_sdk_libraries/bin"
+                "/home/user/.venv/lib/python/site-packages/_rocm_sdk_libraries/bin"
             })],
             sdk_library_paths: vec![PathBuf::from(if cfg!(windows) {
                 r"C:\rocm-sdk\extra-lib"
             } else {
-                "/home/jam/.venv/lib/python/site-packages/_rocm_sdk_libraries/lib"
+                "/home/user/.venv/lib/python/site-packages/_rocm_sdk_libraries/lib"
             })],
         };
 

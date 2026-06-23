@@ -1525,7 +1525,7 @@ mod tests {
             command: PathBuf::from(if cfg!(windows) {
                 r"C:\venv\Scripts\python.exe"
             } else {
-                "/home/jam/.venv/bin/python"
+                "/home/user/.venv/bin/python"
             }),
             launcher: AtomLauncher::Command,
             python_executable: None,
@@ -1534,12 +1534,12 @@ mod tests {
             sdk_root: Some(PathBuf::from(if cfg!(windows) {
                 r"C:\rocm-sdk"
             } else {
-                "/home/jam/.venv/lib/python/site-packages/_rocm_sdk_devel"
+                "/home/user/.venv/lib/python/site-packages/_rocm_sdk_devel"
             })),
             sdk_bin: Some(PathBuf::from(if cfg!(windows) {
                 r"C:\rocm-sdk\bin"
             } else {
-                "/home/jam/.venv/lib/python/site-packages/_rocm_sdk_devel/bin"
+                "/home/user/.venv/lib/python/site-packages/_rocm_sdk_devel/bin"
             })),
             sdk_bin_paths: Vec::new(),
             sdk_library_paths: Vec::new(),
@@ -1592,7 +1592,7 @@ mod tests {
             command: PathBuf::from(if cfg!(windows) {
                 r"C:\venv\Scripts\python.exe"
             } else {
-                "/home/jam/.venv/bin/python"
+                "/home/user/.venv/bin/python"
             }),
             launcher: AtomLauncher::Command,
             python_executable: None,
@@ -1601,22 +1601,22 @@ mod tests {
             sdk_root: Some(PathBuf::from(if cfg!(windows) {
                 r"C:\rocm-sdk"
             } else {
-                "/home/jam/.venv/lib/python/site-packages/_rocm_sdk_devel"
+                "/home/user/.venv/lib/python/site-packages/_rocm_sdk_devel"
             })),
             sdk_bin: Some(PathBuf::from(if cfg!(windows) {
                 r"C:\rocm-sdk\bin"
             } else {
-                "/home/jam/.venv/lib/python/site-packages/_rocm_sdk_devel/bin"
+                "/home/user/.venv/lib/python/site-packages/_rocm_sdk_devel/bin"
             })),
             sdk_bin_paths: vec![PathBuf::from(if cfg!(windows) {
                 r"C:\rocm-sdk\extra-bin"
             } else {
-                "/home/jam/.venv/lib/python/site-packages/_rocm_sdk_libraries/bin"
+                "/home/user/.venv/lib/python/site-packages/_rocm_sdk_libraries/bin"
             })],
             sdk_library_paths: vec![PathBuf::from(if cfg!(windows) {
                 r"C:\rocm-sdk\extra-lib"
             } else {
-                "/home/jam/.venv/lib/python/site-packages/_rocm_sdk_libraries/lib"
+                "/home/user/.venv/lib/python/site-packages/_rocm_sdk_libraries/lib"
             })],
         };
 

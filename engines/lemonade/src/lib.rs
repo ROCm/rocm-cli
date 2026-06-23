@@ -2201,12 +2201,21 @@ mod tests {
             data_dir: PathBuf::from("C:/Users/test/.rocm"),
             cache_dir: PathBuf::from("C:/Users/test/.rocm/cache"),
         };
-        let engine_root = PathBuf::from("D:/jam/temp/therock_venvs/engines");
+        let engine_root = PathBuf::from("D:/path/to/therock_venvs/engines");
 
         assert_eq!(
             lemonade_root(&paths, Some(&engine_root)),
             normalize_runtime_path_for_host(&engine_root).join(ENGINE_NAME)
         );
+    }
+
+    #[test]
+    fn windows_child_path_maps_ape_drive_paths() {
+        assert_eq!(
+            windows_child_path(Path::new("/D/path/to/rocm-cli/file.zip")),
+            r"D:\path\to\rocm-cli\file.zip"
+        );
+        assert_eq!(windows_child_path(Path::new("/c")), r"C:\");
     }
 
     #[test]

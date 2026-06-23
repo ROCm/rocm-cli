@@ -107,8 +107,8 @@ def strip_tool_for(platform: str) -> str | None:
     if platform == "windows-amd64":
         candidates.extend(
             [
-                r"D:\jam\venv\Lib\site-packages\_rocm_sdk_core\lib\llvm\bin\llvm-strip.exe",
-                r"D:\jam\venv\Lib\site-packages\_rocm_sdk_devel\lib\llvm\bin\llvm-strip.exe",
+                r"D:\path\to\venv\Lib\site-packages\_rocm_sdk_core\lib\llvm\bin\llvm-strip.exe",
+                r"D:\path\to\venv\Lib\site-packages\_rocm_sdk_devel\lib\llvm\bin\llvm-strip.exe",
                 "llvm-strip",
             ]
         )

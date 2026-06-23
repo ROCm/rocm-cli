@@ -23,7 +23,7 @@ resolver = "2"
 version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/powderluv/rocm-cli"
+repository = "https://github.com/ROCm/rocm-cli"
 rust-version = "1.96"
 
 [workspace.dependencies]
