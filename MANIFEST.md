@@ -593,8 +593,11 @@ ROCm distribution. Two install formats are supported:
 - **Tarball format** — Prebuilt SDK tarballs are downloaded from AMD-hosted
   artifact storage. Release channel tarballs are served from
   `https://repo.amd.com/rocm/tarball/`. Nightly tarballs are served from
-  `https://rocm.nightlies.amd.com/tarball/`. Tarballs are verified with an
-  optional RSA/SHA-256 detached signature before extraction.
+  `https://rocm.nightlies.amd.com/tarball/`. The metadata index files for
+  tarball installs are optionally verified with an RSA/SHA-256 detached
+  signature (controlled by `ROCM_CLI_METADATA_PUBLIC_KEY_PATH` /
+  `ROCM_CLI_METADATA_PUBLIC_KEY_PEM`); the tarball binary itself is not
+  signature-verified.
 
 Nothing is downloaded until the user explicitly runs `rocm install sdk` or
 `rocm update`. The CLI does not auto-install any ROCm SDK on first launch.
@@ -607,13 +610,24 @@ official uv GitHub releases at `https://github.com/astral-sh/uv/releases/`.
 The binary is cached in the rocm-cli managed data directory and reused for
 subsequent operations. The version may be pinned via `ROCM_CLI_UV_VERSION`.
 
+### Lemonade Embeddable Runtime
+
+When `rocm engines install lemonade` is run, the CLI downloads a prebuilt
+Lemonade embeddable archive from the official Lemonade SDK GitHub releases at
+`https://github.com/lemonade-sdk/lemonade/releases/`. The archive is extracted
+to the rocm-cli managed data directory and is reused for subsequent
+`rocm engines start lemonade` invocations. This is a self-contained binary
+distribution; no Python packages are installed for Lemonade by rocm-cli.
+
 ### Engine-Specific Python Dependencies
 
-Engines that use Python (vLLM, SGLang, PyTorch, Lemonade, ATOM) manage their
-own Python virtual environments using the `uv` binary described above. Python
-packages are installed from the TheRock PyPI index and, where applicable, from
-public PyPI (`https://pypi.org`). No Python packages are bundled in the
-repository.
+The PyTorch engine manages its own Python virtual environment using the `uv`
+binary described above. Python packages are installed from the TheRock PyPI
+index and, where applicable, from public PyPI (`https://pypi.org`). No Python
+packages are bundled in the repository.
+
+The vLLM, SGLang, and ATOM engines do not install Python packages automatically;
+they record externally-provided runtimes supplied by the user.
 
 ## Repository Structure Notes
 
