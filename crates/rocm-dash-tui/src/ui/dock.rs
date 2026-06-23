@@ -62,10 +62,7 @@ pub fn draw_right_dock(f: &mut Frame, area: Rect, state: &AppState, theme: &Them
 /// The persistent left rail: a wall of GPU instrument cards from live snapshot
 /// telemetry (port of the mock `gpu_wall`, read-only).
 pub fn gpu_wall(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let gpus = state
-        .latest
-        .as_ref()
-        .map_or(&[][..], |s| s.gpus.as_slice());
+    let gpus = state.latest.as_ref().map_or(&[][..], |s| s.gpus.as_slice());
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" GPUs · {} ", gpus.len()))

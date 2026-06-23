@@ -154,6 +154,97 @@ fn narrow_layout_is_single_column_no_dock() {
     );
 }
 
+// --- Phase 7: empty / loading / error states, honesty, a11y of color ---
+
+#[test]
+fn observe_empty_state_shows_placeholders() {
+    // Connected but with no instances → honest empty placeholder, no banner.
+    let mut s = AppState::new("c".into(), "default-dark".into());
+    s.active_tab = ActiveTab::Observe;
+    s.conn = ConnState::Connected {
+        host: "h".into(),
+        version: "1".into(),
+    };
+    s.latest = Some(synthetic_snapshot());
+    let out = render(&mut s, 160, 44);
+    assert!(
+        out.contains("no instances"),
+        "empty instances placeholder: {out:?}"
+    );
+}
+
+#[test]
+fn loading_state_connecting_banner() {
+    // Connecting (no snapshot) → header shows the loading status + demo banner.
+    let mut s = AppState::new("c".into(), "default-dark".into());
+    s.active_tab = ActiveTab::Observe;
+    s.conn = ConnState::Connecting;
+    let out = render(&mut s, 160, 44);
+    assert!(
+        out.contains("connecting"),
+        "loading status missing: {out:?}"
+    );
+    assert!(
+        out.contains("demo data"),
+        "demo banner expected while loading"
+    );
+}
+
+#[test]
+fn disconnected_banner_present() {
+    // Disconnected → error status in header + demo banner on Observe.
+    let mut s = AppState::new("c".into(), "default-dark".into());
+    s.active_tab = ActiveTab::Observe;
+    s.conn = ConnState::Disconnected {
+        reason: "daemon gone".into(),
+    };
+    let out = render(&mut s, 160, 44);
+    assert!(
+        out.contains("disconnected"),
+        "error status missing: {out:?}"
+    );
+    assert!(
+        out.contains("demo data"),
+        "demo banner expected when disconnected"
+    );
+}
+
+#[test]
+fn honesty_demo_banner_absent_when_connected_with_telemetry() {
+    let mut s = AppState::new("c".into(), "default-dark".into());
+    s.active_tab = ActiveTab::Observe;
+    s.conn = ConnState::Connected {
+        host: "h".into(),
+        version: "1".into(),
+    };
+    s.latest = Some(synthetic_snapshot());
+    let out = render(&mut s, 160, 44);
+    assert!(
+        !out.contains("demo data"),
+        "banner must be hidden when live: {out:?}"
+    );
+}
+
+#[test]
+fn a11y_status_carries_text_label_not_color_only() {
+    // Connection status is conveyed in words, not by color alone.
+    let mut connected = state_on(ActiveTab::Home);
+    let out = render(&mut connected, 160, 44);
+    assert!(
+        out.contains("connected"),
+        "connected text label missing: {out:?}"
+    );
+
+    let mut s = AppState::new("c".into(), "default-dark".into());
+    s.active_tab = ActiveTab::Home;
+    s.conn = ConnState::Disconnected { reason: "x".into() };
+    let dis = render(&mut s, 160, 44);
+    assert!(
+        dis.contains("disconnected"),
+        "disconnected text label missing: {dis:?}"
+    );
+}
+
 #[test]
 fn every_tab_survives_squeezed_height() {
     // The body rect can collapse to 0–1 inner rows on a short terminal; assert
