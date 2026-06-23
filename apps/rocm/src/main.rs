@@ -3948,6 +3948,7 @@ fn attach_background_stdio(command: &mut ProcessCommand, log_path: Option<&Path>
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn managed_engine_startup_failure_detail(status: ExitStatus, log_path: &Path) -> String {
     let mut recent_lines = read_optional_tail_lines(log_path, 80, "service log");
     if recent_lines.is_empty() {
