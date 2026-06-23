@@ -133,7 +133,7 @@ $bundleBin = Join-Path $rootDir "bin"
 Copy-RequiredFile (Join-Path $binaryDir "rocm.exe") (Join-Path $bundleBin "rocm.exe")
 Copy-RequiredFile (Join-Path $binaryDir "rocmd.exe") (Join-Path $bundleBin "rocmd.exe")
 Copy-RequiredFile (Join-Path $repoRoot "README.md") (Join-Path $rootDir "README.md")
-Copy-RequiredFile (Join-Path $repoRoot "LICENSE") (Join-Path $rootDir "LICENSE")
+Copy-RequiredFile (Join-Path $repoRoot "LICENSE.TXT") (Join-Path $rootDir "LICENSE.TXT")
 Copy-RequiredFile (Join-Path $repoRoot "install.ps1") (Join-Path $rootDir "install.ps1")
 
 Compress-Archive -LiteralPath $rootDir -DestinationPath $archivePath -Force

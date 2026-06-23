@@ -28,14 +28,14 @@ LINUX_REQUIRED = (
     "bin/rocm",
     "bin/rocmd",
     "README.md",
-    "LICENSE",
+    "LICENSE.TXT",
     "install.sh",
 )
 WINDOWS_REQUIRED = (
     "bin/rocm.exe",
     "bin/rocmd.exe",
     "README.md",
-    "LICENSE",
+    "LICENSE.TXT",
     "install.ps1",
 )
 LINUX_EXECUTABLES = (
