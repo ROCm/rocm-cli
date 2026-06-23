@@ -437,7 +437,7 @@ fn print_recipe(r: &FixRecipe) {
 pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
     let Some(recipe) = find_recipe(fix_id) else {
         eprintln!("Unknown fix-id: {fix_id}");
-        eprintln!("Run `rocm examine --diagnose` to see which fix-id applies.");
+        eprintln!("Run `rocm diagnose` to see which fix-id applies.");
         return 2;
     };
     print_recipe(recipe);

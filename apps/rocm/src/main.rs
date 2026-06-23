@@ -66,30 +66,35 @@ struct Cli {
 enum Command {
     /// Check this computer's GPU, ROCm install, engines, and setup folders.
     Examine {
-        /// Diagnose known ROCm/PyTorch/llama.cpp failure modes and suggest fixes.
-        #[arg(long, conflicts_with = "fix")]
-        diagnose: bool,
-        /// Raw error text from the user; sharpens diagnosis keyword scoring.
-        #[arg(long, requires = "diagnose")]
-        symptom: Option<String>,
-        /// With --diagnose, show at most this many matches (default 5).
-        #[arg(long, requires = "diagnose", default_value_t = 5)]
-        top: usize,
-        /// Apply a known fix by id (e.g. fix-4-render-group); see --diagnose output.
-        #[arg(long, value_name = "FIX_ID")]
-        fix: Option<String>,
-        /// With --fix, skip the interactive confirmation (use after approving the plan).
-        #[arg(long, requires = "fix")]
-        yes: bool,
-        /// With --fix, show the plan without changing anything.
-        #[arg(long = "dry-run", requires = "fix")]
-        dry_run: bool,
-        /// For fix-9-igpu-dgpu: the discrete GPU index to pin.
-        #[arg(long, requires = "fix")]
-        device_index: Option<i64>,
-        /// Emit machine-readable JSON (the Examination, or the diagnosis with --diagnose).
+        /// Emit the machine-readable Examination JSON (for diagnosis tooling).
         #[arg(long)]
         json: bool,
+    },
+    /// Diagnose known ROCm/PyTorch/llama.cpp failure modes against a closed catalog.
+    Diagnose {
+        /// Raw error text from the user; sharpens keyword scoring.
+        #[arg(long)]
+        symptom: Option<String>,
+        /// Show at most this many matches (default 5).
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+        /// Emit the machine-readable diagnosis JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply a known fix by id (see `rocm diagnose`); run with no id to list fixes.
+    Fix {
+        /// Fix id, e.g. fix-4-render-group. Omit to list available fixes.
+        fix_id: Option<String>,
+        /// Skip the interactive confirmation (use after approving the plan).
+        #[arg(long)]
+        yes: bool,
+        /// Show the plan without changing anything.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// For fix-9-igpu-dgpu: the discrete GPU index to pin.
+        #[arg(long)]
+        device_index: Option<i64>,
     },
     /// Print the rocm-cli version.
     Version,
@@ -1060,25 +1065,14 @@ fn dispatch(cli: Cli) -> Result<()> {
     }
 
     match cli.command {
-        Some(Command::Examine {
-            diagnose,
-            symptom,
-            top,
-            fix,
+        Some(Command::Examine { json }) => examine(json),
+        Some(Command::Diagnose { symptom, top, json }) => diagnose(symptom, top, json),
+        Some(Command::Fix {
+            fix_id,
             yes,
             dry_run,
             device_index,
-            json,
-        }) => examine(ExamineArgs {
-            diagnose,
-            symptom,
-            top,
-            fix,
-            yes,
-            dry_run,
-            device_index,
-            json,
-        }),
+        }) => fix(fix_id, yes, dry_run, device_index),
         Some(Command::Version) => {
             println!("rocm {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -1455,45 +1449,8 @@ const fn builtin_engine_inventory() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
-struct ExamineArgs {
-    diagnose: bool,
-    symptom: Option<String>,
-    top: usize,
-    fix: Option<String>,
-    yes: bool,
-    dry_run: bool,
-    device_index: Option<i64>,
-    json: bool,
-}
-
-fn examine(args: ExamineArgs) -> Result<()> {
-    if let Some(fix_id) = args.fix {
-        let opts = rocm_core::FixOptions {
-            yes: args.yes,
-            dry_run: args.dry_run,
-            device_index: args.device_index,
-        };
-        let code = rocm_core::apply_fix(&fix_id, &opts);
-        if code != 0 {
-            std::process::exit(code);
-        }
-        return Ok(());
-    }
-    if args.diagnose {
-        let examination = rocm_core::Examination::probe(rocm_core::FrameworkProbe::Auto);
-        let symptom = args.symptom.unwrap_or_default();
-        let report = rocm_core::run_diagnose(&examination, &symptom);
-        if args.json {
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        } else {
-            print!("{}", rocm_core::render_diagnose_text(&report, args.top));
-        }
-        if !report.has_match() {
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
-    if args.json {
+fn examine(json: bool) -> Result<()> {
+    if json {
         let examination = rocm_core::Examination::probe(rocm_core::FrameworkProbe::Auto);
         println!("{}", serde_json::to_string_pretty(&examination)?);
         let code = examination.exit_code();
@@ -1503,6 +1460,37 @@ fn examine(args: ExamineArgs) -> Result<()> {
         return Ok(());
     }
     print!("{}", render_examine_text()?);
+    Ok(())
+}
+
+fn diagnose(symptom: Option<String>, top: usize, json: bool) -> Result<()> {
+    let examination = rocm_core::Examination::probe(rocm_core::FrameworkProbe::Auto);
+    let report = rocm_core::run_diagnose(&examination, &symptom.unwrap_or_default());
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", rocm_core::render_diagnose_text(&report, top));
+    }
+    if !report.has_match() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn fix(fix_id: Option<String>, yes: bool, dry_run: bool, device_index: Option<i64>) -> Result<()> {
+    let Some(fix_id) = fix_id else {
+        print!("{}", rocm_core::list_fix_recipes());
+        return Ok(());
+    };
+    let opts = rocm_core::FixOptions {
+        yes,
+        dry_run,
+        device_index,
+    };
+    let code = rocm_core::apply_fix(&fix_id, &opts);
+    if code != 0 {
+        std::process::exit(code);
+    }
     Ok(())
 }
 
@@ -14157,6 +14145,8 @@ fn service_model_names_match(left: &str, right: &str) -> bool {
 fn treat_as_natural_language(args: &[String]) -> bool {
     const STRUCTURED: &[&str] = &[
         "examine",
+        "diagnose",
+        "fix",
         "status",
         "bridge-snapshot",
         "sandbox-run",

@@ -1279,7 +1279,7 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
     let mut out = String::new();
     if report.matched.is_empty() {
         let route = &report.route_when_no_match;
-        out.push_str("rocm examine: no known misconfiguration matched.\n\n");
+        out.push_str("rocm diagnose: no known misconfiguration matched.\n\n");
         out.push_str("This is the explicit 'I don't recognise this failure mode' case. Do not speculate; file the symptom + this examination output upstream:\n");
         let _ = writeln!(out, "  {:>12}: {}", route.target, route.url);
         out.push('\n');
@@ -1315,7 +1315,7 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
                 flags.push("re-login required");
             }
             if fix.auto_applicable {
-                flags.push("rocm examine --fix can run it");
+                flags.push("rocm fix can run it");
             }
             if !flags.is_empty() {
                 let _ = writeln!(out, "   flags: {}", flags.join(", "));
@@ -1330,7 +1330,7 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
         out.push('\n');
     }
     if let Some(high) = report.matched.iter().find(|d| d.score >= HIGH_CONFIDENCE) {
-        let _ = writeln!(out, "Next step: propose `rocm examine --fix {}`.", high.id);
+        let _ = writeln!(out, "Next step: run `rocm fix {}`.", high.id);
     } else {
         out.push_str("Highest-scoring match is below the HIGH_CONFIDENCE threshold. Confirm one more piece of evidence before applying.\n");
     }
