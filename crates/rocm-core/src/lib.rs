@@ -29,6 +29,7 @@ use windows_sys::Win32::System::Threading::{
 pub mod diagnose;
 pub mod examine;
 pub mod fix;
+pub mod openmpi;
 pub mod runtime;
 pub mod uv;
 pub use diagnose::{

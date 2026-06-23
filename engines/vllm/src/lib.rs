@@ -441,10 +441,16 @@ fn vllm_runtime_warnings(runtime: &VllmRuntime) -> Vec<String> {
     } else {
         "rocm-cli records this as an external vLLM runtime; install/upgrade vLLM in that environment manually"
     };
-    vec![
+    let mut warnings = vec![
         runtime_scope.to_owned(),
         "vLLM serving remains ROCm GPU required; no CPU fallback is used".to_owned(),
-    ]
+    ];
+    if !cfg!(windows) && !rocm_core::openmpi::detect_openmpi().present {
+        warnings.push(
+            "OpenMPI runtime (libmpi.so / mpirun) was not found; vLLM requires it. Install it via your system package manager (for example `sudo apt-get install -y libopenmpi3 openmpi-bin`) or rerun `rocm engines install vllm --yes`.".to_owned(),
+        );
+    }
+    warnings
 }
 
 fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelResponse> {
@@ -1222,6 +1228,10 @@ fn therock_library_path_entries(runtime: &VllmRuntime) -> Vec<PathBuf> {
         if wsl_dxcore_lib.is_dir() {
             entries.push(wsl_dxcore_lib);
         }
+        // OpenMPI is installed outside the default loader path on some distros
+        // (notably RHEL-family under /usr/lib64/openmpi/lib); make sure vLLM can
+        // load libmpi.so at launch when it lives there.
+        entries.extend(rocm_core::openmpi::openmpi_library_dirs());
     }
     dedupe_paths(entries)
 }
