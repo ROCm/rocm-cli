@@ -396,3 +396,180 @@ fn badge<'a>(label: &'a str, bg: ratatui::style::Color, preview_theme: &Theme) -
             .add_modifier(Modifier::BOLD),
     )
 }
+
+// ===========================================================================
+// btop-style chrome helpers ported from `examples/gen_mockups.rs` (Phase 1).
+// Pure draw fns, no wiring this phase — the Esc menu / Options overlays compose
+// them in Phase 4. Hit-testing / state are added with the live wiring.
+// ===========================================================================
+
+/// Stamp a string at `(x, y)` if the row is on-screen. Mirror of the
+/// `gen_mockups` low-level `put`.
+fn put(f: &mut Frame, x: u16, y: u16, s: &str, style: Style) {
+    if y < f.area().height {
+        f.buffer_mut().set_string(x, y, s, style);
+    }
+}
+
+/// Dim the entire frame to a cool grey wash so a centered modal reads as the
+/// foreground (port of `gen_mockups.rs` `grey_overlay`). Call before drawing
+/// the modal box on top.
+pub fn grey_overlay(f: &mut Frame) {
+    use ratatui::style::Color;
+    let area = f.area();
+    let wash = Color::Rgb(0x1c, 0x1e, 0x22);
+    let dim = Color::Rgb(0x4c, 0x50, 0x57);
+    let buf = f.buffer_mut();
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            if let Some(c) = buf.cell_mut((x, y)) {
+                c.set_style(Style::default().fg(dim).bg(wash));
+            }
+        }
+    }
+}
+
+/// Big block "ROCm" wordmark with a horizontal accent→cyan gradient sweep.
+///
+/// Port of `gen_mockups.rs` `draw_logo`. `cx` is the left column of the
+/// 31-wide logo; it occupies 5 rows from `y`. The lowercase `m` matches the
+/// final mock. Reuses the crate's [`gradient::lerp3_t`] ramp rather than a
+/// local lerp.
+pub fn draw_logo(f: &mut Frame, cx: u16, y: u16, theme: &Theme) {
+    use ratatui::style::Color;
+    const R: [&str; 5] = ["██████ ", "██   ██", "██████ ", "██   ██", "██   ██"];
+    const O: [&str; 5] = [" █████ ", "██   ██", "██   ██", "██   ██", " █████ "];
+    const C: [&str; 5] = [" ██████", "██     ", "██     ", "██     ", " ██████"];
+    // lowercase "m": blank top row, sits on the baseline like R/O/C bottoms.
+    const M: [&str; 5] = ["       ", "██████ ", "██ █ ██", "██ █ ██", "██ █ ██"];
+    // ponytail: btop gradient is accent_2 → accent → bright cyan; the bright
+    // stop is a fixed light cyan (matches the mock) rather than a theme token.
+    let light = Color::Rgb(0xc4, 0xf2, 0xff);
+    let stops = [theme.accent_2, theme.accent, light];
+    for i in 0..5 {
+        let line = format!("{} {} {} {}", R[i], O[i], C[i], M[i]);
+        let n = line.chars().count().max(2);
+        for (j, ch) in line.chars().enumerate() {
+            if ch != ' ' {
+                let t = j as f64 / (n - 1) as f64;
+                put(
+                    f,
+                    cx + j as u16,
+                    y + i as u16,
+                    &ch.to_string(),
+                    Style::default().fg(crate::ui::gradient::lerp3_t(stops, t)),
+                );
+            }
+        }
+    }
+}
+
+/// One settings row for the Options panel: focusable label on the left, value +
+/// control hint right-aligned (port of `gen_mockups.rs` `opt_row`).
+pub fn opt_row(
+    f: &mut Frame,
+    area: Rect,
+    label: &str,
+    value: &str,
+    control: &str,
+    focused: bool,
+    theme: &Theme,
+) {
+    let (cur, lc) = if focused {
+        ("▸ ", theme.accent)
+    } else {
+        ("  ", theme.fg)
+    };
+    let lstyle = if focused {
+        Style::default().fg(lc).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(lc)
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(cur, Style::default().fg(theme.accent)),
+            Span::styled(label, lstyle),
+        ])),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let val_w = (value.chars().count() + control.chars().count() + 2) as u16;
+    let vx = area.x + area.width.saturating_sub(val_w);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(value, Style::default().fg(theme.accent)),
+            Span::raw("  "),
+            Span::styled(control, Style::default().fg(theme.muted)),
+        ])),
+        Rect::new(vx, area.y, val_w, 1),
+    );
+}
+
+#[cfg(test)]
+mod ported_chrome_tests {
+    use super::{draw_logo, grey_overlay, opt_row};
+    use crate::ui::theme::Theme;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+
+    fn flat(term: &Terminal<TestBackend>) -> String {
+        term.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    #[test]
+    fn draw_logo_paints_block_wordmark() {
+        let theme = Theme::from_name("default-dark");
+        let backend = TestBackend::new(40, 6);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_logo(f, 1, 0, &theme)).unwrap();
+        let out = flat(&term);
+        assert!(out.contains('█'), "logo block glyphs missing: {out:?}");
+    }
+
+    #[test]
+    fn grey_overlay_dims_every_cell() {
+        let theme = Theme::from_name("default-dark");
+        let backend = TestBackend::new(10, 3);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            draw_logo(f, 0, 0, &theme);
+            grey_overlay(f);
+        })
+        .unwrap();
+        // Every cell should carry the wash bg after the overlay.
+        let wash = ratatui::style::Color::Rgb(0x1c, 0x1e, 0x22);
+        let buf = term.backend().buffer();
+        assert!(
+            buf.content().iter().all(|c| c.style().bg == Some(wash)),
+            "overlay did not wash every cell"
+        );
+    }
+
+    #[test]
+    fn opt_row_renders_label_value_control() {
+        let theme = Theme::from_name("default-dark");
+        let backend = TestBackend::new(40, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            opt_row(
+                f,
+                Rect::new(0, 0, 40, 1),
+                "Theme",
+                "tokyo",
+                "▸◂",
+                true,
+                &theme,
+            );
+        })
+        .unwrap();
+        let out = flat(&term);
+        assert!(out.contains("Theme"), "label missing: {out:?}");
+        assert!(out.contains("tokyo"), "value missing: {out:?}");
+        assert!(out.contains('▸'), "focus/control marker missing: {out:?}");
+    }
+}
