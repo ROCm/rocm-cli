@@ -1230,6 +1230,11 @@ const VLLM_PREFERRED_THEROCK_FAMILIES: &[&str] = &["gfx906", "gfx908", "gfx90a"]
 pub fn preferred_serve_engine_for_host_gpu_summary(
     summary: &HostGpuSummary,
 ) -> Option<&'static str> {
+    // The vLLM engine adapter bails out on native Windows builds, so never prefer it
+    // there. WSL builds as a Linux target and therefore remains eligible.
+    if cfg!(windows) {
+        return None;
+    }
     preferred_serve_engine_for_therock_family(
         summary
             .therock_family
@@ -6126,26 +6131,36 @@ mod tests {
     #[test]
     fn preferred_serve_engine_uses_vllm_for_supported_therock_families() {
         assert_eq!(
-            preferred_serve_engine_for_host_gpu_summary(&HostGpuSummary {
-                therock_family: Some("gfx90a".to_owned()),
-                ..HostGpuSummary::default()
-            }),
+            preferred_serve_engine_for_therock_family(Some("gfx90a")),
             Some("vllm")
         );
         assert_eq!(
-            preferred_serve_engine_for_host_gpu_summary(&HostGpuSummary {
-                gfx_target: Some("gfx950".to_owned()),
-                ..HostGpuSummary::default()
-            }),
+            preferred_serve_engine_for_therock_family(Some("gfx950")),
             Some("vllm")
         );
         assert_eq!(
-            preferred_serve_engine_for_host_gpu_summary(&HostGpuSummary {
-                therock_family: Some("gfx999-dcgpu".to_owned()),
-                ..HostGpuSummary::default()
-            }),
+            preferred_serve_engine_for_therock_family(Some("gfx999-dcgpu")),
             Some("vllm")
         );
+        assert_eq!(preferred_serve_engine_for_therock_family(None), None);
+    }
+
+    #[test]
+    fn preferred_serve_engine_host_summary_respects_platform_and_fields() {
+        // `gfx_target` is consulted as a fallback when `therock_family` is absent.
+        let summary = HostGpuSummary {
+            gfx_target: Some("gfx950".to_owned()),
+            ..HostGpuSummary::default()
+        };
+        // The vLLM adapter is unsupported on native Windows, so the preference is
+        // gated off there while remaining active on Linux/WSL builds.
+        let expected = if cfg!(windows) { None } else { Some("vllm") };
+        assert_eq!(
+            preferred_serve_engine_for_host_gpu_summary(&summary),
+            expected
+        );
+
+        // No GPU information never resolves to a vLLM preference on any platform.
         assert_eq!(
             preferred_serve_engine_for_host_gpu_summary(&HostGpuSummary::default()),
             None
