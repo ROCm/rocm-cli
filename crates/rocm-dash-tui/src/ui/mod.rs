@@ -59,10 +59,8 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     tabs::draw_tab_bar(f, outer[1], state.active_tab, &theme);
     match state.active_tab {
         ActiveTab::Home => tabs::home::draw(f, outer[2], state, &theme),
-        ActiveTab::Overview => tabs::overview::draw(f, outer[2], state, &theme),
-        ActiveTab::Hardware => tabs::hardware::draw(f, outer[2], state, &theme),
-        ActiveTab::Instances => tabs::instances::draw(f, outer[2], state, &theme),
-        ActiveTab::Bench => tabs::bench::draw(f, outer[2], state, &theme),
+        ActiveTab::Action => tabs::action::draw(f, outer[2], state, &theme),
+        ActiveTab::Observe => tabs::observe::draw(f, outer[2], state, &theme),
         ActiveTab::Chat => tabs::chat::draw(f, outer[2], state, &theme),
     }
     draw_footer(f, outer[3], state, &theme);
@@ -71,12 +69,13 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     match state.modal {
         Modal::None => {}
         Modal::Help => modal::draw_help(f, outer[2], state.active_tab, &theme),
-        Modal::Detail => match state.active_tab {
-            ActiveTab::Instances => tabs::instances::draw_detail(f, outer[2], state, &theme),
-            ActiveTab::Bench => tabs::bench::draw_detail(f, outer[2], state, &theme),
-            ActiveTab::Hardware => tabs::hardware::draw_detail(f, outer[2], state, &theme),
-            _ => {}
-        },
+        // Observe folds the telemetry tabs; its detail modal is the instance
+        // detail (the selectable list on that surface).
+        Modal::Detail => {
+            if state.active_tab == ActiveTab::Observe {
+                tabs::instances::draw_detail(f, outer[2], state, &theme);
+            }
+        }
         Modal::ThemePicker => modal::draw_theme_picker(
             f,
             outer[2],
@@ -228,20 +227,21 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let mut spans: Vec<Span> = vec![
         chip("Tab"),
         Span::raw(" next  "),
-        chip("1–6"),
+        chip("1–4"),
         Span::raw(" jump  "),
     ];
-    if matches!(
-        state.active_tab,
-        ActiveTab::Hardware | ActiveTab::Instances | ActiveTab::Bench
-    ) {
+    if matches!(state.active_tab, ActiveTab::Observe | ActiveTab::Action) {
         spans.push(chip("j/k"));
         spans.push(Span::raw(" select  "));
         spans.push(chip("Enter"));
-        spans.push(Span::raw(" detail  "));
+        spans.push(Span::raw(if state.active_tab == ActiveTab::Action {
+            " open  "
+        } else {
+            " detail  "
+        }));
     }
-    // Operational-screen entry points (Phase 3 Wave 1).
-    if matches!(state.active_tab, ActiveTab::Overview | ActiveTab::Instances) {
+    // Guided-action entry points — Observe (telemetry) + Action (verb list).
+    if matches!(state.active_tab, ActiveTab::Observe | ActiveTab::Action) {
         spans.push(chip("w"));
         spans.push(Span::raw(" serve  "));
         spans.push(chip("e"));
@@ -255,7 +255,7 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         spans.push(chip("l"));
         spans.push(Span::raw(" logs  "));
     }
-    if state.active_tab == ActiveTab::Instances {
+    if state.active_tab == ActiveTab::Observe {
         spans.push(chip("s"));
         spans.push(Span::raw(" services  "));
     }

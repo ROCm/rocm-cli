@@ -6,11 +6,13 @@
 //! `pub fn draw(f, area, state, theme)` so they can be implemented in parallel
 //! without touching shared files.
 
+pub mod action;
 pub mod bench;
 pub mod chat;
 pub mod hardware;
 pub mod home;
 pub mod instances;
+pub mod observe;
 pub mod overview;
 
 use ratatui::Frame;
@@ -22,13 +24,11 @@ use ratatui::widgets::Paragraph;
 use crate::app::ActiveTab;
 use crate::ui::theme::Theme;
 
-pub const TAB_LABELS: [(ActiveTab, &str, char); 6] = [
+pub const TAB_LABELS: [(ActiveTab, &str, char); 4] = [
     (ActiveTab::Home, "Home", '1'),
-    (ActiveTab::Overview, "Overview", '2'),
-    (ActiveTab::Hardware, "Hardware", '3'),
-    (ActiveTab::Instances, "Instances", '4'),
-    (ActiveTab::Bench, "Bench", '5'),
-    (ActiveTab::Chat, "Chat", '6'),
+    (ActiveTab::Action, "Action", '2'),
+    (ActiveTab::Observe, "Observe", '3'),
+    (ActiveTab::Chat, "Chat", '4'),
 ];
 
 /// A single tab chip's screen extent. `x_start..x_end` are absolute columns
@@ -46,12 +46,12 @@ pub struct TabChip {
 /// `" Label "` chip (`label.len() + 2`), separated between chips by `" · "`
 /// (3 chars). Pure — both `draw_tab_bar` and `hit_test` route through this
 /// so they cannot drift.
-pub fn compute_chip_layout(bar_x: u16) -> [TabChip; 6] {
+pub fn compute_chip_layout(bar_x: u16) -> [TabChip; 4] {
     let mut out = [TabChip {
         tab: ActiveTab::Home,
         x_start: 0,
         x_end: 0,
-    }; 6];
+    }; 4];
     let mut x = bar_x;
     for (i, (tab, label, _key)) in TAB_LABELS.iter().enumerate() {
         if i > 0 {
@@ -229,30 +229,24 @@ mod tests {
         assert_eq!(chips[0].x_start, 0);
         assert_eq!(chips[0].x_end, 9);
         assert_eq!(chips[0].tab, ActiveTab::Home);
-        // separator (3) then " 2 " (3) + " Overview " (10) = 12..25
+        // separator (3) then " 2 " (3) + " Action " (8) = 12..23
         assert_eq!(chips[1].x_start, 12);
-        assert_eq!(chips[1].x_end, 25);
-        // " 3 " + " Hardware " (10) = 28..41
-        assert_eq!(chips[2].x_start, 28);
-        assert_eq!(chips[2].x_end, 41);
-        // " 4 " + " Instances " (11) = 44..58
-        assert_eq!(chips[3].x_start, 44);
-        assert_eq!(chips[3].x_end, 58);
-        // " 5 " + " Bench " (7) = 61..71
-        assert_eq!(chips[4].x_start, 61);
-        assert_eq!(chips[4].x_end, 71);
-        // separator (3) then " 6 " (3) + " Chat " (6) = 74..83
-        assert_eq!(chips[5].x_start, 74);
-        assert_eq!(chips[5].x_end, 83);
-        assert_eq!(chips[5].tab, ActiveTab::Chat);
+        assert_eq!(chips[1].x_end, 23);
+        // " 3 " + " Observe " (9) = 26..38
+        assert_eq!(chips[2].x_start, 26);
+        assert_eq!(chips[2].x_end, 38);
+        // separator (3) then " 4 " (3) + " Chat " (6) = 41..50
+        assert_eq!(chips[3].x_start, 41);
+        assert_eq!(chips[3].x_end, 50);
+        assert_eq!(chips[3].tab, ActiveTab::Chat);
     }
 
     #[test]
     fn chip_layout_honors_bar_x_offset() {
         let chips = compute_chip_layout(100);
         assert_eq!(chips[0].x_start, 100);
-        // Full bar (Home start → Chat end) spans 83 columns.
-        assert_eq!(chips[5].x_end - chips[0].x_start, 83);
+        // Full bar (Home start → Chat end) spans 50 columns.
+        assert_eq!(chips[3].x_end - chips[0].x_start, 50);
     }
 
     #[test]

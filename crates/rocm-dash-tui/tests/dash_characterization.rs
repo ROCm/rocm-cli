@@ -1,19 +1,18 @@
-//! Characterization safety-net for the dash TUI (Supergoal Phase 0).
+//! Characterization safety-net for the dash TUI (Supergoal Phase 0, updated P3).
 //!
-//! Freezes the CURRENT behaviour of `ui::draw` for every existing tab as
-//! TestBackend buffer-text assertions, so the later UX-migration phases (which
-//! restructure the `ActiveTab` enum and its many literal couplings) are
-//! regression-guarded. These tests assert today's reality; later phases update
-//! them in lockstep with the enum edits.
+//! Freezes `ui::draw` behaviour for every tab in the current 4-tab IA
+//! (Home / Action / Observe / Chat) as TestBackend buffer-text assertions, plus
+//! a squeezed-height no-panic sweep. Phase 0 created this against the original
+//! 5-tab model; Phase 3 folded the telemetry tabs into Observe and updated
+//! these assertions in lockstep with the enum collapse.
 //!
 //! Ponytail: reuse the existing `TestBackend` → `Terminal` → `ui::draw` →
-//! flatten-buffer pattern already used across `src/ui/**` unit tests; no new
-//! test framework, no demo NDJSON (which is not committed).
+//! flatten-buffer pattern; no new test framework, no demo NDJSON.
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo, Snapshot, SystemMetrics};
-use rocm_dash_tui::app::{ActiveTab, AppState};
+use rocm_dash_tui::app::{ActiveTab, AppState, ConnState};
 use rocm_dash_tui::ui;
 
 /// A synthetic single-GPU snapshot so each tab body has real content to paint.
@@ -47,10 +46,14 @@ fn synthetic_snapshot() -> Snapshot {
     }
 }
 
-/// Build an `AppState` parked on `tab` with the synthetic snapshot applied.
+/// Build a connected `AppState` parked on `tab` with the synthetic snapshot.
 fn state_on(tab: ActiveTab) -> AppState {
     let mut s = AppState::new("test-connect".into(), "default-dark".into());
     s.active_tab = tab;
+    s.conn = ConnState::Connected {
+        host: "localhost".into(),
+        version: "1.0".into(),
+    };
     s.latest = Some(synthetic_snapshot());
     s
 }
@@ -71,43 +74,41 @@ fn render(state: &mut AppState, cols: u16, rows: u16) -> String {
 /// The tab bar always paints every tab label; assert it is present so the
 /// chrome itself is characterized once.
 fn assert_tab_bar(out: &str) {
-    for label in ["Overview", "Hardware", "Instances", "Bench", "Chat"] {
+    for label in ["Home", "Action", "Observe", "Chat"] {
         assert!(out.contains(label), "tab bar missing {label:?}: {out:?}");
     }
 }
 
 #[test]
-fn overview_tab_renders_key_labels() {
-    let out = render(&mut state_on(ActiveTab::Overview), 160, 44);
-    assert_tab_bar(&out);
-    assert!(out.contains("Host"), "overview missing Host block: {out:?}");
-}
-
-#[test]
-fn hardware_tab_renders_key_labels() {
-    let out = render(&mut state_on(ActiveTab::Hardware), 160, 44);
+fn home_tab_renders_key_labels() {
+    let out = render(&mut state_on(ActiveTab::Home), 160, 44);
     assert_tab_bar(&out);
     assert!(
-        out.contains("GPU0") && out.contains("util"),
-        "hardware missing GPU detail: {out:?}"
+        out.contains("GPU UTILIZATION"),
+        "home hero missing: {out:?}"
     );
 }
 
 #[test]
-fn instances_tab_renders_key_labels() {
-    let out = render(&mut state_on(ActiveTab::Instances), 160, 44);
+fn action_tab_renders_key_labels() {
+    let out = render(&mut state_on(ActiveTab::Action), 160, 44);
     assert_tab_bar(&out);
     assert!(
-        out.contains("Instances"),
-        "instances missing Instances block: {out:?}"
+        out.contains("Serve a model"),
+        "action verbs missing: {out:?}"
     );
 }
 
 #[test]
-fn bench_tab_renders_key_labels() {
-    let out = render(&mut state_on(ActiveTab::Bench), 160, 44);
+fn observe_tab_renders_key_labels() {
+    let out = render(&mut state_on(ActiveTab::Observe), 160, 44);
     assert_tab_bar(&out);
-    assert!(out.contains("Bench"), "bench missing Bench block: {out:?}");
+    // Observe folds the former Overview/Hardware (host telemetry), Instances and
+    // Bench surfaces into one tab.
+    assert!(
+        out.contains("CPU") && out.contains("Instances") && out.contains("Bench"),
+        "observe folded surfaces missing: {out:?}"
+    );
 }
 
 #[test]
@@ -122,10 +123,9 @@ fn every_tab_survives_squeezed_height() {
     // The body rect can collapse to 0–1 inner rows on a short terminal; assert
     // no tab panics when squeezed (the historical ActiveTab footgun).
     for tab in [
-        ActiveTab::Overview,
-        ActiveTab::Hardware,
-        ActiveTab::Instances,
-        ActiveTab::Bench,
+        ActiveTab::Home,
+        ActiveTab::Action,
+        ActiveTab::Observe,
         ActiveTab::Chat,
     ] {
         let mut s = state_on(tab);

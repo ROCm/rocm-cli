@@ -119,14 +119,13 @@ pub enum ConnState {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ActiveTab {
-    // P2: Home is added as the first tab (matching the target IA) but is NOT
-    // the default yet — Overview stays the default until P3 (additive-then-switch).
-    Home,
+    // P3: final 4-tab IA. Home is the default; Observe folds the former
+    // Overview/Hardware/Instances/Bench telemetry tabs; Action surfaces the
+    // guided mutating verbs through the existing execution seam.
     #[default]
-    Overview,
-    Hardware,
-    Instances,
-    Bench,
+    Home,
+    Action,
+    Observe,
     Chat,
 }
 
@@ -134,11 +133,9 @@ impl ActiveTab {
     #[must_use]
     pub const fn next(self) -> Self {
         match self {
-            Self::Home => Self::Overview,
-            Self::Overview => Self::Hardware,
-            Self::Hardware => Self::Instances,
-            Self::Instances => Self::Bench,
-            Self::Bench => Self::Chat,
+            Self::Home => Self::Action,
+            Self::Action => Self::Observe,
+            Self::Observe => Self::Chat,
             Self::Chat => Self::Home,
         }
     }
@@ -146,21 +143,17 @@ impl ActiveTab {
     pub const fn prev(self) -> Self {
         match self {
             Self::Home => Self::Chat,
-            Self::Overview => Self::Home,
-            Self::Hardware => Self::Overview,
-            Self::Instances => Self::Hardware,
-            Self::Bench => Self::Instances,
-            Self::Chat => Self::Bench,
+            Self::Action => Self::Home,
+            Self::Observe => Self::Action,
+            Self::Chat => Self::Observe,
         }
     }
     pub const fn from_digit(d: char) -> Option<Self> {
         match d {
             '1' => Some(Self::Home),
-            '2' => Some(Self::Overview),
-            '3' => Some(Self::Hardware),
-            '4' => Some(Self::Instances),
-            '5' => Some(Self::Bench),
-            '6' => Some(Self::Chat),
+            '2' => Some(Self::Action),
+            '3' => Some(Self::Observe),
+            '4' => Some(Self::Chat),
             _ => None,
         }
     }
@@ -399,6 +392,8 @@ pub struct AppState {
     pub instances: HashMap<String, Instance>,
     pub active_tab: ActiveTab,
     pub modal: Modal,
+    /// Cursor into the Action tab's guided-verb list.
+    pub action_sel: usize,
     /// Cursor into the sorted Instances grid.
     pub instance_sel: usize,
     /// Cursor into the bench_rows VecDeque (0 = oldest, len-1 = newest).
@@ -542,6 +537,7 @@ impl AppState {
             instances: HashMap::new(),
             active_tab: ActiveTab::default(),
             modal: Modal::None,
+            action_sel: 0,
             instance_sel: 0,
             bench_sel: 0,
             gpu_sel: 0,
@@ -904,9 +900,10 @@ impl AppState {
     /// active tab has no selection model.
     pub fn selection_len(&self) -> usize {
         match self.active_tab {
-            ActiveTab::Instances => self.instances.len(),
-            ActiveTab::Bench => self.bench_rows.len(),
-            ActiveTab::Hardware => self.latest.as_ref().map_or(0, |s| s.gpus.len()),
+            // Observe folds the telemetry tabs; its selectable list is the
+            // instances table (the one actionable list in the cluster).
+            ActiveTab::Observe => self.instances.len(),
+            ActiveTab::Action => crate::ui::tabs::action::VERB_COUNT,
             _ => 0,
         }
     }
@@ -922,7 +919,7 @@ impl AppState {
         self.set_selection(self.active_tab, next);
     }
 
-    pub fn select_first(&mut self) {
+    pub const fn select_first(&mut self) {
         self.set_selection(self.active_tab, 0);
     }
 
@@ -935,21 +932,16 @@ impl AppState {
 
     const fn selection_for(&self, tab: ActiveTab) -> usize {
         match tab {
-            ActiveTab::Instances => self.instance_sel,
-            ActiveTab::Bench => self.bench_sel,
-            ActiveTab::Hardware => self.gpu_sel,
+            ActiveTab::Observe => self.instance_sel,
+            ActiveTab::Action => self.action_sel,
             _ => 0,
         }
     }
 
-    fn set_selection(&mut self, tab: ActiveTab, idx: usize) {
+    const fn set_selection(&mut self, tab: ActiveTab, idx: usize) {
         match tab {
-            ActiveTab::Instances => self.instance_sel = idx,
-            ActiveTab::Bench => self.bench_sel = idx,
-            ActiveTab::Hardware => {
-                self.gpu_sel = idx;
-                self.sync_gpu_scroll();
-            }
+            ActiveTab::Observe => self.instance_sel = idx,
+            ActiveTab::Action => self.action_sel = idx,
             _ => {}
         }
     }
@@ -957,14 +949,6 @@ impl AppState {
     /// Advance `gpu_scroll` so the selected GPU stays within the visible window.
     /// Derives the visible row count from the last rendered body area; with no
     /// prior draw it is a no-op (the renderer self-corrects on the next frame).
-    fn sync_gpu_scroll(&mut self) {
-        let n = self.latest.as_ref().map_or(0, |s| s.gpus.len());
-        let body_h = self.last_body_area.map_or(0, |r| r.height);
-        let visible = crate::ui::tabs::hardware::gpu_visible_count(body_h, n);
-        self.gpu_scroll =
-            crate::ui::tabs::hardware::scroll_to_show(self.gpu_sel, self.gpu_scroll, visible);
-    }
-
     /// Clamp both selectors after a state update that may have shrunk the
     /// underlying collection. Call after push_snapshot / instance changes.
     fn clamp_selectors(&mut self) {
@@ -1706,11 +1690,14 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
             }
         }
         KeyAction::OpenDetail => {
+            if state.active_tab == ActiveTab::Action {
+                // Action rows open the matching manager via the existing seam;
+                // there is no detail modal on the Action tab.
+                let verb = crate::ui::tabs::action::verb_action(state.action_sel);
+                return apply_action(state, verb);
+            }
             if state.selection_len() > 0 {
                 state.modal = Modal::Detail;
-                if state.active_tab == ActiveTab::Bench {
-                    state.reset_bench_detail_scroll();
-                }
             }
         }
         KeyAction::ToggleHelp => {
@@ -1778,17 +1765,10 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
         }
         KeyAction::OpenThemePicker => state.open_theme_picker(),
         KeyAction::ApplyThemePick => state.apply_theme_pick(),
-        KeyAction::ScrollModal(d) => {
-            if state.active_tab == ActiveTab::Bench && state.modal == Modal::Detail {
-                if d == i16::MIN {
-                    state.bench_detail_scroll = 0;
-                } else if d == i16::MAX {
-                    state.bench_detail_scroll = u16::MAX;
-                } else {
-                    state.scroll_bench_detail(d);
-                }
-            }
-        }
+        // ponytail: P3 folds Bench into Observe; the per-tab Bench detail modal
+        // (the only scrollable detail) is no longer reachable, so modal scroll
+        // is a no-op until/unless a scrollable Observe detail is wired.
+        KeyAction::ScrollModal(_) => {}
         KeyAction::ReplayTogglePause => {
             if let Some(r) = state.replay.as_mut() {
                 r.paused = !r.paused;
@@ -1850,11 +1830,11 @@ fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
         if state.modal == Modal::None
             && let Some(area) = state.last_body_area
         {
+            // ponytail: Observe folds the instances table into a stacked region;
+            // body-click hit-testing best-efforts the instances rows. Keyboard
+            // selection is the primary path.
             let action = match state.active_tab {
-                ActiveTab::Instances => {
-                    ui::tabs::instances::hit_test(area, me.column, me.row, state)
-                }
-                ActiveTab::Bench => ui::tabs::bench::hit_test(area, me.column, me.row, state),
+                ActiveTab::Observe => ui::tabs::instances::hit_test(area, me.column, me.row, state),
                 _ => None,
             };
             if let Some(a) = action {
@@ -1866,7 +1846,7 @@ fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
     handle_mouse(me, &state.modal, state.active_tab)
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyAction {
     Nothing,
     Quit,
@@ -2059,7 +2039,7 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
                 KeyAction::SwitchTab(current.next())
             }
         }
-        KeyCode::Char(c @ '1'..='6') => match ActiveTab::from_digit(c) {
+        KeyCode::Char(c @ '1'..='4') => match ActiveTab::from_digit(c) {
             Some(t) => KeyAction::SwitchTab(t),
             None => KeyAction::Nothing,
         },
@@ -2076,50 +2056,53 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         KeyCode::Char('k') | KeyCode::Up => KeyAction::Move(-1),
         KeyCode::Char('g') | KeyCode::Home => KeyAction::SelectFirst,
         KeyCode::Char('G') | KeyCode::End => KeyAction::SelectLast,
-        // Services manager: open from the Instances tab (where servers live).
-        KeyCode::Char('s') if current == ActiveTab::Instances => KeyAction::OpenServices,
-        // Serve wizard: launch a model from the Overview or Instances tab.
-        KeyCode::Char('w') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
+        // The guided-action letter hotkeys live on Observe (the telemetry
+        // surface) and Action (the verb list). Both route through the existing
+        // execution seam — no second approval path.
+        // Services manager: open where servers live.
+        KeyCode::Char('s') if current == ActiveTab::Observe => KeyAction::OpenServices,
+        // Serve wizard: launch a model.
+        KeyCode::Char('w') if matches!(current, ActiveTab::Observe | ActiveTab::Action) => {
             KeyAction::OpenServeWizard
         }
         // Engine manager: use/install/reinstall serving engines.
-        KeyCode::Char('e') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
+        KeyCode::Char('e') if matches!(current, ActiveTab::Observe | ActiveTab::Action) => {
             KeyAction::OpenEngineManager
         }
         // Doctor: read-only environment check.
-        KeyCode::Char('d') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
+        KeyCode::Char('d') if matches!(current, ActiveTab::Observe | ActiveTab::Action) => {
             KeyAction::OpenExamine
         }
         // Update: check/preview/apply ROCm package updates.
-        KeyCode::Char('u') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
+        KeyCode::Char('u') if matches!(current, ActiveTab::Observe | ActiveTab::Action) => {
             KeyAction::OpenUpdate
         }
         // Install: ROCm SDK (TheRock) install / dry-run.
-        KeyCode::Char('i') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
+        KeyCode::Char('i') if matches!(current, ActiveTab::Observe | ActiveTab::Action) => {
             KeyAction::OpenInstall
         }
         // Logs: browse recent ROCm CLI logs.
-        KeyCode::Char('l') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
+        KeyCode::Char('l') if matches!(current, ActiveTab::Observe | ActiveTab::Action) => {
             KeyAction::OpenLogs
         }
         // Runtimes: list/activate/adopt/import ROCm runtimes.
-        KeyCode::Char('r') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
+        KeyCode::Char('r') if matches!(current, ActiveTab::Observe | ActiveTab::Action) => {
             KeyAction::OpenRuntimes
         }
         // Onboarding: first-run setup wizard (install / adopt).
-        KeyCode::Char('n') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
+        KeyCode::Char('n') if matches!(current, ActiveTab::Observe | ActiveTab::Action) => {
             KeyAction::OpenOnboarding
         }
         // Automations: list/enable/disable background checks.
-        KeyCode::Char('a') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
+        KeyCode::Char('a') if matches!(current, ActiveTab::Observe | ActiveTab::Action) => {
             KeyAction::OpenAutomations
         }
         // Command runner: run any ROCm CLI subcommand (gated).
-        KeyCode::Char('c') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
+        KeyCode::Char('c') if matches!(current, ActiveTab::Observe | ActiveTab::Action) => {
             KeyAction::OpenCommand
         }
         // Config & providers.
-        KeyCode::Char('p') if matches!(current, ActiveTab::Overview | ActiveTab::Instances) => {
+        KeyCode::Char('p') if matches!(current, ActiveTab::Observe | ActiveTab::Action) => {
             KeyAction::OpenConfig
         }
         KeyCode::Enter => KeyAction::OpenDetail,
@@ -2147,7 +2130,7 @@ pub fn handle_mouse(ev: MouseEvent, modal: &Modal, tab: ActiveTab) -> KeyAction 
     if *modal == Modal::Detail {
         KeyAction::ScrollModal(delta)
     } else if *modal == Modal::ThemePicker
-        || (*modal == Modal::None && matches!(tab, ActiveTab::Instances | ActiveTab::Bench))
+        || (*modal == Modal::None && matches!(tab, ActiveTab::Observe | ActiveTab::Action))
     {
         KeyAction::Move(delta as isize)
     } else {
@@ -2194,26 +2177,22 @@ mod tests {
 
     #[test]
     fn q_quits_esc_does_not() {
-        assert_eq!(hk(KeyCode::Char('q'), ActiveTab::Overview), KeyAction::Quit);
-        assert_eq!(hk(KeyCode::Esc, ActiveTab::Bench), KeyAction::Nothing);
+        assert_eq!(hk(KeyCode::Char('q'), ActiveTab::Home), KeyAction::Quit);
+        assert_eq!(hk(KeyCode::Esc, ActiveTab::Observe), KeyAction::Nothing);
     }
 
     #[test]
     fn tab_cycles_forward_and_wraps() {
-        // P2: Home is the new first tab; Home → Overview → … → Chat → Home.
+        // P3 4-tab IA: Home → Action → Observe → Chat → Home.
         assert_eq!(
             hk(KeyCode::Tab, ActiveTab::Home),
-            KeyAction::SwitchTab(ActiveTab::Overview)
+            KeyAction::SwitchTab(ActiveTab::Action)
         );
         assert_eq!(
-            hk(KeyCode::Tab, ActiveTab::Overview),
-            KeyAction::SwitchTab(ActiveTab::Hardware)
-        );
-        // Bench precedes Chat; Chat now wraps back to Home.
-        assert_eq!(
-            hk(KeyCode::Tab, ActiveTab::Bench),
+            hk(KeyCode::Tab, ActiveTab::Observe),
             KeyAction::SwitchTab(ActiveTab::Chat)
         );
+        // Chat wraps back to Home.
         assert_eq!(
             hk(KeyCode::Tab, ActiveTab::Chat),
             KeyAction::SwitchTab(ActiveTab::Home)
@@ -2223,55 +2202,51 @@ mod tests {
     #[test]
     fn back_tab_and_shift_tab_both_cycle_backward() {
         assert_eq!(
-            hk(KeyCode::BackTab, ActiveTab::Hardware),
-            KeyAction::SwitchTab(ActiveTab::Overview)
+            hk(KeyCode::BackTab, ActiveTab::Observe),
+            KeyAction::SwitchTab(ActiveTab::Action)
         );
-        // Overview's previous tab is now Home (the new first tab).
+        // Home's previous tab is Chat (the last tab).
         assert_eq!(
-            hk(KeyCode::BackTab, ActiveTab::Overview),
-            KeyAction::SwitchTab(ActiveTab::Home)
+            hk(KeyCode::BackTab, ActiveTab::Home),
+            KeyAction::SwitchTab(ActiveTab::Chat)
         );
         let shift_tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT);
-        // Home's previous tab is Chat (the last tab).
         assert_eq!(
             handle_key(
                 shift_tab,
-                ActiveTab::Home,
+                ActiveTab::Action,
                 &Modal::None,
                 ChatKeyCtx::default()
             ),
-            KeyAction::SwitchTab(ActiveTab::Chat)
+            KeyAction::SwitchTab(ActiveTab::Home)
         );
     }
 
     #[test]
     fn number_keys_jump_to_tab() {
-        // `1` now reaches Home; the rest shift up by one.
+        // P3: '1'→Home, '2'→Action, '3'→Observe, '4'→Chat.
         assert_eq!(
-            hk(KeyCode::Char('1'), ActiveTab::Overview),
+            hk(KeyCode::Char('1'), ActiveTab::Home),
             KeyAction::SwitchTab(ActiveTab::Home)
         );
         assert_eq!(
-            hk(KeyCode::Char('3'), ActiveTab::Overview),
-            KeyAction::SwitchTab(ActiveTab::Hardware)
+            hk(KeyCode::Char('3'), ActiveTab::Home),
+            KeyAction::SwitchTab(ActiveTab::Observe)
         );
-        // `6` now reaches the Chat tab (digit guard widened to '1'..='6').
+        // `4` reaches the Chat tab (digit guard narrowed to '1'..='4').
         assert_eq!(
-            hk(KeyCode::Char('6'), ActiveTab::Overview),
+            hk(KeyCode::Char('4'), ActiveTab::Home),
             KeyAction::SwitchTab(ActiveTab::Chat)
         );
-        assert_eq!(
-            hk(KeyCode::Char('7'), ActiveTab::Overview),
-            KeyAction::Nothing
-        );
+        assert_eq!(hk(KeyCode::Char('5'), ActiveTab::Home), KeyAction::Nothing);
     }
 
     #[test]
     fn from_digit_maps_five_to_chat() {
-        // P2: digit map shifted by Home at '1'; Chat is now '6'.
+        // P3: 4-tab digit map; Chat is now '4', '5' is out of range.
         assert_eq!(ActiveTab::from_digit('1'), Some(ActiveTab::Home));
-        assert_eq!(ActiveTab::from_digit('6'), Some(ActiveTab::Chat));
-        assert_eq!(ActiveTab::from_digit('7'), None);
+        assert_eq!(ActiveTab::from_digit('4'), Some(ActiveTab::Chat));
+        assert_eq!(ActiveTab::from_digit('5'), None);
     }
 
     #[test]
@@ -2284,7 +2259,7 @@ mod tests {
         assert_eq!(
             handle_key(
                 release,
-                ActiveTab::Overview,
+                ActiveTab::Home,
                 &Modal::None,
                 ChatKeyCtx::default()
             ),
@@ -2295,72 +2270,67 @@ mod tests {
     #[test]
     fn jk_arrows_and_g_drive_selection() {
         assert_eq!(
-            hk(KeyCode::Char('j'), ActiveTab::Instances),
+            hk(KeyCode::Char('j'), ActiveTab::Observe),
             KeyAction::Move(1)
         );
         assert_eq!(
-            hk(KeyCode::Char('k'), ActiveTab::Instances),
+            hk(KeyCode::Char('k'), ActiveTab::Observe),
             KeyAction::Move(-1)
         );
-        assert_eq!(hk(KeyCode::Down, ActiveTab::Bench), KeyAction::Move(1));
-        assert_eq!(hk(KeyCode::Up, ActiveTab::Bench), KeyAction::Move(-1));
+        assert_eq!(hk(KeyCode::Down, ActiveTab::Action), KeyAction::Move(1));
+        assert_eq!(hk(KeyCode::Up, ActiveTab::Action), KeyAction::Move(-1));
         assert_eq!(
-            hk(KeyCode::Char('g'), ActiveTab::Bench),
+            hk(KeyCode::Char('g'), ActiveTab::Observe),
             KeyAction::SelectFirst
         );
         assert_eq!(
-            hk(KeyCode::Char('G'), ActiveTab::Bench),
+            hk(KeyCode::Char('G'), ActiveTab::Observe),
             KeyAction::SelectLast
         );
-        assert_eq!(hk(KeyCode::Enter, ActiveTab::Bench), KeyAction::OpenDetail);
+        assert_eq!(
+            hk(KeyCode::Enter, ActiveTab::Observe),
+            KeyAction::OpenDetail
+        );
     }
 
     #[test]
     fn operational_open_keys_are_tab_scoped() {
-        // `s` opens services only on Instances; Nothing elsewhere.
+        // `s` opens services only on Observe; Nothing elsewhere.
         assert_eq!(
-            hk(KeyCode::Char('s'), ActiveTab::Instances),
+            hk(KeyCode::Char('s'), ActiveTab::Observe),
             KeyAction::OpenServices
         );
+        assert_eq!(hk(KeyCode::Char('s'), ActiveTab::Home), KeyAction::Nothing);
+        // `w` / `e` open from Observe + Action; Nothing on other tabs.
         assert_eq!(
-            hk(KeyCode::Char('s'), ActiveTab::Overview),
-            KeyAction::Nothing
-        );
-        // `w` / `e` open from Overview + Instances; Nothing on other tabs.
-        assert_eq!(
-            hk(KeyCode::Char('w'), ActiveTab::Overview),
+            hk(KeyCode::Char('w'), ActiveTab::Observe),
             KeyAction::OpenServeWizard
         );
         assert_eq!(
-            hk(KeyCode::Char('e'), ActiveTab::Instances),
+            hk(KeyCode::Char('e'), ActiveTab::Action),
             KeyAction::OpenEngineManager
         );
+        assert_eq!(hk(KeyCode::Char('w'), ActiveTab::Home), KeyAction::Nothing);
+        // Doctor / update open from Observe + Action.
         assert_eq!(
-            hk(KeyCode::Char('w'), ActiveTab::Hardware),
-            KeyAction::Nothing
-        );
-        assert_eq!(hk(KeyCode::Char('e'), ActiveTab::Bench), KeyAction::Nothing);
-        // Doctor / update open from Overview + Instances.
-        assert_eq!(
-            hk(KeyCode::Char('d'), ActiveTab::Overview),
+            hk(KeyCode::Char('d'), ActiveTab::Observe),
             KeyAction::OpenExamine
         );
         assert_eq!(
-            hk(KeyCode::Char('u'), ActiveTab::Instances),
+            hk(KeyCode::Char('u'), ActiveTab::Action),
             KeyAction::OpenUpdate
         );
-        assert_eq!(hk(KeyCode::Char('d'), ActiveTab::Bench), KeyAction::Nothing);
-        // Install / logs open from Overview + Instances.
+        // Install / logs open from Observe + Action.
         assert_eq!(
-            hk(KeyCode::Char('i'), ActiveTab::Overview),
+            hk(KeyCode::Char('i'), ActiveTab::Observe),
             KeyAction::OpenInstall
         );
         assert_eq!(
-            hk(KeyCode::Char('l'), ActiveTab::Instances),
+            hk(KeyCode::Char('l'), ActiveTab::Action),
             KeyAction::OpenLogs
         );
         // On the Chat tab none of these open an overlay (the operational keys
-        // are guarded to Overview/Instances). `i` is the one that means
+        // are guarded to Observe/Action). `i` is the one that means
         // something else on Chat — insert mode — never OpenInstall.
         for c in ['w', 'e', 'd', 'u', 'l'] {
             assert_eq!(
@@ -2410,7 +2380,7 @@ mod tests {
     #[test]
     fn question_mark_toggles_help() {
         assert_eq!(
-            hk(KeyCode::Char('?'), ActiveTab::Overview),
+            hk(KeyCode::Char('?'), ActiveTab::Home),
             KeyAction::ToggleHelp
         );
     }
@@ -2418,7 +2388,7 @@ mod tests {
     #[test]
     fn t_opens_theme_picker() {
         assert_eq!(
-            hk(KeyCode::Char('t'), ActiveTab::Overview),
+            hk(KeyCode::Char('t'), ActiveTab::Home),
             KeyAction::OpenThemePicker
         );
     }
@@ -2428,7 +2398,7 @@ mod tests {
         let with_picker = |c| {
             handle_key(
                 press(c),
-                ActiveTab::Overview,
+                ActiveTab::Home,
                 &Modal::ThemePicker,
                 ChatKeyCtx::default(),
             )
@@ -2479,31 +2449,26 @@ mod tests {
 
     #[test]
     fn tab_bar_hit_matches_per_chip_extents() {
-        // P2 6-tab layout: Home 0..9, Overview 12..25, Hardware 28..41,
-        // Instances 44..58, Bench 61..71, Chat 74..83. Bar width 80 fits all
-        // but Chat (ends at 83 > 80).
+        // P3 4-tab layout: Home 0..9, Action 12..23, Observe 26..38, Chat 41..50.
         let bar = Rect::new(0, 0, 80, 1);
         assert_eq!(tab_bar_hit(bar, 5, 0), Some(ActiveTab::Home));
-        assert_eq!(tab_bar_hit(bar, 20, 0), Some(ActiveTab::Overview));
-        assert_eq!(tab_bar_hit(bar, 35, 0), Some(ActiveTab::Hardware));
-        assert_eq!(tab_bar_hit(bar, 50, 0), Some(ActiveTab::Instances));
-        assert_eq!(tab_bar_hit(bar, 65, 0), Some(ActiveTab::Bench));
-        // Separator " · " between Home (ends 9) and Overview (starts 12).
+        assert_eq!(tab_bar_hit(bar, 17, 0), Some(ActiveTab::Action));
+        assert_eq!(tab_bar_hit(bar, 30, 0), Some(ActiveTab::Observe));
+        assert_eq!(tab_bar_hit(bar, 45, 0), Some(ActiveTab::Chat));
+        // Separator " · " between Home (ends 9) and Action (starts 12).
         assert_eq!(tab_bar_hit(bar, 10, 0), None);
-        // Chat overflows the 80-wide bar → its column resolves to nothing.
-        assert_eq!(tab_bar_hit(bar, 78, 0), None);
         // Wrong row.
         assert_eq!(tab_bar_hit(bar, 5, 2), None);
     }
 
     #[test]
     fn tab_bar_hit_skips_chips_that_overflow_a_narrow_bar() {
-        // Bar can only fit the first two chips (Overview ends at 25).
-        let bar = Rect::new(0, 0, 27, 1);
+        // Bar can only fit the first two chips (Action ends at 23).
+        let bar = Rect::new(0, 0, 25, 1);
         assert_eq!(tab_bar_hit(bar, 5, 0), Some(ActiveTab::Home));
-        assert_eq!(tab_bar_hit(bar, 20, 0), Some(ActiveTab::Overview));
-        // Hardware chip would be at 28..41 — outside bar → None.
-        assert_eq!(tab_bar_hit(bar, 35, 0), None);
+        assert_eq!(tab_bar_hit(bar, 17, 0), Some(ActiveTab::Action));
+        // Observe chip would be at 26..38 — outside bar → None.
+        assert_eq!(tab_bar_hit(bar, 30, 0), None);
     }
 
     #[test]
@@ -2525,22 +2490,22 @@ mod tests {
         };
         // No modal, non-interactive tab → Nothing
         assert_eq!(
-            handle_mouse(scroll_down, &Modal::None, ActiveTab::Overview),
+            handle_mouse(scroll_down, &Modal::None, ActiveTab::Home),
             KeyAction::Nothing
         );
-        // No modal, Instances → Move
+        // No modal, Observe → Move (drives the instances selection)
         assert_eq!(
-            handle_mouse(scroll_down, &Modal::None, ActiveTab::Instances),
+            handle_mouse(scroll_down, &Modal::None, ActiveTab::Observe),
             KeyAction::Move(3)
         );
         // Detail modal → ScrollModal
         assert_eq!(
-            handle_mouse(scroll_down, &Modal::Detail, ActiveTab::Bench),
+            handle_mouse(scroll_down, &Modal::Detail, ActiveTab::Observe),
             KeyAction::ScrollModal(3)
         );
         // ThemePicker → Move (drives picker cursor)
         assert_eq!(
-            handle_mouse(scroll_down, &Modal::ThemePicker, ActiveTab::Overview),
+            handle_mouse(scroll_down, &Modal::ThemePicker, ActiveTab::Home),
             KeyAction::Move(3)
         );
     }
@@ -2560,7 +2525,7 @@ mod tests {
         let with_detail = |c| {
             handle_key(
                 press(c),
-                ActiveTab::Bench,
+                ActiveTab::Observe,
                 &Modal::Detail,
                 ChatKeyCtx::default(),
             )
@@ -2591,7 +2556,7 @@ mod tests {
         let with_help = |c| {
             handle_key(
                 press(c),
-                ActiveTab::Bench,
+                ActiveTab::Observe,
                 &Modal::Help,
                 ChatKeyCtx::default(),
             )
@@ -2606,23 +2571,27 @@ mod tests {
 
     #[test]
     fn move_selection_clamps_to_bounds() {
+        // P3: Observe's selectable list is the instances table.
         let mut s = AppState::new("test".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Bench;
+        s.active_tab = ActiveTab::Observe;
         for i in 0..5 {
-            s.bench_rows.push_back(BenchmarkRow {
-                cell: format!("c{i}"),
-                ..Default::default()
-            });
+            s.instances.insert(
+                format!("id{i}"),
+                rocm_dash_core::metrics::Instance {
+                    container_id: format!("id{i}"),
+                    ..Default::default()
+                },
+            );
         }
-        s.bench_sel = 0;
+        s.instance_sel = 0;
         s.move_selection(-3);
-        assert_eq!(s.bench_sel, 0);
+        assert_eq!(s.instance_sel, 0);
         s.move_selection(10);
-        assert_eq!(s.bench_sel, 4);
+        assert_eq!(s.instance_sel, 4);
         s.select_first();
-        assert_eq!(s.bench_sel, 0);
+        assert_eq!(s.instance_sel, 0);
         s.select_last();
-        assert_eq!(s.bench_sel, 4);
+        assert_eq!(s.instance_sel, 4);
     }
 
     #[test]
@@ -2638,19 +2607,19 @@ mod tests {
     #[test]
     fn bracket_keys_emit_replay_jump() {
         assert_eq!(
-            hk(KeyCode::Char('['), ActiveTab::Overview),
+            hk(KeyCode::Char('['), ActiveTab::Home),
             KeyAction::ReplayJump(-10)
         );
         assert_eq!(
-            hk(KeyCode::Char(']'), ActiveTab::Overview),
+            hk(KeyCode::Char(']'), ActiveTab::Home),
             KeyAction::ReplayJump(10)
         );
         assert_eq!(
-            hk(KeyCode::Char('{'), ActiveTab::Overview),
+            hk(KeyCode::Char('{'), ActiveTab::Home),
             KeyAction::ReplayJump(-60)
         );
         assert_eq!(
-            hk(KeyCode::Char('}'), ActiveTab::Overview),
+            hk(KeyCode::Char('}'), ActiveTab::Home),
             KeyAction::ReplayJump(60)
         );
     }
@@ -2672,7 +2641,7 @@ mod tests {
     #[test]
     fn selectors_reclamp_after_pop() {
         let mut s = AppState::new("test".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Bench;
+        s.active_tab = ActiveTab::Observe;
         for i in 0..3 {
             s.bench_rows.push_back(BenchmarkRow {
                 cell: format!("c{i}"),
@@ -2733,7 +2702,7 @@ mod tests {
         assert_eq!(gate(KeyCode::Char('q')), KeyAction::Quit);
         assert_eq!(
             gate(KeyCode::Char('2')),
-            KeyAction::SwitchTab(ActiveTab::Overview)
+            KeyAction::SwitchTab(ActiveTab::Action)
         );
     }
 
@@ -3017,16 +2986,16 @@ mod tests {
     #[test]
     fn slash_home_switches_to_overview() {
         let mut s = st();
-        s.active_tab = ActiveTab::Bench;
+        s.active_tab = ActiveTab::Observe;
         assert_eq!(s.handle_slash_command("/home"), SlashOutcome::Handled);
-        assert_eq!(s.active_tab, ActiveTab::Overview);
+        assert_eq!(s.active_tab, ActiveTab::Home);
     }
 
     #[test]
     fn slash_gpu_switches_to_hardware() {
         let mut s = st();
         assert_eq!(s.handle_slash_command("/gpu"), SlashOutcome::Handled);
-        assert_eq!(s.active_tab, ActiveTab::Hardware);
+        assert_eq!(s.active_tab, ActiveTab::Observe);
     }
 
     #[test]
@@ -3276,7 +3245,7 @@ mod tests {
     fn slash_chat_bare_focuses_chat_tab() {
         // Bare /chat focuses the Chat tab, raises no dispatch edge.
         let mut s = st();
-        s.active_tab = ActiveTab::Overview;
+        s.active_tab = ActiveTab::Home;
         assert_eq!(s.handle_slash_command("/chat"), SlashOutcome::Handled);
         assert_eq!(s.active_tab, ActiveTab::Chat);
         assert!(s.chat_focused);
@@ -4111,7 +4080,7 @@ mod tests {
             crossterm::event::KeyCode::Char('n'),
         ] {
             let mut s = st();
-            s.active_tab = ActiveTab::Hardware;
+            s.active_tab = ActiveTab::Observe;
             s.open_approval(crate::tool_exec::ApprovalIntent {
                 title: "T".to_string(),
                 body: vec!["cmd".to_string()],
@@ -4138,7 +4107,7 @@ mod tests {
                 "escape must clear the modal (no focus trap) for {key:?}"
             );
             // The covered tab is preserved — the modal never navigated away.
-            assert_eq!(s.active_tab, ActiveTab::Hardware);
+            assert_eq!(s.active_tab, ActiveTab::Observe);
         }
     }
 

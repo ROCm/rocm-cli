@@ -854,7 +854,7 @@ mod tests {
 
     fn state_with_snapshot(snap: Snapshot) -> AppState {
         let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Hardware;
+        s.active_tab = ActiveTab::Observe;
         s.latest = Some(snap);
         s
     }
@@ -947,24 +947,11 @@ mod tests {
         assert_eq!(scroll_to_show(9, 4, 0), 0);
     }
 
-    #[test]
-    fn appstate_navigation_advances_gpu_scroll() {
-        // 8 GPUs, a body height that forces a small compact window.
-        let mut s = state_with_snapshot(snap_with_gpus(8));
-        // body height 20 → GPU section 4 → header 1 → compact window < n.
-        s.last_body_area = Some(ratatui::layout::Rect::new(0, 0, 80, 20));
-        let visible = gpu_visible_count(20, 8);
-        assert!(visible > 0 && visible < 8, "unexpected visible: {visible}");
-        assert_eq!(s.gpu_scroll, 0);
-        // jump to the last GPU; scroll must advance so it stays visible.
-        s.select_last();
-        assert!(
-            s.gpu_scroll > 0,
-            "gpu_scroll did not advance: {}",
-            s.gpu_scroll
-        );
-        assert!(s.gpu_sel >= s.gpu_scroll && s.gpu_sel < s.gpu_scroll + visible);
-    }
+    // ponytail: P3 folds Hardware into Observe; the main selection model now
+    // drives the instances list rather than per-GPU scroll, so the former
+    // `appstate_navigation_advances_gpu_scroll` test is removed.
+    // `scroll_to_show` / `gpu_visible_count` stay unit-tested above and are
+    // reused by Observe's GPU panel.
 
     #[test]
     fn gpu_compact_line_colors_and_truncates() {
@@ -1197,7 +1184,7 @@ mod tests {
     fn draw_handles_degraded_and_empty_states() {
         // 1) No snapshot at all → "waiting…" placeholder, no panic.
         let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Hardware;
+        s.active_tab = ActiveTab::Observe;
         let out = render_to_string(&s, 100, 30);
         assert!(out.contains("waiting"), "no waiting placeholder: {out:?}");
 

@@ -235,7 +235,7 @@ pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
     // `zbus::blocking`, which builds its own runtime and `block_on`s internally;
     // doing that on a dash runtime worker thread panics with "Cannot start a
     // runtime from within a runtime". See `run_async`.
-    let args = resolved_args(&config, &paths, ActiveTab::Overview);
+    let args = resolved_args(&config, &paths, ActiveTab::Home);
     let rt = build_dashboard_runtime()?;
     rt.block_on(run_async(config, paths, args, replay, chat_mock))
 }
@@ -370,7 +370,7 @@ mod tests {
     #[test]
     fn resolved_args_take_connect_and_theme_from_config() {
         let c = cfg();
-        let args = resolved_args(&c, &paths(), ActiveTab::Overview);
+        let args = resolved_args(&c, &paths(), ActiveTab::Home);
         assert_eq!(args.connect, c.dashboard.tui.connect);
         assert_eq!(args.theme, c.dashboard.tui.theme);
         assert!(!args.chat_mock);

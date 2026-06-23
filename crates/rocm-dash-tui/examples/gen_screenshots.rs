@@ -91,7 +91,7 @@ fn main() -> anyhow::Result<()> {
             let m = mk_dark.clone();
             move || {
                 let mut s = m();
-                s.active_tab = ActiveTab::Overview;
+                s.active_tab = ActiveTab::Home;
                 s
             }
         }),
@@ -102,7 +102,7 @@ fn main() -> anyhow::Result<()> {
             let m = mk_dark.clone();
             move || {
                 let mut s = m();
-                s.active_tab = ActiveTab::Hardware;
+                s.active_tab = ActiveTab::Observe;
                 s
             }
         }),
@@ -113,7 +113,7 @@ fn main() -> anyhow::Result<()> {
             let m = mk_dark.clone();
             move || {
                 let mut s = m();
-                s.active_tab = ActiveTab::Hardware;
+                s.active_tab = ActiveTab::Observe;
                 s.gpu_sel = 2;
                 s.modal = Modal::Detail;
                 s
@@ -126,7 +126,7 @@ fn main() -> anyhow::Result<()> {
             let m = mk_dark.clone();
             move || {
                 let mut s = m();
-                s.active_tab = ActiveTab::Instances;
+                s.active_tab = ActiveTab::Observe;
                 s
             }
         }),
@@ -137,7 +137,7 @@ fn main() -> anyhow::Result<()> {
             let m = mk_dark.clone();
             move || {
                 let mut s = m();
-                s.active_tab = ActiveTab::Instances;
+                s.active_tab = ActiveTab::Observe;
                 s.instance_sel = 0;
                 s.modal = Modal::Detail;
                 s
@@ -150,7 +150,7 @@ fn main() -> anyhow::Result<()> {
             let m = mk_dark.clone();
             move || {
                 let mut s = m();
-                s.active_tab = ActiveTab::Bench;
+                s.active_tab = ActiveTab::Observe;
                 s
             }
         }),
@@ -161,7 +161,7 @@ fn main() -> anyhow::Result<()> {
             let m = mk_dark.clone();
             move || {
                 let mut s = m();
-                s.active_tab = ActiveTab::Bench;
+                s.active_tab = ActiveTab::Observe;
                 s.bench_sel = s.bench_rows.len().saturating_sub(1);
                 s.modal = Modal::Detail;
                 s
@@ -206,7 +206,7 @@ fn main() -> anyhow::Result<()> {
             Box::new({
                 move || {
                     let mut s = m();
-                    s.active_tab = ActiveTab::Overview;
+                    s.active_tab = ActiveTab::Home;
                     s
                 }
             }),

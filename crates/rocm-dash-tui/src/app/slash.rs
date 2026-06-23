@@ -44,8 +44,8 @@ impl AppState {
 
         match cmd.as_str() {
             // --- Group A: nav / session (deterministic, no executor) ---
-            "home" => self.active_tab = ActiveTab::Overview,
-            "gpu" => self.active_tab = ActiveTab::Hardware,
+            "home" => self.active_tab = ActiveTab::Home,
+            "gpu" => self.active_tab = ActiveTab::Observe,
             "help" | "?" => self.modal = Modal::Help,
             "clear" => self.chat.clear(),
             "quit" | "exit" => self.should_quit = true,
