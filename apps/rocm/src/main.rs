@@ -65,7 +65,32 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Check this computer's GPU, ROCm install, engines, and setup folders.
-    Examine,
+    Examine {
+        /// Diagnose known ROCm/PyTorch/llama.cpp failure modes and suggest fixes.
+        #[arg(long, conflicts_with = "fix")]
+        diagnose: bool,
+        /// Raw error text from the user; sharpens diagnosis keyword scoring.
+        #[arg(long, requires = "diagnose")]
+        symptom: Option<String>,
+        /// With --diagnose, show at most this many matches (default 5).
+        #[arg(long, requires = "diagnose", default_value_t = 5)]
+        top: usize,
+        /// Apply a known fix by id (e.g. fix-4-render-group); see --diagnose output.
+        #[arg(long, value_name = "FIX_ID")]
+        fix: Option<String>,
+        /// With --fix, skip the interactive confirmation (use after approving the plan).
+        #[arg(long, requires = "fix")]
+        yes: bool,
+        /// With --fix, show the plan without changing anything.
+        #[arg(long = "dry-run", requires = "fix")]
+        dry_run: bool,
+        /// For fix-9-igpu-dgpu: the discrete GPU index to pin.
+        #[arg(long, requires = "fix")]
+        device_index: Option<i64>,
+        /// Emit machine-readable JSON (the Examination, or the diagnosis with --diagnose).
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the rocm-cli version.
     Version,
     #[command(hide = true)]
@@ -1035,7 +1060,25 @@ fn dispatch(cli: Cli) -> Result<()> {
     }
 
     match cli.command {
-        Some(Command::Examine) => examine(),
+        Some(Command::Examine {
+            diagnose,
+            symptom,
+            top,
+            fix,
+            yes,
+            dry_run,
+            device_index,
+            json,
+        }) => examine(ExamineArgs {
+            diagnose,
+            symptom,
+            top,
+            fix,
+            yes,
+            dry_run,
+            device_index,
+            json,
+        }),
         Some(Command::Version) => {
             println!("rocm {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -1412,7 +1455,53 @@ const fn builtin_engine_inventory() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
-fn examine() -> Result<()> {
+struct ExamineArgs {
+    diagnose: bool,
+    symptom: Option<String>,
+    top: usize,
+    fix: Option<String>,
+    yes: bool,
+    dry_run: bool,
+    device_index: Option<i64>,
+    json: bool,
+}
+
+fn examine(args: ExamineArgs) -> Result<()> {
+    if let Some(fix_id) = args.fix {
+        let opts = rocm_core::FixOptions {
+            yes: args.yes,
+            dry_run: args.dry_run,
+            device_index: args.device_index,
+        };
+        let code = rocm_core::apply_fix(&fix_id, &opts);
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
+    if args.diagnose {
+        let examination = rocm_core::Examination::probe(rocm_core::FrameworkProbe::Auto);
+        let symptom = args.symptom.unwrap_or_default();
+        let report = rocm_core::run_diagnose(&examination, &symptom);
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            print!("{}", rocm_core::render_diagnose_text(&report, args.top));
+        }
+        if !report.has_match() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if args.json {
+        let examination = rocm_core::Examination::probe(rocm_core::FrameworkProbe::Auto);
+        println!("{}", serde_json::to_string_pretty(&examination)?);
+        let code = examination.exit_code();
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
     print!("{}", render_examine_text()?);
     Ok(())
 }
