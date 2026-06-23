@@ -3248,6 +3248,7 @@ dependencies = [
  "directories",
  "libc",
  "rand 0.8.6",
+ "regex",
  "rsa",
  "serde",
  "serde_json",

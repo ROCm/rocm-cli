@@ -65,7 +65,37 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Check this computer's GPU, ROCm install, engines, and setup folders.
-    Examine,
+    Examine {
+        /// Emit the machine-readable Examination JSON (for diagnosis tooling).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Diagnose known ROCm/PyTorch/llama.cpp failure modes against a closed catalog.
+    Diagnose {
+        /// Raw error text from the user; sharpens keyword scoring.
+        #[arg(long)]
+        symptom: Option<String>,
+        /// Show at most this many matches (default 5).
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+        /// Emit the machine-readable diagnosis JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply a known fix by id (see `rocm diagnose`); run with no id to list fixes.
+    Fix {
+        /// Fix id, e.g. fix-4-render-group. Omit to list available fixes.
+        fix_id: Option<String>,
+        /// Skip the interactive confirmation (use after approving the plan).
+        #[arg(long)]
+        yes: bool,
+        /// Show the plan without changing anything.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// For fix-9-igpu-dgpu: the discrete GPU index to pin.
+        #[arg(long)]
+        device_index: Option<i64>,
+    },
     /// Print the rocm-cli version.
     Version,
     #[command(hide = true)]
@@ -1035,7 +1065,14 @@ fn dispatch(cli: Cli) -> Result<()> {
     }
 
     match cli.command {
-        Some(Command::Examine) => examine(),
+        Some(Command::Examine { json }) => examine(json),
+        Some(Command::Diagnose { symptom, top, json }) => diagnose(symptom, top, json),
+        Some(Command::Fix {
+            fix_id,
+            yes,
+            dry_run,
+            device_index,
+        }) => fix(fix_id, yes, dry_run, device_index),
         Some(Command::Version) => {
             println!("rocm {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -1412,8 +1449,56 @@ const fn builtin_engine_inventory() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
-fn examine() -> Result<()> {
-    print!("{}", render_examine_text()?);
+fn examine(json: bool) -> Result<()> {
+    // `rocm examine` is the general system inspector: the exit code reports
+    // whether it RAN, not what it found. Any finding (no GPU, WSL, degraded) is
+    // surfaced in the output and the `--json` `status` field, and the command
+    // exits 0; a genuine inability to examine propagates as an error via `?`.
+    if json {
+        let examination = rocm_core::Examination::probe(rocm_core::FrameworkProbe::Auto);
+        println!("{}", serde_json::to_string_pretty(&examination)?);
+        return Ok(());
+    }
+    let paths = AppPaths::discover()?;
+    let config = RocmCliConfig::load(&paths).unwrap_or_default();
+    let (text, summary) = examine_human_report(&paths, &config)?;
+    print!("{text}");
+    if summary.wsl.as_ref().is_some_and(|w| w.is_wsl) {
+        // Informational route-out guidance for humans (the verdict is also in
+        // the `status` field for `--json` consumers).
+        println!("\n{}", rocm_core::WSL_ROUTE_OUT_NOTE);
+    }
+    Ok(())
+}
+
+fn diagnose(symptom: Option<String>, top: usize, json: bool) -> Result<()> {
+    // `rocm diagnose` is a query: it exits 0 whether it matched, found nothing,
+    // or is out of scope. Callers read `has_match` / `out_of_scope` /
+    // `route_when_no_match` from `--json` rather than branching on the exit code.
+    let examination = rocm_core::Examination::probe(rocm_core::FrameworkProbe::Auto);
+    let report = rocm_core::run_diagnose(&examination, &symptom.unwrap_or_default());
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", rocm_core::render_diagnose_text(&report, top));
+    }
+    Ok(())
+}
+
+fn fix(fix_id: Option<String>, yes: bool, dry_run: bool, device_index: Option<i64>) -> Result<()> {
+    let Some(fix_id) = fix_id else {
+        print!("{}", rocm_core::list_fix_recipes());
+        return Ok(());
+    };
+    let opts = rocm_core::FixOptions {
+        yes,
+        dry_run,
+        device_index,
+    };
+    let code = rocm_core::apply_fix(&fix_id, &opts);
+    if code != 0 {
+        std::process::exit(code);
+    }
     Ok(())
 }
 
@@ -9032,13 +9117,22 @@ pub(crate) fn render_examine_text() -> Result<String> {
 }
 
 fn render_examine_text_with_paths(paths: &AppPaths, config: &RocmCliConfig) -> Result<String> {
+    Ok(examine_human_report(paths, config)?.0)
+}
+
+/// Build the human examine report and return it alongside the `ExamineSummary`
+/// it was built from, so callers can derive scope/exit-code without re-probing.
+fn examine_human_report(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> Result<(String, ExamineSummary)> {
     recover_setup_runtime_registration(paths, config)?;
     let summary = ExamineSummary::gather()?;
     let mut output = render_examine_plain_header(&summary);
     output.push_str(&summary.render_text());
     append_examine_runtime_state(&mut output, paths, config)?;
     append_examine_engine_inventory(&mut output, paths, config);
-    Ok(output)
+    Ok((output, summary))
 }
 
 fn render_examine_plain_header(summary: &ExamineSummary) -> String {
@@ -14068,6 +14162,8 @@ fn service_model_names_match(left: &str, right: &str) -> bool {
 fn treat_as_natural_language(args: &[String]) -> bool {
     const STRUCTURED: &[&str] = &[
         "examine",
+        "diagnose",
+        "fix",
         "status",
         "bridge-snapshot",
         "sandbox-run",

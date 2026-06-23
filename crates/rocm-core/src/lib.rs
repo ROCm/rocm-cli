@@ -22,8 +22,17 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
+pub mod diagnose;
+pub mod examine;
+pub mod fix;
 pub mod runtime;
 pub mod uv;
+pub use diagnose::{
+    DiagnoseReport, Diagnosis, Fix, diagnose as run_diagnose,
+    render_report_text as render_diagnose_text,
+};
+pub use examine::{Examination, FrameworkProbe, WSL_ROUTE_OUT_NOTE};
+pub use fix::{FixOptions, apply as apply_fix, list_recipes as list_fix_recipes};
 use runtime::env_path_override;
 #[cfg(test)]
 use runtime::home_rocm_dir;
