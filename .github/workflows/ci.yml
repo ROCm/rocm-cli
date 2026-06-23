@@ -133,6 +133,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: MANIFEST.md dependency table is current
+        run: cargo xtask manifest --check
+
   coverage:
     name: Coverage (rocm-dash crates, ratcheted)
     runs-on: ubuntu-latest
