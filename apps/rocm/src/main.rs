@@ -19232,13 +19232,20 @@ install therock";
 
         let selection = select_serve_engine(None, None, None, Some(&summary));
 
-        assert_eq!(
-            selection,
+        // vLLM is unsupported on native Windows, so the GPU-family preference is gated
+        // off there and selection falls back to the platform default.
+        let expected = if cfg!(windows) {
+            ServeEngineSelection {
+                engine: "lemonade".to_owned(),
+                source: "platform default",
+            }
+        } else {
             ServeEngineSelection {
                 engine: "vllm".to_owned(),
                 source: "detected ROCm GPU family prefers vLLM",
             }
-        );
+        };
+        assert_eq!(selection, expected);
     }
 
     #[test]
@@ -19274,13 +19281,20 @@ install therock";
         };
 
         let selection = select_serve_engine(None, None, Some(&recipe), Some(&summary));
-        assert_eq!(
-            selection,
+        // On native Windows the vLLM preference is gated off, so the qwen recipe stays on
+        // its own preferred engine (Lemonade) instead of being routed to vLLM.
+        let expected = if cfg!(windows) {
+            ServeEngineSelection {
+                engine: "lemonade".to_owned(),
+                source: "recipe preferred engine; pass --engine <engine> to override; no automatic fallback",
+            }
+        } else {
             ServeEngineSelection {
                 engine: "vllm".to_owned(),
                 source: "detected ROCm GPU family prefers vLLM",
             }
-        );
+        };
+        assert_eq!(selection, expected);
         assert_eq!(
             serve_model_ref_for_engine("qwen", Some(&recipe), "vllm"),
             "Qwen/Qwen3-4B-Instruct-2507"
@@ -19294,11 +19308,11 @@ install therock";
 
     #[test]
     fn sdk_install_auto_engine_selection_prefers_vllm_for_supported_families() {
-        assert_eq!(preferred_engine_for_sdk_family("gfx90a"), Some("vllm"));
-        assert_eq!(
-            preferred_engine_for_sdk_family("gfx94X-dcgpu"),
-            Some("vllm")
-        );
+        // vLLM is unsupported on native Windows, so the SDK family preference is gated
+        // off there and resolves to None.
+        let expected = if cfg!(windows) { None } else { Some("vllm") };
+        assert_eq!(preferred_engine_for_sdk_family("gfx90a"), expected);
+        assert_eq!(preferred_engine_for_sdk_family("gfx94X-dcgpu"), expected);
         assert_eq!(preferred_engine_for_sdk_family("gfx120X-all"), None);
     }
 
