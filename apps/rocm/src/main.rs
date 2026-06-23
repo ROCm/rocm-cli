@@ -56,7 +56,9 @@ use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
+#[cfg(not(windows))]
+use std::process::ExitStatus;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
