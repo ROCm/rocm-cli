@@ -53,7 +53,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         ])
         .split(f.area());
     let body = outer[1];
-    let footer_area = body;
+    let footer_area = outer[2];
 
     draw_header(f, outer[0], state, &theme);
 

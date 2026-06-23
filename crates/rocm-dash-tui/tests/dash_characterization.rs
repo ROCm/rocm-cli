@@ -246,6 +246,42 @@ fn a11y_status_carries_text_label_not_color_only() {
 }
 
 #[test]
+fn control_legend_is_on_the_bottom_row_not_the_top() {
+    // The footer keyboard legend must render on the LAST row, never inside the
+    // body near the top (regression: footer rect once collapsed onto the body).
+    let cols = 160u16;
+    let rows = 44u16;
+    let mut s = state_on(ActiveTab::Home);
+    let backend = TestBackend::new(cols, rows);
+    let mut term = Terminal::new(backend).unwrap();
+    term.draw(|f| ui::draw(f, &mut s)).unwrap();
+    let buf = term.backend().buffer().clone();
+
+    let row_text = |y: u16| -> String {
+        (0..cols)
+            .map(|x| {
+                buf.cell((x, y))
+                    .map_or(" ", ratatui::buffer::Cell::symbol)
+                    .to_string()
+            })
+            .collect()
+    };
+    // "quit" (legend tail) is on the bottom row.
+    assert!(
+        row_text(rows - 1).contains("quit"),
+        "legend must be on the bottom row: {:?}",
+        row_text(rows - 1)
+    );
+    // The top rows (header band) must NOT carry the body-level legend chips like
+    // "select"/"jump" — only the small chrome hint may live up top.
+    let top = (0..6).map(row_text).collect::<String>();
+    assert!(
+        !top.contains(" jump "),
+        "body legend leaked to the top: {top:?}"
+    );
+}
+
+#[test]
 fn every_tab_survives_squeezed_height() {
     // The body rect can collapse to 0–1 inner rows on a short terminal; assert
     // no tab panics when squeezed (the historical ActiveTab footgun).
