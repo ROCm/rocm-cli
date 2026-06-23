@@ -462,8 +462,10 @@ pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
     if let Some(runner) = recipe.runner {
         runner(opts)
     } else {
+        // Internal error (auto-applicable recipe with no runner) -> 1, not 4
+        // (4 is reserved for "attempted but the command failed").
         eprintln!("Internal error: auto-applicable recipe has no runner.");
-        4
+        1
     }
 }
 
@@ -804,6 +806,10 @@ fn run_path_export_windows(opts: &FixOptions) -> i32 {
 
 /// fix-9: persist HIP_VISIBLE_DEVICES so the iGPU is hidden.
 fn run_hip_visible_devices(opts: &FixOptions) -> i32 {
+    if let Some(idx) = opts.device_index.filter(|&i| i < 0) {
+        println!("--device-index must be >= 0 (got {idx}).");
+        return 3;
+    }
     if runtime_is_windows() {
         run_hip_visible_devices_windows(opts)
     } else {

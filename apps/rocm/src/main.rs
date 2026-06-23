@@ -1450,29 +1450,37 @@ const fn builtin_engine_inventory() -> &'static [(&'static str, &'static str)] {
 }
 
 fn examine(json: bool) -> Result<()> {
+    // `rocm examine` is the general system inspector: the exit code reports
+    // whether it RAN, not what it found. Any finding (no GPU, WSL, degraded) is
+    // surfaced in the output and the `--json` `status` field, and the command
+    // exits 0; a genuine inability to examine propagates as an error via `?`.
     if json {
         let examination = rocm_core::Examination::probe(rocm_core::FrameworkProbe::Auto);
         println!("{}", serde_json::to_string_pretty(&examination)?);
-        let code = examination.exit_code();
-        if code != 0 {
-            std::process::exit(code);
-        }
         return Ok(());
     }
-    print!("{}", render_examine_text()?);
+    let paths = AppPaths::discover()?;
+    let config = RocmCliConfig::load(&paths).unwrap_or_default();
+    let (text, summary) = examine_human_report(&paths, &config)?;
+    print!("{text}");
+    if summary.wsl.as_ref().is_some_and(|w| w.is_wsl) {
+        // Informational route-out guidance for humans (the verdict is also in
+        // the `status` field for `--json` consumers).
+        println!("\n{}", rocm_core::WSL_ROUTE_OUT_NOTE);
+    }
     Ok(())
 }
 
 fn diagnose(symptom: Option<String>, top: usize, json: bool) -> Result<()> {
+    // `rocm diagnose` is a query: it exits 0 whether it matched, found nothing,
+    // or is out of scope. Callers read `has_match` / `out_of_scope` /
+    // `route_when_no_match` from `--json` rather than branching on the exit code.
     let examination = rocm_core::Examination::probe(rocm_core::FrameworkProbe::Auto);
     let report = rocm_core::run_diagnose(&examination, &symptom.unwrap_or_default());
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print!("{}", rocm_core::render_diagnose_text(&report, top));
-    }
-    if !report.has_match() {
-        std::process::exit(1);
     }
     Ok(())
 }
@@ -9109,13 +9117,22 @@ pub(crate) fn render_examine_text() -> Result<String> {
 }
 
 fn render_examine_text_with_paths(paths: &AppPaths, config: &RocmCliConfig) -> Result<String> {
+    Ok(examine_human_report(paths, config)?.0)
+}
+
+/// Build the human examine report and return it alongside the `ExamineSummary`
+/// it was built from, so callers can derive scope/exit-code without re-probing.
+fn examine_human_report(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> Result<(String, ExamineSummary)> {
     recover_setup_runtime_registration(paths, config)?;
     let summary = ExamineSummary::gather()?;
     let mut output = render_examine_plain_header(&summary);
     output.push_str(&summary.render_text());
     append_examine_runtime_state(&mut output, paths, config)?;
     append_examine_engine_inventory(&mut output, paths, config);
-    Ok(output)
+    Ok((output, summary))
 }
 
 fn render_examine_plain_header(summary: &ExamineSummary) -> String {

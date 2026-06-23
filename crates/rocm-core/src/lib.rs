@@ -31,7 +31,7 @@ pub use diagnose::{
     DiagnoseReport, Diagnosis, Fix, diagnose as run_diagnose,
     render_report_text as render_diagnose_text,
 };
-pub use examine::{Examination, FrameworkProbe};
+pub use examine::{Examination, FrameworkProbe, WSL_ROUTE_OUT_NOTE};
 pub use fix::{FixOptions, apply as apply_fix, list_recipes as list_fix_recipes};
 use runtime::env_path_override;
 #[cfg(test)]

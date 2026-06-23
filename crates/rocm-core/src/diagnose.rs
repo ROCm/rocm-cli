@@ -59,6 +59,11 @@ pub struct DiagnoseReport {
     pub min_score_for_match: i32,
     pub high_confidence_threshold: i32,
     pub route_when_no_match: Route,
+    /// Set when the host is out of scope for this catalog (e.g. WSL2). When
+    /// present, `matched` is empty — the catalog is deliberately not run, to
+    /// avoid emitting bare-metal-Linux diagnoses that don't apply.
+    #[serde(default)]
+    pub out_of_scope: Option<String>,
 }
 
 impl DiagnoseReport {
@@ -918,6 +923,9 @@ fn check_10_container_devices(e: &Examination, symptom: &str) -> Diagnosis {
     };
     let mut score = 25;
     let mut evidence = vec![format!("running inside a {kind}")];
+    // Mirror diagnose.py: a null kfd contributes 0 (the script reads
+    // `kfd.get("exists") is False`, which is not True for a missing key). The
+    // probe always populates kfd, so this only matters for hand-built exams.
     if let Some(kfd) = &e.kfd {
         if !kfd.exists {
             score += 40;
@@ -926,9 +934,6 @@ fn check_10_container_devices(e: &Examination, symptom: &str) -> Diagnosis {
             score += 30;
             evidence.push("/dev/kfd is present but not writable by the container user".to_owned());
         }
-    } else {
-        score += 40;
-        evidence.push("/dev/kfd is not present in the container".to_owned());
     }
     if e.render_devices.is_empty() {
         score += 20;
@@ -1264,12 +1269,38 @@ fn route_when_no_match(e: &Examination) -> Route {
 /// Diagnose an examination against the closed catalog.
 #[must_use]
 pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
+    // WSL2 is a distinct platform (it uses /dev/dxg + the Windows host driver,
+    // not the in-tree amdgpu module or /dev/kfd), and `examine` already treats
+    // it as out of scope (exit_code() == 2). Mirror that here: skip the
+    // bare-metal Linux catalog entirely so we don't emit false positives like
+    // fix-4-render-group / fix-5-amdgpu-load on a healthy WSL2 box.
+    let out_of_scope = wsl_out_of_scope_message(e);
+    let matched = if out_of_scope.is_some() {
+        Vec::new()
+    } else {
+        run_all_checks(e, symptom)
+    };
     DiagnoseReport {
-        matched: run_all_checks(e, symptom),
+        matched,
         min_score_for_match: MIN_SCORE_FOR_MATCH,
         high_confidence_threshold: HIGH_CONFIDENCE,
         route_when_no_match: route_when_no_match(e),
+        out_of_scope,
     }
+}
+
+/// ROCm-on-WSL2 setup guidance (distinct from the bare-metal catalog).
+const WSL_DOCS_URL: &str = "https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installryz/wsl/howto_wsl.html";
+
+fn wsl_out_of_scope_message(e: &Examination) -> Option<String> {
+    e.is_wsl.then(|| {
+        format!(
+            "ROCm on WSL2 is a distinct platform: it uses /dev/dxg and the Windows host \
+             driver (dxgkrnl), not the in-tree amdgpu kernel module or /dev/kfd. This catalog \
+             targets bare-metal Linux, so its checks (render group, /dev/kfd, modprobe amdgpu) \
+             do not apply here. For ROCm-on-WSL2 setup, see {WSL_DOCS_URL}"
+        )
+    })
 }
 
 /// Render the human-facing diagnosis view (mirrors `diagnose.py`'s text output).
@@ -1277,6 +1308,12 @@ pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
 pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
+    if let Some(reason) = &report.out_of_scope {
+        out.push_str("rocm diagnose: out of scope for this platform.\n\n");
+        out.push_str(reason);
+        out.push('\n');
+        return out;
+    }
     if report.matched.is_empty() {
         let route = &report.route_when_no_match;
         out.push_str("rocm diagnose: no known misconfiguration matched.\n\n");
@@ -1420,6 +1457,40 @@ mod tests {
         // No symptom: -30 from covered arch => score <= 0 => not reported.
         let report = diagnose(&e, "");
         assert!(report.matched.iter().all(|d| d.id != "fix-1-arch"));
+    }
+
+    #[test]
+    fn wsl2_is_out_of_scope_and_emits_no_false_positives() {
+        let mut e = linux_base();
+        e.is_wsl = true;
+        // Signals that WOULD fire fix-4/fix-5/fix-3/fix-6 on bare-metal Linux —
+        // all normal/irrelevant on WSL2, so none must surface.
+        e.in_render_group = Some(false);
+        e.in_video_group = Some(false);
+        e.amdgpu_loaded = Some(false);
+        e.rocm_version = "6.4.1".to_owned();
+        e.rocm_path = "/opt/rocm".to_owned();
+        e.rocminfo_present = false;
+        let report = diagnose(&e, "unable to open /dev/kfd permission denied");
+        assert!(
+            report.matched.is_empty(),
+            "WSL2 must not run the bare-metal catalog"
+        );
+        assert!(
+            report.out_of_scope.is_some(),
+            "WSL2 should be flagged out of scope"
+        );
+        assert!(!report.has_match());
+        assert!(report.out_of_scope.as_deref().unwrap().contains("WSL2"));
+    }
+
+    #[test]
+    fn non_wsl_still_diagnoses_normally() {
+        let mut e = linux_base();
+        e.in_render_group = Some(false);
+        let report = diagnose(&e, "");
+        assert!(report.out_of_scope.is_none());
+        assert_eq!(report.matched[0].id, "fix-4-render-group");
     }
 
     #[test]

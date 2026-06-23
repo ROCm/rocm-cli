@@ -17,6 +17,12 @@ use std::time::{Duration, Instant};
 
 /// Environment variables that commonly steer (or break) ROCm/HIP runtime
 /// behavior. Captured verbatim into `Examination::env`.
+/// Cap on captured `PATH` / `LD_LIBRARY_PATH` length, to keep the Examination
+/// JSON bounded. Generous on purpose: the stored value is read by the catalog
+/// (e.g. the `fix-6-path` PATH check), so the cut must sit well past any
+/// realistic ROCm/HIP bin entry to avoid false "not on PATH" diagnoses.
+const ENV_VALUE_MAX_CHARS: usize = 16_000;
+
 const TRACKED_ENV_VARS: &[&str] = &[
     "HSA_OVERRIDE_GFX_VERSION",
     "HIP_VISIBLE_DEVICES",
@@ -156,6 +162,11 @@ pub struct Examination {
     pub dmesg_amdgpu_tail: Vec<String>,
     pub notes: Vec<String>,
     pub probe_failures: Vec<String>,
+
+    // CLI addition (not in examine.py): a coarse machine-readable verdict so
+    // callers branch on this field instead of the process exit code.
+    // One of: "ok" | "no-amd-gpu" | "wsl" | "unsupported-os" | "degraded".
+    pub status: String,
 }
 
 impl Default for Examination {
@@ -210,9 +221,14 @@ impl Default for Examination {
             dmesg_amdgpu_tail: Vec::new(),
             notes: Vec::new(),
             probe_failures: Vec::new(),
+            status: "ok".to_owned(),
         }
     }
 }
+
+/// Route-out guidance shown when WSL2 is detected (out of scope for this
+/// catalog, which targets bare-metal Linux). Mirrors `examine.py`.
+pub const WSL_ROUTE_OUT_NOTE: &str = "Detected WSL2. rocm examine does not cover the ROCm-on-WSL flow (it requires Adrenalin Pro + the WSL kernel update on the Windows host). Either run `rocm examine` on the native Linux host, or follow AMD's WSL guide directly: https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installryz/wsl/howto_wsl.html";
 
 /// Which framework probe to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,6 +247,15 @@ impl Examination {
     pub fn probe(framework: FrameworkProbe) -> Self {
         let mut e = Self::default();
         probe_os(&mut e);
+        if e.is_wsl {
+            // WSL2 is out of scope: it uses /dev/dxg + the Windows host driver,
+            // not the in-tree amdgpu module or /dev/kfd. Running the Linux probe
+            // set would only mislead, so add the route-out note and stop here
+            // (mirrors examine.py). The "wsl" status carries the verdict.
+            e.notes.push(WSL_ROUTE_OUT_NOTE.to_owned());
+            e.status = "wsl".to_owned();
+            return e;
+        }
         if e.os_family == "linux" {
             probe_cpu_linux(&mut e);
             probe_gpus_lspci(&mut e);
@@ -260,27 +285,26 @@ impl Examination {
                 e.os_family
             ));
         }
+        e.status = e.compute_status();
         e
     }
 
-    /// Exit code mirroring `examine.py`: `2` = wrong platform / WSL / no AMD GPU
-    /// (skill can't help), `3` = a key probe failed (soft warning), `0` = ok.
-    #[must_use]
-    pub fn exit_code(&self) -> i32 {
-        if self.is_wsl || !matches!(self.os_family.as_str(), "linux" | "windows") {
-            return 2;
-        }
-        if !self.has_amd_gpu {
-            return 2;
-        }
-        if self.os_family == "linux" {
-            if !self.probe_failures.is_empty() && !self.rocminfo_present && self.gpus.is_empty() {
-                return 3;
-            }
-        } else if !self.probe_failures.is_empty() && !self.hipinfo_present && self.gpus.is_empty() {
-            return 3;
-        }
-        0
+    /// Coarse machine-readable verdict reported via the `status` field. The
+    /// process exit code does NOT encode this — `rocm examine` always exits 0
+    /// when it ran; callers branch on `status` instead.
+    fn compute_status(&self) -> String {
+        let value = if self.is_wsl {
+            "wsl"
+        } else if !matches!(self.os_family.as_str(), "linux" | "windows") {
+            "unsupported-os"
+        } else if !self.has_amd_gpu {
+            "no-amd-gpu"
+        } else if !self.probe_failures.is_empty() {
+            "degraded"
+        } else {
+            "ok"
+        };
+        value.to_owned()
     }
 }
 
@@ -1087,8 +1111,8 @@ fn probe_env(e: &mut Examination) {
         let Ok(value) = std::env::var(key) else {
             continue;
         };
-        let value = if matches!(*key, "PATH" | "LD_LIBRARY_PATH") && value.len() > 4000 {
-            format!("{}...[truncated]", &value[..4000])
+        let value = if matches!(*key, "PATH" | "LD_LIBRARY_PATH") {
+            truncate_to_chars(value, ENV_VALUE_MAX_CHARS)
         } else {
             value
         };
@@ -1122,6 +1146,18 @@ fn probe_env(e: &mut Examination) {
             .push(format!("libamdhip64 visible via LD_LIBRARY_PATH: {hit}"));
     } else {
         e.hip_libs_on_ld_path = if ld.is_empty() { None } else { Some(false) };
+    }
+}
+
+/// Truncate `value` to at most `max_chars` characters, appending a marker when
+/// truncated. Slices on char boundaries (matching Python's `value[:n]`); a byte
+/// slice would panic when the cut lands inside a multibyte character.
+fn truncate_to_chars(value: String, max_chars: usize) -> String {
+    if value.chars().count() > max_chars {
+        let truncated: String = value.chars().take(max_chars).collect();
+        format!("{truncated}...[truncated]")
+    } else {
+        value
     }
 }
 
@@ -1355,9 +1391,10 @@ mod tests {
 
     #[test]
     fn examination_top_level_keys_match_examine_py_contract() {
-        // The exact field set examine.py emits. diagnose.py reads against these
-        // names, so this is the frozen wire contract — adding/removing/renaming a
-        // top-level field here is a contract change and must be intentional.
+        // The field set examine.py emits, plus the CLI-only `status` addition.
+        // diagnose.py reads against these names, so this is the frozen wire
+        // contract — adding/removing/renaming a top-level field is a contract
+        // change and must be intentional.
         let expected: std::collections::BTreeSet<&str> = [
             "os_family",
             "os_version",
@@ -1408,6 +1445,7 @@ mod tests {
             "dmesg_amdgpu_tail",
             "notes",
             "probe_failures",
+            "status",
         ]
         .into_iter()
         .collect();
@@ -1449,6 +1487,40 @@ mod tests {
         assert!(value.get("in_render_group").expect("present").is_null());
         assert!(value.get("amdgpu_loaded").expect("present").is_null());
         assert!(value.get("kfd").expect("present").is_null());
+    }
+
+    #[test]
+    fn status_reflects_scope_precedence() {
+        let mut e = Examination {
+            os_family: "linux".to_owned(),
+            has_amd_gpu: true,
+            ..Examination::default()
+        };
+        assert_eq!(e.compute_status(), "ok");
+        e.probe_failures.push("lspci missing".to_owned());
+        assert_eq!(e.compute_status(), "degraded");
+        e.probe_failures.clear();
+        e.has_amd_gpu = false;
+        assert_eq!(e.compute_status(), "no-amd-gpu");
+        e.os_family = "other".to_owned();
+        assert_eq!(e.compute_status(), "unsupported-os");
+        e.is_wsl = true;
+        assert_eq!(e.compute_status(), "wsl");
+    }
+
+    #[test]
+    fn env_truncation_is_char_safe_across_multibyte_boundary() {
+        // 5000 'é' chars = 10000 bytes; byte 4000 lands inside a char, which a
+        // byte slice would panic on. Must truncate cleanly to 4000 chars.
+        let value = "é".repeat(5000);
+        let out = truncate_to_chars(value, 4000);
+        assert!(out.ends_with("...[truncated]"));
+        assert_eq!(out.chars().filter(|&c| c == 'é').count(), 4000);
+    }
+
+    #[test]
+    fn env_truncation_leaves_short_values_untouched() {
+        assert_eq!(truncate_to_chars("short".to_owned(), 4000), "short");
     }
 
     #[test]
