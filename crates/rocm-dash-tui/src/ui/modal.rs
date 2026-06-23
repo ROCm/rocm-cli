@@ -96,7 +96,7 @@ pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
         key_line("q", "quit", theme),
         key_line("?", "toggle this help", theme),
         key_line("Tab / Shift-Tab", "next / previous tab", theme),
-        key_line("1 .. 5", "jump to tab", theme),
+        key_line("1 .. 6", "jump to tab", theme),
         key_line("t", "open theme picker", theme),
         key_line("Space", "pause / resume (replay only)", theme),
         key_line("+ / -", "speed up / slow down (replay only)", theme),
@@ -105,6 +105,10 @@ pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
         Line::raw(""),
     ];
     let tab_help: &[(&str, &str)] = match tab {
+        ActiveTab::Home => &[
+            ("▸ Open Chat / Serve", "act on the Next-step card"),
+            ("(no other tab-specific keys)", ""),
+        ],
         ActiveTab::Overview => &[("(no tab-specific keys)", "")],
         ActiveTab::Hardware => &[
             ("j / Down", "select next GPU (scrolls when list overflows)"),

@@ -9,6 +9,7 @@
 pub mod bench;
 pub mod chat;
 pub mod hardware;
+pub mod home;
 pub mod instances;
 pub mod overview;
 
@@ -21,12 +22,13 @@ use ratatui::widgets::Paragraph;
 use crate::app::ActiveTab;
 use crate::ui::theme::Theme;
 
-pub const TAB_LABELS: [(ActiveTab, &str, char); 5] = [
-    (ActiveTab::Overview, "Overview", '1'),
-    (ActiveTab::Hardware, "Hardware", '2'),
-    (ActiveTab::Instances, "Instances", '3'),
-    (ActiveTab::Bench, "Bench", '4'),
-    (ActiveTab::Chat, "Chat", '5'),
+pub const TAB_LABELS: [(ActiveTab, &str, char); 6] = [
+    (ActiveTab::Home, "Home", '1'),
+    (ActiveTab::Overview, "Overview", '2'),
+    (ActiveTab::Hardware, "Hardware", '3'),
+    (ActiveTab::Instances, "Instances", '4'),
+    (ActiveTab::Bench, "Bench", '5'),
+    (ActiveTab::Chat, "Chat", '6'),
 ];
 
 /// A single tab chip's screen extent. `x_start..x_end` are absolute columns
@@ -44,12 +46,12 @@ pub struct TabChip {
 /// `" Label "` chip (`label.len() + 2`), separated between chips by `" · "`
 /// (3 chars). Pure — both `draw_tab_bar` and `hit_test` route through this
 /// so they cannot drift.
-pub fn compute_chip_layout(bar_x: u16) -> [TabChip; 5] {
+pub fn compute_chip_layout(bar_x: u16) -> [TabChip; 6] {
     let mut out = [TabChip {
-        tab: ActiveTab::Overview,
+        tab: ActiveTab::Home,
         x_start: 0,
         x_end: 0,
-    }; 5];
+    }; 6];
     let mut x = bar_x;
     for (i, (tab, label, _key)) in TAB_LABELS.iter().enumerate() {
         if i > 0 {
@@ -223,30 +225,34 @@ mod tests {
     #[test]
     fn chip_layout_matches_draw_widths() {
         let chips = compute_chip_layout(0);
-        // " 1 " (3) + " Overview " (10) = 13
+        // " 1 " (3) + " Home " (6) = 9
         assert_eq!(chips[0].x_start, 0);
-        assert_eq!(chips[0].x_end, 13);
-        // separator (3) then " 2 " (3) + " Hardware " (10) = 16..29
-        assert_eq!(chips[1].x_start, 16);
-        assert_eq!(chips[1].x_end, 29);
-        // " 3 " + " Instances " (11) = 32..46
-        assert_eq!(chips[2].x_start, 32);
-        assert_eq!(chips[2].x_end, 46);
-        // " 4 " + " Bench " (7) = 49..59
-        assert_eq!(chips[3].x_start, 49);
-        assert_eq!(chips[3].x_end, 59);
-        // separator (3) then " 5 " (3) + " Chat " (6) = 62..71
-        assert_eq!(chips[4].x_start, 62);
+        assert_eq!(chips[0].x_end, 9);
+        assert_eq!(chips[0].tab, ActiveTab::Home);
+        // separator (3) then " 2 " (3) + " Overview " (10) = 12..25
+        assert_eq!(chips[1].x_start, 12);
+        assert_eq!(chips[1].x_end, 25);
+        // " 3 " + " Hardware " (10) = 28..41
+        assert_eq!(chips[2].x_start, 28);
+        assert_eq!(chips[2].x_end, 41);
+        // " 4 " + " Instances " (11) = 44..58
+        assert_eq!(chips[3].x_start, 44);
+        assert_eq!(chips[3].x_end, 58);
+        // " 5 " + " Bench " (7) = 61..71
+        assert_eq!(chips[4].x_start, 61);
         assert_eq!(chips[4].x_end, 71);
-        assert_eq!(chips[4].tab, ActiveTab::Chat);
+        // separator (3) then " 6 " (3) + " Chat " (6) = 74..83
+        assert_eq!(chips[5].x_start, 74);
+        assert_eq!(chips[5].x_end, 83);
+        assert_eq!(chips[5].tab, ActiveTab::Chat);
     }
 
     #[test]
     fn chip_layout_honors_bar_x_offset() {
         let chips = compute_chip_layout(100);
         assert_eq!(chips[0].x_start, 100);
-        // Full bar (Overview start → Chat end) spans 71 columns.
-        assert_eq!(chips[4].x_end - chips[0].x_start, 71);
+        // Full bar (Home start → Chat end) spans 83 columns.
+        assert_eq!(chips[5].x_end - chips[0].x_start, 83);
     }
 
     #[test]

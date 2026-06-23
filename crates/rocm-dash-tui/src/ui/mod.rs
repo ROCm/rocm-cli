@@ -58,6 +58,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     draw_header(f, outer[0], state, &theme);
     tabs::draw_tab_bar(f, outer[1], state.active_tab, &theme);
     match state.active_tab {
+        ActiveTab::Home => tabs::home::draw(f, outer[2], state, &theme),
         ActiveTab::Overview => tabs::overview::draw(f, outer[2], state, &theme),
         ActiveTab::Hardware => tabs::hardware::draw(f, outer[2], state, &theme),
         ActiveTab::Instances => tabs::instances::draw(f, outer[2], state, &theme),
@@ -227,7 +228,7 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let mut spans: Vec<Span> = vec![
         chip("Tab"),
         Span::raw(" next  "),
-        chip("1–5"),
+        chip("1–6"),
         Span::raw(" jump  "),
     ];
     if matches!(

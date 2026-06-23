@@ -119,6 +119,9 @@ pub enum ConnState {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ActiveTab {
+    // P2: Home is added as the first tab (matching the target IA) but is NOT
+    // the default yet — Overview stays the default until P3 (additive-then-switch).
+    Home,
     #[default]
     Overview,
     Hardware,
@@ -131,17 +134,19 @@ impl ActiveTab {
     #[must_use]
     pub const fn next(self) -> Self {
         match self {
+            Self::Home => Self::Overview,
             Self::Overview => Self::Hardware,
             Self::Hardware => Self::Instances,
             Self::Instances => Self::Bench,
             Self::Bench => Self::Chat,
-            Self::Chat => Self::Overview,
+            Self::Chat => Self::Home,
         }
     }
     #[must_use]
     pub const fn prev(self) -> Self {
         match self {
-            Self::Overview => Self::Chat,
+            Self::Home => Self::Chat,
+            Self::Overview => Self::Home,
             Self::Hardware => Self::Overview,
             Self::Instances => Self::Hardware,
             Self::Bench => Self::Instances,
@@ -150,11 +155,12 @@ impl ActiveTab {
     }
     pub const fn from_digit(d: char) -> Option<Self> {
         match d {
-            '1' => Some(Self::Overview),
-            '2' => Some(Self::Hardware),
-            '3' => Some(Self::Instances),
-            '4' => Some(Self::Bench),
-            '5' => Some(Self::Chat),
+            '1' => Some(Self::Home),
+            '2' => Some(Self::Overview),
+            '3' => Some(Self::Hardware),
+            '4' => Some(Self::Instances),
+            '5' => Some(Self::Bench),
+            '6' => Some(Self::Chat),
             _ => None,
         }
     }
@@ -2053,7 +2059,7 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
                 KeyAction::SwitchTab(current.next())
             }
         }
-        KeyCode::Char(c @ '1'..='5') => match ActiveTab::from_digit(c) {
+        KeyCode::Char(c @ '1'..='6') => match ActiveTab::from_digit(c) {
             Some(t) => KeyAction::SwitchTab(t),
             None => KeyAction::Nothing,
         },
@@ -2194,18 +2200,23 @@ mod tests {
 
     #[test]
     fn tab_cycles_forward_and_wraps() {
+        // P2: Home is the new first tab; Home → Overview → … → Chat → Home.
+        assert_eq!(
+            hk(KeyCode::Tab, ActiveTab::Home),
+            KeyAction::SwitchTab(ActiveTab::Overview)
+        );
         assert_eq!(
             hk(KeyCode::Tab, ActiveTab::Overview),
             KeyAction::SwitchTab(ActiveTab::Hardware)
         );
-        // Bench now precedes Chat; Chat wraps back to Overview.
+        // Bench precedes Chat; Chat now wraps back to Home.
         assert_eq!(
             hk(KeyCode::Tab, ActiveTab::Bench),
             KeyAction::SwitchTab(ActiveTab::Chat)
         );
         assert_eq!(
             hk(KeyCode::Tab, ActiveTab::Chat),
-            KeyAction::SwitchTab(ActiveTab::Overview)
+            KeyAction::SwitchTab(ActiveTab::Home)
         );
     }
 
@@ -2215,12 +2226,17 @@ mod tests {
             hk(KeyCode::BackTab, ActiveTab::Hardware),
             KeyAction::SwitchTab(ActiveTab::Overview)
         );
+        // Overview's previous tab is now Home (the new first tab).
+        assert_eq!(
+            hk(KeyCode::BackTab, ActiveTab::Overview),
+            KeyAction::SwitchTab(ActiveTab::Home)
+        );
         let shift_tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT);
-        // Overview's previous tab is now Chat (the new last tab).
+        // Home's previous tab is Chat (the last tab).
         assert_eq!(
             handle_key(
                 shift_tab,
-                ActiveTab::Overview,
+                ActiveTab::Home,
                 &Modal::None,
                 ChatKeyCtx::default()
             ),
@@ -2230,25 +2246,32 @@ mod tests {
 
     #[test]
     fn number_keys_jump_to_tab() {
+        // `1` now reaches Home; the rest shift up by one.
+        assert_eq!(
+            hk(KeyCode::Char('1'), ActiveTab::Overview),
+            KeyAction::SwitchTab(ActiveTab::Home)
+        );
         assert_eq!(
             hk(KeyCode::Char('3'), ActiveTab::Overview),
-            KeyAction::SwitchTab(ActiveTab::Instances)
+            KeyAction::SwitchTab(ActiveTab::Hardware)
         );
-        // `5` now reaches the Chat tab (digit guard widened to '1'..='5').
+        // `6` now reaches the Chat tab (digit guard widened to '1'..='6').
         assert_eq!(
-            hk(KeyCode::Char('5'), ActiveTab::Overview),
+            hk(KeyCode::Char('6'), ActiveTab::Overview),
             KeyAction::SwitchTab(ActiveTab::Chat)
         );
         assert_eq!(
-            hk(KeyCode::Char('6'), ActiveTab::Overview),
+            hk(KeyCode::Char('7'), ActiveTab::Overview),
             KeyAction::Nothing
         );
     }
 
     #[test]
     fn from_digit_maps_five_to_chat() {
-        assert_eq!(ActiveTab::from_digit('5'), Some(ActiveTab::Chat));
-        assert_eq!(ActiveTab::from_digit('6'), None);
+        // P2: digit map shifted by Home at '1'; Chat is now '6'.
+        assert_eq!(ActiveTab::from_digit('1'), Some(ActiveTab::Home));
+        assert_eq!(ActiveTab::from_digit('6'), Some(ActiveTab::Chat));
+        assert_eq!(ActiveTab::from_digit('7'), None);
     }
 
     #[test]
@@ -2456,37 +2479,39 @@ mod tests {
 
     #[test]
     fn tab_bar_hit_matches_per_chip_extents() {
-        // Bar wide enough to fit every chip (59 chars wide minimum).
+        // P2 6-tab layout: Home 0..9, Overview 12..25, Hardware 28..41,
+        // Instances 44..58, Bench 61..71, Chat 74..83. Bar width 80 fits all
+        // but Chat (ends at 83 > 80).
         let bar = Rect::new(0, 0, 80, 1);
-        // Inside each chip → its tab.
-        assert_eq!(tab_bar_hit(bar, 5, 0), Some(ActiveTab::Overview));
-        assert_eq!(tab_bar_hit(bar, 20, 0), Some(ActiveTab::Hardware));
-        assert_eq!(tab_bar_hit(bar, 40, 0), Some(ActiveTab::Instances));
-        assert_eq!(tab_bar_hit(bar, 55, 0), Some(ActiveTab::Bench));
-        // Separator " · " between chips 0 and 1 (x in 13..16) is a dead zone.
-        assert_eq!(tab_bar_hit(bar, 14, 0), None);
-        // Past the last chip (x >= 59) → None.
-        assert_eq!(tab_bar_hit(bar, 60, 0), None);
+        assert_eq!(tab_bar_hit(bar, 5, 0), Some(ActiveTab::Home));
+        assert_eq!(tab_bar_hit(bar, 20, 0), Some(ActiveTab::Overview));
+        assert_eq!(tab_bar_hit(bar, 35, 0), Some(ActiveTab::Hardware));
+        assert_eq!(tab_bar_hit(bar, 50, 0), Some(ActiveTab::Instances));
+        assert_eq!(tab_bar_hit(bar, 65, 0), Some(ActiveTab::Bench));
+        // Separator " · " between Home (ends 9) and Overview (starts 12).
+        assert_eq!(tab_bar_hit(bar, 10, 0), None);
+        // Chat overflows the 80-wide bar → its column resolves to nothing.
+        assert_eq!(tab_bar_hit(bar, 78, 0), None);
         // Wrong row.
         assert_eq!(tab_bar_hit(bar, 5, 2), None);
     }
 
     #[test]
     fn tab_bar_hit_skips_chips_that_overflow_a_narrow_bar() {
-        // Bar can only fit the first two chips (29 chars).
-        let bar = Rect::new(0, 0, 30, 1);
-        assert_eq!(tab_bar_hit(bar, 5, 0), Some(ActiveTab::Overview));
-        assert_eq!(tab_bar_hit(bar, 20, 0), Some(ActiveTab::Hardware));
-        // Instances chip would be at 32..46 — outside bar → None.
-        assert_eq!(tab_bar_hit(bar, 40, 0), None);
+        // Bar can only fit the first two chips (Overview ends at 25).
+        let bar = Rect::new(0, 0, 27, 1);
+        assert_eq!(tab_bar_hit(bar, 5, 0), Some(ActiveTab::Home));
+        assert_eq!(tab_bar_hit(bar, 20, 0), Some(ActiveTab::Overview));
+        // Hardware chip would be at 28..41 — outside bar → None.
+        assert_eq!(tab_bar_hit(bar, 35, 0), None);
     }
 
     #[test]
     fn tab_bar_hit_honors_x_offset() {
-        // Bar offset 10 columns to the right.
+        // Bar offset 10 columns to the right: Home chip now spans 10..19.
         let bar = Rect::new(10, 0, 80, 1);
-        assert_eq!(tab_bar_hit(bar, 15, 0), Some(ActiveTab::Overview));
-        // Equivalent absolute x of the previous "inside chip 0" test.
+        assert_eq!(tab_bar_hit(bar, 15, 0), Some(ActiveTab::Home));
+        // Absolute x=5 is left of the offset bar.
         assert_eq!(tab_bar_hit(bar, 5, 0), None);
     }
 
@@ -2688,7 +2713,7 @@ mod tests {
         assert_eq!(unfocused(KeyCode::Enter), KeyAction::ChatFocus);
         assert_eq!(
             unfocused(KeyCode::Char('1')),
-            KeyAction::SwitchTab(ActiveTab::Overview)
+            KeyAction::SwitchTab(ActiveTab::Home)
         );
     }
 
@@ -2708,7 +2733,7 @@ mod tests {
         assert_eq!(gate(KeyCode::Char('q')), KeyAction::Quit);
         assert_eq!(
             gate(KeyCode::Char('2')),
-            KeyAction::SwitchTab(ActiveTab::Hardware)
+            KeyAction::SwitchTab(ActiveTab::Overview)
         );
     }
 
