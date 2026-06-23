@@ -22,6 +22,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::ActiveTab;
+use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
 
 pub const TAB_LABELS: [(ActiveTab, &str, char); 4] = [
@@ -213,19 +214,12 @@ pub fn draw_tab_panel(
 
 /// Common stub renderer used by tabs that are not yet implemented.
 pub fn draw_placeholder(f: &mut Frame, area: Rect, title: &str, body: &str, theme: &Theme) {
-    use ratatui::widgets::{Block, Borders};
+    let inner = panel::bento(f, area, Some(title), BoxRole::Muted, false, theme);
     let p = Paragraph::new(Line::from(Span::styled(
         body,
         Style::default().fg(theme.muted),
-    )))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" {title} "))
-            .border_style(theme.border_style())
-            .title_style(theme.title_style()),
-    );
-    f.render_widget(p, area);
+    )));
+    f.render_widget(p, inner);
 }
 
 #[cfg(test)]

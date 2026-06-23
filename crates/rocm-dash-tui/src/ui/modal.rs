@@ -12,10 +12,11 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Clear, Paragraph, Wrap};
 
 use crate::app::{ActiveTab, AppState};
 use crate::ui::gradient::GradientGauge;
+use crate::ui::panel::{self, BoxRole};
 use crate::ui::sparkline::BrailleSparkline;
 use crate::ui::theme::{self, Theme};
 
@@ -51,18 +52,9 @@ pub fn centered_rect(pct_x: u16, pct_y: u16, max_w: u16, max_h: u16, area: Rect)
 /// returning the inner area so the caller can render content into it.
 pub fn draw_popup_frame(f: &mut Frame, area: Rect, title: &str, theme: &Theme) -> Rect {
     f.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" {title} "))
-        .border_style(Style::default().fg(theme.accent))
-        .title_style(
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        );
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    inner
+    // Compact frame: rounded + notch title but the classic 1-cell inset, so the
+    // many manager overlays keep their original content geometry.
+    panel::popup(f, area, title, theme)
 }
 
 /// Shared chrome: a titled popup whose body is a scrollable block of `lines`.
@@ -112,7 +104,10 @@ pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
         ActiveTab::Action => &[
             ("j / Down", "select next action"),
             ("k / Up", "select previous action"),
-            ("Enter", "open the selected action (asks before mutating)"),
+            (
+                "→ / Enter",
+                "step into detail, then open (asks before mutating)",
+            ),
             (
                 "w / e / d / u / i / l",
                 "serve / engines / doctor / update / install / logs",
@@ -279,17 +274,14 @@ fn draw_theme_list(
 /// title border / label color so the preview frame stays consistent with
 /// the surrounding modal even when the previewed bg is light/dark inverse.
 pub fn draw_theme_preview(f: &mut Frame, area: Rect, preview_theme: &Theme, active_theme: &Theme) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" preview ")
-        .border_style(Style::default().fg(active_theme.muted))
-        .title_style(
-            Style::default()
-                .fg(active_theme.muted)
-                .add_modifier(Modifier::BOLD),
-        );
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::bento(
+        f,
+        area,
+        Some("preview"),
+        BoxRole::Secondary,
+        false,
+        active_theme,
+    );
     if inner.height == 0 || inner.width == 0 {
         return;
     }
@@ -420,13 +412,7 @@ pub fn draw_menu(f: &mut Frame, area: Rect, sel: usize, theme: &Theme) {
     grey_overlay(f);
     let modal = centered_rect(50, 70, 60, 17, area);
     f.render_widget(Clear, modal);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Double)
-        .border_style(Style::default().fg(theme.accent))
-        .style(Style::default().bg(theme.surface));
-    let inner = block.inner(modal);
-    f.render_widget(block, modal);
+    let inner = panel::bento(f, modal, None, BoxRole::Primary, false, theme);
     if inner.height < 6 || inner.width < 31 {
         return;
     }
@@ -510,10 +496,7 @@ pub fn draw_options(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
     grey_overlay(f);
     let modal = centered_rect(80, 80, 112, 26, area);
     f.render_widget(Clear, modal);
-    f.render_widget(
-        Block::default().style(Style::default().bg(theme.surface)),
-        modal,
-    );
+    let _ = panel::bento(f, modal, None, BoxRole::Neutral, false, theme);
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " ⚙  Options",

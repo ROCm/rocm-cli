@@ -14,13 +14,14 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use rocm_dash_core::metrics::InstanceStatus;
 
 use crate::app::{AppState, ConnState};
 use crate::ui::format;
 use crate::ui::gradient::GradientGauge;
+use crate::ui::panel::{self, BoxRole};
 use crate::ui::sparkline::BrailleSparkline;
 use crate::ui::theme::Theme;
 
@@ -118,15 +119,8 @@ fn node_throughput_title(state: &AppState) -> String {
 }
 
 /// A bento card: titled bordered block, returns the inner content rect.
-fn card(f: &mut Frame, area: Rect, title: &str, border: Style, theme: &Theme) -> Rect {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" {title} "))
-        .border_style(border)
-        .title_style(theme.title_style());
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    inner
+fn card(f: &mut Frame, area: Rect, title: &str, role: BoxRole, theme: &Theme) -> Rect {
+    panel::bento(f, area, Some(title), role, false, theme)
 }
 
 pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -151,7 +145,7 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     if area.height < 2 {
         return;
     }
-    let inner = card(f, area, "Activity · node", theme.border_style(), theme);
+    let inner = card(f, area, "Activity · node", BoxRole::Muted, theme);
     if inner.height == 0 {
         return;
     }
@@ -213,7 +207,7 @@ fn draw_hero_band(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .split(area);
 
     let title = node_throughput_title(state);
-    let hero = card(f, top[0], &title, theme.border_style(), theme);
+    let hero = card(f, top[0], &title, BoxRole::Secondary, theme);
     if hero.width >= 8 && hero.height >= 6 {
         let hcols = Layout::default()
             .direction(Direction::Horizontal)
@@ -348,13 +342,7 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 }
 
 fn draw_next_step(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let inner = card(
-        f,
-        area,
-        "Next step",
-        Style::default().fg(theme.accent),
-        theme,
-    );
+    let inner = card(f, area, "Next step", BoxRole::Primary, theme);
     if inner.height == 0 {
         return;
     }
@@ -429,7 +417,7 @@ fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         f,
         mid[0],
         &format!("Running · {n_running}"),
-        theme.border_style(),
+        BoxRole::Success,
         theme,
     );
     if running.height > 0 {
@@ -458,7 +446,7 @@ fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
 
     // Health tile — derive from snapshot/system-info presence + conn state.
-    let health = card(f, mid[1], "Health", theme.border_style(), theme);
+    let health = card(f, mid[1], "Health", BoxRole::Secondary, theme);
     if health.height > 0 {
         let info = state
             .latest
@@ -495,7 +483,7 @@ fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
 
     // Updates tile — honest placeholder (no update feed wired this run).
-    let updates = card(f, mid[2], "Updates", theme.border_style(), theme);
+    let updates = card(f, mid[2], "Updates", BoxRole::Muted, theme);
     if updates.height > 0 {
         let body = match state.conn {
             ConnState::Connected { .. } => {

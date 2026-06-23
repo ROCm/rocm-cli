@@ -408,6 +408,9 @@ pub struct AppState {
     pub options_tab: usize,
     /// Cursor into the Action tab's guided-verb list.
     pub action_sel: usize,
+    /// Whether the Action tab's focus is on the verb list or the detail pane.
+    /// `→`/Enter moves focus into the detail box; `←` returns to the list.
+    pub action_focus: ActionFocus,
     /// Cursor into the sorted Instances grid.
     pub instance_sel: usize,
     /// Cursor into the bench_rows VecDeque (0 = oldest, len-1 = newest).
@@ -466,6 +469,9 @@ pub struct AppState {
     pub last_body_area: Option<ratatui::layout::Rect>,
     /// Same for the tab bar, used for click-to-switch-tab.
     pub last_tab_bar_area: Option<ratatui::layout::Rect>,
+    /// Clickable footer-legend chips from the most recent draw. Left-clicking a
+    /// chip dispatches the same `KeyAction` as pressing that key.
+    pub last_footer_chips: Vec<FooterChip>,
     /// Background-job model for operational screens (Phase 3 Wave 1). The
     /// job-bridge runtime streams `StateEvent`s into this from the event loop.
     pub jobs: rocm_dash_core::state::State,
@@ -555,6 +561,7 @@ impl AppState {
             palette_sel: 0,
             options_tab: 0,
             action_sel: 0,
+            action_focus: ActionFocus::List,
             instance_sel: 0,
             bench_sel: 0,
             gpu_sel: 0,
@@ -579,6 +586,7 @@ impl AppState {
             replay: None,
             last_body_area: None,
             last_tab_bar_area: None,
+            last_footer_chips: Vec::new(),
             jobs: rocm_dash_core::state::State::default(),
             services: None,
             serve_wizard: None,
@@ -1693,12 +1701,57 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
         KeyAction::SwitchTab(t) => {
             state.active_tab = t;
             state.modal = Modal::None;
+            // A fresh tab always starts with focus on its list, never stranded
+            // in the Action detail pane from a previous visit.
+            state.action_focus = ActionFocus::List;
         }
         KeyAction::Move(d) => {
             if state.modal == Modal::ThemePicker {
                 state.theme_picker_move(d);
             } else {
+                // Changing the verb selection snaps focus back to the list so
+                // the detail pane re-previews the newly selected operation.
+                if state.active_tab == ActiveTab::Action {
+                    state.action_focus = ActionFocus::List;
+                }
                 state.move_selection(d);
+            }
+        }
+        KeyAction::ActionFocusDetail => {
+            if state.active_tab == ActiveTab::Action {
+                state.action_focus = ActionFocus::Detail;
+            }
+        }
+        KeyAction::ActionFocusList => {
+            if state.active_tab == ActiveTab::Action {
+                state.action_focus = ActionFocus::List;
+            }
+        }
+        KeyAction::ActionActivate => {
+            if state.active_tab == ActiveTab::Action {
+                match state.action_focus {
+                    // From the list, Enter steps INTO the detail pane.
+                    ActionFocus::List => state.action_focus = ActionFocus::Detail,
+                    // From the detail pane, Enter opens the operation's manager.
+                    ActionFocus::Detail => {
+                        let verb = crate::ui::tabs::action::verb_action(state.action_sel);
+                        return apply_action(state, verb);
+                    }
+                }
+            }
+        }
+        KeyAction::ActionEscape => {
+            // Esc backs out one level: detail → list, then list → main menu.
+            if state.active_tab == ActiveTab::Action && state.action_focus == ActionFocus::Detail {
+                state.action_focus = ActionFocus::List;
+            } else {
+                return apply_action(state, KeyAction::OpenMenu);
+            }
+        }
+        KeyAction::ActionSelect(i) => {
+            if state.active_tab == ActiveTab::Action {
+                state.action_sel = i.min(crate::ui::tabs::action::VERB_COUNT.saturating_sub(1));
+                state.action_focus = ActionFocus::List;
             }
         }
         KeyAction::SelectFirst => {
@@ -1894,6 +1947,10 @@ fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
         {
             return KeyAction::SwitchTab(tab);
         }
+        // Footer legend: a click on a key chip acts exactly like the key press.
+        if let Some(chip) = footer_chip_hit(&state.last_footer_chips, me.column, me.row) {
+            return chip;
+        }
         if state.modal == Modal::None
             && let Some(area) = state.last_body_area
         {
@@ -1902,6 +1959,7 @@ fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
             // selection is the primary path.
             let action = match state.active_tab {
                 ActiveTab::Observe => ui::tabs::instances::hit_test(area, me.column, me.row, state),
+                ActiveTab::Action => ui::tabs::action::hit_test(area, me.column, me.row),
                 _ => None,
             };
             if let Some(a) = action {
@@ -1913,11 +1971,54 @@ fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
     handle_mouse(me, &state.modal, state.active_tab)
 }
 
+/// Resolve a pointer `(col, row)` against the recorded footer-legend chips.
+/// Returns the chip's action when the pointer lands inside a chip span.
+fn footer_chip_hit(chips: &[FooterChip], col: u16, row: u16) -> Option<KeyAction> {
+    chips
+        .iter()
+        .find(|c| row == c.y && col >= c.x0 && col < c.x1)
+        .map(|c| c.action)
+}
+
+/// Where the Action tab's keyboard focus currently sits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActionFocus {
+    /// Browsing the verb list (left column).
+    #[default]
+    List,
+    /// Inside the detail pane (right column), ready to start the operation.
+    Detail,
+}
+
+/// A clickable footer-legend chip: an absolute screen span on the footer row
+/// plus the action a left-click should dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FooterChip {
+    pub x0: u16,
+    /// End-exclusive.
+    pub x1: u16,
+    pub y: u16,
+    pub action: KeyAction,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyAction {
     Nothing,
     Quit,
     SwitchTab(ActiveTab),
+    /// Action tab: move focus into the detail pane (`→`).
+    ActionFocusDetail,
+    /// Action tab: move focus back to the verb list (`←`).
+    ActionFocusList,
+    /// Action tab: activate the current focus — from the list, focus the detail
+    /// pane; from the detail pane, open the operation's manager.
+    ActionActivate,
+    /// Action tab: Esc — step out of the detail pane back to the list, or, when
+    /// already on the list, fall through to the main menu.
+    ActionEscape,
+    /// Action tab: select the verb at this index and park focus on the list
+    /// (from a mouse click on a verb row).
+    ActionSelect(usize),
     Move(isize),
     SelectFirst,
     SelectLast,
@@ -2144,6 +2245,9 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         KeyCode::Char('q') => KeyAction::Quit,
         // Esc opens the main menu when idle, except on Chat (where Esc keeps its
         // existing chat meaning) — managers/approval are routed upstream.
+        // On Action, Esc first steps out of the detail pane (resolved against
+        // focus in `apply_action`); elsewhere it opens the main menu.
+        KeyCode::Esc if current == ActiveTab::Action => KeyAction::ActionEscape,
         KeyCode::Esc if current != ActiveTab::Chat => KeyAction::OpenMenu,
         KeyCode::Esc => KeyAction::Nothing,
         KeyCode::Char(':') => KeyAction::OpenPalette,
@@ -2223,6 +2327,11 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         KeyCode::Char('p') if matches!(current, ActiveTab::Observe | ActiveTab::Action) => {
             KeyAction::OpenConfig
         }
+        // Action tab: arrow keys drive the focus-into-detail interaction; Enter
+        // is focus-aware (list → focus detail, detail → open the manager).
+        KeyCode::Right if current == ActiveTab::Action => KeyAction::ActionFocusDetail,
+        KeyCode::Left if current == ActiveTab::Action => KeyAction::ActionFocusList,
+        KeyCode::Enter if current == ActiveTab::Action => KeyAction::ActionActivate,
         KeyCode::Enter => KeyAction::OpenDetail,
         _ => KeyAction::Nothing,
     }
@@ -2316,6 +2425,113 @@ mod tests {
             hk(KeyCode::Tab, ActiveTab::Chat),
             KeyAction::SwitchTab(ActiveTab::Home)
         );
+    }
+
+    #[test]
+    fn action_tab_arrows_and_enter_drive_focus() {
+        // → steps into the detail pane, ← steps back, Enter is focus-aware.
+        assert_eq!(
+            hk(KeyCode::Right, ActiveTab::Action),
+            KeyAction::ActionFocusDetail
+        );
+        assert_eq!(
+            hk(KeyCode::Left, ActiveTab::Action),
+            KeyAction::ActionFocusList
+        );
+        assert_eq!(
+            hk(KeyCode::Enter, ActiveTab::Action),
+            KeyAction::ActionActivate
+        );
+        // Arrows are inert on other tabs (no focus model there).
+        assert_eq!(hk(KeyCode::Right, ActiveTab::Observe), KeyAction::Nothing);
+        // Enter elsewhere keeps its detail-modal meaning.
+        assert_eq!(
+            hk(KeyCode::Enter, ActiveTab::Observe),
+            KeyAction::OpenDetail
+        );
+    }
+
+    #[test]
+    fn action_activate_is_two_step_list_then_open() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Action;
+        s.action_sel = 0; // Serve a model → OpenServeWizard
+        assert_eq!(s.action_focus, ActionFocus::List);
+        // First activate steps into the detail pane; no overlay yet.
+        apply_action(&mut s, KeyAction::ActionActivate);
+        assert_eq!(s.action_focus, ActionFocus::Detail);
+        assert!(s.serve_wizard.is_none(), "must not open before stepping in");
+        // Second activate opens the operation's manager.
+        apply_action(&mut s, KeyAction::ActionActivate);
+        assert!(
+            s.serve_wizard.is_some(),
+            "detail-focus Enter opens the manager"
+        );
+    }
+
+    #[test]
+    fn action_focus_resets_on_move_and_tab_switch() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Action;
+        s.action_focus = ActionFocus::Detail;
+        apply_action(&mut s, KeyAction::Move(1));
+        assert_eq!(s.action_focus, ActionFocus::List, "Move snaps back to list");
+        s.action_focus = ActionFocus::Detail;
+        apply_action(&mut s, KeyAction::SwitchTab(ActiveTab::Home));
+        assert_eq!(s.action_focus, ActionFocus::List, "tab switch resets focus");
+    }
+
+    #[test]
+    fn action_esc_backs_out_of_detail_then_opens_menu() {
+        // Esc on Action is intercepted (not the global OpenMenu) so it can back
+        // out of the detail pane first.
+        assert_eq!(hk(KeyCode::Esc, ActiveTab::Action), KeyAction::ActionEscape);
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Action;
+        s.action_focus = ActionFocus::Detail;
+        apply_action(&mut s, KeyAction::ActionEscape);
+        assert_eq!(s.action_focus, ActionFocus::List, "first Esc → list");
+        assert_eq!(s.modal, Modal::None, "first Esc does not open the menu");
+        apply_action(&mut s, KeyAction::ActionEscape);
+        assert_eq!(s.modal, Modal::Menu, "second Esc opens the menu");
+    }
+
+    #[test]
+    fn action_select_sets_verb_and_parks_on_list() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Action;
+        s.action_focus = ActionFocus::Detail;
+        apply_action(&mut s, KeyAction::ActionSelect(2));
+        assert_eq!(s.action_sel, 2);
+        assert_eq!(s.action_focus, ActionFocus::List);
+        // Out-of-range clamps rather than panicking.
+        apply_action(&mut s, KeyAction::ActionSelect(999));
+        assert!(s.action_sel < crate::ui::tabs::action::VERB_COUNT);
+    }
+
+    #[test]
+    fn footer_chip_hit_maps_click_to_action() {
+        let chips = vec![
+            FooterChip {
+                x0: 0,
+                x1: 5,
+                y: 49,
+                action: KeyAction::Quit,
+            },
+            FooterChip {
+                x0: 6,
+                x1: 9,
+                y: 49,
+                action: KeyAction::ToggleHelp,
+            },
+        ];
+        // Inside the first chip.
+        assert_eq!(footer_chip_hit(&chips, 2, 49), Some(KeyAction::Quit));
+        // End-exclusive: column 5 is past the first chip, before the second.
+        assert_eq!(footer_chip_hit(&chips, 5, 49), None);
+        assert_eq!(footer_chip_hit(&chips, 7, 49), Some(KeyAction::ToggleHelp));
+        // Wrong row never matches.
+        assert_eq!(footer_chip_hit(&chips, 2, 48), None);
     }
 
     #[test]

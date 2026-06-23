@@ -24,6 +24,7 @@ pub mod logs_view;
 pub mod modal;
 pub mod model_picker;
 pub mod onboarding;
+pub mod panel;
 pub mod runtime_manager;
 pub mod serve_wizard;
 pub mod services_manager;
@@ -37,13 +38,20 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 
-use crate::app::{ActiveTab, AppState, ConnState, Modal};
+use crate::app::{ActiveTab, AppState, ConnState, FooterChip, KeyAction, Modal};
 use crate::ui::theme::Theme;
 
 pub fn draw(f: &mut Frame, state: &mut AppState) {
     let theme = state.theme;
+    // Paint the whole frame with the theme background first, so every cell of
+    // empty space matches the bg instead of showing the terminal default (which
+    // read as a stray black box beneath the tabs).
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme.bg)),
+        f.area(),
+    );
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -93,7 +101,8 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         ActiveTab::Observe => tabs::observe::draw(f, center_inner, state, &theme),
         ActiveTab::Chat => tabs::chat::draw(f, center_inner, state, &theme),
     }
-    draw_footer(f, footer_area, state, &theme);
+    let footer_chips = draw_footer(f, footer_area, state, &theme);
+    state.last_footer_chips = footer_chips;
 
     // Modal overlay (rendered last so it sits on top of the body).
     match state.modal {
@@ -253,32 +262,38 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         "Esc menu · t theme · ? help",
         Style::default().fg(theme.muted),
     ));
-    let header = Paragraph::new(vec![Line::from(spans)]).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(theme.border_style()),
-    );
-    f.render_widget(header, area);
+    let inner = panel::bento(f, area, None, panel::BoxRole::Neutral, false, theme);
+    f.render_widget(Paragraph::new(vec![Line::from(spans)]), inner);
 }
 
-fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let chip = |k: &str| {
-        Span::styled(
-            format!(" {k} "),
-            Style::default().bg(theme.surface_2).fg(theme.fg),
-        )
+/// One footer-legend segment: a key chip (optionally clickable) or plain text.
+enum Seg {
+    /// A keycap. `Some(action)` => left-clicking it dispatches that action and
+    /// the cap is highlighted to signal it is interactive; `None` => a display
+    /// keycap (e.g. the `1–4` range) that has no single click target.
+    Key(&'static str, Option<KeyAction>),
+    /// A plain text separator / label.
+    Sep(&'static str),
+}
+
+/// Draw the footer legend and return the clickable chip geometry for hit-testing.
+fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Vec<FooterChip> {
+    let enter_action = if state.active_tab == ActiveTab::Action {
+        KeyAction::ActionActivate
+    } else {
+        KeyAction::OpenDetail
     };
-    let mut spans: Vec<Span> = vec![
-        chip("Tab"),
-        Span::raw(" next  "),
-        chip("1–4"),
-        Span::raw(" jump  "),
+    let mut segs: Vec<Seg> = vec![
+        Seg::Key("Tab", Some(KeyAction::SwitchTab(state.active_tab.next()))),
+        Seg::Sep(" next  "),
+        Seg::Key("1–4", None),
+        Seg::Sep(" jump  "),
     ];
     if matches!(state.active_tab, ActiveTab::Observe | ActiveTab::Action) {
-        spans.push(chip("j/k"));
-        spans.push(Span::raw(" select  "));
-        spans.push(chip("Enter"));
-        spans.push(Span::raw(if state.active_tab == ActiveTab::Action {
+        segs.push(Seg::Key("j/k", Some(KeyAction::Move(1))));
+        segs.push(Seg::Sep(" select  "));
+        segs.push(Seg::Key("Enter", Some(enter_action)));
+        segs.push(Seg::Sep(if state.active_tab == ActiveTab::Action {
             " open  "
         } else {
             " detail  "
@@ -286,36 +301,88 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
     // Guided-action entry points — Observe (telemetry) + Action (verb list).
     if matches!(state.active_tab, ActiveTab::Observe | ActiveTab::Action) {
-        spans.push(chip("w"));
-        spans.push(Span::raw(" serve  "));
-        spans.push(chip("e"));
-        spans.push(Span::raw(" engines  "));
-        spans.push(chip("d"));
-        spans.push(Span::raw(" examine  "));
-        spans.push(chip("u"));
-        spans.push(Span::raw(" update  "));
-        spans.push(chip("i"));
-        spans.push(Span::raw(" install  "));
-        spans.push(chip("l"));
-        spans.push(Span::raw(" logs  "));
+        segs.push(Seg::Key("w", Some(KeyAction::OpenServeWizard)));
+        segs.push(Seg::Sep(" serve  "));
+        segs.push(Seg::Key("e", Some(KeyAction::OpenEngineManager)));
+        segs.push(Seg::Sep(" engines  "));
+        segs.push(Seg::Key("d", Some(KeyAction::OpenExamine)));
+        segs.push(Seg::Sep(" examine  "));
+        segs.push(Seg::Key("u", Some(KeyAction::OpenUpdate)));
+        segs.push(Seg::Sep(" update  "));
+        segs.push(Seg::Key("i", Some(KeyAction::OpenInstall)));
+        segs.push(Seg::Sep(" install  "));
+        segs.push(Seg::Key("l", Some(KeyAction::OpenLogs)));
+        segs.push(Seg::Sep(" logs  "));
     }
     if state.active_tab == ActiveTab::Observe {
-        spans.push(chip("s"));
-        spans.push(Span::raw(" services  "));
+        segs.push(Seg::Key("s", Some(KeyAction::OpenServices)));
+        segs.push(Seg::Sep(" services  "));
     }
     if state.replay.is_some() {
-        spans.push(chip("Space"));
-        spans.push(Span::raw(" pause  "));
-        spans.push(chip("+/-"));
-        spans.push(Span::raw(" speed  "));
+        segs.push(Seg::Key("Space", Some(KeyAction::ReplayTogglePause)));
+        segs.push(Seg::Sep(" pause  "));
+        segs.push(Seg::Key("+/-", Some(KeyAction::ReplaySpeedUp)));
+        segs.push(Seg::Sep(" speed  "));
     }
-    spans.push(chip("t"));
-    spans.push(Span::raw(" theme  "));
-    spans.push(chip("?"));
-    spans.push(Span::raw(" help  "));
-    spans.push(chip("q"));
-    spans.push(Span::raw(" quit"));
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    segs.push(Seg::Key("t", Some(KeyAction::OpenThemePicker)));
+    segs.push(Seg::Sep(" theme  "));
+    segs.push(Seg::Key("?", Some(KeyAction::ToggleHelp)));
+    segs.push(Seg::Sep(" help  "));
+    segs.push(Seg::Key("q", Some(KeyAction::Quit)));
+    segs.push(Seg::Sep(" quit"));
+
+    // Lay out left-to-right, rendering each segment in its own cell span so the
+    // recorded chip geometry matches the painted columns exactly.
+    let mut cx = area.x;
+    let row = area.y;
+    let max_x = area.x.saturating_add(area.width);
+    let mut chips: Vec<FooterChip> = Vec::new();
+    // Keycap surface tracks the theme's luminance (a small nudge off the bg)
+    // rather than surface_2 (= br_black), which collides with text on light
+    // themes. Clickable caps add UNDERLINE as a non-color affordance so
+    // interactivity does not rely on hue alone.
+    let cap_bg = panel::blend(theme.bg, theme.fg, 0.12);
+    for seg in &segs {
+        if cx >= max_x {
+            break;
+        }
+        let (text, key, action): (&str, bool, Option<KeyAction>) = match seg {
+            Seg::Key(cap, act) => (cap, true, *act),
+            Seg::Sep(sep) => (sep, false, None),
+        };
+        let body = if key {
+            format!(" {text} ")
+        } else {
+            text.to_string()
+        };
+        let width = body.chars().count() as u16;
+        let draw_w = width.min(max_x - cx);
+        let style = match (key, action.is_some()) {
+            // Clickable keycap: accent + bold + underline (color-independent cue).
+            (true, true) => Style::default()
+                .bg(cap_bg)
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            // Display-only keycap (e.g. 1–4): same surface, muted, no underline.
+            (true, false) => Style::default().bg(cap_bg).fg(theme.muted),
+            // Separator / label.
+            _ => Style::default().fg(theme.muted),
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(body, style)),
+            Rect::new(cx, row, draw_w, 1),
+        );
+        if let Some(act) = action {
+            chips.push(FooterChip {
+                x0: cx,
+                x1: cx + width,
+                y: row,
+                action: act,
+            });
+        }
+        cx = cx.saturating_add(width);
+    }
+    chips
 }
 
 #[cfg(test)]

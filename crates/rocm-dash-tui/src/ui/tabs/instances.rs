@@ -9,13 +9,14 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 
 use rocm_dash_core::metrics::{Instance, InstanceStatus};
 
 use crate::app::{AppState, ConnState, KeyAction};
 use crate::ui::format;
 use crate::ui::modal::{centered_rect, draw_popup_frame};
+use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
 use crate::ui::widgets::trunc;
 
@@ -98,17 +99,12 @@ fn draw_kv_heatmap(
 ) {
     use crate::ui::heatmap::Heatmap;
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(
-            " kv-cache % · {} instances · last {} ticks ",
-            instances.len(),
-            state.history.len(),
-        ))
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let title = format!(
+        "kv-cache % · {} instances · last {} ticks",
+        instances.len(),
+        state.history.len(),
+    );
+    let inner = panel::bento(f, area, Some(&title), BoxRole::Secondary, false, theme);
     if inner.height == 0 {
         return;
     }
@@ -210,6 +206,17 @@ const fn status_meta(
     }
 }
 
+/// Map an instance status to a bento box role so unselected cards take a
+/// health-driven border color.
+const fn status_role(status: InstanceStatus) -> BoxRole {
+    match status {
+        InstanceStatus::Running => BoxRole::Success,
+        InstanceStatus::Starting => BoxRole::Warning,
+        InstanceStatus::Stopped | InstanceStatus::Error => BoxRole::Danger,
+        InstanceStatus::Unknown => BoxRole::Muted,
+    }
+}
+
 fn draw_empty(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let body = match &state.conn {
         ConnState::Connected { .. } => {
@@ -217,45 +224,28 @@ fn draw_empty(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         }
         _ => "waiting for daemon…",
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Instances ")
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
+    let inner = panel::bento(f, area, Some("Instances"), BoxRole::Neutral, false, theme);
     let p = Paragraph::new(Line::from(Span::styled(
         body,
         Style::default().fg(theme.muted),
-    )))
-    .block(block);
-    f.render_widget(p, area);
+    )));
+    f.render_widget(p, inner);
 }
 
 fn draw_card(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, selected: bool) {
-    let (status_color, status_text) = status_meta(inst.status, theme);
+    let (_, status_text) = status_meta(inst.status, theme);
     let name = trunc(&inst.container_name, 24);
-    let title = format!(" {name} · {status_text} ");
+    let title = format!("{name} · {status_text}");
 
-    let border_style = if selected {
-        Style::default()
-            .fg(theme.accent)
-            .add_modifier(Modifier::BOLD)
+    // Selected card reads as the primary/actionable surface; others take a
+    // status-driven role so the grid varies by health.
+    let role = if selected {
+        BoxRole::Primary
     } else {
-        theme.border_style()
+        status_role(inst.status)
     };
-    let mut title_style = Style::default()
-        .fg(status_color)
-        .add_modifier(Modifier::BOLD);
-    if selected {
-        title_style = title_style.add_modifier(Modifier::BOLD);
-    }
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(border_style)
-        .title_style(title_style);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::bento(f, area, Some(&title), role, false, theme);
     if inner.height == 0 || inner.width == 0 {
         return;
     }
@@ -585,13 +575,14 @@ fn render_body(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme) {
         .split(area);
 
     // launch_args (left)
-    let args_block = Block::default()
-        .borders(Borders::ALL)
-        .title(" launch_args ")
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
-    let args_inner = args_block.inner(chunks[0]);
-    f.render_widget(args_block, chunks[0]);
+    let args_inner = panel::bento(
+        f,
+        chunks[0],
+        Some("launch_args"),
+        BoxRole::Secondary,
+        false,
+        theme,
+    );
 
     let args_lines: Vec<Line> = if inst.launch_args.is_empty() {
         vec![Line::from(Span::styled(
@@ -610,13 +601,14 @@ fn render_body(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme) {
     );
 
     // env_vars (right). BTreeMap iterates sorted by key.
-    let env_block = Block::default()
-        .borders(Borders::ALL)
-        .title(" env_vars ")
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
-    let env_inner = env_block.inner(chunks[1]);
-    f.render_widget(env_block, chunks[1]);
+    let env_inner = panel::bento(
+        f,
+        chunks[1],
+        Some("env_vars"),
+        BoxRole::Primary,
+        false,
+        theme,
+    );
 
     let env_lines: Vec<Line> = if inst.env_vars.is_empty() {
         vec![Line::from(Span::styled(
@@ -770,6 +762,7 @@ mod tests {
             palette_sel: 0,
             options_tab: 0,
             action_sel: 0,
+            action_focus: crate::app::ActionFocus::List,
             instance_sel: sel,
             bench_sel: 0,
             gpu_sel: 0,
@@ -794,6 +787,7 @@ mod tests {
             replay: None,
             last_body_area: None,
             last_tab_bar_area: None,
+            last_footer_chips: Vec::new(),
             jobs: rocm_dash_core::state::State::default(),
             services: None,
             serve_wizard: None,

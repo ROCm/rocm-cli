@@ -10,7 +10,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use rocm_dash_core::metrics::InstanceStatus;
 use rocm_dash_core::state::JobStatus;
@@ -18,6 +18,7 @@ use rocm_dash_core::state::JobStatus;
 use crate::app::{ActiveTab, AppState};
 use crate::ui::format;
 use crate::ui::gradient::GradientGauge;
+use crate::ui::panel::{self, BoxRole};
 use crate::ui::sparkline::BrailleSparkline;
 use crate::ui::theme::Theme;
 
@@ -63,13 +64,8 @@ pub fn draw_right_dock(f: &mut Frame, area: Rect, state: &AppState, theme: &Them
 /// telemetry (port of the mock `gpu_wall`, read-only).
 pub fn gpu_wall(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let gpus = state.latest.as_ref().map_or(&[][..], |s| s.gpus.as_slice());
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" GPUs · {} ", gpus.len()))
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let title = format!("GPUs · {}", gpus.len());
+    let inner = panel::bento(f, area, Some(&title), BoxRole::Secondary, false, theme);
     if inner.height == 0 {
         return;
     }
@@ -130,13 +126,7 @@ pub fn gpu_wall(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 /// Live LOGS dock: the most recent job-console lines across `AppState.jobs`
 /// (reuses the existing job output ring — no new data source).
 pub fn logs_dock(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" LOGS ")
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::bento(f, area, Some("LOGS"), BoxRole::Muted, false, theme);
     if inner.height == 0 {
         return;
     }
@@ -170,13 +160,7 @@ pub fn logs_dock(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 /// instances / snapshot / jobs (read-only). This is the agent-grounding pane —
 /// not a composer.
 pub fn context_rail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" CONTEXT ")
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::bento(f, area, Some("CONTEXT"), BoxRole::Primary, false, theme);
     if inner.height == 0 {
         return;
     }

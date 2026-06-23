@@ -15,7 +15,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo, Snapshot};
 
@@ -23,6 +23,7 @@ use crate::app::AppState;
 use crate::ui::core_bars::CoreBars;
 use crate::ui::format;
 use crate::ui::gradient::GradientGauge;
+use crate::ui::panel::{self, BoxRole};
 use crate::ui::sparkline::BrailleSparkline;
 use crate::ui::theme::Theme;
 use crate::ui::widgets::{
@@ -40,18 +41,12 @@ const FULL_PANEL_MIN_H: u16 = 6;
 
 pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let Some(snap) = state.latest.as_ref() else {
+        let inner = panel::bento(f, area, Some("Hardware"), BoxRole::Neutral, false, theme);
         let p = Paragraph::new(Line::from(Span::styled(
             "waiting for first snapshot…",
             Style::default().fg(theme.muted),
-        )))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Hardware ")
-                .border_style(theme.border_style())
-                .title_style(theme.title_style()),
-        );
-        f.render_widget(p, area);
+        )));
+        f.render_widget(p, inner);
         return;
     };
 
@@ -80,20 +75,23 @@ fn draw_io_row(f: &mut Frame, area: Rect, snap: &Snapshot, theme: &Theme) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
+    // Distinct roles so the two side-by-side boxes never read as one block.
     draw_rate_block(
         f,
         cols[0],
-        " Disk ",
+        "Disk",
         ("read", snap.host.disk_read_bps),
         ("write", snap.host.disk_write_bps),
+        BoxRole::Primary,
         theme,
     );
     draw_rate_block(
         f,
         cols[1],
-        " Net ",
+        "Net",
         ("rx", snap.host.net_rx_bps),
         ("tx", snap.host.net_tx_bps),
+        BoxRole::Secondary,
         theme,
     );
 }
@@ -105,15 +103,10 @@ fn draw_rate_block(
     title: &str,
     a: (&str, u64),
     b: (&str, u64),
+    role: BoxRole,
     theme: &Theme,
 ) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title.to_string())
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::bento(f, area, Some(title), role, false, theme);
     if inner.height == 0 {
         return;
     }
@@ -129,17 +122,11 @@ fn draw_rate_block(
 fn draw_cpu(f: &mut Frame, area: Rect, state: &AppState, snap: &Snapshot, theme: &Theme) {
     let n_cores = snap.host.cpu_per_core_pct.len();
     let title = format!(
-        " CPU · {} · {} cores ",
+        "CPU · {} · {} cores",
         format::pct(snap.host.cpu_overall_pct),
         n_cores
     );
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::bento(f, area, Some(&title), BoxRole::Secondary, false, theme);
     if inner.height == 0 {
         return;
     }
@@ -184,20 +171,23 @@ fn draw_memory_row(f: &mut Frame, area: Rect, snap: &Snapshot, theme: &Theme) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
+    // Distinct roles so the two side-by-side gauges never read as one block.
     draw_gauge_block(
         f,
         cols[0],
-        " Memory ",
+        "Memory",
         snap.host.memory_used_mb,
         snap.host.memory_total_mb,
+        BoxRole::Success,
         theme,
     );
     draw_gauge_block(
         f,
         cols[1],
-        " Swap ",
+        "Swap",
         snap.host.swap_used_mb,
         snap.host.swap_total_mb,
+        BoxRole::Secondary,
         theme,
     );
 }
@@ -208,25 +198,20 @@ fn draw_gauge_block(
     label: &str,
     used_mb: u64,
     total_mb: u64,
+    role: BoxRole,
     theme: &Theme,
 ) {
     let (ratio, title) = if total_mb > 0 {
         let r = (used_mb as f64 / total_mb as f64).clamp(0.0, 1.0);
         (
             r,
-            format!("{label}· {} ", format::mib_pair(used_mb, total_mb)),
+            format!("{label} · {}", format::mib_pair(used_mb, total_mb)),
         )
     } else {
         // No total reported: render flat gauge with just the used value.
-        (0.0, format!("{label}· {} ", format::mib(used_mb)))
+        (0.0, format!("{label} · {}", format::mib(used_mb)))
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::bento(f, area, Some(&title), role, false, theme);
     if inner.height == 0 {
         return;
     }
@@ -241,25 +226,27 @@ fn draw_gauge_block(
 
 fn draw_gpus(f: &mut Frame, area: Rect, state: &AppState, snap: &Snapshot, theme: &Theme) {
     if snap.gpus.is_empty() {
-        let lines: Vec<Line> = if snap.warnings.is_empty() {
-            vec![Line::from(Span::styled(
-                "no GPUs reported",
-                Style::default().fg(theme.muted),
-            ))]
+        // Caution-yellow only when there is an actual warning to show; the benign
+        // "no GPUs reported" state is neutral chrome, not an alert.
+        let (lines, role): (Vec<Line>, BoxRole) = if snap.warnings.is_empty() {
+            (
+                vec![Line::from(Span::styled(
+                    "no GPUs reported",
+                    Style::default().fg(theme.muted),
+                ))],
+                BoxRole::Neutral,
+            )
         } else {
-            snap.warnings
-                .iter()
-                .map(|w| Line::from(Span::styled(w.clone(), Style::default().fg(theme.warn))))
-                .collect()
+            (
+                snap.warnings
+                    .iter()
+                    .map(|w| Line::from(Span::styled(w.clone(), Style::default().fg(theme.warn))))
+                    .collect(),
+                BoxRole::Warning,
+            )
         };
-        let p = Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" GPUs ")
-                .border_style(theme.border_style())
-                .title_style(theme.title_style()),
-        );
-        f.render_widget(p, area);
+        let inner = panel::bento(f, area, Some("GPUs"), role, false, theme);
+        f.render_widget(Paragraph::new(lines), inner);
         return;
     }
 
@@ -462,27 +449,15 @@ fn draw_gpus_full(
             continue;
         }
         let selected = i == sel;
-        let border_style = if selected {
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD)
+        // Selected GPU reads as the actionable focus (Primary); others are
+        // telemetry panels (Secondary) so adjacent panels differ.
+        let role = if selected {
+            BoxRole::Primary
         } else {
-            theme.border_style()
+            BoxRole::Secondary
         };
-        let title_style = if selected {
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            theme.title_style()
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" GPU {} ", g.device_id))
-            .border_style(border_style)
-            .title_style(title_style);
-        let inner = block.inner(slot);
-        f.render_widget(block, slot);
+        let title = format!("GPU {}", g.device_id);
+        let inner = panel::bento(f, slot, Some(&title), role, false, theme);
         if inner.height == 0 {
             continue;
         }
@@ -1169,7 +1144,7 @@ mod tests {
         snap.gpu_system_info = Some(sysinfo_partitioned());
         snap.instances = vec![mk_instance("llama-70b", &["3"], Some(120.0))];
         let s = state_with_snapshot(snap);
-        let out = render_to_string(&s, 110, 44); // tall → full panels w/ serving
+        let out = render_to_string(&s, 110, 48); // tall → full panels w/ serving
         assert!(
             out.contains("serving:"),
             "no serving line rendered: {out:?}"

@@ -12,9 +12,10 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::app::{AppState, ChatConsent, ChatRole};
+use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
 
 /// Block glyph used to mark the text-entry caret while focused.
@@ -119,15 +120,9 @@ fn draw_consent(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         (title, lines)
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
-    let p = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
-    f.render_widget(p, area);
+    let inner = panel::bento(f, area, Some(title), BoxRole::Neutral, false, theme);
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(p, inner);
 }
 
 /// The base consent-gate content for the current consent state (without the
@@ -224,11 +219,7 @@ fn consent_gate_lines<'a>(
 
 /// Render the scrolling transcript. Empty state shows an actionable hint.
 fn draw_transcript(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Chat ")
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
+    let inner = panel::bento(f, area, Some("Chat"), BoxRole::Secondary, false, theme);
 
     let lines = if state.chat.is_empty() {
         vec![
@@ -247,10 +238,9 @@ fn draw_transcript(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     };
 
     let p = Paragraph::new(lines)
-        .block(block)
         .wrap(Wrap { trim: false })
         .scroll((state.chat_scroll, 0));
-    f.render_widget(p, area);
+    f.render_widget(p, inner);
 }
 
 /// Pure transcript → styled lines mapping. Each turn becomes a role-prefixed,
@@ -286,29 +276,29 @@ fn draw_input(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // While a request is in flight, show a spinner and suppress the caret —
     // input is disabled until the reply or error turn lands.
     if state.chat_sending {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Message (sending…) ")
-            .border_style(Style::default().fg(theme.warn))
-            .title_style(Style::default().fg(theme.warn));
+        let inner = panel::bento(
+            f,
+            area,
+            Some("Message (sending…)"),
+            BoxRole::Warning,
+            false,
+            theme,
+        );
         let line = Line::from(Span::styled(
             "⠿ waiting for the agent…",
             Style::default().fg(theme.muted),
         ));
-        f.render_widget(Paragraph::new(line).block(block), area);
+        f.render_widget(Paragraph::new(line), inner);
         return;
     }
 
-    let (title, border_color) = if state.chat_focused {
-        (" Message (insert) ", theme.accent)
+    // Focused input is the primary actionable surface; idle reads muted.
+    let (title, role) = if state.chat_focused {
+        ("Message (insert)", BoxRole::Primary)
     } else {
-        (" Message ", theme.muted)
+        ("Message", BoxRole::Muted)
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(Style::default().fg(border_color))
-        .title_style(Style::default().fg(border_color));
+    let inner = panel::bento(f, area, Some(title), role, false, theme);
 
     let line = if state.chat_focused {
         Line::from(vec![
@@ -327,7 +317,7 @@ fn draw_input(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         ))
     };
 
-    f.render_widget(Paragraph::new(line).block(block), area);
+    f.render_widget(Paragraph::new(line), inner);
 }
 
 #[cfg(test)]

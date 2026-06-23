@@ -9,12 +9,13 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use crate::app::{AppState, ConnState};
 use crate::ui::core_bars::CoreBars;
 use crate::ui::format;
 use crate::ui::gradient::GradientGauge;
+use crate::ui::panel::{self, BoxRole};
 use crate::ui::sparkline::BrailleSparkline;
 use crate::ui::theme::Theme;
 use crate::ui::widgets::{gpu_stats_line, trunc};
@@ -61,19 +62,13 @@ fn draw_cpu(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .map_or(0, |s| s.host.cpu_per_core_pct.len());
     let title = match state.latest.as_ref() {
         Some(s) => format!(
-            " CPU · {} · {} cores ",
+            "CPU · {} · {} cores",
             format::pct(s.host.cpu_overall_pct),
             n_cores
         ),
-        None => " CPU ".to_string(),
+        None => "CPU".to_string(),
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::bento(f, area, Some(&title), BoxRole::Primary, false, theme);
     if inner.height == 0 {
         return;
     }
@@ -122,14 +117,8 @@ fn draw_memory(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         }
         None => (0, 1, 0.0),
     };
-    let title = format!(" Memory · {} ", format::mib_pair(used, total));
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let title = format!("Memory · {}", format::mib_pair(used, total));
+    let inner = panel::bento(f, area, Some(&title), BoxRole::Success, false, theme);
 
     let label = format::pct((ratio * 100.0) as f32);
     let gauge = GradientGauge::new(ratio)
@@ -165,14 +154,8 @@ fn draw_host(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             Style::default().fg(theme.muted),
         ))],
     };
-    let p = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Host ")
-            .border_style(theme.border_style())
-            .title_style(theme.title_style()),
-    );
-    f.render_widget(p, area);
+    let inner = panel::bento(f, area, Some("Host"), BoxRole::Muted, false, theme);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_gpu(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -182,20 +165,14 @@ fn draw_gpu(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .and_then(|s| s.gpu_system_info.as_ref())
     {
         Some(si) => format!(
-            " GPU · {} × {} · ROCm {} ",
+            "GPU · {} × {} · ROCm {}",
             si.physical_gpu_count,
             si.gpu_model,
             si.rocm_version.as_deref().unwrap_or("?")
         ),
-        None => " GPU ".to_string(),
+        None => "GPU".to_string(),
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::bento(f, area, Some(&title), BoxRole::Secondary, false, theme);
     if inner.height == 0 {
         return;
     }
@@ -271,14 +248,8 @@ fn draw_gpu(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
 fn draw_instances(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let count = state.instances.len();
-    let title = format!(" Instances · {count} ");
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let title = format!("Instances · {count}");
+    let inner = panel::bento(f, area, Some(&title), BoxRole::Primary, false, theme);
 
     if state.instances.is_empty() {
         let body = match &state.conn {
@@ -343,14 +314,9 @@ fn draw_instances(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
 fn draw_bench(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let count = state.bench_rows.len();
-    let title = format!(" Bench rows · {count} ");
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let title = format!("Bench rows · {count}");
+    // Neutral telemetry — not an alert; keep it from reading caution-yellow.
+    let inner = panel::bento(f, area, Some(&title), BoxRole::Muted, false, theme);
 
     if state.bench_rows.is_empty() {
         let p = Paragraph::new(Line::from(Span::styled(
