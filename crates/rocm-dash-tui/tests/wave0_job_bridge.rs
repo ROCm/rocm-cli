@@ -158,7 +158,7 @@ fn job_console_snapshot_renders_status_and_output() {
         });
     }
     let job = state.job("serve").unwrap();
-    let out = render(140, 32, |f| draw_job_console(f, f.area(), job, 0, &theme));
+    let out = render(140, 32, |f| draw_job_console(f, f.area(), job, (0, 0), &theme));
 
     assert!(out.contains("rocm serve llama3"), "title shows the command");
     assert!(out.contains("status"), "status badge present");

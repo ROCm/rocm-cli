@@ -38,7 +38,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::app::{ActiveTab, AppState, ConnState, FooterChip, KeyAction, Modal};
 use crate::ui::theme::Theme;
@@ -72,10 +72,19 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     let active_idx = tabs::active_index(state.active_tab);
     let labels = tabs::tab_labels();
     let area = f.area();
+    // The right dock only hosts a scrollable LOGS stream on the operational tabs;
+    // record its rect for wheel hit-testing (cleared otherwise).
+    let mut dock_logs_rect: Option<Rect> = None;
     let (panel_outer, chip_origin_x) = if dock::is_wide(area.width, area.height) {
         if let Some((left, center_outer, right)) = wide_triptych(body) {
             dock::gpu_wall(f, left, state, &theme);
             dock::draw_right_dock(f, right, state, &theme);
+            if matches!(
+                state.active_tab,
+                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
+            ) {
+                dock_logs_rect = Some(right);
+            }
             (center_outer, center_outer.x + 2)
         } else {
             (body, body.x + 2)
@@ -83,6 +92,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     } else {
         (body, body.x + 2)
     };
+    state.last_dock_area = dock_logs_rect;
     let center_inner = tabs::draw_tab_panel(f, panel_outer, &labels, active_idx, &theme);
 
     // Tab hit-testing: the clickable folder row is the panel's label row, with
@@ -125,21 +135,25 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         Modal::GlobalHelp => modal::draw_global_help(f, body, &theme),
     }
 
-    // Operational managers (Phase 3 de-modal): the active one renders INLINE in
-    // the ROCm/Serving Details pane; when opened from a non-domain tab (Observe
-    // hotkeys / Chat slash commands) it falls back to a centered overlay. Only
-    // one is open at a time (mutually exclusive via `close_overlays`).
-    let manager_rect = if matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving) {
-        tabs::pane::detail_rect(center_inner)
-    } else {
-        modal::centered_rect(82, 80, 130, 34, body)
-    };
+    // Operational managers render as a centered MODAL on every tab. The
+    // ROCm/Serving Details bento keeps its summary + Start affordance; activating
+    // Start opens the manager here, on top of the body, consistent regardless of
+    // which tab is active (an inline manager became an orphaned floating box when
+    // you switched tabs). Only one is open at a time (mutually exclusive via
+    // `close_overlays`).
+    // Dim the whole frame behind an open manager so the modal reads as the
+    // foreground (and the body underneath is visibly inert).
+    if state.has_open_overlay() {
+        modal::grey_overlay(f);
+    }
+    let manager_rect = modal::centered_rect(82, 80, 130, 34, body);
     draw_active_manager(f, manager_rect, state, &theme);
 
     // Approval modal (Phase 4): drawn LAST so it sits on top of every overlay
     // and owns the screen while a mutating-tool approval is pending. This is the
-    // sole approval renderer (the single gating path).
+    // sole approval renderer (the single gating path). It dims the backdrop too.
     if let Some(pa) = &state.approval {
+        modal::grey_overlay(f);
         approval::draw_approval(f, body, &pa.req, pa.choice, &theme);
     }
 }
@@ -149,6 +163,29 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
 /// `rect` is the ROCm/Serving Details pane when inline, or a centered overlay
 /// rect when a manager was opened from a non-domain tab. No-op when none open.
 fn draw_active_manager(f: &mut Frame, rect: Rect, state: &AppState, theme: &Theme) {
+    if !state.has_open_overlay() {
+        return;
+    }
+    // Opaque modal card: clear whatever is behind, then back the whole card with
+    // the theme bg. Without the `Clear`, the box only recolors the cells it
+    // covers and body glyphs bleed through the gaps; the bg fill also makes the
+    // ring around the (slightly inset) job console solid rather than see-through.
+    f.render_widget(Clear, rect);
+    f.render_widget(Block::default().style(Style::default().bg(theme.bg)), rect);
+
+    // Console sub-view: whichever manager is streaming a job shows the shared
+    // job console here, panned by the single `console_scroll`/`console_hscroll`
+    // source. Centralized so the 13 managers don't each duplicate the branch.
+    if let Some(job) = state.active_job_id().and_then(|id| state.jobs.job(id)) {
+        job_console::draw_job_console(
+            f,
+            rect,
+            job,
+            (state.console_scroll, state.console_hscroll),
+            theme,
+        );
+        return;
+    }
     if let Some(sm) = &state.services {
         services_manager::draw_services_manager(f, rect, sm, &state.instances, &state.jobs, theme);
     } else if let Some(w) = &state.serve_wizard {

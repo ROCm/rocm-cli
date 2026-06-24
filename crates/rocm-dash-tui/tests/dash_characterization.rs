@@ -288,12 +288,12 @@ fn control_legend_is_on_the_bottom_row_not_the_top() {
     );
 }
 
-/// Phase 3 de-modal contract: when a manager is open on a ROCm/Serving tab it
-/// renders INLINE in the Details pane — the manager's bento title is painted AND
-/// the left Actions list survives (proving a two-column inline layout, not a
-/// full-screen-centered overlay). One assertion per manager (all 12).
+/// Modal contract: when a manager is open it renders as a centered modal over
+/// the body (on every tab) — the manager's bento title is painted. One assertion
+/// per manager (all 12). The Details bento + Start affordance stay underneath; an
+/// inline-in-pane render was the old behavior (orphaned on tab switch).
 #[test]
-fn managers_render_inline_in_the_details_pane() {
+fn managers_render_as_centered_modal() {
     use rocm_dash_tui::app::PaneFocus;
 
     use rocm_dash_tui::ui::{
@@ -305,99 +305,81 @@ fn managers_render_inline_in_the_details_pane() {
         services_manager::ServicesManagerState, update_manager::UpdateManagerState,
     };
 
-    // (tab, open-closure, manager-title-needle, actions-list-needle)
+    // (tab, open-closure, manager-title-needle)
     type Open = fn(&mut AppState);
-    let cases: &[(ActiveTab, Open, &str, &str)] = &[
+    let cases: &[(ActiveTab, Open, &str)] = &[
         // Serving-group managers (opened on the Serving tab).
         (
             ActiveTab::Serving,
             |s| s.engine_manager = Some(EngineManagerState::default()),
             "serving backends",
-            "Serving actions",
         ),
         (
             ActiveTab::Serving,
             |s| s.services = Some(ServicesManagerState::default()),
             "managed inference servers",
-            "Serving actions",
         ),
         (
             ActiveTab::Serving,
             |s| s.logs_view = Some(LogsViewState::default()),
             "recent ROCm CLI activity",
-            "Serving actions",
         ),
         (
             ActiveTab::Serving,
             |s| s.config_manager = Some(ConfigManagerState::default()),
             "Config & providers",
-            "Serving actions",
         ),
-        // serve_wizard opened on ROCm so its "Serve a model" title can't be
-        // confused with the Serving Actions list row of the same name.
         (
             ActiveTab::Rocm,
             |s| s.serve_wizard = Some(ServeWizardState::default()),
             "Serve a model",
-            "ROCm actions",
         ),
         // ROCm-group managers (opened on the ROCm tab).
         (
             ActiveTab::Rocm,
             |s| s.install_manager = Some(InstallManagerState::default()),
             "ROCm SDK",
-            "ROCm actions",
         ),
         (
             ActiveTab::Rocm,
             |s| s.update_manager = Some(UpdateManagerState::default()),
             "ROCm packages",
-            "ROCm actions",
         ),
         (
             ActiveTab::Rocm,
             |s| s.doctor_manager = Some(DoctorManagerState::default()),
             "environment check",
-            "ROCm actions",
         ),
         (
             ActiveTab::Rocm,
             |s| s.runtime_manager = Some(RuntimeManagerState::default()),
             "ROCm installs",
-            "ROCm actions",
         ),
         (
             ActiveTab::Rocm,
             |s| s.command_screen = Some(CommandScreenState::default()),
             "Run a command",
-            "ROCm actions",
         ),
         (
             ActiveTab::Rocm,
             |s| s.onboarding = Some(OnboardingState::default()),
             "first-run setup",
-            "ROCm actions",
         ),
         (
             ActiveTab::Rocm,
             |s| s.automations_manager = Some(AutomationsManagerState::default()),
             "background checks",
-            "ROCm actions",
         ),
     ];
 
-    for (tab, open, manager_needle, actions_needle) in cases {
+    for (tab, open, manager_needle) in cases {
         let mut s = state_on(*tab);
         s.pane_focus = PaneFocus::Detail;
         open(&mut s);
         let out = render(&mut s, 160, 44);
         assert!(
             out.contains(manager_needle),
-            "manager {manager_needle:?} did not render inline: {out:?}"
-        );
-        assert!(
-            out.contains(actions_needle),
-            "Actions list {actions_needle:?} was covered (not inline): {out:?}"
+            "manager {manager_needle:?} did not render as a modal: {out:?}"
         );
     }
 }
@@ -515,18 +497,15 @@ fn demo_buffer_dump_all_tabs_inline_details_and_heroes() {
         println!("DEMO_DUMP {tab:?}: ok (found {needle:?})");
     }
 
-    // 2) inline Details: a manager renders in-pane on ROCm and Serving.
+    // 2) modal managers: opening a manager renders it as a centered modal on
+    //    ROCm and Serving (Start in the Details bento opens it on top of body).
     let mut r = demo_state();
     r.active_tab = ActiveTab::Rocm;
     r.pane_focus = PaneFocus::Detail;
     r.install_manager = Some(rocm_dash_tui::ui::install_manager::InstallManagerState::default());
     let rout = render(&mut r, 180, 50);
-    assert!(rout.contains("ROCm SDK"), "ROCm inline Details missing");
-    assert!(
-        rout.contains("ROCm actions"),
-        "ROCm Actions list missing alongside"
-    );
-    println!("DEMO_DUMP Rocm inline Details: install_manager in-pane ✓");
+    assert!(rout.contains("ROCm SDK"), "ROCm manager modal missing");
+    println!("DEMO_DUMP Rocm manager modal: install_manager ✓");
 
     let mut sv = demo_state();
     sv.active_tab = ActiveTab::Serving;
@@ -535,9 +514,9 @@ fn demo_buffer_dump_all_tabs_inline_details_and_heroes() {
     let svout = render(&mut sv, 180, 50);
     assert!(
         svout.contains("Serve a model"),
-        "Serving inline Details missing"
+        "Serving manager modal missing"
     );
-    println!("DEMO_DUMP Serving inline Details: serve_wizard in-pane ✓");
+    println!("DEMO_DUMP Serving manager modal: serve_wizard ✓");
 
     // 3) Observe heroes show tok/watt + live TTFT/TPOT, honest `—` for the cold
     //    instance.

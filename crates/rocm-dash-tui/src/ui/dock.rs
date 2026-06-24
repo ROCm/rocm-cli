@@ -128,20 +128,27 @@ pub fn gpu_wall(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 /// Live LOGS dock: the most recent job-console lines across `AppState.jobs`
 /// (reuses the existing job output ring — no new data source).
 pub fn logs_dock(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let inner = panel::bento(f, area, Some("LOGS"), BoxRole::Muted, false, theme);
+    let title = if state.dock_logs_scroll > 0 {
+        format!("LOGS · ↑{}", state.dock_logs_scroll)
+    } else {
+        "LOGS".to_string()
+    };
+    let inner = panel::bento(f, area, Some(&title), BoxRole::Muted, false, theme);
     if inner.height == 0 {
         return;
     }
-    // Newest lines from any active/recent job.
+    // Full chronological buffer across jobs (jobs sorted by id for a stable
+    // order so the scroll offset is deterministic frame-to-frame).
+    let mut jobs: Vec<_> = state.jobs.jobs.iter().collect();
+    jobs.sort_by(|a, b| a.0.cmp(b.0));
     let mut lines: Vec<Line> = Vec::new();
-    let cap = inner.height as usize;
-    for job in state.jobs.jobs.values() {
+    for (_, job) in jobs {
         let color = match job.status {
             JobStatus::Failed { .. } => theme.err,
             JobStatus::Done { .. } => theme.ok,
             _ => theme.fg,
         };
-        for l in job.output.iter().rev().take(cap) {
+        for l in &job.output {
             lines.push(Line::from(Span::styled(
                 l.clone(),
                 Style::default().fg(color),
@@ -149,13 +156,26 @@ pub fn logs_dock(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         }
     }
     if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "no job output yet — start an action to stream logs",
-            Style::default().fg(theme.muted),
-        )));
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "no job output yet — start an action to stream logs",
+                Style::default().fg(theme.muted),
+            ))),
+            inner,
+        );
+        return;
     }
-    lines.truncate(cap);
-    f.render_widget(Paragraph::new(lines), inner);
+
+    // Window the buffer to the dock height, anchored to the tail. `dock_logs_scroll`
+    // counts lines UP from the newest; clamp it so we never scroll past the top.
+    let cap = inner.height as usize;
+    let total = lines.len();
+    let max_scroll = total.saturating_sub(cap);
+    let scroll = (state.dock_logs_scroll as usize).min(max_scroll);
+    let end = total - scroll;
+    let start = end.saturating_sub(cap);
+    let window: Vec<Line> = lines[start..end].to_vec();
+    f.render_widget(Paragraph::new(window), inner);
 }
 
 /// CONTEXT rail: RUNNING SERVICES / GPU STATE / RECENT TOOLS read from
@@ -300,6 +320,41 @@ mod tests {
         // The dock must never be a chat composer.
         assert!(!out.contains("Message"), "composer leaked into dock");
         assert!(!out.contains("press i to type"), "composer prompt in dock");
+    }
+
+    #[test]
+    fn logs_dock_scroll_windows_the_buffer() {
+        use rocm_dash_core::state::StateEvent;
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.jobs.apply(StateEvent::StartJob {
+            id: "logs".into(),
+            cmd: "rocm".into(),
+            args: vec!["logs".into()],
+        });
+        for i in 0..30 {
+            s.jobs.apply(StateEvent::JobLine {
+                id: "logs".into(),
+                line: format!("LINE{i:02}"),
+            });
+        }
+        let theme = s.theme;
+        let render = |st: &AppState| {
+            let backend = TestBackend::new(DOCK_W, 12);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| logs_dock(f, f.area(), st, &theme)).unwrap();
+            flat(&term)
+        };
+        // Pinned to the tail: the newest line shows, an early line does not.
+        let tail = render(&s);
+        assert!(tail.contains("LINE29"), "tail shows newest: {tail:?}");
+        assert!(!tail.contains("LINE00"), "tail hides oldest");
+        // Scrolled all the way up: the oldest line comes into view, newest off.
+        s.last_dock_area = Some(Rect::new(0, 0, DOCK_W, 12));
+        s.scroll_dock(100);
+        let up = render(&s);
+        assert!(up.contains("LINE00"), "scroll-up reveals oldest: {up:?}");
+        assert!(!up.contains("LINE29"), "newest scrolled off");
+        assert!(up.contains('↑'), "title shows the scroll offset");
     }
 
     #[test]

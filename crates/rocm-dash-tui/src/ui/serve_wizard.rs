@@ -31,7 +31,7 @@ use crate::ui::approval::{
 };
 use crate::ui::exec::{exe_label, resolve_exe};
 use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browser};
-use crate::ui::job_console::{ConsoleOutcome, draw_job_console, on_console_key};
+use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::model_picker::{ModelPicker, ModelRecipeSummary, PickerOutcome, draw_model_picker};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
@@ -402,18 +402,10 @@ pub fn draw_serve_wizard(
     f: &mut Frame,
     area: Rect,
     w: &ServeWizardState,
-    jobs: &State,
+    _jobs: &State,
     recipes: &[ModelRecipeSummary],
     theme: &Theme,
 ) {
-    // The job console takes over while a launch is in flight / finished.
-    if let Some(job_id) = &w.active_job
-        && let Some(job) = jobs.job(job_id)
-    {
-        draw_job_console(f, area, job, 0, theme);
-        return;
-    }
-
     let inner = panel::bento(
         f,
         area,

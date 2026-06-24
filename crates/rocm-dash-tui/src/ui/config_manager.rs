@@ -29,7 +29,7 @@ use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
 };
 use crate::ui::exec::{exe_label, resolve_exe};
-use crate::ui::job_console::{ConsoleOutcome, draw_job_console, on_console_key};
+use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
 
@@ -207,16 +207,9 @@ pub fn draw_config_manager(
     f: &mut Frame,
     area: Rect,
     c: &ConfigManagerState,
-    jobs: &State,
+    _jobs: &State,
     theme: &Theme,
 ) {
-    if let Some(job_id) = &c.active_job
-        && let Some(job) = jobs.job(job_id)
-    {
-        draw_job_console(f, area, job, 0, theme);
-        return;
-    }
-
     let inner = panel::bento(
         f,
         area,

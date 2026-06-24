@@ -18,7 +18,7 @@ use ratatui::widgets::Paragraph;
 use rocm_dash_core::state::{SideEffect, State, StateEvent};
 
 use crate::ui::exec::resolve_exe;
-use crate::ui::job_console::{ConsoleOutcome, draw_job_console, on_console_key};
+use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
 
@@ -93,14 +93,7 @@ fn run_logs(l: &mut LogsViewState, jobs: &mut State) -> Vec<SideEffect> {
 }
 
 /// Render the overlay (search box, or the job console once running).
-pub fn draw_logs_view(f: &mut Frame, area: Rect, l: &LogsViewState, jobs: &State, theme: &Theme) {
-    if let Some(job_id) = &l.active_job
-        && let Some(job) = jobs.job(job_id)
-    {
-        draw_job_console(f, area, job, 0, theme);
-        return;
-    }
-
+pub fn draw_logs_view(f: &mut Frame, area: Rect, l: &LogsViewState, _jobs: &State, theme: &Theme) {
     let inner = panel::bento(
         f,
         area,

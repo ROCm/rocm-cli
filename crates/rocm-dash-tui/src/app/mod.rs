@@ -433,6 +433,19 @@ pub struct AppState {
     pub theme_picker_sel: usize,
     /// Scroll offset (in lines) inside the Bench Detail modal. Reset on Open.
     pub bench_detail_scroll: u16,
+    /// Vertical scroll offset (first visible line) of the active job console.
+    /// Shared by whichever operational manager is showing its console; reset
+    /// when an overlay opens (`close_overlays`).
+    pub console_scroll: u16,
+    /// Horizontal scroll offset (columns) of the active job console — log lines
+    /// drawn wider than the console wrap off-screen, so the wheel/H-wheel pans.
+    pub console_hscroll: u16,
+    /// Scroll offset of the wide-layout right LOGS dock, counted in lines UP from
+    /// the newest line (0 = pinned to the tail). Clamped against the buffer.
+    pub dock_logs_scroll: u16,
+    /// Last drawn right-dock rect (wide layout, operational tabs). `None` when the
+    /// dock isn't showing logs. Mouse-wheel hit-tests resolve against it.
+    pub last_dock_area: Option<ratatui::layout::Rect>,
     /// Chat transcript (TUI-local; never travels over the daemon protocol).
     pub chat: Vec<ChatTurn>,
     /// Pending input buffer for the Chat tab.
@@ -578,6 +591,10 @@ impl AppState {
             theme,
             theme_picker_sel,
             bench_detail_scroll: 0,
+            console_scroll: 0,
+            console_hscroll: 0,
+            dock_logs_scroll: 0,
+            last_dock_area: None,
             chat: Vec::new(),
             chat_input: String::new(),
             chat_sending: false,
@@ -638,6 +655,73 @@ impl AppState {
         self.command_screen = None;
         self.config_manager = None;
         self.approval = None;
+        // A fresh overlay starts its console at the top.
+        self.console_scroll = 0;
+        self.console_hscroll = 0;
+    }
+
+    /// The job id of the manager that is currently showing its console (if any).
+    /// Only one manager is open at a time, so at most one matches; `None` when no
+    /// overlay is open or the open one is still on its form screen.
+    pub(crate) fn active_job_id(&self) -> Option<&str> {
+        self.services
+            .as_ref()
+            .and_then(|m| m.active_job.as_deref())
+            .or_else(|| self.serve_wizard.as_ref().and_then(|m| m.active_job.as_deref()))
+            .or_else(|| self.engine_manager.as_ref().and_then(|m| m.active_job.as_deref()))
+            .or_else(|| self.doctor_manager.as_ref().and_then(|m| m.active_job.as_deref()))
+            .or_else(|| self.update_manager.as_ref().and_then(|m| m.active_job.as_deref()))
+            .or_else(|| self.install_manager.as_ref().and_then(|m| m.active_job.as_deref()))
+            .or_else(|| self.logs_view.as_ref().and_then(|m| m.active_job.as_deref()))
+            .or_else(|| self.runtime_manager.as_ref().and_then(|m| m.active_job.as_deref()))
+            .or_else(|| self.onboarding.as_ref().and_then(|m| m.active_job.as_deref()))
+            .or_else(|| {
+                self.automations_manager
+                    .as_ref()
+                    .and_then(|m| m.active_job.as_deref())
+            })
+            .or_else(|| self.command_screen.as_ref().and_then(|m| m.active_job.as_deref()))
+            .or_else(|| self.config_manager.as_ref().and_then(|m| m.active_job.as_deref()))
+    }
+
+    /// Whether a job console is currently displayed (a manager is open AND on its
+    /// console sub-view). Gates scroll routing so wheel/PgUp-PgDn pan the log
+    /// instead of moving the obscured Actions list.
+    pub(crate) fn has_active_console(&self) -> bool {
+        self.active_job_id().is_some()
+    }
+
+    /// Pan the active job console. `dv`/`dh` are line/column deltas (negative =
+    /// up/left). Clamps at 0; the vertical offset is also clamped against the
+    /// active job's line count so it can't scroll past the end into blank space.
+    pub(crate) fn scroll_console(&mut self, dv: i16, dh: i16) {
+        let max_v = self
+            .active_job_id()
+            .and_then(|id| self.jobs.job(id))
+            .map_or(0, |j| j.output.len().saturating_sub(1));
+        let max_v = i32::try_from(max_v).unwrap_or(i32::MAX);
+        let v = (i32::from(self.console_scroll) + i32::from(dv)).clamp(0, max_v) as u16;
+        let h = (i32::from(self.console_hscroll) + i32::from(dh)).max(0) as u16;
+        self.console_scroll = v;
+        self.console_hscroll = h;
+    }
+
+    /// Total log lines the wide-layout LOGS dock aggregates across all jobs.
+    /// Single source for both the renderer's window and the scroll clamp.
+    pub(crate) fn dock_logs_total(&self) -> usize {
+        self.jobs.jobs.values().map(|j| j.output.len()).sum()
+    }
+
+    /// Scroll the wide-layout LOGS dock by `dv` lines (negative = toward newer).
+    /// Counted up from the tail and clamped against the buffer minus the dock's
+    /// visible height (derived from the last drawn dock rect).
+    pub(crate) fn scroll_dock(&mut self, dv: i16) {
+        let cap = self
+            .last_dock_area
+            .map_or(0, |r| r.height.saturating_sub(3) as usize);
+        let max = i32::try_from(self.dock_logs_total().saturating_sub(cap)).unwrap_or(i32::MAX);
+        self.dock_logs_scroll =
+            (i32::from(self.dock_logs_scroll) + i32::from(dv)).clamp(0, max) as u16;
     }
 
     /// Whether any operational manager overlay is open (approval excluded — it
@@ -1446,6 +1530,17 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         state.close_overlays();
                         state.pane_focus = PaneFocus::Actions;
                     }
+                    // While a manager is showing its job console, the navigation
+                    // keys pan the log (PgUp/PgDn = page, arrows = line). Routed
+                    // BEFORE the per-manager arms (which would ignore them); the
+                    // console action keys (Ctrl+C/q/Esc/Enter) are NOT scroll keys
+                    // so they still fall through to `on_console_key`.
+                    Some(Ok(CtEvent::Key(k)))
+                        if state.has_active_console() && console_scroll_delta(k.code).is_some() =>
+                    {
+                        let (dv, dh) = console_scroll_delta(k.code).unwrap_or((0, 0));
+                        state.scroll_console(dv, dh);
+                    }
                     // The services-manager overlay, when open, owns all keys
                     // (and may spawn lifecycle jobs through the job-bridge).
                     Some(Ok(CtEvent::Key(k))) if state.services.is_some() => {
@@ -2029,6 +2124,8 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
         // (the only scrollable detail) is no longer reachable, so modal scroll
         // is a no-op until/unless a scrollable Observe detail is wired.
         KeyAction::ScrollModal(_) => {}
+        KeyAction::ScrollConsole(dv, dh) => state.scroll_console(dv, dh),
+        KeyAction::ScrollDock(dv) => state.scroll_dock(dv),
         KeyAction::ReplayTogglePause => {
             if let Some(r) = state.replay.as_mut() {
                 r.paused = !r.paused;
@@ -2119,7 +2216,62 @@ fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
         }
         return KeyAction::Nothing;
     }
+
+    // Scroll wheel (incl. horizontal wheel where the device emits it). Per-notch
+    // deltas: ±1 line / ±1 col here, scaled per target below.
+    let (dv, dh): (i16, i16) = match me.kind {
+        MouseEventKind::ScrollDown => (1, 0),
+        MouseEventKind::ScrollUp => (-1, 0),
+        MouseEventKind::ScrollRight => (0, 1),
+        MouseEventKind::ScrollLeft => (0, -1),
+        // Not a scroll (e.g. moves / other buttons): nothing to route.
+        _ => return KeyAction::Nothing,
+    };
+
+    // An open manager owns the body. When it is showing its job console, the
+    // wheel pans that log (bigger vertical step, wider horizontal step so long
+    // command lines come into view). On a form screen there is nothing to pan —
+    // swallow it so the wheel can't move the obscured Actions list underneath.
+    if state.has_open_overlay() {
+        return if state.has_active_console() {
+            KeyAction::ScrollConsole(dv * 3, dh * 6)
+        } else {
+            KeyAction::Nothing
+        };
+    }
+
+    // Wide-layout right LOGS dock: the wheel pans the log stream when the pointer
+    // is over it (vertical only — it's a tail-anchored log).
+    if state.modal == Modal::None
+        && dv != 0
+        && let Some(dock) = state.last_dock_area
+        && point_in(dock, me.column, me.row)
+    {
+        return KeyAction::ScrollDock(dv * 3);
+    }
+
+    // No overlay: on a domain tab the wheel moves the Actions selection by ONE
+    // row — but only while the pointer is actually over the Actions column, so
+    // hovering the Details pane doesn't nudge the list. Anything else falls
+    // through to the modal/tab scroll routing.
+    if state.modal == Modal::None
+        && matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving)
+    {
+        if dv != 0
+            && let Some(body) = state.last_body_area
+            && point_in(crate::ui::tabs::pane::actions_rect(body), me.column, me.row)
+        {
+            return KeyAction::Move(dv as isize);
+        }
+        return KeyAction::Nothing;
+    }
+
     handle_mouse(me, &state.modal, state.active_tab)
+}
+
+/// Whether `(x, y)` lies inside `r` (end-exclusive on both axes).
+const fn point_in(r: ratatui::layout::Rect, x: u16, y: u16) -> bool {
+    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
 
 /// Resolve a pointer `(col, row)` against the recorded footer-legend chips.
@@ -2181,6 +2333,12 @@ pub enum KeyAction {
     ApplyThemePick,
     /// Vertical scroll inside the active modal body (positive = down).
     ScrollModal(i16),
+    /// Pan the active job console: `(vertical_lines, horizontal_cols)`, negative
+    /// = up/left. No-op when no console is showing.
+    ScrollConsole(i16, i16),
+    /// Scroll the wide-layout right LOGS dock by N lines (negative = toward the
+    /// newest line). No-op when the dock isn't showing.
+    ScrollDock(i16),
     /// Toggle replay pause / resume. No-op when not replaying.
     ReplayTogglePause,
     /// Step replay speed up or down (clamped). No-op when not replaying.
@@ -2487,20 +2645,35 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
 /// We only translate the parts of mouse handling that are tab-agnostic:
 /// the scroll wheel, and (in the event loop) the tab-bar click. Per-tab
 /// click is handled in tab modules.
+/// Map a navigation key to a job-console pan delta `(lines, cols)` while a
+/// console is showing. `None` for non-scroll keys so they fall through to the
+/// console's own action handler (Ctrl+C / q / Esc / Enter). A page is 10 lines.
+const fn console_scroll_delta(code: KeyCode) -> Option<(i16, i16)> {
+    match code {
+        KeyCode::PageDown => Some((10, 0)),
+        KeyCode::PageUp => Some((-10, 0)),
+        KeyCode::Down => Some((1, 0)),
+        KeyCode::Up => Some((-1, 0)),
+        KeyCode::Right => Some((0, 4)),
+        KeyCode::Left => Some((0, -4)),
+        _ => None,
+    }
+}
+
 pub fn handle_mouse(ev: MouseEvent, modal: &Modal, tab: ActiveTab) -> KeyAction {
+    // Domain-tab (ROCm/Serving) and overlay/console scroll is resolved in
+    // `resolve_mouse` (it needs `&AppState` for hit-testing and overlay state).
+    // This handles the remaining position-independent targets: the scrollable
+    // modal body and the Observe instances list. One row per wheel notch.
     let delta: i16 = match ev.kind {
-        MouseEventKind::ScrollDown => 3,
-        MouseEventKind::ScrollUp => -3,
+        MouseEventKind::ScrollDown => 1,
+        MouseEventKind::ScrollUp => -1,
         _ => return KeyAction::Nothing,
     };
     if *modal == Modal::Detail {
         KeyAction::ScrollModal(delta)
     } else if *modal == Modal::ThemePicker
-        || (*modal == Modal::None
-            && matches!(
-                tab,
-                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
-            ))
+        || (*modal == Modal::None && tab == ActiveTab::Observe)
     {
         KeyAction::Move(delta as isize)
     } else {
@@ -2742,6 +2915,152 @@ mod tests {
         // Manager open → the body click is swallowed (no click-through).
         s.install_manager = Some(crate::ui::install_manager::InstallManagerState::default());
         assert_eq!(resolve_mouse(click, &s), KeyAction::Nothing);
+    }
+
+    /// Build a ScrollDown/Up/Left/Right event at a pointer position.
+    fn wheel(kind: MouseEventKind, col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: col,
+            row: row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn wheel_over_actions_list_moves_selection_by_one() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Rocm;
+        s.last_body_area = Some(Rect::new(2, 4, 150, 30));
+        // Left column (Actions) is the first ~46% — a low column is over the list.
+        let over_list = wheel(MouseEventKind::ScrollDown, 10, 12);
+        assert_eq!(resolve_mouse(over_list, &s), KeyAction::Move(1));
+        let up = wheel(MouseEventKind::ScrollUp, 10, 12);
+        assert_eq!(resolve_mouse(up, &s), KeyAction::Move(-1));
+    }
+
+    #[test]
+    fn wheel_over_details_pane_does_not_move_the_list() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Serving;
+        s.last_body_area = Some(Rect::new(2, 4, 150, 30));
+        // A high column lands in the Details pane (right ~54%) → no list move.
+        let over_detail = wheel(MouseEventKind::ScrollDown, 140, 12);
+        assert_eq!(resolve_mouse(over_detail, &s), KeyAction::Nothing);
+    }
+
+    #[test]
+    fn wheel_over_open_console_pans_the_log_not_the_list() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Rocm;
+        s.last_body_area = Some(Rect::new(2, 4, 150, 30));
+        let mut lv = crate::ui::logs_view::LogsViewState::default();
+        lv.active_job = Some("logs".into());
+        s.logs_view = Some(lv);
+        // Console showing → vertical wheel pans the log (×3 lines), not the list.
+        assert_eq!(
+            resolve_mouse(wheel(MouseEventKind::ScrollDown, 10, 12), &s),
+            KeyAction::ScrollConsole(3, 0)
+        );
+        // Horizontal wheel pans columns (×6) for off-screen-wide log lines.
+        assert_eq!(
+            resolve_mouse(wheel(MouseEventKind::ScrollRight, 10, 12), &s),
+            KeyAction::ScrollConsole(0, 6)
+        );
+    }
+
+    #[test]
+    fn wheel_over_logs_dock_scrolls_the_dock() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Serving;
+        // A recorded dock rect off to the right of the body.
+        s.last_dock_area = Some(Rect::new(160, 4, 52, 30));
+        s.last_body_area = Some(Rect::new(2, 4, 150, 30));
+        let over_dock = wheel(MouseEventKind::ScrollDown, 180, 12);
+        assert_eq!(resolve_mouse(over_dock, &s), KeyAction::ScrollDock(3));
+        // A point outside the dock does not scroll it.
+        let over_body = wheel(MouseEventKind::ScrollDown, 10, 12);
+        assert_ne!(resolve_mouse(over_body, &s), KeyAction::ScrollDock(3));
+    }
+
+    #[test]
+    fn scroll_dock_clamps_against_buffer() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        // Dock 10 rows tall → ~7 visible lines after border/padding.
+        s.last_dock_area = Some(Rect::new(0, 0, 52, 10));
+        s.jobs.apply(rocm_dash_core::state::StateEvent::StartJob {
+            id: "logs".into(),
+            cmd: "rocm".into(),
+            args: vec!["logs".into()],
+        });
+        for i in 0..20 {
+            s.jobs.apply(rocm_dash_core::state::StateEvent::JobLine {
+                id: "logs".into(),
+                line: format!("line {i}"),
+            });
+        }
+        // 20 lines, ~7 visible → max scroll-up is bounded, never past the top.
+        s.scroll_dock(100);
+        assert!(s.dock_logs_scroll <= 13, "clamped: {}", s.dock_logs_scroll);
+        assert!(s.dock_logs_scroll > 0, "scrolled up some");
+        s.scroll_dock(-100);
+        assert_eq!(s.dock_logs_scroll, 0, "back to the tail");
+    }
+
+    #[test]
+    fn wheel_over_form_screen_overlay_is_swallowed() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Rocm;
+        s.last_body_area = Some(Rect::new(2, 4, 150, 30));
+        // Overlay open but on its form (no active_job) → nothing to pan, and the
+        // obscured Actions list must NOT move.
+        s.install_manager = Some(crate::ui::install_manager::InstallManagerState::default());
+        assert_eq!(
+            resolve_mouse(wheel(MouseEventKind::ScrollDown, 10, 12), &s),
+            KeyAction::Nothing
+        );
+    }
+
+    #[test]
+    fn scroll_console_clamps_and_tracks_output() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        // No console → clamps to 0 (max line count is 0).
+        s.scroll_console(5, 5);
+        assert_eq!(s.console_scroll, 0);
+        assert_eq!(s.console_hscroll, 5, "horizontal has no upper clamp");
+        // With a console of N lines, vertical clamps to N-1.
+        s.jobs.apply(rocm_dash_core::state::StateEvent::StartJob {
+            id: "logs".into(),
+            cmd: "rocm".into(),
+            args: vec!["logs".into()],
+        });
+        for i in 0..4 {
+            s.jobs.apply(rocm_dash_core::state::StateEvent::JobLine {
+                id: "logs".into(),
+                line: format!("line {i}"),
+            });
+        }
+        let mut lv = crate::ui::logs_view::LogsViewState::default();
+        lv.active_job = Some("logs".into());
+        s.logs_view = Some(lv);
+        s.console_scroll = 0;
+        s.scroll_console(100, 0);
+        assert_eq!(s.console_scroll, 3, "clamped to output.len()-1 (4 lines)");
+        s.scroll_console(-100, 0);
+        assert_eq!(s.console_scroll, 0);
+    }
+
+    #[test]
+    fn console_scroll_delta_maps_nav_keys_only() {
+        use crossterm::event::KeyCode;
+        assert_eq!(console_scroll_delta(KeyCode::PageDown), Some((10, 0)));
+        assert_eq!(console_scroll_delta(KeyCode::PageUp), Some((-10, 0)));
+        assert_eq!(console_scroll_delta(KeyCode::Down), Some((1, 0)));
+        assert_eq!(console_scroll_delta(KeyCode::Right), Some((0, 4)));
+        // Console action keys are NOT scroll keys (they reach on_console_key).
+        assert_eq!(console_scroll_delta(KeyCode::Esc), None);
+        assert_eq!(console_scroll_delta(KeyCode::Enter), None);
+        assert_eq!(console_scroll_delta(KeyCode::Char('q')), None);
     }
 
     #[test]
@@ -3143,20 +3462,25 @@ mod tests {
             handle_mouse(scroll_down, &Modal::None, ActiveTab::Home),
             KeyAction::Nothing
         );
-        // No modal, Observe → Move (drives the instances selection)
+        // No modal, Observe → Move by ONE (drives the instances selection)
         assert_eq!(
             handle_mouse(scroll_down, &Modal::None, ActiveTab::Observe),
-            KeyAction::Move(3)
+            KeyAction::Move(1)
         );
-        // Detail modal → ScrollModal
+        // Detail modal → ScrollModal by one line
         assert_eq!(
             handle_mouse(scroll_down, &Modal::Detail, ActiveTab::Observe),
-            KeyAction::ScrollModal(3)
+            KeyAction::ScrollModal(1)
         );
         // ThemePicker → Move (drives picker cursor)
         assert_eq!(
             handle_mouse(scroll_down, &Modal::ThemePicker, ActiveTab::Home),
-            KeyAction::Move(3)
+            KeyAction::Move(1)
+        );
+        // Domain-tab scroll is NOT routed here (resolve_mouse owns it) → Nothing.
+        assert_eq!(
+            handle_mouse(scroll_down, &Modal::None, ActiveTab::Rocm),
+            KeyAction::Nothing
         );
     }
 
