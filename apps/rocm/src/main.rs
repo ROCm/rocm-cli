@@ -284,7 +284,11 @@ enum Command {
         query: Vec<String>,
     },
     /// Start the background helper in the foreground.
-    Daemon,
+    Daemon {
+        /// Print the automation status panel instead of running the helper loop.
+        #[arg(long)]
+        status: bool,
+    },
     /// Launch the unified telemetry dashboard (TUI) with an embedded daemon.
     Dash {
         /// Replay a recorded session NDJSON instead of connecting to a live daemon.
@@ -1338,11 +1342,15 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Daemon) => {
-            let paths = AppPaths::discover()?;
-            let config = RocmCliConfig::load(&paths)?;
-            print!("{}", render_daemon_text(&paths, &config));
-            Ok(())
+        Some(Command::Daemon { status }) => {
+            if status {
+                let paths = AppPaths::discover()?;
+                let config = RocmCliConfig::load(&paths)?;
+                print!("{}", render_daemon_text(&paths, &config));
+                Ok(())
+            } else {
+                rocmd::run_from_args(daemon_run_argv())
+            }
         }
         Some(Command::Dash {
             replay,
@@ -3606,7 +3614,7 @@ fn serve(
     }
 
     if managed {
-        return start_managed_service(
+        start_managed_service(
             &selected_engine,
             &service_id,
             &model,
@@ -3617,7 +3625,9 @@ fn serve(
             managed_runtime_id.as_deref(),
             managed_env_id.as_deref(),
             resolve.engine_recipe.as_ref(),
-        );
+        )?;
+        ensure_background_helper_running()?;
+        return Ok(());
     }
 
     if !foreground {
@@ -3814,6 +3824,46 @@ fn start_managed_service(
         ),
         Some(service_id),
     );
+    Ok(())
+}
+
+/// Shared daemon-lifecycle entrypoint: ensures the background automation helper
+/// (`rocm daemon`) is running, spawning it detached if not. Liveness is read from
+/// the file-based automation runtime state. Intentionally `pub(crate)` — reused by
+/// both the `serve --managed` path and `automations enable`. Only the spawn result
+/// itself (`command.spawn()` / `spawn_detached_no_inherit`) is logged rather than
+/// propagated; setup errors (path discovery, stdio attach) still return `Err`.
+pub(crate) fn ensure_background_helper_running() -> Result<()> {
+    let paths = AppPaths::discover()?;
+    if let Some(state) = AutomationRuntimeState::load(&paths)?
+        && state.running
+        && rocm_core::process_is_running(state.daemon_pid)
+    {
+        return Ok(());
+    }
+
+    let exe = managed_service_launcher_path()
+        .context("failed to resolve current rocm executable path")?;
+    let args = vec!["daemon".to_owned()];
+    #[cfg(windows)]
+    let spawn_result = {
+        let env_values = app_path_env_var_values(&paths, None);
+        let env_refs = app_path_env_var_refs(&env_values);
+        rocm_core::spawn_detached_no_inherit(&exe, &args, &env_refs).map(|_| ())
+    };
+    #[cfg(not(windows))]
+    let spawn_result = {
+        let mut command = managed_service_process_command(&exe, &args);
+        command.stdin(Stdio::null());
+        attach_background_stdio(&mut command, None)?;
+        detach_background_command(&mut command);
+        apply_app_path_env(&mut command, &paths);
+        command.spawn().map(|_| ())
+    };
+    match spawn_result {
+        Ok(()) => println!("  helper: started background automation daemon"),
+        Err(error) => println!("  helper: could not start background automation daemon: {error}"),
+    }
     Ok(())
 }
 
@@ -14037,6 +14087,16 @@ fn app_path_env_var_refs<'a>(vars: &'a [(&'static str, PathBuf)]) -> Vec<(&'stat
         .collect()
 }
 
+/// Argv passed to the embedded `rocmd` library to run the real foreground
+/// automation loop (the same path as `rocmd run --automations-enabled`).
+fn daemon_run_argv() -> Vec<OsString> {
+    vec![
+        OsString::from("rocmd"),
+        OsString::from("run"),
+        OsString::from("--automations-enabled"),
+    ]
+}
+
 fn managed_service_launcher_path() -> Result<PathBuf> {
     let current_exe = daemon_binary_path()?;
     if rocm_core::runtime_is_windows() {
@@ -14278,6 +14338,17 @@ fn treat_as_natural_language(args: &[String]) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // The previous `daemon_run_argv_targets_rocmd_run_with_automations` unit test
+    // only re-asserted the literals `daemon_run_argv()` returns, so it tested
+    // nothing real. The intended real behavior — that this argv actually drives
+    // `rocmd` into its `run --automations-enabled` foreground loop — is proven
+    // end-to-end by the `daemon_runs_real_foreground_loop` integration test in
+    // tests/daemon_run.rs. A non-tautological unit test would require parsing the
+    // argv through `rocmd::Cli`/`rocmd::Command`, but those clap structs are
+    // crate-private in rocmd and exposing them (plus their private field types
+    // like `SandboxToolArg`) is more than a trivial visibility change, so the
+    // tautological unit test is removed in favor of the integration coverage.
 
     #[test]
     fn cli_command_definition_is_valid() {

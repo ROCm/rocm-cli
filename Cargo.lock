@@ -3240,6 +3240,7 @@ dependencies = [
  "rocm-engine-pytorch",
  "rocm-engine-sglang",
  "rocm-engine-vllm",
+ "rocmd",
  "rpassword",
  "serde",
  "serde_json",

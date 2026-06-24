@@ -31,6 +31,7 @@ rocm-engine-llama-cpp = { path = "../../engines/llama-cpp" }
 rocm-engine-pytorch = { path = "../../engines/pytorch" }
 rocm-engine-protocol = { path = "../../crates/rocm-engine-protocol" }
 rocm-engine-sglang = { path = "../../engines/sglang" }
+rocmd = { path = "../rocmd" }
 rocm-engine-vllm = { path = "../../engines/vllm" }
 rpassword.workspace = true
 serde.workspace = true
