@@ -337,9 +337,24 @@ rocm logs --search error timeout")]
         #[arg(value_name = "QUERY")]
         query: Vec<String>,
     },
-    /// Start the background helper in the foreground.
+    /// Run the background supervisor that powers automations, managed servers, and the dashboard.
+    ///
+    /// The daemon is a multi-role helper that, while running:
+    ///   - executes enabled automation watchers (update checks, driver-plan
+    ///     checks, artifact prefetch) on a 5s tick in a sandboxed subprocess
+    ///   - health-checks and auto-recovers managed local model servers
+    ///     (vLLM, SGLang, Lemonade, llama.cpp)
+    ///   - collects GPU thermal/VRAM metrics every 60s for the TUI dashboard
+    ///   - listens on a local webhook port for automation events from other
+    ///     `rocm` commands
+    ///
+    /// It is normally started on demand by `rocm automations enable` and
+    /// `rocm managed serve`, so you rarely need to launch it yourself. Run it
+    /// directly only when you want to observe its behavior in the foreground,
+    /// e.g. for debugging.
+    #[command(verbatim_doc_comment)]
     Daemon {
-        /// Print the automation status panel instead of running the helper loop.
+        /// Print a one-shot snapshot of automation/watcher status, then exit without starting the supervisor loop.
         #[arg(long)]
         status: bool,
     },
