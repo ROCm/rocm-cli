@@ -3711,6 +3711,30 @@ fn start_managed_service(
     paths.ensure()?;
     fs::create_dir_all(paths.services_dir())?;
 
+    // Idempotency guard: if a managed service for this engine+model is already
+    // alive, surface it and spawn nothing. A second `serve --managed` (e.g. the
+    // chat assistant re-issuing the same request) is treated as satisfied, not
+    // an error. Stale/dead services fall through and relaunch normally.
+    if let Some(existing) = existing_live_managed_service(&paths, service_id) {
+        println!("managed service already running");
+        println!("  service_id: {service_id}");
+        println!("  endpoint: {}", existing.endpoint_url);
+        println!("  status: {}", existing.status);
+        println!("  note: existing service detected; no second process spawned");
+        record_cli_audit_event(
+            &paths,
+            "service",
+            "managed_service_launch_skipped",
+            "info",
+            format!(
+                "skipped duplicate managed launch service_id={service_id} status={}",
+                existing.status
+            ),
+            Some(service_id),
+        );
+        return Ok(());
+    }
+
     let mut record = ManagedServiceRecord::new(
         &paths,
         service_id,
@@ -11928,6 +11952,23 @@ pub(crate) fn managed_service_is_live(record: &ManagedServiceRecord) -> bool {
     )
 }
 
+/// Idempotency guard for managed launches: returns the existing record when a
+/// managed service with this `service_id` is already alive. `load_managed_service`
+/// refreshes liveness, so a stale manifest (dead PID) demotes to "stopped" and
+/// yields `None` — letting a genuine relaunch proceed. Prevents a second
+/// `serve --managed` for the same engine+model from spawning a duplicate process
+/// once the TUI job-bridge guard has cleared.
+fn existing_live_managed_service(
+    paths: &AppPaths,
+    service_id: &str,
+) -> Option<ManagedServiceRecord> {
+    if !paths.service_manifest_path(service_id).exists() {
+        return None;
+    }
+    let record = load_managed_service(paths, service_id).ok()?;
+    managed_service_is_live(&record).then_some(record)
+}
+
 fn managed_service_running_state(status: &str) -> &'static str {
     match status {
         "ready" | "running" => "running",
@@ -17498,6 +17539,83 @@ install therock";
         assert!(all.contains("  status: stopped"));
         assert_eq!(reloaded.status, "stopped");
         Ok(())
+    }
+
+    #[test]
+    fn duplicate_managed_launch_is_detected_when_live() -> Result<()> {
+        // A live manifest for the same service_id must be detected so a second
+        // `serve --managed` spawns nothing. `starting` skips the endpoint probe;
+        // the current process id is a guaranteed-live PID.
+        let (root, paths) = test_paths("dup-managed-live");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-dup-live",
+            "lemonade",
+            "qwen",
+            "qwen",
+            "127.0.0.1",
+            11500,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = "starting".to_owned();
+        record.engine_pid = Some(std::process::id());
+        record.write()?;
+
+        let found = existing_live_managed_service(&paths, "svc-dup-live");
+        let _ = fs::remove_dir_all(root);
+
+        let found = found.expect("a live managed service should be detected");
+        assert_eq!(found.service_id, "svc-dup-live");
+        assert!(managed_service_is_live(&found));
+        Ok(())
+    }
+
+    #[test]
+    fn dead_managed_service_allows_relaunch() -> Result<()> {
+        // A stale manifest with dead PIDs must NOT block a relaunch: liveness
+        // refresh demotes it to "stopped", so the guard returns None.
+        let (root, paths) = test_paths("dup-managed-dead");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-dup-dead",
+            "lemonade",
+            "qwen",
+            "qwen",
+            "127.0.0.1",
+            11501,
+            "managed",
+            999_999_999,
+            None,
+            None,
+            None,
+        );
+        record.status = "ready".to_owned();
+        record.engine_pid = Some(999_999_999);
+        record.write()?;
+
+        let found = existing_live_managed_service(&paths, "svc-dup-dead");
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            found.is_none(),
+            "a dead managed service must not block relaunch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_manifest_allows_launch() {
+        // No manifest on disk → nothing to detect, launch proceeds.
+        let (root, paths) = test_paths("dup-managed-missing");
+        let found = existing_live_managed_service(&paths, "svc-absent");
+        let _ = fs::remove_dir_all(root);
+        assert!(found.is_none());
     }
 
     #[test]
