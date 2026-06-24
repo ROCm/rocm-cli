@@ -7135,6 +7135,10 @@ pub(crate) fn validate_chat_tool_call(call: &providers::ChatToolCall) -> Result<
     }
     match call.name.as_str() {
         "examine"
+        // `doctor` is the dash-side LLM tool + `/doctor` overlay name for the
+        // same machine inspection the bin exposes as `examine`. Accept it as an
+        // alias so a model-issued `doctor` call resolves end-to-end.
+        | "doctor"
         | "bridge_snapshot"
         | "gpu_snapshot"
         | "engines"
@@ -7706,6 +7710,7 @@ pub(crate) fn chat_tool_call_is_read_only(call: &providers::ChatToolCall) -> boo
     matches!(
         call.name.as_str(),
         "examine"
+            | "doctor"
             | "bridge_snapshot"
             | "gpu_snapshot"
             | "engines"
@@ -8334,7 +8339,7 @@ pub(crate) fn run_internal_mcp_call(
     }
 
     match name {
-        "examine" => {
+        "examine" | "doctor" => {
             let examine = ExamineSummary::gather()?;
             let text = render_examine_text()?;
             Ok(internal_mcp_tool_success(text, serde_json::json!(examine)))
@@ -16199,6 +16204,33 @@ model recipes
             };
             let error = validate_chat_tool_call(&call).unwrap_err().to_string();
             assert!(error.contains(expected), "unexpected error: {error}");
+        }
+    }
+
+    /// Guard: every read-only tool the dash side registers must have a home in
+    /// the bin's accept-list. A name-only tool (the `doctor` regression caught
+    /// in review) would otherwise fail end-to-end as "unsupported ROCm tool"
+    /// while passing the dash-side, name-against-itself completeness checks.
+    ///
+    /// We assert the NAME is accepted — not that empty args validate — so the
+    /// check stays hermetic (no real `BinToolExecutor::execute` / live I/O) and
+    /// independent of each tool's argument schema.
+    #[test]
+    fn read_tool_names_are_subset_of_bin_accept_list() {
+        for name in rocm_dash_tui::agent::ROCM_READ_TOOL_NAMES {
+            let call = providers::ChatToolCall {
+                id: None,
+                name: name.to_owned(),
+                arguments: serde_json::json!({}),
+            };
+            if let Err(error) = validate_chat_tool_call(&call) {
+                let message = error.to_string();
+                assert!(
+                    !message.contains("unsupported ROCm tool"),
+                    "ROCM_READ_TOOL_NAMES advertises `{name}` but the bin rejects \
+                     the name as unsupported: {message}"
+                );
+            }
         }
     }
 
