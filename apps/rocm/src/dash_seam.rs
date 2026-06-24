@@ -53,10 +53,23 @@ impl RocmToolExecutor for BinToolExecutor {
                         }
                         b
                     },
-                    args: req.args,
+                    name: name.to_owned(),
+                    arguments: args.clone(),
                 }),
                 Err(e) => RocmToolOutcome::Error(e.to_string()),
             }
+        }
+    }
+
+    fn execute_approved(&self, name: &str, args: &serde_json::Value) -> RocmToolOutcome {
+        // Replay the approved mutating call via the captured-subprocess path
+        // (`allow_mutation = true`). `run_internal_mcp_call` re-validates the
+        // call first, so the safety validators stay the single gate; it runs the
+        // action with piped stdout/stderr (TUI-safe) — no `dispatch`, no stdout
+        // corruption.
+        match crate::run_internal_mcp_call(&self.paths, name, args.clone(), true) {
+            Ok(v) => RocmToolOutcome::Result(v),
+            Err(e) => RocmToolOutcome::Error(e.to_string()),
         }
     }
 }
@@ -118,14 +131,62 @@ mod tests {
         );
         match outcome {
             RocmToolOutcome::ApprovalRequired(intent) => {
-                assert!(
-                    intent.args.len() >= 2
-                        && intent.args[..2] == ["install".to_owned(), "sdk".to_owned()],
-                    "install_sdk approval args should start with [install, sdk], got: {:?}",
-                    intent.args
+                assert_eq!(
+                    intent.name, "install_sdk",
+                    "approval intent carries the tool name for re-execution"
                 );
+                assert!(
+                    !intent.body.is_empty(),
+                    "approval body should carry human-readable lines, got: {:?}",
+                    intent.body
+                );
+                // The replayable payload is the same args object we passed in.
+                assert_eq!(intent.arguments["channel"], "release");
             }
             other => panic!("expected ApprovalRequired for `install_sdk`, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn seam_execute_rejects_public_bind_before_approval() {
+        // (d) an UNSAFE mutating call fails validation in execute() → Error, NOT
+        // ApprovalRequired. The approval modal never opens for a rejected call.
+        let exec = BinToolExecutor::new(temp_paths());
+        let outcome = exec.execute(
+            "launch_server",
+            &serde_json::json!({ "model": "m", "host": "0.0.0.0" }),
+        );
+        assert!(
+            matches!(outcome, RocmToolOutcome::Error(_)),
+            "public-bind launch_server must be rejected, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn seam_execute_rejects_cpu_device_before_approval() {
+        let exec = BinToolExecutor::new(temp_paths());
+        let outcome = exec.execute(
+            "launch_server",
+            &serde_json::json!({ "model": "m", "host": "127.0.0.1", "device": "cpu" }),
+        );
+        assert!(
+            matches!(outcome, RocmToolOutcome::Error(_)),
+            "CPU-device launch_server must be rejected, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn seam_execute_approved_rejects_unsafe_call_via_validator() {
+        // execute_approved re-validates: a public-bind launch_server is rejected
+        // (the validators stay the single gate even on the approved path).
+        let exec = BinToolExecutor::new(temp_paths());
+        let outcome = exec.execute_approved(
+            "launch_server",
+            &serde_json::json!({ "model": "m", "host": "0.0.0.0" }),
+        );
+        assert!(
+            matches!(outcome, RocmToolOutcome::Error(_)),
+            "approved-path execution must still reject an unsafe call, got {outcome:?}"
+        );
     }
 }

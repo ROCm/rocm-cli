@@ -24,10 +24,10 @@ Groups: **A** nav/session · **B** read-only · **C** approvals/automations ·
 | logs | B | covered (Phase 3) | `/logs` slash → opens the logs overlay (`logs_view`); the read-only `service_logs` tool is covered separately via the LLM tool-call seam | `slash_logs_opens_overlay` / `read_only_tool_round_trips_to_json` |
 | gpu | B | covered (Phase 3) | `/gpu` slash → `ActiveTab::Hardware`; tool `gpu_snapshot` via seam | `slash_gpu_switches_to_hardware` |
 | daemon | B | covered (Phase 3) | `/daemon` slash → `slash_tool` `rocm_command ["daemon","status"]` (off-thread) | `slash_daemon_raises_executor_request` |
-| install | D | pending (Phase 4) | install overlay + mutating tool (approval-gated) | — |
-| engine | D | pending (Phase 4) | engine-manager overlay + mutating tool (approval-gated) | — |
-| serve | D | pending (Phase 4) | serve wizard + mutating tool (approval-gated) | — |
-| services | D | pending (Phase 4) | services-manager overlay + mutating actions (approval-gated) | — |
+| install | D | covered (Phase 4) | `/install` slash → `install_sdk` mutating tool → approval modal → `execute_approved` (captured subprocess); also LLM tool-call seam | `slash_install_raises_install_sdk_request` / `approve_path_runs_execute_approved` |
+| engine | D | covered (Phase 4) | `/engine <name>` slash → `install_engine` mutating tool → approval modal → `execute_approved`; also LLM tool-call seam | `slash_engine_raises_install_engine_request` |
+| serve | D | covered (Phase 4) | `/serve <model>` slash (loopback host) → `launch_server` mutating tool → approval modal → `execute_approved`; also LLM tool-call seam | `slash_serve_raises_launch_server_request` / `seam_execute_approved_rejects_unsafe_call_via_validator` |
+| services | D | covered (Phase 4) | `/services stop <id>` slash → `stop_server` mutating tool → approval modal → `execute_approved`; `restart` is guided (not yet wired through the chat seam — points to stop + `/serve`); bare `/services` is read-only | `slash_services_stop_raises_stop_server_request` / `slash_services_restart_is_guided_not_stop` |
 | update | D | pending (Phase 5) | update overlay + mutating apply (approval-gated) | — |
 | comfyui | D | pending (Phase 5) | ComfyUI serve/launch flow (approval-gated) | — |
 | uninstall | D | pending (Phase 5) | uninstall flow (approval-gated) | — |

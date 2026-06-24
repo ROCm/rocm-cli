@@ -133,6 +133,12 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     } else if let Some(cm) = &state.config_manager {
         config_manager::draw_config_manager(f, outer[2], cm, &state.jobs, &theme);
     }
+
+    // Approval modal (Phase 4): drawn LAST so it sits on top of every overlay
+    // and owns the screen while a mutating-tool approval is pending.
+    if let Some(pa) = &state.approval {
+        approval::draw_approval(f, outer[2], &pa.req, pa.choice, &theme);
+    }
 }
 
 fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {

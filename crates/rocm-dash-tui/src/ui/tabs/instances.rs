@@ -809,6 +809,7 @@ mod tests {
             tool_executor: None,
             should_quit: false,
             slash_tool: None,
+            approval: None,
         }
     }
 
