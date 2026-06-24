@@ -46,6 +46,17 @@ repos:
       - id: shellcheck
         args: [--enable=all, --exclude=SC2310,SC2312]
 
+  # License headers: mirrors the korandoru/hawkeye CI check.
+  # Requires: cargo install hawkeye
+  - repo: local
+    hooks:
+      - id: license-headers
+        name: license header check (hawkeye)
+        entry: hawkeye check --config licenserc.toml
+        language: system
+        types_or: [rust, python, shell]
+        pass_filenames: false
+
   # Rust + PowerShell: mirror the CI checks using the local toolchain.
   - repo: local
     hooks:

@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Host examination probe.
 //!
 //! Rust port of the `rocm-doctor` skill's `examine.py`. It gathers the host

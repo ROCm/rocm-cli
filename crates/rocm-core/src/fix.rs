@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Apply remediations for diagnosed ROCm failure modes.
 //!
 //! Rust port of the `rocm-doctor` skill's `apply_fix.py`. Only small, safe,
