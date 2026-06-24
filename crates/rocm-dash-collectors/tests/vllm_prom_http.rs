@@ -1,6 +1,6 @@
 // Copyright Advanced Micro Devices, Inc.
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 
 //! End-to-end test for VllmPrometheusCollector: spins up a tiny HTTP server
 //! on a random local port, serves a canned `/metrics` payload, asserts that

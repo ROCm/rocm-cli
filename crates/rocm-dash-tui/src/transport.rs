@@ -1,6 +1,6 @@
 // Copyright Advanced Micro Devices, Inc.
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 
 //! NDJSON helpers. (Mirror of the daemon's transport module — duplicated here so we
 //! don't add a circular dep on the daemon crate. Refactor to a shared crate later.)

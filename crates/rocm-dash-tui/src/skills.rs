@@ -1,6 +1,6 @@
 // Copyright Advanced Micro Devices, Inc.
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 
 //! Skills — declarative manifest + plan model for rocm-dash's auto-config /
 //! auto-install mechanism.

@@ -1,6 +1,6 @@
 // Copyright Advanced Micro Devices, Inc.
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 
 //! Instances tab — full-screen instance grid with kv-cache / requests / args,
 //! plus a detail modal showing model / partition / launch_args / env / log.

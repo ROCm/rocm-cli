@@ -1,6 +1,6 @@
 // Copyright Advanced Micro Devices, Inc.
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 
 //! Collector traits. Impls live in `rocm-dash-collectors`.
 //! These are sync + `Send` so collector code can decide its own async/blocking strategy.

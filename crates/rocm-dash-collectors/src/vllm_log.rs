@@ -1,6 +1,6 @@
 // Copyright Advanced Micro Devices, Inc.
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 
 //! vLLM log slicer — verbatim port of `inspect_bench/log_slicer.py`.
 //! See `../wiki/entities/log-slicer.md` and `../wiki/concepts/log-derived-metrics.md`.

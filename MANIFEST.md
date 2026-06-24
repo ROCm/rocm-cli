@@ -4,7 +4,7 @@
 
 - **Name**: rocm-cli
 - **Version**: 0.3.0
-- **License**: Apache-2.0
+- **License**: MIT
 - **Copyright**: Copyright Advanced Micro Devices, Inc.
 - **Repository**: https://github.com/ROCm/rocm-cli
 

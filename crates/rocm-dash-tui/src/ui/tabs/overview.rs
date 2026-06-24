@@ -1,6 +1,6 @@
 // Copyright Advanced Micro Devices, Inc.
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 
 //! Overview tab — the original 60/40 split layout. Preserved verbatim so
 //! switching tabs always lands back on the familiar view.
