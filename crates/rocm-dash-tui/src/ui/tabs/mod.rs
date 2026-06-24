@@ -196,14 +196,15 @@ pub fn draw_tab_panel(
         put(f, ex, y_lab, "│", style);
         if is_active {
             // Open the active folder into the body: erase the panel line under
-            // it. The bottom corners are drawn in the BORDER color (not accent)
-            // so the active color turns straight down into the frame and never
-            // continues horizontally along the body border.
-            put(f, sx, y_line, "╯", border);
+            // it. The bottom corners are accent so the active color continues
+            // down the sides and curves outward into the frame; the rounded arc
+            // (not a straight horizontal run) is the whole flourish — the frame
+            // line beyond the corners stays the border color.
+            put(f, sx, y_line, "╯", acc);
             for x in (sx + 1)..ex {
                 put(f, x, y_line, " ", Style::default().bg(theme.bg));
             }
-            put(f, ex, y_line, "╰", border);
+            put(f, ex, y_line, "╰", acc);
         } else {
             put(f, sx, y_line, "┴", style);
             put(f, ex, y_line, "┴", style);
