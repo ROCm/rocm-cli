@@ -10,8 +10,10 @@
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo, Snapshot, SystemMetrics};
-use rocm_dash_tui::app::{ActiveTab, AppState, ConnState};
+use rocm_dash_core::metrics::{
+    GpuMetrics, GpuSystemInfo, Instance, InstanceStatus, Snapshot, SystemMetrics,
+};
+use rocm_dash_tui::app::{ActiveTab, AppState, ConnState, PaneFocus};
 use rocm_dash_tui::ui;
 
 /// A synthetic single-GPU snapshot so each tab body has real content to paint.
@@ -416,4 +418,144 @@ fn every_tab_survives_squeezed_height() {
             let _ = render(&mut s, 80, h);
         }
     }
+}
+
+// --- Phase 6: harden — a11y across all themes + demo buffer-dump ---
+
+/// A connected demo-style state: synthetic snapshot + two instances, one with
+/// live TTFT/TPOT/tok-watt and one with none (the honest `—` path).
+fn demo_state() -> AppState {
+    let mut s = state_on(ActiveTab::Observe);
+    let live = Instance {
+        container_id: "vllm-a".into(),
+        container_name: "vllm-a".into(),
+        status: InstanceStatus::Running,
+        model_name: "deepseek-r1".into(),
+        gpu_ids: vec!["0".into()],
+        gen_tps: Some(180.0),
+        tokens_per_watt: Some(0.6),
+        ttft_ms: Some(150.0),
+        tpot_ms: Some(22.0),
+        running_reqs: Some(3),
+        waiting_reqs: Some(1),
+        kv_cache_usage_pct: Some(42.0),
+        ..Default::default()
+    };
+    let cold = Instance {
+        container_id: "vllm-b".into(),
+        container_name: "vllm-b".into(),
+        status: InstanceStatus::Running,
+        model_name: "llama-3".into(),
+        gpu_ids: vec!["1".into()],
+        ..Default::default()
+    };
+    if let Some(snap) = s.latest.as_mut() {
+        snap.instances = vec![live.clone(), cold.clone()];
+    }
+    s.instances.insert(live.container_id.clone(), live);
+    s.instances.insert(cold.container_id.clone(), cold);
+    s
+}
+
+#[test]
+fn a11y_every_theme_renders_every_tab_with_chrome_intact() {
+    // Render all 5 tabs under every registered theme: no panic, the rounded
+    // btop tab chrome survives, and the tab labels are present. The single
+    // background is structurally guaranteed by ui::draw painting the whole
+    // frame with theme.bg first (no second competing surface).
+    let themes = rocm_dash_tui::ui::theme::theme_names();
+    assert!(
+        themes.len() >= 15,
+        "expected the full theme registry, got {}",
+        themes.len()
+    );
+    for name in &themes {
+        for tab in [
+            ActiveTab::Home,
+            ActiveTab::Rocm,
+            ActiveTab::Serving,
+            ActiveTab::Observe,
+            ActiveTab::Chat,
+        ] {
+            let mut s = demo_state();
+            s.active_tab = tab;
+            s.theme_name = (*name).to_string();
+            s.theme = rocm_dash_tui::ui::theme::Theme::from_name(name);
+            let out = render(&mut s, 160, 50);
+            assert!(
+                out.contains('╭') && out.contains('╰'),
+                "theme {name}/{tab:?}: rounded tab chrome missing"
+            );
+            assert!(
+                out.contains("Serving"),
+                "theme {name}/{tab:?}: tab labels missing"
+            );
+        }
+    }
+}
+
+#[test]
+fn demo_buffer_dump_all_tabs_inline_details_and_heroes() {
+    // The `rocm dash --demo` equivalent: drive ui::draw over a connected demo
+    // snapshot and confirm every surface renders. Excerpts are printed for the
+    // transcript (run with --nocapture to view).
+    // 1) all 5 tabs render their signature content.
+    let checks: &[(ActiveTab, &str)] = &[
+        (ActiveTab::Home, "GPU UTILIZATION"),
+        (ActiveTab::Rocm, "ROCm actions"),
+        (ActiveTab::Serving, "Serving actions"),
+        (ActiveTab::Observe, "Node efficiency"),
+        (ActiveTab::Chat, "Chat"),
+    ];
+    for (tab, needle) in checks {
+        let mut s = demo_state();
+        s.active_tab = *tab;
+        let out = render(&mut s, 180, 50);
+        assert!(out.contains(needle), "tab {tab:?}: {needle:?} missing");
+        println!("DEMO_DUMP {tab:?}: ok (found {needle:?})");
+    }
+
+    // 2) inline Details: a manager renders in-pane on ROCm and Serving.
+    let mut r = demo_state();
+    r.active_tab = ActiveTab::Rocm;
+    r.pane_focus = PaneFocus::Detail;
+    r.install_manager = Some(rocm_dash_tui::ui::install_manager::InstallManagerState::default());
+    let rout = render(&mut r, 180, 50);
+    assert!(rout.contains("ROCm SDK"), "ROCm inline Details missing");
+    assert!(
+        rout.contains("ROCm actions"),
+        "ROCm Actions list missing alongside"
+    );
+    println!("DEMO_DUMP Rocm inline Details: install_manager in-pane ✓");
+
+    let mut sv = demo_state();
+    sv.active_tab = ActiveTab::Serving;
+    sv.pane_focus = PaneFocus::Detail;
+    sv.serve_wizard = Some(rocm_dash_tui::ui::serve_wizard::ServeWizardState::default());
+    let svout = render(&mut sv, 180, 50);
+    assert!(
+        svout.contains("Serve a model"),
+        "Serving inline Details missing"
+    );
+    println!("DEMO_DUMP Serving inline Details: serve_wizard in-pane ✓");
+
+    // 3) Observe heroes show tok/watt + live TTFT/TPOT, honest `—` for the cold
+    //    instance.
+    let mut o = demo_state();
+    o.active_tab = ActiveTab::Observe;
+    let oout = render(&mut o, 180, 50);
+    assert!(
+        oout.contains("Node efficiency") && oout.contains("Node throughput"),
+        "heroes missing"
+    );
+    assert!(
+        oout.contains("tok/W") || oout.contains("TOK/W"),
+        "tok/watt missing"
+    );
+    assert!(oout.contains("150ms"), "live TTFT value missing");
+    assert!(
+        oout.contains("—"),
+        "honest placeholder for cold instance missing"
+    );
+    println!("DEMO_DUMP Observe: heroes + tok/watt + live TTFT 150ms + honest — ✓");
 }

@@ -285,7 +285,7 @@ mod tests {
             let r = draw_tab_panel(
                 f,
                 f.area(),
-                &["Home", "Action", "Observe", "Chat"],
+                &["Home", "ROCm", "Serving", "Observe", "Chat"],
                 0,
                 &theme,
             );
@@ -301,7 +301,7 @@ mod tests {
             .collect();
         // Inactive tabs show their 1-based index; the active tab shows ●.
         assert!(out.contains("● Home"), "active marker missing: {out:?}");
-        assert!(out.contains("Action"), "tab label missing: {out:?}");
+        assert!(out.contains("Serving"), "tab label missing: {out:?}");
         // Frame + folders use rounded corners now.
         assert!(
             out.contains('╮') && out.contains('╰'),
