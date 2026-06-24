@@ -131,7 +131,10 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: MANIFEST.md dependency table is current
+        run: cargo xtask manifest --check
 
   coverage:
     name: Coverage (rocm-dash crates, ratcheted)
