@@ -46,6 +46,24 @@ repos:
       - id: shellcheck
         args: [--enable=all, --exclude=SC2310,SC2312]
 
+  # Commit trust: signing + DCO sign-off are enforced, not just policy.
+  # `--check-config` is a fast local-config assertion run on every commit;
+  # the full range verification is deferred to pre-push (and mirrored in CI).
+  - repo: local
+    hooks:
+      - id: commit-signing-configured
+        name: commit signing configured
+        entry: cargo xtask verify-commits --check-config
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: verify-commits
+        name: verify commits are signed and signed-off
+        entry: cargo xtask verify-commits
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+
   # License headers: mirrors the korandoru/hawkeye CI check.
   # Requires: cargo install hawkeye
   - repo: local

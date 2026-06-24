@@ -225,6 +225,29 @@ jobs:
       - name: Check license headers
         uses: korandoru/hawkeye@v6
 
+  commit-signatures:
+    name: Commit signatures + sign-off
+    runs-on: ubuntu-latest
+    # Only meaningful for PRs, where a base branch defines the commit range.
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          # Check out the PR head commit, not the synthetic refs/pull/N/merge
+          # commit (which is unsigned and lacks a sign-off, and would otherwise
+          # appear in origin/<base>..HEAD and fail the gate on every PR).
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Verify commits are signed and signed-off
+        # `--require-verified` shells out to the `gh` CLI; pass the job token so
+        # `gh api` is authenticated (avoids the unauthenticated rate limit).
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo xtask verify-commits --base origin/${{ github.base_ref }} --require-verified
+
   # Hardware (real AMD GPU / WSL) smoke tests on dedicated self-hosted runners
   # are intentionally not part of this workflow yet. See
   # docs/ci-hardware-testing.md for the planned design; they will land in a
