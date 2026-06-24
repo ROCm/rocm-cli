@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 pub mod approval;
 pub mod automations_manager;
 pub mod bench;

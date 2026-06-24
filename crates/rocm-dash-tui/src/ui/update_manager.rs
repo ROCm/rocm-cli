@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Update overlay (Phase 3 Wave 2).
 //!
 //! Wraps `rocm update`: a read-only check (and a `--apply --dry-run` preview)

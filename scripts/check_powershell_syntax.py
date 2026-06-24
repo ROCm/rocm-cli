@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright Advanced Micro Devices, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Validate PowerShell script syntax for the pre-commit/prek hook.
 
 Mirrors the syntax check CI runs on Windows, but works as a local hook on any

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright Advanced Micro Devices, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Build platform-native rocm-cli release artifacts.
 
 This helper copies or archives the native `rocm`/`rocm.exe` binary for the

@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Pass^N / Pass@N trial-group rollups over benchmark rows.
 //!
 //! Pure: no rendering, no async. The rollup is cheap, so the TUI recomputes

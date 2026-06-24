@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Repository task runner.
 //!
 //! Currently provides the release-artifact signing toolchain in pure Rust so the

@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Wave 0 exit gate.
 //!
 //! Proves the job-bridge spine end-to-end: a real long-running child process is

@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Chat tab — a TUI-local conversation surface.
 //!
 //! Phase 1 is render-only with a local echo backend; later phases wire a Rig-built agent behind the

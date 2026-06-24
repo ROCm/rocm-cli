@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! End-to-end integration test: spawn the runner with a CSV, drive a broadcast
 //! subscriber from the same process, and assert Snapshot + BenchmarkRowsAppended
 //! events arrive.

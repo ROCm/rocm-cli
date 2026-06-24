@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! sysfs/hwmon collector for Strix Halo (gfx1151). Stub.
 
 use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo};

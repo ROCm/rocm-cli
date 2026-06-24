@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Pure efficiency derivations (tokens-per-watt). No I/O, no rendering.
 //!
 //! This is the join that turns vLLM throughput + amd-smi power into a

@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Three-stop horizontal gradient gauge (ok → warn → err by default).
 //!
 //! ratatui's built-in `Gauge` only supports a single color. This widget

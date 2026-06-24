@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! vLLM Prometheus `/metrics` scraper.
 //!
 //! Field paths and the kv-cache 0..1 → 0..100 scaling are vendored from

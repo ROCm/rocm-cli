@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright Advanced Micro Devices, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Cross-platform local smoke tests for rocm-cli debug/release binaries."""
 
 from __future__ import annotations

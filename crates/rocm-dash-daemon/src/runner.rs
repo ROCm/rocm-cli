@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Owner task: drives collectors on tick cadences and broadcasts Snapshots.
 
 use std::collections::{HashMap, HashSet};

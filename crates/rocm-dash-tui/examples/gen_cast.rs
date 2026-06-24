@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Render the TUI against a synthetic session NDJSON to an asciicast v2
 //! recording. The marketing page replays it as a real animated terminal
 //! demo — no live terminal, no external capture tools, no drift.

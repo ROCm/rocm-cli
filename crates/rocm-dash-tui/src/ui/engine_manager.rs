@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Engine manager overlay (Phase 3 Wave 1).
 //!
 //! Lists the serving engines ROCm CLI knows about and runs use/install/reinstall

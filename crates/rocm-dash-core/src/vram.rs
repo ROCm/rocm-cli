@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Pure VRAM attribution helpers. No I/O, no rendering.
 //!
 //! The `/proc` read and the amd-smi subprocess that feed these live in the

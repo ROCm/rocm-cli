@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright Advanced Micro Devices, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Read-only WSL/ROCDXG preflight for rocm-cli.
 
 This script intentionally does not install packages or modify global WSL state.

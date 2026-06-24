@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Tail a normalized benchmark CSV from instinct-agent-bench.
 //!
 //! Strategy: every `drain()` re-reads the entire file and yields rows we haven't

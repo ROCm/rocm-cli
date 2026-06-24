@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Exponential backoff helper for reconnect loops. Ported from ctux pattern.
 
 use std::time::Duration;

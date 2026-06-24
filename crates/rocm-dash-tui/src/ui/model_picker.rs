@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Model picker (Phase 3 Wave 1).
 //!
 //! A reusable, filterable list of model recipes — the sub-step the serve wizard

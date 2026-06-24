@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Config + provider manager overlay (Phase 3 Wave 3).
 //!
 //! Folds the frozen `config_manager` and `provider_manager` into one screen:

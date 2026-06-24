@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! rocm-dash TUI client library.
 //!
 //! The composition-root binary (`rocm`) is a thin wrapper over `app::run`;

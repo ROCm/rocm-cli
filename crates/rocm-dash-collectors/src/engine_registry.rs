@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Engine registry seam — one place that maps a discovered serving engine to its per-engine sample parser.
 //!
 //! The daemon can pick a backend per service instead

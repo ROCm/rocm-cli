@@ -1,4 +1,8 @@
 #!/bin/sh
+# Copyright Advanced Micro Devices, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
 set -eu
 
 REPO="${ROCM_CLI_GITHUB_REPO:-ROCm/rocm-cli}"

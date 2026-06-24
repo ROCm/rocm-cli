@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! llama-server /slots collector. Stub.
 
 use rocm_dash_core::traits::{

@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Lemonade Server collector — pure parsers over the Lemonade REST API.
 //!
 //! Schema verified against the official docs (lemonade-server.ai/docs/api):

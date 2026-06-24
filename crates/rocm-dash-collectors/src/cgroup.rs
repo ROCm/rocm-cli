@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! PID → docker container id resolution via `/proc/<pid>/cgroup`.
 //!
 //! amd-smi reports the **host** PIDs of GPU compute processes. For a

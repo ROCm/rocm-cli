@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! amd-smi subprocess + JSON parse.
 //!
 //! Field paths and the KFD pre-flight check are vendored from the TypeScript

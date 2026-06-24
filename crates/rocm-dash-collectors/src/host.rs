@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Host system metrics via sysinfo. Backs the daemon's per-tick `SystemMetrics`.
 
 use rocm_dash_core::metrics::SystemMetrics;

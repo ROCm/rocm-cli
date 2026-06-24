@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Offline replay source.
 //!
 //! Reads a daemon-produced session file (NDJSON of `PersistedEntry`) into

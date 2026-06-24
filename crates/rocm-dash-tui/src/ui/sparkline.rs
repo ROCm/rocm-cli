@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Braille sparkline widget.
 //!
 //! One character cell = 2 cols × 4 rows of dots. We pack two consecutive

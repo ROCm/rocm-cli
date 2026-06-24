@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Centered popup helpers + the Help overlay.
 //!
 //! Modal content is rendered by the active tab (`detail_modal` from the tab

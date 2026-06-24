@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Benchmark row schema, vendored from instinct-agent-bench.
 //! See `../wiki/concepts/benchmark-result-schema.md` and `../wiki/entities/csv-emitter.md`.
 

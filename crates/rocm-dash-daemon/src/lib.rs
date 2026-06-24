@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! rocm-dash-daemon — daemon library.
 //!
 //! Runs on the GPU host and serves NDJSON snapshot/bench streams to `rocm`

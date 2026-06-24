@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright Advanced Micro Devices, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """End-to-end PyTorch GPU smoke test for rocm-cli managed TheRock runtimes."""
 
 from __future__ import annotations

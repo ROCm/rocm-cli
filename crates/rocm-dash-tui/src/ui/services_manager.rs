@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Services manager overlay (Phase 3 Wave 1).
 //!
 //! The first operational screen rebuilt on the Wave-0 primitives: it lists the

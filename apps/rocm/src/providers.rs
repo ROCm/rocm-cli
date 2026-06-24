@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, AuditEventRecord, ManagedServiceRecord, RocmCliConfig, append_audit_event,

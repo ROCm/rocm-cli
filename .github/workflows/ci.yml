@@ -209,6 +209,14 @@ jobs:
           }
           if ($findings) { $findings | Format-Table -AutoSize; exit 1 }
 
+  license-headers:
+    name: License header check (hawkeye)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check license headers
+        uses: korandoru/hawkeye@v6
+
   # Hardware (real AMD GPU / WSL) smoke tests on dedicated self-hosted runners
   # are intentionally not part of this workflow yet. See
   # docs/ci-hardware-testing.md for the planned design; they will land in a

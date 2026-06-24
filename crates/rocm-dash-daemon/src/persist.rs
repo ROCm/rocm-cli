@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Append-only NDJSON session writer.
 //!
 //! Each daemon session opens exactly one file under `--persist-dir`, named
