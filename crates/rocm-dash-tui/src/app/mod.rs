@@ -1732,7 +1732,8 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
         }
         KeyAction::OpenExamine => {
             state.close_overlays();
-            state.examine_manager = Some(crate::ui::examine_manager::ExamineManagerState::default());
+            state.examine_manager =
+                Some(crate::ui::examine_manager::ExamineManagerState::default());
         }
         KeyAction::OpenUpdate => {
             state.close_overlays();
