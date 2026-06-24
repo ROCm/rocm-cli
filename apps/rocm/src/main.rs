@@ -11972,11 +11972,14 @@ fn existing_live_managed_service(
     engine: &str,
     canonical_model_id: &str,
 ) -> Option<ManagedServiceRecord> {
-    load_managed_services(paths).ok()?.into_iter().find(|record| {
-        record.engine == engine
-            && record.canonical_model_id == canonical_model_id
-            && managed_service_is_live(record)
-    })
+    load_managed_services(paths)
+        .ok()?
+        .into_iter()
+        .find(|record| {
+            record.engine == engine
+                && record.canonical_model_id == canonical_model_id
+                && managed_service_is_live(record)
+        })
 }
 
 fn managed_service_running_state(status: &str) -> &'static str {
