@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! rocm-core-free tool-call boundary (the execution seam).
 //!
 //! Plain-data signatures ONLY (serde_json / std / serde). The bin (`apps/rocm`,

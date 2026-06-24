@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Bin-side implementation of the dash execution seam.
 //!
 //! The dash crates stay free of `rocm-core`; this module lives in the bin
