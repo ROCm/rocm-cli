@@ -91,16 +91,16 @@ fn home_tab_renders_key_labels() {
 
 #[test]
 fn action_tab_renders_key_labels() {
-    // P1: ROCm + Serving both render the ported Action verb list (placeholder).
+    // ROCm shows the platform verbs; Serving shows the serving verbs.
     let out = render(&mut state_on(ActiveTab::Rocm), 160, 44);
     assert_tab_bar(&out);
     assert!(
-        out.contains("Serve a model"),
-        "action verbs missing: {out:?}"
+        out.contains("Set up / Install ROCm") && out.contains("Runtimes"),
+        "ROCm verbs missing: {out:?}"
     );
     let serving = render(&mut state_on(ActiveTab::Serving), 160, 44);
     assert!(
-        serving.contains("Serve a model"),
+        serving.contains("Serve a model") && serving.contains("Engines"),
         "serving verbs missing: {serving:?}"
     );
 }

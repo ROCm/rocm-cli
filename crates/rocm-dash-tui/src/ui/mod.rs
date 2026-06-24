@@ -97,11 +97,8 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
 
     match state.active_tab {
         ActiveTab::Home => tabs::home::draw(f, center_inner, state, &theme),
-        // P1: ROCm + Serving both render the ported Action verb list as a
-        // one-phase placeholder; P2 lands the real per-tab modules.
-        ActiveTab::Rocm | ActiveTab::Serving => {
-            tabs::action::draw(f, center_inner, state, &theme);
-        }
+        ActiveTab::Rocm => tabs::rocm::draw(f, center_inner, state, &theme),
+        ActiveTab::Serving => tabs::serving::draw(f, center_inner, state, &theme),
         ActiveTab::Observe => tabs::observe::draw(f, center_inner, state, &theme),
         ActiveTab::Chat => tabs::chat::draw(f, center_inner, state, &theme),
     }
@@ -284,7 +281,7 @@ enum Seg {
 fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Vec<FooterChip> {
     let is_action_tab = matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving);
     let enter_action = if is_action_tab {
-        KeyAction::ActionActivate
+        KeyAction::PaneActivate
     } else {
         KeyAction::OpenDetail
     };

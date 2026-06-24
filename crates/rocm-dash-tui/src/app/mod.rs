@@ -411,11 +411,13 @@ pub struct AppState {
     pub palette_sel: usize,
     /// Active tab index in the Options panel (General / CPU / GPU / Engines).
     pub options_tab: usize,
-    /// Cursor into the Action tab's guided-verb list.
-    pub action_sel: usize,
-    /// Whether the Action tab's focus is on the verb list or the detail pane.
-    /// `→`/Enter moves focus into the detail box; `←` returns to the list.
-    pub action_focus: ActionFocus,
+    /// Cursor into the ROCm tab's Actions list (per-tab selection).
+    pub rocm_sel: usize,
+    /// Cursor into the Serving tab's Actions list (per-tab selection).
+    pub serving_sel: usize,
+    /// Whether the active domain tab's focus is on the Actions list or the
+    /// Details pane. `→`/Enter moves focus into Details; `←`/Esc returns to it.
+    pub pane_focus: PaneFocus,
     /// Cursor into the sorted Instances grid.
     pub instance_sel: usize,
     /// Cursor into the bench_rows VecDeque (0 = oldest, len-1 = newest).
@@ -565,8 +567,9 @@ impl AppState {
             menu_sel: 0,
             palette_sel: 0,
             options_tab: 0,
-            action_sel: 0,
-            action_focus: ActionFocus::List,
+            rocm_sel: 0,
+            serving_sel: 0,
+            pane_focus: PaneFocus::Actions,
             instance_sel: 0,
             bench_sel: 0,
             gpu_sel: 0,
@@ -933,9 +936,8 @@ impl AppState {
             // Observe folds the telemetry tabs; its selectable list is the
             // instances table (the one actionable list in the cluster).
             ActiveTab::Observe => self.instances.len(),
-            // P1: ROCm + Serving both share the ported Action verb list as a
-            // one-phase placeholder; P2 splits them into per-tab modules.
-            ActiveTab::Rocm | ActiveTab::Serving => crate::ui::tabs::action::VERB_COUNT,
+            ActiveTab::Rocm => crate::ui::tabs::rocm::VERB_COUNT,
+            ActiveTab::Serving => crate::ui::tabs::serving::VERB_COUNT,
             _ => 0,
         }
     }
@@ -965,7 +967,8 @@ impl AppState {
     const fn selection_for(&self, tab: ActiveTab) -> usize {
         match tab {
             ActiveTab::Observe => self.instance_sel,
-            ActiveTab::Rocm | ActiveTab::Serving => self.action_sel,
+            ActiveTab::Rocm => self.rocm_sel,
+            ActiveTab::Serving => self.serving_sel,
             _ => 0,
         }
     }
@@ -973,8 +976,27 @@ impl AppState {
     const fn set_selection(&mut self, tab: ActiveTab, idx: usize) {
         match tab {
             ActiveTab::Observe => self.instance_sel = idx,
-            ActiveTab::Rocm | ActiveTab::Serving => self.action_sel = idx,
+            ActiveTab::Rocm => self.rocm_sel = idx,
+            ActiveTab::Serving => self.serving_sel = idx,
             _ => {}
+        }
+    }
+
+    /// Number of rows in the active domain tab's Actions list (0 elsewhere).
+    const fn pane_verb_count(&self) -> usize {
+        match self.active_tab {
+            ActiveTab::Rocm => crate::ui::tabs::rocm::VERB_COUNT,
+            ActiveTab::Serving => crate::ui::tabs::serving::VERB_COUNT,
+            _ => 0,
+        }
+    }
+
+    /// Seam action for the active domain tab's selected verb (`Nothing` else).
+    fn pane_verb_action(&self) -> KeyAction {
+        match self.active_tab {
+            ActiveTab::Rocm => crate::ui::tabs::rocm::verb_action(self.rocm_sel),
+            ActiveTab::Serving => crate::ui::tabs::serving::verb_action(self.serving_sel),
+            _ => KeyAction::Nothing,
         }
     }
 
@@ -1708,59 +1730,60 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
         KeyAction::SwitchTab(t) => {
             state.active_tab = t;
             state.modal = Modal::None;
-            // A fresh tab always starts with focus on its list, never stranded
-            // in the Action detail pane from a previous visit.
-            state.action_focus = ActionFocus::List;
+            // A fresh tab always starts with focus on its Actions list, never
+            // stranded in the Details pane from a previous visit.
+            state.pane_focus = PaneFocus::Actions;
         }
         KeyAction::Move(d) => {
             if state.modal == Modal::ThemePicker {
                 state.theme_picker_move(d);
             } else {
-                // Changing the verb selection snaps focus back to the list so
-                // the detail pane re-previews the newly selected operation.
+                // Changing the verb selection snaps focus back to the Actions
+                // list so Details re-previews the newly selected operation.
                 if matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving) {
-                    state.action_focus = ActionFocus::List;
+                    state.pane_focus = PaneFocus::Actions;
                 }
                 state.move_selection(d);
             }
         }
-        KeyAction::ActionFocusDetail => {
+        KeyAction::PaneFocusDetail => {
             if matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving) {
-                state.action_focus = ActionFocus::Detail;
+                state.pane_focus = PaneFocus::Detail;
             }
         }
-        KeyAction::ActionFocusList => {
+        KeyAction::PaneFocusActions => {
             if matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving) {
-                state.action_focus = ActionFocus::List;
+                state.pane_focus = PaneFocus::Actions;
             }
         }
-        KeyAction::ActionActivate => {
+        KeyAction::PaneActivate => {
             if matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving) {
-                match state.action_focus {
-                    // From the list, Enter steps INTO the detail pane.
-                    ActionFocus::List => state.action_focus = ActionFocus::Detail,
-                    // From the detail pane, Enter opens the operation's manager.
-                    ActionFocus::Detail => {
-                        let verb = crate::ui::tabs::action::verb_action(state.action_sel);
+                match state.pane_focus {
+                    // From the Actions list, Enter steps INTO the Details pane.
+                    PaneFocus::Actions => state.pane_focus = PaneFocus::Detail,
+                    // From Details, Enter opens the operation's manager.
+                    PaneFocus::Detail => {
+                        let verb = state.pane_verb_action();
                         return apply_action(state, verb);
                     }
                 }
             }
         }
-        KeyAction::ActionEscape => {
-            // Esc backs out one level: detail → list, then list → main menu.
+        KeyAction::PaneEscape => {
+            // Esc backs out one level: Details → Actions, then Actions → menu.
             if matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving)
-                && state.action_focus == ActionFocus::Detail
+                && state.pane_focus == PaneFocus::Detail
             {
-                state.action_focus = ActionFocus::List;
+                state.pane_focus = PaneFocus::Actions;
             } else {
                 return apply_action(state, KeyAction::OpenMenu);
             }
         }
-        KeyAction::ActionSelect(i) => {
+        KeyAction::PaneSelect(i) => {
             if matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving) {
-                state.action_sel = i.min(crate::ui::tabs::action::VERB_COUNT.saturating_sub(1));
-                state.action_focus = ActionFocus::List;
+                let last = state.pane_verb_count().saturating_sub(1);
+                state.set_selection(state.active_tab, i.min(last));
+                state.pane_focus = PaneFocus::Actions;
             }
         }
         KeyAction::SelectFirst => {
@@ -1779,9 +1802,9 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
         }
         KeyAction::OpenDetail => {
             if matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving) {
-                // Action rows open the matching manager via the existing seam;
+                // Verb rows open the matching manager via the existing seam;
                 // there is no detail modal on the ROCm/Serving tabs.
-                let verb = crate::ui::tabs::action::verb_action(state.action_sel);
+                let verb = state.pane_verb_action();
                 return apply_action(state, verb);
             }
             if state.selection_len() > 0 {
@@ -1968,9 +1991,8 @@ fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
             // selection is the primary path.
             let action = match state.active_tab {
                 ActiveTab::Observe => ui::tabs::instances::hit_test(area, me.column, me.row, state),
-                ActiveTab::Rocm | ActiveTab::Serving => {
-                    ui::tabs::action::hit_test(area, me.column, me.row)
-                }
+                ActiveTab::Rocm => ui::tabs::rocm::hit_test(area, me.column, me.row),
+                ActiveTab::Serving => ui::tabs::serving::hit_test(area, me.column, me.row),
                 _ => None,
             };
             if let Some(a) = action {
@@ -1991,13 +2013,14 @@ fn footer_chip_hit(chips: &[FooterChip], col: u16, row: u16) -> Option<KeyAction
         .map(|c| c.action)
 }
 
-/// Where the Action tab's keyboard focus currently sits.
+/// Where a domain tab's (ROCm/Serving) keyboard focus currently sits. Shared by
+/// both tabs; each keeps its own selection cursor (`rocm_sel`/`serving_sel`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ActionFocus {
-    /// Browsing the verb list (left column).
+pub enum PaneFocus {
+    /// Browsing the Actions list (left column).
     #[default]
-    List,
-    /// Inside the detail pane (right column), ready to start the operation.
+    Actions,
+    /// Inside the Details pane (right column), ready to start the operation.
     Detail,
 }
 
@@ -2017,19 +2040,19 @@ pub enum KeyAction {
     Nothing,
     Quit,
     SwitchTab(ActiveTab),
-    /// Action tab: move focus into the detail pane (`→`).
-    ActionFocusDetail,
-    /// Action tab: move focus back to the verb list (`←`).
-    ActionFocusList,
-    /// Action tab: activate the current focus — from the list, focus the detail
-    /// pane; from the detail pane, open the operation's manager.
-    ActionActivate,
-    /// Action tab: Esc — step out of the detail pane back to the list, or, when
-    /// already on the list, fall through to the main menu.
-    ActionEscape,
-    /// Action tab: select the verb at this index and park focus on the list
-    /// (from a mouse click on a verb row).
-    ActionSelect(usize),
+    /// ROCm/Serving tab: move focus into the Details pane (`→`).
+    PaneFocusDetail,
+    /// ROCm/Serving tab: move focus back to the Actions list (`←`).
+    PaneFocusActions,
+    /// ROCm/Serving tab: activate the current focus — from the Actions list,
+    /// focus the Details pane; from Details, open the operation's manager.
+    PaneActivate,
+    /// ROCm/Serving tab: Esc — step out of Details back to the Actions list, or,
+    /// when already on the list, fall through to the main menu.
+    PaneEscape,
+    /// ROCm/Serving tab: select the verb at this index and park focus on the
+    /// Actions list (from a mouse click on a verb row).
+    PaneSelect(usize),
     Move(isize),
     SelectFirst,
     SelectLast,
@@ -2259,7 +2282,7 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         // On ROCm/Serving, Esc first steps out of the detail pane (resolved
         // against focus in `apply_action`); elsewhere it opens the main menu.
         KeyCode::Esc if matches!(current, ActiveTab::Rocm | ActiveTab::Serving) => {
-            KeyAction::ActionEscape
+            KeyAction::PaneEscape
         }
         KeyCode::Esc if current != ActiveTab::Chat => KeyAction::OpenMenu,
         KeyCode::Esc => KeyAction::Nothing,
@@ -2398,13 +2421,13 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         // ROCm/Serving tabs: arrow keys drive the focus-into-detail interaction;
         // Enter is focus-aware (list → focus detail, detail → open the manager).
         KeyCode::Right if matches!(current, ActiveTab::Rocm | ActiveTab::Serving) => {
-            KeyAction::ActionFocusDetail
+            KeyAction::PaneFocusDetail
         }
         KeyCode::Left if matches!(current, ActiveTab::Rocm | ActiveTab::Serving) => {
-            KeyAction::ActionFocusList
+            KeyAction::PaneFocusActions
         }
         KeyCode::Enter if matches!(current, ActiveTab::Rocm | ActiveTab::Serving) => {
-            KeyAction::ActionActivate
+            KeyAction::PaneActivate
         }
         KeyCode::Enter => KeyAction::OpenDetail,
         _ => KeyAction::Nothing,
@@ -2514,16 +2537,13 @@ mod tests {
         // → steps into the detail pane, ← steps back, Enter is focus-aware.
         assert_eq!(
             hk(KeyCode::Right, ActiveTab::Rocm),
-            KeyAction::ActionFocusDetail
+            KeyAction::PaneFocusDetail
         );
         assert_eq!(
             hk(KeyCode::Left, ActiveTab::Rocm),
-            KeyAction::ActionFocusList
+            KeyAction::PaneFocusActions
         );
-        assert_eq!(
-            hk(KeyCode::Enter, ActiveTab::Rocm),
-            KeyAction::ActionActivate
-        );
+        assert_eq!(hk(KeyCode::Enter, ActiveTab::Rocm), KeyAction::PaneActivate);
         // Arrows are inert on other tabs (no focus model there).
         assert_eq!(hk(KeyCode::Right, ActiveTab::Observe), KeyAction::Nothing);
         // Enter elsewhere keeps its detail-modal meaning.
@@ -2535,46 +2555,54 @@ mod tests {
 
     #[test]
     fn action_activate_is_two_step_list_then_open() {
+        // Serving verb 0 = "Serve a model" → OpenServeWizard.
         let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Rocm;
-        s.action_sel = 0; // Serve a model → OpenServeWizard
-        assert_eq!(s.action_focus, ActionFocus::List);
+        s.active_tab = ActiveTab::Serving;
+        s.serving_sel = 0;
+        assert_eq!(s.pane_focus, PaneFocus::Actions);
         // First activate steps into the detail pane; no overlay yet.
-        apply_action(&mut s, KeyAction::ActionActivate);
-        assert_eq!(s.action_focus, ActionFocus::Detail);
+        apply_action(&mut s, KeyAction::PaneActivate);
+        assert_eq!(s.pane_focus, PaneFocus::Detail);
         assert!(s.serve_wizard.is_none(), "must not open before stepping in");
         // Second activate opens the operation's manager.
-        apply_action(&mut s, KeyAction::ActionActivate);
+        apply_action(&mut s, KeyAction::PaneActivate);
         assert!(
             s.serve_wizard.is_some(),
             "detail-focus Enter opens the manager"
         );
+        // ROCm verb 2 = "Diagnose (doctor)" → OpenDoctor (the other mapping).
+        let mut r = AppState::new("t".into(), "default-dark".into());
+        r.active_tab = ActiveTab::Rocm;
+        r.rocm_sel = 2;
+        r.pane_focus = PaneFocus::Detail;
+        apply_action(&mut r, KeyAction::PaneActivate);
+        assert!(r.doctor_manager.is_some(), "ROCm Diagnose opens the doctor");
     }
 
     #[test]
     fn action_focus_resets_on_move_and_tab_switch() {
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.active_tab = ActiveTab::Rocm;
-        s.action_focus = ActionFocus::Detail;
+        s.pane_focus = PaneFocus::Detail;
         apply_action(&mut s, KeyAction::Move(1));
-        assert_eq!(s.action_focus, ActionFocus::List, "Move snaps back to list");
-        s.action_focus = ActionFocus::Detail;
+        assert_eq!(s.pane_focus, PaneFocus::Actions, "Move snaps back to list");
+        s.pane_focus = PaneFocus::Detail;
         apply_action(&mut s, KeyAction::SwitchTab(ActiveTab::Home));
-        assert_eq!(s.action_focus, ActionFocus::List, "tab switch resets focus");
+        assert_eq!(s.pane_focus, PaneFocus::Actions, "tab switch resets focus");
     }
 
     #[test]
     fn action_esc_backs_out_of_detail_then_opens_menu() {
         // Esc on Action is intercepted (not the global OpenMenu) so it can back
         // out of the detail pane first.
-        assert_eq!(hk(KeyCode::Esc, ActiveTab::Rocm), KeyAction::ActionEscape);
+        assert_eq!(hk(KeyCode::Esc, ActiveTab::Rocm), KeyAction::PaneEscape);
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.active_tab = ActiveTab::Rocm;
-        s.action_focus = ActionFocus::Detail;
-        apply_action(&mut s, KeyAction::ActionEscape);
-        assert_eq!(s.action_focus, ActionFocus::List, "first Esc → list");
+        s.pane_focus = PaneFocus::Detail;
+        apply_action(&mut s, KeyAction::PaneEscape);
+        assert_eq!(s.pane_focus, PaneFocus::Actions, "first Esc → list");
         assert_eq!(s.modal, Modal::None, "first Esc does not open the menu");
-        apply_action(&mut s, KeyAction::ActionEscape);
+        apply_action(&mut s, KeyAction::PaneEscape);
         assert_eq!(s.modal, Modal::Menu, "second Esc opens the menu");
     }
 
@@ -2582,13 +2610,13 @@ mod tests {
     fn action_select_sets_verb_and_parks_on_list() {
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.active_tab = ActiveTab::Rocm;
-        s.action_focus = ActionFocus::Detail;
-        apply_action(&mut s, KeyAction::ActionSelect(2));
-        assert_eq!(s.action_sel, 2);
-        assert_eq!(s.action_focus, ActionFocus::List);
+        s.pane_focus = PaneFocus::Detail;
+        apply_action(&mut s, KeyAction::PaneSelect(2));
+        assert_eq!(s.rocm_sel, 2);
+        assert_eq!(s.pane_focus, PaneFocus::Actions);
         // Out-of-range clamps rather than panicking.
-        apply_action(&mut s, KeyAction::ActionSelect(999));
-        assert!(s.action_sel < crate::ui::tabs::action::VERB_COUNT);
+        apply_action(&mut s, KeyAction::PaneSelect(999));
+        assert!(s.rocm_sel < crate::ui::tabs::rocm::VERB_COUNT);
     }
 
     #[test]

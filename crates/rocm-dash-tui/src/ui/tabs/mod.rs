@@ -6,7 +6,6 @@
 //! `pub fn draw(f, area, state, theme)` so they can be implemented in parallel
 //! without touching shared files.
 
-pub mod action;
 pub mod bench;
 pub mod chat;
 pub mod hardware;
@@ -14,6 +13,9 @@ pub mod home;
 pub mod instances;
 pub mod observe;
 pub mod overview;
+pub mod pane;
+pub mod rocm;
+pub mod serving;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
