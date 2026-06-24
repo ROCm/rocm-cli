@@ -11,9 +11,10 @@ use rocm_core::{
 use rocm_engine_protocol::{
     DetectRequest, DetectResponse, DevicePolicy, ENGINE_RECIPE_CONTRACT_VERSION, EndpointRequest,
     EndpointResponse, EngineCapabilities, EngineDeviceAvailability, EngineMethod, EngineRecipeHint,
-    EngineRequestEnvelope, EngineResponseEnvelope, HealthcheckRequest, HealthcheckResponse,
-    InstallRequest, InstallResponse, LaunchRequest, LaunchResponse, LogsRequest, LogsResponse,
-    ResolveModelRequest, ResolveModelResponse, StopRequest, StopResponse,
+    EngineRequestEnvelope, EngineResponseEnvelope, GpuSelection, HealthcheckRequest,
+    HealthcheckResponse, InstallRequest, InstallResponse, LaunchRequest, LaunchResponse,
+    LogsRequest, LogsResponse, ResolveModelRequest, ResolveModelResponse, StopRequest,
+    StopResponse,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -81,6 +82,8 @@ enum CommandKind {
         runtime_id: Option<String>,
         #[arg(long)]
         env_id: Option<String>,
+        #[arg(long)]
+        gpu: Option<String>,
     },
     Stdio,
     ServeHttp {
@@ -102,6 +105,8 @@ enum CommandKind {
         log_path: Option<PathBuf>,
         #[arg(long)]
         engine_recipe_json: Option<String>,
+        #[arg(long)]
+        gpu: Option<String>,
     },
 }
 
@@ -131,6 +136,7 @@ struct ServeHttpRequest {
     host: String,
     port: u16,
     device_policy: Option<String>,
+    gpu_indices: Vec<u32>,
     runtime_id: Option<String>,
     env_id: Option<String>,
     state_path: PathBuf,
@@ -198,6 +204,7 @@ pub fn run_cli() -> Result<()> {
                 device_policy: None,
                 recipe_override: None,
                 engine_recipe: None,
+                gpu_selection: None,
             })?)?;
         }
         CommandKind::Launch {
@@ -208,6 +215,7 @@ pub fn run_cli() -> Result<()> {
             device_policy,
             runtime_id,
             env_id,
+            gpu,
         } => print_json(&launch_service(LaunchRequest {
             service_id,
             env_id,
@@ -218,6 +226,7 @@ pub fn run_cli() -> Result<()> {
             device_policy: Some(parse_device_policy_arg(device_policy.as_deref())?),
             endpoint_mode: Some("openai".to_owned()),
             engine_recipe: None,
+            gpu_selection: parse_gpu_selection_arg(gpu.as_deref())?,
         })?)?,
         CommandKind::Stdio => {
             let envelope = read_request()?;
@@ -234,12 +243,14 @@ pub fn run_cli() -> Result<()> {
             state_path,
             log_path,
             engine_recipe_json,
+            gpu,
         } => serve_http(ServeHttpRequest {
             service_id,
             model_ref,
             host,
             port,
             device_policy,
+            gpu_indices: parse_gpu_indices_arg(gpu.as_deref())?,
             runtime_id,
             env_id,
             state_path,
@@ -261,6 +272,7 @@ pub fn builtin_serve_http(
     host: String,
     port: u16,
     device_policy: Option<String>,
+    gpu_indices: Vec<u32>,
     runtime_id: Option<String>,
     env_id: Option<String>,
     state_path: PathBuf,
@@ -273,6 +285,7 @@ pub fn builtin_serve_http(
         host,
         port,
         device_policy,
+        gpu_indices,
         runtime_id,
         env_id,
         state_path,
@@ -392,11 +405,9 @@ fn engine_capabilities(rocm_gpu: bool) -> EngineCapabilities {
     EngineCapabilities {
         cpu: false,
         rocm_gpu,
-        multi_gpu: rocm_gpu,
         openai_compatible: true,
         tool_calling: false,
         quantized_models: "gguf".to_owned(),
-        distributed_serving: false,
         reasoning_parser: false,
     }
 }
@@ -711,6 +722,12 @@ fn serve_http_command_args(
         args.push("--log-path".to_owned());
         args.push(log_path.display().to_string());
     }
+    if let Some(csv) = rocm_engine_protocol::gpu_indices_to_csv(
+        &rocm_engine_protocol::launch_gpu_indices(request.gpu_selection.as_ref()),
+    ) {
+        args.push("--gpu".to_owned());
+        args.push(csv);
+    }
     if let Some(engine_recipe) = request.engine_recipe.as_ref() {
         args.push("--engine-recipe-json".to_owned());
         args.push(serde_json::to_string(engine_recipe).expect("engine recipe serializes"));
@@ -798,6 +815,9 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
     let mut command = ProcessCommand::new(&prepared_server.program);
     let server_args = llama_server_args(&request, gpu_requested);
     command.args(&server_args).stdin(Stdio::null());
+    if let Some(csv) = rocm_engine_protocol::gpu_indices_to_csv(&request.gpu_indices) {
+        command.env("HIP_VISIBLE_DEVICES", csv);
+    }
     if let Some(log_path) = request.log_path.as_ref() {
         if let Some(parent) = log_path.parent() {
             fs::create_dir_all(parent)
@@ -1777,6 +1797,20 @@ fn parse_device_policy_arg(value: Option<&str>) -> Result<DevicePolicy> {
     }
 }
 
+/// Parse a `--gpu` CLI value into an optional `GpuSelection` for `LaunchRequest`.
+fn parse_gpu_selection_arg(value: Option<&str>) -> Result<Option<GpuSelection>> {
+    value
+        .map(|raw| GpuSelection::parse_cli_value(raw).map_err(anyhow::Error::msg))
+        .transpose()
+}
+
+/// Parse a `--gpu` CLI value into explicit device ordinals (empty for `auto`).
+fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
+    Ok(rocm_engine_protocol::launch_gpu_indices(
+        parse_gpu_selection_arg(value)?.as_ref(),
+    ))
+}
+
 fn current_unix_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1824,6 +1858,7 @@ mod tests {
             device_policy: Some(DevicePolicy::CpuOnly),
             recipe_override: None,
             engine_recipe: None,
+            gpu_selection: None,
         })
         .expect_err("cpu policy should not resolve");
         assert!(error.to_string().contains("no CPU fallback is used"));
@@ -1837,6 +1872,7 @@ mod tests {
             device_policy: Some(DevicePolicy::GpuPreferred),
             recipe_override: None,
             engine_recipe: None,
+            gpu_selection: None,
         })?;
 
         assert_eq!(response.device_policy, DevicePolicy::GpuRequired);
@@ -1851,6 +1887,7 @@ mod tests {
             device_policy: Some(DevicePolicy::GpuRequired),
             recipe_override: None,
             engine_recipe: None,
+            gpu_selection: None,
         })?;
 
         assert_eq!(response.device_policy, DevicePolicy::GpuRequired);
@@ -1872,6 +1909,7 @@ mod tests {
             device_policy: Some(DevicePolicy::GpuRequired),
             recipe_override: None,
             engine_recipe: None,
+            gpu_selection: None,
         })?;
         fs::remove_file(&path).ok();
 
@@ -1888,6 +1926,7 @@ mod tests {
             device_policy: Some(DevicePolicy::GpuRequired),
             recipe_override: None,
             engine_recipe: None,
+            gpu_selection: None,
         })?;
 
         assert_eq!(response.canonical_model_id, "missing-model.gguf");
@@ -1909,6 +1948,7 @@ mod tests {
             device_policy: Some(DevicePolicy::GpuRequired),
             recipe_override: None,
             engine_recipe: Some(hint.clone()),
+            gpu_selection: None,
         })?;
 
         assert_eq!(response.engine_recipe, Some(hint));
@@ -1926,6 +1966,7 @@ mod tests {
                 "pytorch",
                 ENGINE_RECIPE_CONTRACT_VERSION,
             )),
+            gpu_selection: None,
         })
         .expect_err("mismatched engine recipe should fail");
 
@@ -1940,6 +1981,7 @@ mod tests {
             device_policy: Some(DevicePolicy::GpuRequired),
             recipe_override: None,
             engine_recipe: Some(test_engine_recipe(ENGINE_NAME, "999.0.0")),
+            gpu_selection: None,
         })
         .expect_err("unsupported recipe contract should fail");
 
@@ -2441,6 +2483,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             port: 11435,
             device_policy: Some("gpu_required".to_owned()),
+            gpu_indices: Vec::new(),
             runtime_id: None,
             env_id: None,
             state_path: PathBuf::from("state.json"),
@@ -2516,6 +2559,7 @@ mod tests {
             device_policy: Some(DevicePolicy::GpuRequired),
             endpoint_mode: Some("openai".to_owned()),
             engine_recipe: None,
+            gpu_selection: None,
         };
 
         let args = serve_http_command_args(
@@ -2565,6 +2609,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             port: 11435,
             device_policy: Some("gpu_required".to_owned()),
+            gpu_indices: Vec::new(),
             runtime_id: Some("therock-release".to_owned()),
             env_id: None,
             state_path: PathBuf::from("state.json"),
@@ -2592,6 +2637,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             port: 11435,
             device_policy: Some("gpu_required".to_owned()),
+            gpu_indices: Vec::new(),
             runtime_id: Some("therock-release".to_owned()),
             env_id: None,
             state_path: PathBuf::from("state.json"),
@@ -2615,6 +2661,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             port: 11435,
             device_policy: Some("cpu_only".to_owned()),
+            gpu_indices: Vec::new(),
             runtime_id: None,
             env_id: None,
             state_path: PathBuf::from("state.json"),

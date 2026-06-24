@@ -97,6 +97,8 @@ enum Command {
         #[arg(long, default_value = "gpu_required")]
         device_policy: String,
         #[arg(long)]
+        gpu: Option<String>,
+        #[arg(long)]
         engine_recipe_json: Option<String>,
     },
     Status,
@@ -281,6 +283,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
             host,
             port,
             device_policy,
+            gpu,
             engine_recipe_json,
         } => supervise_service(
             &paths,
@@ -293,6 +296,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
             host,
             port,
             device_policy,
+            gpu,
             engine_recipe_json,
         )?,
         Command::Status => {
@@ -3055,6 +3059,7 @@ fn supervise_service(
     host: String,
     port: u16,
     device_policy: String,
+    gpu: Option<String>,
     engine_recipe_json: Option<String>,
 ) -> Result<()> {
     paths.ensure()?;
@@ -3062,6 +3067,7 @@ fn supervise_service(
     fs::create_dir_all(paths.engine_state_dir(&engine))?;
     fs::create_dir_all(paths.services_dir())?;
 
+    let gpu_indices = parse_gpu_indices_arg(gpu.as_deref())?;
     let _ = daemon_binary_path();
 
     let mut record = ManagedServiceRecord::new(
@@ -3078,6 +3084,7 @@ fn supervise_service(
         env_id.clone(),
         Some(device_policy.clone()),
     );
+    record.gpu_indices = gpu_indices;
     record.engine_recipe_json = engine_recipe_json.clone();
     record.write()?;
 
@@ -3097,6 +3104,7 @@ fn supervise_service(
             &record.host,
             record.port,
             &device_policy,
+            &record.gpu_indices,
             runtime_id.as_deref(),
             env_id.as_deref(),
             engine_recipe_json.as_deref(),
@@ -3146,6 +3154,7 @@ fn engine_serve_http_args(
     host: &str,
     port: u16,
     device_policy: &str,
+    gpu_indices: &[u32],
     runtime_id: Option<&str>,
     env_id: Option<&str>,
     engine_recipe_json: Option<&str>,
@@ -3163,6 +3172,9 @@ fn engine_serve_http_args(
         "--device-policy".to_owned(),
         device_policy.to_owned(),
     ];
+    if let Some(csv) = rocm_engine_protocol::gpu_indices_to_csv(gpu_indices) {
+        args.extend(["--gpu".to_owned(), csv]);
+    }
     args.extend(optional_arg("--runtime-id", runtime_id));
     args.extend(optional_arg("--env-id", env_id));
     args.extend(optional_arg("--engine-recipe-json", engine_recipe_json));
@@ -4806,6 +4818,9 @@ fn recovery_supervise_args(record: &ManagedServiceRecord) -> Vec<String> {
     ];
     args.extend(optional_arg("--runtime-id", record.runtime_id.as_deref()));
     args.extend(optional_arg("--env-id", record.env_id.as_deref()));
+    if let Some(csv) = rocm_engine_protocol::gpu_indices_to_csv(&record.gpu_indices) {
+        args.extend(["--gpu".to_owned(), csv]);
+    }
     args.extend(optional_arg(
         "--engine-recipe-json",
         record.engine_recipe_json.as_deref(),
@@ -4982,6 +4997,7 @@ mod tests {
             "127.0.0.1",
             11435,
             "gpu_required",
+            &[],
             Some("therock-release:gfx120X-all"),
             Some("env-1"),
             Some(engine_recipe_json),
@@ -5001,6 +5017,43 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair[0] == "--state-path" && pair[1] == "state.json")
         );
+    }
+
+    #[test]
+    fn engine_serve_http_args_emit_gpu_indices_when_pinned() {
+        let args = engine_serve_http_args(
+            "vllm",
+            "svc-1",
+            "Qwen/Qwen3.5-4B",
+            "127.0.0.1",
+            11435,
+            "gpu_required",
+            &[1],
+            None,
+            None,
+            None,
+            Path::new("state.json"),
+        );
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--gpu" && pair[1] == "1")
+        );
+
+        let auto = engine_serve_http_args(
+            "vllm",
+            "svc-1",
+            "Qwen/Qwen3.5-4B",
+            "127.0.0.1",
+            11435,
+            "gpu_required",
+            &[],
+            None,
+            None,
+            None,
+            Path::new("state.json"),
+        );
+        assert!(!auto.iter().any(|arg| arg == "--gpu"));
     }
 
     #[test]
@@ -8486,6 +8539,16 @@ async fn shutdown_signal() {
 #[cfg(not(unix))]
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
+    let Some(raw) = value else {
+        return Ok(Vec::new());
+    };
+    match rocm_engine_protocol::GpuSelection::parse_cli_value(raw).map_err(anyhow::Error::msg)? {
+        rocm_engine_protocol::GpuSelection::Auto => Ok(Vec::new()),
+        rocm_engine_protocol::GpuSelection::Index(index) => Ok(vec![index]),
+    }
 }
 
 fn optional_arg(flag: &str, value: Option<&str>) -> Vec<String> {

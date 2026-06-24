@@ -43,6 +43,21 @@ Managed serving:
 rocm serve Qwen/Qwen3.5-4B --engine sglang --device gpu_required --managed
 ```
 
+### GPU selection
+
+Use `--gpu` to choose the AMD GPU SGLang runs on:
+
+```bash
+# Default: first free GPU (auto)
+rocm serve Qwen/Qwen3.5-4B --engine sglang --managed
+
+# Pin a specific GPU
+rocm serve Qwen/Qwen3.5-4B --engine sglang --gpu 1 --managed
+```
+
+rocm-cli pins the device via `HIP_VISIBLE_DEVICES`. Serving one model across
+multiple GPUs is not supported.
+
 Native Windows SGLang serving is skipped in this adapter. Use WSL/Linux for
 SGLang ROCm serving, or choose a different engine explicitly. No CPU fallback is
 used.

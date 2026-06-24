@@ -42,7 +42,7 @@ use rocm_engine_protocol::{
     DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy,
     ENGINE_RECIPE_CONTRACT_VERSION, EngineMethod, EnginePluginDescriptor, EngineRecipeEndpointHint,
     EngineRecipeHint, EngineRecipeUnsupportedCombinationHint, EngineRequestEnvelope,
-    EngineResponseEnvelope, InstallRequest, InstallResponse, ResolveModelRequest,
+    EngineResponseEnvelope, GpuSelection, InstallRequest, InstallResponse, ResolveModelRequest,
     ResolveModelResponse, StopRequest, StopResponse,
 };
 use serde::de::DeserializeOwned;
@@ -147,6 +147,8 @@ enum Command {
         port: u16,
         #[arg(long, default_value = "gpu_required")]
         device_policy: String,
+        #[arg(long)]
+        gpu: Option<String>,
         #[arg(long, conflicts_with = "env_id")]
         runtime_id: Option<String>,
         #[arg(long, conflicts_with = "runtime_id")]
@@ -278,6 +280,10 @@ rocm serve qwen2.5-7b-instruct --foreground --device gpu_required")]
         /// Device policy [possible values: gpu_required, gpu_preferred, cpu_only].
         #[arg(long)]
         device: Option<String>,
+        /// GPU device to serve on: `auto` (default; first free GPU) or a single
+        /// index like `1`.
+        #[arg(long, value_name = "INDEX|auto")]
+        gpu: Option<String>,
         /// ROCm runtime key to use for this server.
         #[arg(long, conflicts_with = "env_id")]
         runtime_id: Option<String>,
@@ -1240,6 +1246,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             host,
             port,
             device_policy,
+            gpu,
             runtime_id,
             env_id,
             state_path,
@@ -1252,6 +1259,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             host,
             port,
             &device_policy,
+            parse_gpu_indices_arg(gpu.as_deref())?,
             runtime_id,
             env_id,
             state_path,
@@ -1433,6 +1441,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             model,
             engine,
             device,
+            gpu,
             runtime_id,
             env_id,
             host,
@@ -1444,6 +1453,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             model,
             engine,
             device,
+            gpu,
             runtime_id,
             env_id,
             host,
@@ -3658,6 +3668,7 @@ fn serve(
     model: String,
     engine: Option<String>,
     device: Option<String>,
+    gpu: Option<String>,
     runtime_id: Option<String>,
     env_id: Option<String>,
     host: String,
@@ -3683,6 +3694,9 @@ fn serve(
     let engine_model_ref =
         serve_model_ref_for_engine(&model, shared_recipe.as_ref(), &selected_engine);
     let device_policy = parse_device_policy(device.as_deref())?;
+    let gpu_selection = parse_gpu_selection(gpu.as_deref())?;
+    let gpu_vram = gpu_vram_usage();
+    let gpu_indices = resolve_gpu_indices(&paths, &gpu_selection, gpu_vram.as_deref())?;
     let resolved_selection = resolve_engine_selection(
         &config,
         &selected_engine,
@@ -3715,6 +3729,7 @@ fn serve(
             device_policy: Some(device_policy),
             recipe_override: None,
             engine_recipe,
+            gpu_selection: Some(gpu_selection.clone()),
         },
     )?;
     let service_id = generate_service_id(&selected_engine, &resolve.canonical_model_id);
@@ -3739,6 +3754,23 @@ fn serve(
         "  device_policy: {}",
         device_policy_name(&resolve.device_policy)
     );
+    match &gpu_selection {
+        GpuSelection::Auto => {
+            if let Some(csv) = rocm_engine_protocol::gpu_indices_to_csv(&gpu_indices) {
+                println!("  gpu: auto (selected {csv})");
+            } else {
+                println!("  gpu: auto (engine default visibility)");
+            }
+        }
+        GpuSelection::Index(_) => {
+            let csv = rocm_engine_protocol::gpu_indices_to_csv(&gpu_indices)
+                .unwrap_or_else(|| "none".to_owned());
+            println!("  gpu: {csv}");
+        }
+    }
+    if let Some(warning) = gpu_low_memory_warning(&gpu_indices, gpu_vram.as_deref()) {
+        println!("  {warning}");
+    }
     if let Some(engine_recipe) = &resolve.engine_recipe {
         print!("{}", render_serve_engine_recipe_lines(engine_recipe));
     }
@@ -3767,6 +3799,7 @@ fn serve(
             &host,
             port,
             &resolve.device_policy,
+            &gpu_indices,
             managed_runtime_id.as_deref(),
             managed_env_id.as_deref(),
             resolve.engine_recipe.as_ref(),
@@ -3786,6 +3819,7 @@ fn serve(
         &host,
         port,
         &resolve.device_policy,
+        &gpu_indices,
         resolved_selection.runtime_id.as_deref(),
         resolved_selection.env_id.as_deref(),
         resolve.engine_recipe.as_ref(),
@@ -3843,6 +3877,7 @@ fn start_managed_service(
     host: &str,
     port: u16,
     device_policy: &DevicePolicy,
+    gpu_indices: &[u32],
     runtime_id: Option<&str>,
     env_id: Option<&str>,
     engine_recipe: Option<&EngineRecipeHint>,
@@ -3893,6 +3928,7 @@ fn start_managed_service(
         env_id.map(str::to_owned),
         Some(device_policy_name(device_policy).to_owned()),
     );
+    record.gpu_indices = gpu_indices.to_vec();
     record.engine_recipe_json = engine_recipe
         .map(serde_json::to_string)
         .transpose()
@@ -3914,6 +3950,7 @@ fn start_managed_service(
         host,
         port,
         device_policy,
+        gpu_indices,
         runtime_id,
         env_id,
         engine_recipe,
@@ -4048,6 +4085,7 @@ fn run_foreground_service(
     host: &str,
     port: u16,
     device_policy: &DevicePolicy,
+    gpu_indices: &[u32],
     runtime_id: Option<&str>,
     env_id: Option<&str>,
     engine_recipe: Option<&EngineRecipeHint>,
@@ -4070,6 +4108,7 @@ fn run_foreground_service(
         env_id.map(str::to_owned),
         Some(device_policy_name(device_policy).to_owned()),
     );
+    record.gpu_indices = gpu_indices.to_vec();
     record.write()?;
 
     println!("foreground service starting");
@@ -4088,6 +4127,7 @@ fn run_foreground_service(
         host.to_owned(),
         port,
         device_policy_name(device_policy),
+        gpu_indices.to_vec(),
         runtime_id.map(str::to_owned),
         env_id.map(str::to_owned),
         record.engine_state_path.clone(),
@@ -11369,6 +11409,7 @@ fn restart_internal_managed_service(
         &record.host,
         record.port,
         &policy,
+        &record.gpu_indices,
         record.runtime_id.as_deref(),
         record.env_id.as_deref(),
         recipe.as_ref(),
@@ -14131,6 +14172,7 @@ fn run_builtin_engine_serve_http(
     host: String,
     port: u16,
     device_policy: &str,
+    gpu_indices: Vec<u32>,
     runtime_id: Option<String>,
     env_id: Option<String>,
     state_path: PathBuf,
@@ -14145,6 +14187,7 @@ fn run_builtin_engine_serve_http(
             host,
             port,
             parsed_policy,
+            gpu_indices,
             runtime_id,
             env_id,
             state_path,
@@ -14156,6 +14199,7 @@ fn run_builtin_engine_serve_http(
             host,
             port,
             parsed_policy,
+            gpu_indices,
             runtime_id,
             env_id,
             state_path,
@@ -14168,6 +14212,7 @@ fn run_builtin_engine_serve_http(
             host,
             port,
             Some(device_policy_name(&parsed_policy).to_owned()),
+            gpu_indices,
             runtime_id,
             env_id,
             state_path,
@@ -14180,6 +14225,7 @@ fn run_builtin_engine_serve_http(
             host,
             port,
             parsed_policy,
+            gpu_indices,
             env_id,
             runtime_id,
             state_path,
@@ -14191,6 +14237,7 @@ fn run_builtin_engine_serve_http(
             host,
             port,
             parsed_policy,
+            gpu_indices,
             runtime_id,
             env_id,
             state_path,
@@ -14202,6 +14249,7 @@ fn run_builtin_engine_serve_http(
             host,
             port,
             parsed_policy,
+            gpu_indices,
             runtime_id,
             env_id,
             state_path,
@@ -14219,6 +14267,7 @@ fn builtin_engine_serve_http_args(
     host: &str,
     port: u16,
     device_policy: &DevicePolicy,
+    gpu_indices: &[u32],
     runtime_id: Option<&str>,
     env_id: Option<&str>,
     engine_recipe: Option<&EngineRecipeHint>,
@@ -14237,6 +14286,9 @@ fn builtin_engine_serve_http_args(
         "--device-policy".to_owned(),
         device_policy_name(device_policy).to_owned(),
     ];
+    if let Some(csv) = rocm_engine_protocol::gpu_indices_to_csv(gpu_indices) {
+        args.extend(["--gpu".to_owned(), csv]);
+    }
     if env_id.is_none() {
         args.extend(optional_arg("--runtime-id", runtime_id));
     }
@@ -14257,6 +14309,278 @@ fn parse_device_policy(value: Option<&str>) -> Result<DevicePolicy> {
         ),
         other => bail!("unsupported device policy: {other}"),
     }
+}
+
+/// Parse the user-facing `--gpu` value (`auto`, `1`, or `0,1,2`) into a
+/// `GpuSelection`. `None` defaults to `auto`.
+fn parse_gpu_selection(value: Option<&str>) -> Result<GpuSelection> {
+    let Some(raw) = value else {
+        return Ok(GpuSelection::Auto);
+    };
+    GpuSelection::parse_cli_value(raw).map_err(|message| anyhow::anyhow!(message))
+}
+
+/// Parse the internal `--gpu` csv passed to the hidden `__engine-serve-http`
+/// subcommand back into explicit device ordinals (empty when absent/`auto`).
+fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
+    match parse_gpu_selection(value)? {
+        GpuSelection::Auto => Ok(Vec::new()),
+        GpuSelection::Index(index) => Ok(vec![index]),
+    }
+}
+
+/// Resolve a `GpuSelection` to the concrete device ordinal to pin for this
+/// server. `Auto` picks the lowest-numbered GPU that is idle (high free VRAM)
+/// and not already serving a rocm-cli managed/foreground model; an explicit
+/// index is validated against the detected GPU count when it is known. The
+/// result holds at most one ordinal; serving across multiple GPUs is not
+/// supported.
+///
+/// Ordinal semantics: the index produced here is fed to engines via
+/// `HIP_VISIBLE_DEVICES`, but it is sourced from `amd-smi`'s `gpu` index
+/// (probing/busy detection). On a normal single-host ROCm install without GPU
+/// partitioning these orderings coincide, but they are not guaranteed to match
+/// when `ROCR_VISIBLE_DEVICES`, CPX/partition modes, or non-default device
+/// enumeration are in play. Validate on multi-GPU hardware before relying on a
+/// specific `--gpu <index>` mapping in those configurations.
+fn resolve_gpu_indices(
+    paths: &AppPaths,
+    selection: &GpuSelection,
+    vram: Option<&[GpuVramUsage]>,
+) -> Result<Vec<u32>> {
+    let detected = detect_gpu_count();
+    match selection {
+        GpuSelection::Index(index) => {
+            if let Some(count) = detected
+                && (*index as usize) >= count
+            {
+                bail!(
+                    "--gpu index {index} is out of range; {count} GPU(s) detected (valid indices 0..{})",
+                    count - 1
+                );
+            }
+            Ok(vec![*index])
+        }
+        GpuSelection::Auto => Ok(auto_select_gpu_indices(paths, detected, vram)),
+    }
+}
+
+/// A GPU's local VRAM occupancy as reported by `amd-smi metric --json`.
+#[derive(Debug, Clone, Copy)]
+struct GpuVramUsage {
+    index: u32,
+    used_mb: u64,
+    total_mb: u64,
+}
+
+impl GpuVramUsage {
+    /// Fraction of total VRAM that is currently free (`0.0`..=`1.0`). Returns
+    /// `None` when the total is unknown so callers do not divide by zero.
+    fn free_fraction(self) -> Option<f64> {
+        if self.total_mb == 0 {
+            return None;
+        }
+        Some(self.total_mb.saturating_sub(self.used_mb) as f64 / self.total_mb as f64)
+    }
+}
+
+/// A GPU is treated as "free" for `--gpu auto` when at least this fraction of
+/// its VRAM is unused (i.e. it is effectively idle).
+const AUTO_FREE_VRAM_FRACTION: f64 = 0.90;
+
+/// Pick a GPU ordinal for `--gpu auto`. Prefers the lowest-numbered GPU that is
+/// idle (free VRAM at or above [`AUTO_FREE_VRAM_FRACTION`]) and not pinned by a
+/// running rocm-cli service; otherwise falls back to the non-busy GPU with the
+/// most free VRAM, then to the first non-busy GPU, then to `[0]`.
+///
+/// Selection reads service state without holding a lock, so two near-concurrent
+/// `--gpu auto` launches can race onto the same idle GPU. The VRAM-occupancy
+/// fallback and the start-time low-memory warning keep this from silently
+/// overcommitting in practice; pass an explicit `--gpu <index>` to avoid the
+/// race entirely.
+fn auto_select_gpu_indices(
+    paths: &AppPaths,
+    detected: Option<usize>,
+    vram: Option<&[GpuVramUsage]>,
+) -> Vec<u32> {
+    let busy = busy_gpu_indices(paths);
+    select_auto_gpu_index(detected, &busy, vram)
+}
+
+/// Pure auto-selection used by [`auto_select_gpu_indices`], split out so the
+/// preference order can be unit-tested without amd-smi or service state.
+fn select_auto_gpu_index(
+    detected: Option<usize>,
+    busy: &[u32],
+    vram: Option<&[GpuVramUsage]>,
+) -> Vec<u32> {
+    let count = detected.unwrap_or(0);
+    if count == 0 {
+        return vec![0];
+    }
+    let candidates = || (0..count as u32).filter(|index| !busy.contains(index));
+    let usage_for = |index: u32| vram.and_then(|rows| rows.iter().find(|row| row.index == index));
+
+    if vram.is_some() {
+        // Pass 1: lowest-index idle GPU.
+        for index in candidates() {
+            if let Some(free) = usage_for(index).and_then(|usage| usage.free_fraction())
+                && free >= AUTO_FREE_VRAM_FRACTION
+            {
+                return vec![index];
+            }
+        }
+        // Pass 2: the non-busy GPU with the most free VRAM.
+        if let Some(index) = candidates().max_by(|left, right| {
+            let left_free = usage_for(*left).and_then(|usage| usage.free_fraction());
+            let right_free = usage_for(*right).and_then(|usage| usage.free_fraction());
+            left_free
+                .partial_cmp(&right_free)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                // Break ties toward the lowest index.
+                .then(right.cmp(left))
+        }) && usage_for(index)
+            .and_then(|usage| usage.free_fraction())
+            .is_some()
+        {
+            return vec![index];
+        }
+    }
+
+    // Pass 3: no VRAM telemetry; first GPU not pinned by a managed service.
+    if let Some(index) = candidates().next() {
+        return vec![index];
+    }
+    // Every detected GPU is pinned by a running service. We still return GPU 0
+    // (no CPU fallback is ever used); the caller surfaces a low-memory warning
+    // so the user can free a device or pick another `--gpu`.
+    vec![0]
+}
+
+/// Best-effort per-GPU VRAM occupancy via `amd-smi metric --json`. Returns
+/// `None` when amd-smi is unavailable or its output cannot be parsed (callers
+/// then fall back to service-state-only auto-selection).
+fn gpu_vram_usage() -> Option<Vec<GpuVramUsage>> {
+    let binary = rocm_core::resolve_amd_smi_binary();
+    let output = ProcessCommand::new(&binary)
+        .arg("metric")
+        .arg("--json")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let rows = parse_gpu_vram_usage(&value);
+    if rows.is_empty() { None } else { Some(rows) }
+}
+
+/// Parse `amd-smi metric --json` output into per-GPU VRAM usage. Accepts both
+/// the `{"gpu_data": [...]}` envelope and a bare top-level array, mirroring the
+/// schema variance handled by the dashboard amd-smi collector.
+fn parse_gpu_vram_usage(value: &serde_json::Value) -> Vec<GpuVramUsage> {
+    let entries = value
+        .get("gpu_data")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array());
+    let Some(entries) = entries else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(position, entry)| {
+            let index = entry
+                .get("gpu")
+                .and_then(serde_json::Value::as_u64)
+                .map_or(position as u32, |id| id as u32);
+            let used_mb = entry
+                .pointer("/mem_usage/used_vram/value")
+                .and_then(serde_json::Value::as_u64)?;
+            let total_mb = entry
+                .pointer("/mem_usage/total_vram/value")
+                .and_then(serde_json::Value::as_u64)?;
+            Some(GpuVramUsage {
+                index,
+                used_mb,
+                total_mb,
+            })
+        })
+        .collect()
+}
+
+/// Build a serve-plan warning when a selected GPU is already heavily used, so
+/// the user knows to free it or pick another `--gpu` before the engine fails on
+/// insufficient VRAM. Returns `None` when telemetry is missing or the selected
+/// GPUs are comfortably free.
+fn gpu_low_memory_warning(gpu_indices: &[u32], vram: Option<&[GpuVramUsage]>) -> Option<String> {
+    let vram = vram?;
+    for &index in gpu_indices {
+        // Skip indices without telemetry rather than abandoning the whole scan,
+        // so a missing row for one GPU does not suppress warnings for others.
+        let Some(usage) = vram.iter().find(|row| row.index == index) else {
+            continue;
+        };
+        let Some(free) = usage.free_fraction() else {
+            continue;
+        };
+        if free < AUTO_FREE_VRAM_FRACTION {
+            let free_gib = (usage.total_mb.saturating_sub(usage.used_mb)) as f64 / 1024.0;
+            let total_gib = usage.total_mb as f64 / 1024.0;
+            return Some(format!(
+                "warning: GPU {index} has only {free_gib:.1} GiB of {total_gib:.1} GiB free; \
+                 serving may fail on VRAM. Free it or pick another with `--gpu <index|auto>`."
+            ));
+        }
+    }
+    None
+}
+
+/// GPU ordinals currently pinned by running rocm-cli managed/foreground
+/// services, used to skip busy devices during `--gpu auto` selection.
+fn busy_gpu_indices(paths: &AppPaths) -> Vec<u32> {
+    let Ok(records) = load_managed_services(paths) else {
+        return Vec::new();
+    };
+    let mut busy = Vec::new();
+    for record in records {
+        if !matches!(
+            record.status.as_str(),
+            "starting" | "running" | "recovering" | "ready"
+        ) {
+            continue;
+        }
+        for index in record.gpu_indices {
+            if !busy.contains(&index) {
+                busy.push(index);
+            }
+        }
+    }
+    busy
+}
+
+/// Best-effort count of local AMD GPUs via `amd-smi`. Returns `None` when
+/// amd-smi is unavailable or its output cannot be parsed (callers then fall
+/// back to conservative defaults).
+fn detect_gpu_count() -> Option<usize> {
+    let binary = rocm_core::resolve_amd_smi_binary();
+    let output = ProcessCommand::new(&binary)
+        .arg("list")
+        .arg("--json")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let count = value.as_array().map(Vec::len)?;
+    if count == 0 { None } else { Some(count) }
 }
 
 const fn device_policy_name(policy: &DevicePolicy) -> &'static str {
@@ -18813,6 +19137,77 @@ install therock";
         Ok(())
     }
 
+    fn vram(index: u32, used_mb: u64, total_mb: u64) -> GpuVramUsage {
+        GpuVramUsage {
+            index,
+            used_mb,
+            total_mb,
+        }
+    }
+
+    #[test]
+    fn auto_selection_prefers_lowest_index_idle_gpu() {
+        // GPU 0 busy (only 5% free), GPU 1 idle, GPU 2 idle.
+        let usage = [
+            vram(0, 182_000, 192_000),
+            vram(1, 1_000, 192_000),
+            vram(2, 500, 192_000),
+        ];
+        assert_eq!(
+            select_auto_gpu_index(Some(3), &[], Some(&usage)),
+            vec![1],
+            "should skip the busy GPU 0 and pick the lowest idle GPU"
+        );
+    }
+
+    #[test]
+    fn auto_selection_skips_managed_and_busy_gpus_then_picks_most_free() {
+        // GPU 0 pinned by a managed service; GPU 1 partly used; GPU 2 more free
+        // but none is fully idle, so pass 2 (most free) applies.
+        let usage = [
+            vram(0, 10_000, 192_000),
+            vram(1, 120_000, 192_000),
+            vram(2, 60_000, 192_000),
+        ];
+        assert_eq!(
+            select_auto_gpu_index(Some(3), &[0], Some(&usage)),
+            vec![2],
+            "with no idle GPU, pick the non-busy GPU with the most free VRAM"
+        );
+    }
+
+    #[test]
+    fn auto_selection_falls_back_to_first_non_busy_without_vram() {
+        assert_eq!(select_auto_gpu_index(Some(4), &[0, 1], None), vec![2]);
+        assert_eq!(select_auto_gpu_index(None, &[], None), vec![0]);
+    }
+
+    #[test]
+    fn parse_gpu_vram_usage_reads_gpu_data_envelope() {
+        let value = json!({
+            "gpu_data": [
+                {"gpu": 0, "mem_usage": {"used_vram": {"value": 1000}, "total_vram": {"value": 192_000}}},
+                {"gpu": 1, "mem_usage": {"used_vram": {"value": 50000}, "total_vram": {"value": 192_000}}}
+            ]
+        });
+        let rows = parse_gpu_vram_usage(&value);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].index, 0);
+        assert_eq!(rows[0].used_mb, 1000);
+        assert_eq!(rows[1].index, 1);
+        assert!((rows[1].free_fraction().unwrap() - (142_000.0 / 192_000.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn gpu_low_memory_warning_flags_busy_selected_gpu() {
+        let usage = [vram(0, 182_000, 192_000), vram(1, 1_000, 192_000)];
+        let warning = gpu_low_memory_warning(&[0], Some(&usage)).expect("warning for busy GPU 0");
+        assert!(warning.contains("GPU 0"));
+        assert!(warning.contains("free"));
+        assert!(gpu_low_memory_warning(&[1], Some(&usage)).is_none());
+        assert!(gpu_low_memory_warning(&[0], None).is_none());
+    }
+
     #[test]
     fn driver_plan_ubuntu_2404_uses_official_dkms_commands() {
         let os_release = r#"
@@ -20636,11 +21031,9 @@ VERSION_ID="41"
             capabilities: rocm_engine_protocol::EngineCapabilities {
                 cpu: false,
                 rocm_gpu: false,
-                multi_gpu: false,
                 openai_compatible: true,
                 tool_calling: false,
                 quantized_models: "sglang-supported".to_owned(),
-                distributed_serving: false,
                 reasoning_parser: false,
             },
             notes: Vec::new(),
