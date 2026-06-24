@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Integration test proving `rocm daemon` runs the real foreground automation
 //! loop (embedded `rocmd`) instead of only printing the status panel.
 //!

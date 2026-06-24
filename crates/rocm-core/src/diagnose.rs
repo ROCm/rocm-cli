@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! ROCm failure-mode diagnosis.
 //!
 //! Rust port of the `rocm-doctor` skill's `diagnose.py`. It matches an
