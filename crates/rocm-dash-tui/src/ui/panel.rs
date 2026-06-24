@@ -77,12 +77,6 @@ pub fn blend(a: Color, b: Color, t: f32) -> Color {
     }
 }
 
-/// Faint per-role surface tint: the theme bg nudged ~10% toward the role color.
-#[must_use]
-pub fn role_tint(role: BoxRole, theme: &Theme) -> Color {
-    blend(theme.bg, role.color(theme), 0.10)
-}
-
 /// Border color for a box, brightened toward `fg` when focused.
 #[must_use]
 fn border_color(role: BoxRole, focused: bool, theme: &Theme) -> Color {
@@ -121,7 +115,7 @@ fn put(f: &mut Frame, x: u16, y: u16, text: &str, style: Style) {
 /// notch. The bracket glyphs take the role `border` color; the label text takes
 /// `text_fg` (a legible foreground) so the title stays readable over the faint
 /// tint on every theme.
-fn stamp_title(f: &mut Frame, area: Rect, title: &str, border: Color, tint: Color, text_fg: Color) {
+fn stamp_title(f: &mut Frame, area: Rect, title: &str, border: Color, bg: Color, text_fg: Color) {
     let title = title.trim();
     if title.is_empty() {
         return;
@@ -135,10 +129,10 @@ fn stamp_title(f: &mut Frame, area: Rect, title: &str, border: Color, tint: Colo
         return; // not enough room — leave the plain rounded top edge
     }
     let y0 = area.y;
-    let bracket = Style::default().fg(border).bg(tint);
+    let bracket = Style::default().fg(border).bg(bg);
     let text = Style::default()
         .fg(text_fg)
-        .bg(tint)
+        .bg(bg)
         .add_modifier(Modifier::BOLD);
 
     // Brackets hug the label directly (no inner spaces); their own downward arc
@@ -171,24 +165,25 @@ fn render_box(
     } else {
         Style::default().fg(border)
     };
-    let tint = role_tint(role, theme);
     let padding = if compact {
         Padding::ZERO
     } else {
         padding_for(area)
     };
 
+    // One background — the theme bg — for every box. Only borders and the
+    // elements inside carry color; boxes are distinguished by border, not fill.
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border_style)
-        .style(Style::default().bg(tint))
+        .style(Style::default().bg(theme.bg))
         .padding(padding);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     if let Some(t) = title {
-        stamp_title(f, area, t, border, tint, theme.fg);
+        stamp_title(f, area, t, border, theme.bg, theme.fg);
     }
     inner
 }
@@ -300,15 +295,6 @@ mod tests {
         );
         assert_ne!(BoxRole::Warning.color(&theme), BoxRole::Muted.color(&theme));
         assert_eq!(BoxRole::Primary.color(&theme), theme.accent);
-    }
-
-    #[test]
-    fn role_tint_sits_between_bg_and_role() {
-        let theme = Theme::default_dark();
-        // A 10% tint is not the bg and not the full role color.
-        let tint = role_tint(BoxRole::Warning, &theme);
-        assert_ne!(tint, theme.bg);
-        assert_ne!(tint, theme.warn);
     }
 
     #[test]

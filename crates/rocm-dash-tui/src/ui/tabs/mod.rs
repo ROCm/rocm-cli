@@ -144,7 +144,6 @@ pub fn draw_tab_panel(
     let acc = Style::default()
         .fg(theme.accent)
         .add_modifier(Modifier::BOLD);
-    let muted = Style::default().fg(theme.muted);
 
     if outer.width < 4 || outer.height < 4 {
         return outer;
@@ -157,17 +156,18 @@ pub fn draw_tab_panel(
     let y_line = outer.y + 2;
     let y_bot = outer.y + outer.height - 1;
 
-    // Panel box (the body frame). The tab folders are stamped on top after.
+    // Panel box (the body frame), rounded to match the bento boxes. The tab
+    // folders are stamped on top after.
     hline(f, x0, x1, y_line, "─", border);
-    put(f, x0, y_line, "┌", border);
-    put(f, x1, y_line, "┐", border);
+    put(f, x0, y_line, "╭", border);
+    put(f, x1, y_line, "╮", border);
     for y in (y_line + 1)..y_bot {
         put(f, x0, y, "│", border);
         put(f, x1, y, "│", border);
     }
     hline(f, x0, x1, y_bot, "─", border);
-    put(f, x0, y_bot, "└", border);
-    put(f, x1, y_bot, "┘", border);
+    put(f, x0, y_bot, "╰", border);
+    put(f, x1, y_bot, "╯", border);
 
     // Tab folders along the top edge — geometry from the shared single source.
     let spans = outlined_chip_spans(x0 + 2, labels);
@@ -183,21 +183,27 @@ pub fn draw_tab_panel(
         if ex >= x1 {
             break; // out of horizontal room — stop cleanly rather than overflow
         }
-        let style = if is_active { acc } else { muted };
+        // Inactive folders share the frame's border color so they read as one
+        // piece; only the active folder is accented.
+        let style = if is_active { acc } else { border };
 
-        put(f, sx, y_top, "┌", style);
+        // Rounded folder top, matching the frame.
+        put(f, sx, y_top, "╭", style);
         hline(f, sx + 1, ex - 1, y_top, "─", style);
-        put(f, ex, y_top, "┐", style);
+        put(f, ex, y_top, "╮", style);
         put(f, sx, y_lab, "│", style);
         put(f, sx + 1, y_lab, &content, style);
         put(f, ex, y_lab, "│", style);
         if is_active {
-            // Open the active folder into the body: erase the panel line under it.
-            put(f, sx, y_line, "┘", style);
+            // Open the active folder into the body: erase the panel line under
+            // it. The bottom corners are drawn in the BORDER color (not accent)
+            // so the active color turns straight down into the frame and never
+            // continues horizontally along the body border.
+            put(f, sx, y_line, "╯", border);
             for x in (sx + 1)..ex {
                 put(f, x, y_line, " ", Style::default().bg(theme.bg));
             }
-            put(f, ex, y_line, "└", style);
+            put(f, ex, y_line, "╰", border);
         } else {
             put(f, sx, y_line, "┴", style);
             put(f, ex, y_line, "┴", style);
@@ -284,7 +290,11 @@ mod tests {
         // Inactive tabs show their 1-based index; the active tab shows ●.
         assert!(out.contains("● Home"), "active marker missing: {out:?}");
         assert!(out.contains("Action"), "tab label missing: {out:?}");
-        assert!(out.contains('┐') && out.contains('└'), "no panel frame");
+        // Frame + folders use rounded corners now.
+        assert!(
+            out.contains('╮') && out.contains('╰'),
+            "no rounded panel frame"
+        );
         // Inner content rect is strictly inside the outer frame.
         let r = inner.get();
         assert!(r.width > 0 && r.height > 0 && r.y >= 3);
