@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Pure display utilities for slash-tool outcomes and natural-language plans.
 //!
 //! Concise, length-bounded summaries of read-only slash-tool results (never a

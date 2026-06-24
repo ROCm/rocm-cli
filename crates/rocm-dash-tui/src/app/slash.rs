@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Slash-command routing for the chat input.
 //!
 //! [`AppState::handle_slash_command`] classifies a `/`-prefixed chat line and

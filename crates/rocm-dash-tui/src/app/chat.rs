@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Chat-backend construction, detection, and persistence.
 //!
 //! The provider→agent factory ([`build_chat_agent`]), the local-engine probe
