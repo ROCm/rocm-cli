@@ -9,7 +9,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 
 use rocm_dash_core::metrics::{Instance, InstanceStatus};
 
@@ -49,6 +49,106 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         draw_kv_heatmap(f, heat_area, state, &instances, theme);
     }
     draw_card_grid(f, grid_area, &instances, sel, theme);
+}
+
+/// AI-serving per-instance table (Phase 5 Observe view).
+///
+/// Columns: model · throughput (tok/s) · tok/watt · TTFT · TPOT · power · queue
+/// (running/waiting) · kv-cache%. Missing `Option` metrics render `—` (honest
+/// placeholder, never a fabricated number); tok/watt is surfaced prominently
+/// (accent). Keyboard + scroll-wheel select; left-click is not wired here.
+pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    if state.instances.is_empty() {
+        draw_empty(f, area, state, theme);
+        return;
+    }
+    let instances = sorted_instances(&state.instances);
+    let sel = clamp_sel(state.instance_sel, instances.len());
+    let gpus: &[rocm_dash_core::metrics::GpuMetrics] =
+        state.latest.as_ref().map_or(&[], |s| s.gpus.as_slice());
+
+    let inner = panel::bento(
+        f,
+        area,
+        Some("Instances · AI metrics"),
+        BoxRole::Secondary,
+        false,
+        theme,
+    );
+    if inner.height == 0 {
+        return;
+    }
+
+    let header = Row::new([
+        "MODEL", "TOK/S", "TOK/W", "TTFT", "TPOT", "POWER", "QUEUE", "KV%",
+    ])
+    .style(
+        Style::default()
+            .fg(theme.muted)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let dash = "—";
+    let rows = instances.iter().enumerate().map(|(i, inst)| {
+        let model = trunc(&inst.model_name, 22);
+        let tps = inst
+            .gen_tps
+            .map_or_else(|| dash.to_string(), |v| format!("{v:.0}"));
+        let tpw = inst
+            .tokens_per_watt
+            .filter(|v| v.is_finite())
+            .map_or_else(|| dash.to_string(), |v| format!("{v:.2}"));
+        let ttft = inst
+            .ttft_ms
+            .map_or_else(|| dash.to_string(), |v| format!("{v:.0}ms"));
+        let tpot = inst
+            .tpot_ms
+            .map_or_else(|| dash.to_string(), |v| format!("{v:.0}ms"));
+        let power = rocm_dash_core::efficiency::instance_power_w(&inst.gpu_ids, gpus)
+            .map_or_else(|| dash.to_string(), |w| format!("{w:.0}W"));
+        let queue = match (inst.running_reqs, inst.waiting_reqs) {
+            (None, None) => dash.to_string(),
+            (r, w) => format!(
+                "{}/{}",
+                r.map_or_else(|| dash.to_string(), |v| v.to_string()),
+                w.map_or_else(|| dash.to_string(), |v| v.to_string()),
+            ),
+        };
+        let kv = inst
+            .kv_cache_usage_pct
+            .map_or_else(|| dash.to_string(), |v| format!("{v:.0}%"));
+
+        let base = if i == sel {
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.fg)
+        };
+        Row::new([
+            Cell::from(model),
+            Cell::from(tps),
+            // tok/watt prominent (the headline efficiency metric).
+            Cell::from(tpw).style(Style::default().fg(theme.accent)),
+            Cell::from(ttft),
+            Cell::from(tpot),
+            Cell::from(power),
+            Cell::from(queue),
+            Cell::from(kv),
+        ])
+        .style(base)
+    });
+
+    let widths = [
+        Constraint::Min(12),
+        Constraint::Length(7),
+        Constraint::Length(7),
+        Constraint::Length(7),
+        Constraint::Length(7),
+        Constraint::Length(7),
+        Constraint::Length(7),
+        Constraint::Length(5),
+    ];
+    let table = Table::new(rows, widths).header(header).column_spacing(1);
+    f.render_widget(table, inner);
 }
 
 /// How tall to make the heatmap block.

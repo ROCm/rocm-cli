@@ -2105,7 +2105,10 @@ fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
             // body-click hit-testing best-efforts the instances rows. Keyboard
             // selection is the primary path.
             let action = match state.active_tab {
-                ActiveTab::Observe => ui::tabs::instances::hit_test(area, me.column, me.row, state),
+                // Observe's AI table is keyboard + scroll-wheel driven (the
+                // scroll path maps to Move in `handle_mouse`); left-click select
+                // is intentionally not wired (the table sits below the hero band,
+                // so a body-relative row map would be wrong). No-op here.
                 ActiveTab::Rocm => ui::tabs::rocm::hit_test(area, me.column, me.row),
                 ActiveTab::Serving => ui::tabs::serving::hit_test(area, me.column, me.row),
                 _ => None,
