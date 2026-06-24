@@ -863,8 +863,8 @@ impl AppState {
                 // uninstall needs `/uninstall --apply` and is approval-gated (the
                 // bin auto-adds --yes on approval).
                 let flags: Vec<&str> = rest.split_whitespace().skip(1).collect();
-                let saw_apply = flags.iter().any(|flag| *flag == "--apply");
-                let saw_dry_run = flags.iter().any(|flag| *flag == "--dry-run");
+                let saw_apply = flags.contains(&"--apply");
+                let saw_dry_run = flags.contains(&"--dry-run");
                 if saw_apply && saw_dry_run {
                     self.chat.push(ChatTurn::error(
                         "conflicting /uninstall flags: choose either --dry-run (safe) or --apply (real uninstall)"
@@ -879,7 +879,11 @@ impl AppState {
                     };
                     self.slash_tool = Some(rocm_cmd_request(
                         &argv,
-                        if real { "uninstall" } else { "uninstall --dry-run" },
+                        if real {
+                            "uninstall"
+                        } else {
+                            "uninstall --dry-run"
+                        },
                     ));
                 }
             }
