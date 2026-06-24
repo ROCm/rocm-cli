@@ -258,6 +258,28 @@ pub fn format_mmss(secs: u64) -> String {
     }
 }
 
+/// Result of routing a chat-input line through the slash-command handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlashOutcome {
+    /// The line was a slash command and was handled in-reducer (state mutated,
+    /// or a slash-tool request raised). It must NOT be sent to the LLM.
+    Handled,
+    /// The line is not a slash command — fall through to normal agent dispatch.
+    NotCommand,
+}
+
+/// A pending read-only slash command that needs the bin executor (no overlay).
+/// `submit_chat` sets it; the event loop drains it once, off the async thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SlashToolRequest {
+    /// Tool name to execute across the seam (e.g. `rocm_command`).
+    pub name: String,
+    /// JSON args for the tool (e.g. `{"args":["model"]}`).
+    pub args: serde_json::Value,
+    /// Human label for the chat turn header (e.g. `model`).
+    pub label: String,
+}
+
 /// Modal overlays. Only one is shown at a time, on top of the active tab body.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Modal {
@@ -374,6 +396,11 @@ pub struct AppState {
     /// Bin-injected tool-executor seam. Set from `ResolvedArgs` in the event
     /// loop; `None` for demo/replay/mock and by default.
     pub tool_executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
+    /// Set by a `/quit` (or `/exit`) slash command; the event loop breaks on it.
+    pub(crate) should_quit: bool,
+    /// Edge: a pending executor-backed read-only slash command. Raised by
+    /// `handle_slash_command`, drained once by the event loop (spawn_blocking).
+    pub(crate) slash_tool: Option<SlashToolRequest>,
 }
 
 impl AppState {
@@ -431,6 +458,8 @@ impl AppState {
             runtimes: Vec::new(),
             automations: Vec::new(),
             tool_executor: None,
+            should_quit: false,
+            slash_tool: None,
         }
     }
 
@@ -597,10 +626,82 @@ impl AppState {
         if text.is_empty() {
             return;
         }
+        // Slash commands are handled locally (nav/overlays/read-only tools) and
+        // never reach the LLM. A `/`-prefixed line is ALWAYS consumed here, even
+        // when unknown (it gets an error turn) — only non-slash text is sent on.
+        if self.handle_slash_command(&text) == SlashOutcome::Handled {
+            self.chat_input.clear();
+            return;
+        }
         self.chat.push(ChatTurn::user(text));
         self.chat_input.clear();
         self.chat_sending = true;
         self.chat_dispatch = true;
+    }
+
+    /// Route a chat-input line that may be a slash command. Returns
+    /// [`SlashOutcome::NotCommand`] for plain text (caller dispatches to the
+    /// agent); otherwise handles it in-reducer and returns
+    /// [`SlashOutcome::Handled`]. Stays I/O-free: executor-backed commands raise
+    /// the `slash_tool` edge for the event loop to drain off-thread.
+    pub(crate) fn handle_slash_command(&mut self, text: &str) -> SlashOutcome {
+        let trimmed = text.trim();
+        let Some(rest) = trimmed.strip_prefix('/') else {
+            return SlashOutcome::NotCommand;
+        };
+        // First whitespace-delimited word after '/', lowercased.
+        let cmd = rest.split_whitespace().next().unwrap_or("").to_lowercase();
+
+        match cmd.as_str() {
+            // --- Group A: nav / session (deterministic, no executor) ---
+            "home" => self.active_tab = ActiveTab::Overview,
+            "gpu" => self.active_tab = ActiveTab::Hardware,
+            "help" | "?" => self.modal = Modal::Help,
+            "clear" => self.chat.clear(),
+            "quit" | "exit" => self.should_quit = true,
+            // --- Group B: read-only overlays (mirror the keybind handlers) ---
+            "doctor" => {
+                self.close_overlays();
+                self.examine_manager =
+                    Some(crate::ui::examine_manager::ExamineManagerState::default());
+            }
+            "runtimes" => {
+                self.close_overlays();
+                self.runtime_manager =
+                    Some(crate::ui::runtime_manager::RuntimeManagerState::default());
+            }
+            "config" => {
+                self.close_overlays();
+                self.config_manager =
+                    Some(crate::ui::config_manager::ConfigManagerState::default());
+            }
+            "logs" => {
+                self.close_overlays();
+                self.logs_view = Some(crate::ui::logs_view::LogsViewState::default());
+            }
+            // --- Group B: read-only executor-backed (no overlay; off-thread) ---
+            "model" => {
+                self.slash_tool = Some(SlashToolRequest {
+                    name: "rocm_command".to_string(),
+                    args: serde_json::json!({ "args": ["model"] }),
+                    label: "model".to_string(),
+                });
+            }
+            "daemon" => {
+                self.slash_tool = Some(SlashToolRequest {
+                    name: "rocm_command".to_string(),
+                    args: serde_json::json!({ "args": ["daemon", "status"] }),
+                    label: "daemon status".to_string(),
+                });
+            }
+            // Unknown slash command: an error turn, never sent to the LLM.
+            other => {
+                self.chat.push(ChatTurn::error(format!(
+                    "unknown command: /{other} (try /help)"
+                )));
+            }
+        }
+        SlashOutcome::Handled
     }
 
     /// Capture a read-only telemetry snapshot for the chat tools. Plain owned
@@ -625,6 +726,15 @@ impl AppState {
     pub fn on_chat_error(&mut self, message: String) {
         self.chat.push(ChatTurn::error(message));
         self.chat_sending = false;
+    }
+
+    /// Handle an executor-backed slash-tool reply (`/model`, `/daemon`): append
+    /// the summary as an agent-role turn WITHOUT touching `chat_sending`. The
+    /// slash-tool path is independent of the agent in-flight state machine, so
+    /// this must never clear/modify that flag (proven by
+    /// `slash_tool_reply_does_not_disturb_chat_sending`).
+    pub(crate) fn on_slash_tool_reply(&mut self, text: String) {
+        self.chat.push(ChatTurn::agent(text));
     }
 
     /// Apply the currently-highlighted picker entry and close the modal.
@@ -897,23 +1007,29 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             && args.chat_env_url.is_none();
         if no_key_no_endpoint {
             let oauth_tx = chat_tx.clone();
-            crate::agent::ChatGptAgentClient::new(args.chat_model.clone(), move |url, code| {
-                let _ = oauth_tx.send(ClientMsg::ChatReply {
-                    text: format!(
-                        "To enable chat, sign in to ChatGPT: open {url} and enter the code {code}"
-                    ),
-                });
-            })
+            crate::agent::ChatGptAgentClient::new(
+                args.chat_model.clone(),
+                move |url, code| {
+                    let _ = oauth_tx.send(ClientMsg::ChatReply {
+                        text: format!(
+                            "To enable chat, sign in to ChatGPT: open {url} and enter the code {code}"
+                        ),
+                    });
+                },
+                state.tool_executor.clone(),
+            )
             .ok()
             .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
         } else {
             // A build failure leaves `agent` None; a submit surfaces an error turn.
             match &state.chat_llm {
-                Some(cfg) => crate::agent::RigAgentClient::new(cfg.clone())
-                    .ok()
-                    .map(|c| {
-                        std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>
-                    }),
+                Some(cfg) => {
+                    crate::agent::RigAgentClient::new(cfg.clone(), state.tool_executor.clone())
+                        .ok()
+                        .map(|c| {
+                            std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>
+                        })
+                }
                 None => None,
             }
         }
@@ -942,6 +1058,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         }
                     }
                     Some(ClientMsg::ChatReply { text }) => state.on_chat_reply(text),
+                    Some(ClientMsg::SlashToolReply { text }) => state.on_slash_tool_reply(text),
                     Some(ClientMsg::ChatError { message }) => state.on_chat_error(message),
                     Some(ClientMsg::ChatDetectResult { offer }) => state.set_detect_result(offer),
                     None => break,
@@ -1105,6 +1222,33 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             }
         }
 
+        // A `/quit` (or `/exit`) slash command sets `should_quit` from inside
+        // the reducer; honor it here (mirrors the `KeyAction::Quit` break).
+        if state.should_quit {
+            break;
+        }
+
+        // Drain a pending executor-backed read-only slash command (`/model`,
+        // `/daemon`). Off-thread (spawn_blocking) so the seam's synchronous
+        // execute() never blocks the async event loop; the concise summary
+        // returns via ClientMsg::SlashToolReply — its own message variant, so
+        // the slash-tool path never disturbs the agent's `chat_sending` flag.
+        if let Some(req) = state.slash_tool.take() {
+            match state.tool_executor.clone() {
+                Some(executor) => {
+                    let reply_tx = chat_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let outcome = executor.execute(&req.name, &req.args);
+                        let text = summarize_slash_tool(&req.label, &outcome);
+                        let _ = reply_tx.send(ClientMsg::SlashToolReply { text });
+                    });
+                }
+                None => {
+                    state.on_slash_tool_reply("ROCm tools unavailable in this mode".to_string());
+                }
+            }
+        }
+
         // Spawn the agent round-trip on the submit edge — keeps `apply_action`
         // I/O-free. `chat_dispatch` is raised once by `submit_chat`; consume it
         // so the in-flight request is spawned exactly once (not every tick).
@@ -1196,6 +1340,70 @@ fn persist_chat_endpoint(base_url: &str, model: &str) -> Result<std::path::PathB
     let toml = toml::to_string_pretty(&next).map_err(|e| e.to_string())?;
     std::fs::write(&path, toml).map_err(|e| e.to_string())?;
     Ok(path)
+}
+
+/// Render a CONCISE, human summary of a read-only slash-tool outcome — never a
+/// raw JSON transcript dump (per docs/ux-guidelines.md). Errors and approval
+/// notes are surfaced plainly; a success object is reduced to a short headline
+/// plus a few key/value lines, with arrays/objects collapsed to counts.
+/// Max object fields a slash-tool summary surfaces before truncating with an
+/// ellipsis line. Keeps `summarize_json_value` output terse and length-bounded.
+const SUMMARY_MAX_FIELDS: usize = 8;
+
+fn summarize_slash_tool(label: &str, outcome: &crate::tool_exec::RocmToolOutcome) -> String {
+    use crate::tool_exec::RocmToolOutcome;
+    match outcome {
+        RocmToolOutcome::Error(e) => format!("/{label} failed: {e}"),
+        RocmToolOutcome::ApprovalRequired(_) => {
+            format!("/{label}: this action needs approval (read-only command did not expect it)")
+        }
+        RocmToolOutcome::Result(v) => {
+            let body = summarize_json_value(v);
+            if body.is_empty() {
+                format!("/{label}: done")
+            } else {
+                format!("/{label}:\n{body}")
+            }
+        }
+    }
+}
+
+/// Collapse a JSON value into at most a handful of readable lines. Scalars print
+/// inline; objects list their top-level fields (nested containers shown as
+/// counts); arrays show a length. Keeps slash-tool output terse and scannable.
+fn summarize_json_value(v: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match v {
+        Value::Object(map) => {
+            let mut lines = Vec::new();
+            for (k, val) in map.iter().take(SUMMARY_MAX_FIELDS) {
+                lines.push(format!("  {k}: {}", scalar_or_shape(val)));
+            }
+            if map.len() > SUMMARY_MAX_FIELDS {
+                lines.push(format!(
+                    "  … ({} more fields)",
+                    map.len() - SUMMARY_MAX_FIELDS
+                ));
+            }
+            lines.join("\n")
+        }
+        Value::Array(arr) => format!("  {} item(s)", arr.len()),
+        other => format!("  {}", scalar_or_shape(other)),
+    }
+}
+
+/// A scalar's plain text, or a shape hint (`{N fields}` / `[N items]`) for a
+/// nested container — used so summaries never inline a whole subtree.
+fn scalar_or_shape(v: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::Array(a) => format!("[{} items]", a.len()),
+        Value::Object(o) => format!("{{{} fields}}", o.len()),
+    }
 }
 
 /// Pure immutable transform: return a copy of `cfg` with the chat endpoint set
@@ -2499,6 +2707,184 @@ mod tests {
         s.chat_input = "third".into();
         apply_action(&mut s, KeyAction::ChatSubmit);
         assert!(s.chat_dispatch);
+    }
+
+    // --- Slash-command dispatch (Phase 3 nav/session + read-only) ---
+
+    fn st() -> AppState {
+        AppState::new("t".into(), "default-dark".into())
+    }
+
+    #[test]
+    fn slash_help_opens_help_modal() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/help"), SlashOutcome::Handled);
+        assert_eq!(s.modal, Modal::Help);
+    }
+
+    #[test]
+    fn slash_question_mark_opens_help_modal() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/?"), SlashOutcome::Handled);
+        assert_eq!(s.modal, Modal::Help);
+    }
+
+    #[test]
+    fn slash_clear_empties_transcript() {
+        let mut s = st();
+        s.chat.push(ChatTurn::user("hi"));
+        s.chat.push(ChatTurn::agent("hello"));
+        assert_eq!(s.handle_slash_command("/clear"), SlashOutcome::Handled);
+        assert!(s.chat.is_empty());
+    }
+
+    #[test]
+    fn slash_quit_sets_should_quit() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/quit"), SlashOutcome::Handled);
+        assert!(s.should_quit);
+    }
+
+    #[test]
+    fn slash_exit_sets_should_quit() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/exit"), SlashOutcome::Handled);
+        assert!(s.should_quit);
+    }
+
+    #[test]
+    fn slash_home_switches_to_overview() {
+        let mut s = st();
+        s.active_tab = ActiveTab::Bench;
+        assert_eq!(s.handle_slash_command("/home"), SlashOutcome::Handled);
+        assert_eq!(s.active_tab, ActiveTab::Overview);
+    }
+
+    #[test]
+    fn slash_gpu_switches_to_hardware() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/gpu"), SlashOutcome::Handled);
+        assert_eq!(s.active_tab, ActiveTab::Hardware);
+    }
+
+    #[test]
+    fn slash_doctor_opens_overlay() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/doctor"), SlashOutcome::Handled);
+        assert!(s.examine_manager.is_some());
+    }
+
+    #[test]
+    fn slash_runtimes_opens_overlay() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/runtimes"), SlashOutcome::Handled);
+        assert!(s.runtime_manager.is_some());
+    }
+
+    #[test]
+    fn slash_config_opens_overlay() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/config"), SlashOutcome::Handled);
+        assert!(s.config_manager.is_some());
+    }
+
+    #[test]
+    fn slash_logs_opens_overlay() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/logs"), SlashOutcome::Handled);
+        assert!(s.logs_view.is_some());
+    }
+
+    #[test]
+    fn slash_model_raises_executor_request() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/model"), SlashOutcome::Handled);
+        let req = s.slash_tool.expect("model raises a slash_tool request");
+        assert_eq!(req.name, "rocm_command");
+        assert_eq!(req.args, serde_json::json!({ "args": ["model"] }));
+    }
+
+    #[test]
+    fn slash_daemon_raises_executor_request() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/daemon"), SlashOutcome::Handled);
+        let req = s.slash_tool.expect("daemon raises a slash_tool request");
+        assert_eq!(req.name, "rocm_command");
+        assert_eq!(
+            req.args,
+            serde_json::json!({ "args": ["daemon", "status"] })
+        );
+    }
+
+    #[test]
+    fn slash_tool_reply_does_not_disturb_chat_sending() {
+        // The slash-tool reply path is decoupled from the agent state machine:
+        // appending a slash-tool summary must NOT touch `chat_sending`, even if
+        // an agent request happens to be in flight at the same time.
+        let mut s = st();
+        s.chat_sending = true;
+        let before = s.chat.len();
+        s.on_slash_tool_reply("x".into());
+        assert_eq!(s.chat.len(), before + 1, "slash-tool turn appended");
+        assert_eq!(s.chat.last().unwrap().role, ChatRole::Agent);
+        assert!(
+            s.chat_sending,
+            "chat_sending untouched by slash-tool reply (decoupled)"
+        );
+    }
+
+    #[test]
+    fn summarize_slash_tool_is_concise_not_raw_json() {
+        // A representative Result(json) must summarize to a terse, labelled,
+        // length-bounded blurb — never a raw JSON dump with braces-spam.
+        let outcome = crate::tool_exec::RocmToolOutcome::Result(serde_json::json!({
+            "status": "ok",
+            "model": "llama3",
+            "nested": { "a": 1, "b": 2, "c": 3 },
+        }));
+        let out = summarize_slash_tool("model", &outcome);
+        assert!(out.contains("/model"), "carries the slash label");
+        assert!(out.contains("status: ok"), "scalars shown inline");
+        // Nested containers collapse to a shape hint, not an inlined subtree.
+        assert!(out.contains("{3 fields}"), "nested object shown as shape");
+        assert!(
+            !out.contains("\"nested\""),
+            "no raw JSON keys / braces-spam in summary"
+        );
+        assert!(out.len() < 200, "summary stays length-bounded");
+    }
+
+    #[test]
+    fn slash_unknown_appends_error_turn_and_is_handled() {
+        let mut s = st();
+        assert_eq!(s.handle_slash_command("/zzz"), SlashOutcome::Handled);
+        assert_eq!(s.chat.len(), 1);
+        assert_eq!(s.chat[0].role, ChatRole::Error);
+        assert!(s.chat[0].content.contains("/zzz"));
+    }
+
+    #[test]
+    fn plain_text_is_not_a_command() {
+        let mut s = st();
+        assert_eq!(
+            s.handle_slash_command("what's GPU-2 doing?"),
+            SlashOutcome::NotCommand
+        );
+    }
+
+    #[test]
+    fn submit_routes_slash_command_away_from_the_agent() {
+        // A slash line through submit_chat must NOT raise the agent dispatch edge.
+        let mut s = st();
+        s.chat_input = "/help".into();
+        s.submit_chat();
+        assert_eq!(s.modal, Modal::Help);
+        assert!(
+            !s.chat_dispatch,
+            "slash command never dispatches to the LLM"
+        );
+        assert!(!s.chat_sending);
+        assert!(s.chat_input.is_empty());
     }
 
     #[tokio::test]
