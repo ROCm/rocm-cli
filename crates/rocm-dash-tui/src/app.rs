@@ -3378,6 +3378,20 @@ mod tests {
     }
 
     #[test]
+    fn slash_uninstall_conflicting_flags_is_guided() {
+        let mut s = st();
+        assert_eq!(
+            s.handle_slash_command("/uninstall --apply --dry-run"),
+            SlashOutcome::Handled
+        );
+        assert!(
+            s.slash_tool.is_none(),
+            "conflicting uninstall flags must NOT dispatch"
+        );
+        assert_eq!(s.chat.last().unwrap().role, ChatRole::Error);
+    }
+
+    #[test]
     fn slash_setup_bare_is_status() {
         let mut s = st();
         assert_eq!(s.handle_slash_command("/setup"), SlashOutcome::Handled);
