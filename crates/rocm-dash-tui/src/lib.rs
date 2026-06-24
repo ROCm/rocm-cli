@@ -12,5 +12,6 @@ pub mod llm;
 pub mod reconnect;
 pub mod replay;
 pub mod skills;
+pub mod tool_exec;
 pub mod transport;
 pub mod ui;

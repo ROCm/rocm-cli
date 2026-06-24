@@ -2,6 +2,7 @@ mod automations;
 mod bootstrap;
 mod comfyui;
 mod dash;
+mod dash_seam;
 mod provider_keys;
 mod providers;
 mod therock;
@@ -8308,7 +8309,8 @@ fn chat_tool_value(tool_text: &str, key: &str) -> Option<String> {
     })
 }
 
-fn run_internal_mcp_call(
+// pub(crate): used by the dash execution seam (dash_seam.rs)
+pub(crate) fn run_internal_mcp_call(
     paths: &AppPaths,
     name: &str,
     arguments: serde_json::Value,

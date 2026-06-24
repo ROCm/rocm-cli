@@ -166,6 +166,9 @@ pub fn resolved_args(
         model_recipes: model_recipe_summaries(),
         runtimes: runtime_summaries(paths, config),
         automations: automation_summaries(config),
+        // The real executor is injected in `run_async` for a live dash; None
+        // here keeps demo/replay/mock behaving exactly as today.
+        tool_executor: None,
     }
 }
 
@@ -202,6 +205,13 @@ async fn run_async(
     let mut args = resolved_args(&config, &paths, ActiveTab::Overview);
     args.replay = replay.clone();
     args.chat_mock = chat_mock;
+    // Inject the bin-side tool-execution seam for a live dash only. Demo/replay
+    // and the offline chat mock keep `tool_executor = None` and behave as today.
+    if !chat_mock && replay.is_none() {
+        let executor: rocm_dash_tui::tool_exec::SharedRocmToolExecutor =
+            std::sync::Arc::new(crate::dash_seam::BinToolExecutor::new(paths.clone()));
+        args.tool_executor = Some(executor);
+    }
     // A live daemon is only needed when connecting; replay/demo feeds events
     // straight into the TUI, so skip the embedded daemon in that mode.
     let embedded = if replay.is_none() {
