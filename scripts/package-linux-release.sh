@@ -29,7 +29,7 @@ mkdir -p "${ROOT_DIR}/bin"
 # are only an external third-party plugin fallback, so they are not shipped.
 cp "${BINARY_DIR}/rocm" "${ROOT_DIR}/bin/"
 cp "${BINARY_DIR}/rocmd" "${ROOT_DIR}/bin/"
-cp README.md LICENSE install.sh "${ROOT_DIR}/"
+cp README.md LICENSE.TXT install.sh "${ROOT_DIR}/"
 
 (cd "${OUTPUT_DIR}" && tar -cf "${DIST_NAME}.tar" "${DIST_NAME}")
 gzip -c "${TAR_PATH}" > "${ARCHIVE_PATH}"

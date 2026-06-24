@@ -1,3 +1,9 @@
+Copyright Advanced Micro Devices, Inc.
+
+Third-party component licenses are maintained in THIRD_PARTY_NOTICES.txt.
+The following Apache-2.0 license applies to the rocm-cli source code
+authored by Advanced Micro Devices, Inc.
+
                                  Apache License
                            Version 2.0, January 2004
                         http://www.apache.org/licenses/

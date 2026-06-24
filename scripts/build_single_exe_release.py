@@ -247,7 +247,7 @@ def stage_platform_release(
         if strip_binaries:
             maybe_strip(destination, platform=platform)
 
-    for name in ["README.md", "LICENSE", platform_install_script(platform)]:
+    for name in ["README.md", "LICENSE.TXT", platform_install_script(platform)]:
         copy_required(repo_root / name, staging_root / name)
 
     archive = output_dir / (
@@ -319,7 +319,7 @@ def run_self_test(root: Path) -> None:
                 path.write_bytes(b"fake release binary\n")
                 if platform == "linux-amd64":
                     path.chmod(path.stat().st_mode | stat.S_IXUSR)
-            for name in ["README.md", "LICENSE", "install.ps1", "install.sh"]:
+            for name in ["README.md", "LICENSE.TXT", "install.ps1", "install.sh"]:
                 (fake_repo / name).write_text(f"fake {name}\n", encoding="utf-8")
             standalone = build_standalone_release(
                 repo_root=fake_repo,
