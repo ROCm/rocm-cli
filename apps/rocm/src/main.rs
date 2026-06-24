@@ -15,7 +15,7 @@ use crate::automations::automations;
 use crate::uninstall::uninstall;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use rocm_core::{
     AppPaths, AuditEventRecord, AutomationEventRecord, AutomationProposalRecord,
     AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot,
@@ -98,6 +98,12 @@ enum Command {
     },
     /// Print the rocm-cli version.
     Version,
+    /// Generate a shell completion script for the given shell.
+    Completions {
+        /// Shell to generate completions for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
     #[command(hide = true)]
     Bootstrap {
         #[command(subcommand)]
@@ -1059,7 +1065,7 @@ fn render_freeform_comfyui_status_answer(
 fn dispatch(cli: Cli) -> Result<()> {
     if !matches!(
         cli.command,
-        Some(Command::Update { .. } | Command::Bootstrap { .. })
+        Some(Command::Update { .. } | Command::Bootstrap { .. } | Command::Completions { .. })
     ) {
         refresh_startup_update_check_quietly();
     }
@@ -1360,8 +1366,75 @@ fn dispatch(cli: Cli) -> Result<()> {
             keep_cache,
             force_dev_binaries,
         }),
+        Some(Command::Completions { shell }) => {
+            let mut cmd = completion_command();
+            clap_complete::generate(shell, &mut cmd, "rocm", &mut std::io::stdout());
+            Ok(())
+        }
         None => launch_default(),
     }
+}
+
+/// Build the command tree handed to `clap_complete` for shell completions.
+///
+/// clap_complete's AOT generators do not filter `hide = true` subcommands the
+/// way `--help` does, so generating directly from `Cli::command()` would leak
+/// internal verbs (e.g. `__engine-stdio`, `mcp-call`) into the completion
+/// scripts. clap 4.x has no API to remove a subcommand from an existing
+/// `Command`, so we rebuild the root from the derived definition while dropping
+/// every hidden subcommand. This keeps the generated completions in sync with
+/// what `--help` shows, at every nesting level.
+fn completion_command() -> clap::Command {
+    without_hidden_subcommands(Cli::command())
+}
+
+/// Return a copy of `cmd` whose (recursive) subcommand set excludes every
+/// `hide = true` subcommand, preserving the command's own settings, args, and
+/// visible subcommands intact.
+///
+/// clap exposes no API to remove a subcommand from a `Command`
+/// (`get_subcommands_mut` cannot remove, `mut_subcommands` is map-only, and
+/// `subcommands`/`subcommand` only append). So we rebuild the command without
+/// subcommands and re-attach only the visible ones, each filtered recursively.
+fn without_hidden_subcommands(cmd: clap::Command) -> clap::Command {
+    let visible: Vec<clap::Command> = cmd
+        .get_subcommands()
+        .filter(|sc| !sc.is_hide_set())
+        .cloned()
+        .map(without_hidden_subcommands)
+        .collect();
+    strip_subcommands(cmd).subcommands(visible)
+}
+
+/// Rebuild a `Command` without any subcommands, preserving the fields that
+/// matter for completion generation (name, metadata, args, key settings).
+fn strip_subcommands(cmd: clap::Command) -> clap::Command {
+    let mut bare = clap::Command::new(cmd.get_name().to_owned());
+    if let Some(about) = cmd.get_about() {
+        bare = bare.about(about.clone());
+    }
+    if let Some(long_about) = cmd.get_long_about() {
+        bare = bare.long_about(long_about.clone());
+    }
+    if let Some(version) = cmd.get_version() {
+        bare = bare.version(version.to_owned());
+    }
+    if let Some(long_version) = cmd.get_long_version() {
+        bare = bare.long_version(long_version.to_owned());
+    }
+    for alias in cmd.get_visible_aliases() {
+        bare = bare.visible_alias(alias.to_owned());
+    }
+    for arg in cmd.get_arguments() {
+        bare = bare.arg(arg.clone());
+    }
+    if cmd.is_subcommand_required_set() {
+        bare = bare.subcommand_required(true);
+    }
+    if cmd.is_arg_required_else_help_set() {
+        bare = bare.arg_required_else_help(true);
+    }
+    bare
 }
 
 fn refresh_startup_update_check_quietly() {
@@ -14165,6 +14238,7 @@ fn treat_as_natural_language(args: &[String]) -> bool {
         "diagnose",
         "fix",
         "status",
+        "completions",
         "bridge-snapshot",
         "sandbox-run",
         "mcp-call",
@@ -14204,6 +14278,125 @@ fn treat_as_natural_language(args: &[String]) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn cli_command_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn completions_generate_for_every_shell() {
+        use clap_complete::Shell;
+        // The hidden, internal-only verbs that `--help` omits and that must
+        // therefore never appear in any generated completion script. These are
+        // matched as substrings of the generated text, so the hidden `status`
+        // verb is intentionally excluded here: it would collide with the
+        // visible `comfyui status` / `setup status` subcommands. The hidden
+        // `status` verb is covered by name equality in
+        // `completion_command_excludes_hidden_subcommands` instead.
+        let hidden = [
+            "__engine-serve-http",
+            "__engine-stdio",
+            "mcp-call",
+            "sandbox-run",
+            "bridge-snapshot",
+            "bootstrap",
+        ];
+        for &shell in Shell::value_variants() {
+            let mut cmd = completion_command();
+            let mut buf: Vec<u8> = Vec::new();
+            clap_complete::generate(shell, &mut cmd, "rocm", &mut buf);
+            assert!(!buf.is_empty(), "no completion output for {shell:?}");
+            let output = String::from_utf8(buf).expect("completion output is valid UTF-8");
+            for verb in hidden {
+                assert!(
+                    !output.contains(verb),
+                    "hidden subcommand `{verb}` leaked into {shell:?} completions"
+                );
+            }
+            // A known visible subcommand must still be present.
+            assert!(
+                output.contains("examine"),
+                "visible subcommand `examine` missing from {shell:?} completions"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_command_excludes_hidden_subcommands() {
+        let names: Vec<String> = completion_command()
+            .get_subcommands()
+            .map(|sc| sc.get_name().to_owned())
+            .collect();
+        // Visible subcommands are preserved.
+        assert!(
+            names.iter().any(|n| n == "examine"),
+            "filtered command tree dropped a visible subcommand; got {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "completions"),
+            "filtered command tree dropped `completions`; got {names:?}"
+        );
+        // Hidden subcommands are excluded.
+        for hidden in [
+            "__engine-serve-http",
+            "__engine-stdio",
+            "mcp-call",
+            "sandbox-run",
+            "bridge-snapshot",
+            "bootstrap",
+            "status",
+        ] {
+            assert!(
+                !names.iter().any(|n| n == hidden),
+                "filtered command tree still exposes hidden subcommand `{hidden}`; got {names:?}"
+            );
+        }
+        // The full derived command (used for runtime dispatch) keeps them.
+        let full_names: Vec<String> = Cli::command()
+            .get_subcommands()
+            .map(|sc| sc.get_name().to_owned())
+            .collect();
+        assert!(
+            full_names.iter().any(|n| n == "__engine-stdio"),
+            "runtime command tree must retain hidden verbs for dispatch; got {full_names:?}"
+        );
+    }
+
+    #[test]
+    fn completions_command_is_structured_not_freeform() {
+        use clap_complete::Shell;
+        for &shell in Shell::value_variants() {
+            let shell_arg = shell.to_string();
+            let invocation =
+                parse_freeform_invocation(&["completions".to_owned(), shell_arg.clone()]);
+            assert!(
+                !should_treat_as_freeform(&invocation),
+                "`completions {shell_arg}` must dispatch as a structured command, not freeform"
+            );
+            // It must also parse cleanly through the structured clap parser.
+            let cli = Cli::try_parse_from(["rocm", "completions", &shell_arg])
+                .expect("completions <shell> should parse via Cli");
+            assert!(matches!(cli.command, Some(Command::Completions { .. })));
+        }
+    }
+
+    #[test]
+    fn completions_rejects_unknown_shell() {
+        // An unrecognized shell must be a hard parse error (non-zero exit in
+        // `main`), not silently treated as natural language or accepted.
+        let invocation =
+            parse_freeform_invocation(&["completions".to_owned(), "notashell".to_owned()]);
+        assert!(
+            !should_treat_as_freeform(&invocation),
+            "`completions notashell` must stay on the structured path so clap reports the error"
+        );
+        let parsed = Cli::try_parse_from(["rocm", "completions", "notashell"]);
+        assert!(
+            parsed.is_err(),
+            "an unknown shell must fail to parse rather than being accepted"
+        );
+    }
 
     #[test]
     fn service_http_readiness_requires_loaded_lemonade_model() {
@@ -17200,7 +17393,9 @@ install therock";
             "config",
             "logs",
             "daemon",
+            "dash",
             "uninstall",
+            "completions",
             "help",
         ] {
             let invocation = parse_freeform_invocation(&[command.to_owned()]);
