@@ -1019,7 +1019,7 @@ impl AppState {
                     self.slash_tool = Some(SlashToolRequest {
                         name: "proposal_action".to_string(),
                         args: serde_json::json!({ "proposal_id": id, "action": "show" }),
-                        label: format!("review {id}"),
+                        label: format!("edit {id}"),
                     });
                     self.chat.push(ChatTurn::agent(format!(
                         "Editing a proposal's content isn't supported; showing {id}. Use /approve {id} or /reject {id}."
