@@ -169,8 +169,8 @@ pub fn hit_test(area: Rect, x: u16, y: u16) -> Option<KeyAction> {
 
 fn draw_verb_list(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // The list owns focus until the user steps right into the detail pane.
-    let list_focused =
-        state.active_tab == ActiveTab::Action && state.action_focus == ActionFocus::List;
+    let list_focused = matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving)
+        && state.action_focus == ActionFocus::List;
     let inner = panel::bento(
         f,
         area,
@@ -242,8 +242,8 @@ fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let d = &DETAILS[sel];
     // The detail pane lights up (bold, brightened border + highlighted Start)
     // once the user steps into it with → or Enter.
-    let focused =
-        state.active_tab == ActiveTab::Action && state.action_focus == ActionFocus::Detail;
+    let focused = matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving)
+        && state.action_focus == ActionFocus::Detail;
 
     let title = format!("{icon} {label}");
     let inner = panel::bento(f, area, Some(&title), BoxRole::Secondary, focused, theme);
@@ -333,7 +333,7 @@ mod tests {
     #[test]
     fn action_renders_verbs_and_soon_marker() {
         let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Action;
+        s.active_tab = ActiveTab::Rocm;
         let out = render(&s, 120, 24);
         assert!(out.contains("Serve a model"), "serve row missing: {out:?}");
         assert!(out.contains("Engines"), "engines row missing");
@@ -357,7 +357,7 @@ mod tests {
     #[test]
     fn action_does_not_panic_when_squeezed() {
         let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Action;
+        s.active_tab = ActiveTab::Rocm;
         for h in [1u16, 2, 3, 5, 10] {
             let _ = render(&s, 60, h);
         }

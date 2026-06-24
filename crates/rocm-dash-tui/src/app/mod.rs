@@ -119,12 +119,14 @@ pub enum ConnState {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ActiveTab {
-    // P3: final 4-tab IA. Home is the default; Observe folds the former
-    // Overview/Hardware/Instances/Bench telemetry tabs; Action surfaces the
-    // guided mutating verbs through the existing execution seam.
+    // 5-tab IA. Home is the default; ROCm and Serving are the two domain tabs
+    // (Actions list + inline Details); Observe folds the host/instance/bench
+    // telemetry; Chat is the assistant. The former single Action tab is gone —
+    // its guided verbs are split across ROCm + Serving.
     #[default]
     Home,
-    Action,
+    Rocm,
+    Serving,
     Observe,
     Chat,
 }
@@ -133,8 +135,9 @@ impl ActiveTab {
     #[must_use]
     pub const fn next(self) -> Self {
         match self {
-            Self::Home => Self::Action,
-            Self::Action => Self::Observe,
+            Self::Home => Self::Rocm,
+            Self::Rocm => Self::Serving,
+            Self::Serving => Self::Observe,
             Self::Observe => Self::Chat,
             Self::Chat => Self::Home,
         }
@@ -143,17 +146,19 @@ impl ActiveTab {
     pub const fn prev(self) -> Self {
         match self {
             Self::Home => Self::Chat,
-            Self::Action => Self::Home,
-            Self::Observe => Self::Action,
+            Self::Rocm => Self::Home,
+            Self::Serving => Self::Rocm,
+            Self::Observe => Self::Serving,
             Self::Chat => Self::Observe,
         }
     }
     pub const fn from_digit(d: char) -> Option<Self> {
         match d {
             '1' => Some(Self::Home),
-            '2' => Some(Self::Action),
-            '3' => Some(Self::Observe),
-            '4' => Some(Self::Chat),
+            '2' => Some(Self::Rocm),
+            '3' => Some(Self::Serving),
+            '4' => Some(Self::Observe),
+            '5' => Some(Self::Chat),
             _ => None,
         }
     }
@@ -928,7 +933,9 @@ impl AppState {
             // Observe folds the telemetry tabs; its selectable list is the
             // instances table (the one actionable list in the cluster).
             ActiveTab::Observe => self.instances.len(),
-            ActiveTab::Action => crate::ui::tabs::action::VERB_COUNT,
+            // P1: ROCm + Serving both share the ported Action verb list as a
+            // one-phase placeholder; P2 splits them into per-tab modules.
+            ActiveTab::Rocm | ActiveTab::Serving => crate::ui::tabs::action::VERB_COUNT,
             _ => 0,
         }
     }
@@ -958,7 +965,7 @@ impl AppState {
     const fn selection_for(&self, tab: ActiveTab) -> usize {
         match tab {
             ActiveTab::Observe => self.instance_sel,
-            ActiveTab::Action => self.action_sel,
+            ActiveTab::Rocm | ActiveTab::Serving => self.action_sel,
             _ => 0,
         }
     }
@@ -966,7 +973,7 @@ impl AppState {
     const fn set_selection(&mut self, tab: ActiveTab, idx: usize) {
         match tab {
             ActiveTab::Observe => self.instance_sel = idx,
-            ActiveTab::Action => self.action_sel = idx,
+            ActiveTab::Rocm | ActiveTab::Serving => self.action_sel = idx,
             _ => {}
         }
     }
@@ -1711,24 +1718,24 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
             } else {
                 // Changing the verb selection snaps focus back to the list so
                 // the detail pane re-previews the newly selected operation.
-                if state.active_tab == ActiveTab::Action {
+                if matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving) {
                     state.action_focus = ActionFocus::List;
                 }
                 state.move_selection(d);
             }
         }
         KeyAction::ActionFocusDetail => {
-            if state.active_tab == ActiveTab::Action {
+            if matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving) {
                 state.action_focus = ActionFocus::Detail;
             }
         }
         KeyAction::ActionFocusList => {
-            if state.active_tab == ActiveTab::Action {
+            if matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving) {
                 state.action_focus = ActionFocus::List;
             }
         }
         KeyAction::ActionActivate => {
-            if state.active_tab == ActiveTab::Action {
+            if matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving) {
                 match state.action_focus {
                     // From the list, Enter steps INTO the detail pane.
                     ActionFocus::List => state.action_focus = ActionFocus::Detail,
@@ -1742,14 +1749,16 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
         }
         KeyAction::ActionEscape => {
             // Esc backs out one level: detail → list, then list → main menu.
-            if state.active_tab == ActiveTab::Action && state.action_focus == ActionFocus::Detail {
+            if matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving)
+                && state.action_focus == ActionFocus::Detail
+            {
                 state.action_focus = ActionFocus::List;
             } else {
                 return apply_action(state, KeyAction::OpenMenu);
             }
         }
         KeyAction::ActionSelect(i) => {
-            if state.active_tab == ActiveTab::Action {
+            if matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving) {
                 state.action_sel = i.min(crate::ui::tabs::action::VERB_COUNT.saturating_sub(1));
                 state.action_focus = ActionFocus::List;
             }
@@ -1769,9 +1778,9 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
             }
         }
         KeyAction::OpenDetail => {
-            if state.active_tab == ActiveTab::Action {
+            if matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving) {
                 // Action rows open the matching manager via the existing seam;
-                // there is no detail modal on the Action tab.
+                // there is no detail modal on the ROCm/Serving tabs.
                 let verb = crate::ui::tabs::action::verb_action(state.action_sel);
                 return apply_action(state, verb);
             }
@@ -1959,7 +1968,9 @@ fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
             // selection is the primary path.
             let action = match state.active_tab {
                 ActiveTab::Observe => ui::tabs::instances::hit_test(area, me.column, me.row, state),
-                ActiveTab::Action => ui::tabs::action::hit_test(area, me.column, me.row),
+                ActiveTab::Rocm | ActiveTab::Serving => {
+                    ui::tabs::action::hit_test(area, me.column, me.row)
+                }
                 _ => None,
             };
             if let Some(a) = action {
@@ -2245,9 +2256,11 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         KeyCode::Char('q') => KeyAction::Quit,
         // Esc opens the main menu when idle, except on Chat (where Esc keeps its
         // existing chat meaning) — managers/approval are routed upstream.
-        // On Action, Esc first steps out of the detail pane (resolved against
-        // focus in `apply_action`); elsewhere it opens the main menu.
-        KeyCode::Esc if current == ActiveTab::Action => KeyAction::ActionEscape,
+        // On ROCm/Serving, Esc first steps out of the detail pane (resolved
+        // against focus in `apply_action`); elsewhere it opens the main menu.
+        KeyCode::Esc if matches!(current, ActiveTab::Rocm | ActiveTab::Serving) => {
+            KeyAction::ActionEscape
+        }
         KeyCode::Esc if current != ActiveTab::Chat => KeyAction::OpenMenu,
         KeyCode::Esc => KeyAction::Nothing,
         KeyCode::Char(':') => KeyAction::OpenPalette,
@@ -2261,7 +2274,7 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
                 KeyAction::SwitchTab(current.next())
             }
         }
-        KeyCode::Char(c @ '1'..='4') => match ActiveTab::from_digit(c) {
+        KeyCode::Char(c @ '1'..='5') => match ActiveTab::from_digit(c) {
             Some(t) => KeyAction::SwitchTab(t),
             None => KeyAction::Nothing,
         },
@@ -2284,54 +2297,115 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         // Services manager: open where servers live.
         KeyCode::Char('s') if current == ActiveTab::Observe => KeyAction::OpenServices,
         // Serve wizard: launch a model.
-        KeyCode::Char('w') if matches!(current, ActiveTab::Observe | ActiveTab::Action) => {
+        KeyCode::Char('w')
+            if matches!(
+                current,
+                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
+            ) =>
+        {
             KeyAction::OpenServeWizard
         }
         // Engine manager: use/install/reinstall serving engines.
-        KeyCode::Char('e') if matches!(current, ActiveTab::Observe | ActiveTab::Action) => {
+        KeyCode::Char('e')
+            if matches!(
+                current,
+                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
+            ) =>
+        {
             KeyAction::OpenEngineManager
         }
         // Doctor: read-only environment check.
-        KeyCode::Char('d') if matches!(current, ActiveTab::Observe | ActiveTab::Action) => {
+        KeyCode::Char('d')
+            if matches!(
+                current,
+                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
+            ) =>
+        {
             KeyAction::OpenExamine
         }
         // Update: check/preview/apply ROCm package updates.
-        KeyCode::Char('u') if matches!(current, ActiveTab::Observe | ActiveTab::Action) => {
+        KeyCode::Char('u')
+            if matches!(
+                current,
+                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
+            ) =>
+        {
             KeyAction::OpenUpdate
         }
         // Install: ROCm SDK (TheRock) install / dry-run.
-        KeyCode::Char('i') if matches!(current, ActiveTab::Observe | ActiveTab::Action) => {
+        KeyCode::Char('i')
+            if matches!(
+                current,
+                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
+            ) =>
+        {
             KeyAction::OpenInstall
         }
         // Logs: browse recent ROCm CLI logs.
-        KeyCode::Char('l') if matches!(current, ActiveTab::Observe | ActiveTab::Action) => {
+        KeyCode::Char('l')
+            if matches!(
+                current,
+                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
+            ) =>
+        {
             KeyAction::OpenLogs
         }
         // Runtimes: list/activate/adopt/import ROCm runtimes.
-        KeyCode::Char('r') if matches!(current, ActiveTab::Observe | ActiveTab::Action) => {
+        KeyCode::Char('r')
+            if matches!(
+                current,
+                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
+            ) =>
+        {
             KeyAction::OpenRuntimes
         }
         // Onboarding: first-run setup wizard (install / adopt).
-        KeyCode::Char('n') if matches!(current, ActiveTab::Observe | ActiveTab::Action) => {
+        KeyCode::Char('n')
+            if matches!(
+                current,
+                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
+            ) =>
+        {
             KeyAction::OpenOnboarding
         }
         // Automations: list/enable/disable background checks.
-        KeyCode::Char('a') if matches!(current, ActiveTab::Observe | ActiveTab::Action) => {
+        KeyCode::Char('a')
+            if matches!(
+                current,
+                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
+            ) =>
+        {
             KeyAction::OpenAutomations
         }
         // Command runner: run any ROCm CLI subcommand (gated).
-        KeyCode::Char('c') if matches!(current, ActiveTab::Observe | ActiveTab::Action) => {
+        KeyCode::Char('c')
+            if matches!(
+                current,
+                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
+            ) =>
+        {
             KeyAction::OpenCommand
         }
         // Config & providers.
-        KeyCode::Char('p') if matches!(current, ActiveTab::Observe | ActiveTab::Action) => {
+        KeyCode::Char('p')
+            if matches!(
+                current,
+                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
+            ) =>
+        {
             KeyAction::OpenConfig
         }
-        // Action tab: arrow keys drive the focus-into-detail interaction; Enter
-        // is focus-aware (list → focus detail, detail → open the manager).
-        KeyCode::Right if current == ActiveTab::Action => KeyAction::ActionFocusDetail,
-        KeyCode::Left if current == ActiveTab::Action => KeyAction::ActionFocusList,
-        KeyCode::Enter if current == ActiveTab::Action => KeyAction::ActionActivate,
+        // ROCm/Serving tabs: arrow keys drive the focus-into-detail interaction;
+        // Enter is focus-aware (list → focus detail, detail → open the manager).
+        KeyCode::Right if matches!(current, ActiveTab::Rocm | ActiveTab::Serving) => {
+            KeyAction::ActionFocusDetail
+        }
+        KeyCode::Left if matches!(current, ActiveTab::Rocm | ActiveTab::Serving) => {
+            KeyAction::ActionFocusList
+        }
+        KeyCode::Enter if matches!(current, ActiveTab::Rocm | ActiveTab::Serving) => {
+            KeyAction::ActionActivate
+        }
         KeyCode::Enter => KeyAction::OpenDetail,
         _ => KeyAction::Nothing,
     }
@@ -2357,7 +2431,11 @@ pub fn handle_mouse(ev: MouseEvent, modal: &Modal, tab: ActiveTab) -> KeyAction 
     if *modal == Modal::Detail {
         KeyAction::ScrollModal(delta)
     } else if *modal == Modal::ThemePicker
-        || (*modal == Modal::None && matches!(tab, ActiveTab::Observe | ActiveTab::Action))
+        || (*modal == Modal::None
+            && matches!(
+                tab,
+                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
+            ))
     {
         KeyAction::Move(delta as isize)
     } else {
@@ -2411,10 +2489,14 @@ mod tests {
 
     #[test]
     fn tab_cycles_forward_and_wraps() {
-        // P3 4-tab IA: Home → Action → Observe → Chat → Home.
+        // 5-tab IA: Home → ROCm → Serving → Observe → Chat → Home.
         assert_eq!(
             hk(KeyCode::Tab, ActiveTab::Home),
-            KeyAction::SwitchTab(ActiveTab::Action)
+            KeyAction::SwitchTab(ActiveTab::Rocm)
+        );
+        assert_eq!(
+            hk(KeyCode::Tab, ActiveTab::Serving),
+            KeyAction::SwitchTab(ActiveTab::Observe)
         );
         assert_eq!(
             hk(KeyCode::Tab, ActiveTab::Observe),
@@ -2431,15 +2513,15 @@ mod tests {
     fn action_tab_arrows_and_enter_drive_focus() {
         // → steps into the detail pane, ← steps back, Enter is focus-aware.
         assert_eq!(
-            hk(KeyCode::Right, ActiveTab::Action),
+            hk(KeyCode::Right, ActiveTab::Rocm),
             KeyAction::ActionFocusDetail
         );
         assert_eq!(
-            hk(KeyCode::Left, ActiveTab::Action),
+            hk(KeyCode::Left, ActiveTab::Rocm),
             KeyAction::ActionFocusList
         );
         assert_eq!(
-            hk(KeyCode::Enter, ActiveTab::Action),
+            hk(KeyCode::Enter, ActiveTab::Rocm),
             KeyAction::ActionActivate
         );
         // Arrows are inert on other tabs (no focus model there).
@@ -2454,7 +2536,7 @@ mod tests {
     #[test]
     fn action_activate_is_two_step_list_then_open() {
         let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Action;
+        s.active_tab = ActiveTab::Rocm;
         s.action_sel = 0; // Serve a model → OpenServeWizard
         assert_eq!(s.action_focus, ActionFocus::List);
         // First activate steps into the detail pane; no overlay yet.
@@ -2472,7 +2554,7 @@ mod tests {
     #[test]
     fn action_focus_resets_on_move_and_tab_switch() {
         let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Action;
+        s.active_tab = ActiveTab::Rocm;
         s.action_focus = ActionFocus::Detail;
         apply_action(&mut s, KeyAction::Move(1));
         assert_eq!(s.action_focus, ActionFocus::List, "Move snaps back to list");
@@ -2485,9 +2567,9 @@ mod tests {
     fn action_esc_backs_out_of_detail_then_opens_menu() {
         // Esc on Action is intercepted (not the global OpenMenu) so it can back
         // out of the detail pane first.
-        assert_eq!(hk(KeyCode::Esc, ActiveTab::Action), KeyAction::ActionEscape);
+        assert_eq!(hk(KeyCode::Esc, ActiveTab::Rocm), KeyAction::ActionEscape);
         let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Action;
+        s.active_tab = ActiveTab::Rocm;
         s.action_focus = ActionFocus::Detail;
         apply_action(&mut s, KeyAction::ActionEscape);
         assert_eq!(s.action_focus, ActionFocus::List, "first Esc → list");
@@ -2499,7 +2581,7 @@ mod tests {
     #[test]
     fn action_select_sets_verb_and_parks_on_list() {
         let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Action;
+        s.active_tab = ActiveTab::Rocm;
         s.action_focus = ActionFocus::Detail;
         apply_action(&mut s, KeyAction::ActionSelect(2));
         assert_eq!(s.action_sel, 2);
@@ -2536,9 +2618,10 @@ mod tests {
 
     #[test]
     fn back_tab_and_shift_tab_both_cycle_backward() {
+        // prev(Observe) = Serving in the 5-tab IA.
         assert_eq!(
             hk(KeyCode::BackTab, ActiveTab::Observe),
-            KeyAction::SwitchTab(ActiveTab::Action)
+            KeyAction::SwitchTab(ActiveTab::Serving)
         );
         // Home's previous tab is Chat (the last tab).
         assert_eq!(
@@ -2549,7 +2632,7 @@ mod tests {
         assert_eq!(
             handle_key(
                 shift_tab,
-                ActiveTab::Action,
+                ActiveTab::Rocm,
                 &Modal::None,
                 ChatKeyCtx::default()
             ),
@@ -2559,29 +2642,38 @@ mod tests {
 
     #[test]
     fn number_keys_jump_to_tab() {
-        // P3: '1'→Home, '2'→Action, '3'→Observe, '4'→Chat.
+        // 5-tab: '1'→Home, '2'→ROCm, '3'→Serving, '4'→Observe, '5'→Chat.
         assert_eq!(
             hk(KeyCode::Char('1'), ActiveTab::Home),
             KeyAction::SwitchTab(ActiveTab::Home)
         );
         assert_eq!(
-            hk(KeyCode::Char('3'), ActiveTab::Home),
-            KeyAction::SwitchTab(ActiveTab::Observe)
+            hk(KeyCode::Char('2'), ActiveTab::Home),
+            KeyAction::SwitchTab(ActiveTab::Rocm)
         );
-        // `4` reaches the Chat tab (digit guard narrowed to '1'..='4').
+        assert_eq!(
+            hk(KeyCode::Char('3'), ActiveTab::Home),
+            KeyAction::SwitchTab(ActiveTab::Serving)
+        );
         assert_eq!(
             hk(KeyCode::Char('4'), ActiveTab::Home),
+            KeyAction::SwitchTab(ActiveTab::Observe)
+        );
+        // `5` reaches the Chat tab (digit guard widened to '1'..='5').
+        assert_eq!(
+            hk(KeyCode::Char('5'), ActiveTab::Home),
             KeyAction::SwitchTab(ActiveTab::Chat)
         );
-        assert_eq!(hk(KeyCode::Char('5'), ActiveTab::Home), KeyAction::Nothing);
+        assert_eq!(hk(KeyCode::Char('6'), ActiveTab::Home), KeyAction::Nothing);
     }
 
     #[test]
     fn from_digit_maps_five_to_chat() {
-        // P3: 4-tab digit map; Chat is now '4', '5' is out of range.
+        // 5-tab digit map; Chat is now '5', '6'/'0' are out of range.
         assert_eq!(ActiveTab::from_digit('1'), Some(ActiveTab::Home));
-        assert_eq!(ActiveTab::from_digit('4'), Some(ActiveTab::Chat));
-        assert_eq!(ActiveTab::from_digit('5'), None);
+        assert_eq!(ActiveTab::from_digit('5'), Some(ActiveTab::Chat));
+        assert_eq!(ActiveTab::from_digit('6'), None);
+        assert_eq!(ActiveTab::from_digit('0'), None);
     }
 
     #[test]
@@ -2612,8 +2704,8 @@ mod tests {
             hk(KeyCode::Char('k'), ActiveTab::Observe),
             KeyAction::Move(-1)
         );
-        assert_eq!(hk(KeyCode::Down, ActiveTab::Action), KeyAction::Move(1));
-        assert_eq!(hk(KeyCode::Up, ActiveTab::Action), KeyAction::Move(-1));
+        assert_eq!(hk(KeyCode::Down, ActiveTab::Rocm), KeyAction::Move(1));
+        assert_eq!(hk(KeyCode::Up, ActiveTab::Rocm), KeyAction::Move(-1));
         assert_eq!(
             hk(KeyCode::Char('g'), ActiveTab::Observe),
             KeyAction::SelectFirst
@@ -2642,7 +2734,7 @@ mod tests {
             KeyAction::OpenServeWizard
         );
         assert_eq!(
-            hk(KeyCode::Char('e'), ActiveTab::Action),
+            hk(KeyCode::Char('e'), ActiveTab::Rocm),
             KeyAction::OpenEngineManager
         );
         assert_eq!(hk(KeyCode::Char('w'), ActiveTab::Home), KeyAction::Nothing);
@@ -2652,7 +2744,7 @@ mod tests {
             KeyAction::OpenExamine
         );
         assert_eq!(
-            hk(KeyCode::Char('u'), ActiveTab::Action),
+            hk(KeyCode::Char('u'), ActiveTab::Rocm),
             KeyAction::OpenUpdate
         );
         // Install / logs open from Observe + Action.
@@ -2660,10 +2752,7 @@ mod tests {
             hk(KeyCode::Char('i'), ActiveTab::Observe),
             KeyAction::OpenInstall
         );
-        assert_eq!(
-            hk(KeyCode::Char('l'), ActiveTab::Action),
-            KeyAction::OpenLogs
-        );
+        assert_eq!(hk(KeyCode::Char('l'), ActiveTab::Rocm), KeyAction::OpenLogs);
         // On the Chat tab none of these open an overlay (the operational keys
         // are guarded to Observe/Action). `i` is the one that means
         // something else on Chat — insert mode — never OpenInstall.
@@ -2771,7 +2860,7 @@ mod tests {
     fn palette_activation_switches_tab() {
         let mut s = AppState::new("t".into(), "default-dark".into());
         apply_action(&mut s, KeyAction::OpenPalette);
-        apply_action(&mut s, KeyAction::MenuMove(2)); // → Observe
+        apply_action(&mut s, KeyAction::MenuMove(3)); // Home→ROCm→Serving→Observe
         apply_action(&mut s, KeyAction::MenuActivate);
         assert_eq!(s.active_tab, ActiveTab::Observe);
         assert_eq!(s.modal, Modal::None);
@@ -2849,13 +2938,15 @@ mod tests {
 
     #[test]
     fn tab_bar_hit_matches_per_chip_extents() {
-        // P3 4-tab layout: Home 0..9, Action 12..23, Observe 26..38, Chat 41..50.
+        // 5-tab layout: Home 0..10, ROCm 11..21, Serving 22..35, Observe 36..49,
+        // Chat 50..60.
         let bar = Rect::new(0, 0, 80, 1);
         assert_eq!(tab_bar_hit(bar, 5, 0), Some(ActiveTab::Home));
-        assert_eq!(tab_bar_hit(bar, 17, 0), Some(ActiveTab::Action));
-        assert_eq!(tab_bar_hit(bar, 30, 0), Some(ActiveTab::Observe));
-        assert_eq!(tab_bar_hit(bar, 45, 0), Some(ActiveTab::Chat));
-        // Separator " · " between Home (ends 9) and Action (starts 12).
+        assert_eq!(tab_bar_hit(bar, 15, 0), Some(ActiveTab::Rocm));
+        assert_eq!(tab_bar_hit(bar, 28, 0), Some(ActiveTab::Serving));
+        assert_eq!(tab_bar_hit(bar, 42, 0), Some(ActiveTab::Observe));
+        assert_eq!(tab_bar_hit(bar, 55, 0), Some(ActiveTab::Chat));
+        // Separator gap between Home (ends 10 excl.) and ROCm (starts 11).
         assert_eq!(tab_bar_hit(bar, 10, 0), None);
         // Wrong row.
         assert_eq!(tab_bar_hit(bar, 5, 2), None);
@@ -2863,12 +2954,12 @@ mod tests {
 
     #[test]
     fn tab_bar_hit_skips_chips_that_overflow_a_narrow_bar() {
-        // Bar can only fit the first two chips (Action ends at 23).
+        // Bar can only fit the first two chips (ROCm ends at 21).
         let bar = Rect::new(0, 0, 25, 1);
         assert_eq!(tab_bar_hit(bar, 5, 0), Some(ActiveTab::Home));
-        assert_eq!(tab_bar_hit(bar, 17, 0), Some(ActiveTab::Action));
-        // Observe chip would be at 26..38 — outside bar → None.
-        assert_eq!(tab_bar_hit(bar, 30, 0), None);
+        assert_eq!(tab_bar_hit(bar, 15, 0), Some(ActiveTab::Rocm));
+        // Serving chip would be at 22..35 — overflows the 25-wide bar → None.
+        assert_eq!(tab_bar_hit(bar, 28, 0), None);
     }
 
     #[test]
@@ -3102,7 +3193,7 @@ mod tests {
         assert_eq!(gate(KeyCode::Char('q')), KeyAction::Quit);
         assert_eq!(
             gate(KeyCode::Char('2')),
-            KeyAction::SwitchTab(ActiveTab::Action)
+            KeyAction::SwitchTab(ActiveTab::Rocm)
         );
     }
 

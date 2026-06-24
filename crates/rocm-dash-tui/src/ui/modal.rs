@@ -88,7 +88,7 @@ pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
         key_line("q", "quit", theme),
         key_line("?", "toggle this help", theme),
         key_line("Tab / Shift-Tab", "next / previous tab", theme),
-        key_line("1 .. 4", "jump to tab", theme),
+        key_line("1 .. 5", "jump to tab", theme),
         key_line("t", "open theme picker", theme),
         key_line("Space", "pause / resume (replay only)", theme),
         key_line("+ / -", "speed up / slow down (replay only)", theme),
@@ -97,11 +97,8 @@ pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
         Line::raw(""),
     ];
     let tab_help: &[(&str, &str)] = match tab {
-        ActiveTab::Home => &[
-            ("▸ Open Chat / Serve", "act on the Next-step card"),
-            ("(no other tab-specific keys)", ""),
-        ],
-        ActiveTab::Action => &[
+        ActiveTab::Home => &[("(no tab-specific keys — see the ROCm / Serving tabs)", "")],
+        ActiveTab::Rocm | ActiveTab::Serving => &[
             ("j / Down", "select next action"),
             ("k / Up", "select previous action"),
             (
@@ -398,7 +395,8 @@ pub const MENU_ITEMS: usize = 3;
 /// Command-palette destinations (label, tab).
 pub const PALETTE_DESTS: &[(&str, ActiveTab)] = &[
     ("Home", ActiveTab::Home),
-    ("Action", ActiveTab::Action),
+    ("ROCm", ActiveTab::Rocm),
+    ("Serving", ActiveTab::Serving),
     ("Observe", ActiveTab::Observe),
     ("Chat", ActiveTab::Chat),
 ];

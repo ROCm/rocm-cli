@@ -97,7 +97,11 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
 
     match state.active_tab {
         ActiveTab::Home => tabs::home::draw(f, center_inner, state, &theme),
-        ActiveTab::Action => tabs::action::draw(f, center_inner, state, &theme),
+        // P1: ROCm + Serving both render the ported Action verb list as a
+        // one-phase placeholder; P2 lands the real per-tab modules.
+        ActiveTab::Rocm | ActiveTab::Serving => {
+            tabs::action::draw(f, center_inner, state, &theme);
+        }
         ActiveTab::Observe => tabs::observe::draw(f, center_inner, state, &theme),
         ActiveTab::Chat => tabs::chat::draw(f, center_inner, state, &theme),
     }
@@ -278,7 +282,8 @@ enum Seg {
 
 /// Draw the footer legend and return the clickable chip geometry for hit-testing.
 fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Vec<FooterChip> {
-    let enter_action = if state.active_tab == ActiveTab::Action {
+    let is_action_tab = matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving);
+    let enter_action = if is_action_tab {
         KeyAction::ActionActivate
     } else {
         KeyAction::OpenDetail
@@ -286,21 +291,27 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
     let mut segs: Vec<Seg> = vec![
         Seg::Key("Tab", Some(KeyAction::SwitchTab(state.active_tab.next()))),
         Seg::Sep(" next  "),
-        Seg::Key("1–4", None),
+        Seg::Key("1–5", None),
         Seg::Sep(" jump  "),
     ];
-    if matches!(state.active_tab, ActiveTab::Observe | ActiveTab::Action) {
+    if matches!(
+        state.active_tab,
+        ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
+    ) {
         segs.push(Seg::Key("j/k", Some(KeyAction::Move(1))));
         segs.push(Seg::Sep(" select  "));
         segs.push(Seg::Key("Enter", Some(enter_action)));
-        segs.push(Seg::Sep(if state.active_tab == ActiveTab::Action {
+        segs.push(Seg::Sep(if is_action_tab {
             " open  "
         } else {
             " detail  "
         }));
     }
-    // Guided-action entry points — Observe (telemetry) + Action (verb list).
-    if matches!(state.active_tab, ActiveTab::Observe | ActiveTab::Action) {
+    // Guided-action entry points — Observe (telemetry) + ROCm/Serving (verbs).
+    if matches!(
+        state.active_tab,
+        ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
+    ) {
         segs.push(Seg::Key("w", Some(KeyAction::OpenServeWizard)));
         segs.push(Seg::Sep(" serve  "));
         segs.push(Seg::Key("e", Some(KeyAction::OpenEngineManager)));

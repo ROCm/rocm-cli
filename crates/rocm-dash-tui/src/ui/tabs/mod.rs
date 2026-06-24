@@ -25,21 +25,23 @@ use crate::app::ActiveTab;
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
 
-pub const TAB_LABELS: [(ActiveTab, &str, char); 4] = [
+pub const TAB_LABELS: [(ActiveTab, &str, char); 5] = [
     (ActiveTab::Home, "Home", '1'),
-    (ActiveTab::Action, "Action", '2'),
-    (ActiveTab::Observe, "Observe", '3'),
-    (ActiveTab::Chat, "Chat", '4'),
+    (ActiveTab::Rocm, "ROCm", '2'),
+    (ActiveTab::Serving, "Serving", '3'),
+    (ActiveTab::Observe, "Observe", '4'),
+    (ActiveTab::Chat, "Chat", '5'),
 ];
 
-/// The four tab labels in display order (for the outlined panel renderer).
+/// The five tab labels in display order (for the outlined panel renderer).
 #[must_use]
-pub const fn tab_labels() -> [&'static str; 4] {
+pub const fn tab_labels() -> [&'static str; 5] {
     [
         TAB_LABELS[0].1,
         TAB_LABELS[1].1,
         TAB_LABELS[2].1,
         TAB_LABELS[3].1,
+        TAB_LABELS[4].1,
     ]
 }
 
@@ -83,19 +85,20 @@ fn outlined_chip_spans(origin_x: u16, labels: &[&str]) -> Vec<(u16, u16)> {
 /// The first folder's left border is at `bar_x`. Mirrors [`draw_tab_panel`]'s
 /// outlined-folder geometry exactly (via [`outlined_chip_spans`]) so a click
 /// resolves to the tab drawn at that column.
-pub fn compute_chip_layout(bar_x: u16) -> [TabChip; 4] {
+pub fn compute_chip_layout(bar_x: u16) -> [TabChip; 5] {
     let labels = [
         TAB_LABELS[0].1,
         TAB_LABELS[1].1,
         TAB_LABELS[2].1,
         TAB_LABELS[3].1,
+        TAB_LABELS[4].1,
     ];
     let spans = outlined_chip_spans(bar_x, &labels);
     let mut out = [TabChip {
         tab: ActiveTab::Home,
         x_start: 0,
         x_end: 0,
-    }; 4];
+    }; 5];
     for (i, (start, end)) in spans.iter().enumerate() {
         out[i] = TabChip {
             tab: TAB_LABELS[i].0,
@@ -235,31 +238,37 @@ mod tests {
 
     #[test]
     fn chip_layout_matches_draw_widths() {
-        // Outlined folders: chip width = label.len()+6 (┌ + " X label " + ┐),
-        // 1-col gap between. Home(4)/Action(6)/Observe(7)/Chat(4).
+        // Outlined folders: chip width = label.chars()+4 content + 2 borders,
+        // 1-col gap between. Home(4)/ROCm(4)/Serving(7)/Observe(7)/Chat(4).
         let chips = compute_chip_layout(0);
         // " ● Home " (8) inside a box (10) → 0..10
         assert_eq!(chips[0].x_start, 0);
         assert_eq!(chips[0].x_end, 10);
         assert_eq!(chips[0].tab, ActiveTab::Home);
-        // gap then " 2 Action " (10) box (12) → 11..23
+        // gap then " 2 ROCm " (8) box (10) → 11..21
         assert_eq!(chips[1].x_start, 11);
-        assert_eq!(chips[1].x_end, 23);
-        // " 3 Observe " (11) box (13) → 24..37
-        assert_eq!(chips[2].x_start, 24);
-        assert_eq!(chips[2].x_end, 37);
-        // " 4 Chat " (8) box (10) → 38..48
-        assert_eq!(chips[3].x_start, 38);
-        assert_eq!(chips[3].x_end, 48);
-        assert_eq!(chips[3].tab, ActiveTab::Chat);
+        assert_eq!(chips[1].x_end, 21);
+        assert_eq!(chips[1].tab, ActiveTab::Rocm);
+        // " 3 Serving " (11) box (13) → 22..35
+        assert_eq!(chips[2].x_start, 22);
+        assert_eq!(chips[2].x_end, 35);
+        assert_eq!(chips[2].tab, ActiveTab::Serving);
+        // " 4 Observe " (11) box (13) → 36..49
+        assert_eq!(chips[3].x_start, 36);
+        assert_eq!(chips[3].x_end, 49);
+        assert_eq!(chips[3].tab, ActiveTab::Observe);
+        // " 5 Chat " (8) box (10) → 50..60
+        assert_eq!(chips[4].x_start, 50);
+        assert_eq!(chips[4].x_end, 60);
+        assert_eq!(chips[4].tab, ActiveTab::Chat);
     }
 
     #[test]
     fn chip_layout_honors_bar_x_offset() {
         let chips = compute_chip_layout(100);
         assert_eq!(chips[0].x_start, 100);
-        // Full panel (Home start → Chat end) spans 48 columns.
-        assert_eq!(chips[3].x_end - chips[0].x_start, 48);
+        // Full panel (Home start → Chat end) spans 60 columns.
+        assert_eq!(chips[4].x_end - chips[0].x_start, 60);
     }
 
     #[test]

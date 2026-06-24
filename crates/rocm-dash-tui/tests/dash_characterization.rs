@@ -74,7 +74,7 @@ fn render(state: &mut AppState, cols: u16, rows: u16) -> String {
 /// The tab bar always paints every tab label; assert it is present so the
 /// chrome itself is characterized once.
 fn assert_tab_bar(out: &str) {
-    for label in ["Home", "Action", "Observe", "Chat"] {
+    for label in ["Home", "ROCm", "Serving", "Observe", "Chat"] {
         assert!(out.contains(label), "tab bar missing {label:?}: {out:?}");
     }
 }
@@ -91,11 +91,17 @@ fn home_tab_renders_key_labels() {
 
 #[test]
 fn action_tab_renders_key_labels() {
-    let out = render(&mut state_on(ActiveTab::Action), 160, 44);
+    // P1: ROCm + Serving both render the ported Action verb list (placeholder).
+    let out = render(&mut state_on(ActiveTab::Rocm), 160, 44);
     assert_tab_bar(&out);
     assert!(
         out.contains("Serve a model"),
         "action verbs missing: {out:?}"
+    );
+    let serving = render(&mut state_on(ActiveTab::Serving), 160, 44);
+    assert!(
+        serving.contains("Serve a model"),
+        "serving verbs missing: {serving:?}"
     );
 }
 
@@ -287,7 +293,8 @@ fn every_tab_survives_squeezed_height() {
     // no tab panics when squeezed (the historical ActiveTab footgun).
     for tab in [
         ActiveTab::Home,
-        ActiveTab::Action,
+        ActiveTab::Rocm,
+        ActiveTab::Serving,
         ActiveTab::Observe,
         ActiveTab::Chat,
     ] {

@@ -52,10 +52,12 @@ pub const fn triptych(body: Rect) -> Option<(Rect, Rect, Rect)> {
 }
 
 /// Draw the right dock appropriate for `tab`: a live LOGS stream for the
-/// operational tabs (Observe/Action), a CONTEXT rail for Home/Chat.
+/// operational tabs (Observe/ROCm/Serving), a CONTEXT rail for Home/Chat.
 pub fn draw_right_dock(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     match state.active_tab {
-        ActiveTab::Observe | ActiveTab::Action => logs_dock(f, area, state, theme),
+        ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving => {
+            logs_dock(f, area, state, theme);
+        }
         ActiveTab::Home | ActiveTab::Chat => context_rail(f, area, state, theme),
     }
 }

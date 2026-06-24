@@ -1,10 +1,10 @@
-//! Home tab — the landing "instrument cluster" + next-step bento.
+//! Home tab — the landing "instrument cluster".
 //!
 //! Composes the `dash-home` mock (`gen_mockups.rs draw_dash_home`) against live
 //! `AppState` (read-only): a hero GPU gauge + spark, a stacked VRAM/TEMP/POWER
-//! mini-spark cluster, a context-aware Next-step card, and Running / Health /
-//! Updates tiles. Empty/absent telemetry renders honest placeholders rather
-//! than the mock's synthetic numbers.
+//! mini-spark cluster, and Running / Health / Updates tiles. Empty/absent
+//! telemetry renders honest placeholders rather than the mock's synthetic
+//! numbers.
 //!
 //! ponytail: Home is added behind the existing default this phase (P2). It is
 //! reachable by Tab / digit `1` but is NOT the default tab yet — P3 repoints
@@ -201,13 +201,8 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 }
 
 fn draw_hero_band(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let top = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-        .split(area);
-
     let title = node_throughput_title(state);
-    let hero = card(f, top[0], &title, BoxRole::Secondary, theme);
+    let hero = card(f, area, &title, BoxRole::Secondary, theme);
     if hero.width >= 8 && hero.height >= 6 {
         let hcols = Layout::default()
             .direction(Direction::Horizontal)
@@ -217,8 +212,6 @@ fn draw_hero_band(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         draw_hero_left(f, hcols[0], state, theme);
         draw_hero_right(f, hcols[1], state, theme);
     }
-
-    draw_next_step(f, top[1], state, theme);
 }
 
 fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -339,63 +332,6 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     );
     let tps: f64 = state.instances.values().filter_map(|i| i.gen_tps).sum();
     mini_spark(f, rh[4], "T/S  ", &format!("{tps:.0}"), &[], true, theme);
-}
-
-fn draw_next_step(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let inner = card(f, area, "Next step", BoxRole::Primary, theme);
-    if inner.height == 0 {
-        return;
-    }
-    let running = state
-        .instances
-        .values()
-        .find(|i| i.status == InstanceStatus::Running);
-    let lines = if let Some(inst) = running {
-        let port = inst
-            .port
-            .map_or_else(|| "—".to_string(), |p| format!(":{p}"));
-        vec![
-            Line::from(vec![
-                Span::styled("● ", Style::default().fg(theme.ok)),
-                Span::styled(
-                    inst.model_name.clone(),
-                    Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(Span::styled(
-                format!("on {port}"),
-                Style::default().fg(theme.muted),
-            )),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("▸ ", Style::default().fg(theme.accent)),
-                Span::styled(
-                    "Open Chat",
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
-        ]
-    } else {
-        vec![
-            Line::from(Span::styled(
-                "Nothing serving yet",
-                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("▸ ", Style::default().fg(theme.accent)),
-                Span::styled(
-                    "Serve a model",
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
-        ]
-    };
-    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -549,7 +485,6 @@ mod tests {
             out.contains("GPU UTILIZATION"),
             "hero label missing: {out:?}"
         );
-        assert!(out.contains("Next step"), "next-step card missing");
         assert!(out.contains("Running"), "running tile missing");
         assert!(out.contains("Health"), "health tile missing");
         assert!(out.contains("Updates"), "updates tile missing");
@@ -582,10 +517,6 @@ mod tests {
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.active_tab = ActiveTab::Home;
         let out = render(&s, 160, 30);
-        assert!(
-            out.contains("Nothing serving yet"),
-            "empty next-step: {out:?}"
-        );
         assert!(out.contains("Nothing running"), "empty running tile");
     }
 
