@@ -665,6 +665,8 @@ mod tests {
             waiting_reqs: None,
             gen_tps: None,
             tokens_per_watt: None,
+            ttft_ms: None,
+            tpot_ms: None,
             launch_args: vec![],
             env_vars: BTreeMap::new(),
             log_file: None,

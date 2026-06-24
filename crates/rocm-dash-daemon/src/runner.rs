@@ -172,6 +172,10 @@ pub async fn run_loop(
     let mut managed_non_vllm: HashSet<String> = HashSet::new();
     // Previous `generation_tokens_total` reading per instance, for rate calc.
     let mut prev_gen_tokens: HashMap<String, (f64, DateTime<Utc>)> = HashMap::new();
+    // Previous TTFT / TPOT histogram readings (sum_s, count, at) per instance,
+    // for the windowed avg-ms derivation (mirrors `prev_gen_tokens`).
+    let mut prev_ttft: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
+    let mut prev_tpot: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
     // Per-container VRAM (MB) from the last amd-smi `process` scrape. Refreshed
     // on the instance cadence and reused every tick so the attributed value is
     // stable between scrapes (mirrors how GPU power drives tokens_per_watt).
@@ -255,6 +259,8 @@ pub async fn run_loop(
                     for gone in known_instances.difference(&seen) {
                         info!(id = %gone, "instance gone");
                         prev_gen_tokens.remove(gone);
+                        prev_ttft.remove(gone);
+                        prev_tpot.remove(gone);
                         runner
                             .state
                             .apply(StateEvent::InstanceRemoved(gone.clone()));
@@ -302,6 +308,8 @@ pub async fn run_loop(
                     if let Some(id) = lemonade_id.take() {
                         info!(id = %id, "lemonade instance gone");
                         prev_gen_tokens.remove(&id);
+                        prev_ttft.remove(&id);
+                        prev_tpot.remove(&id);
                         runner.state.apply(StateEvent::InstanceRemoved(id.clone()));
                         broadcast_and_persist(
                             &tx,
@@ -338,6 +346,8 @@ pub async fn run_loop(
             for gone in known_services.difference(&disc.seen) {
                 info!(id = %gone, "managed service gone");
                 prev_gen_tokens.remove(gone);
+                prev_ttft.remove(gone);
+                prev_tpot.remove(gone);
                 runner
                     .state
                     .apply(StateEvent::InstanceRemoved(gone.clone()));
@@ -388,16 +398,34 @@ pub async fn run_loop(
                     Ok(sample) => {
                         // Difference the cumulative token counter into a live
                         // rate; first reading (or a restart) yields None.
+                        let now = Utc::now();
                         let gen_tps = sample.gen_tokens_total.and_then(|cur| {
-                            let now = Utc::now();
                             let prev = prev_gen_tokens.insert(id.clone(), (cur, now));
                             gen_tps_from_delta(prev, cur, now)
                         });
+                        // Windowed avg latency (ms) from the cumulative TTFT/TPOT
+                        // histograms; cumulative-average fallback on first scrape.
+                        let ttft_ms = avg_ms_from_histogram(
+                            &mut prev_ttft,
+                            &id,
+                            sample.ttft_sum_s,
+                            sample.ttft_count,
+                            now,
+                        );
+                        let tpot_ms = avg_ms_from_histogram(
+                            &mut prev_tpot,
+                            &id,
+                            sample.tpot_sum_s,
+                            sample.tpot_count,
+                            now,
+                        );
                         if let Some(mut inst) = runner.state.instances.get(&id).cloned() {
                             inst.kv_cache_usage_pct = sample.kv_cache_usage_pct;
                             inst.running_reqs = sample.running_reqs;
                             inst.waiting_reqs = sample.waiting_reqs;
                             inst.gen_tps = gen_tps;
+                            inst.ttft_ms = ttft_ms;
+                            inst.tpot_ms = tpot_ms;
                             runner.state.apply(StateEvent::InstanceUpserted(inst));
                         }
                     }
@@ -406,13 +434,20 @@ pub async fn run_loop(
                         let msg = format!("{e}");
                         trace!(id = %id, error = %msg, "vllm scrape failed");
                         last_err = Some(msg);
-                        // Don't let a dead instance show a frozen rate: clear
-                        // throughput and drop the baseline so recovery re-bases.
+                        // Don't let a dead instance show a frozen rate/latency:
+                        // clear throughput + latency and drop the baselines so
+                        // recovery re-bases.
                         prev_gen_tokens.remove(&id);
+                        prev_ttft.remove(&id);
+                        prev_tpot.remove(&id);
                         if let Some(mut inst) = runner.state.instances.get(&id).cloned()
-                            && inst.gen_tps.is_some()
+                            && (inst.gen_tps.is_some()
+                                || inst.ttft_ms.is_some()
+                                || inst.tpot_ms.is_some())
                         {
                             inst.gen_tps = None;
+                            inst.ttft_ms = None;
+                            inst.tpot_ms = None;
                             runner.state.apply(StateEvent::InstanceUpserted(inst));
                         }
                     }
@@ -635,6 +670,39 @@ pub(crate) fn gen_tps_from_delta(
     Some((cur - prev_val) / dt)
 }
 
+/// Average latency (ms) from a cumulative histogram's `_sum` (seconds) and
+/// `_count` series, windowed over successive scrapes: `(Δsum / Δcount) × 1000`.
+/// Updates the per-instance baseline in `prev`. On the FIRST reading (or after a
+/// counter reset / stale interval / no new requests) it falls back to the
+/// cumulative average `sum/count × 1000`, so a single scrape already yields a
+/// value. Returns `None` when the histogram is absent (`sum`/`count` `None`) or
+/// `count == 0` — Observe then shows `—` (never a fabricated number). Mirrors
+/// [`gen_tps_from_delta`] (the proven counter-windowing template).
+fn avg_ms_from_histogram(
+    prev: &mut HashMap<String, (f64, f64, DateTime<Utc>)>,
+    id: &str,
+    sum_s: Option<f64>,
+    count: Option<f64>,
+    now: DateTime<Utc>,
+) -> Option<f64> {
+    let (sum_s, count) = (sum_s?, count?);
+    let last = prev.insert(id.to_string(), (sum_s, count, now));
+    if let Some((psum, pcount, pat)) = last {
+        let dcount = count - pcount;
+        let dsum = sum_s - psum;
+        let dt = (now - pat).num_milliseconds() as f64 / 1000.0;
+        if dcount > 0.0 && dsum >= 0.0 && dt > 0.0 && dt <= MAX_RATE_INTERVAL_S {
+            return Some(dsum / dcount * 1000.0);
+        }
+    }
+    // Cumulative-average fallback: first scrape, no new requests, or a reset.
+    if count > 0.0 {
+        Some(sum_s / count * 1000.0)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,6 +715,39 @@ mod tests {
     #[test]
     fn gen_tps_none_on_first_reading() {
         assert_eq!(gen_tps_from_delta(None, 100.0, at(10)), None);
+    }
+
+    #[test]
+    fn avg_ms_first_scrape_uses_cumulative_then_windows() {
+        let mut prev = HashMap::new();
+        // First scrape: cumulative average = 2.0s / 4 × 1000 = 500 ms.
+        assert_eq!(
+            avg_ms_from_histogram(&mut prev, "a", Some(2.0), Some(4.0), at(10)),
+            Some(500.0)
+        );
+        // Second scrape: Δsum=1.0s over Δcount=10 → 100 ms (windowed).
+        assert_eq!(
+            avg_ms_from_histogram(&mut prev, "a", Some(3.0), Some(14.0), at(12)),
+            Some(100.0)
+        );
+        // Absent histogram → None (Observe shows `—`).
+        assert_eq!(
+            avg_ms_from_histogram(&mut prev, "b", None, None, at(12)),
+            None
+        );
+        // count == 0 (no requests yet) → None, never a divide-by-zero number.
+        assert_eq!(
+            avg_ms_from_histogram(&mut prev, "c", Some(0.0), Some(0.0), at(12)),
+            None
+        );
+        // A counter reset (sum drops) re-bases to the cumulative average.
+        let mut p2 = HashMap::new();
+        avg_ms_from_histogram(&mut p2, "d", Some(10.0), Some(100.0), at(10));
+        assert_eq!(
+            avg_ms_from_histogram(&mut p2, "d", Some(0.2), Some(2.0), at(12)),
+            Some(100.0),
+            "reset falls back to cumulative 0.2/2×1000"
+        );
     }
 
     #[test]

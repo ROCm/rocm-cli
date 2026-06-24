@@ -22,6 +22,13 @@ const KEY_RUNNING: &str = "vllm:num_requests_running";
 const KEY_WAITING: &str = "vllm:num_requests_waiting";
 const KEY_KV_CACHE: &str = "vllm:gpu_cache_usage_perc";
 const KEY_GEN_TOKENS: &str = "vllm:generation_tokens_total";
+// TTFT / TPOT latency histograms. We read the cumulative `_sum` (seconds) and
+// `_count` series; the runner windows successive readings into an average ms
+// (Δsum/Δcount), mirroring the `generation_tokens_total` → `gen_tps` path.
+const KEY_TTFT_SUM: &str = "vllm:time_to_first_token_seconds_sum";
+const KEY_TTFT_COUNT: &str = "vllm:time_to_first_token_seconds_count";
+const KEY_TPOT_SUM: &str = "vllm:time_per_output_token_seconds_sum";
+const KEY_TPOT_COUNT: &str = "vllm:time_per_output_token_seconds_count";
 
 #[derive(Debug, Clone)]
 pub struct VllmPrometheusCollector {
@@ -96,6 +103,11 @@ pub(crate) fn parse(text: &str) -> InstanceSample {
     let kv = extract(text, KEY_KV_CACHE).map(|v| (v * 100.0) as f32);
     // Cumulative output-token counter; the runner differences it into a rate.
     let gen_tokens_total = extract(text, KEY_GEN_TOKENS);
+    // Cumulative latency histograms; the runner windows them into avg ms.
+    let ttft_sum_s = extract(text, KEY_TTFT_SUM);
+    let ttft_count = extract(text, KEY_TTFT_COUNT);
+    let tpot_sum_s = extract(text, KEY_TPOT_SUM);
+    let tpot_count = extract(text, KEY_TPOT_COUNT);
     if running.is_none() && waiting.is_none() && kv.is_none() && gen_tokens_total.is_none() {
         warn!("vllm metrics payload had none of the expected keys");
     }
@@ -106,6 +118,10 @@ pub(crate) fn parse(text: &str) -> InstanceSample {
         gen_tokens_total,
         // vLLM uses the cumulative-counter path; no direct rate.
         gen_tps: None,
+        ttft_sum_s,
+        ttft_count,
+        tpot_sum_s,
+        tpot_count,
     }
 }
 
@@ -158,6 +174,15 @@ vllm:gpu_cache_usage_perc{model=\"deepseek-r1\"} 0.4231
 # HELP vllm:generation_tokens_total Number of generation tokens processed.
 # TYPE vllm:generation_tokens_total counter
 vllm:generation_tokens_total{model=\"deepseek-r1\"} 1234567.0
+# HELP vllm:time_to_first_token_seconds Histogram of time to first token.
+# TYPE vllm:time_to_first_token_seconds histogram
+vllm:time_to_first_token_seconds_sum{model=\"deepseek-r1\"} 50.0
+vllm:time_to_first_token_seconds_count{model=\"deepseek-r1\"} 200.0
+vllm:time_to_first_token_seconds_bucket{model=\"deepseek-r1\",le=\"0.1\"} 5.0
+# HELP vllm:time_per_output_token_seconds Histogram of time per output token.
+# TYPE vllm:time_per_output_token_seconds histogram
+vllm:time_per_output_token_seconds_sum{model=\"deepseek-r1\"} 30.0
+vllm:time_per_output_token_seconds_count{model=\"deepseek-r1\"} 1500.0
 ";
 
     #[test]
@@ -168,6 +193,28 @@ vllm:generation_tokens_total{model=\"deepseek-r1\"} 1234567.0
         let kv = s.kv_cache_usage_pct.unwrap();
         assert!((kv - 42.31).abs() < 0.01, "kv was {kv}");
         assert_eq!(s.gen_tokens_total, Some(1_234_567.0));
+    }
+
+    #[test]
+    fn parses_ttft_tpot_histograms() {
+        let s = parse(SAMPLE);
+        // The `_sum`/`_count` series are read; `_bucket` lines are ignored
+        // (distinct metric name, so the sum key never matches a bucket line).
+        assert_eq!(s.ttft_sum_s, Some(50.0));
+        assert_eq!(s.ttft_count, Some(200.0));
+        assert_eq!(s.tpot_sum_s, Some(30.0));
+        assert_eq!(s.tpot_count, Some(1500.0));
+    }
+
+    #[test]
+    fn ttft_tpot_absent_yields_none() {
+        // A payload with the core gauges but no latency histograms → all None.
+        let text = "vllm:num_requests_running 7\nvllm:generation_tokens_total 9000\n";
+        let s = parse(text);
+        assert_eq!(s.ttft_sum_s, None);
+        assert_eq!(s.ttft_count, None);
+        assert_eq!(s.tpot_sum_s, None);
+        assert_eq!(s.tpot_count, None);
     }
 
     #[test]
