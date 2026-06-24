@@ -37,7 +37,7 @@ use crate::ui::approval::{
 use crate::ui::exec::{exe_label, resolve_exe};
 use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browser};
 use crate::ui::job_console::{ConsoleOutcome, draw_job_console, on_console_key};
-use crate::ui::modal::{centered_rect, draw_popup_frame};
+use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
 
 /// Which step of the wizard is showing.
@@ -307,8 +307,14 @@ pub fn draw_onboarding(
         return;
     }
 
-    let popup = centered_rect(72, 64, 96, 18, area);
-    let inner = draw_popup_frame(f, popup, "Welcome to ROCm — first-run setup", theme);
+    let inner = panel::bento(
+        f,
+        area,
+        Some("Welcome to ROCm — first-run setup"),
+        BoxRole::Primary,
+        false,
+        theme,
+    );
     if inner.height == 0 {
         return;
     }

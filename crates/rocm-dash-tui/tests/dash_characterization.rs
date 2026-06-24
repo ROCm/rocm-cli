@@ -1,10 +1,9 @@
 //! Characterization safety-net for the dash TUI (Supergoal Phase 0, updated P3).
 //!
-//! Freezes `ui::draw` behaviour for every tab in the current 4-tab IA
-//! (Home / Action / Observe / Chat) as TestBackend buffer-text assertions, plus
-//! a squeezed-height no-panic sweep. Phase 0 created this against the original
-//! 5-tab model; Phase 3 folded the telemetry tabs into Observe and updated
-//! these assertions in lockstep with the enum collapse.
+//! Freezes `ui::draw` behaviour for every tab in the 5-tab IA
+//! (Home / ROCm / Serving / Observe / Chat) as TestBackend buffer-text
+//! assertions, plus a squeezed-height no-panic sweep and the Phase-3 inline-
+//! manager (de-modal) rendering contract.
 //!
 //! Ponytail: reuse the existing `TestBackend` → `Terminal` → `ui::draw` →
 //! flatten-buffer pattern; no new test framework, no demo NDJSON.
@@ -285,6 +284,120 @@ fn control_legend_is_on_the_bottom_row_not_the_top() {
         !top.contains(" jump "),
         "body legend leaked to the top: {top:?}"
     );
+}
+
+/// Phase 3 de-modal contract: when a manager is open on a ROCm/Serving tab it
+/// renders INLINE in the Details pane — the manager's bento title is painted AND
+/// the left Actions list survives (proving a two-column inline layout, not a
+/// full-screen-centered overlay). One assertion per manager (all 12).
+#[test]
+fn managers_render_inline_in_the_details_pane() {
+    use rocm_dash_tui::app::PaneFocus;
+
+    use rocm_dash_tui::ui::{
+        automations_manager::AutomationsManagerState, command_screen::CommandScreenState,
+        config_manager::ConfigManagerState, doctor_manager::DoctorManagerState,
+        engine_manager::EngineManagerState, install_manager::InstallManagerState,
+        logs_view::LogsViewState, onboarding::OnboardingState,
+        runtime_manager::RuntimeManagerState, serve_wizard::ServeWizardState,
+        services_manager::ServicesManagerState, update_manager::UpdateManagerState,
+    };
+
+    // (tab, open-closure, manager-title-needle, actions-list-needle)
+    type Open = fn(&mut AppState);
+    let cases: &[(ActiveTab, Open, &str, &str)] = &[
+        // Serving-group managers (opened on the Serving tab).
+        (
+            ActiveTab::Serving,
+            |s| s.engine_manager = Some(EngineManagerState::default()),
+            "serving backends",
+            "Serving actions",
+        ),
+        (
+            ActiveTab::Serving,
+            |s| s.services = Some(ServicesManagerState::default()),
+            "managed inference servers",
+            "Serving actions",
+        ),
+        (
+            ActiveTab::Serving,
+            |s| s.logs_view = Some(LogsViewState::default()),
+            "recent ROCm CLI activity",
+            "Serving actions",
+        ),
+        (
+            ActiveTab::Serving,
+            |s| s.config_manager = Some(ConfigManagerState::default()),
+            "Config & providers",
+            "Serving actions",
+        ),
+        // serve_wizard opened on ROCm so its "Serve a model" title can't be
+        // confused with the Serving Actions list row of the same name.
+        (
+            ActiveTab::Rocm,
+            |s| s.serve_wizard = Some(ServeWizardState::default()),
+            "Serve a model",
+            "ROCm actions",
+        ),
+        // ROCm-group managers (opened on the ROCm tab).
+        (
+            ActiveTab::Rocm,
+            |s| s.install_manager = Some(InstallManagerState::default()),
+            "ROCm SDK",
+            "ROCm actions",
+        ),
+        (
+            ActiveTab::Rocm,
+            |s| s.update_manager = Some(UpdateManagerState::default()),
+            "ROCm packages",
+            "ROCm actions",
+        ),
+        (
+            ActiveTab::Rocm,
+            |s| s.doctor_manager = Some(DoctorManagerState::default()),
+            "environment check",
+            "ROCm actions",
+        ),
+        (
+            ActiveTab::Rocm,
+            |s| s.runtime_manager = Some(RuntimeManagerState::default()),
+            "ROCm installs",
+            "ROCm actions",
+        ),
+        (
+            ActiveTab::Rocm,
+            |s| s.command_screen = Some(CommandScreenState::default()),
+            "Run a command",
+            "ROCm actions",
+        ),
+        (
+            ActiveTab::Rocm,
+            |s| s.onboarding = Some(OnboardingState::default()),
+            "first-run setup",
+            "ROCm actions",
+        ),
+        (
+            ActiveTab::Rocm,
+            |s| s.automations_manager = Some(AutomationsManagerState::default()),
+            "background checks",
+            "ROCm actions",
+        ),
+    ];
+
+    for (tab, open, manager_needle, actions_needle) in cases {
+        let mut s = state_on(*tab);
+        s.pane_focus = PaneFocus::Detail;
+        open(&mut s);
+        let out = render(&mut s, 160, 44);
+        assert!(
+            out.contains(manager_needle),
+            "manager {manager_needle:?} did not render inline: {out:?}"
+        );
+        assert!(
+            out.contains(actions_needle),
+            "Actions list {actions_needle:?} was covered (not inline): {out:?}"
+        );
+    }
 }
 
 #[test]

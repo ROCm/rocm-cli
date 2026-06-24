@@ -99,16 +99,10 @@ pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
     let tab_help: &[(&str, &str)] = match tab {
         ActiveTab::Home => &[("(no tab-specific keys — see the ROCm / Serving tabs)", "")],
         ActiveTab::Rocm | ActiveTab::Serving => &[
-            ("j / Down", "select next action"),
-            ("k / Up", "select previous action"),
-            (
-                "→ / Enter",
-                "step into detail, then open (asks before mutating)",
-            ),
-            (
-                "w / e / d / u / i / l",
-                "serve / engines / doctor / update / install / logs",
-            ),
+            ("j / k  ↑ / ↓", "select an action"),
+            ("→ / Enter", "open it in Details (asks before mutating)"),
+            ("←", "Details preview → Actions list"),
+            ("Esc", "close an open manager (back to Actions)"),
         ],
         ActiveTab::Observe => &[
             ("j / Down", "select next instance"),

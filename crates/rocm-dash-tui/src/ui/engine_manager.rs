@@ -28,7 +28,7 @@ use crate::ui::approval::{
 };
 use crate::ui::exec::{exe_label, resolve_exe};
 use crate::ui::job_console::{ConsoleOutcome, draw_job_console, on_console_key};
-use crate::ui::modal::{centered_rect, draw_popup_frame};
+use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
 
 /// Engine catalog — names + descriptions mirror `apps/rocm` `engine_inventory()`.
@@ -244,8 +244,14 @@ pub fn draw_engine_manager(
         return;
     }
 
-    let popup = centered_rect(80, 76, 120, 26, area);
-    let inner = draw_popup_frame(f, popup, "Engines — serving backends", theme);
+    let inner = panel::bento(
+        f,
+        area,
+        Some("Engines — serving backends"),
+        BoxRole::Primary,
+        false,
+        theme,
+    );
     if inner.height == 0 {
         return;
     }

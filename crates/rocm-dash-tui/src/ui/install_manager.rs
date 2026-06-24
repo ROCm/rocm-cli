@@ -25,7 +25,7 @@ use crate::ui::approval::{
 use crate::ui::exec::{exe_label, resolve_exe};
 use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browser};
 use crate::ui::job_console::{ConsoleOutcome, draw_job_console, on_console_key};
-use crate::ui::modal::{centered_rect, draw_popup_frame};
+use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
 
 /// Package formats — mirrors `apps/rocm` `InstallFormat` (clap value-enum).
@@ -313,8 +313,14 @@ pub fn draw_install_manager(
         return;
     }
 
-    let popup = centered_rect(72, 70, 96, 20, area);
-    let inner = draw_popup_frame(f, popup, "Install — ROCm SDK (TheRock)", theme);
+    let inner = panel::bento(
+        f,
+        area,
+        Some("Install — ROCm SDK (TheRock)"),
+        BoxRole::Primary,
+        false,
+        theme,
+    );
     if inner.height == 0 {
         return;
     }

@@ -36,6 +36,7 @@ use crate::ui::exec::{exe_label, resolve_exe};
 use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browser};
 use crate::ui::job_console::{ConsoleOutcome, draw_job_console, on_console_key};
 use crate::ui::modal::{centered_rect, draw_popup_frame};
+use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
 
 /// A flattened registered-runtime entry for the list.
@@ -349,8 +350,14 @@ pub fn draw_runtime_manager(
         return;
     }
 
-    let popup = centered_rect(80, 72, 120, 24, area);
-    let inner = draw_popup_frame(f, popup, "Runtimes — ROCm installs", theme);
+    let inner = panel::bento(
+        f,
+        area,
+        Some("Runtimes — ROCm installs"),
+        BoxRole::Primary,
+        false,
+        theme,
+    );
     if inner.height == 0 {
         return;
     }

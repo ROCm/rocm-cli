@@ -125,45 +125,61 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         Modal::GlobalHelp => modal::draw_global_help(f, body, &theme),
     }
 
-    // Operational overlays (Phase 3 Wave 1): only one is open at a time. They
-    // sit above the tab body + modals when open.
+    // Operational managers (Phase 3 de-modal): the active one renders INLINE in
+    // the ROCm/Serving Details pane; when opened from a non-domain tab (Observe
+    // hotkeys / Chat slash commands) it falls back to a centered overlay. Only
+    // one is open at a time (mutually exclusive via `close_overlays`).
+    let manager_rect = if matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving) {
+        tabs::pane::detail_rect(center_inner)
+    } else {
+        modal::centered_rect(82, 80, 130, 34, body)
+    };
+    draw_active_manager(f, manager_rect, state, &theme);
+
+    // Approval modal (Phase 4): drawn LAST so it sits on top of every overlay
+    // and owns the screen while a mutating-tool approval is pending. This is the
+    // sole approval renderer (the single gating path).
+    if let Some(pa) = &state.approval {
+        approval::draw_approval(f, body, &pa.req, pa.choice, &theme);
+    }
+}
+
+/// Draw whichever operational manager is open into `rect`. The managers are
+/// mutually exclusive (only one `Some` at a time), so this draws at most one.
+/// `rect` is the ROCm/Serving Details pane when inline, or a centered overlay
+/// rect when a manager was opened from a non-domain tab. No-op when none open.
+fn draw_active_manager(f: &mut Frame, rect: Rect, state: &AppState, theme: &Theme) {
     if let Some(sm) = &state.services {
-        services_manager::draw_services_manager(f, body, sm, &state.instances, &state.jobs, &theme);
+        services_manager::draw_services_manager(f, rect, sm, &state.instances, &state.jobs, theme);
     } else if let Some(w) = &state.serve_wizard {
-        serve_wizard::draw_serve_wizard(f, body, w, &state.jobs, &state.model_recipes, &theme);
+        serve_wizard::draw_serve_wizard(f, rect, w, &state.jobs, &state.model_recipes, theme);
     } else if let Some(em) = &state.engine_manager {
-        engine_manager::draw_engine_manager(f, body, em, &state.jobs, &theme);
+        engine_manager::draw_engine_manager(f, rect, em, &state.jobs, theme);
     } else if let Some(d) = &state.examine_manager {
-        examine_manager::draw_examine_manager(f, body, d, &state.jobs, &theme);
+        examine_manager::draw_examine_manager(f, rect, d, &state.jobs, theme);
     } else if let Some(u) = &state.update_manager {
-        update_manager::draw_update_manager(f, body, u, &state.jobs, &theme);
+        update_manager::draw_update_manager(f, rect, u, &state.jobs, theme);
     } else if let Some(im) = &state.install_manager {
-        install_manager::draw_install_manager(f, body, im, &state.jobs, &theme);
+        install_manager::draw_install_manager(f, rect, im, &state.jobs, theme);
     } else if let Some(lv) = &state.logs_view {
-        logs_view::draw_logs_view(f, body, lv, &state.jobs, &theme);
+        logs_view::draw_logs_view(f, rect, lv, &state.jobs, theme);
     } else if let Some(rm) = &state.runtime_manager {
-        runtime_manager::draw_runtime_manager(f, body, rm, &state.runtimes, &state.jobs, &theme);
+        runtime_manager::draw_runtime_manager(f, rect, rm, &state.runtimes, &state.jobs, theme);
     } else if let Some(o) = &state.onboarding {
-        onboarding::draw_onboarding(f, body, o, &state.jobs, &theme);
+        onboarding::draw_onboarding(f, rect, o, &state.jobs, theme);
     } else if let Some(am) = &state.automations_manager {
         automations_manager::draw_automations_manager(
             f,
-            body,
+            rect,
             am,
             &state.automations,
             &state.jobs,
-            &theme,
+            theme,
         );
     } else if let Some(c) = &state.command_screen {
-        command_screen::draw_command_screen(f, body, c, &state.jobs, &theme);
+        command_screen::draw_command_screen(f, rect, c, &state.jobs, theme);
     } else if let Some(cm) = &state.config_manager {
-        config_manager::draw_config_manager(f, body, cm, &state.jobs, &theme);
-    }
-
-    // Approval modal (Phase 4): drawn LAST so it sits on top of every overlay
-    // and owns the screen while a mutating-tool approval is pending.
-    if let Some(pa) = &state.approval {
-        approval::draw_approval(f, body, &pa.req, pa.choice, &theme);
+        config_manager::draw_config_manager(f, rect, cm, &state.jobs, theme);
     }
 }
 
@@ -291,7 +307,12 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
         Seg::Key("1–5", None),
         Seg::Sep(" jump  "),
     ];
-    if matches!(
+    // On a domain tab with a manager open inline, the pane keys route to the
+    // manager — advertise the back-out instead of the (now wrong) select/open.
+    if is_action_tab && state.has_open_overlay() {
+        segs.push(Seg::Key("Esc", None));
+        segs.push(Seg::Sep(" back out  "));
+    } else if matches!(
         state.active_tab,
         ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
     ) {
@@ -304,11 +325,9 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
             " detail  "
         }));
     }
-    // Guided-action entry points — Observe (telemetry) + ROCm/Serving (verbs).
-    if matches!(
-        state.active_tab,
-        ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
-    ) {
+    // Guided-action letter hotkeys — Observe only (telemetry quick-jumps). On
+    // ROCm/Serving the Actions list is the single path, so no letter chips.
+    if state.active_tab == ActiveTab::Observe {
         segs.push(Seg::Key("w", Some(KeyAction::OpenServeWizard)));
         segs.push(Seg::Sep(" serve  "));
         segs.push(Seg::Key("e", Some(KeyAction::OpenEngineManager)));
@@ -321,8 +340,6 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
         segs.push(Seg::Sep(" install  "));
         segs.push(Seg::Key("l", Some(KeyAction::OpenLogs)));
         segs.push(Seg::Sep(" logs  "));
-    }
-    if state.active_tab == ActiveTab::Observe {
         segs.push(Seg::Key("s", Some(KeyAction::OpenServices)));
         segs.push(Seg::Sep(" services  "));
     }

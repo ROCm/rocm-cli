@@ -25,7 +25,7 @@ use crate::ui::approval::{
 };
 use crate::ui::exec::{exe_label, resolve_exe};
 use crate::ui::job_console::{ConsoleOutcome, draw_job_console, on_console_key};
-use crate::ui::modal::{centered_rect, draw_popup_frame};
+use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
 
 /// One stable console for the runner — a second command waits for the first.
@@ -190,8 +190,14 @@ pub fn draw_command_screen(
         return;
     }
 
-    let popup = centered_rect(72, 40, 100, 12, area);
-    let inner = draw_popup_frame(f, popup, "Run a command", theme);
+    let inner = panel::bento(
+        f,
+        area,
+        Some("Run a command"),
+        BoxRole::Primary,
+        false,
+        theme,
+    );
     if inner.height == 0 {
         return;
     }

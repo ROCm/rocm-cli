@@ -62,6 +62,13 @@ fn split_columns(area: Rect) -> std::rc::Rc<[Rect]> {
         .split(area)
 }
 
+/// The Details pane rect (right column) for a domain tab body `area`. Used by
+/// `ui::draw` to render an open manager INLINE in place of the verb preview.
+#[must_use]
+pub fn detail_rect(area: Rect) -> Rect {
+    split_columns(area)[1]
+}
+
 /// Draw the Actions list (left) + Details preview (right) for one domain tab.
 pub fn draw(
     f: &mut Frame,

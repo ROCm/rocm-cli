@@ -23,7 +23,7 @@ use crate::ui::approval::{
 };
 use crate::ui::exec::{exe_label, resolve_exe};
 use crate::ui::job_console::{ConsoleOutcome, draw_job_console, on_console_key};
-use crate::ui::modal::{centered_rect, draw_popup_frame};
+use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
 
 /// The update menu actions, in display order.
@@ -220,8 +220,14 @@ pub fn draw_update_manager(
         return;
     }
 
-    let popup = centered_rect(70, 60, 84, 16, area);
-    let inner = draw_popup_frame(f, popup, "Update — ROCm packages", theme);
+    let inner = panel::bento(
+        f,
+        area,
+        Some("Update — ROCm packages"),
+        BoxRole::Primary,
+        false,
+        theme,
+    );
     if inner.height == 0 {
         return;
     }

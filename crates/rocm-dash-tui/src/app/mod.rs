@@ -640,6 +640,105 @@ impl AppState {
         self.approval = None;
     }
 
+    /// Whether any operational manager overlay is open (approval excluded — it
+    /// is the separate gating layer with its own routing). Used to decide inline
+    /// vs. centered manager rendering and the ROCm/Serving `←`/Esc back-out.
+    pub(crate) const fn has_open_overlay(&self) -> bool {
+        self.services.is_some()
+            || self.serve_wizard.is_some()
+            || self.engine_manager.is_some()
+            || self.doctor_manager.is_some()
+            || self.update_manager.is_some()
+            || self.install_manager.is_some()
+            || self.logs_view.is_some()
+            || self.runtime_manager.is_some()
+            || self.onboarding.is_some()
+            || self.automations_manager.is_some()
+            || self.command_screen.is_some()
+            || self.config_manager.is_some()
+    }
+
+    /// Whether the open manager (if any) is at its TOP-LEVEL screen — no nested
+    /// sub-popup (folder browser / model picker / import input), no pending
+    /// gating approval, and no job console (running or terminal). Only one
+    /// manager is open at a time, so this reflects that one; `true` when none is
+    /// open. Gates the Esc back-out so Esc cancels the innermost layer first
+    /// (and is ignored while a job runs) before it can eject the manager.
+    fn active_overlay_at_root(&self) -> bool {
+        self.serve_wizard.as_ref().is_none_or(|w| {
+            w.browser.is_none()
+                && w.picker.is_none()
+                && w.approval.is_none()
+                && w.active_job.is_none()
+        }) && self
+            .install_manager
+            .as_ref()
+            .is_none_or(|m| m.browser.is_none() && m.approval.is_none() && m.active_job.is_none())
+            && self.onboarding.as_ref().is_none_or(|m| {
+                m.browser.is_none() && m.approval.is_none() && m.active_job.is_none()
+            })
+            && self.runtime_manager.as_ref().is_none_or(|m| {
+                m.browser.is_none()
+                    && m.import_input.is_none()
+                    && m.approval.is_none()
+                    && m.active_job.is_none()
+            })
+            && self
+                .engine_manager
+                .as_ref()
+                .is_none_or(|m| m.approval.is_none() && m.active_job.is_none())
+            && self
+                .services
+                .as_ref()
+                .is_none_or(|m| m.approval.is_none() && m.active_job.is_none())
+            && self
+                .update_manager
+                .as_ref()
+                .is_none_or(|m| m.approval.is_none() && m.active_job.is_none())
+            && self
+                .config_manager
+                .as_ref()
+                .is_none_or(|m| m.approval.is_none() && m.active_job.is_none())
+            && self
+                .command_screen
+                .as_ref()
+                .is_none_or(|m| m.approval.is_none() && m.active_job.is_none())
+            && self
+                .automations_manager
+                .as_ref()
+                .is_none_or(|m| m.approval.is_none() && m.active_job.is_none())
+            && self
+                .doctor_manager
+                .as_ref()
+                .is_none_or(|m| m.active_job.is_none())
+            && self
+                .logs_view
+                .as_ref()
+                .is_none_or(|m| m.active_job.is_none())
+    }
+
+    /// Whether an `Esc` keypress should back out of an inline manager: true on
+    /// ROCm/Serving while a manager overlay is open AND that manager is at its
+    /// root screen. The event loop closes the manager and returns focus to the
+    /// Actions list when this holds. Pure read so it is unit-testable (the
+    /// mutation lives in the event-loop arm).
+    ///
+    /// When the manager has a sub-popup / approval / job console open, this is
+    /// `false` so Esc falls through to the manager's own handler (cancel the
+    /// sub-layer, dismiss a terminal console, or be ignored while a job runs) —
+    /// it cannot eject the whole manager mid-flow.
+    ///
+    /// Only `Esc` backs out — `←` is left to the open manager (serve_wizard /
+    /// install / config use it to cycle options). When NO manager is open, `←`
+    /// returns focus from the Details preview to the Actions list via the normal
+    /// `PaneFocusActions` key path.
+    pub(crate) fn should_pane_back_out(&self, code: crossterm::event::KeyCode) -> bool {
+        matches!(self.active_tab, ActiveTab::Rocm | ActiveTab::Serving)
+            && self.has_open_overlay()
+            && self.active_overlay_at_root()
+            && matches!(code, crossterm::event::KeyCode::Esc)
+    }
+
     /// Open the theme picker modal, positioning the cursor on the active theme.
     pub fn open_theme_picker(&mut self) {
         let names = crate::ui::theme::theme_names();
@@ -1338,6 +1437,15 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                             None => { /* cursor moved or key ignored — modal stays open */ }
                         }
                     }
+                    // De-modal back-out: on ROCm/Serving, an inline manager is
+                    // shown in the Details pane. Esc closes it and returns focus
+                    // to the Actions list — intercepted BEFORE the per-manager
+                    // key arms so the manager doesn't eat Esc first. `←` is left
+                    // to the manager (some use it to cycle options).
+                    Some(Ok(CtEvent::Key(k))) if state.should_pane_back_out(k.code) => {
+                        state.close_overlays();
+                        state.pane_focus = PaneFocus::Actions;
+                    }
                     // The services-manager overlay, when open, owns all keys
                     // (and may spawn lifecycle jobs through the job-bridge).
                     Some(Ok(CtEvent::Key(k))) if state.services.is_some() => {
@@ -1983,6 +2091,13 @@ fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
         if let Some(chip) = footer_chip_hit(&state.last_footer_chips, me.column, me.row) {
             return chip;
         }
+        // While an operational manager is open it owns the body — swallow body
+        // clicks so they can't fall THROUGH the inline manager to the obscured
+        // Actions/Details list (which would silently change the selection or
+        // re-open a verb). Tab-bar and footer-chip clicks above still work.
+        if state.has_open_overlay() {
+            return KeyAction::Nothing;
+        }
         if state.modal == Modal::None
             && let Some(area) = state.last_body_area
         {
@@ -2314,110 +2429,34 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         KeyCode::Char('k') | KeyCode::Up => KeyAction::Move(-1),
         KeyCode::Char('g') | KeyCode::Home => KeyAction::SelectFirst,
         KeyCode::Char('G') | KeyCode::End => KeyAction::SelectLast,
-        // The guided-action letter hotkeys live on Observe (the telemetry
-        // surface) and Action (the verb list). Both route through the existing
-        // execution seam — no second approval path.
+        // The guided-action letter hotkeys live ONLY on Observe (the telemetry
+        // surface) — quick jumps into the managers via the existing seam. On
+        // ROCm/Serving the Actions list is the single interaction path, so the
+        // per-tab letter hotkeys are retired there.
         // Services manager: open where servers live.
         KeyCode::Char('s') if current == ActiveTab::Observe => KeyAction::OpenServices,
         // Serve wizard: launch a model.
-        KeyCode::Char('w')
-            if matches!(
-                current,
-                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
-            ) =>
-        {
-            KeyAction::OpenServeWizard
-        }
+        KeyCode::Char('w') if current == ActiveTab::Observe => KeyAction::OpenServeWizard,
         // Engine manager: use/install/reinstall serving engines.
-        KeyCode::Char('e')
-            if matches!(
-                current,
-                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
-            ) =>
-        {
-            KeyAction::OpenEngineManager
-        }
+        KeyCode::Char('e') if current == ActiveTab::Observe => KeyAction::OpenEngineManager,
         // Doctor: read-only environment check.
-        KeyCode::Char('d')
-            if matches!(
-                current,
-                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
-            ) =>
-        {
-            KeyAction::OpenExamine
-        }
+        KeyCode::Char('d') if current == ActiveTab::Observe => KeyAction::OpenExamine,
         // Update: check/preview/apply ROCm package updates.
-        KeyCode::Char('u')
-            if matches!(
-                current,
-                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
-            ) =>
-        {
-            KeyAction::OpenUpdate
-        }
+        KeyCode::Char('u') if current == ActiveTab::Observe => KeyAction::OpenUpdate,
         // Install: ROCm SDK (TheRock) install / dry-run.
-        KeyCode::Char('i')
-            if matches!(
-                current,
-                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
-            ) =>
-        {
-            KeyAction::OpenInstall
-        }
+        KeyCode::Char('i') if current == ActiveTab::Observe => KeyAction::OpenInstall,
         // Logs: browse recent ROCm CLI logs.
-        KeyCode::Char('l')
-            if matches!(
-                current,
-                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
-            ) =>
-        {
-            KeyAction::OpenLogs
-        }
+        KeyCode::Char('l') if current == ActiveTab::Observe => KeyAction::OpenLogs,
         // Runtimes: list/activate/adopt/import ROCm runtimes.
-        KeyCode::Char('r')
-            if matches!(
-                current,
-                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
-            ) =>
-        {
-            KeyAction::OpenRuntimes
-        }
+        KeyCode::Char('r') if current == ActiveTab::Observe => KeyAction::OpenRuntimes,
         // Onboarding: first-run setup wizard (install / adopt).
-        KeyCode::Char('n')
-            if matches!(
-                current,
-                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
-            ) =>
-        {
-            KeyAction::OpenOnboarding
-        }
+        KeyCode::Char('n') if current == ActiveTab::Observe => KeyAction::OpenOnboarding,
         // Automations: list/enable/disable background checks.
-        KeyCode::Char('a')
-            if matches!(
-                current,
-                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
-            ) =>
-        {
-            KeyAction::OpenAutomations
-        }
+        KeyCode::Char('a') if current == ActiveTab::Observe => KeyAction::OpenAutomations,
         // Command runner: run any ROCm CLI subcommand (gated).
-        KeyCode::Char('c')
-            if matches!(
-                current,
-                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
-            ) =>
-        {
-            KeyAction::OpenCommand
-        }
+        KeyCode::Char('c') if current == ActiveTab::Observe => KeyAction::OpenCommand,
         // Config & providers.
-        KeyCode::Char('p')
-            if matches!(
-                current,
-                ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
-            ) =>
-        {
-            KeyAction::OpenConfig
-        }
+        KeyCode::Char('p') if current == ActiveTab::Observe => KeyAction::OpenConfig,
         // ROCm/Serving tabs: arrow keys drive the focus-into-detail interaction;
         // Enter is focus-aware (list → focus detail, detail → open the manager).
         KeyCode::Right if matches!(current, ActiveTab::Rocm | ActiveTab::Serving) => {
@@ -2620,6 +2659,89 @@ mod tests {
     }
 
     #[test]
+    fn inline_manager_opens_in_detail_then_backs_out() {
+        // Activating a ROCm verb opens its manager inline (focus stays in
+        // Details); `←`/Esc backs out — closing the manager and returning focus
+        // to the Actions list. This mirrors the event-loop back-out arm.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Rocm;
+        s.rocm_sel = 0; // Set up / Install ROCm → OpenInstall
+        apply_action(&mut s, KeyAction::PaneActivate); // → Details
+        assert_eq!(s.pane_focus, PaneFocus::Detail);
+        assert!(!s.has_open_overlay(), "no manager before second activate");
+        apply_action(&mut s, KeyAction::PaneActivate); // opens install_manager
+        assert!(s.install_manager.is_some(), "verb opens its manager inline");
+        assert!(s.has_open_overlay());
+
+        // Esc backs out on a domain tab while a manager is open.
+        assert!(s.should_pane_back_out(crossterm::event::KeyCode::Esc));
+        // `←` is left to the manager (it may cycle options), not a back-out.
+        assert!(!s.should_pane_back_out(crossterm::event::KeyCode::Left));
+        // A normal key does not back out (routes to the manager instead).
+        assert!(!s.should_pane_back_out(crossterm::event::KeyCode::Char('j')));
+
+        // The event-loop arm closes the manager + parks focus on Actions.
+        s.close_overlays();
+        s.pane_focus = PaneFocus::Actions;
+        assert!(!s.has_open_overlay(), "back-out closed the inline manager");
+        assert_eq!(s.pane_focus, PaneFocus::Actions);
+    }
+
+    #[test]
+    fn back_out_only_on_domain_tabs_with_a_manager() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        // No manager open → never backs out, even on a domain tab.
+        s.active_tab = ActiveTab::Rocm;
+        assert!(!s.should_pane_back_out(crossterm::event::KeyCode::Esc));
+        // Manager open but on a non-domain tab (opened from Observe hotkey) →
+        // the manager keeps its own Esc handling; no domain back-out.
+        s.active_tab = ActiveTab::Observe;
+        s.doctor_manager = Some(crate::ui::doctor_manager::DoctorManagerState::default());
+        assert!(s.has_open_overlay());
+        assert!(!s.should_pane_back_out(crossterm::event::KeyCode::Esc));
+    }
+
+    #[test]
+    fn esc_defers_to_manager_when_a_subscreen_is_open() {
+        // With a job console (or sub-popup / approval) open inside an inline
+        // manager, Esc must reach the manager (cancel the inner layer / be
+        // ignored while running), NOT eject the whole manager.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Rocm;
+        s.install_manager = Some(crate::ui::install_manager::InstallManagerState {
+            active_job: Some("install-job".into()), // a console is up
+            ..Default::default()
+        });
+        assert!(s.has_open_overlay());
+        assert!(
+            !s.should_pane_back_out(crossterm::event::KeyCode::Esc),
+            "Esc must defer to the manager while a job console is open"
+        );
+        // Once the console is dismissed (back at root), Esc backs out.
+        s.install_manager.as_mut().unwrap().active_job = None;
+        assert!(s.should_pane_back_out(crossterm::event::KeyCode::Esc));
+    }
+
+    #[test]
+    fn body_clicks_are_swallowed_while_a_manager_is_open() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Rocm;
+        s.last_body_area = Some(Rect::new(2, 4, 150, 30));
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 90,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        // No manager open → the click resolves against the tab's hit-test.
+        assert_ne!(resolve_mouse(click, &s), KeyAction::Nothing);
+        // Manager open → the body click is swallowed (no click-through).
+        s.install_manager = Some(crate::ui::install_manager::InstallManagerState::default());
+        assert_eq!(resolve_mouse(click, &s), KeyAction::Nothing);
+    }
+
+    #[test]
     fn footer_chip_hit_maps_click_to_action() {
         let chips = vec![
             FooterChip {
@@ -2756,34 +2878,40 @@ mod tests {
             KeyAction::OpenServices
         );
         assert_eq!(hk(KeyCode::Char('s'), ActiveTab::Home), KeyAction::Nothing);
-        // `w` / `e` open from Observe + Action; Nothing on other tabs.
+        // The letter hotkeys fire ONLY on Observe now — quick jumps into the
+        // managers. They open the matching overlay via the seam.
         assert_eq!(
             hk(KeyCode::Char('w'), ActiveTab::Observe),
             KeyAction::OpenServeWizard
         );
         assert_eq!(
-            hk(KeyCode::Char('e'), ActiveTab::Rocm),
+            hk(KeyCode::Char('e'), ActiveTab::Observe),
             KeyAction::OpenEngineManager
         );
-        assert_eq!(hk(KeyCode::Char('w'), ActiveTab::Home), KeyAction::Nothing);
-        // Doctor / update open from Observe + Action.
         assert_eq!(
             hk(KeyCode::Char('d'), ActiveTab::Observe),
             KeyAction::OpenExamine
         );
         assert_eq!(
-            hk(KeyCode::Char('u'), ActiveTab::Rocm),
-            KeyAction::OpenUpdate
-        );
-        // Install / logs open from Observe + Action.
-        assert_eq!(
             hk(KeyCode::Char('i'), ActiveTab::Observe),
             KeyAction::OpenInstall
         );
-        assert_eq!(hk(KeyCode::Char('l'), ActiveTab::Rocm), KeyAction::OpenLogs);
-        // On the Chat tab none of these open an overlay (the operational keys
-        // are guarded to Observe/Action). `i` is the one that means
-        // something else on Chat — insert mode — never OpenInstall.
+        // Retired on the domain tabs: the Actions list is the single path there,
+        // so the letter hotkeys are inert on ROCm/Serving (and Home/Chat).
+        for c in ['w', 'e', 'd', 'u', 'i', 'l', 'r', 'n', 'a', 'c', 'p', 's'] {
+            assert_eq!(
+                hk(KeyCode::Char(c), ActiveTab::Rocm),
+                KeyAction::Nothing,
+                "key {c} must be retired on the ROCm tab"
+            );
+            assert_eq!(
+                hk(KeyCode::Char(c), ActiveTab::Serving),
+                KeyAction::Nothing,
+                "key {c} must be retired on the Serving tab"
+            );
+        }
+        assert_eq!(hk(KeyCode::Char('w'), ActiveTab::Home), KeyAction::Nothing);
+        // On the Chat tab none of these open an overlay. `i` means insert mode.
         for c in ['w', 'e', 'd', 'u', 'l'] {
             assert_eq!(
                 hk(KeyCode::Char(c), ActiveTab::Chat),

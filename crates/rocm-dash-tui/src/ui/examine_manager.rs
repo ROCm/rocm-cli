@@ -20,7 +20,7 @@ use rocm_dash_core::state::{SideEffect, State, StateEvent};
 
 use crate::ui::exec::resolve_exe;
 use crate::ui::job_console::{ConsoleOutcome, draw_job_console, on_console_key};
-use crate::ui::modal::{centered_rect, draw_popup_frame};
+use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
 
 /// Overlay state. `None` on `AppState` means the overlay is closed.
@@ -101,8 +101,14 @@ pub fn draw_examine_manager(
         return;
     }
 
-    let popup = centered_rect(70, 50, 90, 14, area);
-    let inner = draw_popup_frame(f, popup, "Examine — environment check", theme);
+    let inner = panel::bento(
+        f,
+        area,
+        Some("Examine — environment check"),
+        BoxRole::Primary,
+        false,
+        theme,
+    );
     if inner.height == 0 {
         return;
     }
