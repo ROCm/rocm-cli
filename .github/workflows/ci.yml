@@ -220,10 +220,43 @@ jobs:
   license-headers:
     name: License header check (hawkeye)
     runs-on: ubuntu-latest
+    env:
+      # Install a pinned prebuilt hawkeye binary instead of pulling the
+      # korandoru/hawkeye Docker image on every run, and verify it against a
+      # sha256 recorded here. The hash lives in-repo, out of band from the
+      # release: GitHub release assets are mutable, so a republished/tampered
+      # artifact (and its co-published .sha256) would pass an upstream-only
+      # check — pinning the hash here makes that fail instead. To upgrade, bump
+      # the version and replace the hash with the new release's published
+      # .sha256 (confirm the bytes first).
+      HAWKEYE_VERSION: v6.5.1
+      HAWKEYE_SHA256: d6eb0505a45a15244f4f789158aafe5e3f1a7dc86c9dc1d7651f3cb1e1b321e0
+      HAWKEYE_INSTALL_DIR: ${{ github.workspace }}/.hawkeye-bin
     steps:
       - uses: actions/checkout@v6
+
+      - name: Cache hawkeye binary
+        id: cache-hawkeye
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.HAWKEYE_INSTALL_DIR }}
+          key: ${{ runner.os }}-hawkeye-${{ env.HAWKEYE_VERSION }}-${{ env.HAWKEYE_SHA256 }}
+
+      - name: Install hawkeye
+        if: steps.cache-hawkeye.outputs.cache-hit != 'true'
+        run: |
+          tarball="hawkeye-x86_64-unknown-linux-gnu.tar.xz"
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            "https://github.com/korandoru/hawkeye/releases/download/${HAWKEYE_VERSION}/${tarball}" \
+            -o "${tarball}"
+          echo "${HAWKEYE_SHA256}  ${tarball}" | sha256sum -c -
+          mkdir -p "${HAWKEYE_INSTALL_DIR}"
+          tar -xJf "${tarball}" -C "${HAWKEYE_INSTALL_DIR}" --strip-components=1
+          rm -f "${tarball}"
+
       - name: Check license headers
-        uses: korandoru/hawkeye@v6
+        run: |
+          "${HAWKEYE_INSTALL_DIR}/hawkeye" check
 
   # Hardware (real AMD GPU / WSL) smoke tests on dedicated self-hosted runners
   # are intentionally not part of this workflow yet. See
