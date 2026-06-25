@@ -1917,6 +1917,11 @@ fn install(target: InstallTarget) -> Result<()> {
                     print!("{output}");
                     if let Some(finalized) = finalized {
                         print_sdk_install_success(&finalized);
+                        // The SDK runtime wheel bundles PyTorch, whose ROCm build
+                        // links against libatomic.so.1. Ensure it is present for
+                        // every SDK install, independent of which engine (if any)
+                        // is auto-installed below.
+                        ensure_libatomic_for_torch(yes);
                         if let Err(error) =
                             maybe_auto_install_sdk_preferred_engine(&paths, &finalized, yes)
                         {
@@ -3147,7 +3152,7 @@ fn engines(command: EnginesCommand) -> Result<()> {
             let env_root = env_root_for_engine_install(&paths, &config, &engine, &runtime_id)?;
             if engine == "vllm" {
                 ensure_openmpi_for_vllm(yes)?;
-                ensure_libatomic_for_vllm(yes);
+                ensure_libatomic_for_torch(yes);
             }
             let response = engine_request_with_env_root::<_, InstallResponse>(
                 Some(&paths),
@@ -5264,13 +5269,15 @@ fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
     }
 }
 
-/// Ensure the `libatomic` runtime that vLLM's ROCm torch wheel links against is
-/// present before the vLLM wheel is installed. Mirrors [`ensure_openmpi_for_vllm`]:
-/// on Linux/WSL, when `libatomic.so.1` is missing it installs it through the
-/// system package manager (automatically when no interactive prompt is needed or
-/// when `approved`, otherwise it prints the distro-aware plan). Never blocks or
-/// fails the vLLM install (warn-and-continue).
-fn ensure_libatomic_for_vllm(approved: bool) {
+/// Ensure the `libatomic` runtime that PyTorch's ROCm wheel links against is
+/// present. The SDK runtime wheel bundles PyTorch, and vLLM uses it too, so this
+/// is invoked both after `rocm install sdk` and during `rocm engines install
+/// vllm`. On Linux/WSL, when `libatomic.so.1` is missing it installs it through
+/// the system package manager (automatically when no interactive prompt is
+/// needed or when `approved`, otherwise it prints the distro-aware plan). Never
+/// blocks or fails the install (warn-and-continue). It is a no-op when
+/// libatomic is already present.
+fn ensure_libatomic_for_torch(approved: bool) {
     if cfg!(windows) {
         return;
     }
@@ -5285,7 +5292,7 @@ fn ensure_libatomic_for_vllm(approved: bool) {
 
     println!("libatomic setup");
     println!(
-        "  reason: vLLM's torch wheel requires the libatomic runtime (libatomic.so.1), which was not found"
+        "  reason: PyTorch's ROCm wheel requires the libatomic runtime (libatomic.so.1), which was not found"
     );
     if let Some(manager) = plan.package_manager.as_deref() {
         println!("  package_manager: {manager}");
@@ -5308,7 +5315,7 @@ fn ensure_libatomic_for_vllm(approved: bool) {
         for check in &plan.preflight_checks {
             println!("  preflight: {check}");
         }
-        eprintln!("warning: libatomic is required by vLLM but was not installed automatically");
+        eprintln!("warning: libatomic is required by PyTorch but was not installed automatically");
         eprintln!(
             "warning: passwordless sudo is unavailable; run the commands above manually, or rerun with --yes to approve an interactive sudo prompt"
         );
@@ -5336,7 +5343,7 @@ fn ensure_libatomic_for_vllm(approved: bool) {
         Err(error) => {
             eprintln!("warning: libatomic install failed: {error}");
             eprintln!(
-                "warning: continuing vLLM install; run the commands above manually so vLLM can load libatomic.so.1"
+                "warning: continuing; run the commands above manually so PyTorch can load libatomic.so.1"
             );
         }
     }
@@ -5383,7 +5390,6 @@ fn maybe_auto_install_sdk_preferred_engine(
     println!("  runtime_id: {}", finalized.runtime_key);
 
     ensure_openmpi_for_vllm(approved)?;
-    ensure_libatomic_for_vllm(approved);
 
     let mut config = RocmCliConfig::load(paths)?;
     let env_root = env_root_for_engine_install(paths, &config, engine, &finalized.runtime_key)?;
