@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # The merge queue creates a temporary branch and fires `merge_group`; without
+  # this trigger the required checks never start and queued PRs stall forever.
+  merge_group:
+    branches: [main]
+    types: [checks_requested]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
