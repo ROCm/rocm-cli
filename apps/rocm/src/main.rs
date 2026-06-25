@@ -3756,11 +3756,9 @@ fn serve(
     );
     match &gpu_selection {
         GpuSelection::Auto => {
-            if let Some(csv) = rocm_engine_protocol::gpu_indices_to_csv(&gpu_indices) {
-                println!("  gpu: auto (selected {csv})");
-            } else {
-                println!("  gpu: auto (engine default visibility)");
-            }
+            let csv = rocm_engine_protocol::gpu_indices_to_csv(&gpu_indices)
+                .unwrap_or_else(|| "none".to_owned());
+            println!("  gpu: auto (selected {csv})");
         }
         GpuSelection::Index(_) => {
             let csv = rocm_engine_protocol::gpu_indices_to_csv(&gpu_indices)
@@ -14311,8 +14309,9 @@ fn parse_device_policy(value: Option<&str>) -> Result<DevicePolicy> {
     }
 }
 
-/// Parse the user-facing `--gpu` value (`auto`, `1`, or `0,1,2`) into a
-/// `GpuSelection`. `None` defaults to `auto`.
+/// Parse the user-facing `--gpu` value (`auto` or a single index like `1`)
+/// into a `GpuSelection`. Comma lists are rejected (single-GPU serving only).
+/// `None` defaults to `auto`.
 fn parse_gpu_selection(value: Option<&str>) -> Result<GpuSelection> {
     let Some(raw) = value else {
         return Ok(GpuSelection::Auto);
@@ -14382,6 +14381,13 @@ impl GpuVramUsage {
         }
         Some(self.total_mb.saturating_sub(self.used_mb) as f64 / self.total_mb as f64)
     }
+
+    /// Absolute VRAM currently free, in MiB. Used to compare GPUs of differing
+    /// total capacity: a higher free *fraction* on a smaller GPU can still mean
+    /// less free memory than a larger GPU, so auto-selection ranks by this.
+    const fn free_mb(self) -> u64 {
+        self.total_mb.saturating_sub(self.used_mb)
+    }
 }
 
 /// A GPU is treated as "free" for `--gpu auto` when at least this fraction of
@@ -14430,18 +14436,17 @@ fn select_auto_gpu_index(
                 return vec![index];
             }
         }
-        // Pass 2: the non-busy GPU with the most free VRAM.
+        // Pass 2: the non-busy GPU with the most free VRAM in absolute terms
+        // (not free percentage, which can favor a smaller GPU on heterogeneous
+        // VRAM systems).
         if let Some(index) = candidates().max_by(|left, right| {
-            let left_free = usage_for(*left).and_then(|usage| usage.free_fraction());
-            let right_free = usage_for(*right).and_then(|usage| usage.free_fraction());
+            let left_free = usage_for(*left).map(|usage| usage.free_mb());
+            let right_free = usage_for(*right).map(|usage| usage.free_mb());
             left_free
-                .partial_cmp(&right_free)
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .cmp(&right_free)
                 // Break ties toward the lowest index.
                 .then(right.cmp(left))
-        }) && usage_for(index)
-            .and_then(|usage| usage.free_fraction())
-            .is_some()
+        }) && usage_for(index).is_some()
         {
             return vec![index];
         }
@@ -19173,6 +19178,20 @@ install therock";
             select_auto_gpu_index(Some(3), &[0], Some(&usage)),
             vec![2],
             "with no idle GPU, pick the non-busy GPU with the most free VRAM"
+        );
+    }
+
+    #[test]
+    fn auto_selection_pass_two_ranks_by_absolute_free_vram() {
+        // Heterogeneous VRAM with no fully-idle GPU (so pass 2 applies):
+        // GPU 0 is a small card with a high free *fraction* (75%) but little
+        // absolute free memory; GPU 1 is large with a lower fraction (~48%)
+        // but far more free memory. Auto-selection must prefer GPU 1.
+        let usage = [vram(0, 6_000, 24_000), vram(1, 100_000, 192_000)];
+        assert_eq!(
+            select_auto_gpu_index(Some(2), &[], Some(&usage)),
+            vec![1],
+            "pass 2 should rank by absolute free VRAM, not free percentage"
         );
     }
 
