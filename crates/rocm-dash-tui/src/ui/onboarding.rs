@@ -1,6 +1,6 @@
 // Copyright Advanced Micro Devices, Inc.
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 
 //! Onboarding wizard (Phase 3 Wave 2, minimal).
 //!

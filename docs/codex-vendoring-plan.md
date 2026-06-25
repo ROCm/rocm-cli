@@ -14,7 +14,7 @@ Replace the current in-tree `rocm` TUI with a fully vendored Codex TUI stack fro
 
 This plan assumes:
 
-- `rocm-cli` remains Apache-2.0 licensed.
+- `rocm-cli` remains MIT licensed.
 - The vendored Codex tree is treated as a pinned upstream subtree/fork.
 - `rocmd` becomes the primary backend contract for interactive sessions.
 - `rocm` remains the user-facing binary.

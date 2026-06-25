@@ -1,6 +1,6 @@
 // Copyright Advanced Micro Devices, Inc.
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 
 //! TOML config loaded from `~/.config/rocm-dash/config.toml`. Missing = defaults.
 

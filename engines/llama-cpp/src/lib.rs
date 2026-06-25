@@ -1,6 +1,6 @@
 // Copyright Advanced Micro Devices, Inc.
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};

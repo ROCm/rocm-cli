@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright Advanced Micro Devices, Inc.
 #
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
 
 """Verify rocm-cli release dist assets before publication."""
 

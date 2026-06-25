@@ -1,6 +1,6 @@
 // Copyright Advanced Micro Devices, Inc.
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 
 //! Services manager overlay (Phase 3 Wave 1).
 //!

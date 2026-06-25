@@ -1,6 +1,6 @@
 // Copyright Advanced Micro Devices, Inc.
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 
 //! Chat LLM configuration: a pure precedence resolver plus a std-only TCP liveness probe.
 //!

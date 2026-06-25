@@ -1,6 +1,6 @@
 // Copyright Advanced Micro Devices, Inc.
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 
 //! Acquisition and invocation helpers for the [`uv`](https://github.com/astral-sh/uv)
 //! package manager.

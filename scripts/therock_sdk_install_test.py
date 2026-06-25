@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright Advanced Micro Devices, Inc.
 #
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
 
 """Opt-in acceptance test for managed TheRock SDK wheel installs.
 

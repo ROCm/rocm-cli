@@ -1,6 +1,6 @@
 // Copyright Advanced Micro Devices, Inc.
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 
 use crate::{format_structured_tool_call, runtime_usability_status, therock};
 use anyhow::{Context, Result, bail};

@@ -5,7 +5,7 @@
 inlineHeader = """
 Copyright Advanced Micro Devices, Inc.
 
-SPDX-License-Identifier: Apache-2.0
+SPDX-License-Identifier: MIT
 """
 
 includes = [
@@ -17,5 +17,6 @@ includes = [
 excludes = [
   "target/**",
   ".claude/**",
+  ".tmp-*/**",
   "third_party/**",
 ]
