@@ -349,7 +349,7 @@ rocm logs --search error timeout")]
     ///     `rocm` commands
     ///
     /// It is normally started on demand by `rocm automations enable` and
-    /// `rocm managed serve`, so you rarely need to launch it yourself. Run it
+    /// `rocm serve --managed`, so you rarely need to launch it yourself. Run it
     /// directly only when you want to observe its behavior in the foreground,
     /// e.g. for debugging.
     #[command(verbatim_doc_comment)]
@@ -863,37 +863,24 @@ fn run_freeform(request: String, approve: bool) -> Result<()> {
 /// Returns clap's own error when a freeform request looks like a botched
 /// command invocation rather than natural language, so the caller can surface
 /// clap's "did you mean"/usage message and exit instead of feeding it to the
-/// planner. Triggers when the first token is a command-like word and either it
-/// stands alone with a near match, or it is followed by flag-style arguments
-/// (for example `doctorgdfg --help`). Returns `None` for genuine prose.
+/// planner. clap's error is surfaced when it carries a subcommand suggestion (a
+/// near-miss typo such as `instal` or `automatios list`) or when the request
+/// includes flag-style arguments (such as `doctorgdfg --help`). Genuine prose,
+/// which yields neither, is left to the planner.
 fn command_invocation_error(request_args: &[String]) -> Option<clap::Error> {
-    let first = request_args.first()?;
-    let looks_like_command_token = !first.is_empty()
-        && first
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    if !looks_like_command_token {
-        return None;
-    }
-    // A multi-word request with no flags reads as natural language; leave it to
-    // the planner.
-    let has_flag = request_args.iter().any(|arg| arg.starts_with('-'));
-    if request_args.len() > 1 && !has_flag {
+    if request_args.is_empty() {
         return None;
     }
     let argv = std::iter::once("rocm".to_owned()).chain(request_args.iter().cloned());
-    match Cli::try_parse_from(argv) {
-        Err(err) if err.kind() == clap::error::ErrorKind::InvalidSubcommand => {
-            // A lone unknown word with no near match may genuinely be a
-            // natural-language ask, so leave that case to the planner.
-            if request_args.len() == 1 && !err.to_string().contains("similar") {
-                None
-            } else {
-                Some(err)
-            }
-        }
-        _ => None,
+    let err = Cli::try_parse_from(argv).err()?;
+    if err.kind() != clap::error::ErrorKind::InvalidSubcommand {
+        return None;
     }
+    let has_suggestion = err
+        .get(clap::error::ContextKind::SuggestedSubcommand)
+        .is_some();
+    let has_flag = request_args.iter().any(|arg| arg.starts_with('-'));
+    (has_suggestion || has_flag).then_some(err)
 }
 
 fn setup(command: Option<SetupCommand>) -> Result<()> {
@@ -15550,6 +15537,16 @@ mod tests {
             .expect("a command-like token followed by a flag should yield a clap error");
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
         assert!(err.to_string().contains("doctorgdfg"));
+    }
+
+    #[test]
+    fn mistyped_command_with_trailing_argument_yields_suggestion() {
+        // A near-miss subcommand followed by a normal (non-flag) argument should
+        // still surface clap's suggestion instead of falling to the planner.
+        let err = command_invocation_error(&["automatios".to_owned(), "list".to_owned()])
+            .expect("a near-miss subcommand with a trailing arg should yield a clap suggestion");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+        assert!(err.to_string().contains("automations"));
     }
 
     #[test]
