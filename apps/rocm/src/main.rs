@@ -7539,6 +7539,16 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
                 command_title: "ComfyUI".to_owned(),
             })
         }
+        Some("setup") if second.as_deref().is_none_or(|value| value == "status") => {
+            Ok(ChatRocmCommandAction::ReadOnly(args))
+        }
+        Some("setup") if second.as_deref() == Some("reset") => {
+            Ok(ChatRocmCommandAction::Approval {
+                args,
+                pending_title: "Reset first-time setup".to_owned(),
+                command_title: "Setup".to_owned(),
+            })
+        }
         Some(command) => bail!("local assistant cannot use unsupported rocm command `{command}`"),
         None => bail!("rocm_command requires at least one argument"),
     }
@@ -8729,6 +8739,15 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
                 && rest.iter().any(|arg| arg.eq_ignore_ascii_case("--dry-run")) =>
         {
             render_uninstall_dry_run(paths)
+        }
+        [command] if command.eq_ignore_ascii_case("setup") => {
+            render_setup_status_text(paths, &config)
+        }
+        [command, subcommand]
+            if command.eq_ignore_ascii_case("setup")
+                && subcommand.eq_ignore_ascii_case("status") =>
+        {
+            render_setup_status_text(paths, &config)
         }
         _ => bail!(
             "unsupported in-process read-only rocm command: {}",
@@ -15957,6 +15976,77 @@ model recipes
     }
 
     #[test]
+    fn setup_status_is_read_only() {
+        for args in [
+            vec!["setup".to_owned()],
+            vec!["setup".to_owned(), "status".to_owned()],
+        ] {
+            let action =
+                chat_rocm_command_action_from_args(args.clone()).expect("setup status classifies");
+            assert!(
+                matches!(action, ChatRocmCommandAction::ReadOnly(_)),
+                "setup {args:?} should be read-only, got {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_reset_requires_approval() {
+        let action =
+            chat_rocm_command_action_from_args(vec!["setup".to_owned(), "reset".to_owned()])
+                .expect("setup reset classifies");
+        match action {
+            ChatRocmCommandAction::Approval {
+                pending_title,
+                command_title,
+                ..
+            } => {
+                assert_eq!(pending_title, "Reset first-time setup");
+                assert_eq!(command_title, "Setup");
+            }
+            other @ ChatRocmCommandAction::ReadOnly(_) => {
+                panic!("setup reset should require approval, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_read_mutate_split_is_honest() {
+        let read_only = [
+            vec!["update".to_owned()],
+            vec!["comfyui".to_owned(), "status".to_owned()],
+            vec!["comfyui".to_owned(), "logs".to_owned()],
+            vec!["uninstall".to_owned(), "--dry-run".to_owned()],
+            vec!["setup".to_owned(), "status".to_owned()],
+        ];
+        for args in read_only {
+            let action = chat_rocm_command_action_from_args(args.clone())
+                .unwrap_or_else(|err| panic!("{args:?} should classify: {err}"));
+            assert!(
+                matches!(action, ChatRocmCommandAction::ReadOnly(_)),
+                "{args:?} should be read-only, got {action:?}"
+            );
+        }
+
+        let mutating = [
+            vec!["update".to_owned(), "--apply".to_owned()],
+            vec!["comfyui".to_owned(), "install".to_owned()],
+            vec!["comfyui".to_owned(), "start".to_owned()],
+            vec!["comfyui".to_owned(), "stop".to_owned()],
+            vec!["uninstall".to_owned()],
+            vec!["setup".to_owned(), "reset".to_owned()],
+        ];
+        for args in mutating {
+            let action = chat_rocm_command_action_from_args(args.clone())
+                .unwrap_or_else(|err| panic!("{args:?} should classify: {err}"));
+            assert!(
+                matches!(action, ChatRocmCommandAction::Approval { .. }),
+                "{args:?} should require approval, got {action:?}"
+            );
+        }
+    }
+
+    #[test]
     fn chat_rocm_command_runs_read_only_and_rejects_risky_shapes() {
         let status = providers::ChatToolCall {
             id: None,
@@ -16068,6 +16158,27 @@ model recipes
             Some("rocm")
         );
         assert!(mcp_tool_result_text(&result).contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn setup_status_renders_in_process() {
+        let (_root, paths) = test_paths("setup-status-in-process");
+
+        for args in [
+            vec!["setup".to_owned()],
+            vec!["setup".to_owned(), "status".to_owned()],
+        ] {
+            let text = run_rocm_read_only_in_process(&paths, &args)
+                .expect("setup status read path should render in-process");
+            assert!(
+                !text.trim().is_empty(),
+                "setup status text should be non-empty for {args:?}"
+            );
+            assert!(
+                text.contains("ROCm setup"),
+                "setup status text should be reached for {args:?}: {text}"
+            );
+        }
     }
 
     #[test]

@@ -28,10 +28,10 @@ Groups: **A** nav/session · **B** read-only · **C** approvals/automations ·
 | engine | D | covered (Phase 4) | `/engine <name>` slash → `install_engine` mutating tool → approval modal → `execute_approved`; also LLM tool-call seam | `slash_engine_raises_install_engine_request` |
 | serve | D | covered (Phase 4) | `/serve <model>` slash (loopback host) → `launch_server` mutating tool → approval modal → `execute_approved`; also LLM tool-call seam | `slash_serve_raises_launch_server_request` / `seam_execute_approved_rejects_unsafe_call_via_validator` |
 | services | D | covered (Phase 4) | `/services stop <id>` slash → `stop_server` mutating tool → approval modal → `execute_approved`; `restart` is guided (not yet wired through the chat seam — points to stop + `/serve`); bare `/services` is read-only | `slash_services_stop_raises_stop_server_request` / `slash_services_restart_is_guided_not_stop` |
-| update | D | pending (Phase 5) | update overlay + mutating apply (approval-gated) | — |
-| comfyui | D | pending (Phase 5) | ComfyUI serve/launch flow (approval-gated) | — |
-| uninstall | D | pending (Phase 5) | uninstall flow (approval-gated) | — |
-| setup | D | pending (Phase 5) | onboarding wizard (deterministic first-run) | — |
+| update | D | covered (Phase 5) | `/update` slash → `slash_tool` `rocm_command ["update"]` (read-only report); `/update --apply` → `["update","--apply"]` → approval modal | `slash_update_is_read_only_report` / `slash_update_apply_is_mutating` / `lifecycle_read_mutate_split_is_honest` |
+| comfyui | D | covered (Phase 5) | `/comfyui` slash → `rocm_command ["comfyui","status"]` (read; status/logs); `install`/`start`/`stop` → approval modal | `slash_comfyui_bare_is_status` / `slash_comfyui_start_is_mutating` / `slash_comfyui_logs_is_read_only` |
+| uninstall | D | covered (Phase 5) | `/uninstall` slash → `rocm_command ["uninstall","--dry-run"]` (SAFE read-only default); `/uninstall --apply` → `["uninstall"]` → approval modal (bin auto-adds `--yes`) | `slash_uninstall_defaults_to_dry_run` / `slash_uninstall_apply_is_real` |
+| setup | D | covered (Phase 5) | `/setup` slash → `rocm_command ["setup","status"]` (read); `/setup reset` → `["setup","reset"]` → approval modal; unsupported subs guided | `slash_setup_bare_is_status` / `slash_setup_reset_is_mutating` / `setup_status_is_read_only` / `setup_reset_requires_approval` |
 | automations | C | pending (Phase 6) | automations-manager overlay + run/approve actions | — |
 | reviews | C | pending (Phase 6) | approval/review queue surface | — |
 | approve | C | pending (Phase 6) | approval-queue accept action | — |
