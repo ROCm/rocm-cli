@@ -824,9 +824,9 @@ impl AppState {
             // mutating paths classify as ApprovalRequired and open the Phase-4 modal.
             "update" => {
                 // `/update` reports available updates (read-only); `/update --apply`
-                // applies them (approval-gated). The mutating trigger is the
-                // dash flag only, matching `/uninstall --apply` and `rocm update --apply`.
-                let apply = rest.split_whitespace().nth(1) == Some("--apply");
+                // applies them (approval-gated). Scan all tokens for the dash flag
+                // (matching `/uninstall`) so the trigger isn't position-sensitive.
+                let apply = rest.split_whitespace().skip(1).any(|tok| tok == "--apply");
                 let argv: Vec<&str> = if apply {
                     vec!["update", "--apply"]
                 } else {
@@ -3293,6 +3293,23 @@ mod tests {
         assert_eq!(
             req.args,
             serde_json::json!({ "args": ["update", "--apply"] })
+        );
+    }
+
+    #[test]
+    fn slash_update_apply_is_position_independent() {
+        // `--apply` anywhere in the args triggers the mutating path (matching
+        // `/uninstall`'s all-tokens parse), not only as the immediate second token.
+        let mut s = st();
+        assert_eq!(
+            s.handle_slash_command("/update --preview --apply"),
+            SlashOutcome::Handled
+        );
+        let req = s.slash_tool.expect("update --apply raises a request");
+        assert_eq!(
+            req.args,
+            serde_json::json!({ "args": ["update", "--apply"] }),
+            "--apply past the second token must still apply"
         );
     }
 
