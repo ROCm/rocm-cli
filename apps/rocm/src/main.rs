@@ -3147,6 +3147,7 @@ fn engines(command: EnginesCommand) -> Result<()> {
             let env_root = env_root_for_engine_install(&paths, &config, &engine, &runtime_id)?;
             if engine == "vllm" {
                 ensure_openmpi_for_vllm(yes)?;
+                ensure_libatomic_for_vllm(yes);
             }
             let response = engine_request_with_env_root::<_, InstallResponse>(
                 Some(&paths),
@@ -5232,7 +5233,7 @@ fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
             "auto (root or passwordless sudo available)"
         }
     );
-    match run_openmpi_install_plan(&plan) {
+    match run_system_package_install_plan(&plan) {
         Ok(()) => {
             if rocm_core::openmpi::detect_openmpi().present {
                 println!("  status: installed");
@@ -5263,7 +5264,87 @@ fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
     }
 }
 
-fn run_openmpi_install_plan(plan: &rocm_core::openmpi::OpenMpiInstallPlan) -> Result<()> {
+/// Ensure the `libatomic` runtime that vLLM's ROCm torch wheel links against is
+/// present before the vLLM wheel is installed. Mirrors [`ensure_openmpi_for_vllm`]:
+/// on Linux/WSL, when `libatomic.so.1` is missing it installs it through the
+/// system package manager (automatically when no interactive prompt is needed or
+/// when `approved`, otherwise it prints the distro-aware plan). Never blocks or
+/// fails the vLLM install (warn-and-continue).
+fn ensure_libatomic_for_vllm(approved: bool) {
+    if cfg!(windows) {
+        return;
+    }
+    if rocm_core::openmpi::libatomic_present() {
+        return;
+    }
+
+    let os_release = read_os_release().unwrap_or_default();
+    let os_id = parse_os_release_field(&os_release, "ID").unwrap_or_default();
+    let id_like = parse_os_release_field(&os_release, "ID_LIKE").unwrap_or_default();
+    let plan = rocm_core::openmpi::build_libatomic_install_plan(&os_id, &id_like);
+
+    println!("libatomic setup");
+    println!(
+        "  reason: vLLM's torch wheel requires the libatomic runtime (libatomic.so.1), which was not found"
+    );
+    if let Some(manager) = plan.package_manager.as_deref() {
+        println!("  package_manager: {manager}");
+    }
+    println!("  detail: {}", plan.reason);
+
+    if !plan.supported {
+        // Either the distro is unknown or libatomic ships with the base toolchain
+        // (Arch); nothing actionable to auto-install.
+        return;
+    }
+
+    println!("  commands:");
+    for command in &plan.commands {
+        println!("    {command}");
+    }
+
+    let can_autoinstall = rocm_core::openmpi::can_autoinstall();
+    if !approved && !can_autoinstall {
+        for check in &plan.preflight_checks {
+            println!("  preflight: {check}");
+        }
+        eprintln!("warning: libatomic is required by vLLM but was not installed automatically");
+        eprintln!(
+            "warning: passwordless sudo is unavailable; run the commands above manually, or rerun with --yes to approve an interactive sudo prompt"
+        );
+        return;
+    }
+
+    println!(
+        "  approval: {}",
+        if approved {
+            "granted by --yes"
+        } else {
+            "auto (root or passwordless sudo available)"
+        }
+    );
+    match run_system_package_install_plan(&plan) {
+        Ok(()) => {
+            if rocm_core::openmpi::libatomic_present() {
+                println!("  status: installed");
+            } else {
+                eprintln!(
+                    "warning: libatomic install commands completed but libatomic.so.1 was still not found; verify the package manager output above"
+                );
+            }
+        }
+        Err(error) => {
+            eprintln!("warning: libatomic install failed: {error}");
+            eprintln!(
+                "warning: continuing vLLM install; run the commands above manually so vLLM can load libatomic.so.1"
+            );
+        }
+    }
+}
+
+fn run_system_package_install_plan(
+    plan: &rocm_core::openmpi::SystemPackageInstallPlan,
+) -> Result<()> {
     let root = rocm_core::openmpi::running_as_root();
     for command in &plan.commands {
         // When already root, `sudo` may be absent; run the command directly.
@@ -5302,6 +5383,7 @@ fn maybe_auto_install_sdk_preferred_engine(
     println!("  runtime_id: {}", finalized.runtime_key);
 
     ensure_openmpi_for_vllm(approved)?;
+    ensure_libatomic_for_vllm(approved);
 
     let mut config = RocmCliConfig::load(paths)?;
     let env_root = env_root_for_engine_install(paths, &config, engine, &finalized.runtime_key)?;

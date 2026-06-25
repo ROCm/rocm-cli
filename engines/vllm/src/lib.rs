@@ -459,6 +459,12 @@ fn vllm_runtime_warnings(runtime: &VllmRuntime) -> Vec<String> {
             rocm_core::openmpi::install_hint()
         ));
     }
+    if !cfg!(windows) && !rocm_core::openmpi::libatomic_present() {
+        warnings.push(format!(
+            "libatomic runtime (libatomic.so.1) was not found; vLLM's torch wheel requires it. {}, or rerun `rocm engines install vllm --yes`.",
+            rocm_core::openmpi::libatomic_install_hint()
+        ));
+    }
     warnings
 }
 
@@ -632,6 +638,20 @@ fn spawn_vllm_server(
 without it `import torch` fails with `libmpi_cxx.so.40: cannot open shared object file`. \
 {}, or run `rocm engines install vllm --yes` to install it automatically, then retry.",
             rocm_core::openmpi::install_hint()
+        );
+    }
+
+    // Fail fast when the libatomic runtime is missing. PyTorch's ROCm wheel links
+    // `libatomic.so.1`, so `import torch` dies with `libatomic.so.1: cannot open
+    // shared object file` on minimal hosts (notably RHEL UBI, which ships only
+    // GCC's libatomic.so linker script). Unlike libnuma it is not bundled by the
+    // ROCm SDK, so it must be installed from the system package manager.
+    if !cfg!(windows) && !rocm_core::openmpi::libatomic_present() {
+        bail!(
+            "vLLM requires the libatomic runtime (libatomic.so.1), which was not found; \
+without it `import torch` fails with `libatomic.so.1: cannot open shared object file`. \
+{}, or run `rocm engines install vllm --yes` to install it automatically, then retry.",
+            rocm_core::openmpi::libatomic_install_hint()
         );
     }
 
@@ -1274,28 +1294,54 @@ fn therock_library_path_entries(runtime: &VllmRuntime) -> Vec<PathBuf> {
         // load libmpi.so at launch when it lives there.
         entries.extend(rocm_core::openmpi::openmpi_library_dirs());
 
-        // PyTorch's `libtorch_global_deps.so` lists `libmpi_cxx.so.40` as a
-        // NEEDED dependency, but OpenMPI 5.x removed the legacy C++ bindings, so
-        // `import torch` aborts with `libmpi_cxx.so.40: cannot open shared object
-        // file`. When no real `libmpi_cxx.so*` exists, create a compatibility
-        // symlink to the real `libmpi.so*` in a runtime-owned directory and add
-        // it to the loader path. The shimmed library is never called into (the
-        // stub only preloads MPI), so this is safe.
-        if let Some(compat_dir) = openmpi_cxx_compat_dir(runtime)
-            && let Some(dir) = rocm_core::openmpi::ensure_mpi_cxx_compat(&compat_dir)
-        {
-            entries.push(dir);
+        if let Some(compat_dir) = runtime_compat_dir(runtime) {
+            // PyTorch's `libtorch_global_deps.so` lists `libmpi_cxx.so.40` as a
+            // NEEDED dependency, but OpenMPI 5.x removed the legacy C++ bindings,
+            // so `import torch` aborts with `libmpi_cxx.so.40: cannot open shared
+            // object file`. When no real `libmpi_cxx.so*` exists, point that
+            // soname at the real `libmpi.so*` via a runtime-owned symlink. The
+            // shimmed library is never called into (the stub only preloads MPI),
+            // so this is safe.
+            if let Some(dir) = rocm_core::openmpi::ensure_mpi_cxx_compat(&compat_dir) {
+                entries.push(dir);
+            }
+            // PyTorch's `libc10.so` NEEDS the standard `libnuma.so.1` soname, but
+            // TheRock bundles numa in the ROCm SDK sysdeps under the renamed
+            // soname `librocm_sysdeps_numa.so.1`, so hosts without system
+            // numactl fail with `libnuma.so.1: cannot open shared object file`.
+            // The bundled file is the real numactl library, so a `libnuma.so.1`
+            // symlink to it provides working numa support.
+            if let Some(dir) = ensure_numa_compat(&entries, &compat_dir) {
+                entries.push(dir);
+            }
         }
     }
     dedupe_paths(entries)
 }
 
-/// A writable, runtime-owned directory for the OpenMPI C++ bindings
-/// compatibility shim (see [`therock_library_path_entries`]). Prefers the
-/// managed Python environment root (`<env>/bin/python` -> `<env>`); falls back to
-/// the SDK root when no Python launcher is recorded.
-fn openmpi_cxx_compat_dir(runtime: &VllmRuntime) -> Option<PathBuf> {
-    const COMPAT_DIR_NAME: &str = "openmpi-cxx-compat";
+/// Bridge the standard `libnuma.so.1` soname that PyTorch's `libc10.so` requires
+/// on hosts without system numactl, using the ROCm SDK's bundled numa library
+/// (`librocm_sysdeps_numa.so.1`, the real numactl library under a renamed
+/// soname). `sdk_dirs` are the SDK library directories already on the loader
+/// path; the symlink is created in `compat_dir`. No-op when the loader can
+/// already resolve `libnuma.so.1` or the bundled library is not found.
+fn ensure_numa_compat(sdk_dirs: &[PathBuf], compat_dir: &Path) -> Option<PathBuf> {
+    if !cfg!(target_os = "linux") || rocm_core::openmpi::ldconfig_has_soname("libnuma.so.1") {
+        return None;
+    }
+    let target = sdk_dirs
+        .iter()
+        .map(|dir| dir.join("librocm_sysdeps_numa.so.1"))
+        .find(|candidate| candidate.exists())?;
+    rocm_core::openmpi::ensure_compat_symlink(compat_dir, "libnuma.so.1", &target)
+}
+
+/// A writable, runtime-owned directory for managed-runtime library compatibility
+/// shims (see [`therock_library_path_entries`]). Prefers the managed Python
+/// environment root (`<env>/bin/python` -> `<env>`); falls back to the SDK root
+/// when no Python launcher is recorded.
+fn runtime_compat_dir(runtime: &VllmRuntime) -> Option<PathBuf> {
+    const COMPAT_DIR_NAME: &str = "rocm-cli-lib-compat";
     if let Some(env_root) = runtime
         .python_executable
         .as_ref()

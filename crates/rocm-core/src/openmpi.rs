@@ -11,6 +11,12 @@
 //! * detecting whether a usable OpenMPI runtime is already present, and
 //! * building an approval-gated, distro-aware system-package install plan.
 //!
+//! It also owns the related compatibility shims and checks for the other system
+//! libraries the ROCm torch wheel needs on minimal hosts: the `libmpi_cxx.so.40`
+//! and `libnuma.so.1` symlink shims (see [`ensure_compat_symlink`]) and the
+//! `libatomic.so.1` runtime check and install plan (see [`libatomic_present`]
+//! and [`build_libatomic_install_plan`]).
+//!
 //! The plan is never executed here; callers present it for explicit approval and
 //! run it through their normal privileged-command flow (mirroring the native
 //! driver-install plan). Detection is Linux/WSL only — native Windows vLLM is
@@ -37,11 +43,11 @@ pub struct OpenMpiStatus {
     pub mpirun_path: Option<PathBuf>,
 }
 
-/// Cross-distro plan for installing the OpenMPI runtime via the system package
-/// manager. Commands are advisory until explicitly approved and executed by the
-/// caller.
+/// Cross-distro plan for installing a system package (the OpenMPI runtime or
+/// libatomic) via the system package manager. Commands are advisory until
+/// explicitly approved and executed by the caller.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct OpenMpiInstallPlan {
+pub struct SystemPackageInstallPlan {
     /// Whether the host distribution maps to a known package manager.
     pub supported: bool,
     /// Detected package manager (`apt`, `dnf`, `zypper`, `pacman`), when known.
@@ -293,12 +299,13 @@ pub fn ensure_mpi_cxx_compat(_compat_dir: &std::path::Path) -> Option<PathBuf> {
 /// Create (idempotently) a `link_name` symlink in `compat_dir` pointing at
 /// `target`, returning `compat_dir` on success.
 ///
-/// This is the mechanism behind the OpenMPI C++ bindings shim: it bridges the
-/// `libmpi_cxx.so.40` soname that PyTorch's ROCm wheels need to the real
-/// `libmpi.so*` on hosts running OpenMPI 5.x. Returns `None` when `target` does
-/// not exist or the symlink cannot be created.
+/// This is the shared mechanism behind the managed-runtime library shims (for
+/// example bridging the `libmpi_cxx.so.40` and `libnuma.so.1` sonames that
+/// PyTorch/ROCm wheels need on hosts whose system or bundled libraries use a
+/// different name). Returns `None` when `target` does not exist or the symlink
+/// cannot be created.
 #[cfg(target_os = "linux")]
-fn ensure_compat_symlink(compat_dir: &Path, link_name: &str, target: &Path) -> Option<PathBuf> {
+pub fn ensure_compat_symlink(compat_dir: &Path, link_name: &str, target: &Path) -> Option<PathBuf> {
     if !target.exists() {
         return None;
     }
@@ -313,6 +320,93 @@ fn ensure_compat_symlink(compat_dir: &Path, link_name: &str, target: &Path) -> O
     std::os::unix::fs::symlink(target, &link)
         .ok()
         .map(|()| compat_dir.to_path_buf())
+}
+
+/// Non-Linux hosts do not create runtime library shims.
+#[cfg(not(target_os = "linux"))]
+pub fn ensure_compat_symlink(
+    _compat_dir: &std::path::Path,
+    _link_name: &str,
+    _target: &std::path::Path,
+) -> Option<PathBuf> {
+    None
+}
+
+/// Whether `ldconfig -p` reports a shared library with the exact given soname.
+///
+/// Used to skip a compatibility shim when the loader can already resolve the
+/// library, and to detect whether a required system library (such as
+/// `libatomic.so.1`) is installed. Always `false` off Linux or when `ldconfig`
+/// is absent.
+#[cfg(target_os = "linux")]
+pub fn ldconfig_has_soname(soname: &str) -> bool {
+    let Ok(output) = Command::new("ldconfig").arg("-p").output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some(soname))
+}
+
+/// Always `false` off Linux, where the loader-path shim is not exercised.
+#[cfg(not(target_os = "linux"))]
+pub fn ldconfig_has_soname(_soname: &str) -> bool {
+    false
+}
+
+/// Whether the `libatomic.so.1` runtime library is available to the dynamic
+/// loader.
+///
+/// PyTorch's ROCm wheels link `libatomic.so.1` (GCC's atomic-operations runtime)
+/// as a `NEEDED` dependency, so `import torch` aborts with `libatomic.so.1:
+/// cannot open shared object file` when it is missing. Unlike `libnuma`, the
+/// ROCm SDK does not bundle libatomic, so there is nothing to shim — it must be
+/// installed from the distribution's package manager (see
+/// [`build_libatomic_install_plan`]). Minimal container images (notably RHEL UBI)
+/// ship only GCC's `libatomic.so` linker script, not the runtime `.so.1`.
+///
+/// Always `true` off Linux, where this path is not exercised.
+#[cfg(target_os = "linux")]
+pub fn libatomic_present() -> bool {
+    ldconfig_has_soname("libatomic.so.1") || scan_libatomic_path().is_some()
+}
+
+/// Non-Linux hosts do not exercise the libatomic dependency path.
+#[cfg(not(target_os = "linux"))]
+pub fn libatomic_present() -> bool {
+    true
+}
+
+/// Locate a real `libatomic.so.1*` shared object in the standard library
+/// directories. GCC's `/usr/lib/gcc/.../libatomic.so` is only a linker script
+/// (`INPUT(...)`), not a loadable object, so it is intentionally not searched.
+#[cfg(target_os = "linux")]
+fn scan_libatomic_path() -> Option<PathBuf> {
+    const DIRS: &[&str] = &[
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
+        "/usr/lib64",
+        "/lib64",
+        "/usr/lib",
+    ];
+    for dir in DIRS {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("libatomic.so.1")
+            {
+                return Some(entry.path());
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,12 +432,12 @@ impl PackageManager {
 ///
 /// `os_id` is the `/etc/os-release` `ID` field and `id_like` is the (possibly
 /// empty) `ID_LIKE` field. Matching is case-insensitive.
-pub fn build_openmpi_install_plan(os_id: &str, id_like: &str) -> OpenMpiInstallPlan {
+pub fn build_openmpi_install_plan(os_id: &str, id_like: &str) -> SystemPackageInstallPlan {
     let os_id = os_id.trim().to_ascii_lowercase();
     let id_like = id_like.trim().to_ascii_lowercase();
 
     let Some(manager) = resolve_package_manager(&os_id, &id_like) else {
-        return OpenMpiInstallPlan {
+        return SystemPackageInstallPlan {
             supported: false,
             package_manager: None,
             packages: Vec::new(),
@@ -401,7 +495,7 @@ pub fn build_openmpi_install_plan(os_id: &str, id_like: &str) -> OpenMpiInstallP
         ),
     };
 
-    OpenMpiInstallPlan {
+    SystemPackageInstallPlan {
         supported: true,
         package_manager: Some(manager.as_str().to_owned()),
         packages,
@@ -415,7 +509,81 @@ pub fn build_openmpi_install_plan(os_id: &str, id_like: &str) -> OpenMpiInstallP
     }
 }
 
-/// Build a short, distro-aware hint describing how to install the OpenMPI
+/// Build an approval-gated plan for installing the `libatomic` runtime that
+/// PyTorch's ROCm wheels require, for a distribution identity.
+///
+/// Arguments mirror [`build_openmpi_install_plan`]. Unlike OpenMPI, libatomic is
+/// not bundled by the ROCm SDK and cannot be shimmed, so missing hosts must
+/// install it from the package manager. Arch-family hosts ship libatomic as part
+/// of `gcc-libs` (always present), so no install is planned there.
+pub fn build_libatomic_install_plan(os_id: &str, id_like: &str) -> SystemPackageInstallPlan {
+    let os_id = os_id.trim().to_ascii_lowercase();
+    let id_like = id_like.trim().to_ascii_lowercase();
+
+    let Some(manager) = resolve_package_manager(&os_id, &id_like) else {
+        return SystemPackageInstallPlan {
+            supported: false,
+            package_manager: None,
+            packages: Vec::new(),
+            commands: Vec::new(),
+            preflight_checks: Vec::new(),
+            reason: format!(
+                "Could not map distribution (ID={}) to a known package manager; install the libatomic runtime manually (your distro's `libatomic` / `libatomic1` package providing libatomic.so.1).",
+                if os_id.is_empty() {
+                    "<unknown>"
+                } else {
+                    &os_id
+                }
+            ),
+        };
+    };
+
+    let (packages, commands): (Vec<String>, Vec<String>) = match manager {
+        PackageManager::Apt => (
+            vec!["libatomic1".to_owned()],
+            vec![
+                "sudo apt-get update".to_owned(),
+                "sudo apt-get install -y libatomic1".to_owned(),
+            ],
+        ),
+        PackageManager::Dnf => (
+            vec!["libatomic".to_owned()],
+            vec!["sudo dnf install -y libatomic".to_owned()],
+        ),
+        PackageManager::Zypper => (
+            vec!["libatomic1".to_owned()],
+            vec!["sudo zypper install -y libatomic1".to_owned()],
+        ),
+        // Arch ships libatomic inside `gcc-libs`, which is part of the base
+        // install, so there is nothing to install separately.
+        PackageManager::Pacman => (Vec::new(), Vec::new()),
+    };
+
+    if packages.is_empty() {
+        return SystemPackageInstallPlan {
+            supported: false,
+            package_manager: Some(manager.as_str().to_owned()),
+            packages,
+            commands,
+            preflight_checks: Vec::new(),
+            reason: "libatomic ships with the base toolchain on this distribution; no separate install is required.".to_owned(),
+        };
+    }
+
+    SystemPackageInstallPlan {
+        supported: true,
+        package_manager: Some(manager.as_str().to_owned()),
+        packages,
+        commands,
+        preflight_checks: vec![
+            "root access: run as root, or ensure `sudo -v` succeeds before approval".to_owned(),
+            "`sudo` command is available when not running as root".to_owned(),
+            format!("`{}` package manager is available", manager.as_str()),
+        ],
+        reason: "Install the libatomic runtime (libatomic.so.1) that vLLM's ROCm torch wheel links against. Requires root; approve before execution.".to_owned(),
+    }
+}
+
 /// runtime that vLLM requires, for embedding in user-facing error messages.
 ///
 /// On Linux it reads `/etc/os-release` and returns the package-manager command
@@ -433,6 +601,25 @@ pub fn install_hint() -> String {
         }
     }
     "install your distribution's OpenMPI runtime package (providing libmpi.so / libmpi_cxx.so and mpirun)".to_owned()
+}
+
+/// Build a short, distro-aware hint describing how to install the `libatomic`
+/// runtime that vLLM requires, for embedding in user-facing error messages.
+///
+/// On Linux it reads `/etc/os-release` and returns the package-manager command
+/// from [`build_libatomic_install_plan`] when the distribution is recognized,
+/// otherwise a generic instruction. Off Linux it returns a generic message.
+pub fn libatomic_install_hint() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+        let field = |key: &str| parse_os_release_field(&os_release, key).unwrap_or_default();
+        let plan = build_libatomic_install_plan(&field("ID"), &field("ID_LIKE"));
+        if plan.supported && !plan.commands.is_empty() {
+            return format!("install it with `{}`", plan.commands.join(" && "));
+        }
+    }
+    "install your distribution's libatomic runtime package (providing libatomic.so.1)".to_owned()
 }
 
 /// Parse a single `KEY=VALUE` field from `/etc/os-release` contents, stripping
@@ -612,6 +799,37 @@ mod tests {
     fn ldconfig_without_libmpi_returns_none() {
         let output = "\tlibm.so.6 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libm.so.6\n";
         assert_eq!(parse_ldconfig_libmpi(output), None);
+    }
+
+    #[test]
+    fn libatomic_plan_for_rhel_uses_base_package() {
+        let plan = build_libatomic_install_plan("rhel", "fedora");
+        assert!(plan.supported);
+        assert_eq!(plan.package_manager.as_deref(), Some("dnf"));
+        assert_eq!(plan.packages, vec!["libatomic".to_owned()]);
+        assert!(
+            plan.commands
+                .iter()
+                .any(|cmd| cmd == "sudo dnf install -y libatomic"),
+            "expected base libatomic install command: {:?}",
+            plan.commands
+        );
+    }
+
+    #[test]
+    fn libatomic_plan_for_debian_uses_libatomic1() {
+        let plan = build_libatomic_install_plan("ubuntu", "debian");
+        assert_eq!(plan.package_manager.as_deref(), Some("apt"));
+        assert_eq!(plan.packages, vec!["libatomic1".to_owned()]);
+    }
+
+    #[test]
+    fn libatomic_plan_for_arch_is_unsupported_no_op() {
+        // Arch ships libatomic in gcc-libs (base install), so there is nothing
+        // to install separately and the plan is marked unsupported (no-op).
+        let plan = build_libatomic_install_plan("arch", "");
+        assert!(!plan.supported);
+        assert!(plan.commands.is_empty());
     }
 
     #[test]
