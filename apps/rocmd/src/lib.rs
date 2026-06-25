@@ -2389,6 +2389,10 @@ fn ensure_rocm_command_is_read_only(args: &[String]) -> Result<()> {
             .as_deref()
             .is_none_or(|value| matches!(value, "status" | "logs" | "log")),
         Some("uninstall") => args.iter().any(|arg| arg == "--dry-run"),
+        // `setup status` reports first-time setup state (read-only); `setup reset`
+        // re-arms it and is mutating. Mirrors the bin's rocm_command classifier so
+        // the read-only allowlist is consistent across binaries.
+        Some("setup") => second.as_deref().is_none_or(|value| value == "status"),
         _ => false,
     };
     if read_only {
@@ -5160,6 +5164,35 @@ mod tests {
         )?;
         let error = ensure_rocm_command_is_read_only(&shell_args)
             .expect_err("non-rocm shell commands should be rejected");
+        assert!(error.to_string().contains("approval UI"));
+        Ok(())
+    }
+
+    #[test]
+    fn rocm_command_helper_treats_setup_status_as_read_only_and_reset_as_mutating() -> Result<()> {
+        // Mirrors the bin's rocm_command classifier so `setup status` is read-only
+        // on every binary's tool surface while `setup reset` stays approval-gated.
+        let bare_args = normalized_rocm_command_args(
+            serde_json::json!({ "args": ["setup"] })
+                .as_object()
+                .expect("json object"),
+        )?;
+        ensure_rocm_command_is_read_only(&bare_args).expect("bare setup should be read-only");
+
+        let status_args = normalized_rocm_command_args(
+            serde_json::json!({ "args": ["setup", "status"] })
+                .as_object()
+                .expect("json object"),
+        )?;
+        ensure_rocm_command_is_read_only(&status_args).expect("setup status should be read-only");
+
+        let reset_args = normalized_rocm_command_args(
+            serde_json::json!({ "args": ["setup", "reset"] })
+                .as_object()
+                .expect("json object"),
+        )?;
+        let error = ensure_rocm_command_is_read_only(&reset_args)
+            .expect_err("setup reset must go through approval");
         assert!(error.to_string().contains("approval UI"));
         Ok(())
     }
