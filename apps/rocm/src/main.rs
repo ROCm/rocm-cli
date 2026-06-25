@@ -25,9 +25,10 @@ use rocm_core::{
     AppPaths, AuditEventRecord, AutomationEventRecord, AutomationProposalRecord,
     AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot,
     DEFAULT_LOCAL_HOST, ExamineSummary, ManagedServiceRecord, ModelRecipeRecord,
-    ModelRecipeRegistry, ModelRecipeRegistrySource, RocmCliConfig, TELEMETRY_MODE_LOCAL,
-    TELEMETRY_MODE_OFF, WatcherMode, append_audit_event, builtin_model_recipes, builtin_watcher,
-    builtin_watchers, connect_tcp_stream, daemon_binary_path, default_engine_for_platform,
+    ModelRecipeRegistry, ModelRecipeRegistrySource, PERMISSIONS_MODE_ASK,
+    PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF,
+    WatcherMode, append_audit_event, builtin_model_recipes, builtin_watcher, builtin_watchers,
+    connect_tcp_stream, daemon_binary_path, default_engine_for_platform,
     default_interactive_shell_program, engine_binary_path, engine_plugin_dirs, format_host_port,
     format_http_base_url, generate_service_id, interactive_terminal, load_model_recipe_registry,
     load_recent_audit_events, load_recent_automation_events, load_recent_automation_proposals,
@@ -585,6 +586,11 @@ enum ConfigCommand {
         /// Telemetry mode.
         mode: TelemetryModeArg,
     },
+    /// Choose the assistant permissions mode (ask vs full access).
+    SetPermissions {
+        /// Permissions mode.
+        mode: PermissionsModeArg,
+    },
     /// Choose the provider used for ambiguous natural-language plans.
     SetPlannerProvider {
         /// Provider name.
@@ -671,6 +677,21 @@ impl TelemetryModeArg {
         match self {
             Self::Local => TELEMETRY_MODE_LOCAL,
             Self::Off => TELEMETRY_MODE_OFF,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum PermissionsModeArg {
+    FullAccess,
+    Ask,
+}
+
+impl PermissionsModeArg {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::FullAccess => PERMISSIONS_MODE_FULL_ACCESS,
+            Self::Ask => PERMISSIONS_MODE_ASK,
         }
     }
 }
@@ -5504,6 +5525,19 @@ fn config(command: ConfigCommand) -> Result<()> {
             println!("telemetry mode set to {}", mode.as_str());
             println!("  policy: {}", telemetry_policy_summary(&config.telemetry));
         }
+        ConfigCommand::SetPermissions { mode } => {
+            config.permissions.mode = mode.as_str().to_owned();
+            config.save(&paths)?;
+            record_cli_audit_event(
+                &paths,
+                "permissions",
+                "set_mode",
+                "info",
+                format!("permissions mode set to {}", mode.as_str()),
+                None,
+            );
+            println!("permissions mode set to {}", mode.as_str());
+        }
         ConfigCommand::SetPlannerProvider { provider } => {
             let provider = provider_name(provider);
             config.planner_provider = Some(provider.to_owned());
@@ -7134,6 +7168,34 @@ pub(crate) fn chat_tool_approval_request(
                 .map(str::to_owned),
         });
     }
+    // `proposal_action` (approve/reject) executes in-process in
+    // `run_internal_mcp_call` — it has NO CLI argv, so build its approval
+    // request directly rather than through `rocm_chat_tool_requested_args`.
+    if call.name == "proposal_action" {
+        let object = call
+            .arguments
+            .as_object()
+            .context("proposal_action arguments must be a JSON object")?;
+        let proposal_id = json_string(object, "proposal_id")
+            .context("proposal_action requires non-empty `proposal_id`")?;
+        let action =
+            json_string(object, "action").context("proposal_action requires non-empty `action`")?;
+        let pending_title = match action.as_str() {
+            "approve" => "Approve proposal",
+            "reject" => "Reject proposal",
+            other => bail!("proposal_action `{other}` does not require approval"),
+        };
+        return Ok(ChatToolApprovalRequest {
+            pending_title: pending_title.to_owned(),
+            command_title: "Reviews".to_owned(),
+            display_command: Some(format!("proposal {proposal_id}")),
+            args: Vec::new(),
+            explanation: assistant_explanation
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+        });
+    }
     let args = rocm_chat_tool_requested_args(call)
         .with_context(|| format!("ROCm tool `{}` is missing required arguments", call.name))?;
     let (pending_title, command_title) = match call.name.as_str() {
@@ -7184,7 +7246,8 @@ pub(crate) fn validate_chat_tool_call(call: &providers::ChatToolCall) -> Result<
         | "launch_server"
         | "stop_server"
         | "watcher_enable"
-        | "watcher_disable" => {}
+        | "watcher_disable"
+        | "proposal_action" => {}
         other => bail!("local assistant requested unsupported ROCm tool `{other}`"),
     }
     match call.name.as_str() {
@@ -7199,7 +7262,28 @@ pub(crate) fn validate_chat_tool_call(call: &providers::ChatToolCall) -> Result<
         "rocm_command" => validate_chat_rocm_command_tool_call(call)?,
         "watcher_enable" => validate_chat_watcher_tool_call(call, true)?,
         "watcher_disable" => validate_chat_watcher_tool_call(call, false)?,
+        "proposal_action" => validate_chat_proposal_action_tool_call(call)?,
         _ => {}
+    }
+    Ok(())
+}
+
+/// Validate a `proposal_action` chat-tool call: `proposal_id` must be a
+/// non-empty string and `action` must be one of show | approve | reject.
+fn validate_chat_proposal_action_tool_call(call: &providers::ChatToolCall) -> Result<()> {
+    let object = call
+        .arguments
+        .as_object()
+        .context("proposal_action arguments must be a JSON object")?;
+    let proposal_id = json_string(object, "proposal_id")
+        .context("proposal_action requires non-empty `proposal_id`")?;
+    if proposal_id.len() > 128 {
+        bail!("proposal_id too long");
+    }
+    let action =
+        json_string(object, "action").context("proposal_action requires non-empty `action`")?;
+    if !matches!(action.as_str(), "show" | "approve" | "reject") {
+        bail!("proposal_action `action` must be one of show, approve, reject");
     }
     Ok(())
 }
@@ -7297,6 +7381,9 @@ fn validate_chat_watcher_tool_call(call: &providers::ChatToolCall, allow_mode: b
         .as_object()
         .context("watcher tool arguments must be a JSON object")?;
     let watcher = json_string(object, "watcher").context("watcher tool requires `watcher`")?;
+    if watcher.len() > 128 {
+        bail!("watcher id too long");
+    }
     if builtin_watcher(&watcher).is_none() {
         bail!("local assistant requested unknown watcher `{watcher}`");
     }
@@ -7744,6 +7831,16 @@ pub(crate) fn chat_tool_call_is_read_only(call: &providers::ChatToolCall) -> boo
             chat_rocm_command_action(call),
             Ok(ChatRocmCommandAction::ReadOnly(_))
         );
+    }
+    // `proposal_action` is read-only only when showing a proposal; approve/reject
+    // mutate the proposal status and must route through approval.
+    if call.name == "proposal_action" {
+        return call
+            .arguments
+            .as_object()
+            .and_then(|object| json_string(object, "action"))
+            .as_deref()
+            == Some("show");
     }
     matches!(
         call.name.as_str(),
@@ -8518,6 +8615,68 @@ pub(crate) fn run_internal_mcp_call(
             ))
         }
         "path_exists" => run_chat_path_exists_tool(&call),
+        "proposal_action" => {
+            // Executes IN-PROCESS (no CLI subprocess): show loads a proposal;
+            // approve/reject mutate its status (allow_mutation already enforced
+            // by the read-only split above). proposal_action executes in-process
+            // (via update_automation_proposal_status); it never delegates to the
+            // subprocess arm.
+            let proposal_id = json_string(&arguments, "proposal_id")
+                .context("proposal_action requires `proposal_id`")?;
+            let action =
+                json_string(&arguments, "action").context("proposal_action requires `action`")?;
+            match action.as_str() {
+                "show" => {
+                    let proposal = rocm_core::find_automation_proposal(paths, &proposal_id)
+                        .with_context(|| {
+                            format!("automation proposal `{proposal_id}` not found")
+                        })?;
+                    Ok(internal_mcp_tool_success(
+                        format!(
+                            "Proposal {} ({}): {}",
+                            proposal.proposal_id, proposal.status, proposal.title
+                        ),
+                        serde_json::json!({
+                            "id": proposal.proposal_id,
+                            "status": proposal.status,
+                            "summary": proposal.title,
+                            "reason": proposal.message,
+                        }),
+                    ))
+                }
+                "approve" | "reject" => {
+                    let status = if action == "approve" {
+                        "approved"
+                    } else {
+                        "rejected"
+                    };
+                    let updated =
+                        rocm_core::update_automation_proposal_status(paths, &proposal_id, status)?;
+                    record_cli_audit_event(
+                        paths,
+                        "automations",
+                        if action == "approve" {
+                            "proposal_approved"
+                        } else {
+                            "proposal_rejected"
+                        },
+                        "info",
+                        format!("proposal {proposal_id} {status}"),
+                        None,
+                    );
+                    Ok(internal_mcp_tool_success(
+                        format!("Proposal {proposal_id} {status}."),
+                        serde_json::json!({
+                            "id": updated.proposal_id,
+                            "status": updated.status,
+                            "summary": updated.title,
+                            "reason": updated.message,
+                        }),
+                    ))
+                }
+                other => bail!("proposal_action `{other}` is not supported"),
+            }
+        }
         "install_sdk" | "install_engine" | "launch_server" | "stop_server" | "watcher_enable"
         | "watcher_disable" => {
             let args = rocm_chat_tool_requested_args(&call)
@@ -15603,6 +15762,21 @@ mod tests {
     }
 
     #[test]
+    fn proposal_action_rejects_over_long_proposal_id() {
+        let call = providers::ChatToolCall {
+            id: None,
+            name: "proposal_action".to_owned(),
+            arguments: serde_json::json!({
+                "proposal_id": "p".repeat(129),
+                "action": "show"
+            }),
+        };
+        let err = validate_chat_proposal_action_tool_call(&call)
+            .expect_err("over-long proposal_id must be rejected");
+        assert!(err.to_string().contains("proposal_id too long"));
+    }
+
+    #[test]
     fn chat_tool_call_accepts_expanded_read_only_bridge_tools() {
         for call in [
             providers::ChatToolCall {
@@ -16062,6 +16236,256 @@ model recipes
                 panic!("setup reset should require approval, got {other:?}")
             }
         }
+    }
+
+    #[test]
+    fn proposal_action_show_is_read_only() {
+        let call = providers::ChatToolCall {
+            id: None,
+            name: "proposal_action".to_owned(),
+            arguments: serde_json::json!({ "proposal_id": "p1", "action": "show" }),
+        };
+        validate_chat_tool_call(&call).expect("show validates");
+        assert!(
+            chat_tool_call_is_read_only(&call),
+            "proposal_action show must be read-only"
+        );
+    }
+
+    #[test]
+    fn proposal_action_approve_requires_approval() {
+        for action in ["approve", "reject"] {
+            let call = providers::ChatToolCall {
+                id: None,
+                name: "proposal_action".to_owned(),
+                arguments: serde_json::json!({ "proposal_id": "p1", "action": action }),
+            };
+            validate_chat_tool_call(&call).expect("approve/reject validates");
+            assert!(
+                !chat_tool_call_is_read_only(&call),
+                "proposal_action {action} must NOT be read-only"
+            );
+            let req = chat_tool_approval_request(&call, None).unwrap_or_else(|err| {
+                panic!("proposal_action {action} should need approval: {err}")
+            });
+            assert_eq!(req.command_title, "Reviews");
+            assert!(
+                req.pending_title.contains("proposal") || req.pending_title.contains("Proposal")
+            );
+            assert!(
+                req.display_command
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("p1"),
+                "display command should show the proposal id"
+            );
+        }
+    }
+
+    #[test]
+    fn proposal_action_rejects_unknown_action() {
+        let call = providers::ChatToolCall {
+            id: None,
+            name: "proposal_action".to_owned(),
+            arguments: serde_json::json!({ "proposal_id": "p1", "action": "delete" }),
+        };
+        assert!(
+            validate_chat_tool_call(&call).is_err(),
+            "unknown proposal_action `action` must be rejected"
+        );
+    }
+
+    #[test]
+    fn proposal_action_approve_updates_status() {
+        let (root, paths) = test_paths("proposal-approve");
+        // Seed a pending proposal.
+        let proposal = rocm_core::AutomationProposalRecord {
+            at_unix_ms: rocm_core::unix_time_millis(),
+            proposal_id: "prop-approve-1".to_owned(),
+            watcher_id: "therock-update".to_owned(),
+            action: "prepare_driver_plan".to_owned(),
+            title: "Apply driver plan".to_owned(),
+            message: "A reviewed driver plan is ready.".to_owned(),
+            status: "pending".to_owned(),
+            service_id: None,
+            tool: None,
+            arguments: serde_json::Value::Null,
+            reviewed_at_unix_ms: None,
+        };
+        rocm_core::append_automation_proposal(&paths, &proposal).expect("seed proposal");
+
+        // show is read-only and returns the proposal.
+        let shown = run_internal_mcp_call(
+            &paths,
+            "proposal_action",
+            serde_json::json!({ "proposal_id": "prop-approve-1", "action": "show" }),
+            false,
+        )
+        .expect("show ok");
+        assert_eq!(shown["structuredContent"]["status"], "pending");
+
+        // approve requires allow_mutation.
+        assert!(
+            run_internal_mcp_call(
+                &paths,
+                "proposal_action",
+                serde_json::json!({ "proposal_id": "prop-approve-1", "action": "approve" }),
+                false,
+            )
+            .is_err(),
+            "approve without allow_mutation must bail"
+        );
+
+        // approve with allow_mutation sets status to approved.
+        let approved = run_internal_mcp_call(
+            &paths,
+            "proposal_action",
+            serde_json::json!({ "proposal_id": "prop-approve-1", "action": "approve" }),
+            true,
+        )
+        .expect("approve ok");
+        assert_eq!(approved["structuredContent"]["status"], "approved");
+        let stored = rocm_core::find_automation_proposal(&paths, "prop-approve-1")
+            .expect("proposal still present");
+        assert_eq!(stored.status, "approved");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn proposal_action_reject_updates_status() {
+        let (root, paths) = test_paths("proposal-reject");
+        let proposal = rocm_core::AutomationProposalRecord {
+            at_unix_ms: rocm_core::unix_time_millis(),
+            proposal_id: "prop-reject-1".to_owned(),
+            watcher_id: "server-recover".to_owned(),
+            action: "queue_stop_server_proposal".to_owned(),
+            title: "Stop overheating server".to_owned(),
+            message: "GPU thermal pressure detected.".to_owned(),
+            status: "pending".to_owned(),
+            service_id: None,
+            tool: None,
+            arguments: serde_json::Value::Null,
+            reviewed_at_unix_ms: None,
+        };
+        rocm_core::append_automation_proposal(&paths, &proposal).expect("seed proposal");
+
+        let rejected = run_internal_mcp_call(
+            &paths,
+            "proposal_action",
+            serde_json::json!({ "proposal_id": "prop-reject-1", "action": "reject" }),
+            true,
+        )
+        .expect("reject ok");
+        assert_eq!(rejected["structuredContent"]["status"], "rejected");
+        let stored = rocm_core::find_automation_proposal(&paths, "prop-reject-1")
+            .expect("proposal still present");
+        assert_eq!(stored.status, "rejected");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn proposal_action_show_missing_proposal_errors() {
+        let (root, paths) = test_paths("proposal-missing");
+        assert!(
+            run_internal_mcp_call(
+                &paths,
+                "proposal_action",
+                serde_json::json!({ "proposal_id": "nope", "action": "show" }),
+                false,
+            )
+            .is_err(),
+            "showing a missing proposal must error"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn config_set_permissions_classifies_as_approval() {
+        // Permission escalation MUST route through approval — the classifier
+        // routes any `config <sub>` (catch-all) to Approval. Verify both modes.
+        for mode in ["full_access", "ask"] {
+            let action = chat_rocm_command_action_from_args(vec![
+                "config".to_owned(),
+                "set-permissions".to_owned(),
+                mode.to_owned(),
+            ])
+            .expect("config set-permissions classifies");
+            match action {
+                ChatRocmCommandAction::Approval { command_title, .. } => {
+                    assert_eq!(command_title, "Config");
+                }
+                other @ ChatRocmCommandAction::ReadOnly(_) => {
+                    panic!("config set-permissions {mode} must need approval, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn config_set_permissions_sets_mode() {
+        // The SetPermissions handler logic: set permissions.mode, save, reload.
+        let (root, paths) = test_paths("config-permissions");
+        let mut config = RocmCliConfig::load(&paths).expect("load default config");
+        assert_eq!(config.permissions.mode_label(), PERMISSIONS_MODE_ASK);
+        // Mirror the SetPermissions handler mutation.
+        config.permissions.mode = PermissionsModeArg::FullAccess.as_str().to_owned();
+        config.save(&paths).expect("save config");
+        let reloaded = RocmCliConfig::load(&paths).expect("reload config");
+        assert_eq!(
+            reloaded.permissions.mode_label(),
+            PERMISSIONS_MODE_FULL_ACCESS
+        );
+        assert!(reloaded.permissions.full_access_enabled());
+        // And back to ask.
+        let mut config = reloaded;
+        config.permissions.mode = PermissionsModeArg::Ask.as_str().to_owned();
+        config.save(&paths).expect("save config");
+        let reloaded = RocmCliConfig::load(&paths).expect("reload config");
+        assert_eq!(reloaded.permissions.mode_label(), PERMISSIONS_MODE_ASK);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn watcher_validator_rejects_unknown_and_invalid_mode() {
+        // Unknown watcher id → rejected.
+        let unknown = providers::ChatToolCall {
+            id: None,
+            name: "watcher_enable".to_owned(),
+            arguments: serde_json::json!({ "watcher": "no-such-watcher" }),
+        };
+        assert!(
+            validate_chat_watcher_tool_call(&unknown, true).is_err(),
+            "unknown watcher must be rejected"
+        );
+        // Invalid mode → rejected.
+        let bad_mode = providers::ChatToolCall {
+            id: None,
+            name: "watcher_enable".to_owned(),
+            arguments: serde_json::json!({ "watcher": "therock-update", "mode": "rampage" }),
+        };
+        assert!(
+            validate_chat_watcher_tool_call(&bad_mode, true).is_err(),
+            "invalid watcher mode must be rejected"
+        );
+        // Valid watcher + valid mode → accepted.
+        let ok = providers::ChatToolCall {
+            id: None,
+            name: "watcher_enable".to_owned(),
+            arguments: serde_json::json!({ "watcher": "therock-update", "mode": "observe" }),
+        };
+        validate_chat_watcher_tool_call(&ok, true).expect("valid watcher+mode accepted");
+        // Disable must reject a `mode`.
+        let disable_with_mode = providers::ChatToolCall {
+            id: None,
+            name: "watcher_disable".to_owned(),
+            arguments: serde_json::json!({ "watcher": "therock-update", "mode": "observe" }),
+        };
+        assert!(
+            validate_chat_watcher_tool_call(&disable_with_mode, false).is_err(),
+            "disable must reject a mode argument"
+        );
     }
 
     #[test]
