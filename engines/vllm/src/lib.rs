@@ -446,9 +446,10 @@ fn vllm_runtime_warnings(runtime: &VllmRuntime) -> Vec<String> {
         "vLLM serving remains ROCm GPU required; no CPU fallback is used".to_owned(),
     ];
     if !cfg!(windows) && !rocm_core::openmpi::detect_openmpi().present {
-        warnings.push(
-            "OpenMPI runtime (libmpi.so / mpirun) was not found; vLLM requires it. Install it via your system package manager (for example `sudo apt-get install -y libopenmpi3 openmpi-bin`) or rerun `rocm engines install vllm --yes`.".to_owned(),
-        );
+        warnings.push(format!(
+            "OpenMPI runtime (libmpi.so / libmpi_cxx.so / mpirun) was not found; vLLM requires it. {}, or rerun `rocm engines install vllm --yes`.",
+            rocm_core::openmpi::install_hint()
+        ));
     }
     warnings
 }
@@ -607,6 +608,20 @@ fn spawn_vllm_server(
     require_nonempty(&request.model_ref, "model_ref")?;
     if !matches!(request.device_policy, DevicePolicy::GpuRequired) {
         bail!("vLLM launch requires ROCm GPU execution; no CPU fallback is used");
+    }
+
+    // Fail fast when the OpenMPI runtime is missing. vLLM's ROCm torch wheel
+    // dlopen()s the OpenMPI libraries during `import torch`; without them the
+    // process dies with the cryptic `libmpi_cxx.so.40: cannot open shared object
+    // file` error from deep inside torch. Surface a clear, actionable message
+    // here instead so the user knows exactly what to install.
+    if !cfg!(windows) && !rocm_core::openmpi::detect_openmpi().present {
+        bail!(
+            "vLLM requires the OpenMPI runtime (libmpi.so / libmpi_cxx.so and mpirun), which was not found; \
+without it `import torch` fails with `libmpi_cxx.so.40: cannot open shared object file`. \
+{}, or run `rocm engines install vllm --yes` to install it automatically, then retry.",
+            rocm_core::openmpi::install_hint()
+        );
     }
 
     if let Some(parent) = request.state_path.parent() {
@@ -1232,8 +1247,41 @@ fn therock_library_path_entries(runtime: &VllmRuntime) -> Vec<PathBuf> {
         // (notably RHEL-family under /usr/lib64/openmpi/lib); make sure vLLM can
         // load libmpi.so at launch when it lives there.
         entries.extend(rocm_core::openmpi::openmpi_library_dirs());
+
+        // PyTorch's `libtorch_global_deps.so` lists `libmpi_cxx.so.40` as a
+        // NEEDED dependency, but OpenMPI 5.x removed the legacy C++ bindings, so
+        // `import torch` aborts with `libmpi_cxx.so.40: cannot open shared object
+        // file`. When no real `libmpi_cxx.so*` exists, create a compatibility
+        // symlink to the real `libmpi.so*` in a runtime-owned directory and add
+        // it to the loader path. The shimmed library is never called into (the
+        // stub only preloads MPI), so this is safe.
+        if let Some(compat_dir) = openmpi_cxx_compat_dir(runtime)
+            && let Some(dir) = rocm_core::openmpi::ensure_mpi_cxx_compat(&compat_dir)
+        {
+            entries.push(dir);
+        }
     }
     dedupe_paths(entries)
+}
+
+/// A writable, runtime-owned directory for the OpenMPI C++ bindings
+/// compatibility shim (see [`therock_library_path_entries`]). Prefers the
+/// managed Python environment root (`<env>/bin/python` -> `<env>`); falls back to
+/// the SDK root when no Python launcher is recorded.
+fn openmpi_cxx_compat_dir(runtime: &VllmRuntime) -> Option<PathBuf> {
+    const COMPAT_DIR_NAME: &str = "openmpi-cxx-compat";
+    if let Some(env_root) = runtime
+        .python_executable
+        .as_ref()
+        .and_then(|python| python.parent())
+        .and_then(|bin| bin.parent())
+    {
+        return Some(env_root.join(COMPAT_DIR_NAME));
+    }
+    runtime
+        .sdk_root
+        .as_ref()
+        .map(|root| root.join(COMPAT_DIR_NAME))
 }
 
 fn dedupe_paths(entries: Vec<PathBuf>) -> Vec<PathBuf> {
