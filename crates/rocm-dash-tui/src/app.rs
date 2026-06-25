@@ -1523,6 +1523,12 @@ fn build_chat_agent(
         // Local is rebuilt by the caller's inline path (it needs the live probe).
         ChatProvider::Local => None,
         ChatProvider::Openai => {
+            // Require a real key. Without this, `RigAgentClient::new` falls back to
+            // a dummy `sk-no-key` bearer and still builds, so the switch reports
+            // success and then 401s at request time. Returning `None` here makes
+            // the caller surface an actionable error and stay on the current
+            // backend instead of switching to a dead one.
+            let api_key = args.chat_api_key.clone().filter(|k| !k.trim().is_empty())?;
             let cfg = crate::llm::LlmConfig {
                 base_url: OPENAI_BASE_URL.to_string(),
                 model: args
@@ -1530,7 +1536,7 @@ fn build_chat_agent(
                     .clone()
                     .filter(|m| !m.is_empty())
                     .unwrap_or_else(|| OPENAI_DEFAULT_MODEL.to_string()),
-                api_key: args.chat_api_key.clone(),
+                api_key: Some(api_key),
                 auth_header: None,
             };
             crate::agent::RigAgentClient::new(cfg, executor, Some(approval_tx))
@@ -2038,8 +2044,12 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                             .push(ChatTurn::agent(format!("switched to {}", target.label())));
                     } else {
                         // Revert the optimistic `active_provider` set by the
-                        // slash handler so the displayed provider stays honest.
+                        // slash handler so the displayed provider stays honest, and
+                        // reset the live `agent` to local too — otherwise a failed
+                        // switch from a remote backend would leave requests routed
+                        // to the old remote while the UI claims "local".
                         state.active_provider = ChatProvider::Local;
+                        agent = local_agent.clone();
                         let hint = if target == ChatProvider::Anthropic {
                             "anthropic requires ANTHROPIC_API_KEY in env or secure store"
                         } else {
@@ -3846,6 +3856,24 @@ mod tests {
         let args = args_with_anthropic_key(None);
         let agent = build_chat_agent(ChatProvider::Anthropic, &args, None, tx);
         assert!(agent.is_none(), "anthropic without a key does not build");
+    }
+
+    #[test]
+    fn build_chat_agent_openai_requires_key() {
+        // No OpenAI key → None. Without this gate the factory would build a dummy
+        // `sk-no-key` backend that 401s at request time, so the switch reports
+        // success then fails. With a key → Some (construction only, no network).
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut args = args_with_anthropic_key(None);
+        assert!(
+            build_chat_agent(ChatProvider::Openai, &args, None, tx.clone()).is_none(),
+            "openai without a key must not build a dead backend"
+        );
+        args.chat_api_key = Some("sk-real-key".to_string());
+        assert!(
+            build_chat_agent(ChatProvider::Openai, &args, None, tx).is_some(),
+            "openai builds with a key"
+        );
     }
 
     #[test]
