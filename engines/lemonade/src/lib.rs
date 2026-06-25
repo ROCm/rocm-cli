@@ -459,7 +459,10 @@ fn lemonade_rocm_channel(rocm_cli_channel: &str) -> Option<&'static str> {
 /// own default is then left untouched).
 fn align_lemonade_rocm_channel(manifest: &LemonadeInstallManifest) -> Result<Option<&'static str>> {
     let paths = AppPaths::discover()?;
-    let config = RocmCliConfig::load(&paths).unwrap_or_default();
+    // Don't fall back to a default config here: an empty config would discard the active
+    // runtime key and let channel selection guess the most-recent runtime, then mutate
+    // Lemonade based on that guess. Surface the error so the caller leaves defaults untouched.
+    let config = RocmCliConfig::load(&paths)?;
     let Some(rocm_cli_channel) = active_managed_therock_channel(&paths, &config)? else {
         return Ok(None);
     };
@@ -498,10 +501,16 @@ fn run_lemonade_config_set(
         .output()
         .with_context(|| format!("failed to run {}", manifest.lemonade.display()))?;
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
         bail!(
-            "Lemonade config set {key}={value} failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            "Lemonade config set {key}={value} failed ({}): {detail}",
+            output.status
         );
     }
     Ok(())
