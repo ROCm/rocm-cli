@@ -25,7 +25,7 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
-    needs: [fmt, clippy]
+    needs: [clippy, prek]
     steps:
       - uses: actions/checkout@v6
 
@@ -68,7 +68,7 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
-    needs: [fmt, clippy]
+    needs: [clippy, prek]
     steps:
       - uses: actions/checkout@v6
 
@@ -116,17 +116,34 @@ jobs:
         shell: pwsh
         run: .\scripts\acceptance-install-upgrade-tui-uninstall.ps1
 
-  fmt:
+  prek:
+    # The fast lint gate: every toolchain-light lint/hygiene check, run from the
+    # single source of truth in .pre-commit-config.yaml — hygiene + Python (ruff)
+    # + Shell (shellcheck) + cargo fmt (rustfmt only, no compile).
+    # `--no-group local-tools` skips the hooks that need a full Rust compile,
+    # hawkeye, or PowerShell — those have their own jobs (clippy, build-and-test,
+    # license-headers, powershell-lint).
+    name: prek (lint / hygiene)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
+      # cargo-fmt hook needs rustfmt (no build).
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          components: rustfmt
           cache: false
 
-      - name: Check formatting
-        run: cargo fmt --all --check
+      # Supply-chain hardening: the action is pinned to a commit SHA and prek to
+      # an exact version. The action ships a hardcoded SHA-256 checksum map
+      # (src/known-checksums.ts) and verifies the downloaded prek archive against
+      # it, so a tampered release can't be installed. This commit is past the
+      # v2.0.4 tag because it is the one that added prek 0.4.5 to that map — pin
+      # an earlier commit and the action would not know 0.4.5 and skip the check.
+      - uses: j178/prek-action@dec4adcd2fa1db9d50a39668b22112a37235e730 # prek 0.4.5 checksums
+        with:
+          prek-version: 0.4.5
+          extra-args: --all-files --no-group local-tools
 
   clippy:
     runs-on: ubuntu-latest
@@ -181,41 +198,35 @@ jobs:
             -p rocm-dash-daemon -p rocm-dash-tui \
             --fail-under-lines 70
 
-  lint:
-    name: Lint (Python / Shell / PowerShell)
-    runs-on: ubuntu-latest
+  powershell-lint:
+    # Runs the prek `powershell-script-analyzer` hook's logic (cargo xtask
+    # powershell-lint) under BOTH PowerShell editions. windows-latest is the only
+    # runner with Windows PowerShell 5.1 (`powershell`); it also ships PowerShell
+    # 7 (`pwsh`). Kept separate from windows-build-and-test so it runs in parallel
+    # rather than behind that slow job.
+    name: Lint (PowerShell)
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
 
-      - name: Ruff (lint + format)
-        uses: astral-sh/ruff-action@v3
-        with:
-          version: 0.15.16
-          args: check scripts engines
-      - name: Ruff format check
-        uses: astral-sh/ruff-action@v3
-        with:
-          version: 0.15.16
-          args: format --check scripts engines
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
 
-      - name: ShellCheck (all optional checks)
-        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38 # v2.0.0
-        env:
-          SHELLCHECK_OPTS: --enable=all --exclude=SC2310,SC2312
-        with:
-          scandir: '.'
-          ignore_paths: third_party
-
-      - name: PSScriptAnalyzer
+      - name: Install PSScriptAnalyzer (PowerShell 7)
         shell: pwsh
+        run: Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -RequiredVersion 1.25.0
+
+      - name: Install PSScriptAnalyzer (Windows PowerShell 5.1)
+        shell: powershell
         run: |
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
           Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -RequiredVersion 1.25.0
-          $files = Get-ChildItem -Recurse -Filter *.ps1 |
-            Where-Object { $_.FullName -notmatch 'third_party' }
-          $findings = $files | ForEach-Object {
-            Invoke-ScriptAnalyzer -Path $_.FullName -Settings ./PSScriptAnalyzerSettings.psd1
-          }
-          if ($findings) { $findings | Format-Table -AutoSize; exit 1 }
+
+      - name: PSScriptAnalyzer (PowerShell 7)
+        run: cargo xtask powershell-lint --shell pwsh
+
+      - name: PSScriptAnalyzer (Windows PowerShell 5.1)
+        run: cargo xtask powershell-lint --shell powershell
 
   license-headers:
     name: License header check (hawkeye)
