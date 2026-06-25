@@ -824,8 +824,9 @@ impl AppState {
             // mutating paths classify as ApprovalRequired and open the Phase-4 modal.
             "update" => {
                 // `/update` reports available updates (read-only); `/update --apply`
-                // (or `/update apply`) applies them (approval-gated).
-                let apply = matches!(rest.split_whitespace().nth(1), Some("--apply" | "apply"));
+                // applies them (approval-gated). The mutating trigger is the
+                // dash flag only, matching `/uninstall --apply` and `rocm update --apply`.
+                let apply = rest.split_whitespace().nth(1) == Some("--apply");
                 let argv: Vec<&str> = if apply {
                     vec!["update", "--apply"]
                 } else {
