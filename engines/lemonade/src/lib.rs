@@ -5,10 +5,10 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use rocm_core::{
-    AppPaths, DEFAULT_LOCAL_PORT, RocmCliConfig, active_managed_therock_environment,
-    download_file_to_path, format_host_port, format_http_base_url, http_get_text,
-    normalize_runtime_path_for_host, prepend_runtime_paths, require_nonempty, runtime_is_linux,
-    runtime_is_windows,
+    AppPaths, DEFAULT_LOCAL_PORT, RocmCliConfig, active_managed_therock_channel,
+    active_managed_therock_environment, download_file_to_path, format_host_port,
+    format_http_base_url, http_get_text, normalize_runtime_path_for_host, prepend_runtime_paths,
+    require_nonempty, runtime_is_linux, runtime_is_windows,
 };
 use rocm_engine_protocol::{
     DetectRequest, DetectResponse, DevicePolicy, ENGINE_RECIPE_CONTRACT_VERSION, EndpointRequest,
@@ -396,9 +396,33 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
         .as_deref()
         .map(normalize_runtime_path_for_host);
     let mut manifest = prepare_embeddable(&paths, env_root.as_deref(), request.reinstall)?;
+    // Align Lemonade's ROCm backend channel with the ROCm the user installed via rocm-cli
+    // before backend selection, so the backend is pulled from the matching channel. This is
+    // best-effort: a failure here must not abort the engine install.
+    let aligned_channel = match align_lemonade_rocm_channel(&manifest) {
+        Ok(channel) => channel,
+        Err(error) => {
+            eprintln!(
+                "Warning: could not align Lemonade ROCm channel with installed ROCm: {error:#}"
+            );
+            None
+        }
+    };
     eprintln!("Detecting best supported Lemonade llama.cpp backend...");
     install_best_llamacpp_backend(&mut manifest)?;
     write_manifest(&paths, &manifest)?;
+    let mut warnings = vec![
+        "Lemonade is installed as a rocm-cli managed embeddable runtime".to_owned(),
+        format!(
+            "Selected the best supported llama.cpp backend for this GPU: {}:{}",
+            manifest.backend_recipe, manifest.backend_name
+        ),
+    ];
+    if let Some(channel) = aligned_channel {
+        warnings.push(format!(
+            "Set Lemonade ROCm channel to `{channel}` to match the installed ROCm"
+        ));
+    }
     Ok(InstallResponse {
         env_id: manifest.env_id.clone(),
         env_path: manifest.runtime_dir.display().to_string(),
@@ -415,14 +439,72 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
         ],
         capabilities: capabilities(),
         lock_hash: manifest_lock_hash(&manifest),
-        warnings: vec![
-            "Lemonade is installed as a rocm-cli managed embeddable runtime".to_owned(),
-            format!(
-                "Selected the best supported llama.cpp backend for this GPU: {}:{}",
-                manifest.backend_recipe, manifest.backend_name
-            ),
-        ],
+        warnings,
     })
+}
+
+/// Map a rocm-cli SDK channel (`release`/`nightly`) to Lemonade's `rocm_channel`
+/// (`stable`/`nightly`). Returns `None` for channels with no Lemonade equivalent.
+fn lemonade_rocm_channel(rocm_cli_channel: &str) -> Option<&'static str> {
+    match rocm_cli_channel.trim().to_ascii_lowercase().as_str() {
+        "release" => Some("stable"),
+        "nightly" => Some("nightly"),
+        _ => None,
+    }
+}
+
+/// Point Lemonade's ROCm backend at the channel the user installed via rocm-cli, keeping the
+/// backend binary at Lemonade's tested default (`builtin`). Returns the Lemonade channel that
+/// was applied, or `None` when there is no rocm-cli-managed ROCm runtime to mirror (Lemonade's
+/// own default is then left untouched).
+fn align_lemonade_rocm_channel(manifest: &LemonadeInstallManifest) -> Result<Option<&'static str>> {
+    let paths = AppPaths::discover()?;
+    let config = RocmCliConfig::load(&paths).unwrap_or_default();
+    let Some(rocm_cli_channel) = active_managed_therock_channel(&paths, &config)? else {
+        return Ok(None);
+    };
+    let Some(lemonade_channel) = lemonade_rocm_channel(&rocm_cli_channel) else {
+        return Ok(None);
+    };
+    let process_env = lemonade_process_environment()?;
+    run_lemonade_config_set(manifest, "rocm_channel", lemonade_channel, &process_env)?;
+    run_lemonade_config_set(manifest, "llamacpp.rocm_bin", "builtin", &process_env)?;
+    Ok(Some(lemonade_channel))
+}
+
+fn lemonade_config_set_args(key: &str, value: &str) -> Vec<String> {
+    vec![
+        "config".to_owned(),
+        "set".to_owned(),
+        format!("{key}={value}"),
+    ]
+}
+
+fn run_lemonade_config_set(
+    manifest: &LemonadeInstallManifest,
+    key: &str,
+    value: &str,
+    process_env: &LemonadeProcessEnvironment,
+) -> Result<()> {
+    let mut command = ProcessCommand::new(&manifest.lemonade);
+    command
+        .args(lemonade_config_set_args(key, value))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    apply_lemonade_process_environment(&mut command, process_env)?;
+    hide_child_console_window(&mut command);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run {}", manifest.lemonade.display()))?;
+    if !output.status.success() {
+        bail!(
+            "Lemonade config set {key}={value} failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelResponse> {
@@ -2272,6 +2354,27 @@ mod tests {
                 "vulkan",
                 "--save-options",
             ]
+        );
+    }
+
+    #[test]
+    fn rocm_cli_channel_maps_to_lemonade_channel() {
+        assert_eq!(lemonade_rocm_channel("release"), Some("stable"));
+        assert_eq!(lemonade_rocm_channel("RELEASE"), Some("stable"));
+        assert_eq!(lemonade_rocm_channel(" nightly "), Some("nightly"));
+        assert_eq!(lemonade_rocm_channel("preview"), None);
+        assert_eq!(lemonade_rocm_channel(""), None);
+    }
+
+    #[test]
+    fn lemonade_config_set_builds_key_value_arg() {
+        assert_eq!(
+            lemonade_config_set_args("rocm_channel", "nightly"),
+            vec!["config", "set", "rocm_channel=nightly"]
+        );
+        assert_eq!(
+            lemonade_config_set_args("llamacpp.rocm_bin", "builtin"),
+            vec!["config", "set", "llamacpp.rocm_bin=builtin"]
         );
     }
 

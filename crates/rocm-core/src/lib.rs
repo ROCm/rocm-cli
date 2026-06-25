@@ -2356,10 +2356,31 @@ pub fn active_managed_therock_environment(
     paths: &AppPaths,
     config: &RocmCliConfig,
 ) -> Result<Option<ManagedRuntimeEnvironment>> {
+    Ok(select_active_managed_therock_record(paths, config)
+        .map(|record| managed_therock_environment_from_record(&record)))
+}
+
+/// Channel (`"release"`/`"nightly"`) of the active managed TheRock runtime.
+///
+/// Reflects the channel recorded at install time. Returns `None` when there is no managed
+/// runtime (system or legacy ROCm) or the registry record predates channel recording.
+pub fn active_managed_therock_channel(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> Result<Option<String>> {
+    Ok(select_active_managed_therock_record(paths, config).and_then(|record| record.channel))
+}
+
+/// Pick the active managed TheRock runtime record: the one matching
+/// `config.active_runtime_key`, falling back to the most recently installed.
+fn select_active_managed_therock_record(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> Option<TheRockFamilyManifest> {
     let registry_dir = paths.data_dir.join("runtimes").join("registry");
     let mut records = managed_therock_environment_records(&registry_dir);
     if records.is_empty() {
-        return Ok(None);
+        return None;
     }
 
     if let Some(active_key) = config.active_runtime_key.as_deref()
@@ -2374,13 +2395,11 @@ pub fn active_managed_therock_environment(
                     .is_some_and(|id| id.eq_ignore_ascii_case(active_key))
         })
     {
-        return Ok(Some(managed_therock_environment_from_record(record)));
+        return Some(record.clone());
     }
 
     records.sort_by_key(|(_, record)| std::cmp::Reverse(record.installed_at_unix_ms.unwrap_or(0)));
-    Ok(records
-        .first()
-        .map(|(_, record)| managed_therock_environment_from_record(record)))
+    records.into_iter().next().map(|(_, record)| record)
 }
 
 pub fn prepend_runtime_paths(
@@ -2601,7 +2620,7 @@ fn newer_therock_family(
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct TheRockFamilyManifest {
     #[serde(default)]
     runtime_key: Option<String>,
@@ -2611,6 +2630,8 @@ struct TheRockFamilyManifest {
     family: Option<String>,
     #[serde(default)]
     therock_family: Option<String>,
+    #[serde(default)]
+    channel: Option<String>,
     #[serde(default)]
     rocm_sdk: Option<TheRockSdkProbeManifest>,
     #[serde(default)]
@@ -6592,6 +6613,40 @@ Class Name:                Display
         )?;
 
         assert_eq!(detect_managed_therock_sdk_gfx_target(&paths), None);
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn active_managed_therock_channel_reads_recorded_channel() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-therock-channel");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        fs::write(
+            registry.join("runtime.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "runtime_id": "therock-nightly:gfx120X-all",
+                "family": "gfx120X-all",
+                "channel": "nightly",
+                "installed_at_unix_ms": 10,
+                "rocm_sdk": { "import_ok": true }
+            }))?,
+        )?;
+
+        let config = RocmCliConfig::default();
+        assert_eq!(
+            active_managed_therock_channel(&paths, &config)?,
+            Some("nightly".to_owned())
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn active_managed_therock_channel_is_none_without_runtime() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-therock-channel-none");
+        let config = RocmCliConfig::default();
+        assert_eq!(active_managed_therock_channel(&paths, &config)?, None);
         fs::remove_dir_all(root).ok();
         Ok(())
     }
