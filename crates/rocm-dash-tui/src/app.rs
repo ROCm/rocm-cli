@@ -1158,6 +1158,17 @@ impl AppState {
             && !action.has_placeholders
             && !action.provider_assisted
         {
+            // `/plan` drains off-thread without setting `chat_sending`, so a slash
+            // command issued while the plan was in flight may already have queued a
+            // tool request or opened an approval. Don't clobber it — surface a
+            // message and drop the plan's action (mirrors `open_approval`'s
+            // single-in-flight guard).
+            if self.slash_tool.is_some() || self.approval.is_some() {
+                self.chat.push(ChatTurn::error(
+                    "A command is already in progress; the planned action was discarded. Resolve it first, then re-run the plan.",
+                ));
+                return;
+            }
             self.slash_tool = Some(SlashToolRequest {
                 name: "rocm_command".to_string(),
                 args: serde_json::json!({ "args": action.args }),
@@ -3570,6 +3581,30 @@ mod tests {
             req.args["args"],
             serde_json::json!(["install", "sdk", "--prefix", "/x"])
         );
+    }
+
+    #[test]
+    fn on_plan_ready_guards_against_pending_slash_tool() {
+        let mut s = st();
+        // A slash command queued a tool request while the plan computed off-thread.
+        s.slash_tool = Some(SlashToolRequest {
+            name: "rocm_command".to_string(),
+            args: serde_json::json!({ "args": ["services", "list"] }),
+            label: "pending".to_string(),
+        });
+        let action = PlannedAction {
+            args: vec!["update".to_string()],
+            approval_required: true,
+            has_placeholders: false,
+            provider_assisted: false,
+        };
+        s.on_plan_ready("the plan".to_string(), Some(action));
+        // The in-flight request is NOT clobbered…
+        let req = s.slash_tool.as_ref().expect("pending request preserved");
+        assert_eq!(req.label, "pending");
+        assert_eq!(req.args["args"], serde_json::json!(["services", "list"]));
+        // …and the user is told the planned action was discarded.
+        assert_eq!(s.chat.last().unwrap().role, ChatRole::Error);
     }
 
     #[test]
