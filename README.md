@@ -1,11 +1,30 @@
-# rocm-cli
+# ROCm CLI
 
-Command-line tool for setting up and running local AI on AMD GPUs, with a
+![ROCm](https://img.shields.io/badge/ROCm-Enabled-green)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.TXT)
+
+```
+ ██████╗  ██████╗  ██████╗███╗   ███╗     ██████╗██╗     ██╗
+ ██╔══██╗██╔═══██╗██╔════╝████╗ ████║    ██╔════╝██║     ██║
+ ██████╔╝██║   ██║██║     ██╔████╔██║    ██║     ██║     ██║
+ ██╔══██╗██║   ██║██║     ██║╚██╔╝██║    ██║     ██║     ██║
+ ██║  ██║╚██████╔╝╚██████╗██║ ╚═╝ ██║    ╚██████╗███████╗██║
+ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝╚═╝     ╚═╝     ╚═════╝╚══════╝╚═╝
+
+        Local AI on AMD GPUs — one binary, zero setup
+```
+
+ROCm CLI is a command-line tool for setting up and running local AI on AMD GPUs, with a
 full-screen TUI dashboard for GPU telemetry, model serving, and chat.
 
 A single prebuilt binary for Linux and Windows. No Python, Rust, or existing
 ROCm install required. Ships with inference engine adapters for PyTorch,
 llama.cpp, Lemonade, ATOM, vLLM, and SGLang.
+
+> [!IMPORTANT]
+> **Tech Preview** -- This software is provided as-is, without warranty or
+> guarantee of stability. APIs, commands, and behavior may change without
+> notice. Intended for experimentation and early feedback only.
 
 > Only nightly builds are available at this time.
 
