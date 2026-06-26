@@ -280,6 +280,28 @@ pub(crate) struct SlashToolRequest {
     pub label: String,
 }
 
+/// The structured next action from a natural-language plan (Phase 7).
+///
+/// Plain data mirrored from the bin's `freeform_plan_next_action_with_context`
+/// so the reducer can decide whether to hand a complete mutating action to the
+/// approval modal. A placeholder action (`has_placeholders`) stays plan-only.
+/// `pub` (not `pub(crate)`) because it is a payload of the `pub` [`ClientMsg`]
+/// enum (mirrors [`crate::tool_exec::ApprovalIntent`]); the reducer entrypoints
+/// that consume it stay crate-private.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedAction {
+    /// The rocm CLI argv to run (e.g. `["install","sdk","--prefix","/x"]`).
+    pub args: Vec<String>,
+    /// Whether the planned action mutates local ROCm state (needs approval).
+    pub approval_required: bool,
+    /// Whether any arg is still a `<placeholder>` (the plan is incomplete).
+    pub has_placeholders: bool,
+    /// Whether a planner provider produced this plan. Provider-assisted plans
+    /// stay review-only (never auto-forwarded to execution), mirroring the
+    /// bin's `validate_freeform_execution_action` guard.
+    pub provider_assisted: bool,
+}
+
 /// A surfaced mutating-tool approval awaiting the operator's decision (Phase 4).
 /// Reusable for any [`crate::tool_exec::ApprovalIntent`] (the same modal serves
 /// later phases: update/uninstall, permissions, plan). The modal owns keyboard
@@ -416,6 +438,10 @@ pub struct AppState {
     /// Edge: a pending executor-backed read-only slash command. Raised by
     /// `handle_slash_command`, drained once by the event loop (spawn_blocking).
     pub(crate) slash_tool: Option<SlashToolRequest>,
+    /// Edge: a pending `/plan <request>` natural-language plan. Raised by
+    /// `handle_slash_command`, drained once by the event loop (spawn_blocking)
+    /// which calls the read-only `natural_language_plan` tool (Phase 7).
+    pub(crate) plan_request: Option<String>,
     /// A surfaced mutating-tool approval awaiting the operator's decision
     /// (Phase 4). `Some` ⇒ the approval modal is open and owns keyboard focus.
     pub(crate) approval: Option<PendingApproval>,
@@ -478,6 +504,7 @@ impl AppState {
             tool_executor: None,
             should_quit: false,
             slash_tool: None,
+            plan_request: None,
             approval: None,
         }
     }
@@ -1060,6 +1087,27 @@ impl AppState {
                     }
                 }
             }
+            // --- Group F: natural-language planner (Ask→Plan→Review→Run) ---
+            // `/plan <request>` raises the `plan_request` edge; the event loop
+            // calls the read-only `natural_language_plan` tool off-thread and
+            // posts `PlanReady`. The plan is rendered for review; a complete
+            // mutating action is then handed to the Phase-4 approval modal.
+            "plan" => {
+                // Split off the command word (`plan`, any case) and take the
+                // free-form tail; case-insensitive, unlike `strip_prefix`.
+                let request = rest
+                    .split_once(char::is_whitespace)
+                    .map(|(_, tail)| tail.trim())
+                    .unwrap_or_default();
+                if request.is_empty() {
+                    self.chat.push(ChatTurn::agent(
+                        "usage: /plan <request> (e.g. /plan install rocm into /opt/rocm)"
+                            .to_string(),
+                    ));
+                } else {
+                    self.plan_request = Some(request.to_string());
+                }
+            }
             // Unknown slash command: an error turn, never sent to the LLM.
             other => {
                 self.chat.push(ChatTurn::error(format!(
@@ -1092,6 +1140,41 @@ impl AppState {
     pub fn on_chat_error(&mut self, message: String) {
         self.chat.push(ChatTurn::error(message));
         self.chat_sending = false;
+    }
+
+    /// Handle a completed natural-language plan (Phase 7). Pushes the rendered
+    /// plan as a chat turn (the review). If the plan's next action is a complete
+    /// mutating action (`approval_required` AND NOT `has_placeholders`) that is
+    /// NOT provider-assisted, hand its argv to the Phase-4 approval flow via the
+    /// `rocm_command` slash-tool edge (execute → ApprovalRequired → modal). A
+    /// placeholder/incomplete plan, a non-mutating one, or a provider-assisted
+    /// one stays plan-only: no approval focus, no execution. Provider-assisted
+    /// plans are review-only, mirroring the bin's
+    /// `validate_freeform_execution_action` guard.
+    pub(crate) fn on_plan_ready(&mut self, text: String, action: Option<PlannedAction>) {
+        self.chat.push(ChatTurn::agent(text));
+        if let Some(action) = action
+            && action.approval_required
+            && !action.has_placeholders
+            && !action.provider_assisted
+        {
+            // `/plan` drains off-thread without setting `chat_sending`, so a slash
+            // command issued while the plan was in flight may already have queued a
+            // tool request or opened an approval. Don't clobber it — surface a
+            // message and drop the plan's action (mirrors `open_approval`'s
+            // single-in-flight guard).
+            if self.slash_tool.is_some() || self.approval.is_some() {
+                self.chat.push(ChatTurn::error(
+                    "A command is already in progress; the planned action was discarded. Resolve it first, then re-run the plan.",
+                ));
+                return;
+            }
+            self.slash_tool = Some(SlashToolRequest {
+                name: "rocm_command".to_string(),
+                args: serde_json::json!({ "args": action.args }),
+                label: "plan action".to_string(),
+            });
+        }
     }
 
     /// Handle an executor-backed slash-tool reply (`/model`, `/daemon`): append
@@ -1496,6 +1579,11 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                     // An approved action finished: append the result turn and
                     // fire exactly one automatic follow-up agent turn.
                     Some(ClientMsg::ChatApprovalResult { text }) => state.on_approval_result(text),
+                    // A `/plan` plan completed: render the review and (for a
+                    // complete mutating action) hand it to the approval modal.
+                    Some(ClientMsg::PlanReady { text, action }) => {
+                        state.on_plan_ready(text, action);
+                    }
                     None => break,
                 }
             }
@@ -1726,6 +1814,49 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             }
         }
 
+        // Drain a pending `/plan` natural-language plan. Off-thread
+        // (spawn_blocking) so the read-only `natural_language_plan` tool's
+        // synchronous execute() never blocks the async loop. The rendered plan +
+        // structured next action return via ClientMsg::PlanReady; the tool only
+        // PLANS — no mutation happens here. A complete mutating action is handed
+        // to the approval modal by `on_plan_ready`.
+        if let Some(req) = state.plan_request.take() {
+            match state.tool_executor.clone() {
+                Some(executor) => {
+                    let reply_tx = chat_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let args = serde_json::json!({ "request": req });
+                        let msg = match executor.execute("natural_language_plan", &args) {
+                            crate::tool_exec::RocmToolOutcome::Result(v) => {
+                                match parse_plan_result(&v) {
+                                    Some((text, action)) => ClientMsg::PlanReady { text, action },
+                                    None => ClientMsg::SlashToolReply {
+                                        text: "/plan: planner returned no usable plan".to_string(),
+                                    },
+                                }
+                            }
+                            crate::tool_exec::RocmToolOutcome::Error(e) => {
+                                ClientMsg::SlashToolReply {
+                                    text: format!("/plan failed: {e}"),
+                                }
+                            }
+                            crate::tool_exec::RocmToolOutcome::ApprovalRequired(_) => {
+                                ClientMsg::SlashToolReply {
+                                    text:
+                                        "/plan: planning is read-only and should not need approval"
+                                            .to_string(),
+                                }
+                            }
+                        };
+                        let _ = reply_tx.send(msg);
+                    });
+                }
+                None => {
+                    state.on_slash_tool_reply("ROCm tools unavailable in this mode".to_string());
+                }
+            }
+        }
+
         // Spawn the agent round-trip on the submit edge — keeps `apply_action`
         // I/O-free. `chat_dispatch` is raised once by `submit_chat`; consume it
         // so the in-flight request is spawned exactly once (not every tick).
@@ -1852,6 +1983,45 @@ fn run_approved(
             format!("Approved · {name}: unexpected second approval request (not run)")
         }
     }
+}
+
+/// Parse the `natural_language_plan` tool result into the rendered plan text and
+/// the structured next action. The bin returns
+/// `structuredContent: { request, text, action: {...}|null }`; we surface the
+/// concise rendered `text` (the review) and map `action` to [`PlannedAction`].
+/// Returns `None` only when the structured payload is missing/unusable.
+fn parse_plan_result(v: &serde_json::Value) -> Option<(String, Option<PlannedAction>)> {
+    let text = v
+        .pointer("/structuredContent/text")
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
+    let action = v
+        .pointer("/structuredContent/action")
+        .filter(|a| a.is_object())
+        .map(|a| PlannedAction {
+            args: a
+                .get("args")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            approval_required: a
+                .get("approval_required")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            has_placeholders: a
+                .get("has_placeholders")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            provider_assisted: a
+                .get("provider_assisted")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        });
+    Some((text, action))
 }
 
 fn summarize_slash_tool(label: &str, outcome: &crate::tool_exec::RocmToolOutcome) -> String {
@@ -3347,6 +3517,149 @@ mod tests {
             "no dispatch without an install folder"
         );
         assert_eq!(s.chat.last().unwrap().role, ChatRole::Error);
+    }
+
+    #[test]
+    fn plan_request_set_by_slash() {
+        let mut s = st();
+        assert_eq!(
+            s.handle_slash_command("/plan install rocm"),
+            SlashOutcome::Handled
+        );
+        assert_eq!(s.plan_request.as_deref(), Some("install rocm"));
+        // The command word is matched case-insensitively, and so must the arg
+        // extraction be: `/Plan` (mixed case) dispatches just like `/plan`.
+        let mut s_mixed = st();
+        assert_eq!(
+            s_mixed.handle_slash_command("/Plan install rocm"),
+            SlashOutcome::Handled
+        );
+        assert_eq!(s_mixed.plan_request.as_deref(), Some("install rocm"));
+        // Bare `/plan` hints with a usage turn and raises no plan edge.
+        let mut s2 = st();
+        assert_eq!(s2.handle_slash_command("/plan"), SlashOutcome::Handled);
+        assert!(s2.plan_request.is_none(), "bare /plan must not dispatch");
+        assert_eq!(s2.chat.last().unwrap().role, ChatRole::Agent);
+        assert!(s2.chat.last().unwrap().content.contains("usage"));
+    }
+
+    #[test]
+    fn on_plan_ready_renders_plan_text() {
+        let mut s = st();
+        s.on_plan_ready("planner: hybrid-parser-v1\nplan body".to_string(), None);
+        // The review is appended as a chat turn…
+        assert_eq!(s.chat.last().unwrap().role, ChatRole::Agent);
+        assert!(s.chat.last().unwrap().content.contains("plan body"));
+        // …and with no action there is nothing to approve or execute.
+        assert!(s.slash_tool.is_none());
+    }
+
+    #[test]
+    fn on_plan_ready_complete_mutating_hands_off_to_approval() {
+        let mut s = st();
+        let action = PlannedAction {
+            args: vec![
+                "install".to_string(),
+                "sdk".to_string(),
+                "--prefix".to_string(),
+                "/x".to_string(),
+            ],
+            approval_required: true,
+            has_placeholders: false,
+            provider_assisted: false,
+        };
+        s.on_plan_ready("the plan".to_string(), Some(action));
+        // The plan review is shown…
+        assert_eq!(s.chat.last().unwrap().role, ChatRole::Agent);
+        // …and the complete mutating action is forwarded as a rocm_command
+        // slash-tool request (→ execute() → ApprovalRequired → modal).
+        let req = s
+            .slash_tool
+            .expect("complete mutating plan hands off to approval");
+        assert_eq!(req.name, "rocm_command");
+        assert_eq!(
+            req.args["args"],
+            serde_json::json!(["install", "sdk", "--prefix", "/x"])
+        );
+    }
+
+    #[test]
+    fn on_plan_ready_guards_against_pending_slash_tool() {
+        let mut s = st();
+        // A slash command queued a tool request while the plan computed off-thread.
+        s.slash_tool = Some(SlashToolRequest {
+            name: "rocm_command".to_string(),
+            args: serde_json::json!({ "args": ["services", "list"] }),
+            label: "pending".to_string(),
+        });
+        let action = PlannedAction {
+            args: vec!["update".to_string()],
+            approval_required: true,
+            has_placeholders: false,
+            provider_assisted: false,
+        };
+        s.on_plan_ready("the plan".to_string(), Some(action));
+        // The in-flight request is NOT clobbered…
+        let req = s.slash_tool.as_ref().expect("pending request preserved");
+        assert_eq!(req.label, "pending");
+        assert_eq!(req.args["args"], serde_json::json!(["services", "list"]));
+        // …and the user is told the planned action was discarded.
+        assert_eq!(s.chat.last().unwrap().role, ChatRole::Error);
+    }
+
+    #[test]
+    fn on_plan_ready_placeholder_stays_plan_only() {
+        let mut s = st();
+        let action = PlannedAction {
+            args: vec![
+                "install".to_string(),
+                "sdk".to_string(),
+                "--prefix".to_string(),
+                "<PATH>".to_string(),
+            ],
+            approval_required: true,
+            has_placeholders: true,
+            provider_assisted: false,
+        };
+        s.on_plan_ready("the plan".to_string(), Some(action));
+        // The plan is shown for review, but an incomplete (placeholder) plan
+        // never focuses approval and never executes — mirrors the legacy
+        // `natural_serve_with_missing_model_does_not_focus_approval` rule.
+        assert_eq!(s.chat.last().unwrap().role, ChatRole::Agent);
+        assert!(
+            s.slash_tool.is_none(),
+            "placeholder plan must stay plan-only (no approval, no execution)"
+        );
+        assert!(s.approval.is_none(), "no approval modal focus");
+    }
+
+    #[test]
+    fn on_plan_ready_provider_assisted_stays_plan_only() {
+        let mut s = st();
+        // A complete (no placeholders) mutating action that a planner provider
+        // produced. Even though approval_required && !has_placeholders, the
+        // provider_assisted flag keeps it review-only — mirrors the bin's
+        // `validate_freeform_execution_action` provider-assisted guard.
+        let action = PlannedAction {
+            args: vec![
+                "serve".to_string(),
+                "m".to_string(),
+                "--managed".to_string(),
+            ],
+            approval_required: true,
+            has_placeholders: false,
+            provider_assisted: true,
+        };
+        s.on_plan_ready("the plan".to_string(), Some(action));
+        // The plan text is rendered for review…
+        assert_eq!(s.chat.last().unwrap().role, ChatRole::Agent);
+        // …but the provider-assisted plan never focuses approval or executes:
+        // the user runs the displayed command manually.
+        assert!(
+            s.slash_tool.is_none(),
+            "provider-assisted plan must stay plan-only (no execution handoff)"
+        );
+        assert!(s.approval.is_none(), "no approval modal focus");
     }
 
     #[test]

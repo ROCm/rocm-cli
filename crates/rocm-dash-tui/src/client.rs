@@ -75,6 +75,15 @@ pub enum ClientMsg {
     ChatApprovalResult {
         text: String,
     },
+    /// Result of a `/plan` natural-language plan (Phase 7). Posted off-thread
+    /// after the read-only `natural_language_plan` tool returns: `text` is the
+    /// rendered plan (the review) and `action` is the structured next action (if
+    /// any). The app renders the review and, for a complete mutating action that is
+    /// not provider-assisted, hands its argv to the Phase-4 approval modal.
+    PlanReady {
+        text: String,
+        action: Option<crate::app::PlannedAction>,
+    },
 }
 
 pub fn spawn(connect: String, tx: UnboundedSender<ClientMsg>) {

@@ -8568,11 +8568,21 @@ pub(crate) fn run_internal_mcp_call(
                 .context("natural_language_plan requires `request`")?;
             let config = RocmCliConfig::load(paths).unwrap_or_default();
             let text = render_freeform_plan(&request, paths, &config);
+            let action =
+                freeform_plan_next_action_with_context(&request, paths, &config).map(|action| {
+                    serde_json::json!({
+                        "args": action.args,
+                        "approval_required": action.approval_required,
+                        "has_placeholders": action.has_placeholders,
+                        "provider_assisted": action.provider_assisted,
+                    })
+                });
             Ok(internal_mcp_tool_success(
                 "Planned the ROCm request.".to_owned(),
                 serde_json::json!({
                     "request": request,
                     "text": text,
+                    "action": action,
                 }),
             ))
         }
@@ -16636,6 +16646,74 @@ model recipes
             Some("rocm")
         );
         assert!(mcp_tool_result_text(&result).contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn natural_language_plan_returns_structured_mutating_action() {
+        let (_root, paths) = test_paths("nl-plan-structured-mutating");
+
+        let result = run_internal_mcp_call(
+            &paths,
+            "natural_language_plan",
+            serde_json::json!({
+                "request": "install TheRock into /opt/rocm-target"
+            }),
+            false,
+        )
+        .expect("natural_language_plan should plan the request");
+
+        assert_eq!(
+            result.get("isError").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        // text (rendered plan) preserved.
+        assert!(
+            !result
+                .pointer("/structuredContent/text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+        );
+        // A known install folder yields a mutating, placeholder-free action.
+        assert_eq!(
+            result
+                .pointer("/structuredContent/action/approval_required")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            result
+                .pointer("/structuredContent/action/has_placeholders")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        let args = result
+            .pointer("/structuredContent/action/args")
+            .and_then(serde_json::Value::as_array)
+            .expect("action args should be present");
+        assert!(args.iter().any(|arg| arg.as_str() == Some("install")));
+        assert!(args.iter().any(|arg| arg.as_str() == Some("--prefix")));
+    }
+
+    #[test]
+    fn natural_language_plan_returns_placeholder_action_when_incomplete() {
+        let (_root, paths) = test_paths("nl-plan-structured-placeholder");
+
+        let result = run_internal_mcp_call(
+            &paths,
+            "natural_language_plan",
+            serde_json::json!({ "request": "serve" }),
+            false,
+        )
+        .expect("natural_language_plan should plan the request");
+
+        assert_eq!(
+            result
+                .pointer("/structuredContent/action/has_placeholders")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]
