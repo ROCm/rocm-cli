@@ -34,7 +34,14 @@ const HEALTHCHECK_TIMEOUT_MS: u64 = 700;
 const DEFAULT_GPU_MEMORY_UTILIZATION: &str = "0.80";
 const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
 const MAX_TAIL_READ: u64 = 4 * 1024 * 1024;
+/// Default ROCm wheel index for `uv pip install vllm`.
+///
+/// This pins both the vLLM release and the ROCm ABI tag, so it can drift from
+/// the resolved runtime. Override it with `ROCM_CLI_VLLM_ROCM_INDEX_URL` to
+/// match a different vLLM/ROCm combination without rebuilding.
 const VLLM_ROCM_EXTRA_INDEX_URL: &str = "https://wheels.vllm.ai/rocm/0.23.0/rocm723";
+/// Default time to wait for vLLM to report readiness before giving up.
+const DEFAULT_VLLM_READY_TIMEOUT: Duration = Duration::from_mins(5);
 
 #[derive(Parser, Debug)]
 #[command(name = "rocm-engine-vllm", about = "rocm-cli vLLM engine adapter")]
@@ -393,7 +400,7 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
                 )
             },
         )?;
-        install_vllm_with_uv(&managed.python_executable)?;
+        install_vllm_with_uv(&managed.python_executable, request.reinstall)?;
         resolve_vllm_runtime(Some(&managed.runtime_id)).with_context(|| {
             format!(
                 "vLLM install completed in {}, but runtime `{}` still could not be resolved",
@@ -569,7 +576,7 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
         &request.host,
         request.port,
         &request.model_ref,
-        Duration::from_mins(5),
+        vllm_ready_timeout(),
         request.log_path.as_deref(),
     ) {
         // Terminate the whole vLLM process tree so the EngineCore worker (which
@@ -831,13 +838,20 @@ fn runtime_from_python(
     })
 }
 
-fn install_vllm_with_uv(python: &Path) -> Result<()> {
+fn install_vllm_with_uv(python: &Path, reinstall: bool) -> Result<()> {
     let paths = AppPaths::discover()?;
     let uv = ensure_uv_binary(&paths).context("failed to acquire uv binary for vLLM install")?;
+    let index_url = vllm_rocm_extra_index_url();
     let mut args = uv_pip_install_base(python);
+    // Without `--reinstall`, `uv pip install vllm` is a no-op when the wheel is
+    // already present, which would silently turn a requested reinstall into a
+    // no-op. Force the reinstall so the caller's intent is honored.
+    if reinstall {
+        args.push("--reinstall".to_owned());
+    }
     args.push("vllm".to_owned());
     args.push("--extra-index-url".to_owned());
-    args.push(VLLM_ROCM_EXTRA_INDEX_URL.to_owned());
+    args.push(index_url.clone());
     let output = ProcessCommand::new(&uv)
         .args(args)
         .envs(uv_command_env())
@@ -857,7 +871,7 @@ fn install_vllm_with_uv(python: &Path) -> Result<()> {
     };
     bail!(
         "`uv pip install vllm --extra-index-url {}` failed for {}: {}",
-        VLLM_ROCM_EXTRA_INDEX_URL,
+        index_url,
         python.display(),
         detail
     )
@@ -1177,6 +1191,39 @@ fn vllm_enforce_eager_enabled() -> bool {
         })
 }
 
+/// ROCm wheel index passed to `uv pip install vllm`.
+///
+/// Defaults to [`VLLM_ROCM_EXTRA_INDEX_URL`]; override with
+/// `ROCM_CLI_VLLM_ROCM_INDEX_URL` (non-empty) to target a different
+/// vLLM/ROCm combination.
+fn vllm_rocm_extra_index_url() -> String {
+    resolve_vllm_rocm_extra_index_url(std::env::var("ROCM_CLI_VLLM_ROCM_INDEX_URL").ok())
+}
+
+fn resolve_vllm_rocm_extra_index_url(override_value: Option<String>) -> String {
+    override_value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| VLLM_ROCM_EXTRA_INDEX_URL.to_owned())
+}
+
+/// Time to wait for vLLM to become ready before terminating the process tree.
+///
+/// Defaults to [`DEFAULT_VLLM_READY_TIMEOUT`]. A valid-but-slow cold start
+/// (large weight download, first-decode compile) can exceed the default, so the
+/// timeout is configurable via `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` (a positive
+/// integer number of seconds).
+fn vllm_ready_timeout() -> Duration {
+    resolve_vllm_ready_timeout(std::env::var("ROCM_CLI_VLLM_READY_TIMEOUT_SECS").ok())
+}
+
+fn resolve_vllm_ready_timeout(override_value: Option<String>) -> Duration {
+    override_value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map_or(DEFAULT_VLLM_READY_TIMEOUT, Duration::from_secs)
+}
+
 fn runtime_bin_paths(runtime: &VllmRuntime) -> Vec<PathBuf> {
     let mut entries = Vec::new();
     if let Some(bin) = runtime.sdk_bin.as_ref() {
@@ -1480,11 +1527,21 @@ fn tail_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
         .with_context(|| format!("failed to read metadata for {}", path.display()))?;
     let file_size = metadata.len();
 
-    // For large files, seek to MAX_TAIL_READ from the end
+    // For large files, seek to MAX_TAIL_READ from the end. When the seek lands in
+    // the middle of a line, the first line read back is a partial fragment that
+    // must be dropped. When it lands exactly on a line boundary (the byte before
+    // `seek_pos` is a newline) the first line is complete and must be kept.
+    let mut first_line_is_partial = false;
     if file_size > MAX_TAIL_READ {
-        let seek_pos = file_size.saturating_sub(MAX_TAIL_READ);
-        file.seek(SeekFrom::Start(seek_pos))
+        let seek_pos = file_size - MAX_TAIL_READ;
+        // Probe the byte preceding `seek_pos` to classify the first line, then
+        // leave the cursor at `seek_pos` for the buffered read below.
+        file.seek(SeekFrom::Start(seek_pos - 1))
             .with_context(|| format!("failed to seek in log file {}", path.display()))?;
+        let mut probe = [0u8; 1];
+        file.read_exact(&mut probe)
+            .with_context(|| format!("failed to read from log file {}", path.display()))?;
+        first_line_is_partial = probe[0] != b'\n';
     }
 
     let buffered = BufReader::new(file);
@@ -1493,8 +1550,8 @@ fn tail_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
         .collect::<std::result::Result<Vec<_>, _>>()
         .with_context(|| format!("failed to read lines from {}", path.display()))?;
 
-    // Skip the first partial line (result of seeking in the middle of a line)
-    if lines.len() > 1 && !lines[0].is_empty() && file_size > MAX_TAIL_READ {
+    // Drop the leading partial line produced by seeking into the middle of a line.
+    if first_line_is_partial && !lines.is_empty() {
         lines.remove(0);
     }
 
@@ -1704,6 +1761,120 @@ mod tests {
         fs::remove_file(path).ok();
         assert_eq!(lines, vec!["b".to_owned(), "c".to_owned()]);
         Ok(())
+    }
+
+    #[test]
+    fn tail_lines_keeps_first_line_when_seek_lands_on_boundary() -> Result<()> {
+        // Build a file where the MAX_TAIL_READ window starts exactly on a line
+        // boundary: a prefix ending in '\n', followed by exactly MAX_TAIL_READ
+        // bytes of complete lines. The first windowed line must NOT be dropped.
+        let prefix = format!("{}\n", "p".repeat(63));
+        let mut tail = String::from("FIRSTLINE\n");
+        while tail.len() + 2 <= MAX_TAIL_READ as usize {
+            tail.push_str("y\n");
+        }
+        while tail.len() < MAX_TAIL_READ as usize {
+            tail.push('z');
+        }
+        assert_eq!(tail.len(), MAX_TAIL_READ as usize);
+
+        let path = std::env::temp_dir().join(format!(
+            "rocm-vllm-tail-boundary-{}-{}.log",
+            std::process::id(),
+            current_unix_millis()
+        ));
+        fs::write(&path, format!("{prefix}{tail}"))?;
+        let lines = tail_lines(&path, usize::MAX)?;
+        fs::remove_file(&path).ok();
+
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("FIRSTLINE"),
+            "complete first line must be preserved when the seek lands on a newline boundary"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains('p')),
+            "bytes before the tail window must not appear"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tail_lines_drops_partial_first_line_when_seek_lands_midline() -> Result<()> {
+        // The window starts in the middle of a line, so the leading fragment is
+        // partial and must be dropped.
+        let prefix = "p".repeat(64);
+        let mut tail = String::from("PARTIALFRAGMENT");
+        tail.push('\n');
+        tail.push_str("SECONDLINE\n");
+        while tail.len() < MAX_TAIL_READ as usize {
+            tail.push_str("y\n");
+        }
+        // Trim back to exactly MAX_TAIL_READ bytes so the window starts mid-line.
+        tail.truncate(MAX_TAIL_READ as usize);
+
+        let path = std::env::temp_dir().join(format!(
+            "rocm-vllm-tail-midline-{}-{}.log",
+            std::process::id(),
+            current_unix_millis()
+        ));
+        fs::write(&path, format!("{prefix}{tail}"))?;
+        let lines = tail_lines(&path, usize::MAX)?;
+        fs::remove_file(&path).ok();
+
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("SECONDLINE"),
+            "partial leading fragment must be dropped when the seek lands mid-line"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vllm_ready_timeout_uses_default_without_override() {
+        assert_eq!(resolve_vllm_ready_timeout(None), DEFAULT_VLLM_READY_TIMEOUT);
+    }
+
+    #[test]
+    fn vllm_ready_timeout_honors_positive_override() {
+        assert_eq!(
+            resolve_vllm_ready_timeout(Some(" 900 ".to_owned())),
+            Duration::from_mins(15)
+        );
+    }
+
+    #[test]
+    fn vllm_ready_timeout_ignores_invalid_or_zero_override() {
+        assert_eq!(
+            resolve_vllm_ready_timeout(Some("0".to_owned())),
+            DEFAULT_VLLM_READY_TIMEOUT
+        );
+        assert_eq!(
+            resolve_vllm_ready_timeout(Some("not-a-number".to_owned())),
+            DEFAULT_VLLM_READY_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn vllm_extra_index_url_defaults_to_const() {
+        assert_eq!(
+            resolve_vllm_rocm_extra_index_url(None),
+            VLLM_ROCM_EXTRA_INDEX_URL
+        );
+        assert_eq!(
+            resolve_vllm_rocm_extra_index_url(Some("   ".to_owned())),
+            VLLM_ROCM_EXTRA_INDEX_URL
+        );
+    }
+
+    #[test]
+    fn vllm_extra_index_url_honors_override() {
+        assert_eq!(
+            resolve_vllm_rocm_extra_index_url(Some(
+                "  https://example.test/rocm/wheels  ".to_owned()
+            )),
+            "https://example.test/rocm/wheels"
+        );
     }
 
     #[test]

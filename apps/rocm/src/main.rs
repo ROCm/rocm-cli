@@ -5150,13 +5150,10 @@ fn maybe_auto_install_sdk_preferred_engine(
     let Some(engine) = preferred_engine_for_sdk_family(&finalized.family) else {
         return Ok(());
     };
-    if engine != "vllm" {
-        return Ok(());
-    }
 
     println!("engine auto-install");
     println!(
-        "  reason: detected ROCm GPU family prefers vLLM ({})",
+        "  reason: detected ROCm GPU family prefers {engine} ({})",
         finalized.family
     );
     println!("  engine: {engine}");
