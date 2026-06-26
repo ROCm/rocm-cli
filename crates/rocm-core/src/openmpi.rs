@@ -12,9 +12,10 @@
 //! * building an approval-gated, distro-aware system-package install plan.
 //!
 //! It also owns the related compatibility shims and checks for the other system
-//! libraries the ROCm torch wheel needs on minimal hosts: the `libmpi_cxx.so.40`
-//! symlink shim (see [`ensure_compat_symlink`]) and the runtime checks plus
-//! install plans for the `libatomic.so.1` (see [`libatomic_present`] /
+//! libraries the ROCm torch wheel needs on minimal hosts: a compiled
+//! `libmpi_cxx.so.40` stub that supplies the legacy OpenMPI C++ binding symbols
+//! OpenMPI 5.x dropped (see [`ensure_mpi_cxx_compat`]) and the runtime checks
+//! plus install plans for the `libatomic.so.1` (see [`libatomic_present`] /
 //! [`build_libatomic_install_plan`]) and `libnuma.so.1` (see [`libnuma_present`]
 //! / [`build_libnuma_install_plan`]) runtimes. The ROCm SDK bundles numa only
 //! under a renamed soname with rewritten symbol versions, which cannot satisfy
@@ -264,34 +265,73 @@ fn symlink_points_to(link: &Path, target: &Path) -> bool {
     std::fs::read_link(link).is_ok_and(|dest| dest == target)
 }
 
+/// Prebuilt `libmpi_cxx.so.40` stub defining the legacy OpenMPI C++ binding
+/// symbols PyTorch references (see `build.rs`). Empty when the build host had no
+/// C compiler, in which case the shim is disabled.
+#[cfg(target_os = "linux")]
+const MPI_CXX_STUB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libmpi_cxx_stub.so"));
+
+/// Write `bytes` to `compat_dir/name`, creating `compat_dir` as needed, and
+/// return `compat_dir` on success. Idempotent: only rewrites when the file is
+/// missing or differs (which also replaces a stale symlink left by older
+/// rocm-cli versions). The file is marked loadable (mode `0o755`).
+#[cfg(target_os = "linux")]
+fn write_compat_file(compat_dir: &Path, name: &str, bytes: &[u8]) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if std::fs::create_dir_all(compat_dir).is_err() {
+        return None;
+    }
+    let path = compat_dir.join(name);
+    let needs_write = match std::fs::read(&path) {
+        Ok(existing) => existing != bytes,
+        Err(_) => true,
+    };
+    if needs_write {
+        // Remove first so a stale symlink is replaced rather than written through.
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, bytes).ok()?;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+    }
+    Some(compat_dir.to_path_buf())
+}
+
 /// Ensure PyTorch wheels built against OpenMPI 4.x can load on hosts that ship
-/// OpenMPI 5.x (which removed the legacy MPI C++ bindings).
+/// OpenMPI 5.x (which removed the legacy MPI C++ bindings, `libmpi_cxx`).
 ///
 /// PyTorch's `libtorch_global_deps.so` lists `libmpi_cxx.so.40` as a `NEEDED`
-/// dependency, but OpenMPI 5 no longer provides `libmpi_cxx.so*`, so `import
-/// torch` aborts with `libmpi_cxx.so.40: cannot open shared object file`. That
-/// stub library is a preload helper only — it carries `NEEDED` entries so MPI is
-/// loaded with `RTLD_GLOBAL` and never calls any C++ binding symbol — so pointing
-/// the missing soname at the real `libmpi.so*` satisfies the dynamic loader
-/// without changing behavior.
+/// dependency *and* `libtorch_cpu.so` references a few MPI C++ binding symbols
+/// (`MPI::Win::Free()`, `MPI::Datatype::Free()`, `MPI::Comm::Comm()`). OpenMPI 5
+/// provides neither the soname nor those symbols, so `import torch` aborts —
+/// first with `libmpi_cxx.so.40: cannot open shared object file`, and (once the
+/// soname is satisfied) with `undefined symbol: _ZN3MPI...`. A symlink to the
+/// real `libmpi.so` fixes only the first error, because the C library does not
+/// export the C++ symbols.
 ///
-/// Returns `None` (no-op) when a real `libmpi_cxx.so*` is already present, when
-/// no `libmpi.so*` can be found to point at, or when the symlink cannot be
-/// created. Otherwise it creates `libmpi_cxx.so.40` inside `compat_dir` and
-/// returns `compat_dir` for the caller to add to the loader path. The operation
-/// is idempotent.
+/// Those C++ symbols are never *called* in single-node serving (the C MPI API,
+/// resolved from the real `libmpi.so.40` that torch also `NEEDED`s, is what
+/// actually runs), so this materializes a tiny stub `libmpi_cxx.so.40` — built at
+/// compile time (see `build.rs`) and embedded — that merely *defines* the symbols
+/// so the dynamic loader can resolve torch.
+///
+/// Returns `None` (no-op) when a real `libmpi_cxx.so*` is already present
+/// (OpenMPI 4.x), when no stub was embedded (no C toolchain at build time), or
+/// when the stub cannot be written. Otherwise it writes `libmpi_cxx.so.40` inside
+/// `compat_dir` and returns `compat_dir` for the caller to add to the loader
+/// path. The operation is idempotent and replaces a stale symlink left by older
+/// rocm-cli versions.
 #[cfg(target_os = "linux")]
 pub fn ensure_mpi_cxx_compat(compat_dir: &Path) -> Option<PathBuf> {
     // A real C++ bindings library is present (OpenMPI 4.x); nothing to shim.
     if find_libmpi_cxx().is_some() {
         return None;
     }
-    // Need a real libmpi.so* to point the shim at.
-    let target = ldconfig_libmpi_path().or_else(scan_libmpi_paths)?;
-    // PyTorch's NEEDED entry is specifically `libmpi_cxx.so.40`; the OpenMPI 5
-    // runtime keeps the `libmpi.so.40` soname, so the C API symbols torch
-    // actually uses still resolve through the same shared object.
-    ensure_compat_symlink(compat_dir, "libmpi_cxx.so.40", &target)
+    // No stub embedded (build host lacked a C compiler); cannot synthesize the
+    // C++ bindings here.
+    if MPI_CXX_STUB.is_empty() {
+        return None;
+    }
+    write_compat_file(compat_dir, "libmpi_cxx.so.40", MPI_CXX_STUB)
 }
 
 /// Non-Linux hosts never need the OpenMPI C++ bindings shim.
@@ -937,6 +977,55 @@ mod tests {
         );
         assert!(!compat.join("libmpi_cxx.so.40").exists());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn embedded_mpi_cxx_stub_is_valid_elf_with_cxx_symbols() {
+        // The stub must be compiled into the binary so OpenMPI-5.x hosts can
+        // resolve PyTorch's MPI C++ binding symbols without a runtime compiler.
+        assert!(!MPI_CXX_STUB.is_empty(), "libmpi_cxx stub was not embedded");
+        assert_eq!(&MPI_CXX_STUB[..4], b"\x7fELF", "stub is not an ELF object");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn write_compat_file_is_idempotent_and_replaces_symlink() {
+        use std::fs;
+
+        let base = std::env::temp_dir().join(format!(
+            "rocm-compat-write-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let compat = base.join("compat");
+
+        // Seed a stale symlink (as older rocm-cli versions left behind).
+        fs::create_dir_all(&compat).unwrap();
+        let stale_target = base.join("stale.so");
+        fs::write(&stale_target, b"stale").unwrap();
+        std::os::unix::fs::symlink(&stale_target, compat.join("libmpi_cxx.so.40")).unwrap();
+
+        // Writing replaces the symlink with a real file holding the stub bytes.
+        let dir = write_compat_file(&compat, "libmpi_cxx.so.40", b"STUBBYTES").expect("written");
+        assert_eq!(dir, compat);
+        let path = compat.join("libmpi_cxx.so.40");
+        assert!(
+            !fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"STUBBYTES");
+
+        // Second call with identical bytes is idempotent.
+        let dir_again =
+            write_compat_file(&compat, "libmpi_cxx.so.40", b"STUBBYTES").expect("idempotent");
+        assert_eq!(dir_again, compat);
+        assert_eq!(fs::read(&path).unwrap(), b"STUBBYTES");
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
