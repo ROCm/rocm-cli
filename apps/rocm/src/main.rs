@@ -2911,10 +2911,19 @@ fn read_os_release() -> Result<String> {
 }
 
 fn run_driver_shell_command(command: &str) -> Result<()> {
+    run_shell_command_with_stdin(command, Stdio::null())
+}
+
+/// Run a hardcoded shell command, wiring its stdin to `stdin`.
+///
+/// Most install commands run with a null stdin, but privileged commands that may
+/// trigger an interactive `sudo` password prompt (such as the OpenMPI install
+/// approved with `--yes`) must inherit the terminal so the user can respond.
+fn run_shell_command_with_stdin(command: &str, stdin: Stdio) -> Result<()> {
     let (program, args) = shell_command_for_host(command);
     let status = ProcessCommand::new(program)
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .status()
         .with_context(|| format!("failed to launch `{command}`"))?;
     if !status.success() {
@@ -3008,7 +3017,7 @@ fn engines(command: EnginesCommand) -> Result<()> {
             }
             let env_root = env_root_for_engine_install(&paths, &config, &engine, &runtime_id)?;
             if engine == "vllm" {
-                ensure_openmpi_for_vllm(yes);
+                ensure_openmpi_for_vllm(yes)?;
             }
             let response = engine_request_with_env_root::<_, InstallResponse>(
                 Some(&paths),
@@ -4978,22 +4987,26 @@ fn preferred_engine_for_sdk_family(family: &str) -> Option<&'static str> {
 /// The privileged install runs automatically when it can be performed without an
 /// interactive prompt (the process is root, or passwordless `sudo` is available),
 /// or when `approved` (the `--yes` flag) is set. Otherwise the distro-aware plan
-/// is printed and the caller continues without it. This never blocks or fails the
-/// vLLM install (warn-and-continue).
-fn ensure_openmpi_for_vllm(approved: bool) {
+/// is printed and the caller continues without it.
+///
+/// Returns `Ok(())` when OpenMPI is present, was installed, or could not be
+/// installed automatically without explicit approval (warn-and-continue). When
+/// the user explicitly approved the install with `--yes` and it still fails, the
+/// error is propagated so the caller does not silently proceed past a failure the
+/// user asked to perform.
+fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
     if cfg!(windows) {
-        return;
+        return Ok(());
     }
     let status = rocm_core::openmpi::detect_openmpi();
     if status.present {
-        return;
+        return Ok(());
     }
 
     let os_release = read_os_release().unwrap_or_default();
     let os_id = parse_os_release_field(&os_release, "ID").unwrap_or_default();
     let id_like = parse_os_release_field(&os_release, "ID_LIKE").unwrap_or_default();
-    let version_id = parse_os_release_field(&os_release, "VERSION_ID").unwrap_or_default();
-    let plan = rocm_core::openmpi::build_openmpi_install_plan(&os_id, &id_like, &version_id);
+    let plan = rocm_core::openmpi::build_openmpi_install_plan(&os_id, &id_like);
 
     println!("openmpi setup");
     println!(
@@ -5008,7 +5021,7 @@ fn ensure_openmpi_for_vllm(approved: bool) {
         eprintln!(
             "warning: could not determine how to install OpenMPI automatically; install it manually so vLLM can load libmpi.so"
         );
-        return;
+        return Ok(());
     }
 
     println!("  commands:");
@@ -5025,7 +5038,7 @@ fn ensure_openmpi_for_vllm(approved: bool) {
         eprintln!(
             "warning: passwordless sudo is unavailable; run the commands above manually, or rerun with --yes to approve an interactive sudo prompt"
         );
-        return;
+        return Ok(());
     }
 
     println!(
@@ -5042,15 +5055,27 @@ fn ensure_openmpi_for_vllm(approved: bool) {
                 println!("  status: installed");
             } else {
                 eprintln!(
-                    "warning: OpenMPI install commands completed but libmpi.so was still not found; verify the package manager output above"
+                    "warning: OpenMPI install commands completed but the runtime (libmpi.so / mpirun) was still not found; verify the package manager output above"
                 );
             }
+            Ok(())
         }
         Err(error) => {
+            // An explicit `--yes` is a deliberate request to perform the install;
+            // surface the failure so the vLLM install does not silently proceed
+            // past something the user asked for. The auto (unapproved) path keeps
+            // the warn-and-continue behavior so a missing OpenMPI never blocks an
+            // otherwise-unattended install.
+            if approved {
+                return Err(error.context(
+                    "OpenMPI install approved with --yes failed; rerun the commands above manually or retry without --yes to continue without OpenMPI",
+                ));
+            }
             eprintln!("warning: OpenMPI install failed: {error}");
             eprintln!(
                 "warning: continuing vLLM install; run the commands above manually so vLLM can load libmpi.so"
             );
+            Ok(())
         }
     }
 }
@@ -5066,7 +5091,11 @@ fn run_openmpi_install_plan(plan: &rocm_core::openmpi::OpenMpiInstallPlan) -> Re
         } else {
             command.clone()
         };
-        run_driver_shell_command(&command)
+        // Inherit stdin so an interactive `sudo` password prompt (the case the
+        // `--yes` approval exists for) can be answered. When already root or
+        // passwordless sudo is configured, sudo does not prompt and the inherited
+        // stdin is simply unused.
+        run_shell_command_with_stdin(&command, Stdio::inherit())
             .with_context(|| format!("openmpi command failed: {command}"))?;
     }
     Ok(())
@@ -5089,7 +5118,7 @@ fn maybe_auto_install_sdk_preferred_engine(
     println!("  engine: {engine}");
     println!("  runtime_id: {}", finalized.runtime_key);
 
-    ensure_openmpi_for_vllm(approved);
+    ensure_openmpi_for_vllm(approved)?;
 
     let mut config = RocmCliConfig::load(paths)?;
     let env_root = env_root_for_engine_install(paths, &config, engine, &finalized.runtime_key)?;

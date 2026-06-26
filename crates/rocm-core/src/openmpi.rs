@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! OpenMPI detection and cross-distro install planning.
 //!
 //! vLLM's ROCm wheels link against the OpenMPI runtime (`libmpi.so`) and use
@@ -12,16 +16,20 @@
 //! driver-install plan). Detection is Linux/WSL only — native Windows vLLM is
 //! unsupported, so the caller skips this path there.
 
-use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::path::Path;
+use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 
 /// Result of probing the host for an OpenMPI runtime.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OpenMpiStatus {
-    /// Whether a usable `libmpi.so*` was located (what vLLM needs at import time).
+    /// Whether a usable OpenMPI runtime is available, meaning both `libmpi.so*`
+    /// (what vLLM links against at import time) and the `mpirun` launcher (used
+    /// for multi-process/multi-node execution) were located. A host with only
+    /// one of the two is reported as not present so the warning/install path
+    /// still runs.
     pub present: bool,
     /// Path to the discovered `libmpi.so*`, when known.
     pub libmpi_path: Option<PathBuf>,
@@ -74,10 +82,22 @@ pub fn detect_openmpi() -> OpenMpiStatus {
     let libmpi_path = ldconfig_libmpi_path().or_else(scan_libmpi_paths);
     let mpirun_path = find_mpirun_path();
     OpenMpiStatus {
-        present: libmpi_path.is_some(),
+        present: runtime_present(libmpi_path.as_deref(), mpirun_path.as_deref()),
         libmpi_path,
         mpirun_path,
     }
+}
+
+/// Whether the located paths constitute a usable OpenMPI runtime.
+///
+/// A usable runtime needs both the shared library vLLM links against and the
+/// `mpirun` launcher; a library-only (or launcher-only) partial install is not
+/// considered present so the warning/auto-install path still runs.
+pub(crate) const fn runtime_present(
+    libmpi_path: Option<&std::path::Path>,
+    mpirun_path: Option<&std::path::Path>,
+) -> bool {
+    libmpi_path.is_some() && mpirun_path.is_some()
 }
 
 /// Non-Linux hosts do not exercise the OpenMPI install path.
@@ -138,30 +158,41 @@ fn ldconfig_libmpi_path() -> Option<PathBuf> {
     parse_ldconfig_libmpi(&text)
 }
 
+/// Directories scanned for OpenMPI shared libraries that live outside the
+/// default loader path (notably RHEL-family layouts under
+/// `/usr/lib64/openmpi/lib`).
 #[cfg(target_os = "linux")]
-fn scan_libmpi_paths() -> Option<PathBuf> {
-    const DIRS: &[&str] = &[
-        "/usr/lib/x86_64-linux-gnu",
-        "/usr/lib/aarch64-linux-gnu",
-        "/usr/lib64",
-        "/usr/lib",
-        "/usr/lib64/openmpi/lib",
-        "/usr/lib/x86_64-linux-gnu/openmpi/lib",
-        "/usr/lib/openmpi/lib",
-    ];
-    for dir in DIRS {
+const LIBMPI_SCAN_DIRS: &[&str] = &[
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib/aarch64-linux-gnu",
+    "/usr/lib64",
+    "/usr/lib",
+    "/usr/lib64/openmpi/lib",
+    "/usr/lib/x86_64-linux-gnu/openmpi/lib",
+    "/usr/lib/openmpi/lib",
+];
+
+/// Scan [`LIBMPI_SCAN_DIRS`] for the first shared library whose file name starts
+/// with `name_prefix` (for example `libmpi.so` or `libmpi_cxx.so`).
+#[cfg(target_os = "linux")]
+fn scan_for_shared_lib(name_prefix: &str) -> Option<PathBuf> {
+    for dir in LIBMPI_SCAN_DIRS {
         let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
         for entry in entries.flatten() {
             let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with("libmpi.so") {
+            if name.to_string_lossy().starts_with(name_prefix) {
                 return Some(entry.path());
             }
         }
     }
     None
+}
+
+#[cfg(target_os = "linux")]
+fn scan_libmpi_paths() -> Option<PathBuf> {
+    scan_for_shared_lib("libmpi.so")
 }
 
 #[cfg(target_os = "linux")]
@@ -208,27 +239,7 @@ pub(crate) fn parse_ldconfig_libmpi(output: &str) -> Option<PathBuf> {
 /// case on OpenMPI 5.x (it removed the C++ bindings entirely).
 #[cfg(target_os = "linux")]
 fn find_libmpi_cxx() -> Option<PathBuf> {
-    const DIRS: &[&str] = &[
-        "/usr/lib/x86_64-linux-gnu",
-        "/usr/lib/aarch64-linux-gnu",
-        "/usr/lib64",
-        "/usr/lib",
-        "/usr/lib64/openmpi/lib",
-        "/usr/lib/x86_64-linux-gnu/openmpi/lib",
-        "/usr/lib/openmpi/lib",
-    ];
-    for dir in DIRS {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if name.to_string_lossy().starts_with("libmpi_cxx.so") {
-                return Some(entry.path());
-            }
-        }
-    }
-    None
+    scan_for_shared_lib("libmpi_cxx.so")
 }
 
 /// Whether `link` already exists and resolves to `target`.
@@ -319,15 +330,9 @@ impl PackageManager {
 
 /// Build an approval-gated OpenMPI install plan for a distribution identity.
 ///
-/// `os_id` is the `/etc/os-release` `ID` field, `id_like` is the (possibly
-/// empty) `ID_LIKE` field, and `version_id` is `VERSION_ID`. Matching is
-/// case-insensitive.
-pub fn build_openmpi_install_plan(
-    os_id: &str,
-    id_like: &str,
-    version_id: &str,
-) -> OpenMpiInstallPlan {
-    let _ = version_id;
+/// `os_id` is the `/etc/os-release` `ID` field and `id_like` is the (possibly
+/// empty) `ID_LIKE` field. Matching is case-insensitive.
+pub fn build_openmpi_install_plan(os_id: &str, id_like: &str) -> OpenMpiInstallPlan {
     let os_id = os_id.trim().to_ascii_lowercase();
     let id_like = id_like.trim().to_ascii_lowercase();
 
@@ -351,10 +356,16 @@ pub fn build_openmpi_install_plan(
 
     let (packages, commands, reason) = match manager {
         PackageManager::Apt => (
-            vec!["libopenmpi3".to_owned(), "openmpi-bin".to_owned()],
+            // `openmpi-bin` provides `mpirun` and pulls in the matching OpenMPI
+            // runtime library; `libopenmpi-dev` provides the unversioned
+            // `libmpi.so` and depends on the correct runtime package across
+            // releases. Both are release-agnostic names, so they keep working
+            // across the Debian/Ubuntu `t64` ABI transition where the runtime
+            // package was renamed `libopenmpi3` -> `libopenmpi3t64`.
+            vec!["openmpi-bin".to_owned(), "libopenmpi-dev".to_owned()],
             vec![
                 "sudo apt-get update".to_owned(),
-                "sudo apt-get install -y libopenmpi3 openmpi-bin".to_owned(),
+                "sudo apt-get install -y openmpi-bin libopenmpi-dev".to_owned(),
             ],
             "Install the OpenMPI runtime (libmpi.so) and mpirun that vLLM's ROCm wheels require. Requires root via apt; approve before execution.".to_owned(),
         ),
@@ -410,8 +421,7 @@ pub fn install_hint() -> String {
     {
         let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
         let field = |key: &str| parse_os_release_field(&os_release, key).unwrap_or_default();
-        let plan =
-            build_openmpi_install_plan(&field("ID"), &field("ID_LIKE"), &field("VERSION_ID"));
+        let plan = build_openmpi_install_plan(&field("ID"), &field("ID_LIKE"));
         if plan.supported && !plan.commands.is_empty() {
             return format!("install it with `{}`", plan.commands.join(" && "));
         }
@@ -497,8 +507,23 @@ mod tests {
     }
 
     #[test]
+    fn runtime_present_requires_both_libmpi_and_mpirun() {
+        let lib = PathBuf::from("/usr/lib/x86_64-linux-gnu/libmpi.so.40");
+        let run = PathBuf::from("/usr/bin/mpirun");
+        // Both present -> usable runtime.
+        assert!(runtime_present(Some(&lib), Some(&run)));
+        // Library only (e.g. runtime package without launcher) -> not usable.
+        assert!(!runtime_present(Some(&lib), None));
+        // Launcher only -> not usable.
+        assert!(!runtime_present(None, Some(&run)));
+        // Neither -> not usable.
+        assert!(!runtime_present(None, None));
+    }
+
+    #[test]
     fn parses_os_release_fields_with_and_without_quotes() {
-        let text = "NAME=\"Red Hat Enterprise Linux\"\nID=rhel\nID_LIKE=fedora\nVERSION_ID=\"9.4\"\n";
+        let text =
+            "NAME=\"Red Hat Enterprise Linux\"\nID=rhel\nID_LIKE=fedora\nVERSION_ID=\"9.4\"\n";
         assert_eq!(parse_os_release_field(text, "ID").as_deref(), Some("rhel"));
         assert_eq!(
             parse_os_release_field(text, "ID_LIKE").as_deref(),
@@ -537,8 +562,8 @@ mod tests {
         fs::write(&target, b"fake").unwrap();
 
         // First call creates the shim and returns the compat directory.
-        let dir = ensure_compat_symlink(&compat, "libmpi_cxx.so.40", &target)
-            .expect("symlink created");
+        let dir =
+            ensure_compat_symlink(&compat, "libmpi_cxx.so.40", &target).expect("symlink created");
         assert_eq!(dir, compat);
         let link = compat.join("libmpi_cxx.so.40");
         assert!(symlink_points_to(&link, &target));
@@ -546,8 +571,8 @@ mod tests {
         assert_eq!(fs::read(&link).unwrap(), b"fake");
 
         // Second call is idempotent and still reports success.
-        let dir_again = ensure_compat_symlink(&compat, "libmpi_cxx.so.40", &target)
-            .expect("idempotent");
+        let dir_again =
+            ensure_compat_symlink(&compat, "libmpi_cxx.so.40", &target).expect("idempotent");
         assert_eq!(dir_again, compat);
         assert!(symlink_points_to(&link, &target));
 
@@ -582,27 +607,35 @@ mod tests {
 
     #[test]
     fn apt_plan_for_ubuntu() {
-        let plan = build_openmpi_install_plan("ubuntu", "debian", "24.04");
+        let plan = build_openmpi_install_plan("ubuntu", "debian");
         assert!(plan.supported);
         assert_eq!(plan.package_manager.as_deref(), Some("apt"));
-        assert!(plan.packages.contains(&"libopenmpi3".to_owned()));
+        // Release-agnostic names so the plan survives the `t64` ABI transition
+        // (libopenmpi3 -> libopenmpi3t64) on newer Ubuntu/Debian.
+        assert!(plan.packages.contains(&"openmpi-bin".to_owned()));
+        assert!(plan.packages.contains(&"libopenmpi-dev".to_owned()));
+        assert!(
+            !plan.packages.iter().any(|pkg| pkg == "libopenmpi3"),
+            "apt plan must not pin the release-specific libopenmpi3 name: {:?}",
+            plan.packages
+        );
         assert!(
             plan.commands
                 .iter()
-                .any(|cmd| cmd.contains("apt-get install -y libopenmpi3 openmpi-bin"))
+                .any(|cmd| cmd.contains("apt-get install -y openmpi-bin libopenmpi-dev"))
         );
     }
 
     #[test]
     fn apt_plan_via_id_like() {
-        let plan = build_openmpi_install_plan("linuxmint", "ubuntu debian", "21");
+        let plan = build_openmpi_install_plan("linuxmint", "ubuntu debian");
         assert_eq!(plan.package_manager.as_deref(), Some("apt"));
     }
 
     #[test]
     fn dnf_plan_for_rhel_family() {
         for id in ["rhel", "fedora", "rocky", "almalinux", "ol"] {
-            let plan = build_openmpi_install_plan(id, "", "9");
+            let plan = build_openmpi_install_plan(id, "");
             assert_eq!(
                 plan.package_manager.as_deref(),
                 Some("dnf"),
@@ -619,7 +652,7 @@ mod tests {
         // `dnf install` fail outright ("No match for argument: openmpi-devel").
         // The vLLM runtime only needs `libmpi.so*` + `mpirun`, both provided by
         // the base `openmpi` package, so the plan must not request `-devel`.
-        let plan = build_openmpi_install_plan("rhel", "fedora", "9.4");
+        let plan = build_openmpi_install_plan("rhel", "fedora");
         assert_eq!(plan.packages, vec!["openmpi".to_owned()]);
         assert!(
             !plan.packages.iter().any(|pkg| pkg.contains("devel")),
@@ -644,13 +677,13 @@ mod tests {
 
     #[test]
     fn dnf_plan_via_id_like_rhel() {
-        let plan = build_openmpi_install_plan("oraclelinux", "fedora", "9");
+        let plan = build_openmpi_install_plan("oraclelinux", "fedora");
         assert_eq!(plan.package_manager.as_deref(), Some("dnf"));
     }
 
     #[test]
     fn zypper_plan_for_suse() {
-        let plan = build_openmpi_install_plan("opensuse-leap", "suse opensuse", "15.6");
+        let plan = build_openmpi_install_plan("opensuse-leap", "suse opensuse");
         assert_eq!(plan.package_manager.as_deref(), Some("zypper"));
         assert!(
             plan.commands
@@ -661,14 +694,14 @@ mod tests {
 
     #[test]
     fn pacman_plan_for_arch() {
-        let plan = build_openmpi_install_plan("arch", "", "");
+        let plan = build_openmpi_install_plan("arch", "");
         assert_eq!(plan.package_manager.as_deref(), Some("pacman"));
         assert!(plan.commands.iter().any(|cmd| cmd.contains("pacman -S")));
     }
 
     #[test]
     fn unknown_distro_is_unsupported() {
-        let plan = build_openmpi_install_plan("void", "", "");
+        let plan = build_openmpi_install_plan("void", "");
         assert!(!plan.supported);
         assert!(plan.package_manager.is_none());
         assert!(plan.commands.is_empty());
