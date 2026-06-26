@@ -1,6 +1,6 @@
 // Copyright Advanced Micro Devices, Inc.
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 
 //! Slash-command routing for the chat input.
 //!
@@ -183,8 +183,9 @@ impl AppState {
             // mutating paths classify as ApprovalRequired and open the Phase-4 modal.
             "update" => {
                 // `/update` reports available updates (read-only); `/update --apply`
-                // (or `/update apply`) applies them (approval-gated).
-                let apply = matches!(rest.split_whitespace().nth(1), Some("--apply" | "apply"));
+                // applies them (approval-gated). Scan all tokens for the dash flag
+                // (matching `/uninstall`) so the trigger isn't position-sensitive.
+                let apply = rest.split_whitespace().skip(1).any(|tok| tok == "--apply");
                 let argv: Vec<&str> = if apply {
                     vec!["update", "--apply"]
                 } else {
@@ -219,25 +220,32 @@ impl AppState {
             }
             "uninstall" => {
                 // SAFE default: bare `/uninstall` is a dry-run (read-only). A real
-                // uninstall needs `/uninstall --apply` (or now/real) and is
-                // approval-gated (the bin auto-adds --yes on approval).
-                let real = matches!(
-                    rest.split_whitespace().nth(1),
-                    Some("--apply" | "now" | "real")
-                );
-                let argv: Vec<&str> = if real {
-                    vec!["uninstall"]
+                // uninstall needs `/uninstall --apply` and is approval-gated (the
+                // bin auto-adds --yes on approval).
+                let flags: Vec<&str> = rest.split_whitespace().skip(1).collect();
+                let saw_apply = flags.contains(&"--apply");
+                let saw_dry_run = flags.contains(&"--dry-run");
+                if saw_apply && saw_dry_run {
+                    self.chat.push(ChatTurn::error(
+                        "conflicting /uninstall flags: choose either --dry-run (safe) or --apply (real uninstall)"
+                            .to_string(),
+                    ));
                 } else {
-                    vec!["uninstall", "--dry-run"]
-                };
-                self.slash_tool = Some(rocm_cmd_request(
-                    &argv,
-                    if real {
-                        "uninstall"
+                    let real = saw_apply;
+                    let argv: Vec<&str> = if real {
+                        vec!["uninstall"]
                     } else {
-                        "uninstall --dry-run"
-                    },
-                ));
+                        vec!["uninstall", "--dry-run"]
+                    };
+                    self.slash_tool = Some(rocm_cmd_request(
+                        &argv,
+                        if real {
+                            "uninstall"
+                        } else {
+                            "uninstall --dry-run"
+                        },
+                    ));
+                }
             }
             "setup" => {
                 // Bare `/setup` (or `/setup status`) reports first-time setup

@@ -1,6 +1,6 @@
 // Copyright Advanced Micro Devices, Inc.
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 
 //! Chat-backend construction, detection, and persistence.
 //!
@@ -51,6 +51,12 @@ pub(super) fn build_chat_agent(
         // Local is rebuilt by the caller's inline path (it needs the live probe).
         ChatProvider::Local => None,
         ChatProvider::Openai => {
+            // Require a real key. Without this, `RigAgentClient::new` falls back to
+            // a dummy `sk-no-key` bearer and still builds, so the switch reports
+            // success and then 401s at request time. Returning `None` here makes
+            // the caller surface an actionable error and stay on the current
+            // backend instead of switching to a dead one.
+            let api_key = args.chat_api_key.clone().filter(|k| !k.trim().is_empty())?;
             let cfg = crate::llm::LlmConfig {
                 base_url: OPENAI_BASE_URL.to_string(),
                 model: args
@@ -58,7 +64,7 @@ pub(super) fn build_chat_agent(
                     .clone()
                     .filter(|m| !m.is_empty())
                     .unwrap_or_else(|| OPENAI_DEFAULT_MODEL.to_string()),
-                api_key: args.chat_api_key.clone(),
+                api_key: Some(api_key),
                 auth_header: None,
             };
             crate::agent::RigAgentClient::new(cfg, executor, Some(approval_tx))
