@@ -272,7 +272,7 @@ rocm serve qwen2.5-7b-instruct --foreground --device gpu_required")]
     Serve {
         /// Model name, alias, or local model file path.
         model: String,
-        /// Engine to use [possible values: lemonade, pytorch, llama.cpp, vllm, sglang].
+        /// Engine to use [possible values: lemonade, pytorch, llama.cpp, vllm, sglang, atom].
         #[arg(long)]
         engine: Option<String>,
         /// Device policy [possible values: gpu_required, gpu_preferred, cpu_only].
@@ -869,6 +869,14 @@ fn run_freeform(request: String, approve: bool) -> Result<()> {
 /// which yields neither, is left to the planner.
 fn command_invocation_error(request_args: &[String]) -> Option<clap::Error> {
     if request_args.is_empty() {
+        return None;
+    }
+    // A real subcommand token never contains whitespace, so a single quoted
+    // prose argument (such as `"is rocm installed?"`) is natural language, not a
+    // mistyped subcommand. clap can still propose a near-miss suggestion for
+    // such a string (`is rocm installed?` -> `install`), so guard against it
+    // here and leave the request for the planner.
+    if request_args[0].split_whitespace().count() > 1 {
         return None;
     }
     let argv = std::iter::once("rocm".to_owned()).chain(request_args.iter().cloned());
@@ -14709,6 +14717,76 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    fn possible_values_listed_in_help(help: &str) -> Vec<String> {
+        let marker = "[possible values:";
+        let start = help
+            .find(marker)
+            .unwrap_or_else(|| panic!("help text missing `{marker}`: {help:?}"));
+        let rest = &help[start + marker.len()..];
+        let end = rest
+            .find(']')
+            .unwrap_or_else(|| panic!("unterminated possible-values list in help: {help:?}"));
+        rest[..end]
+            .split(',')
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .collect()
+    }
+
+    fn serve_arg_help(arg_id: &str) -> String {
+        let cli = Cli::command();
+        let serve = cli
+            .find_subcommand("serve")
+            .expect("serve subcommand exists");
+        serve
+            .get_arguments()
+            .find(|arg| arg.get_id().as_str() == arg_id)
+            .unwrap_or_else(|| panic!("serve has no `{arg_id}` argument"))
+            .get_help()
+            .map(ToString::to_string)
+            .unwrap_or_default()
+    }
+
+    // These guard against the hand-written `[possible values: ...]` help on the
+    // free-form `--engine`/`--device` flags drifting from their real source of
+    // truth. The flags stay `Option<String>` on purpose (`--engine` is
+    // free-form and `--device` accepts aliases such as `auto`/`gpu` plus the
+    // intentional `cpu_only` rejection), so a ValueEnum would change accepted
+    // input; a sync test keeps the advertised list honest without that.
+    #[test]
+    fn serve_engine_help_lists_match_engine_inventory() {
+        let mut listed = possible_values_listed_in_help(&serve_arg_help("engine"));
+        let mut expected: Vec<String> = builtin_engine_inventory()
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect();
+        listed.sort();
+        expected.sort();
+        assert_eq!(
+            listed, expected,
+            "serve --engine help possible-values must stay in sync with builtin_engine_inventory()"
+        );
+    }
+
+    #[test]
+    fn serve_device_help_lists_match_device_policy_names() {
+        let mut listed = possible_values_listed_in_help(&serve_arg_help("device"));
+        let mut expected: Vec<String> = [
+            DevicePolicy::GpuRequired,
+            DevicePolicy::GpuPreferred,
+            DevicePolicy::CpuOnly,
+        ]
+        .iter()
+        .map(|policy| device_policy_name(policy).to_owned())
+        .collect();
+        listed.sort();
+        expected.sort();
+        assert_eq!(
+            listed, expected,
+            "serve --device help possible-values must stay in sync with DevicePolicy names"
+        );
+    }
+
     #[test]
     fn completions_generate_for_every_shell() {
         use clap_complete::Shell;
@@ -15557,6 +15635,11 @@ mod tests {
         assert!(command_invocation_error(&["zzzzzzzz".to_owned()]).is_none());
         // Prose that happens to be a single quoted argument is not command-like.
         assert!(command_invocation_error(&["please install rocm".to_owned()]).is_none());
+        // A single quoted prose request that clap can fuzzily match to a
+        // subcommand (`is rocm installed?` -> `install`) must still reach the
+        // planner rather than exiting with clap's suggestion.
+        assert!(command_invocation_error(&["is rocm installed?".to_owned()]).is_none());
+        assert!(command_invocation_error(&["how do i setup comfyui".to_owned()]).is_none());
     }
 
     #[test]
