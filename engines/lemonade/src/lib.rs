@@ -180,7 +180,6 @@ pub fn run_cli() -> Result<()> {
                 device_policy: None,
                 recipe_override: None,
                 engine_recipe: None,
-                gpu_selection: None,
             })?)?;
         }
         CommandKind::Launch {

@@ -145,25 +145,6 @@ pub enum GpuSelection {
 }
 
 impl GpuSelection {
-    /// The concrete device ordinal when explicitly pinned; `None` for `Auto`.
-    #[must_use]
-    pub const fn index(&self) -> Option<u32> {
-        match self {
-            Self::Auto => None,
-            Self::Index(index) => Some(*index),
-        }
-    }
-
-    /// Render as a CLI value (`auto` or `1`) for argv round-tripping through the
-    /// hidden `__engine-serve-http` subcommand.
-    #[must_use]
-    pub fn to_cli_value(&self) -> String {
-        match self {
-            Self::Auto => "auto".to_owned(),
-            Self::Index(index) => index.to_string(),
-        }
-    }
-
     /// Parse a CLI value (`auto` or a single GPU index like `1`) into a
     /// selection. Returns an error for non-numeric input or for a comma list,
     /// since serving a model across multiple GPUs is not supported.
@@ -198,6 +179,18 @@ pub fn gpu_indices_to_csv(indices: &[u32]) -> Option<String> {
             .collect::<Vec<_>>()
             .join(","),
     )
+}
+
+/// Pin the resolved GPU ordinals onto a child process by exporting
+/// `HIP_VISIBLE_DEVICES`.
+///
+/// This is the single contract point engines use to make `--gpu`/`auto`
+/// selection visible to the spawned server; an empty slice is a no-op (the
+/// engine keeps its default device visibility, never a CPU fallback).
+pub fn apply_gpu_visibility(command: &mut std::process::Command, gpu_indices: &[u32]) {
+    if let Some(csv) = gpu_indices_to_csv(gpu_indices) {
+        command.env("HIP_VISIBLE_DEVICES", csv);
+    }
 }
 
 /// The explicit GPU ordinal carried by an optional `GpuSelection`, as a list.
@@ -283,8 +276,6 @@ pub struct ResolveModelRequest {
     pub recipe_override: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_recipe: Option<EngineRecipeHint>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gpu_selection: Option<GpuSelection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -519,25 +510,35 @@ mod tests {
     }
 
     #[test]
-    fn gpu_selection_roundtrips_through_cli_value() {
-        let selection = GpuSelection::Index(2);
-        assert_eq!(selection.to_cli_value(), "2");
-        assert_eq!(
-            GpuSelection::parse_cli_value(&selection.to_cli_value()).unwrap(),
-            selection
-        );
-        assert_eq!(GpuSelection::Auto.to_cli_value(), "auto");
-    }
-
-    #[test]
     fn gpu_indices_helpers_handle_auto_and_pinned() {
         assert_eq!(gpu_indices_to_csv(&[]), None);
         assert_eq!(gpu_indices_to_csv(&[1]), Some("1".to_owned()));
-        assert_eq!(GpuSelection::Auto.index(), None);
-        assert_eq!(GpuSelection::Index(3).index(), Some(3));
         assert!(launch_gpu_indices(None).is_empty());
         assert!(launch_gpu_indices(Some(&GpuSelection::Auto)).is_empty());
         assert_eq!(launch_gpu_indices(Some(&GpuSelection::Index(2))), vec![2]);
+    }
+
+    #[test]
+    fn apply_gpu_visibility_sets_hip_visible_devices_on_command() {
+        let mut command = std::process::Command::new("true");
+        apply_gpu_visibility(&mut command, &[2]);
+        let hip = command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("HIP_VISIBLE_DEVICES"))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned());
+        assert_eq!(hip.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn apply_gpu_visibility_is_noop_without_pinned_indices() {
+        let mut command = std::process::Command::new("true");
+        apply_gpu_visibility(&mut command, &[]);
+        assert!(
+            command
+                .get_envs()
+                .all(|(key, _)| key != std::ffi::OsStr::new("HIP_VISIBLE_DEVICES"))
+        );
     }
 
     #[test]
@@ -565,7 +566,6 @@ mod tests {
                 }],
                 notes: vec!["signed recipe metadata".to_owned()],
             }),
-            gpu_selection: None,
         };
 
         let serialized = serde_json::to_string(&request).unwrap();

@@ -145,7 +145,10 @@ not already used by another rocm-cli server (managed or foreground), falling
 back to the GPU with the most free memory. Pass a single index (`--gpu 1`) to
 pin a specific device. The
 selected GPU is exposed to the engine via `HIP_VISIBLE_DEVICES`. Serving one
-model across multiple GPUs is not supported.
+model across multiple GPUs is not supported. `--gpu` is ignored with
+`--device cpu_only` (the model runs on CPU). Because selection uses the
+`amd-smi` ordinal but is applied via `HIP_VISIBLE_DEVICES`, rocm-cli warns when
+`ROCR_VISIBLE_DEVICES` is set, since the two orderings can diverge.
 
 Show recommended models and hardware compatibility:
 

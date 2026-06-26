@@ -204,7 +204,6 @@ pub fn run_cli() -> Result<()> {
                 device_policy: None,
                 recipe_override: None,
                 engine_recipe: None,
-                gpu_selection: None,
             })?)?;
         }
         CommandKind::Launch {
@@ -815,9 +814,7 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
     let mut command = ProcessCommand::new(&prepared_server.program);
     let server_args = llama_server_args(&request, gpu_requested);
     command.args(&server_args).stdin(Stdio::null());
-    if let Some(csv) = rocm_engine_protocol::gpu_indices_to_csv(&request.gpu_indices) {
-        command.env("HIP_VISIBLE_DEVICES", csv);
-    }
+    rocm_engine_protocol::apply_gpu_visibility(&mut command, &request.gpu_indices);
     if let Some(log_path) = request.log_path.as_ref() {
         if let Some(parent) = log_path.parent() {
             fs::create_dir_all(parent)
@@ -1858,7 +1855,6 @@ mod tests {
             device_policy: Some(DevicePolicy::CpuOnly),
             recipe_override: None,
             engine_recipe: None,
-            gpu_selection: None,
         })
         .expect_err("cpu policy should not resolve");
         assert!(error.to_string().contains("no CPU fallback is used"));
@@ -1872,7 +1868,6 @@ mod tests {
             device_policy: Some(DevicePolicy::GpuPreferred),
             recipe_override: None,
             engine_recipe: None,
-            gpu_selection: None,
         })?;
 
         assert_eq!(response.device_policy, DevicePolicy::GpuRequired);
@@ -1887,7 +1882,6 @@ mod tests {
             device_policy: Some(DevicePolicy::GpuRequired),
             recipe_override: None,
             engine_recipe: None,
-            gpu_selection: None,
         })?;
 
         assert_eq!(response.device_policy, DevicePolicy::GpuRequired);
@@ -1909,7 +1903,6 @@ mod tests {
             device_policy: Some(DevicePolicy::GpuRequired),
             recipe_override: None,
             engine_recipe: None,
-            gpu_selection: None,
         })?;
         fs::remove_file(&path).ok();
 
@@ -1926,7 +1919,6 @@ mod tests {
             device_policy: Some(DevicePolicy::GpuRequired),
             recipe_override: None,
             engine_recipe: None,
-            gpu_selection: None,
         })?;
 
         assert_eq!(response.canonical_model_id, "missing-model.gguf");
@@ -1948,7 +1940,6 @@ mod tests {
             device_policy: Some(DevicePolicy::GpuRequired),
             recipe_override: None,
             engine_recipe: Some(hint.clone()),
-            gpu_selection: None,
         })?;
 
         assert_eq!(response.engine_recipe, Some(hint));
@@ -1966,7 +1957,6 @@ mod tests {
                 "pytorch",
                 ENGINE_RECIPE_CONTRACT_VERSION,
             )),
-            gpu_selection: None,
         })
         .expect_err("mismatched engine recipe should fail");
 
@@ -1981,7 +1971,6 @@ mod tests {
             device_policy: Some(DevicePolicy::GpuRequired),
             recipe_override: None,
             engine_recipe: Some(test_engine_recipe(ENGINE_NAME, "999.0.0")),
-            gpu_selection: None,
         })
         .expect_err("unsupported recipe contract should fail");
 

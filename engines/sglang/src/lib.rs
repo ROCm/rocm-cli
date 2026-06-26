@@ -174,7 +174,6 @@ pub fn run_cli() -> Result<()> {
                 .transpose()?,
             recipe_override: None,
             engine_recipe: None,
-            gpu_selection: None,
         })?)?,
         CommandKind::Launch {
             service_id,
@@ -573,9 +572,7 @@ fn spawn_sglang_server(
         .args(engine_recipe_launch_args(request.engine_recipe.as_ref()))
         .stdin(Stdio::null());
     apply_therock_env(&mut command, runtime)?;
-    if let Some(csv) = rocm_engine_protocol::gpu_indices_to_csv(&request.gpu_indices) {
-        command.env("HIP_VISIBLE_DEVICES", csv);
-    }
+    rocm_engine_protocol::apply_gpu_visibility(&mut command, &request.gpu_indices);
     if let Some(log_path) = log_path {
         let log = fs::File::create(log_path)
             .with_context(|| format!("failed to create {}", log_path.display()))?;
@@ -1541,7 +1538,6 @@ mod tests {
             device_policy: Some(DevicePolicy::GpuRequired),
             recipe_override: None,
             engine_recipe: Some(hint.clone()),
-            gpu_selection: None,
         })?;
 
         assert_eq!(response.engine_recipe, Some(hint));
@@ -1559,7 +1555,6 @@ mod tests {
                 "pytorch",
                 ENGINE_RECIPE_CONTRACT_VERSION,
             )),
-            gpu_selection: None,
         })
         .expect_err("mismatched engine recipe should fail");
 
@@ -1574,7 +1569,6 @@ mod tests {
             device_policy: Some(DevicePolicy::GpuRequired),
             recipe_override: None,
             engine_recipe: Some(test_engine_recipe(ENGINE_NAME, "999.0.0")),
-            gpu_selection: None,
         })
         .expect_err("unsupported recipe contract should fail");
 

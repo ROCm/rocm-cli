@@ -3695,8 +3695,20 @@ fn serve(
         serve_model_ref_for_engine(&model, shared_recipe.as_ref(), &selected_engine);
     let device_policy = parse_device_policy(device.as_deref())?;
     let gpu_selection = parse_gpu_selection(gpu.as_deref())?;
-    let gpu_vram = gpu_vram_usage();
-    let gpu_indices = resolve_gpu_indices(&paths, &gpu_selection, gpu_vram.as_deref())?;
+    // CPU-only serving never pins a GPU, so skip GPU resolution entirely and
+    // surface the explicit `--gpu` as ignored rather than printing a device the
+    // server will not use.
+    let cpu_only = matches!(device_policy, DevicePolicy::CpuOnly);
+    // `--gpu` selects by the amd-smi `gpu` ordinal but is exported via
+    // `HIP_VISIBLE_DEVICES`; those orderings can diverge when
+    // `ROCR_VISIBLE_DEVICES`/partitioning is in play, so warn at serve time.
+    let rocr_visible_devices_set = std::env::var_os("ROCR_VISIBLE_DEVICES").is_some();
+    let gpu_vram = if cpu_only { None } else { gpu_vram_usage() };
+    let gpu_indices = if cpu_only {
+        Vec::new()
+    } else {
+        resolve_gpu_indices(&paths, &gpu_selection, gpu_vram.as_deref())?
+    };
     let resolved_selection = resolve_engine_selection(
         &config,
         &selected_engine,
@@ -3729,7 +3741,6 @@ fn serve(
             device_policy: Some(device_policy),
             recipe_override: None,
             engine_recipe,
-            gpu_selection: Some(gpu_selection.clone()),
         },
     )?;
     let service_id = generate_service_id(&selected_engine, &resolve.canonical_model_id);
@@ -3754,20 +3765,35 @@ fn serve(
         "  device_policy: {}",
         device_policy_name(&resolve.device_policy)
     );
-    match &gpu_selection {
-        GpuSelection::Auto => {
-            let csv = rocm_engine_protocol::gpu_indices_to_csv(&gpu_indices)
-                .unwrap_or_else(|| "none".to_owned());
-            println!("  gpu: auto (selected {csv})");
+    if cpu_only {
+        if matches!(gpu_selection, GpuSelection::Index(_)) {
+            println!(
+                "  warning: --gpu was ignored because --device cpu_only runs the model on CPU"
+            );
         }
-        GpuSelection::Index(_) => {
-            let csv = rocm_engine_protocol::gpu_indices_to_csv(&gpu_indices)
-                .unwrap_or_else(|| "none".to_owned());
-            println!("  gpu: {csv}");
+    } else {
+        match &gpu_selection {
+            GpuSelection::Auto => {
+                let csv = rocm_engine_protocol::gpu_indices_to_csv(&gpu_indices)
+                    .unwrap_or_else(|| "none".to_owned());
+                println!("  gpu: auto (selected {csv})");
+            }
+            GpuSelection::Index(_) => {
+                let csv = rocm_engine_protocol::gpu_indices_to_csv(&gpu_indices)
+                    .unwrap_or_else(|| "none".to_owned());
+                println!("  gpu: {csv}");
+            }
         }
-    }
-    if let Some(warning) = gpu_low_memory_warning(&gpu_indices, gpu_vram.as_deref()) {
-        println!("  {warning}");
+        if rocr_visible_devices_set {
+            println!(
+                "  warning: ROCR_VISIBLE_DEVICES is set; --gpu selects by the amd-smi ordinal but \
+                 is applied via HIP_VISIBLE_DEVICES, so the chosen device may differ. Verify the \
+                 selected GPU or unset ROCR_VISIBLE_DEVICES."
+            );
+        }
+        if let Some(warning) = gpu_low_memory_warning(&gpu_indices, gpu_vram.as_deref()) {
+            println!("  {warning}");
+        }
     }
     if let Some(engine_recipe) = &resolve.engine_recipe {
         print!("{}", render_serve_engine_recipe_lines(engine_recipe));
@@ -14349,19 +14375,25 @@ fn resolve_gpu_indices(
 ) -> Result<Vec<u32>> {
     let detected = detect_gpu_count();
     match selection {
-        GpuSelection::Index(index) => {
-            if let Some(count) = detected
-                && (*index as usize) >= count
-            {
-                bail!(
-                    "--gpu index {index} is out of range; {count} GPU(s) detected (valid indices 0..{})",
-                    count - 1
-                );
-            }
-            Ok(vec![*index])
-        }
+        GpuSelection::Index(index) => validate_pinned_gpu_index(*index, detected),
         GpuSelection::Auto => Ok(auto_select_gpu_indices(paths, detected, vram)),
     }
+}
+
+/// Validate an explicit `--gpu <index>` against the detected GPU count and
+/// return the single pinned ordinal. Errors when the index is out of range for
+/// a known device count; an unknown count (amd-smi unavailable) is allowed
+/// through so serving can still proceed where GPU probing is not possible.
+fn validate_pinned_gpu_index(index: u32, detected: Option<usize>) -> Result<Vec<u32>> {
+    if let Some(count) = detected
+        && (index as usize) >= count
+    {
+        bail!(
+            "--gpu index {index} is out of range; {count} GPU(s) detected (valid indices 0..{})",
+            count - 1
+        );
+    }
+    Ok(vec![index])
 }
 
 /// A GPU's local VRAM occupancy as reported by `amd-smi metric --json`.
@@ -19199,6 +19231,23 @@ install therock";
     fn auto_selection_falls_back_to_first_non_busy_without_vram() {
         assert_eq!(select_auto_gpu_index(Some(4), &[0, 1], None), vec![2]);
         assert_eq!(select_auto_gpu_index(None, &[], None), vec![0]);
+    }
+
+    #[test]
+    fn validate_pinned_gpu_index_rejects_out_of_range() {
+        // Index equal to or beyond the detected count is rejected.
+        let error = validate_pinned_gpu_index(4, Some(4)).expect_err("index 4 is out of range");
+        assert!(error.to_string().contains("out of range"));
+        assert!(validate_pinned_gpu_index(9, Some(2)).is_err());
+    }
+
+    #[test]
+    fn validate_pinned_gpu_index_accepts_in_range_or_unknown_count() {
+        // In-range index pins exactly that ordinal.
+        assert_eq!(validate_pinned_gpu_index(0, Some(1)).unwrap(), vec![0]);
+        assert_eq!(validate_pinned_gpu_index(3, Some(4)).unwrap(), vec![3]);
+        // Unknown count (amd-smi unavailable) is allowed through unvalidated.
+        assert_eq!(validate_pinned_gpu_index(7, None).unwrap(), vec![7]);
     }
 
     #[test]

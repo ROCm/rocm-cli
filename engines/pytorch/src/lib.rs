@@ -354,7 +354,6 @@ pub async fn run_cli() -> Result<()> {
                 device_policy: device_policy.map(Into::into),
                 recipe_override: None,
                 engine_recipe: None,
-                gpu_selection: None,
             })?;
             print_json(&response)?;
         }
@@ -1849,9 +1848,7 @@ fn serve_http(
         .env("PYTHONUNBUFFERED", "1")
         .env("TOKENIZERS_PARALLELISM", "false")
         .stdin(Stdio::null());
-    if let Some(csv) = rocm_engine_protocol::gpu_indices_to_csv(&gpu_indices) {
-        worker_command.env("HIP_VISIBLE_DEVICES", csv);
-    }
+    rocm_engine_protocol::apply_gpu_visibility(&mut worker_command, &gpu_indices);
     worker_command
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -3767,7 +3764,6 @@ mod tests {
             device_policy: Some(DevicePolicy::GpuRequired),
             recipe_override: None,
             engine_recipe: Some(hint.clone()),
-            gpu_selection: None,
         })?;
 
         assert_eq!(response.engine_recipe, Some(hint));
@@ -3782,7 +3778,6 @@ mod tests {
             device_policy: Some(DevicePolicy::GpuRequired),
             recipe_override: None,
             engine_recipe: Some(test_engine_recipe("vllm", ENGINE_RECIPE_CONTRACT_VERSION)),
-            gpu_selection: None,
         })
         .expect_err("mismatched engine recipe should fail");
 
@@ -3797,7 +3792,6 @@ mod tests {
             device_policy: Some(DevicePolicy::GpuRequired),
             recipe_override: None,
             engine_recipe: Some(test_engine_recipe(ENGINE_NAME, "999.0.0")),
-            gpu_selection: None,
         })
         .expect_err("unsupported recipe contract should fail");
 
