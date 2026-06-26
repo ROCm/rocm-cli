@@ -435,6 +435,9 @@ rocm install sdk --family gfx110X-all --dry-run")]
         /// Resolve the install plan without changing files.
         #[arg(long)]
         dry_run: bool,
+        /// Approve required system-package installs (such as OpenMPI for vLLM) without asking.
+        #[arg(long)]
+        yes: bool,
     },
     /// Preview or install Linux AMD driver support.
     Driver {
@@ -473,6 +476,9 @@ rocm engines install pytorch --reinstall")]
         /// Reinstall even if the engine already exists.
         #[arg(long)]
         reinstall: bool,
+        /// Approve required system-package installs (such as OpenMPI for vLLM) without asking.
+        #[arg(long)]
+        yes: bool,
     },
     /// Open a shell with the selected engine environment activated.
     Shell {
@@ -1879,6 +1885,7 @@ fn install(target: InstallTarget) -> Result<()> {
             build_date,
             family,
             dry_run,
+            yes,
         } => {
             let format_name = match format {
                 InstallFormat::Wheel => "wheel",
@@ -1911,7 +1918,7 @@ fn install(target: InstallTarget) -> Result<()> {
                     if let Some(finalized) = finalized {
                         print_sdk_install_success(&finalized);
                         if let Err(error) =
-                            maybe_auto_install_sdk_preferred_engine(&paths, &finalized)
+                            maybe_auto_install_sdk_preferred_engine(&paths, &finalized, yes)
                         {
                             record_cli_audit_event(
                                 &paths,
@@ -3033,10 +3040,19 @@ fn read_os_release() -> Result<String> {
 }
 
 fn run_driver_shell_command(command: &str) -> Result<()> {
+    run_shell_command_with_stdin(command, Stdio::null())
+}
+
+/// Run a hardcoded shell command, wiring its stdin to `stdin`.
+///
+/// Most install commands run with a null stdin, but privileged commands that may
+/// trigger an interactive `sudo` password prompt (such as the OpenMPI install
+/// approved with `--yes`) must inherit the terminal so the user can respond.
+fn run_shell_command_with_stdin(command: &str, stdin: Stdio) -> Result<()> {
     let (program, args) = shell_command_for_host(command);
     let status = ProcessCommand::new(program)
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .status()
         .with_context(|| format!("failed to launch `{command}`"))?;
     if !status.success() {
@@ -3095,6 +3111,7 @@ fn engines(command: EnginesCommand) -> Result<()> {
             runtime_id,
             python_version,
             reinstall,
+            yes,
         } => {
             let paths = AppPaths::discover()?;
             let mut config = RocmCliConfig::load(&paths)?;
@@ -3128,6 +3145,9 @@ fn engines(command: EnginesCommand) -> Result<()> {
                 return Ok(());
             }
             let env_root = env_root_for_engine_install(&paths, &config, &engine, &runtime_id)?;
+            if engine == "vllm" {
+                ensure_openmpi_for_vllm(yes)?;
+            }
             let response = engine_request_with_env_root::<_, InstallResponse>(
                 Some(&paths),
                 &engine,
@@ -5143,9 +5163,131 @@ fn preferred_engine_for_sdk_family(family: &str) -> Option<&'static str> {
     preferred_serve_engine_for_host_gpu_summary(&summary)
 }
 
+/// Ensure the OpenMPI runtime that vLLM requires is present before the vLLM wheel
+/// is installed. On Linux/WSL, when OpenMPI is missing, this installs it through
+/// the system package manager.
+///
+/// The privileged install runs automatically when it can be performed without an
+/// interactive prompt (the process is root, or passwordless `sudo` is available),
+/// or when `approved` (the `--yes` flag) is set. Otherwise the distro-aware plan
+/// is printed and the caller continues without it.
+///
+/// Returns `Ok(())` when OpenMPI is present, was installed, or could not be
+/// installed automatically without explicit approval (warn-and-continue). When
+/// the user explicitly approved the install with `--yes` and it still fails, the
+/// error is propagated so the caller does not silently proceed past a failure the
+/// user asked to perform.
+fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+    let status = rocm_core::openmpi::detect_openmpi();
+    if status.present {
+        return Ok(());
+    }
+
+    let os_release = read_os_release().unwrap_or_default();
+    let os_id = parse_os_release_field(&os_release, "ID").unwrap_or_default();
+    let id_like = parse_os_release_field(&os_release, "ID_LIKE").unwrap_or_default();
+    let plan = rocm_core::openmpi::build_openmpi_install_plan(&os_id, &id_like);
+
+    println!("openmpi setup");
+    println!(
+        "  reason: vLLM requires the OpenMPI runtime (libmpi.so / mpirun), which was not found"
+    );
+    if let Some(manager) = plan.package_manager.as_deref() {
+        println!("  package_manager: {manager}");
+    }
+    println!("  detail: {}", plan.reason);
+
+    if !plan.supported {
+        eprintln!(
+            "warning: could not determine how to install OpenMPI automatically; install it manually so vLLM can load libmpi.so"
+        );
+        return Ok(());
+    }
+
+    println!("  commands:");
+    for command in &plan.commands {
+        println!("    {command}");
+    }
+
+    let can_autoinstall = rocm_core::openmpi::can_autoinstall();
+    if !approved && !can_autoinstall {
+        for check in &plan.preflight_checks {
+            println!("  preflight: {check}");
+        }
+        eprintln!("warning: OpenMPI is required by vLLM but was not installed automatically");
+        eprintln!(
+            "warning: passwordless sudo is unavailable; run the commands above manually, or rerun with --yes to approve an interactive sudo prompt"
+        );
+        return Ok(());
+    }
+
+    println!(
+        "  approval: {}",
+        if approved {
+            "granted by --yes"
+        } else {
+            "auto (root or passwordless sudo available)"
+        }
+    );
+    match run_openmpi_install_plan(&plan) {
+        Ok(()) => {
+            if rocm_core::openmpi::detect_openmpi().present {
+                println!("  status: installed");
+            } else {
+                eprintln!(
+                    "warning: OpenMPI install commands completed but the runtime (libmpi.so / mpirun) was still not found; verify the package manager output above"
+                );
+            }
+            Ok(())
+        }
+        Err(error) => {
+            // An explicit `--yes` is a deliberate request to perform the install;
+            // surface the failure so the vLLM install does not silently proceed
+            // past something the user asked for. The auto (unapproved) path keeps
+            // the warn-and-continue behavior so a missing OpenMPI never blocks an
+            // otherwise-unattended install.
+            if approved {
+                return Err(error.context(
+                    "OpenMPI install approved with --yes failed; rerun the commands above manually or retry without --yes to continue without OpenMPI",
+                ));
+            }
+            eprintln!("warning: OpenMPI install failed: {error}");
+            eprintln!(
+                "warning: continuing vLLM install; run the commands above manually so vLLM can load libmpi.so"
+            );
+            Ok(())
+        }
+    }
+}
+
+fn run_openmpi_install_plan(plan: &rocm_core::openmpi::OpenMpiInstallPlan) -> Result<()> {
+    let root = rocm_core::openmpi::running_as_root();
+    for command in &plan.commands {
+        // When already root, `sudo` may be absent; run the command directly.
+        let command = if root {
+            command
+                .strip_prefix("sudo ")
+                .map_or_else(|| command.clone(), str::to_owned)
+        } else {
+            command.clone()
+        };
+        // Inherit stdin so an interactive `sudo` password prompt (the case the
+        // `--yes` approval exists for) can be answered. When already root or
+        // passwordless sudo is configured, sudo does not prompt and the inherited
+        // stdin is simply unused.
+        run_shell_command_with_stdin(&command, Stdio::inherit())
+            .with_context(|| format!("openmpi command failed: {command}"))?;
+    }
+    Ok(())
+}
+
 fn maybe_auto_install_sdk_preferred_engine(
     paths: &AppPaths,
     finalized: &SdkInstallFinalization,
+    approved: bool,
 ) -> Result<()> {
     let Some(engine) = preferred_engine_for_sdk_family(&finalized.family) else {
         return Ok(());
@@ -5158,6 +5300,8 @@ fn maybe_auto_install_sdk_preferred_engine(
     );
     println!("  engine: {engine}");
     println!("  runtime_id: {}", finalized.runtime_key);
+
+    ensure_openmpi_for_vllm(approved)?;
 
     let mut config = RocmCliConfig::load(paths)?;
     let env_root = env_root_for_engine_install(paths, &config, engine, &finalized.runtime_key)?;
