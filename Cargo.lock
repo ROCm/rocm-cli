@@ -3234,6 +3234,7 @@ name = "rocm-core"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "cc",
  "directories",
  "libc",
  "rand 0.8.6",

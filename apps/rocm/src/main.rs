@@ -1917,6 +1917,13 @@ fn install(target: InstallTarget) -> Result<()> {
                     print!("{output}");
                     if let Some(finalized) = finalized {
                         print_sdk_install_success(&finalized);
+                        // The SDK runtime wheel bundles PyTorch, whose ROCm build
+                        // links against libatomic.so.1 and the system numactl
+                        // runtime (libnuma.so.1 / libnuma_1.2). Ensure both are
+                        // present for every SDK install, independent of which
+                        // engine (if any) is auto-installed below.
+                        ensure_libatomic_for_torch(yes);
+                        ensure_libnuma_for_torch(yes);
                         if let Err(error) =
                             maybe_auto_install_sdk_preferred_engine(&paths, &finalized, yes)
                         {
@@ -3061,6 +3068,25 @@ fn run_shell_command_with_stdin(command: &str, stdin: Stdio) -> Result<()> {
     Ok(())
 }
 
+/// Run a command given as an argv vector directly, without going through a shell.
+///
+/// Used for [`run_system_package_install_plan`], whose commands are modeled as
+/// argv vectors so no shell quoting or `sudo`-prefix string handling is needed.
+fn run_argv_with_stdin(argv: &[String], stdin: Stdio) -> Result<()> {
+    let (program, args) = argv
+        .split_first()
+        .context("install command has no program to run")?;
+    let status = ProcessCommand::new(program)
+        .args(args)
+        .stdin(stdin)
+        .status()
+        .with_context(|| format!("failed to launch `{}`", argv.join(" ")))?;
+    if !status.success() {
+        bail!("`{}` exited with {status}", argv.join(" "));
+    }
+    Ok(())
+}
+
 fn driver_install_state_path(paths: &AppPaths) -> PathBuf {
     paths.data_dir.join("driver").join("state.json")
 }
@@ -3147,6 +3173,8 @@ fn engines(command: EnginesCommand) -> Result<()> {
             let env_root = env_root_for_engine_install(&paths, &config, &engine, &runtime_id)?;
             if engine == "vllm" {
                 ensure_openmpi_for_vllm(yes)?;
+                ensure_libatomic_for_torch(yes);
+                ensure_libnuma_for_torch(yes);
             }
             let response = engine_request_with_env_root::<_, InstallResponse>(
                 Some(&paths),
@@ -5232,7 +5260,7 @@ fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
             "auto (root or passwordless sudo available)"
         }
     );
-    match run_openmpi_install_plan(&plan) {
+    match run_system_package_install_plan(&plan) {
         Ok(()) => {
             if rocm_core::openmpi::detect_openmpi().present {
                 println!("  status: installed");
@@ -5263,23 +5291,161 @@ fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
     }
 }
 
-fn run_openmpi_install_plan(plan: &rocm_core::openmpi::OpenMpiInstallPlan) -> Result<()> {
+/// Static description of a PyTorch runtime library dependency that may need to
+/// be installed from the system package manager. Drives [`ensure_torch_runtime_dep`]
+/// so libatomic/libnuma (and any future additions) share one control flow.
+struct TorchRuntimeDep {
+    /// Short label used in the setup header and warnings (e.g. `"libatomic"`).
+    name: &'static str,
+    /// Runtime soname referenced in status messages (e.g. `"libatomic.so.1"`).
+    soname: &'static str,
+    /// `reason:` line explaining why the dependency is required.
+    reason: &'static str,
+    /// Detection probe: returns whether the dependency is already loadable.
+    present: fn() -> bool,
+    /// Builds the distro-aware install plan from the parsed os-release fields.
+    build_plan: fn(&str, &str) -> rocm_core::openmpi::SystemPackageInstallPlan,
+}
+
+/// Ensure the `libatomic` runtime that PyTorch's ROCm wheel links against is
+/// present. The SDK runtime wheel bundles PyTorch, and vLLM uses it too, so this
+/// is invoked both after `rocm install sdk` and during `rocm engines install
+/// vllm`. On Linux/WSL, when `libatomic.so.1` is missing it installs it through
+/// the system package manager (automatically when no interactive prompt is
+/// needed or when `approved`, otherwise it prints the distro-aware plan). Never
+/// blocks or fails the install (warn-and-continue). It is a no-op when
+/// libatomic is already present.
+fn ensure_libatomic_for_torch(approved: bool) {
+    ensure_torch_runtime_dep(
+        approved,
+        &TorchRuntimeDep {
+            name: "libatomic",
+            soname: "libatomic.so.1",
+            reason: "PyTorch's ROCm wheel requires the libatomic runtime (libatomic.so.1), which was not found",
+            present: rocm_core::openmpi::libatomic_present,
+            build_plan: rocm_core::openmpi::build_libatomic_install_plan,
+        },
+    );
+}
+
+/// Ensure the real `libnuma` (numactl) runtime that PyTorch's ROCm wheel binds
+/// is present. Like [`ensure_libatomic_for_torch`], this is invoked after
+/// `rocm install sdk` and during `rocm engines install vllm`. PyTorch's
+/// `libc10.so` binds `libnuma.so.1`'s `libnuma_1.2` symbols; the ROCm SDK only
+/// bundles numa under a renamed soname with rewritten versions that cannot
+/// satisfy it, so the upstream numactl runtime must be installed from the system
+/// package manager. On Linux/WSL, when `libnuma.so.1` is missing it installs it
+/// automatically when no interactive prompt is needed or when `approved`,
+/// otherwise it prints the distro-aware plan. Never blocks or fails the install
+/// (warn-and-continue). No-op when libnuma is already present.
+fn ensure_libnuma_for_torch(approved: bool) {
+    ensure_torch_runtime_dep(
+        approved,
+        &TorchRuntimeDep {
+            name: "libnuma",
+            soname: "libnuma.so.1",
+            reason: "PyTorch's ROCm wheel requires the system numactl runtime (libnuma.so.1 with libnuma_1.2), which was not found",
+            present: rocm_core::openmpi::libnuma_present,
+            build_plan: rocm_core::openmpi::build_libnuma_install_plan,
+        },
+    );
+}
+
+/// Shared control flow behind [`ensure_libatomic_for_torch`] and
+/// [`ensure_libnuma_for_torch`]: detect the dependency, print the distro-aware
+/// plan, and (when approved or auto-installable) run it via
+/// [`run_system_package_install_plan`]. Always warn-and-continue; never fails the
+/// caller. No-op on Windows or when the dependency is already present.
+fn ensure_torch_runtime_dep(approved: bool, dep: &TorchRuntimeDep) {
+    if cfg!(windows) {
+        return;
+    }
+    if (dep.present)() {
+        return;
+    }
+
+    let os_release = read_os_release().unwrap_or_default();
+    let os_id = parse_os_release_field(&os_release, "ID").unwrap_or_default();
+    let id_like = parse_os_release_field(&os_release, "ID_LIKE").unwrap_or_default();
+    let plan = (dep.build_plan)(&os_id, &id_like);
+
+    println!("{} setup", dep.name);
+    println!("  reason: {}", dep.reason);
+    if let Some(manager) = plan.package_manager.as_deref() {
+        println!("  package_manager: {manager}");
+    }
+    println!("  detail: {}", plan.reason);
+
+    if !plan.supported {
+        // The distro is unknown or the dependency ships with the base toolchain;
+        // nothing actionable to auto-install.
+        return;
+    }
+
+    println!("  commands:");
+    for command in &plan.commands {
+        println!("    {command}");
+    }
+
+    let can_autoinstall = rocm_core::openmpi::can_autoinstall();
+    if !approved && !can_autoinstall {
+        for check in &plan.preflight_checks {
+            println!("  preflight: {check}");
+        }
+        eprintln!(
+            "warning: {} is required by PyTorch but was not installed automatically",
+            dep.name
+        );
+        eprintln!(
+            "warning: passwordless sudo is unavailable; run the commands above manually, or rerun with --yes to approve an interactive sudo prompt"
+        );
+        return;
+    }
+
+    println!(
+        "  approval: {}",
+        if approved {
+            "granted by --yes"
+        } else {
+            "auto (root or passwordless sudo available)"
+        }
+    );
+    match run_system_package_install_plan(&plan) {
+        Ok(()) => {
+            if (dep.present)() {
+                println!("  status: installed");
+            } else {
+                eprintln!(
+                    "warning: {} install commands completed but {} was still not found; verify the package manager output above",
+                    dep.name, dep.soname
+                );
+            }
+        }
+        Err(error) => {
+            eprintln!("warning: {} install failed: {error}", dep.name);
+            eprintln!(
+                "warning: continuing; run the commands above manually so PyTorch can load {}",
+                dep.soname
+            );
+        }
+    }
+}
+
+fn run_system_package_install_plan(
+    plan: &rocm_core::openmpi::SystemPackageInstallPlan,
+) -> Result<()> {
     let root = rocm_core::openmpi::running_as_root();
     for command in &plan.commands {
-        // When already root, `sudo` may be absent; run the command directly.
-        let command = if root {
-            command
-                .strip_prefix("sudo ")
-                .map_or_else(|| command.clone(), str::to_owned)
-        } else {
-            command.clone()
-        };
+        // `resolved_argv` prepends `sudo` only when the command needs root and we
+        // are not already root (where `sudo` may be absent); the argv runs
+        // directly without a shell.
+        let argv = command.resolved_argv(root);
         // Inherit stdin so an interactive `sudo` password prompt (the case the
         // `--yes` approval exists for) can be answered. When already root or
         // passwordless sudo is configured, sudo does not prompt and the inherited
         // stdin is simply unused.
-        run_shell_command_with_stdin(&command, Stdio::inherit())
-            .with_context(|| format!("openmpi command failed: {command}"))?;
+        run_argv_with_stdin(&argv, Stdio::inherit())
+            .with_context(|| format!("system package install command failed: {command}"))?;
     }
     Ok(())
 }
