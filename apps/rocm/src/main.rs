@@ -1918,10 +1918,12 @@ fn install(target: InstallTarget) -> Result<()> {
                     if let Some(finalized) = finalized {
                         print_sdk_install_success(&finalized);
                         // The SDK runtime wheel bundles PyTorch, whose ROCm build
-                        // links against libatomic.so.1. Ensure it is present for
-                        // every SDK install, independent of which engine (if any)
-                        // is auto-installed below.
+                        // links against libatomic.so.1 and the system numactl
+                        // runtime (libnuma.so.1 / libnuma_1.2). Ensure both are
+                        // present for every SDK install, independent of which
+                        // engine (if any) is auto-installed below.
                         ensure_libatomic_for_torch(yes);
+                        ensure_libnuma_for_torch(yes);
                         if let Err(error) =
                             maybe_auto_install_sdk_preferred_engine(&paths, &finalized, yes)
                         {
@@ -3153,6 +3155,7 @@ fn engines(command: EnginesCommand) -> Result<()> {
             if engine == "vllm" {
                 ensure_openmpi_for_vllm(yes)?;
                 ensure_libatomic_for_torch(yes);
+                ensure_libnuma_for_torch(yes);
             }
             let response = engine_request_with_env_root::<_, InstallResponse>(
                 Some(&paths),
@@ -5344,6 +5347,88 @@ fn ensure_libatomic_for_torch(approved: bool) {
             eprintln!("warning: libatomic install failed: {error}");
             eprintln!(
                 "warning: continuing; run the commands above manually so PyTorch can load libatomic.so.1"
+            );
+        }
+    }
+}
+
+/// Ensure the real `libnuma` (numactl) runtime that PyTorch's ROCm wheel binds
+/// is present. Like [`ensure_libatomic_for_torch`], this is invoked after
+/// `rocm install sdk` and during `rocm engines install vllm`. PyTorch's
+/// `libc10.so` binds `libnuma.so.1`'s `libnuma_1.2` symbols; the ROCm SDK only
+/// bundles numa under a renamed soname with rewritten versions that cannot
+/// satisfy it, so the upstream numactl runtime must be installed from the system
+/// package manager. On Linux/WSL, when `libnuma.so.1` is missing it installs it
+/// automatically when no interactive prompt is needed or when `approved`,
+/// otherwise it prints the distro-aware plan. Never blocks or fails the install
+/// (warn-and-continue). No-op when libnuma is already present.
+fn ensure_libnuma_for_torch(approved: bool) {
+    if cfg!(windows) {
+        return;
+    }
+    if rocm_core::openmpi::libnuma_present() {
+        return;
+    }
+
+    let os_release = read_os_release().unwrap_or_default();
+    let os_id = parse_os_release_field(&os_release, "ID").unwrap_or_default();
+    let id_like = parse_os_release_field(&os_release, "ID_LIKE").unwrap_or_default();
+    let plan = rocm_core::openmpi::build_libnuma_install_plan(&os_id, &id_like);
+
+    println!("libnuma setup");
+    println!(
+        "  reason: PyTorch's ROCm wheel requires the system numactl runtime (libnuma.so.1 with libnuma_1.2), which was not found"
+    );
+    if let Some(manager) = plan.package_manager.as_deref() {
+        println!("  package_manager: {manager}");
+    }
+    println!("  detail: {}", plan.reason);
+
+    if !plan.supported {
+        // Distribution could not be mapped to a package manager; nothing
+        // actionable to auto-install.
+        return;
+    }
+
+    println!("  commands:");
+    for command in &plan.commands {
+        println!("    {command}");
+    }
+
+    let can_autoinstall = rocm_core::openmpi::can_autoinstall();
+    if !approved && !can_autoinstall {
+        for check in &plan.preflight_checks {
+            println!("  preflight: {check}");
+        }
+        eprintln!("warning: libnuma is required by PyTorch but was not installed automatically");
+        eprintln!(
+            "warning: passwordless sudo is unavailable; run the commands above manually, or rerun with --yes to approve an interactive sudo prompt"
+        );
+        return;
+    }
+
+    println!(
+        "  approval: {}",
+        if approved {
+            "granted by --yes"
+        } else {
+            "auto (root or passwordless sudo available)"
+        }
+    );
+    match run_system_package_install_plan(&plan) {
+        Ok(()) => {
+            if rocm_core::openmpi::libnuma_present() {
+                println!("  status: installed");
+            } else {
+                eprintln!(
+                    "warning: libnuma install commands completed but libnuma.so.1 was still not found; verify the package manager output above"
+                );
+            }
+        }
+        Err(error) => {
+            eprintln!("warning: libnuma install failed: {error}");
+            eprintln!(
+                "warning: continuing; run the commands above manually so PyTorch can load libnuma.so.1"
             );
         }
     }

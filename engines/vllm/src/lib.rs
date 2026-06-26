@@ -465,6 +465,12 @@ fn vllm_runtime_warnings(runtime: &VllmRuntime) -> Vec<String> {
             rocm_core::openmpi::libatomic_install_hint()
         ));
     }
+    if !cfg!(windows) && !rocm_core::openmpi::libnuma_present() {
+        warnings.push(format!(
+            "system numactl runtime (libnuma.so.1 with libnuma_1.2) was not found; vLLM's torch wheel requires it and the ROCm SDK's bundled numa cannot satisfy it. {}, or rerun `rocm engines install vllm --yes`.",
+            rocm_core::openmpi::libnuma_install_hint()
+        ));
+    }
     warnings
 }
 
@@ -652,6 +658,22 @@ without it `import torch` fails with `libmpi_cxx.so.40: cannot open shared objec
 without it `import torch` fails with `libatomic.so.1: cannot open shared object file`. \
 {}, or run `rocm engines install vllm --yes` to install it automatically, then retry.",
             rocm_core::openmpi::libatomic_install_hint()
+        );
+    }
+
+    // Fail fast when the real numactl runtime is missing. PyTorch's `libc10.so`
+    // binds `libnuma.so.1`'s `libnuma_1.2` symbol version. The ROCm SDK bundles
+    // numa only under a renamed soname with rewritten symbol versions, so it
+    // cannot satisfy that binding and `import torch` dies with
+    // `libnuma.so.1: ... version 'libnuma_1.2' not found`. The upstream numactl
+    // runtime must be installed from the system package manager.
+    if !cfg!(windows) && !rocm_core::openmpi::libnuma_present() {
+        bail!(
+            "vLLM requires the system numactl runtime (libnuma.so.1 with the libnuma_1.2 symbols), which was not found; \
+the ROCm SDK's bundled numa uses renamed symbol versions and cannot satisfy it, so `import torch` fails with \
+`libnuma.so.1: version 'libnuma_1.2' not found`. \
+{}, or run `rocm engines install vllm --yes` to install it automatically, then retry.",
+            rocm_core::openmpi::libnuma_install_hint()
         );
     }
 
@@ -1305,35 +1327,35 @@ fn therock_library_path_entries(runtime: &VllmRuntime) -> Vec<PathBuf> {
             if let Some(dir) = rocm_core::openmpi::ensure_mpi_cxx_compat(&compat_dir) {
                 entries.push(dir);
             }
-            // PyTorch's `libc10.so` NEEDS the standard `libnuma.so.1` soname, but
-            // TheRock bundles numa in the ROCm SDK sysdeps under the renamed
-            // soname `librocm_sysdeps_numa.so.1`, so hosts without system
-            // numactl fail with `libnuma.so.1: cannot open shared object file`.
-            // The bundled file is the real numactl library, so a `libnuma.so.1`
-            // symlink to it provides working numa support.
-            if let Some(dir) = ensure_numa_compat(&entries, &compat_dir) {
-                entries.push(dir);
-            }
+            // PyTorch's `libc10.so` NEEDS the standard `libnuma.so.1` soname with
+            // the upstream `libnuma_1.2` symbol version. TheRock bundles numa only
+            // under the renamed soname `librocm_sysdeps_numa.so.1` whose versions
+            // are rewritten to `AMDROCM_SYSDEPS_1.0_libnuma_*`, which cannot
+            // satisfy that binding. An older rocm-cli release symlinked
+            // `libnuma.so.1` to that bundled library; on the loader path it
+            // shadowed any real system libnuma and broke `import torch` with
+            // `version 'libnuma_1.2' not found`. Remove that stale shim here so
+            // the real numactl runtime (installed via the package manager) wins;
+            // `libnuma_present()`/`spawn_vllm_server` handle the install/preflight.
+            remove_stale_numa_shim(&compat_dir);
         }
     }
     dedupe_paths(entries)
 }
 
-/// Bridge the standard `libnuma.so.1` soname that PyTorch's `libc10.so` requires
-/// on hosts without system numactl, using the ROCm SDK's bundled numa library
-/// (`librocm_sysdeps_numa.so.1`, the real numactl library under a renamed
-/// soname). `sdk_dirs` are the SDK library directories already on the loader
-/// path; the symlink is created in `compat_dir`. No-op when the loader can
-/// already resolve `libnuma.so.1` or the bundled library is not found.
-fn ensure_numa_compat(sdk_dirs: &[PathBuf], compat_dir: &Path) -> Option<PathBuf> {
-    if !cfg!(target_os = "linux") || rocm_core::openmpi::ldconfig_has_soname("libnuma.so.1") {
-        return None;
+/// Remove a stale `libnuma.so.1` compatibility symlink left by older rocm-cli
+/// versions in `compat_dir`. That shim pointed at the ROCm SDK's bundled
+/// `librocm_sysdeps_numa.so.1`, whose renamed symbol versions cannot satisfy the
+/// `libnuma_1.2` symbol PyTorch's `libc10.so` binds; leaving it on the loader
+/// path would shadow a correctly installed system libnuma. No-op when absent or
+/// when the entry is not a symlink.
+fn remove_stale_numa_shim(compat_dir: &Path) {
+    let link = compat_dir.join("libnuma.so.1");
+    if let Ok(meta) = link.symlink_metadata()
+        && meta.file_type().is_symlink()
+    {
+        let _ = fs::remove_file(&link);
     }
-    let target = sdk_dirs
-        .iter()
-        .map(|dir| dir.join("librocm_sysdeps_numa.so.1"))
-        .find(|candidate| candidate.exists())?;
-    rocm_core::openmpi::ensure_compat_symlink(compat_dir, "libnuma.so.1", &target)
 }
 
 /// A writable, runtime-owned directory for managed-runtime library compatibility

@@ -13,9 +13,13 @@
 //!
 //! It also owns the related compatibility shims and checks for the other system
 //! libraries the ROCm torch wheel needs on minimal hosts: the `libmpi_cxx.so.40`
-//! and `libnuma.so.1` symlink shims (see [`ensure_compat_symlink`]) and the
-//! `libatomic.so.1` runtime check and install plan (see [`libatomic_present`]
-//! and [`build_libatomic_install_plan`]).
+//! symlink shim (see [`ensure_compat_symlink`]) and the runtime checks plus
+//! install plans for the `libatomic.so.1` (see [`libatomic_present`] /
+//! [`build_libatomic_install_plan`]) and `libnuma.so.1` (see [`libnuma_present`]
+//! / [`build_libnuma_install_plan`]) runtimes. The ROCm SDK bundles numa only
+//! under a renamed soname with rewritten symbol versions, which cannot satisfy
+//! torch's `libnuma_1.2` binding, so the real numactl runtime is installed
+//! rather than shimmed.
 //!
 //! The plan is never executed here; callers present it for explicit approval and
 //! run it through their normal privileged-command flow (mirroring the native
@@ -409,6 +413,60 @@ fn scan_libatomic_path() -> Option<PathBuf> {
     None
 }
 
+/// Whether a real system `libnuma.so.1` is resolvable by the dynamic loader.
+///
+/// PyTorch's ROCm `libc10.so` lists `libnuma.so.1` as a `NEEDED` dependency and
+/// binds the versioned symbols `libnuma_1.1` / `libnuma_1.2` from upstream
+/// numactl. TheRock *does* bundle numa in the ROCm SDK sysdeps, but under the
+/// renamed soname `librocm_sysdeps_numa.so.1` whose version nodes are rewritten
+/// to `AMDROCM_SYSDEPS_1.0_libnuma_*`. Those renamed versions cannot satisfy the
+/// plain `libnuma_1.2` symbol torch needs, so a symlink to the bundled library
+/// fails at load with `version 'libnuma_1.2' not found`. The real numactl
+/// runtime must therefore be installed from the distribution's package manager
+/// (see [`build_libnuma_install_plan`]); it is intentionally not shimmed.
+///
+/// Always `true` off Linux, where this path is not exercised.
+#[cfg(target_os = "linux")]
+pub fn libnuma_present() -> bool {
+    ldconfig_has_soname("libnuma.so.1") || scan_libnuma_path().is_some()
+}
+
+/// Non-Linux hosts do not exercise the libnuma dependency path.
+#[cfg(not(target_os = "linux"))]
+pub fn libnuma_present() -> bool {
+    true
+}
+
+/// Locate a real `libnuma.so.1*` shared object in the standard system library
+/// directories. The ROCm SDK's bundled `librocm_sysdeps_numa.so.1` lives outside
+/// these directories (inside the Python site-packages tree) and uses renamed
+/// symbol versions, so it is intentionally never matched here.
+#[cfg(target_os = "linux")]
+fn scan_libnuma_path() -> Option<PathBuf> {
+    const DIRS: &[&str] = &[
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
+        "/usr/lib64",
+        "/lib64",
+        "/usr/lib",
+    ];
+    for dir in DIRS {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("libnuma.so.1")
+            {
+                return Some(entry.path());
+            }
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PackageManager {
     Apt,
@@ -584,6 +642,73 @@ pub fn build_libatomic_install_plan(os_id: &str, id_like: &str) -> SystemPackage
     }
 }
 
+/// Build an approval-gated plan for installing the real `libnuma` runtime that
+/// PyTorch's ROCm wheels require, for a distribution identity.
+///
+/// Arguments mirror [`build_openmpi_install_plan`]. Although the ROCm SDK bundles
+/// numa, it does so under a renamed soname with rewritten symbol versions that
+/// cannot satisfy torch's `libnuma_1.2` binding (see [`libnuma_present`]), so the
+/// upstream numactl runtime must be installed from the package manager. Unlike
+/// libatomic, numactl is *not* part of the Arch base install, so a pacman plan is
+/// produced there as well.
+pub fn build_libnuma_install_plan(os_id: &str, id_like: &str) -> SystemPackageInstallPlan {
+    let os_id = os_id.trim().to_ascii_lowercase();
+    let id_like = id_like.trim().to_ascii_lowercase();
+
+    let Some(manager) = resolve_package_manager(&os_id, &id_like) else {
+        return SystemPackageInstallPlan {
+            supported: false,
+            package_manager: None,
+            packages: Vec::new(),
+            commands: Vec::new(),
+            preflight_checks: Vec::new(),
+            reason: format!(
+                "Could not map distribution (ID={}) to a known package manager; install the libnuma runtime manually (your distro's `numactl-libs` / `libnuma1` package providing libnuma.so.1).",
+                if os_id.is_empty() {
+                    "<unknown>"
+                } else {
+                    &os_id
+                }
+            ),
+        };
+    };
+
+    let (packages, commands): (Vec<String>, Vec<String>) = match manager {
+        PackageManager::Apt => (
+            vec!["libnuma1".to_owned()],
+            vec![
+                "sudo apt-get update".to_owned(),
+                "sudo apt-get install -y libnuma1".to_owned(),
+            ],
+        ),
+        PackageManager::Dnf => (
+            vec!["numactl-libs".to_owned()],
+            vec!["sudo dnf install -y numactl-libs".to_owned()],
+        ),
+        PackageManager::Zypper => (
+            vec!["libnuma1".to_owned()],
+            vec!["sudo zypper install -y libnuma1".to_owned()],
+        ),
+        PackageManager::Pacman => (
+            vec!["numactl".to_owned()],
+            vec!["sudo pacman -S --needed --noconfirm numactl".to_owned()],
+        ),
+    };
+
+    SystemPackageInstallPlan {
+        supported: true,
+        package_manager: Some(manager.as_str().to_owned()),
+        packages,
+        commands,
+        preflight_checks: vec![
+            "root access: run as root, or ensure `sudo -v` succeeds before approval".to_owned(),
+            "`sudo` command is available when not running as root".to_owned(),
+            format!("`{}` package manager is available", manager.as_str()),
+        ],
+        reason: "Install the real numactl runtime (libnuma.so.1, providing the libnuma_1.2 symbols) that PyTorch's ROCm wheel links against. The ROCm SDK's bundled numa uses renamed symbol versions and cannot satisfy this. Requires root; approve before execution.".to_owned(),
+    }
+}
+
 /// runtime that vLLM requires, for embedding in user-facing error messages.
 ///
 /// On Linux it reads `/etc/os-release` and returns the package-manager command
@@ -620,6 +745,25 @@ pub fn libatomic_install_hint() -> String {
         }
     }
     "install your distribution's libatomic runtime package (providing libatomic.so.1)".to_owned()
+}
+
+/// Build a short, distro-aware hint describing how to install the real `libnuma`
+/// runtime that PyTorch requires, for embedding in user-facing error messages.
+///
+/// On Linux it reads `/etc/os-release` and returns the package-manager command
+/// from [`build_libnuma_install_plan`] when the distribution is recognized,
+/// otherwise a generic instruction. Off Linux it returns a generic message.
+pub fn libnuma_install_hint() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+        let field = |key: &str| parse_os_release_field(&os_release, key).unwrap_or_default();
+        let plan = build_libnuma_install_plan(&field("ID"), &field("ID_LIKE"));
+        if plan.supported && !plan.commands.is_empty() {
+            return format!("install it with `{}`", plan.commands.join(" && "));
+        }
+    }
+    "install your distribution's numactl runtime package (providing libnuma.so.1)".to_owned()
 }
 
 /// Parse a single `KEY=VALUE` field from `/etc/os-release` contents, stripping
@@ -830,6 +974,38 @@ mod tests {
         let plan = build_libatomic_install_plan("arch", "");
         assert!(!plan.supported);
         assert!(plan.commands.is_empty());
+    }
+
+    #[test]
+    fn libnuma_plan_for_rhel_uses_numactl_libs() {
+        let plan = build_libnuma_install_plan("rhel", "fedora");
+        assert!(plan.supported);
+        assert_eq!(plan.package_manager.as_deref(), Some("dnf"));
+        assert_eq!(plan.packages, vec!["numactl-libs".to_owned()]);
+        assert!(
+            plan.commands
+                .iter()
+                .any(|cmd| cmd == "sudo dnf install -y numactl-libs"),
+            "expected numactl-libs install command: {:?}",
+            plan.commands
+        );
+    }
+
+    #[test]
+    fn libnuma_plan_for_debian_uses_libnuma1() {
+        let plan = build_libnuma_install_plan("ubuntu", "debian");
+        assert_eq!(plan.package_manager.as_deref(), Some("apt"));
+        assert_eq!(plan.packages, vec!["libnuma1".to_owned()]);
+    }
+
+    #[test]
+    fn libnuma_plan_for_arch_uses_numactl() {
+        // Unlike libatomic, numactl is not part of the Arch base install, so a
+        // pacman plan is produced.
+        let plan = build_libnuma_install_plan("arch", "");
+        assert!(plan.supported);
+        assert_eq!(plan.package_manager.as_deref(), Some("pacman"));
+        assert_eq!(plan.packages, vec!["numactl".to_owned()]);
     }
 
     #[test]
