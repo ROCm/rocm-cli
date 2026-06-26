@@ -9,19 +9,46 @@ Bench / Chat), the no-key ChatGPT-OAuth chat backend, the unified `config.json`
 Windows-clean build, and `rocm dash --demo/--replay/--chat-mock`.
 
 This file captures (1) the remaining work to reach full **feature parity** with
-the two surfaces the merge replaces, and (2) the scoped **Per-process VRAM →
-model** dashboard item.
+the two surfaces the merge replaces, (2) the **background-helper (`rocm daemon`)
+wiring** regression, and (3) the scoped **Per-process VRAM → model** dashboard
+item.
+
+> **What shipped (Supergoal §1 + §2).** Items (1) and (2) are now done. The dash
+> Chat tab reached agentic parity (read-only ROCm tools, approval-gated mutating
+> tools, `/plan`, `/provider` + Anthropic, a 30-command parity map) and bare
+> `rocm`/`rocm chat` reroute to it; `tui.rs` is retained behind an explicit
+> retire gate (deletion not performed). `rocm daemon` runs the real loop
+> in-process via the `rocmd` lib with on-demand, double-spawn-guarded autostart.
+> Item (3) (per-model VRAM) remains the open dashboard follow-up.
 
 ---
 
 ## 1. Feature parity — retire `tui.rs` without regression
 
-**Status: the only real parity gap.** Bare `rocm` and `rocm chat` still launch
-the legacy chat-first assistant (`apps/rocm/src/tui.rs`); its retirement was
-**deferred** because the new dashboard **Chat** tab is a read-only telemetry
-chat and lacks the legacy assistant's agentic capabilities. Closing this gap is
-the prerequisite for deleting `tui.rs` and routing bare `rocm`/`rocm chat` to
-the unified TUI.
+**Status: parity REACHED; bare `rocm`/`rocm chat` REROUTED to the dash;
+deletion GATED (not performed).** The dash **Chat** tab now matches the legacy
+assistant's agentic capabilities, and bare `rocm` + interactive `rocm chat`
+route to the unified dash chat (`dash::run_chat`). `apps/rocm/src/tui.rs` is
+**retained** (anchored by `_RETAINED_TUI_ENTRY`) behind an explicit accept/retire
+gate — the actual file deletion is intentionally not done in this supergoal.
+
+**What shipped (Supergoal §1, Phases 3–9):**
+- Read-only ROCm tools through a `rocm-core`-free execution seam
+  (`tool_exec.rs` / `dash_seam.rs`): doctor, engines, services, logs, snapshots,
+  automations, path/port checks, update-check, `rocm_command`.
+- Mutating tools gated by the existing `ui/approval.rs` modal (`install_sdk`,
+  `install_engine`, `launch_server`, `stop_server`, `watcher_enable/disable`)
+  plus update/comfyui/uninstall/setup and automations review/approve/reject/edit.
+- Natural-language **`/plan`** (Ask → Plan → Review → Run).
+- **`/provider`** live backend switching + the **Anthropic** backend; the full
+  slash-command set.
+- A **30-command parity map** + accept/retire checklists:
+  [`docs/dash-parity-map.md`](docs/dash-parity-map.md),
+  [`docs/dash-parity-checklist.md`](docs/dash-parity-checklist.md),
+  [`docs/tui-retirement-checklist.md`](docs/tui-retirement-checklist.md).
+
+The original gap analysis and build order below are kept for historical context;
+all stages are now done except the **gated** Stage-8 deletion.
 
 **What the dash Chat tab is missing vs `tui.rs`:**
 - Mutating ROCm tool-calls with **in-chat approval** (`install_sdk`,
@@ -77,7 +104,67 @@ ureq/reqwest partition intact.
 
 ---
 
-## 2. Per-process VRAM → model attribution (rocm dash)
+## 2. Background-helper (`rocm daemon`) wiring — regression
+
+**Status: DONE.** `rocm daemon` now runs the real foreground loop **in-process**
+via the `rocmd` library (`rocm` → `rocmd` lib; acyclic), matching the "built into
+rocm" policy. The helper is **autostarted on demand**, detached and
+double-spawn-guarded (`ensure_background_helper_running` /
+`background_helper_already_running`), from both `automations enable` and
+`rocm serve --managed`. `render_daemon_text` is retained as the `--status` view
+only. The original regression analysis below is kept for historical context.
+
+**Status (historical): regression. The background helper is dormant.**
+`rocm daemon` is documented as *"Start the background helper in the foreground"*
+(`apps/rocm/src/main.rs:250`), but its handler only renders a status panel:
+
+```rust
+// apps/rocm/src/main.rs:1298
+Some(Command::Daemon) => {
+    print!("{}", render_daemon_text(&paths, &config));   // status only — no loop
+    Ok(())
+}
+```
+
+The real foreground loop, `run_daemon()`, exists **only in the separate `rocmd`
+binary** (`apps/rocmd/src/lib.rs:2808`, reached via `rocmd run`). But:
+
+- `apps/rocm` does **not** depend on `rocmd` (its `Cargo.toml` pulls
+  `rocm-core`, `rocm-dash-daemon`, `rocm-dash-tui` — not `rocmd`).
+- **Nothing in `apps/rocm` ever spawns `rocmd run` or `rocm daemon` as a running
+  loop.** The only `"daemon"` references are status renderers and tests.
+- `daemon_binary_path()` (`crates/rocm-core/src/lib.rs:5859`) resolves to the
+  **`rocm`** binary itself, and `main.rs:10666` states *"policy: built into
+  rocm; no separate rocmd binary is required"* — i.e. the intended design is
+  that `rocm daemon` **is** the helper loop, re-executing itself. That loop
+  logic is missing; it is stubbed to the status panel.
+
+**Effect:** automation checks and on-demand local model servers have no helper
+to run, regardless of the §1 chat-parity work. `run_daemon()` in `rocmd` is
+orphaned code the product never invokes.
+
+**Build order:**
+1. **Decide the model** — either (a) fold `rocmd`'s `run_daemon()` into the
+   `rocm` crate so `rocm daemon` runs the loop in-process (matches the
+   "built into rocm" policy), or (b) have `rocm daemon` spawn `rocmd run`, with
+   automations/managed-serve starting it on demand. (a) is the stated direction.
+2. **Wire the chosen entry** so `rocm daemon` actually starts the loop in the
+   foreground; keep `render_daemon_text` as the *status* view only.
+3. **On-demand start** — have automation-enable and `rocm serve --managed`
+   ensure the helper is running (spawn detached if not), then update
+   `AutomationRuntimeState` so the status panel reflects reality.
+4. **Reconcile `rocmd`** — once the loop lives in `rocm`, either remove the
+   orphaned `rocmd` binary or make it a thin alias; don't ship two daemons.
+5. **Verify** — `rocm daemon` runs and accepts work; automation checks fire;
+   status panel shows `running`; clean shutdown.
+
+**Invariants:** keep the user-owned unix socket (mode 0600) hardening from #17;
+no second listener/socket competing with the `rocm dash` telemetry daemon
+(`rocm-dash-daemon`) — these are distinct daemons and must stay distinct.
+
+---
+
+## 3. Per-process VRAM → model attribution (rocm dash)
 
 **Goal:** attribute each running model/serving instance's GPU VRAM by joining
 `amd-smi` per-process VRAM to the owning model/container — so the dashboard

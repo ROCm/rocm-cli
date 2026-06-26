@@ -42,6 +42,11 @@ pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// Max tool-calling turns the model may take before producing a final answer.
 const MAX_TOOL_TURNS: usize = 5;
 
+/// Max tokens the model may emit in its final answer. Shared by all three
+/// backends (RigAgentClient, ChatGptAgentClient, AnthropicAgentClient) so the
+/// budget is defined once. `u64` to match rig's `AgentBuilder::max_tokens`.
+const MAX_AGENT_TOKENS: u64 = 1024;
+
 /// Default system preamble for the dashboard assistant.
 const DEFAULT_PREAMBLE: &str = "You are the rocm-dash assistant, embedded in a terminal dashboard for AMD \
      Instinct GPU telemetry and benchmarks. Use the provided tools (gpu_status, \
@@ -112,6 +117,29 @@ pub fn annotate_reply(reply: String, skills: &[String]) -> String {
         }
     }
     format!("{reply}\n⚙ via: {}", seen.join(", "))
+}
+
+/// Drive a built rig prompt request to completion under the shared
+/// [`REQUEST_TIMEOUT`], then annotate the reply with the Skills that fired.
+///
+/// The shared `complete()` tail for all three backends (RigAgentClient,
+/// ChatGptAgentClient, AnthropicAgentClient): their `req` types differ (rig
+/// typestate), so this is generic over `IntoFuture<Output = Result<String, E>>`
+/// with a `Display` error. A timeout maps to [`AgentError::Timeout`]; a backend
+/// error maps to [`AgentError::Request`]; success is annotated with the fired
+/// Skills. ONE definition of the tail, used by all three.
+async fn finish_agent_request<F, E>(req: F, fired: &FiredLog) -> Result<String, AgentError>
+where
+    F: std::future::IntoFuture<Output = Result<String, E>>,
+    E: std::fmt::Display,
+{
+    let reply = match tokio::time::timeout(REQUEST_TIMEOUT, req.into_future()).await {
+        Err(_) => return Err(AgentError::Timeout),
+        Ok(Ok(reply)) => reply,
+        Ok(Err(e)) => return Err(AgentError::Request(e.to_string())),
+    };
+    let skills = fired.lock().map(|g| g.clone()).unwrap_or_default();
+    Ok(annotate_reply(reply, &skills))
 }
 
 // ---------------------------------------------------------------------------
@@ -944,7 +972,6 @@ impl AgentClient for RigAgentClient {
     ) -> Result<String, AgentError> {
         use rig::client::CompletionClient;
         use rig::completion::Prompt;
-        use std::future::IntoFuture;
 
         let Some((last, prior)) = history.split_last() else {
             return Err(AgentError::Empty);
@@ -956,7 +983,7 @@ impl AgentClient for RigAgentClient {
             .client
             .agent(&self.model)
             .preamble(&self.preamble)
-            .max_tokens(1024);
+            .max_tokens(MAX_AGENT_TOKENS);
         // Telemetry + skill registry tools (shared registration site).
         let agent = register_telemetry_tools(agent, &snap, &fired);
         // Read-only ROCm machine-inspection tools (forward across the seam).
@@ -975,14 +1002,7 @@ impl AgentClient for RigAgentClient {
             .max_turns(MAX_TOOL_TURNS)
             .with_history(build_messages(prior));
 
-        let reply = match tokio::time::timeout(REQUEST_TIMEOUT, req.into_future()).await {
-            Err(_) => return Err(AgentError::Timeout),
-            Ok(Ok(reply)) => reply,
-            Ok(Err(e)) => return Err(AgentError::Request(e.to_string())),
-        };
-
-        let skills = fired.lock().map(|g| g.clone()).unwrap_or_default();
-        Ok(annotate_reply(reply, &skills))
+        finish_agent_request(req, &fired).await
     }
 }
 
@@ -1206,7 +1226,6 @@ impl AgentClient for ChatGptAgentClient {
         use rig::agent::AgentBuilder;
         use rig::completion::Prompt;
         use rig::providers::chatgpt::ResponsesCompletionModel;
-        use std::future::IntoFuture;
 
         let Some((last, prior)) = history.split_last() else {
             return Err(AgentError::Empty);
@@ -1225,7 +1244,7 @@ impl AgentClient for ChatGptAgentClient {
         let model = ResponsesCompletionModel::new(self.client.clone(), self.model.clone());
         let agent = AgentBuilder::new(model)
             .preamble(&self.preamble)
-            .max_tokens(1024);
+            .max_tokens(MAX_AGENT_TOKENS);
         // Telemetry + skill registry tools (shared registration site).
         let agent = register_telemetry_tools(agent, &snap, &fired);
         // Read-only ROCm machine-inspection tools (forward across the seam).
@@ -1244,14 +1263,7 @@ impl AgentClient for ChatGptAgentClient {
             .max_turns(MAX_TOOL_TURNS)
             .with_history(build_messages(prior));
 
-        let reply = match tokio::time::timeout(REQUEST_TIMEOUT, req.into_future()).await {
-            Err(_) => return Err(AgentError::Timeout),
-            Ok(Ok(reply)) => reply,
-            Ok(Err(e)) => return Err(AgentError::Request(e.to_string())),
-        };
-
-        let skills = fired.lock().map(|g| g.clone()).unwrap_or_default();
-        Ok(annotate_reply(reply, &skills))
+        finish_agent_request(req, &fired).await
     }
 }
 
@@ -1319,7 +1331,6 @@ impl AgentClient for AnthropicAgentClient {
     ) -> Result<String, AgentError> {
         use rig::client::CompletionClient;
         use rig::completion::Prompt;
-        use std::future::IntoFuture;
 
         let Some((last, prior)) = history.split_last() else {
             return Err(AgentError::Empty);
@@ -1334,7 +1345,7 @@ impl AgentClient for AnthropicAgentClient {
             .client
             .agent(&self.model)
             .preamble(&self.preamble)
-            .max_tokens(1024);
+            .max_tokens(MAX_AGENT_TOKENS);
         // Telemetry + skill registry tools (shared registration site).
         let agent = register_telemetry_tools(agent, &snap, &fired);
         // Read-only ROCm machine-inspection tools (forward across the seam).
@@ -1353,14 +1364,7 @@ impl AgentClient for AnthropicAgentClient {
             .max_turns(MAX_TOOL_TURNS)
             .with_history(build_messages(prior));
 
-        let reply = match tokio::time::timeout(REQUEST_TIMEOUT, req.into_future()).await {
-            Err(_) => return Err(AgentError::Timeout),
-            Ok(Ok(reply)) => reply,
-            Ok(Err(e)) => return Err(AgentError::Request(e.to_string())),
-        };
-
-        let skills = fired.lock().map(|g| g.clone()).unwrap_or_default();
-        Ok(annotate_reply(reply, &skills))
+        finish_agent_request(req, &fired).await
     }
 }
 
@@ -1798,6 +1802,54 @@ mod tests {
         };
         let out = tool.call(json!({})).await.expect("tool call ok");
         assert!(out.get("error").and_then(Value::as_str).is_some());
+    }
+
+    /// Executor whose `execute`/`execute_approved` both return a seam-level
+    /// `Error`, exercising the recoverable error path (not None, not Approval).
+    #[derive(Debug)]
+    struct FakeErrorExec;
+    impl crate::tool_exec::RocmToolExecutor for FakeErrorExec {
+        fn execute(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
+            RocmToolOutcome::Error("boom".to_string())
+        }
+        fn execute_approved(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
+            RocmToolOutcome::Error("boom".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_tool_seam_error_is_recoverable() {
+        // Edge: the injected executor returns RocmToolOutcome::Error("boom").
+        // call() must return a Value carrying an `error` key (recoverable),
+        // never panic — the model can read and recover from it.
+        let exec: SharedRocmToolExecutor = Arc::new(FakeErrorExec);
+        let tool = DoctorRocmTool {
+            executor: Some(exec),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        let out = tool.call(json!({})).await.expect("tool call ok (no panic)");
+        assert_eq!(out.get("error").and_then(Value::as_str), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn mutating_tool_seam_error_is_recoverable() {
+        // Edge: a mutating tool whose executor returns Error("boom") on the
+        // validate step (e.g. bad args) returns the error as a recoverable
+        // Value — no approval surfaced, no panic.
+        let exec: SharedRocmToolExecutor = Arc::new(FakeErrorExec);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ClientMsg>();
+        let tool = LaunchServerRocmTool {
+            executor: Some(exec),
+            approval_tx: Some(tx),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        let out = tool
+            .call(json!({ "model": "m" }))
+            .await
+            .expect("tool call ok (no panic)");
+        assert_eq!(out.get("error").and_then(Value::as_str), Some("boom"));
+        // No approval intent is surfaced on the error path.
+        assert!(rx.try_recv().is_err(), "error path surfaces no approval");
     }
 
     #[test]
