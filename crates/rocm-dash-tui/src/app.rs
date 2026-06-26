@@ -1568,13 +1568,17 @@ pub async fn run(args: ResolvedArgs) -> color_eyre::Result<()> {
 
     let res = event_loop(&mut terminal, &args).await;
 
-    disable_raw_mode()?;
-    execute!(
+    // Best-effort terminal restoration: never let teardown failures override the
+    // session result. If the controlling terminal already went away (e.g. the
+    // PTY closed on quit), these writes can fail with a broken pipe — that must
+    // not turn a clean exit into a non-zero one.
+    let _ = disable_raw_mode();
+    let _ = execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    );
+    let _ = terminal.show_cursor();
     res
 }
 
@@ -1929,7 +1933,18 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         }
                     }
                     Some(Ok(CtEvent::Resize(_, _))) => { /* repaint */ }
-                    Some(Err(e)) => return Err(e.into()),
+                    // A terminal event-source error means the controlling
+                    // terminal went away (e.g. the PTY/stdin closed) — the
+                    // session is over, so quit cleanly rather than propagating a
+                    // fatal error. Propagating it made `rocm chat` exit non-zero
+                    // when its terminal closed before the first key was read
+                    // (e.g. the acceptance PTY smoke under the embedded-daemon
+                    // start delay); the legacy blocking reader treated this as
+                    // end-of-session too. Mirrors the `None => break` EOF arm.
+                    Some(Err(e)) => {
+                        tracing::debug!(error = %e, "terminal event stream ended; quitting");
+                        break;
+                    }
                     None => break,
                     _ => {}
                 }

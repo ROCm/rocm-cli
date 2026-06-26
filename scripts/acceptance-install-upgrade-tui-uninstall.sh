@@ -311,6 +311,11 @@ set +e
 tui_status=$?
 set -e
 if [[ "${tui_status}" -ne 0 ]]; then
+  # Surface the captured TUI session so a non-zero exit is debuggable in CI
+  # (e.g. a panic or an error returned on quit) instead of failing opaquely.
+  echo "--- TUI smoke log (${TUI_LOG}) ---" >&2
+  cat "${TUI_LOG}" >&2 || true
+  echo "--- end TUI smoke log ---" >&2
   fail "TUI smoke exited with status ${tui_status}"
 fi
 
