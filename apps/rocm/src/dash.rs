@@ -165,10 +165,16 @@ fn automation_summaries(config: &RocmCliConfig) -> Vec<AutomationSummary> {
 }
 
 /// Resolve the TUI args from the unified config + environment.
+///
+/// `anthropic_api_key` is resolved by the caller *before* any tokio runtime is
+/// entered: the secure-store fallback uses a blocking zbus client that spins its
+/// own runtime, which panics ("cannot start a runtime from within a runtime") if
+/// invoked from inside `run_async`. See [`anthropic_api_key_for_dash`].
 pub fn resolved_args(
     config: &RocmCliConfig,
     paths: &AppPaths,
     initial_tab: ActiveTab,
+    anthropic_api_key: Option<String>,
 ) -> ResolvedArgs {
     let t = &config.dashboard.tui;
     ResolvedArgs {
@@ -184,7 +190,7 @@ pub fn resolved_args(
             .ok()
             .filter(|v| !v.is_empty()),
         chat_api_key: chat_api_key_from_env(),
-        anthropic_api_key: anthropic_api_key_for_dash(),
+        anthropic_api_key,
         chat_auto_consent: false,
         chat_mock: false,
         model_recipes: model_recipe_summaries(),
@@ -213,6 +219,9 @@ pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
     } else {
         replay
     };
+    // Resolve the Anthropic key before the runtime exists; the secure-store
+    // fallback blocks on its own zbus runtime and would panic inside `run_async`.
+    let anthropic_api_key = anthropic_api_key_for_dash();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -223,6 +232,7 @@ pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
         replay,
         chat_mock,
         ActiveTab::Overview,
+        anthropic_api_key,
     ))
 }
 
@@ -232,11 +242,21 @@ pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
 pub fn run_chat(chat_mock: bool) -> Result<()> {
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths)?;
+    // Resolve the Anthropic key before the runtime exists; the secure-store
+    // fallback blocks on its own zbus runtime and would panic inside `run_async`.
+    let anthropic_api_key = anthropic_api_key_for_dash();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("building tokio runtime for the dashboard")?;
-    rt.block_on(run_async(config, paths, None, chat_mock, ActiveTab::Chat))
+    rt.block_on(run_async(
+        config,
+        paths,
+        None,
+        chat_mock,
+        ActiveTab::Chat,
+        anthropic_api_key,
+    ))
 }
 
 async fn run_async(
@@ -245,8 +265,9 @@ async fn run_async(
     replay: Option<PathBuf>,
     chat_mock: bool,
     initial_tab: ActiveTab,
+    anthropic_api_key: Option<String>,
 ) -> Result<()> {
-    let mut args = resolved_args(&config, &paths, initial_tab);
+    let mut args = resolved_args(&config, &paths, initial_tab, anthropic_api_key);
     args.replay = replay.clone();
     args.chat_mock = chat_mock;
     // Inject the bin-side tool-execution seam for a live dash only. Demo/replay
@@ -354,7 +375,7 @@ mod tests {
     #[test]
     fn resolved_args_take_connect_and_theme_from_config() {
         let c = cfg();
-        let args = resolved_args(&c, &paths(), ActiveTab::Overview);
+        let args = resolved_args(&c, &paths(), ActiveTab::Overview, None);
         assert_eq!(args.connect, c.dashboard.tui.connect);
         assert_eq!(args.theme, c.dashboard.tui.theme);
         assert!(!args.chat_mock);

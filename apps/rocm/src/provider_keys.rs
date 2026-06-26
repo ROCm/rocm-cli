@@ -229,9 +229,45 @@ impl ProviderKeyStore for NativeProviderKeyStore {
     }
 }
 
-fn with_native_entry<T>(provider: &str, action: impl FnOnce(&Entry) -> Result<T>) -> Result<T> {
-    let entry = native_entry(provider)?;
-    action(&entry)
+/// Build the native credential entry and run `action` against it.
+///
+/// The native stores drive their own blocking runtime — notably the Linux Secret
+/// Service via `zbus::blocking`, which calls `block_on` internally. If a tokio
+/// runtime *context* is already entered on the calling thread, that nested
+/// `block_on` panics with "Cannot start a runtime from within a runtime". The
+/// dash resolves keys off-runtime, but this is the single chokepoint for every
+/// store op (get/set/clear) and for `resolve_provider_api_key` /
+/// `provider_key_status`, so guard the whole class here: when a runtime is
+/// active, run the entry build *and* the action on a fresh OS thread that has no
+/// runtime entered.
+///
+/// `tokio::task::block_in_place` is deliberately NOT used — it keeps the runtime
+/// context entered (and panics outright on a current-thread runtime), so the
+/// nested `block_on` would still panic. Only a thread with no entered runtime
+/// escapes. `Handle::try_current()` also returns `Ok` on tokio's blocking-pool
+/// threads (where the context is not actually entered and no panic would occur),
+/// so this is a conservative over-trigger: at worst one short-lived thread.
+fn with_native_entry<T: Send>(
+    provider: &str,
+    action: impl FnOnce(&Entry) -> Result<T> + Send,
+) -> Result<T> {
+    let run = move || {
+        let entry = native_entry(provider)?;
+        action(&entry)
+    };
+    if tokio::runtime::Handle::try_current().is_ok() {
+        // Must `join()` the handle and convert a worker panic into an `Err`:
+        // otherwise `thread::scope` re-propagates the panic when the scope ends,
+        // which would defeat the guard by aborting the process anyway.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(run)
+                .join()
+                .map_err(|_| anyhow!("secure key-store access thread panicked"))?
+        })
+    } else {
+        run()
+    }
 }
 
 fn native_entry(provider: &str) -> Result<Entry> {
@@ -393,5 +429,32 @@ mod tests {
         assert!(error.contains("requires a saved API key"));
         assert!(error.contains("rocm config set-provider-key anthropic"));
         assert!(error.contains("ANTHROPIC_API_KEY"));
+    }
+
+    /// Regression for the "Cannot start a runtime from within a runtime" panic:
+    /// the native store reaches a blocking `block_on` (Linux Secret Service via
+    /// zbus). Accessing it from inside a live tokio runtime must NOT panic — the
+    /// `with_native_entry` guard reroutes the blocking work onto a fresh thread.
+    ///
+    /// This validates the no-panic / graceful-`Err` contract, not successful
+    /// retrieval: CI has no Secret Service, so the store returns `Ok(None)` (no
+    /// entry) or an `Err` (unavailable). Either is fine; a panic is not. Pre-fix
+    /// this aborted with the nested-runtime panic.
+    #[test]
+    fn native_store_access_inside_tokio_runtime_does_not_panic() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let outcome = rt.block_on(async {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Read-only: never writes to a real keychain on dev machines.
+                NativeProviderKeyStore.get_secret("anthropic")
+            }))
+        });
+        assert!(
+            outcome.is_ok(),
+            "native key-store access panicked inside a tokio runtime (runtime-in-runtime)"
+        );
     }
 }
