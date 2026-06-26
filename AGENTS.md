@@ -40,6 +40,12 @@ Identity requirements stay intact:
 - include DCO sign-off (`git commit -s`)
 - keep commit signing enabled when configured; do not bypass with `--no-gpg-sign`, `-n`, or `--no-verify`
 
+Signing and sign-off are now **enforced**, not just policy: local prek hooks
+check signing config on every commit (`commit-signing-configured`) and verify
+the full range on push (`verify-commits`), and a blocking CI gate
+(`commit-signatures`) re-checks every PR with GitHub "Verified" status. See
+`docs/commit-signatures.md`.
+
 Content restrictions for upstream surfaces:
 
 - do not include internal/proprietary names, aliases, URLs, hostnames, gateways, cluster names, or registry paths

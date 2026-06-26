@@ -276,6 +276,18 @@ prek install -t pre-push    # heavier checks on push (clippy + tests)
 prek run --all-files        # run everything against the whole tree
 ```
 
+Commits must be both cryptographically **signed** and carry a DCO
+**`Signed-off-by`** trailer (use `git commit -s`). This is enforced by the
+prek hooks above and by a blocking CI check. Enable signing once with:
+
+```bash
+git config --global gpg.format ssh
+git config --global user.signingkey ~/.ssh/id_ed25519.pub
+git config --global commit.gpgsign true
+```
+
+See `docs/commit-signatures.md` for details (GPG signing, GitHub "Verified", and troubleshooting).
+
 ## More docs
 
 - Testing and verification: `docs/testing.md`

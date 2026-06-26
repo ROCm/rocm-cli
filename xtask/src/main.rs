@@ -8,6 +8,8 @@
 //! project's signing, CI verification, and test keygen no longer depend on the
 //! `openssl` CLI. Run via the workspace alias `cargo xtask <command>`.
 
+mod verify_commits;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode};
@@ -67,6 +69,22 @@ enum Command {
         /// Verify the table is up to date without writing; exit non-zero if it would change.
         #[arg(long)]
         check: bool,
+    },
+    /// Verify that commits in a range are cryptographically signed and carry a
+    /// DCO `Signed-off-by` trailer.
+    VerifyCommits {
+        /// Base ref for the `<base>..HEAD` range. Defaults to the PR base branch
+        /// (`origin/$GITHUB_BASE_REF`) in CI, otherwise `origin/main`.
+        #[arg(long)]
+        base: Option<String>,
+        /// Strict mode: require GitHub to report each signature as "Verified"
+        /// (shells out to the `gh` CLI). Mutually exclusive with `--check-config`.
+        #[arg(long, conflicts_with = "check_config")]
+        require_verified: bool,
+        /// Assert only that commit signing is configured locally, without
+        /// inspecting any commits. Mutually exclusive with `--base`/`--require-verified`.
+        #[arg(long, conflicts_with_all = ["base", "require_verified"])]
+        check_config: bool,
     },
 }
 
@@ -263,6 +281,20 @@ fn run() -> Result<()> {
             verify_rsa_pkcs1_sha256_signature(&public_pem, &payload, &signature_bytes, &label)?;
         }
         Command::Manifest { check } => run_manifest(check)?,
+        Command::VerifyCommits {
+            base,
+            require_verified,
+            check_config,
+        } => {
+            // `--check-config` is declared `conflicts_with_all = ["base",
+            // "require_verified"]`, so clap rejects those combinations before we
+            // get here.
+            if check_config {
+                verify_commits::check_config()?;
+            } else {
+                verify_commits::run(base, require_verified)?;
+            }
+        }
     }
     Ok(())
 }
