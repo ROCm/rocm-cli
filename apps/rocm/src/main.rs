@@ -29,14 +29,16 @@ use rocm_core::{
     PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF,
     WatcherMode, append_audit_event, builtin_model_recipes, builtin_watcher, builtin_watchers,
     connect_tcp_stream, daemon_binary_path, default_engine_for_platform,
-    default_interactive_shell_program, engine_binary_path, engine_plugin_dirs, format_host_port,
-    format_http_base_url, generate_service_id, interactive_terminal, load_model_recipe_registry,
-    load_recent_audit_events, load_recent_automation_events, load_recent_automation_proposals,
-    managed_pip_cache_dir, managed_service_endpoint_model_ready, model_artifact_cache_status,
-    prepend_runtime_path, process_is_running, read_tcp_stream_to_string,
-    resolve_builtin_model_recipe, resolve_model_recipe, runtime_install_root_is_protected,
-    runtime_path_is_same_or_inside, runtime_python_activation_hint, runtime_python_env_bin_dir,
-    runtime_python_executable_in_env, shell_command_for_host, write_all_tcp_stream,
+    default_interactive_shell_program, detect_host_gpu_summary, engine_binary_path,
+    engine_plugin_dirs, format_host_port, format_http_base_url, generate_service_id,
+    interactive_terminal, load_model_recipe_registry, load_recent_audit_events,
+    load_recent_automation_events, load_recent_automation_proposals, managed_pip_cache_dir,
+    managed_service_endpoint_model_ready, model_artifact_cache_status,
+    preferred_serve_engine_for_host_gpu_summary, prepend_runtime_path, process_is_running,
+    read_tcp_stream_to_string, resolve_builtin_model_recipe, resolve_model_recipe,
+    runtime_install_root_is_protected, runtime_path_is_same_or_inside,
+    runtime_python_activation_hint, runtime_python_env_bin_dir, runtime_python_executable_in_env,
+    shell_command_for_host, write_all_tcp_stream,
 };
 use rocm_engine_protocol::{
     DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy,
@@ -54,6 +56,8 @@ use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
+use std::process::ExitStatus;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -431,6 +435,9 @@ rocm install sdk --family gfx110X-all --dry-run")]
         /// Resolve the install plan without changing files.
         #[arg(long)]
         dry_run: bool,
+        /// Approve required system-package installs (such as OpenMPI for vLLM) without asking.
+        #[arg(long)]
+        yes: bool,
     },
     /// Preview or install Linux AMD driver support.
     Driver {
@@ -469,6 +476,9 @@ rocm engines install pytorch --reinstall")]
         /// Reinstall even if the engine already exists.
         #[arg(long)]
         reinstall: bool,
+        /// Approve required system-package installs (such as OpenMPI for vLLM) without asking.
+        #[arg(long)]
+        yes: bool,
     },
     /// Open a shell with the selected engine environment activated.
     Shell {
@@ -1875,6 +1885,7 @@ fn install(target: InstallTarget) -> Result<()> {
             build_date,
             family,
             dry_run,
+            yes,
         } => {
             let format_name = match format {
                 InstallFormat::Wheel => "wheel",
@@ -1906,6 +1917,26 @@ fn install(target: InstallTarget) -> Result<()> {
                     print!("{output}");
                     if let Some(finalized) = finalized {
                         print_sdk_install_success(&finalized);
+                        if let Err(error) =
+                            maybe_auto_install_sdk_preferred_engine(&paths, &finalized, yes)
+                        {
+                            record_cli_audit_event(
+                                &paths,
+                                "engine",
+                                "engine_auto_install",
+                                "error",
+                                format!(
+                                    "auto-install failed engine=vllm runtime_id={} family={}: {error}",
+                                    finalized.runtime_key, finalized.family
+                                ),
+                                None,
+                            );
+                            eprintln!("warning: automatic vLLM install failed: {error}");
+                            eprintln!(
+                                "warning: SDK install completed; you can run `rocm engines install vllm --runtime-id {}` after vLLM is available in that runtime",
+                                finalized.runtime_key
+                            );
+                        }
                     }
                     record_cli_audit_event(
                         &paths,
@@ -3009,10 +3040,19 @@ fn read_os_release() -> Result<String> {
 }
 
 fn run_driver_shell_command(command: &str) -> Result<()> {
+    run_shell_command_with_stdin(command, Stdio::null())
+}
+
+/// Run a hardcoded shell command, wiring its stdin to `stdin`.
+///
+/// Most install commands run with a null stdin, but privileged commands that may
+/// trigger an interactive `sudo` password prompt (such as the OpenMPI install
+/// approved with `--yes`) must inherit the terminal so the user can respond.
+fn run_shell_command_with_stdin(command: &str, stdin: Stdio) -> Result<()> {
     let (program, args) = shell_command_for_host(command);
     let status = ProcessCommand::new(program)
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .status()
         .with_context(|| format!("failed to launch `{command}`"))?;
     if !status.success() {
@@ -3071,6 +3111,7 @@ fn engines(command: EnginesCommand) -> Result<()> {
             runtime_id,
             python_version,
             reinstall,
+            yes,
         } => {
             let paths = AppPaths::discover()?;
             let mut config = RocmCliConfig::load(&paths)?;
@@ -3104,6 +3145,9 @@ fn engines(command: EnginesCommand) -> Result<()> {
                 return Ok(());
             }
             let env_root = env_root_for_engine_install(&paths, &config, &engine, &runtime_id)?;
+            if engine == "vllm" {
+                ensure_openmpi_for_vllm(yes)?;
+            }
             let response = engine_request_with_env_root::<_, InstallResponse>(
                 Some(&paths),
                 &engine,
@@ -3551,6 +3595,7 @@ fn select_serve_engine(
     explicit_engine: Option<&str>,
     configured_default: Option<&str>,
     recipe: Option<&ModelRecipeRecord>,
+    host_gpu_summary: Option<&rocm_core::HostGpuSummary>,
 ) -> ServeEngineSelection {
     if let Some(engine) = explicit_engine.filter(|value| !value.trim().is_empty()) {
         return ServeEngineSelection {
@@ -3564,6 +3609,21 @@ fn select_serve_engine(
             engine: engine.to_owned(),
             source: "configured default_engine",
         };
+    }
+
+    if let Some(engine) = host_gpu_summary.and_then(preferred_serve_engine_for_host_gpu_summary) {
+        // Only honor the GPU preference when the model's recipe can actually run on
+        // that engine. A recipe that exists but does not support the preferred engine
+        // (for example a GGUF model that only Lemonade can serve) must fall through to
+        // its own preferred engine instead of being forced onto an incompatible engine.
+        let recipe_supports_preferred =
+            recipe.is_none_or(|recipe| model_recipe_supports_engine(recipe, engine));
+        if recipe_supports_preferred {
+            return ServeEngineSelection {
+                engine: engine.to_owned(),
+                source: "detected ROCm GPU family prefers vLLM",
+            };
+        }
     }
 
     if let Some(engine) = recipe
@@ -3598,12 +3658,21 @@ fn serve_model_ref_for_engine(
     recipe: Option<&ModelRecipeRecord>,
     selected_engine: &str,
 ) -> String {
-    recipe
-        .filter(|recipe| model_recipe_supports_engine(recipe, selected_engine))
-        .map_or_else(
-            || model.to_owned(),
-            |recipe| recipe.canonical_model_id.clone(),
-        )
+    let Some(recipe) =
+        recipe.filter(|recipe| model_recipe_supports_engine(recipe, selected_engine))
+    else {
+        return model.to_owned();
+    };
+    if let Some(override_id) = recipe
+        .engine_recipes
+        .iter()
+        .find(|engine_recipe| engine_recipe.engine.eq_ignore_ascii_case(selected_engine))
+        .and_then(|engine_recipe| engine_recipe.model_id_override.as_deref())
+        .filter(|value| !value.trim().is_empty())
+    {
+        return override_id.to_owned();
+    }
+    recipe.canonical_model_id.clone()
 }
 
 fn serve_engine_selection_line(selection: &ServeEngineSelection) -> String {
@@ -3680,11 +3749,27 @@ fn serve(
     validate_bind_host(&host, allow_public_bind)?;
     let paths = AppPaths::discover()?;
     let mut config = RocmCliConfig::load(&paths)?;
+    // Host GPU detection can involve sysfs/WSL probing, so only run it when engine
+    // selection would actually consult it: no explicit `--engine` and no non-empty
+    // configured `default_engine`.
+    let host_gpu_summary = if engine
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || config
+            .default_engine
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        None
+    } else {
+        Some(detect_host_gpu_summary(Some(&paths)))
+    };
     let shared_recipe = resolve_model_recipe(&model)?;
     let serve_engine = select_serve_engine(
         engine.as_deref(),
         config.default_engine.as_deref(),
         shared_recipe.as_ref(),
+        host_gpu_summary.as_ref(),
     );
     let selected_engine = serve_engine.engine.clone();
     let engine_recipe = shared_recipe
@@ -3886,6 +3971,30 @@ fn attach_background_stdio(command: &mut ProcessCommand, log_path: Option<&Path>
 }
 
 #[cfg(not(windows))]
+fn managed_engine_startup_failure_detail(status: ExitStatus, log_path: &Path) -> String {
+    let mut recent_lines = read_optional_tail_lines(log_path, 80, "service log");
+    if recent_lines.is_empty() {
+        for _ in 0..5 {
+            thread::sleep(Duration::from_millis(120));
+            recent_lines = read_optional_tail_lines(log_path, 80, "service log");
+            if !recent_lines.is_empty() {
+                break;
+            }
+        }
+    }
+    if recent_lines.is_empty() {
+        return format!(
+            "managed engine exited immediately with status {status}; inspect {}",
+            log_path.display()
+        );
+    }
+    format!(
+        "managed engine exited immediately with status {status}; inspect {}\n\nrecent startup log output:\n{}",
+        log_path.display(),
+        recent_lines.join("\n")
+    )
+}
+#[cfg(not(windows))]
 fn managed_service_process_command(program: &Path, args: &[String]) -> ProcessCommand {
     let mut command = ProcessCommand::new(program);
     command.args(args);
@@ -4009,9 +4118,8 @@ fn start_managed_service(
             .context("failed to check managed engine startup state")?
         {
             bail!(
-                "managed engine exited immediately with status {}; inspect {}",
-                status,
-                record.log_path.display()
+                "{}",
+                managed_engine_startup_failure_detail(status, &record.log_path)
             );
         }
         child_pid
@@ -5040,10 +5148,207 @@ fn import_runtime_manifest(
 struct SdkInstallFinalization {
     runtime_key: String,
     install_root: PathBuf,
+    family: String,
 }
 
 fn print_sdk_install_success(finalized: &SdkInstallFinalization) {
     print!("{}", render_sdk_install_success(finalized));
+}
+
+fn preferred_engine_for_sdk_family(family: &str) -> Option<&'static str> {
+    let summary = rocm_core::HostGpuSummary {
+        therock_family: Some(family.to_owned()),
+        ..rocm_core::HostGpuSummary::default()
+    };
+    preferred_serve_engine_for_host_gpu_summary(&summary)
+}
+
+/// Ensure the OpenMPI runtime that vLLM requires is present before the vLLM wheel
+/// is installed. On Linux/WSL, when OpenMPI is missing, this installs it through
+/// the system package manager.
+///
+/// The privileged install runs automatically when it can be performed without an
+/// interactive prompt (the process is root, or passwordless `sudo` is available),
+/// or when `approved` (the `--yes` flag) is set. Otherwise the distro-aware plan
+/// is printed and the caller continues without it.
+///
+/// Returns `Ok(())` when OpenMPI is present, was installed, or could not be
+/// installed automatically without explicit approval (warn-and-continue). When
+/// the user explicitly approved the install with `--yes` and it still fails, the
+/// error is propagated so the caller does not silently proceed past a failure the
+/// user asked to perform.
+fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+    let status = rocm_core::openmpi::detect_openmpi();
+    if status.present {
+        return Ok(());
+    }
+
+    let os_release = read_os_release().unwrap_or_default();
+    let os_id = parse_os_release_field(&os_release, "ID").unwrap_or_default();
+    let id_like = parse_os_release_field(&os_release, "ID_LIKE").unwrap_or_default();
+    let plan = rocm_core::openmpi::build_openmpi_install_plan(&os_id, &id_like);
+
+    println!("openmpi setup");
+    println!(
+        "  reason: vLLM requires the OpenMPI runtime (libmpi.so / mpirun), which was not found"
+    );
+    if let Some(manager) = plan.package_manager.as_deref() {
+        println!("  package_manager: {manager}");
+    }
+    println!("  detail: {}", plan.reason);
+
+    if !plan.supported {
+        eprintln!(
+            "warning: could not determine how to install OpenMPI automatically; install it manually so vLLM can load libmpi.so"
+        );
+        return Ok(());
+    }
+
+    println!("  commands:");
+    for command in &plan.commands {
+        println!("    {command}");
+    }
+
+    let can_autoinstall = rocm_core::openmpi::can_autoinstall();
+    if !approved && !can_autoinstall {
+        for check in &plan.preflight_checks {
+            println!("  preflight: {check}");
+        }
+        eprintln!("warning: OpenMPI is required by vLLM but was not installed automatically");
+        eprintln!(
+            "warning: passwordless sudo is unavailable; run the commands above manually, or rerun with --yes to approve an interactive sudo prompt"
+        );
+        return Ok(());
+    }
+
+    println!(
+        "  approval: {}",
+        if approved {
+            "granted by --yes"
+        } else {
+            "auto (root or passwordless sudo available)"
+        }
+    );
+    match run_openmpi_install_plan(&plan) {
+        Ok(()) => {
+            if rocm_core::openmpi::detect_openmpi().present {
+                println!("  status: installed");
+            } else {
+                eprintln!(
+                    "warning: OpenMPI install commands completed but the runtime (libmpi.so / mpirun) was still not found; verify the package manager output above"
+                );
+            }
+            Ok(())
+        }
+        Err(error) => {
+            // An explicit `--yes` is a deliberate request to perform the install;
+            // surface the failure so the vLLM install does not silently proceed
+            // past something the user asked for. The auto (unapproved) path keeps
+            // the warn-and-continue behavior so a missing OpenMPI never blocks an
+            // otherwise-unattended install.
+            if approved {
+                return Err(error.context(
+                    "OpenMPI install approved with --yes failed; rerun the commands above manually or retry without --yes to continue without OpenMPI",
+                ));
+            }
+            eprintln!("warning: OpenMPI install failed: {error}");
+            eprintln!(
+                "warning: continuing vLLM install; run the commands above manually so vLLM can load libmpi.so"
+            );
+            Ok(())
+        }
+    }
+}
+
+fn run_openmpi_install_plan(plan: &rocm_core::openmpi::OpenMpiInstallPlan) -> Result<()> {
+    let root = rocm_core::openmpi::running_as_root();
+    for command in &plan.commands {
+        // When already root, `sudo` may be absent; run the command directly.
+        let command = if root {
+            command
+                .strip_prefix("sudo ")
+                .map_or_else(|| command.clone(), str::to_owned)
+        } else {
+            command.clone()
+        };
+        // Inherit stdin so an interactive `sudo` password prompt (the case the
+        // `--yes` approval exists for) can be answered. When already root or
+        // passwordless sudo is configured, sudo does not prompt and the inherited
+        // stdin is simply unused.
+        run_shell_command_with_stdin(&command, Stdio::inherit())
+            .with_context(|| format!("openmpi command failed: {command}"))?;
+    }
+    Ok(())
+}
+
+fn maybe_auto_install_sdk_preferred_engine(
+    paths: &AppPaths,
+    finalized: &SdkInstallFinalization,
+    approved: bool,
+) -> Result<()> {
+    let Some(engine) = preferred_engine_for_sdk_family(&finalized.family) else {
+        return Ok(());
+    };
+
+    println!("engine auto-install");
+    println!(
+        "  reason: detected ROCm GPU family prefers {engine} ({})",
+        finalized.family
+    );
+    println!("  engine: {engine}");
+    println!("  runtime_id: {}", finalized.runtime_key);
+
+    ensure_openmpi_for_vllm(approved)?;
+
+    let mut config = RocmCliConfig::load(paths)?;
+    let env_root = env_root_for_engine_install(paths, &config, engine, &finalized.runtime_key)?;
+    let response = engine_request_with_env_root::<_, InstallResponse>(
+        Some(paths),
+        engine,
+        EngineMethod::Install,
+        &InstallRequest {
+            runtime_id: finalized.runtime_key.clone(),
+            python_version: None,
+            reinstall: false,
+            env_root: env_root.clone(),
+        },
+        env_root.as_deref(),
+    )?;
+    println!("  reinstall: false");
+    println!("  env_id: {}", response.env_id);
+    println!("  env_path: {}", response.env_path);
+    for warning in response.warnings {
+        println!("  warning: {warning}");
+    }
+
+    if response.managed_env == Some(false) {
+        println!("  note: external runtime");
+    } else {
+        let engine_config = config.engine_config_mut(engine);
+        engine_config.last_installed_runtime_id = Some(finalized.runtime_key.clone());
+        engine_config.last_installed_env_id = Some(response.env_id.clone());
+        if engine_config.preferred_runtime_id.is_none() && engine_config.preferred_env_id.is_none()
+        {
+            engine_config.preferred_env_id = Some(response.env_id.clone());
+        }
+        config.save(paths)?;
+    }
+
+    record_cli_audit_event(
+        paths,
+        "engine",
+        "engine_auto_install",
+        "info",
+        format!(
+            "auto-installed engine={} runtime_id={} env_id={} family={}",
+            engine, finalized.runtime_key, response.env_id, finalized.family
+        ),
+        None,
+    );
+    Ok(())
 }
 
 fn render_sdk_install_success(finalized: &SdkInstallFinalization) -> String {
@@ -5086,6 +5391,7 @@ fn finalize_successful_sdk_install(paths: &AppPaths) -> Result<Option<SdkInstall
     Ok(Some(SdkInstallFinalization {
         runtime_key: activation.runtime_key,
         install_root: manifest.install_root,
+        family: manifest.family,
     }))
 }
 
@@ -11170,7 +11476,8 @@ fn render_service_logs_text_with_options(
     show_file_locations: bool,
 ) -> Result<String> {
     let record = load_managed_service(paths, service_id)?;
-    let recent_lines = read_tail_lines(&record.log_path, DEFAULT_LOG_TAIL_LINES, "service log")?;
+    let recent_lines =
+        read_optional_tail_lines(&record.log_path, DEFAULT_LOG_TAIL_LINES, "service log");
 
     let mut output = String::new();
     let _ = writeln!(output, "Service Log");
@@ -11474,9 +11781,8 @@ fn restart_internal_managed_service(
             record.status = "failed".to_owned();
             record.write()?;
             bail!(
-                "managed engine exited immediately with status {}; inspect {}",
-                status,
-                record.log_path.display()
+                "{}",
+                managed_engine_startup_failure_detail(status, &record.log_path)
             );
         }
         child.id()
@@ -11504,7 +11810,7 @@ fn restart_internal_managed_service(
 }
 
 fn signal_process_tree(pid: u32) -> Result<()> {
-    rocm_core::terminate_process(pid)?;
+    rocm_core::terminate_process_tree(pid)?;
     thread::sleep(Duration::from_millis(300));
     Ok(())
 }
@@ -12207,12 +12513,15 @@ pub(crate) fn render_sidebar_text(
     config: &RocmCliConfig,
     provider: &str,
     setup_ready: bool,
+    host_gpu_summary: Option<&rocm_core::HostGpuSummary>,
 ) -> String {
     let records = load_managed_services(paths).unwrap_or_default();
     let server_counts = managed_service_sidebar_counts(&records);
     let default_engine = config
         .default_engine
         .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| host_gpu_summary.and_then(preferred_serve_engine_for_host_gpu_summary))
         .unwrap_or(default_engine_for_platform());
     let mut output = String::new();
     let _ = writeln!(output, "ROCm CLI");
@@ -14277,6 +14586,7 @@ fn run_builtin_engine_serve_http(
             runtime_id,
             env_id,
             state_path,
+            log_path,
             engine_recipe,
         ),
         other => bail!("engine `{other}` is not built into this rocm binary"),
@@ -19035,7 +19345,7 @@ install therock";
     fn serve_engine_selection_uses_shared_recipe_when_no_override_exists() {
         let recipe = resolve_builtin_model_recipe("qwen32b").expect("qwen32b recipe");
 
-        let selection = select_serve_engine(None, None, Some(&recipe));
+        let selection = select_serve_engine(None, None, Some(&recipe), None);
 
         assert_eq!(
             selection,
@@ -19052,6 +19362,99 @@ install therock";
             serve_model_ref_for_engine("qwen32b", Some(&recipe), "vllm"),
             "Qwen/Qwen3-32B-FP8"
         );
+    }
+
+    #[test]
+    fn serve_engine_selection_prefers_vllm_for_supported_gpus() {
+        let summary = rocm_core::HostGpuSummary {
+            therock_family: Some("gfx90a".to_owned()),
+            ..rocm_core::HostGpuSummary::default()
+        };
+
+        let selection = select_serve_engine(None, None, None, Some(&summary));
+
+        // vLLM is unsupported on native Windows, so the GPU-family preference is gated
+        // off there and selection falls back to the platform default.
+        let expected = if cfg!(windows) {
+            ServeEngineSelection {
+                engine: "lemonade".to_owned(),
+                source: "platform default",
+            }
+        } else {
+            ServeEngineSelection {
+                engine: "vllm".to_owned(),
+                source: "detected ROCm GPU family prefers vLLM",
+            }
+        };
+        assert_eq!(selection, expected);
+    }
+
+    #[test]
+    fn serve_engine_selection_keeps_recipe_engine_when_gpu_preference_is_incompatible() {
+        // qwen-smoke is a tiny GGUF model that only Lemonade can serve and has no vLLM
+        // recipe. Even on a vLLM-preferred GPU it must stay on Lemonade rather than being
+        // forced onto vLLM (which cannot load the GGUF and fails to locate the model).
+        let recipe = resolve_builtin_model_recipe("qwen-smoke").expect("qwen-smoke recipe");
+        let summary = rocm_core::HostGpuSummary {
+            therock_family: Some("gfx90a".to_owned()),
+            ..rocm_core::HostGpuSummary::default()
+        };
+
+        let selection = select_serve_engine(None, None, Some(&recipe), Some(&summary));
+
+        assert_eq!(
+            selection,
+            ServeEngineSelection {
+                engine: "lemonade".to_owned(),
+                source: "recipe preferred engine; pass --engine <engine> to override; no automatic fallback",
+            }
+        );
+    }
+
+    #[test]
+    fn serve_qwen_uses_vllm_with_hf_repo_on_vllm_preferred_gpu() {
+        // The qwen alias serves the GGUF via Lemonade by default, but on a vLLM-preferred
+        // GPU it must serve the non-GGUF Hugging Face repo through vLLM.
+        let recipe = resolve_builtin_model_recipe("qwen").expect("qwen recipe");
+        let summary = rocm_core::HostGpuSummary {
+            therock_family: Some("gfx94X-dcgpu".to_owned()),
+            ..rocm_core::HostGpuSummary::default()
+        };
+
+        let selection = select_serve_engine(None, None, Some(&recipe), Some(&summary));
+        // On native Windows the vLLM preference is gated off, so the qwen recipe stays on
+        // its own preferred engine (Lemonade) instead of being routed to vLLM.
+        let expected = if cfg!(windows) {
+            ServeEngineSelection {
+                engine: "lemonade".to_owned(),
+                source: "recipe preferred engine; pass --engine <engine> to override; no automatic fallback",
+            }
+        } else {
+            ServeEngineSelection {
+                engine: "vllm".to_owned(),
+                source: "detected ROCm GPU family prefers vLLM",
+            }
+        };
+        assert_eq!(selection, expected);
+        assert_eq!(
+            serve_model_ref_for_engine("qwen", Some(&recipe), "vllm"),
+            "Qwen/Qwen3-4B-Instruct-2507"
+        );
+        // Lemonade keeps the GGUF canonical id.
+        assert_eq!(
+            serve_model_ref_for_engine("qwen", Some(&recipe), "lemonade"),
+            "Qwen3-4B-Instruct-2507-GGUF"
+        );
+    }
+
+    #[test]
+    fn sdk_install_auto_engine_selection_prefers_vllm_for_supported_families() {
+        // vLLM is unsupported on native Windows, so the SDK family preference is gated
+        // off there and resolves to None.
+        let expected = if cfg!(windows) { None } else { Some("vllm") };
+        assert_eq!(preferred_engine_for_sdk_family("gfx90a"), expected);
+        assert_eq!(preferred_engine_for_sdk_family("gfx94X-dcgpu"), expected);
+        assert_eq!(preferred_engine_for_sdk_family("gfx120X-all"), None);
     }
 
     #[test]
@@ -19072,8 +19475,8 @@ install therock";
     fn serve_engine_selection_respects_explicit_and_configured_engines() {
         let recipe = resolve_builtin_model_recipe("qwen32b").expect("qwen32b recipe");
 
-        let explicit = select_serve_engine(Some("llama.cpp"), Some("pytorch"), Some(&recipe));
-        let configured = select_serve_engine(None, Some("pytorch"), Some(&recipe));
+        let explicit = select_serve_engine(Some("llama.cpp"), Some("pytorch"), Some(&recipe), None);
+        let configured = select_serve_engine(None, Some("pytorch"), Some(&recipe), None);
 
         assert_eq!(
             explicit,
@@ -19113,6 +19516,7 @@ install therock";
                     },
                 ],
                 notes: vec!["adapter hint".to_owned()],
+                model_id_override: None,
             },
             rocm_core::ModelRecipeEngineRecord {
                 engine: "sglang".to_owned(),
@@ -19121,6 +19525,7 @@ install therock";
                 preferred_endpoint: None,
                 unsupported_combinations: Vec::new(),
                 notes: Vec::new(),
+                model_id_override: None,
             },
         ];
 
@@ -20966,7 +21371,7 @@ VERSION_ID="41"
             record.write()?;
         }
 
-        let rendered = render_sidebar_text(&paths, &RocmCliConfig::default(), "local", true);
+        let rendered = render_sidebar_text(&paths, &RocmCliConfig::default(), "local", true, None);
         let _ = fs::remove_dir_all(root);
 
         assert!(rendered.contains("Local servers: none ready"));
@@ -21254,6 +21659,7 @@ VERSION_ID="41"
                 reason: "vLLM ROCm serving is Linux/WSL only".to_owned(),
             }],
             notes: vec!["metadata only; not applied to launches yet".to_owned()],
+            model_id_override: None,
         }];
         let mut output = String::new();
 

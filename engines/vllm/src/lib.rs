@@ -5,8 +5,8 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use rocm_core::{
-    AppPaths, DEFAULT_LOCAL_PORT, format_http_base_url, openai_models_endpoint_has_model,
-    require_nonempty,
+    AppPaths, DEFAULT_LOCAL_PORT, ensure_uv_binary, format_http_base_url,
+    openai_models_endpoint_has_model, require_nonempty, uv_command_env, uv_pip_install_base,
 };
 use rocm_engine_protocol::{
     DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy,
@@ -23,15 +23,25 @@ use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsString;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const ENGINE_NAME: &str = "vllm";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const HEALTHCHECK_TIMEOUT_MS: u64 = 700;
 const DEFAULT_GPU_MEMORY_UTILIZATION: &str = "0.80";
+const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
+const MAX_TAIL_READ: u64 = 4 * 1024 * 1024;
+/// Default ROCm wheel index for `uv pip install vllm`.
+///
+/// This pins both the vLLM release and the ROCm ABI tag, so it can drift from
+/// the resolved runtime. Override it with `ROCM_CLI_VLLM_ROCM_INDEX_URL` to
+/// match a different vLLM/ROCm combination without rebuilding.
+const VLLM_ROCM_EXTRA_INDEX_URL: &str = "https://wheels.vllm.ai/rocm/0.23.0/rocm723";
+/// Default time to wait for vLLM to report readiness before giving up.
+const DEFAULT_VLLM_READY_TIMEOUT: Duration = Duration::from_mins(5);
 
 #[derive(Parser, Debug)]
 #[command(name = "rocm-engine-vllm", about = "rocm-cli vLLM engine adapter")]
@@ -142,6 +152,12 @@ struct ServiceFiles {
     log_path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+struct ManagedRuntimePython {
+    runtime_id: String,
+    python_executable: PathBuf,
+}
+
 pub fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -205,18 +221,24 @@ pub fn run_cli() -> Result<()> {
             env_id,
             state_path,
             engine_recipe_json,
-        } => serve_http(ServeHttpRequest {
-            service_id,
-            model_ref,
-            host,
-            port,
-            device_policy: parse_device_policy_arg(Some(&device_policy))?,
-            gpu_indices: parse_gpu_indices_arg(gpu.as_deref())?,
-            runtime_id,
-            env_id,
-            state_path,
-            engine_recipe: parse_engine_recipe_json(engine_recipe_json)?,
-        })?,
+        } => {
+            let log_path = AppPaths::discover()?
+                .engine_logs_dir(ENGINE_NAME)
+                .join(format!("{service_id}.log"));
+            serve_http(ServeHttpRequest {
+                service_id,
+                model_ref,
+                host,
+                port,
+                device_policy: parse_device_policy_arg(Some(&device_policy))?,
+                gpu_indices: parse_gpu_indices_arg(gpu.as_deref())?,
+                runtime_id,
+                env_id,
+                state_path,
+                log_path: Some(log_path),
+                engine_recipe: parse_engine_recipe_json(engine_recipe_json)?,
+            })?;
+        }
     }
     Ok(())
 }
@@ -236,6 +258,7 @@ pub fn builtin_serve_http(
     runtime_id: Option<String>,
     env_id: Option<String>,
     state_path: PathBuf,
+    log_path: Option<PathBuf>,
     engine_recipe: Option<EngineRecipeHint>,
 ) -> Result<()> {
     serve_http(ServeHttpRequest {
@@ -248,6 +271,7 @@ pub fn builtin_serve_http(
         runtime_id,
         env_id,
         state_path,
+        log_path,
         engine_recipe,
     })
 }
@@ -360,7 +384,31 @@ fn capabilities() -> EngineCapabilities {
 }
 
 fn install_response(request: InstallRequest) -> Result<InstallResponse> {
-    let runtime = resolve_vllm_runtime(Some(&request.runtime_id))?;
+    let already_installed = if request.reinstall {
+        None
+    } else {
+        resolve_vllm_runtime(Some(&request.runtime_id)).ok()
+    };
+    let runtime = if let Some(runtime) = already_installed {
+        runtime
+    } else {
+        let managed = resolve_managed_runtime_python(Some(&request.runtime_id))?.with_context(
+            || {
+                format!(
+                    "runtime `{}` did not resolve to a managed TheRock Python environment for automatic vLLM install",
+                    request.runtime_id
+                )
+            },
+        )?;
+        install_vllm_with_uv(&managed.python_executable, request.reinstall)?;
+        resolve_vllm_runtime(Some(&managed.runtime_id)).with_context(|| {
+            format!(
+                "vLLM install completed in {}, but runtime `{}` still could not be resolved",
+                managed.python_executable.display(),
+                managed.runtime_id
+            )
+        })?
+    };
     let env_path = runtime
         .command
         .parent()
@@ -397,14 +445,21 @@ fn runtime_is_managed(runtime: &VllmRuntime) -> bool {
 
 fn vllm_runtime_warnings(runtime: &VllmRuntime) -> Vec<String> {
     let runtime_scope = if runtime_is_managed(runtime) {
-        "rocm-cli records this vLLM command from a managed TheRock runtime; it does not pip install vLLM automatically"
+        "rocm-cli records this vLLM command from a managed TheRock runtime; `rocm engines install vllm` can install vLLM into that runtime"
     } else {
-        "rocm-cli records this as an external vLLM runtime; it does not pip install vLLM automatically"
+        "rocm-cli records this as an external vLLM runtime; install/upgrade vLLM in that environment manually"
     };
-    vec![
+    let mut warnings = vec![
         runtime_scope.to_owned(),
         "vLLM serving remains ROCm GPU required; no CPU fallback is used".to_owned(),
-    ]
+    ];
+    if !cfg!(windows) && !rocm_core::openmpi::detect_openmpi().present {
+        warnings.push(format!(
+            "OpenMPI runtime (libmpi.so / libmpi_cxx.so / mpirun) was not found; vLLM requires it. {}, or rerun `rocm engines install vllm --yes`.",
+            rocm_core::openmpi::install_hint()
+        ));
+    }
+    warnings
 }
 
 fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelResponse> {
@@ -474,6 +529,9 @@ fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
     let state_path = AppPaths::discover()?
         .engine_state_dir(ENGINE_NAME)
         .join(format!("{}.json", request.service_id));
+    let log_path = AppPaths::discover()?
+        .engine_logs_dir(ENGINE_NAME)
+        .join(format!("{}.log", request.service_id));
     let serve_request = ServeHttpRequest {
         service_id: request.service_id.clone(),
         model_ref: request.model_ref.clone(),
@@ -484,11 +542,9 @@ fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
         runtime_id: request.runtime_id.clone(),
         env_id: request.env_id.clone(),
         state_path: state_path.clone(),
+        log_path: Some(log_path.clone()),
         engine_recipe,
     };
-    let log_path = AppPaths::discover()?
-        .engine_logs_dir(ENGINE_NAME)
-        .join(format!("{}.log", request.service_id));
     let child = spawn_vllm_server(&serve_request, &runtime, Some(&log_path))?;
     let pid = child.id();
     write_running_state(&serve_request, &runtime, pid)?;
@@ -512,13 +568,32 @@ struct ServeHttpRequest {
     runtime_id: Option<String>,
     env_id: Option<String>,
     state_path: PathBuf,
+    log_path: Option<PathBuf>,
     engine_recipe: Option<EngineRecipeHint>,
 }
 
 fn serve_http(request: ServeHttpRequest) -> Result<()> {
     let runtime = resolve_vllm_runtime(request.runtime_id.as_deref())?;
-    let mut child = spawn_vllm_server(&request, &runtime, None)?;
+    let mut child = spawn_vllm_server(&request, &runtime, request.log_path.as_deref())?;
     write_running_state(&request, &runtime, child.id())?;
+
+    // Wait for the server to become ready, with comprehensive error logging
+    if let Err(e) = wait_for_vllm_ready(
+        &mut child,
+        &request.host,
+        request.port,
+        &request.model_ref,
+        vllm_ready_timeout(),
+        request.log_path.as_deref(),
+    ) {
+        // Terminate the whole vLLM process tree so the EngineCore worker (which
+        // holds the GPU allocation) does not survive and leak device memory.
+        let _ = rocm_core::terminate_process_tree(child.id());
+        let _ = child.wait();
+        write_terminal_state(&request.state_path, "failed")?;
+        return Err(e);
+    }
+
     let status = child.wait().context("failed waiting for vLLM server")?;
     write_terminal_state(
         &request.state_path,
@@ -546,6 +621,20 @@ fn spawn_vllm_server(
         bail!("vLLM launch requires ROCm GPU execution; no CPU fallback is used");
     }
 
+    // Fail fast when the OpenMPI runtime is missing. vLLM's ROCm torch wheel
+    // dlopen()s the OpenMPI libraries during `import torch`; without them the
+    // process dies with the cryptic `libmpi_cxx.so.40: cannot open shared object
+    // file` error from deep inside torch. Surface a clear, actionable message
+    // here instead so the user knows exactly what to install.
+    if !cfg!(windows) && !rocm_core::openmpi::detect_openmpi().present {
+        bail!(
+            "vLLM requires the OpenMPI runtime (libmpi.so / libmpi_cxx.so and mpirun), which was not found; \
+without it `import torch` fails with `libmpi_cxx.so.40: cannot open shared object file`. \
+{}, or run `rocm engines install vllm --yes` to install it automatically, then retry.",
+            rocm_core::openmpi::install_hint()
+        );
+    }
+
     if let Some(parent) = request.state_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -566,7 +655,15 @@ fn spawn_vllm_server(
         .arg("--port")
         .arg(request.port.to_string())
         .arg("--gpu-memory-utilization")
-        .arg(DEFAULT_GPU_MEMORY_UTILIZATION)
+        .arg(DEFAULT_GPU_MEMORY_UTILIZATION);
+    // vLLM's FULL CUDA-graph replay hangs ROCm gfx94x GPUs on the first decode
+    // (surfaces as `HW Exception ... reason :GPU Hang`, which kills the engine and
+    // drops every inference request). Eager mode disables CUDA graphs and keeps
+    // inference stable. Allow opting back in via env once a runtime ships a fix.
+    if vllm_enforce_eager_enabled() {
+        command.arg("--enforce-eager");
+    }
+    command
         .args(engine_recipe_launch_args(request.engine_recipe.as_ref()))
         .stdin(Stdio::null());
     apply_therock_env(&mut command, runtime)?;
@@ -762,11 +859,94 @@ fn runtime_from_python(
     })
 }
 
+fn install_vllm_with_uv(python: &Path, reinstall: bool) -> Result<()> {
+    let paths = AppPaths::discover()?;
+    let uv = ensure_uv_binary(&paths).context("failed to acquire uv binary for vLLM install")?;
+    let index_url = vllm_rocm_extra_index_url();
+    let mut args = uv_pip_install_base(python);
+    // Without `--reinstall`, `uv pip install vllm` is a no-op when the wheel is
+    // already present, which would silently turn a requested reinstall into a
+    // no-op. Force the reinstall so the caller's intent is honored.
+    if reinstall {
+        args.push("--reinstall".to_owned());
+    }
+    args.push("vllm".to_owned());
+    args.push("--extra-index-url".to_owned());
+    args.push(index_url.clone());
+    let output = ProcessCommand::new(&uv)
+        .args(args)
+        .envs(uv_command_env())
+        .output()
+        .context("failed to launch uv pip install for vLLM")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        "no output".to_owned()
+    };
+    bail!(
+        "`uv pip install vllm --extra-index-url {}` failed for {}: {}",
+        index_url,
+        python.display(),
+        detail
+    )
+}
+
 fn resolve_managed_runtime(runtime_id: Option<&str>) -> Result<Option<VllmRuntime>> {
+    let candidates = collect_managed_runtime_candidates(runtime_id)?;
+    for candidate in candidates {
+        if let Ok(runtime) = runtime_from_python(
+            candidate.python_executable,
+            &candidate.runtime_id,
+            &candidate.source,
+            candidate.sdk_root,
+            candidate.sdk_bin,
+            candidate.sdk_bin_paths,
+            candidate.sdk_library_paths,
+        ) {
+            return Ok(Some(runtime));
+        }
+    }
+    Ok(None)
+}
+
+fn resolve_managed_runtime_python(
+    runtime_id: Option<&str>,
+) -> Result<Option<ManagedRuntimePython>> {
+    let candidates = collect_managed_runtime_candidates(runtime_id)?;
+    let Some(candidate) = candidates.into_iter().next() else {
+        return Ok(None);
+    };
+    Ok(Some(ManagedRuntimePython {
+        runtime_id: candidate.runtime_id,
+        python_executable: candidate.python_executable,
+    }))
+}
+
+#[derive(Debug, Clone)]
+struct ManagedRuntimeCandidate {
+    runtime_id: String,
+    source: String,
+    python_executable: PathBuf,
+    sdk_root: Option<PathBuf>,
+    sdk_bin: Option<PathBuf>,
+    sdk_bin_paths: Vec<PathBuf>,
+    sdk_library_paths: Vec<PathBuf>,
+}
+
+fn collect_managed_runtime_candidates(
+    runtime_id: Option<&str>,
+) -> Result<Vec<ManagedRuntimeCandidate>> {
     let paths = AppPaths::discover()?;
     let registry = paths.data_dir.join("runtimes").join("registry");
     if !registry.is_dir() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let mut manifests = Vec::new();
     for entry in
@@ -788,6 +968,7 @@ fn resolve_managed_runtime(runtime_id: Option<&str>) -> Result<Option<VllmRuntim
     }
     manifests.sort_by_key(|(installed_at, _)| std::cmp::Reverse(*installed_at));
 
+    let mut candidates = Vec::new();
     for (_, manifest) in manifests {
         let Some(python) = manifest
             .python_executable
@@ -817,19 +998,17 @@ fn resolve_managed_runtime(runtime_id: Option<&str>) -> Result<Option<VllmRuntim
                     probe.library_paths.clone(),
                 )
             });
-        if let Ok(runtime) = runtime_from_python(
-            python,
-            &runtime_id,
-            &source,
+        candidates.push(ManagedRuntimeCandidate {
+            runtime_id,
+            source,
+            python_executable: python,
             sdk_root,
             sdk_bin,
             sdk_bin_paths,
             sdk_library_paths,
-        ) {
-            return Ok(Some(runtime));
-        }
+        });
     }
-    Ok(None)
+    Ok(candidates)
 }
 
 fn runtime_matches(manifest: &TheRockRuntimeManifest, requested: Option<&str>) -> bool {
@@ -1017,6 +1196,55 @@ fn engine_recipe_launch_args(engine_recipe: Option<&EngineRecipeHint>) -> Vec<St
         .unwrap_or_default()
 }
 
+/// Whether to launch vLLM with `--enforce-eager` (CUDA graphs disabled).
+///
+/// Defaults to enabled because FULL CUDA-graph replay hangs ROCm gfx94x GPUs
+/// during decode. Set `ROCM_CLI_VLLM_ENFORCE_EAGER` to `0`/`false`/`no`/`off`
+/// to re-enable CUDA graphs on runtimes where the hang is fixed.
+fn vllm_enforce_eager_enabled() -> bool {
+    std::env::var("ROCM_CLI_VLLM_ENFORCE_EAGER")
+        .ok()
+        .is_none_or(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+}
+
+/// ROCm wheel index passed to `uv pip install vllm`.
+///
+/// Defaults to [`VLLM_ROCM_EXTRA_INDEX_URL`]; override with
+/// `ROCM_CLI_VLLM_ROCM_INDEX_URL` (non-empty) to target a different
+/// vLLM/ROCm combination.
+fn vllm_rocm_extra_index_url() -> String {
+    resolve_vllm_rocm_extra_index_url(std::env::var("ROCM_CLI_VLLM_ROCM_INDEX_URL").ok())
+}
+
+fn resolve_vllm_rocm_extra_index_url(override_value: Option<String>) -> String {
+    override_value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| VLLM_ROCM_EXTRA_INDEX_URL.to_owned())
+}
+
+/// Time to wait for vLLM to become ready before terminating the process tree.
+///
+/// Defaults to [`DEFAULT_VLLM_READY_TIMEOUT`]. A valid-but-slow cold start
+/// (large weight download, first-decode compile) can exceed the default, so the
+/// timeout is configurable via `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` (a positive
+/// integer number of seconds).
+fn vllm_ready_timeout() -> Duration {
+    resolve_vllm_ready_timeout(std::env::var("ROCM_CLI_VLLM_READY_TIMEOUT_SECS").ok())
+}
+
+fn resolve_vllm_ready_timeout(override_value: Option<String>) -> Duration {
+    override_value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map_or(DEFAULT_VLLM_READY_TIMEOUT, Duration::from_secs)
+}
+
 fn runtime_bin_paths(runtime: &VllmRuntime) -> Vec<PathBuf> {
     let mut entries = Vec::new();
     if let Some(bin) = runtime.sdk_bin.as_ref() {
@@ -1041,8 +1269,45 @@ fn therock_library_path_entries(runtime: &VllmRuntime) -> Vec<PathBuf> {
         if wsl_dxcore_lib.is_dir() {
             entries.push(wsl_dxcore_lib);
         }
+        // OpenMPI is installed outside the default loader path on some distros
+        // (notably RHEL-family under /usr/lib64/openmpi/lib); make sure vLLM can
+        // load libmpi.so at launch when it lives there.
+        entries.extend(rocm_core::openmpi::openmpi_library_dirs());
+
+        // PyTorch's `libtorch_global_deps.so` lists `libmpi_cxx.so.40` as a
+        // NEEDED dependency, but OpenMPI 5.x removed the legacy C++ bindings, so
+        // `import torch` aborts with `libmpi_cxx.so.40: cannot open shared object
+        // file`. When no real `libmpi_cxx.so*` exists, create a compatibility
+        // symlink to the real `libmpi.so*` in a runtime-owned directory and add
+        // it to the loader path. The shimmed library is never called into (the
+        // stub only preloads MPI), so this is safe.
+        if let Some(compat_dir) = openmpi_cxx_compat_dir(runtime)
+            && let Some(dir) = rocm_core::openmpi::ensure_mpi_cxx_compat(&compat_dir)
+        {
+            entries.push(dir);
+        }
     }
     dedupe_paths(entries)
+}
+
+/// A writable, runtime-owned directory for the OpenMPI C++ bindings
+/// compatibility shim (see [`therock_library_path_entries`]). Prefers the
+/// managed Python environment root (`<env>/bin/python` -> `<env>`); falls back to
+/// the SDK root when no Python launcher is recorded.
+fn openmpi_cxx_compat_dir(runtime: &VllmRuntime) -> Option<PathBuf> {
+    const COMPAT_DIR_NAME: &str = "openmpi-cxx-compat";
+    if let Some(env_root) = runtime
+        .python_executable
+        .as_ref()
+        .and_then(|python| python.parent())
+        .and_then(|bin| bin.parent())
+    {
+        return Some(env_root.join(COMPAT_DIR_NAME));
+    }
+    runtime
+        .sdk_root
+        .as_ref()
+        .map(|root| root.join(COMPAT_DIR_NAME))
 }
 
 fn dedupe_paths(entries: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -1188,27 +1453,7 @@ fn pid_from_state(state: &Value) -> Option<u32> {
 }
 
 fn terminate_pid(pid: u32, _force: bool) -> bool {
-    rocm_core::terminate_process(pid).is_ok()
-}
-
-fn tail_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
-    let text =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(tail_lines_from_text(&text, limit))
-}
-
-fn tail_lines_from_text(text: &str, limit: usize) -> Vec<String> {
-    if limit == 0 {
-        return Vec::new();
-    }
-    let mut lines = text
-        .lines()
-        .rev()
-        .take(limit)
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    lines.reverse();
-    lines
+    rocm_core::terminate_process_tree(pid).is_ok()
 }
 
 fn value_string(value: &Value, key: &str) -> Option<String> {
@@ -1261,6 +1506,120 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
     serde_json::to_writer_pretty(&mut handle, value)?;
     writeln!(&mut handle)?;
     Ok(())
+}
+
+/// Builds a human-readable summary of the tail of the startup log, if available.
+/// Returns an empty string when no log is present or it cannot be read.
+fn startup_log_context(log_path: Option<&Path>) -> String {
+    let summary = log_path
+        .and_then(|p| summarize_startup_log_tail(p, STARTUP_FAILURE_LOG_TAIL_LINES).ok())
+        .unwrap_or_default();
+    if summary.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nLast {STARTUP_FAILURE_LOG_TAIL_LINES} lines of startup log:\n{summary}")
+    }
+}
+
+/// Polls the vLLM endpoint until it reports the model is loaded, or times out.
+/// Uses a monotonic clock (`Instant`) so wall-clock adjustments cannot corrupt the
+/// timeout, and surfaces an early process exit immediately instead of waiting out
+/// the full readiness window.
+fn wait_for_vllm_ready(
+    child: &mut std::process::Child,
+    host: &str,
+    port: u16,
+    model_ref: &str,
+    timeout: Duration,
+    log_path: Option<&Path>,
+) -> Result<()> {
+    let start = Instant::now();
+    let endpoint = format!("http://{host}:{port}");
+    let poll_interval = Duration::from_millis(500);
+
+    loop {
+        // Surface an early process exit (bad model ref, missing deps, etc.)
+        // immediately instead of waiting out the full readiness timeout.
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to poll vLLM server process status")?
+        {
+            let log_context = startup_log_context(log_path);
+            bail!(
+                "vLLM server process exited before becoming ready (status: {status}){log_context}"
+            );
+        }
+
+        if start.elapsed() > timeout {
+            let log_context = startup_log_context(log_path);
+            bail!(
+                "vLLM server at {host}:{port} failed to become ready within {} seconds{log_context}",
+                timeout.as_secs()
+            );
+        }
+
+        match query_loaded_model_endpoint(&endpoint, Some(model_ref)) {
+            Ok(true) => return Ok(()),
+            Ok(false) | Err(_) => std::thread::sleep(poll_interval),
+        }
+    }
+}
+
+/// Reads the last N lines from a log file and returns them as a formatted string.
+/// Handles large files by seeking to near the end and reading backwards.
+fn summarize_startup_log_tail(log_path: &Path, limit: usize) -> Result<String> {
+    let lines = tail_lines(log_path, limit)?;
+    if lines.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(lines.join("\n"))
+}
+
+/// Reads the last N lines from a file efficiently by seeking.
+/// For files larger than MAX_TAIL_READ, seeks to MAX_TAIL_READ from the end.
+fn tail_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("failed to open log file {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+    let file_size = metadata.len();
+
+    // For large files, seek to MAX_TAIL_READ from the end. When the seek lands in
+    // the middle of a line, the first line read back is a partial fragment that
+    // must be dropped. When it lands exactly on a line boundary (the byte before
+    // `seek_pos` is a newline) the first line is complete and must be kept.
+    let mut first_line_is_partial = false;
+    if file_size > MAX_TAIL_READ {
+        let seek_pos = file_size - MAX_TAIL_READ;
+        // Probe the byte preceding `seek_pos` to classify the first line, then
+        // leave the cursor at `seek_pos` for the buffered read below.
+        file.seek(SeekFrom::Start(seek_pos - 1))
+            .with_context(|| format!("failed to seek in log file {}", path.display()))?;
+        let mut probe = [0u8; 1];
+        file.read_exact(&mut probe)
+            .with_context(|| format!("failed to read from log file {}", path.display()))?;
+        first_line_is_partial = probe[0] != b'\n';
+    }
+
+    let buffered = BufReader::new(file);
+    let mut lines: Vec<String> = buffered
+        .lines()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to read lines from {}", path.display()))?;
+
+    // Drop the leading partial line produced by seeking into the middle of a line.
+    if first_line_is_partial && !lines.is_empty() {
+        lines.remove(0);
+    }
+
+    // Return only the last `limit` lines
+    let start_idx = if lines.len() > limit {
+        lines.len() - limit
+    } else {
+        0
+    };
+    Ok(lines.into_iter().skip(start_idx).collect())
 }
 
 #[cfg(test)]
@@ -1463,6 +1822,120 @@ mod tests {
     }
 
     #[test]
+    fn tail_lines_keeps_first_line_when_seek_lands_on_boundary() -> Result<()> {
+        // Build a file where the MAX_TAIL_READ window starts exactly on a line
+        // boundary: a prefix ending in '\n', followed by exactly MAX_TAIL_READ
+        // bytes of complete lines. The first windowed line must NOT be dropped.
+        let prefix = format!("{}\n", "p".repeat(63));
+        let mut tail = String::from("FIRSTLINE\n");
+        while tail.len() + 2 <= MAX_TAIL_READ as usize {
+            tail.push_str("y\n");
+        }
+        while tail.len() < MAX_TAIL_READ as usize {
+            tail.push('z');
+        }
+        assert_eq!(tail.len(), MAX_TAIL_READ as usize);
+
+        let path = std::env::temp_dir().join(format!(
+            "rocm-vllm-tail-boundary-{}-{}.log",
+            std::process::id(),
+            current_unix_millis()
+        ));
+        fs::write(&path, format!("{prefix}{tail}"))?;
+        let lines = tail_lines(&path, usize::MAX)?;
+        fs::remove_file(&path).ok();
+
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("FIRSTLINE"),
+            "complete first line must be preserved when the seek lands on a newline boundary"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains('p')),
+            "bytes before the tail window must not appear"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tail_lines_drops_partial_first_line_when_seek_lands_midline() -> Result<()> {
+        // The window starts in the middle of a line, so the leading fragment is
+        // partial and must be dropped.
+        let prefix = "p".repeat(64);
+        let mut tail = String::from("PARTIALFRAGMENT");
+        tail.push('\n');
+        tail.push_str("SECONDLINE\n");
+        while tail.len() < MAX_TAIL_READ as usize {
+            tail.push_str("y\n");
+        }
+        // Trim back to exactly MAX_TAIL_READ bytes so the window starts mid-line.
+        tail.truncate(MAX_TAIL_READ as usize);
+
+        let path = std::env::temp_dir().join(format!(
+            "rocm-vllm-tail-midline-{}-{}.log",
+            std::process::id(),
+            current_unix_millis()
+        ));
+        fs::write(&path, format!("{prefix}{tail}"))?;
+        let lines = tail_lines(&path, usize::MAX)?;
+        fs::remove_file(&path).ok();
+
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("SECONDLINE"),
+            "partial leading fragment must be dropped when the seek lands mid-line"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vllm_ready_timeout_uses_default_without_override() {
+        assert_eq!(resolve_vllm_ready_timeout(None), DEFAULT_VLLM_READY_TIMEOUT);
+    }
+
+    #[test]
+    fn vllm_ready_timeout_honors_positive_override() {
+        assert_eq!(
+            resolve_vllm_ready_timeout(Some(" 900 ".to_owned())),
+            Duration::from_mins(15)
+        );
+    }
+
+    #[test]
+    fn vllm_ready_timeout_ignores_invalid_or_zero_override() {
+        assert_eq!(
+            resolve_vllm_ready_timeout(Some("0".to_owned())),
+            DEFAULT_VLLM_READY_TIMEOUT
+        );
+        assert_eq!(
+            resolve_vllm_ready_timeout(Some("not-a-number".to_owned())),
+            DEFAULT_VLLM_READY_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn vllm_extra_index_url_defaults_to_const() {
+        assert_eq!(
+            resolve_vllm_rocm_extra_index_url(None),
+            VLLM_ROCM_EXTRA_INDEX_URL
+        );
+        assert_eq!(
+            resolve_vllm_rocm_extra_index_url(Some("   ".to_owned())),
+            VLLM_ROCM_EXTRA_INDEX_URL
+        );
+    }
+
+    #[test]
+    fn vllm_extra_index_url_honors_override() {
+        assert_eq!(
+            resolve_vllm_rocm_extra_index_url(Some(
+                "  https://example.test/rocm/wheels  ".to_owned()
+            )),
+            "https://example.test/rocm/wheels"
+        );
+    }
+
+    #[test]
     fn stdio_protocol_routes_all_methods_without_side_effects() {
         let service_id = format!(
             "missing-protocol-{}-{}",
@@ -1607,6 +2080,7 @@ mod tests {
             runtime_id: Some("runtime-key-gfx120x".to_owned()),
             env_id: None,
             state_path: state_path.clone(),
+            log_path: None,
             engine_recipe: None,
         };
         let runtime = VllmRuntime {
