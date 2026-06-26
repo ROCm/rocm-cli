@@ -1320,9 +1320,11 @@ fn therock_library_path_entries(runtime: &VllmRuntime) -> Vec<PathBuf> {
             // PyTorch's `libtorch_global_deps.so` lists `libmpi_cxx.so.40` as a
             // NEEDED dependency, but OpenMPI 5.x removed the legacy C++ bindings,
             // so `import torch` aborts with `libmpi_cxx.so.40: cannot open shared
-            // object file`. When no real `libmpi_cxx.so*` exists, point that
-            // soname at the real `libmpi.so*` via a runtime-owned symlink. The
-            // shimmed library is never called into (the stub only preloads MPI),
+            // object file`. When no real `libmpi_cxx.so*` exists, materialize an
+            // embedded `libmpi_cxx.so.40` stub (built at compile time, see
+            // rocm-core's build.rs) into a runtime-owned directory and add it to
+            // the loader path. The stub only *defines* the legacy C++ binding
+            // symbols torch needs; they are never called in single-node serving,
             // so this is safe.
             if let Some(dir) = rocm_core::openmpi::ensure_mpi_cxx_compat(&compat_dir) {
                 entries.push(dir);

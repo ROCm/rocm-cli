@@ -5272,6 +5272,22 @@ fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
     }
 }
 
+/// Static description of a PyTorch runtime library dependency that may need to
+/// be installed from the system package manager. Drives [`ensure_torch_runtime_dep`]
+/// so libatomic/libnuma (and any future additions) share one control flow.
+struct TorchRuntimeDep {
+    /// Short label used in the setup header and warnings (e.g. `"libatomic"`).
+    name: &'static str,
+    /// Runtime soname referenced in status messages (e.g. `"libatomic.so.1"`).
+    soname: &'static str,
+    /// `reason:` line explaining why the dependency is required.
+    reason: &'static str,
+    /// Detection probe: returns whether the dependency is already loadable.
+    present: fn() -> bool,
+    /// Builds the distro-aware install plan from the parsed os-release fields.
+    build_plan: fn(&str, &str) -> rocm_core::openmpi::SystemPackageInstallPlan,
+}
+
 /// Ensure the `libatomic` runtime that PyTorch's ROCm wheel links against is
 /// present. The SDK runtime wheel bundles PyTorch, and vLLM uses it too, so this
 /// is invoked both after `rocm install sdk` and during `rocm engines install
@@ -5281,75 +5297,16 @@ fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
 /// blocks or fails the install (warn-and-continue). It is a no-op when
 /// libatomic is already present.
 fn ensure_libatomic_for_torch(approved: bool) {
-    if cfg!(windows) {
-        return;
-    }
-    if rocm_core::openmpi::libatomic_present() {
-        return;
-    }
-
-    let os_release = read_os_release().unwrap_or_default();
-    let os_id = parse_os_release_field(&os_release, "ID").unwrap_or_default();
-    let id_like = parse_os_release_field(&os_release, "ID_LIKE").unwrap_or_default();
-    let plan = rocm_core::openmpi::build_libatomic_install_plan(&os_id, &id_like);
-
-    println!("libatomic setup");
-    println!(
-        "  reason: PyTorch's ROCm wheel requires the libatomic runtime (libatomic.so.1), which was not found"
+    ensure_torch_runtime_dep(
+        approved,
+        &TorchRuntimeDep {
+            name: "libatomic",
+            soname: "libatomic.so.1",
+            reason: "PyTorch's ROCm wheel requires the libatomic runtime (libatomic.so.1), which was not found",
+            present: rocm_core::openmpi::libatomic_present,
+            build_plan: rocm_core::openmpi::build_libatomic_install_plan,
+        },
     );
-    if let Some(manager) = plan.package_manager.as_deref() {
-        println!("  package_manager: {manager}");
-    }
-    println!("  detail: {}", plan.reason);
-
-    if !plan.supported {
-        // Either the distro is unknown or libatomic ships with the base toolchain
-        // (Arch); nothing actionable to auto-install.
-        return;
-    }
-
-    println!("  commands:");
-    for command in &plan.commands {
-        println!("    {command}");
-    }
-
-    let can_autoinstall = rocm_core::openmpi::can_autoinstall();
-    if !approved && !can_autoinstall {
-        for check in &plan.preflight_checks {
-            println!("  preflight: {check}");
-        }
-        eprintln!("warning: libatomic is required by PyTorch but was not installed automatically");
-        eprintln!(
-            "warning: passwordless sudo is unavailable; run the commands above manually, or rerun with --yes to approve an interactive sudo prompt"
-        );
-        return;
-    }
-
-    println!(
-        "  approval: {}",
-        if approved {
-            "granted by --yes"
-        } else {
-            "auto (root or passwordless sudo available)"
-        }
-    );
-    match run_system_package_install_plan(&plan) {
-        Ok(()) => {
-            if rocm_core::openmpi::libatomic_present() {
-                println!("  status: installed");
-            } else {
-                eprintln!(
-                    "warning: libatomic install commands completed but libatomic.so.1 was still not found; verify the package manager output above"
-                );
-            }
-        }
-        Err(error) => {
-            eprintln!("warning: libatomic install failed: {error}");
-            eprintln!(
-                "warning: continuing; run the commands above manually so PyTorch can load libatomic.so.1"
-            );
-        }
-    }
 }
 
 /// Ensure the real `libnuma` (numactl) runtime that PyTorch's ROCm wheel binds
@@ -5363,30 +5320,46 @@ fn ensure_libatomic_for_torch(approved: bool) {
 /// otherwise it prints the distro-aware plan. Never blocks or fails the install
 /// (warn-and-continue). No-op when libnuma is already present.
 fn ensure_libnuma_for_torch(approved: bool) {
+    ensure_torch_runtime_dep(
+        approved,
+        &TorchRuntimeDep {
+            name: "libnuma",
+            soname: "libnuma.so.1",
+            reason: "PyTorch's ROCm wheel requires the system numactl runtime (libnuma.so.1 with libnuma_1.2), which was not found",
+            present: rocm_core::openmpi::libnuma_present,
+            build_plan: rocm_core::openmpi::build_libnuma_install_plan,
+        },
+    );
+}
+
+/// Shared control flow behind [`ensure_libatomic_for_torch`] and
+/// [`ensure_libnuma_for_torch`]: detect the dependency, print the distro-aware
+/// plan, and (when approved or auto-installable) run it via
+/// [`run_system_package_install_plan`]. Always warn-and-continue; never fails the
+/// caller. No-op on Windows or when the dependency is already present.
+fn ensure_torch_runtime_dep(approved: bool, dep: &TorchRuntimeDep) {
     if cfg!(windows) {
         return;
     }
-    if rocm_core::openmpi::libnuma_present() {
+    if (dep.present)() {
         return;
     }
 
     let os_release = read_os_release().unwrap_or_default();
     let os_id = parse_os_release_field(&os_release, "ID").unwrap_or_default();
     let id_like = parse_os_release_field(&os_release, "ID_LIKE").unwrap_or_default();
-    let plan = rocm_core::openmpi::build_libnuma_install_plan(&os_id, &id_like);
+    let plan = (dep.build_plan)(&os_id, &id_like);
 
-    println!("libnuma setup");
-    println!(
-        "  reason: PyTorch's ROCm wheel requires the system numactl runtime (libnuma.so.1 with libnuma_1.2), which was not found"
-    );
+    println!("{} setup", dep.name);
+    println!("  reason: {}", dep.reason);
     if let Some(manager) = plan.package_manager.as_deref() {
         println!("  package_manager: {manager}");
     }
     println!("  detail: {}", plan.reason);
 
     if !plan.supported {
-        // Distribution could not be mapped to a package manager; nothing
-        // actionable to auto-install.
+        // The distro is unknown or the dependency ships with the base toolchain;
+        // nothing actionable to auto-install.
         return;
     }
 
@@ -5400,7 +5373,10 @@ fn ensure_libnuma_for_torch(approved: bool) {
         for check in &plan.preflight_checks {
             println!("  preflight: {check}");
         }
-        eprintln!("warning: libnuma is required by PyTorch but was not installed automatically");
+        eprintln!(
+            "warning: {} is required by PyTorch but was not installed automatically",
+            dep.name
+        );
         eprintln!(
             "warning: passwordless sudo is unavailable; run the commands above manually, or rerun with --yes to approve an interactive sudo prompt"
         );
@@ -5417,18 +5393,20 @@ fn ensure_libnuma_for_torch(approved: bool) {
     );
     match run_system_package_install_plan(&plan) {
         Ok(()) => {
-            if rocm_core::openmpi::libnuma_present() {
+            if (dep.present)() {
                 println!("  status: installed");
             } else {
                 eprintln!(
-                    "warning: libnuma install commands completed but libnuma.so.1 was still not found; verify the package manager output above"
+                    "warning: {} install commands completed but {} was still not found; verify the package manager output above",
+                    dep.name, dep.soname
                 );
             }
         }
         Err(error) => {
-            eprintln!("warning: libnuma install failed: {error}");
+            eprintln!("warning: {} install failed: {error}", dep.name);
             eprintln!(
-                "warning: continuing; run the commands above manually so PyTorch can load libnuma.so.1"
+                "warning: continuing; run the commands above manually so PyTorch can load {}",
+                dep.soname
             );
         }
     }
@@ -5452,7 +5430,7 @@ fn run_system_package_install_plan(
         // passwordless sudo is configured, sudo does not prompt and the inherited
         // stdin is simply unused.
         run_shell_command_with_stdin(&command, Stdio::inherit())
-            .with_context(|| format!("openmpi command failed: {command}"))?;
+            .with_context(|| format!("system package install command failed: {command}"))?;
     }
     Ok(())
 }
