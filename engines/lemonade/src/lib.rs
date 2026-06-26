@@ -399,7 +399,7 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
     // Align Lemonade's ROCm backend channel with the ROCm the user installed via rocm-cli
     // before backend selection, so the backend is pulled from the matching channel. This is
     // best-effort: a failure here must not abort the engine install.
-    let aligned_channel = match align_lemonade_rocm_channel(&manifest) {
+    let aligned_channel = match align_lemonade_rocm_channel(&paths, &manifest) {
         Ok(channel) => channel,
         Err(error) => {
             eprintln!(
@@ -457,19 +457,24 @@ fn lemonade_rocm_channel(rocm_cli_channel: &str) -> Option<&'static str> {
 /// backend binary at Lemonade's tested default (`builtin`). Returns the Lemonade channel that
 /// was applied, or `None` when there is no rocm-cli-managed ROCm runtime to mirror (Lemonade's
 /// own default is then left untouched).
-fn align_lemonade_rocm_channel(manifest: &LemonadeInstallManifest) -> Result<Option<&'static str>> {
-    let paths = AppPaths::discover()?;
+fn align_lemonade_rocm_channel(
+    paths: &AppPaths,
+    manifest: &LemonadeInstallManifest,
+) -> Result<Option<&'static str>> {
     // Don't fall back to a default config here: an empty config would discard the active
     // runtime key and let channel selection guess the most-recent runtime, then mutate
     // Lemonade based on that guess. Surface the error so the caller leaves defaults untouched.
-    let config = RocmCliConfig::load(&paths)?;
-    let Some(rocm_cli_channel) = active_managed_therock_channel(&paths, &config)? else {
+    let config = RocmCliConfig::load(paths)?;
+    let Some(rocm_cli_channel) = active_managed_therock_channel(paths, &config)? else {
         return Ok(None);
     };
     let Some(lemonade_channel) = lemonade_rocm_channel(&rocm_cli_channel) else {
         return Ok(None);
     };
     let process_env = lemonade_process_environment()?;
+    // Best-effort and not transactional: if the second call fails after the first succeeds,
+    // `rocm_channel` is updated but `rocm_bin` is left as-is. Acceptable here — the caller
+    // treats any failure as a warning and `rocm_bin` defaults to `builtin` regardless.
     run_lemonade_config_set(manifest, "rocm_channel", lemonade_channel, &process_env)?;
     run_lemonade_config_set(manifest, "llamacpp.rocm_bin", "builtin", &process_env)?;
     Ok(Some(lemonade_channel))

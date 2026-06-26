@@ -6652,6 +6652,64 @@ Class Name:                Display
     }
 
     #[test]
+    fn active_managed_therock_channel_falls_back_to_most_recent() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-therock-channel-recent");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        write_therock_channel_record(&registry, "older", "release", 10)?;
+        write_therock_channel_record(&registry, "newer", "nightly", 20)?;
+
+        // No active_runtime_key set: the most recently installed runtime wins.
+        let config = RocmCliConfig::default();
+        assert_eq!(
+            active_managed_therock_channel(&paths, &config)?,
+            Some("nightly".to_owned())
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn active_managed_therock_channel_prefers_active_runtime_key() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-therock-channel-active-key");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        write_therock_channel_record(&registry, "older", "release", 10)?;
+        write_therock_channel_record(&registry, "newer", "nightly", 20)?;
+
+        // The active key points at the older runtime, overriding recency.
+        let config = RocmCliConfig {
+            active_runtime_key: Some("therock-release:older".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        assert_eq!(
+            active_managed_therock_channel(&paths, &config)?,
+            Some("release".to_owned())
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    fn write_therock_channel_record(
+        registry: &Path,
+        name: &str,
+        channel: &str,
+        installed_at_unix_ms: u64,
+    ) -> Result<()> {
+        fs::write(
+            registry.join(format!("{name}.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "runtime_id": format!("therock-{channel}:{name}"),
+                "family": "gfx120X-all",
+                "channel": channel,
+                "installed_at_unix_ms": installed_at_unix_ms,
+                "rocm_sdk": { "import_ok": true }
+            }))?,
+        )?;
+        Ok(())
+    }
+
+    #[test]
     fn examine_render_includes_driver_and_state_counts() {
         let summary = ExamineSummary {
             os: "windows".to_owned(),
