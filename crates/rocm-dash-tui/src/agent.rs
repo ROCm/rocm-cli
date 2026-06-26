@@ -956,30 +956,9 @@ impl AgentClient for RigAgentClient {
             .client
             .agent(&self.model)
             .preamble(&self.preamble)
-            .max_tokens(1024)
-            .tool(GpuStatusTool {
-                snap: snap.clone(),
-                fired: fired.clone(),
-            })
-            .tool(ListInstancesTool {
-                snap: snap.clone(),
-                fired: fired.clone(),
-            })
-            .tool(BenchSummaryTool {
-                snap: snap.clone(),
-                fired: fired.clone(),
-            })
-            .tool(TokensPerWattTool {
-                snap: snap.clone(),
-                fired: fired.clone(),
-            })
-            // Skills registry tools (read-only: list + dry-run plan; never execute).
-            .tool(ListSkillsTool {
-                fired: fired.clone(),
-            })
-            .tool(SkillPlanTool {
-                fired: fired.clone(),
-            });
+            .max_tokens(1024);
+        // Telemetry + skill registry tools (shared registration site).
+        let agent = register_telemetry_tools(agent, &snap, &fired);
         // Read-only ROCm machine-inspection tools (forward across the seam).
         let agent = register_rocm_read_tools(agent, self.executor.as_ref(), &fired);
         // Mutating ROCm tools (surface approval; never execute in the rig loop).
@@ -1005,6 +984,52 @@ impl AgentClient for RigAgentClient {
         let skills = fired.lock().map(|g| g.clone()).unwrap_or_default();
         Ok(annotate_reply(reply, &skills))
     }
+}
+
+/// Register the telemetry + skill registry tools (GpuStatus, ListInstances,
+/// BenchSummary, TokensPerWatt — snapshot-backed; ListSkills, SkillPlan —
+/// read-only registry) on a fresh Rig `AgentBuilder`, cloning the snapshot +
+/// shared `fired` log into each. Kept generic over the builder's completion
+/// model + preamble so all three backends (RigAgentClient, ChatGptAgentClient,
+/// AnthropicAgentClient) reuse one registration site (DRY — the tool list lives
+/// in exactly one place, mirroring [`register_rocm_read_tools`]). Takes the base
+/// builder (`NoToolConfig`) and returns it in `WithBuilderTools` because the
+/// first `.tool()` transitions the type-state; the ROCm read/mutating
+/// registrations chain after it. Note: ListSkillsTool/SkillPlanTool take only
+/// `fired`; the other four take `snap` + `fired`.
+fn register_telemetry_tools<M, P>(
+    builder: rig::agent::AgentBuilder<M, P>,
+    snap: &Arc<StateSnapshot>,
+    fired: &FiredLog,
+) -> rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>
+where
+    M: rig::completion::CompletionModel,
+    P: rig::agent::PromptHook<M>,
+{
+    builder
+        .tool(GpuStatusTool {
+            snap: snap.clone(),
+            fired: fired.clone(),
+        })
+        .tool(ListInstancesTool {
+            snap: snap.clone(),
+            fired: fired.clone(),
+        })
+        .tool(BenchSummaryTool {
+            snap: snap.clone(),
+            fired: fired.clone(),
+        })
+        .tool(TokensPerWattTool {
+            snap: snap.clone(),
+            fired: fired.clone(),
+        })
+        // Skills registry tools (read-only: list + dry-run plan; never execute).
+        .tool(ListSkillsTool {
+            fired: fired.clone(),
+        })
+        .tool(SkillPlanTool {
+            fired: fired.clone(),
+        })
 }
 
 /// Register every read-only ROCm tool on a Rig `AgentBuilder`, cloning the
@@ -1200,30 +1225,118 @@ impl AgentClient for ChatGptAgentClient {
         let model = ResponsesCompletionModel::new(self.client.clone(), self.model.clone());
         let agent = AgentBuilder::new(model)
             .preamble(&self.preamble)
-            .max_tokens(1024)
-            .tool(GpuStatusTool {
-                snap: snap.clone(),
-                fired: fired.clone(),
-            })
-            .tool(ListInstancesTool {
-                snap: snap.clone(),
-                fired: fired.clone(),
-            })
-            .tool(BenchSummaryTool {
-                snap: snap.clone(),
-                fired: fired.clone(),
-            })
-            .tool(TokensPerWattTool {
-                snap: snap.clone(),
-                fired: fired.clone(),
-            })
-            // Read-only Skills registry tools (list + dry-run plan; never execute).
-            .tool(ListSkillsTool {
-                fired: fired.clone(),
-            })
-            .tool(SkillPlanTool {
-                fired: fired.clone(),
-            });
+            .max_tokens(1024);
+        // Telemetry + skill registry tools (shared registration site).
+        let agent = register_telemetry_tools(agent, &snap, &fired);
+        // Read-only ROCm machine-inspection tools (forward across the seam).
+        let agent = register_rocm_read_tools(agent, self.executor.as_ref(), &fired);
+        // Mutating ROCm tools (surface approval; never execute in the rig loop).
+        let agent = register_rocm_mutating_tools(
+            agent,
+            self.executor.as_ref(),
+            self.approval_tx.as_ref(),
+            &fired,
+        )
+        .build();
+
+        let req = agent
+            .prompt(last.content.clone())
+            .max_turns(MAX_TOOL_TURNS)
+            .with_history(build_messages(prior));
+
+        let reply = match tokio::time::timeout(REQUEST_TIMEOUT, req.into_future()).await {
+            Err(_) => return Err(AgentError::Timeout),
+            Ok(Ok(reply)) => reply,
+            Ok(Err(e)) => return Err(AgentError::Request(e.to_string())),
+        };
+
+        let skills = fired.lock().map(|g| g.clone()).unwrap_or_default();
+        Ok(annotate_reply(reply, &skills))
+    }
+}
+
+/// Live Rig-backed client for Anthropic's Claude API.
+///
+/// Mirrors [`RigAgentClient`]: the Rig client is constructed once; the agent +
+/// the SAME ROCm read/mutating tool set are rebuilt per request from the
+/// captured snapshot, so tool + approval parity holds across every backend. The
+/// key rides in `x-api-key` (handled inside the provider) — never in `base_url`
+/// or the request path — so no key leaks into [`AgentError`] strings.
+pub struct AnthropicAgentClient {
+    client: rig::providers::anthropic::Client,
+    model: String,
+    preamble: String,
+    /// Bin-injected tool executor (None for tests / no live seam).
+    executor: Option<SharedRocmToolExecutor>,
+    /// Channel to surface mutating-tool approval intents to the app (None for
+    /// tests / no live seam). Mutating tools post here instead of executing.
+    approval_tx: Option<UnboundedSender<ClientMsg>>,
+}
+
+impl AnthropicAgentClient {
+    /// Build the Anthropic client from an [`LlmConfig`]. `api_key` is required
+    /// (env / secure-store sourced by the bin and carried in-process via the
+    /// seam — never argv). `base_url` is intentionally ignored: the provider's
+    /// own default (`https://api.anthropic.com`) is used. An empty `model`
+    /// falls back to [`CLAUDE_SONNET_4_6`](rig::providers::anthropic::completion::CLAUDE_SONNET_4_6).
+    /// No network I/O happens here — the request is deferred to `complete()`.
+    pub fn new(
+        cfg: LlmConfig,
+        executor: Option<SharedRocmToolExecutor>,
+        approval_tx: Option<UnboundedSender<ClientMsg>>,
+    ) -> Result<Self, AgentError> {
+        let key = cfg
+            .api_key
+            .as_deref()
+            .ok_or_else(|| AgentError::Build("anthropic requires ANTHROPIC_API_KEY".to_string()))?;
+        // Builder typestate: `.api_key()` then `.build()`. Leave base_url at the
+        // provider default so we never point Claude at a non-Anthropic host.
+        let client = rig::providers::anthropic::Client::builder()
+            .api_key(key)
+            .build()
+            .map_err(|e| AgentError::Build(e.to_string()))?;
+        let model = if cfg.model.is_empty() {
+            rig::providers::anthropic::completion::CLAUDE_SONNET_4_6.to_string()
+        } else {
+            cfg.model
+        };
+        Ok(Self {
+            client,
+            model,
+            preamble: DEFAULT_PREAMBLE.to_string(),
+            executor,
+            approval_tx,
+        })
+    }
+}
+
+#[async_trait]
+impl AgentClient for AnthropicAgentClient {
+    async fn complete(
+        &self,
+        history: &[ChatTurn],
+        snapshot: StateSnapshot,
+    ) -> Result<String, AgentError> {
+        use rig::client::CompletionClient;
+        use rig::completion::Prompt;
+        use std::future::IntoFuture;
+
+        let Some((last, prior)) = history.split_last() else {
+            return Err(AgentError::Empty);
+        };
+        let snap = Arc::new(snapshot);
+        let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
+
+        // Identical tool registration to RigAgentClient / ChatGptAgentClient:
+        // the SAME telemetry/skill tools + every ROCm read + mutating tool, so
+        // capability and approval behavior are uniform across backends.
+        let agent = self
+            .client
+            .agent(&self.model)
+            .preamble(&self.preamble)
+            .max_tokens(1024);
+        // Telemetry + skill registry tools (shared registration site).
+        let agent = register_telemetry_tools(agent, &snap, &fired);
         // Read-only ROCm machine-inspection tools (forward across the seam).
         let agent = register_rocm_read_tools(agent, self.executor.as_ref(), &fired);
         // Mutating ROCm tools (surface approval; never execute in the rig loop).
@@ -1851,6 +1964,148 @@ mod tests {
             rig::providers::chatgpt::GPT_5_3_CODEX,
             "the no-key default uses the provider's Codex model"
         );
+    }
+
+    #[test]
+    fn anthropic_backend_constructs_and_is_agentclient() {
+        // Offline construction with a dummy key (no network until complete()).
+        // An empty model falls back to CLAUDE_SONNET_4_6.
+        let client = AnthropicAgentClient::new(
+            LlmConfig {
+                base_url: String::new(),
+                model: String::new(),
+                api_key: Some("dummy".to_string()),
+                auth_header: None,
+            },
+            None,
+            None,
+        )
+        .expect("build anthropic client");
+        assert_eq!(
+            client.model,
+            rig::providers::anthropic::completion::CLAUDE_SONNET_4_6,
+            "empty model defaults to Claude Sonnet"
+        );
+        // It is usable behind the swappable `AgentClient` seam (object-safe).
+        let _erased: Arc<dyn AgentClient> = Arc::new(client);
+    }
+
+    #[test]
+    fn anthropic_requires_key() {
+        // No api_key → a Build error naming the env var; nothing constructs.
+        // (The Ok variant isn't Debug, so let-else rather than unwrap_err.)
+        let Err(err) = AnthropicAgentClient::new(
+            LlmConfig {
+                base_url: String::new(),
+                model: String::new(),
+                api_key: None,
+                auth_header: None,
+            },
+            None,
+            None,
+        ) else {
+            panic!("expected a Build error without a key");
+        };
+        assert!(matches!(err, AgentError::Build(_)));
+        assert!(
+            err.to_string().contains("ANTHROPIC_API_KEY"),
+            "error names the required env var: {err}"
+        );
+    }
+
+    #[test]
+    fn anthropic_honors_explicit_model() {
+        let client = AnthropicAgentClient::new(
+            LlmConfig {
+                base_url: String::new(),
+                model: "claude-opus-4-7".to_string(),
+                api_key: Some("dummy".to_string()),
+                auth_header: None,
+            },
+            None,
+            None,
+        )
+        .expect("build anthropic client");
+        assert_eq!(client.model, "claude-opus-4-7");
+    }
+
+    #[test]
+    fn all_backends_register_same_rocm_tools() {
+        // Contract: every backend's complete() registers the SAME three tool
+        // sets — telemetry/skill (register_telemetry_tools), read ROCm
+        // (register_rocm_read_tools), and mutating ROCm
+        // (register_rocm_mutating_tools) — so capability + approval parity holds
+        // across local/openai/anthropic. This enumerates the canonical sets that
+        // those shared helpers register; the helper call sites are identical in
+        // RigAgentClient, ChatGptAgentClient, and AnthropicAgentClient.
+        //
+        // Telemetry/skill set: register_telemetry_tools registers exactly the
+        // SKILL_NAMES tools (GpuStatus, ListInstances, BenchSummary,
+        // TokensPerWatt, ListSkills, SkillPlan). Pinning the size here means the
+        // telemetry registration can't silently diverge from the canonical set.
+        assert_eq!(SKILL_NAMES.len(), 6, "canonical telemetry/skill set size");
+        for n in SKILL_NAMES {
+            assert!(!n.is_empty(), "empty telemetry/skill tool name");
+            // Telemetry tools are disjoint from both ROCm sets.
+            assert!(
+                !ROCM_READ_TOOL_NAMES.contains(&n),
+                "telemetry tool {n} collides with read set"
+            );
+            assert!(
+                !ROCM_MUTATING_TOOL_NAMES.contains(&n),
+                "telemetry tool {n} collides with mutating set"
+            );
+        }
+        assert_eq!(
+            ROCM_READ_TOOL_NAMES.len(),
+            13,
+            "canonical read-tool set size"
+        );
+        assert_eq!(
+            ROCM_MUTATING_TOOL_NAMES.len(),
+            6,
+            "canonical mutating-tool set size"
+        );
+        // The two sets are disjoint (no tool is both read and mutating).
+        for n in ROCM_MUTATING_TOOL_NAMES {
+            assert!(
+                !ROCM_READ_TOOL_NAMES.contains(&n),
+                "tool {n} is in both sets"
+            );
+        }
+        // Every name is non-empty (a registered tool must have a NAME).
+        for n in ROCM_READ_TOOL_NAMES
+            .iter()
+            .chain(ROCM_MUTATING_TOOL_NAMES.iter())
+        {
+            assert!(!n.is_empty(), "empty tool name in canonical set");
+        }
+    }
+
+    /// Live round-trip against Anthropic's Claude API. NOT run in CI (network +
+    /// a real key). Run with:
+    /// `ANTHROPIC_API_KEY=… cargo test -p rocm-dash-tui --lib anthropic_round_trip -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "requires ANTHROPIC_API_KEY environment variable + network"]
+    async fn anthropic_round_trip() {
+        let key = std::env::var("ANTHROPIC_API_KEY").expect("set ANTHROPIC_API_KEY");
+        let client = AnthropicAgentClient::new(
+            LlmConfig {
+                base_url: String::new(),
+                model: String::new(),
+                api_key: Some(key),
+                auth_header: None,
+            },
+            None,
+            None,
+        )
+        .expect("build anthropic client");
+        let history = vec![ChatTurn::user("Reply with exactly: anthropic ok")];
+        let reply = client
+            .complete(&history, fixture_snapshot())
+            .await
+            .expect("anthropic reply");
+        assert!(!reply.is_empty());
     }
 
     /// Live no-key device-code round-trip against ChatGPT. NOT run in CI

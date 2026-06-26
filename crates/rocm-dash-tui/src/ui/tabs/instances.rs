@@ -811,6 +811,8 @@ mod tests {
             slash_tool: None,
             plan_request: None,
             approval: None,
+            active_provider: crate::app::ChatProvider::default(),
+            provider_switch: None,
         }
     }
 

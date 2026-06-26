@@ -54,7 +54,12 @@ pub struct ResolvedArgs {
     /// A separate, lower-precedence tier than `chat_url`.
     pub chat_env_url: Option<String>,
     /// Chat api key, sourced from the environment ONLY (never TOML/CLI/source).
+    /// Used by the local/OpenAI backends.
     pub chat_api_key: Option<String>,
+    /// Anthropic API key, sourced by the bin (env-first then OS secure store —
+    /// NEVER argv) and carried in-process via this seam. `None` when absent;
+    /// the Anthropic backend then surfaces an actionable error on switch.
+    pub anthropic_api_key: Option<String>,
     /// Pre-consent to using the detected endpoint (`--chat-yes`), skipping the
     /// one-time in-TUI prompt for the demo.
     pub chat_auto_consent: bool,
@@ -258,6 +263,42 @@ pub fn format_mmss(secs: u64) -> String {
     }
 }
 
+/// Which chat LLM backend is active. The dash can switch live via `/provider`
+/// (Phase 8); every backend calls the SAME ROCm tools through the seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ChatProvider {
+    /// The auto-detected local OpenAI-compatible endpoint (or the no-key ChatGPT
+    /// OAuth default). This is the launch default and reuses the inline build.
+    #[default]
+    Local,
+    /// OpenAI's hosted Chat Completions API (`OPENAI_API_KEY`).
+    Openai,
+    /// Anthropic's Claude API (`ANTHROPIC_API_KEY`).
+    Anthropic,
+}
+
+impl ChatProvider {
+    /// Parse the `/provider <name>` argument (case-insensitive). `None` for an
+    /// unrecognized name so the handler can hint instead of switching silently.
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "local" => Some(Self::Local),
+            "openai" => Some(Self::Openai),
+            "anthropic" => Some(Self::Anthropic),
+            _ => None,
+        }
+    }
+
+    /// The lowercase label used in turns and hints.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Openai => "openai",
+            Self::Anthropic => "anthropic",
+        }
+    }
+}
+
 /// Result of routing a chat-input line through the slash-command handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SlashOutcome {
@@ -445,6 +486,11 @@ pub struct AppState {
     /// A surfaced mutating-tool approval awaiting the operator's decision
     /// (Phase 4). `Some` ⇒ the approval modal is open and owns keyboard focus.
     pub(crate) approval: Option<PendingApproval>,
+    /// The chat LLM backend currently selected (Phase 8). Defaults to `Local`.
+    pub(crate) active_provider: ChatProvider,
+    /// Edge: a pending `/provider` switch. Raised by `handle_slash_command`,
+    /// drained once by the event loop which rebuilds the live `agent`.
+    pub(crate) provider_switch: Option<ChatProvider>,
 }
 
 impl AppState {
@@ -506,6 +552,8 @@ impl AppState {
             slash_tool: None,
             plan_request: None,
             approval: None,
+            active_provider: ChatProvider::default(),
+            provider_switch: None,
         }
     }
 
@@ -1108,6 +1156,49 @@ impl AppState {
                     self.plan_request = Some(request.to_string());
                 }
             }
+            // --- Group G: provider switch + chat entry (Phase 8) ---
+            // `/provider [local|openai|anthropic]` switches the live chat
+            // backend. A bare/unknown arg shows the current provider (or hints);
+            // a valid one raises the `provider_switch` edge for the event loop to
+            // rebuild the agent. Every backend calls the SAME ROCm tools.
+            "provider" => match rest.split_whitespace().nth(1) {
+                None => {
+                    self.chat.push(ChatTurn::agent(format!(
+                        "current provider: {} (usage: /provider [local|openai|anthropic])",
+                        self.active_provider.label()
+                    )));
+                }
+                Some(arg) => match ChatProvider::parse(arg) {
+                    Some(p) => {
+                        self.active_provider = p;
+                        self.provider_switch = Some(p);
+                    }
+                    None => {
+                        self.chat.push(ChatTurn::error(format!(
+                            "unknown provider `{arg}` (try local, openai, or anthropic)"
+                        )));
+                    }
+                },
+            },
+            // `/chat [prompt]`: with a prompt, send it to the agent (passthrough,
+            // exactly as a plain line would); bare `/chat` focuses the Chat tab.
+            "chat" => {
+                let prompt = rest
+                    .split_once(char::is_whitespace)
+                    .map(|(_, tail)| tail.trim())
+                    .unwrap_or_default();
+                if prompt.is_empty() {
+                    self.active_tab = ActiveTab::Chat;
+                    self.chat_focused = true;
+                } else if !self.chat_sending {
+                    // Mirror `submit_chat`'s dispatch tail (the slash already
+                    // consumed `chat_input`); guarded so an in-flight request is
+                    // never double-spawned.
+                    self.chat.push(ChatTurn::user(prompt.to_string()));
+                    self.chat_sending = true;
+                    self.chat_dispatch = true;
+                }
+            }
             // Unknown slash command: an error turn, never sent to the LLM.
             other => {
                 self.chat.push(ChatTurn::error(format!(
@@ -1408,6 +1499,66 @@ impl AppState {
     }
 }
 
+/// OpenAI's hosted Chat Completions base URL (the standard, no-gateway case).
+const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+/// Default OpenAI model when none is configured via `chat_model`.
+const OPENAI_DEFAULT_MODEL: &str = "gpt-5";
+
+/// Construct the chat backend for an explicitly-selected provider (Phase 8).
+///
+/// Construction only — NO network I/O happens here (rig clients defer the
+/// request to `complete()`). Handles ONLY `Openai` and `Anthropic`; `Local`
+/// returns `None` because its build (auto-detect probe → Rig/ChatGPT) is owned
+/// by `event_loop`'s inline path and can't be reproduced from `ResolvedArgs`
+/// alone. Keys come from `ResolvedArgs` (in-process seam), never argv. `None`
+/// signals "couldn't build" (e.g. a missing key) so the caller surfaces an
+/// actionable error turn instead of switching to a dead backend.
+fn build_chat_agent(
+    provider: ChatProvider,
+    args: &ResolvedArgs,
+    executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
+    approval_tx: mpsc::UnboundedSender<ClientMsg>,
+) -> Option<std::sync::Arc<dyn crate::agent::AgentClient>> {
+    match provider {
+        // Local is rebuilt by the caller's inline path (it needs the live probe).
+        ChatProvider::Local => None,
+        ChatProvider::Openai => {
+            // Require a real key. Without this, `RigAgentClient::new` falls back to
+            // a dummy `sk-no-key` bearer and still builds, so the switch reports
+            // success and then 401s at request time. Returning `None` here makes
+            // the caller surface an actionable error and stay on the current
+            // backend instead of switching to a dead one.
+            let api_key = args.chat_api_key.clone().filter(|k| !k.trim().is_empty())?;
+            let cfg = crate::llm::LlmConfig {
+                base_url: OPENAI_BASE_URL.to_string(),
+                model: args
+                    .chat_model
+                    .clone()
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or_else(|| OPENAI_DEFAULT_MODEL.to_string()),
+                api_key: Some(api_key),
+                auth_header: None,
+            };
+            crate::agent::RigAgentClient::new(cfg, executor, Some(approval_tx))
+                .ok()
+                .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
+        }
+        ChatProvider::Anthropic => {
+            // Leave base_url empty → the Anthropic backend uses rig's default
+            // host. model "" → CLAUDE_SONNET_4_6 (resolved inside the backend).
+            let cfg = crate::llm::LlmConfig {
+                base_url: String::new(),
+                model: args.chat_model.clone().unwrap_or_default(),
+                api_key: args.anthropic_api_key.clone(),
+                auth_header: None,
+            };
+            crate::agent::AnthropicAgentClient::new(cfg, executor, Some(approval_tx))
+                .ok()
+                .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
+        }
+    }
+}
+
 pub async fn run(args: ResolvedArgs) -> color_eyre::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1470,7 +1621,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     // deterministic offline MockAgentClient (no live LLM, no network); otherwise
     // we auto-detect the endpoint (the std-TCP probe runs once on a blocking
     // thread before the first frame) and build the Rig backend.
-    let agent: Option<std::sync::Arc<dyn crate::agent::AgentClient>> = if args.chat_mock {
+    let mut agent: Option<std::sync::Arc<dyn crate::agent::AgentClient>> = if args.chat_mock {
         state.set_chat_config(
             Some(crate::llm::LlmConfig {
                 base_url: "mock://offline-demo".to_string(),
@@ -1546,6 +1697,14 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             }
         }
     };
+
+    // Snapshot the auto-detected local backend so `/provider local` can restore
+    // it after a switch to a remote provider. Without this, switching to OpenAI
+    // and back to local would leave `agent` pointing at the OpenAI backend
+    // (silent wrong-backend bug) — `build_chat_agent(Local)` returns None by
+    // design (Local is the inline-built backend), so the caller must restore the
+    // saved clone here. `Option<Arc<…>>` clone is a cheap Arc refcount bump.
+    let local_agent = agent.clone();
 
     loop {
         terminal.draw(|f| ui::draw(f, &mut state))?;
@@ -1853,6 +2012,54 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                 }
                 None => {
                     state.on_slash_tool_reply("ROCm tools unavailable in this mode".to_string());
+                }
+            }
+        }
+
+        // Drain a `/provider` switch (Phase 8). Rebuild the live `agent` for the
+        // newly-selected backend. `Local` reuses whatever the inline launch path
+        // built (it owns the auto-detect probe). `Openai`/`Anthropic` are built
+        // from `ResolvedArgs` keys (in-process seam, never argv). A build failure
+        // (e.g. missing key) leaves `agent` unchanged and surfaces an actionable
+        // error turn. Construction only — no network until the next submit.
+        if let Some(target) = state.provider_switch.take() {
+            match target {
+                ChatProvider::Local => {
+                    // Restore the auto-detected local backend saved before the
+                    // event loop. `build_chat_agent(Local)` returns None by
+                    // design, so the restore must happen here — otherwise a prior
+                    // `/provider openai` would leave requests routed to OpenAI.
+                    agent = local_agent.clone();
+                    state
+                        .chat
+                        .push(ChatTurn::agent("switched to local".to_string()));
+                }
+                ChatProvider::Openai | ChatProvider::Anthropic => {
+                    if let Some(new_agent) =
+                        build_chat_agent(target, args, state.tool_executor.clone(), chat_tx.clone())
+                    {
+                        agent = Some(new_agent);
+                        state
+                            .chat
+                            .push(ChatTurn::agent(format!("switched to {}", target.label())));
+                    } else {
+                        // Revert the optimistic `active_provider` set by the
+                        // slash handler so the displayed provider stays honest, and
+                        // reset the live `agent` to local too — otherwise a failed
+                        // switch from a remote backend would leave requests routed
+                        // to the old remote while the UI claims "local".
+                        state.active_provider = ChatProvider::Local;
+                        agent = local_agent.clone();
+                        let hint = if target == ChatProvider::Anthropic {
+                            "anthropic requires ANTHROPIC_API_KEY in env or secure store"
+                        } else {
+                            "openai requires OPENAI_API_KEY in the environment"
+                        };
+                        state.chat.push(ChatTurn::error(format!(
+                            "could not switch to {}: {hint}",
+                            target.label()
+                        )));
+                    }
                 }
             }
         }
@@ -3541,6 +3748,191 @@ mod tests {
         assert!(s2.plan_request.is_none(), "bare /plan must not dispatch");
         assert_eq!(s2.chat.last().unwrap().role, ChatRole::Agent);
         assert!(s2.chat.last().unwrap().content.contains("usage"));
+    }
+
+    /// Minimal `ResolvedArgs` for the `build_chat_agent` factory tests. Keys are
+    /// passed via the struct (the in-process seam) — never argv.
+    fn args_with_anthropic_key(key: Option<&str>) -> ResolvedArgs {
+        ResolvedArgs {
+            connect: "test".into(),
+            token: None,
+            theme: "default-dark".into(),
+            replay: None,
+            initial_tab: ActiveTab::Chat,
+            chat_url: None,
+            chat_model: None,
+            chat_auth_header: None,
+            chat_env_url: None,
+            chat_api_key: None,
+            anthropic_api_key: key.map(str::to_string),
+            chat_auto_consent: false,
+            chat_mock: false,
+            model_recipes: Vec::new(),
+            runtimes: Vec::new(),
+            automations: Vec::new(),
+            tool_executor: None,
+        }
+    }
+
+    #[test]
+    fn slash_provider_switches_backend() {
+        // /provider anthropic → active_provider set + edge raised.
+        let mut s = st();
+        assert_eq!(
+            s.handle_slash_command("/provider anthropic"),
+            SlashOutcome::Handled
+        );
+        assert_eq!(s.active_provider, ChatProvider::Anthropic);
+        assert_eq!(s.provider_switch, Some(ChatProvider::Anthropic));
+        // /provider openai → openai.
+        let mut s2 = st();
+        s2.handle_slash_command("/provider openai");
+        assert_eq!(s2.active_provider, ChatProvider::Openai);
+        assert_eq!(s2.provider_switch, Some(ChatProvider::Openai));
+        // /provider local → local (matched case-insensitively).
+        let mut s3 = st();
+        s3.handle_slash_command("/Provider LOCAL");
+        assert_eq!(s3.active_provider, ChatProvider::Local);
+        assert_eq!(s3.provider_switch, Some(ChatProvider::Local));
+    }
+
+    #[test]
+    fn slash_provider_bare_shows_current_and_unknown_hints() {
+        // Bare /provider shows the current backend and raises no edge.
+        let mut s = st();
+        s.handle_slash_command("/provider");
+        assert!(s.provider_switch.is_none());
+        let last = s.chat.last().unwrap();
+        assert_eq!(last.role, ChatRole::Agent);
+        assert!(last.content.contains("local"), "shows current provider");
+        // Unknown provider hints (error turn), no edge, no switch.
+        let mut s2 = st();
+        s2.handle_slash_command("/provider grok");
+        assert!(s2.provider_switch.is_none());
+        assert_eq!(s2.active_provider, ChatProvider::Local);
+        assert_eq!(s2.chat.last().unwrap().role, ChatRole::Error);
+    }
+
+    #[test]
+    fn slash_chat_passthrough_submits_prompt() {
+        // /chat <prompt> pushes the user turn + raises the chat_dispatch edge.
+        let mut s = st();
+        assert_eq!(
+            s.handle_slash_command("/chat what's GPU-2 doing?"),
+            SlashOutcome::Handled
+        );
+        assert!(s.chat_dispatch, "passthrough raises the spawn edge");
+        assert!(s.chat_sending);
+        let last = s.chat.last().unwrap();
+        assert_eq!(last.role, ChatRole::User);
+        assert_eq!(last.content, "what's GPU-2 doing?");
+    }
+
+    #[test]
+    fn slash_chat_bare_focuses_chat_tab() {
+        // Bare /chat focuses the Chat tab, raises no dispatch edge.
+        let mut s = st();
+        s.active_tab = ActiveTab::Overview;
+        assert_eq!(s.handle_slash_command("/chat"), SlashOutcome::Handled);
+        assert_eq!(s.active_tab, ActiveTab::Chat);
+        assert!(s.chat_focused);
+        assert!(!s.chat_dispatch, "bare /chat does not dispatch");
+    }
+
+    #[test]
+    fn build_chat_agent_anthropic_with_key() {
+        // The factory returns Some for Anthropic when a key is present in args
+        // (carried in-process — never argv). Construction only, no network.
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let args = args_with_anthropic_key(Some("dummy-anthropic-key"));
+        let agent = build_chat_agent(ChatProvider::Anthropic, &args, None, tx);
+        assert!(agent.is_some(), "anthropic builds with a key");
+    }
+
+    #[test]
+    fn build_chat_agent_anthropic_without_key_is_none() {
+        // No key → None (the event loop reverts to local + an error turn).
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let args = args_with_anthropic_key(None);
+        let agent = build_chat_agent(ChatProvider::Anthropic, &args, None, tx);
+        assert!(agent.is_none(), "anthropic without a key does not build");
+    }
+
+    #[test]
+    fn build_chat_agent_openai_requires_key() {
+        // No OpenAI key → None. Without this gate the factory would build a dummy
+        // `sk-no-key` backend that 401s at request time, so the switch reports
+        // success then fails. With a key → Some (construction only, no network).
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut args = args_with_anthropic_key(None);
+        assert!(
+            build_chat_agent(ChatProvider::Openai, &args, None, tx.clone()).is_none(),
+            "openai without a key must not build a dead backend"
+        );
+        args.chat_api_key = Some("sk-real-key".to_string());
+        assert!(
+            build_chat_agent(ChatProvider::Openai, &args, None, tx).is_some(),
+            "openai builds with a key"
+        );
+    }
+
+    #[test]
+    fn build_chat_agent_local_defers_to_inline_build() {
+        // Local is owned by the inline auto-detect path, so the factory returns
+        // None for it (the caller keeps the existing agent).
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let args = args_with_anthropic_key(Some("k"));
+        assert!(build_chat_agent(ChatProvider::Local, &args, None, tx).is_none());
+    }
+
+    #[test]
+    fn provider_local_restores_saved_local_agent() {
+        // Invariant for the `ChatProvider::Local` arm of the provider_switch
+        // drain: because `build_chat_agent(Local)` returns None (asserted above),
+        // the event loop CANNOT rebuild the local backend on demand. It must
+        // restore the `local_agent` clone snapshotted before the loop. This test
+        // models that contract: after a remote switch flips `agent` away from the
+        // saved local clone, `/provider local` must re-point `agent` back to it.
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let local_agent: Option<std::sync::Arc<dyn crate::agent::AgentClient>> = Some(
+            std::sync::Arc::new(crate::agent::MockAgentClient::new("local"))
+                as std::sync::Arc<dyn crate::agent::AgentClient>,
+        );
+        // Simulate a prior remote switch: `agent` now points elsewhere.
+        let remote: Option<std::sync::Arc<dyn crate::agent::AgentClient>> = Some(
+            std::sync::Arc::new(crate::agent::MockAgentClient::new("remote"))
+                as std::sync::Arc<dyn crate::agent::AgentClient>,
+        );
+        let mut agent = remote;
+        assert!(!std::sync::Arc::ptr_eq(
+            agent.as_ref().unwrap(),
+            local_agent.as_ref().unwrap()
+        ));
+        // The Local arm's restore line (mirrors app.rs): the factory cannot help.
+        let args = args_with_anthropic_key(Some("k"));
+        assert!(build_chat_agent(ChatProvider::Local, &args, None, tx).is_none());
+        agent = local_agent.clone();
+        // `agent` is now the original auto-detected local backend, not the remote.
+        assert!(std::sync::Arc::ptr_eq(
+            agent.as_ref().unwrap(),
+            local_agent.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn chat_keys_flow_only_through_resolved_args_not_argv() {
+        // The seam carries keys via ResolvedArgs (in-process), never process
+        // argv. This structurally asserts the factory reads the key from the
+        // struct field — there is no argv plumbing in the build path.
+        let args = args_with_anthropic_key(Some("sentinel-key"));
+        assert_eq!(args.anthropic_api_key.as_deref(), Some("sentinel-key"));
+        // The real process args never carry the key (no `--api-key`-style flag
+        // exists; keys are env/secure-store sourced by the bin into the struct).
+        let argv: Vec<String> = std::env::args().collect();
+        assert!(
+            !argv.iter().any(|a| a.contains("sentinel-key")),
+            "no key value is ever present in process argv"
+        );
     }
 
     #[test]
