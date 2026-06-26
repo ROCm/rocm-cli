@@ -62,7 +62,23 @@ use std::time::Duration;
 static BUILTIN_ENGINE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Parser, Debug)]
-#[command(name = "rocm", about = "ROCm AI Command Center CLI", version)]
+#[command(
+    name = "rocm",
+    about = "ROCm AI Command Center CLI",
+    long_about = "ROCm AI Command Center CLI: install ROCm, manage local inference engines, \
+and run OpenAI-compatible model servers on AMD GPUs.\n\n\
+Run `rocm` with no subcommand to open the interactive dashboard (TUI). Use `rocm examine` \
+to check that your GPU and ROCm install are ready, then `rocm serve <model>` to start a server.",
+    version,
+    after_help = "EXAMPLES:\n  \
+rocm examine                      Check GPU, ROCm install, and engines\n  \
+rocm install sdk                  Install ROCm wheels into a managed environment\n  \
+rocm model                        List models this machine can run\n  \
+rocm serve qwen2.5-7b-instruct    Start a local OpenAI-compatible server\n  \
+rocm services list                Show running model servers\n  \
+rocm chat --prompt \"Hi\"           Chat with a configured assistant provider\n\n\
+Run `rocm <command> --help` for details and examples on any command."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -170,12 +186,20 @@ enum Command {
         #[arg(long)]
         allow_mutation: bool,
     },
-    /// Chat with an assistant provider.
+    /// Send a one-shot chat prompt to a configured assistant provider.
+    ///
+    /// Reads the prompt from --prompt or, if omitted, from standard input. Use
+    /// `rocm config enable-provider` and `rocm config set-provider-key` first to
+    /// configure a remote provider; the `local` provider talks to a running server.
+    #[command(after_help = "EXAMPLES:\n  \
+rocm chat --prompt \"Explain ROCm in one sentence\"\n  \
+rocm chat --provider local --model qwen2.5-7b-instruct --prompt \"Hello\"\n  \
+echo \"Summarize this\" | rocm chat --provider anthropic")]
     Chat {
         /// Assistant provider to use.
         #[arg(long)]
         provider: Option<Provider>,
-        /// Model name to request from the provider.
+        /// Model name to request from the provider, such as qwen2.5-7b-instruct.
         #[arg(long)]
         model: Option<String>,
         /// Prompt to send. If omitted, rocm-cli reads from standard input when possible.
@@ -193,6 +217,13 @@ enum Command {
         target: InstallTarget,
     },
     /// Check for a newer ROCm package and optionally install it.
+    ///
+    /// Without --apply, only reports whether an update is available. Pass --apply to
+    /// install it, and add --activate to make the new install the default afterward.
+    #[command(after_help = "EXAMPLES:\n  \
+rocm update\n  \
+rocm update --apply --activate\n  \
+rocm update --apply --dry-run")]
     Update {
         /// Install the selected update instead of only checking.
         #[arg(long)]
@@ -207,7 +238,7 @@ enum Command {
         #[arg(long, requires = "apply")]
         dry_run: bool,
     },
-    /// List, choose, add, or remove ROCm installs.
+    /// List, choose, add, or remove ROCm installs (runtimes).
     Runtimes {
         #[command(subcommand)]
         command: Option<RuntimesCommand>,
@@ -218,20 +249,33 @@ enum Command {
         command: EnginesCommand,
     },
     /// Show recommended local models and what this machine can run.
-    #[command(alias = "models")]
+    #[command(
+        alias = "models",
+        after_help = "EXAMPLES:\n  \
+rocm model\n  \
+rocm model --verbose"
+    )]
     Model {
         /// Show detailed recipe diagnostics.
         #[arg(long)]
         verbose: bool,
     },
-    /// Start a local model server.
+    /// Start a local OpenAI-compatible model server.
+    ///
+    /// Picks an engine and ROCm runtime automatically unless overridden. By default the
+    /// server runs as a managed background service; use --foreground to keep it attached
+    /// to this terminal. Inspect or stop servers later with `rocm services`.
+    #[command(after_help = "EXAMPLES:\n  \
+rocm serve qwen2.5-7b-instruct\n  \
+rocm serve ./models/model.gguf --engine llama.cpp --port 8080\n  \
+rocm serve qwen2.5-7b-instruct --foreground --device gpu_required")]
     Serve {
         /// Model name, alias, or local model file path.
         model: String,
-        /// Engine to use, such as lemonade, pytorch, or llama.cpp.
+        /// Engine to use [possible values: lemonade, pytorch, llama.cpp, vllm, sglang, atom].
         #[arg(long)]
         engine: Option<String>,
-        /// Device policy. Use gpu_required for ROCm GPU execution.
+        /// Device policy [possible values: gpu_required, gpu_preferred, cpu_only].
         #[arg(long)]
         device: Option<String>,
         /// ROCm runtime key to use for this server.
@@ -277,7 +321,11 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// Browse recent ROCm CLI logs.
+    /// Browse and search recent ROCm CLI logs.
+    #[command(after_help = "EXAMPLES:\n  \
+rocm logs\n  \
+rocm logs --service <service-id>\n  \
+rocm logs --search error timeout")]
     Logs {
         /// Show logs for a managed service id.
         #[arg(long)]
@@ -289,9 +337,24 @@ enum Command {
         #[arg(value_name = "QUERY")]
         query: Vec<String>,
     },
-    /// Start the background helper in the foreground.
+    /// Run the background supervisor that powers automations, managed servers, and the dashboard.
+    ///
+    /// The daemon is a multi-role helper that, while running:
+    ///   - executes enabled automation watchers (update checks, driver-plan
+    ///     checks, artifact prefetch) on a 5s tick in a sandboxed subprocess
+    ///   - health-checks and auto-recovers managed local model servers
+    ///     (vLLM, SGLang, Lemonade, llama.cpp)
+    ///   - collects GPU thermal/VRAM metrics every 60s for the TUI dashboard
+    ///   - listens on a local webhook port for automation events from other
+    ///     `rocm` commands
+    ///
+    /// It is normally started on demand by `rocm automations enable` and
+    /// `rocm serve --managed`, so you rarely need to launch it yourself. Run it
+    /// directly only when you want to observe its behavior in the foreground,
+    /// e.g. for debugging.
+    #[command(verbatim_doc_comment)]
     Daemon {
-        /// Print the automation status panel instead of running the helper loop.
+        /// Print a one-shot snapshot of automation/watcher status, then exit without starting the supervisor loop.
         #[arg(long)]
         status: bool,
     },
@@ -336,11 +399,15 @@ enum Command {
 #[derive(Subcommand, Debug)]
 enum InstallTarget {
     /// Install TheRock ROCm wheels into a Python folder managed by ROCm CLI.
+    #[command(after_help = "EXAMPLES:\n  \
+rocm install sdk\n  \
+rocm install sdk --channel nightly --build-date 2025-01-15\n  \
+rocm install sdk --family gfx110X-all --dry-run")]
     Sdk {
-        /// Package channel to install.
+        /// Package channel to install, such as release or nightly.
         #[arg(long, default_value = "release")]
         channel: String,
-        /// Package format to install.
+        /// Package format to install [possible values: wheel, tarball].
         #[arg(long, default_value = "wheel")]
         format: InstallFormat,
         /// Full folder path where the ROCm Python environment should be created.
@@ -381,6 +448,9 @@ enum EnginesCommand {
     /// Show local model engines and whether they are ready.
     List,
     /// Install the selected engine into ROCm CLI's managed engine folder.
+    #[command(after_help = "EXAMPLES:\n  \
+rocm engines install lemonade\n  \
+rocm engines install pytorch --reinstall")]
     Install {
         /// Engine name, such as lemonade, pytorch, or llama.cpp.
         engine: String,
@@ -630,27 +700,37 @@ enum SetupCommand {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum InstallFormat {
+    /// Python wheel packages (recommended; smaller, pip-installable).
     Wheel,
+    /// Self-contained tarball archive of the ROCm SDK.
     Tarball,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum Provider {
+    /// A local OpenAI-compatible server started via `rocm serve` (no API key).
     Local,
+    /// Anthropic Claude API (requires an API key).
     Anthropic,
+    /// OpenAI API or OpenAI-compatible endpoint (requires an API key).
     Openai,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum WatcherModeArg {
+    /// Only report findings; never take action.
     Observe,
+    /// Report findings and propose changes for you to approve.
     Propose,
+    /// Apply changes automatically within a contained, reversible scope.
     Contained,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum TelemetryModeArg {
+    /// Collect GPU telemetry on this machine only; nothing leaves the device.
     Local,
+    /// Disable telemetry collection entirely.
     Off,
 }
 
@@ -706,6 +786,14 @@ fn main() -> Result<()> {
 
     let freeform_invocation = parse_freeform_invocation(&raw_args);
     if should_treat_as_freeform(&freeform_invocation) {
+        // Inputs that look like a botched command invocation (a mistyped
+        // subcommand, optionally followed by flags such as `--help`) are routed
+        // to clap so it can surface a friendly "did you mean"/usage error and
+        // exit, instead of dumping a request plan from the natural-language
+        // planner.
+        if let Some(err) = command_invocation_error(&freeform_invocation.request_args) {
+            err.exit();
+        }
         return run_freeform(
             freeform_invocation.request_args.join(" "),
             freeform_invocation.approve,
@@ -770,6 +858,37 @@ fn run_freeform(request: String, approve: bool) -> Result<()> {
         execute_freeform_next_action(&request, &paths, &config)?;
     }
     Ok(())
+}
+
+/// Returns clap's own error when a freeform request looks like a botched
+/// command invocation rather than natural language, so the caller can surface
+/// clap's "did you mean"/usage message and exit instead of feeding it to the
+/// planner. clap's error is surfaced when it carries a subcommand suggestion (a
+/// near-miss typo such as `instal` or `automatios list`) or when the request
+/// includes flag-style arguments (such as `doctorgdfg --help`). Genuine prose,
+/// which yields neither, is left to the planner.
+fn command_invocation_error(request_args: &[String]) -> Option<clap::Error> {
+    if request_args.is_empty() {
+        return None;
+    }
+    // A real subcommand token never contains whitespace, so a single quoted
+    // prose argument (such as `"is rocm installed?"`) is natural language, not a
+    // mistyped subcommand. clap can still propose a near-miss suggestion for
+    // such a string (`is rocm installed?` -> `install`), so guard against it
+    // here and leave the request for the planner.
+    if request_args[0].split_whitespace().count() > 1 {
+        return None;
+    }
+    let argv = std::iter::once("rocm".to_owned()).chain(request_args.iter().cloned());
+    let err = Cli::try_parse_from(argv).err()?;
+    if err.kind() != clap::error::ErrorKind::InvalidSubcommand {
+        return None;
+    }
+    let has_suggestion = err
+        .get(clap::error::ContextKind::SuggestedSubcommand)
+        .is_some();
+    let has_flag = request_args.iter().any(|arg| arg.starts_with('-'));
+    (has_suggestion || has_flag).then_some(err)
 }
 
 fn setup(command: Option<SetupCommand>) -> Result<()> {
@@ -12924,8 +13043,8 @@ fn build_freeform_plan_with_recipes(
         parsed: Vec::new(),
         actions: Vec::new(),
         notes: vec![
-            "No ROCm action was selected from this request.".to_owned(),
-            "Use /help in the TUI, or include install, update, serve, uninstall, check, or inspect in the request.".to_owned(),
+            "No ROCm action matched this request.".to_owned(),
+            "Run `rocm --help` to see available commands, or rephrase to include an action such as install, update, serve, uninstall, check, or inspect.".to_owned(),
         ],
     }
 }
@@ -14608,6 +14727,76 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    fn possible_values_listed_in_help(help: &str) -> Vec<String> {
+        let marker = "[possible values:";
+        let start = help
+            .find(marker)
+            .unwrap_or_else(|| panic!("help text missing `{marker}`: {help:?}"));
+        let rest = &help[start + marker.len()..];
+        let end = rest
+            .find(']')
+            .unwrap_or_else(|| panic!("unterminated possible-values list in help: {help:?}"));
+        rest[..end]
+            .split(',')
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .collect()
+    }
+
+    fn serve_arg_help(arg_id: &str) -> String {
+        let cli = Cli::command();
+        let serve = cli
+            .find_subcommand("serve")
+            .expect("serve subcommand exists");
+        serve
+            .get_arguments()
+            .find(|arg| arg.get_id().as_str() == arg_id)
+            .unwrap_or_else(|| panic!("serve has no `{arg_id}` argument"))
+            .get_help()
+            .map(ToString::to_string)
+            .unwrap_or_default()
+    }
+
+    // These guard against the hand-written `[possible values: ...]` help on the
+    // free-form `--engine`/`--device` flags drifting from their real source of
+    // truth. The flags stay `Option<String>` on purpose (`--engine` is
+    // free-form and `--device` accepts aliases such as `auto`/`gpu` plus the
+    // intentional `cpu_only` rejection), so a ValueEnum would change accepted
+    // input; a sync test keeps the advertised list honest without that.
+    #[test]
+    fn serve_engine_help_lists_match_engine_inventory() {
+        let mut listed = possible_values_listed_in_help(&serve_arg_help("engine"));
+        let mut expected: Vec<String> = builtin_engine_inventory()
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect();
+        listed.sort();
+        expected.sort();
+        assert_eq!(
+            listed, expected,
+            "serve --engine help possible-values must stay in sync with builtin_engine_inventory()"
+        );
+    }
+
+    #[test]
+    fn serve_device_help_lists_match_device_policy_names() {
+        let mut listed = possible_values_listed_in_help(&serve_arg_help("device"));
+        let mut expected: Vec<String> = [
+            DevicePolicy::GpuRequired,
+            DevicePolicy::GpuPreferred,
+            DevicePolicy::CpuOnly,
+        ]
+        .iter()
+        .map(|policy| device_policy_name(policy).to_owned())
+        .collect();
+        listed.sort();
+        expected.sort();
+        assert_eq!(
+            listed, expected,
+            "serve --device help possible-values must stay in sync with DevicePolicy names"
+        );
+    }
+
     #[test]
     fn completions_generate_for_every_shell() {
         use clap_complete::Shell;
@@ -15417,6 +15606,50 @@ mod tests {
                 .iter()
                 .any(|note| note.contains("No ROCm action"))
         );
+    }
+
+    #[test]
+    fn close_subcommand_typo_yields_clap_suggestion() {
+        let err = command_invocation_error(&["instal".to_owned()])
+            .expect("a close typo should surface a clap subcommand suggestion");
+        let message = err.to_string();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+        assert!(message.contains("install"));
+    }
+
+    #[test]
+    fn mistyped_command_with_flags_yields_clap_error() {
+        // `doctorgdfg --help` is a botched command invocation, not prose, so it
+        // should surface clap's usage error rather than a planner request plan.
+        let err = command_invocation_error(&["doctorgdfg".to_owned(), "--help".to_owned()])
+            .expect("a command-like token followed by a flag should yield a clap error");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+        assert!(err.to_string().contains("doctorgdfg"));
+    }
+
+    #[test]
+    fn mistyped_command_with_trailing_argument_yields_suggestion() {
+        // A near-miss subcommand followed by a normal (non-flag) argument should
+        // still surface clap's suggestion instead of falling to the planner.
+        let err = command_invocation_error(&["automatios".to_owned(), "list".to_owned()])
+            .expect("a near-miss subcommand with a trailing arg should yield a clap suggestion");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+        assert!(err.to_string().contains("automations"));
+    }
+
+    #[test]
+    fn natural_language_request_has_no_subcommand_suggestion() {
+        // Multi-word prose requests stay with the planner.
+        assert!(command_invocation_error(&["please".to_owned(), "install".to_owned()]).is_none());
+        // A single token with no near match is left for the planner too.
+        assert!(command_invocation_error(&["zzzzzzzz".to_owned()]).is_none());
+        // Prose that happens to be a single quoted argument is not command-like.
+        assert!(command_invocation_error(&["please install rocm".to_owned()]).is_none());
+        // A single quoted prose request that clap can fuzzily match to a
+        // subcommand (`is rocm installed?` -> `install`) must still reach the
+        // planner rather than exiting with clap's suggestion.
+        assert!(command_invocation_error(&["is rocm installed?".to_owned()]).is_none());
+        assert!(command_invocation_error(&["how do i setup comfyui".to_owned()]).is_none());
     }
 
     #[test]
