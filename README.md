@@ -129,6 +129,7 @@ Start a local OpenAI-compatible model server:
 ```
 rocm serve <model> [--engine lemonade|pytorch|llama.cpp|atom|vllm|sglang]
                    [--device gpu_required|gpu_preferred|cpu_only]
+                   [--gpu auto|<index>]
                    [--runtime-id KEY | --env-id ID]
                    [--host HOST] [--port PORT]
                    [--foreground | --managed]
@@ -137,6 +138,17 @@ rocm serve <model> [--engine lemonade|pytorch|llama.cpp|atom|vllm|sglang]
 
 `--managed` runs the server in the background under rocm-cli's supervision.
 `--foreground` attaches it to the current terminal.
+
+`--gpu` selects which AMD GPU the server runs on. `auto` (the default) probes
+per-GPU VRAM with `amd-smi` and picks the lowest-numbered GPU that is idle and
+not already used by another rocm-cli server (managed or foreground), falling
+back to the GPU with the most free memory. Pass a single index (`--gpu 1`) to
+pin a specific device. The
+selected GPU is exposed to the engine via `HIP_VISIBLE_DEVICES`. Serving one
+model across multiple GPUs is not supported. `--gpu` is ignored with
+`--device cpu_only` (the model runs on CPU). Because selection uses the
+`amd-smi` ordinal but is applied via `HIP_VISIBLE_DEVICES`, rocm-cli warns when
+`ROCR_VISIBLE_DEVICES` is set, since the two orderings can diverge.
 
 Show recommended models and hardware compatibility:
 

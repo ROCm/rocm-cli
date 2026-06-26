@@ -12,7 +12,7 @@ use rocm_engine_protocol::{
     DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy,
     ENGINE_RECIPE_CONTRACT_VERSION, EndpointRequest, EndpointResponse, EngineCapabilities,
     EngineDeviceAvailability, EngineMethod, EngineRecipeHint, EngineRequestEnvelope,
-    EngineResponseEnvelope, HealthcheckRequest, HealthcheckResponse, InstallRequest,
+    EngineResponseEnvelope, GpuSelection, HealthcheckRequest, HealthcheckResponse, InstallRequest,
     InstallResponse, LaunchRequest, LaunchResponse, LogsRequest, LogsResponse, ResolveModelRequest,
     ResolveModelResponse, StopRequest, StopResponse,
 };
@@ -65,6 +65,8 @@ enum CommandKind {
         #[arg(long)]
         device_policy: Option<String>,
         #[arg(long)]
+        gpu: Option<String>,
+        #[arg(long)]
         runtime_id: Option<String>,
         #[arg(long)]
         env_id: Option<String>,
@@ -79,6 +81,8 @@ enum CommandKind {
         port: u16,
         #[arg(long, default_value = "gpu_required")]
         device_policy: String,
+        #[arg(long)]
+        gpu: Option<String>,
         #[arg(long)]
         runtime_id: Option<String>,
         #[arg(long)]
@@ -171,6 +175,7 @@ pub fn run_cli() -> Result<()> {
             host,
             port,
             device_policy,
+            gpu,
             runtime_id,
             env_id,
         } => print_json(&launch_service(LaunchRequest {
@@ -183,6 +188,7 @@ pub fn run_cli() -> Result<()> {
             device_policy: Some(parse_device_policy_arg(device_policy.as_deref())?),
             endpoint_mode: Some("openai".to_owned()),
             engine_recipe: None,
+            gpu_selection: parse_gpu_selection_arg(gpu.as_deref())?,
         })?)?,
         CommandKind::Stdio => {
             let envelope = read_request()?;
@@ -194,6 +200,7 @@ pub fn run_cli() -> Result<()> {
             host,
             port,
             device_policy,
+            gpu,
             runtime_id,
             env_id,
             state_path,
@@ -204,6 +211,7 @@ pub fn run_cli() -> Result<()> {
             host,
             port,
             device_policy: parse_device_policy_arg(Some(&device_policy))?,
+            gpu_indices: parse_gpu_indices_arg(gpu.as_deref())?,
             runtime_id,
             env_id,
             state_path,
@@ -224,6 +232,7 @@ pub fn builtin_serve_http(
     host: String,
     port: u16,
     device_policy: DevicePolicy,
+    gpu_indices: Vec<u32>,
     runtime_id: Option<String>,
     env_id: Option<String>,
     state_path: PathBuf,
@@ -235,6 +244,7 @@ pub fn builtin_serve_http(
         host,
         port,
         device_policy,
+        gpu_indices,
         runtime_id,
         env_id,
         state_path,
@@ -342,11 +352,9 @@ fn capabilities() -> EngineCapabilities {
     EngineCapabilities {
         cpu: false,
         rocm_gpu: !cfg!(windows),
-        multi_gpu: !cfg!(windows),
         openai_compatible: true,
         tool_calling: false,
         quantized_models: "vllm-supported".to_owned(),
-        distributed_serving: !cfg!(windows),
         reasoning_parser: false,
     }
 }
@@ -461,6 +469,7 @@ fn parse_engine_recipe_json(value: Option<String>) -> Result<Option<EngineRecipe
 fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
     let device_policy = normalize_vllm_device_policy(request.device_policy)?;
     let engine_recipe = accepted_engine_recipe(request.engine_recipe)?;
+    let gpu_indices = rocm_engine_protocol::launch_gpu_indices(request.gpu_selection.as_ref());
     let runtime = resolve_vllm_runtime(request.runtime_id.as_deref())?;
     let state_path = AppPaths::discover()?
         .engine_state_dir(ENGINE_NAME)
@@ -471,6 +480,7 @@ fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
         host: request.host.clone(),
         port: request.port,
         device_policy,
+        gpu_indices,
         runtime_id: request.runtime_id.clone(),
         env_id: request.env_id.clone(),
         state_path: state_path.clone(),
@@ -498,6 +508,7 @@ struct ServeHttpRequest {
     host: String,
     port: u16,
     device_policy: DevicePolicy,
+    gpu_indices: Vec<u32>,
     runtime_id: Option<String>,
     env_id: Option<String>,
     state_path: PathBuf,
@@ -559,6 +570,7 @@ fn spawn_vllm_server(
         .args(engine_recipe_launch_args(request.engine_recipe.as_ref()))
         .stdin(Stdio::null());
     apply_therock_env(&mut command, runtime)?;
+    rocm_engine_protocol::apply_gpu_visibility(&mut command, &request.gpu_indices);
     if let Some(log_path) = log_path {
         let log = fs::File::create(log_path)
             .with_context(|| format!("failed to create {}", log_path.display()))?;
@@ -860,6 +872,20 @@ fn parse_device_policy_arg(policy: Option<&str>) -> Result<DevicePolicy> {
         "cpu" | "cpu_only" => Ok(DevicePolicy::CpuOnly),
         other => bail!("unsupported device policy: {other}"),
     }
+}
+
+/// Parse a `--gpu` CLI value into an optional `GpuSelection` for `LaunchRequest`.
+fn parse_gpu_selection_arg(value: Option<&str>) -> Result<Option<GpuSelection>> {
+    value
+        .map(|raw| GpuSelection::parse_cli_value(raw).map_err(anyhow::Error::msg))
+        .transpose()
+}
+
+/// Parse a `--gpu` CLI value into explicit device ordinals (empty for `auto`).
+fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
+    Ok(rocm_engine_protocol::launch_gpu_indices(
+        parse_gpu_selection_arg(value)?.as_ref(),
+    ))
 }
 
 fn vllm_command_from_python(python: &Path) -> Option<PathBuf> {
@@ -1254,6 +1280,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_gpu_args_map_to_indices() {
+        assert_eq!(parse_gpu_indices_arg(None).unwrap(), Vec::<u32>::new());
+        assert_eq!(
+            parse_gpu_indices_arg(Some("auto")).unwrap(),
+            Vec::<u32>::new()
+        );
+        assert_eq!(parse_gpu_indices_arg(Some("2")).unwrap(), vec![2]);
+        assert!(parse_gpu_selection_arg(Some("nope")).is_err());
+        assert!(parse_gpu_selection_arg(Some("0,1")).is_err());
+    }
+
+    #[test]
     fn cpu_policy_is_rejected_without_fallback() {
         let error = normalize_vllm_device_policy(Some(DevicePolicy::CpuOnly))
             .expect_err("vLLM CPU policy must fail");
@@ -1565,6 +1603,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             port: 11439,
             device_policy: DevicePolicy::GpuRequired,
+            gpu_indices: Vec::new(),
             runtime_id: Some("runtime-key-gfx120x".to_owned()),
             env_id: None,
             state_path: state_path.clone(),

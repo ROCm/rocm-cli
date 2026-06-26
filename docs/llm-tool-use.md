@@ -85,6 +85,14 @@ rocm-cli to start the managed `llama.cpp` engine. GPU execution is required:
 {"name":"rocm_command","arguments":{"args":["serve","D:\\models\\tiny.gguf","--engine","llama.cpp","--device","gpu_required","--managed"],"reason":"Start a local GPU llama-server for this GGUF model."}}
 ```
 
+To target a specific GPU, add `--gpu` with `auto` (default; first free GPU) or a
+single index. Serving one model across multiple GPUs is not supported. CPU
+fallback is never used when a GPU is busy or out of range:
+
+```json
+{"name":"rocm_command","arguments":{"args":["serve","D:\\models\\tiny.gguf","--engine","llama.cpp","--device","gpu_required","--gpu","1","--managed"],"reason":"Serve this GGUF model on GPU 1."}}
+```
+
 The assistant can request starting ComfyUI. rocm-cli shows the local URL and
 tries to open the browser:
 

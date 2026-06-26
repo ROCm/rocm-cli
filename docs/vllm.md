@@ -72,6 +72,21 @@ Serving through rocm-cli:
 rocm serve Qwen/Qwen3.5-4B --engine vllm --device gpu_required --managed
 ```
 
+### GPU selection
+
+Use `--gpu` to choose the AMD GPU vLLM runs on:
+
+```bash
+# Default: first free GPU (auto)
+rocm serve Qwen/Qwen3.5-4B --engine vllm --managed
+
+# Pin a specific GPU
+rocm serve Qwen/Qwen3.5-4B --engine vllm --gpu 1 --managed
+```
+
+rocm-cli pins the device via `HIP_VISIBLE_DEVICES`. Serving one model across
+multiple GPUs is not supported.
+
 Native Windows vLLM serving is skipped in this adapter. Use WSL/Linux for vLLM
 ROCm serving, or choose a different engine explicitly. No CPU fallback is used.
 

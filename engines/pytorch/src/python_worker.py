@@ -93,18 +93,11 @@ def detect_device(
         raise RuntimeError(f"unsupported device policy {policy}")
 
     max_single_gpu_mem_gb = inventory["max_single_gpu_mem_gb"]
-    total_gpu_mem_gb = inventory["total_gpu_mem_gb"]
     if (
         min_gpu_mem_gb is not None
         and max_single_gpu_mem_gb is not None
         and max_single_gpu_mem_gb + 0.5 < min_gpu_mem_gb
     ):
-        if total_gpu_mem_gb + 1.0 >= min_gpu_mem_gb and inventory["gpu_count"] > 1:
-            message = (
-                f"single GPU has {max_single_gpu_mem_gb:.1f} GiB but aggregate visible memory is "
-                f"{total_gpu_mem_gb:.1f} GiB across {inventory['gpu_count']} GPUs"
-            )
-            return "cuda", inventory, message, "auto_multi_gpu"
         message = (
             f"detected {max_single_gpu_mem_gb:.1f} GiB GPU memory but recipe recommends "
             f"{min_gpu_mem_gb:.1f} GiB"
@@ -113,13 +106,6 @@ def detect_device(
             raise RuntimeError(f"{message}; no CPU fallback is used")
         raise RuntimeError(f"unsupported device policy {policy}")
 
-    if inventory["gpu_count"] > 1:
-        return (
-            "cuda",
-            inventory,
-            f"using auto device_map across {inventory['gpu_count']} visible GPUs",
-            "auto_multi_gpu",
-        )
     return "cuda", inventory, None, "single_gpu"
 
 
@@ -208,20 +194,6 @@ def resolve_torch_dtype(preferred_dtype: str) -> tuple[torch.dtype | None, str]:
     return torch.float16, "float16"
 
 
-def build_max_memory_map(inventory: dict[str, Any]) -> dict[Any, str] | None:
-    per_gpu_mem_gb = inventory.get("per_gpu_mem_gb") or []
-    if not per_gpu_mem_gb:
-        return None
-
-    max_memory: dict[Any, str] = {}
-    for index, total_gb in enumerate(per_gpu_mem_gb):
-        reserve_gb = 4 if total_gb >= 32 else 2
-        usable_gb = max(1, int(total_gb - reserve_gb))
-        max_memory[index] = f"{usable_gb}GiB"
-    max_memory["cpu"] = "128GiB"
-    return max_memory
-
-
 class Runtime:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -261,10 +233,10 @@ class Runtime:
             self.compute_dtype_label = dtype_label
             if torch_dtype is not None:
                 model_kwargs["torch_dtype"] = torch_dtype
-            model_kwargs["device_map"] = "auto"
-            max_memory = build_max_memory_map(self.gpu_inventory)
-            if max_memory is not None:
-                model_kwargs["max_memory"] = max_memory
+            # Place the entire model on the single visible GPU. HIP_VISIBLE_DEVICES
+            # pins exactly one device, which torch sees as ordinal 0. Serving a
+            # model across multiple GPUs is not supported.
+            model_kwargs["device_map"] = {"": 0}
 
         self.model = AutoModelForCausalLM.from_pretrained(
             args.model_ref, **model_kwargs

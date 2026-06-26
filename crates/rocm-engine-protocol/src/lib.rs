@@ -134,6 +134,78 @@ pub enum DevicePolicy {
     CpuOnly,
 }
 
+/// Which GPU device a server should run on. `Auto` lets the CLI pick the first
+/// free GPU; `Index` pins one explicit GPU ordinal. Running a single model
+/// across multiple GPUs is not supported.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuSelection {
+    Auto,
+    Index(u32),
+}
+
+impl GpuSelection {
+    /// Parse a CLI value (`auto` or a single GPU index like `1`) into a
+    /// selection. Returns an error for non-numeric input or for a comma list,
+    /// since serving a model across multiple GPUs is not supported.
+    pub fn parse_cli_value(value: &str) -> Result<Self, String> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        if trimmed.contains(',') {
+            return Err(format!(
+                "invalid --gpu value `{value}`: serving across multiple GPUs is not supported; pass a single GPU index or `auto`"
+            ));
+        }
+        let index: u32 = trimmed.parse().map_err(|_| {
+            format!("invalid --gpu value `{value}`: `{trimmed}` is not a GPU index")
+        })?;
+        Ok(Self::Index(index))
+    }
+}
+
+/// Render an explicit GPU ordinal as a comma-separated `HIP_VISIBLE_DEVICES`
+/// value. Returns `None` when the slice is empty (no pinning requested).
+#[must_use]
+pub fn gpu_indices_to_csv(indices: &[u32]) -> Option<String> {
+    if indices.is_empty() {
+        return None;
+    }
+    Some(
+        indices
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+/// Pin the resolved GPU ordinals onto a child process by exporting
+/// `HIP_VISIBLE_DEVICES`.
+///
+/// This is the single contract point engines use to make `--gpu`/`auto`
+/// selection visible to the spawned server; an empty slice is a no-op (the
+/// engine keeps its default device visibility, never a CPU fallback).
+pub fn apply_gpu_visibility(command: &mut std::process::Command, gpu_indices: &[u32]) {
+    if let Some(csv) = gpu_indices_to_csv(gpu_indices) {
+        command.env("HIP_VISIBLE_DEVICES", csv);
+    }
+}
+
+/// The explicit GPU ordinal carried by an optional `GpuSelection`, as a list.
+///
+/// Used by engine launch paths. `Auto` and `None` yield an empty list (engine
+/// default visibility), so engines only pin when the CLI resolved a concrete
+/// index.
+#[must_use]
+pub fn launch_gpu_indices(selection: Option<&GpuSelection>) -> Vec<u32> {
+    match selection {
+        Some(GpuSelection::Index(index)) => vec![*index],
+        _ => Vec::new(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineRequestEnvelope {
     pub method: EngineMethod,
@@ -218,6 +290,8 @@ pub struct LaunchRequest {
     pub endpoint_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_recipe: Option<EngineRecipeHint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_selection: Option<GpuSelection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,11 +329,9 @@ pub struct EngineDeviceAvailability {
 pub struct EngineCapabilities {
     pub cpu: bool,
     pub rocm_gpu: bool,
-    pub multi_gpu: bool,
     pub openai_compatible: bool,
     pub tool_calling: bool,
     pub quantized_models: String,
-    pub distributed_serving: bool,
     pub reasoning_parser: bool,
 }
 
@@ -401,6 +473,75 @@ mod tests {
     }
 
     #[test]
+    fn gpu_selection_parses_auto_variants() {
+        assert_eq!(
+            GpuSelection::parse_cli_value("auto").unwrap(),
+            GpuSelection::Auto
+        );
+        assert_eq!(
+            GpuSelection::parse_cli_value("AUTO").unwrap(),
+            GpuSelection::Auto
+        );
+        assert_eq!(
+            GpuSelection::parse_cli_value("  ").unwrap(),
+            GpuSelection::Auto
+        );
+    }
+
+    #[test]
+    fn gpu_selection_parses_single_index() {
+        assert_eq!(
+            GpuSelection::parse_cli_value("1").unwrap(),
+            GpuSelection::Index(1)
+        );
+        assert_eq!(
+            GpuSelection::parse_cli_value("  2 ").unwrap(),
+            GpuSelection::Index(2)
+        );
+    }
+
+    #[test]
+    fn gpu_selection_rejects_invalid_values() {
+        assert!(GpuSelection::parse_cli_value("gpu0").is_err());
+        assert!(GpuSelection::parse_cli_value("-1").is_err());
+        // Multiple GPUs are no longer supported.
+        assert!(GpuSelection::parse_cli_value("0,1").is_err());
+        assert!(GpuSelection::parse_cli_value("0,2,3").is_err());
+    }
+
+    #[test]
+    fn gpu_indices_helpers_handle_auto_and_pinned() {
+        assert_eq!(gpu_indices_to_csv(&[]), None);
+        assert_eq!(gpu_indices_to_csv(&[1]), Some("1".to_owned()));
+        assert!(launch_gpu_indices(None).is_empty());
+        assert!(launch_gpu_indices(Some(&GpuSelection::Auto)).is_empty());
+        assert_eq!(launch_gpu_indices(Some(&GpuSelection::Index(2))), vec![2]);
+    }
+
+    #[test]
+    fn apply_gpu_visibility_sets_hip_visible_devices_on_command() {
+        let mut command = std::process::Command::new("true");
+        apply_gpu_visibility(&mut command, &[2]);
+        let hip = command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("HIP_VISIBLE_DEVICES"))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned());
+        assert_eq!(hip.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn apply_gpu_visibility_is_noop_without_pinned_indices() {
+        let mut command = std::process::Command::new("true");
+        apply_gpu_visibility(&mut command, &[]);
+        assert!(
+            command
+                .get_envs()
+                .all(|(key, _)| key != std::ffi::OsStr::new("HIP_VISIBLE_DEVICES"))
+        );
+    }
+
+    #[test]
     fn engine_recipe_hint_roundtrips_through_resolve_request() {
         let request = ResolveModelRequest {
             model_ref: "Qwen/Test".to_owned(),
@@ -470,6 +611,7 @@ mod tests {
                 unsupported_combinations: Vec::new(),
                 notes: Vec::new(),
             }),
+            gpu_selection: None,
         };
 
         let serialized = serde_json::to_string(&request).unwrap();

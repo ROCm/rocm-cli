@@ -5474,6 +5474,8 @@ pub struct ManagedServiceRecord {
     #[serde(default)]
     pub device_policy: Option<String>,
     #[serde(default)]
+    pub gpu_indices: Vec<u32>,
+    #[serde(default)]
     pub engine_recipe_json: Option<String>,
     #[serde(default)]
     pub restart_count: u32,
@@ -5522,6 +5524,7 @@ impl ManagedServiceRecord {
             runtime_id,
             env_id,
             device_policy,
+            gpu_indices: Vec::new(),
             engine_recipe_json: None,
             restart_count: 0,
             last_restart_unix_ms: None,
