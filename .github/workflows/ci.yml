@@ -228,25 +228,37 @@ jobs:
   commit-signatures:
     name: Commit signatures + sign-off
     runs-on: ubuntu-latest
-    # Only meaningful for PRs, where a base branch defines the commit range.
-    if: github.event_name == 'pull_request'
+    # Runs on pull requests and in the merge queue. Both define a base that
+    # bounds the commit range. Handling `merge_group` matters once this is a
+    # *required* check: the queue fires `merge_group` (not `pull_request`), so a
+    # job gated to PRs only would never produce the required check and the queue
+    # entry would stall forever.
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          # Check out the PR head commit, not the synthetic refs/pull/N/merge
-          # commit (which is unsigned and lacks a sign-off, and would otherwise
-          # appear in origin/<base>..HEAD and fail the gate on every PR).
-          ref: ${{ github.event.pull_request.head.sha }}
+          # PR: check out the PR head, not the synthetic refs/pull/N/merge commit
+          # (which is unsigned and lacks a sign-off, and would otherwise appear
+          # in origin/<base>..HEAD and fail the gate on every PR).
+          # merge_group: check out the queue head — the rebased/squashed commits
+          # GitHub built for the group. Merge commits are disabled on this repo,
+          # so these are normal commits that preserve their Signed-off-by trailer
+          # and are GitHub "Verified" (web-flow signed).
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Verify commits are signed and signed-off
         # `--require-verified` shells out to the `gh` CLI; pass the job token so
         # `gh api` is authenticated (avoids the unauthenticated rate limit).
+        # Base: the PR's base branch, or — in the queue — the exact commit the
+        # merge group was built on (`base_sha`), so the range is just the queued
+        # commits and not whatever else has since landed on the base branch.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: cargo xtask verify-commits --base origin/${{ github.base_ref }} --require-verified
+          BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.merge_group.base_sha }}
+        run: cargo xtask verify-commits --base "$BASE" --require-verified
 
   # Hardware (real AMD GPU / WSL) smoke tests on dedicated self-hosted runners
   # are intentionally not part of this workflow yet. See

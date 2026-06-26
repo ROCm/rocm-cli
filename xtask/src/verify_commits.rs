@@ -292,12 +292,14 @@ pub fn run(base: Option<String>, require_verified: bool) -> Result<()> {
 /// Entry point for the `--check-config` mode: assert that commit signing is
 /// configured locally (used by the fast pre-commit hook).
 pub fn check_config() -> Result<()> {
-    let gpgsign = git(&["config", "--get", "commit.gpgsign"])
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    // `--type=bool` normalizes git's truthy spellings (`true`/`1`/`yes`/`on`,
+    // any case) to the literal `true`, matching what git itself treats as
+    // "signing on". A plain `--get` would only catch the literal `true` and
+    // wrongly report e.g. `commit.gpgsign = 1` as unconfigured.
+    let gpgsign = git(&["config", "--type=bool", "--get", "commit.gpgsign"]).unwrap_or_default();
     let signingkey = git(&["config", "--get", "user.signingkey"]).unwrap_or_default();
 
-    let signing_enabled = gpgsign == "true";
+    let signing_enabled = gpgsign.trim() == "true";
     let key_set = !signingkey.trim().is_empty();
     if signing_enabled && key_set {
         return Ok(());

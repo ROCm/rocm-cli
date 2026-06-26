@@ -69,15 +69,18 @@ prek install -t pre-push    # pre-push
 ```
 
 - **pre-commit**: `cargo xtask verify-commits --check-config` — a fast check
-  that `commit.gpgsign` is `true` and `user.signingkey` is set, with
-  remediation if not.
+  that commit signing is enabled (`commit.gpgsign`, in any of git's truthy
+  spellings) and `user.signingkey` is set, with remediation if not.
 - **pre-push**: `cargo xtask verify-commits` — verifies every outgoing commit
   in `origin/main..HEAD` is signed (signature present and not bad) and
-  signed-off.
+  signed-off. The base is fixed at `origin/main`, so keep it fetched
+  (`git fetch origin main`); on a branch targeting a different base, run the
+  check manually with `--base <ref>` for an accurate range.
 
 ### CI gate
 
-The `commit-signatures` job in `.github/workflows/ci.yml` runs on pull requests:
+The `commit-signatures` job in `.github/workflows/ci.yml` runs on pull requests
+and in the merge queue:
 
 ```bash
 cargo xtask verify-commits --base origin/<base-branch> --require-verified
@@ -85,7 +88,10 @@ cargo xtask verify-commits --base origin/<base-branch> --require-verified
 
 `--require-verified` switches on strict mode (GitHub "Verified" via the `gh`
 CLI). The job checks out with `fetch-depth: 0` so the base ref and all PR
-commits are available. Mark it as a required check in branch protection / your
+commits are available. On a `merge_group` event it verifies the queued commits
+against the queue's base (`merge_group.base_sha..head_sha`) instead of a PR
+base — so the check still runs in the queue and can safely be made *required*
+without stalling it. Mark it as a required check in branch protection / your
 repository ruleset so it blocks merges.
 
 ### The xtask check
