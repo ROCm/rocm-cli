@@ -48,6 +48,55 @@ pub struct OpenMpiStatus {
     pub mpirun_path: Option<PathBuf>,
 }
 
+/// A single system-package install step, modeled as an argv vector rather than a
+/// shell line.
+///
+/// Keeping the program and its arguments as separate tokens lets the runner
+/// execute the command without a shell and decide *structurally* whether to
+/// prepend `sudo` (see [`InstallCommand::resolved_argv`]) instead of
+/// string-munging a `"sudo "` prefix. Every command and package name is a
+/// hardcoded constant; nothing user-controlled is interpolated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallCommand {
+    /// Program followed by its arguments, e.g.
+    /// `["apt-get", "install", "-y", "libatomic1"]`.
+    pub argv: Vec<String>,
+    /// Whether the command must run as root. When the current process is not
+    /// already root, the runner prepends `sudo`.
+    pub needs_root: bool,
+}
+
+impl InstallCommand {
+    /// Build a root-requiring command from borrowed argv tokens.
+    fn sudo(argv: &[&str]) -> Self {
+        Self {
+            argv: argv.iter().map(|token| (*token).to_owned()).collect(),
+            needs_root: true,
+        }
+    }
+
+    /// The argv to execute, given whether the current process is already root.
+    /// Prepends `sudo` only when the command needs root and we are not root (so
+    /// it does not assume `sudo` exists when already running as root).
+    pub fn resolved_argv(&self, root: bool) -> Vec<String> {
+        if self.needs_root && !root {
+            std::iter::once("sudo".to_owned())
+                .chain(self.argv.iter().cloned())
+                .collect()
+        } else {
+            self.argv.clone()
+        }
+    }
+}
+
+impl std::fmt::Display for InstallCommand {
+    /// Render the command as it would run on a non-root host (with `sudo`), for
+    /// display in plans, install hints, and error context.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.resolved_argv(false).join(" "))
+    }
+}
+
 /// Cross-distro plan for installing a system package via the system package
 /// manager.
 ///
@@ -61,8 +110,8 @@ pub struct SystemPackageInstallPlan {
     pub package_manager: Option<String>,
     /// System packages the plan installs.
     pub packages: Vec<String>,
-    /// Ordered shell commands to run (each requires root via `sudo`).
-    pub commands: Vec<String>,
+    /// Ordered install commands to run (each requires root).
+    pub commands: Vec<InstallCommand>,
     /// Human-readable preconditions to verify before approving execution.
     pub preflight_checks: Vec<String>,
     /// Explanation of what the plan does and any distro-specific caveats.
@@ -188,22 +237,46 @@ const LIBMPI_SCAN_DIRS: &[&str] = &[
     "/usr/lib/openmpi/lib",
 ];
 
-/// Scan [`LIBMPI_SCAN_DIRS`] for the first shared library whose file name starts
-/// with `name_prefix` (for example `libmpi.so` or `libmpi_cxx.so`).
+/// Return the path of the first entry across `dirs` whose file name starts with
+/// `prefix`; directories that cannot be read are skipped.
+///
+/// Shared scan behind locating a versioned shared object (for example
+/// `libmpi.so`, `libatomic.so.1`, or `libnuma.so.1`) across a set of candidate
+/// library directories.
 #[cfg(target_os = "linux")]
-fn scan_for_shared_lib(name_prefix: &str) -> Option<PathBuf> {
-    for dir in LIBMPI_SCAN_DIRS {
+fn scan_dirs_for_prefix(dirs: &[&str], prefix: &str) -> Option<PathBuf> {
+    for dir in dirs {
         let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
         for entry in entries.flatten() {
-            let name = entry.file_name();
-            if name.to_string_lossy().starts_with(name_prefix) {
+            if entry.file_name().to_string_lossy().starts_with(prefix) {
                 return Some(entry.path());
             }
         }
     }
     None
+}
+
+/// Standard system library directories searched for distro-provided runtime
+/// objects such as `libatomic.so.1` and `libnuma.so.1`.
+///
+/// Distinct from [`LIBMPI_SCAN_DIRS`], which additionally probes the OpenMPI
+/// subdirectories and omits `/lib64`.
+#[cfg(target_os = "linux")]
+const STANDARD_LIB_DIRS: &[&str] = &[
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib/aarch64-linux-gnu",
+    "/usr/lib64",
+    "/lib64",
+    "/usr/lib",
+];
+
+/// Scan [`LIBMPI_SCAN_DIRS`] for the first shared library whose file name starts
+/// with `name_prefix` (for example `libmpi.so` or `libmpi_cxx.so`).
+#[cfg(target_os = "linux")]
+fn scan_for_shared_lib(name_prefix: &str) -> Option<PathBuf> {
+    scan_dirs_for_prefix(LIBMPI_SCAN_DIRS, name_prefix)
 }
 
 #[cfg(target_os = "linux")]
@@ -432,28 +505,7 @@ pub fn libatomic_present() -> bool {
 /// (`INPUT(...)`), not a loadable object, so it is intentionally not searched.
 #[cfg(target_os = "linux")]
 fn scan_libatomic_path() -> Option<PathBuf> {
-    const DIRS: &[&str] = &[
-        "/usr/lib/x86_64-linux-gnu",
-        "/usr/lib/aarch64-linux-gnu",
-        "/usr/lib64",
-        "/lib64",
-        "/usr/lib",
-    ];
-    for dir in DIRS {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("libatomic.so.1")
-            {
-                return Some(entry.path());
-            }
-        }
-    }
-    None
+    scan_dirs_for_prefix(STANDARD_LIB_DIRS, "libatomic.so.1")
 }
 
 /// Whether a real system `libnuma.so.1` is resolvable by the dynamic loader.
@@ -486,28 +538,7 @@ pub fn libnuma_present() -> bool {
 /// symbol versions, so it is intentionally never matched here.
 #[cfg(target_os = "linux")]
 fn scan_libnuma_path() -> Option<PathBuf> {
-    const DIRS: &[&str] = &[
-        "/usr/lib/x86_64-linux-gnu",
-        "/usr/lib/aarch64-linux-gnu",
-        "/usr/lib64",
-        "/lib64",
-        "/usr/lib",
-    ];
-    for dir in DIRS {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("libnuma.so.1")
-            {
-                return Some(entry.path());
-            }
-        }
-    }
-    None
+    scan_dirs_for_prefix(STANDARD_LIB_DIRS, "libnuma.so.1")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -565,8 +596,14 @@ pub fn build_openmpi_install_plan(os_id: &str, id_like: &str) -> SystemPackageIn
             // package was renamed `libopenmpi3` -> `libopenmpi3t64`.
             vec!["openmpi-bin".to_owned(), "libopenmpi-dev".to_owned()],
             vec![
-                "sudo apt-get update".to_owned(),
-                "sudo apt-get install -y openmpi-bin libopenmpi-dev".to_owned(),
+                InstallCommand::sudo(&["apt-get", "update"]),
+                InstallCommand::sudo(&[
+                    "apt-get",
+                    "install",
+                    "-y",
+                    "openmpi-bin",
+                    "libopenmpi-dev",
+                ]),
             ],
             "Install the OpenMPI runtime (libmpi.so) and mpirun that vLLM's ROCm wheels require. Requires root via apt; approve before execution.".to_owned(),
         ),
@@ -581,17 +618,29 @@ pub fn build_openmpi_install_plan(os_id: &str, id_like: &str) -> SystemPackageIn
             // transaction fail with "No match for argument: openmpi-devel" on
             // stock RHEL hosts, so it is intentionally omitted here.
             vec!["openmpi".to_owned()],
-            vec!["sudo dnf install -y openmpi".to_owned()],
+            vec![InstallCommand::sudo(&["dnf", "install", "-y", "openmpi"])],
             "Install the OpenMPI runtime that vLLM's ROCm wheels require. Requires root via dnf; approve before execution. Note: RHEL-family packages install OpenMPI under /usr/lib64/openmpi (use `module load mpi/openmpi-x86_64` for an interactive shell); rocm-cli adds this directory to the vLLM launch library path automatically.".to_owned(),
         ),
         PackageManager::Zypper => (
             vec!["openmpi4".to_owned(), "openmpi4-devel".to_owned()],
-            vec!["sudo zypper install -y openmpi4 openmpi4-devel".to_owned()],
+            vec![InstallCommand::sudo(&[
+                "zypper",
+                "install",
+                "-y",
+                "openmpi4",
+                "openmpi4-devel",
+            ])],
             "Install the OpenMPI runtime that vLLM's ROCm wheels require. Requires root via zypper; approve before execution. If openmpi4 is unavailable, substitute your distribution's current openmpi package.".to_owned(),
         ),
         PackageManager::Pacman => (
             vec!["openmpi".to_owned()],
-            vec!["sudo pacman -S --needed --noconfirm openmpi".to_owned()],
+            vec![InstallCommand::sudo(&[
+                "pacman",
+                "-S",
+                "--needed",
+                "--noconfirm",
+                "openmpi",
+            ])],
             "Install the OpenMPI runtime that vLLM's ROCm wheels require. Requires root via pacman; approve before execution.".to_owned(),
         ),
     };
@@ -639,21 +688,26 @@ pub fn build_libatomic_install_plan(os_id: &str, id_like: &str) -> SystemPackage
         };
     };
 
-    let (packages, commands): (Vec<String>, Vec<String>) = match manager {
+    let (packages, commands): (Vec<String>, Vec<InstallCommand>) = match manager {
         PackageManager::Apt => (
             vec!["libatomic1".to_owned()],
             vec![
-                "sudo apt-get update".to_owned(),
-                "sudo apt-get install -y libatomic1".to_owned(),
+                InstallCommand::sudo(&["apt-get", "update"]),
+                InstallCommand::sudo(&["apt-get", "install", "-y", "libatomic1"]),
             ],
         ),
         PackageManager::Dnf => (
             vec!["libatomic".to_owned()],
-            vec!["sudo dnf install -y libatomic".to_owned()],
+            vec![InstallCommand::sudo(&["dnf", "install", "-y", "libatomic"])],
         ),
         PackageManager::Zypper => (
             vec!["libatomic1".to_owned()],
-            vec!["sudo zypper install -y libatomic1".to_owned()],
+            vec![InstallCommand::sudo(&[
+                "zypper",
+                "install",
+                "-y",
+                "libatomic1",
+            ])],
         ),
         // Arch ships libatomic inside `gcc-libs`, which is part of the base
         // install, so there is nothing to install separately.
@@ -716,25 +770,38 @@ pub fn build_libnuma_install_plan(os_id: &str, id_like: &str) -> SystemPackageIn
         };
     };
 
-    let (packages, commands): (Vec<String>, Vec<String>) = match manager {
+    let (packages, commands): (Vec<String>, Vec<InstallCommand>) = match manager {
         PackageManager::Apt => (
             vec!["libnuma1".to_owned()],
             vec![
-                "sudo apt-get update".to_owned(),
-                "sudo apt-get install -y libnuma1".to_owned(),
+                InstallCommand::sudo(&["apt-get", "update"]),
+                InstallCommand::sudo(&["apt-get", "install", "-y", "libnuma1"]),
             ],
         ),
         PackageManager::Dnf => (
             vec!["numactl-libs".to_owned()],
-            vec!["sudo dnf install -y numactl-libs".to_owned()],
+            vec![InstallCommand::sudo(&[
+                "dnf",
+                "install",
+                "-y",
+                "numactl-libs",
+            ])],
         ),
         PackageManager::Zypper => (
             vec!["libnuma1".to_owned()],
-            vec!["sudo zypper install -y libnuma1".to_owned()],
+            vec![InstallCommand::sudo(&[
+                "zypper", "install", "-y", "libnuma1",
+            ])],
         ),
         PackageManager::Pacman => (
             vec!["numactl".to_owned()],
-            vec!["sudo pacman -S --needed --noconfirm numactl".to_owned()],
+            vec![InstallCommand::sudo(&[
+                "pacman",
+                "-S",
+                "--needed",
+                "--noconfirm",
+                "numactl",
+            ])],
         ),
     };
 
@@ -765,7 +832,13 @@ pub fn install_hint() -> String {
         let field = |key: &str| parse_os_release_field(&os_release, key).unwrap_or_default();
         let plan = build_openmpi_install_plan(&field("ID"), &field("ID_LIKE"));
         if plan.supported && !plan.commands.is_empty() {
-            return format!("install it with `{}`", plan.commands.join(" && "));
+            let rendered = plan
+                .commands
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" && ");
+            return format!("install it with `{rendered}`");
         }
     }
     "install your distribution's OpenMPI runtime package (providing libmpi.so / libmpi_cxx.so and mpirun)".to_owned()
@@ -784,7 +857,13 @@ pub fn libatomic_install_hint() -> String {
         let field = |key: &str| parse_os_release_field(&os_release, key).unwrap_or_default();
         let plan = build_libatomic_install_plan(&field("ID"), &field("ID_LIKE"));
         if plan.supported && !plan.commands.is_empty() {
-            return format!("install it with `{}`", plan.commands.join(" && "));
+            let rendered = plan
+                .commands
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" && ");
+            return format!("install it with `{rendered}`");
         }
     }
     "install your distribution's libatomic runtime package (providing libatomic.so.1)".to_owned()
@@ -803,7 +882,13 @@ pub fn libnuma_install_hint() -> String {
         let field = |key: &str| parse_os_release_field(&os_release, key).unwrap_or_default();
         let plan = build_libnuma_install_plan(&field("ID"), &field("ID_LIKE"));
         if plan.supported && !plan.commands.is_empty() {
-            return format!("install it with `{}`", plan.commands.join(" && "));
+            let rendered = plan
+                .commands
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" && ");
+            return format!("install it with `{rendered}`");
         }
     }
     "install your distribution's numactl runtime package (providing libnuma.so.1)".to_owned()
@@ -1050,7 +1135,7 @@ mod tests {
         assert!(
             plan.commands
                 .iter()
-                .any(|cmd| cmd == "sudo dnf install -y libatomic"),
+                .any(|cmd| cmd.to_string() == "sudo dnf install -y libatomic"),
             "expected base libatomic install command: {:?}",
             plan.commands
         );
@@ -1081,7 +1166,7 @@ mod tests {
         assert!(
             plan.commands
                 .iter()
-                .any(|cmd| cmd == "sudo dnf install -y numactl-libs"),
+                .any(|cmd| cmd.to_string() == "sudo dnf install -y numactl-libs"),
             "expected numactl-libs install command: {:?}",
             plan.commands
         );
@@ -1118,11 +1203,10 @@ mod tests {
             "apt plan must not pin the release-specific libopenmpi3 name: {:?}",
             plan.packages
         );
-        assert!(
-            plan.commands
-                .iter()
-                .any(|cmd| cmd.contains("apt-get install -y openmpi-bin libopenmpi-dev"))
-        );
+        assert!(plan.commands.iter().any(|cmd| {
+            cmd.to_string()
+                .contains("apt-get install -y openmpi-bin libopenmpi-dev")
+        }));
     }
 
     #[test]
@@ -1140,7 +1224,11 @@ mod tests {
                 Some("dnf"),
                 "expected dnf for {id}"
             );
-            assert!(plan.commands.iter().any(|cmd| cmd.contains("dnf install")));
+            assert!(
+                plan.commands
+                    .iter()
+                    .any(|cmd| cmd.to_string().contains("dnf install"))
+            );
         }
     }
 
@@ -1161,14 +1249,14 @@ mod tests {
         assert!(
             plan.commands
                 .iter()
-                .all(|cmd| !cmd.contains("openmpi-devel")),
+                .all(|cmd| !cmd.to_string().contains("openmpi-devel")),
             "RHEL install command must not reference openmpi-devel: {:?}",
             plan.commands
         );
         assert!(
             plan.commands
                 .iter()
-                .any(|cmd| cmd == "sudo dnf install -y openmpi"),
+                .any(|cmd| cmd.to_string() == "sudo dnf install -y openmpi"),
             "expected base openmpi install command: {:?}",
             plan.commands
         );
@@ -1187,7 +1275,7 @@ mod tests {
         assert!(
             plan.commands
                 .iter()
-                .any(|cmd| cmd.contains("zypper install"))
+                .any(|cmd| cmd.to_string().contains("zypper install"))
         );
     }
 
@@ -1195,7 +1283,11 @@ mod tests {
     fn pacman_plan_for_arch() {
         let plan = build_openmpi_install_plan("arch", "");
         assert_eq!(plan.package_manager.as_deref(), Some("pacman"));
-        assert!(plan.commands.iter().any(|cmd| cmd.contains("pacman -S")));
+        assert!(
+            plan.commands
+                .iter()
+                .any(|cmd| cmd.to_string().contains("pacman -S"))
+        );
     }
 
     #[test]
@@ -1205,5 +1297,21 @@ mod tests {
         assert!(plan.package_manager.is_none());
         assert!(plan.commands.is_empty());
         assert!(plan.reason.contains("manually"));
+    }
+
+    #[test]
+    fn install_command_prepends_sudo_only_when_not_root() {
+        let command = InstallCommand::sudo(&["dnf", "install", "-y", "openmpi"]);
+        // Non-root: sudo is prepended, both in the executed argv and the display.
+        assert_eq!(
+            command.resolved_argv(false),
+            vec!["sudo", "dnf", "install", "-y", "openmpi"]
+        );
+        assert_eq!(command.to_string(), "sudo dnf install -y openmpi");
+        // Root: sudo (which may be absent) is dropped from the executed argv.
+        assert_eq!(
+            command.resolved_argv(true),
+            vec!["dnf", "install", "-y", "openmpi"]
+        );
     }
 }

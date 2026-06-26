@@ -3068,6 +3068,25 @@ fn run_shell_command_with_stdin(command: &str, stdin: Stdio) -> Result<()> {
     Ok(())
 }
 
+/// Run a command given as an argv vector directly, without going through a shell.
+///
+/// Used for [`run_system_package_install_plan`], whose commands are modeled as
+/// argv vectors so no shell quoting or `sudo`-prefix string handling is needed.
+fn run_argv_with_stdin(argv: &[String], stdin: Stdio) -> Result<()> {
+    let (program, args) = argv
+        .split_first()
+        .context("install command has no program to run")?;
+    let status = ProcessCommand::new(program)
+        .args(args)
+        .stdin(stdin)
+        .status()
+        .with_context(|| format!("failed to launch `{}`", argv.join(" ")))?;
+    if !status.success() {
+        bail!("`{}` exited with {status}", argv.join(" "));
+    }
+    Ok(())
+}
+
 fn driver_install_state_path(paths: &AppPaths) -> PathBuf {
     paths.data_dir.join("driver").join("state.json")
 }
@@ -5417,19 +5436,15 @@ fn run_system_package_install_plan(
 ) -> Result<()> {
     let root = rocm_core::openmpi::running_as_root();
     for command in &plan.commands {
-        // When already root, `sudo` may be absent; run the command directly.
-        let command = if root {
-            command
-                .strip_prefix("sudo ")
-                .map_or_else(|| command.clone(), str::to_owned)
-        } else {
-            command.clone()
-        };
+        // `resolved_argv` prepends `sudo` only when the command needs root and we
+        // are not already root (where `sudo` may be absent); the argv runs
+        // directly without a shell.
+        let argv = command.resolved_argv(root);
         // Inherit stdin so an interactive `sudo` password prompt (the case the
         // `--yes` approval exists for) can be answered. When already root or
         // passwordless sudo is configured, sudo does not prompt and the inherited
         // stdin is simply unused.
-        run_shell_command_with_stdin(&command, Stdio::inherit())
+        run_argv_with_stdin(&argv, Stdio::inherit())
             .with_context(|| format!("system package install command failed: {command}"))?;
     }
     Ok(())
