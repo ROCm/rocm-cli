@@ -11,6 +11,13 @@
 #
 # NOTE: the `repo: builtin` block uses prek's native Rust hooks and is therefore
 # NOT compatible with the classic `pre-commit` tool. Everything else is standard.
+#
+# CI runs `prek run --all-files --no-group local-tools` so this file is the single
+# source of truth for the lint/format/hygiene checks. Hooks tagged
+# `groups: [local-tools]` need a full Rust compile, hawkeye, PowerShell, or
+# commit-history/signing access and are covered by their own dedicated CI jobs
+# (clippy / build-and-test / license-headers / powershell-lint /
+# commit-signatures), so the prek job skips them.
 
 default_install_hook_types: [pre-commit, pre-push]
 
@@ -44,7 +51,10 @@ repos:
     rev: v0.11.0.1
     hooks:
       - id: shellcheck
-        args: [--enable=all, --exclude=SC2310,SC2312]
+        # Quote the excludes: an unquoted `--exclude=SC2310,SC2312` in a YAML
+        # flow sequence splits on the comma, dropping SC2312 from the exclude
+        # list and passing it to shellcheck as a (nonexistent) filename.
+        args: [--enable=all, "--exclude=SC2310,SC2312"]
 
   # Commit trust: signing + DCO sign-off are enforced, not just policy.
   # `--check-config` is a fast local-config assertion run on every commit;
@@ -57,12 +67,14 @@ repos:
         language: system
         pass_filenames: false
         stages: [pre-commit]
+        groups: [local-tools] # local-only; CI uses the `commit-signatures` job
       - id: verify-commits
         name: verify commits are signed and signed-off
         entry: cargo xtask verify-commits
         language: system
         pass_filenames: false
         stages: [pre-push]
+        groups: [local-tools] # local-only; CI uses the `commit-signatures` job
 
   # License headers: mirrors the korandoru/hawkeye CI check.
   # Requires: cargo install hawkeye
@@ -74,12 +86,15 @@ repos:
         language: system
         types_or: [rust, python, shell]
         pass_filenames: false
+        groups: [local-tools] # runs in the dedicated `license-headers` CI job (hawkeye action)
 
   # Rust + PowerShell: mirror the CI checks using the local toolchain.
   - repo: local
     hooks:
       - id: cargo-fmt
         name: cargo fmt
+        # Only needs rustfmt (no compile), so it runs in the prek job. clippy and
+        # the test build below need a full compile and stay `local-tools`.
         entry: cargo fmt --all --check
         language: system
         types: [rust]
@@ -91,6 +106,7 @@ repos:
         types: [rust]
         pass_filenames: false
         stages: [pre-push] # compiles the workspace; too slow for every commit
+        groups: [local-tools] # runs in the dedicated `clippy` CI job
       - id: cargo-test
         name: cargo test
         entry: cargo test --workspace --all-targets
@@ -98,14 +114,16 @@ repos:
         types: [rust]
         pass_filenames: false
         stages: [pre-push]
-      - id: powershell-syntax
-        name: powershell syntax check
-        entry: python scripts/check_powershell_syntax.py
-        language: system
-        files: \.ps1$
+        groups: [local-tools] # runs in the dedicated build-and-test CI job
       - id: powershell-script-analyzer
         name: PSScriptAnalyzer
-        # Requires PowerShell (pwsh) + the PSScriptAnalyzer module installed locally.
-        entry: pwsh -NoProfile -Command "$r = $args | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Settings ./PSScriptAnalyzerSettings.psd1 }; if ($r) { $r | Format-Table -AutoSize; exit 1 }"
+        # Lints every .ps1 with PSScriptAnalyzer, which also covers syntax (a file
+        # that fails to parse is reported as a ParseError). The xtask auto-detects
+        # PowerShell 7+ (pwsh) or pre-installed Windows PowerShell (powershell) and
+        # skips cleanly on non-Windows hosts (CI lints on Windows), or if neither
+        # it nor the PSScriptAnalyzer module is present.
+        # On CI the dedicated `powershell-lint` job runs this under both editions.
+        entry: cargo xtask powershell-lint
         language: system
         files: \.ps1$
+        groups: [local-tools] # runs in the dedicated `powershell-lint` CI job
