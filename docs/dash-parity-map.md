@@ -9,6 +9,13 @@ locks the behavior.
 Groups: **A** nav/session · **B** read-only · **C** approvals/automations ·
 **D** mutating ops · **E** permissions · **F** planning · **G** provider/chat.
 
+> **All 30 legacy commands covered as of Phase 9; bare `rocm` and `rocm chat`
+> route to the dash.** The interactive entrypoints (`launch_default` and the
+> no-prompt `Command::Chat` branch) now open the dash with the Chat tab focused
+> via `dash::run_chat`. `tui.rs` is retained but unreferenced by these
+> entrypoints, pending the human go/no-go deletion in
+> [tui-retirement-checklist.md](tui-retirement-checklist.md).
+
 | Command | Group | Status | Dash mechanism | Evidence |
 |---------|-------|--------|----------------|----------|
 | home | A | covered (Phase 3) | `/home` slash → `ActiveTab::Overview` | `slash_home_switches_to_overview` |

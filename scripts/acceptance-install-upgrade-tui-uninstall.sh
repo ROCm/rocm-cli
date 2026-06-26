@@ -301,7 +301,13 @@ tui_command="$(
     openai
 )"
 tui_command="stty rows 40 cols 120; exec ${tui_command}"
-set +e
+# Assert on the TUI's OWN exit code. The dash quits immediately on `q`, so the
+# input feeder's trailing `printf 'y'` races with the child exiting and takes a
+# broken pipe (non-zero); with `pipefail` that would poison the pipeline result
+# even though `script -e` already propagates the child's real exit code. Drop
+# `pipefail` for this one pipeline so the feeder's SIGPIPE can't mask a clean
+# (or genuinely failing) TUI exit.
+set +e +o pipefail
 (
   sleep 1
   printf 'q'
@@ -309,8 +315,13 @@ set +e
   printf 'y'
 ) | timeout 20s script -q -e -f -c "${tui_command}" "${TUI_LOG}"
 tui_status=$?
-set -e
+set -e -o pipefail
 if [[ "${tui_status}" -ne 0 ]]; then
+  # Surface the captured TUI session so a non-zero exit is debuggable in CI
+  # (e.g. a panic or an error returned on quit) instead of failing opaquely.
+  echo "--- TUI smoke log (${TUI_LOG}) ---" >&2
+  cat "${TUI_LOG}" >&2 || true
+  echo "--- end TUI smoke log ---" >&2
   fail "TUI smoke exited with status ${tui_status}"
 fi
 
