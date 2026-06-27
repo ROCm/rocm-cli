@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: MIT
+
 //! Home tab — the landing "instrument cluster".
 //!
 //! Composes the `dash-home` mock (`gen_mockups.rs draw_dash_home`) against live

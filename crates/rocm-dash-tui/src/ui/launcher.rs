@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: MIT
+
 //! Minimal launcher — the bare-`rocm` front door.
 //!
 //! A small pre-dash screen: a live status strip (GPU + serving) over an icon

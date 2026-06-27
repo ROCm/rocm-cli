@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: MIT
+
 //! Shared Actions + Details pane used by the ROCm and Serving tabs.
 //!
 //! Each domain tab is a left **Actions** bento (its locked verb list) plus a

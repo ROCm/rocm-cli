@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: MIT
+
 //! Shared "bento" box — the single source of box chrome for the dash.
 //!
 //! One helper so every visible box reads as part of one design system:

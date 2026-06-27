@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: MIT
+
 //! High-fidelity, runnable previews of the *proposed* UX redesign described in
 //! `docs/design/`. Each "scene" paints a mock layout to a real ratatui
 //! framebuffer (real box-drawing, the real `Theme` palette, and the real

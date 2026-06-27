@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: MIT
+
 //! ROCm tab — install, configure, and manage the ROCm platform.
 //!
 //! Left Actions bento (the locked ROCm verb list) + right `Details: <verb>`
@@ -47,7 +51,7 @@ pub const VERBS: &[Verb] = &[
     Verb {
         icon: "⚕",
         label: "Diagnose & fix  (doctor)",
-        action: KeyAction::OpenDoctor,
+        action: KeyAction::OpenExamine,
         summary: "Read-only environment check that flags what needs fixing.",
         steps: &[
             "Run `rocm doctor` (one job, no approval)",
@@ -170,7 +174,7 @@ mod tests {
     #[test]
     fn rocm_verb_action_maps_selection_to_seam() {
         assert_eq!(verb_action(0), KeyAction::OpenInstall);
-        assert_eq!(verb_action(2), KeyAction::OpenDoctor);
+        assert_eq!(verb_action(2), KeyAction::OpenExamine);
         // Display-only Uninstall is a safe no-op.
         assert_eq!(verb_action(5), KeyAction::Nothing);
         // Out-of-range is a safe no-op.

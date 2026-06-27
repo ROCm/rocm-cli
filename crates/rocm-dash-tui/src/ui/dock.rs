@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: MIT
+
 //! Wide-layout triptych rails (Phase 6).
 //!
 //! When the terminal is wide enough, `ui::draw` splits the body into a left GPU

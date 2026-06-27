@@ -667,21 +667,61 @@ impl AppState {
         self.services
             .as_ref()
             .and_then(|m| m.active_job.as_deref())
-            .or_else(|| self.serve_wizard.as_ref().and_then(|m| m.active_job.as_deref()))
-            .or_else(|| self.engine_manager.as_ref().and_then(|m| m.active_job.as_deref()))
-            .or_else(|| self.doctor_manager.as_ref().and_then(|m| m.active_job.as_deref()))
-            .or_else(|| self.update_manager.as_ref().and_then(|m| m.active_job.as_deref()))
-            .or_else(|| self.install_manager.as_ref().and_then(|m| m.active_job.as_deref()))
-            .or_else(|| self.logs_view.as_ref().and_then(|m| m.active_job.as_deref()))
-            .or_else(|| self.runtime_manager.as_ref().and_then(|m| m.active_job.as_deref()))
-            .or_else(|| self.onboarding.as_ref().and_then(|m| m.active_job.as_deref()))
+            .or_else(|| {
+                self.serve_wizard
+                    .as_ref()
+                    .and_then(|m| m.active_job.as_deref())
+            })
+            .or_else(|| {
+                self.engine_manager
+                    .as_ref()
+                    .and_then(|m| m.active_job.as_deref())
+            })
+            .or_else(|| {
+                self.examine_manager
+                    .as_ref()
+                    .and_then(|m| m.active_job.as_deref())
+            })
+            .or_else(|| {
+                self.update_manager
+                    .as_ref()
+                    .and_then(|m| m.active_job.as_deref())
+            })
+            .or_else(|| {
+                self.install_manager
+                    .as_ref()
+                    .and_then(|m| m.active_job.as_deref())
+            })
+            .or_else(|| {
+                self.logs_view
+                    .as_ref()
+                    .and_then(|m| m.active_job.as_deref())
+            })
+            .or_else(|| {
+                self.runtime_manager
+                    .as_ref()
+                    .and_then(|m| m.active_job.as_deref())
+            })
+            .or_else(|| {
+                self.onboarding
+                    .as_ref()
+                    .and_then(|m| m.active_job.as_deref())
+            })
             .or_else(|| {
                 self.automations_manager
                     .as_ref()
                     .and_then(|m| m.active_job.as_deref())
             })
-            .or_else(|| self.command_screen.as_ref().and_then(|m| m.active_job.as_deref()))
-            .or_else(|| self.config_manager.as_ref().and_then(|m| m.active_job.as_deref()))
+            .or_else(|| {
+                self.command_screen
+                    .as_ref()
+                    .and_then(|m| m.active_job.as_deref())
+            })
+            .or_else(|| {
+                self.config_manager
+                    .as_ref()
+                    .and_then(|m| m.active_job.as_deref())
+            })
     }
 
     /// Whether a job console is currently displayed (a manager is open AND on its
@@ -731,7 +771,7 @@ impl AppState {
         self.services.is_some()
             || self.serve_wizard.is_some()
             || self.engine_manager.is_some()
-            || self.doctor_manager.is_some()
+            || self.examine_manager.is_some()
             || self.update_manager.is_some()
             || self.install_manager.is_some()
             || self.logs_view.is_some()
@@ -792,7 +832,7 @@ impl AppState {
                 .as_ref()
                 .is_none_or(|m| m.approval.is_none() && m.active_job.is_none())
             && self
-                .doctor_manager
+                .examine_manager
                 .as_ref()
                 .is_none_or(|m| m.active_job.is_none())
             && self
@@ -2672,9 +2712,7 @@ pub fn handle_mouse(ev: MouseEvent, modal: &Modal, tab: ActiveTab) -> KeyAction 
     };
     if *modal == Modal::Detail {
         KeyAction::ScrollModal(delta)
-    } else if *modal == Modal::ThemePicker
-        || (*modal == Modal::None && tab == ActiveTab::Observe)
-    {
+    } else if *modal == Modal::ThemePicker || (*modal == Modal::None && tab == ActiveTab::Observe) {
         KeyAction::Move(delta as isize)
     } else {
         KeyAction::Nothing
@@ -2785,13 +2823,16 @@ mod tests {
             s.serve_wizard.is_some(),
             "detail-focus Enter opens the manager"
         );
-        // ROCm verb 2 = "Diagnose (doctor)" → OpenDoctor (the other mapping).
+        // ROCm verb 2 = "Diagnose (doctor)" → OpenExamine (the other mapping).
         let mut r = AppState::new("t".into(), "default-dark".into());
         r.active_tab = ActiveTab::Rocm;
         r.rocm_sel = 2;
         r.pane_focus = PaneFocus::Detail;
         apply_action(&mut r, KeyAction::PaneActivate);
-        assert!(r.doctor_manager.is_some(), "ROCm Diagnose opens the doctor");
+        assert!(
+            r.examine_manager.is_some(),
+            "ROCm Diagnose opens the doctor"
+        );
     }
 
     #[test]
@@ -2872,7 +2913,7 @@ mod tests {
         // Manager open but on a non-domain tab (opened from Observe hotkey) →
         // the manager keeps its own Esc handling; no domain back-out.
         s.active_tab = ActiveTab::Observe;
-        s.doctor_manager = Some(crate::ui::doctor_manager::DoctorManagerState::default());
+        s.examine_manager = Some(crate::ui::examine_manager::ExamineManagerState::default());
         assert!(s.has_open_overlay());
         assert!(!s.should_pane_back_out(crossterm::event::KeyCode::Esc));
     }
@@ -2922,7 +2963,7 @@ mod tests {
         MouseEvent {
             kind,
             column: col,
-            row: row,
+            row,
             modifiers: KeyModifiers::NONE,
         }
     }
@@ -2954,9 +2995,10 @@ mod tests {
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.active_tab = ActiveTab::Rocm;
         s.last_body_area = Some(Rect::new(2, 4, 150, 30));
-        let mut lv = crate::ui::logs_view::LogsViewState::default();
-        lv.active_job = Some("logs".into());
-        s.logs_view = Some(lv);
+        s.logs_view = Some(crate::ui::logs_view::LogsViewState {
+            active_job: Some("logs".into()),
+            ..Default::default()
+        });
         // Console showing → vertical wheel pans the log (×3 lines), not the list.
         assert_eq!(
             resolve_mouse(wheel(MouseEventKind::ScrollDown, 10, 12), &s),
@@ -3040,9 +3082,10 @@ mod tests {
                 line: format!("line {i}"),
             });
         }
-        let mut lv = crate::ui::logs_view::LogsViewState::default();
-        lv.active_job = Some("logs".into());
-        s.logs_view = Some(lv);
+        s.logs_view = Some(crate::ui::logs_view::LogsViewState {
+            active_job: Some("logs".into()),
+            ..Default::default()
+        });
         s.console_scroll = 0;
         s.scroll_console(100, 0);
         assert_eq!(s.console_scroll, 3, "clamped to output.len()-1 (4 lines)");

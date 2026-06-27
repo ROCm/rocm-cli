@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: MIT
+
 //! Characterization safety-net for the dash TUI (Supergoal Phase 0, updated P3).
 //!
 //! Freezes `ui::draw` behaviour for every tab in the 5-tab IA
@@ -298,8 +302,8 @@ fn managers_render_as_centered_modal() {
 
     use rocm_dash_tui::ui::{
         automations_manager::AutomationsManagerState, command_screen::CommandScreenState,
-        config_manager::ConfigManagerState, doctor_manager::DoctorManagerState,
-        engine_manager::EngineManagerState, install_manager::InstallManagerState,
+        config_manager::ConfigManagerState, engine_manager::EngineManagerState,
+        examine_manager::ExamineManagerState, install_manager::InstallManagerState,
         logs_view::LogsViewState, onboarding::OnboardingState,
         runtime_manager::RuntimeManagerState, serve_wizard::ServeWizardState,
         services_manager::ServicesManagerState, update_manager::UpdateManagerState,
@@ -347,7 +351,7 @@ fn managers_render_as_centered_modal() {
         ),
         (
             ActiveTab::Rocm,
-            |s| s.doctor_manager = Some(DoctorManagerState::default()),
+            |s| s.examine_manager = Some(ExamineManagerState::default()),
             "environment check",
         ),
         (

@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: MIT
+
 //! Serving tab — install, configure, and manage serving engines + instances.
 //!
 //! Left Actions bento (the locked Serving verb list) + right `Details: <verb>`

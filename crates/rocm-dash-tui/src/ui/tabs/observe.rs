@@ -1,3 +1,7 @@
+// Copyright Advanced Micro Devices, Inc.
+//
+// SPDX-License-Identifier: MIT
+
 //! Observe tab — the AI-serving telemetry surface.
 //!
 //! P5 reorients Observe around AI-serving efficiency/throughput: a top band of
