@@ -12,7 +12,6 @@
 //!
 //! Exit codes match `apply_fix.py`: `0` ok/dry-run/print-only, `2` unknown id,
 //! `3` environment/OS not right, `4` a command failed, `5` user declined.
-//! See `plans/rocm-doctor-examine-migration-plan.md`.
 
 use crate::examine::{run, which};
 use crate::{runtime_is_linux, runtime_is_windows};

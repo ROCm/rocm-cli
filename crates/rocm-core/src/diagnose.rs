@@ -13,7 +13,7 @@
 //! The catalog is deliberately closed: new failure modes are added here, not
 //! invented at runtime. Keyword tables, thresholds, and tracker URLs are the
 //! data; the per-check logic mirrors `diagnose.py` field-for-field so the two
-//! stay behaviorally identical. See `plans/rocm-doctor-examine-migration-plan.md`.
+//! stay behaviorally identical.
 
 use crate::examine::Examination;
 use regex::Regex;

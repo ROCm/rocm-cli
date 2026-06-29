@@ -8,7 +8,7 @@
 //! signals the diagnosis catalog reasons over and serializes them as the
 //! **Examination** JSON document (`rocm examine --json`). The field names and
 //! shapes mirror `examine.py` field-for-field so the catalog consumes the CLI's
-//! output unchanged. See `plans/rocm-doctor-examine-migration-plan.md`.
+//! output unchanged.
 
 use crate::{runtime_is_linux, runtime_is_windows};
 use serde::{Deserialize, Serialize};
