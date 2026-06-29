@@ -29,7 +29,7 @@ Groups: **A** nav/session · **B** read-only · **C** approvals/automations ·
 | model | B | covered (Phase 3) | `/model` slash → `slash_tool` `rocm_command ["model"]` (off-thread) | `slash_model_raises_executor_request` |
 | config | B | covered (Phase 3) | `/config` slash → config-manager overlay | `slash_config_opens_overlay` |
 | logs | B | covered (Phase 3) | `/logs` slash → opens the logs overlay (`logs_view`); the read-only `service_logs` tool is covered separately via the LLM tool-call seam | `slash_logs_opens_overlay` / `read_only_tool_round_trips_to_json` |
-| gpu | B | covered (Phase 3) | `/gpu` slash → `ActiveTab::Hardware`; tool `gpu_snapshot` via seam | `slash_gpu_switches_to_hardware` |
+| gpu | B | covered (Phase 3) | `/gpu` slash → `ActiveTab::Observe`; tool `gpu_snapshot` via seam | `slash_gpu_switches_to_observe` |
 | daemon | B | covered (Phase 3) | `/daemon` slash → `slash_tool` `rocm_command ["daemon","status"]` (off-thread) | `slash_daemon_raises_executor_request` |
 | install | D | covered (Phase 4) | `/install` slash → `install_sdk` mutating tool → approval modal → `execute_approved` (captured subprocess); also LLM tool-call seam | `slash_install_raises_install_sdk_request` / `approve_path_runs_execute_approved` |
 | engine | D | covered (Phase 4) | `/engine <name>` slash → `install_engine` mutating tool → approval modal → `execute_approved`; also LLM tool-call seam | `slash_engine_raises_install_engine_request` |

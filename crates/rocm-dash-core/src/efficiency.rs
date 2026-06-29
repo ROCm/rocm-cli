@@ -158,4 +158,30 @@ mod tests {
         assert!(!gpu_ids_overlap(&[], &gpus));
         assert!(!gpu_ids_overlap(&["0".into()], &[]));
     }
+
+    #[test]
+    fn instance_power_sums_matching_gpus() {
+        let gpus = [
+            gpu("gpu-0", 200.0),
+            gpu("gpu-1", 300.0),
+            gpu("gpu-2", 999.0),
+        ];
+        // Instance occupies gpus 0 and 1 → 500 W; gpu-2 is excluded.
+        assert_eq!(
+            instance_power_w(&["0".into(), "1".into()], &gpus),
+            Some(500.0)
+        );
+    }
+
+    #[test]
+    fn instance_power_no_match_yields_none() {
+        let gpus = [gpu("gpu-5", 250.0)];
+        assert_eq!(instance_power_w(&["0".into()], &gpus), None);
+    }
+
+    #[test]
+    fn instance_power_empty_ids_yields_none() {
+        let gpus = [gpu("gpu-0", 250.0)];
+        assert_eq!(instance_power_w(&[], &gpus), None);
+    }
 }

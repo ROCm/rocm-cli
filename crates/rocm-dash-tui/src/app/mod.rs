@@ -51,7 +51,7 @@ pub struct ResolvedArgs {
     /// live daemon. Mutually exclusive with `connect` (enforced by clap).
     pub replay: Option<std::path::PathBuf>,
     /// Which tab is active when the TUI opens. `Chat` for the chat-first launch
-    /// (bare `rocm` / `rocm chat`); `Overview` for the dashboard (`rocm dash`).
+    /// (bare `rocm` / `rocm chat`); `Home` for the dashboard (`rocm dash`).
     pub initial_tab: ActiveTab,
     /// Chat endpoint base URL, CLI-flag value already merged over config.
     pub chat_url: Option<String>,
@@ -422,9 +422,9 @@ pub struct AppState {
     pub instance_sel: usize,
     /// Cursor into the bench_rows VecDeque (0 = oldest, len-1 = newest).
     pub bench_sel: usize,
-    /// Cursor into the Hardware tab's per-GPU panel list.
+    /// Cursor into the Hardware Observe sub-panel's per-GPU panel list.
     pub gpu_sel: usize,
-    /// Scroll offset (first visible GPU index) for the Hardware tab when the
+    /// Scroll offset (first visible GPU index) for the Hardware Observe sub-panel when the
     /// GPU list renders as a scrolled window of compact rows. Kept in sync with
     /// `gpu_sel` so the selection stays visible.
     pub gpu_scroll: usize,
@@ -501,7 +501,7 @@ pub struct AppState {
     pub serve_wizard: Option<crate::ui::serve_wizard::ServeWizardState>,
     /// Engine manager overlay (Phase 3 Wave 1). `None` = closed.
     pub engine_manager: Option<crate::ui::engine_manager::EngineManagerState>,
-    /// Doctor overlay (Phase 3 Wave 2). `None` = closed.
+    /// examine overlay (Phase 3 Wave 2). `None` = closed.
     pub examine_manager: Option<crate::ui::examine_manager::ExamineManagerState>,
     /// Update overlay (Phase 3 Wave 2). `None` = closed.
     pub update_manager: Option<crate::ui::update_manager::UpdateManagerState>,
@@ -1613,8 +1613,8 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         );
                         crate::jobs::run_effects(fx, &job_tx);
                     }
-                    // The doctor overlay, when open, owns all keys (read-only
-                    // `rocm doctor` job through the job-bridge).
+                    // The examine overlay, when open, owns all keys (read-only
+                    // `rocm examine` job through the job-bridge).
                     Some(Ok(CtEvent::Key(k))) if state.examine_manager.is_some() => {
                         let fx = crate::ui::examine_manager::on_key(
                             &mut state.examine_manager,
@@ -2427,7 +2427,7 @@ pub enum KeyAction {
     OpenServeWizard,
     /// Open the engine-manager overlay (Phase 3 Wave 1).
     OpenEngineManager,
-    /// Open the doctor overlay (Phase 3 Wave 2).
+    /// Open the examine overlay (Phase 3 Wave 2).
     OpenExamine,
     /// Open the update overlay (Phase 3 Wave 2).
     OpenUpdate,
@@ -2641,7 +2641,7 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         KeyCode::Char('w') if current == ActiveTab::Observe => KeyAction::OpenServeWizard,
         // Engine manager: use/install/reinstall serving engines.
         KeyCode::Char('e') if current == ActiveTab::Observe => KeyAction::OpenEngineManager,
-        // Doctor: read-only environment check.
+        // Examine: read-only environment check.
         KeyCode::Char('d') if current == ActiveTab::Observe => KeyAction::OpenExamine,
         // Update: check/preview/apply ROCm package updates.
         KeyCode::Char('u') if current == ActiveTab::Observe => KeyAction::OpenUpdate,
@@ -4010,7 +4010,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_gpu_switches_to_hardware() {
+    fn slash_gpu_switches_to_observe() {
         let mut s = st();
         assert_eq!(s.handle_slash_command("/gpu"), SlashOutcome::Handled);
         assert_eq!(s.active_tab, ActiveTab::Observe);

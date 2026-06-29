@@ -87,7 +87,7 @@ pub fn si(value: f64) -> String {
 
 /// Byte-rate (bytes per second), SI-suffixed: `512/s`, `1.20 k/s`, `1.20 M/s`.
 ///
-/// Used for disk and network throughput on the Hardware tab. Reuses [`si`], so
+/// Used for disk and network throughput on the Hardware Observe sub-panel. Reuses [`si`], so
 /// the magnitude suffix (k/M/B) carries the scale and `/s` marks it as a rate;
 /// the unit is bytes-per-second by context (the panel labels say disk / net).
 /// No panic at 0 or non-finite input.

@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Hardware tab — full-screen detail of host CPU/memory + per-GPU panels.
+//! Hardware Observe sub-panel — full-screen detail of host CPU/memory + per-GPU panels.
 //!
 //! Layout (vertical):
 //! 1. CPU panel (~10 rows): aggregate braille sparkline over history plus
@@ -333,7 +333,7 @@ fn plan_gpu_rows(section_h: u16, n: usize) -> (bool, usize) {
     }
 }
 
-/// Visible compact-row count for the Hardware tab given the full body height.
+/// Visible compact-row count for the Hardware Observe sub-panel given the full body height.
 ///
 /// Used by `AppState` to keep `gpu_scroll` in sync on navigation. Accounts for
 /// both the rows above the GPU section and the section's own header row.

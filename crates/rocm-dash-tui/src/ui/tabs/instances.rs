@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Instances tab — full-screen instance grid with kv-cache / requests / args,
+//! Instances Observe sub-panel — full-screen instance grid with kv-cache / requests / args,
 //! plus a detail modal showing model / partition / launch_args / env / log.
 
 use ratatui::Frame;
@@ -100,9 +100,11 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             .map_or_else(|| dash.to_string(), |v| format!("{v:.2}"));
         let ttft = inst
             .ttft_ms
+            .filter(|v| v.is_finite())
             .map_or_else(|| dash.to_string(), |v| format!("{v:.0}ms"));
         let tpot = inst
             .tpot_ms
+            .filter(|v| v.is_finite())
             .map_or_else(|| dash.to_string(), |v| format!("{v:.0}ms"));
         let power = rocm_dash_core::efficiency::instance_power_w(&inst.gpu_ids, gpus)
             .map_or_else(|| dash.to_string(), |w| format!("{w:.0}W"));
@@ -491,7 +493,7 @@ fn compact_line<'a>(inst: &'a Instance, theme: &Theme, max_w: usize) -> Line<'a>
 
 /// Detail modal: summary + launch_args + env_vars + log footer.
 ///
-/// Resolve a click at `(x, y)` inside the Instances tab body. Returns a
+/// Resolve a click at `(x, y)` inside the Instances Observe sub-panel body. Returns a
 /// `KeyAction` to dispatch, or `None` when the click misses everything
 /// actionable.
 ///
@@ -1136,6 +1138,33 @@ mod tests {
         assert!(
             detail.contains(&vram),
             "detail modal must render the used / total MiB VRAM string; got:\n{detail}"
+        );
+    }
+
+    #[test]
+    fn nonfinite_ttft_tpot_render_dash_never_nan() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // A NaN TTFT and an infinite TPOT must render the `—` placeholder via the
+        // same is_finite() guard tokens_per_watt uses — never "NaNms"/"infms".
+        let mut inst = mk_inst("vllm");
+        inst.ttft_ms = Some(f64::NAN);
+        inst.tpot_ms = Some(f64::INFINITY);
+
+        let mut m = HashMap::new();
+        m.insert(inst.container_id.clone(), inst);
+        let state = mk_state(m, 0);
+
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(!out.contains("NaN"), "NaN leaked to the screen:\n{out}");
+        assert!(!out.contains("infms"), "inf leaked to the screen:\n{out}");
+        assert!(
+            out.contains('—'),
+            "non-finite metrics must render the em-dash placeholder:\n{out}"
         );
     }
 }

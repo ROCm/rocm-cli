@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Bench tab — full-screen bench browser with Pass^N / Pass@N rollups + sparkline.
+//! Bench Observe sub-panel — full-screen bench browser with Pass^N / Pass@N rollups + sparkline.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -375,7 +375,7 @@ const fn row_hit(
     Some(start + data_idx)
 }
 
-/// Resolve a click at `(x, y)` inside the Bench tab body. Returns a
+/// Resolve a click at `(x, y)` inside the Bench Observe sub-panel body. Returns a
 /// `KeyAction` to dispatch, or `None` when the click misses everything
 /// actionable.
 pub fn hit_test(area: Rect, x: u16, y: u16, state: &AppState) -> Option<KeyAction> {

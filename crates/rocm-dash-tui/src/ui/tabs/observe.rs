@@ -331,8 +331,10 @@ mod tests {
                 "table header {header:?} missing: {out:?}"
             );
         }
-        // A sample row's live values render (TTFT in ms, queue running/waiting).
+        // A sample row's live values render (TTFT + TPOT in ms, queue r/w).
         assert!(out.contains("150ms"), "TTFT value missing: {out:?}");
+        // Fixture sets tpot_ms = 22.0 (observe.rs `instance`); assert it too.
+        assert!(out.contains("22ms"), "TPOT value missing: {out:?}");
         assert!(
             out.contains("3/0"),
             "queue running/waiting missing: {out:?}"

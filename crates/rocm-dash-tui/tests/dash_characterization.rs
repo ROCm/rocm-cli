@@ -95,7 +95,7 @@ fn home_tab_renders_key_labels() {
 }
 
 #[test]
-fn action_tab_renders_key_labels() {
+fn rocm_and_serving_tabs_render_verb_labels() {
     // ROCm shows the platform verbs; Serving shows the serving verbs.
     let out = render(&mut state_on(ActiveTab::Rocm), 160, 44);
     assert_tab_bar(&out);
