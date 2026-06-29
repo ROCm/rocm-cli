@@ -54,36 +54,71 @@ pub async fn run(listen: &str, opts: RunnerOptions) -> anyhow::Result<()> {
     }
 }
 
+/// Ensure the socket's parent directory exists and is private (mode `0o700`).
+///
+/// Directory permissions are *defense-in-depth*: the socket itself is bound with
+/// mode `0o600` (see `run_unix`), so only the owning user can ever connect. We
+/// therefore **enforce** `0o700` only on a directory we just created — a
+/// directory we own must be securable, and failing to do so is a real error.
+///
+/// For a directory that already existed and is owned by another user (the classic
+/// case is a socket parented directly at `/tmp`, which is root-owned with mode
+/// `1777`), `chmod` returns `EPERM`. Aborting there crashed the embedded
+/// telemetry daemon for any user whose configured socket lived under `/tmp`.
+/// Since the `0o600` socket already restricts access, we log a warning and carry
+/// on instead of failing.
+#[cfg(unix)]
+fn prepare_socket_dir(parent: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    // Skip an empty parent (relative socket target such as `unix:foo.sock`).
+    // Operating on `""` would target the CWD.
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+
+    // Whether we are about to create the directory ourselves. `DirBuilder::mode`
+    // only applies to directories it creates; a pre-existing directory keeps its
+    // current permissions, which is why we tighten explicitly below.
+    let created = !parent.exists();
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+        .with_context(|| format!("creating socket directory {}", parent.display()))?;
+
+    if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)) {
+        if created {
+            // We created it, so we own it: inability to secure it is a real error.
+            return Err(e).with_context(|| {
+                format!(
+                    "restricting socket directory {} to mode 0700 — \
+                     check that the directory is owned by the current user \
+                     (EPERM means it is owned by another user or root)",
+                    parent.display()
+                )
+            });
+        }
+        // Pre-existing directory we do not own (e.g. /tmp, mode 1777): the
+        // 0o600 socket still keeps the endpoint private, so warn and continue.
+        warn!(
+            dir = %parent.display(),
+            error = %e,
+            "could not restrict socket directory to mode 0700; continuing because \
+             the socket is created with mode 0600 (expected for shared directories \
+             such as /tmp)"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 async fn run_unix(path: PathBuf, opts: RunnerOptions) -> anyhow::Result<()> {
     use tokio::net::UnixListener;
 
     if let Some(parent) = path.parent() {
-        // Skip hardening if parent is an empty path (relative socket target
-        // such as `unix:foo.sock`). Operating on `""` would target the CWD.
-        if !parent.as_os_str().is_empty() {
-            // Create the parent directory with mode 0o700 so other users cannot
-            // traverse into it. DirBuilder::mode only applies to directories it
-            // creates; pre-existing directories keep their current permissions,
-            // so we explicitly set_permissions afterwards to tighten them.
-            use std::os::unix::fs::DirBuilderExt;
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(parent)
-                .with_context(|| format!("creating socket directory {}", parent.display()))?;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).with_context(
-                || {
-                    format!(
-                        "restricting socket directory {} to mode 0700 — \
-                         check that the directory is owned by the current user \
-                         (EPERM means it is owned by another user or root)",
-                        parent.display()
-                    )
-                },
-            )?;
-        }
+        prepare_socket_dir(parent)?;
     }
     if path.exists() {
         std::fs::remove_file(&path)
@@ -253,4 +288,67 @@ fn hostname() -> Option<String> {
             .ok()
             .map(|s| s.trim().to_string())
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::path::Path;
+
+    use super::prepare_socket_dir;
+
+    /// A freshly created nested parent must end up at mode 0700.
+    #[test]
+    fn creates_missing_parent_at_0700() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("nested").join("telemetry");
+        prepare_socket_dir(&parent).expect("should create and secure a new directory");
+        let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "newly created socket dir must be private");
+    }
+
+    /// A pre-existing parent we own but with looser perms gets tightened to 0700.
+    #[test]
+    fn tightens_owned_preexisting_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("loose");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_socket_dir(&parent).expect("should tighten a directory we own");
+        let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    /// An empty parent (relative socket target like `unix:foo.sock`) is a no-op.
+    #[test]
+    fn empty_parent_is_noop() {
+        prepare_socket_dir(Path::new("")).expect("empty parent must be skipped");
+    }
+
+    /// Regression: a socket parented at a pre-existing directory owned by another
+    /// user (e.g. `/tmp`, root-owned mode 1777) must NOT abort the daemon — the
+    /// chmod EPERM is downgraded to a warning because the 0600 socket already
+    /// protects the endpoint. Before the fix this returned an error and crashed
+    /// the embedded telemetry daemon.
+    #[test]
+    fn preexisting_unowned_parent_does_not_abort() {
+        let tmpdir = std::env::temp_dir();
+        let Ok(meta) = std::fs::metadata(&tmpdir) else {
+            return; // no temp dir to probe; nothing to assert
+        };
+        // Determine our effective uid by stat-ing a file we create ourselves.
+        let probe = tmpdir.join(format!("rocmdashd-uidprobe-{}", std::process::id()));
+        if std::fs::write(&probe, b"x").is_err() {
+            return; // cannot write a probe; skip rather than guess our uid
+        }
+        let my_uid = std::fs::metadata(&probe).map(|m| m.uid()).ok();
+        let _ = std::fs::remove_file(&probe);
+        // Only meaningful when the temp dir is owned by someone else (so chmod is
+        // guaranteed to EPERM). If we own it or are root, chmod would *succeed*
+        // and mutate a shared directory — skip to avoid side effects.
+        if my_uid != Some(meta.uid()) {
+            prepare_socket_dir(&tmpdir)
+                .expect("must not abort when it cannot chmod a pre-existing unowned parent");
+        }
+    }
 }
