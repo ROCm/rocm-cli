@@ -22,28 +22,104 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Decide which file categories a change touches so unaffected jobs can skip
+  # their expensive work. Filtering runs ONLY on pull_request; on push and in the
+  # merge queue every category is forced true, so post-merge `main` and queued
+  # PRs always run the full suite. That keeps the skip from ever starving a
+  # required check in the merge queue (a never-produced required check stalls the
+  # queue forever — see the `commit-signatures` note below). Each output folds in
+  # `.github/workflows/**`, so any change to CI itself triggers a full run.
+  changes:
+    runs-on: ubuntu-latest
+    # paths-filter reads the PR's changed-file list from the API on
+    # pull_request events; that needs pull-requests:read on top of the
+    # workflow-wide contents:read (job-level permissions replace the default
+    # set, so contents:read is repeated here for checkout).
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      # `<filter> || <fallback>`: the filter result on PRs (empty string when the
+      # filter step is skipped off-PR), otherwise the forced 'true'.
+      rust: ${{ steps.filter.outputs.rust || steps.all.outputs.forced }}
+      heavy: ${{ steps.filter.outputs.heavy || steps.all.outputs.forced }}
+      lint: ${{ steps.filter.outputs.lint || steps.all.outputs.forced }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Filter changed paths (pull requests only)
+        id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3.0.2
+        with:
+          filters: |
+            # Rust-only checks (fmt, clippy, coverage).
+            rust:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain*'
+              # clippy runs `cargo xtask manifest --check` against this file.
+              - 'MANIFEST.md'
+              - '.github/workflows/**'
+            # build-and-test runs cargo AND the python/shell smoke + acceptance
+            # steps, so it depends on the Rust set plus those scripts.
+            heavy:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain*'
+              - 'scripts/**'
+              - 'engines/**'
+              - '**/*.py'
+              - '**/*.sh'
+              - '**/*.ps1'
+              - 'install*'
+              - '.github/workflows/**'
+            # Python / Shell / PowerShell lint job.
+            lint:
+              - 'scripts/**'
+              - 'engines/**'
+              - '**/*.py'
+              - '**/*.sh'
+              - '**/*.ps1'
+              - 'ruff.toml'
+              - 'PSScriptAnalyzerSettings.psd1'
+              - '.github/workflows/**'
+
+      - name: Force full run off pull requests
+        id: all
+        if: github.event_name != 'pull_request'
+        run: echo "forced=true" >> "$GITHUB_OUTPUT"
+
   build-and-test:
     runs-on: ubuntu-latest
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
-    needs: [clippy, prek]
+    needs: [changes, clippy, prek]
     steps:
       - uses: actions/checkout@v6
 
       - name: Install native build deps
+        if: needs.changes.outputs.heavy == 'true'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libcap-dev
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        if: needs.changes.outputs.heavy == 'true'
 
       - name: Build
+        if: needs.changes.outputs.heavy == 'true'
         run: cargo build --workspace --all-targets
 
       - name: Test
+        if: needs.changes.outputs.heavy == 'true'
         run: cargo test --workspace --all-targets
 
       - name: Local no-fallback smoke
+        if: needs.changes.outputs.heavy == 'true'
         run: python scripts/smoke_local.py --skip-build
 
       - name: Acceptance harness self-tests
+        if: needs.changes.outputs.heavy == 'true'
         run: |
           python scripts/pytorch_therock_gpu_test.py --self-test
           python scripts/llama_cpp_therock_gpu_test.py --self-test
@@ -55,12 +131,15 @@ jobs:
           python scripts/wsl_preflight.py --self-test
 
       - name: Portable WSL build deps self-test
+        if: needs.changes.outputs.heavy == 'true'
         run: bash scripts/setup-wsl-portable-build-deps.sh --self-test
 
       - name: Release readiness self-test
+        if: needs.changes.outputs.heavy == 'true'
         run: python scripts/release_readiness.py --self-test
 
       - name: Acceptance install lifecycle
+        if: needs.changes.outputs.heavy == 'true'
         run: ./scripts/acceptance-install-upgrade-tui-uninstall.sh
 
   windows-build-and-test:
@@ -68,29 +147,34 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
-    needs: [clippy, prek]
+    needs: [changes, clippy, prek]
     steps:
       - uses: actions/checkout@v6
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        if: needs.changes.outputs.heavy == 'true'
         with:
           cache-on-failure: true
 
       - name: Build
+        if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
         run: |
           cargo build --workspace --all-targets
           cargo build --release -p rocm -p rocmd -p rocm-engine-pytorch -p rocm-engine-llama-cpp -p rocm-engine-lemonade -p rocm-engine-atom -p rocm-engine-vllm -p rocm-engine-sglang -p xtask
 
       - name: Test
+        if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
         run: cargo test --workspace --all-targets
 
       - name: Local no-fallback smoke
+        if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
         run: python .\scripts\smoke_local.py --skip-build
 
       - name: Acceptance harness self-tests
+        if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
         run: |
           python .\scripts\pytorch_therock_gpu_test.py --self-test
@@ -103,16 +187,19 @@ jobs:
           python .\scripts\wsl_preflight.py --self-test
 
       - name: Release readiness self-test
+        if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
         run: python .\scripts\release_readiness.py --self-test
 
       - name: Check PowerShell installer syntax
+        if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
         run: |
           $null = [scriptblock]::Create((Get-Content .\install.ps1 -Raw))
           $null = [scriptblock]::Create((Get-Content .\scripts\package-windows-release.ps1 -Raw))
 
       - name: Acceptance install lifecycle
+        if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
         run: .\scripts\acceptance-install-upgrade-tui-uninstall.ps1
 
@@ -125,6 +212,10 @@ jobs:
     # license-headers, powershell-lint).
     name: prek (lint / hygiene)
     runs-on: ubuntu-latest
+    # Always-on: prek is the cheapest gate (no compile) and its hygiene hooks run
+    # on every file type, so it is relevant to any change — including docs-only
+    # PRs that match no `changes` category. Like license-headers and
+    # commit-signatures, it is not gated.
     steps:
       - uses: actions/checkout@v6
 
@@ -147,34 +238,43 @@ jobs:
 
   clippy:
     runs-on: ubuntu-latest
+    needs: changes
     steps:
       - uses: actions/checkout@v6
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        if: needs.changes.outputs.rust == 'true'
 
       - name: Clippy
+        if: needs.changes.outputs.rust == 'true'
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: MANIFEST.md dependency table is current
+        if: needs.changes.outputs.rust == 'true'
         run: cargo xtask manifest --check
 
   coverage:
     name: Coverage (rocm-dash crates, ratcheted)
     runs-on: ubuntu-latest
+    needs: changes
     steps:
       - uses: actions/checkout@v6
 
       - name: Install native build deps
+        if: needs.changes.outputs.rust == 'true'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libcap-dev
 
       - uses: dtolnay/rust-toolchain@1.96.0
+        if: needs.changes.outputs.rust == 'true'
         with:
           components: llvm-tools-preview
 
       - name: Install cargo-llvm-cov
+        if: needs.changes.outputs.rust == 'true'
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Cache cargo registry and build
+        if: needs.changes.outputs.rust == 'true'
         uses: actions/cache@v5
         with:
           path: |
@@ -192,6 +292,7 @@ jobs:
       # crates. Floor set just below measured; ratchet upward as the larger TUI
       # tab files (bench/overview/modal) gain tests.
       - name: Coverage gate (rocm-dash crates, >= 70% lines)
+        if: needs.changes.outputs.rust == 'true'
         run: |
           cargo llvm-cov --no-cfg-coverage \
             -p rocm-dash-core -p rocm-dash-collectors \
@@ -206,16 +307,20 @@ jobs:
     # rather than behind that slow job.
     name: Lint (PowerShell)
     runs-on: windows-latest
+    needs: changes
     steps:
       - uses: actions/checkout@v6
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        if: needs.changes.outputs.lint == 'true'
 
       - name: Install PSScriptAnalyzer (PowerShell 7)
+        if: needs.changes.outputs.lint == 'true'
         shell: pwsh
         run: Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -RequiredVersion 1.25.0
 
       - name: Install PSScriptAnalyzer (Windows PowerShell 5.1)
+        if: needs.changes.outputs.lint == 'true'
         shell: powershell
         run: |
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -223,9 +328,11 @@ jobs:
           Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -RequiredVersion 1.25.0
 
       - name: PSScriptAnalyzer (PowerShell 7)
+        if: needs.changes.outputs.lint == 'true'
         run: cargo xtask powershell-lint --shell pwsh
 
       - name: PSScriptAnalyzer (Windows PowerShell 5.1)
+        if: needs.changes.outputs.lint == 'true'
         run: cargo xtask powershell-lint --shell powershell
 
   license-headers:
