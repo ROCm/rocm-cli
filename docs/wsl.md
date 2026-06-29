@@ -3,24 +3,6 @@
 This note tracks the WSL path for `rocm-cli` with TheRock-managed Python
 virtual environments and ROCDXG (`librocdxg`).
 
-## Current Host Finding
-
-On this machine, the installed Ubuntu distro is WSL2 Ubuntu 24.04.4. It has:
-
-- `/dev/dxg`
-- `/usr/lib/wsl/lib/libdxcore.so`
-- Windows SDK headers visible under `/mnt/c/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0`
-- `/opt/rocm/lib/librocdxg.so` from `rocdxg-roct 1.2.0`
-- `librocdxg.so` visible through `ldconfig -p`
-- Rust/Cargo inside WSL
-- a rocm-cli-managed TheRock runtime
-
-`/opt/rocm/share/rocdxg/dids.conf` is not present because the current
-`rocdxg-roct 1.2.0` package does not ship it; the preflight treats this as
-optional. `rocminfo` is also not on the global PATH, but `rocminfo` from the
-managed TheRock runtime works when launched with the managed TheRock SDK
-library path plus `/opt/rocm/lib` and `/usr/lib/wsl/lib`.
-
 ## Prerequisites
 
 The AMD WSL path is:
