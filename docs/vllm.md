@@ -1,3 +1,9 @@
+<!--
+Copyright © Advanced Micro Devices, Inc., or its affiliates.
+
+SPDX-License-Identifier: MIT
+-->
+
 # vLLM Adapter
 
 `rocm-engine-vllm` is a first-party adapter around an existing vLLM

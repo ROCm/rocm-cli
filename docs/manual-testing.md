@@ -1,3 +1,9 @@
+<!--
+Copyright © Advanced Micro Devices, Inc., or its affiliates.
+
+SPDX-License-Identifier: MIT
+-->
+
 # Developer Manual QA
 
 Use this checklist to verify rocm-cli behavior as a developer or release

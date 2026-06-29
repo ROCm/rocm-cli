@@ -1,3 +1,9 @@
+<!--
+Copyright © Advanced Micro Devices, Inc., or its affiliates.
+
+SPDX-License-Identifier: MIT
+-->
+
 # ROCm CLI UX Guidelines
 
 These guidelines are project constraints for user-facing ROCm CLI flows.
