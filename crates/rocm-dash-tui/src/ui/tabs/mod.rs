@@ -12,7 +12,6 @@ pub mod hardware;
 pub mod home;
 pub mod instances;
 pub mod observe;
-pub mod overview;
 pub mod pane;
 pub mod rocm;
 pub mod serving;
@@ -20,11 +19,8 @@ pub mod serving;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
 
 use crate::app::ActiveTab;
-use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
 
 pub const TAB_LABELS: [(ActiveTab, &str, char); 5] = [
@@ -221,16 +217,6 @@ pub fn draw_tab_panel(
         outer.width.saturating_sub(4),
         y_bot.saturating_sub(y_line + 1),
     )
-}
-
-/// Common stub renderer used by tabs that are not yet implemented.
-pub fn draw_placeholder(f: &mut Frame, area: Rect, title: &str, body: &str, theme: &Theme) {
-    let inner = panel::bento(f, area, Some(title), BoxRole::Muted, false, theme);
-    let p = Paragraph::new(Line::from(Span::styled(
-        body,
-        Style::default().fg(theme.muted),
-    )));
-    f.render_widget(p, inner);
 }
 
 #[cfg(test)]
