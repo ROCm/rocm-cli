@@ -236,7 +236,7 @@ fn draw_menu(f: &mut Frame, area: Rect, state: &AppState, sel: usize, theme: &Th
     ]));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "↑↓ move   Enter select   d dashboard   t theme   q quit",
+        "↑↓ move   Enter select   d dashboard   q quit",
         Style::default().fg(theme.muted),
     )));
     f.render_widget(Paragraph::new(lines), area);

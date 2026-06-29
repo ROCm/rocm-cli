@@ -398,6 +398,24 @@ pub const PALETTE_DESTS: &[(&str, ActiveTab)] = &[
 /// Options panel tabs.
 pub const OPTIONS_TABS: &[&str] = &["General", "CPU", "GPU", "Engines"];
 
+/// Row (relative to `inner.y`) where the Esc menu's selectable items begin,
+/// just below the 5-row logo (rows 1..=5).
+const MENU_ITEMS_Y: u16 = 8;
+/// Number of selectable rows in the Esc menu (Options / Help / Quit).
+const MENU_ITEM_COUNT: u16 = 3;
+/// Minimum inner width the logo needs before the menu will render.
+const MENU_MIN_WIDTH: u16 = 31;
+
+/// Whether the Esc menu's inner box is tall and wide enough to show the logo
+/// AND every selectable item. The old guard only checked the logo
+/// (`inner.height < 6`), so inner heights 6..=10 painted the logo with no
+/// reachable Options/Help/Quit. Items occupy rows
+/// `MENU_ITEMS_Y .. MENU_ITEMS_Y + MENU_ITEM_COUNT`, so the box must be at least
+/// `MENU_ITEMS_Y + MENU_ITEM_COUNT` rows tall (11) before the menu is drawn.
+const fn menu_fits(inner_height: u16, inner_width: u16) -> bool {
+    inner_width >= MENU_MIN_WIDTH && inner_height >= MENU_ITEMS_Y + MENU_ITEM_COUNT
+}
+
 /// Esc main menu: Home backdrop dimmed by `grey_overlay`, a double-border modal
 /// with the btop `draw_logo` and the Options/Help/Quit list.
 pub fn draw_menu(f: &mut Frame, area: Rect, sel: usize, theme: &Theme) {
@@ -405,7 +423,7 @@ pub fn draw_menu(f: &mut Frame, area: Rect, sel: usize, theme: &Theme) {
     let modal = centered_rect(50, 70, 60, 17, area);
     f.render_widget(Clear, modal);
     let inner = panel::bento(f, modal, None, BoxRole::Primary, false, theme);
-    if inner.height < 6 || inner.width < 31 {
+    if !menu_fits(inner.height, inner.width) {
         return;
     }
     let logo_w = 31u16;
@@ -415,7 +433,7 @@ pub fn draw_menu(f: &mut Frame, area: Rect, sel: usize, theme: &Theme) {
     let items = ["Options", "Help", "Quit"];
     let mx = inner.x + 4;
     for (i, label) in items.iter().enumerate() {
-        let y = inner.y + 8 + i as u16;
+        let y = inner.y + MENU_ITEMS_Y + i as u16;
         if y >= inner.y + inner.height {
             break;
         }
@@ -558,7 +576,7 @@ pub fn draw_global_help(f: &mut Frame, area: Rect, theme: &Theme) {
             "NAVIGATE",
             &[
                 ("Tab / ⇧Tab", "next / prev tab"),
-                ("1 .. 4", "jump to tab"),
+                ("1 .. 5", "jump to tab"),
                 ("j / k", "select"),
             ],
         ),
@@ -728,6 +746,31 @@ mod ported_chrome_tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect()
+    }
+
+    #[test]
+    fn esc_menu_requires_room_for_all_items() {
+        use super::{MENU_MIN_WIDTH, menu_fits};
+        // Logo occupies rows 1..=5; the three items render at rows 8,9,10. The
+        // old `inner.height < 6` guard let inner heights 6,7,8 paint the logo
+        // with NO reachable Options/Help/Quit, and heights 9,10 cut items off.
+        // `menu_fits` must reject the whole broken range and accept only once
+        // all three items fit (inner.height >= 11). This test FAILS against the
+        // old `< 6` guard (which accepted 6..=10).
+        let w = MENU_MIN_WIDTH;
+        for h in [6u16, 7, 8, 9, 10] {
+            assert!(
+                !menu_fits(h, w),
+                "inner height {h} must not render the logo without all items"
+            );
+        }
+        assert!(menu_fits(11, w), "height 11 must fit Options/Help/Quit");
+        assert!(menu_fits(12, w), "height 12 must fit the menu");
+        // Width guard preserved: a too-narrow box never renders the menu.
+        assert!(
+            !menu_fits(20, MENU_MIN_WIDTH - 1),
+            "a box narrower than the logo must not render"
+        );
     }
 
     #[test]

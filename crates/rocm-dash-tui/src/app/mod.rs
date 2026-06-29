@@ -740,8 +740,10 @@ impl AppState {
             .and_then(|id| self.jobs.job(id))
             .map_or(0, |j| j.output.len().saturating_sub(1));
         let max_v = i32::try_from(max_v).unwrap_or(i32::MAX);
-        let v = (i32::from(self.console_scroll) + i32::from(dv)).clamp(0, max_v) as u16;
-        let h = (i32::from(self.console_hscroll) + i32::from(dh)).max(0) as u16;
+        let v = u16::try_from((i32::from(self.console_scroll) + i32::from(dv)).clamp(0, max_v))
+            .unwrap_or(u16::MAX);
+        let h = u16::try_from((i32::from(self.console_hscroll) + i32::from(dh)).max(0))
+            .unwrap_or(u16::MAX);
         self.console_scroll = v;
         self.console_hscroll = h;
     }
@@ -761,7 +763,8 @@ impl AppState {
             .map_or(0, |r| r.height.saturating_sub(3) as usize);
         let max = i32::try_from(self.dock_logs_total().saturating_sub(cap)).unwrap_or(i32::MAX);
         self.dock_logs_scroll =
-            (i32::from(self.dock_logs_scroll) + i32::from(dv)).clamp(0, max) as u16;
+            u16::try_from((i32::from(self.dock_logs_scroll) + i32::from(dv)).clamp(0, max))
+                .unwrap_or(u16::MAX);
     }
 
     /// Whether any operational manager overlay is open (approval excluded — it
@@ -904,7 +907,7 @@ impl AppState {
     /// (no upper bound — the renderer clamps against the actual line count).
     pub fn scroll_bench_detail(&mut self, delta: i16) {
         let cur = i32::from(self.bench_detail_scroll);
-        let next = (cur + i32::from(delta)).max(0) as u16;
+        let next = u16::try_from((cur + i32::from(delta)).max(0)).unwrap_or(u16::MAX);
         self.bench_detail_scroll = next;
     }
 
@@ -1223,9 +1226,6 @@ impl AppState {
         }
     }
 
-    /// Advance `gpu_scroll` so the selected GPU stays within the visible window.
-    /// Derives the visible row count from the last rendered body area; with no
-    /// prior draw it is a no-op (the renderer self-corrects on the next frame).
     /// Clamp both selectors after a state update that may have shrunk the
     /// underlying collection. Call after push_snapshot / instance changes.
     fn clamp_selectors(&mut self) {
@@ -1956,8 +1956,6 @@ fn run_approved(
     }
 }
 
-/// Apply a `KeyAction` to mutable state. Returns `true` when the action
-/// requests application exit (Quit).
 /// Wrap a list cursor by `delta`, cycling within `0..len`. `len == 0` → 0.
 const fn wrap_cursor(cur: usize, delta: isize, len: usize) -> usize {
     if len == 0 {
@@ -1967,6 +1965,8 @@ const fn wrap_cursor(cur: usize, delta: isize, len: usize) -> usize {
     (cur.cast_signed() + delta).rem_euclid(n) as usize
 }
 
+/// Apply a `KeyAction` to mutable state. Returns `true` when the action
+/// requests application exit (Quit).
 fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
     match action {
         KeyAction::Quit => return true,
@@ -2207,7 +2207,8 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
         KeyAction::ChatDetectSave => state.save_detect_offer(),
         KeyAction::ChatDetectDismiss => state.dismiss_detect_offer(),
         KeyAction::ChatScroll(d) => {
-            let next = (i32::from(state.chat_scroll) + i32::from(d)).max(0) as u16;
+            let next = u16::try_from((i32::from(state.chat_scroll) + i32::from(d)).max(0))
+                .unwrap_or(u16::MAX);
             state.chat_scroll = next;
         }
         KeyAction::Nothing => {}
