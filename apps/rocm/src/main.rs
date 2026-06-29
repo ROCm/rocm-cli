@@ -10,14 +10,7 @@ mod dash_seam;
 mod provider_keys;
 mod providers;
 mod therock;
-mod tui;
 mod uninstall;
-
-// tui.rs is RETAINED pending human go/no-go deletion.
-// bare `rocm` and `rocm chat` now route to the dash chat (parity reached, Phases 3-8).
-// This anchor keeps the frozen module compiling (referenced, never invoked) until deletion.
-#[allow(dead_code)]
-const _RETAINED_TUI_ENTRY: fn(Option<String>) -> anyhow::Result<()> = tui::run;
 
 // Per-command handler fns mechanically relocated into modules.
 // Dispatch call sites stay byte-identical via these re-imports (upstream-sync
@@ -860,7 +853,8 @@ fn launch_default() -> Result<()> {
     if interactive_terminal() {
         // Bare `rocm` opens the minimal launcher front door; "Open full
         // dashboard" / `d` escalates into the unified dash, "Chat" reaches the
-        // Chat tab. `rocm dash` / `rocm chat` bypass the launcher.
+        // Chat tab. `rocm dash` / `rocm chat` bypass the launcher. The legacy
+        // TUI assistant has been retired.
         return dash::run_launcher(false);
     }
 
@@ -1345,8 +1339,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 // (parity reached, Phases 3-8). The dash auto-detects the
                 // provider and supports `/provider` switching; --provider is
                 // honored only on the non-interactive render path below. The
-                // legacy `tui::run` assistant is retained but no longer invoked
-                // here.
+                // legacy TUI assistant has been retired.
                 if provider.is_some() {
                     // --provider isn't threaded into the interactive dash; say so
                     // instead of dropping it silently — the user can switch live.
@@ -2344,67 +2337,9 @@ fn passive_render_node_check() -> DriverPassiveCheck {
     }
 }
 
-fn driver_install_args_require_tui_approval(args: &[&str]) -> Result<bool> {
-    let flags = parse_driver_install_flags(args)?;
-    let examine = ExamineSummary::gather()?;
-    let os_release = read_os_release().unwrap_or_default();
-    let plan = build_driver_install_plan(&examine, &os_release, flags.dkms);
-    Ok(driver_install_flags_require_tui_approval(&plan, &flags))
-}
-
-fn driver_install_flags_require_approval(
-    plan: &DriverInstallPlan,
-    flags: &DriverInstallFlags,
-) -> bool {
-    if flags.reconcile {
-        return false;
-    }
-    driver_plan_approval_label(plan, flags.yes, flags.dry_run) == "required"
-}
-
-fn driver_install_flags_require_tui_approval(
-    plan: &DriverInstallPlan,
-    flags: &DriverInstallFlags,
-) -> bool {
-    let mut tui_flags = *flags;
-    tui_flags.yes = false;
-    driver_install_flags_require_approval(plan, &tui_flags)
-}
-
-fn parse_driver_install_flags(args: &[&str]) -> Result<DriverInstallFlags> {
-    if args.first() != Some(&"driver") {
-        bail!("Usage: /install driver [--dkms] [--dry-run] [--yes] [--reconcile]");
-    }
-    let mut flags = DriverInstallFlags::default();
-    for arg in args.iter().skip(1) {
-        match *arg {
-            "--dkms" => flags.dkms = true,
-            "--yes" => flags.yes = true,
-            "--dry-run" => flags.dry_run = true,
-            "--reconcile" => flags.reconcile = true,
-            value if value.starts_with('-') => bail!("Unknown driver install option: {value}"),
-            value => bail!("Unexpected driver install argument: {value}"),
-        }
-    }
-    if flags.reconcile && (flags.dkms || flags.yes || flags.dry_run) {
-        bail!(
-            "Usage: /install driver --reconcile\n\n--reconcile cannot be combined with --dkms, --yes, or --dry-run"
-        );
-    }
-    Ok(flags)
-}
-
 struct DriverInstallResult {
     output: String,
     executed: bool,
-}
-
-#[derive(Clone, Copy, Default)]
-struct DriverInstallFlags {
-    dkms: bool,
-    yes: bool,
-    dry_run: bool,
-    reconcile: bool,
 }
 
 struct DriverInstallError {
@@ -7350,10 +7285,6 @@ fn render_install_sdk_folder_needed_chat_text(prompt: &str, args: &[String]) -> 
     output.trim_end().to_owned()
 }
 
-pub(crate) fn chat_install_folder_from_prompt(prompt: &str) -> Option<String> {
-    requested_install_prefix_from_prompt(prompt).or_else(|| clean_requested_install_prefix(prompt))
-}
-
 fn prompt_requests_rocm_install_or_setup(normalized: &str) -> bool {
     let mentions_rocm_stack = any_substring(
         normalized,
@@ -11346,16 +11277,6 @@ pub(crate) fn render_logs_browser_page_text(
     render_logs_browser_page_text_with_options(paths, query, page, page_size, true)
 }
 
-pub(crate) fn render_logs_browser_page_text_for_tui(
-    paths: &AppPaths,
-    query: Option<&str>,
-    page: usize,
-    page_size: usize,
-    show_file_locations: bool,
-) -> String {
-    render_logs_browser_page_text_with_options(paths, query, page, page_size, show_file_locations)
-}
-
 fn render_logs_browser_page_text_with_options(
     paths: &AppPaths,
     query: Option<&str>,
@@ -11476,16 +11397,6 @@ fn render_logs_browser_page_text_with_options(
         }
     }
     output
-}
-
-pub(crate) fn logs_browser_page_count(
-    paths: &AppPaths,
-    query: Option<&str>,
-    page_size: usize,
-) -> usize {
-    let entries = collect_log_browser_entries(paths);
-    let matching_entries = filter_log_browser_entries(&entries, query);
-    logs_browser_total_pages(matching_entries.len(), page_size.max(1))
 }
 
 fn logs_browser_total_pages(item_count: usize, page_size: usize) -> usize {
@@ -11659,14 +11570,6 @@ fn render_services_tool_result_text(records: &[ManagedServiceRecord]) -> String 
 
 pub(crate) fn render_service_logs_text(paths: &AppPaths, service_id: &str) -> Result<String> {
     render_service_logs_text_with_options(paths, service_id, true)
-}
-
-pub(crate) fn render_service_logs_text_for_tui(
-    paths: &AppPaths,
-    service_id: &str,
-    show_file_locations: bool,
-) -> Result<String> {
-    render_service_logs_text_with_options(paths, service_id, show_file_locations)
 }
 
 fn render_service_logs_text_with_options(
@@ -12707,76 +12610,6 @@ pub(crate) fn render_daemon_text(paths: &AppPaths, config: &RocmCliConfig) -> St
     output
 }
 
-pub(crate) fn render_sidebar_text(
-    paths: &AppPaths,
-    config: &RocmCliConfig,
-    provider: &str,
-    setup_ready: bool,
-    host_gpu_summary: Option<&rocm_core::HostGpuSummary>,
-) -> String {
-    let records = load_managed_services(paths).unwrap_or_default();
-    let server_counts = managed_service_sidebar_counts(&records);
-    let default_engine = config
-        .default_engine
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| host_gpu_summary.and_then(preferred_serve_engine_for_host_gpu_summary))
-        .unwrap_or(default_engine_for_platform());
-    let mut output = String::new();
-    let _ = writeln!(output, "ROCm CLI");
-    let _ = writeln!(
-        output,
-        "Setup: {}",
-        if setup_ready { "ready" } else { "not set up" }
-    );
-    let _ = writeln!(output, "Assistant: {}", friendly_provider_label(provider));
-    let _ = writeln!(
-        output,
-        "Model runner: {}",
-        friendly_engine_label(default_engine)
-    );
-    let _ = writeln!(
-        output,
-        "Changes: {}",
-        if config.permissions.full_access_enabled() {
-            "full access"
-        } else {
-            "ask first"
-        }
-    );
-    let _ = writeln!(
-        output,
-        "Local servers: {}",
-        local_server_sidebar_status(&server_counts)
-    );
-    let enabled_watchers = builtin_watchers()
-        .iter()
-        .filter(|watcher| config.watcher_enabled(watcher))
-        .count();
-    let _ = writeln!(output, "Background checks: {enabled_watchers}");
-    let _ = writeln!(
-        output,
-        "Background helper: {}",
-        if config.automation_daemon_enabled() {
-            "needed"
-        } else {
-            "off"
-        }
-    );
-    let _ = writeln!(output);
-    let _ = writeln!(output, "Choose Run setup check for details.");
-    output
-}
-
-fn friendly_provider_label(provider: &str) -> &str {
-    match provider {
-        "local" => "local model",
-        "openai" => "OpenAI",
-        "anthropic" => "Anthropic",
-        other => other,
-    }
-}
-
 fn friendly_engine_label(engine: &str) -> &str {
     match engine {
         "lemonade" => "Lemonade",
@@ -12933,142 +12766,6 @@ pub(crate) fn load_managed_services(paths: &AppPaths) -> Result<Vec<ManagedServi
     Ok(records)
 }
 
-#[cfg(test)]
-pub(crate) fn tui_help_text() -> String {
-    let mut output = String::new();
-    let _ = writeln!(output, "slash commands");
-    let _ = writeln!(output, "  /home          return to the main dashboard");
-    let _ = writeln!(output, "  /help          show this help");
-    let _ = writeln!(
-        output,
-        "  /examine        check this computer and ROCm setup"
-    );
-    let _ = writeln!(
-        output,
-        "  /setup         reopen the simple ROCm setup screen"
-    );
-    let _ = writeln!(
-        output,
-        "                 status, reset, and skip are available when needed"
-    );
-    let _ = writeln!(output, "  /permissions   show or change confirmation mode");
-    let _ = writeln!(
-        output,
-        "  /runtimes      install, choose, add, remove, or roll back ROCm installs"
-    );
-    let _ = writeln!(
-        output,
-        "  /install       install ROCm or check driver setup"
-    );
-    let _ = writeln!(
-        output,
-        "                 adopt adds an existing Python ROCm folder as read-only"
-    );
-    let _ = writeln!(
-        output,
-        "  /engine        choose or install local model engines"
-    );
-    let _ = writeln!(
-        output,
-        "  /model [NAME]  list recipes or choose a known model"
-    );
-    let _ = writeln!(output, "  /plan TEXT     render an explicit request plan");
-    let _ = writeln!(output, "  /config        show saved settings");
-    let _ = writeln!(
-        output,
-        "                 set-planner-provider enables optional provider help for ambiguous plans"
-    );
-    let _ = writeln!(
-        output,
-        "  /automations   show background checks and review requests"
-    );
-    let _ = writeln!(
-        output,
-        "  /reviews       open review requests that need a decision"
-    );
-    let _ = writeln!(
-        output,
-        "  /approve       review the selected request before approving"
-    );
-    let _ = writeln!(
-        output,
-        "  /reject        review the selected request before rejecting"
-    );
-    let _ = writeln!(
-        output,
-        "  /edit          open review request editing from Automations"
-    );
-    let _ = writeln!(output, "  /services      show local model servers");
-    let _ = writeln!(output, "  /logs [QUERY]  browse or search recent activity");
-    let _ = writeln!(
-        output,
-        "                 use /logs --search <query> when the query matches a service id"
-    );
-    let _ = writeln!(
-        output,
-        "                 use /logs --service <id> for managed service logs"
-    );
-    let _ = writeln!(
-        output,
-        "                 use /logs next, /logs prev, or /logs refresh after opening the log browser"
-    );
-    let _ = writeln!(
-        output,
-        "  /gpu           show the latest local GPU snapshot"
-    );
-    let _ = writeln!(output, "  /update        show update policy");
-    let _ = writeln!(output, "  /daemon        show background helper status");
-    let _ = writeln!(output, "  /chat TEXT     stream a provider chat response");
-    let _ = writeln!(output, "  /provider X    switch provider for this session");
-    let _ = writeln!(
-        output,
-        "  /uninstall     preview what uninstall would remove"
-    );
-    let _ = writeln!(
-        output,
-        "  /serve MODEL   open a guided local model server setup"
-    );
-    let _ = writeln!(output, "  /clear         clear the transcript");
-    let _ = writeln!(output, "  /quit, /exit   exit the TUI");
-    let _ = writeln!(output);
-    let _ = writeln!(output, "keyboard");
-    let _ = writeln!(output, "  F1             open interactive help");
-    let _ = writeln!(output, "  F5             refresh the current screen");
-    let _ = writeln!(
-        output,
-        "  /              open the command popup on normal menu screens"
-    );
-    let _ = writeln!(
-        output,
-        "  Tab            complete slash commands and arguments"
-    );
-    let _ = writeln!(
-        output,
-        "  Up/Down        choose items or recall input history"
-    );
-    let _ = writeln!(output, "  PgUp/PgDn      scroll the current view");
-    let _ = writeln!(output, "  Mouse wheel    scroll long text and log cards");
-    let _ = writeln!(output, "  Home/End       jump to top or bottom");
-    let _ = writeln!(output);
-    let _ = writeln!(output, "logs");
-    let _ = writeln!(
-        output,
-        "  Targeted logs such as /comfyui logs and service logs open in a scrollable card"
-    );
-    let _ = writeln!(output);
-    let _ = writeln!(output, "natural language");
-    let _ = writeln!(output, "  serve qwen with lemonade");
-    let _ = writeln!(output, "  install ROCm");
-    let _ = writeln!(output, "  uninstall rocm-cli");
-    let _ = writeln!(output);
-    let _ = writeln!(output, "examples");
-    let _ = writeln!(output, "  config set-default-engine lemonade");
-    let _ = writeln!(output, "  config set-telemetry local");
-    let _ = writeln!(output, "  /engine install lemonade --reinstall");
-    let _ = writeln!(output, "  automations enable server-recover");
-    output
-}
-
 pub(crate) fn render_freeform_plan(
     request: &str,
     paths: &AppPaths,
@@ -13076,11 +12773,6 @@ pub(crate) fn render_freeform_plan(
 ) -> String {
     let plan = build_freeform_plan_with_context(request, paths, config);
     render_structured_request_plan(&plan, paths)
-}
-
-pub(crate) fn freeform_plan_uses_provider(request: &str, config: &RocmCliConfig) -> bool {
-    let plan = build_freeform_plan(request, config);
-    freeform_plan_needs_ambiguity_resolution(&plan) && configured_planner_provider(config).is_some()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13198,6 +12890,7 @@ impl PlannedToolCall {
     }
 }
 
+#[cfg(test)]
 fn build_freeform_plan(request: &str, config: &RocmCliConfig) -> StructuredRequestPlan {
     build_freeform_plan_with_recipes(request, config, None)
 }
@@ -18993,7 +18686,6 @@ install therock";
 
         let rendered = render_logs_browser_page_text(&paths, Some("alpha"), 1, 4);
 
-        assert_eq!(logs_browser_page_count(&paths, Some("alpha"), 4), 2);
         assert!(rendered.contains("  Page: 2 of 2"));
         assert!(rendered.contains("  Showing: 5-6 of 6"));
         assert!(!rendered.contains("alpha-1"));
@@ -19932,56 +19624,6 @@ VERSION_CODENAME=noble
         assert!(rendered.contains("post_reboot_check_commands:"));
         assert!(rendered.contains("dkms status amdgpu"));
         assert!(rendered.contains("rerun with --yes"));
-    }
-
-    #[test]
-    fn driver_install_approval_only_applies_to_supported_mutating_unapproved_plan() -> Result<()> {
-        let os_release = r#"
-ID=ubuntu
-VERSION_ID="24.04"
-VERSION_CODENAME=noble
-"#;
-        let dkms_plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
-        let preflight_plan =
-            build_driver_install_plan(&test_examine("linux", false), os_release, false);
-        let windows_plan = build_driver_install_plan(&test_examine("windows", false), "", true);
-
-        let dkms_flags = parse_driver_install_flags(&["driver", "--dkms"])?;
-        let dry_run_flags = parse_driver_install_flags(&["driver", "--dkms", "--dry-run"])?;
-        let approved_flags = parse_driver_install_flags(&["driver", "--dkms", "--yes"])?;
-        let preflight_flags = parse_driver_install_flags(&["driver"])?;
-
-        assert!(driver_install_flags_require_approval(
-            &dkms_plan,
-            &dkms_flags
-        ));
-        assert!(!driver_install_flags_require_approval(
-            &dkms_plan,
-            &dry_run_flags
-        ));
-        assert!(!driver_install_flags_require_approval(
-            &dkms_plan,
-            &approved_flags
-        ));
-        assert!(driver_install_flags_require_tui_approval(
-            &dkms_plan,
-            &approved_flags
-        ));
-        assert!(!driver_install_flags_require_approval(
-            &preflight_plan,
-            &preflight_flags
-        ));
-        assert!(!driver_install_flags_require_approval(
-            &windows_plan,
-            &dkms_flags
-        ));
-        let reconcile_flags = parse_driver_install_flags(&["driver", "--reconcile"])?;
-        assert!(!driver_install_flags_require_approval(
-            &dkms_plan,
-            &reconcile_flags
-        ));
-        assert!(parse_driver_install_flags(&["driver", "--reconcile", "--dkms"]).is_err());
-        Ok(())
     }
 
     #[test]
@@ -21549,37 +21191,6 @@ VERSION_ID="41"
     }
 
     #[test]
-    fn sidebar_omits_saved_failed_service_history() -> Result<()> {
-        let (root, paths) = test_paths("sidebar-service-counts");
-        for index in 0..6 {
-            let mut record = ManagedServiceRecord::new(
-                &paths,
-                format!("svc-failed-{index}"),
-                "pytorch",
-                "qwen",
-                "Qwen/Qwen3.5",
-                "127.0.0.1",
-                11435 + index,
-                "managed",
-                1000 + u32::from(index),
-                None,
-                None,
-                None,
-            );
-            record.status = "failed".to_owned();
-            record.write()?;
-        }
-
-        let rendered = render_sidebar_text(&paths, &RocmCliConfig::default(), "local", true, None);
-        let _ = fs::remove_dir_all(root);
-
-        assert!(rendered.contains("Local servers: none ready"));
-        assert!(!rendered.contains("past attempts"));
-        assert!(!rendered.contains("running servers: 6"));
-        Ok(())
-    }
-
-    #[test]
     fn render_automations_text_uses_plain_proposal_history() -> Result<()> {
         let (root, paths) = test_paths("automation-plain-proposal-history");
         rocm_core::append_automation_proposal(
@@ -22516,29 +22127,6 @@ VERSION_ID="41"
         assert!(
             body.contains("render_chat_text("),
             "non-interactive no-prompt path must still call render_chat_text; body:\n{body}"
-        );
-    }
-
-    #[test]
-    fn tui_run_is_referenced_only_by_the_retention_anchor() {
-        // tui.rs is RETAINED (not deleted). The ONLY non-comment reference to
-        // `tui::run` in the PRODUCTION part of main.rs (before `mod tests`) must
-        // be the retention anchor; the interactive handlers must not invoke it.
-        // (The test module itself names `tui::run` in assertion strings.)
-        let full = main_rs_source();
-        let prod = full
-            .split("mod tests {")
-            .next()
-            .expect("production source before the tests module");
-        let src = strip_line_comments(prod);
-        let count = src.matches("tui::run").count();
-        assert_eq!(
-            count, 1,
-            "expected exactly one tui::run reference (the retention anchor), found {count}"
-        );
-        assert!(
-            src.contains("_RETAINED_TUI_ENTRY"),
-            "the retention anchor _RETAINED_TUI_ENTRY must keep tui::run reachable"
         );
     }
 }
