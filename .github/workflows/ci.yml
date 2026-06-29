@@ -381,12 +381,13 @@ jobs:
           # hawkeye excludes *.md by default; check all tracked .md files manually.
           MISSING=()
           while IFS= read -r -d '' f; do
-            if ! grep -qF 'Copyright © Advanced Micro Devices, Inc., or its affiliates.' "$f"; then
+            if ! grep -qF 'Copyright © Advanced Micro Devices, Inc., or its affiliates.' "$f" \
+            || ! grep -qF 'SPDX-License-Identifier: MIT' "$f"; then
               MISSING+=("$f")
             fi
           done < <(git ls-files -z '*.md')
           if [ ${#MISSING[@]} -gt 0 ]; then
-            echo "Missing AMD copyright header in:"
+            echo "Missing AMD copyright header or SPDX identifier in:"
             printf '  %s\n' "${MISSING[@]}"
             exit 1
           fi
