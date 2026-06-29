@@ -1,3 +1,9 @@
+<!--
+Copyright © Advanced Micro Devices, Inc., or its affiliates.
+
+SPDX-License-Identifier: MIT
+-->
+
 # Release Trust
 
 rocm-cli release packages are protected in two layers:

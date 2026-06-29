@@ -1,3 +1,9 @@
+<!--
+Copyright © Advanced Micro Devices, Inc., or its affiliates.
+
+SPDX-License-Identifier: MIT
+-->
+
 # ROCm CLI Assistant Skill
 
 Use this skill when answering ROCm CLI local assistant questions.
