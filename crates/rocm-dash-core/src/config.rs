@@ -102,10 +102,44 @@ pub struct DaemonConfig {
     pub bench_results_dir: Option<PathBuf>,
 }
 
+/// Default Unix-socket address for the telemetry daemon.
+///
+/// The socket lives in a *per-user* subdirectory of the temp dir
+/// (`/tmp/rocm-<user>/`) rather than directly in `/tmp`. The daemon creates and
+/// owns that subdirectory, so it can tighten it to mode `0o700` without the
+/// `EPERM` that results from trying to `chmod` a shared, root-owned `/tmp`
+/// (mode `1777`). Keeping it per-user also avoids collisions on multi-user hosts.
+fn default_socket() -> String {
+    let raw = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "user".to_owned());
+    // Sanitize: keep only alphanumeric, hyphen, and underscore so a path
+    // separator or `..` in the env var cannot escape the intended subdirectory.
+    let user: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let user = if user.is_empty() {
+        "user".to_owned()
+    } else {
+        user
+    };
+    let path = std::env::temp_dir()
+        .join(format!("rocm-{user}"))
+        .join("rocmdashd.sock");
+    format!("unix:{}", path.display())
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            listen: "unix:/tmp/rocmdashd.sock".into(),
+            listen: default_socket(),
             token: None,
             gpu_tick: Duration::from_secs(1),
             discovery_tick: Duration::from_secs(5),
@@ -137,7 +171,7 @@ pub struct TuiConfig {
 impl Default for TuiConfig {
     fn default() -> Self {
         Self {
-            connect: "unix:/tmp/rocmdashd.sock".into(),
+            connect: default_socket(),
             theme: "default-dark".into(),
             chat_url: None,
             chat_model: None,
@@ -327,5 +361,37 @@ theme = "default-dark"
         std::fs::write(&p, "this is = not = valid = toml").unwrap();
         assert!(Config::load(&p).is_err());
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn default_socket_uses_per_user_subdir_not_bare_tmp() {
+        // Regression: the default socket must NOT sit directly in the temp dir.
+        // A bare `/tmp/rocmdashd.sock` makes the daemon try to chmod /tmp (a
+        // shared, root-owned dir) and abort with EPERM. The parent must be a
+        // per-user subdirectory the daemon can create and own.
+        let socket = Config::default().daemon.listen;
+        let path = socket
+            .strip_prefix("unix:")
+            .expect("default socket must be a unix: address");
+        let parent = std::path::Path::new(path)
+            .parent()
+            .expect("socket must have a parent directory");
+        assert_ne!(
+            parent,
+            std::env::temp_dir(),
+            "socket parent must be a subdir, not the bare temp dir: {socket}"
+        );
+        assert!(
+            parent
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("rocm-")),
+            "socket parent should be a per-user rocm-<user> dir: {socket}"
+        );
+        // daemon and tui defaults must agree so a default client finds the daemon.
+        assert_eq!(
+            Config::default().daemon.listen,
+            Config::default().tui.connect
+        );
     }
 }
