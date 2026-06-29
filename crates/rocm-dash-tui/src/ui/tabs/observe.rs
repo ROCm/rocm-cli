@@ -12,7 +12,7 @@
 //! nothing is lost. The selectable list is the instances table (wired via the
 //! main selection model in `AppState`).
 //!
-//! The amber demo-data banner (F151) is shown iff live daemon telemetry is
+//! The amber demo-data banner is shown iff live daemon telemetry is
 //! absent — driven by `ConnState` / snapshot presence, never a hardcoded flag.
 
 use ratatui::Frame;

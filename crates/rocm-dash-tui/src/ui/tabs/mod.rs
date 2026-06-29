@@ -111,8 +111,7 @@ pub fn compute_chip_layout(bar_x: u16) -> [TabChip; 5] {
     out
 }
 
-/// Stamp a string at `(x, y)` if the row is on-screen. Mirror of the
-/// `gen_mockups` low-level `put` so the ported chrome paints identically.
+/// Stamp a string at `(x, y)` if the row is on-screen.
 fn put(f: &mut Frame, x: u16, y: u16, s: &str, style: Style) {
     if y < f.area().height {
         f.buffer_mut().set_string(x, y, s, style);
@@ -126,7 +125,7 @@ fn hline(f: &mut Frame, x0: u16, x1: u16, y: u16, ch: &str, style: Style) {
     }
 }
 
-/// Outlined folder-tab panel (port of `gen_mockups.rs` `tab_panel`).
+/// Outlined folder-tab panel.
 ///
 /// A bordered body box whose top edge carries raised, outlined tab "folders";
 /// the active tab opens into the body (its bottom edge is erased). Returns the

@@ -613,12 +613,10 @@ fn render_help_groups(
 }
 
 // ===========================================================================
-// btop-style chrome helpers ported from `examples/gen_mockups.rs` (Phase 1).
-// Pure draw fns composed by the P4 overlays above.
+// btop-style chrome helpers. Pure draw fns composed by the P4 overlays above.
 // ===========================================================================
 
-/// Stamp a string at `(x, y)` if the row is on-screen. Mirror of the
-/// `gen_mockups` low-level `put`.
+/// Stamp a string at `(x, y)` if the row is on-screen.
 fn put(f: &mut Frame, x: u16, y: u16, s: &str, style: Style) {
     if y < f.area().height {
         f.buffer_mut().set_string(x, y, s, style);
@@ -626,8 +624,7 @@ fn put(f: &mut Frame, x: u16, y: u16, s: &str, style: Style) {
 }
 
 /// Dim the entire frame to a cool grey wash so a centered modal reads as the
-/// foreground (port of `gen_mockups.rs` `grey_overlay`). Call before drawing
-/// the modal box on top.
+/// foreground. Call before drawing the modal box on top.
 pub fn grey_overlay(f: &mut Frame) {
     use ratatui::style::Color;
     let area = f.area();
@@ -645,10 +642,8 @@ pub fn grey_overlay(f: &mut Frame) {
 
 /// Big block "ROCm" wordmark with a horizontal accent→cyan gradient sweep.
 ///
-/// Port of `gen_mockups.rs` `draw_logo`. `cx` is the left column of the
-/// 31-wide logo; it occupies 5 rows from `y`. The lowercase `m` matches the
-/// final mock. Reuses the crate's [`gradient::lerp3_t`] ramp rather than a
-/// local lerp.
+/// `cx` is the left column of the 31-wide logo; it occupies 5 rows from `y`.
+/// Reuses the crate's [`gradient::lerp3_t`] ramp rather than a local lerp.
 pub fn draw_logo(f: &mut Frame, cx: u16, y: u16, theme: &Theme) {
     use ratatui::style::Color;
     const R: [&str; 5] = ["██████ ", "██   ██", "██████ ", "██   ██", "██   ██"];
@@ -679,7 +674,7 @@ pub fn draw_logo(f: &mut Frame, cx: u16, y: u16, theme: &Theme) {
 }
 
 /// One settings row for the Options panel: focusable label on the left, value +
-/// control hint right-aligned (port of `gen_mockups.rs` `opt_row`).
+/// control hint right-aligned.
 pub fn opt_row(
     f: &mut Frame,
     area: Rect,

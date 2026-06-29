@@ -4,11 +4,10 @@
 
 //! Home tab — the landing "instrument cluster".
 //!
-//! Composes the `dash-home` mock (`gen_mockups.rs draw_dash_home`) against live
-//! `AppState` (read-only): a hero GPU gauge + spark, a stacked VRAM/TEMP/POWER
-//! mini-spark cluster, and Running / Health / Updates tiles. Empty/absent
-//! telemetry renders honest placeholders rather than the mock's synthetic
-//! numbers.
+//! Composes the home layout against live `AppState` (read-only): a hero GPU
+//! gauge + spark, a stacked VRAM/TEMP/POWER mini-spark cluster, and Running /
+//! Health / Updates tiles. Empty/absent telemetry renders honest placeholders
+//! rather than synthetic numbers.
 //!
 //! ponytail: Home is added behind the existing default this phase (P2). It is
 //! reachable by Tab / digit `1` but is NOT the default tab yet — P3 repoints
