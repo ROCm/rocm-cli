@@ -251,6 +251,9 @@ pub fn run(initial_provider: Option<String>) -> Result<()> {
     run_app(&mut app)
 }
 
+// Superseded by `dash::run_bootstrap` (the onboarding now lives in the dash
+// crate). Retained unreferenced for this one commit; tui.rs is deleted next.
+#[allow(dead_code)]
 pub(crate) fn run_bootstrap_setup() -> Result<()> {
     let paths = AppPaths::discover()?;
     let mut app = App::new(paths, Some("local".to_owned()));

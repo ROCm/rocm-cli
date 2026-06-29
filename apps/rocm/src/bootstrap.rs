@@ -19,7 +19,7 @@ pub(crate) fn run(command: Option<BootstrapCommand>) -> Result<()> {
 
 fn run_setup() -> Result<()> {
     if interactive_terminal() {
-        crate::tui::run_bootstrap_setup()
+        crate::dash::run_bootstrap()
     } else {
         println!(
             "ROCm setup needs an interactive terminal. Run `rocm` from a terminal to choose an install folder and set up ROCm/TheRock."
