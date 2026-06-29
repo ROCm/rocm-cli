@@ -199,93 +199,12 @@ pub(crate) fn render_status(paths: &AppPaths, config: &RocmCliConfig) -> Result<
     Ok(output)
 }
 
-pub(crate) fn render_tui_status(paths: &AppPaths, config: &RocmCliConfig) -> Result<String> {
-    let mut output = String::new();
-    writeln!(output, "{APP_NAME}")?;
-    writeln!(output)?;
-    if let Some(manifest) = load_manifest(paths)? {
-        writeln!(output, "Installed")?;
-        writeln!(output, "  status: ready")?;
-        writeln!(
-            output,
-            "  ROCm install: {}",
-            therock::runtime_version_display(&manifest.runtime_version)
-        )?;
-        writeln!(
-            output,
-            "  models path: {}",
-            models_folder_for_manifest(&manifest).display()
-        )?;
-        writeln!(
-            output,
-            "  AMD GPU check: {}",
-            if manifest.torch_cuda_available {
-                "ready"
-            } else {
-                "needs attention"
-            }
-        )?;
-    } else {
-        writeln!(output, "Not installed yet")?;
-        writeln!(output, "  Choose Install ComfyUI below.")?;
-    }
-
-    writeln!(output)?;
-    if let Some(state) = load_state(paths)? {
-        let run_report = evaluate_running_state(&state);
-        writeln!(output, "Running")?;
-        match run_report.state {
-            ComfyUiRunState::Running => {
-                writeln!(output, "  status: running")?;
-                writeln!(output, "  URL: {}", state.url)?;
-            }
-            ComfyUiRunState::Starting => {
-                writeln!(output, "  status: starting")?;
-                writeln!(output, "  URL: {}", state.url)?;
-                writeln!(output, "  Waiting for the browser page to answer.")?;
-            }
-            ComfyUiRunState::Stopped => {
-                writeln!(output, "  status: stopped")?;
-                writeln!(output, "  Choose Start ComfyUI below to run it again.")?;
-            }
-        }
-    } else {
-        writeln!(output, "Running")?;
-        if let Some(url) = default_unmanaged_running_url() {
-            writeln!(output, "  status: running outside rocm-cli")?;
-            writeln!(output, "  URL: {url}")?;
-            writeln!(output, "  ROCm CLI did not start this ComfyUI process.")?;
-        } else {
-            writeln!(output, "  status: not started")?;
-        }
-    }
-
-    if config.active_runtime_key.is_none() && load_manifest(paths)?.is_none() {
-        writeln!(output)?;
-        writeln!(output, "ROCm")?;
-        writeln!(output, "  Install ROCm first from Set Up ROCm.")?;
-    }
-    Ok(output)
-}
-
 pub(crate) fn render_logs(paths: &AppPaths, line_limit: usize) -> Result<String> {
     render_logs_with_options(paths, line_limit, true)
 }
 
-pub(crate) fn render_tui_logs(
-    paths: &AppPaths,
-    line_limit: usize,
-    show_file_locations: bool,
-) -> Result<String> {
-    render_logs_with_options(paths, line_limit, show_file_locations)
-}
-
 pub(crate) fn models_folder(paths: &AppPaths) -> Result<Option<PathBuf>> {
     Ok(load_manifest(paths)?.map(|manifest| models_folder_for_manifest(&manifest)))
-}
-
-pub(crate) fn is_installed(paths: &AppPaths) -> Result<bool> {
-    Ok(load_manifest(paths)?.is_some())
 }
 
 pub(crate) fn render_models_path(paths: &AppPaths) -> Result<String> {
@@ -293,21 +212,6 @@ pub(crate) fn render_models_path(paths: &AppPaths) -> Result<String> {
         bail!("ComfyUI is not installed yet. Run `rocm comfyui install` first.");
     };
     Ok(format!("{}\n", path.display()))
-}
-
-pub(crate) fn running_url(paths: &AppPaths) -> Result<Option<String>> {
-    let Some(state) = load_state(paths)? else {
-        return Ok(default_unmanaged_running_url());
-    };
-    let report = evaluate_running_state(&state);
-    if matches!(
-        report.state,
-        ComfyUiRunState::Running | ComfyUiRunState::Starting
-    ) {
-        Ok(Some(state.url))
-    } else {
-        Ok(None)
-    }
 }
 
 fn default_unmanaged_running_url() -> Option<String> {
@@ -1977,96 +1881,6 @@ mod tests {
         assert!(rendered.contains("status: stopped"));
         assert!(rendered.contains("next step: rocm comfyui start"));
         assert!(!rendered.contains("status: starting or running"));
-        Ok(())
-    }
-
-    #[test]
-    fn tui_status_reports_stale_saved_state_plainly() -> Result<()> {
-        let paths = test_paths("comfyui-tui-stale-state");
-        let logs = app_root(&paths).join("logs");
-        fs::create_dir_all(&logs)?;
-        let port = unused_local_port()?;
-        save_state(
-            &paths,
-            &ComfyUiState {
-                app_id: APP_ID.to_owned(),
-                url: format!("http://127.0.0.1:{port}"),
-                host: "127.0.0.1".to_owned(),
-                port,
-                pid: 0,
-                source_path: source_path(&paths),
-                python_executable: paths.data_dir.join("runtimes").join("python.exe"),
-                log_path: logs.join("start-200.log"),
-                started_at_unix_ms: 200,
-            },
-        )?;
-
-        let rendered = render_tui_status(&paths, &RocmCliConfig::default())?;
-
-        assert!(rendered.contains("status: stopped"));
-        assert!(rendered.contains("Choose Start ComfyUI below"));
-        assert!(!rendered.contains("starting or running"));
-        Ok(())
-    }
-
-    #[test]
-    fn tui_status_hides_technical_file_paths() -> Result<()> {
-        let paths = test_paths("comfyui-tui-status");
-        let logs = app_root(&paths).join("logs");
-        fs::create_dir_all(&logs)?;
-        let install_log = logs.join("install-100.log");
-        fs::write(&install_log, "install output\n")?;
-        save_manifest(
-            &paths,
-            &ComfyUiManifest {
-                app_id: APP_ID.to_owned(),
-                runtime_key: "therock-release:gfx120X-all".to_owned(),
-                runtime_id: "therock-release".to_owned(),
-                runtime_version: "7.13.0a20260511".to_owned(),
-                runtime_root: paths.data_dir.join("runtimes").join("runtime"),
-                python_executable: paths.data_dir.join("runtimes").join("python.exe"),
-                source_url: COMFYUI_SOURCE_ARCHIVE_URL.to_owned(),
-                source_path: source_path(&paths),
-                requirements_path: source_path(&paths).join("requirements.txt"),
-                pip_cache_dir: None,
-                log_path: install_log.clone(),
-                torch_version: Some("2.10.0".to_owned()),
-                torch_cuda_available: true,
-                installed_at_unix_ms: 100,
-            },
-        )?;
-
-        let rendered = render_tui_status(&paths, &RocmCliConfig::default())?;
-
-        assert!(rendered.contains("Installed"));
-        assert!(rendered.contains("AMD GPU check: ready"));
-        assert!(!rendered.contains("Use the rows on the left"));
-        assert!(!rendered.contains("python"));
-        assert!(!rendered.contains("torch"));
-        assert!(!rendered.contains("saved file:"));
-        assert!(!rendered.contains(&install_log.display().to_string()));
-        Ok(())
-    }
-
-    #[test]
-    fn tui_logs_hide_file_paths_until_requested() -> Result<()> {
-        let paths = test_paths("comfyui-tui-logs");
-        let logs = app_root(&paths).join("logs");
-        fs::create_dir_all(&logs)?;
-        let install_log = logs.join("install-100.log");
-        fs::write(&install_log, "downloaded ComfyUI\ninstalled packages\n")?;
-
-        let friendly = render_tui_logs(&paths, 10, false)?;
-        assert!(friendly.contains("ComfyUI logs"));
-        assert!(friendly.contains("Install log"));
-        assert!(friendly.contains("downloaded ComfyUI"));
-        assert!(friendly.contains("installed packages"));
-        assert!(!friendly.contains("saved file:"));
-        assert!(!friendly.contains(&install_log.display().to_string()));
-
-        let with_files = render_tui_logs(&paths, 10, true)?;
-        assert!(with_files.contains("saved file:"));
-        assert!(with_files.contains(&install_log.display().to_string()));
         Ok(())
     }
 

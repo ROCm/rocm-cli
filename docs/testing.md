@@ -90,40 +90,6 @@ cargo test -p rocm --bin rocm setup_subcommands_do_not_expose_old_runtime_engine
 cargo test -p rocm --bin rocm permissions_
 ```
 
-Focused TUI command navigability coverage:
-
-```bash
-cargo test -p rocm --bin rocm tui::tests:: -- --nocapture
-cargo test -p rocm tui::tests::advertised_slash_commands_ -- --nocapture
-cargo test -p rocm tui::tests::slash_subcommands_stay_on_navigable_surfaces_without_transcript_dumps -- --nocapture
-cargo test -p rocm tui::tests::slash_command_variants_stay_navigable_without_transcript_dumps -- --nocapture
-cargo test -p rocm tui::tests::slash_actions_stream_inside_active_surface_without_transcript_dump -- --nocapture
-cargo test -p rocm tui::tests::slash_first_views_hide_backend_jargon -- --nocapture
-cargo test -p rocm tui::tests::install_sdk_bad_format_uses_friendly_labels_without_backend_jargon -- --nocapture
-cargo test -p rocm tui::tests::onboarding_ctrl_c_during_install_confirms_before_cancelling -- --nocapture
-cargo test -p rocm tui::tests::automations_review_actions_without_review_show_body_guidance -- --nocapture
-cargo test -p rocm tui::tests::examine_background_completion_updates_report_without_transcript -- --nocapture
-cargo test -p rocm tui::tests::hidden_examine_refresh_does_not_block_next_prompt_commands -- --nocapture
-cargo test -p rocm tui::tests::examine_command_does_not_steal_running_workflow_screens -- --nocapture
-cargo test -p rocm tui::tests::examine_command_does_not_hide_pending_approval -- --nocapture
-cargo test -p rocm tui::tests::daemon_status_uses_background_helper_language -- --nocapture
-cargo test -p rocm tui::tests::automations_bad_watcher_and_mode_stay_screen_local -- --nocapture
-cargo test -p rocm tui::tests::services_manager_stop_requests_rocmd_approval_without_transcript -- --nocapture
-cargo test -p rocm tui::tests::services_command_restart_requests_rocmd_approval_without_transcript -- --nocapture
-cargo test -p rocm --bin rocm services_is_structured_not_freeform -- --nocapture
-cargo test -p rocm --bin rocm top_level_cli_commands_are_not_treated_as_freeform -- --nocapture
-cargo test -p rocm --bin rocm render_model_registry_text_lists_builtin_recipes -- --nocapture
-cargo test -p rocm --bin rocm plain_command_routing_distinguishes_commands_from_requests -- --nocapture
-cargo test -p rocm --bin rocm plain_structured_commands_route_to_navigable_tui_before_plan -- --nocapture
-cargo test -p rocm --bin rocm render_services_text_separates_ready_starting_and_past_attempts -- --nocapture
-cargo test -p rocm --bin rocm service_actions_require_yes_and_render_sandbox_result -- --nocapture
-cargo test -p rocm tui::tests::runtimes_import_without_args_opens_guided_form -- --nocapture
-cargo test -p rocm tui::tests::approval_card_is_arrow_key_navigable_and_scrollable -- --nocapture
-cargo test -p rocm tui::tests::typed_serve_prefills_wizard_and_start_requests_approval_without_prompt_editing -- --nocapture
-cargo test -p rocm tui::tests::explicit_foreground_serve_prefills_wizard_without_launching -- --nocapture
-cargo test -p rocm tui::tests::tui_help_teaches_engine_not_engines -- --nocapture
-```
-
 Self-hosted GPU CI smoke is intentionally non-mutating. The MI300X job builds
 the workspace, runs `rocm examine`, then runs `detect` and `capabilities` for
 all first-party engine adapters: PyTorch, llama.cpp, ATOM, vLLM, and SGLang.

@@ -12,8 +12,7 @@
 //! runs the ratatui dashboard TUI.
 //!
 //! The rest of `rocm` is synchronous; the async daemon/TUI run on a tokio
-//! runtime built here. The two ratatui majors (0.29 in `tui.rs`, 0.30 in
-//! `rocm-dash-tui`) coexist, each confined to its crate.
+//! runtime built here. The TUI lives entirely in the `rocm-dash-tui` crate.
 
 use std::path::PathBuf;
 use std::time::Duration;
