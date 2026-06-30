@@ -1,0 +1,12 @@
+# Custom header style for Markdown files: HTML comment block without extra blank
+# lines after <!-- or before -->, matching our existing file headers.
+[MARKDOWN_STYLE]
+firstLine = "<!--"
+endLine = "-->"
+beforeEachLine = ''
+afterEachLine = ''
+allowBlankLines = true
+multipleLines = true
+padLines = false
+firstLineDetectionPattern = '(\s|\t)*<!--.*$'
+lastLineDetectionPattern = '.*-->(\s|\t)*$'
