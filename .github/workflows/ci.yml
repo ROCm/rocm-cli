@@ -376,10 +376,6 @@ jobs:
         run: |
           "${HAWKEYE_INSTALL_DIR}/hawkeye" check
 
-      - name: Check license headers (Markdown)
-        run: |
-          "${HAWKEYE_INSTALL_DIR}/hawkeye" check --config licenserc-md.toml
-
   commit-signatures:
     name: Commit signatures + sign-off
     runs-on: ubuntu-latest

@@ -1,5 +1,5 @@
-# Custom header style for Markdown files: HTML comment block without extra blank
-# lines after <!-- or before -->, matching our existing file headers.
+# Custom header style for Markdown files: HTML comment block matching our
+# existing <!-- ... --> header format (no indentation on body lines).
 [MARKDOWN_STYLE]
 firstLine = "<!--"
 endLine = "-->"

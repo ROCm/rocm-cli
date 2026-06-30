@@ -1,22 +1,37 @@
 ## hawkeye license-header enforcement configuration.
 ## Run locally: hawkeye check
 ## Docs: https://github.com/korandoru/hawkeye
+##
+## Note: `!**/*.md` is a force-include that overrides hawkeye's built-in
+## default exclusion of *.md. It also overrides the positive excludes below
+## for .md files — there is no way to subsequently re-exclude a subset of
+## .md paths once the negation is in effect. In practice this is harmless
+## because hawkeye's git integration skips untracked directories, but any
+## tracked *.md file (e.g. in third_party/) would be required to carry a
+## copyright header.
 
 inlineHeader = """
-Copyright Advanced Micro Devices, Inc.
+Copyright © Advanced Micro Devices, Inc., or its affiliates.
 
 SPDX-License-Identifier: MIT
 """
+
+additionalHeaders = ["licenserc-md-header.toml"]
 
 includes = [
   "**/*.rs",
   "**/*.py",
   "**/*.sh",
+  "**/*.md",
 ]
 
 excludes = [
+  "!**/*.md",
   "target/**",
   ".claude/**",
   ".tmp-*/**",
   "third_party/**",
 ]
+
+[mapping.MARKDOWN_STYLE]
+extensions = ["md"]
