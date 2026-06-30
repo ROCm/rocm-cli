@@ -1,3 +1,9 @@
+<!--
+Copyright © Advanced Micro Devices, Inc., or its affiliates.
+
+SPDX-License-Identifier: MIT
+-->
+
 # WSL Support Notes
 
 This note tracks the WSL path for `rocm-cli` with TheRock-managed Python

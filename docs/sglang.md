@@ -1,3 +1,9 @@
+<!--
+Copyright © Advanced Micro Devices, Inc., or its affiliates.
+
+SPDX-License-Identifier: MIT
+-->
+
 # SGLang Adapter
 
 `rocm-engine-sglang` is a first-party adapter around an existing SGLang

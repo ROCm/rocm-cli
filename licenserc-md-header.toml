@@ -1,0 +1,12 @@
+# Custom header style for Markdown files: HTML comment block matching our
+# existing <!-- ... --> header format (no indentation on body lines).
+[MARKDOWN_STYLE]
+firstLine = "<!--"
+endLine = "-->"
+beforeEachLine = ''
+afterEachLine = ''
+allowBlankLines = true
+multipleLines = true
+padLines = false
+firstLineDetectionPattern = '(\s|\t)*<!--.*$'
+lastLineDetectionPattern = '.*-->(\s|\t)*$'

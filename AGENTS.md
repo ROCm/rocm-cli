@@ -1,3 +1,9 @@
+<!--
+Copyright © Advanced Micro Devices, Inc., or its affiliates.
+
+SPDX-License-Identifier: MIT
+-->
+
 ---
 name: rocm-cli-oss-contribution
 description: Safe, high-quality contribution workflow for upstream-facing work in rocm-cli. Activate before any upstream PR, issue, review reply, public fork push, or other external-facing GitHub action.

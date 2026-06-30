@@ -1,3 +1,9 @@
+<!--
+Copyright © Advanced Micro Devices, Inc., or its affiliates.
+
+SPDX-License-Identifier: MIT
+-->
+
 # ROCm CLI
 
 ![ROCm](https://img.shields.io/badge/ROCm-Enabled-green)

@@ -1,3 +1,9 @@
+<!--
+Copyright © Advanced Micro Devices, Inc., or its affiliates.
+
+SPDX-License-Identifier: MIT
+-->
+
 # ATOM Adapter
 
 `rocm-engine-atom` is the first-party rocm-cli adapter for AMD's ATOM serving

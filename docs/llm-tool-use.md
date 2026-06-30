@@ -1,3 +1,9 @@
+<!--
+Copyright © Advanced Micro Devices, Inc., or its affiliates.
+
+SPDX-License-Identifier: MIT
+-->
+
 # LLM Tool Use
 
 rocm-cli local assistants use structured tools, not shell commands.

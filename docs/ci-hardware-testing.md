@@ -1,3 +1,9 @@
+<!--
+Copyright © Advanced Micro Devices, Inc., or its affiliates.
+
+SPDX-License-Identifier: MIT
+-->
+
 # CI hardware (GPU / WSL) testing — planned
 
 The hosted CI (`ubuntu-latest`, `windows-latest`) builds and unit-tests every
