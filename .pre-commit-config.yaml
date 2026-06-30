@@ -29,12 +29,19 @@ repos:
   # Fast, zero-setup hygiene hooks implemented natively by prek (no clone, no venv).
   - repo: builtin
     hooks:
+      # THIRD_PARTY_NOTICES.txt is generated verbatim by `cargo xtask tpn`
+      # (cargo-about); reproduced license texts keep their original trailing
+      # whitespace / final-newline, so the whitespace fixers must not touch it
+      # or `cargo xtask tpn --check` would fail against freshly generated output.
       - id: trailing-whitespace
+        exclude: '^THIRD_PARTY_NOTICES\.txt$'
       - id: end-of-file-fixer
+        exclude: '^THIRD_PARTY_NOTICES\.txt$'
       - id: check-yaml
       - id: check-merge-conflict
       - id: mixed-line-ending
         args: [--fix=lf] # repo standardises on LF endings (see .gitattributes)
+        exclude: '^THIRD_PARTY_NOTICES\.txt$'
 
   # Python: lint + format the helper scripts and engine workers.
   - repo: https://github.com/astral-sh/ruff-pre-commit
