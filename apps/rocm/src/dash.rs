@@ -235,14 +235,42 @@ pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
     // `zbus::blocking`, which builds its own runtime and `block_on`s internally;
     // doing that on a dash runtime worker thread panics with "Cannot start a
     // runtime from within a runtime". See `run_async`.
-    let args = resolved_args(&config, &paths, ActiveTab::Overview);
+    let args = resolved_args(&config, &paths, ActiveTab::Home);
     let rt = build_dashboard_runtime()?;
     rt.block_on(run_async(config, paths, args, replay, chat_mock))
 }
 
-/// Entry point for bare `rocm` and interactive `rocm chat`. Opens the unified
-/// dashboard with the Chat tab focused. Thin wrapper over the same runtime/
-/// `run_async` path as [`run`]; no replay/demo, embedded daemon as usual.
+/// Entry point for bare `rocm`: show the minimal launcher front door, then
+/// escalate into the existing dash/chat entry points based on the choice.
+///
+/// The launcher is a thin synchronous pre-screen (no daemon, no async runtime);
+/// `rocm dash` / `rocm chat` reach [`run`] / [`run_chat`] directly and are
+/// unaffected by this path.
+pub fn run_launcher(chat_mock: bool) -> Result<()> {
+    let paths = AppPaths::discover()?;
+    let config = RocmCliConfig::load(&paths).unwrap_or_default();
+    let theme = config.dashboard.tui.theme;
+    match rocm_dash_tui::ui::launcher::run_launcher(&theme)? {
+        None => Ok(()),
+        Some(choice) => {
+            use rocm_dash_tui::ui::launcher::LauncherChoice;
+            match choice {
+                LauncherChoice::Chat => run_chat(chat_mock),
+                // Serve / Set up / Diagnose / Open dashboard all escalate into
+                // the full dash (Home); the guided managers are reachable there
+                // via the Action tab + seam (ponytail: no separate routing yet).
+                LauncherChoice::Serve
+                | LauncherChoice::SetUp
+                | LauncherChoice::Diagnose
+                | LauncherChoice::OpenDashboard => run(None, false, chat_mock),
+            }
+        }
+    }
+}
+
+/// Entry point for interactive `rocm chat`. Opens the unified dashboard with the
+/// Chat tab focused. Thin wrapper over the same runtime/`run_async` path as
+/// [`run`]; no replay/demo, embedded daemon as usual.
 pub fn run_chat(chat_mock: bool) -> Result<()> {
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths)?;
@@ -370,7 +398,7 @@ mod tests {
     #[test]
     fn resolved_args_take_connect_and_theme_from_config() {
         let c = cfg();
-        let args = resolved_args(&c, &paths(), ActiveTab::Overview);
+        let args = resolved_args(&c, &paths(), ActiveTab::Home);
         assert_eq!(args.connect, c.dashboard.tui.connect);
         assert_eq!(args.theme, c.dashboard.tui.theme);
         assert!(!args.chat_mock);

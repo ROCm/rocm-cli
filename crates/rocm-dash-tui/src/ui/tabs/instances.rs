@@ -2,20 +2,21 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Instances tab — full-screen instance grid with kv-cache / requests / args,
+//! Instances Observe sub-panel — full-screen instance grid with kv-cache / requests / args,
 //! plus a detail modal showing model / partition / launch_args / env / log.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 
 use rocm_dash_core::metrics::{Instance, InstanceStatus};
 
 use crate::app::{AppState, ConnState, KeyAction};
 use crate::ui::format;
 use crate::ui::modal::{centered_rect, draw_popup_frame};
+use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
 use crate::ui::widgets::trunc;
 
@@ -48,6 +49,108 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         draw_kv_heatmap(f, heat_area, state, &instances, theme);
     }
     draw_card_grid(f, grid_area, &instances, sel, theme);
+}
+
+/// AI-serving per-instance table (Phase 5 Observe view).
+///
+/// Columns: model · throughput (tok/s) · tok/watt · TTFT · TPOT · power · queue
+/// (running/waiting) · kv-cache%. Missing `Option` metrics render `—` (honest
+/// placeholder, never a fabricated number); tok/watt is surfaced prominently
+/// (accent). Keyboard + scroll-wheel select; left-click is not wired here.
+pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    if state.instances.is_empty() {
+        draw_empty(f, area, state, theme);
+        return;
+    }
+    let instances = sorted_instances(&state.instances);
+    let sel = clamp_sel(state.instance_sel, instances.len());
+    let gpus: &[rocm_dash_core::metrics::GpuMetrics] =
+        state.latest.as_ref().map_or(&[], |s| s.gpus.as_slice());
+
+    let inner = panel::bento(
+        f,
+        area,
+        Some("Instances · AI metrics"),
+        BoxRole::Secondary,
+        false,
+        theme,
+    );
+    if inner.height == 0 {
+        return;
+    }
+
+    let header = Row::new([
+        "MODEL", "TOK/S", "TOK/W", "TTFT", "TPOT", "POWER", "QUEUE", "KV%",
+    ])
+    .style(
+        Style::default()
+            .fg(theme.muted)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let dash = "—";
+    let rows = instances.iter().enumerate().map(|(i, inst)| {
+        let model = trunc(&inst.model_name, 22);
+        let tps = inst
+            .gen_tps
+            .map_or_else(|| dash.to_string(), |v| format!("{v:.0}"));
+        let tpw = inst
+            .tokens_per_watt
+            .filter(|v| v.is_finite())
+            .map_or_else(|| dash.to_string(), |v| format!("{v:.2}"));
+        let ttft = inst
+            .ttft_ms
+            .filter(|v| v.is_finite())
+            .map_or_else(|| dash.to_string(), |v| format!("{v:.0}ms"));
+        let tpot = inst
+            .tpot_ms
+            .filter(|v| v.is_finite())
+            .map_or_else(|| dash.to_string(), |v| format!("{v:.0}ms"));
+        let power = rocm_dash_core::efficiency::instance_power_w(&inst.gpu_ids, gpus)
+            .map_or_else(|| dash.to_string(), |w| format!("{w:.0}W"));
+        let queue = match (inst.running_reqs, inst.waiting_reqs) {
+            (None, None) => dash.to_string(),
+            (r, w) => format!(
+                "{}/{}",
+                r.map_or_else(|| dash.to_string(), |v| v.to_string()),
+                w.map_or_else(|| dash.to_string(), |v| v.to_string()),
+            ),
+        };
+        let kv = inst
+            .kv_cache_usage_pct
+            .map_or_else(|| dash.to_string(), |v| format!("{v:.0}%"));
+
+        let base = if i == sel {
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.fg)
+        };
+        Row::new([
+            Cell::from(model),
+            Cell::from(tps),
+            // tok/watt prominent (the headline efficiency metric).
+            Cell::from(tpw).style(Style::default().fg(theme.accent)),
+            Cell::from(ttft),
+            Cell::from(tpot),
+            Cell::from(power),
+            Cell::from(queue),
+            Cell::from(kv),
+        ])
+        .style(base)
+    });
+
+    let widths = [
+        Constraint::Min(12),
+        Constraint::Length(7),
+        Constraint::Length(7),
+        Constraint::Length(7),
+        Constraint::Length(7),
+        Constraint::Length(7),
+        Constraint::Length(7),
+        Constraint::Length(5),
+    ];
+    let table = Table::new(rows, widths).header(header).column_spacing(1);
+    f.render_widget(table, inner);
 }
 
 /// How tall to make the heatmap block.
@@ -98,17 +201,12 @@ fn draw_kv_heatmap(
 ) {
     use crate::ui::heatmap::Heatmap;
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(
-            " kv-cache % · {} instances · last {} ticks ",
-            instances.len(),
-            state.history.len(),
-        ))
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let title = format!(
+        "kv-cache % · {} instances · last {} ticks",
+        instances.len(),
+        state.history.len(),
+    );
+    let inner = panel::bento(f, area, Some(&title), BoxRole::Secondary, false, theme);
     if inner.height == 0 {
         return;
     }
@@ -210,6 +308,17 @@ const fn status_meta(
     }
 }
 
+/// Map an instance status to a bento box role so unselected cards take a
+/// health-driven border color.
+const fn status_role(status: InstanceStatus) -> BoxRole {
+    match status {
+        InstanceStatus::Running => BoxRole::Success,
+        InstanceStatus::Starting => BoxRole::Warning,
+        InstanceStatus::Stopped | InstanceStatus::Error => BoxRole::Danger,
+        InstanceStatus::Unknown => BoxRole::Muted,
+    }
+}
+
 fn draw_empty(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let body = match &state.conn {
         ConnState::Connected { .. } => {
@@ -217,45 +326,28 @@ fn draw_empty(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         }
         _ => "waiting for daemon…",
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Instances ")
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
+    let inner = panel::bento(f, area, Some("Instances"), BoxRole::Neutral, false, theme);
     let p = Paragraph::new(Line::from(Span::styled(
         body,
         Style::default().fg(theme.muted),
-    )))
-    .block(block);
-    f.render_widget(p, area);
+    )));
+    f.render_widget(p, inner);
 }
 
 fn draw_card(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, selected: bool) {
-    let (status_color, status_text) = status_meta(inst.status, theme);
+    let (_, status_text) = status_meta(inst.status, theme);
     let name = trunc(&inst.container_name, 24);
-    let title = format!(" {name} · {status_text} ");
+    let title = format!("{name} · {status_text}");
 
-    let border_style = if selected {
-        Style::default()
-            .fg(theme.accent)
-            .add_modifier(Modifier::BOLD)
+    // Selected card reads as the primary/actionable surface; others take a
+    // status-driven role so the grid varies by health.
+    let role = if selected {
+        BoxRole::Primary
     } else {
-        theme.border_style()
+        status_role(inst.status)
     };
-    let mut title_style = Style::default()
-        .fg(status_color)
-        .add_modifier(Modifier::BOLD);
-    if selected {
-        title_style = title_style.add_modifier(Modifier::BOLD);
-    }
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(border_style)
-        .title_style(title_style);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::bento(f, area, Some(&title), role, false, theme);
     if inner.height == 0 || inner.width == 0 {
         return;
     }
@@ -401,7 +493,7 @@ fn compact_line<'a>(inst: &'a Instance, theme: &Theme, max_w: usize) -> Line<'a>
 
 /// Detail modal: summary + launch_args + env_vars + log footer.
 ///
-/// Resolve a click at `(x, y)` inside the Instances tab body. Returns a
+/// Resolve a click at `(x, y)` inside the Instances Observe sub-panel body. Returns a
 /// `KeyAction` to dispatch, or `None` when the click misses everything
 /// actionable.
 ///
@@ -585,13 +677,14 @@ fn render_body(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme) {
         .split(area);
 
     // launch_args (left)
-    let args_block = Block::default()
-        .borders(Borders::ALL)
-        .title(" launch_args ")
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
-    let args_inner = args_block.inner(chunks[0]);
-    f.render_widget(args_block, chunks[0]);
+    let args_inner = panel::bento(
+        f,
+        chunks[0],
+        Some("launch_args"),
+        BoxRole::Secondary,
+        false,
+        theme,
+    );
 
     let args_lines: Vec<Line> = if inst.launch_args.is_empty() {
         vec![Line::from(Span::styled(
@@ -610,13 +703,14 @@ fn render_body(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme) {
     );
 
     // env_vars (right). BTreeMap iterates sorted by key.
-    let env_block = Block::default()
-        .borders(Borders::ALL)
-        .title(" env_vars ")
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
-    let env_inner = env_block.inner(chunks[1]);
-    f.render_widget(env_block, chunks[1]);
+    let env_inner = panel::bento(
+        f,
+        chunks[1],
+        Some("env_vars"),
+        BoxRole::Primary,
+        false,
+        theme,
+    );
 
     let env_lines: Vec<Line> = if inst.env_vars.is_empty() {
         vec![Line::from(Span::styled(
@@ -673,6 +767,8 @@ mod tests {
             waiting_reqs: None,
             gen_tps: None,
             tokens_per_watt: None,
+            ttft_ms: None,
+            tpot_ms: None,
             launch_args: vec![],
             env_vars: BTreeMap::new(),
             log_file: None,
@@ -764,8 +860,14 @@ mod tests {
             history: std::collections::VecDeque::new(),
             bench_rows: std::collections::VecDeque::new(),
             instances,
-            active_tab: crate::app::ActiveTab::Instances,
+            active_tab: crate::app::ActiveTab::Observe,
             modal: crate::app::Modal::None,
+            menu_sel: 0,
+            palette_sel: 0,
+            options_tab: 0,
+            rocm_sel: 0,
+            serving_sel: 0,
+            pane_focus: crate::app::PaneFocus::Actions,
             instance_sel: sel,
             bench_sel: 0,
             gpu_sel: 0,
@@ -774,6 +876,10 @@ mod tests {
             theme: Theme::default_dark(),
             theme_picker_sel: 0,
             bench_detail_scroll: 0,
+            console_scroll: 0,
+            console_hscroll: 0,
+            dock_logs_scroll: 0,
+            last_dock_area: None,
             chat: Vec::new(),
             chat_input: String::new(),
             chat_sending: false,
@@ -790,6 +896,7 @@ mod tests {
             replay: None,
             last_body_area: None,
             last_tab_bar_area: None,
+            last_footer_chips: Vec::new(),
             jobs: rocm_dash_core::state::State::default(),
             services: None,
             serve_wizard: None,
@@ -1031,6 +1138,33 @@ mod tests {
         assert!(
             detail.contains(&vram),
             "detail modal must render the used / total MiB VRAM string; got:\n{detail}"
+        );
+    }
+
+    #[test]
+    fn nonfinite_ttft_tpot_render_dash_never_nan() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // A NaN TTFT and an infinite TPOT must render the `—` placeholder via the
+        // same is_finite() guard tokens_per_watt uses — never "NaNms"/"infms".
+        let mut inst = mk_inst("vllm");
+        inst.ttft_ms = Some(f64::NAN);
+        inst.tpot_ms = Some(f64::INFINITY);
+
+        let mut m = HashMap::new();
+        m.insert(inst.container_id.clone(), inst);
+        let state = mk_state(m, 0);
+
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(!out.contains("NaN"), "NaN leaked to the screen:\n{out}");
+        assert!(!out.contains("infms"), "inf leaked to the screen:\n{out}");
+        assert!(
+            out.contains('—'),
+            "non-finite metrics must render the em-dash placeholder:\n{out}"
         );
     }
 }

@@ -97,6 +97,15 @@ pub struct Instance {
     /// occupies. `None` when throughput or GPU power telemetry is unavailable.
     #[serde(default)]
     pub tokens_per_watt: Option<f64>,
+    /// Live average time-to-first-token (ms), windowed from the vLLM TTFT
+    /// histogram. `None` until two scrapes (or absent for non-vLLM engines);
+    /// Observe shows `—`. Serde-default for NDJSON replay back-compat.
+    #[serde(default)]
+    pub ttft_ms: Option<f64>,
+    /// Live average time-per-output-token (ms), windowed from the vLLM TPOT
+    /// histogram. `None` until two scrapes (or absent); Observe shows `—`.
+    #[serde(default)]
+    pub tpot_ms: Option<f64>,
     pub launch_args: Vec<String>,
     pub env_vars: std::collections::BTreeMap<String, String>,
     pub log_file: Option<String>,
@@ -108,8 +117,8 @@ mod tests {
 
     #[test]
     fn instance_deserializes_without_efficiency_fields() {
-        // Replay back-compat: NDJSON sessions recorded before tokens_per_watt
-        // existed must still load, defaulting the new fields to None.
+        // Replay back-compat: NDJSON sessions recorded before tokens_per_watt /
+        // ttft_ms / tpot_ms existed must still load, defaulting them to None.
         let legacy = r#"{
             "container_id": "c1", "container_name": "vllm-a", "status": "running",
             "model_name": "deepseek-r1", "gpu_ids": ["0"], "partition_info": null,
@@ -121,6 +130,23 @@ mod tests {
         let inst: Instance = serde_json::from_str(legacy).expect("legacy instance must parse");
         assert_eq!(inst.gen_tps, None);
         assert_eq!(inst.tokens_per_watt, None);
+        assert_eq!(inst.ttft_ms, None);
+        assert_eq!(inst.tpot_ms, None);
         assert_eq!(inst.kv_cache_usage_pct, Some(42.0));
+    }
+
+    #[test]
+    fn instance_round_trips_ttft_tpot_through_serde() {
+        // The new live-latency fields survive a serialize → deserialize cycle.
+        let inst = Instance {
+            container_id: "c1".into(),
+            ttft_ms: Some(180.5),
+            tpot_ms: Some(22.0),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&inst).expect("serialize");
+        let back: Instance = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.ttft_ms, Some(180.5));
+        assert_eq!(back.tpot_ms, Some(22.0));
     }
 }

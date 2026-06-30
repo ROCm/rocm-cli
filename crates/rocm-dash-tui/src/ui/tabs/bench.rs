@@ -2,13 +2,15 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Bench tab — full-screen bench browser with Pass^N / Pass@N rollups + sparkline.
+//! Bench Observe sub-panel — full-screen bench browser with Pass^N / Pass@N rollups + sparkline.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+
+use crate::ui::panel::{self, BoxRole};
 
 use rocm_dash_core::bench_rollup::{PassNRollup, rollup_pass_n, row_verdict};
 use rocm_dash_core::bench_schema::{BenchmarkRow, PassFail};
@@ -21,17 +23,12 @@ use crate::ui::theme::Theme;
 
 pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     if state.bench_rows.is_empty() {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Bench ")
-            .border_style(theme.border_style())
-            .title_style(theme.title_style());
+        let inner = panel::bento(f, area, Some("Bench"), BoxRole::Neutral, false, theme);
         let p = Paragraph::new(Line::from(Span::styled(
             "no rows · start daemon with --bench-csv <path>",
             Style::default().fg(theme.muted),
-        )))
-        .block(block);
-        f.render_widget(p, area);
+        )));
+        f.render_widget(p, inner);
         return;
     }
 
@@ -92,14 +89,8 @@ fn at_n_mark(r: &PassNRollup, theme: &Theme) -> Span<'static> {
 }
 
 fn draw_rollup(f: &mut Frame, area: Rect, rows: &[PassNRollup], theme: &Theme) {
-    let title = format!(" Rollup · {} groups ", rows.len());
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let title = format!("Rollup · {} groups", rows.len());
+    let inner = panel::bento(f, area, Some(&title), BoxRole::Secondary, false, theme);
     if inner.height == 0 {
         return;
     }
@@ -211,16 +202,10 @@ fn draw_rows_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         state.bench_sel.min(total - 1) + 1
     };
     let title = format!(
-        " Bench rows · {total} total · row {sel_display}/{total} · showing {} ",
+        "Bench rows · {total} total · row {sel_display}/{total} · showing {}",
         avail_estimate.min(total)
     );
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::bento(f, area, Some(&title), BoxRole::Primary, false, theme);
     if inner.height == 0 {
         return;
     }
@@ -333,14 +318,8 @@ fn sparkline_max(data: &[u64]) -> u64 {
 
 fn draw_sparkline(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let n = state.bench_rows.len();
-    let title = format!(" prompt_tps · last {n} rows ");
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(theme.border_style())
-        .title_style(theme.title_style());
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let title = format!("prompt_tps · last {n} rows");
+    let inner = panel::bento(f, area, Some(&title), BoxRole::Success, false, theme);
     if inner.height == 0 || inner.width == 0 {
         return;
     }
@@ -396,7 +375,7 @@ const fn row_hit(
     Some(start + data_idx)
 }
 
-/// Resolve a click at `(x, y)` inside the Bench tab body. Returns a
+/// Resolve a click at `(x, y)` inside the Bench Observe sub-panel body. Returns a
 /// `KeyAction` to dispatch, or `None` when the click misses everything
 /// actionable.
 pub fn hit_test(area: Rect, x: u16, y: u16, state: &AppState) -> Option<KeyAction> {
@@ -415,8 +394,12 @@ pub fn hit_test(area: Rect, x: u16, y: u16, state: &AppState) -> Option<KeyActio
         ])
         .split(area);
     let rows_outer = chunks[1];
-    // Mirror Block::default().borders(ALL).inner(rows_outer).
-    let rows_inner = Block::default().borders(Borders::ALL).inner(rows_outer);
+    // Mirror panel::bento's inner rect: rounded full border + the same adaptive
+    // padding it applies, so click mapping matches the drawn table exactly.
+    let rows_inner = Block::default()
+        .borders(Borders::ALL)
+        .padding(panel::padding_for(rows_outer))
+        .inner(rows_outer);
 
     let total = state.bench_rows.len();
     let avail = (rows_inner.height as usize).saturating_sub(1);

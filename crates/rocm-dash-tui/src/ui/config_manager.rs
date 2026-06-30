@@ -29,8 +29,8 @@ use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
 };
 use crate::ui::exec::{exe_label, resolve_exe};
-use crate::ui::job_console::{ConsoleOutcome, draw_job_console, on_console_key};
-use crate::ui::modal::{centered_rect, draw_popup_frame};
+use crate::ui::job_console::{ConsoleOutcome, on_console_key};
+use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
 
 /// Assistant providers (mirrors the bin's `Provider` value-enum). Fixed set, so
@@ -207,18 +207,17 @@ pub fn draw_config_manager(
     f: &mut Frame,
     area: Rect,
     c: &ConfigManagerState,
-    jobs: &State,
+    _jobs: &State,
     theme: &Theme,
 ) {
-    if let Some(job_id) = &c.active_job
-        && let Some(job) = jobs.job(job_id)
-    {
-        draw_job_console(f, area, job, 0, theme);
-        return;
-    }
-
-    let popup = centered_rect(72, 64, 100, 18, area);
-    let inner = draw_popup_frame(f, popup, "Config & providers", theme);
+    let inner = panel::bento(
+        f,
+        area,
+        Some("Config & providers"),
+        BoxRole::Primary,
+        false,
+        theme,
+    );
     if inner.height == 0 {
         return;
     }

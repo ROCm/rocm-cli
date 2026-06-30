@@ -9,25 +9,48 @@
 pub mod bench;
 pub mod chat;
 pub mod hardware;
+pub mod home;
 pub mod instances;
-pub mod overview;
+pub mod observe;
+pub mod pane;
+pub mod rocm;
+pub mod serving;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
 
 use crate::app::ActiveTab;
 use crate::ui::theme::Theme;
 
 pub const TAB_LABELS: [(ActiveTab, &str, char); 5] = [
-    (ActiveTab::Overview, "Overview", '1'),
-    (ActiveTab::Hardware, "Hardware", '2'),
-    (ActiveTab::Instances, "Instances", '3'),
-    (ActiveTab::Bench, "Bench", '4'),
+    (ActiveTab::Home, "Home", '1'),
+    (ActiveTab::Rocm, "ROCm", '2'),
+    (ActiveTab::Serving, "Serving", '3'),
+    (ActiveTab::Observe, "Observe", '4'),
     (ActiveTab::Chat, "Chat", '5'),
 ];
+
+/// The five tab labels in display order (for the outlined panel renderer).
+#[must_use]
+pub const fn tab_labels() -> [&'static str; 5] {
+    [
+        TAB_LABELS[0].1,
+        TAB_LABELS[1].1,
+        TAB_LABELS[2].1,
+        TAB_LABELS[3].1,
+        TAB_LABELS[4].1,
+    ]
+}
+
+/// Index of `tab` within [`TAB_LABELS`] (the active-folder index).
+#[must_use]
+pub fn active_index(tab: ActiveTab) -> usize {
+    TAB_LABELS
+        .iter()
+        .position(|(t, _, _)| *t == tab)
+        .unwrap_or(0)
+}
 
 /// A single tab chip's screen extent. `x_start..x_end` are absolute columns
 /// (end-exclusive) on the tab-bar row.
@@ -38,73 +61,162 @@ pub struct TabChip {
     pub x_end: u16,
 }
 
-/// Compute the per-chip bounding boxes for a tab bar starting at `bar_x`.
-///
-/// Mirrors `draw_tab_bar` exactly: a 3-char digit chip (" 1 "), then a
-/// `" Label "` chip (`label.len() + 2`), separated between chips by `" · "`
-/// (3 chars). Pure — both `draw_tab_bar` and `hit_test` route through this
-/// so they cannot drift.
-pub fn compute_chip_layout(bar_x: u16) -> [TabChip; 5] {
-    let mut out = [TabChip {
-        tab: ActiveTab::Overview,
-        x_start: 0,
-        x_end: 0,
-    }; 5];
-    let mut x = bar_x;
-    for (i, (tab, label, _key)) in TAB_LABELS.iter().enumerate() {
-        if i > 0 {
-            x = x.saturating_add(3); // " · "
-        }
-        let chip_w = 3u16 + label.len() as u16 + 2; // " 1 " + " Label "
-        out[i] = TabChip {
-            tab: *tab,
-            x_start: x,
-            x_end: x.saturating_add(chip_w),
-        };
-        x = x.saturating_add(chip_w);
+/// Outlined-tab chip clickable spans starting at `origin_x`, one `(start, end)`
+/// (end-exclusive) per label. This is the SINGLE SOURCE of tab geometry: both
+/// [`draw_tab_panel`] (rendering) and [`compute_chip_layout`] (hit-testing)
+/// route through it so they cannot drift. The active marker (`●`) and the
+/// 1-based index are both a single cell, so widths are active-independent.
+fn outlined_chip_spans(origin_x: u16, labels: &[&str]) -> Vec<(u16, u16)> {
+    let mut out = Vec::with_capacity(labels.len());
+    let mut sx = origin_x;
+    for lab in labels {
+        let cw = lab.chars().count() as u16 + 4; // " X label "
+        let ex = sx + cw + 1; // right border column (inclusive)
+        out.push((sx, ex + 1)); // clickable span [sx, ex] → end-exclusive
+        sx = ex + 2; // 1-col gap between folders
     }
     out
 }
 
-/// Render the segmented tab bar. One row tall.
-pub fn draw_tab_bar(f: &mut Frame, area: Rect, active: ActiveTab, theme: &Theme) {
-    let mut spans: Vec<Span> = Vec::with_capacity(TAB_LABELS.len() * 3);
-    for (i, (tab, label, key)) in TAB_LABELS.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" · ", Style::default().fg(theme.muted)));
-        }
-        let style = if *tab == active {
-            Style::default()
-                .bg(theme.accent)
-                .fg(theme.surface_2)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.fg)
+/// Per-chip bounding boxes for the live tab panel.
+///
+/// The first folder's left border is at `bar_x`. Mirrors [`draw_tab_panel`]'s
+/// outlined-folder geometry exactly (via [`outlined_chip_spans`]) so a click
+/// resolves to the tab drawn at that column.
+pub fn compute_chip_layout(bar_x: u16) -> [TabChip; 5] {
+    let labels = [
+        TAB_LABELS[0].1,
+        TAB_LABELS[1].1,
+        TAB_LABELS[2].1,
+        TAB_LABELS[3].1,
+        TAB_LABELS[4].1,
+    ];
+    let spans = outlined_chip_spans(bar_x, &labels);
+    let mut out = [TabChip {
+        tab: ActiveTab::Home,
+        x_start: 0,
+        x_end: 0,
+    }; 5];
+    for (i, (start, end)) in spans.iter().enumerate() {
+        out[i] = TabChip {
+            tab: TAB_LABELS[i].0,
+            x_start: *start,
+            x_end: *end,
         };
-        spans.push(Span::styled(
-            format!(" {key} "),
-            Style::default().fg(theme.muted),
-        ));
-        spans.push(Span::styled(format!(" {label} "), style));
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    out
 }
 
-/// Common stub renderer used by tabs that are not yet implemented.
-pub fn draw_placeholder(f: &mut Frame, area: Rect, title: &str, body: &str, theme: &Theme) {
-    use ratatui::widgets::{Block, Borders};
-    let p = Paragraph::new(Line::from(Span::styled(
-        body,
-        Style::default().fg(theme.muted),
-    )))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" {title} "))
-            .border_style(theme.border_style())
-            .title_style(theme.title_style()),
-    );
-    f.render_widget(p, area);
+/// Stamp a string at `(x, y)` if the row is on-screen.
+fn put(f: &mut Frame, x: u16, y: u16, s: &str, style: Style) {
+    if y < f.area().height {
+        f.buffer_mut().set_string(x, y, s, style);
+    }
+}
+
+/// Draw a horizontal run of `ch` from `x0` to `x1` inclusive on row `y`.
+fn hline(f: &mut Frame, x0: u16, x1: u16, y: u16, ch: &str, style: Style) {
+    for x in x0..=x1 {
+        put(f, x, y, ch, style);
+    }
+}
+
+/// Outlined folder-tab panel.
+///
+/// A bordered body box whose top edge carries raised, outlined tab "folders";
+/// the active tab opens into the body (its bottom edge is erased). Returns the
+/// inner content rect so the caller composes the tab body inside the frame.
+///
+/// `outer` must be ≥3 rows tall (top edge / label row / panel line) + body.
+///
+/// This is the live tab chrome (`ui::draw`). Tab hit-testing routes through
+/// the same [`outlined_chip_spans`] geometry via [`compute_chip_layout`], so a
+/// click resolves to the folder painted at that column.
+#[must_use]
+pub fn draw_tab_panel(
+    f: &mut Frame,
+    outer: Rect,
+    labels: &[&str],
+    active: usize,
+    theme: &Theme,
+) -> Rect {
+    let border = Style::default().fg(theme.border);
+    let acc = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+
+    if outer.width < 4 || outer.height < 4 {
+        return outer;
+    }
+
+    let x0 = outer.x;
+    let x1 = outer.x + outer.width - 1;
+    let y_top = outer.y;
+    let y_lab = outer.y + 1;
+    let y_line = outer.y + 2;
+    let y_bot = outer.y + outer.height - 1;
+
+    // Panel box (the body frame), rounded to match the bento boxes. The tab
+    // folders are stamped on top after.
+    hline(f, x0, x1, y_line, "─", border);
+    put(f, x0, y_line, "╭", border);
+    put(f, x1, y_line, "╮", border);
+    for y in (y_line + 1)..y_bot {
+        put(f, x0, y, "│", border);
+        put(f, x1, y, "│", border);
+    }
+    hline(f, x0, x1, y_bot, "─", border);
+    put(f, x0, y_bot, "╰", border);
+    put(f, x1, y_bot, "╯", border);
+
+    // Tab folders along the top edge — geometry from the shared single source.
+    let spans = outlined_chip_spans(x0 + 2, labels);
+    for (i, lab) in labels.iter().enumerate() {
+        let is_active = i == active;
+        let content = if is_active {
+            format!(" ● {lab} ")
+        } else {
+            format!(" {} {lab} ", i + 1)
+        };
+        let (sx, end) = spans[i];
+        let ex = end.saturating_sub(1); // right border column (inclusive)
+        if ex >= x1 {
+            break; // out of horizontal room — stop cleanly rather than overflow
+        }
+        // Inactive folders share the frame's border color so they read as one
+        // piece; only the active folder is accented.
+        let style = if is_active { acc } else { border };
+
+        // Rounded folder top, matching the frame.
+        put(f, sx, y_top, "╭", style);
+        hline(f, sx + 1, ex - 1, y_top, "─", style);
+        put(f, ex, y_top, "╮", style);
+        put(f, sx, y_lab, "│", style);
+        put(f, sx + 1, y_lab, &content, style);
+        put(f, ex, y_lab, "│", style);
+        if is_active {
+            // Open the active folder into the body: erase the panel line under
+            // it. The bottom corners are accent so the active color continues
+            // down the sides and curves outward into the frame; the rounded arc
+            // (not a straight horizontal run) is the whole flourish — the frame
+            // line beyond the corners stays the border color.
+            put(f, sx, y_line, "╯", acc);
+            for x in (sx + 1)..ex {
+                put(f, x, y_line, " ", Style::default().bg(theme.bg));
+            }
+            put(f, ex, y_line, "╰", acc);
+        } else {
+            put(f, sx, y_line, "┴", style);
+            put(f, ex, y_line, "┴", style);
+        }
+    }
+
+    Rect::new(
+        x0 + 2,
+        y_line + 1,
+        outer.width.saturating_sub(4),
+        y_bot.saturating_sub(y_line + 1),
+    )
 }
 
 #[cfg(test)]
@@ -113,22 +225,28 @@ mod tests {
 
     #[test]
     fn chip_layout_matches_draw_widths() {
+        // Outlined folders: chip width = label.chars()+4 content + 2 borders,
+        // 1-col gap between. Home(4)/ROCm(4)/Serving(7)/Observe(7)/Chat(4).
         let chips = compute_chip_layout(0);
-        // " 1 " (3) + " Overview " (10) = 13
+        // " ● Home " (8) inside a box (10) → 0..10
         assert_eq!(chips[0].x_start, 0);
-        assert_eq!(chips[0].x_end, 13);
-        // separator (3) then " 2 " (3) + " Hardware " (10) = 16..29
-        assert_eq!(chips[1].x_start, 16);
-        assert_eq!(chips[1].x_end, 29);
-        // " 3 " + " Instances " (11) = 32..46
-        assert_eq!(chips[2].x_start, 32);
-        assert_eq!(chips[2].x_end, 46);
-        // " 4 " + " Bench " (7) = 49..59
-        assert_eq!(chips[3].x_start, 49);
-        assert_eq!(chips[3].x_end, 59);
-        // separator (3) then " 5 " (3) + " Chat " (6) = 62..71
-        assert_eq!(chips[4].x_start, 62);
-        assert_eq!(chips[4].x_end, 71);
+        assert_eq!(chips[0].x_end, 10);
+        assert_eq!(chips[0].tab, ActiveTab::Home);
+        // gap then " 2 ROCm " (8) box (10) → 11..21
+        assert_eq!(chips[1].x_start, 11);
+        assert_eq!(chips[1].x_end, 21);
+        assert_eq!(chips[1].tab, ActiveTab::Rocm);
+        // " 3 Serving " (11) box (13) → 22..35
+        assert_eq!(chips[2].x_start, 22);
+        assert_eq!(chips[2].x_end, 35);
+        assert_eq!(chips[2].tab, ActiveTab::Serving);
+        // " 4 Observe " (11) box (13) → 36..49
+        assert_eq!(chips[3].x_start, 36);
+        assert_eq!(chips[3].x_end, 49);
+        assert_eq!(chips[3].tab, ActiveTab::Observe);
+        // " 5 Chat " (8) box (10) → 50..60
+        assert_eq!(chips[4].x_start, 50);
+        assert_eq!(chips[4].x_end, 60);
         assert_eq!(chips[4].tab, ActiveTab::Chat);
     }
 
@@ -136,7 +254,61 @@ mod tests {
     fn chip_layout_honors_bar_x_offset() {
         let chips = compute_chip_layout(100);
         assert_eq!(chips[0].x_start, 100);
-        // Full bar (Overview start → Chat end) spans 71 columns.
-        assert_eq!(chips[4].x_end - chips[0].x_start, 71);
+        // Full panel (Home start → Chat end) spans 60 columns.
+        assert_eq!(chips[4].x_end - chips[0].x_start, 60);
+    }
+
+    #[test]
+    fn outlined_tab_panel_paints_labels_and_active_marker() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let theme = Theme::from_name("default-dark");
+        let backend = TestBackend::new(80, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let inner = std::cell::Cell::new(Rect::new(0, 0, 0, 0));
+        term.draw(|f| {
+            let r = draw_tab_panel(
+                f,
+                f.area(),
+                &["Home", "ROCm", "Serving", "Observe", "Chat"],
+                0,
+                &theme,
+            );
+            inner.set(r);
+        })
+        .unwrap();
+        let out: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        // Inactive tabs show their 1-based index; the active tab shows ●.
+        assert!(out.contains("● Home"), "active marker missing: {out:?}");
+        assert!(out.contains("Serving"), "tab label missing: {out:?}");
+        // Frame + folders use rounded corners now.
+        assert!(
+            out.contains('╮') && out.contains('╰'),
+            "no rounded panel frame"
+        );
+        // Inner content rect is strictly inside the outer frame.
+        let r = inner.get();
+        assert!(r.width > 0 && r.height > 0 && r.y >= 3);
+    }
+
+    #[test]
+    fn outlined_tab_panel_survives_tiny_area() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let theme = Theme::from_name("default-dark");
+        for (w, h) in [(2u16, 2u16), (4, 4), (10, 3)] {
+            let backend = TestBackend::new(w.max(1), h.max(1));
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| {
+                let _ = draw_tab_panel(f, f.area(), &["Home", "Chat"], 1, &theme);
+            })
+            .unwrap();
+        }
     }
 }

@@ -32,8 +32,8 @@ use crate::ui::approval::{
 };
 use crate::ui::exec::{exe_label, resolve_exe};
 use crate::ui::format;
-use crate::ui::job_console::{ConsoleOutcome, draw_job_console, on_console_key};
-use crate::ui::modal::{centered_rect, draw_popup_frame};
+use crate::ui::job_console::{ConsoleOutcome, on_console_key};
+use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
 
 /// A lifecycle operation on a managed service.
@@ -230,19 +230,18 @@ pub fn draw_services_manager<S: ::std::hash::BuildHasher>(
     area: Rect,
     sm: &ServicesManagerState,
     instances: &HashMap<String, Instance, S>,
-    jobs: &State,
+    _jobs: &State,
     theme: &Theme,
 ) {
     // The job console takes over while a lifecycle op is in flight / finished.
-    if let Some(job_id) = &sm.active_job
-        && let Some(job) = jobs.job(job_id)
-    {
-        draw_job_console(f, area, job, 0, theme);
-        return;
-    }
-
-    let popup = centered_rect(82, 80, 130, 34, area);
-    let inner = draw_popup_frame(f, popup, "Services — managed inference servers", theme);
+    let inner = panel::bento(
+        f,
+        area,
+        Some("Services — managed inference servers"),
+        BoxRole::Primary,
+        false,
+        theme,
+    );
     if inner.height == 0 {
         return;
     }

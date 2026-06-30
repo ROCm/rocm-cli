@@ -117,7 +117,7 @@ fn main() -> anyhow::Result<()> {
     let mut frames: Vec<String> = Vec::new();
 
     // --- Overview tab -------------------------------------------------------
-    state.active_tab = ActiveTab::Overview;
+    state.active_tab = ActiveTab::Home;
     state.modal = Modal::None;
     for _ in 0..overview_frames {
         replay.advance_by(&mut state, per_frame_snaps);
@@ -125,14 +125,14 @@ fn main() -> anyhow::Result<()> {
     }
 
     // --- Hardware tab -------------------------------------------------------
-    state.active_tab = ActiveTab::Hardware;
+    state.active_tab = ActiveTab::Observe;
     for _ in 0..hardware_frames {
         replay.advance_by(&mut state, per_frame_snaps);
         frames.push(capture(&mut state, args.cols, args.rows)?);
     }
 
     // --- Instances tab ------------------------------------------------------
-    state.active_tab = ActiveTab::Instances;
+    state.active_tab = ActiveTab::Observe;
     for _ in 0..instances_frames {
         replay.advance_by(&mut state, per_frame_snaps);
         frames.push(capture(&mut state, args.cols, args.rows)?);
@@ -141,7 +141,7 @@ fn main() -> anyhow::Result<()> {
     // --- Bench tab ----------------------------------------------------------
     // Drain whatever remains of the timeline here so the Pass^N/Pass@N rollup
     // (incl. the mixed `S-stress-mixtral` group) fills in over the frames.
-    state.active_tab = ActiveTab::Bench;
+    state.active_tab = ActiveTab::Observe;
     let remaining = total_snaps.saturating_sub(replay.snaps_applied);
     let bench_advance = (remaining / bench_frames.max(1)).max(1);
     for _ in 0..bench_frames {

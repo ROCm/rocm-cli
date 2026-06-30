@@ -91,6 +91,17 @@ pub struct InstanceSample {
     /// Lemonade `/api/v1/stats.tokens_per_second`). vLLM leaves this `None` and
     /// uses the `gen_tokens_total` delta path. Plain data — no async/HTTP/render.
     pub gen_tps: Option<f64>,
+    /// Cumulative vLLM `time_to_first_token_seconds_sum` / `_count` histogram
+    /// readings at scrape time. The runner windows successive readings into
+    /// `Instance.ttft_ms` (Δsum/Δcount × 1000), mirroring the `gen_tps` path;
+    /// these raw cumulative values are not stored on `Instance`. `None` for
+    /// engines that don't expose the histogram.
+    pub ttft_sum_s: Option<f64>,
+    pub ttft_count: Option<f64>,
+    /// Cumulative vLLM `time_per_output_token_seconds_sum` / `_count` histogram
+    /// readings; windowed into `Instance.tpot_ms` the same way.
+    pub tpot_sum_s: Option<f64>,
+    pub tpot_count: Option<f64>,
 }
 
 pub trait InstanceMetrics: Send + Sync {
@@ -135,6 +146,10 @@ pub fn merge_instance(
         // is derived at snapshot assembly.
         gen_tps: sample.gen_tps,
         tokens_per_watt: None,
+        // Derived at the runner by windowing the sample's cumulative histogram
+        // readings (mirrors gen_tps); left None at merge time.
+        ttft_ms: None,
+        tpot_ms: None,
         launch_args: svc.launch_args.clone(),
         env_vars: svc.env_vars.clone(),
         log_file: svc.log_file.clone(),

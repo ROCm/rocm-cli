@@ -29,8 +29,8 @@ use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
 };
 use crate::ui::exec::{exe_label, resolve_exe};
-use crate::ui::job_console::{ConsoleOutcome, draw_job_console, on_console_key};
-use crate::ui::modal::{centered_rect, draw_popup_frame};
+use crate::ui::job_console::{ConsoleOutcome, on_console_key};
+use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
 
 /// A flattened background-check entry for the list. Mirrors the bin's
@@ -231,18 +231,17 @@ pub fn draw_automations_manager(
     area: Rect,
     a: &AutomationsManagerState,
     automations: &[AutomationSummary],
-    jobs: &State,
+    _jobs: &State,
     theme: &Theme,
 ) {
-    if let Some(job_id) = &a.active_job
-        && let Some(job) = jobs.job(job_id)
-    {
-        draw_job_console(f, area, job, 0, theme);
-        return;
-    }
-
-    let popup = centered_rect(80, 70, 120, 22, area);
-    let inner = draw_popup_frame(f, popup, "Automations — background checks", theme);
+    let inner = panel::bento(
+        f,
+        area,
+        Some("Automations — background checks"),
+        BoxRole::Primary,
+        false,
+        theme,
+    );
     if inner.height == 0 {
         return;
     }

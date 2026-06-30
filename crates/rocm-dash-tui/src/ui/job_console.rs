@@ -71,9 +71,15 @@ pub fn status_label(job: &JobState, theme: &Theme) -> (String, ratatui::style::C
     }
 }
 
-/// Render the job console centered over `area`. `scroll` is the first visible
-/// output line offset (the caller clamps it).
-pub fn draw_job_console(f: &mut Frame, area: Rect, job: &JobState, scroll: u16, theme: &Theme) {
+/// Render the job console centered over `area`. `scroll` is `(vertical_line,
+/// horizontal_col)` of the first visible cell (the caller clamps it).
+pub fn draw_job_console(
+    f: &mut Frame,
+    area: Rect,
+    job: &JobState,
+    scroll: (u16, u16),
+    theme: &Theme,
+) {
     let popup = centered_rect(90, 84, 140, 40, area);
     let title = format!("{} {}", job.cmd, job.args.join(" "));
     let inner = draw_popup_frame(f, popup, title.trim(), theme);
@@ -116,13 +122,13 @@ pub fn draw_job_console(f: &mut Frame, area: Rect, job: &JobState, scroll: u16, 
         .iter()
         .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(theme.fg))))
         .collect();
-    f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), rows[1]);
+    f.render_widget(Paragraph::new(lines).scroll(scroll), rows[1]);
 
     // Footer: key hints (cancel only while running).
     let hints = if matches!(job.status, JobStatus::Running) {
-        "Ctrl+C cancel · PgUp/PgDn scroll"
+        "Ctrl+C cancel · wheel / PgUp·PgDn scroll"
     } else {
-        "Enter/Esc close · PgUp/PgDn scroll"
+        "Enter/Esc close · wheel / PgUp·PgDn scroll"
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(

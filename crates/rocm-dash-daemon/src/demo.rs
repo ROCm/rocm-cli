@@ -546,7 +546,8 @@ fn build_sysinfo() -> GpuSystemInfo {
 fn build_instances(t_s: f64, seed: &mut u64) -> Vec<Instance> {
     CONTAINERS
         .iter()
-        .map(|c| {
+        .enumerate()
+        .map(|(idx, c)| {
             let kv =
                 (jitter(seed) - 0.5).mul_add(4.0, osc(t_s, 13.0, c.phase_s, c.kv_mean, c.kv_amp));
             let kv = kv.clamp(0.0, 100.0);
@@ -577,6 +578,19 @@ fn build_instances(t_s: f64, seed: &mut u64) -> Vec<Instance> {
                 * f64::from(osc(t_s, 19.0, c.phase_s, 180.0, 90.0)))
             .max(0.0);
 
+            // Synthesize plausible live latency so `rocm dash --demo` shows real
+            // TTFT/TPOT values: TTFT ~80–360 ms, TPOT ~10–40 ms, oscillating
+            // with load. The first instance leaves them `None` to exercise the
+            // honest `—` path (an engine that doesn't expose the histogram).
+            let (ttft_ms, tpot_ms) = if idx == 0 {
+                (None, None)
+            } else {
+                (
+                    Some(f64::from(osc(t_s, 23.0, c.phase_s, 220.0, 140.0)).max(20.0)),
+                    Some(f64::from(osc(t_s, 11.0, c.phase_s + 3.0, 25.0, 15.0)).max(5.0)),
+                )
+            };
+
             Instance {
                 container_id: c.container_id.into(),
                 container_name: c.container_name.into(),
@@ -594,6 +608,8 @@ fn build_instances(t_s: f64, seed: &mut u64) -> Vec<Instance> {
                 waiting_reqs: Some(waiting),
                 gen_tps: Some(gen_tps),
                 tokens_per_watt: None,
+                ttft_ms,
+                tpot_ms,
                 launch_args: c.launch_args.iter().map(|s| (*s).to_string()).collect(),
                 env_vars,
                 log_file: Some(format!("/var/log/vllm/{}.log", c.container_name)),
@@ -632,6 +648,30 @@ fn write_line<W: Write + ?Sized>(w: &mut W, entry: &PersistedEntry) -> anyhow::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn demo_synthesizes_finite_ttft_tpot_with_one_honest_none() {
+        // `rocm dash --demo` must show real TTFT/TPOT (Phase 4): the synthesized
+        // instances carry finite latency, with the first left None to exercise
+        // the honest `—` path (an engine without the histogram).
+        let mut seed = 42;
+        let insts = build_instances(5.0, &mut seed);
+        assert!(insts.len() >= 2, "need >1 demo instance to test both paths");
+        assert_eq!(insts[0].ttft_ms, None, "first instance is the honest None");
+        assert_eq!(insts[0].tpot_ms, None);
+        for inst in &insts[1..] {
+            let ttft = inst.ttft_ms.expect("synthesized TTFT");
+            let tpot = inst.tpot_ms.expect("synthesized TPOT");
+            assert!(
+                ttft.is_finite() && ttft > 0.0,
+                "TTFT finite/positive: {ttft}"
+            );
+            assert!(
+                tpot.is_finite() && tpot > 0.0,
+                "TPOT finite/positive: {tpot}"
+            );
+        }
+    }
 
     /// Same options must yield byte-identical output (hard invariant).
     #[test]

@@ -74,6 +74,12 @@ pub fn parse_stats(body: &str) -> InstanceSample {
         // Lemonade has no cumulative token counter; surface the rate directly.
         gen_tokens_total: None,
         gen_tps: stats.tokens_per_second,
+        // TTFT/TPOT histograms are a vLLM-Prometheus concept; Lemonade leaves
+        // them None (Observe shows `—`).
+        ttft_sum_s: None,
+        ttft_count: None,
+        tpot_sum_s: None,
+        tpot_count: None,
     }
 }
 

@@ -19,8 +19,8 @@ use ratatui::widgets::Paragraph;
 use rocm_dash_core::state::{SideEffect, State, StateEvent};
 
 use crate::ui::exec::resolve_exe;
-use crate::ui::job_console::{ConsoleOutcome, draw_job_console, on_console_key};
-use crate::ui::modal::{centered_rect, draw_popup_frame};
+use crate::ui::job_console::{ConsoleOutcome, on_console_key};
+use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
 
 /// Overlay state. `None` on `AppState` means the overlay is closed.
@@ -90,19 +90,18 @@ fn run_examine(d: &mut ExamineManagerState, jobs: &mut State) -> Vec<SideEffect>
 pub fn draw_examine_manager(
     f: &mut Frame,
     area: Rect,
-    d: &ExamineManagerState,
-    jobs: &State,
+    _d: &ExamineManagerState,
+    _jobs: &State,
     theme: &Theme,
 ) {
-    if let Some(job_id) = &d.active_job
-        && let Some(job) = jobs.job(job_id)
-    {
-        draw_job_console(f, area, job, 0, theme);
-        return;
-    }
-
-    let popup = centered_rect(70, 50, 90, 14, area);
-    let inner = draw_popup_frame(f, popup, "Examine — environment check", theme);
+    let inner = panel::bento(
+        f,
+        area,
+        Some("Examine — environment check"),
+        BoxRole::Primary,
+        false,
+        theme,
+    );
     if inner.height == 0 {
         return;
     }
