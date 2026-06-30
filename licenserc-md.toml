@@ -25,6 +25,7 @@ excludes = [
   "target/**",
   ".claude/**",
   ".tmp-*/**",
+  ".hawkeye-bin/**",
   "third_party/**",
 ]
 
