@@ -675,12 +675,14 @@ from the dependency lockfile by [`cargo-about`] using the committed `about.toml`
 dependency tree changes — and as part of every release — with:
 
 ```bash
-cargo install cargo-about --locked --features cli   # one-time
+cargo install cargo-about@0.9.1 --locked --features cli   # one-time
 cargo xtask tpn
 ```
 
 CI verifies the committed file is current with `cargo xtask tpn --check`; a new
 dependency under a license not listed in `about.toml` fails the check until the
-license is reviewed and added (or the dependency dropped).
+license is reviewed and added (or the dependency dropped). CI pins the
+cargo-about version shown above — install that same version so your regenerated
+file matches the check.
 
 [`cargo-about`]: https://github.com/EmbarkStudios/cargo-about
