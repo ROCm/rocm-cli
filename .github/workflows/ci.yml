@@ -94,6 +94,14 @@ jobs:
 
   build-and-test:
     runs-on: ubuntu-latest
+    # sccache caches each rustc invocation (keyed by source + deps + flags) in the
+    # GitHub Actions cache, so unchanged crates are not recompiled across runs.
+    # This complements setup-rust-toolchain's rust-cache, which restores the
+    # registry and dependency target/ but deliberately does not cache workspace
+    # crates — the bulk of the build time here.
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
     needs: [changes, clippy, prek]
     steps:
@@ -106,6 +114,10 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         if: needs.changes.outputs.heavy == 'true'
 
+      - name: Set up sccache
+        if: needs.changes.outputs.heavy == 'true'
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
       - name: Build
         if: needs.changes.outputs.heavy == 'true'
         run: cargo build --workspace --all-targets
@@ -113,6 +125,10 @@ jobs:
       - name: Test
         if: needs.changes.outputs.heavy == 'true'
         run: cargo test --workspace --all-targets
+
+      - name: sccache stats
+        if: needs.changes.outputs.heavy == 'true'
+        run: sccache --show-stats
 
       - name: Local no-fallback smoke
         if: needs.changes.outputs.heavy == 'true'
@@ -146,6 +162,11 @@ jobs:
     runs-on: windows-latest
     env:
       CARGO_INCREMENTAL: "0"
+      # Cache each rustc invocation across runs; the full-workspace build is the
+      # dominant cost on this runner and rust-cache does not cache workspace
+      # crates. CARGO_INCREMENTAL=0 above is required for (and assumed by) sccache.
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
     needs: [changes, clippy, prek]
     steps:
@@ -155,6 +176,10 @@ jobs:
         if: needs.changes.outputs.heavy == 'true'
         with:
           cache-on-failure: true
+
+      - name: Set up sccache
+        if: needs.changes.outputs.heavy == 'true'
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
       - name: Build
         if: needs.changes.outputs.heavy == 'true'
@@ -167,6 +192,11 @@ jobs:
         if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
         run: cargo test --workspace --all-targets
+
+      - name: sccache stats
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: sccache --show-stats
 
       - name: Local no-fallback smoke
         if: needs.changes.outputs.heavy == 'true'
@@ -238,12 +268,19 @@ jobs:
 
   clippy:
     runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     needs: changes
     steps:
       - uses: actions/checkout@v6
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         if: needs.changes.outputs.rust == 'true'
+
+      - name: Set up sccache
+        if: needs.changes.outputs.rust == 'true'
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
       - name: Clippy
         if: needs.changes.outputs.rust == 'true'
@@ -252,6 +289,10 @@ jobs:
       - name: MANIFEST.md dependency table is current
         if: needs.changes.outputs.rust == 'true'
         run: cargo xtask manifest --check
+
+      - name: sccache stats
+        if: needs.changes.outputs.rust == 'true'
+        run: sccache --show-stats
 
   coverage:
     name: Coverage (rocm-dash crates, ratcheted)
