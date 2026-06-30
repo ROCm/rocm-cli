@@ -1,5 +1,5 @@
 #!/bin/sh
-# Copyright Advanced Micro Devices, Inc.
+# Copyright © Advanced Micro Devices, Inc., or its affiliates.
 #
 # SPDX-License-Identifier: MIT
 
