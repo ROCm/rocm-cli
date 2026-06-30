@@ -104,36 +104,72 @@ pub struct DaemonConfig {
 
 /// Default Unix-socket address for the telemetry daemon.
 ///
-/// The socket lives in a *per-user* subdirectory of the temp dir
-/// (`/tmp/rocm-<user>/`) rather than directly in `/tmp`. The daemon creates and
-/// owns that subdirectory, so it can tighten it to mode `0o700` without the
-/// `EPERM` that results from trying to `chmod` a shared, root-owned `/tmp`
-/// (mode `1777`). Keeping it per-user also avoids collisions on multi-user hosts.
+/// Chooses a socket location whose *parent* directory is always user-owned, so
+/// the daemon can tighten it to mode `0o700` without the `EPERM` that results
+/// from trying to `chmod` a shared, root-owned `/tmp` (mode `1777`). Precedence
+/// mirrors `rocm-core`'s `default_dashboard_socket` so the canonical `rocm`
+/// config and a standalone `rocm-dash` config resolve to the same place:
+///
+/// 1. `$XDG_RUNTIME_DIR` — already mode `0700` on systemd systems, ideal.
+/// 2. `$HOME/.rocm/data/telemetry` — standard per-user data dir.
+/// 3. `temp_dir()/rocm-<user>` — user-named subdir so the parent is something
+///    the daemon creates and owns, not `/tmp` itself.
 fn default_socket() -> String {
-    let raw = std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .unwrap_or_else(|_| "user".to_owned());
-    // Sanitize: keep only alphanumeric, hyphen, and underscore so a path
-    // separator or `..` in the env var cannot escape the intended subdirectory.
-    let user: String = raw
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let user = if user.is_empty() {
-        "user".to_owned()
-    } else {
-        user
-    };
-    let path = std::env::temp_dir()
-        .join(format!("rocm-{user}"))
-        .join("rocmdashd.sock");
+    let path = socket_path(
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        std::env::var_os("HOME"),
+        std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .ok(),
+        std::env::temp_dir(),
+    );
     format!("unix:{}", path.display())
+}
+
+/// Pure core of [`default_socket`]: resolve the socket path from explicit env
+/// inputs so the precedence is testable without mutating process-global env vars
+/// (unsafe and racy under parallel tests in edition 2024).
+fn socket_path(
+    xdg_runtime_dir: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    user: Option<String>,
+    temp_dir: PathBuf,
+) -> PathBuf {
+    xdg_runtime_dir
+        .filter(|v| !v.is_empty())
+        .map(|d| PathBuf::from(d).join("rocmdashd.sock"))
+        .or_else(|| {
+            home.filter(|v| !v.is_empty()).map(|h| {
+                PathBuf::from(h)
+                    .join(".rocm")
+                    .join("data")
+                    .join("telemetry")
+                    .join("rocmdashd.sock")
+            })
+        })
+        .unwrap_or_else(|| {
+            let raw = user.unwrap_or_else(|| "user".to_owned());
+            // Sanitize: keep only alphanumeric, hyphen, and underscore so a path
+            // separator or `..` in the env var cannot escape the subdirectory.
+            let sanitized: String = raw
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            let sanitized = if sanitized.is_empty() {
+                "user".to_owned()
+            } else {
+                sanitized
+            };
+            temp_dir
+                .join(format!("rocm-{sanitized}"))
+                .join("rocmdashd.sock")
+        })
 }
 
 impl Default for DaemonConfig {
@@ -364,11 +400,11 @@ theme = "default-dark"
     }
 
     #[test]
-    fn default_socket_uses_per_user_subdir_not_bare_tmp() {
-        // Regression: the default socket must NOT sit directly in the temp dir.
-        // A bare `/tmp/rocmdashd.sock` makes the daemon try to chmod /tmp (a
-        // shared, root-owned dir) and abort with EPERM. The parent must be a
-        // per-user subdirectory the daemon can create and own.
+    fn default_socket_never_parents_at_bare_temp_dir() {
+        // Regression: whatever tier is chosen, the default socket must NOT sit
+        // directly in the temp dir. A bare `/tmp/rocmdashd.sock` makes the daemon
+        // try to chmod /tmp (a shared, root-owned dir) and abort with EPERM. The
+        // parent must be a directory the daemon can create or already owns.
         let socket = Config::default().daemon.listen;
         let path = socket
             .strip_prefix("unix:")
@@ -381,17 +417,60 @@ theme = "default-dark"
             std::env::temp_dir(),
             "socket parent must be a subdir, not the bare temp dir: {socket}"
         );
-        assert!(
-            parent
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("rocm-")),
-            "socket parent should be a per-user rocm-<user> dir: {socket}"
-        );
         // daemon and tui defaults must agree so a default client finds the daemon.
         assert_eq!(
             Config::default().daemon.listen,
             Config::default().tui.connect
         );
+    }
+
+    #[test]
+    fn socket_path_prefers_xdg_runtime_dir() {
+        // Tier 1: $XDG_RUNTIME_DIR is already mode 0700 on systemd systems, so it
+        // is the ideal parent and must win over $HOME and the temp dir.
+        let path = socket_path(
+            Some("/run/user/1000".into()),
+            Some("/home/alice".into()),
+            Some("alice".to_owned()),
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(path, PathBuf::from("/run/user/1000/rocmdashd.sock"));
+    }
+
+    #[test]
+    fn socket_path_falls_back_to_home_then_temp() {
+        // Tier 2: no XDG → per-user data dir under $HOME.
+        let path = socket_path(
+            None,
+            Some("/home/alice".into()),
+            Some("alice".to_owned()),
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(
+            path,
+            PathBuf::from("/home/alice/.rocm/data/telemetry/rocmdashd.sock")
+        );
+
+        // Tier 3: no XDG and no HOME → user-named subdir of the temp dir, never
+        // the bare temp dir itself.
+        let path = socket_path(None, None, Some("alice".to_owned()), PathBuf::from("/tmp"));
+        assert_eq!(path, PathBuf::from("/tmp/rocm-alice/rocmdashd.sock"));
+    }
+
+    #[test]
+    fn socket_path_sanitizes_user_and_skips_empty_env() {
+        // An empty XDG/HOME value is treated as unset (falls through), and a user
+        // name with path separators cannot escape the intended subdirectory.
+        let path = socket_path(
+            Some("".into()),
+            Some("".into()),
+            Some("../../etc".to_owned()),
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(path, PathBuf::from("/tmp/rocm-______etc/rocmdashd.sock"));
+
+        // No user name at all still yields a valid per-user subdir.
+        let path = socket_path(None, None, None, PathBuf::from("/tmp"));
+        assert_eq!(path, PathBuf::from("/tmp/rocm-user/rocmdashd.sock"));
     }
 }
