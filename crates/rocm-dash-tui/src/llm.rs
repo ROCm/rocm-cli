@@ -13,7 +13,12 @@ use std::time::Duration;
 
 /// Probed-default endpoint: the local OpenAI-compatible serving endpoint the
 /// dashboard already watches. Used only when no URL is configured anywhere.
-pub const DEFAULT_CHAT_BASE_URL: &str = "http://127.0.0.1:8000";
+///
+/// The `/v1` suffix is required: the Rig OpenAI client appends `chat/completions`
+/// directly to `base_url` (`base_url + "/" + path`), so a base without `/v1`
+/// POSTs to `/chat/completions` and a vLLM/Lemonade server answers `404 Not
+/// Found`. Mirrors the `/v1`-suffixed `VLLM_ENDPOINT` / `LEMONADE_ENDPOINT`.
+pub const DEFAULT_CHAT_BASE_URL: &str = "http://127.0.0.1:8000/v1";
 
 /// Fallback model name when none is configured. Many local endpoints ignore
 /// the model field or expose a single model, so a neutral default is safe.
