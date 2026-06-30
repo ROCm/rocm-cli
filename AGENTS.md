@@ -190,7 +190,7 @@ If a vendored upstream tree is introduced in the future, apply the following rul
 
 - keep vendored changes minimal and attributable
 - do not assume root workspace checks cover vendored workspace behavior
-- follow sync notes in the appropriate upstream-sync documentation (e.g., `docs/upstream-codex-sync.md`) for pin updates and rebuild workflow
+- follow sync notes in the appropriate upstream-sync documentation for pin updates and rebuild workflow
 
 ## 11) PR/Issue/Review Conduct
 

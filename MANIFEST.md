@@ -633,16 +633,6 @@ automatically; they record externally-provided runtimes supplied by the user.
 
 ## Repository Structure Notes
 
-### `plans/` Directory
-
-The `plans/` directory contains internal development planning documents
-(implementation plans, feature specs, linting strategy notes) that were created
-during the development of rocm-cli. These documents reflect the internal
-development process and are not part of the public API or user-facing
-documentation. These files are not expected to contain sensitive infrastructure details, credentials, or internal
-hostnames. They are included in the repository for
-historical reference but are not part of the product distribution.
-
 ### `docs/` Directory
 
 The `docs/` directory contains developer-facing documentation covering testing

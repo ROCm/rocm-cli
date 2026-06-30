@@ -6,6 +6,5 @@
 /crates/** text eol=lf
 /docs/** text eol=lf
 /engines/** text eol=lf
-/plans/** text eol=lf
 /scripts/** text eol=lf
 *.sh text eol=lf

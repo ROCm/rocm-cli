@@ -13,7 +13,7 @@ mod therock;
 mod tui;
 mod uninstall;
 
-// tui.rs is RETAINED pending human go/no-go deletion (see docs/tui-retirement-checklist.md).
+// tui.rs is RETAINED pending human go/no-go deletion.
 // bare `rocm` and `rocm chat` now route to the dash chat (parity reached, Phases 3-8).
 // This anchor keeps the frozen module compiling (referenced, never invoked) until deletion.
 #[allow(dead_code)]
@@ -860,9 +860,7 @@ fn launch_default() -> Result<()> {
     if interactive_terminal() {
         // Bare `rocm` opens the minimal launcher front door; "Open full
         // dashboard" / `d` escalates into the unified dash, "Chat" reaches the
-        // Chat tab. `rocm dash` / `rocm chat` bypass the launcher. The legacy
-        // `tui::run` assistant is retained but not the entrypoint (see
-        // docs/tui-retirement-checklist.md).
+        // Chat tab. `rocm dash` / `rocm chat` bypass the launcher.
         return dash::run_launcher(false);
     }
 
@@ -1348,7 +1346,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 // provider and supports `/provider` switching; --provider is
                 // honored only on the non-interactive render path below. The
                 // legacy `tui::run` assistant is retained but no longer invoked
-                // here (see docs/tui-retirement-checklist.md).
+                // here.
                 if provider.is_some() {
                     // --provider isn't threaded into the interactive dash; say so
                     // instead of dropping it silently — the user can switch live.
