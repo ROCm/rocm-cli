@@ -118,13 +118,14 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         if: needs.changes.outputs.heavy == 'true'
 
+      # Build the runtime binaries the smoke + acceptance steps below need (every
+      # engine binary; smoke hard-fails on a missing one). Unit/integration tests
+      # run in the dedicated `test` job on only the crates a change can affect;
+      # `clippy --all-targets` is the compile-check for the non-binary targets, so
+      # dropping `--all-targets` here loses no coverage.
       - name: Build
         if: needs.changes.outputs.heavy == 'true'
-        run: cargo build --workspace --all-targets
-
-      - name: Test
-        if: needs.changes.outputs.heavy == 'true'
-        run: cargo test --workspace --all-targets
+        run: cargo build --workspace
 
       - name: Local no-fallback smoke
         if: needs.changes.outputs.heavy == 'true'
@@ -149,6 +150,76 @@ jobs:
       - name: Acceptance install lifecycle
         if: needs.changes.outputs.heavy == 'true'
         run: ./scripts/acceptance-install-upgrade-tui-uninstall.sh
+
+  # Fine-grained test selection (the second half of smarter CI; the path-based
+  # job skip is the `changes` job above). Runs cargo's unit + integration tests
+  # for only the crates a change can reach — the changed crates plus their
+  # transitive dependents, computed by `cargo xtask affected` from the workspace
+  # dependency graph — instead of the whole workspace.
+  #
+  # Merge-queue safety: the narrowing happens ONLY on pull_request. On push and
+  # in the merge queue the selection is forced to `--workspace`, so post-merge
+  # `main` and every queued PR run the full suite — a required check is never
+  # starved and the queue cannot stall. The full Windows suite
+  # (windows-build-and-test) also runs the whole workspace on every change, so it
+  # backstops any crate a graph-based selection could miss (e.g. an integration
+  # test that drives another crate only at runtime).
+  test:
+    name: Test (affected crates)
+    runs-on: ubuntu-latest
+    # Same lint gate as the OS build jobs: don't spend a test cycle until the
+    # cheap checks are green.
+    needs: [changes, clippy, prek]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # `cargo xtask affected` diffs origin/<base>...HEAD, so it needs the
+          # base history and the real PR head (not the synthetic merge ref).
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || '' }}
+
+      - name: Install native build deps
+        if: needs.changes.outputs.rust == 'true'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libcap-dev
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        if: needs.changes.outputs.rust == 'true'
+        with:
+          # Keep the PR (subset) and push/merge (`--workspace`) builds in separate
+          # cache lanes. A subset build resolves Cargo features differently than
+          # the whole workspace, so a shared cache would make the two evict and
+          # recompile each other's artifacts on every alternation.
+          cache-key: ${{ github.event_name == 'pull_request' && 'affected-pr' || 'full' }}
+
+      - name: Install cargo-nextest
+        if: needs.changes.outputs.rust == 'true'
+        uses: taiki-e/install-action@9bcaee1dcae34154180f412e2fa69355a7cda9f6 # v2.82.6
+        with:
+          tool: nextest
+
+      - name: Select affected crates
+        id: sel
+        if: needs.changes.outputs.rust == 'true'
+        run: |
+          # The `cargo xtask` alias builds xtask in release (target/release), so
+          # computing the selection doesn't perturb the debug feature resolution
+          # the nextest build below uses.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            sel=$(cargo xtask affected --base "origin/${{ github.base_ref }}")
+          else
+            sel="--workspace"
+          fi
+          echo "affected selection: ${sel:-<no rust crates changed>}"
+          echo "sel=$sel" >> "$GITHUB_OUTPUT"
+
+      - name: Test (nextest)
+        # Skip cleanly when nothing Rust-relevant resolved to a crate, so the
+        # required check still reports success.
+        if: needs.changes.outputs.rust == 'true' && steps.sel.outputs.sel != ''
+        # `sel` is intentionally unquoted: it expands to either `--workspace` or
+        # several `-p <crate>` flags that must word-split into separate argv
+        # entries. The values are crate names from our own tool, not user input.
+        run: cargo nextest run ${{ steps.sel.outputs.sel }}
 
   windows-build-and-test:
     runs-on: windows-latest

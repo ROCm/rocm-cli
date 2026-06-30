@@ -34,6 +34,23 @@ If the workspace is already built:
 python scripts/smoke_local.py --skip-build
 ```
 
+## CI test selection
+
+On pull requests, CI does not test the whole workspace. The `test` job runs
+`cargo nextest run` over only the crates a change can reach — the changed crates
+plus their transitive dependents, derived from the workspace dependency graph by:
+
+```bash
+cargo xtask affected --base origin/main
+```
+
+which prints the cargo package flags to test (`--workspace`, or `-p <crate> …`,
+or nothing when no crate is affected). It falls back to `--workspace` for any
+change that can't be confined to specific crates (the lockfile, the toolchain
+file, the workspace root manifest, or CI config). On `main` and in the merge
+queue the full workspace always runs. For local verification, keep using
+`cargo test --workspace --all-targets` above — `affected` is a CI optimization.
+
 The smoke path is the cross-platform local no-fallback acceptance surface. It
 uses an isolated config/data/cache root, does not install TheRock wheels, does
 not require a managed runtime, and verifies:
