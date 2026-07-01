@@ -8,8 +8,10 @@
 //! version the phase-3 plan calls for: get a clean machine to a working ROCm
 //! runtime two ways —
 //!
-//! - **Install ROCm SDK** — a one-shot gated `rocm install sdk --channel release
-//!   --format wheel`.
+//! - **Install ROCm SDK** — a one-shot gated `rocm install sdk` with a Configure
+//!   step to pick the channel (Release/Nightly) and an optional version pin
+//!   (`--build-date` / `--version`); defaults to `--channel release --format
+//!   wheel`.
 //! - **Adopt existing folder** — pick an existing ROCm env with the Wave-0
 //!   [`FolderBrowser`], then approve `rocm runtimes adopt`.
 //!
@@ -65,7 +67,7 @@ pub const CHOICES: &[OnboardingChoice] = &[
 impl OnboardingChoice {
     const fn label(self) -> &'static str {
         match self {
-            Self::InstallSdk => "Install ROCm SDK (release · pip)",
+            Self::InstallSdk => "Install ROCm SDK (pip)",
             Self::AdoptExisting => "Adopt an existing ROCm folder",
         }
     }
@@ -92,6 +94,111 @@ impl OnboardingChoice {
     }
 }
 
+/// Install channel for the SDK path. Mirrors `rocm install sdk --channel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Channel {
+    #[default]
+    Release,
+    Nightly,
+}
+
+impl Channel {
+    const fn as_arg(self) -> &'static str {
+        match self {
+            Self::Release => "release",
+            Self::Nightly => "nightly",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Release => "Release",
+            Self::Nightly => "Nightly",
+        }
+    }
+
+    const fn toggled(self) -> Self {
+        match self {
+            Self::Release => Self::Nightly,
+            Self::Nightly => Self::Release,
+        }
+    }
+}
+
+/// Optional version pin for the SDK install. Mirrors the CLI's mutually
+/// exclusive `--version` / `--build-date` flags (see `install sdk`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PinMode {
+    #[default]
+    None,
+    BuildDate,
+    Version,
+}
+
+impl PinMode {
+    /// Cycle order for the ↑/↓ selector.
+    const ORDER: [Self; 3] = [Self::None, Self::BuildDate, Self::Version];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::BuildDate => "Build date",
+            Self::Version => "Version",
+        }
+    }
+
+    /// The CLI flag this pin maps to, or `None` for no pin.
+    const fn arg(self) -> Option<&'static str> {
+        match self {
+            Self::None => Option::None,
+            Self::BuildDate => Some("--build-date"),
+            Self::Version => Some("--version"),
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::ORDER.iter().position(|m| *m == self).unwrap_or(0)
+    }
+
+    fn next(self) -> Self {
+        Self::ORDER[(self.index() + 1) % Self::ORDER.len()]
+    }
+
+    fn prev(self) -> Self {
+        Self::ORDER[(self.index() + Self::ORDER.len() - 1) % Self::ORDER.len()]
+    }
+}
+
+/// SDK install configuration (channel + optional version pin). Held on
+/// [`OnboardingState`] while the Configure sub-view has focus; cleared once the
+/// resulting `install sdk` command is staged for approval.
+#[derive(Debug, Clone, Default)]
+pub struct InstallConfig {
+    pub channel: Channel,
+    pub pin_mode: PinMode,
+    pub pin_value: String,
+}
+
+/// Build the `install sdk` args from a configuration. A `None` pin (or an empty
+/// value) leaves the command at `--channel <ch> --format wheel`, so the default
+/// Release path is byte-identical to the pre-toggle behavior.
+fn build_install_args(cfg: &InstallConfig) -> Vec<String> {
+    let mut args = vec![
+        "install".to_string(),
+        "sdk".to_string(),
+        "--channel".to_string(),
+        cfg.channel.as_arg().to_string(),
+        "--format".to_string(),
+        "wheel".to_string(),
+    ];
+    let pin = cfg.pin_value.trim();
+    if let (Some(flag), false) = (cfg.pin_mode.arg(), pin.is_empty()) {
+        args.push(flag.to_string());
+        args.push(pin.to_string());
+    }
+    args
+}
+
 /// An approved-but-not-yet-run onboarding op.
 #[derive(Debug, Clone)]
 pub struct PendingOnboard {
@@ -108,6 +215,8 @@ pub struct OnboardingState {
     pub step: OnboardingStep,
     pub choice: usize,
     pub browser: Option<FolderBrowser>,
+    /// SDK channel/pin picker; `Some` while the Configure sub-view has focus.
+    pub install_config: Option<InstallConfig>,
     pub approval: Option<PendingOnboard>,
     pub active_job: Option<String>,
     pub message: Option<String>,
@@ -202,6 +311,11 @@ pub fn on_key(
         return Vec::new();
     }
 
+    // 3.5) SDK install configuration (channel + version pin) has focus.
+    if o.install_config.is_some() {
+        return configure_key(o, key);
+    }
+
     // 4) Step navigation.
     match o.step {
         OnboardingStep::Welcome => match key.code {
@@ -231,19 +345,51 @@ pub fn on_key(
 fn activate_choice(o: &mut OnboardingState) -> Vec<SideEffect> {
     match CHOICES[o.choice.min(CHOICES.len() - 1)] {
         OnboardingChoice::InstallSdk => {
-            let args = vec![
-                "install".to_string(),
-                "sdk".to_string(),
-                "--channel".to_string(),
-                "release".to_string(),
-                "--format".to_string(),
-                "wheel".to_string(),
-            ];
-            stage_approval(o, OnboardingChoice::InstallSdk, args);
+            // Open the channel/pin picker; the approval is staged on confirm.
+            o.install_config = Some(InstallConfig::default());
         }
         OnboardingChoice::AdoptExisting => {
             let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
             o.browser = Some(FolderBrowser::new("Pick an existing ROCm folder", start));
+        }
+    }
+    Vec::new()
+}
+
+/// Handle a key while the SDK Configure sub-view has focus: `←/→` toggle the
+/// channel, `↑/↓` cycle the pin mode, typing edits the pin value, Enter stages
+/// the install for approval, Esc returns to the choose menu.
+fn configure_key(o: &mut OnboardingState, key: KeyEvent) -> Vec<SideEffect> {
+    match key.code {
+        KeyCode::Esc => {
+            o.install_config = None;
+            o.step = OnboardingStep::Choose;
+        }
+        KeyCode::Enter => {
+            if let Some(cfg) = o.install_config.take() {
+                let args = build_install_args(&cfg);
+                stage_approval(o, OnboardingChoice::InstallSdk, args);
+            }
+        }
+        other => {
+            if let Some(cfg) = o.install_config.as_mut() {
+                match other {
+                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                        cfg.channel = cfg.channel.toggled();
+                    }
+                    KeyCode::Up => cfg.pin_mode = cfg.pin_mode.prev(),
+                    KeyCode::Down => cfg.pin_mode = cfg.pin_mode.next(),
+                    KeyCode::Backspace => {
+                        cfg.pin_value.pop();
+                    }
+                    // Only collect characters once a pin mode is selected, so
+                    // the default (None) view ignores stray keystrokes.
+                    KeyCode::Char(c) if cfg.pin_mode != PinMode::None && !c.is_control() => {
+                        cfg.pin_value.push(c);
+                    }
+                    _ => {}
+                }
+            }
         }
     }
     Vec::new()
@@ -321,53 +467,57 @@ pub fn draw_onboarding(
         ])
         .split(inner);
 
-    match o.step {
-        OnboardingStep::Welcome => {
-            let body = vec![
-                Line::from(Span::styled(
-                    "Let's get ROCm set up on this machine.",
-                    Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "You can install the ROCm SDK fresh, or adopt an existing ROCm",
-                    Style::default().fg(theme.muted),
-                )),
-                Line::from(Span::styled(
-                    "folder you already have.",
-                    Style::default().fg(theme.muted),
-                )),
-            ];
-            f.render_widget(Paragraph::new(body), rows[0]);
-        }
-        OnboardingStep::Choose => {
-            let items: Vec<ListItem> = CHOICES
-                .iter()
-                .map(|c| {
-                    ListItem::new(Line::from(vec![
-                        Span::styled(c.label().to_string(), Style::default().fg(theme.fg)),
-                        Span::styled(" (needs approval)", Style::default().fg(theme.warn)),
-                    ]))
-                })
-                .collect();
-            let mut ls = ListState::default();
-            ls.select(Some(o.choice.min(CHOICES.len() - 1)));
-            let list = List::new(items).highlight_style(
-                Style::default()
-                    .bg(theme.surface_2)
-                    .add_modifier(Modifier::BOLD),
-            );
-            f.render_stateful_widget(list, rows[0], &mut ls);
-        }
-        OnboardingStep::Done => {
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    "Setup step finished. You're ready to go — open the dashboard \
+    if let Some(cfg) = &o.install_config {
+        draw_configure(f, rows[0], cfg, theme);
+    } else {
+        match o.step {
+            OnboardingStep::Welcome => {
+                let body = vec![
+                    Line::from(Span::styled(
+                        "Let's get ROCm set up on this machine.",
+                        Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "You can install the ROCm SDK fresh, or adopt an existing ROCm",
+                        Style::default().fg(theme.muted),
+                    )),
+                    Line::from(Span::styled(
+                        "folder you already have.",
+                        Style::default().fg(theme.muted),
+                    )),
+                ];
+                f.render_widget(Paragraph::new(body), rows[0]);
+            }
+            OnboardingStep::Choose => {
+                let items: Vec<ListItem> = CHOICES
+                    .iter()
+                    .map(|c| {
+                        ListItem::new(Line::from(vec![
+                            Span::styled(c.label().to_string(), Style::default().fg(theme.fg)),
+                            Span::styled(" (needs approval)", Style::default().fg(theme.warn)),
+                        ]))
+                    })
+                    .collect();
+                let mut ls = ListState::default();
+                ls.select(Some(o.choice.min(CHOICES.len() - 1)));
+                let list = List::new(items).highlight_style(
+                    Style::default()
+                        .bg(theme.surface_2)
+                        .add_modifier(Modifier::BOLD),
+                );
+                f.render_stateful_widget(list, rows[0], &mut ls);
+            }
+            OnboardingStep::Done => {
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        "Setup step finished. You're ready to go — open the dashboard \
                      or chat to get started.",
-                    Style::default().fg(theme.ok).add_modifier(Modifier::BOLD),
-                ))),
-                rows[0],
-            );
+                        Style::default().fg(theme.ok).add_modifier(Modifier::BOLD),
+                    ))),
+                    rows[0],
+                );
+            }
         }
     }
 
@@ -380,10 +530,14 @@ pub fn draw_onboarding(
         rows[1],
     );
 
-    let hint = match o.step {
-        OnboardingStep::Welcome => "Enter continue · Esc close",
-        OnboardingStep::Choose => "↑↓ select · Enter run · Esc close",
-        OnboardingStep::Done => "Enter/Esc close",
+    let hint = if o.install_config.is_some() {
+        "←→ channel · ↑↓ pin · type value · Enter confirm · Esc back"
+    } else {
+        match o.step {
+            OnboardingStep::Welcome => "Enter continue · Esc close",
+            OnboardingStep::Choose => "↑↓ select · Enter run · Esc close",
+            OnboardingStep::Done => "Enter/Esc close",
+        }
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -399,6 +553,70 @@ pub fn draw_onboarding(
     if let Some(pending) = &o.approval {
         draw_approval(f, area, &pending.request, pending.approval_choice, theme);
     }
+}
+
+/// Render the SDK Configure sub-view: channel toggle, pin-mode selector, and
+/// (when a pin is selected) the value field.
+fn draw_configure(f: &mut Frame, area: Rect, cfg: &InstallConfig, theme: &Theme) {
+    let chan = |c: Channel| -> Span {
+        if cfg.channel == c {
+            Span::styled(
+                format!("[ {} ]", c.label()),
+                Style::default().fg(theme.ok).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(
+                format!("  {}  ", c.label()),
+                Style::default().fg(theme.muted),
+            )
+        }
+    };
+    let pin = |m: PinMode| -> Span {
+        if cfg.pin_mode == m {
+            Span::styled(
+                format!("[{}]", m.label()),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(format!(" {} ", m.label()), Style::default().fg(theme.muted))
+        }
+    };
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Channel:  ", Style::default().fg(theme.fg)),
+            chan(Channel::Release),
+            Span::raw("  "),
+            chan(Channel::Nightly),
+        ]),
+        Line::from(vec![
+            Span::styled("Pin:      ", Style::default().fg(theme.fg)),
+            pin(PinMode::None),
+            Span::raw(" "),
+            pin(PinMode::BuildDate),
+            Span::raw(" "),
+            pin(PinMode::Version),
+        ]),
+    ];
+    if cfg.pin_mode != PinMode::None {
+        let value = if cfg.pin_value.is_empty() {
+            let placeholder = match cfg.pin_mode {
+                PinMode::BuildDate => "YYYY-MM-DD",
+                PinMode::Version => "e.g. 7.14.0a20260605",
+                PinMode::None => "",
+            };
+            Span::styled(placeholder.to_string(), Style::default().fg(theme.muted))
+        } else {
+            Span::styled(format!("{}_", cfg.pin_value), Style::default().fg(theme.fg))
+        };
+        lines.push(Line::from(vec![
+            Span::styled("Value:    ", Style::default().fg(theme.fg)),
+            value,
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 #[cfg(test)]
@@ -434,9 +652,15 @@ mod tests {
             ..Default::default()
         }); // choice 0 = InstallSdk
         let mut jobs = State::default();
-        // Enter stages approval, NO job.
+        // Enter opens the channel/pin Configure view (no approval, no job yet).
         let fx = on_key(&mut ob, &mut jobs, key(KeyCode::Enter));
         assert!(fx.is_empty());
+        assert!(ob.as_ref().unwrap().install_config.is_some());
+        assert!(ob.as_ref().unwrap().approval.is_none());
+        // Enter again confirms the default (Release · no pin) → stages approval.
+        let fx = on_key(&mut ob, &mut jobs, key(KeyCode::Enter));
+        assert!(fx.is_empty());
+        assert!(ob.as_ref().unwrap().install_config.is_none());
         let pending = ob.as_ref().unwrap().approval.as_ref().unwrap();
         assert_eq!(pending.choice, OnboardingChoice::InstallSdk);
         assert_eq!(
@@ -448,7 +672,8 @@ mod tests {
                 "release",
                 "--format",
                 "wheel"
-            ]
+            ],
+            "default Release path must stay byte-identical to the pre-toggle args"
         );
         assert!(jobs.jobs.is_empty());
         // Approve → spawns.
@@ -493,7 +718,8 @@ mod tests {
             ..Default::default()
         });
         let mut jobs = State::default();
-        on_key(&mut ob, &mut jobs, key(KeyCode::Enter)); // stage install
+        on_key(&mut ob, &mut jobs, key(KeyCode::Enter)); // open Configure
+        on_key(&mut ob, &mut jobs, key(KeyCode::Enter)); // confirm → stage install
         let fx = on_key(&mut ob, &mut jobs, key(KeyCode::Char('n')));
         assert!(fx.is_empty());
         assert!(ob.as_ref().unwrap().approval.is_none());
@@ -507,7 +733,8 @@ mod tests {
             ..Default::default()
         });
         let mut jobs = State::default();
-        on_key(&mut ob, &mut jobs, key(KeyCode::Enter)); // stage
+        on_key(&mut ob, &mut jobs, key(KeyCode::Enter)); // open Configure
+        on_key(&mut ob, &mut jobs, key(KeyCode::Enter)); // confirm → stage
         on_key(&mut ob, &mut jobs, key(KeyCode::Char('y'))); // spawn
         let id = ob.as_ref().unwrap().active_job.clone().unwrap();
         // Finish the job, then Enter dismisses the console → Done.
@@ -527,7 +754,8 @@ mod tests {
             ..Default::default()
         });
         let mut jobs = State::default();
-        on_key(&mut ob, &mut jobs, key(KeyCode::Enter)); // stage install
+        on_key(&mut ob, &mut jobs, key(KeyCode::Enter)); // open Configure
+        on_key(&mut ob, &mut jobs, key(KeyCode::Enter)); // confirm → stage install
         on_key(&mut ob, &mut jobs, key(KeyCode::Char('y'))); // spawn
         let id = ob.as_ref().unwrap().active_job.clone().unwrap();
         // The install FAILED (non-zero exit). Dismiss must NOT claim success.
@@ -572,7 +800,8 @@ mod tests {
             ..Default::default()
         });
         let mut jobs = State::default();
-        on_key(&mut ob, &mut jobs, key(KeyCode::Enter)); // stage
+        on_key(&mut ob, &mut jobs, key(KeyCode::Enter)); // open Configure
+        on_key(&mut ob, &mut jobs, key(KeyCode::Enter)); // confirm → stage
         on_key(&mut ob, &mut jobs, key(KeyCode::Char('y'))); // spawn
         on_key(&mut ob, &mut jobs, key(KeyCode::Char('q')));
         assert!(ob.is_none());
@@ -585,7 +814,8 @@ mod tests {
             step: OnboardingStep::Choose,
             ..Default::default()
         });
-        on_key(&mut o1, &mut jobs, key(KeyCode::Enter));
+        on_key(&mut o1, &mut jobs, key(KeyCode::Enter)); // open Configure
+        on_key(&mut o1, &mut jobs, key(KeyCode::Enter)); // confirm → stage
         on_key(&mut o1, &mut jobs, key(KeyCode::Char('y')));
         assert_eq!(
             o1.as_ref().unwrap().active_job.as_deref(),
@@ -596,7 +826,8 @@ mod tests {
             step: OnboardingStep::Choose,
             ..Default::default()
         });
-        on_key(&mut o2, &mut jobs, key(KeyCode::Enter)); // stage
+        on_key(&mut o2, &mut jobs, key(KeyCode::Enter)); // open Configure
+        on_key(&mut o2, &mut jobs, key(KeyCode::Enter)); // confirm → stage
         let fx = on_key(&mut o2, &mut jobs, key(KeyCode::Char('y'))); // approve
         assert!(fx.is_empty(), "no double-spawn for a running id");
         let s = o2.as_ref().unwrap();
@@ -650,5 +881,154 @@ mod tests {
         assert!(out.contains("Install ROCm SDK"));
         assert!(out.contains("Adopt an existing"));
         assert!(out.contains("needs approval"));
+    }
+
+    /// Open the SDK Configure view (choice 0 = InstallSdk) and return the state.
+    fn open_configure() -> (Option<OnboardingState>, State) {
+        let mut ob = Some(OnboardingState {
+            step: OnboardingStep::Choose,
+            ..Default::default()
+        });
+        let mut jobs = State::default();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Enter));
+        assert!(ob.as_ref().unwrap().install_config.is_some());
+        (ob, jobs)
+    }
+
+    fn type_str(ob: &mut Option<OnboardingState>, jobs: &mut State, s: &str) {
+        for c in s.chars() {
+            on_key(ob, jobs, key(KeyCode::Char(c)));
+        }
+    }
+
+    fn staged_args(o: &OnboardingState) -> Vec<String> {
+        o.approval.as_ref().unwrap().args.clone()
+    }
+
+    #[test]
+    fn nightly_toggle_sets_channel_arg() {
+        let (mut ob, mut jobs) = open_configure();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Right)); // Release → Nightly
+        on_key(&mut ob, &mut jobs, key(KeyCode::Enter)); // confirm
+        assert_eq!(
+            staged_args(ob.as_ref().unwrap()),
+            vec![
+                "install",
+                "sdk",
+                "--channel",
+                "nightly",
+                "--format",
+                "wheel"
+            ]
+        );
+    }
+
+    #[test]
+    fn channel_toggle_is_reversible() {
+        let (mut ob, mut jobs) = open_configure();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Right)); // → Nightly
+        on_key(&mut ob, &mut jobs, key(KeyCode::Left)); // → Release
+        on_key(&mut ob, &mut jobs, key(KeyCode::Enter));
+        assert!(staged_args(ob.as_ref().unwrap()).contains(&"release".to_string()));
+    }
+
+    #[test]
+    fn nightly_build_date_pin_appends_flag() {
+        let (mut ob, mut jobs) = open_configure();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Right)); // Nightly
+        on_key(&mut ob, &mut jobs, key(KeyCode::Down)); // pin None → Build date
+        type_str(&mut ob, &mut jobs, "2026-06-05");
+        on_key(&mut ob, &mut jobs, key(KeyCode::Enter));
+        assert_eq!(
+            staged_args(ob.as_ref().unwrap()),
+            vec![
+                "install",
+                "sdk",
+                "--channel",
+                "nightly",
+                "--format",
+                "wheel",
+                "--build-date",
+                "2026-06-05"
+            ]
+        );
+    }
+
+    #[test]
+    fn version_pin_appends_flag() {
+        let (mut ob, mut jobs) = open_configure();
+        // pin None → Build date → Version.
+        on_key(&mut ob, &mut jobs, key(KeyCode::Down));
+        on_key(&mut ob, &mut jobs, key(KeyCode::Down));
+        type_str(&mut ob, &mut jobs, "7.14.0a20260605");
+        on_key(&mut ob, &mut jobs, key(KeyCode::Enter));
+        let args = staged_args(ob.as_ref().unwrap());
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--version", "7.14.0a20260605"])
+        );
+        assert!(!args.iter().any(|a| a == "--build-date"));
+    }
+
+    #[test]
+    fn empty_pin_value_is_omitted() {
+        let (mut ob, mut jobs) = open_configure();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Down)); // Build date, no value typed
+        on_key(&mut ob, &mut jobs, key(KeyCode::Enter));
+        assert_eq!(
+            staged_args(ob.as_ref().unwrap()),
+            vec![
+                "install",
+                "sdk",
+                "--channel",
+                "release",
+                "--format",
+                "wheel"
+            ],
+            "an empty pin must not add a flag"
+        );
+    }
+
+    #[test]
+    fn chars_ignored_until_a_pin_mode_is_selected() {
+        let (mut ob, mut jobs) = open_configure();
+        type_str(&mut ob, &mut jobs, "abc"); // pin mode still None
+        assert_eq!(
+            ob.as_ref()
+                .unwrap()
+                .install_config
+                .as_ref()
+                .unwrap()
+                .pin_value,
+            ""
+        );
+    }
+
+    #[test]
+    fn backspace_edits_pin_value() {
+        let (mut ob, mut jobs) = open_configure();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Down)); // Build date
+        type_str(&mut ob, &mut jobs, "2026-0X");
+        on_key(&mut ob, &mut jobs, key(KeyCode::Backspace));
+        type_str(&mut ob, &mut jobs, "6");
+        assert_eq!(
+            ob.as_ref()
+                .unwrap()
+                .install_config
+                .as_ref()
+                .unwrap()
+                .pin_value,
+            "2026-06"
+        );
+    }
+
+    #[test]
+    fn configure_esc_returns_to_choose() {
+        let (mut ob, mut jobs) = open_configure();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Esc));
+        let s = ob.as_ref().unwrap();
+        assert!(s.install_config.is_none());
+        assert!(s.approval.is_none());
+        assert_eq!(s.step, OnboardingStep::Choose);
     }
 }
