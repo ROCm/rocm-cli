@@ -1,0 +1,36 @@
+# cargo-about configuration for generating THIRD_PARTY_NOTICES.txt.
+#
+# Do not invoke cargo-about directly; run `cargo xtask tpn` (regenerate) or
+# `cargo xtask tpn --check` (verify up to date). The xtask wrapper fixes the
+# template, this config, and the output path so the result stays reproducible.
+
+# SPDX license identifiers permitted in the dependency tree. cargo-about fails if
+# a crate's license is not listed here, so this list doubles as a tripwire: a new
+# dependency under an unlisted license breaks `cargo xtask tpn --check` until the
+# license is reviewed and either added here or the dependency dropped.
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "MIT-0",
+    "Unlicense",
+    "WTFPL",
+    "CDLA-Permissive-2.0",
+]
+
+# First-party workspace crates are not third-party components; exclude them.
+private = { ignore = true }
+
+# Build- and dev-dependencies are not shipped in the distributed binaries, so
+# they are not third-party components of the distribution.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true

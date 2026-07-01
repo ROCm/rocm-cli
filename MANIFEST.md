@@ -666,10 +666,23 @@ dependency table, run:
 cargo xtask manifest
 ```
 
-For a more detailed license report, install and run `cargo about` or
-`cargo license`:
+### Third-party notices
+
+`THIRD_PARTY_NOTICES.txt` at the repo root lists every third-party crate
+distributed with rocm-cli and the full text of its license. It is generated
+from the dependency lockfile by [`cargo-about`] using the committed `about.toml`
+(accepted licenses) and `about.hbs` (output format). Regenerate it whenever the
+dependency tree changes — and as part of every release — with:
 
 ```bash
-cargo install cargo-about
-cargo about generate about.hbs
+cargo install cargo-about@0.9.1 --locked --features cli   # one-time
+cargo xtask tpn
 ```
+
+CI verifies the committed file is current with `cargo xtask tpn --check`; a new
+dependency under a license not listed in `about.toml` fails the check until the
+license is reviewed and added (or the dependency dropped). CI pins the
+cargo-about version shown above — install that same version so your regenerated
+file matches the check.
+
+[`cargo-about`]: https://github.com/EmbarkStudios/cargo-about

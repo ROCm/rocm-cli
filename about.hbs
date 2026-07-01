@@ -1,0 +1,32 @@
+THIRD-PARTY SOFTWARE NOTICES
+
+{{!--
+  ============================================================================
+  HEADER NOTICE — EDIT ME
+  ----------------------------------------------------------------------------
+  The paragraph below is a generic, factual notice. If a specific third-party-
+  notice format or written-offer wording is required for a given distribution,
+  confirm it and paste it here. Changing it is a one-block edit; the generated
+  component list and license texts below are produced automatically and should
+  not be edited by hand.
+  ============================================================================
+--}}
+This file lists the third-party open-source components distributed with
+rocm-cli, together with their versions and the full text of their licenses.
+The components are grouped by license; each license text appears once and lists
+every component it covers. This file is generated from the project's dependency
+lockfile by `cargo xtask tpn`; do not edit it by hand.
+
+{{#each licenses}}
+================================================================================
+{{{name}}}
+================================================================================
+
+The following component(s) are licensed under {{{name}}}:
+{{#each used_by}}
+  - {{crate.name}} {{crate.version}}{{#if crate.repository}} <{{{crate.repository}}}>{{/if}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

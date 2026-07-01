@@ -5,14 +5,15 @@
 //! Repository task runner.
 //!
 //! Provides release-artifact signing, the MANIFEST.md dependency-table
-//! generator, commit-trust verification, and PowerShell linting in pure Rust.
-//! Each command's implementation lives in its own module; this file holds only
-//! the CLI definition and dispatch. Run via the workspace alias
-//! `cargo xtask <command>`.
+//! generator, third-party-notices generation, commit-trust verification, and
+//! PowerShell linting. Each command's implementation lives in its own module;
+//! this file holds only the CLI definition and dispatch. Run via the workspace
+//! alias `cargo xtask <command>`.
 
 mod manifest;
 mod powershell;
 mod signing;
+mod tpn;
 mod verify_commits;
 
 use std::path::PathBuf;
@@ -69,6 +70,13 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Regenerate THIRD_PARTY_NOTICES.txt from the dependency tree via cargo-about
+    /// (using the committed `about.toml` and `about.hbs`).
+    Tpn {
+        /// Verify the notices file is up to date without writing; exit non-zero if it would change.
+        #[arg(long)]
+        check: bool,
+    },
     /// Verify that commits in a range are cryptographically signed and carry a
     /// DCO `Signed-off-by` trailer.
     VerifyCommits {
@@ -119,6 +127,7 @@ fn run() -> Result<()> {
             signature,
         } => signing::verify(&public_key, &input, &signature)?,
         Command::Manifest { check } => manifest::run(check)?,
+        Command::Tpn { check } => tpn::run(check)?,
         Command::VerifyCommits {
             base,
             require_verified,

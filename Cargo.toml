@@ -25,6 +25,10 @@ edition = "2024"
 license = "MIT"
 repository = "https://github.com/ROCm/rocm-cli"
 rust-version = "1.96"
+# First-party crates are an application, not crates.io libraries: never publish
+# them. This also keeps them out of THIRD_PARTY_NOTICES.txt (cargo-about's
+# `private.ignore`). Members opt in with `publish.workspace = true`.
+publish = false
 
 [workspace.dependencies]
 anyhow = "1.0"
