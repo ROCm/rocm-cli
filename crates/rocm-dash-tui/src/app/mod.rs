@@ -53,6 +53,10 @@ pub struct ResolvedArgs {
     /// Which tab is active when the TUI opens. `Chat` for the chat-first launch
     /// (bare `rocm` / `rocm chat`); `Home` for the dashboard (`rocm dash`).
     pub initial_tab: ActiveTab,
+    /// Open the first-run onboarding wizard immediately on launch. Set by
+    /// `rocm bootstrap setup`, which enters the dashboard straight into the
+    /// install/adopt onboarding overlay.
+    pub start_onboarding: bool,
     /// Chat endpoint base URL, CLI-flag value already merged over config.
     pub chat_url: Option<String>,
     /// Chat model, CLI-flag value already merged over config.
@@ -1362,6 +1366,11 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     let mut state = AppState::new(connect_label, args.theme.clone());
     // Honor the chat-first vs dashboard launch choice (rocm-cli semantics).
     state.active_tab = args.initial_tab;
+    // `rocm bootstrap setup` launches the dashboard straight into the first-run
+    // onboarding wizard (install ROCm SDK / adopt an existing folder).
+    if args.start_onboarding {
+        state.onboarding = Some(crate::ui::onboarding::OnboardingState::default());
+    }
     // Serve-wizard recipe picker source (Phase 3 Wave 1), adapted by the bin.
     state.model_recipes = args.model_recipes.clone();
     // Runtime manager source (Phase 3 Wave 2), adapted by the bin.
@@ -4127,6 +4136,7 @@ mod tests {
             theme: "default-dark".into(),
             replay: None,
             initial_tab: ActiveTab::Chat,
+            start_onboarding: false,
             chat_url: None,
             chat_model: None,
             chat_auth_header: None,

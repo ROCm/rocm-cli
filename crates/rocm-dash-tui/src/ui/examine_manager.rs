@@ -205,14 +205,18 @@ mod tests {
     }
 
     #[test]
-    fn esc_dismisses_console_only_when_terminal() {
+    fn esc_closes_overlay_while_running_dismisses_when_terminal() {
+        // Running: Esc closes the whole overlay (the read-only job keeps running).
         let mut d = Some(ExamineManagerState::default());
         let mut jobs = State::default();
         on_key(&mut d, &mut jobs, key(KeyCode::Enter));
-        // Running: Esc does not dismiss.
-        on_key(&mut d, &mut jobs, key(KeyCode::Esc));
         assert!(d.as_ref().unwrap().active_job.is_some());
-        // Terminal: Esc returns to the intro card.
+        on_key(&mut d, &mut jobs, key(KeyCode::Esc));
+        assert!(d.is_none(), "Esc closes the overlay while the job runs");
+        // Terminal: Esc returns to the intro card (overlay stays open).
+        let mut d = Some(ExamineManagerState::default());
+        let mut jobs = State::default();
+        on_key(&mut d, &mut jobs, key(KeyCode::Enter));
         jobs.apply(StateEvent::JobDone {
             id: "examine".into(),
             code: 0,

@@ -12,8 +12,7 @@
 //! runs the ratatui dashboard TUI.
 //!
 //! The rest of `rocm` is synchronous; the async daemon/TUI run on a tokio
-//! runtime built here. The two ratatui majors (0.29 in `tui.rs`, 0.30 in
-//! `rocm-dash-tui`) coexist, each confined to its crate.
+//! runtime built here. The TUI lives entirely in the `rocm-dash-tui` crate.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -183,6 +182,7 @@ pub fn resolved_args(
         theme: t.theme.clone(),
         replay: None,
         initial_tab,
+        start_onboarding: false,
         chat_url: t.chat_url.clone(),
         chat_model: t.chat_model.clone(),
         chat_auth_header: t.chat_auth_header.clone(),
@@ -279,6 +279,26 @@ pub fn run_chat(chat_mock: bool) -> Result<()> {
     let args = resolved_args(&config, &paths, ActiveTab::Chat);
     let rt = build_dashboard_runtime()?;
     rt.block_on(run_async(config, paths, args, None, chat_mock))
+}
+
+/// Entry point for `rocm bootstrap setup`. Opens the dashboard straight into the
+/// first-run onboarding wizard (install ROCm SDK / adopt an existing folder).
+/// Same runtime/`run_async` path as [`run`]; the keyring lookup in
+/// `resolved_args` runs here on the synchronous thread before the runtime.
+pub fn run_bootstrap() -> Result<()> {
+    let paths = AppPaths::discover()?;
+    let config = RocmCliConfig::load(&paths)?;
+    let args = bootstrap_args(&config, &paths);
+    let rt = build_dashboard_runtime()?;
+    rt.block_on(run_async(config, paths, args, None, false))
+}
+
+/// Resolve the dashboard args for `rocm bootstrap setup`: the standard
+/// dashboard args with the first-run onboarding wizard opened on launch.
+fn bootstrap_args(config: &RocmCliConfig, paths: &AppPaths) -> ResolvedArgs {
+    let mut args = resolved_args(config, paths, ActiveTab::Home);
+    args.start_onboarding = true;
+    args
 }
 
 async fn run_async(
@@ -393,6 +413,27 @@ mod tests {
         assert_eq!(opts.services_dir, Some(p.services_dir()));
         assert_eq!(opts.persist_dir, Some(p.telemetry_state_dir()));
         assert!(!opts.enable_docker);
+    }
+
+    #[test]
+    fn bootstrap_args_open_the_onboarding_wizard() {
+        // `rocm bootstrap setup` must launch the dashboard straight into the
+        // first-run onboarding overlay (install ROCm SDK / adopt existing).
+        let args = bootstrap_args(&cfg(), &paths());
+        assert!(
+            args.start_onboarding,
+            "bootstrap must open the onboarding wizard on launch"
+        );
+        assert_eq!(args.initial_tab, ActiveTab::Home);
+        assert!(!args.chat_mock);
+        assert!(args.replay.is_none());
+    }
+
+    #[test]
+    fn resolved_args_default_does_not_open_onboarding() {
+        // Normal `rocm dash` / `rocm chat` must NOT auto-open onboarding.
+        let args = resolved_args(&cfg(), &paths(), ActiveTab::Home);
+        assert!(!args.start_onboarding);
     }
 
     #[test]

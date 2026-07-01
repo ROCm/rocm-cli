@@ -49,6 +49,14 @@ pub fn on_console_key(job_id: &str, jobs: &mut State, key: KeyEvent) -> ConsoleO
         // `q` always closes the overlay so the user is never trapped mid-job
         // (the job keeps running in the background).
         KeyCode::Char('q') => ConsoleOutcome::Closed,
+        // Esc on a still-running job leaves the overlay (the job keeps running in
+        // the background) — the conventional "get me out" key, so the user is
+        // never trapped during a long step (e.g. a managed serve readiness wait).
+        KeyCode::Esc if jobs.job(job_id).is_some_and(|j| !j.is_terminal()) => {
+            ConsoleOutcome::Closed
+        }
+        // On a finished (or vanished) job, Esc/Enter dismiss the console back to
+        // the screen body.
         KeyCode::Esc | KeyCode::Enter
             if jobs
                 .job(job_id)
@@ -124,9 +132,12 @@ pub fn draw_job_console(
         .collect();
     f.render_widget(Paragraph::new(lines).scroll(scroll), rows[1]);
 
-    // Footer: key hints (cancel only while running).
+    // Footer: key hints. While running, Esc leaves the overlay (the job keeps
+    // running in the background) and Ctrl+C cancels — advertise both so the user
+    // is never left feeling trapped during a long step (e.g. a managed serve's
+    // readiness wait).
     let hints = if matches!(job.status, JobStatus::Running) {
-        "Ctrl+C cancel · wheel / PgUp·PgDn scroll"
+        "Esc close (keeps running) · Ctrl+C cancel · wheel / PgUp·PgDn scroll"
     } else {
         "Enter/Esc close · wheel / PgUp·PgDn scroll"
     };
@@ -172,7 +183,7 @@ mod tests {
             on_console_key("j", &mut s, k(KeyCode::Char('q'))),
             ConsoleOutcome::Closed
         ));
-        // Esc on a RUNNING job is not a dismiss (Unhandled).
+        // Esc on a RUNNING job closes the overlay (job keeps running in the bg).
         let mut s2 = State::default();
         s2.apply(StateEvent::StartJob {
             id: "j".into(),
@@ -181,6 +192,11 @@ mod tests {
         });
         assert!(matches!(
             on_console_key("j", &mut s2, k(KeyCode::Esc)),
+            ConsoleOutcome::Closed
+        ));
+        // Enter on a RUNNING job stays Unhandled (avoids accidental dismissal).
+        assert!(matches!(
+            on_console_key("j", &mut s2, k(KeyCode::Enter)),
             ConsoleOutcome::Unhandled
         ));
         // Esc on a TERMINAL job dismisses.

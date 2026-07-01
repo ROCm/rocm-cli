@@ -728,7 +728,20 @@ mod tests {
     }
 
     #[test]
-    fn esc_is_ignored_while_job_is_running_then_dismisses_when_terminal() {
+    fn esc_closes_overlay_while_running_then_dismisses_when_terminal() {
+        // Running: Esc leaves the whole overlay (the launch keeps running in the
+        // background) — the user is never trapped during the readiness wait.
+        let mut wiz = Some(ServeWizardState::default());
+        let mut jobs = State::default();
+        wiz.as_mut().unwrap().model = "m".into();
+        wiz.as_mut().unwrap().field = FIELDS.iter().position(|f| *f == Field::Launch).unwrap();
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Enter));
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('y')));
+        assert!(wiz.as_ref().unwrap().active_job.is_some());
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Esc));
+        assert!(wiz.is_none(), "Esc closes the overlay even mid-job");
+
+        // Terminal: Esc dismisses the console back to the form (wizard stays open).
         let mut wiz = Some(ServeWizardState::default());
         let mut jobs = State::default();
         wiz.as_mut().unwrap().model = "m".into();
@@ -736,11 +749,6 @@ mod tests {
         on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Enter));
         on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('y')));
         let job_id = wiz.as_ref().unwrap().active_job.clone().unwrap();
-        // Job is Running: Esc must NOT dismiss the console or close the overlay.
-        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Esc));
-        assert_eq!(wiz.as_ref().unwrap().active_job.as_ref(), Some(&job_id));
-        assert!(wiz.is_some());
-        // Once terminal, Esc dismisses the console back to the form.
         jobs.apply(StateEvent::JobDone {
             id: job_id,
             code: 0,
@@ -749,7 +757,7 @@ mod tests {
         assert!(wiz.as_ref().unwrap().active_job.is_none());
         assert!(
             wiz.is_some(),
-            "dismissing the console keeps the wizard open"
+            "dismissing a finished console keeps the wizard open"
         );
     }
 

@@ -84,44 +84,7 @@ cargo test -p rocm-core examine_render
 cargo test -p rocm-core managed_sdk_probe
 cargo test -p rocm --bin rocm examine_runtime_state_reports_ambiguous_default_runtime_id
 cargo test -p rocm --bin rocm engine_runtime_selection_rejects_ambiguous_default_runtime_id
-cargo test -p rocm --bin rocm first_run_shows_dedicated_setup_screen_when_rocm_is_not_installed
-cargo test -p rocm --bin rocm onboarding_enter_requests_rocm_install_with_folder_prefix
-cargo test -p rocm --bin rocm setup_subcommands_do_not_expose_old_runtime_engine_wizard
 cargo test -p rocm --bin rocm permissions_
-```
-
-Focused TUI command navigability coverage:
-
-```bash
-cargo test -p rocm --bin rocm tui::tests:: -- --nocapture
-cargo test -p rocm tui::tests::advertised_slash_commands_ -- --nocapture
-cargo test -p rocm tui::tests::slash_subcommands_stay_on_navigable_surfaces_without_transcript_dumps -- --nocapture
-cargo test -p rocm tui::tests::slash_command_variants_stay_navigable_without_transcript_dumps -- --nocapture
-cargo test -p rocm tui::tests::slash_actions_stream_inside_active_surface_without_transcript_dump -- --nocapture
-cargo test -p rocm tui::tests::slash_first_views_hide_backend_jargon -- --nocapture
-cargo test -p rocm tui::tests::install_sdk_bad_format_uses_friendly_labels_without_backend_jargon -- --nocapture
-cargo test -p rocm tui::tests::onboarding_ctrl_c_during_install_confirms_before_cancelling -- --nocapture
-cargo test -p rocm tui::tests::automations_review_actions_without_review_show_body_guidance -- --nocapture
-cargo test -p rocm tui::tests::examine_background_completion_updates_report_without_transcript -- --nocapture
-cargo test -p rocm tui::tests::hidden_examine_refresh_does_not_block_next_prompt_commands -- --nocapture
-cargo test -p rocm tui::tests::examine_command_does_not_steal_running_workflow_screens -- --nocapture
-cargo test -p rocm tui::tests::examine_command_does_not_hide_pending_approval -- --nocapture
-cargo test -p rocm tui::tests::daemon_status_uses_background_helper_language -- --nocapture
-cargo test -p rocm tui::tests::automations_bad_watcher_and_mode_stay_screen_local -- --nocapture
-cargo test -p rocm tui::tests::services_manager_stop_requests_rocmd_approval_without_transcript -- --nocapture
-cargo test -p rocm tui::tests::services_command_restart_requests_rocmd_approval_without_transcript -- --nocapture
-cargo test -p rocm --bin rocm services_is_structured_not_freeform -- --nocapture
-cargo test -p rocm --bin rocm top_level_cli_commands_are_not_treated_as_freeform -- --nocapture
-cargo test -p rocm --bin rocm render_model_registry_text_lists_builtin_recipes -- --nocapture
-cargo test -p rocm --bin rocm plain_command_routing_distinguishes_commands_from_requests -- --nocapture
-cargo test -p rocm --bin rocm plain_structured_commands_route_to_navigable_tui_before_plan -- --nocapture
-cargo test -p rocm --bin rocm render_services_text_separates_ready_starting_and_past_attempts -- --nocapture
-cargo test -p rocm --bin rocm service_actions_require_yes_and_render_sandbox_result -- --nocapture
-cargo test -p rocm tui::tests::runtimes_import_without_args_opens_guided_form -- --nocapture
-cargo test -p rocm tui::tests::approval_card_is_arrow_key_navigable_and_scrollable -- --nocapture
-cargo test -p rocm tui::tests::typed_serve_prefills_wizard_and_start_requests_approval_without_prompt_editing -- --nocapture
-cargo test -p rocm tui::tests::explicit_foreground_serve_prefills_wizard_without_launching -- --nocapture
-cargo test -p rocm tui::tests::tui_help_teaches_engine_not_engines -- --nocapture
 ```
 
 Self-hosted GPU CI smoke is intentionally non-mutating. The MI300X job builds
@@ -424,7 +387,6 @@ cargo test -p rocm --bin rocm missing_packaged_engine_reason
 cargo test -p rocm --bin rocm model_registry
 cargo test -p rocm --bin rocm render_model_registry_text_reports_host_ram_fit
 cargo test -p rocm --bin rocm model_recipe
-cargo test -p rocm --bin rocm model_completion
 cargo test -p rocm --bin rocm logs
 cargo test -p rocm-core model_recipe
 cargo test -p rocm-core load_model_recipe_index
@@ -483,10 +445,6 @@ TUI log pagination focused tests:
 
 ```bash
 cargo test -p rocm --bin rocm logs_browser
-cargo test -p rocm --bin rocm logs_next
-cargo test -p rocm --bin rocm logs_completion_suggests_service_flag_before_service_ids
-cargo test -p rocm --bin rocm logs_tui_hides_file_locations_until_user_reveals_them
-cargo test -p rocm --bin rocm service_log_details_scroll_without_changing_selected_action
 ```
 
 After opening `/logs` or `/logs --search <query>` in the TUI, use the arrow-key
@@ -578,7 +536,6 @@ cargo test -p rocmd sandbox_tool_stop_server_reports_missing_service
 cargo test -p rocmd sandbox_tool_stop_server_updates_manifest_and_skips_current_pid
 cargo test -p rocmd sandbox_tool_notify_user_is_read_only
 cargo test -p rocmd sandbox_runner_native_fallback_records_audit
-cargo test -p rocm --bin rocm proposal_sandbox_args_support_update_check
 ```
 
 These cover the plan-listed restricted internal tool API: `check_updates`,
@@ -698,52 +655,16 @@ tests use local HTTP fixtures to prove OpenAI and Anthropic send `stream: true`
 requests and deliver the first SSE delta to the callback before the server
 closes the connection.
 
-TUI focused approval tests:
+Proposal history rendering:
 
 ```bash
-cargo test -p rocm --bin rocm onboarding_pending_approval_shows_plain_install_details
-cargo test -p rocm --bin rocm onboarding_custom_folder_approval_uses_selected_folder
-cargo test -p rocm --bin rocm onboarding_folder_rejects_system_folder
-cargo test -p rocm --bin rocm onboarding_folder_rejects_file_path
-cargo test -p rocm --bin rocm onboarding_folder_rejects_missing_parent
-cargo test -p rocm --bin rocm onboarding_install_current_step_covers_pre_pip_phases
-cargo test -p rocm --bin rocm onboarding_running_install_empty_log_uses_general_starting_text
-cargo test -p rocm --bin rocm onboarding_failed_install_shows_full_log_path_for_noisy_output
-cargo test -p rocm --bin rocm render_command_output_keeps_untruncated_output_for_full_logs
-cargo test -p rocm --bin rocm empty_enter_approves_focused_proposal
-cargo test -p rocm --bin rocm restart_proposal_approval_uses_plain_review_language
-cargo test -p rocm --bin rocm prefetch_proposal_approval_shows_plain_artifact_download_controls
-cargo test -p rocm --bin rocm driver_plan_proposal_approval_says_no_driver_install
 cargo test -p rocm --bin rocm render_automations_text_uses_plain_proposal_history
-cargo test -p rocm --bin rocm tab_cycles_and_enter_accepts_slash_arguments
-cargo test -p rocm --bin rocm approval_status_says_enter_or_y_approve
-cargo test -p rocm --bin rocm esc_rejects_focused_proposal
 ```
 
-The onboarding approval test verifies that first-run setup shows the selected
-install folder, the downloads/cache folder, TheRock release wheel source,
-package summary, and plain approve/cancel controls before installing ROCm.
-The install-step test verifies that pre-pip phases render friendly labels for
-checking ROCm packages, checking/downloading/installing Python, creating the
-Python environment, installing pip, installing ROCm packages, and the final SDK
-check.
-The folder validation tests verify that setup rejects obvious system folders,
-file paths, and folders whose parent does not exist before the installer starts.
-The noisy-failure test verifies that long setup installs still save a complete
-log under `data/logs/setup/` and show that full-log path on the failure screen.
-The command-output test verifies that command rendering keeps the raw output
-available for full logs while the transcript display remains bounded by the
-separate truncation step.
-The proposal approval tests verify that restart, artifact prefetch, and driver
-plan reviews use plain-language sections and do not expose backend watcher,
-action, tool, service id, sandbox-run, or raw internal tool names in the
-default review card.
 The plain proposal history test verifies that `/automations` and
 `rocm automations` show recent review requests with friendly action, reason,
 server/artifact details, and approve/reject controls instead of raw backend
 action or restricted-tool names.
-Enter accepts the highlighted completion first. If no completion is accepted
-and a focused approval is visible with an empty input, Enter approves it.
 
 Natural-language plan handoff tests:
 
@@ -757,7 +678,6 @@ cargo test -p rocm --bin rocm freeform_execution_validation_rejects_placeholder_
 cargo test -p rocm --bin rocm freeform_execution_header_surfaces_explicit_approval_and_tool_call
 cargo test -p rocm --bin rocm hybrid_planner_driver_action_includes_yes_for_approved_execution
 cargo test -p rocm --bin rocm render_freeform_plan_exposes_structured_tool_calls
-cargo test -p rocm --bin rocm natural_serve_command_renders_llama_plan
 cargo test -p rocm --bin rocm natural_serve_with_missing_model_does_not_focus_approval
 ```
 
@@ -798,44 +718,15 @@ sent in-process so API keys are not passed through `curl` command arguments.
 In the TUI, clearing a saved API key defaults to `Cancel`; users must move the
 highlight to `Clear API key` before Enter removes anything.
 
-Focused TUI provider-key coverage:
-
-```bash
-cargo test -p rocm --bin rocm config_clear_provider_key_requires_arrow_key_confirmation
-cargo test -p rocm --bin rocm config_provider_key_storage_failure_shows_retry_guidance
-```
-
 Update-surface report test:
 
 ```bash
 cargo test -p rocm --bin rocm render_update_text_reports_all_update_surfaces
-cargo test -p rocm --bin rocm plain_update_report_detects_status_update_available
 ```
 
 `rocm update` must report runtime checks plus CLI, engine, and model-recipe
 surfaces honestly. `rocm update --apply` remains runtime-only until production
 metadata feeds exist for the other surfaces.
-
-TUI mode-state checks:
-
-```bash
-cargo test -p rocm tui_mode
-cargo test -p rocm natural_serve_command_renders_llama_plan
-cargo test -p rocm logs_follow
-cargo test -p rocm --bin rocm advertised_slash_commands
-cargo test -p rocm --bin rocm manager_screens_page_keys_scroll_details_without_changing_selection
-cargo test -p rocm --bin rocm approve_and_reject_commands_open_review_before_mutating
-cargo test -p rocm --bin rocm slash_completion_advertises_guided_model_and_install_defaults
-```
-
-The sidebar must show the current mode (`ask`, `act`, `serve`, `logs`, or
-`automations`), mode changes must not launch commands in tests, and `/logs
-follow [query]` must refresh the current log browser without creating first-run
-log directories. Advertised TUI commands should keep arrow-key focus on the
-visible screen even after accidental prompt typing, manager PageUp/PageDown
-should scroll details without changing the highlighted row, and automation
-review approve/reject commands should open the visible review card before
-mutating proposal status.
 
 Model recipe engine metadata checks:
 
@@ -928,10 +819,6 @@ cargo test -p rocmd local_webhook_cache_warm_rejects_other_cache_events
 cargo test -p rocmd cache_warm_propose_mode_queues_prefetch_proposal
 cargo test -p rocmd cache_warm_unknown_artifact_does_not_queue_proposal
 cargo test -p rocmd cache_warm_contained_mode_still_requires_reviewed_source_policy
-cargo test -p rocm --bin rocm proposal_sandbox_args_support_cache_warm_prefetch
-cargo test -p rocm --bin rocm proposal_sandbox_args_support_cache_warm_prefetch_source_policy
-cargo test -p rocm --bin rocm proposal_sandbox_args_reject_cache_warm_download_without_max_bytes
-cargo test -p rocm --bin rocm proposal_edit_updates_prefetch_source_policy
 ```
 
 The `cache-warm` watcher accepts exactly `cache.warm`, requires
@@ -952,7 +839,6 @@ cargo test -p rocmd driver_upgrade_contained_mode_runs_restricted_driver_plan
 cargo test -p rocmd driver_upgrade_contained_mode_requires_restricted_driver_plan_tool
 cargo test -p rocmd sandbox_driver_plan_value_is_read_only_and_preserves_output
 cargo test -p rocm-core builtin_watchers_include_reviewed_driver_upgrade
-cargo test -p rocm --bin rocm proposal_sandbox_args_support_driver_upgrade_plan
 ```
 
 The `driver-upgrade` watcher accepts exactly `update.available` with
