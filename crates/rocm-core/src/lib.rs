@@ -3832,18 +3832,44 @@ pub struct RocmCliConfig {
 
 fn default_dashboard_socket() -> String {
     // Choose a socket location whose *parent* directory is always user-owned so
-    // that run_unix can tighten it to 0o700 without EPERM. Precedence:
-    //
-    // 1. $XDG_RUNTIME_DIR  — already mode 0700 on systemd systems, ideal.
-    // 2. $HOME/.rocm/data/telemetry — standard per-user data dir.
-    // 3. temp_dir()/rocm-<user> — user-named subdir so the parent is
-    //    something we create and own, not /tmp itself.
+    // that run_unix can tighten it to 0o700 without EPERM. See
+    // `dashboard_socket_path` for the precedence. This resolver is mirrored in
+    // `rocm-dash-core` so the canonical `rocm` config and a standalone
+    // `rocm-dash` config resolve to the same place; keep the two in sync.
+    let path = dashboard_socket_path(
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        std::env::var_os("HOME"),
+        // An empty `USER` must fall through to `LOGNAME`, not short-circuit it.
+        std::env::var("USER")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| std::env::var("LOGNAME").ok().filter(|v| !v.is_empty())),
+        std::env::temp_dir(),
+    );
+    format!("unix:{}", path.display())
+}
+
+/// Pure core of [`default_dashboard_socket`]: resolve the socket path from
+/// explicit env inputs so the precedence is testable without mutating
+/// process-global env vars (unsafe and racy under parallel tests in edition
+/// 2024). Precedence:
+///
+/// 1. `$XDG_RUNTIME_DIR` — already mode `0700` on systemd systems, ideal.
+/// 2. `$HOME/.rocm/data/telemetry` — standard per-user data dir.
+/// 3. `temp_dir()/rocm-<user>` — user-named subdir so the parent is something we
+///    create and own, not `/tmp` itself.
+fn dashboard_socket_path(
+    xdg_runtime_dir: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    user: Option<String>,
+    temp_dir: std::path::PathBuf,
+) -> std::path::PathBuf {
     use std::path::PathBuf;
-    let path = std::env::var_os("XDG_RUNTIME_DIR")
+    xdg_runtime_dir
         .filter(|v| !v.is_empty())
         .map(|d| PathBuf::from(d).join("rocmdashd.sock"))
         .or_else(|| {
-            std::env::var_os("HOME").filter(|v| !v.is_empty()).map(|h| {
+            home.filter(|v| !v.is_empty()).map(|h| {
                 PathBuf::from(h)
                     .join(".rocm")
                     .join("data")
@@ -3852,13 +3878,10 @@ fn default_dashboard_socket() -> String {
             })
         })
         .unwrap_or_else(|| {
-            let raw = std::env::var("USER")
-                .or_else(|_| std::env::var("LOGNAME"))
-                .unwrap_or_else(|_| "user".to_owned());
-            // Sanitize: keep only alphanumeric, hyphen, and underscore so
-            // that path separators or '..' in a user-controlled env var
-            // cannot escape the intended subdirectory.
-            let user: String = raw
+            let raw = user.unwrap_or_else(|| "user".to_owned());
+            // Sanitize: keep only alphanumeric, hyphen, and underscore so a path
+            // separator or `..` in the env var cannot escape the subdirectory.
+            let sanitized: String = raw
                 .chars()
                 .map(|c| {
                     if c.is_alphanumeric() || c == '-' || c == '_' {
@@ -3868,16 +3891,15 @@ fn default_dashboard_socket() -> String {
                     }
                 })
                 .collect();
-            let user = if user.is_empty() {
+            let sanitized = if sanitized.is_empty() {
                 "user".to_owned()
             } else {
-                user
+                sanitized
             };
-            std::env::temp_dir()
-                .join(format!("rocm-{user}"))
+            temp_dir
+                .join(format!("rocm-{sanitized}"))
                 .join("rocmdashd.sock")
-        });
-    format!("unix:{}", path.display())
+        })
 }
 
 fn default_dashboard_listen() -> String {
@@ -5997,6 +6019,61 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
+    use std::path::PathBuf;
+
+    // The socket-path precedence is mirrored in `rocm-dash-core`; these tests
+    // mirror the ones there so a divergence in either crate is caught.
+
+    #[test]
+    fn dashboard_socket_path_prefers_xdg_runtime_dir() {
+        // Tier 1: $XDG_RUNTIME_DIR is already mode 0700 on systemd systems, so it
+        // must win over $HOME and the temp dir.
+        let path = dashboard_socket_path(
+            Some("/run/user/1000".into()),
+            Some("/home/alice".into()),
+            Some("alice".to_owned()),
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(path, PathBuf::from("/run/user/1000/rocmdashd.sock"));
+    }
+
+    #[test]
+    fn dashboard_socket_path_falls_back_to_home_then_temp() {
+        // Tier 2: no XDG → per-user data dir under $HOME.
+        let path = dashboard_socket_path(
+            None,
+            Some("/home/alice".into()),
+            Some("alice".to_owned()),
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(
+            path,
+            PathBuf::from("/home/alice/.rocm/data/telemetry/rocmdashd.sock")
+        );
+
+        // Tier 3: no XDG and no HOME → user-named subdir of the temp dir, never
+        // the bare temp dir itself.
+        let path =
+            dashboard_socket_path(None, None, Some("alice".to_owned()), PathBuf::from("/tmp"));
+        assert_eq!(path, PathBuf::from("/tmp/rocm-alice/rocmdashd.sock"));
+    }
+
+    #[test]
+    fn dashboard_socket_path_sanitizes_user_and_skips_empty_env() {
+        // An empty XDG/HOME value is treated as unset (falls through), and a user
+        // name with path separators cannot escape the intended subdirectory.
+        let path = dashboard_socket_path(
+            Some("".into()),
+            Some("".into()),
+            Some("../../etc".to_owned()),
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(path, PathBuf::from("/tmp/rocm-______etc/rocmdashd.sock"));
+
+        // No user name at all still yields a valid per-user subdir.
+        let path = dashboard_socket_path(None, None, None, PathBuf::from("/tmp"));
+        assert_eq!(path, PathBuf::from("/tmp/rocm-user/rocmdashd.sock"));
+    }
 
     #[test]
     fn openai_models_endpoint_has_model_checks_loaded_model_ids() -> Result<()> {

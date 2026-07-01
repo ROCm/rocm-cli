@@ -118,9 +118,11 @@ fn default_socket() -> String {
     let path = socket_path(
         std::env::var_os("XDG_RUNTIME_DIR"),
         std::env::var_os("HOME"),
+        // An empty `USER` must fall through to `LOGNAME`, not short-circuit it.
         std::env::var("USER")
-            .or_else(|_| std::env::var("LOGNAME"))
-            .ok(),
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| std::env::var("LOGNAME").ok().filter(|v| !v.is_empty())),
         std::env::temp_dir(),
     );
     format!("unix:{}", path.display())
