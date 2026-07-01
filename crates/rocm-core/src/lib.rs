@@ -3836,7 +3836,7 @@ fn default_dashboard_socket() -> String {
     //
     // 1. $XDG_RUNTIME_DIR  — already mode 0700 on systemd systems, ideal.
     // 2. $HOME/.rocm/data/telemetry — standard per-user data dir.
-    // 3. temp_dir()/rocmdashd-<user> — user-named subdir so the parent is
+    // 3. temp_dir()/rocm-<user> — user-named subdir so the parent is
     //    something we create and own, not /tmp itself.
     use std::path::PathBuf;
     let path = std::env::var_os("XDG_RUNTIME_DIR")
@@ -3874,7 +3874,7 @@ fn default_dashboard_socket() -> String {
                 user
             };
             std::env::temp_dir()
-                .join(format!("rocmdashd-{user}"))
+                .join(format!("rocm-{user}"))
                 .join("rocmdashd.sock")
         });
     format!("unix:{}", path.display())
