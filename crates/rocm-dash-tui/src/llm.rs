@@ -17,7 +17,9 @@ use std::time::Duration;
 /// The `/v1` suffix is required: the Rig OpenAI client appends `chat/completions`
 /// directly to `base_url` (`base_url + "/" + path`), so a base without `/v1`
 /// POSTs to `/chat/completions` and a vLLM/Lemonade server answers `404 Not
-/// Found`. Mirrors the `/v1`-suffixed `VLLM_ENDPOINT` / `LEMONADE_ENDPOINT`.
+/// Found`. Matches the `/v1` convention of `VLLM_ENDPOINT` / `LEMONADE_ENDPOINT`
+/// (those use `localhost`; `127.0.0.1` is the unambiguous IPv4 loopback and
+/// matches the live endpoint asserted in `agent.rs`).
 pub const DEFAULT_CHAT_BASE_URL: &str = "http://127.0.0.1:8000/v1";
 
 /// Fallback model name when none is configured. Many local endpoints ignore
@@ -266,6 +268,16 @@ mod tests {
     fn probed_default_used_when_nothing_configured_but_reachable() {
         let r = resolve_llm_config(None, None, None, None, None, None, None, true).unwrap();
         assert_eq!(r.base_url, DEFAULT_CHAT_BASE_URL);
+        // Regression guard for the 404 bug: Rig appends `chat/completions` to
+        // `base_url`, so the probed default must resolve to a `/v1` base or every
+        // completion POSTs to `/chat/completions` and the server returns 404.
+        // Asserting the *resolved* value (not the constant) fails on a revert of
+        // the suffix rather than being tautological.
+        assert!(
+            r.base_url.ends_with("/v1"),
+            "probed default base_url must end in /v1, got {}",
+            r.base_url
+        );
         assert_eq!(r.model, DEFAULT_CHAT_MODEL);
         assert_eq!(r.api_key, None);
     }
