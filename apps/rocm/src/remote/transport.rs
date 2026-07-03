@@ -1,3 +1,7 @@
+// Copyright © Advanced Micro Devices, Inc., or its affiliates.
+//
+// SPDX-License-Identifier: MIT
+
 //! Transport abstraction for reaching a remote GPU host.
 //!
 //! `rocm remote` needs three things from a remote host: run a command and read

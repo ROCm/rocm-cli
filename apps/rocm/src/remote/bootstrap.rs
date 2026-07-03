@@ -1,3 +1,7 @@
+// Copyright © Advanced Micro Devices, Inc., or its affiliates.
+//
+// SPDX-License-Identifier: MIT
+
 //! Ensuring a remote host is ready to serve: probe for the `rocm` CLI and ROCm,
 //! and push the CLI if it is missing.
 //!

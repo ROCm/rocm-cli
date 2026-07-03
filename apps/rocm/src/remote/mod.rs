@@ -1,3 +1,7 @@
+// Copyright © Advanced Micro Devices, Inc., or its affiliates.
+//
+// SPDX-License-Identifier: MIT
+
 //! `rocm remote` — bring up a managed model server on a remote GPU host and make
 //! it callable from this machine.
 //!
