@@ -11,39 +11,12 @@
 //! Why shell out to `ssh` instead of a Rust SSH crate: it reuses the user's
 //! existing keys/agent/`~/.ssh/config` and connection multiplexing for free,
 //! keeps this code synchronous (the surrounding command handlers are sync), and
-//! makes the port-forward a plain child process that plugs into the existing
-//! detach + PID-tracking machinery the managed-service supervisor already uses.
+//! makes the port-forward a plain detached child process tracked by PID — the
+//! same detach + liveness machinery the managed-service supervisor already uses.
 
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
-
-/// A running local port-forward. Dropping it tears the forward down by killing
-/// the underlying `ssh -N -L` child.
-#[derive(Debug)]
-pub struct ForwardGuard {
-    child: Child,
-}
-
-impl ForwardGuard {
-    /// Block until the forward's `ssh` child exits (e.g. the connection drops or
-    /// the process group receives SIGINT). Used to hold a foreground session
-    /// open until the user interrupts it.
-    pub fn wait(&mut self) -> Result<()> {
-        self.child
-            .wait()
-            .context("failed while waiting on the ssh port-forward")?;
-        Ok(())
-    }
-}
-
-impl Drop for ForwardGuard {
-    fn drop(&mut self) {
-        // Best-effort teardown for the foreground path (Ctrl-C / normal return).
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
 
 /// Captured result of running a command on the remote host. Distinguishes a
 /// clean-but-non-zero exit (e.g. `rocm --version` when the CLI is absent) from a
@@ -84,12 +57,18 @@ pub trait Transport {
     /// Copy a local file to `remote_path` on the host.
     fn push_file(&self, local_path: &std::path::Path, remote_path: &str) -> Result<()>;
 
-    /// Open a local port-forward: `127.0.0.1:local_port` on this machine is
-    /// forwarded to `remote_host:remote_port` as seen from the remote side
-    /// (typically `127.0.0.1:<service port>`). Returns a guard that keeps the
-    /// forward alive until dropped.
-    fn forward(&self, local_port: u16, remote_host: &str, remote_port: u16)
-    -> Result<ForwardGuard>;
+    /// Open a **detached** local port-forward: `127.0.0.1:local_port` on this
+    /// machine is forwarded to `remote_host:remote_port` as seen from the remote
+    /// side (typically `127.0.0.1:<service port>`). The forward runs in its own
+    /// detached process that survives this command exiting; the returned PID is
+    /// recorded so the session can later be checked for liveness and torn down.
+    /// Killing the PID closes the forward.
+    fn open_detached_forward(
+        &self,
+        local_port: u16,
+        remote_host: &str,
+        remote_port: u16,
+    ) -> Result<u32>;
 }
 
 /// SSH-backed transport that shells out to the system `ssh`/`scp`.
@@ -141,11 +120,33 @@ impl SshTransport {
         args
     }
 
-    /// Argument vector for the port-forward child (excludes the `ssh` program
-    /// name). `-N` = no remote command, `-T` = no pty; the process stays alive
-    /// holding the forward. Split out for unit testing.
+    /// Argument vector for the detached port-forward child (excludes the `ssh`
+    /// program name). `-N` = no remote command, `-T` = no pty.
+    ///
+    /// Unlike the exec path this uses **`ControlMaster=no`** — a dedicated
+    /// connection, not a shared/persisted master — so that killing this process
+    /// deterministically closes the forward (a persisted master could otherwise
+    /// outlive the PID). `ExitOnForwardFailure=yes` makes a failed bind exit
+    /// instead of silently staying up with no forward, and `ServerAliveInterval`
+    /// lets a dropped link terminate the process rather than hang. Split out for
+    /// unit testing.
     fn forward_argv(&self, local_port: u16, remote_host: &str, remote_port: u16) -> Vec<String> {
-        let mut args = self.base_ssh_args();
+        let mut args = vec![
+            "-o".to_owned(),
+            "BatchMode=yes".to_owned(),
+            "-o".to_owned(),
+            "ConnectTimeout=10".to_owned(),
+            "-o".to_owned(),
+            "ControlMaster=no".to_owned(),
+            "-o".to_owned(),
+            "ExitOnForwardFailure=yes".to_owned(),
+            "-o".to_owned(),
+            "ServerAliveInterval=15".to_owned(),
+        ];
+        if let Some(port) = self.port {
+            args.push("-p".to_owned());
+            args.push(port.to_string());
+        }
         args.push("-N".to_owned());
         args.push("-T".to_owned());
         args.push("-L".to_owned());
@@ -215,23 +216,40 @@ impl Transport for SshTransport {
         Ok(())
     }
 
-    fn forward(
+    fn open_detached_forward(
         &self,
         local_port: u16,
         remote_host: &str,
         remote_port: u16,
-    ) -> Result<ForwardGuard> {
-        let child = Command::new("ssh")
-            .args(self.forward_argv(local_port, remote_host, remote_port))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| {
-                format!("failed to launch ssh port-forward to {}", self.destination)
-            })?;
-        Ok(ForwardGuard { child })
+    ) -> Result<u32> {
+        let argv = self.forward_argv(local_port, remote_host, remote_port);
+        spawn_detached_ssh(&argv)
+            .with_context(|| format!("failed to launch ssh port-forward to {}", self.destination))
     }
+}
+
+/// Spawn `ssh <argv>` as a detached process (its own session/process group) so
+/// it survives the parent command exiting, and return its PID. Mirrors the
+/// managed-service supervisor's platform-split detach.
+#[cfg(not(windows))]
+fn spawn_detached_ssh(argv: &[String]) -> Result<u32> {
+    let mut command = Command::new("ssh");
+    command
+        .args(argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    rocm_core::detach_command_session(&mut command);
+    let child = command.spawn().context("failed to spawn detached ssh")?;
+    // Intentionally do not hold the Child handle: on Unix, dropping it does not
+    // kill the process, and the setsid detach keeps it running past our exit.
+    Ok(child.id())
+}
+
+#[cfg(windows)]
+fn spawn_detached_ssh(argv: &[String]) -> Result<u32> {
+    let program = std::path::Path::new("ssh");
+    rocm_core::spawn_detached_no_inherit(program, argv, &[]).context("failed to spawn detached ssh")
 }
 
 #[cfg(test)]
@@ -259,13 +277,27 @@ mod tests {
     #[test]
     fn forward_argv_maps_loopback_local_to_remote() {
         let t = SshTransport::new("gpubox", None);
-        let argv = t.forward_argv(11435, "127.0.0.1", 11435);
+        let argv = t.forward_argv(8001, "127.0.0.1", 11435);
         assert!(argv.contains(&"-N".to_owned()));
         assert!(
             argv.windows(2)
-                .any(|w| { w[0] == "-L" && w[1] == "127.0.0.1:11435:127.0.0.1:11435" })
+                .any(|w| { w[0] == "-L" && w[1] == "127.0.0.1:8001:127.0.0.1:11435" })
         );
         assert_eq!(argv.last().unwrap(), "gpubox");
+    }
+
+    #[test]
+    fn forward_argv_uses_dedicated_connection_for_deterministic_teardown() {
+        // ControlMaster=no ensures killing the forward's PID actually closes it
+        // (a shared/persisted master could outlive the process).
+        let t = SshTransport::new("gpubox", None);
+        let argv = t.forward_argv(8001, "127.0.0.1", 11435);
+        assert!(argv.windows(2).any(|w| w == ["-o", "ControlMaster=no"]));
+        assert!(
+            argv.windows(2)
+                .any(|w| w == ["-o", "ExitOnForwardFailure=yes"])
+        );
+        assert!(!argv.iter().any(|a| a.starts_with("ControlPersist")));
     }
 
     #[test]

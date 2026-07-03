@@ -90,7 +90,9 @@ pub fn ensure_ready(transport: &dyn Transport) -> Result<RemoteCli> {
     }
 
     // CLI absent: push the local binary.
+    println!("  remote rocm: not found — installing the local rocm binary...");
     push_local_cli(transport)?;
+    println!("  remote rocm: installed to {REMOTE_CLI_PATH}");
     Ok(RemoteCli {
         invocation: REMOTE_CLI_PATH.to_owned(),
     })
@@ -100,6 +102,11 @@ pub fn ensure_ready(transport: &dyn Transport) -> Result<RemoteCli> {
 fn push_local_cli(transport: &dyn Transport) -> Result<()> {
     let local_exe = std::env::current_exe()
         .context("failed to resolve the local rocm executable to push to the remote")?;
+    let size_hint = std::fs::metadata(&local_exe)
+        .ok()
+        .map(|m| format!(" (~{} MB)", m.len() / 1_000_000))
+        .unwrap_or_default();
+    println!("  copying {}{size_hint} ...", local_exe.display());
 
     transport
         .run("mkdir -p \"$HOME/.local/bin\"")
@@ -186,12 +193,12 @@ mod tests {
             self.pushed.borrow_mut().push(remote_path.to_owned());
             Ok(())
         }
-        fn forward(
+        fn open_detached_forward(
             &self,
             _local_port: u16,
             _remote_host: &str,
             _remote_port: u16,
-        ) -> Result<super::super::transport::ForwardGuard> {
+        ) -> Result<u32> {
             unreachable!("bootstrap tests do not forward")
         }
     }

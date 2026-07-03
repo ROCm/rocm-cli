@@ -847,6 +847,17 @@ impl AppPaths {
         self.data_dir.join("services")
     }
 
+    /// Directory holding one JSON record per `rocm remote` serving session.
+    pub fn remote_sessions_dir(&self) -> PathBuf {
+        self.data_dir.join("remote-sessions")
+    }
+
+    /// Path to a single remote-session record.
+    pub fn remote_session_path(&self, session_id: &str) -> PathBuf {
+        self.remote_sessions_dir()
+            .join(format!("{session_id}.json"))
+    }
+
     pub fn audit_dir(&self) -> PathBuf {
         self.data_dir.join("audit")
     }
@@ -5780,6 +5791,122 @@ impl ManagedServiceRecord {
         .with_context(|| format!("failed to write {}", host_record.manifest_path.display()))?;
         Ok(())
     }
+}
+
+/// One `rocm remote` serving session.
+///
+/// A managed server on a remote host plus the local loopback tunnel that reaches
+/// it. Persisted as one JSON file per session under
+/// [`AppPaths::remote_sessions_dir`], mirroring [`ManagedServiceRecord`].
+///
+/// The record captures enough to reconcile two independent lifecycles later:
+/// the remote server (via `remote_service_id` over SSH) and the local tunnel
+/// (via `tunnel_pid`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteSessionRecord {
+    pub session_id: String,
+    /// SSH destination as given on the command line (`user@host` or alias).
+    pub host: String,
+    #[serde(default)]
+    pub ssh_port: Option<u16>,
+    pub model: String,
+    /// Service id of the managed server on the remote (`rocm services` there).
+    pub remote_service_id: String,
+    /// How to invoke `rocm` on the remote (`"rocm"` if on PATH, or an explicit
+    /// path like `~/.local/bin/rocm` when we pushed it — a non-interactive SSH
+    /// shell may not have `~/.local/bin` on PATH, so the exact form is stored).
+    pub remote_cli: String,
+    /// Port the server listens on, on the remote side.
+    pub remote_port: u16,
+    /// Loopback port on this machine that forwards to the remote server.
+    pub local_port: u16,
+    /// OpenAI-compatible base URL clients use locally.
+    pub base_url: String,
+    /// PID of the local `ssh -L` process holding the forward open.
+    pub tunnel_pid: u32,
+    /// Transport backing the session (`"ssh"` today; `"mesh"` later).
+    pub transport: String,
+    pub created_at_unix_ms: u128,
+}
+
+impl RemoteSessionRecord {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        session_id: impl Into<String>,
+        host: impl Into<String>,
+        ssh_port: Option<u16>,
+        model: impl Into<String>,
+        remote_service_id: impl Into<String>,
+        remote_cli: impl Into<String>,
+        remote_port: u16,
+        local_port: u16,
+        tunnel_pid: u32,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            host: host.into(),
+            ssh_port,
+            model: model.into(),
+            remote_service_id: remote_service_id.into(),
+            remote_cli: remote_cli.into(),
+            remote_port,
+            local_port,
+            base_url: format!("{}/v1", format_http_base_url("127.0.0.1", local_port)),
+            tunnel_pid,
+            transport: "ssh".to_owned(),
+            created_at_unix_ms: unix_time_millis(),
+        }
+    }
+
+    /// Persist this record as `<remote_sessions_dir>/<session_id>.json`.
+    pub fn write(&self, paths: &AppPaths) -> Result<()> {
+        let path = paths.remote_session_path(&self.session_id);
+        let parent = path
+            .parent()
+            .context("remote session path must have a parent directory")?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(self).context("failed to serialize remote session record")?,
+        )
+        .with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Delete this session's record file. Missing file is not an error.
+    pub fn remove(paths: &AppPaths, session_id: &str) -> Result<()> {
+        let path = paths.remote_session_path(session_id);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
+        }
+    }
+}
+
+/// Load all remote-session records, newest first. Unreadable/foreign files are
+/// skipped rather than failing the whole listing.
+pub fn load_remote_sessions(paths: &AppPaths) -> Result<Vec<RemoteSessionRecord>> {
+    let dir = paths.remote_sessions_dir();
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut records = Vec::new();
+    for entry in fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes =
+            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        if let Ok(record) = serde_json::from_slice::<RemoteSessionRecord>(&bytes) {
+            records.push(record);
+        }
+    }
+    records.sort_by_key(|record| std::cmp::Reverse(record.created_at_unix_ms));
+    Ok(records)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
