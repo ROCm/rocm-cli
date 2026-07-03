@@ -9,6 +9,7 @@ mod dash;
 mod dash_seam;
 mod provider_keys;
 mod providers;
+mod remote;
 mod serve_summary;
 mod therock;
 mod uninstall;
@@ -331,6 +332,11 @@ rocm serve qwen2.5-7b-instruct --verbose --device gpu_required")]
         #[command(subcommand)]
         command: Option<ServicesCommand>,
     },
+    /// Serve a model on a remote GPU host and forward it to this machine.
+    Remote {
+        #[command(subcommand)]
+        command: remote::RemoteCommand,
+    },
     /// Manage optional background checks and review requests.
     Automations {
         #[command(subcommand)]
@@ -602,6 +608,9 @@ enum ServicesCommand {
         /// Include failed, stopped, and old service records.
         #[arg(short, long)]
         all: bool,
+        /// Emit the machine-readable service records as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Show logs for a local model server.
     Logs {
@@ -1505,6 +1514,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         }),
         Some(Command::Comfyui { command }) => comfyui(command),
         Some(Command::Services { command }) => services(command),
+        Some(Command::Remote { command }) => remote::remote(command),
         Some(Command::Automations { command }) => automations(command),
         Some(Command::Config { command }) => config(command),
         Some(Command::Logs {
@@ -4444,9 +4454,20 @@ fn run_foreground_service(
 
 fn services(command: Option<ServicesCommand>) -> Result<()> {
     let paths = AppPaths::discover()?;
-    match command.unwrap_or(ServicesCommand::List { all: false }) {
-        ServicesCommand::List { all } => {
-            print!("{}", render_services_text(&paths, all)?);
+    match command.unwrap_or(ServicesCommand::List {
+        all: false,
+        json: false,
+    }) {
+        ServicesCommand::List { all, json } => {
+            if json {
+                let records = load_managed_services(&paths)?
+                    .into_iter()
+                    .filter(|record| all || managed_service_is_live(record))
+                    .collect::<Vec<_>>();
+                println!("{}", serde_json::to_string_pretty(&records)?);
+            } else {
+                print!("{}", render_services_text(&paths, all)?);
+            }
             Ok(())
         }
         ServicesCommand::Logs { service_id } => {
@@ -15446,6 +15467,7 @@ fn treat_as_natural_language(args: &[String]) -> bool {
         "comfyui",
         "comfy",
         "services",
+        "remote",
         "automations",
         "config",
         "logs",
@@ -16244,6 +16266,21 @@ mod tests {
         assert!(structured.approve);
         assert!(!treat_as_natural_language(&structured.request_args));
         assert!(!should_treat_as_freeform(&structured));
+    }
+
+    #[test]
+    fn remote_subcommand_routes_to_clap_not_the_planner() {
+        // `rocm remote serve …` must reach the structured command, not be
+        // swallowed by the natural-language planner. Guards the STRUCTURED
+        // allowlist against dropping `remote`.
+        let invocation = parse_freeform_invocation(&[
+            "remote".to_owned(),
+            "serve".to_owned(),
+            "gpu-box".to_owned(),
+            "qwen2.5-7b-instruct".to_owned(),
+        ]);
+        assert!(!treat_as_natural_language(&invocation.request_args));
+        assert!(!should_treat_as_freeform(&invocation));
     }
 
     #[test]
@@ -19060,6 +19097,56 @@ install therock";
         assert!(all.contains("- svc-failed"));
         assert!(all.contains("  restart: rocm services restart svc-failed --yes"));
         assert!(!rendered.contains("running servers"));
+        Ok(())
+    }
+
+    #[test]
+    fn services_list_json_round_trips_records() -> Result<()> {
+        // `rocm services list --json` is the machine-readable source of truth
+        // that `rocm remote` reconciliation reads over SSH. Guard that the
+        // emitted JSON deserializes back into ManagedServiceRecord with the
+        // fields consumers depend on (service_id, endpoint_url, port, status).
+        let (root, paths) = test_paths("services-list-json");
+        paths.ensure()?;
+        let current_pid = std::process::id();
+        for (service_id, status, port) in [
+            ("svc-a", "ready", 11440_u16),
+            ("svc-b", "failed", 11441_u16),
+        ] {
+            let mut record = ManagedServiceRecord::new(
+                &paths,
+                service_id,
+                "pytorch",
+                "qwen",
+                "Qwen/Qwen3.5",
+                "127.0.0.1",
+                port,
+                "managed",
+                current_pid,
+                Some("therock-release".to_owned()),
+                None,
+                Some("gpu_required".to_owned()),
+            );
+            record.status = status.to_owned();
+            record.write()?;
+        }
+
+        // Mirror the handler's `--json --all` path: serialize every record.
+        let records = load_managed_services(&paths)?;
+        let json = serde_json::to_string_pretty(&records)?;
+        let parsed: Vec<ManagedServiceRecord> = serde_json::from_str(&json)?;
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(parsed.len(), 2);
+        let a = parsed
+            .iter()
+            .find(|r| r.service_id == "svc-a")
+            .expect("svc-a present in JSON");
+        assert_eq!(a.port, 11440);
+        assert_eq!(a.engine, "pytorch");
+        assert!(!a.status.is_empty());
+        assert!(a.endpoint_url.contains("11440"));
+        assert!(parsed.iter().any(|r| r.service_id == "svc-b"));
         Ok(())
     }
 
