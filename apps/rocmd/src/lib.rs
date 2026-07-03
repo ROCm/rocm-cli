@@ -1383,11 +1383,6 @@ fn bridge_engine_inventory() -> Vec<CodexBridgeEngine> {
 
 const fn rocmd_engine_inventory() -> &'static [(&'static str, &'static str)] {
     &[
-        ("pytorch", "default local serving engine"),
-        (
-            "llama.cpp",
-            "GGUF serving with ROCm GPU required by rocm-cli",
-        ),
         (
             "lemonade",
             "embedded Lemonade server with ROCm llama.cpp backend",
@@ -1395,14 +1390,6 @@ const fn rocmd_engine_inventory() -> &'static [(&'static str, &'static str)] {
         (
             "vllm",
             "Linux/WSL ROCm GPU serving engine through external vLLM",
-        ),
-        (
-            "sglang",
-            "Linux/WSL ROCm GPU serving engine through external SGLang",
-        ),
-        (
-            "atom",
-            "Linux/WSL ROCm GPU serving engine through external ATOM Python",
         ),
     ]
 }
@@ -5288,11 +5275,11 @@ mod tests {
         let plugin_dir = paths.data_dir.join("engines").join("plugins");
         fs::create_dir_all(&plugin_dir)?;
         let plugin_path = plugin_dir.join(
-            rocm_engine_protocol::platform_engine_plugin_binary_name("pytorch"),
+            rocm_engine_protocol::platform_engine_plugin_binary_name("vllm"),
         );
         fs::write(&plugin_path, "plugin")?;
 
-        let discovered = find_engine_plugin_binary("pytorch", engine_plugin_dirs(&paths))?;
+        let discovered = find_engine_plugin_binary("vllm", engine_plugin_dirs(&paths))?;
         fs::remove_dir_all(root).ok();
 
         assert_eq!(discovered, Some(plugin_path));
@@ -5331,7 +5318,7 @@ mod tests {
             "supervise",
             "svc",
             "--engine",
-            "pytorch",
+            "vllm",
             "--model-ref",
             "qwen",
             "--canonical-model-id",
@@ -5848,7 +5835,7 @@ mod tests {
         let mut failed = ManagedServiceRecord::new(
             &paths,
             "svc-failed",
-            "pytorch",
+            "vllm",
             "qwen",
             "Qwen/Qwen3.5",
             "127.0.0.1",
@@ -6095,7 +6082,7 @@ mod tests {
         let mut record = ManagedServiceRecord::new(
             &paths,
             "svc-hot",
-            "llama.cpp",
+            "vllm",
             "tiny",
             "Tiny/Test",
             "127.0.0.1",
@@ -6163,7 +6150,7 @@ mod tests {
         let mut record = ManagedServiceRecord::new(
             &paths,
             "svc-hot",
-            "pytorch",
+            "vllm",
             "qwen",
             "Qwen/Test",
             "127.0.0.1",
@@ -6250,7 +6237,7 @@ mod tests {
             let mut record = ManagedServiceRecord::new(
                 &paths,
                 service_id,
-                "pytorch",
+                "vllm",
                 "qwen",
                 "Qwen/Test",
                 "127.0.0.1",
@@ -6300,7 +6287,7 @@ mod tests {
         let mut record = ManagedServiceRecord::new(
             &paths,
             "svc-hot",
-            "llama.cpp",
+            "vllm",
             "tiny",
             "Tiny/Test",
             "127.0.0.1",
@@ -6743,7 +6730,7 @@ mod tests {
         let mut failed = ManagedServiceRecord::new(
             &paths,
             "svc-failed",
-            "pytorch",
+            "vllm",
             "qwen",
             "Qwen/Qwen3.5",
             "127.0.0.1",
@@ -6795,7 +6782,7 @@ mod tests {
         let mut healthy = ManagedServiceRecord::new(
             &paths,
             "svc-healthy",
-            "pytorch",
+            "vllm",
             "qwen",
             "Qwen/Qwen3.5",
             "127.0.0.1",
@@ -6906,7 +6893,7 @@ mod tests {
         let mut record = ManagedServiceRecord::new(
             &paths,
             "svc-stale",
-            "pytorch",
+            "vllm",
             "qwen",
             "Qwen/Qwen3.5",
             "127.0.0.1",
@@ -6955,7 +6942,7 @@ mod tests {
         let mut failed = ManagedServiceRecord::new(
             &paths,
             "svc-failed",
-            "pytorch",
+            "vllm",
             "qwen",
             "Qwen/Qwen3.5",
             "127.0.0.1",
@@ -6983,7 +6970,7 @@ mod tests {
         let mut stale = ManagedServiceRecord::new(
             &paths,
             "svc-starting",
-            "pytorch",
+            "vllm",
             "qwen",
             "Qwen/Qwen3.5",
             "127.0.0.1",
@@ -7059,7 +7046,7 @@ mod tests {
         let mut record = ManagedServiceRecord::new(
             &paths,
             "svc-1",
-            "pytorch",
+            "vllm",
             "qwen",
             "Qwen/Qwen3.5",
             "127.0.0.1",
@@ -7521,7 +7508,7 @@ mod tests {
         let record = ManagedServiceRecord::new(
             &paths,
             "svc-1",
-            "pytorch",
+            "vllm",
             "qwen",
             "Qwen/Qwen3.5",
             "127.0.0.1",
@@ -7674,7 +7661,7 @@ mod tests {
         let mut record = ManagedServiceRecord::new(
             &paths,
             "svc-current",
-            "pytorch",
+            "vllm",
             "qwen",
             "Qwen/Qwen3.5",
             "127.0.0.1",
@@ -7863,7 +7850,7 @@ mod tests {
                 license: Some("apache-2.0".to_owned()),
                 gated: Some(false),
                 quantization: Some("bf16".to_owned()),
-                engines: vec!["pytorch".to_owned()],
+                engines: vec!["vllm".to_owned()],
                 source_policy: None,
             },
             SandboxToolPolicy::default(),
@@ -7919,7 +7906,7 @@ mod tests {
             license: Some("test-only".to_owned()),
             gated: Some(false),
             quantization: None,
-            engines: vec!["pytorch".to_owned()],
+            engines: vec!["vllm".to_owned()],
             source_policy: None,
         };
         let cache = model_artifact_cache_status(&paths, "Qwen/Test-1B", &artifact);
@@ -7960,7 +7947,7 @@ mod tests {
             license: Some("test-only".to_owned()),
             gated: Some(false),
             quantization: None,
-            engines: vec!["pytorch".to_owned()],
+            engines: vec!["vllm".to_owned()],
             source_policy: None,
         };
 
@@ -8004,7 +7991,7 @@ mod tests {
             license: Some("test-only".to_owned()),
             gated: Some(false),
             quantization: None,
-            engines: vec!["pytorch".to_owned()],
+            engines: vec!["vllm".to_owned()],
             source_policy: None,
         };
 
@@ -8048,7 +8035,7 @@ mod tests {
             license: Some("test-only".to_owned()),
             gated: Some(true),
             quantization: None,
-            engines: vec!["pytorch".to_owned()],
+            engines: vec!["vllm".to_owned()],
             source_policy: None,
         };
 
@@ -8092,7 +8079,7 @@ mod tests {
             license: Some("test-only".to_owned()),
             gated: Some(true),
             quantization: None,
-            engines: vec!["pytorch".to_owned()],
+            engines: vec!["vllm".to_owned()],
             source_policy: None,
         };
 
@@ -8137,7 +8124,7 @@ mod tests {
             license: Some("test-only".to_owned()),
             gated: Some(false),
             quantization: None,
-            engines: vec!["pytorch".to_owned()],
+            engines: vec!["vllm".to_owned()],
             source_policy: Some(ModelRecipeArtifactSourcePolicyRecord {
                 policy: "manual_only".to_owned(),
                 required_hosts: Vec::new(),
@@ -8185,7 +8172,7 @@ mod tests {
             license: Some("test-only".to_owned()),
             gated: Some(false),
             quantization: None,
-            engines: vec!["pytorch".to_owned()],
+            engines: vec!["vllm".to_owned()],
             source_policy: Some(ModelRecipeArtifactSourcePolicyRecord {
                 policy: "huggingface_authenticated".to_owned(),
                 required_hosts: vec!["huggingface.co".to_owned()],
@@ -8233,7 +8220,7 @@ mod tests {
             license: Some("test-only".to_owned()),
             gated: Some(true),
             quantization: None,
-            engines: vec!["pytorch".to_owned()],
+            engines: vec!["vllm".to_owned()],
             source_policy: None,
         };
 
@@ -8282,7 +8269,7 @@ mod tests {
             license: Some("test-only".to_owned()),
             gated: Some(true),
             quantization: None,
-            engines: vec!["pytorch".to_owned()],
+            engines: vec!["vllm".to_owned()],
             source_policy: None,
         };
 
@@ -8334,7 +8321,7 @@ mod tests {
             license: Some("test-only".to_owned()),
             gated: Some(false),
             quantization: None,
-            engines: vec!["pytorch".to_owned()],
+            engines: vec!["vllm".to_owned()],
             source_policy: None,
         };
 
@@ -8397,7 +8384,7 @@ mod tests {
             license: Some("test-only".to_owned()),
             gated: Some(false),
             quantization: None,
-            engines: vec!["pytorch".to_owned()],
+            engines: vec!["vllm".to_owned()],
             source_policy: None,
         };
 

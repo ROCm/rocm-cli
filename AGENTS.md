@@ -128,13 +128,13 @@ Current workspace members:
 
 - apps: `apps/rocm`, `apps/rocmd`
 - shared crates: `crates/rocm-core`, `crates/rocm-engine-protocol`
-- engine crates: `engines/atom`, `engines/lemonade`, `engines/llama-cpp`, `engines/pytorch`, `engines/sglang`, `engines/vllm`
+- engine crates: `engines/lemonade`, `engines/vllm`
 
 Guardrails:
 
 - `crates/rocm-engine-protocol` is a contract surface; verify all impacted engines after protocol changes
 - preserve strict GPU-required behavior; do not introduce silent CPU fallback
-- respect platform gates (for example, native Windows handling for vLLM/SGLang)
+- respect platform gates (for example, native Windows handling for vLLM)
 - pin third-party GitHub Actions to a full commit SHA with a trailing `# vX.Y.Z` comment, never a moving tag (`@v2`, `@main`); a retagged or compromised action otherwise enters CI silently. Bump the SHA and comment together when upgrading
 - supported host platforms are Windows and Linux only (including WSL where documented)
 - platforms outside Windows/Linux are unsupported; do not implement, debug, or "fix" unsupported-platform behavior

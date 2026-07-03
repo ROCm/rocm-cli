@@ -26,12 +26,8 @@ rocm-core = { path = "../../crates/rocm-core" }
 rocm-dash-daemon = { path = "../../crates/rocm-dash-daemon" }
 rocm-dash-tui = { path = "../../crates/rocm-dash-tui" }
 tokio = { workspace = true }
-rocm-engine-atom = { path = "../../engines/atom" }
 rocm-engine-lemonade = { path = "../../engines/lemonade" }
-rocm-engine-llama-cpp = { path = "../../engines/llama-cpp" }
-rocm-engine-pytorch = { path = "../../engines/pytorch" }
 rocm-engine-protocol = { path = "../../crates/rocm-engine-protocol" }
-rocm-engine-sglang = { path = "../../engines/sglang" }
 rocmd = { path = "../rocmd" }
 rocm-engine-vllm = { path = "../../engines/vllm" }
 rpassword.workspace = true

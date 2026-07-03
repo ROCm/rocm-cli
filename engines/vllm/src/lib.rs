@@ -1854,7 +1854,7 @@ mod tests {
             device_policy: Some(DevicePolicy::GpuRequired),
             recipe_override: None,
             engine_recipe: Some(test_engine_recipe(
-                "pytorch",
+                "lemonade",
                 ENGINE_RECIPE_CONTRACT_VERSION,
             )),
         })

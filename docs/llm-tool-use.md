@@ -23,13 +23,12 @@ rocm-cli local assistants use structured tools, not shell commands.
 - CPU fallback is not a supported path. GPU-required ROCm commands must fail
   loudly when the ROCm GPU path is not ready.
 - The built-in local assistant is fixed to `qwen`
-  (`Qwen3-4B-Instruct-2507-GGUF`) served by Lemonade. vLLM, SGLang,
-  PyTorch, llama.cpp, and Lemonade are general serving engines; the assistant
-  may inspect or manage them for model serving, but it should not switch its own
-  built-in chat engine away from Lemonade.
-- On native Windows, vLLM and SGLang live serving/install checks are skipped.
-  The assistant should direct those requests to WSL/Linux and should not suggest
-  CPU fallback.
+  (`Qwen3-4B-Instruct-2507-GGUF`) served by Lemonade. vLLM and Lemonade are the
+  general serving engines; the assistant may inspect or manage them for model
+  serving, but it should not switch its own built-in chat engine away from
+  Lemonade.
+- On native Windows, vLLM live serving/install checks are skipped. The assistant
+  should direct those requests to WSL/Linux and should not suggest CPU fallback.
 
 This follows the same shape described by current tool-use docs: the application
 defines tool schemas, the model requests a tool, the application executes the
@@ -76,19 +75,18 @@ before running it:
 {"name":"rocm_command","arguments":{"args":["comfyui","install"],"reason":"Install ComfyUI into ROCm CLI's app folder."}}
 ```
 
-The assistant can request installing llama.cpp through the existing engine
-surface. The `llama.cpp` engine is backed by upstream `llama-server`; do not
-replace it with one-off llama.cpp command runners:
+The assistant can request installing a serving engine through the existing
+engine surface. The supported engines are `lemonade` and `vllm`:
 
 ```json
-{"name":"rocm_command","arguments":{"args":["engines","install","llama.cpp"],"reason":"Install the GGUF serving engine."}}
+{"name":"rocm_command","arguments":{"args":["engines","install","vllm"],"reason":"Install the vLLM serving engine."}}
 ```
 
-The assistant can request serving a GGUF model through `llama-server` by asking
-rocm-cli to start the managed `llama.cpp` engine. GPU execution is required:
+The assistant can request serving a model through vLLM by asking rocm-cli to
+start the managed `vllm` engine. GPU execution is required:
 
 ```json
-{"name":"rocm_command","arguments":{"args":["serve","D:\\models\\tiny.gguf","--engine","llama.cpp","--device","gpu_required","--managed"],"reason":"Start a local GPU llama-server for this GGUF model."}}
+{"name":"rocm_command","arguments":{"args":["serve","Qwen/Qwen3.5-4B","--engine","vllm","--device","gpu_required","--managed"],"reason":"Start a local GPU vLLM server for this model."}}
 ```
 
 To target a specific GPU, add `--gpu` with `auto` (default; first free GPU) or a
@@ -96,7 +94,7 @@ single index. Serving one model across multiple GPUs is not supported. CPU
 fallback is never used when a GPU is busy or out of range:
 
 ```json
-{"name":"rocm_command","arguments":{"args":["serve","D:\\models\\tiny.gguf","--engine","llama.cpp","--device","gpu_required","--gpu","1","--managed"],"reason":"Serve this GGUF model on GPU 1."}}
+{"name":"rocm_command","arguments":{"args":["serve","Qwen/Qwen3.5-4B","--engine","vllm","--device","gpu_required","--gpu","1","--managed"],"reason":"Serve this model on GPU 1."}}
 ```
 
 The assistant can request starting ComfyUI. rocm-cli shows the local URL and

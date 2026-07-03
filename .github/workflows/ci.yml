@@ -133,13 +133,9 @@ jobs:
       - name: Acceptance harness self-tests
         if: needs.changes.outputs.heavy == 'true'
         run: |
-          python scripts/pytorch_therock_gpu_test.py --self-test
-          python scripts/llama_cpp_therock_gpu_test.py --self-test
           python scripts/comfyui_therock_gpu_test.py --self-test
           python scripts/local_assistant_therock_gpu_test.py --self-test
           python scripts/vllm_therock_gpu_test.py --self-test
-          python scripts/sglang_therock_gpu_test.py --self-test
-          python scripts/atom_therock_gpu_test.py --self-test
           python scripts/wsl_preflight.py --self-test
 
       - name: Portable WSL build deps self-test
@@ -173,7 +169,7 @@ jobs:
         shell: pwsh
         run: |
           cargo build --workspace --all-targets
-          cargo build --release -p rocm -p rocmd -p rocm-engine-pytorch -p rocm-engine-llama-cpp -p rocm-engine-lemonade -p rocm-engine-atom -p rocm-engine-vllm -p rocm-engine-sglang -p xtask
+          cargo build --release -p rocm -p rocmd -p rocm-engine-lemonade -p rocm-engine-vllm -p xtask
 
       - name: Test
         if: needs.changes.outputs.heavy == 'true'
@@ -189,13 +185,9 @@ jobs:
         if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
         run: |
-          python .\scripts\pytorch_therock_gpu_test.py --self-test
-          python .\scripts\llama_cpp_therock_gpu_test.py --self-test
           python .\scripts\comfyui_therock_gpu_test.py --self-test
           python .\scripts\local_assistant_therock_gpu_test.py --self-test
           python .\scripts\vllm_therock_gpu_test.py --self-test
-          python .\scripts\sglang_therock_gpu_test.py --self-test
-          python .\scripts\atom_therock_gpu_test.py --self-test
           python .\scripts\wsl_preflight.py --self-test
 
       - name: Release readiness self-test

@@ -30,12 +30,8 @@ REPO_ROOT = SCRIPT_DIR.parent
 WINDOWS_BINARIES = [
     "rocm.exe",
     "rocmd.exe",
-    "rocm-engine-pytorch.exe",
-    "rocm-engine-llama-cpp.exe",
     "rocm-engine-lemonade.exe",
-    "rocm-engine-atom.exe",
     "rocm-engine-vllm.exe",
-    "rocm-engine-sglang.exe",
 ]
 LINUX_BINARIES = [name[:-4] for name in WINDOWS_BINARIES]
 PLATFORMS = {"windows-amd64", "linux-amd64"}

@@ -19,8 +19,6 @@ pub enum EngineKind {
     Vllm,
     /// Lemonade Server — JSON `/api/v1/stats`.
     Lemonade,
-    /// llama.cpp `llama-server` — `/slots` (parser not yet wired).
-    LlamaCpp,
 }
 
 impl EngineKind {
@@ -29,7 +27,6 @@ impl EngineKind {
         match self {
             Self::Vllm => "vllm",
             Self::Lemonade => "lemonade",
-            Self::LlamaCpp => "llama.cpp",
         }
     }
 
@@ -41,30 +38,25 @@ impl EngineKind {
         match self {
             Self::Vllm => 8000,
             Self::Lemonade => crate::lemonade::LEMONADE_PORT, // 13305
-            Self::LlamaCpp => 8080,
         }
     }
 
-    /// Map an engine label (config / discovery) to a kind. Case-insensitive;
-    /// accepts the `llama.cpp` / `llamacpp` / `llama_cpp` spellings.
+    /// Map an engine label (config / discovery) to a kind. Case-insensitive.
     pub fn from_label(label: &str) -> Option<Self> {
         match label.trim().to_ascii_lowercase().as_str() {
             "vllm" => Some(Self::Vllm),
             "lemonade" => Some(Self::Lemonade),
-            "llama.cpp" | "llamacpp" | "llama_cpp" => Some(Self::LlamaCpp),
             _ => None,
         }
     }
 
     /// Parse this engine's raw scrape body into an [`InstanceSample`] using the
     /// engine-appropriate parser. vLLM dispatches to the **unchanged**
-    /// `vllm_prom::parse`; Lemonade to `lemonade::parse_stats`. Unwired engines
-    /// return an empty sample (never panic).
+    /// `vllm_prom::parse`; Lemonade to `lemonade::parse_stats`.
     pub fn parse_sample(self, body: &str) -> InstanceSample {
         match self {
             Self::Vllm => crate::vllm_prom::parse(body),
             Self::Lemonade => crate::lemonade::parse_stats(body),
-            Self::LlamaCpp => InstanceSample::default(),
         }
     }
 }
@@ -75,15 +67,12 @@ mod tests {
 
     #[test]
     fn engine_kind_labels_and_ports_and_from_label_roundtrip() {
-        for kind in [EngineKind::Vllm, EngineKind::Lemonade, EngineKind::LlamaCpp] {
+        for kind in [EngineKind::Vllm, EngineKind::Lemonade] {
             assert_eq!(EngineKind::from_label(kind.label()), Some(kind));
         }
         assert_eq!(EngineKind::Lemonade.default_port(), 13305);
         assert_eq!(EngineKind::Vllm.default_port(), 8000);
-        assert_eq!(
-            EngineKind::from_label("LLAMACPP"),
-            Some(EngineKind::LlamaCpp)
-        );
+        assert_eq!(EngineKind::from_label("VLLM"), Some(EngineKind::Vllm));
         assert_eq!(EngineKind::from_label("nope"), None);
     }
 

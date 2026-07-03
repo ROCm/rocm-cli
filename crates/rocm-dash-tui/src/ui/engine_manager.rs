@@ -38,19 +38,9 @@ pub const ENGINE_CATALOG: &[(&str, &str)] = &[
         "lemonade",
         "default embedded Lemonade server with ROCm llama.cpp backend",
     ),
-    ("pytorch", "TheRock PyTorch local serving engine"),
-    ("llama.cpp", "external GGUF serving engine for llama-server"),
     (
         "vllm",
         "Linux/WSL ROCm GPU serving engine through external vLLM",
-    ),
-    (
-        "sglang",
-        "Linux/WSL ROCm GPU serving engine through external SGLang",
-    ),
-    (
-        "atom",
-        "Linux/WSL ROCm GPU serving engine through external ATOM Python",
     ),
 ];
 
@@ -205,7 +195,7 @@ fn spawn_engine_op(
     jobs: &mut State,
     pending: PendingEngineOp,
 ) -> Vec<SideEffect> {
-    // Sanitize the engine name for the job id (e.g. `llama.cpp` → `llama-cpp`).
+    // Sanitize the engine name for the job id (any non-alphanumeric char → `-`).
     let key: String = pending
         .engine
         .chars()
@@ -359,20 +349,6 @@ mod tests {
         assert!(s.approval.is_none());
         assert_eq!(s.active_job.as_deref(), Some("engine-install-lemonade"));
         assert_eq!(jobs.jobs.len(), 1);
-    }
-
-    #[test]
-    fn job_id_sanitizes_dotted_engine_name() {
-        let mut em = Some(EngineManagerState::default());
-        let mut jobs = State::default();
-        // Select llama.cpp (index 2).
-        em.as_mut().unwrap().selected = 2;
-        on_key(&mut em, &mut jobs, key(KeyCode::Char('r')));
-        on_key(&mut em, &mut jobs, key(KeyCode::Char('y')));
-        assert_eq!(
-            em.as_ref().unwrap().active_job.as_deref(),
-            Some("engine-reinstall-llama-cpp")
-        );
     }
 
     #[test]

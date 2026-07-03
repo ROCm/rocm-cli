@@ -116,7 +116,7 @@ write_minimal_config_if_missing() {
   config_tmp="${tmp_dir}/config.json"
   cat > "${config_tmp}" <<'JSON'
 {
-  "default_engine": "pytorch",
+  "default_engine": "lemonade",
   "telemetry": {
     "mode": "local"
   },

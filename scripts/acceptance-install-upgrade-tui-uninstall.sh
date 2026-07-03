@@ -256,20 +256,20 @@ assert_file "${INSTALL_DIR}/rocm"
 assert_file "${INSTALL_DIR}/rocmd"
 assert_file "${INSTALL_DIR}/.rocm-cli-manifest"
 assert_file "${INSTALL_CONFIG_FILE}"
-grep -q '"default_engine"[[:space:]]*:[[:space:]]*"pytorch"' "${INSTALL_CONFIG_FILE}" \
+grep -q '"default_engine"[[:space:]]*:[[:space:]]*"lemonade"' "${INSTALL_CONFIG_FILE}" \
   || fail "installer did not seed minimal config with the expected default engine"
 assert_file "${BASHRC_FILE}"
 grep -F "${INSTALL_DIR}" "${BASHRC_FILE}" >/dev/null \
   || fail "installer did not add install dir to the shell profile"
 
 echo "acceptance: simulate stale prior install entry and reinstall"
-printf '%s\n' '{"default_engine":"llama.cpp"}' > "${INSTALL_CONFIG_FILE}"
+printf '%s\n' '{"default_engine":"vllm"}' > "${INSTALL_CONFIG_FILE}"
 echo "stale" > "${INSTALL_DIR}/rocm-engine-stale"
 echo "${INSTALL_DIR}/rocm-engine-stale" >> "${INSTALL_DIR}/.rocm-cli-manifest"
 run_installer | tee "${INSTALL_LOG_2}"
 assert_missing "${INSTALL_DIR}/rocm-engine-stale"
 assert_file "${INSTALL_DIR}/.rocm-cli-manifest"
-grep -q '"default_engine"[[:space:]]*:[[:space:]]*"llama.cpp"' "${INSTALL_CONFIG_FILE}" \
+grep -q '"default_engine"[[:space:]]*:[[:space:]]*"vllm"' "${INSTALL_CONFIG_FILE}" \
   || fail "installer overwrote an existing config file"
 grep -q "removing previous rocm-cli install" "${INSTALL_LOG_2}" \
   || fail "installer did not report removal of previous install"
@@ -284,7 +284,7 @@ env \
   XDG_CONFIG_HOME="${XDG_CONFIG_HOME}" \
   XDG_DATA_HOME="${XDG_DATA_HOME}" \
   XDG_CACHE_HOME="${XDG_CACHE_HOME}" \
-  "${INSTALL_DIR}/rocm" config set-default-engine pytorch >/dev/null
+  "${INSTALL_DIR}/rocm" config set-default-engine vllm >/dev/null
 
 tui_command="$(
   printf '%q ' \
@@ -326,7 +326,7 @@ if [[ "${tui_status}" -ne 0 ]]; then
 fi
 
 assert_file "${CONFIG_FILE}"
-grep -q '"default_engine"[[:space:]]*:[[:space:]]*"pytorch"' "${CONFIG_FILE}" \
+grep -q '"default_engine"[[:space:]]*:[[:space:]]*"vllm"' "${CONFIG_FILE}" \
   || fail "config smoke did not persist the expected default engine"
 assert_file "${TUI_LOG}"
 [[ -s "${TUI_LOG}" ]] || fail "TUI smoke log was empty"

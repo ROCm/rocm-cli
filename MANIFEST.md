@@ -577,7 +577,7 @@ from the workspace source. The user-facing binaries are:
   processes and expose a local HTTP API
 
 In addition, each engine crate under `engines/` builds its own
-`rocm-engine-<name>` host binary (for example `rocm-engine-pytorch`,
+`rocm-engine-<name>` host binary (for example `rocm-engine-lemonade`,
 `rocm-engine-vllm`), spawned by `rocmd` to run a specific inference engine.
 
 All binaries are compiled from the workspace source using the standard Cargo
@@ -629,13 +629,12 @@ distribution; no Python packages are installed for Lemonade by rocm-cli.
 
 ### Engine-Specific Python Dependencies
 
-The PyTorch engine manages its own Python virtual environment using the `uv`
-binary described above. Python packages are installed from the TheRock PyPI
-index and, where applicable, from public PyPI (`https://pypi.org`). No Python
-packages are bundled in the repository.
-
-The vLLM, SGLang, ATOM, and llama.cpp engines do not install Python packages
-automatically; they record externally-provided runtimes supplied by the user.
+The vLLM engine manages Python packages through the `uv` binary described
+above, installed from the TheRock PyPI index and, where applicable, from public
+PyPI (`https://pypi.org`). No Python packages are bundled in the repository. The
+vLLM engine can also record an externally-provided runtime supplied by the user
+instead of installing one. Lemonade ships as a self-contained embeddable
+distribution and installs no Python packages through rocm-cli.
 
 ## Repository Structure Notes
 

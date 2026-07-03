@@ -24,8 +24,8 @@ ROCm CLI is a command-line tool for setting up and running local AI on AMD GPUs,
 full-screen TUI dashboard for GPU telemetry, model serving, and chat.
 
 A single prebuilt binary for Linux and Windows. No Python, Rust, or existing
-ROCm install required. Ships with inference engine adapters for PyTorch,
-llama.cpp, Lemonade, ATOM, vLLM, and SGLang.
+ROCm install required. Ships with inference engine adapters for Lemonade and
+vLLM.
 
 > [!IMPORTANT]
 > **Tech Preview** -- This software is provided as-is, without warranty or
@@ -166,14 +166,14 @@ rocm engines install <engine> [--runtime-id KEY] [--python-version X.Y] [--reins
 rocm engines shell <engine>   [--runtime-id KEY | --env-id ID] [--shell PATH]
 ```
 
-Supported engines: `lemonade`, `pytorch`, `llama.cpp`, `atom`, `vllm`, `sglang`.
+Supported engines: `lemonade`, `vllm`.
 
 ### Model serving
 
 Start a local OpenAI-compatible model server:
 
 ```
-rocm serve <model> [--engine lemonade|pytorch|llama.cpp|atom|vllm|sglang]
+rocm serve <model> [--engine lemonade|vllm]
                    [--device gpu_required|gpu_preferred|cpu_only]
                    [--gpu auto|<index>]
                    [--runtime-id KEY | --env-id ID]
@@ -369,6 +369,4 @@ See `docs/commit-signatures.md` for details (GPG signing, GitHub "Verified", and
 - Testing and verification: `docs/testing.md`
 - Developer manual QA: `docs/manual-testing.md`
 - Engine plugin policy: `docs/engine-plugins.md`
-- ATOM adapter: `docs/atom.md`
 - vLLM adapter: `docs/vllm.md`
-- SGLang adapter: `docs/sglang.md`

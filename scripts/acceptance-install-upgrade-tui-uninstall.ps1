@@ -295,7 +295,7 @@ try {
     Assert-File (Join-Path $PemInstallDir "rocm.exe")
     Assert-File (Join-Path $PemInstallDir ".rocm-cli-manifest")
     Assert-File $ConfigFile
-    if (-not (Select-String -LiteralPath $ConfigFile -Pattern '"default_engine"\s*:\s*"pytorch"' -Quiet)) {
+    if (-not (Select-String -LiteralPath $ConfigFile -Pattern '"default_engine"\s*:\s*"lemonade"' -Quiet)) {
         Fail "installer did not seed minimal config with the expected default engine"
     }
 
@@ -413,12 +413,12 @@ try {
     Assert-Missing (Join-Path $missingSignatureInstallDir "rocm.exe")
     Assert-Missing (Join-Path $missingSignatureInstallDir ".rocm-cli-manifest")
 
-    Set-Content -LiteralPath $ConfigFile -Value '{"default_engine":"llama.cpp"}' -Encoding utf8
+    Set-Content -LiteralPath $ConfigFile -Value '{"default_engine":"vllm"}' -Encoding utf8
     Invoke-Checked "acceptance: first install" $psExe $installArgs $InstallLog1
     if (-not (Select-String -LiteralPath $InstallLog1 -Pattern "signature verified" -Quiet)) {
         Fail "installer did not report signature verification"
     }
-    if (-not (Select-String -LiteralPath $ConfigFile -Pattern '"default_engine"\s*:\s*"llama.cpp"' -Quiet)) {
+    if (-not (Select-String -LiteralPath $ConfigFile -Pattern '"default_engine"\s*:\s*"vllm"' -Quiet)) {
         Fail "installer overwrote an existing config file"
     }
     Assert-File (Join-Path $InstallDir "rocm.exe")

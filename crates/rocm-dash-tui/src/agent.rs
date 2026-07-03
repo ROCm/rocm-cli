@@ -530,7 +530,7 @@ rocm_read_tool!(
 rocm_read_tool!(
     EnginesRocmTool,
     "engines",
-    "List the available inference engines (e.g. vLLM, llama.cpp, ComfyUI) and \
+    "List the available inference engines (e.g. Lemonade, vLLM, ComfyUI) and \
      their install/availability status. Read-only.",
     { "type": "object", "properties": {} }
 );
@@ -753,7 +753,7 @@ rocm_mutating_tool!(
 rocm_mutating_tool!(
     InstallEngineRocmTool,
     "install_engine",
-    "Install an inference engine (e.g. vllm, llama-cpp, comfyui). MUTATING — \
+    "Install an inference engine (e.g. lemonade, vllm, comfyui). MUTATING — \
      surfaced for operator approval before anything runs.",
     {
         "type": "object",

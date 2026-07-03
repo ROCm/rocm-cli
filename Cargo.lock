@@ -3211,12 +3211,8 @@ dependencies = [
  "rocm-core",
  "rocm-dash-daemon",
  "rocm-dash-tui",
- "rocm-engine-atom",
  "rocm-engine-lemonade",
- "rocm-engine-llama-cpp",
  "rocm-engine-protocol",
- "rocm-engine-pytorch",
- "rocm-engine-sglang",
  "rocm-engine-vllm",
  "rocmd",
  "rpassword",
@@ -3326,18 +3322,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rocm-engine-atom"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "clap",
- "rocm-core",
- "rocm-engine-protocol",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "rocm-engine-lemonade"
 version = "0.3.0"
 dependencies = [
@@ -3351,49 +3335,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "rocm-engine-llama-cpp"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "clap",
- "rocm-core",
- "rocm-engine-protocol",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "rocm-engine-protocol"
 version = "0.3.0"
 dependencies = [
  "rocm-core",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "rocm-engine-pytorch"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "axum",
- "clap",
- "rocm-core",
- "rocm-engine-protocol",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "rocm-engine-sglang"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "clap",
- "rocm-core",
- "rocm-engine-protocol",
  "serde",
  "serde_json",
 ]
