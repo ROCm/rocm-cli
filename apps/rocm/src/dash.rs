@@ -20,8 +20,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rocm_core::{AppPaths, RocmCliConfig, builtin_model_recipes, builtin_watchers};
 use rocm_dash_daemon::runner::RunnerOptions;
-use rocm_dash_tui::app::{ActiveTab, ResolvedArgs};
+use rocm_dash_tui::app::{ActiveTab, Focus, ResolvedArgs};
 use rocm_dash_tui::ui::automations_manager::AutomationSummary;
+use rocm_dash_tui::ui::launcher::LauncherChoice;
 use rocm_dash_tui::ui::model_picker::ModelRecipeSummary;
 use rocm_dash_tui::ui::runtime_manager::RuntimeSummary;
 
@@ -182,7 +183,8 @@ pub fn resolved_args(
         theme: t.theme.clone(),
         replay: None,
         initial_tab,
-        start_onboarding: false,
+        // Default: not a focused host. `run_focused` sets this per launcher flow.
+        focus: None,
         chat_url: t.chat_url.clone(),
         chat_model: t.chat_model.clone(),
         chat_auth_header: t.chat_auth_header.clone(),
@@ -240,32 +242,68 @@ pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
     rt.block_on(run_async(config, paths, args, replay, chat_mock))
 }
 
-/// Entry point for bare `rocm`: show the minimal launcher front door, then
-/// escalate into the existing dash/chat entry points based on the choice.
+/// Where a launcher choice leads. Pure mapping so the hub-loop body stays
+/// trivial and the routing is unit-testable without a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LauncherRoute {
+    /// Run in place via the focused host (Set up / Serve / Diagnose).
+    Focused(Focus),
+    /// Escalate into the full dashboard with the Chat tab focused.
+    Chat,
+    /// Escalate into the full dashboard (Home).
+    Dashboard,
+}
+
+/// Map a launcher row to its destination. Set up / Serve / Diagnose run in place
+/// (focused host); Chat and Open-dashboard are the only escalations into the
+/// full Dash.
+const fn launcher_route(choice: LauncherChoice) -> LauncherRoute {
+    match choice {
+        LauncherChoice::SetUp => LauncherRoute::Focused(Focus::Setup),
+        LauncherChoice::Serve => LauncherRoute::Focused(Focus::Serve),
+        LauncherChoice::Diagnose => LauncherRoute::Focused(Focus::Examine),
+        LauncherChoice::Chat => LauncherRoute::Chat,
+        LauncherChoice::OpenDashboard => LauncherRoute::Dashboard,
+    }
+}
+
+/// Entry point for bare `rocm`: the launcher as a persistent hub.
 ///
-/// The launcher is a thin synchronous pre-screen (no daemon, no async runtime);
-/// `rocm dash` / `rocm chat` reach [`run`] / [`run_chat`] directly and are
-/// unaffected by this path.
+/// Draws the minimal front door; runs the chosen flow; then redraws the menu so
+/// the user can run several flows without relaunching. Set up / Serve / Diagnose
+/// run in place via the focused host ([`run_focused`]); Chat and Open-dashboard
+/// escalate into the full Dash. `q`/`Esc` (the `None` choice) leaves. A flow
+/// error breaks the loop and propagates.
 pub fn run_launcher(chat_mock: bool) -> Result<()> {
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths).unwrap_or_default();
     let theme = config.dashboard.tui.theme;
-    match rocm_dash_tui::ui::launcher::run_launcher(&theme)? {
-        None => Ok(()),
-        Some(choice) => {
-            use rocm_dash_tui::ui::launcher::LauncherChoice;
-            match choice {
-                LauncherChoice::Chat => run_chat(chat_mock),
-                // Serve / Set up / Diagnose / Open dashboard all escalate into
-                // the full dash (Home); the guided managers are reachable there
-                // via the Action tab + seam (ponytail: no separate routing yet).
-                LauncherChoice::Serve
-                | LauncherChoice::SetUp
-                | LauncherChoice::Diagnose
-                | LauncherChoice::OpenDashboard => run(None, false, chat_mock),
-            }
+    loop {
+        match rocm_dash_tui::ui::launcher::run_launcher(&theme)? {
+            None => return Ok(()),
+            Some(choice) => match launcher_route(choice) {
+                LauncherRoute::Focused(focus) => run_focused(focus)?,
+                LauncherRoute::Chat => run_chat(chat_mock)?,
+                LauncherRoute::Dashboard => run(None, false, chat_mock)?,
+            },
         }
     }
+}
+
+/// Entry point for a focused launcher flow (Set up / Serve / Diagnose).
+///
+/// Opens the dashboard runtime hosting exactly the one overlay for `focus` — no
+/// embedded daemon (see [`should_spawn_daemon`]), no tab shell — and returns to
+/// the launcher when that overlay is closed at its root. The keyring lookup in
+/// [`resolved_args`] runs here on the synchronous thread, before the runtime
+/// (nested-runtime invariant).
+pub fn run_focused(focus: Focus) -> Result<()> {
+    let paths = AppPaths::discover()?;
+    let config = RocmCliConfig::load(&paths)?;
+    let mut args = resolved_args(&config, &paths, ActiveTab::Home);
+    args.focus = Some(focus);
+    let rt = build_dashboard_runtime()?;
+    rt.block_on(run_async(config, paths, args, None, false))
 }
 
 /// Entry point for interactive `rocm chat`. Opens the unified dashboard with the
@@ -281,24 +319,17 @@ pub fn run_chat(chat_mock: bool) -> Result<()> {
     rt.block_on(run_async(config, paths, args, None, chat_mock))
 }
 
-/// Entry point for `rocm bootstrap setup`. Opens the dashboard straight into the
-/// first-run onboarding wizard (install ROCm SDK / adopt an existing folder).
-/// Same runtime/`run_async` path as [`run`]; the keyring lookup in
-/// `resolved_args` runs here on the synchronous thread before the runtime.
+/// Entry point for `rocm bootstrap setup`. Routes to the same focused Setup host
+/// as the launcher's "Set up this system" row — the first-run onboarding wizard
+/// (install ROCm SDK / adopt an existing folder), with no daemon or tab shell.
 pub fn run_bootstrap() -> Result<()> {
-    let paths = AppPaths::discover()?;
-    let config = RocmCliConfig::load(&paths)?;
-    let args = bootstrap_args(&config, &paths);
-    let rt = build_dashboard_runtime()?;
-    rt.block_on(run_async(config, paths, args, None, false))
+    run_focused(bootstrap_focus())
 }
 
-/// Resolve the dashboard args for `rocm bootstrap setup`: the standard
-/// dashboard args with the first-run onboarding wizard opened on launch.
-fn bootstrap_args(config: &RocmCliConfig, paths: &AppPaths) -> ResolvedArgs {
-    let mut args = resolved_args(config, paths, ActiveTab::Home);
-    args.start_onboarding = true;
-    args
+/// The focused flow `rocm bootstrap setup` routes to — the onboarding host,
+/// identical to the launcher's "Set up this system".
+const fn bootstrap_focus() -> Focus {
+    Focus::Setup
 }
 
 async fn run_async(
@@ -320,9 +351,10 @@ async fn run_async(
             std::sync::Arc::new(crate::dash_seam::BinToolExecutor::new(paths.clone()));
         args.tool_executor = Some(executor);
     }
-    // A live daemon is only needed when connecting; replay/demo feeds events
-    // straight into the TUI, so skip the embedded daemon in that mode.
-    let embedded = if replay.is_none() {
+    // A live daemon is only needed for a connected full dashboard; replay/demo
+    // feeds events straight into the TUI, and a focused host draws no telemetry
+    // and streams its own job via the job-bridge — both skip the embedded daemon.
+    let embedded = if should_spawn_daemon(&args) {
         maybe_spawn_embedded_daemon(&args.connect, &config, &paths).await
     } else {
         None
@@ -340,6 +372,16 @@ async fn run_async(
         }
     }
     result
+}
+
+/// Whether `run_async` should auto-start the embedded telemetry daemon: only for
+/// a live, non-replay FULL dashboard. A focused host (`args.focus.is_some()`)
+/// draws no telemetry and streams its own job via the job-bridge, so it needs no
+/// daemon — and must not re-surface the socket-crash class for a flow that never
+/// uses it. Replay/demo (`args.replay.is_some()`) feeds events straight in.
+/// Pure predicate → unit-testable. Call after `args.replay` is set in `run_async`.
+const fn should_spawn_daemon(args: &ResolvedArgs) -> bool {
+    args.replay.is_none() && args.focus.is_none()
 }
 
 /// Auto-start an embedded telemetry daemon when no local one is already
@@ -416,24 +458,53 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_args_open_the_onboarding_wizard() {
-        // `rocm bootstrap setup` must launch the dashboard straight into the
-        // first-run onboarding overlay (install ROCm SDK / adopt existing).
-        let args = bootstrap_args(&cfg(), &paths());
-        assert!(
-            args.start_onboarding,
-            "bootstrap must open the onboarding wizard on launch"
-        );
-        assert_eq!(args.initial_tab, ActiveTab::Home);
-        assert!(!args.chat_mock);
-        assert!(args.replay.is_none());
+    fn bootstrap_routes_to_focused_setup() {
+        // `rocm bootstrap setup` must route to the same focused Setup host as the
+        // launcher's "Set up this system" row (onboarding, no daemon/tab shell).
+        assert_eq!(bootstrap_focus(), Focus::Setup);
     }
 
     #[test]
-    fn resolved_args_default_does_not_open_onboarding() {
-        // Normal `rocm dash` / `rocm chat` must NOT auto-open onboarding.
+    fn launcher_route_maps_every_choice() {
+        // Set up / Serve / Diagnose run in place; Chat / Open-dashboard escalate.
+        assert_eq!(
+            launcher_route(LauncherChoice::SetUp),
+            LauncherRoute::Focused(Focus::Setup)
+        );
+        assert_eq!(
+            launcher_route(LauncherChoice::Serve),
+            LauncherRoute::Focused(Focus::Serve)
+        );
+        assert_eq!(
+            launcher_route(LauncherChoice::Diagnose),
+            LauncherRoute::Focused(Focus::Examine),
+        );
+        assert_eq!(launcher_route(LauncherChoice::Chat), LauncherRoute::Chat);
+        assert_eq!(
+            launcher_route(LauncherChoice::OpenDashboard),
+            LauncherRoute::Dashboard
+        );
+    }
+
+    #[test]
+    fn resolved_args_default_has_no_focus() {
+        // Normal `rocm dash` / `rocm chat` are NOT focused hosts.
         let args = resolved_args(&cfg(), &paths(), ActiveTab::Home);
-        assert!(!args.start_onboarding);
+        assert!(args.focus.is_none());
+    }
+
+    #[test]
+    fn focused_and_replay_suppress_the_embedded_daemon() {
+        // Full live dash → spawn the embedded daemon.
+        let mut args = resolved_args(&cfg(), &paths(), ActiveTab::Home);
+        assert!(should_spawn_daemon(&args), "full dash spawns the daemon");
+        // Focused host → never spawn a daemon (avoids the socket-crash class).
+        args.focus = Some(Focus::Examine);
+        assert!(!should_spawn_daemon(&args), "focused host: no daemon");
+        // Replay also suppresses it.
+        args.focus = None;
+        args.replay = Some(PathBuf::from("/tmp/x.ndjson"));
+        assert!(!should_spawn_daemon(&args), "replay: no daemon");
     }
 
     #[test]

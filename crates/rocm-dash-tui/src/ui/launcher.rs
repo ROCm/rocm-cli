@@ -38,16 +38,16 @@ pub enum LauncherChoice {
 /// part of this list.
 pub const ROWS: &[(&str, &str, &str, LauncherChoice)] = &[
     (
-        "◆",
-        "Serve a model",
-        "run a model on your GPU",
-        LauncherChoice::Serve,
-    ),
-    (
         "⚙",
         "Set up this system",
         "install / update ROCm",
         LauncherChoice::SetUp,
+    ),
+    (
+        "◆",
+        "Serve a model",
+        "run a model on your GPU",
+        LauncherChoice::Serve,
     ),
     (
         "⚕",
@@ -377,9 +377,16 @@ mod tests {
     #[test]
     fn choice_mapping_and_counts() {
         assert_eq!(row_count(), 5);
-        assert_eq!(choice_for(0), LauncherChoice::Serve);
+        // Row order: 0=Set up, 1=Serve, 2=Diagnose, 3=Chat, 4=Open dashboard.
+        assert_eq!(choice_for(0), LauncherChoice::SetUp);
+        assert_eq!(choice_for(1), LauncherChoice::Serve);
         assert_eq!(choice_for(4), LauncherChoice::OpenDashboard);
         assert_eq!(choice_for(99), LauncherChoice::OpenDashboard);
+        // The first two rows carry the expected labels in the new order.
+        assert_eq!(ROWS[0].1, "Set up this system");
+        assert_eq!(ROWS[0].3, LauncherChoice::SetUp);
+        assert_eq!(ROWS[1].1, "Serve a model");
+        assert_eq!(ROWS[1].3, LauncherChoice::Serve);
     }
 
     #[test]

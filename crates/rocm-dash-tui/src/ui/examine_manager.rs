@@ -68,6 +68,19 @@ pub fn on_key(
     Vec::new()
 }
 
+/// Build the examine overlay AND immediately start its read-only run.
+///
+/// Returns the overlay state plus the initial spawn side effects. The focused
+/// host (bare-`rocm` `Diagnose & fix`) uses this so examine streams on open
+/// without the user pressing Enter; the normal dash still opens the idle intro
+/// card via [`ExamineManagerState::default`] + Enter. Reuses [`run_examine`], so
+/// the spawned `cmd` resolves to the `rocm` exe with `examine` in its args.
+pub fn open_running(jobs: &mut State) -> (ExamineManagerState, Vec<SideEffect>) {
+    let mut d = ExamineManagerState::default();
+    let fx = run_examine(&mut d, jobs);
+    (d, fx)
+}
+
 /// Spawn `rocm examine` (read-only). A stable id replaces any prior console.
 fn run_examine(d: &mut ExamineManagerState, jobs: &mut State) -> Vec<SideEffect> {
     let cmd = resolve_exe();
