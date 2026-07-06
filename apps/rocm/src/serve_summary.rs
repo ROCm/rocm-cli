@@ -92,20 +92,29 @@ pub(crate) fn format_tps(tps: Option<f64>) -> String {
 /// Render the deployment summary table as plain text (returned rather than
 /// printed so it is unit-testable and identical across engines).
 pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
+    // The server answered its health check within the startup window. A launch
+    // that timed out lands here with `status == "starting"`; the heading and a
+    // note must make that visibly different from a healthy deployment so the
+    // summary is never mistaken for success.
+    let ready = summary.status == "ready";
     let heading = if summary.already_running {
         "Deployment summary (already running)"
-    } else {
+    } else if ready {
         "Deployment summary"
+    } else {
+        "Deployment summary (not ready yet)"
     };
 
-    // (label, value) rows, in the order the ticket calls out.
+    // (label, value) rows, in the order the ticket calls out. Throughput is
+    // labelled "approx" because it is derived from streamed SSE chunk counts
+    // (~1 token per chunk), not the engine's own token accounting.
     let rows: Vec<(&str, String)> = vec![
         ("status", summary.status.clone()),
         ("engine", summary.engine.clone()),
         ("model", summary.api_model.clone()),
         ("endpoint", summary.chat_endpoint.clone()),
         ("time to first token", format_ttft(summary.metrics.ttft)),
-        ("throughput", format_tps(summary.metrics.gen_tps)),
+        ("throughput (approx)", format_tps(summary.metrics.gen_tps)),
         ("service", summary.service_id.clone()),
         ("stop", format!("rocm services stop {}", summary.service_id)),
         (
@@ -121,6 +130,14 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
     out.push('\n');
     for (label, value) in rows {
         let _ = writeln!(out, "  {label:<label_width$}  {value}");
+    }
+    if !ready && !summary.already_running {
+        let _ = writeln!(
+            out,
+            "  note: the server did not report ready before the startup timeout; \
+             it may still be loading — check `rocm logs --service {}` or `rocm services list`",
+            summary.service_id
+        );
     }
     for note in &summary.notes {
         let _ = writeln!(out, "  note: {note}");
@@ -337,6 +354,24 @@ mod tests {
         let mut summary = base_summary();
         summary.already_running = true;
         assert!(render_summary(&summary).contains("already running"));
+    }
+
+    #[test]
+    fn readiness_timeout_does_not_read_as_success() {
+        // A launch that never became ready lands here with status "starting". The
+        // heading must flag it and a note must point the user at the logs, so the
+        // summary is not mistaken for a healthy deployment.
+        let mut summary = base_summary();
+        summary.status = "starting".to_owned();
+        let rendered = render_summary(&summary);
+        assert!(rendered.contains("not ready yet"), "heading: {rendered}");
+        assert!(rendered.contains("did not report ready"));
+        assert!(rendered.contains("rocm logs --service"));
+    }
+
+    #[test]
+    fn throughput_row_is_labelled_approximate() {
+        assert!(render_summary(&base_summary()).contains("throughput (approx)"));
     }
 
     #[test]
