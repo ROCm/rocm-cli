@@ -5327,15 +5327,15 @@ pub fn builtin_model_recipes() -> Vec<ModelRecipeRecord> {
             task: "chat".to_owned(),
             source: "recipe_index".to_owned(),
             revision: "main".to_owned(),
-            loader: "transformers".to_owned(),
+            loader: "llamacpp".to_owned(),
             trust_remote_code: false,
-            dtype: "float16".to_owned(),
+            dtype: "gguf".to_owned(),
             device_policy: "gpu_required".to_owned(),
             min_gpu_mem_gb: Some(6),
             recommended_system_ram_gb: Some(8),
             quantization: Some("none; recommended small assistant recipe".to_owned()),
             artifact_hint: Some(
-                "Hugging Face model id; selected as the built-in low-VRAM assistant path"
+                "Lemonade model id; resolved internally to a GGUF build of this model"
                     .to_owned(),
             ),
             artifacts: Vec::new(),
@@ -5470,7 +5470,7 @@ pub fn builtin_model_recipes() -> Vec<ModelRecipeRecord> {
             chat_template_mode: "auto".to_owned(),
             preferred_engines: vec!["vllm".to_owned()],
             warnings: vec![
-                "not a verified PyTorch smoke path: Transformers 4.57.6 reports unknown architecture qwen3_5"
+                "not a verified vLLM smoke path: Transformers 4.57.6 reports unknown architecture qwen3_5"
                     .to_owned(),
             ],
         },
