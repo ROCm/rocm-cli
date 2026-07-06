@@ -15387,9 +15387,21 @@ fn model_list_ready_for_model(
                     .into_iter()
                     .filter_map(|field| model.get(field).and_then(serde_json::Value::as_str))
                     .any(|loaded| service_model_names_match(loaded, canonical_model_id));
-                name_matches && (!require_rocm_backend || service_model_reports_rocm_backend(model))
+                name_matches && (!require_rocm_backend || service_model_gpu_ready(model))
             })
         })
+}
+
+/// Whether a lemonade `/v1/models` entry is served on GPU. A stock `llama-server`
+/// (direct-serve) entry has no `recipe_options` and is accepted (that path only runs
+/// GPU backends); a Lemonade-router entry carries `recipe_options`, so it must report a
+/// ROCm backend — which keeps a registered-but-unloaded model (empty `recipe_options`)
+/// from reading as ready.
+fn service_model_gpu_ready(model: &serde_json::Value) -> bool {
+    match model.get("recipe_options") {
+        None => true,
+        Some(_) => service_model_reports_rocm_backend(model),
+    }
 }
 
 fn service_model_reports_rocm_backend(model: &serde_json::Value) -> bool {
@@ -15825,6 +15837,36 @@ mod tests {
             200,
             "OK",
             "Qwen3-0.6B-GGUF"
+        ));
+    }
+
+    #[test]
+    fn lemonade_direct_serve_model_reads_ready_without_recipe_options() {
+        // The HF direct-serve path runs a stock llama-server whose `/v1/models` entry
+        // has no `recipe_options`. It must read as ready by name (that path is GPU-only),
+        // while a registered-but-unloaded lemonade entry (empty `recipe_options`) must not.
+        let direct = json!({
+            "data": [{ "id": "LiquidAI/LFM2.5-230M-GGUF:Q4_0", "object": "model" }]
+        })
+        .to_string();
+        assert!(service_http_readiness_response_ready(
+            "lemonade",
+            "/v1/models",
+            200,
+            &direct,
+            "LiquidAI/LFM2.5-230M-GGUF:Q4_0"
+        ));
+
+        let registered = json!({
+            "data": [{ "id": "LiquidAI/LFM2.5-230M-GGUF:Q4_0", "recipe_options": {} }]
+        })
+        .to_string();
+        assert!(!service_http_readiness_response_ready(
+            "lemonade",
+            "/v1/models",
+            200,
+            &registered,
+            "LiquidAI/LFM2.5-230M-GGUF:Q4_0"
         ));
     }
 
