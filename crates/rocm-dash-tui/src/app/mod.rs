@@ -505,6 +505,13 @@ pub struct AppState {
     /// persist the accepted endpoint to `config.toml`. Keeps `apply_action`
     /// I/O-free.
     pub chat_persist_dispatch: bool,
+    /// Edge flag: raised by `accept_detect_offer` (and thus `save_detect_offer`),
+    /// consumed once by `event_loop`.
+    ///
+    /// Rebuilds the live chat `agent` from the newly-accepted `chat_llm` so
+    /// submits stop routing to the stale startup backend (e.g. a cloud gateway).
+    /// Keeps `apply_action` I/O-free.
+    pub chat_endpoint_rebuild: bool,
     /// Replay scrubber state. `None` when running against a live daemon.
     pub replay: Option<ReplayState>,
     /// Last body area used by the most recent draw. Mouse hit-tests resolve
@@ -631,6 +638,7 @@ impl AppState {
             chat_detect_dispatch: false,
             chat_detect_msg: None,
             chat_persist_dispatch: false,
+            chat_endpoint_rebuild: false,
             replay: None,
             last_body_area: None,
             last_tab_bar_area: None,
@@ -1000,13 +1008,23 @@ impl AppState {
         }
     }
 
-    /// Accept the detected local endpoint for this session: switch `chat_llm`
-    /// to the offer and enable chat. No-op when no offer is pending.
+    /// Accept the detected local endpoint for this session.
+    ///
+    /// Switches `chat_llm` to the offer and enables chat. The accepted endpoint
+    /// is local, so this also selects the Local provider and raises the
+    /// `chat_endpoint_rebuild` edge, marking the live agent for rebuild in
+    /// `event_loop`. No-op when no offer is pending.
     pub fn accept_detect_offer(&mut self) {
         if let Some(cfg) = self.chat_detect_offer.take() {
             self.chat_llm = Some(cfg);
             self.chat_consent = ChatConsent::Accepted;
             self.chat_focused = true;
+            // The accepted endpoint is local; align the displayed provider and
+            // raise the rebuild edge so `event_loop` swaps the live agent to it
+            // (the startup agent may be a cloud gateway — see
+            // `chat_endpoint_rebuild`).
+            self.active_provider = ChatProvider::Local;
+            self.chat_endpoint_rebuild = true;
         }
     }
 
@@ -1016,8 +1034,10 @@ impl AppState {
         self.chat_detect_offer = None;
     }
 
-    /// Accept the detected endpoint **and** persist it: same as
-    /// [`accept_detect_offer`](Self::accept_detect_offer), then raise the
+    /// Accept the detected endpoint **and** persist it.
+    ///
+    /// Same as [`accept_detect_offer`](Self::accept_detect_offer) (which selects
+    /// the Local provider and raises the endpoint-rebuild edge), then raise the
     /// one-shot `chat_persist_dispatch` edge so `event_loop` writes
     /// `tui.chat_url`/`tui.chat_model` to the config file. No-op when no offer
     /// is pending.
@@ -1599,7 +1619,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     // (silent wrong-backend bug) — `build_chat_agent(Local)` returns None by
     // design (Local is the inline-built backend), so the caller must restore the
     // saved clone here. `Option<Arc<…>>` clone is a cheap Arc refcount bump.
-    let local_agent = agent.clone();
+    let mut local_agent = agent.clone();
 
     loop {
         // Focused host renders overlay-only (no header / tabs / dock / footer
@@ -2012,6 +2032,43 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         state.chat.push(ChatTurn::error(format!(
                             "could not switch to {}: {hint}",
                             target.label()
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Drain the endpoint-rebuild edge (Phase 8 sibling). An accepted
+        // detected-local offer must re-point the LIVE `agent` — and the
+        // `/provider local` restore snapshot — at the new local backend.
+        // `accept_detect_offer` swaps `chat_llm` to the auth-free local config
+        // but stays I/O-free, so without this the stale startup agent keeps
+        // routing chat to the cloud gateway (wrong-backend 401 bug). On failure
+        // `agent`/`local_agent` are left unchanged and an error turn surfaces.
+        // Construction only — no network until the next submit.
+        if state.chat_endpoint_rebuild {
+            state.chat_endpoint_rebuild = false;
+            if let Some(cfg) = state.chat_llm.clone() {
+                match crate::agent::RigAgentClient::new(
+                    cfg.clone(),
+                    state.tool_executor.clone(),
+                    Some(chat_tx.clone()),
+                ) {
+                    Ok(c) => {
+                        let arc =
+                            std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>;
+                        agent = Some(arc.clone());
+                        // Refresh the restore snapshot so a later `/provider
+                        // local` restores THIS accepted backend, not the stale
+                        // startup one.
+                        local_agent = Some(arc);
+                        state
+                            .chat
+                            .push(ChatTurn::agent("switched to local".to_string()));
+                    }
+                    Err(e) => {
+                        state.chat.push(ChatTurn::error(format!(
+                            "could not switch to the detected local endpoint: {e}"
                         )));
                     }
                 }
@@ -3915,6 +3972,10 @@ mod tests {
             auth_header: Some("Ocp-Apim-Subscription-Key".into()),
         };
         s.set_chat_config(Some(gw), false);
+        // Simulate a prior `/provider openai` so the realignment to Local on
+        // accept is observable (Local is the default, so starting there would
+        // make the assertion below tautological).
+        s.active_provider = ChatProvider::Openai;
 
         // request_detect raises the dispatch edge + detecting flag.
         apply_action(&mut s, KeyAction::ChatDetect);
@@ -3931,6 +3992,11 @@ mod tests {
         assert_eq!(s.chat_consent, ChatConsent::Accepted);
         assert_eq!(s.chat_llm.as_ref(), Some(&local));
         assert!(s.chat_detect_offer.is_none());
+        assert!(
+            s.chat_endpoint_rebuild,
+            "accept raises the live-agent rebuild edge"
+        );
+        assert_eq!(s.active_provider, ChatProvider::Local);
     }
 
     #[test]
@@ -3957,6 +4023,9 @@ mod tests {
     #[test]
     fn save_detect_offer_accepts_and_raises_persist_edge() {
         let mut s = AppState::new("t".into(), "default-dark".into());
+        // Start off-Local so the realignment on accept is observable (Local is
+        // the default provider; asserting it without this would be tautological).
+        s.active_provider = ChatProvider::Openai;
         s.set_detect_result(Some(crate::llm::detected_llm_config(
             "http://localhost:13305/v1",
             "Llama-3.2-3B",
@@ -3964,6 +4033,8 @@ mod tests {
         apply_action(&mut s, KeyAction::ChatDetectSave);
         assert_eq!(s.chat_consent, ChatConsent::Accepted);
         assert!(s.chat_persist_dispatch, "save raises the persist edge");
+        assert!(s.chat_endpoint_rebuild, "save also raises the rebuild edge");
+        assert_eq!(s.active_provider, ChatProvider::Local);
         assert_eq!(
             s.chat_llm.as_ref().map(|c| c.base_url.as_str()),
             Some("http://localhost:13305/v1")
@@ -3972,6 +4043,7 @@ mod tests {
         let mut s2 = AppState::new("t".into(), "default-dark".into());
         apply_action(&mut s2, KeyAction::ChatDetectSave);
         assert!(!s2.chat_persist_dispatch);
+        assert!(!s2.chat_endpoint_rebuild);
     }
 
     #[test]

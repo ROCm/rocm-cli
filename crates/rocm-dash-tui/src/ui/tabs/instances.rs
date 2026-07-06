@@ -884,6 +884,7 @@ mod tests {
             chat_input: String::new(),
             chat_sending: false,
             chat_dispatch: false,
+            chat_endpoint_rebuild: false,
             chat_focused: false,
             chat_scroll: 0,
             chat_llm: None,

@@ -84,11 +84,24 @@ pub fn resolve_llm_config(
         .or(cfg_model)
         .map_or_else(|| DEFAULT_CHAT_MODEL.to_string(), str::to_string);
 
+    // Loopback base_urls talk to a local server that needs no gateway auth;
+    // never attach a cloud subscription-key header/api_key to them (prevents a
+    // startup-configured local endpoint from leaking a cloud credential).
+    let is_loopback = parse_host_port(&base_url).is_some_and(|(host, _)| is_loopback_host(&host));
+
     Some(LlmConfig {
         base_url,
         model,
-        api_key: env_key.map(str::to_string),
-        auth_header: auth_header.map(str::to_string),
+        api_key: if is_loopback {
+            None
+        } else {
+            env_key.map(str::to_string)
+        },
+        auth_header: if is_loopback {
+            None
+        } else {
+            auth_header.map(str::to_string)
+        },
     })
 }
 
@@ -118,6 +131,17 @@ pub fn parse_host_port(base_url: &str) -> Option<(String, u16)> {
         }
         _ => Some((authority.to_string(), default_port)),
     }
+}
+
+/// True when `host` is a loopback address.
+///
+/// Matches `localhost` (case-insensitive), the IPv6 loopback (`::1`, with or
+/// without brackets), and any `127.0.0.0/8` IPv4 address.
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host == "::1"
+        || host == "[::1]"
+        || host.starts_with("127.")
 }
 
 /// Best-effort TCP liveness probe for a candidate endpoint.
@@ -280,6 +304,47 @@ mod tests {
         );
         assert_eq!(r.model, DEFAULT_CHAT_MODEL);
         assert_eq!(r.api_key, None);
+    }
+
+    #[test]
+    fn loopback_base_url_strips_cloud_auth() {
+        for url in [
+            "http://127.0.0.1:8000/v1",
+            "http://localhost:13305/v1",
+            "http://[::1]:8000/v1",
+        ] {
+            let r = resolve_llm_config(
+                Some(url),
+                None,
+                None,
+                None,
+                Some("leaked-key"),
+                None,
+                Some("Ocp-Apim-Subscription-Key"),
+                true,
+            )
+            .expect("config");
+            assert_eq!(r.base_url, url);
+            assert_eq!(r.api_key, None, "loopback strips api_key ({url})");
+            assert_eq!(r.auth_header, None, "loopback strips auth_header ({url})");
+        }
+    }
+
+    #[test]
+    fn remote_base_url_keeps_cloud_auth() {
+        let r = resolve_llm_config(
+            Some("https://gw.example.com/openai"),
+            None,
+            None,
+            None,
+            Some("k"),
+            None,
+            Some("Ocp-Apim-Subscription-Key"),
+            true,
+        )
+        .expect("config");
+        assert_eq!(r.api_key.as_deref(), Some("k"));
+        assert_eq!(r.auth_header.as_deref(), Some("Ocp-Apim-Subscription-Key"));
     }
 
     #[test]
