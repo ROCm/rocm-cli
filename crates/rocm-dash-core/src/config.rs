@@ -130,7 +130,12 @@ fn default_socket() -> String {
 
 /// Pure core of [`default_socket`]: resolve the socket path from explicit env
 /// inputs so the precedence is testable without mutating process-global env vars
-/// (unsafe and racy under parallel tests in edition 2024).
+/// (unsafe and racy under parallel tests in edition 2024). Precedence:
+///
+/// 1. `$XDG_RUNTIME_DIR` — already mode `0700` on systemd systems, ideal.
+/// 2. `$HOME/.rocm/data/telemetry` — standard per-user data dir.
+/// 3. `temp_dir()/rocm-<user>` — user-named subdir so the parent is something
+///    the daemon creates and owns, not `/tmp` itself.
 fn socket_path(
     xdg_runtime_dir: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
@@ -473,6 +478,10 @@ theme = "default-dark"
 
         // No user name at all still yields a valid per-user subdir.
         let path = socket_path(None, None, None, PathBuf::from("/tmp"));
+        assert_eq!(path, PathBuf::from("/tmp/rocm-user/rocmdashd.sock"));
+
+        // A bare empty user name (as opposed to unset) also falls back to "user".
+        let path = socket_path(None, None, Some(String::new()), PathBuf::from("/tmp"));
         assert_eq!(path, PathBuf::from("/tmp/rocm-user/rocmdashd.sock"));
     }
 }

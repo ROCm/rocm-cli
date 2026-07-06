@@ -384,15 +384,18 @@ mod tests {
     fn preexisting_root_sticky_parent_does_not_abort() {
         let tmpdir = std::env::temp_dir();
         let Ok(meta) = std::fs::metadata(&tmpdir) else {
-            return; // no temp dir to probe; nothing to assert
+            eprintln!("skip: no temp dir to probe; nothing to assert");
+            return;
         };
         if !is_safe_shared_dir(meta.uid(), meta.mode()) {
-            return; // not the /tmp signature; not this regression
+            eprintln!("skip: temp dir is not the root-owned-sticky /tmp signature");
+            return;
         }
         // Determine our effective uid by stat-ing a file we create ourselves.
         let probe = tmpdir.join(format!("rocmdashd-uidprobe-{}", std::process::id()));
         if std::fs::write(&probe, b"x").is_err() {
-            return; // cannot write a probe; skip rather than guess our uid
+            eprintln!("skip: cannot write a probe file; cannot determine our uid");
+            return;
         }
         let my_uid = std::fs::metadata(&probe).map(|m| m.uid()).ok();
         let _ = std::fs::remove_file(&probe);

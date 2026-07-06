@@ -6073,6 +6073,10 @@ mod tests {
         // No user name at all still yields a valid per-user subdir.
         let path = dashboard_socket_path(None, None, None, PathBuf::from("/tmp"));
         assert_eq!(path, PathBuf::from("/tmp/rocm-user/rocmdashd.sock"));
+
+        // A bare empty user name (as opposed to unset) also falls back to "user".
+        let path = dashboard_socket_path(None, None, Some(String::new()), PathBuf::from("/tmp"));
+        assert_eq!(path, PathBuf::from("/tmp/rocm-user/rocmdashd.sock"));
     }
 
     #[test]
@@ -7916,6 +7920,8 @@ Class Name:                Display
         assert_eq!(cfg.daemon.instance_tick_secs, 2.0);
         assert_eq!(cfg.tui.theme, "default-dark");
         assert_eq!(cfg.tui.chat_url, None);
+        // daemon and tui defaults must agree so a default client finds the daemon.
+        assert_eq!(cfg.daemon.listen, cfg.tui.connect);
 
         let json = serde_json::to_string(&cfg).unwrap();
         let back: DashboardConfig = serde_json::from_str(&json).unwrap();
