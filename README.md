@@ -178,12 +178,22 @@ rocm serve <model> [--engine lemonade|pytorch|llama.cpp|atom|vllm|sglang]
                    [--gpu auto|<index>]
                    [--runtime-id KEY | --env-id ID]
                    [--host HOST] [--port PORT]
-                   [--foreground | --managed]
+                   [--verbose] [--foreground | --managed]
+                   [--no-smoke-test]
                    [--allow-public-bind]
 ```
 
-`--managed` runs the server in the background under rocm-cli's supervision.
-`--foreground` attaches it to the current terminal.
+By default the server runs in the background under rocm-cli's supervision and
+prints a deployment summary — a progress indicator while it starts, then a table
+with the status, the full inference endpoint, the API-qualified model name, and a
+quick smoke test (time to first token and approximate tokens/sec). Control
+returns to your shell with the server still running; manage it later with `rocm
+services` (below).
+
+`--verbose` (or `--foreground`) instead attaches the server to the current
+terminal and streams every engine log line — use it to debug a startup problem.
+`--managed` is the explicit form of the default background behavior.
+`--no-smoke-test` skips the post-startup inference probe.
 
 Use full HuggingFace model IDs (e.g., `Qwen/Qwen2.5-1.5B-Instruct`) for
 reliable cross-engine compatibility. Short aliases from `rocm model` may not

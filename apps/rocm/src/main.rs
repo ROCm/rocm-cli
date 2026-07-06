@@ -9,6 +9,7 @@ mod dash;
 mod dash_seam;
 mod provider_keys;
 mod providers;
+mod serve_summary;
 mod therock;
 mod uninstall;
 
@@ -271,12 +272,13 @@ rocm model --verbose"
     /// Start a local OpenAI-compatible model server.
     ///
     /// Picks an engine and ROCm runtime automatically unless overridden. By default the
-    /// server runs as a managed background service; use --foreground to keep it attached
-    /// to this terminal. Inspect or stop servers later with `rocm services`.
+    /// server runs as a managed background service and prints a deployment summary
+    /// (status, endpoint, model, and smoke-test metrics); use --verbose to stream engine
+    /// logs in this terminal instead. Inspect or stop servers later with `rocm services`.
     #[command(after_help = "EXAMPLES:\n  \
 rocm serve qwen2.5-7b-instruct\n  \
 rocm serve ./models/model.gguf --engine llama.cpp --port 8080\n  \
-rocm serve qwen2.5-7b-instruct --foreground --device gpu_required")]
+rocm serve qwen2.5-7b-instruct --verbose --device gpu_required")]
     Serve {
         /// Model name, alias, or local model file path.
         model: String,
@@ -308,6 +310,12 @@ rocm serve qwen2.5-7b-instruct --foreground --device gpu_required")]
         /// Keep the server managed by ROCm CLI.
         #[arg(long)]
         managed: bool,
+        /// Stream every engine log line in this terminal instead of a deployment summary.
+        #[arg(long, conflicts_with = "managed")]
+        verbose: bool,
+        /// Skip the post-startup inference smoke test (time-to-first-token, tokens/sec).
+        #[arg(long)]
+        no_smoke_test: bool,
         /// Allow binding to a non-local address.
         #[arg(long)]
         allow_public_bind: bool,
@@ -1477,8 +1485,10 @@ fn dispatch(cli: Cli) -> Result<()> {
             port,
             foreground,
             managed,
+            verbose,
+            no_smoke_test,
             allow_public_bind,
-        }) => serve(
+        }) => serve(ServeArgs {
             model,
             engine,
             device,
@@ -1489,8 +1499,10 @@ fn dispatch(cli: Cli) -> Result<()> {
             port,
             foreground,
             managed,
+            verbose,
+            no_smoke_test,
             allow_public_bind,
-        ),
+        }),
         Some(Command::Comfyui { command }) => comfyui(command),
         Some(Command::Services { command }) => services(command),
         Some(Command::Automations { command }) => automations(command),
@@ -3721,8 +3733,9 @@ fn protocol_engine_recipe_hint(
         })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn serve(
+/// Parsed `rocm serve` arguments. Grouped into a struct to keep the dispatcher
+/// and `serve()` readable now that the verb carries verbose/smoke-test controls.
+struct ServeArgs {
     model: String,
     engine: Option<String>,
     device: Option<String>,
@@ -3733,8 +3746,28 @@ fn serve(
     port: u16,
     foreground: bool,
     managed: bool,
+    verbose: bool,
+    no_smoke_test: bool,
     allow_public_bind: bool,
-) -> Result<()> {
+}
+
+fn serve(args: ServeArgs) -> Result<()> {
+    let ServeArgs {
+        model,
+        engine,
+        device,
+        gpu,
+        runtime_id,
+        env_id,
+        host,
+        port,
+        foreground,
+        managed,
+        verbose,
+        no_smoke_test,
+        allow_public_bind,
+    } = args;
+    let _ = managed; // background is now the default; --managed is accepted as an explicit synonym.
     validate_bind_host(&host, allow_public_bind)?;
     let paths = AppPaths::discover()?;
     let mut config = RocmCliConfig::load(&paths)?;
@@ -3819,63 +3852,74 @@ fn serve(
     )?;
     let service_id = generate_service_id(&selected_engine, &resolve.canonical_model_id);
 
-    println!("serve plan");
-    println!("  requested model: {model}");
-    println!("  resolved model: {}", resolve.canonical_model_id);
-    println!("  engine: {selected_engine}");
-    println!("{}", serve_engine_selection_line(&serve_engine));
-    println!("  host: {host}");
-    println!("  port: {port}");
-    if let Some(runtime_id) = resolved_selection.runtime_id.as_deref() {
-        println!("  runtime_id: {runtime_id}");
-    }
-    if let Some(env_id) = resolved_selection.env_id.as_deref() {
-        println!("  env_id: {env_id}");
-    }
-    if let Some(source) = resolved_selection.source.as_deref() {
-        println!("  selection_source: {source}");
-    }
-    println!(
-        "  device_policy: {}",
-        device_policy_name(&resolve.device_policy)
-    );
-    if cpu_only {
-        if matches!(gpu_selection, GpuSelection::Index(_)) {
-            println!(
-                "  warning: --gpu was ignored because --device cpu_only runs the model on CPU"
-            );
+    // Attached foreground streaming is the debugging path, selected by `--verbose`
+    // or `--foreground`. Everything else backgrounds the server and, when writing
+    // to an interactive terminal, shows a progress spinner + deployment summary
+    // instead of a raw log stream. Piped/captured output (CI, the chat assistant)
+    // keeps the plain line-by-line form.
+    let use_foreground = foreground || verbose;
+    let background = !use_foreground;
+    let summary_mode = background && std::io::IsTerminal::is_terminal(&std::io::stdout());
+
+    if !summary_mode {
+        println!("serve plan");
+        println!("  requested model: {model}");
+        println!("  resolved model: {}", resolve.canonical_model_id);
+        println!("  engine: {selected_engine}");
+        println!("{}", serve_engine_selection_line(&serve_engine));
+        println!("  host: {host}");
+        println!("  port: {port}");
+        if let Some(runtime_id) = resolved_selection.runtime_id.as_deref() {
+            println!("  runtime_id: {runtime_id}");
         }
-    } else {
-        match &gpu_selection {
-            GpuSelection::Auto => {
-                let csv = rocm_engine_protocol::gpu_indices_to_csv(&gpu_indices)
-                    .unwrap_or_else(|| "none".to_owned());
-                println!("  gpu: auto (selected {csv})");
+        if let Some(env_id) = resolved_selection.env_id.as_deref() {
+            println!("  env_id: {env_id}");
+        }
+        if let Some(source) = resolved_selection.source.as_deref() {
+            println!("  selection_source: {source}");
+        }
+        println!(
+            "  device_policy: {}",
+            device_policy_name(&resolve.device_policy)
+        );
+        if cpu_only {
+            if matches!(gpu_selection, GpuSelection::Index(_)) {
+                println!(
+                    "  warning: --gpu was ignored because --device cpu_only runs the model on CPU"
+                );
             }
-            GpuSelection::Index(_) => {
-                let csv = rocm_engine_protocol::gpu_indices_to_csv(&gpu_indices)
-                    .unwrap_or_else(|| "none".to_owned());
-                println!("  gpu: {csv}");
+        } else {
+            match &gpu_selection {
+                GpuSelection::Auto => {
+                    let csv = rocm_engine_protocol::gpu_indices_to_csv(&gpu_indices)
+                        .unwrap_or_else(|| "none".to_owned());
+                    println!("  gpu: auto (selected {csv})");
+                }
+                GpuSelection::Index(_) => {
+                    let csv = rocm_engine_protocol::gpu_indices_to_csv(&gpu_indices)
+                        .unwrap_or_else(|| "none".to_owned());
+                    println!("  gpu: {csv}");
+                }
+            }
+            if rocr_visible_devices_set {
+                println!(
+                    "  warning: ROCR_VISIBLE_DEVICES is set; --gpu selects by the amd-smi ordinal but \
+                     is applied via HIP_VISIBLE_DEVICES, so the chosen device may differ. Verify the \
+                     selected GPU or unset ROCR_VISIBLE_DEVICES."
+                );
+            }
+            if let Some(warning) = gpu_low_memory_warning(&gpu_indices, gpu_vram.as_deref()) {
+                println!("  {warning}");
             }
         }
-        if rocr_visible_devices_set {
-            println!(
-                "  warning: ROCR_VISIBLE_DEVICES is set; --gpu selects by the amd-smi ordinal but \
-                 is applied via HIP_VISIBLE_DEVICES, so the chosen device may differ. Verify the \
-                 selected GPU or unset ROCR_VISIBLE_DEVICES."
-            );
+        if let Some(engine_recipe) = &resolve.engine_recipe {
+            print!("{}", render_serve_engine_recipe_lines(engine_recipe));
         }
-        if let Some(warning) = gpu_low_memory_warning(&gpu_indices, gpu_vram.as_deref()) {
-            println!("  {warning}");
-        }
-    }
-    if let Some(engine_recipe) = &resolve.engine_recipe {
-        print!("{}", render_serve_engine_recipe_lines(engine_recipe));
     }
 
     let mut managed_runtime_id = resolved_selection.runtime_id.clone();
     let mut managed_env_id = resolved_selection.env_id.clone();
-    if managed && selected_engine == "pytorch" {
+    if background && selected_engine == "pytorch" {
         let engine_env = resolve_engine_env(
             &paths,
             &config,
@@ -3883,13 +3927,18 @@ fn serve(
             resolved_selection.runtime_id.as_deref(),
             resolved_selection.env_id.as_deref(),
         )?;
-        println!("  engine_env_id: {}", engine_env.env_id);
+        if !summary_mode {
+            println!("  engine_env_id: {}", engine_env.env_id);
+        }
         managed_runtime_id = Some(engine_env.runtime_id);
         managed_env_id = engine_env.managed_env_id;
     }
 
-    if managed {
-        start_managed_service(
+    if background {
+        let mut spinner =
+            serve_summary::Spinner::new(format!("Starting {model} on {selected_engine}…"));
+        spinner.tick();
+        let report = start_managed_service(
             &selected_engine,
             &service_id,
             &model,
@@ -3901,15 +3950,47 @@ fn serve(
             managed_runtime_id.as_deref(),
             managed_env_id.as_deref(),
             resolve.engine_recipe.as_ref(),
+            &mut |_elapsed| spinner.tick(),
         )?;
-        ensure_background_helper_running()?;
+        ensure_background_helper_running_quiet(summary_mode)?;
+
+        if summary_mode {
+            // Best-effort inference smoke test, on by default (opt out with
+            // `--no-smoke-test`). Only meaningful for a freshly-ready server we
+            // just launched; skipped when metrics could not be shown anyway.
+            let metrics = if !no_smoke_test && !report.already_running && report.status == "ready" {
+                spinner.set_label("Running smoke test…");
+                serve_summary::run_smoke_test(&paths, &resolve.canonical_model_id)
+            } else {
+                serve_summary::SmokeMetrics::default()
+            };
+            spinner.clear();
+
+            let notes = collect_serve_notes(
+                cpu_only,
+                &gpu_selection,
+                rocr_visible_devices_set,
+                &gpu_indices,
+                gpu_vram.as_deref(),
+            );
+            let summary = serve_summary::DeploymentSummary {
+                engine: selected_engine.clone(),
+                api_model: resolve.canonical_model_id,
+                chat_endpoint: format!("{}/chat/completions", report.endpoint_url),
+                service_id: report.service_id.clone(),
+                status: report.status.clone(),
+                already_running: report.already_running,
+                metrics,
+                notes,
+            };
+            print!("{}", serve_summary::render_summary(&summary));
+        } else {
+            spinner.clear();
+            print_managed_launch_plain(&report);
+        }
         return Ok(());
     }
 
-    if !foreground {
-        println!("  mode: foreground (default)");
-        println!("  note: use --managed to hand supervision to rocmd.");
-    }
     run_foreground_service(
         &selected_engine,
         &service_id,
@@ -3922,6 +4003,38 @@ fn serve(
         resolved_selection.env_id.as_deref(),
         resolve.engine_recipe.as_ref(),
     )
+}
+
+/// GPU/device warnings folded into the interactive deployment summary. Mirrors the
+/// inline warnings printed in the plain serve plan, in the same order.
+fn collect_serve_notes(
+    cpu_only: bool,
+    gpu_selection: &GpuSelection,
+    rocr_visible_devices_set: bool,
+    gpu_indices: &[u32],
+    gpu_vram: Option<&[GpuVramUsage]>,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    if cpu_only {
+        if matches!(gpu_selection, GpuSelection::Index(_)) {
+            notes.push(
+                "--gpu was ignored because --device cpu_only runs the model on CPU".to_owned(),
+            );
+        }
+    } else {
+        if rocr_visible_devices_set {
+            notes.push(
+                "ROCR_VISIBLE_DEVICES is set; --gpu selects by the amd-smi ordinal but is applied \
+                 via HIP_VISIBLE_DEVICES, so the chosen device may differ. Verify the selected GPU \
+                 or unset ROCR_VISIBLE_DEVICES."
+                    .to_owned(),
+            );
+        }
+        if let Some(warning) = gpu_low_memory_warning(gpu_indices, gpu_vram) {
+            notes.push(warning);
+        }
+    }
+    notes
 }
 
 fn validate_bind_host(host: &str, allow_public_bind: bool) -> Result<()> {
@@ -3990,6 +4103,22 @@ fn managed_service_process_command(program: &Path, args: &[String]) -> ProcessCo
     command
 }
 
+/// Engine-neutral result of a managed launch. Returned rather than printed so the
+/// caller can render it either as the rich deployment summary (interactive TTY) or
+/// as the plain line-by-line form (piped output, chat assistant), from one code path.
+struct ManagedLaunchReport {
+    service_id: String,
+    /// `http://host:port/v1`.
+    endpoint_url: String,
+    /// `"ready"`, `"starting"`, or the existing service's status.
+    status: String,
+    /// True when an equivalent service was already live and nothing was spawned.
+    already_running: bool,
+    child_pid: Option<u32>,
+    log_path: Option<PathBuf>,
+    manifest_path: Option<PathBuf>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn start_managed_service(
     engine: &str,
@@ -4003,7 +4132,8 @@ fn start_managed_service(
     runtime_id: Option<&str>,
     env_id: Option<&str>,
     engine_recipe: Option<&EngineRecipeHint>,
-) -> Result<()> {
+    on_wait_tick: &mut dyn FnMut(Duration),
+) -> Result<ManagedLaunchReport> {
     let paths = AppPaths::discover()?;
     paths.ensure()?;
     fs::create_dir_all(paths.services_dir())?;
@@ -4017,11 +4147,6 @@ fn start_managed_service(
     if let Some(existing) =
         existing_live_managed_service(&paths, engine, &resolve.canonical_model_id)
     {
-        println!("managed service already running");
-        println!("  service_id: {}", existing.service_id);
-        println!("  endpoint: {}", existing.endpoint_url);
-        println!("  status: {}", existing.status);
-        println!("  note: existing service detected; no second process spawned");
         record_cli_audit_event(
             &paths,
             "service",
@@ -4033,7 +4158,15 @@ fn start_managed_service(
             ),
             Some(&existing.service_id),
         );
-        return Ok(());
+        return Ok(ManagedLaunchReport {
+            service_id: existing.service_id,
+            endpoint_url: existing.endpoint_url,
+            status: existing.status,
+            already_running: true,
+            child_pid: None,
+            log_path: None,
+            manifest_path: None,
+        });
     }
 
     let mut record = ManagedServiceRecord::new(
@@ -4121,26 +4254,17 @@ fn start_managed_service(
     #[cfg(windows)]
     thread::sleep(Duration::from_millis(200));
 
-    let readiness = wait_for_service_http_ready(
+    let readiness = wait_for_service_http_ready_with_progress(
         engine,
         host,
         port,
         &resolve.canonical_model_id,
         Duration::from_secs(45),
+        on_wait_tick,
     );
     record.status = if readiness { "ready" } else { "starting" }.to_owned();
     record.write()?;
     let endpoint_url = format!("{}/v1", format_http_base_url(host, port));
-    println!("managed service launched");
-    println!("  service_id: {service_id}");
-    println!("  process_pid: {child_pid}");
-    println!("  endpoint: {endpoint_url}");
-    println!("  log_path: {}", record.log_path.display());
-    println!("  manifest_path: {}", record.manifest_path.display());
-    println!(
-        "  readiness: {}",
-        if readiness { "ready" } else { "starting" }
-    );
     record_cli_audit_event(
         &paths,
         "service",
@@ -4155,7 +4279,43 @@ fn start_managed_service(
         ),
         Some(service_id),
     );
-    Ok(())
+    Ok(ManagedLaunchReport {
+        service_id: service_id.to_owned(),
+        endpoint_url,
+        status: if readiness { "ready" } else { "starting" }.to_owned(),
+        already_running: false,
+        child_pid: Some(child_pid),
+        log_path: Some(record.log_path),
+        manifest_path: Some(record.manifest_path),
+    })
+}
+
+/// Reproduce the original plain, line-by-line managed-launch output. Used for
+/// non-interactive output (piped, CI, the chat assistant's `serve --managed`),
+/// where the animated summary is inappropriate. The interactive path renders the
+/// summary table via [`serve_summary`] instead.
+fn print_managed_launch_plain(report: &ManagedLaunchReport) {
+    if report.already_running {
+        println!("managed service already running");
+        println!("  service_id: {}", report.service_id);
+        println!("  endpoint: {}", report.endpoint_url);
+        println!("  status: {}", report.status);
+        println!("  note: existing service detected; no second process spawned");
+        return;
+    }
+    println!("managed service launched");
+    println!("  service_id: {}", report.service_id);
+    if let Some(child_pid) = report.child_pid {
+        println!("  process_pid: {child_pid}");
+    }
+    println!("  endpoint: {}", report.endpoint_url);
+    if let Some(log_path) = report.log_path.as_deref() {
+        println!("  log_path: {}", log_path.display());
+    }
+    if let Some(manifest_path) = report.manifest_path.as_deref() {
+        println!("  manifest_path: {}", manifest_path.display());
+    }
+    println!("  readiness: {}", report.status);
 }
 
 /// The "should we spawn?" decision for [`ensure_background_helper_running`],
@@ -4175,6 +4335,13 @@ pub(crate) fn background_helper_already_running(paths: &AppPaths) -> Result<bool
 /// itself (`command.spawn()` / `spawn_detached_no_inherit`) is logged rather than
 /// propagated; setup errors (path discovery, stdio attach) still return `Err`.
 pub(crate) fn ensure_background_helper_running() -> Result<()> {
+    ensure_background_helper_running_quiet(false)
+}
+
+/// As [`ensure_background_helper_running`], but suppresses the stdout status line
+/// when `quiet` is set. The interactive `rocm serve` summary path uses `quiet` so
+/// the daemon-spawn note does not appear above the deployment summary table.
+pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> {
     let paths = AppPaths::discover()?;
     if background_helper_already_running(&paths)? {
         return Ok(());
@@ -4199,8 +4366,12 @@ pub(crate) fn ensure_background_helper_running() -> Result<()> {
         command.spawn().map(|_| ())
     };
     match spawn_result {
-        Ok(()) => println!("  helper: started background automation daemon"),
-        Err(error) => println!("  helper: could not start background automation daemon: {error}"),
+        Ok(()) if !quiet => println!("  helper: started background automation daemon"),
+        Ok(()) => {}
+        Err(error) if !quiet => {
+            println!("  helper: could not start background automation daemon: {error}");
+        }
+        Err(_) => {}
     }
     Ok(())
 }
@@ -15053,6 +15224,28 @@ fn wait_for_service_http_ready(
     canonical_model_id: &str,
     timeout: Duration,
 ) -> bool {
+    wait_for_service_http_ready_with_progress(
+        engine,
+        host,
+        port,
+        canonical_model_id,
+        timeout,
+        &mut |_elapsed| {},
+    )
+}
+
+/// Poll the engine's health endpoints until the server answers ready or `timeout`
+/// elapses, invoking `on_tick(elapsed)` once per polling iteration so a caller can
+/// animate a spinner. Engine-neutral: `service_http_readiness_paths` already maps
+/// each engine to the right health path and normalizes the response to ready/not.
+fn wait_for_service_http_ready_with_progress(
+    engine: &str,
+    host: &str,
+    port: u16,
+    canonical_model_id: &str,
+    timeout: Duration,
+    on_tick: &mut dyn FnMut(Duration),
+) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
         for path in service_http_readiness_paths(engine) {
@@ -15069,6 +15262,7 @@ fn wait_for_service_http_ready(
                 return true;
             }
         }
+        on_tick(start.elapsed());
         thread::sleep(Duration::from_millis(250));
     }
     false
@@ -15358,6 +15552,58 @@ mod tests {
             listed, expected,
             "serve --device help possible-values must stay in sync with DevicePolicy names"
         );
+    }
+
+    fn parse_serve(args: &[&str]) -> Result<Cli, clap::Error> {
+        let mut argv = vec!["rocm", "serve", "qwen"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv)
+    }
+
+    #[test]
+    fn serve_parses_verbose_and_no_smoke_test_flags() {
+        let cli = parse_serve(&["--verbose", "--no-smoke-test"]).expect("flags parse");
+        match cli.command {
+            Some(Command::Serve {
+                verbose,
+                no_smoke_test,
+                foreground,
+                managed,
+                ..
+            }) => {
+                assert!(verbose, "--verbose should set verbose");
+                assert!(no_smoke_test, "--no-smoke-test should set no_smoke_test");
+                assert!(!foreground);
+                assert!(!managed);
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_verbose_conflicts_with_managed() {
+        // `--verbose` streams logs in the foreground; a backgrounded managed
+        // server has no foreground stream to attach to, so the two are mutually
+        // exclusive (point users at `rocm logs` for a managed server instead).
+        let error = parse_serve(&["--verbose", "--managed"]).expect_err("conflict rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn serve_defaults_have_all_flags_off() {
+        let cli = parse_serve(&[]).expect("bare serve parses");
+        match cli.command {
+            Some(Command::Serve {
+                verbose,
+                no_smoke_test,
+                foreground,
+                managed,
+                ..
+            }) => {
+                assert!(!verbose && !no_smoke_test && !foreground && !managed);
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
     }
 
     #[test]
