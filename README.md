@@ -45,8 +45,17 @@ gh auth login
 **Linux / WSL x86_64**:
 
 ```bash
+mkdir -p ~/.local/bin
 gh release download nightly --repo ROCm/rocm-cli --pattern rocm --output ~/.local/bin/rocm
 chmod +x ~/.local/bin/rocm
+```
+
+If `~/.local/bin` is not already on your `PATH`, add it (and persist across
+sessions):
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
 ```
 
 Direct link: <https://github.com/ROCm/rocm-cli/releases/download/nightly/rocm>
@@ -67,9 +76,36 @@ Rerun the same command to upgrade to the latest nightly.
 rocm
 ```
 
-Opens the interactive TUI. On first launch it walks through setup: choose an
-install folder and let rocm-cli download and configure ROCm. After setup the
-TUI shows live GPU utilization, active model servers, and a chat tab.
+Opens the interactive TUI. On first launch, if no ROCm installation is
+detected, it walks through setup: choose an install folder and let rocm-cli
+download and configure ROCm. If ROCm is already installed, the TUI opens
+directly to the dashboard showing live GPU utilization, active model servers,
+and a chat tab.
+
+Press `q` to exit the TUI. Use Tab to switch between the Overview, Instances,
+and Chat tabs.
+
+## Getting started
+
+Before serving a model, ensure a managed ROCm runtime is configured:
+
+```
+rocm install sdk
+```
+
+This downloads TheRock ROCm wheels and a matching PyTorch stack into a managed
+environment. On machines with an existing ROCm install, `rocm examine` will
+show it as `legacy_rocm_status: detected_unmanaged` — running `rocm install sdk`
+creates a separate managed runtime alongside it.
+
+Then serve a model:
+
+```
+rocm serve Qwen/Qwen2.5-1.5B-Instruct
+```
+
+Use `rocm model` to see available model recipes and their GPU memory
+requirements.
 
 ## Quick reference
 
@@ -118,6 +154,10 @@ rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
                     [--runtime-key KEY] [--channel LABEL] [--replace]
 ```
 
+`adopt` registers an existing TheRock-based Python environment as a managed
+runtime. It does not work with standard ROCm package installs (e.g.
+`/opt/rocm`); use `rocm install sdk` instead.
+
 ### Inference engines
 
 ```
@@ -144,6 +184,14 @@ rocm serve <model> [--engine lemonade|pytorch|llama.cpp|atom|vllm|sglang]
 
 `--managed` runs the server in the background under rocm-cli's supervision.
 `--foreground` attaches it to the current terminal.
+
+Use full HuggingFace model IDs (e.g., `Qwen/Qwen2.5-1.5B-Instruct`) for
+reliable cross-engine compatibility. Short aliases from `rocm model` may not
+resolve with all engines.
+
+Some models (e.g., Llama) are gated and require HuggingFace authentication.
+Log in with `huggingface-cli login` or set `HF_TOKEN` in your environment
+before serving gated models.
 
 `--gpu` selects which AMD GPU the server runs on. `auto` (the default) probes
 per-GPU VRAM with `amd-smi` and picks the lowest-numbered GPU that is idle and
