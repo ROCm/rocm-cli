@@ -14,7 +14,6 @@ pub mod docker;
 pub mod engine_registry;
 pub mod host;
 pub mod lemonade;
-pub mod llama_slots;
 pub mod parallel;
 pub mod proc_scan;
 pub mod sysfs;

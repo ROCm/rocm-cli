@@ -5349,22 +5349,22 @@ pub fn builtin_model_recipes() -> Vec<ModelRecipeRecord> {
             task: "chat".to_owned(),
             source: "recipe_index".to_owned(),
             revision: "main".to_owned(),
-            loader: "transformers".to_owned(),
+            loader: "llamacpp".to_owned(),
             trust_remote_code: false,
-            dtype: "float16".to_owned(),
+            dtype: "gguf".to_owned(),
             device_policy: "gpu_required".to_owned(),
             min_gpu_mem_gb: Some(6),
             recommended_system_ram_gb: Some(8),
             quantization: Some("none; recommended small assistant recipe".to_owned()),
             artifact_hint: Some(
-                "Hugging Face model id; selected as the built-in low-VRAM assistant path"
+                "Lemonade model id; resolved internally to a GGUF build of this model"
                     .to_owned(),
             ),
             artifacts: Vec::new(),
             engine_recipes: Vec::new(),
             manual_alternatives: vec!["qwen-tiny".to_owned(), "tiny-gpt2".to_owned()],
             chat_template_mode: "auto".to_owned(),
-            preferred_engines: vec!["pytorch".to_owned()],
+            preferred_engines: vec!["lemonade".to_owned()],
             warnings: vec![
                 "recommended local assistant path for low-VRAM ROCm machines".to_owned(),
             ],
@@ -5388,14 +5388,14 @@ pub fn builtin_model_recipes() -> Vec<ModelRecipeRecord> {
             recommended_system_ram_gb: Some(8),
             quantization: Some("none; tiny instruct smoke recipe".to_owned()),
             artifact_hint: Some(
-                "Hugging Face model id; verified with the managed PyTorch Transformers line"
+                "Hugging Face safetensors model id; served on GPU through vLLM (Linux/WSL)"
                     .to_owned(),
             ),
             artifacts: Vec::new(),
             engine_recipes: Vec::new(),
             manual_alternatives: vec!["qwen".to_owned(), "tiny-gpt2".to_owned()],
             chat_template_mode: "auto".to_owned(),
-            preferred_engines: vec!["pytorch".to_owned()],
+            preferred_engines: vec!["vllm".to_owned()],
             warnings: vec![
                 "tiny smoke path; use qwen for the smarter low-VRAM assistant".to_owned(),
             ],
@@ -5492,7 +5492,7 @@ pub fn builtin_model_recipes() -> Vec<ModelRecipeRecord> {
             chat_template_mode: "auto".to_owned(),
             preferred_engines: vec!["vllm".to_owned()],
             warnings: vec![
-                "not a verified PyTorch smoke path: Transformers 4.57.6 reports unknown architecture qwen3_5"
+                "not a verified vLLM smoke path: Transformers 4.57.6 reports unknown architecture qwen3_5"
                     .to_owned(),
             ],
         },
@@ -5526,7 +5526,7 @@ pub fn builtin_model_recipes() -> Vec<ModelRecipeRecord> {
                 "tiny-gpt2".to_owned(),
             ],
             chat_template_mode: "auto".to_owned(),
-            preferred_engines: vec!["vllm".to_owned(), "pytorch".to_owned()],
+            preferred_engines: vec!["vllm".to_owned()],
             warnings: vec![
                 "this recipe prefers ROCm GPU execution and may span multiple accelerators"
                     .to_owned(),
@@ -5563,7 +5563,7 @@ pub fn builtin_model_recipes() -> Vec<ModelRecipeRecord> {
                 "llama-3.2-3b-instruct".to_owned(),
             ],
             chat_template_mode: "auto".to_owned(),
-            preferred_engines: vec!["vllm".to_owned(), "pytorch".to_owned()],
+            preferred_engines: vec!["vllm".to_owned()],
             warnings: vec![
                 "this model family is configured with trust_remote_code enabled by recipe"
                     .to_owned(),
@@ -5588,14 +5588,14 @@ pub fn builtin_model_recipes() -> Vec<ModelRecipeRecord> {
             recommended_system_ram_gb: Some(16),
             quantization: Some("none; bfloat16 weights".to_owned()),
             artifact_hint: Some(
-                "Hugging Face model id for PyTorch; llama.cpp serving requires an explicit GGUF path"
+                "Hugging Face safetensors model id; served on GPU through vLLM (Linux/WSL)"
                     .to_owned(),
             ),
             artifacts: Vec::new(),
             engine_recipes: Vec::new(),
             manual_alternatives: vec!["qwen".to_owned(), "tiny-gpt2".to_owned()],
             chat_template_mode: "auto".to_owned(),
-            preferred_engines: vec!["pytorch".to_owned(), "llama.cpp".to_owned()],
+            preferred_engines: vec!["vllm".to_owned()],
             warnings: Vec::new(),
         },
         ModelRecipeRecord {
@@ -5616,7 +5616,7 @@ pub fn builtin_model_recipes() -> Vec<ModelRecipeRecord> {
             engine_recipes: Vec::new(),
             manual_alternatives: Vec::new(),
             chat_template_mode: "auto".to_owned(),
-            preferred_engines: vec!["pytorch".to_owned()],
+            preferred_engines: vec!["vllm".to_owned()],
             warnings: Vec::new(),
         },
     ]
@@ -5900,11 +5900,7 @@ fn sibling_binary_candidates(current_exe: &Path, binary_name: &str) -> Result<Ve
 }
 
 pub fn engine_binary_path(engine: &str) -> Result<PathBuf> {
-    let binary_engine = match engine {
-        "llama.cpp" => "llama-cpp",
-        other => other,
-    };
-    sibling_binary_path(&format!("rocm-engine-{binary_engine}"))
+    sibling_binary_path(&format!("rocm-engine-{engine}"))
 }
 
 pub fn daemon_binary_path() -> Result<PathBuf> {
@@ -6597,7 +6593,7 @@ Class Name:                Display
     #[test]
     fn managed_therock_family_falls_back_to_engine_env_manifest() -> Result<()> {
         let (root, paths) = temp_app_paths("engine-therock-family");
-        let manifests = paths.engine_manifests_dir("pytorch");
+        let manifests = paths.engine_manifests_dir("vllm");
         fs::create_dir_all(&manifests)?;
         fs::write(
             manifests.join("env.json"),
@@ -6800,7 +6796,7 @@ Class Name:                Display
             cpu: Some("AMD Ryzen".to_owned()),
             system_ram_gib: Some(64.0),
             interactive_terminal: false,
-            default_engine: "pytorch".to_owned(),
+            default_engine: "vllm".to_owned(),
             detected_gfx_target: None,
             compatible_therock_family: Some("gfx120X-all".to_owned()),
             detected_therock_family: None,
@@ -6852,7 +6848,7 @@ Class Name:                Display
             cpu: None,
             system_ram_gib: None,
             interactive_terminal: false,
-            default_engine: "pytorch".to_owned(),
+            default_engine: "vllm".to_owned(),
             detected_gfx_target: None,
             compatible_therock_family: None,
             detected_therock_family: None,
@@ -7159,7 +7155,7 @@ Class Name:                Display
         assert_eq!(artifact.kind, "huggingface");
         let expected_sha = "a".repeat(64);
         assert_eq!(artifact.sha256.as_deref(), Some(expected_sha.as_str()));
-        assert_eq!(artifact.engines, vec!["pytorch"]);
+        assert_eq!(artifact.engines, vec!["vllm"]);
         assert_eq!(
             artifact
                 .source_policy
@@ -7650,13 +7646,13 @@ Class Name:                Display
                 license: Some("apache-2.0".to_owned()),
                 gated: Some(false),
                 quantization: Some("none".to_owned()),
-                engines: vec!["pytorch".to_owned()],
+                engines: vec!["vllm".to_owned()],
                 source_policy: None,
             }],
             engine_recipes: Vec::new(),
             manual_alternatives: Vec::new(),
             chat_template_mode: "auto".to_owned(),
-            preferred_engines: vec!["pytorch".to_owned()],
+            preferred_engines: vec!["vllm".to_owned()],
             warnings: Vec::new(),
         }
     }
@@ -7762,9 +7758,9 @@ Class Name:                Display
         }
 
         assert_eq!(
-            paths.engine_envs_dir("pytorch"),
+            paths.engine_envs_dir("vllm"),
             normalize_runtime_path_for_host(&override_root)
-                .join("pytorch")
+                .join("vllm")
                 .join("envs")
         );
 
@@ -7780,10 +7776,10 @@ Class Name:                Display
     #[test]
     fn legacy_config_without_telemetry_uses_default_policy() -> Result<()> {
         let config = serde_json::from_value::<RocmCliConfig>(serde_json::json!({
-            "default_engine": "pytorch"
+            "default_engine": "vllm"
         }))?;
 
-        assert_eq!(config.default_engine.as_deref(), Some("pytorch"));
+        assert_eq!(config.default_engine.as_deref(), Some("vllm"));
         assert_eq!(config.telemetry.mode_label(), TELEMETRY_MODE_LOCAL);
         Ok(())
     }

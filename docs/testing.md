@@ -42,9 +42,7 @@ not require a managed runtime, and verifies:
 - telemetry-off config behavior
 - GPU-required recipe planning for `tiny-gpt2`
 - exact-runtime rejection for `rocm engines install` before any runtime exists
-- direct llama.cpp external-runtime probing with a fake local `llama-server`
-- explicit PyTorch `tiny-gpt2` GPU-required recipe resolution
-- direct adapter and `rocm serve` CPU policy rejection
+- direct vLLM adapter and `rocm serve` CPU policy rejection
 - GPU-required paths fail loudly instead of silently falling back
 - no first-run pip cache or runtime registry is created
 
@@ -89,7 +87,7 @@ cargo test -p rocm --bin rocm permissions_
 
 Self-hosted GPU CI smoke is intentionally non-mutating. The MI300X job builds
 the workspace, runs `rocm examine`, then runs `detect` and `capabilities` for
-all first-party engine adapters: PyTorch, llama.cpp, ATOM, vLLM, and SGLang.
+all first-party engine adapters: Lemonade and vLLM.
 Live serving acceptance remains separate because it needs engine-specific
 runtime installs, model artifacts, and supported upstream GPU targets.
 
@@ -116,8 +114,8 @@ Ambiguous runtime selectors should also fail before engine install or serve
 launches:
 
 ```bash
-rocm engines install pytorch
-rocm serve target/models/stories260K.gguf --engine llama.cpp --managed
+rocm engines install vllm
+rocm serve qwen --engine vllm --managed
 ```
 
 On a host where `default_runtime_id` matches multiple registered runtime keys,
@@ -157,7 +155,7 @@ Then it verifies:
 - `python -m rocm_sdk targets`
 - runtime-only TheRock wheel discovery through
   `rocm_sdk.find_libraries("amdhip64", "hipblas")`
-- llama.cpp adapter discovery of the managed TheRock HIP runtime environment
+- vLLM adapter discovery of the managed TheRock runtime environment
 
 Run the full live test with auto-detected GPU family:
 
@@ -183,72 +181,6 @@ selection:
 
 ```bash
 python scripts/therock_sdk_install_test.py --root .rocm-work/tests/therock-sdk-install --fresh --family gfx120X-all
-```
-
-## PyTorch TheRock GPU Acceptance
-
-This opt-in test verifies that PyTorch can run a tiny model on your AMD GPU
-using the TheRock ROCm wheels managed by rocm-cli. It does not use an external
-Python environment and it does not fall back to CPU.
-
-Simple path:
-
-```bash
-rocm
-```
-
-In the first-time setup screen, choose the install folder and choose
-`Install ROCm`. After setup finishes, install the managed PyTorch engine:
-
-```bash
-rocm engines install pytorch
-```
-
-The engine installer should use the Python version from the selected managed
-TheRock runtime, pin `torch`, `torchvision`, and `torchaudio` to the exact
-versions already installed in that runtime, and keep its pip cache under
-rocm-cli's cache directory. It must not ask pip to solve an unbounded TheRock
-torch stack.
-
-Then run the GPU acceptance script:
-
-```bash
-python scripts/pytorch_therock_gpu_test.py
-```
-
-The script uses the active rocm-cli runtime key. If no runtime is active, run
-`rocm runtimes activate <runtime_key>` first or pass `--runtime-id
-<runtime_key>`. A broad runtime id is only accepted when it matches one saved
-runtime unambiguously.
-
-Developer direct path:
-
-```bash
-rocm install sdk --channel release --format wheel
-rocm runtimes activate <runtime_key from install output>
-rocm engines install pytorch
-python scripts/pytorch_therock_gpu_test.py
-```
-
-The script starts a local PyTorch test server in AMD GPU mode, loads
-`hf-internal-testing/tiny-random-gpt2`, sends a tiny prompt, verifies the
-service reports AMD GPU execution, and checks the worker process for loaded HIP
-modules from the managed PyTorch folder. PyTorch reports ROCm GPUs through its
-`cuda` device API; seeing `device: cuda` in the test output is expected on AMD
-ROCm. Model downloads are localized under `target/test-cache/huggingface`
-unless Hugging Face cache variables are already set. When
-`ROCM_CLI_CACHE_DIR` or `ROCM_CLI_DATA_DIR` are set for isolated acceptance
-tests, the script keeps its Hugging Face cache, state file, and logs under
-those rocm-cli directories. If `CARGO_TARGET_DIR` is set, the default engine
-binary is resolved from that target directory. If the managed PyTorch folder is
-missing, the script stops with the exact
-`rocm engines install pytorch` prerequisite instead of creating a surprise
-install or using CPU.
-
-Offline selector sanity check:
-
-```bash
-python scripts/pytorch_therock_gpu_test.py --self-test
 ```
 
 ## ComfyUI TheRock GPU Acceptance
@@ -391,11 +323,9 @@ cargo test -p rocm --bin rocm logs
 cargo test -p rocm-core model_recipe
 cargo test -p rocm-core load_model_recipe_index
 cargo test -p rocm --bin rocm update_report_policy
-cargo test -p rocm-engine-pytorch stdio_protocol_routes_all_methods_without_side_effects
-cargo test -p rocm-engine-llama-cpp stdio_protocol_routes_all_methods_without_side_effects
-cargo test -p rocm-engine-atom
+cargo test -p rocm-engine-lemonade stdio_protocol_routes_all_methods_without_side_effects
+cargo test -p rocm-engine-vllm stdio_protocol_routes_all_methods_without_side_effects
 cargo test -p rocm-engine-vllm
-cargo test -p rocm-engine-sglang
 cargo test -p rocmd event_collector
 cargo test -p rocmd event_dispatcher
 ```
@@ -458,10 +388,10 @@ Engine inventory smoke on native Windows:
 rocm engines list
 ```
 
-The packaged Linux/WSL-only ATOM, vLLM, and SGLang adapters should render
+The packaged Linux/WSL-only vLLM adapter should render
 `runtime: unsupported_native_windows`, not `runtime: not found`.
-The vLLM and SGLang live GPU acceptance scripts should return a clean skip on
-native Windows. They remain strict GPU-required tests on Linux/WSL.
+The vLLM live GPU acceptance script should return a clean skip on native
+Windows. It remains a strict GPU-required test on Linux/WSL.
 
 Serve resolver focused tests:
 
@@ -477,11 +407,8 @@ Engine recipe adapter contract focused tests:
 ```bash
 cargo test -p rocm-engine-protocol engine_recipe_hint_roundtrips_through_resolve_request
 cargo test -p rocm --bin rocm engine_recipe
-cargo test -p rocm-engine-pytorch engine_recipe
-cargo test -p rocm-engine-llama-cpp engine_recipe
-cargo test -p rocm-engine-atom engine_recipe
+cargo test -p rocm-engine-lemonade engine_recipe
 cargo test -p rocm-engine-vllm engine_recipe
-cargo test -p rocm-engine-sglang engine_recipe
 ```
 
 These tests verify that signed-index engine-specific recipe metadata is mapped
@@ -866,34 +793,6 @@ same watcher policy paths as scheduler, managed-service recovery, GPU
 telemetry, and cache-warm proposal events. See `docs/automations.md` for the
 local curl smoke and accepted fields.
 
-ATOM TheRock GPU acceptance:
-
-```bash
-cargo test -p rocm-engine-atom managed_env_reflects_managed_runtime_manifest_source
-cargo test -p rocm-engine-atom running_state_records_managed_therock_env_for_gpu_verification
-python -m py_compile scripts/atom_therock_gpu_test.py
-python scripts/atom_therock_gpu_test.py --self-test
-```
-
-Live ATOM ROCm serving is only valid on a GPU/runtime/model combination
-supported by upstream ATOM. The current WSL validation host is `gfx1201`, while
-upstream ATOM documentation currently lists Instinct `gfx950`, `gfx942`, and
-`gfx90a` targets. Do not force a different target and do not use CPU fallback.
-On a supported ATOM ROCm target, install/build ATOM inside a rocm-cli managed
-TheRock runtime, then verify `rocm-engine-atom detect` reports
-`managed_env: true`, launch with `gpu_required`, and check loaded HIP libraries
-from the managed TheRock SDK wheel directories:
-
-```bash
-python3 scripts/atom_therock_gpu_test.py \
-  --engine /home/user/.cache/rocm-cli-target/debug/rocm-engine-atom \
-  --model Qwen/Qwen3-0.6B
-```
-
-The script defaults to the active exact runtime key. If `--runtime-id` is used,
-it must be an exact runtime key or an unambiguous runtime id. It rejects
-external ATOM command/Python overrides and does not allow CPU fallback.
-
 vLLM TheRock GPU acceptance:
 
 ```bash
@@ -920,41 +819,6 @@ For TheRock 7.13, patch vLLM's GPTQ ROCm compatibility guard to include HIP
 On native Windows this script prints a JSON skip result; run it from WSL/Linux
 for live ROCm GPU acceptance.
 
-SGLang TheRock GPU acceptance:
-
-```bash
-cargo test -p rocm-engine-sglang managed_env_reflects_managed_runtime_manifest_source
-cargo test -p rocm-engine-sglang running_state_records_managed_therock_env_for_gpu_verification
-python -m py_compile scripts/sglang_therock_gpu_test.py
-python scripts/sglang_therock_gpu_test.py --self-test
-```
-
-Live SGLang ROCm serving is only valid on a GPU target supported by upstream
-SGLang ROCm kernels. The current WSL validation host is `gfx1201`; SGLang
-`v0.5.12` and current `origin/main` reject `sgl-kernel/setup_rocm.py` for that
-target and accept only `gfx942`/`gfx950`. Do not force a different target and
-do not use CPU fallback. On a supported SGLang ROCm target, install/build
-SGLang inside a rocm-cli managed TheRock runtime, then verify
-`rocm-engine-sglang detect` reports `managed_env: true`, launch with
-`gpu_required`, and check loaded HIP libraries from the managed TheRock SDK
-wheel directories:
-
-```bash
-python3 scripts/sglang_therock_gpu_test.py \
-  --engine /home/user/.cache/rocm-cli-target/debug/rocm-engine-sglang \
-  --model Qwen/Qwen2.5-1.5B-Instruct
-```
-
-The script defaults to the active exact runtime key. If `--runtime-id` is used,
-it must be an exact runtime key or an unambiguous runtime id. It rejects
-external SGLang command/Python overrides and does not allow CPU fallback.
-For MI300X/gfx942 TheRock 7.13, install SGLang from source with
-`python/pyproject_other.toml` and the ROCm `sgl-kernel` wheel. Use the
-rocm-cli adapter's Triton attention default unless AITER has been built and
-verified for the runtime.
-On native Windows this script prints a JSON skip result; run it from WSL/Linux
-for live ROCm GPU acceptance.
-
 ## Windows Tool Notes
 
 The TheRock SDK wheel install path should not require users to install global
@@ -967,61 +831,6 @@ SDK install test reports these when `--check-windows-tools` is set, but normal
 SDK wheel setup should avoid global source-build tools.
 
 Reference: [TheRock Windows install tools](https://github.com/ROCm/TheRock/blob/main/docs/development/windows_support.md#install-tools)
-
-## llama.cpp TheRock GPU Test
-
-This opt-in test requires a HIP-enabled `llama-server`, a rocm-cli managed
-TheRock runtime, and an AMD GPU. It does not allow CPU fallback.
-
-```bash
-python scripts/llama_cpp_therock_gpu_test.py --llama-server target/llama.cpp-build-hip/bin/llama-server.exe
-```
-
-To verify the background `launch` command also returns promptly when its JSON
-output is captured by a shell or test harness:
-
-```bash
-python scripts/llama_cpp_therock_gpu_test.py --launch-mode launch --llama-server target/llama.cpp-build-hip/bin/llama-server.exe
-```
-
-WSL command shape, using the WSL-built adapter and server:
-
-```bash
-python3 scripts/llama_cpp_therock_gpu_test.py \
-  --engine /home/user/.cache/rocm-cli-target/debug/rocm-engine-llama-cpp \
-  --llama-server /home/user/.cache/rocm-cli-llama.cpp-build-hip/bin/llama-server \
-  --model-path /mnt/d/path/to/rocm-cli/target/models/stories260K.gguf \
-  --timeout 120
-```
-
-The script uses the active rocm-cli runtime key. If no runtime is active, run
-`rocm runtimes activate <runtime_key>` first or pass `--runtime-id
-<runtime_key>`. A broad runtime id is only accepted when it matches one saved
-runtime unambiguously; the test no longer guesses by picking the newest
-manifest. When testing isolated state, set `ROCM_CLI_CONFIG_DIR` and
-`ROCM_CLI_DATA_DIR`; the script should honor those directories instead of
-looking in the default `~/.rocm` state. If `CARGO_TARGET_DIR` is set, the
-default adapter binary is resolved from that target directory. It downloads or
-reuses the tiny `stories260K.gguf` model, launches the llama.cpp adapter with
-`gpu_required`, checks `/health` and `/v1/completions`, and on Windows verifies
-that HIP DLLs load from the staged rocm-cli TheRock runtime rather than
-`System32`. On Linux/WSL it verifies HIP and BLAS shared objects are loaded
-from the managed TheRock SDK wheel roots via `/proc/<pid>/maps`, including
-split `_rocm_sdk_core` and `_rocm_sdk_libraries_*` wheel directories.
-
-Offline selector sanity check:
-
-```bash
-python scripts/llama_cpp_therock_gpu_test.py --self-test
-```
-
-Top-level managed serving smoke:
-
-```bash
-# Set ROCM_CLI_LLAMA_CPP_SERVER if llama-server is not on PATH.
-rocm serve target/models/stories260K.gguf --engine llama.cpp --managed --port 11450
-rocmd sandbox-run stop_server --service-id <printed-service-id> --allow-native-fallback
-```
 
 ## WSL Preflight
 

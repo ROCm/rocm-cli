@@ -121,8 +121,8 @@ export LD_LIBRARY_PATH="<managed TheRock library dirs>:/usr/lib/wsl/lib${LD_LIBR
 ```
 
 For `rocm-cli`, the command itself should resolve the managed runtime manifest
-and apply that environment before launching non-PyTorch HIP apps such as
-`llama.cpp`. Users should not have to hand-export these values.
+and apply that environment before launching HIP apps such as Lemonade's bundled
+`llama.cpp` backend. Users should not have to hand-export these values.
 
 ## Examine And Install UX Recommendations
 
@@ -154,8 +154,8 @@ and apply that environment before launching non-PyTorch HIP apps such as
 2. Explain missing ROCDXG if absent.
 3. Ask before any `sudo apt install` or `sudo make install`.
 4. Install TheRock into a managed venv.
-5. Install/build HIP `llama.cpp`.
-6. Run a tiny GGUF GPU smoke test with CPU fallback disabled.
+5. Install a serving engine (Lemonade or vLLM).
+6. Run a tiny GPU smoke test with CPU fallback disabled.
 
 ## Non-Destructive Tests
 
@@ -173,5 +173,5 @@ need `sudo`:
 - install ROCDXG `.deb`
 - build ROCDXG from source
 - install TheRock wheels into a fresh managed WSL venv
-- build HIP `llama.cpp`
-- run tiny GGUF inference on GPU
+- install a serving engine (Lemonade or vLLM)
+- run tiny inference on GPU

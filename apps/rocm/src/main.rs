@@ -65,6 +65,11 @@ use std::time::Duration;
 
 static BUILTIN_ENGINE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+/// User-selectable serving engines, in the order shown in `--help` and shell
+/// completions. Used as the clap `value_parser` for every user-facing `--engine`
+/// argument so the possible values stay in sync across the CLI surface.
+const SUPPORTED_ENGINES: [&str; 2] = ["lemonade", "vllm"];
+
 #[derive(Parser, Debug)]
 #[command(
     name = "rocm",
@@ -277,13 +282,13 @@ rocm model --verbose"
     /// logs in this terminal instead. Inspect or stop servers later with `rocm services`.
     #[command(after_help = "EXAMPLES:\n  \
 rocm serve qwen2.5-7b-instruct\n  \
-rocm serve ./models/model.gguf --engine llama.cpp --port 8080\n  \
+rocm serve qwen2.5-7b-instruct --engine vllm --port 8000\n  \
 rocm serve qwen2.5-7b-instruct --verbose --device gpu_required")]
     Serve {
         /// Model name, alias, or local model file path.
         model: String,
-        /// Engine to use [possible values: lemonade, pytorch, llama.cpp, vllm, sglang, atom].
-        #[arg(long)]
+        /// Engine to use.
+        #[arg(long, value_parser = SUPPORTED_ENGINES)]
         engine: Option<String>,
         /// Device policy [possible values: gpu_required, gpu_preferred, cpu_only].
         #[arg(long)]
@@ -363,7 +368,7 @@ rocm logs --search error timeout")]
     ///   - executes enabled automation watchers (update checks, driver-plan
     ///     checks, artifact prefetch) on a 5s tick in a sandboxed subprocess
     ///   - health-checks and auto-recovers managed local model servers
-    ///     (vLLM, SGLang, Lemonade, llama.cpp)
+    ///     (Lemonade, vLLM)
     ///   - collects GPU thermal/VRAM metrics every 60s for the TUI dashboard
     ///   - listens on a local webhook port for automation events from other
     ///     `rocm` commands
@@ -473,9 +478,10 @@ enum EnginesCommand {
     /// Install the selected engine into ROCm CLI's managed engine folder.
     #[command(after_help = "EXAMPLES:\n  \
 rocm engines install lemonade\n  \
-rocm engines install pytorch --reinstall")]
+rocm engines install vllm --reinstall")]
     Install {
-        /// Engine name, such as lemonade, pytorch, or llama.cpp.
+        /// Engine name.
+        #[arg(value_parser = SUPPORTED_ENGINES)]
         engine: String,
         /// ROCm runtime key to install against.
         #[arg(long)]
@@ -493,6 +499,7 @@ rocm engines install pytorch --reinstall")]
     /// Open a shell with the selected engine environment activated.
     Shell {
         /// Engine name.
+        #[arg(value_parser = SUPPORTED_ENGINES)]
         engine: String,
         /// ROCm runtime key to use.
         #[arg(long, conflicts_with = "env_id")]
@@ -652,6 +659,7 @@ enum ConfigCommand {
     /// Set the preferred ROCm install for one engine.
     SetEngine {
         /// Engine name.
+        #[arg(value_parser = SUPPORTED_ENGINES)]
         engine: String,
         /// ROCm runtime key to use.
         #[arg(long, conflicts_with = "env_id")]
@@ -666,6 +674,7 @@ enum ConfigCommand {
     /// Choose the default local model engine.
     SetDefaultEngine {
         /// Engine name.
+        #[arg(value_parser = SUPPORTED_ENGINES)]
         engine: String,
     },
     /// Clear the saved default engine.
@@ -1702,11 +1711,6 @@ fn builtin_codex_bridge_engine_inventory() -> Vec<CodexBridgeEngine> {
 
 const fn builtin_engine_inventory() -> &'static [(&'static str, &'static str)] {
     &[
-        ("pytorch", "TheRock PyTorch local serving engine"),
-        (
-            "llama.cpp",
-            "GGUF serving with ROCm GPU required by rocm-cli",
-        ),
         (
             "lemonade",
             "default embedded Lemonade server with ROCm llama.cpp backend",
@@ -1714,14 +1718,6 @@ const fn builtin_engine_inventory() -> &'static [(&'static str, &'static str)] {
         (
             "vllm",
             "Linux/WSL ROCm GPU serving engine through external vLLM",
-        ),
-        (
-            "sglang",
-            "Linux/WSL ROCm GPU serving engine through external SGLang",
-        ),
-        (
-            "atom",
-            "Linux/WSL ROCm GPU serving engine through external ATOM Python",
         ),
     ]
 }
@@ -3116,33 +3112,6 @@ fn engines(command: EnginesCommand) -> Result<()> {
             let mut config = RocmCliConfig::load(&paths)?;
             let runtime_id =
                 resolve_engine_install_runtime_id(&paths, &config, &engine, runtime_id)?;
-            if engine == "pytorch"
-                && !reinstall
-                && python_version.is_none()
-                && let Some(manifest) = active_pytorch_runtime(&paths, &runtime_id)?
-            {
-                let engine_config = config.engine_config_mut(&engine);
-                engine_config.last_installed_runtime_id = Some(runtime_id.clone());
-                if engine_config.preferred_runtime_id.is_none()
-                    && engine_config.preferred_env_id.is_none()
-                {
-                    engine_config.preferred_runtime_id = Some(runtime_id.clone());
-                }
-                config.save(&paths)?;
-                println!("engine ready");
-                println!("  engine: {engine}");
-                println!("  runtime_id: {runtime_id}");
-                println!("  env_path: {}", manifest.install_root.display());
-                record_cli_audit_event(
-                    &paths,
-                    "engine",
-                    "engine_install",
-                    "info",
-                    format!("ready engine={engine} runtime_id={runtime_id}"),
-                    None,
-                );
-                return Ok(());
-            }
             let env_root = env_root_for_engine_install(&paths, &config, &engine, &runtime_id)?;
             if engine == "vllm" {
                 ensure_openmpi_for_vllm(yes)?;
@@ -3324,27 +3293,6 @@ fn env_root_for_service(
     }
 }
 
-fn active_pytorch_runtime(
-    paths: &AppPaths,
-    runtime_id: &str,
-) -> Result<Option<therock::InstalledRuntimeManifest>> {
-    let manifests = therock::load_runtime_manifests(paths)?;
-    let manifest = select_runtime_manifest(&manifests, runtime_id)?;
-    if !pytorch_runtime_ready(manifest) {
-        return Ok(None);
-    }
-    Ok(Some(manifest.clone()))
-}
-
-fn pytorch_runtime_ready(manifest: &therock::InstalledRuntimeManifest) -> bool {
-    manifest.format == "wheel"
-        && validate_runtime_manifest_for_activation(manifest).is_ok()
-        && manifest
-            .rocm_sdk
-            .as_ref()
-            .is_some_and(|sdk| sdk.import_ok && sdk.root_path.is_some())
-}
-
 fn managed_engine_runtime_id(engine: &str) -> &'static str {
     match engine {
         "lemonade" => "lemonade-embeddable-10.6.0",
@@ -3428,7 +3376,6 @@ struct ManagedEngineEnvManifest {
 #[derive(Debug, Clone)]
 struct ResolvedEngineEnv {
     env_id: String,
-    managed_env_id: Option<String>,
     runtime_id: String,
     python_executable: String,
     env_path: PathBuf,
@@ -3447,11 +3394,6 @@ fn engine_shell(
 
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths)?;
-    if engine == "llama.cpp" {
-        bail!(
-            "`rocm engines shell llama.cpp` is not available because llama.cpp uses an external llama-server binary, not a managed Python environment"
-        );
-    }
     let resolved = resolve_engine_env(&paths, &config, engine, runtime_id, env_id)?;
     let shell_program = shell_override
         .map(str::to_owned)
@@ -3516,7 +3458,6 @@ fn resolve_engine_env(
     if let Some(env_id) = selection.env_id.as_deref() {
         let manifest = load_engine_env_manifest(paths, engine, env_id)?;
         return Ok(ResolvedEngineEnv {
-            managed_env_id: Some(manifest.env_id.clone()),
             env_id: manifest.env_id,
             runtime_id: manifest.runtime_id,
             python_executable: manifest.python_executable,
@@ -3530,25 +3471,6 @@ fn resolve_engine_env(
     let runtime_id = selection.runtime_id.with_context(|| {
         "no active ROCm runtime is configured; run `rocm runtimes list` and `rocm runtimes activate <runtime_key>`, or pass --runtime-id"
     })?;
-    if engine == "pytorch"
-        && let Some(manifest) = active_pytorch_runtime(paths, &runtime_id)?
-    {
-        let python_executable = manifest.python_executable.clone().unwrap_or_else(|| {
-            runtime_python_executable_in_env(&manifest.install_root)
-                .display()
-                .to_string()
-        });
-        return Ok(ResolvedEngineEnv {
-            env_id: manifest.runtime_key.clone(),
-            managed_env_id: None,
-            runtime_id,
-            python_executable,
-            env_path: manifest.install_root,
-            source: selection
-                .source
-                .unwrap_or_else(|| "active_therock_runtime".to_owned()),
-        });
-    }
     let env_root = env_root_for_engine_install(paths, config, engine, &runtime_id)?;
     let response = engine_request_with_env_root::<_, InstallResponse>(
         Some(paths),
@@ -3563,7 +3485,6 @@ fn resolve_engine_env(
         env_root.as_deref(),
     )?;
     Ok(ResolvedEngineEnv {
-        managed_env_id: Some(response.env_id.clone()),
         env_id: response.env_id,
         runtime_id,
         python_executable: response.python_executable,
@@ -3917,22 +3838,8 @@ fn serve(args: ServeArgs) -> Result<()> {
         }
     }
 
-    let mut managed_runtime_id = resolved_selection.runtime_id.clone();
-    let mut managed_env_id = resolved_selection.env_id.clone();
-    if background && selected_engine == "pytorch" {
-        let engine_env = resolve_engine_env(
-            &paths,
-            &config,
-            &selected_engine,
-            resolved_selection.runtime_id.as_deref(),
-            resolved_selection.env_id.as_deref(),
-        )?;
-        if !summary_mode {
-            println!("  engine_env_id: {}", engine_env.env_id);
-        }
-        managed_runtime_id = Some(engine_env.runtime_id);
-        managed_env_id = engine_env.managed_env_id;
-    }
+    let managed_runtime_id = resolved_selection.runtime_id.clone();
+    let managed_env_id = resolved_selection.env_id.clone();
 
     if background {
         let mut spinner =
@@ -7000,11 +6907,9 @@ fn prompt_can_use_read_only_without_local_assistant(prompt: &str) -> bool {
             "comfy ui",
             "comfy",
             "vllm",
-            "sglang",
             "lemonade",
             "llama.cpp",
             "llama cpp",
-            "pytorch",
             "qwen",
             "model server",
             "local server",
@@ -7029,11 +6934,9 @@ fn prompt_mentions_serving_engine_or_service(normalized_prompt: &str) -> bool {
         normalized_prompt,
         &[
             "vllm",
-            "sglang",
             "lemonade",
             "llama.cpp",
             "llama cpp",
-            "pytorch",
             "qwen",
             "model server",
             "local server",
@@ -7335,7 +7238,7 @@ fn fallback_config_tool_call_for_prompt(normalized: &str) -> Option<providers::C
         });
     }
     if any_substring(normalized, &["default engine", "set engine", "use engine"]) {
-        for engine in ["pytorch", "llama.cpp", "lemonade", "vllm", "sglang", "atom"] {
+        for engine in ["lemonade", "vllm"] {
             if normalized.contains(engine) {
                 return Some(providers::ChatToolCall {
                     id: Some("fallback-config-default-engine".to_owned()),
@@ -7717,7 +7620,7 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
         .position(|window| window.eq_ignore_ascii_case(needle))
 }
 
-const ROCM_CHAT_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's local assistant. Speak in simple English for non-technical Windows users. Use the provided ROCm tools when you need to inspect this machine, preview setup, read service logs, check updates, inspect automations, install or start ROCm-managed apps, or request ROCm/TheRock, config, engine, app, and local model server changes. For simple greetings or thanks like hello, hi, hey, ok, or thank you, reply normally; do not inspect ROCm, do not call tools, and do not launch or propose a model server. Tool-use rules: inspect first with read-only tools; call rocm_command only with argv-style args and no shell text; use natural_language_plan for ROCm requests that do not fit another read-only tool; ask for a mutating tool call only after explaining why it is needed; summarize tool results after they are returned. Read-only tools may run immediately. Tools that install, launch, stop, delete, or change state require user approval; request rocm_command and explain why. For 'is X running?', 'what is running?', status, or port questions, inspect before answering and do not start, stop, install, or serve anything. For ComfyUI or port 8188 use [\"comfyui\",\"status\"] or port_status. For vLLM, SGLang, Lemonade, PyTorch, llama.cpp, qwen, or local model servers use [\"services\",\"list\",\"--all\"] for running state and [\"engines\",\"list\"] for installed/available engine state. Treat ready/running as running, starting/recovering as starting, failed/stopped as not running, and no matching record as unknown or not managed by ROCm CLI. Interpret Examine carefully: active_runtime_status=ready means ROCm CLI has an active managed TheRock/ROCm runtime; legacy_rocm_status=not_detected only means no global system ROCm install was found. If active_runtime_status=ready, tell the user ROCm/TheRock is installed and active for ROCm CLI. For 'is TheRock installed', 'is ROCm installed', or 'which GPU is on this machine', use examine or gpu_snapshot before answering. For 'how do I setup TheRock' or install/setup requests, guide the user to choose an install folder first; do not answer with only a status check. For 'which LLMs can this machine support', use rocm_command args [\"model\"] or natural_language_plan before answering. For TheRock installs, always let the user choose the install folder. If the user names a folder or prefix, preserve that exact folder with [\"--prefix\",\"PATH\"]; you may call path_exists first to check whether that user-provided folder or its parent exists. If the user asks you to install TheRock/ROCm but has not named a folder, ask for the folder or let the guided setup folder picker collect it; do not invent a hidden default folder and do not request an install command without --prefix. Use rocm_command args [\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"wheel\",\"--prefix\",\"PATH\"] only when the user asks you to install it and a folder is known; for a requested build date add [\"--build-date\",\"YYYY-MM-DD\"] and for a requested exact version add [\"--version\",\"VERSION\"]. For config changes, inspect with [\"config\",\"show\"] first when useful, then request config subcommands such as [\"config\",\"set-default-engine\",\"lemonade\"], [\"config\",\"set-default-runtime\",\"RUNTIME_KEY\"], or [\"config\",\"set-telemetry\",\"local\"] only after explaining why. For ComfyUI, use rocm_command with args like [\"comfyui\",\"status\"], [\"comfyui\",\"logs\"], [\"comfyui\",\"install\"], [\"comfyui\",\"start\"], or [\"comfyui\",\"stop\"]. First-time setup is the same thing as bootstrap in ROCm CLI; it is a deterministic ROCm setup flow, not a separate model chat. The built-in local assistant is fixed to qwen, which maps to Qwen3-4B-Instruct-2507-GGUF served by Lemonade with gpu_required. vLLM, SGLang, PyTorch, and Lemonade are general serving engines; inspect or manage them when the user asks about general model serving, but do not switch the built-in assistant away from Lemonade. Use qwen-smoke only for a quick server smoke test. For llama.cpp, use the llama.cpp engine backed by upstream llama-server: request rocm_command args like [\"engines\",\"install\",\"llama.cpp\"] or [\"serve\",\"MODEL.gguf\",\"--engine\",\"llama.cpp\",\"--device\",\"gpu_required\",\"--managed\"]. On native Windows, vLLM and SGLang are skipped; use WSL/Linux for those ROCm GPU engines. For vLLM management, inspect engines first and use [\"engines\",\"install\",\"vllm\"] or [\"serve\",\"MODEL\",\"--engine\",\"vllm\",\"--device\",\"gpu_required\",\"--managed\"] only where the host supports it. Do not invent shell commands and do not request CPU fallback.";
+const ROCM_CHAT_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's local assistant. Speak in simple English for non-technical Windows users. Use the provided ROCm tools when you need to inspect this machine, preview setup, read service logs, check updates, inspect automations, install or start ROCm-managed apps, or request ROCm/TheRock, config, engine, app, and local model server changes. For simple greetings or thanks like hello, hi, hey, ok, or thank you, reply normally; do not inspect ROCm, do not call tools, and do not launch or propose a model server. Tool-use rules: inspect first with read-only tools; call rocm_command only with argv-style args and no shell text; use natural_language_plan for ROCm requests that do not fit another read-only tool; ask for a mutating tool call only after explaining why it is needed; summarize tool results after they are returned. Read-only tools may run immediately. Tools that install, launch, stop, delete, or change state require user approval; request rocm_command and explain why. For 'is X running?', 'what is running?', status, or port questions, inspect before answering and do not start, stop, install, or serve anything. For ComfyUI or port 8188 use [\"comfyui\",\"status\"] or port_status. For vLLM, Lemonade, qwen, or local model servers use [\"services\",\"list\",\"--all\"] for running state and [\"engines\",\"list\"] for installed/available engine state. Treat ready/running as running, starting/recovering as starting, failed/stopped as not running, and no matching record as unknown or not managed by ROCm CLI. Interpret Examine carefully: active_runtime_status=ready means ROCm CLI has an active managed TheRock/ROCm runtime; legacy_rocm_status=not_detected only means no global system ROCm install was found. If active_runtime_status=ready, tell the user ROCm/TheRock is installed and active for ROCm CLI. For 'is TheRock installed', 'is ROCm installed', or 'which GPU is on this machine', use examine or gpu_snapshot before answering. For 'how do I setup TheRock' or install/setup requests, guide the user to choose an install folder first; do not answer with only a status check. For 'which LLMs can this machine support', use rocm_command args [\"model\"] or natural_language_plan before answering. For TheRock installs, always let the user choose the install folder. If the user names a folder or prefix, preserve that exact folder with [\"--prefix\",\"PATH\"]; you may call path_exists first to check whether that user-provided folder or its parent exists. If the user asks you to install TheRock/ROCm but has not named a folder, ask for the folder or let the guided setup folder picker collect it; do not invent a hidden default folder and do not request an install command without --prefix. Use rocm_command args [\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"wheel\",\"--prefix\",\"PATH\"] only when the user asks you to install it and a folder is known; for a requested build date add [\"--build-date\",\"YYYY-MM-DD\"] and for a requested exact version add [\"--version\",\"VERSION\"]. For config changes, inspect with [\"config\",\"show\"] first when useful, then request config subcommands such as [\"config\",\"set-default-engine\",\"lemonade\"], [\"config\",\"set-default-runtime\",\"RUNTIME_KEY\"], or [\"config\",\"set-telemetry\",\"local\"] only after explaining why. For ComfyUI, use rocm_command with args like [\"comfyui\",\"status\"], [\"comfyui\",\"logs\"], [\"comfyui\",\"install\"], [\"comfyui\",\"start\"], or [\"comfyui\",\"stop\"]. First-time setup is the same thing as bootstrap in ROCm CLI; it is a deterministic ROCm setup flow, not a separate model chat. The built-in local assistant is fixed to qwen, which maps to Qwen3-4B-Instruct-2507-GGUF served by Lemonade with gpu_required. vLLM and Lemonade are the general serving engines; inspect or manage them when the user asks about general model serving, but do not switch the built-in assistant away from Lemonade. Use qwen-smoke only for a quick server smoke test. On native Windows, vLLM is skipped; use WSL/Linux for that ROCm GPU engine. For vLLM management, inspect engines first and use [\"engines\",\"install\",\"vllm\"] or [\"serve\",\"MODEL\",\"--engine\",\"vllm\",\"--device\",\"gpu_required\",\"--managed\"] only where the host supports it. Do not invent shell commands and do not request CPU fallback.";
 const ROCM_CHAT_TOOL_SKILL: &str = include_str!("../../../skills/rocm-cli-assistant/SKILL.md");
 
 fn rocm_chat_tool_system_prompt() -> String {
@@ -8932,7 +8835,7 @@ fn parse_bracketed_csv(line: &str, start: &str, end: &str) -> Vec<String> {
 fn is_engine_status_line(line: &str) -> bool {
     matches!(
         line.split_once(':').map(|(engine, _)| engine),
-        Some("pytorch" | "llama.cpp" | "lemonade" | "vllm" | "sglang" | "atom")
+        Some("lemonade" | "vllm")
     )
 }
 
@@ -9209,14 +9112,12 @@ fn parse_deterministic_engine_rows(tool_text: &str) -> Vec<DeterministicEngineRo
 }
 
 fn engine_name_from_inventory_line(line: &str) -> Option<&'static str> {
-    ["pytorch", "llama.cpp", "lemonade", "vllm", "sglang", "atom"]
-        .into_iter()
-        .find(|engine| {
-            line == *engine
-                || line
-                    .strip_prefix(*engine)
-                    .is_some_and(|rest| rest.starts_with(char::is_whitespace))
-        })
+    ["lemonade", "vllm"].into_iter().find(|engine| {
+        line == *engine
+            || line
+                .strip_prefix(*engine)
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+    })
 }
 
 fn should_request_local_tool_follow_up(
@@ -11093,14 +10994,6 @@ const fn model_registry_adapter_availability_note(engine: &str) -> Option<&'stat
         Some(
             "runtime_status=unsupported_native_windows reason=native Windows skipped; use WSL/Linux vLLM ROCm; gpu_execution_required=true; run /engine for adapter details",
         )
-    } else if rocm_core::runtime_is_windows() && engine.eq_ignore_ascii_case("sglang") {
-        Some(
-            "runtime_status=unsupported_native_windows reason=native Windows skipped; use WSL/Linux SGLang ROCm; gpu_execution_required=true; run /engine for adapter details",
-        )
-    } else if rocm_core::runtime_is_windows() && engine.eq_ignore_ascii_case("atom") {
-        Some(
-            "runtime_status=unsupported_native_windows reason=use WSL/Linux ATOM ROCm; gpu_execution_required=true; run /engine for adapter details",
-        )
     } else {
         None
     }
@@ -11212,21 +11105,6 @@ fn friendly_engine_detect_notes(engine: &str, notes: &[String]) -> Option<String
     }
     let combined = notes.join("; ");
     let lower = combined.to_ascii_lowercase();
-    if engine.eq_ignore_ascii_case("pytorch") {
-        if lower.contains("torch probe failed") || lower.contains("torch probe import failed") {
-            return Some("PyTorch engine is not ready yet; reinstall the PyTorch engine from the TUI or run `rocm engines install pytorch`.".to_owned());
-        }
-        if lower.contains("no managed pytorch envs found") {
-            return Some("PyTorch engine is not installed yet.".to_owned());
-        }
-        if lower.contains("torch probe:")
-            || lower.contains("rocm_sdk:")
-            || lower.contains("torch._rocm_init")
-            || lower.contains("managed env detected")
-        {
-            return Some("PyTorch is ready on your AMD GPU.".to_owned());
-        }
-    }
     if engine.eq_ignore_ascii_case("lemonade") {
         if lower.contains("not installed") || lower.contains("not found") {
             return Some("Lemonade is not installed yet.".to_owned());
@@ -11238,23 +11116,10 @@ fn friendly_engine_detect_notes(engine: &str, notes: &[String]) -> Option<String
             return Some("Lemonade is ready on your AMD GPU.".to_owned());
         }
     }
-    if engine.eq_ignore_ascii_case("llama.cpp") {
-        if lower.contains("llama-server not found") {
-            return Some("llama.cpp server is not installed yet.".to_owned());
-        }
-        if lower.contains("hip runtime env available") || lower.contains("therock") {
-            return Some("llama.cpp can use the active ROCm install.".to_owned());
-        }
-    }
     if engine.eq_ignore_ascii_case("vllm")
         && (lower.contains("not installed") || lower.contains("command was not found"))
     {
         return Some("vLLM is not installed in a Linux/WSL ROCm Python environment.".to_owned());
-    }
-    if engine.eq_ignore_ascii_case("sglang")
-        && (lower.contains("not installed") || lower.contains("command was not found"))
-    {
-        return Some("SGLang is not installed in a Linux/WSL ROCm Python environment.".to_owned());
     }
     if rocm_core::runtime_is_windows()
         && (lower.contains("unsupported_native_windows")
@@ -11269,18 +11134,6 @@ fn friendly_engine_detect_notes(engine: &str, notes: &[String]) -> Option<String
 
 fn friendly_engine_detect_note_fallback(note: &str) -> String {
     let lower = note.to_ascii_lowercase();
-    if lower.contains("torch probe failed") || lower.contains("torch probe import failed") {
-        return "PyTorch engine is not ready yet; reinstall the PyTorch engine from the TUI or run `rocm engines install pytorch`.".to_owned();
-    }
-    if lower.contains("no managed pytorch envs found") {
-        return "PyTorch engine is not installed yet.".to_owned();
-    }
-    if lower.contains("torch probe:")
-        || lower.contains("rocm_sdk:")
-        || lower.contains("torch._rocm_init")
-    {
-        return "PyTorch is ready on your AMD GPU.".to_owned();
-    }
     if rocm_core::runtime_is_windows()
         && (lower.contains("unsupported_native_windows")
             || lower.contains("native windows")
@@ -11303,11 +11156,7 @@ fn engine_runtime_status_label(engine: &str, detect: &DetectResponse) -> &'stati
 }
 
 fn engine_runtime_is_native_windows_unsupported(engine: &str, detect: &DetectResponse) -> bool {
-    if !rocm_core::runtime_is_windows()
-        || !(engine.eq_ignore_ascii_case("vllm")
-            || engine.eq_ignore_ascii_case("sglang")
-            || engine.eq_ignore_ascii_case("atom"))
-    {
+    if !rocm_core::runtime_is_windows() || !engine.eq_ignore_ascii_case("vllm") {
         return false;
     }
 
@@ -12784,11 +12633,7 @@ pub(crate) fn render_daemon_text(paths: &AppPaths, config: &RocmCliConfig) -> St
 fn friendly_engine_label(engine: &str) -> &str {
     match engine {
         "lemonade" => "Lemonade",
-        "pytorch" => "PyTorch",
-        "llama.cpp" => "llama.cpp",
         "vllm" => "vLLM",
-        "sglang" => "SGLang",
-        "atom" => "ATOM",
         other => other,
     }
 }
@@ -14219,8 +14064,6 @@ fn remove_path(path: &Path) -> Result<()> {
 
 pub(crate) const fn engine_inventory() -> &'static [(&'static str, &'static str)] {
     &[
-        ("pytorch", "TheRock PyTorch local serving engine"),
-        ("llama.cpp", "external GGUF serving engine for llama-server"),
         (
             "lemonade",
             "default embedded Lemonade server with ROCm llama.cpp backend",
@@ -14229,27 +14072,13 @@ pub(crate) const fn engine_inventory() -> &'static [(&'static str, &'static str)
             "vllm",
             "Linux/WSL ROCm GPU serving engine through external vLLM",
         ),
-        (
-            "sglang",
-            "Linux/WSL ROCm GPU serving engine through external SGLang",
-        ),
-        (
-            "atom",
-            "Linux/WSL ROCm GPU serving engine through external ATOM Python",
-        ),
     ]
 }
 
-fn infer_engine_from_request(lower: &str) -> Option<&str> {
-    for engine in ["pytorch", "llama.cpp", "lemonade", "vllm", "sglang", "atom"] {
-        if lower.contains(engine) {
-            return Some(engine);
-        }
-    }
-    if lower.contains("llama cpp") {
-        return Some("llama.cpp");
-    }
-    None
+fn infer_engine_from_request(lower: &str) -> Option<&'static str> {
+    ["lemonade", "vllm"]
+        .into_iter()
+        .find(|engine| lower.contains(*engine))
 }
 
 fn infer_model_from_request(request: &str) -> Option<&str> {
@@ -14522,17 +14351,7 @@ fn builtin_engine_request(
     envelope: &EngineRequestEnvelope,
 ) -> Option<EngineResponseEnvelope> {
     match engine {
-        "atom" => Some(rocm_engine_atom::builtin_handle_envelope(envelope.clone())),
         "lemonade" => Some(rocm_engine_lemonade::builtin_handle_envelope(
-            envelope.clone(),
-        )),
-        "llama.cpp" => Some(rocm_engine_llama_cpp::builtin_handle_envelope(
-            envelope.clone(),
-        )),
-        "pytorch" => Some(rocm_engine_pytorch::builtin_handle_envelope(
-            envelope.clone(),
-        )),
-        "sglang" => Some(rocm_engine_sglang::builtin_handle_envelope(
             envelope.clone(),
         )),
         "vllm" => Some(rocm_engine_vllm::builtin_handle_envelope(envelope.clone())),
@@ -14554,10 +14373,7 @@ fn run_builtin_engine_stdio(engine: &str) -> Result<()> {
 }
 
 fn builtin_engine_available(engine: &str) -> bool {
-    matches!(
-        engine,
-        "atom" | "lemonade" | "llama.cpp" | "pytorch" | "sglang" | "vllm"
-    )
+    matches!(engine, "lemonade" | "vllm")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14577,18 +14393,6 @@ fn run_builtin_engine_serve_http(
 ) -> Result<()> {
     let parsed_policy = parse_device_policy(Some(device_policy))?;
     match engine {
-        "atom" => rocm_engine_atom::builtin_serve_http(
-            service_id,
-            model_ref,
-            host,
-            port,
-            parsed_policy,
-            gpu_indices,
-            runtime_id,
-            env_id,
-            state_path,
-            engine_recipe,
-        ),
         "lemonade" => rocm_engine_lemonade::builtin_serve_http(
             service_id,
             model_ref,
@@ -14600,43 +14404,6 @@ fn run_builtin_engine_serve_http(
             env_id,
             state_path,
             log_path,
-            engine_recipe,
-        ),
-        "llama.cpp" => rocm_engine_llama_cpp::builtin_serve_http(
-            service_id,
-            model_ref,
-            host,
-            port,
-            Some(device_policy_name(&parsed_policy).to_owned()),
-            gpu_indices,
-            runtime_id,
-            env_id,
-            state_path,
-            log_path,
-            engine_recipe,
-        ),
-        "pytorch" => rocm_engine_pytorch::builtin_serve_http(
-            service_id,
-            model_ref,
-            host,
-            port,
-            parsed_policy,
-            gpu_indices,
-            env_id,
-            runtime_id,
-            state_path,
-            engine_recipe,
-        ),
-        "sglang" => rocm_engine_sglang::builtin_serve_http(
-            service_id,
-            model_ref,
-            host,
-            port,
-            parsed_policy,
-            gpu_indices,
-            runtime_id,
-            env_id,
-            state_path,
             engine_recipe,
         ),
         "vllm" => rocm_engine_vllm::builtin_serve_http(
@@ -15271,8 +15038,6 @@ fn wait_for_service_http_ready_with_progress(
 fn service_http_readiness_paths(engine: &str) -> &'static [&'static str] {
     match engine {
         "lemonade" => &["/v1/health", "/v1/models"],
-        "llama.cpp" => &["/v1/models", "/health"],
-        "pytorch" => &["/v1/models", "/healthz"],
         _ => &["/v1/models", "/v1/health", "/health", "/healthz"],
     }
 }
@@ -15514,15 +15279,27 @@ mod tests {
             .unwrap_or_default()
     }
 
-    // These guard against the hand-written `[possible values: ...]` help on the
-    // free-form `--engine`/`--device` flags drifting from their real source of
-    // truth. The flags stay `Option<String>` on purpose (`--engine` is
-    // free-form and `--device` accepts aliases such as `auto`/`gpu` plus the
-    // intentional `cpu_only` rejection), so a ValueEnum would change accepted
-    // input; a sync test keeps the advertised list honest without that.
+    // `--engine` restricts its input to `SUPPORTED_ENGINES` via a clap
+    // `value_parser`, so the possible values are advertised in `--help` and shell
+    // completion structurally (not a hand-written doc string). `--device` stays
+    // free-form (it accepts aliases such as `auto`/`gpu` plus the intentional
+    // `cpu_only` rejection), so its advertised list is hand-written and guarded
+    // by a sync test below. Both guards keep the advertised lists honest.
     #[test]
     fn serve_engine_help_lists_match_engine_inventory() {
-        let mut listed = possible_values_listed_in_help(&serve_arg_help("engine"));
+        let cli = Cli::command();
+        let serve = cli
+            .find_subcommand("serve")
+            .expect("serve subcommand exists");
+        let engine_arg = serve
+            .get_arguments()
+            .find(|arg| arg.get_id() == "engine")
+            .expect("serve has an `engine` argument");
+        let mut listed: Vec<String> = engine_arg
+            .get_possible_values()
+            .iter()
+            .map(|value| value.get_name().to_owned())
+            .collect();
         let mut expected: Vec<String> = builtin_engine_inventory()
             .iter()
             .map(|(name, _)| (*name).to_owned())
@@ -15531,7 +15308,7 @@ mod tests {
         expected.sort();
         assert_eq!(
             listed, expected,
-            "serve --engine help possible-values must stay in sync with builtin_engine_inventory()"
+            "serve --engine possible-values must stay in sync with builtin_engine_inventory()"
         );
     }
 
@@ -15766,7 +15543,7 @@ mod tests {
     fn service_http_readiness_requires_model_list_entry() {
         let empty = json!({ "data": [] }).to_string();
         assert!(!service_http_readiness_response_ready(
-            "llama.cpp",
+            "vllm",
             "/v1/models",
             200,
             &empty,
@@ -15775,7 +15552,7 @@ mod tests {
 
         let models = json!({ "data": [{ "id": "tiny.gguf" }] }).to_string();
         assert!(service_http_readiness_response_ready(
-            "llama.cpp",
+            "vllm",
             "/v1/models",
             200,
             &models,
@@ -15813,14 +15590,14 @@ mod tests {
         ));
 
         assert!(!service_http_readiness_response_ready(
-            "llama.cpp",
+            "vllm",
             "/health",
             200,
             "OK",
             "tiny.gguf"
         ));
         assert!(!service_http_readiness_response_ready(
-            "pytorch",
+            "vllm",
             "/healthz",
             200,
             "OK",
@@ -15900,7 +15677,7 @@ mod tests {
             cpu: Some("AMD Ryzen".to_owned()),
             system_ram_gib: Some(64.0),
             interactive_terminal: false,
-            default_engine: "pytorch".to_owned(),
+            default_engine: "vllm".to_owned(),
             detected_gfx_target: Some("gfx1201".to_owned()),
             compatible_therock_family: Some("gfx120X-all".to_owned()),
             detected_therock_family: None,
@@ -16013,7 +15790,7 @@ mod tests {
         recipe.canonical_model_id = "Acme/SignedTiny".to_owned();
         recipe.aliases = vec!["signedtiny".to_owned()];
         recipe.source = "signed_recipe_index".to_owned();
-        recipe.preferred_engines = vec!["llama.cpp".to_owned()];
+        recipe.preferred_engines = vec!["vllm".to_owned()];
         recipe.device_policy = "cpu_only".to_owned();
         recipe.dtype = "float16".to_owned();
 
@@ -16191,7 +15968,7 @@ mod tests {
     #[test]
     fn freeform_plan_next_action_surfaces_approval_action() {
         let action =
-            freeform_plan_next_action("serve qwen3.5 with llama.cpp", &RocmCliConfig::default())
+            freeform_plan_next_action("serve qwen3.5 with vllm", &RocmCliConfig::default())
                 .expect("serve request should have next action");
 
         assert_eq!(action.title, "Launch local endpoint");
@@ -16203,7 +15980,7 @@ mod tests {
                 "serve".to_owned(),
                 "Qwen/Qwen3.5-4B".to_owned(),
                 "--engine".to_owned(),
-                "llama.cpp".to_owned(),
+                "vllm".to_owned(),
                 "--device".to_owned(),
                 "gpu_required".to_owned(),
                 "--managed".to_owned(),
@@ -16219,7 +15996,7 @@ mod tests {
             "serve".to_owned(),
             "qwen3.5".to_owned(),
             "with".to_owned(),
-            "llama.cpp".to_owned(),
+            "vllm".to_owned(),
         ]);
 
         assert!(invocation.approve);
@@ -16231,7 +16008,7 @@ mod tests {
                 "serve".to_owned(),
                 "qwen3.5".to_owned(),
                 "with".to_owned(),
-                "llama.cpp".to_owned(),
+                "vllm".to_owned(),
             ]
         );
 
@@ -16259,7 +16036,7 @@ mod tests {
             "serve".to_owned(),
             "qwen3.5".to_owned(),
             "with".to_owned(),
-            "llama.cpp".to_owned(),
+            "vllm".to_owned(),
         ]);
 
         assert!(!should_treat_as_freeform(&invalid_install));
@@ -16292,13 +16069,13 @@ mod tests {
     #[test]
     fn freeform_execution_validation_accepts_fully_structured_tool_call() -> Result<()> {
         let action =
-            freeform_plan_next_action("serve qwen3.5 with llama.cpp", &RocmCliConfig::default())
+            freeform_plan_next_action("serve qwen3.5 with vllm", &RocmCliConfig::default())
                 .expect("serve request should have next action");
 
         validate_freeform_execution_action(&action)?;
         assert_eq!(
             format_structured_tool_call("rocm", &action.args),
-            "rocm serve Qwen/Qwen3.5-4B --engine llama.cpp --device gpu_required --managed"
+            "rocm serve Qwen/Qwen3.5-4B --engine vllm --device gpu_required --managed"
         );
         Ok(())
     }
@@ -16306,14 +16083,14 @@ mod tests {
     #[test]
     fn freeform_execution_header_surfaces_explicit_approval_and_tool_call() {
         let action =
-            freeform_plan_next_action("serve qwen3.5 with llama.cpp", &RocmCliConfig::default())
+            freeform_plan_next_action("serve qwen3.5 with vllm", &RocmCliConfig::default())
                 .expect("serve request should have next action");
         let rendered = render_freeform_execution_header(&action);
 
         assert!(rendered.contains("execution"));
         assert!(rendered.contains("approval: granted by --yes"));
         assert!(rendered.contains(
-            "tool_call: rocm serve Qwen/Qwen3.5-4B --engine llama.cpp --device gpu_required --managed"
+            "tool_call: rocm serve Qwen/Qwen3.5-4B --engine vllm --device gpu_required --managed"
         ));
     }
 
@@ -16486,7 +16263,7 @@ mod tests {
             "confidence": "high",
             "tool_call": {
                 "tool": "rocm",
-                "args": ["serve", "sshleifer/tiny-gpt2", "--engine", "pytorch", "--device", "gpu_required", "--managed"]
+                "args": ["serve", "sshleifer/tiny-gpt2", "--engine", "vllm", "--device", "gpu_required", "--managed"]
             },
             "notes": ["resolved the missing model to a tiny test model"]
         }"#;
@@ -16504,7 +16281,7 @@ mod tests {
                 "serve".to_owned(),
                 "sshleifer/tiny-gpt2".to_owned(),
                 "--engine".to_owned(),
-                "pytorch".to_owned(),
+                "vllm".to_owned(),
                 "--device".to_owned(),
                 "gpu_required".to_owned(),
                 "--managed".to_owned(),
@@ -16525,14 +16302,14 @@ mod tests {
             "intent": "serve",
             "tool_call": {
                 "tool": "rocm",
-                "args": ["serve", "tiny.gguf", "--engine", "llama.cpp", "--allow-public-bind", "--managed"]
+                "args": ["serve", "tiny.gguf", "--engine", "vllm", "--allow-public-bind", "--managed"]
             }
         }"#,
             r#"{
             "intent": "serve",
             "tool_call": {
                 "tool": "rocm",
-                "args": ["serve", "tiny.gguf", "--engine", "llama.cpp", "--host", "0.0.0.0", "--managed"]
+                "args": ["serve", "tiny.gguf", "--engine", "vllm", "--host", "0.0.0.0", "--managed"]
             }
         }"#,
         ] {
@@ -16550,8 +16327,8 @@ mod tests {
     #[test]
     fn provider_planner_requires_managed_serve_requests() {
         for args in [
-            vec!["serve", "qwen", "--engine", "pytorch"],
-            vec!["serve", "qwen", "--engine", "pytorch", "--foreground"],
+            vec!["serve", "qwen", "--engine", "vllm"],
+            vec!["serve", "qwen", "--engine", "vllm", "--foreground"],
         ] {
             let call = ProviderPlannerToolCall {
                 tool: "rocm".to_owned(),
@@ -16592,7 +16369,7 @@ mod tests {
                 "serve",
                 "sshleifer/tiny-gpt2",
                 "--engine",
-                "pytorch",
+                "vllm",
                 "--device",
                 "cpu",
                 "--managed",
@@ -16601,7 +16378,7 @@ mod tests {
                 "serve",
                 "sshleifer/tiny-gpt2",
                 "--engine",
-                "pytorch",
+                "vllm",
                 "--device=cpu",
                 "--managed",
             ],
@@ -16609,7 +16386,7 @@ mod tests {
                 "serve",
                 "sshleifer/tiny-gpt2",
                 "--engine",
-                "pytorch",
+                "vllm",
                 "--device",
                 "cpu_only",
                 "--managed",
@@ -16897,7 +16674,6 @@ mod tests {
             "port_status",
             "[\"services\",\"list\",\"--all\"]",
             "qwen-smoke",
-            "llama-server",
             "Do not invent shell commands",
             "ROCm CLI Assistant Skill",
             "Treat `localhost` and `127.0.0.1` as the same loopback endpoint",
@@ -16995,16 +16771,16 @@ model recipes
       engine_support:
         lemonade: available path=D:\\rocm\\rocm-engine-lemonade.exe
       warning: tiny Lemonade GGUF smoke-test model; not the default assistant
-  Qwen/Qwen2.5-0.5B-Instruct aliases=[qwen-tiny] task=chat dtype=float16 device=gpu_required min_gpu_mem=4 GiB engines=[pytorch]
+  Qwen/Qwen2.5-0.5B-Instruct aliases=[qwen-tiny] task=chat dtype=float16 device=gpu_required min_gpu_mem=4 GiB engines=[lemonade]
       engine_support:
-        pytorch: available path=D:\\rocm\\rocm-engine-pytorch.exe
+        lemonade: available path=D:\\rocm\\rocm-engine-lemonade.exe
   Qwen/Qwen3.5-4B aliases=[qwen3.5] task=chat dtype=bfloat16 device=gpu_preferred min_gpu_mem=12 GiB engines=[vllm]
       engine_support:
         vllm: adapter_available path=D:\\rocm\\rocm-engine-vllm.exe runtime_status=unsupported_native_windows reason=native Windows skipped; use WSL/Linux vLLM ROCm
-  meta-llama/Llama-3.2-3B-Instruct aliases=[llama] task=chat dtype=bfloat16 device=gpu_preferred min_gpu_mem=8 GiB engines=[pytorch, llama.cpp]
+  meta-llama/Llama-3.2-3B-Instruct aliases=[llama] task=chat dtype=bfloat16 device=gpu_preferred min_gpu_mem=8 GiB engines=[lemonade, vllm]
       engine_support:
-        pytorch: available path=D:\\rocm\\rocm-engine-pytorch.exe
-        llama.cpp: available path=D:\\rocm\\rocm-engine-llama-cpp.exe
+        lemonade: available path=D:\\rocm\\rocm-engine-lemonade.exe
+        vllm: available path=D:\\rocm\\rocm-engine-vllm.exe
 ",
         )
         .expect("model output should summarize");
@@ -17015,7 +16791,7 @@ model recipes
         assert!(summary.contains("Tiny smoke test: qwen-smoke"));
         assert!(summary.contains("Qwen3-0.6B-GGUF"));
         assert!(summary.contains("8 GiB-class option: llama"));
-        assert!(summary.contains("pytorch, llama.cpp"));
+        assert!(summary.contains("lemonade, vllm"));
         assert!(summary.contains("Qwen/Qwen3.5-4B asks for 12 GiB"));
         assert!(summary.contains("Native Windows note"));
         assert!(summary.contains("Run `rocm examine`"));
@@ -17107,11 +16883,11 @@ model recipes
                     name: "launch_server".to_owned(),
                     arguments: serde_json::json!({
                         "model": "qwen",
-                        "engine": "pytorch",
+                        "engine": "vllm",
                         "device": "gpu_required"
                     }),
                 },
-                Some("rocm serve qwen --managed --engine pytorch --device gpu_required"),
+                Some("rocm serve qwen --managed --engine vllm --device gpu_required"),
                 false,
             ),
         ] {
@@ -17132,7 +16908,7 @@ model recipes
     }
 
     #[test]
-    fn chat_rocm_command_routes_comfyui_and_llama_cpp_actions() {
+    fn chat_rocm_command_routes_comfyui_and_engine_actions() {
         let comfy_install = providers::ChatToolCall {
             id: Some("call-comfy".to_owned()),
             name: "rocm_command".to_owned(),
@@ -17156,21 +16932,21 @@ model recipes
             vec!["comfyui".to_owned(), "install".to_owned()]
         );
 
-        let llama = providers::ChatToolCall {
-            id: Some("call-llama".to_owned()),
+        let lemonade = providers::ChatToolCall {
+            id: Some("call-lemonade".to_owned()),
             name: "rocm_command".to_owned(),
             arguments: serde_json::json!({
-                "args": ["engines", "install", "llama.cpp"]
+                "args": ["engines", "install", "lemonade"]
             }),
         };
-        validate_chat_tool_call(&llama).expect("llama.cpp engine install should validate");
-        assert!(!chat_tool_call_is_read_only(&llama));
+        validate_chat_tool_call(&lemonade).expect("lemonade engine install should validate");
+        assert!(!chat_tool_call_is_read_only(&lemonade));
         assert_eq!(
-            rocm_chat_tool_requested_command(&llama).as_deref(),
-            Some("rocm engines install llama.cpp")
+            rocm_chat_tool_requested_command(&lemonade).as_deref(),
+            Some("rocm engines install lemonade")
         );
         let approval =
-            chat_tool_approval_request(&llama, Some("Install llama.cpp for GGUF serving."))
+            chat_tool_approval_request(&lemonade, Some("Install Lemonade for local serving."))
                 .expect("approval should be built");
         assert_eq!(approval.pending_title, "Install engine");
         assert_eq!(approval.command_title, "Engine");
@@ -17211,14 +16987,14 @@ model recipes
             id: Some("call-serve".to_owned()),
             name: "rocm_command".to_owned(),
             arguments: serde_json::json!({
-                "args": ["serve", "qwen", "--engine", "pytorch", "--device", "gpu_required", "--managed"]
+                "args": ["serve", "qwen", "--engine", "vllm", "--device", "gpu_required", "--managed"]
             }),
         };
         validate_chat_tool_call(&serve).expect("managed serve should validate");
         assert!(!chat_tool_call_is_read_only(&serve));
         assert_eq!(
             rocm_chat_tool_requested_command(&serve).as_deref(),
-            Some("rocm serve qwen --engine pytorch --device gpu_required --managed")
+            Some("rocm serve qwen --engine vllm --device gpu_required --managed")
         );
         let approval = chat_tool_approval_request(&serve, Some("Start the recommended assistant."))
             .expect("approval should be built");
@@ -17243,14 +17019,13 @@ model recipes
             id: Some("call-config".to_owned()),
             name: "rocm_command".to_owned(),
             arguments: serde_json::json!({
-                "args": ["config", "set-default-engine", "pytorch"]
+                "args": ["config", "set-default-engine", "vllm"]
             }),
         };
         validate_chat_tool_call(&config).expect("config change should validate");
         assert!(!chat_tool_call_is_read_only(&config));
-        let approval =
-            chat_tool_approval_request(&config, Some("Use PyTorch as the default engine."))
-                .expect("approval should be built");
+        let approval = chat_tool_approval_request(&config, Some("Use vLLM as the default engine."))
+            .expect("approval should be built");
         assert_eq!(approval.pending_title, "Change settings");
         assert_eq!(approval.command_title, "Config");
     }
@@ -17610,7 +17385,7 @@ model recipes
             id: None,
             name: "rocm_command".to_owned(),
             arguments: serde_json::json!({
-                "args": ["serve", "tiny.gguf", "--engine", "llama.cpp", "--device", "cpu"]
+                "args": ["serve", "tiny.gguf", "--engine", "vllm", "--device", "cpu"]
             }),
         };
         let error = validate_chat_tool_call(&cpu).unwrap_err().to_string();
@@ -17620,7 +17395,7 @@ model recipes
             id: None,
             name: "rocm_command".to_owned(),
             arguments: serde_json::json!({
-                "args": ["serve", "tiny.gguf", "--engine", "llama.cpp", "--allow-public-bind", "--managed"]
+                "args": ["serve", "tiny.gguf", "--engine", "vllm", "--allow-public-bind", "--managed"]
             }),
         };
         let error = validate_chat_tool_call(&public_flag)
@@ -17632,7 +17407,7 @@ model recipes
             id: None,
             name: "rocm_command".to_owned(),
             arguments: serde_json::json!({
-                "args": ["serve", "qwen", "--engine", "pytorch", "--foreground"]
+                "args": ["serve", "qwen", "--engine", "vllm", "--foreground"]
             }),
         };
         let error = validate_chat_tool_call(&foreground)
@@ -17833,7 +17608,7 @@ model recipes
             name: "launch_server".to_owned(),
             arguments: serde_json::json!({
                 "model": "tiny.gguf",
-                "engine": "llama.cpp",
+                "engine": "vllm",
                 "device": "cpu"
             }),
         };
@@ -17845,7 +17620,7 @@ model recipes
             name: "launch_server".to_owned(),
             arguments: serde_json::json!({
                 "model": "tiny.gguf",
-                "engine": "llama.cpp",
+                "engine": "vllm",
                 "host": "0.0.0.0",
                 "allow_public_bind": true
             }),
@@ -17858,7 +17633,7 @@ model recipes
             name: "launch_server".to_owned(),
             arguments: serde_json::json!({
                 "model": "tiny.gguf",
-                "engine": "llama.cpp",
+                "engine": "vllm",
                 "host": "0.0.0.0"
             }),
         };
@@ -18023,7 +17798,7 @@ model recipes
 
         for prompt in [
             "Is vLLM running?",
-            "is sglang running?",
+            "is lemonade running?",
             "is the model server running?",
             "is qwen running?",
         ] {
@@ -18048,7 +17823,7 @@ model recipes
 
     #[test]
     fn fallback_tool_call_routes_engine_install_state_to_engines_list() {
-        for prompt in ["is vLLM installed?", "is SGLang available?"] {
+        for prompt in ["is vLLM installed?", "is Lemonade available?"] {
             let call = fallback_rocm_tool_call_for_prompt(prompt).unwrap();
             assert_eq!(call.name, "rocm_command", "{prompt}");
             assert_eq!(
@@ -18472,14 +18247,13 @@ install therock";
         );
         assert!(chat_tool_call_is_read_only(&show));
 
-        let engine =
-            fallback_rocm_tool_call_for_prompt("Set the default engine to pytorch").unwrap();
+        let engine = fallback_rocm_tool_call_for_prompt("Set the default engine to vllm").unwrap();
         assert_eq!(
             normalized_chat_rocm_command_args(&engine).unwrap(),
             vec![
                 "config".to_owned(),
                 "set-default-engine".to_owned(),
-                "pytorch".to_owned(),
+                "vllm".to_owned(),
             ]
         );
         assert!(!chat_tool_call_is_read_only(&engine));
@@ -18754,7 +18528,7 @@ install therock";
             "intent": "serve",
             "tool_call": {
                 "tool": "rocm",
-                "args": ["serve", "sshleifer/tiny-gpt2", "--engine", "pytorch", "--managed"]
+                "args": ["serve", "sshleifer/tiny-gpt2", "--engine", "vllm", "--managed"]
             }
         }"#;
         let plan = provider_planner_response_to_plan("start a local model", "local", content)?;
@@ -18957,7 +18731,7 @@ install therock";
         let mut record = ManagedServiceRecord::new(
             &paths,
             "svc_qwen35_primary",
-            "pytorch",
+            "vllm",
             "qwen3.5",
             "Qwen/Qwen3.5",
             "127.0.0.1",
@@ -18980,7 +18754,7 @@ install therock";
         let rendered = render_service_logs_text(&paths, "svc_qwen35_primary")?;
         assert!(rendered.contains("Service Log"));
         assert!(rendered.contains("Service: svc_qwen35_primary"));
-        assert!(rendered.contains("Engine: pytorch"));
+        assert!(rendered.contains("Engine: vllm"));
         assert!(rendered.contains("Status: starting"));
         assert!(rendered.contains("File locations: shown"));
         assert!(rendered.contains(&format!(
@@ -19029,7 +18803,7 @@ install therock";
             let mut record = ManagedServiceRecord::new(
                 &paths,
                 service_id,
-                "pytorch",
+                "vllm",
                 "qwen",
                 "Qwen/Qwen3.5",
                 "127.0.0.1",
@@ -19596,15 +19370,18 @@ install therock";
 
     #[test]
     fn explicit_engine_override_keeps_alias_when_shared_recipe_is_for_another_engine() {
-        let recipe = resolve_builtin_model_recipe("qwen").expect("qwen recipe");
+        // `qwen-smoke` is a Lemonade-only GGUF recipe (no vLLM engine recipe).
+        let recipe = resolve_builtin_model_recipe("qwen-smoke").expect("qwen-smoke recipe");
 
+        // Served under the engine it targets, the alias resolves to the canonical id.
         assert_eq!(
-            serve_model_ref_for_engine("qwen", Some(&recipe), "lemonade"),
-            "Qwen3-4B-Instruct-2507-GGUF"
+            serve_model_ref_for_engine("qwen-smoke", Some(&recipe), "lemonade"),
+            "Qwen3-0.6B-GGUF"
         );
+        // Under an engine the recipe does not support, the raw alias flows through unchanged.
         assert_eq!(
-            serve_model_ref_for_engine("qwen", Some(&recipe), "pytorch"),
-            "qwen"
+            serve_model_ref_for_engine("qwen-smoke", Some(&recipe), "vllm"),
+            "qwen-smoke"
         );
     }
 
@@ -19612,20 +19389,20 @@ install therock";
     fn serve_engine_selection_respects_explicit_and_configured_engines() {
         let recipe = resolve_builtin_model_recipe("qwen32b").expect("qwen32b recipe");
 
-        let explicit = select_serve_engine(Some("llama.cpp"), Some("pytorch"), Some(&recipe), None);
-        let configured = select_serve_engine(None, Some("pytorch"), Some(&recipe), None);
+        let explicit = select_serve_engine(Some("vllm"), Some("lemonade"), Some(&recipe), None);
+        let configured = select_serve_engine(None, Some("lemonade"), Some(&recipe), None);
 
         assert_eq!(
             explicit,
             ServeEngineSelection {
-                engine: "llama.cpp".to_owned(),
+                engine: "vllm".to_owned(),
                 source: "explicit --engine",
             }
         );
         assert_eq!(
             configured,
             ServeEngineSelection {
-                engine: "pytorch".to_owned(),
+                engine: "lemonade".to_owned(),
                 source: "configured default_engine",
             }
         );
@@ -19656,7 +19433,7 @@ install therock";
                 model_id_override: None,
             },
             rocm_core::ModelRecipeEngineRecord {
-                engine: "sglang".to_owned(),
+                engine: "lemonade".to_owned(),
                 required_flags: vec!["--reasoning-parser".to_owned(), "qwen3".to_owned()],
                 parser_settings: BTreeMap::new(),
                 preferred_endpoint: None,
@@ -19700,7 +19477,7 @@ install therock";
             "engine_recipe_policy: selected-engine required_flags are applied at launch"
         ));
         assert!(serve_lines.contains("engine_recipe_required_flags: --enable-auto-tool-choice"));
-        assert!(protocol_engine_recipe_hint(&recipe, "pytorch").is_none());
+        assert!(protocol_engine_recipe_hint(&recipe, "unknown-engine").is_none());
     }
 
     #[test]
@@ -20163,7 +19940,7 @@ VERSION_ID="41"
             ..RocmCliConfig::default()
         };
 
-        let selection = resolve_engine_selection(&config, "pytorch", None, None);
+        let selection = resolve_engine_selection(&config, "vllm", None, None);
         assert_eq!(
             selection.runtime_id.as_deref(),
             Some("therock-release:gfx120X-all")
@@ -20174,7 +19951,7 @@ VERSION_ID="41"
         );
 
         config.active_runtime_key = Some("release-pip-gfx120x-all-7-13-0".to_owned());
-        let selection = resolve_engine_selection(&config, "pytorch", None, None);
+        let selection = resolve_engine_selection(&config, "vllm", None, None);
         assert_eq!(
             selection.runtime_id.as_deref(),
             Some("release-pip-gfx120x-all-7-13-0")
@@ -20184,9 +19961,9 @@ VERSION_ID="41"
             Some("config_active_runtime_key")
         );
 
-        config.engine_config_mut("pytorch").preferred_runtime_id =
+        config.engine_config_mut("vllm").preferred_runtime_id =
             Some("therock-nightly:gfx120X-all".to_owned());
-        let selection = resolve_engine_selection(&config, "pytorch", None, None);
+        let selection = resolve_engine_selection(&config, "vllm", None, None);
         assert_eq!(
             selection.runtime_id.as_deref(),
             Some("release-pip-gfx120x-all-7-13-0")
@@ -20197,7 +19974,7 @@ VERSION_ID="41"
         );
 
         config.active_runtime_key = None;
-        let selection = resolve_engine_selection(&config, "pytorch", None, None);
+        let selection = resolve_engine_selection(&config, "vllm", None, None);
         assert_eq!(
             selection.runtime_id.as_deref(),
             Some("therock-nightly:gfx120X-all")
@@ -20220,7 +19997,7 @@ VERSION_ID="41"
         )?;
         let selection = validate_engine_selection_runtime(
             &paths,
-            resolve_engine_selection(&RocmCliConfig::default(), "pytorch", None, None),
+            resolve_engine_selection(&RocmCliConfig::default(), "vllm", None, None),
         )?;
 
         assert_eq!(
@@ -20251,7 +20028,7 @@ VERSION_ID="41"
         )?;
         let selection = validate_engine_selection_runtime(
             &paths,
-            resolve_engine_selection(&RocmCliConfig::default(), "pytorch", None, None),
+            resolve_engine_selection(&RocmCliConfig::default(), "vllm", None, None),
         )?;
 
         assert!(selection.runtime_id.is_none());
@@ -20302,7 +20079,7 @@ VERSION_ID="41"
     fn engine_install_runtime_selection_requires_configured_runtime() -> Result<()> {
         let (root, paths) = test_paths("engine-install-runtime-selection");
         let error =
-            resolve_engine_install_runtime_id(&paths, &RocmCliConfig::default(), "pytorch", None)
+            resolve_engine_install_runtime_id(&paths, &RocmCliConfig::default(), "vllm", None)
                 .unwrap_err()
                 .to_string();
         assert!(error.contains("no active ROCm runtime is configured"));
@@ -20323,14 +20100,14 @@ VERSION_ID="41"
             ..RocmCliConfig::default()
         };
         assert_eq!(
-            resolve_engine_install_runtime_id(&paths, &config, "pytorch", None)?,
+            resolve_engine_install_runtime_id(&paths, &config, "vllm", None)?,
             "release-pip-gfx120x-all"
         );
         assert_eq!(
             resolve_engine_install_runtime_id(
                 &paths,
                 &config,
-                "pytorch",
+                "vllm",
                 Some("therock-release:gfx120X-all".to_owned())
             )?,
             "release-pip-gfx120x-all"
@@ -20446,7 +20223,7 @@ VERSION_ID="41"
             1,
         )?;
 
-        let engine_root = env_root_for_runtime(&paths, "pytorch", &manifest.runtime_key)?;
+        let engine_root = env_root_for_runtime(&paths, "vllm", &manifest.runtime_key)?;
 
         assert_eq!(engine_root, Some(manifest.install_root.join("engines")));
         assert_eq!(
@@ -20481,31 +20258,6 @@ VERSION_ID="41"
     }
 
     #[test]
-    fn resolve_pytorch_env_uses_active_therock_runtime() -> Result<()> {
-        let (root, paths) = test_paths("pytorch-active-runtime-env");
-        let manifest = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx120x-all",
-            "therock-release:gfx120X-all",
-            "7.13.0",
-            1,
-        )?;
-        let config = RocmCliConfig {
-            active_runtime_key: Some(manifest.runtime_key.clone()),
-            ..RocmCliConfig::default()
-        };
-
-        let resolved = resolve_engine_env(&paths, &config, "pytorch", None, None)?;
-
-        assert_eq!(resolved.runtime_id, manifest.runtime_key);
-        assert_eq!(resolved.env_path, manifest.install_root);
-        assert_eq!(resolved.managed_env_id, None);
-        assert!(!resolved.env_path.join("engines").exists());
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
     fn engine_runtime_selection_rejects_ambiguous_default_runtime_id() -> Result<()> {
         let (root, paths) = test_paths("engine-runtime-ambiguous-default");
         write_test_pip_runtime(
@@ -20527,20 +20279,20 @@ VERSION_ID="41"
             ..RocmCliConfig::default()
         };
 
-        let error = resolve_engine_install_runtime_id(&paths, &config, "pytorch", None)
+        let error = resolve_engine_install_runtime_id(&paths, &config, "vllm", None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("matches multiple installed runtimes"));
         assert!(error.contains("rocm runtimes activate <runtime_key>"));
 
-        let selection = resolve_engine_selection(&config, "pytorch", None, None);
+        let selection = resolve_engine_selection(&config, "vllm", None, None);
         let error = validate_engine_selection_runtime(&paths, selection)
             .unwrap_err()
             .to_string();
         assert!(error.contains("matches multiple installed runtimes"));
 
         let selection =
-            resolve_engine_selection(&config, "pytorch", Some("release-pip-gfx120x-all"), None);
+            resolve_engine_selection(&config, "vllm", Some("release-pip-gfx120x-all"), None);
         let selection = validate_engine_selection_runtime(&paths, selection)?;
         assert_eq!(
             selection.runtime_id.as_deref(),
@@ -21260,11 +21012,11 @@ VERSION_ID="41"
         let plugin_dir = paths.primary_engine_plugin_dir();
         fs::create_dir_all(&plugin_dir)?;
         let plugin_path = plugin_dir.join(
-            rocm_engine_protocol::platform_engine_plugin_binary_name("pytorch"),
+            rocm_engine_protocol::platform_engine_plugin_binary_name("vllm"),
         );
         fs::write(&plugin_path, "plugin")?;
 
-        let discovered = find_engine_plugin_binary("pytorch", engine_plugin_dirs(&paths))?;
+        let discovered = find_engine_plugin_binary("vllm", engine_plugin_dirs(&paths))?;
         let _ = fs::remove_dir_all(root);
 
         assert_eq!(discovered, Some(plugin_path));
@@ -21278,12 +21030,12 @@ VERSION_ID="41"
         let compatibility_dir = paths.data_dir.join("engines");
         fs::create_dir_all(&primary_dir)?;
         fs::create_dir_all(&compatibility_dir)?;
-        let name = rocm_engine_protocol::platform_engine_plugin_binary_name("pytorch");
+        let name = rocm_engine_protocol::platform_engine_plugin_binary_name("vllm");
         let primary_path = primary_dir.join(&name);
         fs::write(&primary_path, "primary")?;
         fs::write(compatibility_dir.join(&name), "compatibility")?;
 
-        let discovered = find_engine_plugin_binary("pytorch", engine_plugin_dirs(&paths))?;
+        let discovered = find_engine_plugin_binary("vllm", engine_plugin_dirs(&paths))?;
         let _ = fs::remove_dir_all(root);
 
         assert_eq!(discovered, Some(primary_path));
@@ -21306,13 +21058,6 @@ VERSION_ID="41"
 
     #[test]
     fn friendly_engine_detect_notes_hide_probe_and_path_noise() {
-        let pytorch = friendly_engine_detect_notes(
-            "pytorch",
-            &[r"torch probe: cuda_available=true device_count=1; managed env detected at C:\Users\user\.rocm\engines\pytorch\envs\release; rocm_sdk: version=7.13".to_owned()],
-        )
-        .expect("pytorch note");
-        assert_eq!(pytorch, "PyTorch is ready on your AMD GPU.");
-
         let lemonade = friendly_engine_detect_notes(
             "lemonade",
             &["Lemonade embeddable 10.6.0 is installed at D:/ROCm/temp/runtime; Lemonade is configured for llamacpp:rocm; no CPU fallback is used".to_owned()],
@@ -21320,12 +21065,6 @@ VERSION_ID="41"
         .expect("lemonade note");
         assert_eq!(lemonade, "Lemonade is ready on your AMD GPU.");
 
-        let llama = friendly_engine_detect_notes(
-            "llama.cpp",
-            &["llama-server not found; TheRock HIP runtime env available: root=D:\\ROCm\\temp\\therock".to_owned()],
-        )
-        .expect("llama.cpp note");
-        assert_eq!(llama, "llama.cpp server is not installed yet.");
         let vllm = friendly_engine_detect_notes(
             "vllm",
             &["vLLM is not installed in a Linux/WSL ROCm Python environment. Native Windows is skipped; no CPU fallback is used.".to_owned()],
@@ -21335,22 +21074,14 @@ VERSION_ID="41"
             vllm,
             "vLLM is not installed in a Linux/WSL ROCm Python environment."
         );
-        let atom = friendly_engine_detect_note_fallback(
-            "ATOM Python environment was not found; set ROCM_CLI_ATOM_PYTHON.",
-        );
-        assert!(atom.contains("ROCM_CLI_ATOM_PYTHON"));
-        assert!(!pytorch.contains("torch probe"));
+        // Raw install paths from the probe body must not leak into the friendly note.
         assert!(!lemonade.contains("D:/"));
-        assert!(!llama.contains("D:\\"));
     }
 
     #[test]
     fn missing_packaged_engine_reason_has_no_deferred_first_party_engines() {
-        assert!(missing_packaged_engine_reason("atom").is_none());
+        assert!(missing_packaged_engine_reason("lemonade").is_none());
         assert!(missing_packaged_engine_reason("vllm").is_none());
-        assert!(missing_packaged_engine_reason("sglang").is_none());
-        assert!(missing_packaged_engine_reason("pytorch").is_none());
-        assert!(missing_packaged_engine_reason("llama.cpp").is_none());
     }
 
     #[test]
@@ -21543,7 +21274,7 @@ VERSION_ID="41"
         let detect = DetectResponse {
             installed: false,
             env_id: None,
-            runtime_kind: Some("external_sglang".to_owned()),
+            runtime_kind: Some("external_vllm".to_owned()),
             runtime_executable: None,
             managed_env: Some(false),
             python_version: None,
@@ -21553,7 +21284,7 @@ VERSION_ID="41"
                 kind: "rocm_gpu".to_owned(),
                 available: false,
                 reason: Some(
-                    "SGLang ROCm serving is supported by rocm-cli only on Linux/WSL; native Windows SGLang is skipped. No CPU fallback is used."
+                    "vLLM ROCm serving is supported by rocm-cli only on Linux/WSL; native Windows vLLM is skipped. No CPU fallback is used."
                         .to_owned(),
                 ),
             }],
@@ -21562,7 +21293,7 @@ VERSION_ID="41"
                 rocm_gpu: false,
                 openai_compatible: true,
                 tool_calling: false,
-                quantized_models: "sglang-supported".to_owned(),
+                quantized_models: "vllm-supported".to_owned(),
                 reasoning_parser: false,
             },
             notes: Vec::new(),
@@ -21570,26 +21301,16 @@ VERSION_ID="41"
 
         if cfg!(windows) {
             assert_eq!(
-                engine_runtime_status_label("sglang", &detect),
-                "unsupported_native_windows"
-            );
-            let mut atom_detect = detect;
-            atom_detect.runtime_kind = Some("external_atom".to_owned());
-            atom_detect.available_devices[0].reason = Some(
-                "ATOM ROCm serving is supported by rocm-cli only on Linux/WSL; native Windows ATOM is not enabled. No CPU fallback is used."
-                    .to_owned(),
-            );
-            assert_eq!(
-                engine_runtime_status_label("atom", &atom_detect),
+                engine_runtime_status_label("vllm", &detect),
                 "unsupported_native_windows"
             );
             assert!(
-                model_registry_adapter_availability_note("atom")
+                model_registry_adapter_availability_note("vllm")
                     .is_some_and(|note| note.contains("unsupported_native_windows"))
             );
         } else {
-            assert_eq!(engine_runtime_status_label("sglang", &detect), "not found");
-            assert!(model_registry_adapter_availability_note("atom").is_none());
+            assert_eq!(engine_runtime_status_label("vllm", &detect), "not found");
+            assert!(model_registry_adapter_availability_note("vllm").is_none());
         }
     }
 
@@ -21695,7 +21416,7 @@ VERSION_ID="41"
             license: Some("apache-2.0".to_owned()),
             gated: Some(false),
             quantization: Some("bfloat16".to_owned()),
-            engines: vec!["pytorch".to_owned()],
+            engines: vec!["vllm".to_owned()],
             source_policy: Some(rocm_core::ModelRecipeArtifactSourcePolicyRecord {
                 policy: "huggingface_public".to_owned(),
                 required_hosts: vec!["huggingface.co".to_owned()],
@@ -21730,7 +21451,7 @@ VERSION_ID="41"
         assert!(output.contains("note: test metadata only"));
         assert!(!output.contains("source_policy=huggingface_public"));
         assert!(output.contains("size=2.0 GiB"));
-        assert!(output.contains("engines=[pytorch]"));
+        assert!(output.contains("engines=[vllm]"));
         assert!(output.contains("artifact_cache hf-main status=missing"));
         assert!(output.contains("prefetch requires an approved source policy"));
         assert!(output.contains(
@@ -21906,19 +21627,19 @@ VERSION_ID="41"
     fn examine_engine_inventory_reports_config_without_engine_detect() {
         let (root, paths) = test_paths("examine-engine-inventory");
         let mut config = RocmCliConfig {
-            default_engine: Some("llama.cpp".to_owned()),
+            default_engine: Some("vllm".to_owned()),
             ..RocmCliConfig::default()
         };
-        config.engine_config_mut("llama.cpp").preferred_runtime_id =
+        config.engine_config_mut("vllm").preferred_runtime_id =
             Some("therock-release:gfx120X-all".to_owned());
         let mut output = String::new();
 
         append_examine_engine_inventory(&mut output, &paths, &config);
 
         assert!(output.contains("engine_inventory:"));
-        assert!(output.contains("configured_default_engine: llama.cpp"));
-        assert!(output.contains("effective_default_engine: llama.cpp"));
-        assert!(output.contains("* llama.cpp"));
+        assert!(output.contains("configured_default_engine: vllm"));
+        assert!(output.contains("effective_default_engine: vllm"));
+        assert!(output.contains("* vllm"));
         assert!(output.contains("runtime_pref=therock-release:gfx120X-all"));
         assert!(output.contains("plugin_dirs:"));
         let _ = fs::remove_dir_all(root);

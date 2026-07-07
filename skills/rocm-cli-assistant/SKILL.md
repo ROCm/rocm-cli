@@ -11,7 +11,7 @@ Use this skill when answering ROCm CLI local assistant questions.
 ## Status And Running Questions
 
 - Inspect before answering. For "is X running", "what is running", status, or port questions, call a read-only tool first.
-- Use `services list --all` for vLLM, SGLang, PyTorch, Lemonade, llama.cpp, qwen, and general local model servers.
+- Use `services list --all` for vLLM, Lemonade, qwen, and general local model servers.
 - Use `comfyui status` or `port_status` for ComfyUI and port 8188.
 - Interpret `running_state=running` as running, `running_state=starting` as starting, `running_state=not_running` as not running, and no matching row as unknown or not managed by ROCm CLI.
 - Treat `localhost` and `127.0.0.1` as the same loopback endpoint.
@@ -24,11 +24,11 @@ Use this skill when answering ROCm CLI local assistant questions.
 
 ## Engines And Assistant
 
-- vLLM, SGLang, PyTorch, Lemonade, and llama.cpp are serving engines.
-- The built-in assistant is fixed to qwen served by Lemonade with GPU required. Do not switch the built-in assistant to vLLM or SGLang.
+- vLLM and Lemonade are serving engines.
+- The built-in assistant is fixed to qwen served by Lemonade with GPU required. Do not switch the built-in assistant to vLLM.
 - Installing an engine and running a model server are different states. Answer each separately when the user asks.
 - `rocm serve` accepts `--gpu auto|<index>` to pick the AMD GPU. `auto` (default) prefers a GPU that looks idle from `amd-smi` VRAM telemetry and is not already used by another rocm-cli server (managed or foreground), falling back to the GPU with the most free memory; a single index pins one GPU. Serving one model across multiple GPUs is not supported. Do not suggest CPU fallback when a GPU is busy or out of range.
-- On native Windows, vLLM and SGLang serving/install live checks are skipped; tell the user to use WSL/Linux for those ROCm GPU engines and do not suggest CPU fallback.
+- On native Windows, vLLM serving/install live checks are skipped; tell the user to use WSL/Linux for that ROCm GPU engine and do not suggest CPU fallback.
 
 ## ComfyUI
 

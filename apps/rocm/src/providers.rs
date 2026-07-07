@@ -1526,7 +1526,7 @@ mod tests {
         let mut ready = ManagedServiceRecord::new(
             &paths,
             "svc-ready",
-            "pytorch",
+            "vllm",
             "qwen",
             BUILTIN_ASSISTANT_MODEL_ID,
             "127.0.0.1",
@@ -1543,7 +1543,7 @@ mod tests {
         let mut stopped = ManagedServiceRecord::new(
             &paths,
             "svc-stopped",
-            "pytorch",
+            "vllm",
             "llama",
             "meta-llama/Llama",
             "127.0.0.1",
@@ -2025,7 +2025,7 @@ mod tests {
         let mut ready = ManagedServiceRecord::new(
             &paths,
             "svc-ready",
-            "pytorch",
+            "vllm",
             "qwen",
             "Qwen/Qwen3.5",
             "127.0.0.1",
@@ -2088,7 +2088,7 @@ mod tests {
         let mut custom = ManagedServiceRecord::new(
             &paths,
             "svc-custom",
-            "pytorch",
+            "vllm",
             "tiny-gpt2",
             "sshleifer/tiny-gpt2",
             "127.0.0.1",
@@ -2118,7 +2118,7 @@ mod tests {
         let mut qwen = ManagedServiceRecord::new(
             &paths,
             "svc-qwen",
-            "pytorch",
+            "vllm",
             BUILTIN_ASSISTANT_MODEL_ALIAS,
             BUILTIN_ASSISTANT_MODEL_ID,
             "127.0.0.1",
@@ -2191,7 +2191,7 @@ mod tests {
         let mut custom = ManagedServiceRecord::new(
             &paths,
             "svc-custom-qwen",
-            "pytorch",
+            "vllm",
             "Qwen/Qwen3.5-4B",
             "Qwen/Qwen3.5-4B",
             "127.0.0.1",
@@ -2259,7 +2259,7 @@ mod tests {
         let mut ready = ManagedServiceRecord::new(
             &paths,
             "svc-ready",
-            "llama.cpp",
+            "vllm",
             "tiny.gguf",
             "tiny.gguf",
             "127.0.0.1",
@@ -2322,7 +2322,7 @@ mod tests {
         let mut ready = ManagedServiceRecord::new(
             &paths,
             "svc-ready",
-            "pytorch",
+            "vllm",
             "qwen",
             "Qwen/Qwen3.5",
             "127.0.0.1",
@@ -2425,7 +2425,7 @@ mod tests {
         let mut ready = ManagedServiceRecord::new(
             &paths,
             "svc-ready",
-            "pytorch",
+            "vllm",
             "qwen",
             "Qwen/Qwen3.5",
             "127.0.0.1",
@@ -2510,7 +2510,7 @@ mod tests {
         let mut ready = ManagedServiceRecord::new(
             &paths,
             "svc-ready",
-            "pytorch",
+            "vllm",
             "qwen",
             "Qwen/Qwen3.5",
             "127.0.0.1",

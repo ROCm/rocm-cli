@@ -153,35 +153,7 @@ Expected result:
 
 Stop the foreground server with `Ctrl+C`.
 
-## 4. PyTorch GPU Verification
-
-Install or refresh the PyTorch engine:
-
-```powershell
-rocm engines install pytorch
-```
-
-Serve a small model with the managed runtime:
-
-```powershell
-rocm serve qwen --engine pytorch --device gpu_required --managed --foreground --port 11435
-```
-
-Expected result:
-
-- The engine uses the active rocm-cli managed TheRock runtime.
-- PyTorch detects the AMD GPU.
-- The run does not fall back to CPU.
-- If the GPU cannot be used, the command fails with a clear error.
-
-Current known caveat: explicit `Qwen/Qwen3.5-4B` PyTorch requests are gated
-before launch because the installed Transformers package does not recognize
-the checkpoint's `qwen3_5` architecture. The short alias `qwen` resolves to
-the recommended low-VRAM `Qwen/Qwen2.5-1.5B-Instruct` assistant recipe.
-
-Stop the foreground server with `Ctrl+C`.
-
-## 5. Local Server Records
+## 4. Local Server Records
 
 After a managed or foreground serve attempt, inspect local server records:
 
@@ -204,41 +176,7 @@ rocm services stop <service-id> --yes
 rocm services restart <service-id> --yes
 ```
 
-## 6. llama.cpp GPU Verification
-
-Install or refresh the llama.cpp engine:
-
-```powershell
-rocm engines install llama.cpp
-```
-
-Run a GGUF model through llama.cpp with the managed runtime:
-
-```powershell
-rocm serve target\models\stories260K.gguf --engine llama.cpp --managed --foreground --port 11450
-```
-
-Expected result:
-
-- llama.cpp starts with HIP enabled.
-- ROCm libraries load from the active rocm-cli managed TheRock runtime.
-- The run does not fall back to CPU.
-- If `llama-server` or the model file is missing, the command says what is
-  missing.
-
-Stop the foreground server with `Ctrl+C`.
-
-For the stricter developer GPU test:
-
-```powershell
-python scripts\llama_cpp_therock_gpu_test.py --timeout 120
-```
-
-This test downloads or reuses a tiny GGUF model, launches llama.cpp with GPU
-required, checks the HTTP endpoint, and verifies that the loaded ROCm libraries
-come from the managed TheRock runtime.
-
-## 7. ComfyUI Verification
+## 5. ComfyUI Verification
 
 ComfyUI is managed as an app surface. It should start a local web server and
 show the URL to open:
@@ -266,7 +204,7 @@ python scripts\comfyui_therock_gpu_test.py
 This test may download a small checkpoint and submit a cat image workflow
 through the ComfyUI HTTP API.
 
-## 8. Optional Cloud Provider Key
+## 6. Optional Cloud Provider Key
 
 Local ROCm use does not need a cloud provider key. If you want to test OpenAI or
 Anthropic provider setup, save the key through stdin so it does not land in
@@ -291,7 +229,7 @@ To remove the saved key:
 rocm config clear-provider-key openai
 ```
 
-## 9. Optional Provider-Assisted Planning
+## 7. Optional Provider-Assisted Planning
 
 Most users should leave this off. To test ambiguity resolution with an already
 running local provider service:

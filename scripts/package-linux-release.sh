@@ -28,9 +28,9 @@ rm -rf "${ROOT_DIR}"
 rm -f "${ARCHIVE_PATH}" "${ARCHIVE_PATH}.sha256" "${ARCHIVE_PATH}.sig" "${TAR_PATH}"
 mkdir -p "${ROOT_DIR}/bin"
 
-# The first-party engines (pytorch/llama.cpp/lemonade/atom/vllm/sglang) are
-# compiled into `rocm` and run in-process; the standalone rocm-engine-* binaries
-# are only an external third-party plugin fallback, so they are not shipped.
+# The first-party engines (lemonade/vllm) are compiled into `rocm` and run
+# in-process; the standalone rocm-engine-* binaries are only an external
+# third-party plugin fallback, so they are not shipped.
 cp "${BINARY_DIR}/rocm" "${ROOT_DIR}/bin/"
 cp "${BINARY_DIR}/rocmd" "${ROOT_DIR}/bin/"
 cp README.md LICENSE.TXT install.sh "${ROOT_DIR}/"

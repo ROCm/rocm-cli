@@ -25,7 +25,7 @@ pub const VERBS: &[Verb] = &[
         summary: "Launch a model on a serving engine and expose an OpenAI-style endpoint.",
         steps: &[
             "Pick a model",
-            "Choose an engine — vLLM · SGLang · llama.cpp · PyTorch",
+            "Choose an engine — Lemonade · vLLM",
             "Set GPU placement (required / preferred / CPU-only)",
             "Launch on 127.0.0.1:11435 and watch it come up",
         ],
@@ -39,7 +39,7 @@ pub const VERBS: &[Verb] = &[
         action: KeyAction::OpenEngineManager,
         summary: "Install, reinstall, or configure serving engines.",
         steps: &[
-            "Browse engines — vLLM · SGLang · llama.cpp · PyTorch · lemonade",
+            "Browse engines — Lemonade · vLLM",
             "See install status per engine",
             "Install / reinstall an engine",
             "Adjust engine config",

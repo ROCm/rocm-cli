@@ -127,94 +127,9 @@ def binary_paths(
     return {
         "rocm": binary_dir / exe_name("rocm"),
         "rocmd": binary_dir / exe_name("rocmd"),
-        "pytorch": binary_dir / exe_name("rocm-engine-pytorch"),
-        "llama": binary_dir / exe_name("rocm-engine-llama-cpp"),
         "lemonade": binary_dir / exe_name("rocm-engine-lemonade"),
-        "atom": binary_dir / exe_name("rocm-engine-atom"),
         "vllm": binary_dir / exe_name("rocm-engine-vllm"),
-        "sglang": binary_dir / exe_name("rocm-engine-sglang"),
     }
-
-
-def create_fake_llama_server(smoke_root: Path) -> Path:
-    fake_dir = smoke_root / "fake-bin"
-    fake_dir.mkdir(parents=True, exist_ok=True)
-    server_py = fake_dir / "fake_llama_server.py"
-    server_py.write_text(
-        """
-from __future__ import annotations
-
-import http.server
-import json
-import os
-import socketserver
-import sys
-import time
-
-
-def arg_value(name: str, default: str) -> str:
-    if name not in sys.argv:
-        return default
-    index = sys.argv.index(name)
-    if index + 1 >= len(sys.argv):
-        return default
-    return sys.argv[index + 1]
-
-
-host = arg_value("--host", "127.0.0.1")
-port = int(arg_value("--port", "11435"))
-ready_port = int(os.environ.get("ROCM_CLI_FAKE_LLAMA_READY_PORT", "11437"))
-print("fake llama-server " + " ".join(sys.argv[1:]), flush=True)
-
-if port != ready_port:
-    raise SystemExit(0)
-
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, format: str, *args: object) -> None:
-        return
-
-    def do_GET(self) -> None:
-        if self.path == "/health":
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"OK")
-            return
-        if self.path == "/v1/models":
-            payload = json.dumps({"data": [{"id": "tiny.gguf"}]}).encode("utf-8")
-            self.send_response(200)
-            self.send_header("content-type", "application/json")
-            self.send_header("content-length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-            return
-        self.send_response(404)
-        self.end_headers()
-
-
-socketserver.TCPServer.allow_reuse_address = True
-with socketserver.TCPServer((host, port), Handler) as httpd:
-    httpd.timeout = 0.2
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        httpd.handle_request()
-""".lstrip(),
-        encoding="utf-8",
-    )
-    if platform.system() == "Windows":
-        path = fake_dir / "llama-server.cmd"
-        path.write_text(
-            f'@echo off\r\n"{sys.executable}" "{server_py}" %*\r\n',
-            encoding="utf-8",
-        )
-    else:
-        path = fake_dir / "llama-server"
-        path.write_text(
-            f'#!/usr/bin/env sh\nexec "{sys.executable}" "{server_py}" "$@"\n',
-            encoding="utf-8",
-        )
-        path.chmod(0o755)
-    return path
 
 
 def main() -> int:
@@ -249,15 +164,10 @@ def main() -> int:
         shutil.rmtree(smoke_root)
     smoke_root.mkdir(parents=True, exist_ok=True)
     reject_port = free_tcp_port()
-    env["ROCM_CLI_LLAMA_CPP_SERVER"] = str(create_fake_llama_server(smoke_root))
 
     rocm = str(paths["rocm"])
     rocmd = str(paths["rocmd"])
-    pytorch = str(paths["pytorch"])
-    llama = str(paths["llama"])
-    atom = str(paths["atom"])
     vllm = str(paths["vllm"])
-    sglang = str(paths["sglang"])
 
     version = run("rocm version", [rocm, "version"], env=env)
     assert_contains(version, "rocm ", "rocm version")
@@ -269,11 +179,8 @@ def main() -> int:
     assert_contains(examine, "managed_services: 0", "rocm examine first-run state")
 
     engines = run("rocm engines list", [rocm, "engines", "list"], env=env)
-    assert_contains(engines, "llama.cpp", "rocm engines list")
-    assert_contains(engines, "pytorch", "rocm engines list")
-    assert_contains(engines, "atom", "rocm engines list")
+    assert_contains(engines, "lemonade", "rocm engines list")
     assert_contains(engines, "vllm", "rocm engines list")
-    assert_contains(engines, "sglang", "rocm engines list")
 
     telemetry = run(
         "rocm config set telemetry off",
@@ -286,25 +193,9 @@ def main() -> int:
     assert_contains(config_show, "telemetry_mode: off", "config telemetry off")
     assert_contains(config_show, "telemetry_policy: disabled", "config telemetry off")
 
-    llama_install = parse_json(
-        run(
-            "llama.cpp direct external install probe",
-            [llama, "install", "--runtime-id", "external"],
-            env=env,
-        ),
-        "llama.cpp direct external install probe",
-    )
-    if (
-        not isinstance(llama_install, dict)
-        or llama_install.get("runtime_kind") != "external_llama_server"
-        or llama_install.get("managed_env") is not False
-        or "python_executable:" in json.dumps(llama_install)
-    ):
-        fail(f"unexpected llama.cpp external install probe: {llama_install}")
-
     engine_install = run(
         "rocm engines install requires exact runtime",
-        [rocm, "engines", "install", "llama.cpp"],
+        [rocm, "engines", "install", "vllm"],
         env=env,
         expect_failure=True,
     )
@@ -376,11 +267,11 @@ def main() -> int:
     )
 
     plan = run(
-        "rocm freeform llama plan",
-        [rocm, "serve qwen with llama.cpp"],
+        "rocm freeform vllm plan",
+        [rocm, "serve qwen with vllm"],
         env=env,
     )
-    assert_contains(plan, "engine: llama.cpp", "rocm freeform plan")
+    assert_contains(plan, "engine: vllm", "rocm freeform plan")
     assert_contains(
         plan,
         "no CPU fallback is implied",
@@ -463,101 +354,6 @@ def main() -> int:
         prefetch_failure, "prefetch_artifact requires", "sandbox prefetch validation"
     )
 
-    parse_json(run("pytorch detect", [pytorch, "detect"], env=env), "pytorch detect")
-    pytorch_capabilities = parse_json(
-        run("pytorch capabilities", [pytorch, "capabilities"], env=env),
-        "pytorch capabilities",
-    )
-    if not isinstance(pytorch_capabilities, dict) or not pytorch_capabilities.get(
-        "openai_compatible"
-    ):
-        fail(
-            f"pytorch capabilities did not report OpenAI-compatible serving: {pytorch_capabilities}"
-        )
-
-    pytorch_model = run(
-        "pytorch resolve qwen", [pytorch, "resolve-model", "qwen"], env=env
-    )
-    assert_contains(pytorch_model, "Qwen/Qwen2.5-1.5B-Instruct", "pytorch resolve qwen")
-    qwen35_failure = run(
-        "pytorch reject qwen3.5",
-        [pytorch, "resolve-model", "qwen3.5"],
-        env=env,
-        expect_failure=True,
-    )
-    assert_contains(
-        qwen35_failure,
-        "not supported by the managed PyTorch engine",
-        "pytorch reject qwen3.5",
-    )
-    tiny_pytorch = parse_json(
-        run(
-            "pytorch resolve tiny gpu recipe",
-            [pytorch, "resolve-model", "tiny-gpt2"],
-            env=env,
-        ),
-        "pytorch resolve tiny-gpt2",
-    )
-    if (
-        not isinstance(tiny_pytorch, dict)
-        or tiny_pytorch.get("canonical_model_id") != "sshleifer/tiny-gpt2"
-        or tiny_pytorch.get("device_policy") != "gpu_required"
-        or tiny_pytorch.get("dtype") != "float16"
-    ):
-        fail(
-            f"pytorch tiny-gpt2 did not resolve as GPU-required recipe: {tiny_pytorch}"
-        )
-
-    parse_json(run("llama.cpp detect", [llama, "detect"], env=env), "llama.cpp detect")
-    llama_capabilities = parse_json(
-        run("llama.cpp capabilities", [llama, "capabilities"], env=env),
-        "llama.cpp capabilities",
-    )
-    if (
-        not isinstance(llama_capabilities, dict)
-        or not llama_capabilities.get("openai_compatible")
-        or llama_capabilities.get("quantized_models") != "gguf"
-    ):
-        fail(
-            f"llama.cpp capabilities did not report expected GGUF/OpenAI support: {llama_capabilities}"
-        )
-
-    llama_model = run(
-        "llama.cpp resolve gguf", [llama, "resolve-model", "tiny.gguf"], env=env
-    )
-    assert_contains(llama_model, "tiny.gguf", "llama.cpp resolve gguf")
-    llama_cpu = run(
-        "llama.cpp reject cpu",
-        [llama, "launch", "smoke-cpu", "tiny.gguf", "--device-policy", "cpu_only"],
-        env=env,
-        expect_failure=True,
-    )
-    assert_contains(llama_cpu, "no CPU fallback is used", "llama.cpp reject cpu")
-
-    parse_json(run("atom detect", [atom, "detect"], env=env), "atom detect")
-    atom_capabilities = parse_json(
-        run("atom capabilities", [atom, "capabilities"], env=env),
-        "atom capabilities",
-    )
-    if (
-        not isinstance(atom_capabilities, dict)
-        or not atom_capabilities.get("openai_compatible")
-        or atom_capabilities.get("cpu")
-    ):
-        fail(
-            f"atom capabilities did not report GPU-only OpenAI serving: {atom_capabilities}"
-        )
-
-    atom_model = run("atom resolve qwen", [atom, "resolve-model", "qwen"], env=env)
-    assert_contains(atom_model, "qwen", "atom resolve qwen")
-    atom_cpu = run(
-        "atom reject cpu",
-        [atom, "resolve-model", "qwen", "--device-policy", "cpu_only"],
-        env=env,
-        expect_failure=True,
-    )
-    assert_contains(atom_cpu, "no CPU fallback is used", "atom reject cpu")
-
     parse_json(run("vllm detect", [vllm, "detect"], env=env), "vllm detect")
     vllm_capabilities = parse_json(
         run("vllm capabilities", [vllm, "capabilities"], env=env),
@@ -582,40 +378,14 @@ def main() -> int:
     )
     assert_contains(vllm_cpu, "no CPU fallback is used", "vllm reject cpu")
 
-    parse_json(run("sglang detect", [sglang, "detect"], env=env), "sglang detect")
-    sglang_capabilities = parse_json(
-        run("sglang capabilities", [sglang, "capabilities"], env=env),
-        "sglang capabilities",
-    )
-    if (
-        not isinstance(sglang_capabilities, dict)
-        or not sglang_capabilities.get("openai_compatible")
-        or sglang_capabilities.get("cpu")
-    ):
-        fail(
-            f"sglang capabilities did not report GPU-only OpenAI serving: {sglang_capabilities}"
-        )
-
-    sglang_model = run(
-        "sglang resolve qwen", [sglang, "resolve-model", "qwen"], env=env
-    )
-    assert_contains(sglang_model, "qwen", "sglang resolve qwen")
-    sglang_cpu = run(
-        "sglang reject cpu",
-        [sglang, "resolve-model", "qwen", "--device-policy", "cpu_only"],
-        env=env,
-        expect_failure=True,
-    )
-    assert_contains(sglang_cpu, "no CPU fallback is used", "sglang reject cpu")
-
-    llama_gpu_required = run(
-        "llama.cpp reject required gpu",
+    vllm_gpu_required = run(
+        "vllm reject required gpu",
         [
             rocm,
             "serve",
-            "tiny.gguf",
+            "qwen",
             "--engine",
-            "llama.cpp",
+            "vllm",
             "--device",
             "gpu_required",
             "--foreground",
@@ -625,21 +395,21 @@ def main() -> int:
         env=env,
         expect_failure=True,
     )
-    assert_contains(llama_gpu_required, "gpu_required", "llama.cpp reject required gpu")
+    assert_contains(vllm_gpu_required, "gpu_required", "vllm reject required gpu")
     assert_not_contains(
-        llama_gpu_required,
+        vllm_gpu_required,
         "CPU fallback",
-        "llama.cpp reject required gpu",
+        "vllm reject required gpu",
     )
 
-    llama_cpu_serve = run(
-        "rocm llama.cpp reject cpu serve",
+    vllm_cpu_serve = run(
+        "rocm vllm reject cpu serve",
         [
             rocm,
             "serve",
-            "tiny.gguf",
+            "qwen",
             "--engine",
-            "llama.cpp",
+            "vllm",
             "--device",
             "cpu",
             "--foreground",
@@ -650,9 +420,9 @@ def main() -> int:
         expect_failure=True,
     )
     assert_contains(
-        llama_cpu_serve,
+        vllm_cpu_serve,
         "CPU mode is not a fallback path",
-        "rocm llama.cpp reject cpu serve",
+        "rocm vllm reject cpu serve",
     )
 
     assert_path_missing(

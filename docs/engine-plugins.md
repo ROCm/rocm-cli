@@ -16,13 +16,17 @@ Search order:
 
 The first directory is the preferred location for external adapters. Use a
 binary name in the form `rocm-engine-<engine>` on Linux/WSL and
-`rocm-engine-<engine>.exe` on Windows. The `llama.cpp` engine uses
-`rocm-engine-llama-cpp` on Linux/WSL and `rocm-engine-llama-cpp.exe` on
-Windows.
+`rocm-engine-<engine>.exe` on Windows.
 
-Packaged first-party adapters are `pytorch`, `llama.cpp`, `lemonade`, `atom`,
-`vllm`, and `sglang`. Linux/WSL-only ROCm GPU adapters fail explicitly on
-native Windows instead of selecting a CPU fallback.
+Packaged first-party adapters are `lemonade` and `vllm`. Linux/WSL-only ROCm GPU
+adapters (such as `vllm`) fail explicitly on native Windows instead of selecting
+a CPU fallback.
+
+The engine-selecting commands (`rocm serve --engine`, `rocm engines
+install`/`shell`, `rocm config set-engine`/`set-default-engine`) currently accept
+only the built-in `lemonade` and `vllm` engines. Discovery still lists external
+plugins under the search directories above, but selecting one by name from the
+CLI is not supported while the engine set is limited to the two built-ins.
 
 The `lemonade` adapter uses Lemonade embeddable and requires Lemonade's
 `llamacpp:rocm` backend. Windows ROCm serving is validated. WSL is currently

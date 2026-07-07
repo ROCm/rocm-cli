@@ -12,10 +12,10 @@
 //!
 //! Everything here operates at the CLI/HTTP layer *above* the per-engine
 //! adapters, so the summary shape is identical for every serving engine
-//! (lemonade, vLLM, SGLang, PyTorch, llama.cpp, atom). Only two things vary by
-//! engine, and both are already normalized elsewhere: the health path used for
-//! readiness, and whether the server reports token usage (which only affects
-//! whether throughput is exact, approximated, or `n/a`).
+//! (lemonade, vLLM). Only two things vary by engine, and both are already
+//! normalized elsewhere: the health path used for readiness, and whether the
+//! server reports token usage (which only affects whether throughput is
+//! exact, approximated, or `n/a`).
 
 use std::fmt::Write as _;
 use std::io::{IsTerminal, Write};

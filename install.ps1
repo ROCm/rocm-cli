@@ -181,7 +181,7 @@ function Write-MinimalConfigIfMissing {
     New-Item -ItemType Directory -Force -Path $configDir | Out-Null
     $json = @'
 {
-  "default_engine": "pytorch",
+  "default_engine": "lemonade",
   "telemetry": {
     "mode": "local"
   },

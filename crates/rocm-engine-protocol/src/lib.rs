@@ -21,18 +21,8 @@ pub struct EnginePluginDescriptor {
 }
 
 pub fn platform_engine_plugin_binary_name(engine_id: &str) -> String {
-    let binary_name = format!(
-        "{ENGINE_PLUGIN_BINARY_PREFIX}{}",
-        engine_id_to_plugin_binary_component(engine_id)
-    );
+    let binary_name = format!("{ENGINE_PLUGIN_BINARY_PREFIX}{engine_id}");
     rocm_core::platform_binary_name(&binary_name)
-}
-
-fn engine_id_to_plugin_binary_component(engine_id: &str) -> &str {
-    match engine_id {
-        "llama.cpp" => "llama-cpp",
-        other => other,
-    }
 }
 
 pub fn engine_id_from_plugin_binary_name(name: &str) -> Option<String> {
@@ -41,10 +31,6 @@ pub fn engine_id_from_plugin_binary_name(name: &str) -> Option<String> {
     }
     let name = strip_optional_exe_suffix(name);
     let engine_id = name.strip_prefix(ENGINE_PLUGIN_BINARY_PREFIX)?;
-    let engine_id = match engine_id {
-        "llama-cpp" => "llama.cpp",
-        other => other,
-    };
     is_valid_engine_id(engine_id).then(|| engine_id.to_owned())
 }
 
@@ -629,12 +615,12 @@ mod tests {
     #[test]
     fn plugin_binary_names_normalize_to_engine_ids() {
         assert_eq!(
-            engine_id_from_plugin_binary_name("rocm-engine-pytorch"),
-            Some("pytorch".to_owned())
+            engine_id_from_plugin_binary_name("rocm-engine-lemonade"),
+            Some("lemonade".to_owned())
         );
         assert_eq!(
-            engine_id_from_plugin_binary_name("rocm-engine-llama-cpp.EXE"),
-            Some("llama.cpp".to_owned())
+            engine_id_from_plugin_binary_name("rocm-engine-vllm.EXE"),
+            Some("vllm".to_owned())
         );
         assert_eq!(engine_id_from_plugin_binary_name("rocm-engine-"), None);
         assert_eq!(engine_id_from_plugin_binary_name("rocm"), None);
@@ -643,7 +629,7 @@ mod tests {
             None
         );
         assert_eq!(
-            engine_id_from_plugin_binary_name("nested/rocm-engine-pytorch"),
+            engine_id_from_plugin_binary_name("nested/rocm-engine-lemonade"),
             None
         );
     }
@@ -656,16 +642,17 @@ mod tests {
         fs::create_dir_all(&first_dir).unwrap();
         fs::create_dir_all(&second_dir).unwrap();
 
-        let first_pytorch = first_dir.join(platform_engine_plugin_binary_name("pytorch"));
-        let first_vllm = first_dir.join(platform_engine_plugin_binary_name("vllm"));
-        let second_atom = second_dir.join(platform_engine_plugin_binary_name("atom"));
-        let second_pytorch = second_dir.join(platform_engine_plugin_binary_name("pytorch"));
-        fs::write(&first_pytorch, b"pytorch").unwrap();
+        // The `.exe` suffix is optional in `engine_id_from_plugin_binary_name`, so
+        // the bare `rocm-engine-<id>` names are discovered on every platform.
+        let first_lemonade = first_dir.join("rocm-engine-lemonade");
+        let first_vllm = first_dir.join("rocm-engine-vllm");
+        let second_lemonade = second_dir.join("rocm-engine-lemonade");
+        fs::write(&first_lemonade, b"lemonade").unwrap();
         fs::write(&first_vllm, b"vllm").unwrap();
-        fs::write(&second_atom, b"atom").unwrap();
-        fs::write(&second_pytorch, b"duplicate pytorch").unwrap();
+        fs::write(&second_lemonade, b"duplicate lemonade").unwrap();
         fs::write(first_dir.join("not-an-engine"), b"ignore").unwrap();
-        fs::create_dir_all(first_dir.join(platform_engine_plugin_binary_name("sglang"))).unwrap();
+        // A directory matching the plugin naming must be ignored (only files count).
+        fs::create_dir_all(second_dir.join("rocm-engine-ghost")).unwrap();
 
         let plugins =
             discover_engine_plugins([root.join("missing"), first_dir, second_dir]).unwrap();
@@ -673,14 +660,14 @@ mod tests {
             .iter()
             .map(|plugin| plugin.id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(ids, vec!["atom", "pytorch", "vllm"]);
+        assert_eq!(ids, vec!["lemonade", "vllm"]);
         assert_eq!(
             plugins
                 .iter()
-                .find(|plugin| plugin.id == "pytorch")
+                .find(|plugin| plugin.id == "lemonade")
                 .unwrap()
                 .executable_path,
-            first_pytorch
+            first_lemonade
         );
 
         fs::remove_dir_all(root).unwrap();

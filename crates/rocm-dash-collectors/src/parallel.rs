@@ -5,9 +5,9 @@
 //! Shared primitives for async collectors that scrape N targets concurrently.
 //!
 //! Today: [[VllmPrometheusCollector]] uses this pattern hand-rolled in the
-//! daemon's runner. As Strix-Halo's `LlamaSlotsCollector` and any future
-//! per-instance scrapers come online, they'll reuse `parallel_scrape` and
-//! the `WarningBus` instead of re-implementing the JoinSet glue.
+//! daemon's runner. As future per-instance scrapers come online, they'll reuse
+//! `parallel_scrape` and the `WarningBus` instead of re-implementing the
+//! JoinSet glue.
 
 use std::future::Future;
 use std::sync::Arc;

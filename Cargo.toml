@@ -9,11 +9,7 @@ members = [
   "crates/rocm-dash-collectors",
   "crates/rocm-dash-daemon",
   "crates/rocm-dash-tui",
-  "engines/llama-cpp",
-  "engines/atom",
-  "engines/pytorch",
   "engines/lemonade",
-  "engines/sglang",
   "engines/vllm",
   "xtask",
 ]

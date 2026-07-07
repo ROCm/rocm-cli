@@ -444,18 +444,18 @@ def main() -> int:
     if not args.skip_build:
         cargo = resolve_cargo()
         run(
-            "build rocm and llama.cpp adapter",
-            [cargo, "build", "-p", "rocm", "-p", "rocm-engine-llama-cpp"],
+            "build rocm and vLLM adapter",
+            [cargo, "build", "-p", "rocm", "-p", "rocm-engine-vllm"],
             env=os.environ.copy(),
             timeout=1200,
         )
 
     rocm = binary_path(args.profile, args.target_dir, "rocm")
-    llama = binary_path(args.profile, args.target_dir, "rocm-engine-llama-cpp")
+    vllm = binary_path(args.profile, args.target_dir, "rocm-engine-vllm")
     if not rocm.is_file():
         fail(f"missing rocm binary: {rocm}")
-    if not llama.is_file():
-        fail(f"missing llama.cpp adapter binary: {llama}")
+    if not vllm.is_file():
+        fail(f"missing vLLM adapter binary: {vllm}")
 
     bootstrap_python = ensure_bootstrap_python(test_root, args.python)
     env = isolated_env(test_root, bootstrap_python, args.family)
@@ -561,16 +561,16 @@ def main() -> int:
     )
     verify_rocm_manifest_packages(manifest)
 
-    llama_detect = run(
-        "llama.cpp adapter detects TheRock HIP env",
-        [str(llama), "detect"],
+    vllm_detect = run(
+        "vLLM adapter detects the managed TheRock runtime",
+        [str(vllm), "detect"],
         env=env,
         timeout=120,
     )
     assert_contains(
-        llama_detect,
-        "TheRock HIP runtime env available",
-        "llama.cpp TheRock HIP env detection",
+        vllm_detect,
+        "external_vllm",
+        "vLLM TheRock runtime detection",
     )
 
     print("therock-sdk-install: ok")
