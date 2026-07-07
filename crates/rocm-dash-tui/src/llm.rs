@@ -89,6 +89,16 @@ pub fn resolve_llm_config(
     // startup-configured local endpoint from leaking a cloud credential).
     let is_loopback = parse_host_port(&base_url).is_some_and(|(host, _)| is_loopback_host(&host));
 
+    // Make the stripping debuggable: a user pointing at an authenticating local
+    // proxy will otherwise see 401s with no on-host signal. Only warn when there
+    // was actually a credential to discard.
+    if is_loopback && (env_key.is_some() || auth_header.is_some()) {
+        tracing::warn!(
+            %base_url,
+            "loopback endpoint: discarding configured api_key/auth_header (local servers use no gateway auth)"
+        );
+    }
+
     Some(LlmConfig {
         base_url,
         model,
