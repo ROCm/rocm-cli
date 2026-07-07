@@ -139,7 +139,9 @@ pub fn probe_endpoint(base_url: &str, timeout: Duration) -> bool {
     false
 }
 
-/// Probe the known local serving endpoints in priority order (Lemonade, then vLLM) and return the first reachable one.
+/// Probe the known local serving endpoints in priority order (Lemonade, then
+/// vLLM, then `rocm serve`'s non-managed default) and return the first
+/// reachable one.
 ///
 /// Used by the TUI's in-app "detect a local engine" action so the user need not run the CLI skill first.
 /// TCP-only (no HTTP); never blocks longer than [`PROBE_TIMEOUT`] per candidate.
@@ -147,6 +149,7 @@ pub fn detect_local_endpoint() -> Option<&'static str> {
     [
         crate::skills::LEMONADE_ENDPOINT,
         crate::skills::VLLM_ENDPOINT,
+        crate::skills::ROCM_SERVE_ENDPOINT,
     ]
     .into_iter()
     .find(|ep| probe_endpoint(ep, PROBE_TIMEOUT))
@@ -323,5 +326,22 @@ mod tests {
             Duration::from_millis(100)
         ));
         assert!(!probe_endpoint("not a url", Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn detect_local_endpoint_probes_rocm_serve_default_port() {
+        // A listener on rocm serve's (non-managed) default port must be picked
+        // up by the fallback probe, not just Lemonade/vLLM's ports.
+        let Ok(listener) =
+            std::net::TcpListener::bind(("127.0.0.1", crate::skills::ROCM_SERVE_PORT))
+        else {
+            // Port already bound in this environment; skip rather than flake.
+            return;
+        };
+        assert_eq!(
+            detect_local_endpoint(),
+            Some(crate::skills::ROCM_SERVE_ENDPOINT)
+        );
+        drop(listener);
     }
 }

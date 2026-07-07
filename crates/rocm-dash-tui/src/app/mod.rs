@@ -995,8 +995,9 @@ impl AppState {
             self.chat_detect_offer = Some(cfg);
         } else {
             self.chat_detect_offer = None;
-            self.chat_detect_msg =
-                Some("no local engine found (Lemonade :13305 / vLLM :8000)".into());
+            self.chat_detect_msg = Some(
+                "no local engine found (Lemonade :13305 / vLLM :8000 / rocm serve :11435)".into(),
+            );
         }
     }
 
