@@ -10,6 +10,7 @@
 //! this file holds only the CLI definition and dispatch. Run via the workspace
 //! alias `cargo xtask <command>`.
 
+mod affected;
 mod manifest;
 mod powershell;
 mod signing;
@@ -63,6 +64,22 @@ enum Command {
         /// Path to the raw signature bytes.
         #[arg(long)]
         signature: PathBuf,
+    },
+    /// Print the workspace crates affected by a git range (changed crates plus
+    /// their transitive dependents) as `cargo` package-selection flags, so CI
+    /// can build/test only what a change can reach instead of `--workspace`.
+    ///
+    /// Output is `--workspace` (fall back to the full workspace — used whenever a
+    /// change can't be confined to specific crates, e.g. `Cargo.lock` or the
+    /// toolchain file), or `-p <crate> ...`, or empty (nothing Rust-relevant
+    /// changed). Note: selection follows the Cargo dependency graph, so a test
+    /// that exercises another crate only indirectly (e.g. via a subprocess) is
+    /// not captured — the conservative fallbacks cover the common such triggers.
+    Affected {
+        /// Base ref for the `<base>...HEAD` (merge-base) range. Defaults to
+        /// `origin/main`.
+        #[arg(long)]
+        base: Option<String>,
     },
     /// Regenerate the Cargo dependency table in MANIFEST.md from `cargo metadata`.
     Manifest {
@@ -126,6 +143,7 @@ fn run() -> Result<()> {
             input,
             signature,
         } => signing::verify(&public_key, &input, &signature)?,
+        Command::Affected { base } => affected::run(base)?,
         Command::Manifest { check } => manifest::run(check)?,
         Command::Tpn { check } => tpn::run(check)?,
         Command::VerifyCommits {
