@@ -54,22 +54,36 @@ pub async fn run(listen: &str, opts: RunnerOptions) -> anyhow::Result<()> {
     }
 }
 
+/// A directory we could not tighten to `0o700` is safe to keep using only if no
+/// unprivileged user can tamper with entries inside it. The one such case is a
+/// **root-owned, sticky** directory — the `/tmp` signature (mode `1777`): the
+/// sticky bit means only the owner of an entry (us) may remove or rename it, so
+/// our `0o600` socket cannot be replaced. Any other owner means a local,
+/// unprivileged user controls the path (a squatting attack), which is not safe.
+#[cfg(unix)]
+const fn is_safe_shared_dir(uid: u32, mode: u32) -> bool {
+    uid == 0 && (mode & 0o1000 != 0)
+}
+
 /// Ensure the socket's parent directory exists and is private (mode `0o700`).
 ///
 /// Directory permissions are *defense-in-depth*: the socket itself is bound with
-/// mode `0o600` (see `run_unix`), so only the owning user can ever connect. We
-/// therefore **enforce** `0o700` only on a directory we just created — a
-/// directory we own must be securable, and failing to do so is a real error.
+/// mode `0o600` (see `run_unix`), so only the owning user can ever connect.
+/// `set_permissions` fails with `EPERM` only when we do not own the directory,
+/// which is exactly what we key the policy on:
 ///
-/// For a directory that already existed and is owned by another user (the classic
-/// case is a socket parented directly at `/tmp`, which is root-owned with mode
-/// `1777`), `chmod` returns `EPERM`. Aborting there crashed the embedded
-/// telemetry daemon for any user whose configured socket lived under `/tmp`.
-/// Since the `0o600` socket already restricts access, we log a warning and carry
-/// on instead of failing.
+/// * **We own it** (chmod succeeds) — it is now `0o700`; continue.
+/// * **A root-owned sticky directory** such as `/tmp` (chmod fails) — the sticky
+///   bit stops other users removing our socket, so warn and continue. Aborting
+///   here is what previously crashed the embedded telemetry daemon for any user
+///   whose configured socket lived directly under `/tmp`.
+/// * **Any other owner** (chmod fails) — another unprivileged user owns this
+///   path and could unlink or replace the socket, so refuse rather than bind a
+///   telemetry endpoint inside an attacker-controlled directory.
 #[cfg(unix)]
 fn prepare_socket_dir(parent: &std::path::Path) -> anyhow::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
 
     // Skip an empty parent (relative socket target such as `unix:foo.sock`).
@@ -78,10 +92,9 @@ fn prepare_socket_dir(parent: &std::path::Path) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Whether we are about to create the directory ourselves. `DirBuilder::mode`
-    // only applies to directories it creates; a pre-existing directory keeps its
-    // current permissions, which is why we tighten explicitly below.
-    let created = !parent.exists();
+    // `DirBuilder::mode` only applies to directories it creates; a pre-existing
+    // directory keeps its current permissions, which is why we tighten
+    // explicitly below.
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -89,26 +102,34 @@ fn prepare_socket_dir(parent: &std::path::Path) -> anyhow::Result<()> {
         .with_context(|| format!("creating socket directory {}", parent.display()))?;
 
     if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)) {
-        if created {
-            // We created it, so we own it: inability to secure it is a real error.
+        // chmod only fails because we do not own the directory. Decide from the
+        // directory's *actual* owner and mode — not from whether we think we
+        // just created it, which is racy — whether it is nonetheless safe.
+        let meta = std::fs::metadata(parent).with_context(|| {
+            format!(
+                "inspecting socket directory {} after it could not be secured",
+                parent.display()
+            )
+        })?;
+        if is_safe_shared_dir(meta.uid(), meta.mode()) {
+            warn!(
+                dir = %parent.display(),
+                error = %e,
+                "could not restrict socket directory to mode 0700; continuing because \
+                 it is a root-owned sticky directory (e.g. /tmp) and the socket is \
+                 created with mode 0600"
+            );
+        } else {
             return Err(e).with_context(|| {
                 format!(
-                    "restricting socket directory {} to mode 0700 — \
-                     check that the directory is owned by the current user \
-                     (EPERM means it is owned by another user or root)",
+                    "restricting socket directory {} to mode 0700 — it is owned by \
+                     another user, so a local user could replace the telemetry \
+                     socket. Point the socket at a directory you own, for example \
+                     under $XDG_RUNTIME_DIR or $HOME",
                     parent.display()
                 )
             });
         }
-        // Pre-existing directory we do not own (e.g. /tmp, mode 1777): the
-        // 0o600 socket still keeps the endpoint private, so warn and continue.
-        warn!(
-            dir = %parent.display(),
-            error = %e,
-            "could not restrict socket directory to mode 0700; continuing because \
-             the socket is created with mode 0600 (expected for shared directories \
-             such as /tmp)"
-        );
     }
     Ok(())
 }
@@ -295,7 +316,29 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;
 
-    use super::prepare_socket_dir;
+    use super::{is_safe_shared_dir, prepare_socket_dir};
+
+    /// The safe-to-continue predicate is the security-critical decision for a
+    /// directory we cannot tighten, and the squatting case (a non-root user
+    /// owning the parent) cannot be reproduced in a unit test without a second
+    /// uid — so pin every owner/mode combination here.
+    #[test]
+    fn only_root_owned_sticky_dir_is_safe_shared() {
+        assert!(is_safe_shared_dir(0, 0o1777), "/tmp signature is safe");
+        assert!(is_safe_shared_dir(0, 0o1700), "root-owned + sticky is safe");
+        assert!(
+            !is_safe_shared_dir(0, 0o0777),
+            "root-owned without the sticky bit is not safe: others can unlink our socket"
+        );
+        assert!(
+            !is_safe_shared_dir(1000, 0o1777),
+            "a non-root user owning the parent is a squatting risk, even with sticky set"
+        );
+        assert!(
+            !is_safe_shared_dir(1000, 0o0700),
+            "another unprivileged owner is never safe"
+        );
+    }
 
     /// A freshly created nested parent must end up at mode 0700.
     #[test]
@@ -325,30 +368,42 @@ mod tests {
         prepare_socket_dir(Path::new("")).expect("empty parent must be skipped");
     }
 
-    /// Regression: a socket parented at a pre-existing directory owned by another
-    /// user (e.g. `/tmp`, root-owned mode 1777) must NOT abort the daemon — the
-    /// chmod EPERM is downgraded to a warning because the 0600 socket already
-    /// protects the endpoint. Before the fix this returned an error and crashed
-    /// the embedded telemetry daemon.
+    /// Regression: a socket parented at a root-owned sticky directory (`/tmp`,
+    /// mode 1777) must NOT abort the daemon — the chmod EPERM is downgraded to a
+    /// warning because the sticky bit + 0600 socket protect the endpoint. Before
+    /// the fix this returned an error and crashed the embedded telemetry daemon.
+    ///
+    /// This exercises the real fix on Linux CI (where `temp_dir()` is `/tmp`,
+    /// root-owned, and the test runs unprivileged). It is skipped when we own the
+    /// temp dir or it is not a root-owned sticky dir (e.g. a custom `TMPDIR`, some
+    /// containers, or macOS) — there chmod would either succeed and mutate a
+    /// shared directory, or the safe-shared predicate would legitimately refuse,
+    /// neither of which is this regression. `is_safe_shared_dir` is unit-tested
+    /// separately for the refuse path.
     #[test]
-    fn preexisting_unowned_parent_does_not_abort() {
+    fn preexisting_root_sticky_parent_does_not_abort() {
         let tmpdir = std::env::temp_dir();
         let Ok(meta) = std::fs::metadata(&tmpdir) else {
-            return; // no temp dir to probe; nothing to assert
+            eprintln!("skip: no temp dir to probe; nothing to assert");
+            return;
         };
+        if !is_safe_shared_dir(meta.uid(), meta.mode()) {
+            eprintln!("skip: temp dir is not the root-owned-sticky /tmp signature");
+            return;
+        }
         // Determine our effective uid by stat-ing a file we create ourselves.
         let probe = tmpdir.join(format!("rocmdashd-uidprobe-{}", std::process::id()));
         if std::fs::write(&probe, b"x").is_err() {
-            return; // cannot write a probe; skip rather than guess our uid
+            eprintln!("skip: cannot write a probe file; cannot determine our uid");
+            return;
         }
         let my_uid = std::fs::metadata(&probe).map(|m| m.uid()).ok();
         let _ = std::fs::remove_file(&probe);
-        // Only meaningful when the temp dir is owned by someone else (so chmod is
-        // guaranteed to EPERM). If we own it or are root, chmod would *succeed*
-        // and mutate a shared directory — skip to avoid side effects.
+        // Only meaningful when we do not own the dir, so chmod is guaranteed to
+        // EPERM and the warn-and-continue path is actually taken.
         if my_uid != Some(meta.uid()) {
             prepare_socket_dir(&tmpdir)
-                .expect("must not abort when it cannot chmod a pre-existing unowned parent");
+                .expect("must not abort on a root-owned sticky parent it cannot chmod (e.g. /tmp)");
         }
     }
 }
