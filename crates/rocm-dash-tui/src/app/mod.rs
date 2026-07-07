@@ -41,6 +41,24 @@ mod summary;
 use chat::{build_chat_agent, detect_local_chat, detect_managed_chat, persist_chat_endpoint};
 use summary::{parse_plan_result, summarize_json_value, summarize_slash_tool};
 
+/// Which single flow a *focused host* runs.
+///
+/// The bare-`rocm` launcher opens one overlay to completion — no embedded
+/// daemon, no tab shell — then returns to the menu. `None` on
+/// [`ResolvedArgs::focus`] is the normal full dashboard, so every existing
+/// dash/chat path is byte-identical when focus is unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    /// First-run onboarding (install / adopt ROCm) — the launcher's
+    /// `Set up this system` row and `rocm bootstrap setup`.
+    Setup,
+    /// The serve-a-model wizard — the launcher's `Serve a model` row.
+    Serve,
+    /// Read-only `rocm examine` environment check — the launcher's
+    /// `Diagnose & fix` row. Auto-runs on open.
+    Examine,
+}
+
 /// Args after CLI + config resolution. Consumed by `run`.
 #[derive(Debug, Clone)]
 pub struct ResolvedArgs {
@@ -53,10 +71,11 @@ pub struct ResolvedArgs {
     /// Which tab is active when the TUI opens. `Chat` for the chat-first launch
     /// (bare `rocm` / `rocm chat`); `Home` for the dashboard (`rocm dash`).
     pub initial_tab: ActiveTab,
-    /// Open the first-run onboarding wizard immediately on launch. Set by
-    /// `rocm bootstrap setup`, which enters the dashboard straight into the
-    /// install/adopt onboarding overlay.
-    pub start_onboarding: bool,
+    /// When `Some`, run as a *focused host*: open exactly the overlay for this
+    /// flow, skip the embedded daemon + chat backend, render overlay-only, and
+    /// exit back to the launcher when the overlay is closed at its root. `None`
+    /// (the default) is the normal full dashboard — every path stays unchanged.
+    pub focus: Option<Focus>,
     /// Chat endpoint base URL, CLI-flag value already merged over config.
     pub chat_url: Option<String>,
     /// Chat model, CLI-flag value already merged over config.
@@ -789,6 +808,24 @@ impl AppState {
             || self.config_manager.is_some()
     }
 
+    /// Focused-host exit gate: `true` when a `focus` is active AND its single
+    /// overlay is closed (no manager is `Some`).
+    ///
+    /// [`has_open_overlay`](Self::has_open_overlay) stays `true` while a
+    /// sub-popup (folder browser / model picker) is open, so this can't fire
+    /// while the user is inside one of those. It does NOT by itself protect a
+    /// running job console: the shared console maps `q` / running-`Esc` to
+    /// "close overlay", which would null the manager mid-job. That case is
+    /// handled upstream in `event_loop` by [`focused_close_key_blocked`], which
+    /// swallows those keys while the job is non-terminal — so by the time this
+    /// gate is checked, a focused overlay only ever closed at its root (form
+    /// screen or a terminal job). Always `false` for the normal
+    /// (`focus == None`) dashboard, so its loop never self-exits. Pure read →
+    /// unit-testable without a live terminal.
+    pub(crate) const fn focused_should_exit(&self, focus: Option<Focus>) -> bool {
+        focus.is_some() && !self.has_open_overlay()
+    }
+
     /// Whether the open manager (if any) is at its TOP-LEVEL screen — no nested
     /// sub-popup (folder browser / model picker / import input), no pending
     /// gating approval, and no job console (running or terminal). Only one
@@ -1315,6 +1352,65 @@ impl AppState {
     }
 }
 
+/// Whether the event loop should skip the embedded daemon client AND the chat
+/// backend resolution. True exactly when a [`Focus`] is set: a focused host runs
+/// one overlay that streams its own job through the job-bridge, so it needs
+/// neither live telemetry nor an LLM. `focus == None` (the dashboard) keeps both.
+/// Pure predicate → unit-testable without a runtime; also names the render branch
+/// (`draw_focused` when true, `draw` when false).
+const fn should_skip_daemon(focus: Option<Focus>) -> bool {
+    focus.is_some()
+}
+
+/// In a focused host, whether a console "close" key must be SWALLOWED because
+/// the active job is still running.
+///
+/// In the dashboard, `q` / running-`Esc` detach the console and leave the job
+/// running in the background (the app persists). A focused host has no
+/// background: closing the overlay trips the [`AppState::focused_should_exit`]
+/// gate and returns from `event_loop`, tearing down the runtime and killing the
+/// child via `kill_on_drop` — truncating a mutating install/serve mid-write. So
+/// while the job is non-terminal we swallow those keys; the user stops a job
+/// explicitly with `Ctrl+C` (never blocked here), and once it is terminal `q` /
+/// `Esc` exit normally. Always `false` for the dashboard (`focus == None`).
+fn focused_close_key_blocked(state: &AppState, focus: Option<Focus>, code: KeyCode) -> bool {
+    if !should_skip_daemon(focus) {
+        return false;
+    }
+    let running = state
+        .active_job_id()
+        .and_then(|id| state.jobs.job(id))
+        .is_some_and(|j| !j.is_terminal());
+    running && matches!(code, KeyCode::Char('q') | KeyCode::Esc)
+}
+
+/// Open the single overlay a focused host should host, returning any initial
+/// job-bridge side effects to pump (Examine auto-runs `rocm examine` on open;
+/// Setup/Serve open their form and wait for input). Clears any other overlay
+/// first (mutually-exclusive invariant). Pure w.r.t. process I/O — the caller
+/// runs the returned effects through [`crate::jobs::run_effects`].
+fn open_overlay_for_focus(
+    state: &mut AppState,
+    focus: Focus,
+) -> Vec<rocm_dash_core::state::SideEffect> {
+    state.close_overlays();
+    match focus {
+        Focus::Setup => {
+            state.onboarding = Some(crate::ui::onboarding::OnboardingState::default());
+            Vec::new()
+        }
+        Focus::Serve => {
+            state.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState::default());
+            Vec::new()
+        }
+        Focus::Examine => {
+            let (mgr, fx) = crate::ui::examine_manager::open_running(&mut state.jobs);
+            state.examine_manager = Some(mgr);
+            fx
+        }
+    }
+}
+
 pub async fn run(args: ResolvedArgs) -> color_eyre::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1349,6 +1445,13 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     let chat_tx = tx.clone();
     let replay_controller = if let Some(path) = args.replay.clone() {
         Some(crate::replay::spawn(path, tx))
+    } else if should_skip_daemon(args.focus) {
+        // Focused host: no daemon client. The overlay streams its own job via
+        // the job-bridge and the telemetry chrome isn't drawn, so a live
+        // connection would only spawn an unused embedded daemon. Drop `tx`
+        // (its `chat_tx` clone keeps `rx` alive for the loop); nothing is sent.
+        drop(tx);
+        None
     } else {
         client::spawn(args.connect.clone(), tx);
         None
@@ -1366,11 +1469,6 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     let mut state = AppState::new(connect_label, args.theme.clone());
     // Honor the chat-first vs dashboard launch choice (rocm-cli semantics).
     state.active_tab = args.initial_tab;
-    // `rocm bootstrap setup` launches the dashboard straight into the first-run
-    // onboarding wizard (install ROCm SDK / adopt an existing folder).
-    if args.start_onboarding {
-        state.onboarding = Some(crate::ui::onboarding::OnboardingState::default());
-    }
     // Serve-wizard recipe picker source (Phase 3 Wave 1), adapted by the bin.
     state.model_recipes = args.model_recipes.clone();
     // Runtime manager source (Phase 3 Wave 2), adapted by the bin.
@@ -1380,13 +1478,27 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     // Tool-executor seam (Phase 2 plumbing), injected by the bin; None for
     // demo/replay/mock. Phase 3 will use it.
     state.tool_executor = args.tool_executor.clone();
+    // Focused host: open exactly the overlay for the requested flow (Examine
+    // also auto-runs its read-only job). `Focus::Setup` opens the onboarding
+    // overlay — the same wizard `rocm bootstrap setup` routes to.
+    if let Some(focus) = args.focus {
+        let fx = open_overlay_for_focus(&mut state, focus);
+        crate::jobs::run_effects(fx, &job_tx);
+    }
     state.replay = replay_controller.map(ReplayState::new);
 
     // Resolve the chat backend. `--chat-mock` short-circuits detection with a
     // deterministic offline MockAgentClient (no live LLM, no network); otherwise
     // we auto-detect the endpoint (the std-TCP probe runs once on a blocking
     // thread before the first frame) and build the Rig backend.
-    let mut agent: Option<std::sync::Arc<dyn crate::agent::AgentClient>> = if args.chat_mock {
+    let mut agent: Option<std::sync::Arc<dyn crate::agent::AgentClient>> = if should_skip_daemon(
+        args.focus,
+    ) {
+        // Focused host: Setup/Serve/Diagnose never chat. Skip endpoint detection
+        // and backend construction entirely — no probe, no network, no OAuth
+        // default. `chat_llm` stays `None` and the Chat tab is never drawn here.
+        None
+    } else if args.chat_mock {
         state.set_chat_config(
             Some(crate::llm::LlmConfig {
                 base_url: "mock://offline-demo".to_string(),
@@ -1490,7 +1602,13 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     let local_agent = agent.clone();
 
     loop {
-        terminal.draw(|f| ui::draw(f, &mut state))?;
+        // Focused host renders overlay-only (no header / tabs / dock / footer
+        // chrome); the dashboard renders the full shell.
+        if should_skip_daemon(args.focus) {
+            terminal.draw(|f| ui::draw_focused(f, &mut state))?;
+        } else {
+            terminal.draw(|f| ui::draw(f, &mut state))?;
+        }
         tokio::select! {
             _ = tick.tick() => { /* repaint */ }
             maybe_msg = rx.recv() => {
@@ -1590,6 +1708,16 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         let (dv, dh) = console_scroll_delta(k.code).unwrap_or((0, 0));
                         state.scroll_console(dv, dh);
                     }
+                    // Focused host only: while the hosted job is still RUNNING,
+                    // swallow the console close keys (`q`, running-`Esc`) so the
+                    // overlay is never nulled mid-job — which would trip the
+                    // focused exit gate and tear the runtime down, killing the
+                    // child via kill_on_drop. `Ctrl+C` (cancel) and the scroll
+                    // keys above still flow, so the user can always stop a job;
+                    // once it is terminal, `q`/`Esc` exit normally. Routed BEFORE
+                    // the per-manager arms so the manager can't close first.
+                    Some(Ok(CtEvent::Key(k)))
+                        if focused_close_key_blocked(&state, args.focus, k.code) => {}
                     // The services-manager overlay, when open, owns all keys
                     // (and may spawn lifecycle jobs through the job-bridge).
                     Some(Ok(CtEvent::Key(k))) if state.services.is_some() => {
@@ -1753,6 +1881,16 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         // A `/quit` (or `/exit`) slash command sets `should_quit` from inside
         // the reducer; honor it here (mirrors the `KeyAction::Quit` break).
         if state.should_quit {
+            break;
+        }
+
+        // Focused host: the launcher hosts exactly one overlay. Once the user
+        // backs out of it at root (the per-manager `on_key` set its state to
+        // `None`), return so `app::run` hands control back to the launcher menu.
+        // `focused_should_exit` stays `false` while any sub-popup / job console
+        // keeps the overlay `Some`, so this never ejects mid-flow. No-op for the
+        // dashboard (`focus == None`).
+        if state.focused_should_exit(args.focus) {
             break;
         }
 
@@ -3973,6 +4111,267 @@ mod tests {
         AppState::new("t".into(), "default-dark".into())
     }
 
+    // --- Focused host (Phase 2): default-off focus flag hosts one overlay ---
+
+    #[test]
+    fn resolved_args_focus_defaults_none() {
+        // The focus flag is additive and off by default in every constructor, so
+        // existing dash/chat behavior is byte-identical.
+        assert!(args_with_anthropic_key(None).focus.is_none());
+    }
+
+    #[test]
+    fn should_skip_daemon_predicate_matches_focus() {
+        // The dashboard (focus=None) keeps the daemon client + chat backend; any
+        // focus skips both. The render branch reuses this same predicate.
+        assert!(!should_skip_daemon(None));
+        assert!(should_skip_daemon(Some(Focus::Setup)));
+        assert!(should_skip_daemon(Some(Focus::Serve)));
+        assert!(should_skip_daemon(Some(Focus::Examine)));
+        // focus=None never self-exits — the dash loop only breaks on Quit/EOF.
+        assert!(!st().focused_should_exit(None));
+    }
+
+    #[test]
+    fn open_overlay_for_focus_opens_the_right_overlay() {
+        let mut s = st();
+        assert!(open_overlay_for_focus(&mut s, Focus::Setup).is_empty());
+        assert!(s.onboarding.is_some());
+        assert!(s.serve_wizard.is_none() && s.examine_manager.is_none());
+
+        let mut s = st();
+        assert!(open_overlay_for_focus(&mut s, Focus::Serve).is_empty());
+        assert!(s.serve_wizard.is_some());
+        assert!(s.onboarding.is_none() && s.examine_manager.is_none());
+
+        let mut s = st();
+        let fx = open_overlay_for_focus(&mut s, Focus::Examine);
+        assert!(s.examine_manager.is_some());
+        assert!(s.onboarding.is_none() && s.serve_wizard.is_none());
+        assert_eq!(fx.len(), 1, "examine auto-runs on open");
+    }
+
+    #[test]
+    fn focused_examine_auto_runs_rocm_examine() {
+        let mut s = st();
+        let fx = open_overlay_for_focus(&mut s, Focus::Examine);
+        assert_eq!(fx.len(), 1, "exactly one spawn side effect on open");
+        match &fx[0] {
+            rocm_dash_core::state::SideEffect::SpawnJob { cmd, args, .. } => {
+                assert!(cmd.contains("rocm"), "cmd resolves to the rocm exe: {cmd}");
+                assert!(
+                    args.iter().any(|a| a == "examine"),
+                    "examine in args: {args:?}"
+                );
+            }
+            other => panic!("expected SpawnJob, got {other:?}"),
+        }
+        assert_eq!(
+            s.examine_manager.as_ref().unwrap().active_job.as_deref(),
+            Some("examine"),
+            "the auto-run wires the active job"
+        );
+    }
+
+    #[test]
+    fn draw_focused_shows_overlay_without_tab_chrome() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut s = st();
+        // Intro card (no auto-run) → deterministic overlay content to assert on.
+        s.examine_manager = Some(crate::ui::examine_manager::ExamineManagerState::default());
+        let backend = TestBackend::new(120, 32);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| crate::ui::draw_focused(f, &mut s)).unwrap();
+        let out: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(out.contains("Examine"), "overlay content present: {out:?}");
+        assert!(
+            !out.contains("1–5"),
+            "no dash tab-shell hint in focused mode"
+        );
+        assert!(
+            out.contains("Esc"),
+            "focused hint carries an Esc affordance"
+        );
+    }
+
+    #[test]
+    fn focused_exit_gate_holds_until_examine_closed_at_root() {
+        let mut s = st();
+        // Focused Diagnose: examine opens AND auto-runs → a job-console sub-state.
+        let _ = open_overlay_for_focus(&mut s, Focus::Examine);
+        assert!(s.examine_manager.as_ref().unwrap().active_job.is_some());
+        assert!(
+            !s.focused_should_exit(Some(Focus::Examine)),
+            "a running job keeps the launcher out"
+        );
+
+        // Job terminal → first Esc dismisses the console back to the intro card;
+        // the overlay is still open, so the gate stays shut.
+        s.jobs.apply(rocm_dash_core::state::StateEvent::JobDone {
+            id: "examine".into(),
+            code: 0,
+        });
+        let _ = crate::ui::examine_manager::on_key(
+            &mut s.examine_manager,
+            &mut s.jobs,
+            press(KeyCode::Esc),
+        );
+        assert!(
+            s.examine_manager.is_some(),
+            "console dismissed, overlay stays"
+        );
+        assert!(
+            !s.focused_should_exit(Some(Focus::Examine)),
+            "at the intro (not root-closed) the gate is still shut"
+        );
+
+        // Second Esc at the intro (root) closes the overlay → now exit to menu.
+        let _ = crate::ui::examine_manager::on_key(
+            &mut s.examine_manager,
+            &mut s.jobs,
+            press(KeyCode::Esc),
+        );
+        assert!(s.examine_manager.is_none(), "root Esc closes the overlay");
+        assert!(
+            s.focused_should_exit(Some(Focus::Examine)),
+            "closed at root → return to the launcher"
+        );
+    }
+
+    #[test]
+    fn focused_close_keys_swallowed_while_job_runs() {
+        // Regression for the mid-job ejection defect: `q` and running-`Esc` must
+        // be swallowed by the focused host while the job is non-terminal, so the
+        // overlay is never nulled (which would tear the runtime down and kill the
+        // child via kill_on_drop mid-write).
+        let mut s = st();
+        let _ = open_overlay_for_focus(&mut s, Focus::Examine); // auto-runs a job
+        assert!(s.has_active_console(), "examine console is live");
+        // Running job → q and Esc are blocked; Ctrl+C ('c') is NOT (it cancels).
+        assert!(focused_close_key_blocked(
+            &s,
+            Some(Focus::Examine),
+            KeyCode::Char('q')
+        ));
+        assert!(focused_close_key_blocked(
+            &s,
+            Some(Focus::Examine),
+            KeyCode::Esc
+        ));
+        assert!(!focused_close_key_blocked(
+            &s,
+            Some(Focus::Examine),
+            KeyCode::Char('c')
+        ));
+        // The dashboard (focus=None) never blocks — behavior is unchanged there.
+        assert!(!focused_close_key_blocked(&s, None, KeyCode::Char('q')));
+
+        // Because those keys are swallowed (never routed to the manager), the
+        // overlay stays open and the exit gate stays shut mid-job.
+        assert!(s.examine_manager.is_some());
+        assert!(!s.focused_should_exit(Some(Focus::Examine)));
+
+        // Once the job is terminal, close keys are allowed again → normal exit.
+        s.jobs.apply(rocm_dash_core::state::StateEvent::JobDone {
+            id: "examine".into(),
+            code: 0,
+        });
+        assert!(
+            !focused_close_key_blocked(&s, Some(Focus::Examine), KeyCode::Char('q')),
+            "a terminal job no longer blocks exit (the child already exited)"
+        );
+    }
+
+    #[test]
+    fn focused_gate_shut_across_serve_sub_states() {
+        // Exit-at-root (b)+(c): the focused gate stays shut while a folder
+        // browser / model picker / approval is open — it only opens at root.
+        let recipes: Vec<crate::ui::model_picker::ModelRecipeSummary> = Vec::new();
+        let mut s = st();
+        let _ = open_overlay_for_focus(&mut s, Focus::Serve);
+
+        // (b) Tab on the Model field opens the folder-browser sub-popup.
+        let _ = crate::ui::serve_wizard::on_key(
+            &mut s.serve_wizard,
+            &mut s.jobs,
+            &recipes,
+            press(KeyCode::Tab),
+        );
+        assert!(s.serve_wizard.as_ref().unwrap().browser.is_some());
+        assert!(
+            !s.focused_should_exit(Some(Focus::Serve)),
+            "gate shut while the folder browser is open"
+        );
+        // Esc closes the sub-popup, not the wizard → still shut.
+        let _ = crate::ui::serve_wizard::on_key(
+            &mut s.serve_wizard,
+            &mut s.jobs,
+            &recipes,
+            press(KeyCode::Esc),
+        );
+        assert!(s.serve_wizard.as_ref().unwrap().browser.is_none());
+        assert!(s.serve_wizard.is_some());
+        assert!(!s.focused_should_exit(Some(Focus::Serve)));
+
+        // (c) Stage an approval (valid model, Launch field, Enter).
+        {
+            let w = s.serve_wizard.as_mut().unwrap();
+            w.model = "org/model".to_string();
+            w.field = crate::ui::serve_wizard::FIELDS.len() - 1; // Launch
+        }
+        let _ = crate::ui::serve_wizard::on_key(
+            &mut s.serve_wizard,
+            &mut s.jobs,
+            &recipes,
+            press(KeyCode::Enter),
+        );
+        assert!(
+            s.serve_wizard.as_ref().unwrap().approval.is_some(),
+            "a launch approval is pending"
+        );
+        assert!(
+            !s.focused_should_exit(Some(Focus::Serve)),
+            "gate shut while an approval is pending"
+        );
+
+        // Only a root close (wizard → None) opens the gate.
+        s.serve_wizard = None;
+        assert!(s.focused_should_exit(Some(Focus::Serve)));
+    }
+
+    #[test]
+    fn draw_focused_serve_with_empty_recipes_does_not_panic() {
+        // Edge input: the serve wizard must render (and the focused host must
+        // paint it) with NO built-in recipes — the user can still type a path.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut s = st();
+        s.model_recipes = Vec::new();
+        s.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState::default());
+        let backend = TestBackend::new(120, 32);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| crate::ui::draw_focused(f, &mut s)).unwrap();
+        let out: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        // No panic == pass; the focused hint is present regardless of recipes.
+        assert!(
+            out.contains("Esc"),
+            "focused hint renders with empty recipes"
+        );
+    }
+
     #[test]
     fn slash_help_opens_help_modal() {
         let mut s = st();
@@ -4136,7 +4535,7 @@ mod tests {
             theme: "default-dark".into(),
             replay: None,
             initial_tab: ActiveTab::Chat,
-            start_onboarding: false,
+            focus: None,
             chat_url: None,
             chat_model: None,
             chat_auth_header: None,

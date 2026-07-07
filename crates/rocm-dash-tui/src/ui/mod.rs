@@ -158,6 +158,53 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     }
 }
 
+/// Render a *focused-host* frame: theme background plus exactly ONE overlay.
+///
+/// A single hint line sits below it — no header, tab shell, dock, or footer
+/// legend. Used by the bare-`rocm` launcher's in-place flows (Set up / Serve /
+/// Diagnose), where the full dashboard chrome would be misleading. The overlay
+/// is drawn through the same [`draw_active_manager`] path the dashboard uses (so
+/// the approval / job-console layering is identical). Falls back to a centered
+/// "closing…" note when no overlay is open — defensive; the event loop breaks at
+/// that point and hands control back to the launcher.
+pub fn draw_focused(f: &mut Frame, state: &mut AppState) {
+    let theme = state.theme;
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme.bg)),
+        f.area(),
+    );
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(f.area());
+    let body = outer[0];
+    let footer_area = outer[1];
+
+    if state.has_open_overlay() {
+        let manager_rect = modal::centered_rect(82, 80, 130, 34, body);
+        draw_active_manager(f, manager_rect, state, &theme);
+    } else {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "closing…",
+                Style::default().fg(theme.muted),
+            )))
+            .alignment(ratatui::layout::Alignment::Center),
+            body,
+        );
+    }
+
+    // One honest hint: focused overlays return to the launcher menu (not the
+    // dash tab shell — hence no "1–5" tab legend).
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "Esc  back to menu",
+            Style::default().fg(theme.muted),
+        ))),
+        footer_area,
+    );
+}
+
 /// Draw whichever operational manager is open into `rect`. The managers are
 /// mutually exclusive (only one `Some` at a time), so this draws at most one.
 /// `rect` is the ROCm/Serving Details pane when inline, or a centered overlay
