@@ -615,12 +615,21 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
     process_env.gpu_indices = request.gpu_indices.clone();
     let log_path = request.log_path.as_deref();
     write_running_state(&request, &runtime, std::process::id(), None, "starting")?;
+    // A canonical Hugging Face checkpoint (owner/repo:variant) cannot be served under its
+    // exact name through Lemonade's model router (Lemonade renames registered models and
+    // its registry has several naming quirks). Download the GGUF and run a packaged
+    // llama-server on it directly with `--alias`, which serves it under exactly that name.
+    if let Some(checkpoint) = parse_hf_checkpoint(&request.model_ref) {
+        return serve_hf_checkpoint(&request, &runtime, &process_env, log_path, &checkpoint);
+    }
     if runtime_is_linux() && direct_llama_server_path(&runtime.manifest).is_file() {
         ensure_direct_llama_model_available(&request, &runtime, &process_env, log_path)?;
-        return serve_direct_rocm_llama_server(
+        let server = direct_llama_server_path(&runtime.manifest);
+        return serve_direct_llama_server(
             &request,
             &runtime,
             &process_env,
+            &server,
             log_path,
             &anyhow!("using Lemonade packaged ROCm llama-server directly on Linux"),
         );
@@ -670,13 +679,15 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
         && query_chat_smoke_endpoint(&request.host, request.port, &request.model_ref)
             .unwrap_or(false);
     if let Err(error) = load_result {
-        if runtime_is_linux() && direct_llama_server_path(&runtime.manifest).is_file() {
+        let direct_server = direct_llama_server_path(&runtime.manifest);
+        if runtime_is_linux() && direct_server.is_file() {
             let _ = terminate_pid(child.id(), true);
             let _ = child.wait();
-            return serve_direct_rocm_llama_server(
+            return serve_direct_llama_server(
                 &request,
                 &runtime,
                 &process_env,
+                &direct_server,
                 log_path,
                 &error,
             );
@@ -692,13 +703,15 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
         let error = anyhow!(
             "Lemonade load completed but the endpoint did not report a {LLAMACPP_RECIPE}:{backend}-loaded model"
         );
-        if runtime_is_linux() && direct_llama_server_path(&runtime.manifest).is_file() {
+        let direct_server = direct_llama_server_path(&runtime.manifest);
+        if runtime_is_linux() && direct_server.is_file() {
             let _ = terminate_pid(child.id(), true);
             let _ = child.wait();
-            return serve_direct_rocm_llama_server(
+            return serve_direct_llama_server(
                 &request,
                 &runtime,
                 &process_env,
+                &direct_server,
                 log_path,
                 &error,
             );
@@ -739,6 +752,122 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
     } else {
         bail!("Lemonade server exited with status {status}")
     }
+}
+
+/// Serve a canonical Hugging Face checkpoint under its exact name. Requires an explicit
+/// `:variant`; downloads the GGUF, then runs whichever packaged GPU llama-server backend
+/// is installed (e.g. `vulkan` on WSL2, `rocm-stable` on native ROCm) directly on the
+/// file with `--alias`. This bypasses Lemonade's model registry, whose naming rules
+/// cannot preserve an `owner/repo:variant` name.
+fn serve_hf_checkpoint(
+    request: &ServeHttpRequest,
+    runtime: &LemonadeRuntime,
+    process_env: &LemonadeProcessEnvironment,
+    log_path: Option<&Path>,
+    checkpoint: &HfCheckpoint,
+) -> Result<()> {
+    // A variant is required: a bare `owner/repo` would need Lemonade's interactive
+    // variant menu (which cannot be answered from this non-interactive path) and, if a
+    // GGUF happened to be cached, risks silently serving the wrong quantization.
+    if checkpoint.variant.is_none() {
+        bail!(
+            "`{model}` needs an explicit quantization variant to serve; use `owner/repo:variant`, e.g. `{model}:Q4_K_M` (see the repo's GGUF files on Hugging Face for the available variants)",
+            model = request.model_ref
+        );
+    }
+    let Some(server) = find_llama_server_binary(&runtime.manifest) else {
+        bail!(
+            "no GPU llama-server backend is installed under {}; run `rocm engines install lemonade`",
+            runtime
+                .manifest
+                .runtime_dir
+                .join("bin")
+                .join("llamacpp")
+                .display()
+        );
+    };
+    ensure_hf_checkpoint_downloaded(request, runtime, process_env, log_path)?;
+    // Never silently pick between quantizations: if the variant matches more than one
+    // cached GGUF, ask the user to disambiguate instead of choosing one arbitrarily.
+    let paths = AppPaths::discover()?;
+    let matches = hf_checkpoint_gguf_matches(&paths, checkpoint);
+    if matches.len() > 1 {
+        let names = matches
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "variant `{}` matches multiple files ({names}); specify an exact quantization or filename, e.g. `{}:{}`",
+            checkpoint.variant.as_deref().unwrap_or_default(),
+            request.model_ref,
+            matches
+                .first()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or("<file>.gguf")
+        );
+    }
+    serve_direct_llama_server(
+        request,
+        runtime,
+        process_env,
+        &server,
+        log_path,
+        &anyhow!(
+            "serving canonical Hugging Face checkpoint `{}` directly",
+            request.model_ref
+        ),
+    )
+}
+
+/// Ensure a canonical Hugging Face checkpoint's GGUF is in the HF hub cache, pulling
+/// it through a short-lived `lemond` if needed. The bare `pull owner/repo:variant`
+/// only downloads (and registers a derived name we ignore); the file is what we serve.
+fn ensure_hf_checkpoint_downloaded(
+    request: &ServeHttpRequest,
+    runtime: &LemonadeRuntime,
+    process_env: &LemonadeProcessEnvironment,
+    log_path: Option<&Path>,
+) -> Result<()> {
+    let paths = AppPaths::discover()?;
+    if direct_llama_model_path(&paths, &request.model_ref).is_some() {
+        return Ok(());
+    }
+    let download_port = free_local_port()?;
+    let mut child = spawn_lemond(
+        &runtime.manifest,
+        DEFAULT_HOST,
+        download_port,
+        log_path,
+        process_env,
+    )?;
+    let result = (|| -> Result<()> {
+        wait_for_lemonade_cli_status(
+            &runtime.manifest,
+            DEFAULT_HOST,
+            download_port,
+            Duration::from_secs(30),
+            log_path,
+            process_env,
+        )?;
+        run_lemonade_pull(
+            &runtime.manifest,
+            DEFAULT_HOST,
+            download_port,
+            &request.model_ref,
+            log_path,
+            process_env,
+        )?;
+        if direct_llama_model_path(&paths, &request.model_ref).is_some() {
+            Ok(())
+        } else {
+            bail!("Lemonade did not download `{}`", request.model_ref)
+        }
+    })();
+    let _ = terminate_pid(child.id(), true);
+    let _ = child.wait();
+    result
 }
 
 fn ensure_direct_llama_model_available(
@@ -1543,6 +1672,55 @@ fn run_lemonade_backend_install(
     Ok(())
 }
 
+fn lemonade_pull_args(host: &str, port: u16, checkpoint_ref: &str) -> Vec<String> {
+    vec![
+        "--host".to_owned(),
+        host.to_owned(),
+        "--port".to_owned(),
+        port.to_string(),
+        "pull".to_owned(),
+        checkpoint_ref.to_owned(),
+    ]
+}
+
+/// Download a canonical Hugging Face checkpoint (`owner/repo:variant`) through Lemonade
+/// so its GGUF lands in the HF hub cache. Runs non-interactively, so a `:variant` is
+/// required — a bare `owner/repo` triggers Lemonade's interactive variant menu, which
+/// cannot be answered here.
+fn run_lemonade_pull(
+    manifest: &LemonadeInstallManifest,
+    host: &str,
+    port: u16,
+    checkpoint_ref: &str,
+    log_path: Option<&Path>,
+    process_env: &LemonadeProcessEnvironment,
+) -> Result<()> {
+    let mut command = ProcessCommand::new(&manifest.lemonade);
+    command
+        .args(lemonade_pull_args(host, port, checkpoint_ref))
+        .stdin(Stdio::null());
+    if let Some(log_path) = log_path {
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .with_context(|| format!("failed to open {}", log_path.display()))?;
+        command.stdout(Stdio::from(log.try_clone()?));
+        command.stderr(Stdio::from(log));
+    } else {
+        command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    }
+    apply_lemonade_process_environment(&mut command, process_env)?;
+    hide_child_console_window(&mut command);
+    let status = command
+        .status()
+        .with_context(|| format!("failed to run {}", manifest.lemonade.display()))?;
+    if !status.success() {
+        bail!("Lemonade pull of `{checkpoint_ref}` failed with status {status}");
+    }
+    Ok(())
+}
+
 fn run_lemonade_model_load(
     manifest: &LemonadeInstallManifest,
     host: &str,
@@ -1578,27 +1756,29 @@ fn run_lemonade_model_load(
     Ok(())
 }
 
-fn serve_direct_rocm_llama_server(
+/// Run one of Lemonade's packaged `llama-server` binaries (`server`) directly on a
+/// GGUF file, exposing the model under `request.model_ref` via `--alias`. This is how
+/// a canonical Hugging Face name is served under exactly that name — Lemonade's router
+/// renames registered models, but an llama-server alias is a free-form string.
+fn serve_direct_llama_server(
     request: &ServeHttpRequest,
     runtime: &LemonadeRuntime,
     process_env: &LemonadeProcessEnvironment,
+    server: &Path,
     log_path: Option<&Path>,
-    router_error: &anyhow::Error,
+    reason: &anyhow::Error,
 ) -> Result<()> {
     let paths = AppPaths::discover()?;
     let model_path = direct_llama_model_path(&paths, &request.model_ref).with_context(|| {
         format!(
-            "Lemonade downloaded model `{}` was not found after its ROCm router refused to load it",
+            "Lemonade downloaded model `{}` was not found for direct serving",
             request.model_ref
         )
     })?;
-    let server = direct_llama_server_path(&runtime.manifest);
     if !server.is_file() {
-        bail!(
-            "Lemonade ROCm llama-server is missing at {}",
-            server.display()
-        );
+        bail!("Lemonade llama-server is missing at {}", server.display());
     }
+    let backend = llama_server_backend_label(server);
 
     if let Some(log_path) = log_path
         && let Some(parent) = log_path.parent()
@@ -1613,7 +1793,7 @@ fn serve_direct_rocm_llama_server(
             .with_context(|| format!("failed to open {}", log_path.display()))?;
         writeln!(
             log,
-            "\nLemonade router refused ROCm, launching Lemonade packaged llama-server directly: {router_error:#}"
+            "\nLaunching Lemonade packaged {backend} llama-server directly: {reason:#}"
         )
         .ok();
     }
@@ -1624,7 +1804,7 @@ fn serve_direct_rocm_llama_server(
         push_existing_path(&mut direct_env.library_entries, server_dir.to_path_buf());
     }
 
-    let mut command = ProcessCommand::new(&server);
+    let mut command = ProcessCommand::new(server);
     command
         .arg("-m")
         .arg(&model_path)
@@ -1660,14 +1840,25 @@ fn serve_direct_rocm_llama_server(
         Some(child.id()),
         "running",
     )?;
-    wait_for_openai_models_ready(
-        &request.host,
-        request.port,
-        &request.model_ref,
-        Duration::from_mins(2),
-    )?;
-    if !query_chat_smoke_endpoint(&request.host, request.port, &request.model_ref)? {
-        bail!("Lemonade packaged llama-server did not pass a chat-completion smoke test");
+    // If the server never becomes ready (or fails the smoke test), don't leak the child
+    // or leave the state stuck at `running`: kill it and mark the service failed.
+    let readiness = (|| -> Result<()> {
+        wait_for_openai_models_ready(
+            &request.host,
+            request.port,
+            &request.model_ref,
+            Duration::from_mins(2),
+        )?;
+        if !query_chat_smoke_endpoint(&request.host, request.port, &request.model_ref)? {
+            bail!("Lemonade packaged llama-server did not pass a chat-completion smoke test");
+        }
+        Ok(())
+    })();
+    if let Err(error) = readiness {
+        let _ = terminate_pid(child.id(), true);
+        let _ = child.wait();
+        let _ = mark_json_status(&request.state_path, "failed");
+        return Err(error);
     }
     merge_json_state(
         &request.state_path,
@@ -1675,14 +1866,14 @@ fn serve_direct_rocm_llama_server(
             "status": "ready",
             "server_pid": child.id(),
             "backend_state": "ready",
-            "backend_requested": ROCM_BACKEND_NAME,
-            "backend_mode": "lemonade-packaged-llama-server-rocm",
+            "backend_requested": backend,
+            "backend_mode": "lemonade-packaged-llama-server",
             "load_response": {
                 "status": "loaded",
                 "method": "lemonade-packaged-llama-server",
                 "model_name": request.model_ref,
                 "model_path": model_path,
-                "llamacpp_backend": ROCM_BACKEND_NAME
+                "llamacpp_backend": backend
             },
         }),
     )?;
@@ -1704,6 +1895,63 @@ fn serve_direct_rocm_llama_server(
     }
 }
 
+/// A canonical Hugging Face checkpoint reference: `owner/repo` with an optional
+/// `:variant` suffix (a quantization label such as `BF16`/`Q4_0`, or an exact
+/// `file.gguf`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HfCheckpoint {
+    owner: String,
+    repo: String,
+    variant: Option<String>,
+}
+
+/// Parse a model reference as a canonical Hugging Face checkpoint. Returns `None` for
+/// anything not of the form `owner/repo[:variant]` — built-in Lemonade aliases and
+/// bare registered names all fall through unchanged.
+///
+/// Every component is validated against the Hugging Face id / quantization charset
+/// (`[A-Za-z0-9._-]`, and never `.`/`..`). This is a security boundary as well as a
+/// correctness one: the components are used to build a filesystem path into the model
+/// cache, so rejecting path separators and traversal tokens prevents a crafted model
+/// reference from escaping the cache directory.
+fn parse_hf_checkpoint(model_ref: &str) -> Option<HfCheckpoint> {
+    let trimmed = model_ref.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Split off an optional `:variant` suffix on the first colon; the owner/repo pair
+    // never contains a colon, so any remainder is the variant.
+    let (repo_path, variant) = match trimmed.split_once(':') {
+        Some((path, variant)) => (path, Some(variant)),
+        None => (trimmed, None),
+    };
+    let (owner, repo) = repo_path.split_once('/')?;
+    if !is_safe_hf_component(owner) || !is_safe_hf_component(repo) {
+        return None;
+    }
+    if variant.is_some_and(|variant| !is_safe_hf_component(variant)) {
+        return None;
+    }
+    Some(HfCheckpoint {
+        owner: owner.to_owned(),
+        repo: repo.to_owned(),
+        variant: variant.map(str::to_owned),
+    })
+}
+
+/// A safe Hugging Face path component: a non-empty run of `[A-Za-z0-9._-]` that is not
+/// a `.`/`..` traversal token. Matches the Hugging Face id and quantization-label
+/// charset and, by excluding `/`, `\`, and traversal tokens, keeps a user-supplied
+/// component from escaping the model cache directory when used to build a path.
+fn is_safe_hf_component(component: &str) -> bool {
+    !component.is_empty()
+        && component != "."
+        && component != ".."
+        && component
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
 fn direct_llama_server_path(manifest: &LemonadeInstallManifest) -> PathBuf {
     manifest
         .runtime_dir
@@ -1713,37 +1961,71 @@ fn direct_llama_server_path(manifest: &LemonadeInstallManifest) -> PathBuf {
         .join(platform_binary_name("llama-server"))
 }
 
+/// Packaged llama.cpp backends whose `llama-server` we can drive directly, best first.
+/// GPU backends only — `cpu` is intentionally excluded so the direct-serve path never
+/// silently serves on CPU under a GPU-required policy (AGENTS.md §6). An explicit
+/// allowlist rather than a directory scan, so the path is built only from constants.
+const DIRECT_LLAMA_SERVER_BACKENDS: [&str; 4] = ["rocm-stable", "rocm-nightly", "rocm", "vulkan"];
+
+/// Find an installed Lemonade `llama-server` binary under `bin/llamacpp/<backend>/`,
+/// checking known backends in priority order. This lets direct serving work wherever
+/// Lemonade installed a backend (e.g. `vulkan` on WSL2), not just the ROCm build.
+fn find_llama_server_binary(manifest: &LemonadeInstallManifest) -> Option<PathBuf> {
+    let llamacpp_dir = manifest.runtime_dir.join("bin").join("llamacpp");
+    let binary = platform_binary_name("llama-server");
+    DIRECT_LLAMA_SERVER_BACKENDS
+        .into_iter()
+        .map(|backend| llamacpp_dir.join(backend).join(&binary))
+        .find(|candidate| candidate.is_file())
+}
+
+/// The backend label for a packaged llama-server, taken from its parent directory name
+/// (e.g. `vulkan`, `rocm-stable`); falls back to the ROCm backend name.
+fn llama_server_backend_label(server: &Path) -> String {
+    server
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or(ROCM_BACKEND_NAME)
+        .to_owned()
+}
+
 fn direct_llama_model_path(paths: &AppPaths, model_ref: &str) -> Option<PathBuf> {
     let as_path = PathBuf::from(model_ref);
     if as_path.is_file() {
         return Some(as_path);
     }
+    if let Some(checkpoint) = parse_hf_checkpoint(model_ref) {
+        return hf_cache_roots(paths)
+            .into_iter()
+            .find_map(|root| find_hf_checkpoint_gguf(&root, &checkpoint));
+    }
     if resolve_lemonade_model_ref(model_ref) != DEFAULT_MODEL {
         return None;
     }
-    default_qwen_cache_roots(paths)
+    hf_cache_roots(paths)
         .into_iter()
         .find_map(find_default_qwen_gguf)
 }
 
-fn default_qwen_cache_roots(paths: &AppPaths) -> Vec<PathBuf> {
-    default_qwen_cache_roots_from(paths, |name| std::env::var_os(name).map(PathBuf::from))
+fn hf_cache_roots(paths: &AppPaths) -> Vec<PathBuf> {
+    hf_cache_roots_from(paths, |name| std::env::var_os(name).map(PathBuf::from))
 }
 
-fn default_qwen_cache_roots_from<F>(paths: &AppPaths, mut env_path: F) -> Vec<PathBuf>
+fn hf_cache_roots_from<F>(paths: &AppPaths, mut env_path: F) -> Vec<PathBuf>
 where
     F: FnMut(&str) -> Option<PathBuf>,
 {
     let mut roots = Vec::new();
     if let Some(hub_cache) = env_path("HUGGINGFACE_HUB_CACHE") {
-        push_qwen_cache_root(&mut roots, hub_cache);
+        push_hf_cache_root(&mut roots, hub_cache);
     }
     if let Some(hf_home) = env_path("HF_HOME") {
-        push_qwen_cache_root(&mut roots, hf_home.join("hub"));
+        push_hf_cache_root(&mut roots, hf_home.join("hub"));
     }
-    push_qwen_cache_root(&mut roots, paths.cache_dir.join("huggingface").join("hub"));
+    push_hf_cache_root(&mut roots, paths.cache_dir.join("huggingface").join("hub"));
     if let Some(home) = env_path("HOME") {
-        push_qwen_cache_root(
+        push_hf_cache_root(
             &mut roots,
             home.join(".cache").join("huggingface").join("hub"),
         );
@@ -1751,7 +2033,7 @@ where
     roots
 }
 
-fn push_qwen_cache_root(roots: &mut Vec<PathBuf>, path: PathBuf) {
+fn push_hf_cache_root(roots: &mut Vec<PathBuf>, path: PathBuf) {
     if path.as_os_str().is_empty() || roots.iter().any(|existing| existing == &path) {
         return;
     }
@@ -1765,6 +2047,108 @@ fn find_default_qwen_gguf(cache_root: PathBuf) -> Option<PathBuf> {
         .flatten()
         .map(|entry| entry.path().join(DEFAULT_MODEL_GGUF))
         .find(|path| path.is_file())
+}
+
+/// Locate the downloaded GGUF for a Hugging Face checkpoint inside one hub cache root,
+/// selecting the file that matches the requested `:variant` (if any).
+fn find_hf_checkpoint_gguf(cache_root: &Path, checkpoint: &HfCheckpoint) -> Option<PathBuf> {
+    select_gguf_for_variant(
+        collect_hf_checkpoint_ggufs(cache_root, checkpoint),
+        checkpoint.variant.as_deref(),
+    )
+}
+
+/// All cached GGUF files for a checkpoint's repo under one hub cache root (unfiltered
+/// by variant).
+fn collect_hf_checkpoint_ggufs(cache_root: &Path, checkpoint: &HfCheckpoint) -> Vec<PathBuf> {
+    let repo_dir = format!("models--{}--{}", checkpoint.owner, checkpoint.repo);
+    let snapshots = cache_root.join(repo_dir).join("snapshots");
+    let mut ggufs = Vec::new();
+    if let Ok(entries) = fs::read_dir(snapshots) {
+        for entry in entries.flatten() {
+            collect_gguf_files(&entry.path(), &mut ggufs, 0);
+        }
+    }
+    ggufs
+}
+
+/// Every cached GGUF matching a checkpoint's variant, across all hub cache roots,
+/// deduplicated by file name. Used to detect an ambiguous variant (more than one match)
+/// so the caller can refuse to pick arbitrarily.
+fn hf_checkpoint_gguf_matches(paths: &AppPaths, checkpoint: &HfCheckpoint) -> Vec<PathBuf> {
+    let mut matches = Vec::new();
+    let mut seen_names = std::collections::HashSet::new();
+    for root in hf_cache_roots(paths) {
+        let ggufs = collect_hf_checkpoint_ggufs(&root, checkpoint);
+        for gguf in filter_ggufs_by_variant(ggufs, checkpoint.variant.as_deref()) {
+            if let Some(name) = gguf.file_name().and_then(|name| name.to_str())
+                && seen_names.insert(name.to_owned())
+            {
+                matches.push(gguf);
+            }
+        }
+    }
+    matches
+}
+
+/// Collect `*.gguf` files under a snapshot revision directory. GGUFs usually sit at the
+/// snapshot root, but sharded variants live one folder down, so recurse a few levels.
+fn collect_gguf_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+    if depth > 3 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_gguf_files(&path, out, depth + 1);
+        } else if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+        {
+            out.push(path);
+        }
+    }
+}
+
+/// Pick a single GGUF for a requested variant (the first, in sorted order, of the
+/// matches). Sorting is by path — deterministic but not by mtime — which is fine
+/// because the caller rejects an ambiguous variant before relying on this pick.
+fn select_gguf_for_variant(ggufs: Vec<PathBuf>, variant: Option<&str>) -> Option<PathBuf> {
+    filter_ggufs_by_variant(ggufs, variant).into_iter().next()
+}
+
+/// All GGUFs matching a requested variant, sorted by path. With no variant, every file
+/// matches. With a variant, a case-insensitive exact filename match (`:model.gguf`)
+/// wins outright; otherwise every file whose name contains the quantization label
+/// (`:BF16`, `:Q4_0`) matches — more than one indicates an ambiguous variant.
+fn filter_ggufs_by_variant(mut ggufs: Vec<PathBuf>, variant: Option<&str>) -> Vec<PathBuf> {
+    ggufs.sort();
+    ggufs.dedup();
+    let Some(variant) = variant else {
+        return ggufs;
+    };
+    let file_name = |path: &Path| -> Option<String> {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+    };
+    if let Some(exact) = ggufs
+        .iter()
+        .find(|path| file_name(path).is_some_and(|name| name.eq_ignore_ascii_case(variant)))
+    {
+        return vec![exact.clone()];
+    }
+    let variant_lower = variant.to_ascii_lowercase();
+    ggufs
+        .into_iter()
+        .filter(|path| {
+            file_name(path).is_some_and(|name| name.to_ascii_lowercase().contains(&variant_lower))
+        })
+        .collect()
 }
 
 fn wait_for_openai_models_ready(
@@ -1813,6 +2197,40 @@ fn models_payload_has_loaded_model(value: &Value, model_ref: &str) -> bool {
         })
 }
 
+/// Whether `/v1/models` advertises `model_ref` as ready to serve on GPU. A stock
+/// `llama-server` (direct-serve) entry has no `recipe_options` and is accepted by name,
+/// since the direct-serve path only runs GPU backends. A Lemonade-router entry carries
+/// `recipe_options`, so its `llamacpp_backend` must match — this keeps a merely
+/// registered-but-unloaded model (empty `recipe_options`) from reading as ready.
+fn models_payload_has_ready_model(value: &Value, model_ref: &str, backend: &str) -> bool {
+    value
+        .get("data")
+        .or_else(|| value.get("models"))
+        .and_then(Value::as_array)
+        .is_some_and(|models| {
+            models.iter().any(|model| {
+                let name_matches = ["id", "model", "name"]
+                    .into_iter()
+                    .filter_map(|field| model.get(field).and_then(Value::as_str))
+                    .any(|loaded| model_names_match(loaded, model_ref));
+                name_matches && model_reports_ready_backend(model, backend)
+            })
+        })
+}
+
+/// A `/v1/models` entry is servable on GPU when it carries no `recipe_options` (a stock
+/// `llama-server` direct-serve entry — GPU-only by construction) or its reported
+/// `llamacpp_backend` matches the expected backend.
+fn model_reports_ready_backend(model: &Value, backend: &str) -> bool {
+    match model.get("recipe_options") {
+        None => true,
+        Some(options) => options
+            .get("llamacpp_backend")
+            .and_then(Value::as_str)
+            .is_some_and(|loaded| lemonade_backend_matches(loaded, backend)),
+    }
+}
+
 fn lemonade_model_load_args(host: &str, port: u16, model_ref: &str, backend: &str) -> Vec<String> {
     vec![
         "--host".to_owned(),
@@ -1837,16 +2255,21 @@ fn query_health_json(host: &str, port: u16) -> Result<Value> {
 fn query_loaded_model_endpoint(endpoint_url: &str, model_ref: &str, backend: &str) -> Result<bool> {
     let (host, port) = parse_http_endpoint(endpoint_url)
         .with_context(|| format!("unsupported endpoint URL `{endpoint_url}`"))?;
-    if let Ok(health) = query_health_json(&host, port) {
-        Ok(health_has_loaded_model(&health, model_ref, backend))
-    } else {
-        let endpoint = format_http_base_url(&host, port);
-        let body = http_get_text(&endpoint, "/v1/models", Duration::from_secs(3))
-            .with_context(|| format!("failed to query Lemonade models at {endpoint}/v1/models"))?;
-        let models = serde_json::from_str::<Value>(&body)
-            .context("failed to parse Lemonade /v1/models JSON")?;
-        Ok(models_payload_has_loaded_model(&models, model_ref))
+    // Lemonade's router reports readiness via `/v1/health` (`all_models_loaded`). The
+    // direct-serve path runs a stock `llama-server` that has no such field, and instead
+    // advertises the model in `/v1/models`; fall back to that (name + backend) so both
+    // serving modes are recognized as ready.
+    if let Ok(health) = query_health_json(&host, port)
+        && health_has_loaded_model(&health, model_ref, backend)
+    {
+        return Ok(true);
     }
+    let endpoint = format_http_base_url(&host, port);
+    let body = http_get_text(&endpoint, "/v1/models", Duration::from_secs(3))
+        .with_context(|| format!("failed to query Lemonade models at {endpoint}/v1/models"))?;
+    let models =
+        serde_json::from_str::<Value>(&body).context("failed to parse Lemonade /v1/models JSON")?;
+    Ok(models_payload_has_ready_model(&models, model_ref, backend))
 }
 
 fn query_chat_smoke_endpoint(host: &str, port: u16, model_ref: &str) -> Result<bool> {
@@ -2316,6 +2739,216 @@ mod tests {
     }
 
     #[test]
+    fn canonical_hugging_face_name_passes_through_unchanged() {
+        assert_eq!(
+            resolve_lemonade_model_ref("LiquidAI/LFM2.5-230M-GGUF:Q4_0"),
+            "LiquidAI/LFM2.5-230M-GGUF:Q4_0"
+        );
+    }
+
+    #[test]
+    fn parses_canonical_hugging_face_checkpoints() {
+        assert_eq!(
+            parse_hf_checkpoint("LiquidAI/LFM2.5-230M-GGUF:Q4_0"),
+            Some(HfCheckpoint {
+                owner: "LiquidAI".to_owned(),
+                repo: "LFM2.5-230M-GGUF".to_owned(),
+                variant: Some("Q4_0".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse_hf_checkpoint("unsloth/Qwen3-0.6B-GGUF"),
+            Some(HfCheckpoint {
+                owner: "unsloth".to_owned(),
+                repo: "Qwen3-0.6B-GGUF".to_owned(),
+                variant: None,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_non_checkpoint_model_refs() {
+        // Built-in aliases and bare registered names have no owner/repo pair.
+        assert!(parse_hf_checkpoint("qwen").is_none());
+        assert!(parse_hf_checkpoint(DEFAULT_MODEL).is_none());
+        assert!(parse_hf_checkpoint("").is_none());
+        assert!(parse_hf_checkpoint("/model.gguf").is_none());
+        assert!(parse_hf_checkpoint("owner/").is_none());
+        assert!(parse_hf_checkpoint("owner/repo/extra").is_none());
+        assert!(parse_hf_checkpoint("owner/repo:").is_none());
+    }
+
+    #[test]
+    fn rejects_path_traversal_in_checkpoint_components() {
+        // A crafted reference must not be able to escape the model cache directory.
+        assert!(parse_hf_checkpoint("../../etc/passwd").is_none());
+        assert!(parse_hf_checkpoint("..:Q4_0").is_none());
+        assert!(parse_hf_checkpoint("owner/..").is_none());
+        assert!(parse_hf_checkpoint("owner/repo:../secret").is_none());
+        assert!(parse_hf_checkpoint(r"owner\..\..--x/repo").is_none());
+        assert!(parse_hf_checkpoint("owner/repo:a/b.gguf").is_none());
+    }
+
+    #[test]
+    fn selects_gguf_by_variant() {
+        // Real filenames use the quant label without the `-GGUF` repo suffix, so a
+        // substring match on the `:variant` selects the right file.
+        let ggufs = vec![
+            PathBuf::from("/cache/LFM2.5-230M-Q4_0.gguf"),
+            PathBuf::from("/cache/LFM2.5-230M-Q8_0.gguf"),
+        ];
+        assert_eq!(
+            select_gguf_for_variant(ggufs.clone(), Some("q4_0")),
+            Some(PathBuf::from("/cache/LFM2.5-230M-Q4_0.gguf"))
+        );
+        assert_eq!(
+            select_gguf_for_variant(ggufs.clone(), Some("LFM2.5-230M-Q8_0.gguf")),
+            Some(PathBuf::from("/cache/LFM2.5-230M-Q8_0.gguf"))
+        );
+        assert_eq!(
+            select_gguf_for_variant(ggufs.clone(), None),
+            Some(PathBuf::from("/cache/LFM2.5-230M-Q4_0.gguf"))
+        );
+        assert_eq!(select_gguf_for_variant(ggufs, Some("Q2_K")), None);
+    }
+
+    #[test]
+    fn ambiguous_variant_matches_multiple_ggufs() {
+        // A partial label like `Q4` matches several quants; the caller must refuse to
+        // pick. A full label or exact filename resolves to exactly one.
+        let ggufs = vec![
+            PathBuf::from("/cache/LFM2.5-230M-Q4_0.gguf"),
+            PathBuf::from("/cache/LFM2.5-230M-Q4_K_M.gguf"),
+        ];
+        assert_eq!(filter_ggufs_by_variant(ggufs.clone(), Some("Q4")).len(), 2);
+        assert_eq!(
+            filter_ggufs_by_variant(ggufs.clone(), Some("Q4_0")).len(),
+            1
+        );
+        assert_eq!(
+            filter_ggufs_by_variant(ggufs, Some("LFM2.5-230M-Q4_K_M.gguf")).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn models_ready_accepts_direct_serve_and_gates_router_backend() {
+        // Direct-serve (stock llama-server): no `recipe_options` → ready by name.
+        let direct = json!({"data": [{"id": "LiquidAI/LFM2.5-230M-GGUF:Q4_0"}]});
+        assert!(models_payload_has_ready_model(
+            &direct,
+            "LiquidAI/LFM2.5-230M-GGUF:Q4_0",
+            "vulkan"
+        ));
+        // Router entry loaded on the matching backend → ready.
+        let loaded = json!({"data": [{
+            "id": "Qwen3-0.6B-GGUF",
+            "recipe_options": {"llamacpp_backend": "vulkan"}
+        }]});
+        assert!(models_payload_has_ready_model(
+            &loaded,
+            "Qwen3-0.6B-GGUF",
+            "vulkan"
+        ));
+        // Registered but not loaded (empty `recipe_options`) → not ready.
+        let registered = json!({"data": [{
+            "id": "Qwen3-0.6B-GGUF",
+            "recipe_options": {}
+        }]});
+        assert!(!models_payload_has_ready_model(
+            &registered,
+            "Qwen3-0.6B-GGUF",
+            "vulkan"
+        ));
+    }
+
+    #[test]
+    fn find_llama_server_binary_prefers_gpu_and_skips_cpu() {
+        let dir = scratch_dir("find-server");
+        let runtime_dir = dir.join("runtime");
+        let llamacpp = runtime_dir.join("bin").join("llamacpp");
+        for backend in ["cpu", "vulkan"] {
+            let backend_dir = llamacpp.join(backend);
+            fs::create_dir_all(&backend_dir).unwrap();
+            fs::write(backend_dir.join(platform_binary_name("llama-server")), b"x").unwrap();
+        }
+        let manifest = test_manifest(runtime_dir);
+        // Both cpu and vulkan exist; the GPU backend is chosen and cpu is never selected.
+        assert_eq!(
+            find_llama_server_binary(&manifest),
+            Some(
+                llamacpp
+                    .join("vulkan")
+                    .join(platform_binary_name("llama-server"))
+            )
+        );
+        // With only cpu present, nothing is returned (no silent CPU fallback).
+        fs::remove_dir_all(llamacpp.join("vulkan")).unwrap();
+        assert_eq!(find_llama_server_binary(&manifest), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn collect_gguf_files_recurses_and_filters() {
+        let dir = scratch_dir("collect-gguf");
+        fs::create_dir_all(dir.join("shard")).unwrap();
+        fs::write(dir.join("model-Q4_0.gguf"), b"x").unwrap();
+        fs::write(dir.join("notes.txt"), b"x").unwrap();
+        fs::write(dir.join("shard").join("model-Q8_0.gguf"), b"x").unwrap();
+        let mut found = Vec::new();
+        collect_gguf_files(&dir, &mut found, 0);
+        let mut names = found
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, vec!["model-Q4_0.gguf", "model-Q8_0.gguf"]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A fresh scratch directory under the crate's `target/` (dependency-free; no
+    /// `tempfile` so third-party notices stay unchanged). The base is
+    /// `CARGO_MANIFEST_DIR`, a compile-time constant, so the path never derives from a
+    /// runtime environment read.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("lemonade-fs-test-{tag}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn test_manifest(runtime_dir: PathBuf) -> LemonadeInstallManifest {
+        LemonadeInstallManifest {
+            env_id: "test".to_owned(),
+            version: LEMONADE_VERSION.to_owned(),
+            runtime_dir,
+            lemond: PathBuf::from("lemond"),
+            lemonade: PathBuf::from("lemonade"),
+            backend_recipe: LLAMACPP_RECIPE.to_owned(),
+            backend_name: ROCM_BACKEND_NAME.to_owned(),
+            installed_at_unix_ms: 0,
+        }
+    }
+
+    #[test]
+    fn lemonade_pull_builds_checkpoint_command() {
+        assert_eq!(
+            lemonade_pull_args("127.0.0.1", 11435, "LiquidAI/LFM2.5-230M-GGUF:Q4_0"),
+            vec![
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "11435",
+                "pull",
+                "LiquidAI/LFM2.5-230M-GGUF:Q4_0",
+            ]
+        );
+    }
+
+    #[test]
     fn embeddable_package_matches_runtime_os() {
         if runtime_is_windows() {
             assert!(embeddable_archive_name().ends_with("windows-x64.zip"));
@@ -2469,7 +3102,7 @@ vllm                rocm        unsupported     Requires Linux                  
             data_dir: PathBuf::from("data"),
             cache_dir: PathBuf::from("rocm-cache"),
         };
-        let roots = default_qwen_cache_roots_from(&paths, |name| match name {
+        let roots = hf_cache_roots_from(&paths, |name| match name {
             "HUGGINGFACE_HUB_CACHE" => Some(PathBuf::from("hf-hub")),
             "HF_HOME" => Some(PathBuf::from("hf-home")),
             "HOME" => Some(PathBuf::from("home")),
