@@ -279,7 +279,9 @@ rocm model --verbose"
     /// Picks an engine and ROCm runtime automatically unless overridden. By default the
     /// server runs as a managed background service and prints a deployment summary
     /// (status, endpoint, model, and smoke-test metrics); use --verbose to stream engine
-    /// logs in this terminal instead. Inspect or stop servers later with `rocm services`.
+    /// logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
+    /// server running, or Ctrl-C to stop it. Inspect or stop servers later with
+    /// `rocm services`.
     #[command(after_help = "EXAMPLES:\n  \
 rocm serve qwen2.5-7b-instruct\n  \
 rocm serve qwen2.5-7b-instruct --engine vllm --port 8000\n  \
@@ -309,7 +311,8 @@ rocm serve qwen2.5-7b-instruct --verbose --device gpu_required")]
         /// TCP port to bind.
         #[arg(long, default_value_t = rocm_core::DEFAULT_LOCAL_PORT)]
         port: u16,
-        /// Run in this terminal instead of as a managed background server.
+        /// Attach to the server in this terminal and stream its logs (Ctrl-D to
+        /// detach and leave it running, Ctrl-C to stop). Same as --verbose.
         #[arg(long, conflicts_with = "managed")]
         foreground: bool,
         /// Keep the server managed by ROCm CLI.
@@ -3898,17 +3901,16 @@ fn serve(args: ServeArgs) -> Result<()> {
         return Ok(());
     }
 
-    run_foreground_service(
+    run_attached_service(
         &selected_engine,
         &service_id,
-        &resolve.canonical_model_id,
+        &model,
+        &resolve,
         &host,
         port,
-        &resolve.device_policy,
         &gpu_indices,
         resolved_selection.runtime_id.as_deref(),
         resolved_selection.env_id.as_deref(),
-        resolve.engine_recipe.as_ref(),
     )
 }
 
@@ -4026,8 +4028,30 @@ struct ManagedLaunchReport {
     manifest_path: Option<PathBuf>,
 }
 
+/// Either an already-live service (nothing spawned) or a freshly spawned engine
+/// child that is `running` but not yet HTTP-ready.
+///
+/// Split out of [`start_managed_service`] so the attached (`--verbose` /
+/// `--foreground`) serve path can spawn the very same detached child and stream
+/// its log live from the first line — including startup — instead of blocking on
+/// the readiness wait before any output appears.
+enum ManagedSpawn {
+    AlreadyRunning(ManagedLaunchReport),
+    // `ManagedServiceRecord` is large; box it so the two variants stay a similar
+    // size (clippy::large_enum_variant).
+    Spawned {
+        record: Box<ManagedServiceRecord>,
+        child_pid: u32,
+    },
+}
+
+/// Spawn the detached engine child shared by the managed (background) and
+/// attached (`--verbose`/`--foreground`) serve paths. Returns before the HTTP
+/// readiness wait; callers decide whether to block on readiness
+/// ([`start_managed_service`]) or start tailing the log immediately
+/// ([`run_attached_service`]).
 #[allow(clippy::too_many_arguments)]
-fn start_managed_service(
+fn spawn_managed_engine_child(
     engine: &str,
     service_id: &str,
     requested_model: &str,
@@ -4039,8 +4063,7 @@ fn start_managed_service(
     runtime_id: Option<&str>,
     env_id: Option<&str>,
     engine_recipe: Option<&EngineRecipeHint>,
-    on_wait_tick: &mut dyn FnMut(Duration),
-) -> Result<ManagedLaunchReport> {
+) -> Result<ManagedSpawn> {
     let paths = AppPaths::discover()?;
     paths.ensure()?;
     fs::create_dir_all(paths.services_dir())?;
@@ -4065,7 +4088,7 @@ fn start_managed_service(
             ),
             Some(&existing.service_id),
         );
-        return Ok(ManagedLaunchReport {
+        return Ok(ManagedSpawn::AlreadyRunning(ManagedLaunchReport {
             service_id: existing.service_id,
             endpoint_url: existing.endpoint_url,
             status: existing.status,
@@ -4073,7 +4096,7 @@ fn start_managed_service(
             child_pid: None,
             log_path: None,
             manifest_path: None,
-        });
+        }));
     }
 
     let mut record = ManagedServiceRecord::new(
@@ -4157,6 +4180,45 @@ fn start_managed_service(
     record.engine_pid = Some(child_pid);
     record.status = "running".to_owned();
     record.write()?;
+
+    Ok(ManagedSpawn::Spawned {
+        record: Box::new(record),
+        child_pid,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_managed_service(
+    engine: &str,
+    service_id: &str,
+    requested_model: &str,
+    resolve: &ResolveModelResponse,
+    host: &str,
+    port: u16,
+    device_policy: &DevicePolicy,
+    gpu_indices: &[u32],
+    runtime_id: Option<&str>,
+    env_id: Option<&str>,
+    engine_recipe: Option<&EngineRecipeHint>,
+    on_wait_tick: &mut dyn FnMut(Duration),
+) -> Result<ManagedLaunchReport> {
+    let (mut record, child_pid) = match spawn_managed_engine_child(
+        engine,
+        service_id,
+        requested_model,
+        resolve,
+        host,
+        port,
+        device_policy,
+        gpu_indices,
+        runtime_id,
+        env_id,
+        engine_recipe,
+    )? {
+        ManagedSpawn::AlreadyRunning(report) => return Ok(report),
+        ManagedSpawn::Spawned { record, child_pid } => (*record, child_pid),
+    };
+    let paths = AppPaths::discover()?;
 
     #[cfg(windows)]
     thread::sleep(Duration::from_millis(200));
@@ -4283,70 +4345,275 @@ pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> 
     Ok(())
 }
 
+/// What ended an attached (`--verbose`/`--foreground`) streaming session. Kept
+/// as a plain enum, separate from any terminal I/O, so the follow-up action
+/// (detach note vs. stop the server) is unit-testable without a TTY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachOutcome {
+    /// Ctrl-D: leave the server running and hand the terminal back.
+    Detach,
+    /// Ctrl-C: stop the server, then hand the terminal back.
+    Stop,
+    /// The engine process exited on its own while we were streaming its log.
+    ServerExited,
+}
+
+/// Attached serve path for `--verbose`/`--foreground`: spawn the engine as a
+/// detached managed child (the same child the background path spawns) and stream
+/// its log in this terminal. Unlike the old in-process foreground, the server
+/// survives the session — Ctrl-D detaches and leaves it running, Ctrl-C stops it.
 #[allow(clippy::too_many_arguments)]
-fn run_foreground_service(
+fn run_attached_service(
     engine: &str,
     service_id: &str,
-    canonical_model_id: &str,
+    requested_model: &str,
+    resolve: &ResolveModelResponse,
     host: &str,
     port: u16,
-    device_policy: &DevicePolicy,
     gpu_indices: &[u32],
     runtime_id: Option<&str>,
     env_id: Option<&str>,
-    engine_recipe: Option<&EngineRecipeHint>,
 ) -> Result<()> {
     let paths = AppPaths::discover()?;
-    paths.ensure()?;
-    fs::create_dir_all(paths.engine_state_dir(engine))?;
 
-    let mut record = ManagedServiceRecord::new(
-        &paths,
-        service_id,
+    let spawn = spawn_managed_engine_child(
         engine,
-        canonical_model_id,
-        canonical_model_id,
+        service_id,
+        requested_model,
+        resolve,
         host,
         port,
-        "foreground",
-        std::process::id(),
-        runtime_id.map(str::to_owned),
-        env_id.map(str::to_owned),
-        Some(device_policy_name(device_policy).to_owned()),
-    );
-    record.gpu_indices = gpu_indices.to_vec();
-    record.write()?;
+        &resolve.device_policy,
+        gpu_indices,
+        runtime_id,
+        env_id,
+        resolve.engine_recipe.as_ref(),
+    )?;
 
-    println!("foreground service starting");
-    println!("  service_id: {service_id}");
-    println!("  endpoint: {}/v1", format_http_base_url(host, port));
-    println!("  stop: Ctrl-C");
-
-    record.engine_pid = Some(std::process::id());
-    record.status = "running".to_owned();
-    record.write()?;
-
-    let result = run_builtin_engine_serve_http(
-        engine,
-        service_id.to_owned(),
-        canonical_model_id.to_owned(),
-        host.to_owned(),
-        port,
-        device_policy_name(device_policy),
-        gpu_indices.to_vec(),
-        runtime_id.map(str::to_owned),
-        env_id.map(str::to_owned),
-        record.engine_state_path.clone(),
-        None,
-        engine_recipe.cloned(),
-    );
-    record.status = if result.is_ok() {
-        "stopped".to_owned()
-    } else {
-        "failed".to_owned()
+    let (service_id, log_path, child_pid) = match spawn {
+        // A server for this engine+model is already live. Don't fight it for the
+        // port — point the user at the existing one instead of tailing a log we
+        // did not start.
+        ManagedSpawn::AlreadyRunning(report) => {
+            println!("model already being served");
+            println!("  service_id: {}", report.service_id);
+            println!("  endpoint: {}", report.endpoint_url);
+            println!("  status: {}", report.status);
+            println!("  logs: rocm logs {}", report.service_id);
+            println!("  stop: rocm services stop {} --yes", report.service_id);
+            return Ok(());
+        }
+        ManagedSpawn::Spawned { record, child_pid } => {
+            (service_id.to_owned(), record.log_path.clone(), child_pid)
+        }
     };
-    record.write()?;
-    result
+
+    // The resolution detail (model, engine, runtime, GPU, warnings) was already
+    // printed as the "serve plan" block in `serve()`; extend it with the launch
+    // coordinates and the streaming hint rather than repeating it.
+    let endpoint = format!("{}/v1", format_http_base_url(host, port));
+    println!("  service_id: {service_id}");
+    println!("  endpoint: {endpoint}");
+    println!("  streaming engine logs — Ctrl-D detaches (leaves it running), Ctrl-C stops it");
+    println!();
+
+    let outcome = stream_attached_logs(&log_path, child_pid)?;
+    println!();
+
+    match outcome {
+        AttachOutcome::Detach => {
+            println!("detached — server still running");
+            println!("  service_id: {service_id}");
+            println!("  endpoint: {endpoint}");
+            println!("  list: rocm services");
+            println!("  logs: rocm logs {service_id}");
+            println!("  stop: rocm services stop {service_id} --yes");
+            record_cli_audit_event(
+                &paths,
+                "service",
+                "serve_detach",
+                "info",
+                format!("detached from attached serve service_id={service_id} endpoint={endpoint}"),
+                Some(&service_id),
+            );
+            Ok(())
+        }
+        AttachOutcome::Stop => {
+            println!("stopping server…");
+            match run_internal_sandbox_tool(
+                &paths,
+                SandboxToolArg::StopServer,
+                Some(service_id.clone()),
+                true,
+            ) {
+                Ok(result) => print!("{}", render_service_action_result("stop_server", &result)),
+                Err(error) => {
+                    // Best-effort direct signal so Ctrl-C never leaves the model
+                    // orphaned when the sandbox stop path fails.
+                    let _ = rocm_core::terminate_process_tree(child_pid);
+                    println!("  note: {error}");
+                }
+            }
+            record_cli_audit_event(
+                &paths,
+                "service",
+                "serve_stop",
+                "info",
+                format!("stopped attached serve service_id={service_id}"),
+                Some(&service_id),
+            );
+            Ok(())
+        }
+        AttachOutcome::ServerExited => {
+            println!("server process exited");
+            println!("  service_id: {service_id}");
+            println!("  recent logs: rocm logs {service_id}");
+            Ok(())
+        }
+    }
+}
+
+/// Restores cooked terminal mode when dropped, so [`stream_attached_logs`] leaves
+/// the terminal usable on every exit path (normal return, `?` error, or panic).
+struct RawModeGuard;
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// Map a key press (control modifier + lowercased character) to the attach
+/// action it triggers, if any. Factored out of the raw-mode reader loop so the
+/// Ctrl-D/Ctrl-C mapping is unit-testable without a terminal.
+const fn detach_key_outcome(ctrl: bool, ch: char) -> Option<AttachOutcome> {
+    if !ctrl {
+        return None;
+    }
+    match ch {
+        'c' => Some(AttachOutcome::Stop),
+        'd' => Some(AttachOutcome::Detach),
+        _ => None,
+    }
+}
+
+/// Follow `log_path` in the terminal until the user presses Ctrl-D (detach) or
+/// Ctrl-C (stop), or the engine process exits. Uses crossterm raw mode to
+/// capture the keys directly (in raw mode Ctrl-C does not raise SIGINT, so we see
+/// it as a key event). When stdin is not a TTY (piped/CI), keystroke capture is
+/// impossible, so we follow the log until the process exits instead.
+fn stream_attached_logs(log_path: &Path, child_pid: u32) -> Result<AttachOutcome> {
+    use std::io::IsTerminal as _;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    if !std::io::stdin().is_terminal() {
+        return stream_attached_logs_no_tty(log_path, child_pid);
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel::<AttachOutcome>();
+
+    let reader_stop = Arc::clone(&stop);
+    let reader = thread::spawn(move || {
+        use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+        while !reader_stop.load(Ordering::Relaxed) {
+            match event::poll(Duration::from_millis(100)) {
+                Ok(true) => match event::read() {
+                    Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => {
+                        let outcome = match key.code {
+                            KeyCode::Char(ch) => detach_key_outcome(
+                                key.modifiers.contains(KeyModifiers::CONTROL),
+                                ch.to_ascii_lowercase(),
+                            ),
+                            _ => None,
+                        };
+                        if let Some(outcome) = outcome {
+                            let _ = tx.send(outcome);
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                },
+                Ok(false) => {}
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Restore cooked mode on every exit path (normal return, error, panic).
+    crossterm::terminal::enable_raw_mode().context("failed to enter raw terminal mode")?;
+    let _raw_guard = RawModeGuard;
+
+    let mut stdout = io::stdout();
+    let mut log_reader: Option<io::BufReader<fs::File>> = None;
+    let mut line = String::new();
+    let outcome = loop {
+        if log_reader.is_none() {
+            log_reader = fs::File::open(log_path).ok().map(io::BufReader::new);
+        }
+        if let Some(reader) = log_reader.as_mut() {
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        // Raw mode disables the terminal's own \n -> \r\n
+                        // translation, so emit an explicit carriage return to
+                        // keep the log left-aligned instead of stair-stepping.
+                        let _ = write!(stdout, "{}\r\n", line.trim_end_matches('\n'));
+                        let _ = stdout.flush();
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        if let Ok(signal) = rx.try_recv() {
+            break signal;
+        }
+        if !process_is_running(child_pid) {
+            break AttachOutcome::ServerExited;
+        }
+        thread::sleep(Duration::from_millis(150));
+    };
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = reader.join();
+    Ok(outcome)
+}
+
+/// Non-interactive fallback for [`stream_attached_logs`]: no keystroke capture,
+/// so just follow the log until the (detached) engine process exits. A Ctrl-C
+/// here delivers SIGINT to this process and leaves the managed server running.
+fn stream_attached_logs_no_tty(log_path: &Path, child_pid: u32) -> Result<AttachOutcome> {
+    let mut stdout = io::stdout();
+    let mut log_reader: Option<io::BufReader<fs::File>> = None;
+    let mut line = String::new();
+    loop {
+        if log_reader.is_none() {
+            log_reader = fs::File::open(log_path).ok().map(io::BufReader::new);
+        }
+        if let Some(reader) = log_reader.as_mut() {
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let _ = write!(stdout, "{line}");
+                        let _ = stdout.flush();
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        if !process_is_running(child_pid) {
+            return Ok(AttachOutcome::ServerExited);
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
 }
 
 fn services(command: Option<ServicesCommand>) -> Result<()> {
@@ -15376,6 +15643,22 @@ mod tests {
         // exclusive (point users at `rocm logs` for a managed server instead).
         let error = parse_serve(&["--verbose", "--managed"]).expect_err("conflict rejected");
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn detach_key_ctrl_d_detaches_ctrl_c_stops() {
+        assert_eq!(detach_key_outcome(true, 'd'), Some(AttachOutcome::Detach));
+        assert_eq!(detach_key_outcome(true, 'c'), Some(AttachOutcome::Stop));
+    }
+
+    #[test]
+    fn detach_key_ignores_plain_and_unrelated_keys() {
+        // Without the control modifier, `d`/`c` are ordinary log-scroll input.
+        assert_eq!(detach_key_outcome(false, 'd'), None);
+        assert_eq!(detach_key_outcome(false, 'c'), None);
+        // Other control combos are not detach/stop triggers.
+        assert_eq!(detach_key_outcome(true, 'q'), None);
+        assert_eq!(detach_key_outcome(true, 'z'), None);
     }
 
     #[test]

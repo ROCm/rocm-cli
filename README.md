@@ -190,10 +190,13 @@ quick smoke test (time to first token and approximate tokens/sec). Control
 returns to your shell with the server still running; manage it later with `rocm
 services` (below).
 
-`--verbose` (or `--foreground`) instead attaches the server to the current
+`--verbose` (or `--foreground`) instead attaches to the server in the current
 terminal and streams every engine log line — use it to debug a startup problem.
-`--managed` is the explicit form of the default background behavior.
-`--no-smoke-test` skips the post-startup inference probe.
+The server still runs as a managed background process, so while streaming you can
+press **Ctrl-D to detach** — the log stream stops, your shell comes back, and the
+server keeps running (manage it afterward with `rocm services`). Press **Ctrl-C**
+to stop the server instead. `--managed` is the explicit form of the default
+background behavior. `--no-smoke-test` skips the post-startup inference probe.
 
 Use full HuggingFace model IDs (e.g., `Qwen/Qwen2.5-1.5B-Instruct`) for
 reliable cross-engine compatibility. Short aliases from `rocm model` may not
