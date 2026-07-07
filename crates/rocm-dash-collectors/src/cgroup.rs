@@ -53,7 +53,7 @@ pub fn container_id_for_pid(pid: u32) -> Option<String> {
 /// Non-linux stub: there is no `/proc/<pid>/cgroup`, so attribution is never
 /// available off linux. Always `None`.
 #[cfg(not(target_os = "linux"))]
-pub fn container_id_for_pid(_pid: u32) -> Option<String> {
+pub const fn container_id_for_pid(_pid: u32) -> Option<String> {
     None
 }
 
