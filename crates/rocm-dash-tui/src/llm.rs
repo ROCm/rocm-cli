@@ -124,6 +124,22 @@ pub fn parse_host_port(base_url: &str) -> Option<(String, u16)> {
     } else {
         80
     };
+    // Bracketed IPv6 authority: `[host]` or `[host]:port`. Must be handled
+    // before the `rsplit_once(':')` fallback, which would otherwise split
+    // *inside* the address (e.g. `[::1]` → host `[:`, port `1]`) and fail,
+    // making a portless `[::1]` look like a non-loopback host.
+    if let Some(after_open) = authority.strip_prefix('[') {
+        let (host, after_close) = after_open.split_once(']')?;
+        if host.is_empty() {
+            return None;
+        }
+        let port = match after_close.strip_prefix(':') {
+            Some(port_str) => port_str.parse::<u16>().ok()?,
+            None if after_close.is_empty() => default_port,
+            None => return None,
+        };
+        return Some((host.to_string(), port));
+    }
     match authority.rsplit_once(':') {
         Some((host, port_str)) if !host.is_empty() => {
             let port = port_str.parse::<u16>().ok()?;
@@ -312,6 +328,9 @@ mod tests {
             "http://127.0.0.1:8000/v1",
             "http://localhost:13305/v1",
             "http://[::1]:8000/v1",
+            // Portless bracketed IPv6 previously bypassed stripping (parse
+            // returned None → treated as remote). Must strip now.
+            "http://[::1]/v1",
         ] {
             let r = resolve_llm_config(
                 Some(url),
@@ -378,6 +397,23 @@ mod tests {
             Some(("example.com".into(), 80))
         );
         assert_eq!(parse_host_port(""), None);
+    }
+
+    #[test]
+    fn parse_host_port_handles_bracketed_ipv6() {
+        // Brackets are stripped so the host round-trips through `to_socket_addrs`
+        // and matches `is_loopback_host`. Both the port-bearing and the portless
+        // forms must parse (the portless form previously returned None).
+        assert_eq!(
+            parse_host_port("http://[::1]:8000/v1"),
+            Some(("::1".into(), 8000))
+        );
+        assert_eq!(parse_host_port("http://[::1]/v1"), Some(("::1".into(), 80)));
+        assert_eq!(
+            parse_host_port("https://[2001:db8::1]/v1"),
+            Some(("2001:db8::1".into(), 443))
+        );
+        assert_eq!(parse_host_port("http://[]/v1"), None);
     }
 
     #[test]
