@@ -5337,295 +5337,73 @@ fn validate_model_recipe_engine_record(
 }
 
 pub fn builtin_model_recipes() -> Vec<ModelRecipeRecord> {
-    vec![
-        ModelRecipeRecord {
-            canonical_model_id: "Qwen/Qwen2.5-1.5B-Instruct".to_owned(),
-            aliases: vec![
-                "qwen2.5".to_owned(),
-                "qwen2.5-1.5b".to_owned(),
-                "qwen2.5-1.5b-instruct".to_owned(),
-                "qwen-small".to_owned(),
-            ],
-            task: "chat".to_owned(),
-            source: "recipe_index".to_owned(),
-            revision: "main".to_owned(),
-            loader: "llamacpp".to_owned(),
-            trust_remote_code: false,
-            dtype: "gguf".to_owned(),
-            device_policy: "gpu_required".to_owned(),
-            min_gpu_mem_gb: Some(6),
-            recommended_system_ram_gb: Some(8),
-            quantization: Some("none; recommended small assistant recipe".to_owned()),
-            artifact_hint: Some(
-                "Lemonade model id; resolved internally to a GGUF build of this model"
-                    .to_owned(),
-            ),
-            artifacts: Vec::new(),
-            engine_recipes: Vec::new(),
-            manual_alternatives: vec!["qwen-tiny".to_owned(), "tiny-gpt2".to_owned()],
-            chat_template_mode: "auto".to_owned(),
-            preferred_engines: vec!["lemonade".to_owned()],
-            warnings: vec![
-                "recommended local assistant path for low-VRAM ROCm machines".to_owned(),
-            ],
-        },
-        ModelRecipeRecord {
-            canonical_model_id: "Qwen/Qwen2.5-0.5B-Instruct".to_owned(),
-            aliases: vec![
-                "qwen-tiny".to_owned(),
-                "tiny-qwen".to_owned(),
-                "qwen2.5-0.5b".to_owned(),
-                "qwen2.5-0.5b-instruct".to_owned(),
-            ],
-            task: "chat".to_owned(),
-            source: "recipe_index".to_owned(),
-            revision: "main".to_owned(),
-            loader: "transformers".to_owned(),
-            trust_remote_code: false,
-            dtype: "float16".to_owned(),
-            device_policy: "gpu_required".to_owned(),
-            min_gpu_mem_gb: Some(4),
-            recommended_system_ram_gb: Some(8),
-            quantization: Some("none; tiny instruct smoke recipe".to_owned()),
-            artifact_hint: Some(
-                "Hugging Face safetensors model id; served on GPU through vLLM (Linux/WSL)"
-                    .to_owned(),
-            ),
-            artifacts: Vec::new(),
-            engine_recipes: Vec::new(),
-            manual_alternatives: vec!["qwen".to_owned(), "tiny-gpt2".to_owned()],
-            chat_template_mode: "auto".to_owned(),
-            preferred_engines: vec!["vllm".to_owned()],
-            warnings: vec![
-                "tiny smoke path; use qwen for the smarter low-VRAM assistant".to_owned(),
-            ],
-        },
-        ModelRecipeRecord {
-            canonical_model_id: "Qwen3-4B-Instruct-2507-GGUF".to_owned(),
-            aliases: vec![
-                "qwen".to_owned(),
-                "lemonade-qwen".to_owned(),
-                "qwen-gguf".to_owned(),
-                "qwen3-4b".to_owned(),
-                "qwen3-4b-instruct".to_owned(),
-                "qwen3-4b-instruct-2507-gguf".to_owned(),
-            ],
-            task: "chat".to_owned(),
-            source: "recipe_index".to_owned(),
-            revision: "main".to_owned(),
-            loader: "llamacpp".to_owned(),
-            trust_remote_code: false,
-            dtype: "gguf".to_owned(),
-            device_policy: "gpu_required".to_owned(),
-            min_gpu_mem_gb: Some(4),
-            recommended_system_ram_gb: Some(9),
-            quantization: Some("GGUF Q4_K_M; Lemonade llama.cpp ROCm backend".to_owned()),
-            artifact_hint: Some(
-                "Lemonade model id resolved and downloaded by the Lemonade engine".to_owned(),
-            ),
-            artifacts: Vec::new(),
-            engine_recipes: vec![ModelRecipeEngineRecord {
-                engine: "vllm".to_owned(),
-                model_id_override: Some("Qwen/Qwen3-4B-Instruct-2507".to_owned()),
-                ..ModelRecipeEngineRecord::default()
-            }],
-            manual_alternatives: vec!["qwen-tiny".to_owned(), "llama-3.2-3b-instruct".to_owned()],
-            chat_template_mode: "lemonade".to_owned(),
-            preferred_engines: vec!["lemonade".to_owned()],
-            warnings: vec![
-                "recommended local assistant path for low-VRAM ROCm machines".to_owned(),
-            ],
-        },
-        ModelRecipeRecord {
-            canonical_model_id: "Qwen3-0.6B-GGUF".to_owned(),
-            aliases: vec![
-                "qwen-smoke".to_owned(),
-                "lemonade-tiny".to_owned(),
-                "qwen3-0.6b-gguf".to_owned(),
-            ],
-            task: "chat".to_owned(),
-            source: "recipe_index".to_owned(),
-            revision: "main".to_owned(),
-            loader: "llamacpp".to_owned(),
-            trust_remote_code: false,
-            dtype: "gguf".to_owned(),
-            device_policy: "gpu_required".to_owned(),
-            min_gpu_mem_gb: Some(2),
-            recommended_system_ram_gb: Some(4),
-            quantization: Some("GGUF; Lemonade llama.cpp ROCm backend".to_owned()),
-            artifact_hint: Some(
-                "Lemonade model id resolved and downloaded by the Lemonade engine".to_owned(),
-            ),
-            artifacts: Vec::new(),
-            engine_recipes: Vec::new(),
-            manual_alternatives: vec!["qwen".to_owned(), "qwen-tiny".to_owned()],
-            chat_template_mode: "lemonade".to_owned(),
-            preferred_engines: vec!["lemonade".to_owned()],
-            warnings: vec![
-                "tiny Lemonade GGUF smoke-test path; not the default assistant".to_owned(),
-            ],
-        },
-        ModelRecipeRecord {
-            canonical_model_id: "Qwen/Qwen3.5-4B".to_owned(),
-            aliases: vec!["qwen3.5".to_owned(), "qwen3.5-4b".to_owned()],
-            task: "chat".to_owned(),
-            source: "recipe_index".to_owned(),
-            revision: "main".to_owned(),
-            loader: "transformers".to_owned(),
-            trust_remote_code: false,
-            dtype: "bfloat16".to_owned(),
-            device_policy: "gpu_preferred".to_owned(),
-            min_gpu_mem_gb: Some(12),
-            recommended_system_ram_gb: Some(16),
-            quantization: Some("none; bfloat16 weights".to_owned()),
-            artifact_hint: Some(
-                "Hugging Face model id; engine resolver validates artifacts during serve"
-                    .to_owned(),
-            ),
-            artifacts: Vec::new(),
-            engine_recipes: Vec::new(),
-            manual_alternatives: vec![
-                "qwen".to_owned(),
-                "llama-3.2-3b-instruct".to_owned(),
-                "tiny-gpt2".to_owned(),
-            ],
-            chat_template_mode: "auto".to_owned(),
-            preferred_engines: vec!["vllm".to_owned()],
-            warnings: vec![
-                "not a verified vLLM smoke path: Transformers 4.57.6 reports unknown architecture qwen3_5"
-                    .to_owned(),
-            ],
-        },
-        ModelRecipeRecord {
-            canonical_model_id: "Qwen/Qwen3-32B-FP8".to_owned(),
-            aliases: vec![
-                "qwen32b".to_owned(),
-                "qwen3.5-32b".to_owned(),
-                "qwen3-32b".to_owned(),
-                "qwen3-32b-fp8".to_owned(),
-            ],
-            task: "chat".to_owned(),
-            source: "recipe_index".to_owned(),
-            revision: "main".to_owned(),
-            loader: "transformers".to_owned(),
-            trust_remote_code: false,
-            dtype: "auto".to_owned(),
-            device_policy: "gpu_required".to_owned(),
-            min_gpu_mem_gb: Some(48),
-            recommended_system_ram_gb: Some(64),
-            quantization: Some("fp8 recipe".to_owned()),
-            artifact_hint: Some(
-                "Hugging Face model id; engine resolver validates FP8 support during serve"
-                    .to_owned(),
-            ),
-            artifacts: Vec::new(),
-            engine_recipes: Vec::new(),
-            manual_alternatives: vec![
-                "qwen".to_owned(),
-                "llama-3.2-3b-instruct".to_owned(),
-                "tiny-gpt2".to_owned(),
-            ],
-            chat_template_mode: "auto".to_owned(),
-            preferred_engines: vec!["vllm".to_owned()],
-            warnings: vec![
-                "this recipe prefers ROCm GPU execution and may span multiple accelerators"
-                    .to_owned(),
-                "startup will attempt auto device_map placement across visible GPUs when aggregate memory is sufficient"
-                    .to_owned(),
-            ],
-        },
-        ModelRecipeRecord {
-            canonical_model_id: "zai-org/GLM-5-FP8".to_owned(),
-            aliases: vec![
-                "glm5".to_owned(),
-                "glm-5".to_owned(),
-                "glm-5-fp8".to_owned(),
-            ],
-            task: "chat".to_owned(),
-            source: "recipe_index".to_owned(),
-            revision: "main".to_owned(),
-            loader: "transformers".to_owned(),
-            trust_remote_code: true,
-            dtype: "auto".to_owned(),
-            device_policy: "gpu_required".to_owned(),
-            min_gpu_mem_gb: Some(905),
-            recommended_system_ram_gb: Some(1024),
-            quantization: Some("fp8 recipe".to_owned()),
-            artifact_hint: Some(
-                "Hugging Face model id; requires an engine/runtime that supports this model family"
-                    .to_owned(),
-            ),
-            artifacts: Vec::new(),
-            engine_recipes: Vec::new(),
-            manual_alternatives: vec![
-                "qwen3.5-4b".to_owned(),
-                "qwen3-32b-fp8".to_owned(),
-                "llama-3.2-3b-instruct".to_owned(),
-            ],
-            chat_template_mode: "auto".to_owned(),
-            preferred_engines: vec!["vllm".to_owned()],
-            warnings: vec![
-                "this model family is configured with trust_remote_code enabled by recipe"
-                    .to_owned(),
-            ],
-        },
-        ModelRecipeRecord {
-            canonical_model_id: "meta-llama/Llama-3.2-3B-Instruct".to_owned(),
-            aliases: vec![
-                "llama".to_owned(),
-                "llama3.2".to_owned(),
-                "llama-3.2-3b".to_owned(),
-                "llama-3.2-3b-instruct".to_owned(),
-            ],
-            task: "chat".to_owned(),
-            source: "recipe_index".to_owned(),
-            revision: "main".to_owned(),
-            loader: "transformers".to_owned(),
-            trust_remote_code: false,
-            dtype: "bfloat16".to_owned(),
-            device_policy: "gpu_preferred".to_owned(),
-            min_gpu_mem_gb: Some(8),
-            recommended_system_ram_gb: Some(16),
-            quantization: Some("none; bfloat16 weights".to_owned()),
-            artifact_hint: Some(
-                "Hugging Face safetensors model id; served on GPU through vLLM (Linux/WSL)"
-                    .to_owned(),
-            ),
-            artifacts: Vec::new(),
-            engine_recipes: Vec::new(),
-            manual_alternatives: vec!["qwen".to_owned(), "tiny-gpt2".to_owned()],
-            chat_template_mode: "auto".to_owned(),
-            preferred_engines: vec!["vllm".to_owned()],
-            warnings: Vec::new(),
-        },
-        ModelRecipeRecord {
-            canonical_model_id: "sshleifer/tiny-gpt2".to_owned(),
-            aliases: vec!["tiny-gpt2".to_owned(), "gpt2tiny".to_owned()],
-            task: "chat".to_owned(),
-            source: "recipe_index".to_owned(),
-            revision: "main".to_owned(),
-            loader: "transformers".to_owned(),
-            trust_remote_code: false,
-            dtype: "float16".to_owned(),
-            device_policy: "gpu_required".to_owned(),
-            min_gpu_mem_gb: Some(2),
-            recommended_system_ram_gb: Some(1),
-            quantization: Some("none; tiny GPU smoke recipe".to_owned()),
-            artifact_hint: Some("Hugging Face model id for small GPU smoke testing".to_owned()),
-            artifacts: Vec::new(),
-            engine_recipes: Vec::new(),
-            manual_alternatives: Vec::new(),
-            chat_template_mode: "auto".to_owned(),
-            preferred_engines: vec!["vllm".to_owned()],
-            warnings: Vec::new(),
-        },
-    ]
+    builtin_model_catalog_document().recipes.clone()
+}
+
+/// The curated fallback catalog shipped inside the binary. It is authored as JSON
+/// (`model_catalog.json`) using the same schema as an external signed recipe
+/// index, so the offline default and hosted indexes share one format. Parsed once
+/// and cached; a malformed catalog is a build-time bug guarded by a unit test.
+fn builtin_model_catalog_document() -> &'static ModelRecipeIndexDocument {
+    static CATALOG: std::sync::OnceLock<ModelRecipeIndexDocument> = std::sync::OnceLock::new();
+    CATALOG.get_or_init(|| {
+        let document =
+            serde_json::from_str::<ModelRecipeIndexDocument>(include_str!("model_catalog.json"))
+                .expect("built-in model catalog JSON must parse");
+        document
+            .validate()
+            .expect("built-in model catalog must satisfy the recipe index schema");
+        document
+    })
 }
 
 pub fn resolve_builtin_model_recipe(model_ref: &str) -> Option<ModelRecipeRecord> {
     builtin_model_recipes()
         .into_iter()
         .find(|recipe| recipe.matches_ref(model_ref))
+}
+
+/// Ordered hardware groupings for the curated `rocm model` catalog. `rocm model`
+/// lists visible recipes under these headings in this order, skipping empty ones.
+pub const MODEL_CATALOG_PLATFORMS: &[&str] =
+    &["Strix Halo (Lemonade / llama.cpp)", "MI300X (vLLM)"];
+
+/// The hardware target a recipe is curated for.
+///
+/// Derived from its primary preferred engine; returns one of
+/// [`MODEL_CATALOG_PLATFORMS`]. Serving is limited to Lemonade and vLLM, so
+/// Lemonade/llama.cpp recipes map to Strix Halo and everything else (vLLM) maps
+/// to MI300X. Works for any registry (built-in fallback or a signed index).
+pub fn model_recipe_target_platform(recipe: &ModelRecipeRecord) -> &'static str {
+    match recipe
+        .preferred_engines
+        .first()
+        .map(|engine| engine.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("lemonade" | "llama.cpp" | "llamacpp") => MODEL_CATALOG_PLATFORMS[0],
+        _ => MODEL_CATALOG_PLATFORMS[1],
+    }
+}
+
+/// Whether a recipe is a smoke/test-only path hidden from the curated catalog.
+///
+/// Hidden recipes stay fully resolvable for `rocm serve` and the crate's smoke
+/// tests; only the user-facing `rocm model` list omits them.
+pub fn model_recipe_featured(recipe: &ModelRecipeRecord) -> bool {
+    // The curated short list `rocm model` shows for the built-in catalog: current
+    // popular open-weight models, each sized to a quant that fits its target GPU.
+    // Everything else in the built-in list (the default assistant, smoke/test
+    // paths, superseded models) stays resolvable for `rocm serve` but is hidden.
+    const FEATURED_MODEL_IDS: &[&str] = &[
+        "unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M",
+        "unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M",
+        "Qwen/Qwen3.6-27B",
+        "google/gemma-4-31B-it",
+    ];
+    FEATURED_MODEL_IDS
+        .iter()
+        .any(|id| id.eq_ignore_ascii_case(&recipe.canonical_model_id))
 }
 
 pub fn normalize_model_ref(model_ref: &str) -> String {
@@ -6013,6 +5791,7 @@ pub fn unix_time_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
@@ -7070,6 +6849,70 @@ Class Name:                Display
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].action, "proposal_rejected");
         Ok(())
+    }
+
+    #[test]
+    fn builtin_model_catalog_json_parses_and_validates() {
+        // Guards the embedded catalog: malformed JSON, a bad device policy, or a
+        // duplicate alias/canonical id would fail the shared index schema here
+        // instead of panicking at runtime.
+        let document =
+            serde_json::from_str::<ModelRecipeIndexDocument>(include_str!("model_catalog.json"))
+                .expect("catalog JSON parses");
+        document
+            .validate()
+            .expect("catalog satisfies the index schema");
+        assert!(
+            document.recipes.len() >= 10,
+            "curated catalog is non-trivial"
+        );
+        // The default Lemonade assistant must remain resolvable from the catalog.
+        assert!(
+            document
+                .recipes
+                .iter()
+                .any(|recipe| recipe.canonical_model_id == "Qwen3-4B-Instruct-2507-GGUF"),
+            "built-in assistant recipe present"
+        );
+    }
+
+    #[test]
+    fn model_recipe_target_platform_groups_by_engine() {
+        // The (hidden) built-in assistant is a Lemonade recipe → Strix Halo.
+        let strix = resolve_builtin_model_recipe("qwen").expect("qwen assistant");
+        assert_eq!(
+            model_recipe_target_platform(&strix),
+            "Strix Halo (Lemonade / llama.cpp)"
+        );
+        let mi300x = resolve_builtin_model_recipe("qwen3.6-27b").expect("qwen3.6-27b");
+        assert_eq!(model_recipe_target_platform(&mi300x), "MI300X (vLLM)");
+        // Serving is limited to Lemonade and vLLM, so a vLLM recipe lands on MI300X.
+        let llama = resolve_builtin_model_recipe("llama-3.2-3b-instruct").expect("llama");
+        assert_eq!(model_recipe_target_platform(&llama), "MI300X (vLLM)");
+    }
+
+    #[test]
+    fn featured_catalog_is_curated_but_hidden_stay_resolvable() {
+        // Current popular models are featured in the curated list — GGUF for
+        // Strix Halo (served by their owner/repo:variant id) and BF16 for MI300X.
+        for alias in ["qwen3.6", "gemma-4", "qwen3.6-27b", "gemma-4-31b"] {
+            let recipe = resolve_builtin_model_recipe(alias).unwrap_or_else(|| panic!("{alias}"));
+            assert!(model_recipe_featured(&recipe), "{alias} should be featured");
+        }
+        // The Strix Halo entries carry an explicit GGUF quant variant so they are
+        // directly servable via Lemonade.
+        assert_eq!(
+            resolve_builtin_model_recipe("qwen3.6")
+                .unwrap()
+                .canonical_model_id,
+            "unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M"
+        );
+        // ...while the default assistant, smoke paths, and superseded models stay
+        // resolvable for `rocm serve` but are hidden from the curated list.
+        for alias in ["qwen", "tiny-gpt2", "qwen3.5", "glm-5"] {
+            let recipe = resolve_builtin_model_recipe(alias).unwrap_or_else(|| panic!("{alias}"));
+            assert!(!model_recipe_featured(&recipe), "{alias} should be hidden");
+        }
     }
 
     #[test]
