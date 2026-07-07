@@ -3124,7 +3124,7 @@ fn detect_linux_primary_gpu_name() -> Option<String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn detect_linux_primary_gpu_name() -> Option<String> {
+const fn detect_linux_primary_gpu_name() -> Option<String> {
     None
 }
 
@@ -3451,7 +3451,7 @@ fn detect_linux_sysfs_gfx_target() -> Option<String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn detect_linux_sysfs_gfx_target() -> Option<String> {
+const fn detect_linux_sysfs_gfx_target() -> Option<String> {
     None
 }
 
