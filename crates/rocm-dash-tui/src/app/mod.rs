@@ -2072,23 +2072,33 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                 state.active_provider = previous;
                 state.chat.push(ChatTurn::error(msg));
             };
-            if let Some(cfg) = state.chat_llm.clone() {
-                match build_local_agent(cfg, state.tool_executor.clone(), chat_tx.clone()) {
-                    Ok(arc) => {
-                        agent = Some(arc.clone());
-                        // Refresh the restore snapshot so a later `/provider
-                        // local` restores THIS accepted backend, not the stale
-                        // startup one.
-                        local_agent = Some(arc);
-                        state
-                            .chat
-                            .push(ChatTurn::system("switched to local".to_string()));
+            match state.chat_llm.clone() {
+                Some(cfg) => {
+                    match build_local_agent(cfg, state.tool_executor.clone(), chat_tx.clone()) {
+                        Ok(arc) => {
+                            agent = Some(arc.clone());
+                            // Refresh the restore snapshot so a later `/provider
+                            // local` restores THIS accepted backend, not the
+                            // stale startup one.
+                            local_agent = Some(arc);
+                            state
+                                .chat
+                                .push(ChatTurn::system("switched to local".to_string()));
+                        }
+                        Err(e) => revert(
+                            &mut state,
+                            format!("could not switch to the detected local endpoint: {e}"),
+                        ),
                     }
-                    Err(e) => revert(
-                        &mut state,
-                        format!("could not switch to the detected local endpoint: {e}"),
-                    ),
                 }
+                // Edge raised but `chat_llm` is None (shouldn't happen after a
+                // real accept, but don't leave the tab stuck on `Local` with the
+                // old agent and no feedback).
+                None => revert(
+                    &mut state,
+                    "could not switch to the detected local endpoint: no endpoint configured"
+                        .to_string(),
+                ),
             }
         }
 
