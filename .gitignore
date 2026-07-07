@@ -11,3 +11,4 @@ active-implementation-log.md
 current-user-asks.md
 __pycache__/
 /.hawkeye-bin/
+/.claude
