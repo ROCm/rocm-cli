@@ -151,13 +151,12 @@ pub fn parse_host_port(base_url: &str) -> Option<(String, u16)> {
 
 /// True when `host` is a loopback address.
 ///
-/// Matches `localhost` (case-insensitive), the IPv6 loopback (`::1`, with or
-/// without brackets), and any `127.0.0.0/8` IPv4 address.
+/// Expects a bare host as returned by [`parse_host_port`], which strips the
+/// brackets from a bracketed IPv6 authority. Matches `localhost`
+/// (case-insensitive), the IPv6 loopback (`::1`), and any `127.0.0.0/8` IPv4
+/// address.
 fn is_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host == "::1"
-        || host == "[::1]"
-        || host.starts_with("127.")
+    host.eq_ignore_ascii_case("localhost") || host == "::1" || host.starts_with("127.")
 }
 
 /// Best-effort TCP liveness probe for a candidate endpoint.
