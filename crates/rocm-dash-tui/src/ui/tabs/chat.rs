@@ -252,6 +252,7 @@ pub fn transcript_lines<'a>(state: &'a AppState, theme: &Theme) -> Vec<Line<'a>>
             ChatRole::User => ("you  ", theme.accent),
             ChatRole::Agent => ("rocm ", theme.fg),
             ChatRole::Error => ("err  ", theme.err),
+            ChatRole::System => ("··   ", theme.muted),
         };
         // Multi-line content (e.g. an answer plus a "⚙ via: …" Skill annotation)
         // renders one terminal line per segment; continuation lines are indented
