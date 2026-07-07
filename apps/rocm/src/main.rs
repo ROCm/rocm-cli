@@ -4052,6 +4052,7 @@ enum ManagedSpawn {
 /// ([`run_attached_service`]).
 #[allow(clippy::too_many_arguments)]
 fn spawn_managed_engine_child(
+    paths: &AppPaths,
     engine: &str,
     service_id: &str,
     requested_model: &str,
@@ -4064,7 +4065,6 @@ fn spawn_managed_engine_child(
     env_id: Option<&str>,
     engine_recipe: Option<&EngineRecipeHint>,
 ) -> Result<ManagedSpawn> {
-    let paths = AppPaths::discover()?;
     paths.ensure()?;
     fs::create_dir_all(paths.services_dir())?;
 
@@ -4075,10 +4075,10 @@ fn spawn_managed_engine_child(
     // `service_id` is timestamp-unique and would never match an existing one.
     // Stale/dead services fall through and relaunch normally.
     if let Some(existing) =
-        existing_live_managed_service(&paths, engine, &resolve.canonical_model_id)
+        existing_live_managed_service(paths, engine, &resolve.canonical_model_id)
     {
         record_cli_audit_event(
-            &paths,
+            paths,
             "service",
             "managed_service_launch_skipped",
             "info",
@@ -4100,7 +4100,7 @@ fn spawn_managed_engine_child(
     }
 
     let mut record = ManagedServiceRecord::new(
-        &paths,
+        paths,
         service_id,
         engine,
         requested_model,
@@ -4142,10 +4142,10 @@ fn spawn_managed_engine_child(
         &record.engine_state_path,
         Some(&record.log_path),
     )?;
-    let engine_envs_root = env_root_for_service(&paths, engine, runtime_id, env_id)?;
+    let engine_envs_root = env_root_for_service(paths, engine, runtime_id, env_id)?;
     #[cfg(windows)]
     let child_pid = {
-        let env_values = app_path_env_var_values(&paths, engine_envs_root.as_deref());
+        let env_values = app_path_env_var_values(paths, engine_envs_root.as_deref());
         let env_refs = app_path_env_var_refs(&env_values);
         rocm_core::spawn_detached_no_inherit(&current_exe, &serve_args, &env_refs)
             .context("failed to launch managed engine process")?
@@ -4156,7 +4156,7 @@ fn spawn_managed_engine_child(
         command.stdin(Stdio::null());
         attach_background_stdio(&mut command, Some(&record.log_path))?;
         detach_background_command(&mut command);
-        apply_app_path_env(&mut command, &paths);
+        apply_app_path_env(&mut command, paths);
         if let Some(engine_envs_root) = engine_envs_root.as_deref() {
             command.env("ROCM_CLI_ENGINE_ENVS_ROOT", engine_envs_root);
         }
@@ -4202,7 +4202,9 @@ fn start_managed_service(
     engine_recipe: Option<&EngineRecipeHint>,
     on_wait_tick: &mut dyn FnMut(Duration),
 ) -> Result<ManagedLaunchReport> {
+    let paths = AppPaths::discover()?;
     let (mut record, child_pid) = match spawn_managed_engine_child(
+        &paths,
         engine,
         service_id,
         requested_model,
@@ -4218,7 +4220,6 @@ fn start_managed_service(
         ManagedSpawn::AlreadyRunning(report) => return Ok(report),
         ManagedSpawn::Spawned { record, child_pid } => (*record, child_pid),
     };
-    let paths = AppPaths::discover()?;
 
     #[cfg(windows)]
     thread::sleep(Duration::from_millis(200));
@@ -4377,6 +4378,7 @@ fn run_attached_service(
     let paths = AppPaths::discover()?;
 
     let spawn = spawn_managed_engine_child(
+        &paths,
         engine,
         service_id,
         requested_model,
@@ -4407,6 +4409,14 @@ fn run_attached_service(
             (service_id.to_owned(), record.log_path.clone(), child_pid)
         }
     };
+
+    // The child is a managed service that outlives this session once detached, so
+    // it needs the same supervision the background path gives it: the daemon
+    // health-checks and auto-recovers managed servers, reconciles a self-exited
+    // server's record, and feeds the dashboard. Match the background ordering
+    // (spawn, then ensure the helper) and keep it quiet so no status line breaks
+    // into the log stream.
+    ensure_background_helper_running_quiet(true)?;
 
     // The resolution detail (model, engine, runtime, GPU, warnings) was already
     // printed as the "serve plan" block in `serve()`; extend it with the launch
@@ -4512,6 +4522,14 @@ fn stream_attached_logs(log_path: &Path, child_pid: u32) -> Result<AttachOutcome
         return stream_attached_logs_no_tty(log_path, child_pid);
     }
 
+    // Enter raw mode *before* spawning the key reader. In raw mode Ctrl-C arrives
+    // as a key event instead of SIGINT; if the reader started first, a Ctrl-C in
+    // that window would kill the CLI outright (leaving the detached child alive
+    // but printing no detach/stop message). The guard restores cooked mode on
+    // every exit path (normal return, `?` error, panic).
+    crossterm::terminal::enable_raw_mode().context("failed to enter raw terminal mode")?;
+    let _raw_guard = RawModeGuard;
+
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<AttachOutcome>();
 
@@ -4542,10 +4560,6 @@ fn stream_attached_logs(log_path: &Path, child_pid: u32) -> Result<AttachOutcome
             }
         }
     });
-
-    // Restore cooked mode on every exit path (normal return, error, panic).
-    crossterm::terminal::enable_raw_mode().context("failed to enter raw terminal mode")?;
-    let _raw_guard = RawModeGuard;
 
     let mut stdout = io::stdout();
     let mut log_reader: Option<io::BufReader<fs::File>> = None;
