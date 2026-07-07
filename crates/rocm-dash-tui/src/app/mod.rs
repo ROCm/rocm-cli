@@ -521,13 +521,15 @@ pub struct AppState {
     /// persist the accepted endpoint to `config.toml`. Keeps `apply_action`
     /// I/O-free.
     pub chat_persist_dispatch: bool,
-    /// Edge flag: raised by `accept_detect_offer` (and thus `save_detect_offer`),
-    /// consumed once by `event_loop`.
+    /// Edge: raised by `accept_detect_offer` (and thus `save_detect_offer`),
+    /// consumed once by `event_loop`. `Some(previous)` carries the provider that
+    /// was active before the optimistic switch to `Local`.
     ///
     /// Rebuilds the live chat `agent` from the newly-accepted `chat_llm` so
     /// submits stop routing to the stale startup backend (e.g. a cloud gateway).
-    /// Keeps `apply_action` I/O-free.
-    pub chat_endpoint_rebuild: bool,
+    /// On rebuild failure the drain reverts `active_provider` to `previous` so
+    /// the displayed provider stays honest. Keeps `apply_action` I/O-free.
+    pub(crate) chat_endpoint_rebuild: Option<ChatProvider>,
     /// Replay scrubber state. `None` when running against a live daemon.
     pub replay: Option<ReplayState>,
     /// Last body area used by the most recent draw. Mouse hit-tests resolve
@@ -654,7 +656,7 @@ impl AppState {
             chat_detect_dispatch: false,
             chat_detect_msg: None,
             chat_persist_dispatch: false,
-            chat_endpoint_rebuild: false,
+            chat_endpoint_rebuild: None,
             replay: None,
             last_body_area: None,
             last_tab_bar_area: None,
@@ -1038,9 +1040,11 @@ impl AppState {
             // The accepted endpoint is local; align the displayed provider and
             // raise the rebuild edge so `event_loop` swaps the live agent to it
             // (the startup agent may be a cloud gateway — see
-            // `chat_endpoint_rebuild`).
+            // `chat_endpoint_rebuild`). Capture the previous provider first so
+            // the drain can revert the optimistic switch if the rebuild fails.
+            let previous = self.active_provider;
             self.active_provider = ChatProvider::Local;
-            self.chat_endpoint_rebuild = true;
+            self.chat_endpoint_rebuild = Some(previous);
         }
     }
 
@@ -2056,20 +2060,21 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         // `/provider local` restore snapshot — at the new local backend.
         // `accept_detect_offer` swaps `chat_llm` to the auth-free local config
         // but stays I/O-free, so without this the stale startup agent keeps
-        // routing chat to the cloud gateway (wrong-backend 401 bug). On failure
-        // `agent`/`local_agent` are left unchanged and an error turn surfaces.
-        // Construction only — no network until the next submit.
-        if state.chat_endpoint_rebuild {
-            state.chat_endpoint_rebuild = false;
+        // routing chat to the cloud gateway (wrong-backend 401 bug). The edge
+        // carries the provider active BEFORE the optimistic switch to `Local`;
+        // on failure we revert `active_provider` to it (mirrors the
+        // `provider_switch` drain) so the tab never shows `Local` while `agent`
+        // still points elsewhere. Construction only — no network until submit.
+        if let Some(previous) = state.chat_endpoint_rebuild.take() {
+            // `revert` restores the optimistic switch and surfaces an actionable
+            // error turn so the tab does not sit on `Local` with the old agent.
+            let revert = |state: &mut AppState, msg: String| {
+                state.active_provider = previous;
+                state.chat.push(ChatTurn::error(msg));
+            };
             if let Some(cfg) = state.chat_llm.clone() {
-                match crate::agent::RigAgentClient::new(
-                    cfg.clone(),
-                    state.tool_executor.clone(),
-                    Some(chat_tx.clone()),
-                ) {
-                    Ok(c) => {
-                        let arc =
-                            std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>;
+                match build_local_agent(cfg, state.tool_executor.clone(), chat_tx.clone()) {
+                    Ok(arc) => {
                         agent = Some(arc.clone());
                         // Refresh the restore snapshot so a later `/provider
                         // local` restores THIS accepted backend, not the stale
@@ -2079,11 +2084,10 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                             .chat
                             .push(ChatTurn::system("switched to local".to_string()));
                     }
-                    Err(e) => {
-                        state.chat.push(ChatTurn::error(format!(
-                            "could not switch to the detected local endpoint: {e}"
-                        )));
-                    }
+                    Err(e) => revert(
+                        &mut state,
+                        format!("could not switch to the detected local endpoint: {e}"),
+                    ),
                 }
             }
         }
@@ -4005,9 +4009,10 @@ mod tests {
         assert_eq!(s.chat_consent, ChatConsent::Accepted);
         assert_eq!(s.chat_llm.as_ref(), Some(&local));
         assert!(s.chat_detect_offer.is_none());
-        assert!(
+        assert_eq!(
             s.chat_endpoint_rebuild,
-            "accept raises the live-agent rebuild edge"
+            Some(ChatProvider::Openai),
+            "accept raises the rebuild edge carrying the previous provider"
         );
         assert_eq!(s.active_provider, ChatProvider::Local);
     }
@@ -4046,7 +4051,11 @@ mod tests {
         apply_action(&mut s, KeyAction::ChatDetectSave);
         assert_eq!(s.chat_consent, ChatConsent::Accepted);
         assert!(s.chat_persist_dispatch, "save raises the persist edge");
-        assert!(s.chat_endpoint_rebuild, "save also raises the rebuild edge");
+        assert_eq!(
+            s.chat_endpoint_rebuild,
+            Some(ChatProvider::Openai),
+            "save also raises the rebuild edge carrying the previous provider"
+        );
         assert_eq!(s.active_provider, ChatProvider::Local);
         assert_eq!(
             s.chat_llm.as_ref().map(|c| c.base_url.as_str()),
@@ -4056,7 +4065,7 @@ mod tests {
         let mut s2 = AppState::new("t".into(), "default-dark".into());
         apply_action(&mut s2, KeyAction::ChatDetectSave);
         assert!(!s2.chat_persist_dispatch);
-        assert!(!s2.chat_endpoint_rebuild);
+        assert!(s2.chat_endpoint_rebuild.is_none());
     }
 
     #[test]
