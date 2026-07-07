@@ -38,7 +38,10 @@ mod chat;
 mod slash;
 mod summary;
 
-use chat::{build_chat_agent, detect_local_chat, detect_managed_chat, persist_chat_endpoint};
+use chat::{
+    build_chat_agent, build_local_agent, detect_local_chat, detect_managed_chat,
+    persist_chat_endpoint,
+};
 use summary::{parse_plan_result, summarize_json_value, summarize_slash_tool};
 
 /// Which single flow a *focused host* runs.
@@ -1614,13 +1617,10 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         } else {
             // A build failure leaves `agent` None; a submit surfaces an error turn.
             match &state.chat_llm {
-                Some(cfg) => crate::agent::RigAgentClient::new(
-                    cfg.clone(),
-                    state.tool_executor.clone(),
-                    Some(chat_tx.clone()),
-                )
-                .ok()
-                .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>),
+                Some(cfg) => {
+                    build_local_agent(cfg.clone(), state.tool_executor.clone(), chat_tx.clone())
+                        .ok()
+                }
                 None => None,
             }
         }
