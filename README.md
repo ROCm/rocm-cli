@@ -340,29 +340,7 @@ rocm completions powershell | Out-String | Invoke-Expression
 
 ## Contributing
 
-This repo uses [prek](https://github.com/j178/prek) (a fast drop-in
-replacement for `pre-commit`) to run the same checks locally that CI enforces:
-`cargo fmt`, `clippy`, `cargo test`, `ruff` (Python), `shellcheck` (shell),
-and PowerShell syntax.
-
-```bash
-uv tool install prek        # or: cargo install --locked prek
-prek install                # fast checks on commit
-prek install -t pre-push    # heavier checks on push (clippy + tests)
-prek run --all-files        # run everything against the whole tree
-```
-
-Commits must be both cryptographically **signed** and carry a DCO
-**`Signed-off-by`** trailer (use `git commit -s`). This is enforced by the
-prek hooks above and by a blocking CI check. Enable signing once with:
-
-```bash
-git config --global gpg.format ssh
-git config --global user.signingkey ~/.ssh/id_ed25519.pub
-git config --global commit.gpgsign true
-```
-
-See `docs/commit-signatures.md` for details (GPG signing, GitHub "Verified", and troubleshooting).
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## More docs
 

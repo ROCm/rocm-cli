@@ -36,7 +36,7 @@ fix/vram-probe-fallback
 
 ## Development Setup
 
-Prerequisites: Rust (see `rust-toolchain.toml` for the pinned version), Python (for engine adapters and scripts), and [uv](https://github.com/astral-sh/uv).
+Prerequisites: Rust (see `rust-toolchain.toml` for the pinned version) and [uv](https://github.com/astral-sh/uv) (for prek and scripts).
 
 ```bash
 git clone https://github.com/ROCm/rocm-cli
@@ -64,7 +64,6 @@ prek install -t pre-push    # heavier checks on push (clippy + tests)
 | Component | Command |
 | --- | --- |
 | Rust (all crates) | `cargo test` |
-| Python engine adapters | `uv run pytest` |
 | Lint + format check | `prek run --all-files` |
 
 See `docs/testing.md` for the full test guide and `docs/manual-testing.md` for manual QA steps.
