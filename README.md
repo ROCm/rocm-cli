@@ -325,6 +325,20 @@ Show recommended models and hardware compatibility:
 rocm model [--verbose]
 ```
 
+`rocm model` prints a curated catalog of popular open-weight models grouped by
+the hardware path they target — Strix Halo (Lemonade / llama.cpp) and MI300X
+(vLLM) — using canonical Hugging Face ids, and shows for each the quantization
+that fits a single GPU. Strix Halo entries use the `owner/repo:variant` GGUF form
+(e.g. `unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M`) that `rocm serve` needs; MI300X
+entries serve at BF16. This catalog ships inside the binary, so it is available
+offline; when a recipe index is configured instead, the header names it.
+`--verbose` also lists the other recipes (the default assistant and smoke/test
+paths) that `rocm serve` can still resolve but that are hidden from the list.
+
+The catalog is only a starting point: you can serve any compatible Hugging Face
+model by passing its id to `rocm serve` — `owner/repo` for vLLM, or
+`owner/repo:<quant>` for a Lemonade GGUF.
+
 Manage background servers started with `--managed`:
 
 ```

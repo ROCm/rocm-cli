@@ -1,0 +1,453 @@
+{
+  "schema_version": 1,
+  "source": "built-in",
+  "generated_at_unix_ms": null,
+  "platforms": [
+    {
+      "label": "AMD Ryzen AI — Strix Halo (Lemonade / llama.cpp)",
+      "engines": ["lemonade", "llama.cpp", "llamacpp"],
+      "gfx_families": ["gfx1151"]
+    },
+    {
+      "label": "AMD Radeon — RX 7000/9000, Radeon PRO (Lemonade / llama.cpp)",
+      "engines": ["lemonade", "llama.cpp", "llamacpp"],
+      "gfx_families": ["gfx110X-all", "gfx120X-all"]
+    },
+    {
+      "label": "AMD Instinct — MI300X, MI350X, MI355X (vLLM)",
+      "engines": ["vllm"],
+      "gfx_families": ["gfx906", "gfx908", "gfx90a", "gfx94X-dcgpu", "gfx950-dcgpu"]
+    }
+  ],
+  "recipes": [
+    {
+      "canonical_model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "aliases": [
+        "qwen2.5",
+        "qwen2.5-1.5b",
+        "qwen2.5-1.5b-instruct",
+        "qwen-small"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "llamacpp",
+      "trust_remote_code": false,
+      "dtype": "gguf",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 6,
+      "recommended_system_ram_gb": 8,
+      "quantization": "none; recommended small assistant recipe",
+      "artifact_hint": "Lemonade model id; resolved internally to a GGUF build of this model",
+      "artifacts": [],
+      "engine_recipes": [],
+      "manual_alternatives": [
+        "qwen-tiny",
+        "tiny-gpt2"
+      ],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "lemonade"
+      ],
+      "warnings": [
+        "recommended local assistant path for low-VRAM ROCm machines"
+      ]
+    },
+    {
+      "canonical_model_id": "Qwen/Qwen2.5-0.5B-Instruct",
+      "aliases": [
+        "qwen-tiny",
+        "tiny-qwen",
+        "qwen2.5-0.5b",
+        "qwen2.5-0.5b-instruct"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "transformers",
+      "trust_remote_code": false,
+      "dtype": "float16",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 4,
+      "recommended_system_ram_gb": 8,
+      "quantization": "none; tiny instruct smoke recipe",
+      "artifact_hint": "Hugging Face safetensors model id; served on GPU through vLLM (Linux/WSL)",
+      "artifacts": [],
+      "engine_recipes": [],
+      "manual_alternatives": [
+        "qwen",
+        "tiny-gpt2"
+      ],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "vllm"
+      ],
+      "warnings": [
+        "tiny smoke path; use qwen for the smarter low-VRAM assistant"
+      ]
+    },
+    {
+      "canonical_model_id": "Qwen3-4B-Instruct-2507-GGUF",
+      "aliases": [
+        "qwen",
+        "lemonade-qwen",
+        "qwen-gguf",
+        "qwen3-4b",
+        "qwen3-4b-instruct"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "llamacpp",
+      "trust_remote_code": false,
+      "dtype": "gguf",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 4,
+      "recommended_system_ram_gb": 9,
+      "quantization": "GGUF Q4_K_M; Lemonade llama.cpp ROCm backend",
+      "artifact_hint": "Lemonade model id resolved and downloaded by the Lemonade engine",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "vllm",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [],
+          "model_id_override": "Qwen/Qwen3-4B-Instruct-2507"
+        }
+      ],
+      "manual_alternatives": [
+        "qwen-tiny",
+        "llama-3.2-3b-instruct"
+      ],
+      "chat_template_mode": "lemonade",
+      "preferred_engines": [
+        "lemonade"
+      ],
+      "warnings": [
+        "recommended local assistant path for low-VRAM ROCm machines"
+      ]
+    },
+    {
+      "canonical_model_id": "Qwen3-0.6B-GGUF",
+      "aliases": [
+        "qwen-smoke",
+        "lemonade-tiny"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "llamacpp",
+      "trust_remote_code": false,
+      "dtype": "gguf",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 2,
+      "recommended_system_ram_gb": 4,
+      "quantization": "GGUF; Lemonade llama.cpp ROCm backend",
+      "artifact_hint": "Lemonade model id resolved and downloaded by the Lemonade engine",
+      "artifacts": [],
+      "engine_recipes": [],
+      "manual_alternatives": [
+        "qwen",
+        "qwen-tiny"
+      ],
+      "chat_template_mode": "lemonade",
+      "preferred_engines": [
+        "lemonade"
+      ],
+      "warnings": [
+        "tiny Lemonade GGUF smoke-test path; not the default assistant"
+      ]
+    },
+    {
+      "canonical_model_id": "Qwen/Qwen3.5-4B",
+      "aliases": [
+        "qwen3.5",
+        "qwen3.5-4b"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "transformers",
+      "trust_remote_code": false,
+      "dtype": "bfloat16",
+      "device_policy": "gpu_preferred",
+      "min_gpu_mem_gb": 12,
+      "recommended_system_ram_gb": 16,
+      "quantization": "none; bfloat16 weights",
+      "artifact_hint": "Hugging Face model id; engine resolver validates artifacts during serve",
+      "artifacts": [],
+      "engine_recipes": [],
+      "manual_alternatives": [
+        "qwen",
+        "llama-3.2-3b-instruct",
+        "tiny-gpt2"
+      ],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "vllm"
+      ],
+      "warnings": [
+        "not a verified vLLM smoke path: Transformers 4.57.6 reports unknown architecture qwen3_5"
+      ]
+    },
+    {
+      "canonical_model_id": "Qwen/Qwen3-32B-FP8",
+      "aliases": [
+        "qwen32b",
+        "qwen3.5-32b",
+        "qwen3-32b",
+        "qwen3-32b-fp8"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "transformers",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 48,
+      "recommended_system_ram_gb": 64,
+      "quantization": "fp8 recipe",
+      "artifact_hint": "Hugging Face model id; engine resolver validates FP8 support during serve",
+      "artifacts": [],
+      "engine_recipes": [],
+      "manual_alternatives": [
+        "qwen",
+        "llama-3.2-3b-instruct",
+        "tiny-gpt2"
+      ],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "vllm"
+      ],
+      "warnings": [
+        "this recipe prefers ROCm GPU execution and may span multiple accelerators",
+        "startup will attempt auto device_map placement across visible GPUs when aggregate memory is sufficient"
+      ]
+    },
+    {
+      "canonical_model_id": "zai-org/GLM-5-FP8",
+      "aliases": [
+        "glm5",
+        "glm-5",
+        "glm-5-fp8"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "transformers",
+      "trust_remote_code": true,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 905,
+      "recommended_system_ram_gb": 1024,
+      "quantization": "fp8 recipe",
+      "artifact_hint": "Hugging Face model id; requires an engine/runtime that supports this model family",
+      "artifacts": [],
+      "engine_recipes": [],
+      "manual_alternatives": [
+        "qwen3.5-4b",
+        "qwen3-32b-fp8",
+        "llama-3.2-3b-instruct"
+      ],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "vllm"
+      ],
+      "warnings": [
+        "this model family is configured with trust_remote_code enabled by recipe"
+      ]
+    },
+    {
+      "canonical_model_id": "meta-llama/Llama-3.2-3B-Instruct",
+      "aliases": [
+        "llama",
+        "llama3.2",
+        "llama-3.2-3b",
+        "llama-3.2-3b-instruct"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "transformers",
+      "trust_remote_code": false,
+      "dtype": "bfloat16",
+      "device_policy": "gpu_preferred",
+      "min_gpu_mem_gb": 8,
+      "recommended_system_ram_gb": 16,
+      "quantization": "none; bfloat16 weights",
+      "artifact_hint": "Hugging Face safetensors model id; served on GPU through vLLM (Linux/WSL)",
+      "artifacts": [],
+      "engine_recipes": [],
+      "manual_alternatives": [
+        "qwen",
+        "tiny-gpt2"
+      ],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "vllm"
+      ],
+      "warnings": []
+    },
+    {
+      "canonical_model_id": "sshleifer/tiny-gpt2",
+      "aliases": [
+        "tiny-gpt2",
+        "gpt2tiny"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "transformers",
+      "trust_remote_code": false,
+      "dtype": "float16",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 2,
+      "recommended_system_ram_gb": 1,
+      "quantization": "none; tiny GPU smoke recipe",
+      "artifact_hint": "Hugging Face model id for small GPU smoke testing",
+      "artifacts": [],
+      "engine_recipes": [],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "vllm"
+      ],
+      "warnings": []
+    },
+    {
+      "canonical_model_id": "Qwen/Qwen3.6-27B",
+      "aliases": [
+        "qwen3.6-27b",
+        "qwen3.6-dense",
+        "qwen-27b"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "transformers",
+      "trust_remote_code": false,
+      "dtype": "bfloat16",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 54,
+      "recommended_system_ram_gb": 64,
+      "quantization": "BF16, ~54 GiB (1x MI300X)",
+      "artifact_hint": "Hugging Face model id; vLLM ROCm serving validates artifacts during serve",
+      "artifacts": [],
+      "engine_recipes": [],
+      "manual_alternatives": [
+        "qwen3-32b-fp8"
+      ],
+      "featured": true,
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "vllm"
+      ],
+      "warnings": [
+        "Apache-2.0 open-weight; dense 27B tuned for agentic coding"
+      ]
+    },
+    {
+      "canonical_model_id": "google/gemma-4-31B-it",
+      "aliases": [
+        "gemma-4-31b",
+        "gemma-4-dense",
+        "gemma4-31b"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "transformers",
+      "trust_remote_code": false,
+      "dtype": "bfloat16",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 62,
+      "recommended_system_ram_gb": 96,
+      "quantization": "BF16, ~62 GiB (1x MI300X)",
+      "artifact_hint": "Hugging Face model id; vLLM ROCm serving validates artifacts during serve",
+      "artifacts": [],
+      "engine_recipes": [],
+      "manual_alternatives": [
+        "qwen3-32b-fp8"
+      ],
+      "featured": true,
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "vllm"
+      ],
+      "warnings": [
+        "Gemma terms; gated on Hugging Face (accept the license, then authenticate)",
+        "multimodal model; text chat is the default serve path"
+      ]
+    },
+    {
+      "canonical_model_id": "unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M",
+      "aliases": [
+        "qwen3.6",
+        "qwen3.6-35b",
+        "qwen3.6-35b-a3b",
+        "qwen-a3b"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "llamacpp",
+      "trust_remote_code": false,
+      "dtype": "gguf",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 22,
+      "recommended_system_ram_gb": 32,
+      "quantization": "Q4_K_M GGUF, ~22 GiB",
+      "artifact_hint": "GGUF served through Lemonade on Strix Halo; the :Q4_K_M variant selects the quant file",
+      "artifacts": [],
+      "engine_recipes": [],
+      "manual_alternatives": [
+        "qwen3.6-27b"
+      ],
+      "featured": true,
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "lemonade"
+      ],
+      "warnings": [
+        "Apache-2.0 open-weight; mixture-of-experts 35B total / 3B active"
+      ]
+    },
+    {
+      "canonical_model_id": "unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M",
+      "aliases": [
+        "gemma-4",
+        "gemma-4-26b",
+        "gemma-4-26b-a4b",
+        "gemma4-a4b"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "llamacpp",
+      "trust_remote_code": false,
+      "dtype": "gguf",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 17,
+      "recommended_system_ram_gb": 24,
+      "quantization": "Q4_K_M GGUF, ~17 GiB",
+      "artifact_hint": "GGUF served through Lemonade on Strix Halo; the :Q4_K_M variant selects the quant file",
+      "artifacts": [],
+      "engine_recipes": [],
+      "manual_alternatives": [
+        "qwen3.6"
+      ],
+      "featured": true,
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "lemonade"
+      ],
+      "warnings": [
+        "multimodal model; text chat is the default serve path"
+      ]
+    }
+  ]
+}

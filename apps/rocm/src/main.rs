@@ -29,11 +29,13 @@ use rocm_core::{
     PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF,
     WatcherMode, append_audit_event, builtin_model_recipes, builtin_watcher, builtin_watchers,
     connect_tcp_stream, daemon_binary_path, default_engine_for_platform,
-    default_interactive_shell_program, detect_host_gpu_summary, engine_binary_path,
-    engine_plugin_dirs, format_host_port, format_http_base_url, generate_service_id,
-    interactive_terminal, load_model_recipe_registry, load_recent_audit_events,
-    load_recent_automation_events, load_recent_automation_proposals, managed_pip_cache_dir,
-    managed_service_endpoint_model_ready, model_artifact_cache_status,
+    default_interactive_shell_program, detect_host_gfx_target, detect_host_gpu_summary,
+    engine_binary_path, engine_plugin_dirs, format_host_port, format_http_base_url,
+    generate_service_id, interactive_terminal, load_model_recipe_registry,
+    load_recent_audit_events, load_recent_automation_events, load_recent_automation_proposals,
+    managed_pip_cache_dir, managed_service_endpoint_model_ready, model_artifact_cache_status,
+    model_catalog_platforms, model_recipe_featured, model_recipe_target_platform_label,
+    normalize_therock_family, platform_matches_gfx_family,
     preferred_serve_engine_for_host_gpu_summary, prepend_runtime_path, process_is_running,
     read_tcp_stream_to_string, resolve_builtin_model_recipe, resolve_model_recipe,
     runtime_install_root_is_protected, runtime_path_is_same_or_inside,
@@ -10678,27 +10680,82 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
     _host_ram_gib: Option<f64>,
 ) -> String {
     let mut output = String::new();
-    let _ = writeln!(output, "Local models");
     let registry = match load_model_recipe_registry() {
         Ok(registry) => registry,
         Err(error) => {
-            let _ = writeln!(output, "  Model list is unavailable: {error}");
+            let _ = writeln!(output, "Recommended models unavailable: {error}");
             return output;
         }
     };
-    for recipe in &registry.recipes {
+    let _ = writeln!(output, "{}", model_catalog_header(&registry));
+    // Curated view: for the built-in catalog show only the featured short list;
+    // a configured index is already curated, so show all of it. Group either way
+    // by the hardware path each model targets.
+    let show_all = !matches!(registry.source, ModelRecipeRegistrySource::BuiltIn);
+    let visible = registry
+        .recipes
+        .iter()
+        .filter(|recipe| show_all || model_recipe_featured(recipe))
+        .collect::<Vec<_>>();
+    let platforms = model_catalog_platforms(&registry);
+    let host_gfx_family = detect_host_gfx_target()
+        .as_deref()
+        .and_then(normalize_therock_family);
+    for platform in &platforms {
+        let mut group = visible
+            .iter()
+            .filter(|recipe| {
+                recipe.preferred_engines.first().is_some_and(|engine| {
+                    platform
+                        .engines
+                        .iter()
+                        .any(|e| e.eq_ignore_ascii_case(engine))
+                })
+            })
+            .peekable();
+        if group.peek().is_none() {
+            continue;
+        }
+        let your_gpu = host_gfx_family
+            .as_deref()
+            .is_some_and(|family| platform_matches_gfx_family(platform, family));
+        let heading = if your_gpu {
+            format!("{} \u{2190} your GPU", platform.label)
+        } else {
+            platform.label.clone()
+        };
+        let _ = writeln!(output, "\n{heading}");
+        for recipe in group {
+            // Show the canonical Hugging Face id (the reliable serve target) and
+            // the quant that fits this hardware. Append a fit verdict only when the
+            // host GPU VRAM is known — otherwise every row would read "GPU fit
+            // unknown", which is noise.
+            let detail = recipe
+                .quantization
+                .clone()
+                .unwrap_or_else(|| model_recipe_memory_label(recipe));
+            let fit = if aggregate_gpu_vram_gib.is_some() {
+                format!(
+                    "  {}",
+                    model_recipe_gpu_fit_label(recipe, aggregate_gpu_vram_gib)
+                )
+            } else {
+                String::new()
+            };
+            let _ = writeln!(output, "  {}  {}{}", recipe.canonical_model_id, detail, fit);
+        }
+    }
+    if matches!(registry.source, ModelRecipeRegistrySource::BuiltIn) {
         let _ = writeln!(
             output,
-            "  {}  {}  {}",
-            recipe_display_ref(recipe),
-            model_recipe_memory_label(recipe),
-            model_recipe_gpu_fit_label(recipe, aggregate_gpu_vram_gib)
+            "\nThese are recommendations — you can serve any compatible Hugging Face model:\n  \
+             rocm serve <owner/repo>          # vLLM, e.g. Qwen/Qwen3.6-27B\n  \
+             rocm serve <owner/repo>:<quant>  # Lemonade GGUF, e.g. unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M\n\
+             \nUse `rocm model --verbose` for details."
         );
+    } else {
+        let _ = writeln!(output, "\nUse `rocm model --verbose` for details.");
     }
-    let _ = writeln!(
-        output,
-        "\nUse `rocm serve <model>` to start one. Use `rocm model --verbose` for details."
-    );
     output
 }
 
@@ -10765,6 +10822,21 @@ pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
             memory,
             engines
         );
+        let hidden_from_builtin = matches!(registry.source, ModelRecipeRegistrySource::BuiltIn)
+            && !model_recipe_featured(recipe);
+        if hidden_from_builtin {
+            let _ = writeln!(
+                output,
+                "      catalog: hidden (resolvable via rocm serve, not in the curated list)"
+            );
+        } else {
+            let platforms = model_catalog_platforms(&registry);
+            let _ = writeln!(
+                output,
+                "      catalog: {}",
+                model_recipe_target_platform_label(recipe, &platforms)
+            );
+        }
         append_model_recipe_metadata_lines(&mut output, recipe, paths);
         append_model_host_ram_fit_lines(&mut output, recipe, host_ram_gib);
         append_model_fit_lines(&mut output, recipe, aggregate_gpu_vram_gib);
@@ -10778,6 +10850,23 @@ pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
     }
     append_model_recipe_registry_source(&mut output, &registry);
     output
+}
+
+/// The `rocm model` header. For the default built-in list it just names the
+/// action; a configured recipe index instead advertises its provenance (the
+/// only case where the source differs from the default and is worth surfacing).
+fn model_catalog_header(registry: &ModelRecipeRegistry) -> String {
+    match &registry.source {
+        ModelRecipeRegistrySource::BuiltIn => {
+            "Recommended models — run one with `rocm serve <model>`".to_owned()
+        }
+        ModelRecipeRegistrySource::SignedIndex { index_path, .. } => {
+            format!(
+                "Recommended models — from recipe index {}",
+                index_path.display()
+            )
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -21717,14 +21806,76 @@ VERSION_ID="41"
     fn render_model_registry_text_lists_builtin_recipes() {
         let rendered = render_model_registry_text_with_context_and_host(None, None, None);
 
-        assert!(rendered.contains("Local models"));
-        assert!(rendered.contains("qwen3.5"));
-        assert!(rendered.contains("GPU fit unknown"));
-        assert!(rendered.contains("Use `rocm serve <model>`"));
+        // Clean header: what the list is + the one action, no implementation jargon.
+        assert!(rendered.contains("Recommended models — run one with `rocm serve <model>`"));
+        // Featured current models are grouped under their hardware target, each
+        // with the quant that fits a single GPU.
+        assert!(rendered.contains("AMD Ryzen AI — Strix Halo (Lemonade / llama.cpp)"));
+        assert!(rendered.contains("AMD Instinct — MI300X, MI350X, MI355X (vLLM)"));
+        // Strix Halo GGUF entries carry the servable owner/repo:variant ref.
+        assert!(rendered.contains("unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M"));
+        assert!(rendered.contains("Q4_K_M GGUF"));
+        assert!(rendered.contains("Qwen/Qwen3.6-27B"));
+        assert!(rendered.contains("BF16"));
+        // Multi-GPU-only models are not featured (single-GPU serving only).
+        assert!(!rendered.contains("GLM-5.2"));
+        assert!(!rendered.contains("DeepSeek-V4-Flash"));
+        // Without a known host GPU, no misleading per-row fit verdict is shown.
+        assert!(!rendered.contains("GPU fit unknown"));
+        // Superseded / smoke / assistant recipes are hidden from the curated list.
+        assert!(!rendered.contains("tiny-gpt2"));
+        assert!(!rendered.contains("Qwen/Qwen3.5-4B"));
+        assert!(!rendered.contains("Qwen3-4B-Instruct-2507-GGUF"));
+        // Disclaimer: the list is a starting point; any compatible HF model works.
+        assert!(rendered.contains("you can serve any compatible Hugging Face model"));
+        assert!(rendered.contains("rocm serve <owner/repo>:<quant>"));
         assert!(rendered.contains("rocm model --verbose"));
         assert!(!rendered.contains("recommended_system_ram:"));
         assert!(!rendered.contains("engine_support:"));
         assert!(!rendered.contains("artifact_check:"));
+    }
+
+    #[test]
+    fn render_model_registry_text_shows_fit_when_gpu_known() {
+        // With a known aggregate VRAM, each row gains a concrete fit verdict.
+        // 60 GiB fits Qwen3.6-27B (~54) but not Gemma-4-31B (~62).
+        let rendered = render_model_registry_text_with_context_and_host(None, Some(60.0), None);
+
+        assert!(rendered.contains("fits this GPU"));
+        assert!(rendered.contains("needs a larger GPU"));
+        assert!(!rendered.contains("GPU fit unknown"));
+    }
+
+    #[test]
+    fn model_catalog_header_only_names_source_for_configured_index() {
+        // Default built-in list: no implementation jargon, just the action.
+        let builtin = ModelRecipeRegistry {
+            recipes: Vec::new(),
+            platforms: Vec::new(),
+            source: ModelRecipeRegistrySource::BuiltIn,
+        };
+        let header = model_catalog_header(&builtin);
+        assert_eq!(
+            header,
+            "Recommended models — run one with `rocm serve <model>`"
+        );
+        assert!(!header.contains("built-in"));
+        assert!(!header.contains("fallback"));
+
+        // A configured index is the only case worth advertising provenance for.
+        let configured = ModelRecipeRegistry {
+            recipes: Vec::new(),
+            platforms: Vec::new(),
+            source: ModelRecipeRegistrySource::SignedIndex {
+                index_path: PathBuf::from("/etc/rocm/recipes.json"),
+                signature_path: PathBuf::from("/etc/rocm/recipes.json.sig"),
+                public_key_path: PathBuf::from("/etc/rocm/recipes.pub"),
+            },
+        };
+        assert_eq!(
+            model_catalog_header(&configured),
+            "Recommended models — from recipe index /etc/rocm/recipes.json"
+        );
     }
 
     #[test]
@@ -21739,6 +21890,11 @@ VERSION_ID="41"
         assert!(rendered.contains("engine_support:"));
         assert!(rendered.contains("engine_action: use /engine install <engine>"));
         assert!(rendered.contains("source: built-in recipe registry"));
+        // Verbose keeps every recipe (including hidden ones) and annotates each
+        // with its curated catalog placement.
+        assert!(rendered.contains("catalog: AMD Instinct — MI300X, MI350X, MI355X (vLLM)"));
+        assert!(rendered.contains("catalog: hidden (resolvable via rocm serve"));
+        assert!(rendered.contains("sshleifer/tiny-gpt2"));
     }
 
     #[test]
