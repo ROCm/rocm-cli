@@ -6898,22 +6898,22 @@ Class Name:                Display
     fn model_recipe_target_platform_groups_by_engine() {
         let registry = builtin_model_recipe_registry();
         let platforms = model_catalog_platforms(&registry);
-        // The (hidden) built-in assistant is a Lemonade recipe → Strix Halo.
+        // The (hidden) built-in assistant is a Lemonade recipe → Ryzen AI (Strix Halo).
         let strix = resolve_builtin_model_recipe("qwen").expect("qwen assistant");
         assert_eq!(
             model_recipe_target_platform_label(&strix, &platforms),
-            "Strix Halo (Lemonade / llama.cpp)"
+            "AMD Ryzen AI — Strix Halo (Lemonade / llama.cpp)"
         );
         let mi300x = resolve_builtin_model_recipe("qwen3.6-27b").expect("qwen3.6-27b");
         assert_eq!(
             model_recipe_target_platform_label(&mi300x, &platforms),
-            "MI300X (vLLM)"
+            "AMD Instinct — MI300X, MI350X, MI355X (vLLM)"
         );
-        // Serving is limited to Lemonade and vLLM, so a vLLM recipe lands on MI300X.
+        // vLLM recipes land on the Instinct platform.
         let llama = resolve_builtin_model_recipe("llama-3.2-3b-instruct").expect("llama");
         assert_eq!(
             model_recipe_target_platform_label(&llama, &platforms),
-            "MI300X (vLLM)"
+            "AMD Instinct — MI300X, MI350X, MI355X (vLLM)"
         );
     }
 

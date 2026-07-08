@@ -10705,7 +10705,12 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
         let mut group = visible
             .iter()
             .filter(|recipe| {
-                model_recipe_target_platform_label(recipe, &platforms) == platform.label
+                recipe.preferred_engines.first().is_some_and(|engine| {
+                    platform
+                        .engines
+                        .iter()
+                        .any(|e| e.eq_ignore_ascii_case(engine))
+                })
             })
             .peekable();
         if group.peek().is_none() {
@@ -21805,8 +21810,8 @@ VERSION_ID="41"
         assert!(rendered.contains("Recommended models — run one with `rocm serve <model>`"));
         // Featured current models are grouped under their hardware target, each
         // with the quant that fits a single GPU.
-        assert!(rendered.contains("Strix Halo (Lemonade / llama.cpp)"));
-        assert!(rendered.contains("MI300X (vLLM)"));
+        assert!(rendered.contains("AMD Ryzen AI — Strix Halo (Lemonade / llama.cpp)"));
+        assert!(rendered.contains("AMD Instinct — MI300X, MI350X, MI355X (vLLM)"));
         // Strix Halo GGUF entries carry the servable owner/repo:variant ref.
         assert!(rendered.contains("unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M"));
         assert!(rendered.contains("Q4_K_M GGUF"));
@@ -21887,7 +21892,7 @@ VERSION_ID="41"
         assert!(rendered.contains("source: built-in recipe registry"));
         // Verbose keeps every recipe (including hidden ones) and annotates each
         // with its curated catalog placement.
-        assert!(rendered.contains("catalog: MI300X (vLLM)"));
+        assert!(rendered.contains("catalog: AMD Instinct — MI300X, MI350X, MI355X (vLLM)"));
         assert!(rendered.contains("catalog: hidden (resolvable via rocm serve"));
         assert!(rendered.contains("sshleifer/tiny-gpt2"));
     }
