@@ -1,3 +1,9 @@
+<!--
+Copyright © Advanced Micro Devices, Inc., or its affiliates.
+
+SPDX-License-Identifier: MIT
+-->
+
 # Plan: `rocm bench load` — a minimal GPU-saturating load generator
 
 > Status: ready (adversarially vetted against `main`) · Owner: TBD · Date: 2026-07-08

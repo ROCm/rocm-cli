@@ -319,6 +319,112 @@ pub fn run_chat(chat_mock: bool) -> Result<()> {
     rt.block_on(run_async(config, paths, args, None, chat_mock))
 }
 
+/// Entry point for `rocm bench load`.
+///
+/// Runs a concurrency sweep against a local http:// endpoint and appends one
+/// aggregate CSV row per concurrency level. Output goes to a self-labeled file
+/// in `~/.rocm/bench/` unless `--out` is specified explicitly.
+pub fn run_bench(
+    endpoint: String,
+    model: Option<String>,
+    concurrency: Vec<u32>,
+    isl: u32,
+    osl: u32,
+    requests: u32,
+    out: Option<std::path::PathBuf>,
+) -> Result<()> {
+    use rocm_dash_daemon::bench_load::{LoadSpec, run_and_append_csv};
+
+    // Reject https:// — no TLS backend compiled in for the load generator.
+    // Compare on the lowercased scheme so HTTPS:// is also caught.
+    if endpoint.to_lowercase().starts_with("https://") {
+        anyhow::bail!(
+            "rocm bench load supports http:// endpoints only (no TLS backend compiled in)"
+        );
+    }
+
+    // Resolve the model: use the provided value or probe GET {endpoint}/v1/models.
+    let model = if let Some(m) = model {
+        m
+    } else {
+        let models_url = format!("{}/v1/models", endpoint.trim_end_matches('/'));
+        let resp = ureq::get(&models_url)
+            .timeout(std::time::Duration::from_secs(5))
+            .call()
+            .context("fetching /v1/models to detect the default model")?;
+        let body: serde_json::Value = resp.into_json().context("parsing /v1/models response")?;
+        rocm_dash_tui::llm::pick_first_model(&body).with_context(|| {
+            format!("no model found at {endpoint}/v1/models — pass --model explicitly")
+        })?
+    };
+
+    // Resolve the output path: distinct self-labeled file, not the shared bench_results_dir.
+    let csv_path = if let Some(p) = out {
+        p
+    } else {
+        let paths = AppPaths::discover()?;
+        let bench_dir = paths.data_dir.join("bench");
+        std::fs::create_dir_all(&bench_dir)
+            .with_context(|| format!("creating bench output dir {}", bench_dir.display()))?;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        bench_dir.join(format!("rocm-bench-{ts}.csv"))
+    };
+
+    let spec = LoadSpec {
+        endpoint: endpoint.clone(),
+        model: model.clone(),
+        input_len: isl,
+        output_len: osl,
+        requests,
+    };
+
+    println!("mode: raw serving throughput (synthetic prompts) — not agent-workload.");
+    println!(
+        "endpoint={endpoint} model={model} concurrency={} isl={isl} osl={osl} requests={requests}",
+        concurrency
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+
+    let rt = build_dashboard_runtime()?;
+    let rows = rt
+        .block_on(run_and_append_csv(&spec, &concurrency, &csv_path))
+        .context("running bench load sweep")?;
+
+    for row in &rows {
+        let conc = row
+            .concurrency
+            .map_or_else(|| "-".to_string(), |v| v.to_string());
+        let gen_tps = row
+            .gen_tps
+            .map_or_else(|| "-".to_string(), |v| format!("{v:.1}"));
+        let prompt_tps = row
+            .prompt_tps
+            .map_or_else(|| "-".to_string(), |v| format!("{v:.1}"));
+        let wall = row
+            .wall_s
+            .map_or_else(|| "-".to_string(), |v| format!("{v:.2}"));
+        let n = row
+            .n_requests
+            .map_or_else(|| "-".to_string(), |v| v.to_string());
+        println!(
+            "cell={} concurrency={conc} gen_tps={gen_tps} prompt_tps={prompt_tps} wall={wall}s n={n}",
+            row.cell
+        );
+    }
+    println!(
+        "note: local saturation smoke-test — client-measured throughput, not an official ROCm/AMD benchmark."
+    );
+    println!("wrote {} row(s) to {}", rows.len(), csv_path.display());
+
+    Ok(())
+}
+
 /// Entry point for `rocm bootstrap setup`. Routes to the same focused Setup host
 /// as the launcher's "Set up this system" row — the first-run onboarding wizard
 /// (install ROCm SDK / adopt an existing folder), with no daemon or tab shell.

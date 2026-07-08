@@ -3942,7 +3942,7 @@ pub struct DashboardDaemonConfig {
     pub discovery_tick_secs: f64,
     #[serde(default = "default_instance_tick_secs")]
     pub instance_tick_secs: f64,
-    /// Watch this directory for new normalized benchmark CSVs.
+    /// Watch this file for new normalized benchmark CSV rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bench_results_dir: Option<PathBuf>,
 }
