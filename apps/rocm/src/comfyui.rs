@@ -2026,7 +2026,7 @@ mod tests {
         if runtime_is_windows() {
             assert!(path_entries.contains(&sdk_lib));
             assert!(path_entries.contains(&runtime_lib));
-        } else {
+        } else if runtime_is_linux() {
             let ld_library_path =
                 command_env_value(&command, "LD_LIBRARY_PATH").context("LD_LIBRARY_PATH")?;
             let library_entries = split_runtime_paths(&ld_library_path);
