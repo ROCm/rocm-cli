@@ -12,6 +12,7 @@ members = [
   "engines/lemonade",
   "engines/vllm",
   "xtask",
+  "tests/e2e-cucumber",
 ]
 resolver = "2"
 

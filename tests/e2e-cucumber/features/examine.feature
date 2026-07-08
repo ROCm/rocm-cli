@@ -1,0 +1,23 @@
+Feature: GPU detection and system inspection
+
+  Scenario: 1 - The CLI reports its version
+    When the user asks for the version
+    Then a version string is returned
+
+  Scenario: 2 - The CLI lists all supported engines
+    When the user lists available engines
+    Then all supported engines are listed
+
+  @gpu
+  Scenario: 3 - System inspection detects the GPU and driver
+    Given a machine with an AMD GPU
+    When the user inspects the system
+    Then the inspection reports which GPU is installed
+    And the inspection reports that the driver is available
+
+  @gpu
+  Scenario: 4 - System inspection distinguishes CLI-managed from pre-existing ROCm
+    Given a machine with a ROCm install that was not set up by the CLI
+    When the user inspects the system
+    Then the inspection reports the install as pre-existing
+    And the inspection suggests setting up a CLI-managed install
