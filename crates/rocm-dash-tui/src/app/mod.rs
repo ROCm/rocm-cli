@@ -1656,6 +1656,20 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             }
             maybe_ev = events.next() => {
                 match maybe_ev {
+                    // Only ACT on key presses. Terminals (notably Windows
+                    // Terminal / ConPTY under WSL, and any with the kitty
+                    // keyboard protocol) also emit Release/Repeat events; the
+                    // general `handle_key` already drops non-Press, but the
+                    // operational-overlay arms below dispatch straight to their
+                    // managers and would otherwise process the SAME keystroke
+                    // twice. That double-fire is what made Enter in the serve
+                    // wizard's model picker re-open the picker (seeding it with
+                    // the just-chosen model as a filter) instead of choosing.
+                    // Swallow non-Press key events here, above every key arm, so
+                    // the Press-only invariant holds for overlays too.
+                    Some(Ok(CtEvent::Key(k))) if !is_actionable_key(k.kind) => {
+                        let _ = k;
+                    }
                     // The approval modal, when open, owns ALL keys with the
                     // highest priority (above every operational overlay and the
                     // general handler) so the operator's decision can't be
@@ -2594,8 +2608,21 @@ pub enum KeyAction {
     OpenLogs,
 }
 
+/// Whether a crossterm key event should be acted on. Terminals emit
+/// Release/Repeat events in addition to Press (notably Windows Terminal /
+/// ConPTY under WSL, and any terminal advertising the kitty keyboard protocol).
+///
+/// The whole TUI acts on Press only. Both the general [`handle_key`] and the
+/// event loop's operational-overlay dispatch share this gate — without it, a
+/// single keystroke reaches an overlay's `on_key` more than once, which made
+/// Enter in the serve wizard's model picker re-open the picker (seeded with the
+/// just-chosen model as a filter) instead of choosing it.
+const fn is_actionable_key(kind: KeyEventKind) -> bool {
+    matches!(kind, KeyEventKind::Press)
+}
+
 fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) -> KeyAction {
-    if k.kind != KeyEventKind::Press {
+    if !is_actionable_key(k.kind) {
         return KeyAction::Nothing;
     }
     // Chat tab key handling, placed BEFORE the global hotkey match so focused
@@ -3355,6 +3382,18 @@ mod tests {
             ),
             KeyAction::Nothing
         );
+    }
+
+    #[test]
+    fn only_press_key_events_are_actionable() {
+        // The event loop gates overlay dispatch on this predicate so a single
+        // keystroke isn't processed twice by an overlay's `on_key` (Release /
+        // Repeat echoes on Windows Terminal / ConPTY / kitty keyboard). The
+        // double-fire re-opened the serve wizard's model picker on Enter instead
+        // of choosing — this pins Press-only routing.
+        assert!(is_actionable_key(KeyEventKind::Press));
+        assert!(!is_actionable_key(KeyEventKind::Release));
+        assert!(!is_actionable_key(KeyEventKind::Repeat));
     }
 
     #[test]
