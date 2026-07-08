@@ -24,8 +24,8 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use rocm_core::{
     AppPaths, AuditEventRecord, AutomationEventRecord, AutomationProposalRecord,
     AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot,
-    DEFAULT_LOCAL_HOST, ExamineSummary, ManagedServiceRecord, ModelCatalogPlatform,
-    ModelRecipeRecord, ModelRecipeRegistry, ModelRecipeRegistrySource, PERMISSIONS_MODE_ASK,
+    DEFAULT_LOCAL_HOST, ExamineSummary, ManagedServiceRecord, ModelRecipeRecord,
+    ModelRecipeRegistry, ModelRecipeRegistrySource, PERMISSIONS_MODE_ASK,
     PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF,
     WatcherMode, append_audit_event, builtin_model_recipes, builtin_watcher, builtin_watchers,
     connect_tcp_stream, daemon_binary_path, default_engine_for_platform,
@@ -10713,8 +10713,7 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
         }
         let your_gpu = host_gfx_family
             .as_deref()
-            .map(|family| platform_matches_gfx_family(platform, family))
-            .unwrap_or(false);
+            .is_some_and(|family| platform_matches_gfx_family(platform, family));
         let heading = if your_gpu {
             format!("{} \u{2190} your GPU", platform.label)
         } else {
