@@ -141,7 +141,7 @@ Lemonade is the default local assistant/server engine. Serve a small assistant
 model with the managed runtime:
 
 ```powershell
-rocm serve qwen --engine lemonade --device gpu_required --managed --foreground --port 11435
+rocm serve qwen --engine lemonade --device gpu_required --foreground --port 11435
 ```
 
 Expected result:
@@ -151,7 +151,14 @@ Expected result:
 - If the GPU cannot be used, the command fails with a clear error.
 - The OpenAI-compatible endpoint answers a simple chat request.
 
-Stop the foreground server with `Ctrl+C`.
+While the log stream is attached, verify detach and stop behave differently:
+
+- Press `Ctrl+D`. The stream ends and the shell prompt returns, printing a
+  "detached — server still running" note with the service id. Confirm the server
+  is still up: `rocm services` lists it and the endpoint still answers a chat
+  request. Stop it afterward with `rocm services stop <service-id> --yes`.
+- Re-run the serve command and press `Ctrl+C` instead. The server shuts down and
+  `rocm services` no longer lists it as running.
 
 ## 4. Local Server Records
 
