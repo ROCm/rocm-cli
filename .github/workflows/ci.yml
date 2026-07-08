@@ -93,6 +93,7 @@ jobs:
               - '**/*.py'
               - '**/*.sh'
               - '**/*.ps1'
+              - '**/*.feature'
               - 'install*'
               - '.github/workflows/**'
             # THIRD_PARTY_NOTICES.txt staleness gate: anything that changes the
@@ -545,3 +546,91 @@ jobs:
   # are intentionally not part of this workflow yet. See
   # docs/ci-hardware-testing.md for the planned design; they will land in a
   # follow-up PR.
+
+  # ── E2E tests (cucumber-rs) ───────────────────────────────────────────────
+  #
+  # BDD scenarios in Gherkin (.feature files) backed by Rust step functions.
+  # Three selections: blocking mock tier, non-blocking known bugs, non-blocking
+  # GPU. Cucumber tag filters are exact-match, so known-bug scenarios carry a
+  # bare `@expected-failure` (plus `@expected-failure-EAI-NNNN` for traceability)
+  # and hardware-dependent scenarios carry `@gpu`.
+
+  # Blocking mock-tier job: must stay green. Known-bug scenarios and
+  # hardware-dependent scenarios are excluded here and run in the non-blocking
+  # jobs below.
+  e2e:
+    name: E2E tests
+    runs-on: ubuntu-latest
+    needs: [changes, build-and-test]
+    if: needs.changes.outputs.heavy == 'true'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install native build deps
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libcap-dev
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      # The workspace test job selects only affected crates and runs the cucumber
+      # harness, not the library's own unit tests — run the report generator's
+      # unit tests (stats counting, scenario status, date formatting) here.
+      - name: Unit tests (e2e-cucumber lib)
+        run: cargo test -p e2e-cucumber --lib
+
+      - name: Run E2E tests (mock tier, excluding known bugs)
+        run: cargo xtask e2e -- -t "not @gpu and not @expected-failure"
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-report
+          path: tests/e2e-cucumber/results/
+
+  # Non-blocking: runs ONLY the known-bug scenarios so their status is visible
+  # without gating the PR. As each bug is fixed and its tag removed, the scenario
+  # moves into the blocking e2e job above.
+  e2e-known-bugs:
+    name: E2E tests (known bugs)
+    runs-on: ubuntu-latest
+    needs: [changes, build-and-test]
+    if: needs.changes.outputs.heavy == 'true'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install native build deps
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libcap-dev
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Run known-bug E2E scenarios (mock tier)
+        run: cargo xtask e2e -- -t "@expected-failure and not @gpu"
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-known-bugs-report
+          path: tests/e2e-cucumber/results/
+
+  e2e-gpu:
+    name: E2E tests (GPU)
+    runs-on: [self-hosted, linux, amd-gpu]
+    needs: [changes, build-and-test]
+    if: needs.changes.outputs.heavy == 'true'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Run E2E tests on GPU hardware
+        run: cargo xtask e2e -- -t "@gpu"
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-gpu-report
+          path: tests/e2e-cucumber/results/

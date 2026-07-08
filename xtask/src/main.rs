@@ -11,6 +11,7 @@
 //! alias `cargo xtask <command>`.
 
 mod affected;
+mod e2e;
 mod manifest;
 mod powershell;
 mod signing;
@@ -110,6 +111,15 @@ enum Command {
         #[arg(long, conflicts_with_all = ["base", "require_verified"])]
         check_config: bool,
     },
+    /// Build the release `rocm` binary and run the cucumber-rs E2E suite.
+    /// Extra arguments after the command are forwarded to the cucumber CLI, e.g.
+    /// `cargo xtask e2e -- -t "not @expected-failure-EAI-*"`.
+    E2e {
+        /// Arguments forwarded verbatim to the cucumber test binary (tag filters
+        /// `-t`, name filters `-n`, `--fail-fast`, etc.).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Lint PowerShell scripts with PSScriptAnalyzer (parse errors are reported
     /// too, so this also covers syntax).
     PowershellLint {
@@ -160,6 +170,7 @@ fn run() -> Result<()> {
                 verify_commits::run(base, require_verified)?;
             }
         }
+        Command::E2e { args } => e2e::run(&args)?,
         Command::PowershellLint { shell, files } => powershell::run(shell, files)?,
     }
     Ok(())
