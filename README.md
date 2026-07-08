@@ -32,43 +32,112 @@ vLLM.
 > guarantee of stability. APIs, commands, and behavior may change without
 > notice. Intended for experimentation and early feedback only.
 
-> Only nightly builds are available at this time.
-
 ## Installation
 
-This repository is currently private. Install the [GitHub CLI](https://cli.github.com/) and authenticate once before downloading:
+The installer downloads a prebuilt bundle, verifies its SHA-256 checksum,
+installs the `rocm` and `rocmd` binaries into `~/.local/bin`, and adds that
+directory to your shell `PATH`. Rerun it any time to upgrade.
+
+> [!NOTE]
+> This repository is currently private, so the `curl | sh` one-liner only works
+> once the repo and its release assets are public. Until then, use the
+> **GitHub CLI fallback** in each section, which downloads through your
+> authenticated session.
+
+### Linux / WSL (x86_64)
+
+Only nightly builds are published today, so pass the `nightly` channel:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.sh | sh -s -- nightly
+```
+
+Once a stable release exists, omit the argument to track the default `release`
+channel instead:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.sh | sh
+```
+
+<details>
+<summary>Fallback while the repo is private (GitHub CLI)</summary>
+
+Install the [GitHub CLI](https://cli.github.com/), authenticate once, then pull
+the release bundle through your authenticated session and install both binaries:
 
 ```bash
 gh auth login
-```
-
-**Linux / WSL x86_64**:
-
-```bash
+gh release download nightly --repo ROCm/rocm-cli \
+  --pattern 'rocm-cli-nightly-linux-amd64.tar.gz' --output /tmp/rocm-cli.tar.gz --clobber
+tar -xzf /tmp/rocm-cli.tar.gz -C /tmp
 mkdir -p ~/.local/bin
-gh release download nightly --repo ROCm/rocm-cli --pattern rocm --output ~/.local/bin/rocm
-chmod +x ~/.local/bin/rocm
+find /tmp -path '*/bin/rocm*' -type f -exec install -m 0755 {} ~/.local/bin/ \;
 ```
 
-If `~/.local/bin` is not already on your `PATH`, add it (and persist across
-sessions):
+If `~/.local/bin` is not already on your `PATH`, add it (and persist it):
 
 ```bash
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 source ~/.bashrc
 ```
+</details>
 
-Direct link: <https://github.com/ROCm/rocm-cli/releases/download/nightly/rocm>
-
-**Windows x86_64** (PowerShell):
+### Windows (x86_64, PowerShell)
 
 ```powershell
-gh release download nightly --repo ROCm/rocm-cli --pattern rocm.exe --output "$env:LOCALAPPDATA\Microsoft\WindowsApps\rocm.exe"
+$env:ROCM_CLI_CHANNEL = "nightly"
+irm https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.ps1 | iex
 ```
 
-Direct link: <https://github.com/ROCm/rocm-cli/releases/download/nightly/rocm.exe>
+Drop the `ROCM_CLI_CHANNEL` line to track the default `release` channel once a
+stable release is published.
 
-Rerun the same command to upgrade to the latest nightly.
+<details>
+<summary>Fallback while the repo is private (GitHub CLI)</summary>
+
+```powershell
+gh auth login
+gh release download nightly --repo ROCm/rocm-cli `
+  --pattern "rocm-cli-nightly-windows-amd64.zip" --output "$env:TEMP\rocm-cli.zip" --clobber
+Expand-Archive "$env:TEMP\rocm-cli.zip" "$env:TEMP\rocm-cli" -Force
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.local\bin" | Out-Null
+Get-ChildItem "$env:TEMP\rocm-cli" -Recurse -Filter "rocm*.exe" |
+  Copy-Item -Destination "$env:USERPROFILE\.local\bin"
+```
+
+Add `%USERPROFILE%\.local\bin` to your user `PATH` if it is not already there.
+</details>
+
+## Build from source
+
+Building requires [Rust](https://rustup.rs/); the pinned toolchain in
+`rust-toolchain.toml` (currently 1.96.0) installs automatically via `rustup`.
+
+```bash
+git clone https://github.com/ROCm/rocm-cli
+cd rocm-cli
+cargo build --release
+```
+
+This produces the two binaries under `target/release/`:
+
+- `rocm` — the CLI and interactive interfaces
+- `rocmd` — the background telemetry daemon used by the dashboard
+
+Run without installing:
+
+```bash
+cargo run --release --bin rocm -- examine
+```
+
+Or copy the release binaries onto your `PATH`:
+
+```bash
+install -m 0755 target/release/rocm target/release/rocmd ~/.local/bin/
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development setup, test
+commands, and commit-signing requirements.
 
 ## First run
 
@@ -76,14 +145,47 @@ Rerun the same command to upgrade to the latest nightly.
 rocm
 ```
 
-Opens the interactive TUI. On first launch, if no ROCm installation is
-detected, it walks through setup: choose an install folder and let rocm-cli
-download and configure ROCm. If ROCm is already installed, the TUI opens
-directly to the dashboard showing live GPU utilization, active model servers,
-and a chat tab.
+With no arguments on an interactive terminal, `rocm` opens the **launcher** — a
+small front-door menu that gets you to the common tasks:
 
-Press `q` to exit the TUI. Use Tab to switch between the Overview, Instances,
-and Chat tabs.
+- **Set up this system** — install or update ROCm
+- **Serve a model** — run a model on your GPU
+- **Diagnose & fix** — check GPU, driver, and ROCm
+- **Chat** — talk to a local or API-backed model
+- **Open full dashboard →** — escalate into the live dashboard (`rocm dash`)
+
+Pick a row with the arrow keys and `Enter`; press `q` to quit. On a
+non-interactive terminal (or piped output), `rocm` prints a one-shot status
+summary instead of opening the launcher.
+
+## Interactive interfaces
+
+`rocm` ships two terminal UIs built on [ratatui](https://ratatui.rs/):
+
+### The launcher (`rocm`)
+
+The lightweight hub described above. It runs the guided **Set up**, **Serve**,
+**Diagnose**, and **Chat** flows in place, and hands off to the full dashboard
+when you need live instruments. This is the default surface for everyday use;
+the legacy full-screen setup assistant has been retired.
+
+### The dashboard (`rocm dash`)
+
+The full-screen telemetry dashboard — every instrument and action on one screen.
+It auto-starts an embedded `rocmd` daemon when none is running, then presents
+five tabs (switch with `Tab`/`Shift+Tab` or number keys `1`–`5`):
+
+| Tab | What it shows |
+|---|---|
+| **Home** | At-a-glance status: GPU, active runtime, running servers |
+| **ROCm** | Guided ROCm/runtime actions with inline details |
+| **Serving** | Start, inspect, and manage model servers |
+| **Observe** | Live GPU utilization, instances, and benchmark telemetry |
+| **Chat** | Assistant chat backed by a local server or configured provider |
+
+Live mode reads telemetry over a Unix domain socket, so it requires Linux or
+WSL. Use `rocm dash --demo` for a synthetic session that runs anywhere without a
+GPU or daemon.
 
 ## Getting started
 
@@ -111,7 +213,7 @@ requirements.
 
 | Command | Description |
 |---|---|
-| `rocm` | Open the TUI (runs setup on first launch) |
+| `rocm` | Open the launcher menu (setup, serve, diagnose, chat, dashboard) |
 | `rocm examine` | Check GPU, ROCm install, engines, and managed folders |
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
 | `rocm install driver` | Install the AMD kernel driver on Linux |
@@ -238,8 +340,10 @@ rocm services restart <service-id> [--yes]
 rocm dash [--demo] [--replay <file>]
 ```
 
-Full-screen TUI with GPU utilization graphs, active serving instances,
-benchmark results, and a chat tab backed by any configured provider.
+Full-screen TUI with Home, ROCm, Serving, Observe, and Chat tabs — GPU
+utilization graphs, active serving instances, benchmark results, guided actions,
+and a chat tab backed by any configured provider. See
+[Interactive interfaces](#interactive-interfaces) for the tab breakdown.
 
 - `--demo` runs a deterministic synthetic session with no GPU or daemon needed,
   works on all platforms.
