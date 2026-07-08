@@ -4809,6 +4809,8 @@ pub struct ModelRecipeRecord {
     pub engine_recipes: Vec<ModelRecipeEngineRecord>,
     #[serde(default)]
     pub manual_alternatives: Vec<String>,
+    #[serde(default)]
+    pub featured: bool,
     pub chat_template_mode: String,
     pub preferred_engines: Vec<String>,
     pub warnings: Vec<String>,
@@ -4826,18 +4828,30 @@ impl ModelRecipeRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ModelCatalogPlatform {
+    pub label: String,
+    pub engines: Vec<String>,
+    #[serde(default)]
+    pub gfx_families: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ModelRecipeIndexDocument {
     pub schema_version: u32,
     #[serde(default)]
     pub source: Option<String>,
     #[serde(default)]
     pub generated_at_unix_ms: Option<u128>,
-    pub recipes: Vec<ModelRecipeRecord>,
+    #[serde(default)]
+    pub platforms: Vec<ModelCatalogPlatform>,
+
+            recipes: Vec<ModelRecipeRecord>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ModelRecipeRegistry {
     pub recipes: Vec<ModelRecipeRecord>,
+    pub platforms: Vec<ModelCatalogPlatform>,
     pub source: ModelRecipeRegistrySource,
 }
 
@@ -4905,8 +4919,10 @@ impl ModelRecipeIndexDocument {
 }
 
 pub fn builtin_model_recipe_registry() -> ModelRecipeRegistry {
+    let doc = builtin_model_catalog_document();
     ModelRecipeRegistry {
-        recipes: builtin_model_recipes(),
+        recipes: doc.recipes.clone(),
+        platforms: doc.platforms.clone(),
         source: ModelRecipeRegistrySource::BuiltIn,
     }
 }
@@ -4929,8 +4945,14 @@ pub fn load_model_recipe_registry() -> Result<ModelRecipeRegistry> {
             "signed model recipe index requires ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH",
         )?;
     let document = load_signed_model_recipe_index(&index_path, &signature_path, &public_key_path)?;
+    let platforms = if document.platforms.is_empty() {
+        builtin_model_catalog_document().platforms.clone()
+    } else {
+        document.platforms
+    };
     Ok(ModelRecipeRegistry {
         recipes: document.recipes,
+        platforms,
         source: ModelRecipeRegistrySource::SignedIndex {
             index_path,
             signature_path,
@@ -5343,7 +5365,7 @@ pub fn builtin_model_recipes() -> Vec<ModelRecipeRecord> {
 /// The curated fallback catalog shipped inside the binary. It is authored as JSON
 /// (`model_catalog.json`) using the same schema as an external signed recipe
 /// index, so the offline default and hosted indexes share one format. Parsed once
-/// and cached; a malformed catalog is a build-time bug guarded by a unit test.
+/// and cached; a malformed catalog is a test-time bug guarded by a unit test.
 fn builtin_model_catalog_document() -> &'static ModelRecipeIndexDocument {
     static CATALOG: std::sync::OnceLock<ModelRecipeIndexDocument> = std::sync::OnceLock::new();
     CATALOG.get_or_init(|| {
@@ -5363,47 +5385,48 @@ pub fn resolve_builtin_model_recipe(model_ref: &str) -> Option<ModelRecipeRecord
         .find(|recipe| recipe.matches_ref(model_ref))
 }
 
-/// Ordered hardware groupings for the curated `rocm model` catalog. `rocm model`
-/// lists visible recipes under these headings in this order, skipping empty ones.
-pub const MODEL_CATALOG_PLATFORMS: &[&str] =
-    &["Strix Halo (Lemonade / llama.cpp)", "MI300X (vLLM)"];
-
-/// The hardware target a recipe is curated for.
-///
-/// Derived from its primary preferred engine; returns one of
-/// [`MODEL_CATALOG_PLATFORMS`]. Serving is limited to Lemonade and vLLM, so
-/// Lemonade/llama.cpp recipes map to Strix Halo and everything else (vLLM) maps
-/// to MI300X. Works for any registry (built-in fallback or a signed index).
-pub fn model_recipe_target_platform(recipe: &ModelRecipeRecord) -> &'static str {
-    match recipe
-        .preferred_engines
-        .first()
-        .map(|engine| engine.trim().to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("lemonade" | "llama.cpp" | "llamacpp") => MODEL_CATALOG_PLATFORMS[0],
-        _ => MODEL_CATALOG_PLATFORMS[1],
-    }
+/// Returns the ordered platform definitions from the registry.
+pub fn model_catalog_platforms(registry: &ModelRecipeRegistry) -> Vec<ModelCatalogPlatform> {
+    registry.platforms.clone()
 }
 
-/// Whether a recipe is a smoke/test-only path hidden from the curated catalog.
-///
-/// Hidden recipes stay fully resolvable for `rocm serve` and the crate's smoke
-/// tests; only the user-facing `rocm model` list omits them.
-pub fn model_recipe_featured(recipe: &ModelRecipeRecord) -> bool {
-    // The curated short list `rocm model` shows for the built-in catalog: current
-    // popular open-weight models, each sized to a quant that fits its target GPU.
-    // Everything else in the built-in list (the default assistant, smoke/test
-    // paths, superseded models) stays resolvable for `rocm serve` but is hidden.
-    const FEATURED_MODEL_IDS: &[&str] = &[
-        "unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M",
-        "unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M",
-        "Qwen/Qwen3.6-27B",
-        "google/gemma-4-31B-it",
-    ];
-    FEATURED_MODEL_IDS
+/// The label of the hardware platform a recipe targets, derived from its first
+/// preferred engine matched against the catalog's platform definitions.
+pub fn model_recipe_target_platform_label(
+    recipe: &ModelRecipeRecord,
+    platforms: &[ModelCatalogPlatform],
+) -> String {
+    let engine = recipe
+        .preferred_engines
+        .first()
+        .map(|e| e.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    platforms
         .iter()
-        .any(|id| id.eq_ignore_ascii_case(&recipe.canonical_model_id))
+        .find(|p| {
+            p.engines
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case(&engine))
+        })
+        .map(|p| p.label.clone())
+        .unwrap_or_else(|| engine.clone())
+}
+
+/// Whether the given normalized TheRock family matches a platform's gfx targets.
+pub fn platform_matches_gfx_family(platform: &ModelCatalogPlatform, gfx_family: &str) -> bool {
+    platform
+        .gfx_families
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case(gfx_family))
+}
+
+/// Whether a recipe appears in the curated `rocm model` short list.
+///
+/// Driven by the `featured` field in the catalog JSON. Hidden recipes stay fully
+/// resolvable for `rocm serve` and the crate's smoke tests; only the user-facing
+/// `rocm model` list omits them.
+pub fn model_recipe_featured(recipe: &ModelRecipeRecord) -> bool {
+    recipe.featured
 }
 
 pub fn normalize_model_ref(model_ref: &str) -> String {
@@ -6878,17 +6901,19 @@ Class Name:                Display
 
     #[test]
     fn model_recipe_target_platform_groups_by_engine() {
+        let registry = builtin_model_recipe_registry();
+        let platforms = model_catalog_platforms(&registry);
         // The (hidden) built-in assistant is a Lemonade recipe → Strix Halo.
         let strix = resolve_builtin_model_recipe("qwen").expect("qwen assistant");
         assert_eq!(
-            model_recipe_target_platform(&strix),
+            model_recipe_target_platform_label(&strix, &platforms),
             "Strix Halo (Lemonade / llama.cpp)"
         );
         let mi300x = resolve_builtin_model_recipe("qwen3.6-27b").expect("qwen3.6-27b");
-        assert_eq!(model_recipe_target_platform(&mi300x), "MI300X (vLLM)");
+        assert_eq!(model_recipe_target_platform_label(&mi300x, &platforms), "MI300X (vLLM)");
         // Serving is limited to Lemonade and vLLM, so a vLLM recipe lands on MI300X.
         let llama = resolve_builtin_model_recipe("llama-3.2-3b-instruct").expect("llama");
-        assert_eq!(model_recipe_target_platform(&llama), "MI300X (vLLM)");
+        assert_eq!(model_recipe_target_platform_label(&llama, &platforms), "MI300X (vLLM)");
     }
 
     #[test]
@@ -6989,6 +7014,7 @@ Class Name:                Display
             schema_version: 1,
             source: Some("fixture".to_owned()),
             generated_at_unix_ms: Some(123),
+            platforms: Vec::new(),
             recipes: vec![recipe],
         };
 
@@ -7039,6 +7065,7 @@ Class Name:                Display
             schema_version: 1,
             source: Some("fixture".to_owned()),
             generated_at_unix_ms: Some(123),
+            platforms: Vec::new(),
             recipes: vec![recipe],
         }
         .validate()
@@ -7064,6 +7091,7 @@ Class Name:                Display
             schema_version: 1,
             source: Some("fixture".to_owned()),
             generated_at_unix_ms: Some(123),
+            platforms: Vec::new(),
             recipes: vec![recipe],
         }
         .validate()
@@ -7085,6 +7113,7 @@ Class Name:                Display
             schema_version: 1,
             source: Some("fixture".to_owned()),
             generated_at_unix_ms: Some(123),
+            platforms: Vec::new(),
             recipes: vec![recipe],
         }
         .validate()
@@ -7115,6 +7144,7 @@ Class Name:                Display
             schema_version: 1,
             source: Some("fixture".to_owned()),
             generated_at_unix_ms: Some(123),
+            platforms: Vec::new(),
             recipes: vec![recipe],
         }
         .validate()
@@ -7141,6 +7171,7 @@ Class Name:                Display
             schema_version: 1,
             source: Some("fixture".to_owned()),
             generated_at_unix_ms: Some(123),
+            platforms: Vec::new(),
             recipes: vec![recipe],
         }
         .validate()
@@ -7226,6 +7257,7 @@ Class Name:                Display
             schema_version: 1,
             source: None,
             generated_at_unix_ms: None,
+            platforms: Vec::new(),
             recipes: vec![
                 sample_recipe_with_artifact("Qwen/Test-1B", &["shared-alias"]),
                 sample_recipe_with_artifact("Qwen/Other-1B", &["shared-alias"]),
@@ -7247,6 +7279,7 @@ Class Name:                Display
             schema_version: 1,
             source: Some("fixture".to_owned()),
             generated_at_unix_ms: Some(123),
+            platforms: Vec::new(),
             recipes: vec![sample_recipe_with_artifact("Qwen/Test-1B", &["test-qwen"])],
         };
         fs::create_dir_all(&root)?;
@@ -7281,6 +7314,7 @@ Class Name:                Display
             schema_version: 1,
             source: Some("fixture".to_owned()),
             generated_at_unix_ms: Some(123),
+            platforms: Vec::new(),
             recipes: vec![sample_recipe_with_artifact("Qwen/Test-1B", &["test-qwen"])],
         };
 
@@ -7494,6 +7528,7 @@ Class Name:                Display
             }],
             engine_recipes: Vec::new(),
             manual_alternatives: Vec::new(),
+            featured: false,
             chat_template_mode: "auto".to_owned(),
             preferred_engines: vec!["vllm".to_owned()],
             warnings: Vec::new(),

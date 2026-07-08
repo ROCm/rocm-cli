@@ -24,17 +24,18 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use rocm_core::{
     AppPaths, AuditEventRecord, AutomationEventRecord, AutomationProposalRecord,
     AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot,
-    DEFAULT_LOCAL_HOST, ExamineSummary, MODEL_CATALOG_PLATFORMS, ManagedServiceRecord,
+    DEFAULT_LOCAL_HOST, ExamineSummary, ManagedServiceRecord, ModelCatalogPlatform,
     ModelRecipeRecord, ModelRecipeRegistry, ModelRecipeRegistrySource, PERMISSIONS_MODE_ASK,
     PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF,
     WatcherMode, append_audit_event, builtin_model_recipes, builtin_watcher, builtin_watchers,
-    connect_tcp_stream, daemon_binary_path, default_engine_for_platform,
+    connect_tcp_stream, daemon_binary_path, default_engine_for_platform, detect_host_gfx_target,
     default_interactive_shell_program, detect_host_gpu_summary, engine_binary_path,
     engine_plugin_dirs, format_host_port, format_http_base_url, generate_service_id,
     interactive_terminal, load_model_recipe_registry, load_recent_audit_events,
     load_recent_automation_events, load_recent_automation_proposals, managed_pip_cache_dir,
-    managed_service_endpoint_model_ready, model_artifact_cache_status, model_recipe_featured,
-    model_recipe_target_platform, preferred_serve_engine_for_host_gpu_summary,
+    managed_service_endpoint_model_ready, model_artifact_cache_status, model_catalog_platforms,
+    model_recipe_featured, model_recipe_target_platform_label, normalize_therock_family,
+    platform_matches_gfx_family, preferred_serve_engine_for_host_gpu_summary,
     prepend_runtime_path, process_is_running, read_tcp_stream_to_string,
     resolve_builtin_model_recipe, resolve_model_recipe, runtime_install_root_is_protected,
     runtime_path_is_same_or_inside, runtime_python_activation_hint, runtime_python_env_bin_dir,
@@ -10695,15 +10696,30 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
         .iter()
         .filter(|recipe| show_all || model_recipe_featured(recipe))
         .collect::<Vec<_>>();
-    for platform in MODEL_CATALOG_PLATFORMS {
+    let platforms = model_catalog_platforms(&registry);
+    let host_gfx_family = detect_host_gfx_target()
+        .as_deref()
+        .and_then(normalize_therock_family);
+    for platform in &platforms {
         let mut group = visible
             .iter()
-            .filter(|recipe| model_recipe_target_platform(recipe) == *platform)
+            .filter(|recipe| {
+                model_recipe_target_platform_label(recipe, &platforms) == platform.label
+            })
             .peekable();
         if group.peek().is_none() {
             continue;
         }
-        let _ = writeln!(output, "\n{platform}");
+        let your_gpu = host_gfx_family
+            .as_deref()
+            .map(|family| platform_matches_gfx_family(platform, family))
+            .unwrap_or(false);
+        let heading = if your_gpu {
+            format!("{} \u{2190} your GPU", platform.label)
+        } else {
+            platform.label.clone()
+        };
+        let _ = writeln!(output, "\n{heading}");
         for recipe in group {
             // Show the canonical Hugging Face id (the reliable serve target) and
             // the quant that fits this hardware. Append a fit verdict only when the
@@ -10724,13 +10740,17 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
             let _ = writeln!(output, "  {}  {}{}", recipe.canonical_model_id, detail, fit);
         }
     }
-    let _ = writeln!(
-        output,
-        "\nThese are recommendations — you can serve any compatible Hugging Face model:\n  \
-         rocm serve <owner/repo>          # vLLM, e.g. Qwen/Qwen3.6-27B\n  \
-         rocm serve <owner/repo>:<quant>  # Lemonade GGUF, e.g. unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M\n\
-         \nUse `rocm model --verbose` for details."
-    );
+    if matches!(registry.source, ModelRecipeRegistrySource::BuiltIn) {
+        let _ = writeln!(
+            output,
+            "\nThese are recommendations — you can serve any compatible Hugging Face model:\n  \
+             rocm serve <owner/repo>          # vLLM, e.g. Qwen/Qwen3.6-27B\n  \
+             rocm serve <owner/repo>:<quant>  # Lemonade GGUF, e.g. unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M\n\
+             \nUse `rocm model --verbose` for details."
+        );
+    } else {
+        let _ = writeln!(output, "\nUse `rocm model --verbose` for details.");
+    }
     output
 }
 
@@ -10805,10 +10825,11 @@ pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
                 "      catalog: hidden (resolvable via rocm serve, not in the curated list)"
             );
         } else {
+            let platforms = model_catalog_platforms(&registry);
             let _ = writeln!(
                 output,
                 "      catalog: {}",
-                model_recipe_target_platform(recipe)
+                model_recipe_target_platform_label(recipe, &platforms)
             );
         }
         append_model_recipe_metadata_lines(&mut output, recipe, paths);
@@ -21825,6 +21846,7 @@ VERSION_ID="41"
         // Default built-in list: no implementation jargon, just the action.
         let builtin = ModelRecipeRegistry {
             recipes: Vec::new(),
+            platforms: Vec::new(),
             source: ModelRecipeRegistrySource::BuiltIn,
         };
         let header = model_catalog_header(&builtin);
@@ -21838,6 +21860,7 @@ VERSION_ID="41"
         // A configured index is the only case worth advertising provenance for.
         let configured = ModelRecipeRegistry {
             recipes: Vec::new(),
+            platforms: Vec::new(),
             source: ModelRecipeRegistrySource::SignedIndex {
                 index_path: PathBuf::from("/etc/rocm/recipes.json"),
                 signature_path: PathBuf::from("/etc/rocm/recipes.json.sig"),

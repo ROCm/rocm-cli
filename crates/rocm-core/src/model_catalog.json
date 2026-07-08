@@ -2,6 +2,18 @@
   "schema_version": 1,
   "source": "built-in",
   "generated_at_unix_ms": null,
+  "platforms": [
+    {
+      "label": "Strix Halo (Lemonade / llama.cpp)",
+      "engines": ["lemonade", "llama.cpp", "llamacpp"],
+      "gfx_families": ["gfx120X-all"]
+    },
+    {
+      "label": "MI300X (vLLM)",
+      "engines": ["vllm"],
+      "gfx_families": ["gfx906", "gfx908", "gfx90a", "gfx90a-all"]
+    }
+  ],
   "recipes": [
     {
       "canonical_model_id": "Qwen/Qwen2.5-1.5B-Instruct",
@@ -322,9 +334,9 @@
       "artifacts": [],
       "engine_recipes": [],
       "manual_alternatives": [
-        "qwen3-32b-fp8",
-        "gpt-oss-120b"
+        "qwen3-32b-fp8"
       ],
+      "featured": true,
       "chat_template_mode": "auto",
       "preferred_engines": [
         "vllm"
@@ -354,9 +366,9 @@
       "artifacts": [],
       "engine_recipes": [],
       "manual_alternatives": [
-        "qwen3-32b-fp8",
-        "gpt-oss-120b"
+        "qwen3-32b-fp8"
       ],
+      "featured": true,
       "chat_template_mode": "auto",
       "preferred_engines": [
         "vllm"
@@ -390,6 +402,7 @@
       "manual_alternatives": [
         "qwen3.6-27b"
       ],
+      "featured": true,
       "chat_template_mode": "auto",
       "preferred_engines": [
         "lemonade"
@@ -422,6 +435,7 @@
       "manual_alternatives": [
         "qwen3.6"
       ],
+      "featured": true,
       "chat_template_mode": "auto",
       "preferred_engines": [
         "lemonade"
