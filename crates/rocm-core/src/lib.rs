@@ -4845,7 +4845,7 @@ pub struct ModelRecipeIndexDocument {
     #[serde(default)]
     pub platforms: Vec<ModelCatalogPlatform>,
 
-            recipes: Vec<ModelRecipeRecord>,
+    recipes: Vec<ModelRecipeRecord>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -5403,13 +5403,8 @@ pub fn model_recipe_target_platform_label(
         .unwrap_or_default();
     platforms
         .iter()
-        .find(|p| {
-            p.engines
-                .iter()
-                .any(|e| e.eq_ignore_ascii_case(&engine))
-        })
-        .map(|p| p.label.clone())
-        .unwrap_or_else(|| engine.clone())
+        .find(|p| p.engines.iter().any(|e| e.eq_ignore_ascii_case(&engine)))
+        .map_or_else(|| engine.clone(), |p| p.label.clone())
 }
 
 /// Whether the given normalized TheRock family matches a platform's gfx targets.
@@ -5425,7 +5420,7 @@ pub fn platform_matches_gfx_family(platform: &ModelCatalogPlatform, gfx_family: 
 /// Driven by the `featured` field in the catalog JSON. Hidden recipes stay fully
 /// resolvable for `rocm serve` and the crate's smoke tests; only the user-facing
 /// `rocm model` list omits them.
-pub fn model_recipe_featured(recipe: &ModelRecipeRecord) -> bool {
+pub const fn model_recipe_featured(recipe: &ModelRecipeRecord) -> bool {
     recipe.featured
 }
 
@@ -6910,10 +6905,16 @@ Class Name:                Display
             "Strix Halo (Lemonade / llama.cpp)"
         );
         let mi300x = resolve_builtin_model_recipe("qwen3.6-27b").expect("qwen3.6-27b");
-        assert_eq!(model_recipe_target_platform_label(&mi300x, &platforms), "MI300X (vLLM)");
+        assert_eq!(
+            model_recipe_target_platform_label(&mi300x, &platforms),
+            "MI300X (vLLM)"
+        );
         // Serving is limited to Lemonade and vLLM, so a vLLM recipe lands on MI300X.
         let llama = resolve_builtin_model_recipe("llama-3.2-3b-instruct").expect("llama");
-        assert_eq!(model_recipe_target_platform_label(&llama, &platforms), "MI300X (vLLM)");
+        assert_eq!(
+            model_recipe_target_platform_label(&llama, &platforms),
+            "MI300X (vLLM)"
+        );
     }
 
     #[test]
