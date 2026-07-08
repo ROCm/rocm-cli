@@ -201,6 +201,7 @@ pub fn resolved_args(
         // The real executor is injected in `run_async` for a live dash; None
         // here keeps demo/replay/mock behaving exactly as today.
         tool_executor: None,
+        bench_results_dir: config.dashboard.daemon.bench_results_dir.clone(),
     }
 }
 
@@ -319,21 +320,36 @@ pub fn run_chat(chat_mock: bool) -> Result<()> {
     rt.block_on(run_async(config, paths, args, None, chat_mock))
 }
 
+/// CLI arguments for `rocm bench load`.
+pub struct BenchLoadArgs {
+    pub endpoint: String,
+    pub model: Option<String>,
+    pub concurrency: Vec<u32>,
+    pub isl: u32,
+    pub osl: u32,
+    pub requests: u32,
+    pub out: Option<std::path::PathBuf>,
+    pub auto_ramp: bool,
+}
+
 /// Entry point for `rocm bench load`.
 ///
 /// Runs a concurrency sweep against a local http:// endpoint and appends one
 /// aggregate CSV row per concurrency level. Output goes to a self-labeled file
 /// in `~/.rocm/bench/` unless `--out` is specified explicitly.
-pub fn run_bench(
-    endpoint: String,
-    model: Option<String>,
-    concurrency: Vec<u32>,
-    isl: u32,
-    osl: u32,
-    requests: u32,
-    out: Option<std::path::PathBuf>,
-) -> Result<()> {
-    use rocm_dash_daemon::bench_load::{LoadSpec, run_and_append_csv};
+pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
+    use rocm_dash_daemon::bench_load::{LoadSpec, run_and_append_csv, run_auto_ramp};
+
+    let BenchLoadArgs {
+        endpoint,
+        model,
+        concurrency,
+        isl,
+        osl,
+        requests,
+        out,
+        auto_ramp,
+    } = a;
 
     // Reject https:// — no TLS backend compiled in for the load generator.
     // Compare on the lowercased scheme so HTTPS:// is also caught.
@@ -382,19 +398,29 @@ pub fn run_bench(
     };
 
     println!("mode: raw serving throughput (synthetic prompts) — not agent-workload.");
-    println!(
-        "endpoint={endpoint} model={model} concurrency={} isl={isl} osl={osl} requests={requests}",
-        concurrency
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(",")
-    );
+    if auto_ramp {
+        println!(
+            "endpoint={endpoint} model={model} mode=auto-ramp isl={isl} osl={osl} requests={requests}"
+        );
+    } else {
+        println!(
+            "endpoint={endpoint} model={model} concurrency={} isl={isl} osl={osl} requests={requests}",
+            concurrency
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
 
     let rt = build_dashboard_runtime()?;
-    let rows = rt
-        .block_on(run_and_append_csv(&spec, &concurrency, &csv_path))
-        .context("running bench load sweep")?;
+    let rows = if auto_ramp {
+        rt.block_on(run_auto_ramp(&spec, &csv_path))
+            .context("running bench auto-ramp")?
+    } else {
+        rt.block_on(run_and_append_csv(&spec, &concurrency, &csv_path))
+            .context("running bench load sweep")?
+    };
 
     for row in &rows {
         let conc = row

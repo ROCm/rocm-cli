@@ -25,7 +25,7 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     if state.bench_rows.is_empty() {
         let inner = panel::bento(f, area, Some("Bench"), BoxRole::Neutral, false, theme);
         let p = Paragraph::new(Line::from(Span::styled(
-            "no rows · run `rocm bench load --endpoint <url>` or start the daemon with --bench-csv <path>",
+            "no rows · run `rocm bench load --endpoint <url>` or start the daemon with --bench-csv <path> · press b to run a sweep",
             Style::default().fg(theme.muted),
         )));
         f.render_widget(p, inner);
@@ -601,6 +601,8 @@ fn build_detail_lines(row: &BenchmarkRow, theme: &Theme) -> Vec<Line<'static>> {
         fmt_opt_u32_si(row.max_waiting_reqs),
         theme,
     ));
+    lines.push(kv_line("ttft_ms", fmt_opt(&row.ttft_ms), theme));
+    lines.push(kv_line("tpot_ms", fmt_opt(&row.tpot_ms), theme));
     lines.push(kv_line("out_chars", fmt_opt_u64_si(row.out_chars), theme));
     lines.push(Line::raw(""));
 

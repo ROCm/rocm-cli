@@ -5,6 +5,7 @@
 pub mod approval;
 pub mod automations_manager;
 pub mod bench;
+pub mod bench_run;
 pub mod command_screen;
 pub mod config_manager;
 pub mod core_bars;
@@ -264,6 +265,8 @@ fn draw_active_manager(f: &mut Frame, rect: Rect, state: &AppState, theme: &Them
         command_screen::draw_command_screen(f, rect, c, &state.jobs, theme);
     } else if let Some(cm) = &state.config_manager {
         config_manager::draw_config_manager(f, rect, cm, &state.jobs, theme);
+    } else if let Some(br) = &state.bench_run {
+        bench_run::draw_bench_run(f, rect, br, theme);
     }
 }
 
@@ -426,6 +429,8 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
         segs.push(Seg::Sep(" logs  "));
         segs.push(Seg::Key("s", Some(KeyAction::OpenServices)));
         segs.push(Seg::Sep(" services  "));
+        segs.push(Seg::Key("b", Some(KeyAction::OpenBenchRun)));
+        segs.push(Seg::Sep(" bench  "));
     }
     if state.replay.is_some() {
         segs.push(Seg::Key("Space", Some(KeyAction::ReplayTogglePause)));

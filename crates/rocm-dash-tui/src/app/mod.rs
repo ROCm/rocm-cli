@@ -113,6 +113,11 @@ pub struct ResolvedArgs {
     /// Bin-injected tool-executor seam; None for demo/replay/mock — dash behaves
     /// as today. Stored here (Phase 2 plumbing); Phase 3 will use it.
     pub tool_executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
+    /// Daemon-tailed bench CSV path (`config.dashboard.daemon.bench_results_dir`).
+    ///
+    /// When `Some`, the bench-run form defaults `--out` to this path so appended
+    /// rows appear live in the bench tab. Adapted by the bin (owns `rocm-core`).
+    pub bench_results_dir: Option<std::path::PathBuf>,
 }
 
 type Tui = Terminal<CrosstermBackend<io::Stdout>>;
@@ -542,6 +547,8 @@ pub struct AppState {
     pub command_screen: Option<crate::ui::command_screen::CommandScreenState>,
     /// Config & provider manager overlay (Phase 3 Wave 3). `None` = closed.
     pub config_manager: Option<crate::ui::config_manager::ConfigManagerState>,
+    /// Bench-run form overlay. `None` = closed.
+    pub bench_run: Option<crate::ui::bench_run::BenchRunState>,
     /// Built-in model recipes for the serve wizard's picker. Set from
     /// `ResolvedArgs` in the event loop; empty by default.
     pub model_recipes: Vec<crate::ui::model_picker::ModelRecipeSummary>,
@@ -554,6 +561,11 @@ pub struct AppState {
     /// Bin-injected tool-executor seam. Set from `ResolvedArgs` in the event
     /// loop; `None` for demo/replay/mock and by default.
     pub tool_executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
+    /// Daemon-tailed bench CSV path from the bin config.
+    ///
+    /// Forwarded from [`ResolvedArgs::bench_results_dir`] so the bench-run form
+    /// can default `--out` to the live-tailed file. `None` when not configured.
+    pub bench_results_dir: Option<std::path::PathBuf>,
     /// Set by a `/quit` (or `/exit`) slash command; the event loop breaks on it.
     pub(crate) should_quit: bool,
     /// Edge: a pending executor-backed read-only slash command. Raised by
@@ -648,10 +660,12 @@ impl AppState {
             automations_manager: None,
             command_screen: None,
             config_manager: None,
+            bench_run: None,
             model_recipes: Vec::new(),
             runtimes: Vec::new(),
             automations: Vec::new(),
             tool_executor: None,
+            bench_results_dir: None,
             should_quit: false,
             slash_tool: None,
             plan_request: None,
@@ -677,6 +691,7 @@ impl AppState {
         self.automations_manager = None;
         self.command_screen = None;
         self.config_manager = None;
+        self.bench_run = None;
         self.approval = None;
         // A fresh overlay starts its console at the top.
         self.console_scroll = 0;
@@ -806,6 +821,7 @@ impl AppState {
             || self.automations_manager.is_some()
             || self.command_screen.is_some()
             || self.config_manager.is_some()
+            || self.bench_run.is_some()
     }
 
     /// Focused-host exit gate: `true` when a `focus` is active AND its single
@@ -883,6 +899,7 @@ impl AppState {
                 .logs_view
                 .as_ref()
                 .is_none_or(|m| m.active_job.is_none())
+        // bench_run is always at root when Some (no nested sub-popup or job).
     }
 
     /// Whether an `Esc` keypress should back out of an inline manager: true on
@@ -1478,6 +1495,8 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     // Tool-executor seam (Phase 2 plumbing), injected by the bin; None for
     // demo/replay/mock. Phase 3 will use it.
     state.tool_executor = args.tool_executor.clone();
+    // Daemon-tailed bench CSV path for the bench-run form's default --out.
+    state.bench_results_dir = args.bench_results_dir.clone();
     // Focused host: open exactly the overlay for the requested flow (Examine
     // also auto-runs its read-only job). `Focus::Setup` opens the onboarding
     // overlay — the same wizard `rocm bootstrap setup` routes to.
@@ -1837,6 +1856,15 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                     Some(Ok(CtEvent::Key(k))) if state.config_manager.is_some() => {
                         let fx = crate::ui::config_manager::on_key(
                             &mut state.config_manager,
+                            &mut state.jobs,
+                            k,
+                        );
+                        crate::jobs::run_effects(fx, &job_tx);
+                    }
+                    // Bench-run form, when open, owns all keys.
+                    Some(Ok(CtEvent::Key(k))) if state.bench_run.is_some() => {
+                        let fx = crate::ui::bench_run::on_key(
+                            &mut state.bench_run,
                             &mut state.jobs,
                             k,
                         );
@@ -2264,6 +2292,13 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
             state.close_overlays();
             state.config_manager = Some(crate::ui::config_manager::ConfigManagerState::default());
         }
+        KeyAction::OpenBenchRun => {
+            let bench_csv = state.bench_results_dir.clone();
+            state.close_overlays();
+            state.bench_run = Some(crate::ui::bench_run::BenchRunState::new(
+                bench_csv.as_deref(),
+            ));
+        }
         KeyAction::OpenThemePicker => state.open_theme_picker(),
         KeyAction::ApplyThemePick => state.apply_theme_pick(),
         KeyAction::OpenMenu => {
@@ -2592,6 +2627,8 @@ pub enum KeyAction {
     OpenConfig,
     /// Open the logs overlay (Phase 3 Wave 3).
     OpenLogs,
+    /// Open the bench-run form overlay.
+    OpenBenchRun,
 }
 
 fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) -> KeyAction {
@@ -2796,6 +2833,8 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         KeyCode::Char('i') if current == ActiveTab::Observe => KeyAction::OpenInstall,
         // Logs: browse recent ROCm CLI logs.
         KeyCode::Char('l') if current == ActiveTab::Observe => KeyAction::OpenLogs,
+        // Bench-run: launch a bench sweep from the TUI.
+        KeyCode::Char('b') if current == ActiveTab::Observe => KeyAction::OpenBenchRun,
         // Runtimes: list/activate/adopt/import ROCm runtimes.
         KeyCode::Char('r') if current == ActiveTab::Observe => KeyAction::OpenRuntimes,
         // Onboarding: first-run setup wizard (install / adopt).
@@ -3468,6 +3507,41 @@ mod tests {
         assert!(s.command_screen.is_some() && s.automations_manager.is_none());
         apply_action(&mut s, KeyAction::OpenConfig);
         assert!(s.config_manager.is_some() && s.command_screen.is_none());
+        // T13: OpenBenchRun joins the mutual-exclusion set.
+        apply_action(&mut s, KeyAction::OpenBenchRun);
+        assert!(s.bench_run.is_some() && s.config_manager.is_none());
+    }
+
+    // ---------- T13: bench_run overlay invariants ----------
+
+    #[test]
+    fn t13_bench_run_in_has_open_overlay() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        assert!(!s.has_open_overlay(), "no overlay initially");
+        s.bench_run = Some(crate::ui::bench_run::BenchRunState::new(None));
+        assert!(
+            s.has_open_overlay(),
+            "bench_run must be in has_open_overlay"
+        );
+    }
+
+    #[test]
+    fn t13_bench_run_cleared_by_close_overlays() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.bench_run = Some(crate::ui::bench_run::BenchRunState::new(None));
+        s.close_overlays();
+        assert!(s.bench_run.is_none(), "close_overlays must clear bench_run");
+    }
+
+    #[test]
+    fn t13_bench_run_at_root() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        assert!(s.active_overlay_at_root(), "nothing open → at root");
+        s.bench_run = Some(crate::ui::bench_run::BenchRunState::new(None));
+        assert!(
+            s.active_overlay_at_root(),
+            "bench_run (no sub-popup/job) is always at root"
+        );
     }
 
     #[test]
@@ -4548,6 +4622,7 @@ mod tests {
             runtimes: Vec::new(),
             automations: Vec::new(),
             tool_executor: None,
+            bench_results_dir: None,
         }
     }
 

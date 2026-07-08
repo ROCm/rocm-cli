@@ -458,6 +458,12 @@ enum BenchCommand {
         /// Output CSV file (default: ~/.rocm/bench/rocm-bench-<timestamp>.csv)
         #[arg(long, value_name = "FILE")]
         out: Option<PathBuf>,
+        /// Ramp concurrency automatically (1,2,4,8,16,32,64,128), stopping at saturation.
+        ///
+        /// Ignores --concurrency when set. Stops early when gen_tps plateaus
+        /// or the request queue backs up.
+        #[arg(long)]
+        auto_ramp: bool,
     },
 }
 
@@ -1611,7 +1617,17 @@ fn dispatch(cli: Cli) -> Result<()> {
                 osl,
                 requests,
                 out,
-            } => dash::run_bench(endpoint, model, concurrency, isl, osl, requests, out),
+                auto_ramp,
+            } => dash::run_bench(dash::BenchLoadArgs {
+                endpoint,
+                model,
+                concurrency,
+                isl,
+                osl,
+                requests,
+                out,
+                auto_ramp,
+            }),
         },
         Some(Command::Uninstall {
             yes,
