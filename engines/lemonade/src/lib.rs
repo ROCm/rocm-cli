@@ -530,16 +530,18 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
     if let Some(checkpoint) = parse_hf_checkpoint(&request.model_ref) {
         return serve_hf_checkpoint(&request, &runtime, &process_env, log_path, &checkpoint);
     }
-    if runtime_is_linux() && direct_llama_server_path(&runtime.manifest).is_file() {
+    if runtime_is_linux()
+        && let Some(server) = find_llama_server_binary(&runtime.manifest)
+    {
         ensure_direct_llama_model_available(&request, &runtime, &process_env, log_path)?;
-        let server = direct_llama_server_path(&runtime.manifest);
+        let backend = llama_server_backend_label(&server);
         return serve_direct_llama_server(
             &request,
             &runtime,
             &process_env,
             &server,
             log_path,
-            &anyhow!("using Lemonade packaged ROCm llama-server directly on Linux"),
+            &anyhow!("using Lemonade packaged {backend} llama-server directly on Linux"),
         );
     }
     let mut child = spawn_lemond(
@@ -587,8 +589,9 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
         && query_chat_smoke_endpoint(&request.host, request.port, &request.model_ref)
             .unwrap_or(false);
     if let Err(error) = load_result {
-        let direct_server = direct_llama_server_path(&runtime.manifest);
-        if runtime_is_linux() && direct_server.is_file() {
+        if runtime_is_linux()
+            && let Some(direct_server) = find_llama_server_binary(&runtime.manifest)
+        {
             let _ = terminate_pid(child.id(), true);
             let _ = child.wait();
             return serve_direct_llama_server(
@@ -611,8 +614,9 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
         let error = anyhow!(
             "Lemonade load completed but the endpoint did not report a {LLAMACPP_RECIPE}:{backend}-loaded model"
         );
-        let direct_server = direct_llama_server_path(&runtime.manifest);
-        if runtime_is_linux() && direct_server.is_file() {
+        if runtime_is_linux()
+            && let Some(direct_server) = find_llama_server_binary(&runtime.manifest)
+        {
             let _ = terminate_pid(child.id(), true);
             let _ = child.wait();
             return serve_direct_llama_server(
@@ -1860,15 +1864,6 @@ fn is_safe_hf_component(component: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-fn direct_llama_server_path(manifest: &LemonadeInstallManifest) -> PathBuf {
-    manifest
-        .runtime_dir
-        .join("bin")
-        .join("llamacpp")
-        .join("rocm-stable")
-        .join(platform_binary_name("llama-server"))
-}
-
 /// Packaged llama.cpp backends whose `llama-server` we can drive directly, best first.
 /// GPU backends only — `cpu` is intentionally excluded so the direct-serve path never
 /// silently serves on CPU under a GPU-required policy (AGENTS.md §6). An explicit
@@ -2793,6 +2788,37 @@ mod tests {
         // With only cpu present, nothing is returned (no silent CPU fallback).
         fs::remove_dir_all(llamacpp.join("vulkan")).unwrap();
         assert_eq!(find_llama_server_binary(&manifest), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn find_llama_server_binary_follows_backend_priority() {
+        let dir = scratch_dir("find-server-priority");
+        let runtime_dir = dir.join("runtime");
+        let llamacpp = runtime_dir.join("bin").join("llamacpp");
+        let server = platform_binary_name("llama-server");
+        let install = |backend: &str| {
+            let backend_dir = llamacpp.join(backend);
+            fs::create_dir_all(&backend_dir).unwrap();
+            fs::write(backend_dir.join(&server), b"x").unwrap();
+        };
+        let manifest = test_manifest(runtime_dir);
+
+        // Nightly-only host (the resilient case that replaced the hardcoded
+        // rocm-stable direct-serve path): the nightly backend is selected over vulkan.
+        install("rocm-nightly");
+        install("vulkan");
+        assert_eq!(
+            find_llama_server_binary(&manifest),
+            Some(llamacpp.join("rocm-nightly").join(&server))
+        );
+
+        // With rocm-stable also present, it wins (highest priority).
+        install("rocm-stable");
+        assert_eq!(
+            find_llama_server_binary(&manifest),
+            Some(llamacpp.join("rocm-stable").join(&server))
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
