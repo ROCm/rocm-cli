@@ -29,6 +29,7 @@ pub mod runtime_manager;
 pub mod serve_wizard;
 pub mod services_manager;
 pub mod sparkline;
+pub mod spinner;
 pub mod tabs;
 pub mod theme;
 pub mod update_manager;
@@ -229,6 +230,7 @@ fn draw_active_manager(f: &mut Frame, rect: Rect, state: &AppState, theme: &Them
             rect,
             job,
             (state.console_scroll, state.console_hscroll),
+            state.tick_count,
             theme,
         );
         return;

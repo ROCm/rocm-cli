@@ -160,9 +160,38 @@ where
     }
 }
 
+/// Keep only the final visible segment of a `\r`-redrawn progress line.
+///
+/// Progress tools (pip, tqdm, huggingface) redraw a line in place with a bare
+/// carriage return and no newline, so Tokio's `\n`-only line reader hands us
+/// the whole `\r`-joined redraw sequence as one very long string. The segment
+/// after the last `\r` is the final visible state of that line; keeping only it
+/// gives the console clean progress instead of one long horizontal smear. Lines
+/// without `\r` pass through unchanged.
+fn last_cr_segment(line: &str) -> &str {
+    line.rsplit('\r').next().unwrap_or(line)
+}
+
 fn emit(tx: &UnboundedSender<StateEvent>, id: &str, line: String) {
     let _ = tx.send(StateEvent::JobLine {
         id: id.to_string(),
-        line,
+        line: last_cr_segment(&line).to_string(),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::last_cr_segment;
+
+    #[test]
+    fn collapses_carriage_return_redraws() {
+        // A tqdm-style redraw sequence collapses to its final state.
+        assert_eq!(last_cr_segment("dl:  10%\rdl:  50%\rdl: 100%"), "dl: 100%");
+    }
+
+    #[test]
+    fn passes_plain_lines_through() {
+        assert_eq!(last_cr_segment("Installing ROCm…"), "Installing ROCm…");
+        assert_eq!(last_cr_segment(""), "");
+    }
 }

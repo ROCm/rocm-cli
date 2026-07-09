@@ -878,6 +878,7 @@ mod tests {
             bench_detail_scroll: 0,
             console_scroll: 0,
             console_hscroll: 0,
+            tick_count: 0,
             dock_logs_scroll: 0,
             last_dock_area: None,
             chat: Vec::new(),

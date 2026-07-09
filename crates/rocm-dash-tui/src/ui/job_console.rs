@@ -79,13 +79,16 @@ pub fn status_label(job: &JobState, theme: &Theme) -> (String, ratatui::style::C
     }
 }
 
-/// Render the job console centered over `area`. `scroll` is `(vertical_line,
-/// horizontal_col)` of the first visible cell (the caller clamps it).
+/// Render the job console centered over `area`.
+///
+/// `scroll` is `(vertical_line, horizontal_col)` of the first visible cell (the
+/// caller clamps it). `tick_count` drives the running-job progress spinner.
 pub fn draw_job_console(
     f: &mut Frame,
     area: Rect,
     job: &JobState,
     scroll: (u16, u16),
+    tick_count: u64,
     theme: &Theme,
 ) {
     let popup = centered_rect(90, 84, 140, 40, area);
@@ -104,25 +107,47 @@ pub fn draw_job_console(
         ])
         .split(inner);
 
-    // Header: status badge.
+    // Header: status badge, plus an animated braille spinner and parsed
+    // percentage while the job runs so progress reads as live motion.
     let (label, color) = status_label(job, theme);
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                " status ",
+    let mut header = vec![
+        Span::styled(
+            " status ",
+            Style::default()
+                .fg(theme.bg)
+                .bg(color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+    ];
+    if matches!(job.status, JobStatus::Running) {
+        header.push(Span::styled(
+            format!("{} ", crate::ui::spinner::spinner_frame(tick_count)),
+            Style::default().fg(theme.accent),
+        ));
+    }
+    header.push(Span::styled(
+        label,
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ));
+    if matches!(job.status, JobStatus::Running) {
+        // The most recent line carrying a percentage wins (later output is more
+        // current than earlier); silently omit the figure when none is present.
+        if let Some(pct) = job
+            .output
+            .iter()
+            .rev()
+            .find_map(|l| crate::ui::spinner::parse_progress_pct(l))
+        {
+            header.push(Span::styled(
+                format!("  {pct}%"),
                 Style::default()
-                    .fg(theme.bg)
-                    .bg(color)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                label,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-        ])),
-        rows[0],
-    );
+            ));
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(header)), rows[0]);
 
     // Body: streamed output lines.
     let lines: Vec<Line> = job
