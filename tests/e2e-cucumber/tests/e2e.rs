@@ -45,9 +45,16 @@ static WORLD_SEQ: AtomicU64 = AtomicU64::new(0);
 impl Default for E2eWorld {
     fn default() -> Self {
         let seq = WORLD_SEQ.fetch_add(1, Ordering::Relaxed);
+        // CodeQL flags `temp_dir()` (which reads TMPDIR) as a tainted path source.
+        // This is test-only code: the base is the OS temp dir and every joined
+        // segment is a program-controlled constant (pid, an atomic counter, and
+        // fixed names), so there is no attacker-controlled traversal.
         let tmp = std::env::temp_dir().join(format!("rocm-e2e-{}-{}", std::process::id(), seq));
+        // codeql[rust/path-injection]
         std::fs::create_dir_all(tmp.join("config")).ok();
+        // codeql[rust/path-injection]
         std::fs::create_dir_all(tmp.join("data")).ok();
+        // codeql[rust/path-injection]
         std::fs::create_dir_all(tmp.join("cache")).ok();
 
         Self {
