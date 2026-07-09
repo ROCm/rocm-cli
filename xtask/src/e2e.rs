@@ -22,36 +22,33 @@ pub fn run(args: &[String]) -> Result<()> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let root = workspace_root()?;
 
-    let binary = match std::env::var_os("ROCM_CLI_BINARY") {
+    let binary = if let Some(path) = std::env::var_os("ROCM_CLI_BINARY") {
         // The cucumber steps spawn the binary from a working directory that may
         // differ from where `cargo xtask` was invoked, so a relative path would
         // fail to resolve. Make any caller-supplied path absolute.
-        Some(path) => {
-            let path = PathBuf::from(path);
-            if path.is_absolute() {
-                path
-            } else {
-                std::env::current_dir()
-                    .context("failed to read the current directory")?
-                    .join(path)
-            }
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()
+                .context("failed to read the current directory")?
+                .join(path)
         }
-        None => {
-            let status = Command::new(&cargo)
-                .args(["build", "--release", "-p", "rocm"])
-                .current_dir(&root)
-                .status()
-                .context("failed to run `cargo build --release -p rocm`")?;
-            if !status.success() {
-                bail!("building the rocm binary failed");
-            }
-            // Honor CARGO_TARGET_DIR — the built binary is under the active
-            // target dir, which is not always `<root>/target` (e.g. a
-            // cross-platform container build points it elsewhere). Using a
-            // hardcoded `target/` here can pick up a stale binary built for a
-            // different OS/arch and fail with an exec-format error.
-            target_dir(&root).join("release/rocm")
+    } else {
+        let status = Command::new(&cargo)
+            .args(["build", "--release", "-p", "rocm"])
+            .current_dir(&root)
+            .status()
+            .context("failed to run `cargo build --release -p rocm`")?;
+        if !status.success() {
+            bail!("building the rocm binary failed");
         }
+        // Honor CARGO_TARGET_DIR — the built binary is under the active target
+        // dir, which is not always `<root>/target` (e.g. a cross-platform
+        // container build points it elsewhere). Using a hardcoded `target/`
+        // here can pick up a stale binary built for a different OS/arch and
+        // fail with an exec-format error.
+        target_dir(&root).join("release/rocm")
     };
 
     let mut cmd = Command::new(&cargo);
