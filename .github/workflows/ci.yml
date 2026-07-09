@@ -616,6 +616,10 @@ jobs:
           name: e2e-known-bugs-report
           path: tests/e2e-cucumber/results/
 
+  # GPU hardware scenarios that are expected to PASS. Mirrors the mock `e2e` job
+  # but for `@gpu` hardware-dependent scenarios; known-bug `@gpu` scenarios are
+  # split into e2e-gpu-known-bugs below so a red here always means a real GPU
+  # regression, never a known bug still reproducing.
   e2e-gpu:
     name: E2E tests (GPU)
     runs-on: [self-hosted, linux, amd-gpu]
@@ -627,12 +631,38 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
-      - name: Run E2E tests on GPU hardware
-        run: cargo xtask e2e -- -t "@gpu"
+      - name: Run E2E tests on GPU hardware (excluding known bugs)
+        run: cargo xtask e2e -- -t "@gpu and not @expected-failure"
 
       - name: Upload E2E report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-gpu-report
+          path: tests/e2e-cucumber/results/
+
+  # GPU counterpart of e2e-known-bugs: runs ONLY the `@gpu @expected-failure`
+  # scenarios under xfail inversion (`--expect-failures`). Green when each known
+  # GPU bug still fails as expected; red only when one is silently fixed (XPASS —
+  # remove its @expected-failure tag so it joins e2e-gpu above), an untagged
+  # scenario fails, or a parse/hook error occurs.
+  e2e-gpu-known-bugs:
+    name: E2E tests (GPU, known bugs)
+    runs-on: [self-hosted, linux, amd-gpu]
+    needs: [changes, build-and-test]
+    if: needs.changes.outputs.heavy == 'true'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Run known-bug E2E scenarios on GPU hardware
+        run: cargo xtask e2e --expect-failures -- -t "@gpu and @expected-failure"
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-gpu-known-bugs-report
           path: tests/e2e-cucumber/results/
