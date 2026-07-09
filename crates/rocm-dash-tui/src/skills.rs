@@ -21,6 +21,13 @@ pub const LEMONADE_ENDPOINT: &str = "http://localhost:13305/v1";
 /// vLLM's conventional OpenAI-compatible endpoint + port.
 pub const VLLM_PORT: u16 = 8000;
 pub const VLLM_ENDPOINT: &str = "http://localhost:8000/v1";
+/// `rocm serve`'s (non-managed) default vLLM port.
+///
+/// Mirrors `rocm_core::DEFAULT_LOCAL_PORT`; duplicated as a literal because
+/// this crate deliberately carries no `rocm-core` dependency (see
+/// `AppState::model_recipes`).
+pub const ROCM_SERVE_PORT: u16 = 11_435;
+pub const ROCM_SERVE_ENDPOINT: &str = "http://localhost:11435/v1";
 
 /// One typed step in a skill manifest. Tagged by `type` in TOML.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
