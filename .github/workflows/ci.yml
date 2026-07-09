@@ -191,6 +191,12 @@ jobs:
         if: needs.changes.outputs.heavy == 'true'
         run: python scripts/release_readiness.py --self-test
 
+      - name: Pinned key consistency (self-test + repo check)
+        if: needs.changes.outputs.heavy == 'true'
+        run: |
+          python scripts/verify_pinned_keys.py --self-test
+          python scripts/verify_pinned_keys.py
+
       - name: Acceptance install lifecycle
         if: needs.changes.outputs.heavy == 'true'
         run: ./scripts/acceptance-install-upgrade-tui-uninstall.sh
@@ -313,6 +319,13 @@ jobs:
         if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
         run: python .\scripts\release_readiness.py --self-test
+
+      - name: Pinned key consistency (self-test + repo check)
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: |
+          python .\scripts\verify_pinned_keys.py --self-test
+          python .\scripts\verify_pinned_keys.py
 
       - name: Check PowerShell installer syntax
         if: needs.changes.outputs.heavy == 'true'

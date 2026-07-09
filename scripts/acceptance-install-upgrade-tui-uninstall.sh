@@ -188,14 +188,18 @@ grep -q "signature verified" "${PEM_INSTALL_LOG}" \
 assert_file "${PEM_INSTALL_DIR}/rocm"
 assert_file "${PEM_INSTALL_DIR}/.rocm-cli-manifest"
 
-echo "acceptance: reject required signature without public key"
+# With a production release key pinned in install.sh, a release install with no
+# public key supplied falls back to that pinned trust root. The bundle here is
+# signed with the acceptance test key, not the pinned key, so verification must
+# fail — proving the default-on pinned path rejects an untrusted signer.
+echo "acceptance: reject signature from an untrusted key"
 NO_PUBLIC_KEY_INSTALL_DIR="${TMP_ROOT}/no-public-key-install/bin"
 expect_failure \
-  "acceptance: required signature no public key install" \
+  "acceptance: untrusted-key signature install" \
   "${NO_PUBLIC_KEY_LOG}" \
   run_installer_without_public_key "${DOWNLOAD_BASE}" "${NO_PUBLIC_KEY_INSTALL_DIR}"
-grep -q "signature verification requires ROCM_CLI_SIGNING_PUBLIC_KEY_PATH or ROCM_CLI_SIGNING_PUBLIC_KEY_PEM" "${NO_PUBLIC_KEY_LOG}" \
-  || fail "installer did not report missing public key for required signature"
+grep -q "signature verification failed" "${NO_PUBLIC_KEY_LOG}" \
+  || fail "installer did not reject a signature from an untrusted key"
 assert_missing "${NO_PUBLIC_KEY_INSTALL_DIR}/rocm"
 assert_missing "${NO_PUBLIC_KEY_INSTALL_DIR}/.rocm-cli-manifest"
 

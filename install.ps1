@@ -75,6 +75,35 @@ function Convert-FileUriToPath {
     return $null
 }
 
+# Pinned production release signing public keys (trust roots). These stay empty
+# until the repository owner publishes production keys (see docs/release-trust.md,
+# "Remaining Owner Step"). While empty, release installs keep the opt-in behavior:
+# a signature is verified only when a key is supplied via the parameters/env vars
+# or ROCM_CLI_REQUIRE_SIGNATURE=1. Once populated, release-channel installs verify
+# signatures by default with these keys as trust roots. Two slots support
+# zero-downtime key rotation: a release signed with either the current or the
+# pre-staged next key verifies, so the next key is trusted before its first use.
+$PinnedReleasePublicKeyCurrent = @"
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxuyScR/BzV+kuXqWAHtE
++9xiPCWURUYnsio9MOrf2Xe01mBngP7qPcF13+5nrfT3EnuxOn5rSCYwjOndlS+c
+KzOw6GZXJD/ZqeojnbXxxsxlftAQHHEke1WCtga5ZEFxOauTeB5nTV/IbjMAl2Xc
+M4PaudpFFH/6j/E3gongDmt0hWdpMLbaCcd3i1vMTEsaHZooNoAbJ/dIAHR/dDNM
+pScZAZoy0LL3Afhn5Hiv71trfbfnnboVSdhnCoMmisl6/sK55zR7VM8hWDTTowl3
+ultUtiz4emTfXDCb2RptOgoydBA+mu9z6O4eVF8S5dVr/S834SK6dD2fWHNnT0dc
+JwIDAQAB
+-----END PUBLIC KEY-----
+"@
+$PinnedReleasePublicKeyNext = ""
+
+function Test-HasPinnedReleaseKey {
+    return (-not [string]::IsNullOrWhiteSpace($PinnedReleasePublicKeyCurrent)) `
+        -or (-not [string]::IsNullOrWhiteSpace($PinnedReleasePublicKeyNext))
+}
+
+# Return the candidate signing public keys as an array of file paths. An explicit
+# parameter/env-provided key wins (an escape hatch for private mirrors); otherwise
+# the pinned production trust roots are used.
 function Resolve-SigningPublicKey {
     param(
         [string] $KeyPath,
@@ -83,16 +112,26 @@ function Resolve-SigningPublicKey {
     )
 
     if (-not [string]::IsNullOrWhiteSpace($KeyPath)) {
-        return Resolve-InstallerPath $KeyPath
+        return @((Resolve-InstallerPath $KeyPath))
     }
 
     if (-not [string]::IsNullOrWhiteSpace($KeyPem)) {
         $path = Join-Path $TempRoot "rocm-cli-signing-public-key.pem"
         Set-Content -LiteralPath $path -Value $KeyPem -Encoding ascii
-        return $path
+        return @($path)
     }
 
-    return ""
+    $paths = @()
+    $index = 0
+    foreach ($pinned in @($PinnedReleasePublicKeyCurrent, $PinnedReleasePublicKeyNext)) {
+        if (-not [string]::IsNullOrWhiteSpace($pinned)) {
+            $index++
+            $path = Join-Path $TempRoot "rocm-cli-pinned-key-$index.pem"
+            Set-Content -LiteralPath $path -Value $pinned -Encoding ascii
+            $paths += $path
+        }
+    }
+    return $paths
 }
 
 function Save-File {
@@ -136,14 +175,17 @@ function Confirm-ArchiveSignature {
     param(
         [string] $ArchivePath,
         [string] $SignaturePath,
-        [string] $PublicKeyPath
+        [string[]] $PublicKeyPaths
     )
 
     Confirm-Command openssl
-    & openssl dgst -sha256 -verify $PublicKeyPath -signature $SignaturePath $ArchivePath | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Fail "signature verification failed"
+    foreach ($key in $PublicKeyPaths) {
+        & openssl dgst -sha256 -verify $key -signature $SignaturePath $ArchivePath | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            return
+        }
     }
+    Fail "signature verification failed"
 }
 
 function Get-ExpectedSha256 {
@@ -380,10 +422,17 @@ $sigPath = "$archivePath.sig"
 $extractDir = Join-Path $tempRoot "extract"
 $manifestPath = Join-Path $InstallDir ".rocm-cli-manifest"
 $signatureRequired = $RequireSignature -or (Test-Truthy $env:ROCM_CLI_REQUIRE_SIGNATURE)
+# Production default: once release trust roots are pinned, release-channel installs
+# always verify. An unset or 0 ROCM_CLI_REQUIRE_SIGNATURE does not lower this
+# floor; pass -SigningPublicKeyPath/-Pem (or the env vars) to point at an
+# alternate key (e.g. a private mirror) instead.
+if ($Channel -eq "release" -and (Test-HasPinnedReleaseKey)) {
+    $signatureRequired = $true
+}
 
 try {
     New-Item -ItemType Directory -Force -Path $tempRoot, $extractDir | Out-Null
-    $signingPublicKey = Resolve-SigningPublicKey $SigningPublicKeyPath $SigningPublicKeyPem $tempRoot
+    $signingPublicKeys = @(Resolve-SigningPublicKey $SigningPublicKeyPath $SigningPublicKeyPem $tempRoot)
 
     Write-Host "rocm-cli installer"
     Write-Host "  repo: $Repo"
@@ -400,12 +449,12 @@ try {
         Fail "checksum verification failed"
     }
 
-    if ($signatureRequired -or -not [string]::IsNullOrWhiteSpace($signingPublicKey)) {
-        if ([string]::IsNullOrWhiteSpace($signingPublicKey)) {
+    if ($signatureRequired -or ($signingPublicKeys.Count -gt 0)) {
+        if ($signingPublicKeys.Count -eq 0) {
             Fail "signature verification requires ROCM_CLI_SIGNING_PUBLIC_KEY_PATH, ROCM_CLI_SIGNING_PUBLIC_KEY_PEM, -SigningPublicKeyPath, or -SigningPublicKeyPem"
         }
         Save-File $sigUrl $sigPath "required signature sidecar is missing or unavailable"
-        Confirm-ArchiveSignature $archivePath $sigPath $signingPublicKey
+        Confirm-ArchiveSignature $archivePath $sigPath $signingPublicKeys
         Write-Host "signature verified"
     }
 

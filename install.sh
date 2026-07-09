@@ -70,7 +70,33 @@ fetch() {
   fi
 }
 
-signing_public_key_path() {
+# Pinned production release signing public keys (trust roots). These stay empty
+# until the repository owner publishes production keys (see docs/release-trust.md,
+# "Remaining Owner Step"). While empty, release installs keep the opt-in behavior
+# below: a signature is verified only when a key is supplied via the env vars or
+# ROCM_CLI_REQUIRE_SIGNATURE=1. Once populated, release-channel installs verify
+# signatures by default with these keys as trust roots. Two slots support
+# zero-downtime key rotation: a release signed with either the current or the
+# pre-staged next key verifies, so the next key is trusted before its first use.
+PINNED_RELEASE_PUBLIC_KEY_CURRENT="-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxuyScR/BzV+kuXqWAHtE
++9xiPCWURUYnsio9MOrf2Xe01mBngP7qPcF13+5nrfT3EnuxOn5rSCYwjOndlS+c
+KzOw6GZXJD/ZqeojnbXxxsxlftAQHHEke1WCtga5ZEFxOauTeB5nTV/IbjMAl2Xc
+M4PaudpFFH/6j/E3gongDmt0hWdpMLbaCcd3i1vMTEsaHZooNoAbJ/dIAHR/dDNM
+pScZAZoy0LL3Afhn5Hiv71trfbfnnboVSdhnCoMmisl6/sK55zR7VM8hWDTTowl3
+ultUtiz4emTfXDCb2RptOgoydBA+mu9z6O4eVF8S5dVr/S834SK6dD2fWHNnT0dc
+JwIDAQAB
+-----END PUBLIC KEY-----"
+PINNED_RELEASE_PUBLIC_KEY_NEXT=""
+
+has_pinned_release_keys() {
+  [ -n "${PINNED_RELEASE_PUBLIC_KEY_CURRENT}" ] || [ -n "${PINNED_RELEASE_PUBLIC_KEY_NEXT}" ]
+}
+
+# Emit the candidate signing public keys as newline-separated file paths. An
+# explicit env-provided key wins (an escape hatch for private mirrors); otherwise
+# the pinned production trust roots are used. Requires ${tmp_dir} to exist.
+resolve_public_keys() {
   if [ -n "${ROCM_CLI_SIGNING_PUBLIC_KEY_PATH:-}" ]; then
     printf '%s\n' "${ROCM_CLI_SIGNING_PUBLIC_KEY_PATH}"
     return 0
@@ -83,16 +109,37 @@ signing_public_key_path() {
     return 0
   fi
 
-  printf '%s\n' ""
+  pinned_index=0
+  for pinned_pem in "${PINNED_RELEASE_PUBLIC_KEY_CURRENT}" "${PINNED_RELEASE_PUBLIC_KEY_NEXT}"; do
+    [ -n "${pinned_pem}" ] || continue
+    pinned_index=$((pinned_index + 1))
+    key_path="${tmp_dir}/rocm-cli-pinned-key-${pinned_index}.pem"
+    printf '%s\n' "${pinned_pem}" > "${key_path}"
+    printf '%s\n' "${key_path}"
+  done
 }
 
+# Verify ${signature} over ${archive} against any of the newline-separated public
+# key file paths in ${keys}; succeed on the first match, fail if none verify.
 verify_signature() {
   archive="$1"
   signature="$2"
-  public_key="$3"
+  keys="$3"
   need_cmd openssl
-  openssl dgst -sha256 -verify "${public_key}" -signature "${signature}" "${archive}" >/dev/null 2>&1 \
-    || fail "signature verification failed"
+  saved_ifs="${IFS}"
+  IFS='
+'
+  for key in ${keys}; do
+    IFS="${saved_ifs}"
+    [ -n "${key}" ] || continue
+    if openssl dgst -sha256 -verify "${key}" -signature "${signature}" "${archive}" >/dev/null 2>&1; then
+      return 0
+    fi
+    IFS='
+'
+  done
+  IFS="${saved_ifs}"
+  fail "signature verification failed"
 }
 
 installer_config_dir() {
@@ -319,11 +366,24 @@ expected="$(awk '{print $1}' "${sha_path}" | head -n1)"
 actual="$(sha256_file "${archive_path}")"
 [ "${expected}" = "${actual}" ] || fail "checksum verification failed"
 
-public_key_path="$(signing_public_key_path)"
-if truthy "${ROCM_CLI_REQUIRE_SIGNATURE:-0}" || [ -n "${public_key_path}" ]; then
-  [ -n "${public_key_path}" ] || fail "signature verification requires ROCM_CLI_SIGNING_PUBLIC_KEY_PATH or ROCM_CLI_SIGNING_PUBLIC_KEY_PEM"
+public_keys="$(resolve_public_keys)"
+
+require_sig=0
+if truthy "${ROCM_CLI_REQUIRE_SIGNATURE:-0}"; then
+  require_sig=1
+fi
+# Production default: once release trust roots are pinned, release-channel
+# installs always verify. An unset or 0 ROCM_CLI_REQUIRE_SIGNATURE does not lower
+# this floor; use ROCM_CLI_SIGNING_PUBLIC_KEY_PATH/PEM to point at an alternate
+# key (e.g. a private mirror) instead.
+if [ "${CHANNEL}" = "release" ] && has_pinned_release_keys; then
+  require_sig=1
+fi
+
+if [ "${require_sig}" -eq 1 ] || [ -n "${public_keys}" ]; then
+  [ -n "${public_keys}" ] || fail "signature verification requires ROCM_CLI_SIGNING_PUBLIC_KEY_PATH or ROCM_CLI_SIGNING_PUBLIC_KEY_PEM"
   fetch "${sig_url}" "${sig_path}" "required signature sidecar is missing or unavailable: ${sig_url}"
-  verify_signature "${archive_path}" "${sig_path}" "${public_key_path}"
+  verify_signature "${archive_path}" "${sig_path}" "${public_keys}"
   echo "signature verified"
 fi
 

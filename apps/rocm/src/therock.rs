@@ -1702,12 +1702,48 @@ fn select_latest_version(versions: &[String], channel: TheRockChannel) -> Option
     }
 }
 
+/// Pinned production metadata signing public key (trust root). Empty until the
+/// repository owner publishes production keys (see docs/release-trust.md,
+/// "Remaining Owner Step"). While empty, metadata verification stays opt-in
+/// (enabled only via the `ROCM_CLI_METADATA_PUBLIC_KEY_*` env vars). Once
+/// populated, metadata signatures are verified by default with this key as the
+/// trust root.
+const PINNED_METADATA_PUBLIC_KEY_PEM: &str = "";
+
+/// The pinned metadata trust root, or `None` while the sentinel is still empty.
+fn pinned_metadata_public_key() -> Option<String> {
+    let pem = PINNED_METADATA_PUBLIC_KEY_PEM.trim();
+    (!pem.is_empty()).then(|| pem.to_owned())
+}
+
 impl MetadataSignaturePolicy {
     fn from_env() -> Self {
+        Self::resolve(
+            truthy_env("ROCM_CLI_REQUIRE_METADATA_SIGNATURE"),
+            env_path("ROCM_CLI_METADATA_PUBLIC_KEY_PATH"),
+            env_nonempty("ROCM_CLI_METADATA_PUBLIC_KEY_PEM"),
+            pinned_metadata_public_key(),
+        )
+    }
+
+    /// Combine the env-provided inputs with the pinned trust root. An explicit
+    /// env key (path or PEM) wins as an escape hatch; otherwise the pinned key is
+    /// used, and its presence makes verification required by default.
+    fn resolve(
+        env_required: bool,
+        env_path: Option<PathBuf>,
+        env_pem: Option<String>,
+        pinned_pem: Option<String>,
+    ) -> Self {
+        let pinned = if env_path.is_none() && env_pem.is_none() {
+            pinned_pem
+        } else {
+            None
+        };
         Self {
-            required: truthy_env("ROCM_CLI_REQUIRE_METADATA_SIGNATURE"),
-            public_key_path: env_path("ROCM_CLI_METADATA_PUBLIC_KEY_PATH"),
-            public_key_pem: env_nonempty("ROCM_CLI_METADATA_PUBLIC_KEY_PEM"),
+            required: env_required || pinned.is_some(),
+            public_key_path: env_path,
+            public_key_pem: env_pem.or(pinned),
         }
     }
 
@@ -3835,6 +3871,56 @@ echo Python 3.12.10
         assert!(!temp_key.exists());
         let _ = fs::remove_dir_all(root);
         Ok(())
+    }
+
+    #[test]
+    fn metadata_policy_uses_pinned_key_and_requires_by_default() {
+        // A pinned trust root with no env inputs: verification becomes required
+        // by default and the pinned PEM is used.
+        let pinned = "-----BEGIN PUBLIC KEY-----\npinned\n-----END PUBLIC KEY-----\n";
+        let policy = MetadataSignaturePolicy::resolve(false, None, None, Some(pinned.to_owned()));
+        assert!(policy.required);
+        assert!(policy.active());
+        assert_eq!(policy.public_key_pem.as_deref(), Some(pinned));
+        assert!(policy.public_key_path.is_none());
+    }
+
+    #[test]
+    fn metadata_policy_env_key_overrides_pinned_key() {
+        // An explicit env PEM wins over the pinned root (escape hatch), and does
+        // not force `required` on its own.
+        let pinned = "-----BEGIN PUBLIC KEY-----\npinned\n-----END PUBLIC KEY-----\n";
+        let env_pem = "-----BEGIN PUBLIC KEY-----\nenv\n-----END PUBLIC KEY-----\n";
+        let policy = MetadataSignaturePolicy::resolve(
+            false,
+            None,
+            Some(env_pem.to_owned()),
+            Some(pinned.to_owned()),
+        );
+        assert_eq!(policy.public_key_pem.as_deref(), Some(env_pem));
+
+        let env_path = PathBuf::from("/keys/metadata.pem");
+        let policy = MetadataSignaturePolicy::resolve(
+            false,
+            Some(env_path.clone()),
+            None,
+            Some(pinned.to_owned()),
+        );
+        assert_eq!(policy.public_key_path, Some(env_path));
+        assert!(policy.public_key_pem.is_none());
+    }
+
+    #[test]
+    fn metadata_policy_without_pinned_key_preserves_optin_behavior() {
+        // Empty pinned sentinel + no env inputs: verification stays inactive,
+        // exactly as before pinning was introduced.
+        let policy = MetadataSignaturePolicy::resolve(false, None, None, None);
+        assert!(!policy.required);
+        assert!(!policy.active());
+
+        // `ROCM_CLI_REQUIRE_METADATA_SIGNATURE=1` alone still activates it.
+        let policy = MetadataSignaturePolicy::resolve(true, None, None, None);
+        assert!(policy.required);
     }
 
     #[test]

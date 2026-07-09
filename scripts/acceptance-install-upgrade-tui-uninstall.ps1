@@ -299,7 +299,11 @@ try {
         Fail "installer did not seed minimal config with the expected default engine"
     }
 
-    Write-Host "acceptance: reject required signature without public key"
+    # With a production release key pinned in install.ps1, a release install with
+    # no public key supplied falls back to that pinned trust root. The bundle here
+    # is signed with the acceptance test key, not the pinned key, so verification
+    # must fail - proving the default-on pinned path rejects an untrusted signer.
+    Write-Host "acceptance: reject signature from an untrusted key"
     $noPublicKeyInstallDir = Join-Path $AcceptanceRoot "no-public-key-install\bin"
     $noPublicKeyInstallArgs = @(
         "-NoProfile",
@@ -315,9 +319,9 @@ try {
         "-RequireSignature",
         "-NoPathUpdate"
     )
-    Invoke-ExpectFailure "acceptance: required signature no public key install" $psExe $noPublicKeyInstallArgs $NoPublicKeyLog
-    if (-not (Select-String -LiteralPath $NoPublicKeyLog -Pattern "signature verification requires ROCM_CLI_SIGNING_PUBLIC_KEY_PATH" -Quiet)) {
-        Fail "installer did not report missing public key for required signature"
+    Invoke-ExpectFailure "acceptance: untrusted-key signature install" $psExe $noPublicKeyInstallArgs $NoPublicKeyLog
+    if (-not (Select-String -LiteralPath $NoPublicKeyLog -Pattern "signature verification failed" -Quiet)) {
+        Fail "installer did not reject a signature from an untrusted key"
     }
     Assert-Missing (Join-Path $noPublicKeyInstallDir "rocm.exe")
     Assert-Missing (Join-Path $noPublicKeyInstallDir ".rocm-cli-manifest")
