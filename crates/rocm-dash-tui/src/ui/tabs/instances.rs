@@ -881,6 +881,8 @@ mod tests {
             tick_count: 0,
             dock_logs_scroll: 0,
             last_dock_area: None,
+            scrollbars: std::cell::RefCell::new(Vec::new()),
+            scroll_drag: None,
             chat: Vec::new(),
             chat_input: String::new(),
             chat_sending: false,

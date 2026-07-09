@@ -179,7 +179,17 @@ pub fn logs_dock(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let end = total - scroll;
     let start = end.saturating_sub(cap);
     let window: Vec<Line> = lines[start..end].to_vec();
-    f.render_widget(Paragraph::new(window), inner);
+    // `start` is the first visible line from the top — the scrollbar position.
+    let body = panel::vertical_scrollbar(f, inner, total, cap, start, theme);
+    state.record_scrollbar(
+        inner,
+        body,
+        false,
+        total,
+        cap,
+        crate::app::ScrollTarget::DockLogs,
+    );
+    f.render_widget(Paragraph::new(window), body);
 }
 
 /// CONTEXT rail: RUNNING SERVICES / GPU STATE / RECENT TOOLS read from

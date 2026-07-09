@@ -269,7 +269,15 @@ pub fn draw_config_manager(
             .bg(theme.surface_2)
             .add_modifier(Modifier::BOLD),
     );
-    f.render_stateful_widget(list, rows[1], &mut ls);
+    let list_area = panel::vertical_scrollbar(
+        f,
+        rows[1],
+        ACTIONS.len(),
+        rows[1].height as usize,
+        c.action_sel,
+        theme,
+    );
+    f.render_stateful_widget(list, list_area, &mut ls);
 
     let msg = c.message.as_deref().unwrap_or("");
     f.render_widget(

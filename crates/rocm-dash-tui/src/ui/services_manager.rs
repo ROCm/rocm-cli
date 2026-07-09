@@ -292,7 +292,15 @@ pub fn draw_services_manager<S: ::std::hash::BuildHasher>(
                 .bg(theme.surface_2)
                 .add_modifier(Modifier::BOLD),
         );
-        f.render_stateful_widget(list, body[0], &mut ls);
+        let list_area = panel::vertical_scrollbar(
+            f,
+            body[0],
+            rows.len(),
+            body[0].height as usize,
+            sm.selected,
+            theme,
+        );
+        f.render_stateful_widget(list, list_area, &mut ls);
     }
 
     f.render_widget(

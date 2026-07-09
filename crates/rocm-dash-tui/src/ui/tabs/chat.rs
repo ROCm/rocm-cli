@@ -237,10 +237,26 @@ fn draw_transcript(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         transcript_lines(state, theme)
     };
 
+    let body = panel::vertical_scrollbar(
+        f,
+        inner,
+        lines.len(),
+        inner.height as usize,
+        state.chat_scroll as usize,
+        theme,
+    );
+    state.record_scrollbar(
+        inner,
+        body,
+        false,
+        lines.len(),
+        inner.height as usize,
+        crate::app::ScrollTarget::Chat,
+    );
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((state.chat_scroll, 0));
-    f.render_widget(p, inner);
+    f.render_widget(p, body);
 }
 
 /// Pure transcript → styled lines mapping. Each turn becomes a role-prefixed,

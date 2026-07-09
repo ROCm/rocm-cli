@@ -264,7 +264,15 @@ pub fn draw_engine_manager(
             .bg(theme.surface_2)
             .add_modifier(Modifier::BOLD),
     );
-    f.render_stateful_widget(list, body[0], &mut ls);
+    let list_area = panel::vertical_scrollbar(
+        f,
+        body[0],
+        ENGINE_CATALOG.len(),
+        body[0].height as usize,
+        em.selected,
+        theme,
+    );
+    f.render_stateful_widget(list, list_area, &mut ls);
 
     let msg = em.message.as_deref().unwrap_or("");
     f.render_widget(
