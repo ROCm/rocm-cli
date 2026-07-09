@@ -1,9 +1,10 @@
+
 # WIP: E2E BDD tests for rocm-cli (PR #69, cucumber-rs)
 
 **Stage:** 8-awaiting-pr-approval
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
-**Last Updated:** 2026-07-08
+**Last Updated:** 2026-07-09
 
 **Token Usage:** in=0 out=0 cache_create=0 cache_read=0 calls=0
 
@@ -116,3 +117,6 @@ addressed here with the exit-code fix + dedicated known-bugs job.
 - Set up Apple `container` to verify the Linux test suite locally (green).
 - Set up local-only progress branch for WIP storage (push-guarded against
   upstream). Next: await CI + re-review.
+
+### 2026-07-09 (idle flush)
+- **2026-07-09 (idle flush):** Session idle for 1 hour, auto-flushing WIP state.
