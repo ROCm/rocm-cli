@@ -152,13 +152,17 @@ async fn assert_consistent_expansion(world: &mut E2eWorld) {
         "need at least 2 serve outputs to compare"
     );
     let mut resolved: Vec<String> = Vec::new();
-    for output in outputs {
+    for (i, output) in outputs.iter().enumerate() {
+        // A missing `resolved model:` line means the engine never got far enough
+        // to expand the name (e.g. it errored before serving). Fail loudly rather
+        // than defaulting to an empty string — otherwise two engines that both
+        // fail would produce equal ("") values and pass this check vacuously.
         let model = output
             .lines()
             .find(|l| l.contains("resolved model:"))
             .and_then(|l| l.split(':').nth(1))
             .map(|s| s.trim().to_string())
-            .unwrap_or_default();
+            .unwrap_or_else(|| panic!("engine #{i} produced no 'resolved model' line:\n{output}"));
         resolved.push(model);
     }
     let first = &resolved[0];

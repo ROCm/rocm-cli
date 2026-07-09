@@ -587,15 +587,17 @@ jobs:
           name: e2e-report
           path: tests/e2e-cucumber/results/
 
-  # Non-blocking: runs ONLY the known-bug scenarios so their status is visible
-  # without gating the PR. As each bug is fixed and its tag removed, the scenario
-  # moves into the blocking e2e job above.
+  # Runs ONLY the known-bug scenarios under xfail inversion (`--expect-failures`):
+  # a tagged scenario failing is the expected, green outcome. The job goes red
+  # only when a known bug is silently fixed (XPASS — remove its @expected-failure
+  # tag so it joins the blocking e2e job above), an untagged scenario fails, or a
+  # parse/hook error occurs — all actionable, so this gates rather than being an
+  # always-red check reviewers learn to ignore.
   e2e-known-bugs:
     name: E2E tests (known bugs)
     runs-on: ubuntu-latest
     needs: [changes, build-and-test]
     if: needs.changes.outputs.heavy == 'true'
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v6
 
@@ -605,7 +607,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Run known-bug E2E scenarios (mock tier)
-        run: cargo xtask e2e -- -t "@expected-failure and not @gpu"
+        run: cargo xtask e2e --expect-failures -- -t "@expected-failure and not @gpu"
 
       - name: Upload E2E report
         if: always()

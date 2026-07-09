@@ -18,7 +18,12 @@ use anyhow::{Context, Result, bail};
 /// Build the release binary and run the E2E suite, forwarding `args` to the
 /// cucumber CLI. If `ROCM_CLI_BINARY` is already set in the environment, the
 /// build step is skipped and that binary is used as-is.
-pub fn run(args: &[String]) -> Result<()> {
+///
+/// When `expect_failures` is set (known-bugs run), the harness inverts its exit
+/// signal via `E2E_EXPECT_FAILURES`: `@expected-failure` scenarios are meant to
+/// fail, so the run is green unless one unexpectedly passes (XPASS) or a
+/// parse/hook error occurs.
+pub fn run(args: &[String], expect_failures: bool) -> Result<()> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let root = workspace_root()?;
 
@@ -55,6 +60,9 @@ pub fn run(args: &[String]) -> Result<()> {
     cmd.args(["test", "-p", "e2e-cucumber", "--test", "e2e"])
         .current_dir(&root)
         .env("ROCM_CLI_BINARY", &binary);
+    if expect_failures {
+        cmd.env("E2E_EXPECT_FAILURES", "1");
+    }
     if !args.is_empty() {
         cmd.arg("--").args(args);
     }
