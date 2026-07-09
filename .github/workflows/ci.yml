@@ -666,3 +666,97 @@ jobs:
         with:
           name: e2e-gpu-known-bugs-report
           path: tests/e2e-cucumber/results/
+
+  # Second AMD GPU architecture: the Strix Halo (gfx1151) Ubuntu runner. Same
+  # expect-pass / known-bugs split as app-dev-gpu's e2e-gpu jobs, targeted by the
+  # `strix-halo` label so it lands only on that runner (app-dev-gpu carries
+  # `amd-gpu`, not `strix-halo`). Non-blocking while this hardware is proven out.
+  e2e-gpu-strix-ubuntu:
+    name: E2E tests (Strix Halo, Ubuntu)
+    runs-on: [self-hosted, linux, strix-halo]
+    needs: [changes, build-and-test]
+    if: needs.changes.outputs.heavy == 'true'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Run E2E tests on Strix Halo (excluding known bugs)
+        run: cargo xtask e2e -- -t "@gpu and not @expected-failure"
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-gpu-strix-ubuntu-report
+          path: tests/e2e-cucumber/results/
+
+  e2e-gpu-strix-ubuntu-known-bugs:
+    name: E2E tests (Strix Halo, Ubuntu, known bugs)
+    runs-on: [self-hosted, linux, strix-halo]
+    needs: [changes, build-and-test]
+    if: needs.changes.outputs.heavy == 'true'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Run known-bug E2E scenarios on Strix Halo
+        run: cargo xtask e2e --expect-failures -- -t "@gpu and @expected-failure"
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-gpu-strix-ubuntu-known-bugs-report
+          path: tests/e2e-cucumber/results/
+
+  # First real Windows GPU coverage: the Strix Halo Windows 11 runner. The
+  # existing windows-build-and-test uses GitHub-hosted windows-latest, which has
+  # no GPU, so `@gpu` scenarios have never run on Windows hardware. Expect
+  # first-run breakage to triage; non-blocking so it never gates the PR.
+  e2e-gpu-strix-windows:
+    name: E2E tests (Strix Halo, Windows)
+    runs-on: [self-hosted, windows, strix-halo]
+    needs: [changes, build-and-test]
+    if: needs.changes.outputs.heavy == 'true'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Run E2E tests on Strix Halo Windows (excluding known bugs)
+        shell: pwsh
+        run: cargo xtask e2e -- -t "@gpu and not @expected-failure"
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-gpu-strix-windows-report
+          path: tests/e2e-cucumber/results/
+
+  e2e-gpu-strix-windows-known-bugs:
+    name: E2E tests (Strix Halo, Windows, known bugs)
+    runs-on: [self-hosted, windows, strix-halo]
+    needs: [changes, build-and-test]
+    if: needs.changes.outputs.heavy == 'true'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Run known-bug E2E scenarios on Strix Halo Windows
+        shell: pwsh
+        run: cargo xtask e2e --expect-failures -- -t "@gpu and @expected-failure"
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-gpu-strix-windows-known-bugs-report
+          path: tests/e2e-cucumber/results/
