@@ -6,9 +6,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use rocm_core::{
     AppPaths, DEFAULT_LOCAL_PORT, RocmCliConfig, active_managed_therock_environment,
-    download_file_to_path, format_host_port,
-    format_http_base_url, http_get_text, normalize_runtime_path_for_host, prepend_runtime_paths,
-    require_nonempty, runtime_is_linux, runtime_is_windows,
+    download_file_to_path, format_host_port, format_http_base_url, http_get_text,
+    normalize_runtime_path_for_host, prepend_runtime_paths, require_nonempty, runtime_is_linux,
+    runtime_is_windows,
 };
 use rocm_engine_protocol::{
     DetectRequest, DetectResponse, DevicePolicy, ENGINE_RECIPE_CONTRACT_VERSION, EndpointRequest,
@@ -427,7 +427,6 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
         warnings,
     })
 }
-
 
 fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelResponse> {
     let device_policy = normalize_device_policy(request.device_policy)?;
