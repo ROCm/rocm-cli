@@ -9,10 +9,10 @@
 #![allow(clippy::unused_async, clippy::needless_pass_by_ref_mut)]
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use cucumber::{World as _, WriterExt as _};
 use e2e_cucumber::mock_server::MockServer;
+use tempfile::TempDir;
 
 mod e2e {
     pub mod chat_steps;
@@ -34,28 +34,22 @@ pub struct E2eWorld {
     pub cli_outputs: Option<Vec<String>>,
     pub cli_stderr: Option<String>,
     pub cli_rc: Option<i32>,
-    pub isolated_root: Option<PathBuf>,
+    /// Per-scenario isolated config/data/cache root. A `TempDir` so it is unique
+    /// per World and auto-removed on drop; using `tempfile` also keeps the OS
+    /// temp-dir lookup out of our source (avoids a CodeQL path-injection
+    /// false positive on `env::temp_dir()`).
+    pub isolated_root: Option<TempDir>,
 }
-
-/// Per-World counter so each scenario gets its own isolated root. Keying only on
-/// PID made all concurrent scenarios share one config/data/cache tree, and the
-/// first scenario's `Drop` would `remove_dir_all` it out from under the others.
-static WORLD_SEQ: AtomicU64 = AtomicU64::new(0);
 
 impl Default for E2eWorld {
     fn default() -> Self {
-        let seq = WORLD_SEQ.fetch_add(1, Ordering::Relaxed);
-        // CodeQL flags `temp_dir()` (which reads TMPDIR) as a tainted path source.
-        // This is test-only code: the base is the OS temp dir and every joined
-        // segment is a program-controlled constant (pid, an atomic counter, and
-        // fixed names), so there is no attacker-controlled traversal.
-        let tmp = std::env::temp_dir().join(format!("rocm-e2e-{}-{}", std::process::id(), seq));
-        // codeql[rust/path-injection]
-        std::fs::create_dir_all(tmp.join("config")).ok();
-        // codeql[rust/path-injection]
-        std::fs::create_dir_all(tmp.join("data")).ok();
-        // codeql[rust/path-injection]
-        std::fs::create_dir_all(tmp.join("cache")).ok();
+        // A fresh TempDir per World gives each scenario its own isolated
+        // config/data/cache root (unique — concurrent scenarios never share a
+        // tree) and auto-removes it on drop.
+        let root = TempDir::with_prefix("rocm-e2e-").expect("failed to create temp dir");
+        for sub in ["config", "data", "cache"] {
+            std::fs::create_dir_all(root.path().join(sub)).ok();
+        }
 
         Self {
             mock: None,
@@ -67,7 +61,7 @@ impl Default for E2eWorld {
             cli_outputs: None,
             cli_stderr: None,
             cli_rc: None,
-            isolated_root: Some(tmp),
+            isolated_root: Some(root),
         }
     }
 }
@@ -75,6 +69,7 @@ impl Default for E2eWorld {
 impl E2eWorld {
     pub fn isolate_cmd(&self, cmd: &mut std::process::Command) {
         if let Some(root) = &self.isolated_root {
+            let root = root.path();
             cmd.env("ROCM_CLI_CONFIG_DIR", root.join("config"));
             cmd.env("ROCM_CLI_DATA_DIR", root.join("data"));
             cmd.env("ROCM_CLI_CACHE_DIR", root.join("cache"));
@@ -93,7 +88,7 @@ impl E2eWorld {
         let mock = self.mock.as_ref().expect("no mock server running");
         let model = self.model_name.as_deref().expect("no model name set");
         let port = mock.port();
-        let services = root.join("data").join("services");
+        let services = root.path().join("data").join("services");
         std::fs::create_dir_all(&services).expect("failed to create services dir");
 
         // The CLI only extracts host:port from `endpoint_url` and appends
@@ -135,9 +130,7 @@ impl Drop for E2eWorld {
         if let Some(mock) = self.mock.take() {
             mock.stop();
         }
-        if let Some(root) = self.isolated_root.take() {
-            std::fs::remove_dir_all(root).ok();
-        }
+        // `isolated_root` is a `TempDir`; its own Drop removes the directory.
     }
 }
 

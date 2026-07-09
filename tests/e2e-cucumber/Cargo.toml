@@ -17,6 +17,7 @@ maud = "0.27"
 reqwest = { version = "0.13", features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true
+tempfile = "3"
 tokio.workspace = true
 
 [[test]]
