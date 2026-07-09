@@ -143,6 +143,59 @@ fn scenario_duration(el: &Element) -> u64 {
     el.steps.iter().map(|s| s.result.duration).sum()
 }
 
+/// Outcome of a known-bugs ("expect failures") run.
+///
+/// In this mode a tagged scenario failing is the *expected* result (the bug
+/// still reproduces), and a tagged scenario passing is the alarming one — the
+/// bug was silently fixed and its `@expected-failure` tag should be removed so
+/// the scenario moves into the blocking suite.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct XfailReport {
+    /// Scenarios tagged `@expected-failure` that failed as expected (xfail).
+    pub xfail: u32,
+    /// Scenarios tagged `@expected-failure` that unexpectedly passed (XPASS) —
+    /// these make the run fail so the stale tag gets noticed.
+    pub xpass: Vec<String>,
+    /// Scenarios NOT tagged `@expected-failure` that failed — a known-bugs run
+    /// should only contain tagged scenarios, so an untagged failure is a real
+    /// regression and also fails the run.
+    pub untagged_failures: Vec<String>,
+}
+
+impl XfailReport {
+    /// The run is healthy when every expected-failure scenario failed and there
+    /// were no XPASS scenarios or untagged failures.
+    pub const fn is_ok(&self) -> bool {
+        self.xpass.is_empty() && self.untagged_failures.is_empty()
+    }
+}
+
+const EXPECTED_FAILURE_TAG: &str = "expected-failure";
+
+/// Evaluate a completed known-bugs run from its `report.json`, applying xfail
+/// inversion: expected-failure scenarios are meant to fail.
+///
+/// Tag names in the cucumber JSON are stored without the leading `@`.
+pub fn evaluate_xfail(json_path: &Path) -> std::io::Result<XfailReport> {
+    let json = std::fs::read_to_string(json_path)?;
+    let features: Vec<Feature> = serde_json::from_str(&json).unwrap_or_default();
+
+    let mut report = XfailReport::default();
+    for f in &features {
+        for el in &f.elements {
+            let tagged = el.tags.iter().any(|t| t.name == EXPECTED_FAILURE_TAG);
+            let failed = scenario_status(el) == "failed";
+            match (tagged, failed) {
+                (true, true) => report.xfail += 1,
+                (true, false) => report.xpass.push(el.name.clone()),
+                (false, true) => report.untagged_failures.push(el.name.clone()),
+                (false, false) => {}
+            }
+        }
+    }
+    Ok(report)
+}
+
 pub fn generate(json_path: &Path, html_path: &Path) -> std::io::Result<()> {
     let json = std::fs::read_to_string(json_path)?;
     let features: Vec<Feature> = serde_json::from_str(&json).unwrap_or_default();
@@ -472,6 +525,77 @@ mod tests {
             scenario_status(&scenario_from(&["passed", "passed"])),
             "passed"
         );
+    }
+
+    fn write_report(features_json: &str) -> tempfile::NamedTempFile {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        f.write_all(features_json.as_bytes()).expect("write json");
+        f
+    }
+
+    // One feature with scenarios; each scenario is (tags, step-statuses).
+    fn feature_json(scenarios: &[(&[&str], &[&str])]) -> String {
+        let els: Vec<String> = scenarios
+            .iter()
+            .enumerate()
+            .map(|(i, (tags, statuses))| {
+                let tags = tags
+                    .iter()
+                    .map(|t| format!(r#"{{"name":"{t}"}}"#))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let steps = statuses
+                    .iter()
+                    .map(|s| {
+                        format!(r#"{{"keyword":"Given ","name":"x","result":{{"status":"{s}"}}}}"#)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(r#"{{"name":"s{i}","tags":[{tags}],"steps":[{steps}]}}"#)
+            })
+            .collect();
+        format!(
+            r#"[{{"name":"F","uri":"f.feature","elements":[{}]}}]"#,
+            els.join(",")
+        )
+    }
+
+    #[test]
+    fn xfail_all_tagged_failing_is_ok() {
+        let f = write_report(&feature_json(&[
+            (&["expected-failure"], &["failed"]),
+            (
+                &["expected-failure", "expected-failure-EAI-7219"],
+                &["passed", "failed"],
+            ),
+        ]));
+        let r = evaluate_xfail(f.path()).expect("evaluate");
+        assert_eq!(r.xfail, 2);
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn xfail_tagged_passing_is_xpass_and_not_ok() {
+        // A known bug that now passes must fail the run so the stale tag is noticed.
+        let f = write_report(&feature_json(&[
+            (&["expected-failure"], &["failed"]),
+            (&["expected-failure"], &["passed", "passed"]),
+        ]));
+        let r = evaluate_xfail(f.path()).expect("evaluate");
+        assert_eq!(r.xfail, 1);
+        assert_eq!(r.xpass, vec!["s1".to_string()]);
+        assert!(!r.is_ok());
+    }
+
+    #[test]
+    fn xfail_untagged_failure_is_not_ok() {
+        // An untagged scenario shouldn't be in a known-bugs run; if it fails,
+        // that's a real regression.
+        let f = write_report(&feature_json(&[(&[], &["failed"])]));
+        let r = evaluate_xfail(f.path()).expect("evaluate");
+        assert_eq!(r.untagged_failures, vec!["s0".to_string()]);
+        assert!(!r.is_ok());
     }
 
     #[test]

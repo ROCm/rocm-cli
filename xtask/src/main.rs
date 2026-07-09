@@ -115,6 +115,13 @@ enum Command {
     /// Extra arguments after the command are forwarded to the cucumber CLI, e.g.
     /// `cargo xtask e2e -- -t "not @expected-failure-EAI-*"`.
     E2e {
+        /// Known-bugs mode: invert the pass/fail signal for `@expected-failure`
+        /// scenarios. The run is green when every tagged scenario fails as
+        /// expected (xfail) and red only when one unexpectedly passes (XPASS —
+        /// the bug was fixed, drop the tag) or a parse/hook error occurs. Pair
+        /// with `-- -t "@expected-failure and not @gpu"`.
+        #[arg(long)]
+        expect_failures: bool,
         /// Arguments forwarded verbatim to the cucumber test binary (tag filters
         /// `-t`, name filters `-n`, `--fail-fast`, etc.).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -170,7 +177,10 @@ fn run() -> Result<()> {
                 verify_commits::run(base, require_verified)?;
             }
         }
-        Command::E2e { args } => e2e::run(&args)?,
+        Command::E2e {
+            expect_failures,
+            args,
+        } => e2e::run(&args, expect_failures)?,
         Command::PowershellLint { shell, files } => powershell::run(shell, files)?,
     }
     Ok(())

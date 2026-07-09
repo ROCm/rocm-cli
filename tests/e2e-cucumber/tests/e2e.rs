@@ -217,6 +217,43 @@ async fn main() {
 
     eprintln!("Report: {}/report.html", dir.display());
 
+    // Known-bugs mode (`cargo xtask e2e --expect-failures`): the suite is filtered
+    // to `@expected-failure` scenarios, whose failing IS the expected outcome. A
+    // parse/hook error still fails outright (the run didn't execute cleanly);
+    // otherwise invert the step-failure signal via xfail/XPASS accounting.
+    if std::env::var_os("E2E_EXPECT_FAILURES").is_some() {
+        if summary.parsing_errors() > 0 || summary.hook_errors() > 0 {
+            eprintln!(
+                "E2E run errored: {} parsing error(s), {} hook error(s)",
+                summary.parsing_errors(),
+                summary.hook_errors(),
+            );
+            std::process::exit(1);
+        }
+        let xfail = e2e_cucumber::report::evaluate_xfail(&dir.join("report.json"))
+            .expect("failed to evaluate xfail report");
+        eprintln!(
+            "Known-bugs run: {} scenario(s) failed as expected (xfail).",
+            xfail.xfail,
+        );
+        if !xfail.is_ok() {
+            for name in &xfail.xpass {
+                eprintln!(
+                    "XPASS: '{name}' is tagged @expected-failure but PASSED \u{2014} the bug \
+                     appears fixed; remove the tag so it joins the blocking suite.",
+                );
+            }
+            for name in &xfail.untagged_failures {
+                eprintln!(
+                    "FAIL: '{name}' failed but is not tagged @expected-failure \u{2014} a real \
+                     regression in the known-bugs run.",
+                );
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if summary.execution_has_failed() {
         eprintln!(
             "E2E run failed: {} failed step(s), {} parsing error(s), {} hook error(s)",
