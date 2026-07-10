@@ -3845,6 +3845,70 @@ fn protocol_engine_recipe_hint(
         })
 }
 
+/// The vLLM launch flags required for OpenAI tool-calling to work.
+///
+/// The TUI chat tab always attaches tool definitions to non-streaming chat
+/// requests (`tool_choice: "auto"`). vLLM rejects those with HTTP 400 unless it
+/// was started with `--enable-auto-tool-choice` *and* a matching
+/// `--tool-call-parser`. The parser value is model-specific, so it is derived
+/// from the model ref. A mismatched-but-valid parser only degrades tool-call
+/// parsing for that model (chat still works and never 400s), so `hermes` — the
+/// parser used by the Qwen family that dominates the built-in catalog — is a safe
+/// default for unrecognized families.
+fn vllm_tool_choice_flags(model_ref: &str) -> Vec<String> {
+    let lower = model_ref.to_ascii_lowercase();
+    let parser = if lower.contains("llama") {
+        "llama3_json"
+    } else if lower.contains("mistral") || lower.contains("mixtral") {
+        "mistral"
+    } else {
+        // Qwen and every other family fall back to the hermes parser.
+        "hermes"
+    };
+    vec![
+        "--enable-auto-tool-choice".to_owned(),
+        "--tool-call-parser".to_owned(),
+        parser.to_owned(),
+    ]
+}
+
+/// Ensures a vLLM serve carries the tool-choice launch flags so TUI chat works
+/// out of the box (EAI-7223).
+///
+/// Only vLLM needs this — other engines either accept tools without extra flags
+/// or are not affected. Recipe-authored flags win: if the hint already requests
+/// `--enable-auto-tool-choice`, it is left untouched. When no recipe hint exists
+/// (arbitrary HF repos, or a catalog model forced onto a non-preferred engine),
+/// a minimal hint is synthesized carrying just the tool-choice flags.
+fn engine_recipe_with_tool_choice(
+    engine: &str,
+    model_ref: &str,
+    hint: Option<EngineRecipeHint>,
+) -> Option<EngineRecipeHint> {
+    if !engine.eq_ignore_ascii_case("vllm") {
+        return hint;
+    }
+    match hint {
+        Some(mut hint) => {
+            let already_set = hint
+                .required_flags
+                .iter()
+                .any(|flag| flag == "--enable-auto-tool-choice");
+            if !already_set {
+                hint.required_flags
+                    .extend(vllm_tool_choice_flags(model_ref));
+            }
+            Some(hint)
+        }
+        None => Some(EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: engine.to_owned(),
+            required_flags: vllm_tool_choice_flags(model_ref),
+            ..EngineRecipeHint::default()
+        }),
+    }
+}
+
 /// Parsed `rocm serve` arguments. Grouped into a struct to keep the dispatcher
 /// and `serve()` readable now that the verb carries verbose/smoke-test controls.
 struct ServeArgs {
@@ -3906,12 +3970,18 @@ fn serve(args: ServeArgs) -> Result<()> {
         host_gpu_summary.as_ref(),
     );
     let selected_engine = serve_engine.engine.clone();
-    let engine_recipe = shared_recipe
+    let engine_model_ref =
+        serve_model_ref_for_engine(&model, shared_recipe.as_ref(), &selected_engine);
+    let recipe_hint = shared_recipe
         .as_ref()
         .filter(|recipe| model_recipe_supports_engine(recipe, &selected_engine))
         .and_then(|recipe| protocol_engine_recipe_hint(recipe, &selected_engine));
-    let engine_model_ref =
-        serve_model_ref_for_engine(&model, shared_recipe.as_ref(), &selected_engine);
+    // vLLM rejects the TUI chat tab's tool-bearing requests with HTTP 400 unless
+    // it is launched with `--enable-auto-tool-choice`/`--tool-call-parser`, so
+    // inject those flags for every vLLM serve regardless of catalog coverage
+    // (EAI-7223).
+    let engine_recipe =
+        engine_recipe_with_tool_choice(&selected_engine, &engine_model_ref, recipe_hint);
     let device_policy = parse_device_policy(device.as_deref())?;
     let gpu_selection = parse_gpu_selection(gpu.as_deref())?;
     // CPU-only serving never pins a GPU, so skip GPU resolution entirely and
@@ -20261,6 +20331,109 @@ install therock";
         ));
         assert!(serve_lines.contains("engine_recipe_required_flags: --enable-auto-tool-choice"));
         assert!(protocol_engine_recipe_hint(&recipe, "unknown-engine").is_none());
+    }
+
+    #[test]
+    fn vllm_tool_choice_flags_selects_parser_by_model_family() {
+        assert_eq!(
+            vllm_tool_choice_flags("Qwen/Qwen2.5-1.5B-Instruct"),
+            vec![
+                "--enable-auto-tool-choice".to_owned(),
+                "--tool-call-parser".to_owned(),
+                "hermes".to_owned(),
+            ]
+        );
+        assert_eq!(
+            vllm_tool_choice_flags("meta-llama/Llama-3.2-3B-Instruct"),
+            vec![
+                "--enable-auto-tool-choice".to_owned(),
+                "--tool-call-parser".to_owned(),
+                "llama3_json".to_owned(),
+            ]
+        );
+        // Unrecognized families fall back to the hermes parser.
+        assert_eq!(
+            vllm_tool_choice_flags("some-org/mystery-model"),
+            vec![
+                "--enable-auto-tool-choice".to_owned(),
+                "--tool-call-parser".to_owned(),
+                "hermes".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn engine_recipe_with_tool_choice_synthesizes_hint_for_vllm_without_recipe() {
+        let hint = engine_recipe_with_tool_choice("vllm", "Qwen/Qwen2.5-1.5B-Instruct", None)
+            .expect("vllm serve should get a synthesized tool-choice hint");
+        assert_eq!(hint.engine, "vllm");
+        assert_eq!(hint.contract_version, ENGINE_RECIPE_CONTRACT_VERSION);
+        assert_eq!(
+            hint.required_flags,
+            vec![
+                "--enable-auto-tool-choice".to_owned(),
+                "--tool-call-parser".to_owned(),
+                "hermes".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn engine_recipe_with_tool_choice_appends_to_existing_recipe_flags() {
+        let existing = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "vllm".to_owned(),
+            required_flags: vec!["--reasoning-parser".to_owned(), "qwen3".to_owned()],
+            ..EngineRecipeHint::default()
+        };
+        let hint =
+            engine_recipe_with_tool_choice("vllm", "Qwen/Qwen3.5-4B", Some(existing)).unwrap();
+        assert_eq!(
+            hint.required_flags,
+            vec![
+                "--reasoning-parser".to_owned(),
+                "qwen3".to_owned(),
+                "--enable-auto-tool-choice".to_owned(),
+                "--tool-call-parser".to_owned(),
+                "hermes".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn engine_recipe_with_tool_choice_preserves_recipe_authored_tool_choice() {
+        let existing = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "vllm".to_owned(),
+            required_flags: vec![
+                "--enable-auto-tool-choice".to_owned(),
+                "--tool-call-parser".to_owned(),
+                "llama3_json".to_owned(),
+            ],
+            ..EngineRecipeHint::default()
+        };
+        let hint =
+            engine_recipe_with_tool_choice("vllm", "some/qwen-model", Some(existing.clone()))
+                .unwrap();
+        // Recipe-authored tool-choice flags win: no duplication, parser unchanged.
+        assert_eq!(hint.required_flags, existing.required_flags);
+    }
+
+    #[test]
+    fn engine_recipe_with_tool_choice_leaves_non_vllm_engines_untouched() {
+        assert!(
+            engine_recipe_with_tool_choice("lemonade", "Qwen/Qwen2.5-1.5B-Instruct", None)
+                .is_none()
+        );
+        let existing = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "lemonade".to_owned(),
+            required_flags: vec!["--some-flag".to_owned()],
+            ..EngineRecipeHint::default()
+        };
+        let hint =
+            engine_recipe_with_tool_choice("lemonade", "model", Some(existing.clone())).unwrap();
+        assert_eq!(hint.required_flags, existing.required_flags);
     }
 
     #[test]
