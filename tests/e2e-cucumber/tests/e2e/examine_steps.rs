@@ -6,24 +6,9 @@ use cucumber::{given, then, when};
 
 use crate::E2eWorld;
 
-fn run_rocm(world: &E2eWorld, args: &[&str]) -> (String, String, i32) {
-    let binary = crate::rocm_binary();
-    let mut cmd = std::process::Command::new(&binary);
-    cmd.args(args);
-    world.isolate_cmd(&mut cmd);
-    let output = cmd
-        .output()
-        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
-    (
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-        output.status.code().unwrap_or(-1),
-    )
-}
-
 #[given("a machine with an AMD GPU")]
 async fn setup_gpu_machine(world: &mut E2eWorld) {
-    let (stdout, _, _) = run_rocm(world, &["examine"]);
+    let (stdout, _, _) = crate::run_rocm(world, &["examine"]);
     assert!(
         stdout.contains("AMD GPU detected") || stdout.contains("detected_gfx_target"),
         "no AMD GPU detected on this machine:\n{stdout}"
@@ -35,19 +20,19 @@ async fn setup_unmanaged_rocm(_world: &mut E2eWorld) {}
 
 #[when("the user asks for the version")]
 async fn user_asks_version(world: &mut E2eWorld) {
-    let (stdout, _, _) = run_rocm(world, &["version"]);
+    let (stdout, _, _) = crate::run_rocm(world, &["version"]);
     world.cli_output = Some(stdout);
 }
 
 #[when("the user lists available engines")]
 async fn user_lists_engines(world: &mut E2eWorld) {
-    let (stdout, _, _) = run_rocm(world, &["engines", "list"]);
+    let (stdout, _, _) = crate::run_rocm(world, &["engines", "list"]);
     world.cli_output = Some(stdout);
 }
 
 #[when("the user inspects the system")]
 async fn user_inspects_system(world: &mut E2eWorld) {
-    let (stdout, _, _) = run_rocm(world, &["examine"]);
+    let (stdout, _, _) = crate::run_rocm(world, &["examine"]);
     world.cli_output = Some(stdout);
 }
 

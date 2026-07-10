@@ -437,6 +437,32 @@ struct PlatformReport {
     /// is a known-bugs run, whose health follows xfail inversion rather than a
     /// plain zero-failures rule.
     is_known_bugs: bool,
+    /// Recorded `rocm` invocations from this platform's `commands.jsonl`.
+    commands: Vec<CommandRecord>,
+}
+
+/// One recorded `rocm` invocation from a platform's `commands.jsonl` sidecar.
+#[derive(Deserialize)]
+struct CommandRecord {
+    scenario: Option<String>,
+    subcommand: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    engine: Option<String>,
+}
+
+/// Read a platform's `commands.jsonl` (sibling of `report.json`). Missing file =
+/// no records (older artifacts, or a platform that recorded none).
+fn parse_commands(json_path: &Path) -> Vec<CommandRecord> {
+    let path = json_path.with_file_name("commands.jsonl");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
 }
 
 impl PlatformReport {
@@ -450,6 +476,7 @@ impl PlatformReport {
             .any(|el| el.tags.iter().any(|t| t.name == EXPECTED_FAILURE_TAG));
         let desc = parse_descriptor(&artifact);
         let label = format!("{} {} ({})", desc.platform, desc.os, desc.tier());
+        let commands = parse_commands(json_path);
         Self {
             desc,
             label,
@@ -457,7 +484,17 @@ impl PlatformReport {
             stats,
             xfail,
             is_known_bugs,
+            commands,
         }
+    }
+
+    /// Map each scenario name → whether it passed (all steps passed/skipped).
+    fn scenario_pass_map(&self) -> std::collections::HashMap<String, bool> {
+        self.features
+            .iter()
+            .flat_map(|f| &f.elements)
+            .map(|el| (el.name.clone(), scenario_status(el) != "failed"))
+            .collect()
     }
 
     /// A row is healthy (green) when it is in its expected state: for a normal
@@ -659,6 +696,110 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
             out.push_str(&n);
             out.push('\n');
         }
+    }
+
+    out.push_str(&command_coverage_markdown(&reports));
+
+    out
+}
+
+/// A command signature: what we group invocations by in the coverage table.
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone)]
+struct CommandKey {
+    subcommand: String,
+    model: String,
+    engine: String,
+}
+
+/// Build the "which rocm commands are exercised, with which models/engines, on
+/// which platform, and do they work" coverage table.
+///
+/// For each (command, model, engine) × platform cell: ✅ if every scenario that
+/// ran that command on that platform passed, ❌ if any failed, blank if the
+/// command was never run there. "Passed" follows the scenario's own result, so a
+/// command that is *supposed* to be rejected (its scenario asserts the failure)
+/// still reads as ✅ — the tested behaviour held.
+fn command_coverage_markdown(reports: &[PlatformReport]) -> String {
+    use std::collections::BTreeMap;
+    use std::fmt::Write as _;
+
+    // Platform columns in matrix order (platform+os), de-duplicated across tiers.
+    let mut columns: Vec<String> = Vec::new();
+    for r in reports {
+        let col = format!("{} {}", r.desc.platform, r.desc.os);
+        if !columns.contains(&col) {
+            columns.push(col);
+        }
+    }
+
+    // key → (column → all-passed-so-far). None = not run in that column.
+    let mut cells: BTreeMap<CommandKey, BTreeMap<String, bool>> = BTreeMap::new();
+    for r in reports {
+        let col = format!("{} {}", r.desc.platform, r.desc.os);
+        let passed = r.scenario_pass_map();
+        for c in &r.commands {
+            let key = CommandKey {
+                subcommand: c.subcommand.clone(),
+                model: c.model.clone().unwrap_or_default(),
+                engine: c.engine.clone().unwrap_or_default(),
+            };
+            // A command's cell is healthy only if EVERY scenario that ran it on
+            // this platform passed; an unknown scenario is treated as passed
+            // (the command ran and we have no failing evidence).
+            let ok = c
+                .scenario
+                .as_deref()
+                .and_then(|s| passed.get(s).copied())
+                .unwrap_or(true);
+            let entry = cells
+                .entry(key)
+                .or_default()
+                .entry(col.clone())
+                .or_insert(true);
+            *entry = *entry && ok;
+        }
+    }
+
+    if cells.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("\n### Command coverage\n\n");
+    out.push_str("_Which `rocm` commands are exercised, with which model/engine, per platform. ");
+    out.push_str("✅ tested & behaved as expected · ❌ failed · blank = not run there._\n\n");
+
+    out.push_str("| Command | Model | Engine |");
+    for col in &columns {
+        let _ = write!(out, " {col} |");
+    }
+    out.push('\n');
+    out.push_str("|---|---|---|");
+    for _ in &columns {
+        out.push_str(":--:|");
+    }
+    out.push('\n');
+
+    for (key, per_col) in &cells {
+        let model = if key.model.is_empty() {
+            "—"
+        } else {
+            &key.model
+        };
+        let engine = if key.engine.is_empty() {
+            "—"
+        } else {
+            &key.engine
+        };
+        let _ = write!(out, "| `{}` | {} | {} |", key.subcommand, model, engine);
+        for col in &columns {
+            let mark = match per_col.get(col) {
+                Some(true) => " ✅ |",
+                Some(false) => " ❌ |",
+                None => " |",
+            };
+            out.push_str(mark);
+        }
+        out.push('\n');
     }
 
     out
@@ -1210,5 +1351,46 @@ mod tests {
         assert!(html.contains("Mock"));
         assert!(html.contains("Platforms"));
         assert!(html.contains("Legend"));
+    }
+
+    #[test]
+    fn command_coverage_ties_to_scenario_not_rc() {
+        // A scenario that PASSES while its command exited non-zero (e.g. an
+        // adoption that is supposed to be rejected) must read ✅ — coverage
+        // follows the scenario result, not the raw rc.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let report = dir.path().join("report.json");
+        // One scenario "s0" that passed, one "s1" that failed.
+        std::fs::write(
+            &report,
+            feature_json(&[(&[], &["passed"]), (&[], &["failed"])]),
+        )
+        .expect("write report");
+        // s0 ran `runtimes adopt` (rc=1 but scenario passed) → ✅.
+        // s1 ran `serve` (scenario failed) → ❌.
+        std::fs::write(
+            dir.path().join("commands.jsonl"),
+            concat!(
+                r#"{"scenario":"s0","subcommand":"rocm runtimes adopt","model":null,"engine":null,"rc":1}"#,
+                "\n",
+                r#"{"scenario":"s1","subcommand":"rocm serve --engine","model":"Qwen","engine":"vllm","rc":0}"#,
+                "\n",
+            ),
+        )
+        .expect("write commands");
+
+        let inputs = vec![("e2e-gpu-report".to_string(), report)];
+        let md = consolidated_summary_markdown(&inputs);
+        assert!(md.contains("### Command coverage"));
+        // adoption: rc=1 but scenario passed → ✅
+        assert!(
+            md.contains("| `rocm runtimes adopt` | — | — | ✅ |"),
+            "adopt should be ✅ (scenario passed despite rc=1):\n{md}"
+        );
+        // serve: scenario failed → ❌, with model/engine surfaced
+        assert!(
+            md.contains("| `rocm serve --engine` | Qwen | vllm | ❌ |"),
+            "serve should be ❌ with model/engine:\n{md}"
+        );
     }
 }

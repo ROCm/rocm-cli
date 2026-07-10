@@ -10,21 +10,6 @@ use cucumber::{given, then, when};
 use crate::E2eWorld;
 use e2e_cucumber::mock_server::MockServer;
 
-fn run_rocm(world: &E2eWorld, args: &[&str]) -> (String, String, i32) {
-    let binary = crate::rocm_binary();
-    let mut cmd = Command::new(&binary);
-    cmd.args(args);
-    world.isolate_cmd(&mut cmd);
-    let output = cmd
-        .output()
-        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
-    (
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-        output.status.code().unwrap_or(-1),
-    )
-}
-
 /// How long to wait for a freshly served model's endpoint to become ready.
 ///
 /// On real GPU hardware the first serve of a model downloads its weights and
@@ -80,7 +65,7 @@ async fn setup_gpu_model(world: &mut E2eWorld) {
     // not resolve aliases) and sink every downstream scenario for a bug they
     // aren't testing. Alias resolution has its own dedicated scenarios in
     // model_serving.feature.
-    let (stdout, _, rc) = run_rocm(
+    let (stdout, _, rc) = crate::run_rocm(
         world,
         &[
             "serve",
@@ -103,7 +88,7 @@ async fn setup_lemonade_model(world: &mut E2eWorld) {
     // the parallel of setup_gpu_model's vLLM path, giving both engines their own
     // serve+inference coverage. Qwen3-0.6B-GGUF is the smallest lemonade recipe.
     let model = "Qwen3-0.6B-GGUF";
-    let (stdout, _, rc) = run_rocm(
+    let (stdout, _, rc) = crate::run_rocm(
         world,
         &["serve", model, "--engine", "lemonade", "--managed"],
     );
@@ -120,7 +105,7 @@ async fn setup_background_model(world: &mut E2eWorld) {
 
 #[given("the served model has been detected")]
 async fn setup_model_detected(world: &mut E2eWorld) {
-    let (stdout, _, _) = run_rocm(world, &["services", "list"]);
+    let (stdout, _, _) = crate::run_rocm(world, &["services", "list"]);
     let model = world.model_name.as_deref().unwrap_or("");
     assert!(
         stdout.contains(model),
@@ -132,7 +117,7 @@ async fn setup_model_detected(world: &mut E2eWorld) {
 
 #[when("the user serves a model using its short name")]
 async fn user_serves_short_name(world: &mut E2eWorld) {
-    let (stdout, _, _) = run_rocm(world, &["serve", "qwen2.5", "--engine", "vllm"]);
+    let (stdout, _, _) = crate::run_rocm(world, &["serve", "qwen2.5", "--engine", "vllm"]);
     world.cli_output = Some(stdout);
 }
 
@@ -140,7 +125,7 @@ async fn user_serves_short_name(world: &mut E2eWorld) {
 async fn user_serves_multiple_engines(world: &mut E2eWorld) {
     let mut outputs = Vec::new();
     for engine in ["lemonade", "vllm"] {
-        let (stdout, _, _) = run_rocm(world, &["serve", "qwen2.5", "--engine", engine]);
+        let (stdout, _, _) = crate::run_rocm(world, &["serve", "qwen2.5", "--engine", engine]);
         outputs.push(stdout);
     }
     world.cli_outputs = Some(outputs);
@@ -148,7 +133,7 @@ async fn user_serves_multiple_engines(world: &mut E2eWorld) {
 
 #[when("the user lists running services")]
 async fn user_lists_services(world: &mut E2eWorld) {
-    let (stdout, _, _) = run_rocm(world, &["services", "list"]);
+    let (stdout, _, _) = crate::run_rocm(world, &["services", "list"]);
     world.cli_output = Some(stdout);
 }
 
@@ -158,7 +143,8 @@ async fn user_serves_default_engine(world: &mut E2eWorld) {
     // serve by the canonical ID — using the `qwen2.5` alias would make the
     // scenario also depend on EAI-7219 being fixed. Omit `--engine` so the CLI
     // still picks the engine itself, which is the behavior under test.
-    let (stdout, _, rc) = run_rocm(world, &["serve", "Qwen/Qwen2.5-1.5B-Instruct", "--managed"]);
+    let (stdout, _, rc) =
+        crate::run_rocm(world, &["serve", "Qwen/Qwen2.5-1.5B-Instruct", "--managed"]);
     world.cli_output = Some(stdout);
     world.cli_rc = Some(rc);
     world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
@@ -174,7 +160,8 @@ async fn user_serves_vllm_capable_default(world: &mut E2eWorld) {
     // a GGUF-only model would legitimately fall through to lemonade regardless of
     // platform. Qwen2.5-0.5B is the smallest vLLM-preferred catalog entry. Omit
     // `--engine` so the CLI's own default selection is what's exercised.
-    let (stdout, _, rc) = run_rocm(world, &["serve", "Qwen/Qwen2.5-0.5B-Instruct", "--managed"]);
+    let (stdout, _, rc) =
+        crate::run_rocm(world, &["serve", "Qwen/Qwen2.5-0.5B-Instruct", "--managed"]);
     world.cli_output = Some(stdout);
     world.cli_rc = Some(rc);
 }
@@ -189,7 +176,7 @@ async fn when_cli_reports_ready(world: &mut E2eWorld) {
     // Read readiness from the CLI's own view (`services list`), not a direct
     // endpoint poll — this is the signal a user/automation waits on before
     // sending traffic (EAI-7333 concerns exactly this signal being trustworthy).
-    let (stdout, _, _) = run_rocm(world, &["services", "list"]);
+    let (stdout, _, _) = crate::run_rocm(world, &["services", "list"]);
     assert!(
         stdout.contains("ready"),
         "CLI does not report any service ready:\n{stdout}"
@@ -263,7 +250,7 @@ async fn assert_consistent_expansion(world: &mut E2eWorld) {
 
 #[then("the service appears with the correct model name and connection details")]
 async fn assert_service_in_list(world: &mut E2eWorld) {
-    let (stdout, _, _) = run_rocm(world, &["services", "list"]);
+    let (stdout, _, _) = crate::run_rocm(world, &["services", "list"]);
     let model = world.model_name.as_deref().unwrap_or("");
     assert!(
         stdout.to_lowercase().contains(&model.to_lowercase()),
@@ -279,7 +266,7 @@ async fn assert_service_in_list(world: &mut E2eWorld) {
 async fn assert_endpoint_port(world: &mut E2eWorld) {
     let mock = world.mock.as_ref().expect("no mock server running");
     let port = mock.port();
-    let (stdout, _, _) = run_rocm(world, &["services", "list"]);
+    let (stdout, _, _) = crate::run_rocm(world, &["services", "list"]);
     assert!(
         stdout.contains(&port.to_string()),
         "port {port} not found in services list:\n{stdout}"
