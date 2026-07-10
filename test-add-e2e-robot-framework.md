@@ -5,8 +5,7 @@
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-10
-
-**Token Usage:** in=2234 out=656753 cache_create=10780854 cache_read=345536971 calls=1124
+**Token Usage:** in=2548 out=742032 cache_create=10905384 cache_read=410288462 calls=1281
 
 ---
 
@@ -170,6 +169,21 @@ even on Instinct because vllm can't serve them. vLLM-capable safetensors (e.g.
   (18 behind origin, pre-`affected` subcommand) → `Test (affected crates)` failed with
   "unrecognized subcommand 'affected'". Fixed #98 + #99 by rebasing onto origin/main.
 - ✅ **CI security hardening** (PR #99 `ci-harden-actions`): SHA-pinned 4 remaining actions (checkout, cache, setup-rust-toolchain, dtolnay/rust-toolchain) across ci.yml/nightly.yml/release.yml + added `.github/dependabot.yml` (github-actions, weekly). Also applied repo settings: default token read-only, no PR approvals by actions. Post-merge: flip `sha_pinning_required` (after rebasing #69/#98 onto pinned main to avoid CI rejections).
+- ✅ **#98 MERGED** → main dispatchable. Rebased #69 onto new main (`0d5645e`).
+- ✅ **Runner-fix batch `317455d`** (signed, pushed) after live runs exposed real failures:
+  (a) Strix Windows `pwsh`→`powershell` — runner has NEITHER bash nor pwsh, only Windows PS 5.1;
+  the earlier `pwsh` bootstrap failed `pwsh: command not found`.
+  (b) Strix Ubuntu: earlier CARGO/RUSTUP/TMPDIR redirect was INSUFFICIENT — `/` AND `/home/ubuntu`
+  are BOTH full (only the 1.7T nvme at `/home/ubuntu/actions-runner` has space); rustup amends
+  `$HOME/.profile` → ENOSPC. Fix: set `HOME=/home/ubuntu/actions-runner/temp-home` + mkdir.
+  (c) Skip non-E2E jobs on `workflow_dispatch` (was waiting through clippy/prek/build).
+  (d) Known-bugs GPU tiers `E2E_SERVE_TIMEOUT_SECS=90` (fail-fast; note EAI-7052 already fast —
+  serves ~4s, hangs at inference bounded by the 10s inference cap).
+- 📋 **Verify batch on real runners** next run: Strix Win + Ubuntu toolchain bootstrap should now SUCCEED.
+- 📋 **Runner durability** (see [[persist-app-dev-ci-runner]]): app-dev `app-dev-gpu` runner lives ONLY
+  in the vscode dev pod on EPHEMERAL storage — dies if workspace shut down. Works now while pod + bare
+  `run.sh` stay up. Durable replacement (dedicated Deployment + GitHub App/PAT reg credential) designed,
+  NOT built — user paused; needs credential decision.
 
 ## Next Steps
 
@@ -355,3 +369,9 @@ addressed here with the exit-code fix + dedicated known-bugs job.
 - **Strix Linux HOME redirect**: root disk (/) + `/home/ubuntu` both full; `/home/ubuntu/actions-runner` is 1.7TB nvme mount (1% used). Confirmed rustup's `.profile` write fails ENOSPC on root fs. Added `HOME: /home/ubuntu/actions-runner/temp-home` + mkdir to redirect all of rustup's home-dir writes. **Staged, not committed.**
 - **Task #6 batch preparation**: combined 3 fixes (Windows pwsh, Linux HOME, 8 non-E2E skip-on-dispatch guards from earlier) into one uncommitted batch. All valid individually (tested during live run inspection); ready to commit + push once current PR CI run completes.
 - **app-dev runner analysis**: extracted full current pod spec (image, GPU resource requests, node labels, PVC mounts). Currently ephemeral (lives in vscode dev-workspace pod, emptyDir `/workload`, dies on pod restart). User confirmed: want to keep MI300X gfx943 runner active as a CI target after shutting down vscode. **Decision needed**: GitHub credential (PAT or App token) to enable auto-registration on Deployment startup. Plan: hand-rolled Deployment (one fixed runner, not ARC) to replicate pod spec independently + self-bootstrap via token API on startup.
+
+### 2026-07-10 (runner fixes + harness leak + box recovery)
+- ✅ **Batch commit `317455d`** (signed, pushed): Windows `powershell`, Linux `temp-home` HOME redirect, skip non-E2E on dispatch, known-bugs 90s serve timeout.
+- ✅ **Harness leak fix `b967d26`** (signed, pushed): E2E `Drop` now calls `rocm services stop <id> --yes` on all managed services recorded in scenario's isolated root before temp dir removed. Prevents vLLM/llama-server detached processes leaking on persistent runners. Container suite (mock 8/8) green pre-push.
+- ✅ **Box recovery**: app-dev pod accumulated 51 e2e roots + ~24 orphaned GPU processes from pre-leak-fix jobs. User ran cleanup (`pkill -f '/tmp/rocm-e2e...'`, `rm -rf /tmp/rocm-e2e-*`). Runner restarted with `RUNNER_ALLOW_RUNASROOT=1 nohup ./run.sh` (PowerShell guard requires explicit env var; original session had it set).
+- 📋 **Next run** (`b967d26`, pending): waiting for stale `0d5645e` PR run to drain off serial `app-dev-gpu` runner. Once it finishes/cancels, `b967d26` picks up with all fixes (Strix Windows/Linux bootstrap + teardown leak prevention).
