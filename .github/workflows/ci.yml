@@ -760,3 +760,55 @@ jobs:
         with:
           name: e2e-gpu-strix-windows-known-bugs-report
           path: tests/e2e-cucumber/results/
+
+  # Consolidate every platform/tier's report into ONE cross-platform report:
+  # a platform × tier matrix in the run Summary plus a single merged HTML
+  # artifact. `if: always()` so a failing/non-blocking platform still appears;
+  # runs on GitHub-hosted ubuntu (no GPU needed — it only parses report.json).
+  #
+  # Extensibility: the report CONTENT auto-includes any new platform via the
+  # `*-report` artifact glob below — no change needed here. The one manual step
+  # when adding a platform is appending its two job names to `needs:` (for run
+  # ORDERING only; GitHub Actions has no wildcard `needs`). A future matrix
+  # refactor of the 8 e2e jobs would remove even that.
+  e2e-report:
+    name: E2E consolidated report
+    runs-on: ubuntu-latest
+    needs:
+      - changes
+      - e2e
+      - e2e-known-bugs
+      - e2e-gpu
+      - e2e-gpu-known-bugs
+      - e2e-gpu-strix-ubuntu
+      - e2e-gpu-strix-ubuntu-known-bugs
+      - e2e-gpu-strix-windows
+      - e2e-gpu-strix-windows-known-bugs
+    if: always() && needs.changes.outputs.heavy == 'true'
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      # Pull every e2e artifact. Each extracts to e2e-artifacts/<artifact-name>/,
+      # which `xtask e2e-report` turns into one labeled platform. The `*-report`
+      # glob is what makes new platforms appear automatically.
+      - name: Download all E2E reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*-report'
+          path: e2e-artifacts
+
+      - name: Build consolidated report + step summary
+        run: |
+          mkdir -p consolidated
+          cargo xtask e2e-report \
+            --artifacts-dir e2e-artifacts \
+            --html-out consolidated/index.html >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload consolidated report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-consolidated-report
+          path: consolidated/

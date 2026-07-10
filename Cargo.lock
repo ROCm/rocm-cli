@@ -1216,12 +1216,22 @@ version = "0.3.0"
 dependencies = [
  "axum",
  "cucumber",
- "maud",
+ "e2e-report",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "e2e-report"
+version = "0.3.0"
+dependencies = [
+ "maud",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -5833,10 +5843,12 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
+ "e2e-report",
  "rocm-core",
  "semver",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

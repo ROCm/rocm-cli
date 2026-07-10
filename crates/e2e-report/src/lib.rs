@@ -2,8 +2,14 @@
 //
 // SPDX-License-Identifier: MIT
 
+//! HTML/markdown reporting for the cucumber E2E suite.
+//!
+//! Lives in its own lean crate (only `maud` + `serde`) so both the
+//! `e2e-cucumber` test harness and `xtask` can depend on it without pulling the
+//! harness's heavy tree (cucumber/axum/reqwest/tokio) into `xtask`.
+
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use maud::{DOCTYPE, Markup, PreEscaped, html};
@@ -143,6 +149,26 @@ fn scenario_duration(el: &Element) -> u64 {
     el.steps.iter().map(|s| s.result.duration).sum()
 }
 
+/// Read and parse a cucumber `report.json` into its feature list. A missing or
+/// malformed file yields an empty list rather than an error, so a single bad
+/// platform report never sinks a consolidated run.
+fn parse_features(json_path: &Path) -> Vec<Feature> {
+    std::fs::read_to_string(json_path)
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
+fn stats_of(features: &[Feature]) -> Stats {
+    let mut stats = Stats::new();
+    for f in features {
+        for el in &f.elements {
+            stats.add(scenario_status(el), scenario_duration(el));
+        }
+    }
+    stats
+}
+
 /// Outcome of a known-bugs ("expect failures") run.
 ///
 /// In this mode a tagged scenario failing is the *expected* result (the bug
@@ -172,16 +198,9 @@ impl XfailReport {
 
 const EXPECTED_FAILURE_TAG: &str = "expected-failure";
 
-/// Evaluate a completed known-bugs run from its `report.json`, applying xfail
-/// inversion: expected-failure scenarios are meant to fail.
-///
-/// Tag names in the cucumber JSON are stored without the leading `@`.
-pub fn evaluate_xfail(json_path: &Path) -> std::io::Result<XfailReport> {
-    let json = std::fs::read_to_string(json_path)?;
-    let features: Vec<Feature> = serde_json::from_str(&json).unwrap_or_default();
-
+fn evaluate_xfail_features(features: &[Feature]) -> XfailReport {
     let mut report = XfailReport::default();
-    for f in &features {
+    for f in features {
         for el in &f.elements {
             let tagged = el.tags.iter().any(|t| t.name == EXPECTED_FAILURE_TAG);
             let failed = scenario_status(el) == "failed";
@@ -193,7 +212,17 @@ pub fn evaluate_xfail(json_path: &Path) -> std::io::Result<XfailReport> {
             }
         }
     }
-    Ok(report)
+    report
+}
+
+/// Evaluate a completed known-bugs run from its `report.json`, applying xfail
+/// inversion: expected-failure scenarios are meant to fail.
+///
+/// Tag names in the cucumber JSON are stored without the leading `@`.
+pub fn evaluate_xfail(json_path: &Path) -> std::io::Result<XfailReport> {
+    let json = std::fs::read_to_string(json_path)?;
+    let features: Vec<Feature> = serde_json::from_str(&json).unwrap_or_default();
+    Ok(evaluate_xfail_features(&features))
 }
 
 pub fn generate(json_path: &Path, html_path: &Path) -> std::io::Result<()> {
@@ -222,10 +251,7 @@ pub fn generate(json_path: &Path, html_path: &Path) -> std::io::Result<()> {
         }
     }
 
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| format_utc(d.as_secs()))
-        .unwrap_or_default();
+    let now = now_utc();
 
     let overall_status = all.status_text();
     let status_class = overall_status.to_lowercase();
@@ -276,16 +302,7 @@ pub fn generate(json_path: &Path, html_path: &Path) -> std::io::Result<()> {
                 h2 { "Test Details" }
                 div.details {
                     @for feature in &features {
-                        div.feature-group {
-                            div.feature-title {
-                                "Feature: " (feature.name) " "
-                                span.elapsed { "(" (feature.uri) }
-                                ")"
-                            }
-                            @for scenario in &feature.elements {
-                                (scenario_block(scenario))
-                            }
-                        }
+                        (feature_group(feature))
                     }
                 }
             }
@@ -293,6 +310,262 @@ pub fn generate(json_path: &Path, html_path: &Path) -> std::io::Result<()> {
     };
 
     std::fs::write(html_path, markup.into_string())
+}
+
+/// A single platform/job's parsed report plus its derived health.
+///
+/// One of these corresponds to one uploaded `*-report` artifact (a
+/// platform × tier combination, e.g. "GPU Strix Ubuntu (known bugs)").
+struct PlatformReport {
+    label: String,
+    features: Vec<Feature>,
+    stats: Stats,
+    xfail: XfailReport,
+    /// True when the report contains any `@expected-failure` scenario — i.e. it
+    /// is a known-bugs run, whose health follows xfail inversion rather than a
+    /// plain zero-failures rule.
+    is_known_bugs: bool,
+}
+
+impl PlatformReport {
+    fn load(label: String, json_path: &Path) -> Self {
+        let features = parse_features(json_path);
+        let stats = stats_of(&features);
+        let xfail = evaluate_xfail_features(&features);
+        let is_known_bugs = features
+            .iter()
+            .flat_map(|f| &f.elements)
+            .any(|el| el.tags.iter().any(|t| t.name == EXPECTED_FAILURE_TAG));
+        Self {
+            label,
+            features,
+            stats,
+            xfail,
+            is_known_bugs,
+        }
+    }
+
+    /// A row is healthy (green) when it is in its expected state: for a normal
+    /// tier, no failures; for a known-bugs tier, no XPASS and no untagged
+    /// failures (the known bugs are supposed to fail).
+    const fn ok(&self) -> bool {
+        if self.is_known_bugs {
+            self.xfail.is_ok()
+        } else {
+            self.stats.failed == 0 && self.stats.total > 0
+        }
+    }
+
+    const fn status_text(&self) -> &'static str {
+        if self.stats.total == 0 {
+            "EMPTY"
+        } else if self.ok() {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    }
+}
+
+/// Build one consolidated HTML report from several per-platform `report.json`
+/// files.
+///
+/// `inputs` is `(label, json_path)` pairs; the label identifies the
+/// platform/tier (e.g. "GPU Strix Windows (known bugs)"). New platforms need no
+/// code change — the caller just passes more inputs.
+pub fn generate_consolidated(inputs: &[(String, PathBuf)], html_out: &Path) -> std::io::Result<()> {
+    let reports: Vec<PlatformReport> = inputs
+        .iter()
+        .map(|(label, path)| PlatformReport::load(label.clone(), path))
+        .collect();
+
+    let now = now_utc();
+    let all_ok = reports.iter().all(PlatformReport::ok);
+    let overall = if reports.is_empty() {
+        ("status-fail", "No platform reports found".to_string())
+    } else if all_ok {
+        ("status-pass", "All platforms in expected state".to_string())
+    } else {
+        let bad = reports.iter().filter(|r| !r.ok()).count();
+        ("status-fail", format!("{bad} platform(s) need attention"))
+    };
+
+    let markup = html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                title { "Consolidated E2E Report" }
+                style { (PreEscaped(STYLE)) }
+            }
+            body {
+                div.header {
+                    h1 { "Consolidated E2E Report" }
+                    div.generated { "Generated" br; (now) }
+                }
+
+                h2 { "Summary Information" }
+                table.summary-table {
+                    tr {
+                        td { "Status:" }
+                        td class=(overall.0) { (overall.1) }
+                    }
+                    tr { td { "Platforms:" } td { (reports.len()) } }
+                }
+
+                @if reports.is_empty() {
+                    p { "No per-platform report.json files were found to consolidate." }
+                } @else {
+                    h2 { "Platforms" }
+                    (matrix_table(&reports))
+
+                    h2 { "Per-platform Details" }
+                    div.details {
+                        @for report in &reports {
+                            (platform_section(report))
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    std::fs::write(html_out, markup.into_string())
+}
+
+/// Render the consolidated result as a GitHub-flavoured markdown table, for
+/// piping into `$GITHUB_STEP_SUMMARY`. Same inputs as
+/// [`generate_consolidated`].
+pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
+    use std::fmt::Write as _;
+
+    let reports: Vec<PlatformReport> = inputs
+        .iter()
+        .map(|(label, path)| PlatformReport::load(label.clone(), path))
+        .collect();
+
+    let mut out = String::from("## E2E consolidated report\n\n");
+    if reports.is_empty() {
+        out.push_str("_No per-platform report.json files were found to consolidate._\n");
+        return out;
+    }
+
+    out.push_str("| Platform | Total | Pass | Fail | Skip | Known-bug (xfail) | Status |\n");
+    out.push_str("|---|--:|--:|--:|--:|--:|:--|\n");
+    for r in &reports {
+        let xfail = if r.is_known_bugs {
+            r.xfail.xfail.to_string()
+        } else {
+            "-".to_string()
+        };
+        // `writeln!` into a String never fails; the discard keeps clippy happy.
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} | {} | {} |",
+            r.label,
+            r.stats.total,
+            r.stats.passed,
+            r.stats.failed,
+            r.stats.skipped,
+            xfail,
+            r.status_text(),
+        );
+    }
+
+    // Call out anything that needs a human: XPASS (fixed bug, stale tag) and
+    // untagged failures in a known-bugs run.
+    let mut notes = Vec::new();
+    for r in &reports {
+        for name in &r.xfail.xpass {
+            notes.push(format!(
+                "- **XPASS** in _{}_: `{}` is tagged `@expected-failure` but passed — remove the tag.",
+                r.label, name
+            ));
+        }
+        for name in &r.xfail.untagged_failures {
+            if r.is_known_bugs {
+                notes.push(format!(
+                    "- **Regression** in _{}_: `{}` failed but is not tagged `@expected-failure`.",
+                    r.label, name
+                ));
+            }
+        }
+    }
+    if !notes.is_empty() {
+        out.push_str("\n### Needs attention\n\n");
+        for n in notes {
+            out.push_str(&n);
+            out.push('\n');
+        }
+    }
+
+    out
+}
+
+fn matrix_table(reports: &[PlatformReport]) -> Markup {
+    html! {
+        table.stats {
+            tr {
+                th { "Platform" }
+                th { "Total" } th { "Pass" } th { "Fail" } th { "Skip" }
+                th { "Known-bug (xfail)" } th { "Status" }
+                th { "Pass / Fail / Skip" }
+            }
+            @for r in reports {
+                tr {
+                    td { (r.label) }
+                    td.num { (r.stats.total) }
+                    td.num { (r.stats.passed) }
+                    td.num { (r.stats.failed) }
+                    td.num { (r.stats.skipped) }
+                    td.num { @if r.is_known_bugs { (r.xfail.xfail) } @else { "—" } }
+                    td class=(if r.ok() { "status-pass" } else { "status-fail" }) {
+                        (r.status_text())
+                    }
+                    td { (stats_bar(&r.stats)) }
+                }
+            }
+        }
+    }
+}
+
+fn platform_section(report: &PlatformReport) -> Markup {
+    let badge_class = if report.ok() {
+        "badge-pass"
+    } else {
+        "badge-fail"
+    };
+    html! {
+        details.platform open[!report.ok()] {
+            summary.platform-row {
+                span class=(format!("badge {badge_class}")) { (report.status_text()) }
+                span.platform-name { (report.label) }
+                span.elapsed { (report.stats.total) " scenarios" }
+            }
+            @if report.features.is_empty() {
+                p.empty-note { "No report.json data for this platform." }
+            } @else {
+                @for feature in &report.features {
+                    (feature_group(feature))
+                }
+            }
+        }
+    }
+}
+
+fn feature_group(feature: &Feature) -> Markup {
+    html! {
+        div.feature-group {
+            div.feature-title {
+                "Feature: " (feature.name) " "
+                span.elapsed { "(" (feature.uri) }
+                ")"
+            }
+            @for scenario in &feature.elements {
+                (scenario_block(scenario))
+            }
+        }
+    }
 }
 
 fn scenario_block(scenario: &Element) -> Markup {
@@ -365,6 +638,15 @@ fn stats_table(title: &str, rows: &[(String, &Stats)]) -> Markup {
     }
 }
 
+/// Current wall-clock time formatted as `YYYY-MM-DD HH:MM:SS UTC`, or an empty
+/// string if the clock is before the Unix epoch.
+fn now_utc() -> String {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| format_utc(d.as_secs()))
+        .unwrap_or_default()
+}
+
 /// Format Unix epoch seconds as `YYYY-MM-DD HH:MM:SS UTC` without pulling in a
 /// date crate. Uses Howard Hinnant's civil-from-days algorithm (valid for all
 /// Gregorian dates), so the report shows a real timestamp rather than a stub.
@@ -423,6 +705,10 @@ const STYLE: &str = r#"
   .feature-group { margin-bottom: 1.5rem; }
   .feature-title { font-weight: 600; font-size: 1rem; padding: 8px 12px; background: #e3f2fd;
                    border-left: 4px solid #1565c0; margin-bottom: 0; }
+  .platform { border: 1px solid #cfcfcf; border-radius: 4px; padding: 12px; margin-bottom: 1rem; background: #fafafa; }
+  .platform-row { display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 1.05rem; }
+  .platform-name { font-weight: 700; flex: 1; }
+  .empty-note { color: #999; font-style: italic; padding: 8px 0; }
   .scenario { border: 1px solid #e0e0e0; border-top: none; padding: 12px; background: #fff; }
   .scenario:last-child { border-radius: 0 0 4px 4px; }
   .scenario-row { display: flex; align-items: center; gap: 8px; cursor: pointer; }
@@ -605,5 +891,91 @@ mod tests {
         assert_eq!(format_utc(1_609_459_200), "2021-01-01 00:00:00 UTC");
         // A time-of-day sample: 2026-07-08 13:30:45 UTC.
         assert_eq!(format_utc(1_783_517_445), "2026-07-08 13:30:45 UTC");
+    }
+
+    #[test]
+    fn platform_report_normal_tier_ok_only_when_no_failures() {
+        let pass = write_report(&feature_json(&[(&[], &["passed"])]));
+        let r = PlatformReport::load("mock".into(), pass.path());
+        assert!(!r.is_known_bugs);
+        assert!(r.ok());
+        assert_eq!(r.status_text(), "PASS");
+
+        let fail = write_report(&feature_json(&[(&[], &["failed"])]));
+        let r = PlatformReport::load("mock".into(), fail.path());
+        assert!(!r.ok());
+        assert_eq!(r.status_text(), "FAIL");
+    }
+
+    #[test]
+    fn platform_report_known_bugs_tier_ok_when_bugs_still_fail() {
+        // Known-bug tier: tagged scenarios failing is the healthy state.
+        let f = write_report(&feature_json(&[
+            (&["expected-failure"], &["failed"]),
+            (&["expected-failure"], &["failed"]),
+        ]));
+        let r = PlatformReport::load("gpu (known bugs)".into(), f.path());
+        assert!(r.is_known_bugs);
+        assert!(r.ok());
+        assert_eq!(r.status_text(), "PASS");
+        assert_eq!(r.xfail.xfail, 2);
+    }
+
+    #[test]
+    fn platform_report_known_bugs_tier_fails_on_xpass() {
+        let f = write_report(&feature_json(&[
+            (&["expected-failure"], &["failed"]),
+            (&["expected-failure"], &["passed"]),
+        ]));
+        let r = PlatformReport::load("gpu (known bugs)".into(), f.path());
+        assert!(!r.ok());
+        assert_eq!(r.status_text(), "FAIL");
+    }
+
+    #[test]
+    fn missing_report_json_is_empty_not_error() {
+        let r = PlatformReport::load("gone".into(), Path::new("/no/such/report.json"));
+        assert_eq!(r.stats.total, 0);
+        assert_eq!(r.status_text(), "EMPTY");
+    }
+
+    #[test]
+    fn consolidated_summary_markdown_has_a_row_per_platform() {
+        let a = write_report(&feature_json(&[(&[], &["passed"]), (&[], &["passed"])]));
+        let b = write_report(&feature_json(&[(&["expected-failure"], &["failed"])]));
+        let inputs = vec![
+            ("Mock".to_string(), a.path().to_path_buf()),
+            ("GPU (known bugs)".to_string(), b.path().to_path_buf()),
+        ];
+        let md = consolidated_summary_markdown(&inputs);
+        assert!(md.contains("| Mock | 2 | 2 | 0 | 0 | - | PASS |"));
+        assert!(md.contains("| GPU (known bugs) | 1 | 0 | 1 | 0 | 1 | PASS |"));
+    }
+
+    #[test]
+    fn consolidated_summary_markdown_flags_xpass() {
+        let b = write_report(&feature_json(&[(&["expected-failure"], &["passed"])]));
+        let inputs = vec![("GPU (known bugs)".to_string(), b.path().to_path_buf())];
+        let md = consolidated_summary_markdown(&inputs);
+        assert!(md.contains("Needs attention"));
+        assert!(md.contains("XPASS"));
+    }
+
+    #[test]
+    fn consolidated_summary_markdown_empty_inputs() {
+        let md = consolidated_summary_markdown(&[]);
+        assert!(md.contains("No per-platform report.json files"));
+    }
+
+    #[test]
+    fn generate_consolidated_writes_html() {
+        let a = write_report(&feature_json(&[(&[], &["passed"])]));
+        let out = tempfile::NamedTempFile::new().expect("temp");
+        let inputs = vec![("Mock".to_string(), a.path().to_path_buf())];
+        generate_consolidated(&inputs, out.path()).expect("generate");
+        let html = std::fs::read_to_string(out.path()).expect("read");
+        assert!(html.contains("Consolidated E2E Report"));
+        assert!(html.contains("Mock"));
+        assert!(html.contains("Platforms"));
     }
 }
