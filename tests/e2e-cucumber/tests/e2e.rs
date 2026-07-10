@@ -130,7 +130,55 @@ impl Drop for E2eWorld {
         if let Some(mock) = self.mock.take() {
             mock.stop();
         }
+        // A scenario that ran `rocm serve --managed` left a DETACHED supervisor +
+        // engine process (vLLM / llama-server) that outlives this harness — the
+        // TempDir drop below removes the on-disk record but never kills those
+        // processes, so on a persistent runner they accumulate and hold the GPU.
+        // Stop every managed service recorded in this scenario's isolated root
+        // before the directory is removed. Best-effort: this is teardown, so any
+        // failure is ignored rather than panicking (which would abort the run).
+        if let Some(root) = &self.isolated_root {
+            stop_managed_services(root.path());
+        }
         // `isolated_root` is a `TempDir`; its own Drop removes the directory.
+    }
+}
+
+/// Stop every ROCm-managed service recorded under an isolated root's
+/// `data/services/*.json`, so detached engine processes don't leak past the
+/// scenario. Black-box: reads the service_id from each on-disk record and calls
+/// `rocm services stop <id> --yes` with the same isolated env the scenario used.
+fn stop_managed_services(root: &std::path::Path) {
+    let services_dir = root.join("data").join("services");
+    let Ok(entries) = std::fs::read_dir(&services_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        let Some(service_id) = record.get("service_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // The planted mock record has no real process to stop; skip it.
+        if service_id == "e2e-mock" {
+            continue;
+        }
+        let mut cmd = std::process::Command::new(rocm_binary());
+        cmd.args(["services", "stop", service_id, "--yes"]);
+        cmd.env("ROCM_CLI_CONFIG_DIR", root.join("config"));
+        cmd.env("ROCM_CLI_DATA_DIR", root.join("data"));
+        cmd.env("ROCM_CLI_CACHE_DIR", root.join("cache"));
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        let _ = cmd.status();
     }
 }
 
