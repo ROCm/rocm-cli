@@ -34,7 +34,17 @@ pub fn run(artifacts_dir: &Path, html_out: &Path) -> Result<()> {
             .with_context(|| format!("creating output dir {}", parent.display()))?;
     }
 
-    e2e_report::generate_consolidated(&inputs, html_out)
+    let meta = e2e_report::RunMeta {
+        commit: std::env::var("GITHUB_SHA").ok(),
+        // GITHUB_REF_NAME is the short branch/tag name; fall back to GITHUB_REF.
+        branch: std::env::var("GITHUB_REF_NAME")
+            .ok()
+            .or_else(|| std::env::var("GITHUB_REF").ok()),
+        run_number: std::env::var("GITHUB_RUN_NUMBER").ok(),
+        event: std::env::var("GITHUB_EVENT_NAME").ok(),
+    };
+
+    e2e_report::generate_consolidated(&inputs, html_out, &meta)
         .with_context(|| format!("writing consolidated report to {}", html_out.display()))?;
 
     // Printed to stdout so CI can redirect it into $GITHUB_STEP_SUMMARY.
@@ -68,8 +78,10 @@ fn discover(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
         let subdir = entry.path();
         let report = subdir.join("report.json");
         if report.is_file() {
+            // Pass the raw artifact/dir name through; the e2e-report crate parses
+            // it into Platform / OS / Tier and owns all display formatting.
             let raw = entry.file_name().to_string_lossy().into_owned();
-            inputs.push((label_from_artifact(&raw), report));
+            inputs.push((raw, report));
         }
     }
 
@@ -77,47 +89,9 @@ fn discover(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
     Ok(inputs)
 }
 
-/// Turn an artifact/dir name like `e2e-gpu-strix-windows-known-bugs-report`
-/// into a human label like `Gpu Strix Windows Known Bugs`.
-fn label_from_artifact(name: &str) -> String {
-    let without_prefix = name.strip_prefix("e2e-").unwrap_or(name);
-    let core = without_prefix
-        .strip_suffix("-report")
-        .unwrap_or(without_prefix);
-
-    // The bare mock expect-pass artifact is `e2e-report`; after stripping it
-    // collapses to `report` (or empty). Label that tier "Mock".
-    if core.is_empty() || core == "report" {
-        return "Mock".to_string();
-    }
-
-    core.split('-')
-        .filter(|w| !w.is_empty())
-        .map(|w| {
-            let mut c = w.chars();
-            c.next().map_or_else(String::new, |first| {
-                first.to_uppercase().collect::<String>() + c.as_str()
-            })
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn label_strips_prefix_and_suffix_and_titlecases() {
-        assert_eq!(
-            label_from_artifact("e2e-gpu-strix-windows-known-bugs-report"),
-            "Gpu Strix Windows Known Bugs"
-        );
-        // The bare mock expect-pass artifact collapses to "Mock".
-        assert_eq!(label_from_artifact("e2e-report"), "Mock");
-        assert_eq!(label_from_artifact("e2e-gpu-report"), "Gpu");
-        assert_eq!(label_from_artifact("e2e-known-bugs-report"), "Known Bugs");
-    }
 
     #[test]
     fn discover_missing_dir_is_empty() {
@@ -140,8 +114,9 @@ mod tests {
         std::fs::write(root.join("loose.txt"), "x").unwrap();
 
         let got = discover(root).expect("discover");
-        let labels: Vec<&str> = got.iter().map(|(l, _)| l.as_str()).collect();
-        // Sorted by label: "Gpu" (from e2e-gpu-report) then "Mock" (from e2e-report).
-        assert_eq!(labels, vec!["Gpu", "Mock"]);
+        // Raw artifact names are passed through, sorted; the e2e-report crate
+        // turns them into Platform / OS / Tier.
+        let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["e2e-gpu-report", "e2e-report"]);
     }
 }
