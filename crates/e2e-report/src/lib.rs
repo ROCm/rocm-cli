@@ -312,11 +312,123 @@ pub fn generate(json_path: &Path, html_path: &Path) -> std::io::Result<()> {
     std::fs::write(html_path, markup.into_string())
 }
 
+/// The platform/OS/tier a report belongs to, parsed from its artifact name.
+///
+/// Splitting these into separate fields (rather than one mashed
+/// "Gpu Strix Ubuntu Known Bugs" label) is what lets the matrix show distinct
+/// Platform / OS / Tier columns.
+struct Descriptor {
+    platform: String,
+    os: String,
+    /// True for the `known-bugs` tier (xfail-inverted), false for expect-pass.
+    known_bugs: bool,
+}
+
+impl Descriptor {
+    const fn tier(&self) -> &'static str {
+        if self.known_bugs {
+            "known bugs"
+        } else {
+            "expect-pass"
+        }
+    }
+}
+
+/// Parse an artifact/dir name like `e2e-gpu-strix-windows-known-bugs-report`
+/// into its Platform / OS / Tier. Unknown shapes fall back to a titlecased
+/// platform on Linux so a new artifact still renders sensibly.
+fn parse_descriptor(name: &str) -> Descriptor {
+    // Strip prefix, then suffix, each relative to the prior result (not `name`),
+    // so `e2e-report` correctly reduces to the empty core, not back to itself.
+    let core = name.strip_prefix("e2e-").unwrap_or(name);
+    let core = core.strip_suffix("-report").unwrap_or(core);
+
+    // Tier: the `-known-bugs` suffix (or the bare `known-bugs` mock artifact).
+    let (core, known_bugs) = match core.strip_suffix("known-bugs") {
+        Some(rest) => (rest.trim_end_matches('-'), true),
+        None => (core, false),
+    };
+
+    let (platform, os) = match core {
+        // The bare mock expect-pass artifact is `e2e-report` → core "report" or "".
+        "" | "report" => ("Mock", "Linux"),
+        "gpu" => ("MI300X", "Linux"),
+        "gpu-strix-ubuntu" => ("Strix Halo", "Ubuntu"),
+        "gpu-strix-windows" => ("Strix Halo", "Windows"),
+        other => return fallback_descriptor(other, known_bugs),
+    };
+
+    Descriptor {
+        platform: platform.to_string(),
+        os: os.to_string(),
+        known_bugs,
+    }
+}
+
+fn fallback_descriptor(core: &str, known_bugs: bool) -> Descriptor {
+    let platform = core
+        .split('-')
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut c = w.chars();
+            c.next().map_or_else(String::new, |f| {
+                f.to_uppercase().collect::<String>() + c.as_str()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    Descriptor {
+        platform: if platform.is_empty() {
+            "Unknown".to_string()
+        } else {
+            platform
+        },
+        os: "Linux".to_string(),
+        known_bugs,
+    }
+}
+
+/// Run-level metadata shown in the report header so a downloaded report can be
+/// traced back to the CI run that produced it. All optional — populated from CI
+/// env vars, absent for a local run.
+#[derive(Default)]
+pub struct RunMeta {
+    pub commit: Option<String>,
+    pub branch: Option<String>,
+    pub run_number: Option<String>,
+    pub event: Option<String>,
+}
+
+impl RunMeta {
+    fn line(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(c) = &self.commit {
+            parts.push(format!("commit {}", &c[..c.len().min(7)]));
+        }
+        if let Some(b) = &self.branch {
+            parts.push(format!("branch {b}"));
+        }
+        if let Some(n) = &self.run_number {
+            parts.push(format!("run #{n}"));
+        }
+        if let Some(e) = &self.event {
+            parts.push(e.clone());
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" · "))
+        }
+    }
+}
+
 /// A single platform/job's parsed report plus its derived health.
 ///
 /// One of these corresponds to one uploaded `*-report` artifact (a
 /// platform × tier combination, e.g. "GPU Strix Ubuntu (known bugs)").
 struct PlatformReport {
+    desc: Descriptor,
+    /// Human label kept for the per-platform detail sections.
     label: String,
     features: Vec<Feature>,
     stats: Stats,
@@ -328,7 +440,7 @@ struct PlatformReport {
 }
 
 impl PlatformReport {
-    fn load(label: String, json_path: &Path) -> Self {
+    fn load(artifact: String, json_path: &Path) -> Self {
         let features = parse_features(json_path);
         let stats = stats_of(&features);
         let xfail = evaluate_xfail_features(&features);
@@ -336,7 +448,10 @@ impl PlatformReport {
             .iter()
             .flat_map(|f| &f.elements)
             .any(|el| el.tags.iter().any(|t| t.name == EXPECTED_FAILURE_TAG));
+        let desc = parse_descriptor(&artifact);
+        let label = format!("{} {} ({})", desc.platform, desc.os, desc.tier());
         Self {
+            desc,
             label,
             features,
             stats,
@@ -373,11 +488,24 @@ impl PlatformReport {
 /// `inputs` is `(label, json_path)` pairs; the label identifies the
 /// platform/tier (e.g. "GPU Strix Windows (known bugs)"). New platforms need no
 /// code change — the caller just passes more inputs.
-pub fn generate_consolidated(inputs: &[(String, PathBuf)], html_out: &Path) -> std::io::Result<()> {
-    let reports: Vec<PlatformReport> = inputs
+pub fn generate_consolidated(
+    inputs: &[(String, PathBuf)],
+    html_out: &Path,
+    meta: &RunMeta,
+) -> std::io::Result<()> {
+    let mut reports: Vec<PlatformReport> = inputs
         .iter()
         .map(|(label, path)| PlatformReport::load(label.clone(), path))
         .collect();
+    // Group each platform's rows together and order tiers expect-pass → known
+    // bugs, instead of the alphabetical mash of the old single-label sort.
+    reports.sort_by(|a, b| {
+        (&a.desc.platform, &a.desc.os, a.desc.known_bugs).cmp(&(
+            &b.desc.platform,
+            &b.desc.os,
+            b.desc.known_bugs,
+        ))
+    });
 
     let now = now_utc();
     let all_ok = reports.iter().all(PlatformReport::ok);
@@ -401,7 +529,10 @@ pub fn generate_consolidated(inputs: &[(String, PathBuf)], html_out: &Path) -> s
             body {
                 div.header {
                     h1 { "Consolidated E2E Report" }
-                    div.generated { "Generated" br; (now) }
+                    div.generated {
+                        @if let Some(line) = meta.line() { (line) br; }
+                        "Generated " (now)
+                    }
                 }
 
                 h2 { "Summary Information" }
@@ -410,7 +541,7 @@ pub fn generate_consolidated(inputs: &[(String, PathBuf)], html_out: &Path) -> s
                         td { "Status:" }
                         td class=(overall.0) { (overall.1) }
                     }
-                    tr { td { "Platforms:" } td { (reports.len()) } }
+                    tr { td { "Rows:" } td { (reports.len()) } }
                 }
 
                 @if reports.is_empty() {
@@ -418,6 +549,7 @@ pub fn generate_consolidated(inputs: &[(String, PathBuf)], html_out: &Path) -> s
                 } @else {
                     h2 { "Platforms" }
                     (matrix_table(&reports))
+                    (legend())
 
                     h2 { "Per-platform Details" }
                     div.details {
@@ -444,25 +576,44 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
         .map(|(label, path)| PlatformReport::load(label.clone(), path))
         .collect();
 
+    let mut reports = reports;
+    reports.sort_by(|a, b| {
+        (&a.desc.platform, &a.desc.os, a.desc.known_bugs).cmp(&(
+            &b.desc.platform,
+            &b.desc.os,
+            b.desc.known_bugs,
+        ))
+    });
+
     let mut out = String::from("## E2E consolidated report\n\n");
     if reports.is_empty() {
         out.push_str("_No per-platform report.json files were found to consolidate._\n");
         return out;
     }
 
-    out.push_str("| Platform | Total | Pass | Fail | Skip | Known-bug (xfail) | Status |\n");
-    out.push_str("|---|--:|--:|--:|--:|--:|:--|\n");
+    out.push_str("| Platform | OS | Tier | Total | Pass | Fail | Skip | Xfail | Status |\n");
+    out.push_str("|---|---|---|--:|--:|--:|--:|--:|:--|\n");
+    let (mut t_total, mut t_pass, mut t_fail, mut t_skip, mut t_xfail) = (0, 0, 0, 0, 0);
     for r in &reports {
         let xfail = if r.is_known_bugs {
             r.xfail.xfail.to_string()
         } else {
-            "-".to_string()
+            "—".to_string()
         };
+        t_total += r.stats.total;
+        t_pass += r.stats.passed;
+        t_fail += r.stats.failed;
+        t_skip += r.stats.skipped;
+        if r.is_known_bugs {
+            t_xfail += r.xfail.xfail;
+        }
         // `writeln!` into a String never fails; the discard keeps clippy happy.
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {} | {} | {} | {} |",
-            r.label,
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            r.desc.platform,
+            r.desc.os,
+            r.desc.tier(),
             r.stats.total,
             r.stats.passed,
             r.stats.failed,
@@ -471,6 +622,17 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
             r.status_text(),
         );
     }
+    let _ = writeln!(
+        out,
+        "| **Total** | | | {t_total} | {t_pass} | {t_fail} | {t_skip} | {t_xfail} | |",
+    );
+
+    out.push_str(
+        "\n**Mock** = no GPU (fake in-process server, gates the PR); \
+         **MI300X / Strix Halo** = self-hosted GPU (non-blocking). \
+         **expect-pass** must all pass; **known bugs** are xfail-inverted \
+         (failing as expected = PASS; FAIL only on XPASS or an untagged failure).\n",
+    );
 
     // Call out anything that needs a human: XPASS (fixed bug, stale tag) and
     // untagged failures in a known-bugs run.
@@ -503,17 +665,29 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
 }
 
 fn matrix_table(reports: &[PlatformReport]) -> Markup {
+    let (mut t_total, mut t_pass, mut t_fail, mut t_skip, mut t_xfail) = (0, 0, 0, 0, 0);
+    for r in reports {
+        t_total += r.stats.total;
+        t_pass += r.stats.passed;
+        t_fail += r.stats.failed;
+        t_skip += r.stats.skipped;
+        if r.is_known_bugs {
+            t_xfail += r.xfail.xfail;
+        }
+    }
     html! {
         table.stats {
             tr {
-                th { "Platform" }
+                th { "Platform" } th { "OS" } th { "Tier" }
                 th { "Total" } th { "Pass" } th { "Fail" } th { "Skip" }
-                th { "Known-bug (xfail)" } th { "Status" }
+                th { "Xfail" } th { "Status" }
                 th { "Pass / Fail / Skip" }
             }
             @for r in reports {
                 tr {
-                    td { (r.label) }
+                    td { (r.desc.platform) }
+                    td { (r.desc.os) }
+                    td { (r.desc.tier()) }
                     td.num { (r.stats.total) }
                     td.num { (r.stats.passed) }
                     td.num { (r.stats.failed) }
@@ -524,6 +698,50 @@ fn matrix_table(reports: &[PlatformReport]) -> Markup {
                     }
                     td { (stats_bar(&r.stats)) }
                 }
+            }
+            tr.total-row {
+                td { "Total" } td {} td {}
+                td.num { (t_total) }
+                td.num { (t_pass) }
+                td.num { (t_fail) }
+                td.num { (t_skip) }
+                td.num { (t_xfail) }
+                td {} td {}
+            }
+        }
+    }
+}
+
+/// Explain the non-obvious columns/terms so the report is self-contained.
+fn legend() -> Markup {
+    html! {
+        div.legend {
+            h3 { "Legend" }
+            ul {
+                li {
+                    b { "Mock" }
+                    " — no GPU. The CLI runs against a fake in-process model "
+                    "server (a planted service record), validating CLI behaviour "
+                    "and wiring without hardware. Runs on a GitHub-hosted runner "
+                    "and gates the PR."
+                }
+                li {
+                    b { "MI300X / Strix Halo" }
+                    " — real self-hosted GPU hardware; non-blocking while proven out."
+                }
+                li {
+                    b { "Tier — expect-pass" }
+                    " — every scenario must pass; any failure fails the row."
+                }
+                li {
+                    b { "Tier — known bugs" }
+                    " — scenarios tagged @expected-failure. They are expected to "
+                    "fail, so the result is inverted: failing as expected → PASS. "
+                    "The row goes FAIL only on an XPASS (a known bug unexpectedly "
+                    "passed — remove its tag) or an untagged failure."
+                }
+                li { b { "Xfail" } " — count of known-bug scenarios that failed as expected." }
+                li { b { "Skip" } " — scenarios not run." }
             }
         }
     }
@@ -693,8 +911,16 @@ const STYLE: &str = r#"
   table.stats td { padding: 6px 12px; border: 1px solid #ddd; }
   table.stats td.num { text-align: right; font-variant-numeric: tabular-nums; }
   table.stats tr:hover { background: #fafafa; }
+  table.stats tr.total-row { font-weight: 600; background: #f5f5f5; }
+  table.stats tr.total-row:hover { background: #f5f5f5; }
   table.stats a { color: #1565c0; text-decoration: none; }
   table.stats a:hover { text-decoration: underline; }
+
+  .legend { font-size: 0.85rem; color: #444; background: #fafafa; border: 1px solid #e0e0e0;
+            border-radius: 4px; padding: 8px 16px; margin-bottom: 1.5rem; }
+  .legend h3 { margin: 0.4rem 0; font-size: 0.9rem; }
+  .legend ul { margin: 0.4rem 0; padding-left: 1.2rem; }
+  .legend li { margin: 0.25rem 0; }
 
   .bar { display: inline-flex; width: 120px; height: 14px; border-radius: 2px; overflow: hidden; vertical-align: middle; }
   .bar-pass { background: #8bc34a; }
@@ -944,18 +1170,24 @@ mod tests {
         let a = write_report(&feature_json(&[(&[], &["passed"]), (&[], &["passed"])]));
         let b = write_report(&feature_json(&[(&["expected-failure"], &["failed"])]));
         let inputs = vec![
-            ("Mock".to_string(), a.path().to_path_buf()),
-            ("GPU (known bugs)".to_string(), b.path().to_path_buf()),
+            ("e2e-report".to_string(), a.path().to_path_buf()),
+            (
+                "e2e-gpu-known-bugs-report".to_string(),
+                b.path().to_path_buf(),
+            ),
         ];
         let md = consolidated_summary_markdown(&inputs);
-        assert!(md.contains("| Mock | 2 | 2 | 0 | 0 | - | PASS |"));
-        assert!(md.contains("| GPU (known bugs) | 1 | 0 | 1 | 0 | 1 | PASS |"));
+        assert!(md.contains("| Mock | Linux | expect-pass | 2 | 2 | 0 | 0 | — | PASS |"));
+        assert!(md.contains("| MI300X | Linux | known bugs | 1 | 0 | 1 | 0 | 1 | PASS |"));
     }
 
     #[test]
     fn consolidated_summary_markdown_flags_xpass() {
         let b = write_report(&feature_json(&[(&["expected-failure"], &["passed"])]));
-        let inputs = vec![("GPU (known bugs)".to_string(), b.path().to_path_buf())];
+        let inputs = vec![(
+            "e2e-gpu-known-bugs-report".to_string(),
+            b.path().to_path_buf(),
+        )];
         let md = consolidated_summary_markdown(&inputs);
         assert!(md.contains("Needs attention"));
         assert!(md.contains("XPASS"));
@@ -971,11 +1203,12 @@ mod tests {
     fn generate_consolidated_writes_html() {
         let a = write_report(&feature_json(&[(&[], &["passed"])]));
         let out = tempfile::NamedTempFile::new().expect("temp");
-        let inputs = vec![("Mock".to_string(), a.path().to_path_buf())];
-        generate_consolidated(&inputs, out.path()).expect("generate");
+        let inputs = vec![("e2e-report".to_string(), a.path().to_path_buf())];
+        generate_consolidated(&inputs, out.path(), &RunMeta::default()).expect("generate");
         let html = std::fs::read_to_string(out.path()).expect("read");
         assert!(html.contains("Consolidated E2E Report"));
         assert!(html.contains("Mock"));
         assert!(html.contains("Platforms"));
+        assert!(html.contains("Legend"));
     }
 }
