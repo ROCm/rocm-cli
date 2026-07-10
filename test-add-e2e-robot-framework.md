@@ -4,7 +4,7 @@
 **Stage:** 8-awaiting-pr-approval
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
-**Last Updated:** 2026-07-09
+**Last Updated:** 2026-07-10
 
 **Token Usage:** in=0 out=0 cache_create=0 cache_read=0 calls=0
 
@@ -50,8 +50,42 @@ traceability) and `@gpu` for hardware-dependent scenarios.
 - ✅ Engine-set reconcile (lemonade/vllm only, #79); restored mock/gpu split lost in rewrite
 - ✅ Committed `6741054` (signed+signed-off, no AI attribution), force-pushed, PR comment posted (#issuecomment-4916250315)
 
+### Completed ✅ (CI-correctness + multi-runner + consolidated report, Jul 9–10)
+- ✅ Fixed 3 CI failures that surfaced once clippy went green (heavy jobs had been
+  skipped behind the lint gate): (1) `Test (affected crates)` — nextest couldn't
+  `--list` the custom cucumber harness; (2) `windows-build-and-test` — ran all
+  scenarios unfiltered with no mock. Both fixed by `test = false` on the `[[test]]
+  e2e` target (nextest + `cargo test --all-targets` skip it; `xtask e2e`'s
+  explicit `--test e2e` still runs it). (3) `E2E tests (known bugs)` exited red on
+  expected failures → added **xfail inversion**.
+- ✅ xfail inversion: `cargo xtask e2e --expect-failures` sets `E2E_EXPECT_FAILURES`;
+  harness treats `@expected-failure` failing as green, red only on XPASS / untagged
+  failure / parse-hook error. `report::evaluate_xfail` + `XfailReport`. Committed `55b3aec`.
+- ✅ Hardened cross-engine expansion step (was `unwrap_or_default()` → vacuous
+  `""=="" ` pass; now panics on missing `resolved model:` line). Confirmed EAI-7219
+  is NOT fixed — the local "pass" was the vacuous artifact.
+- ✅ Split GPU job into expect-pass + known-bugs tiers (commit `d33d182`).
+- ✅ Added Strix Halo runners: two new self-hosted runners came online
+  (`strix-halo-ubuntu` Linux gfx1151, `strix-halo-windows` Windows 11 iGPU).
+  Added 4 jobs (each expect-pass + known-bugs), label-routed by `strix-halo` +
+  os. Windows = first real Windows-GPU e2e coverage. Commit `93f03ef`.
+  (app-dev-gpu = `amd-gpu` label; strix boxes = `strix-halo` label.)
+- ✅ **Consolidated cross-platform report** (COMMITTED — see blocker): extracted
+  lean `crates/e2e-report` (maud+serde only, so xtask doesn't pull
+  cucumber/axum/tokio); `generate_consolidated` + `consolidated_summary_markdown`
+  (platform×tier matrix, xfail-aware, flags XPASS); `cargo xtask e2e-report`
+  (globs `*-report` artifacts → auto-discovers platforms); CI `e2e-report` job
+  (`if: always()`, step-summary + one HTML artifact). 52 tests green, clippy
+  clean, Linux container green, browser-verified HTML render.
+
 ### Todo 📋
-- 📋 Await @rominf re-review + CI on PR #69
+- 📋 **Commit blocked**: consolidated-report change staged but `git commit` fails
+  on `1Password: failed to fill whole buffer` (SSH signing agent locked). Unlock
+  1Password, then retry commit + `git push --force-with-lease`.
+- 📋 Await @rominf re-review + CI on PR #69 (last push was `93f03ef`)
+- 📋 Watch first live run of the 6 GPU jobs — esp. Strix Windows (untested path)
+- 📋 (Deferred) Surface outstanding known-bug count from CI — largely covered by
+  the consolidated report's xfail column + "Needs attention" section now.
 - 📋 Persistent self-hosted GPU runner (currently ephemeral workspace pod)
 
 ## Next Steps
@@ -70,8 +104,11 @@ traceability) and `@gpu` for hardware-dependent scenarios.
 
 ## Blockers / Open Questions
 
-- None blocking. Open thread: reviewer suggested `maud`/`askama` for the HTML
-  report; user chose to keep the `format!`-based generator with bugs fixed.
+- **1Password signing locked**: consolidated-report commit fails with
+  `1Password: failed to fill whole buffer`. Change is staged + fully verified;
+  just needs 1Password unlocked, then retry `git commit` and force-push.
+- Note: the report was later migrated to `maud` after all (reviewer's earlier
+  suggestion), and now lives in the new `crates/e2e-report` crate.
 - **Persistent runner**: self-hosted GPU runner is ephemeral; needs a k8s deploy.
 
 ## Robot Framework vs cucumber-rs (decision: cucumber-rs)
@@ -120,3 +157,19 @@ addressed here with the exit-code fix + dedicated known-bugs job.
 
 ### 2026-07-09 (idle flush)
 - **2026-07-09 (idle flush):** Session idle for 1 hour, auto-flushing WIP state.
+
+### 2026-07-09..07-10 (CI correctness, multi-runner, consolidated report)
+- Rebased on main (picked up #84 catalog curation, #87 const stubs, #88 dash port).
+- Diagnosed why CI jobs "started failing": they were previously SKIPPED behind a
+  failing clippy gate; once clippy passed, the real Test/Windows/known-bugs
+  failures surfaced for the first time.
+- Fixed all three: `test = false` (nextest + Windows), xfail inversion
+  (known-bugs). Committed `55b3aec`, force-pushed.
+- Established EAI-7220 (#88) was fixed via a dash-tui unit test, not e2e (it's
+  TUI-only, untestable black-box) — that unit test passes on the rebased tree.
+- Split GPU tier expect-pass/known-bugs (`d33d182`).
+- Two new Strix Halo runners came online; added 4 jobs to use them (`93f03ef`).
+- Built the consolidated cross-platform report (new `crates/e2e-report` +
+  `xtask e2e-report` + `e2e-report` CI job). Verified: 52 tests, clippy clean,
+  Linux container green, browser-rendered the HTML matrix. **Commit blocked on
+  locked 1Password signing agent** — staged, awaiting unlock.
