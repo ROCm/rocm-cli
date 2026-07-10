@@ -698,6 +698,10 @@ jobs:
       - name: Run E2E tests on GPU hardware (excluding known bugs)
         run: |
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
+          # Share heavy immutable artifacts (TheRock runtimes ~3.3GB, HF weights,
+          # vLLM venv) across scenarios so they download once per runner, not per
+          # scenario. Persistent path; service state stays isolated per scenario.
+          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
           cargo xtask e2e -- -t "@gpu and not @expected-failure"
 
       - name: Upload E2E report
@@ -749,6 +753,8 @@ jobs:
       - name: Run known-bug E2E scenarios on GPU hardware
         run: |
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
+          # See e2e-gpu: share heavy immutable artifacts across scenarios.
+          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
           cargo xtask e2e --expect-failures -- -t "@gpu and @expected-failure"
 
       - name: Upload E2E report

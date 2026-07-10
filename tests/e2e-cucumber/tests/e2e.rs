@@ -45,6 +45,21 @@ pub struct E2eWorld {
     pub isolated_root: Option<TempDir>,
 }
 
+/// A persistent directory shared across scenarios for heavy, immutable artifacts
+/// (TheRock runtime wheels, HF model weights, engine venvs). Set by CI to a path
+/// on the runner's persistent disk; unset for local runs, where every scenario
+/// stays fully isolated (nothing shared).
+///
+/// Sharing these read-only artifacts avoids re-downloading multi-GB runtimes and
+/// model weights per scenario. Only immutable artifacts are shared — service
+/// records, config, and per-service engine state stay isolated per scenario.
+fn shared_cache_dir() -> Option<PathBuf> {
+    let dir = std::env::var_os("E2E_SHARED_CACHE_DIR")?;
+    let dir = PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
 impl Default for E2eWorld {
     fn default() -> Self {
         // A fresh TempDir per World gives each scenario its own isolated
@@ -53,6 +68,22 @@ impl Default for E2eWorld {
         let root = TempDir::with_prefix("rocm-e2e-").expect("failed to create temp dir");
         for sub in ["config", "data", "cache"] {
             std::fs::create_dir_all(root.path().join(sub)).ok();
+        }
+
+        // Share the immutable TheRock runtimes across scenarios: point this
+        // scenario's <data>/runtimes at the shared dir via a symlink, so the
+        // ~3.3GB wheel + its registry manifest are downloaded once per runner,
+        // not once per scenario. Write-once artifacts, safe to share; service
+        // state lives elsewhere under <data> and stays isolated.
+        if let Some(shared) = shared_cache_dir() {
+            let shared_runtimes = shared.join("runtimes");
+            if std::fs::create_dir_all(&shared_runtimes).is_ok() {
+                let link = root.path().join("data").join("runtimes");
+                #[cfg(unix)]
+                let _ = std::os::unix::fs::symlink(&shared_runtimes, &link);
+                #[cfg(windows)]
+                let _ = std::os::windows::fs::symlink_dir(&shared_runtimes, &link);
+            }
         }
 
         Self {
@@ -78,6 +109,17 @@ impl E2eWorld {
             cmd.env("ROCM_CLI_CONFIG_DIR", root.join("config"));
             cmd.env("ROCM_CLI_DATA_DIR", root.join("data"));
             cmd.env("ROCM_CLI_CACHE_DIR", root.join("cache"));
+        }
+        // Share the immutable heavy caches across scenarios when CI provides a
+        // persistent shared dir (see shared_cache_dir): HF model weights via
+        // HF_HOME (engines honour it for both download and discovery; weights are
+        // content-addressed and immutable) and the vLLM engine venv via
+        // ROCM_CLI_ENGINE_ENVS_ROOT (redirects only the envs/ leaf, so per-service
+        // engine state stays isolated). The runtimes dir is shared via a symlink
+        // set up in `default()`.
+        if let Some(shared) = shared_cache_dir() {
+            cmd.env("HF_HOME", shared.join("huggingface"));
+            cmd.env("ROCM_CLI_ENGINE_ENVS_ROOT", shared.join("engine-envs"));
         }
     }
 
