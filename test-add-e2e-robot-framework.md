@@ -142,6 +142,16 @@ even on Instinct because vllm can't serve them. vLLM-capable safetensors (e.g.
 - 📋 Watch first live run of the GPU jobs — esp. Strix Windows (untested path).
   Note: Strix runners FAIL at toolchain setup (rustup download blocked/failed) until
   provisioned with Rust — infra fix, not code. app-dev-gpu (amd-gpu label) works.
+- 📋 **Re-run full mock blocking suite locally** after today's `serving_steps.rs` changes
+  (`cargo xtask e2e -- -t "not @gpu and not @expected-failure"`). Mock scenarios 3/4 share
+  serving_steps; last green run predates today's edits. Only per-fn compile+clippy done today.
+- 📋 **Re-run Linux container suite** (`workspace/wip/container-test.sh`) — last full run was
+  BEFORE today's rocm-core unit tests (4 new) + scenarios 8/9. Confirms workspace still green
+  on real Linux target before/after committing.
+- 📋 **Fix scenario numbering** in model_serving.feature (currently 1,2,3,4,5,7,6,9,8 — out of
+  order after insertions). Cosmetic; renumber 1-9 sequentially for readability. LOW priority.
+- 📋 (Optional) Update E2E cucumber memory ([[rocm-cli-e2e-cucumber]]) with new default-engine
+  precedence + both-engine coverage once this lands — currently reflects the pre-multi-engine state.
 - 📋 Persistent self-hosted GPU runner (currently ephemeral workspace pod).
 
 ## Next Steps
