@@ -785,25 +785,31 @@ jobs:
           && (inputs.tier == 'both' || inputs.tier == 'expect-pass'))
       )
     continue-on-error: true
-    # Only /home/ubuntu/actions-runner (a 1.7T nvme volume) has space; both / and
-    # /home/ubuntu are full. Keep the toolchain + installer download on that volume.
-    # HOME is left as the real home so rustup doesn't warn about an euid/HOME
-    # mismatch; the bootstrap below uses --no-modify-path so nothing is written to
-    # $HOME/.profile (which is what would otherwise fail ENOSPC on the full disk).
+    # On this runner `/`, `/home/ubuntu`, and `/tmp` are ALL on a full root
+    # partition; only /home/ubuntu/actions-runner (a 1.7T nvme) has space. So
+    # EVERYTHING the job writes must land on the nvme. Point HOME there (catches
+    # ~/.cache/pip, ~/.config, and any other $HOME writer — pip's cache under the
+    # real /home/ubuntu is what previously failed `install sdk` with ENOSPC),
+    # plus the toolchain, temp, and pip cache. The rustup bootstrap still uses
+    # --no-modify-path so it doesn't touch $HOME/.profile. (The HOME override
+    # brings back a cosmetic rustup euid/HOME warning — accepted: not filling the
+    # root disk matters more.)
     env:
+      HOME: /home/ubuntu/actions-runner/e2e-home
       CARGO_HOME: /home/ubuntu/actions-runner/.cargo
       RUSTUP_HOME: /home/ubuntu/actions-runner/.rustup
       TMPDIR: /home/ubuntu/actions-runner/tmp
+      PIP_CACHE_DIR: /home/ubuntu/actions-runner/pip-cache
     steps:
       - uses: actions/checkout@v6
 
-      - name: Prepare temp dir
-        run: mkdir -p /home/ubuntu/actions-runner/tmp
+      - name: Prepare writable dirs on the nvme
+        run: mkdir -p /home/ubuntu/actions-runner/e2e-home /home/ubuntu/actions-runner/tmp /home/ubuntu/actions-runner/pip-cache
 
       # Bootstrap rustup ourselves with --no-modify-path so it never writes to
-      # $HOME/.profile on the full root disk (setup-rust-toolchain doesn't expose
-      # that flag). rust-toolchain.toml pins the exact toolchain, installed on
-      # first cargo use. Idempotent.
+      # $HOME/.profile (setup-rust-toolchain doesn't expose that flag).
+      # rust-toolchain.toml pins the exact toolchain, installed on first cargo
+      # use. Idempotent.
       - name: Ensure Rust toolchain
         run: |
           if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$CARGO_HOME/bin/cargo" ]; then
@@ -813,7 +819,10 @@ jobs:
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       - name: Run E2E tests on Strix Halo (excluding known bugs)
-        run: cargo xtask e2e -- -t "@gpu and not @expected-failure"
+        run: |
+          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
+          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
+          cargo xtask e2e -- -t "@gpu and not @expected-failure"
 
       - name: Upload E2E report
         if: always()
@@ -839,21 +848,24 @@ jobs:
           && (inputs.tier == 'both' || inputs.tier == 'known-bugs'))
       )
     continue-on-error: true
-    # See e2e-gpu-strix-ubuntu: only the nvme volume has space; keep the toolchain
-    # + temp there and bootstrap rustup with --no-modify-path (no $HOME/.profile
-    # write), leaving HOME as the real home to avoid rustup's euid/HOME warning.
+    # See e2e-gpu-strix-ubuntu: /, /home/ubuntu, and /tmp are all on a full root
+    # partition; only the nvme has space. Point HOME + all caches at the nvme so
+    # nothing writes to root (pip's cache under the real $HOME is what failed
+    # `install sdk` with ENOSPC).
     env:
+      HOME: /home/ubuntu/actions-runner/e2e-home
       CARGO_HOME: /home/ubuntu/actions-runner/.cargo
       RUSTUP_HOME: /home/ubuntu/actions-runner/.rustup
       TMPDIR: /home/ubuntu/actions-runner/tmp
+      PIP_CACHE_DIR: /home/ubuntu/actions-runner/pip-cache
       # Known-bug tier: fail fast rather than wait the default 600s on a serve
       # that a bug prevents from becoming ready.
       E2E_SERVE_TIMEOUT_SECS: "90"
     steps:
       - uses: actions/checkout@v6
 
-      - name: Prepare temp dir
-        run: mkdir -p /home/ubuntu/actions-runner/tmp
+      - name: Prepare writable dirs on the nvme
+        run: mkdir -p /home/ubuntu/actions-runner/e2e-home /home/ubuntu/actions-runner/tmp /home/ubuntu/actions-runner/pip-cache
 
       # See e2e-gpu-strix-ubuntu: bootstrap rustup with --no-modify-path so it
       # never writes $HOME/.profile on the full root disk.
@@ -866,7 +878,10 @@ jobs:
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       - name: Run known-bug E2E scenarios on Strix Halo
-        run: cargo xtask e2e --expect-failures -- -t "@gpu and @expected-failure"
+        run: |
+          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
+          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
+          cargo xtask e2e --expect-failures -- -t "@gpu and @expected-failure"
 
       - name: Upload E2E report
         if: always()
