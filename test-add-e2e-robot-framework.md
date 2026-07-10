@@ -6,7 +6,7 @@
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-10
 
-**Token Usage:** in=1820 out=557801 cache_create=10299158 cache_read=279807335 calls=917
+**Token Usage:** in=2234 out=656753 cache_create=10780854 cache_read=345536971 calls=1124
 
 ---
 
@@ -349,3 +349,9 @@ addressed here with the exit-code fix + dedicated known-bugs job.
 - **Security audit** (admin access now): confirmed fork-PR approval all-external, default token read-only, no PR approvals by workflows. Two settings still loose: `sha_pinning_required: false` (actions on mutable tags), `allowed_actions: all`. Planned: separate hardening PR to pin all action refs + add dependabot + new manual-dispatch E2E workflow.
 - **Hardening scope**: (1) pin 5 unpinned actions to resolved SHAs (checkout v6.0.3, upload/download-artifact v4.6.2/4.3.0, cache v5.1.0, setup-rust-toolchain v1.17.0, dtolnay/rust-toolchain 1.96.0), (2) add `.github/dependabot.yml` for auto-bump, (3) add manual-dispatch E2E workflow (inputs: platform [app-dev-gpu/strix-ubuntu/strix-windows/all], tier [expect-pass/known-bugs/both], no build-and-test dependency), (4) post-merge: flip `sha_pinning_required: true`.
 - **Design decision pending**: move provisioning fixes (Strix bash→pwsh, Linux disk env) OUT of PR #69 INTO hardening PR for coherent CI-infra focus, or keep in #69 + duplicate bootstrap in manual workflow?
+
+### 2026-07-10 (Strix infra fixes + app-dev runner analysis)
+- **Strix Windows pwsh → powershell fix**: updated 4 job steps (lines 848, 859, 892, 903) from `shell: pwsh` to `shell: powershell` (Windows PowerShell 5.1, only available shell on self-hosted Strix Windows box). Fixes `pwsh: command not found` error. **Staged, not committed.**
+- **Strix Linux HOME redirect**: root disk (/) + `/home/ubuntu` both full; `/home/ubuntu/actions-runner` is 1.7TB nvme mount (1% used). Confirmed rustup's `.profile` write fails ENOSPC on root fs. Added `HOME: /home/ubuntu/actions-runner/temp-home` + mkdir to redirect all of rustup's home-dir writes. **Staged, not committed.**
+- **Task #6 batch preparation**: combined 3 fixes (Windows pwsh, Linux HOME, 8 non-E2E skip-on-dispatch guards from earlier) into one uncommitted batch. All valid individually (tested during live run inspection); ready to commit + push once current PR CI run completes.
+- **app-dev runner analysis**: extracted full current pod spec (image, GPU resource requests, node labels, PVC mounts). Currently ephemeral (lives in vscode dev-workspace pod, emptyDir `/workload`, dies on pod restart). User confirmed: want to keep MI300X gfx943 runner active as a CI target after shutting down vscode. **Decision needed**: GitHub credential (PAT or App token) to enable auto-registration on Deployment startup. Plan: hand-rolled Deployment (one fixed runner, not ARC) to replicate pod spec independently + self-bootstrap via token API on startup.
