@@ -10,6 +10,24 @@ on:
   merge_group:
     branches: [main]
     types: [checks_requested]
+  # Manual trigger for on-demand E2E runs on the self-hosted GPU runners, without
+  # waiting on a push/PR or the full gate. Dispatch against any ref
+  # (`gh workflow run ci.yml --ref <branch> -f platform=... -f tier=...`) — GitHub
+  # runs THAT ref's copy of this file, so the E2E jobs it selects live on the ref.
+  # A dispatch skips build-and-test (see its `if:`) for a fast loop. This trigger
+  # must exist on the default branch for the workflow to be dispatchable at all.
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Which GPU runner(s) to target
+        type: choice
+        default: all
+        options: [all, app-dev-gpu, strix-ubuntu, strix-windows]
+      tier:
+        description: Which scenario tier(s) to run
+        type: choice
+        default: both
+        options: [both, expect-pass, known-bugs]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -108,6 +126,9 @@ jobs:
     runs-on: ubuntu-latest
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
     needs: [changes, clippy, prek]
+    # A manual E2E dispatch skips this heavy job for a fast loop; the E2E jobs
+    # tolerate a skipped build-and-test in their own `if:` guards.
+    if: github.event_name != 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v6
 
