@@ -4,9 +4,9 @@
 **Stage:** 8-awaiting-pr-approval
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
-**Last Updated:** 2026-07-10 (idle flush at 2026-07-10)
+**Last Updated:** 2026-07-10
 
-**Token Usage:** in=19 out=6619 cache_create=1205042 cache_read=3214519 calls=11
+**Token Usage:** in=73 out=26322 cache_create=1654061 cache_read=13957109 calls=38
 
 ---
 
@@ -70,19 +70,23 @@ traceability) and `@gpu` for hardware-dependent scenarios.
   Added 4 jobs (each expect-pass + known-bugs), label-routed by `strix-halo` +
   os. Windows = first real Windows-GPU e2e coverage. Commit `93f03ef`.
   (app-dev-gpu = `amd-gpu` label; strix boxes = `strix-halo` label.)
-- ✅ **Consolidated cross-platform report** (COMMITTED — see blocker): extracted
+- ✅ **Consolidated cross-platform report** (COMMITTED `96108e5`): extracted
   lean `crates/e2e-report` (maud+serde only, so xtask doesn't pull
   cucumber/axum/tokio); `generate_consolidated` + `consolidated_summary_markdown`
   (platform×tier matrix, xfail-aware, flags XPASS); `cargo xtask e2e-report`
   (globs `*-report` artifacts → auto-discovers platforms); CI `e2e-report` job
   (`if: always()`, step-summary + one HTML artifact). 52 tests green, clippy
   clean, Linux container green, browser-verified HTML render.
+- ✅ Final clippy pass: made `ok()` & `status_text()` const; collapsed nested `if`;
+  used `writeln!` instead of format_push_string. All 3 crates: 52 tests green,
+  Linux container full suite green, harness re-export verified.
+- ✅ Committed `96108e5` (signed via github-app fallback wrapper, signed-off);
+  force-pushed to origin/test/add-e2e-robot-framework. PR now has 4 commits total:
+  CI-correctness (`55b3aec`), GPU split (`d33d182`), Strix runners (`93f03ef`),
+  consolidated report (`96108e5`).
 
 ### Todo 📋
-- 📋 **Commit blocked**: consolidated-report change staged but `git commit` fails
-  on `1Password: failed to fill whole buffer` (SSH signing agent locked). Unlock
-  1Password, then retry commit + `git push --force-with-lease`.
-- 📋 Await @rominf re-review + CI on PR #69 (last push was `93f03ef`)
+- 📋 Await @rominf re-review + first live CI run on PR #69 (latest push: `96108e5`)
 - 📋 Watch first live run of the 6 GPU jobs — esp. Strix Windows (untested path)
 - 📋 (Deferred) Surface outstanding known-bug count from CI — largely covered by
   the consolidated report's xfail column + "Needs attention" section now.
@@ -104,11 +108,7 @@ traceability) and `@gpu` for hardware-dependent scenarios.
 
 ## Blockers / Open Questions
 
-- **1Password signing locked**: consolidated-report commit fails with
-  `1Password: failed to fill whole buffer`. Change is staged + fully verified;
-  just needs 1Password unlocked, then retry `git commit` and force-push.
-- Note: the report was later migrated to `maud` after all (reviewer's earlier
-  suggestion), and now lives in the new `crates/e2e-report` crate.
+- None currently. Consolidated-report commit landed (`96108e5`, signed via github-app fallback).
 - **Persistent runner**: self-hosted GPU runner is ephemeral; needs a k8s deploy.
 
 ## Robot Framework vs cucumber-rs (decision: cucumber-rs)
@@ -182,4 +182,8 @@ addressed here with the exit-code fix + dedicated known-bugs job.
   still green via re-export, Linux container suite fully green.
 - Updated WIP file with multi-runner & consolidated-report scope. Synced to
   progress branch (unsigned, 1Password locked, per skill design).
-- **2026-07-10 (idle flush):** Session idle for 1 hour, auto-flushing WIP state.
+- **2026-07-10 (context switch continued):** Debugged signing blocker on `96108e5`
+  commit: 1Password SSH agent was returning errors. Switched to `git-commit-with-fallback`
+  (github-app skill wrapper) which has GPG fallback; commit signed successfully with
+  RSA SSH key. Pushed to origin/test/add-e2e-robot-framework (fast-forward, no force).
+  All 4 daily commits now landed & pushed.
