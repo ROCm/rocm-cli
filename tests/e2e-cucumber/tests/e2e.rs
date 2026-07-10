@@ -140,11 +140,34 @@ pub fn rocm_binary() -> String {
     std::env::var("ROCM_CLI_BINARY").unwrap_or_else(|_| "rocm".to_string())
 }
 
+/// How long a single inference request may take before the harness gives up.
+///
+/// This bounds the test's wall-clock, not the product: a genuinely hung backend
+/// (e.g. EAI-7052, lemonade falling back to Vulkan) would otherwise block the
+/// HTTP call forever and let a known-bug scenario run until the CI job limit.
+/// Capping it turns the hang into a prompt failure — exactly the expected
+/// outcome for an `@expected-failure` scenario. 10s is ample for a small model
+/// that is already loaded (serve readiness is waited for separately) to answer a
+/// one-word prompt; override with `E2E_INFERENCE_TIMEOUT_SECS` if needed.
+fn inference_timeout_secs() -> u64 {
+    std::env::var("E2E_INFERENCE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10)
+}
+
 pub async fn send_chat(world: &mut E2eWorld) {
     let endpoint = world.endpoint.as_ref().expect("no endpoint configured");
 
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(inference_timeout_secs()))
+        .build()
+        .expect("failed to build HTTP client");
+
     let models_url = format!("{endpoint}/models");
-    let resp: serde_json::Value = reqwest::get(&models_url)
+    let resp: serde_json::Value = client
+        .get(&models_url)
+        .send()
         .await
         .unwrap_or_else(|e| panic!("GET {models_url} failed: {e}"))
         .json()
@@ -157,7 +180,6 @@ pub async fn send_chat(world: &mut E2eWorld) {
     world.discovered_model = Some(model.clone());
 
     let chat_url = format!("{endpoint}/chat/completions");
-    let client = reqwest::Client::new();
     let chat_resp: serde_json::Value = client
         .post(&chat_url)
         .json(&serde_json::json!({
