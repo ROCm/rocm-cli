@@ -39,8 +39,8 @@ mod slash;
 mod summary;
 
 use chat::{
-    build_chat_agent, build_local_agent, detect_local_chat, detect_managed_chat,
-    persist_chat_endpoint,
+    build_chat_agent, build_local_agent, detect_local_chat, detect_managed_chat, fetch_first_model,
+    persist_chat_endpoint, with_discovered_model,
 };
 use summary::{parse_plan_result, summarize_json_value, summarize_slash_tool};
 
@@ -1582,6 +1582,9 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             .await
             .unwrap_or(false)
         };
+        // The managed branch already carries a `/v1/models`-discovered model; a
+        // resolver-produced config from a configured URL does not.
+        let had_managed = managed.is_some();
         let llm = managed.or_else(|| {
             crate::llm::resolve_llm_config(
                 args.chat_url.as_deref(),
@@ -1594,6 +1597,22 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                 probe_ok,
             )
         });
+        // A configured URL (env/CLI) with no explicit model resolves to the
+        // `local-model` placeholder, which 404s on servers that register the
+        // model under its real id. Discover the served model via `/v1/models`,
+        // mirroring the managed-service path. Gated on `probe_ok` so an
+        // unreachable endpoint never adds the fetch timeout to startup.
+        let llm = match llm {
+            Some(cfg) if !had_managed && probe_ok && args.chat_model.is_none() => {
+                let discovered = fetch_first_model(&cfg.base_url).await;
+                Some(with_discovered_model(
+                    cfg,
+                    args.chat_model.as_deref(),
+                    discovered,
+                ))
+            }
+            other => other,
+        };
         state.set_chat_config(llm, args.chat_auto_consent);
         // No reachable local endpoint AND no key/url configured → the no-key
         // ChatGPT OAuth default (device-code login surfaced in the chat tab).

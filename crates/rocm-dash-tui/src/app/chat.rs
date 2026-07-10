@@ -282,8 +282,28 @@ pub(super) fn config_with_chat(
     cfg
 }
 
+/// Fold a `/v1/models`-discovered model id into a resolved [`LlmConfig`].
+///
+/// Only overrides when the user did **not** configure a model explicitly (so the
+/// resolver filled in the neutral `DEFAULT_CHAT_MODEL` placeholder). An explicit
+/// `--chat-model`/config value always wins; a failed discovery (`None`) leaves
+/// the placeholder in place so endpoints that ignore the model field keep
+/// working. Pure — the unit-test anchor for the startup model-discovery wiring.
+pub(super) fn with_discovered_model(
+    mut llm: crate::llm::LlmConfig,
+    explicit_model: Option<&str>,
+    discovered: Option<String>,
+) -> crate::llm::LlmConfig {
+    if explicit_model.is_none()
+        && let Some(model) = discovered
+    {
+        llm.model = model;
+    }
+    llm
+}
+
 /// GET `{base}/models` and return the first served model id, or `None`.
-async fn fetch_first_model(base_url: &str) -> Option<String> {
+pub(super) async fn fetch_first_model(base_url: &str) -> Option<String> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -407,5 +427,34 @@ mod tests {
     fn skips_ready_record_with_empty_endpoint() {
         let env = services_envelope(serde_json::json!([service("vllm", "", "ready", "m", 100)]));
         assert_eq!(pick_managed_chat_endpoint(&env), None);
+    }
+
+    fn placeholder_config() -> crate::llm::LlmConfig {
+        crate::llm::detected_llm_config("http://127.0.0.1:11435/v1", crate::llm::DEFAULT_CHAT_MODEL)
+    }
+
+    #[test]
+    fn discovered_model_replaces_placeholder_when_none_configured() {
+        // The 404 regression: no explicit model → the served id must be adopted.
+        let out = with_discovered_model(
+            placeholder_config(),
+            None,
+            Some("Qwen/Qwen2.5-1.5B-Instruct".to_string()),
+        );
+        assert_eq!(out.model, "Qwen/Qwen2.5-1.5B-Instruct");
+    }
+
+    #[test]
+    fn explicit_model_is_never_overridden() {
+        let mut cfg = placeholder_config();
+        cfg.model = "my-model".to_string();
+        let out = with_discovered_model(cfg, Some("my-model"), Some("served-id".to_string()));
+        assert_eq!(out.model, "my-model");
+    }
+
+    #[test]
+    fn failed_discovery_keeps_placeholder() {
+        let out = with_discovered_model(placeholder_config(), None, None);
+        assert_eq!(out.model, crate::llm::DEFAULT_CHAT_MODEL);
     }
 }
