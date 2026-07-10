@@ -19,10 +19,10 @@ on:
   workflow_dispatch:
     inputs:
       platform:
-        description: Which GPU runner(s) to target
+        description: Which runner(s) to target
         type: choice
         default: all
-        options: [all, app-dev-gpu, strix-ubuntu, strix-windows]
+        options: [all, mock, app-dev-gpu, strix-ubuntu, strix-windows]
       tier:
         description: Which scenario tier(s) to run
         type: choice
