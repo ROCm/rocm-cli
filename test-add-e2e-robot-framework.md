@@ -6,7 +6,7 @@
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-10
 
-**Token Usage:** in=1342 out=402230 cache_create=8611428 cache_read=225869081 calls=678
+**Token Usage:** in=1820 out=557801 cache_create=10299158 cache_read=279807335 calls=917
 
 ---
 
@@ -145,6 +145,31 @@ even on Instinct because vllm can't serve them. vLLM-capable safetensors (e.g.
 - 📋 (Optional) Update E2E cucumber memory ([[rocm-cli-e2e-cucumber]]) with new default-engine
   precedence + both-engine coverage once this lands — currently reflects the pre-multi-engine state.
 - 📋 Persistent self-hosted GPU runner (currently ephemeral workspace pod).
+
+### In progress 🚧 (Jul 10 — CI infra fixes + manual dispatch)
+- ✅ **Inference timeout cap** (`f2fa495`): `send_chat` client had NO timeout → a hung
+  backend (EAI-7052 lemonade) blocked the HTTP POST forever, stretching the GPU known-bugs
+  job to 28+ min. Added `E2E_INFERENCE_TIMEOUT_SECS` (default **10s**). Not a product bug
+  (hang is EAI-7052); harness gap only.
+- ✅ **Strix Linux disk fix** (`f2ee84e`): runner root disk full/non-persistent → rustup
+  bootstrap `curl (23)` write failure. Redirect CARGO_HOME/RUSTUP_HOME/TMPDIR to
+  `/home/ubuntu/actions-runner` + pre-create tmp. Both pushed to #69.
+- ✅ **Strix Windows bootstrap**: `setup-rust-toolchain` fails (`bash: command not found`);
+  replaced with a pwsh `win.rustup.rs` install step (`--default-toolchain none`, rust-toolchain.toml
+  pins 1.96.0), idempotent. Disk on Windows box = 1.8TB, no redirect needed. Committed as `96b8bbb`.
+- ✅ **Manual dispatch plumbing** (task: [[ci-manual-e2e]]): added `workflow_dispatch` + platform/tier
+  inputs to #69's ci.yml (byte-identical to PR #98), build-and-test skip on dispatch, all 8 E2E jobs
+  guarded with platform×tier mapping, e2e-report runs on dispatch. actionlint clean. Committed as `96b8bbb` (signed, no AI refs), pushed. Container suite green pre-push (31 ok).
+  - **Key insight**: `cargo xtask e2e` builds the binary in place (`cargo build --release -p rocm`)
+    when ROCM_CLI_BINARY unset → E2E jobs are self-contained, `needs: build-and-test` is ordering-only,
+    so skipping it on dispatch is safe (each job builds fresh from the dispatched ref).
+  - **PR #98** (`ci-manual-e2e`, off main): just the `on:` trigger, so ci.yml becomes
+    dispatchable (workflow_dispatch must exist on default branch). CI green, **in merge queue** (will land soon).
+  - Once #98 merges: rebase #69 onto pinned main, then `gh workflow run ci.yml --ref test/add-e2e-robot-framework -f platform=strix-windows -f tier=known-bugs` runs E2E on-demand.
+- ✅ **create_worktree.sh gotcha**: branched ci-manual-e2e/ci-harden-actions off STALE local main
+  (18 behind origin, pre-`affected` subcommand) → `Test (affected crates)` failed with
+  "unrecognized subcommand 'affected'". Fixed #98 + #99 by rebasing onto origin/main.
+- ✅ **CI security hardening** (PR #99 `ci-harden-actions`): SHA-pinned 4 remaining actions (checkout, cache, setup-rust-toolchain, dtolnay/rust-toolchain) across ci.yml/nightly.yml/release.yml + added `.github/dependabot.yml` (github-actions, weekly). Also applied repo settings: default token read-only, no PR approvals by actions. Post-merge: flip `sha_pinning_required` (after rebasing #69/#98 onto pinned main to avoid CI rejections).
 
 ## Next Steps
 
@@ -309,7 +334,14 @@ addressed here with the exit-code fix + dedicated known-bugs job.
 - Added brevity feedback to project memory (keep answers short for status questions).
 - WIP updated, synced to progress branch.
 
-### 2026-07-10 (runner provisioning fixes + security hardening planning)
+### 2026-07-10 (runner provisioning + dispatch plumbing + security hardening)
+- **Inference timeout**: added `E2E_INFERENCE_TIMEOUT_SECS` (default 10s) to cap unbounded HTTP client, fail fast on known hangs.
+- **Strix Linux disk**: set `CARGO_HOME`/`RUSTUP_HOME`/`TMPDIR` to persistent `/home/ubuntu/actions-runner`, pre-create tmp, toolchain installs on full-disk runner.
+- **Strix Windows bash**: replaced bash-based action with PowerShell `win.rustup.rs` bootstrap, `--default-toolchain none`, idempotent.
+- **Manual dispatch workflow**: added `workflow_dispatch` trigger + platform/tier inputs to ci.yml (8 E2E jobs guarded, e2e-report runs on dispatch).
+- **PR #98** (ci-manual-e2e): enabler, **in merge queue**. PR #99 (ci-harden-actions): SHA-pin all actions, add dependabot, apply repo security settings.
+
+### 2026-07-10 (earlier — runner provisioning fixes + security hardening planning)
 - **Inference timeout cap** (commit `f2fa495`): `send_chat` used unbounded HTTP client; moved to 10s timeout via `E2E_INFERENCE_TIMEOUT_SECS` env. Known-bugs xfail scenarios now fail fast (~1 min) instead of blocking until job limit.
 - **Strix Linux disk fix** (commit `f2ee84e`): runner's full/non-persistent root disk → `rustup-init` download fails (curl 23). Set `CARGO_HOME`, `RUSTUP_HOME`, `TMPDIR` to `/home/ubuntu/actions-runner`, pre-create temp dir. Toolchain install + reuse now on persistent disk.
 - **Strix Windows bash fix** (staged, not pushed): `setup-rust-toolchain@v1` runs bash script internally. Replaced with PowerShell step: `iwr win.rustup.rs`, `--default-toolchain none` (rust-toolchain.toml pins 1.96.0). Idempotent; cold box auto-provisions on first run.
