@@ -68,3 +68,50 @@ branch exactly to avoid merge collision.
 - Verification before push: run the Linux container suite per
   [[rocm-cli-e2e-cucumber]] rule (this branch touches only YAML, so container run
   is a formality, but keep the habit).
+
+## ✅ CONFIRMED — fast-iteration loop (validated 2026-07-10)
+
+**The problem being solved:** iterating on #69 by "commit + push" is slow because
+every push to the PR branch fires the `pull_request` trigger → a FULL CI run that
+queues on the single serial GPU runner. We want to push a fix and run ONLY a narrow
+E2E slice fast.
+
+**THE LOOP (proven working — use this):**
+1. Branch off #69 to a scratch branch with NO PR (used `ci-e2e-framework-fixes`).
+2. Edit → commit → `git push`. **No CI fires** (confirmed: 2 pushes to the PR-less
+   branch triggered ZERO runs).
+3. Dispatch the narrow slice:
+   `gh workflow run ci.yml --ref ci-e2e-framework-fixes -f platform=strix-ubuntu -f tier=expect-pass`
+4. Repeat 2–3. Fold the fix back into #69 when done; delete scratch.
+
+**Hypothesis A — scratch branch with no PR — ✅ CONFIRMED:**
+- Push to a PR-less branch triggers NOTHING (verified: pushes `b967d26→2633bc1`
+  produced 0 auto-runs on `ci-e2e-framework-fixes`).
+- Dispatching a non-main ref runs THAT ref's YAML + code (verified: run 29109142221
+  ran the scratch ref `2633bc1`'s job definitions).
+- Dispatch targeting is EXACT: `platform=strix-ubuntu tier=expect-pass` selected
+  exactly ONE job (`E2E tests (Strix Halo, Ubuntu)`); all other 7 E2E jobs +
+  build-and-test + every non-E2E job SKIPPED. The speedup guards work as designed.
+
+**Hypothesis B — `[skip ci]` on #69 directly — still UNTESTED (and unnecessary):**
+- The scratch-branch loop (A) is strictly better — no PR-check pollution — so B was
+  not pursued. Left here only as a fallback note: `[skip ci]` in a commit msg
+  suppresses the auto run (nothing in ci.yml overrides it), but skipped commits
+  leave a PR's required checks unproduced until a later normal push. Prefer A.
+
+**Operational cautions (observed this session, likely real):**
+- Single serial runner → rapid re-dispatches queue behind each other. Cancel the
+  previous run before re-dispatching:
+  `gh run list --branch <b> -L1 --json databaseId -q '.[0].databaseId' | xargs -r gh run cancel`
+- Cancel lag on self-hosted is REAL and severe: API cancels repeatedly failed to
+  propagate to a wedged job; a zombie run held the `concurrency: ci-${{ github.ref }}`
+  group and blocked a newer run from even creating jobs. Freeing it required
+  stopping the runner on the box so the job timed out. (This is CONFIRMED pain, not
+  a hypothesis.)
+- Fastest iteration for non-hardware bugs: `platform=mock` (GitHub-hosted, no
+  serial-runner contention) or the local container — avoid the GPU runner entirely
+  unless the bug is hardware-specific.
+
+**The real fix for all this:** ephemeral per-job runners (ARC) — see
+[[persist-app-dev-ci-runner]]. Per-job ephemerality removes serial contention,
+zombie re-grab, and cancel-lag in one move.

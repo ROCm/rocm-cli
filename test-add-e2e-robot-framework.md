@@ -5,7 +5,7 @@
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-10
-**Token Usage:** in=2548 out=742032 cache_create=10905384 cache_read=410288462 calls=1281
+**Token Usage:** in=2768 out=814393 cache_create=11448735 cache_read=462877065 calls=1391
 
 ---
 
@@ -185,11 +185,60 @@ even on Instinct because vllm can't serve them. vLLM-capable safetensors (e.g.
   `run.sh` stay up. Durable replacement (dedicated Deployment + GitHub App/PAT reg credential) designed,
   NOT built — user paused; needs credential decision.
 
+## Apparent real bugs (product, surfaced by E2E — triage separately from framework work)
+
+These are NOT test-framework issues; they look like genuine product behavior gaps
+found by running the suite. Track here, file tickets, fix in product code (not the
+harness). Keep separate from framework-reliability fixes.
+
+- **gfx1151 (Strix Halo) vLLM serve fails** — first-ever gfx1151 E2E run (`b967d26`,
+  run 29104869493): 4/7 scenarios pass, but `a model is being served on GPU` →
+  `rocm serve failed`. Serve PLAN is correct (`engine: vllm`,
+  `runtime_id: release-wheel-gfx1151-7-13-0`, `selection_source: config_active_runtime_key`,
+  `device_policy: gpu_required`); it downloads the gfx1151 TheRock runtime (3.3GB) +
+  llamacpp:rocm backend, then the serve itself does not complete. Unknown yet whether
+  this is an unsupported-hardware expectation or a real bug — NEEDS TRIAGE on the box.
+  Until triaged, the Strix jobs are `continue-on-error` (non-blocking) so they don't
+  gate the PR. Candidate: file EAI ticket once characterized.
+
+## Framework reliability fixes (iterate on scratch branch `ci-e2e-framework-fixes`)
+
+Framework/harness/CI issues to fix fast via the scratch-branch + manual-dispatch loop
+(validated and confirmed working — see [[ci-manual-e2e]]):
+- ✅ **HOME override warning** (introduced by our own Strix Ubuntu fix): replaced
+  `HOME=/home/ubuntu/actions-runner/temp-home` with `--no-modify-path` rustup
+  bootstrap (commit `2633bc1`, run 29109142221 queued on Strix Ubuntu). Keeps toolchain
+  on nvme, avoids `.profile` write, no euid/HOME warning.
+- **Cargo build cache destroyed between runs** — `Swatinem/rust-cache` cleanup wipes
+  `target/` at job end, forcing 15-min full rebuild next run even if sources unchanged.
+  Cargo's incremental build (rebuild-only-if-changed) never runs. Self-hosted runners
+  should persist `target/` in `_work` (survives between jobs) and disable
+  `Swatinem/rust-cache` cleanup. Investigate whether `_work/target` persists, then
+  implement option 1: persist locally, use cargo's native incremental (rebuild only if
+  changed).
+
+## Work Log
+
+**2026-07-10:**
+- Fixed Strix Windows/Ubuntu/Linux runner bootstrap issues (pwsh→powershell, HOME on
+  nvme, temp-home strategy). All runners now bootstrap successfully; E2E executes.
+- Validated fast-iteration loop: PR-less scratch branch + manual dispatch.
+  `ci-e2e-framework-fixes` branch created, HOME warning fix pushed, dispatch to
+  Strix Ubuntu (run 29109142221). Hypothesis A (no auto-CI on PR-less branch) + 
+  dispatch targeting both confirmed in production.
+- Discovered 15-min cargo rebuild is the real #69 E2E slowness. Root: `Swatinem/rust-cache`
+  destroys `target/` between jobs on self-hosted runners, forcing full rebuilds even
+  when sources unchanged.
+- Created 5 WIP files (one per PR/topic), symlinked all into workspace/wip. Recorded
+  apparent real bug (gfx1151 vLLM serve) separately from framework reliability work.
+
 ## Next Steps
 
-- Monitor PR #69 CI + re-review. If report.rs maintainability is raised again,
-  `maud` is the easy upgrade (user wants to keep the HTML report).
-- On merge: post-merge cleanup, then remove worktree.
+- Verify `target/` persistence on self-hosted runner's `_work` directory between jobs.
+- Implement cargo build cache persistence on app-dev GPU runner (disable `Swatinem/rust-cache`
+  cleanup, rely on cargo's incremental compile). Target: sub-minute rebuilds when unchanged.
+- Monitor PR #69 CI + merge readiness. Non-blocking Strix failures (gfx1151 serve) do
+  not gate PR. If report.rs maintainability raised, `maud` is upgrade path.
 
 ## Checklist
 
