@@ -7,21 +7,6 @@ use e2e_cucumber::mock_server::MockServer;
 
 use crate::E2eWorld;
 
-fn run_rocm(world: &E2eWorld, args: &[&str]) -> (String, String, i32) {
-    let binary = crate::rocm_binary();
-    let mut cmd = std::process::Command::new(&binary);
-    cmd.args(args);
-    world.isolate_cmd(&mut cmd);
-    let output = cmd
-        .output()
-        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
-    (
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-        output.status.code().unwrap_or(-1),
-    )
-}
-
 // ── Given ──────────────────────────────────────────────────────────
 
 #[given("a model is being served")]
@@ -51,7 +36,7 @@ async fn send_chat_request(world: &mut E2eWorld) {
 
 #[when("the user checks for running services")]
 async fn user_checks_services(world: &mut E2eWorld) {
-    let (stdout, _, _) = run_rocm(world, &["services", "list"]);
+    let (stdout, _, _) = crate::run_rocm(world, &["services", "list"]);
     world.cli_output = Some(stdout);
 }
 

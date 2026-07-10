@@ -6,24 +6,9 @@ use cucumber::{given, then, when};
 
 use crate::E2eWorld;
 
-fn run_rocm(world: &E2eWorld, args: &[&str]) -> (String, String, i32) {
-    let binary = crate::rocm_binary();
-    let mut cmd = std::process::Command::new(&binary);
-    cmd.args(args);
-    world.isolate_cmd(&mut cmd);
-    let output = cmd
-        .output()
-        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
-    (
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-        output.status.code().unwrap_or(-1),
-    )
-}
-
 #[given("a machine with no CLI-managed runtimes")]
 async fn setup_no_runtimes(world: &mut E2eWorld) {
-    let (stdout, _, _) = run_rocm(world, &["runtimes", "list"]);
+    let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     assert!(
         stdout.contains("installed: none") || stdout.contains("managed_runtimes: 0"),
         "expected no managed runtimes:\n{stdout}"
@@ -35,12 +20,12 @@ async fn setup_standard_rocm(_world: &mut E2eWorld) {}
 
 #[given("a managed runtime is active")]
 async fn setup_active_runtime(world: &mut E2eWorld) {
-    let (stdout, _, _) = run_rocm(world, &["runtimes", "list"]);
+    let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     if stdout.contains("installed: none") {
-        let (install_out, _, rc) = run_rocm(world, &["install", "sdk"]);
+        let (install_out, _, rc) = crate::run_rocm(world, &["install", "sdk"]);
         assert!(rc == 0, "rocm install sdk failed (rc={rc}):\n{install_out}");
     }
-    let (stdout, _, _) = run_rocm(world, &["runtimes", "list"]);
+    let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     assert!(
         !stdout.contains("installed: none"),
         "no managed runtime is active:\n{stdout}"
@@ -49,14 +34,14 @@ async fn setup_active_runtime(world: &mut E2eWorld) {
 
 #[when("the user installs the SDK")]
 async fn user_installs_sdk(world: &mut E2eWorld) {
-    let (stdout, _, rc) = run_rocm(world, &["install", "sdk"]);
+    let (stdout, _, rc) = crate::run_rocm(world, &["install", "sdk"]);
     assert!(rc == 0, "rocm install sdk failed (rc={rc}):\n{stdout}");
     world.cli_output = Some(stdout);
 }
 
 #[when("the user tries to adopt the existing install")]
 async fn user_tries_adopt(world: &mut E2eWorld) {
-    let (stdout, stderr, rc) = run_rocm(
+    let (stdout, stderr, rc) = crate::run_rocm(
         world,
         &[
             "runtimes",
@@ -74,7 +59,7 @@ async fn user_tries_adopt(world: &mut E2eWorld) {
 
 #[then("a runtime is registered")]
 async fn assert_runtime_registered(world: &mut E2eWorld) {
-    let (stdout, _, _) = run_rocm(world, &["runtimes", "list"]);
+    let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     assert!(
         !stdout.contains("installed: none"),
         "no runtime registered after install:\n{stdout}"
@@ -83,7 +68,7 @@ async fn assert_runtime_registered(world: &mut E2eWorld) {
 
 #[then("the runtime is set as active")]
 async fn assert_runtime_active(world: &mut E2eWorld) {
-    let (stdout, _, _) = run_rocm(world, &["runtimes", "list"]);
+    let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     let active = stdout
         .lines()
         .find(|l| l.contains("active_runtime_key:"))
@@ -97,7 +82,7 @@ async fn assert_runtime_active(world: &mut E2eWorld) {
 
 #[then("the runtime includes an inference engine")]
 async fn assert_runtime_has_stack(world: &mut E2eWorld) {
-    let (stdout, _, _) = run_rocm(world, &["examine"]);
+    let (stdout, _, _) = crate::run_rocm(world, &["examine"]);
     assert!(
         stdout.contains("torch") || stdout.contains("vllm"),
         "no inference stack found in runtime:\n{stdout}"

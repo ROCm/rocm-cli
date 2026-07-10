@@ -34,6 +34,10 @@ pub struct E2eWorld {
     pub cli_outputs: Option<Vec<String>>,
     pub cli_stderr: Option<String>,
     pub cli_rc: Option<i32>,
+    /// Name of the scenario currently executing, set by the `before` hook. Used
+    /// to tie each recorded `rocm` invocation to its scenario so the coverage
+    /// report can join commands to pass/fail results.
+    pub current_scenario: Option<String>,
     /// Per-scenario isolated config/data/cache root. A `TempDir` so it is unique
     /// per World and auto-removed on drop; using `tempfile` also keeps the OS
     /// temp-dir lookup out of our source (avoids a CodeQL path-injection
@@ -61,6 +65,7 @@ impl Default for E2eWorld {
             cli_outputs: None,
             cli_stderr: None,
             cli_rc: None,
+            current_scenario: None,
             isolated_root: Some(root),
         }
     }
@@ -188,6 +193,108 @@ pub fn rocm_binary() -> String {
     std::env::var("ROCM_CLI_BINARY").unwrap_or_else(|_| "rocm".to_string())
 }
 
+/// Spawn the real `rocm` binary with the scenario's isolated env, returning
+/// `(stdout, stderr, rc)`. Every scenario goes through here, so this is also
+/// where each invocation is recorded for the command-coverage report.
+pub fn run_rocm(world: &E2eWorld, args: &[&str]) -> (String, String, i32) {
+    let binary = rocm_binary();
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(args);
+    world.isolate_cmd(&mut cmd);
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    let rc = output.status.code().unwrap_or(-1);
+    record_command(world.current_scenario.as_deref(), args, rc);
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        rc,
+    )
+}
+
+/// Append one `rocm` invocation to `results/commands.jsonl` so the consolidated
+/// report can build a command × platform coverage table tied to real results.
+/// Best-effort: a recording failure must never fail a scenario.
+fn record_command(scenario: Option<&str>, args: &[&str], rc: i32) {
+    let subcommand = derive_subcommand(args);
+    let engine = flag_value(args, "--engine");
+    let model = positional_model(args);
+    let record = serde_json::json!({
+        "scenario": scenario,
+        "argv": args,
+        "rc": rc,
+        "subcommand": subcommand,
+        "model": model,
+        "engine": engine,
+    });
+    let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/results"));
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    if let Ok(mut line) = serde_json::to_string(&record) {
+        line.push('\n');
+        // Append; concurrent scenarios each add their own lines.
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("commands.jsonl"))
+        {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+}
+
+/// The signature used to group invocations in the coverage table: the leading
+/// subcommand plus the flags that materially change behaviour (e.g. `--engine`,
+/// `--managed`), but not values like the model name (shown in its own column).
+fn derive_subcommand(args: &[&str]) -> String {
+    // First non-flag token(s): most rocm subcommands are one word (`serve`,
+    // `examine`, `chat`), a few are two (`install sdk`, `services list`,
+    // `runtimes activate`).
+    let words: Vec<&str> = args
+        .iter()
+        .take_while(|a| !a.starts_with('-'))
+        .copied()
+        .collect();
+    let base = match words.as_slice() {
+        [] => "rocm".to_string(),
+        [one] => (*one).to_string(),
+        [first, second, ..] => format!("{first} {second}"),
+    };
+    // Note the behaviour-shaping flags so `serve` vs `serve --engine vllm` vs
+    // `serve` (default engine) are distinct rows.
+    let mut sig = format!("rocm {base}");
+    if args.contains(&"--engine") {
+        sig.push_str(" --engine");
+    } else if base == "serve" {
+        sig.push_str(" (default engine)");
+    }
+    sig
+}
+
+/// Value following `flag` in argv, if present (e.g. the engine after `--engine`).
+fn flag_value(args: &[&str], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| *a == flag)
+        .and_then(|i| args.get(i + 1))
+        .map(|s| (*s).to_string())
+}
+
+/// The model positional for model-taking subcommands (`serve <model>`). Returns
+/// the first non-flag token after the subcommand that looks like a model ref.
+fn positional_model(args: &[&str]) -> Option<String> {
+    // Only `serve` takes a model positional in this suite.
+    if args.first() != Some(&"serve") {
+        return None;
+    }
+    args.iter()
+        .skip(1)
+        .find(|a| !a.starts_with('-'))
+        .map(|s| (*s).to_string())
+}
+
 /// How long a single inference request may take before the harness gives up.
 ///
 /// This bounds the test's wall-clock, not the product: a genuinely hung backend
@@ -270,6 +377,13 @@ async fn main() {
     // `discard_stats_writes()` so the `Tee` bound (both sides implement `Stats`)
     // is satisfied — `Tee`'s counts then come from the summarized side.
     let summary = E2eWorld::cucumber()
+        // Record the scenario name on the World before each scenario so every
+        // `rocm` invocation can be tied back to its scenario for the coverage
+        // report.
+        .before(|_feature, _rule, scenario, world| {
+            world.current_scenario = Some(scenario.name.clone());
+            Box::pin(async {})
+        })
         .with_writer(
             writer::Basic::raw(std::io::stdout(), writer::Coloring::Auto, 1)
                 .summarized()
