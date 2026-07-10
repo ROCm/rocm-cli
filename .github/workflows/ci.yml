@@ -680,7 +680,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # cache: false — on this self-hosted runner we persist the build cache
+      # ourselves via CARGO_TARGET_DIR (below). The action's built-in
+      # Swatinem/rust-cache otherwise tries to SAVE the large target dir to
+      # GitHub's cache service in a post-step (slow/hangs) and its cleanup wipes
+      # the local target.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
 
       # `actions/checkout` runs `git clean -ffdx`, which deletes the gitignored
       # `target/` inside the repo every job → a full ~15min rebuild each run.
@@ -730,7 +737,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # See e2e-gpu: cache: false because we persist the cache ourselves via
+      # CARGO_TARGET_DIR; the action's rust-cache save/cleanup is slow and harmful
+      # on this self-hosted runner.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
 
       # See e2e-gpu: keep the build cache out of the checkout (git clean would
       # wipe it) for incremental rebuilds across jobs.
