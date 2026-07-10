@@ -6,7 +6,7 @@
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-10
 
-**Token Usage:** in=73 out=26322 cache_create=1654061 cache_read=13957109 calls=38
+**Token Usage:** in=323 out=88256 cache_create=5693929 cache_read=66377464 calls=167
 
 ---
 
@@ -86,8 +86,12 @@ traceability) and `@gpu` for hardware-dependent scenarios.
   consolidated report (`96108e5`).
 
 ### Todo 📋
+- 📋 **Investigate alias-forwarding bug** in rocm serve vllm path (manual repro confirmed).
+  Check if it maps to existing EAI ticket or needs filing. Tag `@gpu` serve scenarios as
+  `@expected-failure` if not already tracked. (Timeout bump not a fix, only clarity.)
 - 📋 Await @rominf re-review + first live CI run on PR #69 (latest push: `96108e5`)
-- 📋 Watch first live run of the 6 GPU jobs — esp. Strix Windows (untested path)
+- 📋 Watch first live run of the 6 GPU jobs — esp. Strix Windows (untested path).
+  Note: Strix runners will fail at toolchain setup (rustup download) until provisioned with Rust.
 - 📋 (Deferred) Surface outstanding known-bug count from CI — largely covered by
   the consolidated report's xfail column + "Needs attention" section now.
 - 📋 Persistent self-hosted GPU runner (currently ephemeral workspace pod)
@@ -174,7 +178,7 @@ addressed here with the exit-code fix + dedicated known-bugs job.
   Linux container green, browser-rendered the HTML matrix. **Commit blocked on
   locked 1Password signing agent** — staged, awaiting unlock.
 
-### 2026-07-10 (context switch, verify & finalize consolidated report)
+### 2026-07-10 (context switch, verify & finalize consolidated report, manual GPU repro)
 - Resumed from previous session. Pulled summary, reviewed full branch & implementation.
 - Completed final clippy fixes (3 lints): made `ok()` & `status_text()` const;
   collapsed nested `if` in e2e_report.rs; used `writeln!` instead of `format_push_string`.
@@ -182,8 +186,17 @@ addressed here with the exit-code fix + dedicated known-bugs job.
   still green via re-export, Linux container suite fully green.
 - Updated WIP file with multi-runner & consolidated-report scope. Synced to
   progress branch (unsigned, 1Password locked, per skill design).
-- **2026-07-10 (context switch continued):** Debugged signing blocker on `96108e5`
-  commit: 1Password SSH agent was returning errors. Switched to `git-commit-with-fallback`
-  (github-app skill wrapper) which has GPG fallback; commit signed successfully with
-  RSA SSH key. Pushed to origin/test/add-e2e-robot-framework (fast-forward, no force).
-  All 4 daily commits now landed & pushed.
+- Debugged signing blocker on `96108e5` commit: 1Password SSH agent was returning errors. 
+  Switched to `git-commit-with-fallback` (github-app skill wrapper) which has GPG fallback;
+  commit signed successfully with RSA SSH key. Pushed to origin/test/add-e2e-robot-framework 
+  (fast-forward, no force). All 4 daily commits now landed & pushed.
+- **Manual repro on app-dev-gpu MI300X (via k8s exec into live dev pod):**
+  - Bumped `wait_for_endpoint` timeout: 120s → 600s, made configurable via `E2E_SERVE_TIMEOUT_SECS` env.
+  - Reproduced exact failing scenario: `rocm serve qwen2.5 --engine vllm --managed`.
+  - Found **root cause: alias not forwarded to vllm engine.** CLI reports `resolved model: qwen2.5`;
+    vLLM receives literal `qwen2.5`, tries `https://huggingface.co/qwen2.5/...`, gets 401/not-found,
+    crashes. With canonical name `Qwen/Qwen2.5-1.5B-Instruct`, serve succeeds immediately.
+  - This is a genuine product bug (alias-resolution-not-forwarded-to-adapter), not a timeout issue.
+    Timeout bump still useful for clarity but won't fix the scenario — alias bug must be fixed.
+  - Confirmed Strix Halo runners: never ran tests yet (toolchain setup fails at rustup download).
+  - Confirmed app-dev-gpu app-dev MI300X available, manual testing successful.
