@@ -682,8 +682,16 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
+      # `actions/checkout` runs `git clean -ffdx`, which deletes the gitignored
+      # `target/` inside the repo every job → a full ~15min rebuild each run.
+      # Point CARGO_TARGET_DIR at a sibling of the checkout ($RUNNER_WORKSPACE is
+      # the checkout's parent — untouched by git clean and persistent between jobs
+      # on a self-hosted runner), so cargo rebuilds incrementally: unchanged →
+      # reused, changed → only the diff.
       - name: Run E2E tests on GPU hardware (excluding known bugs)
-        run: cargo xtask e2e -- -t "@gpu and not @expected-failure"
+        run: |
+          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
+          cargo xtask e2e -- -t "@gpu and not @expected-failure"
 
       - name: Upload E2E report
         if: always()
@@ -714,18 +722,22 @@ jobs:
           && (inputs.tier == 'both' || inputs.tier == 'known-bugs'))
       )
     continue-on-error: true
-    # Known-bug scenarios are expected to fail, so don't grant a serve the full
-    # cold-start window — fail fast instead of waiting the default 600s when a
-    # bug manifests as a serve that never becomes ready.
     env:
+      # Known-bug scenarios are expected to fail, so don't grant a serve the full
+      # cold-start window — fail fast instead of waiting the default 600s when a
+      # bug manifests as a serve that never becomes ready.
       E2E_SERVE_TIMEOUT_SECS: "90"
     steps:
       - uses: actions/checkout@v6
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
+      # See e2e-gpu: keep the build cache out of the checkout (git clean would
+      # wipe it) for incremental rebuilds across jobs.
       - name: Run known-bug E2E scenarios on GPU hardware
-        run: cargo xtask e2e --expect-failures -- -t "@gpu and @expected-failure"
+        run: |
+          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
+          cargo xtask e2e --expect-failures -- -t "@gpu and @expected-failure"
 
       - name: Upload E2E report
         if: always()
