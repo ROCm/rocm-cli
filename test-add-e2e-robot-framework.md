@@ -6,7 +6,7 @@
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-10
 
-**Token Usage:** in=849 out=263023 cache_create=8138340 cache_read=192640439 calls=430
+**Token Usage:** in=960 out=291863 cache_create=8471837 cache_read=198161350 calls=487
 
 ---
 
@@ -136,12 +136,10 @@ even on Instinct because vllm can't serve them. vLLM-capable safetensors (e.g.
 - 📋 Add engine-level unit tests for EAI-7333 in engines/vllm + engines/lemonade healthcheck
   (the rocm-core test covers the shared helper; the per-engine healthcheck_service still trusts
   /v1/models — could add per-engine coverage too, lower priority).
-- 📋 Await @rominf re-review + live CI run on PR #69 (latest pushed: `96108e5`; 3 local files
-  not yet committed/pushed on top).
-- 📋 Watch first live run of the GPU jobs — esp. Strix Windows (untested path).
-  Note: Strix runners FAIL at toolchain setup (rustup download blocked/failed) until
-  provisioned with Rust — infra fix, not code. app-dev-gpu (amd-gpu label) works.
-- ✅ DONE: re-ran mock blocking suite (8/8) + Linux container suite (all green) pre-commit.
+- ✅ DONE: Awaited + inspected live CI run on PR #69 (run 29090245163). Core CI all green
+  (clippy, build-and-test, Windows, coverage, signatures, CodeQL). E2E mock tiers passing 
+  (blocking + xfail-inverted). GPU tiers in progress. Strix Halo all 4 fail at `setup-rust-toolchain` 
+  (curl write-to-disk failure, infra not code). No code action needed.
 - 📋 **Fix scenario numbering** in model_serving.feature (currently 1,2,3,4,5,7,6,9,8 — out of
   order after insertions). Cosmetic; renumber 1-9 sequentially for readability. LOW priority.
 - 📋 (Optional) Update E2E cucumber memory ([[rocm-cli-e2e-cucumber]]) with new default-engine
@@ -294,3 +292,10 @@ addressed here with the exit-code fix + dedicated known-bugs job.
   the earlier repro was only the stale pod binary. Reverted the tentative scenario-5 7219 tag.
 - 3 files changed, all clippy/fmt clean, verified on hardware. NOT yet committed (next session).
 - Documented app-dev manual-GPU-verification recipe in Notes for future sessions.
+
+### 2026-07-10 (CI status checkpoint, Strix infra investigation)
+- Verified live run (29090245163) core CI all green; E2E mock tiers (blocking + xfail) passing.
+- GPU tiers in progress; Strix Halo infra issue confirmed (curl write-to-disk in rustup, not code).
+- Checked Strix runner reach (GH API 403, no admin; not k8s pods, standalone hosts). No access path.
+- Added brevity feedback to project memory (keep answers short for status questions).
+- WIP updated, synced to progress branch.
