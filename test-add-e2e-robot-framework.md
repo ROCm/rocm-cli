@@ -4,7 +4,7 @@
 **Stage:** 8-awaiting-pr-approval
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
-**Last Updated:** 2026-07-10
+**Last Updated:** 2026-07-10 (idle flush)
 **Token Usage:** in=2768 out=814393 cache_create=11448735 cache_read=462877065 calls=1391
 
 ---
@@ -205,17 +205,65 @@ harness). Keep separate from framework-reliability fixes.
 
 Framework/harness/CI issues to fix fast via the scratch-branch + manual-dispatch loop
 (validated and confirmed working — see [[ci-manual-e2e]]):
-- ✅ **HOME override warning** (introduced by our own Strix Ubuntu fix): replaced
-  `HOME=/home/ubuntu/actions-runner/temp-home` with `--no-modify-path` rustup
-  bootstrap (commit `2633bc1`, run 29109142221 queued on Strix Ubuntu). Keeps toolchain
-  on nvme, avoids `.profile` write, no euid/HOME warning.
-- **Cargo build cache destroyed between runs** — `Swatinem/rust-cache` cleanup wipes
-  `target/` at job end, forcing 15-min full rebuild next run even if sources unchanged.
-  Cargo's incremental build (rebuild-only-if-changed) never runs. Self-hosted runners
-  should persist `target/` in `_work` (survives between jobs) and disable
-  `Swatinem/rust-cache` cleanup. Investigate whether `_work/target` persists, then
-  implement option 1: persist locally, use cargo's native incremental (rebuild only if
-  changed).
+- ✅ **Build cache — CONFIRMED 22min → ~4min** (`CARGO_TARGET_DIR=$RUNNER_WORKSPACE/e2e-target`,
+  commit `a38cae0`/`00231fa`). Proof: run #501 (29114074546) GPU known-bugs step was
+  18:20:11→18:24:06 = 3m55s vs ~22min on b967d26. Cargo reuses the persistent cache; binary
+  runs from `_work/rocm-cli/e2e-target/release/rocm`.
+- ✅ **Command coverage table — DONE (committed `4adaff8`, NOT pushed)**: unified run_rocm →
+  commands.jsonl sidecar (scenario/argv/subcommand/model/engine/rc) + e2e-report aggregates
+  command×platform tied to scenario pass/fail. "works" = scenario passed (not raw rc), so
+  rejection-tests read ✅. 19 e2e-report + 33 xtask tests green.
+- ✅ **Shared heavy caches across scenarios — DONE (committed `7dc6dd9`, app-dev)**: each
+  scenario's isolated data root forced re-download of the ~3.3GB TheRock runtime + HF weights
+  PER scenario. Now (gated on `E2E_SHARED_CACHE_DIR`): symlink `<data>/runtimes`→shared,
+  `HF_HOME`→shared, `ROCM_CLI_ENGINE_ENVS_ROOT`→shared (envs/ leaf only). services/config/
+  cache/engine-state stay isolated. Unset = full isolation (mock/local unaffected, mock 8/8
+  green). app-dev jobs set it to `$RUNNER_WORKSPACE/e2e-shared`. Design verified against CLI
+  source by subagent (paths in crates/rocm-core AppPaths, engines honour HF_HOME, ENGINE_ENVS_ROOT
+  redirects only envs leaf). **Strix jobs: follow-up** (same win + helps their disk-full issue).
+- 🆕 **setup-rust-toolchain post-step (Swatinem rust-cache) — FIX WRITTEN (`1573b24`)**: added
+  `cache: false` to app-dev GPU jobs. Was: post-step tried to upload large e2e-target to GH cache
+  service (~15min hang on run #501). Not yet validated on a live run.
+- 🆕 **setup-rust-toolchain post-step (Swatinem rust-cache) hangs on self-hosted — original note**:
+  seen on run #501 — the GPU expect-pass job's "Run E2E" step FAILED (real gfx94x result) but the
+  job stayed in_progress for ~15min stuck in `Post Run setup-rust-toolchain` = rust-cache trying
+  to SAVE the large `e2e-target` to GitHub's cache service. On self-hosted runners we persist the
+  cache ourselves via CARGO_TARGET_DIR, so this wrapper is pure overhead (+ its cleanup was what
+  wiped target/ before). FIX: add `with: { cache: false }` to setup-rust-toolchain on all
+  self-hosted GPU jobs (app-dev + Strix). Candidate next scratch-branch change.
+- ✅ **HOME override warning — FIXED & CONFIRMED** (commit `2633bc1`, run 29109142221):
+  replaced `HOME=…/temp-home` with `--no-modify-path` rustup bootstrap. Verified in the
+  run log: rustup euid/HOME warning is GONE, toolchain installs clean. Applied to both
+  Strix Ubuntu jobs.
+- ✅ **Cargo build cache destroyed between runs — FIX WRITTEN (uncommitted, UNVALIDATED)**.
+  Root cause CONFIRMED from run 29104869493 log: the 22-min app-dev GPU job was ~15min
+  `cargo build` (519 crates from scratch) + ~14s actual scenarios. `actions/checkout`
+  runs `git clean -ffdx` which deletes the gitignored `target/` every job → cargo can
+  never build incrementally. Fix: set `CARGO_TARGET_DIR=$RUNNER_WORKSPACE/e2e-target`
+  (a sibling of the checkout, untouched by git clean, persists between jobs) in the run
+  step. Applied to both app-dev GPU jobs on the scratch branch. NOTE: `runner.workspace`
+  context is INVALID in job `env:` (actionlint caught it) — must use the `$RUNNER_WORKSPACE`
+  runtime env var inside the run step. First run after the change is still cold (new dir);
+  the WIN shows on the 2nd run. `a38cae0` dispatch was CANCELLED before validating — still
+  UNVALIDATED.
+- 🆕 **Strix Ubuntu root disk full at job START — NOT yet fixed** (run 29109142221):
+  after the HOME fix, the run still failed 2/7, now at `rocm install sdk failed (rc=1)`
+  (the `Given a managed runtime is active` precondition). Log shows `Free space left:
+  0 MB` at job start (16:58:19) — the root disk was ALREADY full before the job ran, from
+  accumulated prior-run venvs/runtimes/caches (same non-cleanup leak class as app-dev, but
+  on Strix's root fs). Contributing: **pip cache is NOT redirected** → pip writes to
+  `~/.cache/pip` = `/home/ubuntu/.cache` = full root. Candidate fixes (need on-box df/du
+  to confirm — NO ssh/tailscale path to Strix): (a) set `PIP_CACHE_DIR` + `HF_HOME` +
+  `XDG_CACHE_HOME` to the nvme volume; (b) a pre-job cleanup that reclaims the root fs;
+  (c) the durable fix — move the whole runner `_work`/caches onto the nvme volume. The
+  venv itself is already correctly on nvme (via TMPDIR + isolated root); it's pip's cache
+  + pre-existing fullness that bite.
+- 🆕 **Report matrix redesign — DONE (uncommitted on scratch)**: split the mashed single
+  "Platform" column into **Platform / OS / Tier**; `gpu`→MI300X, strix→Strix Halo
+  Ubuntu/Windows; added totals row, a legend (incl. what Mock means), and a run-metadata
+  header (commit/branch/run/event from CI env). Found & fixed a parser bug (`e2e-report`
+  had rendered as "E2e Report" not "Mock"). 18 e2e-report + 33 xtask tests green, clippy
+  clean, rendered real report from run-29104869493 artifacts + browser-verified.
 
 ## Work Log
 
@@ -424,3 +472,6 @@ addressed here with the exit-code fix + dedicated known-bugs job.
 - ✅ **Harness leak fix `b967d26`** (signed, pushed): E2E `Drop` now calls `rocm services stop <id> --yes` on all managed services recorded in scenario's isolated root before temp dir removed. Prevents vLLM/llama-server detached processes leaking on persistent runners. Container suite (mock 8/8) green pre-push.
 - ✅ **Box recovery**: app-dev pod accumulated 51 e2e roots + ~24 orphaned GPU processes from pre-leak-fix jobs. User ran cleanup (`pkill -f '/tmp/rocm-e2e...'`, `rm -rf /tmp/rocm-e2e-*`). Runner restarted with `RUNNER_ALLOW_RUNASROOT=1 nohup ./run.sh` (PowerShell guard requires explicit env var; original session had it set).
 - 📋 **Next run** (`b967d26`, pending): waiting for stale `0d5645e` PR run to drain off serial `app-dev-gpu` runner. Once it finishes/cancels, `b967d26` picks up with all fixes (Strix Windows/Linux bootstrap + teardown leak prevention).
+
+### 2026-07-10 (idle flush)
+**2026-07-10 (idle flush):** Session idle for 1 hour, auto-flushing WIP state.
