@@ -6,7 +6,7 @@
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-10
 
-**Token Usage:** in=323 out=88256 cache_create=5693929 cache_read=66377464 calls=167
+**Token Usage:** in=849 out=263023 cache_create=8138340 cache_read=192640439 calls=430
 
 ---
 
@@ -85,16 +85,23 @@ traceability) and `@gpu` for hardware-dependent scenarios.
   CI-correctness (`55b3aec`), GPU split (`d33d182`), Strix runners (`93f03ef`),
   consolidated report (`96108e5`).
 
+### Completed ✅ (Isolation refactor, both-engine coverage, EAI triage, Jul 10)
+- ✅ **Test isolation refactor**: moved `qwen2.5` alias from serve-setups to EAI-7219 scenarios only.
+  Serve preconditions now use canonical `Qwen/Qwen2.5-1.5B-Instruct`, isolating failures to bugs being tested, not upstream unrelated bugs.
+- ✅ **Timeout env-configurable**: `E2E_SERVE_TIMEOUT_SECS` (default 600s) to make serve readiness tunable per hardware.
+- ✅ **Strengthened auto-engine assertion**: now parses actual engine value from serve output, asserts it's in {lemonade, vllm} (post-#79).
+- ✅ **Both-engine explicit coverage**: added scenario 7 (lemonade serve+inference on Qwen3-0.6B-GGUF), tagged `@expected-failure-EAI-7052`.
+- ✅ **Manual MI300X GPU repro**: built main from latest on app-dev pod, confirmed `setup_gpu_model` (vllm) works end-to-end, `setup_lemonade_model` inference hangs (Vulkan backend/ROCm mismatch).
+- ✅ **EAI tickets filed/updated**: EAI-7333 (healthcheck readiness gap: /v1/models ≠ inference-ready), unassigned + rocm-cli component. Decided unit-test fix in engine crates (not E2E).
+- ✅ **E2E suite final count**: 18 scenarios total (8 mock expect-pass, 2 mock known-bugs, 5 gpu expect-pass, 3 gpu known-bugs).
+
 ### Todo 📋
-- 📋 **Investigate alias-forwarding bug** in rocm serve vllm path (manual repro confirmed).
-  Check if it maps to existing EAI ticket or needs filing. Tag `@gpu` serve scenarios as
-  `@expected-failure` if not already tracked. (Timeout bump not a fix, only clarity.)
-- 📋 Await @rominf re-review + first live CI run on PR #69 (latest push: `96108e5`)
+- 📋 Tag scenario 5 `@expected-failure-EAI-7219` (vllm path hits alias bug). Commit this isolation refactor.
+- 📋 Add engine-level unit tests for EAI-7333 in engines/vllm + engines/lemonade (healthcheck readiness logic).
+- 📋 Await @rominf re-review + first live CI run on PR #69 (latest push: `96108e5`).
 - 📋 Watch first live run of the 6 GPU jobs — esp. Strix Windows (untested path).
   Note: Strix runners will fail at toolchain setup (rustup download) until provisioned with Rust.
-- 📋 (Deferred) Surface outstanding known-bug count from CI — largely covered by
-  the consolidated report's xfail column + "Needs attention" section now.
-- 📋 Persistent self-hosted GPU runner (currently ephemeral workspace pod)
+- 📋 Persistent self-hosted GPU runner (currently ephemeral workspace pod).
 
 ## Next Steps
 
@@ -190,13 +197,14 @@ addressed here with the exit-code fix + dedicated known-bugs job.
   Switched to `git-commit-with-fallback` (github-app skill wrapper) which has GPG fallback;
   commit signed successfully with RSA SSH key. Pushed to origin/test/add-e2e-robot-framework 
   (fast-forward, no force). All 4 daily commits now landed & pushed.
-- **Manual repro on app-dev-gpu MI300X (via k8s exec into live dev pod):**
-  - Bumped `wait_for_endpoint` timeout: 120s → 600s, made configurable via `E2E_SERVE_TIMEOUT_SECS` env.
-  - Reproduced exact failing scenario: `rocm serve qwen2.5 --engine vllm --managed`.
-  - Found **root cause: alias not forwarded to vllm engine.** CLI reports `resolved model: qwen2.5`;
-    vLLM receives literal `qwen2.5`, tries `https://huggingface.co/qwen2.5/...`, gets 401/not-found,
-    crashes. With canonical name `Qwen/Qwen2.5-1.5B-Instruct`, serve succeeds immediately.
-  - This is a genuine product bug (alias-resolution-not-forwarded-to-adapter), not a timeout issue.
-    Timeout bump still useful for clarity but won't fix the scenario — alias bug must be fixed.
-  - Confirmed Strix Halo runners: never ran tests yet (toolchain setup fails at rustup download).
-  - Confirmed app-dev-gpu app-dev MI300X available, manual testing successful.
+
+### 2026-07-10 (test isolation refactor, both-engine coverage, manual hardware validation)
+- **Verified consolidated report** on fresh main build (cloned rocm-cli-main, `cargo build --release`).
+  Served vLLM model end-to-end (qwen2.5 canonical, 600s timeout), inference succeeds, confirms readiness contract works on vLLM path.
+- **Test isolation applied**: pinned serve preconditions to canonical model names + explicit engines, moved alias `qwen2.5` to EAI-7219 scenarios only.
+  Ensures downstream serve+inference tests fail only from bugs they test, not upstream alias issues.
+- **Both-engine coverage**: added scenario 7 (lemonade serve + inference on Qwen3-0.6B-GGUF, `@expected-failure-EAI-7052`).
+  Confirmed lemonade reaches `/v1/models` ready (~4s cached) but inference hangs (Vulkan backend, not ROCm — missing system-ROCm config).
+- **Manual testing on app-dev MI300X**: reproduced EAI-7219 (vllm alias bug), EAI-7052 (lemonade inference hang), confirmed auto-select resolves aliases correctly.
+- **EAI-7333 filed** (healthcheck reports ready via /v1/models, not inference). Decided: unit-test fix in engine crates (white-box logic), not E2E (black-box behavior doesn't isolate the code defect cleanly).
+- **Suite metrics**: 18 scenarios total (breakdown: 8 mock blocking, 2 mock xfail, 5 gpu blocking, 3 gpu xfail).
