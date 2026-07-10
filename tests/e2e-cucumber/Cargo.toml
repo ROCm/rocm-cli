@@ -13,7 +13,7 @@ workspace = true
 [dependencies]
 axum.workspace = true
 cucumber = { version = "0.23", features = ["output-json", "output-junit"] }
-maud = "0.27"
+e2e-report = { path = "../../crates/e2e-report" }
 reqwest = { version = "0.13", features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true
