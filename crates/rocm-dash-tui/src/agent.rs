@@ -91,15 +91,19 @@ pub trait AgentClient: Send + Sync {
     ) -> Result<String, AgentError>;
 }
 
-/// Map our TUI-local turns to Rig messages, preserving role + order. `Error`
-/// turns are UI-local annotations and are never sent to the model. Pure: no I/O.
+/// Map our TUI-local turns to Rig messages, preserving role + order.
+///
+/// `Error` and `System` turns are UI-local annotations and are never sent to the
+/// model (a `System` notice like "switched to local" is not something the
+/// assistant said, so forwarding it would corrupt the model's context). Pure: no
+/// I/O.
 pub fn build_messages(turns: &[ChatTurn]) -> Vec<rig::completion::Message> {
     turns
         .iter()
         .filter_map(|t| match t.role {
             ChatRole::User => Some(rig::completion::Message::user(t.content.clone())),
             ChatRole::Agent => Some(rig::completion::Message::assistant(t.content.clone())),
-            ChatRole::Error => None,
+            ChatRole::Error | ChatRole::System => None,
         })
         .collect()
 }

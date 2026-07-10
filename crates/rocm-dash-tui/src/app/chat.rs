@@ -87,6 +87,23 @@ pub(super) fn build_chat_agent(
     }
 }
 
+/// Build the live agent for a `Local` (inline-detected) `LlmConfig`.
+///
+/// The single construction path for the local backend, shared by the event
+/// loop's startup build and its endpoint-rebuild drain so any change to how a
+/// local agent is constructed lives in exactly one place. Construction only —
+/// no network I/O. Returns the [`AgentError`](crate::agent::AgentError) so the
+/// caller can either discard it (`.ok()` at startup) or surface it as an error
+/// turn (the rebuild drain).
+pub(super) fn build_local_agent(
+    cfg: crate::llm::LlmConfig,
+    executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
+    approval_tx: mpsc::UnboundedSender<ClientMsg>,
+) -> Result<std::sync::Arc<dyn crate::agent::AgentClient>, crate::agent::AgentError> {
+    crate::agent::RigAgentClient::new(cfg, executor, Some(approval_tx))
+        .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
+}
+
 /// Local engines that expose an OpenAI-compatible `/v1` surface the dash chat
 /// can talk to directly. A managed service running one of these is a valid
 /// auto-detected chat endpoint regardless of which port it bound.

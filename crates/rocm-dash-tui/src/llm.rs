@@ -84,11 +84,34 @@ pub fn resolve_llm_config(
         .or(cfg_model)
         .map_or_else(|| DEFAULT_CHAT_MODEL.to_string(), str::to_string);
 
+    // Loopback base_urls talk to a local server that needs no gateway auth;
+    // never attach a cloud subscription-key header/api_key to them (prevents a
+    // startup-configured local endpoint from leaking a cloud credential).
+    let is_loopback = parse_host_port(&base_url).is_some_and(|(host, _)| is_loopback_host(&host));
+
+    // Make the stripping debuggable: a user pointing at an authenticating local
+    // proxy will otherwise see 401s with no on-host signal. Only warn when there
+    // was actually a credential to discard.
+    if is_loopback && (env_key.is_some() || auth_header.is_some()) {
+        tracing::warn!(
+            %base_url,
+            "loopback endpoint: discarding configured api_key/auth_header (local servers use no gateway auth)"
+        );
+    }
+
     Some(LlmConfig {
         base_url,
         model,
-        api_key: env_key.map(str::to_string),
-        auth_header: auth_header.map(str::to_string),
+        api_key: if is_loopback {
+            None
+        } else {
+            env_key.map(str::to_string)
+        },
+        auth_header: if is_loopback {
+            None
+        } else {
+            auth_header.map(str::to_string)
+        },
     })
 }
 
@@ -111,6 +134,22 @@ pub fn parse_host_port(base_url: &str) -> Option<(String, u16)> {
     } else {
         80
     };
+    // Bracketed IPv6 authority: `[host]` or `[host]:port`. Must be handled
+    // before the `rsplit_once(':')` fallback, which would otherwise split
+    // *inside* the address (e.g. `[::1]` → host `[:`, port `1]`) and fail,
+    // making a portless `[::1]` look like a non-loopback host.
+    if let Some(after_open) = authority.strip_prefix('[') {
+        let (host, after_close) = after_open.split_once(']')?;
+        if host.is_empty() {
+            return None;
+        }
+        let port = match after_close.strip_prefix(':') {
+            Some(port_str) => port_str.parse::<u16>().ok()?,
+            None if after_close.is_empty() => default_port,
+            None => return None,
+        };
+        return Some((host.to_string(), port));
+    }
     match authority.rsplit_once(':') {
         Some((host, port_str)) if !host.is_empty() => {
             let port = port_str.parse::<u16>().ok()?;
@@ -118,6 +157,16 @@ pub fn parse_host_port(base_url: &str) -> Option<(String, u16)> {
         }
         _ => Some((authority.to_string(), default_port)),
     }
+}
+
+/// True when `host` is a loopback address.
+///
+/// Expects a bare host as returned by [`parse_host_port`], which strips the
+/// brackets from a bracketed IPv6 authority. Matches `localhost`
+/// (case-insensitive), the IPv6 loopback (`::1`), and any `127.0.0.0/8` IPv4
+/// address.
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost") || host == "::1" || host.starts_with("127.")
 }
 
 /// Best-effort TCP liveness probe for a candidate endpoint.
@@ -286,6 +335,50 @@ mod tests {
     }
 
     #[test]
+    fn loopback_base_url_strips_cloud_auth() {
+        for url in [
+            "http://127.0.0.1:8000/v1",
+            "http://localhost:13305/v1",
+            "http://[::1]:8000/v1",
+            // Portless bracketed IPv6 previously bypassed stripping (parse
+            // returned None → treated as remote). Must strip now.
+            "http://[::1]/v1",
+        ] {
+            let r = resolve_llm_config(
+                Some(url),
+                None,
+                None,
+                None,
+                Some("leaked-key"),
+                None,
+                Some("Ocp-Apim-Subscription-Key"),
+                true,
+            )
+            .expect("config");
+            assert_eq!(r.base_url, url);
+            assert_eq!(r.api_key, None, "loopback strips api_key ({url})");
+            assert_eq!(r.auth_header, None, "loopback strips auth_header ({url})");
+        }
+    }
+
+    #[test]
+    fn remote_base_url_keeps_cloud_auth() {
+        let r = resolve_llm_config(
+            Some("https://gw.example.com/openai"),
+            None,
+            None,
+            None,
+            Some("k"),
+            None,
+            Some("Ocp-Apim-Subscription-Key"),
+            true,
+        )
+        .expect("config");
+        assert_eq!(r.api_key.as_deref(), Some("k"));
+        assert_eq!(r.auth_header.as_deref(), Some("Ocp-Apim-Subscription-Key"));
+    }
+
+    #[test]
     fn none_when_nothing_available() {
         assert_eq!(
             resolve_llm_config(None, None, None, None, None, None, None, false),
@@ -316,6 +409,23 @@ mod tests {
             Some(("example.com".into(), 80))
         );
         assert_eq!(parse_host_port(""), None);
+    }
+
+    #[test]
+    fn parse_host_port_handles_bracketed_ipv6() {
+        // Brackets are stripped so the host round-trips through `to_socket_addrs`
+        // and matches `is_loopback_host`. Both the port-bearing and the portless
+        // forms must parse (the portless form previously returned None).
+        assert_eq!(
+            parse_host_port("http://[::1]:8000/v1"),
+            Some(("::1".into(), 8000))
+        );
+        assert_eq!(parse_host_port("http://[::1]/v1"), Some(("::1".into(), 80)));
+        assert_eq!(
+            parse_host_port("https://[2001:db8::1]/v1"),
+            Some(("2001:db8::1".into(), 443))
+        );
+        assert_eq!(parse_host_port("http://[]/v1"), None);
     }
 
     #[test]
