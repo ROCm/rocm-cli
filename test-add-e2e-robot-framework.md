@@ -6,7 +6,7 @@
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-10
 
-**Token Usage:** in=960 out=291863 cache_create=8471837 cache_read=198161350 calls=487
+**Token Usage:** in=1342 out=402230 cache_create=8611428 cache_read=225869081 calls=678
 
 ---
 
@@ -188,6 +188,15 @@ addressed here with the exit-code fix + dedicated known-bugs job.
   python-launcher/comfyui tests). Verified the full workspace suite passes on
   **Linux** (Apple `container`, arm64, Rust 1.96, exit 0) → push used `--no-verify`
   with evidence. See project memory.
+- **ALWAYS run the full suite in the Linux container before every push** (user rule).
+  The Mac pre-push hook can't pass by design, so the container run IS the
+  verification gate. Command: `workspace/wip/container-test.sh all` (from the
+  worktree) — runs workspace tests excl. cucumber harness + e2e-cucumber lib
+  tests + e2e mock blocking selection. Must be fully green (all `test result: ok`,
+  e2e `8 scenarios (8 passed)`) before pushing with `--no-verify`. Never push on
+  the strength of the native Mac run alone — the rocm-bin flake passes in
+  isolation but fails under full parallel load, which is a false red, not a real
+  signal. Container green is the real signal.
 - EAI-7220 = TUI-only wrong-port bug (can't be black-box tested); EAI-7218 =
   Won't Fix (PyTorch engine removed by #79; rechecked on main — confirmed N/A).
   EAI-7219 (vllm alias not forwarded — CONFIRMED still open on HW), 7221/7223 still open.
@@ -299,3 +308,12 @@ addressed here with the exit-code fix + dedicated known-bugs job.
 - Checked Strix runner reach (GH API 403, no admin; not k8s pods, standalone hosts). No access path.
 - Added brevity feedback to project memory (keep answers short for status questions).
 - WIP updated, synced to progress branch.
+
+### 2026-07-10 (runner provisioning fixes + security hardening planning)
+- **Inference timeout cap** (commit `f2fa495`): `send_chat` used unbounded HTTP client; moved to 10s timeout via `E2E_INFERENCE_TIMEOUT_SECS` env. Known-bugs xfail scenarios now fail fast (~1 min) instead of blocking until job limit.
+- **Strix Linux disk fix** (commit `f2ee84e`): runner's full/non-persistent root disk → `rustup-init` download fails (curl 23). Set `CARGO_HOME`, `RUSTUP_HOME`, `TMPDIR` to `/home/ubuntu/actions-runner`, pre-create temp dir. Toolchain install + reuse now on persistent disk.
+- **Strix Windows bash fix** (staged, not pushed): `setup-rust-toolchain@v1` runs bash script internally. Replaced with PowerShell step: `iwr win.rustup.rs`, `--default-toolchain none` (rust-toolchain.toml pins 1.96.0). Idempotent; cold box auto-provisions on first run.
+- **Both commits pushed** (via `--no-verify` + green Linux container suite verification, per user rule). New PR head: `f2ee84e`. CI run 29092792483 triggered.
+- **Security audit** (admin access now): confirmed fork-PR approval all-external, default token read-only, no PR approvals by workflows. Two settings still loose: `sha_pinning_required: false` (actions on mutable tags), `allowed_actions: all`. Planned: separate hardening PR to pin all action refs + add dependabot + new manual-dispatch E2E workflow.
+- **Hardening scope**: (1) pin 5 unpinned actions to resolved SHAs (checkout v6.0.3, upload/download-artifact v4.6.2/4.3.0, cache v5.1.0, setup-rust-toolchain v1.17.0, dtolnay/rust-toolchain 1.96.0), (2) add `.github/dependabot.yml` for auto-bump, (3) add manual-dispatch E2E workflow (inputs: platform [app-dev-gpu/strix-ubuntu/strix-windows/all], tier [expect-pass/known-bugs/both], no build-and-test dependency), (4) post-merge: flip `sha_pinning_required: true`.
+- **Design decision pending**: move provisioning fixes (Strix bash→pwsh, Linux disk env) OUT of PR #69 INTO hardening PR for coherent CI-infra focus, or keep in #69 + duplicate bootstrap in manual workflow?
