@@ -95,12 +95,53 @@ traceability) and `@gpu` for hardware-dependent scenarios.
 - ✅ **EAI tickets filed/updated**: EAI-7333 (healthcheck readiness gap: /v1/models ≠ inference-ready), unassigned + rocm-cli component. Decided unit-test fix in engine crates (not E2E).
 - ✅ **E2E suite final count**: 18 scenarios total (8 mock expect-pass, 2 mock known-bugs, 5 gpu expect-pass, 3 gpu known-bugs).
 
+### Completed ✅ (readiness + default-engine tests, EAI-7218 recheck, Jul 10 late)
+- ✅ **Reverted** the scenario-5 EAI-7219 tag: isolation refactor means setup uses canonical
+  name, so scenario 5 (vllm inference) is a clean expect-pass again, NOT xfail.
+- ✅ **EAI-7333 unit test** added in `crates/rocm-core/src/lib.rs`:
+  `models_endpoint_readiness_does_not_imply_inference_ready` (mock HTTP server lists model on
+  /v1/models but can't infer → readiness signal is a false positive). Passes.
+- ✅ **Scenario 8** (`@gpu`, expect-pass): "A service reported ready can immediately serve
+  inference" — asserts CLI-reported ready (`services list`) ⇒ inference works now. Verified on
+  MI300X: `Status: 1 ready` → immediate inference returned real content. New steps:
+  `the CLI reports the service as ready`, `an inference request succeeds immediately`.
+- ✅ **Scenario 9** (`@gpu`, expect-pass): "vLLM is the default serving engine on Instinct" —
+  serve a vLLM-capable model w/o `--engine` → asserts `engine: vllm`. Verified on MI300X:
+  `Qwen/Qwen2.5-0.5B-Instruct` → `engine_selection: detected ROCm GPU family prefers vLLM`.
+  New steps: `the user serves a vLLM-capable model without specifying an engine`,
+  `vLLM is selected as the default engine`.
+- ✅ **2 rocm-core unit tests** for default-engine logic: `instinct_dcgpu_family_prefers_vllm`
+  (gfx94X-dcgpu → vllm; None on Windows), `consumer_gpu_family_has_no_vllm_preference`
+  (gfx110X-all → None). Pin the GPU-family default engine-side.
+- ✅ **EAI-7218 rechecked on fresh main**: pytorch engine REMOVED by #79 — `--engine pytorch`
+  now rejected (`invalid value 'pytorch' [possible values: lemonade, vllm]`); auto-select for
+  `qwen2.5` picks lemonade, never pytorch. The EAI-7218 error only reproduced on the STALE
+  `/workload/rocm-cli` v0.3.0 binary (pre-#79). So EAI-7218 (Won't Fix) genuinely N/A on main.
+- ✅ **Suite now: 20 scenarios** (8 mock expect-pass, 2 mock known-bugs, 7 gpu expect-pass,
+  3 gpu known-bugs). model_serving.feature = 9 scenarios.
+
+### DEFAULT-ENGINE SELECTION PRECEDENCE (verified in code + hardware, apps/rocm/src/main.rs ~3530)
+1. explicit `--engine`  2. configured `default_engine`  3. **GPU family prefers vLLM**
+(`*-dcgpu` incl. MI300X gfx94X-dcgpu → vllm) *only if recipe supports vllm*  4. recipe
+`preferred_engines`  5. platform default (`default_engine_for_platform()` = "lemonade").
+KEY: GGUF-only recipes (e.g. `qwen2.5`→Qwen3-4B-GGUF, `Qwen2.5-1.5B`) fall through to lemonade
+even on Instinct because vllm can't serve them. vLLM-capable safetensors (e.g.
+`Qwen/Qwen2.5-0.5B-Instruct`) → vllm on Instinct. This is CORRECT, not a bug.
+
 ### Todo 📋
-- 📋 Tag scenario 5 `@expected-failure-EAI-7219` (vllm path hits alias bug). Commit this isolation refactor.
-- 📋 Add engine-level unit tests for EAI-7333 in engines/vllm + engines/lemonade (healthcheck readiness logic).
-- 📋 Await @rominf re-review + first live CI run on PR #69 (latest push: `96108e5`).
-- 📋 Watch first live run of the 6 GPU jobs — esp. Strix Windows (untested path).
-  Note: Strix runners will fail at toolchain setup (rustup download) until provisioned with Rust.
+- 📋 **UNCOMMITTED**: 3 files changed this session (`crates/rocm-core/src/lib.rs`,
+  `tests/e2e-cucumber/features/model_serving.feature`,
+  `tests/e2e-cucumber/tests/e2e/serving_steps.rs`). All clippy/fmt clean, verified on HW.
+  Commit with `git-commit-with-fallback` (github-app skill; NOT raw git — 1Password flaky,
+  it has GPG fallback). No AI refs. Then push (fast-forward).
+- 📋 Add engine-level unit tests for EAI-7333 in engines/vllm + engines/lemonade healthcheck
+  (the rocm-core test covers the shared helper; the per-engine healthcheck_service still trusts
+  /v1/models — could add per-engine coverage too, lower priority).
+- 📋 Await @rominf re-review + live CI run on PR #69 (latest pushed: `96108e5`; 3 local files
+  not yet committed/pushed on top).
+- 📋 Watch first live run of the GPU jobs — esp. Strix Windows (untested path).
+  Note: Strix runners FAIL at toolchain setup (rustup download blocked/failed) until
+  provisioned with Rust — infra fix, not code. app-dev-gpu (amd-gpu label) works.
 - 📋 Persistent self-hosted GPU runner (currently ephemeral workspace pod).
 
 ## Next Steps
@@ -119,7 +160,14 @@ traceability) and `@gpu` for hardware-dependent scenarios.
 
 ## Blockers / Open Questions
 
-- None currently. Consolidated-report commit landed (`96108e5`, signed via github-app fallback).
+- **3 files uncommitted** (see Todo) — commit + push pending.
+- **Signing**: use `github-app` skill's `git-commit-with-fallback` (NOT raw git; 1Password SSH
+  agent flaky this machine — wrapper has GPG fallback). Progress-branch WIP syncs may commit
+  unsigned (skill-permitted for orphan branch only).
+- **Jira ticket convention** (user pref): new tickets = assignee UNASSIGNED + component `rocm-cli`.
+  acli edit lacks a component flag → set via REST: `curl -u "$JIRA_USERNAME:$JIRA_TOKEN" -X PUT
+  "$JIRA_URL/rest/api/2/issue/KEY" -d '{"fields":{"assignee":null,"components":[{"name":"rocm-cli"}]}}'`.
+  acli auth: `acli jira auth login` (env has JIRA_TOKEN/URL/USERNAME for REST).
 - **Persistent runner**: self-hosted GPU runner is ephemeral; needs a k8s deploy.
 
 ## Robot Framework vs cucumber-rs (decision: cucumber-rs)
@@ -139,9 +187,32 @@ addressed here with the exit-code fix + dedicated known-bugs job.
   **Linux** (Apple `container`, arm64, Rust 1.96, exit 0) → push used `--no-verify`
   with evidence. See project memory.
 - EAI-7220 = TUI-only wrong-port bug (can't be black-box tested); EAI-7218 =
-  Won't Fix (PyTorch engine removed by #79). EAI-7219/7221/7223 still open.
+  Won't Fix (PyTorch engine removed by #79; rechecked on main — confirmed N/A).
+  EAI-7219 (vllm alias not forwarded — CONFIRMED still open on HW), 7221/7223 still open.
 - EAI-7222 (privacy notice) requires TUI interaction — documented known gap.
+- **EAI-7052** (In Progress): lemonade should use installed ROCm libs — root cause of
+  lemonade inference hang on MI300X (falls back to Vulkan backend). Scenario 7 tagged with it.
+- **EAI-7333** (filed this session, Backlog, unassigned, component=rocm-cli): healthcheck
+  reports ready from /v1/models, not actual inference. Covered by rocm-core unit test.
 - PR #66 (README fixes) was a companion PR from the same testing session (merged).
+
+## app-dev MI300X access (manual GPU verification)
+- Cluster context `app-dev` (local Keycloak `kc.app-dev.silogen.ai/realms/airm`, password grant
+  from `~/.kube/cluster-user`; needs Drift/Headscale up). Auth via authenticate-clusters skill;
+  if `invalid_grant`, run `authenticate-clusters/scripts/diagnose-auth app-dev` (creds may just
+  need the secrets-cache refreshed — it auto-recovered this session).
+- Runner is EPHEMERAL (`e2e-test-runner` ns empty between jobs). For manual repro use the
+  persistent dev pod: ns `rocm-cli`, pod `wb-dev-workspace-vscode-*` (1 GPU, MI300X gfx943).
+- **Always build fresh main** — the pod's `/workload/rocm-cli` is STALE (v0.3.0, pre-#79).
+  Recipe: `git clone --depth 1 https://github.com/ROCm/rocm-cli.git /workload/rocm-cli-main`
+  (public, no auth), build with `/root/.rustup/toolchains/1.96.0-x86_64-unknown-linux-gnu/bin/cargo`
+  + `RUSTUP_TOOLCHAIN=1.96.0-x86_64-unknown-linux-gnu` (rustup shim symlinks are DANGLING; use the
+  toolchain bin directly). Release build ~13 min. libcap present.
+- Serve repro pattern: isolated root (`ROCM_CLI_{CONFIG,DATA,CACHE}_DIR=/tmp/x/...`), symlink
+  `ln -s /root/.rocm/runtimes /tmp/x/data/runtimes`, `rocm runtimes activate
+  release-wheel-gfx94x-dcgpu-7-13-0`, then serve. Managed serve DETACHES — read plan from the
+  redirected output file, not the exec stdout. Always stop services after + verify no stray
+  vllm/llama-server procs (they hold the GPU). Never `pkill` broadly — it kills the exec shell.
 
 ## Worktree Context
 
@@ -208,3 +279,14 @@ addressed here with the exit-code fix + dedicated known-bugs job.
 - **Manual testing on app-dev MI300X**: reproduced EAI-7219 (vllm alias bug), EAI-7052 (lemonade inference hang), confirmed auto-select resolves aliases correctly.
 - **EAI-7333 filed** (healthcheck reports ready via /v1/models, not inference). Decided: unit-test fix in engine crates (white-box logic), not E2E (black-box behavior doesn't isolate the code defect cleanly).
 - **Suite metrics**: 18 scenarios total (breakdown: 8 mock blocking, 2 mock xfail, 5 gpu blocking, 3 gpu xfail).
+
+### 2026-07-10 (readiness test, default-engine test, EAI-7218 recheck — context-clear checkpoint)
+- Added EAI-7333 rocm-core unit test (readiness ≠ inference-ready), scenario 8 (readiness
+  contract, expect-pass, HW-verified), scenario 9 (vLLM default on Instinct, expect-pass,
+  HW-verified), + 2 rocm-core default-engine unit tests. Suite now 20 scenarios.
+- Mapped full default-engine precedence in code + confirmed on MI300X: Instinct dcgpu prefers
+  vLLM for vllm-capable models; GGUF-only recipes correctly fall through to lemonade.
+- Rechecked EAI-7218 on fresh main: pytorch fully removed by #79 (`--engine pytorch` rejected);
+  the earlier repro was only the stale pod binary. Reverted the tentative scenario-5 7219 tag.
+- 3 files changed, all clippy/fmt clean, verified on hardware. NOT yet committed (next session).
+- Documented app-dev manual-GPU-verification recipe in Notes for future sessions.
