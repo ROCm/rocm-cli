@@ -129,11 +129,10 @@ even on Instinct because vllm can't serve them. vLLM-capable safetensors (e.g.
 `Qwen/Qwen2.5-0.5B-Instruct`) → vllm on Instinct. This is CORRECT, not a bug.
 
 ### Todo 📋
-- 📋 **UNCOMMITTED**: 3 files changed this session (`crates/rocm-core/src/lib.rs`,
-  `tests/e2e-cucumber/features/model_serving.feature`,
-  `tests/e2e-cucumber/tests/e2e/serving_steps.rs`). All clippy/fmt clean, verified on HW.
-  Commit with `git-commit-with-fallback` (github-app skill; NOT raw git — 1Password flaky,
-  it has GPG fallback). No AI refs. Then push (fast-forward).
+- ✅ DONE: committed the 3 files as `c25c4eb` (signed via git-commit-with-fallback, signed-off,
+  no AI refs), pushed `96108e5..c25c4eb`. Pre-commit verify: mock suite 8/8 green + Linux
+  container suite fully green (rocm-core 170 passed incl. 3 new tests, e2e-report 18 passed).
+  PR #69 now 5 commits: 55b3aec, d33d182, 93f03ef, 96108e5, c25c4eb.
 - 📋 Add engine-level unit tests for EAI-7333 in engines/vllm + engines/lemonade healthcheck
   (the rocm-core test covers the shared helper; the per-engine healthcheck_service still trusts
   /v1/models — could add per-engine coverage too, lower priority).
@@ -142,12 +141,7 @@ even on Instinct because vllm can't serve them. vLLM-capable safetensors (e.g.
 - 📋 Watch first live run of the GPU jobs — esp. Strix Windows (untested path).
   Note: Strix runners FAIL at toolchain setup (rustup download blocked/failed) until
   provisioned with Rust — infra fix, not code. app-dev-gpu (amd-gpu label) works.
-- 📋 **Re-run full mock blocking suite locally** after today's `serving_steps.rs` changes
-  (`cargo xtask e2e -- -t "not @gpu and not @expected-failure"`). Mock scenarios 3/4 share
-  serving_steps; last green run predates today's edits. Only per-fn compile+clippy done today.
-- 📋 **Re-run Linux container suite** (`workspace/wip/container-test.sh`) — last full run was
-  BEFORE today's rocm-core unit tests (4 new) + scenarios 8/9. Confirms workspace still green
-  on real Linux target before/after committing.
+- ✅ DONE: re-ran mock blocking suite (8/8) + Linux container suite (all green) pre-commit.
 - 📋 **Fix scenario numbering** in model_serving.feature (currently 1,2,3,4,5,7,6,9,8 — out of
   order after insertions). Cosmetic; renumber 1-9 sequentially for readability. LOW priority.
 - 📋 (Optional) Update E2E cucumber memory ([[rocm-cli-e2e-cucumber]]) with new default-engine
