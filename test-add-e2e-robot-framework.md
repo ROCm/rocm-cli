@@ -4,7 +4,7 @@
 **Stage:** 8-awaiting-pr-approval
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
-**Last Updated:** 2026-07-10
+**Last Updated:** 2026-07-10 (idle flush at 2026-07-10)
 
 **Token Usage:** in=19 out=6619 cache_create=1205042 cache_read=3214519 calls=11
 
@@ -182,3 +182,4 @@ addressed here with the exit-code fix + dedicated known-bugs job.
   still green via re-export, Linux container suite fully green.
 - Updated WIP file with multi-runner & consolidated-report scope. Synced to
   progress branch (unsigned, 1Password locked, per skill design).
+- **2026-07-10 (idle flush):** Session idle for 1 hour, auto-flushing WIP state.
