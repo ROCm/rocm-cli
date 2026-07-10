@@ -677,8 +677,18 @@ jobs:
     needs: [changes, build-and-test]
     if: needs.changes.outputs.heavy == 'true'
     continue-on-error: true
+    # The runner's root disk is full and non-persistent; keep the toolchain
+    # download, install, and temp files on the persistent runner directory so
+    # the rustup bootstrap can write and later jobs reuse the toolchain.
+    env:
+      CARGO_HOME: /home/ubuntu/actions-runner/.cargo
+      RUSTUP_HOME: /home/ubuntu/actions-runner/.rustup
+      TMPDIR: /home/ubuntu/actions-runner/tmp
     steps:
       - uses: actions/checkout@v6
+
+      - name: Prepare persistent temp dir
+        run: mkdir -p /home/ubuntu/actions-runner/tmp
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
@@ -698,8 +708,17 @@ jobs:
     needs: [changes, build-and-test]
     if: needs.changes.outputs.heavy == 'true'
     continue-on-error: true
+    # See e2e-gpu-strix-ubuntu: root disk is full/non-persistent, so keep the
+    # toolchain and temp files on the persistent runner directory.
+    env:
+      CARGO_HOME: /home/ubuntu/actions-runner/.cargo
+      RUSTUP_HOME: /home/ubuntu/actions-runner/.rustup
+      TMPDIR: /home/ubuntu/actions-runner/tmp
     steps:
       - uses: actions/checkout@v6
+
+      - name: Prepare persistent temp dir
+        run: mkdir -p /home/ubuntu/actions-runner/tmp
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
