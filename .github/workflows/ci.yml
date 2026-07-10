@@ -756,21 +756,31 @@ jobs:
       )
     continue-on-error: true
     # Only /home/ubuntu/actions-runner (a 1.7T nvme volume) has space; both / and
-    # /home/ubuntu are full. Point HOME there too — rustup amends $HOME/.profile
-    # (and defaults CARGO_HOME/RUSTUP_HOME under $HOME), which otherwise fails with
-    # ENOSPC on the full root disk. TMPDIR keeps the installer download off it too.
+    # /home/ubuntu are full. Keep the toolchain + installer download on that volume.
+    # HOME is left as the real home so rustup doesn't warn about an euid/HOME
+    # mismatch; the bootstrap below uses --no-modify-path so nothing is written to
+    # $HOME/.profile (which is what would otherwise fail ENOSPC on the full disk).
     env:
-      HOME: /home/ubuntu/actions-runner/temp-home
       CARGO_HOME: /home/ubuntu/actions-runner/.cargo
       RUSTUP_HOME: /home/ubuntu/actions-runner/.rustup
       TMPDIR: /home/ubuntu/actions-runner/tmp
     steps:
       - uses: actions/checkout@v6
 
-      - name: Prepare writable HOME and temp dirs
-        run: mkdir -p /home/ubuntu/actions-runner/temp-home /home/ubuntu/actions-runner/tmp
+      - name: Prepare temp dir
+        run: mkdir -p /home/ubuntu/actions-runner/tmp
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      # Bootstrap rustup ourselves with --no-modify-path so it never writes to
+      # $HOME/.profile on the full root disk (setup-rust-toolchain doesn't expose
+      # that flag). rust-toolchain.toml pins the exact toolchain, installed on
+      # first cargo use. Idempotent.
+      - name: Ensure Rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$CARGO_HOME/bin/cargo" ]; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --default-toolchain none
+          fi
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       - name: Run E2E tests on Strix Halo (excluding known bugs)
         run: cargo xtask e2e -- -t "@gpu and not @expected-failure"
@@ -799,11 +809,10 @@ jobs:
           && (inputs.tier == 'both' || inputs.tier == 'known-bugs'))
       )
     continue-on-error: true
-    # See e2e-gpu-strix-ubuntu: only the nvme volume has space, so put HOME,
-    # toolchain, and temp there — rustup's $HOME/.profile write fails on the full
-    # root disk otherwise.
+    # See e2e-gpu-strix-ubuntu: only the nvme volume has space; keep the toolchain
+    # + temp there and bootstrap rustup with --no-modify-path (no $HOME/.profile
+    # write), leaving HOME as the real home to avoid rustup's euid/HOME warning.
     env:
-      HOME: /home/ubuntu/actions-runner/temp-home
       CARGO_HOME: /home/ubuntu/actions-runner/.cargo
       RUSTUP_HOME: /home/ubuntu/actions-runner/.rustup
       TMPDIR: /home/ubuntu/actions-runner/tmp
@@ -813,10 +822,18 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Prepare writable HOME and temp dirs
-        run: mkdir -p /home/ubuntu/actions-runner/temp-home /home/ubuntu/actions-runner/tmp
+      - name: Prepare temp dir
+        run: mkdir -p /home/ubuntu/actions-runner/tmp
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      # See e2e-gpu-strix-ubuntu: bootstrap rustup with --no-modify-path so it
+      # never writes $HOME/.profile on the full root disk.
+      - name: Ensure Rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$CARGO_HOME/bin/cargo" ]; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --default-toolchain none
+          fi
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       - name: Run known-bug E2E scenarios on Strix Halo
         run: cargo xtask e2e --expect-failures -- -t "@gpu and @expected-failure"
