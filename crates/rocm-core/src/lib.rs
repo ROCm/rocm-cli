@@ -5914,6 +5914,58 @@ mod tests {
         Ok(())
     }
 
+    // EAI-7333: the service healthcheck marks a model "ready" purely from
+    // `/v1/models` listing it (via `openai_models_endpoint_has_model`), without
+    // verifying inference. This test pins that gap: a server that lists the model
+    // on `/v1/models` but is NOT able to serve `/v1/chat/completions` still
+    // reports the model as present. The readiness signal is therefore a false
+    // positive for inference-readiness — a caller must additionally probe
+    // inference before treating a service as usable. When EAI-7333 is fixed
+    // (readiness gated on an inference probe, not just `/v1/models`), the
+    // healthcheck path should no longer rely on this signal alone.
+    #[test]
+    fn models_endpoint_readiness_does_not_imply_inference_ready() -> Result<()> {
+        // A server that answers `/v1/models` with the model listed, but would
+        // hang/refuse an actual chat request (it only ever serves this one
+        // response, then closes) — mirroring an engine whose model is still
+        // loading while `/v1/models` already responds.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            let mut buffer = [0_u8; 512];
+            let _ = stream.read(&mut buffer)?;
+            let body = r#"{"data":[{"id":"Qwen/Qwen2.5-1.5B-Instruct"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )?;
+            Ok(())
+        });
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        // The `/v1/models` probe reports the model present — this is the exact
+        // signal the healthcheck uses to declare "ready".
+        let models_ready = openai_models_endpoint_has_model(
+            &endpoint,
+            Some("Qwen/Qwen2.5-1.5B-Instruct"),
+            Duration::from_secs(2),
+        )?;
+        assert!(
+            models_ready,
+            "/v1/models lists the model, so the current healthcheck would report ready"
+        );
+
+        // But that says nothing about inference: the server served only the
+        // models response and closed, so a chat request would not succeed.
+        // Readiness based on this signal alone is a false positive (EAI-7333).
+        server.join().expect("server thread should not panic")?;
+        Ok(())
+    }
+
     #[test]
     fn resolve_amd_smi_binary_prefers_home_rocm_venv_path() -> Result<()> {
         let temp_root =
@@ -5982,6 +6034,39 @@ mod tests {
         if cfg!(windows) {
             assert_eq!(default_engine_for_platform(), "lemonade");
         }
+    }
+
+    #[test]
+    fn instinct_dcgpu_family_prefers_vllm() {
+        // On Instinct data-center GPUs (TheRock `*-dcgpu` families, e.g. the
+        // MI300X's gfx94X-dcgpu) the default serving engine is vLLM. This is the
+        // GPU-family preference the serve engine selection honors before falling
+        // back to a recipe's own preferred engine. vLLM is Linux-only, so the
+        // preference does not apply on native Windows.
+        let summary = HostGpuSummary {
+            name: Some("AMD Instinct MI300X".to_owned()),
+            gfx_target: Some("gfx942".to_owned()),
+            therock_family: Some("gfx94X-dcgpu".to_owned()),
+        };
+        let preferred = preferred_serve_engine_for_host_gpu_summary(&summary);
+        if cfg!(windows) {
+            assert_eq!(preferred, None, "vLLM is not preferred on native Windows");
+        } else {
+            assert_eq!(preferred, Some("vllm"));
+        }
+    }
+
+    #[test]
+    fn consumer_gpu_family_has_no_vllm_preference() {
+        // A non-dcgpu consumer family (e.g. gfx110X-all) has no GPU-level vLLM
+        // preference, so serve selection falls through to the recipe/platform
+        // default rather than forcing vLLM.
+        let summary = HostGpuSummary {
+            name: Some("AMD Radeon".to_owned()),
+            gfx_target: Some("gfx1100".to_owned()),
+            therock_family: Some("gfx110X-all".to_owned()),
+        };
+        assert_eq!(preferred_serve_engine_for_host_gpu_summary(&summary), None);
     }
 
     #[test]

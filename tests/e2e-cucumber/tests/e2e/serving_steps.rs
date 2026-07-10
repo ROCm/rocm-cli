@@ -25,6 +25,20 @@ fn run_rocm(world: &E2eWorld, args: &[&str]) -> (String, String, i32) {
     )
 }
 
+/// How long to wait for a freshly served model's endpoint to become ready.
+///
+/// On real GPU hardware the first serve of a model downloads its weights and
+/// loads them onto the device before `/v1/models` responds, which can far exceed
+/// a minute for a multi-billion-parameter model on a cold cache (the built-in
+/// catalog now resolves `qwen2.5` to a 4B GGUF). Default high; override with
+/// `E2E_SERVE_TIMEOUT_SECS` for slower hardware or a warm-cache local run.
+fn serve_timeout_secs() -> u64 {
+    std::env::var("E2E_SERVE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600)
+}
+
 async fn wait_for_endpoint(url: &str, timeout_secs: u64) {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     while Instant::now() < deadline {
@@ -59,14 +73,44 @@ async fn setup_mock_custom_port(world: &mut E2eWorld) {
 
 #[given("a model is being served on GPU")]
 async fn setup_gpu_model(world: &mut E2eWorld) {
+    // Serve by the canonical HuggingFace ID (not the `qwen2.5` alias) with an
+    // explicit engine. This step is a *precondition* for scenarios that test
+    // inference/chat behavior, so it must not fail for reasons unrelated to what
+    // those scenarios assert. Serving the alias would trip EAI-7219 (vLLM does
+    // not resolve aliases) and sink every downstream scenario for a bug they
+    // aren't testing. Alias resolution has its own dedicated scenarios in
+    // model_serving.feature.
     let (stdout, _, rc) = run_rocm(
         world,
-        &["serve", "qwen2.5", "--engine", "vllm", "--managed"],
+        &[
+            "serve",
+            "Qwen/Qwen2.5-1.5B-Instruct",
+            "--engine",
+            "vllm",
+            "--managed",
+        ],
     );
     assert!(rc == 0, "rocm serve failed:\n{stdout}");
     world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
     world.model_name = Some("Qwen/Qwen2.5-1.5B-Instruct".to_string());
-    wait_for_endpoint("http://127.0.0.1:11435/v1/models", 120).await;
+    wait_for_endpoint("http://127.0.0.1:11435/v1/models", serve_timeout_secs()).await;
+}
+
+#[given("a GGUF model is being served on lemonade")]
+async fn setup_lemonade_model(world: &mut E2eWorld) {
+    // Lemonade serves GGUF models via its bundled llama.cpp backend, so use a
+    // GGUF model (not the safetensors Qwen2.5) served explicitly on lemonade —
+    // the parallel of setup_gpu_model's vLLM path, giving both engines their own
+    // serve+inference coverage. Qwen3-0.6B-GGUF is the smallest lemonade recipe.
+    let model = "Qwen3-0.6B-GGUF";
+    let (stdout, _, rc) = run_rocm(
+        world,
+        &["serve", model, "--engine", "lemonade", "--managed"],
+    );
+    assert!(rc == 0, "rocm serve failed:\n{stdout}");
+    world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
+    world.model_name = Some(model.to_string());
+    wait_for_endpoint("http://127.0.0.1:11435/v1/models", serve_timeout_secs()).await;
 }
 
 #[given("a model is served in the background")]
@@ -110,14 +154,29 @@ async fn user_lists_services(world: &mut E2eWorld) {
 
 #[when("the user serves a model without specifying an engine")]
 async fn user_serves_default_engine(world: &mut E2eWorld) {
-    let (stdout, _, rc) = run_rocm(world, &["serve", "qwen2.5", "--managed"]);
+    // This scenario tests automatic *engine selection*, not alias resolution, so
+    // serve by the canonical ID — using the `qwen2.5` alias would make the
+    // scenario also depend on EAI-7219 being fixed. Omit `--engine` so the CLI
+    // still picks the engine itself, which is the behavior under test.
+    let (stdout, _, rc) = run_rocm(world, &["serve", "Qwen/Qwen2.5-1.5B-Instruct", "--managed"]);
     world.cli_output = Some(stdout);
     world.cli_rc = Some(rc);
     world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
     world.model_name = Some("Qwen/Qwen2.5-1.5B-Instruct".to_string());
     if rc == 0 {
-        wait_for_endpoint("http://127.0.0.1:11435/v1/models", 120).await;
+        wait_for_endpoint("http://127.0.0.1:11435/v1/models", serve_timeout_secs()).await;
     }
+}
+
+#[when("the user serves a vLLM-capable model without specifying an engine")]
+async fn user_serves_vllm_capable_default(world: &mut E2eWorld) {
+    // Use a vLLM-capable (safetensors) model so the GPU-family default can apply;
+    // a GGUF-only model would legitimately fall through to lemonade regardless of
+    // platform. Qwen2.5-0.5B is the smallest vLLM-preferred catalog entry. Omit
+    // `--engine` so the CLI's own default selection is what's exercised.
+    let (stdout, _, rc) = run_rocm(world, &["serve", "Qwen/Qwen2.5-0.5B-Instruct", "--managed"]);
+    world.cli_output = Some(stdout);
+    world.cli_rc = Some(rc);
 }
 
 #[when("the user sends a chat completion request")]
@@ -125,7 +184,35 @@ async fn user_sends_completion(world: &mut E2eWorld) {
     crate::send_chat(world).await;
 }
 
+#[when("the CLI reports the service as ready")]
+async fn when_cli_reports_ready(world: &mut E2eWorld) {
+    // Read readiness from the CLI's own view (`services list`), not a direct
+    // endpoint poll — this is the signal a user/automation waits on before
+    // sending traffic (EAI-7333 concerns exactly this signal being trustworthy).
+    let (stdout, _, _) = run_rocm(world, &["services", "list"]);
+    assert!(
+        stdout.contains("ready"),
+        "CLI does not report any service ready:\n{stdout}"
+    );
+    world.cli_output = Some(stdout);
+}
+
 // ── Then ───────────────────────────────────────────────────────────
+
+#[then("an inference request succeeds immediately")]
+async fn assert_inference_succeeds_now(world: &mut E2eWorld) {
+    // No extra wait: the CLI already reported ready, so inference must work now.
+    // If this fails, readiness was a false positive (the gap tracked by EAI-7333).
+    crate::send_chat(world).await;
+    let resp = world.chat_response.as_ref().expect("no chat response");
+    let content = resp["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        !content.is_empty(),
+        "service reported ready but inference returned no content: {resp}"
+    );
+}
 
 #[then("the output shows the full model name")]
 async fn assert_full_model_name(world: &mut E2eWorld) {
@@ -199,12 +286,37 @@ async fn assert_endpoint_port(world: &mut E2eWorld) {
     );
 }
 
+/// Extract the engine name from a serve plan's `engine: <name>` line.
+fn selected_engine(output: &str) -> &str {
+    output
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("engine:"))
+        .map(str::trim)
+        .unwrap_or_else(|| panic!("no 'engine:' line in serve output:\n{output}"))
+}
+
 #[then("an engine is selected automatically")]
 async fn assert_engine_auto_selected(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no serve output");
+    // Parse the actual engine the CLI chose from the `engine: <name>` plan line,
+    // not just the presence of the word — and assert it is one of the supported
+    // serving engines. Since #79 the only serving backends are lemonade and
+    // vllm; auto-selection landing on a removed engine (pytorch/atom/sglang/
+    // llama-cpp) is a regression this must catch.
+    let engine = selected_engine(output);
     assert!(
-        output.contains("engine:"),
-        "no engine in serve output:\n{output}"
+        matches!(engine, "lemonade" | "vllm"),
+        "auto-selected an unsupported engine '{engine}' (expected lemonade or vllm):\n{output}"
+    );
+}
+
+#[then("vLLM is selected as the default engine")]
+async fn assert_vllm_default(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no serve output");
+    let engine = selected_engine(output);
+    assert_eq!(
+        engine, "vllm",
+        "expected vLLM as the default engine on an Instinct GPU, got '{engine}':\n{output}"
     );
 }
 
