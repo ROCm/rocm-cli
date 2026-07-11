@@ -70,21 +70,12 @@ impl Default for E2eWorld {
             std::fs::create_dir_all(root.path().join(sub)).ok();
         }
 
-        // Share the immutable TheRock runtimes across scenarios: point this
-        // scenario's <data>/runtimes at the shared dir via a symlink, so the
-        // ~3.3GB wheel + its registry manifest are downloaded once per runner,
-        // not once per scenario. Write-once artifacts, safe to share; service
-        // state lives elsewhere under <data> and stays isolated.
-        if let Some(shared) = shared_cache_dir() {
-            let shared_runtimes = shared.join("runtimes");
-            if std::fs::create_dir_all(&shared_runtimes).is_ok() {
-                let link = root.path().join("data").join("runtimes");
-                #[cfg(unix)]
-                let _ = std::os::unix::fs::symlink(&shared_runtimes, &link);
-                #[cfg(windows)]
-                let _ = std::os::windows::fs::symlink_dir(&shared_runtimes, &link);
-            }
-        }
+        // NOTE: we deliberately do NOT share <data>/runtimes across scenarios.
+        // Although the runtime wheels are immutable, the runtimes *registry* is
+        // STATE the suite asserts on — e.g. "Installing the SDK" requires
+        // `a machine with no CLI-managed runtimes`, which a shared registry
+        // (populated by other scenarios) would break. Only truly state-free
+        // content-addressed caches (HF weights, pip) are shared, in isolate_cmd.
 
         Self {
             mock: None,
@@ -110,16 +101,15 @@ impl E2eWorld {
             cmd.env("ROCM_CLI_DATA_DIR", root.join("data"));
             cmd.env("ROCM_CLI_CACHE_DIR", root.join("cache"));
         }
-        // Share the immutable heavy caches across scenarios when CI provides a
-        // persistent shared dir (see shared_cache_dir): HF model weights via
-        // HF_HOME (engines honour it for both download and discovery; weights are
-        // content-addressed and immutable) and the vLLM engine venv via
-        // ROCM_CLI_ENGINE_ENVS_ROOT (redirects only the envs/ leaf, so per-service
-        // engine state stays isolated). The runtimes dir is shared via a symlink
-        // set up in `default()`.
+        // Share only STATE-FREE, content-addressed caches across scenarios when
+        // CI provides a persistent shared dir (see shared_cache_dir): HF model
+        // weights (HF_HOME — engines honour it for download + discovery; weights
+        // are content-addressed and immutable) and the pip cache. We do NOT share
+        // runtimes or engine envs — those carry state the suite asserts on (see
+        // the note in `default()`).
         if let Some(shared) = shared_cache_dir() {
             cmd.env("HF_HOME", shared.join("huggingface"));
-            cmd.env("ROCM_CLI_ENGINE_ENVS_ROOT", shared.join("engine-envs"));
+            cmd.env("PIP_CACHE_DIR", shared.join("pip"));
         }
     }
 
