@@ -1725,6 +1725,7 @@ Apache License 2.0
 
 The following component(s) are licensed under Apache License 2.0:
   - rustls-platform-verifier 0.7.0 <https://github.com/rustls/rustls-platform-verifier>
+  - ureq 2.12.1 <https://github.com/algesten/ureq>
 
                                  Apache License
                            Version 2.0, January 2004
@@ -5643,7 +5644,6 @@ The following component(s) are licensed under Apache License 2.0:
   - unicode-truncate 2.0.1 <https://github.com/Aetf/unicode-truncate>
   - unicode-width 0.1.14 <https://github.com/unicode-rs/unicode-width>
   - unicode-width 0.2.0 <https://github.com/unicode-rs/unicode-width>
-  - ureq 2.12.1 <https://github.com/algesten/ureq>
   - url 2.5.8 <https://github.com/servo/rust-url>
   - uuid 1.23.3 <https://github.com/uuid-rs/uuid>
   - wasi 0.11.1+wasi-snapshot-preview1 <https://github.com/bytecodealliance/wasi>

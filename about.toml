@@ -35,10 +35,14 @@ private = { ignore = true }
 ignore-build-dependencies = true
 ignore-dev-dependencies = true
 
-# ureq is dual-licensed "MIT OR Apache-2.0". cargo-about's choice between the
-# two offered licenses is not stable across environments, which makes the
-# generated THIRD_PARTY_NOTICES.txt churn and the `cargo xtask tpn --check`
-# gate flaky (CI regenerates and compares). Pin it to MIT — one of ureq's own
-# offered licenses — so the notice is reproducible everywhere.
-[ureq]
-accepted = ["MIT"]
+# ureq is dual-licensed "MIT OR Apache-2.0". cargo-about's pick between ureq's
+# two bundled license files is not stable across environments (filesystem read
+# order), so a notice generated on one machine can fail the CI regenerate-and-
+# compare check on another. Clarify ureq to Apache-2.0 (the license the
+# committed notice — and main — already use) with the file as source of truth,
+# so every environment resolves ureq identically.
+[ureq.clarify]
+license = "Apache-2.0"
+[[ureq.clarify.files]]
+path = "LICENSE-APACHE"
+checksum = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
