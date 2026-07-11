@@ -59,6 +59,68 @@ async fn wait_for_model(models_url: &str, expect_model: Option<&str>, timeout_se
     }
 }
 
+/// The shared port every GPU serve scenario uses. Because scenarios run in
+/// isolated data dirs on one serial GPU box, a serve from a prior scenario can
+/// still hold this port (and GPU memory) when the next starts — its managed
+/// service lives in a different isolated dir, so this scenario's `rocm` can't
+/// stop it. Left unchecked, servers accumulate and oversubscribe the GPU until
+/// the job times out.
+const SERVE_PORT: u16 = 11435;
+
+/// Best-effort: ensure the shared serve port is free before starting a new
+/// serve, so a leaked server from a prior scenario can't linger on the GPU.
+/// Polls until nothing answers on the port (bounded), killing any listener.
+async fn ensure_serve_port_free() {
+    let url = format!("http://127.0.0.1:{SERVE_PORT}/v1/models");
+    // If nothing is listening, we're done.
+    if reqwest::get(&url).await.is_err() {
+        return;
+    }
+    // Something is still serving on the shared port (a prior scenario's leaked
+    // engine). Kill listeners by port and wait for it to close.
+    kill_listeners_on_port(SERVE_PORT);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        if reqwest::get(&url).await.is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    // Don't panic — the serve below may still succeed by replacing it; this is a
+    // best-effort reclaim.
+}
+
+/// Kill whatever process is listening on `port`. Best-effort and
+/// platform-specific; failures are ignored (the caller only needs the port
+/// eventually free, verified by polling).
+fn kill_listeners_on_port(port: u16) {
+    use std::process::Command;
+    #[cfg(unix)]
+    {
+        // `fuser -k <port>/tcp` kills listeners; fall back to lsof→kill if absent.
+        let _ = Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "fuser -k {port}/tcp 2>/dev/null || \
+                 (for p in $(lsof -t -iTCP:{port} -sTCP:LISTEN 2>/dev/null); do kill -9 \"$p\"; done)"
+            ))
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "Get-NetTCPConnection -LocalPort {port} -State Listen -EA SilentlyContinue | \
+                     ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force -EA SilentlyContinue }}"
+                ),
+            ])
+            .status();
+    }
+}
+
 // ── Given ──────────────────────────────────────────────────────────
 
 #[given("a model is being served on the default port")]
@@ -86,6 +148,10 @@ async fn setup_gpu_model(world: &mut E2eWorld) {
     // not resolve aliases) and sink every downstream scenario for a bug they
     // aren't testing. Alias resolution has its own dedicated scenarios in
     // model_serving.feature.
+    // Free the shared serve port first so a prior scenario's leaked server can't
+    // linger on the GPU and oversubscribe it (which otherwise piles up serves
+    // until the job times out).
+    ensure_serve_port_free().await;
     let (stdout, _, rc) = crate::run_rocm(
         world,
         &[
@@ -118,6 +184,7 @@ async fn setup_lemonade_model(world: &mut E2eWorld) {
     // the parallel of setup_gpu_model's vLLM path, giving both engines their own
     // serve+inference coverage. Qwen3-0.6B-GGUF is the smallest lemonade recipe.
     let model = "Qwen3-0.6B-GGUF";
+    ensure_serve_port_free().await;
     let (stdout, _, rc) = crate::run_rocm(
         world,
         &["serve", model, "--engine", "lemonade", "--managed"],
@@ -181,6 +248,7 @@ async fn user_serves_default_engine(world: &mut E2eWorld) {
     // serve by the canonical ID — using the `qwen2.5` alias would make the
     // scenario also depend on EAI-7219 being fixed. Omit `--engine` so the CLI
     // still picks the engine itself, which is the behavior under test.
+    ensure_serve_port_free().await;
     let (stdout, _, rc) =
         crate::run_rocm(world, &["serve", "Qwen/Qwen2.5-1.5B-Instruct", "--managed"]);
     world.cli_output = Some(stdout);
@@ -198,6 +266,7 @@ async fn user_serves_vllm_capable_default(world: &mut E2eWorld) {
     // a GGUF-only model would legitimately fall through to lemonade regardless of
     // platform. Qwen2.5-0.5B is the smallest vLLM-preferred catalog entry. Omit
     // `--engine` so the CLI's own default selection is what's exercised.
+    ensure_serve_port_free().await;
     let (stdout, _, rc) =
         crate::run_rocm(world, &["serve", "Qwen/Qwen2.5-0.5B-Instruct", "--managed"]);
     world.cli_output = Some(stdout);
