@@ -201,18 +201,46 @@ harness). Keep separate from framework-reliability fixes.
   Until triaged, the Strix jobs are `continue-on-error` (non-blocking) so they don't
   gate the PR. Candidate: file EAI ticket once characterized.
 
+## ✅ STRIX WINDOWS EXPECT-PASS GREEN (run 29162356843, 80d1997) — 4/4 pass in ~3m49s (≤15 ✓✓)
+The hermetic scenario-4 fix works on the real Strix Halo Windows box. **Verified from junit
+artifact: 4 testcases, 0 failures, 0 errors** — examine 3 (GPU+driver), examine 4 (unmanaged-ROCm,
+the previously-failing one), serving 9 (vLLM default), runtime 1 (install SDK). Job 17:52:16→17:56:05
+= ~3m49s; bootstrap steps (checkout, reclaim-GPU, PowerShell rustup) all green again. **This closes
+the Strix Windows platform goal.** Now 3 of 4 platforms verified green (Mock, app-dev, Strix Windows);
+only Strix Ubuntu remains, blocked on its OFFLINE runner (needs USER to start it on the box).
+
+## ✅ SCENARIO 4 FIXED HERMETICALLY (local-verified, Strix Windows CONFIRMED above)
+Root cause was a no-op precondition. FIX (test-correctness, no assertion change, no product change):
+`plant_unmanaged_rocm()` on E2eWorld plants a fake pre-existing ROCm dir in the scenario TempDir
+(`legacy-rocm/.info/version`) and `isolate_cmd` exports it as `ROCM_PATH`. The CLI's
+`detect_legacy_rocm_summary` (rocm-core lib.rs:1546) honors `ROCM_PATH` and treats a dir with a
+marker (`.info/version`) as `detected_unmanaged` → examine emits the "rocm install sdk" adopt
+guidance. Given step `setup_unmanaged_rocm` now calls it (was `{}`).
+- **Verified on THIS Mac (no GPU, no system ROCm — same condition as Strix Windows)**: without
+  ROCM_PATH → `not_detected`/guidance `none` (the old Windows failure); with planted ROCM_PATH →
+  `detected_unmanaged` + `rocm install sdk`. Both scenario-4 assertions PASS.
+- **Ran scenario 4 through the harness on Mac: 1 scenario / 4 steps, all ✔.** Mock suite still 8/8
+  (no regression). Build clean with `RUSTFLAGS=-D warnings`.
+- Bonus: also hardens the MI300X pass, which previously only worked by luck of an ambient `/opt/rocm`.
+- NEXT: commit + push + dispatch Strix Windows expect-pass to confirm 4/4 on the real box.
+
 ## 🟡 STRIX WINDOWS RAN (run 29161852572, 41e5d1f) — bootstrap WORKS, 3/4 pass, ~3m50s (≤15 ✓)
 **Big news: the PowerShell bootstrap fix is validated on real hardware.** Job 86568246532 ran
 17:36:27→17:40:17 = ~3m50s; steps checkout✔, reclaim-GPU✔, **Ensure Rust toolchain (PowerShell)✔**,
 upload✔ — only the E2E test step failed. (It was NOT wedged earlier; hosted `changes` gate + pickup
 latency made it look queued.) junit: 4 testcases, **1 failure**:
-- **PASS**: examine 3 (GPU+driver detect), examine 4 (managed vs pre-existing), serving 9 (vLLM default).
-- **FAIL**: runtime scenario 1 path — assertion `examine_steps.rs:100` `output.contains("rocm install
-  sdk")`. Windows `rocm examine` emits "No ROCm installs saved yet" / "amd display driver detected"
-  but NOT the literal "rocm install sdk" guidance string the step requires. **Platform-specific
-  output difference** — real triage call: (a) product gap (Windows examine should emit the install
-  hint → file EAI + move scenario to known-bugs), or (b) assertion too literal for Windows phrasing
-  → relax it to accept the Windows guidance. Needs USER decision (don't hide a product gap silently).
+- **PASS**: examine 3 (GPU+driver detect), serving 9 (vLLM default), runtime 1 (install SDK).
+- **FAIL** (root-caused): the failing scenario is **examine scenario 4** ("distinguishes CLI-managed
+  from pre-existing ROCm"), NOT runtime 1 (junit ordering misled first read). Its Given step
+  `setup_unmanaged_rocm` (examine_steps.rs:19) is a **no-op `{}`** — it silently assumes the box
+  ALREADY has a non-CLI ROCm install. MI300X has one (system ROCm) → examine emits adopt-guidance
+  ("rocm install sdk") → passes. **Strix Windows has NO unmanaged ROCm** (Windows, iGPU, display
+  driver only) → examine correctly says "No ROCm installs saved yet" and emits no adopt hint. **The
+  scenario's precondition is simply FALSE on Windows** — not a product bug, not a bad assertion; the
+  scenario is *not applicable* on a box without a pre-existing ROCm install. RECOMMENDATION: gate it
+  so it doesn't run where the precondition can't hold (e.g. a `@needs-unmanaged-rocm` tag excluded on
+  Windows) rather than reclassify as known-bug (nothing broken) or relax the assertion (would assert
+  nothing). NEEDS USER OK before editing scenario tags — it changes what each platform asserts.
 - Strix Windows now meets the TIMING half of the goal (≤15min) and 3/4 pass; the 1 failure is a
   triage decision, not a harness/bootstrap defect.
 
