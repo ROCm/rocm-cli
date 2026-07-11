@@ -480,17 +480,31 @@ impl AppState {
             // through the same reducer methods the pre-accept offer buttons
             // use, so a re-detect+accept mid-session raises the
             // `chat_endpoint_rebuild` edge exactly like the initial accept.
-            "detect" => match rest.split_whitespace().nth(1) {
-                None => self.request_detect(),
-                Some("accept") => self.accept_detect_offer(),
-                Some("save") => self.save_detect_offer(),
-                Some("dismiss") => self.dismiss_detect_offer(),
-                Some(other) => {
-                    self.chat.push(ChatTurn::error(format!(
-                        "unknown /detect action `{other}` (try accept, save, dismiss, or bare /detect to probe)"
-                    )));
+            "detect" => {
+                // Lowercase the sub-command to match the case-insensitive
+                // parsing of sibling commands (`/permissions`, `/provider`).
+                let sub = rest.split_whitespace().nth(1).map(str::to_lowercase);
+                match sub.as_deref() {
+                    None => self.request_detect(),
+                    // `accept`/`save` on nothing pending would be a silent
+                    // no-op in the reducer; emit a short hint instead.
+                    Some("accept" | "save") if self.chat_detect_offer.is_none() => {
+                        self.chat.push(ChatTurn::system(
+                            "no detected endpoint to act on yet — run `/detect` first to probe \
+                             for a local engine"
+                                .to_string(),
+                        ));
+                    }
+                    Some("accept") => self.accept_detect_offer(),
+                    Some("save") => self.save_detect_offer(),
+                    Some("dismiss") => self.dismiss_detect_offer(),
+                    Some(other) => {
+                        self.chat.push(ChatTurn::error(format!(
+                            "unknown /detect action `{other}` (try accept, save, dismiss, or bare /detect to probe)"
+                        )));
+                    }
                 }
-            },
+            }
             // `/chat [prompt]`: with a prompt, send it to the agent (passthrough,
             // exactly as a plain line would); bare `/chat` focuses the Chat tab.
             "chat" => {

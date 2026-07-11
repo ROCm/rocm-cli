@@ -4225,6 +4225,41 @@ mod tests {
         assert!(last.content.contains("unknown /detect action"));
     }
 
+    /// Sub-commands are case-insensitive, matching `/permissions` / `/provider`.
+    #[test]
+    fn slash_detect_subcommand_is_case_insensitive() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.set_detect_result(Some(crate::llm::detected_llm_config(
+            "http://localhost:8000/v1",
+            "m",
+        )));
+        // `DISMISS` (upper) must act exactly like `dismiss`.
+        assert_eq!(
+            s.handle_slash_command("/detect DISMISS"),
+            SlashOutcome::Handled
+        );
+        assert!(
+            s.chat_detect_offer.is_none(),
+            "uppercase sub-command is normalized and handled"
+        );
+    }
+
+    /// `/detect accept` / `/detect save` with nothing pending emits a hint
+    /// turn rather than a silent no-op.
+    #[test]
+    fn slash_detect_accept_without_offer_emits_hint() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        assert!(s.chat_detect_offer.is_none());
+        assert_eq!(
+            s.handle_slash_command("/detect accept"),
+            SlashOutcome::Handled
+        );
+        // No endpoint was adopted; a hint explains why.
+        assert_eq!(s.chat_endpoint_rebuild, None);
+        let last = s.chat.last().expect("hint turn");
+        assert!(last.content.contains("no detected endpoint"));
+    }
+
     #[test]
     fn detect_key_available_on_gate_and_offer_keys_take_precedence() {
         // `d` triggers detect from the Unavailable empty-state.
