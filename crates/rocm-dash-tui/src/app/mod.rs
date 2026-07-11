@@ -1592,7 +1592,20 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         // test in `llm.rs`) is completely untouched below — this only ever
         // substitutes a *replacement* `LlmConfig` before that call, it never
         // changes how the call itself resolves.
-        let stale_replacement = if args.chat_url.is_some() && managed.is_none() && !probe_ok {
+        //
+        // Also require NO configured api_key/auth_header: the replacement is a
+        // keyless `detected_llm_config`, and since `ResolvedArgs` can't
+        // distinguish an explicit `--chat-url` from persisted config, a remote
+        // gateway URL + `OPENAI_API_KEY` that merely TCP-times-out (300ms is
+        // tight) must never silently swap to a local keyless engine and drop
+        // the credential. Confining the swap to a no-auth URL keeps it on the
+        // true EAI-7360 target: a dead *persisted* local endpoint.
+        let stale_replacement = if args.chat_url.is_some()
+            && args.chat_api_key.is_none()
+            && args.chat_auth_header.is_none()
+            && managed.is_none()
+            && !probe_ok
+        {
             let live = detect_local_chat(state.tool_executor.clone()).await;
             stale_chat_url_replacement(&probe_target, probe_ok, live)
         } else {

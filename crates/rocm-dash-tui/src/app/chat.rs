@@ -260,8 +260,8 @@ pub(super) async fn detect_local_chat(
 /// before that call runs.
 ///
 /// Returns `Some(live)` only when the configured endpoint is unreachable and
-/// a *different*, live endpoint was found; `None` otherwise (nothing to
-/// replace, or detection simply re-found the same URL).
+/// a *genuinely different*, live endpoint was found; `None` otherwise (nothing
+/// to replace, or detection re-found the same URL modulo a trailing `/`/`/v1`).
 pub(super) fn stale_chat_url_replacement(
     configured_base_url: &str,
     configured_probe_ok: bool,
@@ -270,7 +270,17 @@ pub(super) fn stale_chat_url_replacement(
     if configured_probe_ok {
         return None;
     }
-    live.filter(|l| l.base_url != configured_base_url)
+    let configured = normalize_base_url(configured_base_url);
+    live.filter(|l| normalize_base_url(&l.base_url) != configured)
+}
+
+/// Normalize an OpenAI-style base URL for change-detection comparison: drop a
+/// trailing `/` and a trailing `/v1` so a formatting-only difference (e.g.
+/// `http://h:8000` vs `http://h:8000/v1/`) is not mistaken for a server change
+/// and does not emit a spurious "server changed" notice.
+fn normalize_base_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string()
 }
 
 /// Persist an accepted local endpoint to the user's `config.toml`: load the
@@ -480,5 +490,30 @@ mod tests {
             stale_chat_url_replacement("http://127.0.0.1:9/v1", false, Some(found.clone()))
                 .expect("a different live endpoint replaces the stale one");
         assert_eq!(replacement.base_url, found.base_url);
+    }
+
+    #[test]
+    fn stale_chat_url_replacement_ignores_trailing_slash_and_v1_formatting() {
+        // A formatting-only difference (trailing `/`, presence/absence of the
+        // `/v1` suffix) is the SAME endpoint — no spurious "server changed".
+        for (configured, found) in [
+            ("http://127.0.0.1:8000/v1", "http://127.0.0.1:8000/v1/"),
+            ("http://127.0.0.1:8000/v1", "http://127.0.0.1:8000"),
+            ("http://127.0.0.1:8000", "http://127.0.0.1:8000/v1"),
+        ] {
+            assert_eq!(
+                stale_chat_url_replacement(configured, false, Some(live(found))),
+                None,
+                "{configured} vs {found} must be treated as the same endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_base_url_strips_trailing_slash_and_v1() {
+        assert_eq!(normalize_base_url("http://h:8000/v1/"), "http://h:8000");
+        assert_eq!(normalize_base_url("http://h:8000/v1"), "http://h:8000");
+        assert_eq!(normalize_base_url("http://h:8000/"), "http://h:8000");
+        assert_eq!(normalize_base_url("http://h:8000"), "http://h:8000");
     }
 }
