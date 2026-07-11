@@ -40,7 +40,7 @@ mod summary;
 
 use chat::{
     build_chat_agent, build_local_agent, detect_local_chat, detect_managed_chat,
-    persist_chat_endpoint,
+    persist_chat_endpoint, stale_chat_url_replacement,
 };
 use summary::{parse_plan_result, summarize_json_value, summarize_slash_tool};
 
@@ -1576,13 +1576,36 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         let probe_ok = if managed.is_some() {
             true
         } else {
+            let target = probe_target.clone();
             tokio::task::spawn_blocking(move || {
-                crate::llm::probe_endpoint(&probe_target, crate::llm::PROBE_TIMEOUT)
+                crate::llm::probe_endpoint(&target, crate::llm::PROBE_TIMEOUT)
             })
             .await
             .unwrap_or(false)
         };
-        let llm = managed.or_else(|| {
+        // EAI-7360: a persisted `tui.chat_url` can go stale — the server it
+        // pointed at may have been stopped or replaced since the dash last
+        // wrote it. Only this persisted-config tier is revalidated here:
+        // `chat_env_url` is a separate, lower-precedence tier already excluded
+        // from `managed` detection above, and `resolve_llm_config`'s own
+        // CLI>config>env>probe precedence (the literal contract under unit
+        // test in `llm.rs`) is completely untouched below — this only ever
+        // substitutes a *replacement* `LlmConfig` before that call, it never
+        // changes how the call itself resolves.
+        let stale_replacement = if args.chat_url.is_some() && managed.is_none() && !probe_ok {
+            let live = detect_local_chat(state.tool_executor.clone()).await;
+            stale_chat_url_replacement(&probe_target, probe_ok, live)
+        } else {
+            None
+        };
+        if let Some(live) = &stale_replacement {
+            state.chat.push(ChatTurn::system(format!(
+                "Configured chat server at {probe_target} is unreachable; switched to the live \
+                 local engine at {} (model: {}). Run `/detect save` to persist it.",
+                live.base_url, live.model
+            )));
+        }
+        let llm = managed.or_else(|| stale_replacement.clone()).or_else(|| {
             crate::llm::resolve_llm_config(
                 args.chat_url.as_deref(),
                 args.chat_model.as_deref(),
