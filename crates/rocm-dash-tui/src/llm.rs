@@ -491,12 +491,28 @@ mod tests {
     #[test]
     fn detect_local_endpoint_probes_rocm_serve_default_port() {
         // A listener on rocm serve's (non-managed) default port must be picked
-        // up by the fallback probe, not just Lemonade/vLLM's ports.
+        // up by the fallback probe, not just Lemonade/vLLM's ports. The two
+        // higher-priority ports must be free, or an ambient listener on the
+        // CI runner would make this test flake by returning a different
+        // endpoint. Note: unlike the guard below, these can only be checked
+        // and released (not held) — the probe is a bare TCP connect, so a
+        // held listener would itself register as "reachable" and defeat the
+        // check.
+        let Ok(lemonade_probe) =
+            std::net::TcpListener::bind(("127.0.0.1", crate::skills::LEMONADE_PORT))
+        else {
+            return; // Port already bound in this environment; skip rather than flake.
+        };
+        drop(lemonade_probe);
+        let Ok(vllm_probe) = std::net::TcpListener::bind(("127.0.0.1", crate::skills::VLLM_PORT))
+        else {
+            return; // Port already bound in this environment; skip rather than flake.
+        };
+        drop(vllm_probe);
         let Ok(listener) =
             std::net::TcpListener::bind(("127.0.0.1", crate::skills::ROCM_SERVE_PORT))
         else {
-            // Port already bound in this environment; skip rather than flake.
-            return;
+            return; // Port already bound in this environment; skip rather than flake.
         };
         assert_eq!(
             detect_local_endpoint(),

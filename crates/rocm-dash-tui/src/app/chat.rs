@@ -429,6 +429,27 @@ mod tests {
     /// :11435) is preferred over falling back to the ChatGPT cloud default.
     #[tokio::test]
     async fn detect_local_chat_prefers_local_server_over_no_endpoint() {
+        // detect_local_chat probes candidates in priority order (Lemonade,
+        // then vLLM, then rocm serve's default). For the rocm-serve listener
+        // below to be the one detect_local_chat actually picks, the two
+        // higher-priority ports must be free — an ambient listener on the CI
+        // runner (e.g. another process already on :8000) would otherwise
+        // make this test flake by returning a different endpoint than
+        // expected. Note: unlike the guard below, these can only be checked
+        // and released (not held) — the probe is a bare TCP connect, so a
+        // held listener would itself register as "reachable" and defeat the
+        // check.
+        let Ok(lemonade_probe) =
+            std::net::TcpListener::bind(("127.0.0.1", crate::skills::LEMONADE_PORT))
+        else {
+            return; // Port already bound in this environment; skip rather than flake.
+        };
+        drop(lemonade_probe);
+        let Ok(vllm_probe) = std::net::TcpListener::bind(("127.0.0.1", crate::skills::VLLM_PORT))
+        else {
+            return; // Port already bound in this environment; skip rather than flake.
+        };
+        drop(vllm_probe);
         let Ok(listener) =
             std::net::TcpListener::bind(("127.0.0.1", crate::skills::ROCM_SERVE_PORT))
         else {
