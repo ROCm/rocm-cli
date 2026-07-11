@@ -687,6 +687,12 @@ jobs:
           && (inputs.tier == 'both' || inputs.tier == 'expect-pass'))
       )
     continue-on-error: true
+    env:
+      # Bound serve readiness below the 15-min job cap so a serve that never comes
+      # ready (e.g. starved by the auto-started lemonade Vulkan assistant) fails
+      # the scenario with a real error instead of hanging until the job is
+      # cancelled. 300s is ample for a real MI300X vLLM cold-start.
+      E2E_SERVE_TIMEOUT_SECS: "300"
     steps:
       - uses: actions/checkout@v6
 
@@ -701,6 +707,7 @@ jobs:
           pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
           pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
           pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
+          pkill -f 'vulkan/llama-server' 2>/dev/null || true
           pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
           pkill -f 'e2e-target/release/rocm daemon' 2>/dev/null || true
           rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
