@@ -30,7 +30,14 @@ on:
         options: [both, expect-pass, known-bugs]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Manual dispatches get a UNIQUE group (run_id) so a run that gets stuck — e.g.
+  # a job queued on a temporarily offline self-hosted runner, which GitHub cannot
+  # cancel — never holds the shared group and blocks later dispatches. push / PR /
+  # merge_group keep the shared per-ref group so a new commit still supersedes the
+  # previous in-flight run.
+  group: >-
+    ${{ github.workflow }}-${{ github.ref }}-${{
+      github.event_name == 'workflow_dispatch' && github.run_id || 'shared' }}
   cancel-in-progress: true
 
 permissions:
@@ -576,6 +583,7 @@ jobs:
   # jobs below.
   e2e:
     name: E2E tests
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     needs: [changes, build-and-test]
     # On push/PR/merge_group: unchanged — run when build-and-test succeeded and
@@ -624,6 +632,7 @@ jobs:
   # always-red check reviewers learn to ignore.
   e2e-known-bugs:
     name: E2E tests (known bugs)
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     needs: [changes, build-and-test]
     # See `e2e`: dispatch tolerates skipped build-and-test; mock tier, known-bugs.
@@ -662,6 +671,7 @@ jobs:
   # regression, never a known bug still reproducing.
   e2e-gpu:
     name: E2E tests (GPU)
+    timeout-minutes: 15
     runs-on: [self-hosted, linux, amd-gpu]
     needs: [changes, build-and-test]
     # See `e2e`: dispatch tolerates skipped build-and-test; app-dev-gpu, expect-pass.
@@ -718,6 +728,7 @@ jobs:
   # scenario fails, or a parse/hook error occurs.
   e2e-gpu-known-bugs:
     name: E2E tests (GPU, known bugs)
+    timeout-minutes: 15
     runs-on: [self-hosted, linux, amd-gpu]
     needs: [changes, build-and-test]
     # See `e2e`: dispatch tolerates skipped build-and-test; app-dev-gpu, known-bugs.
@@ -770,6 +781,7 @@ jobs:
   # `amd-gpu`, not `strix-halo`). Non-blocking while this hardware is proven out.
   e2e-gpu-strix-ubuntu:
     name: E2E tests (Strix Halo, Ubuntu)
+    timeout-minutes: 15
     runs-on: [self-hosted, linux, strix-halo]
     needs: [changes, build-and-test]
     # See `e2e`: dispatch tolerates skipped build-and-test; strix-ubuntu, expect-pass.
@@ -833,6 +845,7 @@ jobs:
 
   e2e-gpu-strix-ubuntu-known-bugs:
     name: E2E tests (Strix Halo, Ubuntu, known bugs)
+    timeout-minutes: 15
     runs-on: [self-hosted, linux, strix-halo]
     needs: [changes, build-and-test]
     # See `e2e`: dispatch tolerates skipped build-and-test; strix-ubuntu, known-bugs.
@@ -896,6 +909,7 @@ jobs:
   # first-run breakage to triage; non-blocking so it never gates the PR.
   e2e-gpu-strix-windows:
     name: E2E tests (Strix Halo, Windows)
+    timeout-minutes: 15
     runs-on: [self-hosted, windows, strix-halo]
     needs: [changes, build-and-test]
     # See `e2e`: dispatch tolerates skipped build-and-test; strix-windows, expect-pass.
@@ -944,6 +958,7 @@ jobs:
 
   e2e-gpu-strix-windows-known-bugs:
     name: E2E tests (Strix Halo, Windows, known bugs)
+    timeout-minutes: 15
     runs-on: [self-hosted, windows, strix-halo]
     needs: [changes, build-and-test]
     # See `e2e`: dispatch tolerates skipped build-and-test; strix-windows, known-bugs.
