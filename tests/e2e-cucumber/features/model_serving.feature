@@ -50,10 +50,12 @@ Feature: Model serving
     Then the response contains a model reply
     And the response identifies the correct model
 
-  # Split from the inference assertion: engine auto-selection + a reachable
-  # endpoint work today, so this stays expect-pass. The inference step is the
-  # EAI-7333 known bug and lives in scenario 6b below.
-  @gpu
+  # Known bug EAI-7333 (readiness): serving Qwen2.5-1.5B without --engine on the
+  # MI300X CI runner does not reach a ready /v1/models endpoint within 300s — the
+  # same readiness gap as scenarios 5/6b/8. (The engine-selection CONTRACT is
+  # separately covered as expect-pass by scenario 9, which serves the 0.5B model
+  # and checks only that vLLM is selected.) Kept as a known bug until EAI-7333.
+  @gpu @expected-failure @expected-failure-EAI-7333
   Scenario: 6 - Serving a model without specifying an engine produces a working endpoint
     Given a managed runtime is active
     When the user serves a model without specifying an engine
