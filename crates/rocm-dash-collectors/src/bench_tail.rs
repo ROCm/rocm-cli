@@ -11,7 +11,7 @@
 
 use std::fs::File;
 use std::io::BufReader;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use rocm_dash_core::bench_schema::BenchmarkRow;
 use rocm_dash_core::traits::{BenchTailer, CollectorError, Result};
@@ -33,7 +33,11 @@ impl BenchTailer for CsvBenchTailer {
     }
 
     fn drain(&mut self) -> Result<Vec<BenchmarkRow>> {
-        let file = File::open(&self.path)?;
+        // The tailed path is derived from config / `$ROCM_CLI_DATA_DIR`, so
+        // sanitize it through `validated_read_path` before opening (breaks the
+        // path-injection data flow into the `File::open` sink below).
+        let path = validated_read_path(&self.path)?;
+        let file = File::open(&path)?;
         let mut rdr = csv::ReaderBuilder::new()
             .has_headers(true)
             .from_reader(BufReader::new(file));
@@ -59,6 +63,31 @@ impl BenchTailer for CsvBenchTailer {
 
 fn map_csv_err(e: csv::Error) -> CollectorError {
     CollectorError::Parse(e.to_string())
+}
+
+/// Canonicalize the tailed CSV path and reject `..` traversal before it reaches
+/// the `File::open` sink, breaking the data-flow taint from the config /
+/// `$ROCM_CLI_DATA_DIR`-derived bench path.
+///
+/// Unlike the log-directory guard, the bench results file is intentionally
+/// user-configurable to ANY location (`--out <path>` / `bench_results_dir`), so
+/// there is no fixed root to require containment under; sanitizing via
+/// canonicalization (which resolves symlinks and `..`) is the appropriate
+/// barrier. Canonicalization also fails for a not-yet-created file exactly as
+/// the previous bare `File::open` did, so the daemon's tick loop keeps
+/// tolerating an absent file before the first `rocm bench load` run.
+fn validated_read_path(path: &Path) -> Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)?;
+    if canonical
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(CollectorError::Other(format!(
+            "refusing to read bench CSV via a traversal path: {}",
+            path.display()
+        )));
+    }
+    Ok(canonical)
 }
 
 #[cfg(test)]

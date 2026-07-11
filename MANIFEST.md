@@ -48,6 +48,7 @@ repository.
 | apple-native-keyring-store | 1.0.0 | MIT OR Apache-2.0 |
 | approx | 0.5.1 | Apache-2.0 |
 | as-any | 0.3.2 | MIT OR Apache-2.0 |
+| assert-json-diff | 2.0.2 | MIT |
 | async-broadcast | 0.7.2 | MIT OR Apache-2.0 |
 | async-channel | 2.5.0 | Apache-2.0 OR MIT |
 | async-executor | 1.14.0 | Apache-2.0 OR MIT |
@@ -126,6 +127,8 @@ repository.
 | darling_core | 0.23.0 | MIT |
 | darling_macro | 0.23.0 | MIT |
 | data-encoding | 2.11.0 | MIT |
+| deadpool | 0.12.3 | MIT OR Apache-2.0 |
+| deadpool-runtime | 0.1.4 | MIT OR Apache-2.0 |
 | deltae | 0.3.2 | MIT |
 | der | 0.7.10 | Apache-2.0 OR MIT |
 | deranged | 0.5.8 | MIT OR Apache-2.0 |
@@ -274,6 +277,7 @@ repository.
 | num-iter | 0.1.45 | MIT OR Apache-2.0 |
 | num-rational | 0.4.2 | MIT OR Apache-2.0 |
 | num-traits | 0.2.19 | MIT OR Apache-2.0 |
+| num_cpus | 1.17.0 | MIT OR Apache-2.0 |
 | num_threads | 0.1.7 | MIT OR Apache-2.0 |
 | objc2-core-foundation | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
 | object | 0.37.3 | Apache-2.0 OR MIT |
@@ -543,6 +547,7 @@ repository.
 | windows_x86_64_msvc | 0.53.1 | MIT OR Apache-2.0 |
 | winnow | 0.7.15 | MIT |
 | winnow | 1.0.3 | MIT |
+| wiremock | 0.6.5 | MIT/Apache-2.0 |
 | wit-bindgen | 0.57.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | writeable | 0.6.3 | Unicode-3.0 |
 | xattr | 1.6.1 | MIT OR Apache-2.0 |
