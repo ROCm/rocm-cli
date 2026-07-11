@@ -87,15 +87,26 @@ pub fn is_scrapeable_status(status: &str) -> bool {
 /// `startup_phase`) onto the dashboard's `InstanceStatus`. Only called after
 /// `is_scrapeable_status` has already filtered out `failed`/`stopped`/unrecognized
 /// strings, so the `_` fallback arm is unreachable in practice but kept total
-/// for safety. The `startup_phase` token is only honored for the `Starting`
-/// states; it is meaningless once a service is `ready`/`running`.
+/// for safety.
+///
+/// **`running` + `startup_phase` overlap:** the rocm-cli supervisor
+/// (`apps/rocmd/src/lib.rs::supervise_service`) flips the on-disk record to
+/// `running` immediately after spawning the engine child — *before* it starts
+/// polling and parsing `startup_phase` from the serve log — and only clears
+/// `startup_phase` once the service reaches `ready`. So a record can be
+/// `running` with a `startup_phase` still set while the model is downloading
+/// or loading; that combination must still surface as `Starting{phase}`, not
+/// `Running`, or the coarse phase never renders during a real cold start. A
+/// `running` record without a phase (the steady-state case) still maps to
+/// plain `Running`.
 fn instance_status_for_record(status: &str, startup_phase: Option<&str>) -> InstanceStatus {
+    let phase = || startup_phase.and_then(StartupPhase::from_token);
     match status.trim().to_ascii_lowercase().as_str() {
         "ready" => InstanceStatus::Ready,
-        "running" => InstanceStatus::Running,
-        "starting" | "recovering" => InstanceStatus::Starting {
-            phase: startup_phase.and_then(StartupPhase::from_token),
-        },
+        "running" => startup_phase.map_or(InstanceStatus::Running, |_| InstanceStatus::Starting {
+            phase: phase(),
+        }),
+        "starting" | "recovering" => InstanceStatus::Starting { phase: phase() },
         _ => InstanceStatus::Unknown,
     }
 }
@@ -344,24 +355,28 @@ mod tests {
 
     #[test]
     fn discovered_from_record_surfaces_startup_phase_while_starting() {
-        // A `starting` record with a parsed phase must carry that phase into the
-        // instance status so the dashboard can show DOWNLOADING/LOADING/WARMUP.
-        let rec: ServiceRecord = serde_json::from_str(
-            r#"{
-              "service_id": "svc-load", "engine": "vllm", "model_ref": "m",
-              "canonical_model_id": "m", "host": "127.0.0.1", "port": 8000,
-              "status": "starting", "startup_phase": "loading",
-              "created_at_unix_ms": 1
-            }"#,
-        )
-        .unwrap();
-        let svc = discovered_from_record(&rec).expect("starting record is scrapeable");
-        assert_eq!(
-            svc.status,
-            InstanceStatus::Starting {
-                phase: Some(StartupPhase::Loading)
-            }
-        );
+        // A `starting`/`recovering` record with a parsed phase must carry that
+        // phase into the instance status so the dashboard can show
+        // DOWNLOADING/LOADING/WARMUP.
+        for status in ["starting", "recovering"] {
+            let rec: ServiceRecord = serde_json::from_str(&format!(
+                r#"{{
+                  "service_id": "svc-load", "engine": "vllm", "model_ref": "m",
+                  "canonical_model_id": "m", "host": "127.0.0.1", "port": 8000,
+                  "status": "{status}", "startup_phase": "loading",
+                  "created_at_unix_ms": 1
+                }}"#
+            ))
+            .unwrap();
+            let svc = discovered_from_record(&rec).expect("record is scrapeable");
+            assert_eq!(
+                svc.status,
+                InstanceStatus::Starting {
+                    phase: Some(StartupPhase::Loading)
+                },
+                "status {status:?}"
+            );
+        }
 
         // An unrecognized phase token degrades to a phase-less Starting.
         let rec: ServiceRecord = serde_json::from_str(
@@ -375,6 +390,58 @@ mod tests {
         .unwrap();
         let svc = discovered_from_record(&rec).expect("starting record is scrapeable");
         assert_eq!(svc.status, InstanceStatus::Starting { phase: None });
+    }
+
+    #[test]
+    fn discovered_from_record_surfaces_startup_phase_while_running() {
+        // The real producer (`apps/rocmd/src/lib.rs::supervise_service`) flips
+        // the on-disk record to `running` *before* it starts polling and
+        // parsing `startup_phase` from the serve log, and only clears
+        // `startup_phase` once the service reaches `ready`. Exercise that
+        // exact `running` + `startup_phase` shape end to end through
+        // `load_service_records` + `discovered_from_record` (not a
+        // hand-picked shape the producer never writes) to prove the coarse
+        // phase actually renders during a real cold start.
+        let dir = test_dir("running-phase");
+        fs::write(
+            dir.join("svc.json"),
+            r#"{
+              "service_id": "svc-cold", "engine": "vllm", "model_ref": "m",
+              "canonical_model_id": "m", "host": "127.0.0.1", "port": 8000,
+              "status": "running", "startup_phase": "downloading",
+              "created_at_unix_ms": 1
+            }"#,
+        )
+        .unwrap();
+
+        let records = load_service_records(&dir);
+        let svc = discovered_from_record(&records[0]).expect("running record is scrapeable");
+        assert_eq!(
+            svc.status,
+            InstanceStatus::Starting {
+                phase: Some(StartupPhase::Downloading)
+            },
+            "a `running` record with a live startup_phase must still render as Starting"
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        // Once the supervisor clears `startup_phase` (service reached
+        // `ready`... though status flips to `ready` too — this proves the
+        // `running`-with-no-phase steady state still maps to plain Running).
+        let dir = test_dir("running-no-phase");
+        fs::write(
+            dir.join("svc.json"),
+            r#"{
+              "service_id": "svc-steady", "engine": "vllm", "model_ref": "m",
+              "canonical_model_id": "m", "host": "127.0.0.1", "port": 8000,
+              "status": "running", "created_at_unix_ms": 1
+            }"#,
+        )
+        .unwrap();
+        let records = load_service_records(&dir);
+        let svc = discovered_from_record(&records[0]).expect("running record is scrapeable");
+        assert_eq!(svc.status, InstanceStatus::Running);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
