@@ -34,3 +34,11 @@ private = { ignore = true }
 # they are not third-party components of the distribution.
 ignore-build-dependencies = true
 ignore-dev-dependencies = true
+
+# ureq is dual-licensed "MIT OR Apache-2.0". cargo-about's choice between the
+# two offered licenses is not stable across environments, which makes the
+# generated THIRD_PARTY_NOTICES.txt churn and the `cargo xtask tpn --check`
+# gate flaky (CI regenerates and compares). Pin it to MIT — one of ureq's own
+# offered licenses — so the notice is reproducible everywhere.
+[ureq]
+accepted = ["MIT"]
