@@ -4,7 +4,7 @@
 **Stage:** 8-awaiting-pr-approval
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
-**Last Updated:** 2026-07-10 (idle flush)
+**Last Updated:** 2026-07-11
 **Token Usage:** in=2768 out=814393 cache_create=11448735 cache_read=462877065 calls=1391
 
 ---
@@ -200,6 +200,106 @@ harness). Keep separate from framework-reliability fixes.
   this is an unsupported-hardware expectation or a real bug — NEEDS TRIAGE on the box.
   Until triaged, the Strix jobs are `continue-on-error` (non-blocking) so they don't
   gate the PR. Candidate: file EAI ticket once characterized.
+
+## 📍 STABLE STATE (run #534, 8b42396, app-dev) — ≤15min achieved; 3 inference failures need a call
+app-dev GPU expect-pass now **11m52s (≤15 ✓), 4 passed / 3 failed — reproducible**. The timeout is
+GONE (port-free + assistant-kill + 300s serve timeout). app-dev known-bugs ✅. The 3 failures are all
+identical: serve OK, `/v1/models` ready ("model reachable"/"CLI reports ready" ✔), then
+`POST /v1/chat/completions` → **"error sending request" (connection refused)**. Scenarios: model_serving
+5 (responds to inference), 6 (default-engine … responds to inference — only its LAST step), 8
+(reported-ready ⇒ immediate inference).
+- **UNRESOLVED DIAGNOSIS (needs a call, don't guess)**: "connection refused right after readiness" is
+  either (a) **EAI-7333** — the readiness signal (/v1/models 200) is a false positive; vLLM isn't
+  inference-ready → genuine product bug these scenarios correctly catch; or (b) **GPU contention** —
+  the co-running lemonade Vulkan server (still observed on port 8001 serving Qwen3-0.6B during the run)
+  OOM/pressure-kills the vLLM right after readiness. (a) → tag the 3 (or their inference steps)
+  `@expected-failure-EAI-7333` to move them to known-bugs (makes expect-pass green, honest). (b) →
+  keep hunting the contention (the assistant-kill/port-free helped serves not pile up, but a lemonade
+  serve still appears mid-run). Distinguishing needs the vLLM server log at the moment of the failed
+  POST — not visible in the truncated cucumber output.
+- Caveat on tagging: scenario 6's engine-selection steps PASS and are worth keeping as expect-pass;
+  only its final inference step fails — so a whole-scenario `@expected-failure` tag is too broad.
+  Would need to split the scenario or move just the inference assertion.
+- **Fixes validated this session (all pushed on ci-e2e-framework-fixes)**: mock ✅✅; app-dev
+  known-bugs ✅ (~4.5m); Strix Windows known-bugs ✅; build cache (22→4min); cache:false; unique
+  concurrency (dispatch deadlock fixed); 15min job timeouts; HF/pip shared cache; model-aware serve
+  wait; port-free before serve (no vLLM pile-up); assistant/vulkan kill; 300s expect-pass serve cap;
+  HTTPS-token push (SSH-agent bypass); command-coverage table; report Platform/OS/Tier redesign.
+- **STILL BLOCKED (needs user)**: `strix-halo-ubuntu` runner OFFLINE — no path from here.
+
+## ✅ BREAKTHROUGH (run #532, a4d2b0a, app-dev expect-pass) — no more timeout; failures are EAI-7333
+app-dev GPU expect-pass now finishes **9m54s (≤15 ✓), 4/7 pass** (was timing out entirely). The
+port-free fix (a4d2b0a) + shared-cache narrowing (b501132) resolved the timeout AND the earlier
+regressions: examine "suggests CLI-managed install" ✔, "Installing the SDK" ✔, serve + engine
+selection ✔. The **3 remaining failures are all the SAME product bug**: `/v1/models` returns ready
+but `POST /v1/chat/completions` fails / "CLI does not report any service ready" — i.e. **EAI-7333**
+(readiness signal ≠ inference-ready), which we already filed. These are NOT harness bugs.
+- **DECISION NEEDED**: the 3 affected expect-pass scenarios (chat after serve, inference after
+  default-engine serve, "service reported ready ⇒ immediate inference") are hitting EAI-7333. Either
+  (a) tag them `@expected-failure-EAI-7333` so they move to the known-bugs tier (makes expect-pass
+  green, honestly reflecting the open bug), or (b) treat as a release blocker and fix EAI-7333 in the
+  product. For the GOAL ("tests that are supposed to pass do"), option (a) is the correct
+  reclassification — these are testing a known-broken path, so they belong in known-bugs.
+- Note: earlier "wrong-model" (6d2f091) is fixed; the port-free helper still allows a *starting*
+  (not-yet-HTTP-ready) vllm to briefly coexist, but it no longer causes the timeout.
+
+## 🔴 EARLIER ISSUE (runs #530/#531) — GPU serve accumulation starves the box [RESOLVED by a4d2b0a]
+Definitive process evidence from app-dev during expect-pass (both runs timed out at 15min):
+THREE engine processes alive at once — TWO `vllm serve Qwen2.5` from *different* `/tmp/rocm-e2e-*`
+scenario roots (i.e. a prior scenario's server still up when the next starts) PLUS a lemonade
+Vulkan `llama-server` (Qwen3-4B-Instruct-2507, the built-in assistant) pinned at ~96% CPU
+(EAI-7052). The suite's scenarios only serve vllm Qwen2.5 — the lemonade assistant is auto-started
+by the CLI/daemon, not by a scenario.
+- **Root cause**: per-scenario data isolation + shared GPU + shared hardcoded port 11435 +
+  managed-serve DETACHES → the Drop teardown (stop services from THIS scenario's isolated dir)
+  can't stop a prior scenario's detached server (different isolated dir → not in its records).
+  Servers pile up, oversubscribe the GPU, everything slows → 15min timeout.
+- **Reclaim pre-step (98c2e11) does NOT fix it** — it clears leftovers from PRIOR runs, but the
+  accumulation happens WITHIN a run (scenario N+1 starts before scenario N's detached engine dies).
+- **Fixes that ARE validated this session**: mock ✅✅, Strix Windows known-bugs ✅, app-dev GPU
+  known-bugs ✅ (4m40s, cache 22min→4min), build cache, cache:false, unique concurrency (unblocked
+  dispatches), 15min timeouts (firing correctly), HF/pip shared cache (weights load from e2e-shared),
+  model-aware serve wait, coverage table, HTTPS-token push (SSH-agent bypass).
+- **NEEDS DECISION (can't guess safely)**: how to stop cross-scenario serve accumulation. Options:
+  (a) global pre-scenario "stop ALL managed services + free port 11435 + kill stray engines" that
+  works across isolated dirs (a `rocm services stop --all`-style sweep against a KNOWN shared data
+  dir, or kill-by-port); (b) give each serve scenario its OWN port so they don't collide (but GPU
+  memory still oversubscribes); (c) run GPU scenarios with a shared (not per-scenario) data dir so
+  the CLI itself tracks+replaces the single managed service on 11435. (c) is likely the real fix but
+  changes the isolation model — needs user/design sign-off.
+- **ALSO investigate**: why the CLI auto-starts the lemonade Qwen3-4B assistant during E2E at all
+  (it hangs on Vulkan / EAI-7052 and consumes a GPU core). Possibly a daemon default; may warrant a
+  product ticket or an E2E env to disable the built-in assistant.
+- **STILL BLOCKED**: `strix-halo-ubuntu` runner OFFLINE — no path from here; user must restart it.
+
+## Run #528 results (6bed8a1, platform=all, 2026-07-11) — GOAL: all platforms pass, ≤15min each
+- ✅ **Mock expect-pass 6m50s / known-bugs 8m07s** — compile fix good, no regression.
+- ✅ **app-dev GPU known-bugs 4m40s** (cache working); GPU expect-pass ran (verify).
+- ⛔ **Strix Ubuntu: runner OFFLINE** (`strix-halo-ubuntu` [offline] via runners API) → both jobs
+  queue forever. BLOCKS the goal. Needs the runner process (re)started ON the box
+  (`RUNNER_ALLOW_RUNASROOT=1 nohup ./run.sh …`) — NO access path from here (not on tailnet,
+  not a k8s pod). Disk fix (`24b7fa0`) therefore UNVALIDATED. **User action required.**
+- ⚠️ **Strix Windows expect-pass 7m40s, 5/7 pass, 2 real failures** (bootstrap now WORKS):
+  1. Scenario 4 examine: "expected guidance to install sdk" — examine output on Windows lacks
+     the CLI-managed-install suggestion. Possibly real product/behavior gap on Windows.
+  2. **Scenario 5 wrong-model (TEST ISOLATION BUG) — FIXED `6d2f091`**: serves Qwen2.5-1.5B (vllm)
+     but chat returned `Qwen3-0.6B-Q4_0.gguf` (lemonade model from scenario 7). Leaked serve on
+     shared port 11435; isolated data dirs mean scenario 5's rocm can't stop scenario 7's service.
+     Fix: made serve readiness MODEL-AWARE (`wait_for_model`) — wait until /v1/models lists THIS
+     scenario's model, not just any 200. NOT yet validated on HW.
+
+### ⚠️ REGRESSION found on #528: shared-runtimes over-sharing (FIXED `b501132`)
+- Sharing `<data>/runtimes` regressed app-dev GPU expect-pass **4/7 → 1/7**: the runtimes
+  *registry* is STATE the suite asserts on — scenario "Installing the SDK" needs `a machine with
+  no CLI-managed runtimes`, which a shared registry (populated by other scenarios) breaks →
+  cascaded into serve failures. Also likely caused the examine "expected guidance to install sdk"
+  failure (a leftover managed runtime suppresses the install suggestion).
+- **Fix `b501132`**: share ONLY state-free content-addressed caches (HF_HOME weights + pip cache).
+  Dropped the runtimes symlink + ROCM_CLI_ENGINE_ENVS_ROOT. Runtimes re-install per scenario to the
+  isolated data root (nvme via TMPDIR) — less dedup, but correct. Lesson: "immutable artifact" ≠
+  "safe to share" when tests assert on its registry/state.
+- 📋 Re-validate on a fresh run once Strix Ubuntu runner is back online. Examine-guidance failure
+  should be re-checked then (may have been caused by the shared-runtimes leak).
 
 ## Framework reliability fixes (iterate on scratch branch `ci-e2e-framework-fixes`)
 
@@ -475,3 +575,6 @@ addressed here with the exit-code fix + dedicated known-bugs job.
 
 ### 2026-07-10 (idle flush)
 **2026-07-10 (idle flush):** Session idle for 1 hour, auto-flushing WIP state.
+
+### 2026-07-11 (idle flush)
+**2026-07-11 (idle flush):** Session idle for 1 hour, auto-flushing WIP state.
