@@ -455,7 +455,7 @@ enum BenchCommand {
         /// Requests per concurrency cell
         #[arg(long, default_value_t = 128)]
         requests: u32,
-        /// Output CSV file (default: ~/.rocm/data/bench/results.csv, the
+        /// Output CSV file (default: ~/.rocm/bench/results.csv, the
         /// daemon-tailed path that populates the dashboard's Bench panel)
         #[arg(long, value_name = "FILE")]
         out: Option<PathBuf>,

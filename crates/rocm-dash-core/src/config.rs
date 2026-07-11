@@ -181,27 +181,41 @@ fn socket_path(
 }
 
 /// Default CSV file the standalone `rocm-dash` daemon tails for normalized
-/// benchmark rows: `$HOME/.rocm/data/bench/results.csv`, mirroring
-/// `default_socket`'s own `$HOME/.rocm/data/...` root so a bench run under
-/// the unified `rocm` binary (which appends to this same file by default) is
-/// picked up here too. Falls back to `None` when `$HOME` is unset, same as
-/// `default_socket`'s final tier degrading to a temp-dir socket rather than a
-/// data-dir path.
+/// benchmark rows: `$HOME/.rocm/bench/results.csv` (or
+/// `$ROCM_CLI_DATA_DIR/bench/results.csv` when that override is set).
+///
+/// This must resolve to the SAME absolute path the unified `rocm` binary uses
+/// on both sides — `rocm bench load`'s default `--out` (via
+/// `AppPaths::discover().data_dir`, where `data_dir` is `$HOME/.rocm`) and
+/// rocm-core's `DashboardDaemonConfig` default. Note there is NO extra `/data/`
+/// segment: rocm-core's `default_data_dir()` is `$HOME/.rocm` itself, so a
+/// bench run under `rocm` lands here and the standalone daemon tails it.
+/// Honors `ROCM_CLI_DATA_DIR` for the same reason the producer does; falls back
+/// to `None` when neither the override nor `$HOME` is set.
 fn default_bench_results_dir() -> Option<PathBuf> {
-    bench_results_dir_from_home(std::env::var_os("HOME"))
+    bench_results_dir_from_env(
+        std::env::var_os("ROCM_CLI_DATA_DIR"),
+        std::env::var_os("HOME"),
+    )
 }
 
 /// Pure core of [`default_bench_results_dir`]: resolve the tailed bench CSV
-/// path from an explicit `$HOME` input so the behavior is testable without
-/// mutating process-global env vars (unsafe and racy under parallel tests).
-fn bench_results_dir_from_home(home: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    home.filter(|v| !v.is_empty()).map(|home| {
-        PathBuf::from(home)
-            .join(".rocm")
-            .join("data")
-            .join("bench")
-            .join("results.csv")
-    })
+/// path from explicit `$ROCM_CLI_DATA_DIR` / `$HOME` inputs so the behavior is
+/// testable without mutating process-global env vars (unsafe and racy under
+/// parallel tests). Precedence mirrors rocm-core's `AppPaths::discover`: the
+/// data-dir override wins, else `$HOME/.rocm`.
+fn bench_results_dir_from_env(
+    data_dir_override: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    data_dir_override
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            home.filter(|v| !v.is_empty())
+                .map(|home| PathBuf::from(home).join(".rocm"))
+        })
+        .map(|data_dir| data_dir.join("bench").join("results.csv"))
 }
 
 impl Default for DaemonConfig {
@@ -511,24 +525,42 @@ theme = "default-dark"
     }
 
     #[test]
-    fn bench_results_dir_from_home_joins_the_data_dir_bench_subdir() {
+    fn bench_results_dir_from_env_uses_home_rocm_without_extra_data_segment() {
         // EAI-7361: the Bench panel stayed permanently empty because this
         // default was `None` — the daemon never tailed any file unless the
         // user hand-edited a config file, even after running `rocm bench
-        // load`. Must match the same `<data_dir>/bench/results.csv` file
-        // `rocm bench load` itself appends to by default.
-        let dir = bench_results_dir_from_home(Some("/home/alice".into()));
+        // load`. Must resolve to the SAME absolute path `rocm bench load`
+        // writes to by default: `$HOME/.rocm/bench/results.csv`. Critically
+        // there is NO `/data/` segment — rocm-core's `default_data_dir()` is
+        // `$HOME/.rocm` itself, so an earlier `$HOME/.rocm/data/...` default
+        // would never line up with the producer.
+        let dir = bench_results_dir_from_env(None, Some("/home/alice".into()));
         assert_eq!(
             dir,
-            Some(PathBuf::from("/home/alice/.rocm/data/bench/results.csv"))
+            Some(PathBuf::from("/home/alice/.rocm/bench/results.csv"))
         );
     }
 
     #[test]
-    fn bench_results_dir_from_home_is_none_when_home_unset_or_empty() {
-        assert_eq!(bench_results_dir_from_home(None), None);
+    fn bench_results_dir_from_env_honors_the_data_dir_override() {
+        // Mirrors `AppPaths::discover`: `ROCM_CLI_DATA_DIR` wins over `$HOME`
+        // so the standalone daemon tails exactly what a producer with the same
+        // override set writes.
+        let dir = bench_results_dir_from_env(
+            Some("/mnt/scratch/rocm".into()),
+            Some("/home/alice".into()),
+        );
         assert_eq!(
-            bench_results_dir_from_home(Some(String::new().into())),
+            dir,
+            Some(PathBuf::from("/mnt/scratch/rocm/bench/results.csv"))
+        );
+    }
+
+    #[test]
+    fn bench_results_dir_from_env_is_none_when_unset_or_empty() {
+        assert_eq!(bench_results_dir_from_env(None, None), None);
+        assert_eq!(
+            bench_results_dir_from_env(Some(String::new().into()), Some(String::new().into())),
             None
         );
     }

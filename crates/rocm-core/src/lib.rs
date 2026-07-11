@@ -3932,11 +3932,18 @@ const fn default_instance_tick_secs() -> f64 {
 /// appends to this exact path by default when `--out` is omitted (see
 /// `apps/rocm/src/dash.rs::run_bench`), so a plain CLI run — with no config
 /// edits — is picked up by the daemon and shows up in the dashboard's Bench
-/// panel. Falls back to `None` only if the data directory itself can't be
-/// determined (no `$HOME`, no OS project-dirs fallback), matching
-/// `default_data_dir`'s own failure mode.
+/// panel.
+///
+/// Resolves the data directory through the SAME `AppPaths::discover()` the
+/// producer uses (not the bare `default_data_dir()`), so the `ROCM_CLI_DATA_DIR`
+/// override and host path normalization are honored identically on both sides —
+/// otherwise, with the override set, `rocm bench load` would write a file the
+/// daemon never tails. Falls back to `None` only if `AppPaths::discover()`
+/// itself fails (no `$HOME`, no OS project-dirs fallback).
 fn default_bench_results_dir() -> Option<PathBuf> {
-    default_data_dir().map(|dir| dir.join("bench").join("results.csv"))
+    AppPaths::discover()
+        .ok()
+        .map(|paths| paths.data_dir.join("bench").join("results.csv"))
 }
 
 /// Telemetry daemon operational spec. Tick cadences are stored as f64 seconds in
@@ -7987,15 +7994,17 @@ Class Name:                Display
     }
 
     #[test]
-    fn default_bench_results_dir_joins_the_data_dir_bench_subdir() {
+    fn default_bench_results_dir_matches_app_paths_data_dir() {
         // EAI-7361: the Bench panel stayed permanently empty because this
         // default was `None` — the daemon never tailed any file for
         // normalized CSV rows unless the user hand-edited the config, even
-        // after running `rocm bench load`. Must match `default_data_dir()`
-        // and the same `<data_dir>/bench/results.csv` file `rocm bench load`
-        // appends to by default (see `apps/rocm/src/dash.rs::run_bench`).
-        if let Some(data_dir) = default_data_dir() {
-            let expected = data_dir.join("bench").join("results.csv");
+        // after running `rocm bench load`. It must resolve to the SAME
+        // `<data_dir>/bench/results.csv` file `rocm bench load` appends to by
+        // default, using the same `AppPaths::discover()` resolution (which
+        // honors `ROCM_CLI_DATA_DIR` and host normalization) rather than the
+        // bare `default_data_dir()` — see `apps/rocm/src/dash.rs::run_bench`.
+        if let Ok(paths) = AppPaths::discover() {
+            let expected = paths.data_dir.join("bench").join("results.csv");
             assert_eq!(default_bench_results_dir(), Some(expected.clone()));
             assert_eq!(
                 DashboardDaemonConfig::default().bench_results_dir,

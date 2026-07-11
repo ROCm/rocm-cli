@@ -614,6 +614,26 @@ mod tests {
     }
 
     #[test]
+    fn producer_and_daemon_bench_defaults_resolve_to_the_same_path() {
+        // EAI-7361 cross-binary invariant: the producer default (`rocm bench
+        // load`'s no-`--out` path, resolved from `AppPaths::discover`) and the
+        // daemon-tailed default (`DashboardDaemonConfig::bench_results_dir`)
+        // MUST resolve to the same absolute path — both use the same
+        // `AppPaths::discover` data-dir resolution (honoring
+        // `ROCM_CLI_DATA_DIR` and host normalization), so a plain CLI run is
+        // always what the daemon tails. Guard on `discover()` succeeding
+        // ($HOME is set in CI/dev); skip rather than assert an uncontrolled
+        // value otherwise.
+        if let Ok(p) = AppPaths::discover() {
+            assert_eq!(
+                Some(default_bench_csv_path(&p)),
+                rocm_core::DashboardDaemonConfig::default().bench_results_dir,
+                "producer default and daemon-tailed default must be identical"
+            );
+        }
+    }
+
+    #[test]
     fn bootstrap_routes_to_focused_setup() {
         // `rocm bootstrap setup` must route to the same focused Setup host as the
         // launcher's "Set up this system" row (onboarding, no daemon/tab shell).
