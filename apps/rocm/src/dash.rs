@@ -332,11 +332,19 @@ pub struct BenchLoadArgs {
     pub auto_ramp: bool,
 }
 
+/// Default `--out` path for `rocm bench load`: the same file the telemetry
+/// daemon tails by default (`DashboardDaemonConfig::bench_results_dir`), so a
+/// plain CLI run populates the dashboard's Bench panel without any config
+/// edits. Extracted as a pure function of `AppPaths` for testability.
+fn default_bench_csv_path(paths: &AppPaths) -> std::path::PathBuf {
+    paths.data_dir.join("bench").join("results.csv")
+}
+
 /// Entry point for `rocm bench load`.
 ///
 /// Runs a concurrency sweep against a local http:// endpoint and appends one
-/// aggregate CSV row per concurrency level. Output goes to a self-labeled file
-/// in `~/.rocm/bench/` unless `--out` is specified explicitly.
+/// aggregate CSV row per concurrency level. Output defaults to the daemon's
+/// tailed `<data_dir>/bench/results.csv` unless `--out` is specified explicitly.
 pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
     use rocm_dash_daemon::bench_load::{LoadSpec, run_and_append_csv, run_auto_ramp};
 
@@ -374,19 +382,22 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
         })?
     };
 
-    // Resolve the output path: distinct self-labeled file, not the shared bench_results_dir.
+    // Resolve the output path: default to the same `<data_dir>/bench/results.csv`
+    // file the daemon tails by default (`DashboardDaemonConfig::bench_results_dir`,
+    // rocm-core/src/lib.rs), so a plain `rocm bench load` run — no config edits,
+    // no explicit --out — shows up in the dashboard's Bench panel. Rows are
+    // appended (see `run_and_append_csv` / `run_auto_ramp` below), matching the
+    // "tail" semantics the daemon's `CsvBenchTailer` expects.
     let csv_path = if let Some(p) = out {
         p
     } else {
         let paths = AppPaths::discover()?;
-        let bench_dir = paths.data_dir.join("bench");
-        std::fs::create_dir_all(&bench_dir)
-            .with_context(|| format!("creating bench output dir {}", bench_dir.display()))?;
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        bench_dir.join(format!("rocm-bench-{ts}.csv"))
+        let default_path = default_bench_csv_path(&paths);
+        if let Some(parent) = default_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating bench output dir {}", parent.display()))?;
+        }
+        default_path
     };
 
     let spec = LoadSpec {
@@ -587,6 +598,19 @@ mod tests {
         assert_eq!(opts.services_dir, Some(p.services_dir()));
         assert_eq!(opts.persist_dir, Some(p.telemetry_state_dir()));
         assert!(!opts.enable_docker);
+    }
+
+    #[test]
+    fn default_bench_csv_path_matches_the_daemon_tailed_default() {
+        // EAI-7361: `rocm bench load` with no `--out` must land in the exact
+        // same file the daemon tails by default
+        // (`DashboardDaemonConfig::bench_results_dir`, rocm-core/src/lib.rs),
+        // or a plain CLI run never shows up in the dashboard's Bench panel.
+        let p = paths();
+        assert_eq!(
+            default_bench_csv_path(&p),
+            p.data_dir.join("bench").join("results.csv")
+        );
     }
 
     #[test]

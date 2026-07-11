@@ -25,7 +25,7 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     if state.bench_rows.is_empty() {
         let inner = panel::bento(f, area, Some("Bench"), BoxRole::Neutral, false, theme);
         let p = Paragraph::new(Line::from(Span::styled(
-            "no rows · run `rocm bench load --endpoint <url>` or start the daemon with --bench-csv <path> · press b to run a sweep",
+            "no rows · run `rocm bench load --endpoint <url>` to populate the daemon-tailed bench directory · press b to run a sweep",
             Style::default().fg(theme.muted),
         )));
         f.render_widget(p, inner);

@@ -455,7 +455,8 @@ enum BenchCommand {
         /// Requests per concurrency cell
         #[arg(long, default_value_t = 128)]
         requests: u32,
-        /// Output CSV file (default: ~/.rocm/bench/rocm-bench-<timestamp>.csv)
+        /// Output CSV file (default: ~/.rocm/data/bench/results.csv, the
+        /// daemon-tailed path that populates the dashboard's Bench panel)
         #[arg(long, value_name = "FILE")]
         out: Option<PathBuf>,
         /// Ramp concurrency automatically (1,2,4,8,16,32,64,128), stopping at saturation.

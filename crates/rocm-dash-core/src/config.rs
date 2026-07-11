@@ -98,7 +98,8 @@ pub struct DaemonConfig {
     pub discovery_tick: Duration,
     #[serde(with = "duration_secs")]
     pub instance_tick: Duration,
-    /// Watch this directory for new normalized CSVs.
+    /// Tail this single CSV file for new normalized benchmark rows (despite
+    /// the field name, `CsvBenchTailer` opens it as one file, not a directory).
     pub bench_results_dir: Option<PathBuf>,
 }
 
@@ -179,6 +180,30 @@ fn socket_path(
         })
 }
 
+/// Default CSV file the standalone `rocm-dash` daemon tails for normalized
+/// benchmark rows: `$HOME/.rocm/data/bench/results.csv`, mirroring
+/// `default_socket`'s own `$HOME/.rocm/data/...` root so a bench run under
+/// the unified `rocm` binary (which appends to this same file by default) is
+/// picked up here too. Falls back to `None` when `$HOME` is unset, same as
+/// `default_socket`'s final tier degrading to a temp-dir socket rather than a
+/// data-dir path.
+fn default_bench_results_dir() -> Option<PathBuf> {
+    bench_results_dir_from_home(std::env::var_os("HOME"))
+}
+
+/// Pure core of [`default_bench_results_dir`]: resolve the tailed bench CSV
+/// path from an explicit `$HOME` input so the behavior is testable without
+/// mutating process-global env vars (unsafe and racy under parallel tests).
+fn bench_results_dir_from_home(home: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    home.filter(|v| !v.is_empty()).map(|home| {
+        PathBuf::from(home)
+            .join(".rocm")
+            .join("data")
+            .join("bench")
+            .join("results.csv")
+    })
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -187,7 +212,7 @@ impl Default for DaemonConfig {
             gpu_tick: Duration::from_secs(1),
             discovery_tick: Duration::from_secs(5),
             instance_tick: Duration::from_secs(2),
-            bench_results_dir: None,
+            bench_results_dir: default_bench_results_dir(),
         }
     }
 }
@@ -483,5 +508,38 @@ theme = "default-dark"
         // A bare empty user name (as opposed to unset) also falls back to "user".
         let path = socket_path(None, None, Some(String::new()), PathBuf::from("/tmp"));
         assert_eq!(path, PathBuf::from("/tmp/rocm-user/rocmdashd.sock"));
+    }
+
+    #[test]
+    fn bench_results_dir_from_home_joins_the_data_dir_bench_subdir() {
+        // EAI-7361: the Bench panel stayed permanently empty because this
+        // default was `None` — the daemon never tailed any file unless the
+        // user hand-edited a config file, even after running `rocm bench
+        // load`. Must match the same `<data_dir>/bench/results.csv` file
+        // `rocm bench load` itself appends to by default.
+        let dir = bench_results_dir_from_home(Some("/home/alice".into()));
+        assert_eq!(
+            dir,
+            Some(PathBuf::from("/home/alice/.rocm/data/bench/results.csv"))
+        );
+    }
+
+    #[test]
+    fn bench_results_dir_from_home_is_none_when_home_unset_or_empty() {
+        assert_eq!(bench_results_dir_from_home(None), None);
+        assert_eq!(
+            bench_results_dir_from_home(Some(String::new().into())),
+            None
+        );
+    }
+
+    #[test]
+    fn daemon_config_default_populates_bench_results_dir_when_home_is_set() {
+        // Only meaningful where $HOME is actually set (true in this repo's CI
+        // and dev environments); skip rather than assert a specific value we
+        // don't control.
+        if std::env::var_os("HOME").is_some_and(|h| !h.is_empty()) {
+            assert!(DaemonConfig::default().bench_results_dir.is_some());
+        }
     }
 }

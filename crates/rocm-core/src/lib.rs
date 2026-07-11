@@ -3926,6 +3926,19 @@ const fn default_instance_tick_secs() -> f64 {
     2.0
 }
 
+/// Default CSV file the telemetry daemon tails for normalized benchmark rows:
+/// `<data_dir>/bench/results.csv`. Despite the field's `_dir` name this is a
+/// single file (`CsvBenchTailer` opens it directly), and `rocm bench load`
+/// appends to this exact path by default when `--out` is omitted (see
+/// `apps/rocm/src/dash.rs::run_bench`), so a plain CLI run — with no config
+/// edits — is picked up by the daemon and shows up in the dashboard's Bench
+/// panel. Falls back to `None` only if the data directory itself can't be
+/// determined (no `$HOME`, no OS project-dirs fallback), matching
+/// `default_data_dir`'s own failure mode.
+fn default_bench_results_dir() -> Option<PathBuf> {
+    default_data_dir().map(|dir| dir.join("bench").join("results.csv"))
+}
+
 /// Telemetry daemon operational spec. Tick cadences are stored as f64 seconds in
 /// the unified JSON config; use the `*_tick()` accessors for `Duration`s.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -3943,7 +3956,10 @@ pub struct DashboardDaemonConfig {
     #[serde(default = "default_instance_tick_secs")]
     pub instance_tick_secs: f64,
     /// Watch this file for new normalized benchmark CSV rows.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default = "default_bench_results_dir",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub bench_results_dir: Option<PathBuf>,
 }
 
@@ -3955,7 +3971,7 @@ impl Default for DashboardDaemonConfig {
             gpu_tick_secs: default_gpu_tick_secs(),
             discovery_tick_secs: default_discovery_tick_secs(),
             instance_tick_secs: default_instance_tick_secs(),
-            bench_results_dir: None,
+            bench_results_dir: default_bench_results_dir(),
         }
     }
 }
@@ -7968,6 +7984,24 @@ Class Name:                Display
         assert_eq!(d.gpu_tick(), Duration::from_secs_f64(0.5));
         assert_eq!(d.discovery_tick(), Duration::from_secs(10));
         assert_eq!(d.instance_tick(), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn default_bench_results_dir_joins_the_data_dir_bench_subdir() {
+        // EAI-7361: the Bench panel stayed permanently empty because this
+        // default was `None` — the daemon never tailed any file for
+        // normalized CSV rows unless the user hand-edited the config, even
+        // after running `rocm bench load`. Must match `default_data_dir()`
+        // and the same `<data_dir>/bench/results.csv` file `rocm bench load`
+        // appends to by default (see `apps/rocm/src/dash.rs::run_bench`).
+        if let Some(data_dir) = default_data_dir() {
+            let expected = data_dir.join("bench").join("results.csv");
+            assert_eq!(default_bench_results_dir(), Some(expected.clone()));
+            assert_eq!(
+                DashboardDaemonConfig::default().bench_results_dir,
+                Some(expected)
+            );
+        }
     }
 
     #[test]
