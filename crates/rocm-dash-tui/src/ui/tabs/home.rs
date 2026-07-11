@@ -19,8 +19,6 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use rocm_dash_core::metrics::InstanceStatus;
-
 use crate::app::{AppState, ConnState};
 use crate::ui::format;
 use crate::ui::gradient::GradientGauge;
@@ -171,7 +169,7 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     for inst in state
         .instances
         .values()
-        .filter(|i| i.status == InstanceStatus::Running)
+        .filter(|i| i.status.is_serving())
         .take(feed.height as usize)
     {
         let port = inst.port.map_or_else(String::new, |p| format!(" on :{p}"));
@@ -350,7 +348,7 @@ fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let n_running = state
         .instances
         .values()
-        .filter(|i| i.status == InstanceStatus::Running)
+        .filter(|i| i.status.is_serving())
         .count();
     let running = card(
         f,
@@ -363,7 +361,7 @@ fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         let line = state
             .instances
             .values()
-            .find(|i| i.status == InstanceStatus::Running)
+            .find(|i| i.status.is_serving())
             .map_or_else(
                 || {
                     Line::from(Span::styled(

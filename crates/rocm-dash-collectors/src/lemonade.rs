@@ -117,6 +117,11 @@ pub fn lemonade_container_id(host: &str, port: u16) -> String {
 
 /// PURE: build a `DiscoveredService` for a Lemonade endpoint. Lemonade is a
 /// single local server (no tensor-parallel sharding metadata), so TP = 1.
+///
+/// Every call site only constructs this after `/api/v1/health` has already
+/// answered (see `LemonadeCollector::discover`), so a successfully-built
+/// service is by definition reachable and serving — mark it `Ready` rather
+/// than the generic `Running`.
 pub fn lemonade_service(host: &str, port: u16, model_name: &str) -> DiscoveredService {
     DiscoveredService {
         container_id: lemonade_container_id(host, port),
@@ -128,6 +133,7 @@ pub fn lemonade_service(host: &str, port: u16, model_name: &str) -> DiscoveredSe
         },
         port: Some(port),
         tensor_parallel_size: 1,
+        status: rocm_dash_core::metrics::InstanceStatus::Ready,
         ..Default::default()
     }
 }
@@ -139,9 +145,7 @@ pub fn lemonade_service(host: &str, port: u16, model_name: &str) -> DiscoveredSe
 pub fn lemonade_instance(host: &str, port: u16, model_name: &str, stats_body: &str) -> Instance {
     let svc = lemonade_service(host, port, model_name);
     let sample = parse_stats(stats_body);
-    let mut inst = merge_instance(&svc, &sample, 0, 0);
-    inst.status = rocm_dash_core::metrics::InstanceStatus::Running;
-    inst
+    merge_instance(&svc, &sample, 0, 0)
 }
 
 /// Async scrape of a local Lemonade endpoint. Network/parse failure degrades to
@@ -298,10 +302,7 @@ mod tests {
         assert_eq!(inst.container_id, "lemonade-127.0.0.1-13305");
         assert_eq!(inst.port, Some(13305));
         assert_eq!(inst.gen_tps, Some(33.33));
-        assert_eq!(
-            inst.status,
-            rocm_dash_core::metrics::InstanceStatus::Running
-        );
+        assert_eq!(inst.status, rocm_dash_core::metrics::InstanceStatus::Ready);
         // Lemonade exposes no KV/req metrics → those stay None on the Instance.
         assert_eq!(inst.kv_cache_usage_pct, None);
         assert_eq!(inst.running_reqs, None);

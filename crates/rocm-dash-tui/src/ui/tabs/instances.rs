@@ -301,6 +301,7 @@ const fn status_meta(
 ) -> (ratatui::style::Color, &'static str) {
     match status {
         InstanceStatus::Running => (theme.ok, "RUNNING"),
+        InstanceStatus::Ready => (theme.ok, "READY"),
         InstanceStatus::Starting => (theme.warn, "STARTING"),
         InstanceStatus::Stopped => (theme.err, "STOPPED"),
         InstanceStatus::Error => (theme.err, "ERROR"),
@@ -312,7 +313,7 @@ const fn status_meta(
 /// health-driven border color.
 const fn status_role(status: InstanceStatus) -> BoxRole {
     match status {
-        InstanceStatus::Running => BoxRole::Success,
+        InstanceStatus::Running | InstanceStatus::Ready => BoxRole::Success,
         InstanceStatus::Starting => BoxRole::Warning,
         InstanceStatus::Stopped | InstanceStatus::Error => BoxRole::Danger,
         InstanceStatus::Unknown => BoxRole::Muted,

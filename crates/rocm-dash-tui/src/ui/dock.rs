@@ -16,6 +16,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+#[cfg(test)]
 use rocm_dash_core::metrics::InstanceStatus;
 use rocm_dash_core::state::JobStatus;
 
@@ -202,7 +203,7 @@ pub fn context_rail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
     let running: Vec<_> = state
         .instances
         .values()
-        .filter(|i| i.status == InstanceStatus::Running)
+        .filter(|i| i.status.is_serving())
         .collect();
     if running.is_empty() {
         lines.push(Line::from(Span::styled(
