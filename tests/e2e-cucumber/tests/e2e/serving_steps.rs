@@ -67,6 +67,14 @@ async fn wait_for_model(models_url: &str, expect_model: Option<&str>, timeout_se
 /// the job times out.
 const SERVE_PORT: u16 = 11435;
 
+/// The port the CLI's built-in local assistant (lemonade Qwen3-4B) listens on.
+/// The CLI auto-starts this assistant independently of any scenario; on Instinct
+/// it falls back to a Vulkan llama-server that pins a GPU core (EAI-7052),
+/// starving the vLLM serves the scenarios actually test until they exceed the
+/// job timeout. No scenario needs the built-in assistant, so we free this port
+/// too before serving.
+const ASSISTANT_PORT: u16 = 8001;
+
 /// Best-effort: ensure the shared serve port is free before starting a new
 /// serve, so a leaked server from a prior scenario can't linger on the GPU.
 /// Polls until nothing answers on the port (bounded), killing any listener.
@@ -78,7 +86,10 @@ async fn ensure_serve_port_free() {
     // 0.80), and the collision crashes a server → the next chat POST fails with
     // "error sending request". Killing by port (fuser/lsof) catches the starting
     // server too. Best-effort; then wait for the socket to actually close.
+    // Also kill the CLI's auto-started lemonade assistant — it hogs a GPU core on
+    // Vulkan (EAI-7052) and starves the vLLM serve under test; no scenario needs it.
     kill_listeners_on_port(SERVE_PORT);
+    kill_listeners_on_port(ASSISTANT_PORT);
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         // TcpStream connect succeeds only while something holds the port.
@@ -89,6 +100,7 @@ async fn ensure_serve_port_free() {
             return;
         }
         kill_listeners_on_port(SERVE_PORT);
+        kill_listeners_on_port(ASSISTANT_PORT);
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
