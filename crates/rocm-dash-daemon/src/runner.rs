@@ -42,11 +42,13 @@ pub struct RunnerOptions {
     pub gpu_tick: Duration,
     pub discovery_tick: Duration,
     pub instance_tick: Duration,
-    /// Disable the per-instance vLLM Prometheus scrape. Independent of
-    /// `enable_docker`: the scraper is a plain HTTP GET against a vLLM
-    /// instance's `/metrics` endpoint and runs for BOTH Docker-discovered and
-    /// managed (native, `services_dir`-discovered) instances. `false` (the
-    /// default) means the scrape runs.
+    /// Internal gate for the per-instance vLLM Prometheus scrape. Currently
+    /// always `false` (the scrape runs) — it is NOT yet wired to a CLI flag or
+    /// config field, so callers cannot turn it off today; it exists as the
+    /// single seam a future opt-out would flip. Independent of `enable_docker`:
+    /// the scraper is a plain HTTP GET against a vLLM instance's `/metrics`
+    /// endpoint and runs for BOTH Docker-discovered and managed (native,
+    /// `services_dir`-discovered) instances.
     pub disable_vllm_metrics: bool,
     /// Hostname to scrape; `127.0.0.1` for the typical co-located daemon.
     pub vllm_metrics_host: String,
@@ -853,10 +855,15 @@ mod tests {
     }
 
     /// EAI-7359 regression: vLLM Prometheus scraping must be constructed
-    /// regardless of `enable_docker` — only `disable_vllm_metrics` may turn
-    /// it off. Before the fix this was `enable_docker && !disable_vllm_metrics`,
-    /// which permanently killed the scraper for the embedded daemon (always
-    /// launched with `enable_docker = false`).
+    /// regardless of `enable_docker`. Before the fix this was
+    /// `enable_docker && !disable_vllm_metrics`, which permanently killed the
+    /// scraper for the embedded daemon (always launched with
+    /// `enable_docker = false`).
+    ///
+    /// The `disable_vllm_metrics = true` cases below exercise the internal
+    /// gate directly; it is not currently user-reachable (no CLI flag / config
+    /// field sets it), so this asserts the gate's logic, not a shipped
+    /// off-switch.
     #[test]
     fn vllm_metrics_enabled_is_independent_of_docker() {
         let mut opts = RunnerOptions {
@@ -875,16 +882,18 @@ mod tests {
             "Docker enabled must still scrape"
         );
 
+        // Internal gate (not user-reachable today): flipping it off must win
+        // over any Docker state.
         opts.disable_vllm_metrics = true;
         assert!(
             !vllm_metrics_enabled(&opts),
-            "explicit disable must always win"
+            "internal disable gate must always win"
         );
 
         opts.enable_docker = false;
         assert!(
             !vllm_metrics_enabled(&opts),
-            "explicit disable must always win regardless of docker"
+            "internal disable gate must always win regardless of docker"
         );
     }
 

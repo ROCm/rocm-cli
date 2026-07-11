@@ -462,7 +462,9 @@ mod tests {
     /// Prometheus scraper must NOT be gated on `enable_docker` — otherwise it
     /// is permanently dead in the common no-Docker / managed-vLLM case even
     /// though `vllm_prom.rs` has zero Docker dependency (plain HTTP GET).
-    /// `disable_vllm_metrics` is the only knob that should turn it off.
+    /// The scrape stays on by default; `disable_vllm_metrics` is the internal
+    /// gate that would turn it off, but it is not currently wired to any CLI
+    /// flag or config field, so today it is always `false`.
     #[test]
     fn runner_options_keeps_vllm_metrics_enabled_without_docker() {
         let p = paths();
