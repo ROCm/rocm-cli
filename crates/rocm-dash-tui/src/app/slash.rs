@@ -470,6 +470,27 @@ impl AppState {
                     }
                 },
             },
+            // `/detect [accept|save|dismiss]` (EAI-7354): re-run local-engine
+            // detection mid-session without colliding with focused text entry
+            // (a bare `d` keypress while chat is focused is ordinary chat text,
+            // and the pre-accept `'d'` gate key only exists before
+            // `ChatConsent::Accepted`). A bare `/detect` raises the probe; the
+            // result is echoed into the transcript (see `set_detect_result`)
+            // with these same sub-commands to act on it. `accept`/`save` route
+            // through the same reducer methods the pre-accept offer buttons
+            // use, so a re-detect+accept mid-session raises the
+            // `chat_endpoint_rebuild` edge exactly like the initial accept.
+            "detect" => match rest.split_whitespace().nth(1) {
+                None => self.request_detect(),
+                Some("accept") => self.accept_detect_offer(),
+                Some("save") => self.save_detect_offer(),
+                Some("dismiss") => self.dismiss_detect_offer(),
+                Some(other) => {
+                    self.chat.push(ChatTurn::error(format!(
+                        "unknown /detect action `{other}` (try accept, save, dismiss, or bare /detect to probe)"
+                    )));
+                }
+            },
             // `/chat [prompt]`: with a prompt, send it to the agent (passthrough,
             // exactly as a plain line would); bare `/chat` focuses the Chat tab.
             "chat" => {
