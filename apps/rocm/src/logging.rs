@@ -22,8 +22,11 @@ use tracing_subscriber::EnvFilter;
 /// `rocmdashd.log` under the same canonical `AppPaths` root.
 const LOG_FILE_PREFIX: &str = "rocm-cli.log";
 
-/// Number of rotated daily log files retained; older ones are pruned on
-/// startup so a long-lived install never grows the logs directory unbounded.
+/// Total number of daily log files retained on disk, INCLUDING today's
+/// actively-written file; older ones are pruned on startup so a long-lived
+/// install never grows the logs directory unbounded. Pruning runs *after* the
+/// appender opens today's file (see [`init`]), so this is the true on-disk
+/// bound — a week of history.
 const MAX_RETAINED_LOGS: usize = 7;
 
 /// Default filter applied when `RUST_LOG` is unset: `info` for our own
@@ -43,9 +46,13 @@ const DEFAULT_FILTER: &str = "warn,rocm=info,rocm_dash_tui=info,rocm_dash_daemon
 pub fn init(paths: &AppPaths) -> Option<WorkerGuard> {
     let log_dir = paths.client_log_dir();
     std::fs::create_dir_all(&log_dir).ok()?;
-    prune_old_logs(&log_dir);
 
+    // Construct the appender first: `rolling::daily` opens today's file eagerly
+    // at construction time. Prune AFTER that so today's active file is counted
+    // in the retention window — otherwise the effective on-disk bound would be
+    // MAX_RETAINED_LOGS + 1 (the pruned set plus the freshly-opened file).
     let file_appender = tracing_appender::rolling::daily(&log_dir, LOG_FILE_PREFIX);
+    prune_old_logs(&log_dir);
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     let filter =
@@ -96,17 +103,14 @@ mod tests {
     use super::*;
 
     fn temp_paths(name: &str) -> (std::path::PathBuf, AppPaths) {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join(".rocm-work")
-            .join("tests")
-            .join("logging")
-            .join(format!(
-                "{name}-{}-{}",
-                std::process::id(),
-                rocm_core::unix_time_millis()
-            ));
+        // Use the OS temp dir (not the repo tree) so tests never litter the
+        // working copy. Name-scoped with pid + millis to stay unique across
+        // parallel test threads and repeated runs.
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-logging-test-{name}-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         (
             root.clone(),
@@ -185,6 +189,40 @@ mod tests {
 
         let remaining = std::fs::read_dir(&log_dir).unwrap().count();
         assert_eq!(remaining, MAX_RETAINED_LOGS);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_ordering_bounds_total_including_todays_active_file() {
+        // Regression for the off-by-one: `init` opens today's file BEFORE
+        // pruning, so pruning must count that active file within the retention
+        // window. Pre-seed exactly MAX_RETAINED_LOGS dated files, then mirror
+        // `init`'s ordering (open the daily appender, then prune) without
+        // installing a global subscriber. The total on disk must stay at
+        // MAX_RETAINED_LOGS — not MAX_RETAINED_LOGS + 1.
+        let (root, paths) = temp_paths("prune-ordering");
+        let log_dir = paths.client_log_dir();
+        std::fs::create_dir_all(&log_dir).unwrap();
+        for day in 1..=MAX_RETAINED_LOGS {
+            std::fs::write(
+                log_dir.join(format!("{LOG_FILE_PREFIX}.2020-01-{day:02}")),
+                b"old\n",
+            )
+            .unwrap();
+        }
+
+        // Opens today's file eagerly (dated far after the 2020 seeds, so it
+        // sorts newest and is never the one pruned).
+        let appender = tracing_appender::rolling::daily(&log_dir, LOG_FILE_PREFIX);
+        prune_old_logs(&log_dir);
+        drop(appender);
+
+        let remaining = std::fs::read_dir(&log_dir).unwrap().count();
+        assert_eq!(
+            remaining, MAX_RETAINED_LOGS,
+            "today's active file must count toward the retention bound"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
