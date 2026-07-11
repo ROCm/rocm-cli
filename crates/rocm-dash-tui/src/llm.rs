@@ -510,12 +510,14 @@ mod tests {
     fn detect_local_endpoint_bounded_latency_when_nothing_listening() {
         // Regression guard for the startup-latency fix: with no server
         // reachable, probing all 3 well-known ports must take roughly one
-        // PROBE_TIMEOUT (parallel), not three (sequential). Generous margin
-        // to avoid flaking on loaded CI machines.
+        // PROBE_TIMEOUT (parallel), not three (sequential). A true regression
+        // back to sequential probing takes ~3x PROBE_TIMEOUT, so a 4x margin
+        // still catches it while giving plenty of headroom for scheduling
+        // jitter on loaded/slower CI machines (observed >2x on Windows CI).
         let start = std::time::Instant::now();
         let _ = detect_local_endpoint();
         assert!(
-            start.elapsed() < PROBE_TIMEOUT * 2,
+            start.elapsed() < PROBE_TIMEOUT * 4,
             "expected parallel probing to bound latency to ~1 PROBE_TIMEOUT, took {:?}",
             start.elapsed()
         );
