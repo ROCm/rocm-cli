@@ -38,10 +38,7 @@ mod chat;
 mod slash;
 mod summary;
 
-use chat::{
-    build_chat_agent, build_local_agent, detect_local_chat, detect_managed_chat,
-    persist_chat_endpoint,
-};
+use chat::{build_chat_agent, build_local_agent, detect_local_chat, persist_chat_endpoint};
 use summary::{parse_plan_result, summarize_json_value, summarize_slash_tool};
 
 /// Which single flow a *focused host* runs.
@@ -1562,8 +1559,22 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         // NOT override an explicitly configured `chat_url`/env URL, so config
         // precedence is preserved (we only consult the registry when neither is
         // set, i.e. where the well-known default would otherwise be probed).
-        let managed = if args.chat_url.is_none() && args.chat_env_url.is_none() {
-            detect_managed_chat(state.tool_executor.clone()).await
+        // When neither an explicit URL (CLI/config) nor an env URL is set, run
+        // the SAME full local-engine detection the manual 'd' path uses:
+        // registry-first (an engine we launched ourselves, on whatever port it
+        // bound), then a probe of the well-known Lemonade/vLLM/rocm-serve
+        // ports (parallelized — see `llm::detect_local_endpoint` — so a cold
+        // start with no server doesn't pay 3x the probe timeout), plus a
+        // best-effort served-model fetch. This is what lets a local server win
+        // over the ChatGPT cloud default at startup instead of only the single
+        // well-known :8000 port that a bare `resolve_llm_config` probe covers.
+        //
+        // NOTE: unmerged PR #97 also touches this branch (model discovery when
+        // `chat_model` is None, inside `resolve_llm_config`'s own fallback
+        // path) — this change is conflict-minimal by leaving the
+        // `resolve_llm_config` call below untouched.
+        let detected = if args.chat_url.is_none() && args.chat_env_url.is_none() {
+            detect_local_chat(state.tool_executor.clone()).await
         } else {
             None
         };
@@ -1572,8 +1583,9 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             .clone()
             .or_else(|| args.chat_env_url.clone())
             .unwrap_or_else(|| crate::llm::DEFAULT_CHAT_BASE_URL.to_string());
-        // A managed endpoint is already readiness-verified; otherwise TCP-probe.
-        let probe_ok = if managed.is_some() {
+        // A detected endpoint (managed or probed) is already verified;
+        // otherwise TCP-probe the single explicitly configured URL.
+        let probe_ok = if detected.is_some() {
             true
         } else {
             tokio::task::spawn_blocking(move || {
@@ -1582,7 +1594,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             .await
             .unwrap_or(false)
         };
-        let llm = managed.or_else(|| {
+        let llm = detected.or_else(|| {
             crate::llm::resolve_llm_config(
                 args.chat_url.as_deref(),
                 args.chat_model.as_deref(),

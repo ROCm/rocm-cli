@@ -408,4 +408,24 @@ mod tests {
         let env = services_envelope(serde_json::json!([service("vllm", "", "ready", "m", 100)]));
         assert_eq!(pick_managed_chat_endpoint(&env), None);
     }
+
+    /// EAI-7347: startup now reuses `detect_local_chat` (the same detection the
+    /// manual 'd' path already used) instead of a single well-known-port probe,
+    /// so a local server on a non-default well-known port (e.g. `rocm serve`'s
+    /// :11435) is preferred over falling back to the ChatGPT cloud default.
+    #[tokio::test]
+    async fn detect_local_chat_prefers_local_server_over_no_endpoint() {
+        let Ok(listener) =
+            std::net::TcpListener::bind(("127.0.0.1", crate::skills::ROCM_SERVE_PORT))
+        else {
+            return; // Port already bound in this environment; skip rather than flake.
+        };
+        // No executor (no managed-services registry available) — falls through
+        // to the well-known-port probe, which must still find the listener.
+        let cfg = detect_local_chat(None)
+            .await
+            .expect("local server detected");
+        assert_eq!(cfg.base_url, crate::skills::ROCM_SERVE_ENDPOINT);
+        drop(listener);
+    }
 }
