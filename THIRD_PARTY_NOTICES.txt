@@ -1725,7 +1725,6 @@ Apache License 2.0
 
 The following component(s) are licensed under Apache License 2.0:
   - rustls-platform-verifier 0.7.0 <https://github.com/rustls/rustls-platform-verifier>
-  - ureq 2.12.1 <https://github.com/algesten/ureq>
 
                                  Apache License
                            Version 2.0, January 2004
@@ -5552,6 +5551,7 @@ The following component(s) are licensed under Apache License 2.0:
   - core-foundation 0.10.1 <https://github.com/servo/core-foundation-rs>
   - core-foundation 0.9.4 <https://github.com/servo/core-foundation-rs>
   - critical-section 1.2.0 <https://github.com/rust-embedded/critical-section>
+  - crossbeam-channel 0.5.16 <https://github.com/crossbeam-rs/crossbeam>
   - crossbeam-utils 0.8.21 <https://github.com/crossbeam-rs/crossbeam>
   - displaydoc 0.2.6 <https://github.com/yaahc/displaydoc>
   - either 1.16.0 <https://github.com/rayon-rs/either>
@@ -5631,6 +5631,7 @@ The following component(s) are licensed under Apache License 2.0:
   - smallvec 1.15.2 <https://github.com/servo/rust-smallvec>
   - socket2 0.6.4 <https://github.com/rust-lang/socket2>
   - stable_deref_trait 1.2.1 <https://github.com/storyyeller/stable_deref_trait>
+  - symlink 0.1.0 <https://gitlab.com/chris-morgan/symlink>
   - system-configuration-sys 0.6.0 <https://github.com/mullvad/system-configuration-rs>
   - system-configuration 0.7.0 <https://github.com/mullvad/system-configuration-rs>
   - tar 0.4.46 <https://github.com/composefs/tar-rs>
@@ -5642,6 +5643,7 @@ The following component(s) are licensed under Apache License 2.0:
   - unicode-truncate 2.0.1 <https://github.com/Aetf/unicode-truncate>
   - unicode-width 0.1.14 <https://github.com/unicode-rs/unicode-width>
   - unicode-width 0.2.0 <https://github.com/unicode-rs/unicode-width>
+  - ureq 2.12.1 <https://github.com/algesten/ureq>
   - url 2.5.8 <https://github.com/servo/rust-url>
   - uuid 1.23.3 <https://github.com/uuid-rs/uuid>
   - wasi 0.11.1+wasi-snapshot-preview1 <https://github.com/bytecodealliance/wasi>
@@ -8885,6 +8887,7 @@ MIT License
 ================================================================================
 
 The following component(s) are licensed under MIT License:
+  - tracing-appender 0.2.5 <https://github.com/tokio-rs/tracing>
   - tracing-attributes 0.1.31 <https://github.com/tokio-rs/tracing>
   - tracing-core 0.1.36 <https://github.com/tokio-rs/tracing>
   - tracing-error 0.2.1 <https://github.com/tokio-rs/tracing>

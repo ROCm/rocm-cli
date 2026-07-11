@@ -11,7 +11,7 @@
 //! stdout/stderr — the TUI owns the raw-mode terminal, and a stray write
 //! there would corrupt the display.
 
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use rocm_core::AppPaths;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -44,8 +44,11 @@ const DEFAULT_FILTER: &str = "warn,rocm=info,rocm_dash_tui=info,rocm_dash_daemon
 /// already installed (e.g. a second call in the same process); either case
 /// degrades to no logging rather than a startup failure.
 pub fn init(paths: &AppPaths) -> Option<WorkerGuard> {
-    let log_dir = paths.client_log_dir();
-    std::fs::create_dir_all(&log_dir).ok()?;
+    // Validate the resolved directory before any filesystem write: the base
+    // path is derived from `$HOME` / `$ROCM_CLI_DATA_DIR` / config, so it must
+    // be confirmed to live inside the `AppPaths` root and be free of `..`
+    // traversal before it is handed to the appender or the pruner.
+    let log_dir = validated_log_dir(paths)?;
 
     // Construct the appender first: `rolling::daily` opens today's file eagerly
     // at construction time. Prune AFTER that so today's active file is counted
@@ -70,9 +73,45 @@ pub fn init(paths: &AppPaths) -> Option<WorkerGuard> {
         .map(|()| guard)
 }
 
+/// Resolve, create, and validate the client log directory, breaking the
+/// data-flow taint from `$HOME` / `$ROCM_CLI_DATA_DIR` / config into every
+/// filesystem operation below.
+///
+/// The directory is always `<data_dir>/logs`. We create it, then canonicalize
+/// both it and the `AppPaths` data-dir root and require the canonical log dir
+/// to stay nested under the canonical root — so a symlink or `..` in the
+/// resolved environment cannot redirect log writes outside `~/.rocm`. Returns
+/// the validated, canonicalized directory (all subsequent fs ops run on this
+/// value, not the raw env-derived path), or `None` — in which case [`init`]
+/// degrades to no logging rather than writing to an unexpected location.
+fn validated_log_dir(paths: &AppPaths) -> Option<PathBuf> {
+    let root = paths.data_dir.as_path();
+    let log_dir = paths.client_log_dir();
+    std::fs::create_dir_all(&log_dir).ok()?;
+
+    let canonical_root = std::fs::canonicalize(root).ok()?;
+    let canonical_log_dir = std::fs::canonicalize(&log_dir).ok()?;
+
+    // Reject any parent-dir traversal and require containment under the root.
+    // Both conditions are belt-and-suspenders after canonicalization (which
+    // already resolves `..` and symlinks) and act as the sanitizing barrier
+    // for the tainted base path.
+    let has_traversal = canonical_log_dir
+        .components()
+        .any(|c| matches!(c, Component::ParentDir));
+    if has_traversal || !canonical_log_dir.starts_with(&canonical_root) {
+        return None;
+    }
+
+    Some(canonical_log_dir)
+}
+
 /// Remove rotated log files beyond [`MAX_RETAINED_LOGS`], keeping the logs
 /// directory bounded for long-lived installs. Best-effort: any I/O error
 /// just leaves the file in place for a future run to retry.
+///
+/// `log_dir` must already have passed [`validated_log_dir`]; the caller only
+/// ever passes that validated, canonicalized path.
 fn prune_old_logs(log_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(log_dir) else {
         return;
@@ -102,11 +141,16 @@ fn prune_old_logs(log_dir: &Path) {
 mod tests {
     use super::*;
 
-    fn temp_paths(name: &str) -> (std::path::PathBuf, AppPaths) {
+    fn temp_paths(name: &str) -> (PathBuf, AppPaths) {
         // Use the OS temp dir (not the repo tree) so tests never litter the
-        // working copy. Name-scoped with pid + millis to stay unique across
-        // parallel test threads and repeated runs.
-        let root = std::env::temp_dir().join(format!(
+        // working copy. Canonicalize the base first so the fixture paths are
+        // derived from a resolved, symlink-free root (matches production's
+        // `validated_log_dir` barrier and keeps assertions stable where
+        // `$TMPDIR` is itself a symlink). Name-scoped with pid + millis to stay
+        // unique across parallel test threads and repeated runs.
+        let base = std::env::temp_dir();
+        let base = std::fs::canonicalize(&base).unwrap_or(base);
+        let root = base.join(format!(
             "rocm-cli-logging-test-{name}-{}-{}",
             std::process::id(),
             rocm_core::unix_time_millis()
