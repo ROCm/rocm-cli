@@ -16,7 +16,9 @@ async fn setup_gpu_machine(world: &mut E2eWorld) {
 }
 
 #[given("a machine with a ROCm install that was not set up by the CLI")]
-async fn setup_unmanaged_rocm(_world: &mut E2eWorld) {}
+async fn setup_unmanaged_rocm(world: &mut E2eWorld) {
+    world.plant_unmanaged_rocm();
+}
 
 #[when("the user asks for the version")]
 async fn user_asks_version(world: &mut E2eWorld) {

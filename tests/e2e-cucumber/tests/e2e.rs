@@ -43,6 +43,10 @@ pub struct E2eWorld {
     /// temp-dir lookup out of our source (avoids a CodeQL path-injection
     /// false positive on `env::temp_dir()`).
     pub isolated_root: Option<TempDir>,
+    /// When a scenario plants a fake pre-existing (non-CLI) ROCm install, this
+    /// holds its path; `isolate_cmd` then exports it as `ROCM_PATH` so `rocm
+    /// examine` detects unmanaged ROCm on any platform (see `plant_unmanaged_rocm`).
+    pub legacy_rocm_path: Option<PathBuf>,
 }
 
 /// A persistent directory shared across scenarios for heavy, immutable artifacts
@@ -89,6 +93,7 @@ impl Default for E2eWorld {
             cli_rc: None,
             current_scenario: None,
             isolated_root: Some(root),
+            legacy_rocm_path: None,
         }
     }
 }
@@ -111,6 +116,28 @@ impl E2eWorld {
             cmd.env("HF_HOME", shared.join("huggingface"));
             cmd.env("PIP_CACHE_DIR", shared.join("pip"));
         }
+        // A scenario that planted a fake pre-existing ROCm install points the
+        // CLI's legacy-ROCm probe at it via ROCM_PATH, so `rocm examine` detects
+        // "unmanaged ROCm" hermetically on any platform (see plant_unmanaged_rocm).
+        if let Some(path) = &self.legacy_rocm_path {
+            cmd.env("ROCM_PATH", path);
+        }
+    }
+
+    /// Plant a fake pre-existing (non-CLI) ROCm install in the scenario's isolated
+    /// tree and record its path so `isolate_cmd` exports it as `ROCM_PATH`. The
+    /// CLI's `detect_legacy_rocm_summary` treats any directory containing a known
+    /// marker (here `.info/version`) as an unmanaged ROCm install, so `rocm
+    /// examine` then reports it as pre-existing and suggests a managed install —
+    /// on every platform, instead of depending on an ambient system `/opt/rocm`
+    /// that exists on the MI300X box but not on the Strix Windows runner.
+    pub fn plant_unmanaged_rocm(&mut self) {
+        let root = self.isolated_root.as_ref().expect("no isolated root");
+        let rocm = root.path().join("legacy-rocm");
+        std::fs::create_dir_all(rocm.join(".info")).expect("failed to create legacy rocm dir");
+        std::fs::write(rocm.join(".info").join("version"), "6.0.0\n")
+            .expect("failed to write legacy rocm marker");
+        self.legacy_rocm_path = Some(rocm);
     }
 
     /// Register the running mock server with the CLI by writing a managed-service
