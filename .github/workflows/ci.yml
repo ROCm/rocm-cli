@@ -690,6 +690,22 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Reclaim the GPU before running: a serve leaked by a killed/timed-out prior
+      # run (its Drop teardown never executed) can keep an engine process spinning
+      # on the GPU (e.g. a lemonade Vulkan llama-server), starving this job's
+      # serves until it hits the timeout. Kill only e2e leftovers — scoped to
+      # /tmp/rocm-e2e-* and the e2e-target/e2e-shared trees — never the runner or
+      # any /workload manual-testing processes.
+      - name: Reclaim GPU from stray E2E processes
+        run: |
+          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
+          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
+          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
+          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
+          pkill -f 'e2e-target/release/rocm daemon' 2>/dev/null || true
+          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
+          echo "reclaimed"
+
       # cache: false — on this self-hosted runner we persist the build cache
       # ourselves via CARGO_TARGET_DIR (below). The action's built-in
       # Swatinem/rust-cache otherwise tries to SAVE the large target dir to
@@ -751,6 +767,17 @@ jobs:
       E2E_SERVE_TIMEOUT_SECS: "90"
     steps:
       - uses: actions/checkout@v6
+
+      # See e2e-gpu: reclaim the GPU from any leaked E2E serve before running.
+      - name: Reclaim GPU from stray E2E processes
+        run: |
+          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
+          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
+          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
+          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
+          pkill -f 'e2e-target/release/rocm daemon' 2>/dev/null || true
+          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
+          echo "reclaimed"
 
       # See e2e-gpu: cache: false because we persist the cache ourselves via
       # CARGO_TARGET_DIR; the action's rust-cache save/cleanup is slow and harmful
@@ -815,8 +842,17 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Prepare writable dirs on the nvme
-        run: mkdir -p /home/ubuntu/actions-runner/e2e-home /home/ubuntu/actions-runner/tmp /home/ubuntu/actions-runner/pip-cache
+      - name: Prepare writable dirs on the nvme + reclaim GPU from stray E2E procs
+        run: |
+          mkdir -p /home/ubuntu/actions-runner/e2e-home /home/ubuntu/actions-runner/tmp /home/ubuntu/actions-runner/pip-cache
+          # Reclaim the GPU from any serve leaked by a killed/timed-out prior run
+          # (see e2e-gpu). Scoped to e2e leftovers only.
+          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
+          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
+          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
+          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
+          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
+          echo "prepared + reclaimed"
 
       # Bootstrap rustup ourselves with --no-modify-path so it never writes to
       # $HOME/.profile (setup-rust-toolchain doesn't expose that flag).
@@ -877,8 +913,17 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Prepare writable dirs on the nvme
-        run: mkdir -p /home/ubuntu/actions-runner/e2e-home /home/ubuntu/actions-runner/tmp /home/ubuntu/actions-runner/pip-cache
+      - name: Prepare writable dirs on the nvme + reclaim GPU from stray E2E procs
+        run: |
+          mkdir -p /home/ubuntu/actions-runner/e2e-home /home/ubuntu/actions-runner/tmp /home/ubuntu/actions-runner/pip-cache
+          # Reclaim the GPU from any serve leaked by a killed/timed-out prior run
+          # (see e2e-gpu). Scoped to e2e leftovers only.
+          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
+          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
+          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
+          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
+          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
+          echo "prepared + reclaimed"
 
       # See e2e-gpu-strix-ubuntu: bootstrap rustup with --no-modify-path so it
       # never writes $HOME/.profile on the full root disk.
@@ -934,6 +979,16 @@ jobs:
       # a runner that doesn't already have the toolchain. Use `powershell`
       # (Windows PowerShell 5.1, always present) rather than `pwsh` (PowerShell 7),
       # which this self-hosted runner does not have installed.
+      # Reclaim the GPU from any E2E serve leaked by a killed/timed-out prior run
+      # (see e2e-gpu). PowerShell (5.1) equivalent; best-effort.
+      - name: Reclaim GPU from stray E2E processes
+        shell: powershell
+        run: |
+          Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -match 'rocm-e2e|__engine-serve-http|e2e-target|e2e-shared' -and $_.CommandLine -match 'llama-server|vllm|rocm ' } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          Write-Host "reclaimed"
+
       - name: Ensure Rust toolchain (PowerShell)
         shell: powershell
         run: |
@@ -984,6 +1039,16 @@ jobs:
       # See e2e-gpu-strix-windows: bootstrap rustup via Windows PowerShell 5.1
       # (`powershell`, not `pwsh`) because this runner has neither bash nor
       # PowerShell 7 for setup-rust-toolchain's internal script.
+      # Reclaim the GPU from any E2E serve leaked by a killed/timed-out prior run
+      # (see e2e-gpu). PowerShell (5.1) equivalent; best-effort.
+      - name: Reclaim GPU from stray E2E processes
+        shell: powershell
+        run: |
+          Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -match 'rocm-e2e|__engine-serve-http|e2e-target|e2e-shared' -and $_.CommandLine -match 'llama-server|vllm|rocm ' } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          Write-Host "reclaimed"
+
       - name: Ensure Rust toolchain (PowerShell)
         shell: powershell
         run: |
