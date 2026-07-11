@@ -121,9 +121,17 @@ mod tests {
     #[test]
     fn init_creates_log_dir_and_a_log_file() {
         let (root, paths) = temp_paths("init-creates-dir");
+        // A global `tracing` subscriber can only be installed once per test
+        // binary process, so whether THIS call wins the race is
+        // nondeterministic under `cargo test`'s default parallel threads.
+        // The rolling file appender opens its current-period file eagerly at
+        // construction time, before the (possibly-losing) subscriber install
+        // is attempted, so the directory/file assertions below hold either
+        // way — only the `Some`/`None` guard outcome depends on the race.
         let guard = init(&paths);
-        assert!(guard.is_some(), "first init in-process should install ok");
-        tracing::info!("hello from the test subscriber");
+        if guard.is_some() {
+            tracing::info!("hello from the test subscriber");
+        }
         // Drop the guard to flush the non-blocking writer before inspecting
         // the directory contents.
         drop(guard);
