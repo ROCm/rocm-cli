@@ -71,23 +71,26 @@ const SERVE_PORT: u16 = 11435;
 /// serve, so a leaked server from a prior scenario can't linger on the GPU.
 /// Polls until nothing answers on the port (bounded), killing any listener.
 async fn ensure_serve_port_free() {
-    let url = format!("http://127.0.0.1:{SERVE_PORT}/v1/models");
-    // If nothing is listening, we're done.
-    if reqwest::get(&url).await.is_err() {
-        return;
-    }
-    // Something is still serving on the shared port (a prior scenario's leaked
-    // engine). Kill listeners by port and wait for it to close.
+    // Always kill any listener on the shared port — NOT just one that already
+    // answers /v1/models. A prior scenario's vLLM that is still LOADING holds the
+    // port and GPU memory without yet serving /v1/models; if we only checked HTTP
+    // readiness we'd start a second server, overcommit GPU memory (each asks for
+    // 0.80), and the collision crashes a server → the next chat POST fails with
+    // "error sending request". Killing by port (fuser/lsof) catches the starting
+    // server too. Best-effort; then wait for the socket to actually close.
     kill_listeners_on_port(SERVE_PORT);
     let deadline = Instant::now() + Duration::from_secs(60);
-    while Instant::now() < deadline {
-        if reqwest::get(&url).await.is_err() {
+    loop {
+        // TcpStream connect succeeds only while something holds the port.
+        let free = tokio::net::TcpStream::connect(("127.0.0.1", SERVE_PORT))
+            .await
+            .is_err();
+        if free || Instant::now() >= deadline {
             return;
         }
+        kill_listeners_on_port(SERVE_PORT);
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    // Don't panic — the serve below may still succeed by replacing it; this is a
-    // best-effort reclaim.
 }
 
 /// Kill whatever process is listening on `port`. Best-effort and
