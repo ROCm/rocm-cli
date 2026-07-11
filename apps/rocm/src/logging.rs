@@ -146,10 +146,12 @@ mod tests {
         // working copy. Canonicalize the base first so the fixture paths are
         // derived from a resolved, symlink-free root (matches production's
         // `validated_log_dir` barrier and keeps assertions stable where
-        // `$TMPDIR` is itself a symlink). Name-scoped with pid + millis to stay
-        // unique across parallel test threads and repeated runs.
-        let base = std::env::temp_dir();
-        let base = std::fs::canonicalize(&base).unwrap_or(base);
+        // `$TMPDIR` is itself a symlink). Use `expect` rather than falling back
+        // to the raw `temp_dir()` so the env-derived path is never used
+        // un-canonicalized. Name-scoped with pid + millis to stay unique across
+        // parallel test threads and repeated runs.
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .expect("OS temp dir must exist and canonicalize");
         let root = base.join(format!(
             "rocm-cli-logging-test-{name}-{}-{}",
             std::process::id(),
