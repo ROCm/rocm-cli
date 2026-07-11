@@ -229,15 +229,23 @@ pub(super) async fn detect_managed_chat(
 pub(super) async fn detect_local_chat(
     executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
 ) -> Option<crate::llm::LlmConfig> {
+    detect_local_chat_with_probe(executor, crate::llm::detect_local_endpoint).await
+}
+
+/// Same as [`detect_local_chat`], but with the well-known-port probe passed
+/// in rather than hard-coded, so a test can substitute a deterministic probe
+/// instead of depending on the real well-known ports being free on the
+/// machine running the test.
+async fn detect_local_chat_with_probe(
+    executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
+    probe: impl Fn() -> Option<&'static str> + Send + 'static,
+) -> Option<crate::llm::LlmConfig> {
     if let Some(cfg) = detect_managed_chat(executor).await {
         return Some(cfg);
     }
 
     // TCP probe is blocking; keep it off the async reactor.
-    let base = tokio::task::spawn_blocking(crate::llm::detect_local_endpoint)
-        .await
-        .ok()
-        .flatten()?;
+    let base = tokio::task::spawn_blocking(probe).await.ok().flatten()?;
 
     // Best-effort model query; fall back to the neutral default on any failure.
     let model = fetch_first_model(base)
@@ -429,39 +437,20 @@ mod tests {
     /// :11435) is preferred over falling back to the ChatGPT cloud default.
     #[tokio::test]
     async fn detect_local_chat_prefers_local_server_over_no_endpoint() {
-        // detect_local_chat probes candidates in priority order (Lemonade,
-        // then vLLM, then rocm serve's default). For the rocm-serve listener
-        // below to be the one detect_local_chat actually picks, the two
-        // higher-priority ports must be free — an ambient listener on the CI
-        // runner (e.g. another process already on :8000) would otherwise
-        // make this test flake by returning a different endpoint than
-        // expected. Note: unlike the guard below, these can only be checked
-        // and released (not held) — the probe is a bare TCP connect, so a
-        // held listener would itself register as "reachable" and defeat the
-        // check.
-        let Ok(lemonade_probe) =
-            std::net::TcpListener::bind(("127.0.0.1", crate::skills::LEMONADE_PORT))
-        else {
-            return; // Port already bound in this environment; skip rather than flake.
-        };
-        drop(lemonade_probe);
-        let Ok(vllm_probe) = std::net::TcpListener::bind(("127.0.0.1", crate::skills::VLLM_PORT))
-        else {
-            return; // Port already bound in this environment; skip rather than flake.
-        };
-        drop(vllm_probe);
-        let Ok(listener) =
-            std::net::TcpListener::bind(("127.0.0.1", crate::skills::ROCM_SERVE_PORT))
-        else {
-            return; // Port already bound in this environment; skip rather than flake.
-        };
-        // No executor (no managed-services registry available) — falls through
-        // to the well-known-port probe, which must still find the listener.
-        let cfg = detect_local_chat(None)
+        // Priority order among the well-known ports (Lemonade > vLLM > rocm
+        // serve's default) is covered deterministically in `llm.rs`'s own
+        // tests, against OS-assigned ephemeral ports. This test's job is
+        // narrower: prove `detect_local_chat`'s no-managed-executor path
+        // wires whatever the well-known-port probe finds into the resulting
+        // config, rather than falling back to the cloud default — so the
+        // probe is injected rather than exercised against real ports (real
+        // ports it doesn't own would make this flake on a CI runner where an
+        // ambient listener happens to occupy one of them).
+        const PROBED: &str = "http://127.0.0.1:1/v1";
+        let cfg = detect_local_chat_with_probe(None, || Some(PROBED))
             .await
             .expect("local server detected");
-        assert_eq!(cfg.base_url, crate::skills::ROCM_SERVE_ENDPOINT);
-        drop(listener);
+        assert_eq!(cfg.base_url, PROBED);
     }
 
     #[test]

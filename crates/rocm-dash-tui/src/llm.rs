@@ -188,28 +188,23 @@ pub fn probe_endpoint(base_url: &str, timeout: Duration) -> bool {
     false
 }
 
-/// Probe the known local serving endpoints (Lemonade, vLLM, then `rocm
-/// serve`'s non-managed default) concurrently and return the highest-priority
-/// one that answered.
+/// Probe `candidates` (in priority order) concurrently and return the
+/// highest-priority one that answered.
 ///
-/// Used by the TUI's in-app "detect a local engine" action, and by chat
-/// startup, so the user need not run the CLI skill first. Probing all three
-/// candidates in parallel (rather than sequentially) bounds the worst case
-/// (no server listening) to one [`PROBE_TIMEOUT`] instead of three, which
-/// matters at startup where this gates falling back to the cloud default.
-/// TCP-only (no HTTP); never blocks longer than [`PROBE_TIMEOUT`] total.
-pub fn detect_local_endpoint() -> Option<&'static str> {
-    const CANDIDATES: [&str; 3] = [
-        crate::skills::LEMONADE_ENDPOINT,
-        crate::skills::VLLM_ENDPOINT,
-        crate::skills::ROCM_SERVE_ENDPOINT,
-    ];
+/// Split out from [`detect_local_endpoint`] so priority-order behavior is
+/// testable against OS-assigned ephemeral ports instead of the real
+/// well-known ports, which may be occupied by an unrelated ambient listener
+/// on the machine running the test. Probing all candidates in parallel
+/// (rather than sequentially) bounds the worst case (no server listening) to
+/// one [`PROBE_TIMEOUT`] instead of one per candidate. TCP-only (no HTTP);
+/// never blocks longer than [`PROBE_TIMEOUT`] total.
+fn probe_first_reachable<'a>(candidates: &[&'a str]) -> Option<&'a str> {
     std::thread::scope(|scope| {
         // The collect is load-bearing, not needless: every probe must be
         // *spawned* before any is *joined*, or they run one at a time and the
         // whole point (bounding total latency to one PROBE_TIMEOUT) is lost.
         #[allow(clippy::needless_collect)]
-        let handles: Vec<_> = CANDIDATES
+        let handles: Vec<_> = candidates
             .iter()
             .map(|ep| (*ep, scope.spawn(|| probe_endpoint(ep, PROBE_TIMEOUT))))
             .collect();
@@ -217,6 +212,21 @@ pub fn detect_local_endpoint() -> Option<&'static str> {
             .into_iter()
             .find_map(|(ep, handle)| handle.join().unwrap_or(false).then_some(ep))
     })
+}
+
+/// Probe the known local serving endpoints (Lemonade, vLLM, then `rocm
+/// serve`'s non-managed default) concurrently and return the highest-priority
+/// one that answered.
+///
+/// Used by the TUI's in-app "detect a local engine" action, and by chat
+/// startup, so the user need not run the CLI skill first.
+pub fn detect_local_endpoint() -> Option<&'static str> {
+    const CANDIDATES: [&str; 3] = [
+        crate::skills::LEMONADE_ENDPOINT,
+        crate::skills::VLLM_ENDPOINT,
+        crate::skills::ROCM_SERVE_ENDPOINT,
+    ];
+    probe_first_reachable(&CANDIDATES)
 }
 
 /// Pick the first model id from an OpenAI-compatible `/v1/models` response (`{"data":[{"id":"…"}]}`).
@@ -453,24 +463,47 @@ mod tests {
         assert!(!probe_endpoint("not a url", Duration::from_millis(100)));
     }
 
+    /// Binds an OS-assigned ephemeral port and returns its listener (kept
+    /// alive so the port stays reachable) plus its `http://host:port` URL.
+    ///
+    /// Ephemeral ports are used instead of the real well-known ports
+    /// (Lemonade/vLLM/rocm serve) so priority-order tests are deterministic:
+    /// an ambient listener elsewhere on the machine (e.g. a real local
+    /// engine, or — on some CI runners — a pre-installed one) can otherwise
+    /// make well-known-port-based tests flake by answering a probe the test
+    /// didn't intend to exercise.
+    fn ephemeral_endpoint() -> (std::net::TcpListener, String) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
+        let url = format!("http://{}", listener.local_addr().expect("local_addr"));
+        (listener, url)
+    }
+
     #[test]
-    fn detect_local_endpoint_prefers_lemonade_when_multiple_reachable() {
-        // Lemonade and vLLM both listening: priority order (Lemonade first)
-        // must win even though probes run concurrently, not sequentially.
-        let Ok(lemonade) = std::net::TcpListener::bind(("127.0.0.1", crate::skills::LEMONADE_PORT))
-        else {
-            return; // Port already bound in this environment; skip rather than flake.
-        };
-        let Ok(vllm) = std::net::TcpListener::bind(("127.0.0.1", crate::skills::VLLM_PORT)) else {
-            drop(lemonade);
-            return;
-        };
+    fn probe_first_reachable_prefers_earlier_candidate_when_multiple_reachable() {
+        // Two reachable candidates: priority order (first in the list) must
+        // win even though probes run concurrently, not sequentially.
+        let (_first, first_url) = ephemeral_endpoint();
+        let (_second, second_url) = ephemeral_endpoint();
         assert_eq!(
-            detect_local_endpoint(),
-            Some(crate::skills::LEMONADE_ENDPOINT)
+            probe_first_reachable(&[first_url.as_str(), second_url.as_str()]),
+            Some(first_url.as_str())
         );
-        drop(lemonade);
-        drop(vllm);
+    }
+
+    #[test]
+    fn probe_first_reachable_skips_unreachable_earlier_candidates() {
+        // The first candidate (port 1) is essentially never open; the probe
+        // must fall through to the second, reachable one.
+        let (_listener, url) = ephemeral_endpoint();
+        assert_eq!(
+            probe_first_reachable(&["http://127.0.0.1:1", url.as_str()]),
+            Some(url.as_str())
+        );
+    }
+
+    #[test]
+    fn probe_first_reachable_none_when_nothing_listening() {
+        assert_eq!(probe_first_reachable(&["http://127.0.0.1:1"]), None);
     }
 
     #[test]
@@ -486,38 +519,5 @@ mod tests {
             "expected parallel probing to bound latency to ~1 PROBE_TIMEOUT, took {:?}",
             start.elapsed()
         );
-    }
-
-    #[test]
-    fn detect_local_endpoint_probes_rocm_serve_default_port() {
-        // A listener on rocm serve's (non-managed) default port must be picked
-        // up by the fallback probe, not just Lemonade/vLLM's ports. The two
-        // higher-priority ports must be free, or an ambient listener on the
-        // CI runner would make this test flake by returning a different
-        // endpoint. Note: unlike the guard below, these can only be checked
-        // and released (not held) — the probe is a bare TCP connect, so a
-        // held listener would itself register as "reachable" and defeat the
-        // check.
-        let Ok(lemonade_probe) =
-            std::net::TcpListener::bind(("127.0.0.1", crate::skills::LEMONADE_PORT))
-        else {
-            return; // Port already bound in this environment; skip rather than flake.
-        };
-        drop(lemonade_probe);
-        let Ok(vllm_probe) = std::net::TcpListener::bind(("127.0.0.1", crate::skills::VLLM_PORT))
-        else {
-            return; // Port already bound in this environment; skip rather than flake.
-        };
-        drop(vllm_probe);
-        let Ok(listener) =
-            std::net::TcpListener::bind(("127.0.0.1", crate::skills::ROCM_SERVE_PORT))
-        else {
-            return; // Port already bound in this environment; skip rather than flake.
-        };
-        assert_eq!(
-            detect_local_endpoint(),
-            Some(crate::skills::ROCM_SERVE_ENDPOINT)
-        );
-        drop(listener);
     }
 }
