@@ -62,6 +62,45 @@ pub struct GpuSystemInfo {
     pub llamacpp_backend: Option<String>,
 }
 
+/// A coarse phase within an instance's startup, parsed from the serve logs.
+///
+/// Ordered by the lifecycle it represents: pull the weights, load them onto
+/// the device, then warm the engine up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StartupPhase {
+    /// Fetching model weights (e.g. a Hugging Face download).
+    Downloading,
+    /// Loading weights onto the device / initializing the engine.
+    Loading,
+    /// Weights loaded; warming up (CUDA-graph capture, warmup requests).
+    Warmup,
+}
+
+impl StartupPhase {
+    /// Short UPPERCASE label for status chips.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Downloading => "DOWNLOADING",
+            Self::Loading => "LOADING",
+            Self::Warmup => "WARMUP",
+        }
+    }
+
+    /// Parse a lowercase phase token (as persisted in a `ManagedServiceRecord`'s
+    /// `startup_phase` field) back into a phase. Unknown tokens yield `None`.
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "downloading" => Some(Self::Downloading),
+            "loading" => Some(Self::Loading),
+            "warmup" => Some(Self::Warmup),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum InstanceStatus {
@@ -69,7 +108,12 @@ pub enum InstanceStatus {
     /// equivalent) and is serving inference requests.
     Ready,
     Running,
-    Starting,
+    /// Coming up but not yet ready. `phase` carries a coarse startup stage
+    /// parsed from the serve logs when known (`None` for sources that expose
+    /// no readiness detail, e.g. Docker-discovered containers).
+    Starting {
+        phase: Option<StartupPhase>,
+    },
     Stopped,
     Error,
     #[default]
@@ -84,6 +128,21 @@ impl InstanceStatus {
     #[must_use]
     pub const fn is_serving(self) -> bool {
         matches!(self, Self::Ready | Self::Running)
+    }
+
+    /// Short UPPERCASE label for status chips. `Starting` surfaces its startup
+    /// phase (e.g. `LOADING`) when one is known, else the generic `STARTING`.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "READY",
+            Self::Running => "RUNNING",
+            Self::Starting { phase: Some(phase) } => phase.label(),
+            Self::Starting { phase: None } => "STARTING",
+            Self::Stopped => "STOPPED",
+            Self::Error => "ERROR",
+            Self::Unknown => "UNKNOWN",
+        }
     }
 }
 
@@ -178,9 +237,71 @@ mod tests {
     fn instance_status_is_serving_covers_ready_and_running_only() {
         assert!(InstanceStatus::Ready.is_serving());
         assert!(InstanceStatus::Running.is_serving());
-        assert!(!InstanceStatus::Starting.is_serving());
+        assert!(!InstanceStatus::Starting { phase: None }.is_serving());
+        assert!(
+            !InstanceStatus::Starting {
+                phase: Some(StartupPhase::Loading)
+            }
+            .is_serving()
+        );
         assert!(!InstanceStatus::Stopped.is_serving());
         assert!(!InstanceStatus::Error.is_serving());
         assert!(!InstanceStatus::Unknown.is_serving());
+    }
+
+    #[test]
+    fn instance_status_label_surfaces_startup_phase() {
+        assert_eq!(InstanceStatus::Starting { phase: None }.label(), "STARTING");
+        assert_eq!(
+            InstanceStatus::Starting {
+                phase: Some(StartupPhase::Downloading)
+            }
+            .label(),
+            "DOWNLOADING"
+        );
+        assert_eq!(
+            InstanceStatus::Starting {
+                phase: Some(StartupPhase::Loading)
+            }
+            .label(),
+            "LOADING"
+        );
+        assert_eq!(
+            InstanceStatus::Starting {
+                phase: Some(StartupPhase::Warmup)
+            }
+            .label(),
+            "WARMUP"
+        );
+        assert_eq!(InstanceStatus::Ready.label(), "READY");
+    }
+
+    #[test]
+    fn instance_status_starting_round_trips_through_serde() {
+        // The data-carrying variant serializes as an externally-tagged object
+        // and survives a round trip, both with and without a phase.
+        for status in [
+            InstanceStatus::Starting { phase: None },
+            InstanceStatus::Starting {
+                phase: Some(StartupPhase::Warmup),
+            },
+        ] {
+            let json = serde_json::to_string(&status).expect("serialize");
+            let back: InstanceStatus = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, status);
+        }
+    }
+
+    #[test]
+    fn startup_phase_from_token_round_trips_labels() {
+        for phase in [
+            StartupPhase::Downloading,
+            StartupPhase::Loading,
+            StartupPhase::Warmup,
+        ] {
+            let token = phase.label().to_ascii_lowercase();
+            assert_eq!(StartupPhase::from_token(&token), Some(phase));
+        }
+        assert_eq!(StartupPhase::from_token("nonsense"), None);
     }
 }

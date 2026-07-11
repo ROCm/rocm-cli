@@ -307,10 +307,11 @@ fn parse_container(inspect: &ContainerInspectResponse) -> Result<DiscoveredServi
         env_vars: env,
         pid,
         log_file: None,
-        // Docker gives us no readiness signal of its own; stay `Starting`
-        // until the vLLM Prometheus scrape succeeds at least once (see
-        // `runner::instance_from_discovered` callers).
-        status: InstanceStatus::Starting,
+        // Docker gives us no readiness signal (or startup phase) of its own;
+        // stay `Starting` with no phase until the vLLM Prometheus scrape
+        // succeeds at least once (see `runner::instance_from_discovered`
+        // callers).
+        status: InstanceStatus::Starting { phase: None },
     })
 }
 

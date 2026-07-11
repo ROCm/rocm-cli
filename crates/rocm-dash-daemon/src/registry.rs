@@ -36,7 +36,7 @@ use std::path::Path;
 
 use crate::runner::instance_from_discovered;
 use rocm_dash_collectors::engine_registry::EngineKind;
-use rocm_dash_core::metrics::{Instance, InstanceStatus};
+use rocm_dash_core::metrics::{Instance, InstanceStatus, StartupPhase};
 use rocm_dash_core::traits::DiscoveredService;
 use serde::Deserialize;
 
@@ -61,6 +61,11 @@ pub struct ServiceRecord {
     pub port: u16,
     #[serde(default)]
     pub status: String,
+    /// Coarse startup stage (`downloading`/`loading`/`warmup`) the rocm-cli
+    /// supervisor parsed from the serve logs while the service was coming up.
+    /// Absent on older records and once the service reaches `ready`.
+    #[serde(default)]
+    pub startup_phase: Option<String>,
     #[serde(default)]
     pub created_at_unix_ms: u128,
 }
@@ -78,15 +83,19 @@ pub fn is_scrapeable_status(status: &str) -> bool {
     )
 }
 
-/// Map a rocm-cli managed-service record's `status` string onto the
-/// dashboard's `InstanceStatus`. Only called after `is_scrapeable_status` has
-/// already filtered out `failed`/`stopped`/unrecognized strings, so the `_`
-/// fallback arm is unreachable in practice but kept total for safety.
-fn instance_status_for_record_status(status: &str) -> InstanceStatus {
+/// Map a rocm-cli managed-service record's `status` string (plus any parsed
+/// `startup_phase`) onto the dashboard's `InstanceStatus`. Only called after
+/// `is_scrapeable_status` has already filtered out `failed`/`stopped`/unrecognized
+/// strings, so the `_` fallback arm is unreachable in practice but kept total
+/// for safety. The `startup_phase` token is only honored for the `Starting`
+/// states; it is meaningless once a service is `ready`/`running`.
+fn instance_status_for_record(status: &str, startup_phase: Option<&str>) -> InstanceStatus {
     match status.trim().to_ascii_lowercase().as_str() {
         "ready" => InstanceStatus::Ready,
         "running" => InstanceStatus::Running,
-        "starting" | "recovering" => InstanceStatus::Starting,
+        "starting" | "recovering" => InstanceStatus::Starting {
+            phase: startup_phase.and_then(StartupPhase::from_token),
+        },
         _ => InstanceStatus::Unknown,
     }
 }
@@ -144,7 +153,7 @@ pub fn discovered_from_record(record: &ServiceRecord) -> Option<DiscoveredServic
         container_name: record.service_id.clone(),
         model_name,
         port: Some(record.port),
-        status: instance_status_for_record_status(&record.status),
+        status: instance_status_for_record(&record.status, record.startup_phase.as_deref()),
         ..Default::default()
     })
 }
@@ -321,8 +330,8 @@ mod tests {
             ("ready", InstanceStatus::Ready),
             ("running", InstanceStatus::Running),
             ("RUNNING", InstanceStatus::Running),
-            ("starting", InstanceStatus::Starting),
-            ("recovering", InstanceStatus::Starting),
+            ("starting", InstanceStatus::Starting { phase: None }),
+            ("recovering", InstanceStatus::Starting { phase: None }),
         ];
         for (status, expected) in cases {
             let rec: ServiceRecord =
@@ -331,6 +340,41 @@ mod tests {
                 .unwrap_or_else(|| panic!("status {status:?} must be scrapeable"));
             assert_eq!(svc.status, expected, "status {status:?}");
         }
+    }
+
+    #[test]
+    fn discovered_from_record_surfaces_startup_phase_while_starting() {
+        // A `starting` record with a parsed phase must carry that phase into the
+        // instance status so the dashboard can show DOWNLOADING/LOADING/WARMUP.
+        let rec: ServiceRecord = serde_json::from_str(
+            r#"{
+              "service_id": "svc-load", "engine": "vllm", "model_ref": "m",
+              "canonical_model_id": "m", "host": "127.0.0.1", "port": 8000,
+              "status": "starting", "startup_phase": "loading",
+              "created_at_unix_ms": 1
+            }"#,
+        )
+        .unwrap();
+        let svc = discovered_from_record(&rec).expect("starting record is scrapeable");
+        assert_eq!(
+            svc.status,
+            InstanceStatus::Starting {
+                phase: Some(StartupPhase::Loading)
+            }
+        );
+
+        // An unrecognized phase token degrades to a phase-less Starting.
+        let rec: ServiceRecord = serde_json::from_str(
+            r#"{
+              "service_id": "svc-x", "engine": "vllm", "model_ref": "m",
+              "canonical_model_id": "m", "host": "127.0.0.1", "port": 8000,
+              "status": "starting", "startup_phase": "bogus",
+              "created_at_unix_ms": 1
+            }"#,
+        )
+        .unwrap();
+        let svc = discovered_from_record(&rec).expect("starting record is scrapeable");
+        assert_eq!(svc.status, InstanceStatus::Starting { phase: None });
     }
 
     #[test]

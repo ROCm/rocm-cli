@@ -5455,6 +5455,11 @@ pub struct ManagedServiceRecord {
     pub restart_count: u32,
     #[serde(default)]
     pub last_restart_unix_ms: Option<u128>,
+    /// Coarse startup stage (`downloading`/`loading`/`warmup`) parsed from the
+    /// serve process's own log output while it is coming up. Set to `None` once
+    /// the service reaches `ready`, and absent on older on-disk records.
+    #[serde(default)]
+    pub startup_phase: Option<String>,
     pub manifest_path: PathBuf,
     pub log_path: PathBuf,
     pub engine_state_path: PathBuf,
@@ -5502,6 +5507,7 @@ impl ManagedServiceRecord {
             engine_recipe_json: None,
             restart_count: 0,
             last_restart_unix_ms: None,
+            startup_phase: None,
             manifest_path,
             log_path,
             engine_state_path,

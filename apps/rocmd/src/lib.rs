@@ -37,7 +37,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
@@ -3107,14 +3107,25 @@ fn supervise_service(
     record.status = "running".to_owned();
     record.write()?;
 
-    if wait_for_service_ready(
-        &record.engine,
-        &record.service_id,
-        &record.host,
-        record.port,
+    // Clone the fields the poller reads so the `on_phase` closure can borrow
+    // `record` mutably to persist each startup-phase transition to disk.
+    let ready_engine = record.engine.clone();
+    let ready_service_id = record.service_id.clone();
+    let ready_log_path = record.log_path.clone();
+    let became_ready = wait_for_service_ready(
+        &ready_engine,
+        &ready_service_id,
+        &ready_log_path,
         Duration::from_mins(3),
-    ) {
+        |phase| {
+            record.startup_phase = Some(phase.to_owned());
+            let _ = record.write();
+        },
+    );
+    if became_ready {
         record.status = "ready".to_owned();
+        // The phase only describes the coming-up window; clear it once ready.
+        record.startup_phase = None;
         record.write()?;
     }
 
@@ -4973,6 +4984,95 @@ mod tests {
     use clap::CommandFactory;
     use rocm_core::ModelRecipeArtifactSourcePolicyRecord;
     use std::path::PathBuf;
+
+    #[test]
+    fn last_cr_segment_keeps_final_progress_redraw() {
+        // A tqdm/HF-style in-place redraw collapses to its last segment.
+        assert_eq!(
+            last_cr_segment("Downloading:  10%\rDownloading:  55%\rDownloading: 100%"),
+            "Downloading: 100%"
+        );
+        // A plain line is unchanged.
+        assert_eq!(
+            last_cr_segment("Loading model weights"),
+            "Loading model weights"
+        );
+    }
+
+    #[test]
+    fn classify_startup_phase_maps_engine_vocabulary() {
+        assert_eq!(
+            classify_startup_phase("Downloading shards: 100%"),
+            Some("downloading")
+        );
+        assert_eq!(
+            classify_startup_phase("Fetching 12 files"),
+            Some("downloading")
+        );
+        assert_eq!(
+            classify_startup_phase("INFO: Loading model weights took 4.2s"),
+            Some("loading")
+        );
+        assert_eq!(
+            classify_startup_phase("llama_model_loader: loaded meta data"),
+            Some("loading")
+        );
+        assert_eq!(
+            classify_startup_phase("Capturing CUDA graph shapes"),
+            Some("warmup")
+        );
+        assert_eq!(
+            classify_startup_phase("Warming up the engine"),
+            Some("warmup")
+        );
+        // Ordinary chatter carries no phase signal.
+        assert_eq!(
+            classify_startup_phase("Uvicorn running on http://..."),
+            None
+        );
+    }
+
+    #[test]
+    fn classify_startup_phase_emits_only_dashboard_known_tokens() {
+        // These tokens are the wire contract with the dashboard's
+        // `StartupPhase::from_token` (rocm-dash-core); emitting anything else
+        // would be silently dropped there. rocmd can't link that crate, so the
+        // contract is pinned here by literal.
+        for line in [
+            "Downloading shards",
+            "Loading model weights",
+            "Capturing CUDA graph",
+        ] {
+            let token = classify_startup_phase(line).expect("line is a phase signal");
+            assert!(
+                matches!(token, "downloading" | "loading" | "warmup"),
+                "token {token:?} must be one the dashboard understands"
+            );
+        }
+    }
+
+    #[test]
+    fn read_new_log_phase_advances_and_tracks_latest() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("rocmd-phase-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("svc.log");
+        std::fs::write(&log, "boot\nDownloading shards: 100%\n").unwrap();
+
+        let mut pos = 0_u64;
+        assert_eq!(read_new_log_phase(&log, &mut pos), Some("downloading"));
+        // No new bytes → no phase, cursor unchanged.
+        let after_first = pos;
+        assert_eq!(read_new_log_phase(&log, &mut pos), None);
+        assert_eq!(pos, after_first);
+
+        // Appending a later stage advances the phase.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        writeln!(f, "Loading model weights took 3s").unwrap();
+        assert_eq!(read_new_log_phase(&log, &mut pos), Some("loading"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn engine_serve_http_args_forward_engine_recipe_json() {
@@ -8545,15 +8645,92 @@ fn optional_arg(flag: &str, value: Option<&str>) -> Vec<String> {
     }
 }
 
+/// Keep only the final visible segment of a `\r`-redrawn progress line.
+///
+/// Progress tools (pip, tqdm, Hugging Face) redraw a line in place with a bare
+/// carriage return and no newline, so the segment after the last `\r` is its
+/// final visible state. Lines without `\r` pass through unchanged. (Same
+/// collapse rule the dashboard job console applies to streamed job output.)
+fn last_cr_segment(line: &str) -> &str {
+    line.rsplit('\r').next().unwrap_or(line)
+}
+
+/// Classify a single serve-log line into a coarse startup phase token
+/// (`downloading`/`loading`/`warmup`), or `None` when the line carries no phase
+/// signal. Case-insensitive substring match over the common vLLM / llama.cpp /
+/// Hugging Face startup vocabulary. Checked warmup → loading → downloading so
+/// the latest lifecycle stage a line mentions wins.
+fn classify_startup_phase(line: &str) -> Option<&'static str> {
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("capturing cuda graph")
+        || lower.contains("capturing the model")
+        || lower.contains("warming up")
+        || lower.contains("warmup")
+    {
+        Some("warmup")
+    } else if lower.contains("loading weights")
+        || lower.contains("loading model")
+        || lower.contains("load_tensors")
+        || lower.contains("llama_model_loader")
+        || lower.contains("model loading took")
+    {
+        Some("loading")
+    } else if lower.contains("downloading") || lower.contains("fetching") {
+        Some("downloading")
+    } else {
+        None
+    }
+}
+
+/// Read log bytes appended since `*pos`, advance `*pos`, and return the most
+/// recent recognizable startup phase in that new output (later lines win, so a
+/// download → load → warmup progression advances naturally).
+///
+/// Best-effort: any I/O error (file not created yet, transient read) yields
+/// `None`. A shrunk file (rotation/truncation) resets the cursor to the top.
+fn read_new_log_phase(log_path: &Path, pos: &mut u64) -> Option<&'static str> {
+    let mut file = fs::File::open(log_path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len < *pos {
+        *pos = 0;
+    }
+    if len == *pos {
+        return None;
+    }
+    file.seek(SeekFrom::Start(*pos)).ok()?;
+    let mut bytes = Vec::new();
+    let read = file.read_to_end(&mut bytes).ok()?;
+    *pos += read as u64;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut phase = None;
+    for line in text.lines() {
+        if let Some(found) = classify_startup_phase(last_cr_segment(line)) {
+            phase = Some(found);
+        }
+    }
+    phase
+}
+
+/// Poll a freshly-spawned service until its healthcheck reports ready (or the
+/// timeout elapses), tailing its log file meanwhile and reporting each coarse
+/// startup phase transition via `on_phase`.
 fn wait_for_service_ready(
     engine: &str,
     service_id: &str,
-    _host: &str,
-    _port: u16,
+    log_path: &Path,
     timeout: Duration,
+    mut on_phase: impl FnMut(&str),
 ) -> bool {
     let start = std::time::Instant::now();
+    let mut log_pos: u64 = 0;
+    let mut last_phase: Option<&'static str> = None;
     while start.elapsed() < timeout {
+        if let Some(phase) = read_new_log_phase(log_path, &mut log_pos)
+            && last_phase != Some(phase)
+        {
+            last_phase = Some(phase);
+            on_phase(phase);
+        }
         if engine_healthcheck_ready(engine, service_id).unwrap_or(false) {
             return true;
         }
