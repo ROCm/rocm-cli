@@ -24,17 +24,39 @@ fn serve_timeout_secs() -> u64 {
 }
 
 async fn wait_for_endpoint(url: &str, timeout_secs: u64) {
+    wait_for_model(url, None, timeout_secs).await;
+}
+
+/// Wait for `<endpoint>/models` to return 200. When `expect_model` is given,
+/// wait until that model id actually appears in the listing — not merely any
+/// 200. This defends against a leaked serve from a prior scenario still
+/// answering on the shared port (11435): scenarios run in isolated data dirs, so
+/// scenario A's `rocm` has no record of scenario B's managed service and can't
+/// stop it; a plain 200 check would then proceed against the WRONG model. Wait
+/// for the expected model so the readiness signal reflects this scenario's serve.
+async fn wait_for_model(models_url: &str, expect_model: Option<&str>, timeout_secs: u64) {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     while Instant::now() < deadline {
-        if reqwest::get(url)
-            .await
-            .is_ok_and(|r| r.status().is_success())
+        if let Ok(resp) = reqwest::get(models_url).await
+            && resp.status().is_success()
         {
-            return;
+            match expect_model {
+                None => return,
+                Some(model) => {
+                    if let Ok(body) = resp.text().await
+                        && body.contains(model)
+                    {
+                        return;
+                    }
+                }
+            }
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
-    panic!("endpoint {url} not ready after {timeout_secs}s");
+    match expect_model {
+        Some(m) => panic!("endpoint {models_url} did not serve model {m} within {timeout_secs}s"),
+        None => panic!("endpoint {models_url} not ready after {timeout_secs}s"),
+    }
 }
 
 // ── Given ──────────────────────────────────────────────────────────
@@ -77,7 +99,16 @@ async fn setup_gpu_model(world: &mut E2eWorld) {
     assert!(rc == 0, "rocm serve failed:\n{stdout}");
     world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
     world.model_name = Some("Qwen/Qwen2.5-1.5B-Instruct".to_string());
-    wait_for_endpoint("http://127.0.0.1:11435/v1/models", serve_timeout_secs()).await;
+    // Wait for THIS model specifically: the shared port 11435 may still be
+    // answering from a prior scenario's leaked serve (isolated data dirs mean
+    // this scenario can't stop it), so a plain readiness check could pass against
+    // the wrong model. "Qwen2.5-1.5B" is the distinctive substring of the id.
+    wait_for_model(
+        "http://127.0.0.1:11435/v1/models",
+        Some("Qwen2.5-1.5B"),
+        serve_timeout_secs(),
+    )
+    .await;
 }
 
 #[given("a GGUF model is being served on lemonade")]
@@ -94,7 +125,15 @@ async fn setup_lemonade_model(world: &mut E2eWorld) {
     assert!(rc == 0, "rocm serve failed:\n{stdout}");
     world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
     world.model_name = Some(model.to_string());
-    wait_for_endpoint("http://127.0.0.1:11435/v1/models", serve_timeout_secs()).await;
+    // Wait for this lemonade model specifically (see setup_gpu_model): guards
+    // against a leaked serve on the shared port. "Qwen3-0.6B" is the distinctive
+    // substring (the endpoint reports it as e.g. Qwen3-0.6B-Q4_0.gguf).
+    wait_for_model(
+        "http://127.0.0.1:11435/v1/models",
+        Some("Qwen3-0.6B"),
+        serve_timeout_secs(),
+    )
+    .await;
 }
 
 #[given("a model is served in the background")]
