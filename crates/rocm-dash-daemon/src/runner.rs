@@ -42,8 +42,11 @@ pub struct RunnerOptions {
     pub gpu_tick: Duration,
     pub discovery_tick: Duration,
     pub instance_tick: Duration,
-    /// Disable the per-instance Prometheus scrape (otherwise runs whenever
-    /// docker discovery is enabled).
+    /// Disable the per-instance vLLM Prometheus scrape. Independent of
+    /// `enable_docker`: the scraper is a plain HTTP GET against a vLLM
+    /// instance's `/metrics` endpoint and runs for BOTH Docker-discovered and
+    /// managed (native, `services_dir`-discovered) instances. `false` (the
+    /// default) means the scrape runs.
     pub disable_vllm_metrics: bool,
     /// Hostname to scrape; `127.0.0.1` for the typical co-located daemon.
     pub vllm_metrics_host: String,
@@ -96,6 +99,17 @@ pub struct Runner {
     pub state: State,
 }
 
+/// Whether `run_loop` should construct the [`VllmPrometheusCollector`].
+///
+/// EAI-7359: the scraper is a plain HTTP GET against a vLLM instance's
+/// `/metrics` endpoint — it has no Docker dependency. Managed (native)
+/// instances are already discovered via `services_dir` independently of
+/// Docker, so this is gated on `disable_vllm_metrics` ALONE; `enable_docker`
+/// must never factor in here (it continues to gate only `DockerDiscovery`).
+const fn vllm_metrics_enabled(opts: &RunnerOptions) -> bool {
+    !opts.disable_vllm_metrics
+}
+
 /// Loop forever: tick host + gpu metrics + bench rows, apply through reducer, broadcast.
 ///
 /// `tick_override` lets tests run faster than `opts.gpu_tick`; production passes
@@ -119,7 +133,7 @@ pub async fn run_loop(
     let instance_ticks = ticks_per(opts.instance_tick, tick);
     let sysinfo_refresh_ticks = ticks_per(Duration::from_secs(SYSINFO_REFRESH_SECS), tick);
 
-    let vllm = if opts.enable_docker && !opts.disable_vllm_metrics {
+    let vllm = if vllm_metrics_enabled(&opts) {
         Some(Arc::new(VllmPrometheusCollector::new(
             opts.vllm_metrics_host.clone(),
             Duration::from_millis(1500),
@@ -836,6 +850,42 @@ mod tests {
         enrich_instance_vram(&mut instances, &gpus, &per);
         assert_eq!(instances[0].vram_used_mb, 0);
         assert_eq!(instances[0].vram_total_mb, 0);
+    }
+
+    /// EAI-7359 regression: vLLM Prometheus scraping must be constructed
+    /// regardless of `enable_docker` — only `disable_vllm_metrics` may turn
+    /// it off. Before the fix this was `enable_docker && !disable_vllm_metrics`,
+    /// which permanently killed the scraper for the embedded daemon (always
+    /// launched with `enable_docker = false`).
+    #[test]
+    fn vllm_metrics_enabled_is_independent_of_docker() {
+        let mut opts = RunnerOptions {
+            enable_docker: false,
+            disable_vllm_metrics: false,
+            ..RunnerOptions::default()
+        };
+        assert!(
+            vllm_metrics_enabled(&opts),
+            "no-Docker case must still scrape"
+        );
+
+        opts.enable_docker = true;
+        assert!(
+            vllm_metrics_enabled(&opts),
+            "Docker enabled must still scrape"
+        );
+
+        opts.disable_vllm_metrics = true;
+        assert!(
+            !vllm_metrics_enabled(&opts),
+            "explicit disable must always win"
+        );
+
+        opts.enable_docker = false;
+        assert!(
+            !vllm_metrics_enabled(&opts),
+            "explicit disable must always win regardless of docker"
+        );
     }
 
     #[test]

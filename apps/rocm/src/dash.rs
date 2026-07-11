@@ -457,6 +457,23 @@ mod tests {
         assert!(!opts.enable_docker);
     }
 
+    /// EAI-7359 regression: the embedded daemon (`maybe_spawn_embedded_daemon`)
+    /// always calls `runner_options(.., enable_docker=false)`, so the vLLM
+    /// Prometheus scraper must NOT be gated on `enable_docker` — otherwise it
+    /// is permanently dead in the common no-Docker / managed-vLLM case even
+    /// though `vllm_prom.rs` has zero Docker dependency (plain HTTP GET).
+    /// `disable_vllm_metrics` is the only knob that should turn it off.
+    #[test]
+    fn runner_options_keeps_vllm_metrics_enabled_without_docker() {
+        let p = paths();
+        let opts = runner_options(&cfg(), &p, false);
+        assert!(!opts.enable_docker);
+        assert!(
+            !opts.disable_vllm_metrics,
+            "vLLM metrics must stay on by default even when Docker discovery is off"
+        );
+    }
+
     #[test]
     fn bootstrap_routes_to_focused_setup() {
         // `rocm bootstrap setup` must route to the same focused Setup host as the
