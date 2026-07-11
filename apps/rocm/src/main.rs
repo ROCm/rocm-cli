@@ -16167,6 +16167,17 @@ mod tests {
             .expect("service should be present");
         assert_eq!(promoted.status, "ready");
 
+        // Re-read the manifest file directly (bypassing any code path that
+        // could itself re-run the promotion) to prove the transition was
+        // actually written to disk, not just returned in the in-memory
+        // `Vec<ManagedServiceRecord>` above. `load_managed_service` below
+        // also calls `refresh_managed_service_runtime_liveness` on every
+        // read, so asserting only on its return value would pass even if
+        // `load_managed_services` never persisted anything.
+        let on_disk_bytes = fs::read(&record.manifest_path)?;
+        let on_disk = serde_json::from_slice::<ManagedServiceRecord>(&on_disk_bytes)?;
+        assert_eq!(on_disk.status, "ready");
+
         // The promotion must have been persisted to disk, not just returned
         // in-memory, since chat's `pick_managed_chat_endpoint` re-reads it.
         let reloaded = load_managed_service(&paths, "svc-qwen-promote")?;
