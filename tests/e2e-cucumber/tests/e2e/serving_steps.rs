@@ -2,7 +2,6 @@
 //
 // SPDX-License-Identifier: MIT
 
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use cucumber::{given, then, when};
