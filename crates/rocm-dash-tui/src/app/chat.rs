@@ -246,6 +246,20 @@ pub(super) async fn detect_local_chat(
     Some(crate::llm::detected_llm_config(base, &model))
 }
 
+/// Whether startup should run the local-engine auto-detection swap.
+///
+/// Detection produces a keyless [`crate::llm::detected_llm_config`], so it may
+/// only fire when the user configured NO endpoint (URL/env URL) AND NO api key
+/// — otherwise the swap would silently drop a configured credential and 401 at
+/// request time. Pure; the anchor for the startup-gate unit test.
+pub(super) const fn should_detect_local_chat(
+    chat_url: Option<&str>,
+    chat_env_url: Option<&str>,
+    chat_api_key: Option<&str>,
+) -> bool {
+    chat_url.is_none() && chat_env_url.is_none() && chat_api_key.is_none()
+}
+
 /// Persist an accepted local endpoint to the user's `config.toml`: load the
 /// existing config (or defaults), set `tui.chat_url`/`tui.chat_model`, and write
 /// it back. Best-effort — returns a human error string on failure.
@@ -427,5 +441,25 @@ mod tests {
             .expect("local server detected");
         assert_eq!(cfg.base_url, crate::skills::ROCM_SERVE_ENDPOINT);
         drop(listener);
+    }
+
+    #[test]
+    fn should_detect_only_when_no_url_env_or_key_configured() {
+        // The clean slate: nothing configured → auto-detect a local engine.
+        assert!(should_detect_local_chat(None, None, None));
+        // A configured api key must SUPPRESS the swap — detection returns a
+        // keyless config and would otherwise silently drop the key (401).
+        assert!(!should_detect_local_chat(None, None, Some("sk-configured")));
+        // An explicit URL or env URL also suppresses it (config precedence).
+        assert!(!should_detect_local_chat(
+            Some("http://cfg:1/v1"),
+            None,
+            None
+        ));
+        assert!(!should_detect_local_chat(
+            None,
+            Some("http://env:2/v1"),
+            None
+        ));
     }
 }

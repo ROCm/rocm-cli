@@ -1573,7 +1573,19 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         // `chat_model` is None, inside `resolve_llm_config`'s own fallback
         // path) — this change is conflict-minimal by leaving the
         // `resolve_llm_config` call below untouched.
-        let detected = if args.chat_url.is_none() && args.chat_env_url.is_none() {
+        //
+        // Gate on `chat_api_key.is_none()` too: local detection returns a
+        // keyless `detected_llm_config` (api_key/auth_header forced to None),
+        // so firing it when the user configured a key would SILENTLY DROP that
+        // key and 401 at request time. A configured key means "use my
+        // configured backend", so skip the swap and let `resolve_llm_config`
+        // carry the key through its normal precedence.
+        let detection_ran = chat::should_detect_local_chat(
+            args.chat_url.as_deref(),
+            args.chat_env_url.as_deref(),
+            args.chat_api_key.as_deref(),
+        );
+        let detected = if detection_ran {
             detect_local_chat(state.tool_executor.clone()).await
         } else {
             None
@@ -1583,10 +1595,16 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             .clone()
             .or_else(|| args.chat_env_url.clone())
             .unwrap_or_else(|| crate::llm::DEFAULT_CHAT_BASE_URL.to_string());
-        // A detected endpoint (managed or probed) is already verified;
-        // otherwise TCP-probe the single explicitly configured URL.
+        // A detected endpoint (managed or probed) is already verified. When
+        // detection ran and found nothing it already probed the well-known
+        // vLLM :8000 port (== `DEFAULT_CHAT_BASE_URL`), so re-probing the same
+        // fallback target here is redundant and just burns another probe
+        // timeout on a cold start — treat that as unreachable directly.
+        // Otherwise (an explicit URL/env/key path) TCP-probe the target.
         let probe_ok = if detected.is_some() {
             true
+        } else if detection_ran {
+            false
         } else {
             tokio::task::spawn_blocking(move || {
                 crate::llm::probe_endpoint(&probe_target, crate::llm::PROBE_TIMEOUT)
