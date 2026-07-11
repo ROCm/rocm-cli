@@ -165,7 +165,7 @@ pub fn parse_host_port(base_url: &str) -> Option<(String, u16)> {
 /// brackets from a bracketed IPv6 authority. Matches `localhost`
 /// (case-insensitive), the IPv6 loopback (`::1`), and any `127.0.0.0/8` IPv4
 /// address.
-fn is_loopback_host(host: &str) -> bool {
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host == "::1" || host.starts_with("127.")
 }
 
