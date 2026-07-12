@@ -4,9 +4,9 @@
 **Stage:** 8-awaiting-pr-approval
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
-**Last Updated:** 2026-07-12 (idle flush)
+**Last Updated:** 2026-07-12
 
-**Token Usage:** in=8722 out=2647778 cache_create=29642514 cache_read=1857183378 calls=4377
+**Token Usage:** in=8740 out=2653376 cache_create=30217605 cache_read=1861739877 calls=4386
 
 ---
 
@@ -772,9 +772,9 @@ addressed here with the exit-code fix + dedicated known-bugs job.
 
 ### Work Log
 
-**2026-07-12 (idle flush):** Session idle for 1 hour, auto-flushing WIP state.
-
-**2026-07-12 (Stages 1–5 + probe fix, all complete):**
-- Implemented 5-stage expectation-matrix system: capability probe (stage 1) derives engine once; resolver (stage 3) classifies each scenario pass/xfail/skip from tags+probe+expectations.toml; fixed EAI-7333 XPASS regression (run #543) by conditioning on effective_engine.
-- Grid reconciliation (stage 4): renders (scenario × platform) in markdown+HTML, joins platform.json (expected) ↔ report.json (actual) by @id, flags XPASS/unexpected failures. CI collapse (stage 5): 8 jobs → 4 per-platform, removed filters/flags.
-- Committed 5 changesets: `2327f74` (stages 1-3), `8d5f9e4` (clippy), `c4c7a6c` (stage 5), `99d5890` (probe fix: parse human examine text, disambiguate strix by OS), `61f6d1f` (docs). Verified end-to-end; live run 29195892270 re-verifying after probe fix.
+**2026-07-12 (Stages 1–5 complete, probe bugs found + fixed):**
+- Implemented 5-stage expectation-matrix system: probe derives effective engine once; resolver classifies pass/xfail/skip from tags+probe+expectations.toml; fixed EAI-7333 XPASS by conditioning on effective_engine="vllm" (run #543 Strix Windows now correct-pass).
+- Grid reconciliation: (scenario × platform) grid in markdown+HTML, joins platform.json (expected) ↔ report.json (actual) by @id, flags XPASS/unexpected failures. CI collapse: 8 jobs → 4 per-platform.
+- Run #544 verification exposed 2 probe bugs: (1) parsed examine --json (reported has_amd_gpu:false on real MI300X); fixed to parse human examine text. (2) Strix Ubuntu+Windows collided in grid (both gfx1151); fixed by appending OS to slugs → "strix-halo-linux"/"strix-halo-windows".
+- Committed 5 changesets: `2327f74` (stages 1-3), `8d5f9e4` (clippy), `c4c7a6c` (stage 5), `99d5890` (probe fix), `61f6d1f` (docs). Run 29195892270 dispatched to re-verify with probe fix. Grid now correctly surfaces real findings (e.g. lemonade failures on Strix platforms).
+- **DECISION NEEDED**: MI300X job times out at 15min with all vLLM serves; options: (a) raise timeout to ~25min (GPU non-blocking), (b) wire serve_timeout_secs from expectations.toml for xfail serves (fail-fast). Both recommended. Also: widen EAI-7052 condition to include Windows (currently os=linux only).
