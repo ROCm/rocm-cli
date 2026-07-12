@@ -485,7 +485,38 @@ async fn assert_response_model_correct(world: &mut E2eWorld) {
     let resp_model = resp["model"].as_str().unwrap_or("");
     let expected = world.model_name.as_deref().unwrap_or("");
     assert!(
-        resp_model.contains(expected),
-        "response model '{resp_model}' does not match '{expected}'"
+        model_ids_match(resp_model, expected),
+        "response model '{resp_model}' does not identify '{expected}'"
     );
+}
+
+/// Whether a chat response's `model` field identifies the model we served.
+///
+/// vLLM echoes the exact id we passed (`Qwen/Qwen2.5-1.5B-Instruct`), so a plain
+/// containment holds. Lemonade instead reports the concrete GGUF artifact it
+/// loaded — e.g. serving `Qwen3-0.6B-GGUF` yields `Qwen3-0.6B-Q4_0.gguf` — so an
+/// exact/containment check on the catalog name fails even though it IS the right
+/// model. Compare on a normalized base (lowercased, `.gguf` and the `-gguf`
+/// catalog suffix and quantization tokens like `-q4_0` stripped) and accept a
+/// match in either direction.
+fn model_ids_match(resp_model: &str, expected: &str) -> bool {
+    let a = normalize_model_id(resp_model);
+    let b = normalize_model_id(expected);
+    !a.is_empty() && !b.is_empty() && (a.contains(&b) || b.contains(&a))
+}
+
+fn normalize_model_id(id: &str) -> String {
+    let mut s = id.to_ascii_lowercase();
+    if let Some(stripped) = s.strip_suffix(".gguf") {
+        s = stripped.to_owned();
+    }
+    // Drop the catalog `-gguf` marker and common quantization suffixes so the
+    // catalog name and the concrete artifact reduce to the same base.
+    s = s.replace("-gguf", "");
+    for q in [
+        "-q4_0", "-q4_k_m", "-q4_k_s", "-q5_k_m", "-q8_0", "-f16", "-fp16",
+    ] {
+        s = s.replace(q, "");
+    }
+    s.trim_matches(['-', '_', '.']).to_owned()
 }

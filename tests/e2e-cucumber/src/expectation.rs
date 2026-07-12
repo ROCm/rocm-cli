@@ -21,6 +21,7 @@ use crate::capability::HostCapability;
 /// Tag prefixes (gherkin strips the leading `@`, so we match the bare form).
 const ID_PREFIX: &str = "id:";
 const REQUIRES_ENGINE_PREFIX: &str = "requires-engine:";
+const REQUIRES_OS_PREFIX: &str = "requires-os:";
 const REQUIRES_GPU_TAG: &str = "requires-gpu";
 
 /// The resolved expectation for one scenario on one host.
@@ -42,6 +43,10 @@ pub struct ScenarioDecl {
     pub requires_gpu: bool,
     /// Engine the scenario pins via `@requires-engine:<e>` (if any).
     pub requires_engine: Option<String>,
+    /// OS the scenario requires via `@requires-os:<os>` (e.g. "linux"), if any —
+    /// for scenarios whose premise is OS-specific (e.g. adopting a `/opt/rocm`
+    /// install only exists on Linux). Runs everywhere when absent.
+    pub requires_os: Option<String>,
 }
 
 impl ScenarioDecl {
@@ -50,12 +55,15 @@ impl ScenarioDecl {
         let mut id = None;
         let mut requires_gpu = false;
         let mut requires_engine = None;
+        let mut requires_os = None;
         for tag in tags {
             let tag = tag.as_ref();
             if let Some(rest) = tag.strip_prefix(ID_PREFIX) {
                 id = Some(rest.to_owned());
             } else if let Some(rest) = tag.strip_prefix(REQUIRES_ENGINE_PREFIX) {
                 requires_engine = Some(rest.to_owned());
+            } else if let Some(rest) = tag.strip_prefix(REQUIRES_OS_PREFIX) {
+                requires_os = Some(rest.to_ascii_lowercase());
             } else if tag == REQUIRES_GPU_TAG {
                 requires_gpu = true;
             }
@@ -64,6 +72,7 @@ impl ScenarioDecl {
             id,
             requires_gpu,
             requires_engine,
+            requires_os,
         }
     }
 
@@ -219,7 +228,8 @@ pub struct PlatformManifest<'a> {
 /// Resolve a scenario's expectation on this host.
 ///
 /// 1. Not-applicable → `Skip`: a `@requires-gpu` scenario on a host with no AMD
-///    GPU, or a scenario whose effective engine can't start here.
+///    GPU, a `@requires-os:<os>` scenario on a different OS, or a scenario whose
+///    effective engine can't start here.
 /// 2. First matching `expectations.toml` condition → `ExpectXfail`.
 /// 3. Otherwise → `ExpectPass`.
 pub fn resolve(decl: &ScenarioDecl, cap: &HostCapability, matrix: &Expectations) -> Expectation {
@@ -227,6 +237,13 @@ pub fn resolve(decl: &ScenarioDecl, cap: &HostCapability, matrix: &Expectations)
     if decl.requires_gpu && !cap.has_amd_gpu {
         return Expectation::Skip {
             reason: "requires an AMD GPU; none detected on this host".to_owned(),
+        };
+    }
+    if let Some(os) = &decl.requires_os
+        && !os.eq_ignore_ascii_case(&cap.os_family)
+    {
+        return Expectation::Skip {
+            reason: format!("requires os '{os}'; this host is '{}'", cap.os_family),
         };
     }
     let engine = decl.effective_engine(cap);
@@ -425,6 +442,28 @@ serve_timeout_secs = 90
         // Strix Windows: vLLM can't start → skip (N/A).
         assert!(matches!(
             resolve(&d, &cap("strix-windows"), &m),
+            Expectation::Skip { .. }
+        ));
+    }
+
+    #[test]
+    fn requires_os_skips_on_other_os() {
+        let m = Expectations::default();
+        // Linux-only scenario (e.g. adopt /opt/rocm): runs on Linux hosts, skips
+        // on Windows.
+        let d = decl(&["id:runtime-adopt-preexisting-rejected", "requires-os:linux"]);
+        // Runs on a Linux GPU host; skips where os_family != linux (windows, and
+        // the "other" fixture host).
+        assert_eq!(
+            resolve(&d, &cap("strix-ubuntu"), &m),
+            Expectation::ExpectPass
+        );
+        assert!(matches!(
+            resolve(&d, &cap("strix-windows"), &m),
+            Expectation::Skip { .. }
+        ));
+        assert!(matches!(
+            resolve(&d, &cap("mock"), &m),
             Expectation::Skip { .. }
         ));
     }
