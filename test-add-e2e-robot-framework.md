@@ -774,3 +774,5 @@ addressed here with the exit-code fix + dedicated known-bugs job.
 - Implemented all 5 stages of per-scenario expectation resolution. Capability probe derives effective engine once; resolver uses tags + probe + expectations.toml to classify each scenario pass/xfail/skip. Fixed EAI-7333 XPASS regression (run #543) by conditioning on effective_engine.
 - Stage 4 renders (scenario × platform) grid in markdown step-summary + HTML report, joins platform.json (expected) ↔ report.json (actual) by @id, flags XPASS/regressions. Stage 5 collapsed 8 CI jobs → 4 (one per platform), removed tag filters + --expect-failures flag.
 - Committed 3 changesets (`2327f74` core logic, `8d5f9e4` clippy fixes, `c4c7a6c` CI collapse) to ci-e2e-framework-fixes. All 43 lib tests pass, clippy-clean, end-to-end verified (8 pass / 2 xfail / 11 skip). Dispatched full platform=all run 29193461214 on live hardware for regression verification.
+
+**2026-07-12 (idle flush):** Session idle for 1 hour, auto-flushing WIP state.
