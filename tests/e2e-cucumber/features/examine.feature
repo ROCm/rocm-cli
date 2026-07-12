@@ -1,21 +1,23 @@
 Feature: GPU detection and system inspection
 
+  @id:examine-version
   Scenario: 1 - The CLI reports its version
     When the user asks for the version
     Then a version string is returned
 
+  @id:examine-engines-list
   Scenario: 2 - The CLI lists all supported engines
     When the user lists available engines
     Then all supported engines are listed
 
-  @gpu
+  @id:examine-detects-gpu-and-driver @requires-gpu
   Scenario: 3 - System inspection detects the GPU and driver
     Given a machine with an AMD GPU
     When the user inspects the system
     Then the inspection reports which GPU is installed
     And the inspection reports that the driver is available
 
-  @gpu
+  @id:examine-distinguishes-unmanaged-rocm @requires-gpu
   Scenario: 4 - System inspection distinguishes CLI-managed from pre-existing ROCm
     Given a machine with a ROCm install that was not set up by the CLI
     When the user inspects the system

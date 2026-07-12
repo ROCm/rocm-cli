@@ -19,6 +19,7 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile = "3"
 tokio.workspace = true
+toml = "0.8"
 
 [[test]]
 name = "e2e"
