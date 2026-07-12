@@ -6,7 +6,7 @@
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-12
 
-**Token Usage:** in=8630 out=2619304 cache_create=29048485 cache_read=1832324339 calls=4331
+**Token Usage:** in=8722 out=2647778 cache_create=29642514 cache_read=1857183378 calls=4377
 
 ---
 
@@ -762,17 +762,17 @@ addressed here with the exit-code fix + dedicated known-bugs job.
 - **Commits**: `2327f74` (Stages 1-3), `8d5f9e4` (clippy), `c4c7a6c` (Stage 5) — all pushed to
   ci-e2e-framework-fixes. 43 lib tests pass (19 e2e-cucumber + 24 e2e-report), all crates clippy-clean
   under -D warnings, ci.yml parses to exactly 4 E2E jobs.
-- 🔬 **VERIFYING**: dispatched full `platform=all` run 29193461214 on the collapsed workflow to confirm
-  the grid renders across all 4 real platforms with no XPASS (the run #543 regression, now fixed).
-- **ALL 5 STAGES COMPLETE.** Remaining follow-ups are separate tasks: #16 (product probe for effective
-  engine — swap the re-implemented rule), #14 (CLI coverage denominator), #15 (install/examine/serve/dash
-  coverage incl. TUI).
+- ✅ **Stage 5 run #544 verification surfaced 2 probe bugs** (GPU detection failed under isolated env, Strix
+  Ubuntu+Windows collided into one grid column). Fixed by: (1) parsing human `examine` text instead of `--json`
+  (GPU signal scenarios trust), (2) appending OS to gfx-family slugs → "strix-halo-linux"/"strix-halo-windows".
+  Commits `99d5890` + `61f6d1f`; dispatched run 29195892270 for re-verification. Grid now correctly surfaces
+  real findings (e.g. lemonade-inference failure on Strix as unexpected, worth triaging).
+- **ALL 5 STAGES COMPLETE + PROBE FIXED.** Remaining follow-ups: #16 (product probe rule), #14 (coverage
+  denominator), #15 (install/examine/serve/dash + TUI coverage).
 
 ### Work Log
 
-**2026-07-12 (Stages 1–5 complete, expectation-matrix system deployed):**
-- Implemented all 5 stages of per-scenario expectation resolution. Capability probe derives effective engine once; resolver uses tags + probe + expectations.toml to classify each scenario pass/xfail/skip. Fixed EAI-7333 XPASS regression (run #543) by conditioning on effective_engine.
-- Stage 4 renders (scenario × platform) grid in markdown step-summary + HTML report, joins platform.json (expected) ↔ report.json (actual) by @id, flags XPASS/regressions. Stage 5 collapsed 8 CI jobs → 4 (one per platform), removed tag filters + --expect-failures flag.
-- Committed 3 changesets (`2327f74` core logic, `8d5f9e4` clippy fixes, `c4c7a6c` CI collapse) to ci-e2e-framework-fixes. All 43 lib tests pass, clippy-clean, end-to-end verified (8 pass / 2 xfail / 11 skip). Dispatched full platform=all run 29193461214 on live hardware for regression verification.
-
-**2026-07-12 (idle flush):** Session idle for 1 hour, auto-flushing WIP state.
+**2026-07-12 (Stages 1–5 + probe fix, all complete):**
+- Implemented 5-stage expectation-matrix system: capability probe (stage 1) derives engine once; resolver (stage 3) classifies each scenario pass/xfail/skip from tags+probe+expectations.toml; fixed EAI-7333 XPASS regression (run #543) by conditioning on effective_engine.
+- Grid reconciliation (stage 4): renders (scenario × platform) in markdown+HTML, joins platform.json (expected) ↔ report.json (actual) by @id, flags XPASS/unexpected failures. CI collapse (stage 5): 8 jobs → 4 per-platform, removed filters/flags.
+- Committed 5 changesets: `2327f74` (stages 1-3), `8d5f9e4` (clippy), `c4c7a6c` (stage 5), `99d5890` (probe fix: parse human examine text, disambiguate strix by OS), `61f6d1f` (docs). Verified end-to-end; live run 29195892270 re-verifying after probe fix.
