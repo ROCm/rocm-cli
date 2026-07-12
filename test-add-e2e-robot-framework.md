@@ -6,7 +6,7 @@
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-12
 
-**Token Usage:** in=7721 out=2246816 cache_create=23865778 cache_read=1667458626 calls=3873
+**Token Usage:** in=7877 out=2291759 cache_create=25046245 cache_read=1683994303 calls=3951
 
 ---
 
@@ -201,6 +201,19 @@ harness). Keep separate from framework-reliability fixes.
   this is an unsupported-hardware expectation or a real bug — NEEDS TRIAGE on the box.
   Until triaged, the Strix jobs are `continue-on-error` (non-blocking) so they don't
   gate the PR. Candidate: file EAI ticket once characterized.
+
+## 🎉 ALL 4 PLATFORMS GREEN — GOAL MET (2026-07-12)
+Strix Ubuntu runner brought back online (user ran `sudo ./svc.sh install` + `start` on the box;
+it had no service unit installed). Dispatched expect-pass run **29185072965** (commit 80d1997).
+**Verified from junit artifact: 4 testcases, 0 failures, 0 errors** — examine 3, examine 4
+(hermetic scenario-4 fix), serving 9, runtime 1. Job 08:14:10→08:14:37 = **~27s** (toolchain warm;
+nvme-dir prep + reclaim-GPU step handled the full-root-disk issue). Final scoreboard, all ≤15min:
+- Mock (hosted ubuntu/win/mac): 8/8, ~1m55s (run 29161942060)
+- app-dev MI300X: 4/4, ~1m56s (run 29161621191)
+- Strix Windows: 4/4, ~3m49s (run 29162356843)
+- **Strix Ubuntu gfx1151: 4/4, ~27s (run 29185072965)** ← last platform, now confirmed
+FOLLOW-UP (task #13): examine scenario 4's setup is a thin prime (single ROCM_PATH marker file);
+rework to a faithful ROCm-tree prime + explicit teardown so it's a true user-behavior E2E.
 
 ## ✅ STRIX WINDOWS EXPECT-PASS GREEN (run 29162356843, 80d1997) — 4/4 pass in ~3m49s (≤15 ✓✓)
 The hermetic scenario-4 fix works on the real Strix Halo Windows box. **Verified from junit
@@ -470,18 +483,23 @@ Framework/harness/CI issues to fix fast via the scratch-branch + manual-dispatch
 
 ## Work Log
 
-**2026-07-12:**
-- ✅ **Root-caused & fixed Strix Windows scenario 4 failure** (commit 80d1997): precondition was no-op,
-  silently relied on ambient system ROCm. Made hermetic by planting fake ROCm dir, exported via
-  ROCM_PATH. detect_legacy_rocm_summary honors ROCM_PATH → examine reports detected_unmanaged +
-  "rocm install sdk" guidance on every platform. Verified locally (Mac, no GPU), then on Strix Windows real hardware.
-- ✅ **Strix Windows expect-pass GREEN** (run 29162356843, 80d1997): 4/4 pass in ~3m49s (≤15min ✓).
-  Scenario 4 now passes; bootstrap (PowerShell rustup) validated end-to-end. Artifact confirmed.
-- ✅ **3 of 4 platforms verified green** (all ≤15min, all from junit artifacts):
-  Mock 8/8 ~1m55s; app-dev 4/4 ~1m56s; Strix Windows 4/4 ~3m49s.
-- ❌ **Strix Ubuntu runner remains offline** (re-confirmed via API). No code change reaches it;
-  needs user to start the runner on the box (`cd ~/actions-runner && ./run.sh`).
-- 📋 **Known-bugs tier**: user accepted as-is (non-blocking, vLLM cold-start is hard floor).
+**2026-07-12 (final session update):**
+- ✅ **ALL 4 PLATFORMS VERIFIED GREEN** — **expect-pass goal fully met**.
+  Strix Ubuntu runner brought back online by user (ran `sudo ./svc.sh install && start` on box).
+  Dispatched run 29185072965 (commit 80d1997): 4/4 pass, ~27s (≤15min ✓).
+  Final scoreboard: Mock 8/8 ~1m55s, app-dev 4/4 ~1m56s, Strix Windows 4/4 ~3m49s, Strix Ubuntu 4/4 ~27s.
+- ✅ **Scenario 4 hermetic fix validated on all platforms** (commit 80d1997): planted ROCm tree + ROCM_PATH override.
+  User feedback: rework setup to faithful ROCm-tree prime + explicit teardown (task #13).
+- ✅ **GitHub Actions security review** (from https://docs.github.com/en/actions/reference/security/secure-use):
+  Identified gaps + added to security backlog: task #9 (CODEOWNERS), #10 (enable code-owner review),
+  #11 (JIT/ephemeral runners), #12 (private-mirror repo for self-hosted).
+- ✅ **Full run dispatched** (29185765632, platform=all tier=both) for consolidated report with all 4 platforms + tiers.
+  Background watcher polling for completion.
+
+**2026-07-12 (earlier):**
+- ✅ Root-caused & fixed Strix Windows scenario 4 failure (commit 80d1997): hermetic ROCM_PATH plant.
+- ✅ Strix Windows expect-pass GREEN (run 29162356843, 4/4 ~3m49s).
+- ✅ 3 of 4 platforms verified green.
 
 **2026-07-11 (continued):**
 - ✅ Reclassified scenario 6 (default-engine serve, 1.5B readiness timeout) to known-bugs
