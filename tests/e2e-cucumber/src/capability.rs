@@ -141,13 +141,20 @@ fn probe_host_capability() -> HostCapability {
         tempfile::TempDir::with_prefix("rocm-e2e-probe-").expect("failed to create probe temp dir");
     let root = tmp.path();
 
-    let examine = run_probe(root, &["examine", "--json"]);
+    // Parse the HUMAN `examine` text, not `--json`: the two disagree on GPU
+    // detection on the self-hosted runners (the JSON `Examination` reported
+    // has_amd_gpu:false / no gfx on a real MI300X, while the human text — the
+    // signal the scenarios themselves trust via `detected_gfx_target:` — reports
+    // it correctly). Keying on the human text keeps the probe consistent with
+    // what the scenarios see.
+    let examine = run_probe(root, &["examine"]);
     let engines = run_probe(root, &["engines", "list"]);
 
-    let (os_family, is_wsl, has_amd_gpu, gfx_target) = parse_examine_json(&examine);
+    let (os_family, is_wsl, gfx_target) = parse_examine_text(&examine);
+    let has_amd_gpu = gfx_target.is_some();
     let available_engines = parse_engines_list(&engines);
     let effective_serve_engine = effective_serve_engine(gfx_target.as_deref(), &os_family);
-    let platform_slug = derive_platform_slug(has_amd_gpu, gfx_target.as_deref());
+    let platform_slug = derive_platform_slug(has_amd_gpu, gfx_target.as_deref(), &os_family);
 
     HostCapability {
         os_family,
@@ -174,35 +181,29 @@ fn run_probe(root: &std::path::Path, args: &[&str]) -> String {
     }
 }
 
-/// Extract `(os_family, is_wsl, has_amd_gpu, first_gfx_target)` from
-/// `examine --json`. Tolerant: unknown/missing fields degrade to a mock-like
-/// host (os_family "other", no GPU).
-fn parse_examine_json(json: &str) -> (String, bool, bool, Option<String>) {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
-        return ("other".to_owned(), false, false, None);
-    };
-    let os_family = v
-        .get("os_family")
-        .and_then(|x| x.as_str())
-        .unwrap_or("other")
-        .to_ascii_lowercase();
-    let is_wsl = v
-        .get("is_wsl")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let has_amd_gpu = v
-        .get("has_amd_gpu")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let gfx_target = v.get("gpus").and_then(|g| g.as_array()).and_then(|arr| {
-        arr.iter().find_map(|gpu| {
-            gpu.get("gfx_target")
-                .and_then(|t| t.as_str())
-                .filter(|s| !s.trim().is_empty())
-                .map(str::to_owned)
-        })
-    });
-    (os_family, is_wsl, has_amd_gpu, gfx_target)
+/// Extract `(os_family, is_wsl, first_gfx_target)` from the human `rocm examine`
+/// text (format string in rocm-core `ExamineSummary`): lines like `  os: linux`,
+/// `  detected_gfx_target: gfx942`, `  wsl: false`. A missing/placeholder
+/// (`<unknown>`, empty, `none`) gfx target yields `None` (→ treated as no GPU).
+/// Tolerant: an unrecognized dump degrades to a mock-like host.
+fn parse_examine_text(text: &str) -> (String, bool, Option<String>) {
+    let mut os_family = "other".to_owned();
+    let mut is_wsl = false;
+    let mut gfx_target = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("os:") {
+            os_family = v.trim().to_ascii_lowercase();
+        } else if let Some(v) = line.strip_prefix("detected_gfx_target:") {
+            let v = v.trim();
+            if !v.is_empty() && v != "<unknown>" && v != "none" {
+                gfx_target = Some(v.to_owned());
+            }
+        } else if let Some(v) = line.strip_prefix("wsl:") {
+            is_wsl = matches!(v.trim(), "true" | "yes" | "1");
+        }
+    }
+    (os_family, is_wsl, gfx_target)
 }
 
 /// Parse engine names from `rocm engines list`. Engine rows are the lines whose
@@ -225,8 +226,11 @@ fn parse_engines_list(text: &str) -> Vec<String> {
 
 /// Stable platform identity from hardware. No AMD GPU → "mock". Otherwise a
 /// coarse slug from the gfx family (data-center → "mi300x"; Strix gfx115x →
-/// "strix-halo"), falling back to the normalized family.
-fn derive_platform_slug(has_amd_gpu: bool, gfx_target: Option<&str>) -> String {
+/// "strix-halo"), falling back to the normalized family. The OS is appended for
+/// families that ship on more than one OS (Strix Halo runs both Ubuntu and
+/// Windows on the same gfx1151), so those become distinct grid columns rather
+/// than colliding into one.
+fn derive_platform_slug(has_amd_gpu: bool, gfx_target: Option<&str>, os_family: &str) -> String {
     if !has_amd_gpu {
         return "mock".to_owned();
     }
@@ -236,12 +240,25 @@ fn derive_platform_slug(has_amd_gpu: bool, gfx_target: Option<&str>) -> String {
             if f.ends_with("-dcgpu") {
                 "mi300x".to_owned()
             } else if f.starts_with("gfx115") {
-                "strix-halo".to_owned()
+                // Same silicon on Ubuntu and Windows — disambiguate by OS.
+                format!("strix-halo-{}", os_normalized(os_family))
             } else {
                 f
             }
         }
         None => "mock".to_owned(),
+    }
+}
+
+/// Short OS token for a platform slug: "windows" / "linux" / else the raw value.
+fn os_normalized(os_family: &str) -> String {
+    let o = os_family.trim().to_ascii_lowercase();
+    if o.contains("windows") {
+        "windows".to_owned()
+    } else if o.contains("linux") {
+        "linux".to_owned()
+    } else {
+        o
     }
 }
 
@@ -324,22 +341,34 @@ mod tests {
     }
 
     #[test]
-    fn parses_examine_json() {
-        let json = r#"{"os_family":"linux","is_wsl":false,"has_amd_gpu":true,
-            "gpus":[{"name":"AMD Instinct MI300X","gfx_target":"gfx942"}]}"#;
-        let (os, wsl, gpu, gfx) = parse_examine_json(json);
+    fn parses_examine_text_gpu_host() {
+        // Human `rocm examine` dump (subset of the real format).
+        let text = "\
+rocm examine
+  os: linux
+  arch: x86_64
+  detected_gfx_target: gfx942
+  detected_therock_family: gfx94X-dcgpu
+  wsl: false
+  driver_status: ok
+";
+        let (os, wsl, gfx) = parse_examine_text(text);
         assert_eq!(os, "linux");
         assert!(!wsl);
-        assert!(gpu);
         assert_eq!(gfx.as_deref(), Some("gfx942"));
     }
 
     #[test]
-    fn parses_examine_json_mock_host() {
-        let json = r#"{"os_family":"other","is_wsl":false,"has_amd_gpu":false,"gpus":[]}"#;
-        let (os, _, gpu, gfx) = parse_examine_json(json);
+    fn parses_examine_text_mock_host() {
+        // No GPU: detected_gfx_target is the <unknown> placeholder.
+        let text = "\
+rocm examine
+  os: other
+  detected_gfx_target: <unknown>
+  wsl: false
+";
+        let (os, _, gfx) = parse_examine_text(text);
         assert_eq!(os, "other");
-        assert!(!gpu);
         assert_eq!(gfx, None);
     }
 
@@ -361,8 +390,20 @@ Local model engines
 
     #[test]
     fn platform_slug_derivation() {
-        assert_eq!(derive_platform_slug(false, None), "mock");
-        assert_eq!(derive_platform_slug(true, Some("gfx942")), "mi300x");
-        assert_eq!(derive_platform_slug(true, Some("gfx1151")), "strix-halo");
+        assert_eq!(derive_platform_slug(false, None, "other"), "mock");
+        assert_eq!(
+            derive_platform_slug(true, Some("gfx942"), "linux"),
+            "mi300x"
+        );
+        // Strix Halo: same gfx1151 silicon on both OSes → distinct slugs so the
+        // report grid gets a column per platform, not a collision.
+        assert_eq!(
+            derive_platform_slug(true, Some("gfx1151"), "linux"),
+            "strix-halo-linux"
+        );
+        assert_eq!(
+            derive_platform_slug(true, Some("gfx1151"), "windows"),
+            "strix-halo-windows"
+        );
     }
 }
