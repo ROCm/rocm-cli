@@ -12,6 +12,63 @@
 
 ---
 
+## ⏸️ STOPPED: runtime-sharing (#22) needs a redesign — full situation (2026-07-12 late)
+
+**Where the goal stands (5 of 7 conditions met, verified on real hardware):**
+- ✅ Mock 8/8 (run 29161942060) · app-dev MI300X expect-pass 4/4 ~2min earlier
+  (29161621191) · Strix Windows 4/4 after fixes (29201768234) · Strix Ubuntu
+  expect-pass 4/4 ~27s (29185072965).
+- ✅ Expectation-matrix system (Stages 1–5), probe-from-examine-text, per-OS grid
+  columns, coverage % + uncovered fold-out (0fc67d1), dash journey tests
+  (f315ba0). Committed + pushed; 43+ lib tests green; clippy clean.
+- ✅ Windows "failures" triaged + FIXED as test bugs (89312ed): lemonade inference
+  works on Windows (assertion too strict on GGUF model name); adopt scenario gated
+  `@requires-os:linux` (Unix-path premise).
+
+**The one blocking item — condition 4 for the COLLAPSED GPU run:**
+One job per platform now runs ALL serve scenarios. On MI300X `rocm install sdk`
+ran **9×** (once per isolated scenario, each a multi-GB TheRock cold install) →
+~37min, CANCELLED before writing platform.json (= no grid column). Raising the
+cap 15→25→35 didn't help; the install count is the cost.
+
+**What I tried (task #22, commit 1817c5b) and why it's not done:**
+- Harness `use_shared_runtimes()`: symlinks a scenario's `data/runtimes` at a
+  shared `E2E_SHARED_RUNTIMES_DIR`, opt-in from "a managed runtime is active"
+  only; clean-slate scenarios stay isolated; active resolves via
+  most-recently-installed fallback. **Sound + safe** — NO-OP unless the env var is
+  set (mock/local verified unaffected: 7 pass / 2 xfail).
+- CI pre-warm (e2e-gpu only): **FAILED validation** (run 29205441532):
+  1. used `cargo run -p rocm --release` → redundant release rebuild (~5min);
+  2. cold first-run still pays the full multi-GB download in pre-warm;
+  3. still exceeded 35min AND a scenario still ran its own `install sdk` (sharing
+     didn't take effect / pre-warm may not have populated the shared dir before
+     time ran out).
+- **Runner wedged TWICE** past timeout (GitHub won't reap a self-hosted job
+  mid-multi-GB-install). Cleared manually:
+  `kubectl --context app-dev -n rocm-cli exec <wb-dev-workspace-vscode-...-zjm2d>
+  -- pkill Runner.Worker` (Runner.Listener kept alive). Runner now free + clean;
+  **CI pre-warm REVERTED** — branch CI back to the safe pre-sharing baseline
+  (harness change stays, dormant).
+
+**Why stopped (per user):** regression-prone work that needs a proper, tested
+design pass, not live-patching against 35-min GPU dispatches that wedge the
+runner. Redesign questions for #22:
+  - Pre-warm must use the already-built DEBUG binary (drop `cargo run --release`);
+    build rocm once, pass `ROCM_CLI_BINARY` to both pre-warm + suite.
+  - Verify a scenario whose `data/runtimes` is a symlink to a populated shared
+    registry actually reports "installed" (failed run suggests NOT — check
+    `runtimes list` through a symlink, and whether pre-warm populated the shared
+    dir at all before being killed).
+  - Make pre-warm a SEPARATE CI step/job off the E2E clock; persist the shared
+    runtime across runs (`$RUNNER_WORKSPACE`).
+  - First-run cold ~3.4GB download is unavoidable once; decide if acceptable vs a
+    warmed runner image.
+Task #22 stays in_progress with this diagnosis; #23 (Strix default-engine serve,
+same cold-install root cause) stays blocked on #22.
+
+**Fallback if #22 stays hard:** revert 1817c5b and set GPU cap ~60min so the
+collapsed run completes + writes platform.json (condition 4's letter, no sharing).
+
 ## North-star goal (2026-07-12)
 
 Deliver a black-box E2E suite for rocm-cli whose consolidated report is a
