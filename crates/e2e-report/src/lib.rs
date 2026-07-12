@@ -235,10 +235,11 @@ fn scenario_id(el: &Element) -> Option<String> {
         .find_map(|t| t.name.strip_prefix(ID_TAG_PREFIX).map(str::to_owned))
 }
 
-/// Map each scenario's stable `@id` → whether it passed, read from a completed
-/// run's `report.json`. Scenarios without an `@id` tag are skipped (the new
-/// system requires every scenario to carry one). Used by the harness to
-/// reconcile actual results against per-scenario expectations.
+/// Map each scenario's stable `@id` → whether it passed.
+///
+/// Read from a completed run's `report.json`. Scenarios without an `@id` tag are
+/// skipped (the new system requires every scenario to carry one). Used by the
+/// harness to reconcile actual results against per-scenario expectations.
 pub fn scenario_results_by_id(json_path: &Path) -> std::io::Result<Vec<(String, bool)>> {
     let json = std::fs::read_to_string(json_path)?;
     let features: Vec<Feature> = serde_json::from_str(&json).unwrap_or_default();
@@ -685,7 +686,7 @@ impl Grid {
         out
     }
 
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.columns.is_empty() || self.ids.is_empty()
     }
 }

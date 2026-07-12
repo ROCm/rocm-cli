@@ -93,15 +93,15 @@ pub struct Condition {
 impl Condition {
     /// Does this condition hold for the given host + resolved engine?
     fn matches(&self, cap: &HostCapability, effective_engine: &str) -> bool {
-        if let Some(e) = &self.effective_engine {
-            if !e.eq_ignore_ascii_case(effective_engine) {
-                return false;
-            }
+        if let Some(e) = &self.effective_engine
+            && !e.eq_ignore_ascii_case(effective_engine)
+        {
+            return false;
         }
-        if let Some(os) = &self.os {
-            if !os.eq_ignore_ascii_case(&cap.os_family) {
-                return false;
-            }
+        if let Some(os) = &self.os
+            && !os.eq_ignore_ascii_case(&cap.os_family)
+        {
+            return false;
         }
         if let Some(fam) = &self.therock_family {
             let host_fam = cap.gfx_target.as_deref().unwrap_or("");
@@ -109,10 +109,10 @@ impl Condition {
                 return false;
             }
         }
-        if let Some(w) = self.is_wsl {
-            if w != cap.is_wsl {
-                return false;
-            }
+        if let Some(w) = self.is_wsl
+            && w != cap.is_wsl
+        {
+            return false;
         }
         true
     }
@@ -149,18 +149,19 @@ impl Expectations {
 
 /// Serializable outcome label for a resolved scenario (for `platform.json`).
 impl Expectation {
-    pub fn label(&self) -> &'static str {
+    pub const fn label(&self) -> &'static str {
         match self {
-            Expectation::ExpectPass => "pass",
-            Expectation::ExpectXfail { .. } => "xfail",
-            Expectation::Skip { .. } => "skip",
+            Self::ExpectPass => "pass",
+            Self::ExpectXfail { .. } => "xfail",
+            Self::Skip { .. } => "skip",
         }
     }
 }
 
-/// One scenario's resolution on this host, recorded for `platform.json` so the
-/// central report can reconcile expected-vs-actual by id (including scenarios
-/// that were skipped, which never appear in cucumber's `report.json`).
+/// One scenario's resolution on this host, recorded for `platform.json`.
+///
+/// Lets the central report reconcile expected-vs-actual by id — including
+/// scenarios that were skipped, which never appear in cucumber's `report.json`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ResolvedScenario {
     pub id: String,
@@ -265,10 +266,11 @@ fn glob_match(pattern: &str, text: &str) -> bool {
         }
     }
     // Last part must anchor at the end unless the pattern trailed with '*'.
-    if let Some(last) = parts.last() {
-        if !last.is_empty() && !text.ends_with(last) {
-            return false;
-        }
+    if let Some(last) = parts.last()
+        && !last.is_empty()
+        && !text.ends_with(last)
+    {
+        return false;
     }
     true
 }
