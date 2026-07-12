@@ -4,7 +4,7 @@
 **Stage:** 8-awaiting-pr-approval
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
-**Last Updated:** 2026-07-12
+**Last Updated:** 2026-07-12 (idle flush)
 
 **Token Usage:** in=8271 out=2497111 cache_create=27069204 cache_read=1748846347 calls=4149
 
@@ -754,3 +754,5 @@ addressed here with the exit-code fix + dedicated known-bugs job.
 - 📋 **Stage 5** (pending): collapse 8 CI E2E jobs → 4 (one per platform), drop tag-filter/--expect-failures args.
 - **19 library unit tests all passing, build clean under -D warnings.** Three new library files staged in working tree.
 - **Token usage high** (stage 3 wiring + comprehensive testing): in=8271 out=2.5M cache_create=27M cache_read=1.7B.
+
+**2026-07-12 (idle flush):** Session idle for 1 hour, auto-flushing WIP state.
