@@ -1,16 +1,60 @@
 
 # WIP: E2E BDD tests for rocm-cli (PR #69, cucumber-rs)
 
-**Stage:** 9-all-fixes-pushed-ready-for-review
+**Stage:** 10-4platform-report-complete
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
-**Last Updated:** 2026-07-12
+**Last Updated:** 2026-07-13
 
-**Status:** Expectation-matrix Stages 1–5 complete + pushed (origin/ci-e2e-framework-fixes). Run 29209242248 (e800661, 90min GPU caps) live: Mock/Strix-Windows/Strix-Ubuntu complete (3/4 columns done), MI300X in progress. Identified report Status column defect: uses raw junit, not expectation-matrix reconciliation → Mock shows FAIL despite 0 unexpected/0 XPASS.
+**Status:** ✅ GOAL MET — complete 4-platform consolidated E2E report generated from run 29209242248 (all of mock / MI300X / Strix-Ubuntu / Strix-Windows produced platform.json + report.json). Overnight: found + fixed the report Status-column defect (used raw junit, not expectation reconciliation → clean platforms wrongly shown FAIL); fix committed `afbabc8` + pushed to origin/ci-e2e-framework-fixes, container-verified (0 unexpected, 28 e2e-report tests, clippy clean). Corrected report rendered locally with the fixed binary. Only outstanding red = the 2 known Strix-Ubuntu serve-default-engine-* test-bug fails (task #23), which the grid correctly surfaces.
 
 **Token Usage:** in=8868 out=2694429 cache_create=30600958 cache_read=1868833248 calls=4450
 
 ---
+
+## ✅ OVERNIGHT OUTCOME (2026-07-13 — READ THIS FIRST)
+
+**The 4-platform consolidated report is done.** Run **29209242248** (commit `e800661`,
+90min GPU caps) completed successfully: MI300X finished ~66min (under cap), all 4
+platforms wrote `platform.json` + `report.json`.
+
+**Per-platform result (expectation-reconciled, from the corrected report):**
+| Platform | Engine | Pass | Fail | Xfail | Skip | Status |
+|---|---|--:|--:|--:|--:|:--|
+| MI300X | vllm | 12 | 0 | 9 | 0 | ✅ PASS |
+| Mock | lemonade | 8 | 0 | 2 | 11 | ✅ PASS |
+| Strix Halo Windows | lemonade | 14 | 0 | 2 | 5 | ✅ PASS |
+| Strix Halo Ubuntu | lemonade | 12 | **2** | 3 | 4 | ❌ FAIL |
+
+- **0 XPASS**, **0 ran-when-N/A** across all 4 platforms.
+- The **only** unexpected fails are the 2 known Strix-Ubuntu `serve-default-engine-inference`
+  + `serve-default-engine-working-endpoint` (task #23 test bug — lemonade first-serve
+  downloads ~3.4GB, assertion scrapes the download log). Documented, acceptable.
+- Nice cross-platform signal the grid now surfaces honestly: `serve-lemonade-inference`
+  is ✅ on Strix-Windows but xfail (EAI-7052) on MI300X/Strix-Ubuntu — engine-conditioned
+  expectations handle it with no XPASS.
+- CLI surface coverage line: **7/43 commands (16%)** exercised by ≥1 platform.
+
+**Report defect found + FIXED overnight (`afbabc8`, pushed to origin/ci-e2e-framework-fixes):**
+The consolidated report's summary **Status** column (and Pass/Fail/Skip/Xfail counts)
+derived from raw junit, not the id-keyed expectation reconciliation the grid uses — so
+Mock/Strix-Windows showed **FAIL** despite 0 unexpected/0 XPASS (a known-bug xfail was
+miscounted as a failure). The report contradicted itself. Fix: summary status + counts
+now come from the same reconciliation as the grid (xfail is healthy; only unexpected-fail
+/ XPASS / ran-when-NA red a platform); pre-expectation artifacts fall back to junit.
+Container suite green (0 unexpected), 28 e2e-report tests, clippy clean under -D warnings.
+NOTE: the CI job `e2e-consolidated-report` in run 29209242248 rendered with the OLD e800661
+code (wrong FAIL statuses). The corrected report was rendered LOCALLY with the fixed binary
+from the same artifacts (artifacts are data; only rendering changed).
+
+**Corrected report saved:** `/Users/fres/Developer/rocm-cli-progress/e2e-report-29209242248-corrected/`
+(`consolidated.html` + `summary.md` + the 4 platform.json/report.json for provenance).
+Run URL: https://github.com/ROCm/rocm-cli/actions/runs/29209242248
+
+**To show a clean report in CI too:** re-dispatch `gh workflow run ci.yml --ref ci-e2e-framework-fixes -f platform=all`
+now that `afbabc8` is on origin — its `e2e-consolidated-report` will render with the fix.
+(Not done overnight to avoid another ~66min GPU cycle; the local corrected report already
+satisfies the goal.)
 
 ## 🌙 RESUME STATE (context cleared 2026-07-12 late — read this first)
 
@@ -28,7 +72,9 @@
 - `#23` [BLOCKED on #22] Fix default-engine serve assertion for lemonade-default platforms (Strix) — test bug: lemonade first-serve downloads ~3.4GB, assertion scrapes the download log for `engine:`. Fix = read engine from a deterministic source (services list / serve plan) after pre-warm, not the streaming log.
 - DONE this session: #14 (coverage %), #15 (install/examine/serve/dash incl. dash journey tests), #17-21 (expectation-matrix Stages 1-5).
 
-**In flight:** full CI run **29209242248** on branch `ci-e2e-framework-fixes` (commit `e800661`) — `platform=all`, GPU job caps raised to **90min** so MI300X (~37min, 9× per-scenario install sdk) completes + writes platform.json instead of being cancelled. When all E2E jobs finish, the `e2e-report` job renders `e2e-consolidated-report` (grid + coverage % + command table).
+**In flight:** NONE — run **29209242248** COMPLETED (all 4 platforms wrote platform.json;
+see the ✅ OVERNIGHT OUTCOME section above). Latest origin/ci-e2e-framework-fixes HEAD is
+`afbabc8` (report status-reconciliation fix, on top of e800661).
 
 **Durable cron `c8eccc60`** (every 20min, in `.claude/scheduled_tasks.json`) drives the overnight follow-through: checks the run, downloads the report, and fixes issues WITHOUT asking — clears a wedged runner + re-dispatches, or fixes clear test-bug assertions + commits/pushes/re-dispatches. It updates this WIP with the outcome when a complete report exists, then stops.
 

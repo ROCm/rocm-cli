@@ -1,0 +1,131 @@
+{
+  "platform_slug": "strix-halo-windows",
+  "capability": {
+    "os_family": "windows",
+    "is_wsl": false,
+    "gfx_target": "gfx1151",
+    "has_amd_gpu": true,
+    "available_engines": [
+      "lemonade",
+      "vllm"
+    ],
+    "effective_serve_engine": "lemonade",
+    "platform_slug": "strix-halo-windows"
+  },
+  "expectations": [
+    {
+      "id": "chat-end-to-end-local-model",
+      "effective_engine": "vllm",
+      "expected": "skip",
+      "reason": "engine 'vllm' cannot start on this host (strix-halo-windows)"
+    },
+    {
+      "id": "chat-endpoint-shown-in-services",
+      "effective_engine": "lemonade",
+      "expected": "pass"
+    },
+    {
+      "id": "chat-privacy-notice-accurate",
+      "effective_engine": "lemonade",
+      "expected": "pass"
+    },
+    {
+      "id": "chat-served-model-discoverable",
+      "effective_engine": "lemonade",
+      "expected": "pass"
+    },
+    {
+      "id": "chat-tool-definitions-accepted",
+      "effective_engine": "vllm",
+      "expected": "skip",
+      "reason": "engine 'vllm' cannot start on this host (strix-halo-windows)"
+    },
+    {
+      "id": "examine-detects-gpu-and-driver",
+      "effective_engine": "lemonade",
+      "expected": "pass"
+    },
+    {
+      "id": "examine-distinguishes-unmanaged-rocm",
+      "effective_engine": "lemonade",
+      "expected": "pass"
+    },
+    {
+      "id": "examine-engines-list",
+      "effective_engine": "lemonade",
+      "expected": "pass"
+    },
+    {
+      "id": "examine-version",
+      "effective_engine": "lemonade",
+      "expected": "pass"
+    },
+    {
+      "id": "runtime-adopt-preexisting-rejected",
+      "effective_engine": "lemonade",
+      "expected": "skip",
+      "reason": "requires os 'linux'; this host is 'windows'"
+    },
+    {
+      "id": "runtime-install-sdk-active",
+      "effective_engine": "lemonade",
+      "expected": "pass"
+    },
+    {
+      "id": "serve-connection-details",
+      "effective_engine": "lemonade",
+      "expected": "pass"
+    },
+    {
+      "id": "serve-default-engine-inference",
+      "effective_engine": "lemonade",
+      "expected": "pass"
+    },
+    {
+      "id": "serve-default-engine-working-endpoint",
+      "effective_engine": "lemonade",
+      "expected": "pass"
+    },
+    {
+      "id": "serve-discoverable-by-name",
+      "effective_engine": "lemonade",
+      "expected": "pass"
+    },
+    {
+      "id": "serve-inference-response",
+      "effective_engine": "vllm",
+      "expected": "skip",
+      "reason": "engine 'vllm' cannot start on this host (strix-halo-windows)"
+    },
+    {
+      "id": "serve-lemonade-inference",
+      "effective_engine": "lemonade",
+      "expected": "pass"
+    },
+    {
+      "id": "serve-ready-implies-inference",
+      "effective_engine": "vllm",
+      "expected": "skip",
+      "reason": "engine 'vllm' cannot start on this host (strix-halo-windows)"
+    },
+    {
+      "id": "serve-short-name-consistent-across-engines",
+      "effective_engine": "lemonade",
+      "expected": "xfail",
+      "bug": "EAI-7219",
+      "reason": "Engines do not report a consistent resolved model name for a short name."
+    },
+    {
+      "id": "serve-short-name-expansion",
+      "effective_engine": "lemonade",
+      "expected": "xfail",
+      "bug": "EAI-7219",
+      "reason": "Serve output does not surface the expanded full model name for a short name."
+    },
+    {
+      "id": "serve-vllm-default-on-instinct",
+      "effective_engine": "lemonade",
+      "expected": "pass"
+    }
+  ]
+}
