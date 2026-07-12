@@ -624,14 +624,14 @@ jobs:
 
   # app-dev MI300X (Instinct data-center GPU, `amd-gpu` label). Non-blocking.
   # One job now runs every applicable scenario (tiers collapsed), so the cap is
-  # 25min not 15: several real vLLM cold-starts add up. Known-bug serves that
-  # never become ready fail fast via per-scenario serve_timeout_secs
-  # (expectations.toml), so the wall time stays well under this ceiling — the cap
-  # is a safety net so a stuck serve can't cancel the job before it writes its
-  # report (a cancelled job produces no platform.json → no grid data).
+  # 35min not 15: the dominant cost is `install sdk` re-running per scenario
+  # (each has an isolated data dir) plus several vLLM cold-starts — a full MI300X
+  # run measured ~28min. The cap must exceed that so the job COMPLETES and writes
+  # platform.json (a cancelled job produces none → no grid column). Sharing the
+  # runtime across scenarios to cut the redundant installs is a tracked follow-up.
   e2e-gpu:
     name: E2E tests (GPU)
-    timeout-minutes: 25
+    timeout-minutes: 35
     runs-on: [self-hosted, linux, amd-gpu]
     needs: [changes, build-and-test]
     # See `e2e`: dispatch tolerates skipped build-and-test; app-dev-gpu.
@@ -706,9 +706,9 @@ jobs:
   # Non-blocking while this hardware is proven out.
   e2e-gpu-strix-ubuntu:
     name: E2E tests (Strix Halo, Ubuntu)
-    # 25min: see e2e-gpu — one collapsed job runs all serves; the cap is a safety
-    # net so a stuck serve can't cancel the job before it writes its report.
-    timeout-minutes: 25
+    # 35min: see e2e-gpu — one collapsed job runs all serves + per-scenario
+    # install sdk; the cap must exceed the run so the job writes platform.json.
+    timeout-minutes: 35
     runs-on: [self-hosted, linux, strix-halo]
     needs: [changes, build-and-test]
     # See `e2e`: dispatch tolerates skipped build-and-test; strix-ubuntu.
@@ -782,9 +782,9 @@ jobs:
   # no GPU. Non-blocking so it never gates the PR.
   e2e-gpu-strix-windows:
     name: E2E tests (Strix Halo, Windows)
-    # 25min: see e2e-gpu — one collapsed job runs all serves; the cap is a safety
-    # net so a stuck serve can't cancel the job before it writes its report.
-    timeout-minutes: 25
+    # 35min: see e2e-gpu — one collapsed job runs all serves + per-scenario
+    # install sdk; the cap must exceed the run so the job writes platform.json.
+    timeout-minutes: 35
     runs-on: [self-hosted, windows, strix-halo]
     needs: [changes, build-and-test]
     # See `e2e`: dispatch tolerates skipped build-and-test; strix-windows.
