@@ -23,11 +23,8 @@ on:
         type: choice
         default: all
         options: [all, mock, app-dev-gpu, strix-ubuntu, strix-windows]
-      tier:
-        description: Which scenario tier(s) to run
-        type: choice
-        default: both
-        options: [both, expect-pass, known-bugs]
+        # No tier input: the harness resolves pass/xfail/skip per scenario, so a
+        # platform runs one job covering everything applicable to it.
 
 concurrency:
   # Manual dispatches get a UNIQUE group (run_id) so a run that gets stuck — e.g.
@@ -572,23 +569,25 @@ jobs:
 
   # ── E2E tests (cucumber-rs) ───────────────────────────────────────────────
   #
-  # BDD scenarios in Gherkin (.feature files) backed by Rust step functions.
-  # Three selections: blocking mock tier, non-blocking known bugs, non-blocking
-  # GPU. Cucumber tag filters are exact-match, so known-bug scenarios carry a
-  # bare `@expected-failure` (plus `@expected-failure-EAI-NNNN` for traceability)
-  # and hardware-dependent scenarios carry `@gpu`.
+  # BDD scenarios in Gherkin (.feature files) backed by Rust step functions. ONE
+  # job per platform: the harness resolves every scenario to pass / xfail / skip
+  # per host from its @id + @requires-* tags, a capability probe, and
+  # expectations.toml (no tier flag, no tag filter). The mock job (GitHub-hosted,
+  # no GPU) gates the PR; the self-hosted GPU jobs are non-blocking while proven
+  # out. Each job writes a platform.json sidecar the consolidated report joins by
+  # scenario id to render the (scenario × platform) expectation grid.
 
-  # Blocking mock-tier job: must stay green. Known-bug scenarios and
-  # hardware-dependent scenarios are excluded here and run in the non-blocking
-  # jobs below.
+  # Blocking mock job (GitHub-hosted, no GPU): must stay green. @requires-gpu
+  # scenarios resolve to skip here; known bugs resolve to xfail from
+  # expectations.toml.
   e2e:
     name: E2E tests
     timeout-minutes: 15
     runs-on: ubuntu-latest
     needs: [changes, build-and-test]
-    # On push/PR/merge_group: unchanged — run when build-and-test succeeded and
-    # the change is heavy. On workflow_dispatch: build-and-test is skipped, so
-    # tolerate that and gate on the platform/tier inputs instead (mock tier here).
+    # On push/PR/merge_group: run when build-and-test succeeded and the change is
+    # heavy. On workflow_dispatch: build-and-test is skipped, so tolerate that and
+    # gate on the platform input instead.
     if: >-
       always()
       && needs.changes.result == 'success'
@@ -597,8 +596,7 @@ jobs:
           && needs.build-and-test.result == 'success'
           && needs.changes.outputs.heavy == 'true')
         || (github.event_name == 'workflow_dispatch'
-          && (inputs.platform == 'all' || inputs.platform == 'mock')
-          && (inputs.tier == 'both' || inputs.tier == 'expect-pass'))
+          && (inputs.platform == 'all' || inputs.platform == 'mock'))
       )
     steps:
       - uses: actions/checkout@v6
@@ -609,13 +607,13 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
       # The workspace test job selects only affected crates and runs the cucumber
-      # harness, not the library's own unit tests — run the report generator's
-      # unit tests (stats counting, scenario status, date formatting) here.
+      # harness, not the library's own unit tests — run the capability/expectation
+      # /report unit tests (resolver logic, grid reconciliation) here.
       - name: Unit tests (e2e-cucumber lib)
         run: cargo test -p e2e-cucumber --lib
 
-      - name: Run E2E tests (mock tier, excluding known bugs)
-        run: cargo xtask e2e -- -t "not @gpu and not @expected-failure"
+      - name: Run E2E tests
+        run: cargo xtask e2e
 
       - name: Upload E2E report
         if: always()
@@ -624,57 +622,13 @@ jobs:
           name: e2e-report
           path: tests/e2e-cucumber/results/
 
-  # Runs ONLY the known-bug scenarios under xfail inversion (`--expect-failures`):
-  # a tagged scenario failing is the expected, green outcome. The job goes red
-  # only when a known bug is silently fixed (XPASS — remove its @expected-failure
-  # tag so it joins the blocking e2e job above), an untagged scenario fails, or a
-  # parse/hook error occurs — all actionable, so this gates rather than being an
-  # always-red check reviewers learn to ignore.
-  e2e-known-bugs:
-    name: E2E tests (known bugs)
-    timeout-minutes: 15
-    runs-on: ubuntu-latest
-    needs: [changes, build-and-test]
-    # See `e2e`: dispatch tolerates skipped build-and-test; mock tier, known-bugs.
-    if: >-
-      always()
-      && needs.changes.result == 'success'
-      && (
-        (github.event_name != 'workflow_dispatch'
-          && needs.build-and-test.result == 'success'
-          && needs.changes.outputs.heavy == 'true')
-        || (github.event_name == 'workflow_dispatch'
-          && (inputs.platform == 'all' || inputs.platform == 'mock')
-          && (inputs.tier == 'both' || inputs.tier == 'known-bugs'))
-      )
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install native build deps
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libcap-dev
-
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-
-      - name: Run known-bug E2E scenarios (mock tier)
-        run: cargo xtask e2e --expect-failures -- -t "@expected-failure and not @gpu"
-
-      - name: Upload E2E report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: e2e-known-bugs-report
-          path: tests/e2e-cucumber/results/
-
-  # GPU hardware scenarios that are expected to PASS. Mirrors the mock `e2e` job
-  # but for `@gpu` hardware-dependent scenarios; known-bug `@gpu` scenarios are
-  # split into e2e-gpu-known-bugs below so a red here always means a real GPU
-  # regression, never a known bug still reproducing.
+  # app-dev MI300X (Instinct data-center GPU, `amd-gpu` label). Non-blocking.
   e2e-gpu:
     name: E2E tests (GPU)
     timeout-minutes: 15
     runs-on: [self-hosted, linux, amd-gpu]
     needs: [changes, build-and-test]
-    # See `e2e`: dispatch tolerates skipped build-and-test; app-dev-gpu, expect-pass.
+    # See `e2e`: dispatch tolerates skipped build-and-test; app-dev-gpu.
     if: >-
       always()
       && needs.changes.result == 'success'
@@ -683,25 +637,23 @@ jobs:
           && needs.build-and-test.result == 'success'
           && needs.changes.outputs.heavy == 'true')
         || (github.event_name == 'workflow_dispatch'
-          && (inputs.platform == 'all' || inputs.platform == 'app-dev-gpu')
-          && (inputs.tier == 'both' || inputs.tier == 'expect-pass'))
+          && (inputs.platform == 'all' || inputs.platform == 'app-dev-gpu'))
       )
     continue-on-error: true
     env:
       # Bound serve readiness below the 15-min job cap so a serve that never comes
-      # ready (e.g. starved by the auto-started lemonade Vulkan assistant) fails
-      # the scenario with a real error instead of hanging until the job is
-      # cancelled. 300s is ample for a real MI300X vLLM cold-start.
+      # ready fails the scenario with a real error instead of hanging until the
+      # job is cancelled. 300s is ample for a real MI300X vLLM cold-start;
+      # per-scenario known-bug overrides in expectations.toml shorten it further.
       E2E_SERVE_TIMEOUT_SECS: "300"
     steps:
       - uses: actions/checkout@v6
 
       # Reclaim the GPU before running: a serve leaked by a killed/timed-out prior
       # run (its Drop teardown never executed) can keep an engine process spinning
-      # on the GPU (e.g. a lemonade Vulkan llama-server), starving this job's
-      # serves until it hits the timeout. Kill only e2e leftovers — scoped to
-      # /tmp/rocm-e2e-* and the e2e-target/e2e-shared trees — never the runner or
-      # any /workload manual-testing processes.
+      # on the GPU, starving this job's serves until it hits the timeout. Kill only
+      # e2e leftovers — scoped to /tmp/rocm-e2e-* and the e2e-target/e2e-shared
+      # trees — never the runner or any /workload manual-testing processes.
       - name: Reclaim GPU from stray E2E processes
         run: |
           pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
@@ -726,16 +678,15 @@ jobs:
       # `target/` inside the repo every job → a full ~15min rebuild each run.
       # Point CARGO_TARGET_DIR at a sibling of the checkout ($RUNNER_WORKSPACE is
       # the checkout's parent — untouched by git clean and persistent between jobs
-      # on a self-hosted runner), so cargo rebuilds incrementally: unchanged →
-      # reused, changed → only the diff.
-      - name: Run E2E tests on GPU hardware (excluding known bugs)
+      # on a self-hosted runner), so cargo rebuilds incrementally.
+      - name: Run E2E tests on GPU hardware
         run: |
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           # Share heavy immutable artifacts (TheRock runtimes ~3.3GB, HF weights,
           # vLLM venv) across scenarios so they download once per runner, not per
           # scenario. Persistent path; service state stays isolated per scenario.
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          cargo xtask e2e -- -t "@gpu and not @expected-failure"
+          cargo xtask e2e
 
       - name: Upload E2E report
         if: always()
@@ -744,81 +695,15 @@ jobs:
           name: e2e-gpu-report
           path: tests/e2e-cucumber/results/
 
-  # GPU counterpart of e2e-known-bugs: runs ONLY the `@gpu @expected-failure`
-  # scenarios under xfail inversion (`--expect-failures`). Green when each known
-  # GPU bug still fails as expected; red only when one is silently fixed (XPASS —
-  # remove its @expected-failure tag so it joins e2e-gpu above), an untagged
-  # scenario fails, or a parse/hook error occurs.
-  e2e-gpu-known-bugs:
-    name: E2E tests (GPU, known bugs)
-    timeout-minutes: 15
-    runs-on: [self-hosted, linux, amd-gpu]
-    needs: [changes, build-and-test]
-    # See `e2e`: dispatch tolerates skipped build-and-test; app-dev-gpu, known-bugs.
-    if: >-
-      always()
-      && needs.changes.result == 'success'
-      && (
-        (github.event_name != 'workflow_dispatch'
-          && needs.build-and-test.result == 'success'
-          && needs.changes.outputs.heavy == 'true')
-        || (github.event_name == 'workflow_dispatch'
-          && (inputs.platform == 'all' || inputs.platform == 'app-dev-gpu')
-          && (inputs.tier == 'both' || inputs.tier == 'known-bugs'))
-      )
-    continue-on-error: true
-    env:
-      # Known-bug scenarios are expected to fail, so don't grant a serve the full
-      # cold-start window — fail fast instead of waiting the default 600s when a
-      # bug manifests as a serve that never becomes ready.
-      E2E_SERVE_TIMEOUT_SECS: "90"
-    steps:
-      - uses: actions/checkout@v6
-
-      # See e2e-gpu: reclaim the GPU from any leaked E2E serve before running.
-      - name: Reclaim GPU from stray E2E processes
-        run: |
-          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
-          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
-          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
-          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
-          pkill -f 'e2e-target/release/rocm daemon' 2>/dev/null || true
-          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
-          echo "reclaimed"
-
-      # See e2e-gpu: cache: false because we persist the cache ourselves via
-      # CARGO_TARGET_DIR; the action's rust-cache save/cleanup is slow and harmful
-      # on this self-hosted runner.
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache: false
-
-      # See e2e-gpu: keep the build cache out of the checkout (git clean would
-      # wipe it) for incremental rebuilds across jobs.
-      - name: Run known-bug E2E scenarios on GPU hardware
-        run: |
-          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
-          # See e2e-gpu: share heavy immutable artifacts across scenarios.
-          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          cargo xtask e2e --expect-failures -- -t "@gpu and @expected-failure"
-
-      - name: Upload E2E report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: e2e-gpu-known-bugs-report
-          path: tests/e2e-cucumber/results/
-
-  # Second AMD GPU architecture: the Strix Halo (gfx1151) Ubuntu runner. Same
-  # expect-pass / known-bugs split as app-dev-gpu's e2e-gpu jobs, targeted by the
-  # `strix-halo` label so it lands only on that runner (app-dev-gpu carries
-  # `amd-gpu`, not `strix-halo`). Non-blocking while this hardware is proven out.
+  # Second AMD GPU architecture: the Strix Halo (gfx1151) Ubuntu runner, targeted
+  # by the `strix-halo` label (app-dev-gpu carries `amd-gpu`, not `strix-halo`).
+  # Non-blocking while this hardware is proven out.
   e2e-gpu-strix-ubuntu:
     name: E2E tests (Strix Halo, Ubuntu)
     timeout-minutes: 15
     runs-on: [self-hosted, linux, strix-halo]
     needs: [changes, build-and-test]
-    # See `e2e`: dispatch tolerates skipped build-and-test; strix-ubuntu, expect-pass.
+    # See `e2e`: dispatch tolerates skipped build-and-test; strix-ubuntu.
     if: >-
       always()
       && needs.changes.result == 'success'
@@ -827,8 +712,7 @@ jobs:
           && needs.build-and-test.result == 'success'
           && needs.changes.outputs.heavy == 'true')
         || (github.event_name == 'workflow_dispatch'
-          && (inputs.platform == 'all' || inputs.platform == 'strix-ubuntu')
-          && (inputs.tier == 'both' || inputs.tier == 'expect-pass'))
+          && (inputs.platform == 'all' || inputs.platform == 'strix-ubuntu'))
       )
     continue-on-error: true
     # On this runner `/`, `/home/ubuntu`, and `/tmp` are ALL on a full root
@@ -837,15 +721,14 @@ jobs:
     # ~/.cache/pip, ~/.config, and any other $HOME writer — pip's cache under the
     # real /home/ubuntu is what previously failed `install sdk` with ENOSPC),
     # plus the toolchain, temp, and pip cache. The rustup bootstrap still uses
-    # --no-modify-path so it doesn't touch $HOME/.profile. (The HOME override
-    # brings back a cosmetic rustup euid/HOME warning — accepted: not filling the
-    # root disk matters more.)
+    # --no-modify-path so it doesn't touch $HOME/.profile.
     env:
       HOME: /home/ubuntu/actions-runner/e2e-home
       CARGO_HOME: /home/ubuntu/actions-runner/.cargo
       RUSTUP_HOME: /home/ubuntu/actions-runner/.rustup
       TMPDIR: /home/ubuntu/actions-runner/tmp
       PIP_CACHE_DIR: /home/ubuntu/actions-runner/pip-cache
+      E2E_SERVE_TIMEOUT_SECS: "300"
     steps:
       - uses: actions/checkout@v6
 
@@ -873,11 +756,11 @@ jobs:
           fi
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
-      - name: Run E2E tests on Strix Halo (excluding known bugs)
+      - name: Run E2E tests on Strix Halo
         run: |
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          cargo xtask e2e -- -t "@gpu and not @expected-failure"
+          cargo xtask e2e
 
       - name: Upload E2E report
         if: always()
@@ -886,85 +769,15 @@ jobs:
           name: e2e-gpu-strix-ubuntu-report
           path: tests/e2e-cucumber/results/
 
-  e2e-gpu-strix-ubuntu-known-bugs:
-    name: E2E tests (Strix Halo, Ubuntu, known bugs)
-    timeout-minutes: 15
-    runs-on: [self-hosted, linux, strix-halo]
-    needs: [changes, build-and-test]
-    # See `e2e`: dispatch tolerates skipped build-and-test; strix-ubuntu, known-bugs.
-    if: >-
-      always()
-      && needs.changes.result == 'success'
-      && (
-        (github.event_name != 'workflow_dispatch'
-          && needs.build-and-test.result == 'success'
-          && needs.changes.outputs.heavy == 'true')
-        || (github.event_name == 'workflow_dispatch'
-          && (inputs.platform == 'all' || inputs.platform == 'strix-ubuntu')
-          && (inputs.tier == 'both' || inputs.tier == 'known-bugs'))
-      )
-    continue-on-error: true
-    # See e2e-gpu-strix-ubuntu: /, /home/ubuntu, and /tmp are all on a full root
-    # partition; only the nvme has space. Point HOME + all caches at the nvme so
-    # nothing writes to root (pip's cache under the real $HOME is what failed
-    # `install sdk` with ENOSPC).
-    env:
-      HOME: /home/ubuntu/actions-runner/e2e-home
-      CARGO_HOME: /home/ubuntu/actions-runner/.cargo
-      RUSTUP_HOME: /home/ubuntu/actions-runner/.rustup
-      TMPDIR: /home/ubuntu/actions-runner/tmp
-      PIP_CACHE_DIR: /home/ubuntu/actions-runner/pip-cache
-      # Known-bug tier: fail fast rather than wait the default 600s on a serve
-      # that a bug prevents from becoming ready.
-      E2E_SERVE_TIMEOUT_SECS: "90"
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Prepare writable dirs on the nvme + reclaim GPU from stray E2E procs
-        run: |
-          mkdir -p /home/ubuntu/actions-runner/e2e-home /home/ubuntu/actions-runner/tmp /home/ubuntu/actions-runner/pip-cache
-          # Reclaim the GPU from any serve leaked by a killed/timed-out prior run
-          # (see e2e-gpu). Scoped to e2e leftovers only.
-          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
-          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
-          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
-          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
-          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
-          echo "prepared + reclaimed"
-
-      # See e2e-gpu-strix-ubuntu: bootstrap rustup with --no-modify-path so it
-      # never writes $HOME/.profile on the full root disk.
-      - name: Ensure Rust toolchain
-        run: |
-          if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$CARGO_HOME/bin/cargo" ]; then
-            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
-              | sh -s -- -y --no-modify-path --default-toolchain none
-          fi
-          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-
-      - name: Run known-bug E2E scenarios on Strix Halo
-        run: |
-          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
-          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          cargo xtask e2e --expect-failures -- -t "@gpu and @expected-failure"
-
-      - name: Upload E2E report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: e2e-gpu-strix-ubuntu-known-bugs-report
-          path: tests/e2e-cucumber/results/
-
   # First real Windows GPU coverage: the Strix Halo Windows 11 runner. The
   # existing windows-build-and-test uses GitHub-hosted windows-latest, which has
-  # no GPU, so `@gpu` scenarios have never run on Windows hardware. Expect
-  # first-run breakage to triage; non-blocking so it never gates the PR.
+  # no GPU. Non-blocking so it never gates the PR.
   e2e-gpu-strix-windows:
     name: E2E tests (Strix Halo, Windows)
     timeout-minutes: 15
     runs-on: [self-hosted, windows, strix-halo]
     needs: [changes, build-and-test]
-    # See `e2e`: dispatch tolerates skipped build-and-test; strix-windows, expect-pass.
+    # See `e2e`: dispatch tolerates skipped build-and-test; strix-windows.
     if: >-
       always()
       && needs.changes.result == 'success'
@@ -973,8 +786,7 @@ jobs:
           && needs.build-and-test.result == 'success'
           && needs.changes.outputs.heavy == 'true')
         || (github.event_name == 'workflow_dispatch'
-          && (inputs.platform == 'all' || inputs.platform == 'strix-windows')
-          && (inputs.tier == 'both' || inputs.tier == 'expect-pass'))
+          && (inputs.platform == 'all' || inputs.platform == 'strix-windows'))
       )
     continue-on-error: true
     steps:
@@ -1007,75 +819,15 @@ jobs:
             "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
           }
 
-      - name: Run E2E tests on Strix Halo Windows (excluding known bugs)
+      - name: Run E2E tests on Strix Halo Windows
         shell: powershell
-        run: cargo xtask e2e -- -t "@gpu and not @expected-failure"
+        run: cargo xtask e2e
 
       - name: Upload E2E report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-gpu-strix-windows-report
-          path: tests/e2e-cucumber/results/
-
-  e2e-gpu-strix-windows-known-bugs:
-    name: E2E tests (Strix Halo, Windows, known bugs)
-    timeout-minutes: 15
-    runs-on: [self-hosted, windows, strix-halo]
-    needs: [changes, build-and-test]
-    # See `e2e`: dispatch tolerates skipped build-and-test; strix-windows, known-bugs.
-    if: >-
-      always()
-      && needs.changes.result == 'success'
-      && (
-        (github.event_name != 'workflow_dispatch'
-          && needs.build-and-test.result == 'success'
-          && needs.changes.outputs.heavy == 'true')
-        || (github.event_name == 'workflow_dispatch'
-          && (inputs.platform == 'all' || inputs.platform == 'strix-windows')
-          && (inputs.tier == 'both' || inputs.tier == 'known-bugs'))
-      )
-    continue-on-error: true
-    # Known-bug tier: fail fast rather than wait the default 600s on a serve that
-    # a bug prevents from becoming ready.
-    env:
-      E2E_SERVE_TIMEOUT_SECS: "90"
-    steps:
-      - uses: actions/checkout@v6
-
-      # See e2e-gpu-strix-windows: bootstrap rustup via Windows PowerShell 5.1
-      # (`powershell`, not `pwsh`) because this runner has neither bash nor
-      # PowerShell 7 for setup-rust-toolchain's internal script.
-      # Reclaim the GPU from any E2E serve leaked by a killed/timed-out prior run
-      # (see e2e-gpu). PowerShell (5.1) equivalent; best-effort.
-      - name: Reclaim GPU from stray E2E processes
-        shell: powershell
-        run: |
-          Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -match 'rocm-e2e|__engine-serve-http|e2e-target|e2e-shared' -and $_.CommandLine -match 'llama-server|vllm|rocm ' } |
-            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-          Write-Host "reclaimed"
-
-      - name: Ensure Rust toolchain (PowerShell)
-        shell: powershell
-        run: |
-          if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-            Invoke-WebRequest https://win.rustup.rs/x86_64 -OutFile $env:TEMP\rustup-init.exe
-            # --default-toolchain none: rust-toolchain.toml pins the exact
-            # version (1.96.0 + components), auto-installed on first cargo use.
-            & $env:TEMP\rustup-init.exe -y --default-toolchain none
-            "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
-          }
-
-      - name: Run known-bug E2E scenarios on Strix Halo Windows
-        shell: powershell
-        run: cargo xtask e2e --expect-failures -- -t "@gpu and @expected-failure"
-
-      - name: Upload E2E report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: e2e-gpu-strix-windows-known-bugs-report
           path: tests/e2e-cucumber/results/
 
   # Consolidate every platform/tier's report into ONE cross-platform report:
@@ -1085,22 +837,17 @@ jobs:
   #
   # Extensibility: the report CONTENT auto-includes any new platform via the
   # `*-report` artifact glob below — no change needed here. The one manual step
-  # when adding a platform is appending its two job names to `needs:` (for run
-  # ORDERING only; GitHub Actions has no wildcard `needs`). A future matrix
-  # refactor of the 8 e2e jobs would remove even that.
+  # when adding a platform is appending its job name to `needs:` (for run ORDERING
+  # only; GitHub Actions has no wildcard `needs`).
   e2e-report:
     name: E2E consolidated report
     runs-on: ubuntu-latest
     needs:
       - changes
       - e2e
-      - e2e-known-bugs
       - e2e-gpu
-      - e2e-gpu-known-bugs
       - e2e-gpu-strix-ubuntu
-      - e2e-gpu-strix-ubuntu-known-bugs
       - e2e-gpu-strix-windows
-      - e2e-gpu-strix-windows-known-bugs
     # Consolidate whatever ran. On dispatch `heavy` is unset, so also run when the
     # trigger was manual; `always()` still lets it collect partial/failed tiers.
     if: >-

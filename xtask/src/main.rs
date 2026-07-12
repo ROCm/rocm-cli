@@ -113,18 +113,15 @@ enum Command {
         check_config: bool,
     },
     /// Build the release `rocm` binary and run the cucumber-rs E2E suite.
-    /// Extra arguments after the command are forwarded to the cucumber CLI, e.g.
-    /// `cargo xtask e2e -- -t "not @expected-failure-EAI-*"`.
+    ///
+    /// The harness resolves every scenario's expectation (pass / xfail / skip)
+    /// per host from its tags + a capability probe + `expectations.toml`, so no
+    /// tier flag or tag filter is needed — one run covers a whole platform.
+    /// Extra arguments after `--` are still forwarded to the cucumber CLI for
+    /// ad-hoc local use, e.g. `cargo xtask e2e -- -n serve-inference`.
     E2e {
-        /// Known-bugs mode: invert the pass/fail signal for `@expected-failure`
-        /// scenarios. The run is green when every tagged scenario fails as
-        /// expected (xfail) and red only when one unexpectedly passes (XPASS —
-        /// the bug was fixed, drop the tag) or a parse/hook error occurs. Pair
-        /// with `-- -t "@expected-failure and not @gpu"`.
-        #[arg(long)]
-        expect_failures: bool,
-        /// Arguments forwarded verbatim to the cucumber test binary (tag filters
-        /// `-t`, name filters `-n`, `--fail-fast`, etc.).
+        /// Arguments forwarded verbatim to the cucumber test binary (name filter
+        /// `-n`, `--fail-fast`, etc.). Not used by CI.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -191,10 +188,7 @@ fn run() -> Result<()> {
                 verify_commits::run(base, require_verified)?;
             }
         }
-        Command::E2e {
-            expect_failures,
-            args,
-        } => e2e::run(&args, expect_failures)?,
+        Command::E2e { args } => e2e::run(&args)?,
         Command::E2eReport {
             artifacts_dir,
             html_out,
