@@ -468,6 +468,9 @@ struct PlatformReport {
     is_known_bugs: bool,
     /// Recorded `rocm` invocations from this platform's `commands.jsonl`.
     commands: Vec<CommandRecord>,
+    /// Expectation-reconciled outcome (`platform.json` × `report.json` by `@id`).
+    /// `None` for pre-expectation artifacts, which fall back to the junit status.
+    tally: Option<ReconciledTally>,
 }
 
 /// One recorded `rocm` invocation from a platform's `commands.jsonl` sidecar.
@@ -702,6 +705,56 @@ fn id_pass_map(json_path: &Path) -> std::collections::HashMap<String, bool> {
         .collect()
 }
 
+/// A platform's outcome after reconciling each scenario's declared expectation
+/// (`platform.json`) against its actual result (`report.json`) by stable `@id`.
+///
+/// This is the trustworthy per-platform signal in the one-job-per-platform model:
+/// a known bug that fails is `xfail` (healthy), not a failure. The coarse junit
+/// [`Stats`]/`XfailReport` path counts an xfail scenario as a raw failure, so it
+/// wrongly reds a clean platform — this tally is what the Status column uses.
+#[derive(Default, Clone, Copy)]
+struct ReconciledTally {
+    pass: u32,
+    xfail: u32,
+    skip: u32,
+    /// Cells that need a human: unexpected-fail, XPASS, or ran-when-N/A.
+    problems: u32,
+}
+
+impl ReconciledTally {
+    /// `true` when nothing needs attention (no unexpected-fail / XPASS / ran-when-NA).
+    const fn ok(&self) -> bool {
+        self.problems == 0
+    }
+
+    const fn status_text(&self) -> &'static str {
+        if self.ok() { "PASS" } else { "FAIL" }
+    }
+}
+
+/// Reconcile one platform's `platform.json` expectations against its
+/// `report.json` results. `None` when the artifact predates the expectation
+/// system (no `platform.json`) — callers fall back to the legacy junit status.
+fn reconciled_tally(json_path: &Path) -> Option<ReconciledTally> {
+    let manifest = parse_platform_manifest(json_path)?;
+    let actual = id_pass_map(json_path);
+    let mut t = ReconciledTally::default();
+    for exp in &manifest.expectations {
+        match CellOutcome::reconcile(&exp.expected, actual.get(&exp.id).copied()) {
+            CellOutcome::Pass => t.pass += 1,
+            CellOutcome::Xfail => t.xfail += 1,
+            CellOutcome::Skip => t.skip += 1,
+            CellOutcome::UnexpectedFail | CellOutcome::Xpass | CellOutcome::RanWhenNa => {
+                t.problems += 1;
+            }
+            // A declared expectation with no result is a missing data point, not a
+            // pass or a problem — it neither greenwashes nor reds the platform.
+            CellOutcome::Missing => {}
+        }
+    }
+    Some(t)
+}
+
 impl PlatformReport {
     fn load(artifact: String, json_path: &Path) -> Self {
         let features = parse_features(json_path);
@@ -714,6 +767,7 @@ impl PlatformReport {
         let desc = parse_descriptor(&artifact);
         let label = format!("{} {} ({})", desc.platform, desc.os, desc.tier());
         let commands = parse_commands(json_path);
+        let tally = reconciled_tally(json_path);
         Self {
             desc,
             label,
@@ -722,6 +776,7 @@ impl PlatformReport {
             xfail,
             is_known_bugs,
             commands,
+            tally,
         }
     }
 
@@ -734,10 +789,16 @@ impl PlatformReport {
             .collect()
     }
 
-    /// A row is healthy (green) when it is in its expected state: for a normal
-    /// tier, no failures; for a known-bugs tier, no XPASS and no untagged
-    /// failures (the known bugs are supposed to fail).
+    /// A row is healthy (green) when it is in its expected state.
+    ///
+    /// Prefers the expectation-reconciled tally (a known bug failing is `xfail`,
+    /// not a failure). Falls back to the legacy junit rule only for artifacts
+    /// without a `platform.json`: for a normal tier, no failures; for a
+    /// known-bugs tier, no XPASS and no untagged failures.
     const fn ok(&self) -> bool {
+        if let Some(tally) = &self.tally {
+            return tally.ok();
+        }
         if self.is_known_bugs {
             self.xfail.is_ok()
         } else {
@@ -746,12 +807,41 @@ impl PlatformReport {
     }
 
     const fn status_text(&self) -> &'static str {
+        if let Some(tally) = &self.tally {
+            return tally.status_text();
+        }
         if self.stats.total == 0 {
             "EMPTY"
         } else if self.ok() {
             "PASS"
         } else {
             "FAIL"
+        }
+    }
+
+    /// Display counts for the summary table, reconciliation-aware so the numbers
+    /// agree with [`Self::status_text`]. Returns `(total, pass, fail, skip,
+    /// xfail)`. With a `platform.json`, `fail` counts only cells needing
+    /// attention (unexpected-fail / XPASS / ran-when-NA) — a known bug failing as
+    /// expected lands in `xfail`, not `fail`. Without one, falls back to raw
+    /// junit stats.
+    const fn display_counts(&self) -> (u32, u32, u32, u32, u32) {
+        if let Some(t) = &self.tally {
+            let total = t.pass + t.xfail + t.skip + t.problems;
+            (total, t.pass, t.problems, t.skip, t.xfail)
+        } else {
+            let xfail = if self.is_known_bugs {
+                self.xfail.xfail
+            } else {
+                0
+            };
+            (
+                self.stats.total,
+                self.stats.passed,
+                self.stats.failed,
+                self.stats.skipped,
+                xfail,
+            )
         }
     }
 }
@@ -871,18 +961,19 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
     out.push_str("|---|---|---|--:|--:|--:|--:|--:|:--|\n");
     let (mut t_total, mut t_pass, mut t_fail, mut t_skip, mut t_xfail) = (0, 0, 0, 0, 0);
     for r in &reports {
-        let xfail = if r.is_known_bugs {
-            r.xfail.xfail.to_string()
+        let (total, pass, fail, skip, xf) = r.display_counts();
+        // Xfail column only applies where there are known bugs to invert; a plain
+        // expect-pass platform (no xfail entries) shows a dash.
+        let xfail = if xf > 0 || r.is_known_bugs {
+            xf.to_string()
         } else {
             "—".to_string()
         };
-        t_total += r.stats.total;
-        t_pass += r.stats.passed;
-        t_fail += r.stats.failed;
-        t_skip += r.stats.skipped;
-        if r.is_known_bugs {
-            t_xfail += r.xfail.xfail;
-        }
+        t_total += total;
+        t_pass += pass;
+        t_fail += fail;
+        t_skip += skip;
+        t_xfail += xf;
         // `writeln!` into a String never fails; the discard keeps clippy happy.
         let _ = writeln!(
             out,
@@ -890,10 +981,10 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
             r.desc.platform,
             r.desc.os,
             r.desc.tier(),
-            r.stats.total,
-            r.stats.passed,
-            r.stats.failed,
-            r.stats.skipped,
+            total,
+            pass,
+            fail,
+            skip,
             xfail,
             r.status_text(),
         );
@@ -1303,13 +1394,12 @@ fn command_coverage_markdown(reports: &[PlatformReport]) -> String {
 fn matrix_table(reports: &[PlatformReport]) -> Markup {
     let (mut t_total, mut t_pass, mut t_fail, mut t_skip, mut t_xfail) = (0, 0, 0, 0, 0);
     for r in reports {
-        t_total += r.stats.total;
-        t_pass += r.stats.passed;
-        t_fail += r.stats.failed;
-        t_skip += r.stats.skipped;
-        if r.is_known_bugs {
-            t_xfail += r.xfail.xfail;
-        }
+        let (total, pass, fail, skip, xf) = r.display_counts();
+        t_total += total;
+        t_pass += pass;
+        t_fail += fail;
+        t_skip += skip;
+        t_xfail += xf;
     }
     html! {
         table.stats {
@@ -1320,15 +1410,16 @@ fn matrix_table(reports: &[PlatformReport]) -> Markup {
                 th { "Pass / Fail / Skip" }
             }
             @for r in reports {
+                @let (total, pass, fail, skip, xf) = r.display_counts();
                 tr {
                     td { (r.desc.platform) }
                     td { (r.desc.os) }
                     td { (r.desc.tier()) }
-                    td.num { (r.stats.total) }
-                    td.num { (r.stats.passed) }
-                    td.num { (r.stats.failed) }
-                    td.num { (r.stats.skipped) }
-                    td.num { @if r.is_known_bugs { (r.xfail.xfail) } @else { "—" } }
+                    td.num { (total) }
+                    td.num { (pass) }
+                    td.num { (fail) }
+                    td.num { (skip) }
+                    td.num { @if xf > 0 || r.is_known_bugs { (xf) } @else { "—" } }
                     td class=(if r.ok() { "status-pass" } else { "status-fail" }) {
                         (r.status_text())
                     }
@@ -2051,5 +2142,60 @@ mod tests {
             !md.contains("### Expectation grid"),
             "no grid expected:\n{md}"
         );
+    }
+
+    #[test]
+    fn summary_status_reconciles_xfail_as_pass() {
+        // Regression (run 29209242248): a platform whose only junit failures are
+        // known-bug xfails was shown FAIL in the summary while the grid said
+        // clean. With a platform.json, the summary Status must reconcile: an
+        // xfail is healthy, so the row is PASS and its Fail count is 0.
+        let report = feature_json(&[
+            (&["id:serve-short-name"], &["failed"]), // known bug, expected xfail
+            (&["id:examine-version"], &["passed"]),
+        ]);
+        let platform = r#"{
+            "platform_slug": "mock",
+            "capability": {"effective_serve_engine": "lemonade"},
+            "expectations": [
+                {"id":"serve-short-name","effective_engine":"lemonade","expected":"xfail","bug":"EAI-7219","reason":"alias not forwarded"},
+                {"id":"examine-version","effective_engine":"lemonade","expected":"pass"}
+            ]
+        }"#;
+        let (_d, path) = write_platform(&report, platform);
+        let r = PlatformReport::load("e2e-report".into(), &path);
+        assert!(r.ok(), "xfail-only platform should be ok");
+        assert_eq!(r.status_text(), "PASS");
+        // Fail column is the reconciled problem count (0), not raw junit (1);
+        // the failed known bug is counted as xfail instead.
+        let (total, pass, fail, _skip, xfail) = r.display_counts();
+        assert_eq!((total, pass, fail, xfail), (2, 1, 0, 1));
+
+        let inputs = vec![("e2e-report".to_string(), path)];
+        let md = consolidated_summary_markdown(&inputs);
+        assert!(
+            md.contains("| Mock | Linux | expect-pass | 2 | 1 | 0 | 0 | 1 | PASS |"),
+            "summary row should be reconciled PASS with 0 fails:\n{md}"
+        );
+    }
+
+    #[test]
+    fn summary_status_reconciles_unexpected_fail_as_fail() {
+        // The honest-red half: an expect-pass scenario that actually failed is an
+        // unexpected failure → the platform's summary Status is FAIL.
+        let report = feature_json(&[(&["id:serve-default-engine"], &["failed"])]);
+        let platform = r#"{
+            "platform_slug": "strix-halo-linux",
+            "capability": {"effective_serve_engine": "lemonade"},
+            "expectations": [
+                {"id":"serve-default-engine","effective_engine":"lemonade","expected":"pass"}
+            ]
+        }"#;
+        let (_d, path) = write_platform(&report, platform);
+        let r = PlatformReport::load("e2e-gpu-strix-ubuntu-report".into(), &path);
+        assert!(!r.ok(), "an unexpected fail must red the platform");
+        assert_eq!(r.status_text(), "FAIL");
+        let (_total, _pass, fail, _skip, _xfail) = r.display_counts();
+        assert_eq!(fail, 1);
     }
 }
