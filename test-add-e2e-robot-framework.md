@@ -4,9 +4,9 @@
 **Stage:** 8-awaiting-pr-approval
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
-**Last Updated:** 2026-07-12 (idle flush)
+**Last Updated:** 2026-07-12
 
-**Token Usage:** in=8271 out=2497111 cache_create=27069204 cache_read=1748846347 calls=4149
+**Token Usage:** in=8630 out=2619304 cache_create=29048485 cache_read=1832324339 calls=4331
 
 ---
 
@@ -749,10 +749,28 @@ addressed here with the exit-code fix + dedicated known-bugs job.
   all 21 resolutions incl. skips). Old `E2E_EXPECT_FAILURES` global path removed.
   **End-to-end mock run verified**: 8 pass / 2 xfail / 11 skip, exit 0. platform.json contains all 21 ids
   with correct labels + reasons.
-- 📋 **Stage 4** (pending): rewrite consolidated report to render (scenario-id × platform) grid from platform.json,
-  flag XPASS/unexpected-fail/ran-when-NA.
-- 📋 **Stage 5** (pending): collapse 8 CI E2E jobs → 4 (one per platform), drop tag-filter/--expect-failures args.
-- **19 library unit tests all passing, build clean under -D warnings.** Three new library files staged in working tree.
-- **Token usage high** (stage 3 wiring + comprehensive testing): in=8271 out=2.5M cache_create=27M cache_read=1.7B.
+- ✅ **Stage 4 (Report reconciliation, id-keyed)**: `crates/e2e-report/src/lib.rs` — parse `platform.json`;
+  `CellOutcome::reconcile(expected, actual)` → pass/xfail/skip/XPASS/unexpected-fail/ran-when-NA; `Grid`
+  joins each platform's platform.json (expected) with report.json (actual) by `@id`. Renders a
+  **(scenario × platform) grid** in BOTH the markdown step-summary and the HTML report, plus a
+  Needs-attention list (bug + engine + reason). Added `scenario_results_by_id()`. 5 new tests incl. the
+  run #543 XPASS-flagging case. Verified rendering the grid from the real mock artifacts.
+- ✅ **Stage 5 (xtask + CI collapse)**: dropped `--expect-failures`/`E2E_EXPECT_FAILURES` from xtask; each
+  job now just runs `cargo xtask e2e` (no tag filter). ci.yml: **8 E2E jobs → 4** (one per platform:
+  mock hosted+blocking, app-dev-gpu/strix-ubuntu/strix-windows self-hosted+non-blocking); removed the four
+  `*-known-bugs` jobs; `e2e-report` needs 8→4; dropped the obsolete `tier` dispatch input. Net −325 lines.
+- **Commits**: `2327f74` (Stages 1-3), `8d5f9e4` (clippy), `c4c7a6c` (Stage 5) — all pushed to
+  ci-e2e-framework-fixes. 43 lib tests pass (19 e2e-cucumber + 24 e2e-report), all crates clippy-clean
+  under -D warnings, ci.yml parses to exactly 4 E2E jobs.
+- 🔬 **VERIFYING**: dispatched full `platform=all` run 29193461214 on the collapsed workflow to confirm
+  the grid renders across all 4 real platforms with no XPASS (the run #543 regression, now fixed).
+- **ALL 5 STAGES COMPLETE.** Remaining follow-ups are separate tasks: #16 (product probe for effective
+  engine — swap the re-implemented rule), #14 (CLI coverage denominator), #15 (install/examine/serve/dash
+  coverage incl. TUI).
 
-**2026-07-12 (idle flush):** Session idle for 1 hour, auto-flushing WIP state.
+### Work Log
+
+**2026-07-12 (Stages 1–5 complete, expectation-matrix system deployed):**
+- Implemented all 5 stages of per-scenario expectation resolution. Capability probe derives effective engine once; resolver uses tags + probe + expectations.toml to classify each scenario pass/xfail/skip. Fixed EAI-7333 XPASS regression (run #543) by conditioning on effective_engine.
+- Stage 4 renders (scenario × platform) grid in markdown step-summary + HTML report, joins platform.json (expected) ↔ report.json (actual) by @id, flags XPASS/regressions. Stage 5 collapsed 8 CI jobs → 4 (one per platform), removed tag filters + --expect-failures flag.
+- Committed 3 changesets (`2327f74` core logic, `8d5f9e4` clippy fixes, `c4c7a6c` CI collapse) to ci-e2e-framework-fixes. All 43 lib tests pass, clippy-clean, end-to-end verified (8 pass / 2 xfail / 11 skip). Dispatched full platform=all run 29193461214 on live hardware for regression verification.
