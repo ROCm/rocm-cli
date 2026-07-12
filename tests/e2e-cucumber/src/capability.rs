@@ -7,8 +7,8 @@
 //! The suite is black-box (it never imports rocm-cli crates), but its
 //! per-scenario expectations must still follow the product's real behaviour —
 //! chiefly *which serve engine the CLI would pick on this host*. We learn that
-//! by spawning the real binary (`rocm examine --json` + `rocm engines list`)
-//! once at startup and caching the result.
+//! by spawning the real binary (`rocm examine` + `rocm engines list`) once at
+//! startup and caching the result.
 //!
 //! IMPORTANT — the effective serve engine is currently RE-IMPLEMENTED here (see
 //! [`effective_serve_engine`]) because no `rocm` command exposes it directly
@@ -92,13 +92,14 @@ fn normalize_family(raw: &str) -> String {
 /// The probed host capability, learned once from the real `rocm` binary.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HostCapability {
-    /// examine --json `os_family`, lowercased (e.g. "linux", "windows", "other").
+    /// `examine`'s `os:` line, lowercased (e.g. "linux", "windows", "macos").
     pub os_family: String,
-    /// examine --json `is_wsl`.
+    /// `examine`'s `wsl:` line.
     pub is_wsl: bool,
-    /// First AMD GPU's gfx target (e.g. "gfx942", "gfx1151"), if any.
+    /// First AMD GPU's gfx target from `examine`'s `detected_gfx_target:` line
+    /// (e.g. "gfx942", "gfx1151"), if a real one was reported.
     pub gfx_target: Option<String>,
-    /// examine --json `has_amd_gpu`.
+    /// Whether an AMD GPU was detected (a real `detected_gfx_target` is present).
     pub has_amd_gpu: bool,
     /// Engine adapters the binary reports as present. Both builtins are always
     /// "built-in", so this is NOT the same as "can start here" — use
