@@ -4,9 +4,9 @@
 **Stage:** 8-awaiting-pr-approval
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
-**Last Updated:** 2026-07-11
+**Last Updated:** 2026-07-12
 
-**Token Usage:** in=3216 out=943422 cache_create=11925652 cache_read=564630363 calls=1615
+**Token Usage:** in=7721 out=2246816 cache_create=23865778 cache_read=1667458626 calls=3873
 
 ---
 
@@ -470,16 +470,27 @@ Framework/harness/CI issues to fix fast via the scratch-branch + manual-dispatch
 
 ## Work Log
 
+**2026-07-12:**
+- ✅ **Root-caused & fixed Strix Windows scenario 4 failure** (commit 80d1997): precondition was no-op,
+  silently relied on ambient system ROCm. Made hermetic by planting fake ROCm dir, exported via
+  ROCM_PATH. detect_legacy_rocm_summary honors ROCM_PATH → examine reports detected_unmanaged +
+  "rocm install sdk" guidance on every platform. Verified locally (Mac, no GPU), then on Strix Windows real hardware.
+- ✅ **Strix Windows expect-pass GREEN** (run 29162356843, 80d1997): 4/4 pass in ~3m49s (≤15min ✓).
+  Scenario 4 now passes; bootstrap (PowerShell rustup) validated end-to-end. Artifact confirmed.
+- ✅ **3 of 4 platforms verified green** (all ≤15min, all from junit artifacts):
+  Mock 8/8 ~1m55s; app-dev 4/4 ~1m56s; Strix Windows 4/4 ~3m49s.
+- ❌ **Strix Ubuntu runner remains offline** (re-confirmed via API). No code change reaches it;
+  needs user to start the runner on the box (`cd ~/actions-runner && ./run.sh`).
+- 📋 **Known-bugs tier**: user accepted as-is (non-blocking, vLLM cold-start is hard floor).
+
 **2026-07-11 (continued):**
 - ✅ Reclassified scenario 6 (default-engine serve, 1.5B readiness timeout) to known-bugs
   (@expected-failure-EAI-7333, commit 41e5d1f). Engine-selection still covered by scenario 9.
 - ✅ **Mock platform verified**: run 29161942060, 8/8 pass in ~1m55s (≤15min ✓). Artifact confirmed.
 - ✅ **app-dev (MI300X) verified**: run 29161621191, 4/4 expect-pass in ~1m56s (≤15min ✓). Artifact confirmed.
-- ✅ **Strix Windows tested**: run 29161852572, PowerShell bootstrap works; 3/4 pass in ~3m50s (≤15min ✓).
-  Failure: scenario 1 asserts `rocm examine` contains "rocm install sdk", but Windows outputs differ.
-  Triage call: product gap or relax assertion — needs user decision.
-- Strix Ubuntu runner still offline. Strix Windows succeeded after long queue (hosted runner pickup latency).
-- Identified known-bugs tier timing cannot fit 15min (vLLM cold-start floor). User decision needed on strategy.
+- ✅ **Strix Windows first run**: run 29161852572, PowerShell bootstrap works; 3/4 pass in ~3m50s (≤15min ✓).
+  Failure was scenario 4 (no-op precondition; later fixed in 80d1997).
+- Strix Ubuntu runner offline. Known-bugs tier timing identified as vLLM cold-start floor.
 
 **2026-07-10:**
 - Fixed Strix Windows/Ubuntu/Linux runner bootstrap issues (pwsh→powershell, HOME on
@@ -496,12 +507,9 @@ Framework/harness/CI issues to fix fast via the scratch-branch + manual-dispatch
 
 ## Next Steps
 
-1. **Strix Ubuntu runner**: restart on the box to bring online; then dispatch + verify.
-2. **Strix Windows scenario 1**: triage decision — (a) file EAI (Windows examine gap) + move to known-bugs,
-   or (b) relax the assertion to accept Windows "No ROCm installs saved yet" phrasing.
-3. **Known-bugs tier timing**: user decision — (a) accept as non-blocking (vLLM cold-start is hard floor),
-   (b) split by engine into per-job sub-tiers, or (c) drop redundant EAI-7333 scenarios (5/6/6b/8).
-4. Once decisions made: update ci.yml as needed, re-verify on all runners, prepare for PR #69 merge.
+1. **Strix Ubuntu runner**: restart on the box (`cd ~/actions-runner && ./run.sh`). When online, dispatch + verify (expect green, same suite passes on app-dev Linux + Strix Windows).
+2. **Known-bugs tier**: accepted as-is (non-blocking, vLLM cold-start is hard floor).
+3. All expect-pass tiers now green on reachable platforms. Prepare for PR #69 merge once Ubuntu verified (or accept 3/4 for now).
 
 ## Checklist
 
