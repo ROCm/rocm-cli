@@ -23,6 +23,15 @@ fn serve_timeout_secs() -> u64 {
         .unwrap_or(600)
 }
 
+/// Serve-readiness timeout for a scenario: a per-scenario override set by the
+/// `before` hook from `expectations.toml` (a known bug fails fast) takes
+/// precedence over the global `E2E_SERVE_TIMEOUT_SECS` / default.
+fn serve_timeout_for(world: &E2eWorld) -> u64 {
+    world
+        .serve_timeout_override
+        .unwrap_or_else(serve_timeout_secs)
+}
+
 async fn wait_for_endpoint(url: &str, timeout_secs: u64) {
     wait_for_model(url, None, timeout_secs).await;
 }
@@ -187,7 +196,7 @@ async fn setup_gpu_model(world: &mut E2eWorld) {
     wait_for_model(
         "http://127.0.0.1:11435/v1/models",
         Some("Qwen2.5-1.5B"),
-        serve_timeout_secs(),
+        serve_timeout_for(world),
     )
     .await;
 }
@@ -213,7 +222,7 @@ async fn setup_lemonade_model(world: &mut E2eWorld) {
     wait_for_model(
         "http://127.0.0.1:11435/v1/models",
         Some("Qwen3-0.6B"),
-        serve_timeout_secs(),
+        serve_timeout_for(world),
     )
     .await;
 }
@@ -271,7 +280,7 @@ async fn user_serves_default_engine(world: &mut E2eWorld) {
     world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
     world.model_name = Some("Qwen/Qwen2.5-1.5B-Instruct".to_string());
     if rc == 0 {
-        wait_for_endpoint("http://127.0.0.1:11435/v1/models", serve_timeout_secs()).await;
+        wait_for_endpoint("http://127.0.0.1:11435/v1/models", serve_timeout_for(world)).await;
     }
 }
 
