@@ -4,7 +4,7 @@
 **Stage:** 8-awaiting-pr-approval
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
-**Last Updated:** 2026-07-12
+**Last Updated:** 2026-07-12 (idle flush)
 
 **Token Usage:** in=8722 out=2647778 cache_create=29642514 cache_read=1857183378 calls=4377
 
@@ -771,6 +771,8 @@ addressed here with the exit-code fix + dedicated known-bugs job.
   denominator), #15 (install/examine/serve/dash + TUI coverage).
 
 ### Work Log
+
+**2026-07-12 (idle flush):** Session idle for 1 hour, auto-flushing WIP state.
 
 **2026-07-12 (Stages 1–5 + probe fix, all complete):**
 - Implemented 5-stage expectation-matrix system: capability probe (stage 1) derives engine once; resolver (stage 3) classifies each scenario pass/xfail/skip from tags+probe+expectations.toml; fixed EAI-7333 XPASS regression (run #543) by conditioning on effective_engine.
