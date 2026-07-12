@@ -6,9 +6,9 @@
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-12
 
-**Status:** Expectation-matrix system built + 5/7 goal conditions met (see north-star goal below). Overnight: full run 29209242248 (commit e800661, 90min GPU caps) dispatched to produce the complete 4-platform consolidated report the user needs by morning.
+**Status:** Expectation-matrix Stages 1–5 complete + pushed (origin/ci-e2e-framework-fixes). Run 29209242248 (e800661, 90min GPU caps) live: Mock/Strix-Windows/Strix-Ubuntu complete (3/4 columns done), MI300X in progress. Identified report Status column defect: uses raw junit, not expectation-matrix reconciliation → Mock shows FAIL despite 0 unexpected/0 XPASS.
 
-**Token Usage:** in=8740 out=2653376 cache_create=30217605 cache_read=1861739877 calls=4386 (+ continuation session)
+**Token Usage:** in=8868 out=2694429 cache_create=30600958 cache_read=1868833248 calls=4450
 
 ---
 
@@ -932,3 +932,9 @@ addressed here with the exit-code fix + dedicated known-bugs job.
 - **DECISION IMPLEMENTED**: MI300X job timeout addressed by (a) raising timeout to 35min (GPU non-blocking, commit caeab96), (b) wiring serve_timeout_secs from expectations.toml for xfail serves (fail-fast, commit a5dd8dd). Also widen EAI-7052 condition to include Windows (currently os=linux only, commit 89312ed).
 
 **2026-07-12 (idle flush):** Session idle for 1 hour, auto-flushing WIP state.
+
+**2026-07-12 (Report delivery focus — final session checkpoint):**
+- ✅ **Run 29209242248 status verified**: Mock / Strix-Ubuntu / Strix-Windows complete (3 of 4 platform columns); MI300X (~37min) still in progress. Consolidated report renderable from available 3 platforms.
+- ✅ **Report Status column bug identified**: summary table reports "FAIL" on Mock despite 0 unexpected-fail, 0 XPASS (reconciled grid shows correct pass). Root: status_text() uses raw junit counts, not id-keyed expectation reconciliation. Fix: recompute status from reconciled outcome (unexpected-fail | XPASS ⇒ FAIL; else PASS). Report-crate-only, safe to land.
+- 🔄 **Strix-Ubuntu 2 expected failures flagged**: serve-default-engine-inference/working-endpoint fail as expected (task #23, lemonade assertion bug scraping download log). Grid correctly shows them as honest findings; system working as designed.
+- 📋 **Next on report**: wait for MI300X completion → final consolidated report with all 4 columns + fix Status column defect before final delivery.
