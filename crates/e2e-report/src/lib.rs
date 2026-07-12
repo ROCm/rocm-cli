@@ -225,6 +225,34 @@ pub fn evaluate_xfail(json_path: &Path) -> std::io::Result<XfailReport> {
     Ok(evaluate_xfail_features(&features))
 }
 
+/// Tag prefix carrying a scenario's stable id (`@id:<slug>`, stored without `@`).
+const ID_TAG_PREFIX: &str = "id:";
+
+/// The stable `@id:` slug of a scenario, if it has one.
+fn scenario_id(el: &Element) -> Option<String> {
+    el.tags
+        .iter()
+        .find_map(|t| t.name.strip_prefix(ID_TAG_PREFIX).map(str::to_owned))
+}
+
+/// Map each scenario's stable `@id` → whether it passed, read from a completed
+/// run's `report.json`. Scenarios without an `@id` tag are skipped (the new
+/// system requires every scenario to carry one). Used by the harness to
+/// reconcile actual results against per-scenario expectations.
+pub fn scenario_results_by_id(json_path: &Path) -> std::io::Result<Vec<(String, bool)>> {
+    let json = std::fs::read_to_string(json_path)?;
+    let features: Vec<Feature> = serde_json::from_str(&json).unwrap_or_default();
+    let mut out = Vec::new();
+    for f in &features {
+        for el in &f.elements {
+            if let Some(id) = scenario_id(el) {
+                out.push((id, scenario_status(el) == "passed"));
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn generate(json_path: &Path, html_path: &Path) -> std::io::Result<()> {
     let json = std::fs::read_to_string(json_path)?;
     let features: Vec<Feature> = serde_json::from_str(&json).unwrap_or_default();
@@ -465,6 +493,214 @@ fn parse_commands(json_path: &Path) -> Vec<CommandRecord> {
         .collect()
 }
 
+/// The `platform.json` sidecar written by the harness: the probed host
+/// capability plus every scenario's resolved expectation (including skips, which
+/// never appear in `report.json`). This is the source of truth for a platform's
+/// identity and for the expected-vs-actual reconciliation.
+#[derive(Deserialize)]
+struct PlatformManifest {
+    #[serde(default)]
+    platform_slug: String,
+    #[serde(default)]
+    capability: Option<ManifestCapability>,
+    #[serde(default)]
+    expectations: Vec<ManifestExpectation>,
+}
+
+#[derive(Deserialize)]
+struct ManifestCapability {
+    #[serde(default)]
+    effective_serve_engine: String,
+}
+
+/// One scenario's resolved expectation, keyed by its stable `@id`.
+#[derive(Deserialize, Clone)]
+struct ManifestExpectation {
+    id: String,
+    #[serde(default)]
+    effective_engine: String,
+    /// "pass" | "xfail" | "skip".
+    expected: String,
+    #[serde(default)]
+    bug: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Read a platform's `platform.json` (sibling of `report.json`). Missing =
+/// `None` (older artifacts predating the expectation system).
+fn parse_platform_manifest(json_path: &Path) -> Option<PlatformManifest> {
+    let path = json_path.with_file_name("platform.json");
+    let text = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// How a scenario's actual result compared to its expectation on one platform.
+/// Drives both the grid glyph and the "needs attention" list.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CellOutcome {
+    /// Expected pass, passed.
+    Pass,
+    /// Expected xfail, failed as expected.
+    Xfail,
+    /// Not applicable here (skipped) — the engine/hardware can't exercise it.
+    Skip,
+    /// Expected pass, but FAILED — a real regression.
+    UnexpectedFail,
+    /// Expected xfail, but PASSED — stale entry (bug fixed here?).
+    Xpass,
+    /// Expected skip, yet a result exists — harness/resolver disagreement.
+    RanWhenNa,
+    /// No expectation and no result recorded for this id on this platform.
+    Missing,
+}
+
+impl CellOutcome {
+    /// Reconcile one scenario's expectation against its actual result.
+    /// `actual` is `Some(passed)` when the scenario ran, `None` when it did not
+    /// appear in `report.json` (filtered out / skipped).
+    fn reconcile(expected: &str, actual: Option<bool>) -> Self {
+        match (expected, actual) {
+            ("pass", Some(true)) => Self::Pass,
+            ("pass", Some(false)) => Self::UnexpectedFail,
+            ("pass", None) => Self::Missing,
+            ("xfail", Some(false)) => Self::Xfail,
+            ("xfail", Some(true)) => Self::Xpass,
+            ("xfail", None) => Self::Missing,
+            ("skip", None) => Self::Skip,
+            ("skip", Some(_)) => Self::RanWhenNa,
+            _ => Self::Missing,
+        }
+    }
+
+    /// True when this cell needs human attention (report FAILs on any).
+    const fn is_problem(self) -> bool {
+        matches!(self, Self::UnexpectedFail | Self::Xpass | Self::RanWhenNa)
+    }
+
+    const fn glyph(self) -> &'static str {
+        match self {
+            Self::Pass => "✅",
+            Self::Xfail => "xfail",
+            Self::Skip => "—",
+            Self::UnexpectedFail => "❌FAIL",
+            Self::Xpass => "⚠️XPASS",
+            Self::RanWhenNa => "⚠️N/A-ran",
+            Self::Missing => "·",
+        }
+    }
+}
+
+/// One platform column of the reconciled (scenario-id × platform) grid.
+struct GridColumn {
+    /// Platform identity from the manifest (e.g. "mi300x", "strix-halo", "mock").
+    slug: String,
+    /// Effective serve engine on this host (for the column subheading).
+    engine: String,
+    /// scenario id → reconciled outcome.
+    outcomes: std::collections::BTreeMap<String, CellOutcome>,
+    /// Per-id bug/reason, surfaced in the "needs attention" list.
+    details: std::collections::BTreeMap<String, ManifestExpectation>,
+}
+
+/// The reconciled grid: ordered scenario ids × platform columns. Built from each
+/// input's `platform.json` (expected) joined with its `report.json` (actual) by
+/// stable `@id`. Inputs without a `platform.json` (pre-expectation artifacts) are
+/// skipped here — they still appear in the legacy platform×tier matrix.
+struct Grid {
+    /// Scenario ids in first-seen order across all columns.
+    ids: Vec<String>,
+    columns: Vec<GridColumn>,
+}
+
+impl Grid {
+    fn build(inputs: &[(String, PathBuf)]) -> Self {
+        let mut ids: Vec<String> = Vec::new();
+        let mut columns: Vec<GridColumn> = Vec::new();
+
+        for (_label, json_path) in inputs {
+            let Some(manifest) = parse_platform_manifest(json_path) else {
+                continue;
+            };
+            // Actual results by id from this platform's report.json.
+            let actual = id_pass_map(json_path);
+
+            // Merge into an existing column with the same slug (defensive; with
+            // one job per platform there is exactly one input per slug).
+            let col_idx = columns
+                .iter()
+                .position(|c| c.slug == manifest.platform_slug)
+                .unwrap_or_else(|| {
+                    columns.push(GridColumn {
+                        slug: manifest.platform_slug.clone(),
+                        engine: manifest
+                            .capability
+                            .as_ref()
+                            .map(|c| c.effective_serve_engine.clone())
+                            .unwrap_or_default(),
+                        outcomes: std::collections::BTreeMap::new(),
+                        details: std::collections::BTreeMap::new(),
+                    });
+                    columns.len() - 1
+                });
+
+            for exp in &manifest.expectations {
+                if !ids.contains(&exp.id) {
+                    ids.push(exp.id.clone());
+                }
+                let outcome = CellOutcome::reconcile(&exp.expected, actual.get(&exp.id).copied());
+                // A real result supersedes a defensive Missing on merge.
+                columns[col_idx]
+                    .outcomes
+                    .entry(exp.id.clone())
+                    .and_modify(|o| {
+                        if *o == CellOutcome::Missing {
+                            *o = outcome;
+                        }
+                    })
+                    .or_insert(outcome);
+                columns[col_idx].details.insert(exp.id.clone(), exp.clone());
+            }
+        }
+
+        ids.sort();
+        Self { ids, columns }
+    }
+
+    /// Every problem cell across the grid, as `(slug, id, outcome, detail)`.
+    fn problems(&self) -> Vec<(&str, &str, CellOutcome, Option<&ManifestExpectation>)> {
+        let mut out = Vec::new();
+        for col in &self.columns {
+            for (id, outcome) in &col.outcomes {
+                if outcome.is_problem() {
+                    out.push((
+                        col.slug.as_str(),
+                        id.as_str(),
+                        *outcome,
+                        col.details.get(id),
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    fn is_empty(&self) -> bool {
+        self.columns.is_empty() || self.ids.is_empty()
+    }
+}
+
+/// Map each scenario's stable `@id` → whether it passed, from a `report.json`.
+/// (Internal sibling of the public [`scenario_results_by_id`], returning a map.)
+fn id_pass_map(json_path: &Path) -> std::collections::HashMap<String, bool> {
+    let features = parse_features(json_path);
+    features
+        .iter()
+        .flat_map(|f| &f.elements)
+        .filter_map(|el| scenario_id(el).map(|id| (id, scenario_status(el) != "failed")))
+        .collect()
+}
+
 impl PlatformReport {
     fn load(artifact: String, json_path: &Path) -> Self {
         let features = parse_features(json_path);
@@ -588,6 +824,8 @@ pub fn generate_consolidated(
                     (matrix_table(&reports))
                     (legend())
 
+                    (expectation_grid_html(inputs))
+
                     h2 { "Per-platform Details" }
                     div.details {
                         @for report in &reports {
@@ -698,7 +936,154 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
         }
     }
 
+    // The per-(scenario × platform) expectation grid, when platform.json
+    // sidecars are present (the new expectation system). Placed before the
+    // command-coverage table; it supersedes the coarse platform×tier matrix for
+    // "where should each test pass / not matter / not run".
+    out.push_str(&expectation_grid_markdown(inputs));
+
     out.push_str(&command_coverage_markdown(&reports));
+
+    out
+}
+
+/// Render the reconciled expectation grid as an HTML section (for the standalone
+/// report). Empty markup when no `platform.json` sidecars are present.
+fn expectation_grid_html(inputs: &[(String, PathBuf)]) -> Markup {
+    let grid = Grid::build(inputs);
+    if grid.is_empty() {
+        return html! {};
+    }
+    let problems = grid.problems();
+    html! {
+        h2 { "Expectation grid (scenario × platform)" }
+        table.stats {
+            thead {
+                tr {
+                    th { "Scenario" }
+                    @for col in &grid.columns {
+                        th {
+                            (col.slug)
+                            @if !col.engine.is_empty() { br; small { (col.engine) } }
+                        }
+                    }
+                }
+            }
+            tbody {
+                @for id in &grid.ids {
+                    tr {
+                        td { code { (id) } }
+                        @for col in &grid.columns {
+                            @let outcome = col.outcomes.get(id).copied().unwrap_or(CellOutcome::Missing);
+                            td.num
+                              class=(if outcome.is_problem() { "status-fail" } else { "" }) {
+                                (outcome.glyph())
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        @if !problems.is_empty() {
+            h3 { "Needs attention" }
+            ul {
+                @for (slug, id, outcome, detail) in &problems {
+                    li {
+                        b {
+                            @match outcome {
+                                CellOutcome::Xpass => "XPASS",
+                                CellOutcome::UnexpectedFail => "unexpected failure",
+                                CellOutcome::RanWhenNa => "ran despite N/A",
+                                _ => "issue",
+                            }
+                        }
+                        " on " code { (slug) } ": " code { (id) }
+                        @if let Some(d) = detail {
+                            @if let Some(b) = &d.bug { " (" (b) ")" }
+                            @if !d.effective_engine.is_empty() { " [engine: " (d.effective_engine) "]" }
+                            @if let Some(r) = &d.reason { " — " (r) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render the reconciled (scenario-id × platform) expectation grid as markdown,
+/// plus a "needs attention" list of every XPASS / unexpected-fail / ran-when-NA.
+/// Empty string when no `platform.json` sidecars are present.
+fn expectation_grid_markdown(inputs: &[(String, PathBuf)]) -> String {
+    use std::fmt::Write as _;
+
+    let grid = Grid::build(inputs);
+    if grid.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("\n### Expectation grid (scenario × platform)\n\n");
+    out.push_str(
+        "_✅ pass · `xfail` known bug (failed as expected) · — not applicable here · \
+         ❌FAIL regression · ⚠️XPASS bug fixed here (stale entry) · · no data._\n\n",
+    );
+
+    // Header: one column per platform, with its effective engine as context.
+    out.push_str("| Scenario |");
+    for col in &grid.columns {
+        let eng = if col.engine.is_empty() {
+            String::new()
+        } else {
+            format!("<br><sub>{}</sub>", col.engine)
+        };
+        let _ = write!(out, " {}{} |", col.slug, eng);
+    }
+    out.push('\n');
+    out.push_str("|---|");
+    for _ in &grid.columns {
+        out.push_str(":--:|");
+    }
+    out.push('\n');
+
+    for id in &grid.ids {
+        let _ = write!(out, "| `{id}` |");
+        for col in &grid.columns {
+            let g = col
+                .outcomes
+                .get(id)
+                .copied()
+                .unwrap_or(CellOutcome::Missing);
+            let _ = write!(out, " {} |", g.glyph());
+        }
+        out.push('\n');
+    }
+
+    // Needs-attention list from reconciliation problems.
+    let problems = grid.problems();
+    if !problems.is_empty() {
+        out.push_str("\n### Needs attention\n\n");
+        for (slug, id, outcome, detail) in problems {
+            let bug = detail
+                .and_then(|d| d.bug.as_deref())
+                .map(|b| format!(" ({b})"))
+                .unwrap_or_default();
+            let engine = detail
+                .map(|d| d.effective_engine.as_str())
+                .filter(|e| !e.is_empty())
+                .map(|e| format!(" [engine: {e}]"))
+                .unwrap_or_default();
+            let reason = detail
+                .and_then(|d| d.reason.as_deref())
+                .map(|r| format!(" — {r}"))
+                .unwrap_or_default();
+            let kind = match outcome {
+                CellOutcome::Xpass => "XPASS",
+                CellOutcome::UnexpectedFail => "unexpected failure",
+                CellOutcome::RanWhenNa => "ran despite N/A",
+                _ => "issue",
+            };
+            let _ = writeln!(out, "- **{kind}** on `{slug}`: `{id}`{bug}{engine}{reason}");
+        }
+    }
 
     out
 }
@@ -1391,6 +1776,120 @@ mod tests {
         assert!(
             md.contains("| `rocm serve --engine` | Qwen | vllm | ❌ |"),
             "serve should be ❌ with model/engine:\n{md}"
+        );
+    }
+
+    #[test]
+    fn cell_outcome_reconciliation() {
+        use CellOutcome as C;
+        assert_eq!(C::reconcile("pass", Some(true)), C::Pass);
+        assert_eq!(C::reconcile("pass", Some(false)), C::UnexpectedFail);
+        assert_eq!(C::reconcile("xfail", Some(false)), C::Xfail);
+        assert_eq!(C::reconcile("xfail", Some(true)), C::Xpass);
+        assert_eq!(C::reconcile("skip", None), C::Skip);
+        assert_eq!(C::reconcile("skip", Some(true)), C::RanWhenNa);
+        assert!(C::UnexpectedFail.is_problem());
+        assert!(C::Xpass.is_problem());
+        assert!(C::RanWhenNa.is_problem());
+        assert!(!C::Pass.is_problem());
+        assert!(!C::Xfail.is_problem());
+        assert!(!C::Skip.is_problem());
+    }
+
+    /// Write a report.json + platform.json pair into a fresh dir and return the
+    /// report.json path (the input the grid keys on).
+    fn write_platform(report_json: &str, platform_json: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let report = dir.path().join("report.json");
+        std::fs::write(&report, report_json).expect("write report");
+        std::fs::write(dir.path().join("platform.json"), platform_json).expect("write platform");
+        (dir, report)
+    }
+
+    #[test]
+    fn grid_reconciles_xfail_and_pass_by_id() {
+        // Scenario s0 tagged @id:serve-x, expected xfail, actually failed → xfail (good).
+        // Scenario s1 tagged @id:examine-y, expected pass, actually passed → pass.
+        let report = feature_json(&[
+            (&["id:serve-x"], &["failed"]),
+            (&["id:examine-y"], &["passed"]),
+        ]);
+        let platform = r#"{
+            "platform_slug": "mi300x",
+            "capability": {"effective_serve_engine": "vllm"},
+            "expectations": [
+                {"id":"serve-x","effective_engine":"vllm","expected":"xfail","bug":"EAI-7333","reason":"readiness gap"},
+                {"id":"examine-y","effective_engine":"vllm","expected":"pass"}
+            ]
+        }"#;
+        let (_d, path) = write_platform(&report, platform);
+        let inputs = vec![("mi300x".to_string(), path)];
+        let md = consolidated_summary_markdown(&inputs);
+        assert!(md.contains("### Expectation grid"), "grid missing:\n{md}");
+        assert!(
+            md.contains("| `serve-x` | xfail |"),
+            "serve-x should be xfail:\n{md}"
+        );
+        assert!(
+            md.contains("| `examine-y` | ✅ |"),
+            "examine-y should be pass:\n{md}"
+        );
+        // No problems → no needs-attention from the grid.
+        assert!(!md.contains("**XPASS**"), "should have no XPASS:\n{md}");
+    }
+
+    #[test]
+    fn grid_flags_xpass_when_known_bug_passes() {
+        // s0 expected xfail but PASSED → XPASS (the run #543 Strix-Windows case).
+        let report = feature_json(&[(&["id:serve-default"], &["passed"])]);
+        let platform = r#"{
+            "platform_slug": "strix-halo",
+            "capability": {"effective_serve_engine": "lemonade"},
+            "expectations": [
+                {"id":"serve-default","effective_engine":"lemonade","expected":"xfail","bug":"EAI-7333","reason":"readiness gap"}
+            ]
+        }"#;
+        let (_d, path) = write_platform(&report, platform);
+        let inputs = vec![("strix-halo".to_string(), path)];
+        let md = consolidated_summary_markdown(&inputs);
+        assert!(md.contains("⚠️XPASS"), "grid cell should show XPASS:\n{md}");
+        assert!(
+            md.contains("**XPASS** on `strix-halo`: `serve-default` (EAI-7333)"),
+            "needs-attention should list the XPASS with bug:\n{md}"
+        );
+    }
+
+    #[test]
+    fn grid_shows_skip_as_not_applicable() {
+        // Scenario is skip on this host; report.json has no entry for it.
+        let report = feature_json(&[(&["id:ran-here"], &["passed"])]);
+        let platform = r#"{
+            "platform_slug": "mock",
+            "capability": {"effective_serve_engine": "lemonade"},
+            "expectations": [
+                {"id":"ran-here","effective_engine":"lemonade","expected":"pass"},
+                {"id":"gpu-only","effective_engine":"vllm","expected":"skip","reason":"requires an AMD GPU"}
+            ]
+        }"#;
+        let (_d, path) = write_platform(&report, platform);
+        let inputs = vec![("mock".to_string(), path)];
+        let md = consolidated_summary_markdown(&inputs);
+        assert!(
+            md.contains("| `gpu-only` | — |"),
+            "skip should render as —:\n{md}"
+        );
+        assert!(md.contains("| `ran-here` | ✅ |"));
+    }
+
+    #[test]
+    fn grid_absent_without_platform_json() {
+        // Old-style artifact (report.json only) → no grid section.
+        let report = write_report(&feature_json(&[(&[], &["passed"])]));
+        let inputs = vec![("e2e-report".to_string(), report.path().to_path_buf())];
+        let md = consolidated_summary_markdown(&inputs);
+        assert!(
+            !md.contains("### Expectation grid"),
+            "no grid expected:\n{md}"
         );
     }
 }

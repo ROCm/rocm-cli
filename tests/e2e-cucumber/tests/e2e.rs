@@ -417,15 +417,47 @@ fn results_dir() -> PathBuf {
     dir
 }
 
+/// Load the per-scenario expectation matrix that lives next to the features.
+fn load_expectations() -> e2e_cucumber::expectation::Expectations {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/expectations.toml");
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read expectations.toml ({path}): {e}"));
+    e2e_cucumber::expectation::Expectations::parse(&text)
+        .unwrap_or_else(|e| panic!("failed to parse expectations.toml: {e}"))
+}
+
 #[tokio::main]
 async fn main() {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
     use cucumber::writer::{self, Stats as _};
+    use e2e_cucumber::capability::host_capability;
+    use e2e_cucumber::expectation::{Expectation, ScenarioDecl, resolve};
 
     let dir = results_dir();
     let json_file =
         std::fs::File::create(dir.join("report.json")).expect("failed to create report.json");
     let junit_file =
         std::fs::File::create(dir.join("junit.xml")).expect("failed to create junit.xml");
+
+    // Probe the host once and load the xfail matrix. Every scenario's outcome
+    // (pass / xfail / skip) is resolved from these two inputs + its tags —
+    // replacing the old global @expected-failure tag filter.
+    let cap = host_capability();
+    let matrix = load_expectations();
+    eprintln!(
+        "Host capability: platform={} os={} gpu={} effective_engine={}",
+        cap.platform_slug, cap.os_family, cap.has_amd_gpu, cap.effective_serve_engine,
+    );
+
+    // Shared record of each scenario's resolved expectation, keyed by @id.
+    // Populated by `filter_run` (which sees every scenario, run or skipped) so
+    // the post-run evaluation and platform.json can reconcile by id — including
+    // skipped scenarios, which never appear in cucumber's report.json.
+    // id → (resolved expectation, effective engine for that scenario).
+    let resolutions: &'static Mutex<BTreeMap<String, (Expectation, String)>> =
+        Box::leak(Box::new(Mutex::new(BTreeMap::new())));
 
     // `.run()` records failures into the writers but never sets a non-zero exit
     // code — only the returned writer knows. Capture it (summarized, so it tracks
@@ -450,7 +482,25 @@ async fn main() {
                 .tee(writer::JUnit::new(junit_file, 0).discard_stats_writes())
                 .normalized(),
         )
-        .run(concat!(env!("CARGO_MANIFEST_DIR"), "/features/"))
+        // Resolve every scenario's expectation from its tags + host capability +
+        // the xfail matrix. Scenarios resolving to `Skip` (not-applicable on this
+        // host — e.g. a required engine can't start) are filtered out and never
+        // run; their resolution is still recorded so platform.json can show N/A.
+        .filter_run(concat!(env!("CARGO_MANIFEST_DIR"), "/features/"), {
+            move |_feature, _rule, scenario| {
+                let decl = ScenarioDecl::from_tags(&scenario.tags);
+                let expectation = resolve(&decl, cap, &matrix);
+                let run = !matches!(expectation, Expectation::Skip { .. });
+                if let Some(id) = &decl.id {
+                    let engine = decl.effective_engine(cap).to_owned();
+                    resolutions
+                        .lock()
+                        .expect("resolutions poisoned")
+                        .insert(id.clone(), (expectation, engine));
+                }
+                run
+            }
+        })
         .await;
 
     // Generate the HTML report before exiting so the artifact still uploads on
@@ -460,50 +510,81 @@ async fn main() {
 
     eprintln!("Report: {}/report.html", dir.display());
 
-    // Known-bugs mode (`cargo xtask e2e --expect-failures`): the suite is filtered
-    // to `@expected-failure` scenarios, whose failing IS the expected outcome. A
-    // parse/hook error still fails outright (the run didn't execute cleanly);
-    // otherwise invert the step-failure signal via xfail/XPASS accounting.
-    if std::env::var_os("E2E_EXPECT_FAILURES").is_some() {
-        if summary.parsing_errors() > 0 || summary.hook_errors() > 0 {
-            eprintln!(
-                "E2E run errored: {} parsing error(s), {} hook error(s)",
-                summary.parsing_errors(),
-                summary.hook_errors(),
-            );
-            std::process::exit(1);
-        }
-        let xfail = e2e_cucumber::report::evaluate_xfail(&dir.join("report.json"))
-            .expect("failed to evaluate xfail report");
+    // A parse/hook error means the run did not execute cleanly — always fatal,
+    // regardless of per-scenario expectations.
+    if summary.parsing_errors() > 0 || summary.hook_errors() > 0 {
         eprintln!(
-            "Known-bugs run: {} scenario(s) failed as expected (xfail).",
-            xfail.xfail,
-        );
-        if !xfail.is_ok() {
-            for name in &xfail.xpass {
-                eprintln!(
-                    "XPASS: '{name}' is tagged @expected-failure but PASSED \u{2014} the bug \
-                     appears fixed; remove the tag so it joins the blocking suite.",
-                );
-            }
-            for name in &xfail.untagged_failures {
-                eprintln!(
-                    "FAIL: '{name}' failed but is not tagged @expected-failure \u{2014} a real \
-                     regression in the known-bugs run.",
-                );
-            }
-            std::process::exit(1);
-        }
-        return;
-    }
-
-    if summary.execution_has_failed() {
-        eprintln!(
-            "E2E run failed: {} failed step(s), {} parsing error(s), {} hook error(s)",
-            summary.failed_steps(),
+            "E2E run errored: {} parsing error(s), {} hook error(s)",
             summary.parsing_errors(),
             summary.hook_errors(),
         );
+        std::process::exit(1);
+    }
+
+    // Per-scenario reconciliation: join each scenario's resolved expectation
+    // against its actual result (from report.json, keyed by @id) and classify.
+    let actual = e2e_cucumber::report::scenario_results_by_id(&dir.join("report.json"))
+        .expect("failed to read scenario results");
+    let resolutions = resolutions.lock().expect("resolutions poisoned");
+
+    // Write the platform.json sidecar (probed capability + every resolution,
+    // including skips) for the central report's expected-vs-actual grid.
+    let manifest = e2e_cucumber::expectation::PlatformManifest {
+        platform_slug: &cap.platform_slug,
+        capability: cap,
+        expectations: resolutions
+            .iter()
+            .map(|(id, (exp, engine))| {
+                e2e_cucumber::expectation::ResolvedScenario::new(id, engine, exp)
+            })
+            .collect(),
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&manifest) {
+        let _ = std::fs::write(dir.join("platform.json"), json);
+    }
+
+    // Classify: XPASS (expected xfail but passed) and unexpected-fail (expected
+    // pass but failed) are failures; expected outcomes are fine. Scenarios that
+    // ran but have no id, or ran without a recorded resolution, are treated as
+    // expect-pass (a bare failure then fails the run).
+    let mut xpass = Vec::new();
+    let mut unexpected_fail = Vec::new();
+    let mut xfail_count = 0u32;
+    for (id, passed) in &actual {
+        match resolutions.get(id).map(|(exp, _)| exp) {
+            Some(Expectation::ExpectXfail { bug, .. }) => {
+                if *passed {
+                    xpass.push(format!("{id} ({bug})"));
+                } else {
+                    xfail_count += 1;
+                }
+            }
+            // ExpectPass, or no recorded resolution (untagged) → must pass.
+            _ => {
+                if !passed {
+                    unexpected_fail.push(id.clone());
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "Reconciliation: {xfail_count} xfail (failed as expected), {} XPASS, {} unexpected failure(s).",
+        xpass.len(),
+        unexpected_fail.len(),
+    );
+    if !xpass.is_empty() || !unexpected_fail.is_empty() {
+        for x in &xpass {
+            eprintln!(
+                "XPASS: '{x}' is expected to fail on this host but PASSED \u{2014} the bug appears \
+                 fixed here; update expectations.toml.",
+            );
+        }
+        for f in &unexpected_fail {
+            eprintln!(
+                "FAIL: '{f}' was expected to pass on this host but FAILED \u{2014} a regression."
+            );
+        }
         std::process::exit(1);
     }
 }

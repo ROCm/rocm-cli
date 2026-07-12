@@ -1,0 +1,85 @@
+# Per-scenario expected-failure (xfail) matrix, keyed by scenario @id.
+#
+# This file holds the irreducibly manual part of the expectation system: a known
+# BUG is a defect the capability probe cannot infer, so each is declared here.
+# Everything else — is the required engine available on this host? what engine
+# does `serve` default to? does this platform prefer vLLM? — is DERIVED from the
+# host capability probe (see src/capability.rs) and is NOT encoded here.
+#
+# Resolution at runtime (see tests/e2e-cucumber/tests/e2e/expectation.rs):
+#   1. A scenario whose @requires-gpu / @requires-engine can't be satisfied on
+#      this host is SKIPPED (not-applicable) — never listed here.
+#   2. Otherwise, the FIRST matching condition below marks it expected-fail
+#      (xfail); a scenario that then PASSES is an XPASS (stale entry — remove it).
+#   3. No matching condition → expected-pass.
+#
+# Condition predicate grammar (deliberately tiny):
+#   [[<scenario-id>]]                 one table per condition (arrays = OR)
+#   when = { effective_engine = "vllm", os = "linux", is_wsl = false }
+#                                     all present keys must match (AND)
+#   bug = "EAI-NNNN"                  ticket reference (shown in the report)
+#   reason = "..."                    human explanation (shown in the report)
+#   serve_timeout_secs = 90          optional: shorter serve wait for a known bug
+#
+# An empty `when = {}` means "always xfail" (platform-independent bug).
+
+# --- EAI-7219: short-name expansion not surfaced in serve output (any engine) ---
+[["serve-short-name-expansion"]]
+when = {}
+bug = "EAI-7219"
+reason = "Serve output does not surface the expanded full model name for a short name."
+
+[["serve-short-name-consistent-across-engines"]]
+when = {}
+bug = "EAI-7219"
+reason = "Engines do not report a consistent resolved model name for a short name."
+
+# --- EAI-7333: vLLM reports /v1/models ready but refuses inference. vLLM-only. ---
+# Applies wherever the effective serve engine is vLLM. On lemonade-default hosts
+# (e.g. Strix Halo gfx1151, native Windows) these resolve to expected-pass, which
+# is what fixes the Strix-Windows XPASS from run #543.
+[["serve-inference-response"]]
+when = { effective_engine = "vllm" }
+bug = "EAI-7333"
+reason = "vLLM service reports ready (/v1/models 200) but POST /v1/chat/completions is refused."
+serve_timeout_secs = 90
+
+[["serve-default-engine-working-endpoint"]]
+when = { effective_engine = "vllm" }
+bug = "EAI-7333"
+reason = "Default-selected vLLM endpoint never reaches a ready /v1/models within the serve timeout."
+serve_timeout_secs = 90
+
+[["serve-default-engine-inference"]]
+when = { effective_engine = "vllm" }
+bug = "EAI-7333"
+reason = "Default-engine (vLLM) endpoint is reachable but chat inference is refused."
+serve_timeout_secs = 90
+
+[["serve-ready-implies-inference"]]
+when = { effective_engine = "vllm" }
+bug = "EAI-7333"
+reason = "CLI reports the vLLM service ready, but an immediate inference request fails."
+serve_timeout_secs = 90
+
+# --- EAI-7052: lemonade falls back to Vulkan llama.cpp instead of system ROCm ---
+# and inference hangs. Observed on Linux GPU hosts serving GGUF via lemonade.
+[["serve-lemonade-inference"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "EAI-7052"
+reason = "Lemonade uses its Vulkan llama.cpp backend instead of system ROCm; inference hangs."
+serve_timeout_secs = 90
+
+# --- EAI-7223: chat requests with tool definitions rejected (vLLM path) ---
+[["chat-tool-definitions-accepted"]]
+when = { effective_engine = "vllm" }
+bug = "EAI-7223"
+reason = "Chat requests carrying tool definitions are not accepted by the served vLLM model."
+serve_timeout_secs = 90
+
+# --- EAI-7221: end-to-end chat through a locally served model (vLLM path) ---
+[["chat-end-to-end-local-model"]]
+when = { effective_engine = "vllm" }
+bug = "EAI-7221"
+reason = "End-to-end chat through a locally served vLLM model does not return a valid reply."
+serve_timeout_secs = 90

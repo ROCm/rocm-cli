@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: MIT
 
+pub mod capability;
+pub mod expectation;
 pub mod mock_server;
 
 // The report generator lives in its own lean crate (only maud + serde) so xtask
