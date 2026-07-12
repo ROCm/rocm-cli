@@ -6,7 +6,7 @@
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-12
 
-**Token Usage:** in=7909 out=2298643 cache_create=25326802 cache_read=1687728488 calls=3967
+**Token Usage:** in=8271 out=2497111 cache_create=27069204 cache_read=1748846347 calls=4149
 
 ---
 
@@ -729,5 +729,28 @@ addressed here with the exit-code fix + dedicated known-bugs job.
 
 **2026-07-11 (idle flush):** Session idle for 1 hour, auto-flushing WIP state.
 
-### 2026-07-12 (idle flush)
-**2026-07-12 (idle flush):** Session idle for 1 hour, auto-flushing WIP state.
+### 2026-07-12 (Stages 1–3: per-scenario expectation matrix system, COMPLETED)
+- ✅ **Stage 1 (Capability probe)**: `src/capability.rs` (~480 lines, 10 unit tests all green).
+  Spawns `rocm examine --json` + `engines list`, derives OS/GPU/engine state. Re-implements
+  product's `preferred_serve_engine_for_therock_family()` (vllm on *-dcgpu/gfx906/908/90a + not-Windows,
+  else lemonade). Single centralized function so Task #16 can swap it later. Drift-guard unit tests
+  pin gfx942→vllm, gfx1151→lemonade, Windows→lemonade. Live integration test on Mac: correctly reports
+  no GPU, platform_slug=mock. **RUSTFLAGS="-D warnings" clean.**
+- ✅ **Stage 2 (Scenario re-tagging + expectations matrix)**: All 21 scenarios tagged with stable `@id:` slugs.
+  Replaced `@gpu` → `@requires-gpu`; added `@requires-engine:vllm|lemonade` (5 engine-pinning scenarios).
+  Removed old `@expected-failure` tags. New `expectations.toml` (TOML, per-id xfail conditions).
+  **Core fix**: EAI-7333 condition uses `when = { effective_engine = "vllm" }`, so scenarios 6/6b/5/8
+  xfail on vLLM hosts but expect-pass on lemonade hosts (Strix Windows) — eliminates run #543 XPASS.
+  **21 scenarios, 9 with xfail entries, all accounted for.**
+- ✅ **Stage 3 (Runtime resolver + filter_run + per-scenario eval)**: `src/expectation.rs` (resolver enum +
+  toml parsing, 9 unit tests incl. core XPASS regression test). Harness changes: probe host once, load matrix,
+  `filter_run` resolves each scenario (skip N/A: no GPU or engine can't start, run pass/xfail). Post-run
+  reconciliation classifies XPASS/unexpected-fail by id. Writes `platform.json` sidecar (capability +
+  all 21 resolutions incl. skips). Old `E2E_EXPECT_FAILURES` global path removed.
+  **End-to-end mock run verified**: 8 pass / 2 xfail / 11 skip, exit 0. platform.json contains all 21 ids
+  with correct labels + reasons.
+- 📋 **Stage 4** (pending): rewrite consolidated report to render (scenario-id × platform) grid from platform.json,
+  flag XPASS/unexpected-fail/ran-when-NA.
+- 📋 **Stage 5** (pending): collapse 8 CI E2E jobs → 4 (one per platform), drop tag-filter/--expect-failures args.
+- **19 library unit tests all passing, build clean under -D warnings.** Three new library files staged in working tree.
+- **Token usage high** (stage 3 wiring + comprehensive testing): in=8271 out=2.5M cache_create=27M cache_read=1.7B.
