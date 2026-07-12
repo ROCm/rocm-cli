@@ -145,6 +145,23 @@ impl Expectations {
     pub fn entries_for(&self, id: &str) -> &[XfailEntry] {
         self.by_id.get(id).map_or(&[], Vec::as_slice)
     }
+
+    /// The shortest `serve_timeout_secs` among the conditions matching this host
+    /// for a scenario, if any. A known bug that manifests as a serve which never
+    /// becomes ready should fail fast rather than burn the full cold-start window
+    /// — so the harness applies this per scenario instead of the global default.
+    pub fn serve_timeout_for(
+        &self,
+        id: &str,
+        cap: &HostCapability,
+        effective_engine: &str,
+    ) -> Option<u64> {
+        self.entries_for(id)
+            .iter()
+            .filter(|e| e.when.matches(cap, effective_engine))
+            .filter_map(|e| e.serve_timeout_secs)
+            .min()
+    }
 }
 
 /// Serializable outcome label for a resolved scenario (for `platform.json`).
@@ -469,6 +486,37 @@ reason = "lemonade vulkan fallback"
             resolve(&d, &cap("strix-windows"), &m),
             Expectation::ExpectPass
         );
+    }
+
+    #[test]
+    fn serve_timeout_applies_only_when_condition_matches() {
+        let m = Expectations::parse(
+            r#"
+[["serve-default-engine-inference"]]
+when = { effective_engine = "vllm" }
+bug = "EAI-7333"
+reason = "vLLM readiness gap"
+serve_timeout_secs = 90
+"#,
+        )
+        .unwrap();
+        // MI300X: effective engine vllm → override applies (fail fast).
+        assert_eq!(
+            m.serve_timeout_for("serve-default-engine-inference", &cap("mi300x"), "vllm"),
+            Some(90)
+        );
+        // Strix Windows: lemonade default → condition doesn't match → no override
+        // (full window; the scenario is expected to pass there).
+        assert_eq!(
+            m.serve_timeout_for(
+                "serve-default-engine-inference",
+                &cap("strix-windows"),
+                "lemonade"
+            ),
+            None
+        );
+        // Unknown id → no override.
+        assert_eq!(m.serve_timeout_for("nope", &cap("mi300x"), "vllm"), None);
     }
 
     #[test]

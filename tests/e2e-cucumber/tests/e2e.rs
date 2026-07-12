@@ -47,6 +47,12 @@ pub struct E2eWorld {
     /// holds its path; `isolate_cmd` then exports it as `ROCM_PATH` so `rocm
     /// examine` detects unmanaged ROCm on any platform (see `plant_unmanaged_rocm`).
     pub legacy_rocm_path: Option<PathBuf>,
+    /// Per-scenario serve-readiness timeout override (seconds), set by the
+    /// `before` hook from `expectations.toml` when this scenario is a known bug
+    /// with a `serve_timeout_secs`. Lets an xfail serve that never becomes ready
+    /// fail fast instead of burning the full cold-start window. `None` → the
+    /// step's default / `E2E_SERVE_TIMEOUT_SECS`.
+    pub serve_timeout_override: Option<u64>,
 }
 
 /// A persistent directory shared across scenarios for heavy, immutable artifacts
@@ -94,6 +100,7 @@ impl Default for E2eWorld {
             current_scenario: None,
             isolated_root: Some(root),
             legacy_rocm_path: None,
+            serve_timeout_override: None,
         }
     }
 }
@@ -445,7 +452,10 @@ async fn main() {
     // (pass / xfail / skip) is resolved from these two inputs + its tags —
     // replacing the old global @expected-failure tag filter.
     let cap = host_capability();
-    let matrix = load_expectations();
+    // Leaked so both the `filter_run` closure and the `before` hook (which sets
+    // the per-scenario serve-timeout override) can borrow it for 'static.
+    let matrix: &'static e2e_cucumber::expectation::Expectations =
+        Box::leak(Box::new(load_expectations()));
     eprintln!(
         "Host capability: platform={} os={} gpu={} effective_engine={}",
         cap.platform_slug, cap.os_family, cap.has_amd_gpu, cap.effective_serve_engine,
@@ -471,8 +481,18 @@ async fn main() {
         // Record the scenario name on the World before each scenario so every
         // `rocm` invocation can be tied back to its scenario for the coverage
         // report.
-        .before(|_feature, _rule, scenario, world| {
+        .before(move |_feature, _rule, scenario, world| {
             world.current_scenario = Some(scenario.name.clone());
+            // If this scenario is a known bug with a serve-timeout override that
+            // applies on this host, hand it to the serve steps so an xfail serve
+            // that never becomes ready fails fast instead of burning the full
+            // cold-start window (keeps the collapsed one-job-per-platform run
+            // inside its time budget).
+            let decl = ScenarioDecl::from_tags(&scenario.tags);
+            if let Some(id) = &decl.id {
+                let engine = decl.effective_engine(cap);
+                world.serve_timeout_override = matrix.serve_timeout_for(id, cap, engine);
+            }
             Box::pin(async {})
         })
         .with_writer(
@@ -489,7 +509,7 @@ async fn main() {
         .filter_run(concat!(env!("CARGO_MANIFEST_DIR"), "/features/"), {
             move |_feature, _rule, scenario| {
                 let decl = ScenarioDecl::from_tags(&scenario.tags);
-                let expectation = resolve(&decl, cap, &matrix);
+                let expectation = resolve(&decl, cap, matrix);
                 let run = !matches!(expectation, Expectation::Skip { .. });
                 if let Some(id) = &decl.id {
                     let engine = decl.effective_engine(cap).to_owned();
