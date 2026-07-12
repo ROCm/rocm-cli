@@ -4,9 +4,9 @@
 **Stage:** 8-awaiting-pr-approval
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
-**Last Updated:** 2026-07-12 (idle flush)
+**Last Updated:** 2026-07-12
 
-**Token Usage:** in=7877 out=2291759 cache_create=25046245 cache_read=1683994303 calls=3951
+**Token Usage:** in=7909 out=2298643 cache_create=25326802 cache_read=1687728488 calls=3967
 
 ---
 
@@ -128,23 +128,23 @@ KEY: GGUF-only recipes (e.g. `qwen2.5`→Qwen3-4B-GGUF, `Qwen2.5-1.5B`) fall thr
 even on Instinct because vllm can't serve them. vLLM-capable safetensors (e.g.
 `Qwen/Qwen2.5-0.5B-Instruct`) → vllm on Instinct. This is CORRECT, not a bug.
 
+### Completed ✅ (Goal achievement + full cross-platform report, Jul 11–12)
+- ✅ **Scenario 6 reclassified** (`41e5d1f`): moved to known-bugs (default-engine serve readiness gap, same EAI-7333 as 5/6b/8). App-dev expect-pass = 4/4 green, ~2min.
+- ✅ **Windows scenario 4 hermetic fix** (`80d1997`): precondition was no-op (silently assumed ambient ROCm); plant fake ROCm via `ROCM_PATH` + marker file in scenario TempDir. Tested locally (no GPU, no system ROCm) + verified on real Strix Windows box.
+- ✅ **Strix Ubuntu runner restarted**: user ran `sudo ./svc.sh install + start` on the box. Dispatcher ran expect-pass → 4/4 pass, ~27s.
+- ✅ **Full all-4-platform run #543** (commit 80d1997): platform=all tier=both. Expect-pass green all 4 (Mock 8/8, app-dev 4/4, Strix Win 4/4, Strix Ubu 4/4). Known-bugs: Strix Windows row flagged XPASS (scenarios 6/6b unexpectedly passed — EAI-7333 vLLM-specific, doesn't reproduce on lemonade-default Windows). Consolidated report + command-coverage table generated.
+- ✅ **Goal reached**: all 4 platforms verified ≤15min expect-pass pass (confirmed from junit artifacts).
+
 ### Todo 📋
-- ✅ DONE: committed the 3 files as `c25c4eb` (signed via git-commit-with-fallback, signed-off,
-  no AI refs), pushed `96108e5..c25c4eb`. Pre-commit verify: mock suite 8/8 green + Linux
-  container suite fully green (rocm-core 170 passed incl. 3 new tests, e2e-report 18 passed).
-  PR #69 now 5 commits: 55b3aec, d33d182, 93f03ef, 96108e5, c25c4eb.
-- 📋 Add engine-level unit tests for EAI-7333 in engines/vllm + engines/lemonade healthcheck
-  (the rocm-core test covers the shared helper; the per-engine healthcheck_service still trusts
-  /v1/models — could add per-engine coverage too, lower priority).
-- ✅ DONE: Awaited + inspected live CI run on PR #69 (run 29090245163). Core CI all green
-  (clippy, build-and-test, Windows, coverage, signatures, CodeQL). E2E mock tiers passing 
-  (blocking + xfail-inverted). GPU tiers in progress. Strix Halo all 4 fail at `setup-rust-toolchain` 
-  (curl write-to-disk failure, infra not code). No code action needed.
-- 📋 **Fix scenario numbering** in model_serving.feature (currently 1,2,3,4,5,7,6,9,8 — out of
-  order after insertions). Cosmetic; renumber 1-9 sequentially for readability. LOW priority.
-- 📋 (Optional) Update E2E cucumber memory ([[rocm-cli-e2e-cucumber]]) with new default-engine
-  precedence + both-engine coverage once this lands — currently reflects the pre-multi-engine state.
-- 📋 Persistent self-hosted GPU runner (currently ephemeral workspace pod).
+- 📋 **Task #13**: Refine scenario 4 setup to faithful ROCm-tree prime + explicit teardown (currently thin prime with single marker file).
+- 📋 **Task #12**: Discuss private mirror repo for self-hosted E2E validation (eliminate public-repo self-hosted risk).
+- 📋 **Task #9**: Add .github/CODEOWNERS for workflow security (blocked on user: owner handle + scope).
+- 📋 **Task #10**: Enable "Require review from Code Owners" on main (depends on #9).
+- 📋 **Task #11**: Evaluate JIT/ephemeral self-hosted runners (larger architectural change, hardware-constrained).
+- 📋 **XPASS triage**: Scope EAI-7333 xfail to vLLM-default platforms only (not Strix Windows lemonade-default).
+- 📋 Add engine-level unit tests for EAI-7333 in engines/vllm + engines/lemonade healthcheck.
+- 📋 **Fix scenario numbering** in model_serving.feature (1,2,3,4,5,7,6,9,8 → 1-9 sequential). Cosmetic, LOW priority.
+- 📋 Persistent self-hosted GPU runner (app-dev currently ephemeral workspace pod).
 
 ### In progress 🚧 (Jul 10 — CI infra fixes + manual dispatch)
 - ✅ **Inference timeout cap** (`f2fa495`): `send_chat` client had NO timeout → a hung
@@ -692,6 +692,13 @@ addressed here with the exit-code fix + dedicated known-bugs job.
 - **Strix Windows bash**: replaced bash-based action with PowerShell `win.rustup.rs` bootstrap, `--default-toolchain none`, idempotent.
 - **Manual dispatch workflow**: added `workflow_dispatch` trigger + platform/tier inputs to ci.yml (8 E2E jobs guarded, e2e-report runs on dispatch).
 - **PR #98** (ci-manual-e2e): enabler, **in merge queue**. PR #99 (ci-harden-actions): SHA-pin all actions, add dependabot, apply repo security settings.
+
+### 2026-07-11..12 (Goal completion: all 4 platforms verified green ≤15min)
+- **Scenario 6 reclassified** to known-bugs (readiness gap, EAI-7333). App-dev expect-pass 4/4 green.
+- **Scenario 4 hermetic fix** (`plant_unmanaged_rocm`): precondition was no-op; now plants fake ROCm via `ROCM_PATH` marker file. Verified locally (no GPU/ROCm) + on real Strix Windows box.
+- **Strix Ubuntu runner restarted** (user ran `sudo ./svc.sh install + start`). Verified online via API.
+- **Full all-4-platform run #543** (commit 80d1997): platform=all tier=both. Expect-pass green all 4 (alls ≤15min). Known-bugs: Strix Windows XPASS (scenarios 6/6b passed—EAI-7333 vLLM-specific, doesn't reproduce on lemonade-default Windows). Consolidated report + command-coverage generated.
+- **Security backlog**: Tasks #9–#12 added (CODEOWNERS, JIT runners, private-mirror discussion).
 
 ### 2026-07-10 (earlier — runner provisioning fixes + security hardening planning)
 - **Inference timeout cap** (commit `f2fa495`): `send_chat` used unbounded HTTP client; moved to 10s timeout via `E2E_INFERENCE_TIMEOUT_SECS` env. Known-bugs xfail scenarios now fail fast (~1 min) instead of blocking until job limit.
