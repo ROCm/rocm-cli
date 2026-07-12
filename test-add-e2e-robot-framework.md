@@ -6,9 +6,40 @@
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-12
 
-**Status:** ✅ All goal conditions met; all 5 probe/timeout/assertion fixes pushed to origin; local mock tests pass (7✓/2xfail/0XPASS/0unexpected); 45 unit tests green; ready for PR review and merge.
+**Status:** Expectation-matrix system built + 5/7 goal conditions met (see north-star goal below). Overnight: full run 29209242248 (commit e800661, 90min GPU caps) dispatched to produce the complete 4-platform consolidated report the user needs by morning.
 
 **Token Usage:** in=8740 out=2653376 cache_create=30217605 cache_read=1861739877 calls=4386 (+ continuation session)
+
+---
+
+## 🌙 RESUME STATE (context cleared 2026-07-12 late — read this first)
+
+**User's immediate ask:** by tomorrow morning, have a CONSOLIDATED E2E REPORT with all 4 platform columns generated. Time optimization deferred; "accept any required time on app-dev." Work autonomously, don't ask questions (user asleep).
+
+**Open task list (session tasks are cleared with context — this is the durable copy):**
+- `#4` Enable `sha_pinning_required` repo policy after SHA-pinning lands (PR #99).
+- `#9` Add `.github/CODEOWNERS` for workflow security — BLOCKED on user: owner handle + scope.
+- `#10` Enable "Require review from Code Owners" on main (user GitHub setting; needs #9).
+- `#11` Evaluate JIT/ephemeral self-hosted runners (larger, hardware-constrained).
+- `#12` Discuss private-mirror repo for self-hosted E2E (move runners off public repo; user to consult team).
+- `#13` Make examine scenario 4 setup a faithful ROCm prime + explicit teardown (currently a thin ROCM_PATH marker plant, works but minimal).
+- `#16` Reevaluate: add a product probe for effective serve engine (examine --json → effective_serve_engine) so the harness stops re-implementing the rule (capability.rs). Needs team consult. examine.default_engine is a DECOY (const "lemonade").
+- `#22` [IN PROGRESS] Share managed runtime across GPU scenarios to cut per-scenario install sdk — first cut (1817c5b) failed + wedged runner; CI pre-warm reverted (b79f2fb), harness dormant. Needs redesign (see the ⏸️ STOPPED section below). This is the real time-optimization for MI300X.
+- `#23` [BLOCKED on #22] Fix default-engine serve assertion for lemonade-default platforms (Strix) — test bug: lemonade first-serve downloads ~3.4GB, assertion scrapes the download log for `engine:`. Fix = read engine from a deterministic source (services list / serve plan) after pre-warm, not the streaming log.
+- DONE this session: #14 (coverage %), #15 (install/examine/serve/dash incl. dash journey tests), #17-21 (expectation-matrix Stages 1-5).
+
+**In flight:** full CI run **29209242248** on branch `ci-e2e-framework-fixes` (commit `e800661`) — `platform=all`, GPU job caps raised to **90min** so MI300X (~37min, 9× per-scenario install sdk) completes + writes platform.json instead of being cancelled. When all E2E jobs finish, the `e2e-report` job renders `e2e-consolidated-report` (grid + coverage % + command table).
+
+**Durable cron `c8eccc60`** (every 20min, in `.claude/scheduled_tasks.json`) drives the overnight follow-through: checks the run, downloads the report, and fixes issues WITHOUT asking — clears a wedged runner + re-dispatches, or fixes clear test-bug assertions + commits/pushes/re-dispatches. It updates this WIP with the outcome when a complete report exists, then stops.
+
+**Signing is unblocked:** user ran `ssh-add -t 8h ~/.ssh/id_rsa_amd_fespinoz` — SSH key loaded in the agent, so `git-commit-with-fallback -s` signs fine (1Password `op-ssh-sign` was failing headless). Push ROCm/* via `git push https://x-access-token:$(gh auth token)@github.com/ROCm/rocm-cli.git ci-e2e-framework-fixes` (plain git/gh, NOT ghapp-* — App not installed on ROCm/*).
+
+**Wedged-runner recovery (used twice this session):** the app-dev-gpu runner lives in pod `wb-dev-workspace-vscode-1782742332-03bb-78d7499b6b-zjm2d`, namespace `rocm-cli`, kube context `app-dev`. Clear a stuck job with:
+`kubectl --context app-dev -n rocm-cli exec <pod> -- pkill -KILL -f "e2e-target/release/rocm"` (also `cargo test -p e2e-cucumber`, `xtask e2e`) — KEEP `Runner.Listener` + `run.sh` alive. Runner then picks up the queued run.
+
+**Known acceptable gap:** the 2 Strix-Ubuntu `serve-default-engine-*` unexpected-fails (task #23) — a test bug (lemonade first-serve downloads ~3.4GB; assertion scrapes the download log). OK to leave documented; don't block the report on it.
+
+**Commits this session (all pushed to origin/ci-e2e-framework-fixes):** 41e5d1f (scenario 6→known-bugs), 80d1997 (hermetic scenario 4), 2327f74 (per-scenario expectations Stages 1-3), 8d5f9e4 (clippy), c4c7a6c (Stage 5 collapse 8→4 jobs), 61f6d1f (probe doc), 89312ed (Windows model-name + @requires-os:linux), a5dd8dd (per-scenario serve timeout), 0fc67d1 (coverage %), f315ba0 (dash journey tests), 1817c5b (shared-runtime harness — DORMANT), b79f2fb (revert CI pre-warm), e800661 (90min GPU caps).
 
 ---
 
