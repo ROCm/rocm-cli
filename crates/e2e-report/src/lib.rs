@@ -1105,6 +1105,93 @@ struct CommandKey {
 /// command was never run there. "Passed" follows the scenario's own result, so a
 /// command that is *supposed* to be rejected (its scenario asserts the failure)
 /// still reads as ✅ — the tested behaviour held.
+/// The `rocm` command surface we measure coverage against — the denominator.
+///
+/// Curated from the CLI's own `--help` tree (top-level subcommands and their
+/// meaningful second-level subcommands), normalized to the `rocm <base>` shape
+/// that `record_command`'s signature produces (see `derive_subcommand`). Pure
+/// `help`/`completions` plumbing is intentionally excluded — they aren't product
+/// behaviour worth an E2E. When the CLI gains a command, add it here so the
+/// coverage % reflects the real surface (a deliberate, reviewable denominator
+/// beats silently drifting).
+const KNOWN_COMMAND_SURFACE: &[&str] = &[
+    "rocm examine",
+    "rocm diagnose",
+    "rocm fix",
+    "rocm version",
+    "rocm setup status",
+    "rocm setup reset",
+    "rocm chat",
+    "rocm install sdk",
+    "rocm install driver",
+    "rocm update",
+    "rocm runtimes list",
+    "rocm runtimes activate",
+    "rocm runtimes rollback",
+    "rocm runtimes uninstall",
+    "rocm runtimes import",
+    "rocm runtimes adopt",
+    "rocm engines list",
+    "rocm engines install",
+    "rocm engines shell",
+    "rocm model",
+    "rocm serve",
+    "rocm comfyui status",
+    "rocm comfyui install",
+    "rocm comfyui start",
+    "rocm comfyui stop",
+    "rocm comfyui logs",
+    "rocm comfyui models-path",
+    "rocm services list",
+    "rocm services logs",
+    "rocm services stop",
+    "rocm services restart",
+    "rocm automations list",
+    "rocm automations enable",
+    "rocm automations disable",
+    "rocm config show",
+    "rocm config set-engine",
+    "rocm config set-default-engine",
+    "rocm config set-default-runtime",
+    "rocm config set-telemetry",
+    "rocm config set-permissions",
+    "rocm logs",
+    "rocm dash",
+    "rocm uninstall",
+];
+
+/// Normalize a recorded command signature to its base `rocm <base>` form for
+/// matching against `KNOWN_COMMAND_SURFACE` — drops the behaviour-shaping
+/// suffixes `record_command` appends (` --engine`, ` (default engine)`).
+fn command_base(sig: &str) -> &str {
+    sig.split(" --engine")
+        .next()
+        .unwrap_or(sig)
+        .split(" (default engine)")
+        .next()
+        .unwrap_or(sig)
+        .trim()
+}
+
+/// Coverage of the known command surface: `(covered, total, uncovered_sorted)`.
+/// A command counts as covered if any platform ran a matching invocation.
+fn command_coverage_summary(reports: &[PlatformReport]) -> (usize, usize, Vec<&'static str>) {
+    use std::collections::BTreeSet;
+    let mut exercised: BTreeSet<String> = BTreeSet::new();
+    for r in reports {
+        for c in &r.commands {
+            exercised.insert(command_base(&c.subcommand).to_owned());
+        }
+    }
+    let uncovered: Vec<&'static str> = KNOWN_COMMAND_SURFACE
+        .iter()
+        .copied()
+        .filter(|cmd| !exercised.contains(*cmd))
+        .collect();
+    let total = KNOWN_COMMAND_SURFACE.len();
+    (total - uncovered.len(), total, uncovered)
+}
+
 fn command_coverage_markdown(reports: &[PlatformReport]) -> String {
     use std::collections::BTreeMap;
     use std::fmt::Write as _;
@@ -1150,7 +1237,15 @@ fn command_coverage_markdown(reports: &[PlatformReport]) -> String {
         return String::new();
     }
 
+    let (covered, total, uncovered) = command_coverage_summary(reports);
+    let pct = (covered * 100).checked_div(total).unwrap_or(0);
+
     let mut out = String::from("\n### Command coverage\n\n");
+    let _ = writeln!(
+        out,
+        "**CLI surface coverage: {covered}/{total} commands ({pct}%)** exercised by \
+         at least one platform.\n"
+    );
     out.push_str("_Which `rocm` commands are exercised, with which model/engine, per platform. ");
     out.push_str("✅ tested & behaved as expected · ❌ failed · blank = not run there._\n\n");
 
@@ -1186,6 +1281,20 @@ fn command_coverage_markdown(reports: &[PlatformReport]) -> String {
             out.push_str(mark);
         }
         out.push('\n');
+    }
+
+    // Fold-out list of the command surface NOT yet exercised by any platform, so
+    // the coverage % is actionable rather than just a number.
+    if !uncovered.is_empty() {
+        let _ = write!(
+            out,
+            "\n<details><summary>Uncovered commands ({})</summary>\n\n",
+            uncovered.len()
+        );
+        for cmd in &uncovered {
+            let _ = writeln!(out, "- `{cmd}`");
+        }
+        out.push_str("\n</details>\n");
     }
 
     out
@@ -1880,6 +1989,56 @@ mod tests {
             "skip should render as —:\n{md}"
         );
         assert!(md.contains("| `ran-here` | ✅ |"));
+    }
+
+    #[test]
+    fn command_base_strips_suffixes() {
+        assert_eq!(command_base("rocm serve --engine"), "rocm serve");
+        assert_eq!(command_base("rocm serve (default engine)"), "rocm serve");
+        assert_eq!(command_base("rocm install sdk"), "rocm install sdk");
+    }
+
+    #[test]
+    fn command_coverage_counts_against_known_surface() {
+        // A report whose commands.jsonl exercised examine + serve (+ a serve
+        // variant) → those count once against the known surface; total is the
+        // full catalog; uncovered excludes what ran.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let report = dir.path().join("report.json");
+        std::fs::write(&report, feature_json(&[(&[], &["passed"])])).expect("write report");
+        std::fs::write(
+            dir.path().join("commands.jsonl"),
+            concat!(
+                r#"{"scenario":"s0","subcommand":"rocm examine","model":null,"engine":null,"rc":0}"#,
+                "\n",
+                r#"{"scenario":"s0","subcommand":"rocm serve --engine","model":"Q","engine":"vllm","rc":0}"#,
+                "\n",
+                r#"{"scenario":"s0","subcommand":"rocm serve (default engine)","model":"Q","engine":null,"rc":0}"#,
+                "\n",
+            ),
+        )
+        .expect("write commands");
+
+        let reports = vec![PlatformReport::load("e2e-gpu-report".to_string(), &report)];
+        let (covered, total, uncovered) = command_coverage_summary(&reports);
+        assert_eq!(total, KNOWN_COMMAND_SURFACE.len());
+        // examine + serve (both variants normalize to "rocm serve") = 2 covered.
+        assert_eq!(covered, 2, "expected examine + serve covered");
+        assert_eq!(total - covered, uncovered.len());
+        assert!(uncovered.contains(&"rocm dash"), "dash should be uncovered");
+        assert!(!uncovered.contains(&"rocm examine"));
+        assert!(!uncovered.contains(&"rocm serve"));
+
+        // The rendered markdown surfaces the % and the fold-out.
+        let md = consolidated_summary_markdown(&[("e2e-gpu-report".to_string(), report)]);
+        assert!(
+            md.contains("CLI surface coverage:"),
+            "coverage line missing:\n{md}"
+        );
+        assert!(
+            md.contains("Uncovered commands ("),
+            "uncovered fold missing:\n{md}"
+        );
     }
 
     #[test]
