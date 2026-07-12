@@ -27,11 +27,11 @@ fn rocm_binary() -> String {
     std::env::var("ROCM_CLI_BINARY").unwrap_or_else(|_| "rocm".to_string())
 }
 
-/// What `rocm serve <model>` would pick when the user does NOT pass `--engine`,
-/// derived from the host's GPU family + OS. Mirrors the product precedence in
-/// `preferred_serve_engine_for_host_gpu_summary` (rocm-core): vLLM on
-/// data-center families (`*-dcgpu`) and gfx906/908/90a, never on native Windows;
-/// otherwise the platform default, lemonade.
+/// What `rocm serve <model>` would pick with no `--engine`, from GPU family + OS.
+///
+/// Mirrors the product precedence in `preferred_serve_engine_for_host_gpu_summary`
+/// (rocm-core): vLLM on data-center families (`*-dcgpu`) and gfx906/908/90a,
+/// never on native Windows; otherwise the platform default, lemonade.
 ///
 /// This is the single re-implemented rule (decision #1). When the product grows
 /// an `effective_serve_engine` probe field, replace the callers with the parsed
