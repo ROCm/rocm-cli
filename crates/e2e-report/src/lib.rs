@@ -4,7 +4,7 @@
 
 //! HTML/markdown reporting for the cucumber E2E suite.
 //!
-//! Lives in its own lean crate (only `maud` + `serde`) so both the
+//! Lives in its own lean crate (only `maud` + `serde`/`serde_json`) so both the
 //! `e2e-cucumber` test harness and `xtask` can depend on it without pulling the
 //! harness's heavy tree (cucumber/axum/reqwest/tokio) into `xtask`.
 
@@ -30,6 +30,21 @@ struct Element {
     tags: Vec<Tag>,
     #[serde(default)]
     steps: Vec<Step>,
+    /// Before-scenario hooks (cucumber JSON `before`). A failing Before hook
+    /// leaves `steps` empty, so it must be inspected too or the scenario scores
+    /// as passed despite never running.
+    #[serde(default)]
+    before: Vec<Hook>,
+    /// After-scenario hooks (cucumber JSON `after`).
+    #[serde(default)]
+    after: Vec<Hook>,
+}
+
+/// A cucumber before/after hook entry — we only need its result status.
+#[derive(Deserialize)]
+struct Hook {
+    #[serde(default)]
+    result: StepResult,
 }
 
 #[derive(Deserialize)]
@@ -102,7 +117,10 @@ impl Stats {
         }
         let pw = self.passed * 100 / self.total;
         let fw = self.failed * 100 / self.total;
-        let sw = 100 - pw - fw;
+        // Derive the skip width from the actual skipped count, not `100 - pw - fw`
+        // — the latter dumped the integer-division remainder into the skip
+        // segment, rendering a grey sliver even when there are zero skips.
+        let sw = self.skipped * 100 / self.total;
         Some((pw, fw, sw))
     }
 
@@ -130,6 +148,14 @@ fn stats_bar(stats: &Stats) -> Markup {
 }
 
 fn scenario_status(el: &Element) -> &'static str {
+    // A failing before/after hook fails the scenario even when `steps` is empty
+    // (a Before-hook failure prevents steps from running), so it must be checked
+    // — otherwise a hook-failed scenario falls through to "passed".
+    for h in el.before.iter().chain(el.after.iter()) {
+        if !matches!(h.result.status.as_str(), "" | "passed" | "skipped") {
+            return "failed";
+        }
+    }
     // Any non-pass, non-skip step status (failed, undefined, ambiguous, pending)
     // fails the scenario — an undefined step must not report as passed.
     for s in &el.steps {
@@ -143,6 +169,18 @@ fn scenario_status(el: &Element) -> &'static str {
         }
     }
     "passed"
+}
+
+/// The single source of truth for "did this scenario pass" across BOTH the CI
+/// gate (`scenario_results_by_id`) and the report grid (`id_pass_map`/tally).
+///
+/// A scenario counts as passed ONLY when every step passed — a `skipped` status
+/// (steps skipped after an early bail, or an undefined step) is NOT a pass. The
+/// gate and the grid previously disagreed on this (gate: `== "passed"`, grid:
+/// `!= "failed"`), so the same `report.json` could fail the job yet render green
+/// in the consolidated grid. Route both through here so they can never diverge.
+fn scenario_passed(el: &Element) -> bool {
+    scenario_status(el) == "passed"
 }
 
 fn scenario_duration(el: &Element) -> u64 {
@@ -247,7 +285,7 @@ pub fn scenario_results_by_id(json_path: &Path) -> std::io::Result<Vec<(String, 
     for f in &features {
         for el in &f.elements {
             if let Some(id) = scenario_id(el) {
-                out.push((id, scenario_status(el) == "passed"));
+                out.push((id, scenario_passed(el)));
             }
         }
     }
@@ -699,7 +737,7 @@ fn id_pass_map(json_path: &Path) -> std::collections::HashMap<String, bool> {
     features
         .iter()
         .flat_map(|f| &f.elements)
-        .filter_map(|el| scenario_id(el).map(|id| (id, scenario_status(el) != "failed")))
+        .filter_map(|el| scenario_id(el).map(|id| (id, scenario_passed(el))))
         .collect()
 }
 
@@ -1799,6 +1837,35 @@ mod tests {
             scenario_status(&scenario_from(&["passed", "passed"])),
             "passed"
         );
+    }
+
+    #[test]
+    fn scenario_passed_is_strict_and_shared() {
+        // The unified predicate: only an all-steps-passed scenario counts as
+        // passed. A skipped scenario is NOT a pass — both the CI gate and the
+        // grid go through scenario_passed, so they can't diverge on this.
+        assert!(scenario_passed(&scenario_from(&["passed", "passed"])));
+        assert!(!scenario_passed(&scenario_from(&["passed", "skipped"])));
+        assert!(!scenario_passed(&scenario_from(&["failed"])));
+    }
+
+    #[test]
+    fn before_hook_failure_scores_scenario_failed() {
+        // A failing Before hook leaves steps empty; without checking hooks the
+        // scenario would fall through to "passed". It must score failed.
+        let el: Element = serde_json::from_str(
+            r#"{"name":"s","steps":[],"before":[{"result":{"status":"failed"}}]}"#,
+        )
+        .expect("valid element json");
+        assert_eq!(scenario_status(&el), "failed");
+        assert!(!scenario_passed(&el));
+
+        // A passed Before hook + passed steps is still a pass.
+        let ok: Element = serde_json::from_str(
+            r#"{"name":"s","steps":[{"keyword":"Given ","name":"x","result":{"status":"passed"}}],"before":[{"result":{"status":"passed"}}]}"#,
+        )
+        .expect("valid element json");
+        assert!(scenario_passed(&ok));
     }
 
     fn write_report(features_json: &str) -> tempfile::NamedTempFile {

@@ -93,11 +93,13 @@ async fn assert_runtime_has_stack(world: &mut E2eWorld) {
 async fn assert_runtime_path_not_nested(world: &mut E2eWorld) {
     // `rocm examine` prints `Folder: <install_root>` for the active runtime.
     let output = world.cli_output.as_ref().expect("no examine output");
-    let folder = output
+    let Some(folder) = output
         .lines()
         .find_map(|l| l.trim().strip_prefix("Folder:"))
         .map(str::trim)
-        .unwrap_or_else(|| panic!("no 'Folder:' line in examine output:\n{output}"));
+    else {
+        panic!("no 'Folder:' line in examine output:\n{output}");
+    };
     // A healthy path contains `runtimes/wheel` at most once. Re-provisioning
     // inside an existing runtime produces `runtimes/wheel/.../runtimes/wheel/`
     // (dogfooding #17). Count occurrences of the marker segment.

@@ -35,10 +35,6 @@ fn serve_timeout_for(world: &E2eWorld) -> u64 {
         .unwrap_or_else(serve_timeout_secs)
 }
 
-async fn wait_for_endpoint(url: &str, timeout_secs: u64) {
-    wait_for_model(url, None, timeout_secs).await;
-}
-
 /// Wait for `<endpoint>/models` to return 200. When `expect_model` is given,
 /// wait until that model id actually appears in the listing — not merely any
 /// 200. This defends against a leaked serve from a prior scenario still
@@ -102,7 +98,7 @@ async fn ensure_serve_port_free() {
     // Vulkan (EAI-7052) and starves the vLLM serve under test; no scenario needs it.
     kill_listeners_on_port(SERVE_PORT);
     kill_listeners_on_port(ASSISTANT_PORT);
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         // TcpStream connect succeeds only while something holds the port.
         let free = tokio::net::TcpStream::connect(("127.0.0.1", SERVE_PORT))
@@ -142,7 +138,7 @@ async fn wait_for_free_vram() {
     if free_vram_mib().is_none() {
         return;
     }
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + Duration::from_mins(2);
     loop {
         match free_vram_mib() {
             Some(free) if free >= MIN_FREE_VRAM_MIB => return,
@@ -399,7 +395,15 @@ async fn user_serves_default_engine(world: &mut E2eWorld) {
     world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
     world.model_name = Some("Qwen/Qwen2.5-1.5B-Instruct".to_string());
     if rc == 0 {
-        wait_for_endpoint("http://127.0.0.1:11435/v1/models", serve_timeout_for(world)).await;
+        // Wait for THIS model specifically (not just any 200) — the shared port
+        // 11435 may still answer from a prior scenario's leaked serve, and a
+        // model-agnostic wait would then proceed against the wrong server.
+        wait_for_model(
+            "http://127.0.0.1:11435/v1/models",
+            Some("Qwen2.5-1.5B"),
+            serve_timeout_for(world),
+        )
+        .await;
     }
 }
 
@@ -481,12 +485,14 @@ async fn assert_consistent_expansion(world: &mut E2eWorld) {
         // to expand the name (e.g. it errored before serving). Fail loudly rather
         // than defaulting to an empty string — otherwise two engines that both
         // fail would produce equal ("") values and pass this check vacuously.
-        let model = output
+        let Some(model) = output
             .lines()
             .find(|l| l.contains("resolved model:"))
             .and_then(|l| l.split(':').nth(1))
             .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| panic!("engine #{i} produced no 'resolved model' line:\n{output}"));
+        else {
+            panic!("engine #{i} produced no 'resolved model' line:\n{output}");
+        };
         resolved.push(model);
     }
     let first = &resolved[0];
@@ -525,11 +531,14 @@ async fn assert_endpoint_port(world: &mut E2eWorld) {
 
 /// Extract the engine name from a serve plan's `engine: <name>` line.
 fn selected_engine(output: &str) -> &str {
-    output
+    let Some(engine) = output
         .lines()
         .find_map(|l| l.trim().strip_prefix("engine:"))
         .map(str::trim)
-        .unwrap_or_else(|| panic!("no 'engine:' line in serve output:\n{output}"))
+    else {
+        panic!("no 'engine:' line in serve output:\n{output}");
+    };
+    engine
 }
 
 #[then("an engine is selected automatically")]
@@ -550,6 +559,11 @@ async fn assert_engine_auto_selected(world: &mut E2eWorld) {
 #[then("vLLM is selected as the default engine")]
 async fn assert_vllm_default(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no serve output");
+    // The serve must have actually launched, not just printed a correct plan: a
+    // non-zero rc after a good plan-print (e.g. the engine fails to start) would
+    // otherwise go undetected since this scenario only inspected the plan line.
+    let rc = world.cli_rc.expect("no serve rc recorded");
+    assert!(rc == 0, "rocm serve failed (rc={rc}):\n{output}");
     let engine = selected_engine(output);
     assert_eq!(
         engine, "vllm",
@@ -560,6 +574,7 @@ async fn assert_vllm_default(world: &mut E2eWorld) {
 #[then("the model is reachable")]
 async fn assert_model_reachable(world: &mut E2eWorld) {
     let endpoint = world.endpoint.as_ref().expect("no endpoint configured");
+    let expected = world.model_name.as_deref().expect("no model name set");
     let url = format!("{endpoint}/models");
     let resp: serde_json::Value = reqwest::get(&url)
         .await
@@ -567,10 +582,15 @@ async fn assert_model_reachable(world: &mut E2eWorld) {
         .json()
         .await
         .unwrap_or_else(|e| panic!("GET {url} returned non-JSON: {e}"));
-    let data = resp["data"].as_array();
+    let ids: Vec<&str> = resp["data"]
+        .as_array()
+        .map(|d| d.iter().filter_map(|m| m["id"].as_str()).collect())
+        .unwrap_or_default();
+    // Assert THIS scenario's model is the one listed — not merely "some model" —
+    // so a leaked prior serve still answering on the shared port can't satisfy it.
     assert!(
-        data.is_some_and(|d| !d.is_empty()),
-        "no models at {url}: {resp}"
+        ids.iter().any(|id| model_ids_match(id, expected)),
+        "endpoint {url} does not list the served model '{expected}'; got {ids:?}"
     );
 }
 
@@ -582,6 +602,14 @@ async fn assert_endpoint_responds(world: &mut E2eWorld) {
         .as_str()
         .unwrap_or("");
     assert!(!content.is_empty(), "empty reply in chat response: {resp}");
+    // Verify the reply came from THIS scenario's model, so a leaked prior serve
+    // on the shared port can't answer in its place.
+    let expected = world.model_name.as_deref().expect("no model name set");
+    let resp_model = resp["model"].as_str().unwrap_or("");
+    assert!(
+        model_ids_match(resp_model, expected),
+        "inference reply model '{resp_model}' does not identify the served '{expected}'"
+    );
 }
 
 #[then("the response contains a model reply")]
@@ -621,7 +649,10 @@ async fn assert_response_model_correct(world: &mut E2eWorld) {
 fn model_ids_match(resp_model: &str, expected: &str) -> bool {
     let a = normalize_model_id(resp_model);
     let b = normalize_model_id(expected);
-    !a.is_empty() && !b.is_empty() && (a.contains(&b) || b.contains(&a))
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    a.contains(&b) || b.contains(&a)
 }
 
 fn normalize_model_id(id: &str) -> String {

@@ -141,9 +141,15 @@ async fn assert_model_endpoint_listed(world: &mut E2eWorld) {
 
 #[then("the notice does not claim that requests leave the machine")]
 async fn assert_privacy_notice_accurate(_world: &mut E2eWorld) {
-    eprintln!(
-        "WARN: privacy notice verification requires TUI interaction — \
-         known limitation for automated tests"
+    // The privacy notice is only shown in the interactive dash/TUI, which a
+    // black-box CLI test can't drive — so this behaviour genuinely cannot be
+    // verified here (EAI-7222). Rather than pass silently (a green no-op that
+    // tests nothing), fail: the scenario is marked xfail in expectations.toml
+    // with EAI-7222, so this failure is the *expected* outcome and the gap stays
+    // visible until the notice is exposed on a non-TUI surface.
+    panic!(
+        "privacy notice is TUI-only and cannot be verified black-box (EAI-7222); \
+         scenario is tracked as xfail"
     );
 }
 
