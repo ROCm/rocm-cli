@@ -33,11 +33,12 @@ impl BenchTailer for CsvBenchTailer {
     }
 
     fn drain(&mut self) -> Result<Vec<BenchmarkRow>> {
-        let file = match File::open(&self.path) {
-            Ok(file) => file,
+        let path = match std::fs::canonicalize(&self.path) {
+            Ok(path) => path,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
         };
+        let file = File::open(path)?;
         let mut rdr = csv::ReaderBuilder::new()
             .has_headers(true)
             .from_reader(BufReader::new(file));
