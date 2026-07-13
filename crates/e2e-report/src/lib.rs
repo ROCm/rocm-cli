@@ -470,10 +470,16 @@ struct PlatformReport {
 struct CommandRecord {
     scenario: Option<String>,
     subcommand: String,
+    /// Full command as executed (e.g. "rocm serve Qwen/... --engine vllm").
+    /// Falls back to `subcommand` for older artifacts that predate this field.
     #[serde(default)]
-    model: Option<String>,
+    command: Option<String>,
     #[serde(default)]
     engine: Option<String>,
+    /// True when `engine` was the CLI's own default choice (no `--engine` flag),
+    /// so the report can show it as "<engine> (default)".
+    #[serde(default)]
+    engine_is_default: bool,
 }
 
 /// Read a platform's `commands.jsonl` (sibling of `report.json`). Missing file =
@@ -1187,10 +1193,15 @@ fn expectation_grid_markdown(inputs: &[(String, PathBuf)]) -> String {
 }
 
 /// A command signature: what we group invocations by in the coverage table.
+///
+/// `command` is the full invocation as executed; `engine` is the engine that
+/// actually ran, with a "(default)" suffix when the CLI chose it itself. Grouping
+/// on both keeps an explicit `--engine vllm` distinct from a default that
+/// resolved to vLLM, and distinct from the same command resolving to lemonade on
+/// another platform.
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone)]
 struct CommandKey {
-    subcommand: String,
-    model: String,
+    command: String,
     engine: String,
 }
 
@@ -1308,11 +1319,17 @@ fn command_coverage_markdown(reports: &[PlatformReport]) -> String {
         let col = format!("{} {}", r.desc.platform, r.desc.os);
         let passed = r.scenario_pass_map();
         for c in &r.commands {
-            let key = CommandKey {
-                subcommand: c.subcommand.clone(),
-                model: c.model.clone().unwrap_or_default(),
-                engine: c.engine.clone().unwrap_or_default(),
+            // Full command as executed; fall back to the stripped signature for
+            // older artifacts that predate the `command` field.
+            let command = c.command.clone().unwrap_or_else(|| c.subcommand.clone());
+            // Engine actually used, with a "(default)" marker when the CLI chose
+            // it (no explicit --engine flag).
+            let engine = match c.engine.as_deref() {
+                Some(e) if c.engine_is_default => format!("{e} (default)"),
+                Some(e) => e.to_string(),
+                None => String::new(),
             };
+            let key = CommandKey { command, engine };
             // A command's cell is healthy only if EVERY scenario that ran it on
             // this platform passed; an unknown scenario is treated as passed
             // (the command ran and we have no failing evidence).
@@ -1343,32 +1360,27 @@ fn command_coverage_markdown(reports: &[PlatformReport]) -> String {
         "**CLI surface coverage: {covered}/{total} commands ({pct}%)** exercised by \
          at least one platform.\n"
     );
-    out.push_str("_Which `rocm` commands are exercised, with which model/engine, per platform. ");
+    out.push_str("_Which `rocm` commands are exercised, with which engine, per platform. ");
     out.push_str("✅ tested & behaved as expected · ❌ failed · blank = not run there._\n\n");
 
-    out.push_str("| Command | Model | Engine |");
+    out.push_str("| Command | Engine |");
     for col in &columns {
         let _ = write!(out, " {col} |");
     }
     out.push('\n');
-    out.push_str("|---|---|---|");
+    out.push_str("|---|---|");
     for _ in &columns {
         out.push_str(":--:|");
     }
     out.push('\n');
 
     for (key, per_col) in &cells {
-        let model = if key.model.is_empty() {
-            "n/a"
-        } else {
-            &key.model
-        };
         let engine = if key.engine.is_empty() {
             "n/a"
         } else {
             &key.engine
         };
-        let _ = write!(out, "| `{}` | {} | {} |", key.subcommand, model, engine);
+        let _ = write!(out, "| `{}` | {} |", key.command, engine);
         for col in &columns {
             let mark = match per_col.get(col) {
                 Some(true) => " ✅ |",
@@ -1954,13 +1966,16 @@ mod tests {
         )
         .expect("write report");
         // s0 ran `runtimes adopt` (rc=1 but scenario passed) → ✅.
-        // s1 ran `serve` (scenario failed) → ❌.
+        // s1 ran an explicit-engine `serve` (scenario failed) → ❌.
+        // s0 also ran a default-engine `serve` whose engine the CLI resolved.
         std::fs::write(
             dir.path().join("commands.jsonl"),
             concat!(
-                r#"{"scenario":"s0","subcommand":"rocm runtimes adopt","model":null,"engine":null,"rc":1}"#,
+                r#"{"scenario":"s0","subcommand":"rocm runtimes adopt","command":"rocm runtimes adopt","model":null,"engine":null,"rc":1}"#,
                 "\n",
-                r#"{"scenario":"s1","subcommand":"rocm serve --engine","model":"Qwen","engine":"vllm","rc":0}"#,
+                r#"{"scenario":"s1","subcommand":"rocm serve --engine","command":"rocm serve Qwen --engine vllm","model":"Qwen","engine":"vllm","engine_is_default":false,"rc":0}"#,
+                "\n",
+                r#"{"scenario":"s0","subcommand":"rocm serve (default engine)","command":"rocm serve Qwen","model":"Qwen","engine":"lemonade","engine_is_default":true,"rc":0}"#,
                 "\n",
             ),
         )
@@ -1971,13 +1986,18 @@ mod tests {
         assert!(md.contains("### Command coverage"));
         // adoption: rc=1 but scenario passed → ✅
         assert!(
-            md.contains("| `rocm runtimes adopt` | n/a | n/a | ✅ |"),
+            md.contains("| `rocm runtimes adopt` | n/a | ✅ |"),
             "adopt should be ✅ (scenario passed despite rc=1):\n{md}"
         );
-        // serve: scenario failed → ❌, with model/engine surfaced
+        // explicit-engine serve: full command shown, engine surfaced, scenario failed → ❌
         assert!(
-            md.contains("| `rocm serve --engine` | Qwen | vllm | ❌ |"),
-            "serve should be ❌ with model/engine:\n{md}"
+            md.contains("| `rocm serve Qwen --engine vllm` | vllm | ❌ |"),
+            "serve should show full command + engine and be ❌:\n{md}"
+        );
+        // default-engine serve: the CLI-resolved engine shows as "<engine> (default)"
+        assert!(
+            md.contains("| `rocm serve Qwen` | lemonade (default) | ✅ |"),
+            "default serve should show resolved engine marked (default):\n{md}"
         );
     }
 

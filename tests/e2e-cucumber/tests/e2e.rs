@@ -271,9 +271,10 @@ pub fn run_rocm(world: &E2eWorld, args: &[&str]) -> (String, String, i32) {
         .output()
         .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
     let rc = output.status.code().unwrap_or(-1);
-    record_command(world.current_scenario.as_deref(), args, rc);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    record_command(world.current_scenario.as_deref(), args, rc, &stdout);
     (
-        String::from_utf8_lossy(&output.stdout).to_string(),
+        stdout,
         String::from_utf8_lossy(&output.stderr).to_string(),
         rc,
     )
@@ -282,17 +283,31 @@ pub fn run_rocm(world: &E2eWorld, args: &[&str]) -> (String, String, i32) {
 /// Append one `rocm` invocation to `results/commands.jsonl` so the consolidated
 /// report can build a command × platform coverage table tied to real results.
 /// Best-effort: a recording failure must never fail a scenario.
-fn record_command(scenario: Option<&str>, args: &[&str], rc: i32) {
+fn record_command(scenario: Option<&str>, args: &[&str], rc: i32, stdout: &str) {
     let subcommand = derive_subcommand(args);
-    let engine = flag_value(args, "--engine");
     let model = positional_model(args);
+    // The full command as executed, so the coverage table shows the real
+    // invocation (including the `--engine <value>` the signature strips).
+    let command = format!("rocm {}", args.join(" "));
+    // The engine that actually ran: the explicit `--engine` value if given, else
+    // — for `serve` only — the engine the CLI resolved itself (parsed from the
+    // serve plan's `engine: <name>` line), flagged so the report can show
+    // "<engine> (default)". Restricted to `serve` so an `engine:` line in some
+    // other command's output (e.g. `services list`) is never misattributed.
+    let (engine, engine_is_default) = match flag_value(args, "--engine") {
+        Some(e) => (Some(e), false),
+        None if args.first() == Some(&"serve") => (resolved_engine(stdout), true),
+        None => (None, false),
+    };
     let record = serde_json::json!({
         "scenario": scenario,
         "argv": args,
         "rc": rc,
         "subcommand": subcommand,
+        "command": command,
         "model": model,
         "engine": engine,
+        "engine_is_default": engine_is_default,
     });
     let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/results"));
     if std::fs::create_dir_all(&dir).is_err() {
@@ -338,6 +353,19 @@ fn derive_subcommand(args: &[&str]) -> String {
         sig.push_str(" (default engine)");
     }
     sig
+}
+
+/// The engine the CLI resolved on its own, parsed from a serve plan's
+/// `engine: <name>` line in stdout. Used only when no explicit `--engine` was
+/// passed, to record the engine a default serve actually used. Best-effort:
+/// `None` when there is no such line (non-serve commands, or serve output that
+/// failed before printing a plan).
+fn resolved_engine(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("engine:"))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Value following `flag` in argv, if present (e.g. the engine after `--engine`).
