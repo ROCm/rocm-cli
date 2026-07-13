@@ -4,11 +4,11 @@
 **Stage:** 10-4platform-report-complete
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
-**Last Updated:** 2026-07-13 (idle-flushed)
+**Last Updated:** 2026-07-13
 
-**Status:** ✅ GOAL MET — complete 4-platform consolidated E2E report generated from run 29209242248 (all of mock / MI300X / Strix-Ubuntu / Strix-Windows produced platform.json + report.json). Overnight: found + fixed the report Status-column defect (used raw junit, not expectation reconciliation → clean platforms wrongly shown FAIL); fix committed `afbabc8` + pushed to origin/ci-e2e-framework-fixes, container-verified (0 unexpected, 28 e2e-report tests, clippy clean). Corrected report rendered locally with the fixed binary. Only outstanding red = the 2 known Strix-Ubuntu serve-default-engine-* test-bug fails (task #23), which the grid correctly surfaces.
+**Status:** ✅ GOAL MET + SESSION COMPLETE — 4-platform consolidated E2E report generated from run 29209242248. Found + fixed report Status-column defect (reconciliation bug `afbabc8`). Corrected report rendered locally. Tier column vestigial (post-Stage-5 architecture). All 4 platforms: pass/xfail/skip counts accurate; 0 XPASS; 2 known task #23 test-bug fails on Strix-Ubuntu documented.
 
-**Token Usage:** in=9308 out=2845480 cache_create=32006992 cache_read=1907659368 calls=4670
+**Token Usage:** in=9346 out=2854928 cache_create=34324634 cache_read=1909740383 calls=4689
 
 ---
 
@@ -986,3 +986,9 @@ addressed here with the exit-code fix + dedicated known-bugs job.
 - ✅ **Report Status column bug identified**: summary table reports "FAIL" on Mock despite 0 unexpected-fail, 0 XPASS (reconciled grid shows correct pass). Root: status_text() uses raw junit counts, not id-keyed expectation reconciliation. Fix: recompute status from reconciled outcome (unexpected-fail | XPASS ⇒ FAIL; else PASS). Report-crate-only, safe to land.
 - 🔄 **Strix-Ubuntu 2 expected failures flagged**: serve-default-engine-inference/working-endpoint fail as expected (task #23, lemonade assertion bug scraping download log). Grid correctly shows them as honest findings; system working as designed.
 - 📋 **Next on report**: wait for MI300X completion → final consolidated report with all 4 columns + fix Status column defect before final delivery.
+
+**2026-07-13 (Overnight follow-through + session delivery):**
+- ✅ **Run 29209242248 complete**: MI300X finished ~66min (under 90min cap). All 4 platforms produced `platform.json` + `report.json`.
+- ✅ **Report Status reconciliation fix**: committed `afbabc8` (summary Status + counts now derived from id-keyed expectations, not raw junit). Container suite green (0 unexpected, 28 e2e-report tests, clippy clean). Fix pushed to origin/ci-e2e-framework-fixes.
+- ✅ **4-platform corrected report rendered**: saved to `/Users/fres/Developer/rocm-cli-progress/e2e-report-29209242248-corrected/` (consolidated.html + summary.md + platform.json/report.json for all 4 columns). Scoreboard: MI300X ✅ / Mock ✅ / Strix-Windows ✅ / Strix-Ubuntu ❌ (2 known task #23 test-bug fails, grid surfaces honestly). 0 XPASS, 0 ran-when-N/A.
+- 📝 **Identified: Tier column now vestigial** — post-Stage-5 architecture eliminated two-job-per-platform tier split; renamed single-job-per-platform all artifacts lack `-known-bugs` suffix → all rows parse as "expect-pass". Column conveys nothing now (known-bug info moved into xfail counts + grid). Safe to drop from future renders.
