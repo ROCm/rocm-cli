@@ -64,8 +64,18 @@ pub struct E2eWorld {
 /// model weights per scenario. Only immutable artifacts are shared — service
 /// records, config, and per-service engine state stay isolated per scenario.
 fn shared_cache_dir() -> Option<PathBuf> {
-    let dir = std::env::var_os("E2E_SHARED_CACHE_DIR")?;
-    let dir = PathBuf::from(dir);
+    let dir = PathBuf::from(std::env::var_os("E2E_SHARED_CACHE_DIR")?);
+    // The value is CI-controlled, but validate it before it reaches a filesystem
+    // sink: require an absolute path with no `..` traversal components. This both
+    // rejects a malformed/relative override (which would create a cache dir in an
+    // unexpected place) and sanitises the taint flow for path-injection analysis.
+    if !dir.is_absolute()
+        || dir
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
