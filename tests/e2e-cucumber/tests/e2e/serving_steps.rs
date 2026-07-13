@@ -163,39 +163,54 @@ async fn setup_mock_custom_port(world: &mut E2eWorld) {
     world.mock = Some(mock);
 }
 
+/// The (model, engine, ready-substring) this host should serve for an
+/// engine-agnostic "serve a real model" precondition.
+///
+/// The behaviour these preconditions set up — serve a model, then chat/infer —
+/// is not vLLM-specific, so the concrete model+engine follows the host's
+/// effective serve engine: a safetensors model on vLLM (Instinct), a GGUF model
+/// on lemonade (Strix Halo / native Windows). This mirrors the two dedicated
+/// single-engine steps (`setup_gpu_model`'s old vLLM body and
+/// `setup_lemonade_model`), but lets a scenario tagged only `@requires-gpu` run
+/// on whichever engine the platform actually uses.
+fn host_serve_target() -> (&'static str, &'static str, &'static str) {
+    if e2e_cucumber::capability::host_capability().effective_serve_engine == "lemonade" {
+        // GGUF via lemonade's llama.cpp backend; endpoint reports e.g.
+        // Qwen3-0.6B-Q4_0.gguf, so "Qwen3-0.6B" is the distinctive substring.
+        ("Qwen3-0.6B-GGUF", "lemonade", "Qwen3-0.6B")
+    } else {
+        // Safetensors via vLLM; "Qwen2.5-1.5B" is the distinctive substring.
+        ("Qwen/Qwen2.5-1.5B-Instruct", "vllm", "Qwen2.5-1.5B")
+    }
+}
+
 #[given("a model is being served on GPU")]
 async fn setup_gpu_model(world: &mut E2eWorld) {
     // Serve by the canonical HuggingFace ID (not the `qwen2.5` alias) with an
-    // explicit engine. This step is a *precondition* for scenarios that test
-    // inference/chat behavior, so it must not fail for reasons unrelated to what
-    // those scenarios assert. Serving the alias would trip EAI-7219 (vLLM does
-    // not resolve aliases) and sink every downstream scenario for a bug they
-    // aren't testing. Alias resolution has its own dedicated scenarios in
-    // model_serving.feature.
+    // explicit engine matching this host. This step is a *precondition* for
+    // scenarios that test inference/chat behavior, so it must not fail for
+    // reasons unrelated to what those scenarios assert. Serving the alias would
+    // trip EAI-7219 (alias resolution) and sink every downstream scenario for a
+    // bug they aren't testing; a fixed engine would false-fail on a host that
+    // can't run it. Alias resolution and engine selection have their own
+    // dedicated scenarios in model_serving.feature.
     // Free the shared serve port first so a prior scenario's leaked server can't
     // linger on the GPU and oversubscribe it (which otherwise piles up serves
     // until the job times out).
+    let (model, engine, ready_substr) = host_serve_target();
     ensure_serve_port_free().await;
-    let (stdout, _, rc) = crate::run_rocm(
-        world,
-        &[
-            "serve",
-            "Qwen/Qwen2.5-1.5B-Instruct",
-            "--engine",
-            "vllm",
-            "--managed",
-        ],
-    );
+    let (stdout, _, rc) =
+        crate::run_rocm(world, &["serve", model, "--engine", engine, "--managed"]);
     assert!(rc == 0, "rocm serve failed:\n{stdout}");
     world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
-    world.model_name = Some("Qwen/Qwen2.5-1.5B-Instruct".to_string());
+    world.model_name = Some(model.to_string());
     // Wait for THIS model specifically: the shared port 11435 may still be
     // answering from a prior scenario's leaked serve (isolated data dirs mean
     // this scenario can't stop it), so a plain readiness check could pass against
-    // the wrong model. "Qwen2.5-1.5B" is the distinctive substring of the id.
+    // the wrong model.
     wait_for_model(
         "http://127.0.0.1:11435/v1/models",
-        Some("Qwen2.5-1.5B"),
+        Some(ready_substr),
         serve_timeout_for(world),
     )
     .await;

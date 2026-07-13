@@ -20,14 +20,14 @@ Feature: Chat and endpoint detection
     When the user lists running services
     Then the served model endpoint is listed
 
-  @id:chat-tool-definitions-accepted @requires-gpu @requires-engine:vllm
+  @id:chat-tool-definitions-accepted @requires-gpu
   Scenario: 4 - Chat requests that include tool definitions are accepted
     Given a managed runtime is active
     And a model is served in the background
     When a chat request with tool definitions is sent
     Then the chat response is successful
 
-  @id:chat-end-to-end-local-model @requires-gpu @requires-engine:vllm
+  @id:chat-end-to-end-local-model @requires-gpu
   Scenario: 5 - End-to-end chat through a locally served model
     Given a managed runtime is active
     And a model is served in the background

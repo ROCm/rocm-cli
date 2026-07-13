@@ -29,9 +29,11 @@ Feature: Model serving
     When the user lists running services
     Then the connection details match the actual server port
 
-  # vLLM serve + inference (safetensors model). Engine coverage: vLLM.
-  @id:serve-inference-response @requires-gpu @requires-engine:vllm
-  Scenario: 5 - A served model responds to inference requests
+  # vLLM serve + inference (safetensors model). Engine coverage: vLLM. This is the
+  # deliberate vLLM half of a per-engine pair with `serve-lemonade-inference`
+  # below, so it stays pinned to vLLM (the slug names the engine).
+  @id:serve-vllm-inference @requires-gpu @requires-engine:vllm
+  Scenario: 5 - A served model responds to inference requests on vLLM
     Given a managed runtime is active
     And a model is being served on GPU
     When the user sends a chat completion request
@@ -74,7 +76,10 @@ Feature: Model serving
     Then vLLM is selected as the default engine
 
   # Readiness contract: when the CLI reports a service ready, inference must work.
-  @id:serve-ready-implies-inference @requires-gpu @requires-engine:vllm
+  # Engine-agnostic — the served model+engine follow the host (see
+  # `a model is being served on GPU`), so this holds the contract on every GPU
+  # platform. Where it resolves to vLLM, EAI-7333 makes it xfail (expectations.toml).
+  @id:serve-readiness-contract @requires-gpu
   Scenario: 8 - A service reported ready can immediately serve inference
     Given a managed runtime is active
     And a model is being served on GPU

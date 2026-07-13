@@ -38,7 +38,7 @@ reason = "Engines do not report a consistent resolved model name for a short nam
 # Applies wherever the effective serve engine is vLLM. On lemonade-default hosts
 # (e.g. Strix Halo gfx1151, native Windows) these resolve to expected-pass, which
 # is what fixes the Strix-Windows XPASS from run #543.
-[["serve-inference-response"]]
+[["serve-vllm-inference"]]
 when = { effective_engine = "vllm" }
 bug = "EAI-7333"
 reason = "vLLM service reports ready (/v1/models 200) but POST /v1/chat/completions is refused."
@@ -56,10 +56,18 @@ bug = "EAI-7333"
 reason = "Default-engine (vLLM) endpoint is reachable but chat inference is refused."
 serve_timeout_secs = 90
 
-[["serve-ready-implies-inference"]]
+[["serve-readiness-contract"]]
 when = { effective_engine = "vllm" }
 bug = "EAI-7333"
 reason = "CLI reports the vLLM service ready, but an immediate inference request fails."
+serve_timeout_secs = 90
+
+# On a lemonade-default Linux host this scenario does real lemonade inference,
+# which hits the EAI-7052 Vulkan hang (see serve-lemonade-inference).
+[["serve-readiness-contract"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "EAI-7052"
+reason = "Lemonade uses its Vulkan llama.cpp backend instead of system ROCm; inference hangs."
 serve_timeout_secs = 90
 
 # --- EAI-7052: lemonade falls back to Vulkan llama.cpp instead of system ROCm ---
@@ -77,9 +85,23 @@ bug = "EAI-7223"
 reason = "Chat requests carrying tool definitions are not accepted by the served vLLM model."
 serve_timeout_secs = 90
 
+# On a lemonade-default Linux host this does real lemonade inference → EAI-7052 hang.
+[["chat-tool-definitions-accepted"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "EAI-7052"
+reason = "Lemonade uses its Vulkan llama.cpp backend instead of system ROCm; inference hangs."
+serve_timeout_secs = 90
+
 # --- EAI-7221: end-to-end chat through a locally served model (vLLM path) ---
 [["chat-end-to-end-local-model"]]
 when = { effective_engine = "vllm" }
 bug = "EAI-7221"
 reason = "End-to-end chat through a locally served vLLM model does not return a valid reply."
+serve_timeout_secs = 90
+
+# On a lemonade-default Linux host this does real lemonade inference → EAI-7052 hang.
+[["chat-end-to-end-local-model"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "EAI-7052"
+reason = "Lemonade uses its Vulkan llama.cpp backend instead of system ROCm; inference hangs."
 serve_timeout_secs = 90
