@@ -649,15 +649,17 @@ jobs:
           path: tests/e2e-cucumber/results/
 
   # app-dev MI300X (Instinct data-center GPU, `amd-gpu` label). Non-blocking.
-  # One job now runs every applicable scenario (tiers collapsed), so the cap is
-  # 35min not 15: the dominant cost is `install sdk` re-running per scenario
-  # (each has an isolated data dir) plus several vLLM cold-starts — a full MI300X
-  # run measured ~28min. The cap must exceed that so the job COMPLETES and writes
-  # platform.json (a cancelled job produces none → no grid column). Sharing the
-  # runtime across scenarios to cut the redundant installs is a tracked follow-up.
+  # One job runs every applicable scenario (tiers collapsed). Cost drivers:
+  # `install sdk` re-running per scenario (isolated data dirs), several vLLM
+  # cold-starts, and — since it was added — the large-model (Qwen3.6-27B) serve,
+  # whose ~54 GiB load plus the post-serve VRAM-drain wait pushed a full run past
+  # the old 35min cap (it was cancelled at 35m17s). Cap raised to 90min so the job
+  # COMPLETES and writes platform.json (a cancelled job produces none → no grid
+  # column). The heaviest scenarios are being moved to a nightly-only tag so the
+  # per-PR run stays short; see the `@nightly` handling in xtask/the harness.
   e2e-gpu:
     name: E2E tests (GPU)
-    timeout-minutes: 35
+    timeout-minutes: 90
     runs-on: [self-hosted, linux, amd-gpu]
     needs: [changes, build-and-test]
     # See `e2e`: dispatch tolerates skipped build-and-test; app-dev-gpu.
