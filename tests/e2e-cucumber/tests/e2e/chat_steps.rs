@@ -88,6 +88,29 @@ async fn user_sends_chat(world: &mut E2eWorld) {
     crate::send_chat(world).await;
 }
 
+#[when("the user sends a one-shot chat prompt through the CLI")]
+async fn user_sends_oneshot_chat(world: &mut E2eWorld) {
+    // Drive the real `rocm chat` command (one-shot `--prompt`) so the command
+    // surface records it as covered. The local provider resolves the planted
+    // managed-service record and talks to the mock server. Passing the served
+    // model id avoids depending on any default-model resolution.
+    let model = world.model_name.clone().expect("no model name set");
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "chat",
+            "--provider",
+            "local",
+            "--model",
+            &model,
+            "--prompt",
+            "Hello",
+        ],
+    );
+    assert!(rc == 0, "rocm chat failed (rc={rc}):\n{stdout}\n{stderr}");
+    world.cli_output = Some(stdout);
+}
+
 // ── Then ───────────────────────────────────────────────────────────
 
 #[then("the served model is listed")]
@@ -130,6 +153,19 @@ async fn assert_chat_successful(world: &mut E2eWorld) {
     assert!(
         resp.get("choices").is_some(),
         "no choices in response: {resp}"
+    );
+}
+
+#[then("the CLI prints the assistant's reply")]
+async fn assert_cli_prints_reply(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no chat CLI output");
+    // The mock server replies "This is a mock response for testing."; the CLI's
+    // one-shot renderer prints the assistant content. Assert the reply text
+    // surfaced, so this proves the whole `rocm chat` path (arg parse → local
+    // provider → endpoint → rendered output), not merely a zero exit code.
+    assert!(
+        output.contains("mock response"),
+        "chat CLI output does not contain the assistant reply:\n{output}"
     );
 }
 

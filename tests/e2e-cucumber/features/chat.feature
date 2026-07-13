@@ -20,6 +20,17 @@ Feature: Chat and endpoint detection
     When the user lists running services
     Then the served model endpoint is listed
 
+  # Exercises the `rocm chat` CLI itself (one-shot `--prompt` via the local
+  # provider), not just the model endpoint over HTTP — so the command surface
+  # reports `rocm chat` as covered. Runs on mock (no GPU): the local provider
+  # resolves the planted managed-service record and talks to the mock server.
+  @id:chat-cli-oneshot-prompt
+  Scenario: 6 - The chat CLI answers a one-shot prompt against a local server
+    Given a model is being served
+    And the model is registered with the CLI
+    When the user sends a one-shot chat prompt through the CLI
+    Then the CLI prints the assistant's reply
+
   @id:chat-tool-definitions-accepted @requires-gpu
   Scenario: 4 - Chat requests that include tool definitions are accepted
     Given a managed runtime is active
