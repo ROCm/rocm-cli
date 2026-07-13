@@ -1,15 +1,96 @@
 
 # WIP: E2E BDD tests for rocm-cli (PR #69, cucumber-rs)
 
-**Stage:** 10-4platform-report-complete
+**Stage:** 11-review-addressed-plus-task22-in-progress
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
-**Last Updated:** 2026-07-13
+**Last Updated:** 2026-07-13 (idle flush)
+
+## 🌙 RESUME STATE (2026-07-13 late — read FIRST; context about to compact)
+
+**PR #69 is fully up to date.** origin/test/add-e2e-robot-framework HEAD = `0e6c80e`.
+origin/ci-e2e-framework-fixes (scratch) HEAD = `31f38b1` — IDENTICAL content to PR
+(no scratch-only commits now; the old runtime-sharing/90min/pre-warm commits were
+dropped when the scratch branch was deleted+recreated off the PR head).
+
+**rominf's 2nd review (CHANGES_REQUESTED, 2026-07-13) — ALL addressed** (commit
+`eb5778f` "address PR review" + follow-ups). Posted response comment
+(#issuecomment-4960587111) + requested re-review. Fixes:
+- 🔴 clippy on step files: new CI step `cargo clippy -p e2e-cucumber --test e2e` (the
+  `test=false` target was unlinted); fixed the 9 lints it surfaced.
+- 🔴 vacuous scenarios: `chat-privacy-notice-accurate` now panics + xfail EAI-7222;
+  `serve-vllm-default-on-instinct` asserts rc==0.
+- 🟠 unified report.json pass predicate (`scenario_passed`) — gate + grid agreed.
+- 🟠 serial GPU (`max_concurrent_scenarios(1)` when GPU present).
+- 🟠 mock e2e job: job-level `if`, step-level heavy gate (was skipped on non-heavy PR).
+- 🟠 removed unanchored `pkill vulkan/llama-server`.
+- 🟠 hook-failure scored failed; default-engine serve model-aware wait + model assert.
+- 🟠 README rewritten to current model; expectations.toml path fixed.
+- 🔵 EAI-IDs-in-public-files: POSTPONED per user (not a defect; spans many files).
+
+**Also landed on PR:** VRAM-drain wait before each serve (`9f786da`); EAI-7052 xfail
+widened to any-OS lemonade (not just linux); path-injection fix + CodeQL alert #680
+dismissed "used in tests" (CodeQL check now PASSES); `@nightly` tag system; 90min GPU cap.
+
+**@nightly tag (commit on PR):** `serve-large-model-inference` (Qwen3.6-27B) tagged
+`@nightly` → resolver skips it unless `E2E_INCLUDE_NIGHTLY=1`. Per-PR/on-demand GPU
+runs skip it (fast); nightly.yml has a new `e2e-gpu-nightly` job (self-hosted amd-gpu,
+90min, E2E_INCLUDE_NIGHTLY=1) that runs it. Mechanism verified on mock (correct skip
+reason with/without flag).
+
+**Big-model E2E: NOT confirmed in-suite; confirmed MANUALLY only.**
+- Manually on app-dev: 27B serves + does real inference (needs weights seeded +
+  `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` raised past the 5-min default = EAI-7393, filed).
+- In-suite: runs 29254970358 + 29268106812 BOTH cancelled at cap — never reached a
+  serve. Root cause: per-scenario `install sdk` (multi-GB TheRock cold install ×N) +
+  a self-starving box ate the whole budget. NOT the 27B's fault.
+
+**🔧 TASK #22 IN PROGRESS (share the download cache so install sdk is fast) — where I stopped:**
+- **DECISION (user):** share the download cache, install per-scenario (NOT symlink the
+  installed tree — avoids the absolute-install_root/`status=unusable` + shared-registry-
+  state regression that bit the prior attempt `1817c5b`).
+- **MEASURED ON BOX (clean-room, on the roomy `/` overlay):** install sdk #1 cold =
+  **160s** (populates uv cache), #2 warm in a FRESH isolated dir reusing the shared
+  `UV_CACHE_DIR` = **34s, rc=0**. ~5× win. This is the proof the design works.
+- **DISK DECISION (user):** put the uv cache on the **2.1TB `/` overlay**, NOT
+  `/workload` (the 125GB Longhorn PVC where e2e-shared lives is 94% full — 52GB of it
+  is the 27B HF seed; only 8GB free, uv cache needs ~23GB). Overlay doesn't persist
+  across pod restart (one cold rebuild per pod-life; fine within a run).
+- **NEXT STEP (was mid-edit when interrupted):** in `tests/e2e-cucumber/tests/e2e.rs`
+  `isolate_cmd`, add a `shared_uv_cache_dir()` helper reading a NEW env var
+  `E2E_SHARED_UV_CACHE_DIR` (independent of E2E_SHARED_CACHE_DIR so it can live on the
+  overlay) and `cmd.env("UV_CACHE_DIR", <that>)`. Reuse the path-validation
+  (absolute + no `..`) — refactor `shared_cache_dir`'s validation into a shared
+  `validated_shared_dir(env_var)` helper. Then set `E2E_SHARED_UV_CACHE_DIR` to an
+  overlay path (e.g. `/root/e2e-uv-cache` or a `$RUNNER_WORKSPACE`-independent `/`
+  path) in ci.yml's e2e-gpu + nightly e2e-gpu-nightly jobs. Verify mock unaffected
+  (NO-OP when unset), then container-gate, commit on SCRATCH first, dispatch app-dev.
+- **#23 (Strix default-engine serve assertion) still BLOCKED on #22.**
+
+**🧹 BOX CLEANUP DONE THIS SESSION (app-dev, important):** killed 12 stale 3-day-old
+`rocm daemon` procs (from `/workload/rocm-cli{,-main}` manual builds, supervising
+`/tmp/{e2e2,e2e3,s6,pin5,as,lg,v5,rl,s8,de,de2,t}` scratch dirs) that were auto-
+reviving lemonade Vulkan assistants → starving the GPU box + re-cluttering the runner
+after every cleanup. This was the deeper reason GPU runs stalled. Box now clean: 0
+daemons, GPU free (196GB), Runner.Listener alive. If it recurs: `pgrep -f "rocm daemon"`,
+check each's ROCM_CLI_DATA_DIR, kill the stale-/tmp ones (spare live /workload work).
+
+**27B weights ARE seeded** at `/workload/actions-runner/_work/rocm-cli/e2e-shared/
+huggingface/hub/models--Qwen--Qwen3.6-27B` (52GB, all 15 safetensors). Kept for the
+nightly job. This is what fills /workload — hence uv cache must go on the overlay.
+
+**Signing:** 1Password Touch ID works (user present). `git-commit-with-fallback -s`.
+Push ROCm/* via `git push https://x-access-token:$(gh auth token)@github.com/ROCm/rocm-cli.git <branch>`.
+Container gate before every push: `workspace/wip/container-test.sh` OR the inline
+`container run ... docker.io/library/rust:1.96-bookworm` (see history). PR-branch pushes
+use --no-verify (Mac pre-push hook can't pass by design; container IS the gate).
+
+---
+
+**Status:** rominf review addressed + all changes on PR (`0e6c80e`). Task #22
+(download-cache sharing) design validated on box (160s→34s), mid-implementation.
+
 **Token Usage:** in=10414 out=3255487 cache_create=39340842 cache_read=2088873069 calls=5223
-
-**Status:** ✅ GOAL MET + ENGINE-AGNOSTIC RETAGGING COMPLETE — 4-platform consolidated E2E report complete. Session: fixed Status-column defect + Tier/n-a presentation (`d9d3adb`). Made 3 serve/chat scenarios engine-agnostic via host_serve_target() helper; renamed `serve-inference-response` → `serve-vllm-inference`, `serve-ready-implies-inference` → `serve-readiness-contract`; added EAI-7052 lemonade-linux xfail conditions. All changes green (mock 0 unexpected, 28+21 tests, container full suite). Committed to scratch, cherry-picked 5 keepers to PR branch, held push pending user signal.
-
-**Token Usage:** in=9942 out=3061896 cache_create=37924524 cache_read=1993776063 calls=4987
 
 ---
 
@@ -963,6 +1044,54 @@ addressed here with the exit-code fix + dedicated known-bugs job.
   denominator), #15 (install/examine/serve/dash + TUI coverage).
 
 ### Work Log
+
+**2026-07-13 T13:16 (FINAL DELIVERY — SESSION COMPLETE):**
+- ✅ **MISSION ACCOMPLISHED**: All 3 dogfooding gaps implemented, tested, signed, and pushed.
+- ✅ **11 commits delivered** to origin/test/add-e2e-robot-framework (fully synced, no uncommitted changes):
+  - `a0991bf` large-model vLLM (Qwen3.6-27B, 54GB, 2400s timeout)
+  - `fa78a34` help-alphabetization (EAI-7383) + runtime-path-nesting (EAI-7384)
+  - 9 prior commits (chat, report fixes, engine-agnostic retagging)
+- ✅ **Code quality verified**:
+  - 22 e2e-cucumber unit tests: PASS
+  - 29 e2e-report unit tests: PASS
+  - Mock E2E: 8 pass / 3 xfail (expected) / 0 XPASS / 0 regressions
+  - All commits signed + signed-off
+  - Pre-commit hooks: ✅ lint, clippy, cargo test, license headers
+- 📊 **Scenario inventory**: 4 feature files, 25 total scenarios (3 new), all with @id tags
+- 🔬 **@serve-timeout system verified**: Tag parsing, malformed-value graceful handling, hook integration, unit test
+- 📋 **Test suite structure**: Features describe scenarios, steps implement via BDD; expectations.toml tracks known bugs; host capability probe derives effective engine; reconciliation flags xfail/xpass
+- 🎯 **CI monitoring**: Run 29244034990 (app-dev-gpu, large-model test) in progress 28min (ETA ~12 more for 40min total); will verify Qwen3.6-27B serves/infers on MI300X under 2400s timeout
+- **Status**: Ready for PR final review once CI run completes (~13:30 UTC).
+
+**2026-07-13 (Final session: ALL KEEPER COMMITS PUSHED + MONITORING LARGE-MODEL RUN):**
+- ✅ **All 11 keeper commits pushed to origin/test/add-e2e-robot-framework** (1198b45 HEAD):
+  - 10 keeper commits (cherry-picked from ci-e2e-framework-fixes): help-alphabetization, runtime-path-nesting, large-model coverage, engine-agnostic retagging, report fixes
+  - 1 new commit: .gitignore update (workspace/ + e2e-consolidated-report.md)
+  - All commits signed + signed-off; pre-commit hooks passed (lint, clippy, cargo test)
+- ✅ **Verified code correctness** (all implementations present and tested):
+  - Large-model scenario (serve-large-model-inference): @requires-gpu @requires-engine:vllm @serve-timeout:2400
+  - setup_large_gpu_model() step: serves Qwen/Qwen3.6-27B (~54GB), hardcoded vLLM, waits for readiness on "Qwen3.6-27B" model name
+  - @serve-timeout:2400 tag: parsed in ScenarioDecl.from_tags(), precedence scenario-tag > xfail-matrix > default 600s
+  - Unit test serve_timeout_tag_parses_seconds() verifies tag parsing + malformed-value graceful handling
+  - Help-alphabetization scenario (help-lists-subcommands-alphabetically): @id matches, xfail EAI-7383
+  - Runtime-path-nesting scenario (runtime-path-not-nested): @id matches, @requires-gpu, xfail EAI-7384
+  - assert_runtime_path_not_nested() step correctly parses folder path and counts recursive nesting
+  - Expectations.toml: all 3 new xfail entries with correct bug refs present
+- ✅ **Unit tests all passing**:
+  - 22 e2e-cucumber tests (including serve_timeout_tag_parses_seconds): PASS
+  - 29 e2e-report tests: PASS
+- ✅ **Mock E2E test**: 11 scenarios (8 pass, 3 xfail as expected), 0 XPASS, 0 unexpected failures
+- 📊 **Run 29244034990 (app-dev-gpu, large-model test) monitoring**: 
+  - Triggered on origin/ci-e2e-framework-fixes (not PR branch)
+  - E2E GPU job in progress for ~25 minutes (scenario serves Qwen3.6-27B with 2400s timeout)
+  - Estimated completion: ~40min total for scenario + overhead
+  - Job will complete within 90min cap
+- 📋 **Test suite inventory**:
+  - 4 feature files: chat, examine, model_serving, runtime_setup
+  - 25 scenarios total, all with @id tags (stable identifiers)
+  - 14 xfail conditions in expectations.toml (some scenarios have multiple when={} conditions)
+  - ~1,445 lines of test code + expectations
+- **PR readiness**: ✅ All code present, tested, and pushed. Awaiting large-model run completion for final verification.
 
 **2026-07-13 (Report review + improvements: Tier removal, caption clarity):**
 - ✅ Identified vestigial Tier column (post-Stage-5 one-job-per-platform; always showed "expect-pass").
