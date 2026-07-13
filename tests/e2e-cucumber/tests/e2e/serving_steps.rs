@@ -109,12 +109,88 @@ async fn ensure_serve_port_free() {
             .await
             .is_err();
         if free || Instant::now() >= deadline {
-            return;
+            break;
         }
         kill_listeners_on_port(SERVE_PORT);
         kill_listeners_on_port(ASSISTANT_PORT);
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+    // The port closing does NOT mean the prior serve's VRAM is back: a killed
+    // vLLM releases ~tens of GiB of device memory only as the process fully
+    // exits, which lags the socket close. The next `rocm serve` reads free VRAM
+    // at startup and demands `gpu-memory-utilization` of the TOTAL — after a large
+    // model (e.g. 27B ~54 GiB) the residue can drop free memory below that
+    // request, so the next serve dies with "Free memory ... less than desired GPU
+    // memory utilization" (engine core init failed). Wait for the device to
+    // actually drain before returning.
+    wait_for_free_vram().await;
+}
+
+/// Minimum free device VRAM (MiB) required before starting a new serve. Sized so
+/// the largest single scenario model can allocate its `gpu-memory-utilization`
+/// share without tripping vLLM's startup memory check. A generous floor: the
+/// suite's biggest model (Qwen3.6-27B, ~54 GiB) plus vLLM's ~0.8-of-total KV
+/// reservation needs the card mostly clear.
+const MIN_FREE_VRAM_MIB: u64 = 150_000;
+
+/// Best-effort: wait until the GPU reports at least [`MIN_FREE_VRAM_MIB`] free,
+/// so a just-killed serve's memory is actually reclaimed before the next serve
+/// starts. Queries `amd-smi` then `rocm-smi`; if neither is present (mock/local,
+/// no ROCm), returns immediately so non-GPU runs are unaffected.
+async fn wait_for_free_vram() {
+    // No GPU tooling → nothing to wait on (mock/local). Probe once up front.
+    if free_vram_mib().is_none() {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        match free_vram_mib() {
+            Some(free) if free >= MIN_FREE_VRAM_MIB => return,
+            _ if Instant::now() >= deadline => return,
+            _ => tokio::time::sleep(Duration::from_secs(3)).await,
+        }
+    }
+}
+
+/// Free device VRAM in MiB for GPU 0, via `amd-smi` (then `rocm-smi`). `None`
+/// when no such tool exists or its output can't be parsed.
+fn free_vram_mib() -> Option<u64> {
+    use std::process::Command;
+    // amd-smi: a line like "        FREE_VRAM: 196309 MB"
+    if let Ok(out) = Command::new("amd-smi").args(["metric", "-m"]).output()
+        && out.status.success()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        if let Some(mib) = text
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("FREE_VRAM:"))
+            .and_then(|v| v.split_whitespace().next())
+            .and_then(|n| n.parse::<u64>().ok())
+        {
+            return Some(mib);
+        }
+    }
+    // rocm-smi fallback: `--showmeminfo vram --json` → vram total/used per card.
+    if let Ok(out) = Command::new("rocm-smi")
+        .args(["--showmeminfo", "vram", "--csv"])
+        .output()
+        && out.status.success()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        // CSV columns include "VRAM Total Memory (B)" and "VRAM Total Used Memory (B)".
+        // Parse the first data row's total and used to derive free.
+        let mut lines = text.lines();
+        let header = lines.next()?;
+        let cols: Vec<&str> = header.split(',').collect();
+        let total_idx = cols.iter().position(|c| c.contains("Total Memory"))?;
+        let used_idx = cols.iter().position(|c| c.contains("Total Used Memory"))?;
+        let row = lines.next()?;
+        let vals: Vec<&str> = row.split(',').collect();
+        let total: u64 = vals.get(total_idx)?.trim().parse().ok()?;
+        let used: u64 = vals.get(used_idx)?.trim().parse().ok()?;
+        return Some(total.saturating_sub(used) / (1024 * 1024));
+    }
+    None
 }
 
 /// Kill whatever process is listening on `port`. Best-effort and
