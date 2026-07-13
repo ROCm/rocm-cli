@@ -6,9 +6,9 @@
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-13
 
-**Status:** ✅ GOAL MET + SESSION COMPLETE — 4-platform consolidated E2E report generated from run 29209242248. Found + fixed report Status-column defect (reconciliation bug `afbabc8`). Corrected report rendered locally. Tier column vestigial (post-Stage-5 architecture). All 4 platforms: pass/xfail/skip counts accurate; 0 XPASS; 2 known task #23 test-bug fails on Strix-Ubuntu documented.
+**Status:** ✅ GOAL MET + REPORT REVIEWED — 4-platform consolidated E2E report complete. Session: fixed Status-column defect (`afbabc8` on origin scratch), removed vestigial Tier column, clarified captions (Mock inference-backend mock, gates-the-PR + non-blocking distinction). Gist published at https://gist.github.com/fredespi/601a3ebd8cb5d112e2ebe0b25fd5ecb6 for phone-viewable updates.
 
-**Token Usage:** in=9346 out=2854928 cache_create=34324634 cache_read=1909740383 calls=4689
+**Token Usage:** in=9526 out=2903950 cache_create=36944954 cache_read=1929951949 calls=4779
 
 ---
 
@@ -948,6 +948,13 @@ addressed here with the exit-code fix + dedicated known-bugs job.
   denominator), #15 (install/examine/serve/dash + TUI coverage).
 
 ### Work Log
+
+**2026-07-13 (Report review + improvements: Tier removal, caption clarity):**
+- ✅ Identified vestigial Tier column (post-Stage-5 one-job-per-platform; always showed "expect-pass").
+- ✅ Removed Tier column from markdown + HTML matrices + legend. Updated test assertions.
+- ✅ Rewrote captions to explain Mock (inference-backend fake, OpenAI endpoints), gates-the-PR vs non-blocking distinction, column meanings.
+- ✅ Published gist https://gist.github.com/fredespi/601a3ebd8cb5d112e2ebe0b25fd5ecb6 for phone-viewable report updates.
+- Container suite verified green (28 e2e-report tests, clippy -D warnings clean).
 
 **2026-07-12 (Session continuation: FINAL — All 5 fixes pushed to origin, ready for review):**
 - Rebased test/add-e2e-robot-framework onto ci-e2e-framework-fixes (26 commits ahead of origin).
