@@ -105,3 +105,17 @@ when = { effective_engine = "lemonade", os = "linux" }
 bug = "EAI-7052"
 reason = "Lemonade uses its Vulkan llama.cpp backend instead of system ROCm; inference hangs."
 serve_timeout_secs = 90
+
+# --- EAI-7383: `rocm help` lists subcommands in declaration order, not
+# alphabetically. Platform-independent (pure CLI help output). ---
+[["help-lists-subcommands-alphabetically"]]
+when = {}
+bug = "EAI-7383"
+reason = "rocm help lists subcommands in declaration order, not alphabetically."
+
+# --- EAI-7384: re-provisioning nests the managed runtime path recursively
+# (runtimes/wheel/.../runtimes/wheel/). Surfaces wherever a real install runs. ---
+[["runtime-path-not-nested"]]
+when = {}
+bug = "EAI-7384"
+reason = "Managed runtime path nests recursively (runtimes/wheel/...) on re-provisioning."

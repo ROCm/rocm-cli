@@ -38,12 +38,54 @@ async fn user_inspects_system(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
 }
 
+#[when("the user asks for help")]
+async fn user_asks_help(world: &mut E2eWorld) {
+    let (stdout, _, _) = crate::run_rocm(world, &["help"]);
+    world.cli_output = Some(stdout);
+}
+
 #[then("a version string is returned")]
 async fn assert_version_returned(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no command was run");
     assert!(
         output.trim().starts_with("rocm "),
         "expected version string starting with 'rocm ': {output}"
+    );
+}
+
+#[then("the subcommands are listed in alphabetical order")]
+async fn assert_subcommands_alphabetical(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no help output");
+    // Parse the leading token of each line in the `Commands:` block (the
+    // subcommand name), stopping at the blank line before `Options:`. Exclude
+    // the clap-appended `help` subcommand, which is conventionally listed last.
+    let mut names: Vec<String> = Vec::new();
+    let mut in_commands = false;
+    for line in output.lines() {
+        if line.trim_start().starts_with("Commands:") {
+            in_commands = true;
+            continue;
+        }
+        if in_commands {
+            if line.trim().is_empty() {
+                break;
+            }
+            if let Some(name) = line.split_whitespace().next() {
+                if name != "help" {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+    assert!(
+        names.len() > 1,
+        "could not parse subcommands from help output:\n{output}"
+    );
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert!(
+        names == sorted,
+        "subcommands are not in alphabetical order.\nactual: {names:?}\nsorted: {sorted:?}"
     );
 }
 

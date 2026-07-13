@@ -10,6 +10,14 @@ Feature: GPU detection and system inspection
     When the user lists available engines
     Then all supported engines are listed
 
+  # Dogfooding #24: the `rocm help` subcommand list is in declaration order, not
+  # alphabetical, which makes it harder to scan. Expected to FAIL until fixed —
+  # surfaces the bug so it can be ticketed.
+  @id:help-lists-subcommands-alphabetically
+  Scenario: 5 - The help output lists subcommands in alphabetical order
+    When the user asks for help
+    Then the subcommands are listed in alphabetical order
+
   @id:examine-detects-gpu-and-driver @requires-gpu
   Scenario: 3 - System inspection detects the GPU and driver
     Given a machine with an AMD GPU
