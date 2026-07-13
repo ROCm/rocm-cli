@@ -374,11 +374,11 @@ serve_timeout_secs = 90
     #[test]
     fn tags_parse_without_at_prefix() {
         let d = decl(&[
-            "id:serve-inference-response",
+            "id:serve-vllm-inference",
             "requires-gpu",
             "requires-engine:vllm",
         ]);
-        assert_eq!(d.id.as_deref(), Some("serve-inference-response"));
+        assert_eq!(d.id.as_deref(), Some("serve-vllm-inference"));
         assert!(d.requires_gpu);
         assert_eq!(d.requires_engine.as_deref(), Some("vllm"));
     }
@@ -433,7 +433,7 @@ serve_timeout_secs = 90
         let m = Expectations::default();
         // Scenario 5-style: pins vLLM.
         let d = decl(&[
-            "id:serve-inference-response",
+            "id:serve-vllm-inference",
             "requires-gpu",
             "requires-engine:vllm",
         ]);
