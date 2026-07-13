@@ -1281,14 +1281,31 @@ fn command_base(sig: &str) -> &str {
         .trim()
 }
 
+/// The `KNOWN_COMMAND_SURFACE` entry a recorded command exercises, if any.
+///
+/// A recorded base carries positionals the surface entry does not — e.g.
+/// `rocm serve Qwen/Qwen2.5-1.5B-Instruct` exercises the surface command
+/// `rocm serve`. Match by the LONGEST surface entry that is a word-boundary
+/// prefix of the base, so a two-word command (`rocm install sdk`) wins over any
+/// shorter prefix and `rocm serve <model>` maps to `rocm serve`.
+fn matched_surface_command(base: &str) -> Option<&'static str> {
+    KNOWN_COMMAND_SURFACE
+        .iter()
+        .copied()
+        .filter(|cmd| base == *cmd || base.starts_with(&format!("{cmd} ")))
+        .max_by_key(|cmd| cmd.len())
+}
+
 /// Coverage of the known command surface: `(covered, total, uncovered_sorted)`.
 /// A command counts as covered if any platform ran a matching invocation.
 fn command_coverage_summary(reports: &[PlatformReport]) -> (usize, usize, Vec<&'static str>) {
     use std::collections::BTreeSet;
-    let mut exercised: BTreeSet<String> = BTreeSet::new();
+    let mut exercised: BTreeSet<&'static str> = BTreeSet::new();
     for r in reports {
         for c in &r.commands {
-            exercised.insert(command_base(&c.subcommand).to_owned());
+            if let Some(cmd) = matched_surface_command(command_base(&c.subcommand)) {
+                exercised.insert(cmd);
+            }
         }
     }
     let uncovered: Vec<&'static str> = KNOWN_COMMAND_SURFACE
@@ -1361,7 +1378,12 @@ fn command_coverage_markdown(reports: &[PlatformReport]) -> String {
          at least one platform.\n"
     );
     out.push_str("_Which `rocm` commands are exercised, with which engine, per platform. ");
-    out.push_str("✅ tested & behaved as expected · ❌ failed · blank = not run there._\n\n");
+    out.push_str(
+        "✅ tested & behaved as expected · ❌ failed · blank = this command was not run on \
+         this platform — usually because its scenario is not applicable here (skipped for \
+         GPU/OS/engine), or the command is platform-specific by construction (e.g. a \
+         host serves a different model/engine)._\n\n",
+    );
 
     out.push_str("| Command | Engine |");
     for col in &columns {
@@ -2111,6 +2133,32 @@ mod tests {
     }
 
     #[test]
+    fn matched_surface_command_maps_positionals_and_prefers_longest() {
+        // Regression: a serve command embeds the model in its base, so it must
+        // still map to the surface entry `rocm serve` (was counted uncovered).
+        assert_eq!(
+            matched_surface_command("rocm serve Qwen/Qwen2.5-1.5B-Instruct"),
+            Some("rocm serve")
+        );
+        assert_eq!(
+            matched_surface_command("rocm serve Qwen3-0.6B-GGUF"),
+            Some("rocm serve")
+        );
+        // Longest-prefix wins: a two-word surface command is not shadowed by a
+        // shorter one, and `rocm install sdk` maps to itself, not `rocm install`.
+        assert_eq!(
+            matched_surface_command("rocm install sdk"),
+            Some("rocm install sdk")
+        );
+        // A bare exact match still works; an unknown command matches nothing.
+        assert_eq!(
+            matched_surface_command("rocm version"),
+            Some("rocm version")
+        );
+        assert_eq!(matched_surface_command("rocm bogus"), None);
+    }
+
+    #[test]
     fn command_coverage_counts_against_known_surface() {
         // A report whose commands.jsonl exercised examine + serve (+ a serve
         // variant) → those count once against the known surface; total is the
@@ -2123,9 +2171,9 @@ mod tests {
             concat!(
                 r#"{"scenario":"s0","subcommand":"rocm examine","model":null,"engine":null,"rc":0}"#,
                 "\n",
-                r#"{"scenario":"s0","subcommand":"rocm serve --engine","model":"Q","engine":"vllm","rc":0}"#,
+                r#"{"scenario":"s0","subcommand":"rocm serve Qwen/Qwen2.5-1.5B-Instruct --engine","model":"Qwen/Qwen2.5-1.5B-Instruct","engine":"vllm","rc":0}"#,
                 "\n",
-                r#"{"scenario":"s0","subcommand":"rocm serve (default engine)","model":"Q","engine":null,"rc":0}"#,
+                r#"{"scenario":"s0","subcommand":"rocm serve Qwen3-0.6B-GGUF (default engine)","model":"Qwen3-0.6B-GGUF","engine":null,"rc":0}"#,
                 "\n",
             ),
         )
