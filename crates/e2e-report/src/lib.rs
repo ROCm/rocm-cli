@@ -341,30 +341,22 @@ pub fn generate(json_path: &Path, html_path: &Path) -> std::io::Result<()> {
     std::fs::write(html_path, markup.into_string())
 }
 
-/// The platform/OS/tier a report belongs to, parsed from its artifact name.
+/// The platform/OS a report belongs to, parsed from its artifact name.
 ///
 /// Splitting these into separate fields (rather than one mashed
-/// "Gpu Strix Ubuntu Known Bugs" label) is what lets the matrix show distinct
-/// Platform / OS / Tier columns.
+/// "Gpu Strix Ubuntu" label) is what lets the matrix show distinct
+/// Platform / OS columns.
 struct Descriptor {
     platform: String,
     os: String,
-    /// True for the `known-bugs` tier (xfail-inverted), false for expect-pass.
+    /// True for a legacy `known-bugs` artifact (xfail-inverted). With the
+    /// one-job-per-platform model these no longer exist, but the flag is retained
+    /// as a stable secondary sort key so old artifacts still order predictably.
     known_bugs: bool,
 }
 
-impl Descriptor {
-    const fn tier(&self) -> &'static str {
-        if self.known_bugs {
-            "known bugs"
-        } else {
-            "expect-pass"
-        }
-    }
-}
-
-/// Parse an artifact/dir name like `e2e-gpu-strix-windows-known-bugs-report`
-/// into its Platform / OS / Tier. Unknown shapes fall back to a titlecased
+/// Parse an artifact/dir name like `e2e-gpu-strix-windows-report`
+/// into its Platform / OS. Unknown shapes fall back to a titlecased
 /// platform on Linux so a new artifact still renders sensibly.
 fn parse_descriptor(name: &str) -> Descriptor {
     // Strip prefix, then suffix, each relative to the prior result (not `name`),
@@ -372,7 +364,7 @@ fn parse_descriptor(name: &str) -> Descriptor {
     let core = name.strip_prefix("e2e-").unwrap_or(name);
     let core = core.strip_suffix("-report").unwrap_or(core);
 
-    // Tier: the `-known-bugs` suffix (or the bare `known-bugs` mock artifact).
+    // Legacy `-known-bugs` suffix (retained only as a stable secondary sort key).
     let (core, known_bugs) = match core.strip_suffix("known-bugs") {
         Some(rest) => (rest.trim_end_matches('-'), true),
         None => (core, false),
@@ -586,10 +578,10 @@ impl CellOutcome {
         match self {
             Self::Pass => "✅",
             Self::Xfail => "xfail",
-            Self::Skip => "—",
+            Self::Skip => "n/a",
             Self::UnexpectedFail => "❌FAIL",
             Self::Xpass => "⚠️XPASS",
-            Self::RanWhenNa => "⚠️N/A-ran",
+            Self::RanWhenNa => "⚠️n/a-ran",
             Self::Missing => "·",
         }
     }
@@ -765,7 +757,7 @@ impl PlatformReport {
             .flat_map(|f| &f.elements)
             .any(|el| el.tags.iter().any(|t| t.name == EXPECTED_FAILURE_TAG));
         let desc = parse_descriptor(&artifact);
-        let label = format!("{} {} ({})", desc.platform, desc.os, desc.tier());
+        let label = format!("{} {}", desc.platform, desc.os);
         let commands = parse_commands(json_path);
         let tally = reconciled_tally(json_path);
         Self {
@@ -957,17 +949,17 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
         return out;
     }
 
-    out.push_str("| Platform | OS | Tier | Total | Pass | Fail | Skip | Xfail | Status |\n");
-    out.push_str("|---|---|---|--:|--:|--:|--:|--:|:--|\n");
+    out.push_str("| Platform | OS | Total | Pass | Fail | Skip | Xfail | Status |\n");
+    out.push_str("|---|---|--:|--:|--:|--:|--:|:--|\n");
     let (mut t_total, mut t_pass, mut t_fail, mut t_skip, mut t_xfail) = (0, 0, 0, 0, 0);
     for r in &reports {
         let (total, pass, fail, skip, xf) = r.display_counts();
         // Xfail column only applies where there are known bugs to invert; a plain
-        // expect-pass platform (no xfail entries) shows a dash.
+        // expect-pass platform (no xfail entries) shows N/A.
         let xfail = if xf > 0 || r.is_known_bugs {
             xf.to_string()
         } else {
-            "—".to_string()
+            "n/a".to_string()
         };
         t_total += total;
         t_pass += pass;
@@ -977,10 +969,9 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
         // `writeln!` into a String never fails; the discard keeps clippy happy.
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
             r.desc.platform,
             r.desc.os,
-            r.desc.tier(),
             total,
             pass,
             fail,
@@ -991,14 +982,29 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
     }
     let _ = writeln!(
         out,
-        "| **Total** | | | {t_total} | {t_pass} | {t_fail} | {t_skip} | {t_xfail} | |",
+        "| **Total** | | {t_total} | {t_pass} | {t_fail} | {t_skip} | {t_xfail} | |",
     );
 
     out.push_str(
-        "\n**Mock** = no GPU (fake in-process server, gates the PR); \
-         **MI300X / Strix Halo** = self-hosted GPU (non-blocking). \
-         **expect-pass** must all pass; **known bugs** are xfail-inverted \
-         (failing as expected = PASS; FAIL only on XPASS or an untagged failure).\n",
+        "\n**Mock** runs the real `rocm` CLI, but fakes the inference backend: instead \
+         of downloading a runtime and launching a real engine (vLLM/lemonade) on a \
+         GPU, a tiny in-process HTTP server stands in for the OpenAI-compatible \
+         endpoint that engine would expose (`/v1/models`, `/v1/chat/completions`). \
+         This exercises CLI behaviour — alias resolution, service discovery, chat \
+         forwarding — with no GPU, no model download, and no engine process, so it \
+         runs on a GitHub-hosted runner. It **gates the PR**: it runs on every push, \
+         and if it fails the PR's required check goes red and the PR cannot merge. \
+         **MI300X / Strix Halo** run on real self-hosted GPU hardware with real \
+         engines. They are **non-blocking**: they still run and are reported here, but \
+         a failure does NOT block the PR from merging (the hardware/runners are still \
+         being proven out, so their results are informational rather than a merge \
+         gate).\n\n\
+         Column meanings: **Pass** = scenarios that passed as expected; \
+         **Xfail** = known bugs that failed as expected (healthy — the bug still \
+         reproduces); **Skip** = not applicable on this platform (e.g. a GPU-only \
+         scenario on Mock); **Fail** = unexpected — a scenario that should pass but \
+         failed, or a known bug that unexpectedly passed (its tag is now stale). \
+         **Status** is PASS unless a platform has any Fail.\n",
     );
 
     // Call out anything that needs a human: XPASS (fixed bug, stale tag) and
@@ -1085,7 +1091,7 @@ fn expectation_grid_html(inputs: &[(String, PathBuf)]) -> Markup {
                             @match outcome {
                                 CellOutcome::Xpass => "XPASS",
                                 CellOutcome::UnexpectedFail => "unexpected failure",
-                                CellOutcome::RanWhenNa => "ran despite N/A",
+                                CellOutcome::RanWhenNa => "ran despite n/a",
                                 _ => "issue",
                             }
                         }
@@ -1115,7 +1121,7 @@ fn expectation_grid_markdown(inputs: &[(String, PathBuf)]) -> String {
 
     let mut out = String::from("\n### Expectation grid (scenario × platform)\n\n");
     out.push_str(
-        "_✅ pass · `xfail` known bug (failed as expected) · — not applicable here · \
+        "_✅ pass · `xfail` known bug (failed as expected) · n/a not applicable here · \
          ❌FAIL regression · ⚠️XPASS bug fixed here (stale entry) · · no data._\n\n",
     );
 
@@ -1170,7 +1176,7 @@ fn expectation_grid_markdown(inputs: &[(String, PathBuf)]) -> String {
             let kind = match outcome {
                 CellOutcome::Xpass => "XPASS",
                 CellOutcome::UnexpectedFail => "unexpected failure",
-                CellOutcome::RanWhenNa => "ran despite N/A",
+                CellOutcome::RanWhenNa => "ran despite n/a",
                 _ => "issue",
             };
             let _ = writeln!(out, "- **{kind}** on `{slug}`: `{id}`{bug}{engine}{reason}");
@@ -1353,12 +1359,12 @@ fn command_coverage_markdown(reports: &[PlatformReport]) -> String {
 
     for (key, per_col) in &cells {
         let model = if key.model.is_empty() {
-            "—"
+            "n/a"
         } else {
             &key.model
         };
         let engine = if key.engine.is_empty() {
-            "—"
+            "n/a"
         } else {
             &key.engine
         };
@@ -1404,7 +1410,7 @@ fn matrix_table(reports: &[PlatformReport]) -> Markup {
     html! {
         table.stats {
             tr {
-                th { "Platform" } th { "OS" } th { "Tier" }
+                th { "Platform" } th { "OS" }
                 th { "Total" } th { "Pass" } th { "Fail" } th { "Skip" }
                 th { "Xfail" } th { "Status" }
                 th { "Pass / Fail / Skip" }
@@ -1414,12 +1420,11 @@ fn matrix_table(reports: &[PlatformReport]) -> Markup {
                 tr {
                     td { (r.desc.platform) }
                     td { (r.desc.os) }
-                    td { (r.desc.tier()) }
                     td.num { (total) }
                     td.num { (pass) }
                     td.num { (fail) }
                     td.num { (skip) }
-                    td.num { @if xf > 0 || r.is_known_bugs { (xf) } @else { "—" } }
+                    td.num { @if xf > 0 || r.is_known_bugs { (xf) } @else { "n/a" } }
                     td class=(if r.ok() { "status-pass" } else { "status-fail" }) {
                         (r.status_text())
                     }
@@ -1427,7 +1432,7 @@ fn matrix_table(reports: &[PlatformReport]) -> Markup {
                 }
             }
             tr.total-row {
-                td { "Total" } td {} td {}
+                td { "Total" } td {}
                 td.num { (t_total) }
                 td.num { (t_pass) }
                 td.num { (t_fail) }
@@ -1457,18 +1462,14 @@ fn legend() -> Markup {
                     " — real self-hosted GPU hardware; non-blocking while proven out."
                 }
                 li {
-                    b { "Tier — expect-pass" }
-                    " — every scenario must pass; any failure fails the row."
-                }
-                li {
-                    b { "Tier — known bugs" }
-                    " — scenarios tagged @expected-failure. They are expected to "
-                    "fail, so the result is inverted: failing as expected → PASS. "
-                    "The row goes FAIL only on an XPASS (a known bug unexpectedly "
-                    "passed — remove its tag) or an untagged failure."
+                    b { "Status" }
+                    " — PASS when the platform is in its expected state (every "
+                    "expect-pass scenario passed and every known bug failed as "
+                    "expected); FAIL on an unexpected failure or an XPASS (a known "
+                    "bug that unexpectedly passed — remove its @expected-failure tag)."
                 }
                 li { b { "Xfail" } " — count of known-bug scenarios that failed as expected." }
-                li { b { "Skip" } " — scenarios not run." }
+                li { b { "Skip" } " — scenarios not applicable on this platform (not run)." }
             }
         }
     }
@@ -1904,8 +1905,8 @@ mod tests {
             ),
         ];
         let md = consolidated_summary_markdown(&inputs);
-        assert!(md.contains("| Mock | Linux | expect-pass | 2 | 2 | 0 | 0 | — | PASS |"));
-        assert!(md.contains("| MI300X | Linux | known bugs | 1 | 0 | 1 | 0 | 1 | PASS |"));
+        assert!(md.contains("| Mock | Linux | 2 | 2 | 0 | 0 | n/a | PASS |"));
+        assert!(md.contains("| MI300X | Linux | 1 | 0 | 1 | 0 | 1 | PASS |"));
     }
 
     #[test]
@@ -1970,7 +1971,7 @@ mod tests {
         assert!(md.contains("### Command coverage"));
         // adoption: rc=1 but scenario passed → ✅
         assert!(
-            md.contains("| `rocm runtimes adopt` | — | — | ✅ |"),
+            md.contains("| `rocm runtimes adopt` | n/a | n/a | ✅ |"),
             "adopt should be ✅ (scenario passed despite rc=1):\n{md}"
         );
         // serve: scenario failed → ❌, with model/engine surfaced
@@ -2076,8 +2077,8 @@ mod tests {
         let inputs = vec![("mock".to_string(), path)];
         let md = consolidated_summary_markdown(&inputs);
         assert!(
-            md.contains("| `gpu-only` | — |"),
-            "skip should render as —:\n{md}"
+            md.contains("| `gpu-only` | n/a |"),
+            "skip should render as n/a:\n{md}"
         );
         assert!(md.contains("| `ran-here` | ✅ |"));
     }
@@ -2174,7 +2175,7 @@ mod tests {
         let inputs = vec![("e2e-report".to_string(), path)];
         let md = consolidated_summary_markdown(&inputs);
         assert!(
-            md.contains("| Mock | Linux | expect-pass | 2 | 1 | 0 | 0 | 1 | PASS |"),
+            md.contains("| Mock | Linux | 2 | 1 | 0 | 0 | 1 | PASS |"),
             "summary row should be reconciled PASS with 0 fails:\n{md}"
         );
     }
