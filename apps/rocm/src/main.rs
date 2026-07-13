@@ -444,16 +444,16 @@ enum BenchCommand {
         #[arg(long)]
         model: Option<String>,
         /// Concurrency levels to sweep, comma-separated
-        #[arg(long, value_delimiter = ',', default_value = "1,8,32,64")]
+        #[arg(long, value_delimiter = ',', default_value = "1,8,32,64", value_parser = clap::value_parser!(u32).range(1..=128))]
         concurrency: Vec<u32>,
         /// Input sequence length in tokens
-        #[arg(long, default_value_t = 1024)]
+        #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u32).range(1..=32768))]
         isl: u32,
         /// Output sequence length in tokens
-        #[arg(long, default_value_t = 1024)]
+        #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u32).range(1..=32768))]
         osl: u32,
         /// Requests per concurrency cell
-        #[arg(long, default_value_t = 128)]
+        #[arg(long, default_value_t = 128, value_parser = clap::value_parser!(u32).range(1..=10000))]
         requests: u32,
         /// Output CSV file (default: ~/.rocm/bench/results.csv, the
         /// daemon-tailed path that populates the dashboard's Bench panel)
@@ -15328,6 +15328,57 @@ mod tests {
     #[test]
     fn cli_command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn bench_load_rejects_zero_and_unbounded_numeric_arguments() {
+        for args in [
+            [
+                "rocm",
+                "bench",
+                "load",
+                "--endpoint",
+                "http://localhost:8000",
+                "--concurrency",
+                "0",
+            ]
+            .as_slice(),
+            [
+                "rocm",
+                "bench",
+                "load",
+                "--endpoint",
+                "http://localhost:8000",
+                "--isl",
+                "32769",
+            ]
+            .as_slice(),
+            [
+                "rocm",
+                "bench",
+                "load",
+                "--endpoint",
+                "http://localhost:8000",
+                "--osl",
+                "32769",
+            ]
+            .as_slice(),
+            [
+                "rocm",
+                "bench",
+                "load",
+                "--endpoint",
+                "http://localhost:8000",
+                "--requests",
+                "10001",
+            ]
+            .as_slice(),
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "accepted invalid args: {args:?}"
+            );
+        }
     }
 
     fn possible_values_listed_in_help(help: &str) -> Vec<String> {

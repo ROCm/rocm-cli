@@ -180,18 +180,14 @@ fn socket_path(
         })
 }
 
-/// Default CSV file the standalone `rocm-dash` daemon tails for normalized
-/// benchmark rows: `$HOME/.rocm/bench/results.csv` (or
-/// `$ROCM_CLI_DATA_DIR/bench/results.csv` when that override is set).
+/// Default CSV file the standalone dashboard daemon tails for normalized
+/// benchmark rows. The data-dir override wins; otherwise this legacy config
+/// surface uses `$HOME/.rocm/bench/results.csv`.
 ///
-/// This must resolve to the SAME absolute path the unified `rocm` binary uses
-/// on both sides — `rocm bench load`'s default `--out` (via
-/// `AppPaths::discover().data_dir`, where `data_dir` is `$HOME/.rocm`) and
-/// rocm-core's `DashboardDaemonConfig` default. Note there is NO extra `/data/`
-/// segment: rocm-core's `default_data_dir()` is `$HOME/.rocm` itself, so a
-/// bench run under `rocm` lands here and the standalone daemon tails it.
-/// Honors `ROCM_CLI_DATA_DIR` for the same reason the producer does; falls back
-/// to `None` when neither the override nor `$HOME` is set.
+/// The unified `rocm` command and daemon share `rocm_core::AppPaths`, including
+/// managed-root resolution. This standalone config does not read rocm-core's
+/// JSON config, so managed-root users must set `ROCM_CLI_DATA_DIR` when launching
+/// a standalone dashboard daemon. Normal `rocm daemon` usage is unaffected.
 fn default_bench_results_dir() -> Option<PathBuf> {
     bench_results_dir_from_env(
         std::env::var_os("ROCM_CLI_DATA_DIR"),
@@ -199,11 +195,8 @@ fn default_bench_results_dir() -> Option<PathBuf> {
     )
 }
 
-/// Pure core of [`default_bench_results_dir`]: resolve the tailed bench CSV
-/// path from explicit `$ROCM_CLI_DATA_DIR` / `$HOME` inputs so the behavior is
-/// testable without mutating process-global env vars (unsafe and racy under
-/// parallel tests). Precedence mirrors rocm-core's `AppPaths::discover`: the
-/// data-dir override wins, else `$HOME/.rocm`.
+/// Resolve the standalone daemon's tailed bench CSV from explicit environment
+/// inputs without mutating process-global variables in tests.
 fn bench_results_dir_from_env(
     data_dir_override: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,

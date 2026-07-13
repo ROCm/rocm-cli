@@ -12,7 +12,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use reqwest::Client;
@@ -28,8 +28,8 @@ const METRICS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 /// Poll interval for the mid-cell Prometheus poller.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Sentinel stored in peak atomics before any successful scrape is observed.
-const NO_SAMPLE: u32 = u32::MAX;
+/// Sentinel stored before any successful paired running/waiting scrape.
+const NO_SAMPLE_PAIR: u64 = u64::MAX;
 
 /// Fixed minimal header written once when a CSV file is new or empty.
 pub const CSV_HEADER: &str = "cell,run,concurrency,model,engine,input_len,output_len,\
@@ -108,6 +108,46 @@ async fn try_scrape_prom(client: &Client, endpoint: &str) -> Option<InstanceSamp
     Some(crate::vllm_prom::parse(&text))
 }
 
+fn pack_peak_pair(running: u32, waiting: u32) -> u64 {
+    (u64::from(waiting) << 32) | u64::from(running)
+}
+
+const fn unpack_peak_pair(value: u64) -> (u32, u32) {
+    (value as u32, (value >> 32) as u32)
+}
+
+fn update_peak_pair(peak: &AtomicU64, running: u32, waiting: u32) {
+    let candidate = pack_peak_pair(running, waiting);
+    let _ = peak.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        if current == NO_SAMPLE_PAIR || running > unpack_peak_pair(current).0 {
+            Some(candidate)
+        } else {
+            None
+        }
+    });
+}
+
+fn peak_pair(peak: &AtomicU64) -> Option<(u32, u32)> {
+    let value = peak.load(Ordering::Relaxed);
+    (value != NO_SAMPLE_PAIR).then(|| unpack_peak_pair(value))
+}
+
+struct BenchClients {
+    post: Client,
+    metrics: Client,
+}
+
+impl BenchClients {
+    fn new() -> Result<Self, BenchLoadError> {
+        Ok(Self {
+            post: Client::builder()
+                .timeout(std::time::Duration::from_mins(5))
+                .build()?,
+            metrics: Client::builder().timeout(METRICS_TIMEOUT).build()?,
+        })
+    }
+}
+
 /// Send `spec.requests` POST `/chat/completions` requests with `concurrency`
 /// in-flight at a time.
 ///
@@ -116,51 +156,42 @@ async fn try_scrape_prom(client: &Client, endpoint: &str) -> Option<InstanceSamp
 /// missing `usage` fields excludes that request from the sums but does not
 /// abort the cell.
 pub async fn run_cell(spec: &LoadSpec, concurrency: u32) -> Result<BenchmarkRow, BenchLoadError> {
-    // Long-timeout client for POST /chat/completions (generation can be slow).
-    let post_client = Client::builder()
-        .timeout(std::time::Duration::from_mins(5))
-        .build()?;
-    // Short-timeout client for /metrics scrapes — must never stall the sweep.
-    let metrics_client = Client::builder().timeout(METRICS_TIMEOUT).build()?;
+    run_cell_with_clients(spec, concurrency, &BenchClients::new()?).await
+}
 
+async fn run_cell_with_clients(
+    spec: &LoadSpec,
+    concurrency: u32,
+    clients: &BenchClients,
+) -> Result<BenchmarkRow, BenchLoadError> {
     let sem = Arc::new(Semaphore::new(concurrency as usize));
     let url = format!("{}/chat/completions", spec.endpoint.trim_end_matches('/'));
 
     // Before scrape: used only for TTFT/TPOT histogram deltas.
-    let prom_before = try_scrape_prom(&metrics_client, &spec.endpoint).await;
+    let prom_before = try_scrape_prom(&clients.metrics, &spec.endpoint).await;
 
-    // Shared poller state: max running and waiting seen during the cell.
-    let peak_running = Arc::new(AtomicU32::new(NO_SAMPLE));
-    let peak_waiting = Arc::new(AtomicU32::new(NO_SAMPLE));
+    // Keep the queue pair from the sample with the highest running count so
+    // saturation compares values observed at the same instant.
+    let peak_queue = Arc::new(AtomicU64::new(NO_SAMPLE_PAIR));
     let stop_flag = Arc::new(AtomicBool::new(false));
 
     // Spawn the mid-cell poller before any POST requests so it can observe
     // the rising queue depth as requests are dispatched.
     let poller = {
-        let metrics_client = metrics_client.clone();
+        let metrics_client = clients.metrics.clone();
         let endpoint = spec.endpoint.clone();
-        let peak_running = Arc::clone(&peak_running);
-        let peak_waiting = Arc::clone(&peak_waiting);
+        let peak_queue = Arc::clone(&peak_queue);
         let stop_flag = Arc::clone(&stop_flag);
         tokio::spawn(async move {
             loop {
                 if stop_flag.load(Ordering::Relaxed) {
                     break;
                 }
-                if let Some(sample) = try_scrape_prom(&metrics_client, &endpoint).await {
-                    if let Some(r) = sample.running_reqs {
-                        // Initialise from NO_SAMPLE or track maximum.
-                        let prev = peak_running.load(Ordering::Relaxed);
-                        if prev == NO_SAMPLE || r > prev {
-                            peak_running.store(r, Ordering::Relaxed);
-                        }
-                    }
-                    if let Some(w) = sample.waiting_reqs {
-                        let prev = peak_waiting.load(Ordering::Relaxed);
-                        if prev == NO_SAMPLE || w > prev {
-                            peak_waiting.store(w, Ordering::Relaxed);
-                        }
-                    }
+                if let Some(sample) = try_scrape_prom(&metrics_client, &endpoint).await
+                    && let (Some(running), Some(waiting)) =
+                        (sample.running_reqs, sample.waiting_reqs)
+                {
+                    update_peak_pair(&peak_queue, running, waiting);
                 }
                 tokio::time::sleep(POLL_INTERVAL).await;
             }
@@ -172,7 +203,7 @@ pub async fn run_cell(spec: &LoadSpec, concurrency: u32) -> Result<BenchmarkRow,
 
     let mut js: JoinSet<Option<Outcome>> = JoinSet::new();
     for _ in 0..spec.requests {
-        let client = post_client.clone();
+        let client = clients.post.clone();
         let sem = Arc::clone(&sem);
         let url = url.clone();
         let model = spec.model.clone();
@@ -239,7 +270,7 @@ pub async fn run_cell(spec: &LoadSpec, concurrency: u32) -> Result<BenchmarkRow,
     let _ = poller.await;
 
     // After scrape: used only for TTFT/TPOT histogram deltas.
-    let prom_after = try_scrape_prom(&metrics_client, &spec.endpoint).await;
+    let prom_after = try_scrape_prom(&clients.metrics, &spec.endpoint).await;
 
     let makespan_s = t0.elapsed().as_secs_f64();
 
@@ -254,16 +285,11 @@ pub async fn run_cell(spec: &LoadSpec, concurrency: u32) -> Result<BenchmarkRow,
         None
     };
 
-    // Peaks come from the mid-cell poller (real-time observations).
-    // NO_SAMPLE sentinel means no successful scrape — leave as None.
-    let max_running_reqs = {
-        let v = peak_running.load(Ordering::Relaxed);
-        if v == NO_SAMPLE { None } else { Some(v) }
-    };
-    let max_waiting_reqs = {
-        let v = peak_waiting.load(Ordering::Relaxed);
-        if v == NO_SAMPLE { None } else { Some(v) }
-    };
+    // Running and waiting are retained from one real-time observation.
+    let (max_running_reqs, max_waiting_reqs) = peak_pair(&peak_queue)
+        .map_or((None, None), |(running, waiting)| {
+            (Some(running), Some(waiting))
+        });
 
     // TTFT/TPOT deltas come from the before/after histogram scrapes (unchanged).
     let (_, _, ttft_ms, tpot_ms) = prom_deltas(prom_before.as_ref(), prom_after.as_ref());
@@ -387,24 +413,11 @@ pub async fn run_and_append_csv(
     concurrency_levels: &[u32],
     csv_path: &Path,
 ) -> Result<Vec<BenchmarkRow>, BenchLoadError> {
-    // Check header mismatch once before running any cells.
-    let is_empty = csv_path.metadata().map_or(true, |m| m.len() == 0);
-    if !is_empty {
-        use std::io::BufRead;
-        let f = std::fs::File::open(csv_path)?;
-        let mut reader = std::io::BufReader::new(f);
-        let mut first_line = String::new();
-        reader.read_line(&mut first_line)?;
-        if first_line.trim() != CSV_HEADER.trim() {
-            return Err(BenchLoadError::HeaderMismatch {
-                path: csv_path.display().to_string(),
-            });
-        }
-    }
+    let clients = BenchClients::new()?;
 
     let mut rows = Vec::with_capacity(concurrency_levels.len());
     for &conc in concurrency_levels {
-        let row = run_cell(spec, conc).await?;
+        let row = run_cell_with_clients(spec, conc, &clients).await?;
         append_one_row(&row, csv_path)?;
         rows.push(row);
     }
@@ -450,6 +463,10 @@ pub fn should_stop_ramp(prev_gen_tps: Option<f64>, row: &BenchmarkRow, is_last: 
     false
 }
 
+fn next_prev_gen_tps(previous: Option<f64>, current: Option<f64>) -> Option<f64> {
+    current.or(previous)
+}
+
 /// Run an automatic concurrency ramp over [`RAMP_SEQUENCE`], stopping early
 /// when throughput saturates.
 ///
@@ -464,14 +481,15 @@ pub async fn run_auto_ramp(
 ) -> Result<Vec<BenchmarkRow>, BenchLoadError> {
     let mut rows = Vec::new();
     let mut prev_gen_tps: Option<f64> = None;
+    let clients = BenchClients::new()?;
 
     for &conc in RAMP_SEQUENCE {
-        let row = run_cell(spec, conc).await?;
+        let row = run_cell_with_clients(spec, conc, &clients).await?;
         append_one_row(&row, csv_path)?;
 
         let is_last = conc == *RAMP_SEQUENCE.last().unwrap_or(&conc);
         let stop = should_stop_ramp(prev_gen_tps, &row, is_last);
-        prev_gen_tps = row.gen_tps;
+        prev_gen_tps = next_prev_gen_tps(prev_gen_tps, row.gen_tps);
         rows.push(row);
 
         if stop {
@@ -1186,6 +1204,12 @@ mod tests {
     }
 
     #[test]
+    fn t12f_failed_cell_preserves_last_successful_throughput() {
+        assert_eq!(next_prev_gen_tps(Some(100.0), None), Some(100.0));
+        assert_eq!(next_prev_gen_tps(Some(100.0), Some(120.0)), Some(120.0));
+    }
+
+    #[test]
     fn t12f_both_none_peaks_does_not_stop() {
         // Non-vLLM endpoint: both peaks are None; no saturation stop.
         let row = row_with_peaks(None, None, None);
@@ -1193,5 +1217,13 @@ mod tests {
             !should_stop_ramp(None, &row, false),
             "None peaks must not stop"
         );
+    }
+    #[test]
+    fn peak_pair_keeps_running_and_waiting_from_one_sample() {
+        let peak = AtomicU64::new(NO_SAMPLE_PAIR);
+        update_peak_pair(&peak, 2, 5);
+        update_peak_pair(&peak, 8, 1);
+
+        assert_eq!(peak_pair(&peak), Some((8, 1)));
     }
 }

@@ -11,7 +11,7 @@
 
 use std::fs::File;
 use std::io::BufReader;
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 
 use rocm_dash_core::bench_schema::BenchmarkRow;
 use rocm_dash_core::traits::{BenchTailer, CollectorError, Result};
@@ -33,11 +33,11 @@ impl BenchTailer for CsvBenchTailer {
     }
 
     fn drain(&mut self) -> Result<Vec<BenchmarkRow>> {
-        // The tailed path is derived from config / `$ROCM_CLI_DATA_DIR`, so
-        // sanitize it through `validated_read_path` before opening (breaks the
-        // path-injection data flow into the `File::open` sink below).
-        let path = validated_read_path(&self.path)?;
-        let file = File::open(&path)?;
+        let file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
         let mut rdr = csv::ReaderBuilder::new()
             .has_headers(true)
             .from_reader(BufReader::new(file));
@@ -63,31 +63,6 @@ impl BenchTailer for CsvBenchTailer {
 
 fn map_csv_err(e: csv::Error) -> CollectorError {
     CollectorError::Parse(e.to_string())
-}
-
-/// Canonicalize the tailed CSV path and reject `..` traversal before it reaches
-/// the `File::open` sink, breaking the data-flow taint from the config /
-/// `$ROCM_CLI_DATA_DIR`-derived bench path.
-///
-/// Unlike the log-directory guard, the bench results file is intentionally
-/// user-configurable to ANY location (`--out <path>` / `bench_results_dir`), so
-/// there is no fixed root to require containment under; sanitizing via
-/// canonicalization (which resolves symlinks and `..`) is the appropriate
-/// barrier. Canonicalization also fails for a not-yet-created file exactly as
-/// the previous bare `File::open` did, so the daemon's tick loop keeps
-/// tolerating an absent file before the first `rocm bench load` run.
-fn validated_read_path(path: &Path) -> Result<PathBuf> {
-    let canonical = std::fs::canonicalize(path)?;
-    if canonical
-        .components()
-        .any(|c| matches!(c, Component::ParentDir))
-    {
-        return Err(CollectorError::Other(format!(
-            "refusing to read bench CSV via a traversal path: {}",
-            path.display()
-        )));
-    }
-    Ok(canonical)
 }
 
 #[cfg(test)]
@@ -170,6 +145,17 @@ mod tests {
         assert_eq!(rows[0].cell, "O-arch");
         assert_eq!(rows[0].run, 7);
         assert_eq!(rows[0].prompt_tps, None);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn absent_results_file_is_an_empty_drain() {
+        let dir = tempdir();
+        let path = dir.join("not-created-yet.csv");
+        let mut tailer = CsvBenchTailer::new(path);
+
+        assert!(tailer.drain().unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(dir);
     }
