@@ -358,6 +358,14 @@ jobs:
         if: needs.changes.outputs.rust == 'true'
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      # The e2e-cucumber `e2e` target sets `test = false` (so nextest/`cargo test
+      # --all-targets` skip the custom harness), which also excludes it from
+      # `clippy --all-targets` above — leaving the ~1.6k lines of harness + step
+      # code unlinted. Clippy honours an explicit `--test`, so lint it directly.
+      - name: Clippy (e2e harness + steps)
+        if: needs.changes.outputs.rust == 'true'
+        run: cargo clippy --locked -p e2e-cucumber --test e2e -- -D warnings
+
       - name: MANIFEST.md dependency table is current
         if: needs.changes.outputs.rust == 'true'
         run: cargo xtask manifest --check
@@ -585,38 +593,56 @@ jobs:
     timeout-minutes: 15
     runs-on: ubuntu-latest
     needs: [changes, build-and-test]
-    # On push/PR/merge_group: run when build-and-test succeeded and the change is
-    # heavy. On workflow_dispatch: build-and-test is skipped, so tolerate that and
-    # gate on the platform input instead.
+    # This is a REQUIRED check, so — like every sibling required job — the job
+    # itself must always run (except on a manual dispatch that didn't select the
+    # mock platform), and the actual work is gated at the STEP level. Gating
+    # `heavy` at the job level would SKIP the job on a non-heavy PR, and a required
+    # check that is never produced stalls the merge queue. `merge_group` forces
+    # heavy=true, so the mock gate always executes there as a backstop.
     if: >-
       always()
       && needs.changes.result == 'success'
-      && (
-        (github.event_name != 'workflow_dispatch'
-          && needs.build-and-test.result == 'success'
-          && needs.changes.outputs.heavy == 'true')
-        || (github.event_name == 'workflow_dispatch'
-          && (inputs.platform == 'all' || inputs.platform == 'mock'))
-      )
+      && (github.event_name != 'workflow_dispatch'
+          || inputs.platform == 'all' || inputs.platform == 'mock')
     steps:
       - uses: actions/checkout@v6
 
+      # Whether the real work runs this time. On push/PR/merge_group: only when
+      # build-and-test succeeded and the change is heavy. On workflow_dispatch:
+      # build-and-test is skipped, so tolerate that and rely on the job-level
+      # platform gate above.
+      - name: Decide whether to run
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ needs.build-and-test.result }}" = "success" ] \
+            && [ "${{ needs.changes.outputs.heavy }}" = "true" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install native build deps
+        if: steps.gate.outputs.run == 'true'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libcap-dev
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        if: steps.gate.outputs.run == 'true'
 
       # The workspace test job selects only affected crates and runs the cucumber
       # harness, not the library's own unit tests — run the capability/expectation
       # /report unit tests (resolver logic, grid reconciliation) here.
       - name: Unit tests (e2e-cucumber lib)
+        if: steps.gate.outputs.run == 'true'
         run: cargo test -p e2e-cucumber --lib
 
       - name: Run E2E tests
+        if: steps.gate.outputs.run == 'true'
         run: cargo xtask e2e
 
       - name: Upload E2E report
-        if: always()
+        if: always() && steps.gate.outputs.run == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: e2e-report
@@ -647,10 +673,11 @@ jobs:
       )
     continue-on-error: true
     env:
-      # Bound serve readiness below the 15-min job cap so a serve that never comes
+      # Bound serve readiness below the 35-min job cap so a serve that never comes
       # ready fails the scenario with a real error instead of hanging until the
       # job is cancelled. 300s is ample for a real MI300X vLLM cold-start;
-      # per-scenario known-bug overrides in expectations.toml shorten it further.
+      # per-scenario overrides in expectations.toml / a `@serve-timeout` tag adjust
+      # it (shorter for known bugs, longer for large models).
       E2E_SERVE_TIMEOUT_SECS: "300"
     steps:
       - uses: actions/checkout@v6
@@ -665,7 +692,11 @@ jobs:
           pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
           pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
           pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
-          pkill -f 'vulkan/llama-server' 2>/dev/null || true
+          # NOTE: no unanchored `pkill -f 'vulkan/llama-server'` — the lemonade
+          # Vulkan assistant an e2e scenario spawns lives under /tmp/rocm-e2e-*
+          # and is already caught by the first line; an unanchored pattern would
+          # also kill a legitimate /workload manual-testing serve on this shared
+          # self-hosted runner.
           pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
           pkill -f 'e2e-target/release/rocm daemon' 2>/dev/null || true
           rm -rf /tmp/rocm-e2e-* 2>/dev/null || true

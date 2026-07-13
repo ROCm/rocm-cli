@@ -6,7 +6,7 @@
 # does `serve` default to? does this platform prefer vLLM? — is DERIVED from the
 # host capability probe (see src/capability.rs) and is NOT encoded here.
 #
-# Resolution at runtime (see tests/e2e-cucumber/tests/e2e/expectation.rs):
+# Resolution at runtime (see tests/e2e-cucumber/src/expectation.rs):
 #   1. A scenario whose @requires-gpu / @requires-engine can't be satisfied on
 #      this host is SKIPPED (not-applicable) — never listed here.
 #   2. Otherwise, the FIRST matching condition below marks it expected-fail
@@ -22,6 +22,14 @@
 #   serve_timeout_secs = 90          optional: shorter serve wait for a known bug
 #
 # An empty `when = {}` means "always xfail" (platform-independent bug).
+
+# --- EAI-7222: privacy notice is only shown in the interactive dash/TUI, so a
+# black-box CLI test can't verify it. Tracked as xfail (any platform) rather than
+# a silent green no-op — the step panics, which is the expected outcome here. ---
+[["chat-privacy-notice-accurate"]]
+when = {}
+bug = "EAI-7222"
+reason = "Privacy notice is TUI-only; cannot be verified by a black-box CLI test."
 
 # --- EAI-7219: short-name expansion not surfaced in serve output (any engine) ---
 [["serve-short-name-expansion"]]

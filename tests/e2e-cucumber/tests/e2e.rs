@@ -280,9 +280,10 @@ pub fn rocm_binary() -> String {
     std::env::var("ROCM_CLI_BINARY").unwrap_or_else(|_| "rocm".to_string())
 }
 
-/// Spawn the real `rocm` binary with the scenario's isolated env, returning
-/// `(stdout, stderr, rc)`. Every scenario goes through here, so this is also
-/// where each invocation is recorded for the command-coverage report.
+/// Spawn the real `rocm` binary with the scenario's isolated env.
+///
+/// Returns `(stdout, stderr, rc)`. Every scenario goes through here, so this is
+/// also where each invocation is recorded for the command-coverage report.
 pub fn run_rocm(world: &E2eWorld, args: &[&str]) -> (String, String, i32) {
     let binary = rocm_binary();
     let mut cmd = std::process::Command::new(&binary);
@@ -305,6 +306,7 @@ pub fn run_rocm(world: &E2eWorld, args: &[&str]) -> (String, String, i32) {
 /// report can build a command × platform coverage table tied to real results.
 /// Best-effort: a recording failure must never fail a scenario.
 fn record_command(scenario: Option<&str>, args: &[&str], rc: i32, stdout: &str) {
+    use std::io::Write as _;
     let subcommand = derive_subcommand(args);
     let model = positional_model(args);
     // The full command as executed, so the coverage table shows the real
@@ -337,7 +339,6 @@ fn record_command(scenario: Option<&str>, args: &[&str], rc: i32, stdout: &str) 
     if let Ok(mut line) = serde_json::to_string(&record) {
         line.push('\n');
         // Append; concurrent scenarios each add their own lines.
-        use std::io::Write as _;
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -526,7 +527,15 @@ async fn main() {
     // summary's arbitrary string writes); the file writers are teed in with
     // `discard_stats_writes()` so the `Tee` bound (both sides implement `Stats`)
     // is satisfied — `Tee`'s counts then come from the summarized side.
+    // On a GPU host, serve scenarios share one card and the fixed serve port
+    // (11435) — cucumber-rs defaults to 64 concurrent scenarios, which would run
+    // several serves at once and collide on the port + oversubscribe VRAM. Pin to
+    // one scenario at a time whenever a GPU is present. The no-GPU mock job keeps
+    // the default parallelism (its scenarios use isolated in-process mock servers
+    // on OS-assigned ports, so they're safe to run concurrently).
+    let max_concurrent = if cap.has_amd_gpu { 1 } else { 64 };
     let summary = E2eWorld::cucumber()
+        .max_concurrent_scenarios(max_concurrent)
         // Record the scenario name on the World before each scenario so every
         // `rocm` invocation can be tied back to its scenario for the coverage
         // report.
@@ -568,10 +577,18 @@ async fn main() {
                 let run = !matches!(expectation, Expectation::Skip { .. });
                 if let Some(id) = &decl.id {
                     let engine = decl.effective_engine(cap).to_owned();
-                    resolutions
+                    let prev = resolutions
                         .lock()
                         .expect("resolutions poisoned")
                         .insert(id.clone(), (expectation, engine));
+                    // Two scenarios sharing an `@id` would silently overwrite each
+                    // other's resolution (e.g. a copy-paste with a forgotten id
+                    // change) — the report grid keys on @id, so the collision would
+                    // hide one scenario. Fail loudly instead.
+                    assert!(
+                        prev.is_none(),
+                        "duplicate scenario @id '{id}' — ids must be unique"
+                    );
                 }
                 run
             }
