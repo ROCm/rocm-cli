@@ -275,41 +275,8 @@ impl E2eWorld {
         let root = self.isolated_root.as_ref().expect("no isolated root");
         let mock = self.mock.as_ref().expect("no mock server running");
         let model = self.model_name.as_deref().expect("no model name set");
-        let port = mock.port();
         let services = root.path().join("data").join("services");
-        std::fs::create_dir_all(&services).expect("failed to create services dir");
-
-        // The CLI only extracts host:port from `endpoint_url` and appends
-        // `/v1/models` for its readiness probe, which the mock serves.
-        let record = serde_json::json!({
-            "service_id": "e2e-mock",
-            "engine": "vllm",
-            "model_ref": model,
-            "canonical_model_id": model,
-            "host": "127.0.0.1",
-            "port": port,
-            "endpoint_url": format!("http://127.0.0.1:{port}/v1"),
-            "mode": "managed",
-            "status": "ready",
-            "supervisor_pid": 0,
-            "engine_pid": null,
-            "runtime_id": null,
-            "env_id": null,
-            "device_policy": null,
-            "gpu_indices": [],
-            "engine_recipe_json": null,
-            "restart_count": 0,
-            "last_restart_unix_ms": null,
-            "manifest_path": services.join("e2e-mock.json"),
-            "log_path": services.join("e2e-mock.log"),
-            "engine_state_path": services.join("e2e-mock.state.json"),
-            "created_at_unix_ms": 1_700_000_000_000_u64,
-        });
-        std::fs::write(
-            services.join("e2e-mock.json"),
-            serde_json::to_vec_pretty(&record).expect("failed to serialize record"),
-        )
-        .expect("failed to write service record");
+        e2e_cucumber::mock_server::write_service_record(&services, model, mock.port());
     }
 }
 

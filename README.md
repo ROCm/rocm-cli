@@ -32,6 +32,22 @@ vLLM.
 > guarantee of stability. APIs, commands, and behavior may change without
 > notice. Intended for experimentation and early feedback only.
 
+## Demos
+
+Chat with a locally served model:
+
+![rocm chat one-shot demo](https://raw.githubusercontent.com/ROCm/rocm-cli/media/chat.gif)
+
+Inspect running model servers:
+
+![rocm services list demo](https://raw.githubusercontent.com/ROCm/rocm-cli/media/services.gif)
+
+<!--
+The GIFs above are generated in CI and served from the orphan `media` branch;
+they are never committed to source branches. See docs/demos.md to regenerate or
+add a demo. Until the demo-gifs workflow has run once, these links 404.
+-->
+
 ## Installation
 
 The installer downloads a prebuilt bundle, verifies its SHA-256 checksum,

@@ -1,0 +1,63 @@
+name: demo-gifs
+
+# Render documentation screencasts (VHS -> GIF) and publish them to the orphan
+# `media` branch, which the README embeds via raw URLs. Deliberately never runs
+# on pull requests: VHS rendering is slow and would churn the branch. Regenerate
+# on demand, and automatically on each release so the docs GIFs track released
+# behavior (the release tag doubles as a cache-buster for GitHub's image proxy).
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write # push rendered GIFs to the `media` branch
+
+concurrency:
+  group: demo-gifs
+  cancel-in-progress: true
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Build rocm + demo mock server
+        run: |
+          cargo build --release -p rocm --bin rocm
+          cargo build --release -p e2e-cucumber --bin rocm-demo-env
+
+      # VHS + its runtime deps. ttyd/ffmpeg from apt; vhs pinned via `go install`
+      # (Go is preinstalled on the runner). Chrome (used by VHS to rasterize
+      # frames) is preinstalled; the sysctl re-enables its sandbox on Ubuntu 24.04
+      # runners, where unprivileged user namespaces are AppArmor-restricted.
+      - name: Install VHS toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ttyd ffmpeg
+          go install github.com/charmbracelet/vhs@v0.11.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      # render.sh starts the mock server + isolated env, then runs vhs against a
+      # pure command tape (see docs/demos.md). Setup lives here, never in a tape.
+      - name: Render tapes
+        run: |
+          mkdir -p docs/media
+          for t in version engines services chat; do
+            docs/tapes/render.sh "docs/tapes/$t.tape"
+          done
+
+      - name: Publish to media branch
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4.1.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: media
+          publish_dir: ./docs/media
+          force_orphan: true # single-commit branch; old GIF blobs are GC'd
+          user_name: github-actions[bot]
+          user_email: github-actions[bot]@users.noreply.github.com
+          commit_message: "chore(media): regenerate demo screencasts"
