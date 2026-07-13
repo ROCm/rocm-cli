@@ -250,8 +250,11 @@ async fn setup_large_gpu_model(world: &mut E2eWorld) {
     // Large-model coverage (dogfooding W9): a big vLLM model, served explicitly
     // on vLLM (the scenario is @requires-engine:vllm, so this only runs on an
     // Instinct host). Qwen/Qwen3.6-27B is the catalog's Instinct recommendation
-    // (BF16, ~54 GiB, fits 1x MI300X). The scenario carries @serve-timeout so the
-    // cold ~54 GiB load has room; readiness still waits for THIS model.
+    // (BF16, ~54 GiB, fits 1x MI300X). The scenario's @serve-timeout tag both
+    // widens the harness poll AND raises the CLI's own vLLM readiness cap via
+    // ROCM_CLI_VLLM_READY_TIMEOUT_SECS (see isolate_cmd) — the 5-min default
+    // would SIGTERM the server mid-load. Weights are pre-seeded in the shared HF
+    // cache so this is load-only, not a 54 GiB download.
     let model = "Qwen/Qwen3.6-27B";
     ensure_serve_port_free().await;
     let (stdout, _, rc) =

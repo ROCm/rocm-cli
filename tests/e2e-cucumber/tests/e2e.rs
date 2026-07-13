@@ -129,6 +129,17 @@ impl E2eWorld {
         if let Some(path) = &self.legacy_rocm_path {
             cmd.env("ROCM_PATH", path);
         }
+        // When a scenario declares a longer serve-readiness window (via a
+        // `@serve-timeout:<secs>` tag → serve_timeout_override), also raise the
+        // CLI's OWN vLLM readiness cap to match. `rocm serve --managed` otherwise
+        // SIGTERM-kills a vLLM that isn't ready within its default (5 min,
+        // EAI-7393), which a large model's cold load legitimately exceeds — so
+        // extending only the harness's poll (wait_for_model) isn't enough; the CLI
+        // would kill the server first. Keeping the two in lockstep makes the
+        // big-model serve actually reach ready (verified on MI300X with Qwen3.6-27B).
+        if let Some(secs) = self.serve_timeout_override {
+            cmd.env("ROCM_CLI_VLLM_READY_TIMEOUT_SECS", secs.to_string());
+        }
     }
 
     /// Plant a fake pre-existing (non-CLI) ROCm install in the scenario's isolated
