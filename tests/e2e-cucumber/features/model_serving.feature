@@ -45,7 +45,7 @@ Feature: Model serving
   # vLLM so in our fleet it runs only there (Strix Halo is lemonade / too little
   # VRAM). A cold load of ~54 GiB far exceeds the 600s default, so the scenario
   # declares a longer serve-readiness timeout. Confirmed working on app-dev MI300X.
-  @id:serve-large-model-inference @requires-gpu @requires-engine:vllm @serve-timeout:2400
+  @id:serve-large-model-inference @requires-gpu @requires-engine:vllm @serve-timeout:2400 @nightly
   Scenario: 10 - A large vLLM model serves and responds to inference
     Given a managed runtime is active
     And a large model is being served on GPU

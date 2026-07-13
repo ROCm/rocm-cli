@@ -506,6 +506,10 @@ async fn main() {
     // the per-scenario serve-timeout override) can borrow it for 'static.
     let matrix: &'static e2e_cucumber::expectation::Expectations =
         Box::leak(Box::new(load_expectations()));
+    // Expensive `@nightly` scenarios (e.g. the large-model serve) are skipped
+    // unless the nightly workflow opts in via `E2E_INCLUDE_NIGHTLY`, keeping the
+    // per-PR / on-demand GPU run fast.
+    let include_nightly = std::env::var_os("E2E_INCLUDE_NIGHTLY").is_some_and(|v| v == "1");
     eprintln!(
         "Host capability: platform={} os={} gpu={} effective_engine={}",
         cap.platform_slug, cap.os_family, cap.has_amd_gpu, cap.effective_serve_engine,
@@ -573,7 +577,7 @@ async fn main() {
         .filter_run(concat!(env!("CARGO_MANIFEST_DIR"), "/features/"), {
             move |_feature, _rule, scenario| {
                 let decl = ScenarioDecl::from_tags(&scenario.tags);
-                let expectation = resolve(&decl, cap, matrix);
+                let expectation = resolve(&decl, cap, matrix, include_nightly);
                 let run = !matches!(expectation, Expectation::Skip { .. });
                 if let Some(id) = &decl.id {
                     let engine = decl.effective_engine(cap).to_owned();
