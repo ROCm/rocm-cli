@@ -40,6 +40,19 @@ Feature: Model serving
     Then the response contains a model reply
     And the response identifies the correct model
 
+  # Large-model coverage (dogfooding W9): serve a big vLLM model end-to-end at
+  # least once. Qwen/Qwen3.6-27B (BF16, ~54 GiB) fits a single MI300X; pinned to
+  # vLLM so in our fleet it runs only there (Strix Halo is lemonade / too little
+  # VRAM). A cold load of ~54 GiB far exceeds the 600s default, so the scenario
+  # declares a longer serve-readiness timeout. Confirmed working on app-dev MI300X.
+  @id:serve-large-model-inference @requires-gpu @requires-engine:vllm @serve-timeout:2400
+  Scenario: 10 - A large vLLM model serves and responds to inference
+    Given a managed runtime is active
+    And a large model is being served on GPU
+    When the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
+
   # Lemonade serve + inference (GGUF model). Engine coverage: Lemonade.
   @id:serve-lemonade-inference @requires-gpu @requires-engine:lemonade
   Scenario: 7 - A model served on lemonade responds to inference requests
