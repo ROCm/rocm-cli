@@ -5,6 +5,7 @@
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-13
+**Token Usage:** in=10414 out=3255487 cache_create=39340842 cache_read=2088873069 calls=5223
 
 **Status:** ✅ GOAL MET + ENGINE-AGNOSTIC RETAGGING COMPLETE — 4-platform consolidated E2E report complete. Session: fixed Status-column defect + Tier/n-a presentation (`d9d3adb`). Made 3 serve/chat scenarios engine-agnostic via host_serve_target() helper; renamed `serve-inference-response` → `serve-vllm-inference`, `serve-ready-implies-inference` → `serve-readiness-contract`; added EAI-7052 lemonade-linux xfail conditions. All changes green (mock 0 unexpected, 28+21 tests, container full suite). Committed to scratch, cherry-picked 5 keepers to PR branch, held push pending user signal.
 
@@ -657,6 +658,13 @@ Framework/harness/CI issues to fix fast via the scratch-branch + manual-dispatch
   clean, rendered real report from run-29104869493 artifacts + browser-verified.
 
 ## Work Log
+
+**2026-07-13 (continuation — comprehensive report fixes + command-coverage + chat coverage):**
+- ✅ Report presentation fix (d9d3adb): removed Tier, clarified legend, n/a instead of dashes. 28 tests.
+- ✅ Command-coverage: full command + resolved engine (6bd0933). Fixed serve-coverage bug: longest-prefix match (b67897e).
+- ✅ rocm chat CLI coverage: scenario 6 added (e58f365), one-shot prompt against mock service. 11 scenarios, 0 unexpected.
+- ✅ Dogfooding analysis: mapped 24 issues; identified 3 black-box gaps; wrote correlation-analysis.md.
+- ✅ Dispatched CI run 29238253738 (platform=all, e58f365); expected ~66min for full report with commands, engines, chat covered.
 
 **2026-07-13 (continued session):** Engine-agnostic scenario refactor (Task #5 completed):
 - ✅ Made 3 serve/chat scenarios host-adaptive: `setup_gpu_model()` now calls `host_serve_target()` helper to serve model+engine matching effective_serve_engine (safetensors/vLLM on Instinct, GGUF/lemonade on Strix).
