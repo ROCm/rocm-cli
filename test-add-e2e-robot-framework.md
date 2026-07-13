@@ -6,9 +6,9 @@
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-13
 
-**Status:** ✅ GOAL MET + REPORT REVIEWED — 4-platform consolidated E2E report complete. Session: fixed Status-column defect (`afbabc8` on origin scratch), removed vestigial Tier column, clarified captions (Mock inference-backend mock, gates-the-PR + non-blocking distinction). Gist published at https://gist.github.com/fredespi/601a3ebd8cb5d112e2ebe0b25fd5ecb6 for phone-viewable updates.
+**Status:** ✅ GOAL MET + ENGINE-AGNOSTIC RETAGGING COMPLETE — 4-platform consolidated E2E report complete. Session: fixed Status-column defect + Tier/n-a presentation (`d9d3adb`). Made 3 serve/chat scenarios engine-agnostic via host_serve_target() helper; renamed `serve-inference-response` → `serve-vllm-inference`, `serve-ready-implies-inference` → `serve-readiness-contract`; added EAI-7052 lemonade-linux xfail conditions. All changes green (mock 0 unexpected, 28+21 tests, container full suite). Committed to scratch, cherry-picked 5 keepers to PR branch, held push pending user signal.
 
-**Token Usage:** in=9526 out=2903950 cache_create=36944954 cache_read=1929951949 calls=4779
+**Token Usage:** in=9942 out=3061896 cache_create=37924524 cache_read=1993776063 calls=4987
 
 ---
 
@@ -657,6 +657,13 @@ Framework/harness/CI issues to fix fast via the scratch-branch + manual-dispatch
   clean, rendered real report from run-29104869493 artifacts + browser-verified.
 
 ## Work Log
+
+**2026-07-13 (continued session):** Engine-agnostic scenario refactor (Task #5 completed):
+- ✅ Made 3 serve/chat scenarios host-adaptive: `setup_gpu_model()` now calls `host_serve_target()` helper to serve model+engine matching effective_serve_engine (safetensors/vLLM on Instinct, GGUF/lemonade on Strix).
+- ✅ Renamed scenarios for clarity: `serve-inference-response` → `serve-vllm-inference` (deliberate vLLM-only half of paired scenarios), `serve-ready-implies-inference` → `serve-readiness-contract` (engine-agnostic contract test).
+- ✅ Broadened `chat-end-to-end-local-model`, `chat-tool-definitions-accepted`, `serve-readiness-contract` by dropping `@requires-engine:vllm`, kept `@requires-gpu`.
+- ✅ Added EAI-7052 lemonade+linux xfail conditions to avoid false-fail on Strix-Ubuntu where lemonade inference hangs.
+- ✅ Committed both clean to scratch (2 commits: report presentation `d9d3adb`, engine-agnostic `f63ca2c`). Cherry-picked 5 keepers to PR branch, held push. Container suite fully green.
 
 **2026-07-13 (idle flush):** Session idle for 1 hour, auto-flushing WIP state. Goal remains complete: 4-platform E2E report (run 29209242248) with all platforms producing platform.json + report.json; report defect fixed in `afbabc8` committed to origin/ci-e2e-framework-fixes. Outstanding: 2 known Strix-Ubuntu test-bug fails (task #23, same root cause as EAI-7333). No active work.
 
