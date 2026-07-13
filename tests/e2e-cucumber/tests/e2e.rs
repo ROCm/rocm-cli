@@ -519,7 +519,13 @@ async fn main() {
             let decl = ScenarioDecl::from_tags(&scenario.tags);
             if let Some(id) = &decl.id {
                 let engine = decl.effective_engine(cap);
-                world.serve_timeout_override = matrix.serve_timeout_for(id, cap, engine);
+                // A `@serve-timeout:<secs>` tag on an expected-pass scenario (a
+                // genuinely slow serve, e.g. a large model) takes precedence;
+                // otherwise fall back to any xfail matrix override (fail-fast for
+                // a known-bug serve). Absent both → the step default.
+                world.serve_timeout_override = decl
+                    .serve_timeout_secs
+                    .or_else(|| matrix.serve_timeout_for(id, cap, engine));
             }
             Box::pin(async {})
         })

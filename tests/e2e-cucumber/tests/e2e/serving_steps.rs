@@ -24,8 +24,11 @@ fn serve_timeout_secs() -> u64 {
 }
 
 /// Serve-readiness timeout for a scenario: a per-scenario override set by the
-/// `before` hook from `expectations.toml` (a known bug fails fast) takes
-/// precedence over the global `E2E_SERVE_TIMEOUT_SECS` / default.
+/// `before` hook takes precedence over the global `E2E_SERVE_TIMEOUT_SECS` /
+/// default. The override is a `@serve-timeout:<secs>` tag on an expected-pass
+/// scenario (lengthen a genuinely slow serve, e.g. a large model), else an
+/// `expectations.toml` xfail `serve_timeout_secs` (shorten a known-bug serve so
+/// it fails fast).
 fn serve_timeout_for(world: &E2eWorld) -> u64 {
     world
         .serve_timeout_override
@@ -237,6 +240,28 @@ async fn setup_lemonade_model(world: &mut E2eWorld) {
     wait_for_model(
         "http://127.0.0.1:11435/v1/models",
         Some("Qwen3-0.6B"),
+        serve_timeout_for(world),
+    )
+    .await;
+}
+
+#[given("a large model is being served on GPU")]
+async fn setup_large_gpu_model(world: &mut E2eWorld) {
+    // Large-model coverage (dogfooding W9): a big vLLM model, served explicitly
+    // on vLLM (the scenario is @requires-engine:vllm, so this only runs on an
+    // Instinct host). Qwen/Qwen3.6-27B is the catalog's Instinct recommendation
+    // (BF16, ~54 GiB, fits 1x MI300X). The scenario carries @serve-timeout so the
+    // cold ~54 GiB load has room; readiness still waits for THIS model.
+    let model = "Qwen/Qwen3.6-27B";
+    ensure_serve_port_free().await;
+    let (stdout, _, rc) =
+        crate::run_rocm(world, &["serve", model, "--engine", "vllm", "--managed"]);
+    assert!(rc == 0, "rocm serve failed:\n{stdout}");
+    world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
+    world.model_name = Some(model.to_string());
+    wait_for_model(
+        "http://127.0.0.1:11435/v1/models",
+        Some("Qwen3.6-27B"),
         serve_timeout_for(world),
     )
     .await;

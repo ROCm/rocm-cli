@@ -23,6 +23,7 @@ const ID_PREFIX: &str = "id:";
 const REQUIRES_ENGINE_PREFIX: &str = "requires-engine:";
 const REQUIRES_OS_PREFIX: &str = "requires-os:";
 const REQUIRES_GPU_TAG: &str = "requires-gpu";
+const SERVE_TIMEOUT_PREFIX: &str = "serve-timeout:";
 
 /// The resolved expectation for one scenario on one host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +48,12 @@ pub struct ScenarioDecl {
     /// for scenarios whose premise is OS-specific (e.g. adopting a `/opt/rocm`
     /// install only exists on Linux). Runs everywhere when absent.
     pub requires_os: Option<String>,
+    /// Serve-readiness timeout (seconds) declared via `@serve-timeout:<secs>`, for
+    /// a *passing* scenario that legitimately needs longer than the default — e.g.
+    /// a large model whose cold load exceeds the 600s default. Distinct from the
+    /// xfail `serve_timeout_secs` in expectations.toml (which shortens a known-bug
+    /// serve to fail fast); this lengthens a genuinely-slow expected-pass serve.
+    pub serve_timeout_secs: Option<u64>,
 }
 
 impl ScenarioDecl {
@@ -56,6 +63,7 @@ impl ScenarioDecl {
         let mut requires_gpu = false;
         let mut requires_engine = None;
         let mut requires_os = None;
+        let mut serve_timeout_secs = None;
         for tag in tags {
             let tag = tag.as_ref();
             if let Some(rest) = tag.strip_prefix(ID_PREFIX) {
@@ -64,6 +72,8 @@ impl ScenarioDecl {
                 requires_engine = Some(rest.to_owned());
             } else if let Some(rest) = tag.strip_prefix(REQUIRES_OS_PREFIX) {
                 requires_os = Some(rest.to_ascii_lowercase());
+            } else if let Some(rest) = tag.strip_prefix(SERVE_TIMEOUT_PREFIX) {
+                serve_timeout_secs = rest.parse::<u64>().ok();
             } else if tag == REQUIRES_GPU_TAG {
                 requires_gpu = true;
             }
@@ -73,6 +83,7 @@ impl ScenarioDecl {
             requires_gpu,
             requires_engine,
             requires_os,
+            serve_timeout_secs,
         }
     }
 
@@ -381,6 +392,16 @@ serve_timeout_secs = 90
         assert_eq!(d.id.as_deref(), Some("serve-vllm-inference"));
         assert!(d.requires_gpu);
         assert_eq!(d.requires_engine.as_deref(), Some("vllm"));
+        assert_eq!(d.serve_timeout_secs, None);
+    }
+
+    #[test]
+    fn serve_timeout_tag_parses_seconds() {
+        let d = decl(&["id:serve-large-model-inference", "serve-timeout:2400"]);
+        assert_eq!(d.serve_timeout_secs, Some(2400));
+        // A malformed value is ignored rather than panicking.
+        let bad = decl(&["id:x", "serve-timeout:soon"]);
+        assert_eq!(bad.serve_timeout_secs, None);
     }
 
     #[test]
