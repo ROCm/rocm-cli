@@ -24,6 +24,7 @@ const REQUIRES_ENGINE_PREFIX: &str = "requires-engine:";
 const REQUIRES_OS_PREFIX: &str = "requires-os:";
 const REQUIRES_GPU_TAG: &str = "requires-gpu";
 const SERVE_TIMEOUT_PREFIX: &str = "serve-timeout:";
+const NIGHTLY_TAG: &str = "nightly";
 
 /// The resolved expectation for one scenario on one host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +55,10 @@ pub struct ScenarioDecl {
     /// xfail `serve_timeout_secs` in expectations.toml (which shortens a known-bug
     /// serve to fail fast); this lengthens a genuinely-slow expected-pass serve.
     pub serve_timeout_secs: Option<u64>,
+    /// `@nightly`: an expensive scenario (e.g. a large-model serve) that is skipped
+    /// on ordinary per-PR / on-demand runs to keep them fast, and only runs when
+    /// the nightly workflow opts in via `E2E_INCLUDE_NIGHTLY`.
+    pub nightly: bool,
 }
 
 impl ScenarioDecl {
@@ -64,6 +69,7 @@ impl ScenarioDecl {
         let mut requires_engine = None;
         let mut requires_os = None;
         let mut serve_timeout_secs = None;
+        let mut nightly = false;
         for tag in tags {
             let tag = tag.as_ref();
             if let Some(rest) = tag.strip_prefix(ID_PREFIX) {
@@ -76,6 +82,8 @@ impl ScenarioDecl {
                 serve_timeout_secs = rest.parse::<u64>().ok();
             } else if tag == REQUIRES_GPU_TAG {
                 requires_gpu = true;
+            } else if tag == NIGHTLY_TAG {
+                nightly = true;
             }
         }
         Self {
@@ -84,6 +92,7 @@ impl ScenarioDecl {
             requires_engine,
             requires_os,
             serve_timeout_secs,
+            nightly,
         }
     }
 
@@ -238,13 +247,27 @@ pub struct PlatformManifest<'a> {
 
 /// Resolve a scenario's expectation on this host.
 ///
-/// 1. Not-applicable → `Skip`: a `@requires-gpu` scenario on a host with no AMD
-///    GPU, a `@requires-os:<os>` scenario on a different OS, or a scenario whose
-///    effective engine can't start here.
+/// 1. Not-applicable → `Skip`: a `@nightly` scenario when nightly isn't included,
+///    a `@requires-gpu` scenario on a host with no AMD GPU, a `@requires-os:<os>`
+///    scenario on a different OS, or a scenario whose effective engine can't start.
 /// 2. First matching `expectations.toml` condition → `ExpectXfail`.
 /// 3. Otherwise → `ExpectPass`.
-pub fn resolve(decl: &ScenarioDecl, cap: &HostCapability, matrix: &Expectations) -> Expectation {
+///
+/// `include_nightly` is set by the nightly workflow (via `E2E_INCLUDE_NIGHTLY`);
+/// ordinary per-PR / on-demand runs pass `false` so expensive `@nightly`
+/// scenarios stay out of the fast path.
+pub fn resolve(
+    decl: &ScenarioDecl,
+    cap: &HostCapability,
+    matrix: &Expectations,
+    include_nightly: bool,
+) -> Expectation {
     // (1) Applicability / skip.
+    if decl.nightly && !include_nightly {
+        return Expectation::Skip {
+            reason: "nightly-only scenario; set E2E_INCLUDE_NIGHTLY to run".to_owned(),
+        };
+    }
     if decl.requires_gpu && !cap.has_amd_gpu {
         return Expectation::Skip {
             reason: "requires an AMD GPU; none detected on this host".to_owned(),
@@ -405,6 +428,29 @@ serve_timeout_secs = 90
     }
 
     #[test]
+    fn nightly_scenario_skips_unless_included() {
+        let m = Expectations::default();
+        // A @nightly GPU scenario on an applicable host: skipped when nightly is
+        // NOT included (the per-PR fast path), runs when it is.
+        let d = decl(&["id:big", "requires-gpu", "nightly"]);
+        assert!(d.nightly);
+        assert!(matches!(
+            resolve(&d, &cap("mi300x"), &m, false),
+            Expectation::Skip { .. }
+        ));
+        assert_eq!(
+            resolve(&d, &cap("mi300x"), &m, true),
+            Expectation::ExpectPass
+        );
+        // The nightly gate is cheapest-first: a @nightly scenario that ALSO can't
+        // run here (no GPU) still skips regardless of the include flag.
+        assert!(matches!(
+            resolve(&d, &cap("mock"), &m, true),
+            Expectation::Skip { .. }
+        ));
+    }
+
+    #[test]
     fn effective_engine_prefers_explicit_pin() {
         let d = decl(&["id:x", "requires-gpu", "requires-engine:vllm"]);
         // Even on a lemonade-default host, an explicit vllm pin wins.
@@ -424,17 +470,17 @@ serve_timeout_secs = 90
 
         // MI300X: default engine vLLM → xfail.
         assert!(matches!(
-            resolve(&d, &cap("mi300x"), &m),
+            resolve(&d, &cap("mi300x"), &m, false),
             Expectation::ExpectXfail { .. }
         ));
         // Strix Ubuntu: gfx1151 → lemonade default → NOT vLLM → expect-pass.
         assert_eq!(
-            resolve(&d, &cap("strix-ubuntu"), &m),
+            resolve(&d, &cap("strix-ubuntu"), &m, false),
             Expectation::ExpectPass
         );
         // Strix Windows: lemonade default → expect-pass (this is the XPASS fix).
         assert_eq!(
-            resolve(&d, &cap("strix-windows"), &m),
+            resolve(&d, &cap("strix-windows"), &m, false),
             Expectation::ExpectPass
         );
     }
@@ -444,7 +490,7 @@ serve_timeout_secs = 90
         let m = eai7333_matrix();
         let d = decl(&["id:serve-default-engine-inference", "requires-gpu"]);
         assert!(matches!(
-            resolve(&d, &cap("mock"), &m),
+            resolve(&d, &cap("mock"), &m, false),
             Expectation::Skip { .. }
         ));
     }
@@ -459,10 +505,13 @@ serve_timeout_secs = 90
             "requires-engine:vllm",
         ]);
         // MI300X: vLLM available → not skipped (expect-pass here, no matrix entry).
-        assert_eq!(resolve(&d, &cap("mi300x"), &m), Expectation::ExpectPass);
+        assert_eq!(
+            resolve(&d, &cap("mi300x"), &m, false),
+            Expectation::ExpectPass
+        );
         // Strix Windows: vLLM can't start → skip (N/A).
         assert!(matches!(
-            resolve(&d, &cap("strix-windows"), &m),
+            resolve(&d, &cap("strix-windows"), &m, false),
             Expectation::Skip { .. }
         ));
     }
@@ -476,15 +525,15 @@ serve_timeout_secs = 90
         // Runs on a Linux GPU host; skips where os_family != linux (windows, and
         // the "other" fixture host).
         assert_eq!(
-            resolve(&d, &cap("strix-ubuntu"), &m),
+            resolve(&d, &cap("strix-ubuntu"), &m, false),
             Expectation::ExpectPass
         );
         assert!(matches!(
-            resolve(&d, &cap("strix-windows"), &m),
+            resolve(&d, &cap("strix-windows"), &m, false),
             Expectation::Skip { .. }
         ));
         assert!(matches!(
-            resolve(&d, &cap("mock"), &m),
+            resolve(&d, &cap("mock"), &m, false),
             Expectation::Skip { .. }
         ));
     }
@@ -493,8 +542,14 @@ serve_timeout_secs = 90
     fn non_gpu_scenario_always_runs() {
         let m = Expectations::default();
         let d = decl(&["id:examine-version"]);
-        assert_eq!(resolve(&d, &cap("mock"), &m), Expectation::ExpectPass);
-        assert_eq!(resolve(&d, &cap("mi300x"), &m), Expectation::ExpectPass);
+        assert_eq!(
+            resolve(&d, &cap("mock"), &m, false),
+            Expectation::ExpectPass
+        );
+        assert_eq!(
+            resolve(&d, &cap("mi300x"), &m, false),
+            Expectation::ExpectPass
+        );
     }
 
     #[test]
@@ -511,11 +566,11 @@ reason = "short-name not surfaced"
         let d = decl(&["id:serve-short-name-expansion"]);
         // No requires-gpu → runs everywhere, always xfail.
         assert!(matches!(
-            resolve(&d, &cap("mock"), &m),
+            resolve(&d, &cap("mock"), &m, false),
             Expectation::ExpectXfail { .. }
         ));
         assert!(matches!(
-            resolve(&d, &cap("mi300x"), &m),
+            resolve(&d, &cap("mi300x"), &m, false),
             Expectation::ExpectXfail { .. }
         ));
     }
@@ -538,12 +593,12 @@ reason = "lemonade vulkan fallback"
         ]);
         // Strix Ubuntu (linux, lemonade) → xfail.
         assert!(matches!(
-            resolve(&d, &cap("strix-ubuntu"), &m),
+            resolve(&d, &cap("strix-ubuntu"), &m, false),
             Expectation::ExpectXfail { .. }
         ));
         // Strix Windows (windows, lemonade) → os mismatch → expect-pass.
         assert_eq!(
-            resolve(&d, &cap("strix-windows"), &m),
+            resolve(&d, &cap("strix-windows"), &m, false),
             Expectation::ExpectPass
         );
     }

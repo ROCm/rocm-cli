@@ -309,3 +309,54 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: gh release delete "${{ needs.nightly.outputs.staging_tag }}" --yes --cleanup-tag 2>/dev/null || true
+
+  # Full E2E on app-dev MI300X INCLUDING the expensive `@nightly` scenarios (the
+  # large-model serve), which the per-PR ci.yml `e2e-gpu` job skips to stay fast.
+  # Runs unconditionally on the schedule/dispatch (independent of the nightly
+  # BUILD skip above — a regression run is worth doing even with no new commits).
+  # Non-blocking, mirrors ci.yml's e2e-gpu job but sets E2E_INCLUDE_NIGHTLY.
+  e2e-gpu-nightly:
+    name: E2E tests (GPU, incl. nightly-only)
+    timeout-minutes: 90
+    runs-on: [self-hosted, linux, amd-gpu]
+    continue-on-error: true
+    env:
+      # Include @nightly scenarios (the large-model serve). See src/expectation.rs.
+      E2E_INCLUDE_NIGHTLY: "1"
+      # Serve-readiness floor; a `@serve-timeout` tag lengthens it for the large
+      # model (its cold ~54 GiB load exceeds this default).
+      E2E_SERVE_TIMEOUT_SECS: "300"
+    steps:
+      - uses: actions/checkout@v6
+
+      # Reclaim the GPU before running: kill only e2e leftovers scoped to
+      # /tmp/rocm-e2e-* and the e2e-target/e2e-shared trees — never the runner or
+      # any /workload manual-testing processes (see ci.yml e2e-gpu for the same).
+      - name: Reclaim GPU from stray E2E processes
+        run: |
+          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
+          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
+          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
+          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
+          pkill -f 'e2e-target/release/rocm daemon' 2>/dev/null || true
+          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
+          echo "reclaimed"
+
+      # cache: false — this self-hosted runner persists the build cache itself via
+      # CARGO_TARGET_DIR (below), so the action's rust-cache is pure overhead.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+
+      - name: Run full E2E on GPU hardware (incl. nightly-only)
+        run: |
+          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
+          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
+          cargo xtask e2e
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-gpu-nightly-report
+          path: tests/e2e-cucumber/results/
