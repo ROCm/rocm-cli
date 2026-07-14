@@ -214,14 +214,49 @@ fn build_dashboard_runtime() -> Result<tokio::runtime::Runtime> {
         .context("building tokio runtime for the dashboard")
 }
 
+/// Compute a private, unpredictable path for a `--demo` session file.
+///
+/// Written under the per-user data dir (`{data_dir}/demo`, created `0o700` on
+/// Unix), never a fixed name in the world-shared temp dir. Stale demo sessions
+/// are pruned first so the directory does not accumulate. The file itself is
+/// created `0o600` by `demo::generate_file`.
+fn demo_session_path(paths: &AppPaths) -> Result<PathBuf> {
+    let dir = paths.data_dir.join("demo");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating demo session dir {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Best-effort: restrict the demo dir to the owner.
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    // Best-effort prune of previous demo sessions so the dir stays bounded.
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("ndjson") {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+    let file = format!(
+        "session-{}-{}.ndjson",
+        std::process::id(),
+        rocm_core::unix_time_millis()
+    );
+    Ok(dir.join(file))
+}
+
 /// Entry point for `rocm dash`. Builds a tokio runtime and runs the dashboard.
 pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths)?;
-    // `--demo` writes a deterministic synthetic session and replays it, so the
-    // dashboard shows populated data with no GPU and no daemon.
+    // `--demo` writes a synthetic session and replays it, so the dashboard shows
+    // populated data with no GPU and no daemon. The session is written under the
+    // per-user data dir with an unpredictable name (not a fixed world-shared
+    // temp path) and created `0o600` by `demo::generate_file`.
     let replay = if demo {
-        let path = std::env::temp_dir().join("rocm-dash-demo.ndjson");
+        let path = demo_session_path(&paths)?;
         rocm_dash_daemon::demo::generate_file(
             &rocm_dash_daemon::demo::DemoOptions::default(),
             &path,
@@ -455,6 +490,57 @@ mod tests {
         assert_eq!(opts.services_dir, Some(p.services_dir()));
         assert_eq!(opts.persist_dir, Some(p.telemetry_state_dir()));
         assert!(!opts.enable_docker);
+    }
+
+    #[test]
+    fn demo_session_path_is_private_and_unpredictable() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-demo-test-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        let p = AppPaths {
+            config_dir: root.join("cfg"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+
+        let path = demo_session_path(&p).expect("demo session path");
+
+        // Under the per-user data dir, never the shared temp dir with a fixed name.
+        assert!(
+            path.starts_with(p.data_dir.join("demo")),
+            "demo file must live under the data dir: {}",
+            path.display()
+        );
+        assert_ne!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("rocm-dash-demo.ndjson"),
+            "demo file name must not be the old predictable shared-temp name"
+        );
+
+        // The generated file is created private to the owner.
+        rocm_dash_daemon::demo::generate_file(
+            &rocm_dash_daemon::demo::DemoOptions::default(),
+            &path,
+        )
+        .expect("generate demo session");
+        assert!(path.exists(), "demo session file should exist");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(file_mode, 0o600, "demo session file must be 0o600");
+            let dir_mode = std::fs::metadata(p.data_dir.join("demo"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700, "demo dir must be 0o700");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

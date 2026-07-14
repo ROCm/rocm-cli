@@ -532,6 +532,13 @@ pub struct AppState {
     pub(crate) chat_endpoint_rebuild: Option<ChatProvider>,
     /// Replay scrubber state. `None` when running against a live daemon.
     pub replay: Option<ReplayState>,
+    /// Data-honesty flag: `true` when the displayed telemetry is NOT from a live
+    /// daemon — i.e. `--demo`, `--replay`, or an asset generator. Drives the
+    /// persistent "SIMULATED DATA" marker and suppresses live/connected/health
+    /// indicators so simulated data can never be presented as live. Distinct
+    /// from `replay`, which is playback-control state and is not set by the
+    /// screenshot/cast generators.
+    pub simulated: bool,
     /// Last body area used by the most recent draw. Mouse hit-tests resolve
     /// pointer coordinates against this rect (filled by `ui::draw`).
     pub last_body_area: Option<ratatui::layout::Rect>,
@@ -658,6 +665,7 @@ impl AppState {
             chat_persist_dispatch: false,
             chat_endpoint_rebuild: None,
             replay: None,
+            simulated: false,
             last_body_area: None,
             last_tab_bar_area: None,
             last_footer_chips: Vec::new(),
@@ -1527,6 +1535,9 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         crate::jobs::run_effects(fx, &job_tx);
     }
     state.replay = replay_controller.map(ReplayState::new);
+    // Both `--demo` (a generated session replayed) and `--replay <file>` present
+    // non-live data, so mark the session simulated for the honesty chrome.
+    state.simulated = state.replay.is_some();
 
     // Resolve the chat backend. `--chat-mock` short-circuits detection with a
     // deterministic offline MockAgentClient (no live LLM, no network); otherwise

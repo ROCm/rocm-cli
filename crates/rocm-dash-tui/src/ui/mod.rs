@@ -290,14 +290,21 @@ const fn wide_triptych(body: Rect) -> Option<(Rect, Rect, Rect)> {
 }
 
 fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let (status_text, status_color) = match &state.conn {
-        ConnState::Initial => ("starting".to_string(), theme.muted),
-        ConnState::Connecting => ("connecting…".to_string(), theme.warn),
-        ConnState::Connected { host, version } => (
-            format!("connected · {host} · rocm daemon {version}"),
-            theme.ok,
-        ),
-        ConnState::Disconnected { reason } => (format!("disconnected · {reason}"), theme.err),
+    // In demo/replay the data is not live, so never present the session as
+    // "connected" to a real daemon — the connection status is a simulated label
+    // instead, and the SIMULATED DATA chip below makes the state unmistakable.
+    let (status_text, status_color) = if state.simulated {
+        ("simulated — not live".to_string(), theme.warn)
+    } else {
+        match &state.conn {
+            ConnState::Initial => ("starting".to_string(), theme.muted),
+            ConnState::Connecting => ("connecting…".to_string(), theme.warn),
+            ConnState::Connected { host, version } => (
+                format!("connected · {host} · rocm daemon {version}"),
+                theme.ok,
+            ),
+            ConnState::Disconnected { reason } => (format!("disconnected · {reason}"), theme.err),
+        }
     };
 
     let mut spans: Vec<Span> = vec![
@@ -308,13 +315,23 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 .fg(theme.accent),
         ),
         Span::raw("  "),
-        Span::styled(
-            format!("→ {}", state.connect),
-            Style::default().fg(theme.muted),
-        ),
-        Span::raw("   "),
-        Span::styled(status_text, Style::default().fg(status_color)),
     ];
+    if state.simulated {
+        spans.push(Span::styled(
+            " SIMULATED DATA ",
+            Style::default()
+                .bg(theme.warn)
+                .fg(theme.surface_2)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw("  "));
+    }
+    spans.push(Span::styled(
+        format!("→ {}", state.connect),
+        Style::default().fg(theme.muted),
+    ));
+    spans.push(Span::raw("   "));
+    spans.push(Span::styled(status_text, Style::default().fg(status_color)));
     let warning_count = state.latest.as_ref().map_or(0, |s| s.warnings.len());
     if warning_count > 0 {
         spans.push(Span::raw("   "));

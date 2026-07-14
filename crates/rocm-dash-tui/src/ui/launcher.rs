@@ -182,7 +182,9 @@ fn draw_status_strip(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             ),
             Span::styled(port, Style::default().fg(theme.muted)),
             Span::styled("  │  ", Style::default().fg(theme.border)),
-            Span::styled("✓ healthy", Style::default().fg(theme.ok)),
+            // A Running process is not a health signal. Without an actual health
+            // probe we report health as unknown rather than fabricating "healthy".
+            Span::styled("health: unknown", Style::default().fg(theme.muted)),
         ])
     } else {
         Line::from(vec![

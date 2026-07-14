@@ -153,11 +153,19 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         return;
     }
     let load_hist = history(state, snap_util);
+    // Never label simulated telemetry "live".
+    let spark_label = if load_hist.is_empty() {
+        "—"
+    } else if state.simulated {
+        "sim"
+    } else {
+        "live"
+    };
     mini_spark(
         f,
         Rect::new(inner.x, inner.y, inner.width, 1),
         "node load ",
-        if load_hist.is_empty() { "—" } else { "live" },
+        spark_label,
         &load_hist,
         false,
         theme,
@@ -272,10 +280,16 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1); 6])
         .split(area);
+    // In demo/replay this is not a live feed — say so rather than "LIVE".
+    let (feed_label, feed_color) = if state.simulated {
+        ("SIMULATED · last 60s", theme.warn)
+    } else {
+        ("LIVE · last 60s", theme.muted)
+    };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "LIVE · last 60s",
-            Style::default().fg(theme.muted),
+            feed_label,
+            Style::default().fg(feed_color),
         ))),
         rh[0],
     );
@@ -424,11 +438,16 @@ fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // Updates tile — honest placeholder (no update feed wired this run).
     let updates = card(f, mid[2], "Updates", BoxRole::Muted, theme);
     if updates.height > 0 {
-        let body = match state.conn {
-            ConnState::Connected { .. } => {
-                Line::from(Span::styled("Up to date", Style::default().fg(theme.muted)))
+        let body = if state.simulated {
+            // No real update feed can be observed for simulated data.
+            Line::from(Span::styled("unknown", Style::default().fg(theme.muted)))
+        } else {
+            match state.conn {
+                ConnState::Connected { .. } => {
+                    Line::from(Span::styled("Up to date", Style::default().fg(theme.muted)))
+                }
+                _ => Line::from(Span::styled("Checking…", Style::default().fg(theme.muted))),
             }
-            _ => Line::from(Span::styled("Checking…", Style::default().fg(theme.muted))),
         };
         // ponytail: no update-feed data source this run; tile shows conn-derived
         // status rather than the mock's hardcoded "ROCm 6.3 ready".
