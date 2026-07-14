@@ -34,7 +34,8 @@ SCRATCH only (e21297d). Bring to PR (test/add-e2e-robot-framework) after strix-w
 **Stage:** 22-volen-review-triaged-3B+2NB-fixed-strix23-needs-xfail
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
-**Last Updated:** 2026-07-14 (auto-flushed)
+**Last Updated:** 2026-07-14
+**Token Usage:** in=12214 out=3774903 cache_create=48512624 cache_read=2292020174 calls=6129
 
 ## 📋 VOLEN-SILO (Eugene / pr-review-watcher BOT) REVIEW — TRIAGED (2026-07-14) — READ FIRST
 
@@ -230,6 +231,8 @@ Rebuilt the `1817c5b` idea correctly:
 default-engine), rominf re-review pending.
 
 ## 📋 Work Log
+
+**2026-07-14 (report UI enhancement):** Redesigned expectation grid cell rendering for xfail (known bugs): changed glyph from text "xfail" → grey ✗ (style `.status-xfail { color: #9e9e9e }`) — a muted sibling to red ❌ regression mark. Added `grid_class()` helper + legend line (HTML + markdown) explaining grey ✗ = "known bug, failed as expected". Fixed latent dual-class bug in maud rendering (`class="num" class="status-fail"` → single combined class). Live report generated locally from run 29357303454: 44 ✅, 31 grey ✗ (xfail), 24 n/a, 1 red ❌FAIL. All 33 e2e-report tests pass, `-D warnings` clean. 
 
 **2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state. #23 Strix probe result: both serve-default-engine scenarios still fail on lemonade-native path (backend-install masking engine line, Vulkan instability). Needs xfail or deeper fix. PR #69 all-blocking checks green. VOLEN bot review fully triaged (5B+6NB items addressed in worktree, see section above). Task #22 (share-one-runtime) validated by hand — redesigned without redundant cargo rebuild, with persistence at E2E_SHARED_RUNTIMES_DIR; full GPU suite under 90min cap achieved (run 29322186691, 24 scenarios, 11 xfail as expected, 0 unexpected). Commits on scratch: ebc00b1, 021b14c, 72c6457, fc4687b. Pending: bring #22 to PR after rominf re-review, finalize #23 decision, remove temp name_filter commit.
 
