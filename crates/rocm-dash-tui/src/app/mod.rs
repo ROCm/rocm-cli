@@ -38,7 +38,10 @@ mod chat;
 mod slash;
 mod summary;
 
-use chat::{build_chat_agent, build_local_agent, detect_local_chat, persist_chat_endpoint};
+use chat::{
+    StartupChatOutcome, build_chat_agent, build_local_agent, detect_local_chat,
+    persist_chat_endpoint, startup_chat_outcome,
+};
 use summary::{parse_plan_result, summarize_json_value, summarize_slash_tool};
 
 /// Which single flow a *focused host* runs.
@@ -1601,16 +1604,15 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         // fallback target here is redundant and just burns another probe
         // timeout on a cold start — treat that as unreachable directly.
         // Otherwise (an explicit URL/env/key path) TCP-probe the target.
-        let probe_ok = if detected.is_some() {
-            true
-        } else if detection_ran {
-            false
-        } else {
-            tokio::task::spawn_blocking(move || {
+        let startup_outcome = startup_chat_outcome(detection_ran, detected.is_some());
+        let probe_ok = match startup_outcome {
+            StartupChatOutcome::Local => true,
+            StartupChatOutcome::OAuth => false,
+            StartupChatOutcome::Configured => tokio::task::spawn_blocking(move || {
                 crate::llm::probe_endpoint(&probe_target, crate::llm::PROBE_TIMEOUT)
             })
             .await
-            .unwrap_or(false)
+            .unwrap_or(false),
         };
         let llm = detected.or_else(|| {
             crate::llm::resolve_llm_config(
@@ -1629,10 +1631,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         // ChatGPT OAuth default (device-code login surfaced in the chat tab).
         // This restores the no-key login the vendored Codex path provided; it
         // takes NO api_key (env-only invariant untouched — OAuth, not a key).
-        let no_key_no_endpoint = !probe_ok
-            && args.chat_api_key.is_none()
-            && args.chat_url.is_none()
-            && args.chat_env_url.is_none();
+        let no_key_no_endpoint = startup_outcome == StartupChatOutcome::OAuth;
         if no_key_no_endpoint {
             let oauth_tx = chat_tx.clone();
             crate::agent::ChatGptAgentClient::new(

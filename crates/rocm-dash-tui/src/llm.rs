@@ -198,7 +198,10 @@ pub fn probe_endpoint(base_url: &str, timeout: Duration) -> bool {
 /// (rather than sequentially) bounds the worst case (no server listening) to
 /// one [`PROBE_TIMEOUT`] instead of one per candidate. TCP-only (no HTTP);
 /// never blocks longer than [`PROBE_TIMEOUT`] total.
-fn probe_first_reachable<'a>(candidates: &[&'a str]) -> Option<&'a str> {
+fn probe_first_reachable<'a, P>(candidates: &[&'a str], probe: P) -> Option<&'a str>
+where
+    P: Fn(&str, Duration) -> bool + Sync,
+{
     std::thread::scope(|scope| {
         // The collect is load-bearing, not needless: every probe must be
         // *spawned* before any is *joined*, or they run one at a time and the
@@ -206,13 +209,19 @@ fn probe_first_reachable<'a>(candidates: &[&'a str]) -> Option<&'a str> {
         #[allow(clippy::needless_collect)]
         let handles: Vec<_> = candidates
             .iter()
-            .map(|ep| (*ep, scope.spawn(|| probe_endpoint(ep, PROBE_TIMEOUT))))
+            .map(|ep| (*ep, scope.spawn(|| probe(ep, PROBE_TIMEOUT))))
             .collect();
         handles
             .into_iter()
             .find_map(|(ep, handle)| handle.join().unwrap_or(false).then_some(ep))
     })
 }
+
+const LOCAL_ENDPOINT_CANDIDATES: [&str; 3] = [
+    crate::skills::LEMONADE_ENDPOINT,
+    crate::skills::VLLM_ENDPOINT,
+    crate::skills::ROCM_SERVE_ENDPOINT,
+];
 
 /// Probe the known local serving endpoints (Lemonade, vLLM, then `rocm
 /// serve`'s non-managed default) concurrently and return the highest-priority
@@ -221,12 +230,7 @@ fn probe_first_reachable<'a>(candidates: &[&'a str]) -> Option<&'a str> {
 /// Used by the TUI's in-app "detect a local engine" action, and by chat
 /// startup, so the user need not run the CLI skill first.
 pub fn detect_local_endpoint() -> Option<&'static str> {
-    const CANDIDATES: [&str; 3] = [
-        crate::skills::LEMONADE_ENDPOINT,
-        crate::skills::VLLM_ENDPOINT,
-        crate::skills::ROCM_SERVE_ENDPOINT,
-    ];
-    probe_first_reachable(&CANDIDATES)
+    probe_first_reachable(&LOCAL_ENDPOINT_CANDIDATES, probe_endpoint)
 }
 
 /// Pick the first model id from an OpenAI-compatible `/v1/models` response (`{"data":[{"id":"…"}]}`).
@@ -485,7 +489,7 @@ mod tests {
         let (_first, first_url) = ephemeral_endpoint();
         let (_second, second_url) = ephemeral_endpoint();
         assert_eq!(
-            probe_first_reachable(&[first_url.as_str(), second_url.as_str()]),
+            probe_first_reachable(&[first_url.as_str(), second_url.as_str()], probe_endpoint),
             Some(first_url.as_str())
         );
     }
@@ -496,30 +500,50 @@ mod tests {
         // must fall through to the second, reachable one.
         let (_listener, url) = ephemeral_endpoint();
         assert_eq!(
-            probe_first_reachable(&["http://127.0.0.1:1", url.as_str()]),
+            probe_first_reachable(&["http://127.0.0.1:1", url.as_str()], probe_endpoint,),
             Some(url.as_str())
         );
     }
 
     #[test]
     fn probe_first_reachable_none_when_nothing_listening() {
-        assert_eq!(probe_first_reachable(&["http://127.0.0.1:1"]), None);
+        assert_eq!(
+            probe_first_reachable(&["http://127.0.0.1:1"], probe_endpoint),
+            None
+        );
     }
 
     #[test]
-    fn detect_local_endpoint_bounded_latency_when_nothing_listening() {
-        // Regression guard for the startup-latency fix: with no server
-        // reachable, probing all 3 well-known ports must take roughly one
-        // PROBE_TIMEOUT (parallel), not three (sequential). A true regression
-        // back to sequential probing takes ~3x PROBE_TIMEOUT, so a 4x margin
-        // still catches it while giving plenty of headroom for scheduling
-        // jitter on loaded/slower CI machines (observed >2x on Windows CI).
-        let start = std::time::Instant::now();
-        let _ = detect_local_endpoint();
-        assert!(
-            start.elapsed() < PROBE_TIMEOUT * 4,
-            "expected parallel probing to bound latency to ~1 PROBE_TIMEOUT, took {:?}",
-            start.elapsed()
+    fn probe_first_reachable_starts_all_probes_concurrently() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let active = AtomicUsize::new(0);
+        let max_active = AtomicUsize::new(0);
+        let probe = |_: &str, _: Duration| {
+            let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active.fetch_max(now_active, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(50));
+            active.fetch_sub(1, Ordering::SeqCst);
+            false
+        };
+
+        assert_eq!(probe_first_reachable(&["a", "b", "c"], probe), None);
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            3,
+            "all probes must be in flight before any probe is joined"
+        );
+    }
+
+    #[test]
+    fn local_endpoint_candidates_preserve_supported_order() {
+        assert_eq!(
+            LOCAL_ENDPOINT_CANDIDATES,
+            [
+                crate::skills::LEMONADE_ENDPOINT,
+                crate::skills::VLLM_ENDPOINT,
+                crate::skills::ROCM_SERVE_ENDPOINT,
+            ]
         );
     }
 }

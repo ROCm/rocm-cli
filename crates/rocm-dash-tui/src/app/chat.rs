@@ -268,6 +268,30 @@ pub(super) const fn should_detect_local_chat(
     chat_url.is_none() && chat_env_url.is_none() && chat_api_key.is_none()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StartupChatOutcome {
+    Local,
+    OAuth,
+    Configured,
+}
+
+/// Select the startup backend path after optional local detection.
+///
+/// A successful detection is already reachable. A detection miss means the
+/// well-known endpoints were exhausted and startup should proceed to OAuth.
+/// When detection was gated off, the configured target still needs its normal
+/// liveness probe before backend construction.
+pub(super) const fn startup_chat_outcome(
+    detection_ran: bool,
+    detected: bool,
+) -> StartupChatOutcome {
+    match (detection_ran, detected) {
+        (_, true) => StartupChatOutcome::Local,
+        (true, false) => StartupChatOutcome::OAuth,
+        (false, false) => StartupChatOutcome::Configured,
+    }
+}
+
 /// Persist an accepted local endpoint to the user's `config.toml`: load the
 /// existing config (or defaults), set `tui.chat_url`/`tui.chat_model`, and write
 /// it back. Best-effort — returns a human error string on failure.
@@ -436,7 +460,7 @@ mod tests {
     /// so a local server on a non-default well-known port (e.g. `rocm serve`'s
     /// :11435) is preferred over falling back to the ChatGPT cloud default.
     #[tokio::test]
-    async fn detect_local_chat_prefers_local_server_over_no_endpoint() {
+    async fn detect_local_chat_wires_probed_endpoint_through() {
         // Priority order among the well-known ports (Lemonade > vLLM > rocm
         // serve's default) is covered deterministically in `llm.rs`'s own
         // tests, against OS-assigned ephemeral ports. This test's job is
@@ -471,5 +495,23 @@ mod tests {
             Some("http://env:2/v1"),
             None
         ));
+    }
+
+    #[test]
+    fn startup_uses_detected_local_endpoint() {
+        assert_eq!(startup_chat_outcome(true, true), StartupChatOutcome::Local);
+    }
+
+    #[test]
+    fn startup_uses_oauth_after_empty_detection() {
+        assert_eq!(startup_chat_outcome(true, false), StartupChatOutcome::OAuth);
+    }
+
+    #[test]
+    fn startup_uses_configured_endpoint_when_detection_is_skipped() {
+        assert_eq!(
+            startup_chat_outcome(false, false),
+            StartupChatOutcome::Configured
+        );
     }
 }
