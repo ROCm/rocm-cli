@@ -205,6 +205,8 @@ default-engine), rominf re-review pending.
 
 **2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
+**2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+
 **2026-07-14 (idle flush — auto):** Session idle for 10 minutes, auto-flushing WIP state.
 
 **2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state. Full GPU suite under 90-min cap achieved and validated (run 29322186691). Share-one-runtime works end-to-end with install-once + reuse pattern. 1 XPASS (EAI-7221 chat-end-to-end-local-model on MI300X) needs triage before closing — appears fixed but needs confirmation. Commits on scratch: ebc00b1 (share-one-runtime harness+CI), 021b14c (pre-warm in-place), 72c6457 (remove temp filter). All signed, pushed. Next: triage XPASS, bring #22 + share-one-runtime to PR, rominf re-review pending, #23 still open.
