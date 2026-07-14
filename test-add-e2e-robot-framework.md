@@ -1,12 +1,41 @@
 
 # WIP: E2E BDD tests for rocm-cli (PR #69, cucumber-rs)
 
-**Stage:** 18-share-one-runtime-VALIDATED-in-CI-run-29321270536-green
+**Stage:** 19-FULL-suite-under-cap-30min-goal-achieved-1-xpass-to-triage
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-14
 
-## 🔧 PRE-WARM mv BUG FOUND + FIXED (2026-07-14) — READ FIRST
+## 🎉 ORIGINAL GOAL ACHIEVED — FULL GPU SUITE UNDER CAP (2026-07-14) — READ FIRST
+
+**Full app-dev-gpu suite (run 29322186691, scratch 72c6457) finished in ~30 min** (11:35→12:05
+CEST) — the previous THREE full runs (29254970358, 29268106812, 29306008273) ALL hit the 90min
+cap. Share-one-runtime works end-to-end in CI:
+- **Pre-warm was a NO-OP** ("shared runtime already present — skipping") — it persisted from the
+  probe run at $RUNNER_WORKSPACE/e2e-prewarm. Zero per-scenario `install sdk` (except the one
+  isolated `runtime-install-sdk-active`, which legitimately installs, warm ~30s).
+- **24 scenarios (13 passed, 11 failed); Reconciliation: 11 xfail (as expected), 0 unexpected
+  failures.** The 11 "failures" are all known-bug xfails — healthy.
+
+**ONE action item — 1 XPASS (why the job shows red):** `chat-end-to-end-local-model (EAI-7221)`
+is marked xfail for `effective_engine=vllm` in expectations.toml (lines 103-108) but PASSED on
+MI300X — EAI-7221 (vLLM end-to-end chat returns no valid reply) appears FIXED on the vLLM path.
+The harness flags XPASS as failure (good hygiene). **NOT yet edited** — a single XPASS could be
+flaky; no corroborating history that EAI-7221 was deliberately fixed. DECISION NEEDED: confirm
+non-flaky (re-run / check ticket), then remove the vllm-condition EAI-7221 block (keep the
+lemonade EAI-7052 block at lines 110-115). This is the only thing keeping the run red; it is
+NOT a regression from share-one-runtime.
+
+**Commits on scratch (all pushed, signed):** ebc00b1 (share-one-runtime harness+CI), 021b14c
+(pre-warm in-place, no mv — fixes baked-path bug), 72c6457 (remove temp name_filter). Plus
+6c6231b (#22 uv cache) earlier. NONE on the PR branch yet.
+
+**NEXT:** (1) triage the EAI-7221 XPASS; (2) bring #22 + share-one-runtime to the PR branch;
+(3) rominf re-review pending; (4) #23 (Strix default-engine) still open.
+
+---
+
+## 🔧 PRE-WARM mv BUG FOUND + FIXED (2026-07-14) — (superseded by goal-achieved above)
 
 **Scoped 3-scenario probe (run 29320025393, commit dde598c) FAILED — but exactly as the
 minimal-experiment method intends: fast (~6min) with a precise signal.** Result:
