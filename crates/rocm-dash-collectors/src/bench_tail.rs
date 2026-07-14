@@ -157,8 +157,6 @@ mod tests {
         let mut tailer = CsvBenchTailer::new(path);
 
         assert!(tailer.drain().unwrap().is_empty());
-
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn tempdir() -> std::path::PathBuf {
