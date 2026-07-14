@@ -799,7 +799,16 @@ jobs:
             echo "shared runtime already present at $E2E_SHARED_RUNTIMES_DIR — skipping pre-warm"
           fi
 
-          cargo xtask e2e
+          # TEMP: optional scenario-name filter for a scoped probe dispatch (same
+          # as the strix job) — lets a dispatch run just one scenario (e.g. the
+          # 27B nightly) instead of the whole suite. Empty = full suite.
+          NAME_FILTER="${{ github.event.inputs.name_filter }}"
+          if [ -n "$NAME_FILTER" ]; then
+            echo "TEMP name filter active: $NAME_FILTER"
+            cargo xtask e2e -- --name "$NAME_FILTER"
+          else
+            cargo xtask e2e
+          fi
 
       - name: Upload E2E report
         if: always()
