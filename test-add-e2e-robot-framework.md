@@ -1,11 +1,11 @@
 
 # WIP: E2E BDD tests for rocm-cli (PR #69, cucumber-rs)
 
-**Stage:** 11-review-addressed-task22-landed-on-scratch-dispatched
+**Stage:** 11-review-addressed-task22-on-scratch-run-29306008273-monitoring
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-14
-**Token Usage:** in=10633 out=3339868 cache_create=40515111 cache_read=2101198907 calls=5336
+**Token Usage:** in=10819 out=3385676 cache_create=40885912 cache_read=2116953021 calls=5429
 
 ## 🌙 RESUME STATE (2026-07-13 late — read FIRST; context about to compact)
 
@@ -89,9 +89,7 @@ use --no-verify (Mac pre-push hook can't pass by design; container IS the gate).
 
 ---
 
-**Status:** rominf review addressed + all changes on PR (`0e6c80e`). Task #22
-(download-cache sharing) design validated on box (160s→34s), **fully implemented on scratch**.
-Code staged, container mock gate green (0 unexpected failures). Commit pending SSH key load.
+**Status:** rominf review fully addressed (all threads resolved; re-review pending on rominf). Task #22 complete: scratch HEAD `6c6231b` (signed, pushed), container mock gate green (0 unexpected failures). Run 29306008273 active (~58 min / 90min cap) — monitoring for install-sdk warm timing + suite completion.
 
 ---
 
@@ -674,6 +672,13 @@ by the CLI/daemon, not by a scenario.
   "safe to share" when tests assert on its registry/state.
 - 📋 Re-validate on a fresh run once Strix Ubuntu runner is back online. Examine-guidance failure
   should be re-checked then (may have been caused by the shared-runtimes leak).
+
+## 📝 WORK LOG — 2026-07-14 (Task #22 uv-cache, signing recipe, timezone)
+
+- ✅ **Task #22 fully implemented on scratch `6c6231b`** (signed via launchd SSH agent, remote session; 1Password locked): refactored path validation into `validated_shared_dir(env_var)` helper, added `shared_uv_cache_dir()` reading `E2E_SHARED_UV_CACHE_DIR`, wired `UV_CACHE_DIR` in `isolate_cmd` (no-op when unset). CI config: set the env var to `/var/tmp/rocm-e2e-uv-cache` (roomy `/` overlay, safe from reclaim glob) in `ci.yml` e2e-gpu and `nightly.yml` jobs. Container mock gate green (0 unexpected failures).
+- ✅ **Pushed scratch to origin** and dispatched app-dev-gpu run **29306008273** (platform=app-dev-gpu only) to validate install-sdk warm timing (~34s vs cold ~160s) and suite completion under 90min cap. Run is in_progress (~58min elapsed as of last check).
+- ✅ **Saved signing gotcha to global memory**: when remote + 1Password locked, point `SSH_AUTH_SOCK` to launchd agent (holds the amd work key `fespinoz@amd.com`), NOT the 1Password socket. Used `GHAPP_SIGN_TIMEOUT=5` to skip the dead prompt fast.
+- ✅ **User timezone CET saved to memory**: all future date/time presentations will convert to CET (CEST in summer).
 
 ## Framework reliability fixes (iterate on scratch branch `ci-e2e-framework-fixes`)
 
