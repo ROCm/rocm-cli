@@ -31,12 +31,11 @@ SCRATCH only (e21297d). Bring to PR (test/add-e2e-robot-framework) after strix-w
 
 # WIP: E2E BDD tests for rocm-cli (PR #69, cucumber-rs)
 
-**Stage:** 25-report-changes-merged-version-probe-diagnosed
+**Stage:** 26-report-polish-version-probe-in-progress-nightly-validation
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework (PR-side) / ci-e2e-framework-fixes (scratch, active)
 **Last Updated:** 2026-07-14
-**Token Usage:** in=13098 out=4168920 cache_create=50069541 cache_read=2383913684 calls=6573
-**Idle Flush:** 2026-07-14
+**Token Usage:** in=13226 out=4222395 cache_create=50129798 cache_read=2401925838 calls=6637
 
 ## 📋 VOLEN-SILO (Eugene / pr-review-watcher BOT) REVIEW — TRIAGED (2026-07-14) — READ FIRST
 
