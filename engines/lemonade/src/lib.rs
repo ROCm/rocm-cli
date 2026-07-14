@@ -2665,6 +2665,12 @@ fn parse_engine_recipe_json(value: Option<String>) -> Result<Option<EngineRecipe
 fn resolve_lemonade_model_ref(model_ref: &str) -> String {
     let trimmed = model_ref.trim();
     let lower = trimmed.to_ascii_lowercase();
+    // Only exact, recognized shorthand aliases map to the bundled assistant GGUF.
+    // A syntactically valid `owner/repo` Hugging Face checkpoint must never be
+    // silently rewritten here — e.g. `Qwen/Qwen2.5-1.5B-Instruct` is a real
+    // checkpoint id, not a shorthand, and is passed through unchanged so the
+    // serve path can honour (or explicitly reject) it rather than substituting
+    // an unrelated model behind the user's back.
     if trimmed.is_empty()
         || matches!(
             lower.as_str(),
@@ -2678,8 +2684,6 @@ fn resolve_lemonade_model_ref(model_ref: &str) -> String {
                 | "qwen3-4b-instruct"
                 | "qwen3-4b-instruct-2507-gguf"
         )
-        || lower.contains("qwen2.5-1.5b")
-        || lower.contains("qwen3.5-0.8b")
     {
         DEFAULT_MODEL.to_owned()
     } else if matches!(
@@ -2731,10 +2735,6 @@ mod tests {
     #[test]
     fn qwen_alias_resolves_to_validated_assistant_gguf_model() {
         assert_eq!(resolve_lemonade_model_ref("qwen"), DEFAULT_MODEL);
-        assert_eq!(
-            resolve_lemonade_model_ref("Qwen/Qwen2.5-1.5B-Instruct"),
-            DEFAULT_MODEL
-        );
         assert_eq!(resolve_lemonade_model_ref("qwen-smoke"), "Qwen3-0.6B-GGUF");
     }
 
@@ -2743,6 +2743,14 @@ mod tests {
         assert_eq!(
             resolve_lemonade_model_ref("LiquidAI/LFM2.5-230M-GGUF:Q4_0"),
             "LiquidAI/LFM2.5-230M-GGUF:Q4_0"
+        );
+        // Regression (EAI-7370): a fully-qualified checkpoint id that merely
+        // contains a known-alias substring must not be swapped for the bundled
+        // default. `Qwen/Qwen2.5-1.5B-Instruct` was silently served as
+        // `Qwen3-4B-Instruct-2507-GGUF`; it must now pass through verbatim.
+        assert_eq!(
+            resolve_lemonade_model_ref("Qwen/Qwen2.5-1.5B-Instruct"),
+            "Qwen/Qwen2.5-1.5B-Instruct"
         );
     }
 
