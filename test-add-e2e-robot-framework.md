@@ -1,10 +1,37 @@
 
 # WIP: E2E BDD tests for rocm-cli (PR #69, cucumber-rs)
 
-**Stage:** 15-share-one-runtime-PROVEN-by-hand-1817c5b-failures-diagnosed
+**Stage:** 16-share-one-runtime-IMPLEMENTED-committed-scratch-ebc00b1
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
-**Last Updated:** 2026-07-14 (idle flush)
+**Last Updated:** 2026-07-14
+
+## ✅ SHARE-ONE-RUNTIME IMPLEMENTED + ON SCRATCH (2026-07-14) — READ FIRST
+
+**Committed `ebc00b1` on scratch (ci-e2e-framework-fixes), pushed.** SSH-signed (launchd key).
+Rebuilt the `1817c5b` idea correctly:
+- Harness: `shared_runtimes_dir()` (via `validated_shared_dir`, path-injection safe) +
+  `use_shared_runtimes()` (symlinks `data/runtimes` at `E2E_SHARED_RUNTIMES_DIR`), opt-in from
+  `a managed runtime is active` ONLY. Clean-slate scenarios stay isolated.
+- CI (ci.yml e2e-gpu + nightly e2e-gpu-nightly): build rocm ONCE, reuse via `ROCM_CLI_BINARY`
+  for both pre-warm + suite (no `cargo run --release`); pre-warm the shared runtime once,
+  persist on `$RUNNER_WORKSPACE/e2e-runtimes` across runs (no-op after first run ever).
+- **PROVEN on MI300X: 2-scenario probe (serve-vllm-inference SHARED + runtime-install-sdk-active
+  ISOLATED) → both PASS, 0 unexpected failures.** The isolated install scenario correctly still
+  sees `a machine with no CLI-managed runtimes` (shared tree does NOT pollute it).
+- **Mock gate green** (env unset → no-op). **Full Linux container suite green** (all crates 0
+  failed, retroactive confirm of ebc00b1).
+
+**⚠️ PROCESS NOTE (user rule):** I pushed ebc00b1 after only the mock e2e gate, then the user
+said "always run the test suite in the linux container before push". Fixed the memory
+(reference_linux_container_testing) — ALWAYS run full `workspace/wip/container-test.sh` before
+EVERY push, it's the gate. Retroactive full container run confirmed ebc00b1 is clean.
+
+**NEXT:** dispatch app-dev-gpu on scratch to confirm the whole GPU suite now finishes under
+90min with install-once. Then bring #22 + this to the PR branch. Also still: #23 (Strix
+default-engine), rominf re-review pending.
+
+---
 **Token Usage:** in=11490 out=3569750 cache_create=44048080 cache_read=2183015218 calls=5767
 
 ## ✅ SHARE-ONE-RUNTIME PROVEN BY HAND (2026-07-14) — READ FIRST
