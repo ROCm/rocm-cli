@@ -273,41 +273,26 @@ pub fn transcript_lines<'a>(state: &'a AppState, theme: &Theme) -> Vec<Line<'a>>
     lines
 }
 
-/// Render the single-row input line. While focused, a caret glyph trails the
-/// buffer; otherwise a muted hint invites focus.
-/// Parse the TCP port out of a chat endpoint base URL
-/// (`http://127.0.0.1:8000/v1` → `8000`). `None` when no explicit port is
-/// present (e.g. a bare host or a remote gateway URL).
-fn port_from_base_url(base_url: &str) -> Option<u16> {
-    let after_scheme = base_url.split("://").nth(1).unwrap_or(base_url);
-    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
-    authority.rsplit(':').next()?.parse().ok()
-}
-
-/// Parse the host out of a chat endpoint base URL
-/// (`http://127.0.0.1:8000/v1` → `127.0.0.1`, `https://gateway.example.com` →
-/// `gateway.example.com`). `None` only for a malformed/empty authority.
-fn host_from_base_url(base_url: &str) -> Option<String> {
-    let after_scheme = base_url.split("://").nth(1).unwrap_or(base_url);
-    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
-    let host = authority
-        .rsplit_once(':')
-        .map_or(authority, |(host, _)| host);
-    (!host.is_empty()).then(|| host.to_owned())
-}
-
 /// If the local instance backing the chat endpoint is not yet answering,
 /// explain why so an in-flight request reads as "the model is still coming up"
 /// rather than an unexplained spinner. Matched to a daemon-surfaced instance by
 /// host + port (daemon-tracked instances are always co-located, so only a
 /// loopback endpoint can be one of them — a remote gateway must never
 /// false-match just because it happens to share a port number with a local
-/// instance); returns `None` when the endpoint looks live, is remote, or
-/// isn't a managed instance we can see (caller then shows the plain spinner).
+/// instance).
+///
+/// Returns `None` when the endpoint is remote, isn't a managed instance we can
+/// see, or the instance is serving/unknown — the caller then shows the plain
+/// spinner. Note `Running` is not a hard HTTP-readiness guarantee: the daemon
+/// collapses `ready`/`running`/`starting` into `Running` today, so the
+/// `Starting`/`Stopped`/`Error` reasons below only reach production once the
+/// status-signal work (#106 EAI-7354, #107 EAI-7355) lands beneath this change.
 fn chat_backend_wait_reason(state: &AppState) -> Option<String> {
     let base_url = &state.chat_llm.as_ref()?.base_url;
-    let port = port_from_base_url(base_url)?;
-    let host = host_from_base_url(base_url)?;
+    // Reuse the crate's authority parser: it strips the brackets from an IPv6
+    // loopback (`http://[::1]:8000` → host `::1`) that a hand-rolled
+    // `rsplit(':')` would mangle, and defaults the port from the scheme.
+    let (host, port) = crate::llm::parse_host_port(base_url)?;
     if !crate::llm::is_loopback_host(&host) {
         return None;
     }
@@ -325,6 +310,8 @@ fn chat_backend_wait_reason(state: &AppState) -> Option<String> {
     }
 }
 
+/// Render the single-row input line. While focused, a caret glyph trails the
+/// buffer; otherwise a muted hint invites focus.
 fn draw_input(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // While a request is in flight, show a spinner and suppress the caret —
     // input is disabled until the reply or error turn lands. When the backing
@@ -488,35 +475,6 @@ mod tests {
         assert!(out.contains("use & save"));
     }
 
-    #[test]
-    fn port_from_base_url_parses_local_endpoints() {
-        assert_eq!(port_from_base_url("http://127.0.0.1:8000/v1"), Some(8000));
-        assert_eq!(port_from_base_url("http://localhost:11435"), Some(11435));
-        // Remote gateway (no explicit port) and a bare host yield None.
-        assert_eq!(port_from_base_url("https://gateway.example.com/v1"), None);
-        assert_eq!(port_from_base_url("http://127.0.0.1"), None);
-    }
-
-    #[test]
-    fn host_from_base_url_parses_local_and_remote_endpoints() {
-        assert_eq!(
-            host_from_base_url("http://127.0.0.1:8000/v1"),
-            Some("127.0.0.1".to_owned())
-        );
-        assert_eq!(
-            host_from_base_url("http://localhost:11435"),
-            Some("localhost".to_owned())
-        );
-        assert_eq!(
-            host_from_base_url("https://gateway.example.com:8000/v1"),
-            Some("gateway.example.com".to_owned())
-        );
-        assert_eq!(
-            host_from_base_url("http://127.0.0.1"),
-            Some("127.0.0.1".to_owned())
-        );
-    }
-
     fn accepted_chat_at_port(port: u16) -> AppState {
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.active_tab = crate::app::ActiveTab::Chat;
@@ -566,6 +524,30 @@ mod tests {
         // A mismatched port is not our endpoint.
         set_backing_instance(&mut s, 9999, InstanceStatus::Starting);
         assert_eq!(chat_backend_wait_reason(&s), None);
+    }
+
+    #[test]
+    fn backend_wait_reason_matches_bracketed_ipv6_loopback() {
+        // A bracketed IPv6 loopback endpoint must still resolve to its backing
+        // instance: the shared authority parser strips the brackets so
+        // `is_loopback_host` sees `::1`. A hand-rolled `rsplit(':')` used to
+        // mangle this (`[::1]` host / `1]` port) and silently disable the reason.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = crate::app::ActiveTab::Chat;
+        let llm = crate::llm::LlmConfig {
+            base_url: "http://[::1]:8000/v1".into(),
+            model: "m".into(),
+            api_key: None,
+            auth_header: None,
+        };
+        s.set_chat_config(Some(llm), true);
+        set_backing_instance(&mut s, 8000, InstanceStatus::Starting);
+        assert!(
+            chat_backend_wait_reason(&s)
+                .unwrap()
+                .contains("starting up"),
+            "bracketed IPv6 loopback should resolve to its backing instance"
+        );
     }
 
     #[test]
