@@ -1,10 +1,48 @@
 
 # WIP: E2E BDD tests for rocm-cli (PR #69, cucumber-rs)
 
-**Stage:** 20-full-suite-green-under-cap-xpass-fixed-fc4687b
+**Stage:** 21-merged-to-PR-blocking-green-hash23-fix-strix-probe-dispatched
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
-**Last Updated:** 2026-07-14 (idle flush)
+**Last Updated:** 2026-07-14
+
+## ✅ MERGED TO PR + #23 FIX (2026-07-14) — READ FIRST
+
+**All session work is now on the PR branch (test/add-e2e-robot-framework), NOT just scratch.**
+Cherry-picked the 4 substantive scratch commits (dropped the 2 temp-flag ones as churn); PR
+tree == validated scratch tree. PR head progression: 0e6c80e → e6a37d5 (uv cache) → 0d14482
+(share-one-runtime) → c782cc9 (pre-warm in-place) → c10fc35 (EAI-7221 xfail drop) → e21d68e
+(#23 recipe-aware) → 064a714 (temp Strix name_filter). All signed (1Password Touch ID now that
+user is at the Mac; the launchd ssh-add -t 8h had expired).
+
+**PR #69 checks: ALL BLOCKING GREEN** (18 pass / 2 fail; the 2 fails are the NON-BLOCKING Strix
+jobs = the #23 issue being fixed). Confirmed: Commit signatures ✅, clippy ✅, mock E2E ✅,
+build-and-test ✅, windows-build-and-test ✅, and **E2E tests (GPU) ✅ in 35m42s** (share-one-
+runtime validated on the PR branch, under cap). CodeQL alert #682 (path-injection on the new
+validated_shared_dir) dismissed "used in tests" (same as #680); 0 unresolved threads.
+
+**#23 ROOT CAUSE (investigated on MI300X) + FIX (e21d68e):** `rocm serve <model>` with no
+--engine is RECIPE-driven, not platform-driven — it resolves the request to the recipe's
+preferred model+engine, which can differ from what was requested (a safetensors request
+resolved to a GGUF recipe on lemonade, even on MI300X). The scenarios hardcoded the requested
+model in the readiness wait → timed out when the recipe resolved elsewhere. Fix: wait on the
+model the CLI ACTUALLY resolved (parse `resolved model:` from the serve plan) via new
+resolved_model() + ready_substr_for() helpers (+ dedup 2 existing parses). Re-keyed the
+Instinct xfail EAI-7333 → EAI-7052 (the default serve resolves to lemonade GGUF, whose Vulkan
+backend hangs on Instinct — vLLM isn't used, so EAI-7333 was wrong). Verified on MI300X:
+scenario 6 passes (was timing out); the lemonade GGUF serve is flaky on Instinct (EAI-7052).
+
+**STRIX PROBE DISPATCHED (run 29332985258):** scoped to the 2 serve-default-engine-* scenarios
+on strix-ubuntu, to validate the recipe-aware fix on the lemonade-NATIVE path (where I can't
+test by hand — no Strix box access). Monitoring (cron efeb8444). Question it answers: do the 2
+scenarios now PASS on Strix, or need a Strix xfail too? Temp name_filter input (064a714) drives
+the scoping — REMOVE after this validates.
+
+**NEXT:** (1) read Strix probe result → finalize #23 (pass, or add Strix xfail); (2) remove the
+temp name_filter commit; (3) rominf re-review still pending (his CHANGES_REQUESTED predates all
+this — nothing left unresolved on our side).
+
+---
 
 ## 🎉 ORIGINAL GOAL ACHIEVED — FULL GPU SUITE UNDER CAP (2026-07-14) — READ FIRST
 
