@@ -1,7 +1,7 @@
 
 # WIP: E2E BDD tests for rocm-cli (PR #69, cucumber-rs)
 
-**Stage:** 17-prewarm-mv-bug-fixed-021b14c-reprobe-29321270536
+**Stage:** 18-share-one-runtime-VALIDATED-in-CI-run-29321270536-green
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-14
@@ -32,11 +32,23 @@ mv. Baked manifest paths stay valid; each scenario's data/runtimes symlink resol
 real tree. Applied to BOTH ci.yml e2e-gpu + nightly e2e-gpu-nightly. Re-proved by hand:
 symlink-to-in-place-install → serve READY 75s + real chat completion.
 
-**RE-DISPATCHED:** run **29321270536** (021b14c), same scoped 3-scenario probe. Monitoring
-(cron 3f5d8b3d). Expect: all 3 pass, no 'rocm serve failed'. Box cleaned (stale e2e-runtimes
-+ e2e-prewarm removed; GPU VRAM back to ~297MB).
+**✅ RE-PROBE GREEN — SHARE-ONE-RUNTIME VALIDATED IN CI (run 29321270536, 021b14c):**
+`3 scenarios (3 passed), 0 unexpected failures`, total wall ~5 min (11:20→11:25 CEST):
+- Pre-warm ran once in place (~2 min), tree valid at e2e-prewarm/data/runtimes.
+- `serve-vllm-inference` (shared) ✔ serve+chat; `serve-readiness-contract` (shared) ✔
+  reused same runtime, immediate inference; `runtime-install-sdk-active` (isolated) ✔ clean
+  slate + real install. Exactly the intended behavior: ONE install, serves reuse it, clean-
+  slate stays isolated. The mv-invalidated-paths bug is gone.
 
-**Container gate run before push (per user rule).** name_filter dispatch input still TEMP.
+**Container gate run before push (per user rule).**
+
+**NEXT:**
+1. Remove the TEMP `name_filter` dispatch input (ci.yml) — it was only for scoped probes.
+2. Dispatch the FULL app-dev-gpu suite on scratch to confirm the whole thing finishes under
+   90min with install-once (the original goal). NOTE: the shared runtime now persists at
+   e2e-prewarm on the runner, so that run's pre-warm is a no-op.
+3. Bring #22 (uv cache) + share-one-runtime to the PR branch. rominf re-review still pending.
+4. #23 (Strix default-engine) still open.
 
 ---
 **Token Usage:** in=12024 out=3725255 cache_create=47997275 cache_read=2277540752 calls=6034
