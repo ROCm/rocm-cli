@@ -5,12 +5,13 @@
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_gpu_diagnostics,
-    detect_host_therock_family, detect_managed_therock_family, ensure_uv_binary, managed_tools_dir,
-    normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
-    normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_storage,
-    normalize_therock_family, runtime_is_windows, runtime_os_name, runtime_path_for_windows_child,
-    runtime_path_list_split, runtime_python_executable_in_env, unix_time_millis, uv_command_env,
-    uv_pip_install_base, uv_venv_args, verify_rsa_pkcs1_sha256_signature,
+    detect_host_therock_family, detect_managed_therock_family, ensure_uv_binary,
+    known_therock_families, managed_tools_dir, normalize_runtime_path_for_host,
+    normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
+    normalize_runtime_path_text_for_storage, normalize_therock_family, runtime_is_windows,
+    runtime_os_name, runtime_path_for_windows_child, runtime_path_list_split,
+    runtime_python_executable_in_env, unix_time_millis, uv_command_env, uv_pip_install_base,
+    uv_venv_args, verify_rsa_pkcs1_sha256_signature,
 };
 #[cfg(test)]
 use rocm_core::{generate_rsa_signing_keypair, sign_rsa_pkcs1_sha256_signature};
@@ -1131,9 +1132,15 @@ fn resolve_pip_runtime_with_timeout(
         }
     }
     bail!(
-        "failed to resolve TheRock {} wheel runtime from candidate indexes:\n  - {}",
+        "failed to resolve TheRock {} wheel runtime from candidate indexes:\n  - {}\n\n{}",
         channel.as_str(),
-        errors.join("\n  - ")
+        errors.join("\n  - "),
+        family_resolution_hint(
+            &family_resolution.source,
+            &family_resolution.family,
+            channel,
+            "wheel",
+        )
     )
 }
 
@@ -1249,9 +1256,17 @@ fn resolve_tarball_artifact_with_timeout(
             .unwrap_or(Ordering::Equal)
             .then_with(|| compare_version_strings(&left.1, &right.1))
     });
-    let (file, version) = candidates
-        .pop()
-        .context("no matching TheRock tarball artifact was found for the resolved GPU family")?;
+    let (file, version) = candidates.pop().with_context(|| {
+        format!(
+            "no matching TheRock tarball artifact was found for the resolved GPU family\n\n{}",
+            family_resolution_hint(
+                &family_resolution.source,
+                &family_resolution.family,
+                channel,
+                "tarball",
+            )
+        )
+    })?;
     Ok(TarballArtifact {
         family: family_resolution.family,
         family_source: family_resolution.source,
@@ -1299,7 +1314,10 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
     }
 
     bail!(
-        "unable to resolve a supported TheRock GPU family for this host\n\n{}",
+        "unable to resolve a supported TheRock GPU family for this host.\n\
+         Re-run with an explicit package family: `rocm install sdk --family <FAMILY>`.\n\
+         Recognized families: {}.\n\n{}",
+        known_therock_families().join(", "),
         detect_host_gpu_diagnostics()
     )
 }
@@ -3170,6 +3188,71 @@ fn therock_index_urls(channel: TheRockChannel, family: &str) -> Vec<String> {
     }
 }
 
+/// Recovery guidance appended to family/index resolution failures so a clean
+/// first run can recover without the user having to guess a `--family`.
+///
+/// `source` is the [`FamilyResolution::source`] that produced `family`:
+/// auto-detected (`host`, `managed-runtime`) versus user-supplied (`manifest`
+/// from `--family`, `env` from `ROCM_CLI_THEROCK_FAMILY`). The wording differs
+/// so an auto-detected miss points the user at `--family`, while a user-supplied
+/// miss confirms the family they already named. Both point at the other channel
+/// and, where valid for the platform, the other install format.
+fn family_resolution_hint(
+    source: &str,
+    family: &str,
+    channel: TheRockChannel,
+    format: &str,
+) -> String {
+    let families = known_therock_families().join(", ");
+    let auto_detected = matches!(source, "host" | "managed-runtime");
+    let mut hint = String::new();
+
+    if auto_detected {
+        let _ = write!(
+            hint,
+            "no installable TheRock {} runtime was found for the auto-detected GPU family `{family}`.\n\
+             Re-run with an explicit package family: `rocm install sdk --family <FAMILY>`.\n\
+             Recognized families: {families}.",
+            channel.as_str()
+        );
+    } else {
+        let _ = write!(
+            hint,
+            "no installable TheRock {} runtime was found for the requested package family `{family}`.\n\
+             Recognized families: {families}.",
+            channel.as_str()
+        );
+    }
+
+    let other_channel = match channel {
+        TheRockChannel::Release => "nightly",
+        TheRockChannel::Nightly => "release",
+    };
+    let alternate_format = match format {
+        "wheel" if !runtime_is_windows() => Some("tarball"),
+        "tarball" => Some("wheel"),
+        _ => None,
+    };
+    match alternate_format {
+        Some(alternate_format) => {
+            let _ = write!(
+                hint,
+                "\nIf your GPU is newer than the {} packages, try `--channel {other_channel}` or `--format {alternate_format}`.",
+                channel.as_str()
+            );
+        }
+        None => {
+            let _ = write!(
+                hint,
+                "\nIf your GPU is newer than the {} packages, try `--channel {other_channel}`.",
+                channel.as_str()
+            );
+        }
+    }
+
+    hint
+}
+
 const fn platform_tarball_token() -> &'static str {
     if runtime_is_windows() {
         "windows"
@@ -4056,6 +4139,37 @@ echo Python 3.12.10
         assert_eq!(resolution.source, "managed-runtime");
         let _ = fs::remove_dir_all(root);
         Ok(())
+    }
+
+    #[test]
+    fn family_resolution_hint_for_auto_detected_points_at_family_flag() {
+        let hint = family_resolution_hint("host", "gfx950-dcgpu", TheRockChannel::Release, "wheel");
+
+        assert!(hint.contains("auto-detected GPU family `gfx950-dcgpu`"));
+        assert!(hint.contains("--family <FAMILY>"));
+        // Lists recognized families the user can pass instead.
+        assert!(hint.contains("gfx110X-all"));
+        // Points at the other channel as an escape hatch.
+        assert!(hint.contains("--channel nightly"));
+    }
+
+    #[test]
+    fn family_resolution_hint_for_user_supplied_frames_around_requested_family() {
+        let hint =
+            family_resolution_hint("manifest", "gfx110X-all", TheRockChannel::Release, "wheel");
+
+        assert!(hint.contains("requested package family `gfx110X-all`"));
+        // A family the user named themselves is not described as auto-detected.
+        assert!(!hint.contains("auto-detected"));
+        assert!(!hint.contains("--family <FAMILY>"));
+        assert!(hint.contains("--channel nightly"));
+    }
+
+    #[test]
+    fn family_resolution_hint_suggests_release_channel_from_nightly() {
+        let hint = family_resolution_hint("host", "gfx950-dcgpu", TheRockChannel::Nightly, "wheel");
+
+        assert!(hint.contains("--channel release"));
     }
 
     #[test]

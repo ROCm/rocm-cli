@@ -2801,6 +2801,38 @@ pub fn normalize_therock_family(value: &str) -> Option<String> {
     }
 }
 
+/// The TheRock package families the CLI recognizes.
+///
+/// This is the full set of values [`normalize_therock_family`] can produce. Used
+/// to tell the user which `--family` values are valid when GPU auto-detection
+/// cannot resolve an installable runtime. Whether a given family currently has
+/// published wheels depends on the channel and release; recognition here does
+/// not guarantee availability.
+///
+/// Kept in sync with [`normalize_therock_family`] by
+/// `known_therock_families_all_round_trip` — every entry must normalize back to
+/// itself.
+pub const fn known_therock_families() -> &'static [&'static str] {
+    &[
+        "gfx90X-dgpu",
+        "gfx90X-dcgpu",
+        "gfx900",
+        "gfx906",
+        "gfx908",
+        "gfx90a",
+        "gfx94X-dcgpu",
+        "gfx950-dcgpu",
+        "gfx101X-dgpu",
+        "gfx103X-dgpu",
+        "gfx110X-all",
+        "gfx1150",
+        "gfx1151",
+        "gfx1152",
+        "gfx1153",
+        "gfx120X-all",
+    ]
+}
+
 fn capture_optional_command(program: &str, args: &[&str]) -> Option<String> {
     capture_optional_command_with_timeout(program, args, OPTIONAL_COMMAND_TIMEOUT)
 }
@@ -6125,6 +6157,22 @@ mod tests {
             normalize_therock_family("gfx94X-dcgpu"),
             Some("gfx94X-dcgpu".to_owned())
         );
+    }
+
+    #[test]
+    fn known_therock_families_all_round_trip() {
+        for family in known_therock_families() {
+            assert_eq!(
+                normalize_therock_family(family).as_deref(),
+                Some(*family),
+                "known family `{family}` must normalize back to itself"
+            );
+        }
+    }
+
+    #[test]
+    fn known_therock_families_is_not_empty() {
+        assert!(!known_therock_families().is_empty());
     }
 
     #[test]
