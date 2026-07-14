@@ -66,8 +66,7 @@ impl BenchRunState {
         } else {
             (
                 None,
-                "~/.rocm/bench/rocm-bench-<ts>.csv (set bench-results-dir for live updates)"
-                    .to_string(),
+                "<data_dir>/bench/results.csv (shared CLI and daemon default)".to_string(),
             )
         };
         Self {
@@ -193,7 +192,7 @@ fn try_submit(br: &mut Option<BenchRunState>, jobs: &mut State) -> Vec<SideEffec
     }
 
     // Resolve the output path: use the explicit Out field, else the tailed path,
-    // else let the CLI use its default timestamp file.
+    // else let the CLI derive its shared `<data_dir>/bench/results.csv` default.
     let out = state.out.trim().to_string();
     if !out.is_empty() {
         args.push("--out".to_string());
@@ -209,7 +208,11 @@ fn try_submit(br: &mut Option<BenchRunState>, jobs: &mut State) -> Vec<SideEffec
         cmd,
         args,
     });
-    // Close the form after spawning (the job console is shown by the job-bridge).
+    if fx.is_empty() {
+        state.message = Some("a bench run is already running".to_string());
+        return fx;
+    }
+    // Close the form only after spawning (the job console is shown by the job-bridge).
     *br = None;
     fx
 }
@@ -511,6 +514,33 @@ mod tests {
             }
             other => panic!("expected SpawnJob, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn duplicate_submit_keeps_form_open_with_message() {
+        let mut jobs = State::default();
+        let mut first = with_endpoint("http://127.0.0.1:8000");
+        assert_eq!(on_key(&mut first, &mut jobs, key(KeyCode::Enter)).len(), 1);
+
+        let mut duplicate = with_endpoint("http://127.0.0.1:8000");
+        let fx = on_key(&mut duplicate, &mut jobs, key(KeyCode::Enter));
+
+        assert!(fx.is_empty());
+        let state = duplicate.expect("deduplicated submission must keep form open");
+        assert!(
+            state
+                .message
+                .as_deref()
+                .unwrap_or("")
+                .contains("already running")
+        );
+    }
+
+    #[test]
+    fn empty_out_hint_describes_shared_default_results_file() {
+        let state = BenchRunState::new(None);
+        assert!(state.default_out_hint.contains("bench/results.csv"));
+        assert!(!state.default_out_hint.contains("<ts>"));
     }
 
     #[test]

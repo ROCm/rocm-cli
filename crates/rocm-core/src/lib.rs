@@ -3926,26 +3926,6 @@ const fn default_instance_tick_secs() -> f64 {
     2.0
 }
 
-/// Default CSV file the telemetry daemon tails for normalized benchmark rows:
-/// `<data_dir>/bench/results.csv`. Despite the field's `_dir` name this is a
-/// single file (`CsvBenchTailer` opens it directly), and `rocm bench load`
-/// appends to this exact path by default when `--out` is omitted (see
-/// `apps/rocm/src/dash.rs::run_bench`), so a plain CLI run — with no config
-/// edits — is picked up by the daemon and shows up in the dashboard's Bench
-/// panel.
-///
-/// Resolves the data directory through the SAME `AppPaths::discover()` the
-/// producer uses (not the bare `default_data_dir()`), so the `ROCM_CLI_DATA_DIR`
-/// override and host path normalization are honored identically on both sides —
-/// otherwise, with the override set, `rocm bench load` would write a file the
-/// daemon never tails. Falls back to `None` only if `AppPaths::discover()`
-/// itself fails (no `$HOME`, no OS project-dirs fallback).
-fn default_bench_results_dir() -> Option<PathBuf> {
-    AppPaths::discover()
-        .ok()
-        .map(|paths| paths.data_dir.join("bench").join("results.csv"))
-}
-
 /// Telemetry daemon operational spec. Tick cadences are stored as f64 seconds in
 /// the unified JSON config; use the `*_tick()` accessors for `Duration`s.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -3962,11 +3942,10 @@ pub struct DashboardDaemonConfig {
     pub discovery_tick_secs: f64,
     #[serde(default = "default_instance_tick_secs")]
     pub instance_tick_secs: f64,
-    /// Watch this file for new normalized benchmark CSV rows.
-    #[serde(
-        default = "default_bench_results_dir",
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// Watch this file for new normalized benchmark CSV rows. When unset, the
+    /// daemon derives `<data_dir>/bench/results.csv` from the current `AppPaths`
+    /// at startup so machine-specific paths are never persisted in config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bench_results_dir: Option<PathBuf>,
 }
 
@@ -3978,7 +3957,7 @@ impl Default for DashboardDaemonConfig {
             gpu_tick_secs: default_gpu_tick_secs(),
             discovery_tick_secs: default_discovery_tick_secs(),
             instance_tick_secs: default_instance_tick_secs(),
-            bench_results_dir: default_bench_results_dir(),
+            bench_results_dir: None,
         }
     }
 }
@@ -7873,23 +7852,15 @@ Class Name:                Display
     }
 
     #[test]
-    fn default_bench_results_dir_matches_app_paths_data_dir() {
-        // EAI-7361: the Bench panel stayed permanently empty because this
-        // default was `None` — the daemon never tailed any file for
-        // normalized CSV rows unless the user hand-edited the config, even
-        // after running `rocm bench load`. It must resolve to the SAME
-        // `<data_dir>/bench/results.csv` file `rocm bench load` appends to by
-        // default, using the same `AppPaths::discover()` resolution (which
-        // honors `ROCM_CLI_DATA_DIR` and host normalization) rather than the
-        // bare `default_data_dir()` — see `apps/rocm/src/dash.rs::run_bench`.
-        if let Ok(paths) = AppPaths::discover() {
-            let expected = paths.data_dir.join("bench").join("results.csv");
-            assert_eq!(default_bench_results_dir(), Some(expected.clone()));
-            assert_eq!(
-                DashboardDaemonConfig::default().bench_results_dir,
-                Some(expected)
-            );
-        }
+    fn dashboard_bench_results_path_is_derived_not_persisted() {
+        let config = DashboardDaemonConfig::default();
+        assert_eq!(config.bench_results_dir, None);
+
+        let json = serde_json::to_value(config).unwrap();
+        assert!(
+            json.get("bench_results_dir").is_none(),
+            "machine-specific derived path must not be serialized"
+        );
     }
 
     #[test]

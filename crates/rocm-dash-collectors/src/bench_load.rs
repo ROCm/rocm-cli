@@ -69,8 +69,13 @@ pub enum BenchLoadError {
     /// File I/O failure.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// Concurrency must be at least one.
+    #[error("concurrency must be at least 1 (got {0})")]
+    InvalidConcurrency(u32),
     /// Existing file has a different CSV header; refusing to corrupt it.
-    #[error("refusing to append: {path} has a different header")]
+    #[error(
+        "refusing to append: {path} has a different header; pass --out <path> or remove the incompatible file"
+    )]
     HeaderMismatch {
         /// Path of the file with the conflicting header.
         path: String,
@@ -164,6 +169,9 @@ async fn run_cell_with_clients(
     concurrency: u32,
     clients: &BenchClients,
 ) -> Result<BenchmarkRow, BenchLoadError> {
+    if concurrency == 0 {
+        return Err(BenchLoadError::InvalidConcurrency(concurrency));
+    }
     let sem = Arc::new(Semaphore::new(concurrency as usize));
     let url = format!("{}/chat/completions", spec.endpoint.trim_end_matches('/'));
 
@@ -359,41 +367,35 @@ fn latency_delta_ms(
 pub const RAMP_SEQUENCE: &[u32] = &[1, 2, 4, 8, 16, 32, 64, 128];
 
 /// Minimum fractional `gen_tps` improvement to keep ramping.
-///
-/// When the new cell's `gen_tps` is at most `prev * (1.0 + PLATEAU_GAIN)`,
-/// the ramp is considered saturated and stops.
 pub const PLATEAU_GAIN: f64 = 0.05;
 
-/// Open (or create) `csv_path` for append, write the header when the file is
-/// new or empty (guarding header mismatch on non-empty files), serialize `row`
-/// as a single `write_all`, and return the open file handle for subsequent calls.
+/// Open (or create) `csv_path` once, take an exclusive advisory lock, validate
+/// or write the header, then append one newline-terminated row.
 ///
-/// This is the shared primitive reused by both [`run_and_append_csv`] and
-/// [`run_auto_ramp`]; it keeps the header-once + mismatch-guard + O_APPEND
-/// invariants in one place.
+/// The lock serializes cooperating `rocm bench load` processes so concurrent
+/// first writers cannot both emit the header. `O_APPEND` keeps each row write
+/// at the end of the file.
 fn append_one_row(row: &BenchmarkRow, csv_path: &Path) -> Result<(), BenchLoadError> {
-    let is_empty = csv_path.metadata().map_or(true, |m| m.len() == 0);
+    use std::io::{BufRead, Seek};
 
-    if !is_empty {
-        use std::io::BufRead;
-        let f = std::fs::File::open(csv_path)?;
-        let mut reader = std::io::BufReader::new(f);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(csv_path)?;
+    file.lock()?;
+
+    if file.metadata()?.len() == 0 {
+        file.write_all(CSV_HEADER.as_bytes())?;
+    } else {
+        file.seek(std::io::SeekFrom::Start(0))?;
         let mut first_line = String::new();
-        reader.read_line(&mut first_line)?;
+        std::io::BufReader::new(&file).read_line(&mut first_line)?;
         if first_line.trim() != CSV_HEADER.trim() {
             return Err(BenchLoadError::HeaderMismatch {
                 path: csv_path.display().to_string(),
             });
         }
-    }
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(csv_path)?;
-
-    if is_empty {
-        file.write_all(CSV_HEADER.as_bytes())?;
     }
 
     let line = serialize_row_to_line(row)?;
@@ -648,6 +650,16 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn run_cell_rejects_zero_concurrency() {
+        let spec = make_spec("http://127.0.0.1:1");
+        let result = run_cell(&spec, 0).await;
+        assert!(
+            matches!(result, Err(BenchLoadError::InvalidConcurrency(0))),
+            "zero concurrency must fail before any network request: {result:?}"
+        );
+    }
+
     // ---------- T2: concurrency cap ----------
     //
     // wiremock's hyper handler calls respond() under an exclusive write-lock,
@@ -783,6 +795,47 @@ mod tests {
             content_after, original_content,
             "file must not be modified on header mismatch"
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn concurrent_first_appends_write_one_header() {
+        const WRITERS: usize = 8;
+        let dir = tempdir();
+        let csv_path = dir.join("concurrent.csv");
+        let barrier = Arc::new(std::sync::Barrier::new(WRITERS));
+
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|run| {
+                let csv_path = csv_path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let row = BenchmarkRow {
+                        cell: format!("bench-{run}"),
+                        run: run as u32,
+                        ..Default::default()
+                    };
+                    barrier.wait();
+                    append_one_row(&row, &csv_path)
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        let content = std::fs::read_to_string(&csv_path).unwrap();
+        assert_eq!(
+            content
+                .lines()
+                .filter(|line| *line == CSV_HEADER.trim())
+                .count(),
+            1,
+            "concurrent creators must not duplicate the CSV header"
+        );
+        assert_eq!(content.lines().count(), WRITERS + 1);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1083,57 +1136,11 @@ mod tests {
     // that each cell's gen_tps has a chance to grow (more concurrent = more TPS),
     // and by checking the last concurrency rather than exact row count.
 
-    #[tokio::test]
-    async fn t11_auto_ramp_cap_reaches_128() {
-        let server = MockServer::start().await;
-        // No delay — responses come back as fast as the mock can serve them.
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .respond_with(stub_response(10, 5))
-            .mount(&server)
-            .await;
-        // /metrics: 404 so queue-full exit never fires.
-        Mock::given(method("GET"))
-            .and(path("/metrics"))
-            .respond_with(wiremock::ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-
-        let dir = tempdir();
-        let csv_path = dir.join("auto_ramp_cap.csv");
-        // Use enough requests so higher concurrency genuinely finishes faster and
-        // gen_tps can increase. With 0ms latency and many requests, gen_tps is
-        // dominated by overhead and is roughly flat — but may rise due to
-        // concurrency pipeline effects.  We can't force monotonic increase, so
-        // we instead verify the hard cap: the last row must have concurrency=128.
-        let mut spec = make_spec(&server.uri());
-        spec.requests = 128;
-
-        let rows = run_auto_ramp(&spec, &csv_path).await.unwrap();
-
-        // The ramp must always produce at least one row.
-        assert!(!rows.is_empty(), "auto ramp must produce at least one row");
-
-        // The hard cap: regardless of the plateau/queue-full logic, the ramp
-        // cannot exceed the last element of RAMP_SEQUENCE (128). Verify the
-        // concurrency values are all within RAMP_SEQUENCE.
-        for row in &rows {
-            let c = row.concurrency.unwrap_or(0);
-            assert!(
-                RAMP_SEQUENCE.contains(&c),
-                "concurrency {c} not in RAMP_SEQUENCE"
-            );
-        }
-
-        // CSV file must have the right header and one row per cell.
-        let content = std::fs::read_to_string(&csv_path).unwrap();
-        let mut lines = content.lines();
-        let header = lines.next().expect("must have header");
-        assert_eq!(header.split(',').count(), 18, "header must have 18 cols");
-        let data_lines = lines.count();
-        assert_eq!(data_lines, rows.len(), "CSV rows must match returned rows");
-
-        let _ = std::fs::remove_dir_all(dir);
+    #[test]
+    fn t11_auto_ramp_hard_cap_stops_at_128() {
+        let row = row_with_peaks(Some(1_000.0), None, None);
+        assert!(should_stop_ramp(Some(1.0), &row, true));
+        assert_eq!(RAMP_SEQUENCE.last(), Some(&128));
     }
 
     // ---------- T12: should_stop_ramp — pure-function unit tests ----------

@@ -43,7 +43,11 @@ pub fn runner_options(
 ) -> RunnerOptions {
     let d = &config.dashboard.daemon;
     RunnerOptions {
-        bench_csv: d.bench_results_dir.clone(),
+        bench_csv: Some(
+            d.bench_results_dir
+                .clone()
+                .unwrap_or_else(|| default_bench_csv_path(paths)),
+        ),
         enable_docker,
         image_patterns: None,
         gpu_tick: Duration::from_secs_f64(d.gpu_tick_secs),
@@ -340,6 +344,16 @@ fn default_bench_csv_path(paths: &AppPaths) -> std::path::PathBuf {
     paths.data_dir.join("bench").join("results.csv")
 }
 
+fn ensure_bench_csv_parent(csv_path: &std::path::Path) -> Result<()> {
+    if let Some(parent) = csv_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating bench output dir {}", parent.display()))?;
+    }
+    Ok(())
+}
+
 /// Entry point for `rocm bench load`.
 ///
 /// Runs a concurrency sweep against a local http:// endpoint and appends one
@@ -383,22 +397,13 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
     };
 
     // Resolve the output path: default to the same `<data_dir>/bench/results.csv`
-    // file the daemon tails by default (`DashboardDaemonConfig::bench_results_dir`,
-    // rocm-core/src/lib.rs), so a plain `rocm bench load` run — no config edits,
-    // no explicit --out — shows up in the dashboard's Bench panel. Rows are
-    // appended (see `run_and_append_csv` / `run_auto_ramp` below), matching the
-    // "tail" semantics the daemon's `CsvBenchTailer` expects.
-    let csv_path = if let Some(p) = out {
-        p
-    } else {
-        let paths = AppPaths::discover()?;
-        let default_path = default_bench_csv_path(&paths);
-        if let Some(parent) = default_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating bench output dir {}", parent.display()))?;
-        }
-        default_path
+    // file the daemon tails. Rows are appended, matching the `CsvBenchTailer`
+    // semantics. Create parents for explicit and default paths alike.
+    let csv_path = match out {
+        Some(path) => path,
+        None => default_bench_csv_path(&AppPaths::discover()?),
     };
+    ensure_bench_csv_parent(&csv_path)?;
 
     let spec = LoadSpec {
         endpoint: endpoint.clone(),
@@ -601,36 +606,36 @@ mod tests {
     }
 
     #[test]
-    fn default_bench_csv_path_matches_the_daemon_tailed_default() {
-        // EAI-7361: `rocm bench load` with no `--out` must land in the exact
-        // same file the daemon tails by default
-        // (`DashboardDaemonConfig::bench_results_dir`, rocm-core/src/lib.rs),
-        // or a plain CLI run never shows up in the dashboard's Bench panel.
+    fn runner_options_derives_default_bench_csv_from_current_paths() {
         let p = paths();
-        assert_eq!(
-            default_bench_csv_path(&p),
-            p.data_dir.join("bench").join("results.csv")
-        );
+        let opts = runner_options(&cfg(), &p, false);
+        assert_eq!(opts.bench_csv, Some(default_bench_csv_path(&p)));
     }
 
     #[test]
-    fn producer_and_daemon_bench_defaults_resolve_to_the_same_path() {
-        // EAI-7361 cross-binary invariant: the producer default (`rocm bench
-        // load`'s no-`--out` path, resolved from `AppPaths::discover`) and the
-        // daemon-tailed default (`DashboardDaemonConfig::bench_results_dir`)
-        // MUST resolve to the same absolute path — both use the same
-        // `AppPaths::discover` data-dir resolution (honoring
-        // `ROCM_CLI_DATA_DIR` and host normalization), so a plain CLI run is
-        // always what the daemon tails. Guard on `discover()` succeeding
-        // ($HOME is set in CI/dev); skip rather than assert an uncontrolled
-        // value otherwise.
-        if let Ok(p) = AppPaths::discover() {
-            assert_eq!(
-                Some(default_bench_csv_path(&p)),
-                rocm_core::DashboardDaemonConfig::default().bench_results_dir,
-                "producer default and daemon-tailed default must be identical"
-            );
-        }
+    fn runner_options_preserves_explicit_bench_csv_override() {
+        let p = paths();
+        let mut config = cfg();
+        let explicit = PathBuf::from("/var/rocm/custom-bench.csv");
+        config.dashboard.daemon.bench_results_dir = Some(explicit.clone());
+
+        let opts = runner_options(&config, &p, false);
+        assert_eq!(opts.bench_csv, Some(explicit));
+    }
+
+    #[test]
+    fn ensure_bench_csv_parent_creates_explicit_output_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-bench-parent-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let csv = root.join("nested").join("results.csv");
+
+        ensure_bench_csv_parent(&csv).unwrap();
+        assert!(csv.parent().unwrap().is_dir());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
