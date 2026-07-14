@@ -190,6 +190,15 @@ pub fn collect_versions(runtimes_dir: Option<&std::path::Path>) -> PlatformVersi
 /// Read the active managed runtime's `(version, install_root)` from the runtimes
 /// registry: prefer the runtime named by `active.json`, else the sole installed
 /// manifest. Returns `None` when nothing is installed.
+///
+/// The install_root is resolved from `runtimes_dir` (the shared tree we were
+/// handed) as `<runtimes_dir>/wheel/<runtime_key>`, NOT from the manifest's own
+/// `install_root` field. That field records the absolute path where the runtime
+/// was first installed — on Strix a per-scenario temp dir that no longer exists
+/// by report time — so trusting it made `vllm`/`lemonade` probe a dead path and
+/// come back `None`. On MI300X the two coincide (prewarm installs in place),
+/// which is why it worked there but not on Strix. Falls back to the manifest
+/// path if the derived one is absent, for any tree that predates the wheel layout.
 fn active_runtime_install_root(
     runtimes_dir: &std::path::Path,
 ) -> Option<(String, std::path::PathBuf)> {
@@ -220,8 +229,16 @@ fn active_runtime_install_root(
     let json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(pick).ok()?).ok()?;
     let version = json.get("version")?.as_str()?.to_owned();
-    let root = json.get("install_root")?.as_str()?;
-    Some((version, std::path::PathBuf::from(root)))
+    // Runtime key = the manifest file stem (e.g. release-wheel-gfx1151-7-13-0).
+    let key = pick.file_stem().and_then(|s| s.to_str());
+    // Resolve the root inside the shared tree first; fall back to the manifest's
+    // recorded install_root only if that derived path doesn't exist.
+    let derived = key.map(|k| runtimes_dir.join("wheel").join(k));
+    let root = match derived {
+        Some(d) if d.is_dir() => d,
+        _ => std::path::PathBuf::from(json.get("install_root")?.as_str()?),
+    };
+    Some((version, root))
 }
 
 /// Parse the vLLM version from the `vllm-<ver>.dist-info` directory in the
