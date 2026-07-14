@@ -226,24 +226,56 @@ fn active_runtime_install_root(
 
 /// Parse the vLLM version from the `vllm-<ver>.dist-info` directory in the
 /// runtime venv's site-packages (works without importing vllm).
+///
+/// The venv layout differs by OS: Linux/macOS put site-packages under
+/// `lib/python3.X/site-packages` (the minor version varies), Windows under
+/// `Lib/site-packages`. Locate it by probing both rather than hardcoding one, so
+/// vLLM is found on every platform where it's installed.
 fn vllm_version_from_venv(install_root: &std::path::Path) -> Option<String> {
-    let site = install_root.join("lib/python3.12/site-packages");
-    std::fs::read_dir(site).ok()?.find_map(|e| {
-        let name = e.ok()?.file_name().into_string().ok()?;
-        // "vllm-0.23.0+rocm723.dist-info" -> "0.23.0+rocm723"
-        name.strip_prefix("vllm-")?
-            .strip_suffix(".dist-info")
-            .map(str::to_owned)
-    })
+    site_packages_dirs(install_root)
+        .into_iter()
+        .find_map(|site| {
+            std::fs::read_dir(site).ok()?.find_map(|e| {
+                let name = e.ok()?.file_name().into_string().ok()?;
+                // "vllm-0.23.0+rocm723.dist-info" -> "0.23.0+rocm723"
+                name.strip_prefix("vllm-")?
+                    .strip_suffix(".dist-info")
+                    .map(str::to_owned)
+            })
+        })
+}
+
+/// Candidate `site-packages` directories for a runtime venv, across OS layouts.
+/// Windows: `Lib/site-packages`. Unix: `lib/python3.X/site-packages` for
+/// whatever python minor version the runtime shipped (globbed, not hardcoded).
+fn site_packages_dirs(install_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    // Windows layout.
+    dirs.push(install_root.join("Lib").join("site-packages"));
+    // Unix layout: enumerate lib/python3.* so the minor version isn't pinned.
+    if let Ok(entries) = std::fs::read_dir(install_root.join("lib")) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("python3"))
+            {
+                dirs.push(p.join("site-packages"));
+            }
+        }
+    }
+    dirs
 }
 
 /// Ask the embedded lemonade server for its version (`lemond --version` →
 /// "lemond version 10.6.0"). `None` if lemonade isn't installed in this runtime.
+///
+/// The binary is `lemond` on Unix and `lemond.exe` on Windows — try both.
 fn lemonade_version(install_root: &std::path::Path) -> Option<String> {
-    let lemond = install_root.join("engines/lemonade/runtime/lemond");
-    if !lemond.is_file() {
-        return None;
-    }
+    let runtime = install_root.join("engines/lemonade/runtime");
+    let lemond = [runtime.join("lemond"), runtime.join("lemond.exe")]
+        .into_iter()
+        .find(|p| p.is_file())?;
     let out = std::process::Command::new(&lemond)
         .arg("--version")
         .output()

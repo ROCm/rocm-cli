@@ -662,13 +662,27 @@ impl CellOutcome {
     const fn glyph(self) -> &'static str {
         match self {
             Self::Pass => "✅",
-            Self::Xfail => "xfail",
+            // A grey ✗ (styled `status-xfail` in HTML): a known bug that failed as
+            // expected — visually a muted sibling of the red ❌ regression mark.
+            Self::Xfail => "✗",
             Self::Skip => "n/a",
             Self::UnexpectedFail => "❌FAIL",
             Self::Xpass => "⚠️XPASS",
             Self::RanWhenNa => "⚠️n/a-ran",
             Self::Absent => "⚠️no-result",
             Self::Missing => "·",
+        }
+    }
+
+    /// CSS class for this cell in the HTML grid: red for a problem, grey for an
+    /// xfail (known bug, healthy), none otherwise.
+    const fn grid_class(self) -> &'static str {
+        if self.is_problem() {
+            "status-fail"
+        } else if matches!(self, Self::Xfail) {
+            "status-xfail"
+        } else {
+            ""
         }
     }
 }
@@ -1151,6 +1165,13 @@ fn expectation_grid_html(inputs: &[(String, PathBuf)]) -> Markup {
     let problems = grid.problems();
     html! {
         h2 { "Expectation grid (scenario × platform)" }
+        p.grid-legend {
+            "✅ pass · "
+            span.status-xfail { "✗" } " known bug, failed as expected (xfail) · "
+            "n/a not applicable here · "
+            span.status-fail { "❌FAIL" } " regression · "
+            "⚠️XPASS bug fixed here (stale entry) · · no data."
+        }
         table.stats {
             thead {
                 tr {
@@ -1171,8 +1192,10 @@ fn expectation_grid_html(inputs: &[(String, PathBuf)]) -> Markup {
                         td { code { (id) } }
                         @for col in &grid.columns {
                             @let outcome = col.outcomes.get(id).copied().unwrap_or(CellOutcome::Missing);
-                            td.num
-                              class=(if outcome.is_problem() { "status-fail" } else { "" }) {
+                            // One combined class attr — `td.num class=(..)` would emit
+                            // two `class` attributes, and the browser keeps only the
+                            // first ("num"), dropping the status colour.
+                            td class=(format!("num {}", outcome.grid_class())) {
                                 (outcome.glyph())
                             }
                         }
@@ -1219,7 +1242,7 @@ fn expectation_grid_markdown(inputs: &[(String, PathBuf)]) -> String {
 
     let mut out = String::from("\n### Expectation grid (scenario × platform)\n\n");
     out.push_str(
-        "_✅ pass · `xfail` known bug (failed as expected) · n/a not applicable here · \
+        "_✅ pass · ✗ known bug (failed as expected, i.e. xfail) · n/a not applicable here · \
          ❌FAIL regression · ⚠️XPASS bug fixed here (stale entry) · · no data._\n\n",
     );
 
@@ -1429,7 +1452,7 @@ fn command_coverage_markdown(reports: &[PlatformReport]) -> String {
         }
     }
 
-    // key → (column → all-passed-so-far). None = not run in that column.
+    // key → (column → all-passed-so-far). Absent column = not run there.
     let mut cells: BTreeMap<CommandKey, BTreeMap<String, bool>> = BTreeMap::new();
     for r in reports {
         let col = format!("{} {}", r.desc.platform, r.desc.os);
@@ -1446,9 +1469,12 @@ fn command_coverage_markdown(reports: &[PlatformReport]) -> String {
                 None => String::new(),
             };
             let key = CommandKey { command, engine };
-            // A command's cell is healthy only if EVERY scenario that ran it on
-            // this platform passed; an unknown scenario is treated as passed
-            // (the command ran and we have no failing evidence).
+            // A command's cell is ✅ only if EVERY scenario that ran it on this
+            // platform passed; an unknown scenario is treated as passed (the
+            // command ran and we have no failing evidence). ❌ here means the
+            // command did NOT work on this platform — whether or not the failure
+            // is a known/expected bug (that nuance lives in the expectation grid;
+            // this coverage table only cares whether it worked here).
             let ok = c
                 .scenario
                 .as_deref()
@@ -1478,10 +1504,9 @@ fn command_coverage_markdown(reports: &[PlatformReport]) -> String {
     );
     out.push_str("_Which `rocm` commands are exercised, with which engine, per platform. ");
     out.push_str(
-        "✅ tested & behaved as expected · ❌ failed · blank = this command was not run on \
-         this platform — usually because its scenario is not applicable here (skipped for \
-         GPU/OS/engine), or the command is platform-specific by construction (e.g. a \
-         host serves a different model/engine)._\n\n",
+        "✅ ran and worked here · ❌ ran but did not work here · `n/a` not run on this \
+         platform — this row is a specific model/engine invocation and this platform \
+         serves a different one, or the command is not applicable to its GPU/OS/engine._\n\n",
     );
 
     out.push_str("| Command | Engine |");
@@ -1503,10 +1528,12 @@ fn command_coverage_markdown(reports: &[PlatformReport]) -> String {
         };
         let _ = write!(out, "| `{}` | {} |", key.command, engine);
         for col in &columns {
+            // Not-run cells render as a grayed `n/a`, not blank, so an empty cell
+            // clearly means "not applicable here" rather than looking broken.
             let mark = match per_col.get(col) {
                 Some(true) => " ✅ |",
                 Some(false) => " ❌ |",
-                None => " |",
+                None => " `n/a` |",
             };
             out.push_str(mark);
         }
@@ -1765,6 +1792,9 @@ const STYLE: &str = r#"
   .summary-table td:first-child { font-weight: 600; width: 140px; }
   .status-pass { color: #2e7d32; font-weight: 600; }
   .status-fail { color: #c62828; font-weight: 600; }
+  /* xfail: a known bug that failed as expected — a muted grey ✗, sibling to the red ✗. */
+  .status-xfail { color: #9e9e9e; font-weight: 600; }
+  .grid-legend { font-size: 0.82rem; color: #555; margin: -0.5rem 0 0.75rem; }
 
   table.stats { width: 100%; border-collapse: collapse; margin-bottom: 1.5rem; font-size: 0.9rem; }
   table.stats th { background: #f5f5f5; padding: 6px 12px; text-align: left; border: 1px solid #ddd;
@@ -2204,8 +2234,8 @@ mod tests {
         let md = consolidated_summary_markdown(&inputs);
         assert!(md.contains("### Expectation grid"), "grid missing:\n{md}");
         assert!(
-            md.contains("| `serve-x` | xfail |"),
-            "serve-x should be xfail:\n{md}"
+            md.contains("| `serve-x` | ✗ |"),
+            "serve-x should be xfail (grey ✗):\n{md}"
         );
         assert!(
             md.contains("| `examine-y` | ✅ |"),
