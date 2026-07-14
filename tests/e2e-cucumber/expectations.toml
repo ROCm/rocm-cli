@@ -121,11 +121,13 @@ bug = "EAI-7223"
 reason = "Chat requests carrying tool definitions are not accepted by the served vLLM model."
 serve_timeout_secs = 90
 
-# On a lemonade host this does real lemonade inference → EAI-7052 backend failure.
+# On a lemonade LINUX host this does real lemonade inference → EAI-7052 Vulkan
+# hang. os=linux: passes on native Windows lemonade (run 29354305288 XPASS'd it),
+# consistent with the other lemonade inference scenarios.
 [["chat-tool-definitions-accepted"]]
-when = { effective_engine = "lemonade" }
+when = { effective_engine = "lemonade", os = "linux" }
 bug = "EAI-7052"
-reason = "Lemonade inference fails on the llama.cpp backend (Vulkan hang on Linux; connection drop on Windows) instead of using system ROCm."
+reason = "Lemonade inference fails on the llama.cpp Vulkan backend on Linux instead of using system ROCm."
 serve_timeout_secs = 90
 
 # EAI-7221 (TUI chat sends hardcoded 'local-model' instead of querying /v1/models)
