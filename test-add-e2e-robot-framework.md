@@ -31,11 +31,11 @@ SCRATCH only (e21297d). Bring to PR (test/add-e2e-robot-framework) after strix-w
 
 # WIP: E2E BDD tests for rocm-cli (PR #69, cucumber-rs)
 
-**Stage:** 22-volen-review-triaged-3B+2NB-fixed-strix23-needs-xfail
+**Stage:** 23-report-xfail-grey-x-coverage-na-versions-wip
 **Pipeline:** standard
-**Branch:** test/add-e2e-robot-framework
+**Branch:** test/add-e2e-robot-framework (PR-side) / ci-e2e-framework-fixes (scratch, active)
 **Last Updated:** 2026-07-14
-**Token Usage:** in=12214 out=3774903 cache_create=48512624 cache_read=2292020174 calls=6129
+**Token Usage:** in=12486 out=3926310 cache_create=48635781 cache_read=2321430331 calls=6265
 
 ## 📋 VOLEN-SILO (Eugene / pr-review-watcher BOT) REVIEW — TRIAGED (2026-07-14) — READ FIRST
 
@@ -232,7 +232,11 @@ default-engine), rominf re-review pending.
 
 ## 📋 Work Log
 
-**2026-07-14 (report UI enhancement):** Redesigned expectation grid cell rendering for xfail (known bugs): changed glyph from text "xfail" → grey ✗ (style `.status-xfail { color: #9e9e9e }`) — a muted sibling to red ❌ regression mark. Added `grid_class()` helper + legend line (HTML + markdown) explaining grey ✗ = "known bug, failed as expected". Fixed latent dual-class bug in maud rendering (`class="num" class="status-fail"` → single combined class). Live report generated locally from run 29357303454: 44 ✅, 31 grey ✗ (xfail), 24 n/a, 1 red ❌FAIL. All 33 e2e-report tests pass, `-D warnings` clean. 
+**2026-07-14 (report + version fixes):**
+- ✅ **Xfail grid glyph**: `xfail` text → grey ✗ (`.status-xfail { color: #9e9e9e }`), muted sibling to red ❌. Fixed maud dual-class bug. Legend updated (HTML + markdown).
+- ✅ **Command coverage n/a**: empty cells now show `n/a` (scenario not run on this platform); legend explains GPU/OS/engine-specific applicability.
+- ✅ **Version collection hardening** (scratch `ci-e2e-framework-fixes`): OS-aware `site_packages_dirs()` glob (Windows `Lib/site-packages`, non-pinned python3.X Unix); `lemond`/`lemond.exe` binary probe. Fixes strix-ubuntu vllm missing + strix-windows venv layout issues. All 33 e2e-report + 23 e2e-cucumber lib tests pass `-D warnings` clean.
+- 🔄 **Container gate building on scratch** (background); commit + push + scoped strix-ubuntu diagnostic dispatch pending gate pass. 
 
 **2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state. #23 Strix probe result: both serve-default-engine scenarios still fail on lemonade-native path (backend-install masking engine line, Vulkan instability). Needs xfail or deeper fix. PR #69 all-blocking checks green. VOLEN bot review fully triaged (5B+6NB items addressed in worktree, see section above). Task #22 (share-one-runtime) validated by hand — redesigned without redundant cargo rebuild, with persistence at E2E_SHARED_RUNTIMES_DIR; full GPU suite under 90min cap achieved (run 29322186691, 24 scenarios, 11 xfail as expected, 0 unexpected). Commits on scratch: ebc00b1, 021b14c, 72c6457, fc4687b. Pending: bring #22 to PR after rominf re-review, finalize #23 decision, remove temp name_filter commit.
 
