@@ -232,6 +232,12 @@ default-engine), rominf re-review pending.
 
 ## 📋 Work Log
 
+**2026-07-14 (report polish + version-probe diagnosis):**
+- ✅ Grey-✗ xfail grid cells: expectation grid now renders xfail as grey cross (status-xfail) with legend; fixed latent maud double-class bug dropping cell colors.
+- ✅ Command-coverage n/a blanks: not-run cells now show `n/a` instead of blank, with updated legend explaining non-applicability (different model/engine per platform, or scenario N/A on that GPU/OS).
+- ✅ OS-aware version probe (option 1): `collect_versions` now finds vllm dist-info + lemond across Windows/Unix venv layouts, with `site_packages_dirs` glob + lemond/lemond.exe detection. Committed b38b50d + c0d1fc2 (diagnostic) to scratch.
+- 🔄 Nightly scenarios validation (tasks #1–2): 27B serve manually running on app-dev (recipe correct, vLLM 0.23.0 loading weights from seeded HF cache via shared prewarm runtime); diagnostic probe 29364419058 queued (strix-ubuntu runtime-path-not-nested, no serve, to reveal where lemond/vllm actually live in Strix tree).
+
 **2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
 **2026-07-14 (late — all report fixes committed, version fix diagnosed):**
