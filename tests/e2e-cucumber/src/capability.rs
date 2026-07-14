@@ -159,10 +159,11 @@ pub struct PlatformVersions {
 /// from the active runtime, so they're populated only once the SDK / an engine
 /// has been installed on this platform.
 #[must_use]
-pub fn collect_versions(runtimes_dir: &std::path::Path) -> PlatformVersions {
+pub fn collect_versions(runtimes_dir: Option<&std::path::Path>) -> PlatformVersions {
     let mut v = PlatformVersions::default();
 
-    // OS distro from `examine` (isolated throwaway root — reads host, not data).
+    // OS distro from `examine` — ALWAYS collected (every platform, incl. mock and
+    // hosts without a shared runtime dir). Isolated throwaway root reads the host.
     if let Ok(tmp) = tempfile::TempDir::with_prefix("rocm-e2e-ver-") {
         let examine = run_probe(tmp.path(), &["examine"]);
         v.os = examine
@@ -172,8 +173,10 @@ pub fn collect_versions(runtimes_dir: &std::path::Path) -> PlatformVersions {
             .filter(|s| !s.is_empty());
     }
 
-    // ROCm version + the active runtime's install_root from its manifest.
-    if let Some((rocm, root)) = active_runtime_install_root(runtimes_dir) {
+    // ROCm/vLLM/lemonade versions come from the installed managed runtime. Only
+    // available when CI provides a persistent runtimes dir (E2E_SHARED_RUNTIMES_DIR)
+    // — mock has no runtime, and per-scenario isolated installs are gone by now.
+    if let Some((rocm, root)) = runtimes_dir.and_then(active_runtime_install_root) {
         v.rocm = Some(rocm);
         // vLLM: parse the version out of `.../site-packages/vllm-<ver>.dist-info`.
         v.vllm = vllm_version_from_venv(&root);
