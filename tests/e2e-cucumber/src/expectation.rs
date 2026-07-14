@@ -107,7 +107,14 @@ impl ScenarioDecl {
 }
 
 /// One xfail condition: all present keys must match (AND).
+///
+/// `deny_unknown_fields`: every field is an optional `#[serde(default)]`, and
+/// `matches` returns `true` when they are all `None` (an empty condition matches
+/// unconditionally). Without this, a typo'd key (e.g. `engine` for
+/// `effective_engine`) would parse to an all-`None` condition = an always-xfail
+/// that silently masks real regressions on every platform. Reject unknown keys.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Condition {
     #[serde(default)]
     pub effective_engine: Option<String>,
@@ -149,6 +156,7 @@ impl Condition {
 
 /// One xfail matrix entry: a condition plus its bug/reason metadata.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct XfailEntry {
     pub when: Condition,
     pub bug: String,

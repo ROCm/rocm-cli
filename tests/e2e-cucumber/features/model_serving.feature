@@ -81,8 +81,11 @@ Feature: Model serving
 
   # Default engine on Instinct: a vLLM-capable model served without --engine on
   # an Instinct data-center GPU (gfx*-dcgpu) defaults to vLLM. Checks only the
-  # selection PLAN, not endpoint readiness, so it is expect-pass everywhere.
-  @id:serve-vllm-default-on-instinct @requires-gpu
+  # selection PLAN, not endpoint readiness. The assertion is vLLM-specific, so it
+  # only applies where vLLM is the effective engine — `@requires-engine:vllm`
+  # skips it on lemonade-default hosts (Strix Halo), where asserting a vLLM
+  # default would be a guaranteed false failure.
+  @id:serve-vllm-default-on-instinct @requires-gpu @requires-engine:vllm
   Scenario: 9 - vLLM is the default serving engine on Instinct
     Given a managed runtime is active
     When the user serves a vLLM-capable model without specifying an engine

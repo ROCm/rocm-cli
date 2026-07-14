@@ -651,7 +651,7 @@ jobs:
 
       - name: Upload E2E report
         if: always() && steps.gate.outputs.run == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: e2e-report
           path: tests/e2e-cucumber/results/
@@ -792,7 +792,7 @@ jobs:
 
       - name: Upload E2E report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: e2e-gpu-report
           path: tests/e2e-cucumber/results/
@@ -875,7 +875,7 @@ jobs:
 
       - name: Upload E2E report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: e2e-gpu-strix-ubuntu-report
           path: tests/e2e-cucumber/results/
@@ -938,7 +938,7 @@ jobs:
 
       - name: Upload E2E report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: e2e-gpu-strix-windows-report
           path: tests/e2e-cucumber/results/
@@ -955,6 +955,9 @@ jobs:
   e2e-report:
     name: E2E consolidated report
     runs-on: ubuntu-latest
+    # Bound the job (like every E2E job) so a stalled artifact download can't hang
+    # a hosted runner indefinitely.
+    timeout-minutes: 15
     needs:
       - changes
       - e2e
@@ -976,7 +979,7 @@ jobs:
       # which `xtask e2e-report` turns into one labeled platform. The `*-report`
       # glob is what makes new platforms appear automatically.
       - name: Download all E2E reports
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: '*-report'
           path: e2e-artifacts
@@ -990,7 +993,7 @@ jobs:
 
       - name: Upload consolidated report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: e2e-consolidated-report
           path: consolidated/

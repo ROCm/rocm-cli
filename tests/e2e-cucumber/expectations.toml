@@ -63,10 +63,27 @@ bug = "EAI-7052"
 reason = "Default serve resolves to a GGUF recipe on lemonade; its Vulkan backend hangs on Instinct, so the endpoint never reaches ready."
 serve_timeout_secs = 90
 
+# On a lemonade-native host (Strix Halo) the first default serve triggers a
+# llama.cpp backend install whose progress output replaces the serve plan, so no
+# `engine:` line is emitted for the "engine selected automatically" assertion.
+[["serve-default-engine-working-endpoint"]]
+when = { effective_engine = "lemonade" }
+bug = "EAI-7423"
+reason = "First default serve on lemonade runs a backend install; its output omits the serve-plan `engine:` line, so engine auto-selection can't be asserted."
+serve_timeout_secs = 90
+
 [["serve-default-engine-inference"]]
 when = { effective_engine = "vllm" }
 bug = "EAI-7052"
 reason = "Default serve resolves to a GGUF recipe on lemonade; its Vulkan backend hangs on Instinct, so inference never succeeds."
+serve_timeout_secs = 90
+
+# On a lemonade-native host the served model's endpoint drops before inference
+# (lemonade llama.cpp Vulkan instability, EAI-7052; e2e gap tracked in EAI-7423).
+[["serve-default-engine-inference"]]
+when = { effective_engine = "lemonade" }
+bug = "EAI-7423"
+reason = "Default serve on lemonade: the endpoint dies before inference (llama.cpp Vulkan instability, EAI-7052)."
 serve_timeout_secs = 90
 
 [["serve-readiness-contract"]]

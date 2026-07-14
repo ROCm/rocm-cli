@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT
 
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::extract::State;
@@ -15,7 +14,6 @@ use tokio::net::TcpListener;
 #[derive(Clone)]
 struct ServerState {
     model_name: String,
-    received_models: Arc<Mutex<Vec<String>>>,
 }
 
 pub struct MockServer {
@@ -36,7 +34,6 @@ impl MockServer {
     pub async fn start(model_name: &str) -> Self {
         let state = ServerState {
             model_name: model_name.to_string(),
-            received_models: Arc::new(Mutex::new(Vec::new())),
         };
 
         let app = Router::new()
@@ -75,10 +72,6 @@ impl MockServer {
         self.addr.port()
     }
 
-    pub fn received_models(&self) -> Vec<String> {
-        self.state.received_models.lock().unwrap().clone()
-    }
-
     pub fn stop(self) {
         self.shutdown.send(()).ok();
     }
@@ -97,7 +90,6 @@ async fn handle_chat(State(state): State<ServerState>, Json(body): Json<Value>) 
         .and_then(Value::as_str)
         .unwrap_or("<missing>")
         .to_string();
-    state.received_models.lock().unwrap().push(model.clone());
 
     Json(json!({
         "id": "mock-completion-1",
