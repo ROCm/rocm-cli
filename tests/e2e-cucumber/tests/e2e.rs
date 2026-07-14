@@ -707,14 +707,13 @@ async fn main() {
         .expect("failed to read scenario results");
     let resolutions = resolutions.lock().expect("resolutions poisoned");
 
-    // Collect component versions (OS/ROCm/vLLM/lemonade) for the report heading,
-    // now that the suite has installed the runtime + engines. Read from the shared
-    // runtimes tree CI provides (E2E_SHARED_RUNTIMES_DIR); on local runs each
-    // scenario installs into its own throwaway dir (already dropped by now), so
-    // versions stay empty there — best-effort, missing sources render as "n/a".
-    let versions = shared_runtimes_dir()
-        .map(|dir| e2e_cucumber::capability::collect_versions(&dir))
-        .unwrap_or_default();
+    // Collect component versions (OS/ROCm/vLLM/lemonade) for the report heading.
+    // OS is always collected (every platform, incl. mock); ROCm/vLLM/lemonade come
+    // from the shared runtimes tree CI provides (E2E_SHARED_RUNTIMES_DIR) — absent
+    // on mock (no runtime) and on local runs (per-scenario dirs already dropped),
+    // where those render as "n/a". Best-effort.
+    let shared = shared_runtimes_dir();
+    let versions = e2e_cucumber::capability::collect_versions(shared.as_deref());
 
     // Write the platform.json sidecar (probed capability + every resolution,
     // including skips) for the central report's expected-vs-actual grid.

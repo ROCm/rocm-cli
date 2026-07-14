@@ -864,6 +864,11 @@ jobs:
         run: |
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
+          # Share one installed runtime across serve/chat scenarios (install once)
+          # AND persist it so the end-of-run version probe (report headings) can read
+          # the runtime's ROCm/vLLM/lemonade versions. The first "a managed runtime
+          # is active" scenario installs into this dir via use_shared_runtimes().
+          export E2E_SHARED_RUNTIMES_DIR="$RUNNER_WORKSPACE/e2e-runtimes"
           # TEMP: optional scenario-name filter for a scoped probe dispatch.
           NAME_FILTER="${{ github.event.inputs.name_filter }}"
           if [ -n "$NAME_FILTER" ]; then
@@ -934,7 +939,12 @@ jobs:
 
       - name: Run E2E tests on Strix Halo Windows
         shell: powershell
-        run: cargo xtask e2e
+        run: |
+          # Persist one installed runtime so the end-of-run version probe can read
+          # ROCm/vLLM/lemonade versions for the report heading (and to install once
+          # across serve/chat scenarios). See the Strix-Ubuntu / e2e-gpu jobs.
+          $env:E2E_SHARED_RUNTIMES_DIR = "$env:RUNNER_WORKSPACE\e2e-runtimes"
+          cargo xtask e2e
 
       - name: Upload E2E report
         if: always()
