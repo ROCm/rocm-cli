@@ -31,11 +31,11 @@ SCRATCH only (e21297d). Bring to PR (test/add-e2e-robot-framework) after strix-w
 
 # WIP: E2E BDD tests for rocm-cli (PR #69, cucumber-rs)
 
-**Stage:** 26-report-polish-version-probe-in-progress-nightly-validation
+**Stage:** 27-version-probe-fix-strix-ready-nightly-pending
 **Pipeline:** standard
-**Branch:** test/add-e2e-robot-framework (PR-side) / ci-e2e-framework-fixes (scratch, active)
+**Branch:** ci-e2e-framework-fixes (scratch, active) / test/add-e2e-robot-framework (PR)
 **Last Updated:** 2026-07-14 (idle flush)
-**Token Usage:** in=13226 out=4222395 cache_create=50129798 cache_read=2401925838 calls=6637
+**Token Usage:** in=13238 out=4227864 cache_create=50789016 cache_read=2403572293 calls=6644
 
 ## 📋 VOLEN-SILO (Eugene / pr-review-watcher BOT) REVIEW — TRIAGED (2026-07-14) — READ FIRST
 
@@ -231,6 +231,8 @@ Rebuilt the `1817c5b` idea correctly:
 default-engine), rominf re-review pending.
 
 ## 📋 Work Log
+
+**2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
 **2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
