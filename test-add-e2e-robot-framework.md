@@ -201,6 +201,8 @@ default-engine), rominf re-review pending.
 
 ## 📋 Work Log
 
+**2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+
 **2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state. #23 Strix probe validated; both serve-default-engine scenarios still fail on lemonade path (backend-install masks engine line, Vulkan instability). Needs xfail or deeper fix. PR #69 all-blocking green, rominf re-review pending, 4 work-in-progress commits signed/pushed. VOLEN bot review triaged + fixed (5 blocking + 6 non-blocking addressed in scratch worktree). Task #22 (share-one-runtime) validated hand-proof → rebuilt correctly with pre-warm in-place + persistence; full GPU suite under cap achieved run 29322186691 (24 scenarios, 11 xfail as expected, 0 unexpected). Commits on scratch: ebc00b1 (harness+CI), 021b14c (pre-warm fix), 72c6457 (remove probe filter), fc4687b (drop mismapped EAI-7221 vLLM block). Bring #22 + these to PR after rominf re-review completes.
 
 **2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
