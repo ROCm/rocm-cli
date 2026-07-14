@@ -41,10 +41,19 @@ runtime across scenarios** (the `1817c5b` direction, done correctly — install 
 The env-knob branch is NOT the fix: either revert the harness wiring (keep the harmless
 product knob unused) or drop the whole patch.
 
-**⚠️ NOTHING FROM THIS FIX IS COMMITTED** — only local worktree edits in `ci-e2e-framework-fixes`
-(therock.rs extras knob + `run_rocm_with_env` + runtime_steps wiring) + the same patch applied
-on the pod checkout (uncommitted). #22 (uv cache) remains the only committed new work (scratch
-`6c6231b`). Box: e2e-devel/e2e-libonly test dirs left at /var/tmp for reference; serves killed.
+**ENV KNOB DROPPED (user call: "why keep it if it doesn't work").** Reverted all three files
+in the `ci-e2e-framework-fixes` worktree AND on the pod checkout (both clean at `6c6231b`).
+No `ROCM_CLI_THEROCK_EXTRAS` / `run_rocm_with_env` / runtime_steps wiring remains anywhere.
+#22 (uv cache) is the only committed new work (scratch `6c6231b`). Box: e2e-devel/e2e-libonly
+test dirs left at /var/tmp for reference; serves killed; shared uv cache retained.
+
+**NEXT: share-one-runtime (the real fix).** Before rebuilding, study exactly why `1817c5b`
+regressed (it symlinked `data/runtimes` via `E2E_SHARED_RUNTIMES_DIR` but still had a scenario
+run its own install + exceeded cap — check whether the shared registry actually reported
+"installed" and whether concurrent installs raced the shared dir). Then: install ONE devel
+runtime serially (pre-warm step), share it read-appropriately across serve/chat scenarios,
+keep the clean-slate scenarios (`runtime-install-sdk-active`, `a machine with no CLI-managed
+runtimes`) fully isolated. Prove with a 2-scenario `@probe` run before full dispatch.
 
 ---
 
