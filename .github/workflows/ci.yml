@@ -3,8 +3,11 @@ name: CI
 on:
   push:
     branches: [main]
+  # Run on PRs against ANY base branch, not just main, so a stacked PR (based on
+  # another in-flight feature branch) still gets CI instead of no checks until it
+  # is retargeted to main. Affected-crate selection already diffs against
+  # `github.base_ref`, so a non-main base works. push/merge_group stay main-only.
   pull_request:
-    branches: [main]
   # The merge queue creates a temporary branch and fires `merge_group`; without
   # this trigger the required checks never start and queued PRs stall forever.
   merge_group:
