@@ -383,24 +383,37 @@ async fn user_lists_services(world: &mut E2eWorld) {
 
 #[when("the user serves a model without specifying an engine")]
 async fn user_serves_default_engine(world: &mut E2eWorld) {
-    // This scenario tests automatic *engine selection*, not alias resolution, so
-    // serve by the canonical ID — using the `qwen2.5` alias would make the
-    // scenario also depend on EAI-7219 being fixed. Omit `--engine` so the CLI
-    // still picks the engine itself, which is the behavior under test.
+    // This scenario tests automatic *engine selection* — a platform-agnostic
+    // behaviour. Omit `--engine` so the CLI picks the engine itself (the behaviour
+    // under test), and serve by canonical ID (not the `qwen2.5` alias, which would
+    // also depend on EAI-7219).
+    //
+    // Selection is RECIPE-driven, not platform-driven: `rocm serve <model>` with
+    // no `--engine` resolves the request to the recipe's preferred model+engine,
+    // which may differ from what was requested (e.g. Qwen2.5-1.5B → a GGUF recipe
+    // on lemonade). So the readiness wait must key on the model the CLI ACTUALLY
+    // resolved (parsed from the serve plan), not the requested one — hardcoding the
+    // requested model made this time out on hosts where the recipe resolved to a
+    // different model, for reasons unrelated to engine selection.
+    let model = host_serve_target().0;
     ensure_serve_port_free().await;
-    let (stdout, _, rc) =
-        crate::run_rocm(world, &["serve", "Qwen/Qwen2.5-1.5B-Instruct", "--managed"]);
+    let (stdout, _, rc) = crate::run_rocm(world, &["serve", model, "--managed"]);
+    // The model the CLI resolved (what actually gets served) can differ from the
+    // requested id, so downstream reachability/readiness checks must look for the
+    // resolved model on the shared port; fall back to the requested id.
+    let served = resolved_model(&stdout).unwrap_or(model).to_string();
+    let ready_substr = ready_substr_for(&served).to_string();
     world.cli_output = Some(stdout);
     world.cli_rc = Some(rc);
     world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
-    world.model_name = Some("Qwen/Qwen2.5-1.5B-Instruct".to_string());
+    world.model_name = Some(served);
     if rc == 0 {
-        // Wait for THIS model specifically (not just any 200) — the shared port
-        // 11435 may still answer from a prior scenario's leaked serve, and a
+        // Wait for THE RESOLVED model specifically (not just any 200) — the shared
+        // port 11435 may still answer from a prior scenario's leaked serve, and a
         // model-agnostic wait would then proceed against the wrong server.
         wait_for_model(
             "http://127.0.0.1:11435/v1/models",
-            Some("Qwen2.5-1.5B"),
+            Some(&ready_substr),
             serve_timeout_for(world),
         )
         .await;
@@ -458,14 +471,8 @@ async fn assert_inference_succeeds_now(world: &mut E2eWorld) {
 #[then("the output shows the full model name")]
 async fn assert_full_model_name(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no CLI output");
-    let resolved = output
-        .lines()
-        .find(|l| l.contains("resolved model:"))
-        .and_then(|l| l.split(':').nth(1))
-        .map_or_else(
-            || panic!("no 'resolved model' in output:\n{output}"),
-            str::trim,
-        );
+    let resolved = resolved_model(output)
+        .unwrap_or_else(|| panic!("no 'resolved model' in output:\n{output}"));
     assert!(
         resolved.contains('/'),
         "expected a fully qualified model name (org/model), got '{resolved}'\n\nfull output:\n{output}"
@@ -485,12 +492,7 @@ async fn assert_consistent_expansion(world: &mut E2eWorld) {
         // to expand the name (e.g. it errored before serving). Fail loudly rather
         // than defaulting to an empty string — otherwise two engines that both
         // fail would produce equal ("") values and pass this check vacuously.
-        let Some(model) = output
-            .lines()
-            .find(|l| l.contains("resolved model:"))
-            .and_then(|l| l.split(':').nth(1))
-            .map(|s| s.trim().to_string())
-        else {
+        let Some(model) = resolved_model(output).map(str::to_string) else {
             panic!("engine #{i} produced no 'resolved model' line:\n{output}");
         };
         resolved.push(model);
@@ -539,6 +541,30 @@ fn selected_engine(output: &str) -> &str {
         panic!("no 'engine:' line in serve output:\n{output}");
     };
     engine
+}
+
+/// The model a serve plan actually resolved to (`resolved model: <id>`), which
+/// can differ from the requested id — `rocm serve <model>` with no `--engine`
+/// picks the recipe's preferred model+engine. `None` if the plan has no such line
+/// (e.g. the serve errored before resolving).
+fn resolved_model(output: &str) -> Option<&str> {
+    output
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("resolved model:"))
+        .map(str::trim)
+}
+
+/// A distinctive substring of a model id that appears in the served endpoint's
+/// `/v1/models` response, for `wait_for_model`'s containment check. Strips the
+/// `org/` prefix and the `-GGUF` catalog marker so a resolved catalog id
+/// (`Qwen3-4B-Instruct-2507-GGUF`) matches the concrete artifact the endpoint
+/// reports (`Qwen3-4B-Instruct-2507-Q4_K_M.gguf`) — both share the base
+/// `Qwen3-4B-Instruct-2507`.
+fn ready_substr_for(model_id: &str) -> &str {
+    let base = model_id.rsplit('/').next().unwrap_or(model_id);
+    base.strip_suffix("-GGUF")
+        .or_else(|| base.strip_suffix("-gguf"))
+        .unwrap_or(base)
 }
 
 #[then("an engine is selected automatically")]

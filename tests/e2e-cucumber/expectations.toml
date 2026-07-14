@@ -52,16 +52,21 @@ bug = "EAI-7333"
 reason = "vLLM service reports ready (/v1/models 200) but POST /v1/chat/completions is refused."
 serve_timeout_secs = 90
 
+# Default-engine serve is RECIPE-driven, not host-driven: `rocm serve <model>`
+# with no --engine resolves to the recipe's preferred model+engine. On an Instinct
+# host (effective_engine=vllm) the request resolves to a GGUF recipe on lemonade,
+# whose llama.cpp Vulkan backend hangs on Instinct (EAI-7052) → the endpoint never
+# becomes ready. (Not EAI-7333: the default serve doesn't use vLLM at all here.)
 [["serve-default-engine-working-endpoint"]]
 when = { effective_engine = "vllm" }
-bug = "EAI-7333"
-reason = "Default-selected vLLM endpoint never reaches a ready /v1/models within the serve timeout."
+bug = "EAI-7052"
+reason = "Default serve resolves to a GGUF recipe on lemonade; its Vulkan backend hangs on Instinct, so the endpoint never reaches ready."
 serve_timeout_secs = 90
 
 [["serve-default-engine-inference"]]
 when = { effective_engine = "vllm" }
-bug = "EAI-7333"
-reason = "Default-engine (vLLM) endpoint is reachable but chat inference is refused."
+bug = "EAI-7052"
+reason = "Default serve resolves to a GGUF recipe on lemonade; its Vulkan backend hangs on Instinct, so inference never succeeds."
 serve_timeout_secs = 90
 
 [["serve-readiness-contract"]]
