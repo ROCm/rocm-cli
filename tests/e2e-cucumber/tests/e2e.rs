@@ -511,11 +511,25 @@ fn inference_timeout_secs() -> u64 {
         .unwrap_or(10)
 }
 
+/// The inference client timeout for a specific scenario. A large model in eager
+/// mode (e.g. the 27B `@serve-timeout:2400` nightly scenario) can take far longer
+/// than the 10s default just to produce its FIRST token — the model is loaded,
+/// but prefill+generation for a cold BF16 27B exceeds 10s, so the flat cap aborts
+/// the POST with "error sending request" (a client timeout, not a server fault;
+/// this is why a manual `curl -m 60` passed while the suite failed). A scenario
+/// that declared a long serve-readiness budget via `@serve-timeout` clearly runs
+/// a heavy model, so give its inference the same headroom — floor the timeout at
+/// the serve override. Normal/known-bug scenarios have no override and keep the
+/// fast 10s fail-fast (which the EAI-7052 hang-detection relies on).
+fn inference_timeout_for(world: &E2eWorld) -> u64 {
+    inference_timeout_secs().max(world.serve_timeout_override.unwrap_or(0))
+}
+
 pub async fn send_chat(world: &mut E2eWorld) {
     let endpoint = world.endpoint.as_ref().expect("no endpoint configured");
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(inference_timeout_secs()))
+        .timeout(std::time::Duration::from_secs(inference_timeout_for(world)))
         .build()
         .expect("failed to build HTTP client");
 
