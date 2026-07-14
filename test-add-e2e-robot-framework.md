@@ -4,7 +4,8 @@
 **Stage:** 11-review-addressed-plus-task22-in-progress
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
-**Last Updated:** 2026-07-13 (idle flush)
+**Last Updated:** 2026-07-14
+**Token Usage:** in=10633 out=3339868 cache_create=40515111 cache_read=2101198907 calls=5336
 
 ## 🌙 RESUME STATE (2026-07-13 late — read FIRST; context about to compact)
 
@@ -45,27 +46,14 @@ reason with/without flag).
   serve. Root cause: per-scenario `install sdk` (multi-GB TheRock cold install ×N) +
   a self-starving box ate the whole budget. NOT the 27B's fault.
 
-**🔧 TASK #22 IN PROGRESS (share the download cache so install sdk is fast) — where I stopped:**
-- **DECISION (user):** share the download cache, install per-scenario (NOT symlink the
-  installed tree — avoids the absolute-install_root/`status=unusable` + shared-registry-
-  state regression that bit the prior attempt `1817c5b`).
-- **MEASURED ON BOX (clean-room, on the roomy `/` overlay):** install sdk #1 cold =
-  **160s** (populates uv cache), #2 warm in a FRESH isolated dir reusing the shared
-  `UV_CACHE_DIR` = **34s, rc=0**. ~5× win. This is the proof the design works.
-- **DISK DECISION (user):** put the uv cache on the **2.1TB `/` overlay**, NOT
-  `/workload` (the 125GB Longhorn PVC where e2e-shared lives is 94% full — 52GB of it
-  is the 27B HF seed; only 8GB free, uv cache needs ~23GB). Overlay doesn't persist
-  across pod restart (one cold rebuild per pod-life; fine within a run).
-- **NEXT STEP (was mid-edit when interrupted):** in `tests/e2e-cucumber/tests/e2e.rs`
-  `isolate_cmd`, add a `shared_uv_cache_dir()` helper reading a NEW env var
-  `E2E_SHARED_UV_CACHE_DIR` (independent of E2E_SHARED_CACHE_DIR so it can live on the
-  overlay) and `cmd.env("UV_CACHE_DIR", <that>)`. Reuse the path-validation
-  (absolute + no `..`) — refactor `shared_cache_dir`'s validation into a shared
-  `validated_shared_dir(env_var)` helper. Then set `E2E_SHARED_UV_CACHE_DIR` to an
-  overlay path (e.g. `/root/e2e-uv-cache` or a `$RUNNER_WORKSPACE`-independent `/`
-  path) in ci.yml's e2e-gpu + nightly e2e-gpu-nightly jobs. Verify mock unaffected
-  (NO-OP when unset), then container-gate, commit on SCRATCH first, dispatch app-dev.
-- **#23 (Strix default-engine serve assertion) still BLOCKED on #22.**
+**✅ TASK #22 COMPLETE (share the download cache so install sdk is warm):**
+- ✅ **Refactor:** extracted `validated_shared_dir(env_var)` for both caches (absolute + no `..`).
+- ✅ **New helper:** `shared_uv_cache_dir()` → `E2E_SHARED_UV_CACHE_DIR` env var.
+- ✅ **Wiring:** `isolate_cmd` exports `UV_CACHE_DIR` when the env var is set (no-op when unset).
+- ✅ **CI config:** set `E2E_SHARED_UV_CACHE_DIR=/var/tmp/rocm-e2e-uv-cache` in ci.yml e2e-gpu + nightly.yml.
+- ✅ **Validation:** container mock gate green (8/8, **0 unexpected failures**); env var unset → no behavior change.
+- 📋 **Commit pending:** all code staged, SSH key load needed for signing (user running `ssh-add` now).
+- **#23 (Strix default-engine serve assertion) UNBLOCKED by #22 implementation; depends on user dispatch.**
 
 **🧹 BOX CLEANUP DONE THIS SESSION (app-dev, important):** killed 12 stale 3-day-old
 `rocm daemon` procs (from `/workload/rocm-cli{,-main}` manual builds, supervising
@@ -88,9 +76,8 @@ use --no-verify (Mac pre-push hook can't pass by design; container IS the gate).
 ---
 
 **Status:** rominf review addressed + all changes on PR (`0e6c80e`). Task #22
-(download-cache sharing) design validated on box (160s→34s), mid-implementation.
-
-**Token Usage:** in=10414 out=3255487 cache_create=39340842 cache_read=2088873069 calls=5223
+(download-cache sharing) design validated on box (160s→34s), **fully implemented on scratch**.
+Code staged, container mock gate green (0 unexpected failures). Commit pending SSH key load.
 
 ---
 
@@ -739,6 +726,12 @@ Framework/harness/CI issues to fix fast via the scratch-branch + manual-dispatch
   clean, rendered real report from run-29104869493 artifacts + browser-verified.
 
 ## Work Log
+
+**2026-07-14 (Task #22 complete — uv cache sharing, signing handoff):**
+- ✅ Task #22 implementation: `validated_shared_dir()` refactor + `shared_uv_cache_dir()` + `UV_CACHE_DIR` wiring in isolate_cmd.
+- ✅ CI config: `E2E_SHARED_UV_CACHE_DIR=/var/tmp/rocm-e2e-uv-cache` in e2e-gpu + nightly jobs (overlay path, off-PVC).
+- ✅ Validation: container mock gate (8/8, 0 unexpected), no-op when unset, cargo check + clippy clean, YAML parse OK.
+- 📋 Commit staged, blocked on SSH key load for signing (user running `ssh-add -t 8h ~/.ssh/id_rsa_amd_fespinoz`).
 
 **2026-07-13 (continuation — comprehensive report fixes + command-coverage + chat coverage):**
 - ✅ Report presentation fix (d9d3adb): removed Tier, clarified legend, n/a instead of dashes. 28 tests.
