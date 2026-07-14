@@ -18,7 +18,6 @@ struct ServerState {
 
 pub struct MockServer {
     addr: SocketAddr,
-    state: ServerState,
     shutdown: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -41,7 +40,7 @@ impl MockServer {
             .route("/models", get(handle_models))
             .route("/v1/chat/completions", post(handle_chat))
             .route("/chat/completions", post(handle_chat))
-            .with_state(state.clone());
+            .with_state(state);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -57,11 +56,7 @@ impl MockServer {
                 .ok();
         });
 
-        Self {
-            addr,
-            state,
-            shutdown: tx,
-        }
+        Self { addr, shutdown: tx }
     }
 
     pub fn base_url(&self) -> String {
@@ -84,7 +79,7 @@ async fn handle_models(State(state): State<ServerState>) -> Json<Value> {
     }))
 }
 
-async fn handle_chat(State(state): State<ServerState>, Json(body): Json<Value>) -> Json<Value> {
+async fn handle_chat(Json(body): Json<Value>) -> Json<Value> {
     let model = body
         .get("model")
         .and_then(Value::as_str)
