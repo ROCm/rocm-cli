@@ -20,6 +20,13 @@ async fn setup_standard_rocm(_world: &mut E2eWorld) {}
 
 #[given("a managed runtime is active")]
 async fn setup_active_runtime(world: &mut E2eWorld) {
+    // This precondition only needs *a* runtime present — it does not assert a
+    // clean slate — so opt into the shared runtimes tree: the first scenario to
+    // hit an empty shared tree installs once, and every later scenario finds the
+    // runtime already there instead of re-installing a multi-GiB TheRock SDK
+    // (the per-scenario install count is what blew the GPU time cap). No-op unless
+    // E2E_SHARED_RUNTIMES_DIR is set (CI on a persistent runner).
+    world.use_shared_runtimes();
     let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     if stdout.contains("installed: none") {
         let (install_out, _, rc) = crate::run_rocm(world, &["install", "sdk"]);

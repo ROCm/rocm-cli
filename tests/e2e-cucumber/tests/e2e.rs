@@ -100,6 +100,27 @@ fn shared_uv_cache_dir() -> Option<PathBuf> {
     validated_shared_dir("E2E_SHARED_UV_CACHE_DIR")
 }
 
+/// A persistent directory holding ONE installed managed-runtime tree
+/// (`runtimes/registry/*` + the TheRock venv) shared across scenarios that only
+/// need *a* runtime active. Set by CI (`E2E_SHARED_RUNTIMES_DIR`) on the runner's
+/// persistent disk; unset for local runs, where every scenario installs its own.
+///
+/// Why opt-in and not global: a cold `rocm install sdk` installs a multi-GiB
+/// TheRock runtime (and its post-install probe unpacks an ~8.8 GiB devel tarball),
+/// and each scenario's isolated data dir made it re-run per scenario — the GPU job
+/// then exceeds its time cap. Scenarios that just need a runtime present
+/// ("a managed runtime is active") point their `data/runtimes` at this shared tree
+/// (see [`E2eWorld::use_shared_runtimes`]) so the install happens once per runner.
+/// Scenarios that ASSERT a clean slate ("a machine with no CLI-managed runtimes",
+/// "Installing the SDK") deliberately do NOT opt in — they keep their empty
+/// isolated runtimes dir. A serve resolves the shared runtime via
+/// `single_ready_runtime` (no active-key wiring needed) and `runtimes list`
+/// reports it `status=ready`, so both the precondition and serve are satisfied
+/// (verified by hand on MI300X: serve + chat completion through a symlinked tree).
+fn shared_runtimes_dir() -> Option<PathBuf> {
+    validated_shared_dir("E2E_SHARED_RUNTIMES_DIR")
+}
+
 impl Default for E2eWorld {
     fn default() -> Self {
         // A fresh TempDir per World gives each scenario its own isolated
@@ -110,12 +131,14 @@ impl Default for E2eWorld {
             std::fs::create_dir_all(root.path().join(sub)).ok();
         }
 
-        // NOTE: we deliberately do NOT share <data>/runtimes across scenarios.
-        // Although the runtime wheels are immutable, the runtimes *registry* is
-        // STATE the suite asserts on — e.g. "Installing the SDK" requires
-        // `a machine with no CLI-managed runtimes`, which a shared registry
-        // (populated by other scenarios) would break. Only truly state-free
-        // content-addressed caches (HF weights, pip) are shared, in isolate_cmd.
+        // By default <data>/runtimes stays isolated: the runtimes *registry* is
+        // STATE the suite asserts on — "Installing the SDK" and "a machine with no
+        // CLI-managed runtimes" require an empty slate a shared registry would
+        // break. Only scenarios that merely need *a* runtime active OPT IN via
+        // `use_shared_runtimes()` (see shared_runtimes_dir), which symlinks this
+        // scenario's runtimes dir at a shared, install-once tree so `install sdk`
+        // runs once per runner instead of per scenario. State-free content-
+        // addressed caches (HF weights, pip, uv) are always shared, in isolate_cmd.
 
         Self {
             mock: None,
@@ -176,6 +199,40 @@ impl E2eWorld {
         // big-model serve actually reach ready (verified on MI300X with Qwen3.6-27B).
         if let Some(secs) = self.serve_timeout_override {
             cmd.env("ROCM_CLI_VLLM_READY_TIMEOUT_SECS", secs.to_string());
+        }
+    }
+
+    /// Opt this scenario into the shared managed-runtime tree (see
+    /// [`shared_runtimes_dir`]): replace its empty isolated `data/runtimes` with a
+    /// symlink to the shared dir, so an `install sdk` here populates the shared
+    /// tree once and later scenarios find the runtime already present. No-op when
+    /// `E2E_SHARED_RUNTIMES_DIR` is unset (local runs stay fully isolated) or when
+    /// the symlink can't be created (falls back to an isolated install). Only
+    /// scenarios that need *a* runtime active should call this — never the
+    /// clean-slate scenarios that assert "no CLI-managed runtimes".
+    pub fn use_shared_runtimes(&self) {
+        let Some(shared) = shared_runtimes_dir() else {
+            return;
+        };
+        let Some(root) = &self.isolated_root else {
+            return;
+        };
+        let data = root.path().join("data");
+        if std::fs::create_dir_all(&data).is_err() {
+            return;
+        }
+        let link = data.join("runtimes");
+        // Remove the empty isolated runtimes dir (created in `default()`) so the
+        // symlink can take its place; ignore if it's absent.
+        let _ = std::fs::remove_dir_all(&link);
+        #[cfg(unix)]
+        let res = std::os::unix::fs::symlink(&shared, &link);
+        #[cfg(windows)]
+        let res = std::os::windows::fs::symlink_dir(&shared, &link);
+        if res.is_err() {
+            // Couldn't symlink (e.g. Windows without privilege): recreate the
+            // isolated dir so the scenario still works, just without sharing.
+            let _ = std::fs::create_dir_all(&link);
         }
     }
 
