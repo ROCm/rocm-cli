@@ -1,10 +1,59 @@
 
 # WIP: E2E BDD tests for rocm-cli (PR #69, cucumber-rs)
 
-**Stage:** 14-libonly-fix-DISPROVEN-by-hand-devel-required-for-serve
+**Stage:** 15-share-one-runtime-PROVEN-by-hand-1817c5b-failures-diagnosed
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-14
+
+## ✅ SHARE-ONE-RUNTIME PROVEN BY HAND (2026-07-14) — READ FIRST
+
+**The real fix works.** Hand-proven on app-dev MI300X: a fresh isolated scenario dir whose
+`data/runtimes` is a SYMLINK to a shared, already-installed (devel) runtime tree serves +
+infers correctly. Install once, symlink everywhere.
+- Symlinked `share-test/data/runtimes -> e2e-devel/data/runtimes` (the runtime installed once).
+- `rocm runtimes list` through the symlink: `installed:` lists the runtime `status=ready` ✅
+  (BUT `active_runtime_key: <unset>` — see below; doesn't matter).
+- `rocm serve Qwen2.5-1.5B --engine vllm --managed`: plan shows
+  `selection_source: single_ready_runtime`, **READY in 45s, real chat completion returned
+  `"Hello there!"`**. End-to-end serve+infer through a shared runtime = WORKS.
+
+**KEY subtlety (why 1817c5b's "active fallback" was a red herring):** the symlinked shared
+registry does NOT set `active_runtime_key` (stays `<unset>`). But it doesn't need to —
+(a) the precondition check is `!contains("installed: none")`, which PASSES (it says
+`installed: <runtime> status=ready`); (b) `serve` resolves via `single_ready_runtime` when
+exactly one ready runtime exists. So sharing satisfies both the precondition AND serve
+without any active-key wiring. `active.json` in the shared tree carries absolute paths into
+the shared install_root, which is fine since all scenarios read the same shared tree.
+
+**WHY 1817c5b ACTUALLY REGRESSED (diagnosed — all operational, NOT a design flaw):**
+1. Pre-warm used `cargo run -p rocm --release` → redundant ~5min RELEASE REBUILD on the clock.
+2. Pre-warm ran ON the E2E clock and the cold first download still paid full multi-GB.
+3. 35-min cap (now 90) — job cancelled before platform.json; runner wedged mid-install ×2.
+4. (Suspected "sharing didn't take effect" — but hand-test shows the symlink mechanism is
+   sound; the real culprit was 1+2+3 eating the clock before/around the install.)
+
+**WHAT'S DIFFERENT NOW (why it'll work this time):** 90-min cap (was 35); #22 uv-cache makes
+installs warm; a single devel install = 30s and install+serve-ready = 75s (measured) — so even
+the pre-warm is cheap now. The symlink-share mechanism is proven to serve.
+
+**REDESIGN for the rebuild (do it RIGHT):**
+- Pre-warm with the ALREADY-BUILT binary (pass `ROCM_CLI_BINARY`), NOT `cargo run --release`.
+- Better: persist the shared runtime tree ACROSS runs on the runner's persistent disk
+  (`$RUNNER_WORKSPACE/e2e-runtimes`), so pre-warm is a no-op after the first run ever.
+- Pre-warm OFF the suite where possible, or accept the one-time ~30s now that installs are warm.
+- Harness `use_shared_runtimes()` (symlink `data/runtimes` at `E2E_SHARED_RUNTIMES_DIR`),
+  opt-in ONLY from `a managed runtime is active`; clean-slate scenarios
+  (`runtime-install-sdk-active`, `a machine with no CLI-managed runtimes`) stay isolated.
+  This is exactly 1817c5b's harness code — it was sound; only the CI pre-warm was broken.
+- Prove with a 2-scenario `@probe` run (one serve + `runtime-install-sdk-active`) before full.
+
+**Box state:** GPU clean (VRAM back to ~297MB after killing the test serve's process group
+857529). `e2e-devel` (25G installed devel runtime) + uv cache retained on /var/tmp for reuse.
+Nothing committed from this investigation — pure hand-proof. #22 (uv cache) still the only
+committed new work (scratch `6c6231b`).
+
+---
 **Token Usage:** in=11277 out=3518635 cache_create=43169465 cache_read=2168971148 calls=5658
 
 ## ❌ LIBRARIES-ONLY FIX DISPROVEN BY HAND (2026-07-14) — READ FIRST, SUPERSEDES BELOW
