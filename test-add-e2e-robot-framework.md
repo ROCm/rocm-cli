@@ -1,7 +1,7 @@
 
 # WIP: E2E BDD tests for rocm-cli (PR #69, cucumber-rs)
 
-**Stage:** 11-review-addressed-plus-task22-in-progress
+**Stage:** 11-review-addressed-task22-landed-on-scratch-dispatched
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-14
@@ -46,14 +46,28 @@ reason with/without flag).
   serve. Root cause: per-scenario `install sdk` (multi-GB TheRock cold install ×N) +
   a self-starving box ate the whole budget. NOT the 27B's fault.
 
-**✅ TASK #22 COMPLETE (share the download cache so install sdk is warm):**
+**✅ TASK #22 LANDED ON SCRATCH + DISPATCHED (share download cache so install sdk is warm):**
 - ✅ **Refactor:** extracted `validated_shared_dir(env_var)` for both caches (absolute + no `..`).
 - ✅ **New helper:** `shared_uv_cache_dir()` → `E2E_SHARED_UV_CACHE_DIR` env var.
 - ✅ **Wiring:** `isolate_cmd` exports `UV_CACHE_DIR` when the env var is set (no-op when unset).
-- ✅ **CI config:** set `E2E_SHARED_UV_CACHE_DIR=/var/tmp/rocm-e2e-uv-cache` in ci.yml e2e-gpu + nightly.yml.
-- ✅ **Validation:** container mock gate green (8/8, **0 unexpected failures**); env var unset → no behavior change.
-- 📋 **Commit pending:** all code staged, SSH key load needed for signing (user running `ssh-add` now).
-- **#23 (Strix default-engine serve assertion) UNBLOCKED by #22 implementation; depends on user dispatch.**
+- ✅ **CI config:** set `E2E_SHARED_UV_CACHE_DIR=/var/tmp/rocm-e2e-uv-cache` in ci.yml e2e-gpu + nightly.yml
+  (the roomy `/` overlay, off the near-full PVC; safe from the `/tmp/rocm-e2e-*` reclaim glob).
+- ✅ **Validation:** container mock gate `cargo xtask e2e` → XTASK_EXIT=0, **"0 unexpected failure(s)"**
+  (4 xfail as expected); env var unset → no behavior change.
+- ✅ **Committed on scratch `6c6231b`** (SSH-signed with amd work key — 1Password was locked, remote
+  session; see Signing note) and **pushed** to origin/ci-e2e-framework-fixes. Scratch now AHEAD of PR
+  by this one commit (#22 is NOT yet on the PR branch).
+- ✅ **Dispatched app-dev-gpu run `29306008273`** on scratch (platform=app-dev-gpu only).
+- 📋 **NEXT: watch run 29306008273** — is `install sdk` warm (~34s) after scenario #1, and does the
+  (non-nightly) GPU suite finish under 90min? If green → cherry-pick/bring #22 to the PR branch.
+- **#23 (Strix default-engine serve assertion) UNBLOCKED by #22; still pending.**
+
+**⚠️ SIGNING GOTCHA (remote session, 1Password locked) — how #22 got signed:** the amd work
+key `~/.ssh/id_rsa_amd_fespinoz` (fpr `/kI7Ku…HjGs`, `fespinoz@amd.com`) is loaded in the
+**launchd** agent, NOT the 1Password socket. `git-commit-with-fallback` signs via it only when
+`SSH_AUTH_SOCK` points at launchd: `export SSH_AUTH_SOCK="$(launchctl asuser $(id -u) launchctl
+getenv SSH_AUTH_SOCK)"` + `GHAPP_SIGN_TIMEOUT=5` (skip the dead 1Password prompt fast). Pointing
+`SSH_AUTH_SOCK` at the 1Password socket makes the wrapper dead-end ("preferred key not loaded").
 
 **🧹 BOX CLEANUP DONE THIS SESSION (app-dev, important):** killed 12 stale 3-day-old
 `rocm daemon` procs (from `/workload/rocm-cli{,-main}` manual builds, supervising
