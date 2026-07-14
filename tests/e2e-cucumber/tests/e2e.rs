@@ -55,20 +55,15 @@ pub struct E2eWorld {
     pub serve_timeout_override: Option<u64>,
 }
 
-/// A persistent directory shared across scenarios for heavy, immutable artifacts
-/// (TheRock runtime wheels, HF model weights, engine venvs). Set by CI to a path
-/// on the runner's persistent disk; unset for local runs, where every scenario
-/// stays fully isolated (nothing shared).
+/// Resolve a CI-provided shared-directory env var to a validated, existing path.
 ///
-/// Sharing these read-only artifacts avoids re-downloading multi-GB runtimes and
-/// model weights per scenario. Only immutable artifacts are shared — service
-/// records, config, and per-service engine state stay isolated per scenario.
-fn shared_cache_dir() -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("E2E_SHARED_CACHE_DIR")?);
-    // The value is CI-controlled, but validate it before it reaches a filesystem
-    // sink: require an absolute path with no `..` traversal components. This both
-    // rejects a malformed/relative override (which would create a cache dir in an
-    // unexpected place) and sanitises the taint flow for path-injection analysis.
+/// The value is CI-controlled, but validate it before it reaches a filesystem
+/// sink: require an absolute path with no `..` traversal components. This both
+/// rejects a malformed/relative override (which would create a directory in an
+/// unexpected place) and sanitises the taint flow for path-injection analysis.
+/// Returns `None` when the var is unset (local runs) or fails validation.
+fn validated_shared_dir(env_var: &str) -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os(env_var)?);
     if !dir.is_absolute()
         || dir
             .components()
@@ -78,6 +73,31 @@ fn shared_cache_dir() -> Option<PathBuf> {
     }
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
+}
+
+/// A persistent directory shared across scenarios for heavy, immutable artifacts
+/// (TheRock runtime wheels, HF model weights, engine venvs). Set by CI to a path
+/// on the runner's persistent disk; unset for local runs, where every scenario
+/// stays fully isolated (nothing shared).
+///
+/// Sharing these read-only artifacts avoids re-downloading multi-GB runtimes and
+/// model weights per scenario. Only immutable artifacts are shared — service
+/// records, config, and per-service engine state stay isolated per scenario.
+fn shared_cache_dir() -> Option<PathBuf> {
+    validated_shared_dir("E2E_SHARED_CACHE_DIR")
+}
+
+/// A persistent `uv` download/build cache shared across scenarios (`UV_CACHE_DIR`).
+///
+/// `rocm install sdk` fetches TheRock runtime wheels with `uv`, which are large
+/// and identical across scenarios. Sharing uv's content-addressed cache turns a
+/// cold ~160s install into a ~34s warm one (measured on MI300X) without sharing
+/// any mutable state — the runtimes *registry* the suite asserts on still lives
+/// in each scenario's isolated `<data>/runtimes` (see `default()`). Kept as its
+/// own env var (not derived from `E2E_SHARED_CACHE_DIR`) so CI can place it on a
+/// larger overlay disk than the model-weights cache. Unset locally → no sharing.
+fn shared_uv_cache_dir() -> Option<PathBuf> {
+    validated_shared_dir("E2E_SHARED_UV_CACHE_DIR")
 }
 
 impl Default for E2eWorld {
@@ -132,6 +152,13 @@ impl E2eWorld {
         if let Some(shared) = shared_cache_dir() {
             cmd.env("HF_HOME", shared.join("huggingface"));
             cmd.env("PIP_CACHE_DIR", shared.join("pip"));
+        }
+        // Share uv's content-addressed download/build cache (the wheels `rocm
+        // install sdk` fetches) so only the first scenario pays the cold download.
+        // Independent of the weights cache above so CI can host it on a larger
+        // disk; the runtimes registry the suite asserts on stays isolated.
+        if let Some(uv_cache) = shared_uv_cache_dir() {
+            cmd.env("UV_CACHE_DIR", uv_cache);
         }
         // A scenario that planted a fake pre-existing ROCm install points the
         // CLI's legacy-ROCm probe at it via ROCM_PATH, so `rocm examine` detects
