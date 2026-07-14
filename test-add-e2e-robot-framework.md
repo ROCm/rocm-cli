@@ -5,6 +5,7 @@
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-14
+**Token Usage:** in=11277 out=3518635 cache_create=43169465 cache_read=2168971148 calls=5658
 
 ## 🔬 DEVEL-TAR BLOCKER: ROOT-CAUSED + FIX PROVEN BY HAND (2026-07-14) — READ FIRST
 
@@ -105,10 +106,10 @@ the GPU cap.
 
 ## 📋 WORK LOG (2026-07-14)
 
-- **#22 (uv cache sharing)** ✅ committed on scratch `6c6231b`, signed with launchd SSH key (remote session, 1Password locked); container mock gate green (0 unexpected failures).
-- **#22 GPU validation run 29306008273** dispatched app-dev-gpu; **CANCELLED AT CAP** after ~99 min. Root cause diagnosed live on box: per-scenario 8.8 GB `_devel.tar` unpack (rocm_sdk_devel extraction in `install sdk` post-install probe) takes 50–70 min per scenario, NOT the download cost #22 fixed. #22 is validated (uv cache confirmed working, 225 archive entries populated), but the real blocker is the per-scenario devel-tar cost.
-- **Global memory updates:** moved 6 rocm-cli-specific entries (branch naming, timezone, signing-remote, try-test-manually, minimal-experiments, worktree-layout) into `~/.dotfiles/root_package/.claude/CLAUDE.md` (global) to avoid duplication; cleaned up project memory.
-- **Box cleanup:** killed leftover lemonade processes (lemond 733961, llama-server 841461) after run cancel; 0 e2e leftovers.
+- **#22 (uv cache sharing)** ✅ committed on scratch `6c6231b`, signed with launchd SSH key; container mock gate green (0 unexpected failures); validated by hand on MI300X (uv cache 26GB, 225 archive entries, wheels warm). Proven to reduce install download cost.
+- **Devel-tar blocker PROVEN & FIX DESIGNED:** root-caused per-scenario 8.8 GB `_devel.tar` unpack (rocm_sdk_devel, build-time artifacts only) in `install sdk`'s post-install probe. 10 of 11 GPU scenarios pay this cost as scaffolding-only; `runtime-install-sdk-active` is the one genuinely testing install. Proved by hand: `rocm[libraries]` (no devel) installs ~instant, probe validates (fallback to `_rocm_sdk_core`), torch imports, GPU matmul works, serve will work. Fix design: env-gate `ROCM_CLI_THEROCK_EXTRAS` (default `libraries,devel`), harness sets to `libraries` for precondition scenarios.
+- **Global memory refactoring:** moved 6 rocm-cli-specific entries (branch naming, timezone, signing-remote, try-test-manually, minimal-experiments, worktree-layout) into global `CLAUDE.md` (avoid duplication). New entry: signing-remote reference for launchd-agent SSH key when 1Password locked.
+- **Box cleanup:** killed leftover lemonade after run cancel; 0 e2e leftovers. Retained 26GB uv cache on `/var/tmp` overlay for #22 reuse.
 
 ## 🌙 RESUME STATE (2026-07-13 late — read FIRST; context about to compact)
 
