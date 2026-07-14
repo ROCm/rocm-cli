@@ -5,6 +5,7 @@
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-14
+**Token Usage:** in=11490 out=3569750 cache_create=44048080 cache_read=2183015218 calls=5767
 
 ## ✅ SHARE-ONE-RUNTIME PROVEN BY HAND (2026-07-14) — READ FIRST
 
@@ -203,7 +204,13 @@ the GPU cap.
 
 ---
 
-## 📋 WORK LOG (2026-07-14)
+## 📋 WORK LOG (2026-07-14 — TUI E2E spike + parent WIP research)
+
+- **Created new WIP `test-e2e-tui-cucumber`** (test-e2e-tui-cucumber.md on progress branch): the dash TUI is NOT untestable black-box; can be driven via PTY (portable-pty + vt100) like any terminal app. Spike proven by hand: drove `rocm dash --demo` under 80×24 PTY, asserted on screen grid, sent Tab, saw redraw, quit cleanly.
+- **Research findings into TUI e2e WIP:** portable-pty 0.9 + vt100 0.16 is the standard Rust-native stack (honors EAI-7164 one-toolchain). Product already has determinism knobs: `--demo` (no GPU/daemon), `--dev-chat-mock` (fixed reply), `interactive_terminal()` requires TTY (PTY satisfies). Windows ConPTY support exists but crossterm input is flaky; likely gate to linux(+mac).
+- **Spike execution:** throwaway harness (workspace/tui-spike/) spawned real `rocm` binary, polled `vt100` screen for `rocm.ai` marker, sent Tab, read the dashboard with tabs/keybindings, quit. Result: `opened=true exited=true`. Takeaway: portable-pty needs absolute binary path.
+
+### 2026-07-14 (continued)
 
 - **#22 (uv cache sharing)** ✅ committed on scratch `6c6231b`, signed with launchd SSH key; container mock gate green (0 unexpected failures); validated by hand on MI300X (uv cache 26GB, 225 archive entries, wheels warm). Proven to reduce install download cost.
 - **Devel-tar blocker PROVEN & FIX DESIGNED:** root-caused per-scenario 8.8 GB `_devel.tar` unpack (rocm_sdk_devel, build-time artifacts only) in `install sdk`'s post-install probe. 10 of 11 GPU scenarios pay this cost as scaffolding-only; `runtime-install-sdk-active` is the one genuinely testing install. Proved by hand: `rocm[libraries]` (no devel) installs ~instant, probe validates (fallback to `_rocm_sdk_core`), torch imports, GPU matmul works, serve will work. Fix design: env-gate `ROCM_CLI_THEROCK_EXTRAS` (default `libraries,devel`), harness sets to `libraries` for precondition scenarios.
