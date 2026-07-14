@@ -4,7 +4,7 @@
 **Stage:** 22-volen-review-triaged-3B+2NB-fixed-strix23-needs-xfail
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
-**Last Updated:** 2026-07-14
+**Last Updated:** 2026-07-14 (idle flush)
 
 ## 📋 VOLEN-SILO (Eugene / pr-review-watcher BOT) REVIEW — TRIAGED (2026-07-14) — READ FIRST
 
@@ -200,6 +200,8 @@ Rebuilt the `1817c5b` idea correctly:
 default-engine), rominf re-review pending.
 
 ## 📋 Work Log
+
+**2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
 **2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
