@@ -1,10 +1,44 @@
 
 # WIP: E2E BDD tests for rocm-cli (PR #69, cucumber-rs)
 
-**Stage:** 16-share-one-runtime-IMPLEMENTED-committed-scratch-ebc00b1
+**Stage:** 17-prewarm-mv-bug-fixed-021b14c-reprobe-29321270536
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
-**Last Updated:** 2026-07-14 (idle flush)
+**Last Updated:** 2026-07-14
+
+## 🔧 PRE-WARM mv BUG FOUND + FIXED (2026-07-14) — READ FIRST
+
+**Scoped 3-scenario probe (run 29320025393, commit dde598c) FAILED — but exactly as the
+minimal-experiment method intends: fast (~6min) with a precise signal.** Result:
+- isolated install scenario (`runtime-install-sdk-active`) ✅ PASSED.
+- BOTH shared serve scenarios (`serve-vllm-inference`, `serve-readiness-contract`):
+  `Given a managed runtime is active` ✅ (shared runtime picked up!) but
+  `a model is being served on GPU` ✘ — `rocm serve failed` INSTANTLY (~1s, empty output).
+
+**ROOT CAUSE:** the CI pre-warm did `install sdk` into a scratch dir then
+`mv "$prewarm/data/runtimes" "$E2E_SHARED_RUNTIMES_DIR"`. But `install sdk` bakes ABSOLUTE
+paths into the runtime manifest + active.json (`install_root`, `python_executable` =
+`.../e2e-prewarm/data/runtimes/wheel/...`). After the mv those point at a DELETED dir, so
+serve can't find the runtime binary → instant fail. `runtimes list` still said `status=ready`
+(precondition passed) — the failure only hit at serve. Verified on box: baked install_root
+`.../e2e-prewarm/data/runtimes/wheel/release-wheel-gfx94x-dcgpu-7-13-0` → "No such file".
+
+**Why my earlier manual proof missed it:** I pointed E2E_SHARED_RUNTIMES_DIR at
+`e2e-devel/data/runtimes` IN PLACE (paths valid). The CI mv was the only untested delta.
+
+**FIX (commit 021b14c on scratch, pushed):** install the pre-warm directly into its
+persistent `data/runtimes` and set `E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"` — NO
+mv. Baked manifest paths stay valid; each scenario's data/runtimes symlink resolves to the
+real tree. Applied to BOTH ci.yml e2e-gpu + nightly e2e-gpu-nightly. Re-proved by hand:
+symlink-to-in-place-install → serve READY 75s + real chat completion.
+
+**RE-DISPATCHED:** run **29321270536** (021b14c), same scoped 3-scenario probe. Monitoring
+(cron 3f5d8b3d). Expect: all 3 pass, no 'rocm serve failed'. Box cleaned (stale e2e-runtimes
++ e2e-prewarm removed; GPU VRAM back to ~297MB).
+
+**Container gate run before push (per user rule).** name_filter dispatch input still TEMP.
+
+---
 **Token Usage:** in=12024 out=3725255 cache_create=47997275 cache_read=2277540752 calls=6034
 
 ## ✅ SHARE-ONE-RUNTIME IMPLEMENTED + ON SCRATCH (2026-07-14) — READ FIRST
