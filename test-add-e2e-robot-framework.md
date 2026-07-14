@@ -1,13 +1,54 @@
 
 # WIP: E2E BDD tests for rocm-cli (PR #69, cucumber-rs)
 
-**Stage:** 13-devel-tar-blocker-root-caused-fix-designed-libonly-proven
+**Stage:** 14-libonly-fix-DISPROVEN-by-hand-devel-required-for-serve
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-14
 **Token Usage:** in=11277 out=3518635 cache_create=43169465 cache_read=2168971148 calls=5658
 
-## 🔬 DEVEL-TAR BLOCKER: ROOT-CAUSED + FIX PROVEN BY HAND (2026-07-14) — READ FIRST
+## ❌ LIBRARIES-ONLY FIX DISPROVEN BY HAND (2026-07-14) — READ FIRST, SUPERSEDES BELOW
+
+**The `ROCM_CLI_THEROCK_EXTRAS=libraries` fix does NOT work — `devel` IS required to
+serve.** Caught by hand-testing on app-dev MI300X BEFORE any CI dispatch (this is exactly
+why we test manually first). Controlled A/B on the SAME pod, same CLI binary (built from
+scratch + the extras patch), same env — only the extra differed:
+- **full `rocm[libraries,devel]` install → serve Qwen2.5-1.5B on vLLM = READY in 75s. ✅**
+- **`rocm[libraries]` (no devel) install → serve CRASHES:** vLLM `import torch` →
+  `import amdsmi` → loads the STALE system `/opt/rocm/lib/libamd_smi.so` →
+  `AttributeError: undefined symbol: amdsmi_get_node_handle`. vLLM exits before ready. ❌
+- Dropping `devel` is the ONLY difference and it breaks serve. My earlier "environmental
+  /opt/rocm confounder" read was WRONG — the devel install serves fine on the SAME polluted
+  pod. Devel provides something (a libamd_smi on a path that wins amdsmi's search / shadows
+  the system one) that libraries-only lacks. `amdsmi/libamd_smi.so` is byte-identical in both
+  trees, so it's a LOADER-PATH/precedence effect from what devel adds, not that file itself.
+
+**Why my first hand-experiment looked green (the trap):** the first probe set
+`LD_LIBRARY_PATH` to the runtime libs manually and torch imported + a matmul ran. That proved
+"a libraries-only venv CAN do GPU compute in a hand-tuned env" — NOT "the CLI's serve works
+with libraries-only". The real `rocm serve` env resolves amdsmi differently and fails. Lesson:
+test the ACTUAL command path (`rocm serve`), not a hand-approximated `import torch`.
+
+**CONSEQUENCE:** the env-knob code is sound + prod-safe (default unchanged, unit-tested,
+`--dry-run` wiring verified) but the harness must NOT use `libraries` for serve preconditions.
+Timings observed: a SINGLE devel install = 30s, install+serve ready = 75s — NOT slow. The
+90min-cap blowups were N repetitions (+ earlier hang/contention), so the real fix is to cut
+the install COUNT, not the per-install size.
+
+**RECOMMENDATION (decide w/ user):** abandon libraries-only; pursue **share ONE installed
+runtime across scenarios** (the `1817c5b` direction, done correctly — install once, symlink
+`data/runtimes` via `E2E_SHARED_RUNTIMES_DIR`, keep config/services/registry-state isolated).
+The env-knob branch is NOT the fix: either revert the harness wiring (keep the harmless
+product knob unused) or drop the whole patch.
+
+**⚠️ NOTHING FROM THIS FIX IS COMMITTED** — only local worktree edits in `ci-e2e-framework-fixes`
+(therock.rs extras knob + `run_rocm_with_env` + runtime_steps wiring) + the same patch applied
+on the pod checkout (uncommitted). #22 (uv cache) remains the only committed new work (scratch
+`6c6231b`). Box: e2e-devel/e2e-libonly test dirs left at /var/tmp for reference; serves killed.
+
+---
+
+## 🔬 DEVEL-TAR BLOCKER: ROOT-CAUSED + LIBONLY FIX (2026-07-14) — SUPERSEDED, SEE ABOVE
 
 **Root cause (source-traced):** `rocm install sdk` installs `rocm[libraries,devel]`
 (`apps/rocm/src/therock.rs:992`, `therock_pip_package_specs`). The `devel` extra pulls
