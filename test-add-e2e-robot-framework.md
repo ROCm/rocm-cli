@@ -31,11 +31,11 @@ SCRATCH only (e21297d). Bring to PR (test/add-e2e-robot-framework) after strix-w
 
 # WIP: E2E BDD tests for rocm-cli (PR #69, cucumber-rs)
 
-**Stage:** 24-report-changes-committed-diagnostic-probe-dispatched
+**Stage:** 25-report-changes-merged-version-probe-diagnosed
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework (PR-side) / ci-e2e-framework-fixes (scratch, active)
 **Last Updated:** 2026-07-14
-**Token Usage:** in=13036 out=4146295 cache_create=50055070 cache_read=2375692212 calls=6542
+**Token Usage:** in=13098 out=4168920 cache_create=50069541 cache_read=2383913684 calls=6573
 
 ## 📋 VOLEN-SILO (Eugene / pr-review-watcher BOT) REVIEW — TRIAGED (2026-07-14) — READ FIRST
 
@@ -232,11 +232,10 @@ default-engine), rominf re-review pending.
 
 ## 📋 Work Log
 
-**2026-07-14 (late — report fixes + diagnostic dispatched):**
-- ✅ **Xfail grid glyph**: `xfail` → grey ✗ (`.status-xfail`), muted sibling to red ❌. Fixed maud dual-class bug. Legend updated HTML + markdown.
-- ✅ **Command coverage n/a**: not-run cells show `n/a` (vs blank); legend explains GPU/OS/engine-specific applicability.
-- ✅ **Version collection hardening** (scratch `b38b50d`): OS-aware `site_packages_dirs()` glob (Windows `Lib/`, non-pinned python3.X Unix); `lemond`/`lemond.exe` probe. Fixes strix-ubuntu vllm + strix-windows layout issues. Container gate green (mock E2E 0 unexpected, libs 33+23 pass `-D warnings`).
-- ✅ **Diagnostic dispatch**: run 29363255225 (strix-ubuntu, scenario 7 lemonade-serve only, `name_filter`). Confirms whether vllm+lemonade now populate in platform.json. Cron monitoring every 4 min. 
+**2026-07-14 (late — all report fixes committed, version fix diagnosed):**
+- ✅ **Report changes merged to scratch** (`b38b50d`): grey-✗ xfail grid cells (`.status-xfail` CSS), `n/a` coverage blanks + legends (HTML + markdown), fixed maud dual-class bug.
+- ✅ **Version collection redesigned** (OS-aware `site_packages_dirs()` + `lemond`/`lemond.exe`). Container gate full green (report lib 33, e2e-cucumber lib 23, mock E2E 0 unexpected, all under `-D warnings`).
+- ✅ **Diagnostic probe run 29363255225**: strix-ubuntu, scenario 7 lemonade-serve, `name_filter` scoped. **RESULT: vllm + lemonade still `None`**, not fixed. Root cause: scenario 7 serve failed (90s timeout during backend download); lemonade installs lazily on-serve, never reached the shared tree. vllm legitimately absent (strix-ubuntu=lemonade-native, no vllm install). **Decision needed:** read lemonade version without serve completion (e.g., backend-install probe step), or accept lemonade=n/a on Strix. 
 
 **2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state. #23 Strix probe result: both serve-default-engine scenarios still fail on lemonade-native path (backend-install masking engine line, Vulkan instability). Needs xfail or deeper fix. PR #69 all-blocking checks green. VOLEN bot review fully triaged (5B+6NB items addressed in worktree, see section above). Task #22 (share-one-runtime) validated by hand — redesigned without redundant cargo rebuild, with persistence at E2E_SHARED_RUNTIMES_DIR; full GPU suite under 90min cap achieved (run 29322186691, 24 scenarios, 11 xfail as expected, 0 unexpected). Commits on scratch: ebc00b1, 021b14c, 72c6457, fc4687b. Pending: bring #22 to PR after rominf re-review, finalize #23 decision, remove temp name_filter commit.
 
