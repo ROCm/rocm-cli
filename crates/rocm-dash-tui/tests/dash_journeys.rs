@@ -21,7 +21,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo, Snapshot, SystemMetrics};
 use rocm_dash_core::protocol::Event;
-use rocm_dash_tui::app::{ActiveTab, AppState, ConnState};
+use rocm_dash_tui::app::{ActiveTab, AppState, ChatRole, ConnState};
 use rocm_dash_tui::ui;
 
 fn synthetic_snapshot() -> Snapshot {
@@ -126,13 +126,23 @@ fn journey_live_telemetry_updates_state() {
 #[test]
 fn journey_theme_picker() {
     let mut s = connected();
+    let before = s.theme_name.clone();
     s.open_theme_picker();
-    // Moving the selection and applying it must not panic and should leave the
-    // picker in a consistent state (render proves the overlay paints).
+    // Move the selection down one and apply: the active theme must change to the
+    // next theme in the list (the actual state transition, not just "it renders").
     s.theme_picker_move(1);
+    let expected = ui::theme::theme_names()[s.theme_picker_sel].to_string();
+    assert_ne!(
+        expected, before,
+        "moving the picker selects a different theme"
+    );
     let out_open = render(&mut s, 160, 44);
     assert!(!out_open.is_empty());
     s.apply_theme_pick();
+    assert_eq!(
+        s.theme_name, expected,
+        "applying the pick sets the active theme to the selected one"
+    );
     let out_applied = render(&mut s, 160, 44);
     assert!(
         !out_applied.is_empty(),
@@ -173,6 +183,15 @@ fn journey_chat_error_is_shown() {
     s.submit_chat();
     s.on_chat_error("backend unreachable".into());
     assert!(!s.chat_sending, "in-flight cleared on error");
+    // The error must be SURFACED as an error turn in the transcript, not silently
+    // dropped — this is the actual behaviour the journey name claims.
+    let last = s.chat.last().expect("an error turn was appended");
+    assert_eq!(
+        last.role,
+        ChatRole::Error,
+        "error surfaced as an error turn"
+    );
+    assert_eq!(last.content, "backend unreachable");
     let out = render(&mut s, 160, 44);
     assert!(
         !out.is_empty(),

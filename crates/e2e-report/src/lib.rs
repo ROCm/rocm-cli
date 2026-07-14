@@ -591,6 +591,10 @@ enum CellOutcome {
     Xpass,
     /// Expected skip, yet a result exists — harness/resolver disagreement.
     RanWhenNa,
+    /// Expected to run (pass or xfail) but NO result was recorded — the scenario
+    /// never reported (hung / cancelled / lost report.json). A problem: a
+    /// lost-results run must not be indistinguishable from all-pass.
+    Absent,
     /// No expectation and no result recorded for this id on this platform.
     Missing,
 }
@@ -603,10 +607,10 @@ impl CellOutcome {
         match (expected, actual) {
             ("pass", Some(true)) => Self::Pass,
             ("pass", Some(false)) => Self::UnexpectedFail,
-            ("pass", None) => Self::Missing,
+            ("pass", None) => Self::Absent,
             ("xfail", Some(false)) => Self::Xfail,
             ("xfail", Some(true)) => Self::Xpass,
-            ("xfail", None) => Self::Missing,
+            ("xfail", None) => Self::Absent,
             ("skip", None) => Self::Skip,
             ("skip", Some(_)) => Self::RanWhenNa,
             _ => Self::Missing,
@@ -615,7 +619,10 @@ impl CellOutcome {
 
     /// True when this cell needs human attention (report FAILs on any).
     const fn is_problem(self) -> bool {
-        matches!(self, Self::UnexpectedFail | Self::Xpass | Self::RanWhenNa)
+        matches!(
+            self,
+            Self::UnexpectedFail | Self::Xpass | Self::RanWhenNa | Self::Absent
+        )
     }
 
     const fn glyph(self) -> &'static str {
@@ -626,6 +633,7 @@ impl CellOutcome {
             Self::UnexpectedFail => "❌FAIL",
             Self::Xpass => "⚠️XPASS",
             Self::RanWhenNa => "⚠️n/a-ran",
+            Self::Absent => "⚠️no-result",
             Self::Missing => "·",
         }
     }
@@ -780,11 +788,15 @@ fn reconciled_tally(json_path: &Path) -> Option<ReconciledTally> {
             CellOutcome::Pass => t.pass += 1,
             CellOutcome::Xfail => t.xfail += 1,
             CellOutcome::Skip => t.skip += 1,
-            CellOutcome::UnexpectedFail | CellOutcome::Xpass | CellOutcome::RanWhenNa => {
+            CellOutcome::UnexpectedFail
+            | CellOutcome::Xpass
+            | CellOutcome::RanWhenNa
+            | CellOutcome::Absent => {
                 t.problems += 1;
             }
-            // A declared expectation with no result is a missing data point, not a
-            // pass or a problem — it neither greenwashes nor reds the platform.
+            // No expectation AND no result — nothing declared to reconcile. (A
+            // DECLARED expectation with no result is `Absent`, counted above, so a
+            // lost-results run reds the platform instead of silently passing.)
             CellOutcome::Missing => {}
         }
     }
@@ -816,12 +828,15 @@ impl PlatformReport {
         }
     }
 
-    /// Map each scenario name → whether it passed (all steps passed/skipped).
+    /// Map each scenario name → whether it passed. Uses the canonical
+    /// `scenario_passed` predicate (every step passed) so the command-coverage
+    /// table can never diverge from the CI gate / grid — a `skipped` scenario is
+    /// NOT a pass (see `scenario_passed`).
     fn scenario_pass_map(&self) -> std::collections::HashMap<String, bool> {
         self.features
             .iter()
             .flat_map(|f| &f.elements)
-            .map(|el| (el.name.clone(), scenario_status(el) != "failed"))
+            .map(|el| (el.name.clone(), scenario_passed(el)))
             .collect()
     }
 
@@ -2099,9 +2114,14 @@ mod tests {
         assert_eq!(C::reconcile("xfail", Some(true)), C::Xpass);
         assert_eq!(C::reconcile("skip", None), C::Skip);
         assert_eq!(C::reconcile("skip", Some(true)), C::RanWhenNa);
+        // A declared expect-pass/xfail with NO result is Absent (a problem), so a
+        // hung/lost-results run reds the platform instead of greenwashing to PASS.
+        assert_eq!(C::reconcile("pass", None), C::Absent);
+        assert_eq!(C::reconcile("xfail", None), C::Absent);
         assert!(C::UnexpectedFail.is_problem());
         assert!(C::Xpass.is_problem());
         assert!(C::RanWhenNa.is_problem());
+        assert!(C::Absent.is_problem());
         assert!(!C::Pass.is_problem());
         assert!(!C::Xfail.is_problem());
         assert!(!C::Skip.is_problem());

@@ -29,11 +29,6 @@ async fn setup_localhost_model(world: &mut E2eWorld) {
 
 // ── When ───────────────────────────────────────────────────────────
 
-#[when("a chat completion request is sent")]
-async fn send_chat_request(world: &mut E2eWorld) {
-    crate::send_chat(world).await;
-}
-
 #[when("the user checks for running services")]
 async fn user_checks_services(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["services", "list"]);
