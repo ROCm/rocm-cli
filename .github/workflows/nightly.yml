@@ -357,28 +357,28 @@ jobs:
           export E2E_SHARED_UV_CACHE_DIR="/var/tmp/rocm-e2e-uv-cache"
           # Share ONE installed managed runtime across serve/chat scenarios so
           # install sdk runs once per runner, not per scenario (see ci.yml e2e-gpu).
-          export E2E_SHARED_RUNTIMES_DIR="$RUNNER_WORKSPACE/e2e-runtimes"
+          # The shared dir IS the pre-warm's own data/runtimes; NEVER move it — a
+          # post-install mv invalidates the absolute paths install sdk bakes into
+          # the runtime manifest and every serve fails instantly (run 29320025393).
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
+          export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # Build once; reuse for pre-warm + suite so xtask doesn't rebuild.
           cargo build --release -p rocm
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
 
           # Pre-warm the shared runtime once/serially before the suite; skipped
-          # once populated (persists across runs). See ci.yml e2e-gpu for rationale.
+          # once populated (persists across runs). Install in place (no mv) so the
+          # manifest's absolute paths stay valid. See ci.yml e2e-gpu for rationale.
           if [ ! -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
             echo "pre-warming shared runtime (first run on this runner)…"
-            prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
-            rm -rf "$prewarm"; mkdir -p "$prewarm"/{data,config,cache} "$E2E_SHARED_RUNTIMES_DIR"
+            mkdir -p "$prewarm"/{data,config,cache}
             ROCM_CLI_CONFIG_DIR="$prewarm/config" \
             ROCM_CLI_DATA_DIR="$prewarm/data" \
             ROCM_CLI_CACHE_DIR="$prewarm/cache" \
             HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
             UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
               "$ROCM_CLI_BINARY" install sdk
-            if [ -d "$prewarm/data/runtimes/registry" ]; then
-              rm -rf "$E2E_SHARED_RUNTIMES_DIR"
-              mv "$prewarm/data/runtimes" "$E2E_SHARED_RUNTIMES_DIR"
-            fi
           fi
 
           cargo xtask e2e

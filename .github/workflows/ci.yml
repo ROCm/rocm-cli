@@ -739,7 +739,16 @@ jobs:
           # data/runtimes here (see use_shared_runtimes); clean-slate scenarios
           # stay isolated. Persisted across runs on RUNNER_WORKSPACE, so after the
           # first run ever the pre-warm below is a no-op.
-          export E2E_SHARED_RUNTIMES_DIR="$RUNNER_WORKSPACE/e2e-runtimes"
+          #
+          # CRITICAL: the shared dir IS the pre-warm's own `data/runtimes`, and we
+          # NEVER move it. `install sdk` bakes ABSOLUTE paths (install_root,
+          # python_executable) into the runtime manifest; a post-install `mv` would
+          # leave those pointing at a deleted location and every serve would fail
+          # instantly (observed on run 29320025393). Installing in place keeps the
+          # baked paths valid, and each scenario's data/runtimes symlink resolves to
+          # this same real tree.
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
+          export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # Build the rocm binary ONCE and reuse it for both the pre-warm and the
           # suite (via ROCM_CLI_BINARY) so xtask does not rebuild. Honors
@@ -749,23 +758,20 @@ jobs:
 
           # Pre-warm the shared runtime ONCE, SERIALLY, before the suite — never
           # lazily inside a concurrent scenario (two multi-GiB installs racing the
-          # same dir). Skipped entirely once the shared tree is populated (it
-          # persists across runs). Uses the prebuilt binary (no cargo run
-          # --release), the shared uv + HF caches, and an isolated scratch data dir
-          # whose runtimes it produces get moved into the shared location.
+          # same dir). Skipped once the tree is populated (it persists across runs).
+          # Uses the prebuilt binary (no cargo run --release) and the shared uv + HF
+          # caches. Installs directly into the persistent pre-warm data dir (no mv),
+          # so the manifest's absolute install_root stays valid for every scenario.
           if [ ! -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
             echo "pre-warming shared runtime (first run on this runner)…"
-            prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
-            rm -rf "$prewarm"; mkdir -p "$prewarm"/{data,config,cache} "$E2E_SHARED_RUNTIMES_DIR"
+            mkdir -p "$prewarm"/{data,config,cache}
             ROCM_CLI_CONFIG_DIR="$prewarm/config" \
             ROCM_CLI_DATA_DIR="$prewarm/data" \
             ROCM_CLI_CACHE_DIR="$prewarm/cache" \
             HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
             UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
               "$ROCM_CLI_BINARY" install sdk
-            if [ -d "$prewarm/data/runtimes/registry" ]; then
-              rm -rf "$E2E_SHARED_RUNTIMES_DIR"
-              mv "$prewarm/data/runtimes" "$E2E_SHARED_RUNTIMES_DIR"
+            if [ -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
               echo "shared runtime pre-warmed at $E2E_SHARED_RUNTIMES_DIR"
             else
               echo "pre-warm did not produce a runtimes registry; scenarios will install their own" >&2
