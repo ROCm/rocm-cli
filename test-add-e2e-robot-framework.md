@@ -1,10 +1,10 @@
 
 # WIP: E2E BDD tests for rocm-cli (PR #69, cucumber-rs)
 
-**Stage:** 19-FULL-suite-under-cap-30min-goal-achieved-1-xpass-to-triage
+**Stage:** 20-full-suite-green-under-cap-xpass-fixed-fc4687b
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
-**Last Updated:** 2026-07-14 (idle flush)
+**Last Updated:** 2026-07-14
 
 ## 🎉 ORIGINAL GOAL ACHIEVED — FULL GPU SUITE UNDER CAP (2026-07-14) — READ FIRST
 
@@ -17,17 +17,22 @@ cap. Share-one-runtime works end-to-end in CI:
 - **24 scenarios (13 passed, 11 failed); Reconciliation: 11 xfail (as expected), 0 unexpected
   failures.** The 11 "failures" are all known-bug xfails — healthy.
 
-**ONE action item — 1 XPASS (why the job shows red):** `chat-end-to-end-local-model (EAI-7221)`
-is marked xfail for `effective_engine=vllm` in expectations.toml (lines 103-108) but PASSED on
-MI300X — EAI-7221 (vLLM end-to-end chat returns no valid reply) appears FIXED on the vLLM path.
-The harness flags XPASS as failure (good hygiene). **NOT yet edited** — a single XPASS could be
-flaky; no corroborating history that EAI-7221 was deliberately fixed. DECISION NEEDED: confirm
-non-flaky (re-run / check ticket), then remove the vllm-condition EAI-7221 block (keep the
-lemonade EAI-7052 block at lines 110-115). This is the only thing keeping the run red; it is
-NOT a regression from share-one-runtime.
+**XPASS TRIAGED + FIXED (commit fc4687b, pushed):** the 1 XPASS was
+`chat-end-to-end-local-model (EAI-7221)`. Checked the ticket (acli): EAI-7221 = "TUI chat
+sends hardcoded 'local-model' instead of querying /v1/models" — a **TUI-only** bug (status
+In Progress). But this scenario drives the **CLI** `rocm chat --prompt` path
+(chat_steps.rs:93,106), which discovers the model correctly and works — so the vLLM-path xfail
+was MISMAPPED (scenario ≠ the bug's code path), NOT a fix to verify. Confirmed non-flaky: 3/3
+green re-runs on MI300X + a clean 0-xfail/0-XPASS reconciliation with the block removed.
+Dropped the vLLM EAI-7221 block (kept lemonade EAI-7052). Container gate green before push.
+So the full GPU suite is now GREEN under cap: 0 XPASS, 0 unexpected failures.
+- (Reconciliation puzzle explained: standalone `--name` runs showed the scenario as
+  expect-pass because report.json holds only scenarios that ran; the full run's accumulated
+  report is what surfaced the XPASS. Immaterial now — block removed.)
 
 **Commits on scratch (all pushed, signed):** ebc00b1 (share-one-runtime harness+CI), 021b14c
-(pre-warm in-place, no mv — fixes baked-path bug), 72c6457 (remove temp name_filter). Plus
+(pre-warm in-place, no mv — fixes baked-path bug), 72c6457 (remove temp name_filter), fc4687b
+(drop mismapped EAI-7221 vLLM xfail). Plus
 6c6231b (#22 uv cache) earlier. NONE on the PR branch yet.
 
 **NEXT:** (1) triage the EAI-7221 XPASS; (2) bring #22 + share-one-runtime to the PR branch;
