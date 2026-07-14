@@ -250,6 +250,8 @@ impl ResolvedScenario {
 pub struct PlatformManifest<'a> {
     pub platform_slug: &'a str,
     pub capability: &'a HostCapability,
+    /// Component versions (OS/ROCm/vLLM/lemonade) for the report heading.
+    pub versions: crate::capability::PlatformVersions,
     pub expectations: Vec<ResolvedScenario>,
 }
 

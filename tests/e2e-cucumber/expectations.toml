@@ -63,13 +63,15 @@ bug = "EAI-7052"
 reason = "Default serve resolves to a GGUF recipe on lemonade; its Vulkan backend hangs on Instinct, so the endpoint never reaches ready."
 serve_timeout_secs = 90
 
-# On a lemonade-native host (Strix Halo) the first default serve triggers a
-# llama.cpp backend install whose progress output replaces the serve plan, so no
-# `engine:` line is emitted for the "engine selected automatically" assertion.
+# On a lemonade-native LINUX host (Strix Halo Ubuntu) the first default serve
+# triggers a llama.cpp backend install whose progress output replaces the serve
+# plan, so no `engine:` line is emitted for the "engine selected automatically"
+# assertion. os=linux: on native Windows this scenario PASSES (run 29338475133
+# Strix-Windows), so it must NOT be xfail'd there.
 [["serve-default-engine-working-endpoint"]]
-when = { effective_engine = "lemonade" }
+when = { effective_engine = "lemonade", os = "linux" }
 bug = "EAI-7423"
-reason = "First default serve on lemonade runs a backend install; its output omits the serve-plan `engine:` line, so engine auto-selection can't be asserted."
+reason = "First default serve on lemonade (Linux) runs a backend install; its output omits the serve-plan `engine:` line, so engine auto-selection can't be asserted."
 serve_timeout_secs = 90
 
 [["serve-default-engine-inference"]]
@@ -78,12 +80,13 @@ bug = "EAI-7052"
 reason = "Default serve resolves to a GGUF recipe on lemonade; its Vulkan backend hangs on Instinct, so inference never succeeds."
 serve_timeout_secs = 90
 
-# On a lemonade-native host the served model's endpoint drops before inference
-# (lemonade llama.cpp Vulkan instability, EAI-7052; e2e gap tracked in EAI-7423).
+# On a lemonade-native LINUX host the served model's endpoint drops before
+# inference (lemonade llama.cpp Vulkan instability on Linux, EAI-7052; e2e gap
+# tracked in EAI-7423). os=linux: passes on native Windows (run 29338475133).
 [["serve-default-engine-inference"]]
-when = { effective_engine = "lemonade" }
+when = { effective_engine = "lemonade", os = "linux" }
 bug = "EAI-7423"
-reason = "Default serve on lemonade: the endpoint dies before inference (llama.cpp Vulkan instability, EAI-7052)."
+reason = "Default serve on lemonade (Linux): the endpoint dies before inference (llama.cpp Vulkan instability, EAI-7052)."
 serve_timeout_secs = 90
 
 [["serve-readiness-contract"]]
@@ -92,20 +95,23 @@ bug = "EAI-7333"
 reason = "CLI reports the vLLM service ready, but an immediate inference request fails."
 serve_timeout_secs = 90
 
-# On a lemonade host this scenario does real lemonade inference, which hits
-# the EAI-7052 backend failure (see serve-lemonade-inference).
+# On a lemonade LINUX host this scenario does real lemonade inference, which hits
+# the EAI-7052 llama.cpp Vulkan hang (see serve-lemonade-inference). os=linux:
+# on native Windows lemonade inference works, so this PASSES there (verified run
+# 29338475133 Strix-Windows XPASS) and must not be xfail'd.
 [["serve-readiness-contract"]]
-when = { effective_engine = "lemonade" }
+when = { effective_engine = "lemonade", os = "linux" }
 bug = "EAI-7052"
-reason = "Lemonade inference fails on the llama.cpp backend (Vulkan hang on Linux; connection drop on Windows) instead of using system ROCm."
+reason = "Lemonade inference fails on the llama.cpp Vulkan backend on Linux instead of using system ROCm."
 serve_timeout_secs = 90
 
-# --- EAI-7052: lemonade llama.cpp backend fails inference instead of using ---
-# system ROCm. Both Linux (Vulkan hang) and Windows (connection drop) — any OS.
+# --- EAI-7052: lemonade llama.cpp Vulkan backend fails inference on LINUX
+# instead of using system ROCm. os=linux: native Windows lemonade inference works
+# (run 29338475133 Strix-Windows XPASS'd this), so scope the xfail to Linux. ---
 [["serve-lemonade-inference"]]
-when = { effective_engine = "lemonade" }
+when = { effective_engine = "lemonade", os = "linux" }
 bug = "EAI-7052"
-reason = "Lemonade inference fails on the llama.cpp backend (Vulkan hang on Linux; connection drop on Windows) instead of using system ROCm."
+reason = "Lemonade inference fails on the llama.cpp Vulkan backend on Linux instead of using system ROCm."
 serve_timeout_secs = 90
 
 # --- EAI-7223: chat requests with tool definitions rejected (vLLM path) ---
@@ -127,11 +133,12 @@ serve_timeout_secs = 90
 # scenario exercises the CLI `rocm chat --prompt` path (which correctly discovers the
 # model via /v1/models). Verified expect-pass on MI300X vLLM (XPASS on run 29322186691,
 # then 3/3 green re-runs), so there is NO vLLM xfail for this scenario — the CLI chat
-# path works. Only the lemonade path stays xfail (real inference → EAI-7052 backend bug).
+# path works. Only the lemonade LINUX path stays xfail (real inference → EAI-7052
+# Vulkan hang); native Windows lemonade inference works (run 29338475133 XPASS).
 [["chat-end-to-end-local-model"]]
-when = { effective_engine = "lemonade" }
+when = { effective_engine = "lemonade", os = "linux" }
 bug = "EAI-7052"
-reason = "Lemonade inference fails on the llama.cpp backend (Vulkan hang on Linux; connection drop on Windows) instead of using system ROCm."
+reason = "Lemonade inference fails on the llama.cpp Vulkan backend on Linux instead of using system ROCm."
 serve_timeout_secs = 90
 
 # --- EAI-7383: `rocm help` lists subcommands in declaration order, not

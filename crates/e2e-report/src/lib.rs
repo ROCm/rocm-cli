@@ -543,6 +543,9 @@ struct PlatformManifest {
     platform_slug: String,
     #[serde(default)]
     capability: Option<ManifestCapability>,
+    /// Component versions (OS/ROCm/vLLM/lemonade); absent in older artifacts.
+    #[serde(default)]
+    versions: PlatformVersions,
     #[serde(default)]
     expectations: Vec<ManifestExpectation>,
 }
@@ -551,6 +554,37 @@ struct PlatformManifest {
 struct ManifestCapability {
     #[serde(default)]
     effective_serve_engine: String,
+}
+
+/// Per-platform component versions, mirrored from the harness `platform.json`.
+/// All optional — a source not present on a platform is simply omitted.
+#[derive(Deserialize, Default, Clone)]
+struct PlatformVersions {
+    #[serde(default)]
+    os: Option<String>,
+    #[serde(default)]
+    rocm: Option<String>,
+    #[serde(default)]
+    vllm: Option<String>,
+    #[serde(default)]
+    lemonade: Option<String>,
+}
+
+impl PlatformVersions {
+    /// Rendered "os X · ROCm Y · vLLM Z · lemonade W" line for a column heading,
+    /// skipping absent components. Empty when nothing is known.
+    fn summary(&self) -> String {
+        [
+            self.os.as_deref().map(|v| format!("OS {v}")),
+            self.rocm.as_deref().map(|v| format!("ROCm {v}")),
+            self.vllm.as_deref().map(|v| format!("vLLM {v}")),
+            self.lemonade.as_deref().map(|v| format!("lemonade {v}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ")
+    }
 }
 
 /// One scenario's resolved expectation, keyed by its stable `@id`.
@@ -645,6 +679,8 @@ struct GridColumn {
     slug: String,
     /// Effective serve engine on this host (for the column subheading).
     engine: String,
+    /// Component versions (OS/ROCm/vLLM/lemonade) for the column heading.
+    versions: PlatformVersions,
     /// scenario id → reconciled outcome.
     outcomes: std::collections::BTreeMap<String, CellOutcome>,
     /// Per-id bug/reason, surfaced in the "needs attention" list.
@@ -686,6 +722,7 @@ impl Grid {
                             .as_ref()
                             .map(|c| c.effective_serve_engine.clone())
                             .unwrap_or_default(),
+                        versions: manifest.versions.clone(),
                         outcomes: std::collections::BTreeMap::new(),
                         details: std::collections::BTreeMap::new(),
                     });
@@ -1119,9 +1156,11 @@ fn expectation_grid_html(inputs: &[(String, PathBuf)]) -> Markup {
                 tr {
                     th { "Scenario" }
                     @for col in &grid.columns {
+                        @let versions = col.versions.summary();
                         th {
                             (col.slug)
                             @if !col.engine.is_empty() { br; small { (col.engine) } }
+                            @if !versions.is_empty() { br; small.versions { (versions) } }
                         }
                     }
                 }
@@ -1184,7 +1223,8 @@ fn expectation_grid_markdown(inputs: &[(String, PathBuf)]) -> String {
          ❌FAIL regression · ⚠️XPASS bug fixed here (stale entry) · · no data._\n\n",
     );
 
-    // Header: one column per platform, with its effective engine as context.
+    // Header: one column per platform, with its effective engine + component
+    // versions (OS/ROCm/vLLM/lemonade) as context.
     out.push_str("| Scenario |");
     for col in &grid.columns {
         let eng = if col.engine.is_empty() {
@@ -1192,7 +1232,13 @@ fn expectation_grid_markdown(inputs: &[(String, PathBuf)]) -> String {
         } else {
             format!("<br><sub>{}</sub>", col.engine)
         };
-        let _ = write!(out, " {}{} |", col.slug, eng);
+        let versions = col.versions.summary();
+        let ver = if versions.is_empty() {
+            String::new()
+        } else {
+            format!("<br><sub>{versions}</sub>")
+        };
+        let _ = write!(out, " {}{}{} |", col.slug, eng, ver);
     }
     out.push('\n');
     out.push_str("|---|");
@@ -2188,6 +2234,51 @@ mod tests {
             md.contains("**XPASS** on `strix-halo`: `serve-default` (EAI-7333)"),
             "needs-attention should list the XPASS with bug:\n{md}"
         );
+    }
+
+    #[test]
+    fn grid_heading_shows_component_versions() {
+        // platform.json carries OS/ROCm/vLLM/lemonade versions → the grid column
+        // heading renders them (skipping any absent component).
+        let report = feature_json(&[(&["id:serve-x"], &["passed"])]);
+        let platform = r#"{
+            "platform_slug": "mi300x",
+            "capability": {"effective_serve_engine": "vllm"},
+            "versions": {"os":"Ubuntu 24.04.3 LTS","rocm":"7.13.0","vllm":"0.23.0+rocm723","lemonade":"10.6.0"},
+            "expectations": [
+                {"id":"serve-x","effective_engine":"vllm","expected":"pass"}
+            ]
+        }"#;
+        let (_d, path) = write_platform(&report, platform);
+        let inputs = vec![("mi300x".to_string(), path)];
+        let md = consolidated_summary_markdown(&inputs);
+        for token in [
+            "OS Ubuntu 24.04.3 LTS",
+            "ROCm 7.13.0",
+            "vLLM 0.23.0+rocm723",
+            "lemonade 10.6.0",
+        ] {
+            assert!(md.contains(token), "grid heading missing {token:?}:\n{md}");
+        }
+    }
+
+    #[test]
+    fn grid_heading_omits_absent_versions() {
+        // A platform.json with only OS+ROCm known renders just those, no vLLM/lemonade.
+        let report = feature_json(&[(&["id:serve-x"], &["passed"])]);
+        let platform = r#"{
+            "platform_slug": "mock",
+            "capability": {"effective_serve_engine": "lemonade"},
+            "versions": {"os":"Debian 12"},
+            "expectations": [
+                {"id":"serve-x","effective_engine":"lemonade","expected":"pass"}
+            ]
+        }"#;
+        let (_d, path) = write_platform(&report, platform);
+        let inputs = vec![("mock".to_string(), path)];
+        let md = consolidated_summary_markdown(&inputs);
+        assert!(md.contains("OS Debian 12"), "should show OS:\n{md}");
+        assert!(!md.contains("vLLM "), "no vLLM version known → omit:\n{md}");
     }
 
     #[test]
