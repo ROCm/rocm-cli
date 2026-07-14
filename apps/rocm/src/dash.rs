@@ -625,11 +625,8 @@ mod tests {
 
     #[test]
     fn ensure_bench_csv_parent_creates_explicit_output_directory() {
-        let root = std::env::temp_dir().join(format!(
-            "rocm-cli-bench-parent-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+        let root =
+            std::env::temp_dir().join(format!("rocm-cli-bench-parent-{}", std::process::id()));
         let csv = root.join("nested").join("results.csv");
 
         ensure_bench_csv_parent(&csv).unwrap();
