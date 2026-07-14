@@ -1,10 +1,57 @@
 
 # WIP: E2E BDD tests for rocm-cli (PR #69, cucumber-rs)
 
-**Stage:** 12-task22-validated-but-NEW-blocker-found-devel-tar-unpack
+**Stage:** 13-devel-tar-blocker-root-caused-fix-designed-libonly-proven
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-14
+
+## 🔬 DEVEL-TAR BLOCKER: ROOT-CAUSED + FIX PROVEN BY HAND (2026-07-14) — READ FIRST
+
+**Root cause (source-traced):** `rocm install sdk` installs `rocm[libraries,devel]`
+(`apps/rocm/src/therock.rs:992`, `therock_pip_package_specs`). The `devel` extra pulls
+the `rocm-sdk-devel` wheel = an **8.8 GB `_devel.tar`** (rocBLAS gtest bins, cmake,
+headers — BUILD-time only). The mandatory post-install probe (`therock.rs:932` →
+`ROCM_SDK_PROBE_SCRIPT` at 2498, calls `_devel.get_devel_root()`) then EXTRACTS it →
+12 GB, into the scenario's ISOLATED `ROCM_CLI_DATA_DIR` on `/tmp`. E2E runs install per
+scenario → 10 of 11 GPU scenarios repeat this → blows the 90min cap (and on run
+29306008273 it hung/looped on the unpack: read_bytes frozen while rchar climbed).
+
+**WHO PAYS IT:** all `@requires-gpu` scenarios that hit `install sdk`. Exactly 1 —
+`runtime-install-sdk-active` (runtime_setup.feature) — actually TESTS install and must
+keep full behavior. The other 10 go through the `@given("a managed runtime is active")`
+precondition (`runtime_steps.rs:21`, runs `install sdk` only if `runtimes list` shows
+`installed: none`); for them the runtime is just SCAFFOLDING to serve/chat.
+
+**KEY INSIGHT — serve needs the runtime LIBS, NOT devel.** vLLM at serve time needs
+`sdk_root/lib{,64}` + `rocm_sysdeps/lib` on `LD_LIBRARY_PATH` (`engines/vllm/src/lib.rs`
+`apply_therock_env`/`therock_library_path_entries`) so torch can dlopen amdhip64/hipblas.
+The 8.8 GB devel tree is never touched by serving. Proven by the existing unit test
+`runtime_only_rocm_sdk_probe_validates_without_devel_root` (therock.rs:4142): probe
+validates with devel ABSENT (falls back to `_rocm_sdk_core` as root_path).
+
+**PROVEN BY HAND ON app-dev MI300X (2026-07-14, minimal experiment):** installed
+`rocm[libraries]==7.13.0` (NO devel) + torch stack into a fresh venv w/ shared UV_CACHE:
+- install near-instant warm; site-packages 9.0 GB; **NO `_devel.tar`, NO `_rocm_sdk_devel`**.
+- CLI probe: `root_path_error=rocm_sdk_devel not installed` → **root_path falls back to
+  `_rocm_sdk_core`**, `amdhip64_resolved:True`, `hipblas_resolved:True` → validate PASSES.
+- `torch 2.11.0+rocm7.13.0`: `cuda.is_available()=True`, sees **MI300X**, **ran a real GPU
+  matmul**. So serve WILL work on a libraries-only runtime. Devel is irrelevant to serving.
+
+**FIX (designed, not yet coded):** env-gate the extras in `therock_pip_package_specs`.
+New env var e.g. `ROCM_CLI_THEROCK_EXTRAS` (default `libraries,devel` = unchanged prod
+behavior). E2E harness sets it to `libraries` for the `a managed runtime is active`
+precondition (the 10 serve/chat scenarios); `runtime-install-sdk-active` leaves it unset
+(full devel — still tests the real install). This removes the 8.8 GB unpack for 10/11
+scenarios with a tiny, prod-safe change. Simpler + more robust than the shared-runtime
+symlink (`1817c5b`) that failed on registry-state regressions.
+- NEXT: implement the env knob (product side + harness wiring), then prove with a
+  **2-scenario `@probe` run** (one serve + `runtime-install-sdk-active`) before full dispatch.
+- Shared uv cache on box overlay retained (`/var/tmp/rocm-e2e-uv-cache`, 26 GB) for reuse.
+- #22 (uv-cache) stays valid + on scratch `6c6231b`; still bring it to PR regardless.
+
+---
+
 **Token Usage:** in=11101 out=3462251 cache_create=41714668 cache_read=2146464031 calls=5570
 
 ## 🚨 BLOCKER FOUND 2026-07-14 (run 29306008273 — the #22 confirmation run) — READ FIRST
