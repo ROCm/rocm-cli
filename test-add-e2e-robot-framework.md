@@ -1,10 +1,60 @@
 
 # WIP: E2E BDD tests for rocm-cli (PR #69, cucumber-rs)
 
-**Stage:** 11-review-addressed-task22-on-scratch-run-29306008273-monitoring
+**Stage:** 12-task22-validated-but-NEW-blocker-found-devel-tar-unpack
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-14
+
+## 🚨 BLOCKER FOUND 2026-07-14 (run 29306008273 — the #22 confirmation run) — READ FIRST
+
+**Outcome: cancelled at the 90min cap AGAIN.** But this time root cause is fully diagnosed
+by live inspection on the app-dev box (kubectl exec), and it is NOT what #22 fixed.
+
+**#22 IS VALIDATED (works as designed):** live env on the box showed
+`UV_CACHE_DIR=/var/tmp/rocm-e2e-uv-cache` set on the harness; the overlay uv cache was
+populated (full uv layout: `wheels-v6`, `archive-v0` w/ 225 entries, `simple-v22`, …). uv
+*download* sharing works. So #22 is correct and worth keeping.
+
+**THE REAL CAP-KILLER — per-scenario 8.8 GB devel-tar unpack:**
+- `rocm install sdk`'s post-install introspection runs a python one-liner
+  (`from rocm_sdk import _devel; _devel.get_devel_root()`) that lazily EXTRACTS
+  `rocm_sdk_devel/_devel.tar` = **8.8 GB → 12 GB unpacked** (`_rocm_sdk_devel/…`, rocBLAS
+  gtest binaries etc.) into the scenario's ISOLATED `ROCM_CLI_DATA_DIR` (`/tmp/rocm-e2e-*`).
+- Happens EVERY scenario (isolated data dir; #22 shares only the uv download cache, NOT the
+  installed/extracted tree — by design, since the runtimes *registry* is asserted state).
+- Observed: ONE `install sdk` (pid 842104) ran **50+ min**; its python probe (pid 842738)
+  ran **72+ min** and never finished. Only 5 scenario dirs ever created; NO progress for the
+  last ~47 min of the run. `read_bytes` frozen at 914MB while `rchar` kept climbing → it was
+  RE-READING the same tar from page cache in a loop, i.e. pathological (an 8.8GB tar should
+  not take 70+min). State R but ~0 CPU growth (12.9s CPU in 30min) → not CPU-bound, not
+  GPU-bound (GPU util 0%), not lock/socket-blocked (0 sockets). Looks like a hang/spin in
+  the extraction path, or catastrophic small-file unpack on the overlay.
+- **NOT the download cost #22 addressed.** The 27B (@nightly) never even ran — the suite
+  wedged on a normal-scenario `install sdk` devel unpack.
+
+**FIX DIRECTIONS (not yet done — needs decision):**
+1. Best: the devel tree is immutable → extract ONCE and share across scenarios (like HF
+   weights). Careful: the runtimes registry is asserted state (the trap that bit `1817c5b`).
+   Could share the extracted `_rocm_sdk_devel` content dir while keeping the registry isolated.
+2. Simpler/likely correct: most e2e scenarios only SERVE models — they don't need the devel
+   tree (rocBLAS test bins are build-time). If `install sdk` can skip/defer the `_devel.tar`
+   extraction unless dev headers are actually requested, per-scenario cost collapses.
+3. Investigate WHY the probe forces `get_devel_root()` at all (it's gathering root/bin/cmake
+   paths for reporting) — and whether the extraction is genuinely hanging vs merely slow.
+4. Separately: the 90min `timeout-minutes` cap did NOT self-cancel promptly — job ran ~95min
+   before terminating; I manually cancelled (it had just completed as cancelled). Watch this.
+
+**Box cleaned after cancel:** killed leftover lemonade `lemond` (733961) + `llama-server`
+(841461) scoped to `/tmp/rocm-e2e-n5ov2P`; 0 e2e leftovers now.
+
+**NEXT:** file a ticket for the per-scenario devel-tar unpack (the true in-suite-big-model
+blocker) and decide fix #1 vs #2. #22 stays on scratch (`6c6231b`), still NOT on the PR
+branch — bring it over regardless (it's a real, verified win) but it alone doesn't unblock
+the GPU cap.
+
+---
+
 **Token Usage:** in=10819 out=3385676 cache_create=40885912 cache_read=2116953021 calls=5429
 
 ## 🌙 RESUME STATE (2026-07-13 late — read FIRST; context about to compact)
