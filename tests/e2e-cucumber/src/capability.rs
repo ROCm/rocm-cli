@@ -128,6 +128,128 @@ impl HostCapability {
     }
 }
 
+/// Component versions on this platform, for the consolidated report's per-column
+/// heading. All fields are best-effort: `None` when the source isn't present
+/// (e.g. an engine that was never installed on this platform). Collected from the
+/// harness only — no product command exposes all of these, so we read the OS from
+/// `examine`, ROCm from the active managed runtime, and the engine versions from
+/// the installed runtime tree (see [`collect_versions`]).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PlatformVersions {
+    /// OS distro string, e.g. "Ubuntu 24.04.3 LTS" (`examine`'s `distro:` line).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    /// Active managed ROCm/TheRock runtime version, e.g. "7.13.0"
+    /// (`runtimes list`'s `version=` on the active runtime).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rocm: Option<String>,
+    /// Installed vLLM version, e.g. "0.23.0+rocm723" (parsed from the
+    /// `vllm-<ver>.dist-info` dir in the active runtime venv).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm: Option<String>,
+    /// Installed lemonade server version, e.g. "10.6.0" (`lemond --version`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lemonade: Option<String>,
+}
+
+/// Collect component versions for the report from the already-installed managed
+/// runtime whose registry lives at `runtimes_dir` (the shared prewarm tree in CI,
+/// or a scenario's `data/runtimes` locally). Best-effort: any source that isn't
+/// present yields `None`. `os` re-reads `examine`; `rocm`/`vllm`/`lemonade` come
+/// from the active runtime, so they're populated only once the SDK / an engine
+/// has been installed on this platform.
+#[must_use]
+pub fn collect_versions(runtimes_dir: &std::path::Path) -> PlatformVersions {
+    let mut v = PlatformVersions::default();
+
+    // OS distro from `examine` (isolated throwaway root — reads host, not data).
+    if let Ok(tmp) = tempfile::TempDir::with_prefix("rocm-e2e-ver-") {
+        let examine = run_probe(tmp.path(), &["examine"]);
+        v.os = examine
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("distro:"))
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+    }
+
+    // ROCm version + the active runtime's install_root from its manifest.
+    if let Some((rocm, root)) = active_runtime_install_root(runtimes_dir) {
+        v.rocm = Some(rocm);
+        // vLLM: parse the version out of `.../site-packages/vllm-<ver>.dist-info`.
+        v.vllm = vllm_version_from_venv(&root);
+        // lemonade: `<root>/engines/lemonade/runtime/lemond --version`.
+        v.lemonade = lemonade_version(&root);
+    }
+
+    v
+}
+
+/// Read the active managed runtime's `(version, install_root)` from the runtimes
+/// registry: prefer the runtime named by `active.json`, else the sole installed
+/// manifest. Returns `None` when nothing is installed.
+fn active_runtime_install_root(
+    runtimes_dir: &std::path::Path,
+) -> Option<(String, std::path::PathBuf)> {
+    let registry = runtimes_dir.join("registry");
+    let entries: Vec<std::path::PathBuf> = std::fs::read_dir(&registry)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    // Prefer the active runtime's key if active.json names one.
+    let active_key = std::fs::read_to_string(runtimes_dir.join("active.json"))
+        .ok()
+        .and_then(|t| {
+            serde_json::from_str::<serde_json::Value>(&t)
+                .ok()?
+                .get("runtime_key")?
+                .as_str()
+                .map(str::to_owned)
+        });
+    let pick = entries
+        .iter()
+        .find(|p| {
+            active_key
+                .as_deref()
+                .is_some_and(|k| p.file_stem().and_then(|s| s.to_str()) == Some(k))
+        })
+        .or_else(|| entries.first())?;
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(pick).ok()?).ok()?;
+    let version = json.get("version")?.as_str()?.to_owned();
+    let root = json.get("install_root")?.as_str()?;
+    Some((version, std::path::PathBuf::from(root)))
+}
+
+/// Parse the vLLM version from the `vllm-<ver>.dist-info` directory in the
+/// runtime venv's site-packages (works without importing vllm).
+fn vllm_version_from_venv(install_root: &std::path::Path) -> Option<String> {
+    let site = install_root.join("lib/python3.12/site-packages");
+    std::fs::read_dir(site).ok()?.find_map(|e| {
+        let name = e.ok()?.file_name().into_string().ok()?;
+        // "vllm-0.23.0+rocm723.dist-info" -> "0.23.0+rocm723"
+        name.strip_prefix("vllm-")?
+            .strip_suffix(".dist-info")
+            .map(str::to_owned)
+    })
+}
+
+/// Ask the embedded lemonade server for its version (`lemond --version` →
+/// "lemond version 10.6.0"). `None` if lemonade isn't installed in this runtime.
+fn lemonade_version(install_root: &std::path::Path) -> Option<String> {
+    let lemond = install_root.join("engines/lemonade/runtime/lemond");
+    if !lemond.is_file() {
+        return None;
+    }
+    let out = std::process::Command::new(&lemond)
+        .arg("--version")
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // "lemond version 10.6.0" -> "10.6.0"; fall back to the last whitespace token.
+    text.split_whitespace().last().map(str::to_owned)
+}
+
 /// Cached, probed once per process.
 pub fn host_capability() -> &'static HostCapability {
     static CAP: OnceLock<HostCapability> = OnceLock::new();

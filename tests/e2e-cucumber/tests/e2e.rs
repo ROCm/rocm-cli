@@ -707,11 +707,21 @@ async fn main() {
         .expect("failed to read scenario results");
     let resolutions = resolutions.lock().expect("resolutions poisoned");
 
+    // Collect component versions (OS/ROCm/vLLM/lemonade) for the report heading,
+    // now that the suite has installed the runtime + engines. Read from the shared
+    // runtimes tree CI provides (E2E_SHARED_RUNTIMES_DIR); on local runs each
+    // scenario installs into its own throwaway dir (already dropped by now), so
+    // versions stay empty there — best-effort, missing sources render as "n/a".
+    let versions = shared_runtimes_dir()
+        .map(|dir| e2e_cucumber::capability::collect_versions(&dir))
+        .unwrap_or_default();
+
     // Write the platform.json sidecar (probed capability + every resolution,
     // including skips) for the central report's expected-vs-actual grid.
     let manifest = e2e_cucumber::expectation::PlatformManifest {
         platform_slug: &cap.platform_slug,
         capability: cap,
+        versions,
         expectations: resolutions
             .iter()
             .map(|(id, (exp, engine))| {
