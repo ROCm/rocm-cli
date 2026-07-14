@@ -5,6 +5,7 @@
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-14
+**Token Usage:** in=11101 out=3462251 cache_create=41714668 cache_read=2146464031 calls=5570
 
 ## 🚨 BLOCKER FOUND 2026-07-14 (run 29306008273 — the #22 confirmation run) — READ FIRST
 
@@ -55,7 +56,12 @@ the GPU cap.
 
 ---
 
-**Token Usage:** in=10819 out=3385676 cache_create=40885912 cache_read=2116953021 calls=5429
+## 📋 WORK LOG (2026-07-14)
+
+- **#22 (uv cache sharing)** ✅ committed on scratch `6c6231b`, signed with launchd SSH key (remote session, 1Password locked); container mock gate green (0 unexpected failures).
+- **#22 GPU validation run 29306008273** dispatched app-dev-gpu; **CANCELLED AT CAP** after ~99 min. Root cause diagnosed live on box: per-scenario 8.8 GB `_devel.tar` unpack (rocm_sdk_devel extraction in `install sdk` post-install probe) takes 50–70 min per scenario, NOT the download cost #22 fixed. #22 is validated (uv cache confirmed working, 225 archive entries populated), but the real blocker is the per-scenario devel-tar cost.
+- **Global memory updates:** moved 6 rocm-cli-specific entries (branch naming, timezone, signing-remote, try-test-manually, minimal-experiments, worktree-layout) into `~/.dotfiles/root_package/.claude/CLAUDE.md` (global) to avoid duplication; cleaned up project memory.
+- **Box cleanup:** killed leftover lemonade processes (lemond 733961, llama-server 841461) after run cancel; 0 e2e leftovers.
 
 ## 🌙 RESUME STATE (2026-07-13 late — read FIRST; context about to compact)
 
