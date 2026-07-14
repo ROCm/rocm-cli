@@ -25,6 +25,14 @@ on:
         options: [all, mock, app-dev-gpu, strix-ubuntu, strix-windows]
         # No tier input: the harness resolves pass/xfail/skip per scenario, so a
         # platform runs one job covering everything applicable to it.
+      # TEMP (probe): scenario-name regex forwarded to the cucumber harness
+      # (`cargo xtask e2e -- --name <regex>`) so a dispatch can run just a few
+      # scenarios. Empty = full suite. REMOVE after the #23 default-engine
+      # classification is validated on Strix.
+      name_filter:
+        description: "TEMP scenario-name regex (cucumber --name); empty = full suite"
+        type: string
+        default: ""
 
 concurrency:
   # Manual dispatches get a UNIQUE group (run_id) so a run that gets stuck — e.g.
@@ -856,7 +864,14 @@ jobs:
         run: |
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          cargo xtask e2e
+          # TEMP: optional scenario-name filter for a scoped probe dispatch.
+          NAME_FILTER="${{ github.event.inputs.name_filter }}"
+          if [ -n "$NAME_FILTER" ]; then
+            echo "TEMP name filter active: $NAME_FILTER"
+            cargo xtask e2e -- --name "$NAME_FILTER"
+          else
+            cargo xtask e2e
+          fi
 
       - name: Upload E2E report
         if: always()
