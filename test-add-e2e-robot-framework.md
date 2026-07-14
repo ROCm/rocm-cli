@@ -36,6 +36,7 @@ SCRATCH only (e21297d). Bring to PR (test/add-e2e-robot-framework) after strix-w
 **Branch:** test/add-e2e-robot-framework (PR-side) / ci-e2e-framework-fixes (scratch, active)
 **Last Updated:** 2026-07-14
 **Token Usage:** in=13098 out=4168920 cache_create=50069541 cache_read=2383913684 calls=6573
+**Idle Flush:** 2026-07-14
 
 ## 📋 VOLEN-SILO (Eugene / pr-review-watcher BOT) REVIEW — TRIAGED (2026-07-14) — READ FIRST
 
@@ -231,6 +232,8 @@ Rebuilt the `1817c5b` idea correctly:
 default-engine), rominf re-review pending.
 
 ## 📋 Work Log
+
+**2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
 **2026-07-14 (late — all report fixes committed, version fix diagnosed):**
 - ✅ **Report changes merged to scratch** (`b38b50d`): grey-✗ xfail grid cells (`.status-xfail` CSS), `n/a` coverage blanks + legends (HTML + markdown), fixed maud dual-class bug.
