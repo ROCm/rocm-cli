@@ -31,11 +31,11 @@ SCRATCH only (e21297d). Bring to PR (test/add-e2e-robot-framework) after strix-w
 
 # WIP: E2E BDD tests for rocm-cli (PR #69, cucumber-rs)
 
-**Stage:** 23-report-xfail-grey-x-coverage-na-versions-wip
+**Stage:** 24-report-changes-committed-diagnostic-probe-dispatched
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework (PR-side) / ci-e2e-framework-fixes (scratch, active)
 **Last Updated:** 2026-07-14
-**Token Usage:** in=12486 out=3926310 cache_create=48635781 cache_read=2321430331 calls=6265
+**Token Usage:** in=13036 out=4146295 cache_create=50055070 cache_read=2375692212 calls=6542
 
 ## 📋 VOLEN-SILO (Eugene / pr-review-watcher BOT) REVIEW — TRIAGED (2026-07-14) — READ FIRST
 
@@ -232,11 +232,11 @@ default-engine), rominf re-review pending.
 
 ## 📋 Work Log
 
-**2026-07-14 (report + version fixes):**
-- ✅ **Xfail grid glyph**: `xfail` text → grey ✗ (`.status-xfail { color: #9e9e9e }`), muted sibling to red ❌. Fixed maud dual-class bug. Legend updated (HTML + markdown).
-- ✅ **Command coverage n/a**: empty cells now show `n/a` (scenario not run on this platform); legend explains GPU/OS/engine-specific applicability.
-- ✅ **Version collection hardening** (scratch `ci-e2e-framework-fixes`): OS-aware `site_packages_dirs()` glob (Windows `Lib/site-packages`, non-pinned python3.X Unix); `lemond`/`lemond.exe` binary probe. Fixes strix-ubuntu vllm missing + strix-windows venv layout issues. All 33 e2e-report + 23 e2e-cucumber lib tests pass `-D warnings` clean.
-- 🔄 **Container gate building on scratch** (background); commit + push + scoped strix-ubuntu diagnostic dispatch pending gate pass. 
+**2026-07-14 (late — report fixes + diagnostic dispatched):**
+- ✅ **Xfail grid glyph**: `xfail` → grey ✗ (`.status-xfail`), muted sibling to red ❌. Fixed maud dual-class bug. Legend updated HTML + markdown.
+- ✅ **Command coverage n/a**: not-run cells show `n/a` (vs blank); legend explains GPU/OS/engine-specific applicability.
+- ✅ **Version collection hardening** (scratch `b38b50d`): OS-aware `site_packages_dirs()` glob (Windows `Lib/`, non-pinned python3.X Unix); `lemond`/`lemond.exe` probe. Fixes strix-ubuntu vllm + strix-windows layout issues. Container gate green (mock E2E 0 unexpected, libs 33+23 pass `-D warnings`).
+- ✅ **Diagnostic dispatch**: run 29363255225 (strix-ubuntu, scenario 7 lemonade-serve only, `name_filter`). Confirms whether vllm+lemonade now populate in platform.json. Cron monitoring every 4 min. 
 
 **2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state. #23 Strix probe result: both serve-default-engine scenarios still fail on lemonade-native path (backend-install masking engine line, Vulkan instability). Needs xfail or deeper fix. PR #69 all-blocking checks green. VOLEN bot review fully triaged (5B+6NB items addressed in worktree, see section above). Task #22 (share-one-runtime) validated by hand — redesigned without redundant cargo rebuild, with persistence at E2E_SHARED_RUNTIMES_DIR; full GPU suite under 90min cap achieved (run 29322186691, 24 scenarios, 11 xfail as expected, 0 unexpected). Commits on scratch: ebc00b1, 021b14c, 72c6457, fc4687b. Pending: bring #22 to PR after rominf re-review, finalize #23 decision, remove temp name_filter commit.
 
