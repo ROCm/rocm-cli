@@ -4,7 +4,7 @@
 **Stage:** 15-share-one-runtime-PROVEN-by-hand-1817c5b-failures-diagnosed
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
-**Last Updated:** 2026-07-14
+**Last Updated:** 2026-07-14 (idle flush)
 **Token Usage:** in=11490 out=3569750 cache_create=44048080 cache_read=2183015218 calls=5767
 
 ## ✅ SHARE-ONE-RUNTIME PROVEN BY HAND (2026-07-14) — READ FIRST
@@ -205,6 +205,8 @@ the GPU cap.
 ---
 
 ## 📋 WORK LOG (2026-07-14 — TUI E2E spike + parent WIP research)
+
+**2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
 - **Created new WIP `test-e2e-tui-cucumber`** (test-e2e-tui-cucumber.md on progress branch): the dash TUI is NOT untestable black-box; can be driven via PTY (portable-pty + vt100) like any terminal app. Spike proven by hand: drove `rocm dash --demo` under 80×24 PTY, asserted on screen grid, sent Tab, saw redraw, quit cleanly.
 - **Research findings into TUI e2e WIP:** portable-pty 0.9 + vt100 0.16 is the standard Rust-native stack (honors EAI-7164 one-toolchain). Product already has determinism knobs: `--demo` (no GPU/daemon), `--dev-chat-mock` (fixed reply), `interactive_terminal()` requires TTY (PTY satisfies). Windows ConPTY support exists but crossterm input is flaky; likely gate to linux(+mac).
