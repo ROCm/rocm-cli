@@ -33,6 +33,13 @@ on:
         description: "TEMP scenario-name regex (cucumber --name); empty = full suite"
         type: string
         default: ""
+      # Opt a manual dispatch into the expensive `@nightly` scenarios (large-model
+      # serve, cold devel install) that the per-PR run skips. Off by default so a
+      # normal dispatch is unchanged; combine with name_filter to probe just one.
+      include_nightly:
+        description: "Include @nightly scenarios (large-model serve, cold install)"
+        type: boolean
+        default: false
 
 concurrency:
   # Manual dispatches get a UNIQUE group (run_id) so a run that gets stuck — e.g.
@@ -689,6 +696,10 @@ jobs:
       # per-scenario overrides in expectations.toml / a `@serve-timeout` tag adjust
       # it (shorter for known bugs, longer for large models).
       E2E_SERVE_TIMEOUT_SECS: "300"
+      # Opt-in @nightly scenarios on a manual dispatch (default off). The nightly
+      # workflow sets this unconditionally; here it lets a scoped dispatch confirm
+      # a single nightly scenario (e.g. the 27B serve) without the full nightly run.
+      E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
     steps:
       - uses: actions/checkout@v6
 
