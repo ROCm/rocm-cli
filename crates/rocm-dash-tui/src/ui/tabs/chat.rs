@@ -60,7 +60,7 @@ fn draw_consent(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         (
             " Chat — detecting… ",
             vec![Line::from(Span::styled(
-                "Probing for a local engine (Lemonade :13305 / vLLM :8000)…",
+                "Probing for a local engine (Lemonade :13305 / vLLM :8000 / rocm serve :11435)…",
                 Style::default().fg(theme.fg),
             ))],
         )
@@ -209,7 +209,7 @@ fn consent_gate_lines<'a>(
                     Style::default().fg(theme.muted),
                 )),
                 Line::from(Span::styled(
-                    "  • or run a local endpoint at 127.0.0.1:8000",
+                    "  • or run a local endpoint (vLLM :8000, rocm serve :11435)",
                     Style::default().fg(theme.muted),
                 )),
             ],
@@ -252,6 +252,7 @@ pub fn transcript_lines<'a>(state: &'a AppState, theme: &Theme) -> Vec<Line<'a>>
             ChatRole::User => ("you  ", theme.accent),
             ChatRole::Agent => ("rocm ", theme.fg),
             ChatRole::Error => ("err  ", theme.err),
+            ChatRole::System => ("··   ", theme.muted),
         };
         // Multi-line content (e.g. an answer plus a "⚙ via: …" Skill annotation)
         // renders one terminal line per segment; continuation lines are indented

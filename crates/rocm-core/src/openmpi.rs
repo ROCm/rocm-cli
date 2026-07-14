@@ -181,7 +181,7 @@ pub fn running_as_root() -> bool {
 
 /// Whether the current process is running as root. Always false off Linux.
 #[cfg(not(target_os = "linux"))]
-pub fn running_as_root() -> bool {
+pub const fn running_as_root() -> bool {
     false
 }
 
@@ -198,7 +198,7 @@ pub fn can_autoinstall() -> bool {
 
 /// Privileged auto-install is never attempted off Linux.
 #[cfg(not(target_os = "linux"))]
-pub fn can_autoinstall() -> bool {
+pub const fn can_autoinstall() -> bool {
     false
 }
 
@@ -411,7 +411,7 @@ pub fn ensure_mpi_cxx_compat(compat_dir: &Path) -> Option<PathBuf> {
 
 /// Non-Linux hosts never need the OpenMPI C++ bindings shim.
 #[cfg(not(target_os = "linux"))]
-pub fn ensure_mpi_cxx_compat(_compat_dir: &std::path::Path) -> Option<PathBuf> {
+pub const fn ensure_mpi_cxx_compat(_compat_dir: &std::path::Path) -> Option<PathBuf> {
     None
 }
 
@@ -444,7 +444,7 @@ pub fn ensure_compat_symlink(compat_dir: &Path, link_name: &str, target: &Path) 
 
 /// Non-Linux hosts do not create runtime library shims.
 #[cfg(not(target_os = "linux"))]
-pub fn ensure_compat_symlink(
+pub const fn ensure_compat_symlink(
     _compat_dir: &std::path::Path,
     _link_name: &str,
     _target: &std::path::Path,
@@ -473,7 +473,7 @@ pub fn ldconfig_has_soname(soname: &str) -> bool {
 
 /// Always `false` off Linux, where the loader-path shim is not exercised.
 #[cfg(not(target_os = "linux"))]
-pub fn ldconfig_has_soname(_soname: &str) -> bool {
+pub const fn ldconfig_has_soname(_soname: &str) -> bool {
     false
 }
 
@@ -496,7 +496,7 @@ pub fn libatomic_present() -> bool {
 
 /// Non-Linux hosts do not exercise the libatomic dependency path.
 #[cfg(not(target_os = "linux"))]
-pub fn libatomic_present() -> bool {
+pub const fn libatomic_present() -> bool {
     true
 }
 
@@ -528,7 +528,7 @@ pub fn libnuma_present() -> bool {
 
 /// Non-Linux hosts do not exercise the libnuma dependency path.
 #[cfg(not(target_os = "linux"))]
-pub fn libnuma_present() -> bool {
+pub const fn libnuma_present() -> bool {
     true
 }
 
