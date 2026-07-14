@@ -40,6 +40,18 @@ fn history<F: Fn(&rocm_dash_core::metrics::Snapshot) -> f64>(
         .collect()
 }
 
+/// Label for the node-load sparkline: no data → `—`; simulated telemetry is
+/// never labeled "live" (it reads `sim`); otherwise a live feed.
+const fn node_load_label(hist_empty: bool, simulated: bool) -> &'static str {
+    if hist_empty {
+        "—"
+    } else if simulated {
+        "sim"
+    } else {
+        "live"
+    }
+}
+
 /// Peak GPU utilization across the GPUs in a snapshot (the headline metric).
 fn snap_util(s: &rocm_dash_core::metrics::Snapshot) -> f64 {
     s.gpus
@@ -153,19 +165,11 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         return;
     }
     let load_hist = history(state, snap_util);
-    // Never label simulated telemetry "live".
-    let spark_label = if load_hist.is_empty() {
-        "—"
-    } else if state.simulated {
-        "sim"
-    } else {
-        "live"
-    };
     mini_spark(
         f,
         Rect::new(inner.x, inner.y, inner.width, 1),
         "node load ",
-        spark_label,
+        node_load_label(load_hist.is_empty(), state.simulated),
         &load_hist,
         false,
         theme,
@@ -449,8 +453,9 @@ fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 _ => Line::from(Span::styled("Checking…", Style::default().fg(theme.muted))),
             }
         };
-        // ponytail: no update-feed data source this run; tile shows conn-derived
-        // status rather than the mock's hardcoded "ROCm 6.3 ready".
+        // No update-feed data source this run: simulated sessions show "unknown"
+        // (nothing observable), otherwise the tile is conn-derived rather than
+        // the mock's hardcoded "ROCm 6.3 ready".
         f.render_widget(Paragraph::new(body), updates);
     }
 }
@@ -462,6 +467,14 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo, Snapshot, SystemMetrics};
+
+    #[test]
+    fn node_load_label_never_marks_simulated_live() {
+        assert_eq!(node_load_label(true, false), "—");
+        assert_eq!(node_load_label(true, true), "—");
+        assert_eq!(node_load_label(false, false), "live");
+        assert_eq!(node_load_label(false, true), "sim");
+    }
 
     fn render(state: &AppState, cols: u16, rows: u16) -> String {
         let backend = TestBackend::new(cols, rows);

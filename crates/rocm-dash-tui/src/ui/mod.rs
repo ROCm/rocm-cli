@@ -291,20 +291,21 @@ const fn wide_triptych(body: Rect) -> Option<(Rect, Rect, Rect)> {
 
 fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // In demo/replay the data is not live, so never present the session as
-    // "connected" to a real daemon — the connection status is a simulated label
+    // "connected" to a real daemon — the Connected case shows a simulated label
     // instead, and the SIMULATED DATA chip below makes the state unmistakable.
-    let (status_text, status_color) = if state.simulated {
-        ("simulated — not live".to_string(), theme.warn)
-    } else {
-        match &state.conn {
-            ConnState::Initial => ("starting".to_string(), theme.muted),
-            ConnState::Connecting => ("connecting…".to_string(), theme.warn),
-            ConnState::Connected { host, version } => (
-                format!("connected · {host} · rocm daemon {version}"),
-                theme.ok,
-            ),
-            ConnState::Disconnected { reason } => (format!("disconnected · {reason}"), theme.err),
+    // Other states (e.g. Disconnected on end-of-recording or a failed replay
+    // file) still surface their reason so playback status is not masked.
+    let (status_text, status_color) = match &state.conn {
+        ConnState::Initial => ("starting".to_string(), theme.muted),
+        ConnState::Connecting => ("connecting…".to_string(), theme.warn),
+        ConnState::Connected { .. } if state.simulated => {
+            ("simulated — not live".to_string(), theme.warn)
         }
+        ConnState::Connected { host, version } => (
+            format!("connected · {host} · rocm daemon {version}"),
+            theme.ok,
+        ),
+        ConnState::Disconnected { reason } => (format!("disconnected · {reason}"), theme.err),
     };
 
     let mut spans: Vec<Span> = vec![

@@ -14,7 +14,7 @@
 //! The rest of `rocm` is synchronous; the async daemon/TUI run on a tokio
 //! runtime built here. The TUI lives entirely in the `rocm-dash-tui` crate.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -214,37 +214,72 @@ fn build_dashboard_runtime() -> Result<tokio::runtime::Runtime> {
         .context("building tokio runtime for the dashboard")
 }
 
-/// Compute a private, unpredictable path for a `--demo` session file.
+/// Compute a private, per-run path for a `--demo` session file.
 ///
 /// Written under the per-user data dir (`{data_dir}/demo`, created `0o700` on
-/// Unix), never a fixed name in the world-shared temp dir. Stale demo sessions
-/// are pruned first so the directory does not accumulate. The file itself is
-/// created `0o600` by `demo::generate_file`.
+/// Unix), never a fixed name in the world-shared temp dir. The name is unique
+/// per run, not secret — confidentiality rests on the `0o700` dir / `0o600` file
+/// permissions (the file is created `0o600` by `demo::generate_file`). Stale
+/// sessions are pruned so the directory does not accumulate.
 fn demo_session_path(paths: &AppPaths) -> Result<PathBuf> {
     let dir = paths.data_dir.join("demo");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating demo session dir {}", dir.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Best-effort: restrict the demo dir to the owner.
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    }
-    // Best-effort prune of previous demo sessions so the dir stays bounded.
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("ndjson") {
-                let _ = std::fs::remove_file(path);
-            }
-        }
-    }
+    create_private_dir(&dir)?;
     let file = format!(
         "session-{}-{}.ndjson",
         std::process::id(),
         rocm_core::unix_time_millis()
     );
-    Ok(dir.join(file))
+    let target = dir.join(file);
+    prune_stale_demo_sessions(&dir, &target);
+    Ok(target)
+}
+
+/// Create `dir` restricted to the owner (`0o700`) on Unix. `DirBuilder::mode`
+/// applies at creation so there is no umask window; a pre-existing directory is
+/// tightened best-effort afterward (matching `server.rs`/`agent.rs`).
+#[cfg(unix)]
+fn create_private_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("creating demo session dir {}", dir.display()))?;
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("creating demo session dir {}", dir.display()))
+}
+
+/// Best-effort prune of old demo sessions so the directory stays bounded,
+/// without deleting a session a concurrent `rocm dash --demo` may be replaying:
+/// the file we are about to write and any file modified in the last hour are
+/// kept.
+fn prune_stale_demo_sessions(dir: &Path, keep: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == *keep || path.extension().and_then(|e| e.to_str()) != Some("ndjson") {
+            continue;
+        }
+        let recently_touched = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .is_some_and(|age| age < std::time::Duration::from_hours(1));
+        if recently_touched {
+            continue;
+        }
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Entry point for `rocm dash`. Builds a tokio runtime and runs the dashboard.
@@ -493,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn demo_session_path_is_private_and_unpredictable() {
+    fn demo_session_path_is_private_and_unique() {
         let root = std::env::temp_dir().join(format!(
             "rocm-cli-demo-test-{}-{}",
             std::process::id(),

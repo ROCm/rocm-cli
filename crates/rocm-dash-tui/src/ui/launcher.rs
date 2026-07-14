@@ -370,6 +370,32 @@ mod tests {
     }
 
     #[test]
+    fn launcher_running_reports_unknown_health_not_fabricated_healthy() {
+        // A Running process is not a health signal; without a probe the launcher
+        // must not claim the service is healthy.
+        let mut s = base();
+        s.instances.insert(
+            "id".into(),
+            Instance {
+                container_id: "id".into(),
+                model_name: "Qwen3-72B".into(),
+                status: InstanceStatus::Running,
+                port: Some(8000),
+                ..Default::default()
+            },
+        );
+        let out = render(&s, 0, 100, 24);
+        assert!(
+            out.contains("health: unknown"),
+            "launcher must report unknown health: {out:?}"
+        );
+        assert!(
+            !out.contains("healthy"),
+            "launcher must not fabricate a healthy claim: {out:?}"
+        );
+    }
+
+    #[test]
     fn launcher_idle_variant_renders() {
         let out = render(&base(), 0, 100, 24);
         assert!(out.contains("Idle"), "idle status line missing: {out:?}");

@@ -286,6 +286,23 @@ fn home_live_indicators_suppressed_when_simulated() {
     );
 }
 
+/// The Updates tile must not claim "Up to date" for simulated data — there is
+/// no update feed to observe, so it reads "unknown".
+#[test]
+fn home_updates_tile_unknown_when_simulated() {
+    let mut s = state_on(ActiveTab::Home);
+    s.simulated = true;
+    let out = render(&mut s, 160, 44);
+    assert!(
+        !out.contains("Up to date"),
+        "simulated Updates tile must not claim up to date: {out:?}"
+    );
+    assert!(
+        out.contains("unknown"),
+        "simulated Updates tile should read unknown: {out:?}"
+    );
+}
+
 #[test]
 fn a11y_status_carries_text_label_not_color_only() {
     // Connection status is conveyed in words, not by color alone.
