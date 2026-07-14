@@ -100,14 +100,12 @@ bug = "EAI-7052"
 reason = "Lemonade inference fails on the llama.cpp backend (Vulkan hang on Linux; connection drop on Windows) instead of using system ROCm."
 serve_timeout_secs = 90
 
-# --- EAI-7221: end-to-end chat through a locally served model (vLLM path) ---
-[["chat-end-to-end-local-model"]]
-when = { effective_engine = "vllm" }
-bug = "EAI-7221"
-reason = "End-to-end chat through a locally served vLLM model does not return a valid reply."
-serve_timeout_secs = 90
-
-# On a lemonade host this does real lemonade inference → EAI-7052 backend failure.
+# EAI-7221 (TUI chat sends hardcoded 'local-model' instead of querying /v1/models)
+# was previously mapped here as a vLLM-path xfail, but that bug is TUI-only and this
+# scenario exercises the CLI `rocm chat --prompt` path (which correctly discovers the
+# model via /v1/models). Verified expect-pass on MI300X vLLM (XPASS on run 29322186691,
+# then 3/3 green re-runs), so there is NO vLLM xfail for this scenario — the CLI chat
+# path works. Only the lemonade path stays xfail (real inference → EAI-7052 backend bug).
 [["chat-end-to-end-local-model"]]
 when = { effective_engine = "lemonade" }
 bug = "EAI-7052"
