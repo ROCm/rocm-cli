@@ -1,10 +1,62 @@
 
 # WIP: E2E BDD tests for rocm-cli (PR #69, cucumber-rs)
 
-**Stage:** 21-merged-to-PR-blocking-green-hash23-fix-strix-probe-dispatched
+**Stage:** 22-volen-review-triaged-3B+2NB-fixed-strix23-needs-xfail
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-14
+
+## 📋 VOLEN-SILO (Eugene / pr-review-watcher BOT) REVIEW — TRIAGED (2026-07-14) — READ FIRST
+
+**LESSON (now global memory):** the bot reviewer posts as ISSUE comments, not PR reviews —
+I missed it twice and reported "nothing to fix". ALWAYS check all 3 surfaces (reviews +
+inline + issues/<n>/comments) for ALL authors incl. bots. Latest review = c10fc353, 5 blocking
++ 6 non-blocking.
+
+**FIXED in worktree (not yet committed):**
+- B2: `serve-vllm-default-on-instinct` had `@requires-gpu` only → false-fails on Strix
+  (asserts vLLM default where lemonade is default). Added `@requires-engine:vllm`.
+- B3: `Condition`/`XfailEntry` lacked `#[serde(deny_unknown_fields)]` → a typo'd key parsed
+  to all-None = unconditional always-xfail. Added it to both (lib tests still pass — current
+  toml uses only known keys).
+- B5: `scenario_pass_map` used `!= "failed"` (skipped counted as pass), diverging from the
+  canonical `scenario_passed`. Routed through `scenario_passed`.
+- NB3: removed dead `#[when("a chat completion request is sent")]` (kept `user_offered_endpoint`
+  — it IS referenced by chat.feature:13; volen wrongly lumped them).
+- NB5: added `timeout-minutes: 15` to the `e2e-report` job.
+All compile + clippy clean; e2e-cucumber lib 23, e2e-report lib 31 pass.
+
+**DEFERRED / needs user decision:**
+- B1 (BLOCKING per bot): EAI-NNNN internal IDs across 52 refs + ~24 commit subjects + PR body,
+  cites AGENTS.md §2. SAME item rominf raised + user POSTPONED. Unmerged PR #110 would relax
+  the rule. Big rebase/reword — user call: scrub to ROCm/rocm-cli#NNN or hold for #110.
+- B4 (BLOCKING per bot): artifact actions not SHA-pinned (AGENTS.md §6). Bot itself says it's a
+  pre-existing repo-wide pattern this PR extends, NOT a regression; user has task #4 (SHA-pin
+  after #99). Follow-up.
+- NB1 (reconciled_tally drops Missing), NB2 (mock_server received_models dead), NB4
+  (dash_journeys weak asserts) — legitimate, not yet done; offered to user.
+
+## 🔴 #23 STRIX PROBE RESULT (run 29332985258) — NOT fully fixed on Strix; needs xfail
+
+The recipe-aware fix (e21d68e) HELPED — on Strix the serve STEP now passes (readiness wait
+matches the resolved model; the old ~3.4GB-timeout is gone). But both scenarios still FAIL, for
+TWO NEW reasons specific to the lemonade-native path:
+- **Scenario 6** (`serve-default-engine-working-endpoint`): `Then an engine is selected
+  automatically` ✘ — "no 'engine:' line in serve output". First-serve on Strix triggers a
+  llama.cpp BACKEND INSTALL (`Installing backend: llamacpp:rocm`, 215MB download) and the
+  stdout has NO `engine:` plan line at all (the install flow replaces/precedes the plan). So
+  `selected_engine()` can't parse it — a real first-serve UX difference, not just parser noise.
+- **Scenario 6b** (`serve-default-engine-inference`): `Then the model responds to inference` ✘
+  — GET /v1/models connection refused: the lemonade server died before inference (EAI-7052
+  Vulkan instability on this hardware).
+
+Reconciliation: 0 xfail, 0 XPASS, **2 unexpected failures** on Strix-Ubuntu (effective_engine=
+lemonade). So #23 needs a lemonade/Strix xfail (or a deeper fix). **DECISION NEEDED:** xfail
+both on effective_engine=lemonade (EAI-7052 for 6b; a new/existing ticket for the backend-
+install-hides-engine-line issue on 6), OR pursue a deeper fix (e.g. serve --engine explicit in
+this scenario, or parse engine from services list). This is the last open piece of #23.
+
+---
 
 ## ✅ MERGED TO PR + #23 FIX (2026-07-14) — READ FIRST
 
