@@ -725,6 +725,12 @@ jobs:
           # vLLM venv) across scenarios so they download once per runner, not per
           # scenario. Persistent path; service state stays isolated per scenario.
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
+          # Share uv's wheel download/build cache so `rocm install sdk` is a warm
+          # ~34s per scenario instead of a cold ~160s (measured on MI300X). Kept
+          # OFF the RUNNER_WORKSPACE Longhorn PVC (near-full) and on the roomy `/`
+          # overlay; ~23GB, one cold fill per pod-life. Not git-cleaned (outside
+          # the checkout) and outside the reclaim step's /tmp/rocm-e2e-* glob.
+          export E2E_SHARED_UV_CACHE_DIR="/var/tmp/rocm-e2e-uv-cache"
           cargo xtask e2e
 
       - name: Upload E2E report

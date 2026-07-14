@@ -352,6 +352,9 @@ jobs:
         run: |
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
+          # Share uv's wheel cache off the near-full PVC, on the roomy `/` overlay
+          # (see ci.yml e2e-gpu): warm `rocm install sdk` ~34s vs cold ~160s.
+          export E2E_SHARED_UV_CACHE_DIR="/var/tmp/rocm-e2e-uv-cache"
           cargo xtask e2e
 
       - name: Upload E2E report
