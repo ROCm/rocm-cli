@@ -1,6 +1,6 @@
 Feature: Runtime configuration
 
-  @id:runtime-install-sdk-active @requires-gpu
+  @id:runtime-install-sdk-active @requires-gpu @nightly
   Scenario: 1 - Installing the SDK makes it the active runtime
     Given a machine with no CLI-managed runtimes
     When the user installs the SDK
