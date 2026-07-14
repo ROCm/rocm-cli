@@ -5,34 +5,37 @@
 **Pipeline:** standard
 **Branch:** test/add-e2e-robot-framework
 **Last Updated:** 2026-07-14
+**Token Usage:** in=12024 out=3725255 cache_create=47997275 cache_read=2277540752 calls=6034
 
 ## ✅ SHARE-ONE-RUNTIME IMPLEMENTED + ON SCRATCH (2026-07-14) — READ FIRST
 
 **Committed `ebc00b1` on scratch (ci-e2e-framework-fixes), pushed.** SSH-signed (launchd key).
 Rebuilt the `1817c5b` idea correctly:
-- Harness: `shared_runtimes_dir()` (via `validated_shared_dir`, path-injection safe) +
+- ✅ Harness: `shared_runtimes_dir()` (via `validated_shared_dir`, path-injection safe) +
   `use_shared_runtimes()` (symlinks `data/runtimes` at `E2E_SHARED_RUNTIMES_DIR`), opt-in from
   `a managed runtime is active` ONLY. Clean-slate scenarios stay isolated.
-- CI (ci.yml e2e-gpu + nightly e2e-gpu-nightly): build rocm ONCE, reuse via `ROCM_CLI_BINARY`
+- ✅ CI (ci.yml e2e-gpu + nightly e2e-gpu-nightly): build rocm ONCE, reuse via `ROCM_CLI_BINARY`
   for both pre-warm + suite (no `cargo run --release`); pre-warm the shared runtime once,
   persist on `$RUNNER_WORKSPACE/e2e-runtimes` across runs (no-op after first run ever).
-- **PROVEN on MI300X: 2-scenario probe (serve-vllm-inference SHARED + runtime-install-sdk-active
+- ✅ **PROVEN on MI300X: 2-scenario probe (serve-vllm-inference SHARED + runtime-install-sdk-active
   ISOLATED) → both PASS, 0 unexpected failures.** The isolated install scenario correctly still
   sees `a machine with no CLI-managed runtimes` (shared tree does NOT pollute it).
-- **Mock gate green** (env unset → no-op). **Full Linux container suite green** (all crates 0
+- ✅ **Mock gate green** (env unset → no-op). **Full Linux container suite green** (all crates 0
   failed, retroactive confirm of ebc00b1).
-
-**⚠️ PROCESS NOTE (user rule):** I pushed ebc00b1 after only the mock e2e gate, then the user
-said "always run the test suite in the linux container before push". Fixed the memory
-(reference_linux_container_testing) — ALWAYS run full `workspace/wip/container-test.sh` before
-EVERY push, it's the gate. Retroactive full container run confirmed ebc00b1 is clean.
+- ✅ **Process rule logged:** always run full `workspace/wip/container-test.sh` before EVERY push
+  (reference_linux_container_testing memory updated).
 
 **NEXT:** dispatch app-dev-gpu on scratch to confirm the whole GPU suite now finishes under
 90min with install-once. Then bring #22 + this to the PR branch. Also still: #23 (Strix
 default-engine), rominf re-review pending.
 
----
-**Token Usage:** in=11490 out=3569750 cache_create=44048080 cache_read=2183015218 calls=5767
+## 📋 Work Log
+
+**2026-07-14 — Task #22 redesign iteration #3: libraries-only rejected, share-one-runtime rebuilt correctly**
+- Tested `ROCM_CLI_THEROCK_EXTRAS=libraries` fix by hand on MI300X: **disproven** — `devel` is load-bearing (torch/amdsmi need it), not just build-time. Dropped env-knob entirely.
+- Investigated why `1817c5b` regressed: all four failure causes were operational (redundant cargo rebuild, cold download on E2E clock, 35-min cap, wedged runner), NOT design flaws. Hand-proved symlink mechanism works: served + inferred through shared runtime.
+- Rebuilt `1817c5b` correctly: harness `use_shared_runtimes()` symlink code + CI pre-warm with prebuilt binary reuse, no-op persistence. 2-scenario MI300X probe: BOTH PASS (shared serve, isolated install clean-slate). Full Linux container suite green. Committed as `ebc00b1`.
+- Saved process rule to memory: always run full container suite before EVERY push, it's the gate (retroactively confirmed ebc00b1 clean on Linux).
 
 ## ✅ SHARE-ONE-RUNTIME PROVEN BY HAND (2026-07-14) — READ FIRST
 
