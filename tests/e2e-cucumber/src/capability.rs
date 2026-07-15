@@ -178,6 +178,13 @@ pub fn collect_versions(runtimes_dir: Option<&std::path::Path>) -> PlatformVersi
     // — mock has no runtime, and per-scenario isolated installs are gone by now.
     if let Some((rocm, root)) = runtimes_dir.and_then(active_runtime_install_root) {
         v.rocm = Some(rocm);
+        // TEMP DIAGNOSTIC (#11): on Windows lemonade_version returns None even
+        // though lemonade serves work — dump where lemond(.exe) / vllm dist-info
+        // actually live under the tree so the real path fix targets the right spot.
+        // REMOVE after diagnosis.
+        if let Some(dir) = runtimes_dir {
+            debug_dump_version_sources(dir, &root);
+        }
         // vLLM: parse the version out of `.../site-packages/vllm-<ver>.dist-info`.
         v.vllm = vllm_version_from_venv(&root);
         // lemonade: `<root>/engines/lemonade/runtime/lemond --version`.
@@ -185,6 +192,44 @@ pub fn collect_versions(runtimes_dir: Option<&std::path::Path>) -> PlatformVersi
     }
 
     v
+}
+
+/// TEMP DIAGNOSTIC (#11): walk the shared runtimes dir + active install_root
+/// (bounded depth) and print any path whose name matches lemond(.exe) or
+/// vllm-*.dist-info, so a probe run reveals the Windows tree layout. REMOVE.
+fn debug_dump_version_sources(runtimes_dir: &std::path::Path, install_root: &std::path::Path) {
+    eprintln!("=== VERSION-PROBE DIAGNOSTIC (#11) ===");
+    eprintln!("runtimes_dir = {}", runtimes_dir.display());
+    eprintln!("install_root = {}", install_root.display());
+    for base in [runtimes_dir, install_root] {
+        walk_report(base, 0, 7);
+    }
+    eprintln!("=== END VERSION-PROBE DIAGNOSTIC ===");
+}
+
+fn walk_report(dir: &std::path::Path, depth: usize, max: usize) {
+    if depth > max {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        let name = e.file_name().to_string_lossy().to_string();
+        let lower = name.to_ascii_lowercase();
+        if lower == "lemond"
+            || lower == "lemond.exe"
+            || (lower.starts_with("vllm-") && lower.ends_with(".dist-info"))
+            || lower == "site-packages"
+            || lower == "runtime"
+        {
+            eprintln!("  HIT: {}", p.display());
+        }
+        if p.is_dir() {
+            walk_report(&p, depth + 1, max);
+        }
+    }
 }
 
 /// Read the active managed runtime's `(version, install_root)` from the runtimes
