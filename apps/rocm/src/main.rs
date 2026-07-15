@@ -4478,6 +4478,9 @@ fn spawn_managed_engine_child(
     };
     record.supervisor_pid = child_pid;
     record.engine_pid = Some(child_pid);
+    // Capture the identity token while the child is alive, so a later stop
+    // verifies this exact process rather than a recycled PID.
+    record.supervisor_start_ticks = rocm_core::process_start_ticks(child_pid);
     record.status = "running".to_owned();
     record.write()?;
 
@@ -12436,6 +12439,66 @@ fn run_internal_sandbox_tool(
     }))
 }
 
+/// How long a managed stop waits for each recorded process to actually exit
+/// after `SIGTERM` before escalating to `SIGKILL` and then reporting a timeout.
+const MANAGED_STOP_GRACE: Duration = Duration::from_secs(10);
+
+/// Terminate the processes recorded for a managed service, verifying each PID's
+/// identity first so a recycled PID never causes an unrelated process tree to be
+/// killed.
+///
+/// The supervisor (launcher) and the engine server are distinct processes, so
+/// each PID is paired with **its own** start-time token (`supervisor_start_ticks`
+/// vs `engine_start_ticks`). When they resolve to the same PID (e.g. before the
+/// engine state has been refreshed) the entry is de-duplicated, preferring a
+/// known token. Returns the PIDs actually signalled and whether every recorded
+/// process is confirmed no longer running.
+fn terminate_recorded_service_pids(record: &ManagedServiceRecord) -> (Vec<u32>, bool) {
+    // Build the (pid, own-token) work list, de-duplicating on PID and preferring
+    // an entry that carries a verifiable start-time.
+    let mut entries: Vec<(u32, Option<u64>)> = Vec::new();
+    for (pid, ticks) in [
+        (Some(record.supervisor_pid), record.supervisor_start_ticks),
+        (record.engine_pid, record.engine_start_ticks),
+    ] {
+        let Some(pid) = pid.filter(|pid| *pid != 0 && *pid != std::process::id()) else {
+            continue;
+        };
+        if let Some(existing) = entries.iter_mut().find(|(seen, _)| *seen == pid) {
+            if existing.1.is_none() {
+                existing.1 = ticks;
+            }
+        } else {
+            entries.push((pid, ticks));
+        }
+    }
+
+    let mut signaled_pids = Vec::new();
+    let mut all_stopped = true;
+    for (pid, ticks) in entries {
+        let identity = rocm_core::ProcessIdentity::new(pid, ticks);
+        let outcome = rocm_core::terminate_verified(
+            &identity,
+            rocm_core::KillScope::Tree,
+            MANAGED_STOP_GRACE,
+            true,
+        );
+        if !outcome.stopped() {
+            all_stopped = false;
+        }
+        // Only report PIDs we actually signalled (a live, verified match).
+        if matches!(
+            outcome,
+            rocm_core::TerminationOutcome::Graceful
+                | rocm_core::TerminationOutcome::Forced
+                | rocm_core::TerminationOutcome::TimedOut
+        ) {
+            signaled_pids.push(pid);
+        }
+    }
+    (signaled_pids, all_stopped)
+}
+
 fn stop_internal_managed_service(paths: &AppPaths, service_id: &str) -> Result<serde_json::Value> {
     let mut record = load_managed_service(paths, service_id)?;
     let engine_stop = if record.engine == "lemonade" {
@@ -12454,17 +12517,15 @@ fn stop_internal_managed_service(paths: &AppPaths, service_id: &str) -> Result<s
             },
         )
     };
-    let mut signaled_pids = Vec::new();
-    for pid in [record.engine_pid, Some(record.supervisor_pid)]
-        .into_iter()
-        .flatten()
-        .filter(|pid| *pid != 0 && *pid != std::process::id())
-    {
-        if signal_process_tree(pid).is_ok() {
-            signaled_pids.push(pid);
-        }
+    let (signaled_pids, all_stopped) = terminate_recorded_service_pids(&record);
+    // Only claim "stopped" when every recorded process is confirmed gone. When a
+    // stop cannot confirm termination (rare: SIGKILL-resistant or unverifiable
+    // PID), leave the prior status so the standard liveness refresh reconciles it
+    // to "stopped" once the process actually dies — rather than asserting a stop
+    // that did not happen.
+    if all_stopped {
+        record.status = "stopped".to_owned();
     }
-    record.status = "stopped".to_owned();
     record.write()?;
     let engine_stop = match engine_stop {
         Ok(response) => serde_json::json!({
@@ -12582,6 +12643,8 @@ fn restart_internal_managed_service(
     record.status = "running".to_owned();
     record.supervisor_pid = child_pid;
     record.engine_pid = Some(child_pid);
+    // Refresh the identity token in lockstep with the restarted child's PID.
+    record.supervisor_start_ticks = rocm_core::process_start_ticks(child_pid);
     record.restart_count = record.restart_count.saturating_add(1);
     record.last_restart_unix_ms = Some(rocm_core::unix_time_millis());
     record.status = if wait_for_service_http_ready(
@@ -12597,12 +12660,6 @@ fn restart_internal_managed_service(
     };
     record.write()?;
     Ok(record)
-}
-
-fn signal_process_tree(pid: u32) -> Result<()> {
-    rocm_core::terminate_process_tree(pid)?;
-    thread::sleep(Duration::from_millis(300));
-    Ok(())
 }
 
 fn validate_service_id(service_id: &str) -> Result<()> {
@@ -23075,6 +23132,123 @@ ID_LIKE="suse opensuse"
             imported_from: None,
             installed_at_unix_ms: 1,
         }
+    }
+
+    #[cfg(unix)]
+    fn managed_record_for_pid(
+        paths: &AppPaths,
+        pid: u32,
+        start_ticks: Option<u64>,
+    ) -> ManagedServiceRecord {
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            "svc-managed-stop",
+            "vllm",
+            "m",
+            "m",
+            "127.0.0.1",
+            9,
+            "managed",
+            pid,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = Some(pid);
+        record.supervisor_pid = pid;
+        record.supervisor_start_ticks = start_ticks;
+        record
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_stop_refuses_recycled_pid() {
+        // A live process whose recorded identity does not match: this is exactly
+        // what a recycled PID looks like. The stop must NOT signal it.
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        let (root, paths) = test_paths("managed-stop-recycled");
+        let real = rocm_core::process_start_ticks(pid).expect("start-ticks");
+        let record = managed_record_for_pid(&paths, pid, Some(real.wrapping_add(1)));
+
+        let (signaled, all_stopped) = terminate_recorded_service_pids(&record);
+
+        assert!(signaled.is_empty(), "must not signal a mismatched identity");
+        // A recycled PID means the recorded service process itself is gone.
+        assert!(all_stopped);
+        assert!(
+            rocm_core::process_is_running(pid),
+            "the unrelated live process must survive"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_stop_verifies_distinct_supervisor_and_engine_pids() {
+        // The launcher and the engine server are different processes; each PID
+        // must be verified with its OWN start-time token and terminated.
+        let sup = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn supervisor");
+        let eng = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn engine");
+        let (sup_pid, eng_pid) = (sup.id(), eng.id());
+        let (root, paths) = test_paths("managed-stop-distinct");
+        let mut record =
+            managed_record_for_pid(&paths, sup_pid, rocm_core::process_start_ticks(sup_pid));
+        record.engine_pid = Some(eng_pid);
+        record.engine_start_ticks = rocm_core::process_start_ticks(eng_pid);
+
+        let (mut signaled, all_stopped) = terminate_recorded_service_pids(&record);
+        signaled.sort_unstable();
+        let mut expected = vec![sup_pid, eng_pid];
+        expected.sort_unstable();
+
+        assert_eq!(signaled, expected);
+        assert!(all_stopped);
+        let (mut sup, mut eng) = (sup, eng);
+        let _ = sup.wait();
+        let _ = eng.wait();
+        assert!(!rocm_core::process_is_running(sup_pid));
+        assert!(!rocm_core::process_is_running(eng_pid));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_stop_terminates_verified_pid() {
+        // Correct identity: the recorded process is really ours, so it is stopped.
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        let (root, paths) = test_paths("managed-stop-verified");
+        let real = rocm_core::process_start_ticks(pid).expect("start-ticks");
+        let record = managed_record_for_pid(&paths, pid, Some(real));
+
+        let (signaled, all_stopped) = terminate_recorded_service_pids(&record);
+
+        assert_eq!(signaled, vec![pid]);
+        assert!(all_stopped);
+        // Reap our own child (a detached managed process would be reaped by init)
+        // so the liveness check does not observe a not-yet-reaped zombie.
+        let mut child = child;
+        let _ = child.wait();
+        assert!(
+            !rocm_core::process_is_running(pid),
+            "the verified process must be terminated"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     fn test_paths(name: &str) -> (PathBuf, AppPaths) {

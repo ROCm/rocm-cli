@@ -34,6 +34,9 @@ const HEALTHCHECK_TIMEOUT_MS: u64 = 700;
 const DEFAULT_GPU_MEMORY_UTILIZATION: &str = "0.80";
 const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
 const MAX_TAIL_READ: u64 = 4 * 1024 * 1024;
+/// How long a stop waits for the server to actually exit after each signal
+/// before reporting a timeout (or, under `force`, escalating to `SIGKILL`).
+const STOP_GRACE: Duration = Duration::from_secs(10);
 /// Default ROCm wheel index for `uv pip install vllm`.
 ///
 /// This pins both the vLLM release and the ROCm ABI tag, so it can drift from
@@ -798,17 +801,29 @@ fn stop_service(request: StopRequest) -> Result<StopResponse> {
     require_nonempty(&request.service_id, "service_id")?;
     let files = service_files(&request.service_id)?;
     let state = read_service_state(&files.state_path).ok();
-    let stopped = match state.as_ref().and_then(pid_from_state) {
-        Some(pid) => terminate_pid(pid, request.force),
-        None => false,
+    let outcome = state
+        .as_ref()
+        .and_then(identity_from_state)
+        // vLLM spawns an `EngineCore` worker that pins the GPU allocation, so
+        // the whole process tree must be signalled — but only after the recorded
+        // PID is confirmed to still be our server, never a recycled stranger.
+        .map(|identity| {
+            rocm_core::terminate_verified(
+                &identity,
+                rocm_core::KillScope::Tree,
+                STOP_GRACE,
+                request.force,
+            )
+        });
+    let (stopped, graceful) = match outcome {
+        Some(outcome) => (outcome.stopped(), outcome.graceful()),
+        // No PID recorded: nothing we can confirm stopping.
+        None => (false, false),
     };
     if stopped {
         write_terminal_state(&files.state_path, "stopped")?;
     }
-    Ok(StopResponse {
-        stopped,
-        graceful: stopped && !request.force,
-    })
+    Ok(StopResponse { stopped, graceful })
 }
 
 fn resolve_vllm_runtime(runtime_id: Option<&str>) -> Result<VllmRuntime> {
@@ -1440,7 +1455,11 @@ fn write_running_state(request: &ServeHttpRequest, runtime: &VllmRuntime, pid: u
             "engine_recipe": request.engine_recipe,
             "engine_recipe_required_flags": engine_recipe_launch_args(request.engine_recipe.as_ref()),
             "therock_runtime_env": therock_runtime_env_state(runtime),
-            "started_at_unix_ms": current_unix_millis()
+            "started_at_unix_ms": current_unix_millis(),
+            // Kernel start-time of the launcher PID, captured while it is alive.
+            // Paired with `pid`, it identifies this exact process across PID
+            // recycling so a later stop never signals a reused PID.
+            "start_ticks": rocm_core::process_start_ticks(pid)
         }),
     )
 }
@@ -1522,8 +1541,13 @@ fn pid_from_state(state: &Value) -> Option<u32> {
         .and_then(|pid| pid.try_into().ok())
 }
 
-fn terminate_pid(pid: u32, _force: bool) -> bool {
-    rocm_core::terminate_process_tree(pid).is_ok()
+/// Reconstruct the recorded process identity (PID + kernel start-time) from a
+/// service state file. `start_ticks` is absent in state files written before
+/// this field existed, in which case verification degrades to best-effort.
+fn identity_from_state(state: &Value) -> Option<rocm_core::ProcessIdentity> {
+    let pid = pid_from_state(state)?;
+    let start_ticks = state.get("start_ticks").and_then(Value::as_u64);
+    Some(rocm_core::ProcessIdentity::new(pid, start_ticks))
 }
 
 fn value_string(value: &Value, key: &str) -> Option<String> {
@@ -2224,6 +2248,31 @@ mod tests {
                 .and_then(Value::as_array)
                 .is_some_and(|paths| !paths.is_empty())
         );
+        // The identity token must be recorded so a later stop can verify it.
+        assert!(state.get("start_ticks").is_some());
         Ok(())
+    }
+
+    #[test]
+    fn identity_from_state_carries_pid_and_start_ticks() {
+        let state = json!({ "pid": 4321, "start_ticks": 987_654_u64 });
+        let identity = identity_from_state(&state).expect("identity");
+        assert_eq!(identity.pid, 4321);
+        assert_eq!(identity.start_ticks, Some(987_654));
+    }
+
+    #[test]
+    fn identity_from_legacy_state_has_no_start_ticks() {
+        // State files written before this change carry only `pid`; verification
+        // must degrade gracefully rather than fail to parse.
+        let state = json!({ "pid": 4321 });
+        let identity = identity_from_state(&state).expect("identity");
+        assert_eq!(identity.pid, 4321);
+        assert_eq!(identity.start_ticks, None);
+    }
+
+    #[test]
+    fn identity_from_state_without_pid_is_none() {
+        assert!(identity_from_state(&json!({ "status": "running" })).is_none());
     }
 }

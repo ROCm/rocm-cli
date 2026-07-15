@@ -42,6 +42,9 @@ const ROCM_BACKEND_NAME: &str = "rocm";
 /// we pick the highest-priority backend it considers supported on this host.
 const LLAMACPP_BACKEND_PRIORITY: [&str; 3] = ["rocm", "vulkan", "cpu"];
 const DEFAULT_LOG_TAIL_LINES: usize = 200;
+/// How long a stop waits for the server to actually exit after each signal
+/// before reporting a timeout (or, under `force`, escalating to `SIGKILL`).
+const STOP_GRACE: Duration = Duration::from_secs(10);
 const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
 /// Maximum bytes to read from the end of a log file when extracting tail lines.
 /// Prevents reading entire gigabyte-sized logs on startup timeout.
@@ -504,6 +507,9 @@ fn launch_service(mut request: LaunchRequest) -> Result<LaunchResponse> {
         &json!({
             "pid": wrapper_pid,
             "wrapper_pid": wrapper_pid,
+            // Refresh the identity token in lockstep with the PID so a stop that
+            // lands before the wrapper rewrites its own state still verifies it.
+            "start_ticks": rocm_core::process_start_ticks(wrapper_pid),
         }),
     )?;
     Ok(LaunchResponse {
@@ -639,6 +645,8 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
         &json!({
             "status": "ready",
             "server_pid": child.id(),
+            // Identity token for the server PID, captured while the child is alive.
+            "server_start_ticks": rocm_core::process_start_ticks(child.id()),
             "backend_state": "ready",
             "backend_requested": backend,
             "load_response": {
@@ -916,17 +924,27 @@ fn stop_service(request: StopRequest) -> Result<StopResponse> {
     require_nonempty(&request.service_id, "service_id")?;
     let files = service_files(&request.service_id)?;
     let state = read_service_state(&files.state_path).ok();
-    let stopped = match state.as_ref().and_then(pid_to_terminate_from_state) {
-        Some(pid) => terminate_pid(pid, request.force),
-        None => false,
+    // Verify the recorded PID still belongs to our server before signalling it,
+    // then wait for it to actually exit so the reported result is truthful.
+    let outcome = state
+        .as_ref()
+        .and_then(identity_from_state)
+        .map(|identity| {
+            rocm_core::terminate_verified(
+                &identity,
+                rocm_core::KillScope::Single,
+                STOP_GRACE,
+                request.force,
+            )
+        });
+    let (stopped, graceful) = match outcome {
+        Some(outcome) => (outcome.stopped(), outcome.graceful()),
+        None => (false, false),
     };
     if stopped {
         mark_json_status(&files.state_path, "stopped")?;
     }
-    Ok(StopResponse {
-        stopped,
-        graceful: stopped && !request.force,
-    })
+    Ok(StopResponse { stopped, graceful })
 }
 
 fn prepare_embeddable(
@@ -1776,6 +1794,8 @@ fn serve_direct_llama_server(
         &json!({
             "status": "ready",
             "server_pid": child.id(),
+            // Identity token for the server PID, captured while the child is alive.
+            "server_start_ticks": rocm_core::process_start_ticks(child.id()),
             "backend_state": "ready",
             "backend_requested": backend,
             "backend_mode": "lemonade-packaged-llama-server",
@@ -2324,7 +2344,12 @@ fn write_running_state(
             "runtime_executable": runtime.manifest.lemond,
             "log_path": request.log_path.as_ref().map(|path| path.display().to_string()),
             "engine_recipe": request.engine_recipe,
-            "started_at_unix_ms": current_unix_millis()
+            "started_at_unix_ms": current_unix_millis(),
+            // Kernel start-times captured while each PID is alive. Paired with the
+            // PIDs, they identify these exact processes across PID recycling so a
+            // later stop never signals a reused PID.
+            "start_ticks": rocm_core::process_start_ticks(pid),
+            "server_start_ticks": server_pid.and_then(rocm_core::process_start_ticks)
         }),
     )
 }
@@ -2408,8 +2433,18 @@ fn value_u32(value: &Value, key: &str) -> Option<u32> {
         .and_then(|value| u32::try_from(value).ok())
 }
 
-fn pid_to_terminate_from_state(state: &Value) -> Option<u32> {
-    value_u32(state, "server_pid").or_else(|| value_u32(state, "pid"))
+/// Reconstruct the identity (PID + kernel start-time) of the process a stop
+/// should terminate. The server PID is preferred, falling back to the launcher
+/// PID, each paired with its recorded start-time. `start_ticks` is absent in
+/// pre-existing state files, in which case verification degrades to best-effort.
+fn identity_from_state(state: &Value) -> Option<rocm_core::ProcessIdentity> {
+    if let Some(server_pid) = value_u32(state, "server_pid") {
+        let start_ticks = state.get("server_start_ticks").and_then(Value::as_u64);
+        return Some(rocm_core::ProcessIdentity::new(server_pid, start_ticks));
+    }
+    let pid = value_u32(state, "pid")?;
+    let start_ticks = state.get("start_ticks").and_then(Value::as_u64);
+    Some(rocm_core::ProcessIdentity::new(pid, start_ticks))
 }
 
 fn tail_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
@@ -2633,6 +2668,41 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_from_state_prefers_server_pid_and_its_start_ticks() {
+        let state = json!({
+            "pid": 100,
+            "start_ticks": 111_u64,
+            "server_pid": 200,
+            "server_start_ticks": 222_u64,
+        });
+        let identity = identity_from_state(&state).expect("identity");
+        assert_eq!(identity.pid, 200);
+        assert_eq!(identity.start_ticks, Some(222));
+    }
+
+    #[test]
+    fn identity_from_state_falls_back_to_launcher_pid() {
+        let state = json!({ "pid": 100, "start_ticks": 111_u64 });
+        let identity = identity_from_state(&state).expect("identity");
+        assert_eq!(identity.pid, 100);
+        assert_eq!(identity.start_ticks, Some(111));
+    }
+
+    #[test]
+    fn identity_from_legacy_state_has_no_start_ticks() {
+        // Pre-existing state files carry only PIDs; verification must degrade.
+        let state = json!({ "server_pid": 200 });
+        let identity = identity_from_state(&state).expect("identity");
+        assert_eq!(identity.pid, 200);
+        assert_eq!(identity.start_ticks, None);
+    }
+
+    #[test]
+    fn identity_from_state_without_any_pid_is_none() {
+        assert!(identity_from_state(&json!({ "status": "running" })).is_none());
+    }
 
     #[test]
     fn qwen_alias_resolves_to_validated_assistant_gguf_model() {

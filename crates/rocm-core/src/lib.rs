@@ -30,6 +30,7 @@ pub mod diagnose;
 pub mod examine;
 pub mod fix;
 pub mod openmpi;
+pub mod proc_lifecycle;
 pub mod runtime;
 pub mod uv;
 pub use diagnose::{
@@ -38,6 +39,10 @@ pub use diagnose::{
 };
 pub use examine::{Examination, FrameworkProbe, WSL_ROUTE_OUT_NOTE};
 pub use fix::{FixOptions, apply as apply_fix, list_recipes as list_fix_recipes};
+pub use proc_lifecycle::{
+    IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
+    process_start_ticks, terminate_verified,
+};
 use runtime::env_path_override;
 #[cfg(test)]
 use runtime::home_rocm_dir;
@@ -485,6 +490,45 @@ pub fn terminate_process_tree(pid: u32) -> Result<()> {
         return Err(error).with_context(|| format!("failed to terminate process {target}"));
     }
     Ok(())
+}
+
+/// Send `signal` to `pid`, optionally extending to its transitive children.
+///
+/// Delivery to a process that has already exited (`ESRCH`) counts as success:
+/// the goal — that process no longer running — is already met. Returns `false`
+/// only when a signal could not be delivered for another reason (for example
+/// `EPERM`). Used by the verified-termination logic in [`proc_lifecycle`].
+#[cfg(not(windows))]
+#[allow(unsafe_code)] // libc FFI
+pub(crate) fn signal_process_scope(pid: u32, signal: i32, include_tree: bool) -> bool {
+    let targets = if include_tree {
+        collect_process_tree(pid)
+    } else {
+        vec![pid]
+    };
+    let mut delivered = true;
+    for target in targets {
+        let status = unsafe { libc::kill(target.cast_signed(), signal) };
+        if status != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+            delivered = false;
+        }
+    }
+    delivered
+}
+
+/// Snapshot `root` plus its transitive descendants as a flat PID list.
+///
+/// Used by [`proc_lifecycle`] to bind a tree termination to the exact processes
+/// present when the stop began. On platforms without `/proc` only `root` is
+/// returned.
+#[cfg(not(windows))]
+pub(crate) fn process_tree_pids(root: u32) -> Vec<u32> {
+    collect_process_tree(root)
+}
+
+#[cfg(windows)]
+pub(crate) fn process_tree_pids(root: u32) -> Vec<u32> {
+    vec![root]
 }
 
 /// Collect `root` plus all of its transitive descendants by reading `/proc`.
@@ -5485,6 +5529,18 @@ pub struct ManagedServiceRecord {
     pub status: String,
     pub supervisor_pid: u32,
     pub engine_pid: Option<u32>,
+    /// Kernel start-time of the supervisor (launcher) process, captured at
+    /// spawn. Paired with `supervisor_pid` it forms an identity that survives
+    /// PID recycling, so a later stop never signals a reused PID. `None` for
+    /// records written before this field existed.
+    #[serde(default)]
+    pub supervisor_start_ticks: Option<u64>,
+    /// Kernel start-time of the engine server process, adopted from the engine
+    /// state file whenever `engine_pid` is refreshed from it. The launcher and
+    /// the engine server are distinct processes, so each PID carries its own
+    /// identity token. `None` until the engine state records one.
+    #[serde(default)]
+    pub engine_start_ticks: Option<u64>,
     #[serde(default)]
     pub runtime_id: Option<String>,
     #[serde(default)]
@@ -5544,6 +5600,8 @@ impl ManagedServiceRecord {
             status: "starting".to_owned(),
             supervisor_pid,
             engine_pid: None,
+            supervisor_start_ticks: None,
+            engine_start_ticks: None,
             runtime_id,
             env_id,
             device_policy,
@@ -5611,13 +5669,25 @@ impl ManagedServiceRecord {
         {
             self.env_id = Some(env_id.to_owned());
         }
-        if let Some(pid) = state
+        // Adopt the engine server PID together with ITS OWN start-time token so
+        // a later stop verifies the server process, not the launcher. The ticks
+        // key must match the PID key: `server_pid`↔`server_start_ticks`,
+        // `pid`↔`start_ticks`.
+        let engine_pid = state
             .get("server_pid")
-            .or_else(|| state.get("pid"))
             .and_then(serde_json::Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
+            .map(|pid| (pid, "server_start_ticks"))
+            .or_else(|| {
+                state
+                    .get("pid")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|pid| (pid, "start_ticks"))
+            });
+        if let Some((pid, ticks_key)) = engine_pid
+            && let Ok(pid) = u32::try_from(pid)
         {
             self.engine_pid = Some(pid);
+            self.engine_start_ticks = state.get(ticks_key).and_then(serde_json::Value::as_u64);
         }
         Ok(self.status != previous)
     }
