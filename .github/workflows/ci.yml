@@ -993,11 +993,54 @@ jobs:
       - name: Run E2E tests on Strix Halo Windows
         shell: powershell
         run: |
-          # Persist one installed runtime so the end-of-run version probe can read
-          # ROCm/vLLM/lemonade versions for the report heading (and to install once
-          # across serve/chat scenarios). See the Strix-Ubuntu / e2e-gpu jobs.
-          $env:E2E_SHARED_RUNTIMES_DIR = "$env:RUNNER_WORKSPACE\e2e-runtimes"
-          cargo xtask e2e
+          # Share ONE installed managed runtime across serve/chat scenarios, and
+          # PRE-WARM it in place before the suite (mirrors e2e-gpu / strix-ubuntu).
+          # REQUIRED for correctness, not just speed: `install sdk` bakes ABSOLUTE
+          # paths (install_root, python_executable, rocm_sdk.*, .rocm-cli-runtime.json)
+          # into the runtime manifest. If the first scenario installs into its own
+          # isolated temp data dir and only the registry is shared onward, those baked
+          # paths point at that scenario's dir — deleted when the scenario ends — so
+          # every later serve sees status=unusable and fails (diagnosed on the Linux
+          # box 2026-07-15; the Windows scenario-8 cold-download failure is the same
+          # class). Install in place so the baked paths stay valid for all scenarios.
+          $prewarm = "$env:RUNNER_WORKSPACE\e2e-prewarm"
+          $env:E2E_SHARED_RUNTIMES_DIR = "$prewarm\data\runtimes"
+
+          # Build the rocm binary once; reuse for pre-warm + suite so xtask doesn't
+          # rebuild. This job does not set CARGO_TARGET_DIR, so the binary lands in
+          # the default target\release (fall back to it when the env var is unset).
+          cargo build --release -p rocm
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "target" }
+          $env:ROCM_CLI_BINARY = "$targetDir\release\rocm.exe"
+
+          # Pre-warm once, in place (no move/symlink). Skipped once the tree is
+          # populated (persists across runs on RUNNER_WORKSPACE).
+          if (-not (Test-Path "$env:E2E_SHARED_RUNTIMES_DIR\registry")) {
+            Write-Host "pre-warming shared runtime (first run on this runner)..."
+            New-Item -ItemType Directory -Force -Path "$prewarm\data","$prewarm\config","$prewarm\cache" | Out-Null
+            $env:ROCM_CLI_CONFIG_DIR = "$prewarm\config"
+            $env:ROCM_CLI_DATA_DIR   = "$prewarm\data"
+            $env:ROCM_CLI_CACHE_DIR  = "$prewarm\cache"
+            & $env:ROCM_CLI_BINARY install sdk
+            Remove-Item Env:\ROCM_CLI_CONFIG_DIR,Env:\ROCM_CLI_DATA_DIR,Env:\ROCM_CLI_CACHE_DIR -ErrorAction SilentlyContinue
+            if (Test-Path "$env:E2E_SHARED_RUNTIMES_DIR\registry") {
+              Write-Host "shared runtime pre-warmed at $env:E2E_SHARED_RUNTIMES_DIR"
+            } else {
+              Write-Host "pre-warm did not produce a runtimes registry; scenarios will install their own"
+            }
+          } else {
+            Write-Host "shared runtime already present at $env:E2E_SHARED_RUNTIMES_DIR - skipping pre-warm"
+          }
+
+          # TEMP: optional scenario-name filter for a scoped probe dispatch.
+          $nameFilter = "${{ github.event.inputs.name_filter }}"
+          if ($nameFilter) {
+            Write-Host "TEMP name filter active: $nameFilter"
+            cargo xtask e2e -- --name "$nameFilter"
+          } else {
+            cargo xtask e2e
+          }
 
       - name: Upload E2E report
         if: always()
