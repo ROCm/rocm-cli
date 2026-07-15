@@ -31,6 +31,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const ENGINE_NAME: &str = "vllm";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const HEALTHCHECK_TIMEOUT_MS: u64 = 700;
+/// Fraction of GPU memory vLLM may reserve for weights and KV cache when the
+/// operator does not override it. Conservative by default so a first serve
+/// leaves headroom for other processes on the device.
 const DEFAULT_GPU_MEMORY_UTILIZATION: &str = "0.80";
 const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
 const MAX_TAIL_READ: u64 = 4 * 1024 * 1024;
@@ -492,7 +495,7 @@ fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelRe
             "endpoint_mode": "openai",
             "host": DEFAULT_HOST,
             "port": DEFAULT_LOCAL_PORT,
-            "gpu_memory_utilization": DEFAULT_GPU_MEMORY_UTILIZATION
+            "gpu_memory_utilization": vllm_gpu_memory_utilization()
         }),
         engine_recipe,
         warnings: vec![
@@ -697,7 +700,7 @@ the ROCm SDK's bundled numa uses renamed symbol versions and cannot satisfy it, 
         .arg("--port")
         .arg(request.port.to_string())
         .arg("--gpu-memory-utilization")
-        .arg(DEFAULT_GPU_MEMORY_UTILIZATION);
+        .arg(vllm_gpu_memory_utilization());
     // vLLM's FULL CUDA-graph replay hangs ROCm gfx94x GPUs on the first decode
     // (surfaces as `HW Exception ... reason :GPU Hang`, which kills the engine and
     // drops every inference request). Eager mode disables CUDA graphs and keeps
@@ -1285,6 +1288,28 @@ fn resolve_vllm_ready_timeout(override_value: Option<String>) -> Duration {
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|secs| *secs > 0)
         .map_or(DEFAULT_VLLM_READY_TIMEOUT, Duration::from_secs)
+}
+
+/// Fraction of GPU memory passed to vLLM's `--gpu-memory-utilization`.
+///
+/// Defaults to [`DEFAULT_GPU_MEMORY_UTILIZATION`]; override with
+/// `ROCM_CLI_VLLM_GPU_MEMORY_UTILIZATION` to trade headroom for KV-cache
+/// capacity. Values outside vLLM's accepted `(0.0, 1.0]` range (or anything
+/// unparsable) fall back to the safe default rather than launching an engine
+/// that would immediately OOM or refuse to start.
+fn vllm_gpu_memory_utilization() -> String {
+    resolve_gpu_memory_utilization(std::env::var("ROCM_CLI_VLLM_GPU_MEMORY_UTILIZATION").ok())
+}
+
+fn resolve_gpu_memory_utilization(override_value: Option<String>) -> String {
+    override_value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| {
+            value
+                .parse::<f64>()
+                .is_ok_and(|fraction| fraction.is_finite() && fraction > 0.0 && fraction <= 1.0)
+        })
+        .unwrap_or_else(|| DEFAULT_GPU_MEMORY_UTILIZATION.to_owned())
 }
 
 fn runtime_bin_paths(runtime: &VllmRuntime) -> Vec<PathBuf> {
@@ -2002,6 +2027,79 @@ mod tests {
                 "  https://example.test/rocm/wheels  ".to_owned()
             )),
             "https://example.test/rocm/wheels"
+        );
+    }
+
+    #[test]
+    fn gpu_memory_utilization_defaults_without_override() {
+        assert_eq!(
+            resolve_gpu_memory_utilization(None),
+            DEFAULT_GPU_MEMORY_UTILIZATION
+        );
+        assert_eq!(
+            resolve_gpu_memory_utilization(Some("   ".to_owned())),
+            DEFAULT_GPU_MEMORY_UTILIZATION
+        );
+    }
+
+    #[test]
+    fn gpu_memory_utilization_honors_valid_override() {
+        assert_eq!(
+            resolve_gpu_memory_utilization(Some("0.5".to_owned())),
+            "0.5"
+        );
+        assert_eq!(
+            resolve_gpu_memory_utilization(Some("  0.92  ".to_owned())),
+            "0.92"
+        );
+        // The upper boundary (whole-GPU) is valid.
+        assert_eq!(
+            resolve_gpu_memory_utilization(Some("1.0".to_owned())),
+            "1.0"
+        );
+        assert_eq!(resolve_gpu_memory_utilization(Some("1".to_owned())), "1");
+    }
+
+    #[test]
+    fn gpu_memory_utilization_rejects_out_of_range_override() {
+        // Zero and negatives would leave vLLM with no KV-cache budget.
+        assert_eq!(
+            resolve_gpu_memory_utilization(Some("0".to_owned())),
+            DEFAULT_GPU_MEMORY_UTILIZATION
+        );
+        assert_eq!(
+            resolve_gpu_memory_utilization(Some("0.0".to_owned())),
+            DEFAULT_GPU_MEMORY_UTILIZATION
+        );
+        assert_eq!(
+            resolve_gpu_memory_utilization(Some("-0.3".to_owned())),
+            DEFAULT_GPU_MEMORY_UTILIZATION
+        );
+        // Above 1.0 over-commits VRAM; vLLM rejects it and so do we.
+        assert_eq!(
+            resolve_gpu_memory_utilization(Some("1.5".to_owned())),
+            DEFAULT_GPU_MEMORY_UTILIZATION
+        );
+    }
+
+    #[test]
+    fn gpu_memory_utilization_rejects_unparsable_override() {
+        assert_eq!(
+            resolve_gpu_memory_utilization(Some("high".to_owned())),
+            DEFAULT_GPU_MEMORY_UTILIZATION
+        );
+        assert_eq!(
+            resolve_gpu_memory_utilization(Some("0.8x".to_owned())),
+            DEFAULT_GPU_MEMORY_UTILIZATION
+        );
+        // Non-finite values are not a safe utilization fraction.
+        assert_eq!(
+            resolve_gpu_memory_utilization(Some("NaN".to_owned())),
+            DEFAULT_GPU_MEMORY_UTILIZATION
+        );
+        assert_eq!(
+            resolve_gpu_memory_utilization(Some("inf".to_owned())),
+            DEFAULT_GPU_MEMORY_UTILIZATION
         );
     }
 

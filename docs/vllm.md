@@ -55,7 +55,10 @@ On WSL, the tested source build needed vLLM ROCm platform detection to use
 TheRock PyTorch device data when `amdsmi` is unavailable, and needed vLLM's
 ROCm GPTQ half-atomic compatibility path enabled for TheRock 7.13 headers. The
 adapter passes `--gpu-memory-utilization 0.80` by default so display/WSL VRAM
-use does not prevent a small GPU model from starting.
+use does not prevent a small GPU model from starting. Override the fraction
+with `ROCM_CLI_VLLM_GPU_MEMORY_UTILIZATION` (a value in vLLM's accepted
+`(0.0, 1.0]` range); anything out of range or unparsable falls back to the
+`0.80` default.
 
 On the MI300X/gfx942 TheRock 7.13 runtime, current vLLM source required the
 GPTQ compatibility guard in
