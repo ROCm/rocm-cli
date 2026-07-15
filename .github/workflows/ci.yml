@@ -884,11 +884,44 @@ jobs:
         run: |
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          # Share one installed runtime across serve/chat scenarios (install once)
-          # AND persist it so the end-of-run version probe (report headings) can read
-          # the runtime's ROCm/vLLM/lemonade versions. The first "a managed runtime
-          # is active" scenario installs into this dir via use_shared_runtimes().
-          export E2E_SHARED_RUNTIMES_DIR="$RUNNER_WORKSPACE/e2e-runtimes"
+          # Share ONE installed managed runtime across serve/chat scenarios, and
+          # PRE-WARM it in place before the suite (mirrors e2e-gpu). This is not an
+          # optimization — it is REQUIRED for correctness. `install sdk` bakes
+          # ABSOLUTE paths (install_root, python_executable, rocm_sdk.*) into the
+          # runtime manifest. If the first scenario installs into its own isolated
+          # /tmp/rocm-e2e-XXXX data dir and only the registry is shared onward, those
+          # baked paths point at that scenario's temp dir — which is deleted when the
+          # scenario ends. Every later serve then sees `status=unusable (install root
+          # is missing)` and fails (diagnosed on the box 2026-07-15). Installing in
+          # place, directly into the persistent shared dir, keeps the baked paths
+          # valid for all scenarios and for the end-of-run version probe.
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
+          export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
+
+          # Build the rocm binary once; reuse for pre-warm + suite so xtask doesn't
+          # rebuild.
+          cargo build --release -p rocm
+          export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
+
+          # Pre-warm once, serially, in place (no mv/symlink). Skipped once the tree
+          # is populated (persists across runs on RUNNER_WORKSPACE).
+          if [ ! -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
+            echo "pre-warming shared runtime (first run on this runner)…"
+            mkdir -p "$prewarm"/{data,config,cache}
+            ROCM_CLI_CONFIG_DIR="$prewarm/config" \
+            ROCM_CLI_DATA_DIR="$prewarm/data" \
+            ROCM_CLI_CACHE_DIR="$prewarm/cache" \
+            HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
+              "$ROCM_CLI_BINARY" install sdk
+            if [ -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
+              echo "shared runtime pre-warmed at $E2E_SHARED_RUNTIMES_DIR"
+            else
+              echo "pre-warm did not produce a runtimes registry; scenarios will install their own" >&2
+            fi
+          else
+            echo "shared runtime already present at $E2E_SHARED_RUNTIMES_DIR — skipping pre-warm"
+          fi
+
           # TEMP: optional scenario-name filter for a scoped probe dispatch.
           NAME_FILTER="${{ github.event.inputs.name_filter }}"
           if [ -n "$NAME_FILTER" ]; then
