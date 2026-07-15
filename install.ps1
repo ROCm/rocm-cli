@@ -180,7 +180,9 @@ function Confirm-ArchiveSignature {
 
     Confirm-Command openssl
     foreach ($key in $PublicKeyPaths) {
-        & openssl dgst -sha256 -verify $key -signature $SignaturePath $ArchivePath | Out-Null
+        # Quote every path argument so keys or archives under a directory with
+        # spaces are passed to native openssl as single arguments.
+        & openssl dgst -sha256 -verify "$key" -signature "$SignaturePath" "$ArchivePath" | Out-Null
         if ($LASTEXITCODE -eq 0) {
             return
         }

@@ -20,8 +20,7 @@ env:
   # validate_production_trust() and behavior is unchanged. The values are public
   # keys and paths (not the private signing key, which stays step-scoped). When
   # enabling the gate, the recipe-index inputs also require a step that
-  # materializes the hosted index + its .sig into the workspace. See
-  # plans/release-production-trust-rollout.md.
+  # materializes the hosted index + its .sig into the workspace.
   ROCM_CLI_REQUIRE_PRODUCTION_TRUST: ${{ vars.ROCM_CLI_REQUIRE_PRODUCTION_TRUST }}
   ROCM_CLI_SIGNING_PUBLIC_KEY_PEM: ${{ secrets.ROCM_CLI_SIGNING_PUBLIC_KEY_PEM }}
   ROCM_CLI_METADATA_PUBLIC_KEY_PEM: ${{ secrets.ROCM_CLI_METADATA_PUBLIC_KEY_PEM }}
@@ -37,8 +36,10 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
       - name: Verify pinned keys match the signing key
-        run: python scripts/verify_pinned_keys.py
+        run: cargo xtask verify-pinned-keys
 
       - name: Determine version
         id: version
@@ -180,11 +181,11 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
       - name: Verify pinned keys match the signing key
         shell: pwsh
-        run: python .\scripts\verify_pinned_keys.py
-
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        run: cargo xtask verify-pinned-keys
 
       - name: Build release binaries
         shell: pwsh

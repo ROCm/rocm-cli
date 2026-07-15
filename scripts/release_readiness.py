@@ -17,7 +17,6 @@ import shutil
 import subprocess
 import sys
 import tarfile
-import tempfile
 import zipfile
 from pathlib import Path
 
@@ -334,12 +333,22 @@ def validate_archive_contents(archive: Path) -> list[str]:
     raise ReadinessError(f"unsupported archive extension: {archive.name}")
 
 
-def verify_signature(archive: Path, signature: Path, public_key: Path) -> None:
-    if not public_key.is_file():
+def verify_signature(archive: Path, signature: Path, public_key: Path | None) -> None:
+    """Verify ``archive`` against ``public_key`` via ``cargo xtask verify``.
+
+    When ``public_key`` is ``None`` the ``--public-key`` flag is omitted and
+    ``cargo xtask verify`` reads the key from ``ROCM_CLI_SIGNING_PUBLIC_KEY_PEM``
+    (the inline PEM release/nightly CI wire from the signing-key secret), so no
+    temporary key file has to be materialized here.
+    """
+    if public_key is not None and not public_key.is_file():
         raise ReadinessError(f"public key does not exist: {public_key}")
     cargo = shutil.which("cargo")
     if cargo is None:
         raise ReadinessError("cargo is required for signature verification")
+    key_args = (
+        ["--public-key", str(public_key.resolve())] if public_key is not None else []
+    )
     # Resolve to absolute paths because the subprocess runs from the repo root
     # (so the `cargo xtask` alias resolves); relative paths would otherwise be
     # interpreted against the repo root rather than the caller's working directory.
@@ -348,8 +357,7 @@ def verify_signature(archive: Path, signature: Path, public_key: Path) -> None:
             cargo,
             "xtask",
             "verify",
-            "--public-key",
-            str(public_key.resolve()),
+            *key_args,
             "--in",
             str(archive.resolve()),
             "--signature",
@@ -374,6 +382,7 @@ def validate_archive(
     *,
     require_signatures: bool,
     public_key: Path | None,
+    verify_with_env_key: bool = False,
     require_rocm_asset_names: bool,
 ) -> list[str]:
     messages: list[str] = []
@@ -400,15 +409,16 @@ def validate_archive(
         )
     messages.append(f"checksum ok: {archive.name}")
 
+    verify = public_key is not None or verify_with_env_key
     signature = Path(f"{archive}.sig")
-    if require_signatures or public_key is not None:
+    if require_signatures or verify:
         if not signature.is_file():
             raise ReadinessError(f"missing signature sidecar: {signature}")
         if signature.stat().st_size <= 0:
             raise ReadinessError(f"signature sidecar is empty: {signature}")
         messages.append(f"signature present: {archive.name}.sig")
 
-    if public_key is not None:
+    if verify:
         verify_signature(archive, signature, public_key)
         messages.append(f"signature verified: {archive.name}")
 
@@ -464,33 +474,6 @@ def require_existing_env_path(name: str) -> Path:
     return path
 
 
-def resolve_release_public_key() -> Path:
-    """Materialize the release signing public key from ROCM_CLI_SIGNING_PUBLIC_KEY_PEM
-    into a temp file so archives can be verified against it. Raises if it is not set.
-
-    Verifying against this key proves the artifact CI is about to publish was signed
-    by the private half of the key that installers will pin as a trust root, instead
-    of merely confirming a key input exists — a mismatched pair would otherwise pass
-    the gate and ship releases that installers reject once default-on verification
-    lands. The env value MUST be the same public key pinned in install.sh/.ps1.
-
-    Only the inline PEM form is accepted (that is what release/nightly CI wire from
-    the signing-key secret); to verify against a key *file* on disk, pass its path
-    with the --public-key flag instead.
-    """
-    pem = env_text("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM")
-    if pem is None:
-        raise ReadinessError(
-            "production trust requires the release signing public key: set "
-            "ROCM_CLI_SIGNING_PUBLIC_KEY_PEM (or pass --public-key)"
-        )
-    with tempfile.NamedTemporaryFile(
-        "w", suffix=".pem", delete=False, encoding="ascii"
-    ) as handle:
-        handle.write(pem if pem.endswith("\n") else f"{pem}\n")
-    return Path(handle.name)
-
-
 def validate_production_trust() -> list[str]:
     """Validate only explicit owner-provided production trust inputs."""
 
@@ -539,11 +522,13 @@ def validate_release(
     assets: list[str],
     require_signatures: bool,
     public_key: Path | None,
+    verify_with_env_key: bool = False,
     require_production_trust: bool,
     require_rocm_asset_names: bool,
     require_exact_assets: bool,
 ) -> list[str]:
     archives = discover_archives(dist, assets)
+    verify = public_key is not None or verify_with_env_key
     messages: list[str] = []
     if require_exact_assets:
         if not assets:
@@ -552,7 +537,7 @@ def validate_release(
             validate_exact_dist_assets(
                 dist,
                 archives,
-                expect_signatures=require_signatures or public_key is not None,
+                expect_signatures=require_signatures or verify,
             )
         )
     for archive in archives:
@@ -561,6 +546,7 @@ def validate_release(
                 archive,
                 require_signatures=require_signatures,
                 public_key=public_key,
+                verify_with_env_key=verify_with_env_key,
                 require_rocm_asset_names=require_rocm_asset_names,
             )
         )
@@ -869,29 +855,6 @@ def run_self_test(root: Path) -> None:
         )
         print("release readiness self-test: valid production trust inputs accepted")
 
-        # resolve_release_public_key(): the PEM env input is materialized to a temp
-        # file, and a missing input is an error. This is the key CI verifies release
-        # archives against under production trust.
-        pem_text = "-----BEGIN PUBLIC KEY-----\nself-test\n-----END PUBLIC KEY-----"
-        resolved_pem = run_with_env(
-            {"ROCM_CLI_SIGNING_PUBLIC_KEY_PEM": pem_text},
-            resolve_release_public_key,
-        )
-        if resolved_pem.read_text(encoding="ascii") != f"{pem_text}\n":
-            raise ReadinessError(
-                "resolve_release_public_key did not materialize the PEM input"
-            )
-        resolved_pem.unlink()
-        print("release readiness self-test: release public key resolution ok")
-
-        expect_failure(
-            "production trust without a release public key",
-            lambda: run_with_env(
-                {"ROCM_CLI_SIGNING_PUBLIC_KEY_PEM": None},
-                resolve_release_public_key,
-            ),
-        )
-
         expect_failure(
             "missing explicit asset",
             lambda: validate_release(
@@ -1011,18 +974,28 @@ def main() -> None:
     # trust; otherwise opportunistic: if a signing public key is present in the
     # environment (release/nightly wire it from the secret), verify against it.
     # An explicit --public-key still wins; with neither, behavior is unchanged.
+    #
+    # When relying on the environment key, `cargo xtask verify` reads it directly
+    # from ROCM_CLI_SIGNING_PUBLIC_KEY_PEM, so no temp key file is materialized here.
     public_key = args.public_key
+    verify_with_env_key = False
     try:
         if public_key is None and (
             require_production_trust
             or env_text("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM") is not None
         ):
-            public_key = resolve_release_public_key()
+            if env_text("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM") is None:
+                raise ReadinessError(
+                    "production trust requires the release signing public key: set "
+                    "ROCM_CLI_SIGNING_PUBLIC_KEY_PEM (or pass --public-key)"
+                )
+            verify_with_env_key = True
         messages = validate_release(
             Path(args.dist),
             assets=args.asset,
             require_signatures=require_signatures,
             public_key=public_key,
+            verify_with_env_key=verify_with_env_key,
             require_production_trust=require_production_trust,
             require_rocm_asset_names=args.require_rocm_asset_names,
             require_exact_assets=args.require_exact_assets,
