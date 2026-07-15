@@ -723,6 +723,46 @@ jobs:
           rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
           echo "reclaimed"
 
+      # GPU preflight: fail fast (~90s) instead of hanging to the job cap when the
+      # GPU is missing, the driver is wedged, or VRAM is still saturated by a
+      # leftover serve. A BOUNDED POLL, not a one-shot check: transient contention
+      # (e.g. the reclaim step's kills still draining VRAM) self-heals within
+      # seconds, so we retry up to a ceiling and succeed the moment the GPU is both
+      # responsive AND has enough free VRAM. Only a genuinely absent/wedged/held
+      # GPU reaches the ceiling and fails — with a per-reason message.
+      - name: GPU preflight (bounded wait for an available GPU)
+        run: |
+          # A serve here needs most of the card; require a generous free-VRAM
+          # floor so a leftover serve (which the reclaim step should have killed)
+          # is caught, while normal baseline (~300 MB used) passes immediately.
+          MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-16}"
+          CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
+          min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
+          deadline=$(( SECONDS + CEILING_SECS ))
+          reason="rocm-smi never returned within its timeout (driver wedged or GPU absent)"
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            # rocm-smi itself can hang on a wedged driver — bound it with timeout.
+            out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
+            # Parse the byte value AFTER the colon; the line prefix "GPU[0]" would
+            # otherwise make a naive first-number match pick up the "0".
+            total=$(printf '%s\n' "$out" | grep -i 'VRAM Total Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            used=$(printf '%s\n' "$out" | grep -i 'VRAM Total Used Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            if [ -z "$total" ] || [ -z "$used" ]; then
+              reason="rocm-smi returned no VRAM figures (no AMD GPU detected)"
+              sleep 5; continue
+            fi
+            free=$(( total - used ))
+            if [ "$free" -ge "$min_free" ]; then
+              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB free (>= ${MIN_FREE_GIB} GiB)."
+              exit 0
+            fi
+            reason="VRAM never dropped below the floor: only $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB) — a serve is likely still holding the GPU"
+            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB)…"
+            sleep 5
+          done
+          echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${reason}"
+          exit 1
+
       # cache: false — on this self-hosted runner we persist the build cache
       # ourselves via CARGO_TARGET_DIR (below). The action's built-in
       # Swatinem/rust-cache otherwise tries to SAVE the large target dir to
@@ -868,6 +908,38 @@ jobs:
           rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
           echo "prepared + reclaimed"
 
+      # GPU preflight: bounded wait so a missing/wedged/held GPU fails fast (~90s)
+      # instead of hanging to the job cap. Transient contention (VRAM still
+      # draining from the reclaim above) self-heals within the ceiling. See the
+      # e2e-gpu job for the rationale. gfx1151 shares system memory, so the free
+      # floor is smaller than the Instinct card but still catches a leftover serve.
+      - name: GPU preflight (bounded wait for an available GPU)
+        run: |
+          MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-8}"
+          CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
+          min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
+          deadline=$(( SECONDS + CEILING_SECS ))
+          reason="rocm-smi never returned within its timeout (driver wedged or GPU absent)"
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
+            total=$(printf '%s\n' "$out" | grep -i 'VRAM Total Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            used=$(printf '%s\n' "$out" | grep -i 'VRAM Total Used Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            if [ -z "$total" ] || [ -z "$used" ]; then
+              reason="rocm-smi returned no VRAM figures (no AMD GPU detected)"
+              sleep 5; continue
+            fi
+            free=$(( total - used ))
+            if [ "$free" -ge "$min_free" ]; then
+              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB free (>= ${MIN_FREE_GIB} GiB)."
+              exit 0
+            fi
+            reason="VRAM never dropped below the floor: only $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB) — a serve is likely still holding the GPU"
+            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB)…"
+            sleep 5
+          done
+          echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${reason}"
+          exit 1
+
       # Bootstrap rustup ourselves with --no-modify-path so it never writes to
       # $HOME/.profile (setup-rust-toolchain doesn't expose that flag).
       # rust-toolchain.toml pins the exact toolchain, installed on first cargo
@@ -978,6 +1050,44 @@ jobs:
             Where-Object { $_.CommandLine -match 'rocm-e2e|__engine-serve-http|e2e-target|e2e-shared' -and $_.CommandLine -match 'llama-server|vllm|rocm ' } |
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
           Write-Host "reclaimed"
+
+      # GPU preflight (best-effort on Windows): bounded wait for the GPU to be
+      # available so a wedged/held GPU fails fast instead of hanging to the cap.
+      # BEST-EFFORT because the Windows ROCm GPU query tool isn't verified here —
+      # if no rocm-smi is found we WARN and continue rather than false-fail a
+      # working runner. When rocm-smi IS present we poll free VRAM the same way as
+      # the Linux jobs and fail only after the ceiling.
+      - name: GPU preflight (bounded wait for an available GPU)
+        shell: powershell
+        run: |
+          $minFreeGiB = if ($env:GPU_PREFLIGHT_MIN_FREE_GIB) { [int]$env:GPU_PREFLIGHT_MIN_FREE_GIB } else { 8 }
+          $ceilingSecs = if ($env:GPU_PREFLIGHT_CEILING_SECS) { [int]$env:GPU_PREFLIGHT_CEILING_SECS } else { 90 }
+          if (-not (Get-Command rocm-smi -ErrorAction SilentlyContinue)) {
+            Write-Host "rocm-smi not found on this Windows runner; skipping GPU preflight (best-effort)."
+            exit 0
+          }
+          $minFree = [int64]$minFreeGiB * 1GB
+          $deadline = (Get-Date).AddSeconds($ceilingSecs)
+          $reason = "rocm-smi never returned usable VRAM figures"
+          while ((Get-Date) -lt $deadline) {
+            $out = (rocm-smi --showmeminfo vram 2>$null | Out-String)
+            $total = ([regex]::Matches($out, 'VRAM Total Memory \(B\):\s*(\d+)') | Select-Object -First 1).Groups[1].Value
+            $used  = ([regex]::Matches($out, 'VRAM Total Used Memory \(B\):\s*(\d+)') | Select-Object -First 1).Groups[1].Value
+            if (-not $total -or -not $used) {
+              $reason = "rocm-smi returned no VRAM figures (no AMD GPU detected)"
+              Start-Sleep -Seconds 5; continue
+            }
+            $free = [int64]$total - [int64]$used
+            if ($free -ge $minFree) {
+              Write-Host "GPU ready: $([math]::Floor($free/1GB)) GiB free (>= $minFreeGiB GiB)."
+              exit 0
+            }
+            $reason = "VRAM never dropped below the floor: only $([math]::Floor($free/1GB)) GiB free (< $minFreeGiB GiB) - a serve is likely still holding the GPU"
+            Write-Host "waiting: $([math]::Floor($free/1GB)) GiB free (< $minFreeGiB GiB)..."
+            Start-Sleep -Seconds 5
+          }
+          Write-Host "::error::GPU preflight failed after ${ceilingSecs}s: $reason"
+          exit 1
 
       - name: Ensure Rust toolchain (PowerShell)
         shell: powershell
