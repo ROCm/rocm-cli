@@ -35,7 +35,7 @@ SCRATCH only (e21297d). Bring to PR (test/add-e2e-robot-framework) after strix-w
 **Pipeline:** standard
 **Branch:** ci-e2e-framework-fixes (scratch, active) / test/add-e2e-robot-framework (PR)
 **Last Updated:** 2026-07-15
-**Idle flush:** 2026-07-15 — session inactive for 10 minutes, auto-flushing state
+**Idle flush:** 2026-07-15 — session idle for 10 minutes, auto-flushing state
 **Token Usage:** in=13238 out=4227864 cache_create=50789016 cache_read=2403572293 calls=6644
 
 ## 📋 VOLEN-SILO (Eugene / pr-review-watcher BOT) REVIEW — TRIAGED (2026-07-14) — READ FIRST
@@ -232,6 +232,8 @@ Rebuilt the `1817c5b` idea correctly:
 default-engine), rominf re-review pending.
 
 ## 📋 Work Log
+
+**2026-07-15 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
 **2026-07-15 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state. PR #69 all-blocking checks green (commit e21297d on scratch, equivalent to PR tree post-cherry-pick); strix-windows 0 XPASS confirmed via run 29356345254. Version feature + os=linux xfail scoping + @nightly-install-tag remain on scratch only — bring to PR after strix-windows validation completes. VOLEN-silo review fully triaged (5B+6NB items fixed in worktree). Task #22 (share-one-runtime) validated by hand, #23 (strix lemonade probe) returned 2 unexpected failures (backend-install masking engine line, Vulkan instability) requiring xfail or deeper fix. Full 4-platform CI report exists (run 29354305288, all columns live, version headings present, reconciliation all-green with 0 XPASS/0 unexp except strix-windows 1 XPASS on chat-tool-definitions).
 
