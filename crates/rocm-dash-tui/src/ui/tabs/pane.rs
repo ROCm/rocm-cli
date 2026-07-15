@@ -20,7 +20,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use crate::app::{KeyAction, PaneFocus};
+use rocm_dash_core::metrics::InstanceStatus;
+
+use crate::app::{AppState, KeyAction, PaneFocus};
+use crate::ui::format;
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
 
@@ -82,12 +85,13 @@ pub fn draw(
     list_title: &str,
     verbs: &[Verb],
     sel: usize,
-    focus: PaneFocus,
+    state: &AppState,
     theme: &Theme,
 ) {
+    let focus = state.pane_focus;
     let cols = split_columns(area);
     draw_verb_list(f, cols[0], list_title, verbs, sel, focus, theme);
-    draw_detail(f, cols[1], verbs, sel, focus, theme);
+    draw_detail(f, cols[1], verbs, sel, focus, state, theme);
 }
 
 /// Map a left-click in a domain tab's body to an action.
@@ -196,6 +200,7 @@ fn draw_detail(
     verbs: &[Verb],
     sel: usize,
     focus: PaneFocus,
+    state: &AppState,
     theme: &Theme,
 ) {
     let sel = sel.min(verbs.len().saturating_sub(1));
@@ -215,13 +220,22 @@ fn draw_detail(
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(v.summary, Style::default().fg(theme.fg))),
         Line::from(""),
-        Line::from(Span::styled(
-            "What you'll do",
-            Style::default()
-                .fg(theme.muted)
-                .add_modifier(Modifier::BOLD),
-        )),
     ];
+
+    // State-aware block: what's actually installed / known / running for this
+    // verb, so the pane reflects the system rather than fixed copy.
+    let live = live_lines(v.action, state, theme);
+    if !live.is_empty() {
+        lines.extend(live);
+        lines.push(Line::from(""));
+    }
+
+    lines.push(Line::from(Span::styled(
+        "What you'll do",
+        Style::default()
+            .fg(theme.muted)
+            .add_modifier(Modifier::BOLD),
+    )));
     for (i, step) in v.steps.iter().enumerate() {
         lines.push(Line::from(vec![
             Span::styled(
@@ -280,4 +294,148 @@ fn draw_detail(
     }
 
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+/// State-aware "current status" lines for a verb, or empty when the verb has no
+/// live view.
+///
+/// Surfaces what's actually installed (ROCm/engines), known (model catalog), or
+/// running (instances) so the detail pane reflects the system — including the
+/// running-instances view inline, without opening the services popup.
+fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
+    let head = |t: String| {
+        Line::from(Span::styled(
+            t,
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let mark = |ok: bool| {
+        if ok {
+            Span::styled("✓ ", Style::default().fg(theme.ok))
+        } else {
+            Span::styled("· ", Style::default().fg(theme.muted))
+        }
+    };
+    let info = || {
+        state
+            .latest
+            .as_ref()
+            .and_then(|s| s.gpu_system_info.as_ref())
+    };
+
+    match action {
+        KeyAction::OpenInstall => {
+            let mut lines = vec![head("Installed now".into())];
+            let rocm = info().and_then(|i| i.rocm_version.clone());
+            lines.push(Line::from(vec![
+                mark(rocm.is_some()),
+                Span::styled(
+                    rocm.map_or_else(|| "ROCm — not detected".into(), |v| format!("ROCm {v}")),
+                    Style::default().fg(theme.fg),
+                ),
+            ]));
+            let driver = info().and_then(|i| i.driver_version.clone());
+            lines.push(Line::from(vec![
+                mark(driver.is_some()),
+                Span::styled(
+                    driver.map_or_else(|| "Driver —".into(), |v| format!("Driver {v}")),
+                    Style::default().fg(theme.fg),
+                ),
+            ]));
+            if !state.runtimes.is_empty() {
+                lines.push(head(format!("{} runtime(s)", state.runtimes.len())));
+                for rt in state.runtimes.iter().take(4) {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            if rt.active { "● " } else { "  " },
+                            Style::default().fg(theme.ok),
+                        ),
+                        Span::styled(
+                            format!("{} ({} {})", rt.key, rt.channel, rt.version),
+                            Style::default().fg(theme.fg),
+                        ),
+                    ]));
+                }
+            }
+            lines
+        }
+        KeyAction::OpenEngineManager => {
+            let mut lines = vec![head("Engines".into())];
+            let lemon = info().and_then(|i| i.lemond_version.clone());
+            lines.push(Line::from(vec![
+                mark(lemon.is_some()),
+                Span::styled(
+                    lemon.map_or_else(
+                        || "Lemonade — not installed".into(),
+                        |v| format!("Lemonade {v}"),
+                    ),
+                    Style::default().fg(theme.fg),
+                ),
+            ]));
+            // The daemon doesn't surface vLLM detection yet — open the manager to
+            // check rather than claiming a status we don't have.
+            lines.push(Line::from(vec![
+                Span::styled("· ", Style::default().fg(theme.muted)),
+                Span::styled("vLLM — open to check", Style::default().fg(theme.muted)),
+            ]));
+            lines
+        }
+        KeyAction::OpenServeWizard => {
+            let n = state.model_recipes.len();
+            if n == 0 {
+                return Vec::new();
+            }
+            let mut lines = vec![head(format!("Model catalog — {n} known"))];
+            for r in state.model_recipes.iter().take(4) {
+                lines.push(Line::from(vec![
+                    Span::styled("• ", Style::default().fg(theme.accent_2)),
+                    Span::styled(r.id.clone(), Style::default().fg(theme.fg)),
+                ]));
+            }
+            if n > 4 {
+                lines.push(Line::from(Span::styled(
+                    format!("  …and {} more", n - 4),
+                    Style::default().fg(theme.muted),
+                )));
+            }
+            lines
+        }
+        KeyAction::OpenServices => {
+            let running: Vec<_> = state
+                .instances
+                .values()
+                .filter(|i| i.status == InstanceStatus::Running)
+                .collect();
+            let mut lines = vec![head(format!("Running now — {}", running.len()))];
+            if running.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  none running",
+                    Style::default().fg(theme.muted),
+                )));
+            } else {
+                for i in running.iter().take(5) {
+                    let port = i.port.map_or_else(String::new, |p| format!(" :{p}"));
+                    lines.push(Line::from(vec![
+                        Span::styled("● ", Style::default().fg(theme.ok)),
+                        Span::styled(i.model_name.clone(), Style::default().fg(theme.fg)),
+                        Span::styled(port, Style::default().fg(theme.muted)),
+                        Span::styled(
+                            format!("  gen {}", format::tps_opt(i.gen_tps)),
+                            Style::default().fg(theme.muted),
+                        ),
+                    ]));
+                }
+                if running.len() > 5 {
+                    lines.push(Line::from(Span::styled(
+                        format!("  …and {} more", running.len() - 5),
+                        Style::default().fg(theme.muted),
+                    )));
+                }
+            }
+            lines
+        }
+        _ => Vec::new(),
+    }
 }
