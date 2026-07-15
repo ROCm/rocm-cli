@@ -2492,6 +2492,7 @@ fn build_driver_install_plan(
         .or_else(|| parse_os_release_field(os_release_text, "UBUNTU_CODENAME"))
         .or_else(|| codename_for_version(&os_id, &version_id).map(str::to_owned))
         .unwrap_or_default();
+    let id_like = parse_os_release_field(os_release_text, "ID_LIKE").unwrap_or_default();
 
     match (os_id.as_str(), version_id.as_str()) {
         ("ubuntu", "22.04" | "24.04") => apt_driver_plan(
@@ -2540,7 +2541,15 @@ fn build_driver_install_plan(
         ("sles" | "sle", "15.7") => {
             sles_driver_plan(os_id, version_id, codename, repo_version_expr, dkms)
         }
-        _ => DriverInstallPlan {
+        _ => driver_plan_via_id_like(
+            &os_id,
+            &version_id,
+            &id_like,
+            &codename,
+            &repo_version_expr,
+            dkms,
+        )
+        .unwrap_or_else(|| DriverInstallPlan {
             supported: false,
             mutating: false,
             policy: "unsupported_linux_dkms_plan".to_owned(),
@@ -2552,8 +2561,102 @@ fn build_driver_install_plan(
             preflight_checks: Vec::new(),
             commands: Vec::new(),
             checks: vec!["rocm examine".to_owned()],
-        },
+        }),
     }
+}
+
+/// Select a driver install plan for a distro whose `/etc/os-release` `ID` is not
+/// an AMD-documented distro, by falling back to its `ID_LIKE` base family.
+///
+/// This mirrors the family resolution already used by the OpenMPI and system
+/// dependency install plans in [`rocm_core::openmpi`], which honor `ID_LIKE`. A
+/// derivative is matched only when its `VERSION_ID` aligns with an AMD-documented
+/// version of the base family, so version-misaligned derivatives still fall
+/// through to the unsupported plan rather than fabricating a repository URL that
+/// would 404.
+fn driver_plan_via_id_like(
+    os_id: &str,
+    version_id: &str,
+    id_like: &str,
+    codename: &str,
+    repo_version_expr: &str,
+    dkms: bool,
+) -> Option<DriverInstallPlan> {
+    let likes: Vec<String> = id_like
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let mentions = |family: &str| likes.iter().any(|like| like == family);
+
+    // Ubuntu-family derivatives that reuse Ubuntu's VERSION_ID (e.g. Pop!_OS)
+    // also reuse its repositories; the amdgpu apt line always targets the
+    // `ubuntu/<codename>` repo, so the plan is identical to the Ubuntu base.
+    // Derivatives with their own version scheme (e.g. Linux Mint's "22") do not
+    // match here and remain unsupported rather than guessing a codename.
+    if mentions("ubuntu") && matches!(version_id, "22.04" | "24.04") {
+        let codename = if codename.is_empty() {
+            codename_for_version("ubuntu", version_id)
+                .unwrap_or_default()
+                .to_owned()
+        } else {
+            codename.to_owned()
+        };
+        return Some(apt_driver_plan(
+            os_id.to_owned(),
+            version_id.to_owned(),
+            codename,
+            repo_version_expr.to_owned(),
+            dkms,
+            true,
+        ));
+    }
+
+    // Debian-family derivatives that share Debian's version scheme map to the
+    // matching Ubuntu repo codename, exactly like the Debian base.
+    if mentions("debian") && matches!(version_id, "12" | "13") {
+        let repo_codename = if version_id == "13" { "noble" } else { "jammy" };
+        return Some(apt_driver_plan(
+            os_id.to_owned(),
+            version_id.to_owned(),
+            repo_codename.to_owned(),
+            repo_version_expr.to_owned(),
+            dkms,
+            false,
+        ));
+    }
+
+    // Enterprise-Linux rebuilds (e.g. AlmaLinux) reuse RHEL's version scheme and
+    // standard (RHCK, non-UEK) kernels, but are served from the vendor-neutral
+    // `el/` repository path rather than `rhel/`. Gate strictly on `ID_LIKE`
+    // naming `rhel`: Oracle Linux advertises only `ID_LIKE=fedora` and boots the
+    // UEK kernel, so it must keep its dedicated `("ol", ...)` flow and never be
+    // captured here with RHCK kernel commands that would fail to install. Guard
+    // the `ol`/`oracle` IDs explicitly as well, in case a future OL release adds
+    // `rhel` to `ID_LIKE`.
+    if mentions("rhel") && !matches!(os_id, "ol" | "oracle") && is_supported_el_version(version_id)
+    {
+        return Some(dnf_driver_plan(
+            os_id.to_owned(),
+            version_id.to_owned(),
+            codename.to_owned(),
+            repo_version_expr.to_owned(),
+            dkms,
+            DnfDriverDistro::Generic,
+        ));
+    }
+
+    // No SUSE-family fallback: SLES is matched exactly, and community rebuilds
+    // such as openSUSE Leap share the SLES version scheme but lack SUSEConnect
+    // entitlements, so the SLES plan's `SUSEConnect` commands would fail. They
+    // intentionally remain unsupported rather than producing a broken plan.
+
+    None
+}
+
+/// The set of Enterprise-Linux versions AMD documents for the driver install,
+/// used to gate `ID_LIKE`-based matching of RHEL rebuilds.
+fn is_supported_el_version(version_id: &str) -> bool {
+    matches!(version_id, "10.1" | "10.0" | "9.7" | "9.6" | "9.4" | "8.10")
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2561,6 +2664,9 @@ enum DnfDriverDistro {
     Rhel,
     Oracle,
     Rocky,
+    /// A RHEL rebuild matched via `ID_LIKE` (e.g. AlmaLinux, CentOS Stream):
+    /// standard RHEL kernels, served from the vendor-neutral `el/` repo path.
+    Generic,
 }
 
 fn apt_driver_plan(
@@ -2667,7 +2773,7 @@ fn dnf_driver_plan(
     let mut commands = Vec::new();
     if dkms {
         match distro {
-            DnfDriverDistro::Rhel => {
+            DnfDriverDistro::Rhel | DnfDriverDistro::Generic => {
                 commands.extend(
                     rhel_kernel_prepare_commands(&version_id)
                         .into_iter()
@@ -2691,7 +2797,7 @@ fn dnf_driver_plan(
             DriverCommandPhase::Prepare,
             &format!(
                 "sudo dnf install -y {}",
-                amdgpu_install_rpm_url(&repo_version_expr, &os_id, &version_id, distro)
+                amdgpu_install_rpm_url(&repo_version_expr, &version_id, distro)
             ),
         ));
         commands.push(driver_command(
@@ -2852,15 +2958,14 @@ fn rhel_kernel_prepare_commands(version_id: &str) -> Vec<&'static str> {
 
 fn amdgpu_install_rpm_url(
     repo_version_expr: &str,
-    os_id: &str,
     version_id: &str,
     distro: DnfDriverDistro,
 ) -> String {
     let repo_family = match distro {
         DnfDriverDistro::Rhel => "rhel",
-        DnfDriverDistro::Oracle | DnfDriverDistro::Rocky => "el",
+        DnfDriverDistro::Oracle | DnfDriverDistro::Rocky | DnfDriverDistro::Generic => "el",
     };
-    let repo_version = dnf_repo_version_path(os_id, version_id);
+    let repo_version = dnf_repo_version_path(version_id);
     let el_major = linux_major_version(version_id);
     format!(
         "https://repo.radeon.com/amdgpu-install/{repo_version_expr}/{repo_family}/{repo_version}/amdgpu-install-{repo_version_expr}.${{ROCM_CLI_AMDGPU_PACKAGE_RELEASE:-70204}}-1.el{el_major}.noarch.rpm"
@@ -2873,10 +2978,14 @@ fn amdgpu_install_sles_rpm_url(repo_version_expr: &str, version_id: &str) -> Str
     )
 }
 
-fn dnf_repo_version_path(os_id: &str, version_id: &str) -> String {
-    match (os_id, version_id) {
-        ("rhel", "10.1" | "10.0") | ("ol", "10.1") => "10".to_owned(),
-        ("rhel" | "ol", "8.10") => "8".to_owned(),
+fn dnf_repo_version_path(version_id: &str) -> String {
+    // AMD serves EL 8 and 10 from a major-version path (el8/, el10/, rhel/10/),
+    // but EL 9 from the point-release path (el/9.7/, rhel/9.6/). Keying on the
+    // major version keeps this correct for RHEL, Oracle Linux, and ID_LIKE-matched
+    // rebuilds alike, without depending on the specific distro `ID`.
+    let major = linux_major_version(version_id);
+    match major {
+        "8" | "10" => major.to_owned(),
         _ => version_id.to_owned(),
     }
 }
@@ -20358,6 +20467,178 @@ VERSION_ID="41"
         assert!(rendered.contains("approval: not required"));
         assert!(rendered.contains("execution_commands: <none>"));
         assert!(rendered.contains("scripts/wsl_setup_rocdxg.sh"));
+        assert!(!rendered.contains("amdgpu-dkms"));
+    }
+
+    // EAI-7406: distro selection must honor `/etc/os-release` `ID_LIKE`, so that
+    // Debian/Ubuntu-family and RHEL-rebuild derivatives that share their base
+    // version scheme are matched to the correct apt (`ubuntu/<codename>`) or EL
+    // (`el/`) plan instead of falling through to the unsupported plan.
+
+    #[test]
+    fn driver_plan_ubuntu_derivative_via_id_like_matches_ubuntu_plan() {
+        // Pop!_OS reports its own ID but reuses Ubuntu's version + repositories.
+        let os_release = r#"
+ID=pop
+VERSION_ID="22.04"
+VERSION_CODENAME=jammy
+ID_LIKE="ubuntu debian"
+"#;
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert!(plan.supported);
+        assert!(plan.mutating);
+        assert_eq!(plan.policy, "linux_official_amd_dkms_wrapper");
+        // Ubuntu-family derivatives ship the Ubuntu kernel, so linux-modules-extra applies.
+        assert!(rendered.contains("linux-modules-extra-$(uname -r)"));
+        assert!(rendered.contains(
+            "https://repo.radeon.com/graphics/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/ubuntu jammy main"
+        ));
+        assert!(rendered.contains("Execute: sudo apt-get install -y amdgpu-dkms"));
+    }
+
+    #[test]
+    fn driver_plan_debian_derivative_via_id_like_matches_debian_plan() {
+        // A Debian derivative (e.g. LMDE) that shares Debian's version scheme.
+        let os_release = r#"
+ID=lmde
+VERSION_ID="12"
+ID_LIKE=debian
+"#;
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert!(plan.supported);
+        // Debian-family maps to the Ubuntu jammy repo and omits linux-modules-extra.
+        assert!(rendered.contains(
+            "https://repo.radeon.com/graphics/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/ubuntu jammy main"
+        ));
+        assert!(!rendered.contains("linux-modules-extra-$(uname -r)"));
+        assert!(rendered.contains("amdgpu-dkms"));
+    }
+
+    #[test]
+    fn driver_plan_almalinux_via_id_like_uses_el_9_flow() {
+        // AlmaLinux is a RHEL rebuild: standard kernel, served from the el/ path.
+        let os_release = r#"
+ID=almalinux
+VERSION_ID="9.6"
+ID_LIKE="rhel centos fedora"
+"#;
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert!(plan.supported);
+        assert!(plan.mutating);
+        assert_eq!(plan.policy, "linux_official_amd_dkms_wrapper");
+        // EL rebuilds use the vendor-neutral el/ repo path, not rhel/.
+        assert!(
+            rendered.contains(
+                "repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/el/9.6/"
+            )
+        );
+        assert!(!rendered.contains("/rhel/9.6/"));
+        assert!(rendered.contains("amdgpu-install-${ROCM_CLI_AMDGPU_VERSION:-7.2.4}.${ROCM_CLI_AMDGPU_PACKAGE_RELEASE:-70204}-1.el9.noarch.rpm"));
+        // el9 uses the version-aware standard-kernel prepare commands.
+        assert!(rendered.contains("kernel-devel-matched-$(uname -r)"));
+        assert!(rendered.contains("Execute: sudo dnf install -y amdgpu-dkms"));
+    }
+
+    #[test]
+    fn driver_plan_almalinux_8_via_id_like_uses_el_major_path() {
+        let os_release = r#"
+ID=almalinux
+VERSION_ID="8.10"
+ID_LIKE="rhel centos fedora"
+"#;
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert!(plan.supported);
+        // EL 8 is served from the major-version path (el/8), matching AMD docs.
+        assert!(
+            rendered
+                .contains("repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/el/8/")
+        );
+        assert!(rendered.contains("-1.el8.noarch.rpm"));
+        // el8 has no kernel-devel-matched package.
+        assert!(!rendered.contains("kernel-devel-matched"));
+        assert!(rendered.contains("kernel-devel-$(uname -r)"));
+    }
+
+    #[test]
+    fn driver_plan_id_like_with_unsupported_version_stays_unsupported() {
+        // A Debian-family derivative whose VERSION_ID does not align with any
+        // AMD-documented Debian version must not fabricate a plan.
+        let os_release = r#"
+ID=lmde
+VERSION_ID="6"
+ID_LIKE=debian
+"#;
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert!(!plan.supported);
+        assert!(!plan.mutating);
+        assert!(rendered.contains("unsupported_linux_dkms_plan"));
+        assert!(!rendered.contains("amdgpu-dkms"));
+    }
+
+    #[test]
+    fn driver_plan_exact_id_takes_precedence_over_id_like() {
+        // An exact RHEL match must keep the rhel/ path even though ID_LIKE=fedora.
+        let os_release = r#"
+ID=rhel
+VERSION_ID="9.7"
+ID_LIKE=fedora
+"#;
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert!(plan.supported);
+        assert!(rendered.contains(
+            "repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/rhel/9.7/"
+        ));
+        assert!(!rendered.contains("/el/9.7/"));
+    }
+
+    #[test]
+    fn driver_plan_oracle_linux_off_arm_version_stays_unsupported() {
+        // Oracle Linux reports `ID_LIKE=fedora` (not rhel) and boots UEK. An OL
+        // version outside the exact `ol` arm must NOT be captured by the EL
+        // fallback, which would emit non-UEK kernel commands that cannot install.
+        let os_release = r#"
+ID=ol
+VERSION_ID="9.6"
+ID_LIKE=fedora
+"#;
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert!(!plan.supported);
+        assert!(!plan.mutating);
+        assert!(rendered.contains("unsupported_linux_dkms_plan"));
+        assert!(!rendered.contains("kernel-devel-matched"));
+        assert!(!rendered.contains("amdgpu-dkms"));
+    }
+
+    #[test]
+    fn driver_plan_opensuse_leap_stays_unsupported() {
+        // openSUSE Leap shares SLES's version scheme but has no SUSEConnect/SCC
+        // entitlement, so it must not be matched to the SLES plan.
+        let os_release = r#"
+ID=opensuse-leap
+VERSION_ID="15.7"
+ID_LIKE="suse opensuse"
+"#;
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert!(!plan.supported);
+        assert!(!plan.mutating);
+        assert!(rendered.contains("unsupported_linux_dkms_plan"));
+        assert!(!rendered.contains("SUSEConnect"));
         assert!(!rendered.contains("amdgpu-dkms"));
     }
 
