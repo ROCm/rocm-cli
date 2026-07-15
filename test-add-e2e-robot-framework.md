@@ -34,7 +34,7 @@ SCRATCH only (e21297d). Bring to PR (test/add-e2e-robot-framework) after strix-w
 **Stage:** 27-version-probe-fix-strix-ready-nightly-pending
 **Pipeline:** standard
 **Branch:** ci-e2e-framework-fixes (scratch, active) / test/add-e2e-robot-framework (PR)
-**Last Updated:** 2026-07-15
+**Last Updated:** 2026-07-15 (idle flush)
 **Idle flush:** 2026-07-15 — session idle for 10 minutes, auto-flushing state
 **Token Usage:** in=13238 out=4227864 cache_create=50789016 cache_read=2403572293 calls=6644
 
