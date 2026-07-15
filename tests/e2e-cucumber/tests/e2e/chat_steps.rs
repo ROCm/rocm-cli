@@ -54,7 +54,12 @@ async fn send_chat_with_tools(world: &mut E2eWorld) {
         .to_string();
 
     let chat_url = format!("{endpoint}/chat/completions");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(
+            crate::inference_timeout_for(world),
+        ))
+        .build()
+        .expect("failed to build HTTP client");
     let chat_resp: serde_json::Value = client
         .post(&chat_url)
         .json(&serde_json::json!({
@@ -152,8 +157,8 @@ async fn assert_privacy_notice_accurate(_world: &mut E2eWorld) {
 async fn assert_chat_successful(world: &mut E2eWorld) {
     let resp = world.chat_response.as_ref().expect("no chat response");
     assert!(
-        resp.get("choices").is_some(),
-        "no choices in response: {resp}"
+        e2e_cucumber::chat_response_is_successful(resp),
+        "no non-empty choices array in response: {resp}"
     );
 }
 

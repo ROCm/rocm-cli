@@ -116,6 +116,7 @@ jobs:
               - '**/*.sh'
               - '**/*.ps1'
               - '**/*.feature'
+              - 'tests/e2e-cucumber/expectations.toml'
               - 'install*'
               - '.github/workflows/**'
             # THIRD_PARTY_NOTICES.txt staleness gate: anything that changes the
