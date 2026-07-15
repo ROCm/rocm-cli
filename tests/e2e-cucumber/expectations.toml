@@ -91,11 +91,13 @@ bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so inference never succeeds."
 serve_timeout_secs = 90
 
-[["serve-readiness-contract"]]
-when = { effective_engine = "vllm" }
-bug = "EAI-7333"
-reason = "CLI reports the vLLM service ready, but an immediate inference request fails."
-serve_timeout_secs = 90
+# NOTE: no vLLM xfail for serve-readiness-contract. It was xfail'd against
+# EAI-7333 (CLI healthcheck reports ready off /v1/models before inference works),
+# but it XPASS'd on MI300X (run 29404668327) and passes reliably by hand there:
+# on Instinct vLLM (--enforce-eager) the model IS inference-ready by the time
+# `services list` reports ready, so the readiness contract holds. EAI-7333 stays
+# OPEN (the early-readiness code smell is real and may surface on other
+# scenarios/hardware), but this scenario is expect-pass on the vLLM path.
 
 # On a lemonade LINUX host this scenario does a real lemonade serve, which reaches
 # ready then shuts down immediately (EAI-7423, see serve-lemonade-inference).
