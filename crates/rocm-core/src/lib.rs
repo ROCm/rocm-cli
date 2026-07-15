@@ -6998,6 +6998,49 @@ Class Name:                Display
     }
 
     #[test]
+    fn builtin_catalog_authors_vllm_tool_call_parsers() {
+        // vLLM does not auto-detect a tool-call parser; the correct value is sourced
+        // from explicit per-model recipe metadata (never guessed at runtime). This
+        // guards the authored parser for well-known chat families so a regression is
+        // caught here rather than as an HTTP 400 in the TUI chat tab.
+        let document =
+            serde_json::from_str::<ModelRecipeIndexDocument>(include_str!("model_catalog.json"))
+                .expect("catalog JSON parses");
+        let tool_call_parser = |model_id: &str| -> Option<String> {
+            document
+                .recipes
+                .iter()
+                .find(|recipe| recipe.canonical_model_id == model_id)?
+                .engine_recipes
+                .iter()
+                .find(|engine_recipe| engine_recipe.engine == "vllm")
+                .and_then(|engine_recipe| {
+                    let flags = &engine_recipe.required_flags;
+                    assert!(
+                        flags.iter().any(|flag| flag == "--enable-auto-tool-choice"),
+                        "{model_id}: --tool-call-parser must be paired with --enable-auto-tool-choice"
+                    );
+                    let index = flags.iter().position(|flag| flag == "--tool-call-parser")?;
+                    flags.get(index + 1).cloned()
+                })
+        };
+        // Reported repro: a lemonade-preferred Qwen forced onto vLLM must still
+        // carry the Qwen-family parser.
+        assert_eq!(
+            tool_call_parser("Qwen/Qwen2.5-1.5B-Instruct").as_deref(),
+            Some("hermes")
+        );
+        assert_eq!(
+            tool_call_parser("Qwen/Qwen3-32B-FP8").as_deref(),
+            Some("hermes")
+        );
+        assert_eq!(
+            tool_call_parser("meta-llama/Llama-3.2-3B-Instruct").as_deref(),
+            Some("llama3_json")
+        );
+    }
+
+    #[test]
     fn model_recipe_target_platform_groups_by_engine() {
         let registry = builtin_model_recipe_registry();
         let platforms = model_catalog_platforms(&registry);
