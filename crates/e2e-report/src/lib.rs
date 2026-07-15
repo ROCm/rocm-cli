@@ -501,6 +501,9 @@ struct PlatformReport {
     /// Expectation-reconciled outcome (`platform.json` × `report.json` by `@id`).
     /// `None` for pre-expectation artifacts, which fall back to the junit status.
     tally: Option<ReconciledTally>,
+    /// Component versions (OS/ROCm/vLLM/lemonade) from `platform.json`, for the
+    /// summary-matrix Platform/OS cells. Default (all `None`) for older artifacts.
+    versions: PlatformVersions,
 }
 
 /// One recorded `rocm` invocation from a platform's `commands.jsonl` sidecar.
@@ -576,6 +579,21 @@ impl PlatformVersions {
     fn summary(&self) -> String {
         [
             self.os.as_deref().map(|v| format!("OS {v}")),
+            self.rocm.as_deref().map(|v| format!("ROCm {v}")),
+            self.vllm.as_deref().map(|v| format!("vLLM {v}")),
+            self.lemonade.as_deref().map(|v| format!("lemonade {v}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ")
+    }
+
+    /// The software-stack versions (ROCm/vLLM/lemonade, WITHOUT the OS — that goes
+    /// in its own cell), for the summary-matrix Platform cell. Empty when none are
+    /// known (e.g. mock, which has no installed runtime).
+    fn platform_stack(&self) -> String {
+        [
             self.rocm.as_deref().map(|v| format!("ROCm {v}")),
             self.vllm.as_deref().map(|v| format!("vLLM {v}")),
             self.lemonade.as_deref().map(|v| format!("lemonade {v}")),
@@ -867,6 +885,9 @@ impl PlatformReport {
         let label = format!("{} {}", desc.platform, desc.os);
         let commands = parse_commands(json_path);
         let tally = reconciled_tally(json_path);
+        let versions = parse_platform_manifest(json_path)
+            .map(|m| m.versions)
+            .unwrap_or_default();
         Self {
             desc,
             label,
@@ -876,6 +897,7 @@ impl PlatformReport {
             is_known_bugs,
             commands,
             tally,
+            versions,
         }
     }
 
@@ -1076,12 +1098,23 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
         t_fail += fail;
         t_skip += skip;
         t_xfail += xf;
+        // Component versions in the Platform/OS cells: ROCm/vLLM/lemonade under the
+        // platform, the OS version under the OS. Absent components are omitted (mock
+        // has no runtime; a not-yet-probed source is simply skipped).
+        let plat_cell = match r.versions.platform_stack() {
+            s if s.is_empty() => r.desc.platform.clone(),
+            s => format!("{}<br><sub>{}</sub>", r.desc.platform, s),
+        };
+        let os_cell = match r.versions.os.as_deref() {
+            Some(v) if v != r.desc.os => format!("{}<br><sub>{}</sub>", r.desc.os, v),
+            _ => r.desc.os.clone(),
+        };
         // `writeln!` into a String never fails; the discard keeps clippy happy.
         let _ = writeln!(
             out,
             "| {} | {} | {} | {} | {} | {} | {} | {} |",
-            r.desc.platform,
-            r.desc.os,
+            plat_cell,
+            os_cell,
             total,
             pass,
             fail,
@@ -1144,13 +1177,22 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
         }
     }
 
+    // id → (scenario name, Gherkin steps), built once from report.json across all
+    // inputs. Used both for the grid's Scenario column (name + id link) and the
+    // Scenario reference section at the very end.
+    let scenarios = scenario_reference(inputs);
+
     // The per-(scenario × platform) expectation grid, when platform.json
     // sidecars are present (the new expectation system). Placed before the
     // command-coverage table; it supersedes the coarse platform×tier matrix for
     // "where should each test pass / not matter / not run".
-    out.push_str(&expectation_grid_markdown(inputs));
+    out.push_str(&expectation_grid_markdown(inputs, &scenarios));
 
     out.push_str(&command_coverage_markdown(&reports));
+
+    // Scenario reference LAST (after command coverage): each id's actual Gherkin
+    // scenario, anchored so the grid's id links resolve here.
+    out.push_str(&scenario_reference_markdown(inputs, &scenarios));
 
     out
 }
@@ -1232,7 +1274,10 @@ fn expectation_grid_html(inputs: &[(String, PathBuf)]) -> Markup {
 /// Render the reconciled (scenario-id × platform) expectation grid as markdown,
 /// plus a "needs attention" list of every XPASS / unexpected-fail / ran-when-NA.
 /// Empty string when no `platform.json` sidecars are present.
-fn expectation_grid_markdown(inputs: &[(String, PathBuf)]) -> String {
+fn expectation_grid_markdown(
+    inputs: &[(String, PathBuf)],
+    scenarios: &std::collections::BTreeMap<String, (String, Vec<String>)>,
+) -> String {
     use std::fmt::Write as _;
 
     let grid = Grid::build(inputs);
@@ -1246,8 +1291,8 @@ fn expectation_grid_markdown(inputs: &[(String, PathBuf)]) -> String {
          ❌FAIL regression · ⚠️XPASS bug fixed here (stale entry) · · no data._\n\n",
     );
 
-    // Header: one column per platform, with its effective engine + component
-    // versions (OS/ROCm/vLLM/lemonade) as context.
+    // Header: one column per platform, with its effective engine. Component
+    // versions live in the summary matrix above, not here.
     out.push_str("| Scenario |");
     for col in &grid.columns {
         let eng = if col.engine.is_empty() {
@@ -1255,13 +1300,7 @@ fn expectation_grid_markdown(inputs: &[(String, PathBuf)]) -> String {
         } else {
             format!("<br><sub>{}</sub>", col.engine)
         };
-        let versions = col.versions.summary();
-        let ver = if versions.is_empty() {
-            String::new()
-        } else {
-            format!("<br><sub>{versions}</sub>")
-        };
-        let _ = write!(out, " {}{}{} |", col.slug, eng, ver);
+        let _ = write!(out, " {}{} |", col.slug, eng);
     }
     out.push('\n');
     out.push_str("|---|");
@@ -1271,7 +1310,10 @@ fn expectation_grid_markdown(inputs: &[(String, PathBuf)]) -> String {
     out.push('\n');
 
     for id in &grid.ids {
-        let _ = write!(out, "| `{id}` |");
+        // Scenario cell: human name on top, the @id below as a link to its entry
+        // in the Scenario reference section (GitHub anchors `#### <id>` to `#<id>`).
+        let name = scenarios.get(id).map(|(n, _)| n.as_str()).unwrap_or("");
+        let _ = write!(out, "| {name}<br>[`{id}`](#{id}) |");
         for col in &grid.columns {
             let g = col
                 .outcomes
@@ -1312,6 +1354,61 @@ fn expectation_grid_markdown(inputs: &[(String, PathBuf)]) -> String {
     }
 
     out
+}
+
+/// Render the Scenario reference section: each scenario `@id` with its actual
+/// Gherkin scenario (name + steps), anchored by the id (`#### <id>` → GitHub
+/// anchor `#<id>`) so the grid's id links resolve. Ordered by id for stability.
+/// Empty when no scenarios are known.
+fn scenario_reference_markdown(
+    inputs: &[(String, PathBuf)],
+    scenarios: &std::collections::BTreeMap<String, (String, Vec<String>)>,
+) -> String {
+    use std::fmt::Write as _;
+
+    // Only emit when there is a grid to reference (platform.json sidecars present),
+    // matching where the id links are generated.
+    if scenarios.is_empty() || Grid::build(inputs).is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("\n### Scenario reference\n\n");
+    for (id, (name, steps)) in scenarios {
+        let _ = writeln!(out, "#### {id}\n");
+        let _ = writeln!(out, "_{name}_\n");
+        for step in steps {
+            let _ = writeln!(out, "- {step}");
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Build a map of scenario `@id` → (human name, Gherkin steps) by scanning every
+/// input's `report.json`. Used for the grid's Scenario reference section. A
+/// scenario appears on the first input that ran it; later duplicates are ignored
+/// (the name/steps are identical across platforms).
+fn scenario_reference(
+    inputs: &[(String, PathBuf)],
+) -> std::collections::BTreeMap<String, (String, Vec<String>)> {
+    let mut map = std::collections::BTreeMap::new();
+    for (_label, json_path) in inputs {
+        for f in parse_features(json_path) {
+            for el in f.elements {
+                let Some(id) = scenario_id(&el) else { continue };
+                if map.contains_key(&id) {
+                    continue;
+                }
+                let steps = el
+                    .steps
+                    .iter()
+                    .map(|s| format!("{}{}", s.keyword, s.name))
+                    .collect();
+                map.insert(id, (el.name.clone(), steps));
+            }
+        }
+    }
+    map
 }
 
 /// A command signature: what we group invocations by in the coverage table.
@@ -2234,11 +2331,11 @@ mod tests {
         let md = consolidated_summary_markdown(&inputs);
         assert!(md.contains("### Expectation grid"), "grid missing:\n{md}");
         assert!(
-            md.contains("| `serve-x` | ✗ |"),
+            md.contains("[`serve-x`](#serve-x) | ✗ |"),
             "serve-x should be xfail (grey ✗):\n{md}"
         );
         assert!(
-            md.contains("| `examine-y` | ✅ |"),
+            md.contains("[`examine-y`](#examine-y) | ✅ |"),
             "examine-y should be pass:\n{md}"
         );
         // No problems → no needs-attention from the grid.
@@ -2268,8 +2365,9 @@ mod tests {
 
     #[test]
     fn grid_heading_shows_component_versions() {
-        // platform.json carries OS/ROCm/vLLM/lemonade versions → the grid column
-        // heading renders them (skipping any absent component).
+        // platform.json carries OS/ROCm/vLLM/lemonade versions → they render in the
+        // summary matrix Platform cell (ROCm/vLLM/lemonade) and OS cell (distro).
+        // (Versions were removed from the expectation-grid header.)
         let report = feature_json(&[(&["id:serve-x"], &["passed"])]);
         let platform = r#"{
             "platform_slug": "mi300x",
@@ -2283,18 +2381,19 @@ mod tests {
         let inputs = vec![("mi300x".to_string(), path)];
         let md = consolidated_summary_markdown(&inputs);
         for token in [
-            "OS Ubuntu 24.04.3 LTS",
+            "Ubuntu 24.04.3 LTS",
             "ROCm 7.13.0",
             "vLLM 0.23.0+rocm723",
             "lemonade 10.6.0",
         ] {
-            assert!(md.contains(token), "grid heading missing {token:?}:\n{md}");
+            assert!(md.contains(token), "matrix cell missing {token:?}:\n{md}");
         }
     }
 
     #[test]
     fn grid_heading_omits_absent_versions() {
-        // A platform.json with only OS+ROCm known renders just those, no vLLM/lemonade.
+        // A platform.json with only OS known renders just the distro (in the matrix
+        // OS cell); absent ROCm/vLLM/lemonade are omitted from the Platform cell.
         let report = feature_json(&[(&["id:serve-x"], &["passed"])]);
         let platform = r#"{
             "platform_slug": "mock",
@@ -2307,7 +2406,7 @@ mod tests {
         let (_d, path) = write_platform(&report, platform);
         let inputs = vec![("mock".to_string(), path)];
         let md = consolidated_summary_markdown(&inputs);
-        assert!(md.contains("OS Debian 12"), "should show OS:\n{md}");
+        assert!(md.contains("Debian 12"), "should show OS distro:\n{md}");
         assert!(!md.contains("vLLM "), "no vLLM version known → omit:\n{md}");
     }
 
@@ -2327,10 +2426,10 @@ mod tests {
         let inputs = vec![("mock".to_string(), path)];
         let md = consolidated_summary_markdown(&inputs);
         assert!(
-            md.contains("| `gpu-only` | n/a |"),
+            md.contains("[`gpu-only`](#gpu-only) | n/a |"),
             "skip should render as n/a:\n{md}"
         );
-        assert!(md.contains("| `ran-here` | ✅ |"));
+        assert!(md.contains("[`ran-here`](#ran-here) | ✅ |"));
     }
 
     #[test]
