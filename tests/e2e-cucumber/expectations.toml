@@ -1,0 +1,170 @@
+# Per-scenario expected-failure (xfail) matrix, keyed by scenario @id.
+#
+# This file holds the irreducibly manual part of the expectation system: a known
+# BUG is a defect the capability probe cannot infer, so each is declared here.
+# Everything else — is the required engine available on this host? what engine
+# does `serve` default to? does this platform prefer vLLM? — is DERIVED from the
+# host capability probe (see src/capability.rs) and is NOT encoded here.
+#
+# Resolution at runtime (see tests/e2e-cucumber/src/expectation.rs):
+#   1. A scenario whose @requires-gpu / @requires-engine can't be satisfied on
+#      this host is SKIPPED (not-applicable) — never listed here.
+#   2. Otherwise, the FIRST matching condition below marks it expected-fail
+#      (xfail); a scenario that then PASSES is an XPASS (stale entry — remove it).
+#   3. No matching condition → expected-pass.
+#
+# Condition predicate grammar (deliberately tiny):
+#   [[<scenario-id>]]                 one table per condition (arrays = OR)
+#   when = { effective_engine = "vllm", os = "linux", is_wsl = false }
+#                                     all present keys must match (AND)
+#   bug = "EAI-NNNN"                  ticket reference (shown in the report)
+#   reason = "..."                    human explanation (shown in the report)
+#   serve_timeout_secs = 90          optional: shorter serve wait for a known bug
+#
+# An empty `when = {}` means "always xfail" (platform-independent bug).
+
+# --- EAI-7222: privacy notice is only shown in the interactive dash/TUI, so a
+# black-box CLI test can't verify it. Tracked as xfail (any platform) rather than
+# a silent green no-op — the step panics, which is the expected outcome here. ---
+[["chat-privacy-notice-accurate"]]
+when = {}
+bug = "EAI-7222"
+reason = "Privacy notice is TUI-only; cannot be verified by a black-box CLI test."
+
+# --- EAI-7219: short-name expansion not surfaced in serve output (any engine) ---
+[["serve-short-name-expansion"]]
+when = {}
+bug = "EAI-7219"
+reason = "Serve output does not surface the expanded full model name for a short name."
+
+[["serve-short-name-consistent-across-engines"]]
+when = {}
+bug = "EAI-7219"
+reason = "Engines do not report a consistent resolved model name for a short name."
+
+# --- EAI-7333: vLLM reports /v1/models ready but refuses inference. vLLM-only. ---
+# Applies wherever the effective serve engine is vLLM. On lemonade-default hosts
+# (e.g. Strix Halo gfx1151, native Windows) these resolve to expected-pass, which
+# is what fixes the Strix-Windows XPASS from run #543.
+[["serve-vllm-inference"]]
+when = { effective_engine = "vllm" }
+bug = "EAI-7333"
+reason = "vLLM service reports ready (/v1/models 200) but POST /v1/chat/completions is refused."
+serve_timeout_secs = 90
+
+# Default-engine serve is RECIPE-driven, not host-driven: `rocm serve <model>`
+# with no --engine resolves to the recipe's preferred model+engine. On an Instinct
+# host (effective_engine=vllm) the request resolves to a GGUF recipe on lemonade,
+# whose llama.cpp Vulkan backend hangs on Instinct (EAI-7052) → the endpoint never
+# becomes ready. (Not EAI-7333: the default serve doesn't use vLLM at all here.)
+[["serve-default-engine-working-endpoint"]]
+when = { effective_engine = "vllm" }
+bug = "EAI-7052"
+reason = "Default serve resolves to a GGUF recipe on lemonade; its Vulkan backend hangs on Instinct, so the endpoint never reaches ready."
+serve_timeout_secs = 90
+
+# On a lemonade-native LINUX host (Strix Halo Ubuntu) the lemonade managed serve
+# loads the model and reaches ready on :8001, then is shut down ~0.08s later, so
+# the endpoint never becomes reachable (EAI-7423, root-caused on the box
+# 2026-07-15 — NOT the earlier "backend install hides the plan line" theory, which
+# was disproven: the `engine:` line IS emitted). os=linux: on native Windows this
+# scenario PASSES (run 29338475133 Strix-Windows), so it must NOT be xfail'd there.
+[["serve-default-engine-working-endpoint"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "EAI-7423"
+reason = "Lemonade managed serve reaches ready then shuts down immediately, so the endpoint never becomes reachable."
+serve_timeout_secs = 90
+
+[["serve-default-engine-inference"]]
+when = { effective_engine = "vllm" }
+bug = "EAI-7052"
+reason = "Default serve resolves to a GGUF recipe on lemonade; its Vulkan backend hangs on Instinct, so inference never succeeds."
+serve_timeout_secs = 90
+
+# On a lemonade-native LINUX host the served model's endpoint drops before
+# inference: the lemonade managed serve reaches ready then is shut down ~0.08s
+# later (EAI-7423, root-caused on the box 2026-07-15 — not a Vulkan hang).
+# os=linux: passes on native Windows (run 29338475133).
+[["serve-default-engine-inference"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "EAI-7423"
+reason = "Lemonade managed serve reaches ready then shuts down immediately, so inference never succeeds."
+serve_timeout_secs = 90
+
+# EAI-7333 (CLI healthcheck reports ready off /v1/models before inference works)
+# on the vLLM path. This scenario is FLAKY, not fixed: it XPASS'd on MI300X once
+# (run 29404668327) but FAILED the next run (29413321046) — a race between the
+# CLI reporting ready and the vLLM model actually being inference-ready. EAI-7333
+# is still OPEN, so keep it xfail'd on the vLLM path; an intermittent known-bug
+# scenario stays xfail (an occasional XPASS is expected and harmless here).
+[["serve-readiness-contract"]]
+when = { effective_engine = "vllm" }
+bug = "EAI-7333"
+reason = "CLI reports the vLLM service ready, but an immediate inference request races the model load and intermittently fails."
+serve_timeout_secs = 90
+
+# On a lemonade LINUX host this scenario does a real lemonade serve, which reaches
+# ready then shuts down immediately (EAI-7423, see serve-lemonade-inference).
+# os=linux: on native Windows lemonade serve works, so this PASSES there (verified
+# run 29338475133 Strix-Windows XPASS) and must not be xfail'd.
+[["serve-readiness-contract"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "EAI-7423"
+reason = "Lemonade managed serve reaches ready then shuts down immediately, so the ready-to-serve contract fails."
+serve_timeout_secs = 90
+
+# --- EAI-7423: on a lemonade LINUX host the managed serve reaches ready then is
+# shut down immediately, so inference never happens (root-caused on the box
+# 2026-07-15; previously mis-attributed to the EAI-7052 Vulkan hang). os=linux:
+# native Windows lemonade serve works (run 29338475133 Strix-Windows XPASS'd
+# this), so scope the xfail to Linux. ---
+[["serve-lemonade-inference"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "EAI-7423"
+reason = "Lemonade managed serve reaches ready then shuts down immediately, so inference never succeeds."
+serve_timeout_secs = 90
+
+# --- EAI-7223: chat requests with tool definitions rejected (vLLM path) ---
+[["chat-tool-definitions-accepted"]]
+when = { effective_engine = "vllm" }
+bug = "EAI-7223"
+reason = "Chat requests carrying tool definitions are not accepted by the served vLLM model."
+serve_timeout_secs = 90
+
+# On a lemonade LINUX host this needs a live lemonade serve, which reaches ready
+# then shuts down immediately (EAI-7423). os=linux: passes on native Windows
+# lemonade (run 29354305288 XPASS'd it), consistent with the other lemonade
+# serve scenarios.
+[["chat-tool-definitions-accepted"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "EAI-7423"
+reason = "Lemonade managed serve reaches ready then shuts down immediately, so the chat request never reaches a live model."
+serve_timeout_secs = 90
+
+# EAI-7221 (TUI chat sends hardcoded 'local-model' instead of querying /v1/models)
+# was previously mapped here as a vLLM-path xfail, but that bug is TUI-only and this
+# scenario exercises the CLI `rocm chat --prompt` path (which correctly discovers the
+# model via /v1/models). Verified expect-pass on MI300X vLLM (XPASS on run 29322186691,
+# then 3/3 green re-runs), so there is NO vLLM xfail for this scenario — the CLI chat
+# path works. Only the lemonade LINUX path stays xfail: it needs a live lemonade
+# serve, which reaches ready then shuts down immediately (EAI-7423); native Windows
+# lemonade serve works (run 29338475133 XPASS).
+[["chat-end-to-end-local-model"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "EAI-7423"
+reason = "Lemonade managed serve reaches ready then shuts down immediately, so the chat request never reaches a live model."
+serve_timeout_secs = 90
+
+# --- EAI-7383: `rocm help` lists subcommands in declaration order, not
+# alphabetically. Platform-independent (pure CLI help output). ---
+[["help-lists-subcommands-alphabetically"]]
+when = {}
+bug = "EAI-7383"
+reason = "rocm help lists subcommands in declaration order, not alphabetically."
+
+# --- EAI-7384: re-provisioning nests the managed runtime path recursively
+# (runtimes/wheel/.../runtimes/wheel/). Surfaces wherever a real install runs. ---
+[["runtime-path-not-nested"]]
+when = {}
+bug = "EAI-7384"
+reason = "Managed runtime path nests recursively (runtimes/wheel/...) on re-provisioning."
