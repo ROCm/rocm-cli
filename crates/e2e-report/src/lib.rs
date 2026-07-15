@@ -1312,7 +1312,7 @@ fn expectation_grid_markdown(
     for id in &grid.ids {
         // Scenario cell: human name on top, the @id below as a link to its entry
         // in the Scenario reference section (GitHub anchors `#### <id>` to `#<id>`).
-        let name = scenarios.get(id).map(|(n, _)| n.as_str()).unwrap_or("");
+        let name = scenarios.get(id).map_or("", |(n, _)| n.as_str());
         let _ = write!(out, "| {name}<br>[`{id}`](#{id}) |");
         for col in &grid.columns {
             let g = col
