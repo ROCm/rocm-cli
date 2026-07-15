@@ -237,6 +237,8 @@ default-engine), rominf re-review pending.
 
 **2026-07-15 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
+**2026-07-15 (idle flush — auto-sync):** Session idle for 10 minutes, auto-flushing WIP state.
+
 **2026-07-15 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
 **2026-07-15 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
