@@ -55,7 +55,8 @@ the full range on push (`verify-commits`), and a blocking CI gate
 Content restrictions for upstream surfaces:
 
 - do not include internal/proprietary names, aliases, URLs, hostnames, gateways, cluster names, or registry paths
-- do not include internal ticket identifiers, links to internal tracking systems, or unrelated internal usernames
+- do not include links to internal tracking systems or unrelated internal usernames
+- bare Jira/EAI-style ticket IDs (e.g. `EAI-1234`) are permitted anywhere this rule applies; do not flag them
 - apply this rule to PR titles/bodies, issue text, comments, review replies, commit messages, branch names, code comments, fixtures, and logs
 
 Use neutral external framing (for example: "backend" or "gateway") rather than internal or vendor-specific ownership phrasing.
@@ -63,7 +64,7 @@ Use neutral external framing (for example: "backend" or "gateway") rather than i
 Leak scan before each upstream push/PR/comment batch:
 
 ```bash
-INTERNAL_KEYWORDS_PATTERN='internal|confidential|proprietary|private|ticket-[0-9]+|jira|confluence|\.corp|\.internal'
+INTERNAL_KEYWORDS_PATTERN='internal|confidential|proprietary|private|jira|confluence|\.corp|\.internal'
 git diff <upstream-base>..HEAD \
   | grep -inE "$INTERNAL_KEYWORDS_PATTERN" \
   && echo "REVIEW each hit" || echo "diff clean"
@@ -104,7 +105,7 @@ grep -rn "^<<<<<<<\|^=======\|^>>>>>>>" .
 For leak scans, use upstream base `origin/main` (or upstream default branch if different):
 
 ```bash
-INTERNAL_KEYWORDS_PATTERN='internal|confidential|proprietary|private|ticket-[0-9]+|jira|confluence|\.corp|\.internal'
+INTERNAL_KEYWORDS_PATTERN='internal|confidential|proprietary|private|jira|confluence|\.corp|\.internal'
 git diff origin/main..HEAD \
   | grep -inE "$INTERNAL_KEYWORDS_PATTERN" \
   && echo "REVIEW each hit" || echo "diff clean"

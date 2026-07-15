@@ -25,6 +25,7 @@ accepted = [
     "Unlicense",
     "WTFPL",
     "CDLA-Permissive-2.0",
+    "BlueOak-1.0.0",
 ]
 
 # First-party workspace crates are not third-party components; exclude them.

@@ -229,21 +229,67 @@ pub(super) async fn detect_managed_chat(
 pub(super) async fn detect_local_chat(
     executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
 ) -> Option<crate::llm::LlmConfig> {
+    detect_local_chat_with_probe(executor, crate::llm::detect_local_endpoint).await
+}
+
+/// Same as [`detect_local_chat`], but with the well-known-port probe passed
+/// in rather than hard-coded, so a test can substitute a deterministic probe
+/// instead of depending on the real well-known ports being free on the
+/// machine running the test.
+async fn detect_local_chat_with_probe(
+    executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
+    probe: impl Fn() -> Option<&'static str> + Send + 'static,
+) -> Option<crate::llm::LlmConfig> {
     if let Some(cfg) = detect_managed_chat(executor).await {
         return Some(cfg);
     }
 
     // TCP probe is blocking; keep it off the async reactor.
-    let base = tokio::task::spawn_blocking(crate::llm::detect_local_endpoint)
-        .await
-        .ok()
-        .flatten()?;
+    let base = tokio::task::spawn_blocking(probe).await.ok().flatten()?;
 
     // Best-effort model query; fall back to the neutral default on any failure.
     let model = fetch_first_model(base)
         .await
         .unwrap_or_else(|| crate::llm::DEFAULT_CHAT_MODEL.to_string());
     Some(crate::llm::detected_llm_config(base, &model))
+}
+
+/// Whether startup should run the local-engine auto-detection swap.
+///
+/// Detection produces a keyless [`crate::llm::detected_llm_config`], so it may
+/// only fire when the user configured NO endpoint (URL/env URL) AND NO api key
+/// — otherwise the swap would silently drop a configured credential and 401 at
+/// request time. Pure; the anchor for the startup-gate unit test.
+pub(super) const fn should_detect_local_chat(
+    chat_url: Option<&str>,
+    chat_env_url: Option<&str>,
+    chat_api_key: Option<&str>,
+) -> bool {
+    chat_url.is_none() && chat_env_url.is_none() && chat_api_key.is_none()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StartupChatOutcome {
+    Local,
+    OAuth,
+    Configured,
+}
+
+/// Select the startup backend path after optional local detection.
+///
+/// A successful detection is already reachable. A detection miss means the
+/// well-known endpoints were exhausted and startup should proceed to OAuth.
+/// When detection was gated off, the configured target still needs its normal
+/// liveness probe before backend construction.
+pub(super) const fn startup_chat_outcome(
+    detection_ran: bool,
+    detected: bool,
+) -> StartupChatOutcome {
+    match (detection_ran, detected) {
+        (_, true) => StartupChatOutcome::Local,
+        (true, false) => StartupChatOutcome::OAuth,
+        (false, false) => StartupChatOutcome::Configured,
+    }
 }
 
 /// Persist an accepted local endpoint to the user's `config.toml`: load the
@@ -407,5 +453,65 @@ mod tests {
     fn skips_ready_record_with_empty_endpoint() {
         let env = services_envelope(serde_json::json!([service("vllm", "", "ready", "m", 100)]));
         assert_eq!(pick_managed_chat_endpoint(&env), None);
+    }
+
+    /// EAI-7347: startup now reuses `detect_local_chat` (the same detection the
+    /// manual 'd' path already used) instead of a single well-known-port probe,
+    /// so a local server on a non-default well-known port (e.g. `rocm serve`'s
+    /// :11435) is preferred over falling back to the ChatGPT cloud default.
+    #[tokio::test]
+    async fn detect_local_chat_wires_probed_endpoint_through() {
+        // Priority order among the well-known ports (Lemonade > vLLM > rocm
+        // serve's default) is covered deterministically in `llm.rs`'s own
+        // tests, against OS-assigned ephemeral ports. This test's job is
+        // narrower: prove `detect_local_chat`'s no-managed-executor path
+        // wires whatever the well-known-port probe finds into the resulting
+        // config, rather than falling back to the cloud default — so the
+        // probe is injected rather than exercised against real ports (real
+        // ports it doesn't own would make this flake on a CI runner where an
+        // ambient listener happens to occupy one of them).
+        const PROBED: &str = "http://127.0.0.1:1/v1";
+        let cfg = detect_local_chat_with_probe(None, || Some(PROBED))
+            .await
+            .expect("local server detected");
+        assert_eq!(cfg.base_url, PROBED);
+    }
+
+    #[test]
+    fn should_detect_only_when_no_url_env_or_key_configured() {
+        // The clean slate: nothing configured → auto-detect a local engine.
+        assert!(should_detect_local_chat(None, None, None));
+        // A configured api key must SUPPRESS the swap — detection returns a
+        // keyless config and would otherwise silently drop the key (401).
+        assert!(!should_detect_local_chat(None, None, Some("sk-configured")));
+        // An explicit URL or env URL also suppresses it (config precedence).
+        assert!(!should_detect_local_chat(
+            Some("http://cfg:1/v1"),
+            None,
+            None
+        ));
+        assert!(!should_detect_local_chat(
+            None,
+            Some("http://env:2/v1"),
+            None
+        ));
+    }
+
+    #[test]
+    fn startup_uses_detected_local_endpoint() {
+        assert_eq!(startup_chat_outcome(true, true), StartupChatOutcome::Local);
+    }
+
+    #[test]
+    fn startup_uses_oauth_after_empty_detection() {
+        assert_eq!(startup_chat_outcome(true, false), StartupChatOutcome::OAuth);
+    }
+
+    #[test]
+    fn startup_uses_configured_endpoint_when_detection_is_skipped() {
+        assert_eq!(
+            startup_chat_outcome(false, false),
+            StartupChatOutcome::Configured
+        );
     }
 }

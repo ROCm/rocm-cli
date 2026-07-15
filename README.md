@@ -203,8 +203,13 @@ creates a separate managed runtime alongside it.
 Then serve a model:
 
 ```
-rocm serve Qwen/Qwen2.5-1.5B-Instruct
+rocm serve qwen
 ```
+
+`qwen` is a built-in alias for a small assistant model that serves out of the
+box. You can also serve any compatible Hugging Face model directly — see
+[Model serving](#model-serving) for the GGUF-vs-safetensors rule, since which
+form works depends on the engine your GPU selects.
 
 Use `rocm model` to see available model recipes and their GPU memory
 requirements.
@@ -300,9 +305,14 @@ server keeps running (manage it afterward with `rocm services`). Press **Ctrl-C*
 to stop the server instead. `--managed` is the explicit form of the default
 background behavior. `--no-smoke-test` skips the post-startup inference probe.
 
-Use full HuggingFace model IDs (e.g., `Qwen/Qwen2.5-1.5B-Instruct`) for
-reliable cross-engine compatibility. Short aliases from `rocm model` may not
-resolve with all engines.
+Which model form to pass depends on the engine your GPU selects. The Lemonade
+engine (Ryzen AI / Radeon) serves llama.cpp **GGUF** models — pass a GGUF repo
+with an explicit quantization variant, e.g.
+`rocm serve unsloth/Qwen3-0.6B-GGUF:Q4_0`. The vLLM engine (Instinct) serves
+**safetensors** repos, e.g. `rocm serve Qwen/Qwen2.5-1.5B-Instruct`. A
+safetensors-only id has no GGUF build, so serving it through Lemonade fails with
+a clear message rather than silently substituting a different model. Short
+aliases from `rocm model` may not resolve with all engines.
 
 Some models (e.g., Llama) are gated and require HuggingFace authentication.
 Log in with `huggingface-cli login` or set `HF_TOKEN` in your environment
