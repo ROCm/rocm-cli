@@ -128,12 +128,14 @@ impl HostCapability {
     }
 }
 
-/// Component versions on this platform, for the consolidated report's per-column
-/// heading. All fields are best-effort: `None` when the source isn't present
-/// (e.g. an engine that was never installed on this platform). Collected from the
-/// harness only — no product command exposes all of these, so we read the OS from
-/// `examine`, ROCm from the active managed runtime, and the engine versions from
-/// the installed runtime tree (see [`collect_versions`]).
+/// Component versions on this platform (for the report heading).
+///
+/// For the consolidated report's per-column heading. All fields are best-effort:
+/// `None` when the source isn't present (e.g. an engine that was never installed
+/// on this platform). Collected from the harness only — no product command
+/// exposes all of these, so we read the OS from `examine`, ROCm from the active
+/// managed runtime, and the engine versions from the installed runtime tree (see
+/// [`collect_versions`]).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PlatformVersions {
     /// OS distro string, e.g. "Ubuntu 24.04.3 LTS" (`examine`'s `distro:` line).
@@ -152,12 +154,13 @@ pub struct PlatformVersions {
     pub lemonade: Option<String>,
 }
 
-/// Collect component versions for the report from the already-installed managed
-/// runtime whose registry lives at `runtimes_dir` (the shared prewarm tree in CI,
-/// or a scenario's `data/runtimes` locally). Best-effort: any source that isn't
-/// present yields `None`. `os` re-reads `examine`; `rocm`/`vllm`/`lemonade` come
-/// from the active runtime, so they're populated only once the SDK / an engine
-/// has been installed on this platform.
+/// Collect component versions for the report from the installed managed runtime.
+///
+/// Reads the runtime whose registry lives at `runtimes_dir` (the shared prewarm
+/// tree in CI, or a scenario's `data/runtimes` locally). Best-effort: any source
+/// that isn't present yields `None`. `os` re-reads `examine`; `rocm`/`vllm`/
+/// `lemonade` come from the active runtime, so they're populated only once the SDK
+/// / an engine has been installed on this platform.
 #[must_use]
 pub fn collect_versions(runtimes_dir: Option<&std::path::Path>) -> PlatformVersions {
     let mut v = PlatformVersions::default();
