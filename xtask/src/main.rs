@@ -11,6 +11,8 @@
 //! alias `cargo xtask <command>`.
 
 mod affected;
+mod e2e;
+mod e2e_report;
 mod manifest;
 mod powershell;
 mod signing;
@@ -110,6 +112,32 @@ enum Command {
         #[arg(long, conflicts_with_all = ["base", "require_verified"])]
         check_config: bool,
     },
+    /// Build the release `rocm` binary and run the cucumber-rs E2E suite.
+    ///
+    /// The harness resolves every scenario's expectation (pass / xfail / skip)
+    /// per host from its tags + a capability probe + `expectations.toml`, so no
+    /// tier flag or tag filter is needed — one run covers a whole platform.
+    /// Extra arguments after `--` are still forwarded to the cucumber CLI for
+    /// ad-hoc local use, e.g. `cargo xtask e2e -- -n serve-inference`.
+    E2e {
+        /// Arguments forwarded verbatim to the cucumber test binary (name filter
+        /// `-n`, `--fail-fast`, etc.). Not used by CI.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Consolidate per-platform E2E `report.json` files (one per CI job/runner)
+    /// into a single cross-platform HTML report, and print a summary matrix to
+    /// stdout for `$GITHUB_STEP_SUMMARY`.
+    E2eReport {
+        /// Directory holding the downloaded E2E artifacts. Each immediate subdir
+        /// containing a `report.json` is treated as one platform; its name (an
+        /// `e2e-*-report` artifact name) becomes the platform label.
+        #[arg(long)]
+        artifacts_dir: PathBuf,
+        /// Path to write the consolidated HTML report.
+        #[arg(long)]
+        html_out: PathBuf,
+    },
     /// Lint PowerShell scripts with PSScriptAnalyzer (parse errors are reported
     /// too, so this also covers syntax).
     PowershellLint {
@@ -160,6 +188,11 @@ fn run() -> Result<()> {
                 verify_commits::run(base, require_verified)?;
             }
         }
+        Command::E2e { args } => e2e::run(&args)?,
+        Command::E2eReport {
+            artifacts_dir,
+            html_out,
+        } => e2e_report::run(&artifacts_dir, &html_out)?,
         Command::PowershellLint { shell, files } => powershell::run(shell, files)?,
     }
     Ok(())

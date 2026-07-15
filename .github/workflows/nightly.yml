@@ -21,7 +21,7 @@ jobs:
       short_sha: ${{ steps.meta.outputs.short_sha }}
       staging_tag: ${{ steps.staging.outputs.tag }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Check for changes since last nightly
         id: check
@@ -41,7 +41,7 @@ jobs:
 
       - name: Cache Cargo home and build artifacts
         if: steps.check.outputs.skip != 'true'
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: |
             ~/.cargo/bin
@@ -178,9 +178,9 @@ jobs:
     needs: nightly
     if: needs.nightly.outputs.skip != 'true'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       - name: Build release binaries
         shell: pwsh
@@ -235,7 +235,7 @@ jobs:
       - windows-nightly
     if: needs.nightly.outputs.skip != 'true'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Publish staged nightly
         env:
@@ -309,3 +309,83 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: gh release delete "${{ needs.nightly.outputs.staging_tag }}" --yes --cleanup-tag 2>/dev/null || true
+
+  # Full E2E on app-dev MI300X INCLUDING the expensive `@nightly` scenarios (the
+  # large-model serve), which the per-PR ci.yml `e2e-gpu` job skips to stay fast.
+  # Runs unconditionally on the schedule/dispatch (independent of the nightly
+  # BUILD skip above — a regression run is worth doing even with no new commits).
+  # Non-blocking, mirrors ci.yml's e2e-gpu job but sets E2E_INCLUDE_NIGHTLY.
+  e2e-gpu-nightly:
+    name: E2E tests (GPU, incl. nightly-only)
+    timeout-minutes: 90
+    runs-on: [self-hosted, linux, amd-gpu]
+    continue-on-error: true
+    env:
+      # Include @nightly scenarios (the large-model serve). See src/expectation.rs.
+      E2E_INCLUDE_NIGHTLY: "1"
+      # Serve-readiness floor; a `@serve-timeout` tag lengthens it for the large
+      # model (its cold ~54 GiB load exceeds this default).
+      E2E_SERVE_TIMEOUT_SECS: "300"
+    steps:
+      - uses: actions/checkout@v6
+
+      # Reclaim the GPU before running: kill only e2e leftovers scoped to
+      # /tmp/rocm-e2e-* and the e2e-target/e2e-shared trees — never the runner or
+      # any /workload manual-testing processes (see ci.yml e2e-gpu for the same).
+      - name: Reclaim GPU from stray E2E processes
+        run: |
+          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
+          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
+          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
+          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
+          pkill -f 'e2e-target/release/rocm daemon' 2>/dev/null || true
+          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
+          echo "reclaimed"
+
+      # cache: false — this self-hosted runner persists the build cache itself via
+      # CARGO_TARGET_DIR (below), so the action's rust-cache is pure overhead.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+
+      - name: Run full E2E on GPU hardware (incl. nightly-only)
+        run: |
+          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
+          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
+          # Share uv's wheel cache off the near-full PVC, on the roomy `/` overlay
+          # (see ci.yml e2e-gpu): warm `rocm install sdk` ~34s vs cold ~160s.
+          export E2E_SHARED_UV_CACHE_DIR="/var/tmp/rocm-e2e-uv-cache"
+          # Share ONE installed managed runtime across serve/chat scenarios so
+          # install sdk runs once per runner, not per scenario (see ci.yml e2e-gpu).
+          # The shared dir IS the pre-warm's own data/runtimes; NEVER move it — a
+          # post-install mv invalidates the absolute paths install sdk bakes into
+          # the runtime manifest and every serve fails instantly (run 29320025393).
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
+          export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
+
+          # Build once; reuse for pre-warm + suite so xtask doesn't rebuild.
+          cargo build --release -p rocm
+          export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
+
+          # Pre-warm the shared runtime once/serially before the suite; skipped
+          # once populated (persists across runs). Install in place (no mv) so the
+          # manifest's absolute paths stay valid. See ci.yml e2e-gpu for rationale.
+          if [ ! -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
+            echo "pre-warming shared runtime (first run on this runner)…"
+            mkdir -p "$prewarm"/{data,config,cache}
+            ROCM_CLI_CONFIG_DIR="$prewarm/config" \
+            ROCM_CLI_DATA_DIR="$prewarm/data" \
+            ROCM_CLI_CACHE_DIR="$prewarm/cache" \
+            HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
+            UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
+              "$ROCM_CLI_BINARY" install sdk
+          fi
+
+          cargo xtask e2e
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-gpu-nightly-report
+          path: tests/e2e-cucumber/results/
