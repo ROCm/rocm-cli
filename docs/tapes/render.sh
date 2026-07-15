@@ -15,7 +15,7 @@
 # Env overrides: ROCM_BIN_DIR (default target/release), ROCM_DEMO_MODEL.
 set -u
 
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" || exit
 
 tape="${1:?usage: render.sh <tape>}"
 
@@ -24,4 +24,4 @@ tape="${1:?usage: render.sh <tape>}"
 # shellcheck source=docs/tapes/lib/demo-env.sh
 source docs/tapes/lib/demo-env.sh
 
-vhs "$tape"
+vhs "${tape}"
