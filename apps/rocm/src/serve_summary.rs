@@ -51,7 +51,10 @@ pub(crate) struct SmokeMetrics {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DeploymentSummary {
     pub engine: String,
-    /// Canonical / API-qualified model id clients pass as `"model"`.
+    /// The model reference the user requested on the command line.
+    pub requested_model: String,
+    /// Canonical / API-qualified model id clients pass as `"model"`. May differ
+    /// from `requested_model` when a recipe alias resolves to a canonical id.
     pub api_model: String,
     /// Full chat-completions endpoint, e.g. `http://127.0.0.1:1337/v1/chat/completions`.
     pub chat_endpoint: String,
@@ -108,20 +111,37 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
     // (label, value) rows, in the order the ticket calls out. Throughput is
     // labelled "approx" because it is derived from streamed SSE chunk counts
     // (~1 token per chunk), not the engine's own token accounting.
-    let rows: Vec<(&str, String)> = vec![
-        ("status", summary.status.clone()),
-        ("engine", summary.engine.clone()),
-        ("model", summary.api_model.clone()),
-        ("endpoint", summary.chat_endpoint.clone()),
-        ("time to first token", format_ttft(summary.metrics.ttft)),
-        ("throughput (approx)", format_tps(summary.metrics.gen_tps)),
-        ("service", summary.service_id.clone()),
-        ("stop", format!("rocm services stop {}", summary.service_id)),
-        (
-            "logs",
-            format!("rocm logs --service {}", summary.service_id),
-        ),
-    ];
+    // When the requested reference resolved to a different canonical id, show
+    // both so a silent substitution can never masquerade as the requested model;
+    // when they match, a single `model` row keeps the common case uncluttered.
+    let model_rows: Vec<(&str, String)> = if summary.requested_model == summary.api_model {
+        vec![("model", summary.api_model.clone())]
+    } else {
+        vec![
+            ("requested model", summary.requested_model.clone()),
+            ("resolved model", summary.api_model.clone()),
+        ]
+    };
+
+    let rows: Vec<(&str, String)> = [
+        vec![
+            ("status", summary.status.clone()),
+            ("engine", summary.engine.clone()),
+        ],
+        model_rows,
+        vec![
+            ("endpoint", summary.chat_endpoint.clone()),
+            ("time to first token", format_ttft(summary.metrics.ttft)),
+            ("throughput (approx)", format_tps(summary.metrics.gen_tps)),
+            ("service", summary.service_id.clone()),
+            ("stop", format!("rocm services stop {}", summary.service_id)),
+            (
+                "logs",
+                format!("rocm logs --service {}", summary.service_id),
+            ),
+        ],
+    ]
+    .concat();
 
     let label_width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
 
@@ -275,6 +295,7 @@ mod tests {
     fn base_summary() -> DeploymentSummary {
         DeploymentSummary {
             engine: "vllm".to_owned(),
+            requested_model: "Qwen/Qwen2.5-7B-Instruct".to_owned(),
             api_model: "Qwen/Qwen2.5-7B-Instruct".to_owned(),
             chat_endpoint: "http://127.0.0.1:1337/v1/chat/completions".to_owned(),
             service_id: "vllm-qwen-1720000000".to_owned(),
@@ -335,6 +356,7 @@ mod tests {
         vllm.engine = "vllm".to_owned();
         let mut lemonade = base_summary();
         lemonade.engine = "lemonade".to_owned();
+        lemonade.requested_model = "Qwen3-0.6B-GGUF".to_owned();
         lemonade.api_model = "Qwen3-0.6B-GGUF".to_owned();
         lemonade.chat_endpoint = "http://127.0.0.1:8000/v1/chat/completions".to_owned();
         lemonade.metrics = SmokeMetrics::default(); // engine reported no usage
@@ -347,6 +369,41 @@ mod tests {
         let rendered = render_summary(&lemonade);
         assert!(rendered.contains("time to first token"));
         assert!(rendered.contains("n/a"));
+    }
+
+    #[test]
+    fn matching_request_and_resolved_show_a_single_model_row() {
+        let rendered = render_summary(&base_summary());
+        assert!(rendered.contains("  model  "));
+        assert!(!rendered.contains("requested model"));
+        assert!(!rendered.contains("resolved model"));
+    }
+
+    #[test]
+    fn divergent_request_and_resolved_are_both_reported() {
+        // A recipe alias that resolves to a different canonical id must surface
+        // both identities so a substitution is never silent (EAI-7370).
+        let mut summary = base_summary();
+        summary.requested_model = "qwen".to_owned();
+        summary.api_model = "Qwen3-4B-Instruct-2507-GGUF".to_owned();
+        let rendered = render_summary(&summary);
+        let row = |label: &str, value: &str| {
+            rendered.lines().any(|line| {
+                line.trim_start().starts_with(label) && line.trim_end().ends_with(value)
+            })
+        };
+        assert!(row("requested model", "qwen"), "{rendered}");
+        assert!(
+            row("resolved model", "Qwen3-4B-Instruct-2507-GGUF"),
+            "{rendered}"
+        );
+        // The bare `model` row is not used when the two differ.
+        assert!(
+            !rendered
+                .lines()
+                .any(|line| line.trim_start().starts_with("model ")),
+            "{rendered}"
+        );
     }
 
     #[test]
