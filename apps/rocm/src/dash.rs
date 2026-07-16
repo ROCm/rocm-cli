@@ -695,8 +695,9 @@ mod tests {
 
     #[test]
     fn ensure_bench_csv_parent_creates_explicit_output_directory() {
-        let root =
-            std::env::temp_dir().join(format!("rocm-cli-bench-parent-{}", std::process::id()));
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("bench-parent-test-{}", std::process::id()));
         let csv = root.join("nested").join("results.csv");
 
         ensure_bench_csv_parent(&csv).unwrap();
