@@ -7,7 +7,7 @@
 **Branch:** fix-speed-up-e2e
 **Last Updated:** 2026-07-16
 
-**Token Usage:** in=700 out=198538 cache_create=2220595 cache_read=64243484 calls=352
+**Token Usage:** in=708 out=199561 cache_create=2816942 cache_read=64838847 calls=356
 
 ---
 
@@ -156,7 +156,7 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persiste-app-dev-c
 ## Work Log
 
 ### 2026-07-16 (idle flush)
-- Session idle for 10 minutes, auto-flushing WIP state.
+**2026-07-16 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
 ### 2026-07-16 — Task #1 fix complete, Task #3 scenarios drafted, probing backlogged
 
