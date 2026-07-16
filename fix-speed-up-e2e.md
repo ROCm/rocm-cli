@@ -163,3 +163,4 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persiste-app-dev-c
 - **Task #3 drafted:** 6 BDD scenarios for `rocm diagnose`/`fix` (GPU-independent, mock-lane, P0 coverage gap). Scenarios + technical mapping written, awaiting review before step implementation.
 - **Methods saved:** scoped dispatch for rapid validation, act-don't-ask feedback, commit-push workflow docs confirmed.
 - **Open decisions:** Task #4 (Strix Qwen variant: latest or smallest), Task #2 (CI tiering tune), Task #5 (mock overhead).
+- **2026-07-16 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
