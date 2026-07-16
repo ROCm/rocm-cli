@@ -39,8 +39,8 @@ mod slash;
 mod summary;
 
 use chat::{
-    build_chat_agent, build_local_agent, detect_local_chat, detect_managed_chat,
-    persist_chat_endpoint,
+    StartupChatOutcome, build_chat_agent, build_local_agent, detect_local_chat,
+    persist_chat_endpoint, startup_chat_outcome,
 };
 use summary::{parse_plan_result, summarize_json_value, summarize_slash_tool};
 
@@ -479,6 +479,10 @@ pub struct AppState {
     /// Horizontal scroll offset (columns) of the active job console — log lines
     /// drawn wider than the console wrap off-screen, so the wheel/H-wheel pans.
     pub console_hscroll: u16,
+    /// Monotonic UI repaint counter, incremented once per tick (~250ms). Drives
+    /// frame-based animation (e.g. the job-console braille progress spinner)
+    /// without threading a clock through the render path.
+    pub tick_count: u64,
     /// Scroll offset of the wide-layout right LOGS dock, counted in lines UP from
     /// the newest line (0 = pinned to the tail). Clamped against the buffer.
     pub dock_logs_scroll: u16,
@@ -532,6 +536,13 @@ pub struct AppState {
     pub(crate) chat_endpoint_rebuild: Option<ChatProvider>,
     /// Replay scrubber state. `None` when running against a live daemon.
     pub replay: Option<ReplayState>,
+    /// Data-honesty flag: `true` when the displayed telemetry is NOT from a live
+    /// daemon — i.e. `--demo`, `--replay`, or an asset generator. Drives the
+    /// persistent "SIMULATED DATA" marker and suppresses live/connected/health
+    /// indicators so simulated data can never be presented as live. Distinct
+    /// from `replay`, which is playback-control state and is not set by the
+    /// screenshot/cast generators.
+    pub simulated: bool,
     /// Last body area used by the most recent draw. Mouse hit-tests resolve
     /// pointer coordinates against this rect (filled by `ui::draw`).
     pub last_body_area: Option<ratatui::layout::Rect>,
@@ -641,6 +652,7 @@ impl AppState {
             bench_detail_scroll: 0,
             console_scroll: 0,
             console_hscroll: 0,
+            tick_count: 0,
             dock_logs_scroll: 0,
             last_dock_area: None,
             chat: Vec::new(),
@@ -658,6 +670,7 @@ impl AppState {
             chat_persist_dispatch: false,
             chat_endpoint_rebuild: None,
             replay: None,
+            simulated: false,
             last_body_area: None,
             last_tab_bar_area: None,
             last_footer_chips: Vec::new(),
@@ -1002,6 +1015,13 @@ impl AppState {
     /// `chat_detect_dispatch` edge so `event_loop` runs the probe + `/v1/models`
     /// query off the reducer. No-op while a probe is already in flight or an
     /// offer is awaiting a decision. I/O-free.
+    ///
+    /// Reachable both from the pre-accept gate (`'d'` key) and, once
+    /// `ChatConsent::Accepted`, from the `/detect` slash command (a focused
+    /// `'d'` keypress is ordinary chat text at that point, so the gate key
+    /// doesn't apply there — see `handle_slash_command`). When already
+    /// accepted, echo the in-flight probe into the transcript since the
+    /// pre-accept "detecting…" banner isn't drawn once chat is live.
     pub fn request_detect(&mut self) {
         if self.chat_detecting || self.chat_detect_offer.is_some() {
             return;
@@ -1009,21 +1029,44 @@ impl AppState {
         self.chat_detecting = true;
         self.chat_detect_msg = None;
         self.chat_detect_dispatch = true;
+        if self.chat_consent == ChatConsent::Accepted {
+            self.chat.push(ChatTurn::agent(
+                "Detecting a local engine (Lemonade :13305 / vLLM :8000 / rocm serve :11435)…"
+                    .to_string(),
+            ));
+        }
     }
 
     /// Record the result of a detect attempt: `Some(cfg)` raises the offer
     /// prompt; `None` records a "nothing found" message. Clears the in-flight
     /// flag either way.
+    ///
+    /// Once `ChatConsent::Accepted`, the offer prompt is not drawn (the gate UI
+    /// only renders pre-accept), so the result is also echoed into the
+    /// transcript with the `/detect accept|save|dismiss` sub-commands needed to
+    /// act on it.
     pub fn set_detect_result(&mut self, offer: Option<crate::llm::LlmConfig>) {
         self.chat_detecting = false;
+        let accepted = self.chat_consent == ChatConsent::Accepted;
         if let Some(cfg) = offer {
             self.chat_detect_msg = None;
+            if accepted {
+                self.chat.push(ChatTurn::agent(format!(
+                    "Detected a local engine: {}  (model: {}). Type `/detect accept` to \
+                     switch now, `/detect save` to also persist it, or `/detect dismiss` \
+                     to ignore.",
+                    cfg.base_url, cfg.model
+                )));
+            }
             self.chat_detect_offer = Some(cfg);
         } else {
             self.chat_detect_offer = None;
-            self.chat_detect_msg = Some(
-                "no local engine found (Lemonade :13305 / vLLM :8000 / rocm serve :11435)".into(),
-            );
+            let msg = "no local engine found (Lemonade :13305 / vLLM :8000 / rocm serve :11435)";
+            if accepted {
+                self.chat.push(ChatTurn::agent(msg.to_string()));
+            } else {
+                self.chat_detect_msg = Some(msg.to_string());
+            }
         }
     }
 
@@ -1527,6 +1570,9 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         crate::jobs::run_effects(fx, &job_tx);
     }
     state.replay = replay_controller.map(ReplayState::new);
+    // Both `--demo` (a generated session replayed) and `--replay <file>` present
+    // non-live data, so mark the session simulated for the honesty chrome.
+    state.simulated = state.replay.is_some();
 
     // Resolve the chat backend. `--chat-mock` short-circuits detection with a
     // deterministic offline MockAgentClient (no live LLM, no network); otherwise
@@ -1562,8 +1608,34 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         // NOT override an explicitly configured `chat_url`/env URL, so config
         // precedence is preserved (we only consult the registry when neither is
         // set, i.e. where the well-known default would otherwise be probed).
-        let managed = if args.chat_url.is_none() && args.chat_env_url.is_none() {
-            detect_managed_chat(state.tool_executor.clone()).await
+        // When neither an explicit URL (CLI/config) nor an env URL is set, run
+        // the SAME full local-engine detection the manual 'd' path uses:
+        // registry-first (an engine we launched ourselves, on whatever port it
+        // bound), then a probe of the well-known Lemonade/vLLM/rocm-serve
+        // ports (parallelized — see `llm::detect_local_endpoint` — so a cold
+        // start with no server doesn't pay 3x the probe timeout), plus a
+        // best-effort served-model fetch. This is what lets a local server win
+        // over the ChatGPT cloud default at startup instead of only the single
+        // well-known :8000 port that a bare `resolve_llm_config` probe covers.
+        //
+        // NOTE: unmerged PR #97 also touches this branch (model discovery when
+        // `chat_model` is None, inside `resolve_llm_config`'s own fallback
+        // path) — this change is conflict-minimal by leaving the
+        // `resolve_llm_config` call below untouched.
+        //
+        // Gate on `chat_api_key.is_none()` too: local detection returns a
+        // keyless `detected_llm_config` (api_key/auth_header forced to None),
+        // so firing it when the user configured a key would SILENTLY DROP that
+        // key and 401 at request time. A configured key means "use my
+        // configured backend", so skip the swap and let `resolve_llm_config`
+        // carry the key through its normal precedence.
+        let detection_ran = chat::should_detect_local_chat(
+            args.chat_url.as_deref(),
+            args.chat_env_url.as_deref(),
+            args.chat_api_key.as_deref(),
+        );
+        let detected = if detection_ran {
+            detect_local_chat(state.tool_executor.clone()).await
         } else {
             None
         };
@@ -1572,17 +1644,23 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             .clone()
             .or_else(|| args.chat_env_url.clone())
             .unwrap_or_else(|| crate::llm::DEFAULT_CHAT_BASE_URL.to_string());
-        // A managed endpoint is already readiness-verified; otherwise TCP-probe.
-        let probe_ok = if managed.is_some() {
-            true
-        } else {
-            tokio::task::spawn_blocking(move || {
+        // A detected endpoint (managed or probed) is already verified. When
+        // detection ran and found nothing it already probed the well-known
+        // vLLM :8000 port (== `DEFAULT_CHAT_BASE_URL`), so re-probing the same
+        // fallback target here is redundant and just burns another probe
+        // timeout on a cold start — treat that as unreachable directly.
+        // Otherwise (an explicit URL/env/key path) TCP-probe the target.
+        let startup_outcome = startup_chat_outcome(detection_ran, detected.is_some());
+        let probe_ok = match startup_outcome {
+            StartupChatOutcome::Local => true,
+            StartupChatOutcome::OAuth => false,
+            StartupChatOutcome::Configured => tokio::task::spawn_blocking(move || {
                 crate::llm::probe_endpoint(&probe_target, crate::llm::PROBE_TIMEOUT)
             })
             .await
-            .unwrap_or(false)
+            .unwrap_or(false),
         };
-        let llm = managed.or_else(|| {
+        let llm = detected.or_else(|| {
             crate::llm::resolve_llm_config(
                 args.chat_url.as_deref(),
                 args.chat_model.as_deref(),
@@ -1599,10 +1677,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         // ChatGPT OAuth default (device-code login surfaced in the chat tab).
         // This restores the no-key login the vendored Codex path provided; it
         // takes NO api_key (env-only invariant untouched — OAuth, not a key).
-        let no_key_no_endpoint = !probe_ok
-            && args.chat_api_key.is_none()
-            && args.chat_url.is_none()
-            && args.chat_env_url.is_none();
+        let no_key_no_endpoint = startup_outcome == StartupChatOutcome::OAuth;
         if no_key_no_endpoint {
             let oauth_tx = chat_tx.clone();
             crate::agent::ChatGptAgentClient::new(
@@ -1648,7 +1723,11 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             terminal.draw(|f| ui::draw(f, &mut state))?;
         }
         tokio::select! {
-            _ = tick.tick() => { /* repaint */ }
+            _ = tick.tick() => {
+                // Advance the animation clock so spinners cycle even while a
+                // job produces no new output.
+                state.tick_count = state.tick_count.wrapping_add(1);
+            }
             maybe_msg = rx.recv() => {
                 match maybe_msg {
                     Some(ClientMsg::Connecting) => state.conn = ConnState::Connecting,
@@ -1694,6 +1773,20 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             }
             maybe_ev = events.next() => {
                 match maybe_ev {
+                    // Only ACT on key presses. Terminals (notably Windows
+                    // Terminal / ConPTY under WSL, and any with the kitty
+                    // keyboard protocol) also emit Release/Repeat events; the
+                    // general `handle_key` already drops non-Press, but the
+                    // operational-overlay arms below dispatch straight to their
+                    // managers and would otherwise process the SAME keystroke
+                    // twice. That double-fire is what made Enter in the serve
+                    // wizard's model picker re-open the picker (seeding it with
+                    // the just-chosen model as a filter) instead of choosing.
+                    // Swallow non-Press key events here, above every key arm, so
+                    // the Press-only invariant holds for overlays too.
+                    Some(Ok(CtEvent::Key(k))) if !is_actionable_key(k.kind) => {
+                        let _ = k;
+                    }
                     // The approval modal, when open, owns ALL keys with the
                     // highest priority (above every operational overlay and the
                     // general handler) so the operator's decision can't be
@@ -2679,8 +2772,21 @@ pub enum KeyAction {
     OpenLogs,
 }
 
+/// Whether a crossterm key event should be acted on. Terminals emit
+/// Release/Repeat events in addition to Press (notably Windows Terminal /
+/// ConPTY under WSL, and any terminal advertising the kitty keyboard protocol).
+///
+/// The whole TUI acts on Press only. Both the general [`handle_key`] and the
+/// event loop's operational-overlay dispatch share this gate — without it, a
+/// single keystroke reaches an overlay's `on_key` more than once, which made
+/// Enter in the serve wizard's model picker re-open the picker (seeded with the
+/// just-chosen model as a filter) instead of choosing it.
+const fn is_actionable_key(kind: KeyEventKind) -> bool {
+    matches!(kind, KeyEventKind::Press)
+}
+
 fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) -> KeyAction {
-    if k.kind != KeyEventKind::Press {
+    if !is_actionable_key(k.kind) {
         return KeyAction::Nothing;
     }
     // Chat tab key handling, placed BEFORE the global hotkey match so focused
@@ -3443,6 +3549,18 @@ mod tests {
     }
 
     #[test]
+    fn only_press_key_events_are_actionable() {
+        // The event loop gates overlay dispatch on this predicate so a single
+        // keystroke isn't processed twice by an overlay's `on_key` (Release /
+        // Repeat echoes on Windows Terminal / ConPTY / kitty keyboard). The
+        // double-fire re-opened the serve wizard's model picker on Enter instead
+        // of choosing — this pins Press-only routing.
+        assert!(is_actionable_key(KeyEventKind::Press));
+        assert!(!is_actionable_key(KeyEventKind::Release));
+        assert!(!is_actionable_key(KeyEventKind::Repeat));
+    }
+
+    #[test]
     fn jk_arrows_and_g_drive_selection() {
         assert_eq!(
             hk(KeyCode::Char('j'), ActiveTab::Observe),
@@ -4103,6 +4221,131 @@ mod tests {
         assert!(!s.chat_detecting);
         assert!(s.chat_detect_offer.is_none());
         assert!(s.chat_detect_msg.is_some());
+    }
+
+    /// EAI-7354: once `ChatConsent::Accepted`, a focused `'d'` keypress is
+    /// ordinary chat text (see `handle_key`'s `ChatConsent::Accepted` arm), so
+    /// re-detect must be reachable another way. `/detect` is the affordance —
+    /// it runs through the same `request_detect`/`set_detect_result` edge as
+    /// the pre-accept `'d'` key, and since the offer prompt isn't drawn once
+    /// accepted (`ui::tabs::chat::draw` only renders the gate pre-accept), the
+    /// result is echoed into the transcript instead.
+    #[test]
+    fn slash_detect_probes_and_echoes_result_while_accepted() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.set_chat_config(
+            Some(crate::llm::LlmConfig {
+                base_url: "http://localhost:8000/v1".into(),
+                model: "m".into(),
+                api_key: None,
+                auth_header: None,
+            }),
+            true,
+        );
+        assert_eq!(s.chat_consent, ChatConsent::Accepted);
+
+        assert_eq!(s.handle_slash_command("/detect"), SlashOutcome::Handled);
+        assert!(s.chat_detecting && s.chat_detect_dispatch);
+        assert!(
+            s.chat.last().is_some(),
+            "probing while accepted is echoed into the transcript"
+        );
+
+        let local = crate::llm::detected_llm_config("http://localhost:13305/v1", "Llama-3.2-3B");
+        s.set_detect_result(Some(local.clone()));
+        assert_eq!(s.chat_detect_offer.as_ref(), Some(&local));
+        // No gate UI once accepted (draw_consent only renders pre-accept) — the
+        // offer must be surfaced in the transcript instead.
+        let last = s.chat.last().expect("echoed offer turn");
+        assert!(last.content.contains("/detect accept"));
+    }
+
+    /// `/detect accept` mid-session must integrate with the same
+    /// `chat_endpoint_rebuild` edge the initial pre-accept offer uses, or the
+    /// live agent silently keeps talking to the stale endpoint.
+    #[test]
+    fn slash_detect_accept_raises_endpoint_rebuild_like_initial_accept() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.set_chat_config(
+            Some(crate::llm::LlmConfig {
+                base_url: "http://localhost:8000/v1".into(),
+                model: "m".into(),
+                api_key: None,
+                auth_header: None,
+            }),
+            true,
+        );
+        s.active_provider = ChatProvider::Openai; // observe the realignment to Local
+        let local = crate::llm::detected_llm_config("http://localhost:13305/v1", "Llama-3.2-3B");
+        s.set_detect_result(Some(local.clone()));
+
+        assert_eq!(
+            s.handle_slash_command("/detect accept"),
+            SlashOutcome::Handled
+        );
+        assert_eq!(s.chat_llm.as_ref(), Some(&local));
+        assert_eq!(s.active_provider, ChatProvider::Local);
+        assert_eq!(
+            s.chat_endpoint_rebuild,
+            Some(ChatProvider::Openai),
+            "re-detect accept raises the rebuild edge exactly like the initial accept"
+        );
+    }
+
+    #[test]
+    fn slash_detect_dismiss_and_unknown_subcommand() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.set_detect_result(Some(crate::llm::detected_llm_config(
+            "http://localhost:8000/v1",
+            "m",
+        )));
+        assert_eq!(
+            s.handle_slash_command("/detect dismiss"),
+            SlashOutcome::Handled
+        );
+        assert!(s.chat_detect_offer.is_none());
+
+        assert_eq!(
+            s.handle_slash_command("/detect bogus"),
+            SlashOutcome::Handled
+        );
+        let last = s.chat.last().expect("error turn");
+        assert!(last.content.contains("unknown /detect action"));
+    }
+
+    /// Sub-commands are case-insensitive, matching `/permissions` / `/provider`.
+    #[test]
+    fn slash_detect_subcommand_is_case_insensitive() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.set_detect_result(Some(crate::llm::detected_llm_config(
+            "http://localhost:8000/v1",
+            "m",
+        )));
+        // `DISMISS` (upper) must act exactly like `dismiss`.
+        assert_eq!(
+            s.handle_slash_command("/detect DISMISS"),
+            SlashOutcome::Handled
+        );
+        assert!(
+            s.chat_detect_offer.is_none(),
+            "uppercase sub-command is normalized and handled"
+        );
+    }
+
+    /// `/detect accept` / `/detect save` with nothing pending emits a hint
+    /// turn rather than a silent no-op.
+    #[test]
+    fn slash_detect_accept_without_offer_emits_hint() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        assert!(s.chat_detect_offer.is_none());
+        assert_eq!(
+            s.handle_slash_command("/detect accept"),
+            SlashOutcome::Handled
+        );
+        // No endpoint was adopted; a hint explains why.
+        assert_eq!(s.chat_endpoint_rebuild, None);
+        let last = s.chat.last().expect("hint turn");
+        assert!(last.content.contains("no detected endpoint"));
     }
 
     #[test]

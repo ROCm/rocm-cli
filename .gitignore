@@ -12,3 +12,5 @@ current-user-asks.md
 __pycache__/
 /.hawkeye-bin/
 /.claude
+/workspace/
+/e2e-consolidated-report.md

@@ -17,10 +17,12 @@
 //! model can call read-only tools and then answer — one final reply to the UI.
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tracing::{error, info, warn};
 
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
@@ -132,17 +134,53 @@ pub fn annotate_reply(reply: String, skills: &[String]) -> String {
 /// with a `Display` error. A timeout maps to [`AgentError::Timeout`]; a backend
 /// error maps to [`AgentError::Request`]; success is annotated with the fired
 /// Skills. ONE definition of the tail, used by all three.
-async fn finish_agent_request<F, E>(req: F, fired: &FiredLog) -> Result<String, AgentError>
+///
+/// `backend` tags the lifecycle trace events (request-start / completion /
+/// error / timeout) so a hung or failing chat is traceable to a specific
+/// provider in the client log. The request is non-streaming (rig's
+/// `prompt().await` resolves once with the full reply), so there is no
+/// separate first-byte instant to record — "first-byte" and "completion" are
+/// the same instant here; the elapsed time logged on success is the
+/// request's effective TTFT.
+async fn finish_agent_request<F, E>(
+    backend: &'static str,
+    req: F,
+    fired: &FiredLog,
+) -> Result<String, AgentError>
 where
     F: std::future::IntoFuture<Output = Result<String, E>>,
     E: std::fmt::Display,
 {
+    let started = Instant::now();
+    info!(backend, "chat request start");
     let reply = match tokio::time::timeout(REQUEST_TIMEOUT, req.into_future()).await {
-        Err(_) => return Err(AgentError::Timeout),
+        Err(_) => {
+            warn!(
+                backend,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "chat request timed out"
+            );
+            return Err(AgentError::Timeout);
+        }
+        Ok(Err(e)) => {
+            error!(
+                backend,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error = %e,
+                "chat request failed"
+            );
+            return Err(AgentError::Request(e.to_string()));
+        }
         Ok(Ok(reply)) => reply,
-        Ok(Err(e)) => return Err(AgentError::Request(e.to_string())),
     };
     let skills = fired.lock().map(|g| g.clone()).unwrap_or_default();
+    info!(
+        backend,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        reply_len = reply.len(),
+        skills_fired = skills.len(),
+        "chat request complete"
+    );
     Ok(annotate_reply(reply, &skills))
 }
 
@@ -1006,7 +1044,7 @@ impl AgentClient for RigAgentClient {
             .max_turns(MAX_TOOL_TURNS)
             .with_history(build_messages(prior));
 
-        finish_agent_request(req, &fired).await
+        finish_agent_request("rig-openai", req, &fired).await
     }
 }
 
@@ -1267,7 +1305,7 @@ impl AgentClient for ChatGptAgentClient {
             .max_turns(MAX_TOOL_TURNS)
             .with_history(build_messages(prior));
 
-        finish_agent_request(req, &fired).await
+        finish_agent_request("chatgpt-oauth", req, &fired).await
     }
 }
 
@@ -1368,7 +1406,7 @@ impl AgentClient for AnthropicAgentClient {
             .max_turns(MAX_TOOL_TURNS)
             .with_history(build_messages(prior));
 
-        finish_agent_request(req, &fired).await
+        finish_agent_request("anthropic", req, &fired).await
     }
 }
 

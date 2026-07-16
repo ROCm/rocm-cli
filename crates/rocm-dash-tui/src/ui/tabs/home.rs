@@ -38,6 +38,18 @@ fn history<F: Fn(&rocm_dash_core::metrics::Snapshot) -> f64>(
         .collect()
 }
 
+/// Label for the node-load sparkline: no data → `—`; simulated telemetry is
+/// never labeled "live" (it reads `sim`); otherwise a live feed.
+const fn node_load_label(hist_empty: bool, simulated: bool) -> &'static str {
+    if hist_empty {
+        "—"
+    } else if simulated {
+        "sim"
+    } else {
+        "live"
+    }
+}
+
 /// Peak GPU utilization across the GPUs in a snapshot (the headline metric).
 fn snap_util(s: &rocm_dash_core::metrics::Snapshot) -> f64 {
     s.gpus
@@ -155,7 +167,7 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         f,
         Rect::new(inner.x, inner.y, inner.width, 1),
         "node load ",
-        if load_hist.is_empty() { "—" } else { "live" },
+        node_load_label(load_hist.is_empty(), state.simulated),
         &load_hist,
         false,
         theme,
@@ -270,10 +282,16 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1); 6])
         .split(area);
+    // In demo/replay this is not a live feed — say so rather than "LIVE".
+    let (feed_label, feed_color) = if state.simulated {
+        ("SIMULATED · last 60s", theme.warn)
+    } else {
+        ("LIVE · last 60s", theme.muted)
+    };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "LIVE · last 60s",
-            Style::default().fg(theme.muted),
+            feed_label,
+            Style::default().fg(feed_color),
         ))),
         rh[0],
     );
@@ -422,14 +440,20 @@ fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // Updates tile — honest placeholder (no update feed wired this run).
     let updates = card(f, mid[2], "Updates", BoxRole::Muted, theme);
     if updates.height > 0 {
-        let body = match state.conn {
-            ConnState::Connected { .. } => {
-                Line::from(Span::styled("Up to date", Style::default().fg(theme.muted)))
+        let body = if state.simulated {
+            // No real update feed can be observed for simulated data.
+            Line::from(Span::styled("unknown", Style::default().fg(theme.muted)))
+        } else {
+            match state.conn {
+                ConnState::Connected { .. } => {
+                    Line::from(Span::styled("Up to date", Style::default().fg(theme.muted)))
+                }
+                _ => Line::from(Span::styled("Checking…", Style::default().fg(theme.muted))),
             }
-            _ => Line::from(Span::styled("Checking…", Style::default().fg(theme.muted))),
         };
-        // ponytail: no update-feed data source this run; tile shows conn-derived
-        // status rather than the mock's hardcoded "ROCm 6.3 ready".
+        // No update-feed data source this run: simulated sessions show "unknown"
+        // (nothing observable), otherwise the tile is conn-derived rather than
+        // the mock's hardcoded "ROCm 6.3 ready".
         f.render_widget(Paragraph::new(body), updates);
     }
 }
@@ -441,6 +465,14 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo, Snapshot, SystemMetrics};
+
+    #[test]
+    fn node_load_label_never_marks_simulated_live() {
+        assert_eq!(node_load_label(true, false), "—");
+        assert_eq!(node_load_label(true, true), "—");
+        assert_eq!(node_load_label(false, false), "live");
+        assert_eq!(node_load_label(false, true), "sim");
+    }
 
     fn render(state: &AppState, cols: u16, rows: u16) -> String {
         let backend = TestBackend::new(cols, rows);

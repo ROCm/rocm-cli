@@ -12,8 +12,10 @@
 //! nothing is lost. The selectable list is the instances table (wired via the
 //! main selection model in `AppState`).
 //!
-//! The amber demo-data banner is shown iff live daemon telemetry is
+//! The amber no-live-data banner is shown iff live daemon telemetry is
 //! absent — driven by `ConnState` / snapshot presence, never a hardcoded flag.
+//! Simulated (`--demo`/`--replay`) sessions are marked separately by the global
+//! SIMULATED DATA header chip; see `AppState::simulated`.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -27,8 +29,9 @@ use crate::ui::theme::Theme;
 use crate::ui::{format, widgets};
 
 /// True when we have no live daemon telemetry to show — i.e. not connected to a
-/// running daemon, or connected but no snapshot has arrived yet. The demo-data
-/// banner is shown exactly in this case (honesty: numbers may be placeholders).
+/// running daemon, or connected but no snapshot has arrived yet. The
+/// no-live-data banner is shown exactly in this case (honesty: numbers may be
+/// placeholders).
 const fn telemetry_absent(state: &AppState) -> bool {
     !matches!(state.conn, ConnState::Connected { .. }) || state.latest.is_none()
 }
@@ -39,7 +42,7 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(0)])
             .split(area);
-        draw_demo_banner(f, split[0], theme);
+        draw_no_live_data_banner(f, split[0], theme);
         split[1]
     } else {
         area
@@ -193,17 +196,17 @@ fn draw_throughput_hero(f: &mut Frame, area: Rect, state: &AppState, theme: &The
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_demo_banner(f: &mut Frame, area: Rect, theme: &Theme) {
+fn draw_no_live_data_banner(f: &mut Frame, area: Rect, theme: &Theme) {
     let banner = Paragraph::new(Line::from(vec![
         Span::styled(
-            " ⚠ demo data ",
+            " ⚠ no live data ",
             Style::default()
                 .bg(theme.warn)
                 .fg(theme.bg)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            "  no live ROCm daemon — telemetry shown is synthetic / last-known",
+            "  not connected to a ROCm daemon — showing placeholders / last-known",
             Style::default().fg(theme.warn),
         ),
     ]));
@@ -357,21 +360,24 @@ mod tests {
     }
 
     #[test]
-    fn demo_banner_absent_when_connected_with_telemetry() {
+    fn no_live_data_banner_absent_when_connected_with_telemetry() {
         let out = render(&connected_with_snapshot(), 160, 44);
         assert!(
-            !out.contains("demo data"),
-            "demo banner must be hidden when connected with telemetry: {out:?}"
+            !out.contains("no live data"),
+            "no-live-data banner must be hidden when connected with telemetry: {out:?}"
         );
     }
 
     #[test]
-    fn demo_banner_present_when_telemetry_absent() {
+    fn no_live_data_banner_present_when_telemetry_absent() {
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.active_tab = ActiveTab::Observe;
         // Initial conn, no snapshot → telemetry absent.
         let out = render(&s, 160, 44);
-        assert!(out.contains("demo data"), "demo banner expected: {out:?}");
+        assert!(
+            out.contains("no live data"),
+            "no-live-data banner expected: {out:?}"
+        );
     }
 
     #[test]

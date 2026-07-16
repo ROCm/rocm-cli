@@ -108,7 +108,7 @@ repos:
         pass_filenames: false
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy --workspace --all-targets -- -D warnings
+        entry: cargo clippy --workspace --all-targets --exclude e2e-cucumber -- -D warnings
         language: system
         types: [rust]
         pass_filenames: false
@@ -116,7 +116,7 @@ repos:
         groups: [local-tools] # runs in the dedicated `clippy` CI job
       - id: cargo-test
         name: cargo test
-        entry: cargo test --workspace --all-targets
+        entry: cargo test --workspace --all-targets --exclude e2e-cucumber
         language: system
         types: [rust]
         pass_filenames: false

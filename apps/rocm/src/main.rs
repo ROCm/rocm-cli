@@ -7,6 +7,7 @@ mod bootstrap;
 mod comfyui;
 mod dash;
 mod dash_seam;
+mod logging;
 mod provider_keys;
 mod providers;
 mod serve_summary;
@@ -817,6 +818,14 @@ impl PermissionsModeArg {
 }
 
 fn main() -> Result<()> {
+    // Held for the whole process lifetime: dropping it flushes and stops the
+    // non-blocking file writer, so an early drop would silently truncate the
+    // log. A failed/missing `AppPaths::discover()` degrades to no logging
+    // rather than a startup failure.
+    let _log_guard = AppPaths::discover()
+        .ok()
+        .and_then(|paths| logging::init(&paths));
+
     maybe_migrate_legacy_dashboard_config();
 
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
@@ -3887,6 +3896,7 @@ fn serve(args: ServeArgs) -> Result<()> {
             );
             let summary = serve_summary::DeploymentSummary {
                 engine: selected_engine.clone(),
+                requested_model: model,
                 api_model: resolve.canonical_model_id,
                 chat_endpoint: format!("{}/chat/completions", report.endpoint_url),
                 service_id: report.service_id.clone(),
@@ -13082,6 +13092,12 @@ fn refresh_managed_service_runtime_liveness(record: &mut ManagedServiceRecord) -
         && managed_service_endpoint_model_ready(record, SERVICE_LIVENESS_CHECK_TIMEOUT)
             .unwrap_or(false);
     if endpoint_ready {
+        // Mirror `providers.rs::ready_local_services()`: a live, probe-passing
+        // service should be persisted as "ready", not left stuck at "running".
+        if record.status == "running" {
+            record.status = "ready".to_owned();
+            return true;
+        }
         return false;
     }
 
@@ -16093,6 +16109,92 @@ mod tests {
         let request = receiver.recv_timeout(Duration::from_secs(1))?;
         assert!(request.starts_with("POST /v1/unload HTTP/1.1"));
         assert!(request.contains("\"model_name\":\"Qwen3-0.6B-GGUF\""));
+        Ok(())
+    }
+
+    #[test]
+    fn load_managed_services_promotes_running_to_ready_once_probe_passes() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        // Two probes hit this mock: one from `load_managed_services`, another
+        // from the `load_managed_service` re-read below that verifies the
+        // promotion was actually persisted, not just returned in-memory.
+        let server = thread::spawn(move || -> Result<()> {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut request_bytes = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    request_bytes.extend_from_slice(&buffer[..read]);
+                    if String::from_utf8_lossy(&request_bytes).contains("\r\n\r\n") {
+                        break;
+                    }
+                }
+                let body = r#"{"data":[{"id":"Qwen3-0.6B-GGUF"}]}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )?;
+            }
+            Ok(())
+        });
+
+        let (root, paths) = test_paths("load-managed-services-promote-ready");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-qwen-promote",
+            "vllm",
+            "Qwen3-0.6B-GGUF",
+            "Qwen3-0.6B-GGUF",
+            "127.0.0.1",
+            port,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        // A supervisor that has already observed the engine come up reports
+        // "running"; only the HTTP model-ready probe should promote it further.
+        record.status = "running".to_owned();
+        record.write()?;
+
+        let records = load_managed_services(&paths)?;
+        let promoted = records
+            .iter()
+            .find(|found| found.service_id == "svc-qwen-promote")
+            .expect("service should be present");
+        assert_eq!(promoted.status, "ready");
+
+        // Re-read the manifest file directly (bypassing any code path that
+        // could itself re-run the promotion) to prove the transition was
+        // actually written to disk, not just returned in the in-memory
+        // `Vec<ManagedServiceRecord>` above. `load_managed_service` below
+        // also calls `refresh_managed_service_runtime_liveness` on every
+        // read, so asserting only on its return value would pass even if
+        // `load_managed_services` never persisted anything.
+        let on_disk_bytes = fs::read(&record.manifest_path)?;
+        let on_disk = serde_json::from_slice::<ManagedServiceRecord>(&on_disk_bytes)?;
+        assert_eq!(on_disk.status, "ready");
+
+        // The promotion must have been persisted to disk, not just returned
+        // in-memory, since chat's `pick_managed_chat_endpoint` re-reads it.
+        let reloaded = load_managed_service(&paths, "svc-qwen-promote")?;
+        assert_eq!(reloaded.status, "ready");
+
+        server.join().expect("server thread should not panic")?;
+        fs::remove_dir_all(root).ok();
         Ok(())
     }
 
