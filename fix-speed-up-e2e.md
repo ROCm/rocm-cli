@@ -7,7 +7,7 @@
 **Branch:** fix-speed-up-e2e
 **Last Updated:** 2026-07-16
 
-**Token Usage:** in=20 out=5587 cache_create=195033 cache_read=855738 calls=11
+**Token Usage:** in=176 out=37358 cache_create=262209 cache_read=9155512 calls=89
 
 ---
 
@@ -77,7 +77,10 @@ Profile the suite to establish a baseline runtime and find the dominant cost bef
 
 ## Blockers / Open Questions
 
-- **Baseline unknown**: need current runtime numbers before deciding where to optimize.
+- **Coverage gap on diagnose**: `rocm diagnose` command exists but zero E2E scenarios cover it — real gap vs P0 plan.
+- **Strix Halo Qwen not latest**: suite uses `Qwen3-0.6B-GGUF` (smallest GGUF recipe) on lemonade; unclear if this is the "latest variant supported by Lemonade" you intended.
+- **Per-PR vs nightly split unclear**: CI currently has no per-PR-only tier — `xtask e2e` runs everything applicable per-host, and `@nightly` is only pulled in via manual dispatch. Need to clarify how your P0-every-PR intent maps to CI workflows.
+- **Baseline unknown**: need to inspect a live CI run (e.g. #29472891569) to quantify current runtimes and identify bottlenecks.
 
 ## Notes
 
@@ -92,6 +95,8 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persiste-app-dev-c
 
 ### 2026-07-16
 
-- Created WIP file for the E2E speed-up effort.
-- Established skeleton with problem statement, candidate optimization levers, and initial profiling task.
-- Next: profile the suite to get a baseline and find the dominant cost.
+- Fetched latest main (34 commits ahead); rebased branch (fast-forward, now at abb80fa).
+- Discovered E2E suite exists on updated main (`tests/e2e-cucumber/`, 4 features, ~21 scenarios).
+- Audited coverage vs P0/P1 plan: `examine` ✅, `install` ⚠️ (nightly-only), `diagnose` ❌ (zero coverage), `serve` Qwen3.6-27B MI300X ✅ (nightly), Strix Halo ⚠️ (uses smallest GGUF, not latest variant).
+- Identified gaps: diagnose uncovered, Strix Halo model choice unclear, per-PR vs nightly CI tiering not aligned with plan.
+- Next: inspect live CI run to quantify baseline runtime, then decide scope (profiling, coverage gaps, tiering rewire).
