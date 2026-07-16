@@ -895,6 +895,7 @@ mod tests {
             chat_detect_msg: None,
             chat_persist_dispatch: false,
             replay: None,
+            simulated: false,
             last_body_area: None,
             last_tab_bar_area: None,
             last_footer_chips: Vec::new(),

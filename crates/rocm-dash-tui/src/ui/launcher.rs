@@ -182,7 +182,9 @@ fn draw_status_strip(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             ),
             Span::styled(port, Style::default().fg(theme.muted)),
             Span::styled("  │  ", Style::default().fg(theme.border)),
-            Span::styled("✓ healthy", Style::default().fg(theme.ok)),
+            // A Running process is not a health signal. Without an actual health
+            // probe we report health as unknown rather than fabricating "healthy".
+            Span::styled("health: unknown", Style::default().fg(theme.muted)),
         ])
     } else {
         Line::from(vec![
@@ -365,6 +367,32 @@ mod tests {
         assert!(out.contains("soon"), "optimize soon badge missing");
         let needle = ["generate", "an", "image"].join(" ");
         assert!(!out.to_lowercase().contains(&needle), "no image verb");
+    }
+
+    #[test]
+    fn launcher_running_reports_unknown_health_not_fabricated_healthy() {
+        // A Running process is not a health signal; without a probe the launcher
+        // must not claim the service is healthy.
+        let mut s = base();
+        s.instances.insert(
+            "id".into(),
+            Instance {
+                container_id: "id".into(),
+                model_name: "Qwen3-72B".into(),
+                status: InstanceStatus::Running,
+                port: Some(8000),
+                ..Default::default()
+            },
+        );
+        let out = render(&s, 0, 100, 24);
+        assert!(
+            out.contains("health: unknown"),
+            "launcher must report unknown health: {out:?}"
+        );
+        assert!(
+            !out.contains("healthy"),
+            "launcher must not fabricate a healthy claim: {out:?}"
+        );
     }
 
     #[test]
