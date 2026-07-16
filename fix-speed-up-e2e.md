@@ -7,7 +7,7 @@
 **Branch:** fix-speed-up-e2e
 **Last Updated:** 2026-07-16
 
-**Token Usage:** in=726 out=203041 cache_create=3717627 cache_read=66635355 calls=365
+**Token Usage:** in=790 out=227659 cache_create=4348451 cache_read=75825694 calls=397
 
 ---
 
@@ -91,19 +91,28 @@ Scenario: 6 - Asking for a fix the CLI does not know is refused clearly
 
 | # | @id | invocation | key assertion | tier |
 |---|-----|-----------|---------------|------|
-| 1 | diagnose-matches-known-symptom | `diagnose --symptom "unable to open /dev/kfd"` | exit 0; stdout has a `#1 [HIGH/LIKELY ...]` match + an `id:`/`plan:` line | mock (per-PR) |
-| 2 | diagnose-no-match-routes-upstream | `diagnose --symptom "totally unrelated gibberish"` | exit 0; "no known misconfiguration matched" + a report/route target | mock |
-| 3 | diagnose-json-has-match-flag | `diagnose --symptom "unable to open /dev/kfd" --json` | exit 0; parseable JSON; `matched` non-empty / `has_match` true | mock |
+| 1 | diagnose-matches-known-symptom | `diagnose --symptom "unable to open /dev/kfd"` | exit 0; stdout has a `#1 [HIGH/LIKELY score=…]` match with an `id: fix-…` + `plan:` line (do NOT assert a specific fix-id — see below) | mock (per-PR) |
+| 2 | diagnose-no-match-routes-upstream | `diagnose --symptom "xyzzy gibberish"` | exit 0; "no known misconfiguration matched" + a route target line (`rocm-core: https://…`) | mock |
+| 3 | diagnose-json-has-match-flag | `diagnose --symptom "unable to open /dev/kfd" --json` | exit 0; parseable JSON; `matched` non-empty | mock |
 | 4 | fix-lists-known-recipes | `fix` (no id) | exit 0; "Available fix-ids" + ≥1 `[AUTO]`/`[PRINT-ONLY]` row | mock |
-| 5 | fix-dry-run-changes-nothing | `fix fix-4-render-group --dry-run` | exit 0; prints a plan; no mutation (isolated data dir untouched) | mock |
-| 6 | fix-unknown-id-rejected | `fix fix-does-not-exist` | non-zero exit (code 2); message names the unknown id | mock |
+| 5 | fix-dry-run-changes-nothing | `fix fix-1-arch --dry-run` | exit **0**; prints a `Fix: fix-1-arch …` plan; no mutation | mock |
+| 6 | fix-unknown-id-rejected | `fix fix-does-not-exist` | exit **2**; stderr/stdout "Unknown fix-id: …" | mock |
 
-Notes for implementation (NOT part of the spec): `diagnose` always exits 0 (it's a query —
-branch on `--json` fields, never the code). `--symptom "unable to open /dev/kfd"` scores exactly
-50 = `MIN_SCORE_FOR_MATCH`, a deterministic match with no GPU. `fix fix-9-igpu-dgpu` mutates —
-use `fix-4-render-group` (a print-only recipe) for the dry-run scenario. All 6 need
-`expectations.toml` entries (expect-pass on all platforms; none are known bugs). Candidate file:
-new `tests/e2e-cucumber/features/diagnose.feature`.
+**VERIFIED live in the Linux container (2026-07-16), corrections vs my first draft:**
+- `diagnose` always exits 0 (query) ✓. BUT diagnose is **OS-gated**: on Mac `os_family`≠linux → the
+  CHECKERS all skip → 0 matches for ANY symptom (that's why a Mac probe wrongly showed "no match").
+  On the mock lane (hosted **Ubuntu**) it matches correctly. Lesson logged: always probe in the container.
+- Scenario 1: the KFD symptom matched, but the top hit on the CI box was **fix-4-render-group score=95**
+  (the box's user isn't in render/video, so those env-checks stack with the keyword). So the specific
+  fix-id is ENV-DEPENDENT — assert "a match with an `id:`+`plan:`", NOT a hardcoded id.
+- Scenario 5: `fix-4-render-group --dry-run` returns **rc=3** (env-not-right: no `$USER` in container),
+  and `fix-2-unset-override --dry-run` **PANICS rc=101** (separate bug — flag it, don't use it).
+  `fix-1-arch --dry-run` is PRINT-ONLY, linux+windows, deterministic **rc=0** → use it for scenario 5.
+- Scenario 6: `fix <unknown>` → **rc=2** ✓ ("Unknown fix-id: …").
+
+All 6 need `expectations.toml` entries (expect-pass all platforms; none are known bugs). Candidate file:
+new `tests/e2e-cucumber/features/diagnose.feature`. SIDE FINDING to file separately: `fix
+fix-2-unset-override --dry-run` panics (rc=101) — a dry-run should never panic.
 
 ## Implementation Steps
 
@@ -113,15 +122,15 @@ new `tests/e2e-cucumber/features/diagnose.feature`.
 - ✅ Implement VRAM-floor fix: added device-total probe, scaled floor to `min(150_000, total*0.9)`, verified compile + arithmetic. Committed and pushed to origin/fix-speed-up-e2e (commit `122d2be`).
 
 ### In Progress ⏳
-- ⏳ Task #1 probe: run 29529197875 (Strix-Ubuntu, 2 serve scenarios) in queue behind older PR/merge runs on serial box (~2h backlog). Auto-loop every 10m. On completion: if timing drops ~120s/serve → open PR for `122d2be`; else diagnose + iterate.
-- ⏳ Task #3: BDD scenarios for `rocm diagnose`/`fix` (6 scenarios drafted, GPU-independent mock-lane, awaiting review before step implementation).
+- ⏳ Task #1 probe: run 29529197875 (Strix-Ubuntu, 2 serve scenarios) queued behind PR/merge runs on serial GPU box. Auto-loop every 10m. On completion: if ~120s/serve drop → open PR for `122d2be`; else diagnose + iterate.
+- ✅ Task #3: BDD scenarios for `rocm diagnose`/`fix` drafted — 6 scenarios (GPU-independent, mock-lane) + technical table. Verified against live container behavior (corrected: OS-gating, env-dependence, rc codes). Awaiting review before implementation.
 
 ### Todo 📋
+- 📋 Task #1 probe completion: run 29529197875 still queued; verify timing drop on completion → open PR.
 - 📋 Task #2: Rework CI tiering (per-PR vs nightly) — verify/tune existing `@nightly` split.
-- 📋 Task #3: Implement diagnose E2E test steps (scenarios drafted, awaiting review).
+- 📋 Task #3: Implement diagnose E2E test steps + expectations.toml (scenarios drafted + verified, ready for code).
 - 📋 Task #4: Confirm Strix Halo Qwen variant (user decision: latest vs smallest).
 - 📋 Task #5: Reduce mock lane per-scenario overhead (fixed overhead ~4.8s/scenario, multiply across 12).
-- 📋 Verify VRAM-floor fix on real Strix-Ubuntu GPU (run 29529197875 in progress; expect ~12 min saved).
 
 ## Next Steps
 
@@ -155,15 +164,11 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persiste-app-dev-c
 
 ## Work Log
 
-### 2026-07-16 (idle flush)
+### 2026-07-16 — Task #1 fix + container gate, Task #3 scenarios drafted + live validated, methods saved
 
-Session idle for 10 minutes, auto-flushing WIP state.
-
-### 2026-07-16 — Task #1 fix + probe, Task #3 scenarios drafted, methods saved, container validated
-
-- **Task #1 root cause + fix:** hardcoded `MIN_FREE_VRAM_MIB=150_000` (MI300X) vs Strix 62 GiB → every serve waited 2 min (~12 min wasted). Fix: scale to device total `min(150_000, total*0.9)`. Commit `122d2be` (signed/off, pushed).
-- **Container gate:** clippy/tests clean; mock reconciliation 4 xfail/0 unexpected. Helper bug fixed (removed `--tags` that broke reconciliation).
-- **Probe fired:** run 29529197875 (Strix-Ubuntu, 2 serve, nightly off). Queued in serial backlog (~2h behind 2 PR runs). Auto-loop every 10m; on done: if ~120s/serve drop → open PR; else iterate.
-- **Task #3 drafted:** 6 BDD scenarios `rocm diagnose`/`fix` (GPU-independent, mock-lane, P0 gap). Gherkin + technical table ready for review.
-- **Methods to memory:** scoped dispatch (rapid narrow testing), act-don't-ask feedback, commit/push workflow (signing, sign-off, container gate, --no-verify).
-- **Awaiting:** probe completion (still queued), Task #4 user call (Strix Qwen: latest or smallest).
+- **Task #1 root cause + fix:** hardcoded `MIN_FREE_VRAM_MIB=150_000` (MI300X) vs Strix 62 GiB → every serve waited 2 min (~12 min wasted). Fix: scale to device total `min(150_000, total*0.9)`. Commit `122d2be` signed/off, pushed.
+- **Container gate (full):** clippy + workspace tests clean under `-D warnings`; e2e-cucumber clippy passed. Mock lane reconciliation 4 xfail/0 unexpected (helper bug: removed erroneous `--tags` filter).
+- **Probe run 29529197875:** Strix-Ubuntu 2-scenario dispatch fired; queued behind PR/merge runs on serial GPU box (~2h backlog). Auto-loop every 10m checks; on completion: if durations drop ~120s/serve → PR ready; else iterate.
+- **Task #3 scenarios drafted + validated:** 6 BDD (diagnose/fix, GPU-independent, mock-lane). Probed live in container; corrected 3 assumptions: OS-gating, env-dependence of match/rc, recipe selection. Technical table verified. Ready for implementation review.
+- **Methods to memory:** scoped dispatch (narrow rapid testing), act-don't-ask, commit/push flow (signing, sign-off, container gate, --no-verify), always-Linux-container, feedback entries.
+- **Awaiting:** probe completion (still queued), user decision on Task #4 (Strix Qwen: latest or smallest).
