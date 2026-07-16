@@ -7,7 +7,7 @@
 **Branch:** fix-speed-up-e2e
 **Last Updated:** 2026-07-17
 
-**Token Usage:** in=790 out=227659 cache_create=4348451 cache_read=75825694 calls=397
+**Token Usage:** in=860 out=244602 cache_create=4705173 cache_read=86893998 calls=432
 
 ---
 
@@ -122,8 +122,8 @@ fix-2-unset-override --dry-run` panics (rc=101) — a dry-run should never panic
 - ✅ Implement VRAM-floor fix: added device-total probe, scaled floor to `min(150_000, total*0.9)`, verified compile + arithmetic. Committed and pushed to origin/fix-speed-up-e2e (commit `122d2be`).
 
 ### In Progress ⏳
-- ⏳ Task #1 probe: run 29529197875 (Strix-Ubuntu, 2 serve scenarios) queued behind PR/merge runs on serial GPU box. Auto-loop every 10m. On completion: if ~120s/serve drop → open PR for `122d2be`; else diagnose + iterate.
-- ✅ Task #3: BDD scenarios for `rocm diagnose`/`fix` drafted — 6 scenarios (GPU-independent, mock-lane) + technical table. Verified against live container behavior (corrected: OS-gating, env-dependence, rc codes). Awaiting review before implementation.
+- ⏳ Task #1 probe: run 29529197875 (Strix-Ubuntu, 2 serve scenarios) queued, waiting behind PR/merge work. Auto-loop every 10m; no action until completion.
+- ✅ Task #3 scenarios: 6 BDD (diagnose/fix, mock-lane GPU-independent). Verified live in container; corrected 3 assumptions (OS-gating, env-dependence, rc codes). Ready for implementation review.
 
 ### Todo 📋
 - 📋 Task #1 probe completion: run 29529197875 still queued; verify timing drop on completion → open PR.
@@ -164,8 +164,12 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persiste-app-dev-c
 
 ## Work Log
 
-### 2026-07-17 (idle flush)
-Session idle for 10 minutes, auto-flushing WIP state.
+### 2026-07-17 — Container gate validated, Task #3 live-probed, methods saved, Task #4 + #2 scoped
+
+- **Container gate passed clean:** clippy `-D warnings` + all unit tests on e2e-cucumber (the fix itself compiles clean).
+- **Task #3 live-verified:** probed `rocm diagnose/fix` in Linux container; corrected 3 assumptions (OS-gating, env-dependent match-id, rc codes). 6 scenarios ready for implementation review. Saved rule to bdd-scenarios skill + global memory (verify against running system, not just source).
+- **Task #4 + #2 scoped:** confirmed P0/P1 plan vs suite; Task #4 needs user decision (Strix Qwen variant); Task #2 verified `@nightly` infra exists, just needs alignment check.
+- **Probe 29529197875 still queued:** waited ~2.5h; serial GPU box has heavy contention behind 2 PR runs. No action until completion (auto-loop every 10m).
 
 ### 2026-07-16 — Task #1 fix + container gate, Task #3 scenarios drafted + live validated, methods saved
 
