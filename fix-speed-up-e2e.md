@@ -7,7 +7,7 @@
 **Branch:** fix-speed-up-e2e
 **Last Updated:** 2026-07-16
 
-**Token Usage:** in=680 out=193398 cache_create=1626624 cache_read=61884209 calls=342
+**Token Usage:** in=684 out=193954 cache_create=1920953 cache_read=62178046 calls=344
 
 ---
 
@@ -113,8 +113,8 @@ new `tests/e2e-cucumber/features/diagnose.feature`.
 - ✅ Implement VRAM-floor fix: added device-total probe, scaled floor to `min(150_000, total*0.9)`, verified compile + arithmetic. Committed and pushed to origin/fix-speed-up-e2e (commit `122d2be`).
 
 ### In Progress ⏳
-- ⏳ Scoped dispatch in progress on Strix-Ubuntu (run 29529197875, 2 serve scenarios, measuring per-serve step duration vs ~262s baseline). Loop checks every 10m; if successful will open PR immediately.
-- ⏳ Task #3: BDD scenarios for `rocm diagnose`/`fix` (6 scenarios drafted, GPU-independent, awaiting review before implementation).
+- ⏳ Task #1 probe: run 29529197875 (Strix-Ubuntu, 2 serve scenarios) queued on GPU runner; still waiting to execute. Loop auto-checks every 10m. On completion: if successful, open PR; else diagnose + iterate.
+- ⏳ Task #3: BDD scenarios for `rocm diagnose`/`fix` (6 scenarios drafted, GPU-independent mock-lane, awaiting review before implementation).
 
 ### Todo 📋
 - 📋 Task #2: Rework CI tiering (per-PR vs nightly) — verify/tune existing `@nightly` split.
@@ -155,12 +155,11 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persiste-app-dev-c
 
 ## Work Log
 
-### 2026-07-16
+### 2026-07-16 — Task #1 fix complete, Task #3 scenarios drafted, probing underway
 
-- **Task #1 root cause + fix:** VRAM-floor waste = hardcoded 150 GB (sized for MI300X) vs Strix's 62 GiB → full 2-min timeout on every serve, ~12 min total. Fix: device-relative floor `min(150_000, total*0.9)`. Commit `122d2be` signed + signed-off, pushed.
-- **Fix validated locally:** container gate passed (clippy + tests under `-D warnings`, 0 warnings); mock e2e reconciliation clean (4 xfail as expected, 0 unexpected).
-- **Scoped probe dispatched:** run 29529197875 queued on Strix-Ubuntu (2 serve scenarios). On completion: if successful (~120s per-scenario drop), open PR; if not, diagnose + iterate. Loop checks every 10m.
-- **Task #3 drafted:** 6 BDD scenarios for `rocm diagnose`/`fix` (GPU-independent, mock-lane, P0 coverage gap). Scenarios + technical mapping written, awaiting review before step implementation.
-- **Methods saved:** scoped dispatch for rapid validation, act-don't-ask feedback, commit-push workflow docs confirmed.
-- **Open decisions:** Task #4 (Strix Qwen variant: latest or smallest), Task #2 (CI tiering tune), Task #5 (mock overhead).
-- **2026-07-16 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+- **Task #1 root cause + fix:** hardcoded VRAM-floor 150 GB (MI300X-only) vs Strix's 62 GiB → 2-min timeout on every serve (~12 min wasted). Fix: scale floor to `min(150_000, total*0.9)`. Commit `122d2be` signed/signed-off, pushed.
+- **Validation:** container gate green (clippy `-D warnings` clean, all tests pass, mock e2e reconciliation 4 xfail/0 unexpected). VRAM fix arithmetic verified (MI300X floor unchanged, Strix ~43-55 GB reachable).
+- **Probe running:** run 29529197875 (Strix-Ubuntu, 2 serve scenarios) queued on GPU runner (still awaiting pickup). Auto-loop every 10m checks; on completion → if success, open PR; else diagnose + iterate.
+- **Task #3 drafted:** 6 BDD scenarios for `rocm diagnose`/`fix` (GPU-independent, mock-lane, P0 gap). Full Gherkin + technical mapping table written, awaiting review before step code.
+- **Processes documented:** scoped dispatch for rapid fix validation (saves waiting for full CI), act-don't-ask feedback, commit/push/gate workflow solidified in memory.
+- **Pending user input:** Task #4 (Strix Qwen variant: latest or smallest).
