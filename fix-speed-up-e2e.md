@@ -7,7 +7,7 @@
 **Branch:** fix-speed-up-e2e
 **Last Updated:** 2026-07-16
 
-**Token Usage:** in=396 out=110424 cache_create=605796 cache_read=26382485 calls=199
+**Token Usage:** in=490 out=136554 cache_create=649620 cache_read=37285438 calls=246
 
 ---
 
@@ -59,7 +59,7 @@ Scenario: [Abstract behavior description]
 - ✅ Implement VRAM-floor fix: added device-total probe, scaled floor to `min(150_000, total*0.9)`, verified compile + arithmetic. Committed and pushed to origin/fix-speed-up-e2e (commit `122d2be`).
 
 ### In Progress ⏳
-- ⏳ Task #2: Rework per-PR vs nightly CI tiering to match P0/P1 plan (existing `@nightly` gate works; need to verify alignment with P0 scope and wall-clock savings).
+- ⏳ Container gate running (cold build, background task `b4rdy2tpk`). Will validate VRAM-floor fix + commit under `RUSTFLAGS="-D warnings"` after completion.
 
 ### Todo 📋
 - 📋 Task #3: Add E2E coverage for `rocm diagnose` (P0 gap).
@@ -116,3 +116,6 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persiste-app-dev-c
 - Read `test-add-e2e-robot-framework.md` to understand testing regimen: cucumber-rs suite auto-reconciles pass/xfail via `expectations.toml` per-platform; share-one-runtime (Task #22 on that WIP) solves per-scenario cold-install cost; `@nightly` tag + `E2E_INCLUDE_NIGHTLY=1` already gates heavy scenarios. Per-PR vs nightly tiering exists — Task #2 is to verify/tune alignment with P0 scope.
 - Created 5 issue tasks to organize the work; Task #1 (VRAM-floor fix) completed; Task #2 deferred (tiering verification).
 - Five levers identified: (1) VRAM-floor waste (Task #1 ✅), (2) CI tiering tune (Task #2), (3) diagnose coverage gap (Task #3), (4) Strix Qwen variant decision (Task #4), (5) mock lane overhead (Task #5).
+- Reviewed memory system: `reference_rocm_cli_commit_push_workflow.md` already documents signed+signed-off + container gate + `--no-verify` (no gap, my miss not consulting it before commit). Confirmed per-project memory on disk, shared across worktrees.
+- Recreated git-hidden `workspace/wip/container-test.sh` helper (was missing from fresh worktree; runs full clippy+test gate under `-D warnings`).
+- Feedback saved: "act, don't ask when obvious" — for low-risk obvious work, just execute instead of asking permission.
