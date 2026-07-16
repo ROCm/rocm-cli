@@ -7,6 +7,7 @@ mod bootstrap;
 mod comfyui;
 mod dash;
 mod dash_seam;
+mod logging;
 mod provider_keys;
 mod providers;
 mod serve_summary;
@@ -864,6 +865,14 @@ impl PermissionsModeArg {
 }
 
 fn main() -> Result<()> {
+    // Held for the whole process lifetime: dropping it flushes and stops the
+    // non-blocking file writer, so an early drop would silently truncate the
+    // log. A failed/missing `AppPaths::discover()` degrades to no logging
+    // rather than a startup failure.
+    let _log_guard = AppPaths::discover()
+        .ok()
+        .and_then(|paths| logging::init(&paths));
+
     maybe_migrate_legacy_dashboard_config();
 
     let raw_args: Vec<String> = std::env::args().skip(1).collect();

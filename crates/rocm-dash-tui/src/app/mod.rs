@@ -40,7 +40,7 @@ mod summary;
 
 use chat::{
     StartupChatOutcome, build_chat_agent, build_local_agent, detect_local_chat,
-    persist_chat_endpoint, startup_chat_outcome,
+    discover_configured_chat_model, persist_chat_endpoint, startup_chat_outcome,
 };
 use summary::{parse_plan_result, summarize_json_value, summarize_slash_tool};
 
@@ -1691,6 +1691,20 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                 probe_ok,
             )
         });
+        // PR #97 port onto PR #100's startup flow: a *configured* URL (CLI/env)
+        // with no explicit model resolves to the `local-model` placeholder,
+        // which 404s on servers that register the model under its real id. Only
+        // the `Configured` outcome needs this — the `Local` outcome already
+        // carries a `/v1/models`-discovered model from `detect_local_chat`, and
+        // `OAuth` has no config. Discovery is gated inside the helper on
+        // `probe_ok` (an unreachable endpoint is never probed nor replaced) and
+        // on the absence of an explicit model (config precedence wins).
+        let llm = match llm {
+            Some(cfg) if startup_outcome == StartupChatOutcome::Configured => Some(
+                discover_configured_chat_model(cfg, args.chat_model.as_deref(), probe_ok).await,
+            ),
+            other => other,
+        };
         state.set_chat_config(llm, args.chat_auto_consent);
         // No reachable local endpoint AND no key/url configured → the no-key
         // ChatGPT OAuth default (device-code login surfaced in the chat tab).

@@ -328,8 +328,28 @@ pub(super) fn config_with_chat(
     cfg
 }
 
+/// Fold a `/v1/models`-discovered model id into a resolved [`LlmConfig`].
+///
+/// Only overrides when the user did **not** configure a model explicitly (so the
+/// resolver filled in the neutral `DEFAULT_CHAT_MODEL` placeholder). An explicit
+/// `--chat-model`/config value always wins; a failed discovery (`None`) leaves
+/// the placeholder in place so endpoints that ignore the model field keep
+/// working. Pure — the unit-test anchor for the startup model-discovery wiring.
+pub(super) fn with_discovered_model(
+    mut llm: crate::llm::LlmConfig,
+    explicit_model: Option<&str>,
+    discovered: Option<String>,
+) -> crate::llm::LlmConfig {
+    if explicit_model.is_none()
+        && let Some(model) = discovered
+    {
+        llm.model = model;
+    }
+    llm
+}
+
 /// GET `{base}/models` and return the first served model id, or `None`.
-async fn fetch_first_model(base_url: &str) -> Option<String> {
+pub(super) async fn fetch_first_model(base_url: &str) -> Option<String> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -338,6 +358,34 @@ async fn fetch_first_model(base_url: &str) -> Option<String> {
     let resp = client.get(&url).send().await.ok()?;
     let json: serde_json::Value = resp.json().await.ok()?;
     crate::llm::pick_first_model(&json)
+}
+
+/// Startup served-model discovery for a *configured* chat endpoint (an explicit
+/// CLI/env URL, i.e. the [`StartupChatOutcome::Configured`] path that skips
+/// local auto-detection).
+///
+/// A configured URL with no explicit model resolves to the `local-model`
+/// placeholder, which 404s on servers that register the model under its real id
+/// (`The model 'local-model' does not exist`). When the endpoint is reachable
+/// (`probe_ok`) and the user set no explicit model, query `/v1/models` and adopt
+/// the served id — mirroring the discovery [`detect_local_chat`] already does
+/// for the auto-detected path. Otherwise the config is returned untouched: an
+/// explicit model always wins, and an unreachable endpoint is never probed
+/// (no fetch timeout) nor silently replaced. The `/v1/models` fold is delegated
+/// to the pure [`with_discovered_model`].
+pub(super) async fn discover_configured_chat_model(
+    cfg: crate::llm::LlmConfig,
+    explicit_model: Option<&str>,
+    probe_ok: bool,
+) -> crate::llm::LlmConfig {
+    // An explicit model always wins (config precedence), and an unreachable
+    // endpoint is never probed (no fetch timeout on startup) nor silently
+    // replaced — return the resolved config untouched in both cases.
+    if !probe_ok || explicit_model.is_some() {
+        return cfg;
+    }
+    let discovered = fetch_first_model(&cfg.base_url).await;
+    with_discovered_model(cfg, explicit_model, discovered)
 }
 
 #[cfg(test)]
@@ -453,6 +501,99 @@ mod tests {
     fn skips_ready_record_with_empty_endpoint() {
         let env = services_envelope(serde_json::json!([service("vllm", "", "ready", "m", 100)]));
         assert_eq!(pick_managed_chat_endpoint(&env), None);
+    }
+
+    fn placeholder_config() -> crate::llm::LlmConfig {
+        crate::llm::detected_llm_config("http://127.0.0.1:11435/v1", crate::llm::DEFAULT_CHAT_MODEL)
+    }
+
+    #[test]
+    fn discovered_model_replaces_placeholder_when_none_configured() {
+        // The 404 regression: no explicit model → the served id must be adopted.
+        let out = with_discovered_model(
+            placeholder_config(),
+            None,
+            Some("Qwen/Qwen2.5-1.5B-Instruct".to_string()),
+        );
+        assert_eq!(out.model, "Qwen/Qwen2.5-1.5B-Instruct");
+    }
+
+    #[test]
+    fn explicit_model_is_never_overridden() {
+        let mut cfg = placeholder_config();
+        cfg.model = "my-model".to_string();
+        let out = with_discovered_model(cfg, Some("my-model"), Some("served-id".to_string()));
+        assert_eq!(out.model, "my-model");
+    }
+
+    #[test]
+    fn failed_discovery_keeps_placeholder() {
+        let out = with_discovered_model(placeholder_config(), None, None);
+        assert_eq!(out.model, crate::llm::DEFAULT_CHAT_MODEL);
+    }
+
+    /// One-shot HTTP server on an ephemeral loopback port that answers a single
+    /// `GET .../models` with `body`, returning its `http://127.0.0.1:{port}/v1`
+    /// base URL. Lets the behavioral tests drive `fetch_first_model`'s real
+    /// reqwest path against a deterministic `/v1/models` response without a new
+    /// dev-dependency. The accept loop runs on a detached thread and closes
+    /// after the single request.
+    fn spawn_models_server(body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://127.0.0.1:{port}/v1")
+    }
+
+    /// Matrix (configured URL + no model + reachable): the startup path queries
+    /// `/v1/models` and adopts the first served id. Fails on merged-main, whose
+    /// configured-endpoint path leaves the `DEFAULT_CHAT_MODEL` placeholder in
+    /// place (the `The model 'local-model' does not exist` 404).
+    #[tokio::test]
+    async fn configured_endpoint_adopts_served_model_when_no_model_set() {
+        let base = spawn_models_server(r#"{"data":[{"id":"served-model-id"}]}"#);
+        let cfg = crate::llm::detected_llm_config(&base, crate::llm::DEFAULT_CHAT_MODEL);
+        let out = discover_configured_chat_model(cfg, None, true).await;
+        assert_eq!(out.model, "served-model-id");
+    }
+
+    /// Matrix (configured URL + explicit model + reachable): discovery must not
+    /// override the user's model — config precedence is preserved even when the
+    /// endpoint serves a different id.
+    #[tokio::test]
+    async fn configured_endpoint_preserves_explicit_model() {
+        let base = spawn_models_server(r#"{"data":[{"id":"served-model-id"}]}"#);
+        let cfg = crate::llm::detected_llm_config(&base, "user-model");
+        let out = discover_configured_chat_model(cfg, Some("user-model"), true).await;
+        assert_eq!(out.model, "user-model");
+    }
+
+    /// Matrix (configured URL + no model + unreachable): fail honestly — the
+    /// configured endpoint is never swapped and no `/v1/models` fetch is even
+    /// attempted (`probe_ok == false` gates it out, so startup pays no fetch
+    /// timeout). base_url and the placeholder model are left untouched.
+    #[tokio::test]
+    async fn configured_endpoint_unreachable_is_never_replaced() {
+        let cfg = crate::llm::detected_llm_config(
+            "http://127.0.0.1:9/v1",
+            crate::llm::DEFAULT_CHAT_MODEL,
+        );
+        let out = discover_configured_chat_model(cfg.clone(), None, false).await;
+        assert_eq!(out.base_url, cfg.base_url);
+        assert_eq!(out.model, crate::llm::DEFAULT_CHAT_MODEL);
     }
 
     /// EAI-7347: startup now reuses `detect_local_chat` (the same detection the

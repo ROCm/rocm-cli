@@ -899,6 +899,16 @@ impl AppPaths {
     pub fn daemon_log_path(&self) -> PathBuf {
         self.data_dir.join("logs").join("rocmdashd.log")
     }
+
+    /// Directory for client-side (CLI/TUI process) `tracing` log files.
+    ///
+    /// Siblings the daemon's `rocmdashd.log` under the same canonical
+    /// `~/.rocm/logs` root; the client writer rotates files inside this
+    /// directory itself (see `apps/rocm/src/logging.rs`), so only the
+    /// directory — not a single fixed file name — is exposed here.
+    pub fn client_log_dir(&self) -> PathBuf {
+        self.data_dir.join("logs")
+    }
 }
 
 fn configured_managed_root_from_config(paths: &AppPaths) -> Option<PathBuf> {
@@ -7959,6 +7969,7 @@ Class Name:                Display
             paths.daemon_log_path(),
             paths.data_dir.join("logs").join("rocmdashd.log")
         );
+        assert_eq!(paths.client_log_dir(), paths.data_dir.join("logs"));
         // ensure() creates the telemetry state dir alongside the others.
         paths.ensure()?;
         assert!(paths.telemetry_state_dir().is_dir());

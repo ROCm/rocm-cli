@@ -34,6 +34,9 @@ rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tar = "0.4"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ureq = { version = "2.12", features = ["native-certs"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
