@@ -5,7 +5,7 @@
 **Stage:** 0-idea
 **Pipeline:** standard
 **Branch:** fix-speed-up-e2e
-**Last Updated:** 2026-07-17
+**Last Updated:** 2026-07-17 (idle flush)
 
 **Token Usage:** in=860 out=244602 cache_create=4705173 cache_read=86893998 calls=432
 
@@ -163,6 +163,10 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persiste-app-dev-c
 - Recreate with: `create_worktree.sh fix-speed-up-e2e`
 
 ## Work Log
+
+### 2026-07-17 (idle flush)
+
+**Session idle for 10 minutes, auto-flushing WIP state.**
 
 ### 2026-07-17 — Container gate validated, Task #3 live-probed, methods saved, Task #4 + #2 scoped
 
