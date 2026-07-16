@@ -7,7 +7,7 @@
 **Branch:** fix-speed-up-e2e
 **Last Updated:** 2026-07-16
 
-**Token Usage:** in=176 out=37358 cache_create=262209 cache_read=9155512 calls=89
+**Token Usage:** in=306 out=95333 cache_create=376084 cache_read=18574529 calls=154
 
 ---
 
@@ -54,19 +54,23 @@ Scenario: [Abstract behavior description]
 ## Implementation Steps
 
 ### Completed ✅
-- (none yet)
+- ✅ Task #1: Investigate Strix-Ubuntu ~262s timeout cluster — root cause found (hardcoded VRAM floor) and fixed.
+- ✅ Profile current E2E runtime from live CI run #29472891569 (baseline quantified: mock 7.6m / MI300X 8.0m / Strix-Windows 15.8m / Strix-Ubuntu 28.4m long pole).
 
 ### In Progress ⏳
-- (none yet)
+- ⏳ Task #2: Rework per-PR vs nightly CI tiering to match P0/P1 plan.
 
 ### Todo 📋
-- 📋 Profile current E2E runtime; identify the biggest time sinks
-- 📋 Decide which levers to pull (caching, parallelism, tiering)
-- 📋 Implement + measure improvement
+- 📋 Task #3: Add E2E coverage for `rocm diagnose` (P0 gap).
+- 📋 Task #4: Confirm Strix Halo Qwen variant (latest vs smallest).
+- 📋 Task #5: Reduce mock lane per-scenario overhead.
+- 📋 Verify VRAM-floor fix on real Strix-Ubuntu GPU (expect ~12 min saved).
 
 ## Next Steps
 
-Profile the suite to establish a baseline runtime and find the dominant cost before changing anything.
+- Task #2: Rework CI tiering (per-PR vs nightly) to align with P0/P1 plan and reduce wall-clock queue time (~13h).
+- Task #3: Add `rocm diagnose` E2E scenarios (P0 coverage gap).
+- Verify VRAM-floor fix on real GPU (expect ~12 min savings on Strix-Ubuntu lane).
 
 ## Checklist
 
@@ -99,4 +103,10 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persiste-app-dev-c
 - Discovered E2E suite exists on updated main (`tests/e2e-cucumber/`, 4 features, ~21 scenarios).
 - Audited coverage vs P0/P1 plan: `examine` ✅, `install` ⚠️ (nightly-only), `diagnose` ❌ (zero coverage), `serve` Qwen3.6-27B MI300X ✅ (nightly), Strix Halo ⚠️ (uses smallest GGUF, not latest variant).
 - Identified gaps: diagnose uncovered, Strix Halo model choice unclear, per-PR vs nightly CI tiering not aligned with plan.
-- Next: inspect live CI run to quantify baseline runtime, then decide scope (profiling, coverage gaps, tiering rewire).
+- Baseline from run 29472891569 (PR fix/chat-stale-url, PR event → @nightly excluded, so 27B serve did NOT run). Job compute: mock 7.6m / MI300X-GPU 8.0m / Strix-Windows 15.8m / Strix-Ubuntu 28.4m (long pole). Wall clock ~13h = serial GPU queue, not compute.
+- ROOT CAUSE of Strix-Ubuntu long pole: each failing serve scenario = a fixed ~262s = ~120s `wait_for_free_vram` (ALWAYS times out) + ~60s port-drain + 90s `wait_for_model` (shortened xfail, real bug EAI-7423 lemonade-on-Strix-Linux).
+  - The ~120s dead wait is an AVOIDABLE BUG: `MIN_FREE_VRAM_MIB = 150_000` (serving_steps.rs:130) is a hardcoded global floor sized for the 27B MI300X model. Strix Halo has 62 GiB *unified* RAM → can never report 150 GB free VRAM → `free >= 150_000` never true → full 2-min deadline burns on EVERY serve scenario. ~12 min of pure dead time on the lane, hits any GPU with <150 GB total VRAM.
+  - FIX: make floor relative to device total, e.g. `min(150_000, total_vram * 0.9)`. Strix then needs ~90% of its real VRAM free (drains promptly); MI300X keeps the large floor for 27B.
+- IMPLEMENTED VRAM-floor fix (serving_steps.rs): added `total_vram_mib`/`vram_mib` probe (amd-smi TOTAL_VRAM + rocm-smi total), `required_free_vram_mib(total) = min(150_000, total*0.9)`; `wait_for_free_vram` now uses the scaled floor. MI300X floor unchanged (150 GB); Strix ~43-55 GB (reachable). `cargo check -p e2e-cucumber --test e2e` passes.
+- NOT yet verified on real GPU — behavioral confirmation needs a Strix-Ubuntu CI run (expect ~12 min saved on that lane). Compile + arithmetic verified only.
+- Moved to Task #2 (CI tiering). Note: EAI-7423 (lemonade-on-Strix-Linux serve fails at 90s) is a real bug separate from the VRAM-floor waste fix.
