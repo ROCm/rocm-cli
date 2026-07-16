@@ -645,6 +645,7 @@ Apache License 2.0
 
 The following component(s) are licensed under Apache License 2.0:
   - as-any 0.3.2 <https://codeberg.org/fogti/as-any>
+  - encode_unicode 1.0.0 <https://github.com/tormol/encode_unicode>
   - encoding_rs 0.8.35 <https://github.com/hsivonen/encoding_rs>
   - static_assertions 1.1.0 <https://github.com/nvzqz/static-assertions-rs>
   - utf8_iter 1.0.4 <https://github.com/hsivonen/utf8_iter>
@@ -1725,6 +1726,7 @@ Apache License 2.0
 
 The following component(s) are licensed under Apache License 2.0:
   - rustls-platform-verifier 0.7.0 <https://github.com/rustls/rustls-platform-verifier>
+  - unicode-linebreak 0.1.5 <https://github.com/axelf4/unicode-linebreak>
   - ureq 2.12.1 <https://github.com/algesten/ureq>
 
                                  Apache License
@@ -2565,6 +2567,7 @@ Apache License 2.0
 ================================================================================
 
 The following component(s) are licensed under Apache License 2.0:
+  - bytecount 0.6.9 <https://github.com/llogiq/bytecount>
   - winapi 0.3.9 <https://github.com/retep998/winapi-rs>
 
                                  Apache License
@@ -2788,10 +2791,12 @@ The following component(s) are licensed under Apache License 2.0:
   - colorchoice 1.0.5 <https://github.com/rust-cli/anstyle.git>
   - crc32fast 1.5.0 <https://github.com/srijs/rust-crc32fast>
   - hex 0.4.3 <https://github.com/KokaKiwi/rust-hex>
+  - humantime 2.4.0 <https://github.com/chronotope/humantime>
   - is_terminal_polyfill 1.70.2 <https://github.com/polyfill-rs/is_terminal_polyfill>
   - jni-sys 0.4.1 <https://github.com/jni-rs/jni-sys>
   - once_cell_polyfill 1.70.2 <https://github.com/polyfill-rs/once_cell_polyfill>
   - serde_spanned 0.6.9 <https://github.com/toml-rs/toml>
+  - terminal_size 0.4.4 <https://github.com/eminence/terminal-size>
   - toml 0.8.23 <https://github.com/toml-rs/toml>
   - toml_datetime 0.6.11 <https://github.com/toml-rs/toml>
   - toml_datetime 1.1.1+spec-1.1.0 <https://github.com/toml-rs/toml>
@@ -5322,6 +5327,7 @@ Apache License 2.0
 The following component(s) are licensed under Apache License 2.0:
   - async-recursion 1.1.1 <https://github.com/dcchut/async-recursion>
   - rsa 0.9.10 <https://github.com/RustCrypto/RSA>
+  - sealed 0.6.0 <https://github.com/jmg-duarte/sealed-rs>
 
                               Apache License
                         Version 2.0, January 2004
@@ -5543,6 +5549,7 @@ The following component(s) are licensed under Apache License 2.0:
   - base64 0.22.1 <https://github.com/marshallpierce/rust-base64>
   - bitflags 2.13.0 <https://github.com/bitflags/bitflags>
   - blocking 1.6.2 <https://github.com/smol-rs/blocking>
+  - bstr 1.12.3 <https://github.com/BurntSushi/bstr>
   - bumpalo 3.20.3 <https://github.com/fitzgen/bumpalo>
   - cfg-if 1.0.4 <https://github.com/rust-lang/cfg-if>
   - color-eyre 0.6.5 <https://github.com/eyre-rs/eyre>
@@ -5552,7 +5559,12 @@ The following component(s) are licensed under Apache License 2.0:
   - core-foundation 0.10.1 <https://github.com/servo/core-foundation-rs>
   - core-foundation 0.9.4 <https://github.com/servo/core-foundation-rs>
   - critical-section 1.2.0 <https://github.com/rust-embedded/critical-section>
+  - crossbeam-channel 0.5.16 <https://github.com/crossbeam-rs/crossbeam>
+  - crossbeam-deque 0.8.7 <https://github.com/crossbeam-rs/crossbeam>
+  - crossbeam-epoch 0.9.20 <https://github.com/crossbeam-rs/crossbeam>
   - crossbeam-utils 0.8.21 <https://github.com/crossbeam-rs/crossbeam>
+  - cucumber-expressions 0.5.0 <https://github.com/cucumber-rs/cucumber-expressions>
+  - cucumber 0.23.0 <https://github.com/cucumber-rs/cucumber>
   - displaydoc 0.2.6 <https://github.com/yaahc/displaydoc>
   - either 1.16.0 <https://github.com/rayon-rs/either>
   - equivalent 1.0.2 <https://github.com/indexmap-rs/equivalent>
@@ -5567,6 +5579,7 @@ The following component(s) are licensed under Apache License 2.0:
   - form_urlencoded 1.2.2 <https://github.com/servo/rust-url>
   - futures-lite 2.6.1 <https://github.com/smol-rs/futures-lite>
   - futures-timer 3.0.4 <https://github.com/async-rs/futures-timer>
+  - gherkin 0.16.0 <https://github.com/cucumber-rs/gherkin>
   - gimli 0.32.3 <https://github.com/gimli-rs/gimli>
   - glob 0.3.3 <https://github.com/rust-lang/glob>
   - hashbrown 0.15.5 <https://github.com/rust-lang/hashbrown>
@@ -5624,6 +5637,7 @@ The following component(s) are licensed under Apache License 2.0:
   - security-framework 2.11.1 <https://github.com/kornelski/rust-security-framework>
   - security-framework 3.7.0 <https://github.com/kornelski/rust-security-framework>
   - serde_with 3.21.0 <https://github.com/jonasbb/serde_with/>
+  - serde_with_macros 3.21.0 <https://github.com/jonasbb/serde_with/>
   - signal-hook-mio 0.2.5 <https://github.com/vorner/signal-hook>
   - signal-hook-registry 1.4.8 <https://github.com/vorner/signal-hook>
   - signal-hook 0.3.18 <https://github.com/vorner/signal-hook>
@@ -5631,17 +5645,21 @@ The following component(s) are licensed under Apache License 2.0:
   - smallvec 1.15.2 <https://github.com/servo/rust-smallvec>
   - socket2 0.6.4 <https://github.com/rust-lang/socket2>
   - stable_deref_trait 1.2.1 <https://github.com/storyyeller/stable_deref_trait>
+  - symlink 0.1.0 <https://gitlab.com/chris-morgan/symlink>
   - system-configuration-sys 0.6.0 <https://github.com/mullvad/system-configuration-rs>
   - system-configuration 0.7.0 <https://github.com/mullvad/system-configuration-rs>
   - tar 0.4.46 <https://github.com/composefs/tar-rs>
   - tempfile 3.27.0 <https://github.com/Stebalien/tempfile>
   - thread_local 1.1.9 <https://github.com/Amanieu/thread_local-rs>
+  - typed-builder-macro 0.23.2 <https://github.com/idanarye/rust-typed-builder>
+  - typed-builder 0.23.2 <https://github.com/idanarye/rust-typed-builder>
   - unicase 2.9.0 <https://github.com/seanmonstar/unicase>
   - unicode-segmentation 1.13.3 <https://github.com/unicode-rs/unicode-segmentation>
   - unicode-truncate 1.1.0 <https://github.com/Aetf/unicode-truncate>
   - unicode-truncate 2.0.1 <https://github.com/Aetf/unicode-truncate>
   - unicode-width 0.1.14 <https://github.com/unicode-rs/unicode-width>
   - unicode-width 0.2.0 <https://github.com/unicode-rs/unicode-width>
+  - unicode-xid 0.2.6 <https://github.com/unicode-rs/unicode-xid>
   - url 2.5.8 <https://github.com/servo/rust-url>
   - uuid 1.23.3 <https://github.com/uuid-rs/uuid>
   - wasi 0.11.1+wasi-snapshot-preview1 <https://github.com/bytecodealliance/wasi>
@@ -5861,6 +5879,7 @@ Apache License 2.0
 ================================================================================
 
 The following component(s) are licensed under Apache License 2.0:
+  - linked-hash-map 0.5.6 <https://github.com/contain-rs/linked-hash-map>
   - minimal-lexical 0.2.1 <https://github.com/Alexhuszagh/minimal-lexical>
 
                               Apache License
@@ -7707,6 +7726,7 @@ The following component(s) are licensed under Apache License 2.0:
   - async-trait 0.1.89 <https://github.com/dtolnay/async-trait>
   - aws-lc-sys 0.41.0 <https://github.com/aws/aws-lc-rs>
   - bollard-stubs 1.45.0-rc.26.0.1
+  - cucumber-codegen 0.23.0 <https://github.com/cucumber-rs/cucumber>
   - directories 6.0.0 <https://github.com/soc/directories-rs>
   - dirs-sys 0.5.0 <https://github.com/dirs-dev/dirs-sys-rs>
   - dirs 6.0.0 <https://github.com/soc/dirs-rs>
@@ -7716,12 +7736,15 @@ The following component(s) are licensed under Apache License 2.0:
   - ident_case 1.0.1 <https://github.com/TedDriggs/ident_case>
   - indenter 0.3.4 <https://github.com/yaahc/indenter>
   - indoc 2.0.7 <https://github.com/dtolnay/indoc>
+  - inventory 0.3.24 <https://github.com/dtolnay/inventory>
   - itoa 1.0.18 <https://github.com/dtolnay/itoa>
   - jni-macros 0.22.4 <https://github.com/jni-rs/jni-rs>
   - jni-sys-macros 0.4.1 <https://github.com/jni-rs/jni-sys>
   - jni 0.22.4 <https://github.com/jni-rs/jni-rs>
   - libc 0.2.186 <https://github.com/rust-lang/libc>
   - litrs 1.0.0 <https://github.com/LukasKalbertodt/litrs>
+  - maud 0.27.0 <https://github.com/lambda-fairy/maud>
+  - maud_macros 0.27.0 <https://github.com/lambda-fairy/maud>
   - miniz_oxide 0.8.9 <https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide>
   - num-conv 0.2.2 <https://github.com/jhpratt/num-conv>
   - objc2-core-foundation 0.3.2 <https://github.com/madsmtm/objc2>
@@ -7729,6 +7752,7 @@ The following component(s) are licensed under Apache License 2.0:
   - pin-project-internal 1.1.13 <https://github.com/taiki-e/pin-project>
   - pin-project-lite 0.2.17 <https://github.com/taiki-e/pin-project-lite>
   - pin-project 1.1.13 <https://github.com/taiki-e/pin-project>
+  - proc-macro2-diagnostics 0.10.1 <https://github.com/SergioBenitez/proc-macro2-diagnostics>
   - proc-macro2 1.0.106 <https://github.com/dtolnay/proc-macro2>
   - quote 1.0.46 <https://github.com/dtolnay/quote>
   - r-efi 6.0.0 <https://github.com/r-efi/r-efi>
@@ -7757,6 +7781,7 @@ The following component(s) are licensed under Apache License 2.0:
   - thiserror 1.0.69 <https://github.com/dtolnay/thiserror>
   - thiserror 2.0.18 <https://github.com/dtolnay/thiserror>
   - time-core 0.1.9 <https://github.com/time-rs/time>
+  - time-macros 0.2.30 <https://github.com/time-rs/time>
   - time 0.3.51 <https://github.com/time-rs/time>
   - unicode-ident 1.0.24 <https://github.com/dtolnay/unicode-ident>
   - utf8parse 0.2.2 <https://github.com/alacritty/vte>
@@ -8089,6 +8114,24 @@ limitations under the License.
 
 
 ================================================================================
+BSD 2-Clause "Simplified" License
+================================================================================
+
+The following component(s) are licensed under BSD 2-Clause "Simplified" License:
+  - Inflector 0.11.4 <https://github.com/whatisinternet/inflector>
+
+Copyright (c) <year> <owner> 
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+================================================================================
 BSD 3-Clause "New" or "Revised" License
 ================================================================================
 
@@ -8217,6 +8260,136 @@ SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
 CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+================================================================================
+Blue Oak Model License 1.0.0
+================================================================================
+
+The following component(s) are licensed under Blue Oak Model License 1.0.0:
+  - synthez-codegen 0.4.0 <https://github.com/arcane-rs/synthez/tree/main/codegen>
+  - synthez-core 0.4.0 <https://github.com/arcane-rs/synthez/tree/main/core>
+
+# Blue Oak Model License
+
+Version 1.0.0
+
+## Purpose
+
+This license gives everyone as much permission to work with
+this software as possible, while protecting contributors
+from liability.
+
+## Acceptance
+
+In order to receive this license, you must agree to its
+rules.  The rules of this license are both obligations
+under that agreement and conditions to your license.
+You must not do anything with this software that triggers
+a rule that you cannot or will not follow.
+
+## Copyright
+
+Each contributor licenses you to do everything with this
+software that would otherwise infringe that contributor's
+copyright in it.
+
+## Notices
+
+You must ensure that everyone who gets a copy of
+any part of this software from you, with or without
+changes, also gets the text of this license or a link to
+<https://blueoakcouncil.org/license/1.0.0>.
+
+## Excuse
+
+If anyone notifies you in writing that you have not
+complied with [Notices](#notices), you can keep your
+license by taking all practical steps to comply within 30
+days after the notice.  If you do not do so, your license
+ends immediately.
+
+## Patent
+
+Each contributor licenses you to do everything with this
+software that would otherwise infringe any patent claims
+they can license or become able to license.
+
+## Reliability
+
+No contributor can revoke this license.
+
+## No Liability
+
+***As far as the law allows, this software comes as is,
+without any warranty or condition, and no contributor
+will be liable to anyone for any damages related to this
+software or this license, under any kind of legal claim.***
+
+
+================================================================================
+Blue Oak Model License 1.0.0
+================================================================================
+
+The following component(s) are licensed under Blue Oak Model License 1.0.0:
+  - synthez 0.4.0 <https://github.com/arcane-rs/synthez>
+
+Blue Oak Model License
+======================
+
+Version 1.0.0
+
+## Purpose
+
+This license gives everyone as much permission to work with
+this software as possible, while protecting contributors
+from liability.
+
+## Acceptance
+
+In order to receive this license, you must agree to its
+rules. The rules of this license are both obligations
+under that agreement and conditions to your license.
+You must not do anything with this software that triggers
+a rule that you cannot or will not follow.
+
+## Copyright
+
+Each contributor licenses you to do everything with this
+software that would otherwise infringe that contributor's
+copyright in it.
+
+## Notices
+
+You must ensure that everyone who gets a copy of
+any part of this software from you, with or without
+changes, also gets the text of this license or a link to
+<https://blueoakcouncil.org/license/1.0.0>.
+
+## Excuse
+
+If anyone notifies you in writing that you have not
+complied with [Notices](#notices), you can keep your
+license by taking all practical steps to comply within 30
+days after the notice.  If you do not do so, your license
+ends immediately.
+
+## Patent
+
+Each contributor licenses you to do everything with this
+software that would otherwise infringe any patent claims
+they can license or become able to license.
+
+## Reliability
+
+No contributor can revoke this license.
+
+## No Liability
+
+***As far as the law allows, this software comes as is,
+without any warranty or condition, and no contributor
+will be liable to anyone for any damages related to this
+software or this license, under any kind of legal claim.***
 
 
 ================================================================================
@@ -8447,6 +8620,40 @@ MIT License
 ================================================================================
 
 The following component(s) are licensed under MIT License:
+  - peg 0.6.3 <https://github.com/kevinmehall/rust-peg>
+
+Copyright (C) 2013 Kevin Mehall
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+================================================================================
+MIT License
+================================================================================
+
+The following component(s) are licensed under MIT License:
   - mio 1.2.1 <https://github.com/tokio-rs/mio>
 
 Copyright (c) 2014 Carl Lerche and other MIO contributors
@@ -8476,6 +8683,7 @@ MIT License
 
 The following component(s) are licensed under MIT License:
   - nom 7.1.3 <https://github.com/Geal/nom>
+  - nom 8.0.0 <https://github.com/rust-bakery/nom>
 
 Copyright (c) 2014-2019 Geoffroy Couprie
 
@@ -8610,6 +8818,36 @@ MIT License
 ================================================================================
 
 The following component(s) are licensed under MIT License:
+  - inflections 1.1.1 <https://docs.rs/inflections>
+
+Copyright (c) 2016 Caleb Meredith
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be included
+in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+================================================================================
+MIT License
+================================================================================
+
+The following component(s) are licensed under MIT License:
+  - globwalk 0.9.1 <https://github.com/gilnaa/globwalk>
   - memoffset 0.9.1 <https://github.com/Gilnaa/memoffset>
 
 Copyright (c) 2017 Gilad Naaman
@@ -8705,6 +8943,40 @@ The following component(s) are licensed under MIT License:
   - bytes 1.12.0 <https://github.com/tokio-rs/bytes>
 
 Copyright (c) 2018 Carl Lerche
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+================================================================================
+MIT License
+================================================================================
+
+The following component(s) are licensed under MIT License:
+  - junit-report 0.9.0 <https://github.com/bachp/junit-report-rs>
+
+Copyright (c) 2018 Pascal Bach <pascal.bach@nextrem.ch>
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -8885,6 +9157,7 @@ MIT License
 ================================================================================
 
 The following component(s) are licensed under MIT License:
+  - tracing-appender 0.2.5 <https://github.com/tokio-rs/tracing>
   - tracing-attributes 0.1.31 <https://github.com/tokio-rs/tracing>
   - tracing-core 0.1.36 <https://github.com/tokio-rs/tracing>
   - tracing-error 0.2.1 <https://github.com/tokio-rs/tracing>
@@ -9225,6 +9498,34 @@ MIT License
 ================================================================================
 
 The following component(s) are licensed under MIT License:
+  - nom_locate 5.0.0 <https://github.com/fflorent/nom_locate>
+
+Copyright 2017-2019 Florent Fayolle, Valentin Lorentz
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+================================================================================
+MIT License
+================================================================================
+
+The following component(s) are licensed under MIT License:
   - lru 0.12.5 <https://github.com/jeromefroe/lru-rs.git>
   - lru 0.18.0 <https://github.com/jeromefroe/lru-rs.git>
 
@@ -9249,6 +9550,96 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+================================================================================
+MIT License
+================================================================================
+
+The following component(s) are licensed under MIT License:
+  - textwrap 0.16.2 <https://github.com/mgeisler/textwrap>
+
+MIT License
+
+Copyright (c) 2016 Martin Geisler
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+================================================================================
+MIT License
+================================================================================
+
+The following component(s) are licensed under MIT License:
+  - smart-default 0.7.1 <https://github.com/idanarye/rust-smart-default>
+
+MIT License
+
+Copyright (c) 2017 Idan Arye
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+================================================================================
+MIT License
+================================================================================
+
+The following component(s) are licensed under MIT License:
+  - smawk 0.3.3 <https://github.com/mgeisler/smawk>
+
+MIT License
+
+Copyright (c) 2017 Martin Geisler
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
 
 ================================================================================
 MIT License
@@ -9538,6 +9929,36 @@ MIT License
 ================================================================================
 
 The following component(s) are licensed under MIT License:
+  - derive-getters 0.5.0 <https://git.sr.ht/~kvsari/derive-getters>
+
+MIT License
+
+Copyright (c) 2021 Stephan Luther
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+================================================================================
+MIT License
+================================================================================
+
+The following component(s) are licensed under MIT License:
   - castaway 0.2.4 <https://github.com/sagebind/castaway>
 
 MIT License
@@ -9660,6 +10081,8 @@ The following component(s) are licensed under MIT License:
   - async-stream-impl 0.3.6 <https://github.com/tokio-rs/async-stream>
   - async-stream 0.3.6 <https://github.com/tokio-rs/async-stream>
   - libm 0.2.16 <https://github.com/rust-lang/compiler-builtins>
+  - peg-macros 0.6.3 <https://github.com/kevinmehall/rust-peg>
+  - peg-runtime 0.6.3 <https://github.com/kevinmehall/rust-peg>
 
 MIT License
 
@@ -9874,7 +10297,10 @@ The following component(s) are licensed under MIT License:
   - byteorder 1.5.0 <https://github.com/BurntSushi/byteorder>
   - csv-core 0.1.13 <https://github.com/BurntSushi/rust-csv>
   - csv 1.4.0 <https://github.com/BurntSushi/rust-csv>
+  - globset 0.4.18 <https://github.com/BurntSushi/ripgrep/tree/master/crates/globset>
+  - ignore 0.4.27 <https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore>
   - memchr 2.8.2 <https://github.com/BurntSushi/memchr>
+  - walkdir 2.5.0 <https://github.com/BurntSushi/walkdir>
 
 The MIT License (MIT)
 
@@ -10125,6 +10551,68 @@ MIT License
 ================================================================================
 
 The following component(s) are licensed under MIT License:
+  - same-file 1.0.6 <https://github.com/BurntSushi/same-file>
+  - winapi-util 0.1.11 <https://github.com/BurntSushi/winapi-util>
+
+The MIT License (MIT)
+
+Copyright (c) 2017 Andrew Gallant
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+
+================================================================================
+MIT License
+================================================================================
+
+The following component(s) are licensed under MIT License:
+  - console 0.16.4 <https://github.com/console-rs/console>
+
+The MIT License (MIT)
+
+Copyright (c) 2017 Armin Ronacher <armin.ronacher@active-4.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+
+================================================================================
+MIT License
+================================================================================
+
+The following component(s) are licensed under MIT License:
   - redox_users 0.5.2 <https://gitlab.redox-os.org/redox-os/users>
 
 The MIT License (MIT)
@@ -10241,6 +10729,38 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+================================================================================
+MIT License
+================================================================================
+
+The following component(s) are licensed under MIT License:
+  - quick-xml 0.39.4 <https://github.com/tafia/quick-xml>
+
+The MIT License (MIT)
+
+Copyright (c) 2016 Johann Tuffe
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
 
 ================================================================================
 Mozilla Public License 2.0

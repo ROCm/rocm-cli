@@ -1,0 +1,32 @@
+[package]
+name = "e2e-cucumber"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+axum.workspace = true
+cucumber = { version = "0.23", features = ["output-json", "output-junit"] }
+e2e-report = { path = "../../crates/e2e-report" }
+reqwest = { version = "0.13", features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
+tempfile = "3"
+tokio.workspace = true
+toml = "0.8"
+
+[[test]]
+name = "e2e"
+harness = false
+# The suite drives the real `rocm` binary (installs, GPU probes, a mock server)
+# and is meant to run only via `cargo xtask e2e` on Linux. Exclude it from the
+# default test set so `cargo test`/`--all-targets` (e.g. the Windows job) and
+# `cargo nextest` skip it — they would otherwise run every scenario unfiltered
+# with no mock and fail. `xtask e2e`'s explicit `--test e2e` still runs it.
+test = false

@@ -83,11 +83,7 @@ fn main() -> anyhow::Result<()> {
         .count();
     eprintln!("  {total_snaps} snapshots in timeline");
 
-    let mut state = AppState::new("demo-mi355x-01".into(), "default-dark".into());
-    state.conn = ConnState::Connected {
-        host: "demo-mi355x-01".into(),
-        version: "0.1.0".into(),
-    };
+    let mut state = build_state();
 
     // Replay cursor: `cursor` indexes into `entries`, `snaps_applied` counts
     // snapshot events consumed so the storyboard can target a timeline depth.
@@ -207,6 +203,19 @@ impl Replay<'_> {
 
 /// Render the current `AppState` to a `TestBackend` buffer and convert it to a
 /// truecolor ANSI frame. Mirrors `gen_screenshots::render_to_svg`.
+/// Base state for the cast: a connected view over a synthetic session. Marked
+/// simulated so the SIMULATED DATA chrome renders and the recording never
+/// presents the telemetry as live.
+fn build_state() -> AppState {
+    let mut state = AppState::new("demo-mi355x-01".into(), "default-dark".into());
+    state.conn = ConnState::Connected {
+        host: "demo-mi355x-01".into(),
+        version: "0.1.0".into(),
+    };
+    state.simulated = true;
+    state
+}
+
 fn capture(state: &mut AppState, cols: u16, rows: u16) -> anyhow::Result<String> {
     let backend = TestBackend::new(cols, rows);
     let mut terminal = Terminal::new(backend)?;
@@ -350,5 +359,21 @@ const fn resolve_color(c: Option<Color>, default: (u8, u8, u8)) -> (u8, u8, u8) 
         Some(Color::LightMagenta) => (173, 127, 168),
         Some(Color::LightCyan) => (52, 226, 226),
         _ => default,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_cast_is_marked_simulated() {
+        let mut state = build_state();
+        assert!(state.simulated, "cast state must be marked simulated");
+        let ansi = capture(&mut state, 160, 44).expect("capture frame");
+        assert!(
+            ansi.contains("SIMULATED DATA"),
+            "cast frame must carry the SIMULATED marker"
+        );
     }
 }

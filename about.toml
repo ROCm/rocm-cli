@@ -25,6 +25,7 @@ accepted = [
     "Unlicense",
     "WTFPL",
     "CDLA-Permissive-2.0",
+    "BlueOak-1.0.0",
 ]
 
 # First-party workspace crates are not third-party components; exclude them.
@@ -34,3 +35,15 @@ private = { ignore = true }
 # they are not third-party components of the distribution.
 ignore-build-dependencies = true
 ignore-dev-dependencies = true
+
+# ureq is dual-licensed "MIT OR Apache-2.0". cargo-about's pick between ureq's
+# two bundled license files is not stable across environments (filesystem read
+# order), so a notice generated on one machine can fail the CI regenerate-and-
+# compare check on another. Clarify ureq to Apache-2.0 (the license the
+# committed notice — and main — already use) with the file as source of truth,
+# so every environment resolves ureq identically.
+[ureq.clarify]
+license = "Apache-2.0"
+[[ureq.clarify.files]]
+path = "LICENSE-APACHE"
+checksum = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"

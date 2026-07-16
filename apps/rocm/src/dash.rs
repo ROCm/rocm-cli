@@ -14,7 +14,7 @@
 //! The rest of `rocm` is synchronous; the async daemon/TUI run on a tokio
 //! runtime built here. The TUI lives entirely in the `rocm-dash-tui` crate.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -214,14 +214,84 @@ fn build_dashboard_runtime() -> Result<tokio::runtime::Runtime> {
         .context("building tokio runtime for the dashboard")
 }
 
+/// Compute a private, per-run path for a `--demo` session file.
+///
+/// Written under the per-user data dir (`{data_dir}/demo`, created `0o700` on
+/// Unix), never a fixed name in the world-shared temp dir. The name is unique
+/// per run, not secret — confidentiality rests on the `0o700` dir / `0o600` file
+/// permissions (the file is created `0o600` by `demo::generate_file`). Stale
+/// sessions are pruned so the directory does not accumulate.
+fn demo_session_path(paths: &AppPaths) -> Result<PathBuf> {
+    let dir = paths.data_dir.join("demo");
+    create_private_dir(&dir)?;
+    let file = format!(
+        "session-{}-{}.ndjson",
+        std::process::id(),
+        rocm_core::unix_time_millis()
+    );
+    let target = dir.join(file);
+    prune_stale_demo_sessions(&dir, &target);
+    Ok(target)
+}
+
+/// Create `dir` restricted to the owner (`0o700`) on Unix. `DirBuilder::mode`
+/// applies at creation so there is no umask window; a pre-existing directory is
+/// tightened best-effort afterward (matching `server.rs`/`agent.rs`).
+#[cfg(unix)]
+fn create_private_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("creating demo session dir {}", dir.display()))?;
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("creating demo session dir {}", dir.display()))
+}
+
+/// Best-effort prune of old demo sessions so the directory stays bounded,
+/// without deleting a session a concurrent `rocm dash --demo` may be replaying:
+/// the file we are about to write and any file modified in the last hour are
+/// kept.
+fn prune_stale_demo_sessions(dir: &Path, keep: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == *keep || path.extension().and_then(|e| e.to_str()) != Some("ndjson") {
+            continue;
+        }
+        let recently_touched = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .is_some_and(|age| age < std::time::Duration::from_hours(1));
+        if recently_touched {
+            continue;
+        }
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Entry point for `rocm dash`. Builds a tokio runtime and runs the dashboard.
 pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths)?;
-    // `--demo` writes a deterministic synthetic session and replays it, so the
-    // dashboard shows populated data with no GPU and no daemon.
+    // `--demo` writes a synthetic session and replays it, so the dashboard shows
+    // populated data with no GPU and no daemon. The session is written under the
+    // per-user data dir with an unpredictable name (not a fixed world-shared
+    // temp path) and created `0o600` by `demo::generate_file`.
     let replay = if demo {
-        let path = std::env::temp_dir().join("rocm-dash-demo.ndjson");
+        let path = demo_session_path(&paths)?;
         rocm_dash_daemon::demo::generate_file(
             &rocm_dash_daemon::demo::DemoOptions::default(),
             &path,
@@ -455,6 +525,57 @@ mod tests {
         assert_eq!(opts.services_dir, Some(p.services_dir()));
         assert_eq!(opts.persist_dir, Some(p.telemetry_state_dir()));
         assert!(!opts.enable_docker);
+    }
+
+    #[test]
+    fn demo_session_path_is_private_and_unique() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-demo-test-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        let p = AppPaths {
+            config_dir: root.join("cfg"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+
+        let path = demo_session_path(&p).expect("demo session path");
+
+        // Under the per-user data dir, never the shared temp dir with a fixed name.
+        assert!(
+            path.starts_with(p.data_dir.join("demo")),
+            "demo file must live under the data dir: {}",
+            path.display()
+        );
+        assert_ne!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("rocm-dash-demo.ndjson"),
+            "demo file name must not be the old predictable shared-temp name"
+        );
+
+        // The generated file is created private to the owner.
+        rocm_dash_daemon::demo::generate_file(
+            &rocm_dash_daemon::demo::DemoOptions::default(),
+            &path,
+        )
+        .expect("generate demo session");
+        assert!(path.exists(), "demo session file should exist");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(file_mode, 0o600, "demo session file must be 0o600");
+            let dir_mode = std::fs::metadata(p.data_dir.join("demo"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700, "demo dir must be 0o700");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

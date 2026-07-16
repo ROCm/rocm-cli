@@ -130,7 +130,7 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         "Serving actions",
         VERBS,
         state.serving_sel,
-        state.pane_focus,
+        state,
         theme,
     );
 }
@@ -175,6 +175,35 @@ mod tests {
         }
         // The display-only row carries its `soon` badge.
         assert!(out.contains("soon"), "optimize soon badge missing: {out:?}");
+    }
+
+    #[test]
+    fn serving_detail_lists_running_instances_inline() {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Serving;
+        s.serving_sel = 2; // "Running instances/services" → OpenServices
+        s.instances.insert(
+            "vllm-1".into(),
+            Instance {
+                container_name: "vllm-1".into(),
+                model_name: "Llama-3.1-8B".into(),
+                status: InstanceStatus::Running,
+                port: Some(8000),
+                ..Default::default()
+            },
+        );
+        let out = render(&s, 120, 28);
+        // The running instance is shown inline in the detail pane — no popup.
+        assert!(
+            out.contains("Running now"),
+            "live running header missing: {out:?}"
+        );
+        assert!(
+            out.contains("Llama-3.1-8B"),
+            "running model not shown inline: {out:?}"
+        );
+        assert!(out.contains("8000"), "running port not shown: {out:?}");
     }
 
     #[test]
