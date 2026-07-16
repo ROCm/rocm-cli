@@ -4026,6 +4026,23 @@ fn serve(args: ServeArgs) -> Result<()> {
     // surface the explicit `--gpu` as ignored rather than printing a device the
     // server will not use.
     let cpu_only = matches!(device_policy, DevicePolicy::CpuOnly);
+    // Fail fast under a GPU-required policy when the host has no usable AMD GPU,
+    // BEFORE preparing or launching any engine (no wasted engine download, and an
+    // actionable message instead of a late engine crash). The engine enforces the
+    // same rule as a backstop. Skipped for cpu_only; permissive when availability
+    // cannot be probed on this platform (probe returns `None`).
+    if !cpu_only
+        && let Some(usable) = rocm_core::usable_amd_gpu_indices()
+        && usable.is_empty()
+    {
+        bail!(
+            "no usable AMD GPU detected; `rocm serve` requires a GPU under the {policy} \
+             policy and does not fall back to CPU. Check the driver with `rocm examine`, \
+             confirm /dev/kfd is present, and ensure HIP_VISIBLE_DEVICES / \
+             ROCR_VISIBLE_DEVICES are not masking every device.",
+            policy = device_policy_name(&device_policy)
+        );
+    }
     // `--gpu` selects by the amd-smi `gpu` ordinal but is exported via
     // `HIP_VISIBLE_DEVICES`; those orderings can diverge when
     // `ROCR_VISIBLE_DEVICES`/partitioning is in play, so warn at serve time.

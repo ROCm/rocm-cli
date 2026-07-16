@@ -23,6 +23,7 @@ const ID_PREFIX: &str = "id:";
 const REQUIRES_ENGINE_PREFIX: &str = "requires-engine:";
 const REQUIRES_OS_PREFIX: &str = "requires-os:";
 const REQUIRES_GPU_TAG: &str = "requires-gpu";
+const REQUIRES_NO_GPU_TAG: &str = "requires-no-gpu";
 const SERVE_TIMEOUT_PREFIX: &str = "serve-timeout:";
 const NIGHTLY_TAG: &str = "nightly";
 
@@ -43,6 +44,11 @@ pub enum Expectation {
 pub struct ScenarioDecl {
     pub id: Option<String>,
     pub requires_gpu: bool,
+    /// `@requires-no-gpu`: the scenario's premise is a host with NO usable AMD GPU
+    /// (e.g. a GPU-required serve must fail fast). Skipped on any host that has a
+    /// GPU — the inverse of `requires_gpu`. This is how the no-GPU fail-fast path
+    /// gets live coverage: it runs on the GitHub-hosted mock job.
+    pub requires_no_gpu: bool,
     /// Engine the scenario pins via `@requires-engine:<e>` (if any).
     pub requires_engine: Option<String>,
     /// OS the scenario requires via `@requires-os:<os>` (e.g. "linux"), if any —
@@ -66,6 +72,7 @@ impl ScenarioDecl {
     pub fn from_tags<S: AsRef<str>>(tags: &[S]) -> Self {
         let mut id = None;
         let mut requires_gpu = false;
+        let mut requires_no_gpu = false;
         let mut requires_engine = None;
         let mut requires_os = None;
         let mut serve_timeout_secs = None;
@@ -82,6 +89,8 @@ impl ScenarioDecl {
                 serve_timeout_secs = rest.parse::<u64>().ok();
             } else if tag == REQUIRES_GPU_TAG {
                 requires_gpu = true;
+            } else if tag == REQUIRES_NO_GPU_TAG {
+                requires_no_gpu = true;
             } else if tag == NIGHTLY_TAG {
                 nightly = true;
             }
@@ -89,6 +98,7 @@ impl ScenarioDecl {
         Self {
             id,
             requires_gpu,
+            requires_no_gpu,
             requires_engine,
             requires_os,
             serve_timeout_secs,
@@ -281,6 +291,11 @@ pub fn resolve(
     if decl.requires_gpu && !cap.has_amd_gpu {
         return Expectation::Skip {
             reason: "requires an AMD GPU; none detected on this host".to_owned(),
+        };
+    }
+    if decl.requires_no_gpu && cap.has_amd_gpu {
+        return Expectation::Skip {
+            reason: "requires a host with no AMD GPU; this host has one".to_owned(),
         };
     }
     if let Some(os) = &decl.requires_os
@@ -501,6 +516,26 @@ serve_timeout_secs = 90
         let d = decl(&["id:serve-default-engine-inference", "requires-gpu"]);
         assert!(matches!(
             resolve(&d, &cap("mock"), &m, false),
+            Expectation::Skip { .. }
+        ));
+    }
+
+    #[test]
+    fn requires_no_gpu_runs_only_on_hosts_without_a_gpu() {
+        let m = Expectations::default();
+        let d = decl(&["id:serve-no-gpu-fails-fast", "requires-no-gpu"]);
+        // The mock host has no AMD GPU → the no-GPU premise applies → runs.
+        assert_eq!(
+            resolve(&d, &cap("mock"), &m, false),
+            Expectation::ExpectPass
+        );
+        // Every GPU host skips it — the premise can't hold there.
+        assert!(matches!(
+            resolve(&d, &cap("mi300x"), &m, false),
+            Expectation::Skip { .. }
+        ));
+        assert!(matches!(
+            resolve(&d, &cap("strix-ubuntu"), &m, false),
             Expectation::Skip { .. }
         ));
     }

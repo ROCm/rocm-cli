@@ -398,6 +398,37 @@ pub fn run_rocm(world: &E2eWorld, args: &[&str]) -> (String, String, i32) {
     )
 }
 
+/// Like [`run_rocm`], but with extra environment variables set on the child.
+///
+/// Used by scenarios that must control the device environment the CLI and engine
+/// see — e.g. masking every GPU via `HIP_VISIBLE_DEVICES=""` to prove a
+/// GPU-required serve is refused. The vars are applied on top of the scenario's
+/// isolated config/data/cache env.
+pub fn run_rocm_with_env(
+    world: &E2eWorld,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> (String, String, i32) {
+    let binary = rocm_binary();
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(args);
+    world.isolate_cmd(&mut cmd);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    let rc = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    record_command(world.current_scenario.as_deref(), args, rc, &stdout);
+    (
+        stdout,
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        rc,
+    )
+}
+
 /// Append one `rocm` invocation to `results/commands.jsonl` so the consolidated
 /// report can build a command × platform coverage table tied to real results.
 /// Best-effort: a recording failure must never fail a scenario.
