@@ -5,7 +5,7 @@
 **Stage:** 0-idea
 **Pipeline:** standard
 **Branch:** fix-speed-up-e2e
-**Last Updated:** 2026-07-16
+**Last Updated:** 2026-07-16 (idle flush)
 
 **Token Usage:** in=672 out=192360 cache_create=1039992 cache_read=61298581 calls=338
 
@@ -155,7 +155,7 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persiste-app-dev-c
 
 ## Work Log
 
-### 2026-07-16 (idle flush)
+### 2026-07-16 (idle flush) — *auto-flush*
 
 - **Session idle for 10 minutes, auto-flushing WIP state.**
 
