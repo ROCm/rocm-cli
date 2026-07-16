@@ -448,7 +448,7 @@ pub async fn run_loop(
                             // Prometheus scrape is the first hard evidence the
                             // instance is actually serving requests, so promote
                             // it to `Ready` here.
-                            if inst.status == InstanceStatus::Starting {
+                            if matches!(inst.status, InstanceStatus::Starting { .. }) {
                                 inst.status = InstanceStatus::Ready;
                             }
                             runner.state.apply(StateEvent::InstanceUpserted(inst));
@@ -502,7 +502,7 @@ pub async fn run_loop(
                         // See the vLLM scrape-success handler above: a
                         // successful stats fetch is proof the Lemonade
                         // instance is serving, so promote it out of Starting.
-                        if inst.status == InstanceStatus::Starting {
+                        if matches!(inst.status, InstanceStatus::Starting { .. }) {
                             inst.status = InstanceStatus::Ready;
                         }
                         runner.state.apply(StateEvent::InstanceUpserted(inst));

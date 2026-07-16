@@ -10,7 +10,12 @@ use serde::{Deserialize, Serialize};
 use crate::bench_schema::BenchmarkRow;
 use crate::metrics::{Instance, Snapshot};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+// Bumped for the `InstanceStatus::Starting` shape change (unit variant ->
+// `{ phase: Option<StartupPhase> }`): the external-tag JSON for
+// `Event::InstanceDiscovered`/`Snapshot` changes from the string `"Starting"`
+// to an object `{"Starting":{"phase":...}}`, which a client on the previous
+// version cannot deserialize.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Sent by the TUI to the daemon. One per line.
 #[derive(Debug, Clone, Serialize, Deserialize)]

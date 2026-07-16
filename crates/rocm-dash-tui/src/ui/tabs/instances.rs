@@ -299,14 +299,15 @@ const fn status_meta(
     status: InstanceStatus,
     theme: &Theme,
 ) -> (ratatui::style::Color, &'static str) {
-    match status {
-        InstanceStatus::Running => (theme.ok, "RUNNING"),
-        InstanceStatus::Ready => (theme.ok, "READY"),
-        InstanceStatus::Starting => (theme.warn, "STARTING"),
-        InstanceStatus::Stopped => (theme.err, "STOPPED"),
-        InstanceStatus::Error => (theme.err, "ERROR"),
-        InstanceStatus::Unknown => (theme.muted, "UNKNOWN"),
-    }
+    // The text label (incl. the DOWNLOADING/LOADING/WARMUP startup phases) is
+    // owned by `InstanceStatus::label`; only the color is chosen here.
+    let color = match status {
+        InstanceStatus::Ready | InstanceStatus::Running => theme.ok,
+        InstanceStatus::Starting { .. } => theme.warn,
+        InstanceStatus::Stopped | InstanceStatus::Error => theme.err,
+        InstanceStatus::Unknown => theme.muted,
+    };
+    (color, status.label())
 }
 
 /// Map an instance status to a bento box role so unselected cards take a
@@ -314,7 +315,7 @@ const fn status_meta(
 const fn status_role(status: InstanceStatus) -> BoxRole {
     match status {
         InstanceStatus::Running | InstanceStatus::Ready => BoxRole::Success,
-        InstanceStatus::Starting => BoxRole::Warning,
+        InstanceStatus::Starting { .. } => BoxRole::Warning,
         InstanceStatus::Stopped | InstanceStatus::Error => BoxRole::Danger,
         InstanceStatus::Unknown => BoxRole::Muted,
     }
@@ -799,7 +800,20 @@ mod tests {
     fn status_meta_maps_each_variant() {
         let theme = Theme::default_dark();
         assert_eq!(status_meta(InstanceStatus::Running, &theme).1, "RUNNING");
-        assert_eq!(status_meta(InstanceStatus::Starting, &theme).1, "STARTING");
+        assert_eq!(
+            status_meta(InstanceStatus::Starting { phase: None }, &theme).1,
+            "STARTING"
+        );
+        assert_eq!(
+            status_meta(
+                InstanceStatus::Starting {
+                    phase: Some(rocm_dash_core::metrics::StartupPhase::Downloading)
+                },
+                &theme
+            )
+            .1,
+            "DOWNLOADING"
+        );
         assert_eq!(status_meta(InstanceStatus::Stopped, &theme).1, "STOPPED");
         assert_eq!(status_meta(InstanceStatus::Error, &theme).1, "ERROR");
         assert_eq!(status_meta(InstanceStatus::Unknown, &theme).1, "UNKNOWN");
