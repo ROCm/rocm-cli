@@ -147,6 +147,18 @@ jobs:
 
   build-and-test:
     runs-on: ubuntu-latest
+    # sccache caches each rustc invocation (keyed by source + deps + flags) in the
+    # GitHub Actions cache, so unchanged workspace crates are restored instead of
+    # recompiled across runs. It layers on top of setup-rust-toolchain's rust-cache,
+    # which restores the registry and dependency target/ but deliberately does not
+    # cache workspace crates — the bulk of the build time here. rust-cache also sets
+    # CARGO_INCREMENTAL=0 (which sccache requires) for these steps. These env vars
+    # only take effect where the "Set up sccache" step and the cargo steps run
+    # (both gated on `heavy`), so a skipped/non-heavy run never invokes a missing
+    # sccache binary.
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
     needs: [changes, clippy, prek]
     # A manual E2E dispatch skips this heavy job for a fast loop; the E2E jobs
@@ -162,6 +174,13 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         if: needs.changes.outputs.heavy == 'true'
 
+      # Installs the sccache binary and wires it to the GitHub Actions cache
+      # backend. Runs AFTER setup-rust-toolchain so the wrapper is on PATH before
+      # the first cargo compile. Same `heavy` gate as the cargo steps below.
+      - name: Set up sccache
+        if: needs.changes.outputs.heavy == 'true'
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
       # Build the runtime binaries the smoke + acceptance steps below need (every
       # engine binary; smoke hard-fails on a missing one). Unit/integration tests
       # run in the dedicated `test` job on only the crates a change can affect;
@@ -170,6 +189,12 @@ jobs:
       - name: Build
         if: needs.changes.outputs.heavy == 'true'
         run: cargo build --workspace
+
+      # Surface the cache hit rate for the workspace compile so the effect is
+      # visible in the logs.
+      - name: sccache stats
+        if: needs.changes.outputs.heavy == 'true'
+        run: sccache --show-stats
 
       - name: Local no-fallback smoke
         if: needs.changes.outputs.heavy == 'true'
@@ -271,6 +296,14 @@ jobs:
     runs-on: windows-latest
     env:
       CARGO_INCREMENTAL: "0"
+      # Cache each rustc invocation across runs; the full-workspace build is the
+      # dominant cost on this runner and rust-cache does not cache workspace
+      # crates. CARGO_INCREMENTAL=0 above is required for (and assumed by) sccache.
+      # These vars only take effect where the "Set up sccache" step and the cargo
+      # steps run (both gated on `heavy`), so a non-heavy run never invokes a
+      # missing sccache binary.
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
     needs: [changes, clippy, prek]
     # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
@@ -283,6 +316,12 @@ jobs:
         with:
           cache-on-failure: true
 
+      # Installs sccache and wires it to the GitHub Actions cache. Runs after
+      # setup-rust-toolchain so the wrapper is on PATH before the first compile.
+      - name: Set up sccache
+        if: needs.changes.outputs.heavy == 'true'
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
       - name: Build
         if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
@@ -294,6 +333,13 @@ jobs:
         if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
         run: cargo test --workspace --all-targets
+
+      # Surface the cache hit rate for the workspace build/test so the effect is
+      # visible in the logs.
+      - name: sccache stats
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: sccache --show-stats
 
       - name: Local no-fallback smoke
         if: needs.changes.outputs.heavy == 'true'
@@ -363,6 +409,15 @@ jobs:
 
   clippy:
     runs-on: ubuntu-latest
+    # sccache caches each rustc invocation across runs (see build-and-test). clippy
+    # compiles the whole workspace with --all-targets, so it benefits too.
+    # rust-cache sets CARGO_INCREMENTAL=0 (required by sccache) for these steps.
+    # These vars only take effect where the "Set up sccache" step and the cargo
+    # steps run (both gated on `rust`), so a non-rust run never invokes a missing
+    # sccache binary.
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     needs: changes
     # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
     if: github.event_name != 'workflow_dispatch'
@@ -371,6 +426,12 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         if: needs.changes.outputs.rust == 'true'
+
+      # Installs sccache and wires it to the GitHub Actions cache. Runs after
+      # setup-rust-toolchain so the wrapper is on PATH before the first compile.
+      - name: Set up sccache
+        if: needs.changes.outputs.rust == 'true'
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
       - name: Clippy
         if: needs.changes.outputs.rust == 'true'
@@ -387,6 +448,12 @@ jobs:
       - name: MANIFEST.md dependency table is current
         if: needs.changes.outputs.rust == 'true'
         run: cargo xtask manifest --check
+
+      # Surface the cache hit rate for the clippy compile so the effect is visible
+      # in the logs.
+      - name: sccache stats
+        if: needs.changes.outputs.rust == 'true'
+        run: sccache --show-stats
 
   third-party-notices:
     name: Third-party notices current
