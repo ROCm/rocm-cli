@@ -5,9 +5,9 @@
 **Stage:** 0-idea
 **Pipeline:** standard
 **Branch:** fix-speed-up-e2e
-**Last Updated:** 2026-07-16 (idle flush)
+**Last Updated:** 2026-07-16
 
-**Token Usage:** in=306 out=95333 cache_create=376084 cache_read=18574529 calls=154
+**Token Usage:** in=390 out=106785 cache_create=408059 cache_read=25954676 calls=196
 
 ---
 
@@ -56,6 +56,7 @@ Scenario: [Abstract behavior description]
 ### Completed ✅
 - ✅ Task #1: Investigate Strix-Ubuntu ~262s timeout cluster — root cause found (hardcoded VRAM floor) and fixed.
 - ✅ Profile current E2E runtime from live CI run #29472891569 (baseline quantified: mock 7.6m / MI300X 8.0m / Strix-Windows 15.8m / Strix-Ubuntu 28.4m long pole).
+- ✅ Implement VRAM-floor fix: added device-total probe, scaled floor to `min(150_000, total*0.9)`, verified compile + arithmetic. Committed and pushed to origin/fix-speed-up-e2e (commit `122d2be`).
 
 ### In Progress ⏳
 - ⏳ Task #2: Rework per-PR vs nightly CI tiering to match P0/P1 plan.
@@ -111,4 +112,5 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persiste-app-dev-c
 - NOT yet verified on real GPU — behavioral confirmation needs a Strix-Ubuntu CI run (expect ~12 min saved on that lane). Compile + arithmetic verified only.
 - Moved to Task #2 (CI tiering). Note: EAI-7423 (lemonade-on-Strix-Linux serve fails at 90s) is a real bug separate from the VRAM-floor waste fix.
 
-**2026-07-16 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+- Committed VRAM-floor fix via `git-commit-with-fallback`, added DCO sign-off, all pre-push hooks passed (346 rocm-bin tests).
+- Pushed to origin; branch now tracking origin/fix-speed-up-e2e at commit `122d2be`.
