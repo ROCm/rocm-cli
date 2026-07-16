@@ -17,6 +17,19 @@ The E2E suite is slow enough to be a drag on the dev loop and on CI (self-hosted
 
 TODO: quantify current runtime and identify the biggest contributors (model downloads, vLLM readiness waits, redundant setup, serial scenarios).
 
+## Command Coverage & Priority
+
+Tiering is the primary lever: **P0 runs on every PR; P1 runs less often** (nightly/on-demand).
+
+**P0 — every PR:**
+- `rocm install`, `rocm examine`, `rocm diagnose`
+- Strix Halo with the latest Qwen variant supported by Lemonade
+
+**P0 — nightly** (heavy, too expensive per-PR):
+- `rocm serve` — MI300X serving Qwen3.6-27B (this is the "MI300X" P0 scenario)
+
+**P1 (everything else):** all other commands, models, and platform combinations.
+
 ## Solution
 
 High-level approach TBD after profiling. Candidate levers:
