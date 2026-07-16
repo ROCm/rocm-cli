@@ -251,8 +251,20 @@ fn with_native_entry<T: Send>(
     provider: &str,
     action: impl FnOnce(&Entry) -> Result<T> + Send,
 ) -> Result<T> {
+    with_keyring_entry(PROVIDER_KEY_SERVICE, provider, action)
+}
+
+/// Generic form of [`with_native_entry`] for any keyring `service` namespace and
+/// entry `name`. Shares the same runtime guard (see above) so other secret
+/// stores in this crate (e.g. per-service endpoint keys) reuse the single
+/// platform-specific credential-store chokepoint rather than duplicating it.
+pub(crate) fn with_keyring_entry<T: Send>(
+    service: &str,
+    name: &str,
+    action: impl FnOnce(&Entry) -> Result<T> + Send,
+) -> Result<T> {
     let run = move || {
-        let entry = native_entry(provider)?;
+        let entry = keyring_entry(service, name)?;
         action(&entry)
     };
     if tokio::runtime::Handle::try_current().is_ok() {
@@ -270,13 +282,11 @@ fn with_native_entry<T: Send>(
     }
 }
 
-fn native_entry(provider: &str) -> Result<Entry> {
+fn keyring_entry(service: &str, name: &str) -> Result<Entry> {
     #[cfg(target_os = "windows")]
     {
         let store = windows_native_keyring_store::Store::new().map_err(keyring_anyhow)?;
-        store
-            .build(PROVIDER_KEY_SERVICE, provider, None)
-            .map_err(keyring_anyhow)
+        store.build(service, name, None).map_err(keyring_anyhow)
     }
 
     #[cfg(target_os = "macos")]
@@ -285,9 +295,7 @@ fn native_entry(provider: &str) -> Result<Entry> {
             &std::collections::HashMap::new(),
         )
         .map_err(keyring_anyhow)?;
-        store
-            .build(PROVIDER_KEY_SERVICE, provider, None)
-            .map_err(keyring_anyhow)
+        store.build(service, name, None).map_err(keyring_anyhow)
     }
 
     #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
@@ -296,9 +304,7 @@ fn native_entry(provider: &str) -> Result<Entry> {
             &std::collections::HashMap::new(),
         )
         .map_err(keyring_anyhow)?;
-        store
-            .build(PROVIDER_KEY_SERVICE, provider, None)
-            .map_err(keyring_anyhow)
+        store.build(service, name, None).map_err(keyring_anyhow)
     }
 
     #[cfg(not(any(
@@ -321,7 +327,7 @@ const fn native_store_label() -> &'static str {
     }
 }
 
-fn keyring_anyhow(error: KeyringError) -> anyhow::Error {
+pub(crate) fn keyring_anyhow(error: KeyringError) -> anyhow::Error {
     anyhow!("{error}")
 }
 

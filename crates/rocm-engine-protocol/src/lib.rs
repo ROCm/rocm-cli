@@ -14,6 +14,47 @@ pub const ENGINE_RECIPE_CONTRACT_VERSION: &str = "0.1.0";
 pub const ENGINE_PLUGIN_BINARY_PREFIX: &str = "rocm-engine-";
 pub const DEFAULT_LOG_TAIL_LINES: usize = 80;
 
+/// Environment variable holding a *path* to a 0600 file whose contents are the
+/// endpoint API key.
+///
+/// `rocm serve` sets this explicitly on the internal `__engine-serve-http` child
+/// (never argv), and each engine adapter reads it to decide whether to enforce
+/// authentication. A path — not the secret value — is what the detached-spawn
+/// primitives accept as an env override, and a key file keeps the secret off both
+/// the argv and the environment block.
+///
+/// The adapter reads *only* this explicitly-set carrier, never a value-bearing
+/// variable: the engine child inherits the launching shell's environment, so
+/// reading a variable like `ROCM_SERVE_API_KEY` would let a stray value in the
+/// user's shell silently authenticate an endpoint we intended to leave open
+/// (e.g. a loopback bind).
+pub const ENDPOINT_API_KEY_FILE_ENV: &str = "ROCM_SERVE_API_KEY_FILE";
+
+/// Resolve the endpoint API key an engine adapter must enforce, if any.
+///
+/// Reads the key file named by [`ENDPOINT_API_KEY_FILE_ENV`]. Returns `None` when
+/// the variable is unset or the file is empty/missing — i.e. an unauthenticated
+/// (loopback) endpoint. The value is trimmed of surrounding whitespace/newlines.
+pub fn resolve_endpoint_api_key() -> Option<String> {
+    let path = std::env::var(ENDPOINT_API_KEY_FILE_ENV).ok()?;
+    endpoint_api_key_from_file(std::path::Path::new(&path))
+}
+
+/// Read and trim an endpoint API key from `path`.
+///
+/// Returns `None` for a missing file or empty/whitespace-only contents. Split out
+/// from [`resolve_endpoint_api_key`] so it is testable without mutating the
+/// process environment.
+pub fn endpoint_api_key_from_file(path: &std::path::Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnginePluginDescriptor {
     pub id: String,
@@ -445,6 +486,31 @@ pub struct LogsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_api_key_from_file_reads_and_trims() {
+        let dir = unique_temp_dir("endpoint-key");
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_file = dir.join("endpoint-api-key");
+        std::fs::write(&key_file, "  secret-key-value\n").unwrap();
+        assert_eq!(
+            endpoint_api_key_from_file(&key_file),
+            Some("secret-key-value".to_owned())
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn endpoint_api_key_from_file_none_for_missing_or_empty() {
+        let dir = unique_temp_dir("endpoint-key-empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("does-not-exist");
+        assert_eq!(endpoint_api_key_from_file(&missing), None);
+        let empty = dir.join("empty");
+        std::fs::write(&empty, "   \n").unwrap();
+        assert_eq!(endpoint_api_key_from_file(&empty), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn request_roundtrip_preserves_method() {

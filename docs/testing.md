@@ -419,6 +419,38 @@ cargo test -p rocm --bin rocm serve_engine_selection
 These tests verify that explicit/configured engines still win and shared model
 recipes only choose a preferred engine when no user/default engine is set.
 
+Public-endpoint authentication focused tests:
+
+```bash
+cargo test -p rocm --bin rocm resolve_endpoint_auth
+cargo test -p rocm --bin rocm endpoint_client_config
+cargo test -p rocm --bin rocm api_key_client_config
+cargo test -p rocm --bin rocm public_bind_fails_closed
+cargo test -p rocm-core generate_endpoint_api_key
+cargo test -p rocm-engine-protocol endpoint_api_key
+```
+
+A loopback bind (`rocm serve <model>`, default `127.0.0.1`) stays
+credential-free. A public bind (`--host 0.0.0.0 --allow-public-bind`) requires an
+API key: pass one with `--api-key` / the `ROCM_SERVE_API_KEY` environment
+variable, or let one be generated. The key is handed to the engine via a 0600
+key file (never argv), stored in the OS keychain by service id, and printed once
+as client configuration — it must never appear in `rocm services`, `rocm logs`,
+or the audit log. Verifying that the running server actually rejects
+unauthenticated requests requires a live engine and is covered by the GPU
+acceptance scripts (`scripts/vllm_therock_gpu_test.py`), not the unit tests.
+
+Windows + Lemonade note: the Windows *managed* native-Lemonade server is launched
+via `spawn_hidden_console_with_log`, whose env-override API is path-valued only,
+so it cannot receive the value-typed `LEMONADE_API_KEY` that Lemonade's server
+reads. Rather than launch an unauthenticated public server, `rocm serve` **fails
+closed** on that exact combination (public bind + `--engine lemonade` + Windows)
+and directs the user to `--engine vllm` or a loopback host. vLLM (all platforms,
+via `VLLM_API_KEY`), the packaged llama-server fallback (via `--api-key-file`),
+and Lemonade on non-Windows are all fully supported. Teaching the Windows
+detached-spawn primitive to carry a value-typed override (so Windows Lemonade can
+serve public with auth) is tracked as a separate follow-up.
+
 Engine recipe adapter contract focused tests:
 
 ```bash

@@ -1497,7 +1497,41 @@ fn lemonade_process_environment_vars(
     if let Some(csv) = rocm_engine_protocol::gpu_indices_to_csv(&env.gpu_indices) {
         vars.push(("HIP_VISIBLE_DEVICES", OsString::from(csv)));
     }
+    // When `rocm serve` protects a public endpoint, the key arrives via
+    // `ROCM_SERVE_API_KEY[_FILE]`. Lemonade's server gates /api,/v0,/v1 on
+    // `LEMONADE_API_KEY`, and its own CLI clients (used here for the readiness
+    // `status` probe) auto-present the same env var — so translating it once here
+    // both secures the server and keeps our readiness checks authenticated.
+    if let Some(api_key) = rocm_engine_protocol::resolve_endpoint_api_key() {
+        vars.push(("LEMONADE_API_KEY", OsString::from(api_key)));
+    }
     Ok(vars)
+}
+
+/// Write `contents` to `path`, creating it with owner-only (0600) permissions on
+/// Unix so a secret (e.g. an endpoint API key) is not world-readable. On other
+/// platforms the file is created with default permissions.
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(contents)?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, contents)?;
+    }
+    Ok(())
 }
 
 fn push_existing_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -1743,6 +1777,24 @@ fn serve_direct_llama_server(
         .arg("--alias")
         .arg(&request.model_ref)
         .stdin(Stdio::null());
+    // Packaged llama-server is raw llama.cpp — it does not read `LEMONADE_API_KEY`.
+    // When `rocm serve` protects a public endpoint, write the key to a 0600 file
+    // and pass `--api-key-file` so the secret never lands in the process table
+    // (unlike the bare `--api-key` flag).
+    if let Some(api_key) = rocm_engine_protocol::resolve_endpoint_api_key() {
+        let key_dir = log_path
+            .and_then(Path::parent)
+            .or_else(|| model_path.parent())
+            .unwrap_or_else(|| Path::new("."));
+        let key_file = key_dir.join(".llama-server-api-key");
+        write_private_file(&key_file, api_key.as_bytes()).with_context(|| {
+            format!(
+                "failed to write llama-server API key file {}",
+                key_file.display()
+            )
+        })?;
+        command.arg("--api-key-file").arg(&key_file);
+    }
     if let Some(log_path) = log_path {
         let log = fs::OpenOptions::new()
             .create(true)

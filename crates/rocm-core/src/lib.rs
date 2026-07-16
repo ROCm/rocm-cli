@@ -5157,6 +5157,32 @@ pub fn sign_rsa_pkcs1_sha256_signature(private_key_pem: &str, payload: &[u8]) ->
     Ok(signature.to_bytes().into_vec())
 }
 
+/// Number of random alphanumeric characters in a generated endpoint API key.
+/// 48 chars from a 62-symbol alphabet is ~285 bits of entropy — far beyond what
+/// a bearer token guarding a network endpoint needs, with no padding characters
+/// that would complicate copy/paste into client configs or shell env vars.
+const ENDPOINT_API_KEY_LEN: usize = 48;
+
+/// Generate a fresh, cryptographically-random API key for a public endpoint.
+///
+/// The value is URL-safe alphanumeric (`[A-Za-z0-9]`) so it can be dropped
+/// verbatim into an `Authorization: Bearer` header, a client config file, or an
+/// environment variable without escaping.
+///
+/// Uses the same `rand::thread_rng()` CSPRNG as [`generate_rsa_signing_keypair`];
+/// deliberately *not* derived from `generate_service_id` (a timestamp-based,
+/// guessable identifier — unsuitable as a secret).
+pub fn generate_endpoint_api_key() -> String {
+    use rand::Rng;
+    use rand::distributions::Alphanumeric;
+
+    rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(ENDPOINT_API_KEY_LEN)
+        .map(char::from)
+        .collect()
+}
+
 /// Generate a fresh 2048-bit RSA signing keypair, returned as
 /// `(PKCS#8 private-key PEM, SubjectPublicKeyInfo public-key PEM)` — the same
 /// formats `openssl genpkey` / `openssl rsa -pubout` produce.
@@ -5933,6 +5959,18 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
+
+    #[test]
+    fn generate_endpoint_api_key_is_random_and_alphanumeric() {
+        let key = generate_endpoint_api_key();
+        assert_eq!(key.len(), ENDPOINT_API_KEY_LEN);
+        assert!(
+            key.chars().all(|c| c.is_ascii_alphanumeric()),
+            "key must be URL-safe alphanumeric, got {key:?}"
+        );
+        // Two draws must differ — a constant key would be catastrophic for auth.
+        assert_ne!(generate_endpoint_api_key(), generate_endpoint_api_key());
+    }
 
     // The socket-path precedence is mirrored in `rocm-dash-core`; these tests
     // mirror the ones there so a divergence in either crate is caught.
