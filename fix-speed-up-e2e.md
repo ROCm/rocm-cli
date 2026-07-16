@@ -7,7 +7,7 @@
 **Branch:** fix-speed-up-e2e
 **Last Updated:** 2026-07-16
 
-**Token Usage:** in=664 out=191264 cache_create=743349 cache_read=60428514 calls=334
+**Token Usage:** in=672 out=192360 cache_create=1039992 cache_read=61298581 calls=338
 
 ---
 
@@ -113,8 +113,8 @@ new `tests/e2e-cucumber/features/diagnose.feature`.
 - ✅ Implement VRAM-floor fix: added device-total probe, scaled floor to `min(150_000, total*0.9)`, verified compile + arithmetic. Committed and pushed to origin/fix-speed-up-e2e (commit `122d2be`).
 
 ### In Progress ⏳
-- ⏳ Scoped dispatch queued on Strix-Ubuntu (run 29529197875, 2 serve scenarios, measuring per-serve step duration vs ~262s baseline). Loop checks every 10m for completion.
-- ⏳ Task #3: BDD scenarios for `rocm diagnose`/`fix` (6 scenarios drafted, awaiting review).
+- ⏳ Scoped dispatch in progress on Strix-Ubuntu (run 29529197875, 2 serve scenarios, measuring per-serve step duration vs ~262s baseline). Loop checks every 10m; if successful will open PR immediately.
+- ⏳ Task #3: BDD scenarios for `rocm diagnose`/`fix` (6 scenarios drafted, GPU-independent, awaiting review before implementation).
 
 ### Todo 📋
 - 📋 Task #2: Rework CI tiering (per-PR vs nightly) — verify/tune existing `@nightly` split.
@@ -159,11 +159,11 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persiste-app-dev-c
 
 - **Session idle for 10 minutes, auto-flushing WIP state.**
 
-### 2026-07-16
+### 2026-07-16 (continued)
 
-- **Task #1 completed:** identified VRAM-floor waste as ~12 min of dead time on Strix-Ubuntu lane (hardcoded 150 GB floor vs 62 GiB device total); implemented fix in `serving_steps.rs` (device-relative floor = min(150GB, total*0.9)), verified arithmetic + compile.
-- **Commit `122d2be` validated:** container gate (clippy + tests under `-D warnings`) passed clean; fix has zero compile warnings, unit tests pass, mock e2e reconciles to 0 unexpected failures.
-- **Scoped dispatch fired:** run 29529197875 on Strix-Ubuntu (2 serve scenarios, measuring step duration vs ~262s baseline); expect ~120s per-scenario drop if fix works.
-- **E2E regimen studied:** cucumber-rs suite already has per-PR vs nightly split (`@nightly` tag + `E2E_INCLUDE_NIGHTLY=1`); `expectations.toml` per-platform reconciliation; Task #22 (share-one-runtime) addresses cold-install overhead. P0 coverage gaps: `diagnose` (zero scenarios), Strix Qwen (uses smallest, not latest).
-- **Saved methods to memory:** scoped dispatch for rapid fix validation (don't wait for full CI), act-don't-ask feedback, confirmed commit-push workflow already well-documented.
-- **Five levers identified:** (1) VRAM-floor ✅, (2) CI tiering tune (pending), (3) diagnose coverage (pending), (4) Strix Qwen variant (user decision), (5) mock overhead (pending).
+- **Task #1 root cause + fix:** VRAM-floor waste = hardcoded 150 GB (sized for MI300X) vs Strix's 62 GiB → full 2-min timeout on every serve, ~12 min total. Fix: device-relative floor `min(150_000, total*0.9)`. Commit `122d2be` signed + signed-off, pushed.
+- **Fix validated locally:** container gate passed (clippy + tests under `-D warnings`, 0 warnings); mock e2e reconciliation clean (4 xfail as expected, 0 unexpected).
+- **Scoped probe dispatched:** run 29529197875 queued on Strix-Ubuntu (2 serve scenarios). On completion: if successful (~120s per-scenario drop), open PR; if not, diagnose + iterate. Loop checks every 10m.
+- **Task #3 drafted:** 6 BDD scenarios for `rocm diagnose`/`fix` (GPU-independent, mock-lane, P0 coverage gap). Scenarios + technical mapping written, awaiting review before step implementation.
+- **Methods saved:** scoped dispatch for rapid validation, act-don't-ask feedback, commit-push workflow docs confirmed.
+- **Open decisions:** Task #4 (Strix Qwen variant: latest or smallest), Task #2 (CI tiering tune), Task #5 (mock overhead).
