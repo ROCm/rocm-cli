@@ -118,6 +118,7 @@ repository.
 | cpufeatures | 0.2.17 | MIT OR Apache-2.0 |
 | crc32fast | 1.5.0 | MIT OR Apache-2.0 |
 | critical-section | 1.2.0 | MIT OR Apache-2.0 |
+| crossbeam-channel | 0.5.16 | MIT OR Apache-2.0 |
 | crossbeam-deque | 0.8.7 | MIT OR Apache-2.0 |
 | crossbeam-epoch | 0.9.20 | MIT OR Apache-2.0 |
 | crossbeam-utils | 0.8.21 | MIT OR Apache-2.0 |
@@ -444,6 +445,7 @@ repository.
 | strum_macros | 0.26.4 | MIT |
 | strum_macros | 0.28.0 | MIT |
 | subtle | 2.6.1 | BSD-3-Clause |
+| symlink | 0.1.0 | MIT/Apache-2.0 |
 | syn | 1.0.109 | MIT OR Apache-2.0 |
 | syn | 2.0.118 | MIT OR Apache-2.0 |
 | sync_wrapper | 1.0.2 | Apache-2.0 |
@@ -490,6 +492,7 @@ repository.
 | tower-layer | 0.3.3 | MIT |
 | tower-service | 0.3.3 | MIT |
 | tracing | 0.1.44 | MIT |
+| tracing-appender | 0.2.5 | MIT |
 | tracing-attributes | 0.1.31 | MIT |
 | tracing-core | 0.1.36 | MIT |
 | tracing-error | 0.2.1 | MIT |
