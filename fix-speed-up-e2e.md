@@ -114,3 +114,5 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persiste-app-dev-c
 
 - Committed VRAM-floor fix via `git-commit-with-fallback`, added DCO sign-off, all pre-push hooks passed (346 rocm-bin tests).
 - Pushed to origin; branch now tracking origin/fix-speed-up-e2e at commit `122d2be`.
+
+**2026-07-16 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
