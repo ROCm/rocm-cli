@@ -3,16 +3,56 @@ name: CI
 on:
   push:
     branches: [main]
+  # Run on PRs against ANY base branch, not just main, so a stacked PR (based on
+  # another in-flight feature branch) still gets CI instead of no checks until it
+  # is retargeted to main. Affected-crate selection already diffs against
+  # `github.base_ref`, so a non-main base works. push/merge_group stay main-only.
   pull_request:
-    branches: [main]
   # The merge queue creates a temporary branch and fires `merge_group`; without
   # this trigger the required checks never start and queued PRs stall forever.
   merge_group:
     branches: [main]
     types: [checks_requested]
+  # Manual trigger for on-demand E2E runs on the self-hosted GPU runners, without
+  # waiting on a push/PR or the full gate. Dispatch against any ref
+  # (`gh workflow run ci.yml --ref <branch> -f platform=... -f tier=...`) — GitHub
+  # runs THAT ref's copy of this file, so the E2E jobs it selects live on the ref.
+  # A dispatch skips build-and-test (see its `if:`) for a fast loop. This trigger
+  # must exist on the default branch for the workflow to be dispatchable at all.
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Which runner(s) to target
+        type: choice
+        default: all
+        options: [all, mock, app-dev-gpu, strix-ubuntu, strix-windows]
+        # No tier input: the harness resolves pass/xfail/skip per scenario, so a
+        # platform runs one job covering everything applicable to it.
+      # TEMP (probe): scenario-name regex forwarded to the cucumber harness
+      # (`cargo xtask e2e -- --name <regex>`) so a dispatch can run just a few
+      # scenarios. Empty = full suite. REMOVE after the #23 default-engine
+      # classification is validated on Strix.
+      name_filter:
+        description: "TEMP scenario-name regex (cucumber --name); empty = full suite"
+        type: string
+        default: ""
+      # Opt a manual dispatch into the expensive `@nightly` scenarios (large-model
+      # serve, cold devel install) that the per-PR run skips. Off by default so a
+      # normal dispatch is unchanged; combine with name_filter to probe just one.
+      include_nightly:
+        description: "Include @nightly scenarios (large-model serve, cold install)"
+        type: boolean
+        default: false
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Manual dispatches get a UNIQUE group (run_id) so a run that gets stuck — e.g.
+  # a job queued on a temporarily offline self-hosted runner, which GitHub cannot
+  # cancel — never holds the shared group and blocks later dispatches. push / PR /
+  # merge_group keep the shared per-ref group so a new commit still supersedes the
+  # previous in-flight run.
+  group: >-
+    ${{ github.workflow }}-${{ github.ref }}-${{
+      github.event_name == 'workflow_dispatch' && github.run_id || 'shared' }}
   cancel-in-progress: true
 
 permissions:
@@ -46,7 +86,7 @@ jobs:
       lint: ${{ steps.filter.outputs.lint || steps.all.outputs.forced }}
       tpn: ${{ steps.filter.outputs.tpn || steps.all.outputs.forced }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Filter changed paths (pull requests only)
         id: filter
@@ -75,6 +115,7 @@ jobs:
               - '**/*.py'
               - '**/*.sh'
               - '**/*.ps1'
+              - '**/*.feature'
               - 'install*'
               - '.github/workflows/**'
             # THIRD_PARTY_NOTICES.txt staleness gate: anything that changes the
@@ -108,14 +149,17 @@ jobs:
     runs-on: ubuntu-latest
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
     needs: [changes, clippy, prek]
+    # A manual E2E dispatch skips this heavy job for a fast loop; the E2E jobs
+    # tolerate a skipped build-and-test in their own `if:` guards.
+    if: github.event_name != 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Install native build deps
         if: needs.changes.outputs.heavy == 'true'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libcap-dev
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         if: needs.changes.outputs.heavy == 'true'
 
       # Build the runtime binaries the smoke + acceptance steps below need (every
@@ -170,8 +214,10 @@ jobs:
     # Same lint gate as the OS build jobs: don't spend a test cycle until the
     # cheap checks are green.
     needs: [changes, clippy, prek]
+    # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
+    if: github.event_name != 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           # `cargo xtask affected` diffs origin/<base>...HEAD, so it needs the
           # base history and the real PR head (not the synthetic merge ref).
@@ -227,10 +273,12 @@ jobs:
       CARGO_INCREMENTAL: "0"
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
     needs: [changes, clippy, prek]
+    # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
+    if: github.event_name != 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         if: needs.changes.outputs.heavy == 'true'
         with:
           cache-on-failure: true
@@ -291,11 +339,13 @@ jobs:
     # on every file type, so it is relevant to any change — including docs-only
     # PRs that match no `changes` category. Like license-headers and
     # commit-signatures, it is not gated.
+    # Exception: a manual E2E dispatch only exercises the E2E jobs; skip the rest.
+    if: github.event_name != 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       # cargo-fmt hook needs rustfmt (no build).
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           components: rustfmt
           cache: false
@@ -314,15 +364,25 @@ jobs:
   clippy:
     runs-on: ubuntu-latest
     needs: changes
+    # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
+    if: github.event_name != 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         if: needs.changes.outputs.rust == 'true'
 
       - name: Clippy
         if: needs.changes.outputs.rust == 'true'
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      # The e2e-cucumber `e2e` target sets `test = false` (so nextest/`cargo test
+      # --all-targets` skip the custom harness), which also excludes it from
+      # `clippy --all-targets` above — leaving the ~1.6k lines of harness + step
+      # code unlinted. Clippy honours an explicit `--test`, so lint it directly.
+      - name: Clippy (e2e harness + steps)
+        if: needs.changes.outputs.rust == 'true'
+        run: cargo clippy --locked -p e2e-cucumber --test e2e -- -D warnings
 
       - name: MANIFEST.md dependency table is current
         if: needs.changes.outputs.rust == 'true'
@@ -332,10 +392,12 @@ jobs:
     name: Third-party notices current
     runs-on: ubuntu-latest
     needs: changes
+    # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
+    if: github.event_name != 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         if: needs.changes.outputs.tpn == 'true'
 
       # Pin the cargo-about version so the check compares against the exact same
@@ -347,7 +409,7 @@ jobs:
       - name: Cache cargo-about
         if: needs.changes.outputs.tpn == 'true'
         id: cache-cargo-about
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/.cargo/bin/cargo-about
           key: ${{ runner.os }}-cargo-about-0.9.1
@@ -364,14 +426,16 @@ jobs:
     name: Coverage (rocm-dash crates, ratcheted)
     runs-on: ubuntu-latest
     needs: changes
+    # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
+    if: github.event_name != 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Install native build deps
         if: needs.changes.outputs.rust == 'true'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libcap-dev
 
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@c0e9df88980754dd93e5833b8dcb1b304c1fe173 # 1.96.0
         if: needs.changes.outputs.rust == 'true'
         with:
           components: llvm-tools-preview
@@ -384,7 +448,7 @@ jobs:
 
       - name: Cache cargo registry and build
         if: needs.changes.outputs.rust == 'true'
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -417,10 +481,12 @@ jobs:
     name: Lint (PowerShell)
     runs-on: windows-latest
     needs: changes
+    # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
+    if: github.event_name != 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         if: needs.changes.outputs.lint == 'true'
 
       - name: Install PSScriptAnalyzer (PowerShell 7)
@@ -459,12 +525,14 @@ jobs:
       HAWKEYE_VERSION: v6.5.1
       HAWKEYE_SHA256: d6eb0505a45a15244f4f789158aafe5e3f1a7dc86c9dc1d7651f3cb1e1b321e0
       HAWKEYE_INSTALL_DIR: ${{ github.workspace }}/.hawkeye-bin
+    # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
+    if: github.event_name != 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Cache hawkeye binary
         id: cache-hawkeye
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ${{ env.HAWKEYE_INSTALL_DIR }}
           key: ${{ runner.os }}-hawkeye-${{ env.HAWKEYE_VERSION }}-${{ env.HAWKEYE_SHA256 }}
@@ -495,7 +563,7 @@ jobs:
     # entry would stall forever.
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
           # PR: check out the PR head, not the synthetic refs/pull/N/merge commit
@@ -507,7 +575,7 @@ jobs:
           # and are GitHub "Verified" (web-flow signed).
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       - name: Verify commits are signed and signed-off
         # `--require-verified` shells out to the `gh` CLI; pass the job token so
@@ -524,3 +592,627 @@ jobs:
   # are intentionally not part of this workflow yet. See
   # docs/ci-hardware-testing.md for the planned design; they will land in a
   # follow-up PR.
+
+  # ── E2E tests (cucumber-rs) ───────────────────────────────────────────────
+  #
+  # BDD scenarios in Gherkin (.feature files) backed by Rust step functions. ONE
+  # job per platform: the harness resolves every scenario to pass / xfail / skip
+  # per host from its @id + @requires-* tags, a capability probe, and
+  # expectations.toml (no tier flag, no tag filter). The mock job (GitHub-hosted,
+  # no GPU) gates the PR; the self-hosted GPU jobs are non-blocking while proven
+  # out. Each job writes a platform.json sidecar the consolidated report joins by
+  # scenario id to render the (scenario × platform) expectation grid.
+
+  # Blocking mock job (GitHub-hosted, no GPU): must stay green. @requires-gpu
+  # scenarios resolve to skip here; known bugs resolve to xfail from
+  # expectations.toml.
+  e2e:
+    name: E2E tests
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    needs: [changes, build-and-test]
+    # This is a REQUIRED check, so — like every sibling required job — the job
+    # itself must always run (except on a manual dispatch that didn't select the
+    # mock platform), and the actual work is gated at the STEP level. Gating
+    # `heavy` at the job level would SKIP the job on a non-heavy PR, and a required
+    # check that is never produced stalls the merge queue. `merge_group` forces
+    # heavy=true, so the mock gate always executes there as a backstop.
+    if: >-
+      always()
+      && needs.changes.result == 'success'
+      && (github.event_name != 'workflow_dispatch'
+          || inputs.platform == 'all' || inputs.platform == 'mock')
+    steps:
+      - uses: actions/checkout@v6
+
+      # Whether the real work runs this time. On push/PR/merge_group: only when
+      # build-and-test succeeded and the change is heavy. On workflow_dispatch:
+      # build-and-test is skipped, so tolerate that and rely on the job-level
+      # platform gate above.
+      - name: Decide whether to run
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ needs.build-and-test.result }}" = "success" ] \
+            && [ "${{ needs.changes.outputs.heavy }}" = "true" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install native build deps
+        if: steps.gate.outputs.run == 'true'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libcap-dev
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        if: steps.gate.outputs.run == 'true'
+
+      # The workspace test job selects only affected crates and runs the cucumber
+      # harness, not the library's own unit tests — run the capability/expectation
+      # /report unit tests (resolver logic, grid reconciliation) here.
+      - name: Unit tests (e2e-cucumber lib)
+        if: steps.gate.outputs.run == 'true'
+        run: cargo test -p e2e-cucumber --lib
+
+      - name: Run E2E tests
+        if: steps.gate.outputs.run == 'true'
+        run: cargo xtask e2e
+
+      - name: Upload E2E report
+        if: always() && steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-report
+          path: tests/e2e-cucumber/results/
+
+  # app-dev MI300X (Instinct data-center GPU, `amd-gpu` label). Non-blocking.
+  # One job runs every applicable scenario (tiers collapsed). Cost drivers:
+  # `install sdk` re-running per scenario (isolated data dirs), several vLLM
+  # cold-starts, and — since it was added — the large-model (Qwen3.6-27B) serve,
+  # whose ~54 GiB load plus the post-serve VRAM-drain wait pushed a full run past
+  # the old 35min cap (it was cancelled at 35m17s). Cap raised to 90min so the job
+  # COMPLETES and writes platform.json (a cancelled job produces none → no grid
+  # column). The heaviest scenarios are being moved to a nightly-only tag so the
+  # per-PR run stays short; see the `@nightly` handling in xtask/the harness.
+  e2e-gpu:
+    name: E2E tests (GPU)
+    timeout-minutes: 90
+    runs-on: [self-hosted, linux, amd-gpu]
+    needs: [changes, build-and-test]
+    # See `e2e`: dispatch tolerates skipped build-and-test; app-dev-gpu.
+    if: >-
+      always()
+      && needs.changes.result == 'success'
+      && (
+        (github.event_name != 'workflow_dispatch'
+          && needs.build-and-test.result == 'success'
+          && needs.changes.outputs.heavy == 'true')
+        || (github.event_name == 'workflow_dispatch'
+          && (inputs.platform == 'all' || inputs.platform == 'app-dev-gpu'))
+      )
+    continue-on-error: true
+    env:
+      # Bound serve readiness below the 35-min job cap so a serve that never comes
+      # ready fails the scenario with a real error instead of hanging until the
+      # job is cancelled. 300s is ample for a real MI300X vLLM cold-start;
+      # per-scenario overrides in expectations.toml / a `@serve-timeout` tag adjust
+      # it (shorter for known bugs, longer for large models).
+      E2E_SERVE_TIMEOUT_SECS: "300"
+      # Opt-in @nightly scenarios on a manual dispatch (default off). The nightly
+      # workflow sets this unconditionally; here it lets a scoped dispatch confirm
+      # a single nightly scenario (e.g. the 27B serve) without the full nightly run.
+      E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
+    steps:
+      - uses: actions/checkout@v6
+
+      # Reclaim the GPU before running: a serve leaked by a killed/timed-out prior
+      # run (its Drop teardown never executed) can keep an engine process spinning
+      # on the GPU, starving this job's serves until it hits the timeout. Kill only
+      # e2e leftovers — scoped to /tmp/rocm-e2e-* and the e2e-target/e2e-shared
+      # trees — never the runner or any /workload manual-testing processes.
+      - name: Reclaim GPU from stray E2E processes
+        run: |
+          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
+          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
+          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
+          # NOTE: no unanchored `pkill -f 'vulkan/llama-server'` — the lemonade
+          # Vulkan assistant an e2e scenario spawns lives under /tmp/rocm-e2e-*
+          # and is already caught by the first line; an unanchored pattern would
+          # also kill a legitimate /workload manual-testing serve on this shared
+          # self-hosted runner.
+          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
+          pkill -f 'e2e-target/release/rocm daemon' 2>/dev/null || true
+          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
+          echo "reclaimed"
+
+      # GPU preflight: fail fast (~90s) instead of hanging to the job cap when the
+      # GPU is missing, the driver is wedged, or VRAM is still saturated by a
+      # leftover serve. A BOUNDED POLL, not a one-shot check: transient contention
+      # (e.g. the reclaim step's kills still draining VRAM) self-heals within
+      # seconds, so we retry up to a ceiling and succeed the moment the GPU is both
+      # responsive AND has enough free VRAM. Only a genuinely absent/wedged/held
+      # GPU reaches the ceiling and fails — with a per-reason message.
+      - name: GPU preflight (bounded wait for an available GPU)
+        run: |
+          # A serve here needs most of the card; require a generous free-VRAM
+          # floor so a leftover serve (which the reclaim step should have killed)
+          # is caught, while normal baseline (~300 MB used) passes immediately.
+          MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-16}"
+          CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
+          min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
+          deadline=$(( SECONDS + CEILING_SECS ))
+          reason="rocm-smi never returned within its timeout (driver wedged or GPU absent)"
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            # rocm-smi itself can hang on a wedged driver — bound it with timeout.
+            out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
+            # Parse the byte value AFTER the colon; the line prefix "GPU[0]" would
+            # otherwise make a naive first-number match pick up the "0".
+            total=$(printf '%s\n' "$out" | grep -i 'VRAM Total Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            used=$(printf '%s\n' "$out" | grep -i 'VRAM Total Used Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            if [ -z "$total" ] || [ -z "$used" ]; then
+              reason="rocm-smi returned no VRAM figures (no AMD GPU detected)"
+              sleep 5; continue
+            fi
+            free=$(( total - used ))
+            if [ "$free" -ge "$min_free" ]; then
+              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB free (>= ${MIN_FREE_GIB} GiB)."
+              exit 0
+            fi
+            reason="VRAM never dropped below the floor: only $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB) — a serve is likely still holding the GPU"
+            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB)…"
+            sleep 5
+          done
+          echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${reason}"
+          exit 1
+
+      # cache: false — on this self-hosted runner we persist the build cache
+      # ourselves via CARGO_TARGET_DIR (below). The action's built-in
+      # Swatinem/rust-cache otherwise tries to SAVE the large target dir to
+      # GitHub's cache service in a post-step (slow/hangs) and its cleanup wipes
+      # the local target.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+
+      # `actions/checkout` runs `git clean -ffdx`, which deletes the gitignored
+      # `target/` inside the repo every job → a full ~15min rebuild each run.
+      # Point CARGO_TARGET_DIR at a sibling of the checkout ($RUNNER_WORKSPACE is
+      # the checkout's parent — untouched by git clean and persistent between jobs
+      # on a self-hosted runner), so cargo rebuilds incrementally.
+      - name: Run E2E tests on GPU hardware
+        run: |
+          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
+          # Share heavy immutable artifacts (TheRock runtimes ~3.3GB, HF weights,
+          # vLLM venv) across scenarios so they download once per runner, not per
+          # scenario. Persistent path; service state stays isolated per scenario.
+          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
+          # Share uv's wheel download/build cache so `rocm install sdk` is a warm
+          # ~34s per scenario instead of a cold ~160s (measured on MI300X). Kept
+          # OFF the RUNNER_WORKSPACE Longhorn PVC (near-full) and on the roomy `/`
+          # overlay; ~23GB, one cold fill per pod-life. Not git-cleaned (outside
+          # the checkout) and outside the reclaim step's /tmp/rocm-e2e-* glob.
+          export E2E_SHARED_UV_CACHE_DIR="/var/tmp/rocm-e2e-uv-cache"
+          # Share ONE installed managed runtime across the serve/chat scenarios so
+          # `rocm install sdk` runs once per runner, not once per scenario (the
+          # per-scenario install count — each a multi-GiB TheRock SDK whose probe
+          # unpacks an ~8.8 GiB devel tarball — is what blew the time cap). The
+          # "a managed runtime is active" precondition symlinks each scenario's
+          # data/runtimes here (see use_shared_runtimes); clean-slate scenarios
+          # stay isolated. Persisted across runs on RUNNER_WORKSPACE, so after the
+          # first run ever the pre-warm below is a no-op.
+          #
+          # CRITICAL: the shared dir IS the pre-warm's own `data/runtimes`, and we
+          # NEVER move it. `install sdk` bakes ABSOLUTE paths (install_root,
+          # python_executable) into the runtime manifest; a post-install `mv` would
+          # leave those pointing at a deleted location and every serve would fail
+          # instantly (observed on run 29320025393). Installing in place keeps the
+          # baked paths valid, and each scenario's data/runtimes symlink resolves to
+          # this same real tree.
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
+          export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
+
+          # Build the rocm binary ONCE and reuse it for both the pre-warm and the
+          # suite (via ROCM_CLI_BINARY) so xtask does not rebuild. Honors
+          # CARGO_TARGET_DIR set above.
+          cargo build --release -p rocm
+          export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
+
+          # Pre-warm the shared runtime ONCE, SERIALLY, before the suite — never
+          # lazily inside a concurrent scenario (two multi-GiB installs racing the
+          # same dir). Skipped once the tree is populated (it persists across runs).
+          # Uses the prebuilt binary (no cargo run --release) and the shared uv + HF
+          # caches. Installs directly into the persistent pre-warm data dir (no mv),
+          # so the manifest's absolute install_root stays valid for every scenario.
+          if [ ! -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
+            echo "pre-warming shared runtime (first run on this runner)…"
+            mkdir -p "$prewarm"/{data,config,cache}
+            ROCM_CLI_CONFIG_DIR="$prewarm/config" \
+            ROCM_CLI_DATA_DIR="$prewarm/data" \
+            ROCM_CLI_CACHE_DIR="$prewarm/cache" \
+            HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
+            UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
+              "$ROCM_CLI_BINARY" install sdk
+            if [ -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
+              echo "shared runtime pre-warmed at $E2E_SHARED_RUNTIMES_DIR"
+            else
+              echo "pre-warm did not produce a runtimes registry; scenarios will install their own" >&2
+            fi
+          else
+            echo "shared runtime already present at $E2E_SHARED_RUNTIMES_DIR — skipping pre-warm"
+          fi
+
+          # TEMP: optional scenario-name filter for a scoped probe dispatch (same
+          # as the strix job) — lets a dispatch run just one scenario (e.g. the
+          # 27B nightly) instead of the whole suite. Empty = full suite.
+          NAME_FILTER="${{ github.event.inputs.name_filter }}"
+          if [ -n "$NAME_FILTER" ]; then
+            echo "TEMP name filter active: $NAME_FILTER"
+            cargo xtask e2e -- --name "$NAME_FILTER"
+          else
+            cargo xtask e2e
+          fi
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-gpu-report
+          path: tests/e2e-cucumber/results/
+
+  # Second AMD GPU architecture: the Strix Halo (gfx1151) Ubuntu runner, targeted
+  # by the `strix-halo` label (app-dev-gpu carries `amd-gpu`, not `strix-halo`).
+  # Non-blocking while this hardware is proven out.
+  e2e-gpu-strix-ubuntu:
+    name: E2E tests (Strix Halo, Ubuntu)
+    # 35min: see e2e-gpu — one collapsed job runs all serves + per-scenario
+    # install sdk; the cap must exceed the run so the job writes platform.json.
+    timeout-minutes: 35
+    runs-on: [self-hosted, linux, strix-halo]
+    needs: [changes, build-and-test]
+    # See `e2e`: dispatch tolerates skipped build-and-test; strix-ubuntu.
+    if: >-
+      always()
+      && needs.changes.result == 'success'
+      && (
+        (github.event_name != 'workflow_dispatch'
+          && needs.build-and-test.result == 'success'
+          && needs.changes.outputs.heavy == 'true')
+        || (github.event_name == 'workflow_dispatch'
+          && (inputs.platform == 'all' || inputs.platform == 'strix-ubuntu'))
+      )
+    continue-on-error: true
+    # On this runner `/`, `/home/ubuntu`, and `/tmp` are ALL on a full root
+    # partition; only /home/ubuntu/actions-runner (a 1.7T nvme) has space. So
+    # EVERYTHING the job writes must land on the nvme. Point HOME there (catches
+    # ~/.cache/pip, ~/.config, and any other $HOME writer — pip's cache under the
+    # real /home/ubuntu is what previously failed `install sdk` with ENOSPC),
+    # plus the toolchain, temp, and pip cache. The rustup bootstrap still uses
+    # --no-modify-path so it doesn't touch $HOME/.profile.
+    env:
+      HOME: /home/ubuntu/actions-runner/e2e-home
+      CARGO_HOME: /home/ubuntu/actions-runner/.cargo
+      RUSTUP_HOME: /home/ubuntu/actions-runner/.rustup
+      TMPDIR: /home/ubuntu/actions-runner/tmp
+      PIP_CACHE_DIR: /home/ubuntu/actions-runner/pip-cache
+      E2E_SERVE_TIMEOUT_SECS: "300"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Prepare writable dirs on the nvme + reclaim GPU from stray E2E procs
+        run: |
+          mkdir -p /home/ubuntu/actions-runner/e2e-home /home/ubuntu/actions-runner/tmp /home/ubuntu/actions-runner/pip-cache
+          # Reclaim the GPU from any serve leaked by a killed/timed-out prior run
+          # (see e2e-gpu). Scoped to e2e leftovers only.
+          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
+          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
+          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
+          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
+          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
+          echo "prepared + reclaimed"
+
+      # GPU preflight: bounded wait so a missing/wedged/held GPU fails fast (~90s)
+      # instead of hanging to the job cap. Transient contention (VRAM still
+      # draining from the reclaim above) self-heals within the ceiling. See the
+      # e2e-gpu job for the rationale. gfx1151 shares system memory, so the free
+      # floor is smaller than the Instinct card but still catches a leftover serve.
+      - name: GPU preflight (bounded wait for an available GPU)
+        run: |
+          MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-8}"
+          CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
+          min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
+          deadline=$(( SECONDS + CEILING_SECS ))
+          reason="rocm-smi never returned within its timeout (driver wedged or GPU absent)"
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
+            total=$(printf '%s\n' "$out" | grep -i 'VRAM Total Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            used=$(printf '%s\n' "$out" | grep -i 'VRAM Total Used Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            if [ -z "$total" ] || [ -z "$used" ]; then
+              reason="rocm-smi returned no VRAM figures (no AMD GPU detected)"
+              sleep 5; continue
+            fi
+            free=$(( total - used ))
+            if [ "$free" -ge "$min_free" ]; then
+              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB free (>= ${MIN_FREE_GIB} GiB)."
+              exit 0
+            fi
+            reason="VRAM never dropped below the floor: only $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB) — a serve is likely still holding the GPU"
+            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB)…"
+            sleep 5
+          done
+          echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${reason}"
+          exit 1
+
+      # Bootstrap rustup ourselves with --no-modify-path so it never writes to
+      # $HOME/.profile (setup-rust-toolchain doesn't expose that flag).
+      # rust-toolchain.toml pins the exact toolchain, installed on first cargo
+      # use. Idempotent.
+      - name: Ensure Rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$CARGO_HOME/bin/cargo" ]; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --default-toolchain none
+          fi
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Run E2E tests on Strix Halo
+        run: |
+          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
+          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
+          # Share ONE installed managed runtime across serve/chat scenarios, and
+          # PRE-WARM it in place before the suite (mirrors e2e-gpu). This is not an
+          # optimization — it is REQUIRED for correctness. `install sdk` bakes
+          # ABSOLUTE paths (install_root, python_executable, rocm_sdk.*) into the
+          # runtime manifest. If the first scenario installs into its own isolated
+          # /tmp/rocm-e2e-XXXX data dir and only the registry is shared onward, those
+          # baked paths point at that scenario's temp dir — which is deleted when the
+          # scenario ends. Every later serve then sees `status=unusable (install root
+          # is missing)` and fails (diagnosed on the box 2026-07-15). Installing in
+          # place, directly into the persistent shared dir, keeps the baked paths
+          # valid for all scenarios and for the end-of-run version probe.
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
+          export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
+
+          # Build the rocm binary once; reuse for pre-warm + suite so xtask doesn't
+          # rebuild.
+          cargo build --release -p rocm
+          export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
+
+          # Pre-warm once, serially, in place (no mv/symlink). Skipped once the tree
+          # is populated (persists across runs on RUNNER_WORKSPACE).
+          if [ ! -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
+            echo "pre-warming shared runtime (first run on this runner)…"
+            mkdir -p "$prewarm"/{data,config,cache}
+            ROCM_CLI_CONFIG_DIR="$prewarm/config" \
+            ROCM_CLI_DATA_DIR="$prewarm/data" \
+            ROCM_CLI_CACHE_DIR="$prewarm/cache" \
+            HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
+              "$ROCM_CLI_BINARY" install sdk
+            if [ -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
+              echo "shared runtime pre-warmed at $E2E_SHARED_RUNTIMES_DIR"
+            else
+              echo "pre-warm did not produce a runtimes registry; scenarios will install their own" >&2
+            fi
+          else
+            echo "shared runtime already present at $E2E_SHARED_RUNTIMES_DIR — skipping pre-warm"
+          fi
+
+          # TEMP: optional scenario-name filter for a scoped probe dispatch.
+          NAME_FILTER="${{ github.event.inputs.name_filter }}"
+          if [ -n "$NAME_FILTER" ]; then
+            echo "TEMP name filter active: $NAME_FILTER"
+            cargo xtask e2e -- --name "$NAME_FILTER"
+          else
+            cargo xtask e2e
+          fi
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-gpu-strix-ubuntu-report
+          path: tests/e2e-cucumber/results/
+
+  # First real Windows GPU coverage: the Strix Halo Windows 11 runner. The
+  # existing windows-build-and-test uses GitHub-hosted windows-latest, which has
+  # no GPU. Non-blocking so it never gates the PR.
+  e2e-gpu-strix-windows:
+    name: E2E tests (Strix Halo, Windows)
+    # 35min: see e2e-gpu — one collapsed job runs all serves + per-scenario
+    # install sdk; the cap must exceed the run so the job writes platform.json.
+    timeout-minutes: 35
+    runs-on: [self-hosted, windows, strix-halo]
+    needs: [changes, build-and-test]
+    # See `e2e`: dispatch tolerates skipped build-and-test; strix-windows.
+    if: >-
+      always()
+      && needs.changes.result == 'success'
+      && (
+        (github.event_name != 'workflow_dispatch'
+          && needs.build-and-test.result == 'success'
+          && needs.changes.outputs.heavy == 'true')
+        || (github.event_name == 'workflow_dispatch'
+          && (inputs.platform == 'all' || inputs.platform == 'strix-windows'))
+      )
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      # setup-rust-toolchain runs an internal bash script, which this Windows
+      # runner lacks (bash: command not found). Bootstrap rustup with the
+      # PowerShell-native installer instead; idempotent, so it only downloads on
+      # a runner that doesn't already have the toolchain. Use `powershell`
+      # (Windows PowerShell 5.1, always present) rather than `pwsh` (PowerShell 7),
+      # which this self-hosted runner does not have installed.
+      # Reclaim the GPU from any E2E serve leaked by a killed/timed-out prior run
+      # (see e2e-gpu). PowerShell (5.1) equivalent; best-effort.
+      - name: Reclaim GPU from stray E2E processes
+        shell: powershell
+        run: |
+          Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -match 'rocm-e2e|__engine-serve-http|e2e-target|e2e-shared' -and $_.CommandLine -match 'llama-server|vllm|rocm ' } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          Write-Host "reclaimed"
+
+      # GPU preflight (best-effort on Windows): bounded wait for the GPU to be
+      # available so a wedged/held GPU fails fast instead of hanging to the cap.
+      # BEST-EFFORT because the Windows ROCm GPU query tool isn't verified here —
+      # if no rocm-smi is found we WARN and continue rather than false-fail a
+      # working runner. When rocm-smi IS present we poll free VRAM the same way as
+      # the Linux jobs and fail only after the ceiling.
+      - name: GPU preflight (bounded wait for an available GPU)
+        shell: powershell
+        run: |
+          $minFreeGiB = if ($env:GPU_PREFLIGHT_MIN_FREE_GIB) { [int]$env:GPU_PREFLIGHT_MIN_FREE_GIB } else { 8 }
+          $ceilingSecs = if ($env:GPU_PREFLIGHT_CEILING_SECS) { [int]$env:GPU_PREFLIGHT_CEILING_SECS } else { 90 }
+          if (-not (Get-Command rocm-smi -ErrorAction SilentlyContinue)) {
+            Write-Host "rocm-smi not found on this Windows runner; skipping GPU preflight (best-effort)."
+            exit 0
+          }
+          $minFree = [int64]$minFreeGiB * 1GB
+          $deadline = (Get-Date).AddSeconds($ceilingSecs)
+          $reason = "rocm-smi never returned usable VRAM figures"
+          while ((Get-Date) -lt $deadline) {
+            $out = (rocm-smi --showmeminfo vram 2>$null | Out-String)
+            $total = ([regex]::Matches($out, 'VRAM Total Memory \(B\):\s*(\d+)') | Select-Object -First 1).Groups[1].Value
+            $used  = ([regex]::Matches($out, 'VRAM Total Used Memory \(B\):\s*(\d+)') | Select-Object -First 1).Groups[1].Value
+            if (-not $total -or -not $used) {
+              $reason = "rocm-smi returned no VRAM figures (no AMD GPU detected)"
+              Start-Sleep -Seconds 5; continue
+            }
+            $free = [int64]$total - [int64]$used
+            if ($free -ge $minFree) {
+              Write-Host "GPU ready: $([math]::Floor($free/1GB)) GiB free (>= $minFreeGiB GiB)."
+              exit 0
+            }
+            $reason = "VRAM never dropped below the floor: only $([math]::Floor($free/1GB)) GiB free (< $minFreeGiB GiB) - a serve is likely still holding the GPU"
+            Write-Host "waiting: $([math]::Floor($free/1GB)) GiB free (< $minFreeGiB GiB)..."
+            Start-Sleep -Seconds 5
+          }
+          Write-Host "::error::GPU preflight failed after ${ceilingSecs}s: $reason"
+          exit 1
+
+      - name: Ensure Rust toolchain (PowerShell)
+        shell: powershell
+        run: |
+          if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+            Invoke-WebRequest https://win.rustup.rs/x86_64 -OutFile $env:TEMP\rustup-init.exe
+            # --default-toolchain none: rust-toolchain.toml pins the exact
+            # version (1.96.0 + components), auto-installed on first cargo use.
+            & $env:TEMP\rustup-init.exe -y --default-toolchain none
+            "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          }
+
+      - name: Run E2E tests on Strix Halo Windows
+        shell: powershell
+        run: |
+          # Share ONE installed managed runtime across serve/chat scenarios, and
+          # PRE-WARM it in place before the suite (mirrors e2e-gpu / strix-ubuntu).
+          # REQUIRED for correctness, not just speed: `install sdk` bakes ABSOLUTE
+          # paths (install_root, python_executable, rocm_sdk.*, .rocm-cli-runtime.json)
+          # into the runtime manifest. If the first scenario installs into its own
+          # isolated temp data dir and only the registry is shared onward, those baked
+          # paths point at that scenario's dir — deleted when the scenario ends — so
+          # every later serve sees status=unusable and fails (diagnosed on the Linux
+          # box 2026-07-15; the Windows scenario-8 cold-download failure is the same
+          # class). Install in place so the baked paths stay valid for all scenarios.
+          $prewarm = "$env:RUNNER_WORKSPACE\e2e-prewarm"
+          $env:E2E_SHARED_RUNTIMES_DIR = "$prewarm\data\runtimes"
+
+          # Build the rocm binary once; reuse for pre-warm + suite so xtask doesn't
+          # rebuild. This job does not set CARGO_TARGET_DIR, so the binary lands in
+          # the default target\release (fall back to it when the env var is unset).
+          cargo build --release -p rocm
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "target" }
+          $env:ROCM_CLI_BINARY = "$targetDir\release\rocm.exe"
+
+          # Pre-warm once, in place (no move/symlink). Skipped once the tree is
+          # populated (persists across runs on RUNNER_WORKSPACE).
+          if (-not (Test-Path "$env:E2E_SHARED_RUNTIMES_DIR\registry")) {
+            Write-Host "pre-warming shared runtime (first run on this runner)..."
+            New-Item -ItemType Directory -Force -Path "$prewarm\data","$prewarm\config","$prewarm\cache" | Out-Null
+            $env:ROCM_CLI_CONFIG_DIR = "$prewarm\config"
+            $env:ROCM_CLI_DATA_DIR   = "$prewarm\data"
+            $env:ROCM_CLI_CACHE_DIR  = "$prewarm\cache"
+            & $env:ROCM_CLI_BINARY install sdk
+            Remove-Item Env:\ROCM_CLI_CONFIG_DIR,Env:\ROCM_CLI_DATA_DIR,Env:\ROCM_CLI_CACHE_DIR -ErrorAction SilentlyContinue
+            if (Test-Path "$env:E2E_SHARED_RUNTIMES_DIR\registry") {
+              Write-Host "shared runtime pre-warmed at $env:E2E_SHARED_RUNTIMES_DIR"
+            } else {
+              Write-Host "pre-warm did not produce a runtimes registry; scenarios will install their own"
+            }
+          } else {
+            Write-Host "shared runtime already present at $env:E2E_SHARED_RUNTIMES_DIR - skipping pre-warm"
+          }
+
+          # TEMP: optional scenario-name filter for a scoped probe dispatch.
+          $nameFilter = "${{ github.event.inputs.name_filter }}"
+          if ($nameFilter) {
+            Write-Host "TEMP name filter active: $nameFilter"
+            cargo xtask e2e -- --name "$nameFilter"
+          } else {
+            cargo xtask e2e
+          }
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-gpu-strix-windows-report
+          path: tests/e2e-cucumber/results/
+
+  # Consolidate every platform/tier's report into ONE cross-platform report:
+  # a platform × tier matrix in the run Summary plus a single merged HTML
+  # artifact. `if: always()` so a failing/non-blocking platform still appears;
+  # runs on GitHub-hosted ubuntu (no GPU needed — it only parses report.json).
+  #
+  # Extensibility: the report CONTENT auto-includes any new platform via the
+  # `*-report` artifact glob below — no change needed here. The one manual step
+  # when adding a platform is appending its job name to `needs:` (for run ORDERING
+  # only; GitHub Actions has no wildcard `needs`).
+  e2e-report:
+    name: E2E consolidated report
+    runs-on: ubuntu-latest
+    # Bound the job (like every E2E job) so a stalled artifact download can't hang
+    # a hosted runner indefinitely.
+    timeout-minutes: 15
+    needs:
+      - changes
+      - e2e
+      - e2e-gpu
+      - e2e-gpu-strix-ubuntu
+      - e2e-gpu-strix-windows
+    # Consolidate whatever ran. On dispatch `heavy` is unset, so also run when the
+    # trigger was manual; `always()` still lets it collect partial/failed tiers.
+    if: >-
+      always()
+      && (needs.changes.outputs.heavy == 'true'
+        || github.event_name == 'workflow_dispatch')
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      # Pull every e2e artifact. Each extracts to e2e-artifacts/<artifact-name>/,
+      # which `xtask e2e-report` turns into one labeled platform. The `*-report`
+      # glob is what makes new platforms appear automatically.
+      - name: Download all E2E reports
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: '*-report'
+          path: e2e-artifacts
+
+      - name: Build consolidated report + step summary
+        run: |
+          mkdir -p consolidated
+          cargo xtask e2e-report \
+            --artifacts-dir e2e-artifacts \
+            --html-out consolidated/index.html >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload consolidated report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-consolidated-report
+          path: consolidated/

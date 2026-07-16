@@ -123,15 +123,7 @@ pub fn hit_test(area: Rect, x: u16, y: u16) -> Option<KeyAction> {
 }
 
 pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    pane::draw(
-        f,
-        area,
-        "ROCm actions",
-        VERBS,
-        state.rocm_sel,
-        state.pane_focus,
-        theme,
-    );
+    pane::draw(f, area, "ROCm actions", VERBS, state.rocm_sel, state, theme);
 }
 
 #[cfg(test)]
@@ -169,6 +161,30 @@ mod tests {
         ] {
             assert!(out.contains(label), "ROCm row {label:?} missing: {out:?}");
         }
+    }
+
+    #[test]
+    fn rocm_detail_shows_installed_rocm_version() {
+        use rocm_dash_core::metrics::{GpuSystemInfo, Snapshot};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Rocm;
+        s.rocm_sel = 0; // "Set up / Install ROCm" → OpenInstall
+        s.latest = Some(Snapshot {
+            gpu_system_info: Some(GpuSystemInfo {
+                rocm_version: Some("6.4.1".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let out = render(&s, 120, 28);
+        assert!(
+            out.contains("Installed now"),
+            "live install header missing: {out:?}"
+        );
+        assert!(
+            out.contains("6.4.1"),
+            "detected ROCm version not shown: {out:?}"
+        );
     }
 
     #[test]

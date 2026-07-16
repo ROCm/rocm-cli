@@ -39,8 +39,8 @@ mod slash;
 mod summary;
 
 use chat::{
-    build_chat_agent, build_local_agent, detect_local_chat, detect_managed_chat, fetch_first_model,
-    persist_chat_endpoint, with_discovered_model,
+    StartupChatOutcome, build_chat_agent, build_local_agent, detect_local_chat,
+    discover_configured_chat_model, persist_chat_endpoint, startup_chat_outcome,
 };
 use summary::{parse_plan_result, summarize_json_value, summarize_slash_tool};
 
@@ -1562,8 +1562,34 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         // NOT override an explicitly configured `chat_url`/env URL, so config
         // precedence is preserved (we only consult the registry when neither is
         // set, i.e. where the well-known default would otherwise be probed).
-        let managed = if args.chat_url.is_none() && args.chat_env_url.is_none() {
-            detect_managed_chat(state.tool_executor.clone()).await
+        // When neither an explicit URL (CLI/config) nor an env URL is set, run
+        // the SAME full local-engine detection the manual 'd' path uses:
+        // registry-first (an engine we launched ourselves, on whatever port it
+        // bound), then a probe of the well-known Lemonade/vLLM/rocm-serve
+        // ports (parallelized — see `llm::detect_local_endpoint` — so a cold
+        // start with no server doesn't pay 3x the probe timeout), plus a
+        // best-effort served-model fetch. This is what lets a local server win
+        // over the ChatGPT cloud default at startup instead of only the single
+        // well-known :8000 port that a bare `resolve_llm_config` probe covers.
+        //
+        // NOTE: unmerged PR #97 also touches this branch (model discovery when
+        // `chat_model` is None, inside `resolve_llm_config`'s own fallback
+        // path) — this change is conflict-minimal by leaving the
+        // `resolve_llm_config` call below untouched.
+        //
+        // Gate on `chat_api_key.is_none()` too: local detection returns a
+        // keyless `detected_llm_config` (api_key/auth_header forced to None),
+        // so firing it when the user configured a key would SILENTLY DROP that
+        // key and 401 at request time. A configured key means "use my
+        // configured backend", so skip the swap and let `resolve_llm_config`
+        // carry the key through its normal precedence.
+        let detection_ran = chat::should_detect_local_chat(
+            args.chat_url.as_deref(),
+            args.chat_env_url.as_deref(),
+            args.chat_api_key.as_deref(),
+        );
+        let detected = if detection_ran {
+            detect_local_chat(state.tool_executor.clone()).await
         } else {
             None
         };
@@ -1572,20 +1598,23 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             .clone()
             .or_else(|| args.chat_env_url.clone())
             .unwrap_or_else(|| crate::llm::DEFAULT_CHAT_BASE_URL.to_string());
-        // A managed endpoint is already readiness-verified; otherwise TCP-probe.
-        let probe_ok = if managed.is_some() {
-            true
-        } else {
-            tokio::task::spawn_blocking(move || {
+        // A detected endpoint (managed or probed) is already verified. When
+        // detection ran and found nothing it already probed the well-known
+        // vLLM :8000 port (== `DEFAULT_CHAT_BASE_URL`), so re-probing the same
+        // fallback target here is redundant and just burns another probe
+        // timeout on a cold start — treat that as unreachable directly.
+        // Otherwise (an explicit URL/env/key path) TCP-probe the target.
+        let startup_outcome = startup_chat_outcome(detection_ran, detected.is_some());
+        let probe_ok = match startup_outcome {
+            StartupChatOutcome::Local => true,
+            StartupChatOutcome::OAuth => false,
+            StartupChatOutcome::Configured => tokio::task::spawn_blocking(move || {
                 crate::llm::probe_endpoint(&probe_target, crate::llm::PROBE_TIMEOUT)
             })
             .await
-            .unwrap_or(false)
+            .unwrap_or(false),
         };
-        // The managed branch already carries a `/v1/models`-discovered model; a
-        // resolver-produced config from a configured URL does not.
-        let had_managed = managed.is_some();
-        let llm = managed.or_else(|| {
+        let llm = detected.or_else(|| {
             crate::llm::resolve_llm_config(
                 args.chat_url.as_deref(),
                 args.chat_model.as_deref(),
@@ -1597,20 +1626,18 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                 probe_ok,
             )
         });
-        // A configured URL (env/CLI) with no explicit model resolves to the
-        // `local-model` placeholder, which 404s on servers that register the
-        // model under its real id. Discover the served model via `/v1/models`,
-        // mirroring the managed-service path. Gated on `probe_ok` so an
-        // unreachable endpoint never adds the fetch timeout to startup.
+        // PR #97 port onto PR #100's startup flow: a *configured* URL (CLI/env)
+        // with no explicit model resolves to the `local-model` placeholder,
+        // which 404s on servers that register the model under its real id. Only
+        // the `Configured` outcome needs this — the `Local` outcome already
+        // carries a `/v1/models`-discovered model from `detect_local_chat`, and
+        // `OAuth` has no config. Discovery is gated inside the helper on
+        // `probe_ok` (an unreachable endpoint is never probed nor replaced) and
+        // on the absence of an explicit model (config precedence wins).
         let llm = match llm {
-            Some(cfg) if !had_managed && probe_ok && args.chat_model.is_none() => {
-                let discovered = fetch_first_model(&cfg.base_url).await;
-                Some(with_discovered_model(
-                    cfg,
-                    args.chat_model.as_deref(),
-                    discovered,
-                ))
-            }
+            Some(cfg) if startup_outcome == StartupChatOutcome::Configured => Some(
+                discover_configured_chat_model(cfg, args.chat_model.as_deref(), probe_ok).await,
+            ),
             other => other,
         };
         state.set_chat_config(llm, args.chat_auto_consent);
@@ -1618,10 +1645,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         // ChatGPT OAuth default (device-code login surfaced in the chat tab).
         // This restores the no-key login the vendored Codex path provided; it
         // takes NO api_key (env-only invariant untouched — OAuth, not a key).
-        let no_key_no_endpoint = !probe_ok
-            && args.chat_api_key.is_none()
-            && args.chat_url.is_none()
-            && args.chat_env_url.is_none();
+        let no_key_no_endpoint = startup_outcome == StartupChatOutcome::OAuth;
         if no_key_no_endpoint {
             let oauth_tx = chat_tx.clone();
             crate::agent::ChatGptAgentClient::new(
@@ -1713,6 +1737,20 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             }
             maybe_ev = events.next() => {
                 match maybe_ev {
+                    // Only ACT on key presses. Terminals (notably Windows
+                    // Terminal / ConPTY under WSL, and any with the kitty
+                    // keyboard protocol) also emit Release/Repeat events; the
+                    // general `handle_key` already drops non-Press, but the
+                    // operational-overlay arms below dispatch straight to their
+                    // managers and would otherwise process the SAME keystroke
+                    // twice. That double-fire is what made Enter in the serve
+                    // wizard's model picker re-open the picker (seeding it with
+                    // the just-chosen model as a filter) instead of choosing.
+                    // Swallow non-Press key events here, above every key arm, so
+                    // the Press-only invariant holds for overlays too.
+                    Some(Ok(CtEvent::Key(k))) if !is_actionable_key(k.kind) => {
+                        let _ = k;
+                    }
                     // The approval modal, when open, owns ALL keys with the
                     // highest priority (above every operational overlay and the
                     // general handler) so the operator's decision can't be
@@ -2698,8 +2736,21 @@ pub enum KeyAction {
     OpenLogs,
 }
 
+/// Whether a crossterm key event should be acted on. Terminals emit
+/// Release/Repeat events in addition to Press (notably Windows Terminal /
+/// ConPTY under WSL, and any terminal advertising the kitty keyboard protocol).
+///
+/// The whole TUI acts on Press only. Both the general [`handle_key`] and the
+/// event loop's operational-overlay dispatch share this gate — without it, a
+/// single keystroke reaches an overlay's `on_key` more than once, which made
+/// Enter in the serve wizard's model picker re-open the picker (seeded with the
+/// just-chosen model as a filter) instead of choosing it.
+const fn is_actionable_key(kind: KeyEventKind) -> bool {
+    matches!(kind, KeyEventKind::Press)
+}
+
 fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) -> KeyAction {
-    if k.kind != KeyEventKind::Press {
+    if !is_actionable_key(k.kind) {
         return KeyAction::Nothing;
     }
     // Chat tab key handling, placed BEFORE the global hotkey match so focused
@@ -3459,6 +3510,18 @@ mod tests {
             ),
             KeyAction::Nothing
         );
+    }
+
+    #[test]
+    fn only_press_key_events_are_actionable() {
+        // The event loop gates overlay dispatch on this predicate so a single
+        // keystroke isn't processed twice by an overlay's `on_key` (Release /
+        // Repeat echoes on Windows Terminal / ConPTY / kitty keyboard). The
+        // double-fire re-opened the serve wizard's model picker on Enter instead
+        // of choosing — this pins Press-only routing.
+        assert!(is_actionable_key(KeyEventKind::Press));
+        assert!(!is_actionable_key(KeyEventKind::Release));
+        assert!(!is_actionable_key(KeyEventKind::Repeat));
     }
 
     #[test]

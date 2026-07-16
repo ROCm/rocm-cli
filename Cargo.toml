@@ -9,9 +9,11 @@ members = [
   "crates/rocm-dash-collectors",
   "crates/rocm-dash-daemon",
   "crates/rocm-dash-tui",
+  "crates/e2e-report",
   "engines/lemonade",
   "engines/vllm",
   "xtask",
+  "tests/e2e-cucumber",
 ]
 resolver = "2"
 
