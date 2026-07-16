@@ -5,7 +5,7 @@
 **Stage:** 0-idea
 **Pipeline:** standard
 **Branch:** fix-speed-up-e2e
-**Last Updated:** 2026-07-16
+**Last Updated:** 2026-07-16 (idle flush)
 
 **Token Usage:** in=306 out=95333 cache_create=376084 cache_read=18574529 calls=154
 
@@ -110,3 +110,5 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persiste-app-dev-c
 - IMPLEMENTED VRAM-floor fix (serving_steps.rs): added `total_vram_mib`/`vram_mib` probe (amd-smi TOTAL_VRAM + rocm-smi total), `required_free_vram_mib(total) = min(150_000, total*0.9)`; `wait_for_free_vram` now uses the scaled floor. MI300X floor unchanged (150 GB); Strix ~43-55 GB (reachable). `cargo check -p e2e-cucumber --test e2e` passes.
 - NOT yet verified on real GPU — behavioral confirmation needs a Strix-Ubuntu CI run (expect ~12 min saved on that lane). Compile + arithmetic verified only.
 - Moved to Task #2 (CI tiering). Note: EAI-7423 (lemonade-on-Strix-Linux serve fails at 90s) is a real bug separate from the VRAM-floor waste fix.
+
+**2026-07-16 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
