@@ -155,6 +155,10 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persiste-app-dev-c
 
 ## Work Log
 
+### 2026-07-16 (idle flush)
+
+Session idle for 10 minutes, auto-flushing WIP state.
+
 ### 2026-07-16 — Task #1 fix complete & probe dispatched, Task #3 scenarios drafted, container gate validated
 
 - **Task #1 root cause + fix:** hardcoded `MIN_FREE_VRAM_MIB=150_000` (sized for MI300X only) vs Strix's 62 GiB total → every serve waited 2 min for an unreachable threshold (~12 min wasted on lane). Fix: `required_free_vram_mib(total) = min(150_000, total*0.9)`. Commit `122d2be` (signed/signed-off, pushed origin/fix-speed-up-e2e).
