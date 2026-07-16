@@ -444,15 +444,15 @@ try {
     $httpInstallDir = Join-Path $AcceptanceRoot "http-install\bin"
     $httpPort = Get-FreeTcpPort
     $httpServer = Start-Job -ScriptBlock {
-        param($Root, $Port)
+        $root = $using:DistDir
         $listener = [System.Net.HttpListener]::new()
-        $listener.Prefixes.Add("http://127.0.0.1:$Port/")
+        $listener.Prefixes.Add(('http://127.0.0.1:{0}/' -f $using:httpPort))
         $listener.Start()
         try {
             while ($listener.IsListening) {
                 $context = $listener.GetContext()
                 $relative = $context.Request.Url.AbsolutePath.TrimStart('/')
-                $path = Join-Path $Root $relative
+                $path = Join-Path $root $relative
                 if (Test-Path -LiteralPath $path -PathType Leaf) {
                     $bytes = [System.IO.File]::ReadAllBytes($path)
                     $context.Response.StatusCode = 200
@@ -466,7 +466,7 @@ try {
         } finally {
             $listener.Stop()
         }
-    } -ArgumentList $DistDir, $httpPort
+    }
     try {
         # Wait for the listener to accept connections before installing.
         $ready = $false
