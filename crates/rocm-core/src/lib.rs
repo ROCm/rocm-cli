@@ -3539,7 +3539,8 @@ pub fn has_usable_amd_gpu() -> bool {
 
 #[cfg(target_os = "linux")]
 fn probe_usable_amd_gpu_indices() -> Option<Vec<u32>> {
-    let present = linux_kfd_gpu_node_count()?;
+    let present =
+        combine_amd_gpu_counts(linux_kfd_gpu_node_count(), linux_drm_amdgpu_card_count())?;
     Some(usable_amd_gpu_indices_from(
         present,
         visibility_mask_from_env(),
@@ -3549,6 +3550,41 @@ fn probe_usable_amd_gpu_indices() -> Option<Vec<u32>> {
 #[cfg(not(target_os = "linux"))]
 fn probe_usable_amd_gpu_indices() -> Option<Vec<u32>> {
     None
+}
+
+/// Combine the KFD-topology and DRM-card AMD GPU counts into one "GPUs present"
+/// figure, taking the larger available count. Some hosts (e.g. Strix Halo APUs)
+/// enumerate the GPU only via DRM ip-discovery and report zero KFD GPU nodes, so
+/// relying on KFD alone would wrongly conclude there is no GPU and block serving.
+/// `None` only when NEITHER surface could be read (availability truly unknown).
+#[cfg(any(target_os = "linux", test))]
+fn combine_amd_gpu_counts(kfd: Option<usize>, drm: Option<usize>) -> Option<usize> {
+    match (kfd, drm) {
+        (Some(k), Some(d)) => Some(k.max(d)),
+        (Some(n), None) | (None, Some(n)) => Some(n),
+        (None, None) => None,
+    }
+}
+
+/// Count AMD (`amdgpu`) primary DRM cards under `/sys/class/drm` (`card0`,
+/// `card1`, …), skipping connector sub-nodes like `card0-DP-1`. `None` when the
+/// DRM class dir can't be read; `Some(0)` when it is readable with no AMD card.
+#[cfg(target_os = "linux")]
+fn linux_drm_amdgpu_card_count() -> Option<usize> {
+    let entries = fs::read_dir(Path::new("/sys/class/drm")).ok()?;
+    let count = entries
+        .flatten()
+        .filter(|entry| {
+            let card_path = entry.path();
+            let Some(name) = card_path.file_name().and_then(|value| value.to_str()) else {
+                return false;
+            };
+            name.starts_with("card")
+                && !name.contains('-')
+                && is_amdgpu_device(&card_path.join("device"))
+        })
+        .count();
+    Some(count)
 }
 
 /// Count AMD GPU nodes in the KFD topology. `Some(0)` is an authoritative "no
@@ -3591,7 +3627,11 @@ fn kfd_gfx_target_version_is_gpu(value: &str) -> bool {
 /// `ROCR_VISIBLE_DEVICES`. `None` when neither is set; an explicitly empty value
 /// is returned as `Some("")` so callers can distinguish "unset" (all visible)
 /// from "set to nothing" (all masked out).
-#[cfg(any(target_os = "linux", test))]
+///
+/// Linux-only: its sole caller is the Linux probe. (Not `+ test` — no test
+/// references it directly, so compiling it into a non-Linux test build would be
+/// dead code, which the workspace lints deny.)
+#[cfg(target_os = "linux")]
 fn visibility_mask_from_env() -> Option<String> {
     ["HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"]
         .into_iter()
@@ -8275,6 +8315,21 @@ last_installed_runtime_id = "therock-release"
         assert!(!kfd_gfx_target_version_is_gpu("not-a-number"));
         assert!(kfd_gfx_target_version_is_gpu("90402"));
         assert!(kfd_gfx_target_version_is_gpu("110000"));
+    }
+
+    #[test]
+    fn combine_amd_gpu_counts_takes_larger_and_needs_one_readable_surface() {
+        // Strix Halo shape: KFD reports 0 GPU nodes, DRM sees the iGPU → 1 present.
+        assert_eq!(combine_amd_gpu_counts(Some(0), Some(1)), Some(1));
+        // Discrete GPUs: both surfaces agree.
+        assert_eq!(combine_amd_gpu_counts(Some(8), Some(8)), Some(8));
+        // One surface unreadable → use the other.
+        assert_eq!(combine_amd_gpu_counts(None, Some(1)), Some(1));
+        assert_eq!(combine_amd_gpu_counts(Some(2), None), Some(2));
+        // Neither readable → unknown (caller must not treat as zero).
+        assert_eq!(combine_amd_gpu_counts(None, None), None);
+        // Both agree on zero → authoritative no-GPU.
+        assert_eq!(combine_amd_gpu_counts(Some(0), Some(0)), Some(0));
     }
 
     #[test]
