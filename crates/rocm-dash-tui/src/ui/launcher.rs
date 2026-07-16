@@ -16,6 +16,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+#[cfg(test)]
 use rocm_dash_core::metrics::InstanceStatus;
 
 use crate::app::AppState;
@@ -84,10 +85,7 @@ pub fn choice_for(sel: usize) -> LauncherChoice {
 
 /// True when a model is actively serving (drives the running vs idle variant).
 fn is_running(state: &AppState) -> bool {
-    state
-        .instances
-        .values()
-        .any(|i| i.status == InstanceStatus::Running)
+    state.instances.values().any(|i| i.status.is_serving())
 }
 
 pub fn draw(f: &mut Frame, area: Rect, state: &AppState, sel: usize, theme: &Theme) {
@@ -163,10 +161,7 @@ fn draw_status_strip(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         },
     );
     let serve_line = if running {
-        let inst = state
-            .instances
-            .values()
-            .find(|i| i.status == InstanceStatus::Running);
+        let inst = state.instances.values().find(|i| i.status.is_serving());
         let (name, port) = inst.map_or(("model", String::new()), |i| {
             (
                 i.model_name.as_str(),
