@@ -229,21 +229,67 @@ pub(super) async fn detect_managed_chat(
 pub(super) async fn detect_local_chat(
     executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
 ) -> Option<crate::llm::LlmConfig> {
+    detect_local_chat_with_probe(executor, crate::llm::detect_local_endpoint).await
+}
+
+/// Same as [`detect_local_chat`], but with the well-known-port probe passed
+/// in rather than hard-coded, so a test can substitute a deterministic probe
+/// instead of depending on the real well-known ports being free on the
+/// machine running the test.
+async fn detect_local_chat_with_probe(
+    executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
+    probe: impl Fn() -> Option<&'static str> + Send + 'static,
+) -> Option<crate::llm::LlmConfig> {
     if let Some(cfg) = detect_managed_chat(executor).await {
         return Some(cfg);
     }
 
     // TCP probe is blocking; keep it off the async reactor.
-    let base = tokio::task::spawn_blocking(crate::llm::detect_local_endpoint)
-        .await
-        .ok()
-        .flatten()?;
+    let base = tokio::task::spawn_blocking(probe).await.ok().flatten()?;
 
     // Best-effort model query; fall back to the neutral default on any failure.
     let model = fetch_first_model(base)
         .await
         .unwrap_or_else(|| crate::llm::DEFAULT_CHAT_MODEL.to_string());
     Some(crate::llm::detected_llm_config(base, &model))
+}
+
+/// Whether startup should run the local-engine auto-detection swap.
+///
+/// Detection produces a keyless [`crate::llm::detected_llm_config`], so it may
+/// only fire when the user configured NO endpoint (URL/env URL) AND NO api key
+/// — otherwise the swap would silently drop a configured credential and 401 at
+/// request time. Pure; the anchor for the startup-gate unit test.
+pub(super) const fn should_detect_local_chat(
+    chat_url: Option<&str>,
+    chat_env_url: Option<&str>,
+    chat_api_key: Option<&str>,
+) -> bool {
+    chat_url.is_none() && chat_env_url.is_none() && chat_api_key.is_none()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StartupChatOutcome {
+    Local,
+    OAuth,
+    Configured,
+}
+
+/// Select the startup backend path after optional local detection.
+///
+/// A successful detection is already reachable. A detection miss means the
+/// well-known endpoints were exhausted and startup should proceed to OAuth.
+/// When detection was gated off, the configured target still needs its normal
+/// liveness probe before backend construction.
+pub(super) const fn startup_chat_outcome(
+    detection_ran: bool,
+    detected: bool,
+) -> StartupChatOutcome {
+    match (detection_ran, detected) {
+        (_, true) => StartupChatOutcome::Local,
+        (true, false) => StartupChatOutcome::OAuth,
+        (false, false) => StartupChatOutcome::Configured,
+    }
 }
 
 /// Decide whether a persisted `chat_url` should be replaced by a freshly
@@ -319,8 +365,28 @@ pub(super) fn config_with_chat(
     cfg
 }
 
+/// Fold a `/v1/models`-discovered model id into a resolved [`LlmConfig`].
+///
+/// Only overrides when the user did **not** configure a model explicitly (so the
+/// resolver filled in the neutral `DEFAULT_CHAT_MODEL` placeholder). An explicit
+/// `--chat-model`/config value always wins; a failed discovery (`None`) leaves
+/// the placeholder in place so endpoints that ignore the model field keep
+/// working. Pure — the unit-test anchor for the startup model-discovery wiring.
+pub(super) fn with_discovered_model(
+    mut llm: crate::llm::LlmConfig,
+    explicit_model: Option<&str>,
+    discovered: Option<String>,
+) -> crate::llm::LlmConfig {
+    if explicit_model.is_none()
+        && let Some(model) = discovered
+    {
+        llm.model = model;
+    }
+    llm
+}
+
 /// GET `{base}/models` and return the first served model id, or `None`.
-async fn fetch_first_model(base_url: &str) -> Option<String> {
+pub(super) async fn fetch_first_model(base_url: &str) -> Option<String> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -329,6 +395,34 @@ async fn fetch_first_model(base_url: &str) -> Option<String> {
     let resp = client.get(&url).send().await.ok()?;
     let json: serde_json::Value = resp.json().await.ok()?;
     crate::llm::pick_first_model(&json)
+}
+
+/// Startup served-model discovery for a *configured* chat endpoint (an explicit
+/// CLI/env URL, i.e. the [`StartupChatOutcome::Configured`] path that skips
+/// local auto-detection).
+///
+/// A configured URL with no explicit model resolves to the `local-model`
+/// placeholder, which 404s on servers that register the model under its real id
+/// (`The model 'local-model' does not exist`). When the endpoint is reachable
+/// (`probe_ok`) and the user set no explicit model, query `/v1/models` and adopt
+/// the served id — mirroring the discovery [`detect_local_chat`] already does
+/// for the auto-detected path. Otherwise the config is returned untouched: an
+/// explicit model always wins, and an unreachable endpoint is never probed
+/// (no fetch timeout) nor silently replaced. The `/v1/models` fold is delegated
+/// to the pure [`with_discovered_model`].
+pub(super) async fn discover_configured_chat_model(
+    cfg: crate::llm::LlmConfig,
+    explicit_model: Option<&str>,
+    probe_ok: bool,
+) -> crate::llm::LlmConfig {
+    // An explicit model always wins (config precedence), and an unreachable
+    // endpoint is never probed (no fetch timeout on startup) nor silently
+    // replaced — return the resolved config untouched in both cases.
+    if !probe_ok || explicit_model.is_some() {
+        return cfg;
+    }
+    let discovered = fetch_first_model(&cfg.base_url).await;
+    with_discovered_model(cfg, explicit_model, discovered)
 }
 
 #[cfg(test)]
@@ -515,5 +609,158 @@ mod tests {
         assert_eq!(normalize_base_url("http://h:8000/v1"), "http://h:8000");
         assert_eq!(normalize_base_url("http://h:8000/"), "http://h:8000");
         assert_eq!(normalize_base_url("http://h:8000"), "http://h:8000");
+    }
+
+    fn placeholder_config() -> crate::llm::LlmConfig {
+        crate::llm::detected_llm_config("http://127.0.0.1:11435/v1", crate::llm::DEFAULT_CHAT_MODEL)
+    }
+
+    #[test]
+    fn discovered_model_replaces_placeholder_when_none_configured() {
+        // The 404 regression: no explicit model → the served id must be adopted.
+        let out = with_discovered_model(
+            placeholder_config(),
+            None,
+            Some("Qwen/Qwen2.5-1.5B-Instruct".to_string()),
+        );
+        assert_eq!(out.model, "Qwen/Qwen2.5-1.5B-Instruct");
+    }
+
+    #[test]
+    fn explicit_model_is_never_overridden() {
+        let mut cfg = placeholder_config();
+        cfg.model = "my-model".to_string();
+        let out = with_discovered_model(cfg, Some("my-model"), Some("served-id".to_string()));
+        assert_eq!(out.model, "my-model");
+    }
+
+    #[test]
+    fn failed_discovery_keeps_placeholder() {
+        let out = with_discovered_model(placeholder_config(), None, None);
+        assert_eq!(out.model, crate::llm::DEFAULT_CHAT_MODEL);
+    }
+
+    /// One-shot HTTP server on an ephemeral loopback port that answers a single
+    /// `GET .../models` with `body`, returning its `http://127.0.0.1:{port}/v1`
+    /// base URL. Lets the behavioral tests drive `fetch_first_model`'s real
+    /// reqwest path against a deterministic `/v1/models` response without a new
+    /// dev-dependency. The accept loop runs on a detached thread and closes
+    /// after the single request.
+    fn spawn_models_server(body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://127.0.0.1:{port}/v1")
+    }
+
+    /// Matrix (configured URL + no model + reachable): the startup path queries
+    /// `/v1/models` and adopts the first served id. Fails on merged-main, whose
+    /// configured-endpoint path leaves the `DEFAULT_CHAT_MODEL` placeholder in
+    /// place (the `The model 'local-model' does not exist` 404).
+    #[tokio::test]
+    async fn configured_endpoint_adopts_served_model_when_no_model_set() {
+        let base = spawn_models_server(r#"{"data":[{"id":"served-model-id"}]}"#);
+        let cfg = crate::llm::detected_llm_config(&base, crate::llm::DEFAULT_CHAT_MODEL);
+        let out = discover_configured_chat_model(cfg, None, true).await;
+        assert_eq!(out.model, "served-model-id");
+    }
+
+    /// Matrix (configured URL + explicit model + reachable): discovery must not
+    /// override the user's model — config precedence is preserved even when the
+    /// endpoint serves a different id.
+    #[tokio::test]
+    async fn configured_endpoint_preserves_explicit_model() {
+        let base = spawn_models_server(r#"{"data":[{"id":"served-model-id"}]}"#);
+        let cfg = crate::llm::detected_llm_config(&base, "user-model");
+        let out = discover_configured_chat_model(cfg, Some("user-model"), true).await;
+        assert_eq!(out.model, "user-model");
+    }
+
+    /// Matrix (configured URL + no model + unreachable): fail honestly — the
+    /// configured endpoint is never swapped and no `/v1/models` fetch is even
+    /// attempted (`probe_ok == false` gates it out, so startup pays no fetch
+    /// timeout). base_url and the placeholder model are left untouched.
+    #[tokio::test]
+    async fn configured_endpoint_unreachable_is_never_replaced() {
+        let cfg = crate::llm::detected_llm_config(
+            "http://127.0.0.1:9/v1",
+            crate::llm::DEFAULT_CHAT_MODEL,
+        );
+        let out = discover_configured_chat_model(cfg.clone(), None, false).await;
+        assert_eq!(out.base_url, cfg.base_url);
+        assert_eq!(out.model, crate::llm::DEFAULT_CHAT_MODEL);
+    }
+
+    /// EAI-7347: startup now reuses `detect_local_chat` (the same detection the
+    /// manual 'd' path already used) instead of a single well-known-port probe,
+    /// so a local server on a non-default well-known port (e.g. `rocm serve`'s
+    /// :11435) is preferred over falling back to the ChatGPT cloud default.
+    #[tokio::test]
+    async fn detect_local_chat_wires_probed_endpoint_through() {
+        // Priority order among the well-known ports (Lemonade > vLLM > rocm
+        // serve's default) is covered deterministically in `llm.rs`'s own
+        // tests, against OS-assigned ephemeral ports. This test's job is
+        // narrower: prove `detect_local_chat`'s no-managed-executor path
+        // wires whatever the well-known-port probe finds into the resulting
+        // config, rather than falling back to the cloud default — so the
+        // probe is injected rather than exercised against real ports (real
+        // ports it doesn't own would make this flake on a CI runner where an
+        // ambient listener happens to occupy one of them).
+        const PROBED: &str = "http://127.0.0.1:1/v1";
+        let cfg = detect_local_chat_with_probe(None, || Some(PROBED))
+            .await
+            .expect("local server detected");
+        assert_eq!(cfg.base_url, PROBED);
+    }
+
+    #[test]
+    fn should_detect_only_when_no_url_env_or_key_configured() {
+        // The clean slate: nothing configured → auto-detect a local engine.
+        assert!(should_detect_local_chat(None, None, None));
+        // A configured api key must SUPPRESS the swap — detection returns a
+        // keyless config and would otherwise silently drop the key (401).
+        assert!(!should_detect_local_chat(None, None, Some("sk-configured")));
+        // An explicit URL or env URL also suppresses it (config precedence).
+        assert!(!should_detect_local_chat(
+            Some("http://cfg:1/v1"),
+            None,
+            None
+        ));
+        assert!(!should_detect_local_chat(
+            None,
+            Some("http://env:2/v1"),
+            None
+        ));
+    }
+
+    #[test]
+    fn startup_uses_detected_local_endpoint() {
+        assert_eq!(startup_chat_outcome(true, true), StartupChatOutcome::Local);
+    }
+
+    #[test]
+    fn startup_uses_oauth_after_empty_detection() {
+        assert_eq!(startup_chat_outcome(true, false), StartupChatOutcome::OAuth);
+    }
+
+    #[test]
+    fn startup_uses_configured_endpoint_when_detection_is_skipped() {
+        assert_eq!(
+            startup_chat_outcome(false, false),
+            StartupChatOutcome::Configured
+        );
     }
 }

@@ -3887,6 +3887,7 @@ fn serve(args: ServeArgs) -> Result<()> {
             );
             let summary = serve_summary::DeploymentSummary {
                 engine: selected_engine.clone(),
+                requested_model: model,
                 api_model: resolve.canonical_model_id,
                 chat_endpoint: format!("{}/chat/completions", report.endpoint_url),
                 service_id: report.service_id.clone(),
