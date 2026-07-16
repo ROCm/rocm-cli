@@ -155,6 +155,9 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persiste-app-dev-c
 
 ## Work Log
 
+### 2026-07-16 (idle flush)
+- Session idle for 10 minutes, auto-flushing WIP state.
+
 ### 2026-07-16 — Task #1 fix complete, Task #3 scenarios drafted, probing underway
 
 - **Task #1 root cause + fix:** hardcoded VRAM-floor 150 GB (MI300X-only) vs Strix's 62 GiB → 2-min timeout on every serve (~12 min wasted). Fix: scale floor to `min(150_000, total*0.9)`. Commit `122d2be` signed/signed-off, pushed.
