@@ -426,6 +426,15 @@ pub async fn run_loop(
                             inst.gen_tps = gen_tps;
                             inst.ttft_ms = ttft_ms;
                             inst.tpot_ms = tpot_ms;
+                            // Docker-discovered instances have no
+                            // `ManagedServiceRecord` to promote their status, so
+                            // they start life as `Starting`. A successful vLLM
+                            // Prometheus scrape is the first hard evidence the
+                            // instance is actually serving requests, so promote
+                            // it to `Ready` here.
+                            if inst.status == InstanceStatus::Starting {
+                                inst.status = InstanceStatus::Ready;
+                            }
                             runner.state.apply(StateEvent::InstanceUpserted(inst));
                         }
                     }
@@ -474,6 +483,12 @@ pub async fn run_loop(
                         inst.kv_cache_usage_pct = sample.kv_cache_usage_pct;
                         inst.running_reqs = sample.running_reqs;
                         inst.waiting_reqs = sample.waiting_reqs;
+                        // See the vLLM scrape-success handler above: a
+                        // successful stats fetch is proof the Lemonade
+                        // instance is serving, so promote it out of Starting.
+                        if inst.status == InstanceStatus::Starting {
+                            inst.status = InstanceStatus::Ready;
+                        }
                         runner.state.apply(StateEvent::InstanceUpserted(inst));
                     }
                 }
@@ -593,11 +608,14 @@ pub async fn run_loop(
 }
 
 /// Build an `Instance` from a `DiscoveredService` with no live KV/req sample yet.
-/// vLLM Prometheus scraping will fill these fields in a later collector.
+///
+/// Status is taken from `svc.status` — the caller sets it from whatever real
+/// signal its discovery source has (a managed-service record's status, a
+/// Lemonade health probe, or `Starting` for a Docker container with no status
+/// source until its first successful vLLM Prometheus scrape). vLLM Prometheus
+/// scraping fills the KV/req sample fields in a later collector tick.
 pub(crate) fn instance_from_discovered(svc: &DiscoveredService) -> Instance {
-    let mut inst = merge_instance(svc, &InstanceSample::default(), 0, 0);
-    inst.status = InstanceStatus::Running;
-    inst
+    merge_instance(svc, &InstanceSample::default(), 0, 0)
 }
 
 /// Set `vram_used_mb`/`vram_total_mb` on each instance from the per-process

@@ -301,6 +301,7 @@ const fn status_meta(
 ) -> (ratatui::style::Color, &'static str) {
     match status {
         InstanceStatus::Running => (theme.ok, "RUNNING"),
+        InstanceStatus::Ready => (theme.ok, "READY"),
         InstanceStatus::Starting => (theme.warn, "STARTING"),
         InstanceStatus::Stopped => (theme.err, "STOPPED"),
         InstanceStatus::Error => (theme.err, "ERROR"),
@@ -312,7 +313,7 @@ const fn status_meta(
 /// health-driven border color.
 const fn status_role(status: InstanceStatus) -> BoxRole {
     match status {
-        InstanceStatus::Running => BoxRole::Success,
+        InstanceStatus::Running | InstanceStatus::Ready => BoxRole::Success,
         InstanceStatus::Starting => BoxRole::Warning,
         InstanceStatus::Stopped | InstanceStatus::Error => BoxRole::Danger,
         InstanceStatus::Unknown => BoxRole::Muted,
@@ -878,6 +879,7 @@ mod tests {
             bench_detail_scroll: 0,
             console_scroll: 0,
             console_hscroll: 0,
+            tick_count: 0,
             dock_logs_scroll: 0,
             last_dock_area: None,
             chat: Vec::new(),
@@ -895,6 +897,7 @@ mod tests {
             chat_detect_msg: None,
             chat_persist_dispatch: false,
             replay: None,
+            simulated: false,
             last_body_area: None,
             last_tab_bar_area: None,
             last_footer_chips: Vec::new(),

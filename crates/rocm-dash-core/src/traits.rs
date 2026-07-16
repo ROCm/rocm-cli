@@ -69,6 +69,11 @@ pub struct DiscoveredService {
     pub env_vars: std::collections::BTreeMap<String, String>,
     pub pid: u32,
     pub log_file: Option<String>,
+    /// The instance's real status, when the discovery source knows it (e.g. a
+    /// rocm-cli managed-service record's `status` field). Sources with no
+    /// authoritative status (Docker containers) leave this at the default and
+    /// the caller decides how to treat it.
+    pub status: crate::metrics::InstanceStatus,
 }
 
 pub trait ServiceDiscovery: Send + Sync {
@@ -119,6 +124,11 @@ pub trait BenchTailer: Send + Sync {
 }
 
 /// Merge per-instance metadata + live sample into a finished `Instance`.
+///
+/// `status` comes from `svc.status` — the discovery source's own knowledge of
+/// the instance's real state (e.g. a managed-service record's `status`
+/// field). Sources with no authoritative status leave `svc.status` at its
+/// default and the caller is responsible for setting it before/after this call.
 pub fn merge_instance(
     svc: &DiscoveredService,
     sample: &InstanceSample,
@@ -128,7 +138,7 @@ pub fn merge_instance(
     Instance {
         container_id: svc.container_id.clone(),
         container_name: svc.container_name.clone(),
-        status: crate::metrics::InstanceStatus::Running,
+        status: svc.status,
         model_name: svc.model_name.clone(),
         gpu_ids: svc.gpu_ids.clone(),
         partition_info: None,

@@ -36,7 +36,7 @@ use std::path::Path;
 
 use crate::runner::instance_from_discovered;
 use rocm_dash_collectors::engine_registry::EngineKind;
-use rocm_dash_core::metrics::Instance;
+use rocm_dash_core::metrics::{Instance, InstanceStatus};
 use rocm_dash_core::traits::DiscoveredService;
 use serde::Deserialize;
 
@@ -67,13 +67,28 @@ pub struct ServiceRecord {
 
 /// Service statuses worth scraping.
 ///
-/// Matches the live set the rocm-cli supervisor overlays onto a record (`ready`/`running`/`starting`);
-/// a `failed`/`stopped` record is skipped so we never poll a dead port.
+/// Matches the live set the rocm-cli supervisor overlays onto a record
+/// (`ready`/`running`/`starting`/`recovering` — see e.g. `apps/rocm/src/main.rs`'s
+/// own "is this service live" checks); a `failed`/`stopped` record is skipped
+/// so we never poll a dead port.
 pub fn is_scrapeable_status(status: &str) -> bool {
     matches!(
         status.trim().to_ascii_lowercase().as_str(),
-        "ready" | "running" | "starting"
+        "ready" | "running" | "starting" | "recovering"
     )
+}
+
+/// Map a rocm-cli managed-service record's `status` string onto the
+/// dashboard's `InstanceStatus`. Only called after `is_scrapeable_status` has
+/// already filtered out `failed`/`stopped`/unrecognized strings, so the `_`
+/// fallback arm is unreachable in practice but kept total for safety.
+fn instance_status_for_record_status(status: &str) -> InstanceStatus {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "ready" => InstanceStatus::Ready,
+        "running" => InstanceStatus::Running,
+        "starting" | "recovering" => InstanceStatus::Starting,
+        _ => InstanceStatus::Unknown,
+    }
 }
 
 /// Load every managed-service record under `services_dir`, newest first.
@@ -129,6 +144,7 @@ pub fn discovered_from_record(record: &ServiceRecord) -> Option<DiscoveredServic
         container_name: record.service_id.clone(),
         model_name,
         port: Some(record.port),
+        status: instance_status_for_record_status(&record.status),
         ..Default::default()
     })
 }
@@ -294,6 +310,26 @@ mod tests {
                 discovered_from_record(&rec).is_some(),
                 "status {live:?} must be scraped"
             );
+        }
+    }
+
+    #[test]
+    fn discovered_from_record_maps_status_string_to_instance_status() {
+        // The registry seam must surface the record's real lifecycle state,
+        // not silently downgrade everything to `Running`/`Unknown`.
+        let cases = [
+            ("ready", InstanceStatus::Ready),
+            ("running", InstanceStatus::Running),
+            ("RUNNING", InstanceStatus::Running),
+            ("starting", InstanceStatus::Starting),
+            ("recovering", InstanceStatus::Starting),
+        ];
+        for (status, expected) in cases {
+            let rec: ServiceRecord =
+                serde_json::from_str(&record_json("svc", "vllm", 8000, status, 1)).unwrap();
+            let svc = discovered_from_record(&rec)
+                .unwrap_or_else(|| panic!("status {status:?} must be scrapeable"));
+            assert_eq!(svc.status, expected, "status {status:?}");
         }
     }
 

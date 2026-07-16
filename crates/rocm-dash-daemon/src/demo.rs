@@ -137,16 +137,34 @@ pub fn generate_to_writer<W: Write>(opts: &DemoOptions, w: &mut W) -> anyhow::Re
 
 /// Write a synthetic session to `path` (via a buffered file writer).
 ///
-/// On a mid-write failure the partial file is removed so a failed run never
-/// leaves a corrupt session behind.
+/// The file is created private to the current user (`0o600` on Unix) so a
+/// demo/replay session is never world-readable. On a mid-write failure the
+/// partial file is removed so a failed run never leaves a corrupt session behind.
 pub fn generate_file(opts: &DemoOptions, path: &Path) -> anyhow::Result<()> {
-    let mut w = BufWriter::new(File::create(path)?);
+    let mut w = BufWriter::new(create_private_file(path)?);
     if let Err(e) = generate_to_writer(opts, &mut w) {
         drop(w);
         let _ = std::fs::remove_file(path);
         return Err(e);
     }
     Ok(())
+}
+
+/// Create (or truncate) `path` for writing, restricted to the owner on Unix.
+#[cfg(unix)]
+fn create_private_file(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_file(path: &Path) -> std::io::Result<File> {
+    File::create(path)
 }
 
 /// Upper bound on `DemoOptions::seconds` — ~115 days at 1Hz. Keeps generation
