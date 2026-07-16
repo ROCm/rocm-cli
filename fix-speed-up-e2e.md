@@ -122,11 +122,11 @@ fix-2-unset-override --dry-run` panics (rc=101) — a dry-run should never panic
 - ✅ Implement VRAM-floor fix: added device-total probe, scaled floor to `min(150_000, total*0.9)`, verified compile + arithmetic. Committed and pushed to origin/fix-speed-up-e2e (commit `122d2be`).
 
 ### In Progress ⏳
-- ⏳ Task #1 probe: run 29529197875 (Strix-Ubuntu, 2 serve scenarios) queued, waiting behind PR/merge work. Auto-loop every 10m; no action until completion.
+- ✅ Task #1 probe COMPLETE (run 29529197875, Strix-Ubuntu): **VRAM fix CONFIRMED**. Serve step = 91s (pure 90s readiness wait) vs ~262s baseline → the ~120s `wait_for_free_vram` dead-time is GONE. The job's "1 unexpected failure / regression" flag is a FALSE ALARM from `--name` scoped mode: platform.json recorded 0 expectations (scoped `--name` bypasses the `.filter_run` resolutions-population path; baseline full run recorded 25). So the EAI-7423 lemonade xfail couldn't reconcile — NOT caused by my change, reproduces only under `--name`. NOTE for the scoped-dispatch method: `--name` breaks reconciliation; judge scoped probes by step TIMING/behavior, not the pass/fail verdict.
 - ✅ Task #3 scenarios: 6 BDD (diagnose/fix, mock-lane GPU-independent). Verified live in container; corrected 3 assumptions (OS-gating, env-dependence, rc codes). Ready for implementation review.
 
 ### Todo 📋
-- 📋 Task #1 probe completion: run 29529197875 still queued; verify timing drop on completion → open PR.
+- 📋 Open PR for `122d2be` (VRAM floor fix) — probe confirmed, container gate green.
 - 📋 Task #2: Rework CI tiering (per-PR vs nightly) — verify/tune existing `@nightly` split.
 - 📋 Task #3: Implement diagnose E2E test steps + expectations.toml (scenarios drafted + verified, ready for code).
 - 📋 Task #4: Confirm Strix Halo Qwen variant (user decision: latest vs smallest).
@@ -163,6 +163,10 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persiste-app-dev-c
 - Recreate with: `create_worktree.sh fix-speed-up-e2e`
 
 ## Work Log
+
+### 2026-07-17 (idle flush) — [IDLE FLUSH 2]
+
+**Session idle for 10 minutes, auto-flushing WIP state.**
 
 ### 2026-07-17 (idle flush)
 
