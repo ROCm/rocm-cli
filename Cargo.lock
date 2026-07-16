@@ -3681,6 +3681,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "futures",
+ "rocm-core",
  "rocm-dash-collectors",
  "rocm-dash-core",
  "serde",

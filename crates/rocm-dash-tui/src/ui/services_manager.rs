@@ -94,7 +94,9 @@ pub fn service_rows<S: ::std::hash::BuildHasher>(
             id: i.container_id.clone(),
             model: i.model_name.clone(),
             port: i.port,
-            status: format!("{:?}", i.status),
+            // `label()` surfaces the DOWNLOADING/LOADING/WARMUP startup phase
+            // when the instance is `Starting`; never a raw `{:?}` debug string.
+            status: i.status.label().to_owned(),
             gen_tps: i.gen_tps,
         })
         .collect();
