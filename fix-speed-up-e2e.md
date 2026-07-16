@@ -155,6 +155,10 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persiste-app-dev-c
 
 ## Work Log
 
+### 2026-07-16 (idle flush)
+
+- **Session idle for 10 minutes, auto-flushing WIP state.**
+
 ### 2026-07-16
 
 - **Task #1 completed:** identified VRAM-floor waste as ~12 min of dead time on Strix-Ubuntu lane (hardcoded 150 GB floor vs 62 GiB device total); implemented fix in `serving_steps.rs` (device-relative floor = min(150GB, total*0.9)), verified arithmetic + compile.
