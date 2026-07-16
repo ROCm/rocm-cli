@@ -7,7 +7,7 @@
 **Branch:** fix-speed-up-e2e
 **Last Updated:** 2026-07-16
 
-**Token Usage:** in=390 out=106785 cache_create=408059 cache_read=25954676 calls=196
+**Token Usage:** in=396 out=110424 cache_create=605796 cache_read=26382485 calls=199
 
 ---
 
@@ -59,7 +59,7 @@ Scenario: [Abstract behavior description]
 - ✅ Implement VRAM-floor fix: added device-total probe, scaled floor to `min(150_000, total*0.9)`, verified compile + arithmetic. Committed and pushed to origin/fix-speed-up-e2e (commit `122d2be`).
 
 ### In Progress ⏳
-- ⏳ Task #2: Rework per-PR vs nightly CI tiering to match P0/P1 plan.
+- ⏳ Task #2: Rework per-PR vs nightly CI tiering to match P0/P1 plan (existing `@nightly` gate works; need to verify alignment with P0 scope and wall-clock savings).
 
 ### Todo 📋
 - 📋 Task #3: Add E2E coverage for `rocm diagnose` (P0 gap).
@@ -82,10 +82,10 @@ Scenario: [Abstract behavior description]
 
 ## Blockers / Open Questions
 
-- **Coverage gap on diagnose**: `rocm diagnose` command exists but zero E2E scenarios cover it — real gap vs P0 plan.
-- **Strix Halo Qwen not latest**: suite uses `Qwen3-0.6B-GGUF` (smallest GGUF recipe) on lemonade; unclear if this is the "latest variant supported by Lemonade" you intended.
-- **Per-PR vs nightly split unclear**: CI currently has no per-PR-only tier — `xtask e2e` runs everything applicable per-host, and `@nightly` is only pulled in via manual dispatch. Need to clarify how your P0-every-PR intent maps to CI workflows.
-- **Baseline unknown**: need to inspect a live CI run (e.g. #29472891569) to quantify current runtimes and identify bottlenecks.
+- **Coverage gap on diagnose**: `rocm diagnose` command exists but zero E2E scenarios cover it — real gap vs P0 plan (Task #3).
+- **Strix Halo Qwen not latest**: suite uses `Qwen3-0.6B-GGUF` (smallest GGUF recipe) on lemonade; unclear if this is the "latest variant" you intended (Task #4 decision gate).
+- **Tiering already exists**: `@nightly` gate + `E2E_INCLUDE_NIGHTLY=1` env gate already separates heavy scenarios (27B serve, cold install) from per-PR runs. Task #2 is to verify/tune this alignment, not build from scratch.
+- **Real bugs separate**: EAI-7423 (lemonade-on-Strix-Linux serve fails) and EAI-7052 (lemonade Vulkan instability) are tracked known bugs in `expectations.toml`, separate from the VRAM-floor waste fix (Task #1).
 
 ## Notes
 
@@ -112,7 +112,7 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persiste-app-dev-c
 - NOT yet verified on real GPU — behavioral confirmation needs a Strix-Ubuntu CI run (expect ~12 min saved on that lane). Compile + arithmetic verified only.
 - Moved to Task #2 (CI tiering). Note: EAI-7423 (lemonade-on-Strix-Linux serve fails at 90s) is a real bug separate from the VRAM-floor waste fix.
 
-- Committed VRAM-floor fix via `git-commit-with-fallback`, added DCO sign-off, all pre-push hooks passed (346 rocm-bin tests).
-- Pushed to origin; branch now tracking origin/fix-speed-up-e2e at commit `122d2be`.
-
-**2026-07-16 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+- Committed VRAM-floor fix via `git-commit-with-fallback`, added DCO sign-off, all pre-push hooks passed (346 rocm-bin tests). Pushed to origin; branch tracking origin/fix-speed-up-e2e at commit `122d2be`.
+- Read `test-add-e2e-robot-framework.md` to understand testing regimen: cucumber-rs suite auto-reconciles pass/xfail via `expectations.toml` per-platform; share-one-runtime (Task #22 on that WIP) solves per-scenario cold-install cost; `@nightly` tag + `E2E_INCLUDE_NIGHTLY=1` already gates heavy scenarios. Per-PR vs nightly tiering exists — Task #2 is to verify/tune alignment with P0 scope.
+- Created 5 issue tasks to organize the work; Task #1 (VRAM-floor fix) completed; Task #2 deferred (tiering verification).
+- Five levers identified: (1) VRAM-floor waste (Task #1 ✅), (2) CI tiering tune (Task #2), (3) diagnose coverage gap (Task #3), (4) Strix Qwen variant decision (Task #4), (5) mock lane overhead (Task #5).
