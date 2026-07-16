@@ -1010,6 +1010,13 @@ impl AppState {
     /// `chat_detect_dispatch` edge so `event_loop` runs the probe + `/v1/models`
     /// query off the reducer. No-op while a probe is already in flight or an
     /// offer is awaiting a decision. I/O-free.
+    ///
+    /// Reachable both from the pre-accept gate (`'d'` key) and, once
+    /// `ChatConsent::Accepted`, from the `/detect` slash command (a focused
+    /// `'d'` keypress is ordinary chat text at that point, so the gate key
+    /// doesn't apply there — see `handle_slash_command`). When already
+    /// accepted, echo the in-flight probe into the transcript since the
+    /// pre-accept "detecting…" banner isn't drawn once chat is live.
     pub fn request_detect(&mut self) {
         if self.chat_detecting || self.chat_detect_offer.is_some() {
             return;
@@ -1017,21 +1024,44 @@ impl AppState {
         self.chat_detecting = true;
         self.chat_detect_msg = None;
         self.chat_detect_dispatch = true;
+        if self.chat_consent == ChatConsent::Accepted {
+            self.chat.push(ChatTurn::agent(
+                "Detecting a local engine (Lemonade :13305 / vLLM :8000 / rocm serve :11435)…"
+                    .to_string(),
+            ));
+        }
     }
 
     /// Record the result of a detect attempt: `Some(cfg)` raises the offer
     /// prompt; `None` records a "nothing found" message. Clears the in-flight
     /// flag either way.
+    ///
+    /// Once `ChatConsent::Accepted`, the offer prompt is not drawn (the gate UI
+    /// only renders pre-accept), so the result is also echoed into the
+    /// transcript with the `/detect accept|save|dismiss` sub-commands needed to
+    /// act on it.
     pub fn set_detect_result(&mut self, offer: Option<crate::llm::LlmConfig>) {
         self.chat_detecting = false;
+        let accepted = self.chat_consent == ChatConsent::Accepted;
         if let Some(cfg) = offer {
             self.chat_detect_msg = None;
+            if accepted {
+                self.chat.push(ChatTurn::agent(format!(
+                    "Detected a local engine: {}  (model: {}). Type `/detect accept` to \
+                     switch now, `/detect save` to also persist it, or `/detect dismiss` \
+                     to ignore.",
+                    cfg.base_url, cfg.model
+                )));
+            }
             self.chat_detect_offer = Some(cfg);
         } else {
             self.chat_detect_offer = None;
-            self.chat_detect_msg = Some(
-                "no local engine found (Lemonade :13305 / vLLM :8000 / rocm serve :11435)".into(),
-            );
+            let msg = "no local engine found (Lemonade :13305 / vLLM :8000 / rocm serve :11435)";
+            if accepted {
+                self.chat.push(ChatTurn::agent(msg.to_string()));
+            } else {
+                self.chat_detect_msg = Some(msg.to_string());
+            }
         }
     }
 
@@ -4182,6 +4212,131 @@ mod tests {
         assert!(!s.chat_detecting);
         assert!(s.chat_detect_offer.is_none());
         assert!(s.chat_detect_msg.is_some());
+    }
+
+    /// EAI-7354: once `ChatConsent::Accepted`, a focused `'d'` keypress is
+    /// ordinary chat text (see `handle_key`'s `ChatConsent::Accepted` arm), so
+    /// re-detect must be reachable another way. `/detect` is the affordance —
+    /// it runs through the same `request_detect`/`set_detect_result` edge as
+    /// the pre-accept `'d'` key, and since the offer prompt isn't drawn once
+    /// accepted (`ui::tabs::chat::draw` only renders the gate pre-accept), the
+    /// result is echoed into the transcript instead.
+    #[test]
+    fn slash_detect_probes_and_echoes_result_while_accepted() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.set_chat_config(
+            Some(crate::llm::LlmConfig {
+                base_url: "http://localhost:8000/v1".into(),
+                model: "m".into(),
+                api_key: None,
+                auth_header: None,
+            }),
+            true,
+        );
+        assert_eq!(s.chat_consent, ChatConsent::Accepted);
+
+        assert_eq!(s.handle_slash_command("/detect"), SlashOutcome::Handled);
+        assert!(s.chat_detecting && s.chat_detect_dispatch);
+        assert!(
+            s.chat.last().is_some(),
+            "probing while accepted is echoed into the transcript"
+        );
+
+        let local = crate::llm::detected_llm_config("http://localhost:13305/v1", "Llama-3.2-3B");
+        s.set_detect_result(Some(local.clone()));
+        assert_eq!(s.chat_detect_offer.as_ref(), Some(&local));
+        // No gate UI once accepted (draw_consent only renders pre-accept) — the
+        // offer must be surfaced in the transcript instead.
+        let last = s.chat.last().expect("echoed offer turn");
+        assert!(last.content.contains("/detect accept"));
+    }
+
+    /// `/detect accept` mid-session must integrate with the same
+    /// `chat_endpoint_rebuild` edge the initial pre-accept offer uses, or the
+    /// live agent silently keeps talking to the stale endpoint.
+    #[test]
+    fn slash_detect_accept_raises_endpoint_rebuild_like_initial_accept() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.set_chat_config(
+            Some(crate::llm::LlmConfig {
+                base_url: "http://localhost:8000/v1".into(),
+                model: "m".into(),
+                api_key: None,
+                auth_header: None,
+            }),
+            true,
+        );
+        s.active_provider = ChatProvider::Openai; // observe the realignment to Local
+        let local = crate::llm::detected_llm_config("http://localhost:13305/v1", "Llama-3.2-3B");
+        s.set_detect_result(Some(local.clone()));
+
+        assert_eq!(
+            s.handle_slash_command("/detect accept"),
+            SlashOutcome::Handled
+        );
+        assert_eq!(s.chat_llm.as_ref(), Some(&local));
+        assert_eq!(s.active_provider, ChatProvider::Local);
+        assert_eq!(
+            s.chat_endpoint_rebuild,
+            Some(ChatProvider::Openai),
+            "re-detect accept raises the rebuild edge exactly like the initial accept"
+        );
+    }
+
+    #[test]
+    fn slash_detect_dismiss_and_unknown_subcommand() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.set_detect_result(Some(crate::llm::detected_llm_config(
+            "http://localhost:8000/v1",
+            "m",
+        )));
+        assert_eq!(
+            s.handle_slash_command("/detect dismiss"),
+            SlashOutcome::Handled
+        );
+        assert!(s.chat_detect_offer.is_none());
+
+        assert_eq!(
+            s.handle_slash_command("/detect bogus"),
+            SlashOutcome::Handled
+        );
+        let last = s.chat.last().expect("error turn");
+        assert!(last.content.contains("unknown /detect action"));
+    }
+
+    /// Sub-commands are case-insensitive, matching `/permissions` / `/provider`.
+    #[test]
+    fn slash_detect_subcommand_is_case_insensitive() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.set_detect_result(Some(crate::llm::detected_llm_config(
+            "http://localhost:8000/v1",
+            "m",
+        )));
+        // `DISMISS` (upper) must act exactly like `dismiss`.
+        assert_eq!(
+            s.handle_slash_command("/detect DISMISS"),
+            SlashOutcome::Handled
+        );
+        assert!(
+            s.chat_detect_offer.is_none(),
+            "uppercase sub-command is normalized and handled"
+        );
+    }
+
+    /// `/detect accept` / `/detect save` with nothing pending emits a hint
+    /// turn rather than a silent no-op.
+    #[test]
+    fn slash_detect_accept_without_offer_emits_hint() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        assert!(s.chat_detect_offer.is_none());
+        assert_eq!(
+            s.handle_slash_command("/detect accept"),
+            SlashOutcome::Handled
+        );
+        // No endpoint was adopted; a hint explains why.
+        assert_eq!(s.chat_endpoint_rebuild, None);
+        let last = s.chat.last().expect("hint turn");
+        assert!(last.content.contains("no detected endpoint"));
     }
 
     #[test]
