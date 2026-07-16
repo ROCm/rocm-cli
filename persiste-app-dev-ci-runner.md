@@ -4,7 +4,7 @@
 **Stage:** 4-design
 **Pipeline:** standard
 **Branch:** (none yet — infra/k8s, not a code branch)
-**Last Updated:** 2026-07-16
+**Last Updated:** 2026-07-16 (idle flush)
 
 ---
 
