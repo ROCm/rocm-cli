@@ -204,12 +204,12 @@ impl E2eWorld {
 
     /// Opt this scenario into the shared managed-runtime tree (see
     /// [`shared_runtimes_dir`]): replace its empty isolated `data/runtimes` with a
-    /// symlink to the shared dir, so an `install sdk` here populates the shared
-    /// tree once and later scenarios find the runtime already present. No-op when
-    /// `E2E_SHARED_RUNTIMES_DIR` is unset (local runs stay fully isolated) or when
-    /// the symlink can't be created (falls back to an isolated install). Only
-    /// scenarios that need *a* runtime active should call this — never the
-    /// clean-slate scenarios that assert "no CLI-managed runtimes".
+    /// directory link to the shared dir, so an `install sdk` here populates the
+    /// shared tree once and later scenarios find the runtime already present.
+    /// No-op when `E2E_SHARED_RUNTIMES_DIR` is unset (local runs stay fully
+    /// isolated) or when the link can't be created (falls back to an isolated
+    /// install). Only scenarios that need *a* runtime active should call this —
+    /// never the clean-slate scenarios that assert "no CLI-managed runtimes".
     pub fn use_shared_runtimes(&self) {
         let Some(shared) = shared_runtimes_dir() else {
             return;
@@ -222,16 +222,28 @@ impl E2eWorld {
             return;
         }
         let link = data.join("runtimes");
-        // Remove the empty isolated runtimes dir (created in `default()`) so the
-        // symlink can take its place; ignore if it's absent.
         let _ = std::fs::remove_dir_all(&link);
         #[cfg(unix)]
         let res = std::os::unix::fs::symlink(&shared, &link);
         #[cfg(windows)]
-        let res = std::os::windows::fs::symlink_dir(&shared, &link);
+        let res = std::os::windows::fs::symlink_dir(&shared, &link).or_else(|_| {
+            // Self-hosted Windows runners commonly lack SeCreateSymbolicLinkPrivilege.
+            // Directory junctions need no developer mode or elevated token and expose
+            // the same shared runtime tree to the scenario's isolated data directory.
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&link)
+                .arg(&shared)
+                .status()?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!(
+                    "mklink /J exited with {status}"
+                )))
+            }
+        });
         if res.is_err() {
-            // Couldn't symlink (e.g. Windows without privilege): recreate the
-            // isolated dir so the scenario still works, just without sharing.
             let _ = std::fs::create_dir_all(&link);
         }
     }
