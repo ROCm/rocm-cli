@@ -7,7 +7,7 @@
 **Branch:** fix-speed-up-e2e
 **Last Updated:** 2026-07-16
 
-**Token Usage:** in=572 out=173915 cache_create=696408 cache_read=47588686 calls=287
+**Token Usage:** in=664 out=191264 cache_create=743349 cache_read=60428514 calls=334
 
 ---
 
@@ -41,15 +41,69 @@ High-level approach TBD after profiling. Candidate levers:
 ## Scenarios
 
 Define expected behaviors in BDD-style (Gherkin) **before** writing any tests or code.
+**Always activate the bdd-scenarios skill** before writing or reviewing scenarios.
+
+### Task #3 — `rocm diagnose` / `rocm fix` coverage (P0 gap) — DRAFT, awaiting review
+
+These cover the P0 `diagnose` command (and its sibling `fix`). All are **GPU-independent**
+— `diagnose` matches purely on a symptom string against a closed catalog, `fix --dry-run`
+and `fix` listing change nothing — so they belong on the **fast mock lane / per-PR tier**,
+not `@requires-gpu`.
 
 ```gherkin
-Scenario: [Abstract behavior description]
-  Given [situation/context]
-  When [user action or event]
-  Then [observable outcome]
+Scenario: 1 - Diagnosing a recognised failure reports a likely cause and a fix
+  Given a user who hit a known ROCm failure
+  When the user asks the CLI to diagnose that symptom
+  Then the CLI reports a likely cause
+  And it points to a fix for that cause
+
+Scenario: 2 - Diagnosing an unrecognised failure admits it and routes the user onward
+  Given a user who hit a failure the CLI does not recognise
+  When the user asks the CLI to diagnose that symptom
+  Then the CLI states that no known cause matched
+  And it tells the user where to report the problem
+
+Scenario: 3 - A diagnosis is available in machine-readable form for tooling
+  Given a user who hit a known ROCm failure
+  When the user asks the CLI to diagnose that symptom in machine-readable form
+  Then the result identifies whether a known cause matched
+  And it can be consumed by other tools
+
+Scenario: 4 - The user can see every fix the CLI knows how to apply
+  When the user asks the CLI which fixes it offers
+  Then the CLI lists the fixes it can apply
+  And each fix indicates whether the CLI can apply it automatically
+
+Scenario: 5 - Previewing a fix explains the change without making it
+  Given a user who has chosen a known fix
+  When the user previews that fix without applying it
+  Then the CLI describes what the fix would change
+  And nothing on the machine is changed
+
+Scenario: 6 - Asking for a fix the CLI does not know is refused clearly
+  Given a user who names a fix the CLI does not offer
+  When the user asks the CLI to apply that fix
+  Then the CLI refuses
+  And it explains that the fix is not recognised
 ```
 
-**Always activate the bdd-scenarios skill** before writing or reviewing scenarios.
+**Technical Details** (mapping — kept out of the scenarios per bdd rules):
+
+| # | @id | invocation | key assertion | tier |
+|---|-----|-----------|---------------|------|
+| 1 | diagnose-matches-known-symptom | `diagnose --symptom "unable to open /dev/kfd"` | exit 0; stdout has a `#1 [HIGH/LIKELY ...]` match + an `id:`/`plan:` line | mock (per-PR) |
+| 2 | diagnose-no-match-routes-upstream | `diagnose --symptom "totally unrelated gibberish"` | exit 0; "no known misconfiguration matched" + a report/route target | mock |
+| 3 | diagnose-json-has-match-flag | `diagnose --symptom "unable to open /dev/kfd" --json` | exit 0; parseable JSON; `matched` non-empty / `has_match` true | mock |
+| 4 | fix-lists-known-recipes | `fix` (no id) | exit 0; "Available fix-ids" + ≥1 `[AUTO]`/`[PRINT-ONLY]` row | mock |
+| 5 | fix-dry-run-changes-nothing | `fix fix-4-render-group --dry-run` | exit 0; prints a plan; no mutation (isolated data dir untouched) | mock |
+| 6 | fix-unknown-id-rejected | `fix fix-does-not-exist` | non-zero exit (code 2); message names the unknown id | mock |
+
+Notes for implementation (NOT part of the spec): `diagnose` always exits 0 (it's a query —
+branch on `--json` fields, never the code). `--symptom "unable to open /dev/kfd"` scores exactly
+50 = `MIN_SCORE_FOR_MATCH`, a deterministic match with no GPU. `fix fix-9-igpu-dgpu` mutates —
+use `fix-4-render-group` (a print-only recipe) for the dry-run scenario. All 6 need
+`expectations.toml` entries (expect-pass on all platforms; none are known bugs). Candidate file:
+new `tests/e2e-cucumber/features/diagnose.feature`.
 
 ## Implementation Steps
 
@@ -59,19 +113,22 @@ Scenario: [Abstract behavior description]
 - ✅ Implement VRAM-floor fix: added device-total probe, scaled floor to `min(150_000, total*0.9)`, verified compile + arithmetic. Committed and pushed to origin/fix-speed-up-e2e (commit `122d2be`).
 
 ### In Progress ⏳
-- ⏳ Scoped dispatch running on Strix-Ubuntu (run 29529197875, 2 serve scenarios, measuring per-serve step duration vs ~262s baseline).
+- ⏳ Scoped dispatch queued on Strix-Ubuntu (run 29529197875, 2 serve scenarios, measuring per-serve step duration vs ~262s baseline). Loop checks every 10m for completion.
+- ⏳ Task #3: BDD scenarios for `rocm diagnose`/`fix` (6 scenarios drafted, awaiting review).
 
 ### Todo 📋
-- 📋 Task #3: Add E2E coverage for `rocm diagnose` (P0 gap).
-- 📋 Task #4: Confirm Strix Halo Qwen variant (latest vs smallest).
-- 📋 Task #5: Reduce mock lane per-scenario overhead.
-- 📋 Verify VRAM-floor fix on real Strix-Ubuntu GPU (expect ~12 min saved).
+- 📋 Task #2: Rework CI tiering (per-PR vs nightly) — verify/tune existing `@nightly` split.
+- 📋 Task #3: Implement diagnose E2E test steps (scenarios drafted, awaiting review).
+- 📋 Task #4: Confirm Strix Halo Qwen variant (user decision: latest vs smallest).
+- 📋 Task #5: Reduce mock lane per-scenario overhead (fixed overhead ~4.8s/scenario, multiply across 12).
+- 📋 Verify VRAM-floor fix on real Strix-Ubuntu GPU (run 29529197875 in progress; expect ~12 min saved).
 
 ## Next Steps
 
-- Task #2: Rework CI tiering (per-PR vs nightly) to align with P0/P1 plan and reduce wall-clock queue time (~13h).
-- Task #3: Add `rocm diagnose` E2E scenarios (P0 coverage gap).
-- Verify VRAM-floor fix on real GPU (expect ~12 min savings on Strix-Ubuntu lane).
+- Probe run 29529197875 completes → verify VRAM-floor fix impact → if successful, open PR for `122d2be`; if not, diagnose and iterate.
+- Task #3: Review & implement diagnose E2E scenarios (6 drafted, mock-lane ready).
+- Task #4: Confirm with user whether Strix Qwen should be latest variant or smallest (current: smallest).
+- Task #2: Tune CI tiering alignment (review existing `@nightly` structure vs P0/P1 plan).
 
 ## Checklist
 
