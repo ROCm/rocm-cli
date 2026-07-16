@@ -171,15 +171,17 @@ jobs:
         if: needs.changes.outputs.heavy == 'true'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libcap-dev
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
-        if: needs.changes.outputs.heavy == 'true'
-
       # Installs the sccache binary and wires it to the GitHub Actions cache
-      # backend. Runs AFTER setup-rust-toolchain so the wrapper is on PATH before
-      # the first cargo compile. Same `heavy` gate as the cargo steps below.
+      # backend. Runs BEFORE setup-rust-toolchain: RUSTC_WRAPPER=sccache is set at
+      # the job level, and setup-rust-toolchain's rust-cache runs `cargo metadata`
+      # (which honours RUSTC_WRAPPER) during setup — so sccache must already be on
+      # PATH by then. Same `heavy` gate as the cargo steps below.
       - name: Set up sccache
         if: needs.changes.outputs.heavy == 'true'
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        if: needs.changes.outputs.heavy == 'true'
 
       # Build the runtime binaries the smoke + acceptance steps below need (every
       # engine binary; smoke hard-fails on a missing one). Unit/integration tests
@@ -311,16 +313,18 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
+      # Installs sccache and wires it to the GitHub Actions cache. Runs BEFORE
+      # setup-rust-toolchain: RUSTC_WRAPPER=sccache is set at the job level and
+      # setup-rust-toolchain's rust-cache runs `cargo metadata` (which honours
+      # RUSTC_WRAPPER) during setup, so sccache must already be on PATH by then.
+      - name: Set up sccache
+        if: needs.changes.outputs.heavy == 'true'
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         if: needs.changes.outputs.heavy == 'true'
         with:
           cache-on-failure: true
-
-      # Installs sccache and wires it to the GitHub Actions cache. Runs after
-      # setup-rust-toolchain so the wrapper is on PATH before the first compile.
-      - name: Set up sccache
-        if: needs.changes.outputs.heavy == 'true'
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
       - name: Build
         if: needs.changes.outputs.heavy == 'true'
@@ -424,14 +428,16 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
-        if: needs.changes.outputs.rust == 'true'
-
-      # Installs sccache and wires it to the GitHub Actions cache. Runs after
-      # setup-rust-toolchain so the wrapper is on PATH before the first compile.
+      # Installs sccache and wires it to the GitHub Actions cache. Runs BEFORE
+      # setup-rust-toolchain: RUSTC_WRAPPER=sccache is set at the job level and
+      # setup-rust-toolchain's rust-cache runs `cargo metadata` (which honours
+      # RUSTC_WRAPPER) during setup, so sccache must already be on PATH by then.
       - name: Set up sccache
         if: needs.changes.outputs.rust == 'true'
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        if: needs.changes.outputs.rust == 'true'
 
       - name: Clippy
         if: needs.changes.outputs.rust == 'true'
