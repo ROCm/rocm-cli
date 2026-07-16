@@ -697,7 +697,7 @@ python scripts/release_readiness.py --self-test
 ROCDXG_CHECKSUM_SELF_TEST=1 bash scripts/wsl_setup_rocdxg.sh
 bash scripts/setup-wsl-portable-build-deps.sh --self-test
 ./scripts/acceptance-install-upgrade-tui-uninstall.sh
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\acceptance-install-upgrade-tui-uninstall.ps1
+pwsh -NoProfile -File .\scripts\acceptance-install-upgrade-tui-uninstall.ps1
 ```
 
 The release-readiness self-test is cross-platform and uses only workspace-local

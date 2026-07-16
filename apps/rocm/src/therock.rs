@@ -2026,9 +2026,6 @@ fn download_file(url: &str, destination: &Path) -> Result<()> {
         .parent()
         .context("download destination has no parent directory")?;
     fs::create_dir_all(parent)?;
-    if use_windows_powershell_http() {
-        return download_file_windows_powershell(url, destination, None);
-    }
     let response = http_get(url, &[], None)?;
     if response.status != 200 {
         bail!("HTTP {} while fetching {url}", response.status);
@@ -2041,9 +2038,6 @@ fn http_get(
     headers: &[(&str, &str)],
     max_time_secs: Option<u64>,
 ) -> Result<HttpResponseBody> {
-    if use_windows_powershell_http() {
-        return http_get_windows_powershell(url, headers, max_time_secs);
-    }
     let timeout = max_time_secs
         .filter(|value| *value > 0)
         .map_or_else(|| Duration::from_mins(10), Duration::from_secs);
@@ -2078,164 +2072,6 @@ fn http_get(
         headers,
         body,
     })
-}
-
-const fn use_windows_powershell_http() -> bool {
-    runtime_is_windows()
-}
-
-#[derive(Deserialize)]
-struct WindowsHttpMetadata {
-    #[serde(rename = "StatusCode")]
-    status_code: u16,
-    #[serde(rename = "Headers")]
-    headers: String,
-}
-
-fn http_get_windows_powershell(
-    url: &str,
-    headers: &[(&str, &str)],
-    max_time_secs: Option<u64>,
-) -> Result<HttpResponseBody> {
-    let temp_dir = windows_http_temp_dir()?;
-    let body_path = temp_dir.join("body.bin");
-    let meta_path = temp_dir.join("meta.json");
-    let script_path = temp_dir.join("http-get.ps1");
-    let timeout = max_time_secs.filter(|value| *value > 0).unwrap_or(600);
-    fs::write(&script_path, windows_http_get_script())
-        .with_context(|| format!("failed to write {}", script_path.display()))?;
-    let mut command = Command::new("powershell.exe");
-    command
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-        ])
-        .arg(windows_child_path(&script_path))
-        .args(["-Url", url])
-        .arg("-BodyPath")
-        .arg(windows_child_path(&body_path))
-        .arg("-MetaPath")
-        .arg(windows_child_path(&meta_path))
-        .args(["-TimeoutSec", &timeout.to_string()]);
-    for (name, value) in headers {
-        command.arg("-Header").arg(format!("{name}={value}"));
-    }
-    let stdout_path = temp_dir.join("stdout.txt");
-    let stderr_path = temp_dir.join("stderr.txt");
-    let stdout_file = fs::File::create(&stdout_path)
-        .with_context(|| format!("failed to create {}", stdout_path.display()))?;
-    let stderr_file = fs::File::create(&stderr_path)
-        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
-    let status = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
-        .status()
-        .with_context(|| format!("failed to launch PowerShell HTTP request for {url}"))?;
-    if !windows_child_status_success(status) {
-        let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
-        let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
-        let temp_note = windows_http_failure_temp_note(&temp_dir);
-        if !windows_http_keep_temp() {
-            let _ = fs::remove_dir_all(&temp_dir);
-        }
-        bail!(
-            "PowerShell HTTP request failed for {url} (status {status}): {}{}{}",
-            stdout.trim(),
-            stderr.trim(),
-            temp_note
-        );
-    }
-    let metadata_bytes = fs::read(&meta_path)
-        .with_context(|| format!("failed to read HTTP metadata {}", meta_path.display()))?;
-    let metadata: WindowsHttpMetadata = serde_json::from_slice(strip_utf8_bom(&metadata_bytes))
-        .context("failed to parse PowerShell HTTP metadata")?;
-    let body = fs::read(&body_path)
-        .with_context(|| format!("failed to read HTTP response body {}", body_path.display()))?;
-    let _ = fs::remove_dir_all(&temp_dir);
-    Ok(HttpResponseBody {
-        status: metadata.status_code,
-        headers: metadata.headers,
-        body,
-    })
-}
-
-fn download_file_windows_powershell(
-    url: &str,
-    destination: &Path,
-    max_time_secs: Option<u64>,
-) -> Result<()> {
-    let parent = destination
-        .parent()
-        .context("download destination has no parent directory")?;
-    fs::create_dir_all(parent)?;
-    let temp_dir = windows_http_temp_dir()?;
-    let script_path = temp_dir.join("download-file.ps1");
-    let meta_path = temp_dir.join("meta.json");
-    let timeout = max_time_secs.filter(|value| *value > 0).unwrap_or(600);
-    fs::write(&script_path, windows_http_get_script())
-        .with_context(|| format!("failed to write {}", script_path.display()))?;
-    let stdout_path = temp_dir.join("stdout.txt");
-    let stderr_path = temp_dir.join("stderr.txt");
-    let stdout_file = fs::File::create(&stdout_path)
-        .with_context(|| format!("failed to create {}", stdout_path.display()))?;
-    let stderr_file = fs::File::create(&stderr_path)
-        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
-    let status = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-        ])
-        .arg(windows_child_path(&script_path))
-        .args(["-Url", url])
-        .arg("-BodyPath")
-        .arg(windows_child_path(destination))
-        .arg("-MetaPath")
-        .arg(windows_child_path(&meta_path))
-        .args(["-TimeoutSec", &timeout.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
-        .status()
-        .with_context(|| format!("failed to launch PowerShell download for {url}"))?;
-    if !windows_child_status_success(status) {
-        let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
-        let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
-        let temp_note = windows_http_failure_temp_note(&temp_dir);
-        if !windows_http_keep_temp() {
-            let _ = fs::remove_dir_all(&temp_dir);
-        }
-        bail!(
-            "PowerShell download failed for {url} (status {status}): {}{}{}",
-            stdout.trim(),
-            stderr.trim(),
-            temp_note
-        );
-    }
-    let metadata_bytes = fs::read(&meta_path)
-        .with_context(|| format!("failed to read HTTP metadata {}", meta_path.display()))?;
-    let metadata: WindowsHttpMetadata = serde_json::from_slice(strip_utf8_bom(&metadata_bytes))
-        .context("failed to parse PowerShell HTTP metadata")?;
-    if metadata.status_code != 200 {
-        let _ = fs::remove_dir_all(&temp_dir);
-        let _ = fs::remove_file(destination);
-        bail!("HTTP {} while fetching {url}", metadata.status_code);
-    }
-    let _ = fs::remove_dir_all(&temp_dir);
-    Ok(())
-}
-
-fn windows_http_temp_dir() -> Result<PathBuf> {
-    if !runtime_is_windows() {
-        return linux_temp_dir("rocm-cli-http");
-    }
-    windows_temp_dir("rocm-cli-http")
 }
 
 fn linux_temp_dir(prefix: &str) -> Result<PathBuf> {
@@ -2290,73 +2126,8 @@ fn windows_runtime_temp_root() -> Option<PathBuf> {
     None
 }
 
-fn windows_child_status_success(status: std::process::ExitStatus) -> bool {
-    status.success() || status.code() == Some(0)
-}
-
-fn windows_http_keep_temp() -> bool {
-    std::env::var("ROCM_CLI_DEBUG_WINDOWS_HTTP")
-        .ok()
-        .is_some_and(|value| {
-            let value = value.trim().to_ascii_lowercase();
-            matches!(value.as_str(), "1" | "true" | "yes" | "on")
-        })
-}
-
-fn windows_http_failure_temp_note(temp_dir: &Path) -> String {
-    if windows_http_keep_temp() {
-        format!("; temp files kept at {}", display_child_path(temp_dir))
-    } else {
-        String::new()
-    }
-}
-
-const fn windows_http_get_script() -> &'static str {
-    r#"
-param(
-  [Parameter(Mandatory=$true)][string]$Url,
-  [Parameter(Mandatory=$true)][string]$BodyPath,
-  [Parameter(Mandatory=$true)][string]$MetaPath,
-  [int]$TimeoutSec = 600,
-  [string[]]$Header = @()
-)
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-$headers = @{}
-foreach ($entry in $Header) {
-  $index = $entry.IndexOf('=')
-  if ($index -gt 0) {
-    $headers[$entry.Substring(0, $index)] = $entry.Substring($index + 1)
-  }
-}
-$response = Invoke-WebRequest -Uri $Url -UseBasicParsing -Headers $headers -OutFile $BodyPath -PassThru -TimeoutSec $TimeoutSec
-$headerLines = @()
-foreach ($key in $response.Headers.Keys) {
-  $headerLines += "${key}: $($response.Headers[$key])"
-}
-$metadata = [pscustomobject]@{
-  StatusCode = [int]$response.StatusCode
-  Headers = ($headerLines -join "`n")
-}
-$json = $metadata | ConvertTo-Json -Compress
-[System.IO.File]::WriteAllText($MetaPath, $json, [System.Text.UTF8Encoding]::new($false))
-"#
-}
-
-fn strip_utf8_bom(bytes: &[u8]) -> &[u8] {
-    bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes)
-}
-
 fn windows_child_path(path: &Path) -> String {
     runtime_path_for_windows_child(path)
-}
-
-fn display_child_path(path: &Path) -> String {
-    if runtime_is_windows() {
-        windows_child_path(path)
-    } else {
-        path.display().to_string()
-    }
 }
 
 fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -3944,12 +3715,68 @@ echo Python 3.12.10
     }
 
     #[test]
-    fn windows_http_uses_powershell_backend() {
-        if runtime_is_windows() {
-            assert!(use_windows_powershell_http());
-        } else {
-            assert!(!use_windows_powershell_http());
-        }
+    fn native_http_download_and_get_round_trip_without_powershell() -> Result<()> {
+        use std::net::TcpListener;
+        use std::thread;
+
+        // Serve a fixed body from a localhost HTTP/1.1 server so the request
+        // exercises the native `ureq` transport that `http_get`/`download_file`
+        // now use on every platform. This runs under `cargo test` on the
+        // windows-latest CI job, where `runtime_is_windows()` is true and the
+        // removed PowerShell/ExecutionPolicy-Bypass backend used to run — so it
+        // verifies the native replacement on real Windows.
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let body = b"native-http-smoke-body".to_vec();
+        let served = body.clone();
+        // Two requests: one for download_file, one for http_get.
+        let server = thread::spawn(move || -> Result<()> {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    served.len()
+                )?;
+                stream.write_all(&served)?;
+                stream.flush()?;
+            }
+            Ok(())
+        });
+
+        let url = format!("http://127.0.0.1:{port}/artifact.bin");
+
+        let temp = std::env::temp_dir().join(format!(
+            "rocm-cli-native-http-test-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(&temp)?;
+        let destination = temp.join("artifact.bin");
+
+        download_file(&url, &destination)?;
+        assert_eq!(fs::read(&destination)?, body);
+
+        let response = http_get(&url, &[], Some(5))?;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, body);
+
+        server.join().expect("localhost server thread panicked")?;
+        let _ = fs::remove_dir_all(&temp);
+        Ok(())
     }
 
     #[test]
