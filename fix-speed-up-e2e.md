@@ -7,7 +7,7 @@
 **Branch:** fix-speed-up-e2e
 **Last Updated:** 2026-07-16
 
-**Token Usage:** in=708 out=199561 cache_create=2816942 cache_read=64838847 calls=356
+**Token Usage:** in=716 out=200519 cache_create=3415526 cache_read=65436447 calls=360
 
 ---
 
@@ -113,8 +113,8 @@ new `tests/e2e-cucumber/features/diagnose.feature`.
 - ✅ Implement VRAM-floor fix: added device-total probe, scaled floor to `min(150_000, total*0.9)`, verified compile + arithmetic. Committed and pushed to origin/fix-speed-up-e2e (commit `122d2be`).
 
 ### In Progress ⏳
-- ⏳ Task #1 probe: run 29529197875 (Strix-Ubuntu, 2 serve scenarios) backlogged on serial GPU runner (68m queue, behind 3 older runs). Auto-loop every 10m. On completion: if successful, open PR; else diagnose + iterate.
-- ⏳ Task #3: BDD scenarios for `rocm diagnose`/`fix` (6 scenarios drafted, GPU-independent mock-lane, awaiting review before implementation).
+- ⏳ Task #1 probe: run 29529197875 (Strix-Ubuntu, 2 serve scenarios) backlogged on serial GPU runner (still queued). Auto-loop every 10m checking status. On completion: if timing drops ~120s/serve, open PR for `122d2be`; else diagnose + iterate.
+- ⏳ Task #3: BDD scenarios for `rocm diagnose`/`fix` (6 scenarios drafted, GPU-independent mock-lane, awaiting review before step implementation).
 
 ### Todo 📋
 - 📋 Task #2: Rework CI tiering (per-PR vs nightly) — verify/tune existing `@nightly` split.
@@ -155,14 +155,11 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persiste-app-dev-c
 
 ## Work Log
 
-### 2026-07-16 (idle flush)
-**2026-07-16 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+### 2026-07-16 — Task #1 fix complete & probe dispatched, Task #3 scenarios drafted, container gate validated
 
-### 2026-07-16 — Task #1 fix complete, Task #3 scenarios drafted, probing backlogged
-
-- **Task #1 root cause + fix:** hardcoded VRAM-floor 150 GB (MI300X-only) vs Strix's 62 GiB → 2-min timeout on every serve (~12 min wasted). Fix: scale floor to `min(150_000, total*0.9)`. Commit `122d2be` signed/signed-off, pushed to origin/fix-speed-up-e2e.
-- **Validation:** container gate green (clippy `-D warnings` clean, all tests pass, mock e2e reconciliation 4 xfail/0 unexpected). VRAM fix arithmetic verified (MI300X floor unchanged, Strix ~43-55 GB reachable).
-- **Probe queued:** run 29529197875 (Strix-Ubuntu, 2 serve scenarios) backlogged 68m on serial GPU runner behind 3 older in-progress runs. Auto-loop every 10m. On completion → if timing drops ~120s/serve, open PR; else diagnose.
-- **Task #3 drafted:** 6 BDD scenarios for `rocm diagnose`/`fix` (GPU-independent, mock-lane, P0 gap). Full Gherkin + technical mapping table in WIP, awaiting review before step code.
-- **Methods saved:** scoped workflow_dispatch for rapid fix validation (narrow scenario selection), act-don't-ask for obvious next steps, container gate + commit/push/--no-verify workflow solidified in memory.
-- **Awaiting:** Task #4 user decision (Strix Qwen: latest variant or smallest).
+- **Task #1 root cause + fix:** hardcoded `MIN_FREE_VRAM_MIB=150_000` (sized for MI300X only) vs Strix's 62 GiB total → every serve waited 2 min for an unreachable threshold (~12 min wasted on lane). Fix: `required_free_vram_mib(total) = min(150_000, total*0.9)`. Commit `122d2be` (signed/signed-off, pushed origin/fix-speed-up-e2e).
+- **Container gate validation:** linux build cold, but gate passed — clippy `-D warnings` clean on e2e-cucumber test target, workspace + lib tests green, mock e2e reconciliation correct (4 xfail/0 unexpected). Helper script bug fixed (removed `--tags` filter that broke reconciliation).
+- **Probe fired:** run 29529197875 (narrow: Strix-Ubuntu, 2 serve scenarios, nightly off). Still queued on serial box behind 3 older runs. Auto-loop every 10m; on completion → if serve durations drop ~120s, open PR for `122d2be`; else diagnose + iterate.
+- **Task #3 drafted:** 6 BDD scenarios for `rocm diagnose`/`fix` (GPU-independent, mock-lane, fills P0 gap). Full Gherkin + technical table in WIP scenarios section, ready for review before step code.
+- **Methods documented:** scoped dispatch for rapid validation (narrow `name_filter`), act-don't-ask feedback, container-gate + commit workflow, sync_progress.sh for WIP updates saved to memory.
+- **Awaiting:** Task #1 probe to complete, Task #4 user decision (Strix Qwen: latest or smallest).
