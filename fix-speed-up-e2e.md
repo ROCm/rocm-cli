@@ -5,9 +5,9 @@
 **Stage:** 0-idea
 **Pipeline:** standard
 **Branch:** fix-speed-up-e2e
-**Last Updated:** 2026-07-16 (idle flush)
+**Last Updated:** 2026-07-16
 
-**Token Usage:** in=672 out=192360 cache_create=1039992 cache_read=61298581 calls=338
+**Token Usage:** in=680 out=193398 cache_create=1626624 cache_read=61884209 calls=342
 
 ---
 
@@ -155,11 +155,7 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persiste-app-dev-c
 
 ## Work Log
 
-### 2026-07-16 (idle flush) — *auto-flush*
-
-- **Session idle for 10 minutes, auto-flushing WIP state.**
-
-### 2026-07-16 (continued)
+### 2026-07-16
 
 - **Task #1 root cause + fix:** VRAM-floor waste = hardcoded 150 GB (sized for MI300X) vs Strix's 62 GiB → full 2-min timeout on every serve, ~12 min total. Fix: device-relative floor `min(150_000, total*0.9)`. Commit `122d2be` signed + signed-off, pushed.
 - **Fix validated locally:** container gate passed (clippy + tests under `-D warnings`, 0 warnings); mock e2e reconciliation clean (4 xfail as expected, 0 unexpected).
