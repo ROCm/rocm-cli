@@ -479,6 +479,10 @@ pub struct AppState {
     /// Horizontal scroll offset (columns) of the active job console — log lines
     /// drawn wider than the console wrap off-screen, so the wheel/H-wheel pans.
     pub console_hscroll: u16,
+    /// Monotonic UI repaint counter, incremented once per tick (~250ms). Drives
+    /// frame-based animation (e.g. the job-console braille progress spinner)
+    /// without threading a clock through the render path.
+    pub tick_count: u64,
     /// Scroll offset of the wide-layout right LOGS dock, counted in lines UP from
     /// the newest line (0 = pinned to the tail). Clamped against the buffer.
     pub dock_logs_scroll: u16,
@@ -648,6 +652,7 @@ impl AppState {
             bench_detail_scroll: 0,
             console_scroll: 0,
             console_hscroll: 0,
+            tick_count: 0,
             dock_logs_scroll: 0,
             last_dock_area: None,
             chat: Vec::new(),
@@ -1718,7 +1723,11 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             terminal.draw(|f| ui::draw(f, &mut state))?;
         }
         tokio::select! {
-            _ = tick.tick() => { /* repaint */ }
+            _ = tick.tick() => {
+                // Advance the animation clock so spinners cycle even while a
+                // job produces no new output.
+                state.tick_count = state.tick_count.wrapping_add(1);
+            }
             maybe_msg = rx.recv() => {
                 match maybe_msg {
                     Some(ClientMsg::Connecting) => state.conn = ConnState::Connecting,
