@@ -15243,7 +15243,10 @@ const AUTO_FREE_VRAM_FRACTION: f64 = 0.90;
 /// Pick a GPU ordinal for `--gpu auto`. Prefers the lowest-numbered GPU that is
 /// idle (free VRAM at or above [`AUTO_FREE_VRAM_FRACTION`]) and not pinned by a
 /// running rocm-cli service; otherwise falls back to the non-busy GPU with the
-/// most free VRAM, then to the first non-busy GPU, then to `[0]`.
+/// most free VRAM, then to the first non-busy GPU. When the GPU count is unknown
+/// (amd-smi unavailable or zero devices) it returns no selection rather than
+/// assuming device 0 — the engine's device probe then pins the first present GPU
+/// or fails fast under the GPU-required policy.
 ///
 /// Selection reads service state without holding a lock, so two near-concurrent
 /// `--gpu auto` launches can race onto the same idle GPU. The VRAM-occupancy
@@ -15268,7 +15271,11 @@ fn select_auto_gpu_index(
 ) -> Vec<u32> {
     let count = detected.unwrap_or(0);
     if count == 0 {
-        return vec![0];
+        // No GPU count from amd-smi (unavailable, or genuinely zero devices). Do
+        // not assume device 0 exists: return no selection and let the engine's
+        // device probe pin the first present GPU or fail fast under the
+        // GPU-required policy (no GPU-0 fallback).
+        return Vec::new();
     }
     let candidates = || (0..count as u32).filter(|index| !busy.contains(index));
     let usage_for = |index: u32| vram.and_then(|rows| rows.iter().find(|row| row.index == index));
@@ -20555,7 +20562,8 @@ install therock";
     #[test]
     fn auto_selection_falls_back_to_first_non_busy_without_vram() {
         assert_eq!(select_auto_gpu_index(Some(4), &[0, 1], None), vec![2]);
-        assert_eq!(select_auto_gpu_index(None, &[], None), vec![0]);
+        // Unknown GPU count: no GPU-0 fallback — defer to the engine device probe.
+        assert_eq!(select_auto_gpu_index(None, &[], None), Vec::<u32>::new());
     }
 
     #[test]

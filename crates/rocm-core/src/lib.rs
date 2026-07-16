@@ -3513,6 +3513,117 @@ fn detect_linux_kfd_gfx_target() -> Option<String> {
     None
 }
 
+/// AMD GPU device ordinals usable for a GPU-required launch on this host, after
+/// applying the runtime visibility mask (`HIP_VISIBLE_DEVICES`, then
+/// `ROCR_VISIBLE_DEVICES`).
+///
+/// `Some(indices)` is an authoritative answer: an empty vector means no GPU is
+/// usable, so a GPU-required launch must fail rather than fall back to CPU or
+/// assume device 0. `None` means availability could not be probed on this
+/// platform (e.g. the KFD device exists but its topology is unreadable, or a
+/// non-Linux target) and callers should not block a launch on this basis.
+#[must_use]
+pub fn usable_amd_gpu_indices() -> Option<Vec<u32>> {
+    probe_usable_amd_gpu_indices()
+}
+
+/// Whether at least one AMD GPU is usable for a GPU-required launch.
+///
+/// `false` only when the probe authoritatively reports zero usable devices; an
+/// unprobeable platform reports `true` so it does not block launches (see
+/// [`usable_amd_gpu_indices`]).
+#[must_use]
+pub fn has_usable_amd_gpu() -> bool {
+    usable_amd_gpu_indices().is_none_or(|indices| !indices.is_empty())
+}
+
+#[cfg(target_os = "linux")]
+fn probe_usable_amd_gpu_indices() -> Option<Vec<u32>> {
+    let present = linux_kfd_gpu_node_count()?;
+    Some(usable_amd_gpu_indices_from(
+        present,
+        visibility_mask_from_env(),
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_usable_amd_gpu_indices() -> Option<Vec<u32>> {
+    None
+}
+
+/// Count AMD GPU nodes in the KFD topology. `Some(0)` is an authoritative "no
+/// GPU" (topology readable with no GPU node, or no KFD device at all); `None`
+/// means the topology could not be read even though `/dev/kfd` exists, so
+/// availability is unknown and must not be treated as zero.
+#[cfg(target_os = "linux")]
+fn linux_kfd_gpu_node_count() -> Option<usize> {
+    let nodes_dir = Path::new("/sys/class/kfd/kfd/topology/nodes");
+    match fs::read_dir(nodes_dir) {
+        Ok(entries) => Some(
+            entries
+                .flatten()
+                .filter(|entry| kfd_node_is_gpu(&entry.path()))
+                .count(),
+        ),
+        Err(_) if Path::new("/dev/kfd").exists() => None,
+        Err(_) => Some(0),
+    }
+}
+
+/// A KFD topology node is a GPU (not the CPU node) when its
+/// `gfx_target_version` is a nonzero value; CPU nodes report `0`.
+#[cfg(target_os = "linux")]
+fn kfd_node_is_gpu(node_dir: &Path) -> bool {
+    fs::read_to_string(node_dir.join("gfx_target_version"))
+        .ok()
+        .is_some_and(|value| kfd_gfx_target_version_is_gpu(value.trim()))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn kfd_gfx_target_version_is_gpu(value: &str) -> bool {
+    value
+        .trim()
+        .parse::<u64>()
+        .is_ok_and(|version| version != 0)
+}
+
+/// The active GPU visibility mask, preferring `HIP_VISIBLE_DEVICES` then
+/// `ROCR_VISIBLE_DEVICES`. `None` when neither is set; an explicitly empty value
+/// is returned as `Some("")` so callers can distinguish "unset" (all visible)
+/// from "set to nothing" (all masked out).
+#[cfg(any(target_os = "linux", test))]
+fn visibility_mask_from_env() -> Option<String> {
+    ["HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"]
+        .into_iter()
+        .find_map(std::env::var_os)
+        .map(|value| value.to_string_lossy().into_owned())
+}
+
+/// Apply a `HIP_VISIBLE_DEVICES`-style `mask` to the present device ordinals
+/// (`0..present`). `None` means no mask is set (every present device is visible).
+/// The mask is a comma-separated ordinal list parsed left to right; a
+/// non-numeric or out-of-range entry terminates the list (earlier entries stay
+/// visible), and an empty value hides every device.
+#[cfg(any(target_os = "linux", test))]
+fn usable_amd_gpu_indices_from(present: usize, mask: Option<String>) -> Vec<u32> {
+    let Some(mask) = mask else {
+        return (0..present as u32).collect();
+    };
+    let mut visible = Vec::new();
+    for token in mask.split(',') {
+        let Ok(index) = token.trim().parse::<u32>() else {
+            break;
+        };
+        if (index as usize) >= present {
+            break;
+        }
+        if !visible.contains(&index) {
+            visible.push(index);
+        }
+    }
+    visible
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn parse_linux_kfd_gfx_target(value: &str) -> Option<String> {
     if let Some(token) = extract_first_gfx_token(value) {
@@ -8153,5 +8264,54 @@ last_installed_runtime_id = "therock-release"
         assert!(!paths.config_path().is_file());
         let _ = fs::remove_dir_all(&root);
         Ok(())
+    }
+
+    #[test]
+    fn kfd_gfx_target_version_distinguishes_gpu_from_cpu_nodes() {
+        // CPU topology nodes report a zero gfx target version; GPU nodes report a
+        // nonzero one.
+        assert!(!kfd_gfx_target_version_is_gpu("0"));
+        assert!(!kfd_gfx_target_version_is_gpu(""));
+        assert!(!kfd_gfx_target_version_is_gpu("not-a-number"));
+        assert!(kfd_gfx_target_version_is_gpu("90402"));
+        assert!(kfd_gfx_target_version_is_gpu("110000"));
+    }
+
+    #[test]
+    fn usable_gpu_indices_unset_mask_returns_all_present_devices() {
+        assert_eq!(usable_amd_gpu_indices_from(0, None), Vec::<u32>::new());
+        assert_eq!(usable_amd_gpu_indices_from(1, None), vec![0]);
+        assert_eq!(usable_amd_gpu_indices_from(3, None), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn usable_gpu_indices_empty_mask_hides_every_device() {
+        // The masked-device path: GPUs are present but fully masked out.
+        assert_eq!(
+            usable_amd_gpu_indices_from(2, Some(String::new())),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn usable_gpu_indices_honors_partial_and_reordered_mask() {
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, Some("2,0".to_owned())),
+            vec![2, 0]
+        );
+        // Out-of-range and non-numeric entries terminate the visible list.
+        assert_eq!(
+            usable_amd_gpu_indices_from(2, Some("0,5".to_owned())),
+            vec![0]
+        );
+        assert_eq!(
+            usable_amd_gpu_indices_from(2, Some("bogus".to_owned())),
+            Vec::<u32>::new()
+        );
+        // Duplicates are collapsed.
+        assert_eq!(
+            usable_amd_gpu_indices_from(2, Some("1,1".to_owned())),
+            vec![1]
+        );
     }
 }

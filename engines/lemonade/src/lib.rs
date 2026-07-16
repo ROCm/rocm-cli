@@ -40,7 +40,11 @@ const LLAMACPP_RECIPE: &str = "llamacpp";
 const ROCM_BACKEND_NAME: &str = "rocm";
 /// Preferred llama.cpp backends, best first. Lemonade reports per-GPU support;
 /// we pick the highest-priority backend it considers supported on this host.
-const LLAMACPP_BACKEND_PRIORITY: [&str; 3] = ["rocm", "vulkan", "cpu"];
+/// GPU backends only — `cpu` is intentionally excluded so the router path never
+/// selects CPU under the GPU-required policy (AGENTS.md §6, matching
+/// `DIRECT_LLAMA_SERVER_BACKENDS`). When only CPU is usable, selection returns
+/// `None` and the caller fails with actionable guidance.
+const LLAMACPP_BACKEND_PRIORITY: [&str; 2] = ["rocm", "vulkan"];
 const DEFAULT_LOG_TAIL_LINES: usize = 200;
 const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
 /// Maximum bytes to read from the end of a log file when extracting tail lines.
@@ -335,8 +339,8 @@ fn capabilities() -> EngineCapabilities {
         rocm_gpu: true,
         openai_compatible: true,
         tool_calling: true,
-        quantized_models: "GGUF through Lemonade llama.cpp (ROCm/Vulkan/CPU auto-selected)"
-            .to_owned(),
+        quantized_models:
+            "GGUF through Lemonade llama.cpp (ROCm or Vulkan GPU backend auto-selected)".to_owned(),
         reasoning_parser: false,
     }
 }
@@ -373,15 +377,7 @@ fn detect_response() -> DetectResponse {
         python_version: None,
         torch_version: None,
         transformers_version: None,
-        available_devices: vec![EngineDeviceAvailability {
-            kind: "rocm_gpu".to_owned(),
-            available: runtime.is_some(),
-            reason: if runtime.is_some() {
-                None
-            } else {
-                Some("Lemonade embeddable runtime is not installed".to_owned())
-            },
-        }],
+        available_devices: vec![gpu_availability_device(runtime.is_some())],
         capabilities: capabilities(),
         notes,
     }
@@ -450,7 +446,7 @@ fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelRe
         }),
         engine_recipe,
         warnings: vec![
-            "Lemonade auto-selects the best supported llama.cpp backend for this GPU (ROCm, then Vulkan, then CPU)".to_owned(),
+            "Lemonade auto-selects the best supported GPU llama.cpp backend for this host (ROCm, then Vulkan); CPU is never used under the GPU-required policy".to_owned(),
         ],
     })
 }
@@ -515,8 +511,13 @@ fn launch_service(mut request: LaunchRequest) -> Result<LaunchResponse> {
     })
 }
 
-fn serve_http(request: ServeHttpRequest) -> Result<()> {
+fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
     require_gpu_required(&request.device_policy)?;
+    // Verify a real GPU is available before launching anything: zero usable
+    // devices fails fast, `auto` resolves to the first present device (never an
+    // assumed device 0), and an explicit `--gpu` index is rejected when it is not
+    // actually present. This runs before any server process is spawned.
+    request.gpu_indices = resolve_serve_gpu_indices(&request.gpu_indices)?;
     let runtime = resolve_runtime()?;
     let mut process_env = lemonade_process_environment()?;
     process_env.gpu_indices = request.gpu_indices.clone();
@@ -868,7 +869,7 @@ fn healthcheck_service(request: HealthcheckRequest) -> Result<HealthcheckRespons
         status,
         model_loaded: ready,
         device: if ready {
-            "rocm_gpu".to_owned()
+            reported_device(state.as_ref(), &backend)
         } else {
             "unknown".to_owned()
         },
@@ -877,6 +878,26 @@ fn healthcheck_service(request: HealthcheckRequest) -> Result<HealthcheckRespons
         last_error: None,
         tokens_per_sec: None,
     })
+}
+
+/// The device string reported once a model is loaded. Reflects the backend that
+/// actually ran (`rocm`, `vulkan`, …) and the pinned GPU ordinal when known,
+/// rather than a hardcoded value, so the report matches observed execution.
+fn reported_device(state: Option<&Value>, backend: &str) -> String {
+    match state.and_then(first_gpu_index_from_state) {
+        Some(index) => format!("{backend} gpu {index}"),
+        None => format!("{backend} gpu"),
+    }
+}
+
+/// The first pinned GPU ordinal recorded in service state, if any.
+fn first_gpu_index_from_state(state: &Value) -> Option<u32> {
+    state
+        .get("gpu_indices")
+        .and_then(Value::as_array)
+        .and_then(|indices| indices.first())
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
 }
 
 fn endpoint_response(request: EndpointRequest) -> Result<EndpointResponse> {
@@ -1017,7 +1038,10 @@ fn ensure_best_llamacpp_backend(
     let backends = parse_llamacpp_backend_statuses(&listing);
     let Some((backend, already_installed)) = select_best_llamacpp_backend(&backends) else {
         bail!(
-            "Lemonade reports no supported llama.cpp backend for this GPU (status: {})",
+            "Lemonade reports no supported GPU llama.cpp backend for this host (status: {}). \
+             The GPU-required policy does not fall back to CPU; install a ROCm or Vulkan \
+             backend (e.g. `rocm engines install lemonade`) or verify the GPU driver with \
+             `rocm examine`.",
             describe_llamacpp_backends(&backends)
         );
     };
@@ -2318,6 +2342,7 @@ fn write_running_state(
             "port": request.port,
             "endpoint_url": endpoint_url(&request.host, request.port),
             "device_policy": device_policy_name(&request.device_policy),
+            "gpu_indices": request.gpu_indices,
             "runtime_id": request.runtime_id.as_deref().unwrap_or(runtime.manifest.env_id.as_str()),
             "env_id": request.env_id.as_deref().unwrap_or(runtime.manifest.env_id.as_str()),
             "runtime_kind": "lemonade_embeddable",
@@ -2499,6 +2524,85 @@ fn require_gpu_required(policy: &DevicePolicy) -> Result<()> {
         DevicePolicy::CpuOnly => {
             bail!("Lemonade adapter requires ROCm GPU execution; no CPU fallback is used")
         }
+    }
+}
+
+/// Probe real GPU availability and resolve the device ordinal(s) to pin before a
+/// GPU-required launch. Returns the resolved indices, or an error that stops
+/// serving before any process is spawned:
+/// - no usable device → fail with actionable guidance (no CPU/GPU-0 fallback);
+/// - `auto` (empty `requested`) → the first present, visible device;
+/// - explicit index not among the usable devices → fail.
+///
+/// When availability cannot be probed on this platform, the requested selection
+/// is passed through unchanged so serving is not blocked on that basis.
+fn resolve_serve_gpu_indices(requested: &[u32]) -> Result<Vec<u32>> {
+    resolve_gpu_indices_against(requested, rocm_core::usable_amd_gpu_indices())
+}
+
+/// Pure resolution used by [`resolve_serve_gpu_indices`], split out so the
+/// auto/explicit/no-device policy can be unit-tested without real hardware.
+/// `usable` is the probe result: `None` (unprobeable) passes the request
+/// through; `Some(_)` is authoritative.
+fn resolve_gpu_indices_against(requested: &[u32], usable: Option<Vec<u32>>) -> Result<Vec<u32>> {
+    let Some(usable) = usable else {
+        return Ok(requested.to_vec());
+    };
+    if usable.is_empty() {
+        bail!(
+            "no usable AMD GPU detected; `rocm serve` requires a GPU under the default \
+             GPU-required policy and does not fall back to CPU. Check the driver with \
+             `rocm examine`, confirm /dev/kfd is present, and ensure HIP_VISIBLE_DEVICES / \
+             ROCR_VISIBLE_DEVICES are not masking every device."
+        );
+    }
+    if requested.is_empty() {
+        return Ok(vec![usable[0]]);
+    }
+    for index in requested {
+        if !usable.contains(index) {
+            let visible = usable
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "requested GPU {index} is not available on this host; usable GPU indices: [{visible}]"
+            );
+        }
+    }
+    Ok(requested.to_vec())
+}
+
+/// GPU device availability for `detect`, sourced from the real device probe. When
+/// the probe is authoritative it reports true/false with a reason; when it cannot
+/// determine availability on this platform, it falls back to whether the runtime
+/// is installed so `detect` stays informative.
+fn gpu_availability_device(runtime_installed: bool) -> EngineDeviceAvailability {
+    match rocm_core::usable_amd_gpu_indices() {
+        Some(indices) if !indices.is_empty() => EngineDeviceAvailability {
+            kind: "rocm_gpu".to_owned(),
+            available: true,
+            reason: None,
+        },
+        Some(_) => EngineDeviceAvailability {
+            kind: "rocm_gpu".to_owned(),
+            available: false,
+            reason: Some(
+                "no AMD GPU detected, or every device is masked by \
+                 HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES"
+                    .to_owned(),
+            ),
+        },
+        None => EngineDeviceAvailability {
+            kind: "rocm_gpu".to_owned(),
+            available: runtime_installed,
+            reason: if runtime_installed {
+                None
+            } else {
+                Some("Lemonade embeddable runtime is not installed".to_owned())
+            },
+        },
     }
 }
 
@@ -2998,21 +3102,76 @@ vllm                rocm        unsupported     Requires Linux                  
     }
 
     #[test]
-    fn selects_cpu_when_no_gpu_backend() {
+    fn never_selects_cpu_when_no_gpu_backend() {
+        // Under the GPU-required policy there is no silent CPU fallback: when only
+        // a CPU backend is usable, selection returns nothing and the caller fails.
         let backends = vec![
             ("rocm".to_owned(), "unsupported".to_owned()),
             ("cpu".to_owned(), "installable".to_owned()),
         ];
-        assert_eq!(
-            select_best_llamacpp_backend(&backends),
-            Some(("cpu".to_owned(), false))
-        );
+        assert_eq!(select_best_llamacpp_backend(&backends), None);
     }
 
     #[test]
     fn selects_nothing_when_all_unsupported() {
         let backends = vec![("rocm".to_owned(), "unsupported".to_owned())];
         assert_eq!(select_best_llamacpp_backend(&backends), None);
+    }
+
+    #[test]
+    fn serve_gpu_resolution_fails_fast_when_no_device_usable() {
+        // No-device / masked-device path: the probe authoritatively reports zero
+        // usable GPUs, so serving is refused before any process is spawned.
+        let error = resolve_gpu_indices_against(&[], Some(vec![]))
+            .expect_err("zero usable devices must be rejected");
+        assert!(error.to_string().contains("no usable AMD GPU"));
+    }
+
+    #[test]
+    fn serve_gpu_resolution_auto_pins_first_present_device() {
+        // `auto` (empty request) resolves to the first present device — never an
+        // assumed device 0 when device 0 is not present.
+        assert_eq!(
+            resolve_gpu_indices_against(&[], Some(vec![1, 2])).unwrap(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn serve_gpu_resolution_validates_explicit_index() {
+        // An explicitly requested present device is honored.
+        assert_eq!(
+            resolve_gpu_indices_against(&[2], Some(vec![0, 1, 2])).unwrap(),
+            vec![2]
+        );
+        // A requested device that is not present is rejected rather than silently
+        // remapped to another GPU.
+        let error = resolve_gpu_indices_against(&[3], Some(vec![0, 1]))
+            .expect_err("absent device must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("requested GPU 3 is not available")
+        );
+    }
+
+    #[test]
+    fn serve_gpu_resolution_passes_through_when_unprobeable() {
+        // When availability cannot be determined, the request is passed through
+        // unchanged so serving is not blocked on that basis.
+        assert_eq!(
+            resolve_gpu_indices_against(&[], None).unwrap(),
+            Vec::<u32>::new()
+        );
+        assert_eq!(resolve_gpu_indices_against(&[1], None).unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn reported_device_reflects_backend_and_pinned_ordinal() {
+        let state = json!({ "gpu_indices": [1] });
+        assert_eq!(reported_device(Some(&state), "vulkan"), "vulkan gpu 1");
+        // Without a recorded ordinal the backend is still reported truthfully.
+        assert_eq!(reported_device(None, "rocm"), "rocm gpu");
     }
 
     #[test]
