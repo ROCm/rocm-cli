@@ -3759,8 +3759,8 @@ echo Python 3.12.10
 
         let url = format!("http://127.0.0.1:{port}/artifact.bin");
 
-        let temp = std::env::temp_dir().join(format!(
-            "rocm-cli-native-http-test-{}-{}",
+        let temp = workspace_test_artifact_dir().join(format!(
+            "native-http-{}-{}",
             std::process::id(),
             unix_time_millis()
         ));
