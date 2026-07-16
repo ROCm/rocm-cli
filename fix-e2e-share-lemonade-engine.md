@@ -62,6 +62,8 @@ both clean; ci.yml valid YAML.
 **2026-07-16 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
 **2026-07-16:** Diagnosed root cause from failing job 87668414041 logs (4.6 GB
+
+**2026-07-16:** Diagnosed root cause from failing job 87668414041 logs (4.6 GB
 per-scenario re-download → 300s serve timeout). Traced lemonade backend install path
 through engines/lemonade/src/lib.rs + crates/rocm-core. Implemented harness sharing + CI
 pre-warm across all 3 E2E jobs. Branch created off origin/main (worktree was behind).
