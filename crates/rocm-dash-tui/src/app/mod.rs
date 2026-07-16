@@ -40,7 +40,8 @@ mod summary;
 
 use chat::{
     StartupChatOutcome, build_chat_agent, build_local_agent, detect_local_chat,
-    persist_chat_endpoint, startup_chat_outcome,
+    discover_configured_chat_model, persist_chat_endpoint, stale_chat_url_replacement,
+    startup_chat_outcome,
 };
 use summary::{parse_plan_result, summarize_json_value, summarize_slash_tool};
 
@@ -1654,11 +1655,16 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         let probe_ok = match startup_outcome {
             StartupChatOutcome::Local => true,
             StartupChatOutcome::OAuth => false,
-            StartupChatOutcome::Configured => tokio::task::spawn_blocking(move || {
-                crate::llm::probe_endpoint(&probe_target, crate::llm::PROBE_TIMEOUT)
-            })
-            .await
-            .unwrap_or(false),
+            StartupChatOutcome::Configured => {
+                // Clone so `probe_target` stays available for the EAI-7360
+                // stale-URL recovery and its notice below.
+                let target = probe_target.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::llm::probe_endpoint(&target, crate::llm::PROBE_TIMEOUT)
+                })
+                .await
+                .unwrap_or(false)
+            }
         };
         let llm = detected.or_else(|| {
             crate::llm::resolve_llm_config(
@@ -1672,6 +1678,57 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                 probe_ok,
             )
         });
+        // PR #97 port onto PR #100's startup flow: a *configured* URL (CLI/env)
+        // with no explicit model resolves to the `local-model` placeholder,
+        // which 404s on servers that register the model under its real id. Only
+        // the `Configured` outcome needs this — the `Local` outcome already
+        // carries a `/v1/models`-discovered model from `detect_local_chat`, and
+        // `OAuth` has no config. Discovery is gated inside the helper on
+        // `probe_ok` (an unreachable endpoint is never probed nor replaced) and
+        // on the absence of an explicit model (config precedence wins).
+        let llm = match llm {
+            Some(cfg) if startup_outcome == StartupChatOutcome::Configured => Some(
+                discover_configured_chat_model(cfg, args.chat_model.as_deref(), probe_ok).await,
+            ),
+            other => other,
+        };
+        // EAI-7360: a persisted `tui.chat_url` can go stale — the server it
+        // pointed at may have been stopped or replaced since the dash last wrote
+        // it. This is the `Configured`-but-unreachable case: the reachable
+        // `Configured` case already ran `discover_configured_chat_model` above,
+        // and a `Local` outcome auto-detected its own live endpoint. Only this
+        // persisted-config tier is revalidated — `chat_env_url` is a separate
+        // tier, and `resolve_llm_config`'s CLI>config>env>probe precedence (the
+        // literal contract unit-tested in `llm.rs`) is untouched: this only
+        // substitutes a *replacement* `LlmConfig` after that call, never changes
+        // how the call itself resolves.
+        //
+        // Require NO configured api_key/auth_header: the replacement is a
+        // keyless `detected_llm_config`, and since `ResolvedArgs` can't
+        // distinguish an explicit `--chat-url` from persisted config, a remote
+        // gateway URL + `OPENAI_API_KEY` that merely TCP-times-out must never
+        // silently swap to a local keyless engine and drop the credential.
+        // Confining the swap to a no-auth `chat_url` keeps it on the true
+        // EAI-7360 target: a dead *persisted* local endpoint.
+        let stale_replacement = if startup_outcome == StartupChatOutcome::Configured
+            && !probe_ok
+            && args.chat_url.is_some()
+            && args.chat_api_key.is_none()
+            && args.chat_auth_header.is_none()
+        {
+            let live = detect_local_chat(state.tool_executor.clone()).await;
+            stale_chat_url_replacement(&probe_target, probe_ok, live)
+        } else {
+            None
+        };
+        if let Some(live) = &stale_replacement {
+            state.chat.push(ChatTurn::system(format!(
+                "Configured chat server at {probe_target} is unreachable; switched to the live \
+                 local engine at {} (model: {}). Run `/detect save` to persist it.",
+                live.base_url, live.model
+            )));
+        }
+        let llm = stale_replacement.or(llm);
         state.set_chat_config(llm, args.chat_auto_consent);
         // No reachable local endpoint AND no key/url configured → the no-key
         // ChatGPT OAuth default (device-code login surfaced in the chat tab).
