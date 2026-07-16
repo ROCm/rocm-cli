@@ -5054,8 +5054,9 @@ mod tests {
     #[test]
     fn read_new_log_phase_advances_and_tracks_latest() {
         use std::io::Write as _;
-        let dir = std::env::temp_dir().join(format!("rocmd-phase-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // Workspace-local test root (rooted at CARGO_MANIFEST_DIR, not the
+        // ambient temp dir) — same helper the other rocmd tests use.
+        let dir = unique_test_root(&format!("rocmd-phase-{}", std::process::id()));
         let log = dir.join("svc.log");
         std::fs::write(&log, "boot\nDownloading shards: 100%\n").unwrap();
 
