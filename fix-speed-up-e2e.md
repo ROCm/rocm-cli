@@ -2,10 +2,10 @@
 
 # WIP: Speed up E2E test suite
 
-**Stage:** 6-implementing — STAGED TASK, NOT done (PR #126 shipped; Tasks #2–#4 shipped to PR #128; Tasks #5–#11 remain)
+**Stage:** 6-implementing — STAGED TASK, NOT done (PR #126 shipped; Tasks #2–#4 in PR #128, review fix pushed `4cd2c53`, awaiting volen-silo re-review; Tasks #5–#11 remain)
 **Pipeline:** standard
 **Branch:** test-e2e-smallest-serve-model (was fix-speed-up-e2e; re-branched off fresh main for Task #3 chunk)
-**Last Updated:** 2026-07-17 (idle flush)
+**Last Updated:** 2026-07-17
 
 **Token Usage:** in=1006 out=301808 cache_create=5512288 cache_read=94907267 calls=509
 
@@ -135,8 +135,8 @@ capture more cleanly. **Capacity** = user adds hardware when available (near-max
 
 ## Next Steps
 
-- Task #1 (merged PR #126) done; diagnose coverage moved to [[test-e2e-diagnose]] (PR #127). Post-merge cleanup deferred. Remaining work = Tasks #2–#11.
-- **Decision gate Task #3:** confirm with user whether serve targets should be latest variant or smallest (current: lemonade `Qwen3-0.6B-GGUF` smallest; vLLM 1.5B). Settle once, apply to both. Gates Tasks #2–#4.
+- **PR #128 (Tasks #2–#4):** decision was SMALLEST (user). Review fix `4cd2c53` pushed (scoped swap). Awaiting: volen-silo re-review to clear CHANGES_REQUESTED + GPU CI lane (real verdict for the 0.5B serve on vLLM). Can't self-dismiss a bot review.
+- Task #1 (merged PR #126) done; diagnose coverage in [[test-e2e-diagnose]] (PR #127). Remaining new work = Tasks #5–#11.
 - **Biggest structural win Tasks #5–#7:** mock/real split — classify `@requires-gpu` scenarios, build a faithful mock serve engine, migrate mockable ones off GPU.
 - **Schedule Tasks #8–#9:** gate heavy serve matrix to `merge_group` + narrow serve paths-filter (prereq: fix Strix-Windows flake first).
 
