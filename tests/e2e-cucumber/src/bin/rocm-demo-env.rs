@@ -6,9 +6,10 @@
 //!
 //! Starts the same axum mock OpenAI server the cucumber e2e suite uses, plants a
 //! managed-service record into an isolated config root, and prints the env vars
-//! that point `rocm` at it. A demo tape sources this output (in a hidden block)
-//! so `rocm chat` / `rocm services list` run against the mock — no GPU, no real
-//! model, fully deterministic. Runs until interrupted; the tape kills it on exit.
+//! that point `rocm` at it. `cargo xtask demos` parses this output and exports
+//! it before VHS runs, so `rocm chat` / `rocm services list` hit the mock — no
+//! GPU, no real model, fully deterministic. Runs until signalled; xtask kills it
+//! when rendering finishes.
 //!
 //! Usage: `rocm-demo-env --root <dir> [--model <id>]`
 
@@ -75,8 +76,11 @@ async fn main() {
 
 /// Block until a stop signal. On Unix, ignore SIGINT/SIGHUP — VHS/ttyd emit some
 /// during terminal setup, and catching the default disposition would kill the
-/// server before the demo command runs — and exit only on SIGTERM, which the
-/// render harness's cleanup trap sends. Elsewhere, fall back to Ctrl-C.
+/// server before the demo command runs — and exit gracefully on SIGTERM (useful
+/// when this binary is run standalone and stopped with `kill`). When driven by
+/// `cargo xtask demos`, the parent instead hard-kills this process (SIGKILL) once
+/// rendering finishes, so this handler need not run in that path. Elsewhere, fall
+/// back to Ctrl-C.
 #[cfg(unix)]
 async fn wait_for_shutdown() {
     use tokio::signal::unix::{SignalKind, signal};

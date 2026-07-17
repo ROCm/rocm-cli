@@ -6,74 +6,110 @@ SPDX-License-Identifier: MIT
 
 # Demo screencasts
 
-The README embeds short terminal screencasts (GIFs) of common `rocm` commands.
-They are authored as [VHS](https://github.com/charmbracelet/vhs) tapes, rendered
-in CI, and published to the orphan **`media`** branch. GIFs are **never committed
-to source branches** — the README references them by absolute raw URL, so the
-binaries stay out of `main`'s history.
+The README embeds two complete terminal demos:
+
+- **ROCm CLI** follows a first-use journey from environment inspection through
+  local-model chat.
+- **ROCm Console** tours the real full-screen TUI with deterministic simulated
+  telemetry and its offline chat backend.
+
+Both are authored as [VHS](https://github.com/charmbracelet/vhs) tapes, rendered
+in CI, and published to the orphan **`media`** branch. GIFs are never committed
+to source branches; the README references them by absolute raw URL.
 
 ## Layout
 
 | Path | Purpose |
 | --- | --- |
-| `docs/tapes/*.tape` | One VHS tape per demo — a **pure command sequence**, no setup. |
-| `docs/tapes/render.sh` | Sets up the env + mock server, then runs `vhs <tape>`. |
-| `docs/tapes/lib/demo-env.sh` | Sourced by `render.sh`; starts the mock server and points `rocm` at an isolated config. |
-| `.github/workflows/demo-gifs.yml` | Builds the binaries, renders every tape, publishes GIFs to the `media` branch. |
-| `docs/media/` | Render output directory (git-ignored; present only so `vhs` has a target). |
+| `docs/tapes/cli.tape` | CLI first-use journey. |
+| `docs/tapes/console.tape` | Interactive Console tour using `--demo --chat-mock`. |
+| `xtask/src/demos.rs` | Builds binaries, starts the isolated mock service, runs VHS, and cleans up. |
+| `tests/e2e-cucumber/src/bin/rocm-demo-env.rs` | Mock-service helper: reuses the e2e harness's loopback OpenAI server and plants a service record under isolated config. |
+| `.github/workflows/demo-gifs.yml` | Installs VHS and publishes generated GIFs to `media`. |
+| `docs/media/` | Git-ignored render output directory. |
 
-## Why setup lives in render.sh, not the tapes
+## Deterministic environment
 
-VHS types on a fixed clock and **never waits for a command to finish**. If a tape
-does its own setup (e.g. `source`-ing a helper that blocks while a server starts),
-VHS keeps typing into a busy shell — the following commands never execute cleanly
-and the "hidden" setup leaks into the recording. So all setup happens in
-`render.sh` *before* `vhs` starts, and every tape is a pure command sequence that
-runs against an already-ready shell.
+`cargo xtask demos` performs all setup before VHS starts:
 
-## How the server-backed demos work
+1. Builds release versions of `rocm` and `rocm-demo-env`.
+2. Starts `rocm-demo-env`, which reuses the end-to-end harness's loopback
+   OpenAI-compatible server and plants a managed-service record under isolated
+   config, data, and cache directories.
+3. Waits for the helper to publish all required environment paths and its
+   readiness marker.
+4. Prepends the release binary directory to `PATH`, renders the selected tapes,
+   then stops the helper and removes its temporary state.
 
-`chat` and `services` need a running model endpoint. Instead of a GPU or a real
-model, they reuse the end-to-end test harness's mock OpenAI server via the
-standalone `rocm-demo-env` binary (`tests/e2e-cucumber/src/bin/rocm-demo-env.rs`).
-`render.sh` sources `demo-env.sh`, which:
+Setup deliberately does not live inside a tape. VHS advances on a fixed clock
+and does not wait for commands to finish, so hidden setup can race subsequent
+keystrokes. The tapes remain pure visible command/key sequences against an
+already-ready environment.
 
-1. Starts `rocm-demo-env` — boots the axum mock server on a loopback port and
-   plants a managed-service record into an isolated config dir.
-2. Exports `ROCM_CLI_CONFIG_DIR` / `ROCM_CLI_DATA_DIR` / `ROCM_CLI_CACHE_DIR` so
-   `rocm` discovers the mock, and `ROCM_MOCK_CHAT_REPLY` for a realistic answer.
-3. Installs an EXIT trap that stops the server when rendering finishes.
+The Console needs no ROCm hardware: `rocm dash --demo` replays the project's
+seeded synthetic telemetry through the same UI as a live daemon, and visibly
+marks it **SIMULATED DATA**. `--chat-mock` provides the deterministic offline
+chat response. The CLI's service and chat commands use only the loopback mock.
+Neither demo downloads a model or calls a cloud provider.
 
-Output is deterministic and needs no hardware, so renders are reproducible.
+## Storyboards
 
-## Regenerate locally
+### CLI
 
-Install [VHS](https://github.com/charmbracelet/vhs) (plus `ttyd` + `ffmpeg`),
-then from the repo root:
+`cli.tape` demonstrates:
+
+1. `rocm examine`
+2. `rocm engines list`
+3. `rocm model`
+4. `rocm services list`
+5. one-shot `rocm chat` against the discovered mock service
+
+### Console
+
+`console.tape` launches `rocm dash --demo --chat-mock`, visits Home, ROCm,
+Serving, Observe, and Chat, asks which simulated GPU needs attention, opens the
+built-in help, and exits cleanly.
+
+## Regenerate
+
+Install VHS and its runtime dependencies (`ttyd`, `ffmpeg`, and Chrome), then
+run from the repository root:
 
 ```bash
-# Build the binaries the tapes invoke.
-cargo build --release -p rocm --bin rocm
-cargo build --release -p e2e-cucumber --bin rocm-demo-env
+# Render both demos, building the binaries first.
+cargo xtask demos
 
-# Render one tape (writes docs/media/<name>.gif).
-docs/tapes/render.sh docs/tapes/chat.tape
+# Render one demo.
+cargo xtask demos cli
+cargo xtask demos console
+
+# Reuse release binaries already present in target/release.
+cargo xtask demos --skip-build
 ```
 
-`render.sh` resolves binaries from `target/release` by default; override with
-`ROCM_BIN_DIR=/path/to/bin`. Change the demo model with `ROCM_DEMO_MODEL`.
+Set `ROCM_BIN_DIR` to use binaries from another directory. `ROCM_DEMO_MODEL`
+changes the model the mock service advertises; the CLI tape's `--model`
+argument must match it (both default to the same identifier), so override
+them together if you change one.
 
-## Add a demo
+> [!NOTE]
+> Browser-backed VHS GIF rendering can hang under WSL2. On WSL2, run the Rust
+> tests and command-level checks locally, then use the `demo-gifs` GitHub Actions
+> workflow for the actual GIF render.
 
-1. Add `docs/tapes/<name>.tape` with `Output docs/media/<name>.gif` — a pure
-   command sequence (no `Hide`/`source`; `render.sh` provides the env).
-2. Add `<name>` to the render loop in `.github/workflows/demo-gifs.yml`.
-3. Reference the published GIF from the README:
+## Add or change a demo
+
+1. Keep each tape a pure command/key sequence; put environment orchestration in
+   `xtask/src/demos.rs`.
+2. When adding a new tape, add its name to the `DEMOS` list in that module.
+3. Reference the published GIF as
    `https://raw.githubusercontent.com/ROCm/rocm-cli/media/<name>.gif`.
+4. Verify the story without relying on GPU hardware, model downloads, or
+   non-loopback services.
 
-## Triggers
+## Workflow triggers
 
-The workflow runs on `workflow_dispatch` and on published releases — never on
-pull requests (rendering is slow and would churn the `media` branch). GitHub
-proxies README images through a cache; when a regenerated GIF looks stale, append
-a cache-buster to the URL (e.g. `...chat.gif?v=<release-tag>`).
+The workflow runs on `workflow_dispatch` and on published releases, never on
+pull requests. Rendering is slow and would churn the generated-media branch.
+GitHub proxies README images through a cache; append a release-based query
+parameter if a regenerated image appears stale.

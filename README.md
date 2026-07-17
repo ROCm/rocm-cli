@@ -34,13 +34,19 @@ vLLM.
 
 ## Demos
 
-Chat with a locally served model:
+### ROCm CLI
 
-![rocm chat one-shot demo](https://raw.githubusercontent.com/ROCm/rocm-cli/media/chat.gif)
+Inspect the environment, discover engines and models, find a running service,
+and chat with a locally served model:
 
-Inspect running model servers:
+![ROCm CLI demo](https://raw.githubusercontent.com/ROCm/rocm-cli/media/cli.gif)
 
-![rocm services list demo](https://raw.githubusercontent.com/ROCm/rocm-cli/media/services.gif)
+### ROCm Console
+
+Explore simulated GPU telemetry, model serving, and offline chat in the
+full-screen Console:
+
+![ROCm Console demo](https://raw.githubusercontent.com/ROCm/rocm-cli/media/console.gif)
 
 <!--
 The GIFs above are generated in CI and served from the orphan `media` branch;

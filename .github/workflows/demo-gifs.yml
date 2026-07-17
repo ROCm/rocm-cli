@@ -25,11 +25,6 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
-      - name: Build rocm + demo mock server
-        run: |
-          cargo build --release -p rocm --bin rocm
-          cargo build --release -p e2e-cucumber --bin rocm-demo-env
-
       # VHS + its runtime deps. ttyd/ffmpeg from apt; vhs pinned via `go install`
       # (Go is preinstalled on the runner). Chrome (used by VHS to rasterize
       # frames) is preinstalled; the sysctl re-enables its sandbox on Ubuntu 24.04
@@ -42,14 +37,10 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 
-      # render.sh starts the mock server + isolated env, then runs vhs against a
-      # pure command tape (see docs/demos.md). Setup lives here, never in a tape.
-      - name: Render tapes
-        run: |
-          mkdir -p docs/media
-          for t in version engines services chat; do
-            docs/tapes/render.sh "docs/tapes/$t.tape"
-          done
+      # xtask builds the binaries, starts the isolated mock service, then runs
+      # VHS against the pure command/key tapes (see docs/demos.md).
+      - name: Render demos
+        run: cargo xtask demos
 
       - name: Publish to media branch
         uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4.1.0
