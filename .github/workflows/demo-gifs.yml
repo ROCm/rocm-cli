@@ -46,12 +46,20 @@ jobs:
       - name: Render demos
         run: cargo xtask demos
 
+      # Publish from an unignored staging directory. `docs/media/*.gif` is
+      # intentionally git-ignored on source branches, and the Pages action honors
+      # that ignore file while preparing assets.
+      - name: Stage rendered media
+        run: |
+          mkdir -p rendered-media
+          cp docs/media/cli.gif docs/media/console.gif rendered-media/
+
       - name: Publish to media branch
         uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4.1.0
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_branch: media
-          publish_dir: ./docs/media
+          publish_dir: ./rendered-media
           force_orphan: true # single-commit branch; old GIF blobs are GC'd
           user_name: github-actions[bot]
           user_email: github-actions[bot]@users.noreply.github.com
