@@ -4,7 +4,7 @@
 **Pipeline:** standard
 **Branch:** fix-xpass-non-fatal-flaky (worktree active)
 **Jira:** EAI-7456 (In Progress, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-17
+**Last Updated:** 2026-07-17 (idle flush)
 
 **Token Usage:** in=402 out=91813 cache_create=953594 cache_read=23617635 calls=183
 
@@ -130,3 +130,6 @@ Scenario: Non-flaky XPASS remains fatal
 **2026-07-17 (gate verification):**
 - Container gate (`container-test.sh all`) re-run with warm 397M cargo cache from sibling worktree — **GREEN** (exit 0). Full mock E2E suite ran in Linux binary; reconciliation printed: `4 xfail (failed as expected), 0 XPASS (0 flaky, non-fatal), 0 unexpected failure(s)`. Code verified.
 - Ready: commit + push + open PR (separate, per recommendation).
+
+**2026-07-17 (idle flush):**
+- Session idle for 10 minutes, auto-flushing WIP state.
