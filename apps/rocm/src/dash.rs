@@ -43,7 +43,11 @@ pub fn runner_options(
 ) -> RunnerOptions {
     let d = &config.dashboard.daemon;
     RunnerOptions {
-        bench_csv: d.bench_results_dir.clone(),
+        bench_csv: Some(
+            d.bench_results_dir
+                .clone()
+                .unwrap_or_else(|| default_bench_csv_path(paths)),
+        ),
         enable_docker,
         image_patterns: None,
         gpu_tick: Duration::from_secs_f64(d.gpu_tick_secs),
@@ -201,6 +205,7 @@ pub fn resolved_args(
         // The real executor is injected in `run_async` for a live dash; None
         // here keeps demo/replay/mock behaving exactly as today.
         tool_executor: None,
+        bench_results_dir: config.dashboard.daemon.bench_results_dir.clone(),
     }
 }
 
@@ -389,6 +394,149 @@ pub fn run_chat(chat_mock: bool) -> Result<()> {
     rt.block_on(run_async(config, paths, args, None, chat_mock))
 }
 
+/// CLI arguments for `rocm bench load`.
+pub struct BenchLoadArgs {
+    pub endpoint: String,
+    pub model: Option<String>,
+    pub concurrency: Vec<u32>,
+    pub isl: u32,
+    pub osl: u32,
+    pub requests: u32,
+    pub out: Option<std::path::PathBuf>,
+    pub auto_ramp: bool,
+}
+
+/// Default `--out` path for `rocm bench load`: the same file the telemetry
+/// daemon tails by default (`DashboardDaemonConfig::bench_results_dir`), so a
+/// plain CLI run populates the dashboard's Bench panel without any config
+/// edits. Extracted as a pure function of `AppPaths` for testability.
+fn default_bench_csv_path(paths: &AppPaths) -> std::path::PathBuf {
+    paths.data_dir.join("bench").join("results.csv")
+}
+
+fn ensure_bench_csv_parent(csv_path: &std::path::Path) -> Result<()> {
+    if let Some(parent) = csv_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating bench output dir {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+/// Entry point for `rocm bench load`.
+///
+/// Runs a concurrency sweep against a local http:// endpoint and appends one
+/// aggregate CSV row per concurrency level. Output defaults to the daemon's
+/// tailed `<data_dir>/bench/results.csv` unless `--out` is specified explicitly.
+pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
+    use rocm_dash_daemon::bench_load::{LoadSpec, run_and_append_csv, run_auto_ramp};
+
+    let BenchLoadArgs {
+        endpoint,
+        model,
+        concurrency,
+        isl,
+        osl,
+        requests,
+        out,
+        auto_ramp,
+    } = a;
+
+    // Reject https:// — no TLS backend compiled in for the load generator.
+    // Compare on the lowercased scheme so HTTPS:// is also caught.
+    if endpoint.to_lowercase().starts_with("https://") {
+        anyhow::bail!(
+            "rocm bench load supports http:// endpoints only (no TLS backend compiled in)"
+        );
+    }
+
+    // Resolve the model: use the provided value or probe GET {endpoint}/v1/models.
+    let model = if let Some(m) = model {
+        m
+    } else {
+        let models_url = format!("{}/v1/models", endpoint.trim_end_matches('/'));
+        let resp = ureq::get(&models_url)
+            .timeout(std::time::Duration::from_secs(5))
+            .call()
+            .context("fetching /v1/models to detect the default model")?;
+        let body: serde_json::Value = resp.into_json().context("parsing /v1/models response")?;
+        rocm_dash_tui::llm::pick_first_model(&body).with_context(|| {
+            format!("no model found at {endpoint}/v1/models — pass --model explicitly")
+        })?
+    };
+
+    // Resolve the output path: default to the same `<data_dir>/bench/results.csv`
+    // file the daemon tails. Rows are appended, matching the `CsvBenchTailer`
+    // semantics. Create parents for explicit and default paths alike.
+    let csv_path = match out {
+        Some(path) => path,
+        None => default_bench_csv_path(&AppPaths::discover()?),
+    };
+    ensure_bench_csv_parent(&csv_path)?;
+
+    let spec = LoadSpec {
+        endpoint: endpoint.clone(),
+        model: model.clone(),
+        input_len: isl,
+        output_len: osl,
+        requests,
+    };
+
+    println!("mode: raw serving throughput (synthetic prompts) — not agent-workload.");
+    if auto_ramp {
+        println!(
+            "endpoint={endpoint} model={model} mode=auto-ramp isl={isl} osl={osl} requests={requests}"
+        );
+    } else {
+        println!(
+            "endpoint={endpoint} model={model} concurrency={} isl={isl} osl={osl} requests={requests}",
+            concurrency
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+
+    let rt = build_dashboard_runtime()?;
+    let rows = if auto_ramp {
+        rt.block_on(run_auto_ramp(&spec, &csv_path))
+            .context("running bench auto-ramp")?
+    } else {
+        rt.block_on(run_and_append_csv(&spec, &concurrency, &csv_path))
+            .context("running bench load sweep")?
+    };
+
+    for row in &rows {
+        let conc = row
+            .concurrency
+            .map_or_else(|| "-".to_string(), |v| v.to_string());
+        let gen_tps = row
+            .gen_tps
+            .map_or_else(|| "-".to_string(), |v| format!("{v:.1}"));
+        let prompt_tps = row
+            .prompt_tps
+            .map_or_else(|| "-".to_string(), |v| format!("{v:.1}"));
+        let wall = row
+            .wall_s
+            .map_or_else(|| "-".to_string(), |v| format!("{v:.2}"));
+        let n = row
+            .n_requests
+            .map_or_else(|| "-".to_string(), |v| v.to_string());
+        println!(
+            "cell={} concurrency={conc} gen_tps={gen_tps} prompt_tps={prompt_tps} wall={wall}s n={n}",
+            row.cell
+        );
+    }
+    println!(
+        "note: local saturation smoke-test — client-measured throughput, not an official ROCm/AMD benchmark."
+    );
+    println!("wrote {} row(s) to {}", rows.len(), csv_path.display());
+
+    Ok(())
+}
+
 /// Entry point for `rocm bootstrap setup`. Routes to the same focused Setup host
 /// as the launcher's "Set up this system" row — the first-run onboarding wizard
 /// (install ROCm SDK / adopt an existing folder), with no daemon or tab shell.
@@ -544,6 +692,37 @@ mod tests {
             !opts.disable_vllm_metrics,
             "vLLM metrics must stay on by default even when Docker discovery is off"
         );
+    }
+
+    #[test]
+    fn runner_options_derives_default_bench_csv_from_current_paths() {
+        let p = paths();
+        let opts = runner_options(&cfg(), &p, false);
+        assert_eq!(opts.bench_csv, Some(default_bench_csv_path(&p)));
+    }
+
+    #[test]
+    fn runner_options_preserves_explicit_bench_csv_override() {
+        let p = paths();
+        let mut config = cfg();
+        let explicit = PathBuf::from("/var/rocm/custom-bench.csv");
+        config.dashboard.daemon.bench_results_dir = Some(explicit.clone());
+
+        let opts = runner_options(&config, &p, false);
+        assert_eq!(opts.bench_csv, Some(explicit));
+    }
+
+    #[test]
+    fn ensure_bench_csv_parent_creates_explicit_output_directory() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("bench-parent-test-{}", std::process::id()));
+        let csv = root.join("nested").join("results.csv");
+
+        ensure_bench_csv_parent(&csv).unwrap();
+        assert!(csv.parent().unwrap().is_dir());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

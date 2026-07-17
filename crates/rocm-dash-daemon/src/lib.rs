@@ -20,5 +20,6 @@ pub mod transport;
 /// Daemon crate version, surfaced in the `Welcome` handshake.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub use rocm_dash_collectors::bench_load;
 pub use runner::RunnerOptions;
 pub use server::run;

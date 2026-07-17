@@ -401,6 +401,12 @@ rocm logs --search error timeout")]
         #[arg(long)]
         chat_mock: bool,
     },
+    /// Saturate a local OpenAI-compatible endpoint and report rough client-side
+    /// throughput (local smoke-test, NOT an official ROCm/AMD benchmark).
+    Bench {
+        #[command(subcommand)]
+        command: BenchCommand,
+    },
     /// Remove ROCm CLI-managed files from this computer.
     Uninstall {
         /// Do not ask for interactive confirmation.
@@ -424,6 +430,47 @@ rocm logs --search error timeout")]
         /// Allow removing development binaries inside the current build tree.
         #[arg(long)]
         force_dev_binaries: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum BenchCommand {
+    /// Run a concurrency sweep (RAW serving throughput, synthetic single-shot
+    /// requests — not agent-shaped, not comparable to *-agent-bench harnesses).
+    ///
+    /// Measures RAW serving throughput (synthetic single-shot requests, vLLM
+    /// benchmark_serving shape). It does NOT reproduce agent-shaped, multi-turn,
+    /// long-context tool traffic and is not comparable to the *-agent-bench quality
+    /// harnesses.
+    Load {
+        /// Base URL of the OpenAI-compatible endpoint, e.g. http://127.0.0.1:8000
+        #[arg(long, value_name = "URL")]
+        endpoint: String,
+        /// Model name (defaults to the first model returned by GET {endpoint}/v1/models)
+        #[arg(long)]
+        model: Option<String>,
+        /// Concurrency levels to sweep, comma-separated
+        #[arg(long, value_delimiter = ',', default_value = "1,8,32,64", value_parser = clap::value_parser!(u32).range(1..=128))]
+        concurrency: Vec<u32>,
+        /// Input sequence length in tokens
+        #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u32).range(1..=32768))]
+        isl: u32,
+        /// Output sequence length in tokens
+        #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u32).range(1..=32768))]
+        osl: u32,
+        /// Requests per concurrency cell
+        #[arg(long, default_value_t = 128, value_parser = clap::value_parser!(u32).range(1..=10000))]
+        requests: u32,
+        /// Output CSV file (default: ~/.rocm/bench/results.csv, the
+        /// daemon-tailed path that populates the dashboard's Bench panel)
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+        /// Ramp concurrency automatically (1,2,4,8,16,32,64,128), stopping at saturation.
+        ///
+        /// Ignores --concurrency when set. Stops early when gen_tps plateaus
+        /// or the request queue backs up.
+        #[arg(long)]
+        auto_ramp: bool,
     },
 }
 
@@ -1576,6 +1623,27 @@ fn dispatch(cli: Cli) -> Result<()> {
             demo,
             chat_mock,
         }) => dash::run(replay, demo, chat_mock),
+        Some(Command::Bench { command }) => match command {
+            BenchCommand::Load {
+                endpoint,
+                model,
+                concurrency,
+                isl,
+                osl,
+                requests,
+                out,
+                auto_ramp,
+            } => dash::run_bench(dash::BenchLoadArgs {
+                endpoint,
+                model,
+                concurrency,
+                isl,
+                osl,
+                requests,
+                out,
+                auto_ramp,
+            }),
+        },
         Some(Command::Uninstall {
             yes,
             dry_run,
@@ -15614,6 +15682,7 @@ fn treat_as_natural_language(args: &[String]) -> bool {
         "logs",
         "daemon",
         "dash",
+        "bench",
         "uninstall",
         "help",
         "--help",
@@ -15645,6 +15714,57 @@ mod tests {
     #[test]
     fn cli_command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn bench_load_rejects_zero_and_unbounded_numeric_arguments() {
+        for args in [
+            [
+                "rocm",
+                "bench",
+                "load",
+                "--endpoint",
+                "http://localhost:8000",
+                "--concurrency",
+                "0",
+            ]
+            .as_slice(),
+            [
+                "rocm",
+                "bench",
+                "load",
+                "--endpoint",
+                "http://localhost:8000",
+                "--isl",
+                "32769",
+            ]
+            .as_slice(),
+            [
+                "rocm",
+                "bench",
+                "load",
+                "--endpoint",
+                "http://localhost:8000",
+                "--osl",
+                "32769",
+            ]
+            .as_slice(),
+            [
+                "rocm",
+                "bench",
+                "load",
+                "--endpoint",
+                "http://localhost:8000",
+                "--requests",
+                "10001",
+            ]
+            .as_slice(),
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "accepted invalid args: {args:?}"
+            );
+        }
     }
 
     fn possible_values_listed_in_help(help: &str) -> Vec<String> {
@@ -19654,6 +19774,7 @@ install therock";
             "logs",
             "daemon",
             "dash",
+            "bench",
             "uninstall",
             "completions",
             "help",
@@ -19674,6 +19795,29 @@ install therock";
             .expect("comfyui logs should parse");
         Cli::try_parse_from(["rocm", "comfyui", "stop"]).expect("comfyui stop should parse");
         Cli::try_parse_from(["rocm", "comfy", "logs"]).expect("comfy alias should parse");
+    }
+
+    #[test]
+    fn t5_bench_load_clap_parse_smoke() {
+        // T5: verify BenchCommand::Load parses correctly including comma-separated concurrency.
+        let cli = Cli::try_parse_from([
+            "rocm",
+            "bench",
+            "load",
+            "--endpoint",
+            "http://x",
+            "--concurrency",
+            "1,8,32,64",
+        ])
+        .expect("rocm bench load should parse");
+        match cli.command {
+            Some(Command::Bench {
+                command: BenchCommand::Load { concurrency, .. },
+            }) => {
+                assert_eq!(concurrency, vec![1u32, 8, 32, 64]);
+            }
+            other => panic!("expected Bench/Load, got {other:?}"),
+        }
     }
 
     #[test]

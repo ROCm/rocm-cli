@@ -111,6 +111,10 @@ git diff origin/main..HEAD \
   && echo "REVIEW each hit" || echo "diff clean"
 ```
 
+Planning and scratch artifacts are not repository documentation. Keep `plans/`,
+implementation logs, and agent working notes out of commits; durable design
+documentation belongs under `docs/`.
+
 ## 5) Investigate rocm-cli Before Editing
 
 Understand existing patterns first:

@@ -3952,7 +3952,9 @@ pub struct DashboardDaemonConfig {
     pub discovery_tick_secs: f64,
     #[serde(default = "default_instance_tick_secs")]
     pub instance_tick_secs: f64,
-    /// Watch this directory for new normalized benchmark CSVs.
+    /// Watch this file for new normalized benchmark CSV rows. When unset, the
+    /// daemon derives `<data_dir>/bench/results.csv` from the current `AppPaths`
+    /// at startup so machine-specific paths are never persisted in config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bench_results_dir: Option<PathBuf>,
 }
@@ -7948,6 +7950,18 @@ Class Name:                Display
         assert_eq!(d.gpu_tick(), Duration::from_secs_f64(0.5));
         assert_eq!(d.discovery_tick(), Duration::from_secs(10));
         assert_eq!(d.instance_tick(), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn dashboard_bench_results_path_is_derived_not_persisted() {
+        let config = DashboardDaemonConfig::default();
+        assert_eq!(config.bench_results_dir, None);
+
+        let json = serde_json::to_value(config).unwrap();
+        assert!(
+            json.get("bench_results_dir").is_none(),
+            "machine-specific derived path must not be serialized"
+        );
     }
 
     #[test]
