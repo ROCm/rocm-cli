@@ -5,9 +5,9 @@
 **Stage:** 6-implementing — STAGED TASK, NOT done (PR #126 shipped as milestone; roadmap R1–R8 + Task #5 remain; re-branch in place for next chunk)
 **Pipeline:** standard
 **Branch:** fix-speed-up-e2e
-**Last Updated:** 2026-07-17 (idle flush)
+**Last Updated:** 2026-07-17
 
-**Token Usage:** in=991 out=291238 cache_create=5250327 cache_read=93853352 calls=500
+**Token Usage:** in=1006 out=301808 cache_create=5512288 cache_read=94907267 calls=509
 
 ---
 
@@ -151,6 +151,13 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persist-app-dev-ci
 - Recreate with: `create_worktree.sh fix-speed-up-e2e`
 
 ## Work Log
+
+### 2026-07-17 — Session: WIP restructure, overlap reconciliation, staged-task framing, awaiting R2 decision
+
+- **Moved Task #3 to own WIP:** Created [[test-e2e-diagnose]].md (PR #127 open, Stage 8-awaiting-pr-approval); trimmed parent WIP to pointer.
+- **Reconciled roadmap overlaps:** Task #2/#4 superseded by Efficiency roadmap R1–R8. Remapped Task #2→R7+R8, Task #4→R1–R3 (decision gate R2). One home per piece of work.
+- **Fixed done-detection:** Updated Stage line to flag "STAGED TASK, NOT done"; PR #126 shipped as milestone; re-branch in place for next chunk per wip-management skill protocol.
+- **Next actionable:** R2 decision gate (latest vs smallest serve model); then R4–R6 (mock/real split, biggest structural win).
 
 ### 2026-07-17 (idle flush) — [IDLE FLUSH 6]
 
