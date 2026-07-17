@@ -8,9 +8,10 @@
 //! screen, and clean exit — which the piped-`Command` steps structurally cannot.
 
 use cucumber::{given, then, when};
+use e2e_cucumber::mock_server::MockServer;
 
-use crate::E2eWorld;
 use crate::e2e::tui_driver::{DEFAULT_TIMEOUT, TuiSession};
+use crate::{E2eWorld, RegisterServiceOptions};
 
 /// Borrow the scenario's active TUI session, or fail clearly if none was opened.
 const fn session(world: &mut E2eWorld) -> &mut TuiSession {
@@ -28,6 +29,46 @@ async fn chat_offline(world: &mut E2eWorld) {
     // pre-accepted and a fixed reply is returned, so the journey needs no live
     // model or network. The launch step reads this flag.
     world.chat_use_mock = true;
+}
+
+async fn setup_managed_model(
+    world: &mut E2eWorld,
+    options: RegisterServiceOptions,
+    with_metrics: bool,
+) {
+    let model = "TestModel/E2E-1B";
+    let mock = if with_metrics {
+        MockServer::start_with_metrics(model).await
+    } else {
+        MockServer::start(model).await
+    };
+    world.endpoint = Some(mock.base_url());
+    world.model_name = Some(model.to_string());
+    world.mock = Some(mock);
+    world.register_mock_service_with(options);
+}
+
+#[given("a managed model is still loading")]
+async fn managed_model_loading(world: &mut E2eWorld) {
+    setup_managed_model(
+        world,
+        RegisterServiceOptions {
+            status: "starting",
+            startup_phase: Some("loading"),
+        },
+        false,
+    )
+    .await;
+}
+
+#[given("a managed model exposes serving metrics")]
+async fn managed_model_with_metrics(world: &mut E2eWorld) {
+    setup_managed_model(world, RegisterServiceOptions::default(), true).await;
+}
+
+#[given("a running managed model is available locally")]
+async fn running_managed_model(world: &mut E2eWorld) {
+    setup_managed_model(world, RegisterServiceOptions::default(), false).await;
 }
 
 // ── When ───────────────────────────────────────────────────────────
@@ -53,11 +94,81 @@ async fn open_chat(world: &mut E2eWorld) {
     world.tui = Some(session);
 }
 
+#[when("the user opens the dashboard")]
+async fn open_dashboard(world: &mut E2eWorld) {
+    let tui = TuiSession::spawn(world, &["dash"])
+        .unwrap_or_else(|e| panic!("failed to open the dashboard: {e}"));
+    world.tui = Some(tui);
+}
+
 #[when("the user opens the ROCm view")]
 async fn open_rocm_view(world: &mut E2eWorld) {
     session(world)
         .send("2")
         .unwrap_or_else(|e| panic!("failed to switch to the ROCm tab: {e}"));
+}
+
+#[when("the user opens the Observe view")]
+async fn open_observe_view(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.use_detail_size()
+        .unwrap_or_else(|e| panic!("failed to enlarge the dashboard: {e}"));
+    tui.send("4")
+        .unwrap_or_else(|e| panic!("failed to switch to the Observe tab: {e}"));
+}
+
+#[when("the user opens dashboard help")]
+async fn open_dashboard_help(world: &mut E2eWorld) {
+    session(world)
+        .send("?")
+        .unwrap_or_else(|e| panic!("failed to open dashboard help: {e}"));
+}
+
+#[when("the user closes dashboard help")]
+async fn close_dashboard_help(world: &mut E2eWorld) {
+    session(world)
+        .send("?")
+        .unwrap_or_else(|e| panic!("failed to close dashboard help: {e}"));
+}
+
+#[when("the user opens the command palette")]
+async fn open_command_palette(world: &mut E2eWorld) {
+    session(world)
+        .send(":")
+        .unwrap_or_else(|e| panic!("failed to open the command palette: {e}"));
+}
+
+#[when("the user chooses Serving")]
+async fn choose_serving(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.send("jj")
+        .unwrap_or_else(|e| panic!("failed to select Serving: {e}"));
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to open Serving: {e}"));
+}
+
+#[when("the user accepts the local endpoint")]
+async fn accept_local_endpoint(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_for_screen("Your request only leaves this machine", DEFAULT_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("local endpoint consent did not appear: {e}"));
+    tui.send("y")
+        .unwrap_or_else(|e| panic!("failed to accept local endpoint: {e}"));
+}
+
+#[when("the user sends a message to the managed model")]
+async fn send_managed_model_message(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_for_screen("No messages yet.", DEFAULT_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("chat surface never became ready: {e}"));
+    tui.send("i")
+        .unwrap_or_else(|e| panic!("failed to focus the chat input: {e}"));
+    tui.send("hello from the terminal")
+        .unwrap_or_else(|e| panic!("failed to type the chat message: {e}"));
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to submit the chat message: {e}"));
 }
 
 #[when("the user sends a message about GPU health")]
@@ -77,12 +188,21 @@ async fn send_gpu_message(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to submit the chat message: {e}"));
 }
 
-#[when("the user quits the dashboard")]
-async fn quit_dashboard(world: &mut E2eWorld) {
+async fn quit_tui(world: &mut E2eWorld, surface: &str) {
     session(world)
         .quit_and_wait(DEFAULT_TIMEOUT)
         .await
-        .unwrap_or_else(|e| panic!("the dashboard did not exit cleanly: {e}"));
+        .unwrap_or_else(|e| panic!("{surface} did not exit cleanly: {e}"));
+}
+
+#[when("the user quits the dashboard")]
+async fn quit_dashboard(world: &mut E2eWorld) {
+    quit_tui(world, "the dashboard").await;
+}
+
+#[when("the user quits interactive chat")]
+async fn quit_interactive_chat(world: &mut E2eWorld) {
+    quit_tui(world, "interactive chat").await;
 }
 
 // ── Then ───────────────────────────────────────────────────────────
@@ -118,8 +238,108 @@ async fn gpu_response_displayed(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("the assistant's response did not appear: {e}"));
 }
 
-#[then("the dashboard exits successfully")]
-async fn dashboard_exited(world: &mut E2eWorld) {
+#[then("the managed model's response is displayed")]
+async fn managed_model_response_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("mock response for testing", DEFAULT_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("the managed model's response did not appear: {e}"));
+}
+
+#[then("the managed model is shown as loading rather than ready")]
+async fn managed_model_shown_loading(world: &mut E2eWorld) {
+    let model = world.model_name.clone().expect("no model name set");
+    let tui = session(world);
+    tui.wait_for_screen(&model, DEFAULT_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("the managed model did not appear: {e}"));
+    // The compact Observe table intentionally omits lifecycle status; opening
+    // the selected instance exposes the status a user uses to diagnose startup.
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to open instance details: {e}"));
+    tui.wait_for_screen("LOADING", DEFAULT_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("the loading state did not appear: {e}"));
+    let screen = tui.screen_text();
+    assert!(screen.contains(&model), "managed model missing:\n{screen}");
+    assert!(
+        !screen
+            .lines()
+            .any(|line| line.contains(&model) && line.contains("READY")),
+        "loading model was presented as ready:\n{screen}"
+    );
+}
+
+#[then("live serving metrics are displayed for the managed model")]
+async fn managed_model_metrics_displayed(world: &mut E2eWorld) {
+    let model = world.model_name.clone().expect("no model name set");
+    let tui = session(world);
+    tui.wait_for_screen(&model, DEFAULT_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("the managed model did not appear: {e}"));
+    tui.wait_for_screen("50ms", DEFAULT_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("TTFT metrics did not appear: {e}"));
+    let screen = tui.screen_text();
+    assert!(screen.contains("20ms"), "TPOT metrics missing:\n{screen}");
+    let row = screen
+        .lines()
+        .find(|line| line.contains(&model))
+        .unwrap_or_default();
+    assert!(
+        row.contains("50ms") && row.contains("20ms") && row.contains("1/0") && row.contains("25%"),
+        "managed serving metrics were incomplete:\n{screen}"
+    );
+}
+
+#[then("navigation and next-step guidance are displayed")]
+async fn navigation_guidance_displayed(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_for_screen("toggle this help", DEFAULT_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("dashboard help did not appear: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains("next / previous tab") && screen.contains("Home tab"),
+        "navigation or contextual guidance missing:\n{screen}"
+    );
+}
+
+#[then("dashboard destinations are displayed")]
+async fn dashboard_destinations_displayed(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_for_screen("Go to", DEFAULT_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("command palette did not appear: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains("Home") && screen.contains("Serving") && screen.contains("Observe"),
+        "command-palette destinations missing:\n{screen}"
+    );
+}
+
+#[then("Serving actions are displayed")]
+async fn serving_actions_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("Serving actions", DEFAULT_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("Serving actions did not appear: {e}"));
+}
+
+#[then("the managed model is displayed")]
+async fn managed_model_displayed(world: &mut E2eWorld) {
+    let model = world
+        .model_name
+        .as_deref()
+        .expect("no model name set")
+        .to_string();
+    session(world)
+        .wait_for_screen(&model, DEFAULT_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("managed model did not appear: {e}"));
+}
+
+fn assert_tui_opened(world: &E2eWorld) {
     // `quit_and_wait` (in the "quits" step) already reaped the process and
     // asserted a zero exit; reaching here means the whole launch→interact→quit
     // round trip through the real terminal succeeded.
@@ -127,6 +347,16 @@ async fn dashboard_exited(world: &mut E2eWorld) {
         world.tui.is_some(),
         "no TUI session was opened for this scenario"
     );
+}
+
+#[then("the dashboard exits successfully")]
+async fn dashboard_exited(world: &mut E2eWorld) {
+    assert_tui_opened(world);
+}
+
+#[then("interactive chat exits successfully")]
+async fn interactive_chat_exited(world: &mut E2eWorld) {
+    assert_tui_opened(world);
 }
 
 // ── Then: chat privacy consent gate (real endpoint, EAI-7222) ──────

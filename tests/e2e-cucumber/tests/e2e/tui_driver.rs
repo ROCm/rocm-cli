@@ -36,6 +36,10 @@ use crate::E2eWorld;
 /// terminal.
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
+/// Taller geometry for journeys that assert rows below the dashboard's summary
+/// cards (managed instances and live serving metrics).
+const DETAIL_ROWS: u16 = 40;
+const DETAIL_COLS: u16 = 120;
 
 /// How often `wait_for_*` re-checks the screen/process while waiting. This is a
 /// poll cadence, not a fixed readiness sleep: every wait has a deadline and
@@ -57,7 +61,7 @@ pub struct TuiSession {
     reader: Option<JoinHandle<()>>,
     /// Kept alive for the lifetime of the session: the reader/writer are cloned
     /// from it, and dropping it early would close the PTY.
-    _master: Box<dyn MasterPty + Send>,
+    master: Box<dyn MasterPty + Send>,
     /// `true` once the child has been reaped, so `Drop` doesn't kill/wait twice.
     finished: bool,
     /// Guards a single coverage record per session.
@@ -140,7 +144,7 @@ impl TuiSession {
             parser,
             reader_stop,
             reader: Some(reader),
-            _master: pair.master,
+            master: pair.master,
             finished: false,
             recorded: false,
             is_chat: args.first() == Some(&"chat"),
@@ -157,6 +161,27 @@ impl TuiSession {
             .lock()
             .map(|p| p.screen().contents())
             .unwrap_or_default()
+    }
+
+    /// Resize both the real PTY and the emulated screen. The application receives
+    /// the normal terminal resize event; assertions continue to inspect exactly
+    /// what a user would see at the new geometry.
+    pub fn use_detail_size(&mut self) -> Result<(), String> {
+        let size = PtySize {
+            rows: DETAIL_ROWS,
+            cols: DETAIL_COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        self.master
+            .resize(size)
+            .map_err(|e| format!("failed to resize pty: {e}"))?;
+        self.parser
+            .lock()
+            .map_err(|_| "failed to lock vt100 parser".to_string())?
+            .screen_mut()
+            .set_size(DETAIL_ROWS, DETAIL_COLS);
+        Ok(())
     }
 
     /// Write raw bytes to the terminal (keystrokes/text). `Enter` is `"\r"`.

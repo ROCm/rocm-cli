@@ -26,6 +26,25 @@ mod e2e {
 
 // ── World ──────────────────────────────────────────────────────────
 
+/// Managed-service registry fields that vary between black-box scenarios.
+///
+/// The default matches a service that passed its readiness probe. Tests can
+/// override the lifecycle fields without duplicating the on-disk record shape.
+#[derive(Debug, Clone, Copy)]
+pub struct RegisterServiceOptions {
+    pub status: &'static str,
+    pub startup_phase: Option<&'static str>,
+}
+
+impl Default for RegisterServiceOptions {
+    fn default() -> Self {
+        Self {
+            status: "ready",
+            startup_phase: None,
+        }
+    }
+}
+
 #[derive(Debug, cucumber::World)]
 pub struct E2eWorld {
     pub mock: Option<MockServer>,
@@ -186,6 +205,17 @@ impl E2eWorld {
             env.push(("ROCM_CLI_CONFIG_DIR", root.join("config").into_os_string()));
             env.push(("ROCM_CLI_DATA_DIR", root.join("data").into_os_string()));
             env.push(("ROCM_CLI_CACHE_DIR", root.join("cache").into_os_string()));
+            // The dashboard socket default is derived from HOME/XDG rather than
+            // AppPaths, so isolate it too; otherwise a host daemon can answer
+            // the scenario and hide the planted service registry. Create both
+            // directories because some PTY implementations use HOME as the
+            // child's working directory.
+            let home = root.join("home");
+            let runtime = root.join("runtime");
+            std::fs::create_dir_all(&home).expect("failed to create isolated HOME");
+            std::fs::create_dir_all(&runtime).expect("failed to create isolated runtime dir");
+            env.push(("HOME", home.into_os_string()));
+            env.push(("XDG_RUNTIME_DIR", runtime.into_os_string()));
         }
         // Share only STATE-FREE, content-addressed caches across scenarios when
         // CI provides a persistent shared dir (see shared_cache_dir): HF model
@@ -300,11 +330,51 @@ impl E2eWorld {
     /// record is plain JSON matching the CLI's on-disk schema, not a typed import
     /// from the rocm-cli crates.
     pub fn register_mock_service(&self) {
+        self.register_mock_service_with(RegisterServiceOptions::default());
+    }
+
+    pub fn register_mock_service_with(&self, options: RegisterServiceOptions) {
         let root = self.isolated_root.as_ref().expect("no isolated root");
         let mock = self.mock.as_ref().expect("no mock server running");
         let model = self.model_name.as_deref().expect("no model name set");
+        let port = mock.port();
         let services = root.path().join("data").join("services");
-        e2e_cucumber::mock_server::write_service_record(&services, model, mock.port());
+        std::fs::create_dir_all(&services).expect("failed to create services dir");
+
+        // The CLI only extracts host:port from `endpoint_url` and appends
+        // `/v1/models` for its readiness probe, which the mock serves.
+        let record = serde_json::json!({
+            "service_id": "e2e-mock",
+            "engine": "vllm",
+            "model_ref": model,
+            "canonical_model_id": model,
+            "host": "127.0.0.1",
+            "port": port,
+            "endpoint_url": format!("http://127.0.0.1:{port}/v1"),
+            "mode": "managed",
+            "status": options.status,
+            "startup_phase": options.startup_phase,
+            // Keep the planted record live when the CLI overlays process
+            // liveness during startup; this test process owns the mock server.
+            "supervisor_pid": std::process::id(),
+            "engine_pid": std::process::id(),
+            "runtime_id": null,
+            "env_id": null,
+            "device_policy": null,
+            "gpu_indices": [],
+            "engine_recipe_json": null,
+            "restart_count": 0,
+            "last_restart_unix_ms": null,
+            "manifest_path": services.join("e2e-mock.json"),
+            "log_path": services.join("e2e-mock.log"),
+            "engine_state_path": services.join("e2e-mock.state.json"),
+            "created_at_unix_ms": 1_700_000_000_000_u64,
+        });
+        std::fs::write(
+            services.join("e2e-mock.json"),
+            serde_json::to_vec_pretty(&record).expect("failed to serialize record"),
+        )
+        .expect("failed to write service record");
     }
 }
 

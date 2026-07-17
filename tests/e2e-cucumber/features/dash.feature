@@ -22,3 +22,49 @@ Feature: Interactive dashboard
     Then the assistant's GPU status response is displayed
     When the user quits the dashboard
     Then the dashboard exits successfully
+
+  @id:dash-loading-service-status @requires-os:linux
+  Scenario: 3 - The dashboard reports a model that is still loading as loading
+    Given a managed model is still loading
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is shown as loading rather than ready
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-managed-service-metrics @requires-os:linux
+  Scenario: 4 - Observe displays metrics from a managed model
+    Given a managed model exposes serving metrics
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then live serving metrics are displayed for the managed model
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-help-guidance @requires-os:linux
+  Scenario: 5 - A user can discover dashboard help and next-step guidance
+    When the user opens the dashboard with demo data
+    And the user opens dashboard help
+    Then navigation and next-step guidance are displayed
+    When the user closes dashboard help
+    And the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-command-palette-navigation @requires-os:linux
+  Scenario: 6 - A user navigates to Serving through the command palette
+    When the user opens the dashboard with demo data
+    And the user opens the command palette
+    Then dashboard destinations are displayed
+    When the user chooses Serving
+    Then Serving actions are displayed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-managed-service-visible @requires-os:linux
+  Scenario: 7 - A managed model is visible in the dashboard
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
