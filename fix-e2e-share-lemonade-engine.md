@@ -3,7 +3,7 @@
 **Stage:** 5-fix-implemented-verifying (full unscoped run #708 pending)
 **Pipeline:** standard
 **Branch:** fix-e2e-share-lemonade-engine (PUSHED to origin; HEAD fe7c7fe). 6 commits, 4 files. Branch is ~7 behind origin/main → REBASE before PR (consider squashing the diagnostic add/remove churn).
-**Last Updated:** 2026-07-17 (idle flush)
+**Last Updated:** 2026-07-17
 
 ---
 
@@ -179,6 +179,8 @@ runtime; local `cargo build` + `cargo clippy --locked -p e2e-cucumber --test e2e
 both clean; ci.yml valid YAML.
 
 ## Work Log
+
+**2026-07-17 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
 **2026-07-17 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state (2026-07-17).
 
