@@ -1,10 +1,10 @@
 # WIP: Make XPASS non-fatal for known-flaky xfails (flaky marker)
 
-**Stage:** 0-idea
+**Stage:** 6-implementing
 **Pipeline:** standard
-**Branch:** fix-xpass-non-fatal-flaky (not created yet)
-**Jira:** EAI-7456 (Backlog) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-17
+**Branch:** fix-xpass-non-fatal-flaky (worktree active)
+**Jira:** EAI-7456 (In Progress, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
+**Last Updated:** 2026-07-17 (idle flush)
 
 **Token Usage:** in=7 out=1602 cache_create=107869 cache_read=379532 calls=5
 
@@ -64,12 +64,16 @@ Scenario: Non-flaky XPASS remains fatal
 
 ## Implementation Steps
 
+### Done ✅
+- ✅ Added `flaky` field to `XfailEntry` + `Expectation::ExpectXfail` in `src/expectation.rs`; parsed from `expectations.toml` (`#[serde(default)]`, defaults false).
+- ✅ Extracted the exit classification into a pure `reconcile()` + `Reconciliation` (with `is_fatal()`) in `src/expectation.rs`; `tests/e2e.rs` now calls it. Flaky XPASS printed as "(flaky, non-fatal)" and excluded from exit-1; non-flaky XPASS + unexpected-FAIL stay fatal.
+- ✅ Marked EAI-7333 vLLM entries (`serve-vllm-inference`, `serve-readiness-contract`) `flaky = true`, with grammar doc in the toml header.
+- ✅ Added 5 unit tests (flaky parse/default, flaky-XPASS non-fatal, non-flaky-XPASS fatal, unexpected-FAIL always fatal, all-expected clean). `cargo test --lib` green (18 passed); clippy clean.
+
 ### Todo 📋
-- 📋 Add `flaky` field to the expectation struct in `src/expectation.rs` and parse it from `expectations.toml`.
-- 📋 Update the exit-decision logic in `tests/e2e-cucumber/tests/e2e.rs` (~779–791) to exclude flaky XPASS from the fatal set; keep it in the printed reconciliation line.
-- 📋 Mark EAI-7333 vLLM entries (`serve-vllm-inference`, `serve-readiness-contract`) `flaky = true`.
-- 📋 Mark the new EAI-7455 lemonade-Windows entries `flaky = true`.
-- 📋 Verify: a run where a flaky xfail XPASSes exits 0; an unexpected-FAIL still exits 1.
+- 📋 Container gate (`container-test.sh all`) — running.
+- 📋 Commit + push, open PR.
+- 📋 EAI-7455 lemonade-Windows entries: N/A here — they live on `fix-e2e-share-lemonade-engine`; that branch marks them flaky after this lands.
 
 ## Next Steps
 
@@ -115,3 +119,5 @@ Scenario: Non-flaky XPASS remains fatal
 - Created WIP capturing the flaky-XPASS-non-fatal design (own branch, not started).
 - Blocking #127 live; recommended delivery is a separate PR landed first, then rebase #127 and the lemonade branch on top.
 - Next: user decides separate-PR-vs-bundle, then create branch/worktree and write scenarios.
+
+**2026-07-17 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
