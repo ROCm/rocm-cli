@@ -218,7 +218,7 @@ Build + clippy green. Not committed/pushed yet.
 ## Related
 
 - [[fix-speed-up-e2e]] — broader E2E-speedup effort (distinct; this is one specific flake).
-- [[persiste-app-dev-ci-runner]] — runner capacity work (2nd GPU runner, Kueue cpu quota
+- [[persist-app-dev-ci-runner]] — runner capacity work (2nd GPU runner, Kueue cpu quota
   18, merge-queue Build concurrency 1). Complementary: that adds GPU capacity; this reduces
   demand on the un-scalable Strix box.
 - [[test-e2e-tui-cucumber]] / [[ci-manual-e2e]] — the cucumber suite + manual-dispatch loop.
