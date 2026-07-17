@@ -296,6 +296,25 @@ fn host_serve_target() -> (&'static str, &'static str, &'static str) {
     }
 }
 
+/// The model the default-engine (no `--engine`) serve step should request.
+///
+/// This is deliberately NOT `host_serve_target` — that step passes no `--engine`,
+/// so the CLI resolves the engine from the model's own `preferred_engines`, and
+/// the model choice therefore determines WHICH engine runs. The default-engine
+/// xfail matrix depends on that resolution: on an Instinct host the request must
+/// resolve to a GGUF recipe on lemonade (EAI-7052 — see expectations.toml), NOT
+/// to vLLM. So this stays lemonade-preferred on every host; the smaller
+/// vLLM-preferred 0.5B size cut applies only to the explicit-vLLM path. The model
+/// hangs at load on Instinct (EAI-7052, xfail) so its size is irrelevant to
+/// wall-clock here — behaviour preservation is what matters.
+fn default_engine_serve_target() -> &'static str {
+    if e2e_cucumber::capability::host_capability().effective_serve_engine == "lemonade" {
+        "Qwen3-0.6B-GGUF"
+    } else {
+        "Qwen/Qwen2.5-1.5B-Instruct"
+    }
+}
+
 #[given("a model is being served on GPU")]
 async fn setup_gpu_model(world: &mut E2eWorld) {
     // Serve by the canonical HuggingFace ID (not the `qwen2.5` alias) with an
@@ -432,7 +451,12 @@ async fn user_serves_default_engine(world: &mut E2eWorld) {
     // resolved (parsed from the serve plan), not the requested one — hardcoding the
     // requested model made this time out on hosts where the recipe resolved to a
     // different model, for reasons unrelated to engine selection.
-    let model = host_serve_target().0;
+    //
+    // Uses `default_engine_serve_target` (a lemonade-preferred model), NOT
+    // `host_serve_target`: the model here drives engine resolution, and the xfail
+    // matrix requires this to resolve to lemonade on Instinct (EAI-7052). See that
+    // fn's doc comment.
+    let model = default_engine_serve_target();
     ensure_serve_port_free().await;
     let (stdout, _, rc) = crate::run_rocm(world, &["serve", model, "--managed"]);
     // The model the CLI resolved (what actually gets served) can differ from the
