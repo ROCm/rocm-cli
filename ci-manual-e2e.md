@@ -1,11 +1,11 @@
 
 # WIP: Make ci.yml manually dispatchable (workflow_dispatch)
 
-**Stage:** 8-awaiting-pr-approval
+**Stage:** done (PR #98 merged 2026-07-10)
 **Pipeline:** lightweight
 **Branch:** ci-manual-e2e
 **PR:** #98
-**Last Updated:** 2026-07-10
+**Last Updated:** 2026-07-17
 
 ---
 

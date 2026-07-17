@@ -1,9 +1,9 @@
 # WIP: Improve README Getting-Started Flow
 
-**Stage:** 6-implementing
+**Stage:** done (PR #66 merged 2026-07-06)
 **Pipeline:** lightweight
 **Branch:** docs/improve-readme-getting-started
-**Last Updated:** 2026-06-30
+**Last Updated:** 2026-07-17
 
 **Token Usage:** in=0 out=0 cache_create=0 cache_read=0 calls=0
 

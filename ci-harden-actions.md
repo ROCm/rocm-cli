@@ -1,11 +1,11 @@
 
 # WIP: CI security hardening (SHA-pin actions + Dependabot)
 
-**Stage:** 8-awaiting-pr-approval
+**Stage:** done (PR #99 merged 2026-07-15)
 **Pipeline:** lightweight
 **Branch:** ci-harden-actions
 **PR:** #99
-**Last Updated:** 2026-07-10
+**Last Updated:** 2026-07-17
 
 ---
 
