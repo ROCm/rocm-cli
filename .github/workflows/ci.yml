@@ -116,6 +116,7 @@ jobs:
               - '**/*.sh'
               - '**/*.ps1'
               - '**/*.feature'
+              - 'tests/e2e-cucumber/expectations.toml'
               - 'install*'
               # Pinned-key consistency compares docs/keys/* against the installers,
               # so a canonical-key-only change must trigger the heavy job that runs
