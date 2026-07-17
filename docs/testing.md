@@ -434,9 +434,10 @@ A loopback bind (`rocm serve <model>`, default `127.0.0.1`) stays
 credential-free. A public bind (`--host 0.0.0.0 --allow-public-bind`) requires an
 API key: pass one with `--api-key` / the `ROCM_SERVE_API_KEY` environment
 variable, or let one be generated. The key is handed to the engine via a 0600
-key file (never argv), stored in the OS keychain by service id, and printed once
-as client configuration — it must never appear in `rocm services`, `rocm logs`,
-or the audit log. Verifying that the running server actually rejects
+key file (never argv), persisted as a 0600 per-service file (not the OS keychain,
+which is unavailable on headless serving hosts), and printed once as client
+configuration — it must never appear in `rocm services`, `rocm logs`, or the
+audit log. Verifying that the running server actually rejects
 unauthenticated requests requires a live engine and is covered by the GPU
 acceptance scripts (`scripts/vllm_therock_gpu_test.py`), not the unit tests.
 

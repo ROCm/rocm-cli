@@ -133,12 +133,30 @@ pub fn download_file_to_path(url: &str, destination: &Path, timeout: Duration) -
 }
 
 pub fn http_get_text(endpoint_url: &str, path: &str, timeout: Duration) -> Result<String> {
+    http_get_text_with_auth(endpoint_url, path, None, timeout)
+}
+
+/// As [`http_get_text`], but authenticated.
+///
+/// Sends `Authorization: Bearer <key>` when `endpoint_api_key` is `Some`. Used to
+/// probe endpoints that `rocm serve` has protected with an API key; `None`
+/// preserves the unauthenticated behavior for loopback endpoints.
+pub fn http_get_text_with_auth(
+    endpoint_url: &str,
+    path: &str,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<String> {
     let (host, port) = parse_http_endpoint(endpoint_url)
         .with_context(|| format!("unsupported endpoint URL `{endpoint_url}`"))?;
     let mut stream = connect_tcp_stream(&host, port, timeout)?;
     let host_header = format_host_port(&host, port);
+    let auth_header = match endpoint_api_key {
+        Some(key) => format!("Authorization: Bearer {key}\r\n"),
+        None => String::new(),
+    };
     let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nAccept: application/json\r\n{auth_header}Connection: close\r\n\r\n"
     );
     write_all_tcp_stream(&mut stream, request.as_bytes())
         .with_context(|| format!("failed to write HTTP GET {path}"))?;
@@ -157,9 +175,10 @@ pub fn http_get_text(endpoint_url: &str, path: &str, timeout: Duration) -> Resul
 pub fn openai_models_endpoint_has_model(
     endpoint_url: &str,
     expected_model: Option<&str>,
+    endpoint_api_key: Option<&str>,
     timeout: Duration,
 ) -> Result<bool> {
-    let body = http_get_text(endpoint_url, "/v1/models", timeout)?;
+    let body = http_get_text_with_auth(endpoint_url, "/v1/models", endpoint_api_key, timeout)?;
     let value = serde_json::from_str::<serde_json::Value>(body.trim())
         .context("failed to parse /v1/models JSON")?;
     let loaded_models = openai_loaded_model_ids(&value);
@@ -176,6 +195,7 @@ pub fn openai_models_endpoint_has_model(
 
 pub fn managed_service_endpoint_model_ready(
     record: &ManagedServiceRecord,
+    endpoint_api_key: Option<&str>,
     timeout: Duration,
 ) -> Result<bool> {
     if record.endpoint_url.trim().is_empty() {
@@ -188,7 +208,7 @@ pub fn managed_service_endpoint_model_ready(
     } else {
         None
     };
-    openai_models_endpoint_has_model(&record.endpoint_url, expected, timeout)
+    openai_models_endpoint_has_model(&record.endpoint_url, expected, endpoint_api_key, timeout)
 }
 
 fn openai_loaded_model_ids(value: &serde_json::Value) -> Vec<String> {
@@ -6064,11 +6084,72 @@ mod tests {
         assert!(openai_models_endpoint_has_model(
             &endpoint,
             Some("qwen"),
+            None,
             Duration::from_secs(2)
         )?);
 
         let request = server.join().expect("server thread should not panic")?;
         assert!(request.starts_with("GET /v1/models HTTP/1.1"));
+        Ok(())
+    }
+
+    #[test]
+    fn openai_models_endpoint_sends_bearer_when_key_present() -> Result<()> {
+        // A protected endpoint: 200 with the model list only when the request
+        // carries `Authorization: Bearer test-key`, otherwise 401. Serves two
+        // connections — the no-key probe, then the with-key probe.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> Result<()> {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut request_bytes = Vec::new();
+                let mut buffer = [0_u8; 512];
+                loop {
+                    let read = stream.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    request_bytes.extend_from_slice(&buffer[..read]);
+                    if String::from_utf8_lossy(&request_bytes).contains("\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request_bytes).into_owned();
+                if request.contains("Authorization: Bearer test-key") {
+                    let body = r#"{"data":[{"id":"qwen"}]}"#;
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )?;
+                } else {
+                    write!(
+                        stream,
+                        "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )?;
+                }
+            }
+            Ok(())
+        });
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        // Without the key the protected endpoint 401s → treated as not ready.
+        assert!(
+            openai_models_endpoint_has_model(&endpoint, Some("qwen"), None, Duration::from_secs(2))
+                .is_err()
+        );
+        // With the key the bearer header is sent → the model reads as ready.
+        assert!(openai_models_endpoint_has_model(
+            &endpoint,
+            Some("qwen"),
+            Some("test-key"),
+            Duration::from_secs(2)
+        )?);
+
+        server.join().expect("server thread should not panic")?;
         Ok(())
     }
 
@@ -6110,6 +6191,7 @@ mod tests {
         let models_ready = openai_models_endpoint_has_model(
             &endpoint,
             Some("Qwen/Qwen2.5-1.5B-Instruct"),
+            None,
             Duration::from_secs(2),
         )?;
         assert!(

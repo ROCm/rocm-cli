@@ -4738,7 +4738,10 @@ fn print_managed_launch_plain(report: &ManagedLaunchReport, endpoint_api_key: Op
     }
     println!("  endpoint: {}", report.endpoint_url);
     if let Some(key) = endpoint_api_key {
-        print!("{}", render_endpoint_client_config(&report.endpoint_url, key));
+        print!(
+            "{}",
+            render_endpoint_client_config(&report.endpoint_url, key)
+        );
     }
     if let Some(log_path) = report.log_path.as_deref() {
         println!("  log_path: {}", log_path.display());
@@ -12539,7 +12542,7 @@ fn load_managed_service(paths: &AppPaths, service_id: &str) -> Result<ManagedSer
         .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
     record.normalize_paths_for_host();
     let refreshed_from_engine = record.refresh_from_engine_state().unwrap_or(false);
-    let refreshed_liveness = refresh_managed_service_runtime_liveness(&mut record);
+    let refreshed_liveness = refresh_managed_service_runtime_liveness(paths, &mut record);
     if refreshed_from_engine || refreshed_liveness {
         let _ = record.write();
     }
@@ -12760,7 +12763,15 @@ fn restart_internal_managed_service(
     service_id: &str,
 ) -> Result<ManagedServiceRecord> {
     let mut record = load_managed_service(paths, service_id)?;
+    // Preserve the endpoint key across the restart: `stop_internal_managed_service`
+    // deletes the key file (correct on a real stop), but a restart must bring the
+    // service back on the same public host with the same auth. Capture it first and
+    // re-store it after the stop so the spawn below hands the child the same key.
+    let preserved_endpoint_key = endpoint_keys::endpoint_api_key(paths, service_id);
     let _ = stop_internal_managed_service(paths, service_id);
+    if let Some(key) = preserved_endpoint_key.as_deref() {
+        endpoint_keys::store_endpoint_api_key(paths, service_id, key)?;
+    }
     let policy = parse_device_policy(record.device_policy.as_deref())?;
     fs::OpenOptions::new()
         .create(true)
@@ -13630,14 +13641,24 @@ fn managed_service_running_state(status: &str) -> &'static str {
 
 const SERVICE_LIVENESS_CHECK_TIMEOUT: Duration = Duration::from_millis(750);
 
-fn refresh_managed_service_runtime_liveness(record: &mut ManagedServiceRecord) -> bool {
+fn refresh_managed_service_runtime_liveness(
+    paths: &AppPaths,
+    record: &mut ManagedServiceRecord,
+) -> bool {
     if !managed_service_is_live(record) {
         return false;
     }
 
+    // Probe with the service's key so a protected public service is not mistaken
+    // for dead (an anonymous /v1/models would 401).
+    let endpoint_api_key = endpoint_keys::endpoint_api_key(paths, &record.service_id);
     let endpoint_ready = matches!(record.status.as_str(), "ready" | "running")
-        && managed_service_endpoint_model_ready(record, SERVICE_LIVENESS_CHECK_TIMEOUT)
-            .unwrap_or(false);
+        && managed_service_endpoint_model_ready(
+            record,
+            endpoint_api_key.as_deref(),
+            SERVICE_LIVENESS_CHECK_TIMEOUT,
+        )
+        .unwrap_or(false);
     if endpoint_ready {
         // Mirror `providers.rs::ready_local_services()`: a live, probe-passing
         // service should be persisted as "ready", not left stuck at "running".
@@ -13703,7 +13724,7 @@ pub(crate) fn load_managed_services(paths: &AppPaths) -> Result<Vec<ManagedServi
         if let Ok(mut record) = serde_json::from_slice::<ManagedServiceRecord>(&bytes) {
             record.normalize_paths_for_host();
             let refreshed_from_engine = record.refresh_from_engine_state().unwrap_or(false);
-            let refreshed_liveness = refresh_managed_service_runtime_liveness(&mut record);
+            let refreshed_liveness = refresh_managed_service_runtime_liveness(paths, &mut record);
             if refreshed_from_engine || refreshed_liveness {
                 let _ = record.write();
             }

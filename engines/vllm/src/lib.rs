@@ -1531,9 +1531,13 @@ fn endpoint_url_from_state(state: &Value) -> Option<String> {
 }
 
 fn query_loaded_model_endpoint(endpoint_url: &str, model_ref: Option<&str>) -> Result<bool> {
+    // Send the endpoint key when the server is protected so the healthcheck does
+    // not read a 401 as "not ready" and kill a correctly-authenticated server.
+    let endpoint_api_key = rocm_engine_protocol::resolve_endpoint_api_key();
     openai_models_endpoint_has_model(
         endpoint_url,
         model_ref,
+        endpoint_api_key.as_deref(),
         Duration::from_millis(HEALTHCHECK_TIMEOUT_MS),
     )
 }

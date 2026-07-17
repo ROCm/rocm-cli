@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use rocm_core::{
     AppPaths, DEFAULT_LOCAL_PORT, RocmCliConfig, active_managed_therock_environment,
-    download_file_to_path, format_host_port, format_http_base_url, http_get_text,
+    download_file_to_path, format_host_port, format_http_base_url, http_get_text_with_auth,
     normalize_runtime_path_for_host, prepend_runtime_paths, require_nonempty, runtime_is_linux,
     runtime_is_windows,
 };
@@ -2129,11 +2129,17 @@ fn wait_for_openai_models_ready(
     timeout: Duration,
 ) -> Result<()> {
     let endpoint = format_http_base_url(host, port);
+    let endpoint_api_key = rocm_engine_protocol::resolve_endpoint_api_key();
     let start = std::time::Instant::now();
     let mut last_error = None;
     while start.elapsed() < timeout {
-        match http_get_text(&endpoint, "/v1/models", Duration::from_secs(3))
-            .and_then(|body| parse_models_ready(&body, model_ref))
+        match http_get_text_with_auth(
+            &endpoint,
+            "/v1/models",
+            endpoint_api_key.as_deref(),
+            Duration::from_secs(3),
+        )
+        .and_then(|body| parse_models_ready(&body, model_ref))
         {
             Ok(true) => return Ok(()),
             Ok(false) => last_error = Some("model was not reported by /v1/models".to_owned()),
@@ -2218,8 +2224,14 @@ fn lemonade_model_load_args(host: &str, port: u16, model_ref: &str, backend: &st
 
 fn query_health_json(host: &str, port: u16) -> Result<Value> {
     let endpoint = format_http_base_url(host, port);
-    let body = http_get_text(&endpoint, "/v1/health", Duration::from_secs(3))
-        .with_context(|| format!("failed to query Lemonade health at {endpoint}/v1/health"))?;
+    let endpoint_api_key = rocm_engine_protocol::resolve_endpoint_api_key();
+    let body = http_get_text_with_auth(
+        &endpoint,
+        "/v1/health",
+        endpoint_api_key.as_deref(),
+        Duration::from_secs(3),
+    )
+    .with_context(|| format!("failed to query Lemonade health at {endpoint}/v1/health"))?;
     serde_json::from_str(&body).context("failed to parse Lemonade health JSON")
 }
 
@@ -2236,8 +2248,14 @@ fn query_loaded_model_endpoint(endpoint_url: &str, model_ref: &str, backend: &st
         return Ok(true);
     }
     let endpoint = format_http_base_url(&host, port);
-    let body = http_get_text(&endpoint, "/v1/models", Duration::from_secs(3))
-        .with_context(|| format!("failed to query Lemonade models at {endpoint}/v1/models"))?;
+    let endpoint_api_key = rocm_engine_protocol::resolve_endpoint_api_key();
+    let body = http_get_text_with_auth(
+        &endpoint,
+        "/v1/models",
+        endpoint_api_key.as_deref(),
+        Duration::from_secs(3),
+    )
+    .with_context(|| format!("failed to query Lemonade models at {endpoint}/v1/models"))?;
     let models =
         serde_json::from_str::<Value>(&body).context("failed to parse Lemonade /v1/models JSON")?;
     Ok(models_payload_has_ready_model(&models, model_ref, backend))
@@ -2262,9 +2280,13 @@ fn query_chat_smoke_endpoint(host: &str, port: u16, model_ref: &str) -> Result<b
     });
     let body = serde_json::to_string(&body).context("failed to serialize chat smoke request")?;
     let host_header = format_host_port(host, port);
+    let auth_header = match rocm_engine_protocol::resolve_endpoint_api_key() {
+        Some(key) => format!("Authorization: Bearer {key}\r\n"),
+        None => String::new(),
+    };
     write!(
         stream,
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{auth_header}Connection: close\r\n\r\n{}",
         body.len(),
         body
     )

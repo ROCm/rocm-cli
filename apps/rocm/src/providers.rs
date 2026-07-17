@@ -525,9 +525,17 @@ fn ready_local_services(paths: &AppPaths) -> Result<Vec<ManagedServiceRecord>> {
         if record.refresh_from_engine_state().unwrap_or(false) {
             let _ = record.write();
         }
+        // Probe with the service's key so a protected public service is not
+        // filtered out here (an anonymous /v1/models would 401) before
+        // `LocalProvider` can send the bearer token.
+        let endpoint_api_key = crate::endpoint_keys::endpoint_api_key(paths, &record.service_id);
         if matches!(record.status.as_str(), "ready" | "running")
-            && managed_service_endpoint_model_ready(&record, LOCAL_SERVICE_READY_TIMEOUT)
-                .unwrap_or(false)
+            && managed_service_endpoint_model_ready(
+                &record,
+                endpoint_api_key.as_deref(),
+                LOCAL_SERVICE_READY_TIMEOUT,
+            )
+            .unwrap_or(false)
         {
             if record.status != "ready" {
                 record.status = "ready".to_owned();
@@ -547,7 +555,8 @@ fn post_json_to_local_endpoint(
     endpoint_api_key: Option<&str>,
     timeout: Duration,
 ) -> Result<serde_json::Value> {
-    let body = post_json_to_local_endpoint_body(endpoint_url, path, body, endpoint_api_key, timeout)?;
+    let body =
+        post_json_to_local_endpoint_body(endpoint_url, path, body, endpoint_api_key, timeout)?;
     serde_json::from_str(body.trim()).context("failed to parse local provider chat JSON")
 }
 
