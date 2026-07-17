@@ -7,7 +7,7 @@
 **Branch:** fix-speed-up-e2e
 **Last Updated:** 2026-07-17
 
-**Token Usage:** in=864 out=245630 cache_create=4875757 cache_read=86893998 calls=435
+**Token Usage:** in=953 out=277549 cache_create=4971577 cache_read=91650360 calls=481
 
 ---
 
@@ -146,6 +146,12 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persiste-app-dev-c
 - Recreate with: `create_worktree.sh fix-speed-up-e2e`
 
 ## Work Log
+
+### 2026-07-17 — Created dedicated WIP for Task #3 (test-e2e-diagnose, PR #127)
+
+- Created `/Users/fres/Developer/rocm-cli-progress/test-e2e-diagnose.md` (Stage `8-awaiting-pr-approval`).
+- Moved Task #3 context out of [[fix-speed-up-e2e]] into dedicated branch WIP: scenarios, technical mapping, env-dependence saga, process notes.
+- Trimmed parent WIP (fix-speed-up-e2e) down to `[[test-e2e-diagnose]]` pointers; Task #3 full detail now lives in its own file.
 
 ### 2026-07-17 (idle flush) — [IDLE FLUSH 5]
 
