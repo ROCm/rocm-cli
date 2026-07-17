@@ -126,6 +126,7 @@ Scenario: 6 - Asking for a fix the CLI does not know is refused clearly
 ### 2026-07-17 (idle flush) — Auto-flush WIP state
 
 - Session idle for 10 minutes, auto-flushing WIP state to progress file.
+- **2026-07-17 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
 ### 2026-07-17 — Session review & token usage snapshot
 

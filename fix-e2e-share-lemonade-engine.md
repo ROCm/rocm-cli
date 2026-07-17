@@ -1,13 +1,58 @@
 # WIP: Fix flaky Strix-Halo Windows E2E — share the lemonade engine across scenarios
 
-**Stage:** 5-fix-implemented-verifying (full unscoped run #708 pending)
+**Stage:** 7-PR-open (awaiting review)
 **Pipeline:** standard
-**Branch:** fix-e2e-share-lemonade-engine (PUSHED to origin; HEAD fe7c7fe). 6 commits, 4 files. Branch is ~7 behind origin/main → REBASE before PR (consider squashing the diagnostic add/remove churn).
-**Last Updated:** 2026-07-17 (idle flush)
+**Branch:** fix-e2e-share-lemonade-engine → **PR #129** (https://github.com/ROCm/rocm-cli/pull/129). Rebased onto current main, squashed to ONE clean commit (40bbf19), 3 files. State: OPEN, MERGEABLE.
+**Last Updated:** 2026-07-17
 
 ---
 
-## ✅ 2026-07-17 — RESOLVED: root cause = lemonade startup race; fix = pre-warm retry — READ FIRST
+## ✅ 2026-07-17 — PR #129 OPEN — READ FIRST
+
+**Final fix (PR #129, single commit 40bbf19, 3 files):**
+1. **CI Windows pre-warm with RETRY** (ci.yml) — `rocm engines install lemonade` once per
+   runner, up to 4× gated on install exit code, kills stray lemonade between tries.
+   Fixes the per-scenario 4.6 GiB backend re-download (native Windows serves route to
+   lemonade; vLLM skipped there).
+2. **6 lemonade serve/chat scenarios xfail'd on os=windows → EAI-7455** (expectations.toml):
+   serve-lemonade-inference, serve-default-engine-working-endpoint,
+   serve-default-engine-inference, serve-readiness-contract, chat-tool-definitions-accepted,
+   chat-end-to-end-local-model. The residual daemon flake can't be papered over by a
+   harness retry (proven — see below), so xfail is the honest interim handling.
+3. **STDERR-in-assert** on serve steps (the real serve error was hidden on stdout-only
+   asserts — this is what made the flake diagnosable).
+
+**Verification:** full unscoped Strix-Windows run #726 reconciled **11 xfail / 0 XPASS /
+0 unexpected failures**. Container gate (clippy + tests, -D warnings) green on the
+rebased-onto-main tree.
+
+**Tickets filed:**
+- **EAI-7455** — the lemonade daemon flake (product-side; likely lemonade server, rocm-cli
+  readiness-gating as the actionable seam; labelled `lemonade`). Full investigation in the
+  ticket. This PR's xfails reference it.
+- **EAI-7456** — flaky-xfail marker (`flaky=true` making XPASS non-fatal). Recommended to
+  land FIRST as its own small PR: it unblocks the sibling PR #127 (blocked by EAI-7333
+  XPASS drift) AND hardens #129 against its own flaky xfails XPASS-ing on a lucky run.
+
+**Watch on PR #129 CI:** a merge-queue/GPU lane could go red on an XPASS (a flaky xfail
+that happens to pass), NOT a real failure — that's EAI-7456 manifesting, not a defect here.
+
+### What the retry saga proved (why xfail, not retry)
+Four harness-side mitigations tried, in order: pre-warm (fixed download, not the race) →
+serve retry immediate (rescued single-scenario, failed under load) → pre-warm retry (didn't
+fix serves) → kill-stray + escalating backoff (made it WORSE: 4 fails vs 3). A test retry
+can't fix a product-side daemon race. All retry churn was reverted; only the pre-warm +
+xfails remain. Scoped single-scenario runs were misleading (3/3 green) — only the FULL
+unscoped run reproduces the under-load flake. See [[strix-windows-e2e-gotchas]].
+
+## Next steps
+- 📋 PR #129 review + merge (non-blocking Windows lane, so low risk).
+- 📋 EAI-7456 flaky-marker PR (unblocks #127, hardens #129) — [[fix-speed-up-e2e]] task #14.
+- 📋 Broader E2E efficiency levers in [[fix-speed-up-e2e]] (R1–R8).
+
+---
+
+## (historical) 2026-07-17 — RESOLVED: root cause = lemonade startup race — earlier read
 
 Full diagnostic (a temp CI step that looped the serve 6× and captured the lemonade
 DAEMON's own log — since removed) overturned the earlier "flaky hardware" read:
