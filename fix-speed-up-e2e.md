@@ -165,6 +165,12 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persist-app-dev-ci
 
 ## Work Log
 
+### 2026-07-17 — PR #128 review (volen-silo, CHANGES_REQUESTED): scoped the swap
+
+- **Review was CORRECT — verified vs expectations.toml + catalog, not trusted blind.** `host_serve_target().0` also feeds the default-engine step (serving_steps.rs:435, no `--engine`), where the model's own `preferred_engines` drives resolution. 1.5B (lemonade-pref) → 0.5B (vLLM-pref) flipped default-engine resolution on Instinct lemonade→vLLM, invalidating the EAI-7052 xfail for serve-default-engine-working-endpoint/-inference → XPASS → reconciliation exit 1. expectations.toml:55-63 states the dependency.
+- **Fix = option (a) scope the swap** (`4cd2c53`): new `default_engine_serve_target()` stays lemonade-preferred (1.5B Instinct / 0.6B lemonade hosts) for the default-engine step; 0.5B size cut kept ONLY on explicit `--engine vllm` path (scenarios 5, 8). Default-engine resolution now byte-identical to main → xfail matrix untouched, no GPU re-verify needed. Rejected option (b) (embrace default-vLLM + rewrite matrix) as scope creep beyond "smallest model".
+- Gate green (clippy + 23 ws tests), pushed, replied to review (issue-comment 5002733399). LESSON: a shared test helper can feed both explicit-engine AND engine-resolving call sites — a model swap is not always behavior-neutral.
+
 ### 2026-07-17 — Tasks #2+#3 shipped to PR #128 (smallest vLLM serve model)
 
 - **Task #2 audit:** mapped all 7 GPU serve scenarios → only lever is host_serve_target vLLM branch (1.5B).
