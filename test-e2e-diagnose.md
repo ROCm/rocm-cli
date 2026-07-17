@@ -5,7 +5,7 @@
 **Stage:** 8-awaiting-pr-approval (PR #127 open)
 **Pipeline:** standard
 **Branch:** test-e2e-diagnose
-**Last Updated:** 2026-07-17
+**Last Updated:** 2026-07-17 (idle flush)
 
 **Token Usage:** in=57 out=10825 cache_create=651314 cache_read=2486326 calls=31
 
@@ -122,6 +122,10 @@ Scenario: 6 - Asking for a fix the CLI does not know is refused clearly
 - Recreate with: `create_worktree.sh test-e2e-diagnose`
 
 ## Work Log
+
+### 2026-07-17 (idle flush) — Auto-flush WIP state
+
+- Session idle for 10 minutes, auto-flushing WIP state to progress file.
 
 ### 2026-07-17 — PR #127 CI complete; awaiting human review
 
