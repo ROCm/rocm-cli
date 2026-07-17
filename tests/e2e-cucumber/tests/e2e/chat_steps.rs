@@ -41,8 +41,18 @@ async fn user_offered_endpoint(_world: &mut E2eWorld) {}
 #[when("a chat request with tool definitions is sent")]
 async fn send_chat_with_tools(world: &mut E2eWorld) {
     let endpoint = world.endpoint.as_ref().expect("no endpoint configured");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(
+            crate::inference_timeout_for(world),
+        ))
+        .build()
+        .expect("failed to build HTTP client");
+
     let models_url = format!("{endpoint}/models");
-    let resp: serde_json::Value = reqwest::get(&models_url)
+    let resp: serde_json::Value = client
+        .get(&models_url)
+        .send()
         .await
         .unwrap_or_else(|e| panic!("GET {models_url} failed: {e}"))
         .json()
@@ -54,12 +64,6 @@ async fn send_chat_with_tools(world: &mut E2eWorld) {
         .to_string();
 
     let chat_url = format!("{endpoint}/chat/completions");
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(
-            crate::inference_timeout_for(world),
-        ))
-        .build()
-        .expect("failed to build HTTP client");
     let chat_resp: serde_json::Value = client
         .post(&chat_url)
         .json(&serde_json::json!({
