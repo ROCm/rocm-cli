@@ -5,8 +5,12 @@ name: demo-gifs
 # on pull requests: VHS rendering is slow and would churn the branch. Regenerate
 # on demand, and automatically on each release so the docs GIFs track released
 # behavior (the release tag doubles as a cache-buster for GitHub's image proxy).
+# The feature-branch push trigger is temporary: GitHub cannot manually dispatch a
+# workflow until its file exists on the default branch.
 on:
   workflow_dispatch:
+  push:
+    branches: [docs/demo-screencasts]
   release:
     types: [published]
 
