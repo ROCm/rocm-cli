@@ -28,12 +28,11 @@ on:
         options: [all, mock, app-dev-gpu, strix-ubuntu, strix-windows]
         # No tier input: the harness resolves pass/xfail/skip per scenario, so a
         # platform runs one job covering everything applicable to it.
-      # TEMP (probe): scenario-name regex forwarded to the cucumber harness
-      # (`cargo xtask e2e -- --name <regex>`) so a dispatch can run just a few
-      # scenarios. Empty = full suite. REMOVE after the #23 default-engine
-      # classification is validated on Strix.
+      # Scenario-name regex forwarded to the cucumber harness
+      # (`cargo xtask e2e -- --name <regex>`) so a dispatch can run only the
+      # selected scenarios. Empty = full suite.
       name_filter:
-        description: "TEMP scenario-name regex (cucumber --name); empty = full suite"
+        description: "Scenario-name regex (cucumber --name); empty = full suite"
         type: string
         default: ""
       # Opt a manual dispatch into the expensive `@nightly` scenarios (large-model
@@ -637,7 +636,7 @@ jobs:
       && (github.event_name != 'workflow_dispatch'
           || inputs.platform == 'all' || inputs.platform == 'mock')
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       # Whether the real work runs this time. On push/PR/merge_group: only when
       # build-and-test succeeded and the change is heavy. On workflow_dispatch:
@@ -659,7 +658,7 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libcap-dev
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         if: steps.gate.outputs.run == 'true'
 
       # The workspace test job selects only affected crates and runs the cucumber
@@ -718,7 +717,7 @@ jobs:
       # a single nightly scenario (e.g. the 27B serve) without the full nightly run.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       # Reclaim the GPU before running: a serve leaked by a killed/timed-out prior
       # run (its Drop teardown never executed) can keep an engine process spinning
@@ -785,7 +784,7 @@ jobs:
       # Swatinem/rust-cache otherwise tries to SAVE the large target dir to
       # GitHub's cache service in a post-step (slow/hangs) and its cleanup wipes
       # the local target.
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache: false
 
@@ -856,12 +855,11 @@ jobs:
             echo "shared runtime already present at $E2E_SHARED_RUNTIMES_DIR — skipping pre-warm"
           fi
 
-          # TEMP: optional scenario-name filter for a scoped probe dispatch (same
-          # as the strix job) — lets a dispatch run just one scenario (e.g. the
-          # 27B nightly) instead of the whole suite. Empty = full suite.
+          # Optional scenario-name filter for a scoped dispatch — lets a manual
+          # run select only the large-model scenario instead of the whole suite.
           NAME_FILTER="${{ github.event.inputs.name_filter }}"
           if [ -n "$NAME_FILTER" ]; then
-            echo "TEMP name filter active: $NAME_FILTER"
+            echo "name filter active: $NAME_FILTER"
             cargo xtask e2e -- --name "$NAME_FILTER"
           else
             cargo xtask e2e
@@ -910,8 +908,11 @@ jobs:
       TMPDIR: /home/ubuntu/actions-runner/tmp
       PIP_CACHE_DIR: /home/ubuntu/actions-runner/pip-cache
       E2E_SERVE_TIMEOUT_SECS: "300"
+      # Match the MI300X dispatch path: opt into the platform-adaptive large-model
+      # scenario only when the manual include_nightly input is enabled.
+      E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Prepare writable dirs on the nvme + reclaim GPU from stray E2E procs
         run: |
@@ -1011,10 +1012,10 @@ jobs:
             echo "shared runtime already present at $E2E_SHARED_RUNTIMES_DIR — skipping pre-warm"
           fi
 
-          # TEMP: optional scenario-name filter for a scoped probe dispatch.
+          # Optional scenario-name filter for a scoped manual dispatch.
           NAME_FILTER="${{ github.event.inputs.name_filter }}"
           if [ -n "$NAME_FILTER" ]; then
-            echo "TEMP name filter active: $NAME_FILTER"
+            echo "name filter active: $NAME_FILTER"
             cargo xtask e2e -- --name "$NAME_FILTER"
           else
             cargo xtask e2e
@@ -1050,7 +1051,7 @@ jobs:
       )
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       # setup-rust-toolchain runs an internal bash script, which this Windows
       # runner lacks (bash: command not found). Bootstrap rustup with the
@@ -1160,10 +1161,10 @@ jobs:
             Write-Host "shared runtime already present at $env:E2E_SHARED_RUNTIMES_DIR - skipping pre-warm"
           }
 
-          # TEMP: optional scenario-name filter for a scoped probe dispatch.
+          # Optional scenario-name filter for a scoped manual dispatch.
           $nameFilter = "${{ github.event.inputs.name_filter }}"
           if ($nameFilter) {
-            Write-Host "TEMP name filter active: $nameFilter"
+            Write-Host "name filter active: $nameFilter"
             cargo xtask e2e -- --name "$nameFilter"
           } else {
             cargo xtask e2e
@@ -1204,9 +1205,9 @@ jobs:
       && (needs.changes.outputs.heavy == 'true'
         || github.event_name == 'workflow_dispatch')
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       # Pull every e2e artifact. Each extracts to e2e-artifacts/<artifact-name>/,
       # which `xtask e2e-report` turns into one labeled platform. The `*-report`

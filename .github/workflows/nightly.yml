@@ -35,7 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       - name: Verify pinned keys match the signing key
         run: cargo xtask verify-pinned-keys
@@ -348,7 +348,7 @@ jobs:
       # model (its cold ~54 GiB load exceeds this default).
       E2E_SERVE_TIMEOUT_SECS: "300"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       # Reclaim the GPU before running: kill only e2e leftovers scoped to
       # /tmp/rocm-e2e-* and the e2e-target/e2e-shared trees — never the runner or
@@ -365,7 +365,7 @@ jobs:
 
       # cache: false — this self-hosted runner persists the build cache itself via
       # CARGO_TARGET_DIR (below), so the action's rust-cache is pure overhead.
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache: false
 
@@ -409,4 +409,104 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: e2e-gpu-nightly-report
+          path: tests/e2e-cucumber/results/
+
+  # Strix Halo counterpart to e2e-gpu-nightly. The same @nightly large-model
+  # scenario selects the featured Lemonade GGUF on this host. Keep the runner's
+  # storage and runtime setup aligned with ci.yml's proven Strix Ubuntu job.
+  e2e-gpu-nightly-strix:
+    name: E2E tests (Strix Halo, incl. nightly-only)
+    timeout-minutes: 90
+    runs-on: [self-hosted, linux, strix-halo]
+    continue-on-error: true
+    env:
+      HOME: /home/ubuntu/actions-runner/e2e-home
+      CARGO_HOME: /home/ubuntu/actions-runner/.cargo
+      RUSTUP_HOME: /home/ubuntu/actions-runner/.rustup
+      TMPDIR: /home/ubuntu/actions-runner/tmp
+      PIP_CACHE_DIR: /home/ubuntu/actions-runner/pip-cache
+      E2E_INCLUDE_NIGHTLY: "1"
+      E2E_SERVE_TIMEOUT_SECS: "300"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Prepare writable dirs on the nvme + reclaim GPU from stray E2E procs
+        run: |
+          mkdir -p "$HOME" "$TMPDIR" "$PIP_CACHE_DIR"
+          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
+          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
+          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
+          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
+          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
+          echo "prepared + reclaimed"
+
+      - name: GPU preflight (bounded wait for an available GPU)
+        run: |
+          MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-8}"
+          CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
+          min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
+          deadline=$(( SECONDS + CEILING_SECS ))
+          reason="rocm-smi never returned within its timeout (driver wedged or GPU absent)"
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
+            total=$(printf '%s\n' "$out" | grep -i 'VRAM Total Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            used=$(printf '%s\n' "$out" | grep -i 'VRAM Total Used Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            if [ -z "$total" ] || [ -z "$used" ]; then
+              reason="rocm-smi returned no VRAM figures (no AMD GPU detected)"
+              sleep 5; continue
+            fi
+            free=$(( total - used ))
+            if [ "$free" -ge "$min_free" ]; then
+              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB free (>= ${MIN_FREE_GIB} GiB)."
+              exit 0
+            fi
+            reason="VRAM never dropped below the floor: only $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB) — a serve is likely still holding the GPU"
+            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB)…"
+            sleep 5
+          done
+          echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${reason}"
+          exit 1
+
+      - name: Ensure Rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$CARGO_HOME/bin/cargo" ]; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --default-toolchain none
+          fi
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Run E2E tests on Strix Halo (incl. nightly-only)
+        run: |
+          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
+          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
+          export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
+
+          cargo build --release -p rocm
+          export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
+
+          if [ ! -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
+            echo "pre-warming shared runtime (first run on this runner)…"
+            mkdir -p "$prewarm"/{data,config,cache}
+            ROCM_CLI_CONFIG_DIR="$prewarm/config" \
+            ROCM_CLI_DATA_DIR="$prewarm/data" \
+            ROCM_CLI_CACHE_DIR="$prewarm/cache" \
+            HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
+              "$ROCM_CLI_BINARY" install sdk
+            if [ -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
+              echo "shared runtime pre-warmed at $E2E_SHARED_RUNTIMES_DIR"
+            else
+              echo "pre-warm did not produce a runtimes registry; scenarios will install their own" >&2
+            fi
+          else
+            echo "shared runtime already present at $E2E_SHARED_RUNTIMES_DIR — skipping pre-warm"
+          fi
+
+          cargo xtask e2e
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-gpu-nightly-strix-report
           path: tests/e2e-cucumber/results/
