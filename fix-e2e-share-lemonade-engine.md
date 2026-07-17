@@ -3,7 +3,7 @@
 **Stage:** 3-diagnosis-complete-needs-decision
 **Pipeline:** standard
 **Branch:** fix-e2e-share-lemonade-engine (PUSHED to origin; HEAD 03b0b9a = fix c57ed46 + diagnostics 03b0b9a)
-**Last Updated:** 2026-07-17 (idle flush applied)
+**Last Updated:** 2026-07-17
 
 ---
 
@@ -135,8 +135,6 @@ runtime; local `cargo build` + `cargo clippy --locked -p e2e-cucumber --test e2e
 both clean; ci.yml valid YAML.
 
 ## Work Log
-
-**2026-07-17 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
 **2026-07-17 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
