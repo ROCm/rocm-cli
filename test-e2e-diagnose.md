@@ -7,7 +7,7 @@
 **Branch:** test-e2e-diagnose
 **Last Updated:** 2026-07-17
 
-**Token Usage:** in=0 out=0 cache_create=0 cache_read=0 calls=0
+**Token Usage:** in=57 out=10825 cache_create=651314 cache_read=2486326 calls=31
 
 ---
 
@@ -90,13 +90,13 @@ Scenario: 6 - Asking for a fix the CLI does not know is refused clearly
 - ✅ **PR #127 opened** (commit `5e074fa`, signed + signed-off, off updated main).
 
 ### Todo 📋
-- 📋 Await PR #127 CI (the real verdict — container host ≠ CI Docker host for env-probing commands).
-- 📋 Address any review comments; resolve threads after pushing fixes.
+- 📋 PR #127 CI complete: all 6 diagnose scenarios PASS on mock lane, Strix Ubuntu, Strix Windows, GPU lane. No diagnose-related failures. (GPU lane blocked by unrelated EAI-7333 XPASS drift in serve scenarios, not this PR.)
+- 📋 Await human review (no reviews yet; `reviewDecision: REVIEW_REQUIRED`).
 
 ## Next Steps
 
-- Watch PR #127 CI on the mock lane; scenario 2 is the fragile one (env-dependent diagnose probing) — if it fails again, the fix is to assert only the host-invariant escalation-route contract, already applied.
-- On merge: post-merge cleanup (stage → done, delete remote branch, remove worktree).
+- Await human review on PR #127 (all 6 diagnose scenarios green across all tiers; no blockers on this PR's changes).
+- On merge: run post-merge cleanup (stage → done, delete remote branch, remove worktree).
 
 ## Checklist
 
@@ -122,6 +122,12 @@ Scenario: 6 - Asking for a fix the CLI does not know is refused clearly
 - Recreate with: `create_worktree.sh test-e2e-diagnose`
 
 ## Work Log
+
+### 2026-07-17 — PR #127 CI complete; awaiting human review
+
+- All 6 diagnose scenarios **PASS** across all E2E tiers (mock, Strix Ubuntu, Strix Windows, GPU). No diagnose-related failures.
+- GPU lane reconciliation: 9 xfail (as expected), 2 XPASS, 0 unexpected failures — the 2 XPASSes are EAI-7333 serve scenarios (unrelated to diagnose).
+- No human reviews yet on any surface (reviews, inline comments, issue comments all empty).
 
 ### 2026-07-17 — Split into its own WIP file
 
