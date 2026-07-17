@@ -31,7 +31,7 @@ SCRATCH only (e21297d). Bring to PR (test/add-e2e-robot-framework) after strix-w
 
 # WIP: E2E BDD tests for rocm-cli (PR #69, cucumber-rs)
 
-**Stage:** 27-version-probe-fix-strix-ready-nightly-pending (PR #69 merged 2026-07-15; follow-up work continues on scratch)
+**Stage:** done (PR #69 merged 2026-07-15; follow-ups moved to inbox / own WIPs)
 **Pipeline:** standard
 **Branch:** ci-e2e-framework-fixes (scratch, active) / test/add-e2e-robot-framework (PR)
 **Last Updated:** 2026-07-17
@@ -906,15 +906,9 @@ even on Instinct because vllm can't serve them. vLLM-capable safetensors (e.g.
 - ✅ **Goal reached**: all 4 platforms verified ≤15min expect-pass pass (confirmed from junit artifacts).
 
 ### Todo 📋
-- 📋 **Task #13**: Refine scenario 4 setup to faithful ROCm-tree prime + explicit teardown (currently thin prime with single marker file).
-- 📋 **Task #12**: Discuss private mirror repo for self-hosted E2E validation (eliminate public-repo self-hosted risk).
-- 📋 **Task #9**: Add .github/CODEOWNERS for workflow security (blocked on user: owner handle + scope).
-- 📋 **Task #10**: Enable "Require review from Code Owners" on main (depends on #9).
-- 📋 **Task #11**: Evaluate JIT/ephemeral self-hosted runners (larger architectural change, hardware-constrained).
-- 📋 **XPASS triage**: Scope EAI-7333 xfail to vLLM-default platforms only (not Strix Windows lemonade-default).
-- 📋 Add engine-level unit tests for EAI-7333 in engines/vllm + engines/lemonade healthcheck.
-- 📋 **Fix scenario numbering** in model_serving.feature (1,2,3,4,5,7,6,9,8 → 1-9 sequential). Cosmetic, LOW priority.
-- 📋 Persistent self-hosted GPU runner (app-dev currently ephemeral workspace pod).
+- 📋 Persistent self-hosted GPU runner (app-dev currently ephemeral workspace pod) — see [[persist-app-dev-ci-runner]].
+
+_Follow-up items that had accreted into this WIP but are separate from finishing the PR #69 test suite were moved to the work-ledger inbox (`~/Developer/work-ledger/INBOX.md`, rocm-cli section, 2026-07-17): scenario-4 prime/teardown (#13), private mirror repo (#12), CODEOWNERS (#9) + require-code-owner-review (#10), JIT/ephemeral runners (#11), EAI-7333 xfail scoping + engine unit tests, and model_serving scenario renumbering. The EAI-7333 XPASS-non-fatal harness change is now its own WIP ([[fix-xpass-non-fatal-flaky]], EAI-7456)._
 
 ### In progress 🚧 (Jul 10 — CI infra fixes + manual dispatch)
 - ✅ **Inference timeout cap** (`f2fa495`): `send_chat` client had NO timeout → a hung

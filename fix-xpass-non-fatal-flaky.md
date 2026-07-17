@@ -4,9 +4,9 @@
 **Pipeline:** standard
 **Branch:** fix-xpass-non-fatal-flaky (worktree active)
 **Jira:** EAI-7456 (In Progress, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-17 (idle flush)
+**Last Updated:** 2026-07-17
 
-**Token Usage:** in=7 out=1602 cache_create=107869 cache_read=379532 calls=5
+**Token Usage:** in=388 out=87761 cache_create=743329 cache_read=22669324 calls=176
 
 ---
 
@@ -71,8 +71,8 @@ Scenario: Non-flaky XPASS remains fatal
 - ✅ Added 5 unit tests (flaky parse/default, flaky-XPASS non-fatal, non-flaky-XPASS fatal, unexpected-FAIL always fatal, all-expected clean). `cargo test --lib` green (18 passed); clippy clean.
 
 ### Todo 📋
-- 📋 Container gate (`container-test.sh all`) — running.
-- 📋 Commit + push, open PR.
+- 📋 Container gate (`container-test.sh all`) — transient crates.io timeout; warm cache copied from sibling worktree, re-running offline. Gate did not complete before session end.
+- 📋 Commit + push, open PR (await gate completion).
 - 📋 EAI-7455 lemonade-Windows entries: N/A here — they live on `fix-e2e-share-lemonade-engine`; that branch marks them flaky after this lands.
 
 ## Next Steps
@@ -121,9 +121,9 @@ Scenario: Non-flaky XPASS remains fatal
 - Blocking #127 live; recommended delivery is a separate PR landed first, then rebase #127 and the lemonade branch on top.
 - Next: user decides separate-PR-vs-bundle, then create branch/worktree and write scenarios.
 
-**2026-07-17 (implementation):**
+**2026-07-17 (implementation & verification):**
 - EAI-7456 → In Progress, assigned to Fredrik.
-- Implemented the full change (3 files, +211/-38): `flaky` field on `XfailEntry`+`ExpectXfail`; extracted a pure `reconcile()`/`Reconciliation{is_fatal()}` in expectation.rs (testable); e2e.rs exit decision now calls it. Marked the two EAI-7333 vLLM entries `flaky=true` + toml grammar doc.
-- 5 new unit tests; `cargo test --lib` 18 passed; clippy clean (fixed one nursery const lint).
-- Container gate (`container-test.sh all`) blocked twice on **transient crates.io network timeouts** (`curl [28]`, downloading into empty worktree cache) — NOT a code failure. Working around by copying a warm `.cargo-container` (397M) from the fix-speed-up-e2e sibling worktree, then re-running the gate offline.
-- Next: green container gate → commit → push → open PR (separate PR, per delivery decision) → rebase #127 on top.
+- Full implementation done: 3 files (+211/-38); `flaky` field + pure `reconcile()`/`Reconciliation{is_fatal()}` in expectation.rs; e2e.rs calls it; both EAI-7333 vLLM entries marked `flaky=true`.
+- 5 unit tests (parse, default, fatal/non-fatal logic); `cargo test --lib` 18 passed; clippy clean.
+- Container gate: warm `.cargo-container` (397M) copied from sibling; gate re-running offline. Did not complete before session end (ongoing background task).
+- Next: await gate → commit → push → PR (separate, per delivery decision).
