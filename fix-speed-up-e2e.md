@@ -43,76 +43,7 @@ High-level approach TBD after profiling. Candidate levers:
 Define expected behaviors in BDD-style (Gherkin) **before** writing any tests or code.
 **Always activate the bdd-scenarios skill** before writing or reviewing scenarios.
 
-### Task #3 — `rocm diagnose` / `rocm fix` coverage (P0 gap) — DRAFT, awaiting review
-
-These cover the P0 `diagnose` command (and its sibling `fix`). All are **GPU-independent**
-— `diagnose` matches purely on a symptom string against a closed catalog, `fix --dry-run`
-and `fix` listing change nothing — so they belong on the **fast mock lane / per-PR tier**,
-not `@requires-gpu`.
-
-```gherkin
-Scenario: 1 - Diagnosing a recognised failure reports a likely cause and a fix
-  Given a user who hit a known ROCm failure
-  When the user asks the CLI to diagnose that symptom
-  Then the CLI reports a likely cause
-  And it points to a fix for that cause
-
-Scenario: 2 - Diagnosing an unrecognised failure admits it and routes the user onward
-  Given a user who hit a failure the CLI does not recognise
-  When the user asks the CLI to diagnose that symptom
-  Then the CLI states that no known cause matched
-  And it tells the user where to report the problem
-
-Scenario: 3 - A diagnosis is available in machine-readable form for tooling
-  Given a user who hit a known ROCm failure
-  When the user asks the CLI to diagnose that symptom in machine-readable form
-  Then the result identifies whether a known cause matched
-  And it can be consumed by other tools
-
-Scenario: 4 - The user can see every fix the CLI knows how to apply
-  When the user asks the CLI which fixes it offers
-  Then the CLI lists the fixes it can apply
-  And each fix indicates whether the CLI can apply it automatically
-
-Scenario: 5 - Previewing a fix explains the change without making it
-  Given a user who has chosen a known fix
-  When the user previews that fix without applying it
-  Then the CLI describes what the fix would change
-  And nothing on the machine is changed
-
-Scenario: 6 - Asking for a fix the CLI does not know is refused clearly
-  Given a user who names a fix the CLI does not offer
-  When the user asks the CLI to apply that fix
-  Then the CLI refuses
-  And it explains that the fix is not recognised
-```
-
-**Technical Details** (mapping — kept out of the scenarios per bdd rules):
-
-| # | @id | invocation | key assertion | tier |
-|---|-----|-----------|---------------|------|
-| 1 | diagnose-matches-known-symptom | `diagnose --symptom "unable to open /dev/kfd"` | exit 0; stdout has a `#1 [HIGH/LIKELY score=…]` match with an `id: fix-…` + `plan:` line (do NOT assert a specific fix-id — see below) | mock (per-PR) |
-| 2 | diagnose-no-match-routes-upstream | `diagnose --symptom "xyzzy gibberish"` | exit 0; "no known misconfiguration matched" + a route target line (`rocm-core: https://…`) | mock |
-| 3 | diagnose-json-has-match-flag | `diagnose --symptom "unable to open /dev/kfd" --json` | exit 0; parseable JSON; `matched` non-empty | mock |
-| 4 | fix-lists-known-recipes | `fix` (no id) | exit 0; "Available fix-ids" + ≥1 `[AUTO]`/`[PRINT-ONLY]` row | mock |
-| 5 | fix-dry-run-changes-nothing | `fix fix-1-arch --dry-run` | exit **0**; prints a `Fix: fix-1-arch …` plan; no mutation | mock |
-| 6 | fix-unknown-id-rejected | `fix fix-does-not-exist` | exit **2**; stderr/stdout "Unknown fix-id: …" | mock |
-
-**VERIFIED live in the Linux container (2026-07-16), corrections vs my first draft:**
-- `diagnose` always exits 0 (query) ✓. BUT diagnose is **OS-gated**: on Mac `os_family`≠linux → the
-  CHECKERS all skip → 0 matches for ANY symptom (that's why a Mac probe wrongly showed "no match").
-  On the mock lane (hosted **Ubuntu**) it matches correctly. Lesson logged: always probe in the container.
-- Scenario 1: the KFD symptom matched, but the top hit on the CI box was **fix-4-render-group score=95**
-  (the box's user isn't in render/video, so those env-checks stack with the keyword). So the specific
-  fix-id is ENV-DEPENDENT — assert "a match with an `id:`+`plan:`", NOT a hardcoded id.
-- Scenario 5: `fix-4-render-group --dry-run` returns **rc=3** (env-not-right: no `$USER` in container),
-  and `fix-2-unset-override --dry-run` **PANICS rc=101** (separate bug — flag it, don't use it).
-  `fix-1-arch --dry-run` is PRINT-ONLY, linux+windows, deterministic **rc=0** → use it for scenario 5.
-- Scenario 6: `fix <unknown>` → **rc=2** ✓ ("Unknown fix-id: …").
-
-All 6 need `expectations.toml` entries (expect-pass all platforms; none are known bugs). Candidate file:
-new `tests/e2e-cucumber/features/diagnose.feature`. SIDE FINDING to file separately: `fix
-fix-2-unset-override --dry-run` panics (rc=101) — a dry-run should never panic.
+Task #3 (`rocm diagnose`/`fix` coverage) has moved to its own WIP + branch/PR: [[test-e2e-diagnose]] (PR #127). Its 6 scenarios, technical mapping, and live-container corrections now live there.
 
 ## Implementation Steps
 
@@ -125,9 +56,7 @@ fix-2-unset-override --dry-run` panics (rc=101) — a dry-run should never panic
 - ✅ Task #1 probe (run 29529197875, Strix-Ubuntu): **VRAM fix CONFIRMED**. Serve step = 91s (pure 90s readiness wait) vs ~262s baseline → the ~120s `wait_for_free_vram` dead-time is GONE. The job's "regression" flag was a FALSE ALARM from `--name` scoped mode: platform.json recorded 0 expectations (scoped `--name` bypasses the `.filter_run` resolutions-population path; a full run records all 25). So the EAI-7423 lemonade xfail couldn't reconcile — NOT caused by my change. LESSON: `--name` breaks reconciliation; judge scoped probes by step TIMING/behavior, not the pass/fail verdict.
 - ✅ **Task #1 SHIPPED: PR #126 MERGED** into main (merge commit `e9a4b154`, 2026-07-17 ~03:03 CEST). All blocking checks green; Strix-Ubuntu lane PASS 15m37s (was 28.4m long pole). The 2 red lanes (MI300X-GPU, Strix-Windows) are non-blocking `continue-on-error` pre-existing failures, unaffected by this change (MI300X floor unchanged). Branch was rebased onto latest main before merge (commit became `a94600f`).
 
-- ✅ **Task #3 SHIPPED: PR #127 open** (branch `test-e2e-diagnose`, off updated main, commit `5e074fa` signed+signed-off). Added `diagnose.feature` (6 scenarios) + `diagnose_steps.rs` + e2e.rs module wiring; all mock-lane GPU-independent, all expect-pass. Container gate green: clippy `-D warnings` clean, 6/6 pass, 0 unexpected.
-- **Scenario 2 broke THREE times on environment-dependence** (`diagnose` probes the real host): (Mac) OS-gated 0 matches; (my Linux container) user-not-in-render → score 45 for any symptom, killed "no match"; (CI mock Docker host) amdgpu BLACKLISTED → `fix-5-amdgpu-load` score 90 HIGH for any symptom, killed "no HIGH-confidence match". FINAL fix: assert only the host-INVARIANT contract — diagnose always emits an escalation route (`route_when_no_match.url`). The container gate is necessary but NOT sufficient for env-probing commands (container host ≠ CI Docker host); PR CI is the real verdict. Saved memory `env-probing-commands-untestable-by-state`.
-- Also caught pre-CI: scenario 5 "no mutation" — dry-run creates data/logs/, narrowed assertion to managed-state dirs (runtimes/services/config); clippy `is_ok_and`; rustfmt wraps. PROCESS NOTE: commit stalls were the `cargo fmt` pre-commit hook, NOT signing (the "1Password unlocked / signing failed" message is a red herring; configured key = 1Password GitHub RSA, signs fine once fmt passes).
+- ✅ **Task #3 SHIPPED to PR #127** — moved to its own WIP: [[test-e2e-diagnose]]. Full detail (scenarios, env-dependence saga, process notes) lives there.
 
 ### Todo 📋
 - 📋 Task #2: Rework CI tiering (per-PR vs nightly) — verify/tune existing `@nightly` split.
@@ -202,7 +131,7 @@ capture more cleanly. **Capacity** = user adds hardware when available (near-max
 
 ## Blockers / Open Questions
 
-- **Coverage gap on diagnose**: `rocm diagnose` command exists but zero E2E scenarios cover it — real gap vs P0 plan (Task #3).
+- **Coverage gap on diagnose**: addressed in [[test-e2e-diagnose]] (PR #127) — no longer tracked here.
 - **Strix Halo Qwen not latest**: suite uses `Qwen3-0.6B-GGUF` (smallest GGUF recipe) on lemonade; unclear if this is the "latest variant" you intended (Task #4 decision gate).
 - **Tiering already exists**: `@nightly` gate + `E2E_INCLUDE_NIGHTLY=1` env gate already separates heavy scenarios (27B serve, cold install) from per-PR runs. Task #2 is to verify/tune this alignment, not build from scratch.
 - **Real bugs separate**: EAI-7423 (lemonade-on-Strix-Linux serve fails) and EAI-7052 (lemonade Vulkan instability) are tracked known bugs in `expectations.toml`, separate from the VRAM-floor waste fix (Task #1).
