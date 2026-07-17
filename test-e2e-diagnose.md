@@ -5,9 +5,9 @@
 **Stage:** 8-awaiting-pr-approval (PR #127 open)
 **Pipeline:** standard
 **Branch:** test-e2e-diagnose
-**Last Updated:** 2026-07-17 (idle flush)
+**Last Updated:** 2026-07-17
 
-**Token Usage:** in=57 out=10825 cache_create=651314 cache_read=2486326 calls=31
+**Token Usage:** in=4141 out=12296 cache_create=663450 cache_read=2514694 calls=40
 
 ---
 
@@ -123,9 +123,11 @@ Scenario: 6 - Asking for a fix the CLI does not know is refused clearly
 
 ## Work Log
 
-### 2026-07-17 (idle flush) — Auto-flush WIP state
+### 2026-07-17 — Session review & token usage snapshot
 
-- Session idle for 10 minutes, auto-flushing WIP state to progress file.
+- Reviewed full session context and PR #127 state; all 6 diagnose scenarios passing across all CI tiers.
+- Updated token usage snapshot: in=4141 out=12296 cache_create=663450 cache_read=2514694 calls=40.
+- Status unchanged: awaiting human review on PR #127 (no blockers on diagnose changes).
 
 ### 2026-07-17 — PR #127 CI complete; awaiting human review
 
