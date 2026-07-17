@@ -40,7 +40,17 @@
       "quantization": "none; recommended small assistant recipe",
       "artifact_hint": "Lemonade model id; resolved internally to a GGUF build of this model",
       "artifacts": [],
-      "engine_recipes": [],
+      "engine_recipes": [
+        {
+          "engine": "vllm",
+          "required_flags": ["--enable-auto-tool-choice", "--tool-call-parser", "hermes"],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [],
+          "model_id_override": null
+        }
+      ],
       "manual_alternatives": [
         "qwen-tiny",
         "tiny-gpt2"
@@ -73,7 +83,17 @@
       "quantization": "none; tiny instruct smoke recipe",
       "artifact_hint": "Hugging Face safetensors model id; served on GPU through vLLM (Linux/WSL)",
       "artifacts": [],
-      "engine_recipes": [],
+      "engine_recipes": [
+        {
+          "engine": "vllm",
+          "required_flags": ["--enable-auto-tool-choice", "--tool-call-parser", "hermes"],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [],
+          "model_id_override": null
+        }
+      ],
       "manual_alternatives": [
         "qwen",
         "tiny-gpt2"
@@ -110,7 +130,7 @@
       "engine_recipes": [
         {
           "engine": "vllm",
-          "required_flags": [],
+          "required_flags": ["--enable-auto-tool-choice", "--tool-call-parser", "hermes"],
           "parser_settings": {},
           "preferred_endpoint": null,
           "unsupported_combinations": [],
@@ -179,7 +199,17 @@
       "quantization": "none; bfloat16 weights",
       "artifact_hint": "Hugging Face model id; engine resolver validates artifacts during serve",
       "artifacts": [],
-      "engine_recipes": [],
+      "engine_recipes": [
+        {
+          "engine": "vllm",
+          "required_flags": ["--enable-auto-tool-choice", "--tool-call-parser", "hermes"],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [],
+          "model_id_override": null
+        }
+      ],
       "manual_alternatives": [
         "qwen",
         "llama-3.2-3b-instruct",
@@ -213,7 +243,17 @@
       "quantization": "fp8 recipe",
       "artifact_hint": "Hugging Face model id; engine resolver validates FP8 support during serve",
       "artifacts": [],
-      "engine_recipes": [],
+      "engine_recipes": [
+        {
+          "engine": "vllm",
+          "required_flags": ["--enable-auto-tool-choice", "--tool-call-parser", "hermes"],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [],
+          "model_id_override": null
+        }
+      ],
       "manual_alternatives": [
         "qwen",
         "llama-3.2-3b-instruct",
@@ -281,7 +321,17 @@
       "quantization": "none; bfloat16 weights",
       "artifact_hint": "Hugging Face safetensors model id; served on GPU through vLLM (Linux/WSL)",
       "artifacts": [],
-      "engine_recipes": [],
+      "engine_recipes": [
+        {
+          "engine": "vllm",
+          "required_flags": ["--enable-auto-tool-choice", "--tool-call-parser", "llama3_json"],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [],
+          "model_id_override": null
+        }
+      ],
       "manual_alternatives": [
         "qwen",
         "tiny-gpt2"
@@ -337,7 +387,17 @@
       "quantization": "BF16, ~54 GiB (1x MI300X)",
       "artifact_hint": "Hugging Face model id; vLLM ROCm serving validates artifacts during serve",
       "artifacts": [],
-      "engine_recipes": [],
+      "engine_recipes": [
+        {
+          "engine": "vllm",
+          "required_flags": ["--enable-auto-tool-choice", "--tool-call-parser", "hermes"],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [],
+          "model_id_override": null
+        }
+      ],
       "manual_alternatives": [
         "qwen3-32b-fp8"
       ],
