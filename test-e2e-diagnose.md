@@ -2,7 +2,7 @@
 
 # WIP: E2E coverage for `rocm diagnose` / `rocm fix`
 
-**Stage:** 8-awaiting-pr-approval (PR #127 open)
+**Stage:** 8-awaiting-pr-approval (PR #127 — addressing review changes)
 **Pipeline:** standard
 **Branch:** test-e2e-diagnose
 **Last Updated:** 2026-07-17
@@ -122,6 +122,13 @@ Scenario: 6 - Asking for a fix the CLI does not know is refused clearly
 - Recreate with: `create_worktree.sh test-e2e-diagnose`
 
 ## Work Log
+
+### 2026-07-17 — volen-silo CHANGES_REQUESTED: host-invariance fix for S1/S3
+
+- **PR #127 got a `CHANGES_REQUESTED` review from the `volen-silo` bot** (single top-level formal review; no inline/issue threads, no CodeQL alerts). It ran the built binary and confirmed S2/S4/S5/S6 are genuinely host-invariant, but flagged **S1 & S3 as NOT host-invariant**: the known symptom `"unable to open /dev/kfd"` scores only via `check_4_render_group`, which is `LINUX_ONLY` (`diagnose.rs:1225`) → on `strix-windows` `matched` is empty, no `score=` rendered → both fail deterministically (untagged ⇒ expect-pass on every lane incl. strix-windows).
+- **Applied the reviewer's PREFERRED fix** (keeps Windows coverage): swapped `KNOWN_SYMPTOM` → `"HSA_STATUS_ERROR_INVALID_ISA"`. Verified against source: keyword scores 50 in `KEYWORDS_INVALID_ISA` → `check_1_arch_not_in_wheel`, which is `LINUX_AND_WINDOWS` (`diagnose.rs:1222`); the `-30` covered-arch penalty only fires when `framework_arch_list` is non-empty (`diagnose.rs:339`), so with no framework installed it stays at 50 → match always renders on both OSes.
+- **S5 minor note (non-blocking):** reviewer observed `fix-1-arch` is print-only so `--dry-run` is a trivial no-op. Kept as-is — using an auto-applicable recipe reintroduces the host-dependent dry-run rc / fix-2 panic this PR exists to avoid. Will explain in the reply, not change.
+- Verifying the symptom swap in a Linux container before pushing (Mac is OS-gated → wrong answers).
 
 ### 2026-07-17 (idle flush) — Auto-flush WIP state
 

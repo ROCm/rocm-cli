@@ -109,8 +109,9 @@ Scenario: Non-flaky XPASS remains fatal
 
 ## Worktree Context
 
-**Worktree directory**: not created yet.
+**Worktree directory**: /Users/fres/Developer/rocm-cli-wt/fix-xpass-non-fatal-flaky (active).
 - Recreate with: `create_worktree.sh fix-xpass-non-fatal-flaky`
+- Container gate script copied in at `workspace/wip/container-test.sh` (gitignored).
 
 ## Work Log
 
@@ -120,4 +121,9 @@ Scenario: Non-flaky XPASS remains fatal
 - Blocking #127 live; recommended delivery is a separate PR landed first, then rebase #127 and the lemonade branch on top.
 - Next: user decides separate-PR-vs-bundle, then create branch/worktree and write scenarios.
 
-**2026-07-17 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+**2026-07-17 (implementation):**
+- EAI-7456 → In Progress, assigned to Fredrik.
+- Implemented the full change (3 files, +211/-38): `flaky` field on `XfailEntry`+`ExpectXfail`; extracted a pure `reconcile()`/`Reconciliation{is_fatal()}` in expectation.rs (testable); e2e.rs exit decision now calls it. Marked the two EAI-7333 vLLM entries `flaky=true` + toml grammar doc.
+- 5 new unit tests; `cargo test --lib` 18 passed; clippy clean (fixed one nursery const lint).
+- Container gate (`container-test.sh all`) blocked twice on **transient crates.io network timeouts** (`curl [28]`, downloading into empty worktree cache) — NOT a code failure. Working around by copying a warm `.cargo-container` (397M) from the fix-speed-up-e2e sibling worktree, then re-running the gate offline.
+- Next: green container gate → commit → push → open PR (separate PR, per delivery decision) → rebase #127 on top.
