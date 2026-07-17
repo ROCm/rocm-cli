@@ -92,6 +92,11 @@ changes the model the mock service advertises; the CLI tape's `--model`
 argument must match it (both default to the same identifier), so override
 them together if you change one.
 
+Running `rocm-demo-env` directly (instead of through `cargo xtask demos`) skips
+the wrapper's `ROCM_MOCK_CHAT_REPLY` export, so the mock server's chat replies
+fall back to a generic test stub; set `ROCM_MOCK_CHAT_REPLY` yourself for a
+realistic chat response.
+
 > [!NOTE]
 > Browser-backed VHS GIF rendering can hang under WSL2. On WSL2, run the Rust
 > tests and command-level checks locally, then use the `demo-gifs` GitHub Actions

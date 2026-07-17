@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
-const DEFAULT_MODEL: &str = "Qwen/Qwen3.5-0.6B";
+const DEFAULT_MODEL: &str = "Qwen/Qwen3.5-4B";
 const DEMOS: &[&str] = &["cli", "console"];
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 

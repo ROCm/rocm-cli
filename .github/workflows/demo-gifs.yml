@@ -5,12 +5,8 @@ name: demo-gifs
 # on pull requests: VHS rendering is slow and would churn the branch. Regenerate
 # on demand, and automatically on each release so the docs GIFs track released
 # behavior (the release tag doubles as a cache-buster for GitHub's image proxy).
-# The feature-branch push trigger is temporary: GitHub cannot manually dispatch a
-# workflow until its file exists on the default branch.
 on:
   workflow_dispatch:
-  push:
-    branches: [docs/demo-screencasts]
   release:
     types: [published]
 
@@ -25,7 +21,7 @@ jobs:
   render:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
@@ -47,8 +43,8 @@ jobs:
         run: cargo xtask demos
 
       # Publish from an unignored staging directory. `docs/media/*.gif` is
-      # intentionally git-ignored on source branches, and the Pages action honors
-      # that ignore file while preparing assets.
+      # intentionally git-ignored on source branches; staging the GIFs outside
+      # that ignored path makes them available for the publish step below.
       - name: Stage rendered media
         run: |
           mkdir -p rendered-media

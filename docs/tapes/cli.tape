@@ -36,7 +36,7 @@ Sleep 400ms
 Enter
 Sleep 4s
 
-Type "rocm chat --provider local --model Qwen/Qwen3.5-0.6B --prompt 'What can ROCm CLI help me do?'"
+Type "rocm chat --provider local --model Qwen/Qwen3.5-4B --prompt 'What can ROCm CLI help me do?'"
 Sleep 400ms
 Enter
 Sleep 6s

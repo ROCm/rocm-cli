@@ -21,7 +21,7 @@ use e2e_cucumber::mock_server::{MockServer, write_service_record};
 #[tokio::main]
 async fn main() {
     let mut root: Option<PathBuf> = None;
-    let mut model = "Qwen/Qwen3.5-0.6B".to_string();
+    let mut model = "Qwen/Qwen3.5-4B".to_string();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
