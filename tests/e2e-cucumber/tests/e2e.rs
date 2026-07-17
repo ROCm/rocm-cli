@@ -193,11 +193,8 @@ impl Default for E2eWorld {
 
 impl E2eWorld {
     /// The isolation/behaviour environment every spawned `rocm` gets, as owned
-    /// `(key, value)` pairs. One source of truth for both the piped
-    /// `std::process::Command` path (`isolate_cmd`) and the pseudo-terminal path
-    /// (`tui_driver`, whose `portable_pty::CommandBuilder` has its own env API and
-    /// can't take a `std::process::Command`) — so the interactive and
-    /// non-interactive spawns can never drift.
+    /// `(key, value)` pairs. Shared by the piped `std::process::Command` path and
+    /// the pseudo-terminal path; PTY-only isolation is added by [`pty_env`].
     pub fn isolate_env(&self) -> Vec<(&'static str, std::ffi::OsString)> {
         let mut env = Vec::new();
         if let Some(root) = &self.isolated_root {
@@ -205,17 +202,6 @@ impl E2eWorld {
             env.push(("ROCM_CLI_CONFIG_DIR", root.join("config").into_os_string()));
             env.push(("ROCM_CLI_DATA_DIR", root.join("data").into_os_string()));
             env.push(("ROCM_CLI_CACHE_DIR", root.join("cache").into_os_string()));
-            // The dashboard socket default is derived from HOME/XDG rather than
-            // AppPaths, so isolate it too; otherwise a host daemon can answer
-            // the scenario and hide the planted service registry. Create both
-            // directories because some PTY implementations use HOME as the
-            // child's working directory.
-            let home = root.join("home");
-            let runtime = root.join("runtime");
-            std::fs::create_dir_all(&home).expect("failed to create isolated HOME");
-            std::fs::create_dir_all(&runtime).expect("failed to create isolated runtime dir");
-            env.push(("HOME", home.into_os_string()));
-            env.push(("XDG_RUNTIME_DIR", runtime.into_os_string()));
         }
         // Share only STATE-FREE, content-addressed caches across scenarios when
         // CI provides a persistent shared dir (see shared_cache_dir): HF model
@@ -252,6 +238,24 @@ impl E2eWorld {
             env.push(("ROCM_CLI_VLLM_READY_TIMEOUT_SECS", secs.to_string().into()));
         }
         env
+    }
+
+    /// Additional isolation for interactive sessions. The dashboard socket
+    /// default is derived from HOME/XDG rather than the CLI AppPaths, so a PTY
+    /// must not inherit the host daemon's socket location. Piped scenarios keep
+    /// their historical HOME/XDG environment, including GPU/runtime defaults.
+    pub fn pty_env(&self) -> Vec<(&'static str, std::ffi::OsString)> {
+        let Some(root) = &self.isolated_root else {
+            return Vec::new();
+        };
+        let home = root.path().join("home");
+        let runtime = root.path().join("runtime");
+        std::fs::create_dir_all(&home).expect("failed to create isolated HOME");
+        std::fs::create_dir_all(&runtime).expect("failed to create isolated runtime dir");
+        vec![
+            ("HOME", home.into_os_string()),
+            ("XDG_RUNTIME_DIR", runtime.into_os_string()),
+        ]
     }
 
     pub fn isolate_cmd(&self, cmd: &mut std::process::Command) {

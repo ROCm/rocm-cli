@@ -103,6 +103,8 @@ async fn open_dashboard(world: &mut E2eWorld) {
 
 #[when("the user opens the ROCm view")]
 async fn open_rocm_view(world: &mut E2eWorld) {
+    // Dashboard tabs are currently ordered Home, ROCm, Serving, Observe; these
+    // numeric shortcuts intentionally exercise that user-visible ordering.
     session(world)
         .send("2")
         .unwrap_or_else(|e| panic!("failed to switch to the ROCm tab: {e}"));
@@ -141,6 +143,8 @@ async fn open_command_palette(world: &mut E2eWorld) {
 #[when("the user chooses Serving")]
 async fn choose_serving(world: &mut E2eWorld) {
     let tui = session(world);
+    // The palette initially selects Home; Serving is the third destination, so
+    // two downward moves intentionally assert the current destination ordering.
     tui.send("jj")
         .unwrap_or_else(|e| panic!("failed to select Serving: {e}"));
     tui.send("\r")

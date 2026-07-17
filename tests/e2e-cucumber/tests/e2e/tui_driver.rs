@@ -45,6 +45,9 @@ const DETAIL_COLS: u16 = 120;
 /// poll cadence, not a fixed readiness sleep: every wait has a deadline and
 /// returns the instant its condition holds.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// Maximum time to let the PTY reader consume the child's final frame after the
+/// process exits. This is bounded so a misbehaving PTY cannot stall a scenario.
+const DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Default wall-clock budget for a single wait. Generous enough for a cold dash
 /// start plus the embedded-daemon connect, while still turning a genuine hang
@@ -108,7 +111,7 @@ impl TuiSession {
         for (key, value) in std::env::vars_os() {
             cmd.env(key, value);
         }
-        for (key, value) in world.isolate_env() {
+        for (key, value) in world.isolate_env().into_iter().chain(world.pty_env()) {
             cmd.env(key, value);
         }
         // Deterministic terminal type; the PTY ioctl size above is authoritative
@@ -157,10 +160,19 @@ impl TuiSession {
     /// already resolved escape sequences and styling into cells, so this is
     /// exactly what a user sees — color/attribute independent.
     pub fn screen_text(&self) -> String {
+        self.screen_snapshot().0
+    }
+
+    fn screen_snapshot(&self) -> (String, (u16, u16)) {
         self.parser
             .lock()
-            .map(|p| p.screen().contents())
+            .map(|p| (p.screen().contents(), p.screen().size()))
             .unwrap_or_default()
+    }
+
+    fn framed_screen(&self) -> String {
+        let (screen, (rows, cols)) = self.screen_snapshot();
+        format!("--- last screen ({cols}x{rows}) ---\n{screen}\n--- end screen ---")
     }
 
     /// Resize both the real PTY and the emulated screen. The application receives
@@ -201,24 +213,41 @@ impl TuiSession {
             if self.screen_text().contains(marker) {
                 return Ok(());
             }
-            // If the process is gone, give the reader a beat to drain any final
-            // bytes, then check once more before declaring failure.
+            // If the process is gone, let the reader drain the final frame for a
+            // short bounded window. A single poll is not enough when a large frame
+            // is still buffered behind the process exit notification.
             if let Ok(Some(status)) = self.child.try_wait() {
                 self.finished = true;
-                tokio::time::sleep(POLL_INTERVAL).await;
-                let screen = self.screen_text();
-                if screen.contains(marker) {
+                self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
+                let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
+                while Instant::now() < drain_deadline {
+                    if self.screen_text().contains(marker) {
+                        return Ok(());
+                    }
+                    if self
+                        .reader
+                        .as_ref()
+                        .is_some_and(std::thread::JoinHandle::is_finished)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
+                // Final check after the drain window closes: the reader may have
+                // committed the last frame between the loop's screen check and the
+                // `is_finished`/deadline exit, so re-read before declaring failure.
+                if self.screen_text().contains(marker) {
                     return Ok(());
                 }
                 return Err(format!(
                     "process exited ({status:?}) before {marker:?} appeared.\n{}",
-                    framed_screen(&screen)
+                    self.framed_screen()
                 ));
             }
             if Instant::now() >= deadline {
                 return Err(format!(
                     "timed out after {timeout:?} waiting for {marker:?}.\n{}",
-                    framed_screen(&self.screen_text())
+                    self.framed_screen()
                 ));
             }
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -250,7 +279,7 @@ impl TuiSession {
                     } else {
                         Err(format!(
                             "TUI exited unsuccessfully ({status:?}).\n{}",
-                            framed_screen(&self.screen_text())
+                            self.framed_screen()
                         ))
                     };
                 }
@@ -260,7 +289,7 @@ impl TuiSession {
             if Instant::now() >= deadline {
                 return Err(format!(
                     "timed out after {timeout:?} waiting for the TUI to exit.\n{}",
-                    framed_screen(&self.screen_text())
+                    self.framed_screen()
                 ));
             }
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -288,8 +317,14 @@ impl Drop for TuiSession {
         // without an explicit quit (e.g. the consent-gate scenarios).
         if !self.finished {
             let _ = self.child.kill();
-            let _ = self.child.wait();
+            let rc = self
+                .child
+                .wait()
+                .ok()
+                .and_then(|status| i32::try_from(status.exit_code()).ok())
+                .unwrap_or(-1);
             self.finished = true;
+            self.record_once(rc);
         }
         self.reader_stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.reader.take() {
@@ -326,9 +361,4 @@ fn spawn_reader(
             }
         }
     })
-}
-
-/// Wrap a screen dump in delimiters so failure messages are easy to read.
-fn framed_screen(screen: &str) -> String {
-    format!("--- last screen ({COLS}x{ROWS}) ---\n{screen}\n--- end screen ---")
 }
