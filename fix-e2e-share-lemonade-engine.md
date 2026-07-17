@@ -3,7 +3,7 @@
 **Stage:** 3-diagnosis-complete-needs-decision
 **Pipeline:** standard
 **Branch:** fix-e2e-share-lemonade-engine (PUSHED to origin; HEAD 03b0b9a = fix c57ed46 + diagnostics 03b0b9a)
-**Last Updated:** 2026-07-17
+**Last Updated:** 2026-07-17 (idle flush applied)
 
 ---
 
