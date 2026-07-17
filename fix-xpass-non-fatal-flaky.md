@@ -4,7 +4,7 @@
 **Pipeline:** standard
 **Branch:** fix-xpass-non-fatal-flaky (worktree active)
 **Jira:** EAI-7456 (In Progress, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-17
+**Last Updated:** 2026-07-17 (idle flush)
 
 **Token Usage:** in=388 out=87761 cache_create=743329 cache_read=22669324 calls=176
 
@@ -127,3 +127,5 @@ Scenario: Non-flaky XPASS remains fatal
 - 5 unit tests (parse, default, fatal/non-fatal logic); `cargo test --lib` 18 passed; clippy clean.
 - Container gate: warm `.cargo-container` (397M) copied from sibling; gate re-running offline. Did not complete before session end (ongoing background task).
 - Next: await gate → commit → push → PR (separate, per delivery decision).
+
+**2026-07-17 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
