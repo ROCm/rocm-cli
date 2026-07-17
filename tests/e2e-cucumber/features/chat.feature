@@ -7,11 +7,18 @@ Feature: Chat and endpoint detection
     When the user checks for running services
     Then the served model is listed
 
-  @id:chat-privacy-notice-accurate
-  Scenario: 2 - The privacy notice is accurate for local endpoints
+  # Driven through the interactive TUI (a pseudo-terminal): the privacy notice
+  # lives on the chat consent gate, which only the real terminal path renders.
+  # The model is registered so the CLI discovers it on its OS-assigned port and
+  # offers it — the notice must precede any request. (Was EAI-7222, previously
+  # an untestable-black-box gap.)
+  @id:chat-privacy-notice-accurate @requires-os:linux
+  Scenario: 2 - The privacy notice is shown before using a local endpoint
     Given a model is being served locally
-    When the user is offered the detected endpoint
-    Then the notice does not claim that requests leave the machine
+    And the model is registered with the CLI
+    When the user opens interactive chat
+    Then the local endpoint is shown for confirmation
+    And the privacy notice is shown before any message is sent
 
   @id:chat-endpoint-shown-in-services
   Scenario: 3 - A served model's endpoint is shown in the services list

@@ -48,6 +48,7 @@ repository.
 | anyhow | 1.0.102 | MIT OR Apache-2.0 |
 | apple-native-keyring-store | 1.0.0 | MIT OR Apache-2.0 |
 | approx | 0.5.1 | Apache-2.0 |
+| arrayvec | 0.7.8 | MIT OR Apache-2.0 |
 | as-any | 0.3.2 | MIT OR Apache-2.0 |
 | assert-json-diff | 2.0.2 | MIT |
 | async-broadcast | 0.7.2 | MIT OR Apache-2.0 |
@@ -89,11 +90,11 @@ repository.
 | bytemuck | 1.25.0 | Zlib OR Apache-2.0 OR MIT |
 | byteorder | 1.5.0 | Unlicense OR MIT |
 | bytes | 1.12.0 | MIT |
-| cassowary | 0.3.0 | MIT / Apache-2.0 |
 | castaway | 0.2.4 | MIT |
 | cbc | 0.1.2 | MIT OR Apache-2.0 |
 | cc | 1.2.65 | MIT OR Apache-2.0 |
 | cfg-if | 1.0.4 | MIT OR Apache-2.0 |
+| cfg_aliases | 0.1.1 | MIT |
 | cfg_aliases | 0.2.1 | MIT |
 | chrono | 0.4.45 | MIT OR Apache-2.0 |
 | cipher | 0.4.4 | MIT OR Apache-2.0 |
@@ -107,7 +108,6 @@ repository.
 | color-spantrace | 0.3.0 | MIT OR Apache-2.0 |
 | colorchoice | 1.0.5 | MIT OR Apache-2.0 |
 | combine | 4.6.7 | MIT |
-| compact_str | 0.8.2 | MIT |
 | compact_str | 0.9.1 | MIT |
 | concurrent-queue | 2.5.0 | Apache-2.0 OR MIT |
 | console | 0.16.4 | MIT |
@@ -151,6 +151,7 @@ repository.
 | dirs-sys | 0.5.0 | MIT OR Apache-2.0 |
 | displaydoc | 0.2.6 | MIT OR Apache-2.0 |
 | document-features | 0.2.12 | MIT OR Apache-2.0 |
+| downcast-rs | 1.2.1 | MIT/Apache-2.0 |
 | dunce | 1.0.5 | CC0-1.0 OR MIT-0 OR Apache-2.0 |
 | dyn-clone | 1.0.20 | MIT OR Apache-2.0 |
 | either | 1.16.0 | MIT OR Apache-2.0 |
@@ -176,7 +177,6 @@ repository.
 | fixedbitset | 0.4.2 | MIT/Apache-2.0 |
 | flate2 | 1.1.9 | MIT OR Apache-2.0 |
 | fnv | 1.0.7 | Apache-2.0 / MIT |
-| foldhash | 0.1.5 | Zlib |
 | foldhash | 0.2.0 | Zlib |
 | form_urlencoded | 1.2.2 | MIT OR Apache-2.0 |
 | fs_extra | 1.3.0 | MIT |
@@ -202,7 +202,6 @@ repository.
 | globwalk | 0.9.1 | MIT |
 | h2 | 0.4.15 | MIT |
 | hashbrown | 0.12.3 | MIT OR Apache-2.0 |
-| hashbrown | 0.15.5 | MIT OR Apache-2.0 |
 | hashbrown | 0.16.1 | MIT OR Apache-2.0 |
 | hashbrown | 0.17.1 | MIT OR Apache-2.0 |
 | heck | 0.5.0 | MIT OR Apache-2.0 |
@@ -244,7 +243,6 @@ repository.
 | inventory | 0.3.24 | MIT OR Apache-2.0 |
 | ipnet | 2.12.0 | MIT OR Apache-2.0 |
 | is_terminal_polyfill | 1.70.2 | MIT OR Apache-2.0 |
-| itertools | 0.13.0 | MIT OR Apache-2.0 |
 | itertools | 0.14.0 | MIT OR Apache-2.0 |
 | itoa | 1.0.18 | MIT OR Apache-2.0 |
 | jni | 0.22.4 | MIT OR Apache-2.0 |
@@ -269,7 +267,6 @@ repository.
 | litrs | 1.0.0 | MIT OR Apache-2.0 |
 | lock_api | 0.4.14 | MIT OR Apache-2.0 |
 | log | 0.4.33 | MIT OR Apache-2.0 |
-| lru | 0.12.5 | MIT |
 | lru | 0.18.0 | MIT |
 | lru-slab | 0.1.2 | MIT OR Apache-2.0 OR Zlib |
 | mac_address | 1.1.8 | MIT OR Apache-2.0 |
@@ -286,6 +283,7 @@ repository.
 | miniz_oxide | 0.8.9 | MIT OR Zlib OR Apache-2.0 |
 | mio | 1.2.1 | MIT |
 | nanoid | 0.4.0 | MIT |
+| nix | 0.28.0 | MIT |
 | nix | 0.29.0 | MIT |
 | nom | 7.1.3 | MIT |
 | nom | 8.0.0 | MIT |
@@ -320,7 +318,6 @@ repository.
 | parking | 2.2.1 | Apache-2.0 OR MIT |
 | parking_lot | 0.12.5 | MIT OR Apache-2.0 |
 | parking_lot_core | 0.9.12 | MIT OR Apache-2.0 |
-| paste | 1.0.15 | MIT OR Apache-2.0 |
 | peg | 0.6.3 | MIT |
 | peg-macros | 0.6.3 | MIT |
 | peg-runtime | 0.6.3 | MIT |
@@ -343,6 +340,7 @@ repository.
 | pkcs8 | 0.10.2 | Apache-2.0 OR MIT |
 | polling | 3.11.0 | Apache-2.0 OR MIT |
 | portable-atomic | 1.13.1 | Apache-2.0 OR MIT |
+| portable-pty | 0.9.0 | MIT |
 | potential_utf | 0.1.5 | Unicode-3.0 |
 | powerfmt | 0.2.0 | MIT OR Apache-2.0 |
 | ppv-lite86 | 0.2.21 | MIT OR Apache-2.0 |
@@ -362,7 +360,6 @@ repository.
 | rand_chacha | 0.9.0 | MIT OR Apache-2.0 |
 | rand_core | 0.6.4 | MIT OR Apache-2.0 |
 | rand_core | 0.9.5 | MIT OR Apache-2.0 |
-| ratatui | 0.29.0 | MIT |
 | ratatui | 0.30.2 | MIT |
 | ratatui-core | 0.1.2 | MIT |
 | ratatui-crossterm | 0.1.2 | MIT |
@@ -422,9 +419,12 @@ repository.
 | serde_urlencoded | 0.7.1 | MIT/Apache-2.0 |
 | serde_with | 3.21.0 | MIT OR Apache-2.0 |
 | serde_with_macros | 3.21.0 | MIT OR Apache-2.0 |
+| serial2 | 0.2.37 | BSD-2-Clause OR Apache-2.0 |
 | sha1 | 0.10.6 | MIT OR Apache-2.0 |
 | sha2 | 0.10.9 | MIT OR Apache-2.0 |
 | sharded-slab | 0.1.7 | MIT |
+| shared_library | 0.1.9 | Apache-2.0/MIT |
+| shell-words | 1.1.1 | MIT/Apache-2.0 |
 | shlex | 2.0.1 | MIT OR Apache-2.0 |
 | signal-hook | 0.3.18 | Apache-2.0/MIT |
 | signal-hook-mio | 0.2.5 | MIT OR Apache-2.0 |
@@ -444,9 +444,7 @@ repository.
 | stable_deref_trait | 1.2.1 | MIT OR Apache-2.0 |
 | static_assertions | 1.1.0 | MIT OR Apache-2.0 |
 | strsim | 0.11.1 | MIT |
-| strum | 0.26.3 | MIT |
 | strum | 0.28.0 | MIT |
-| strum_macros | 0.26.4 | MIT |
 | strum_macros | 0.28.0 | MIT |
 | subtle | 2.6.1 | BSD-3-Clause |
 | symlink | 0.1.0 | MIT/Apache-2.0 |
@@ -515,10 +513,8 @@ repository.
 | unicode-ident | 1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 |
 | unicode-linebreak | 0.1.5 | Apache-2.0 |
 | unicode-segmentation | 1.13.3 | MIT OR Apache-2.0 |
-| unicode-truncate | 1.1.0 | MIT OR Apache-2.0 |
 | unicode-truncate | 2.0.1 | MIT OR Apache-2.0 |
-| unicode-width | 0.1.14 | MIT OR Apache-2.0 |
-| unicode-width | 0.2.0 | MIT OR Apache-2.0 |
+| unicode-width | 0.2.2 | MIT OR Apache-2.0 |
 | unicode-xid | 0.2.6 | MIT OR Apache-2.0 |
 | untrusted | 0.9.0 | ISC |
 | ureq | 2.12.1 | MIT OR Apache-2.0 |
@@ -529,6 +525,8 @@ repository.
 | uuid | 1.23.3 | Apache-2.0 OR MIT |
 | valuable | 0.1.1 | MIT |
 | version_check | 0.9.5 | MIT/Apache-2.0 |
+| vt100 | 0.16.2 | MIT |
+| vte | 0.15.0 | Apache-2.0 OR MIT |
 | vtparse | 0.6.2 | MIT |
 | walkdir | 2.5.0 | Unlicense/MIT |
 | want | 0.3.1 | MIT |
@@ -592,6 +590,7 @@ repository.
 | windows_x86_64_msvc | 0.53.1 | MIT OR Apache-2.0 |
 | winnow | 0.7.15 | MIT |
 | winnow | 1.0.3 | MIT |
+| winreg | 0.10.1 | MIT |
 | wiremock | 0.6.5 | MIT/Apache-2.0 |
 | wit-bindgen | 0.57.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | writeable | 0.6.3 | Unicode-3.0 |

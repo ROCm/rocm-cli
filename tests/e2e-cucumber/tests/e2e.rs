@@ -16,10 +16,12 @@ use tempfile::TempDir;
 
 mod e2e {
     pub mod chat_steps;
+    pub mod dash_steps;
     pub mod diagnose_steps;
     pub mod examine_steps;
     pub mod runtime_steps;
     pub mod serving_steps;
+    pub mod tui_driver;
 }
 
 // ── World ──────────────────────────────────────────────────────────
@@ -54,6 +56,15 @@ pub struct E2eWorld {
     /// fail fast instead of burning the full cold-start window. `None` → the
     /// step's default / `E2E_SERVE_TIMEOUT_SECS`.
     pub serve_timeout_override: Option<u64>,
+    /// The interactive dash/chat TUI spawned under a pseudo-terminal for this
+    /// scenario, if any (see `e2e::tui_driver`). Torn down in `Drop` before the
+    /// mock server and isolated directory so the child process never outlives
+    /// the scenario. `None` for the non-interactive (piped `Command`) scenarios.
+    pub tui: Option<e2e::tui_driver::TuiSession>,
+    /// Set by the "interactive chat uses an offline assistant" step so the chat
+    /// launch step knows to pass `--chat-mock` (deterministic offline agent, no
+    /// endpoint detection) instead of driving the real detection/consent path.
+    pub chat_use_mock: bool,
 }
 
 /// Resolve a CI-provided shared-directory env var to a validated, existing path.
@@ -155,17 +166,26 @@ impl Default for E2eWorld {
             isolated_root: Some(root),
             legacy_rocm_path: None,
             serve_timeout_override: None,
+            tui: None,
+            chat_use_mock: false,
         }
     }
 }
 
 impl E2eWorld {
-    pub fn isolate_cmd(&self, cmd: &mut std::process::Command) {
+    /// The isolation/behaviour environment every spawned `rocm` gets, as owned
+    /// `(key, value)` pairs. One source of truth for both the piped
+    /// `std::process::Command` path (`isolate_cmd`) and the pseudo-terminal path
+    /// (`tui_driver`, whose `portable_pty::CommandBuilder` has its own env API and
+    /// can't take a `std::process::Command`) — so the interactive and
+    /// non-interactive spawns can never drift.
+    pub fn isolate_env(&self) -> Vec<(&'static str, std::ffi::OsString)> {
+        let mut env = Vec::new();
         if let Some(root) = &self.isolated_root {
             let root = root.path();
-            cmd.env("ROCM_CLI_CONFIG_DIR", root.join("config"));
-            cmd.env("ROCM_CLI_DATA_DIR", root.join("data"));
-            cmd.env("ROCM_CLI_CACHE_DIR", root.join("cache"));
+            env.push(("ROCM_CLI_CONFIG_DIR", root.join("config").into_os_string()));
+            env.push(("ROCM_CLI_DATA_DIR", root.join("data").into_os_string()));
+            env.push(("ROCM_CLI_CACHE_DIR", root.join("cache").into_os_string()));
         }
         // Share only STATE-FREE, content-addressed caches across scenarios when
         // CI provides a persistent shared dir (see shared_cache_dir): HF model
@@ -174,21 +194,21 @@ impl E2eWorld {
         // runtimes or engine envs — those carry state the suite asserts on (see
         // the note in `default()`).
         if let Some(shared) = shared_cache_dir() {
-            cmd.env("HF_HOME", shared.join("huggingface"));
-            cmd.env("PIP_CACHE_DIR", shared.join("pip"));
+            env.push(("HF_HOME", shared.join("huggingface").into_os_string()));
+            env.push(("PIP_CACHE_DIR", shared.join("pip").into_os_string()));
         }
         // Share uv's content-addressed download/build cache (the wheels `rocm
         // install sdk` fetches) so only the first scenario pays the cold download.
         // Independent of the weights cache above so CI can host it on a larger
         // disk; the runtimes registry the suite asserts on stays isolated.
         if let Some(uv_cache) = shared_uv_cache_dir() {
-            cmd.env("UV_CACHE_DIR", uv_cache);
+            env.push(("UV_CACHE_DIR", uv_cache.into_os_string()));
         }
         // A scenario that planted a fake pre-existing ROCm install points the
         // CLI's legacy-ROCm probe at it via ROCM_PATH, so `rocm examine` detects
         // "unmanaged ROCm" hermetically on any platform (see plant_unmanaged_rocm).
         if let Some(path) = &self.legacy_rocm_path {
-            cmd.env("ROCM_PATH", path);
+            env.push(("ROCM_PATH", path.clone().into_os_string()));
         }
         // When a scenario declares a longer serve-readiness window (via a
         // `@serve-timeout:<secs>` tag → serve_timeout_override), also raise the
@@ -199,7 +219,14 @@ impl E2eWorld {
         // would kill the server first. Keeping the two in lockstep makes the
         // big-model serve actually reach ready (verified on MI300X with Qwen3.6-27B).
         if let Some(secs) = self.serve_timeout_override {
-            cmd.env("ROCM_CLI_VLLM_READY_TIMEOUT_SECS", secs.to_string());
+            env.push(("ROCM_CLI_VLLM_READY_TIMEOUT_SECS", secs.to_string().into()));
+        }
+        env
+    }
+
+    pub fn isolate_cmd(&self, cmd: &mut std::process::Command) {
+        for (key, value) in self.isolate_env() {
+            cmd.env(key, value);
         }
     }
 
@@ -283,6 +310,12 @@ impl E2eWorld {
 
 impl Drop for E2eWorld {
     fn drop(&mut self) {
+        // Kill/reap any interactive TUI child FIRST — before the mock server it
+        // may be talking to stops and before the isolated dir it reads is
+        // removed — so it never outlives the scenario or races teardown.
+        if let Some(tui) = self.tui.take() {
+            drop(tui);
+        }
         if let Some(mock) = self.mock.take() {
             mock.stop();
         }
