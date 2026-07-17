@@ -4,9 +4,9 @@
 **Pipeline:** standard
 **Branch:** fix-xpass-non-fatal-flaky (worktree active)
 **Jira:** EAI-7456 (In Progress, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-17 (idle flush)
+**Last Updated:** 2026-07-17
 
-**Token Usage:** in=388 out=87761 cache_create=743329 cache_read=22669324 calls=176
+**Token Usage:** in=402 out=91813 cache_create=953594 cache_read=23617635 calls=183
 
 ---
 
