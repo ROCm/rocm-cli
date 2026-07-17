@@ -135,6 +135,58 @@ fix-2-unset-override --dry-run` panics (rc=101) — a dry-run should never panic
 - 📋 Task #5: Reduce mock lane per-scenario overhead (fixed overhead ~4.8s/scenario, multiply across 12).
 - 📋 FILE separately: `fix fix-2-unset-override --dry-run` panics rc=101 (a dry-run should never panic).
 
+## Efficiency roadmap — fundamental levers (2026-07-17, discussed with user)
+
+Stepping back from point-fixes: E2E wall-clock is dominated by REAL model serving
+(cold weight load + engine startup + GPU ready), run serially on scarce hardware.
+The levers below attack that from three angles — fewer real serves, cheaper real
+serves, less-frequent real serves. Ordered by leverage. (R-prefixed to avoid clashing
+with Task #1–5 above; R2/R4 overlap Task #4/#2 respectively — reconcile, don't dup.)
+
+**Cheaper serves — smallest model (R1–R3):**
+- 📋 R1 — Audit every GPU serve scenario: map scenario → current model → smallest
+  viable model. Baseline: lemonade already uses `Qwen3-0.6B-GGUF` (smallest recipe);
+  vLLM path uses `Qwen2.5-1.5B-Instruct` but code notes `Qwen2.5-0.5B` is the smallest
+  vLLM-preferred entry.
+- 📋 R2 — Switch vLLM serve target 1.5B → 0.5B (host_serve_target in serving_steps.rs);
+  verify it still resolves to vLLM on Instinct. **Overlaps Task #4** (Strix Qwen
+  variant decision) — settle the "latest vs smallest" call once, apply to both.
+- 📋 R3 — Document the policy: any GPU serve scenario uses the smallest model that
+  satisfies its assertion; large-model behavior is `@nightly` only.
+
+**Fewer real serves — mock/real split (R4–R6, biggest structural win):**
+- 📋 R4 — Classify every `@requires-gpu` scenario: genuinely-needs-real-inference vs
+  only-tests-CLI-behavior. Hypothesis (validate against assertions): MUST be real =
+  serve-vllm-inference, serve-lemonade-inference, serve-default-engine-inference (6b),
+  serve-readiness-contract (8), serve-large-model-inference (nightly), chat-end-to-end,
+  chat-tool-definitions. MOCKABLE = serve-default-engine-working-endpoint (6),
+  serve-vllm-default-on-instinct (9), examine-detects-gpu-and-driver (3),
+  examine-distinguishes-unmanaged-rocm (4), runtime-path-not-nested (3).
+- 📋 R5 — Design a faithful mock serve engine (extends existing mock_server.rs +
+  register_mock_service): must mimic serve plan / /v1/models / /v1/chat/completions so
+  behavioral scenarios pass identically without a GPU. Risk: mock/real drift kills E2E
+  confidence — keep a small real-serve smoke set to catch it.
+- 📋 R6 — Migrate mockable scenarios off GPU (drop `@requires-gpu` → hosted/parallel/
+  per-push); keep only genuine real-inference scenarios on GPU/Strix. No coverage loss.
+  Depends on R4+R5.
+
+**Less-frequent real serves — schedule (R7–R8):**
+- 📋 R7 — Gate the heavy real-GPU serve matrix to `merge_group` only (not per push),
+  BUT keep ONE minimal real serve on `pull_request` as a pre-merge canary (user's
+  mitigation, so a broken serve is caught on the PR, not after it enters the queue).
+  Prereqs: fix the Strix-Windows flake first (merge-time flakes bounce good PRs);
+  verify no moved job is a required check (would stall the queue). **Overlaps Task #2**
+  (tiering) — same lever, reconcile.
+- 📋 R8 — Add a narrow `serve` paths-filter (engines/**, apps/rocm serve code,
+  crates/rocm-core, **/*.feature, e2e-cucumber + broad-dep safety nets) so Rust-but-
+  not-serve PRs (dash-only, unrelated crates) skip the GPU matrix. Today the coarse
+  `heavy` filter trips the whole matrix on ANY `.rs`. Err toward inclusion.
+
+**Dropped (user, 2026-07-17):** "serve once, assert many" (shared serve fixture) —
+sacrifices scenario independence for a gain the smallest-model + mock split already
+capture more cleanly. **Capacity** = user adds hardware when available (near-maxed:
+2nd MI300X runner added, Strix boxes physically 1-each).
+
 ## Next Steps
 
 - Tasks #1 (merged PR #126) + #3 (PR #127 open) done. Post-merge cleanup deferred; Tasks #2/#4/#5 still tracked on this WIP.
