@@ -22,7 +22,9 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, BorderType, Borders, Padding};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Padding, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 
 use crate::ui::theme::Theme;
 
@@ -218,6 +220,72 @@ pub fn popup(f: &mut Frame, area: Rect, title: &str, theme: &Theme) -> Rect {
     render_box(f, area, Some(title), BoxRole::Primary, false, theme, true)
 }
 
+/// Draw a vertical scrollbar on the right edge of `area` when content overflows.
+///
+/// Returns the content rect: `area` shrunk one column on the right when a bar is
+/// drawn, or `area` unchanged when everything fits. Pure draw — the caller owns
+/// `position` (first visible line) and clamps it. `content_len` is the total
+/// scrollable units, `viewport_len` the visible units.
+#[must_use]
+pub fn vertical_scrollbar(
+    f: &mut Frame,
+    area: Rect,
+    content_len: usize,
+    viewport_len: usize,
+    position: usize,
+    theme: &Theme,
+) -> Rect {
+    if content_len <= viewport_len || area.width < 2 || area.height == 0 {
+        return area;
+    }
+    let mut sb = ScrollbarState::new(content_len)
+        .viewport_content_length(viewport_len)
+        .position(position);
+    let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .thumb_style(Style::default().fg(theme.accent))
+        .track_style(Style::default().fg(theme.border));
+    f.render_stateful_widget(bar, area, &mut sb);
+    Rect {
+        width: area.width - 1,
+        ..area
+    }
+}
+
+/// Draw a horizontal scrollbar on the bottom edge of `area` when content is
+/// wider than the viewport.
+///
+/// Returns the content rect: `area` shrunk one row at the bottom when a bar is
+/// drawn, or `area` unchanged when everything fits. `content_len` is the widest
+/// content column count, `viewport_len` the visible column count.
+#[must_use]
+pub fn horizontal_scrollbar(
+    f: &mut Frame,
+    area: Rect,
+    content_len: usize,
+    viewport_len: usize,
+    position: usize,
+    theme: &Theme,
+) -> Rect {
+    if content_len <= viewport_len || area.height < 2 || area.width == 0 {
+        return area;
+    }
+    let mut sb = ScrollbarState::new(content_len)
+        .viewport_content_length(viewport_len)
+        .position(position);
+    let bar = Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .thumb_style(Style::default().fg(theme.accent))
+        .track_style(Style::default().fg(theme.border));
+    f.render_stateful_widget(bar, area, &mut sb);
+    Rect {
+        height: area.height - 1,
+        ..area
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +386,47 @@ mod tests {
                 let _ = bento(f, f.area(), Some("x"), BoxRole::Neutral, false, &theme);
             });
         }
+    }
+
+    fn draw_scrollbar<F: FnOnce(&mut Frame) -> Rect>(w: u16, h: u16, f: F) -> Rect {
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut got = Rect::new(0, 0, 0, 0);
+        term.draw(|frame| got = f(frame)).unwrap();
+        got
+    }
+
+    #[test]
+    fn vertical_scrollbar_noops_when_content_fits() {
+        let theme = Theme::default_dark();
+        let area = Rect::new(0, 0, 20, 10);
+        // 8 lines into a 10-row viewport: everything fits, no bar, rect intact.
+        let got = draw_scrollbar(20, 10, |f| vertical_scrollbar(f, area, 8, 10, 0, &theme));
+        assert_eq!(got, area, "no scrollbar → content rect unchanged");
+    }
+
+    #[test]
+    fn vertical_scrollbar_shrinks_when_overflowing() {
+        let theme = Theme::default_dark();
+        let area = Rect::new(0, 0, 20, 10);
+        // 50 lines into a 10-row viewport → bar drawn, rect loses a column.
+        let got = draw_scrollbar(20, 10, |f| vertical_scrollbar(f, area, 50, 10, 0, &theme));
+        assert_eq!(
+            got.width, 19,
+            "content rect shrinks by the scrollbar column"
+        );
+        assert_eq!(got.height, area.height, "height unchanged for vertical bar");
+    }
+
+    #[test]
+    fn horizontal_scrollbar_shrinks_height_when_overflowing() {
+        let theme = Theme::default_dark();
+        let area = Rect::new(0, 0, 20, 10);
+        let got = draw_scrollbar(20, 10, |f| {
+            horizontal_scrollbar(f, area, 200, 20, 0, &theme)
+        });
+        assert_eq!(got.height, 9, "content rect shrinks by the scrollbar row");
+        assert_eq!(got.width, area.width, "width unchanged for horizontal bar");
     }
 
     #[test]

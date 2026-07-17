@@ -494,6 +494,13 @@ pub struct AppState {
     /// Last drawn right-dock rect (wide layout, operational tabs). `None` when the
     /// dock isn't showing logs. Mouse-wheel hit-tests resolve against it.
     pub last_dock_area: Option<ratatui::layout::Rect>,
+    /// Scrollbars drawn this frame, recorded so a mouse click/drag can hit-test
+    /// them. Cleared and repopulated every `ui::draw`; interior-mutable because
+    /// the deep render fns hold `&AppState`.
+    pub scrollbars: std::cell::RefCell<Vec<ScrollbarHandle>>,
+    /// The scrollbar currently being dragged (mouse held down on a track), so
+    /// pointer moves keep updating that offset until release.
+    pub scroll_drag: Option<ScrollTarget>,
     /// Chat transcript (TUI-local; never travels over the daemon protocol).
     pub chat: Vec<ChatTurn>,
     /// Pending input buffer for the Chat tab.
@@ -667,6 +674,8 @@ impl AppState {
             tick_count: 0,
             dock_logs_scroll: 0,
             last_dock_area: None,
+            scrollbars: std::cell::RefCell::new(Vec::new()),
+            scroll_drag: None,
             chat: Vec::new(),
             chat_input: String::new(),
             chat_sending: false,
@@ -809,17 +818,25 @@ impl AppState {
     }
 
     /// Pan the active job console. `dv`/`dh` are line/column deltas (negative =
-    /// up/left). Clamps at 0; the vertical offset is also clamped against the
-    /// active job's line count so it can't scroll past the end into blank space.
+    /// up/left). Clamps at 0; the vertical offset is clamped against the active
+    /// job's line count and the horizontal offset against its widest line, so it
+    /// can't scroll past the content into blank space in either axis.
     pub(crate) fn scroll_console(&mut self, dv: i16, dh: i16) {
-        let max_v = self
-            .active_job_id()
-            .and_then(|id| self.jobs.job(id))
-            .map_or(0, |j| j.output.len().saturating_sub(1));
+        let job = self.active_job_id().and_then(|id| self.jobs.job(id));
+        let max_v = job.map_or(0, |j| j.output.len().saturating_sub(1));
         let max_v = i32::try_from(max_v).unwrap_or(i32::MAX);
+        let max_h = job.map_or(0, |j| {
+            j.output
+                .iter()
+                .map(|l| l.chars().count())
+                .max()
+                .unwrap_or(0)
+                .saturating_sub(1)
+        });
+        let max_h = i32::try_from(max_h).unwrap_or(i32::MAX);
         let v = u16::try_from((i32::from(self.console_scroll) + i32::from(dv)).clamp(0, max_v))
             .unwrap_or(u16::MAX);
-        let h = u16::try_from((i32::from(self.console_hscroll) + i32::from(dh)).max(0))
+        let h = u16::try_from((i32::from(self.console_hscroll) + i32::from(dh)).clamp(0, max_h))
             .unwrap_or(u16::MAX);
         self.console_scroll = v;
         self.console_hscroll = h;
@@ -842,6 +859,42 @@ impl AppState {
         self.dock_logs_scroll =
             u16::try_from((i32::from(self.dock_logs_scroll) + i32::from(dv)).clamp(0, max))
                 .unwrap_or(u16::MAX);
+    }
+
+    /// Arm a scrollbar drag and jump the target surface to `position` (already
+    /// in the target's own offset units — the caller inverts the tail-anchored
+    /// dock). Idempotent, so pointer moves during a drag reuse it.
+    pub(crate) fn apply_scroll_grab(&mut self, target: ScrollTarget, position: usize) {
+        self.scroll_drag = Some(target);
+        let p = u16::try_from(position).unwrap_or(u16::MAX);
+        match target {
+            ScrollTarget::Console => self.console_scroll = p,
+            ScrollTarget::ConsoleH => self.console_hscroll = p,
+            ScrollTarget::Chat => self.chat_scroll = p,
+            ScrollTarget::BenchDetail => self.bench_detail_scroll = p,
+            ScrollTarget::DockLogs => self.dock_logs_scroll = p,
+        }
+    }
+
+    /// Record a scrollbar drawn this frame for later mouse hit-testing.
+    ///
+    /// `area` is the rect passed to the scrollbar helper and `drawn` its return
+    /// value; when they're equal no bar was drawn (content fit) and nothing is
+    /// recorded. The 1-cell track strip is derived from `area` and `horizontal`.
+    pub(crate) fn record_scrollbar(
+        &self,
+        area: ratatui::layout::Rect,
+        drawn: ratatui::layout::Rect,
+        horizontal: bool,
+        content_len: usize,
+        viewport_len: usize,
+        target: ScrollTarget,
+    ) {
+        if let Some(h) =
+            ScrollbarHandle::new(area, drawn, horizontal, content_len, viewport_len, target)
+        {
+            self.scrollbars.borrow_mut().push(h);
+        }
     }
 
     /// Whether any operational manager overlay is open (approval excluded — it
@@ -2540,6 +2593,8 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
         KeyAction::ScrollModal(_) => {}
         KeyAction::ScrollConsole(dv, dh) => state.scroll_console(dv, dh),
         KeyAction::ScrollDock(dv) => state.scroll_dock(dv),
+        KeyAction::ScrollGrab(target, pos) => state.apply_scroll_grab(target, pos),
+        KeyAction::ScrollRelease => state.scroll_drag = None,
         KeyAction::ReplayTogglePause => {
             if let Some(r) = state.replay.as_mut() {
                 r.paused = !r.paused;
@@ -2592,8 +2647,53 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
 
 /// Translate a mouse event into a `KeyAction` using whatever state context
 /// is needed (last drawn areas, active tab, current modal).
+/// Position (in the target's own offset units) for a scrollbar grabbed at
+/// `(col, row)`, inverting for the tail-anchored dock so dragging down scrolls
+/// toward older lines.
+fn grab_position(h: &ScrollbarHandle, col: u16, row: u16) -> usize {
+    let pos = h.position_at(col, row);
+    if h.target == ScrollTarget::DockLogs {
+        h.content_len
+            .saturating_sub(h.viewport_len)
+            .saturating_sub(pos)
+    } else {
+        pos
+    }
+}
+
+/// If `(col, row)` lands on a recorded scrollbar track, the grab action for it.
+fn scrollbar_hit(state: &AppState, col: u16, row: u16) -> Option<KeyAction> {
+    let bars = state.scrollbars.borrow();
+    let h = bars.iter().find(|h| point_in(h.track, col, row))?;
+    Some(KeyAction::ScrollGrab(h.target, grab_position(h, col, row)))
+}
+
 fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
+    // A held drag on a scrollbar keeps updating that offset until release, even
+    // when the pointer slides off the narrow track.
+    if me.kind == MouseEventKind::Drag(MouseButton::Left) {
+        if let Some(t) = state.scroll_drag
+            && let Some(h) = state.scrollbars.borrow().iter().find(|h| h.target == t)
+        {
+            return KeyAction::ScrollGrab(t, grab_position(h, me.column, me.row));
+        }
+        return KeyAction::Nothing;
+    }
+    // Any button release ends an active scrollbar drag.
+    if matches!(me.kind, MouseEventKind::Up(_)) {
+        return if state.scroll_drag.is_some() {
+            KeyAction::ScrollRelease
+        } else {
+            KeyAction::Nothing
+        };
+    }
+
     if me.kind == MouseEventKind::Down(MouseButton::Left) {
+        // Scrollbar tracks win over everything (incl. an open overlay's console
+        // bar), so a click on the bar grabs it instead of falling through.
+        if let Some(a) = scrollbar_hit(state, me.column, me.row) {
+            return a;
+        }
         if let Some(area) = state.last_tab_bar_area
             && let Some(tab) = tab_bar_hit(area, me.column, me.row)
         {
@@ -2720,6 +2820,88 @@ pub struct FooterChip {
     pub action: KeyAction,
 }
 
+/// Which scrollable surface a drawn scrollbar controls. Lets a mouse click on a
+/// scrollbar track write the right offset field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollTarget {
+    /// Job console vertical (`console_scroll`).
+    Console,
+    /// Job console horizontal (`console_hscroll`).
+    ConsoleH,
+    /// Wide-layout LOGS dock (`dock_logs_scroll`, tail-anchored / inverted).
+    DockLogs,
+    /// Bench row detail modal (`bench_detail_scroll`).
+    BenchDetail,
+    /// Chat transcript (`chat_scroll`).
+    Chat,
+}
+
+/// A scrollbar drawn this frame, recorded so a mouse click/drag can hit-test it.
+///
+/// `track` is the screen rect of the bar; `content_len`/`viewport_len` size the
+/// thumb; `target` says which offset to move. Vertical bars map the mouse row,
+/// horizontal bars the column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollbarHandle {
+    pub track: ratatui::layout::Rect,
+    pub horizontal: bool,
+    pub content_len: usize,
+    pub viewport_len: usize,
+    pub target: ScrollTarget,
+}
+
+impl ScrollbarHandle {
+    /// Build a handle from the rect passed to a scrollbar helper (`area`) and its
+    /// returned content rect (`drawn`). Returns `None` when they're equal — i.e.
+    /// no bar was drawn because the content fit — so nothing gets hit-tested.
+    pub(crate) fn new(
+        area: ratatui::layout::Rect,
+        drawn: ratatui::layout::Rect,
+        horizontal: bool,
+        content_len: usize,
+        viewport_len: usize,
+        target: ScrollTarget,
+    ) -> Option<Self> {
+        if drawn == area {
+            return None;
+        }
+        let track = if horizontal {
+            ratatui::layout::Rect::new(area.x, area.y + area.height - 1, area.width, 1)
+        } else {
+            ratatui::layout::Rect::new(area.x + area.width - 1, area.y, 1, area.height)
+        };
+        Some(Self {
+            track,
+            horizontal,
+            content_len,
+            viewport_len,
+            target,
+        })
+    }
+
+    /// Map an absolute mouse `(col, row)` to a clamped scroll position over
+    /// `0..=(content_len - viewport_len)`, proportional to where along the track
+    /// the pointer sits. Off-axis coordinates are ignored.
+    fn position_at(&self, col: u16, row: u16) -> usize {
+        let max_pos = self.content_len.saturating_sub(self.viewport_len);
+        if max_pos == 0 {
+            return 0;
+        }
+        let (coord, start, span) = if self.horizontal {
+            (col, self.track.x, self.track.width)
+        } else {
+            (row, self.track.y, self.track.height)
+        };
+        if span <= 1 {
+            return 0;
+        }
+        let rel = coord.saturating_sub(start).min(span - 1);
+        // Proportional: last cell of the track = max position.
+        let pos = usize::from(rel) * max_pos / usize::from(span - 1);
+        pos.min(max_pos)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyAction {
     Nothing,
@@ -2754,6 +2936,12 @@ pub enum KeyAction {
     /// Scroll the wide-layout right LOGS dock by N lines (negative = toward the
     /// newest line). No-op when the dock isn't showing.
     ScrollDock(i16),
+    /// Grab a scrollbar and jump its surface to `position` (first visible unit).
+    /// Emitted on a click or drag over a scrollbar track; also arms drag so
+    /// subsequent moves keep tracking the pointer.
+    ScrollGrab(ScrollTarget, usize),
+    /// Release the active scrollbar drag (mouse button up).
+    ScrollRelease,
     /// Toggle replay pause / resume. No-op when not replaying.
     ReplayTogglePause,
     /// Step replay speed up or down (clamped). No-op when not replaying.
@@ -3361,6 +3549,72 @@ mod tests {
     }
 
     #[test]
+    fn scrollbar_position_maps_proportionally() {
+        let h = ScrollbarHandle {
+            track: Rect::new(50, 0, 1, 10),
+            horizontal: false,
+            content_len: 100,
+            viewport_len: 10,
+            target: ScrollTarget::Console,
+        };
+        // max position = 90; top of track → 0, last cell (row 9) → 90.
+        assert_eq!(h.position_at(50, 0), 0);
+        assert_eq!(h.position_at(50, 9), 90);
+        assert_eq!(h.position_at(50, 5), 90 * 5 / 9);
+        // Below the track clamps to the last cell.
+        assert_eq!(h.position_at(50, 99), 90);
+    }
+
+    #[test]
+    fn scrollbar_click_grabs_drag_scrolls_then_releases() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.scrollbars.borrow_mut().push(ScrollbarHandle {
+            track: Rect::new(60, 0, 1, 10),
+            horizontal: false,
+            content_len: 100,
+            viewport_len: 10,
+            target: ScrollTarget::Console,
+        });
+        // Click near the bottom of the track → grab + jump near the end.
+        let down = wheel(MouseEventKind::Down(MouseButton::Left), 60, 9);
+        let a = resolve_mouse(down, &s);
+        assert_eq!(a, KeyAction::ScrollGrab(ScrollTarget::Console, 90));
+        apply_action(&mut s, a);
+        assert_eq!(s.console_scroll, 90);
+        assert_eq!(s.scroll_drag, Some(ScrollTarget::Console));
+        // Drag to the top — the off-axis column is ignored, so it still tracks.
+        let drag = wheel(MouseEventKind::Drag(MouseButton::Left), 40, 0);
+        let a = resolve_mouse(drag, &s);
+        assert_eq!(a, KeyAction::ScrollGrab(ScrollTarget::Console, 0));
+        apply_action(&mut s, a);
+        assert_eq!(s.console_scroll, 0);
+        // Release clears the drag.
+        let up = wheel(MouseEventKind::Up(MouseButton::Left), 40, 0);
+        let a = resolve_mouse(up, &s);
+        assert_eq!(a, KeyAction::ScrollRelease);
+        apply_action(&mut s, a);
+        assert_eq!(s.scroll_drag, None);
+    }
+
+    #[test]
+    fn dock_scrollbar_grab_inverts_tail_anchored_offset() {
+        let s = AppState::new("t".into(), "default-dark".into());
+        s.scrollbars.borrow_mut().push(ScrollbarHandle {
+            track: Rect::new(0, 0, 1, 10),
+            horizontal: false,
+            content_len: 100,
+            viewport_len: 10,
+            target: ScrollTarget::DockLogs,
+        });
+        // Top of the bar = oldest lines = fully scrolled up from the tail (max).
+        let top = resolve_mouse(wheel(MouseEventKind::Down(MouseButton::Left), 0, 0), &s);
+        assert_eq!(top, KeyAction::ScrollGrab(ScrollTarget::DockLogs, 90));
+        // Bottom of the bar = newest tail = offset 0.
+        let bot = resolve_mouse(wheel(MouseEventKind::Down(MouseButton::Left), 0, 9), &s);
+        assert_eq!(bot, KeyAction::ScrollGrab(ScrollTarget::DockLogs, 0));
+    }
+
+    #[test]
     fn wheel_over_actions_list_moves_selection_by_one() {
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.active_tab = ActiveTab::Rocm;
@@ -3458,10 +3712,10 @@ mod tests {
     #[test]
     fn scroll_console_clamps_and_tracks_output() {
         let mut s = AppState::new("t".into(), "default-dark".into());
-        // No console → clamps to 0 (max line count is 0).
+        // No console → both axes clamp to 0 (no content to pan over).
         s.scroll_console(5, 5);
         assert_eq!(s.console_scroll, 0);
-        assert_eq!(s.console_hscroll, 5, "horizontal has no upper clamp");
+        assert_eq!(s.console_hscroll, 0, "no console → horizontal clamps to 0");
         // With a console of N lines, vertical clamps to N-1.
         s.jobs.apply(rocm_dash_core::state::StateEvent::StartJob {
             id: "logs".into(),
@@ -3483,6 +3737,11 @@ mod tests {
         assert_eq!(s.console_scroll, 3, "clamped to output.len()-1 (4 lines)");
         s.scroll_console(-100, 0);
         assert_eq!(s.console_scroll, 0);
+        // Horizontal clamps to the widest line minus one ("line 0" = 6 chars).
+        s.scroll_console(0, 100);
+        assert_eq!(s.console_hscroll, 5, "clamped to max line width - 1");
+        s.scroll_console(0, -100);
+        assert_eq!(s.console_hscroll, 0);
     }
 
     #[test]

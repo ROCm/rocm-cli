@@ -47,6 +47,9 @@ use crate::ui::theme::Theme;
 
 pub fn draw(f: &mut Frame, state: &mut AppState) {
     let theme = state.theme;
+    // Scrollbar hit-test registry is rebuilt every frame from what's actually
+    // drawn, so mouse clicks resolve against the current layout.
+    state.scrollbars.borrow_mut().clear();
     // Paint the whole frame with the theme background first, so every cell of
     // empty space matches the bg instead of showing the terminal default (which
     // read as a stray black box beneath the tabs).
@@ -171,6 +174,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
 /// that point and hands control back to the launcher.
 pub fn draw_focused(f: &mut Frame, state: &mut AppState) {
     let theme = state.theme;
+    state.scrollbars.borrow_mut().clear();
     f.render_widget(
         Block::default().style(Style::default().bg(theme.bg)),
         f.area(),
@@ -226,7 +230,7 @@ fn draw_active_manager(f: &mut Frame, rect: Rect, state: &AppState, theme: &Them
     // job console here, panned by the single `console_scroll`/`console_hscroll`
     // source. Centralized so the 13 managers don't each duplicate the branch.
     if let Some(job) = state.active_job_id().and_then(|id| state.jobs.job(id)) {
-        job_console::draw_job_console(
+        let handles = job_console::draw_job_console(
             f,
             rect,
             job,
@@ -234,6 +238,7 @@ fn draw_active_manager(f: &mut Frame, rect: Rect, state: &AppState, theme: &Them
             state.tick_count,
             theme,
         );
+        state.scrollbars.borrow_mut().extend(handles);
         return;
     }
     if let Some(sm) = &state.services {

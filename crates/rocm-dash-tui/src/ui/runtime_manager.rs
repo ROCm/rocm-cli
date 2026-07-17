@@ -416,7 +416,15 @@ pub fn draw_runtime_manager(
                 .bg(theme.surface_2)
                 .add_modifier(Modifier::BOLD),
         );
-        f.render_stateful_widget(list, rows[0], &mut ls);
+        let list_area = panel::vertical_scrollbar(
+            f,
+            rows[0],
+            runtimes.len(),
+            rows[0].height as usize,
+            r.selected,
+            theme,
+        );
+        f.render_stateful_widget(list, list_area, &mut ls);
     }
 
     let msg = r.message.as_deref().unwrap_or("");

@@ -452,10 +452,26 @@ pub fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         (inner, None)
     };
 
+    let body = crate::ui::panel::vertical_scrollbar(
+        f,
+        body_area,
+        lines.len(),
+        body_area.height as usize,
+        scroll as usize,
+        theme,
+    );
+    state.record_scrollbar(
+        body_area,
+        body,
+        false,
+        lines.len(),
+        body_area.height as usize,
+        crate::app::ScrollTarget::BenchDetail,
+    );
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
-    f.render_widget(p, body_area);
+    f.render_widget(p, body);
 
     if let Some(footer) = footer_area {
         let hint = Paragraph::new(Line::from(Span::styled(
