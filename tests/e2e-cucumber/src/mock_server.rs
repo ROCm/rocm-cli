@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT
 
 use std::net::SocketAddr;
+use std::path::Path;
 
 use axum::Router;
 use axum::extract::State;
@@ -72,6 +73,49 @@ impl MockServer {
     }
 }
 
+/// Write a managed-service record pointing the CLI at a mock server on `port`.
+///
+/// Drops the JSON into `services_dir` (`<data>/services/`) exactly as `rocm serve
+/// --managed` would. Shared by the cucumber `World` and the standalone
+/// `rocm-demo-env` binary so the on-disk schema lives in one place. Black-box:
+/// plain JSON matching the CLI's on-disk schema, not a typed import from the
+/// rocm-cli crates.
+pub fn write_service_record(services_dir: &Path, model: &str, port: u16) {
+    std::fs::create_dir_all(services_dir).expect("failed to create services dir");
+
+    // The CLI only extracts host:port from `endpoint_url` and appends
+    // `/v1/models` for its readiness probe, which the mock serves.
+    let record = json!({
+        "service_id": "e2e-mock",
+        "engine": "vllm",
+        "model_ref": model,
+        "canonical_model_id": model,
+        "host": "127.0.0.1",
+        "port": port,
+        "endpoint_url": format!("http://127.0.0.1:{port}/v1"),
+        "mode": "managed",
+        "status": "ready",
+        "supervisor_pid": 0,
+        "engine_pid": null,
+        "runtime_id": null,
+        "env_id": null,
+        "device_policy": null,
+        "gpu_indices": [],
+        "engine_recipe_json": null,
+        "restart_count": 0,
+        "last_restart_unix_ms": null,
+        "manifest_path": services_dir.join("e2e-mock.json"),
+        "log_path": services_dir.join("e2e-mock.log"),
+        "engine_state_path": services_dir.join("e2e-mock.state.json"),
+        "created_at_unix_ms": 1_700_000_000_000_u64,
+    });
+    std::fs::write(
+        services_dir.join("e2e-mock.json"),
+        serde_json::to_vec_pretty(&record).expect("failed to serialize record"),
+    )
+    .expect("failed to write service record");
+}
+
 async fn handle_models(State(state): State<ServerState>) -> Json<Value> {
     Json(json!({
         "object": "list",
@@ -86,6 +130,12 @@ async fn handle_chat(Json(body): Json<Value>) -> Json<Value> {
         .unwrap_or("<missing>")
         .to_string();
 
+    // Tests assert on the request contract, not the reply text, so the default
+    // is a fixed stub. Demos (`rocm-demo-env`) set `ROCM_MOCK_CHAT_REPLY` to a
+    // realistic answer so the recorded screencast reads naturally.
+    let content = std::env::var("ROCM_MOCK_CHAT_REPLY")
+        .unwrap_or_else(|_| "This is a mock response for testing.".to_string());
+
     Json(json!({
         "id": "mock-completion-1",
         "object": "chat.completion",
@@ -94,7 +144,7 @@ async fn handle_chat(Json(body): Json<Value>) -> Json<Value> {
             "index": 0,
             "message": {
                 "role": "assistant",
-                "content": "This is a mock response for testing."
+                "content": content
             },
             "finish_reason": "stop"
         }],

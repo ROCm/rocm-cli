@@ -1,0 +1,5 @@
+# Rendered demo screencasts are generated in CI and published to the orphan
+# `media` branch (see .github/workflows/demo-gifs.yml) — never committed to the
+# source branches. This keeps the directory present so `vhs` has an output path.
+*.gif
+!.gitignore

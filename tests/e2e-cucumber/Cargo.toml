@@ -10,6 +10,12 @@ publish = false
 [lints]
 workspace = true
 
+# Standalone mock-environment runner for documentation screencasts (see
+# docs/tapes/). Reuses this crate's mock server; not part of the test harness.
+[[bin]]
+name = "rocm-demo-env"
+path = "src/bin/rocm-demo-env.rs"
+
 [dependencies]
 axum.workspace = true
 cucumber = { version = "0.23", features = ["output-json", "output-junit"] }

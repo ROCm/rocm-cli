@@ -11,6 +11,7 @@
 //! alias `cargo xtask <command>`.
 
 mod affected;
+mod demos;
 mod e2e;
 mod e2e_report;
 mod manifest;
@@ -119,6 +120,15 @@ enum Command {
         #[arg(long, conflicts_with_all = ["base", "require_verified"])]
         check_config: bool,
     },
+    /// Build the demo binaries and render the deterministic CLI and Console GIFs.
+    Demos {
+        /// Demo names to render. When omitted, renders `cli` and `console`.
+        #[arg(value_name = "DEMO")]
+        names: Vec<String>,
+        /// Use binaries already present in `ROCM_BIN_DIR` or the release target dir.
+        #[arg(long)]
+        skip_build: bool,
+    },
     /// Build the release `rocm` binary and run the cucumber-rs E2E suite.
     ///
     /// The harness resolves every scenario's expectation (pass / xfail / skip)
@@ -196,6 +206,7 @@ fn run() -> Result<()> {
                 verify_commits::run(base, require_verified)?;
             }
         }
+        Command::Demos { names, skip_build } => demos::run(&names, skip_build)?,
         Command::E2e { args } => e2e::run(&args)?,
         Command::E2eReport {
             artifacts_dir,

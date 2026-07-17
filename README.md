@@ -32,6 +32,28 @@ vLLM.
 > guarantee of stability. APIs, commands, and behavior may change without
 > notice. Intended for experimentation and early feedback only.
 
+## Demos
+
+### ROCm CLI
+
+Inspect the environment, discover engines and models, find a running service,
+and chat with a locally served model:
+
+![ROCm CLI demo](https://raw.githubusercontent.com/ROCm/rocm-cli/media/cli.gif)
+
+### ROCm Console
+
+Explore simulated GPU telemetry, model serving, and offline chat in the
+full-screen Console:
+
+![ROCm Console demo](https://raw.githubusercontent.com/ROCm/rocm-cli/media/console.gif)
+
+<!--
+The GIFs above are generated in CI and served from the orphan `media` branch;
+they are never committed to source branches. See docs/demos.md to regenerate or
+add a demo. Until the demo-gifs workflow has run once, these links 404.
+-->
+
 ## Installation
 
 The installer downloads a prebuilt bundle, verifies its SHA-256 checksum,
