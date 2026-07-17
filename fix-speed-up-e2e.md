@@ -5,7 +5,7 @@
 **Stage:** 6-implementing (Task #1 merged PR #126; Tasks #2-5 open)
 **Pipeline:** standard
 **Branch:** fix-speed-up-e2e
-**Last Updated:** 2026-07-17
+**Last Updated:** 2026-07-17 (idle flush)
 
 **Token Usage:** in=991 out=291238 cache_create=5250327 cache_read=93853352 calls=500
 
@@ -151,6 +151,10 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persist-app-dev-ci
 - Recreate with: `create_worktree.sh fix-speed-up-e2e`
 
 ## Work Log
+
+### 2026-07-17 (idle flush) — [IDLE FLUSH 6]
+
+**Session idle for 10 minutes, auto-flushing WIP state.**
 
 ### 2026-07-17 — Session review: verified PR #126 merge, reconciled overlaps between Task list and Efficiency roadmap
 
