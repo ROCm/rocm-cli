@@ -125,11 +125,9 @@ fix-2-unset-override --dry-run` panics (rc=101) — a dry-run should never panic
 - ✅ Task #1 probe (run 29529197875, Strix-Ubuntu): **VRAM fix CONFIRMED**. Serve step = 91s (pure 90s readiness wait) vs ~262s baseline → the ~120s `wait_for_free_vram` dead-time is GONE. The job's "regression" flag was a FALSE ALARM from `--name` scoped mode: platform.json recorded 0 expectations (scoped `--name` bypasses the `.filter_run` resolutions-population path; a full run records all 25). So the EAI-7423 lemonade xfail couldn't reconcile — NOT caused by my change. LESSON: `--name` breaks reconciliation; judge scoped probes by step TIMING/behavior, not the pass/fail verdict.
 - ✅ **Task #1 SHIPPED: PR #126 MERGED** into main (merge commit `e9a4b154`, 2026-07-17 ~03:03 CEST). All blocking checks green; Strix-Ubuntu lane PASS 15m37s (was 28.4m long pole). The 2 red lanes (MI300X-GPU, Strix-Windows) are non-blocking `continue-on-error` pre-existing failures, unaffected by this change (MI300X floor unchanged). Branch was rebased onto latest main before merge (commit became `a94600f`).
 
-### In Progress ⏳
-- ⏳ Task #3 scenarios: 6 BDD (diagnose/fix, mock-lane GPU-independent). Verified live in container; corrected 3 assumptions (OS-gating, env-dependence, rc codes). Ready to implement (feature + steps + expectations.toml). Should be a NEW branch off updated main.
+- ✅ **Task #3 SHIPPED: PR #127 open** (branch `test-e2e-diagnose`, off updated main, commit `5355b24` signed+signed-off). Added `diagnose.feature` (6 scenarios) + `diagnose_steps.rs` + e2e.rs module wiring; all mock-lane GPU-independent, all expect-pass (no expectations.toml entries). Container gate green: clippy `-D warnings` clean, 6/6 pass, 0 unexpected. Caught 3 test bugs by running the real binary: (a) scenario 5 "no mutation" — dry-run creates data/logs/, narrowed to managed-state dirs (runtimes/services/config); (b) scenario 2 "no match" premise unreachable on a box whose user isn't in render group (any symptom scores 45) — rewrote to "gibberish yields no HIGH-confidence match" via --json; (c) clippy `is_ok_and` + rustfmt wrap. PROCESS NOTE: commit stalls were the `cargo fmt` pre-commit hook rewriting lines, NOT signing — the "1Password unlocked / signing failed" message was a red herring; configured key = 1Password GitHub RSA, signs fine once fmt passes.
 
 ### Todo 📋
-- 📋 Task #3: Implement diagnose E2E test steps + expectations.toml (scenarios drafted + verified, ready for code). New branch off main.
 - 📋 Task #2: Rework CI tiering (per-PR vs nightly) — verify/tune existing `@nightly` split.
 - 📋 Task #4: Confirm Strix Halo Qwen variant (user decision: latest vs smallest).
 - 📋 Task #5: Reduce mock lane per-scenario overhead (fixed overhead ~4.8s/scenario, multiply across 12).
@@ -137,8 +135,7 @@ fix-2-unset-override --dry-run` panics (rc=101) — a dry-run should never panic
 
 ## Next Steps
 
-- Task #1 done + merged. Post-merge cleanup deferred: Tasks #2–5 still tracked on this WIP; branch/worktree kept for now.
-- Task #3: implement the 6 diagnose scenarios (new branch off updated main).
+- Tasks #1 (merged PR #126) + #3 (PR #127 open) done. Post-merge cleanup deferred; Tasks #2/#4/#5 still tracked on this WIP.
 - Task #4: confirm with user whether Strix Qwen should be latest variant or smallest (current: smallest).
 - Task #2: tune CI tiering alignment (review existing `@nightly` structure vs P0/P1 plan).
 

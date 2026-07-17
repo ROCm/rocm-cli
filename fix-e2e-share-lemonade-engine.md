@@ -1,9 +1,86 @@
 # WIP: Fix flaky Strix-Halo Windows E2E — share the lemonade engine across scenarios
 
-**Stage:** 2-implementation
+**Stage:** 3-diagnosis-complete-needs-decision
 **Pipeline:** standard
-**Branch:** fix-e2e-share-lemonade-engine (local-only, not pushed; off origin/main @ abb80fa)
-**Last Updated:** 2026-07-17 (idle flush)
+**Branch:** fix-e2e-share-lemonade-engine (PUSHED to origin; HEAD 03b0b9a = fix c57ed46 + diagnostics 03b0b9a)
+**Last Updated:** 2026-07-17
+
+---
+
+## ⚠️ 2026-07-17 — TWO PROBE RUNS DONE; ORIGINAL PREMISE PARTLY WRONG — READ FIRST
+
+Two scoped strix-windows dispatches (scenarios 6/7/8) with FULL diagnostics now give
+the definitive picture. **My original "share data/engines" premise was wrong on
+Windows, and the real remaining failure is a pre-existing flaky lemonade bug, not
+anything this change controls.**
+
+**Run 1 (29528158960, fix only):** 3 passed, 1 failed (scenario 8). Looked like a
+targeted win.
+**Run 2 (29538372917, fix + diagnostics):** **1 passed, 3 failed** (scenarios 6, 7, 8
+ALL failed). Same branch, opposite result → **NON-DETERMINISTIC / FLAKY**, run-to-run.
+
+**Definitive findings from the complete logs (diagnostics: serve steps now print
+STDERR+rc, share helpers log symlink OK/fallback, cucumber verbosity 1→2):**
+
+1. **Symlink sharing NEVER works on this Windows runner.** EVERY scenario (6,7,8) logs
+   `[SHARE] runtimes/engines … symlink FAILED (A required privilege is not held by the
+   client, os error 1314)`. The runner lacks `SeCreateSymbolicLinkPrivilege`, so BOTH
+   `use_shared_runtimes` AND `use_shared_engines` silently fall back to isolated dirs.
+   → The `data/engines` symlink I added is a **no-op on Windows**. So was the
+   pre-existing `data/runtimes` symlink. Sharing-by-symlink is dead here.
+
+2. **The pre-warm is the ONLY thing that actually helps** — and it does: **0 backend
+   downloads (`therock-dist`) in BOTH runs.** The lemonade engine lives at
+   `install_root/engines/lemonade` INSIDE the shared runtime tree, which persists on the
+   runner across scenarios at `$RUNNER_WORKSPACE/e2e-prewarm` regardless of symlinks. So
+   the 4.6 GB re-download IS gone. That win is real and holds.
+
+3. **The real serve failure (finally visible via STDERR) is a flaky lemonade daemon
+   bug, NOT a download/timeout and NOT my code:**
+   ```
+   Warning: could not align Lemonade ROCm channel … config set rocm_channel=stable failed (exit 1)
+   Error: Could not connect to Lemonade server (Failed to read connection).
+   Error: request_failed: Lemonade backend install failed with status exit code: 1
+   ```
+   The lemonade server flakily fails to accept the backend-install/config RPC. When it
+   comes up → serves work (run 1); when it doesn't → they fail (run 2). This is the same
+   CLASS as the known EAI-7052 lemonade-Vulkan instability on this hardware.
+
+**Why the CLI resolves the engine under the runtime tree (source):**
+`env_root_for_self_managed_engine` (apps/rocm/src/main.rs ~3248) returns
+`manifest.install_root.join("engines")` for lemonade (`engine_manages_own_runtime`).
+So lemonade's engine dir is under `data/runtimes/…/engines/lemonade`, NOT
+`data/engines/lemonade` — which is why the separate `data/engines` sharing is
+irrelevant on this platform.
+
+## DECISION NEEDED (user)
+The download-once win is real; the symlink sharing is dead on Windows; the residual
+serve failures are a pre-existing FLAKY lemonade bug affecting ALL THREE serve
+scenarios (not just 8), flipping run-to-run. Options weighed:
+1. **(RECOMMENDED)** Land pre-warm win; DROP the dead `data/engines` symlink code;
+   revert diagnostics; do NOT xfail (blanket-xfailing all 3 lemonade serves would hide
+   real coverage on the good runs). File a ticket for the flaky lemonade daemon on
+   Strix-Windows. Jobs are already continue-on-error/non-blocking.
+2. Same + add a retry around the lemonade serve (flaky daemon might survive a retry).
+3. Investigate the lemonade daemon crash on the box (jump-host access) — product bug in
+   lemonade's rocm_channel config step; likely out of scope for this test-infra branch.
+**DECISION (user, 2026-07-17): option #2** — land pre-warm win, drop dead `data/engines`
+symlink code, revert diagnostics, AND add a RETRY around the lemonade serve (the flaky
+daemon may survive a retry). File a ticket for the flaky lemonade daemon regardless.
+
+### Implementation plan for #2
+- Revert the diagnostics commit's temporary bits: cucumber verbosity 2→1; keep the
+  serve-step STDERR-in-assert change (it's a genuine improvement, low-cost) OR revert —
+  decide minimal. The `[SHARE]` eprintln logging: revert (temporary).
+- Drop `use_shared_engines()` + `shared_engines_dir()` + the `data/engines` CI export &
+  pre-warm? NO — the pre-warm `engines install lemonade` is what gives download-once and
+  MUST stay. Only the SYMLINK sharing (`use_shared_engines` call + helper) is the dead
+  no-op to remove. Keep the CI pre-warm step.
+- Add a bounded retry around the lemonade serve in serving_steps.rs (setup_lemonade_model
+  + setup_gpu_model + default-engine step) — re-run `rocm serve` once or twice on the
+  specific "Could not connect to Lemonade server" / backend-install-failed error before
+  failing the step. Keep it targeted so it doesn't mask non-lemonade failures.
+- Re-run container gate (clippy+tests, -D warnings), commit, push, re-dispatch strix-windows.
 
 ---
 
