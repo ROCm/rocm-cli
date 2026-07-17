@@ -71,8 +71,7 @@ Scenario: Non-flaky XPASS remains fatal
 - ✅ Added 5 unit tests (flaky parse/default, flaky-XPASS non-fatal, non-flaky-XPASS fatal, unexpected-FAIL always fatal, all-expected clean). `cargo test --lib` green (18 passed); clippy clean.
 
 ### Todo 📋
-- 📋 Container gate (`container-test.sh all`) — transient crates.io timeout; warm cache copied from sibling worktree, re-running offline. Gate did not complete before session end.
-- 📋 Commit + push, open PR (await gate completion).
+- 📋 Commit + push, open PR (separate, per delivery decision).
 - 📋 EAI-7455 lemonade-Windows entries: N/A here — they live on `fix-e2e-share-lemonade-engine`; that branch marks them flaky after this lands.
 
 ## Next Steps
@@ -128,4 +127,6 @@ Scenario: Non-flaky XPASS remains fatal
 - Container gate: warm `.cargo-container` (397M) copied from sibling; gate re-running offline. Did not complete before session end (ongoing background task).
 - Next: await gate → commit → push → PR (separate, per delivery decision).
 
-**2026-07-17 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+**2026-07-17 (gate verification):**
+- Container gate (`container-test.sh all`) re-run with warm 397M cargo cache from sibling worktree — **GREEN** (exit 0). Full mock E2E suite ran in Linux binary; reconciliation printed: `4 xfail (failed as expected), 0 XPASS (0 flaky, non-fatal), 0 unexpected failure(s)`. Code verified.
+- Ready: commit + push + open PR (separate, per recommendation).
