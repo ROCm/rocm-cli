@@ -2,7 +2,7 @@
 
 # WIP: Speed up E2E test suite
 
-**Stage:** 6-implementing — STAGED TASK, NOT done (PR #126 shipped; Tasks #2–#3 shipped to PR #128; Tasks #4–#11 remain)
+**Stage:** 6-implementing — STAGED TASK, NOT done (PR #126 shipped; Tasks #2–#4 shipped to PR #128; Tasks #5–#11 remain)
 **Pipeline:** standard
 **Branch:** test-e2e-smallest-serve-model (was fix-speed-up-e2e; re-branched off fresh main for Task #3 chunk)
 **Last Updated:** 2026-07-17 (idle flush)
@@ -89,8 +89,9 @@ leverage. Tasks #8–#9 are smaller/independent.
   **SHIPPED: PR #128** (commit `7579270`, signed+signed-off). Container gate green
   (clippy -D warnings, workspace tests, e2e mock lane 4 xfail/0 unexpected). GPU CI lane
   is the real verdict for the model swap.
-- 📋 Task #4 — Document the policy: any GPU serve scenario uses the smallest model that
-  satisfies its assertion; large-model behavior is `@nightly` only.
+- ✅ Task #4 — SHIPPED to PR #128 (commit `f326e93`). Added a MODEL-SIZE POLICY
+  doc-comment on host_serve_target: smallest model that satisfies the assertion; floors
+  vLLM 0.5B / lemonade 0.6B; large-model = `@nightly` only. Gate green (clippy + ws tests).
 
 **Fewer real serves — mock/real split (Tasks #5–#7, biggest structural win):**
 - 📋 Task #5 — Classify every `@requires-gpu` scenario: genuinely-needs-real-inference vs
