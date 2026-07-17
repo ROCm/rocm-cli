@@ -166,6 +166,10 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persiste-app-dev-c
 
 ## Work Log
 
+### 2026-07-17 (idle flush) — [IDLE FLUSH 4]
+
+**Session idle for 10 minutes, auto-flushing WIP state.**
+
 ### 2026-07-17 (idle flush) — [IDLE FLUSH 3]
 
 **Session idle for 10 minutes, auto-flushing WIP state.**
