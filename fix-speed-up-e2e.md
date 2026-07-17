@@ -59,9 +59,13 @@ Task #3 (`rocm diagnose`/`fix` coverage) has moved to its own WIP + branch/PR: [
 - ✅ **Task #3 SHIPPED to PR #127** — moved to its own WIP: [[test-e2e-diagnose]]. Full detail (scenarios, env-dependence saga, process notes) lives there.
 
 ### Todo 📋
-- 📋 Task #2: Rework CI tiering (per-PR vs nightly) — verify/tune existing `@nightly` split.
-- 📋 Task #4: Confirm Strix Halo Qwen variant (user decision: latest vs smallest).
-- 📋 Task #5: Reduce mock lane per-scenario overhead (fixed overhead ~4.8s/scenario, multiply across 12).
+
+The old Task #2/#4 were superseded by the **Efficiency roadmap (R1–R8)** below — same work, better framed. Do not track them separately:
+- Task #2 (CI tiering per-PR vs nightly) → **R7 + R8** (gate heavy serve matrix to `merge_group`, narrow paths-filter).
+- Task #4 (Strix Qwen variant: latest vs smallest) → **R1–R3**, decision gate is **R2** (settle "latest vs smallest" once, apply to both lemonade + vLLM).
+
+Still tracked here (not covered by the roadmap):
+- 📋 Task #5: Reduce mock lane per-scenario overhead (fixed overhead ~4.8s/scenario, multiply across 12). Distinct from R4–R6 (which moves scenarios *off* GPU, not the mock-lane fixed cost).
 - 📋 FILE separately: `fix fix-2-unset-override --dry-run` panics rc=101 (a dry-run should never panic).
 
 ## Efficiency roadmap — fundamental levers (2026-07-17, discussed with user)
@@ -118,9 +122,10 @@ capture more cleanly. **Capacity** = user adds hardware when available (near-max
 
 ## Next Steps
 
-- Tasks #1 (merged PR #126) + #3 (PR #127 open) done. Post-merge cleanup deferred; Tasks #2/#4/#5 still tracked on this WIP.
-- Task #4: confirm with user whether Strix Qwen should be latest variant or smallest (current: smallest).
-- Task #2: tune CI tiering alignment (review existing `@nightly` structure vs P0/P1 plan).
+- Tasks #1 (merged PR #126) + #3 (PR #127 open) done. Post-merge cleanup deferred. Remaining work = the Efficiency roadmap (R1–R8) + Task #5.
+- **Decision gate R2:** confirm with user whether serve targets should be latest variant or smallest (current: lemonade `Qwen3-0.6B-GGUF` smallest; vLLM 1.5B). Settle once, apply to both.
+- **Biggest structural win R4–R6:** mock/real split — classify `@requires-gpu` scenarios, build a faithful mock serve engine, migrate mockable ones off GPU.
+- **Schedule R7–R8:** gate heavy serve matrix to `merge_group` + narrow serve paths-filter (prereq: fix Strix-Windows flake first).
 
 ## Checklist
 
@@ -132,8 +137,8 @@ capture more cleanly. **Capacity** = user adds hardware when available (near-max
 ## Blockers / Open Questions
 
 - **Coverage gap on diagnose**: addressed in [[test-e2e-diagnose]] (PR #127) — no longer tracked here.
-- **Strix Halo Qwen not latest**: suite uses `Qwen3-0.6B-GGUF` (smallest GGUF recipe) on lemonade; unclear if this is the "latest variant" you intended (Task #4 decision gate).
-- **Tiering already exists**: `@nightly` gate + `E2E_INCLUDE_NIGHTLY=1` env gate already separates heavy scenarios (27B serve, cold install) from per-PR runs. Task #2 is to verify/tune this alignment, not build from scratch.
+- **Serve model: latest vs smallest** (decision gate **R2**): suite uses `Qwen3-0.6B-GGUF` (smallest GGUF recipe) on lemonade, 1.5B on vLLM; unclear if the "latest variant" is intended. Settle once, apply to both.
+- **Tiering already exists** (feeds **R7**): `@nightly` gate + `E2E_INCLUDE_NIGHTLY=1` env gate already separates heavy scenarios (27B serve, cold install) from per-PR runs. R7 verifies/tunes this alignment (merge_group gating), not build from scratch.
 - **Real bugs separate**: EAI-7423 (lemonade-on-Strix-Linux serve fails) and EAI-7052 (lemonade Vulkan instability) are tracked known bugs in `expectations.toml`, separate from the VRAM-floor waste fix (Task #1).
 
 ## Notes
