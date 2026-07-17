@@ -5,10 +5,10 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use rocm_core::{
-    AppPaths, DEFAULT_LOCAL_PORT, RocmCliConfig, active_managed_therock_channel,
-    active_managed_therock_environment, download_file_to_path, format_host_port,
-    format_http_base_url, http_get_text, normalize_runtime_path_for_host, prepend_runtime_paths,
-    require_nonempty, runtime_is_linux, runtime_is_windows,
+    AppPaths, DEFAULT_LOCAL_PORT, RocmCliConfig, active_managed_therock_environment,
+    download_file_to_path, format_host_port, format_http_base_url, http_get_text,
+    normalize_runtime_path_for_host, prepend_runtime_paths, require_nonempty, runtime_is_linux,
+    runtime_is_windows,
 };
 use rocm_engine_protocol::{
     DetectRequest, DetectResponse, DevicePolicy, ENGINE_RECIPE_CONTRACT_VERSION, EndpointRequest,
@@ -31,7 +31,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const ENGINE_NAME: &str = "lemonade";
-const LEMONADE_VERSION: &str = "10.6.0";
+const LEMONADE_VERSION: &str = "10.10.0";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_MODEL: &str = "Qwen3-4B-Instruct-2507-GGUF";
 const DEFAULT_MODEL_REPO_DIR: &str = "models--unsloth--Qwen3-4B-Instruct-2507-GGUF";
@@ -47,10 +47,10 @@ const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
 /// Prevents reading entire gigabyte-sized logs on startup timeout.
 const MAX_TAIL_READ: u64 = 4 * 1024 * 1024; // 4MB
 
-const EMBEDDABLE_WINDOWS_ARCHIVE_NAME: &str = "lemonade-embeddable-10.6.0-windows-x64.zip";
-const EMBEDDABLE_LINUX_ARCHIVE_NAME: &str = "lemonade-embeddable-10.6.0-ubuntu-x64.tar.gz";
-const EMBEDDABLE_WINDOWS_URL: &str = "https://github.com/lemonade-sdk/lemonade/releases/download/v10.6.0/lemonade-embeddable-10.6.0-windows-x64.zip";
-const EMBEDDABLE_LINUX_URL: &str = "https://github.com/lemonade-sdk/lemonade/releases/download/v10.6.0/lemonade-embeddable-10.6.0-ubuntu-x64.tar.gz";
+const EMBEDDABLE_WINDOWS_ARCHIVE_NAME: &str = "lemonade-embeddable-10.10.0-windows-x64.zip";
+const EMBEDDABLE_LINUX_ARCHIVE_NAME: &str = "lemonade-embeddable-10.10.0-ubuntu-x64.tar.gz";
+const EMBEDDABLE_WINDOWS_URL: &str = "https://github.com/lemonade-sdk/lemonade/releases/download/v10.10.0/lemonade-embeddable-10.10.0-windows-x64.zip";
+const EMBEDDABLE_LINUX_URL: &str = "https://github.com/lemonade-sdk/lemonade/releases/download/v10.10.0/lemonade-embeddable-10.10.0-ubuntu-x64.tar.gz";
 
 #[derive(Parser)]
 #[command(name = "rocm-engine-lemonade")]
@@ -396,33 +396,18 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
         .as_deref()
         .map(normalize_runtime_path_for_host);
     let mut manifest = prepare_embeddable(&paths, env_root.as_deref(), request.reinstall)?;
-    // Align Lemonade's ROCm backend channel with the ROCm the user installed via rocm-cli
-    // before backend selection, so the backend is pulled from the matching channel. This is
-    // best-effort: a failure here must not abort the engine install.
-    let aligned_channel = match align_lemonade_rocm_channel(&paths, &manifest) {
-        Ok(channel) => channel,
-        Err(error) => {
-            eprintln!(
-                "Warning: could not align Lemonade ROCm channel with installed ROCm: {error:#}"
-            );
-            None
-        }
-    };
+    // Lemonade reuses the ROCm rocm-cli already installed via the injected process
+    // environment (ROCM_PATH / rocm-sdk on PATH); no channel translation is needed.
     eprintln!("Detecting best supported Lemonade llama.cpp backend...");
     install_best_llamacpp_backend(&mut manifest)?;
     write_manifest(&paths, &manifest)?;
-    let mut warnings = vec![
+    let warnings = vec![
         "Lemonade is installed as a rocm-cli managed embeddable runtime".to_owned(),
         format!(
             "Selected the best supported llama.cpp backend for this GPU: {}:{}",
             manifest.backend_recipe, manifest.backend_name
         ),
     ];
-    if let Some(channel) = aligned_channel {
-        warnings.push(format!(
-            "Set Lemonade ROCm channel to `{channel}` to match the installed ROCm"
-        ));
-    }
     Ok(InstallResponse {
         env_id: manifest.env_id.clone(),
         env_path: manifest.runtime_dir.display().to_string(),
@@ -441,84 +426,6 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
         lock_hash: manifest_lock_hash(&manifest),
         warnings,
     })
-}
-
-/// Map a rocm-cli SDK channel (`release`/`nightly`) to Lemonade's `rocm_channel`
-/// (`stable`/`nightly`). Returns `None` for channels with no Lemonade equivalent.
-fn lemonade_rocm_channel(rocm_cli_channel: &str) -> Option<&'static str> {
-    match rocm_cli_channel.trim().to_ascii_lowercase().as_str() {
-        "release" => Some("stable"),
-        "nightly" => Some("nightly"),
-        _ => None,
-    }
-}
-
-/// Point Lemonade's ROCm backend at the channel the user installed via rocm-cli, keeping the
-/// backend binary at Lemonade's tested default (`builtin`). Returns the Lemonade channel that
-/// was applied, or `None` when there is no rocm-cli-managed ROCm runtime to mirror (Lemonade's
-/// own default is then left untouched).
-fn align_lemonade_rocm_channel(
-    paths: &AppPaths,
-    manifest: &LemonadeInstallManifest,
-) -> Result<Option<&'static str>> {
-    // Don't fall back to a default config here: an empty config would discard the active
-    // runtime key and let channel selection guess the most-recent runtime, then mutate
-    // Lemonade based on that guess. Surface the error so the caller leaves defaults untouched.
-    let config = RocmCliConfig::load(paths)?;
-    let Some(rocm_cli_channel) = active_managed_therock_channel(paths, &config)? else {
-        return Ok(None);
-    };
-    let Some(lemonade_channel) = lemonade_rocm_channel(&rocm_cli_channel) else {
-        return Ok(None);
-    };
-    let process_env = lemonade_process_environment()?;
-    // Best-effort and not transactional: if the second call fails after the first succeeds,
-    // `rocm_channel` is updated but `rocm_bin` is left as-is. Acceptable here — the caller
-    // treats any failure as a warning and `rocm_bin` defaults to `builtin` regardless.
-    run_lemonade_config_set(manifest, "rocm_channel", lemonade_channel, &process_env)?;
-    run_lemonade_config_set(manifest, "llamacpp.rocm_bin", "builtin", &process_env)?;
-    Ok(Some(lemonade_channel))
-}
-
-fn lemonade_config_set_args(key: &str, value: &str) -> Vec<String> {
-    vec![
-        "config".to_owned(),
-        "set".to_owned(),
-        format!("{key}={value}"),
-    ]
-}
-
-fn run_lemonade_config_set(
-    manifest: &LemonadeInstallManifest,
-    key: &str,
-    value: &str,
-    process_env: &LemonadeProcessEnvironment,
-) -> Result<()> {
-    let mut command = ProcessCommand::new(&manifest.lemonade);
-    command
-        .args(lemonade_config_set_args(key, value))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    apply_lemonade_process_environment(&mut command, process_env)?;
-    hide_child_console_window(&mut command);
-    let output = command
-        .output()
-        .with_context(|| format!("failed to run {}", manifest.lemonade.display()))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let detail = if stderr.trim().is_empty() {
-            stdout.trim()
-        } else {
-            stderr.trim()
-        };
-        bail!(
-            "Lemonade config set {key}={value} failed ({}): {detail}",
-            output.status
-        );
-    }
-    Ok(())
 }
 
 fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelResponse> {
@@ -622,16 +529,18 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
     if let Some(checkpoint) = parse_hf_checkpoint(&request.model_ref) {
         return serve_hf_checkpoint(&request, &runtime, &process_env, log_path, &checkpoint);
     }
-    if runtime_is_linux() && direct_llama_server_path(&runtime.manifest).is_file() {
+    if runtime_is_linux()
+        && let Some(server) = find_llama_server_binary(&runtime.manifest)
+    {
         ensure_direct_llama_model_available(&request, &runtime, &process_env, log_path)?;
-        let server = direct_llama_server_path(&runtime.manifest);
+        let backend = llama_server_backend_label(&server);
         return serve_direct_llama_server(
             &request,
             &runtime,
             &process_env,
             &server,
             log_path,
-            &anyhow!("using Lemonade packaged ROCm llama-server directly on Linux"),
+            &anyhow!("using Lemonade packaged {backend} llama-server directly on Linux"),
         );
     }
     let mut child = spawn_lemond(
@@ -679,8 +588,9 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
         && query_chat_smoke_endpoint(&request.host, request.port, &request.model_ref)
             .unwrap_or(false);
     if let Err(error) = load_result {
-        let direct_server = direct_llama_server_path(&runtime.manifest);
-        if runtime_is_linux() && direct_server.is_file() {
+        if runtime_is_linux()
+            && let Some(direct_server) = find_llama_server_binary(&runtime.manifest)
+        {
             let _ = terminate_pid(child.id(), true);
             let _ = child.wait();
             return serve_direct_llama_server(
@@ -703,8 +613,9 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
         let error = anyhow!(
             "Lemonade load completed but the endpoint did not report a {LLAMACPP_RECIPE}:{backend}-loaded model"
         );
-        let direct_server = direct_llama_server_path(&runtime.manifest);
-        if runtime_is_linux() && direct_server.is_file() {
+        if runtime_is_linux()
+            && let Some(direct_server) = find_llama_server_binary(&runtime.manifest)
+        {
             let _ = terminate_pid(child.id(), true);
             let _ = child.wait();
             return serve_direct_llama_server(
@@ -1952,15 +1863,6 @@ fn is_safe_hf_component(component: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-fn direct_llama_server_path(manifest: &LemonadeInstallManifest) -> PathBuf {
-    manifest
-        .runtime_dir
-        .join("bin")
-        .join("llamacpp")
-        .join("rocm-stable")
-        .join(platform_binary_name("llama-server"))
-}
-
 /// Packaged llama.cpp backends whose `llama-server` we can drive directly, best first.
 /// GPU backends only — `cpu` is intentionally excluded so the direct-serve path never
 /// silently serves on CPU under a GPU-required policy (AGENTS.md §6). An explicit
@@ -2897,6 +2799,37 @@ mod tests {
     }
 
     #[test]
+    fn find_llama_server_binary_follows_backend_priority() {
+        let dir = scratch_dir("find-server-priority");
+        let runtime_dir = dir.join("runtime");
+        let llamacpp = runtime_dir.join("bin").join("llamacpp");
+        let server = platform_binary_name("llama-server");
+        let install = |backend: &str| {
+            let backend_dir = llamacpp.join(backend);
+            fs::create_dir_all(&backend_dir).unwrap();
+            fs::write(backend_dir.join(&server), b"x").unwrap();
+        };
+        let manifest = test_manifest(runtime_dir);
+
+        // Nightly-only host (the resilient case that replaced the hardcoded
+        // rocm-stable direct-serve path): the nightly backend is selected over vulkan.
+        install("rocm-nightly");
+        install("vulkan");
+        assert_eq!(
+            find_llama_server_binary(&manifest),
+            Some(llamacpp.join("rocm-nightly").join(&server))
+        );
+
+        // With rocm-stable also present, it wins (highest priority).
+        install("rocm-stable");
+        assert_eq!(
+            find_llama_server_binary(&manifest),
+            Some(llamacpp.join("rocm-stable").join(&server))
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn collect_gguf_files_recurses_and_filters() {
         let dir = scratch_dir("collect-gguf");
         fs::create_dir_all(dir.join("shard")).unwrap();
@@ -3009,27 +2942,6 @@ mod tests {
                 "vulkan",
                 "--save-options",
             ]
-        );
-    }
-
-    #[test]
-    fn rocm_cli_channel_maps_to_lemonade_channel() {
-        assert_eq!(lemonade_rocm_channel("release"), Some("stable"));
-        assert_eq!(lemonade_rocm_channel("RELEASE"), Some("stable"));
-        assert_eq!(lemonade_rocm_channel(" nightly "), Some("nightly"));
-        assert_eq!(lemonade_rocm_channel("preview"), None);
-        assert_eq!(lemonade_rocm_channel(""), None);
-    }
-
-    #[test]
-    fn lemonade_config_set_builds_key_value_arg() {
-        assert_eq!(
-            lemonade_config_set_args("rocm_channel", "nightly"),
-            vec!["config", "set", "rocm_channel=nightly"]
-        );
-        assert_eq!(
-            lemonade_config_set_args("llamacpp.rocm_bin", "builtin"),
-            vec!["config", "set", "llamacpp.rocm_bin=builtin"]
         );
     }
 
