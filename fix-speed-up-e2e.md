@@ -2,7 +2,7 @@
 
 # WIP: Speed up E2E test suite
 
-**Stage:** 6-implementing — STAGED TASK, NOT done (PR #126 shipped as milestone; roadmap R1–R8 + Task #5 remain; re-branch in place for next chunk)
+**Stage:** 6-implementing — STAGED TASK, NOT done (PR #126 shipped as milestone; Tasks #2–#11 remain; re-branch in place for next chunk)
 **Pipeline:** standard
 **Branch:** fix-speed-up-e2e
 **Last Updated:** 2026-07-17
@@ -56,64 +56,60 @@ Task #3 (`rocm diagnose`/`fix` coverage) has moved to its own WIP + branch/PR: [
 - ✅ Task #1 probe (run 29529197875, Strix-Ubuntu): **VRAM fix CONFIRMED**. Serve step = 91s (pure 90s readiness wait) vs ~262s baseline → the ~120s `wait_for_free_vram` dead-time is GONE. The job's "regression" flag was a FALSE ALARM from `--name` scoped mode: platform.json recorded 0 expectations (scoped `--name` bypasses the `.filter_run` resolutions-population path; a full run records all 25). So the EAI-7423 lemonade xfail couldn't reconcile — NOT caused by my change. LESSON: `--name` breaks reconciliation; judge scoped probes by step TIMING/behavior, not the pass/fail verdict.
 - ✅ **Task #1 SHIPPED: PR #126 MERGED** into main (merge commit `e9a4b154`, 2026-07-17 ~03:03 CEST). All blocking checks green; Strix-Ubuntu lane PASS 15m37s (was 28.4m long pole). The 2 red lanes (MI300X-GPU, Strix-Windows) are non-blocking `continue-on-error` pre-existing failures, unaffected by this change (MI300X floor unchanged). Branch was rebased onto latest main before merge (commit became `a94600f`).
 
-- ✅ **Task #3 SHIPPED to PR #127** — moved to its own WIP: [[test-e2e-diagnose]]. Full detail (scenarios, env-dependence saga, process notes) lives there.
+- ✅ Diagnose/fix E2E coverage — moved to its own WIP: [[test-e2e-diagnose]] (PR #127). No longer numbered here.
 
 ### Todo 📋
 
-The old Task #2/#4 were superseded by the **Efficiency roadmap (R1–R8)** below — same work, better framed. Do not track them separately:
-- Task #2 (CI tiering per-PR vs nightly) → **R7 + R8** (gate heavy serve matrix to `merge_group`, narrow paths-filter).
-- Task #4 (Strix Qwen variant: latest vs smallest) → **R1–R3**, decision gate is **R2** (settle "latest vs smallest" once, apply to both lemonade + vLLM).
+One flat task list. E2E wall-clock is dominated by REAL model serving (cold weight load
++ engine startup + GPU ready), run serially on scarce hardware. Tasks #2–#7 attack that
+from three angles — cheaper serves, fewer serves, less-frequent serves — ordered by
+leverage. Tasks #8–#9 are smaller/independent.
 
-Still tracked here (not covered by the roadmap):
-- 📋 Task #5: Reduce mock lane per-scenario overhead (fixed overhead ~4.8s/scenario, multiply across 12). Distinct from R4–R6 (which moves scenarios *off* GPU, not the mock-lane fixed cost).
-- 📋 FILE separately: `fix fix-2-unset-override --dry-run` panics rc=101 (a dry-run should never panic).
-
-## Efficiency roadmap — fundamental levers (2026-07-17, discussed with user)
-
-Stepping back from point-fixes: E2E wall-clock is dominated by REAL model serving
-(cold weight load + engine startup + GPU ready), run serially on scarce hardware.
-The levers below attack that from three angles — fewer real serves, cheaper real
-serves, less-frequent real serves. Ordered by leverage. (R-prefixed to avoid clashing
-with Task #1–5 above; R2/R4 overlap Task #4/#2 respectively — reconcile, don't dup.)
-
-**Cheaper serves — smallest model (R1–R3):**
-- 📋 R1 — Audit every GPU serve scenario: map scenario → current model → smallest
+**Cheaper serves — smallest model (Tasks #2–#4):**
+- 📋 Task #2 — Audit every GPU serve scenario: map scenario → current model → smallest
   viable model. Baseline: lemonade already uses `Qwen3-0.6B-GGUF` (smallest recipe);
   vLLM path uses `Qwen2.5-1.5B-Instruct` but code notes `Qwen2.5-0.5B` is the smallest
   vLLM-preferred entry.
-- 📋 R2 — Switch vLLM serve target 1.5B → 0.5B (host_serve_target in serving_steps.rs);
-  verify it still resolves to vLLM on Instinct. **Overlaps Task #4** (Strix Qwen
-  variant decision) — settle the "latest vs smallest" call once, apply to both.
-- 📋 R3 — Document the policy: any GPU serve scenario uses the smallest model that
+- 📋 Task #3 — **DECISION GATE**: switch vLLM serve target 1.5B → 0.5B (host_serve_target
+  in serving_steps.rs); verify it still resolves to vLLM on Instinct. Settle the "latest
+  vs smallest" call once and apply to both lemonade + vLLM.
+- 📋 Task #4 — Document the policy: any GPU serve scenario uses the smallest model that
   satisfies its assertion; large-model behavior is `@nightly` only.
 
-**Fewer real serves — mock/real split (R4–R6, biggest structural win):**
-- 📋 R4 — Classify every `@requires-gpu` scenario: genuinely-needs-real-inference vs
+**Fewer real serves — mock/real split (Tasks #5–#7, biggest structural win):**
+- 📋 Task #5 — Classify every `@requires-gpu` scenario: genuinely-needs-real-inference vs
   only-tests-CLI-behavior. Hypothesis (validate against assertions): MUST be real =
   serve-vllm-inference, serve-lemonade-inference, serve-default-engine-inference (6b),
   serve-readiness-contract (8), serve-large-model-inference (nightly), chat-end-to-end,
   chat-tool-definitions. MOCKABLE = serve-default-engine-working-endpoint (6),
   serve-vllm-default-on-instinct (9), examine-detects-gpu-and-driver (3),
   examine-distinguishes-unmanaged-rocm (4), runtime-path-not-nested (3).
-- 📋 R5 — Design a faithful mock serve engine (extends existing mock_server.rs +
+- 📋 Task #6 — Design a faithful mock serve engine (extends existing mock_server.rs +
   register_mock_service): must mimic serve plan / /v1/models / /v1/chat/completions so
   behavioral scenarios pass identically without a GPU. Risk: mock/real drift kills E2E
   confidence — keep a small real-serve smoke set to catch it.
-- 📋 R6 — Migrate mockable scenarios off GPU (drop `@requires-gpu` → hosted/parallel/
+- 📋 Task #7 — Migrate mockable scenarios off GPU (drop `@requires-gpu` → hosted/parallel/
   per-push); keep only genuine real-inference scenarios on GPU/Strix. No coverage loss.
-  Depends on R4+R5.
+  Depends on Tasks #5+#6.
 
-**Less-frequent real serves — schedule (R7–R8):**
-- 📋 R7 — Gate the heavy real-GPU serve matrix to `merge_group` only (not per push),
-  BUT keep ONE minimal real serve on `pull_request` as a pre-merge canary (user's
-  mitigation, so a broken serve is caught on the PR, not after it enters the queue).
-  Prereqs: fix the Strix-Windows flake first (merge-time flakes bounce good PRs);
-  verify no moved job is a required check (would stall the queue). **Overlaps Task #2**
-  (tiering) — same lever, reconcile.
-- 📋 R8 — Add a narrow `serve` paths-filter (engines/**, apps/rocm serve code,
+**Less-frequent real serves — schedule (Tasks #8–#9):**
+- 📋 Task #8 — Gate the heavy real-GPU serve matrix to `merge_group` only (not per push),
+  BUT keep ONE minimal real serve on `pull_request` as a pre-merge canary (so a broken
+  serve is caught on the PR, not after it enters the queue). Prereqs: fix the
+  Strix-Windows flake first (merge-time flakes bounce good PRs); verify no moved job is a
+  required check (would stall the queue). Note: `@nightly` + `E2E_INCLUDE_NIGHTLY=1`
+  tiering already exists — this verifies/tunes it, not build from scratch.
+- 📋 Task #9 — Add a narrow `serve` paths-filter (engines/**, apps/rocm serve code,
   crates/rocm-core, **/*.feature, e2e-cucumber + broad-dep safety nets) so Rust-but-
   not-serve PRs (dash-only, unrelated crates) skip the GPU matrix. Today the coarse
   `heavy` filter trips the whole matrix on ANY `.rs`. Err toward inclusion.
+
+**Smaller / independent (Tasks #10–#11):**
+- 📋 Task #10 — Reduce mock lane per-scenario overhead (fixed overhead ~4.8s/scenario,
+  multiply across 12). Distinct from Tasks #5–#7 (which move scenarios *off* GPU, not the
+  mock-lane fixed cost).
+- 📋 Task #11 — FILE separately: `fix fix-2-unset-override --dry-run` panics rc=101 (a
+  dry-run should never panic). Not a speedup; a correctness bug found while probing.
 
 **Dropped (user, 2026-07-17):** "serve once, assert many" (shared serve fixture) —
 sacrifices scenario independence for a gain the smallest-model + mock split already
@@ -122,10 +118,10 @@ capture more cleanly. **Capacity** = user adds hardware when available (near-max
 
 ## Next Steps
 
-- Tasks #1 (merged PR #126) + #3 (PR #127 open) done. Post-merge cleanup deferred. Remaining work = the Efficiency roadmap (R1–R8) + Task #5.
-- **Decision gate R2:** confirm with user whether serve targets should be latest variant or smallest (current: lemonade `Qwen3-0.6B-GGUF` smallest; vLLM 1.5B). Settle once, apply to both.
-- **Biggest structural win R4–R6:** mock/real split — classify `@requires-gpu` scenarios, build a faithful mock serve engine, migrate mockable ones off GPU.
-- **Schedule R7–R8:** gate heavy serve matrix to `merge_group` + narrow serve paths-filter (prereq: fix Strix-Windows flake first).
+- Task #1 (merged PR #126) done; diagnose coverage moved to [[test-e2e-diagnose]] (PR #127). Post-merge cleanup deferred. Remaining work = Tasks #2–#11.
+- **Decision gate Task #3:** confirm with user whether serve targets should be latest variant or smallest (current: lemonade `Qwen3-0.6B-GGUF` smallest; vLLM 1.5B). Settle once, apply to both. Gates Tasks #2–#4.
+- **Biggest structural win Tasks #5–#7:** mock/real split — classify `@requires-gpu` scenarios, build a faithful mock serve engine, migrate mockable ones off GPU.
+- **Schedule Tasks #8–#9:** gate heavy serve matrix to `merge_group` + narrow serve paths-filter (prereq: fix Strix-Windows flake first).
 
 ## Checklist
 
@@ -137,8 +133,8 @@ capture more cleanly. **Capacity** = user adds hardware when available (near-max
 ## Blockers / Open Questions
 
 - **Coverage gap on diagnose**: addressed in [[test-e2e-diagnose]] (PR #127) — no longer tracked here.
-- **Serve model: latest vs smallest** (decision gate **R2**): suite uses `Qwen3-0.6B-GGUF` (smallest GGUF recipe) on lemonade, 1.5B on vLLM; unclear if the "latest variant" is intended. Settle once, apply to both.
-- **Tiering already exists** (feeds **R7**): `@nightly` gate + `E2E_INCLUDE_NIGHTLY=1` env gate already separates heavy scenarios (27B serve, cold install) from per-PR runs. R7 verifies/tunes this alignment (merge_group gating), not build from scratch.
+- **Serve model: latest vs smallest** (decision gate **Task #3**): suite uses `Qwen3-0.6B-GGUF` (smallest GGUF recipe) on lemonade, 1.5B on vLLM; unclear if the "latest variant" is intended. Settle once, apply to both.
+- **Tiering already exists** (feeds **Task #8**): `@nightly` gate + `E2E_INCLUDE_NIGHTLY=1` env gate already separates heavy scenarios (27B serve, cold install) from per-PR runs. Task #8 verifies/tunes this alignment (merge_group gating), not build from scratch.
 - **Real bugs separate**: EAI-7423 (lemonade-on-Strix-Linux serve fails) and EAI-7052 (lemonade Vulkan instability) are tracked known bugs in `expectations.toml`, separate from the VRAM-floor waste fix (Task #1).
 
 ## Notes
@@ -152,7 +148,14 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persist-app-dev-ci
 
 ## Work Log
 
-### 2026-07-17 — Session: WIP restructure, overlap reconciliation, staged-task framing, awaiting R2 decision
+### 2026-07-17 — Unified numbering: one flat task scheme (dropped R-prefix)
+
+- Collapsed the separate "Efficiency roadmap R1–R8" + Todo list into ONE flat task list. Dropped the "R" namespace (it only meant "Roadmap"). Everything is now Task #N.
+- Renumbering: R1–R8 → Tasks #2–#9; old Task #5 (mock-lane overhead) → Task #10; panic-bug filing → Task #11. Task #1 (VRAM, merged PR #126) keeps its number. Diagnose (old Task #3) exits this file's numbering — lives in [[test-e2e-diagnose]].
+- Decision gate is now **Task #3** (was R2): latest vs smallest serve model.
+- Updated Stage line, Next Steps, and Blockers to the new numbers.
+
+### 2026-07-17 — Session: WIP restructure, overlap reconciliation, staged-task framing, awaiting decision gate
 
 - **Moved Task #3 to own WIP:** Created [[test-e2e-diagnose]].md (PR #127 open, Stage 8-awaiting-pr-approval); trimmed parent WIP to pointer.
 - **Reconciled roadmap overlaps:** Task #2/#4 superseded by Efficiency roadmap R1–R8. Remapped Task #2→R7+R8, Task #4→R1–R3 (decision gate R2). One home per piece of work.
