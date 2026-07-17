@@ -2,7 +2,7 @@
 
 # WIP: Speed up E2E test suite
 
-**Stage:** 6-implementing (Task #1 merged PR #126; Tasks #2-5 open)
+**Stage:** 6-implementing — STAGED TASK, NOT done (PR #126 shipped as milestone; roadmap R1–R8 + Task #5 remain; re-branch in place for next chunk)
 **Pipeline:** standard
 **Branch:** fix-speed-up-e2e
 **Last Updated:** 2026-07-17 (idle flush)
