@@ -276,11 +276,10 @@ async fn setup_mock_custom_port(world: &mut E2eWorld) {
 /// `setup_lemonade_model`), but lets a scenario tagged only `@requires-gpu` run
 /// on whichever engine the platform actually uses.
 ///
-/// MODEL-SIZE POLICY: every GPU serve scenario uses the SMALLEST model that
-/// still satisfies its assertion — real GPU serves are the E2E wall-clock long
-/// pole on serial hardware, so weight-load time is pure overhead here. Current
-/// floors: vLLM `Qwen2.5-0.5B` (smallest vLLM-preferred catalog entry), lemonade
-/// `Qwen3-0.6B-GGUF` (smallest lemonade recipe). Large-model behaviour is
+/// MODEL-SIZE POLICY: GPU serve scenarios use small models that still satisfy
+/// their assertions — real GPU serves are the E2E wall-clock long pole on serial
+/// hardware, so weight-load time is pure overhead here. Current paths use vLLM
+/// `Qwen3.5-0.8B` and lemonade `Qwen3-0.6B-GGUF`. Large-model behaviour is
 /// exercised exactly once, in the `@nightly` `serve-large-model-inference`
 /// scenario (Qwen3.6-27B) — never on the per-PR path. Do not raise a serve
 /// scenario's model unless a smaller one genuinely cannot prove the assertion.
@@ -290,9 +289,8 @@ fn host_serve_target() -> (&'static str, &'static str, &'static str) {
         // Qwen3-0.6B-Q4_0.gguf, so "Qwen3-0.6B" is the distinctive substring.
         ("Qwen3-0.6B-GGUF", "lemonade", "Qwen3-0.6B")
     } else {
-        // Safetensors via vLLM; "Qwen2.5-0.5B" is the distinctive substring.
-        // Smallest vLLM-preferred catalog entry — see user_serves_vllm_capable_default.
-        ("Qwen/Qwen2.5-0.5B-Instruct", "vllm", "Qwen2.5-0.5B")
+        // Safetensors via vLLM; "Qwen3.5-0.8B" is the distinctive substring.
+        ("Qwen/Qwen3.5-0.8B", "vllm", "Qwen3.5-0.8B")
     }
 }
 
@@ -303,9 +301,9 @@ fn host_serve_target() -> (&'static str, &'static str, &'static str) {
 /// the model choice therefore determines WHICH engine runs. The default-engine
 /// xfail matrix depends on that resolution: on an Instinct host the request must
 /// resolve to a GGUF recipe on lemonade (EAI-7052 — see expectations.toml), NOT
-/// to vLLM. So this stays lemonade-preferred on every host; the smaller
-/// vLLM-preferred 0.5B size cut applies only to the explicit-vLLM path. The model
-/// hangs at load on Instinct (EAI-7052, xfail) so its size is irrelevant to
+/// to vLLM. So this stays lemonade-preferred on every host; the smaller model
+/// used by vLLM applies only to the explicit-engine path. The model hangs at load
+/// on Instinct (EAI-7052, xfail) so its size is irrelevant to
 /// wall-clock here — behaviour preservation is what matters.
 fn default_engine_serve_target() -> &'static str {
     if e2e_cucumber::capability::host_capability().effective_serve_engine == "lemonade" {
@@ -726,7 +724,7 @@ async fn assert_response_model_correct(world: &mut E2eWorld) {
 
 /// Whether a chat response's `model` field identifies the model we served.
 ///
-/// vLLM echoes the exact id we passed (`Qwen/Qwen2.5-0.5B-Instruct`), so a plain
+/// vLLM echoes the exact id we passed (`Qwen/Qwen3.5-0.8B`), so a plain
 /// containment holds. Lemonade instead reports the concrete GGUF artifact it
 /// loaded — e.g. serving `Qwen3-0.6B-GGUF` yields `Qwen3-0.6B-Q4_0.gguf` — so an
 /// exact/containment check on the catalog name fails even though it IS the right
