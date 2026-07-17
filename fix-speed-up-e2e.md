@@ -2,9 +2,9 @@
 
 # WIP: Speed up E2E test suite
 
-**Stage:** 6-implementing — STAGED TASK, NOT done (PR #126 shipped as milestone; Tasks #2–#11 remain; re-branch in place for next chunk)
+**Stage:** 6-implementing — STAGED TASK, NOT done (PR #126 shipped; Tasks #2–#3 shipped to PR #128; Tasks #4–#11 remain)
 **Pipeline:** standard
-**Branch:** fix-speed-up-e2e
+**Branch:** test-e2e-smallest-serve-model (was fix-speed-up-e2e; re-branched off fresh main for Task #3 chunk)
 **Last Updated:** 2026-07-17 (idle flush)
 
 **Token Usage:** in=1006 out=301808 cache_create=5512288 cache_read=94907267 calls=509
@@ -80,9 +80,15 @@ leverage. Tasks #8–#9 are smaller/independent.
   1.5B and feeds 4 real-serve Instinct scenarios (5, 8, 6, 6b). Code already documents
   0.5B as the smallest vLLM-preferred entry (line 458 uses it, proven to serve). Lemonade
   already at floor (0.6B); 27B nightly by design. → Task #3 = flip line 285 1.5B→0.5B.
-- 📋 Task #3 — **DECISION GATE**: switch vLLM serve target 1.5B → 0.5B (host_serve_target
-  in serving_steps.rs); verify it still resolves to vLLM on Instinct. Settle the "latest
-  vs smallest" call once and apply to both lemonade + vLLM.
+- ✅ Task #3 — **DECISION: smallest** (user, 2026-07-17). Flipped host_serve_target vLLM
+  branch 1.5B→0.5B (serving_steps.rs:285) + stale doc-comment at :695. 4-line diff,
+  compiles clean. vLLM-resolution proof: scenario 9 already serves this exact 0.5B model
+  and asserts vLLM selection. No CI prewarm list to update (weights lazy-download to shared
+  HF cache; prewarm only installs SDK runtime). Real GPU verdict = PR CI lane.
+  Branch: `test-e2e-smallest-serve-model` (off fresh main, re-branched in place).
+  **SHIPPED: PR #128** (commit `7579270`, signed+signed-off). Container gate green
+  (clippy -D warnings, workspace tests, e2e mock lane 4 xfail/0 unexpected). GPU CI lane
+  is the real verdict for the model swap.
 - 📋 Task #4 — Document the policy: any GPU serve scenario uses the smallest model that
   satisfies its assertion; large-model behavior is `@nightly` only.
 
@@ -157,6 +163,13 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persist-app-dev-ci
 - Recreate with: `create_worktree.sh fix-speed-up-e2e`
 
 ## Work Log
+
+### 2026-07-17 — Tasks #2+#3 shipped to PR #128 (smallest vLLM serve model)
+
+- **Task #2 audit:** mapped all 7 GPU serve scenarios → only lever is host_serve_target vLLM branch (1.5B).
+- **Task #3 (decision: smallest, user):** flipped serving_steps.rs:285 1.5B→0.5B + stale doc-comment :695. 4-line diff.
+- **Re-branched in place** (merged fix-speed-up-e2e → new test-e2e-smallest-serve-model off fresh origin/main; picked up #90/#94/#116). Saved memory `staged-task-rebranch-on-merged`.
+- **Container gate green**, committed signed `7579270`, pushed, **PR #128 open**. Awaiting GPU CI lane (real verdict for the swap).
 
 ### 2026-07-17 — Unified numbering: one flat task scheme (dropped R-prefix)
 
