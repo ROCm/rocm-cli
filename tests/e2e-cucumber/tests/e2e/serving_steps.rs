@@ -275,6 +275,15 @@ async fn setup_mock_custom_port(world: &mut E2eWorld) {
 /// single-engine steps (`setup_gpu_model`'s old vLLM body and
 /// `setup_lemonade_model`), but lets a scenario tagged only `@requires-gpu` run
 /// on whichever engine the platform actually uses.
+///
+/// MODEL-SIZE POLICY: every GPU serve scenario uses the SMALLEST model that
+/// still satisfies its assertion — real GPU serves are the E2E wall-clock long
+/// pole on serial hardware, so weight-load time is pure overhead here. Current
+/// floors: vLLM `Qwen2.5-0.5B` (smallest vLLM-preferred catalog entry), lemonade
+/// `Qwen3-0.6B-GGUF` (smallest lemonade recipe). Large-model behaviour is
+/// exercised exactly once, in the `@nightly` `serve-large-model-inference`
+/// scenario (Qwen3.6-27B) — never on the per-PR path. Do not raise a serve
+/// scenario's model unless a smaller one genuinely cannot prove the assertion.
 fn host_serve_target() -> (&'static str, &'static str, &'static str) {
     if e2e_cucumber::capability::host_capability().effective_serve_engine == "lemonade" {
         // GGUF via lemonade's llama.cpp backend; endpoint reports e.g.
