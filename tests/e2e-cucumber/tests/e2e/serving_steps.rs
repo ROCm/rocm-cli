@@ -281,8 +281,9 @@ fn host_serve_target() -> (&'static str, &'static str, &'static str) {
         // Qwen3-0.6B-Q4_0.gguf, so "Qwen3-0.6B" is the distinctive substring.
         ("Qwen3-0.6B-GGUF", "lemonade", "Qwen3-0.6B")
     } else {
-        // Safetensors via vLLM; "Qwen2.5-1.5B" is the distinctive substring.
-        ("Qwen/Qwen2.5-1.5B-Instruct", "vllm", "Qwen2.5-1.5B")
+        // Safetensors via vLLM; "Qwen2.5-0.5B" is the distinctive substring.
+        // Smallest vLLM-preferred catalog entry — see user_serves_vllm_capable_default.
+        ("Qwen/Qwen2.5-0.5B-Instruct", "vllm", "Qwen2.5-0.5B")
     }
 }
 
@@ -692,7 +693,7 @@ async fn assert_response_model_correct(world: &mut E2eWorld) {
 
 /// Whether a chat response's `model` field identifies the model we served.
 ///
-/// vLLM echoes the exact id we passed (`Qwen/Qwen2.5-1.5B-Instruct`), so a plain
+/// vLLM echoes the exact id we passed (`Qwen/Qwen2.5-0.5B-Instruct`), so a plain
 /// containment holds. Lemonade instead reports the concrete GGUF artifact it
 /// loaded — e.g. serving `Qwen3-0.6B-GGUF` yields `Qwen3-0.6B-Q4_0.gguf` — so an
 /// exact/containment check on the catalog name fails even though it IS the right
