@@ -2,7 +2,7 @@
 
 # WIP: Speed up E2E test suite
 
-**Stage:** 0-idea
+**Stage:** 6-implementing (Task #1 merged PR #126; Tasks #2-5 open)
 **Pipeline:** standard
 **Branch:** fix-speed-up-e2e
 **Last Updated:** 2026-07-17 (idle flush)
@@ -121,23 +121,26 @@ fix-2-unset-override --dry-run` panics (rc=101) — a dry-run should never panic
 - ✅ Profile current E2E runtime from live CI run #29472891569 (baseline quantified: mock 7.6m / MI300X 8.0m / Strix-Windows 15.8m / Strix-Ubuntu 28.4m long pole).
 - ✅ Implement VRAM-floor fix: added device-total probe, scaled floor to `min(150_000, total*0.9)`, verified compile + arithmetic. Committed and pushed to origin/fix-speed-up-e2e (commit `122d2be`).
 
+### Completed ✅ (cont.)
+- ✅ Task #1 probe (run 29529197875, Strix-Ubuntu): **VRAM fix CONFIRMED**. Serve step = 91s (pure 90s readiness wait) vs ~262s baseline → the ~120s `wait_for_free_vram` dead-time is GONE. The job's "regression" flag was a FALSE ALARM from `--name` scoped mode: platform.json recorded 0 expectations (scoped `--name` bypasses the `.filter_run` resolutions-population path; a full run records all 25). So the EAI-7423 lemonade xfail couldn't reconcile — NOT caused by my change. LESSON: `--name` breaks reconciliation; judge scoped probes by step TIMING/behavior, not the pass/fail verdict.
+- ✅ **Task #1 SHIPPED: PR #126 MERGED** into main (merge commit `e9a4b154`, 2026-07-17 ~03:03 CEST). All blocking checks green; Strix-Ubuntu lane PASS 15m37s (was 28.4m long pole). The 2 red lanes (MI300X-GPU, Strix-Windows) are non-blocking `continue-on-error` pre-existing failures, unaffected by this change (MI300X floor unchanged). Branch was rebased onto latest main before merge (commit became `a94600f`).
+
 ### In Progress ⏳
-- ✅ Task #1 probe COMPLETE (run 29529197875, Strix-Ubuntu): **VRAM fix CONFIRMED**. Serve step = 91s (pure 90s readiness wait) vs ~262s baseline → the ~120s `wait_for_free_vram` dead-time is GONE. The job's "1 unexpected failure / regression" flag is a FALSE ALARM from `--name` scoped mode: platform.json recorded 0 expectations (scoped `--name` bypasses the `.filter_run` resolutions-population path; baseline full run recorded 25). So the EAI-7423 lemonade xfail couldn't reconcile — NOT caused by my change, reproduces only under `--name`. NOTE for the scoped-dispatch method: `--name` breaks reconciliation; judge scoped probes by step TIMING/behavior, not the pass/fail verdict.
-- ✅ Task #3 scenarios: 6 BDD (diagnose/fix, mock-lane GPU-independent). Verified live in container; corrected 3 assumptions (OS-gating, env-dependence, rc codes). Ready for implementation review.
+- ⏳ Task #3 scenarios: 6 BDD (diagnose/fix, mock-lane GPU-independent). Verified live in container; corrected 3 assumptions (OS-gating, env-dependence, rc codes). Ready to implement (feature + steps + expectations.toml). Should be a NEW branch off updated main.
 
 ### Todo 📋
-- 📋 Open PR for `122d2be` (VRAM floor fix) — probe confirmed, container gate green.
+- 📋 Task #3: Implement diagnose E2E test steps + expectations.toml (scenarios drafted + verified, ready for code). New branch off main.
 - 📋 Task #2: Rework CI tiering (per-PR vs nightly) — verify/tune existing `@nightly` split.
-- 📋 Task #3: Implement diagnose E2E test steps + expectations.toml (scenarios drafted + verified, ready for code).
 - 📋 Task #4: Confirm Strix Halo Qwen variant (user decision: latest vs smallest).
 - 📋 Task #5: Reduce mock lane per-scenario overhead (fixed overhead ~4.8s/scenario, multiply across 12).
+- 📋 FILE separately: `fix fix-2-unset-override --dry-run` panics rc=101 (a dry-run should never panic).
 
 ## Next Steps
 
-- Probe run 29529197875 completes → verify VRAM-floor fix impact → if successful, open PR for `122d2be`; if not, diagnose and iterate.
-- Task #3: Review & implement diagnose E2E scenarios (6 drafted, mock-lane ready).
-- Task #4: Confirm with user whether Strix Qwen should be latest variant or smallest (current: smallest).
-- Task #2: Tune CI tiering alignment (review existing `@nightly` structure vs P0/P1 plan).
+- Task #1 done + merged. Post-merge cleanup deferred: Tasks #2–5 still tracked on this WIP; branch/worktree kept for now.
+- Task #3: implement the 6 diagnose scenarios (new branch off updated main).
+- Task #4: confirm with user whether Strix Qwen should be latest variant or smallest (current: smallest).
+- Task #2: tune CI tiering alignment (review existing `@nightly` structure vs P0/P1 plan).
 
 ## Checklist
 
