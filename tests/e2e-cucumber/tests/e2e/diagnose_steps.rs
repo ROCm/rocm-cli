@@ -6,11 +6,15 @@ use cucumber::{given, then, when};
 
 use crate::E2eWorld;
 
-/// A symptom string that scores a catalog match on any bare-metal Linux/Windows
-/// host (the "/dev/kfd open failure" keyword). The specific fix-id it resolves
-/// to is environment-dependent, so scenarios assert the shape of a match, not
-/// the id.
-const KNOWN_SYMPTOM: &str = "unable to open /dev/kfd";
+/// A symptom string that scores a catalog match on both Linux and Windows. It
+/// keys off `check_1_arch_not_in_wheel` (a `LINUX_AND_WINDOWS` checker), which
+/// scores 50 on the `HSA_STATUS_ERROR_INVALID_ISA` keyword regardless of host
+/// state — the covered-arch penalty only applies when a framework arch list is
+/// present, so with none installed the match always renders. (The earlier
+/// "/dev/kfd" symptom keyed only off the Linux-only render-group checker and so
+/// produced no match on Windows.) The specific fix-id is environment-dependent,
+/// so scenarios assert the shape of a match, not the id.
+const KNOWN_SYMPTOM: &str = "HSA_STATUS_ERROR_INVALID_ISA";
 
 /// A print-only recipe (no runner, applies on linux+windows) whose `--dry-run`
 /// is deterministic across environments — used for the preview scenario. Other
