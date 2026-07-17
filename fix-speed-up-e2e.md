@@ -5,7 +5,7 @@
 **Stage:** 6-implementing — STAGED TASK, NOT done (PR #126 shipped as milestone; Tasks #2–#11 remain; re-branch in place for next chunk)
 **Pipeline:** standard
 **Branch:** fix-speed-up-e2e
-**Last Updated:** 2026-07-17
+**Last Updated:** 2026-07-17 (idle flush)
 
 **Token Usage:** in=1006 out=301808 cache_create=5512288 cache_read=94907267 calls=509
 
@@ -66,10 +66,20 @@ from three angles — cheaper serves, fewer serves, less-frequent serves — ord
 leverage. Tasks #8–#9 are smaller/independent.
 
 **Cheaper serves — smallest model (Tasks #2–#4):**
-- 📋 Task #2 — Audit every GPU serve scenario: map scenario → current model → smallest
-  viable model. Baseline: lemonade already uses `Qwen3-0.6B-GGUF` (smallest recipe);
-  vLLM path uses `Qwen2.5-1.5B-Instruct` but code notes `Qwen2.5-0.5B` is the smallest
-  vLLM-preferred entry.
+- ✅ Task #2 — AUDIT DONE (2026-07-17). Mapping of every GPU serve scenario:
+  | @id | serve step | model | engine | smallest? |
+  |-----|-----------|-------|--------|-----------|
+  | serve-vllm-inference (5) | host_serve_target | Qwen2.5-**1.5B** | vLLM | ❌ 0.5B avail |
+  | serve-readiness-contract (8) | host_serve_target | 1.5B / 0.6B | host | ❌ vLLM side |
+  | serve-default-engine-working-endpoint (6) | host_serve_target | 1.5B / 0.6B | host | ❌ vLLM side |
+  | serve-default-engine-inference (6b) | host_serve_target | 1.5B / 0.6B | host | ❌ vLLM side |
+  | serve-lemonade-inference (7) | setup_lemonade_model | Qwen3-0.6B-GGUF | lemonade | ✅ |
+  | serve-vllm-default-on-instinct (9) | dedicated | Qwen2.5-0.5B | vLLM | ✅ |
+  | serve-large-model-inference (10, nightly) | setup_large_gpu_model | Qwen3.6-27B | vLLM | ✅ intentional |
+  **ONE lever:** the vLLM branch of `host_serve_target()` (serving_steps.rs:285) serves
+  1.5B and feeds 4 real-serve Instinct scenarios (5, 8, 6, 6b). Code already documents
+  0.5B as the smallest vLLM-preferred entry (line 458 uses it, proven to serve). Lemonade
+  already at floor (0.6B); 27B nightly by design. → Task #3 = flip line 285 1.5B→0.5B.
 - 📋 Task #3 — **DECISION GATE**: switch vLLM serve target 1.5B → 0.5B (host_serve_target
   in serving_steps.rs); verify it still resolves to vLLM on Instinct. Settle the "latest
   vs smallest" call once and apply to both lemonade + vLLM.
@@ -161,6 +171,10 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persist-app-dev-ci
 - **Reconciled roadmap overlaps:** Task #2/#4 superseded by Efficiency roadmap R1–R8. Remapped Task #2→R7+R8, Task #4→R1–R3 (decision gate R2). One home per piece of work.
 - **Fixed done-detection:** Updated Stage line to flag "STAGED TASK, NOT done"; PR #126 shipped as milestone; re-branch in place for next chunk per wip-management skill protocol.
 - **Next actionable:** R2 decision gate (latest vs smallest serve model); then R4–R6 (mock/real split, biggest structural win).
+
+### 2026-07-17 (idle flush) — [IDLE FLUSH 7]
+
+**Session idle for 10 minutes, auto-flushing WIP state.**
 
 ### 2026-07-17 (idle flush) — [IDLE FLUSH 6]
 
