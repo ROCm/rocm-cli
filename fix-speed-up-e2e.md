@@ -7,7 +7,7 @@
 **Branch:** fix-speed-up-e2e
 **Last Updated:** 2026-07-17
 
-**Token Usage:** in=953 out=277549 cache_create=4971577 cache_read=91650360 calls=481
+**Token Usage:** in=991 out=291238 cache_create=5250327 cache_read=93853352 calls=500
 
 ---
 
@@ -151,6 +151,12 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persist-app-dev-ci
 - Recreate with: `create_worktree.sh fix-speed-up-e2e`
 
 ## Work Log
+
+### 2026-07-17 — Session review: verified PR #126 merge, reconciled overlaps between Task list and Efficiency roadmap
+
+- **PR #126 verified MERGED** (2026-07-17 01:02 UTC, merge commit `e9a4b154`, main branch). Strix-Ubuntu lane 28.4m → 15.6m; VRAM-floor fix live.
+- **Reconciled overlaps:** Task #2/#4 superseded by Efficiency roadmap R1–R8. Remapped Task #2 → R7+R8 (merge_group gating + paths-filter); Task #4 → R1–R3, decision gate R2 (latest vs smallest). Updated Next Steps and Blockers to use R-numbering; no duplicate tracking.
+- **Task #3 split to own WIP:** [[test-e2e-diagnose]] created as dedicated file (Stage 8-awaiting-pr-approval, PR #127 open).
 
 ### 2026-07-17 — Created dedicated WIP for Task #3 (test-e2e-diagnose, PR #127)
 
