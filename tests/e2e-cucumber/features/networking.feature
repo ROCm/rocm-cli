@@ -1,8 +1,8 @@
 Feature: Native HTTP networking
 
-  # EAI-7402: rocm-cli performs downloads and GETs over the native `ureq` stack
-  # (native certificate store), replacing the generated PowerShell script that
-  # used to run under `powershell.exe -ExecutionPolicy Bypass` on Windows. These
+  # rocm-cli performs downloads and GETs over the native `ureq` stack (native
+  # certificate store), replacing the generated PowerShell script that used to
+  # run under `powershell.exe -ExecutionPolicy Bypass` on Windows. These
   # scenarios drive the real `rocm` binary end-to-end against the mock server so a
   # GET/round-trip reaches a local endpoint over the native stack. They run on the
   # mock (no GPU) on every platform the suite runs on, so a regression back to a

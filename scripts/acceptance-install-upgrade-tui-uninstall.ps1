@@ -436,10 +436,10 @@ try {
     Assert-File (Join-Path $InstallDir "rocmd.exe")
     Assert-File (Join-Path $InstallDir ".rocm-cli-manifest")
 
-    # EAI-7402: install/download smoke over REAL HTTP (not file://). Serve the
-    # signed dist from a localhost HttpListener so install.ps1 exercises its
-    # native `Invoke-WebRequest` download path (native certificate-store
-    # behavior) end to end, then verify the archive + signature and install.
+    # Install/download smoke over REAL HTTP (not file://). Serve the signed dist
+    # from a localhost HttpListener so install.ps1 exercises its native
+    # `Invoke-WebRequest` download path (native certificate-store behavior) end
+    # to end, then verify the archive + signature and install.
     Write-Host "acceptance: install over native HTTP (localhost)"
     $httpInstallDir = Join-Path $AcceptanceRoot "http-install\bin"
     $httpPort = Get-FreeTcpPort
