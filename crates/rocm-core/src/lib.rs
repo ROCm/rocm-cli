@@ -3541,10 +3541,7 @@ pub fn has_usable_amd_gpu() -> bool {
 fn probe_usable_amd_gpu_indices() -> Option<Vec<u32>> {
     let present =
         combine_amd_gpu_counts(linux_kfd_gpu_node_count(), linux_drm_amdgpu_card_count())?;
-    Some(usable_amd_gpu_indices_from(
-        present,
-        visibility_mask_from_env(),
-    ))
+    usable_amd_gpu_indices_from(present, visibility_mask_from_env())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -3641,27 +3638,28 @@ fn visibility_mask_from_env() -> Option<String> {
 
 /// Apply a `HIP_VISIBLE_DEVICES`-style `mask` to the present device ordinals
 /// (`0..present`). `None` means no mask is set (every present device is visible).
-/// The mask is a comma-separated ordinal list parsed left to right; a
-/// non-numeric or out-of-range entry terminates the list (earlier entries stay
-/// visible), and an empty value hides every device.
+/// An empty value hides every device. A nonempty mask containing UUIDs or invalid
+/// ordinals returns `None`: the ordinal-only probe cannot interpret it
+/// authoritatively, so callers must not mistake it for "no GPU".
 #[cfg(any(target_os = "linux", test))]
-fn usable_amd_gpu_indices_from(present: usize, mask: Option<String>) -> Vec<u32> {
+fn usable_amd_gpu_indices_from(present: usize, mask: Option<String>) -> Option<Vec<u32>> {
     let Some(mask) = mask else {
-        return (0..present as u32).collect();
+        return Some((0..present as u32).collect());
     };
+    if mask.is_empty() {
+        return Some(Vec::new());
+    }
     let mut visible = Vec::new();
     for token in mask.split(',') {
-        let Ok(index) = token.trim().parse::<u32>() else {
-            break;
-        };
+        let index = token.trim().parse::<u32>().ok()?;
         if (index as usize) >= present {
-            break;
+            return None;
         }
         if !visible.contains(&index) {
             visible.push(index);
         }
     }
-    visible
+    Some(visible)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -8334,9 +8332,9 @@ last_installed_runtime_id = "therock-release"
 
     #[test]
     fn usable_gpu_indices_unset_mask_returns_all_present_devices() {
-        assert_eq!(usable_amd_gpu_indices_from(0, None), Vec::<u32>::new());
-        assert_eq!(usable_amd_gpu_indices_from(1, None), vec![0]);
-        assert_eq!(usable_amd_gpu_indices_from(3, None), vec![0, 1, 2]);
+        assert_eq!(usable_amd_gpu_indices_from(0, None), Some(Vec::new()));
+        assert_eq!(usable_amd_gpu_indices_from(1, None), Some(vec![0]));
+        assert_eq!(usable_amd_gpu_indices_from(3, None), Some(vec![0, 1, 2]));
     }
 
     #[test]
@@ -8344,29 +8342,29 @@ last_installed_runtime_id = "therock-release"
         // The masked-device path: GPUs are present but fully masked out.
         assert_eq!(
             usable_amd_gpu_indices_from(2, Some(String::new())),
-            Vec::<u32>::new()
+            Some(Vec::new())
         );
     }
 
     #[test]
-    fn usable_gpu_indices_honors_partial_and_reordered_mask() {
+    fn usable_gpu_indices_honors_valid_ordinal_masks() {
         assert_eq!(
             usable_amd_gpu_indices_from(4, Some("2,0".to_owned())),
-            vec![2, 0]
-        );
-        // Out-of-range and non-numeric entries terminate the visible list.
-        assert_eq!(
-            usable_amd_gpu_indices_from(2, Some("0,5".to_owned())),
-            vec![0]
-        );
-        assert_eq!(
-            usable_amd_gpu_indices_from(2, Some("bogus".to_owned())),
-            Vec::<u32>::new()
+            Some(vec![2, 0])
         );
         // Duplicates are collapsed.
         assert_eq!(
             usable_amd_gpu_indices_from(2, Some("1,1".to_owned())),
-            vec![1]
+            Some(vec![1])
+        );
+    }
+
+    #[test]
+    fn usable_gpu_indices_treats_unsupported_masks_as_unprobeable() {
+        assert_eq!(usable_amd_gpu_indices_from(2, Some("0,5".to_owned())), None);
+        assert_eq!(
+            usable_amd_gpu_indices_from(2, Some("GPU-deadbeef".to_owned())),
+            None
         );
     }
 }

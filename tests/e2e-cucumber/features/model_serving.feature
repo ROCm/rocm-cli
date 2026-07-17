@@ -115,7 +115,7 @@ Feature: Model serving
   # The masked-device path: on a real GPU host where every device is hidden, the
   # GPU-required serve must treat it as "no GPU" and refuse, not fall back. Runs on
   # GPU hardware (Strix Halo / Instinct).
-  @id:serve-masked-devices-fail @requires-gpu
+  @id:serve-masked-devices-fail @requires-gpu @requires-os:linux
   Scenario: 12 - Serving is refused when every GPU is masked from view
     When the user serves a model with every GPU masked from view
     Then serving is refused before any engine starts
@@ -124,7 +124,7 @@ Feature: Model serving
   # Honest device selection: a `--gpu` index that does not exist on the host is
   # rejected outright, never silently remapped to another device (no device-0
   # fallback). Runs on GPU hardware.
-  @id:serve-absent-gpu-index-rejected @requires-gpu
+  @id:serve-absent-gpu-index-rejected @requires-gpu @requires-os:linux
   Scenario: 13 - Serving pinned to a GPU that does not exist is refused
     When the user serves a model pinned to a GPU index that does not exist
     Then serving is refused before any engine starts

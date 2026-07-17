@@ -536,7 +536,9 @@ fn parse_engine_recipe_json(value: Option<String>) -> Result<Option<EngineRecipe
 fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
     let device_policy = normalize_vllm_device_policy(request.device_policy)?;
     let engine_recipe = accepted_engine_recipe(request.engine_recipe)?;
-    let gpu_indices = rocm_engine_protocol::launch_gpu_indices(request.gpu_selection.as_ref());
+    let requested_gpu_indices =
+        rocm_engine_protocol::launch_gpu_indices(request.gpu_selection.as_ref());
+    let gpu_indices = resolve_serve_gpu_indices(&requested_gpu_indices)?;
     let runtime = resolve_vllm_runtime(request.runtime_id.as_deref())?;
     let state_path = AppPaths::discover()?
         .engine_state_dir(ENGINE_NAME)
@@ -584,7 +586,8 @@ struct ServeHttpRequest {
     engine_recipe: Option<EngineRecipeHint>,
 }
 
-fn serve_http(request: ServeHttpRequest) -> Result<()> {
+fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
+    request.gpu_indices = resolve_serve_gpu_indices(&request.gpu_indices)?;
     let runtime = resolve_vllm_runtime(request.runtime_id.as_deref())?;
     let mut child = spawn_vllm_server(&request, &runtime, request.log_path.as_deref())?;
     write_running_state(&request, &runtime, child.id())?;
@@ -1074,6 +1077,43 @@ fn runtime_matches(manifest: &TheRockRuntimeManifest, requested: Option<&str>) -
         }
     }
     false
+}
+
+/// Resolve and validate the GPU ordinal before spawning vLLM. An authoritative
+/// empty probe result fails under the adapter's GPU-only policy; `auto` selects
+/// the first visible device. Unknown availability remains permissive so WSL and
+/// unsupported probe surfaces are not blocked.
+fn resolve_serve_gpu_indices(requested: &[u32]) -> Result<Vec<u32>> {
+    resolve_gpu_indices_against(requested, rocm_core::usable_amd_gpu_indices())
+}
+
+fn resolve_gpu_indices_against(requested: &[u32], usable: Option<Vec<u32>>) -> Result<Vec<u32>> {
+    let Some(usable) = usable else {
+        return Ok(requested.to_vec());
+    };
+    if usable.is_empty() {
+        bail!(
+            "no usable AMD GPU detected; vLLM requires ROCm GPU execution and does not fall back \
+             to CPU. Check the driver with `rocm examine` and ensure HIP_VISIBLE_DEVICES / \
+             ROCR_VISIBLE_DEVICES are not masking every device."
+        );
+    }
+    if requested.is_empty() {
+        return Ok(vec![usable[0]]);
+    }
+    for index in requested {
+        if !usable.contains(index) {
+            let visible = usable
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "requested GPU {index} is not available on this host; usable GPU indices: [{visible}]"
+            );
+        }
+    }
+    Ok(requested.to_vec())
 }
 
 fn normalize_vllm_device_policy(policy: Option<DevicePolicy>) -> Result<DevicePolicy> {
@@ -1718,6 +1758,37 @@ mod tests {
         assert_eq!(parse_gpu_indices_arg(Some("2")).unwrap(), vec![2]);
         assert!(parse_gpu_selection_arg(Some("nope")).is_err());
         assert!(parse_gpu_selection_arg(Some("0,1")).is_err());
+    }
+
+    #[test]
+    fn gpu_required_launch_rejects_no_usable_device() {
+        let error = resolve_gpu_indices_against(&[], Some(Vec::new()))
+            .expect_err("zero usable devices must be rejected");
+        assert!(error.to_string().contains("no usable AMD GPU"));
+    }
+
+    #[test]
+    fn gpu_required_launch_selects_and_validates_visible_devices() {
+        assert_eq!(
+            resolve_gpu_indices_against(&[], Some(vec![1, 2])).unwrap(),
+            vec![1]
+        );
+        assert_eq!(
+            resolve_gpu_indices_against(&[2], Some(vec![1, 2])).unwrap(),
+            vec![2]
+        );
+        let error = resolve_gpu_indices_against(&[0], Some(vec![1, 2]))
+            .expect_err("masked device must be rejected");
+        assert!(error.to_string().contains("not available"));
+    }
+
+    #[test]
+    fn gpu_required_launch_allows_unprobeable_hosts() {
+        assert_eq!(
+            resolve_gpu_indices_against(&[], None).unwrap(),
+            Vec::<u32>::new()
+        );
+        assert_eq!(resolve_gpu_indices_against(&[3], None).unwrap(), vec![3]);
     }
 
     #[test]
