@@ -18,6 +18,7 @@ mod powershell;
 mod signing;
 mod tpn;
 mod verify_commits;
+mod verify_pinned_keys;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -57,9 +58,10 @@ enum Command {
     },
     /// Verify a file's signature against an RSA public key.
     Verify {
-        /// Path to the SubjectPublicKeyInfo public-key PEM.
+        /// Path to the SubjectPublicKeyInfo public-key PEM. When omitted, the key is
+        /// read from the `ROCM_CLI_SIGNING_PUBLIC_KEY_PEM` environment variable.
         #[arg(long)]
-        public_key: PathBuf,
+        public_key: Option<PathBuf>,
         /// File whose signature is checked.
         #[arg(long = "in")]
         input: PathBuf,
@@ -67,6 +69,11 @@ enum Command {
         #[arg(long)]
         signature: PathBuf,
     },
+    /// Assert the release/metadata public keys pinned in the installers and
+    /// `apps/rocm/src/therock.rs` match the canonical published keys under
+    /// `docs/keys/`, and that any configured CI signing key matches the pinned
+    /// current release key. A no-op while no canonical keys are published.
+    VerifyPinnedKeys,
     /// Print the workspace crates affected by a git range (changed crates plus
     /// their transitive dependents) as `cargo` package-selection flags, so CI
     /// can build/test only what a change can reach instead of `--workspace`.
@@ -170,7 +177,8 @@ fn run() -> Result<()> {
             public_key,
             input,
             signature,
-        } => signing::verify(&public_key, &input, &signature)?,
+        } => signing::verify(public_key.as_deref(), &input, &signature)?,
+        Command::VerifyPinnedKeys => verify_pinned_keys::run()?,
         Command::Affected { base } => affected::run(base)?,
         Command::Manifest { check } => manifest::run(check)?,
         Command::Tpn { check } => tpn::run(check)?,

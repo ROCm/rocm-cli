@@ -14,6 +14,18 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Production trust gate — dormant until the owner sets the repository variable
+  # ROCM_CLI_REQUIRE_PRODUCTION_TRUST (e.g. "1") and provides the trust inputs
+  # below. While the variable is unset/falsy, release_readiness.py skips
+  # validate_production_trust() and behavior is unchanged. The values are public
+  # keys and paths (not the private signing key, which stays step-scoped). When
+  # enabling the gate, the recipe-index inputs also require a step that
+  # materializes the hosted index + its .sig into the workspace.
+  ROCM_CLI_REQUIRE_PRODUCTION_TRUST: ${{ vars.ROCM_CLI_REQUIRE_PRODUCTION_TRUST }}
+  ROCM_CLI_SIGNING_PUBLIC_KEY_PEM: ${{ secrets.ROCM_CLI_SIGNING_PUBLIC_KEY_PEM }}
+  ROCM_CLI_METADATA_PUBLIC_KEY_PEM: ${{ secrets.ROCM_CLI_METADATA_PUBLIC_KEY_PEM }}
+  ROCM_CLI_MODEL_RECIPE_INDEX_PATH: ${{ vars.ROCM_CLI_MODEL_RECIPE_INDEX_PATH }}
+  ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH: ${{ vars.ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH }}
 
 jobs:
   release:
@@ -23,6 +35,11 @@ jobs:
       version: ${{ steps.version.outputs.value }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Verify pinned keys match the signing key
+        run: cargo xtask verify-pinned-keys
 
       - name: Determine version
         id: version
@@ -165,6 +182,10 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Verify pinned keys match the signing key
+        shell: pwsh
+        run: cargo xtask verify-pinned-keys
 
       - name: Build release binaries
         shell: pwsh

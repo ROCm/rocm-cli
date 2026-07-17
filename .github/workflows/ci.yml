@@ -117,6 +117,10 @@ jobs:
               - '**/*.ps1'
               - '**/*.feature'
               - 'install*'
+              # Pinned-key consistency compares docs/keys/* against the installers,
+              # so a canonical-key-only change must trigger the heavy job that runs
+              # `cargo xtask verify-pinned-keys`.
+              - 'docs/keys/**'
               - '.github/workflows/**'
             # THIRD_PARTY_NOTICES.txt staleness gate: anything that changes the
             # dependency tree, the cargo-about config/template, the generator, or
@@ -190,6 +194,10 @@ jobs:
       - name: Release readiness self-test
         if: needs.changes.outputs.heavy == 'true'
         run: python scripts/release_readiness.py --self-test
+
+      - name: Pinned key consistency check
+        if: needs.changes.outputs.heavy == 'true'
+        run: cargo xtask verify-pinned-keys
 
       - name: Acceptance install lifecycle
         if: needs.changes.outputs.heavy == 'true'
@@ -313,6 +321,11 @@ jobs:
         if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
         run: python .\scripts\release_readiness.py --self-test
+
+      - name: Pinned key consistency check
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: cargo xtask verify-pinned-keys
 
       - name: Check PowerShell installer syntax
         if: needs.changes.outputs.heavy == 'true'
