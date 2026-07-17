@@ -1,13 +1,57 @@
 # WIP: Fix flaky Strix-Halo Windows E2E — share the lemonade engine across scenarios
 
-**Stage:** 3-diagnosis-complete-needs-decision
+**Stage:** 5-fix-implemented-verifying (full unscoped run #708 pending)
 **Pipeline:** standard
-**Branch:** fix-e2e-share-lemonade-engine (PUSHED to origin; HEAD 03b0b9a = fix c57ed46 + diagnostics 03b0b9a)
+**Branch:** fix-e2e-share-lemonade-engine (PUSHED to origin; HEAD fe7c7fe). 6 commits, 4 files. Branch is ~7 behind origin/main → REBASE before PR (consider squashing the diagnostic add/remove churn).
 **Last Updated:** 2026-07-17
 
 ---
 
-## ⚠️ 2026-07-17 — TWO PROBE RUNS DONE; ORIGINAL PREMISE PARTLY WRONG — READ FIRST
+## ✅ 2026-07-17 — RESOLVED: root cause = lemonade startup race; fix = pre-warm retry — READ FIRST
+
+Full diagnostic (a temp CI step that looped the serve 6× and captured the lemonade
+DAEMON's own log — since removed) overturned the earlier "flaky hardware" read:
+
+- **The `Could not connect to Lemonade server / backend install failed` error is a
+  STARTUP RACE, not a hardware flake.** `engines install lemonade` starts the embedded
+  lemonade server then immediately fires config-set + backend-install RPCs before it is
+  listening → the FIRST install intermittently fails; a retry succeeds. Diagnostic loop:
+  6/6 back-to-back serves rc=0 once warm.
+- **The scary `Error:` lines appear even in PASSING serves** — they're non-fatal warnings
+  from the install path, which is why the earlier serve-error matching was imperfect.
+- **Symlink sharing (`data/engines` AND `data/runtimes`) is a hard no-op on Windows**
+  (os error 1314 — no `SeCreateSymbolicLinkPrivilege`), for EVERY scenario. What actually
+  shares the engine is the **pre-warm into the persisted `$prewarm` runtime tree**
+  (lemonade self-manages its runtime; its backend lives under
+  `data/runtimes/<wheel>/engines/lemonade`, not `data/engines`). See
+  [[strix-windows-e2e-gotchas]].
+
+### Fix shipped on the branch (HEAD fe7c7fe)
+1. **CI Windows pre-warm with RETRY** (up to 4×, gated on install EXIT CODE not the weak
+   marker-dir Test-Path; kills stray lemonade between tries) — attacks the race at source.
+2. **Serve-level retry** `serve_managed_with_retry` (serving_steps.rs) — retries only the
+   narrow transient signature; belt-and-suspenders.
+3. **STDERR-in-assert** on serve steps (real errors were hidden on stdout-only asserts).
+4. **Dropped the dead `data/engines` symlink code** (shared_engines_dir/use_shared_engines
+   + E2E_SHARED_ENGINES_DIR) and reverted the untested engine pre-warm from the GPU +
+   Strix-Ubuntu jobs (green without it); kept only the Windows pre-warm that fixed it.
+
+### Determinism evidence
+Scoped scenario-8 dispatches after the pre-warm-retry: **3/3 GREEN** (runs #705/706/707)
+— vs the earlier coin-flip (3-pass / 1-pass / 4-pass on the same branch). Container gate
+(clippy + tests, -D warnings) green after each change.
+
+### Remaining before PR
+- ⏳ **Full unscoped Strix-Windows run #708** (all scenarios, no name_filter) — dispatched,
+  confirms the whole job is green not just scenario 8. [run 29564583858]
+- 📋 Rebase onto current origin/main (~7 behind); consider squashing the diagnostic
+  add/remove commits (03b0b9a + f99ba98) for a clean PR history.
+- 📋 Open PR (`--no-issue`; no AI refs per repo convention). Non-blocking job, so safe.
+- 📋 Broader E2E efficiency levers captured separately in [[fix-speed-up-e2e]] (R1–R8).
+
+---
+
+## ⚠️ 2026-07-17 — TWO PROBE RUNS DONE; ORIGINAL PREMISE PARTLY WRONG (historical)
 
 Two scoped strix-windows dispatches (scenarios 6/7/8) with FULL diagnostics now give
 the definitive picture. **My original "share data/engines" premise was wrong on
