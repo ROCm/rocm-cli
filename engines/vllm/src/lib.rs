@@ -37,6 +37,8 @@ const MAX_TAIL_READ: u64 = 4 * 1024 * 1024;
 /// How long a stop waits for the server to actually exit after each signal
 /// before reporting a timeout (or, under `force`, escalating to `SIGKILL`).
 const STOP_GRACE: Duration = Duration::from_secs(10);
+/// vLLM launches worker descendants that retain GPU allocations.
+const STOP_SCOPE: rocm_core::KillScope = rocm_core::KillScope::Tree;
 /// Default ROCm wheel index for `uv pip install vllm`.
 ///
 /// This pins both the vLLM release and the ROCm ABI tag, so it can drift from
@@ -808,12 +810,7 @@ fn stop_service(request: StopRequest) -> Result<StopResponse> {
         // the whole process tree must be signalled — but only after the recorded
         // PID is confirmed to still be our server, never a recycled stranger.
         .map(|identity| {
-            rocm_core::terminate_verified(
-                &identity,
-                rocm_core::KillScope::Tree,
-                STOP_GRACE,
-                request.force,
-            )
+            rocm_core::terminate_verified(&identity, STOP_SCOPE, STOP_GRACE, request.force)
         });
     let (stopped, graceful) = match outcome {
         Some(outcome) => (outcome.stopped(), outcome.graceful()),
@@ -2251,6 +2248,11 @@ mod tests {
         // The identity token must be recorded so a later stop can verify it.
         assert!(state.get("start_ticks").is_some());
         Ok(())
+    }
+
+    #[test]
+    fn stop_scope_includes_vllm_workers() {
+        assert_eq!(STOP_SCOPE, rocm_core::KillScope::Tree);
     }
 
     #[test]

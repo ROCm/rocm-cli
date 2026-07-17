@@ -169,6 +169,7 @@ impl TerminationOutcome {
 #[derive(Clone, Copy)]
 enum Signal {
     /// Request a graceful shutdown (`SIGTERM` on Unix).
+    #[cfg(not(windows))]
     Term,
     /// Force termination (`SIGKILL` on Unix, `TerminateProcess` on Windows).
     Kill,
@@ -214,12 +215,22 @@ pub fn terminate_verified(
         vec![*id]
     };
 
-    // Graceful request first: signal the whole scope, then wait for all to exit.
-    send_signal(id.pid, Signal::Term, tree);
-    if wait_for_all_exit(&members, grace) {
-        return TerminationOutcome::Graceful;
-    }
+    // Unix can request a graceful shutdown before escalating. Windows has no
+    // equivalent signal: do not burn the grace period on a no-op. A non-forced
+    // Windows stop reports TimedOut immediately; a forced stop proceeds directly
+    // to the verified kill path below.
+    #[cfg(not(windows))]
+    {
+        send_signal(id.pid, Signal::Term, tree);
+        if wait_for_all_exit(&members, grace) {
+            return TerminationOutcome::Graceful;
+        }
 
+        if !force {
+            return TerminationOutcome::TimedOut;
+        }
+    }
+    #[cfg(windows)]
     if !force {
         return TerminationOutcome::TimedOut;
     }
@@ -283,14 +294,8 @@ fn send_signal(pid: u32, signal: Signal, tree: bool) -> bool {
 
 #[cfg(windows)]
 fn send_signal(pid: u32, signal: Signal, _tree: bool) -> bool {
-    // Windows has no graceful process signal. A `Term` request is therefore a
-    // no-op — the bounded wait will time out and, only under a forced stop, the
-    // `Kill` step force-terminates. This keeps the reported outcome truthful:
-    // non-forced Windows stops surface `TimedOut` rather than a false graceful.
-    match signal {
-        Signal::Term => true,
-        Signal::Kill => crate::terminate_process(pid).is_ok(),
-    }
+    debug_assert!(matches!(signal, Signal::Kill));
+    crate::terminate_process(pid).is_ok()
 }
 
 /// Read the kernel start-time (field 22 of `/proc/<pid>/stat`) for `pid`.
@@ -353,6 +358,7 @@ fn parse_start_ticks(stat: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::process::{Child, Command, Stdio};
 
     /// Spawn a child that prints a line to stdout once it is ready, and block

@@ -45,6 +45,8 @@ const DEFAULT_LOG_TAIL_LINES: usize = 200;
 /// How long a stop waits for the server to actually exit after each signal
 /// before reporting a timeout (or, under `force`, escalating to `SIGKILL`).
 const STOP_GRACE: Duration = Duration::from_secs(10);
+/// Lemonade state identifies the actual llama-server process directly.
+const STOP_SCOPE: rocm_core::KillScope = rocm_core::KillScope::Single;
 const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
 /// Maximum bytes to read from the end of a log file when extracting tail lines.
 /// Prevents reading entire gigabyte-sized logs on startup timeout.
@@ -930,12 +932,7 @@ fn stop_service(request: StopRequest) -> Result<StopResponse> {
         .as_ref()
         .and_then(identity_from_state)
         .map(|identity| {
-            rocm_core::terminate_verified(
-                &identity,
-                rocm_core::KillScope::Single,
-                STOP_GRACE,
-                request.force,
-            )
+            rocm_core::terminate_verified(&identity, STOP_SCOPE, STOP_GRACE, request.force)
         });
     let (stopped, graceful) = match outcome {
         Some(outcome) => (outcome.stopped(), outcome.graceful()),
@@ -2668,6 +2665,11 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_scope_targets_only_the_recorded_lemonade_server() {
+        assert_eq!(STOP_SCOPE, rocm_core::KillScope::Single);
+    }
 
     #[test]
     fn identity_from_state_prefers_server_pid_and_its_start_ticks() {

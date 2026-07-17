@@ -12477,6 +12477,9 @@ fn terminate_recorded_service_pids(record: &ManagedServiceRecord) -> (Vec<u32>, 
     let mut all_stopped = true;
     for (pid, ticks) in entries {
         let identity = rocm_core::ProcessIdentity::new(pid, ticks);
+        // The managed stop contract is definitive: after the adapter gets its
+        // graceful opportunity, this cleanup pass forces any verified survivor
+        // so the command does not report success while a GPU worker remains.
         let outcome = rocm_core::terminate_verified(
             &identity,
             rocm_core::KillScope::Tree,
@@ -12486,7 +12489,9 @@ fn terminate_recorded_service_pids(record: &ManagedServiceRecord) -> (Vec<u32>, 
         if !outcome.stopped() {
             all_stopped = false;
         }
-        // Only report PIDs we actually signalled (a live, verified match).
+        // Report every PID that received a signal. TimedOut belongs here because
+        // signalling was attempted even though the process was not confirmed
+        // stopped; `all_stopped` separately carries the truthful completion state.
         if matches!(
             outcome,
             rocm_core::TerminationOutcome::Graceful
