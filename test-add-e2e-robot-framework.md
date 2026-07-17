@@ -908,7 +908,10 @@ even on Instinct because vllm can't serve them. vLLM-capable safetensors (e.g.
 ### Todo 📋
 - 📋 Persistent self-hosted GPU runner (app-dev currently ephemeral workspace pod) — see [[persist-app-dev-ci-runner]].
 
-_Follow-up items that had accreted into this WIP but are separate from finishing the PR #69 test suite were moved to the work-ledger inbox (`~/Developer/work-ledger/INBOX.md`, rocm-cli section, 2026-07-17): scenario-4 prime/teardown (#13), private mirror repo (#12), CODEOWNERS (#9) + require-code-owner-review (#10), JIT/ephemeral runners (#11), EAI-7333 xfail scoping + engine unit tests, and model_serving scenario renumbering. The EAI-7333 XPASS-non-fatal harness change is now its own WIP ([[fix-xpass-non-fatal-flaky]], EAI-7456)._
+**DONE 2026-07-17.** PR #69 merged; all remaining follow-ups relocated so this WIP is closed:
+- Moved to the work-ledger inbox (`~/Developer/work-ledger/INBOX.md`, rocm-cli): scenario-4 prime/teardown, private mirror repo, CODEOWNERS + require-code-owner-review, JIT/ephemeral runners, EAI-7333 xfail scoping + engine unit tests, model_serving renumbering, and the **per-scenario devel-tar unpack CI-cap fix** (root-caused + designed here; see inbox for the full env-gate plan).
+- Own WIPs: [[persist-app-dev-ci-runner]] (persistent GPU runner), [[fix-xpass-non-fatal-flaky]] / EAI-7456 (XPASS-non-fatal harness change).
+- The 3 uncommitted scratch files remain on the `ci-e2e-framework-fixes` scratch branch (uv-cache #22 etc.) — carry to a future PR if still wanted; not blocking this WIP.
 
 ### In progress 🚧 (Jul 10 — CI infra fixes + manual dispatch)
 - ✅ **Inference timeout cap** (`f2fa495`): `send_chat` client had NO timeout → a hung

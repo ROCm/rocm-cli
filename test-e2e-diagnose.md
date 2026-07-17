@@ -2,7 +2,7 @@
 
 # WIP: E2E coverage for `rocm diagnose` / `rocm fix`
 
-**Stage:** 8-awaiting-pr-approval (PR #127 — addressing review changes)
+**Stage:** 8-awaiting-pr-approval (PR #127 — S1/S3 symptom swap applied, verifying in container)
 **Pipeline:** standard
 **Branch:** test-e2e-diagnose
 **Last Updated:** 2026-07-17
@@ -90,12 +90,15 @@ Scenario: 6 - Asking for a fix the CLI does not know is refused clearly
 - ✅ **PR #127 opened** (commit `5e074fa`, signed + signed-off, off updated main).
 
 ### Todo 📋
-- 📋 PR #127 CI complete: all 6 diagnose scenarios PASS on mock lane, Strix Ubuntu, Strix Windows, GPU lane. No diagnose-related failures. (GPU lane blocked by unrelated EAI-7333 XPASS drift in serve scenarios, not this PR.)
-- 📋 Await human review (no reviews yet; `reviewDecision: REVIEW_REQUIRED`).
+- 📋 Verify symptom swap (`"unable to open /dev/kfd"` → `"HSA_STATUS_ERROR_INVALID_ISA"`) in Linux container before pushing amendment commit.
+- 📋 Push amended commit; re-run CI (strix-windows should now pass S1/S3).
+- 📋 Resolve CHANGES_REQUESTED → awaiting re-review on amended commit.
 
 ## Next Steps
 
-- Await human review on PR #127 (all 6 diagnose scenarios green across all tiers; no blockers on this PR's changes).
+- Verify symptom swap in container (must confirm `"HSA_STATUS_ERROR_INVALID_ISA"` scores via LINUX_AND_WINDOWS checker).
+- Push amended commit with symptom swap.
+- Re-run CI; resolve CHANGES_REQUESTED review.
 - On merge: run post-merge cleanup (stage → done, delete remote branch, remove worktree).
 
 ## Checklist
@@ -121,14 +124,12 @@ Scenario: 6 - Asking for a fix the CLI does not know is refused clearly
 **Worktree directory**: `/Users/fres/Developer/rocm-cli-wt/test-e2e-diagnose`
 - Recreate with: `create_worktree.sh test-e2e-diagnose`
 
-## Work Log
+### 2026-07-17 — CHANGES_REQUESTED: S1/S3 OS-gating host-invariance violation
 
-### 2026-07-17 — volen-silo CHANGES_REQUESTED: host-invariance fix for S1/S3
-
-- **PR #127 got a `CHANGES_REQUESTED` review from the `volen-silo` bot** (single top-level formal review; no inline/issue threads, no CodeQL alerts). It ran the built binary and confirmed S2/S4/S5/S6 are genuinely host-invariant, but flagged **S1 & S3 as NOT host-invariant**: the known symptom `"unable to open /dev/kfd"` scores only via `check_4_render_group`, which is `LINUX_ONLY` (`diagnose.rs:1225`) → on `strix-windows` `matched` is empty, no `score=` rendered → both fail deterministically (untagged ⇒ expect-pass on every lane incl. strix-windows).
-- **Applied the reviewer's PREFERRED fix** (keeps Windows coverage): swapped `KNOWN_SYMPTOM` → `"HSA_STATUS_ERROR_INVALID_ISA"`. Verified against source: keyword scores 50 in `KEYWORDS_INVALID_ISA` → `check_1_arch_not_in_wheel`, which is `LINUX_AND_WINDOWS` (`diagnose.rs:1222`); the `-30` covered-arch penalty only fires when `framework_arch_list` is non-empty (`diagnose.rs:339`), so with no framework installed it stays at 50 → match always renders on both OSes.
-- **S5 minor note (non-blocking):** reviewer observed `fix-1-arch` is print-only so `--dry-run` is a trivial no-op. Kept as-is — using an auto-applicable recipe reintroduces the host-dependent dry-run rc / fix-2 panic this PR exists to avoid. Will explain in the reply, not change.
-- Verifying the symptom swap in a Linux container before pushing (Mac is OS-gated → wrong answers).
+- **volen-silo bot flagged S1 & S3 NOT host-invariant**: symptom `"unable to open /dev/kfd"` scores only via `check_4_render_group` (LINUX_ONLY) → strix-windows renders no match → S1/S3 fail deterministically.
+- **Applied preferred fix:** swapped symptom → `"HSA_STATUS_ERROR_INVALID_ISA"`, scored via `check_1_arch_not_in_wheel` (LINUX_AND_WINDOWS) → scores 50 on both OSes when no framework present.
+- **S5 note (non-blocking):** `fix-1-arch --dry-run` is print-only (trivial no-op); using auto-applicable recipe reintroduces host-dependent rc. Explained in reply, not changing.
+- Container verification in progress before pushing amendment.
 
 ### 2026-07-17 (idle flush) — Auto-flush WIP state
 
