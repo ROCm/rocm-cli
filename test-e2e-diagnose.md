@@ -124,6 +124,12 @@ Scenario: 6 - Asking for a fix the CLI does not know is refused clearly
 
 ## Work Log
 
+### 2026-07-20 — Session review: CI GREEN, PR #127 awaiting approval
+
+- All 6 diagnose scenarios **PASSING** across all CI tiers (mock, Strix Ubuntu, Strix Windows, GPU); commit `268988d` symptom swap (`"HSA_STATUS_ERROR_INVALID_ISA"` → LINUX_AND_WINDOWS checker) confirmed host-invariant.
+- Reviewed full session context: no blockers on diagnose changes; PR #127 ready for merge approval.
+- Updated token usage snapshot for session closure.
+
 ### 2026-07-20 — CI GREEN; all 6 diagnose scenarios passing
 
 - Commit `268988d` (symptom swap to `"HSA_STATUS_ERROR_INVALID_ISA"`) passed full CI pipeline: mock, Strix Ubuntu, Strix Windows, GPU tiers all show **6/6 diagnose scenarios GREEN**.
