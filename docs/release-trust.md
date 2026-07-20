@@ -80,7 +80,8 @@ archive's SHA-256 digest, verified against the SubjectPublicKeyInfo
 `openssl`. The Windows installer (`install.ps1`) verifies it with the built-in
 .NET RSA APIs and has no runtime dependency on `openssl`: it parses the public
 key and calls `RSA.VerifyData` with SHA-256 and PKCS#1 v1.5 padding. This works
-on both Windows PowerShell 5.1 (.NET Framework) and PowerShell 7+ (.NET).
+on both Windows PowerShell 5.1 (.NET Framework 4.6+, which the
+`RSA.VerifyData` overload requires) and PowerShell 7+ (.NET).
 `certutil`/`certreq` are not used, because they only verify certificate-backed
 CMS/Authenticode blobs, not a raw detached signature checked against a bare
 public key.
