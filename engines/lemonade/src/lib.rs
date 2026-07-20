@@ -1508,32 +1508,6 @@ fn lemonade_process_environment_vars(
     Ok(vars)
 }
 
-/// Write `contents` to `path`, creating it with owner-only (0600) permissions on
-/// Unix so a secret (e.g. an endpoint API key) is not world-readable. On other
-/// platforms the file is created with default permissions.
-fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    #[cfg(unix)]
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(contents)?;
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(path, contents)?;
-    }
-    Ok(())
-}
-
 fn push_existing_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if !path.exists() || paths.iter().any(|existing| existing == &path) {
         return;
@@ -1778,21 +1752,12 @@ fn serve_direct_llama_server(
         .arg(&request.model_ref)
         .stdin(Stdio::null());
     // Packaged llama-server is raw llama.cpp — it does not read `LEMONADE_API_KEY`.
-    // When `rocm serve` protects a public endpoint, write the key to a 0600 file
-    // and pass `--api-key-file` so the secret never lands in the process table
-    // (unlike the bare `--api-key` flag).
-    if let Some(api_key) = rocm_engine_protocol::resolve_endpoint_api_key() {
-        let key_dir = log_path
-            .and_then(Path::parent)
-            .or_else(|| model_path.parent())
-            .unwrap_or_else(|| Path::new("."));
-        let key_file = key_dir.join(".llama-server-api-key");
-        write_private_file(&key_file, api_key.as_bytes()).with_context(|| {
-            format!(
-                "failed to write llama-server API key file {}",
-                key_file.display()
-            )
-        })?;
+    // When `rocm serve` protects a public endpoint, hand llama-server the *existing*
+    // CLI-managed 0600 key file via `--api-key-file` (a path, not the value, so the
+    // secret never lands in the process table). Reusing the managed file rather than
+    // writing a copy keeps the key's lifecycle owned by `rocm serve` — created before
+    // spawn, deleted on stop — with no stale plaintext copy left behind on teardown.
+    if let Some(key_file) = rocm_engine_protocol::resolve_endpoint_api_key_file() {
         command.arg("--api-key-file").arg(&key_file);
     }
     if let Some(log_path) = log_path {

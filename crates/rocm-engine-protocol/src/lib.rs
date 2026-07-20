@@ -40,6 +40,30 @@ pub fn resolve_endpoint_api_key() -> Option<String> {
     endpoint_api_key_from_file(std::path::Path::new(&path))
 }
 
+/// Resolve the *path* to the endpoint API key file, for engines that authenticate
+/// from a file rather than an env var (e.g. llama-server's `--api-key-file`).
+///
+/// Returns the path named by [`ENDPOINT_API_KEY_FILE_ENV`] when it exists and holds
+/// a non-empty key — the same condition under which [`resolve_endpoint_api_key`]
+/// returns `Some`. Handing the child the CLI-managed key file directly (rather than
+/// copying the secret into a second file) keeps the key's lifecycle owned by
+/// `rocm serve`, which creates the file before spawn and deletes it on stop, so no
+/// stale plaintext copy is ever left behind.
+pub fn resolve_endpoint_api_key_file() -> Option<PathBuf> {
+    endpoint_api_key_file_if_valid(&PathBuf::from(
+        std::env::var(ENDPOINT_API_KEY_FILE_ENV).ok()?,
+    ))
+}
+
+/// Return `path` when it holds a non-empty endpoint key, otherwise `None`.
+///
+/// Uses [`endpoint_api_key_from_file`] for the key check. Split out from
+/// [`resolve_endpoint_api_key_file`] so the key-presence gate is testable without
+/// mutating the process environment.
+pub fn endpoint_api_key_file_if_valid(path: &std::path::Path) -> Option<PathBuf> {
+    endpoint_api_key_from_file(path).map(|_| path.to_path_buf())
+}
+
 /// Read and trim an endpoint API key from `path`.
 ///
 /// Returns `None` for a missing file or empty/whitespace-only contents. Split out
@@ -509,6 +533,28 @@ mod tests {
         let empty = dir.join("empty");
         std::fs::write(&empty, "   \n").unwrap();
         assert_eq!(endpoint_api_key_from_file(&empty), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn endpoint_api_key_file_if_valid_returns_path_only_when_key_present() {
+        let dir = unique_temp_dir("endpoint-key-file-if-valid");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A file holding a key resolves to that same path — the packaged
+        // llama-server fallback hands this to `--api-key-file` instead of writing a
+        // copy, so cleanup stays owned by the caller's key file.
+        let key_file = dir.join("endpoint-key");
+        std::fs::write(&key_file, "secret-key-value\n").unwrap();
+        assert_eq!(
+            endpoint_api_key_file_if_valid(&key_file),
+            Some(key_file.clone())
+        );
+        // A missing or empty file is an unauthenticated (loopback) endpoint: no
+        // `--api-key-file` should be passed.
+        assert_eq!(endpoint_api_key_file_if_valid(&dir.join("missing")), None);
+        let empty = dir.join("empty");
+        std::fs::write(&empty, "\n").unwrap();
+        assert_eq!(endpoint_api_key_file_if_valid(&empty), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
