@@ -3,9 +3,9 @@
 **Stage:** 2-spike-proven-pty-drives-dash-black-box
 **Pipeline:** standard
 **Branch:** test-e2e-tui-cucumber
-**Last Updated:** 2026-07-14
+**Last Updated:** 2026-07-20
 
-**Token Usage:** in=0 out=0 cache_create=0 cache_read=0 calls=0
+**Token Usage:** in=6 out=1856 cache_create=206168 cache_read=192584 calls=4
 
 ---
 
@@ -232,6 +232,12 @@ since the value is a BLOCKING mock-tier gate.
 - Recreate with: `create_worktree.sh test-e2e-tui-cucumber`
 
 ## Work Log
+
+### 2026-07-20
+
+- Session start: reviewed WIP status, oriented to spike-proven stage.
+- Confirmed spike approach (portable-pty + vt100) is viable and proven by hand.
+- Next: activate bdd-scenarios skill + refine draft scenarios before implementation phase.
 
 ### 2026-07-14
 
