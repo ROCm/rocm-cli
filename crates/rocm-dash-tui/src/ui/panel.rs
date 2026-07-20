@@ -238,9 +238,12 @@ pub fn vertical_scrollbar(
     if content_len <= viewport_len || area.width < 2 || area.height == 0 {
         return area;
     }
+    let max_position = content_len.saturating_sub(viewport_len);
+    let rendered_position =
+        position.min(max_position) * content_len.saturating_sub(1) / max_position.max(1);
     let mut sb = ScrollbarState::new(content_len)
         .viewport_content_length(viewport_len)
-        .position(position);
+        .position(rendered_position);
     let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
         .begin_symbol(None)
         .end_symbol(None)
@@ -271,9 +274,12 @@ pub fn horizontal_scrollbar(
     if content_len <= viewport_len || area.height < 2 || area.width == 0 {
         return area;
     }
+    let max_position = content_len.saturating_sub(viewport_len);
+    let rendered_position =
+        position.min(max_position) * content_len.saturating_sub(1) / max_position.max(1);
     let mut sb = ScrollbarState::new(content_len)
         .viewport_content_length(viewport_len)
-        .position(position);
+        .position(rendered_position);
     let bar = Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
         .begin_symbol(None)
         .end_symbol(None)
@@ -427,6 +433,34 @@ mod tests {
         });
         assert_eq!(got.height, 9, "content rect shrinks by the scrollbar row");
         assert_eq!(got.width, area.width, "width unchanged for horizontal bar");
+    }
+
+    #[test]
+    fn vertical_scrollbar_renders_expected_thumb_cells() {
+        let theme = Theme::default_dark();
+        let backend = TestBackend::new(2, 4);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let _ = vertical_scrollbar(f, f.area(), 4, 2, 1, &theme);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let cells: Vec<&str> = (0..4).map(|y| buf.cell((1, y)).unwrap().symbol()).collect();
+        assert_eq!(cells, ["║", "█", "█", "║"]);
+    }
+
+    #[test]
+    fn horizontal_scrollbar_renders_expected_thumb_cells() {
+        let theme = Theme::default_dark();
+        let backend = TestBackend::new(4, 2);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let _ = horizontal_scrollbar(f, f.area(), 4, 2, 1, &theme);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let cells: Vec<&str> = (0..4).map(|x| buf.cell((x, 1)).unwrap().symbol()).collect();
+        assert_eq!(cells, ["═", "█", "█", "═"]);
     }
 
     #[test]

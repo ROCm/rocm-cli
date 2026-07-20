@@ -16,14 +16,14 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use rocm_dash_core::metrics::InstanceStatus;
 
-use crate::app::{AppState, ChatConsent, ChatRole};
+use crate::app::{AppState, ChatConsent, ChatRole, ChatTurn};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
 
 /// Block glyph used to mark the text-entry caret while focused.
 const CURSOR_GLYPH: &str = "▋";
 
-pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+pub fn draw(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
     // Until the user consents to the detected endpoint, the tab shows a gate /
     // empty-state instead of the transcript+input surface.
     if state.chat_consent != ChatConsent::Accepted {
@@ -220,7 +220,42 @@ fn consent_gate_lines<'a>(
 }
 
 /// Render the scrolling transcript. Empty state shows an actionable hint.
-fn draw_transcript(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChatViewport {
+    rendered_rows: usize,
+    viewport_rows: usize,
+    max_scroll: u16,
+    scroll: u16,
+    follow: bool,
+}
+
+impl ChatViewport {
+    fn measure(
+        rendered_rows: usize,
+        viewport_rows: usize,
+        old_scroll: u16,
+        old_follow: bool,
+    ) -> Self {
+        let max_scroll =
+            u16::try_from(rendered_rows.saturating_sub(viewport_rows)).unwrap_or(u16::MAX);
+        let scroll = if old_follow {
+            max_scroll
+        } else {
+            old_scroll.min(max_scroll)
+        };
+        let follow = old_follow || old_scroll > max_scroll;
+        Self {
+            rendered_rows,
+            viewport_rows,
+            max_scroll,
+            scroll,
+            follow,
+        }
+    }
+}
+
+/// Render the scrolling transcript. Empty state shows an actionable hint.
+fn draw_transcript(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
     let inner = panel::bento(f, area, Some("Chat"), BoxRole::Secondary, false, theme);
 
     let lines = if state.chat.is_empty() {
@@ -236,36 +271,61 @@ fn draw_transcript(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             )),
         ]
     } else {
-        transcript_lines(state, theme)
+        transcript_lines_from_turns(&state.chat, theme)
     };
+    let wrap = Wrap { trim: false };
+    let unbarred_rows = Paragraph::new(lines.as_slice())
+        .wrap(wrap)
+        .line_count(inner.width);
+    let body_width = if unbarred_rows > usize::from(inner.height) && inner.width >= 2 {
+        inner.width - 1
+    } else {
+        inner.width
+    };
+    let rendered_rows = Paragraph::new(lines.as_slice())
+        .wrap(wrap)
+        .line_count(body_width);
+    let viewport = ChatViewport::measure(
+        rendered_rows,
+        usize::from(inner.height),
+        state.chat_scroll,
+        state.chat_follow,
+    );
+    state.chat_max_scroll = viewport.max_scroll;
+    state.chat_scroll = viewport.scroll;
+    state.chat_follow = viewport.follow;
 
     let body = panel::vertical_scrollbar(
         f,
         inner,
-        lines.len(),
-        inner.height as usize,
-        state.chat_scroll as usize,
+        viewport.rendered_rows,
+        viewport.viewport_rows,
+        usize::from(viewport.scroll),
         theme,
     );
     state.record_scrollbar(
         inner,
         body,
         false,
-        lines.len(),
-        inner.height as usize,
+        viewport.rendered_rows,
+        viewport.viewport_rows,
         crate::app::ScrollTarget::Chat,
     );
-    let p = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((state.chat_scroll, 0));
-    f.render_widget(p, body);
+    let paragraph = Paragraph::new(lines)
+        .wrap(wrap)
+        .scroll((viewport.scroll, 0));
+    f.render_widget(paragraph, body);
 }
 
 /// Pure transcript → styled lines mapping. Each turn becomes a role-prefixed,
 /// role-colored line. Kept free of `Frame` so it can be unit-tested.
 pub fn transcript_lines<'a>(state: &'a AppState, theme: &Theme) -> Vec<Line<'a>> {
-    let mut lines: Vec<Line> = Vec::with_capacity(state.chat.len());
-    for turn in &state.chat {
+    transcript_lines_from_turns(&state.chat, theme)
+}
+
+fn transcript_lines_from_turns<'a>(turns: &'a [ChatTurn], theme: &Theme) -> Vec<Line<'a>> {
+    let mut lines = Vec::with_capacity(turns.len());
+    for turn in turns {
         let (prefix, color) = match turn.role {
             ChatRole::User => ("you  ", theme.accent),
             ChatRole::Agent => ("rocm ", theme.fg),
@@ -410,16 +470,17 @@ mod tests {
         use crate::app::ChatConsent;
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        let render = |s: &AppState| {
+        let render = |s: &mut AppState| {
             let backend = TestBackend::new(80, 24);
             let mut term = Terminal::new(backend).unwrap();
-            term.draw(|f| draw(f, f.area(), s, &s.theme)).unwrap();
+            let theme = s.theme;
+            term.draw(|f| draw(f, f.area(), s, &theme)).unwrap();
         };
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.active_tab = crate::app::ActiveTab::Chat;
 
         // Unavailable empty-state.
-        render(&s);
+        render(&mut s);
 
         let llm = crate::llm::LlmConfig {
             base_url: "http://127.0.0.1:8000".into(),
@@ -429,10 +490,10 @@ mod tests {
         };
         // Pending consent prompt.
         s.set_chat_config(Some(llm.clone()), false);
-        render(&s);
+        render(&mut s);
         // Declined.
         s.chat_consent = ChatConsent::Declined;
-        render(&s);
+        render(&mut s);
 
         // Accepted: populated transcript + focused input.
         s.set_chat_config(Some(llm), true);
@@ -440,15 +501,16 @@ mod tests {
         s.chat_input = "what's GPU-2 doing?".into();
         s.chat.push(ChatTurn::user("hi"));
         s.chat.push(ChatTurn::agent("echo: hi"));
-        render(&s);
+        render(&mut s);
     }
 
-    fn render_str(s: &AppState) -> String {
+    fn render_str(s: &mut AppState) -> String {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| draw(f, f.area(), s, &s.theme)).unwrap();
+        let theme = s.theme;
+        term.draw(|f| draw(f, f.area(), s, &theme)).unwrap();
         let buf = term.backend().buffer().clone();
         buf.content()
             .iter()
@@ -456,15 +518,126 @@ mod tests {
             .collect()
     }
 
+    fn render_at(s: &mut AppState, width: u16, height: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(width, height);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = s.theme;
+        term.draw(|f| draw(f, f.area(), s, &theme)).unwrap();
+        term.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    #[test]
+    fn deliberate_bottom_position_does_not_enable_follow() {
+        let viewport = ChatViewport::measure(30, 10, 20, false);
+
+        assert_eq!(viewport.scroll, viewport.max_scroll);
+        assert!(!viewport.follow);
+    }
+
+    #[test]
+    fn transcript_segments_remain_borrowed() {
+        use std::borrow::Cow;
+
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.chat.push(ChatTurn::agent("borrow me"));
+        let lines = transcript_lines(&s, &s.theme);
+        assert!(matches!(
+            lines[0].spans[1].content,
+            Cow::Borrowed("borrow me")
+        ));
+    }
+
+    #[test]
+    fn wrapped_transcript_records_rendered_rows_for_scrolling() {
+        let mut s = accepted_chat_at_port(8000);
+        s.chat.push(ChatTurn::agent("x".repeat(500)));
+
+        render_at(&mut s, 40, 12);
+
+        let bars = s.scrollbars.borrow();
+        let chat_bar = bars
+            .iter()
+            .find(|bar| bar.target == crate::app::ScrollTarget::Chat)
+            .expect("wrapped transcript should overflow and draw a scrollbar");
+        assert!(chat_bar.content_len > s.chat.len());
+        assert_eq!(s.chat_scroll, s.chat_max_scroll);
+    }
+
+    #[test]
+    fn chat_render_clamps_scroll_to_last_full_viewport() {
+        let mut s = accepted_chat_at_port(8000);
+        for i in 0..30 {
+            s.chat.push(ChatTurn::agent(format!("message {i}")));
+        }
+        s.chat_follow = false;
+        s.chat_scroll = u16::MAX;
+
+        let out = render_at(&mut s, 80, 24);
+
+        assert_eq!(s.chat_scroll, s.chat_max_scroll);
+        assert!(s.chat_follow, "clamping past the bottom restores follow");
+        assert!(out.contains("message 29"), "latest message remains visible");
+    }
+
+    #[test]
+    fn chat_preserves_scrolled_position_but_follows_from_bottom() {
+        let mut s = accepted_chat_at_port(8000);
+        for i in 0..30 {
+            s.chat.push(ChatTurn::agent(format!("message {i}")));
+        }
+        render_at(&mut s, 80, 24);
+        let old_max = s.chat_max_scroll;
+
+        s.chat_follow = false;
+        s.chat_scroll = old_max.saturating_sub(3);
+        s.chat.push(ChatTurn::agent("new while reviewing"));
+        render_at(&mut s, 80, 24);
+        assert_eq!(s.chat_scroll, old_max.saturating_sub(3));
+        assert!(!s.chat_follow);
+
+        s.chat_follow = true;
+        s.chat.push(ChatTurn::agent("new while following"));
+        let out = render_at(&mut s, 80, 24);
+        assert_eq!(s.chat_scroll, s.chat_max_scroll);
+        assert!(out.contains("new while following"));
+    }
+
+    #[test]
+    fn resize_clamp_to_bottom_reenables_chat_follow() {
+        let mut s = accepted_chat_at_port(8000);
+        for i in 0..35 {
+            s.chat.push(ChatTurn::agent(format!("message {i}")));
+        }
+        render_at(&mut s, 50, 14);
+        s.chat_follow = false;
+        s.chat_scroll = s.chat_max_scroll.saturating_sub(2);
+
+        render_at(&mut s, 50, 24);
+        assert_eq!(s.chat_scroll, s.chat_max_scroll);
+        assert!(s.chat_follow);
+
+        s.chat.push(ChatTurn::agent("latest after resize"));
+        let out = render_at(&mut s, 50, 24);
+        assert_eq!(s.chat_scroll, s.chat_max_scroll);
+        assert!(out.contains("latest after resize"));
+    }
+
     #[test]
     fn gate_shows_detect_affordance_and_message() {
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.active_tab = crate::app::ActiveTab::Chat;
         // Unavailable empty-state offers detection.
-        assert!(render_str(&s).contains("detect a local engine"));
+        assert!(render_str(&mut s).contains("detect a local engine"));
         // After a fruitless detect, the message shows.
         s.set_detect_result(None);
-        assert!(render_str(&s).contains("no local engine found"));
+        assert!(render_str(&mut s).contains("no local engine found"));
     }
 
     #[test]
@@ -472,7 +645,7 @@ mod tests {
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.active_tab = crate::app::ActiveTab::Chat;
         s.request_detect();
-        assert!(render_str(&s).contains("Probing for a local engine"));
+        assert!(render_str(&mut s).contains("Probing for a local engine"));
     }
 
     #[test]
@@ -483,7 +656,7 @@ mod tests {
             "http://localhost:13305/v1",
             "Llama-3.2-3B",
         )));
-        let out = render_str(&s);
+        let out = render_str(&mut s);
         assert!(out.contains("Detected a local engine"));
         assert!(out.contains("localhost:13305"));
         assert!(out.contains("Llama-3.2-3B"));
@@ -593,7 +766,7 @@ mod tests {
         let mut s = accepted_chat_at_port(8000);
         s.chat_sending = true;
         set_backing_instance(&mut s, 8000, InstanceStatus::Starting { phase: None });
-        let out = render_str(&s);
+        let out = render_str(&mut s);
         assert!(
             out.contains("starting up"),
             "shows the specific startup reason"
@@ -616,7 +789,7 @@ mod tests {
         };
         s.set_chat_config(Some(llm), true);
         s.chat_sending = true;
-        let out = render_str(&s);
+        let out = render_str(&mut s);
         assert!(
             out.contains("waiting for the agent"),
             "generic spinner remains"

@@ -905,6 +905,8 @@ mod tests {
             chat_endpoint_rebuild: None,
             chat_focused: false,
             chat_scroll: 0,
+            chat_max_scroll: 0,
+            chat_follow: true,
             chat_llm: None,
             chat_consent: crate::app::ChatConsent::Unavailable,
             chat_detect_offer: None,
