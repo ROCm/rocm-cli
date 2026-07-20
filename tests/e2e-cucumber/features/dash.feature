@@ -20,8 +20,8 @@ Feature: Interactive dashboard
     When the user opens interactive chat
     And the user sends a message about GPU health
     Then the assistant's GPU status response is displayed
-    When the user quits the dashboard
-    Then the dashboard exits successfully
+    When the user quits interactive chat
+    Then interactive chat exits successfully
 
   @id:dash-loading-service-status @requires-os:linux
   Scenario: 3 - The dashboard reports a model that is still loading as loading

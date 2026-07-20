@@ -288,6 +288,16 @@ impl TuiSession {
                 if self.screen_text().contains(marker) {
                     return Ok(());
                 }
+                // A reader panic landing exactly on the drain deadline would
+                // otherwise be masked by the generic "process exited" error below
+                // (and then swallowed entirely if `Drop` runs during another
+                // unwind). Surface it here so the real cause wins.
+                if let Some(panic_message) = self.take_reader_panic() {
+                    return Err(format!(
+                        "pty reader thread panicked while draining the final frame for {marker:?}: {panic_message}\n{}",
+                        self.framed_screen()
+                    ));
+                }
                 return Err(format!(
                     "process exited ({status:?}) before {marker:?} appeared.\n{}",
                     self.framed_screen()
@@ -404,14 +414,21 @@ impl Drop for TuiSession {
                 } else {
                     panic!("pty reader thread panicked: {message}");
                 }
-            } else if let Some(message) = self.take_reader_panic()
-                && !std::thread::panicking()
-            {
+            } else if let Some(message) = self.take_reader_panic() {
                 // The reader caught its own panic and exited cleanly (see
                 // `spawn_reader`), but no `wait_for_screen`/`wait_for_exit` call
                 // ever observed and reported it — surface it now rather than
-                // silently dropping the diagnostic.
-                panic!("pty reader thread panicked: {message}");
+                // silently dropping the diagnostic. As with the `join` branch
+                // above, never turn this into a second panic while another panic
+                // is already unwinding (it would abort the process and destroy
+                // the original failure's message); log to stderr in that case.
+                if std::thread::panicking() {
+                    eprintln!(
+                        "pty reader thread panicked (suppressed to preserve the original panic): {message}"
+                    );
+                } else {
+                    panic!("pty reader thread panicked: {message}");
+                }
             }
         }
     }
