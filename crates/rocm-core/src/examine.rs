@@ -545,13 +545,33 @@ fn classify_amd_marketing_name(name: &str) -> (String, bool) {
     (String::new(), APU_KEYWORDS.iter().any(|kw| n.contains(kw)))
 }
 
-/// Whether a gfx target belongs to an APU family the doctor cares about
-/// (gfx115x / gfx110x / gfx103x).
+/// Whether a gfx target belongs to an AMD APU family the doctor cares about.
+///
+/// APUs: gfx1103 (Phoenix / Hawk Point) and the gfx115x parts (Strix Point /
+/// Strix Halo). Their neighbors gfx1100 / gfx1101 / gfx1102 (Navi 31 / 32 / 33)
+/// share the gfx110x prefix but are *discrete* RDNA3 GPUs, so they must not
+/// match — otherwise they inflate `has_apu` and suppress `has_discrete_amd`,
+/// which gates the iGPU+dGPU collision fix. (Target -> product per LLVM
+/// AMDGPUUsage.)
 fn gfx_is_apu_family(gfx: &str) -> bool {
     let g = gfx.to_lowercase();
-    (g.starts_with("gfx110") || g.starts_with("gfx115"))
-        && g.len() >= 7
-        && g.as_bytes()[6].is_ascii_digit()
+    // gfx115x: every Strix part is an APU.
+    if gfx_model_digit(&g, "gfx115").is_some() {
+        return true;
+    }
+    // gfx110x: only gfx1103 and above are APUs; gfx1100/1101/1102 are discrete.
+    if let Some(digit) = gfx_model_digit(&g, "gfx110") {
+        return digit >= 3;
+    }
+    false
+}
+
+/// The model digit that follows `prefix` in a gfx target, e.g. `3` from
+/// `gfx1103` given prefix `gfx110`. Returns `None` when `gfx` does not start
+/// with `prefix` or has no digit there. Any trailing feature suffix (such as
+/// `:sramecc+:xnack-`) is ignored, matching how gcnArchName can be reported.
+fn gfx_model_digit(gfx: &str, prefix: &str) -> Option<u32> {
+    gfx.strip_prefix(prefix)?.chars().next()?.to_digit(10)
 }
 
 fn probe_gpus_lspci(e: &mut Examination) {
@@ -1564,15 +1584,80 @@ mod tests {
     }
 
     #[test]
-    fn gfx_apu_family_classification() {
-        // Mirrors examine.py's `gfx11[05]\d` regex exactly (faithful parity),
-        // including that it matches gfx1100 — diagnose.py is written against
-        // this behavior, so we reproduce it rather than "correct" it.
-        assert!(gfx_is_apu_family("gfx1151"));
+    fn gfx_apu_family_neighboring_contract() {
+        // gfx110x straddles two silicon families: gfx1100/gfx1101/gfx1102 are
+        // discrete RDNA3 parts (Navi 31/32/33 -> Radeon RX 7900/7800/7600),
+        // while gfx1103 (Phoenix / Hawk Point) is an APU. gfx115x (Strix Point
+        // / Strix Halo) are APUs. Target->product mapping per LLVM AMDGPUUsage.
+        //
+        // The discrete neighbors must NOT be classified as an APU family: they
+        // drive `has_discrete_amd`, which gates the iGPU+dGPU collision fix.
+        assert!(!gfx_is_apu_family("gfx1100"));
+        assert!(!gfx_is_apu_family("gfx1101"));
+        assert!(!gfx_is_apu_family("gfx1102"));
+        // Integrated APUs (every gfx115x part plus gfx1103+).
         assert!(gfx_is_apu_family("gfx1103"));
-        assert!(gfx_is_apu_family("gfx1100"));
+        assert!(gfx_is_apu_family("gfx1150"));
+        assert!(gfx_is_apu_family("gfx1151"));
+        assert!(gfx_is_apu_family("gfx1152"));
+        // Unrelated families are never APUs.
         assert!(!gfx_is_apu_family("gfx1200"));
         assert!(!gfx_is_apu_family("gfx942"));
+        // A trailing gcnArchName feature suffix must not change the verdict.
+        assert!(gfx_is_apu_family("gfx1103:sramecc+:xnack-"));
+        assert!(!gfx_is_apu_family("gfx1100:xnack-"));
+        // Degenerate inputs never match.
+        assert!(!gfx_is_apu_family("gfx110"));
+        assert!(!gfx_is_apu_family(""));
+    }
+
+    #[test]
+    fn apu_plus_discrete_neighbor_sets_both_category_flags() {
+        // A machine with a real APU (gfx1103 Phoenix) and its discrete RDNA3
+        // neighbor (gfx1100 Navi 31) must report BOTH an APU and a discrete
+        // AMD GPU. Before the gfx110x carve-out, gfx1100 was tagged an APU
+        // too, so `has_discrete_amd` stayed false and the iGPU+dGPU collision
+        // fix was silently suppressed for exactly this pairing.
+        let mut e = Examination {
+            gpus: vec![
+                Gpu {
+                    gfx_target: "gfx1103".to_owned(),
+                    is_amd: true,
+                    is_apu: Some(gfx_is_apu_family("gfx1103")),
+                    ..Gpu::default()
+                },
+                Gpu {
+                    gfx_target: "gfx1100".to_owned(),
+                    is_amd: true,
+                    is_apu: Some(gfx_is_apu_family("gfx1100")),
+                    ..Gpu::default()
+                },
+            ],
+            ..Examination::default()
+        };
+        summarise_gpu_categories(&mut e);
+        assert!(e.has_apu, "gfx1103 APU should set has_apu");
+        assert!(
+            e.has_discrete_amd,
+            "gfx1100 dGPU should set has_discrete_amd"
+        );
+    }
+
+    #[test]
+    fn lone_discrete_rdna3_is_not_reported_as_apu() {
+        // A box with only a gfx1100 discrete card must not claim to have an APU.
+        let mut e = Examination {
+            gpus: vec![Gpu {
+                gfx_target: "gfx1100".to_owned(),
+                is_amd: true,
+                is_apu: Some(gfx_is_apu_family("gfx1100")),
+                ..Gpu::default()
+            }],
+            ..Examination::default()
+        };
+        summarise_gpu_categories(&mut e);
+        assert!(!e.has_apu, "a lone gfx1100 dGPU must not set has_apu");
+        assert!(e.has_discrete_amd);
     }
 
     #[test]

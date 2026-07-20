@@ -874,6 +874,31 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
     }
 
     let gfx_targets = amd_gfx_targets(e);
+    // Name the discrete GPU explicitly instead of guessing by gfx number: on
+    // RDNA3 the integrated APU (gfx1103 / gfx115x) can outrank its discrete
+    // neighbor (gfx1100/1101/1102), so "the higher-numbered target is the dGPU"
+    // is actively wrong for exactly the APU+dGPU pairing this check fires on.
+    let discrete_targets: Vec<String> = e
+        .gpus
+        .iter()
+        .filter(|g| g.is_amd && g.is_apu == Some(false) && !g.gfx_target.is_empty())
+        .map(|g| g.gfx_target.clone())
+        .collect();
+    let apu_targets: Vec<String> = e
+        .gpus
+        .iter()
+        .filter(|g| g.is_amd && g.is_apu == Some(true) && !g.gfx_target.is_empty())
+        .map(|g| g.gfx_target.clone())
+        .collect();
+    let note = if discrete_targets.is_empty() {
+        format!(
+            "Detected gfx targets: {gfx_targets:?}. Pin HIP_VISIBLE_DEVICES to the discrete GPU so the integrated APU is hidden."
+        )
+    } else {
+        format!(
+            "Detected gfx targets: {gfx_targets:?}. Discrete GPU(s): {discrete_targets:?}; integrated APU(s): {apu_targets:?}. Pin HIP_VISIBLE_DEVICES to the discrete GPU — do not assume the higher-numbered gfx target is the dGPU (on RDNA3 the APU can be higher)."
+        )
+    };
     let fix = if e.os_family == "windows" {
         Fix {
             summary: "Pin the HIP runtime to the discrete GPU with HIP_VISIBLE_DEVICES so the iGPU is hidden.".to_owned(),
@@ -887,7 +912,7 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
             fix_id: "fix-9-igpu-dgpu".to_owned(),
             auto_applicable: true,
             verify: "powershell -NoProfile -Command \"$env:HIP_VISIBLE_DEVICES=1; python -c \\\"import torch; print(torch.cuda.device_count())\\\"\"".to_owned(),
-            notes: vec![format!("Detected gfx targets: {gfx_targets:?}. The dGPU is usually the higher-numbered family (gfx11xx).")],
+            notes: vec![note],
             ..Fix::default()
         }
     } else {
@@ -903,7 +928,7 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
             fix_id: "fix-9-igpu-dgpu".to_owned(),
             auto_applicable: false,
             verify: "HIP_VISIBLE_DEVICES=1 python -c \"import torch; print(torch.cuda.device_count())\"".to_owned(),
-            notes: vec![format!("Detected gfx targets: {gfx_targets:?}. The dGPU is usually the higher-numbered family (gfx11xx).")],
+            notes: vec![note],
             ..Fix::default()
         }
     };
@@ -1446,6 +1471,44 @@ mod tests {
         assert_eq!(top.id, "fix-1-arch");
         // 50 (keyword) + 55 (missing arch), clamped to 100.
         assert_eq!(top.score, 100);
+    }
+
+    #[test]
+    fn igpu_dgpu_collision_fires_for_rdna3_apu_plus_discrete() {
+        // End-to-end guard for EAI-7412: a gfx1103 (Phoenix APU) + gfx1100
+        // (Navi 31 dGPU) box must now trigger the iGPU+dGPU collision fix,
+        // which was silently suppressed while gfx1100 was misclassified as an
+        // APU. The note must name the discrete target rather than telling the
+        // user the higher-numbered gfx target is the dGPU (false here).
+        let mut e = linux_base();
+        e.has_apu = true;
+        e.has_discrete_amd = true;
+        e.gpus = vec![
+            Gpu {
+                gfx_target: "gfx1103".to_owned(),
+                is_amd: true,
+                is_apu: Some(true),
+                ..Gpu::default()
+            },
+            Gpu {
+                gfx_target: "gfx1100".to_owned(),
+                is_amd: true,
+                is_apu: Some(false),
+                ..Gpu::default()
+            },
+        ];
+        let report = diagnose(&e, "torch crashes with a segfault");
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-9-igpu-dgpu")
+            .expect("iGPU+dGPU collision should be diagnosed");
+        let note = hit.fix.as_ref().unwrap().notes.join(" ");
+        assert!(note.contains("gfx1100"), "note must name the dGPU: {note}");
+        assert!(
+            !note.contains("usually the higher-numbered"),
+            "note must not repeat the old wrong gfx-number heuristic: {note}"
+        );
     }
 
     #[test]
