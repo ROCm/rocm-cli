@@ -3550,16 +3550,26 @@ fn probe_usable_amd_gpu_indices() -> Option<Vec<u32>> {
 }
 
 /// Combine the KFD-topology and DRM-card AMD GPU counts into one "GPUs present"
-/// figure, taking the larger available count. Some hosts (e.g. Strix Halo APUs)
-/// enumerate the GPU only via DRM ip-discovery and report zero KFD GPU nodes, so
-/// relying on KFD alone would wrongly conclude there is no GPU and block serving.
+/// figure. KFD counts *compute* nodes and is authoritative for HIP ordinals, so
+/// it wins whenever it reports at least one GPU. DRM is used only as the
+/// zero-KFD fallback: some hosts (e.g. Strix Halo APUs) enumerate the GPU only
+/// via DRM ip-discovery and report zero KFD GPU nodes, so relying on KFD alone
+/// would wrongly conclude there is no GPU and block serving.
+///
+/// DRM must not *raise* a nonzero KFD count: a display/render-only AMD DRM card
+/// with no KFD compute node (e.g. KFD=1, DRM=2) would otherwise invent a usable
+/// HIP ordinal that passes `--gpu` validation but fails later inside HIP.
+///
 /// `None` only when NEITHER surface could be read (availability truly unknown).
 #[cfg(any(target_os = "linux", test))]
 fn combine_amd_gpu_counts(kfd: Option<usize>, drm: Option<usize>) -> Option<usize> {
-    match (kfd, drm) {
-        (Some(k), Some(d)) => Some(k.max(d)),
-        (Some(n), None) | (None, Some(n)) => Some(n),
-        (None, None) => None,
+    match kfd {
+        // KFD is compute-authoritative: prefer it whenever it sees a GPU.
+        Some(k) if k > 0 => Some(k),
+        // Zero KFD compute nodes: fall back to DRM for the APU shape.
+        Some(_) => Some(drm.unwrap_or(0)),
+        // KFD unreadable: use DRM if it could be read, else availability unknown.
+        None => drm,
     }
 }
 
@@ -8316,7 +8326,16 @@ last_installed_runtime_id = "therock-release"
     }
 
     #[test]
-    fn combine_amd_gpu_counts_takes_larger_and_needs_one_readable_surface() {
+    fn combine_amd_gpu_counts_prefers_compute_authoritative_kfd() {
+        // KFD is compute-authoritative: a nonzero KFD count wins, and DRM must not
+        // raise it. A display/render-only AMD DRM card (KFD=1, DRM=2) must NOT
+        // invent a second usable HIP ordinal, or an explicit `--gpu 1` would pass
+        // validation and then fail inside HIP.
+        assert_eq!(combine_amd_gpu_counts(Some(1), Some(2)), Some(1));
+        // Same principle with more DRM cards: still bounded by the KFD count.
+        assert_eq!(combine_amd_gpu_counts(Some(2), Some(8)), Some(2));
+        // KFD larger than DRM (e.g. multi-partition compute nodes): KFD still wins.
+        assert_eq!(combine_amd_gpu_counts(Some(3), Some(1)), Some(3));
         // Strix Halo shape: KFD reports 0 GPU nodes, DRM sees the iGPU → 1 present.
         assert_eq!(combine_amd_gpu_counts(Some(0), Some(1)), Some(1));
         // Discrete GPUs: both surfaces agree.
