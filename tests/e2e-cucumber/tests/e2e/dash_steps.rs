@@ -8,10 +8,15 @@
 //! screen, and clean exit — which the piped-`Command` steps structurally cannot.
 
 use cucumber::{given, then, when};
-use e2e_cucumber::mock_server::MockServer;
+use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions};
 
+use crate::E2eWorld;
 use crate::e2e::tui_driver::{DEFAULT_TIMEOUT, TuiSession};
-use crate::{E2eWorld, RegisterServiceOptions};
+
+/// The exact prompt `send_managed_model_message` types, and the string the
+/// corresponding `Then` step (`managed_chat_request_carried_prompt`) asserts
+/// the mock actually received — so the two can never silently drift apart.
+const MANAGED_MODEL_PROMPT: &str = "hello from the terminal";
 
 /// Borrow the scenario's active TUI session, or fail clearly if none was opened.
 const fn session(world: &mut E2eWorld) -> &mut TuiSession {
@@ -33,7 +38,7 @@ async fn chat_offline(world: &mut E2eWorld) {
 
 async fn setup_managed_model(
     world: &mut E2eWorld,
-    options: RegisterServiceOptions,
+    options: ServiceRecordOptions,
     with_metrics: bool,
 ) {
     let model = "TestModel/E2E-1B";
@@ -52,9 +57,10 @@ async fn setup_managed_model(
 async fn managed_model_loading(world: &mut E2eWorld) {
     setup_managed_model(
         world,
-        RegisterServiceOptions {
+        ServiceRecordOptions {
             status: "starting",
             startup_phase: Some("loading"),
+            ..ServiceRecordOptions::default()
         },
         false,
     )
@@ -63,12 +69,12 @@ async fn managed_model_loading(world: &mut E2eWorld) {
 
 #[given("a managed model exposes serving metrics")]
 async fn managed_model_with_metrics(world: &mut E2eWorld) {
-    setup_managed_model(world, RegisterServiceOptions::default(), true).await;
+    setup_managed_model(world, ServiceRecordOptions::default(), true).await;
 }
 
 #[given("a running managed model is available locally")]
 async fn running_managed_model(world: &mut E2eWorld) {
-    setup_managed_model(world, RegisterServiceOptions::default(), false).await;
+    setup_managed_model(world, ServiceRecordOptions::default(), false).await;
 }
 
 // ── When ───────────────────────────────────────────────────────────
@@ -167,9 +173,11 @@ async fn send_managed_model_message(world: &mut E2eWorld) {
     tui.wait_for_screen("No messages yet.", DEFAULT_TIMEOUT)
         .await
         .unwrap_or_else(|e| panic!("chat surface never became ready: {e}"));
-    tui.send("i")
-        .unwrap_or_else(|e| panic!("failed to focus the chat input: {e}"));
-    tui.send("hello from the terminal")
+    // No `i` here: accepting local-endpoint consent (`accept_chat_consent`) already
+    // focused the input, so an extra `i` would be typed as a literal character
+    // instead of a focus gesture (contrast the offline path in
+    // `send_gpu_message`, whose `--chat-mock` consent does not focus the input).
+    tui.send(MANAGED_MODEL_PROMPT)
         .unwrap_or_else(|e| panic!("failed to type the chat message: {e}"));
     tui.send("\r")
         .unwrap_or_else(|e| panic!("failed to submit the chat message: {e}"));
@@ -248,6 +256,39 @@ async fn managed_model_response_displayed(world: &mut E2eWorld) {
         .wait_for_screen("mock response for testing", DEFAULT_TIMEOUT)
         .await
         .unwrap_or_else(|e| panic!("the managed model's response did not appear: {e}"));
+}
+
+#[then("the mock received the typed prompt")]
+async fn managed_chat_request_carried_prompt(world: &mut E2eWorld) {
+    // The canned reply above is fixed regardless of what was sent, so it alone
+    // can't prove the TUI actually submitted `MANAGED_MODEL_PROMPT` (a stray
+    // keystroke corrupting the prompt would still show that reply). Assert on
+    // the request the mock actually received instead. `wait_for_chat_request`
+    // polls rather than reading a single snapshot: the response already
+    // rendering on screen only proves the reply arrived, not that the mock's
+    // handler finished recording the request into shared state first.
+    let body = world
+        .mock
+        .as_ref()
+        .expect("no mock server running")
+        .wait_for_chat_request(DEFAULT_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("the mock never received a chat request: {e}"));
+    let messages = body
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("chat request had no messages array:\n{body}"));
+    let last_user_content = messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+        .and_then(|m| m.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("no user message found in chat request:\n{body}"));
+    assert_eq!(
+        last_user_content, MANAGED_MODEL_PROMPT,
+        "mock did not receive the exact typed prompt; full request:\n{body}"
+    );
 }
 
 #[then("the managed model is shown as loading rather than ready")]
@@ -363,7 +404,7 @@ async fn interactive_chat_exited(world: &mut E2eWorld) {
     assert_tui_opened(world);
 }
 
-// ── Then: chat privacy consent gate (real endpoint, EAI-7222) ──────
+// ── Then: chat privacy consent gate (real endpoint) ──
 
 #[then("the local endpoint is shown for confirmation")]
 async fn local_endpoint_shown(world: &mut E2eWorld) {

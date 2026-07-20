@@ -9,7 +9,7 @@
 //! the CLI only enters the crossterm raw-mode event loop when both stdin and
 //! stdout are a real terminal (`rocm_core::interactive_terminal`), and a pipe is
 //! not. So the dash was previously "untestable black-box" (e.g. the chat privacy
-//! notice, EAI-7222) and only had in-process render tests.
+//! notice) and only had in-process render tests.
 //!
 //! This driver closes that gap the way a user's terminal does: it spawns the
 //! real binary under a pseudo-terminal (`portable-pty`), feeds keystrokes to the
@@ -28,6 +28,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+
+use e2e_cucumber::panic_capture::panic_message;
 
 use crate::E2eWorld;
 
@@ -62,6 +64,12 @@ pub struct TuiSession {
     parser: Arc<Mutex<vt100::Parser>>,
     reader_stop: Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
+    /// Set by the reader thread if `vt100::Parser::process` ever panics, before
+    /// the thread exits. `wait_for_screen`/`wait_for_exit` check this every poll
+    /// so a reader panic (which would otherwise just stop screen updates and
+    /// poison `parser`) is reported directly instead of surfacing as a 20s
+    /// timeout over an unexplained blank/stale screen.
+    reader_panic: Arc<Mutex<Option<String>>>,
     /// Kept alive for the lifetime of the session: the reader/writer are cloned
     /// from it, and dropping it early would close the PTY.
     master: Box<dyn MasterPty + Send>,
@@ -139,7 +147,13 @@ impl TuiSession {
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, 0)));
         let reader_stop = Arc::new(AtomicBool::new(false));
-        let reader = spawn_reader(reader, Arc::clone(&parser), Arc::clone(&reader_stop));
+        let reader_panic: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let reader = spawn_reader(
+            reader,
+            Arc::clone(&parser),
+            Arc::clone(&reader_stop),
+            Arc::clone(&reader_panic),
+        );
 
         Ok(Self {
             child,
@@ -147,6 +161,7 @@ impl TuiSession {
             parser,
             reader_stop,
             reader: Some(reader),
+            reader_panic,
             master: pair.master,
             finished: false,
             recorded: false,
@@ -164,15 +179,34 @@ impl TuiSession {
     }
 
     fn screen_snapshot(&self) -> (String, (u16, u16)) {
-        self.parser
+        // Recover a poisoned lock rather than defaulting to a blank screen: the
+        // parser's data is still valid even if some other thread panicked while
+        // holding the lock (the reader thread never panics while holding it —
+        // see `spawn_reader` — but recovering here keeps this robust regardless).
+        // A silent blank default would otherwise masquerade as "nothing rendered
+        // yet" and burn the full poll timeout instead of failing immediately.
+        let p = self
+            .parser
             .lock()
-            .map(|p| (p.screen().contents(), p.screen().size()))
-            .unwrap_or_default()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (p.screen().contents(), p.screen().size())
     }
 
     fn framed_screen(&self) -> String {
         let (screen, (rows, cols)) = self.screen_snapshot();
         format!("--- last screen ({cols}x{rows}) ---\n{screen}\n--- end screen ---")
+    }
+
+    /// Take the reader thread's recorded panic message, if any, clearing it so
+    /// it's only reported once. Checked on every poll in `wait_for_screen`/
+    /// `wait_for_exit` so a reader-thread fault surfaces immediately with a
+    /// direct diagnostic instead of a 20s timeout over a screen that stopped
+    /// updating for an unexplained reason.
+    fn take_reader_panic(&self) -> Option<String> {
+        self.reader_panic
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     /// Resize both the real PTY and the emulated screen. The application receives
@@ -188,9 +222,12 @@ impl TuiSession {
         self.master
             .resize(size)
             .map_err(|e| format!("failed to resize pty: {e}"))?;
+        // As in `screen_snapshot`, recover rather than fail on a poisoned lock —
+        // resizing is still meaningful even if some earlier operation panicked
+        // while holding it.
         self.parser
             .lock()
-            .map_err(|_| "failed to lock vt100 parser".to_string())?
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .screen_mut()
             .set_size(DETAIL_ROWS, DETAIL_COLS);
         Ok(())
@@ -213,6 +250,12 @@ impl TuiSession {
             if self.screen_text().contains(marker) {
                 return Ok(());
             }
+            if let Some(panic_message) = self.take_reader_panic() {
+                return Err(format!(
+                    "pty reader thread panicked while waiting for {marker:?}: {panic_message}\n{}",
+                    self.framed_screen()
+                ));
+            }
             // If the process is gone, let the reader drain the final frame for a
             // short bounded window. A single poll is not enough when a large frame
             // is still buffered behind the process exit notification.
@@ -223,6 +266,12 @@ impl TuiSession {
                 while Instant::now() < drain_deadline {
                     if self.screen_text().contains(marker) {
                         return Ok(());
+                    }
+                    if let Some(panic_message) = self.take_reader_panic() {
+                        return Err(format!(
+                            "pty reader thread panicked while draining the final frame for {marker:?}: {panic_message}\n{}",
+                            self.framed_screen()
+                        ));
                     }
                     if self
                         .reader
@@ -286,6 +335,15 @@ impl TuiSession {
                 Ok(None) => {}
                 Err(e) => return Err(format!("failed to poll TUI child: {e}")),
             }
+            // A reader panic doesn't affect whether the child itself has exited,
+            // but it does mean the screen in any resulting error/diagnostic is
+            // stale, so surface it rather than let this poll silently continue.
+            if let Some(panic_message) = self.take_reader_panic() {
+                return Err(format!(
+                    "pty reader thread panicked while waiting for exit: {panic_message}\n{}",
+                    self.framed_screen()
+                ));
+            }
             if Instant::now() >= deadline {
                 return Err(format!(
                     "timed out after {timeout:?} waiting for the TUI to exit.\n{}",
@@ -328,7 +386,33 @@ impl Drop for TuiSession {
         }
         self.reader_stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.reader.take() {
-            let _ = handle.join();
+            // `join` returns `Err` only if the reader thread itself panicked
+            // (distinct from `reader_panic`, which we set *before* the thread
+            // exits normally after catching a `p.process` panic — so `join`
+            // failing here would mean some other, uncaught panic in the reader).
+            // Never re-panic here: if a scenario step already panicked and this
+            // `drop` is running during that unwind, turning a teardown detail
+            // into a second panic would abort the process and destroy the
+            // original failure's message. Log to stderr instead, and only ever
+            // panic (to fail an otherwise-green test) when nothing is unwinding.
+            if let Err(payload) = handle.join() {
+                let message = panic_message(&payload);
+                if std::thread::panicking() {
+                    eprintln!(
+                        "pty reader thread also panicked during teardown (suppressed to preserve the original panic): {message}"
+                    );
+                } else {
+                    panic!("pty reader thread panicked: {message}");
+                }
+            } else if let Some(message) = self.take_reader_panic()
+                && !std::thread::panicking()
+            {
+                // The reader caught its own panic and exited cleanly (see
+                // `spawn_reader`), but no `wait_for_screen`/`wait_for_exit` call
+                // ever observed and reported it — surface it now rather than
+                // silently dropping the diagnostic.
+                panic!("pty reader thread panicked: {message}");
+            }
         }
     }
 }
@@ -336,10 +420,16 @@ impl Drop for TuiSession {
 /// Continuously drain the PTY into the shared parser until EOF or stop. Runs on a
 /// dedicated OS thread because PTY reads block; the assertion side only ever
 /// inspects the resulting `Screen`, never the reader.
+///
+/// If `vt100::Parser::process` ever panics, it's caught here (rather than left
+/// to unwind the reader thread silently) and recorded into `reader_panic` before
+/// the thread exits, so `wait_for_screen`/`wait_for_exit` can fail fast with the
+/// actual cause instead of quietly polling a screen that will never update again.
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
     stop: Arc<AtomicBool>,
+    reader_panic: Arc<Mutex<Option<String>>>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
@@ -350,8 +440,19 @@ fn spawn_reader(
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if let Ok(mut p) = parser.lock() {
+                    let mut p = parser
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         p.process(&buf[..n]);
+                    }));
+                    drop(p);
+                    if let Err(payload) = result {
+                        let message = panic_message(&payload);
+                        *reader_panic
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(message);
+                        break;
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}

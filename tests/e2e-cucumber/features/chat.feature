@@ -10,8 +10,8 @@ Feature: Chat and endpoint detection
   # Driven through the interactive TUI (a pseudo-terminal): the privacy notice
   # lives on the chat consent gate, which only the real terminal path renders.
   # The model is registered so the CLI discovers it on its OS-assigned port and
-  # offers it — the notice must precede any request. (Was EAI-7222, previously
-  # an untestable-black-box gap.)
+  # offers it — the notice must precede any request. (Previously an
+  # untestable-black-box gap.)
   @id:chat-privacy-notice-accurate @requires-os:linux
   Scenario: 2 - The privacy notice is shown before using a local endpoint
     Given a model is being served locally
@@ -28,6 +28,7 @@ Feature: Chat and endpoint detection
     When the user accepts the local endpoint
     And the user sends a message to the managed model
     Then the managed model's response is displayed
+    And the mock received the typed prompt
     When the user quits interactive chat
     Then interactive chat exits successfully
 

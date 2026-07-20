@@ -4,8 +4,9 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::State;
@@ -13,6 +14,10 @@ use axum::response::Json;
 use axum::routing::{get, post};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+
+/// How often [`MockServer::wait_for_chat_request`] re-checks the captured
+/// request while waiting for the client to POST.
+const CHAT_REQUEST_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Clone)]
 struct ServerState {
@@ -24,6 +29,11 @@ struct ServerState {
     /// dashboard metrics — gets a 404 for `/metrics`, matching a vLLM instance
     /// that scenario never asked to simulate.
     metrics: Option<Arc<MetricsCounter>>,
+    /// The most recently received `/v1/chat/completions` request body, shared
+    /// with the `MockServer` handle so scenarios can assert on exactly what the
+    /// CLI sent — not just on the (fixed) canned reply, which would silently
+    /// mask a corrupted or missing prompt. `None` until a chat request arrives.
+    last_chat_request: Arc<Mutex<Option<Value>>>,
 }
 
 /// Deterministic, monotonically-advancing state behind the mock `/metrics`
@@ -96,6 +106,8 @@ vllm:time_per_output_token_seconds_count{{model=\"mock\"}} {tpot_count}
 pub struct MockServer {
     addr: SocketAddr,
     shutdown: tokio::sync::oneshot::Sender<()>,
+    /// Shared with the running server's `ServerState`; see the field doc there.
+    last_chat_request: Arc<Mutex<Option<Value>>>,
 }
 
 impl std::fmt::Debug for MockServer {
@@ -122,9 +134,11 @@ impl MockServer {
     }
 
     async fn spawn(model_name: &str, with_metrics: bool) -> Self {
+        let last_chat_request = Arc::new(Mutex::new(None));
         let state = ServerState {
             model_name: model_name.to_string(),
             metrics: with_metrics.then(|| Arc::new(MetricsCounter::new())),
+            last_chat_request: Arc::clone(&last_chat_request),
         };
 
         let mut app = Router::new()
@@ -151,7 +165,11 @@ impl MockServer {
                 .ok();
         });
 
-        Self { addr, shutdown: tx }
+        Self {
+            addr,
+            shutdown: tx,
+            last_chat_request,
+        }
     }
 
     pub fn base_url(&self) -> String {
@@ -162,12 +180,71 @@ impl MockServer {
         self.addr.port()
     }
 
+    /// The most recently received `/v1/chat/completions` request body, if any
+    /// chat request has landed yet. Recovers a poisoned lock rather than
+    /// propagating the panic: a torn-down request body is still the most
+    /// recent one worth inspecting on assertion failure.
+    pub fn last_chat_request(&self) -> Option<Value> {
+        self.last_chat_request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Poll for a chat request to arrive, so scenarios that assert on the exact
+    /// request body don't race the TUI's async send. Returns the body once
+    /// present, or `Err` with a diagnostic if none arrives within `timeout`.
+    pub async fn wait_for_chat_request(&self, timeout: Duration) -> Result<Value, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(body) = self.last_chat_request() {
+                return Ok(body);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for a chat request"
+                ));
+            }
+            tokio::time::sleep(CHAT_REQUEST_POLL_INTERVAL).await;
+        }
+    }
+
     pub fn stop(self) {
         self.shutdown.send(()).ok();
     }
 }
 
-/// Write a managed-service record pointing the CLI at a mock server on `port`.
+/// Lifecycle fields of the on-disk managed-service record that vary across
+/// callers.
+///
+/// The default matches a service that passed its readiness probe with no
+/// process attached (the `rocm-demo-env` shape: `status: "ready"`, no
+/// `startup_phase`, `supervisor_pid: 0`, `engine_pid: null`). Cucumber
+/// scenarios that need a mid-startup record, or one the CLI's process-liveness
+/// overlay keeps alive (pointed at this test process), override the relevant
+/// fields via [`write_service_record_with`] instead of duplicating the whole
+/// record shape.
+#[derive(Debug, Clone, Copy)]
+pub struct ServiceRecordOptions {
+    pub status: &'static str,
+    pub startup_phase: Option<&'static str>,
+    pub supervisor_pid: u32,
+    pub engine_pid: Option<u32>,
+}
+
+impl Default for ServiceRecordOptions {
+    fn default() -> Self {
+        Self {
+            status: "ready",
+            startup_phase: None,
+            supervisor_pid: 0,
+            engine_pid: None,
+        }
+    }
+}
+
+/// Write a managed-service record pointing the CLI at a mock server on `port`,
+/// using [`ServiceRecordOptions::default`] (ready, no attached process).
 ///
 /// Drops the JSON into `services_dir` (`<data>/services/`) exactly as `rocm serve
 /// --managed` would. Shared by the cucumber `World` and the standalone
@@ -175,6 +252,20 @@ impl MockServer {
 /// plain JSON matching the CLI's on-disk schema, not a typed import from the
 /// rocm-cli crates.
 pub fn write_service_record(services_dir: &Path, model: &str, port: u16) {
+    write_service_record_with(services_dir, model, port, ServiceRecordOptions::default());
+}
+
+/// Like [`write_service_record`], but with caller-specified lifecycle fields.
+///
+/// See [`ServiceRecordOptions`] -- e.g. a "still loading" status/startup_phase,
+/// or `supervisor_pid`/`engine_pid` pointed at a live process so the CLI's
+/// liveness overlay doesn't mark the planted record dead.
+pub fn write_service_record_with(
+    services_dir: &Path,
+    model: &str,
+    port: u16,
+    options: ServiceRecordOptions,
+) {
     std::fs::create_dir_all(services_dir).expect("failed to create services dir");
 
     // The CLI only extracts host:port from `endpoint_url` and appends
@@ -188,9 +279,10 @@ pub fn write_service_record(services_dir: &Path, model: &str, port: u16) {
         "port": port,
         "endpoint_url": format!("http://127.0.0.1:{port}/v1"),
         "mode": "managed",
-        "status": "ready",
-        "supervisor_pid": 0,
-        "engine_pid": null,
+        "status": options.status,
+        "startup_phase": options.startup_phase,
+        "supervisor_pid": options.supervisor_pid,
+        "engine_pid": options.engine_pid,
         "runtime_id": null,
         "env_id": null,
         "device_policy": null,
@@ -225,12 +317,21 @@ async fn handle_metrics(State(state): State<ServerState>) -> String {
         .scrape()
 }
 
-async fn handle_chat(Json(body): Json<Value>) -> Json<Value> {
+async fn handle_chat(State(state): State<ServerState>, Json(body): Json<Value>) -> Json<Value> {
     let model = body
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or("<missing>")
         .to_string();
+
+    // Record the request body so scenarios can assert on exactly what the CLI
+    // sent (see `MockServer::last_chat_request` / `wait_for_chat_request`) —
+    // the canned reply below never varies with the prompt, so without this a
+    // corrupted or missing request would pass unnoticed.
+    *state
+        .last_chat_request
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(body);
 
     // Tests assert on the request contract, not the reply text, so the default
     // is a fixed stub. Demos (`rocm-demo-env`) set `ROCM_MOCK_CHAT_REPLY` to a

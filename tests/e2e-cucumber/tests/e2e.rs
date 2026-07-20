@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 
 use cucumber::{World as _, WriterExt as _};
-use e2e_cucumber::mock_server::MockServer;
+use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use tempfile::TempDir;
 
 mod e2e {
@@ -25,25 +25,6 @@ mod e2e {
 }
 
 // ── World ──────────────────────────────────────────────────────────
-
-/// Managed-service registry fields that vary between black-box scenarios.
-///
-/// The default matches a service that passed its readiness probe. Tests can
-/// override the lifecycle fields without duplicating the on-disk record shape.
-#[derive(Debug, Clone, Copy)]
-pub struct RegisterServiceOptions {
-    pub status: &'static str,
-    pub startup_phase: Option<&'static str>,
-}
-
-impl Default for RegisterServiceOptions {
-    fn default() -> Self {
-        Self {
-            status: "ready",
-            startup_phase: None,
-        }
-    }
-}
 
 #[derive(Debug, cucumber::World)]
 pub struct E2eWorld {
@@ -332,53 +313,30 @@ impl E2eWorld {
     /// `local` chat provider discover the mock — so scenarios exercise the real
     /// binary instead of asserting against the test's own helper. Black-box: the
     /// record is plain JSON matching the CLI's on-disk schema, not a typed import
-    /// from the rocm-cli crates.
+    /// from the rocm-cli crates. The schema itself lives in
+    /// `mock_server::write_service_record_with`; this only supplies the World's
+    /// own lifecycle defaults (a record kept alive by this test process).
     pub fn register_mock_service(&self) {
-        self.register_mock_service_with(RegisterServiceOptions::default());
+        self.register_mock_service_with(ServiceRecordOptions::default());
     }
 
-    pub fn register_mock_service_with(&self, options: RegisterServiceOptions) {
+    pub fn register_mock_service_with(&self, options: ServiceRecordOptions) {
         let root = self.isolated_root.as_ref().expect("no isolated root");
         let mock = self.mock.as_ref().expect("no mock server running");
         let model = self.model_name.as_deref().expect("no model name set");
         let port = mock.port();
         let services = root.path().join("data").join("services");
-        std::fs::create_dir_all(&services).expect("failed to create services dir");
 
-        // The CLI only extracts host:port from `endpoint_url` and appends
-        // `/v1/models` for its readiness probe, which the mock serves.
-        let record = serde_json::json!({
-            "service_id": "e2e-mock",
-            "engine": "vllm",
-            "model_ref": model,
-            "canonical_model_id": model,
-            "host": "127.0.0.1",
-            "port": port,
-            "endpoint_url": format!("http://127.0.0.1:{port}/v1"),
-            "mode": "managed",
-            "status": options.status,
-            "startup_phase": options.startup_phase,
-            // Keep the planted record live when the CLI overlays process
-            // liveness during startup; this test process owns the mock server.
-            "supervisor_pid": std::process::id(),
-            "engine_pid": std::process::id(),
-            "runtime_id": null,
-            "env_id": null,
-            "device_policy": null,
-            "gpu_indices": [],
-            "engine_recipe_json": null,
-            "restart_count": 0,
-            "last_restart_unix_ms": null,
-            "manifest_path": services.join("e2e-mock.json"),
-            "log_path": services.join("e2e-mock.log"),
-            "engine_state_path": services.join("e2e-mock.state.json"),
-            "created_at_unix_ms": 1_700_000_000_000_u64,
-        });
-        std::fs::write(
-            services.join("e2e-mock.json"),
-            serde_json::to_vec_pretty(&record).expect("failed to serialize record"),
-        )
-        .expect("failed to write service record");
+        // Keep the planted record live when the CLI overlays process liveness
+        // during startup; this test process owns the mock server. Overrides
+        // whatever PIDs the caller passed in `options` — the World always wants
+        // a live-looking record, unlike `rocm-demo-env`'s supervisor-less one.
+        let options = ServiceRecordOptions {
+            supervisor_pid: std::process::id(),
+            engine_pid: Some(std::process::id()),
+            ..options
+        };
+        write_service_record_with(&services, model, port, options);
     }
 }
 
