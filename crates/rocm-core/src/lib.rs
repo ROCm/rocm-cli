@@ -5203,6 +5203,19 @@ pub fn generate_endpoint_api_key() -> String {
         .collect()
 }
 
+/// Return `true` if `key` contains a character that must never appear in an API
+/// key used verbatim in an `Authorization: Bearer` header.
+///
+/// The CLI and engine adapters build those header lines by raw string
+/// interpolation (`Authorization: Bearer {key}\r\n`), so an embedded CR or LF in
+/// the key would inject additional header lines (HTTP header injection). A
+/// control character has no legitimate place in a bearer token, so we reject the
+/// whole class rather than only CR/LF. Callers apply this at input validation
+/// (rejecting a supplied key) and defensively when reading the key file.
+pub fn endpoint_api_key_has_forbidden_chars(key: &str) -> bool {
+    key.chars().any(char::is_control)
+}
+
 /// Generate a fresh 2048-bit RSA signing keypair, returned as
 /// `(PKCS#8 private-key PEM, SubjectPublicKeyInfo public-key PEM)` — the same
 /// formats `openssl genpkey` / `openssl rsa -pubout` produce.
@@ -5990,6 +6003,29 @@ mod tests {
         );
         // Two draws must differ — a constant key would be catastrophic for auth.
         assert_ne!(generate_endpoint_api_key(), generate_endpoint_api_key());
+        // A freshly generated key must itself pass the header-safety predicate.
+        assert!(!endpoint_api_key_has_forbidden_chars(
+            &generate_endpoint_api_key()
+        ));
+    }
+
+    #[test]
+    fn endpoint_api_key_has_forbidden_chars_flags_control_chars() {
+        // Control characters (notably CR/LF) enable header injection when the key
+        // is interpolated into a raw `Authorization: Bearer` line.
+        for bad in ["key\r\ninject", "key\nother", "tab\there", "nul\0byte"] {
+            assert!(
+                endpoint_api_key_has_forbidden_chars(bad),
+                "should reject {bad:?}"
+            );
+        }
+        // Ordinary printable keys are accepted.
+        for good in ["my-key", "AbC123._~-", "sk-proj-abcDEF0123456789"] {
+            assert!(
+                !endpoint_api_key_has_forbidden_chars(good),
+                "should accept {good:?}"
+            );
+        }
     }
 
     // The socket-path precedence is mirrored in `rocm-dash-core`; these tests

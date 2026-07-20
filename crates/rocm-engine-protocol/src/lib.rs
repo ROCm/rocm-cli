@@ -72,7 +72,11 @@ pub fn endpoint_api_key_file_if_valid(path: &std::path::Path) -> Option<PathBuf>
 pub fn endpoint_api_key_from_file(path: &std::path::Path) -> Option<String> {
     let contents = std::fs::read_to_string(path).ok()?;
     let trimmed = contents.trim();
-    if trimmed.is_empty() {
+    // The key is interpolated verbatim into raw `Authorization: Bearer` header
+    // lines, so a key file holding an embedded control character (e.g. CR/LF) is
+    // treated as no valid key rather than passed through — defense in depth behind
+    // the CLI's input validation, which already rejects such keys before writing.
+    if trimmed.is_empty() || rocm_core::endpoint_api_key_has_forbidden_chars(trimmed) {
         None
     } else {
         Some(trimmed.to_owned())
@@ -533,6 +537,19 @@ mod tests {
         let empty = dir.join("empty");
         std::fs::write(&empty, "   \n").unwrap();
         assert_eq!(endpoint_api_key_from_file(&empty), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn endpoint_api_key_from_file_rejects_embedded_control_chars() {
+        // A key file whose contents carry an embedded CR/LF would, if passed
+        // through, inject extra lines into the raw `Authorization: Bearer` header.
+        // Trimming only strips the ends, so the reader must reject it outright.
+        let dir = unique_temp_dir("endpoint-key-crlf");
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_file = dir.join("endpoint-key");
+        std::fs::write(&key_file, "good-key\r\nX-Injected: value\n").unwrap();
+        assert_eq!(endpoint_api_key_from_file(&key_file), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 

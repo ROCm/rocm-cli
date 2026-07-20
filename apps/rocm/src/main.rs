@@ -4348,6 +4348,16 @@ fn resolve_endpoint_auth(host: &str, supplied: Option<&str>) -> Result<Option<St
                      endpoint must be protected by a non-empty API key"
                 );
             }
+            // The key is later interpolated verbatim into raw `Authorization:
+            // Bearer {key}\r\n` header lines; reject a control character (e.g. an
+            // embedded CR/LF) here so a crafted key cannot inject extra headers.
+            if rocm_core::endpoint_api_key_has_forbidden_chars(trimmed) {
+                bail!(
+                    "`rocm serve --api-key` (or ROCM_SERVE_API_KEY) contained a control \
+                     character such as a carriage return or newline; an endpoint API key \
+                     must be a single line of printable characters"
+                );
+            }
             Ok(Some(trimmed.to_owned()))
         }
         None => Ok(Some(rocm_core::generate_endpoint_api_key())),
@@ -20473,6 +20483,21 @@ install therock";
     fn resolve_endpoint_auth_public_rejects_empty_supplied_key() {
         let error = resolve_endpoint_auth("0.0.0.0", Some("   ")).unwrap_err();
         assert!(error.to_string().contains("non-empty"), "{error:#}");
+    }
+
+    #[test]
+    fn resolve_endpoint_auth_public_rejects_embedded_crlf() {
+        // A supplied key survives `trim()` with embedded CR/LF intact and would
+        // otherwise be interpolated into a raw `Authorization: Bearer` header,
+        // injecting an extra header line. It must be rejected at input validation.
+        for supplied in [
+            "good-key\r\nX-Injected: value",
+            "good-key\nmore",
+            "line\rreturn",
+        ] {
+            let error = resolve_endpoint_auth("0.0.0.0", Some(supplied)).unwrap_err();
+            assert!(error.to_string().contains("control character"), "{error:#}");
+        }
     }
 
     #[test]
