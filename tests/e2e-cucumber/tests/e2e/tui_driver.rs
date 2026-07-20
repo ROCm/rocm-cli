@@ -122,6 +122,18 @@ impl TuiSession {
         for (key, value) in world.isolate_env().into_iter().chain(world.pty_env()) {
             cmd.env(key, value);
         }
+        // Provider configuration changes product startup semantics: a host API
+        // key or endpoint suppresses local managed-service detection. These PTY
+        // journeys exercise deterministic local/mock chat, so do not let the
+        // developer's shell or CI credential environment select a cloud backend.
+        for key in [
+            "ROCMDASH_CHAT_API_KEY",
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "ANTHROPIC_API_KEY",
+        ] {
+            cmd.env_remove(key);
+        }
         // Deterministic terminal type; the PTY ioctl size above is authoritative
         // for crossterm, with COLUMNS/LINES as a belt-and-braces fallback.
         cmd.env("TERM", "xterm-256color");
