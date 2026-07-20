@@ -39,8 +39,8 @@ mod slash;
 mod summary;
 
 use chat::{
-    build_chat_agent, build_local_agent, detect_local_chat, detect_managed_chat,
-    persist_chat_endpoint,
+    StartupChatOutcome, build_chat_agent, build_local_agent, detect_local_chat,
+    discover_configured_chat_model, persist_chat_endpoint, startup_chat_outcome,
 };
 use summary::{parse_plan_result, summarize_json_value, summarize_slash_tool};
 
@@ -116,6 +116,11 @@ pub struct ResolvedArgs {
     /// Bin-injected tool-executor seam; None for demo/replay/mock — dash behaves
     /// as today. Stored here (Phase 2 plumbing); Phase 3 will use it.
     pub tool_executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
+    /// Daemon-tailed bench CSV path (`config.dashboard.daemon.bench_results_dir`).
+    ///
+    /// When `Some`, the bench-run form defaults `--out` to this path so appended
+    /// rows appear live in the bench tab. Adapted by the bin (owns `rocm-core`).
+    pub bench_results_dir: Option<std::path::PathBuf>,
 }
 
 type Tui = Terminal<CrosstermBackend<io::Stdout>>;
@@ -479,12 +484,23 @@ pub struct AppState {
     /// Horizontal scroll offset (columns) of the active job console — log lines
     /// drawn wider than the console wrap off-screen, so the wheel/H-wheel pans.
     pub console_hscroll: u16,
+    /// Monotonic UI repaint counter, incremented once per tick (~250ms). Drives
+    /// frame-based animation (e.g. the job-console braille progress spinner)
+    /// without threading a clock through the render path.
+    pub tick_count: u64,
     /// Scroll offset of the wide-layout right LOGS dock, counted in lines UP from
     /// the newest line (0 = pinned to the tail). Clamped against the buffer.
     pub dock_logs_scroll: u16,
     /// Last drawn right-dock rect (wide layout, operational tabs). `None` when the
     /// dock isn't showing logs. Mouse-wheel hit-tests resolve against it.
     pub last_dock_area: Option<ratatui::layout::Rect>,
+    /// Scrollbars drawn this frame, recorded so a mouse click/drag can hit-test
+    /// them. Cleared and repopulated every `ui::draw`; interior-mutable because
+    /// the deep render fns hold `&AppState`.
+    pub scrollbars: std::cell::RefCell<Vec<ScrollbarHandle>>,
+    /// The scrollbar currently being dragged (mouse held down on a track), so
+    /// pointer moves keep updating that offset until release.
+    pub scroll_drag: Option<ScrollTarget>,
     /// Chat transcript (TUI-local; never travels over the daemon protocol).
     pub chat: Vec<ChatTurn>,
     /// Pending input buffer for the Chat tab.
@@ -532,6 +548,13 @@ pub struct AppState {
     pub(crate) chat_endpoint_rebuild: Option<ChatProvider>,
     /// Replay scrubber state. `None` when running against a live daemon.
     pub replay: Option<ReplayState>,
+    /// Data-honesty flag: `true` when the displayed telemetry is NOT from a live
+    /// daemon — i.e. `--demo`, `--replay`, or an asset generator. Drives the
+    /// persistent "SIMULATED DATA" marker and suppresses live/connected/health
+    /// indicators so simulated data can never be presented as live. Distinct
+    /// from `replay`, which is playback-control state and is not set by the
+    /// screenshot/cast generators.
+    pub simulated: bool,
     /// Last body area used by the most recent draw. Mouse hit-tests resolve
     /// pointer coordinates against this rect (filled by `ui::draw`).
     pub last_body_area: Option<ratatui::layout::Rect>,
@@ -567,6 +590,8 @@ pub struct AppState {
     pub command_screen: Option<crate::ui::command_screen::CommandScreenState>,
     /// Config & provider manager overlay (Phase 3 Wave 3). `None` = closed.
     pub config_manager: Option<crate::ui::config_manager::ConfigManagerState>,
+    /// Bench-run form overlay. `None` = closed.
+    pub bench_run: Option<crate::ui::bench_run::BenchRunState>,
     /// Built-in model recipes for the serve wizard's picker. Set from
     /// `ResolvedArgs` in the event loop; empty by default.
     pub model_recipes: Vec<crate::ui::model_picker::ModelRecipeSummary>,
@@ -579,6 +604,11 @@ pub struct AppState {
     /// Bin-injected tool-executor seam. Set from `ResolvedArgs` in the event
     /// loop; `None` for demo/replay/mock and by default.
     pub tool_executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
+    /// Daemon-tailed bench CSV path from the bin config.
+    ///
+    /// Forwarded from [`ResolvedArgs::bench_results_dir`] so the bench-run form
+    /// can default `--out` to the live-tailed file. `None` when not configured.
+    pub bench_results_dir: Option<std::path::PathBuf>,
     /// Set by a `/quit` (or `/exit`) slash command; the event loop breaks on it.
     pub(crate) should_quit: bool,
     /// Edge: a pending executor-backed read-only slash command. Raised by
@@ -641,8 +671,11 @@ impl AppState {
             bench_detail_scroll: 0,
             console_scroll: 0,
             console_hscroll: 0,
+            tick_count: 0,
             dock_logs_scroll: 0,
             last_dock_area: None,
+            scrollbars: std::cell::RefCell::new(Vec::new()),
+            scroll_drag: None,
             chat: Vec::new(),
             chat_input: String::new(),
             chat_sending: false,
@@ -658,6 +691,7 @@ impl AppState {
             chat_persist_dispatch: false,
             chat_endpoint_rebuild: None,
             replay: None,
+            simulated: false,
             last_body_area: None,
             last_tab_bar_area: None,
             last_footer_chips: Vec::new(),
@@ -674,10 +708,12 @@ impl AppState {
             automations_manager: None,
             command_screen: None,
             config_manager: None,
+            bench_run: None,
             model_recipes: Vec::new(),
             runtimes: Vec::new(),
             automations: Vec::new(),
             tool_executor: None,
+            bench_results_dir: None,
             should_quit: false,
             slash_tool: None,
             plan_request: None,
@@ -703,6 +739,7 @@ impl AppState {
         self.automations_manager = None;
         self.command_screen = None;
         self.config_manager = None;
+        self.bench_run = None;
         self.approval = None;
         // A fresh overlay starts its console at the top.
         self.console_scroll = 0;
@@ -781,17 +818,25 @@ impl AppState {
     }
 
     /// Pan the active job console. `dv`/`dh` are line/column deltas (negative =
-    /// up/left). Clamps at 0; the vertical offset is also clamped against the
-    /// active job's line count so it can't scroll past the end into blank space.
+    /// up/left). Clamps at 0; the vertical offset is clamped against the active
+    /// job's line count and the horizontal offset against its widest line, so it
+    /// can't scroll past the content into blank space in either axis.
     pub(crate) fn scroll_console(&mut self, dv: i16, dh: i16) {
-        let max_v = self
-            .active_job_id()
-            .and_then(|id| self.jobs.job(id))
-            .map_or(0, |j| j.output.len().saturating_sub(1));
+        let job = self.active_job_id().and_then(|id| self.jobs.job(id));
+        let max_v = job.map_or(0, |j| j.output.len().saturating_sub(1));
         let max_v = i32::try_from(max_v).unwrap_or(i32::MAX);
+        let max_h = job.map_or(0, |j| {
+            j.output
+                .iter()
+                .map(|l| l.chars().count())
+                .max()
+                .unwrap_or(0)
+                .saturating_sub(1)
+        });
+        let max_h = i32::try_from(max_h).unwrap_or(i32::MAX);
         let v = u16::try_from((i32::from(self.console_scroll) + i32::from(dv)).clamp(0, max_v))
             .unwrap_or(u16::MAX);
-        let h = u16::try_from((i32::from(self.console_hscroll) + i32::from(dh)).max(0))
+        let h = u16::try_from((i32::from(self.console_hscroll) + i32::from(dh)).clamp(0, max_h))
             .unwrap_or(u16::MAX);
         self.console_scroll = v;
         self.console_hscroll = h;
@@ -816,6 +861,42 @@ impl AppState {
                 .unwrap_or(u16::MAX);
     }
 
+    /// Arm a scrollbar drag and jump the target surface to `position` (already
+    /// in the target's own offset units — the caller inverts the tail-anchored
+    /// dock). Idempotent, so pointer moves during a drag reuse it.
+    pub(crate) fn apply_scroll_grab(&mut self, target: ScrollTarget, position: usize) {
+        self.scroll_drag = Some(target);
+        let p = u16::try_from(position).unwrap_or(u16::MAX);
+        match target {
+            ScrollTarget::Console => self.console_scroll = p,
+            ScrollTarget::ConsoleH => self.console_hscroll = p,
+            ScrollTarget::Chat => self.chat_scroll = p,
+            ScrollTarget::BenchDetail => self.bench_detail_scroll = p,
+            ScrollTarget::DockLogs => self.dock_logs_scroll = p,
+        }
+    }
+
+    /// Record a scrollbar drawn this frame for later mouse hit-testing.
+    ///
+    /// `area` is the rect passed to the scrollbar helper and `drawn` its return
+    /// value; when they're equal no bar was drawn (content fit) and nothing is
+    /// recorded. The 1-cell track strip is derived from `area` and `horizontal`.
+    pub(crate) fn record_scrollbar(
+        &self,
+        area: ratatui::layout::Rect,
+        drawn: ratatui::layout::Rect,
+        horizontal: bool,
+        content_len: usize,
+        viewport_len: usize,
+        target: ScrollTarget,
+    ) {
+        if let Some(h) =
+            ScrollbarHandle::new(area, drawn, horizontal, content_len, viewport_len, target)
+        {
+            self.scrollbars.borrow_mut().push(h);
+        }
+    }
+
     /// Whether any operational manager overlay is open (approval excluded — it
     /// is the separate gating layer with its own routing). Used to decide inline
     /// vs. centered manager rendering and the ROCm/Serving `←`/Esc back-out.
@@ -832,6 +913,7 @@ impl AppState {
             || self.automations_manager.is_some()
             || self.command_screen.is_some()
             || self.config_manager.is_some()
+            || self.bench_run.is_some()
     }
 
     /// Focused-host exit gate: `true` when a `focus` is active AND its single
@@ -909,6 +991,7 @@ impl AppState {
                 .logs_view
                 .as_ref()
                 .is_none_or(|m| m.active_job.is_none())
+        // bench_run is always at root when Some (no nested sub-popup or job).
     }
 
     /// Whether an `Esc` keypress should back out of an inline manager: true on
@@ -1002,6 +1085,13 @@ impl AppState {
     /// `chat_detect_dispatch` edge so `event_loop` runs the probe + `/v1/models`
     /// query off the reducer. No-op while a probe is already in flight or an
     /// offer is awaiting a decision. I/O-free.
+    ///
+    /// Reachable both from the pre-accept gate (`'d'` key) and, once
+    /// `ChatConsent::Accepted`, from the `/detect` slash command (a focused
+    /// `'d'` keypress is ordinary chat text at that point, so the gate key
+    /// doesn't apply there — see `handle_slash_command`). When already
+    /// accepted, echo the in-flight probe into the transcript since the
+    /// pre-accept "detecting…" banner isn't drawn once chat is live.
     pub fn request_detect(&mut self) {
         if self.chat_detecting || self.chat_detect_offer.is_some() {
             return;
@@ -1009,21 +1099,44 @@ impl AppState {
         self.chat_detecting = true;
         self.chat_detect_msg = None;
         self.chat_detect_dispatch = true;
+        if self.chat_consent == ChatConsent::Accepted {
+            self.chat.push(ChatTurn::agent(
+                "Detecting a local engine (Lemonade :13305 / vLLM :8000 / rocm serve :11435)…"
+                    .to_string(),
+            ));
+        }
     }
 
     /// Record the result of a detect attempt: `Some(cfg)` raises the offer
     /// prompt; `None` records a "nothing found" message. Clears the in-flight
     /// flag either way.
+    ///
+    /// Once `ChatConsent::Accepted`, the offer prompt is not drawn (the gate UI
+    /// only renders pre-accept), so the result is also echoed into the
+    /// transcript with the `/detect accept|save|dismiss` sub-commands needed to
+    /// act on it.
     pub fn set_detect_result(&mut self, offer: Option<crate::llm::LlmConfig>) {
         self.chat_detecting = false;
+        let accepted = self.chat_consent == ChatConsent::Accepted;
         if let Some(cfg) = offer {
             self.chat_detect_msg = None;
+            if accepted {
+                self.chat.push(ChatTurn::agent(format!(
+                    "Detected a local engine: {}  (model: {}). Type `/detect accept` to \
+                     switch now, `/detect save` to also persist it, or `/detect dismiss` \
+                     to ignore.",
+                    cfg.base_url, cfg.model
+                )));
+            }
             self.chat_detect_offer = Some(cfg);
         } else {
             self.chat_detect_offer = None;
-            self.chat_detect_msg = Some(
-                "no local engine found (Lemonade :13305 / vLLM :8000 / rocm serve :11435)".into(),
-            );
+            let msg = "no local engine found (Lemonade :13305 / vLLM :8000 / rocm serve :11435)";
+            if accepted {
+                self.chat.push(ChatTurn::agent(msg.to_string()));
+            } else {
+                self.chat_detect_msg = Some(msg.to_string());
+            }
         }
     }
 
@@ -1519,6 +1632,8 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     // Tool-executor seam (Phase 2 plumbing), injected by the bin; None for
     // demo/replay/mock. Phase 3 will use it.
     state.tool_executor = args.tool_executor.clone();
+    // Daemon-tailed bench CSV path for the bench-run form's default --out.
+    state.bench_results_dir = args.bench_results_dir.clone();
     // Focused host: open exactly the overlay for the requested flow (Examine
     // also auto-runs its read-only job). `Focus::Setup` opens the onboarding
     // overlay — the same wizard `rocm bootstrap setup` routes to.
@@ -1527,6 +1642,9 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         crate::jobs::run_effects(fx, &job_tx);
     }
     state.replay = replay_controller.map(ReplayState::new);
+    // Both `--demo` (a generated session replayed) and `--replay <file>` present
+    // non-live data, so mark the session simulated for the honesty chrome.
+    state.simulated = state.replay.is_some();
 
     // Resolve the chat backend. `--chat-mock` short-circuits detection with a
     // deterministic offline MockAgentClient (no live LLM, no network); otherwise
@@ -1562,8 +1680,34 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         // NOT override an explicitly configured `chat_url`/env URL, so config
         // precedence is preserved (we only consult the registry when neither is
         // set, i.e. where the well-known default would otherwise be probed).
-        let managed = if args.chat_url.is_none() && args.chat_env_url.is_none() {
-            detect_managed_chat(state.tool_executor.clone()).await
+        // When neither an explicit URL (CLI/config) nor an env URL is set, run
+        // the SAME full local-engine detection the manual 'd' path uses:
+        // registry-first (an engine we launched ourselves, on whatever port it
+        // bound), then a probe of the well-known Lemonade/vLLM/rocm-serve
+        // ports (parallelized — see `llm::detect_local_endpoint` — so a cold
+        // start with no server doesn't pay 3x the probe timeout), plus a
+        // best-effort served-model fetch. This is what lets a local server win
+        // over the ChatGPT cloud default at startup instead of only the single
+        // well-known :8000 port that a bare `resolve_llm_config` probe covers.
+        //
+        // NOTE: unmerged PR #97 also touches this branch (model discovery when
+        // `chat_model` is None, inside `resolve_llm_config`'s own fallback
+        // path) — this change is conflict-minimal by leaving the
+        // `resolve_llm_config` call below untouched.
+        //
+        // Gate on `chat_api_key.is_none()` too: local detection returns a
+        // keyless `detected_llm_config` (api_key/auth_header forced to None),
+        // so firing it when the user configured a key would SILENTLY DROP that
+        // key and 401 at request time. A configured key means "use my
+        // configured backend", so skip the swap and let `resolve_llm_config`
+        // carry the key through its normal precedence.
+        let detection_ran = chat::should_detect_local_chat(
+            args.chat_url.as_deref(),
+            args.chat_env_url.as_deref(),
+            args.chat_api_key.as_deref(),
+        );
+        let detected = if detection_ran {
+            detect_local_chat(state.tool_executor.clone()).await
         } else {
             None
         };
@@ -1572,17 +1716,23 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             .clone()
             .or_else(|| args.chat_env_url.clone())
             .unwrap_or_else(|| crate::llm::DEFAULT_CHAT_BASE_URL.to_string());
-        // A managed endpoint is already readiness-verified; otherwise TCP-probe.
-        let probe_ok = if managed.is_some() {
-            true
-        } else {
-            tokio::task::spawn_blocking(move || {
+        // A detected endpoint (managed or probed) is already verified. When
+        // detection ran and found nothing it already probed the well-known
+        // vLLM :8000 port (== `DEFAULT_CHAT_BASE_URL`), so re-probing the same
+        // fallback target here is redundant and just burns another probe
+        // timeout on a cold start — treat that as unreachable directly.
+        // Otherwise (an explicit URL/env/key path) TCP-probe the target.
+        let startup_outcome = startup_chat_outcome(detection_ran, detected.is_some());
+        let probe_ok = match startup_outcome {
+            StartupChatOutcome::Local => true,
+            StartupChatOutcome::OAuth => false,
+            StartupChatOutcome::Configured => tokio::task::spawn_blocking(move || {
                 crate::llm::probe_endpoint(&probe_target, crate::llm::PROBE_TIMEOUT)
             })
             .await
-            .unwrap_or(false)
+            .unwrap_or(false),
         };
-        let llm = managed.or_else(|| {
+        let llm = detected.or_else(|| {
             crate::llm::resolve_llm_config(
                 args.chat_url.as_deref(),
                 args.chat_model.as_deref(),
@@ -1594,15 +1744,26 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                 probe_ok,
             )
         });
+        // PR #97 port onto PR #100's startup flow: a *configured* URL (CLI/env)
+        // with no explicit model resolves to the `local-model` placeholder,
+        // which 404s on servers that register the model under its real id. Only
+        // the `Configured` outcome needs this — the `Local` outcome already
+        // carries a `/v1/models`-discovered model from `detect_local_chat`, and
+        // `OAuth` has no config. Discovery is gated inside the helper on
+        // `probe_ok` (an unreachable endpoint is never probed nor replaced) and
+        // on the absence of an explicit model (config precedence wins).
+        let llm = match llm {
+            Some(cfg) if startup_outcome == StartupChatOutcome::Configured => Some(
+                discover_configured_chat_model(cfg, args.chat_model.as_deref(), probe_ok).await,
+            ),
+            other => other,
+        };
         state.set_chat_config(llm, args.chat_auto_consent);
         // No reachable local endpoint AND no key/url configured → the no-key
         // ChatGPT OAuth default (device-code login surfaced in the chat tab).
         // This restores the no-key login the vendored Codex path provided; it
         // takes NO api_key (env-only invariant untouched — OAuth, not a key).
-        let no_key_no_endpoint = !probe_ok
-            && args.chat_api_key.is_none()
-            && args.chat_url.is_none()
-            && args.chat_env_url.is_none();
+        let no_key_no_endpoint = startup_outcome == StartupChatOutcome::OAuth;
         if no_key_no_endpoint {
             let oauth_tx = chat_tx.clone();
             crate::agent::ChatGptAgentClient::new(
@@ -1648,7 +1809,11 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             terminal.draw(|f| ui::draw(f, &mut state))?;
         }
         tokio::select! {
-            _ = tick.tick() => { /* repaint */ }
+            _ = tick.tick() => {
+                // Advance the animation clock so spinners cycle even while a
+                // job produces no new output.
+                state.tick_count = state.tick_count.wrapping_add(1);
+            }
             maybe_msg = rx.recv() => {
                 match maybe_msg {
                     Some(ClientMsg::Connecting) => state.conn = ConnState::Connecting,
@@ -1694,6 +1859,20 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             }
             maybe_ev = events.next() => {
                 match maybe_ev {
+                    // Only ACT on key presses. Terminals (notably Windows
+                    // Terminal / ConPTY under WSL, and any with the kitty
+                    // keyboard protocol) also emit Release/Repeat events; the
+                    // general `handle_key` already drops non-Press, but the
+                    // operational-overlay arms below dispatch straight to their
+                    // managers and would otherwise process the SAME keystroke
+                    // twice. That double-fire is what made Enter in the serve
+                    // wizard's model picker re-open the picker (seeding it with
+                    // the just-chosen model as a filter) instead of choosing.
+                    // Swallow non-Press key events here, above every key arm, so
+                    // the Press-only invariant holds for overlays too.
+                    Some(Ok(CtEvent::Key(k))) if !is_actionable_key(k.kind) => {
+                        let _ = k;
+                    }
                     // The approval modal, when open, owns ALL keys with the
                     // highest priority (above every operational overlay and the
                     // general handler) so the operator's decision can't be
@@ -1875,6 +2054,15 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                     Some(Ok(CtEvent::Key(k))) if state.config_manager.is_some() => {
                         let fx = crate::ui::config_manager::on_key(
                             &mut state.config_manager,
+                            &mut state.jobs,
+                            k,
+                        );
+                        crate::jobs::run_effects(fx, &job_tx);
+                    }
+                    // Bench-run form, when open, owns all keys.
+                    Some(Ok(CtEvent::Key(k))) if state.bench_run.is_some() => {
+                        let fx = crate::ui::bench_run::on_key(
+                            &mut state.bench_run,
                             &mut state.jobs,
                             k,
                         );
@@ -2349,6 +2537,13 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
             state.close_overlays();
             state.config_manager = Some(crate::ui::config_manager::ConfigManagerState::default());
         }
+        KeyAction::OpenBenchRun => {
+            let bench_csv = state.bench_results_dir.clone();
+            state.close_overlays();
+            state.bench_run = Some(crate::ui::bench_run::BenchRunState::new(
+                bench_csv.as_deref(),
+            ));
+        }
         KeyAction::OpenThemePicker => state.open_theme_picker(),
         KeyAction::ApplyThemePick => state.apply_theme_pick(),
         KeyAction::OpenMenu => {
@@ -2398,6 +2593,8 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
         KeyAction::ScrollModal(_) => {}
         KeyAction::ScrollConsole(dv, dh) => state.scroll_console(dv, dh),
         KeyAction::ScrollDock(dv) => state.scroll_dock(dv),
+        KeyAction::ScrollGrab(target, pos) => state.apply_scroll_grab(target, pos),
+        KeyAction::ScrollRelease => state.scroll_drag = None,
         KeyAction::ReplayTogglePause => {
             if let Some(r) = state.replay.as_mut() {
                 r.paused = !r.paused;
@@ -2450,8 +2647,53 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
 
 /// Translate a mouse event into a `KeyAction` using whatever state context
 /// is needed (last drawn areas, active tab, current modal).
+/// Position (in the target's own offset units) for a scrollbar grabbed at
+/// `(col, row)`, inverting for the tail-anchored dock so dragging down scrolls
+/// toward older lines.
+fn grab_position(h: &ScrollbarHandle, col: u16, row: u16) -> usize {
+    let pos = h.position_at(col, row);
+    if h.target == ScrollTarget::DockLogs {
+        h.content_len
+            .saturating_sub(h.viewport_len)
+            .saturating_sub(pos)
+    } else {
+        pos
+    }
+}
+
+/// If `(col, row)` lands on a recorded scrollbar track, the grab action for it.
+fn scrollbar_hit(state: &AppState, col: u16, row: u16) -> Option<KeyAction> {
+    let bars = state.scrollbars.borrow();
+    let h = bars.iter().find(|h| point_in(h.track, col, row))?;
+    Some(KeyAction::ScrollGrab(h.target, grab_position(h, col, row)))
+}
+
 fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
+    // A held drag on a scrollbar keeps updating that offset until release, even
+    // when the pointer slides off the narrow track.
+    if me.kind == MouseEventKind::Drag(MouseButton::Left) {
+        if let Some(t) = state.scroll_drag
+            && let Some(h) = state.scrollbars.borrow().iter().find(|h| h.target == t)
+        {
+            return KeyAction::ScrollGrab(t, grab_position(h, me.column, me.row));
+        }
+        return KeyAction::Nothing;
+    }
+    // Any button release ends an active scrollbar drag.
+    if matches!(me.kind, MouseEventKind::Up(_)) {
+        return if state.scroll_drag.is_some() {
+            KeyAction::ScrollRelease
+        } else {
+            KeyAction::Nothing
+        };
+    }
+
     if me.kind == MouseEventKind::Down(MouseButton::Left) {
+        // Scrollbar tracks win over everything (incl. an open overlay's console
+        // bar), so a click on the bar grabs it instead of falling through.
+        if let Some(a) = scrollbar_hit(state, me.column, me.row) {
+            return a;
+        }
         if let Some(area) = state.last_tab_bar_area
             && let Some(tab) = tab_bar_hit(area, me.column, me.row)
         {
@@ -2578,6 +2820,88 @@ pub struct FooterChip {
     pub action: KeyAction,
 }
 
+/// Which scrollable surface a drawn scrollbar controls. Lets a mouse click on a
+/// scrollbar track write the right offset field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollTarget {
+    /// Job console vertical (`console_scroll`).
+    Console,
+    /// Job console horizontal (`console_hscroll`).
+    ConsoleH,
+    /// Wide-layout LOGS dock (`dock_logs_scroll`, tail-anchored / inverted).
+    DockLogs,
+    /// Bench row detail modal (`bench_detail_scroll`).
+    BenchDetail,
+    /// Chat transcript (`chat_scroll`).
+    Chat,
+}
+
+/// A scrollbar drawn this frame, recorded so a mouse click/drag can hit-test it.
+///
+/// `track` is the screen rect of the bar; `content_len`/`viewport_len` size the
+/// thumb; `target` says which offset to move. Vertical bars map the mouse row,
+/// horizontal bars the column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollbarHandle {
+    pub track: ratatui::layout::Rect,
+    pub horizontal: bool,
+    pub content_len: usize,
+    pub viewport_len: usize,
+    pub target: ScrollTarget,
+}
+
+impl ScrollbarHandle {
+    /// Build a handle from the rect passed to a scrollbar helper (`area`) and its
+    /// returned content rect (`drawn`). Returns `None` when they're equal — i.e.
+    /// no bar was drawn because the content fit — so nothing gets hit-tested.
+    pub(crate) fn new(
+        area: ratatui::layout::Rect,
+        drawn: ratatui::layout::Rect,
+        horizontal: bool,
+        content_len: usize,
+        viewport_len: usize,
+        target: ScrollTarget,
+    ) -> Option<Self> {
+        if drawn == area {
+            return None;
+        }
+        let track = if horizontal {
+            ratatui::layout::Rect::new(area.x, area.y + area.height - 1, area.width, 1)
+        } else {
+            ratatui::layout::Rect::new(area.x + area.width - 1, area.y, 1, area.height)
+        };
+        Some(Self {
+            track,
+            horizontal,
+            content_len,
+            viewport_len,
+            target,
+        })
+    }
+
+    /// Map an absolute mouse `(col, row)` to a clamped scroll position over
+    /// `0..=(content_len - viewport_len)`, proportional to where along the track
+    /// the pointer sits. Off-axis coordinates are ignored.
+    fn position_at(&self, col: u16, row: u16) -> usize {
+        let max_pos = self.content_len.saturating_sub(self.viewport_len);
+        if max_pos == 0 {
+            return 0;
+        }
+        let (coord, start, span) = if self.horizontal {
+            (col, self.track.x, self.track.width)
+        } else {
+            (row, self.track.y, self.track.height)
+        };
+        if span <= 1 {
+            return 0;
+        }
+        let rel = coord.saturating_sub(start).min(span - 1);
+        // Proportional: last cell of the track = max position.
+        let pos = usize::from(rel) * max_pos / usize::from(span - 1);
+        pos.min(max_pos)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyAction {
     Nothing,
@@ -2612,6 +2936,12 @@ pub enum KeyAction {
     /// Scroll the wide-layout right LOGS dock by N lines (negative = toward the
     /// newest line). No-op when the dock isn't showing.
     ScrollDock(i16),
+    /// Grab a scrollbar and jump its surface to `position` (first visible unit).
+    /// Emitted on a click or drag over a scrollbar track; also arms drag so
+    /// subsequent moves keep tracking the pointer.
+    ScrollGrab(ScrollTarget, usize),
+    /// Release the active scrollbar drag (mouse button up).
+    ScrollRelease,
     /// Toggle replay pause / resume. No-op when not replaying.
     ReplayTogglePause,
     /// Step replay speed up or down (clamped). No-op when not replaying.
@@ -2677,10 +3007,25 @@ pub enum KeyAction {
     OpenConfig,
     /// Open the logs overlay (Phase 3 Wave 3).
     OpenLogs,
+    /// Open the bench-run form overlay.
+    OpenBenchRun,
+}
+
+/// Whether a crossterm key event should be acted on. Terminals emit
+/// Release/Repeat events in addition to Press (notably Windows Terminal /
+/// ConPTY under WSL, and any terminal advertising the kitty keyboard protocol).
+///
+/// The whole TUI acts on Press only. Both the general [`handle_key`] and the
+/// event loop's operational-overlay dispatch share this gate — without it, a
+/// single keystroke reaches an overlay's `on_key` more than once, which made
+/// Enter in the serve wizard's model picker re-open the picker (seeded with the
+/// just-chosen model as a filter) instead of choosing it.
+const fn is_actionable_key(kind: KeyEventKind) -> bool {
+    matches!(kind, KeyEventKind::Press)
 }
 
 fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) -> KeyAction {
-    if k.kind != KeyEventKind::Press {
+    if !is_actionable_key(k.kind) {
         return KeyAction::Nothing;
     }
     // Chat tab key handling, placed BEFORE the global hotkey match so focused
@@ -2881,6 +3226,8 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
         KeyCode::Char('i') if current == ActiveTab::Observe => KeyAction::OpenInstall,
         // Logs: browse recent ROCm CLI logs.
         KeyCode::Char('l') if current == ActiveTab::Observe => KeyAction::OpenLogs,
+        // Bench-run: launch a bench sweep from the TUI.
+        KeyCode::Char('b') if current == ActiveTab::Observe => KeyAction::OpenBenchRun,
         // Runtimes: list/activate/adopt/import ROCm runtimes.
         KeyCode::Char('r') if current == ActiveTab::Observe => KeyAction::OpenRuntimes,
         // Onboarding: first-run setup wizard (install / adopt).
@@ -3202,6 +3549,72 @@ mod tests {
     }
 
     #[test]
+    fn scrollbar_position_maps_proportionally() {
+        let h = ScrollbarHandle {
+            track: Rect::new(50, 0, 1, 10),
+            horizontal: false,
+            content_len: 100,
+            viewport_len: 10,
+            target: ScrollTarget::Console,
+        };
+        // max position = 90; top of track → 0, last cell (row 9) → 90.
+        assert_eq!(h.position_at(50, 0), 0);
+        assert_eq!(h.position_at(50, 9), 90);
+        assert_eq!(h.position_at(50, 5), 90 * 5 / 9);
+        // Below the track clamps to the last cell.
+        assert_eq!(h.position_at(50, 99), 90);
+    }
+
+    #[test]
+    fn scrollbar_click_grabs_drag_scrolls_then_releases() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.scrollbars.borrow_mut().push(ScrollbarHandle {
+            track: Rect::new(60, 0, 1, 10),
+            horizontal: false,
+            content_len: 100,
+            viewport_len: 10,
+            target: ScrollTarget::Console,
+        });
+        // Click near the bottom of the track → grab + jump near the end.
+        let down = wheel(MouseEventKind::Down(MouseButton::Left), 60, 9);
+        let a = resolve_mouse(down, &s);
+        assert_eq!(a, KeyAction::ScrollGrab(ScrollTarget::Console, 90));
+        apply_action(&mut s, a);
+        assert_eq!(s.console_scroll, 90);
+        assert_eq!(s.scroll_drag, Some(ScrollTarget::Console));
+        // Drag to the top — the off-axis column is ignored, so it still tracks.
+        let drag = wheel(MouseEventKind::Drag(MouseButton::Left), 40, 0);
+        let a = resolve_mouse(drag, &s);
+        assert_eq!(a, KeyAction::ScrollGrab(ScrollTarget::Console, 0));
+        apply_action(&mut s, a);
+        assert_eq!(s.console_scroll, 0);
+        // Release clears the drag.
+        let up = wheel(MouseEventKind::Up(MouseButton::Left), 40, 0);
+        let a = resolve_mouse(up, &s);
+        assert_eq!(a, KeyAction::ScrollRelease);
+        apply_action(&mut s, a);
+        assert_eq!(s.scroll_drag, None);
+    }
+
+    #[test]
+    fn dock_scrollbar_grab_inverts_tail_anchored_offset() {
+        let s = AppState::new("t".into(), "default-dark".into());
+        s.scrollbars.borrow_mut().push(ScrollbarHandle {
+            track: Rect::new(0, 0, 1, 10),
+            horizontal: false,
+            content_len: 100,
+            viewport_len: 10,
+            target: ScrollTarget::DockLogs,
+        });
+        // Top of the bar = oldest lines = fully scrolled up from the tail (max).
+        let top = resolve_mouse(wheel(MouseEventKind::Down(MouseButton::Left), 0, 0), &s);
+        assert_eq!(top, KeyAction::ScrollGrab(ScrollTarget::DockLogs, 90));
+        // Bottom of the bar = newest tail = offset 0.
+        let bot = resolve_mouse(wheel(MouseEventKind::Down(MouseButton::Left), 0, 9), &s);
+        assert_eq!(bot, KeyAction::ScrollGrab(ScrollTarget::DockLogs, 0));
+    }
+
+    #[test]
     fn wheel_over_actions_list_moves_selection_by_one() {
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.active_tab = ActiveTab::Rocm;
@@ -3299,10 +3712,10 @@ mod tests {
     #[test]
     fn scroll_console_clamps_and_tracks_output() {
         let mut s = AppState::new("t".into(), "default-dark".into());
-        // No console → clamps to 0 (max line count is 0).
+        // No console → both axes clamp to 0 (no content to pan over).
         s.scroll_console(5, 5);
         assert_eq!(s.console_scroll, 0);
-        assert_eq!(s.console_hscroll, 5, "horizontal has no upper clamp");
+        assert_eq!(s.console_hscroll, 0, "no console → horizontal clamps to 0");
         // With a console of N lines, vertical clamps to N-1.
         s.jobs.apply(rocm_dash_core::state::StateEvent::StartJob {
             id: "logs".into(),
@@ -3324,6 +3737,11 @@ mod tests {
         assert_eq!(s.console_scroll, 3, "clamped to output.len()-1 (4 lines)");
         s.scroll_console(-100, 0);
         assert_eq!(s.console_scroll, 0);
+        // Horizontal clamps to the widest line minus one ("line 0" = 6 chars).
+        s.scroll_console(0, 100);
+        assert_eq!(s.console_hscroll, 5, "clamped to max line width - 1");
+        s.scroll_console(0, -100);
+        assert_eq!(s.console_hscroll, 0);
     }
 
     #[test]
@@ -3443,6 +3861,18 @@ mod tests {
     }
 
     #[test]
+    fn only_press_key_events_are_actionable() {
+        // The event loop gates overlay dispatch on this predicate so a single
+        // keystroke isn't processed twice by an overlay's `on_key` (Release /
+        // Repeat echoes on Windows Terminal / ConPTY / kitty keyboard). The
+        // double-fire re-opened the serve wizard's model picker on Enter instead
+        // of choosing — this pins Press-only routing.
+        assert!(is_actionable_key(KeyEventKind::Press));
+        assert!(!is_actionable_key(KeyEventKind::Release));
+        assert!(!is_actionable_key(KeyEventKind::Repeat));
+    }
+
+    #[test]
     fn jk_arrows_and_g_drive_selection() {
         assert_eq!(
             hk(KeyCode::Char('j'), ActiveTab::Observe),
@@ -3553,6 +3983,41 @@ mod tests {
         assert!(s.command_screen.is_some() && s.automations_manager.is_none());
         apply_action(&mut s, KeyAction::OpenConfig);
         assert!(s.config_manager.is_some() && s.command_screen.is_none());
+        // T13: OpenBenchRun joins the mutual-exclusion set.
+        apply_action(&mut s, KeyAction::OpenBenchRun);
+        assert!(s.bench_run.is_some() && s.config_manager.is_none());
+    }
+
+    // ---------- T13: bench_run overlay invariants ----------
+
+    #[test]
+    fn t13_bench_run_in_has_open_overlay() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        assert!(!s.has_open_overlay(), "no overlay initially");
+        s.bench_run = Some(crate::ui::bench_run::BenchRunState::new(None));
+        assert!(
+            s.has_open_overlay(),
+            "bench_run must be in has_open_overlay"
+        );
+    }
+
+    #[test]
+    fn t13_bench_run_cleared_by_close_overlays() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.bench_run = Some(crate::ui::bench_run::BenchRunState::new(None));
+        s.close_overlays();
+        assert!(s.bench_run.is_none(), "close_overlays must clear bench_run");
+    }
+
+    #[test]
+    fn t13_bench_run_at_root() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        assert!(s.active_overlay_at_root(), "nothing open → at root");
+        s.bench_run = Some(crate::ui::bench_run::BenchRunState::new(None));
+        assert!(
+            s.active_overlay_at_root(),
+            "bench_run (no sub-popup/job) is always at root"
+        );
     }
 
     #[test]
@@ -4105,6 +4570,131 @@ mod tests {
         assert!(s.chat_detect_msg.is_some());
     }
 
+    /// EAI-7354: once `ChatConsent::Accepted`, a focused `'d'` keypress is
+    /// ordinary chat text (see `handle_key`'s `ChatConsent::Accepted` arm), so
+    /// re-detect must be reachable another way. `/detect` is the affordance —
+    /// it runs through the same `request_detect`/`set_detect_result` edge as
+    /// the pre-accept `'d'` key, and since the offer prompt isn't drawn once
+    /// accepted (`ui::tabs::chat::draw` only renders the gate pre-accept), the
+    /// result is echoed into the transcript instead.
+    #[test]
+    fn slash_detect_probes_and_echoes_result_while_accepted() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.set_chat_config(
+            Some(crate::llm::LlmConfig {
+                base_url: "http://localhost:8000/v1".into(),
+                model: "m".into(),
+                api_key: None,
+                auth_header: None,
+            }),
+            true,
+        );
+        assert_eq!(s.chat_consent, ChatConsent::Accepted);
+
+        assert_eq!(s.handle_slash_command("/detect"), SlashOutcome::Handled);
+        assert!(s.chat_detecting && s.chat_detect_dispatch);
+        assert!(
+            s.chat.last().is_some(),
+            "probing while accepted is echoed into the transcript"
+        );
+
+        let local = crate::llm::detected_llm_config("http://localhost:13305/v1", "Llama-3.2-3B");
+        s.set_detect_result(Some(local.clone()));
+        assert_eq!(s.chat_detect_offer.as_ref(), Some(&local));
+        // No gate UI once accepted (draw_consent only renders pre-accept) — the
+        // offer must be surfaced in the transcript instead.
+        let last = s.chat.last().expect("echoed offer turn");
+        assert!(last.content.contains("/detect accept"));
+    }
+
+    /// `/detect accept` mid-session must integrate with the same
+    /// `chat_endpoint_rebuild` edge the initial pre-accept offer uses, or the
+    /// live agent silently keeps talking to the stale endpoint.
+    #[test]
+    fn slash_detect_accept_raises_endpoint_rebuild_like_initial_accept() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.set_chat_config(
+            Some(crate::llm::LlmConfig {
+                base_url: "http://localhost:8000/v1".into(),
+                model: "m".into(),
+                api_key: None,
+                auth_header: None,
+            }),
+            true,
+        );
+        s.active_provider = ChatProvider::Openai; // observe the realignment to Local
+        let local = crate::llm::detected_llm_config("http://localhost:13305/v1", "Llama-3.2-3B");
+        s.set_detect_result(Some(local.clone()));
+
+        assert_eq!(
+            s.handle_slash_command("/detect accept"),
+            SlashOutcome::Handled
+        );
+        assert_eq!(s.chat_llm.as_ref(), Some(&local));
+        assert_eq!(s.active_provider, ChatProvider::Local);
+        assert_eq!(
+            s.chat_endpoint_rebuild,
+            Some(ChatProvider::Openai),
+            "re-detect accept raises the rebuild edge exactly like the initial accept"
+        );
+    }
+
+    #[test]
+    fn slash_detect_dismiss_and_unknown_subcommand() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.set_detect_result(Some(crate::llm::detected_llm_config(
+            "http://localhost:8000/v1",
+            "m",
+        )));
+        assert_eq!(
+            s.handle_slash_command("/detect dismiss"),
+            SlashOutcome::Handled
+        );
+        assert!(s.chat_detect_offer.is_none());
+
+        assert_eq!(
+            s.handle_slash_command("/detect bogus"),
+            SlashOutcome::Handled
+        );
+        let last = s.chat.last().expect("error turn");
+        assert!(last.content.contains("unknown /detect action"));
+    }
+
+    /// Sub-commands are case-insensitive, matching `/permissions` / `/provider`.
+    #[test]
+    fn slash_detect_subcommand_is_case_insensitive() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.set_detect_result(Some(crate::llm::detected_llm_config(
+            "http://localhost:8000/v1",
+            "m",
+        )));
+        // `DISMISS` (upper) must act exactly like `dismiss`.
+        assert_eq!(
+            s.handle_slash_command("/detect DISMISS"),
+            SlashOutcome::Handled
+        );
+        assert!(
+            s.chat_detect_offer.is_none(),
+            "uppercase sub-command is normalized and handled"
+        );
+    }
+
+    /// `/detect accept` / `/detect save` with nothing pending emits a hint
+    /// turn rather than a silent no-op.
+    #[test]
+    fn slash_detect_accept_without_offer_emits_hint() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        assert!(s.chat_detect_offer.is_none());
+        assert_eq!(
+            s.handle_slash_command("/detect accept"),
+            SlashOutcome::Handled
+        );
+        // No endpoint was adopted; a hint explains why.
+        assert_eq!(s.chat_endpoint_rebuild, None);
+        let last = s.chat.last().expect("hint turn");
+        assert!(last.content.contains("no detected endpoint"));
+    }
+
     #[test]
     fn detect_key_available_on_gate_and_offer_keys_take_precedence() {
         // `d` triggers detect from the Unavailable empty-state.
@@ -4653,6 +5243,7 @@ mod tests {
             runtimes: Vec::new(),
             automations: Vec::new(),
             tool_executor: None,
+            bench_results_dir: None,
         }
     }
 

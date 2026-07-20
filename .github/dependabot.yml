@@ -1,0 +1,14 @@
+version: 2
+updates:
+  # Keep GitHub Actions pinned to SHAs but current: Dependabot reads the version
+  # from the trailing `# vX.Y.Z` comment on each `uses:` and opens PRs that bump
+  # the SHA when a new release lands, so pinning for supply-chain safety does not
+  # mean going stale.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"

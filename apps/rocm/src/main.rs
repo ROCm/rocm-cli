@@ -7,6 +7,7 @@ mod bootstrap;
 mod comfyui;
 mod dash;
 mod dash_seam;
+mod logging;
 mod provider_keys;
 mod providers;
 mod serve_summary;
@@ -329,6 +330,11 @@ rocm serve qwen2.5-7b-instruct --verbose --device gpu_required")]
         /// Allow binding to a non-local address.
         #[arg(long)]
         allow_public_bind: bool,
+        /// vLLM tool-call parser to enable OpenAI tool calling for this model
+        /// (e.g. `hermes`, `llama3_json`, `mistral`). Overrides any catalog default
+        /// and implies `--enable-auto-tool-choice`. Applies to vLLM only.
+        #[arg(long, value_name = "NAME")]
+        tool_call_parser: Option<String>,
     },
     /// Install, start, stop, or inspect ComfyUI.
     #[command(alias = "comfy")]
@@ -400,6 +406,12 @@ rocm logs --search error timeout")]
         #[arg(long)]
         chat_mock: bool,
     },
+    /// Saturate a local OpenAI-compatible endpoint and report rough client-side
+    /// throughput (local smoke-test, NOT an official ROCm/AMD benchmark).
+    Bench {
+        #[command(subcommand)]
+        command: BenchCommand,
+    },
     /// Remove ROCm CLI-managed files from this computer.
     Uninstall {
         /// Do not ask for interactive confirmation.
@@ -423,6 +435,47 @@ rocm logs --search error timeout")]
         /// Allow removing development binaries inside the current build tree.
         #[arg(long)]
         force_dev_binaries: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum BenchCommand {
+    /// Run a concurrency sweep (RAW serving throughput, synthetic single-shot
+    /// requests — not agent-shaped, not comparable to *-agent-bench harnesses).
+    ///
+    /// Measures RAW serving throughput (synthetic single-shot requests, vLLM
+    /// benchmark_serving shape). It does NOT reproduce agent-shaped, multi-turn,
+    /// long-context tool traffic and is not comparable to the *-agent-bench quality
+    /// harnesses.
+    Load {
+        /// Base URL of the OpenAI-compatible endpoint, e.g. http://127.0.0.1:8000
+        #[arg(long, value_name = "URL")]
+        endpoint: String,
+        /// Model name (defaults to the first model returned by GET {endpoint}/v1/models)
+        #[arg(long)]
+        model: Option<String>,
+        /// Concurrency levels to sweep, comma-separated
+        #[arg(long, value_delimiter = ',', default_value = "1,8,32,64", value_parser = clap::value_parser!(u32).range(1..=128))]
+        concurrency: Vec<u32>,
+        /// Input sequence length in tokens
+        #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u32).range(1..=32768))]
+        isl: u32,
+        /// Output sequence length in tokens
+        #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u32).range(1..=32768))]
+        osl: u32,
+        /// Requests per concurrency cell
+        #[arg(long, default_value_t = 128, value_parser = clap::value_parser!(u32).range(1..=10000))]
+        requests: u32,
+        /// Output CSV file (default: ~/.rocm/bench/results.csv, the
+        /// daemon-tailed path that populates the dashboard's Bench panel)
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+        /// Ramp concurrency automatically (1,2,4,8,16,32,64,128), stopping at saturation.
+        ///
+        /// Ignores --concurrency when set. Stops early when gen_tps plateaus
+        /// or the request queue backs up.
+        #[arg(long)]
+        auto_ramp: bool,
     },
 }
 
@@ -817,6 +870,14 @@ impl PermissionsModeArg {
 }
 
 fn main() -> Result<()> {
+    // Held for the whole process lifetime: dropping it flushes and stops the
+    // non-blocking file writer, so an early drop would silently truncate the
+    // log. A failed/missing `AppPaths::discover()` degrades to no logging
+    // rather than a startup failure.
+    let _log_guard = AppPaths::discover()
+        .ok()
+        .and_then(|paths| logging::init(&paths));
+
     maybe_migrate_legacy_dashboard_config();
 
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
@@ -1502,6 +1563,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             verbose,
             no_smoke_test,
             allow_public_bind,
+            tool_call_parser,
         }) => serve(ServeArgs {
             model,
             engine,
@@ -1516,6 +1578,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             verbose,
             no_smoke_test,
             allow_public_bind,
+            tool_call_parser,
         }),
         Some(Command::Comfyui { command }) => comfyui(command),
         Some(Command::Services { command }) => services(command),
@@ -1567,6 +1630,27 @@ fn dispatch(cli: Cli) -> Result<()> {
             demo,
             chat_mock,
         }) => dash::run(replay, demo, chat_mock),
+        Some(Command::Bench { command }) => match command {
+            BenchCommand::Load {
+                endpoint,
+                model,
+                concurrency,
+                isl,
+                osl,
+                requests,
+                out,
+                auto_ramp,
+            } => dash::run_bench(dash::BenchLoadArgs {
+                endpoint,
+                model,
+                concurrency,
+                isl,
+                osl,
+                requests,
+                out,
+                auto_ramp,
+            }),
+        },
         Some(Command::Uninstall {
             yes,
             dry_run,
@@ -2492,6 +2576,7 @@ fn build_driver_install_plan(
         .or_else(|| parse_os_release_field(os_release_text, "UBUNTU_CODENAME"))
         .or_else(|| codename_for_version(&os_id, &version_id).map(str::to_owned))
         .unwrap_or_default();
+    let id_like = parse_os_release_field(os_release_text, "ID_LIKE").unwrap_or_default();
 
     match (os_id.as_str(), version_id.as_str()) {
         ("ubuntu", "22.04" | "24.04") => apt_driver_plan(
@@ -2504,14 +2589,24 @@ fn build_driver_install_plan(
         ),
         ("debian", "12" | "13") => {
             let repo_codename = if version_id == "13" { "noble" } else { "jammy" };
-            apt_driver_plan(
+            let mut plan = apt_driver_plan(
                 os_id,
                 version_id,
                 repo_codename.to_owned(),
                 repo_version_expr,
                 dkms,
                 false,
-            )
+            );
+            // Debian deliberately reuses AMD's Ubuntu-suite repository: AMD's
+            // documented Debian install maps Debian 12 -> jammy and 13 -> noble
+            // and serves them from the .../ubuntu graphics tree. Surface that in
+            // the plan so the Ubuntu codename on a Debian host doesn't read as a
+            // misdetection.
+            plan.reason = format!(
+                "Debian intentionally uses AMD's Ubuntu-suite repository (codename {repo_codename}), per AMD's documented Debian install; the Ubuntu codename is deliberate, not a misdetection. {}",
+                plan.reason
+            );
+            plan
         }
         ("rhel", "10.1" | "10.0" | "9.7" | "9.6" | "9.4" | "8.10") => dnf_driver_plan(
             os_id,
@@ -2529,7 +2624,7 @@ fn build_driver_install_plan(
             dkms,
             DnfDriverDistro::Oracle,
         ),
-        ("rocky", "9.7") => dnf_driver_plan(
+        ("rocky", "9.4" | "9.6" | "9.7") => dnf_driver_plan(
             os_id,
             version_id,
             codename,
@@ -2540,7 +2635,15 @@ fn build_driver_install_plan(
         ("sles" | "sle", "15.7") => {
             sles_driver_plan(os_id, version_id, codename, repo_version_expr, dkms)
         }
-        _ => DriverInstallPlan {
+        _ => driver_plan_via_id_like(
+            &os_id,
+            &version_id,
+            &id_like,
+            &codename,
+            &repo_version_expr,
+            dkms,
+        )
+        .unwrap_or_else(|| DriverInstallPlan {
             supported: false,
             mutating: false,
             policy: "unsupported_linux_dkms_plan".to_owned(),
@@ -2552,8 +2655,102 @@ fn build_driver_install_plan(
             preflight_checks: Vec::new(),
             commands: Vec::new(),
             checks: vec!["rocm examine".to_owned()],
-        },
+        }),
     }
+}
+
+/// Select a driver install plan for a distro whose `/etc/os-release` `ID` is not
+/// an AMD-documented distro, by falling back to its `ID_LIKE` base family.
+///
+/// This mirrors the family resolution already used by the OpenMPI and system
+/// dependency install plans in [`rocm_core::openmpi`], which honor `ID_LIKE`. A
+/// derivative is matched only when its `VERSION_ID` aligns with an AMD-documented
+/// version of the base family, so version-misaligned derivatives still fall
+/// through to the unsupported plan rather than fabricating a repository URL that
+/// would 404.
+fn driver_plan_via_id_like(
+    os_id: &str,
+    version_id: &str,
+    id_like: &str,
+    codename: &str,
+    repo_version_expr: &str,
+    dkms: bool,
+) -> Option<DriverInstallPlan> {
+    let likes: Vec<String> = id_like
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let mentions = |family: &str| likes.iter().any(|like| like == family);
+
+    // Ubuntu-family derivatives that reuse Ubuntu's VERSION_ID (e.g. Pop!_OS)
+    // also reuse its repositories; the amdgpu apt line always targets the
+    // `ubuntu/<codename>` repo, so the plan is identical to the Ubuntu base.
+    // Derivatives with their own version scheme (e.g. Linux Mint's "22") do not
+    // match here and remain unsupported rather than guessing a codename.
+    if mentions("ubuntu") && matches!(version_id, "22.04" | "24.04") {
+        let codename = if codename.is_empty() {
+            codename_for_version("ubuntu", version_id)
+                .unwrap_or_default()
+                .to_owned()
+        } else {
+            codename.to_owned()
+        };
+        return Some(apt_driver_plan(
+            os_id.to_owned(),
+            version_id.to_owned(),
+            codename,
+            repo_version_expr.to_owned(),
+            dkms,
+            true,
+        ));
+    }
+
+    // Debian-family derivatives that share Debian's version scheme map to the
+    // matching Ubuntu repo codename, exactly like the Debian base.
+    if mentions("debian") && matches!(version_id, "12" | "13") {
+        let repo_codename = if version_id == "13" { "noble" } else { "jammy" };
+        return Some(apt_driver_plan(
+            os_id.to_owned(),
+            version_id.to_owned(),
+            repo_codename.to_owned(),
+            repo_version_expr.to_owned(),
+            dkms,
+            false,
+        ));
+    }
+
+    // Enterprise-Linux rebuilds (e.g. AlmaLinux) reuse RHEL's version scheme and
+    // standard (RHCK, non-UEK) kernels, but are served from the vendor-neutral
+    // `el/` repository path rather than `rhel/`. Gate strictly on `ID_LIKE`
+    // naming `rhel`: Oracle Linux advertises only `ID_LIKE=fedora` and boots the
+    // UEK kernel, so it must keep its dedicated `("ol", ...)` flow and never be
+    // captured here with RHCK kernel commands that would fail to install. Guard
+    // the `ol`/`oracle` IDs explicitly as well, in case a future OL release adds
+    // `rhel` to `ID_LIKE`.
+    if mentions("rhel") && !matches!(os_id, "ol" | "oracle") && is_supported_el_version(version_id)
+    {
+        return Some(dnf_driver_plan(
+            os_id.to_owned(),
+            version_id.to_owned(),
+            codename.to_owned(),
+            repo_version_expr.to_owned(),
+            dkms,
+            DnfDriverDistro::Generic,
+        ));
+    }
+
+    // No SUSE-family fallback: SLES is matched exactly, and community rebuilds
+    // such as openSUSE Leap share the SLES version scheme but lack SUSEConnect
+    // entitlements, so the SLES plan's `SUSEConnect` commands would fail. They
+    // intentionally remain unsupported rather than producing a broken plan.
+
+    None
+}
+
+/// The set of Enterprise-Linux versions AMD documents for the driver install,
+/// used to gate `ID_LIKE`-based matching of RHEL rebuilds.
+fn is_supported_el_version(version_id: &str) -> bool {
+    matches!(version_id, "10.1" | "10.0" | "9.7" | "9.6" | "9.4" | "8.10")
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2561,6 +2758,9 @@ enum DnfDriverDistro {
     Rhel,
     Oracle,
     Rocky,
+    /// A RHEL rebuild matched via `ID_LIKE` (e.g. AlmaLinux, CentOS Stream):
+    /// standard RHEL kernels, served from the vendor-neutral `el/` repo path.
+    Generic,
 }
 
 fn apt_driver_plan(
@@ -2667,7 +2867,7 @@ fn dnf_driver_plan(
     let mut commands = Vec::new();
     if dkms {
         match distro {
-            DnfDriverDistro::Rhel => {
+            DnfDriverDistro::Rhel | DnfDriverDistro::Generic => {
                 commands.extend(
                     rhel_kernel_prepare_commands(&version_id)
                         .into_iter()
@@ -2691,7 +2891,7 @@ fn dnf_driver_plan(
             DriverCommandPhase::Prepare,
             &format!(
                 "sudo dnf install -y {}",
-                amdgpu_install_rpm_url(&repo_version_expr, &os_id, &version_id, distro)
+                amdgpu_install_rpm_url(&repo_version_expr, &version_id, distro)
             ),
         ));
         commands.push(driver_command(
@@ -2852,15 +3052,14 @@ fn rhel_kernel_prepare_commands(version_id: &str) -> Vec<&'static str> {
 
 fn amdgpu_install_rpm_url(
     repo_version_expr: &str,
-    os_id: &str,
     version_id: &str,
     distro: DnfDriverDistro,
 ) -> String {
     let repo_family = match distro {
         DnfDriverDistro::Rhel => "rhel",
-        DnfDriverDistro::Oracle | DnfDriverDistro::Rocky => "el",
+        DnfDriverDistro::Oracle | DnfDriverDistro::Rocky | DnfDriverDistro::Generic => "el",
     };
-    let repo_version = dnf_repo_version_path(os_id, version_id);
+    let repo_version = dnf_repo_version_path(version_id);
     let el_major = linux_major_version(version_id);
     format!(
         "https://repo.radeon.com/amdgpu-install/{repo_version_expr}/{repo_family}/{repo_version}/amdgpu-install-{repo_version_expr}.${{ROCM_CLI_AMDGPU_PACKAGE_RELEASE:-70204}}-1.el{el_major}.noarch.rpm"
@@ -2873,10 +3072,14 @@ fn amdgpu_install_sles_rpm_url(repo_version_expr: &str, version_id: &str) -> Str
     )
 }
 
-fn dnf_repo_version_path(os_id: &str, version_id: &str) -> String {
-    match (os_id, version_id) {
-        ("rhel", "10.1" | "10.0") | ("ol", "10.1") => "10".to_owned(),
-        ("rhel" | "ol", "8.10") => "8".to_owned(),
+fn dnf_repo_version_path(version_id: &str) -> String {
+    // AMD serves EL 8 and 10 from a major-version path (el8/, el10/, rhel/10/),
+    // but EL 9 from the point-release path (el/9.7/, rhel/9.6/). Keying on the
+    // major version keeps this correct for RHEL, Oracle Linux, and ID_LIKE-matched
+    // rebuilds alike, without depending on the specific distro `ID`.
+    let major = linux_major_version(version_id);
+    match major {
+        "8" | "10" => major.to_owned(),
         _ => version_id.to_owned(),
     }
 }
@@ -3659,6 +3862,83 @@ fn protocol_engine_recipe_hint(
         })
 }
 
+/// Applies an explicit `--tool-call-parser` override to a vLLM engine recipe hint.
+///
+/// The TUI chat tab always attaches tool definitions to non-streaming chat
+/// requests (`tool_choice: "auto"`). vLLM rejects those with HTTP 400 unless it was
+/// started with `--enable-auto-tool-choice` *and* a matching `--tool-call-parser`.
+/// The correct parser is model-specific and vLLM does not auto-detect it, so it is
+/// never guessed from the model ref: it comes either from authored catalog recipe
+/// metadata (already carried in `required_flags`) or from the explicit
+/// `--tool-call-parser` serve flag, which this applies.
+///
+/// Only vLLM is affected. When an override is supplied it wins over any
+/// recipe-authored parser (a single `--tool-call-parser`, no duplication) and a
+/// minimal hint is synthesized when none exists (arbitrary HF repos, or a catalog
+/// model forced onto a non-preferred engine). With no override the hint passes
+/// through unchanged.
+fn engine_recipe_with_tool_call_override(
+    engine: &str,
+    hint: Option<EngineRecipeHint>,
+    tool_call_parser: Option<&str>,
+) -> Option<EngineRecipeHint> {
+    if !engine.eq_ignore_ascii_case("vllm") {
+        return hint;
+    }
+    let Some(parser) = tool_call_parser
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return hint;
+    };
+    let mut hint = hint.unwrap_or_else(|| EngineRecipeHint {
+        contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+        engine: engine.to_owned(),
+        ..EngineRecipeHint::default()
+    });
+    set_vllm_tool_call_parser(&mut hint.required_flags, parser);
+    Some(hint)
+}
+
+/// Rewrites `flags` so vLLM tool calling uses exactly `parser`: drops any existing
+/// `--tool-call-parser <value>` pair, ensures `--enable-auto-tool-choice` is
+/// present, then appends the new parser flag.
+fn set_vllm_tool_call_parser(flags: &mut Vec<String>, parser: &str) {
+    let existing = std::mem::take(flags);
+    let mut rewritten: Vec<String> = Vec::with_capacity(existing.len() + 3);
+    let mut skip_value = false;
+    for flag in existing {
+        if skip_value {
+            // Drop the value that followed the removed `--tool-call-parser`.
+            skip_value = false;
+            continue;
+        }
+        if flag == "--tool-call-parser" {
+            skip_value = true;
+            continue;
+        }
+        rewritten.push(flag);
+    }
+    if !rewritten
+        .iter()
+        .any(|flag| flag == "--enable-auto-tool-choice")
+    {
+        rewritten.push("--enable-auto-tool-choice".to_owned());
+    }
+    rewritten.push("--tool-call-parser".to_owned());
+    rewritten.push(parser.to_owned());
+    *flags = rewritten;
+}
+
+/// Whether the resolved engine recipe launches vLLM with tool calling enabled.
+fn engine_recipe_enables_tool_choice(hint: Option<&EngineRecipeHint>) -> bool {
+    hint.is_some_and(|hint| {
+        hint.required_flags
+            .iter()
+            .any(|flag| flag == "--enable-auto-tool-choice")
+    })
+}
+
 /// Parsed `rocm serve` arguments. Grouped into a struct to keep the dispatcher
 /// and `serve()` readable now that the verb carries verbose/smoke-test controls.
 struct ServeArgs {
@@ -3675,6 +3955,7 @@ struct ServeArgs {
     verbose: bool,
     no_smoke_test: bool,
     allow_public_bind: bool,
+    tool_call_parser: Option<String>,
 }
 
 fn serve(args: ServeArgs) -> Result<()> {
@@ -3692,6 +3973,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         verbose,
         no_smoke_test,
         allow_public_bind,
+        tool_call_parser,
     } = args;
     let _ = managed; // background is now the default; --managed is accepted as an explicit synonym.
     validate_bind_host(&host, allow_public_bind)?;
@@ -3720,12 +4002,34 @@ fn serve(args: ServeArgs) -> Result<()> {
         host_gpu_summary.as_ref(),
     );
     let selected_engine = serve_engine.engine.clone();
-    let engine_recipe = shared_recipe
+    let engine_model_ref =
+        serve_model_ref_for_engine(&model, shared_recipe.as_ref(), &selected_engine);
+    let recipe_hint = shared_recipe
         .as_ref()
         .filter(|recipe| model_recipe_supports_engine(recipe, &selected_engine))
         .and_then(|recipe| protocol_engine_recipe_hint(recipe, &selected_engine));
-    let engine_model_ref =
-        serve_model_ref_for_engine(&model, shared_recipe.as_ref(), &selected_engine);
+    // vLLM rejects the TUI chat tab's tool-bearing requests with HTTP 400 unless it
+    // is launched with `--enable-auto-tool-choice`/`--tool-call-parser`. The parser
+    // is model-specific and vLLM does not auto-detect it, so it is never guessed: it
+    // comes from authored catalog recipe metadata or an explicit `--tool-call-parser`
+    // override, applied here for vLLM only.
+    let engine_serves_vllm = selected_engine.eq_ignore_ascii_case("vllm");
+    let engine_recipe = engine_recipe_with_tool_call_override(
+        &selected_engine,
+        recipe_hint,
+        tool_call_parser.as_deref(),
+    );
+    let tool_call_note = if tool_call_parser.is_some() && !engine_serves_vllm {
+        Some(format!(
+            "note: --tool-call-parser applies only to vLLM; ignored for engine '{selected_engine}'"
+        ))
+    } else if engine_serves_vllm && !engine_recipe_enables_tool_choice(engine_recipe.as_ref()) {
+        Some(
+            "note: tool calling is disabled for this model; pass `--tool-call-parser <name>` (e.g. hermes, llama3_json, mistral) to enable it".to_owned(),
+        )
+    } else {
+        None
+    };
     let device_policy = parse_device_policy(device.as_deref())?;
     let gpu_selection = parse_gpu_selection(gpu.as_deref())?;
     // CPU-only serving never pins a GPU, so skip GPU resolution entirely and
@@ -3841,6 +4145,9 @@ fn serve(args: ServeArgs) -> Result<()> {
         if let Some(engine_recipe) = &resolve.engine_recipe {
             print!("{}", render_serve_engine_recipe_lines(engine_recipe));
         }
+        if let Some(note) = &tool_call_note {
+            println!("  {note}");
+        }
     }
 
     let managed_runtime_id = resolved_selection.runtime_id.clone();
@@ -3887,6 +4194,7 @@ fn serve(args: ServeArgs) -> Result<()> {
             );
             let summary = serve_summary::DeploymentSummary {
                 engine: selected_engine.clone(),
+                requested_model: model,
                 api_model: resolve.canonical_model_id,
                 chat_endpoint: format!("{}/chat/completions", report.endpoint_url),
                 service_id: report.service_id.clone(),
@@ -4180,6 +4488,9 @@ fn spawn_managed_engine_child(
     };
     record.supervisor_pid = child_pid;
     record.engine_pid = Some(child_pid);
+    // Capture the identity token while the child is alive, so a later stop
+    // verifies this exact process rather than a recycled PID.
+    record.supervisor_start_ticks = rocm_core::process_start_ticks(child_pid);
     record.status = "running".to_owned();
     record.write()?;
 
@@ -12138,6 +12449,71 @@ fn run_internal_sandbox_tool(
     }))
 }
 
+/// How long a managed stop waits for each recorded process to actually exit
+/// after `SIGTERM` before escalating to `SIGKILL` and then reporting a timeout.
+const MANAGED_STOP_GRACE: Duration = Duration::from_secs(10);
+
+/// Terminate the processes recorded for a managed service, verifying each PID's
+/// identity first so a recycled PID never causes an unrelated process tree to be
+/// killed.
+///
+/// The supervisor (launcher) and the engine server are distinct processes, so
+/// each PID is paired with **its own** start-time token (`supervisor_start_ticks`
+/// vs `engine_start_ticks`). When they resolve to the same PID (e.g. before the
+/// engine state has been refreshed) the entry is de-duplicated, preferring a
+/// known token. Returns the PIDs actually signalled and whether every recorded
+/// process is confirmed no longer running.
+fn terminate_recorded_service_pids(record: &ManagedServiceRecord) -> (Vec<u32>, bool) {
+    // Build the (pid, own-token) work list, de-duplicating on PID and preferring
+    // an entry that carries a verifiable start-time.
+    let mut entries: Vec<(u32, Option<u64>)> = Vec::new();
+    for (pid, ticks) in [
+        (Some(record.supervisor_pid), record.supervisor_start_ticks),
+        (record.engine_pid, record.engine_start_ticks),
+    ] {
+        let Some(pid) = pid.filter(|pid| *pid != 0 && *pid != std::process::id()) else {
+            continue;
+        };
+        if let Some(existing) = entries.iter_mut().find(|(seen, _)| *seen == pid) {
+            if existing.1.is_none() {
+                existing.1 = ticks;
+            }
+        } else {
+            entries.push((pid, ticks));
+        }
+    }
+
+    let mut signaled_pids = Vec::new();
+    let mut all_stopped = true;
+    for (pid, ticks) in entries {
+        let identity = rocm_core::ProcessIdentity::new(pid, ticks);
+        // The managed stop contract is definitive: after the adapter gets its
+        // graceful opportunity, this cleanup pass forces any verified survivor
+        // so the command does not report success while a GPU worker remains.
+        let outcome = rocm_core::terminate_verified(
+            &identity,
+            rocm_core::KillScope::Tree,
+            MANAGED_STOP_GRACE,
+            true,
+        );
+        if !outcome.stopped() {
+            all_stopped = false;
+        }
+        // Report every PID that received a signal. TimedOut belongs here because
+        // signalling was attempted even though the process was not confirmed
+        // stopped; `all_stopped` separately carries the truthful completion state.
+        if matches!(
+            outcome,
+            rocm_core::TerminationOutcome::Graceful
+                | rocm_core::TerminationOutcome::Forced
+                | rocm_core::TerminationOutcome::TimedOut
+        ) {
+            signaled_pids.push(pid);
+        }
+    }
+    (signaled_pids, all_stopped)
+}
+
 fn stop_internal_managed_service(paths: &AppPaths, service_id: &str) -> Result<serde_json::Value> {
     let mut record = load_managed_service(paths, service_id)?;
     let engine_stop = if record.engine == "lemonade" {
@@ -12156,17 +12532,15 @@ fn stop_internal_managed_service(paths: &AppPaths, service_id: &str) -> Result<s
             },
         )
     };
-    let mut signaled_pids = Vec::new();
-    for pid in [record.engine_pid, Some(record.supervisor_pid)]
-        .into_iter()
-        .flatten()
-        .filter(|pid| *pid != 0 && *pid != std::process::id())
-    {
-        if signal_process_tree(pid).is_ok() {
-            signaled_pids.push(pid);
-        }
+    let (signaled_pids, all_stopped) = terminate_recorded_service_pids(&record);
+    // Only claim "stopped" when every recorded process is confirmed gone. When a
+    // stop cannot confirm termination (rare: SIGKILL-resistant or unverifiable
+    // PID), leave the prior status so the standard liveness refresh reconciles it
+    // to "stopped" once the process actually dies — rather than asserting a stop
+    // that did not happen.
+    if all_stopped {
+        record.status = "stopped".to_owned();
     }
-    record.status = "stopped".to_owned();
     record.write()?;
     let engine_stop = match engine_stop {
         Ok(response) => serde_json::json!({
@@ -12284,6 +12658,8 @@ fn restart_internal_managed_service(
     record.status = "running".to_owned();
     record.supervisor_pid = child_pid;
     record.engine_pid = Some(child_pid);
+    // Refresh the identity token in lockstep with the restarted child's PID.
+    record.supervisor_start_ticks = rocm_core::process_start_ticks(child_pid);
     record.restart_count = record.restart_count.saturating_add(1);
     record.last_restart_unix_ms = Some(rocm_core::unix_time_millis());
     record.status = if wait_for_service_http_ready(
@@ -12299,12 +12675,6 @@ fn restart_internal_managed_service(
     };
     record.write()?;
     Ok(record)
-}
-
-fn signal_process_tree(pid: u32) -> Result<()> {
-    rocm_core::terminate_process_tree(pid)?;
-    thread::sleep(Duration::from_millis(300));
-    Ok(())
 }
 
 fn validate_service_id(service_id: &str) -> Result<()> {
@@ -15604,6 +15974,7 @@ fn treat_as_natural_language(args: &[String]) -> bool {
         "logs",
         "daemon",
         "dash",
+        "bench",
         "uninstall",
         "help",
         "--help",
@@ -15635,6 +16006,57 @@ mod tests {
     #[test]
     fn cli_command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn bench_load_rejects_zero_and_unbounded_numeric_arguments() {
+        for args in [
+            [
+                "rocm",
+                "bench",
+                "load",
+                "--endpoint",
+                "http://localhost:8000",
+                "--concurrency",
+                "0",
+            ]
+            .as_slice(),
+            [
+                "rocm",
+                "bench",
+                "load",
+                "--endpoint",
+                "http://localhost:8000",
+                "--isl",
+                "32769",
+            ]
+            .as_slice(),
+            [
+                "rocm",
+                "bench",
+                "load",
+                "--endpoint",
+                "http://localhost:8000",
+                "--osl",
+                "32769",
+            ]
+            .as_slice(),
+            [
+                "rocm",
+                "bench",
+                "load",
+                "--endpoint",
+                "http://localhost:8000",
+                "--requests",
+                "10001",
+            ]
+            .as_slice(),
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "accepted invalid args: {args:?}"
+            );
+        }
     }
 
     fn possible_values_listed_in_help(help: &str) -> Vec<String> {
@@ -16166,6 +16588,17 @@ mod tests {
             .find(|found| found.service_id == "svc-qwen-promote")
             .expect("service should be present");
         assert_eq!(promoted.status, "ready");
+
+        // Re-read the manifest file directly (bypassing any code path that
+        // could itself re-run the promotion) to prove the transition was
+        // actually written to disk, not just returned in the in-memory
+        // `Vec<ManagedServiceRecord>` above. `load_managed_service` below
+        // also calls `refresh_managed_service_runtime_liveness` on every
+        // read, so asserting only on its return value would pass even if
+        // `load_managed_services` never persisted anything.
+        let on_disk_bytes = fs::read(&record.manifest_path)?;
+        let on_disk = serde_json::from_slice::<ManagedServiceRecord>(&on_disk_bytes)?;
+        assert_eq!(on_disk.status, "ready");
 
         // The promotion must have been persisted to disk, not just returned
         // in-memory, since chat's `pick_managed_chat_endpoint` re-reads it.
@@ -19633,6 +20066,7 @@ install therock";
             "logs",
             "daemon",
             "dash",
+            "bench",
             "uninstall",
             "completions",
             "help",
@@ -19653,6 +20087,29 @@ install therock";
             .expect("comfyui logs should parse");
         Cli::try_parse_from(["rocm", "comfyui", "stop"]).expect("comfyui stop should parse");
         Cli::try_parse_from(["rocm", "comfy", "logs"]).expect("comfy alias should parse");
+    }
+
+    #[test]
+    fn t5_bench_load_clap_parse_smoke() {
+        // T5: verify BenchCommand::Load parses correctly including comma-separated concurrency.
+        let cli = Cli::try_parse_from([
+            "rocm",
+            "bench",
+            "load",
+            "--endpoint",
+            "http://x",
+            "--concurrency",
+            "1,8,32,64",
+        ])
+        .expect("rocm bench load should parse");
+        match cli.command {
+            Some(Command::Bench {
+                command: BenchCommand::Load { concurrency, .. },
+            }) => {
+                assert_eq!(concurrency, vec![1u32, 8, 32, 64]);
+            }
+            other => panic!("expected Bench/Load, got {other:?}"),
+        }
     }
 
     #[test]
@@ -19987,6 +20444,118 @@ install therock";
         ));
         assert!(serve_lines.contains("engine_recipe_required_flags: --enable-auto-tool-choice"));
         assert!(protocol_engine_recipe_hint(&recipe, "unknown-engine").is_none());
+    }
+
+    #[test]
+    fn tool_call_override_synthesizes_hint_for_vllm_without_recipe() {
+        // Arbitrary HF repo with no catalog recipe: the explicit override is the
+        // only source of the parser, and a minimal hint is synthesized to carry it.
+        let hint = engine_recipe_with_tool_call_override("vllm", None, Some("hermes"))
+            .expect("an override should synthesize a vllm tool-choice hint");
+        assert_eq!(hint.engine, "vllm");
+        assert_eq!(hint.contract_version, ENGINE_RECIPE_CONTRACT_VERSION);
+        assert_eq!(
+            hint.required_flags,
+            vec![
+                "--enable-auto-tool-choice".to_owned(),
+                "--tool-call-parser".to_owned(),
+                "hermes".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_call_override_replaces_recipe_authored_parser() {
+        // Override wins over an authored parser: exactly one `--tool-call-parser`,
+        // set to the override value, with unrelated flags preserved in order.
+        let existing = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "vllm".to_owned(),
+            required_flags: vec![
+                "--reasoning-parser".to_owned(),
+                "qwen3".to_owned(),
+                "--enable-auto-tool-choice".to_owned(),
+                "--tool-call-parser".to_owned(),
+                "llama3_json".to_owned(),
+            ],
+            ..EngineRecipeHint::default()
+        };
+        let hint =
+            engine_recipe_with_tool_call_override("vllm", Some(existing), Some("hermes")).unwrap();
+        assert_eq!(
+            hint.required_flags,
+            vec![
+                "--reasoning-parser".to_owned(),
+                "qwen3".to_owned(),
+                "--enable-auto-tool-choice".to_owned(),
+                "--tool-call-parser".to_owned(),
+                "hermes".to_owned(),
+            ]
+        );
+        assert_eq!(
+            hint.required_flags
+                .iter()
+                .filter(|flag| *flag == "--tool-call-parser")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn tool_call_override_absent_preserves_recipe_flags_without_guessing() {
+        // No override: authored recipe metadata flows through unchanged and no
+        // parser is ever guessed from the model ref.
+        let authored = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "vllm".to_owned(),
+            required_flags: vec![
+                "--enable-auto-tool-choice".to_owned(),
+                "--tool-call-parser".to_owned(),
+                "hermes".to_owned(),
+            ],
+            ..EngineRecipeHint::default()
+        };
+        let hint =
+            engine_recipe_with_tool_call_override("vllm", Some(authored.clone()), None).unwrap();
+        assert_eq!(hint.required_flags, authored.required_flags);
+
+        // Unknown model, no recipe, no override: nothing is injected.
+        assert!(engine_recipe_with_tool_call_override("vllm", None, None).is_none());
+        // A blank override is treated as absent.
+        assert!(engine_recipe_with_tool_call_override("vllm", None, Some("  ")).is_none());
+    }
+
+    #[test]
+    fn tool_call_override_leaves_non_vllm_engines_untouched() {
+        // The override is vLLM-specific: other engines are never rewritten.
+        assert!(engine_recipe_with_tool_call_override("lemonade", None, Some("hermes")).is_none());
+        let existing = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "lemonade".to_owned(),
+            required_flags: vec!["--some-flag".to_owned()],
+            ..EngineRecipeHint::default()
+        };
+        let hint = engine_recipe_with_tool_call_override(
+            "lemonade",
+            Some(existing.clone()),
+            Some("hermes"),
+        )
+        .unwrap();
+        assert_eq!(hint.required_flags, existing.required_flags);
+    }
+
+    #[test]
+    fn engine_recipe_enables_tool_choice_reflects_flags() {
+        assert!(!engine_recipe_enables_tool_choice(None));
+        let without = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "vllm".to_owned(),
+            required_flags: vec!["--reasoning-parser".to_owned(), "qwen3".to_owned()],
+            ..EngineRecipeHint::default()
+        };
+        assert!(!engine_recipe_enables_tool_choice(Some(&without)));
+        let with = engine_recipe_with_tool_call_override("vllm", None, Some("hermes"));
+        assert!(engine_recipe_enables_tool_choice(with.as_ref()));
     }
 
     #[test]
@@ -20375,6 +20944,66 @@ VERSION_ID="9.7"
     }
 
     #[test]
+    fn driver_plan_rocky_94_uses_el_dnf_flow() {
+        // Rocky 9.x point releases must resolve like RHEL 9.x, not just 9.7.
+        let os_release = r#"
+ID=rocky
+VERSION_ID="9.4"
+"#;
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert!(plan.supported);
+        assert!(plan.mutating);
+        assert!(
+            rendered.contains(
+                "repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/el/9.4/"
+            )
+        );
+        assert!(rendered.contains("amdgpu-install-${ROCM_CLI_AMDGPU_VERSION:-7.2.4}.${ROCM_CLI_AMDGPU_PACKAGE_RELEASE:-70204}-1.el9.noarch.rpm"));
+        assert!(rendered.contains("Execute: sudo dnf install -y amdgpu-dkms"));
+    }
+
+    #[test]
+    fn driver_plan_rocky_8_and_10_remain_unsupported() {
+        // AMD documents Rocky Linux 9 only; keep the driver matrix scoped to 9.x.
+        for version in ["8.10", "10.0"] {
+            let os_release = format!("\nID=rocky\nVERSION_ID=\"{version}\"\n");
+            let plan = build_driver_install_plan(&test_examine("linux", false), &os_release, true);
+            assert!(!plan.supported, "rocky {version} should be unsupported");
+            assert!(!plan.mutating, "rocky {version} must not mutate");
+            assert!(
+                plan.commands.is_empty(),
+                "rocky {version} must emit no commands"
+            );
+        }
+    }
+
+    #[test]
+    fn driver_plan_debian_uses_intended_ubuntu_suite() {
+        // AMD's documented Debian install deliberately serves Debian from the
+        // Ubuntu-suite graphics tree (Debian 12 -> jammy). Lock that in and
+        // ensure the plan explains the mapping is intentional.
+        let os_release = r#"
+ID=debian
+VERSION_ID="12"
+VERSION_CODENAME=bookworm
+"#;
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let rendered = render_driver_install_plan(&plan, false, true);
+
+        assert!(plan.supported);
+        assert_eq!(plan.codename, "jammy");
+        assert!(rendered.contains(
+            "https://repo.radeon.com/graphics/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/ubuntu jammy main"
+        ));
+        assert!(
+            plan.reason
+                .contains("intentionally uses AMD's Ubuntu-suite repository")
+        );
+    }
+
+    #[test]
     fn driver_plan_sles_157_uses_documented_zypper_commands() {
         let os_release = r#"
 ID=sles
@@ -20439,6 +21068,178 @@ VERSION_ID="41"
         assert!(rendered.contains("approval: not required"));
         assert!(rendered.contains("execution_commands: <none>"));
         assert!(rendered.contains("scripts/wsl_setup_rocdxg.sh"));
+        assert!(!rendered.contains("amdgpu-dkms"));
+    }
+
+    // EAI-7406: distro selection must honor `/etc/os-release` `ID_LIKE`, so that
+    // Debian/Ubuntu-family and RHEL-rebuild derivatives that share their base
+    // version scheme are matched to the correct apt (`ubuntu/<codename>`) or EL
+    // (`el/`) plan instead of falling through to the unsupported plan.
+
+    #[test]
+    fn driver_plan_ubuntu_derivative_via_id_like_matches_ubuntu_plan() {
+        // Pop!_OS reports its own ID but reuses Ubuntu's version + repositories.
+        let os_release = r#"
+ID=pop
+VERSION_ID="22.04"
+VERSION_CODENAME=jammy
+ID_LIKE="ubuntu debian"
+"#;
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert!(plan.supported);
+        assert!(plan.mutating);
+        assert_eq!(plan.policy, "linux_official_amd_dkms_wrapper");
+        // Ubuntu-family derivatives ship the Ubuntu kernel, so linux-modules-extra applies.
+        assert!(rendered.contains("linux-modules-extra-$(uname -r)"));
+        assert!(rendered.contains(
+            "https://repo.radeon.com/graphics/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/ubuntu jammy main"
+        ));
+        assert!(rendered.contains("Execute: sudo apt-get install -y amdgpu-dkms"));
+    }
+
+    #[test]
+    fn driver_plan_debian_derivative_via_id_like_matches_debian_plan() {
+        // A Debian derivative (e.g. LMDE) that shares Debian's version scheme.
+        let os_release = r#"
+ID=lmde
+VERSION_ID="12"
+ID_LIKE=debian
+"#;
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert!(plan.supported);
+        // Debian-family maps to the Ubuntu jammy repo and omits linux-modules-extra.
+        assert!(rendered.contains(
+            "https://repo.radeon.com/graphics/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/ubuntu jammy main"
+        ));
+        assert!(!rendered.contains("linux-modules-extra-$(uname -r)"));
+        assert!(rendered.contains("amdgpu-dkms"));
+    }
+
+    #[test]
+    fn driver_plan_almalinux_via_id_like_uses_el_9_flow() {
+        // AlmaLinux is a RHEL rebuild: standard kernel, served from the el/ path.
+        let os_release = r#"
+ID=almalinux
+VERSION_ID="9.6"
+ID_LIKE="rhel centos fedora"
+"#;
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert!(plan.supported);
+        assert!(plan.mutating);
+        assert_eq!(plan.policy, "linux_official_amd_dkms_wrapper");
+        // EL rebuilds use the vendor-neutral el/ repo path, not rhel/.
+        assert!(
+            rendered.contains(
+                "repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/el/9.6/"
+            )
+        );
+        assert!(!rendered.contains("/rhel/9.6/"));
+        assert!(rendered.contains("amdgpu-install-${ROCM_CLI_AMDGPU_VERSION:-7.2.4}.${ROCM_CLI_AMDGPU_PACKAGE_RELEASE:-70204}-1.el9.noarch.rpm"));
+        // el9 uses the version-aware standard-kernel prepare commands.
+        assert!(rendered.contains("kernel-devel-matched-$(uname -r)"));
+        assert!(rendered.contains("Execute: sudo dnf install -y amdgpu-dkms"));
+    }
+
+    #[test]
+    fn driver_plan_almalinux_8_via_id_like_uses_el_major_path() {
+        let os_release = r#"
+ID=almalinux
+VERSION_ID="8.10"
+ID_LIKE="rhel centos fedora"
+"#;
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert!(plan.supported);
+        // EL 8 is served from the major-version path (el/8), matching AMD docs.
+        assert!(
+            rendered
+                .contains("repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/el/8/")
+        );
+        assert!(rendered.contains("-1.el8.noarch.rpm"));
+        // el8 has no kernel-devel-matched package.
+        assert!(!rendered.contains("kernel-devel-matched"));
+        assert!(rendered.contains("kernel-devel-$(uname -r)"));
+    }
+
+    #[test]
+    fn driver_plan_id_like_with_unsupported_version_stays_unsupported() {
+        // A Debian-family derivative whose VERSION_ID does not align with any
+        // AMD-documented Debian version must not fabricate a plan.
+        let os_release = r#"
+ID=lmde
+VERSION_ID="6"
+ID_LIKE=debian
+"#;
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert!(!plan.supported);
+        assert!(!plan.mutating);
+        assert!(rendered.contains("unsupported_linux_dkms_plan"));
+        assert!(!rendered.contains("amdgpu-dkms"));
+    }
+
+    #[test]
+    fn driver_plan_exact_id_takes_precedence_over_id_like() {
+        // An exact RHEL match must keep the rhel/ path even though ID_LIKE=fedora.
+        let os_release = r#"
+ID=rhel
+VERSION_ID="9.7"
+ID_LIKE=fedora
+"#;
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert!(plan.supported);
+        assert!(rendered.contains(
+            "repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/rhel/9.7/"
+        ));
+        assert!(!rendered.contains("/el/9.7/"));
+    }
+
+    #[test]
+    fn driver_plan_oracle_linux_off_arm_version_stays_unsupported() {
+        // Oracle Linux reports `ID_LIKE=fedora` (not rhel) and boots UEK. An OL
+        // version outside the exact `ol` arm must NOT be captured by the EL
+        // fallback, which would emit non-UEK kernel commands that cannot install.
+        let os_release = r#"
+ID=ol
+VERSION_ID="9.6"
+ID_LIKE=fedora
+"#;
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert!(!plan.supported);
+        assert!(!plan.mutating);
+        assert!(rendered.contains("unsupported_linux_dkms_plan"));
+        assert!(!rendered.contains("kernel-devel-matched"));
+        assert!(!rendered.contains("amdgpu-dkms"));
+    }
+
+    #[test]
+    fn driver_plan_opensuse_leap_stays_unsupported() {
+        // openSUSE Leap shares SLES's version scheme but has no SUSEConnect/SCC
+        // entitlement, so it must not be matched to the SLES plan.
+        let os_release = r#"
+ID=opensuse-leap
+VERSION_ID="15.7"
+ID_LIKE="suse opensuse"
+"#;
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert!(!plan.supported);
+        assert!(!plan.mutating);
+        assert!(rendered.contains("unsupported_linux_dkms_plan"));
+        assert!(!rendered.contains("SUSEConnect"));
         assert!(!rendered.contains("amdgpu-dkms"));
     }
 
@@ -22406,6 +23207,123 @@ VERSION_ID="41"
             imported_from: None,
             installed_at_unix_ms: 1,
         }
+    }
+
+    #[cfg(unix)]
+    fn managed_record_for_pid(
+        paths: &AppPaths,
+        pid: u32,
+        start_ticks: Option<u64>,
+    ) -> ManagedServiceRecord {
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            "svc-managed-stop",
+            "vllm",
+            "m",
+            "m",
+            "127.0.0.1",
+            9,
+            "managed",
+            pid,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = Some(pid);
+        record.supervisor_pid = pid;
+        record.supervisor_start_ticks = start_ticks;
+        record
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_stop_refuses_recycled_pid() {
+        // A live process whose recorded identity does not match: this is exactly
+        // what a recycled PID looks like. The stop must NOT signal it.
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        let (root, paths) = test_paths("managed-stop-recycled");
+        let real = rocm_core::process_start_ticks(pid).expect("start-ticks");
+        let record = managed_record_for_pid(&paths, pid, Some(real.wrapping_add(1)));
+
+        let (signaled, all_stopped) = terminate_recorded_service_pids(&record);
+
+        assert!(signaled.is_empty(), "must not signal a mismatched identity");
+        // A recycled PID means the recorded service process itself is gone.
+        assert!(all_stopped);
+        assert!(
+            rocm_core::process_is_running(pid),
+            "the unrelated live process must survive"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_stop_verifies_distinct_supervisor_and_engine_pids() {
+        // The launcher and the engine server are different processes; each PID
+        // must be verified with its OWN start-time token and terminated.
+        let sup = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn supervisor");
+        let eng = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn engine");
+        let (sup_pid, eng_pid) = (sup.id(), eng.id());
+        let (root, paths) = test_paths("managed-stop-distinct");
+        let mut record =
+            managed_record_for_pid(&paths, sup_pid, rocm_core::process_start_ticks(sup_pid));
+        record.engine_pid = Some(eng_pid);
+        record.engine_start_ticks = rocm_core::process_start_ticks(eng_pid);
+
+        let (mut signaled, all_stopped) = terminate_recorded_service_pids(&record);
+        signaled.sort_unstable();
+        let mut expected = vec![sup_pid, eng_pid];
+        expected.sort_unstable();
+
+        assert_eq!(signaled, expected);
+        assert!(all_stopped);
+        let (mut sup, mut eng) = (sup, eng);
+        let _ = sup.wait();
+        let _ = eng.wait();
+        assert!(!rocm_core::process_is_running(sup_pid));
+        assert!(!rocm_core::process_is_running(eng_pid));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_stop_terminates_verified_pid() {
+        // Correct identity: the recorded process is really ours, so it is stopped.
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        let (root, paths) = test_paths("managed-stop-verified");
+        let real = rocm_core::process_start_ticks(pid).expect("start-ticks");
+        let record = managed_record_for_pid(&paths, pid, Some(real));
+
+        let (signaled, all_stopped) = terminate_recorded_service_pids(&record);
+
+        assert_eq!(signaled, vec![pid]);
+        assert!(all_stopped);
+        // Reap our own child (a detached managed process would be reaped by init)
+        // so the liveness check does not observe a not-yet-reaped zombie.
+        let mut child = child;
+        let _ = child.wait();
+        assert!(
+            !rocm_core::process_is_running(pid),
+            "the verified process must be terminated"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     fn test_paths(name: &str) -> (PathBuf, AppPaths) {

@@ -16,6 +16,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+#[cfg(test)]
 use rocm_dash_core::metrics::InstanceStatus;
 
 use crate::app::AppState;
@@ -84,10 +85,7 @@ pub fn choice_for(sel: usize) -> LauncherChoice {
 
 /// True when a model is actively serving (drives the running vs idle variant).
 fn is_running(state: &AppState) -> bool {
-    state
-        .instances
-        .values()
-        .any(|i| i.status == InstanceStatus::Running)
+    state.instances.values().any(|i| i.status.is_serving())
 }
 
 pub fn draw(f: &mut Frame, area: Rect, state: &AppState, sel: usize, theme: &Theme) {
@@ -163,10 +161,7 @@ fn draw_status_strip(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         },
     );
     let serve_line = if running {
-        let inst = state
-            .instances
-            .values()
-            .find(|i| i.status == InstanceStatus::Running);
+        let inst = state.instances.values().find(|i| i.status.is_serving());
         let (name, port) = inst.map_or(("model", String::new()), |i| {
             (
                 i.model_name.as_str(),
@@ -182,7 +177,9 @@ fn draw_status_strip(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             ),
             Span::styled(port, Style::default().fg(theme.muted)),
             Span::styled("  │  ", Style::default().fg(theme.border)),
-            Span::styled("✓ healthy", Style::default().fg(theme.ok)),
+            // A Running process is not a health signal. Without an actual health
+            // probe we report health as unknown rather than fabricating "healthy".
+            Span::styled("health: unknown", Style::default().fg(theme.muted)),
         ])
     } else {
         Line::from(vec![
@@ -365,6 +362,32 @@ mod tests {
         assert!(out.contains("soon"), "optimize soon badge missing");
         let needle = ["generate", "an", "image"].join(" ");
         assert!(!out.to_lowercase().contains(&needle), "no image verb");
+    }
+
+    #[test]
+    fn launcher_running_reports_unknown_health_not_fabricated_healthy() {
+        // A Running process is not a health signal; without a probe the launcher
+        // must not claim the service is healthy.
+        let mut s = base();
+        s.instances.insert(
+            "id".into(),
+            Instance {
+                container_id: "id".into(),
+                model_name: "Qwen3-72B".into(),
+                status: InstanceStatus::Running,
+                port: Some(8000),
+                ..Default::default()
+            },
+        );
+        let out = render(&s, 0, 100, 24);
+        assert!(
+            out.contains("health: unknown"),
+            "launcher must report unknown health: {out:?}"
+        );
+        assert!(
+            !out.contains("healthy"),
+            "launcher must not fabricate a healthy claim: {out:?}"
+        );
     }
 
     #[test]

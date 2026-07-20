@@ -18,6 +18,7 @@ use ratatui::widgets::Paragraph;
 
 use rocm_dash_core::state::{JobState, JobStatus, SideEffect, State, StateEvent};
 
+use crate::app::{ScrollTarget, ScrollbarHandle};
 use crate::ui::modal::{centered_rect, draw_popup_frame};
 use crate::ui::theme::Theme;
 
@@ -79,20 +80,25 @@ pub fn status_label(job: &JobState, theme: &Theme) -> (String, ratatui::style::C
     }
 }
 
-/// Render the job console centered over `area`. `scroll` is `(vertical_line,
-/// horizontal_col)` of the first visible cell (the caller clamps it).
+/// Render the job console centered over `area`.
+///
+/// `scroll` is `(vertical_line, horizontal_col)` of the first visible cell (the
+/// caller clamps it). `tick_count` drives the running-job progress spinner.
+/// Returns the scrollbar handles drawn this frame so the caller can record them
+/// for mouse hit-testing.
 pub fn draw_job_console(
     f: &mut Frame,
     area: Rect,
     job: &JobState,
     scroll: (u16, u16),
+    tick_count: u64,
     theme: &Theme,
-) {
+) -> Vec<ScrollbarHandle> {
     let popup = centered_rect(90, 84, 140, 40, area);
     let title = format!("{} {}", job.cmd, job.args.join(" "));
     let inner = draw_popup_frame(f, popup, title.trim(), theme);
     if inner.height == 0 {
-        return;
+        return Vec::new();
     }
 
     let rows = Layout::default()
@@ -104,33 +110,98 @@ pub fn draw_job_console(
         ])
         .split(inner);
 
-    // Header: status badge.
+    // Header: status badge, plus an animated braille spinner and parsed
+    // percentage while the job runs so progress reads as live motion.
     let (label, color) = status_label(job, theme);
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                " status ",
+    let mut header = vec![
+        Span::styled(
+            " status ",
+            Style::default()
+                .fg(theme.bg)
+                .bg(color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+    ];
+    if matches!(job.status, JobStatus::Running) {
+        header.push(Span::styled(
+            format!("{} ", crate::ui::spinner::spinner_frame(tick_count)),
+            Style::default().fg(theme.accent),
+        ));
+    }
+    header.push(Span::styled(
+        label,
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ));
+    if matches!(job.status, JobStatus::Running) {
+        // The most recent line carrying a percentage wins (later output is more
+        // current than earlier); silently omit the figure when none is present.
+        if let Some(pct) = job
+            .output
+            .iter()
+            .rev()
+            .find_map(|l| crate::ui::spinner::parse_progress_pct(l))
+        {
+            header.push(Span::styled(
+                format!("  {pct}%"),
                 Style::default()
-                    .fg(theme.bg)
-                    .bg(color)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                label,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-        ])),
-        rows[0],
-    );
+            ));
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(header)), rows[0]);
 
-    // Body: streamed output lines.
+    // Body: streamed output lines, with a scrollbar when the ring overflows the
+    // viewport so the user can see there's more above/below.
     let lines: Vec<Line> = job
         .output
         .iter()
         .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(theme.fg))))
         .collect();
-    f.render_widget(Paragraph::new(lines).scroll(scroll), rows[1]);
+    let content_w = job
+        .output
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0);
+    let vbody = crate::ui::panel::vertical_scrollbar(
+        f,
+        rows[1],
+        job.output.len(),
+        rows[1].height as usize,
+        scroll.0 as usize,
+        theme,
+    );
+    let body = crate::ui::panel::horizontal_scrollbar(
+        f,
+        vbody,
+        content_w,
+        vbody.width as usize,
+        scroll.1 as usize,
+        theme,
+    );
+    f.render_widget(Paragraph::new(lines).scroll(scroll), body);
+
+    // Report the drawn bars so the caller can hit-test mouse clicks/drags.
+    let handles = [
+        ScrollbarHandle::new(
+            rows[1],
+            vbody,
+            false,
+            job.output.len(),
+            rows[1].height as usize,
+            ScrollTarget::Console,
+        ),
+        ScrollbarHandle::new(
+            vbody,
+            body,
+            true,
+            content_w,
+            vbody.width as usize,
+            ScrollTarget::ConsoleH,
+        ),
+    ];
 
     // Footer: key hints. While running, Esc leaves the overlay (the job keeps
     // running in the background) and Ctrl+C cancels — advertise both so the user
@@ -148,6 +219,8 @@ pub fn draw_job_console(
         ))),
         rows[2],
     );
+
+    handles.into_iter().flatten().collect()
 }
 
 #[cfg(test)]

@@ -14,7 +14,7 @@
 //! The rest of `rocm` is synchronous; the async daemon/TUI run on a tokio
 //! runtime built here. The TUI lives entirely in the `rocm-dash-tui` crate.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -43,7 +43,11 @@ pub fn runner_options(
 ) -> RunnerOptions {
     let d = &config.dashboard.daemon;
     RunnerOptions {
-        bench_csv: d.bench_results_dir.clone(),
+        bench_csv: Some(
+            d.bench_results_dir
+                .clone()
+                .unwrap_or_else(|| default_bench_csv_path(paths)),
+        ),
         enable_docker,
         image_patterns: None,
         gpu_tick: Duration::from_secs_f64(d.gpu_tick_secs),
@@ -201,6 +205,7 @@ pub fn resolved_args(
         // The real executor is injected in `run_async` for a live dash; None
         // here keeps demo/replay/mock behaving exactly as today.
         tool_executor: None,
+        bench_results_dir: config.dashboard.daemon.bench_results_dir.clone(),
     }
 }
 
@@ -214,14 +219,84 @@ fn build_dashboard_runtime() -> Result<tokio::runtime::Runtime> {
         .context("building tokio runtime for the dashboard")
 }
 
+/// Compute a private, per-run path for a `--demo` session file.
+///
+/// Written under the per-user data dir (`{data_dir}/demo`, created `0o700` on
+/// Unix), never a fixed name in the world-shared temp dir. The name is unique
+/// per run, not secret — confidentiality rests on the `0o700` dir / `0o600` file
+/// permissions (the file is created `0o600` by `demo::generate_file`). Stale
+/// sessions are pruned so the directory does not accumulate.
+fn demo_session_path(paths: &AppPaths) -> Result<PathBuf> {
+    let dir = paths.data_dir.join("demo");
+    create_private_dir(&dir)?;
+    let file = format!(
+        "session-{}-{}.ndjson",
+        std::process::id(),
+        rocm_core::unix_time_millis()
+    );
+    let target = dir.join(file);
+    prune_stale_demo_sessions(&dir, &target);
+    Ok(target)
+}
+
+/// Create `dir` restricted to the owner (`0o700`) on Unix. `DirBuilder::mode`
+/// applies at creation so there is no umask window; a pre-existing directory is
+/// tightened best-effort afterward (matching `server.rs`/`agent.rs`).
+#[cfg(unix)]
+fn create_private_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("creating demo session dir {}", dir.display()))?;
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("creating demo session dir {}", dir.display()))
+}
+
+/// Best-effort prune of old demo sessions so the directory stays bounded,
+/// without deleting a session a concurrent `rocm dash --demo` may be replaying:
+/// the file we are about to write and any file modified in the last hour are
+/// kept.
+fn prune_stale_demo_sessions(dir: &Path, keep: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == *keep || path.extension().and_then(|e| e.to_str()) != Some("ndjson") {
+            continue;
+        }
+        let recently_touched = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .is_some_and(|age| age < std::time::Duration::from_hours(1));
+        if recently_touched {
+            continue;
+        }
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Entry point for `rocm dash`. Builds a tokio runtime and runs the dashboard.
 pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths)?;
-    // `--demo` writes a deterministic synthetic session and replays it, so the
-    // dashboard shows populated data with no GPU and no daemon.
+    // `--demo` writes a synthetic session and replays it, so the dashboard shows
+    // populated data with no GPU and no daemon. The session is written under the
+    // per-user data dir with an unpredictable name (not a fixed world-shared
+    // temp path) and created `0o600` by `demo::generate_file`.
     let replay = if demo {
-        let path = std::env::temp_dir().join("rocm-dash-demo.ndjson");
+        let path = demo_session_path(&paths)?;
         rocm_dash_daemon::demo::generate_file(
             &rocm_dash_daemon::demo::DemoOptions::default(),
             &path,
@@ -317,6 +392,149 @@ pub fn run_chat(chat_mock: bool) -> Result<()> {
     let args = resolved_args(&config, &paths, ActiveTab::Chat);
     let rt = build_dashboard_runtime()?;
     rt.block_on(run_async(config, paths, args, None, chat_mock))
+}
+
+/// CLI arguments for `rocm bench load`.
+pub struct BenchLoadArgs {
+    pub endpoint: String,
+    pub model: Option<String>,
+    pub concurrency: Vec<u32>,
+    pub isl: u32,
+    pub osl: u32,
+    pub requests: u32,
+    pub out: Option<std::path::PathBuf>,
+    pub auto_ramp: bool,
+}
+
+/// Default `--out` path for `rocm bench load`: the same file the telemetry
+/// daemon tails by default (`DashboardDaemonConfig::bench_results_dir`), so a
+/// plain CLI run populates the dashboard's Bench panel without any config
+/// edits. Extracted as a pure function of `AppPaths` for testability.
+fn default_bench_csv_path(paths: &AppPaths) -> std::path::PathBuf {
+    paths.data_dir.join("bench").join("results.csv")
+}
+
+fn ensure_bench_csv_parent(csv_path: &std::path::Path) -> Result<()> {
+    if let Some(parent) = csv_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating bench output dir {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+/// Entry point for `rocm bench load`.
+///
+/// Runs a concurrency sweep against a local http:// endpoint and appends one
+/// aggregate CSV row per concurrency level. Output defaults to the daemon's
+/// tailed `<data_dir>/bench/results.csv` unless `--out` is specified explicitly.
+pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
+    use rocm_dash_daemon::bench_load::{LoadSpec, run_and_append_csv, run_auto_ramp};
+
+    let BenchLoadArgs {
+        endpoint,
+        model,
+        concurrency,
+        isl,
+        osl,
+        requests,
+        out,
+        auto_ramp,
+    } = a;
+
+    // Reject https:// — no TLS backend compiled in for the load generator.
+    // Compare on the lowercased scheme so HTTPS:// is also caught.
+    if endpoint.to_lowercase().starts_with("https://") {
+        anyhow::bail!(
+            "rocm bench load supports http:// endpoints only (no TLS backend compiled in)"
+        );
+    }
+
+    // Resolve the model: use the provided value or probe GET {endpoint}/v1/models.
+    let model = if let Some(m) = model {
+        m
+    } else {
+        let models_url = format!("{}/v1/models", endpoint.trim_end_matches('/'));
+        let resp = ureq::get(&models_url)
+            .timeout(std::time::Duration::from_secs(5))
+            .call()
+            .context("fetching /v1/models to detect the default model")?;
+        let body: serde_json::Value = resp.into_json().context("parsing /v1/models response")?;
+        rocm_dash_tui::llm::pick_first_model(&body).with_context(|| {
+            format!("no model found at {endpoint}/v1/models — pass --model explicitly")
+        })?
+    };
+
+    // Resolve the output path: default to the same `<data_dir>/bench/results.csv`
+    // file the daemon tails. Rows are appended, matching the `CsvBenchTailer`
+    // semantics. Create parents for explicit and default paths alike.
+    let csv_path = match out {
+        Some(path) => path,
+        None => default_bench_csv_path(&AppPaths::discover()?),
+    };
+    ensure_bench_csv_parent(&csv_path)?;
+
+    let spec = LoadSpec {
+        endpoint: endpoint.clone(),
+        model: model.clone(),
+        input_len: isl,
+        output_len: osl,
+        requests,
+    };
+
+    println!("mode: raw serving throughput (synthetic prompts) — not agent-workload.");
+    if auto_ramp {
+        println!(
+            "endpoint={endpoint} model={model} mode=auto-ramp isl={isl} osl={osl} requests={requests}"
+        );
+    } else {
+        println!(
+            "endpoint={endpoint} model={model} concurrency={} isl={isl} osl={osl} requests={requests}",
+            concurrency
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+
+    let rt = build_dashboard_runtime()?;
+    let rows = if auto_ramp {
+        rt.block_on(run_auto_ramp(&spec, &csv_path))
+            .context("running bench auto-ramp")?
+    } else {
+        rt.block_on(run_and_append_csv(&spec, &concurrency, &csv_path))
+            .context("running bench load sweep")?
+    };
+
+    for row in &rows {
+        let conc = row
+            .concurrency
+            .map_or_else(|| "-".to_string(), |v| v.to_string());
+        let gen_tps = row
+            .gen_tps
+            .map_or_else(|| "-".to_string(), |v| format!("{v:.1}"));
+        let prompt_tps = row
+            .prompt_tps
+            .map_or_else(|| "-".to_string(), |v| format!("{v:.1}"));
+        let wall = row
+            .wall_s
+            .map_or_else(|| "-".to_string(), |v| format!("{v:.2}"));
+        let n = row
+            .n_requests
+            .map_or_else(|| "-".to_string(), |v| v.to_string());
+        println!(
+            "cell={} concurrency={conc} gen_tps={gen_tps} prompt_tps={prompt_tps} wall={wall}s n={n}",
+            row.cell
+        );
+    }
+    println!(
+        "note: local saturation smoke-test — client-measured throughput, not an official ROCm/AMD benchmark."
+    );
+    println!("wrote {} row(s) to {}", rows.len(), csv_path.display());
+
+    Ok(())
 }
 
 /// Entry point for `rocm bootstrap setup`. Routes to the same focused Setup host
@@ -455,6 +673,107 @@ mod tests {
         assert_eq!(opts.services_dir, Some(p.services_dir()));
         assert_eq!(opts.persist_dir, Some(p.telemetry_state_dir()));
         assert!(!opts.enable_docker);
+    }
+
+    /// EAI-7359 regression: the embedded daemon (`maybe_spawn_embedded_daemon`)
+    /// always calls `runner_options(.., enable_docker=false)`, so the vLLM
+    /// Prometheus scraper must NOT be gated on `enable_docker` — otherwise it
+    /// is permanently dead in the common no-Docker / managed-vLLM case even
+    /// though `vllm_prom.rs` has zero Docker dependency (plain HTTP GET).
+    /// The scrape stays on by default; `disable_vllm_metrics` is the internal
+    /// gate that would turn it off, but it is not currently wired to any CLI
+    /// flag or config field, so today it is always `false`.
+    #[test]
+    fn runner_options_keeps_vllm_metrics_enabled_without_docker() {
+        let p = paths();
+        let opts = runner_options(&cfg(), &p, false);
+        assert!(!opts.enable_docker);
+        assert!(
+            !opts.disable_vllm_metrics,
+            "vLLM metrics must stay on by default even when Docker discovery is off"
+        );
+    }
+
+    #[test]
+    fn runner_options_derives_default_bench_csv_from_current_paths() {
+        let p = paths();
+        let opts = runner_options(&cfg(), &p, false);
+        assert_eq!(opts.bench_csv, Some(default_bench_csv_path(&p)));
+    }
+
+    #[test]
+    fn runner_options_preserves_explicit_bench_csv_override() {
+        let p = paths();
+        let mut config = cfg();
+        let explicit = PathBuf::from("/var/rocm/custom-bench.csv");
+        config.dashboard.daemon.bench_results_dir = Some(explicit.clone());
+
+        let opts = runner_options(&config, &p, false);
+        assert_eq!(opts.bench_csv, Some(explicit));
+    }
+
+    #[test]
+    fn ensure_bench_csv_parent_creates_explicit_output_directory() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("bench-parent-test-{}", std::process::id()));
+        let csv = root.join("nested").join("results.csv");
+
+        ensure_bench_csv_parent(&csv).unwrap();
+        assert!(csv.parent().unwrap().is_dir());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn demo_session_path_is_private_and_unique() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-demo-test-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        let p = AppPaths {
+            config_dir: root.join("cfg"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+
+        let path = demo_session_path(&p).expect("demo session path");
+
+        // Under the per-user data dir, never the shared temp dir with a fixed name.
+        assert!(
+            path.starts_with(p.data_dir.join("demo")),
+            "demo file must live under the data dir: {}",
+            path.display()
+        );
+        assert_ne!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("rocm-dash-demo.ndjson"),
+            "demo file name must not be the old predictable shared-temp name"
+        );
+
+        // The generated file is created private to the owner.
+        rocm_dash_daemon::demo::generate_file(
+            &rocm_dash_daemon::demo::DemoOptions::default(),
+            &path,
+        )
+        .expect("generate demo session");
+        assert!(path.exists(), "demo session file should exist");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(file_mode, 0o600, "demo session file must be 0o600");
+            let dir_mode = std::fs::metadata(p.data_dir.join("demo"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700, "demo dir must be 0o700");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

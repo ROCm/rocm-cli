@@ -94,7 +94,9 @@ pub fn service_rows<S: ::std::hash::BuildHasher>(
             id: i.container_id.clone(),
             model: i.model_name.clone(),
             port: i.port,
-            status: format!("{:?}", i.status),
+            // `label()` surfaces the DOWNLOADING/LOADING/WARMUP startup phase
+            // when the instance is `Starting`; never a raw `{:?}` debug string.
+            status: i.status.label().to_owned(),
             gen_tps: i.gen_tps,
         })
         .collect();
@@ -292,7 +294,15 @@ pub fn draw_services_manager<S: ::std::hash::BuildHasher>(
                 .bg(theme.surface_2)
                 .add_modifier(Modifier::BOLD),
         );
-        f.render_stateful_widget(list, body[0], &mut ls);
+        let list_area = panel::vertical_scrollbar(
+            f,
+            body[0],
+            rows.len(),
+            body[0].height as usize,
+            sm.selected,
+            theme,
+        );
+        f.render_stateful_widget(list, list_area, &mut ls);
     }
 
     f.render_widget(

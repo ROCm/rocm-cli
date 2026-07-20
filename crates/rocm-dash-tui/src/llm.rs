@@ -188,20 +188,49 @@ pub fn probe_endpoint(base_url: &str, timeout: Duration) -> bool {
     false
 }
 
-/// Probe the known local serving endpoints in priority order (Lemonade, then
-/// vLLM, then `rocm serve`'s non-managed default) and return the first
-/// reachable one.
+/// Probe `candidates` (in priority order) concurrently and return the
+/// highest-priority one that answered.
 ///
-/// Used by the TUI's in-app "detect a local engine" action so the user need not run the CLI skill first.
-/// TCP-only (no HTTP); never blocks longer than [`PROBE_TIMEOUT`] per candidate.
+/// Split out from [`detect_local_endpoint`] so priority-order behavior is
+/// testable against OS-assigned ephemeral ports instead of the real
+/// well-known ports, which may be occupied by an unrelated ambient listener
+/// on the machine running the test. Probing all candidates in parallel
+/// (rather than sequentially) bounds the worst case (no server listening) to
+/// one [`PROBE_TIMEOUT`] instead of one per candidate. TCP-only (no HTTP);
+/// never blocks longer than [`PROBE_TIMEOUT`] total.
+fn probe_first_reachable<'a, P>(candidates: &[&'a str], probe: P) -> Option<&'a str>
+where
+    P: Fn(&str, Duration) -> bool + Sync,
+{
+    std::thread::scope(|scope| {
+        // The collect is load-bearing, not needless: every probe must be
+        // *spawned* before any is *joined*, or they run one at a time and the
+        // whole point (bounding total latency to one PROBE_TIMEOUT) is lost.
+        #[allow(clippy::needless_collect)]
+        let handles: Vec<_> = candidates
+            .iter()
+            .map(|ep| (*ep, scope.spawn(|| probe(ep, PROBE_TIMEOUT))))
+            .collect();
+        handles
+            .into_iter()
+            .find_map(|(ep, handle)| handle.join().unwrap_or(false).then_some(ep))
+    })
+}
+
+const LOCAL_ENDPOINT_CANDIDATES: [&str; 3] = [
+    crate::skills::LEMONADE_ENDPOINT,
+    crate::skills::VLLM_ENDPOINT,
+    crate::skills::ROCM_SERVE_ENDPOINT,
+];
+
+/// Probe the known local serving endpoints (Lemonade, vLLM, then `rocm
+/// serve`'s non-managed default) concurrently and return the highest-priority
+/// one that answered.
+///
+/// Used by the TUI's in-app "detect a local engine" action, and by chat
+/// startup, so the user need not run the CLI skill first.
 pub fn detect_local_endpoint() -> Option<&'static str> {
-    [
-        crate::skills::LEMONADE_ENDPOINT,
-        crate::skills::VLLM_ENDPOINT,
-        crate::skills::ROCM_SERVE_ENDPOINT,
-    ]
-    .into_iter()
-    .find(|ep| probe_endpoint(ep, PROBE_TIMEOUT))
+    probe_first_reachable(&LOCAL_ENDPOINT_CANDIDATES, probe_endpoint)
 }
 
 /// Pick the first model id from an OpenAI-compatible `/v1/models` response (`{"data":[{"id":"…"}]}`).
@@ -438,20 +467,83 @@ mod tests {
         assert!(!probe_endpoint("not a url", Duration::from_millis(100)));
     }
 
+    /// Binds an OS-assigned ephemeral port and returns its listener (kept
+    /// alive so the port stays reachable) plus its `http://host:port` URL.
+    ///
+    /// Ephemeral ports are used instead of the real well-known ports
+    /// (Lemonade/vLLM/rocm serve) so priority-order tests are deterministic:
+    /// an ambient listener elsewhere on the machine (e.g. a real local
+    /// engine, or — on some CI runners — a pre-installed one) can otherwise
+    /// make well-known-port-based tests flake by answering a probe the test
+    /// didn't intend to exercise.
+    fn ephemeral_endpoint() -> (std::net::TcpListener, String) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
+        let url = format!("http://{}", listener.local_addr().expect("local_addr"));
+        (listener, url)
+    }
+
     #[test]
-    fn detect_local_endpoint_probes_rocm_serve_default_port() {
-        // A listener on rocm serve's (non-managed) default port must be picked
-        // up by the fallback probe, not just Lemonade/vLLM's ports.
-        let Ok(listener) =
-            std::net::TcpListener::bind(("127.0.0.1", crate::skills::ROCM_SERVE_PORT))
-        else {
-            // Port already bound in this environment; skip rather than flake.
-            return;
-        };
+    fn probe_first_reachable_prefers_earlier_candidate_when_multiple_reachable() {
+        // Two reachable candidates: priority order (first in the list) must
+        // win even though probes run concurrently, not sequentially.
+        let (_first, first_url) = ephemeral_endpoint();
+        let (_second, second_url) = ephemeral_endpoint();
         assert_eq!(
-            detect_local_endpoint(),
-            Some(crate::skills::ROCM_SERVE_ENDPOINT)
+            probe_first_reachable(&[first_url.as_str(), second_url.as_str()], probe_endpoint),
+            Some(first_url.as_str())
         );
-        drop(listener);
+    }
+
+    #[test]
+    fn probe_first_reachable_skips_unreachable_earlier_candidates() {
+        // The first candidate (port 1) is essentially never open; the probe
+        // must fall through to the second, reachable one.
+        let (_listener, url) = ephemeral_endpoint();
+        assert_eq!(
+            probe_first_reachable(&["http://127.0.0.1:1", url.as_str()], probe_endpoint,),
+            Some(url.as_str())
+        );
+    }
+
+    #[test]
+    fn probe_first_reachable_none_when_nothing_listening() {
+        assert_eq!(
+            probe_first_reachable(&["http://127.0.0.1:1"], probe_endpoint),
+            None
+        );
+    }
+
+    #[test]
+    fn probe_first_reachable_starts_all_probes_concurrently() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let active = AtomicUsize::new(0);
+        let max_active = AtomicUsize::new(0);
+        let probe = |_: &str, _: Duration| {
+            let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active.fetch_max(now_active, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(50));
+            active.fetch_sub(1, Ordering::SeqCst);
+            false
+        };
+
+        assert_eq!(probe_first_reachable(&["a", "b", "c"], probe), None);
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            3,
+            "all probes must be in flight before any probe is joined"
+        );
+    }
+
+    #[test]
+    fn local_endpoint_candidates_preserve_supported_order() {
+        assert_eq!(
+            LOCAL_ENDPOINT_CANDIDATES,
+            [
+                crate::skills::LEMONADE_ENDPOINT,
+                crate::skills::VLLM_ENDPOINT,
+                crate::skills::ROCM_SERVE_ENDPOINT,
+            ]
+        );
     }
 }

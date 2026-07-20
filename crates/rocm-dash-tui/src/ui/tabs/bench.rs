@@ -25,7 +25,7 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     if state.bench_rows.is_empty() {
         let inner = panel::bento(f, area, Some("Bench"), BoxRole::Neutral, false, theme);
         let p = Paragraph::new(Line::from(Span::styled(
-            "no rows · start daemon with --bench-csv <path>",
+            "no rows · run `rocm bench load --endpoint <url>` to populate the daemon-tailed bench results file · press b to run a sweep",
             Style::default().fg(theme.muted),
         )));
         f.render_widget(p, inner);
@@ -452,10 +452,26 @@ pub fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         (inner, None)
     };
 
+    let body = crate::ui::panel::vertical_scrollbar(
+        f,
+        body_area,
+        lines.len(),
+        body_area.height as usize,
+        scroll as usize,
+        theme,
+    );
+    state.record_scrollbar(
+        body_area,
+        body,
+        false,
+        lines.len(),
+        body_area.height as usize,
+        crate::app::ScrollTarget::BenchDetail,
+    );
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
-    f.render_widget(p, body_area);
+    f.render_widget(p, body);
 
     if let Some(footer) = footer_area {
         let hint = Paragraph::new(Line::from(Span::styled(
@@ -601,6 +617,8 @@ fn build_detail_lines(row: &BenchmarkRow, theme: &Theme) -> Vec<Line<'static>> {
         fmt_opt_u32_si(row.max_waiting_reqs),
         theme,
     ));
+    lines.push(kv_line("ttft_ms", fmt_opt(&row.ttft_ms), theme));
+    lines.push(kv_line("tpot_ms", fmt_opt(&row.tpot_ms), theme));
     lines.push(kv_line("out_chars", fmt_opt_u64_si(row.out_chars), theme));
     lines.push(Line::raw(""));
 

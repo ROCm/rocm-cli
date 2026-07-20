@@ -299,21 +299,23 @@ const fn status_meta(
     status: InstanceStatus,
     theme: &Theme,
 ) -> (ratatui::style::Color, &'static str) {
-    match status {
-        InstanceStatus::Running => (theme.ok, "RUNNING"),
-        InstanceStatus::Starting => (theme.warn, "STARTING"),
-        InstanceStatus::Stopped => (theme.err, "STOPPED"),
-        InstanceStatus::Error => (theme.err, "ERROR"),
-        InstanceStatus::Unknown => (theme.muted, "UNKNOWN"),
-    }
+    // The text label (incl. the DOWNLOADING/LOADING/WARMUP startup phases) is
+    // owned by `InstanceStatus::label`; only the color is chosen here.
+    let color = match status {
+        InstanceStatus::Ready | InstanceStatus::Running => theme.ok,
+        InstanceStatus::Starting { .. } => theme.warn,
+        InstanceStatus::Stopped | InstanceStatus::Error => theme.err,
+        InstanceStatus::Unknown => theme.muted,
+    };
+    (color, status.label())
 }
 
 /// Map an instance status to a bento box role so unselected cards take a
 /// health-driven border color.
 const fn status_role(status: InstanceStatus) -> BoxRole {
     match status {
-        InstanceStatus::Running => BoxRole::Success,
-        InstanceStatus::Starting => BoxRole::Warning,
+        InstanceStatus::Running | InstanceStatus::Ready => BoxRole::Success,
+        InstanceStatus::Starting { .. } => BoxRole::Warning,
         InstanceStatus::Stopped | InstanceStatus::Error => BoxRole::Danger,
         InstanceStatus::Unknown => BoxRole::Muted,
     }
@@ -798,7 +800,20 @@ mod tests {
     fn status_meta_maps_each_variant() {
         let theme = Theme::default_dark();
         assert_eq!(status_meta(InstanceStatus::Running, &theme).1, "RUNNING");
-        assert_eq!(status_meta(InstanceStatus::Starting, &theme).1, "STARTING");
+        assert_eq!(
+            status_meta(InstanceStatus::Starting { phase: None }, &theme).1,
+            "STARTING"
+        );
+        assert_eq!(
+            status_meta(
+                InstanceStatus::Starting {
+                    phase: Some(rocm_dash_core::metrics::StartupPhase::Downloading)
+                },
+                &theme
+            )
+            .1,
+            "DOWNLOADING"
+        );
         assert_eq!(status_meta(InstanceStatus::Stopped, &theme).1, "STOPPED");
         assert_eq!(status_meta(InstanceStatus::Error, &theme).1, "ERROR");
         assert_eq!(status_meta(InstanceStatus::Unknown, &theme).1, "UNKNOWN");
@@ -878,8 +893,11 @@ mod tests {
             bench_detail_scroll: 0,
             console_scroll: 0,
             console_hscroll: 0,
+            tick_count: 0,
             dock_logs_scroll: 0,
             last_dock_area: None,
+            scrollbars: std::cell::RefCell::new(Vec::new()),
+            scroll_drag: None,
             chat: Vec::new(),
             chat_input: String::new(),
             chat_sending: false,
@@ -895,6 +913,7 @@ mod tests {
             chat_detect_msg: None,
             chat_persist_dispatch: false,
             replay: None,
+            simulated: false,
             last_body_area: None,
             last_tab_bar_area: None,
             last_footer_chips: Vec::new(),
@@ -911,10 +930,12 @@ mod tests {
             automations_manager: None,
             command_screen: None,
             config_manager: None,
+            bench_run: None,
             model_recipes: Vec::new(),
             runtimes: Vec::new(),
             automations: Vec::new(),
             tool_executor: None,
+            bench_results_dir: None,
             should_quit: false,
             slash_tool: None,
             plan_request: None,

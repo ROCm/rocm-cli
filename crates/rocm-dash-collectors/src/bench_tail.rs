@@ -33,7 +33,12 @@ impl BenchTailer for CsvBenchTailer {
     }
 
     fn drain(&mut self) -> Result<Vec<BenchmarkRow>> {
-        let file = File::open(&self.path)?;
+        let path = match std::fs::canonicalize(&self.path) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let file = File::open(path)?;
         let mut rdr = csv::ReaderBuilder::new()
             .has_headers(true)
             .from_reader(BufReader::new(file));
@@ -143,6 +148,15 @@ mod tests {
         assert_eq!(rows[0].prompt_tps, None);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn absent_results_file_is_an_empty_drain() {
+        let dir = tempdir();
+        let path = dir.join("not-created-yet.csv");
+        let mut tailer = CsvBenchTailer::new(path);
+
+        assert!(tailer.drain().unwrap().is_empty());
     }
 
     fn tempdir() -> std::path::PathBuf {

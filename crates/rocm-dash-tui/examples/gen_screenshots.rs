@@ -246,6 +246,9 @@ fn build_state(theme: &str, entries: &[PersistedEntry], snapshots_target: usize)
         host: "demo-mi355x-01".into(),
         version: "0.1.0".into(),
     };
+    // These assets are built from a synthetic session; mark them simulated so
+    // the SIMULATED DATA chrome renders and no asset presents data as live.
+    state.simulated = true;
     let mut snap_count = 0usize;
     for entry in entries {
         state.apply_event(entry.event.clone());
@@ -438,4 +441,22 @@ fn xml_escape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_screenshot_is_marked_simulated() {
+        let mut state = build_state("default-dark", &[], 0);
+        assert!(state.simulated, "screenshot state must be marked simulated");
+        let svg = render_to_svg(&mut state, 200, 50).expect("render svg");
+        // The SVG groups text runs and breaks on spaces, so assert the
+        // distinctive marker word rather than the space-joined phrase.
+        assert!(
+            svg.contains("SIMULATED"),
+            "generated screenshot must carry the SIMULATED marker"
+        );
+    }
 }

@@ -67,9 +67,28 @@ pub fn sign(private_key: &Path, input: &Path, output: &Path) -> Result<()> {
 }
 
 /// Verify `input`'s `signature` against the RSA public key.
-pub fn verify(public_key: &Path, input: &Path, signature: &Path) -> Result<()> {
-    let public_pem = fs::read_to_string(public_key)
-        .with_context(|| format!("failed to read {}", public_key.display()))?;
+///
+/// When `public_key` is `None`, the key is taken from the
+/// `ROCM_CLI_SIGNING_PUBLIC_KEY_PEM` environment variable (the inline PEM that
+/// release/nightly CI wire from the signing-key secret) — so callers that already
+/// have the key in the environment do not have to materialize a temp file. It is an
+/// error if neither a path nor the env var is provided.
+pub fn verify(public_key: Option<&Path>, input: &Path, signature: &Path) -> Result<()> {
+    let public_pem = if let Some(path) = public_key {
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?
+    } else {
+        let pem = std::env::var("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .context(
+                "no signing public key: pass --public-key or set ROCM_CLI_SIGNING_PUBLIC_KEY_PEM",
+            )?;
+        if pem.ends_with('\n') {
+            pem
+        } else {
+            format!("{pem}\n")
+        }
+    };
     let payload = fs::read(input).with_context(|| format!("failed to read {}", input.display()))?;
     let signature_bytes =
         fs::read(signature).with_context(|| format!("failed to read {}", signature.display()))?;

@@ -98,7 +98,8 @@ pub struct DaemonConfig {
     pub discovery_tick: Duration,
     #[serde(with = "duration_secs")]
     pub instance_tick: Duration,
-    /// Watch this directory for new normalized CSVs.
+    /// Tail this single CSV file for new normalized benchmark rows (despite
+    /// the field name, `CsvBenchTailer` opens it as one file, not a directory).
     pub bench_results_dir: Option<PathBuf>,
 }
 
@@ -179,6 +180,37 @@ fn socket_path(
         })
 }
 
+/// Default CSV file the standalone dashboard daemon tails for normalized
+/// benchmark rows. The data-dir override wins; otherwise this legacy config
+/// surface uses `$HOME/.rocm/bench/results.csv`.
+///
+/// The unified `rocm` command and daemon share `rocm_core::AppPaths`, including
+/// managed-root resolution. This standalone config does not read rocm-core's
+/// JSON config, so managed-root users must set `ROCM_CLI_DATA_DIR` when launching
+/// a standalone dashboard daemon. Normal `rocm daemon` usage is unaffected.
+fn default_bench_results_dir() -> Option<PathBuf> {
+    bench_results_dir_from_env(
+        std::env::var_os("ROCM_CLI_DATA_DIR"),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// Resolve the standalone daemon's tailed bench CSV from explicit environment
+/// inputs without mutating process-global variables in tests.
+fn bench_results_dir_from_env(
+    data_dir_override: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    data_dir_override
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            home.filter(|v| !v.is_empty())
+                .map(|home| PathBuf::from(home).join(".rocm"))
+        })
+        .map(|data_dir| data_dir.join("bench").join("results.csv"))
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -187,7 +219,7 @@ impl Default for DaemonConfig {
             gpu_tick: Duration::from_secs(1),
             discovery_tick: Duration::from_secs(5),
             instance_tick: Duration::from_secs(2),
-            bench_results_dir: None,
+            bench_results_dir: default_bench_results_dir(),
         }
     }
 }
@@ -483,5 +515,56 @@ theme = "default-dark"
         // A bare empty user name (as opposed to unset) also falls back to "user".
         let path = socket_path(None, None, Some(String::new()), PathBuf::from("/tmp"));
         assert_eq!(path, PathBuf::from("/tmp/rocm-user/rocmdashd.sock"));
+    }
+
+    #[test]
+    fn bench_results_dir_from_env_uses_home_rocm_without_extra_data_segment() {
+        // EAI-7361: the Bench panel stayed permanently empty because this
+        // default was `None` — the daemon never tailed any file unless the
+        // user hand-edited a config file, even after running `rocm bench
+        // load`. Must resolve to the SAME absolute path `rocm bench load`
+        // writes to by default: `$HOME/.rocm/bench/results.csv`. Critically
+        // there is NO `/data/` segment — rocm-core's `default_data_dir()` is
+        // `$HOME/.rocm` itself, so an earlier `$HOME/.rocm/data/...` default
+        // would never line up with the producer.
+        let dir = bench_results_dir_from_env(None, Some("/home/alice".into()));
+        assert_eq!(
+            dir,
+            Some(PathBuf::from("/home/alice/.rocm/bench/results.csv"))
+        );
+    }
+
+    #[test]
+    fn bench_results_dir_from_env_honors_the_data_dir_override() {
+        // Mirrors `AppPaths::discover`: `ROCM_CLI_DATA_DIR` wins over `$HOME`
+        // so the standalone daemon tails exactly what a producer with the same
+        // override set writes.
+        let dir = bench_results_dir_from_env(
+            Some("/mnt/scratch/rocm".into()),
+            Some("/home/alice".into()),
+        );
+        assert_eq!(
+            dir,
+            Some(PathBuf::from("/mnt/scratch/rocm/bench/results.csv"))
+        );
+    }
+
+    #[test]
+    fn bench_results_dir_from_env_is_none_when_unset_or_empty() {
+        assert_eq!(bench_results_dir_from_env(None, None), None);
+        assert_eq!(
+            bench_results_dir_from_env(Some(String::new().into()), Some(String::new().into())),
+            None
+        );
+    }
+
+    #[test]
+    fn daemon_config_default_populates_bench_results_dir_when_home_is_set() {
+        // Only meaningful where $HOME is actually set (true in this repo's CI
+        // and dev environments); skip rather than assert a specific value we
+        // don't control.
+        if std::env::var_os("HOME").is_some_and(|h| !h.is_empty()) {
+            assert!(DaemonConfig::default().bench_results_dir.is_some());
+        }
     }
 }

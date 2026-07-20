@@ -18,6 +18,7 @@ use std::time::Duration;
 use bollard::Docker;
 use bollard::container::{InspectContainerOptions, ListContainersOptions};
 use bollard::secret::ContainerInspectResponse;
+use rocm_dash_core::metrics::InstanceStatus;
 use rocm_dash_core::traits::{CollectorError, DiscoveredService, Result, ServiceDiscovery};
 use tokio::time::timeout;
 use tracing::{debug, warn};
@@ -306,6 +307,11 @@ fn parse_container(inspect: &ContainerInspectResponse) -> Result<DiscoveredServi
         env_vars: env,
         pid,
         log_file: None,
+        // Docker gives us no readiness signal (or startup phase) of its own;
+        // stay `Starting` with no phase until the vLLM Prometheus scrape
+        // succeeds at least once (see `runner::instance_from_discovered`
+        // callers).
+        status: InstanceStatus::Starting { phase: None },
     })
 }
 

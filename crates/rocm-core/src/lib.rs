@@ -30,6 +30,7 @@ pub mod diagnose;
 pub mod examine;
 pub mod fix;
 pub mod openmpi;
+pub mod proc_lifecycle;
 pub mod runtime;
 pub mod uv;
 pub use diagnose::{
@@ -38,6 +39,10 @@ pub use diagnose::{
 };
 pub use examine::{Examination, FrameworkProbe, WSL_ROUTE_OUT_NOTE};
 pub use fix::{FixOptions, apply as apply_fix, list_recipes as list_fix_recipes};
+pub use proc_lifecycle::{
+    IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
+    process_start_ticks, terminate_verified,
+};
 use runtime::env_path_override;
 #[cfg(test)]
 use runtime::home_rocm_dir;
@@ -487,6 +492,45 @@ pub fn terminate_process_tree(pid: u32) -> Result<()> {
     Ok(())
 }
 
+/// Send `signal` to `pid`, optionally extending to its transitive children.
+///
+/// Delivery to a process that has already exited (`ESRCH`) counts as success:
+/// the goal — that process no longer running — is already met. Returns `false`
+/// only when a signal could not be delivered for another reason (for example
+/// `EPERM`). Used by the verified-termination logic in [`proc_lifecycle`].
+#[cfg(not(windows))]
+#[allow(unsafe_code)] // libc FFI
+pub(crate) fn signal_process_scope(pid: u32, signal: i32, include_tree: bool) -> bool {
+    let targets = if include_tree {
+        collect_process_tree(pid)
+    } else {
+        vec![pid]
+    };
+    let mut delivered = true;
+    for target in targets {
+        let status = unsafe { libc::kill(target.cast_signed(), signal) };
+        if status != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+            delivered = false;
+        }
+    }
+    delivered
+}
+
+/// Snapshot `root` plus its transitive descendants as a flat PID list.
+///
+/// Used by [`proc_lifecycle`] to bind a tree termination to the exact processes
+/// present when the stop began. On platforms without `/proc` only `root` is
+/// returned.
+#[cfg(not(windows))]
+pub(crate) fn process_tree_pids(root: u32) -> Vec<u32> {
+    collect_process_tree(root)
+}
+
+#[cfg(windows)]
+pub(crate) fn process_tree_pids(root: u32) -> Vec<u32> {
+    vec![root]
+}
+
 /// Collect `root` plus all of its transitive descendants by reading `/proc`.
 ///
 /// On platforms without `/proc` (for example macOS) only `root` is returned, so
@@ -898,6 +942,16 @@ impl AppPaths {
     /// onto `~/.rocm`; do not "restore" the old XDG location.
     pub fn daemon_log_path(&self) -> PathBuf {
         self.data_dir.join("logs").join("rocmdashd.log")
+    }
+
+    /// Directory for client-side (CLI/TUI process) `tracing` log files.
+    ///
+    /// Siblings the daemon's `rocmdashd.log` under the same canonical
+    /// `~/.rocm/logs` root; the client writer rotates files inside this
+    /// directory itself (see `apps/rocm/src/logging.rs`), so only the
+    /// directory — not a single fixed file name — is exposed here.
+    pub fn client_log_dir(&self) -> PathBuf {
+        self.data_dir.join("logs")
     }
 }
 
@@ -2791,6 +2845,38 @@ pub fn normalize_therock_family(value: &str) -> Option<String> {
     }
 }
 
+/// The TheRock package families the CLI recognizes.
+///
+/// This is the full set of values [`normalize_therock_family`] can produce. Used
+/// to tell the user which `--family` values are valid when GPU auto-detection
+/// cannot resolve an installable runtime. Whether a given family currently has
+/// published wheels depends on the channel and release; recognition here does
+/// not guarantee availability.
+///
+/// Kept in sync with [`normalize_therock_family`] by
+/// `known_therock_families_all_round_trip` — every entry must normalize back to
+/// itself.
+pub const fn known_therock_families() -> &'static [&'static str] {
+    &[
+        "gfx90X-dgpu",
+        "gfx90X-dcgpu",
+        "gfx900",
+        "gfx906",
+        "gfx908",
+        "gfx90a",
+        "gfx94X-dcgpu",
+        "gfx950-dcgpu",
+        "gfx101X-dgpu",
+        "gfx103X-dgpu",
+        "gfx110X-all",
+        "gfx1150",
+        "gfx1151",
+        "gfx1152",
+        "gfx1153",
+        "gfx120X-all",
+    ]
+}
+
 fn capture_optional_command(program: &str, args: &[&str]) -> Option<String> {
     capture_optional_command_with_timeout(program, args, OPTIONAL_COMMAND_TIMEOUT)
 }
@@ -3942,7 +4028,9 @@ pub struct DashboardDaemonConfig {
     pub discovery_tick_secs: f64,
     #[serde(default = "default_instance_tick_secs")]
     pub instance_tick_secs: f64,
-    /// Watch this directory for new normalized benchmark CSVs.
+    /// Watch this file for new normalized benchmark CSV rows. When unset, the
+    /// daemon derives `<data_dir>/bench/results.csv` from the current `AppPaths`
+    /// at startup so machine-specific paths are never persisted in config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bench_results_dir: Option<PathBuf>,
 }
@@ -5441,6 +5529,18 @@ pub struct ManagedServiceRecord {
     pub status: String,
     pub supervisor_pid: u32,
     pub engine_pid: Option<u32>,
+    /// Kernel start-time of the supervisor (launcher) process, captured at
+    /// spawn. Paired with `supervisor_pid` it forms an identity that survives
+    /// PID recycling, so a later stop never signals a reused PID. `None` for
+    /// records written before this field existed.
+    #[serde(default)]
+    pub supervisor_start_ticks: Option<u64>,
+    /// Kernel start-time of the engine server process, adopted from the engine
+    /// state file whenever `engine_pid` is refreshed from it. The launcher and
+    /// the engine server are distinct processes, so each PID carries its own
+    /// identity token. `None` until the engine state records one.
+    #[serde(default)]
+    pub engine_start_ticks: Option<u64>,
     #[serde(default)]
     pub runtime_id: Option<String>,
     #[serde(default)]
@@ -5455,6 +5555,11 @@ pub struct ManagedServiceRecord {
     pub restart_count: u32,
     #[serde(default)]
     pub last_restart_unix_ms: Option<u128>,
+    /// Coarse startup stage (`downloading`/`loading`/`warmup`) parsed from the
+    /// serve process's own log output while it is coming up. Set to `None` once
+    /// the service reaches `ready`, and absent on older on-disk records.
+    #[serde(default)]
+    pub startup_phase: Option<String>,
     pub manifest_path: PathBuf,
     pub log_path: PathBuf,
     pub engine_state_path: PathBuf,
@@ -5495,6 +5600,8 @@ impl ManagedServiceRecord {
             status: "starting".to_owned(),
             supervisor_pid,
             engine_pid: None,
+            supervisor_start_ticks: None,
+            engine_start_ticks: None,
             runtime_id,
             env_id,
             device_policy,
@@ -5502,6 +5609,7 @@ impl ManagedServiceRecord {
             engine_recipe_json: None,
             restart_count: 0,
             last_restart_unix_ms: None,
+            startup_phase: None,
             manifest_path,
             log_path,
             engine_state_path,
@@ -5561,13 +5669,25 @@ impl ManagedServiceRecord {
         {
             self.env_id = Some(env_id.to_owned());
         }
-        if let Some(pid) = state
+        // Adopt the engine server PID together with ITS OWN start-time token so
+        // a later stop verifies the server process, not the launcher. The ticks
+        // key must match the PID key: `server_pid`↔`server_start_ticks`,
+        // `pid`↔`start_ticks`.
+        let engine_pid = state
             .get("server_pid")
-            .or_else(|| state.get("pid"))
             .and_then(serde_json::Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
+            .map(|pid| (pid, "server_start_ticks"))
+            .or_else(|| {
+                state
+                    .get("pid")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|pid| (pid, "start_ticks"))
+            });
+        if let Some((pid, ticks_key)) = engine_pid
+            && let Ok(pid) = u32::try_from(pid)
         {
             self.engine_pid = Some(pid);
+            self.engine_start_ticks = state.get(ticks_key).and_then(serde_json::Value::as_u64);
         }
         Ok(self.status != previous)
     }
@@ -5914,6 +6034,58 @@ mod tests {
         Ok(())
     }
 
+    // EAI-7333: the service healthcheck marks a model "ready" purely from
+    // `/v1/models` listing it (via `openai_models_endpoint_has_model`), without
+    // verifying inference. This test pins that gap: a server that lists the model
+    // on `/v1/models` but is NOT able to serve `/v1/chat/completions` still
+    // reports the model as present. The readiness signal is therefore a false
+    // positive for inference-readiness — a caller must additionally probe
+    // inference before treating a service as usable. When EAI-7333 is fixed
+    // (readiness gated on an inference probe, not just `/v1/models`), the
+    // healthcheck path should no longer rely on this signal alone.
+    #[test]
+    fn models_endpoint_readiness_does_not_imply_inference_ready() -> Result<()> {
+        // A server that answers `/v1/models` with the model listed, but would
+        // hang/refuse an actual chat request (it only ever serves this one
+        // response, then closes) — mirroring an engine whose model is still
+        // loading while `/v1/models` already responds.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            let mut buffer = [0_u8; 512];
+            let _ = stream.read(&mut buffer)?;
+            let body = r#"{"data":[{"id":"Qwen/Qwen2.5-1.5B-Instruct"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )?;
+            Ok(())
+        });
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        // The `/v1/models` probe reports the model present — this is the exact
+        // signal the healthcheck uses to declare "ready".
+        let models_ready = openai_models_endpoint_has_model(
+            &endpoint,
+            Some("Qwen/Qwen2.5-1.5B-Instruct"),
+            Duration::from_secs(2),
+        )?;
+        assert!(
+            models_ready,
+            "/v1/models lists the model, so the current healthcheck would report ready"
+        );
+
+        // But that says nothing about inference: the server served only the
+        // models response and closed, so a chat request would not succeed.
+        // Readiness based on this signal alone is a false positive (EAI-7333).
+        server.join().expect("server thread should not panic")?;
+        Ok(())
+    }
+
     #[test]
     fn resolve_amd_smi_binary_prefers_home_rocm_venv_path() -> Result<()> {
         let temp_root =
@@ -5985,6 +6157,39 @@ mod tests {
     }
 
     #[test]
+    fn instinct_dcgpu_family_prefers_vllm() {
+        // On Instinct data-center GPUs (TheRock `*-dcgpu` families, e.g. the
+        // MI300X's gfx94X-dcgpu) the default serving engine is vLLM. This is the
+        // GPU-family preference the serve engine selection honors before falling
+        // back to a recipe's own preferred engine. vLLM is Linux-only, so the
+        // preference does not apply on native Windows.
+        let summary = HostGpuSummary {
+            name: Some("AMD Instinct MI300X".to_owned()),
+            gfx_target: Some("gfx942".to_owned()),
+            therock_family: Some("gfx94X-dcgpu".to_owned()),
+        };
+        let preferred = preferred_serve_engine_for_host_gpu_summary(&summary);
+        if cfg!(windows) {
+            assert_eq!(preferred, None, "vLLM is not preferred on native Windows");
+        } else {
+            assert_eq!(preferred, Some("vllm"));
+        }
+    }
+
+    #[test]
+    fn consumer_gpu_family_has_no_vllm_preference() {
+        // A non-dcgpu consumer family (e.g. gfx110X-all) has no GPU-level vLLM
+        // preference, so serve selection falls through to the recipe/platform
+        // default rather than forcing vLLM.
+        let summary = HostGpuSummary {
+            name: Some("AMD Radeon".to_owned()),
+            gfx_target: Some("gfx1100".to_owned()),
+            therock_family: Some("gfx110X-all".to_owned()),
+        };
+        assert_eq!(preferred_serve_engine_for_host_gpu_summary(&summary), None);
+    }
+
+    #[test]
     fn normalize_therock_family_maps_gfx1101_to_gfx110x_all() {
         assert_eq!(
             normalize_therock_family("gfx1101"),
@@ -6022,6 +6227,22 @@ mod tests {
             normalize_therock_family("gfx94X-dcgpu"),
             Some("gfx94X-dcgpu".to_owned())
         );
+    }
+
+    #[test]
+    fn known_therock_families_all_round_trip() {
+        for family in known_therock_families() {
+            assert_eq!(
+                normalize_therock_family(family).as_deref(),
+                Some(*family),
+                "known family `{family}` must normalize back to itself"
+            );
+        }
+    }
+
+    #[test]
+    fn known_therock_families_is_not_empty() {
+        assert!(!known_therock_families().is_empty());
     }
 
     #[test]
@@ -6891,6 +7112,49 @@ Class Name:                Display
                 .iter()
                 .any(|recipe| recipe.canonical_model_id == "Qwen3-4B-Instruct-2507-GGUF"),
             "built-in assistant recipe present"
+        );
+    }
+
+    #[test]
+    fn builtin_catalog_authors_vllm_tool_call_parsers() {
+        // vLLM does not auto-detect a tool-call parser; the correct value is sourced
+        // from explicit per-model recipe metadata (never guessed at runtime). This
+        // guards the authored parser for well-known chat families so a regression is
+        // caught here rather than as an HTTP 400 in the TUI chat tab.
+        let document =
+            serde_json::from_str::<ModelRecipeIndexDocument>(include_str!("model_catalog.json"))
+                .expect("catalog JSON parses");
+        let tool_call_parser = |model_id: &str| -> Option<String> {
+            document
+                .recipes
+                .iter()
+                .find(|recipe| recipe.canonical_model_id == model_id)?
+                .engine_recipes
+                .iter()
+                .find(|engine_recipe| engine_recipe.engine == "vllm")
+                .and_then(|engine_recipe| {
+                    let flags = &engine_recipe.required_flags;
+                    assert!(
+                        flags.iter().any(|flag| flag == "--enable-auto-tool-choice"),
+                        "{model_id}: --tool-call-parser must be paired with --enable-auto-tool-choice"
+                    );
+                    let index = flags.iter().position(|flag| flag == "--tool-call-parser")?;
+                    flags.get(index + 1).cloned()
+                })
+        };
+        // Reported repro: a lemonade-preferred Qwen forced onto vLLM must still
+        // carry the Qwen-family parser.
+        assert_eq!(
+            tool_call_parser("Qwen/Qwen2.5-1.5B-Instruct").as_deref(),
+            Some("hermes")
+        );
+        assert_eq!(
+            tool_call_parser("Qwen/Qwen3-32B-FP8").as_deref(),
+            Some("hermes")
+        );
+        assert_eq!(
+            tool_call_parser("meta-llama/Llama-3.2-3B-Instruct").as_deref(),
+            Some("llama3_json")
         );
     }
 
@@ -7850,6 +8114,18 @@ Class Name:                Display
     }
 
     #[test]
+    fn dashboard_bench_results_path_is_derived_not_persisted() {
+        let config = DashboardDaemonConfig::default();
+        assert_eq!(config.bench_results_dir, None);
+
+        let json = serde_json::to_value(config).unwrap();
+        assert!(
+            json.get("bench_results_dir").is_none(),
+            "machine-specific derived path must not be serialized"
+        );
+    }
+
+    #[test]
     fn app_paths_expose_telemetry_and_daemon_log_paths() -> Result<()> {
         let (root, paths) = temp_app_paths("telemetry-paths");
         assert_eq!(
@@ -7860,6 +8136,7 @@ Class Name:                Display
             paths.daemon_log_path(),
             paths.data_dir.join("logs").join("rocmdashd.log")
         );
+        assert_eq!(paths.client_log_dir(), paths.data_dir.join("logs"));
         // ensure() creates the telemetry state dir alongside the others.
         paths.ensure()?;
         assert!(paths.telemetry_state_dir().is_dir());

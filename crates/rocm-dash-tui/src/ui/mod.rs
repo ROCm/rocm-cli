@@ -5,6 +5,7 @@
 pub mod approval;
 pub mod automations_manager;
 pub mod bench;
+pub mod bench_run;
 pub mod command_screen;
 pub mod config_manager;
 pub mod core_bars;
@@ -29,6 +30,7 @@ pub mod runtime_manager;
 pub mod serve_wizard;
 pub mod services_manager;
 pub mod sparkline;
+pub mod spinner;
 pub mod tabs;
 pub mod theme;
 pub mod update_manager;
@@ -45,6 +47,9 @@ use crate::ui::theme::Theme;
 
 pub fn draw(f: &mut Frame, state: &mut AppState) {
     let theme = state.theme;
+    // Scrollbar hit-test registry is rebuilt every frame from what's actually
+    // drawn, so mouse clicks resolve against the current layout.
+    state.scrollbars.borrow_mut().clear();
     // Paint the whole frame with the theme background first, so every cell of
     // empty space matches the bg instead of showing the terminal default (which
     // read as a stray black box beneath the tabs).
@@ -169,6 +174,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
 /// that point and hands control back to the launcher.
 pub fn draw_focused(f: &mut Frame, state: &mut AppState) {
     let theme = state.theme;
+    state.scrollbars.borrow_mut().clear();
     f.render_widget(
         Block::default().style(Style::default().bg(theme.bg)),
         f.area(),
@@ -224,13 +230,15 @@ fn draw_active_manager(f: &mut Frame, rect: Rect, state: &AppState, theme: &Them
     // job console here, panned by the single `console_scroll`/`console_hscroll`
     // source. Centralized so the 13 managers don't each duplicate the branch.
     if let Some(job) = state.active_job_id().and_then(|id| state.jobs.job(id)) {
-        job_console::draw_job_console(
+        let handles = job_console::draw_job_console(
             f,
             rect,
             job,
             (state.console_scroll, state.console_hscroll),
+            state.tick_count,
             theme,
         );
+        state.scrollbars.borrow_mut().extend(handles);
         return;
     }
     if let Some(sm) = &state.services {
@@ -264,6 +272,8 @@ fn draw_active_manager(f: &mut Frame, rect: Rect, state: &AppState, theme: &Them
         command_screen::draw_command_screen(f, rect, c, &state.jobs, theme);
     } else if let Some(cm) = &state.config_manager {
         config_manager::draw_config_manager(f, rect, cm, &state.jobs, theme);
+    } else if let Some(br) = &state.bench_run {
+        bench_run::draw_bench_run(f, rect, br, theme);
     }
 }
 
@@ -290,9 +300,17 @@ const fn wide_triptych(body: Rect) -> Option<(Rect, Rect, Rect)> {
 }
 
 fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    // In demo/replay the data is not live, so never present the session as
+    // "connected" to a real daemon — the Connected case shows a simulated label
+    // instead, and the SIMULATED DATA chip below makes the state unmistakable.
+    // Other states (e.g. Disconnected on end-of-recording or a failed replay
+    // file) still surface their reason so playback status is not masked.
     let (status_text, status_color) = match &state.conn {
         ConnState::Initial => ("starting".to_string(), theme.muted),
         ConnState::Connecting => ("connecting…".to_string(), theme.warn),
+        ConnState::Connected { .. } if state.simulated => {
+            ("simulated — not live".to_string(), theme.warn)
+        }
         ConnState::Connected { host, version } => (
             format!("connected · {host} · rocm daemon {version}"),
             theme.ok,
@@ -308,13 +326,23 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 .fg(theme.accent),
         ),
         Span::raw("  "),
-        Span::styled(
-            format!("→ {}", state.connect),
-            Style::default().fg(theme.muted),
-        ),
-        Span::raw("   "),
-        Span::styled(status_text, Style::default().fg(status_color)),
     ];
+    if state.simulated {
+        spans.push(Span::styled(
+            " SIMULATED DATA ",
+            Style::default()
+                .bg(theme.warn)
+                .fg(theme.surface_2)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw("  "));
+    }
+    spans.push(Span::styled(
+        format!("→ {}", state.connect),
+        Style::default().fg(theme.muted),
+    ));
+    spans.push(Span::raw("   "));
+    spans.push(Span::styled(status_text, Style::default().fg(status_color)));
     let warning_count = state.latest.as_ref().map_or(0, |s| s.warnings.len());
     if warning_count > 0 {
         spans.push(Span::raw("   "));
@@ -426,6 +454,8 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
         segs.push(Seg::Sep(" logs  "));
         segs.push(Seg::Key("s", Some(KeyAction::OpenServices)));
         segs.push(Seg::Sep(" services  "));
+        segs.push(Seg::Key("b", Some(KeyAction::OpenBenchRun)));
+        segs.push(Seg::Sep(" bench  "));
     }
     if state.replay.is_some() {
         segs.push(Seg::Key("Space", Some(KeyAction::ReplayTogglePause)));

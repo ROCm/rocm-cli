@@ -28,6 +28,7 @@ $PemInstallLog = Join-Path $AcceptanceRoot "pem-install.log"
 $PathUpdateInstallLog = Join-Path $AcceptanceRoot "path-update-install.log"
 $ExamineLog = Join-Path $AcceptanceRoot "examine.log"
 $UninstallLog = Join-Path $AcceptanceRoot "uninstall.log"
+$HttpInstallLog = Join-Path $AcceptanceRoot "http-install.log"
 
 function Fail {
     param([string] $Message)
@@ -46,6 +47,16 @@ function Assert-Missing {
     param([string] $Path)
     if (Test-Path -LiteralPath $Path) {
         Fail "expected path to be removed: $Path"
+    }
+}
+
+function Get-FreeTcpPort {
+    $probe = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $probe.Start()
+    try {
+        return [int]$probe.LocalEndpoint.Port
+    } finally {
+        $probe.Stop()
     }
 }
 
@@ -299,7 +310,11 @@ try {
         Fail "installer did not seed minimal config with the expected default engine"
     }
 
-    Write-Host "acceptance: reject required signature without public key"
+    # With a production release key pinned in install.ps1, a release install with
+    # no public key supplied falls back to that pinned trust root. The bundle here
+    # is signed with the acceptance test key, not the pinned key, so verification
+    # must fail - proving the default-on pinned path rejects an untrusted signer.
+    Write-Host "acceptance: reject signature from an untrusted key"
     $noPublicKeyInstallDir = Join-Path $AcceptanceRoot "no-public-key-install\bin"
     $noPublicKeyInstallArgs = @(
         "-NoProfile",
@@ -315,9 +330,9 @@ try {
         "-RequireSignature",
         "-NoPathUpdate"
     )
-    Invoke-ExpectFailure "acceptance: required signature no public key install" $psExe $noPublicKeyInstallArgs $NoPublicKeyLog
-    if (-not (Select-String -LiteralPath $NoPublicKeyLog -Pattern "signature verification requires ROCM_CLI_SIGNING_PUBLIC_KEY_PATH" -Quiet)) {
-        Fail "installer did not report missing public key for required signature"
+    Invoke-ExpectFailure "acceptance: untrusted-key signature install" $psExe $noPublicKeyInstallArgs $NoPublicKeyLog
+    if (-not (Select-String -LiteralPath $NoPublicKeyLog -Pattern "signature verification failed" -Quiet)) {
+        Fail "installer did not reject a signature from an untrusted key"
     }
     Assert-Missing (Join-Path $noPublicKeyInstallDir "rocm.exe")
     Assert-Missing (Join-Path $noPublicKeyInstallDir ".rocm-cli-manifest")
@@ -424,6 +439,82 @@ try {
     Assert-File (Join-Path $InstallDir "rocm.exe")
     Assert-File (Join-Path $InstallDir "rocmd.exe")
     Assert-File (Join-Path $InstallDir ".rocm-cli-manifest")
+
+    # Install/download smoke over REAL HTTP (not file://). Serve the signed dist
+    # from a localhost HttpListener so install.ps1 exercises its native
+    # `Invoke-WebRequest` download path (native certificate-store behavior) end
+    # to end, then verify the archive + signature and install.
+    Write-Host "acceptance: install over native HTTP (localhost)"
+    $httpInstallDir = Join-Path $AcceptanceRoot "http-install\bin"
+    $httpPort = Get-FreeTcpPort
+    $httpServer = Start-Job -ScriptBlock {
+        $root = $using:DistDir
+        $listener = [System.Net.HttpListener]::new()
+        $listener.Prefixes.Add(('http://127.0.0.1:{0}/' -f $using:httpPort))
+        $listener.Start()
+        try {
+            while ($listener.IsListening) {
+                $context = $listener.GetContext()
+                $relative = $context.Request.Url.AbsolutePath.TrimStart('/')
+                $path = Join-Path $root $relative
+                if (Test-Path -LiteralPath $path -PathType Leaf) {
+                    $bytes = [System.IO.File]::ReadAllBytes($path)
+                    $context.Response.StatusCode = 200
+                    $context.Response.ContentLength64 = $bytes.Length
+                    $context.Response.OutputStream.Write($bytes, 0, $bytes.Length)
+                } else {
+                    $context.Response.StatusCode = 404
+                }
+                $context.Response.OutputStream.Close()
+            }
+        } finally {
+            $listener.Stop()
+        }
+    }
+    try {
+        # Wait for the listener to accept connections before installing.
+        $ready = $false
+        $deadline = (Get-Date).AddSeconds(5)
+        while (-not $ready -and (Get-Date) -lt $deadline) {
+            try {
+                $client = [System.Net.Sockets.TcpClient]::new()
+                $client.Connect("127.0.0.1", $httpPort)
+                $client.Close()
+                $ready = $true
+            } catch {
+                Start-Sleep -Milliseconds 100
+            }
+        }
+        if (-not $ready) {
+            Fail "localhost HTTP server did not start on port $httpPort"
+        }
+
+        $httpInstallArgs = @(
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            (Join-Path $RepoRoot "install.ps1"),
+            "release",
+            "-InstallDir",
+            $httpInstallDir,
+            "-DownloadBase",
+            "http://127.0.0.1:$httpPort",
+            "-SigningPublicKeyPath",
+            $signingPublicKey,
+            "-RequireSignature",
+            "-NoPathUpdate"
+        )
+        Invoke-Checked "acceptance: native HTTP install" $psExe $httpInstallArgs $HttpInstallLog
+        if (-not (Select-String -LiteralPath $HttpInstallLog -Pattern "signature verified" -Quiet)) {
+            Fail "native HTTP installer did not report signature verification"
+        }
+        Assert-File (Join-Path $httpInstallDir "rocm.exe")
+        Assert-File (Join-Path $httpInstallDir ".rocm-cli-manifest")
+    } finally {
+        Stop-Job -Job $httpServer -ErrorAction SilentlyContinue
+        Remove-Job -Job $httpServer -Force -ErrorAction SilentlyContinue
+    }
 
     Write-Host "acceptance: simulate stale prior install entry and reinstall"
     $stalePath = Join-Path $InstallDir "rocm-engine-stale.exe"

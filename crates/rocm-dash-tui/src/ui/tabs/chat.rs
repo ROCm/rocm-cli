@@ -239,10 +239,26 @@ fn draw_transcript(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         transcript_lines(state, theme)
     };
 
+    let body = panel::vertical_scrollbar(
+        f,
+        inner,
+        lines.len(),
+        inner.height as usize,
+        state.chat_scroll as usize,
+        theme,
+    );
+    state.record_scrollbar(
+        inner,
+        body,
+        false,
+        lines.len(),
+        inner.height as usize,
+        crate::app::ScrollTarget::Chat,
+    );
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((state.chat_scroll, 0));
-    f.render_widget(p, inner);
+    f.render_widget(p, body);
 }
 
 /// Pure transcript → styled lines mapping. Each turn becomes a role-prefixed,
@@ -283,10 +299,8 @@ pub fn transcript_lines<'a>(state: &'a AppState, theme: &Theme) -> Vec<Line<'a>>
 ///
 /// Returns `None` when the endpoint is remote, isn't a managed instance we can
 /// see, or the instance is serving/unknown — the caller then shows the plain
-/// spinner. Note `Running` is not a hard HTTP-readiness guarantee: the daemon
-/// collapses `ready`/`running`/`starting` into `Running` today, so the
-/// `Starting`/`Stopped`/`Error` reasons below only reach production once the
-/// status-signal work (#106 EAI-7354, #107 EAI-7355) lands beneath this change.
+/// spinner. `Ready` is the precise probe-backed serving state; `Running` remains
+/// a serving synonym for discovery sources without a readiness signal.
 fn chat_backend_wait_reason(state: &AppState) -> Option<String> {
     let base_url = &state.chat_llm.as_ref()?.base_url;
     // Reuse the crate's authority parser: it strips the brackets from an IPv6
@@ -298,8 +312,10 @@ fn chat_backend_wait_reason(state: &AppState) -> Option<String> {
     }
     let inst = state.instances.values().find(|i| i.port == Some(port))?;
     match inst.status {
-        InstanceStatus::Running => None,
-        InstanceStatus::Starting => Some("the model is still starting up — hang tight".to_owned()),
+        InstanceStatus::Ready | InstanceStatus::Running => None,
+        InstanceStatus::Starting { .. } => {
+            Some("the model is still starting up — hang tight".to_owned())
+        }
         InstanceStatus::Stopped => {
             Some("the endpoint has stopped — restart the service to chat".to_owned())
         }
@@ -508,7 +524,7 @@ mod tests {
         // No instance visible → no endpoint-specific reason (falls back to spinner).
         assert_eq!(chat_backend_wait_reason(&s), None);
 
-        set_backing_instance(&mut s, 8000, InstanceStatus::Starting);
+        set_backing_instance(&mut s, 8000, InstanceStatus::Starting { phase: None });
         assert!(
             chat_backend_wait_reason(&s)
                 .unwrap()
@@ -521,8 +537,10 @@ mod tests {
         // A live instance needs no explanation.
         set_backing_instance(&mut s, 8000, InstanceStatus::Running);
         assert_eq!(chat_backend_wait_reason(&s), None);
+        set_backing_instance(&mut s, 8000, InstanceStatus::Ready);
+        assert_eq!(chat_backend_wait_reason(&s), None);
         // A mismatched port is not our endpoint.
-        set_backing_instance(&mut s, 9999, InstanceStatus::Starting);
+        set_backing_instance(&mut s, 9999, InstanceStatus::Starting { phase: None });
         assert_eq!(chat_backend_wait_reason(&s), None);
     }
 
@@ -541,7 +559,7 @@ mod tests {
             auth_header: None,
         };
         s.set_chat_config(Some(llm), true);
-        set_backing_instance(&mut s, 8000, InstanceStatus::Starting);
+        set_backing_instance(&mut s, 8000, InstanceStatus::Starting { phase: None });
         assert!(
             chat_backend_wait_reason(&s)
                 .unwrap()
@@ -566,7 +584,7 @@ mod tests {
             auth_header: None,
         };
         s.set_chat_config(Some(llm), true);
-        set_backing_instance(&mut s, 8000, InstanceStatus::Starting);
+        set_backing_instance(&mut s, 8000, InstanceStatus::Starting { phase: None });
         assert_eq!(chat_backend_wait_reason(&s), None);
     }
 
@@ -574,7 +592,7 @@ mod tests {
     fn sending_input_surfaces_startup_reason_not_generic_spinner() {
         let mut s = accepted_chat_at_port(8000);
         s.chat_sending = true;
-        set_backing_instance(&mut s, 8000, InstanceStatus::Starting);
+        set_backing_instance(&mut s, 8000, InstanceStatus::Starting { phase: None });
         let out = render_str(&s);
         assert!(
             out.contains("starting up"),

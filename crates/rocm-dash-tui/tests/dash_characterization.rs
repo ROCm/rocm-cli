@@ -186,7 +186,7 @@ fn observe_empty_state_shows_placeholders() {
 
 #[test]
 fn loading_state_connecting_banner() {
-    // Connecting (no snapshot) → header shows the loading status + demo banner.
+    // Connecting (no snapshot) → header shows the loading status + no-live-data banner.
     let mut s = AppState::new("c".into(), "default-dark".into());
     s.active_tab = ActiveTab::Observe;
     s.conn = ConnState::Connecting;
@@ -196,14 +196,14 @@ fn loading_state_connecting_banner() {
         "loading status missing: {out:?}"
     );
     assert!(
-        out.contains("demo data"),
-        "demo banner expected while loading"
+        out.contains("no live data"),
+        "no-live-data banner expected while loading"
     );
 }
 
 #[test]
 fn disconnected_banner_present() {
-    // Disconnected → error status in header + demo banner on Observe.
+    // Disconnected → error status in header + no-live-data banner on Observe.
     let mut s = AppState::new("c".into(), "default-dark".into());
     s.active_tab = ActiveTab::Observe;
     s.conn = ConnState::Disconnected {
@@ -215,13 +215,13 @@ fn disconnected_banner_present() {
         "error status missing: {out:?}"
     );
     assert!(
-        out.contains("demo data"),
-        "demo banner expected when disconnected"
+        out.contains("no live data"),
+        "no-live-data banner expected when disconnected"
     );
 }
 
 #[test]
-fn honesty_demo_banner_absent_when_connected_with_telemetry() {
+fn honesty_no_live_data_banner_absent_when_connected_with_telemetry() {
     let mut s = AppState::new("c".into(), "default-dark".into());
     s.active_tab = ActiveTab::Observe;
     s.conn = ConnState::Connected {
@@ -231,8 +231,75 @@ fn honesty_demo_banner_absent_when_connected_with_telemetry() {
     s.latest = Some(synthetic_snapshot());
     let out = render(&mut s, 160, 44);
     assert!(
-        !out.contains("demo data"),
+        !out.contains("no live data"),
         "banner must be hidden when live: {out:?}"
+    );
+}
+
+/// A simulated (`--demo`/`--replay`) session must carry the SIMULATED DATA
+/// marker on every tab, and must never present itself as live/connected.
+#[test]
+fn simulated_marker_present_on_every_tab() {
+    for tab in [
+        ActiveTab::Home,
+        ActiveTab::Rocm,
+        ActiveTab::Serving,
+        ActiveTab::Observe,
+        ActiveTab::Chat,
+    ] {
+        let mut s = state_on(tab);
+        s.simulated = true;
+        let out = render(&mut s, 160, 44);
+        assert!(
+            out.contains("SIMULATED DATA"),
+            "SIMULATED marker missing on {tab:?}: {out:?}"
+        );
+        assert!(
+            !out.contains("connected · "),
+            "simulated session must not show a live daemon connection on {tab:?}: {out:?}"
+        );
+    }
+}
+
+/// A live session (connected + telemetry, not simulated) must NOT show the
+/// SIMULATED marker, and keeps its live indicators.
+#[test]
+fn simulated_marker_absent_when_live() {
+    let mut s = state_on(ActiveTab::Home);
+    let out = render(&mut s, 160, 44);
+    assert!(
+        !out.contains("SIMULATED DATA"),
+        "live session must not show the SIMULATED marker: {out:?}"
+    );
+    assert!(out.contains("LIVE"), "live feed label expected: {out:?}");
+}
+
+/// The home hero must not label simulated telemetry as a LIVE feed.
+#[test]
+fn home_live_indicators_suppressed_when_simulated() {
+    let mut s = state_on(ActiveTab::Home);
+    s.simulated = true;
+    let out = render(&mut s, 160, 44);
+    assert!(
+        !out.contains("LIVE · last 60s"),
+        "simulated home must not claim a LIVE feed: {out:?}"
+    );
+}
+
+/// The Updates tile must not claim "Up to date" for simulated data — there is
+/// no update feed to observe, so it reads "unknown".
+#[test]
+fn home_updates_tile_unknown_when_simulated() {
+    let mut s = state_on(ActiveTab::Home);
+    s.simulated = true;
+    let out = render(&mut s, 160, 44);
+    assert!(
+        !out.contains("Up to date"),
+        "simulated Updates tile must not claim up to date: {out:?}"
+    );
+    assert!(
+        out.contains("unknown"),
+        "simulated Updates tile should read unknown: {out:?}"
     );
 }
 

@@ -36,7 +36,7 @@ use std::path::Path;
 
 use crate::runner::instance_from_discovered;
 use rocm_dash_collectors::engine_registry::EngineKind;
-use rocm_dash_core::metrics::Instance;
+use rocm_dash_core::metrics::{Instance, InstanceStatus, StartupPhase};
 use rocm_dash_core::traits::DiscoveredService;
 use serde::Deserialize;
 
@@ -61,19 +61,58 @@ pub struct ServiceRecord {
     pub port: u16,
     #[serde(default)]
     pub status: String,
+    /// Coarse startup stage (`downloading`/`loading`/`warmup`) the rocm-cli
+    /// supervisor parsed from the serve logs while the service was coming up.
+    /// Absent on older records and once the service reaches `ready`.
+    #[serde(default)]
+    pub startup_phase: Option<String>,
     #[serde(default)]
     pub created_at_unix_ms: u128,
 }
 
 /// Service statuses worth scraping.
 ///
-/// Matches the live set the rocm-cli supervisor overlays onto a record (`ready`/`running`/`starting`);
-/// a `failed`/`stopped` record is skipped so we never poll a dead port.
+/// Matches the live set the rocm-cli supervisor overlays onto a record
+/// (`ready`/`running`/`starting`/`recovering` — see e.g. `apps/rocm/src/main.rs`'s
+/// own "is this service live" checks); a `failed`/`stopped` record is skipped
+/// so we never poll a dead port.
 pub fn is_scrapeable_status(status: &str) -> bool {
     matches!(
         status.trim().to_ascii_lowercase().as_str(),
-        "ready" | "running" | "starting"
+        "ready" | "running" | "starting" | "recovering"
     )
+}
+
+/// Map a rocm-cli managed-service record's `status` string (plus any parsed
+/// `startup_phase`) onto the dashboard's `InstanceStatus`. Only called after
+/// `is_scrapeable_status` has already filtered out `failed`/`stopped`/unrecognized
+/// strings, so the `_` fallback arm is unreachable in practice but kept total
+/// for safety.
+///
+/// **`running` + `startup_phase` overlap:** the rocm-cli supervisor
+/// (`apps/rocmd/src/lib.rs::supervise_service`) flips the on-disk record to
+/// `running` immediately after spawning the engine child — *before* it starts
+/// polling and parsing `startup_phase` from the serve log — and only clears
+/// `startup_phase` once the service reaches `ready`. So a record can be
+/// `running` with a `startup_phase` still set while the model is downloading
+/// or loading; a *recognized* phase there must surface as `Starting{phase}`,
+/// not `Running`, or the coarse phase never renders during a real cold start.
+///
+/// A `running` record with **no** phase (the steady-state case) — or with a
+/// phase token we don't recognize (a forward/foreign value from a newer
+/// producer) — is a genuinely serving instance and stays plain `Running`. An
+/// unrecognized token must **not** downgrade it to a non-serving `Starting`;
+/// only the pinned tokens (`downloading`/`loading`/`warmup`) do.
+fn instance_status_for_record(status: &str, startup_phase: Option<&str>) -> InstanceStatus {
+    let phase = startup_phase.and_then(StartupPhase::from_token);
+    match status.trim().to_ascii_lowercase().as_str() {
+        "ready" => InstanceStatus::Ready,
+        "running" => phase.map_or(InstanceStatus::Running, |phase| InstanceStatus::Starting {
+            phase: Some(phase),
+        }),
+        "starting" | "recovering" => InstanceStatus::Starting { phase },
+        _ => InstanceStatus::Unknown,
+    }
 }
 
 /// Load every managed-service record under `services_dir`, newest first.
@@ -129,6 +168,7 @@ pub fn discovered_from_record(record: &ServiceRecord) -> Option<DiscoveredServic
         container_name: record.service_id.clone(),
         model_name,
         port: Some(record.port),
+        status: instance_status_for_record(&record.status, record.startup_phase.as_deref()),
         ..Default::default()
     })
 }
@@ -295,6 +335,206 @@ mod tests {
                 "status {live:?} must be scraped"
             );
         }
+    }
+
+    #[test]
+    fn discovered_from_record_maps_status_string_to_instance_status() {
+        // The registry seam must surface the record's real lifecycle state,
+        // not silently downgrade everything to `Running`/`Unknown`.
+        let cases = [
+            ("ready", InstanceStatus::Ready),
+            ("running", InstanceStatus::Running),
+            ("RUNNING", InstanceStatus::Running),
+            ("starting", InstanceStatus::Starting { phase: None }),
+            ("recovering", InstanceStatus::Starting { phase: None }),
+        ];
+        for (status, expected) in cases {
+            let rec: ServiceRecord =
+                serde_json::from_str(&record_json("svc", "vllm", 8000, status, 1)).unwrap();
+            let svc = discovered_from_record(&rec)
+                .unwrap_or_else(|| panic!("status {status:?} must be scrapeable"));
+            assert_eq!(svc.status, expected, "status {status:?}");
+        }
+    }
+
+    #[test]
+    fn discovered_from_record_surfaces_startup_phase_while_starting() {
+        // A `starting`/`recovering` record with a parsed phase must carry that
+        // phase into the instance status so the dashboard can show
+        // DOWNLOADING/LOADING/WARMUP.
+        for status in ["starting", "recovering"] {
+            let rec: ServiceRecord = serde_json::from_str(&format!(
+                r#"{{
+                  "service_id": "svc-load", "engine": "vllm", "model_ref": "m",
+                  "canonical_model_id": "m", "host": "127.0.0.1", "port": 8000,
+                  "status": "{status}", "startup_phase": "loading",
+                  "created_at_unix_ms": 1
+                }}"#
+            ))
+            .unwrap();
+            let svc = discovered_from_record(&rec).expect("record is scrapeable");
+            assert_eq!(
+                svc.status,
+                InstanceStatus::Starting {
+                    phase: Some(StartupPhase::Loading)
+                },
+                "status {status:?}"
+            );
+        }
+
+        // An unrecognized phase token degrades to a phase-less Starting.
+        let rec: ServiceRecord = serde_json::from_str(
+            r#"{
+              "service_id": "svc-x", "engine": "vllm", "model_ref": "m",
+              "canonical_model_id": "m", "host": "127.0.0.1", "port": 8000,
+              "status": "starting", "startup_phase": "bogus",
+              "created_at_unix_ms": 1
+            }"#,
+        )
+        .unwrap();
+        let svc = discovered_from_record(&rec).expect("starting record is scrapeable");
+        assert_eq!(svc.status, InstanceStatus::Starting { phase: None });
+    }
+
+    #[test]
+    fn discovered_from_record_surfaces_startup_phase_while_running() {
+        // The real producer (`apps/rocmd/src/lib.rs::supervise_service`) flips
+        // the on-disk record to `running` *before* it starts polling and
+        // parsing `startup_phase` from the serve log, and only clears
+        // `startup_phase` once the service reaches `ready`. Exercise that
+        // exact `running` + `startup_phase` shape end to end through
+        // `load_service_records` + `discovered_from_record` (not a
+        // hand-picked shape the producer never writes) to prove the coarse
+        // phase actually renders during a real cold start.
+        let dir = test_dir("running-phase");
+        fs::write(
+            dir.join("svc.json"),
+            r#"{
+              "service_id": "svc-cold", "engine": "vllm", "model_ref": "m",
+              "canonical_model_id": "m", "host": "127.0.0.1", "port": 8000,
+              "status": "running", "startup_phase": "downloading",
+              "created_at_unix_ms": 1
+            }"#,
+        )
+        .unwrap();
+
+        let records = load_service_records(&dir);
+        let svc = discovered_from_record(&records[0]).expect("running record is scrapeable");
+        assert_eq!(
+            svc.status,
+            InstanceStatus::Starting {
+                phase: Some(StartupPhase::Downloading)
+            },
+            "a `running` record with a live startup_phase must still render as Starting"
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        // Once the supervisor clears `startup_phase` (service reached
+        // `ready`... though status flips to `ready` too — this proves the
+        // `running`-with-no-phase steady state still maps to plain Running).
+        let dir = test_dir("running-no-phase");
+        fs::write(
+            dir.join("svc.json"),
+            r#"{
+              "service_id": "svc-steady", "engine": "vllm", "model_ref": "m",
+              "canonical_model_id": "m", "host": "127.0.0.1", "port": 8000,
+              "status": "running", "created_at_unix_ms": 1
+            }"#,
+        )
+        .unwrap();
+        let records = load_service_records(&dir);
+        let svc = discovered_from_record(&records[0]).expect("running record is scrapeable");
+        assert_eq!(svc.status, InstanceStatus::Running);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discovered_running_with_unknown_phase_stays_serving() {
+        // Robustness against a forward/foreign phase token: a genuinely
+        // serving `running` instance whose `startup_phase` we don't recognize
+        // (e.g. a newer producer emits a token this dashboard predates) must
+        // stay `Running`/serving — never be downgraded to a non-serving
+        // `Starting`. Only the pinned tokens flip a `running` record to
+        // Starting; everything else leaves it serving.
+        let dir = test_dir("running-unknown-phase");
+        fs::write(
+            dir.join("svc.json"),
+            r#"{
+              "service_id": "svc-fwd", "engine": "vllm", "model_ref": "m",
+              "canonical_model_id": "m", "host": "127.0.0.1", "port": 8000,
+              "status": "running", "startup_phase": "quantizing",
+              "created_at_unix_ms": 1
+            }"#,
+        )
+        .unwrap();
+        let records = load_service_records(&dir);
+        let svc = discovered_from_record(&records[0]).expect("running record is scrapeable");
+        assert_eq!(
+            svc.status,
+            InstanceStatus::Running,
+            "an unrecognized phase token must not downgrade a running instance"
+        );
+        assert!(
+            svc.status.is_serving(),
+            "a running instance with an unknown phase token is still serving"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn managed_service_record_startup_phase_survives_cross_crate_serde() {
+        // Cross-crate wire contract: the rocm-cli supervisor persists a
+        // `rocm_core::ManagedServiceRecord`, and this daemon reads it back as
+        // the local `ServiceRecord`. The `startup_phase` handoff currently
+        // relies on both structs naming the field identically; nothing but a
+        // hand-written JSON literal pins that today. Serialize the *producer's*
+        // real type and deserialize it as *our* type so a future
+        // `#[serde(rename)]` on either side fails here instead of silently
+        // dropping the phase on the floor at runtime.
+        use rocm_core::{AppPaths, ManagedServiceRecord};
+
+        let root = PathBuf::from("/tmp/rocm-xcrate-test");
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        let mut produced = ManagedServiceRecord::new(
+            &paths,
+            "svc-xcrate",
+            "vllm",
+            "meta-llama/Llama-3.1-8B",
+            "meta-llama/Llama-3.1-8B",
+            "127.0.0.1",
+            8000,
+            "serve",
+            4242,
+            None,
+            None,
+            None,
+        );
+        produced.status = "running".to_owned();
+        produced.startup_phase = Some("loading".to_owned());
+
+        let json = serde_json::to_string(&produced).expect("producer record serializes");
+        let consumed: ServiceRecord =
+            serde_json::from_str(&json).expect("daemon record deserializes the producer's JSON");
+
+        assert_eq!(
+            consumed.startup_phase.as_deref(),
+            Some("loading"),
+            "startup_phase must survive the producer→daemon serde handoff by field name"
+        );
+        // The field name is the actual contract; prove the map end to end
+        // resolves the live phase (guards a rename on either side *and* the
+        // consumer-side mapping in one shot).
+        let svc = discovered_from_record(&consumed).expect("running record is scrapeable");
+        assert_eq!(
+            svc.status,
+            InstanceStatus::Starting {
+                phase: Some(StartupPhase::Loading)
+            }
+        );
     }
 
     #[test]

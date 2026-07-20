@@ -93,6 +93,27 @@ rocm serve Qwen/Qwen3.5-4B --engine vllm --gpu 1 --managed
 rocm-cli pins the device via `HIP_VISIBLE_DEVICES`. Serving one model across
 multiple GPUs is not supported.
 
+### Tool calling
+
+The TUI chat tab attaches tool definitions to every chat request. vLLM rejects
+those with HTTP 400 unless it is launched with `--enable-auto-tool-choice` **and**
+a matching `--tool-call-parser`. vLLM does not auto-detect the parser and it is
+model-specific, so rocm-cli never guesses one:
+
+- **Built-in catalog models** carry the correct parser in their recipe metadata,
+  so tool calling works out of the box (e.g. Qwen family → `hermes`,
+  Llama&nbsp;3 → `llama3_json`).
+- **Other models** (arbitrary Hugging Face repos, or a catalog model forced onto
+  vLLM without authored metadata) need an explicit parser:
+
+  ```bash
+  rocm serve <model> --engine vllm --tool-call-parser hermes --managed
+  ```
+
+  `--tool-call-parser` implies `--enable-auto-tool-choice`, overrides any catalog
+  default, and applies to vLLM only. Common values: `hermes`, `llama3_json`,
+  `mistral`. Without it, plain chat still works but tool calls return HTTP 400.
+
 Native Windows vLLM serving is skipped in this adapter. Use WSL/Linux for vLLM
 ROCm serving, or choose a different engine explicitly. No CPU fallback is used.
 

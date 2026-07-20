@@ -16,6 +16,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+#[cfg(test)]
 use rocm_dash_core::metrics::InstanceStatus;
 use rocm_dash_core::state::JobStatus;
 
@@ -179,7 +180,17 @@ pub fn logs_dock(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let end = total - scroll;
     let start = end.saturating_sub(cap);
     let window: Vec<Line> = lines[start..end].to_vec();
-    f.render_widget(Paragraph::new(window), inner);
+    // `start` is the first visible line from the top — the scrollbar position.
+    let body = panel::vertical_scrollbar(f, inner, total, cap, start, theme);
+    state.record_scrollbar(
+        inner,
+        body,
+        false,
+        total,
+        cap,
+        crate::app::ScrollTarget::DockLogs,
+    );
+    f.render_widget(Paragraph::new(window), body);
 }
 
 /// CONTEXT rail: RUNNING SERVICES / GPU STATE / RECENT TOOLS read from
@@ -202,7 +213,7 @@ pub fn context_rail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
     let running: Vec<_> = state
         .instances
         .values()
-        .filter(|i| i.status == InstanceStatus::Running)
+        .filter(|i| i.status.is_serving())
         .collect();
     if running.is_empty() {
         lines.push(Line::from(Span::styled(

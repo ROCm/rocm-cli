@@ -256,7 +256,15 @@ pub fn draw_folder_browser(f: &mut Frame, area: Rect, fb: &FolderBrowser, theme:
             .bg(theme.surface_2)
             .add_modifier(Modifier::BOLD),
     );
-    f.render_stateful_widget(list, rows[1], &mut list_state);
+    let list_area = crate::ui::panel::vertical_scrollbar(
+        f,
+        rows[1],
+        fb.entries.len(),
+        rows[1].height as usize,
+        fb.selected,
+        theme,
+    );
+    f.render_stateful_widget(list, list_area, &mut list_state);
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(

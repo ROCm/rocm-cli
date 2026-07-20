@@ -8,6 +8,7 @@
 //! Stubs return `CollectorError::Unsupported` so the daemon can start with nothing wired.
 
 pub mod amd_smi;
+pub mod bench_load;
 pub mod bench_tail;
 pub mod cgroup;
 pub mod docker;
