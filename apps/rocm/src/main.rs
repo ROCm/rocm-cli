@@ -4229,9 +4229,10 @@ fn serve(args: ServeArgs) -> Result<()> {
             // just launched; skipped when metrics could not be shown anyway.
             let metrics = if !no_smoke_test && !report.already_running && report.status == "ready" {
                 spinner.set_label("Running smoke test…");
-                // The local provider resolves the endpoint key from the keychain by
-                // service id, so the smoke test authenticates against a protected
-                // public endpoint without threading the secret through here.
+                // The local provider resolves the endpoint key from the per-service
+                // 0600 key file by service id, so the smoke test authenticates
+                // against a protected public endpoint without threading the secret
+                // through here.
                 serve_summary::run_smoke_test(&paths, &resolve.canonical_model_id)
             } else {
                 serve_summary::SmokeMetrics::default()

@@ -437,9 +437,11 @@ variable, or let one be generated. The key is handed to the engine via a 0600
 key file (never argv), persisted as a 0600 per-service file (not the OS keychain,
 which is unavailable on headless serving hosts), and printed once as client
 configuration — it must never appear in `rocm services`, `rocm logs`, or the
-audit log. Verifying that the running server actually rejects
-unauthenticated requests requires a live engine and is covered by the GPU
-acceptance scripts (`scripts/vllm_therock_gpu_test.py`), not the unit tests.
+audit log. Verifying that the running server actually *rejects* an
+unauthenticated request requires a live engine; that end-to-end assertion is a
+deferred follow-up and is **not yet** exercised by the GPU acceptance scripts
+(`scripts/vllm_therock_gpu_test.py`). The unit tests cover key policy,
+generation, the 0600 key file, key-file resolution, and cleanup on stop.
 
 Windows + Lemonade note: the Windows *managed* native-Lemonade server is launched
 via `spawn_hidden_console_with_log`, whose env-override API is path-valued only,
