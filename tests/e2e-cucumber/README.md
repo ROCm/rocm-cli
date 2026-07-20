@@ -116,9 +116,9 @@ The blocking mock job passes when every applicable scenario is pass-or-xfail wit
 no XPASS or unexpected failure; the GPU jobs are non-blocking. The `e2e-report`
 job consolidates all platforms' results into one cross-platform report.
 
-The nightly workflow adds non-blocking MI300X and Strix Halo / Ubuntu jobs with
-`E2E_INCLUDE_NIGHTLY=1`. The shared large-model scenario serves
-`Qwen/Qwen3.6-27B` through vLLM on MI300X and
+The nightly workflow adds three non-blocking jobs — MI300X, Strix Halo
+(Ubuntu), and Strix Halo (Windows) — with `E2E_INCLUDE_NIGHTLY=1`. The shared
+large-model scenario serves `Qwen/Qwen3.6-27B` through vLLM on MI300X and
 `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL` through Lemonade on Strix Halo.
 
 Use the CI workflow dispatch to run either model independently on a ref:
@@ -130,9 +130,15 @@ gh workflow run ci.yml --ref <ref> \
   -f include_nightly=true \
   -f name_filter='large platform-recommended model'
 
-# Strix Halo / Lemonade / Qwen3.6-35B-A3B-GGUF (UD-Q4_K_XL)
+# Strix Halo Linux / Lemonade / Qwen3.6-35B-A3B-GGUF (UD-Q4_K_XL)
 gh workflow run ci.yml --ref <ref> \
   -f platform=strix-ubuntu \
+  -f include_nightly=true \
+  -f name_filter='large platform-recommended model'
+
+# Strix Halo Windows / Lemonade / Qwen3.6-35B-A3B-GGUF (UD-Q4_K_XL)
+gh workflow run ci.yml --ref <ref> \
+  -f platform=strix-windows \
   -f include_nightly=true \
   -f name_filter='large platform-recommended model'
 ```

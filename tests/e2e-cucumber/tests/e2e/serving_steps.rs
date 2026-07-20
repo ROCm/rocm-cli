@@ -125,10 +125,10 @@ async fn ensure_serve_port_free() {
 /// Upper bound on the free-VRAM floor (MiB). Sized so the largest single
 /// scenario model can allocate its engine's memory share without tripping its
 /// startup check: Qwen3.6-27B plus vLLM's ~0.8-of-total KV reservation needs the
-/// MI300X mostly clear, while the Strix Halo large-model path is capped to 90%
-/// of its smaller unified-memory pool. Only a data-center GPU has this much,
-/// so on smaller cards the floor is capped to a fraction of the device total
-/// (see [`required_free_vram_mib`]) — otherwise the check could never pass.
+/// MI300X mostly clear. Only a data-center GPU has this much, so on smaller
+/// cards (e.g. Strix Halo's smaller unified-memory pool) the floor is capped to
+/// 90% of the device total (see [`required_free_vram_mib`]) — otherwise the
+/// check could never pass.
 const MAX_FREE_VRAM_FLOOR_MIB: u64 = 150_000;
 
 /// The free-VRAM floor to wait for on this host: the model-sized ceiling, but
@@ -354,11 +354,12 @@ async fn setup_large_gpu_model(world: &mut E2eWorld) {
     // default readiness cap from terminating the server mid-load.
     let (model, engine, ready_substr) =
         if e2e_cucumber::capability::host_capability().effective_serve_engine == "lemonade" {
-            // ready_substr is the base name WITHOUT the quant: lemonade renders
-            // its own quant token in the `/v1/models` id (as with the small
-            // `Qwen3-0.6B-GGUF` -> `Qwen3-0.6B-Q4_0.gguf`), so baking the literal
-            // `UD-Q4_K_XL` into the readiness containment check would miss on any
-            // spelling difference and burn the full @serve-timeout before failing.
+            // ready_substr is the base name WITHOUT the quant. lemonade serves
+            // this explicit `owner/repo:variant` checkpoint under its verbatim
+            // ref, so the `/v1/models` id keeps the `UD-Q4_K_XL` tag — but matching
+            // only the quant-free base keeps the readiness check robust to any
+            // future id-normalization on the serve path (e.g. the quant rewriting
+            // lemonade applies to shorthand refs like `Qwen3-0.6B-GGUF`).
             (
                 "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL",
                 "lemonade",
