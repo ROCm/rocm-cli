@@ -237,9 +237,17 @@ function Read-DerTlv {
             $length = ($length -shl 8) -bor [int] $Bytes[$index]
             $index++
         }
+        # A 4-byte length with the high bit set decodes to a negative Int32; reject
+        # it rather than letting the bounds check below pass and then blowing up in
+        # the byte[] allocation with an unhandled OverflowException.
+        if ($length -lt 0) {
+            Fail "signing public key DER has an unsupported length encoding"
+        }
     }
     $valueStart = $index
-    if ($valueStart + $length -gt $Bytes.Length) {
+    # Compare without adding (`$valueStart + $length` can overflow Int32 for a
+    # crafted multi-GB length and wrap negative, silently passing the check).
+    if ($length -gt $Bytes.Length - $valueStart) {
         Fail "signing public key DER is truncated"
     }
     $value = New-Object byte[] $length
