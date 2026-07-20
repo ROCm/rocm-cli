@@ -16,6 +16,7 @@ use tempfile::TempDir;
 
 mod e2e {
     pub mod chat_steps;
+    pub mod diagnose_steps;
     pub mod examine_steps;
     pub mod runtime_steps;
     pub mod serving_steps;
