@@ -2,7 +2,7 @@
 
 # WIP: E2E coverage for `rocm diagnose` / `rocm fix`
 
-**Stage:** 8-awaiting-pr-approval (PR #127 — commit 268988d passed CI, all 6 diagnose scenarios GREEN across all tiers, awaiting merge approval)
+**Stage:** 8-awaiting-pr-approval (PR #127 — commit 268988d passed full CI, all 6 diagnose scenarios GREEN across all tiers, awaiting merge decision)
 **Pipeline:** standard
 **Branch:** test-e2e-diagnose
 **Last Updated:** 2026-07-20
@@ -123,6 +123,12 @@ Scenario: 6 - Asking for a fix the CLI does not know is refused clearly
 - Recreate with: `create_worktree.sh test-e2e-diagnose`
 
 ## Work Log
+
+### 2026-07-20 (session end 2) — Final status check: PR #127 passing all tiers, awaiting merge decision
+
+- Confirmed commit `268988d` clean across full CI pipeline: mock lane (6/6 ✓), Strix Ubuntu (6/6 ✓), Strix Windows (6/6 ✓), GPU tier (6/6 ✓, 9 xfail expected, 0 unexpected).
+- No diagnose-related test failures or blockers. All expectations in `expectations.toml` met.
+- PR #127 technically ready for merge; awaiting maintainer approval.
 
 ### 2026-07-20 (session end) — All 6 diagnose scenarios GREEN; PR #127 ready for approval
 
