@@ -2,9 +2,9 @@
 
 # WIP: E2E coverage for `rocm diagnose` / `rocm fix`
 
-**Stage:** 8-awaiting-pr-approval (PR #127 — commit 268988d passed full CI, all 6 diagnose scenarios GREEN across all tiers, awaiting merge decision)
+**Stage:** 9-done (PR #127 MERGED — squash 8f67d4a on main, 2026-07-20)
 **Pipeline:** standard
-**Branch:** test-e2e-diagnose
+**Branch:** test-e2e-diagnose (merged; remote branch + worktree NOT yet cleaned up — left intentionally)
 **Last Updated:** 2026-07-20
 
 **Token Usage:** in=4141 out=12296 cache_create=663450 cache_read=2514694 calls=40
@@ -123,6 +123,12 @@ Scenario: 6 - Asking for a fix the CLI does not know is refused clearly
 - Recreate with: `create_worktree.sh test-e2e-diagnose`
 
 ## Work Log
+
+### 2026-07-20 — PR #127 MERGED (stage → done)
+
+- **PR #127 merged to main** via merge queue (squash commit `8f67d4a` "test(e2e): cover rocm diagnose and fix on the mock lane (#127)", merged 2026-07-20 ~10:09 CEST). Repo has a merge queue + auto-merge disabled, so `gh pr merge` couldn't be used directly — enqueued via GraphQL `enqueuePullRequest` mutation; the `UNSTABLE` state was only the non-required GPU E2E lane (5 XPASSes, unrelated bugs), all required checks green + APPROVED.
+- **Post-merge cleanup deliberately deferred** (user chose to keep it): remote branch `test-e2e-diagnose` and this worktree are still present. To clean up later: delete remote branch, remove worktree, verify no unpushed work first.
+- **Side findings filed to work-ledger INBOX** (not part of this PR): (12) code-only bug fixes skip the path-filtered E2E lanes so stale `expectations.toml` xfails surface late as XPASSes on unrelated PRs — e.g. EAI-7052/PR #94 rows XPASS'd on #127's GPU lane; (13) nightly `serve-large-model-inference` (Qwen3.6-27B) fails every run — cold 54 GiB HF pull because the pre-warm only `install sdk`s the runtime, never seeds the weights the test assumes are cached.
 
 ### 2026-07-20 (session end 2) — Final status check: PR #127 passing all tiers, awaiting merge decision
 
