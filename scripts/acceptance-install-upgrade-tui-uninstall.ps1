@@ -128,6 +128,30 @@ function Resolve-CommandPath {
     Fail "missing required command: $Name"
 }
 
+# Build a copy of the current process PATH with every directory that contains an
+# openssl executable removed, so a child install.ps1 cannot find openssl even if
+# the host has it installed. Proves the installer verifies signatures with native
+# crypto only, never shelling out to openssl.
+function Get-PathWithoutOpenssl {
+    $entries = @()
+    foreach ($entry in ($env:Path -split ";")) {
+        if ([string]::IsNullOrWhiteSpace($entry)) {
+            continue
+        }
+        $hasOpenssl = $false
+        foreach ($candidate in @("openssl.exe", "openssl")) {
+            if (Test-Path -LiteralPath (Join-Path $entry $candidate) -PathType Leaf) {
+                $hasOpenssl = $true
+                break
+            }
+        }
+        if (-not $hasOpenssl) {
+            $entries += $entry
+        }
+    }
+    return ($entries -join ";")
+}
+
 function Test-PathInList {
     param(
         [string] $PathList,
@@ -309,6 +333,77 @@ try {
     if (-not (Select-String -LiteralPath $ConfigFile -Pattern '"default_engine"\s*:\s*"lemonade"' -Quiet)) {
         Fail "installer did not seed minimal config with the expected default engine"
     }
+
+    # Regression: install.ps1 must verify the detached signature with native
+    # crypto and never depend on openssl at runtime. Run a full signed install
+    # with openssl scrubbed from PATH and confirm it still verifies and installs.
+    Write-Host "acceptance: install verifies signature with openssl absent from PATH"
+    $noOpensslInstallDir = Join-Path $AcceptanceRoot "no-openssl-install\bin"
+    $NoOpensslInstallLog = Join-Path $AcceptanceRoot "no-openssl-install.log"
+    $noOpensslInstallArgs = @(
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        (Join-Path $RepoRoot "install.ps1"),
+        "release",
+        "-InstallDir",
+        $noOpensslInstallDir,
+        "-DownloadBase",
+        $downloadBase,
+        "-SigningPublicKeyPath",
+        $signingPublicKey,
+        "-RequireSignature",
+        "-NoPathUpdate"
+    )
+    $originalProcessPath = $env:Path
+    try {
+        $env:Path = Get-PathWithoutOpenssl
+        if (Get-Command openssl -ErrorAction SilentlyContinue) {
+            Fail "openssl was still on PATH after scrubbing; cannot prove openssl-free verification"
+        }
+        Invoke-Checked "acceptance: install with openssl absent" $psExe $noOpensslInstallArgs $NoOpensslInstallLog
+
+        # Invalid signatures must still fail (before activation) with openssl absent.
+        Write-Host "acceptance: reject bad signature with openssl absent from PATH"
+        $noOpensslBadSigDistDir = Join-Path $AcceptanceRoot "no-openssl-bad-sig-dist"
+        $noOpensslBadSigInstallDir = Join-Path $AcceptanceRoot "no-openssl-bad-sig-install\bin"
+        $NoOpensslBadSigLog = Join-Path $AcceptanceRoot "no-openssl-bad-sig.log"
+        New-Item -ItemType Directory -Force -Path $noOpensslBadSigDistDir | Out-Null
+        Copy-Item -LiteralPath (Join-Path $DistDir "$DistName.zip") -Destination (Join-Path $noOpensslBadSigDistDir "$DistName.zip") -Force
+        Copy-Item -LiteralPath (Join-Path $DistDir "$DistName.zip.sha256") -Destination (Join-Path $noOpensslBadSigDistDir "$DistName.zip.sha256") -Force
+        Set-Content -LiteralPath (Join-Path $noOpensslBadSigDistDir "$DistName.zip.sig") -Value "not a real signature" -Encoding ascii
+        $noOpensslBadSigDownloadBase = ([System.Uri]::new($noOpensslBadSigDistDir + [System.IO.Path]::DirectorySeparatorChar)).AbsoluteUri.TrimEnd("/")
+        $noOpensslBadSigArgs = @(
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            (Join-Path $RepoRoot "install.ps1"),
+            "release",
+            "-InstallDir",
+            $noOpensslBadSigInstallDir,
+            "-DownloadBase",
+            $noOpensslBadSigDownloadBase,
+            "-SigningPublicKeyPath",
+            $signingPublicKey,
+            "-RequireSignature",
+            "-NoPathUpdate"
+        )
+        Invoke-ExpectFailure "acceptance: bad signature install with openssl absent" $psExe $noOpensslBadSigArgs $NoOpensslBadSigLog
+    } finally {
+        $env:Path = $originalProcessPath
+    }
+    if (-not (Select-String -LiteralPath $NoOpensslInstallLog -Pattern "signature verified" -Quiet)) {
+        Fail "installer did not verify the signature with openssl absent"
+    }
+    Assert-File (Join-Path $noOpensslInstallDir "rocm.exe")
+    Assert-File (Join-Path $noOpensslInstallDir ".rocm-cli-manifest")
+    if (-not (Select-String -LiteralPath $NoOpensslBadSigLog -Pattern "signature verification failed" -Quiet)) {
+        Fail "installer did not reject a bad signature with openssl absent"
+    }
+    Assert-Missing (Join-Path $noOpensslBadSigInstallDir "rocm.exe")
+    Assert-Missing (Join-Path $noOpensslBadSigInstallDir ".rocm-cli-manifest")
 
     # With a production release key pinned in install.ps1, a release install with
     # no public key supplied falls back to that pinned trust root. The bundle here
