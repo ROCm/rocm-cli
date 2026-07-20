@@ -152,6 +152,32 @@ function Get-PathWithoutOpenssl {
     return ($entries -join ";")
 }
 
+function Write-PinnedKeyInstaller {
+    param(
+        [string] $Destination,
+        [string] $CurrentKey,
+        [string] $NextKey
+    )
+
+    $installer = Get-Content -LiteralPath (Join-Path $RepoRoot "install.ps1") -Raw
+    foreach ($slot in @(
+        @{ Name = "Current"; Key = $CurrentKey },
+        @{ Name = "Next"; Key = $NextKey }
+    )) {
+        $pattern = '(?s)\$PinnedReleasePublicKey' + $slot.Name + ' = (?:@".*?"@|"")'
+        $replacement = '$PinnedReleasePublicKey' + $slot.Name + " = @`"`r`n" + $slot.Key.Trim() + "`r`n`"@"
+        # Constant replacement (the here-string literal contains `$` sequences, so a
+        # plain string replacement would be treated as `$`-substitutions); a
+        # MatchEvaluator returns it verbatim. It ignores the match, so no param.
+        $updated = [regex]::Replace($installer, $pattern, [System.Text.RegularExpressions.MatchEvaluator] { $replacement }, 1)
+        if ($updated -eq $installer) {
+            Fail "could not replace pinned $($slot.Name.ToLowerInvariant()) key in installer fixture"
+        }
+        $installer = $updated
+    }
+    Set-Content -LiteralPath $Destination -Value $installer -Encoding utf8
+}
+
 function Test-PathInList {
     param(
         [string] $PathList,
@@ -252,6 +278,61 @@ try {
     $downloadBase = ([System.Uri]::new($DistDir + [System.IO.Path]::DirectorySeparatorChar)).AbsoluteUri.TrimEnd("/")
     $pemDownloadBase = ([System.Uri]::new($PemDistDir + [System.IO.Path]::DirectorySeparatorChar)).AbsoluteUri.TrimEnd("/")
     $env:ROCM_CLI_CONFIG_DIR = $ConfigDir
+
+    # A malformed candidate key must not block a valid rotation key. Build test
+    # installer fixtures with controlled pinned-key slots because the public key
+    # override intentionally accepts only one key.
+    $malformedPublicKey = @"
+-----BEGIN PUBLIC KEY-----
+not-valid-base64
+-----END PUBLIC KEY-----
+"@
+    $validPublicKey = Get-Content -LiteralPath $signingPublicKey -Raw
+    $rotationInstaller = Join-Path $AcceptanceRoot "install-key-rotation.ps1"
+    $rotationInstallDir = Join-Path $AcceptanceRoot "key-rotation-install\bin"
+    $rotationInstallLog = Join-Path $AcceptanceRoot "key-rotation-install.log"
+    Write-PinnedKeyInstaller $rotationInstaller $malformedPublicKey $validPublicKey
+    $rotationInstallArgs = @(
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        $rotationInstaller,
+        "release",
+        "-InstallDir",
+        $rotationInstallDir,
+        "-DownloadBase",
+        $downloadBase,
+        "-NoPathUpdate"
+    )
+    Invoke-Checked "acceptance: malformed first key falls through to valid rotation key" $psExe $rotationInstallArgs $rotationInstallLog
+    if (-not (Select-String -LiteralPath $rotationInstallLog -Pattern "signature verified" -Quiet)) {
+        Fail "installer did not verify with the valid rotation key"
+    }
+    Assert-File (Join-Path $rotationInstallDir "rocm.exe")
+
+    $malformedKeysInstaller = Join-Path $AcceptanceRoot "install-malformed-keys.ps1"
+    $malformedKeysInstallDir = Join-Path $AcceptanceRoot "malformed-keys-install\bin"
+    $malformedKeysLog = Join-Path $AcceptanceRoot "malformed-keys.log"
+    Write-PinnedKeyInstaller $malformedKeysInstaller $malformedPublicKey $malformedPublicKey
+    $malformedKeysArgs = @(
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        $malformedKeysInstaller,
+        "release",
+        "-InstallDir",
+        $malformedKeysInstallDir,
+        "-DownloadBase",
+        $downloadBase,
+        "-NoPathUpdate"
+    )
+    Invoke-ExpectFailure "acceptance: all malformed keys fail deterministically" $psExe $malformedKeysArgs $malformedKeysLog
+    if (-not (Select-String -LiteralPath $malformedKeysLog -Pattern "signature verification failed" -Quiet)) {
+        Fail "installer did not report deterministic failure after all candidate keys failed"
+    }
+    Assert-Missing (Join-Path $malformedKeysInstallDir "rocm.exe")
 
     Write-Host "acceptance: default install updates user PATH"
     $originalUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -359,7 +440,7 @@ try {
     $originalProcessPath = $env:Path
     try {
         $env:Path = Get-PathWithoutOpenssl
-        if (Get-Command openssl -ErrorAction SilentlyContinue) {
+        if (Get-Command openssl -CommandType Application -ErrorAction SilentlyContinue) {
             Fail "openssl was still on PATH after scrubbing; cannot prove openssl-free verification"
         }
         Invoke-Checked "acceptance: install with openssl absent" $psExe $noOpensslInstallArgs $NoOpensslInstallLog

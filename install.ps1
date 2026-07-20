@@ -171,6 +171,11 @@ function Save-File {
     }
 }
 
+function Stop-SigningKeyParsing {
+    param([string] $Message)
+    throw [System.Security.Cryptography.CryptographicException]::new($Message)
+}
+
 # Decode the base64 body of a PEM block (the DER bytes) regardless of the
 # header label. openssl and `cargo xtask keygen` emit SubjectPublicKeyInfo
 # ("BEGIN PUBLIC KEY") PEM; this strips the armor and returns the raw DER.
@@ -195,12 +200,12 @@ function Convert-PemToDer {
         }
     }
     if ($body.Length -eq 0) {
-        Fail "signing public key is not a valid PEM block"
+        Stop-SigningKeyParsing "signing public key is not a valid PEM block"
     }
     try {
         return [System.Convert]::FromBase64String($body.ToString())
     } catch {
-        Fail "signing public key PEM body is not valid base64: $($_.Exception.Message)"
+        Stop-SigningKeyParsing "signing public key PEM body is not valid base64: $($_.Exception.Message)"
     }
 }
 
@@ -216,7 +221,7 @@ function Read-DerTlv {
 
     $start = $Offset.Value
     if ($start + 2 -gt $Bytes.Length) {
-        Fail "signing public key DER is truncated"
+        Stop-SigningKeyParsing "signing public key DER is truncated"
     }
     $tag = $Bytes[$start]
     $index = $start + 1
@@ -227,12 +232,12 @@ function Read-DerTlv {
     } else {
         $byteCount = $lengthByte -band 0x7f
         if ($byteCount -eq 0 -or $byteCount -gt 4) {
-            Fail "signing public key DER has an unsupported length encoding"
+            Stop-SigningKeyParsing "signing public key DER has an unsupported length encoding"
         }
         $length = 0
         for ($i = 0; $i -lt $byteCount; $i++) {
             if ($index -ge $Bytes.Length) {
-                Fail "signing public key DER is truncated"
+                Stop-SigningKeyParsing "signing public key DER is truncated"
             }
             $length = ($length -shl 8) -bor [int] $Bytes[$index]
             $index++
@@ -241,14 +246,14 @@ function Read-DerTlv {
         # it rather than letting the bounds check below pass and then blowing up in
         # the byte[] allocation with an unhandled OverflowException.
         if ($length -lt 0) {
-            Fail "signing public key DER has an unsupported length encoding"
+            Stop-SigningKeyParsing "signing public key DER has an unsupported length encoding"
         }
     }
     $valueStart = $index
     # Compare without adding (`$valueStart + $length` can overflow Int32 for a
     # crafted multi-GB length and wrap negative, silently passing the check).
     if ($length -gt $Bytes.Length - $valueStart) {
-        Fail "signing public key DER is truncated"
+        Stop-SigningKeyParsing "signing public key DER is truncated"
     }
     $value = New-Object byte[] $length
     if ($length -gt 0) {
@@ -287,7 +292,7 @@ function Resolve-RsaVerifier {
     $offset = 0
     $spki = Read-DerTlv $der ([ref] $offset)
     if ($spki.Tag -ne 0x30) {
-        Fail "signing public key is not a SubjectPublicKeyInfo structure"
+        Stop-SigningKeyParsing "signing public key is not a SubjectPublicKeyInfo structure"
     }
 
     # Inside the outer SEQUENCE: AlgorithmIdentifier (SEQUENCE) then the
@@ -295,18 +300,18 @@ function Resolve-RsaVerifier {
     $inner = 0
     $algorithm = Read-DerTlv $spki.Value ([ref] $inner)
     if ($algorithm.Tag -ne 0x30) {
-        Fail "signing public key algorithm identifier is malformed"
+        Stop-SigningKeyParsing "signing public key algorithm identifier is malformed"
     }
     $subjectPublicKey = Read-DerTlv $spki.Value ([ref] $inner)
     if ($subjectPublicKey.Tag -ne 0x03) {
-        Fail "signing public key bit string is malformed"
+        Stop-SigningKeyParsing "signing public key bit string is malformed"
     }
 
     # BIT STRING: first byte is the count of unused bits (0 for a key), the rest
     # is the DER-encoded RSAPublicKey.
     $bitString = $subjectPublicKey.Value
     if ($bitString.Length -lt 1 -or $bitString[0] -ne 0) {
-        Fail "signing public key bit string padding is unsupported"
+        Stop-SigningKeyParsing "signing public key bit string padding is unsupported"
     }
     $rsaKeyDer = New-Object byte[] ($bitString.Length - 1)
     [System.Array]::Copy($bitString, 1, $rsaKeyDer, 0, $rsaKeyDer.Length)
@@ -315,13 +320,13 @@ function Resolve-RsaVerifier {
     $rsaOffset = 0
     $rsaSequence = Read-DerTlv $rsaKeyDer ([ref] $rsaOffset)
     if ($rsaSequence.Tag -ne 0x30) {
-        Fail "signing public key RSA structure is malformed"
+        Stop-SigningKeyParsing "signing public key RSA structure is malformed"
     }
     $rsaInner = 0
     $modulus = Read-DerTlv $rsaSequence.Value ([ref] $rsaInner)
     $exponent = Read-DerTlv $rsaSequence.Value ([ref] $rsaInner)
     if ($modulus.Tag -ne 0x02 -or $exponent.Tag -ne 0x02) {
-        Fail "signing public key modulus or exponent is malformed"
+        Stop-SigningKeyParsing "signing public key modulus or exponent is malformed"
     }
 
     $parameters = New-Object System.Security.Cryptography.RSAParameters
@@ -331,9 +336,9 @@ function Resolve-RsaVerifier {
     $rsa = [System.Security.Cryptography.RSA]::Create()
     try {
         $rsa.ImportParameters($parameters)
-    } catch {
+    } catch [System.Security.Cryptography.CryptographicException] {
         $rsa.Dispose()
-        Fail "signing public key could not be imported: $($_.Exception.Message)"
+        Stop-SigningKeyParsing "signing public key could not be imported: $($_.Exception.Message)"
     }
     return $rsa
 }
@@ -358,14 +363,19 @@ function Confirm-ArchiveSignature {
     $padding = [System.Security.Cryptography.RSASignaturePadding]::Pkcs1
 
     foreach ($key in $PublicKeyPaths) {
-        $pem = Get-Content -LiteralPath $key -Raw
-        $rsa = Resolve-RsaVerifier $pem
+        $rsa = $null
         try {
+            $pem = Get-Content -LiteralPath $key -Raw
+            $rsa = Resolve-RsaVerifier $pem
             if ($rsa.VerifyData($archiveBytes, $signatureBytes, $hashAlgorithm, $padding)) {
                 return
             }
+        } catch [System.Security.Cryptography.CryptographicException] {
+            continue
         } finally {
-            $rsa.Dispose()
+            if ($null -ne $rsa) {
+                $rsa.Dispose()
+            }
         }
     }
     Fail "signature verification failed"
