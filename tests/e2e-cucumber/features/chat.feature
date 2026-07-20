@@ -19,6 +19,8 @@ Feature: Chat and endpoint detection
     When the user opens interactive chat
     Then the local endpoint is shown for confirmation
     And the privacy notice is shown before any message is sent
+    When the user quits interactive chat
+    Then interactive chat exits successfully
 
   @id:chat-managed-model-interactive @requires-os:linux
   Scenario: 3 - Interactive chat uses a running managed model
