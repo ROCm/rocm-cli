@@ -5,7 +5,7 @@
 **Stage:** 9-done (PR #127 MERGED — squash 8f67d4a on main, 2026-07-20)
 **Pipeline:** standard
 **Branch:** test-e2e-diagnose (merged; remote branch + worktree NOT yet cleaned up — left intentionally)
-**Last Updated:** 2026-07-20
+**Last Updated:** 2026-07-20 (idle flush)
 
 **Token Usage:** in=4141 out=12296 cache_create=663450 cache_read=2514694 calls=40
 
@@ -123,6 +123,10 @@ Scenario: 6 - Asking for a fix the CLI does not know is refused clearly
 - Recreate with: `create_worktree.sh test-e2e-diagnose`
 
 ## Work Log
+
+### 2026-07-20 (idle flush)
+
+- **Session idle for 10 minutes, auto-flushing WIP state.** No changes to branch or code files. PR #127 remains merged on main; worktree+remote branch cleanup still pending.
 
 ### 2026-07-20 — PR #127 MERGED (stage → done)
 
