@@ -83,6 +83,37 @@ pub fn endpoint_api_key_from_file(path: &std::path::Path) -> Option<String> {
     }
 }
 
+/// Deterministic path of the 0600 endpoint key file for `service_id`.
+///
+/// Shared so both binaries that need to locate a service's key file — `rocm`
+/// (which owns writing and clearing it) and `rocmd` (which only re-threads
+/// [`ENDPOINT_API_KEY_FILE_ENV`] onto engine children it spawns for daemon
+/// recovery and healthchecks) — derive the same path without either depending
+/// on the other's private modules.
+#[must_use]
+pub fn endpoint_key_file_path(paths: &rocm_core::AppPaths, service_id: &str) -> PathBuf {
+    paths
+        .services_dir()
+        .join(format!("{service_id}.endpoint-key"))
+}
+
+/// The key file path if it exists, for handing to an engine child via
+/// [`ENDPOINT_API_KEY_FILE_ENV`]. `None` for loopback services with no stored
+/// key.
+///
+/// This is only an existence check, not a validity check — callers that need
+/// to know whether the file holds a *usable* key (as opposed to deciding
+/// whether to set the env var at all) should read it with
+/// [`endpoint_api_key_from_file`] instead.
+#[must_use]
+pub fn endpoint_key_file_if_present(
+    paths: &rocm_core::AppPaths,
+    service_id: &str,
+) -> Option<PathBuf> {
+    let path = endpoint_key_file_path(paths, service_id);
+    path.exists().then_some(path)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnginePluginDescriptor {
     pub id: String,
@@ -573,6 +604,53 @@ mod tests {
         std::fs::write(&empty, "\n").unwrap();
         assert_eq!(endpoint_api_key_file_if_valid(&empty), None);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn test_app_paths(label: &str) -> rocm_core::AppPaths {
+        let root = unique_temp_dir(label);
+        std::fs::create_dir_all(root.join("data").join("services")).unwrap();
+        rocm_core::AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        }
+    }
+
+    #[test]
+    fn endpoint_key_file_path_is_deterministic_per_service_under_services_dir() {
+        let paths = test_app_paths("key-file-path");
+        let path = endpoint_key_file_path(&paths, "svc-1");
+        assert_eq!(path, paths.services_dir().join("svc-1.endpoint-key"));
+        // Same inputs, same path: callers on both sides of a spawn (writer and
+        // the env-threading reader) must agree without coordination.
+        assert_eq!(path, endpoint_key_file_path(&paths, "svc-1"));
+        // Different service ids never collide.
+        assert_ne!(path, endpoint_key_file_path(&paths, "svc-2"));
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    #[test]
+    fn endpoint_key_file_if_present_reflects_existence_only() {
+        let paths = test_app_paths("key-file-if-present");
+        let service_id = "svc-present";
+        // No file written yet: not present, regardless of what a future key
+        // would contain.
+        assert_eq!(endpoint_key_file_if_present(&paths, service_id), None);
+
+        let path = endpoint_key_file_path(&paths, service_id);
+        // Existence is all this helper checks — even an empty file (which
+        // `endpoint_api_key_from_file` would treat as "no key") counts as
+        // present, since callers use it to decide whether to set the env var
+        // at all, not whether the key is valid.
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(
+            endpoint_key_file_if_present(&paths, service_id),
+            Some(path.clone())
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(endpoint_key_file_if_present(&paths, service_id), None);
+        std::fs::remove_dir_all(&paths.data_dir).ok();
     }
 
     #[test]

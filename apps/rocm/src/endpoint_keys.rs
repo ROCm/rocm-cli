@@ -22,10 +22,13 @@ use std::path::PathBuf;
 use rocm_core::AppPaths;
 
 /// Deterministic path of the 0600 endpoint key file for `service_id`.
+///
+/// Delegates to the shared helper in `rocm-engine-protocol` so `rocmd` (which
+/// needs the same path to re-thread `ROCM_SERVE_API_KEY_FILE` onto engine
+/// children it spawns) derives an identical path without depending on this
+/// crate-private module.
 pub(crate) fn endpoint_key_file_path(paths: &AppPaths, service_id: &str) -> PathBuf {
-    paths
-        .services_dir()
-        .join(format!("{service_id}.endpoint-key"))
+    rocm_engine_protocol::endpoint_key_file_path(paths, service_id)
 }
 
 /// Persist `key` for `service_id`, creating the file 0600. Overwrites any
@@ -44,9 +47,11 @@ pub(crate) fn endpoint_api_key(paths: &AppPaths, service_id: &str) -> Option<Str
 
 /// The key file path if it exists, for handing to the engine child via
 /// `ROCM_SERVE_API_KEY_FILE`. `None` for loopback services with no stored key.
+///
+/// Delegates to the shared helper in `rocm-engine-protocol` (see
+/// [`endpoint_key_file_path`]).
 pub(crate) fn endpoint_key_file_if_present(paths: &AppPaths, service_id: &str) -> Option<PathBuf> {
-    let path = endpoint_key_file_path(paths, service_id);
-    path.exists().then_some(path)
+    rocm_engine_protocol::endpoint_key_file_if_present(paths, service_id)
 }
 
 /// Remove the stored key for `service_id`. Idempotent and best-effort: a missing
