@@ -2,10 +2,10 @@
 
 # WIP: E2E coverage for `rocm diagnose` / `rocm fix`
 
-**Stage:** 8-awaiting-pr-approval (PR #127 — CHANGES_REQUESTED addressed, pushed 268988d, awaiting re-review)
+**Stage:** 8-awaiting-pr-approval (PR #127 — commit 268988d passed CI, all 6 diagnose scenarios GREEN across all tiers, awaiting merge approval)
 **Pipeline:** standard
 **Branch:** test-e2e-diagnose
-**Last Updated:** 2026-07-17
+**Last Updated:** 2026-07-20
 
 **Token Usage:** in=4141 out=12296 cache_create=663450 cache_read=2514694 calls=40
 
@@ -88,17 +88,15 @@ Scenario: 6 - Asking for a fix the CLI does not know is refused clearly
 - ✅ Implemented `diagnose.feature` + `diagnose_steps.rs` + e2e.rs module wiring; all expect-pass entries in `expectations.toml`.
 - ✅ Container gate green: clippy `-D warnings` clean, 6/6 pass, 0 unexpected.
 - ✅ **PR #127 opened** (commit `5e074fa`, signed + signed-off, off updated main).
+- ✅ **CHANGES_REQUESTED addressed:** symptom swapped to `"HSA_STATUS_ERROR_INVALID_ISA"` (LINUX_AND_WINDOWS checker), verified in container, pushed commit `268988d`.
+- ✅ **CI passed:** all 6 diagnose scenarios GREEN across mock, Strix Ubuntu, Strix Windows, GPU tiers; no blockers.
 
 ### Todo 📋
-- 📋 Verify symptom swap (`"unable to open /dev/kfd"` → `"HSA_STATUS_ERROR_INVALID_ISA"`) in Linux container before pushing amendment commit.
-- 📋 Push amended commit; re-run CI (strix-windows should now pass S1/S3).
-- 📋 Resolve CHANGES_REQUESTED → awaiting re-review on amended commit.
+- 📋 Await merge approval on PR #127 (all 6 scenarios GREEN, no technical blockers).
 
 ## Next Steps
 
-- Verify symptom swap in container (must confirm `"HSA_STATUS_ERROR_INVALID_ISA"` scores via LINUX_AND_WINDOWS checker).
-- Push amended commit with symptom swap.
-- Re-run CI; resolve CHANGES_REQUESTED review.
+- Await merge approval on PR #127 (no technical blockers; all 6 scenarios passing all tiers).
 - On merge: run post-merge cleanup (stage → done, delete remote branch, remove worktree).
 
 ## Checklist
@@ -124,6 +122,13 @@ Scenario: 6 - Asking for a fix the CLI does not know is refused clearly
 **Worktree directory**: `/Users/fres/Developer/rocm-cli-wt/test-e2e-diagnose`
 - Recreate with: `create_worktree.sh test-e2e-diagnose`
 
+## Work Log
+
+### 2026-07-20 — CI GREEN; all 6 diagnose scenarios passing
+
+- Commit `268988d` (symptom swap to `"HSA_STATUS_ERROR_INVALID_ISA"`) passed full CI pipeline: mock, Strix Ubuntu, Strix Windows, GPU tiers all show **6/6 diagnose scenarios GREEN**.
+- No diagnose-related failures; no blockers on PR #127. Awaiting merge approval.
+
 ### 2026-07-17 — CHANGES_REQUESTED addressed → pushed (commit 268988d)
 
 - **volen-silo bot flagged S1 & S3 NOT host-invariant**: symptom `"unable to open /dev/kfd"` scores only via `check_4_render_group` (LINUX_ONLY, `diagnose.rs:1225`) → strix-windows renders no match → S1/S3 fail deterministically (untagged ⇒ expect-pass every lane).
@@ -139,12 +144,6 @@ Scenario: 6 - Asking for a fix the CLI does not know is refused clearly
 - Verified `"HSA_STATUS_ERROR_INVALID_ISA"` in container: scores via LINUX_AND_WINDOWS checker (fix-1-arch [LIKELY score=50]).
 - All 6 diagnose scenarios pass across mock, Ubuntu, Windows tiers; no blockers.
 - Pushed amended commit 268988d; awaiting volen-silo re-review on PR #127.
-
-### 2026-07-17 (idle flush) — Auto-flush WIP state
-
-- Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-17 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
 ### 2026-07-17 — Session review & token usage snapshot
 
