@@ -402,6 +402,46 @@ jobs:
               "$ROCM_CLI_BINARY" install sdk
           fi
 
+          # Pre-seed the large-model (27B) weights into the SAME shared HF cache the
+          # harness reads (isolate_cmd sets HF_HOME=$E2E_SHARED_CACHE_DIR/huggingface).
+          # The @nightly serve scenario assumes weights are already local so the timed
+          # serve is load-only; without this it does a cold ~54 GiB pull inside the
+          # serve step and times out (did not serve within 2400s). Guarded by the
+          # snapshot marker dir so it runs once per runner (weights are
+          # content-addressed/immutable — re-fetch is a no-op). HF_TOKEN is used if the
+          # secret exists (dodges HF Hub rate limits); unauthenticated still works,
+          # just slower on the one-time fill. The nightly always runs the 27B scenario
+          # (E2E_INCLUDE_NIGHTLY=1), so this is unconditional here.
+          hf_home="$E2E_SHARED_CACHE_DIR/huggingface"
+          marker="$hf_home/hub/models--Qwen--Qwen3.6-27B"
+          if [ ! -d "$marker" ]; then
+            echo "pre-seeding Qwen/Qwen3.6-27B weights (first run on this runner)…"
+            # Reuse the uv the runtime pre-warm just acquired: `rocm` fetches a
+            # managed uv under <data_dir>/managed-tools/uv/… (not on PATH), so prefer
+            # a system uv if present, else the newest managed one. Avoids assuming a
+            # system-wide uv install on the self-hosted runner.
+            uv_bin="$(command -v uv || true)"
+            if [ -z "$uv_bin" ]; then
+              uv_bin="$(ls -t "$prewarm"/data/managed-tools/uv/*/uv 2>/dev/null | head -1 || true)"
+            fi
+            if [ -z "$uv_bin" ]; then
+              echo "no uv binary found (system PATH or managed); cannot pre-seed" >&2
+            else
+              HF_HOME="$hf_home" \
+              HF_TOKEN="${{ secrets.HF_TOKEN }}" \
+              UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
+                "$uv_bin" run --with huggingface_hub --no-project python -c \
+                  'from huggingface_hub import snapshot_download; snapshot_download("Qwen/Qwen3.6-27B")'
+            fi
+            if [ -d "$marker" ]; then
+              echo "pre-seeded 27B weights at $marker"
+            else
+              echo "pre-seed did not produce the expected snapshot dir; serve will pull on demand" >&2
+            fi
+          else
+            echo "27B weights already present at $marker — skipping pre-seed"
+          fi
+
           cargo xtask e2e
 
       - name: Upload E2E report
