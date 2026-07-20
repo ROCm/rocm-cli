@@ -412,8 +412,8 @@ jobs:
           path: tests/e2e-cucumber/results/
 
   # Strix Halo counterpart to e2e-gpu-nightly. The same @nightly large-model
-  # scenario selects the featured Lemonade GGUF on this host. Keep the runner's
-  # storage and runtime setup aligned with ci.yml's proven Strix Ubuntu job.
+  # scenario serves the platform-specific Lemonade GGUF on this host. Keep the
+  # runner's storage and runtime setup aligned with ci.yml's proven Strix Ubuntu job.
   e2e-gpu-nightly-strix:
     name: E2E tests (Strix Halo, incl. nightly-only)
     timeout-minutes: 90

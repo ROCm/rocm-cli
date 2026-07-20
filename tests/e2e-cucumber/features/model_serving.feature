@@ -40,13 +40,14 @@ Feature: Model serving
     Then the response contains a model reply
     And the response identifies the correct model
 
-  # Large-model coverage (dogfooding W9): serve the featured model for each GPU
-  # platform end-to-end at least once. MI300X uses Qwen/Qwen3.6-27B through vLLM;
-  # Strix Halo uses unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL through Lemonade.
-  # These slow loads stay off the ordinary per-PR path, and the longer readiness
-  # timeout also gives the first inference request enough time to complete.
+  # Large-model coverage (dogfooding W9): serve a representative large model for
+  # each GPU platform end-to-end at least once. MI300X uses Qwen/Qwen3.6-27B through
+  # vLLM; Strix Halo uses the hardware-verified
+  # unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL checkpoint through Lemonade. These slow
+  # loads stay off the ordinary per-PR path, and the longer readiness timeout also
+  # gives the first inference request enough time to complete.
   @id:serve-large-model-inference @requires-gpu @serve-timeout:2400 @nightly
-  Scenario: 10 - A large platform-recommended model serves and responds to inference
+  Scenario: 10 - A large platform-specific model serves and responds to inference
     Given a managed runtime is active
     And a large model is being served on GPU
     When the user sends a chat completion request

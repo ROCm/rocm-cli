@@ -347,11 +347,12 @@ async fn setup_lemonade_model(world: &mut E2eWorld) {
 #[given("a large model is being served on GPU")]
 async fn setup_large_gpu_model(world: &mut E2eWorld) {
     // Large-model nightly coverage follows the host's serving path. MI300X uses
-    // the dense BF16 model through vLLM; Strix Halo uses the requested UD-Q4_K_XL
-    // GGUF through Lemonade. The scenario's @serve-timeout tag widens both the
-    // readiness poll and heavy-model inference timeout. For vLLM it also raises
-    // ROCM_CLI_VLLM_READY_TIMEOUT_SECS (see isolate_cmd), preventing the CLI's
-    // default readiness cap from terminating the server mid-load.
+    // the dense BF16 model through vLLM; Strix Halo uses the hardware-verified
+    // UD-Q4_K_XL GGUF checkpoint through Lemonade. The scenario's @serve-timeout
+    // tag widens both the readiness poll and heavy-model inference timeout. For
+    // vLLM it also raises ROCM_CLI_VLLM_READY_TIMEOUT_SECS (see isolate_cmd),
+    // preventing the CLI's default readiness cap from terminating the server
+    // mid-load.
     let (model, engine, ready_substr) =
         if e2e_cucumber::capability::host_capability().effective_serve_engine == "lemonade" {
             // ready_substr is the base name WITHOUT the quant. lemonade serves
@@ -713,40 +714,5 @@ async fn assert_response_model_correct(world: &mut E2eWorld) {
 /// catalog suffix and quantization tokens like `-q4_0` stripped) and accept a
 /// match in either direction.
 fn model_ids_match(resp_model: &str, expected: &str) -> bool {
-    let a = normalize_model_id(resp_model);
-    let b = normalize_model_id(expected);
-    if a.is_empty() || b.is_empty() {
-        return false;
-    }
-    a.contains(&b) || b.contains(&a)
-}
-
-fn normalize_model_id(id: &str) -> String {
-    let mut s = id
-        .rsplit('/')
-        .next()
-        .unwrap_or(id)
-        .split(':')
-        .next()
-        .unwrap_or(id)
-        .to_ascii_lowercase();
-    if let Some(stripped) = s.strip_suffix(".gguf") {
-        s = stripped.to_owned();
-    }
-    // Drop the catalog `-gguf` marker and common quantization suffixes so the
-    // catalog name and the concrete artifact reduce to the same base.
-    s = s.replace("-gguf", "");
-    for q in [
-        "-ud-q4_k_xl",
-        "-q4_0",
-        "-q4_k_m",
-        "-q4_k_s",
-        "-q5_k_m",
-        "-q8_0",
-        "-f16",
-        "-fp16",
-    ] {
-        s = s.replace(q, "");
-    }
-    s.trim_matches(['-', '_', '.']).to_owned()
+    e2e_cucumber::model_id::model_ids_match(resp_model, expected)
 }

@@ -1050,6 +1050,10 @@ jobs:
           && (inputs.platform == 'all' || inputs.platform == 'strix-windows'))
       )
     continue-on-error: true
+    env:
+      # Match the Linux Strix dispatch path: opt into the platform-adaptive
+      # large-model scenario only when the manual input is enabled.
+      E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
