@@ -14,6 +14,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
+use rocm_dash_core::metrics::InstanceStatus;
+
 use crate::app::{AppState, ChatConsent, ChatRole};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
@@ -287,24 +289,57 @@ pub fn transcript_lines<'a>(state: &'a AppState, theme: &Theme) -> Vec<Line<'a>>
     lines
 }
 
+/// If the local instance backing the chat endpoint is not yet answering,
+/// explain why so an in-flight request reads as "the model is still coming up"
+/// rather than an unexplained spinner. Matched to a daemon-surfaced instance by
+/// host + port (daemon-tracked instances are always co-located, so only a
+/// loopback endpoint can be one of them — a remote gateway must never
+/// false-match just because it happens to share a port number with a local
+/// instance).
+///
+/// Returns `None` when the endpoint is remote, isn't a managed instance we can
+/// see, or the instance is serving/unknown — the caller then shows the plain
+/// spinner. `Ready` is the precise probe-backed serving state; `Running` remains
+/// a serving synonym for discovery sources without a readiness signal.
+fn chat_backend_wait_reason(state: &AppState) -> Option<String> {
+    let base_url = &state.chat_llm.as_ref()?.base_url;
+    // Reuse the crate's authority parser: it strips the brackets from an IPv6
+    // loopback (`http://[::1]:8000` → host `::1`) that a hand-rolled
+    // `rsplit(':')` would mangle, and defaults the port from the scheme.
+    let (host, port) = crate::llm::parse_host_port(base_url)?;
+    if !crate::llm::is_loopback_host(&host) {
+        return None;
+    }
+    let inst = state.instances.values().find(|i| i.port == Some(port))?;
+    match inst.status {
+        InstanceStatus::Ready | InstanceStatus::Running => None,
+        InstanceStatus::Starting { .. } => {
+            Some("the model is still starting up — hang tight".to_owned())
+        }
+        InstanceStatus::Stopped => {
+            Some("the endpoint has stopped — restart the service to chat".to_owned())
+        }
+        InstanceStatus::Error => {
+            Some("the endpoint reported an error — check the service logs".to_owned())
+        }
+        InstanceStatus::Unknown => None,
+    }
+}
+
 /// Render the single-row input line. While focused, a caret glyph trails the
 /// buffer; otherwise a muted hint invites focus.
 fn draw_input(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // While a request is in flight, show a spinner and suppress the caret —
-    // input is disabled until the reply or error turn lands.
+    // input is disabled until the reply or error turn lands. When the backing
+    // endpoint isn't ready yet, say so instead of an unexplained spinner.
     if state.chat_sending {
-        let inner = panel::bento(
-            f,
-            area,
-            Some("Message (sending…)"),
-            BoxRole::Warning,
-            false,
-            theme,
-        );
-        let line = Line::from(Span::styled(
-            "⠿ waiting for the agent…",
-            Style::default().fg(theme.muted),
-        ));
+        let reason = chat_backend_wait_reason(state);
+        let (title, body): (&str, String) = match &reason {
+            Some(reason) => ("Message (waiting on the model)", format!("⠿ {reason}")),
+            None => ("Message (sending…)", "⠿ waiting for the agent…".to_owned()),
+        };
+        let inner = panel::bento(f, area, Some(title), BoxRole::Warning, false, theme);
+        let line = Line::from(Span::styled(body, Style::default().fg(theme.muted)));
         f.render_widget(Paragraph::new(line), inner);
         return;
     }
@@ -454,5 +489,137 @@ mod tests {
         assert!(out.contains("Llama-3.2-3B"));
         assert!(out.contains("use now"));
         assert!(out.contains("use & save"));
+    }
+
+    fn accepted_chat_at_port(port: u16) -> AppState {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = crate::app::ActiveTab::Chat;
+        let llm = crate::llm::LlmConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "m".into(),
+            api_key: None,
+            auth_header: None,
+        };
+        s.set_chat_config(Some(llm), true);
+        s
+    }
+
+    fn set_backing_instance(s: &mut AppState, port: u16, status: InstanceStatus) {
+        use rocm_dash_core::metrics::Instance;
+        s.instances.clear();
+        s.instances.insert(
+            "svc".into(),
+            Instance {
+                container_id: "svc".into(),
+                port: Some(port),
+                status,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn backend_wait_reason_reflects_instance_status() {
+        let mut s = accepted_chat_at_port(8000);
+        // No instance visible → no endpoint-specific reason (falls back to spinner).
+        assert_eq!(chat_backend_wait_reason(&s), None);
+
+        set_backing_instance(&mut s, 8000, InstanceStatus::Starting { phase: None });
+        assert!(
+            chat_backend_wait_reason(&s)
+                .unwrap()
+                .contains("starting up")
+        );
+        set_backing_instance(&mut s, 8000, InstanceStatus::Stopped);
+        assert!(chat_backend_wait_reason(&s).unwrap().contains("stopped"));
+        set_backing_instance(&mut s, 8000, InstanceStatus::Error);
+        assert!(chat_backend_wait_reason(&s).unwrap().contains("error"));
+        // A live instance needs no explanation.
+        set_backing_instance(&mut s, 8000, InstanceStatus::Running);
+        assert_eq!(chat_backend_wait_reason(&s), None);
+        set_backing_instance(&mut s, 8000, InstanceStatus::Ready);
+        assert_eq!(chat_backend_wait_reason(&s), None);
+        // A mismatched port is not our endpoint.
+        set_backing_instance(&mut s, 9999, InstanceStatus::Starting { phase: None });
+        assert_eq!(chat_backend_wait_reason(&s), None);
+    }
+
+    #[test]
+    fn backend_wait_reason_matches_bracketed_ipv6_loopback() {
+        // A bracketed IPv6 loopback endpoint must still resolve to its backing
+        // instance: the shared authority parser strips the brackets so
+        // `is_loopback_host` sees `::1`. A hand-rolled `rsplit(':')` used to
+        // mangle this (`[::1]` host / `1]` port) and silently disable the reason.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = crate::app::ActiveTab::Chat;
+        let llm = crate::llm::LlmConfig {
+            base_url: "http://[::1]:8000/v1".into(),
+            model: "m".into(),
+            api_key: None,
+            auth_header: None,
+        };
+        s.set_chat_config(Some(llm), true);
+        set_backing_instance(&mut s, 8000, InstanceStatus::Starting { phase: None });
+        assert!(
+            chat_backend_wait_reason(&s)
+                .unwrap()
+                .contains("starting up"),
+            "bracketed IPv6 loopback should resolve to its backing instance"
+        );
+    }
+
+    #[test]
+    fn backend_wait_reason_ignores_remote_endpoint_sharing_a_local_port_number() {
+        // A remote gateway can happen to use the same port number (e.g. 8000)
+        // as a local daemon-tracked instance. Matching by port alone would
+        // wrongly borrow that unrelated instance's status; matching requires
+        // the endpoint's host to be loopback, so a remote host must fall back
+        // to the generic spinner even when a same-port local instance exists.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = crate::app::ActiveTab::Chat;
+        let llm = crate::llm::LlmConfig {
+            base_url: "https://gateway.example.com:8000/v1".into(),
+            model: "m".into(),
+            api_key: None,
+            auth_header: None,
+        };
+        s.set_chat_config(Some(llm), true);
+        set_backing_instance(&mut s, 8000, InstanceStatus::Starting { phase: None });
+        assert_eq!(chat_backend_wait_reason(&s), None);
+    }
+
+    #[test]
+    fn sending_input_surfaces_startup_reason_not_generic_spinner() {
+        let mut s = accepted_chat_at_port(8000);
+        s.chat_sending = true;
+        set_backing_instance(&mut s, 8000, InstanceStatus::Starting { phase: None });
+        let out = render_str(&s);
+        assert!(
+            out.contains("starting up"),
+            "shows the specific startup reason"
+        );
+        assert!(
+            !out.contains("waiting for the agent"),
+            "not the generic spinner"
+        );
+    }
+
+    #[test]
+    fn sending_input_falls_back_to_generic_spinner_for_remote_endpoint() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = crate::app::ActiveTab::Chat;
+        let llm = crate::llm::LlmConfig {
+            base_url: "https://gateway.example.com/v1".into(),
+            model: "m".into(),
+            api_key: None,
+            auth_header: None,
+        };
+        s.set_chat_config(Some(llm), true);
+        s.chat_sending = true;
+        let out = render_str(&s);
+        assert!(
+            out.contains("waiting for the agent"),
+            "generic spinner remains"
+        );
     }
 }
