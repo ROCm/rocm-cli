@@ -2589,14 +2589,24 @@ fn build_driver_install_plan(
         ),
         ("debian", "12" | "13") => {
             let repo_codename = if version_id == "13" { "noble" } else { "jammy" };
-            apt_driver_plan(
+            let mut plan = apt_driver_plan(
                 os_id,
                 version_id,
                 repo_codename.to_owned(),
                 repo_version_expr,
                 dkms,
                 false,
-            )
+            );
+            // Debian deliberately reuses AMD's Ubuntu-suite repository: AMD's
+            // documented Debian install maps Debian 12 -> jammy and 13 -> noble
+            // and serves them from the .../ubuntu graphics tree. Surface that in
+            // the plan so the Ubuntu codename on a Debian host doesn't read as a
+            // misdetection.
+            plan.reason = format!(
+                "Debian intentionally uses AMD's Ubuntu-suite repository (codename {repo_codename}), per AMD's documented Debian install; the Ubuntu codename is deliberate, not a misdetection. {}",
+                plan.reason
+            );
+            plan
         }
         ("rhel", "10.1" | "10.0" | "9.7" | "9.6" | "9.4" | "8.10") => dnf_driver_plan(
             os_id,
@@ -2614,7 +2624,7 @@ fn build_driver_install_plan(
             dkms,
             DnfDriverDistro::Oracle,
         ),
-        ("rocky", "9.7") => dnf_driver_plan(
+        ("rocky", "9.4" | "9.6" | "9.7") => dnf_driver_plan(
             os_id,
             version_id,
             codename,
@@ -20931,6 +20941,66 @@ VERSION_ID="9.7"
             )
         );
         assert!(rendered.contains("Execute: sudo dnf install -y amdgpu-dkms"));
+    }
+
+    #[test]
+    fn driver_plan_rocky_94_uses_el_dnf_flow() {
+        // Rocky 9.x point releases must resolve like RHEL 9.x, not just 9.7.
+        let os_release = r#"
+ID=rocky
+VERSION_ID="9.4"
+"#;
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert!(plan.supported);
+        assert!(plan.mutating);
+        assert!(
+            rendered.contains(
+                "repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/el/9.4/"
+            )
+        );
+        assert!(rendered.contains("amdgpu-install-${ROCM_CLI_AMDGPU_VERSION:-7.2.4}.${ROCM_CLI_AMDGPU_PACKAGE_RELEASE:-70204}-1.el9.noarch.rpm"));
+        assert!(rendered.contains("Execute: sudo dnf install -y amdgpu-dkms"));
+    }
+
+    #[test]
+    fn driver_plan_rocky_8_and_10_remain_unsupported() {
+        // AMD documents Rocky Linux 9 only; keep the driver matrix scoped to 9.x.
+        for version in ["8.10", "10.0"] {
+            let os_release = format!("\nID=rocky\nVERSION_ID=\"{version}\"\n");
+            let plan = build_driver_install_plan(&test_examine("linux", false), &os_release, true);
+            assert!(!plan.supported, "rocky {version} should be unsupported");
+            assert!(!plan.mutating, "rocky {version} must not mutate");
+            assert!(
+                plan.commands.is_empty(),
+                "rocky {version} must emit no commands"
+            );
+        }
+    }
+
+    #[test]
+    fn driver_plan_debian_uses_intended_ubuntu_suite() {
+        // AMD's documented Debian install deliberately serves Debian from the
+        // Ubuntu-suite graphics tree (Debian 12 -> jammy). Lock that in and
+        // ensure the plan explains the mapping is intentional.
+        let os_release = r#"
+ID=debian
+VERSION_ID="12"
+VERSION_CODENAME=bookworm
+"#;
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let rendered = render_driver_install_plan(&plan, false, true);
+
+        assert!(plan.supported);
+        assert_eq!(plan.codename, "jammy");
+        assert!(rendered.contains(
+            "https://repo.radeon.com/graphics/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/ubuntu jammy main"
+        ));
+        assert!(
+            plan.reason
+                .contains("intentionally uses AMD's Ubuntu-suite repository")
+        );
     }
 
     #[test]
