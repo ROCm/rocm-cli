@@ -6,6 +6,7 @@
 **Pipeline:** standard
 **Branch:** fix-xfail-cleanup-gap
 **Jira:** EAI-7478 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7478
+**Review:** approved (rominf, follow-up addressed) + read-only pass (opencode agent)
 **Last Updated:** 2026-07-21
 
 **Token Usage:** in=494 out=130312 cache_create=1561110 cache_read=33379281 calls=250
@@ -105,6 +106,9 @@ avoid drift, per the agreed lifecycle):
   force-pushed with lease (head `1889e21`). Approval survived. Required checks queued; CodeQL already green.
 - ✅ Reopened PR #134 to retrigger CI (initial run was stuck for 3h with zero jobs dispatched).
   Fresh run `29848018755` started; approval survives reopen. Awaiting job dispatch (repo-wide Actions backlog).
+- ✅ Second review (opencode agent, read-only): ready/solid. Independently verified self-test 7/7, ruff clean,
+  real expectations.toml parses (9 live xfail bugs), EAI-7052 reproduces documented case, exit 0 always,
+  leak scan clean, no conflict markers, single logical change. No code change required.
 
 ## Next Steps
 
@@ -118,6 +122,10 @@ avoid drift, per the agreed lifecycle):
 ## Notes
 
 - Improvement/gap-closure, not a single-line fix — deliberately kept options open in both ticket and WIP.
+- **Known self-nudge (accepted):** #134's own body cites EAI-7052/EAI-7333 as illustrative examples, so the
+  xfail-hint check nudges on EAI-7052 for this very PR (which does NOT fix it). Expected under the
+  advisory + recall-over-precision stance; not a bug. Optional: a one-line note in the PR body so a reviewer
+  isn't confused — not yet added (awaiting user call; PR-body edit is shared state).
 - Inbox origin: `~/Developer/work-ledger/inbox.md` rocm-cli item 12 (from test-e2e-diagnose review, 2026-07-20).
 - Related in-flight WIP: `fix-nightly-27b-preseed` (EAI-7477) also E2E-infra; and `test-e2e-diagnose` where this was surfaced.
 
@@ -154,3 +162,7 @@ avoid drift, per the agreed lifecycle):
 - Verified PR #134 rebased to current main (1881294), mergeable, approval intact.
 - CI run stuck in queue (repo-wide Actions backlog); reopened PR to retrigger. Fresh run dispatching.
 - Ready for merge once required checks pass.
+
+### 2026-07-21 (idle flush)
+
+- Session idle for 10 minutes, auto-flushing WIP state.
