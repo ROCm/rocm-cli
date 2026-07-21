@@ -35,9 +35,6 @@ async fn user_checks_services(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
 }
 
-#[when("the user is offered the detected endpoint")]
-async fn user_offered_endpoint(_world: &mut E2eWorld) {}
-
 #[when("a chat request with tool definitions is sent")]
 async fn send_chat_with_tools(world: &mut E2eWorld) {
     let endpoint = world.endpoint.as_ref().expect("no endpoint configured");
@@ -140,20 +137,6 @@ async fn assert_model_endpoint_listed(world: &mut E2eWorld) {
     assert!(
         output.contains(&port.to_string()),
         "served model endpoint (port {port}) not found in services list:\n{output}"
-    );
-}
-
-#[then("the notice does not claim that requests leave the machine")]
-async fn assert_privacy_notice_accurate(_world: &mut E2eWorld) {
-    // The privacy notice is only shown in the interactive dash/TUI, which a
-    // black-box CLI test can't drive — so this behaviour genuinely cannot be
-    // verified here (EAI-7222). Rather than pass silently (a green no-op that
-    // tests nothing), fail: the scenario is marked xfail in expectations.toml
-    // with EAI-7222, so this failure is the *expected* outcome and the gap stays
-    // visible until the notice is exposed on a non-TUI surface.
-    panic!(
-        "privacy notice is TUI-only and cannot be verified black-box (EAI-7222); \
-         scenario is tracked as xfail"
     );
 }
 

@@ -16,11 +16,11 @@ path = "src/lib.rs"
 
 [dependencies]
 rocm-dash-core = { path = "../rocm-dash-core" }
-# Unified dashboard TUI base: ratatui 0.30 + crossterm 0.28 stay
-# confined to this crate. The frozen rocm-cli tui.rs keeps ratatui 0.29; the two
-# majors coexist in the tree, each confined to its own crate.
-# Exact wrapped-row counts must match Ratatui rendering so chat scroll bounds stay correct.
-# `line_count` is currently gated by Ratatui's unstable rendered-line-info feature.
+# Unified dashboard TUI base: ratatui 0.30 + crossterm 0.28. This is the only
+# ratatui in the workspace — the `rocm` binary no longer carries a (dead) 0.29
+# dependency, so no second major is pulled in. Exact wrapped-row counts must
+# match Ratatui rendering so chat scroll bounds stay correct; `line_count` is
+# gated by Ratatui's unstable rendered-line-info feature.
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 tokio = { version = "1", features = ["full"] }

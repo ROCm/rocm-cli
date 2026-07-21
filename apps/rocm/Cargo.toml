@@ -17,7 +17,6 @@ clap_complete.workspace = true
 crossterm.workspace = true
 flate2 = "1.1"
 keyring-core.workspace = true
-ratatui.workspace = true
 rocm-core = { path = "../../crates/rocm-core" }
 # rocm-dash unified dashboard launch. The
 # telemetry daemon + ratatui-0.30 TUI are launched from the `dash` verb; tokio

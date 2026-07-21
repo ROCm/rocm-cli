@@ -23,14 +23,6 @@
 #
 # An empty `when = {}` means "always xfail" (platform-independent bug).
 
-# --- EAI-7222: privacy notice is only shown in the interactive dash/TUI, so a
-# black-box CLI test can't verify it. Tracked as xfail (any platform) rather than
-# a silent green no-op — the step panics, which is the expected outcome here. ---
-[["chat-privacy-notice-accurate"]]
-when = {}
-bug = "EAI-7222"
-reason = "Privacy notice is TUI-only; cannot be verified by a black-box CLI test."
-
 # --- EAI-7219: short-name expansion not surfaced in serve output (any engine) ---
 [["serve-short-name-expansion"]]
 when = {}
