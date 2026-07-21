@@ -789,6 +789,11 @@ jobs:
         with:
           cache: false
 
+      # `uvx` runs the Hugging Face CLI for the weights pre-seed below. `rocm`
+      # downloads its own `uv` into an internal managed cache not on PATH, and the
+      # runner has no guaranteed system python/pip — so provision a pinned `uv`.
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+
       # `actions/checkout` runs `git clean -ffdx`, which deletes the gitignored
       # `target/` inside the repo every job → a full ~15min rebuild each run.
       # Point CARGO_TARGET_DIR at a sibling of the checkout ($RUNNER_WORKSPACE is
@@ -854,6 +859,33 @@ jobs:
             fi
           else
             echo "shared runtime already present at $E2E_SHARED_RUNTIMES_DIR — skipping pre-warm"
+          fi
+
+          # Pre-seed the large-model weights ONCE into the shared HF cache so the
+          # timed serve-large-model-inference scenario is load-only, not a ~54 GiB
+          # download. A cold pull would risk this job's 90-min cap and blows the
+          # scenario's 2400s serve window. The
+          # serve step (serving_steps.rs setup_large_gpu_model) assumes weights are
+          # already present; nothing else seeds them. Guarded like the runtime
+          # pre-warm: skip when the snapshot exists (persists across runs; weights
+          # are content-addressed/immutable, so a re-fetch is a no-op). Must use
+          # the SAME HF_HOME the harness reads (see e2e.rs isolate_cmd). hf_transfer
+          # speeds the pull; HF_TOKEN (when the secret is set) avoids anonymous HF
+          # Hub rate-limiting — degrades to anonymous for this public model when
+          # unset. This scenario is @nightly, so it only runs here on a dispatch
+          # with include_nightly — gate the seed on E2E_INCLUDE_NIGHTLY so a normal
+          # per-PR run never pays the one-time ~54 GiB pull for a scenario it skips.
+          model_cache="$E2E_SHARED_CACHE_DIR/huggingface/hub/models--Qwen--Qwen3.6-27B"
+          if [ -z "$E2E_INCLUDE_NIGHTLY" ]; then
+            echo "nightly scenarios not included — skipping 27B weights pre-seed"
+          elif [ ! -d "$model_cache" ]; then
+            echo "pre-seeding Qwen/Qwen3.6-27B weights (first run on this runner)…"
+            HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
+            HF_HUB_ENABLE_HF_TRANSFER=1 \
+            HF_TOKEN="${{ secrets.HF_TOKEN }}" \
+              uvx --from "huggingface_hub[hf_transfer]" hf download Qwen/Qwen3.6-27B
+          else
+            echo "27B weights already present at $model_cache — skipping pre-seed"
           fi
 
           # TEMP: optional scenario-name filter for a scoped probe dispatch (same
