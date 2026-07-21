@@ -9,7 +9,7 @@ SPDX-License-Identifier: MIT
 ## Application
 
 - **Name**: rocm-cli
-- **Version**: 0.3.0
+- **Version**: 0.1.0
 - **License**: MIT
 - **Copyright**: Copyright Advanced Micro Devices, Inc.
 - **Repository**: https://github.com/ROCm/rocm-cli
