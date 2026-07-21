@@ -136,3 +136,5 @@ avoid drift, per the agreed lifecycle):
   Self-test, ruff, YAML all pass.
 - 1Password launched, committed signed+DCO (`47e74a2`), pushed. CodeQL re-run confirmed all 4 CI checks green.
   Alert 742 cleared. PR #134 review-ready.
+
+**2026-07-21 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
