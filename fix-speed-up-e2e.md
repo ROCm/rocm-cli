@@ -2,10 +2,10 @@
 
 # WIP: Speed up E2E test suite
 
-**Stage:** 6-implementing — STAGED TASK, NOT done (PR #126 shipped; Tasks #2–#4 in PR #128, review fix pushed `4cd2c53`, awaiting volen-silo re-review; Tasks #5–#11 remain)
+**Stage:** 6-implementing — STAGED TASK, NOT done (PR #126 + PR #128 both MERGED; Tasks #1–#4 done; Tasks #5–#11 remain — re-branch in place for the mock/real split)
 **Pipeline:** standard
-**Branch:** test-e2e-smallest-serve-model (was fix-speed-up-e2e; re-branched off fresh main for Task #3 chunk)
-**Last Updated:** 2026-07-17
+**Branch:** (next chunk) re-branch off fresh main for Tasks #5–#7. Shipped so far: test-e2e-smallest-serve-model (PR #128, merged), fix-speed-up-e2e (PR #126, merged)
+**Last Updated:** 2026-07-21
 
 **Token Usage:** in=1006 out=301808 cache_create=5512288 cache_read=94907267 calls=509
 
@@ -93,6 +93,13 @@ leverage. Tasks #8–#9 are smaller/independent.
   doc-comment on host_serve_target: smallest model that satisfies the assertion; floors
   vLLM 0.5B / lemonade 0.6B; large-model = `@nightly` only. Gate green (clippy + ws tests).
 
+- ✅ **Tasks #2–#4 SHIPPED: PR #128 MERGED** into main (squash `73e0fd1`, 2026-07-20
+  ~15:58 CEST). Final landed model = **Qwen3.5-0.8B** on the vLLM `host_serve_target`
+  path (evolved 1.5B→0.5B→scoped→0.8B across review). rominf APPROVED; volen-silo's
+  CHANGES_REQUESTED dismissed. All blocking checks green; only non-blocking
+  `E2E tests (GPU)` red (pre-existing continue-on-error lane). Also merged around it:
+  PR #127 (diagnose, squash `8f67d4a`) and the GPU-required probe PR #121.
+
 **Fewer real serves — mock/real split (Tasks #5–#7, biggest structural win):**
 - 📋 Task #5 — Classify every `@requires-gpu` scenario: genuinely-needs-real-inference vs
   only-tests-CLI-behavior. Hypothesis (validate against assertions): MUST be real =
@@ -135,10 +142,13 @@ capture more cleanly. **Capacity** = user adds hardware when available (near-max
 
 ## Next Steps
 
-- **PR #128 (Tasks #2–#4):** decision was SMALLEST (user). Review fix `4cd2c53` pushed (scoped swap). Awaiting: volen-silo re-review to clear CHANGES_REQUESTED + GPU CI lane (real verdict for the 0.5B serve on vLLM). Can't self-dismiss a bot review.
-- Task #1 (merged PR #126) done; diagnose coverage in [[test-e2e-diagnose]] (PR #127). Remaining new work = Tasks #5–#11.
+- **PR #128 (Tasks #2–#4) MERGED** (squash `73e0fd1`, 2026-07-20). Tasks #1–#4 all done.
+- **Re-branch in place** for the next chunk (Tasks #5–#7): `git checkout main && git pull &&
+  git checkout -b <task5-7-branch>` off fresh main, update Branch field. Do NOT keep
+  committing on the merged `test-e2e-smallest-serve-model`.
 - **Biggest structural win Tasks #5–#7:** mock/real split — classify `@requires-gpu` scenarios, build a faithful mock serve engine, migrate mockable ones off GPU.
 - **Schedule Tasks #8–#9:** gate heavy serve matrix to `merge_group` + narrow serve paths-filter (prereq: fix Strix-Windows flake first).
+- Task #11 (dry-run panic) still to be filed separately.
 
 ## Checklist
 
@@ -164,6 +174,18 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persist-app-dev-ci
 - Recreate with: `create_worktree.sh fix-speed-up-e2e`
 
 ## Work Log
+
+### 2026-07-21 — PR #128 verified MERGED; Tasks #2–#4 done, re-branch pending for #5–#11
+
+- **Live check (git fetch + gh):** PR #128 state MERGED, squash `73e0fd1` on main
+  (2026-07-20 15:58 CEST). Final landed subject "serve Qwen3.5 0.8B on shared vLLM path":
+  the model evolved past my local `4cd2c53` (1.5B→0.5B→scoped→**0.8B**) via extra commits
+  I don't have locally. rominf APPROVED, volen-silo DISMISSED. Blocking checks all green;
+  only `E2E tests (GPU)` red = pre-existing non-blocking continue-on-error lane.
+- **Also confirmed merged:** PR #127 diagnose (squash `8f67d4a`), GPU-required probe #121.
+- **Local branch `test-e2e-smallest-serve-model` HEAD `4cd2c53` is now stale** (behind the
+  merged squash). Next actionable = re-branch off fresh main for Tasks #5–#7 (mock/real
+  split), per staged-task protocol. Marked Tasks #2–#4 ✅ SHIPPED in the WIP.
 
 ### 2026-07-17 — PR #128 review (volen-silo, CHANGES_REQUESTED): scoped the swap
 

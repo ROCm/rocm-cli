@@ -1,6 +1,6 @@
 # WIP: Black-box E2E cucumber testing of the dash TUI
 
-**Stage:** 2-spike-proven-pty-drives-dash-black-box
+**Stage:** 6-implementing (real PTY harness landed on branch; HEAD `9adc56c`)
 **Pipeline:** standard
 **Branch:** test-e2e-tui-cucumber
 **Last Updated:** 2026-07-20
@@ -183,16 +183,26 @@ Scenario: The user quits the dashboard
   `rocm dash --demo` black-box — open, assert screen text, send Tab, see redraw,
   quit cleanly. Determinism via `--demo`. `workspace/tui-spike/` (throwaway).
 
+### Landed on branch ✅ (HEAD `9adc56c`, 2026-07-20)
+- ✅ Driver stack decided: **portable-pty + vt100** (no expectrl). Real driver in
+  `tests/e2e-cucumber/tests/e2e/tui_driver.rs` (`TuiSession`) — supersedes the
+  throwaway `workspace/tui-spike/`.
+- ✅ Driver integrated into `E2eWorld` + dash/chat step defs
+  (`tests/e2e/dash_steps.rs`, `tests/e2e/chat_steps.rs`).
+- ✅ `features/dash.feature` + `features/chat.feature` written.
+- ✅ Determinism knobs implemented: pinned 24×80 (40×120 detail) PTY, `TERM`/
+  `COLUMNS`/`LINES`, poll-until-contains with deadline (`wait_for_screen`),
+  bounded drain, robust Drop-based cleanup (commit `9adc56c` hardened this).
+- Commits: `cdbe4d1` drive dash black-box over PTY, `4ba48c0` managed TUI
+  journeys, `9adc56c` harden PTY session cleanup.
+
 ### Todo 📋
-- 📋 Activate **bdd-scenarios** + **e2e-testing** skills; refine scenarios above.
-- 📋 Decide the driver stack (portable-pty + vt100 vs expectrl) and determinism
-  knobs (PTY size, TERM, poll-until-contains helper, `--dev-chat-mock`).
-- 📋 Add a `PtyWorld`/driver to `tests/e2e-cucumber` (or extend `E2eWorld`) +
-  Given/When/Then steps for launch / send-keys / assert-screen / quit.
-- 📋 Write a new `dash.feature`; tag appropriately (mock-runnable, blocking).
-- 📋 Wire into `cargo xtask e2e` selections + CI (mock tier, hosted OS matrix).
-- 📋 Revisit EAI-7220 / EAI-7222: convert to real e2e scenarios where now possible.
+- 📋 Confirm wired into `cargo xtask e2e` selections + CI (mock tier, hosted OS
+  matrix); verify Windows gating (`@requires-os`) decision.
+- 📋 Revisit EAI-7220 / EAI-7222: confirm they're now real e2e scenarios.
 - 📋 Keep `dash_journeys.rs` seam tests (complementary, not replaced).
+- ✅ Deleted throwaway `workspace/tui-spike/` (2026-07-20) — fully absorbed.
+- 📋 Run the suite in the Linux container gate before any push.
 
 ## Next Steps
 
@@ -228,16 +238,20 @@ since the value is a BLOCKING mock-tier gate.
 
 ## Worktree Context
 
-**Worktree directory**: not created yet (branch is `0-idea`; no code yet).
+**Worktree directory**: `~/Developer/rocm-cli-wt/test-e2e-tui-cucumber` (active).
 - Recreate with: `create_worktree.sh test-e2e-tui-cucumber`
 
 ## Work Log
 
 ### 2026-07-20
 
-- Session start: reviewed WIP status, oriented to spike-proven stage.
-- Confirmed spike approach (portable-pty + vt100) is viable and proven by hand.
-- Next: activate bdd-scenarios skill + refine draft scenarios before implementation phase.
+- Pulled branch: fast-forward `74ee17d` → `9adc56c` (3 new commits). The real PTY
+  harness the WIP had only *planned* is now on the branch — `tui_driver.rs`
+  (`TuiSession`, 364 lines), `dash_steps.rs`, `dash.feature`, `chat.feature`.
+- Stage moved 2 → 6-implementing. Todo list rewritten to reflect landed vs left.
+- Compared the throwaway spike (`workspace/tui-spike/src/main.rs`) against the
+  landed driver — spike's approach fully absorbed and hardened.
+- (earlier) Session start: reviewed WIP status, oriented to spike-proven stage.
 
 ### 2026-07-14
 
