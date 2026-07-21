@@ -4,9 +4,9 @@
 **Pipeline:** standard
 **Branch:** fix-xpass-non-fatal-flaky (worktree active)
 **Jira:** EAI-7456 (In Progress, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-17 (idle flush)
+**Last Updated:** 2026-07-21
 
-**Token Usage:** in=402 out=91813 cache_create=953594 cache_read=23617635 calls=183
+**Token Usage:** in=806 out=184814 cache_create=2139870 cache_read=47360294 calls=368
 
 ---
 
@@ -71,6 +71,7 @@ Scenario: Non-flaky XPASS remains fatal
 - ✅ Added 5 unit tests (flaky parse/default, flaky-XPASS non-fatal, non-flaky-XPASS fatal, unexpected-FAIL always fatal, all-expected clean). `cargo test --lib` green (18 passed); clippy clean.
 
 ### Todo 📋
+- 📋 **READY TO COMMIT** — Code complete, all tests green, container gate green (exit 0, full mock E2E ran in Linux binary, reconciliation printed correctly).
 - 📋 Commit + push, open PR (separate, per delivery decision).
 - 📋 EAI-7455 lemonade-Windows entries: N/A here — they live on `fix-e2e-share-lemonade-engine`; that branch marks them flaky after this lands.
 
@@ -131,5 +132,8 @@ Scenario: Non-flaky XPASS remains fatal
 - Container gate (`container-test.sh all`) re-run with warm 397M cargo cache from sibling worktree — **GREEN** (exit 0). Full mock E2E suite ran in Linux binary; reconciliation printed: `4 xfail (failed as expected), 0 XPASS (0 flaky, non-fatal), 0 unexpected failure(s)`. Code verified.
 - Ready: commit + push + open PR (separate, per recommendation).
 
-**2026-07-17 (idle flush):**
-- Session idle for 10 minutes, auto-flushing WIP state.
+### 2026-07-21
+
+- **Implementation complete**: 3 files (+211/-38), `flaky` field in `XfailEntry` + `Expectation::ExpectXfail`, extracted pure `reconcile()`/`Reconciliation` in expectation.rs, e2e.rs exit decision refactored to use it.
+- **Verification**: 5 unit tests (parse/default/fatal logic), `cargo test --lib` 18 passed, clippy clean, container gate green (exit 0, warm `.cargo-container` 397M from sibling, full mock E2E suite ran in Linux binary, reconciliation printed correctly: `4 xfail, 0 XPASS (0 flaky, non-fatal), 0 unexpected failure(s)`).
+- **Status**: Code ready to commit/push/open PR (separate, per delivery decision). EAI-7456 In Progress, assigned Fredrik.
