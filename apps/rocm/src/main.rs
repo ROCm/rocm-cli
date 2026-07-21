@@ -4212,8 +4212,12 @@ fn serve(args: ServeArgs) -> Result<()> {
         // An equivalent service was already running, so nothing was spawned and the
         // freshly generated key is unused — drop it rather than leave it orphaned in
         // storage. The existing service keeps its own key.
-        if report.already_running && endpoint_auth.is_some() {
-            endpoint_keys::clear_endpoint_api_key(&paths, &service_id);
+        if report.already_running {
+            drop_orphaned_endpoint_key_on_already_running(
+                &paths,
+                &service_id,
+                endpoint_auth.as_deref(),
+            );
         }
         // Safe to move `endpoint_auth` here: this branch always returns, so the
         // fall-through (attached) path below never observes it moved.
@@ -4361,6 +4365,21 @@ fn resolve_endpoint_auth(host: &str, supplied: Option<&str>) -> Result<Option<St
             Ok(Some(trimmed.to_owned()))
         }
         None => Ok(Some(rocm_core::generate_endpoint_api_key())),
+    }
+}
+
+/// When an equivalent managed service is already running, the endpoint key
+/// serve() freshly stored for this attempt is unused — drop it so it is not
+/// orphaned in storage. The already-running service keeps its own key.
+/// Best-effort and idempotent; a loopback attempt (`freshly_stored == None`)
+/// is a no-op.
+fn drop_orphaned_endpoint_key_on_already_running(
+    paths: &AppPaths,
+    service_id: &str,
+    freshly_stored: Option<&str>,
+) {
+    if freshly_stored.is_some() {
+        endpoint_keys::clear_endpoint_api_key(paths, service_id);
     }
 }
 
@@ -4898,6 +4917,7 @@ fn run_attached_service(
             println!("  status: {}", report.status);
             println!("  logs: rocm logs {}", report.service_id);
             println!("  stop: rocm services stop {} --yes", report.service_id);
+            drop_orphaned_endpoint_key_on_already_running(&paths, service_id, endpoint_api_key);
             return Ok(());
         }
         ManagedSpawn::Spawned { record, child_pid } => {
@@ -20498,6 +20518,33 @@ install therock";
             let error = resolve_endpoint_auth("0.0.0.0", Some(supplied)).unwrap_err();
             assert!(error.to_string().contains("control character"), "{error:#}");
         }
+    }
+
+    #[test]
+    fn drop_orphaned_endpoint_key_on_already_running_clears_stored_key() {
+        let (root, paths) = test_paths("drop-orphaned-key-stored");
+        let service_id = "svc-orphaned";
+        endpoint_keys::store_endpoint_api_key(&paths, service_id, "secret-key").unwrap();
+
+        drop_orphaned_endpoint_key_on_already_running(&paths, service_id, Some("secret-key"));
+
+        assert_eq!(endpoint_keys::endpoint_api_key(&paths, service_id), None);
+        assert!(!endpoint_keys::endpoint_key_file_path(&paths, service_id).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn drop_orphaned_endpoint_key_on_already_running_is_noop_for_loopback() {
+        // A loopback attempt never stores a key (`freshly_stored == None`), so the
+        // helper must not panic or error, and no file must appear.
+        let (root, paths) = test_paths("drop-orphaned-key-loopback");
+        let service_id = "svc-loopback";
+
+        drop_orphaned_endpoint_key_on_already_running(&paths, service_id, None);
+
+        assert_eq!(endpoint_keys::endpoint_api_key(&paths, service_id), None);
+        assert!(!endpoint_keys::endpoint_key_file_path(&paths, service_id).exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
