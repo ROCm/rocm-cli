@@ -3557,6 +3557,165 @@ fn detect_linux_kfd_gfx_target() -> Option<String> {
     None
 }
 
+/// AMD GPU device ordinals usable for a GPU-required launch on this host, after
+/// applying the runtime visibility mask (`HIP_VISIBLE_DEVICES`, then
+/// `ROCR_VISIBLE_DEVICES`).
+///
+/// `Some(indices)` is an authoritative answer: an empty vector means no GPU is
+/// usable, so a GPU-required launch must fail rather than fall back to CPU or
+/// assume device 0. `None` means availability could not be probed on this
+/// platform (e.g. the KFD device exists but its topology is unreadable, or a
+/// non-Linux target) and callers should not block a launch on this basis.
+#[must_use]
+pub fn usable_amd_gpu_indices() -> Option<Vec<u32>> {
+    probe_usable_amd_gpu_indices()
+}
+
+/// Whether at least one AMD GPU is usable for a GPU-required launch.
+///
+/// `false` only when the probe authoritatively reports zero usable devices; an
+/// unprobeable platform reports `true` so it does not block launches (see
+/// [`usable_amd_gpu_indices`]).
+#[must_use]
+pub fn has_usable_amd_gpu() -> bool {
+    usable_amd_gpu_indices().is_none_or(|indices| !indices.is_empty())
+}
+
+#[cfg(target_os = "linux")]
+fn probe_usable_amd_gpu_indices() -> Option<Vec<u32>> {
+    let present =
+        combine_amd_gpu_counts(linux_kfd_gpu_node_count(), linux_drm_amdgpu_card_count())?;
+    usable_amd_gpu_indices_from(present, visibility_mask_from_env())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_usable_amd_gpu_indices() -> Option<Vec<u32>> {
+    None
+}
+
+/// Combine the KFD-topology and DRM-card AMD GPU counts into one "GPUs present"
+/// figure. KFD counts *compute* nodes and is authoritative for HIP ordinals, so
+/// it wins whenever it reports at least one GPU. DRM is used only as the
+/// zero-KFD fallback: some hosts (e.g. Strix Halo APUs) enumerate the GPU only
+/// via DRM ip-discovery and report zero KFD GPU nodes, so relying on KFD alone
+/// would wrongly conclude there is no GPU and block serving.
+///
+/// DRM must not *raise* a nonzero KFD count: a display/render-only AMD DRM card
+/// with no KFD compute node (e.g. KFD=1, DRM=2) would otherwise invent a usable
+/// HIP ordinal that passes `--gpu` validation but fails later inside HIP.
+///
+/// `None` only when NEITHER surface could be read (availability truly unknown).
+#[cfg(any(target_os = "linux", test))]
+fn combine_amd_gpu_counts(kfd: Option<usize>, drm: Option<usize>) -> Option<usize> {
+    match kfd {
+        // KFD is compute-authoritative: prefer it whenever it sees a GPU.
+        Some(k) if k > 0 => Some(k),
+        // Zero KFD compute nodes: fall back to DRM for the APU shape.
+        Some(_) => Some(drm.unwrap_or(0)),
+        // KFD unreadable: use DRM if it could be read, else availability unknown.
+        None => drm,
+    }
+}
+
+/// Count AMD (`amdgpu`) primary DRM cards under `/sys/class/drm` (`card0`,
+/// `card1`, …), skipping connector sub-nodes like `card0-DP-1`. `None` when the
+/// DRM class dir can't be read; `Some(0)` when it is readable with no AMD card.
+#[cfg(target_os = "linux")]
+fn linux_drm_amdgpu_card_count() -> Option<usize> {
+    let entries = fs::read_dir(Path::new("/sys/class/drm")).ok()?;
+    let count = entries
+        .flatten()
+        .filter(|entry| {
+            let card_path = entry.path();
+            let Some(name) = card_path.file_name().and_then(|value| value.to_str()) else {
+                return false;
+            };
+            name.starts_with("card")
+                && !name.contains('-')
+                && is_amdgpu_device(&card_path.join("device"))
+        })
+        .count();
+    Some(count)
+}
+
+/// Count AMD GPU nodes in the KFD topology. `Some(0)` is an authoritative "no
+/// GPU" (topology readable with no GPU node, or no KFD device at all); `None`
+/// means the topology could not be read even though `/dev/kfd` exists, so
+/// availability is unknown and must not be treated as zero.
+#[cfg(target_os = "linux")]
+fn linux_kfd_gpu_node_count() -> Option<usize> {
+    let nodes_dir = Path::new("/sys/class/kfd/kfd/topology/nodes");
+    match fs::read_dir(nodes_dir) {
+        Ok(entries) => Some(
+            entries
+                .flatten()
+                .filter(|entry| kfd_node_is_gpu(&entry.path()))
+                .count(),
+        ),
+        Err(_) if Path::new("/dev/kfd").exists() => None,
+        Err(_) => Some(0),
+    }
+}
+
+/// A KFD topology node is a GPU (not the CPU node) when its
+/// `gfx_target_version` is a nonzero value; CPU nodes report `0`.
+#[cfg(target_os = "linux")]
+fn kfd_node_is_gpu(node_dir: &Path) -> bool {
+    fs::read_to_string(node_dir.join("gfx_target_version"))
+        .ok()
+        .is_some_and(|value| kfd_gfx_target_version_is_gpu(value.trim()))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn kfd_gfx_target_version_is_gpu(value: &str) -> bool {
+    value
+        .trim()
+        .parse::<u64>()
+        .is_ok_and(|version| version != 0)
+}
+
+/// The active GPU visibility mask, preferring `HIP_VISIBLE_DEVICES` then
+/// `ROCR_VISIBLE_DEVICES`. `None` when neither is set; an explicitly empty value
+/// is returned as `Some("")` so callers can distinguish "unset" (all visible)
+/// from "set to nothing" (all masked out).
+///
+/// Linux-only: its sole caller is the Linux probe. (Not `+ test` — no test
+/// references it directly, so compiling it into a non-Linux test build would be
+/// dead code, which the workspace lints deny.)
+#[cfg(target_os = "linux")]
+fn visibility_mask_from_env() -> Option<String> {
+    ["HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"]
+        .into_iter()
+        .find_map(std::env::var_os)
+        .map(|value| value.to_string_lossy().into_owned())
+}
+
+/// Apply a `HIP_VISIBLE_DEVICES`-style `mask` to the present device ordinals
+/// (`0..present`). `None` means no mask is set (every present device is visible).
+/// An empty value hides every device. A nonempty mask containing UUIDs or invalid
+/// ordinals returns `None`: the ordinal-only probe cannot interpret it
+/// authoritatively, so callers must not mistake it for "no GPU".
+#[cfg(any(target_os = "linux", test))]
+fn usable_amd_gpu_indices_from(present: usize, mask: Option<String>) -> Option<Vec<u32>> {
+    let Some(mask) = mask else {
+        return Some((0..present as u32).collect());
+    };
+    if mask.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut visible = Vec::new();
+    for token in mask.split(',') {
+        let index = token.trim().parse::<u32>().ok()?;
+        if (index as usize) >= present {
+            return None;
+        }
+        if !visible.contains(&index) {
+            visible.push(index);
+        }
+    }
+    Some(visible)
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn parse_linux_kfd_gfx_target(value: &str) -> Option<String> {
     if let Some(token) = extract_first_gfx_token(value) {
@@ -8223,5 +8382,78 @@ last_installed_runtime_id = "therock-release"
         assert!(!paths.config_path().is_file());
         let _ = fs::remove_dir_all(&root);
         Ok(())
+    }
+
+    #[test]
+    fn kfd_gfx_target_version_distinguishes_gpu_from_cpu_nodes() {
+        // CPU topology nodes report a zero gfx target version; GPU nodes report a
+        // nonzero one.
+        assert!(!kfd_gfx_target_version_is_gpu("0"));
+        assert!(!kfd_gfx_target_version_is_gpu(""));
+        assert!(!kfd_gfx_target_version_is_gpu("not-a-number"));
+        assert!(kfd_gfx_target_version_is_gpu("90402"));
+        assert!(kfd_gfx_target_version_is_gpu("110000"));
+    }
+
+    #[test]
+    fn combine_amd_gpu_counts_prefers_compute_authoritative_kfd() {
+        // KFD is compute-authoritative: a nonzero KFD count wins, and DRM must not
+        // raise it. A display/render-only AMD DRM card (KFD=1, DRM=2) must NOT
+        // invent a second usable HIP ordinal, or an explicit `--gpu 1` would pass
+        // validation and then fail inside HIP.
+        assert_eq!(combine_amd_gpu_counts(Some(1), Some(2)), Some(1));
+        // Same principle with more DRM cards: still bounded by the KFD count.
+        assert_eq!(combine_amd_gpu_counts(Some(2), Some(8)), Some(2));
+        // KFD larger than DRM (e.g. multi-partition compute nodes): KFD still wins.
+        assert_eq!(combine_amd_gpu_counts(Some(3), Some(1)), Some(3));
+        // Strix Halo shape: KFD reports 0 GPU nodes, DRM sees the iGPU → 1 present.
+        assert_eq!(combine_amd_gpu_counts(Some(0), Some(1)), Some(1));
+        // Discrete GPUs: both surfaces agree.
+        assert_eq!(combine_amd_gpu_counts(Some(8), Some(8)), Some(8));
+        // One surface unreadable → use the other.
+        assert_eq!(combine_amd_gpu_counts(None, Some(1)), Some(1));
+        assert_eq!(combine_amd_gpu_counts(Some(2), None), Some(2));
+        // Neither readable → unknown (caller must not treat as zero).
+        assert_eq!(combine_amd_gpu_counts(None, None), None);
+        // Both agree on zero → authoritative no-GPU.
+        assert_eq!(combine_amd_gpu_counts(Some(0), Some(0)), Some(0));
+    }
+
+    #[test]
+    fn usable_gpu_indices_unset_mask_returns_all_present_devices() {
+        assert_eq!(usable_amd_gpu_indices_from(0, None), Some(Vec::new()));
+        assert_eq!(usable_amd_gpu_indices_from(1, None), Some(vec![0]));
+        assert_eq!(usable_amd_gpu_indices_from(3, None), Some(vec![0, 1, 2]));
+    }
+
+    #[test]
+    fn usable_gpu_indices_empty_mask_hides_every_device() {
+        // The masked-device path: GPUs are present but fully masked out.
+        assert_eq!(
+            usable_amd_gpu_indices_from(2, Some(String::new())),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn usable_gpu_indices_honors_valid_ordinal_masks() {
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, Some("2,0".to_owned())),
+            Some(vec![2, 0])
+        );
+        // Duplicates are collapsed.
+        assert_eq!(
+            usable_amd_gpu_indices_from(2, Some("1,1".to_owned())),
+            Some(vec![1])
+        );
+    }
+
+    #[test]
+    fn usable_gpu_indices_treats_unsupported_masks_as_unprobeable() {
+        assert_eq!(usable_amd_gpu_indices_from(2, Some("0,5".to_owned())), None);
+        assert_eq!(
+            usable_amd_gpu_indices_from(2, Some("GPU-deadbeef".to_owned())),
+            None
+        );
     }
 }

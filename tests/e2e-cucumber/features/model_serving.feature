@@ -101,3 +101,31 @@ Feature: Model serving
     And a model is being served on GPU
     When the CLI reports the service as ready
     Then an inference request succeeds immediately
+
+  # GPU-required enforcement (EAI-7400). Under the GPU-required default, a host
+  # with no usable AMD GPU must refuse to serve — before any engine is prepared or
+  # launched — with an actionable message, never a CPU or device-0 fallback. Runs
+  # on the no-GPU mock host, so it gates every PR (@requires-no-gpu, no GPU needed).
+  @id:serve-no-gpu-fails-fast @requires-no-gpu
+  Scenario: 11 - Serving is refused on a host with no AMD GPU
+    When the user serves a model under the GPU-required default
+    Then serving is refused before any engine starts
+    And the user is told no AMD GPU was detected
+
+  # The masked-device path: on a real GPU host where every device is hidden, the
+  # GPU-required serve must treat it as "no GPU" and refuse, not fall back. Runs on
+  # GPU hardware (Strix Halo / Instinct).
+  @id:serve-masked-devices-fail @requires-gpu @requires-os:linux
+  Scenario: 12 - Serving is refused when every GPU is masked from view
+    When the user serves a model with every GPU masked from view
+    Then serving is refused before any engine starts
+    And the user is told no AMD GPU was detected
+
+  # Honest device selection: a `--gpu` index that does not exist on the host is
+  # rejected outright, never silently remapped to another device (no device-0
+  # fallback). Runs on GPU hardware.
+  @id:serve-absent-gpu-index-rejected @requires-gpu @requires-os:linux
+  Scenario: 13 - Serving pinned to a GPU that does not exist is refused
+    When the user serves a model pinned to a GPU index that does not exist
+    Then serving is refused before any engine starts
+    And the user is told that GPU index is unavailable

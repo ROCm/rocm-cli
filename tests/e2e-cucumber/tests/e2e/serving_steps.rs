@@ -497,6 +497,45 @@ async fn user_sends_completion(world: &mut E2eWorld) {
     crate::send_chat(world).await;
 }
 
+/// Serve under the GPU-required default (no `--device`), pinning the engine to the
+/// host's effective serve engine so the serve reaches GPU enforcement rather than
+/// tripping on engine selection.
+#[when("the user serves a model under the GPU-required default")]
+async fn user_serves_gpu_required(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["serve", model, "--engine", engine]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Serve with every GPU hidden from the CLI and engine via an empty
+/// `HIP_VISIBLE_DEVICES`, so a GPU host presents as having no usable device.
+#[when("the user serves a model with every GPU masked from view")]
+async fn user_serves_with_masked_gpus(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["serve", model, "--engine", engine],
+        &[("HIP_VISIBLE_DEVICES", "")],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Serve pinned to a GPU ordinal far beyond any real device count, so the request
+/// names a device that does not exist on the host.
+#[when("the user serves a model pinned to a GPU index that does not exist")]
+async fn user_serves_absent_gpu_index(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["serve", model, "--engine", engine, "--gpu", "99"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 #[when("the CLI reports the service as ready")]
 async fn when_cli_reports_ready(world: &mut E2eWorld) {
     // Read readiness from the CLI's own view (`services list`), not a direct
@@ -524,6 +563,51 @@ async fn assert_inference_succeeds_now(world: &mut E2eWorld) {
     assert!(
         !content.is_empty(),
         "service reported ready but inference returned no content: {resp}"
+    );
+}
+
+/// The CLI's combined stdout+stderr from the last recorded serve attempt.
+fn serve_output(world: &E2eWorld) -> String {
+    format!(
+        "{}\n{}",
+        world.cli_output.as_deref().unwrap_or(""),
+        world.cli_stderr.as_deref().unwrap_or("")
+    )
+}
+
+#[then("serving is refused before any engine starts")]
+async fn assert_serve_refused(world: &mut E2eWorld) {
+    // A non-zero exit is the observable "refused". The GPU-required pre-flight
+    // rejects the launch before any engine is prepared or spawned, so this fails
+    // fast rather than after a download or a late engine crash.
+    let rc = world.cli_rc.expect("no serve rc recorded");
+    assert!(
+        rc != 0,
+        "expected serving to be refused, but it exited 0:\n{}",
+        serve_output(world)
+    );
+}
+
+#[then("the user is told no AMD GPU was detected")]
+async fn assert_no_gpu_message(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.to_lowercase().contains("no usable amd gpu"),
+        "expected a no-AMD-GPU message, got:\n{output}"
+    );
+}
+
+#[then("the user is told that GPU index is unavailable")]
+async fn assert_absent_index_message(world: &mut E2eWorld) {
+    let output = serve_output(world).to_lowercase();
+    // The named index must appear alongside an unavailability reason — whether the
+    // CLI rejects it against the detected count ("out of range") or the engine's
+    // probe rejects it ("not available") on a host where amd-smi can't count.
+    assert!(
+        output.contains("99")
+            && (output.contains("out of range") || output.contains("not available")),
+        "expected the absent GPU index to be reported unavailable, got:\n{}",
+        serve_output(world)
     );
 }
 
