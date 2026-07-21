@@ -4,7 +4,7 @@
 **Pipeline:** standard
 **Branch:** fix-xpass-non-fatal-flaky (worktree active)
 **Jira:** EAI-7456 (In Progress, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-21
+**Last Updated:** 2026-07-21 (idle flush)
 
 **Token Usage:** in=806 out=184814 cache_create=2139870 cache_read=47360294 calls=368
 
@@ -137,3 +137,5 @@ Scenario: Non-flaky XPASS remains fatal
 - **Implementation complete**: 3 files (+211/-38), `flaky` field in `XfailEntry` + `Expectation::ExpectXfail`, extracted pure `reconcile()`/`Reconciliation` in expectation.rs, e2e.rs exit decision refactored to use it.
 - **Verification**: 5 unit tests (parse/default/fatal logic), `cargo test --lib` 18 passed, clippy clean, container gate green (exit 0, warm `.cargo-container` 397M from sibling, full mock E2E suite ran in Linux binary, reconciliation printed correctly: `4 xfail, 0 XPASS (0 flaky, non-fatal), 0 unexpected failure(s)`).
 - **Status**: Code ready to commit/push/open PR (separate, per delivery decision). EAI-7456 In Progress, assigned Fredrik.
+
+**2026-07-21 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
