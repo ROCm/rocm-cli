@@ -40,13 +40,14 @@ Feature: Model serving
     Then the response contains a model reply
     And the response identifies the correct model
 
-  # Large-model coverage (dogfooding W9): serve a big vLLM model end-to-end at
-  # least once. Qwen/Qwen3.6-27B (BF16, ~54 GiB) fits a single MI300X; pinned to
-  # vLLM so in our fleet it runs only there (Strix Halo is lemonade / too little
-  # VRAM). A cold load of ~54 GiB far exceeds the 600s default, so the scenario
-  # declares a longer serve-readiness timeout. Confirmed working on app-dev MI300X.
-  @id:serve-large-model-inference @requires-gpu @requires-engine:vllm @serve-timeout:2400 @nightly
-  Scenario: 10 - A large vLLM model serves and responds to inference
+  # Large-model coverage (dogfooding W9): serve a representative large model for
+  # each GPU platform end-to-end at least once. MI300X uses Qwen/Qwen3.6-27B through
+  # vLLM; Strix Halo uses the hardware-verified
+  # unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL checkpoint through Lemonade. These slow
+  # loads stay off the ordinary per-PR path, and the longer readiness timeout also
+  # gives the first inference request enough time to complete.
+  @id:serve-large-model-inference @requires-gpu @serve-timeout:2400 @nightly
+  Scenario: 10 - A large platform-specific model serves and responds to inference
     Given a managed runtime is active
     And a large model is being served on GPU
     When the user sends a chat completion request
