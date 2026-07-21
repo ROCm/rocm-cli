@@ -4,9 +4,9 @@
 **Pipeline:** standard
 **Branch:** fix-xpass-non-fatal-flaky (worktree active)
 **Jira:** EAI-7456 (In Progress, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-21 (idle flush)
+**Last Updated:** 2026-07-21
 
-**Token Usage:** in=806 out=184814 cache_create=2139870 cache_read=47360294 calls=368
+**Token Usage:** in=818 out=187516 cache_create=2517152 cache_read=48086994 calls=374
 
 ---
 
@@ -69,9 +69,9 @@ Scenario: Non-flaky XPASS remains fatal
 - ✅ Extracted the exit classification into a pure `reconcile()` + `Reconciliation` (with `is_fatal()`) in `src/expectation.rs`; `tests/e2e.rs` now calls it. Flaky XPASS printed as "(flaky, non-fatal)" and excluded from exit-1; non-flaky XPASS + unexpected-FAIL stay fatal.
 - ✅ Marked EAI-7333 vLLM entries (`serve-vllm-inference`, `serve-readiness-contract`) `flaky = true`, with grammar doc in the toml header.
 - ✅ Added 5 unit tests (flaky parse/default, flaky-XPASS non-fatal, non-flaky-XPASS fatal, unexpected-FAIL always fatal, all-expected clean). `cargo test --lib` green (18 passed); clippy clean.
+- ✅ Container gate green (exit 0, full mock E2E suite ran, reconciliation line correct). Code reviewed LGTM.
 
 ### Todo 📋
-- 📋 **READY TO COMMIT** — Code complete, all tests green, container gate green (exit 0, full mock E2E ran in Linux binary, reconciliation printed correctly).
 - 📋 Commit + push, open PR (separate, per delivery decision).
 - 📋 EAI-7455 lemonade-Windows entries: N/A here — they live on `fix-e2e-share-lemonade-engine`; that branch marks them flaky after this lands.
 
@@ -138,4 +138,6 @@ Scenario: Non-flaky XPASS remains fatal
 - **Verification**: 5 unit tests (parse/default/fatal logic), `cargo test --lib` 18 passed, clippy clean, container gate green (exit 0, warm `.cargo-container` 397M from sibling, full mock E2E suite ran in Linux binary, reconciliation printed correctly: `4 xfail, 0 XPASS (0 flaky, non-fatal), 0 unexpected failure(s)`).
 - **Status**: Code ready to commit/push/open PR (separate, per delivery decision). EAI-7456 In Progress, assigned Fredrik.
 
-**2026-07-21 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+**2026-07-21 (final verification):**
+- Reviewed by opencode: reconcile() pure fn, 4-bucket logic, flaky defaults false via serde(default), TOML run IDs cited. BTreeMap clone noted (minor, intentional for testability).
+- All gates passed: unit tests (18), clippy, container gate (full mock E2E, exit 0). Ready to commit/push/PR.
