@@ -12907,12 +12907,9 @@ fn restart_internal_managed_service(
 }
 
 fn validate_service_id(service_id: &str) -> Result<()> {
-    if service_id.trim().is_empty() {
-        bail!("service id must not be empty");
-    }
-    if service_id.contains('/') || service_id.contains('\\') {
-        bail!("service id must not contain path separators");
-    }
+    // Single source of truth for what makes an id safe as a filesystem path
+    // component (rejects empty, path separators, `..`, control chars).
+    rocm_core::ServiceId::new(service_id)?;
     Ok(())
 }
 

@@ -3358,9 +3358,10 @@ fn local_webhook_event_from_request(
     }
     let service_id = request.service_id.as_deref().map(str::trim);
     if let Some(service_id) = service_id
-        && (service_id.contains('/') || service_id.contains('\\'))
+        && !service_id.is_empty()
     {
-        bail!("service_id must not contain path separators");
+        rocm_core::ServiceId::new(service_id)
+            .with_context(|| format!("invalid service_id `{service_id}`"))?;
     }
     match watcher_hint {
         "server-recover" if service_id.unwrap_or_default().is_empty() => {
@@ -4728,9 +4729,8 @@ fn endpoint_service_recovery_reason(record: &ManagedServiceRecord) -> Option<Str
 }
 
 fn load_service_record(paths: &AppPaths, service_id: &str) -> Result<ManagedServiceRecord> {
-    if service_id.trim().is_empty() || service_id.contains('/') || service_id.contains('\\') {
-        bail!("invalid managed service id `{service_id}`");
-    }
+    rocm_core::ServiceId::new(service_id)
+        .with_context(|| format!("invalid managed service id `{service_id}`"))?;
     let manifest_path = paths.service_manifest_path(service_id);
     let bytes = fs::read(&manifest_path).with_context(|| {
         format!(

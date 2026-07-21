@@ -90,11 +90,22 @@ pub fn endpoint_api_key_from_file(path: &std::path::Path) -> Option<String> {
 /// [`ENDPOINT_API_KEY_FILE_ENV`] onto engine children it spawns for daemon
 /// recovery and healthchecks) — derive the same path without either depending
 /// on the other's private modules.
+///
+/// Callers must pass a validated id (see [`rocm_core::ServiceId`]); as
+/// defense-in-depth this asserts the built path is a direct child of the
+/// services directory, so a stray separator or `..` in `service_id` fails
+/// closed here rather than silently escaping the directory.
 #[must_use]
 pub fn endpoint_key_file_path(paths: &rocm_core::AppPaths, service_id: &str) -> PathBuf {
-    paths
-        .services_dir()
-        .join(format!("{service_id}.endpoint-key"))
+    let services_dir = paths.services_dir();
+    let path = services_dir.join(format!("{service_id}.endpoint-key"));
+    assert_eq!(
+        path.parent(),
+        Some(services_dir.as_path()),
+        "endpoint key path must be a direct child of the services directory; \
+         got service id {service_id:?}"
+    );
+    path
 }
 
 /// The key file path if it exists, for handing to an engine child via
