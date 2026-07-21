@@ -140,7 +140,7 @@ impl TuiSession {
         cmd.env("COLUMNS", COLS.to_string());
         cmd.env("LINES", ROWS.to_string());
 
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| format!("failed to spawn rocm under a pty: {e}"))?;
@@ -148,14 +148,21 @@ impl TuiSession {
         // would prevent the reader from seeing EOF when the child exits.
         drop(pair.slave);
 
+        // `Child` does not kill the process on drop. Reap it if either remaining
+        // fallible setup step fails before `TuiSession` takes ownership.
+        let mut reap_orphan = |error: String| -> String {
+            let _ = child.kill();
+            let _ = child.wait();
+            error
+        };
         let reader = pair
             .master
             .try_clone_reader()
-            .map_err(|e| format!("failed to clone pty reader: {e}"))?;
+            .map_err(|e| reap_orphan(format!("failed to clone pty reader: {e}")))?;
         let writer = pair
             .master
             .take_writer()
-            .map_err(|e| format!("failed to take pty writer: {e}"))?;
+            .map_err(|e| reap_orphan(format!("failed to take pty writer: {e}")))?;
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, 0)));
         let reader_stop = Arc::new(AtomicBool::new(false));
