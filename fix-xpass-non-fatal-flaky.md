@@ -4,7 +4,7 @@
 **Pipeline:** standard
 **Branch:** fix-xpass-non-fatal-flaky (worktree active)
 **Jira:** EAI-7456 (In Progress, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-21
+**Last Updated:** 2026-07-21 (idle flush)
 
 **Token Usage:** in=818 out=187516 cache_create=2517152 cache_read=48086994 calls=374
 
@@ -141,3 +141,5 @@ Scenario: Non-flaky XPASS remains fatal
 **2026-07-21 (final verification):**
 - Reviewed by opencode: reconcile() pure fn, 4-bucket logic, flaky defaults false via serde(default), TOML run IDs cited. BTreeMap clone noted (minor, intentional for testability).
 - All gates passed: unit tests (18), clippy, container gate (full mock E2E, exit 0). Ready to commit/push/PR.
+
+**2026-07-21 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
