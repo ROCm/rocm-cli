@@ -2603,6 +2603,14 @@ fn stop_managed_service(paths: &AppPaths, service_id: &str) -> Result<Value> {
     let force_signaled_pids = force_terminate_remaining_processes(&signaled_pids)?;
     record.status = "stopped".to_owned();
     record.write()?;
+    // Best-effort and idempotent: a missing key file is not an error, so this
+    // is safe to call unconditionally on every stop (including loopback
+    // services that never had a key, and repeated stops of an already-stopped
+    // service). Leaving the 0600 key file behind after stop would strand a
+    // plaintext secret on disk for a service that no longer exists.
+    let _ = std::fs::remove_file(rocm_engine_protocol::endpoint_key_file_path(
+        paths, service_id,
+    ));
     Ok(json!({
         "service": record,
         "signaled_pids": signaled_pids,
@@ -7846,6 +7854,98 @@ mod tests {
                     .iter()
                     .any(|pid| pid.as_u64() == Some(u64::from(current_pid))))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_managed_service_removes_endpoint_key_file() -> Result<()> {
+        let (root, paths) = temp_app_paths("stop-removes-endpoint-key");
+        paths.ensure()?;
+        let current_pid = std::process::id();
+        let service_id = "svc-endpoint-key-stop";
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            service_id,
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "0.0.0.0",
+            11435,
+            "managed",
+            current_pid,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = Some(current_pid);
+        record.status = "ready".to_owned();
+        record.write()?;
+
+        let key_path = rocm_engine_protocol::endpoint_key_file_path(&paths, service_id);
+        fs::create_dir_all(paths.services_dir())?;
+        fs::write(&key_path, "secret-key")?;
+        assert!(key_path.exists());
+
+        let result = stop_managed_service(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let value = result?;
+        assert_eq!(
+            value
+                .get("service")
+                .and_then(|service| service.get("status"))
+                .and_then(Value::as_str),
+            Some("stopped")
+        );
+        assert!(
+            !key_path.exists(),
+            "endpoint key file must be removed after stop"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_managed_service_without_endpoint_key_file_succeeds() -> Result<()> {
+        let (root, paths) = temp_app_paths("stop-no-endpoint-key");
+        paths.ensure()?;
+        let current_pid = std::process::id();
+        let service_id = "svc-no-endpoint-key-stop";
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            service_id,
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11435,
+            "managed",
+            current_pid,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = Some(current_pid);
+        record.status = "ready".to_owned();
+        record.write()?;
+
+        // Loopback service: no endpoint key file was ever written for it.
+        let key_path = rocm_engine_protocol::endpoint_key_file_path(&paths, service_id);
+        assert!(!key_path.exists());
+
+        let result = stop_managed_service(&paths, service_id);
+        let reloaded = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let value = result?;
+        assert_eq!(
+            value
+                .get("service")
+                .and_then(|service| service.get("status"))
+                .and_then(Value::as_str),
+            Some("stopped")
+        );
+        assert_eq!(reloaded?.status, "stopped");
+        assert!(!key_path.exists());
         Ok(())
     }
 
