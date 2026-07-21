@@ -6,9 +6,9 @@
 **Pipeline:** standard
 **Branch:** fix-xfail-cleanup-gap
 **Jira:** EAI-7478 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7478
-**Last Updated:** 2026-07-21 (idle flush)
+**Last Updated:** 2026-07-21
 
-**Token Usage:** in=430 out=118011 cache_create=864382 cache_read=28486394 calls=218
+**Token Usage:** in=490 out=129710 cache_create=1206044 cache_read=33379281 calls=248
 
 ---
 
@@ -79,7 +79,7 @@ avoid drift, per the agreed lifecycle):
 ## Implementation Steps
 
 ### Todo 📋
-- 📋 Await CI completion on rebased head `1889e21` (current with main, required checks queued)
+- 📋 Resolve CI dispatch backlog (Actions repo-wide, not branch-specific); merge when checks pass
 
 ### Done ✅
 - ✅ Added `.github/pull_request_template.md` (single ticket-neutral xfail-cleanup checkbox)
@@ -103,11 +103,13 @@ avoid drift, per the agreed lifecycle):
 - ✅ Fixed reviewer follow-up: guard expectations.toml read in main(), exit 0 if absent (never-fail).
   Self-test + ruff green. Rebased 3 commits onto latest main (1881294 after PR #132 merged), re-signed,
   force-pushed with lease (head `1889e21`). Approval survived. Required checks queued; CodeQL already green.
+- ✅ Reopened PR #134 to retrigger CI (initial run was stuck for 3h with zero jobs dispatched).
+  Fresh run `29848018755` started; approval survives reopen. Awaiting job dispatch (repo-wide Actions backlog).
 
 ## Next Steps
 
-- Await CI completion on head `1889e21` (required checks queued; CodeQL already green).
-- Merge once all checks pass.
+- Await job dispatch on fresh run `29848018755` (repo-wide Actions backlog).
+- Merge once all required checks pass.
 
 ## Blockers / Open Questions
 
@@ -144,7 +146,5 @@ avoid drift, per the agreed lifecycle):
   Verified missing-file case exits 0; self-test + ruff green.
 - Rebased 3 commits onto latest main after PR #132 merged (1881294). Re-signed all, force-pushed with lease.
   Approval survived. Head now `1889e21`, up-to-date with main, required checks queued.
-
-### 2026-07-21 (idle flush)
-
-- **Session idle for 10 minutes, auto-flushing WIP state.**
+- CI run stuck (0 jobs dispatched for 3h across repo). Closed + reopened PR to retrigger. Fresh run started.
+  Awaiting Actions job dispatch (repo-wide backlog, not branch-specific).
