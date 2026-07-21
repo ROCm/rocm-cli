@@ -74,6 +74,18 @@ local keys. Those keys are test material only; they are not trust roots.
 Installers always verify checksums. Signature verification runs when a public
 key is supplied or `ROCM_CLI_REQUIRE_SIGNATURE=1` is set.
 
+The detached `.sig` sidecar is the raw RSASSA-PKCS#1 v1.5 signature over the
+archive's SHA-256 digest, verified against the SubjectPublicKeyInfo
+(`-----BEGIN PUBLIC KEY-----`) public key. The Linux installer verifies it with
+`openssl`. The Windows installer (`install.ps1`) verifies it with the built-in
+.NET RSA APIs and has no runtime dependency on `openssl`: it parses the public
+key and calls `RSA.VerifyData` with SHA-256 and PKCS#1 v1.5 padding. This works
+on both Windows PowerShell 5.1 (.NET Framework 4.6+, which the
+`RSA.VerifyData` overload requires) and PowerShell 7+ (.NET).
+`certutil`/`certreq` are not used, because they only verify certificate-backed
+CMS/Authenticode blobs, not a raw detached signature checked against a bare
+public key.
+
 Linux:
 
 ```bash
@@ -91,8 +103,10 @@ $env:ROCM_CLI_REQUIRE_SIGNATURE = "1"
 
 Developer acceptance covers public-key path and PEM installer inputs, bad
 checksums, bad detached signatures, missing required `.sig` sidecars, and
-required-signature mode without a public key. All of those checks happen before
-activation.
+required-signature mode without a public key. Windows acceptance additionally
+runs a full signed install and a bad-signature rejection with `openssl` scrubbed
+from `PATH`, proving `install.ps1` verifies with native .NET crypto and still
+rejects invalid signatures. All of those checks happen before activation.
 
 ## WSL ROCDXG Package Verification
 

@@ -128,6 +128,56 @@ function Resolve-CommandPath {
     Fail "missing required command: $Name"
 }
 
+# Build a copy of the current process PATH with every directory that contains an
+# openssl executable removed, so a child install.ps1 cannot find openssl even if
+# the host has it installed. Proves the installer verifies signatures with native
+# crypto only, never shelling out to openssl.
+function Get-PathWithoutOpenssl {
+    $entries = @()
+    foreach ($entry in ($env:Path -split ";")) {
+        if ([string]::IsNullOrWhiteSpace($entry)) {
+            continue
+        }
+        $hasOpenssl = $false
+        foreach ($candidate in @("openssl.exe", "openssl")) {
+            if (Test-Path -LiteralPath (Join-Path $entry $candidate) -PathType Leaf) {
+                $hasOpenssl = $true
+                break
+            }
+        }
+        if (-not $hasOpenssl) {
+            $entries += $entry
+        }
+    }
+    return ($entries -join ";")
+}
+
+function Write-PinnedKeyInstaller {
+    param(
+        [string] $Destination,
+        [string] $CurrentKey,
+        [string] $NextKey
+    )
+
+    $installer = Get-Content -LiteralPath (Join-Path $RepoRoot "install.ps1") -Raw
+    foreach ($slot in @(
+        @{ Name = "Current"; Key = $CurrentKey },
+        @{ Name = "Next"; Key = $NextKey }
+    )) {
+        $pattern = '(?s)\$PinnedReleasePublicKey' + $slot.Name + ' = (?:@".*?"@|"")'
+        $replacement = '$PinnedReleasePublicKey' + $slot.Name + " = @`"`r`n" + $slot.Key.Trim() + "`r`n`"@"
+        # Constant replacement (the here-string literal contains `$` sequences, so a
+        # plain string replacement would be treated as `$`-substitutions); a
+        # MatchEvaluator returns it verbatim. It ignores the match, so no param.
+        $updated = [regex]::Replace($installer, $pattern, [System.Text.RegularExpressions.MatchEvaluator] { $replacement }, 1)
+        if ($updated -eq $installer) {
+            Fail "could not replace pinned $($slot.Name.ToLowerInvariant()) key in installer fixture"
+        }
+        $installer = $updated
+    }
+    Set-Content -LiteralPath $Destination -Value $installer -Encoding utf8
+}
+
 function Test-PathInList {
     param(
         [string] $PathList,
@@ -229,6 +279,61 @@ try {
     $pemDownloadBase = ([System.Uri]::new($PemDistDir + [System.IO.Path]::DirectorySeparatorChar)).AbsoluteUri.TrimEnd("/")
     $env:ROCM_CLI_CONFIG_DIR = $ConfigDir
 
+    # A malformed candidate key must not block a valid rotation key. Build test
+    # installer fixtures with controlled pinned-key slots because the public key
+    # override intentionally accepts only one key.
+    $malformedPublicKey = @"
+-----BEGIN PUBLIC KEY-----
+not-valid-base64
+-----END PUBLIC KEY-----
+"@
+    $validPublicKey = Get-Content -LiteralPath $signingPublicKey -Raw
+    $rotationInstaller = Join-Path $AcceptanceRoot "install-key-rotation.ps1"
+    $rotationInstallDir = Join-Path $AcceptanceRoot "key-rotation-install\bin"
+    $rotationInstallLog = Join-Path $AcceptanceRoot "key-rotation-install.log"
+    Write-PinnedKeyInstaller $rotationInstaller $malformedPublicKey $validPublicKey
+    $rotationInstallArgs = @(
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        $rotationInstaller,
+        "release",
+        "-InstallDir",
+        $rotationInstallDir,
+        "-DownloadBase",
+        $downloadBase,
+        "-NoPathUpdate"
+    )
+    Invoke-Checked "acceptance: malformed first key falls through to valid rotation key" $psExe $rotationInstallArgs $rotationInstallLog
+    if (-not (Select-String -LiteralPath $rotationInstallLog -Pattern "signature verified" -Quiet)) {
+        Fail "installer did not verify with the valid rotation key"
+    }
+    Assert-File (Join-Path $rotationInstallDir "rocm.exe")
+
+    $malformedKeysInstaller = Join-Path $AcceptanceRoot "install-malformed-keys.ps1"
+    $malformedKeysInstallDir = Join-Path $AcceptanceRoot "malformed-keys-install\bin"
+    $malformedKeysLog = Join-Path $AcceptanceRoot "malformed-keys.log"
+    Write-PinnedKeyInstaller $malformedKeysInstaller $malformedPublicKey $malformedPublicKey
+    $malformedKeysArgs = @(
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        $malformedKeysInstaller,
+        "release",
+        "-InstallDir",
+        $malformedKeysInstallDir,
+        "-DownloadBase",
+        $downloadBase,
+        "-NoPathUpdate"
+    )
+    Invoke-ExpectFailure "acceptance: all malformed keys fail deterministically" $psExe $malformedKeysArgs $malformedKeysLog
+    if (-not (Select-String -LiteralPath $malformedKeysLog -Pattern "signature verification failed" -Quiet)) {
+        Fail "installer did not report deterministic failure after all candidate keys failed"
+    }
+    Assert-Missing (Join-Path $malformedKeysInstallDir "rocm.exe")
+
     Write-Host "acceptance: default install updates user PATH"
     $originalUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
     try {
@@ -309,6 +414,77 @@ try {
     if (-not (Select-String -LiteralPath $ConfigFile -Pattern '"default_engine"\s*:\s*"lemonade"' -Quiet)) {
         Fail "installer did not seed minimal config with the expected default engine"
     }
+
+    # Regression: install.ps1 must verify the detached signature with native
+    # crypto and never depend on openssl at runtime. Run a full signed install
+    # with openssl scrubbed from PATH and confirm it still verifies and installs.
+    Write-Host "acceptance: install verifies signature with openssl absent from PATH"
+    $noOpensslInstallDir = Join-Path $AcceptanceRoot "no-openssl-install\bin"
+    $NoOpensslInstallLog = Join-Path $AcceptanceRoot "no-openssl-install.log"
+    $noOpensslInstallArgs = @(
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        (Join-Path $RepoRoot "install.ps1"),
+        "release",
+        "-InstallDir",
+        $noOpensslInstallDir,
+        "-DownloadBase",
+        $downloadBase,
+        "-SigningPublicKeyPath",
+        $signingPublicKey,
+        "-RequireSignature",
+        "-NoPathUpdate"
+    )
+    $originalProcessPath = $env:Path
+    try {
+        $env:Path = Get-PathWithoutOpenssl
+        if (Get-Command openssl -CommandType Application -ErrorAction SilentlyContinue) {
+            Fail "openssl was still on PATH after scrubbing; cannot prove openssl-free verification"
+        }
+        Invoke-Checked "acceptance: install with openssl absent" $psExe $noOpensslInstallArgs $NoOpensslInstallLog
+
+        # Invalid signatures must still fail (before activation) with openssl absent.
+        Write-Host "acceptance: reject bad signature with openssl absent from PATH"
+        $noOpensslBadSigDistDir = Join-Path $AcceptanceRoot "no-openssl-bad-sig-dist"
+        $noOpensslBadSigInstallDir = Join-Path $AcceptanceRoot "no-openssl-bad-sig-install\bin"
+        $NoOpensslBadSigLog = Join-Path $AcceptanceRoot "no-openssl-bad-sig.log"
+        New-Item -ItemType Directory -Force -Path $noOpensslBadSigDistDir | Out-Null
+        Copy-Item -LiteralPath (Join-Path $DistDir "$DistName.zip") -Destination (Join-Path $noOpensslBadSigDistDir "$DistName.zip") -Force
+        Copy-Item -LiteralPath (Join-Path $DistDir "$DistName.zip.sha256") -Destination (Join-Path $noOpensslBadSigDistDir "$DistName.zip.sha256") -Force
+        Set-Content -LiteralPath (Join-Path $noOpensslBadSigDistDir "$DistName.zip.sig") -Value "not a real signature" -Encoding ascii
+        $noOpensslBadSigDownloadBase = ([System.Uri]::new($noOpensslBadSigDistDir + [System.IO.Path]::DirectorySeparatorChar)).AbsoluteUri.TrimEnd("/")
+        $noOpensslBadSigArgs = @(
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            (Join-Path $RepoRoot "install.ps1"),
+            "release",
+            "-InstallDir",
+            $noOpensslBadSigInstallDir,
+            "-DownloadBase",
+            $noOpensslBadSigDownloadBase,
+            "-SigningPublicKeyPath",
+            $signingPublicKey,
+            "-RequireSignature",
+            "-NoPathUpdate"
+        )
+        Invoke-ExpectFailure "acceptance: bad signature install with openssl absent" $psExe $noOpensslBadSigArgs $NoOpensslBadSigLog
+    } finally {
+        $env:Path = $originalProcessPath
+    }
+    if (-not (Select-String -LiteralPath $NoOpensslInstallLog -Pattern "signature verified" -Quiet)) {
+        Fail "installer did not verify the signature with openssl absent"
+    }
+    Assert-File (Join-Path $noOpensslInstallDir "rocm.exe")
+    Assert-File (Join-Path $noOpensslInstallDir ".rocm-cli-manifest")
+    if (-not (Select-String -LiteralPath $NoOpensslBadSigLog -Pattern "signature verification failed" -Quiet)) {
+        Fail "installer did not reject a bad signature with openssl absent"
+    }
+    Assert-Missing (Join-Path $noOpensslBadSigInstallDir "rocm.exe")
+    Assert-Missing (Join-Path $noOpensslBadSigInstallDir ".rocm-cli-manifest")
 
     # With a production release key pinned in install.ps1, a release install with
     # no public key supplied falls back to that pinned trust root. The bundle here

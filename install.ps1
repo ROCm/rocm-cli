@@ -171,6 +171,178 @@ function Save-File {
     }
 }
 
+function FailSigningKeyParsing {
+    param([string] $Message)
+    throw [System.Security.Cryptography.CryptographicException]::new($Message)
+}
+
+# Decode the base64 body of a PEM block (the DER bytes) regardless of the
+# header label. openssl and `cargo xtask keygen` emit SubjectPublicKeyInfo
+# ("BEGIN PUBLIC KEY") PEM; this strips the armor and returns the raw DER.
+function Convert-PemToDer {
+    param([string] $Pem)
+
+    $lines = $Pem -split "`r?`n"
+    $body = New-Object System.Text.StringBuilder
+    $inBody = $false
+    foreach ($line in $lines) {
+        $trimmed = $line.Trim()
+        if ($trimmed -like "-----BEGIN *-----") {
+            $inBody = $true
+            continue
+        }
+        if ($trimmed -like "-----END *-----") {
+            $inBody = $false
+            continue
+        }
+        if ($inBody -and -not [string]::IsNullOrWhiteSpace($trimmed)) {
+            [void] $body.Append($trimmed)
+        }
+    }
+    if ($body.Length -eq 0) {
+        FailSigningKeyParsing "signing public key is not a valid PEM block"
+    }
+    try {
+        return [System.Convert]::FromBase64String($body.ToString())
+    } catch {
+        FailSigningKeyParsing "signing public key PEM body is not valid base64: $($_.Exception.Message)"
+    }
+}
+
+# Minimal DER reader: parse (tag, length, value) triplets. Windows PowerShell 5.1
+# runs on .NET Framework, which lacks RSA.ImportSubjectPublicKeyInfo (.NET Core
+# 3.0+ only), so the SubjectPublicKeyInfo is decoded by hand into RSAParameters.
+# Only the small subset of DER needed for an RSA SPKI is handled.
+function Read-DerTlv {
+    param(
+        [byte[]] $Bytes,
+        [ref] $Offset
+    )
+
+    $start = $Offset.Value
+    if ($start + 2 -gt $Bytes.Length) {
+        FailSigningKeyParsing "signing public key DER is truncated"
+    }
+    $tag = $Bytes[$start]
+    $index = $start + 1
+    $lengthByte = $Bytes[$index]
+    $index++
+    if ($lengthByte -lt 0x80) {
+        $length = [int] $lengthByte
+    } else {
+        $byteCount = $lengthByte -band 0x7f
+        if ($byteCount -eq 0 -or $byteCount -gt 4) {
+            FailSigningKeyParsing "signing public key DER has an unsupported length encoding"
+        }
+        $length = 0
+        for ($i = 0; $i -lt $byteCount; $i++) {
+            if ($index -ge $Bytes.Length) {
+                FailSigningKeyParsing "signing public key DER is truncated"
+            }
+            $length = ($length -shl 8) -bor [int] $Bytes[$index]
+            $index++
+        }
+        # A 4-byte length with the high bit set decodes to a negative Int32; reject
+        # it rather than letting the bounds check below pass and then blowing up in
+        # the byte[] allocation with an unhandled OverflowException.
+        if ($length -lt 0) {
+            FailSigningKeyParsing "signing public key DER has an unsupported length encoding"
+        }
+    }
+    $valueStart = $index
+    # Compare without adding (`$valueStart + $length` can overflow Int32 for a
+    # crafted multi-GB length and wrap negative, silently passing the check).
+    if ($length -gt $Bytes.Length - $valueStart) {
+        FailSigningKeyParsing "signing public key DER is truncated"
+    }
+    $value = New-Object byte[] $length
+    if ($length -gt 0) {
+        [System.Array]::Copy($Bytes, $valueStart, $value, 0, $length)
+    }
+    $Offset.Value = $valueStart + $length
+    return [PSCustomObject]@{
+        Tag   = $tag
+        Value = $value
+    }
+}
+
+# Convert a DER INTEGER value to an unsigned big-endian byte array, dropping the
+# leading 0x00 sign byte that DER inserts when the high bit is set.
+function ConvertFrom-DerInteger {
+    param([byte[]] $Value)
+
+    $bytes = $Value
+    if ($bytes.Length -gt 1 -and $bytes[0] -eq 0) {
+        $trimmed = New-Object byte[] ($bytes.Length - 1)
+        [System.Array]::Copy($bytes, 1, $trimmed, 0, $trimmed.Length)
+        $bytes = $trimmed
+    }
+    return $bytes
+}
+
+# Build an RSA verifier from a SubjectPublicKeyInfo ("BEGIN PUBLIC KEY") PEM.
+# Parses the SPKI DER into modulus/exponent and imports them via RSAParameters,
+# which works on both Windows PowerShell 5.1 (.NET Framework) and PowerShell 7+
+# (.NET). No external process (openssl) is involved.
+function Resolve-RsaVerifier {
+    param([string] $PublicKeyPem)
+
+    $der = Convert-PemToDer $PublicKeyPem
+
+    $offset = 0
+    $spki = Read-DerTlv $der ([ref] $offset)
+    if ($spki.Tag -ne 0x30) {
+        FailSigningKeyParsing "signing public key is not a SubjectPublicKeyInfo structure"
+    }
+
+    # Inside the outer SEQUENCE: AlgorithmIdentifier (SEQUENCE) then the
+    # public key BIT STRING.
+    $inner = 0
+    $algorithm = Read-DerTlv $spki.Value ([ref] $inner)
+    if ($algorithm.Tag -ne 0x30) {
+        FailSigningKeyParsing "signing public key algorithm identifier is malformed"
+    }
+    $subjectPublicKey = Read-DerTlv $spki.Value ([ref] $inner)
+    if ($subjectPublicKey.Tag -ne 0x03) {
+        FailSigningKeyParsing "signing public key bit string is malformed"
+    }
+
+    # BIT STRING: first byte is the count of unused bits (0 for a key), the rest
+    # is the DER-encoded RSAPublicKey.
+    $bitString = $subjectPublicKey.Value
+    if ($bitString.Length -lt 1 -or $bitString[0] -ne 0) {
+        FailSigningKeyParsing "signing public key bit string padding is unsupported"
+    }
+    $rsaKeyDer = New-Object byte[] ($bitString.Length - 1)
+    [System.Array]::Copy($bitString, 1, $rsaKeyDer, 0, $rsaKeyDer.Length)
+
+    # RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }
+    $rsaOffset = 0
+    $rsaSequence = Read-DerTlv $rsaKeyDer ([ref] $rsaOffset)
+    if ($rsaSequence.Tag -ne 0x30) {
+        FailSigningKeyParsing "signing public key RSA structure is malformed"
+    }
+    $rsaInner = 0
+    $modulus = Read-DerTlv $rsaSequence.Value ([ref] $rsaInner)
+    $exponent = Read-DerTlv $rsaSequence.Value ([ref] $rsaInner)
+    if ($modulus.Tag -ne 0x02 -or $exponent.Tag -ne 0x02) {
+        FailSigningKeyParsing "signing public key modulus or exponent is malformed"
+    }
+
+    $parameters = New-Object System.Security.Cryptography.RSAParameters
+    $parameters.Modulus = ConvertFrom-DerInteger $modulus.Value
+    $parameters.Exponent = ConvertFrom-DerInteger $exponent.Value
+
+    $rsa = [System.Security.Cryptography.RSA]::Create()
+    try {
+        $rsa.ImportParameters($parameters)
+    } catch [System.Security.Cryptography.CryptographicException] {
+        $rsa.Dispose()
+        FailSigningKeyParsing "signing public key could not be imported: $($_.Exception.Message)"
+    }
+    return $rsa
+}
+
 function Confirm-ArchiveSignature {
     param(
         [string] $ArchivePath,
@@ -178,13 +350,32 @@ function Confirm-ArchiveSignature {
         [string[]] $PublicKeyPaths
     )
 
-    Confirm-Command openssl
+    # The `.sig` sidecar is the raw RSASSA-PKCS#1 v1.5 over SHA-256 signature
+    # bytes (as produced by `cargo xtask sign` / `openssl dgst -sha256 -sign`),
+    # not a PKCS#7/CMS or Authenticode container. certutil/certreq only verify
+    # certificate-backed CMS/Authenticode blobs and cannot check a raw detached
+    # signature against a bare SubjectPublicKeyInfo public key, so verification
+    # uses .NET RSA directly. This keeps the installer free of any openssl
+    # runtime dependency while supporting Windows PowerShell 5.1.
+    $archiveBytes = [System.IO.File]::ReadAllBytes($ArchivePath)
+    $signatureBytes = [System.IO.File]::ReadAllBytes($SignaturePath)
+    $hashAlgorithm = [System.Security.Cryptography.HashAlgorithmName]::SHA256
+    $padding = [System.Security.Cryptography.RSASignaturePadding]::Pkcs1
+
     foreach ($key in $PublicKeyPaths) {
-        # Quote every path argument so keys or archives under a directory with
-        # spaces are passed to native openssl as single arguments.
-        & openssl dgst -sha256 -verify "$key" -signature "$SignaturePath" "$ArchivePath" | Out-Null
-        if ($LASTEXITCODE -eq 0) {
-            return
+        $rsa = $null
+        try {
+            $pem = Get-Content -LiteralPath $key -Raw
+            $rsa = Resolve-RsaVerifier $pem
+            if ($rsa.VerifyData($archiveBytes, $signatureBytes, $hashAlgorithm, $padding)) {
+                return
+            }
+        } catch [System.Security.Cryptography.CryptographicException] {
+            continue
+        } finally {
+            if ($null -ne $rsa) {
+                $rsa.Dispose()
+            }
         }
     }
     Fail "signature verification failed"
