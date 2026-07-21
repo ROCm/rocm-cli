@@ -176,7 +176,7 @@ jobs:
           python3 scripts/xfail_expectations_hint.py \
             --title "$PR_TITLE" \
             --body "$PR_BODY" \
-            --commits-file /tmp/pr-commits.txt
+            --commits-file /tmp/pr-commits.txt >> "$GITHUB_STEP_SUMMARY"
 
   build-and-test:
     runs-on: ubuntu-latest

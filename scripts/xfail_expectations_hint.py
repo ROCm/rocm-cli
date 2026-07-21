@@ -37,7 +37,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import sys
 from pathlib import Path
@@ -121,18 +120,13 @@ def run_check(
 
 
 def emit(hits: dict[str, list[str]]) -> None:
-    """Print the note; also append to the CI step summary when available."""
+    """Write the advisory note to stdout so the workflow can redirect it to the
+    CI step summary. Nothing is written when there is nothing to report."""
     if not hits:
-        print("xfail hint: no referenced bug has a live xfail row.")
+        # Keep the step summary clean; leave only a trace in the job log.
+        print("xfail hint: no referenced bug has a live xfail row.", file=sys.stderr)
         return
-    note = format_note(hits)
-    print(note)
-    summary = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary:
-        # GITHUB_STEP_SUMMARY is a trusted path provided by the CI runner, not
-        # user input.
-        with open(summary, "a", encoding="utf-8") as fh:  # codeql[py/path-injection]
-            fh.write(note + "\n")
+    print(format_note(hits))
 
 
 # --- Self-test --------------------------------------------------------------
