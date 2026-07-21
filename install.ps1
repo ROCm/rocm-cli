@@ -171,7 +171,7 @@ function Save-File {
     }
 }
 
-function Stop-SigningKeyParsing {
+function FailSigningKeyParsing {
     param([string] $Message)
     throw [System.Security.Cryptography.CryptographicException]::new($Message)
 }
@@ -200,12 +200,12 @@ function Convert-PemToDer {
         }
     }
     if ($body.Length -eq 0) {
-        Stop-SigningKeyParsing "signing public key is not a valid PEM block"
+        FailSigningKeyParsing "signing public key is not a valid PEM block"
     }
     try {
         return [System.Convert]::FromBase64String($body.ToString())
     } catch {
-        Stop-SigningKeyParsing "signing public key PEM body is not valid base64: $($_.Exception.Message)"
+        FailSigningKeyParsing "signing public key PEM body is not valid base64: $($_.Exception.Message)"
     }
 }
 
@@ -221,7 +221,7 @@ function Read-DerTlv {
 
     $start = $Offset.Value
     if ($start + 2 -gt $Bytes.Length) {
-        Stop-SigningKeyParsing "signing public key DER is truncated"
+        FailSigningKeyParsing "signing public key DER is truncated"
     }
     $tag = $Bytes[$start]
     $index = $start + 1
@@ -232,12 +232,12 @@ function Read-DerTlv {
     } else {
         $byteCount = $lengthByte -band 0x7f
         if ($byteCount -eq 0 -or $byteCount -gt 4) {
-            Stop-SigningKeyParsing "signing public key DER has an unsupported length encoding"
+            FailSigningKeyParsing "signing public key DER has an unsupported length encoding"
         }
         $length = 0
         for ($i = 0; $i -lt $byteCount; $i++) {
             if ($index -ge $Bytes.Length) {
-                Stop-SigningKeyParsing "signing public key DER is truncated"
+                FailSigningKeyParsing "signing public key DER is truncated"
             }
             $length = ($length -shl 8) -bor [int] $Bytes[$index]
             $index++
@@ -246,14 +246,14 @@ function Read-DerTlv {
         # it rather than letting the bounds check below pass and then blowing up in
         # the byte[] allocation with an unhandled OverflowException.
         if ($length -lt 0) {
-            Stop-SigningKeyParsing "signing public key DER has an unsupported length encoding"
+            FailSigningKeyParsing "signing public key DER has an unsupported length encoding"
         }
     }
     $valueStart = $index
     # Compare without adding (`$valueStart + $length` can overflow Int32 for a
     # crafted multi-GB length and wrap negative, silently passing the check).
     if ($length -gt $Bytes.Length - $valueStart) {
-        Stop-SigningKeyParsing "signing public key DER is truncated"
+        FailSigningKeyParsing "signing public key DER is truncated"
     }
     $value = New-Object byte[] $length
     if ($length -gt 0) {
@@ -292,7 +292,7 @@ function Resolve-RsaVerifier {
     $offset = 0
     $spki = Read-DerTlv $der ([ref] $offset)
     if ($spki.Tag -ne 0x30) {
-        Stop-SigningKeyParsing "signing public key is not a SubjectPublicKeyInfo structure"
+        FailSigningKeyParsing "signing public key is not a SubjectPublicKeyInfo structure"
     }
 
     # Inside the outer SEQUENCE: AlgorithmIdentifier (SEQUENCE) then the
@@ -300,18 +300,18 @@ function Resolve-RsaVerifier {
     $inner = 0
     $algorithm = Read-DerTlv $spki.Value ([ref] $inner)
     if ($algorithm.Tag -ne 0x30) {
-        Stop-SigningKeyParsing "signing public key algorithm identifier is malformed"
+        FailSigningKeyParsing "signing public key algorithm identifier is malformed"
     }
     $subjectPublicKey = Read-DerTlv $spki.Value ([ref] $inner)
     if ($subjectPublicKey.Tag -ne 0x03) {
-        Stop-SigningKeyParsing "signing public key bit string is malformed"
+        FailSigningKeyParsing "signing public key bit string is malformed"
     }
 
     # BIT STRING: first byte is the count of unused bits (0 for a key), the rest
     # is the DER-encoded RSAPublicKey.
     $bitString = $subjectPublicKey.Value
     if ($bitString.Length -lt 1 -or $bitString[0] -ne 0) {
-        Stop-SigningKeyParsing "signing public key bit string padding is unsupported"
+        FailSigningKeyParsing "signing public key bit string padding is unsupported"
     }
     $rsaKeyDer = New-Object byte[] ($bitString.Length - 1)
     [System.Array]::Copy($bitString, 1, $rsaKeyDer, 0, $rsaKeyDer.Length)
@@ -320,13 +320,13 @@ function Resolve-RsaVerifier {
     $rsaOffset = 0
     $rsaSequence = Read-DerTlv $rsaKeyDer ([ref] $rsaOffset)
     if ($rsaSequence.Tag -ne 0x30) {
-        Stop-SigningKeyParsing "signing public key RSA structure is malformed"
+        FailSigningKeyParsing "signing public key RSA structure is malformed"
     }
     $rsaInner = 0
     $modulus = Read-DerTlv $rsaSequence.Value ([ref] $rsaInner)
     $exponent = Read-DerTlv $rsaSequence.Value ([ref] $rsaInner)
     if ($modulus.Tag -ne 0x02 -or $exponent.Tag -ne 0x02) {
-        Stop-SigningKeyParsing "signing public key modulus or exponent is malformed"
+        FailSigningKeyParsing "signing public key modulus or exponent is malformed"
     }
 
     $parameters = New-Object System.Security.Cryptography.RSAParameters
@@ -338,7 +338,7 @@ function Resolve-RsaVerifier {
         $rsa.ImportParameters($parameters)
     } catch [System.Security.Cryptography.CryptographicException] {
         $rsa.Dispose()
-        Stop-SigningKeyParsing "signing public key could not be imported: $($_.Exception.Message)"
+        FailSigningKeyParsing "signing public key could not be imported: $($_.Exception.Message)"
     }
     return $rsa
 }
