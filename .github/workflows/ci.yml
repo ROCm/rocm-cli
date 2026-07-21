@@ -149,6 +149,35 @@ jobs:
         if: github.event_name != 'pull_request'
         run: echo "forced=true" >> "$GITHUB_OUTPUT"
 
+  # Advisory nudge: if a PR references a bug that still has an expected-failure
+  # (xfail) row in expectations.toml, remind the author to clear it. Otherwise a
+  # fix whose CI lane doesn't exercise that platform merges green and the stale
+  # row later surfaces as a mis-attributed XPASS on an unrelated PR. Never blocks:
+  # advisory only, and deliberately NOT a required check.
+  xfail-hint:
+    name: Stale xfail hint (advisory)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # Need the PR range to read its commit messages.
+          fetch-depth: 0
+      - name: Warn on referenced bugs that still have xfail rows
+        # Title/body are passed via env (never interpolated into the shell) so a
+        # crafted PR description can't inject commands.
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git log --format=%B "$BASE_SHA..$HEAD_SHA" > /tmp/pr-commits.txt || true
+          python3 scripts/xfail_expectations_hint.py \
+            --title "$PR_TITLE" \
+            --body "$PR_BODY" \
+            --commits-file /tmp/pr-commits.txt
+
   build-and-test:
     runs-on: ubuntu-latest
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
