@@ -2,13 +2,13 @@
 
 # WIP: Close the xfail-cleanup gap for code-only bug fixes (EAI-7478)
 
-**Stage:** 5-implement
+**Stage:** 7-PR-open (PR #134, driving CI green)
 **Pipeline:** standard
 **Branch:** fix-xfail-cleanup-gap
 **Jira:** EAI-7478 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7478
 **Last Updated:** 2026-07-21
 
-**Token Usage:** in=202 out=82973 cache_create=419132 cache_read=11550177 calls=104
+**Token Usage:** in=290 out=96473 cache_create=440292 cache_read=17692307 calls=148
 
 ---
 
@@ -79,7 +79,7 @@ avoid drift, per the agreed lifecycle):
 ## Implementation Steps
 
 ### Todo 📋
-- 📋 SSH key load + signed commit + push to unblock CodeQL re-run
+(none — PR #134 CI green, review-ready)
 
 ### Done ✅
 - ✅ Added `.github/pull_request_template.md` (single ticket-neutral xfail-cleanup checkbox)
@@ -95,17 +95,19 @@ avoid drift, per the agreed lifecycle):
 - ✅ Decided approach (a)+(b); recorded rationale + bare-`#123` reasoning here and in project memory
 - ✅ Fixed CodeQL path-injection alert 742: removed taint sink (`os.environ.get + open()`); emit() now prints
   to stdout, workflow redirects to $GITHUB_STEP_SUMMARY (matching ci.yml:1254 convention). Removed unused `import os`,
-  self-test + ruff + YAML validation all pass. Staged, ready for signed push.
+  self-test + ruff + YAML validation all pass.
+- ✅ Committed signed+DCO (`47e74a2`) and pushed to PR #134 (1Password launched → signed via op-ssh-sign;
+  repo enforces `Signed-off-by`, added via `-s --amend`). CodeQL re-analyzing.
+- ✅ Verified CodeQL re-run: all 4 checks pass (0 failures). Alert 742 no longer appears on `47e74a2`;
+  fix confirmed. PR #134 review-ready.
 
 ## Next Steps
 
-- User loads SSH key (`ssh-add -t 24h /Users/fres/.ssh/id_rsa_amd_fespinoz`)
-- Agent retries signed commit + push
-- Verify CodeQL alerts 740–742 dismiss after workflow re-run
+- PR #134 is review-ready; await human approval for merge.
 
 ## Blockers / Open Questions
 
-- **Signing key load** — launchd + 1Password SSH agents both empty; waiting for manual load
+- None open.
 
 ## Notes
 
@@ -131,4 +133,6 @@ avoid drift, per the agreed lifecycle):
 
 - Diagnosed CodeQL path-injection alert 742: inline `# codeql[...]` comment ignored by GitHub; removed taint sink.
 - Refactored emit() to print stdout, updated ci.yml to redirect to $GITHUB_STEP_SUMMARY (matching convention).
-- All gates pass (self-test, ruff, YAML). Staged, awaiting SSH key load for signed push.
+  Self-test, ruff, YAML all pass.
+- 1Password launched, committed signed+DCO (`47e74a2`), pushed. CodeQL re-run confirmed all 4 CI checks green.
+  Alert 742 cleared. PR #134 review-ready.
