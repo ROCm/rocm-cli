@@ -19,7 +19,9 @@ rocm-dash-core = { path = "../rocm-dash-core" }
 # Unified dashboard TUI base: ratatui 0.30 + crossterm 0.28 stay
 # confined to this crate. The frozen rocm-cli tui.rs keeps ratatui 0.29; the two
 # majors coexist in the tree, each confined to its own crate.
-ratatui = "0.30"
+# Exact wrapped-row counts must match Ratatui rendering so chat scroll bounds stay correct.
+# `line_count` is currently gated by Ratatui's unstable rendered-line-info feature.
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
