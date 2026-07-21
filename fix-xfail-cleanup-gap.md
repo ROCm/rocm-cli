@@ -6,7 +6,7 @@
 **Pipeline:** standard
 **Branch:** fix-xfail-cleanup-gap
 **Jira:** EAI-7478 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7478
-**Last Updated:** 2026-07-21
+**Last Updated:** 2026-07-21 (idle flush)
 
 **Token Usage:** in=430 out=118011 cache_create=864382 cache_read=28486394 calls=218
 
@@ -144,3 +144,7 @@ avoid drift, per the agreed lifecycle):
   Verified missing-file case exits 0; self-test + ruff green.
 - Rebased 3 commits onto latest main after PR #132 merged (1881294). Re-signed all, force-pushed with lease.
   Approval survived. Head now `1889e21`, up-to-date with main, required checks queued.
+
+### 2026-07-21 (idle flush)
+
+- **Session idle for 10 minutes, auto-flushing WIP state.**
