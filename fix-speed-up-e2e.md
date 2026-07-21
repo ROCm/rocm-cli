@@ -4,7 +4,7 @@
 
 **Stage:** 6-implementing — STAGED TASK, NOT done (PR #126 + PR #128 both MERGED; Tasks #1–#4 done; Tasks #5–#11 remain — re-branch in place for the mock/real split)
 **Pipeline:** standard
-**Branch:** (next chunk) re-branch off fresh main for Tasks #5–#7. Shipped so far: test-e2e-smallest-serve-model (PR #128, merged), fix-speed-up-e2e (PR #126, merged)
+**Branch:** (next chunk) test-e2e-mock-real-split (off fresh main `3aa64e7`, Tasks #5–#7). Shipped so far: test-e2e-smallest-serve-model (PR #128, merged), fix-speed-up-e2e (PR #126, merged)
 **Last Updated:** 2026-07-21
 
 **Token Usage:** in=1006 out=301808 cache_create=5512288 cache_read=94907267 calls=509
@@ -101,13 +101,24 @@ leverage. Tasks #8–#9 are smaller/independent.
   PR #127 (diagnose, squash `8f67d4a`) and the GPU-required probe PR #121.
 
 **Fewer real serves — mock/real split (Tasks #5–#7, biggest structural win):**
-- 📋 Task #5 — Classify every `@requires-gpu` scenario: genuinely-needs-real-inference vs
-  only-tests-CLI-behavior. Hypothesis (validate against assertions): MUST be real =
-  serve-vllm-inference, serve-lemonade-inference, serve-default-engine-inference (6b),
-  serve-readiness-contract (8), serve-large-model-inference (nightly), chat-end-to-end,
-  chat-tool-definitions. MOCKABLE = serve-default-engine-working-endpoint (6),
-  serve-vllm-default-on-instinct (9), examine-detects-gpu-and-driver (3),
-  examine-distinguishes-unmanaged-rocm (4), runtime-path-not-nested (3).
+- ✅ Task #5 — DONE (2026-07-21). Classified all 14 GPU-tagged scenarios vs their actual
+  assertions (not the hypothesis). GPU tags in use: `@requires-gpu` (primary), co-tags
+  `@nightly`, `@requires-engine:vllm|lemonade`, `@requires-os:linux`, `@serve-timeout:2400`.
+  **MUST-BE-REAL (8):** model_serving #5 (vLLM inference, model_ids_match), #7 (lemonade
+  inference), #6b (default-engine inference), #8 (readiness contract EAI-7333), #10 (27B
+  nightly), examine #3 (real gfx/amdgpu probe — no serve engine), runtime #1 (real SDK
+  install, nightly), runtime #3 (real install folder layout). Note examine#3 + runtime#1/#3
+  need real HARDWARE/INSTALL but exercise NO serve engine — a mock serve can't help them.
+  **MOCKABLE (6):** chat #4 (tools accepted — asserts only valid choices array), chat #5
+  (end-to-end — asserts only non-empty content, not model_ids_match; `given` already uses
+  MockServer), model_serving #9 (vLLM-default — plan-only, comment says so), #12 + #13
+  (GPU-masked / bad-index refusals — assert rc!=0 + stderr, refuse before engine start),
+  examine #4 (planted unmanaged-ROCm fixture, classification+guidance only — tag over-broad).
+  **HYPOTHESIS CORRECTIONS:** chat #4/#5 are MOCKABLE (hypothesis wrongly had them real);
+  #12/#13 newly found mockable; examine#4 confirmed mockable.
+  **Borderline:** model_serving #6 (working-endpoint) — engine-selection half is plan-only
+  but "model reachable" hits real /v1/models after a real managed serve. Kept MUST-BE-REAL
+  on the reachability assertion; strongest demotion candidate if intent is selection-only.
 - 📋 Task #6 — Design a faithful mock serve engine (extends existing mock_server.rs +
   register_mock_service): must mimic serve plan / /v1/models / /v1/chat/completions so
   behavioral scenarios pass identically without a GPU. Risk: mock/real drift kills E2E
@@ -174,6 +185,18 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persist-app-dev-ci
 - Recreate with: `create_worktree.sh fix-speed-up-e2e`
 
 ## Work Log
+
+### 2026-07-21 — Re-branched for Tasks #5–#7; Task #5 audit DONE
+
+- **Re-branched in place:** `test-e2e-mock-real-split` reset onto fresh `origin/main`
+  (`3aa64e7`; had to fetch+reset — `main` is checked out in the primary worktree so a
+  plain `git checkout main` failed). Old `test-e2e-smallest-serve-model` is merged/stale.
+- **Task #5 DONE (subagent audit vs live assertions):** 14 GPU-tagged scenarios → 8
+  MUST-BE-REAL, 6 MOCKABLE. Hypothesis was WRONG on chat #4/#5 (actually mockable — assert
+  only success/non-empty, not model_ids_match) and MISSED #12/#13 (masked-GPU refusals,
+  mockable). Borderline = model_serving #6. examine#3 + runtime#1/#3 need real hardware but
+  no serve engine (mock serve irrelevant). Full table in Task #5 above.
+- **Next:** Task #6 — design faithful mock serve engine extending mock_server.rs.
 
 ### 2026-07-21 — PR #128 verified MERGED; Tasks #2–#4 done, re-branch pending for #5–#11
 
