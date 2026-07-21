@@ -8,7 +8,7 @@
 **Jira:** EAI-7478 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7478
 **Last Updated:** 2026-07-21
 
-**Token Usage:** in=290 out=96473 cache_create=440292 cache_read=17692307 calls=148
+**Token Usage:** in=300 out=98757 cache_create=828991 cache_read=18054121 calls=153
 
 ---
 
@@ -79,7 +79,7 @@ avoid drift, per the agreed lifecycle):
 ## Implementation Steps
 
 ### Todo 📋
-(none — PR #134 CI green, review-ready)
+- 📋 Await human approval for merge (non-blocking follow-up: guard missing expectations.toml file)
 
 ### Done ✅
 - ✅ Added `.github/pull_request_template.md` (single ticket-neutral xfail-cleanup checkbox)
@@ -99,11 +99,12 @@ avoid drift, per the agreed lifecycle):
 - ✅ Committed signed+DCO (`47e74a2`) and pushed to PR #134 (1Password launched → signed via op-ssh-sign;
   repo enforces `Signed-off-by`, added via `-s --amend`). CodeQL re-analyzing.
 - ✅ Verified CodeQL re-run: all 4 checks pass (0 failures). Alert 742 no longer appears on `47e74a2`;
-  fix confirmed. PR #134 review-ready.
+  fix confirmed. PR #134 APPROVED by rominf (non-blocking follow-up: guard missing expectations.toml).
 
 ## Next Steps
 
-- PR #134 is review-ready; await human approval for merge.
+- Await human approval for merge.
+- Post-merge: address non-blocking follow-up (guard `expectations.toml` missing-file case in main()).
 
 ## Blockers / Open Questions
 
@@ -129,12 +130,10 @@ avoid drift, per the agreed lifecycle):
 - Set up worktree off fresh origin/main and this WIP at stage 4-design with the three options captured.
 - Investigated CI gaps (path filters, reconciler, nightly behavior); decided approach (a)+(b).
 
-### 2026-07-21
+### 2026-07-21 (continued)
 
 - Diagnosed CodeQL path-injection alert 742: inline `# codeql[...]` comment ignored by GitHub; removed taint sink.
 - Refactored emit() to print stdout, updated ci.yml to redirect to $GITHUB_STEP_SUMMARY (matching convention).
   Self-test, ruff, YAML all pass.
-- 1Password launched, committed signed+DCO (`47e74a2`), pushed. CodeQL re-run confirmed all 4 CI checks green.
-  Alert 742 cleared. PR #134 review-ready.
-
-**2026-07-21 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+- 1Password launched, committed signed+DCO (`47e74a2`), pushed. CodeQL re-run: all 4 CI checks green, alert 742 cleared.
+- Verified PR #134 APPROVED by rominf; noted non-blocking follow-up (guard missing expectations.toml in main()).
