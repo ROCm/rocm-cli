@@ -6,9 +6,9 @@
 **Pipeline:** standard
 **Branch:** fix-xfail-cleanup-gap
 **Jira:** EAI-7478 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7478
-**Last Updated:** 2026-07-20
+**Last Updated:** 2026-07-21
 
-**Token Usage:** in=0 out=0 cache_create=0 cache_read=0 calls=0
+**Token Usage:** in=163 out=72863 cache_create=169377 cache_read=9024082 calls=83
 
 ---
 
@@ -79,7 +79,7 @@ avoid drift, per the agreed lifecycle):
 ## Implementation Steps
 
 ### Todo 📋
-- 📋 Container gate + leak scan + signed/DCO commit + push + open PR + drive to green
+- 📋 Signed/DCO commit + push (CodeQL gate fixed; awaiting SSH key load)
 
 ### Done ✅
 - ✅ Added `.github/pull_request_template.md` (single ticket-neutral xfail-cleanup checkbox)
@@ -93,17 +93,18 @@ avoid drift, per the agreed lifecycle):
 - ✅ Investigated CI: no `e2e` path filter (gated on `heavy`); reconciler at `e2e.rs:729-772` (exit 1, no issue);
   nightly runs GPU lane but `continue-on-error` swallows it; no EAI-grep, no PR template, no DoD doc exist today
 - ✅ Decided approach (a)+(b); recorded rationale + bare-`#123` reasoning here and in project memory
+- ✅ Fixed CodeQL path-injection alert 742: removed taint sink (`os.environ.get + open()`); emit() now prints
+  to stdout, workflow redirects to $GITHUB_STEP_SUMMARY (matching ci.yml:1254 convention). Removed unused `import os`,
+  self-test + ruff + YAML validation all pass. Staged, ready for signed push.
 
 ## Next Steps
 
-Start at 4-design: read how the `changes` job path-filters E2E and where the XPASS reconciler lives,
-then commit to an approach.
+- Load SSH key (`ssh-add -t 24h /Users/fres/.ssh/id_rsa_amd_fespinoz`), retry signed commit + push
+- Allow CI to re-run CodeQL on merged commit head; verify all 3 alerts dismiss
 
 ## Blockers / Open Questions
 
-- **Which option(s)** — needs a decision before implementation. (a)+(b) leaning.
-- **Reconciler location/behavior** — confirm where the XPASS reconciler runs and how it attributes XPASS to a PR today.
-- **Issue-open path (if c)** — does CI already have a permission/token to open issues, and how to avoid duplicate issues on repeated XPASS?
+- **Signing key load** — launchd + 1Password SSH agents both empty; waiting for manual load
 
 ## Notes
 
@@ -123,4 +124,10 @@ then commit to an approach.
 
 - Created EAI-7478 (Bug, component rocm-cli) from inbox item 12.
 - Set up worktree off fresh origin/main and this WIP at stage 4-design with the three options captured.
-- Next: read the `changes` path-filter + reconciler, decide approach.
+- Investigated CI gaps (path filters, reconciler, nightly behavior); decided approach (a)+(b).
+
+### 2026-07-21
+
+- Diagnosed CodeQL path-injection alert 742: inline `# codeql[...]` comment ignored by GitHub; removed taint sink.
+- Refactored emit() to print stdout, updated ci.yml to redirect to $GITHUB_STEP_SUMMARY (matching convention).
+- All gates pass (self-test, ruff, YAML). Staged, awaiting SSH key load for signed push.
