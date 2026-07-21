@@ -8,7 +8,7 @@
 **Jira:** EAI-7478 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7478
 **Last Updated:** 2026-07-21
 
-**Token Usage:** in=163 out=72863 cache_create=169377 cache_read=9024082 calls=83
+**Token Usage:** in=202 out=82973 cache_create=419132 cache_read=11550177 calls=104
 
 ---
 
@@ -79,7 +79,7 @@ avoid drift, per the agreed lifecycle):
 ## Implementation Steps
 
 ### Todo 📋
-- 📋 Signed/DCO commit + push (CodeQL gate fixed; awaiting SSH key load)
+- 📋 SSH key load + signed commit + push to unblock CodeQL re-run
 
 ### Done ✅
 - ✅ Added `.github/pull_request_template.md` (single ticket-neutral xfail-cleanup checkbox)
@@ -99,8 +99,9 @@ avoid drift, per the agreed lifecycle):
 
 ## Next Steps
 
-- Load SSH key (`ssh-add -t 24h /Users/fres/.ssh/id_rsa_amd_fespinoz`), retry signed commit + push
-- Allow CI to re-run CodeQL on merged commit head; verify all 3 alerts dismiss
+- User loads SSH key (`ssh-add -t 24h /Users/fres/.ssh/id_rsa_amd_fespinoz`)
+- Agent retries signed commit + push
+- Verify CodeQL alerts 740–742 dismiss after workflow re-run
 
 ## Blockers / Open Questions
 
