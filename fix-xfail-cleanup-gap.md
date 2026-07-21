@@ -6,7 +6,7 @@
 **Pipeline:** standard
 **Branch:** fix-xfail-cleanup-gap
 **Jira:** EAI-7478 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7478
-**Last Updated:** 2026-07-21
+**Last Updated:** 2026-07-21 (idle flush)
 
 **Token Usage:** in=490 out=129710 cache_create=1206044 cache_read=33379281 calls=248
 
@@ -148,3 +148,7 @@ avoid drift, per the agreed lifecycle):
   Approval survived. Head now `1889e21`, up-to-date with main, required checks queued.
 - CI run stuck (0 jobs dispatched for 3h across repo). Closed + reopened PR to retrigger. Fresh run started.
   Awaiting Actions job dispatch (repo-wide backlog, not branch-specific).
+
+### 2026-07-21 (idle flush)
+
+- **2026-07-21 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
