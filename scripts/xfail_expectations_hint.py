@@ -221,6 +221,10 @@ def main() -> None:
     commits = ""
     if args.commits_file and args.commits_file.exists():
         commits = args.commits_file.read_text(encoding="utf-8")
+    if not EXPECTATIONS_PATH.exists():
+        # Nothing to check against (e.g. the file was renamed or removed);
+        # stay silent rather than break the never-fail advisory contract.
+        sys.exit(0)
     expectations_toml = EXPECTATIONS_PATH.read_text(encoding="utf-8")
     hits = run_check(expectations_toml, args.title, args.body, commits)
     emit(hits)
