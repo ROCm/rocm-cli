@@ -8,7 +8,7 @@
 **Jira:** EAI-7478 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7478
 **Last Updated:** 2026-07-21
 
-**Token Usage:** in=300 out=98757 cache_create=828991 cache_read=18054121 calls=153
+**Token Usage:** in=430 out=118011 cache_create=864382 cache_read=28486394 calls=218
 
 ---
 
@@ -79,7 +79,7 @@ avoid drift, per the agreed lifecycle):
 ## Implementation Steps
 
 ### Todo 📋
-- 📋 Await human approval for merge (non-blocking follow-up: guard missing expectations.toml file)
+- 📋 Await CI completion on rebased head `1889e21` (current with main, required checks queued)
 
 ### Done ✅
 - ✅ Added `.github/pull_request_template.md` (single ticket-neutral xfail-cleanup checkbox)
@@ -100,11 +100,14 @@ avoid drift, per the agreed lifecycle):
   repo enforces `Signed-off-by`, added via `-s --amend`). CodeQL re-analyzing.
 - ✅ Verified CodeQL re-run: all 4 checks pass (0 failures). Alert 742 no longer appears on `47e74a2`;
   fix confirmed. PR #134 APPROVED by rominf (non-blocking follow-up: guard missing expectations.toml).
+- ✅ Fixed reviewer follow-up: guard expectations.toml read in main(), exit 0 if absent (never-fail).
+  Self-test + ruff green. Rebased 3 commits onto latest main (1881294 after PR #132 merged), re-signed,
+  force-pushed with lease (head `1889e21`). Approval survived. Required checks queued; CodeQL already green.
 
 ## Next Steps
 
-- Await human approval for merge.
-- Post-merge: address non-blocking follow-up (guard `expectations.toml` missing-file case in main()).
+- Await CI completion on head `1889e21` (required checks queued; CodeQL already green).
+- Merge once all checks pass.
 
 ## Blockers / Open Questions
 
@@ -137,3 +140,7 @@ avoid drift, per the agreed lifecycle):
   Self-test, ruff, YAML all pass.
 - 1Password launched, committed signed+DCO (`47e74a2`), pushed. CodeQL re-run: all 4 CI checks green, alert 742 cleared.
 - Verified PR #134 APPROVED by rominf; noted non-blocking follow-up (guard missing expectations.toml in main()).
+- Fixed the follow-up: guard the expectations.toml read in main(), exit 0 if absent (never-fail contract).
+  Verified missing-file case exits 0; self-test + ruff green.
+- Rebased 3 commits onto latest main after PR #132 merged (1881294). Re-signed all, force-pushed with lease.
+  Approval survived. Head now `1889e21`, up-to-date with main, required checks queued.
