@@ -7887,6 +7887,10 @@ mod tests {
         assert!(key_path.exists());
 
         let result = stop_managed_service(&paths, service_id);
+        // Observe the real filesystem state before the blanket temp-dir cleanup,
+        // otherwise remove_dir_all would delete the key file and mask a missing
+        // production cleanup (the regression this test guards).
+        let key_removed = !key_path.exists();
         fs::remove_dir_all(root).ok();
 
         let value = result?;
@@ -7897,10 +7901,7 @@ mod tests {
                 .and_then(Value::as_str),
             Some("stopped")
         );
-        assert!(
-            !key_path.exists(),
-            "endpoint key file must be removed after stop"
-        );
+        assert!(key_removed, "endpoint key file must be removed after stop");
         Ok(())
     }
 
