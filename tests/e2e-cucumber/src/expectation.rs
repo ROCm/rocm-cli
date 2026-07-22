@@ -33,8 +33,13 @@ pub enum Expectation {
     /// Must pass; a failure is a real regression.
     ExpectPass,
     /// Declared known bug that reproduces on this host; failing is the expected
-    /// outcome, passing is an XPASS (stale entry).
-    ExpectXfail { bug: String, reason: String },
+    /// outcome, passing is an XPASS (stale entry). `flaky` marks an intermittent
+    /// bug whose XPASS is non-fatal (see `XfailEntry::flaky`).
+    ExpectXfail {
+        bug: String,
+        reason: String,
+        flaky: bool,
+    },
     /// Not applicable on this host (e.g. required engine can't start); skipped.
     Skip { reason: String },
 }
@@ -173,6 +178,11 @@ pub struct XfailEntry {
     pub reason: String,
     #[serde(default)]
     pub serve_timeout_secs: Option<u64>,
+    /// This xfail is for an intermittent bug: on a lucky run it may not reproduce
+    /// and the scenario passes (XPASS). Such an XPASS is expected noise, so it is
+    /// reported but does NOT fail the suite. Unexpected-FAIL stays fatal always.
+    #[serde(default)]
+    pub flaky: bool,
 }
 
 /// The parsed `expectations.toml`: scenario-id → list of xfail conditions (OR).
@@ -241,7 +251,9 @@ pub struct ResolvedScenario {
 impl ResolvedScenario {
     pub fn new(id: &str, effective_engine: &str, expectation: &Expectation) -> Self {
         let (bug, reason) = match expectation {
-            Expectation::ExpectXfail { bug, reason } => (Some(bug.clone()), Some(reason.clone())),
+            Expectation::ExpectXfail { bug, reason, .. } => {
+                (Some(bug.clone()), Some(reason.clone()))
+            }
             Expectation::Skip { reason } => (None, Some(reason.clone())),
             Expectation::ExpectPass => (None, None),
         };
@@ -325,6 +337,7 @@ pub fn resolve(
                 return Expectation::ExpectXfail {
                     bug: entry.bug.clone(),
                     reason: entry.reason.clone(),
+                    flaky: entry.flaky,
                 };
             }
         }
@@ -332,6 +345,65 @@ pub fn resolve(
 
     // (3) default.
     Expectation::ExpectPass
+}
+
+/// The classified outcome of reconciling actual scenario results against their
+/// resolved expectations. Drives the suite's exit code.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Reconciliation {
+    /// xfails that failed as expected.
+    pub xfail_count: u32,
+    /// Non-flaky xfails that passed (stale entries) — fatal. `"id (BUG)"`.
+    pub xpass: Vec<String>,
+    /// Flaky xfails that passed — reported but non-fatal. `"id (BUG)"`.
+    pub flaky_xpass: Vec<String>,
+    /// Expected-pass scenarios that failed — always fatal.
+    pub unexpected_fail: Vec<String>,
+}
+
+impl Reconciliation {
+    /// The suite must exit non-zero iff there is a non-flaky XPASS or an
+    /// unexpected failure. Flaky XPASS is expected noise and never fatal.
+    pub const fn is_fatal(&self) -> bool {
+        !self.xpass.is_empty() || !self.unexpected_fail.is_empty()
+    }
+}
+
+/// Reconcile actual per-scenario results (id → passed) against their resolved
+/// expectations (id → expectation), classifying each into the exit-code buckets.
+///
+/// A scenario with no recorded resolution (untagged, or ran without an @id match)
+/// is treated as expect-pass: a failure then counts as unexpected. A flaky xfail
+/// that passes is expected noise (the intermittent bug didn't reproduce this run)
+/// — recorded but non-fatal; a non-flaky XPASS is a stale entry and stays fatal.
+pub fn reconcile<'a, I>(actual: I, resolutions: &BTreeMap<String, Expectation>) -> Reconciliation
+where
+    I: IntoIterator<Item = (&'a String, &'a bool)>,
+{
+    let mut r = Reconciliation::default();
+    for (id, passed) in actual {
+        match resolutions.get(id) {
+            Some(Expectation::ExpectXfail { bug, flaky, .. }) => {
+                if *passed {
+                    let entry = format!("{id} ({bug})");
+                    if *flaky {
+                        r.flaky_xpass.push(entry);
+                    } else {
+                        r.xpass.push(entry);
+                    }
+                } else {
+                    r.xfail_count += 1;
+                }
+            }
+            // ExpectPass, Skip, or no recorded resolution (untagged) → must pass.
+            _ => {
+                if !passed {
+                    r.unexpected_fail.push(id.clone());
+                }
+            }
+        }
+    }
+    r
 }
 
 /// Tiny glob: `*` matches any run of chars. Used only for `therock_family`.
@@ -677,6 +749,106 @@ serve_timeout_secs = 90
         );
         // Unknown id → no override.
         assert_eq!(m.serve_timeout_for("nope", &cap("mi300x"), "vllm"), None);
+    }
+
+    #[test]
+    fn flaky_defaults_false_and_parses_true() {
+        let m = Expectations::parse(
+            r#"
+[["a"]]
+when = {}
+bug = "EAI-1"
+reason = "not flaky"
+
+[["b"]]
+when = {}
+bug = "EAI-2"
+reason = "flaky"
+flaky = true
+"#,
+        )
+        .unwrap();
+        assert!(!m.entries_for("a")[0].flaky);
+        assert!(m.entries_for("b")[0].flaky);
+        // The flag propagates into the resolved expectation.
+        let da = decl(&["id:a"]);
+        let db = decl(&["id:b"]);
+        assert_eq!(
+            resolve(&da, &cap("mock"), &m, false),
+            Expectation::ExpectXfail {
+                bug: "EAI-1".into(),
+                reason: "not flaky".into(),
+                flaky: false,
+            }
+        );
+        assert_eq!(
+            resolve(&db, &cap("mock"), &m, false),
+            Expectation::ExpectXfail {
+                bug: "EAI-2".into(),
+                reason: "flaky".into(),
+                flaky: true,
+            }
+        );
+    }
+
+    fn xfail(bug: &str, flaky: bool) -> Expectation {
+        Expectation::ExpectXfail {
+            bug: bug.into(),
+            reason: "r".into(),
+            flaky,
+        }
+    }
+
+    #[test]
+    fn reconcile_flaky_xpass_is_non_fatal() {
+        let mut res = BTreeMap::new();
+        res.insert("flaky-one".to_owned(), xfail("EAI-7333", true));
+        let actual = BTreeMap::from([("flaky-one".to_owned(), true)]);
+        let r = reconcile(actual.iter(), &res);
+        assert_eq!(r.flaky_xpass, vec!["flaky-one (EAI-7333)"]);
+        assert!(r.xpass.is_empty());
+        assert!(!r.is_fatal(), "a flaky XPASS alone must not fail the suite");
+    }
+
+    #[test]
+    fn reconcile_non_flaky_xpass_is_fatal() {
+        let mut res = BTreeMap::new();
+        res.insert("stale".to_owned(), xfail("EAI-9", false));
+        let actual = BTreeMap::from([("stale".to_owned(), true)]);
+        let r = reconcile(actual.iter(), &res);
+        assert_eq!(r.xpass, vec!["stale (EAI-9)"]);
+        assert!(r.flaky_xpass.is_empty());
+        assert!(r.is_fatal(), "a non-flaky XPASS is a stale entry and fatal");
+    }
+
+    #[test]
+    fn reconcile_unexpected_fail_is_always_fatal() {
+        // Even a flaky xfail that *fails* is fine (expected); but an expect-pass
+        // scenario that fails is fatal regardless of any flaky entries present.
+        let mut res = BTreeMap::new();
+        res.insert("flaky-one".to_owned(), xfail("EAI-7333", true));
+        // "clean" has no resolution → treated as expect-pass.
+        let actual = BTreeMap::from([
+            ("flaky-one".to_owned(), false), // xfail failed as expected
+            ("clean".to_owned(), false),     // expect-pass FAILED → fatal
+        ]);
+        let r = reconcile(actual.iter(), &res);
+        assert_eq!(r.xfail_count, 1);
+        assert_eq!(r.unexpected_fail, vec!["clean"]);
+        assert!(r.is_fatal());
+    }
+
+    #[test]
+    fn reconcile_all_expected_is_clean() {
+        let mut res = BTreeMap::new();
+        res.insert("xf".to_owned(), xfail("EAI-1", false));
+        let actual = BTreeMap::from([
+            ("xf".to_owned(), false), // xfail failed as expected
+            ("ok".to_owned(), true),  // untagged pass
+        ]);
+        let r = reconcile(actual.iter(), &res);
+        assert_eq!(r.xfail_count, 1);
+        assert!(!r.is_fatal());
     }
 
     #[test]
