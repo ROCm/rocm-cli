@@ -18,7 +18,9 @@ use serde::Deserialize;
 
 use crate::capability::HostCapability;
 
-/// Tag prefixes (gherkin strips the leading `@`, so we match the bare form).
+/// Tag prefixes in their normalized bare form. cucumber-rs currently supplies
+/// scenario tags with a leading `@`; [`ScenarioDecl::from_tags`] accepts either
+/// shape so direct unit fixtures and runtime parser output cannot drift.
 const ID_PREFIX: &str = "id:";
 const REQUIRES_ENGINE_PREFIX: &str = "requires-engine:";
 const REQUIRES_OS_PREFIX: &str = "requires-os:";
@@ -26,6 +28,7 @@ const REQUIRES_GPU_TAG: &str = "requires-gpu";
 const REQUIRES_NO_GPU_TAG: &str = "requires-no-gpu";
 const SERVE_TIMEOUT_PREFIX: &str = "serve-timeout:";
 const NIGHTLY_TAG: &str = "nightly";
+const LIFECYCLE_TAG: &str = "lifecycle";
 
 /// The resolved expectation for one scenario on one host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,7 +42,7 @@ pub enum Expectation {
     Skip { reason: String },
 }
 
-/// Facts extracted from a scenario's tags (all `@`-stripped).
+/// Facts extracted from a scenario's tags.
 #[derive(Debug, Clone)]
 pub struct ScenarioDecl {
     pub id: Option<String>,
@@ -65,10 +68,16 @@ pub struct ScenarioDecl {
     /// on ordinary per-PR / on-demand runs to keep them fast, and only runs when
     /// the nightly workflow opts in via `E2E_INCLUDE_NIGHTLY`.
     pub nightly: bool,
+    /// `@lifecycle`: an expensive, OS-mutating release-lifecycle scenario
+    /// (packaging, real installer, install/uninstall) that is skipped by default
+    /// so the fast E2E suite stays fast, and only runs when the caller opts in via
+    /// `E2E_INCLUDE_LIFECYCLE`. Runs explicitly in heavy CI and on demand.
+    pub lifecycle: bool,
 }
 
 impl ScenarioDecl {
-    /// Parse a scenario's declaration from its gherkin tags (no `@` prefix).
+    /// Parse a scenario's declaration from its gherkin tags, accepting the
+    /// leading `@` shape cucumber-rs supplies at runtime and bare unit fixtures.
     pub fn from_tags<S: AsRef<str>>(tags: &[S]) -> Self {
         let mut id = None;
         let mut requires_gpu = false;
@@ -77,8 +86,12 @@ impl ScenarioDecl {
         let mut requires_os = None;
         let mut serve_timeout_secs = None;
         let mut nightly = false;
+        let mut lifecycle = false;
         for tag in tags {
-            let tag = tag.as_ref();
+            let tag = tag
+                .as_ref()
+                .strip_prefix('@')
+                .unwrap_or_else(|| tag.as_ref());
             if let Some(rest) = tag.strip_prefix(ID_PREFIX) {
                 id = Some(rest.to_owned());
             } else if let Some(rest) = tag.strip_prefix(REQUIRES_ENGINE_PREFIX) {
@@ -93,6 +106,8 @@ impl ScenarioDecl {
                 requires_no_gpu = true;
             } else if tag == NIGHTLY_TAG {
                 nightly = true;
+            } else if tag == LIFECYCLE_TAG {
+                lifecycle = true;
             }
         }
         Self {
@@ -103,6 +118,7 @@ impl ScenarioDecl {
             requires_os,
             serve_timeout_secs,
             nightly,
+            lifecycle,
         }
     }
 
@@ -275,17 +291,25 @@ pub struct PlatformManifest<'a> {
 ///
 /// `include_nightly` is set by the nightly workflow (via `E2E_INCLUDE_NIGHTLY`);
 /// ordinary per-PR / on-demand runs pass `false` so expensive `@nightly`
-/// scenarios stay out of the fast path.
+/// scenarios stay out of the fast path. `include_lifecycle` is set (via
+/// `E2E_INCLUDE_LIFECYCLE`) only when the caller opts into the expensive,
+/// OS-mutating release-lifecycle scenarios; the default fast suite keeps them out.
 pub fn resolve(
     decl: &ScenarioDecl,
     cap: &HostCapability,
     matrix: &Expectations,
     include_nightly: bool,
+    include_lifecycle: bool,
 ) -> Expectation {
     // (1) Applicability / skip.
     if decl.nightly && !include_nightly {
         return Expectation::Skip {
             reason: "nightly-only scenario; set E2E_INCLUDE_NIGHTLY to run".to_owned(),
+        };
+    }
+    if decl.lifecycle && !include_lifecycle {
+        return Expectation::Skip {
+            reason: "lifecycle-only scenario; set E2E_INCLUDE_LIFECYCLE=1 to run".to_owned(),
         };
     }
     if decl.requires_gpu && !cap.has_amd_gpu {
@@ -444,6 +468,18 @@ serve_timeout_secs = 90
     }
 
     #[test]
+    fn tags_parse_with_runtime_at_prefix() {
+        let d = decl(&[
+            "@id:lifecycle-linux-install",
+            "@requires-os:linux",
+            "@lifecycle",
+        ]);
+        assert_eq!(d.id.as_deref(), Some("lifecycle-linux-install"));
+        assert_eq!(d.requires_os.as_deref(), Some("linux"));
+        assert!(d.lifecycle);
+    }
+
+    #[test]
     fn serve_timeout_tag_parses_seconds() {
         let d = decl(&["id:serve-large-model-inference", "serve-timeout:2400"]);
         assert_eq!(d.serve_timeout_secs, Some(2400));
@@ -460,17 +496,43 @@ serve_timeout_secs = 90
         let d = decl(&["id:big", "requires-gpu", "nightly"]);
         assert!(d.nightly);
         assert!(matches!(
-            resolve(&d, &cap("mi300x"), &m, false),
+            resolve(&d, &cap("mi300x"), &m, false, false),
             Expectation::Skip { .. }
         ));
         assert_eq!(
-            resolve(&d, &cap("mi300x"), &m, true),
+            resolve(&d, &cap("mi300x"), &m, true, false),
             Expectation::ExpectPass
         );
         // The nightly gate is cheapest-first: a @nightly scenario that ALSO can't
         // run here (no GPU) still skips regardless of the include flag.
         assert!(matches!(
-            resolve(&d, &cap("mock"), &m, true),
+            resolve(&d, &cap("mock"), &m, true, false),
+            Expectation::Skip { .. }
+        ));
+    }
+
+    #[test]
+    fn lifecycle_scenario_skips_unless_included() {
+        let m = Expectations::default();
+        // A @lifecycle scenario is skipped on the default fast path and runs only
+        // when the caller opts in via E2E_INCLUDE_LIFECYCLE (the last arg).
+        let d = decl(&[
+            "id:lifecycle-linux-install",
+            "requires-os:linux",
+            "lifecycle",
+        ]);
+        assert!(d.lifecycle);
+        assert!(matches!(
+            resolve(&d, &cap("strix-ubuntu"), &m, false, false),
+            Expectation::Skip { .. }
+        ));
+        assert_eq!(
+            resolve(&d, &cap("strix-ubuntu"), &m, false, true),
+            Expectation::ExpectPass
+        );
+        // Even when included, an inapplicable OS still skips (os gate is checked).
+        assert!(matches!(
+            resolve(&d, &cap("strix-windows"), &m, false, true),
             Expectation::Skip { .. }
         ));
     }
@@ -495,17 +557,17 @@ serve_timeout_secs = 90
 
         // MI300X: default engine vLLM → xfail.
         assert!(matches!(
-            resolve(&d, &cap("mi300x"), &m, false),
+            resolve(&d, &cap("mi300x"), &m, false, false),
             Expectation::ExpectXfail { .. }
         ));
         // Strix Ubuntu: gfx1151 → lemonade default → NOT vLLM → expect-pass.
         assert_eq!(
-            resolve(&d, &cap("strix-ubuntu"), &m, false),
+            resolve(&d, &cap("strix-ubuntu"), &m, false, false),
             Expectation::ExpectPass
         );
         // Strix Windows: lemonade default → expect-pass (this is the XPASS fix).
         assert_eq!(
-            resolve(&d, &cap("strix-windows"), &m, false),
+            resolve(&d, &cap("strix-windows"), &m, false, false),
             Expectation::ExpectPass
         );
     }
@@ -515,7 +577,7 @@ serve_timeout_secs = 90
         let m = eai7333_matrix();
         let d = decl(&["id:serve-default-engine-inference", "requires-gpu"]);
         assert!(matches!(
-            resolve(&d, &cap("mock"), &m, false),
+            resolve(&d, &cap("mock"), &m, false, false),
             Expectation::Skip { .. }
         ));
     }
@@ -526,16 +588,16 @@ serve_timeout_secs = 90
         let d = decl(&["id:serve-no-gpu-fails-fast", "requires-no-gpu"]);
         // The mock host has no AMD GPU → the no-GPU premise applies → runs.
         assert_eq!(
-            resolve(&d, &cap("mock"), &m, false),
+            resolve(&d, &cap("mock"), &m, false, false),
             Expectation::ExpectPass
         );
         // Every GPU host skips it — the premise can't hold there.
         assert!(matches!(
-            resolve(&d, &cap("mi300x"), &m, false),
+            resolve(&d, &cap("mi300x"), &m, false, false),
             Expectation::Skip { .. }
         ));
         assert!(matches!(
-            resolve(&d, &cap("strix-ubuntu"), &m, false),
+            resolve(&d, &cap("strix-ubuntu"), &m, false, false),
             Expectation::Skip { .. }
         ));
     }
@@ -551,12 +613,12 @@ serve_timeout_secs = 90
         ]);
         // MI300X: vLLM available → not skipped (expect-pass here, no matrix entry).
         assert_eq!(
-            resolve(&d, &cap("mi300x"), &m, false),
+            resolve(&d, &cap("mi300x"), &m, false, false),
             Expectation::ExpectPass
         );
         // Strix Windows: vLLM can't start → skip (N/A).
         assert!(matches!(
-            resolve(&d, &cap("strix-windows"), &m, false),
+            resolve(&d, &cap("strix-windows"), &m, false, false),
             Expectation::Skip { .. }
         ));
     }
@@ -570,15 +632,15 @@ serve_timeout_secs = 90
         // Runs on a Linux GPU host; skips where os_family != linux (windows, and
         // the "other" fixture host).
         assert_eq!(
-            resolve(&d, &cap("strix-ubuntu"), &m, false),
+            resolve(&d, &cap("strix-ubuntu"), &m, false, false),
             Expectation::ExpectPass
         );
         assert!(matches!(
-            resolve(&d, &cap("strix-windows"), &m, false),
+            resolve(&d, &cap("strix-windows"), &m, false, false),
             Expectation::Skip { .. }
         ));
         assert!(matches!(
-            resolve(&d, &cap("mock"), &m, false),
+            resolve(&d, &cap("mock"), &m, false, false),
             Expectation::Skip { .. }
         ));
     }
@@ -588,11 +650,11 @@ serve_timeout_secs = 90
         let m = Expectations::default();
         let d = decl(&["id:examine-version"]);
         assert_eq!(
-            resolve(&d, &cap("mock"), &m, false),
+            resolve(&d, &cap("mock"), &m, false, false),
             Expectation::ExpectPass
         );
         assert_eq!(
-            resolve(&d, &cap("mi300x"), &m, false),
+            resolve(&d, &cap("mi300x"), &m, false, false),
             Expectation::ExpectPass
         );
     }
@@ -611,11 +673,11 @@ reason = "short-name not surfaced"
         let d = decl(&["id:serve-short-name-expansion"]);
         // No requires-gpu → runs everywhere, always xfail.
         assert!(matches!(
-            resolve(&d, &cap("mock"), &m, false),
+            resolve(&d, &cap("mock"), &m, false, false),
             Expectation::ExpectXfail { .. }
         ));
         assert!(matches!(
-            resolve(&d, &cap("mi300x"), &m, false),
+            resolve(&d, &cap("mi300x"), &m, false, false),
             Expectation::ExpectXfail { .. }
         ));
     }
@@ -638,12 +700,12 @@ reason = "lemonade vulkan fallback"
         ]);
         // Strix Ubuntu (linux, lemonade) → xfail.
         assert!(matches!(
-            resolve(&d, &cap("strix-ubuntu"), &m, false),
+            resolve(&d, &cap("strix-ubuntu"), &m, false, false),
             Expectation::ExpectXfail { .. }
         ));
         // Strix Windows (windows, lemonade) → os mismatch → expect-pass.
         assert_eq!(
-            resolve(&d, &cap("strix-windows"), &m, false),
+            resolve(&d, &cap("strix-windows"), &m, false, false),
             Expectation::ExpectPass
         );
     }

@@ -99,6 +99,19 @@ impl TuiSession {
     /// environment. The child renders into the emulated screen immediately; use
     /// [`wait_for_screen`](Self::wait_for_screen) to synchronise before asserting.
     pub fn spawn(world: &E2eWorld, args: &[&str]) -> Result<Self, String> {
+        Self::spawn_binary(world, crate::rocm_binary(), args)
+    }
+
+    /// Spawn a specific `rocm` binary under a fresh PTY.
+    ///
+    /// Most scenarios use [`spawn`](Self::spawn) and exercise the harness-built
+    /// binary. Install-lifecycle scenarios use this entry point so the terminal
+    /// journey executes the binary copied by the real installer instead.
+    pub fn spawn_binary(
+        world: &E2eWorld,
+        binary: impl AsRef<std::ffi::OsStr>,
+        args: &[&str],
+    ) -> Result<Self, String> {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: ROWS,
@@ -108,7 +121,7 @@ impl TuiSession {
             })
             .map_err(|e| format!("openpty failed: {e}"))?;
 
-        let mut cmd = CommandBuilder::new(crate::rocm_binary());
+        let mut cmd = CommandBuilder::new(binary);
         for arg in args {
             cmd.arg(arg);
         }
@@ -188,6 +201,11 @@ impl TuiSession {
             scenario: world.current_scenario.clone(),
             argv: args.iter().map(|s| (*s).to_string()).collect(),
         })
+    }
+
+    /// Whether the child has exited and been reaped successfully by a wait.
+    pub const fn is_finished(&self) -> bool {
+        self.finished
     }
 
     /// The current visible screen as plain text (one row per line). `vt100` has
