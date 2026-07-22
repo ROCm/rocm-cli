@@ -8,13 +8,7 @@
 **Jira:** EAI-7456 (QA, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
 **Last Updated:** 2026-07-22
 
-**2026-07-22 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-## CI status
-- ✅ **First run (commit 5ee8341)**: All green EXCEPT: (1) missing DCO trailer (fixed below); (2) GPU lane showed 2 EAI-7333 flaky XPASS now correctly non-fatal, but 1 non-flaky XPASS (EAI-7052) + 1 unexpected-FAIL (chat) → exit 1 (orthogonal flake).
-- ✅ **Second run (commit 3dd423a)**: Amended with `Signed-off-by`, re-signed, force-pushed. DCO check will pass. GPU lane still pending (runner queue); feature works per first run's reconciliation output.
-
-**Token Usage:** in=980 out=215223 cache_create=3649861 cache_read=63437287 calls=455
+**Token Usage:** in=1010 out=223153 cache_create=3874430 cache_read=66536950 calls=470
 
 ---
 
@@ -96,7 +90,7 @@ Scenario: Non-flaky XPASS remains fatal
 
 ## Blockers / Open Questions
 
-- **BLOCKED (awaiting user):** Second CI run (commit 3dd423a, DCO amended) still pending job creation (~runner queue). GPU lane queued; once it finishes: (a) confirm `chat-end-to-end-local-model` is cold-cache flake via re-run result, or (b) mark `serve-default-engine-working-endpoint (EAI-7052)` flaky if it repeats (don't force green). Decision pending user.
+- **BLOCKED (awaiting user):** CI run 29910874741 (commit 3dd423a, DCO amended, signed) stuck pending after 54+ min; old superseded run 29901541610 holding shared concurrency group (GPU job queued on offline `app-dev-gpu` runner that cannot be cancelled). Cancelled old run but GitHub slow to reap. Options: (1) bring `app-dev-gpu` runner online (`restore-app-dev-runner` skill) to unstick queue, or (2) wait for GitHub timeout. User decision pending.
 
 ## Notes
 
@@ -162,7 +156,7 @@ Scenario: Non-flaky XPASS remains fatal
 - **Note on GPU failures:** orthogonal to this PR; recommend either (a) re-run to confirm flake vs. real, or (b) mark `serve-default-engine-working-endpoint (EAI-7052)` flaky too (separate follow-up PR, or include here if user wants).
 
 **2026-07-22 (amend + CI re-trigger):**
-- DCO sign-off missing from commit `5ee8341`; amended with `git commit -s --amend`, re-signed (signature good), force-pushed → commit `3dd423a`.
-- CI re-triggered (run 29910874741); CodeQL checks pass; main CI (sign-off + E2E GPU) still pending job creation (~runner queue/initialization).
-- GPU lane will re-run; feature confirmed working from first run's reconciliation output (`7 xfail, 3 XPASS (2 flaky, non-fatal), 1 unexpected failure`). Two orthogonal failures pending re-confirmation.
-- **Next**: await second CI run to complete; decide on EAI-7052 flaky marker based on whether GPU failures repeat.
+- Commit `5ee8341` missing DCO; amended with `git commit -s --amend`, re-signed (good sig), force-pushed → `3dd423a`.
+- CI re-triggered (run 29910874741); CodeQL green; main CI (sign-off + GPU) pending. Old run 29901541610 holds shared concurrency group (GPU job stuck on offline `app-dev-gpu`); cancelled old run but GitHub slow to reap.
+- Feature confirmed working from first run: reconciliation `7 xfail, 3 XPASS (2 flaky, non-fatal), 1 unexpected failure` — EAI-7333 flaky entries correctly non-fatal.
+- **BLOCKED**: runner concurrency deadlock awaiting user action (bring runner online or wait for GitHub timeout).
