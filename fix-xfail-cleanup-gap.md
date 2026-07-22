@@ -80,7 +80,7 @@ avoid drift, per the agreed lifecycle):
 ## Implementation Steps
 
 ### Todo 📋
-- 📋 Resolve CI dispatch backlog (Actions repo-wide, not branch-specific); merge when checks pass
+- 📋 Merge queue: PR #134 enqueued (position 1, QUEUED); auto-completes when queue CI passes. Then post-merge cleanup.
 
 ### Done ✅
 - ✅ Added `.github/pull_request_template.md` (single ticket-neutral xfail-cleanup checkbox)
@@ -109,11 +109,16 @@ avoid drift, per the agreed lifecycle):
 - ✅ Second review (opencode agent, read-only): ready/solid. Independently verified self-test 7/7, ruff clean,
   real expectations.toml parses (9 live xfail bugs), EAI-7052 reproduces documented case, exit 0 always,
   leak scan clean, no conflict markers, single logical change. No code change required.
+- ✅ Confirmed the failing check (E2E tests (GPU), non-required) is PRE-EXISTING on main (merged cfae8d3,
+  run 29860772853): same `chat-end-to-end-local-model` regression + same EAI-7333/EAI-7052 XPASS. Not caused by #134.
+- ✅ Filed follow-up tickets (both Bug, component rocm-cli, unassigned): **EAI-7532** (chat-end-to-end-local-model
+  GPU regression), **EAI-7533** (stale xfail rows EAI-7333/EAI-7052 XPASS on GPU lane). Verified fields via REST.
+- ✅ Enqueued PR #134 into the merge queue (repo uses a merge queue; `gh pr merge` mis-routes to disabled
+  auto-merge — used GraphQL `enqueuePullRequest`). Position 1, state QUEUED.
 
 ## Next Steps
 
-- Required checks complete; E2E GPU lane (non-required) shows 2 pre-existing XPASS on stale rows (EAI-7052, EAI-7333) + 1 unrelated regression.
-- Merge when user signals go-ahead (PR is mergeable: all 21 required checks pass, approval intact).
+- Merge queue completes #134 automatically once its queue CI passes. Then run post-merge cleanup.
 
 ## Blockers / Open Questions
 
@@ -168,3 +173,5 @@ avoid drift, per the agreed lifecycle):
 - CI run completed: all 21 required checks pass (green). E2E GPU lane (non-required) shows 2 stale XPASS (EAI-7052, EAI-7333) + 1 unrelated chat regression. PR mergeable.
 - opencode agent reviewed independently: ready/solid. All logic verified, no code changes needed.
 - PR #134 fully approved (rominf + opencode), mergeable, awaiting user merge signal.
+
+**2026-07-22 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.

@@ -1,12 +1,13 @@
 # WIP: Make XPASS non-fatal for known-flaky xfails (flaky marker)
 
-**Stage:** 6-implementing
+**Stage:** 7-PR-open (PR #138)
 **Pipeline:** standard
 **Branch:** fix-xpass-non-fatal-flaky (worktree active)
+**PR:** #138 — https://github.com/ROCm/rocm-cli/pull/138 (commit 5ee8341, signed)
 **Jira:** EAI-7456 (In Progress, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-21 (idle flush)
+**Last Updated:** 2026-07-22
 
-**Token Usage:** in=818 out=187516 cache_create=2517152 cache_read=48086994 calls=374
+**Token Usage:** in=874 out=196297 cache_create=2789807 cache_read=53159288 calls=402
 
 ---
 
@@ -72,7 +73,6 @@ Scenario: Non-flaky XPASS remains fatal
 - ✅ Container gate green (exit 0, full mock E2E suite ran, reconciliation line correct). Code reviewed LGTM.
 
 ### Todo 📋
-- 📋 Commit + push, open PR (separate, per delivery decision).
 - 📋 EAI-7455 lemonade-Windows entries: N/A here — they live on `fix-e2e-share-lemonade-engine`; that branch marks them flaky after this lands.
 
 ## Next Steps
