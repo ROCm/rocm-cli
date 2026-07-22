@@ -7,7 +7,7 @@
 **Pre-PR-check:** passed — opencode (independent reviewer), 2026-07-22 (reviewed after PR open)
 **Resume:** re-poll #138 approval — OPEN/MERGEABLE, mergeStateStatus BLOCKED, reviewDecision REVIEW_REQUIRED, head 3dd423a, all required checks green; gated ONLY on a human approving review. Nothing actionable until then.
 **Jira:** EAI-7456 (QA, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-22
+**Last Updated:** 2026-07-22 (idle flush)
 
 **Token Usage:** in=1102 out=246858 cache_create=4816361 cache_read=76537345 calls=517
 
@@ -190,3 +190,5 @@ Scenario: Non-flaky XPASS remains fatal
 - Re-polled PR #138: OPEN/MERGEABLE, mergeStateStatus BLOCKED, reviewDecision REVIEW_REQUIRED, 0 reviews, head 3dd423a, all 8 required checks green.
 - No further progress until human approval. WIP stage remains 7-PR-open; blocker set to BLOCKED (awaiting user).
 - Concurrency-group finding (split self-hosted E2E into separate workflow) captured for later work-ledger item.
+
+**2026-07-22 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
