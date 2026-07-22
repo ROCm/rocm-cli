@@ -30,7 +30,7 @@ Lemonade and vLLM.
 | Platform | Prebuilt binary | Notes |
 |---|---|---|
 | Linux (x86_64) | Yes | Full support, including the live dashboard and both inference engines |
-| Windows (x86_64) | Yes | Full support |
+| Windows (x86_64) | Yes | CLI and Lemonade serving; no live dashboard or vLLM |
 | WSL2 (x86_64) | Yes (Linux binary) | Full support, including the live dashboard; see [docs/wsl.md](docs/wsl.md) for setup |
 | macOS | No | No official installer, release, CI, or QA coverage |
 
