@@ -7,9 +7,9 @@
 **Branch:** fix-xfail-cleanup-gap
 **Jira:** EAI-7478 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7478
 **Review:** approved (rominf, follow-up addressed) + read-only pass (opencode agent)
-**Last Updated:** 2026-07-21
+**Last Updated:** 2026-07-22
 
-**Token Usage:** in=494 out=130312 cache_create=1561110 cache_read=33379281 calls=250
+**Token Usage:** in=542 out=140792 cache_create=1836976 cache_read=37716018 calls=275
 
 ---
 
@@ -112,8 +112,8 @@ avoid drift, per the agreed lifecycle):
 
 ## Next Steps
 
-- Await job dispatch on fresh run `29848018755` (repo-wide Actions backlog).
-- Merge once all required checks pass.
+- Required checks complete; E2E GPU lane (non-required) shows 2 pre-existing XPASS on stale rows (EAI-7052, EAI-7333) + 1 unrelated regression.
+- Merge when user signals go-ahead (PR is mergeable: all 21 required checks pass, approval intact).
 
 ## Blockers / Open Questions
 
@@ -163,6 +163,8 @@ avoid drift, per the agreed lifecycle):
 - CI run stuck in queue (repo-wide Actions backlog); reopened PR to retrigger. Fresh run dispatching.
 - Ready for merge once required checks pass.
 
-### 2026-07-21 (idle flush)
+### 2026-07-22
 
-- Session idle for 10 minutes, auto-flushing WIP state.
+- CI run completed: all 21 required checks pass (green). E2E GPU lane (non-required) shows 2 stale XPASS (EAI-7052, EAI-7333) + 1 unrelated chat regression. PR mergeable.
+- opencode agent reviewed independently: ready/solid. All logic verified, no code changes needed.
+- PR #134 fully approved (rominf + opencode), mergeable, awaiting user merge signal.
