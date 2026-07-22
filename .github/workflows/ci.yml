@@ -630,10 +630,11 @@ jobs:
           BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.merge_group.base_sha }}
         run: cargo xtask verify-commits --base "$BASE" --require-verified
 
-  # Hardware (real AMD GPU / WSL) smoke tests on dedicated self-hosted runners
-  # are intentionally not part of this workflow yet. See
-  # docs/ci-hardware-testing.md for the planned design; they will land in a
-  # follow-up PR.
+  # Hardware (real AMD GPU) smoke tests run on dedicated self-hosted runners —
+  # see the e2e-gpu, e2e-gpu-strix-ubuntu, and e2e-gpu-strix-windows jobs below.
+  # They are non-blocking (continue-on-error) and fork-safe (self-hosted runners
+  # do not execute untrusted fork PRs). See docs/ci-hardware-testing.md for the
+  # design.
 
   # ── E2E tests (cucumber-rs) ───────────────────────────────────────────────
   #
