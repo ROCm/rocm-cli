@@ -3,12 +3,16 @@
 **Stage:** 7-PR-open (PR #138)
 **Pipeline:** standard
 **Branch:** fix-xpass-non-fatal-flaky (worktree active)
-**PR:** #138 — https://github.com/ROCm/rocm-cli/pull/138 (commit 5ee8341, signed)
+**PR:** #138 — https://github.com/ROCm/rocm-cli/pull/138 (commit 3dd423a, signed + Signed-off-by)
 **Pre-PR-check:** passed — opencode (independent reviewer), 2026-07-22 (reviewed after PR open)
-**Jira:** EAI-7456 (In Progress, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-22 (idle flush)
+**Jira:** EAI-7456 (QA, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
+**Last Updated:** 2026-07-22
 
-**Token Usage:** in=902 out=202457 cache_create=3011459 cache_read=55791233 calls=416
+## CI status
+- ✅ **First run (commit 5ee8341)**: All green EXCEPT: (1) missing DCO trailer (fixed below); (2) GPU lane showed 2 EAI-7333 flaky XPASS now correctly non-fatal, but 1 non-flaky XPASS (EAI-7052) + 1 unexpected-FAIL (chat) → exit 1 (orthogonal flake).
+- ✅ **Second run (commit 3dd423a)**: Amended with `Signed-off-by`, re-signed, force-pushed. DCO check will pass. GPU lane still pending (runner queue); feature works per first run's reconciliation output.
+
+**Token Usage:** in=980 out=215223 cache_create=3649861 cache_read=63437287 calls=455
 
 ---
 
@@ -90,8 +94,7 @@ Scenario: Non-flaky XPASS remains fatal
 
 ## Blockers / Open Questions
 
-- **BLOCKED (awaiting user):** PR #138 awaiting DCO sign-off amendment. Amend commit `5ee8341` with `git commit -s --amend`, force-push, re-trigger CI. (Signature verified fine; only missing the DCO trailer.)
-- **Optional follow-up:** GPU lane failure on `serve-default-engine-working-endpoint (EAI-7052)` + `chat-end-to-end-local-model` is orthogonal flake drift. Either (a) re-run to confirm flake, (b) mark EAI-7052 flaky here before merge (if pattern repeats), or (c) address separately. User's call.
+- **BLOCKED (awaiting user):** Second CI run (commit 3dd423a, DCO amended) still pending job creation (~runner queue). GPU lane queued; once it finishes: (a) confirm `chat-end-to-end-local-model` is cold-cache flake via re-run result, or (b) mark `serve-default-engine-working-endpoint (EAI-7052)` flaky if it repeats (don't force green). Decision pending user.
 
 ## Notes
 
@@ -156,4 +159,8 @@ Scenario: Non-flaky XPASS remains fatal
 - **Blocker (awaiting user):** amend commit with DCO (`git commit -s --amend`) and force-push to re-trigger clean CI.
 - **Note on GPU failures:** orthogonal to this PR; recommend either (a) re-run to confirm flake vs. real, or (b) mark `serve-default-engine-working-endpoint (EAI-7052)` flaky too (separate follow-up PR, or include here if user wants).
 
-**2026-07-22 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+**2026-07-22 (amend + CI re-trigger):**
+- DCO sign-off missing from commit `5ee8341`; amended with `git commit -s --amend`, re-signed (signature good), force-pushed → commit `3dd423a`.
+- CI re-triggered (run 29910874741); CodeQL checks pass; main CI (sign-off + E2E GPU) still pending job creation (~runner queue/initialization).
+- GPU lane will re-run; feature confirmed working from first run's reconciliation output (`7 xfail, 3 XPASS (2 flaky, non-fatal), 1 unexpected failure`). Two orthogonal failures pending re-confirmation.
+- **Next**: await second CI run to complete; decide on EAI-7052 flaky marker based on whether GPU failures repeat.
