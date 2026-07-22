@@ -98,7 +98,8 @@ Scenarios carry stable-id and capability tags:
 | Tag | Meaning |
 |---|---|
 | `@id:<slug>` | Stable scenario id. Keys the expectation matrix and the report grid; every scenario has one. |
-| `@requires-gpu` | Needs a real AMD GPU. Resolves to **skip** (n/a) on a host with none (e.g. the mock job). |
+| `@requires-gpu` | Needs a real AMD GPU. Resolves to **skip** (n/a) on a host with none (e.g. the mock or hosted WSL job). |
+| `@requires-wsl` | Needs a real WSL host. Resolves to **skip** on native Linux, native Windows, and other environments. |
 | `@requires-engine:<vllm\|lemonade>` | Pins the serve engine. Resolves to skip where that engine can't start (e.g. vLLM on a lemonade-only Strix host). |
 | `@requires-os:<linux\|windows>` | Premise is OS-specific; skip on other OSes. |
 | `@serve-timeout:<secs>` | Lengthen the serve-readiness wait for a genuinely slow serve (e.g. a large model). |
@@ -129,7 +130,8 @@ self-hosted runner can never stall `ci.yml`'s merge-required checks:
 
 | Job | Workflow | Platform | Blocking |
 |---|---|---|---|
-| `e2e` | `ci.yml` | Mock (no GPU, GitHub-hosted) | yes |
+| `e2e` | `ci.yml` | Mock (no GPU, GitHub-hosted Linux) | yes |
+| `e2e-wsl` | `ci.yml` | WSL2 / Ubuntu (no GPU, GitHub-hosted Windows) | no |
 | `e2e-gpu` | `e2e-selfhosted.yml` | MI300X (self-hosted) | no |
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo / Ubuntu (self-hosted) | no |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo / Windows (self-hosted) | no |
