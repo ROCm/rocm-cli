@@ -4,6 +4,7 @@
 **Pipeline:** standard
 **Branch:** fix-xpass-non-fatal-flaky (worktree active)
 **PR:** #138 — https://github.com/ROCm/rocm-cli/pull/138 (commit 5ee8341, signed)
+**Pre-PR-check:** passed — opencode (independent reviewer), 2026-07-22 (reviewed after PR open)
 **Jira:** EAI-7456 (In Progress, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
 **Last Updated:** 2026-07-22
 
@@ -146,3 +147,9 @@ Scenario: Non-flaky XPASS remains fatal
 - **Commit + push + PR**: all pre-commit hooks passed (cargo fmt caught 1 line); signed commit `5ee8341`; pushed to origin; PR #138 open.
 - **PR body**: full test plan (unit tests, clippy, container gate), why flaky instead of expect-pass, run IDs for intermittent behavior.
 - **WIP stage**: 7-PR-open.
+
+**2026-07-22 (independent second-agent review — opencode):**
+- Reviewed the working diff of the 3 tracked files (expectations.toml, src/expectation.rs, tests/e2e.rs) against the WIP's Problem/Solution/Scenarios. **Verdict: passed** — recorded in the new `Pre-PR-check` field (this WIP predated that field, so it was backfilled). Note: PR #138 was already open, so this is effectively a post-open review, not a pre-PR gate.
+- Findings: reconcile() extracted as pure testable fn with 4 bucket tests; is_fatal() gates only on non-flaky xpass + unexpected_fail; flaky defaults false via serde(default); Scenarios sketch (flaky-XPASS non-fatal / unexpected-FAIL fatal / non-flaky-XPASS fatal) all map to a passing test. Nit (non-blocking): BTreeMap rebuilt via clone in e2e.rs — minor, acceptable for testability.
+- Not re-run locally this session: cargo test / clippy / container gate (WIP records them green on 2026-07-21).
+- Posted the review to tmux window 0 of this session per user request.
