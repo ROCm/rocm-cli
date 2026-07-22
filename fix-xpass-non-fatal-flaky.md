@@ -8,9 +8,7 @@
 **Jira:** EAI-7456 (QA, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
 **Last Updated:** 2026-07-22
 
-**2026-07-22 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**Token Usage:** in=1010 out=223153 cache_create=3874430 cache_read=66536950 calls=470
+**Token Usage:** in=1034 out=233516 cache_create=4558402 cache_read=68812726 calls=483
 
 ---
 
@@ -92,7 +90,7 @@ Scenario: Non-flaky XPASS remains fatal
 
 ## Blockers / Open Questions
 
-- **BLOCKED (awaiting user):** CI run 29910874741 (commit 3dd423a, DCO amended, signed) stuck pending after 54+ min; old superseded run 29901541610 holding shared concurrency group (GPU job queued on offline `app-dev-gpu` runner that cannot be cancelled). Cancelled old run but GitHub slow to reap. Options: (1) bring `app-dev-gpu` runner online (`restore-app-dev-runner` skill) to unstick queue, or (2) wait for GitHub timeout. User decision pending.
+- **BLOCKED (awaiting user):** CI run 29910874741 (commit 3dd423a, DCO amended) stuck pending; old run 29901541610's Windows job (`strix-halo-windows` runner, offline) holds shared concurrency group. Need offline Windows runner brought online to unstick both runs, or wait for GitHub timeout (unknown duration). Windows box is a separate SSH-jump access machine (not the app-dev GPU skill issue discovered mid-investigation).
 
 ## Notes
 
@@ -161,6 +159,8 @@ Scenario: Non-flaky XPASS remains fatal
 - Commit `5ee8341` missing DCO; amended with `git commit -s --amend`, re-signed (good sig), force-pushed → `3dd423a`.
 - CI re-triggered (run 29910874741); CodeQL green; main CI (sign-off + GPU) pending. Old run 29901541610 holds shared concurrency group (GPU job stuck on offline `app-dev-gpu`); cancelled old run but GitHub slow to reap.
 - Feature confirmed working from first run: reconciliation `7 xfail, 3 XPASS (2 flaky, non-fatal), 1 unexpected failure` — EAI-7333 flaky entries correctly non-fatal.
-- **BLOCKED**: runner concurrency deadlock awaiting user action (bring runner online or wait for GitHub timeout).
 
-**2026-07-22 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+**2026-07-22 (CI queue analysis):**
+- Investigated CI deadlock: old run's GPU job completed (failure), but Windows job (`strix-halo-windows`) still queued on offline runner; cannot be cancelled → holds shared concurrency group → new run stuck pending 54+ min.
+- `restore-app-dev-runner` skill checked but not applicable: bottleneck is `strix-halo-windows` (offline), not `app-dev-gpu`.
+- No further progress until Windows runner back online or GitHub times out offline job.
