@@ -20,6 +20,7 @@ use rocm_engine_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{VecDeque, hash_map::DefaultHasher};
 use std::ffi::OsString;
 use std::fs;
@@ -55,11 +56,16 @@ const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
 /// Maximum bytes to read from the end of a log file when extracting tail lines.
 /// Prevents reading entire gigabyte-sized logs on startup timeout.
 const MAX_TAIL_READ: u64 = 4 * 1024 * 1024; // 4MB
+static EMBEDDABLE_ARCHIVE_CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const EMBEDDABLE_WINDOWS_ARCHIVE_NAME: &str = "lemonade-embeddable-10.10.0-windows-x64.zip";
 const EMBEDDABLE_LINUX_ARCHIVE_NAME: &str = "lemonade-embeddable-10.10.0-ubuntu-x64.tar.gz";
 const EMBEDDABLE_WINDOWS_URL: &str = "https://github.com/lemonade-sdk/lemonade/releases/download/v10.10.0/lemonade-embeddable-10.10.0-windows-x64.zip";
 const EMBEDDABLE_LINUX_URL: &str = "https://github.com/lemonade-sdk/lemonade/releases/download/v10.10.0/lemonade-embeddable-10.10.0-ubuntu-x64.tar.gz";
+const EMBEDDABLE_WINDOWS_SHA256: &str =
+    "3bbbf755b438ba016a9cb828c71833156b3f64feba9e65b3514857b4183c1026";
+const EMBEDDABLE_LINUX_SHA256: &str =
+    "22962975980b6f1aa90201de93859d21214c84787ad4476bdc843dcdd19ac160";
 
 #[derive(Parser)]
 #[command(name = "rocm-engine-lemonade")]
@@ -976,12 +982,12 @@ fn prepare_embeddable(
     let downloads = root.join("downloads");
     let archive = downloads.join(archive_name);
     fs::create_dir_all(&downloads)?;
-    if archive.is_file() {
-        eprintln!("Using cached {archive_name}.");
-    } else {
-        eprintln!("Downloading {archive_name}...");
-        download_file(archive_url, &archive)?;
-    }
+    ensure_cached_archive(
+        archive_url,
+        &archive,
+        embeddable_archive_sha256(),
+        download_file,
+    )?;
     let runtime_dir = runtime_dir_in(&root);
     if reinstall || !lemond_path_in(&runtime_dir).is_file() {
         if runtime_dir.exists() {
@@ -1241,8 +1247,210 @@ const fn embeddable_url() -> &'static str {
     }
 }
 
+const fn embeddable_archive_sha256() -> &'static str {
+    if runtime_is_windows() {
+        EMBEDDABLE_WINDOWS_SHA256
+    } else {
+        EMBEDDABLE_LINUX_SHA256
+    }
+}
+
 fn download_file(url: &str, destination: &Path) -> Result<()> {
     download_file_to_path(url, destination, Duration::from_mins(15))
+}
+
+fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("failed to open {} for verification", path.display()))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)
+        .with_context(|| format!("failed to hash {}", path.display()))?;
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != expected {
+        bail!(
+            "SHA-256 mismatch for {}: expected {expected}, got {actual}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn publish_verified_archive(
+    temporary: tempfile::NamedTempFile,
+    archive: &Path,
+    expected_sha256: &str,
+) -> Result<()> {
+    match temporary.persist_noclobber(archive) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let publication_error = error.error;
+            verify_sha256(archive, expected_sha256).with_context(|| {
+                format!(
+                    "concurrent archive publication at {} failed verification after publish conflict ({publication_error})",
+                    archive.display()
+                )
+            })
+        }
+        Err(error) => Err(error.error)
+            .with_context(|| format!("failed to publish verified archive {}", archive.display())),
+    }
+}
+
+fn ensure_cached_archive<F>(
+    url: &str,
+    archive: &Path,
+    expected_sha256: &str,
+    download: F,
+) -> Result<()>
+where
+    F: FnMut(&str, &Path) -> Result<()>,
+{
+    ensure_cached_archive_after_invalid(url, archive, expected_sha256, download, || {})
+}
+
+struct ArchiveCacheLock {
+    file: fs::File,
+}
+
+impl Drop for ArchiveCacheLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn archive_lock_path(archive: &Path) -> Result<PathBuf> {
+    let parent = archive
+        .parent()
+        .with_context(|| format!("archive path has no parent: {}", archive.display()))?;
+    let file_name = archive
+        .file_name()
+        .with_context(|| format!("archive path has no file name: {}", archive.display()))?;
+    let mut lock_name = OsString::from(".");
+    lock_name.push(file_name);
+    lock_name.push(".lock");
+    Ok(parent.join(lock_name))
+}
+
+#[cfg(test)]
+fn mark_archive_lock_test_stage(stage: &str) {
+    const ROLE: &str = "ROCM_LEMONADE_ARCHIVE_LOCK_TEST_ROLE";
+    const DIR: &str = "ROCM_LEMONADE_ARCHIVE_LOCK_TEST_DIR";
+    if let (Ok(role), Some(dir)) = (std::env::var(ROLE), std::env::var_os(DIR)) {
+        fs::write(PathBuf::from(dir).join(format!("{role}-{stage}")), b"")
+            .expect("write archive lock test marker");
+    }
+}
+
+#[cfg(test)]
+fn start_archive_lock_test_heartbeat() -> Option<std::thread::JoinHandle<()>> {
+    const ROLE: &str = "ROCM_LEMONADE_ARCHIVE_LOCK_TEST_ROLE";
+    const DIR: &str = "ROCM_LEMONADE_ARCHIVE_LOCK_TEST_DIR";
+    if std::env::var(ROLE).as_deref() != Ok("recoverer") {
+        return None;
+    }
+    let dir = std::env::var_os(DIR)?;
+    Some(std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        fs::write(PathBuf::from(dir).join("recoverer-heartbeat"), b"")
+            .expect("write archive lock test heartbeat");
+    }))
+}
+
+fn lock_archive_cache(archive: &Path) -> Result<ArchiveCacheLock> {
+    let lock_path = archive_lock_path(archive)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open archive cache lock {}", lock_path.display()))?;
+    #[cfg(test)]
+    mark_archive_lock_test_stage("before-lock");
+    #[cfg(test)]
+    let heartbeat = start_archive_lock_test_heartbeat();
+    file.lock().with_context(|| {
+        format!(
+            "failed to acquire archive cache lock {}",
+            lock_path.display()
+        )
+    })?;
+    #[cfg(test)]
+    {
+        mark_archive_lock_test_stage("after-lock");
+        if let Some(heartbeat) = heartbeat {
+            heartbeat
+                .join()
+                .expect("archive lock test heartbeat panicked");
+        }
+    }
+    Ok(ArchiveCacheLock { file })
+}
+
+fn ensure_cached_archive_after_invalid<F, I>(
+    url: &str,
+    archive: &Path,
+    expected_sha256: &str,
+    mut download: F,
+    after_invalid: I,
+) -> Result<()>
+where
+    F: FnMut(&str, &Path) -> Result<()>,
+    I: FnOnce(),
+{
+    let parent = archive
+        .parent()
+        .with_context(|| format!("archive path has no parent: {}", archive.display()))?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create archive cache directory {}",
+            parent.display()
+        )
+    })?;
+    let _process_guard = EMBEDDABLE_ARCHIVE_CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _archive_guard = lock_archive_cache(archive)?;
+
+    match fs::symlink_metadata(archive) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            if verify_sha256(archive, expected_sha256).is_ok() {
+                eprintln!("Using verified cached {}.", archive.display());
+                return Ok(());
+            }
+            after_invalid();
+            match fs::remove_file(archive) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to remove invalid {}", archive.display())
+                    });
+                }
+            }
+        }
+        Ok(_) => bail!(
+            "archive cache path is not a regular file: {}",
+            archive.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let temporary = tempfile::Builder::new()
+        .prefix(".lemonade-download-")
+        .tempfile_in(parent)
+        .with_context(|| {
+            format!(
+                "failed to create private download beside {}",
+                archive.display()
+            )
+        })?;
+    let temporary_path = temporary.path().to_path_buf();
+    eprintln!("Downloading {}...", archive.display());
+    download(url, &temporary_path)?;
+    verify_sha256(&temporary_path, expected_sha256)?;
+    publish_verified_archive(temporary, archive, expected_sha256)
 }
 
 fn extract_archive(archive: &Path, destination: &Path) -> Result<()> {
@@ -1288,8 +1496,10 @@ fn windows_child_path(path: &Path) -> String {
 }
 
 fn find_embeddable_root(extract_root: &Path) -> Result<PathBuf> {
+    let extract_root = fs::canonicalize(extract_root)
+        .with_context(|| format!("failed to canonicalize {}", extract_root.display()))?;
     let mut candidates = Vec::new();
-    collect_embeddable_roots(extract_root, &mut candidates, 0)?;
+    collect_embeddable_roots(&extract_root, &extract_root, &mut candidates, 0)?;
     candidates.into_iter().next().with_context(|| {
         format!(
             "no Lemonade embeddable root found in {}",
@@ -1299,6 +1509,7 @@ fn find_embeddable_root(extract_root: &Path) -> Result<PathBuf> {
 }
 
 fn collect_embeddable_roots(
+    extract_root: &Path,
     path: &Path,
     candidates: &mut Vec<PathBuf>,
     depth: usize,
@@ -1306,35 +1517,142 @@ fn collect_embeddable_roots(
     if depth > 4 {
         return Ok(());
     }
-    if lemond_path_in(path).is_file() && lemonade_path_in(path).is_file() {
-        candidates.push(path.to_path_buf());
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        bail!("archive contains symlink at {}", path.display());
+    }
+    if !metadata.file_type().is_dir() {
+        bail!("archive contains non-directory entry at {}", path.display());
+    }
+    let canonical_path = fs::canonicalize(path)?;
+    if !canonical_path.starts_with(extract_root) {
+        bail!("archive entry escapes extraction root: {}", path.display());
+    }
+
+    let lemond = lemond_path_in(path);
+    let lemonade = lemonade_path_in(path);
+    let lemond_type = fs::symlink_metadata(&lemond)
+        .ok()
+        .map(|metadata| metadata.file_type());
+    let lemonade_type = fs::symlink_metadata(&lemonade)
+        .ok()
+        .map(|metadata| metadata.file_type());
+    if lemond_type.as_ref().is_some_and(fs::FileType::is_symlink)
+        || lemonade_type.as_ref().is_some_and(fs::FileType::is_symlink)
+    {
+        bail!(
+            "archive contains symlinked Lemonade binary in {}",
+            path.display()
+        );
+    }
+    if lemond_type.as_ref().is_some_and(fs::FileType::is_file)
+        && lemonade_type.as_ref().is_some_and(fs::FileType::is_file)
+    {
+        candidates.push(canonical_path);
         return Ok(());
     }
-    if !path.is_dir() {
-        return Ok(());
-    }
+
     for entry in fs::read_dir(path)? {
         let entry = entry?;
-        if entry.path().is_dir() {
-            collect_embeddable_roots(&entry.path(), candidates, depth + 1)?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            bail!("archive contains symlink at {}", entry.path().display());
+        }
+        if file_type.is_dir() {
+            collect_embeddable_roots(extract_root, &entry.path(), candidates, depth + 1)?;
+        } else if !file_type.is_file() {
+            bail!(
+                "archive contains non-regular entry at {}",
+                entry.path().display()
+            );
         }
     }
     Ok(())
 }
 
+fn destination_child(destination: &Path, name: &std::ffi::OsStr) -> Result<PathBuf> {
+    let component = Path::new(name);
+    if component.components().count() != 1
+        || !matches!(
+            component.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        bail!(
+            "archive entry is not one destination component: {}",
+            Path::new(name).display()
+        );
+    }
+    Ok(destination.join(component))
+}
+
 fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
-    fs::create_dir_all(destination)?;
+    let source = fs::canonicalize(source)
+        .with_context(|| format!("failed to canonicalize {}", source.display()))?;
+    if !fs::symlink_metadata(&source)?.file_type().is_dir() {
+        bail!("copy source is not a directory: {}", source.display());
+    }
+    fs::create_dir(destination)
+        .with_context(|| format!("failed to create {}", destination.display()))?;
+    let destination = fs::canonicalize(destination)
+        .with_context(|| format!("failed to canonicalize {}", destination.display()))?;
+    copy_tree_entries(&source, &source, &destination, &destination)
+}
+
+fn copy_tree_entries(
+    source_root: &Path,
+    source: &Path,
+    destination_root: &Path,
+    destination: &Path,
+) -> Result<()> {
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let source_path = entry.path();
-        let destination_path = destination.join(entry.file_name());
-        if source_path.is_dir() {
-            copy_tree(&source_path, &destination_path)?;
-        } else if source_path.is_file() {
-            fs::copy(&source_path, &destination_path).with_context(|| {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            bail!("refusing to copy symlink {}", source_path.display());
+        }
+        if !file_type.is_dir() && !file_type.is_file() {
+            bail!(
+                "refusing to copy non-regular entry {}",
+                source_path.display()
+            );
+        }
+        let canonical_source = fs::canonicalize(&source_path)?;
+        if !canonical_source.starts_with(source_root) {
+            bail!(
+                "copy source escapes extraction root: {}",
+                source_path.display()
+            );
+        }
+        let destination_path = destination_child(destination, &entry.file_name())?;
+        if !destination_path.starts_with(destination_root) {
+            bail!(
+                "copy destination escapes runtime root: {}",
+                destination_path.display()
+            );
+        }
+        if file_type.is_dir() {
+            fs::create_dir(&destination_path)
+                .with_context(|| format!("failed to create {}", destination_path.display()))?;
+            let canonical_destination = fs::canonicalize(&destination_path)?;
+            if !canonical_destination.starts_with(destination_root) {
+                bail!(
+                    "copy destination escapes runtime root: {}",
+                    destination_path.display()
+                );
+            }
+            copy_tree_entries(
+                source_root,
+                &canonical_source,
+                destination_root,
+                &canonical_destination,
+            )?;
+        } else {
+            fs::copy(&canonical_source, &destination_path).with_context(|| {
                 format!(
                     "failed to copy {} to {}",
-                    source_path.display(),
+                    canonical_source.display(),
                     destination_path.display()
                 )
             })?;
@@ -1342,7 +1660,7 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let metadata = fs::metadata(&source_path)?;
+                    let metadata = fs::symlink_metadata(&canonical_source)?;
                     fs::set_permissions(
                         &destination_path,
                         fs::Permissions::from_mode(metadata.permissions().mode()),
@@ -3063,8 +3381,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// A fresh scratch directory under the crate's `target/` (dependency-free; no
-    /// `tempfile` so third-party notices stay unchanged). The base is
+    /// A fresh scratch directory under the crate's `target/`. The base is
     /// `CARGO_MANIFEST_DIR`, a compile-time constant, so the path never derives from a
     /// runtime environment read.
     fn scratch_dir(tag: &str) -> PathBuf {
@@ -3115,6 +3432,351 @@ mod tests {
             assert!(embeddable_url().ends_with("ubuntu-x64.tar.gz"));
             assert_eq!(platform_binary_name("lemond"), "lemond");
         }
+    }
+
+    #[test]
+    fn sha256_verification_accepts_matching_content_and_rejects_mismatch() {
+        let dir = scratch_dir("archive-digest");
+        let archive = dir.join("archive");
+        fs::write(&archive, b"verified archive").unwrap();
+        let expected = format!("{:x}", Sha256::digest(b"verified archive"));
+
+        verify_sha256(&archive, &expected).unwrap();
+        let error = verify_sha256(&archive, &"0".repeat(64)).unwrap_err();
+        assert!(error.to_string().contains("SHA-256 mismatch"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_valid_archive_publication_succeeds_for_both_installers() {
+        let dir = scratch_dir("valid-publication-race");
+        let archive = dir.join("archive");
+        let content = b"verified archive";
+        let expected = format!("{:x}", Sha256::digest(content));
+
+        for _ in 0..2 {
+            let mut temporary = tempfile::NamedTempFile::new_in(&dir).unwrap();
+            temporary.write_all(content).unwrap();
+            verify_sha256(temporary.path(), &expected).unwrap();
+            publish_verified_archive(temporary, &archive, &expected).unwrap();
+        }
+
+        assert_eq!(fs::read(&archive).unwrap(), content);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_invalid_archive_publication_fails_closed() {
+        let dir = scratch_dir("invalid-publication-race");
+        let archive = dir.join("archive");
+        let content = b"verified archive";
+        let expected = format!("{:x}", Sha256::digest(content));
+        let mut temporary = tempfile::NamedTempFile::new_in(&dir).unwrap();
+        temporary.write_all(content).unwrap();
+        verify_sha256(temporary.path(), &expected).unwrap();
+
+        fs::write(&archive, b"unverified concurrent archive").unwrap();
+        let error = publish_verified_archive(temporary, &archive, &expected).unwrap_err();
+        let error = format!("{error:#}");
+
+        assert!(error.contains("concurrent archive publication"));
+        assert!(error.contains("failed verification after publish conflict"));
+        assert!(error.contains("SHA-256 mismatch"));
+        assert_eq!(
+            fs::read(&archive).unwrap(),
+            b"unverified concurrent archive"
+        );
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn poisoned_cached_archive_is_removed_and_redownloaded() {
+        let dir = scratch_dir("poisoned-cache");
+        let archive = dir.join("archive");
+        fs::write(&archive, b"poisoned").unwrap();
+        let expected = format!("{:x}", Sha256::digest(b"fresh archive"));
+        let mut downloads = 0;
+
+        ensure_cached_archive("test://archive", &archive, &expected, |_, destination| {
+            downloads += 1;
+            fs::write(destination, b"fresh archive")?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(downloads, 1);
+        assert_eq!(fs::read(&archive).unwrap(), b"fresh archive");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn poisoned_process_mutex_is_recovered_before_digest_validation() {
+        let _ = std::thread::spawn(|| {
+            let _guard = EMBEDDABLE_ARCHIVE_CACHE_LOCK.lock().unwrap();
+            panic!("poison archive cache process mutex");
+        })
+        .join();
+        let dir = scratch_dir("poisoned-process-mutex");
+        let archive = dir.join("archive");
+        fs::write(&archive, b"poisoned").unwrap();
+        let expected = format!("{:x}", Sha256::digest(b"fresh archive"));
+
+        ensure_cached_archive("test://archive", &archive, &expected, |_, destination| {
+            fs::write(destination, b"fresh archive")?;
+            Ok(())
+        })
+        .unwrap();
+
+        verify_sha256(&archive, &expected).unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    const ARCHIVE_LOCK_TEST_ROLE: &str = "ROCM_LEMONADE_ARCHIVE_LOCK_TEST_ROLE";
+    const ARCHIVE_LOCK_TEST_DIR: &str = "ROCM_LEMONADE_ARCHIVE_LOCK_TEST_DIR";
+    const ARCHIVE_LOCK_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+    struct ChildGuard(Option<std::process::Child>);
+
+    impl ChildGuard {
+        fn spawn(test_exe: &Path, dir: &Path, role: &str) -> Self {
+            let child = ProcessCommand::new(test_exe)
+                .args([
+                    "--exact",
+                    "tests::archive_cache_subprocess_helper",
+                    "--nocapture",
+                ])
+                .env(ARCHIVE_LOCK_TEST_ROLE, role)
+                .env(ARCHIVE_LOCK_TEST_DIR, dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            Self(Some(child))
+        }
+
+        fn is_running(&mut self) -> bool {
+            self.0.as_mut().unwrap().try_wait().unwrap().is_none()
+        }
+
+        fn wait_until_exit(&mut self, timeout: Duration) -> std::process::ExitStatus {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                if let Some(status) = self.0.as_mut().unwrap().try_wait().unwrap() {
+                    self.0.take();
+                    return status;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for child process {}",
+                    self.0.as_ref().unwrap().id()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                if child.try_wait().ok().flatten().is_none() {
+                    let _ = child.kill();
+                }
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[test]
+    fn archive_cache_subprocess_helper() {
+        let Ok(role) = std::env::var(ARCHIVE_LOCK_TEST_ROLE) else {
+            return;
+        };
+        let dir = PathBuf::from(std::env::var_os(ARCHIVE_LOCK_TEST_DIR).unwrap());
+        let archive = dir.join("archive");
+        let expected = format!("{:x}", Sha256::digest(b"fresh archive"));
+
+        ensure_cached_archive_after_invalid(
+            "test://archive",
+            &archive,
+            &expected,
+            |_, destination| {
+                fs::write(destination, b"fresh archive")?;
+                Ok(())
+            },
+            || {
+                if role == "validator" {
+                    fs::write(dir.join("validator-paused"), b"").unwrap();
+                    let deadline = std::time::Instant::now() + ARCHIVE_LOCK_TEST_TIMEOUT;
+                    while !dir.join("release-validator").is_file() {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "timed out waiting to release validator"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            },
+        )
+        .unwrap();
+        verify_sha256(&archive, &expected).unwrap();
+    }
+
+    fn wait_for_test_file(path: &Path, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while !path.is_file() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn interprocess_lock_serializes_poisoned_validation_and_recovery() {
+        let dir = scratch_dir("interprocess-archive-lock");
+        let archive = dir.join("archive");
+        fs::write(&archive, b"poisoned").unwrap();
+        let test_exe = std::env::current_exe().unwrap();
+
+        let mut validator = ChildGuard::spawn(&test_exe, &dir, "validator");
+        wait_for_test_file(&dir.join("validator-paused"), ARCHIVE_LOCK_TEST_TIMEOUT);
+        let mut recoverer = ChildGuard::spawn(&test_exe, &dir, "recoverer");
+        wait_for_test_file(
+            &dir.join("recoverer-before-lock"),
+            ARCHIVE_LOCK_TEST_TIMEOUT,
+        );
+        wait_for_test_file(&dir.join("recoverer-heartbeat"), ARCHIVE_LOCK_TEST_TIMEOUT);
+        assert!(
+            !dir.join("recoverer-after-lock").is_file(),
+            "recoverer acquired the inter-process lock before release"
+        );
+        assert!(
+            recoverer.is_running(),
+            "recoverer exited while waiting for the inter-process lock"
+        );
+
+        fs::write(dir.join("release-validator"), b"").unwrap();
+        assert!(
+            validator
+                .wait_until_exit(ARCHIVE_LOCK_TEST_TIMEOUT)
+                .success(),
+            "validator subprocess failed"
+        );
+        assert!(
+            recoverer
+                .wait_until_exit(ARCHIVE_LOCK_TEST_TIMEOUT)
+                .success(),
+            "recoverer subprocess failed"
+        );
+        assert!(dir.join("recoverer-after-lock").is_file());
+        let expected = format!("{:x}", Sha256::digest(b"fresh archive"));
+        verify_sha256(&archive, &expected).unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn failed_download_removes_private_partial_file() {
+        let dir = scratch_dir("partial-download");
+        let archive = dir.join("archive");
+        let expected = format!("{:x}", Sha256::digest(b"complete"));
+
+        let error =
+            ensure_cached_archive("test://archive", &archive, &expected, |_, destination| {
+                fs::write(destination, b"partial")?;
+                bail!("download interrupted")
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("download interrupted"));
+        assert!(!archive.exists());
+        assert_eq!(
+            fs::read_dir(&dir)
+                .unwrap()
+                .filter(
+                    |entry| entry.as_ref().unwrap().path() != archive_lock_path(&archive).unwrap()
+                )
+                .count(),
+            0
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn valid_embeddable_tree_is_found_and_copied() {
+        let dir = scratch_dir("valid-embeddable-tree");
+        let extract = dir.join("extract");
+        let package = extract.join("package");
+        fs::create_dir_all(package.join("lib")).unwrap();
+        fs::write(lemond_path_in(&package), b"lemond").unwrap();
+        fs::write(lemonade_path_in(&package), b"lemonade").unwrap();
+        fs::write(package.join("lib").join("backend"), b"backend").unwrap();
+
+        let found = find_embeddable_root(&extract).unwrap();
+        assert_eq!(found, fs::canonicalize(&package).unwrap());
+        let destination = dir.join("runtime");
+        copy_tree(&found, &destination).unwrap();
+        assert_eq!(
+            fs::read(destination.join("lib").join("backend")).unwrap(),
+            b"backend"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn embeddable_tree_rejects_external_file_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch_dir("external-file-symlink");
+        let extract = dir.join("extract");
+        let package = extract.join("package");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(lemond_path_in(&package), b"lemond").unwrap();
+        fs::write(lemonade_path_in(&package), b"lemonade").unwrap();
+        let outside = dir.join("outside-file");
+        fs::write(&outside, b"secret").unwrap();
+        symlink(&outside, package.join("linked-file")).unwrap();
+
+        let found = find_embeddable_root(&extract).unwrap();
+        let error = copy_tree(&found, &dir.join("runtime")).unwrap_err();
+        assert!(error.to_string().contains("symlink"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn embeddable_tree_rejects_external_directory_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch_dir("external-directory-symlink");
+        let extract = dir.join("extract");
+        fs::create_dir_all(&extract).unwrap();
+        let outside = dir.join("outside-package");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(lemond_path_in(&outside), b"lemond").unwrap();
+        fs::write(lemonade_path_in(&outside), b"lemonade").unwrap();
+        symlink(&outside, extract.join("linked-package")).unwrap();
+
+        let error = find_embeddable_root(&extract).unwrap_err();
+        assert!(error.to_string().contains("symlink"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn destination_child_requires_one_normal_component() {
+        let destination = Path::new("runtime");
+        assert_eq!(
+            destination_child(destination, std::ffi::OsStr::new("bin")).unwrap(),
+            destination.join("bin")
+        );
+        assert!(destination_child(destination, std::ffi::OsStr::new("..")).is_err());
+        assert!(destination_child(destination, std::ffi::OsStr::new(".")).is_err());
+        assert!(destination_child(destination, std::ffi::OsStr::new("a/b")).is_err());
     }
 
     #[test]
