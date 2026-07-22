@@ -102,20 +102,23 @@ jobs:
               # clippy runs `cargo xtask manifest --check` against this file.
               - 'MANIFEST.md'
               - '.github/workflows/**'
-            # build-and-test runs cargo AND the python/shell smoke + acceptance
-            # steps, so it depends on the Rust set plus those scripts.
+            # build-and-test runs cargo AND the python/shell smoke steps plus the
+            # install-lifecycle E2E (`cargo xtask package` + the real installer),
+            # so it depends on the Rust set, the packaging xtask, the lifecycle
+            # feature/steps, and the installer inputs.
             heavy:
               - '**/*.rs'
               - '**/Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain*'
               - 'scripts/**'
+              - 'xtask/**'
               - 'engines/**'
               - '**/*.py'
               - '**/*.sh'
               - '**/*.ps1'
               - '**/*.feature'
-              - 'tests/e2e-cucumber/expectations.toml'
+              - 'tests/e2e-cucumber/**'
               - 'install*'
               # Pinned-key consistency compares docs/keys/* against the installers,
               # so a canonical-key-only change must trigger the heavy job that runs
@@ -230,7 +233,12 @@ jobs:
 
       - name: Acceptance install lifecycle
         if: needs.changes.outputs.heavy == 'true'
-        run: ./scripts/acceptance-install-upgrade-tui-uninstall.sh
+        # The install lifecycle (package + real installer + install/uninstall) now
+        # lives in the opt-in @lifecycle E2E set; run the Linux scenarios here.
+        env:
+          E2E_INCLUDE_LIFECYCLE: "1"
+          E2E_ONLY_LIFECYCLE: "1"
+        run: cargo xtask e2e
 
   # Fine-grained test selection (the second half of smarter CI; the path-based
   # job skip is the `changes` job above). Runs cargo's unit + integration tests
@@ -361,12 +369,15 @@ jobs:
         shell: pwsh
         run: |
           $null = [scriptblock]::Create((Get-Content .\install.ps1 -Raw))
-          $null = [scriptblock]::Create((Get-Content .\scripts\package-windows-release.ps1 -Raw))
 
       - name: Acceptance install lifecycle
         if: needs.changes.outputs.heavy == 'true'
-        shell: pwsh
-        run: .\scripts\acceptance-install-upgrade-tui-uninstall.ps1
+        # Windows install lifecycle (packaging + native-crypto verify + user-PATH
+        # + loopback HTTP + isolated smoke + uninstall) as opt-in @lifecycle E2E.
+        env:
+          E2E_INCLUDE_LIFECYCLE: "1"
+          E2E_ONLY_LIFECYCLE: "1"
+        run: cargo xtask e2e
 
   prek:
     # The fast lint gate: every toolchain-light lint/hygiene check, run from the
