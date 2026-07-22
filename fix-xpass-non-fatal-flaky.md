@@ -6,11 +6,17 @@
 **PR:** #138 — https://github.com/ROCm/rocm-cli/pull/138 (commit 3dd423a, signed + Signed-off-by)
 **Pre-PR-check:** passed — opencode (independent reviewer), 2026-07-22 (reviewed after PR open)
 **Jira:** EAI-7456 (QA, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-22 (idle flush)
+**Last Updated:** 2026-07-22
 
-**Token Usage:** in=1034 out=233516 cache_create=4558402 cache_read=68812726 calls=483
+**Token Usage:** in=1094 out=245705 cache_create=4573243 cache_read=75810976 calls=513
 
 ---
+
+## CI status — ALL REQUIRED CHECKS GREEN (run 29910874741, commit 3dd423a)
+- ✅ All 8 merge-required checks pass: Coverage, License header, clippy, build-and-test, **windows-build-and-test**, **Commit signatures + sign-off** (DCO fix worked), Lint (PowerShell), prek.
+- PR state: `MERGEABLE` but `BLOCKED` on `REVIEW_REQUIRED` — needs a human approving review. Nothing else gates merge.
+- **Non-required E2E lanes are advisory** (NOT in branch protection): Strix-Windows queues on an offline runner; the GPU lane may still show the orthogonal EAI-7052 XPASS / chat cold-cache FAIL. Neither blocks merge.
+- **Concurrency-group finding (for later, separate from #138):** `ci.yml` uses a shared per-ref group with `cancel-in-progress: true`. Supersession can't complete when the superseded run has a job queued on an OFFLINE self-hosted runner (GitHub can't cancel it) → it holds the group and stalls the new run at `pending`/0-jobs. Fix required this time: `gh api -X POST .../force-cancel` on the old run (plain `gh run cancel` does NOT reap an offline-runner job). Recommendation: split self-hosted E2E lanes into their own workflow/concurrency group so an offline runner can never stall the merge-required lanes. Capture as a work-ledger item.
 
 ## Problem
 
@@ -72,9 +78,14 @@ Scenario: Non-flaky XPASS remains fatal
 - ✅ Marked EAI-7333 vLLM entries (`serve-vllm-inference`, `serve-readiness-contract`) `flaky = true`, with grammar doc in the toml header.
 - ✅ Added 5 unit tests (flaky parse/default, flaky-XPASS non-fatal, non-flaky-XPASS fatal, unexpected-FAIL always fatal, all-expected clean). `cargo test --lib` green (18 passed); clippy clean.
 - ✅ Container gate green (exit 0, full mock E2E suite ran, reconciliation line correct). Code reviewed LGTM.
+- ✅ Commit `5ee8341` (signed), push to origin, PR #138 open.
+- ✅ DCO fix: amended `5ee8341` → `3dd423a` (added `Signed-off-by`, re-signed), force-pushed.
+- ✅ CI re-triggered (run 29910874741); all 8 merge-required checks green (including `Commit signatures + sign-off`); PR `MERGEABLE` but awaiting approving review.
+- ✅ CI deadlock diagnosed: old run's Windows job (`strix-halo-windows` runner, offline) held shared concurrency group; resolved via `gh api -X POST .../force-cancel` (plain cancel cannot reap offline-runner jobs).
 
 ### Todo 📋
 - 📋 EAI-7455 lemonade-Windows entries: N/A here — they live on `fix-e2e-share-lemonade-engine`; that branch marks them flaky after this lands.
+- 📋 PR #138 awaiting human approving review (all required checks green).
 
 ## Next Steps
 
@@ -90,7 +101,7 @@ Scenario: Non-flaky XPASS remains fatal
 
 ## Blockers / Open Questions
 
-- **BLOCKED (awaiting user):** CI run 29910874741 (commit 3dd423a, DCO amended) stuck pending; old run 29901541610's Windows job (`strix-halo-windows` runner, offline) holds shared concurrency group. Need offline Windows runner brought online to unstick both runs, or wait for GitHub timeout (unknown duration). Windows box is a separate SSH-jump access machine (not the app-dev GPU skill issue discovered mid-investigation).
+- PR #138 awaiting approving review (all required checks green; feature gated only on human review per branch protection).
 
 ## Notes
 
@@ -165,4 +176,9 @@ Scenario: Non-flaky XPASS remains fatal
 - `restore-app-dev-runner` skill checked but not applicable: bottleneck is `strix-halo-windows` (offline), not `app-dev-gpu`.
 - No further progress until Windows runner back online or GitHub times out offline job.
 
-**2026-07-22 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+**2026-07-22 (force-cancel + merge-ready state):**
+- Old CI run 29901541610 stuck on Windows job queued on offline runner; `force-cancel` via `gh api -X POST .../force-cancel` reped it (plain `gh run cancel` cannot reap offline-runner jobs).
+- New run 29910874741 freed from concurrency block, created 5 jobs, then all 8 merge-required checks completed successfully (including `Commit signatures + sign-off`).
+- PR #138 now `MERGEABLE`, gated only on `REVIEW_REQUIRED` (human approving review).
+- Non-required E2E lanes (GPU, Strix-Windows) are advisory, do not block merge.
+- Concurrency-group root cause & recommended fix (split self-hosted E2E into separate workflow) captured in WIP CI status section for later work-ledger item.
