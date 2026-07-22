@@ -15,6 +15,8 @@ mod demos;
 mod e2e;
 mod e2e_report;
 mod manifest;
+mod package;
+mod paths;
 mod powershell;
 mod signing;
 mod tpn;
@@ -129,6 +131,28 @@ enum Command {
         #[arg(long)]
         skip_build: bool,
     },
+    /// Package the built release binaries into a distribution archive
+    /// (`.tar.gz` on Unix, `.zip` on Windows) with a SHA-256 sidecar and, when a
+    /// signing key is configured, a detached signature.
+    ///
+    /// Replaces the former `scripts/package-{linux,windows}-release` scripts with
+    /// one cross-platform command. Signing inputs are read from the environment
+    /// for parity with those scripts: `ROCM_CLI_SIGNING_PRIVATE_KEY_PATH` (a PEM
+    /// file) or `ROCM_CLI_SIGNING_PRIVATE_KEY_PEM` (an inline PEM); set
+    /// `ROCM_CLI_REQUIRE_SIGNATURE=1` to fail unless a signature is produced.
+    Package {
+        /// Distribution name (the archive stem and top-level bundle directory),
+        /// e.g. `rocm-cli-1.2.3-linux-amd64`.
+        dist_name: String,
+        /// Output directory for the bundle directory and archive. Relative paths
+        /// are resolved against the workspace root. Defaults to `dist`.
+        #[arg(default_value = "dist")]
+        output_dir: PathBuf,
+        /// Optional cross-compilation target triple selecting the
+        /// `target/<triple>/release` binaries instead of `target/release`.
+        #[arg(long)]
+        target: Option<String>,
+    },
     /// Build the release `rocm` binary and run the cucumber-rs E2E suite.
     ///
     /// The harness resolves every scenario's expectation (pass / xfail / skip)
@@ -207,6 +231,11 @@ fn run() -> Result<()> {
             }
         }
         Command::Demos { names, skip_build } => demos::run(&names, skip_build)?,
+        Command::Package {
+            dist_name,
+            output_dir,
+            target,
+        } => package::run(&dist_name, &output_dir, target.as_deref())?,
         Command::E2e { args } => e2e::run(&args)?,
         Command::E2eReport {
             artifacts_dir,

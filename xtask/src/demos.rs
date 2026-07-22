@@ -18,6 +18,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
+use crate::paths::{binary_name, release_binary_dir, workspace_root};
+
 const DEFAULT_MODEL: &str = "Qwen/Qwen3.5-4B";
 const DEMOS: &[&str] = &["cli", "console"];
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -32,7 +34,7 @@ pub fn run(names: &[String], skip_build: bool) -> Result<()> {
         build_binary(&cargo, &root, "e2e-cucumber", "rocm-demo-env")?;
     }
 
-    let bin_dir = binary_dir(&root);
+    let bin_dir = release_binary_dir(&root, None);
     require_file(&bin_dir.join(binary_name("rocm")))?;
     require_file(&bin_dir.join(binary_name("rocm-demo-env")))?;
 
@@ -196,32 +198,6 @@ fn prepend_path(bin_dir: &Path) -> Result<OsString> {
     std::env::join_paths(paths).context("failed to prepend the demo binary directory to PATH")
 }
 
-fn binary_dir(root: &Path) -> PathBuf {
-    if let Some(dir) = std::env::var_os("ROCM_BIN_DIR") {
-        let dir = PathBuf::from(dir);
-        return if dir.is_absolute() {
-            dir
-        } else {
-            root.join(dir)
-        };
-    }
-    target_dir(root).join("release")
-}
-
-fn target_dir(root: &Path) -> PathBuf {
-    match std::env::var_os("CARGO_TARGET_DIR") {
-        Some(dir) => {
-            let dir = PathBuf::from(dir);
-            if dir.is_absolute() {
-                dir
-            } else {
-                root.join(dir)
-            }
-        }
-        None => root.join("target"),
-    }
-}
-
 fn unique_demo_root() -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -234,29 +210,6 @@ fn require_file(path: &Path) -> Result<()> {
         bail!("required file not found: {}", path.display());
     }
     Ok(())
-}
-
-fn binary_name(name: &str) -> String {
-    format!("{name}{}", std::env::consts::EXE_SUFFIX)
-}
-
-fn workspace_root() -> Result<PathBuf> {
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let output = Command::new(cargo)
-        .args(["locate-project", "--workspace", "--message-format", "plain"])
-        .output()
-        .context("failed to run `cargo locate-project`")?;
-    if !output.status.success() {
-        bail!(
-            "`cargo locate-project` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let manifest = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Path::new(&manifest)
-        .parent()
-        .map(Path::to_path_buf)
-        .with_context(|| format!("could not derive workspace root from {manifest}"))
 }
 
 #[cfg(test)]
