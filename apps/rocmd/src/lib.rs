@@ -2603,6 +2603,14 @@ fn stop_managed_service(paths: &AppPaths, service_id: &str) -> Result<Value> {
     let force_signaled_pids = force_terminate_remaining_processes(&signaled_pids)?;
     record.status = "stopped".to_owned();
     record.write()?;
+    // Best-effort and idempotent: a missing key file is not an error, so this
+    // is safe to call unconditionally on every stop (including loopback
+    // services that never had a key, and repeated stops of an already-stopped
+    // service). Leaving the 0600 key file behind after stop would strand a
+    // plaintext secret on disk for a service that no longer exists.
+    let _ = std::fs::remove_file(rocm_engine_protocol::endpoint_key_file_path(
+        paths, service_id,
+    ));
     Ok(json!({
         "service": record,
         "signaled_pids": signaled_pids,
@@ -3083,7 +3091,8 @@ fn supervise_service(
 
     let rocm_binary =
         std::env::current_exe().context("failed to resolve current rocm executable path")?;
-    let mut child = ProcessCommand::new(rocm_binary)
+    let mut command = ProcessCommand::new(rocm_binary);
+    command
         .args(engine_serve_http_args(
             &engine,
             &record.service_id,
@@ -3099,7 +3108,14 @@ fn supervise_service(
         ))
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(log_file_err))
+        .stderr(Stdio::from(log_file_err));
+    // Re-thread the endpoint key file (public bind only) onto the engine child,
+    // same as the initial `rocm serve` spawn. This path also runs on daemon
+    // recovery (`restart_managed_service` re-execs `rocmd supervise`), so
+    // without this a previously-authenticated public service would come back
+    // up anonymous after a crash/recover cycle.
+    apply_endpoint_key_env(&mut command, paths, &record.service_id);
+    let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn engine supervisor child for {engine}"))?;
 
@@ -3113,6 +3129,7 @@ fn supervise_service(
     let ready_service_id = record.service_id.clone();
     let ready_log_path = record.log_path.clone();
     let became_ready = wait_for_service_ready(
+        paths,
         &ready_engine,
         &ready_service_id,
         &ready_log_path,
@@ -3341,9 +3358,12 @@ fn local_webhook_event_from_request(
     }
     let service_id = request.service_id.as_deref().map(str::trim);
     if let Some(service_id) = service_id
-        && (service_id.contains('/') || service_id.contains('\\'))
+        && !service_id.is_empty()
     {
-        bail!("service_id must not contain path separators");
+        // Propagate ServiceId's own message verbatim (e.g. "... must not contain
+        // path separators") rather than wrapping it in context, which anyhow's
+        // top-level Display would otherwise hide.
+        rocm_core::ServiceId::new(service_id)?;
     }
     match watcher_hint {
         "server-recover" if service_id.unwrap_or_default().is_empty() => {
@@ -4513,7 +4533,7 @@ fn handle_server_recover_event(
         .as_deref()
         .context("server-recover event is missing service_id")?;
     let mut record = load_service_record(paths, service_id)?;
-    if !service_record_matches_recovery_event(&record, event) {
+    if !service_record_matches_recovery_event(paths, &record, event) {
         record_event(
             paths,
             state,
@@ -4532,6 +4552,7 @@ fn handle_server_recover_event(
 }
 
 fn service_record_matches_recovery_event(
+    paths: &AppPaths,
     record: &ManagedServiceRecord,
     event: &AutomationTriggerEvent,
 ) -> bool {
@@ -4541,7 +4562,7 @@ fn service_record_matches_recovery_event(
         }
         "service.endpoint_recoverable" => endpoint_service_recovery_reason(record).is_some(),
         "service.healthcheck_recoverable" => {
-            engine_healthcheck_response(&record.engine, &record.service_id)
+            engine_healthcheck_response(paths, &record.engine, &record.service_id)
                 .is_ok_and(|healthcheck| healthcheck_response_recoverable(&healthcheck))
         }
         _ => false,
@@ -4682,7 +4703,8 @@ fn find_recoverable_service(paths: &AppPaths) -> Result<Option<(ManagedServiceRe
             return Ok(Some((record, reason)));
         }
         if matches!(record.status.as_str(), "ready" | "running") {
-            let Ok(healthcheck) = engine_healthcheck_response(&record.engine, &record.service_id)
+            let Ok(healthcheck) =
+                engine_healthcheck_response(paths, &record.engine, &record.service_id)
             else {
                 if let Some(reason) = endpoint_service_recovery_reason(&record) {
                     return Ok(Some((record, reason)));
@@ -4709,9 +4731,8 @@ fn endpoint_service_recovery_reason(record: &ManagedServiceRecord) -> Option<Str
 }
 
 fn load_service_record(paths: &AppPaths, service_id: &str) -> Result<ManagedServiceRecord> {
-    if service_id.trim().is_empty() || service_id.contains('/') || service_id.contains('\\') {
-        bail!("invalid managed service id `{service_id}`");
-    }
+    rocm_core::ServiceId::new(service_id)
+        .with_context(|| format!("invalid managed service id `{service_id}`"))?;
     let manifest_path = paths.service_manifest_path(service_id);
     let bytes = fs::read(&manifest_path).with_context(|| {
         format!(
@@ -6989,6 +7010,41 @@ mod tests {
     }
 
     #[test]
+    fn apply_endpoint_key_env_sets_var_only_when_key_file_present() {
+        let (_root, paths) = temp_app_paths("apply-endpoint-key-env");
+        let service_id = "svc-endpoint-key-env";
+
+        // Loopback service: no key file has ever been written, so the child's
+        // environment must be left untouched.
+        let mut command = ProcessCommand::new("true");
+        apply_endpoint_key_env(&mut command, &paths, service_id);
+        assert!(
+            command
+                .get_envs()
+                .all(|(key, _)| key != rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV),
+            "loopback service must not receive the endpoint key env var"
+        );
+
+        // Public service: once a key file exists at the deterministic path,
+        // it must be threaded onto the child so the engine's HTTP probe
+        // authenticates.
+        let key_path = rocm_engine_protocol::endpoint_key_file_path(&paths, service_id);
+        fs::create_dir_all(paths.services_dir()).unwrap();
+        fs::write(&key_path, "secret-key").unwrap();
+        let mut command = ProcessCommand::new("true");
+        apply_endpoint_key_env(&mut command, &paths, service_id);
+        let env_value = command
+            .get_envs()
+            .find_map(|(key, value)| {
+                (key == rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV)
+                    .then_some(value)
+                    .flatten()
+            })
+            .expect("endpoint key env var must be set once the key file exists");
+        assert_eq!(env_value, key_path.as_os_str());
+    }
+
+    #[test]
     fn manifest_recovery_policy_covers_terminal_and_stale_transient_states() {
         let (root, paths) = temp_app_paths("manifest-recovery-policy");
         let mut record = ManagedServiceRecord::new(
@@ -7800,6 +7856,99 @@ mod tests {
                     .iter()
                     .any(|pid| pid.as_u64() == Some(u64::from(current_pid))))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_managed_service_removes_endpoint_key_file() -> Result<()> {
+        let (root, paths) = temp_app_paths("stop-removes-endpoint-key");
+        paths.ensure()?;
+        let current_pid = std::process::id();
+        let service_id = "svc-endpoint-key-stop";
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            service_id,
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "0.0.0.0",
+            11435,
+            "managed",
+            current_pid,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = Some(current_pid);
+        record.status = "ready".to_owned();
+        record.write()?;
+
+        let key_path = rocm_engine_protocol::endpoint_key_file_path(&paths, service_id);
+        fs::create_dir_all(paths.services_dir())?;
+        fs::write(&key_path, "secret-key")?;
+        assert!(key_path.exists());
+
+        let result = stop_managed_service(&paths, service_id);
+        // Observe the real filesystem state before the blanket temp-dir cleanup,
+        // otherwise remove_dir_all would delete the key file and mask a missing
+        // production cleanup (the regression this test guards).
+        let key_removed = !key_path.exists();
+        fs::remove_dir_all(root).ok();
+
+        let value = result?;
+        assert_eq!(
+            value
+                .get("service")
+                .and_then(|service| service.get("status"))
+                .and_then(Value::as_str),
+            Some("stopped")
+        );
+        assert!(key_removed, "endpoint key file must be removed after stop");
+        Ok(())
+    }
+
+    #[test]
+    fn stop_managed_service_without_endpoint_key_file_succeeds() -> Result<()> {
+        let (root, paths) = temp_app_paths("stop-no-endpoint-key");
+        paths.ensure()?;
+        let current_pid = std::process::id();
+        let service_id = "svc-no-endpoint-key-stop";
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            service_id,
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11435,
+            "managed",
+            current_pid,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = Some(current_pid);
+        record.status = "ready".to_owned();
+        record.write()?;
+
+        // Loopback service: no endpoint key file was ever written for it.
+        let key_path = rocm_engine_protocol::endpoint_key_file_path(&paths, service_id);
+        assert!(!key_path.exists());
+
+        let result = stop_managed_service(&paths, service_id);
+        let reloaded = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let value = result?;
+        assert_eq!(
+            value
+                .get("service")
+                .and_then(|service| service.get("status"))
+                .and_then(Value::as_str),
+            Some("stopped")
+        );
+        assert_eq!(reloaded?.status, "stopped");
+        assert!(!key_path.exists());
         Ok(())
     }
 
@@ -8716,6 +8865,7 @@ fn read_new_log_phase(log_path: &Path, pos: &mut u64) -> Option<&'static str> {
 /// timeout elapses), tailing its log file meanwhile and reporting each coarse
 /// startup phase transition via `on_phase`.
 fn wait_for_service_ready(
+    paths: &AppPaths,
     engine: &str,
     service_id: &str,
     log_path: &Path,
@@ -8732,7 +8882,7 @@ fn wait_for_service_ready(
             last_phase = Some(phase);
             on_phase(phase);
         }
-        if engine_healthcheck_ready(engine, service_id).unwrap_or(false) {
+        if engine_healthcheck_ready(paths, engine, service_id).unwrap_or(false) {
             return true;
         }
         thread::sleep(Duration::from_millis(200));
@@ -8740,15 +8890,21 @@ fn wait_for_service_ready(
     false
 }
 
-fn engine_healthcheck_ready(engine: &str, service_id: &str) -> Result<bool> {
+fn engine_healthcheck_ready(paths: &AppPaths, engine: &str, service_id: &str) -> Result<bool> {
     Ok(healthcheck_response_ready(&engine_healthcheck_response(
-        engine, service_id,
+        paths, engine, service_id,
     )?))
 }
 
-fn engine_healthcheck_response(engine: &str, service_id: &str) -> Result<HealthcheckResponse> {
+fn engine_healthcheck_response(
+    paths: &AppPaths,
+    engine: &str,
+    service_id: &str,
+) -> Result<HealthcheckResponse> {
     engine_request::<_, HealthcheckResponse>(
+        paths,
         engine,
+        service_id,
         EngineMethod::Healthcheck,
         &HealthcheckRequest {
             service_id: service_id.to_owned(),
@@ -8767,7 +8923,23 @@ fn healthcheck_response_recoverable(response: &HealthcheckResponse) -> bool {
     )
 }
 
-fn engine_request<T, R>(engine: &str, method: EngineMethod, request: &T) -> Result<R>
+/// Re-thread the endpoint key file (public bind only) onto an engine child's
+/// environment, mirroring the initial `rocm serve` spawn. `None` for a
+/// loopback service with no stored key leaves the command's environment
+/// untouched, matching the unauthenticated default.
+fn apply_endpoint_key_env(command: &mut ProcessCommand, paths: &AppPaths, service_id: &str) {
+    if let Some(key_file) = rocm_engine_protocol::endpoint_key_file_if_present(paths, service_id) {
+        command.env(rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file);
+    }
+}
+
+fn engine_request<T, R>(
+    paths: &AppPaths,
+    engine: &str,
+    service_id: &str,
+    method: EngineMethod,
+    request: &T,
+) -> Result<R>
 where
     T: Serialize,
     R: DeserializeOwned,
@@ -8778,19 +8950,25 @@ where
     };
     let engine_binary =
         std::env::current_exe().context("failed to resolve current rocm executable path")?;
-    let mut child = ProcessCommand::new(&engine_binary)
+    let mut command = ProcessCommand::new(&engine_binary);
+    command
         .arg("__engine-stdio")
         .arg(engine)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to spawn engine stdio process {}",
-                engine_binary.display()
-            )
-        })?;
+        .stderr(Stdio::piped());
+    // A protected public endpoint enforces its key on every request, including
+    // this stdio-transported healthcheck — without the carrier the engine
+    // adapter's HTTP probe is unauthenticated and the endpoint looks
+    // unreachable, which would misclassify a healthy protected service as
+    // recoverable.
+    apply_endpoint_key_env(&mut command, paths, service_id);
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "failed to spawn engine stdio process {}",
+            engine_binary.display()
+        )
+    })?;
 
     {
         let stdin = child

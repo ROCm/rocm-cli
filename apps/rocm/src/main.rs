@@ -7,6 +7,7 @@ mod bootstrap;
 mod comfyui;
 mod dash;
 mod dash_seam;
+mod endpoint_keys;
 mod logging;
 mod provider_keys;
 mod providers;
@@ -335,6 +336,14 @@ rocm serve qwen2.5-7b-instruct --verbose --device gpu_required")]
         /// and implies `--enable-auto-tool-choice`. Applies to vLLM only.
         #[arg(long, value_name = "NAME")]
         tool_call_parser: Option<String>,
+        /// API key that clients must present to a public (non-loopback) endpoint.
+        /// When binding a public interface and this is omitted, a strong key is
+        /// generated automatically. Prefer the `ROCM_SERVE_API_KEY` environment
+        /// variable over this flag so the secret does not appear in shell history
+        /// or the process table. Ignored for loopback binds, which stay
+        /// credential-free.
+        #[arg(long)]
+        api_key: Option<String>,
     },
     /// Install, start, stop, or inspect ComfyUI.
     #[command(alias = "comfy")]
@@ -1564,6 +1573,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             no_smoke_test,
             allow_public_bind,
             tool_call_parser,
+            api_key,
         }) => serve(ServeArgs {
             model,
             engine,
@@ -1579,6 +1589,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             no_smoke_test,
             allow_public_bind,
             tool_call_parser,
+            api_key,
         }),
         Some(Command::Comfyui { command }) => comfyui(command),
         Some(Command::Services { command }) => services(command),
@@ -3956,6 +3967,7 @@ struct ServeArgs {
     no_smoke_test: bool,
     allow_public_bind: bool,
     tool_call_parser: Option<String>,
+    api_key: Option<String>,
 }
 
 fn serve(args: ServeArgs) -> Result<()> {
@@ -3974,9 +3986,21 @@ fn serve(args: ServeArgs) -> Result<()> {
         no_smoke_test,
         allow_public_bind,
         tool_call_parser,
+        api_key,
     } = args;
     let _ = managed; // background is now the default; --managed is accepted as an explicit synonym.
     validate_bind_host(&host, allow_public_bind)?;
+    // Loopback stays credential-free; a public bind must be authenticated. Resolve
+    // (or generate) the endpoint key now so every downstream path — engine spawn,
+    // readiness probe, smoke test, and the client-config we print — shares one value.
+    // The `--api-key` flag wins; otherwise fall back to `ROCM_SERVE_API_KEY` (read
+    // here rather than via clap's `env` so it works without clap's `env` feature).
+    let supplied_key = api_key.or_else(|| {
+        std::env::var("ROCM_SERVE_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    });
+    let endpoint_auth = resolve_endpoint_auth(&host, supplied_key.as_deref())?;
     let paths = AppPaths::discover()?;
     let mut config = RocmCliConfig::load(&paths)?;
     // Host GPU detection can involve sysfs/WSL probing, so only run it when engine
@@ -4002,6 +4026,10 @@ fn serve(args: ServeArgs) -> Result<()> {
         host_gpu_summary.as_ref(),
     );
     let selected_engine = serve_engine.engine.clone();
+    // Fail closed: a public bind must be authenticated, but Windows managed
+    // Lemonade cannot receive the key (see `ensure_public_bind_engine_supported`),
+    // so refuse rather than launch an open public server.
+    ensure_public_bind_engine_supported(&selected_engine, endpoint_auth.is_some(), cfg!(windows))?;
     let engine_model_ref =
         serve_model_ref_for_engine(&model, shared_recipe.as_ref(), &selected_engine);
     let recipe_hint = shared_recipe
@@ -4170,6 +4198,13 @@ fn serve(args: ServeArgs) -> Result<()> {
     let managed_runtime_id = resolved_selection.runtime_id.clone();
     let managed_env_id = resolved_selection.env_id.clone();
 
+    // Persist the endpoint key (public bind only) in a 0600 file so the engine
+    // child, the restart/recovery path, and inspection commands can retrieve it by
+    // service id. Loopback binds resolve to `None` and store nothing.
+    if let Some(key) = endpoint_auth.as_deref() {
+        endpoint_keys::store_endpoint_api_key(&paths, &service_id, key)?;
+    }
+
     if background {
         let mut spinner =
             serve_summary::Spinner::new(format!("Starting {model} on {selected_engine}…"));
@@ -4186,9 +4221,28 @@ fn serve(args: ServeArgs) -> Result<()> {
             managed_runtime_id.as_deref(),
             managed_env_id.as_deref(),
             resolve.engine_recipe.as_ref(),
+            endpoint_auth.as_deref(),
             &mut |_elapsed| spinner.tick(),
         )?;
         ensure_background_helper_running_quiet(summary_mode)?;
+
+        // An equivalent service was already running, so nothing was spawned and the
+        // freshly generated key is unused — drop it rather than leave it orphaned in
+        // storage. The existing service keeps its own key.
+        if report.already_running {
+            drop_orphaned_endpoint_key_on_already_running(
+                &paths,
+                &service_id,
+                endpoint_auth.as_deref(),
+            );
+        }
+        // Safe to move `endpoint_auth` here: this branch always returns, so the
+        // fall-through (attached) path below never observes it moved.
+        let launched_key = if report.already_running {
+            None
+        } else {
+            endpoint_auth
+        };
 
         if summary_mode {
             // Best-effort inference smoke test, on by default (opt out with
@@ -4196,6 +4250,10 @@ fn serve(args: ServeArgs) -> Result<()> {
             // just launched; skipped when metrics could not be shown anyway.
             let metrics = if !no_smoke_test && !report.already_running && report.status == "ready" {
                 spinner.set_label("Running smoke test…");
+                // The local provider resolves the endpoint key from the per-service
+                // 0600 key file by service id, so the smoke test authenticates
+                // against a protected public endpoint without threading the secret
+                // through here.
                 serve_summary::run_smoke_test(&paths, &resolve.canonical_model_id)
             } else {
                 serve_summary::SmokeMetrics::default()
@@ -4218,12 +4276,13 @@ fn serve(args: ServeArgs) -> Result<()> {
                 status: report.status.clone(),
                 already_running: report.already_running,
                 metrics,
+                api_key: launched_key,
                 notes,
             };
             print!("{}", serve_summary::render_summary(&summary));
         } else {
             spinner.clear();
-            print_managed_launch_plain(&report);
+            print_managed_launch_plain(&report, launched_key.as_deref());
         }
         return Ok(());
     }
@@ -4238,6 +4297,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         &gpu_indices,
         resolved_selection.runtime_id.as_deref(),
         resolved_selection.env_id.as_deref(),
+        endpoint_auth.as_deref(),
     )
 }
 
@@ -4284,6 +4344,108 @@ fn validate_bind_host(host: &str, allow_public_bind: bool) -> Result<()> {
 
 fn is_loopback_host(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+/// Resolve the API key that will guard this endpoint, applying the
+/// loopback-vs-public policy for `rocm serve`.
+///
+/// - **Loopback host** → `None`: local serving stays credential-free (the
+///   unchanged default). Any key supplied for a loopback bind is ignored and
+///   nothing is persisted — loopback needs no auth.
+/// - **Public host** → `Some(key)`: use the user-supplied key when present,
+///   otherwise generate a strong random one so a public endpoint can never come
+///   up anonymous. An empty/whitespace supplied key is rejected rather than
+///   silently treated as "no auth".
+fn resolve_endpoint_auth(host: &str, supplied: Option<&str>) -> Result<Option<String>> {
+    if is_loopback_host(host) {
+        return Ok(None);
+    }
+    match supplied {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                bail!(
+                    "`rocm serve --api-key` (or ROCM_SERVE_API_KEY) was empty; a public \
+                     endpoint must be protected by a non-empty API key"
+                );
+            }
+            // The key is later interpolated verbatim into raw `Authorization:
+            // Bearer {key}\r\n` header lines; reject a control character (e.g. an
+            // embedded CR/LF) here so a crafted key cannot inject extra headers.
+            if rocm_core::endpoint_api_key_has_forbidden_chars(trimmed) {
+                bail!(
+                    "`rocm serve --api-key` (or ROCM_SERVE_API_KEY) contained a control \
+                     character such as a carriage return or newline; an endpoint API key \
+                     must be a single line of printable characters"
+                );
+            }
+            Ok(Some(trimmed.to_owned()))
+        }
+        None => Ok(Some(rocm_core::generate_endpoint_api_key())),
+    }
+}
+
+/// When an equivalent managed service is already running, the endpoint key
+/// serve() freshly stored for this attempt is unused — drop it so it is not
+/// orphaned in storage. The already-running service keeps its own key.
+/// Best-effort and idempotent; a loopback attempt (`freshly_stored == None`)
+/// is a no-op.
+fn drop_orphaned_endpoint_key_on_already_running(
+    paths: &AppPaths,
+    service_id: &str,
+    freshly_stored: Option<&str>,
+) {
+    if freshly_stored.is_some() {
+        endpoint_keys::clear_endpoint_api_key(paths, service_id);
+    }
+}
+
+/// Reject engine/platform combinations that cannot enforce a public endpoint's
+/// API key, so a public bind fails closed instead of coming up unauthenticated.
+///
+/// The one such case today: Windows managed Lemonade. Its server reads the
+/// value-typed `LEMONADE_API_KEY` env var, but the Windows detached-spawn
+/// primitive only carries path-valued env overrides, so the key never reaches it.
+/// vLLM enforces auth on every platform (`VLLM_API_KEY`), and loopback binds
+/// (`public_bind == false`) need no key — both pass. `is_windows` is a parameter
+/// so both branches are unit-testable off-Windows.
+fn ensure_public_bind_engine_supported(
+    engine: &str,
+    public_bind: bool,
+    is_windows: bool,
+) -> Result<()> {
+    if public_bind && is_windows && engine == "lemonade" {
+        bail!(
+            "public binding with the lemonade engine is not supported on Windows: the endpoint \
+             API key cannot be enforced there. Use `--engine vllm`, or bind a loopback host \
+             (the default 127.0.0.1)."
+        );
+    }
+    Ok(())
+}
+
+/// Write `contents` to `path` with owner-only (0600) permissions on Unix so a
+/// secret is not world-readable. On non-Unix, default permissions apply.
+pub(crate) fn write_private_file_0600(path: &Path, contents: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        std::io::Write::write_all(&mut file, contents)?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, contents)?;
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -4470,10 +4632,18 @@ fn spawn_managed_engine_child(
         Some(&record.log_path),
     )?;
     let engine_envs_root = env_root_for_service(paths, engine, runtime_id, env_id)?;
+    // Hand the child the *path* to the endpoint key file (public bind only) via the
+    // environment. A path — not the secret value — is what the detached-spawn
+    // primitives accept as an env override, and it keeps the key off both the argv
+    // and the environment block. `serve()` wrote the file before spawning.
+    let endpoint_key_file = endpoint_keys::endpoint_key_file_if_present(paths, service_id);
     #[cfg(windows)]
     let child_pid = {
         let env_values = app_path_env_var_values(paths, engine_envs_root.as_deref());
-        let env_refs = app_path_env_var_refs(&env_values);
+        let mut env_refs = app_path_env_var_refs(&env_values);
+        if let Some(key_file) = endpoint_key_file.as_deref() {
+            env_refs.push((rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file));
+        }
         rocm_core::spawn_detached_no_inherit(&current_exe, &serve_args, &env_refs)
             .context("failed to launch managed engine process")?
     };
@@ -4486,6 +4656,9 @@ fn spawn_managed_engine_child(
         apply_app_path_env(&mut command, paths);
         if let Some(engine_envs_root) = engine_envs_root.as_deref() {
             command.env("ROCM_CLI_ENGINE_ENVS_ROOT", engine_envs_root);
+        }
+        if let Some(key_file) = endpoint_key_file.as_deref() {
+            command.env(rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file);
         }
         let mut child = command
             .spawn()
@@ -4530,6 +4703,7 @@ fn start_managed_service(
     runtime_id: Option<&str>,
     env_id: Option<&str>,
     engine_recipe: Option<&EngineRecipeHint>,
+    endpoint_api_key: Option<&str>,
     on_wait_tick: &mut dyn FnMut(Duration),
 ) -> Result<ManagedLaunchReport> {
     let paths = AppPaths::discover()?;
@@ -4559,6 +4733,7 @@ fn start_managed_service(
         host,
         port,
         &resolve.canonical_model_id,
+        endpoint_api_key,
         Duration::from_secs(45),
         on_wait_tick,
     );
@@ -4594,7 +4769,7 @@ fn start_managed_service(
 /// non-interactive output (piped, CI, the chat assistant's `serve --managed`),
 /// where the animated summary is inappropriate. The interactive path renders the
 /// summary table via [`serve_summary`] instead.
-fn print_managed_launch_plain(report: &ManagedLaunchReport) {
+fn print_managed_launch_plain(report: &ManagedLaunchReport, endpoint_api_key: Option<&str>) {
     if report.already_running {
         println!("managed service already running");
         println!("  service_id: {}", report.service_id);
@@ -4609,6 +4784,12 @@ fn print_managed_launch_plain(report: &ManagedLaunchReport) {
         println!("  process_pid: {child_pid}");
     }
     println!("  endpoint: {}", report.endpoint_url);
+    if let Some(key) = endpoint_api_key {
+        print!(
+            "{}",
+            render_endpoint_client_config(&report.endpoint_url, key)
+        );
+    }
     if let Some(log_path) = report.log_path.as_deref() {
         println!("  log_path: {}", log_path.display());
     }
@@ -4616,6 +4797,25 @@ fn print_managed_launch_plain(report: &ManagedLaunchReport) {
         println!("  manifest_path: {}", manifest_path.display());
     }
     println!("  readiness: {}", report.status);
+}
+
+/// Render the one-time secure client configuration for a public, authenticated
+/// endpoint. This is the *intended* channel for delivering the key to the user
+/// (unlike logs/status, which must never contain it) — it prints the key once at
+/// launch alongside a ready-to-use example. Callers only invoke this for a
+/// non-loopback bind that generated/received a key.
+fn render_endpoint_client_config(endpoint_url: &str, api_key: &str) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "  api key: {api_key}");
+    let _ = writeln!(
+        out,
+        "  note: this key is shown only now — clients must send `Authorization: Bearer <key>`"
+    );
+    let _ = writeln!(
+        out,
+        "  example: curl -H \"Authorization: Bearer {api_key}\" {endpoint_url}/models"
+    );
+    out
 }
 
 /// The "should we spawn?" decision for [`ensure_background_helper_running`],
@@ -4704,6 +4904,7 @@ fn run_attached_service(
     gpu_indices: &[u32],
     runtime_id: Option<&str>,
     env_id: Option<&str>,
+    endpoint_api_key: Option<&str>,
 ) -> Result<()> {
     let paths = AppPaths::discover()?;
 
@@ -4733,6 +4934,7 @@ fn run_attached_service(
             println!("  status: {}", report.status);
             println!("  logs: rocm logs {}", report.service_id);
             println!("  stop: rocm services stop {} --yes", report.service_id);
+            drop_orphaned_endpoint_key_on_already_running(&paths, service_id, endpoint_api_key);
             return Ok(());
         }
         ManagedSpawn::Spawned { record, child_pid } => {
@@ -4754,6 +4956,9 @@ fn run_attached_service(
     let endpoint = format!("{}/v1", format_http_base_url(host, port));
     println!("  service_id: {service_id}");
     println!("  endpoint: {endpoint}");
+    if let Some(key) = endpoint_api_key {
+        print!("{}", render_endpoint_client_config(&endpoint, key));
+    }
     println!("  streaming engine logs — Ctrl-D detaches (leaves it running), Ctrl-C stops it");
     println!();
 
@@ -12385,7 +12590,7 @@ fn load_managed_service(paths: &AppPaths, service_id: &str) -> Result<ManagedSer
         .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
     record.normalize_paths_for_host();
     let refreshed_from_engine = record.refresh_from_engine_state().unwrap_or(false);
-    let refreshed_liveness = refresh_managed_service_runtime_liveness(&mut record);
+    let refreshed_liveness = refresh_managed_service_runtime_liveness(paths, &mut record);
     if refreshed_from_engine || refreshed_liveness {
         let _ = record.write();
     }
@@ -12559,6 +12764,10 @@ fn stop_internal_managed_service(paths: &AppPaths, service_id: &str) -> Result<s
         record.status = "stopped".to_owned();
     }
     record.write()?;
+    // Drop the endpoint key with the service by deleting its 0600 key file.
+    // Best-effort — a stopped service must not fail to stop just because key
+    // cleanup did.
+    endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
     let engine_stop = match engine_stop {
         Ok(response) => serde_json::json!({
             "attempted": true,
@@ -12602,7 +12811,15 @@ fn restart_internal_managed_service(
     service_id: &str,
 ) -> Result<ManagedServiceRecord> {
     let mut record = load_managed_service(paths, service_id)?;
+    // Preserve the endpoint key across the restart: `stop_internal_managed_service`
+    // deletes the key file (correct on a real stop), but a restart must bring the
+    // service back on the same public host with the same auth. Capture it first and
+    // re-store it after the stop so the spawn below hands the child the same key.
+    let preserved_endpoint_key = endpoint_keys::endpoint_api_key(paths, service_id);
     let _ = stop_internal_managed_service(paths, service_id);
+    if let Some(key) = preserved_endpoint_key.as_deref() {
+        endpoint_keys::store_endpoint_api_key(paths, service_id, key)?;
+    }
     let policy = parse_device_policy(record.device_policy.as_deref())?;
     fs::OpenOptions::new()
         .create(true)
@@ -12636,10 +12853,18 @@ fn restart_internal_managed_service(
         record.runtime_id.as_deref(),
         record.env_id.as_deref(),
     )?;
+    // A restarted public service comes back authenticated: its 0600 key file
+    // persists across restarts (removed only on stop), so hand the child the same
+    // file and reuse the key for the readiness probe.
+    let endpoint_key_file = endpoint_keys::endpoint_key_file_if_present(paths, &record.service_id);
+    let endpoint_api_key = endpoint_keys::endpoint_api_key(paths, &record.service_id);
     #[cfg(windows)]
     let child_pid = {
         let env_values = app_path_env_var_values(paths, engine_envs_root.as_deref());
-        let env_refs = app_path_env_var_refs(&env_values);
+        let mut env_refs = app_path_env_var_refs(&env_values);
+        if let Some(key_file) = endpoint_key_file.as_deref() {
+            env_refs.push((rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file));
+        }
         rocm_core::spawn_detached_no_inherit(&current_exe, &serve_args, &env_refs)
             .context("failed to restart managed engine process")?
     };
@@ -12652,6 +12877,9 @@ fn restart_internal_managed_service(
         apply_app_path_env(&mut command, paths);
         if let Some(engine_envs_root) = engine_envs_root.as_deref() {
             command.env("ROCM_CLI_ENGINE_ENVS_ROOT", engine_envs_root);
+        }
+        if let Some(key_file) = endpoint_key_file.as_deref() {
+            command.env(rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file);
         }
         let mut child = command
             .spawn()
@@ -12684,6 +12912,7 @@ fn restart_internal_managed_service(
         &record.host,
         record.port,
         &record.canonical_model_id,
+        endpoint_api_key.as_deref(),
         Duration::from_secs(45),
     ) {
         "ready".to_owned()
@@ -12695,12 +12924,9 @@ fn restart_internal_managed_service(
 }
 
 fn validate_service_id(service_id: &str) -> Result<()> {
-    if service_id.trim().is_empty() {
-        bail!("service id must not be empty");
-    }
-    if service_id.contains('/') || service_id.contains('\\') {
-        bail!("service id must not contain path separators");
-    }
+    // Single source of truth for what makes an id safe as a filesystem path
+    // component (rejects empty, path separators, `..`, control chars).
+    rocm_core::ServiceId::new(service_id)?;
     Ok(())
 }
 
@@ -13460,14 +13686,24 @@ fn managed_service_running_state(status: &str) -> &'static str {
 
 const SERVICE_LIVENESS_CHECK_TIMEOUT: Duration = Duration::from_millis(750);
 
-fn refresh_managed_service_runtime_liveness(record: &mut ManagedServiceRecord) -> bool {
+fn refresh_managed_service_runtime_liveness(
+    paths: &AppPaths,
+    record: &mut ManagedServiceRecord,
+) -> bool {
     if !managed_service_is_live(record) {
         return false;
     }
 
+    // Probe with the service's key so a protected public service is not mistaken
+    // for dead (an anonymous /v1/models would 401).
+    let endpoint_api_key = endpoint_keys::endpoint_api_key(paths, &record.service_id);
     let endpoint_ready = matches!(record.status.as_str(), "ready" | "running")
-        && managed_service_endpoint_model_ready(record, SERVICE_LIVENESS_CHECK_TIMEOUT)
-            .unwrap_or(false);
+        && managed_service_endpoint_model_ready(
+            record,
+            endpoint_api_key.as_deref(),
+            SERVICE_LIVENESS_CHECK_TIMEOUT,
+        )
+        .unwrap_or(false);
     if endpoint_ready {
         // Mirror `providers.rs::ready_local_services()`: a live, probe-passing
         // service should be persisted as "ready", not left stuck at "running".
@@ -13533,7 +13769,7 @@ pub(crate) fn load_managed_services(paths: &AppPaths) -> Result<Vec<ManagedServi
         if let Ok(mut record) = serde_json::from_slice::<ManagedServiceRecord>(&bytes) {
             record.normalize_paths_for_host();
             let refreshed_from_engine = record.refresh_from_engine_state().unwrap_or(false);
-            let refreshed_liveness = refresh_managed_service_runtime_liveness(&mut record);
+            let refreshed_liveness = refresh_managed_service_runtime_liveness(paths, &mut record);
             if refreshed_from_engine || refreshed_liveness {
                 let _ = record.write();
             }
@@ -15759,6 +15995,7 @@ fn wait_for_service_http_ready(
     host: &str,
     port: u16,
     canonical_model_id: &str,
+    endpoint_api_key: Option<&str>,
     timeout: Duration,
 ) -> bool {
     wait_for_service_http_ready_with_progress(
@@ -15766,6 +16003,7 @@ fn wait_for_service_http_ready(
         host,
         port,
         canonical_model_id,
+        endpoint_api_key,
         timeout,
         &mut |_elapsed| {},
     )
@@ -15775,27 +16013,33 @@ fn wait_for_service_http_ready(
 /// elapses, invoking `on_tick(elapsed)` once per polling iteration so a caller can
 /// animate a spinner. Engine-neutral: `service_http_readiness_paths` already maps
 /// each engine to the right health path and normalizes the response to ready/not.
+/// `endpoint_api_key` is sent as a bearer token so the probe still succeeds against
+/// a public endpoint that now requires authentication.
 fn wait_for_service_http_ready_with_progress(
     engine: &str,
     host: &str,
     port: u16,
     canonical_model_id: &str,
+    endpoint_api_key: Option<&str>,
     timeout: Duration,
     on_tick: &mut dyn FnMut(Duration),
 ) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
         for path in service_http_readiness_paths(engine) {
-            if let Ok((status, body)) =
-                http_get_local_service(host, port, path, Duration::from_millis(750))
-                && service_http_readiness_response_ready(
-                    engine,
-                    path,
-                    status,
-                    &body,
-                    canonical_model_id,
-                )
-            {
+            if let Ok((status, body)) = http_get_local_service(
+                host,
+                port,
+                path,
+                endpoint_api_key,
+                Duration::from_millis(750),
+            ) && service_http_readiness_response_ready(
+                engine,
+                path,
+                status,
+                &body,
+                canonical_model_id,
+            ) {
                 return true;
             }
         }
@@ -15816,12 +16060,20 @@ fn http_get_local_service(
     host: &str,
     port: u16,
     path: &str,
+    endpoint_api_key: Option<&str>,
     timeout: Duration,
 ) -> Result<(u16, String)> {
     let mut stream = connect_tcp_stream(host, port, timeout)?;
     let host_header = format_host_port(host, port);
-    let request =
-        format!("GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n");
+    // Authenticate the probe when the endpoint is protected; loopback endpoints
+    // pass `None` and the header is omitted.
+    let auth_header = match endpoint_api_key {
+        Some(key) => format!("Authorization: Bearer {key}\r\n"),
+        None => String::new(),
+    };
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host_header}\r\n{auth_header}Connection: close\r\n\r\n"
+    );
     write_all_tcp_stream(&mut stream, request.as_bytes())
         .context("failed to write service readiness request")?;
     let response = read_tcp_stream_to_string(&mut stream)
@@ -20240,6 +20492,99 @@ install therock";
             "{error:#}"
         );
         validate_bind_host("0.0.0.0", true).unwrap();
+    }
+
+    #[test]
+    fn resolve_endpoint_auth_loopback_stays_credential_free() {
+        // Loopback binds never require auth, even if a key is supplied.
+        for host in ["127.0.0.1", "localhost", "::1"] {
+            assert_eq!(resolve_endpoint_auth(host, None).unwrap(), None);
+            assert_eq!(resolve_endpoint_auth(host, Some("ignored")).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn resolve_endpoint_auth_public_uses_supplied_key_trimmed() {
+        let key = resolve_endpoint_auth("0.0.0.0", Some("  my-key  "))
+            .unwrap()
+            .expect("public bind must have a key");
+        assert_eq!(key, "my-key");
+    }
+
+    #[test]
+    fn resolve_endpoint_auth_public_generates_key_when_absent() {
+        let key = resolve_endpoint_auth("0.0.0.0", None)
+            .unwrap()
+            .expect("public bind must generate a key");
+        assert_eq!(key.len(), 48);
+        assert!(key.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn resolve_endpoint_auth_public_rejects_empty_supplied_key() {
+        let error = resolve_endpoint_auth("0.0.0.0", Some("   ")).unwrap_err();
+        assert!(error.to_string().contains("non-empty"), "{error:#}");
+    }
+
+    #[test]
+    fn resolve_endpoint_auth_public_rejects_embedded_crlf() {
+        // A supplied key survives `trim()` with embedded CR/LF intact and would
+        // otherwise be interpolated into a raw `Authorization: Bearer` header,
+        // injecting an extra header line. It must be rejected at input validation.
+        for supplied in [
+            "good-key\r\nX-Injected: value",
+            "good-key\nmore",
+            "line\rreturn",
+        ] {
+            let error = resolve_endpoint_auth("0.0.0.0", Some(supplied)).unwrap_err();
+            assert!(error.to_string().contains("control character"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn drop_orphaned_endpoint_key_on_already_running_clears_stored_key() {
+        let (root, paths) = test_paths("drop-orphaned-key-stored");
+        let service_id = "svc-orphaned";
+        endpoint_keys::store_endpoint_api_key(&paths, service_id, "secret-key").unwrap();
+
+        drop_orphaned_endpoint_key_on_already_running(&paths, service_id, Some("secret-key"));
+
+        assert_eq!(endpoint_keys::endpoint_api_key(&paths, service_id), None);
+        assert!(!endpoint_keys::endpoint_key_file_path(&paths, service_id).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn drop_orphaned_endpoint_key_on_already_running_is_noop_for_loopback() {
+        // A loopback attempt never stores a key (`freshly_stored == None`), so the
+        // helper must not panic or error, and no file must appear.
+        let (root, paths) = test_paths("drop-orphaned-key-loopback");
+        let service_id = "svc-loopback";
+
+        drop_orphaned_endpoint_key_on_already_running(&paths, service_id, None);
+
+        assert_eq!(endpoint_keys::endpoint_api_key(&paths, service_id), None);
+        assert!(!endpoint_keys::endpoint_key_file_path(&paths, service_id).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn public_bind_fails_closed_for_windows_lemonade_only() {
+        // Windows + Lemonade + public bind: refuse (cannot enforce the key).
+        let error = ensure_public_bind_engine_supported("lemonade", true, true).unwrap_err();
+        assert!(error.to_string().contains("lemonade"), "{error:#}");
+        // Every other combination is allowed:
+        ensure_public_bind_engine_supported("vllm", true, true).unwrap(); // vLLM enforces auth on Windows
+        ensure_public_bind_engine_supported("lemonade", true, false).unwrap(); // non-Windows
+        ensure_public_bind_engine_supported("lemonade", false, true).unwrap(); // loopback needs no key
+    }
+
+    #[test]
+    fn endpoint_client_config_shows_key_once_with_bearer_guidance() {
+        let rendered = render_endpoint_client_config("http://0.0.0.0:11435/v1", "secret-123");
+        assert!(rendered.contains("secret-123"), "{rendered}");
+        assert!(rendered.contains("Authorization: Bearer"), "{rendered}");
+        assert!(rendered.contains("shown only now"), "{rendered}");
     }
 
     #[test]

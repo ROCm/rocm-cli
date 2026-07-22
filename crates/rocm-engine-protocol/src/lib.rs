@@ -14,6 +14,117 @@ pub const ENGINE_RECIPE_CONTRACT_VERSION: &str = "0.1.0";
 pub const ENGINE_PLUGIN_BINARY_PREFIX: &str = "rocm-engine-";
 pub const DEFAULT_LOG_TAIL_LINES: usize = 80;
 
+/// Environment variable holding a *path* to a 0600 file whose contents are the
+/// endpoint API key.
+///
+/// `rocm serve` sets this explicitly on the internal `__engine-serve-http` child
+/// (never argv), and each engine adapter reads it to decide whether to enforce
+/// authentication. A path — not the secret value — is what the detached-spawn
+/// primitives accept as an env override, and a key file keeps the secret off both
+/// the argv and the environment block.
+///
+/// The adapter reads *only* this explicitly-set carrier, never a value-bearing
+/// variable: the engine child inherits the launching shell's environment, so
+/// reading a variable like `ROCM_SERVE_API_KEY` would let a stray value in the
+/// user's shell silently authenticate an endpoint we intended to leave open
+/// (e.g. a loopback bind).
+pub const ENDPOINT_API_KEY_FILE_ENV: &str = "ROCM_SERVE_API_KEY_FILE";
+
+/// Resolve the endpoint API key an engine adapter must enforce, if any.
+///
+/// Reads the key file named by [`ENDPOINT_API_KEY_FILE_ENV`]. Returns `None` when
+/// the variable is unset or the file is empty/missing — i.e. an unauthenticated
+/// (loopback) endpoint. The value is trimmed of surrounding whitespace/newlines.
+pub fn resolve_endpoint_api_key() -> Option<String> {
+    let path = std::env::var(ENDPOINT_API_KEY_FILE_ENV).ok()?;
+    endpoint_api_key_from_file(std::path::Path::new(&path))
+}
+
+/// Resolve the *path* to the endpoint API key file, for engines that authenticate
+/// from a file rather than an env var (e.g. llama-server's `--api-key-file`).
+///
+/// Returns the path named by [`ENDPOINT_API_KEY_FILE_ENV`] when it exists and holds
+/// a non-empty key — the same condition under which [`resolve_endpoint_api_key`]
+/// returns `Some`. Handing the child the CLI-managed key file directly (rather than
+/// copying the secret into a second file) keeps the key's lifecycle owned by
+/// `rocm serve`, which creates the file before spawn and deletes it on stop, so no
+/// stale plaintext copy is ever left behind.
+pub fn resolve_endpoint_api_key_file() -> Option<PathBuf> {
+    endpoint_api_key_file_if_valid(&PathBuf::from(
+        std::env::var(ENDPOINT_API_KEY_FILE_ENV).ok()?,
+    ))
+}
+
+/// Return `path` when it holds a non-empty endpoint key, otherwise `None`.
+///
+/// Uses [`endpoint_api_key_from_file`] for the key check. Split out from
+/// [`resolve_endpoint_api_key_file`] so the key-presence gate is testable without
+/// mutating the process environment.
+pub fn endpoint_api_key_file_if_valid(path: &std::path::Path) -> Option<PathBuf> {
+    endpoint_api_key_from_file(path).map(|_| path.to_path_buf())
+}
+
+/// Read and trim an endpoint API key from `path`.
+///
+/// Returns `None` for a missing file or empty/whitespace-only contents. Split out
+/// from [`resolve_endpoint_api_key`] so it is testable without mutating the
+/// process environment.
+pub fn endpoint_api_key_from_file(path: &std::path::Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let trimmed = contents.trim();
+    // The key is interpolated verbatim into raw `Authorization: Bearer` header
+    // lines, so a key file holding an embedded control character (e.g. CR/LF) is
+    // treated as no valid key rather than passed through — defense in depth behind
+    // the CLI's input validation, which already rejects such keys before writing.
+    if trimmed.is_empty() || rocm_core::endpoint_api_key_has_forbidden_chars(trimmed) {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+/// Deterministic path of the 0600 endpoint key file for `service_id`.
+///
+/// Shared so both binaries that need to locate a service's key file — `rocm`
+/// (which owns writing and clearing it) and `rocmd` (which only re-threads
+/// [`ENDPOINT_API_KEY_FILE_ENV`] onto engine children it spawns for daemon
+/// recovery and healthchecks) — derive the same path without either depending
+/// on the other's private modules.
+///
+/// Callers must pass a validated id (see [`rocm_core::ServiceId`]); as
+/// defense-in-depth this asserts the built path is a direct child of the
+/// services directory, so a stray separator or `..` in `service_id` fails
+/// closed here rather than silently escaping the directory.
+#[must_use]
+pub fn endpoint_key_file_path(paths: &rocm_core::AppPaths, service_id: &str) -> PathBuf {
+    let services_dir = paths.services_dir();
+    let path = services_dir.join(format!("{service_id}.endpoint-key"));
+    assert_eq!(
+        path.parent(),
+        Some(services_dir.as_path()),
+        "endpoint key path must be a direct child of the services directory; \
+         got service id {service_id:?}"
+    );
+    path
+}
+
+/// The key file path if it exists, for handing to an engine child via
+/// [`ENDPOINT_API_KEY_FILE_ENV`]. `None` for loopback services with no stored
+/// key.
+///
+/// This is only an existence check, not a validity check — callers that need
+/// to know whether the file holds a *usable* key (as opposed to deciding
+/// whether to set the env var at all) should read it with
+/// [`endpoint_api_key_from_file`] instead.
+#[must_use]
+pub fn endpoint_key_file_if_present(
+    paths: &rocm_core::AppPaths,
+    service_id: &str,
+) -> Option<PathBuf> {
+    let path = endpoint_key_file_path(paths, service_id);
+    path.exists().then_some(path)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnginePluginDescriptor {
     pub id: String,
@@ -445,6 +556,113 @@ pub struct LogsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_api_key_from_file_reads_and_trims() {
+        let dir = unique_temp_dir("endpoint-key");
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_file = dir.join("endpoint-api-key");
+        std::fs::write(&key_file, "  secret-key-value\n").unwrap();
+        assert_eq!(
+            endpoint_api_key_from_file(&key_file),
+            Some("secret-key-value".to_owned())
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn endpoint_api_key_from_file_none_for_missing_or_empty() {
+        let dir = unique_temp_dir("endpoint-key-empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("does-not-exist");
+        assert_eq!(endpoint_api_key_from_file(&missing), None);
+        let empty = dir.join("empty");
+        std::fs::write(&empty, "   \n").unwrap();
+        assert_eq!(endpoint_api_key_from_file(&empty), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn endpoint_api_key_from_file_rejects_embedded_control_chars() {
+        // A key file whose contents carry an embedded CR/LF would, if passed
+        // through, inject extra lines into the raw `Authorization: Bearer` header.
+        // Trimming only strips the ends, so the reader must reject it outright.
+        let dir = unique_temp_dir("endpoint-key-crlf");
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_file = dir.join("endpoint-key");
+        std::fs::write(&key_file, "good-key\r\nX-Injected: value\n").unwrap();
+        assert_eq!(endpoint_api_key_from_file(&key_file), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn endpoint_api_key_file_if_valid_returns_path_only_when_key_present() {
+        let dir = unique_temp_dir("endpoint-key-file-if-valid");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A file holding a key resolves to that same path — the packaged
+        // llama-server fallback hands this to `--api-key-file` instead of writing a
+        // copy, so cleanup stays owned by the caller's key file.
+        let key_file = dir.join("endpoint-key");
+        std::fs::write(&key_file, "secret-key-value\n").unwrap();
+        assert_eq!(
+            endpoint_api_key_file_if_valid(&key_file),
+            Some(key_file.clone())
+        );
+        // A missing or empty file is an unauthenticated (loopback) endpoint: no
+        // `--api-key-file` should be passed.
+        assert_eq!(endpoint_api_key_file_if_valid(&dir.join("missing")), None);
+        let empty = dir.join("empty");
+        std::fs::write(&empty, "\n").unwrap();
+        assert_eq!(endpoint_api_key_file_if_valid(&empty), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn test_app_paths(label: &str) -> rocm_core::AppPaths {
+        let root = unique_temp_dir(label);
+        std::fs::create_dir_all(root.join("data").join("services")).unwrap();
+        rocm_core::AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        }
+    }
+
+    #[test]
+    fn endpoint_key_file_path_is_deterministic_per_service_under_services_dir() {
+        let paths = test_app_paths("key-file-path");
+        let path = endpoint_key_file_path(&paths, "svc-1");
+        assert_eq!(path, paths.services_dir().join("svc-1.endpoint-key"));
+        // Same inputs, same path: callers on both sides of a spawn (writer and
+        // the env-threading reader) must agree without coordination.
+        assert_eq!(path, endpoint_key_file_path(&paths, "svc-1"));
+        // Different service ids never collide.
+        assert_ne!(path, endpoint_key_file_path(&paths, "svc-2"));
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    #[test]
+    fn endpoint_key_file_if_present_reflects_existence_only() {
+        let paths = test_app_paths("key-file-if-present");
+        let service_id = "svc-present";
+        // No file written yet: not present, regardless of what a future key
+        // would contain.
+        assert_eq!(endpoint_key_file_if_present(&paths, service_id), None);
+
+        let path = endpoint_key_file_path(&paths, service_id);
+        // Existence is all this helper checks — even an empty file (which
+        // `endpoint_api_key_from_file` would treat as "no key") counts as
+        // present, since callers use it to decide whether to set the env var
+        // at all, not whether the key is valid.
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(
+            endpoint_key_file_if_present(&paths, service_id),
+            Some(path.clone())
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(endpoint_key_file_if_present(&paths, service_id), None);
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
 
     #[test]
     fn request_roundtrip_preserves_method() {

@@ -307,10 +307,13 @@ impl ProviderAdapter for LocalProvider<'_> {
                 .unwrap_or(&service.canonical_model_id),
             request,
         );
+        let endpoint_api_key =
+            crate::endpoint_keys::endpoint_api_key(self.paths, &service.service_id);
         let response = post_json_to_local_endpoint(
             &service.endpoint_url,
             "/v1/chat/completions",
             &body,
+            endpoint_api_key.as_deref(),
             LOCAL_PROVIDER_HTTP_TIMEOUT,
         )?;
         let (content, tool_calls) = parse_openai_chat_message(&response)?;
@@ -336,10 +339,13 @@ impl ProviderAdapter for LocalProvider<'_> {
                 .unwrap_or(&service.canonical_model_id),
             request,
         );
+        let endpoint_api_key =
+            crate::endpoint_keys::endpoint_api_key(self.paths, &service.service_id);
         stream_json_from_local_endpoint(
             &service.endpoint_url,
             "/v1/chat/completions",
             &body,
+            endpoint_api_key.as_deref(),
             LOCAL_PROVIDER_HTTP_TIMEOUT,
             on_event,
         )?;
@@ -519,9 +525,17 @@ fn ready_local_services(paths: &AppPaths) -> Result<Vec<ManagedServiceRecord>> {
         if record.refresh_from_engine_state().unwrap_or(false) {
             let _ = record.write();
         }
+        // Probe with the service's key so a protected public service is not
+        // filtered out here (an anonymous /v1/models would 401) before
+        // `LocalProvider` can send the bearer token.
+        let endpoint_api_key = crate::endpoint_keys::endpoint_api_key(paths, &record.service_id);
         if matches!(record.status.as_str(), "ready" | "running")
-            && managed_service_endpoint_model_ready(&record, LOCAL_SERVICE_READY_TIMEOUT)
-                .unwrap_or(false)
+            && managed_service_endpoint_model_ready(
+                &record,
+                endpoint_api_key.as_deref(),
+                LOCAL_SERVICE_READY_TIMEOUT,
+            )
+            .unwrap_or(false)
         {
             if record.status != "ready" {
                 record.status = "ready".to_owned();
@@ -538,16 +552,28 @@ fn post_json_to_local_endpoint(
     endpoint_url: &str,
     path: &str,
     body: &serde_json::Value,
+    endpoint_api_key: Option<&str>,
     timeout: Duration,
 ) -> Result<serde_json::Value> {
-    let body = post_json_to_local_endpoint_body(endpoint_url, path, body, timeout)?;
+    let body =
+        post_json_to_local_endpoint_body(endpoint_url, path, body, endpoint_api_key, timeout)?;
     serde_json::from_str(body.trim()).context("failed to parse local provider chat JSON")
+}
+
+/// `Authorization: Bearer` request-header line for a protected local endpoint, or
+/// an empty string for an unauthenticated (loopback) one.
+fn local_bearer_header(endpoint_api_key: Option<&str>) -> String {
+    match endpoint_api_key {
+        Some(key) => format!("Authorization: Bearer {key}\r\n"),
+        None => String::new(),
+    }
 }
 
 fn post_json_to_local_endpoint_body(
     endpoint_url: &str,
     path: &str,
     body: &serde_json::Value,
+    endpoint_api_key: Option<&str>,
     timeout: Duration,
 ) -> Result<String> {
     let (host, port) = parse_http_endpoint(endpoint_url)
@@ -555,8 +581,9 @@ fn post_json_to_local_endpoint_body(
     let body = serde_json::to_string(body).context("failed to serialize chat request")?;
     let mut stream = connect_tcp_stream(&host, port, timeout)?;
     let host_header = format_host_port(&host, port);
+    let auth_header = local_bearer_header(endpoint_api_key);
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{auth_header}Connection: close\r\n\r\n{}",
         body.len(),
         body
     );
@@ -579,6 +606,7 @@ fn stream_json_from_local_endpoint(
     endpoint_url: &str,
     path: &str,
     body: &serde_json::Value,
+    endpoint_api_key: Option<&str>,
     timeout: Duration,
     on_event: &mut dyn FnMut(ProviderStreamEvent) -> Result<()>,
 ) -> Result<()> {
@@ -587,8 +615,9 @@ fn stream_json_from_local_endpoint(
     let body = serde_json::to_string(body).context("failed to serialize chat request")?;
     let mut stream = connect_tcp_stream(&host, port, timeout)?;
     let host_header = format_host_port(&host, port);
+    let auth_header = local_bearer_header(endpoint_api_key);
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{auth_header}Connection: close\r\n\r\n{}",
         body.len(),
         body
     );

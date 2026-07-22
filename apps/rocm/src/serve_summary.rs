@@ -64,6 +64,10 @@ pub(crate) struct DeploymentSummary {
     /// True when an equivalent server was already running and nothing was spawned.
     pub already_running: bool,
     pub metrics: SmokeMetrics,
+    /// The endpoint API key for a freshly launched *public* server, shown once as
+    /// secure client configuration. `None` for loopback binds (no auth) and for an
+    /// already-running service (whose key was delivered at its own launch).
+    pub api_key: Option<String>,
     /// GPU/device warnings folded in from the serve plan.
     pub notes: Vec<String>,
 }
@@ -150,6 +154,16 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
     out.push('\n');
     for (label, value) in rows {
         let _ = writeln!(out, "  {label:<label_width$}  {value}");
+    }
+    if let Some(api_key) = summary.api_key.as_deref() {
+        // Secure client configuration: the intended one-time channel for handing
+        // the key to the user. It is printed here to the terminal only — never to
+        // logs, `rocm services`, or `rocm logs`.
+        let _ = writeln!(out, "  api key: {api_key}");
+        let _ = writeln!(
+            out,
+            "  note: this key is shown only now — clients must send `Authorization: Bearer <key>`"
+        );
     }
     if !ready && !summary.already_running {
         let _ = writeln!(
@@ -305,6 +319,7 @@ mod tests {
                 ttft: Some(Duration::from_millis(180)),
                 gen_tps: Some(42.15),
             },
+            api_key: None,
             notes: Vec::new(),
         }
     }
@@ -436,6 +451,20 @@ mod tests {
         let mut summary = base_summary();
         summary.notes = vec!["selected GPU 0 has low free VRAM".to_owned()];
         assert!(render_summary(&summary).contains("note: selected GPU 0 has low free VRAM"));
+    }
+
+    #[test]
+    fn api_key_client_config_shown_only_when_present() {
+        // Loopback / no key: the summary must not mention an api key at all.
+        let plain = render_summary(&base_summary());
+        assert!(!plain.contains("api key"), "{plain}");
+
+        // Public bind: the key is shown once as secure client config.
+        let mut summary = base_summary();
+        summary.api_key = Some("endpoint-secret".to_owned());
+        let rendered = render_summary(&summary);
+        assert!(rendered.contains("api key: endpoint-secret"), "{rendered}");
+        assert!(rendered.contains("shown only now"), "{rendered}");
     }
 
     #[test]

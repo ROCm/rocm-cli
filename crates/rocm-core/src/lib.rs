@@ -133,12 +133,30 @@ pub fn download_file_to_path(url: &str, destination: &Path, timeout: Duration) -
 }
 
 pub fn http_get_text(endpoint_url: &str, path: &str, timeout: Duration) -> Result<String> {
+    http_get_text_with_auth(endpoint_url, path, None, timeout)
+}
+
+/// As [`http_get_text`], but authenticated.
+///
+/// Sends `Authorization: Bearer <key>` when `endpoint_api_key` is `Some`. Used to
+/// probe endpoints that `rocm serve` has protected with an API key; `None`
+/// preserves the unauthenticated behavior for loopback endpoints.
+pub fn http_get_text_with_auth(
+    endpoint_url: &str,
+    path: &str,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<String> {
     let (host, port) = parse_http_endpoint(endpoint_url)
         .with_context(|| format!("unsupported endpoint URL `{endpoint_url}`"))?;
     let mut stream = connect_tcp_stream(&host, port, timeout)?;
     let host_header = format_host_port(&host, port);
+    let auth_header = match endpoint_api_key {
+        Some(key) => format!("Authorization: Bearer {key}\r\n"),
+        None => String::new(),
+    };
     let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nAccept: application/json\r\n{auth_header}Connection: close\r\n\r\n"
     );
     write_all_tcp_stream(&mut stream, request.as_bytes())
         .with_context(|| format!("failed to write HTTP GET {path}"))?;
@@ -157,9 +175,10 @@ pub fn http_get_text(endpoint_url: &str, path: &str, timeout: Duration) -> Resul
 pub fn openai_models_endpoint_has_model(
     endpoint_url: &str,
     expected_model: Option<&str>,
+    endpoint_api_key: Option<&str>,
     timeout: Duration,
 ) -> Result<bool> {
-    let body = http_get_text(endpoint_url, "/v1/models", timeout)?;
+    let body = http_get_text_with_auth(endpoint_url, "/v1/models", endpoint_api_key, timeout)?;
     let value = serde_json::from_str::<serde_json::Value>(body.trim())
         .context("failed to parse /v1/models JSON")?;
     let loaded_models = openai_loaded_model_ids(&value);
@@ -176,6 +195,7 @@ pub fn openai_models_endpoint_has_model(
 
 pub fn managed_service_endpoint_model_ready(
     record: &ManagedServiceRecord,
+    endpoint_api_key: Option<&str>,
     timeout: Duration,
 ) -> Result<bool> {
     if record.endpoint_url.trim().is_empty() {
@@ -188,7 +208,7 @@ pub fn managed_service_endpoint_model_ready(
     } else {
         None
     };
-    openai_models_endpoint_has_model(&record.endpoint_url, expected, timeout)
+    openai_models_endpoint_has_model(&record.endpoint_url, expected, endpoint_api_key, timeout)
 }
 
 fn openai_loaded_model_ids(value: &serde_json::Value) -> Vec<String> {
@@ -5316,6 +5336,45 @@ pub fn sign_rsa_pkcs1_sha256_signature(private_key_pem: &str, payload: &[u8]) ->
     Ok(signature.to_bytes().into_vec())
 }
 
+/// Number of random alphanumeric characters in a generated endpoint API key.
+/// 48 chars from a 62-symbol alphabet is ~285 bits of entropy — far beyond what
+/// a bearer token guarding a network endpoint needs, with no padding characters
+/// that would complicate copy/paste into client configs or shell env vars.
+const ENDPOINT_API_KEY_LEN: usize = 48;
+
+/// Generate a fresh, cryptographically-random API key for a public endpoint.
+///
+/// The value is URL-safe alphanumeric (`[A-Za-z0-9]`) so it can be dropped
+/// verbatim into an `Authorization: Bearer` header, a client config file, or an
+/// environment variable without escaping.
+///
+/// Uses the same `rand::thread_rng()` CSPRNG as [`generate_rsa_signing_keypair`];
+/// deliberately *not* derived from `generate_service_id` (a timestamp-based,
+/// guessable identifier — unsuitable as a secret).
+pub fn generate_endpoint_api_key() -> String {
+    use rand::Rng;
+    use rand::distributions::Alphanumeric;
+
+    rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(ENDPOINT_API_KEY_LEN)
+        .map(char::from)
+        .collect()
+}
+
+/// Return `true` if `key` contains a character that must never appear in an API
+/// key used verbatim in an `Authorization: Bearer` header.
+///
+/// The CLI and engine adapters build those header lines by raw string
+/// interpolation (`Authorization: Bearer {key}\r\n`), so an embedded CR or LF in
+/// the key would inject additional header lines (HTTP header injection). A
+/// control character has no legitimate place in a bearer token, so we reject the
+/// whole class rather than only CR/LF. Callers apply this at input validation
+/// (rejecting a supplied key) and defensively when reading the key file.
+pub fn endpoint_api_key_has_forbidden_chars(key: &str) -> bool {
+    key.chars().any(char::is_control)
+}
+
 /// Generate a fresh 2048-bit RSA signing keypair, returned as
 /// `(PKCS#8 private-key PEM, SubjectPublicKeyInfo public-key PEM)` — the same
 /// formats `openssl genpkey` / `openssl rsa -pubout` produce.
@@ -6054,6 +6113,68 @@ fn resolve_amd_smi_binary_in_home(home_dir: Option<&Path>) -> OsString {
     "amd-smi".into()
 }
 
+/// A validated managed-service identifier that is safe to use as a single
+/// filesystem path component.
+///
+/// Every managed-service path (e.g. the endpoint-key sidecar) is built as
+/// `services_dir().join(format!("{service_id}..."))`. A `ServiceId` can only be
+/// constructed through [`ServiceId::new`], which rejects path separators, `..`
+/// traversal, and control characters — so a value of this type can never make a
+/// join escape its intended directory. Prefer threading a `ServiceId` (or
+/// validating with it) over passing raw `&str` ids into path builders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceId(String);
+
+impl ServiceId {
+    /// Validate an untrusted string as a service id.
+    ///
+    /// Rejects empty/whitespace-only input, path separators (`/` and `\`), `..`
+    /// traversal sequences, and control characters. Ids produced by
+    /// [`generate_service_id`] are always accepted.
+    ///
+    /// # Errors
+    /// Returns an error describing the first rule the input violates.
+    pub fn new(value: &str) -> Result<Self> {
+        if value.trim().is_empty() {
+            bail!("service id must not be empty");
+        }
+        if value.contains('/') || value.contains('\\') {
+            bail!("service id must not contain path separators");
+        }
+        if value.contains("..") {
+            bail!("service id must not contain `..`");
+        }
+        if value.chars().any(char::is_control) {
+            bail!("service id must not contain control characters");
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::convert::TryFrom<&str> for ServiceId {
+    type Error = anyhow::Error;
+    fn try_from(value: &str) -> Result<Self> {
+        Self::new(value)
+    }
+}
+
+impl std::fmt::Display for ServiceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for ServiceId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 pub fn generate_service_id(engine: &str, model_ref: &str) -> String {
     let model_slug = sanitize_component(model_ref)
         .trim_matches('-')
@@ -6092,6 +6213,74 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
+
+    #[test]
+    fn service_id_accepts_generated_and_plain_ids() {
+        // A freshly generated id must always validate.
+        let generated = generate_service_id("vllm", "Qwen/Qwen3.5");
+        assert!(ServiceId::new(&generated).is_ok());
+        // Plain alphanumeric-with-dashes ids validate and round-trip verbatim.
+        let id = ServiceId::new("svc-vllm-qwen-1730000000000").expect("valid id");
+        assert_eq!(id.as_str(), "svc-vllm-qwen-1730000000000");
+        assert_eq!(id.to_string(), "svc-vllm-qwen-1730000000000");
+    }
+
+    #[test]
+    fn service_id_rejects_traversal_and_separators() {
+        // Anything that could make `services_dir().join(id)` escape the directory
+        // (or otherwise not resolve to a single child component) is rejected.
+        for bad in [
+            "",
+            "   ",
+            "../../etc/passwd",
+            "..",
+            "a/b",
+            "a\\b",
+            "/abs",
+            "svc\r\ninject",
+            "svc\0nul",
+        ] {
+            assert!(
+                ServiceId::new(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_endpoint_api_key_is_random_and_alphanumeric() {
+        let key = generate_endpoint_api_key();
+        assert_eq!(key.len(), ENDPOINT_API_KEY_LEN);
+        assert!(
+            key.chars().all(|c| c.is_ascii_alphanumeric()),
+            "key must be URL-safe alphanumeric, got {key:?}"
+        );
+        // Two draws must differ — a constant key would be catastrophic for auth.
+        assert_ne!(generate_endpoint_api_key(), generate_endpoint_api_key());
+        // A freshly generated key must itself pass the header-safety predicate.
+        assert!(!endpoint_api_key_has_forbidden_chars(
+            &generate_endpoint_api_key()
+        ));
+    }
+
+    #[test]
+    fn endpoint_api_key_has_forbidden_chars_flags_control_chars() {
+        // Control characters (notably CR/LF) enable header injection when the key
+        // is interpolated into a raw `Authorization: Bearer` line.
+        for bad in ["key\r\ninject", "key\nother", "tab\there", "nul\0byte"] {
+            assert!(
+                endpoint_api_key_has_forbidden_chars(bad),
+                "should reject {bad:?}"
+            );
+        }
+        // Ordinary printable keys are accepted.
+        for good in ["my-key", "AbC123._~-", "sk-proj-abcDEF0123456789"] {
+            assert!(
+                !endpoint_api_key_has_forbidden_chars(good),
+                "should accept {good:?}"
+            );
+        }
+    }
 
     // The socket-path precedence is mirrored in `rocm-dash-core`; these tests
     // mirror the ones there so a divergence in either crate is caught.
@@ -6185,11 +6374,72 @@ mod tests {
         assert!(openai_models_endpoint_has_model(
             &endpoint,
             Some("qwen"),
+            None,
             Duration::from_secs(2)
         )?);
 
         let request = server.join().expect("server thread should not panic")?;
         assert!(request.starts_with("GET /v1/models HTTP/1.1"));
+        Ok(())
+    }
+
+    #[test]
+    fn openai_models_endpoint_sends_bearer_when_key_present() -> Result<()> {
+        // A protected endpoint: 200 with the model list only when the request
+        // carries `Authorization: Bearer test-key`, otherwise 401. Serves two
+        // connections — the no-key probe, then the with-key probe.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> Result<()> {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut request_bytes = Vec::new();
+                let mut buffer = [0_u8; 512];
+                loop {
+                    let read = stream.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    request_bytes.extend_from_slice(&buffer[..read]);
+                    if String::from_utf8_lossy(&request_bytes).contains("\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request_bytes).into_owned();
+                if request.contains("Authorization: Bearer test-key") {
+                    let body = r#"{"data":[{"id":"qwen"}]}"#;
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )?;
+                } else {
+                    write!(
+                        stream,
+                        "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )?;
+                }
+            }
+            Ok(())
+        });
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        // Without the key the protected endpoint 401s → treated as not ready.
+        assert!(
+            openai_models_endpoint_has_model(&endpoint, Some("qwen"), None, Duration::from_secs(2))
+                .is_err()
+        );
+        // With the key the bearer header is sent → the model reads as ready.
+        assert!(openai_models_endpoint_has_model(
+            &endpoint,
+            Some("qwen"),
+            Some("test-key"),
+            Duration::from_secs(2)
+        )?);
+
+        server.join().expect("server thread should not panic")?;
         Ok(())
     }
 
@@ -6231,6 +6481,7 @@ mod tests {
         let models_ready = openai_models_endpoint_has_model(
             &endpoint,
             Some("Qwen/Qwen2.5-1.5B-Instruct"),
+            None,
             Duration::from_secs(2),
         )?;
         assert!(
