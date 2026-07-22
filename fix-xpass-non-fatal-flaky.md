@@ -77,9 +77,8 @@ Scenario: Non-flaky XPASS remains fatal
 
 ## Next Steps
 
-1. Decide delivery: separate PR first vs. bundle into the lemonade branch (see Blockers).
-2. Create branch/worktree, write scenarios (bdd-scenarios skill), implement.
-3. Land, then rebase #127 and `fix-e2e-share-lemonade-engine` on top.
+1. PR #138 awaiting review/merge.
+2. Once merged: rebase `fix-e2e-share-lemonade-engine` on top (it will mark EAI-7455 Windows entries flaky).
 
 ## Checklist
 
@@ -142,4 +141,8 @@ Scenario: Non-flaky XPASS remains fatal
 - Reviewed by opencode: reconcile() pure fn, 4-bucket logic, flaky defaults false via serde(default), TOML run IDs cited. BTreeMap clone noted (minor, intentional for testability).
 - All gates passed: unit tests (18), clippy, container gate (full mock E2E, exit 0). Ready to commit/push/PR.
 
-**2026-07-21 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+### 2026-07-22
+
+- **Commit + push + PR**: all pre-commit hooks passed (cargo fmt caught 1 line); signed commit `5ee8341`; pushed to origin; PR #138 open.
+- **PR body**: full test plan (unit tests, clippy, container gate), why flaky instead of expect-pass, run IDs for intermittent behavior.
+- **WIP stage**: 7-PR-open.
