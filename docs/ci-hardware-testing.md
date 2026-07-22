@@ -59,11 +59,16 @@ the `heavy` gate, with these inputs:
   `strix-windows` to `e2e-gpu-strix-windows`.
 - `name_filter` (string) — a scenario-name regex forwarded to the cucumber
   harness (`cargo xtask e2e -- --name <regex>`) so a dispatch can run a
-  single scenario instead of the full suite. Empty runs everything
-  applicable to the selected platform(s).
+  single scenario instead of the full suite. Only wired into the three
+  self-hosted GPU jobs (`e2e-gpu`, `e2e-gpu-strix-ubuntu`,
+  `e2e-gpu-strix-windows`); `platform=mock` always runs the full mock suite
+  and ignores it. Empty runs everything applicable to the selected
+  platform(s).
 - `include_nightly` (boolean, default `false`) — opts a dispatch into
   `@nightly`-tagged scenarios (e.g. large-model serves, cold installs) that
-  are otherwise skipped on a normal push/PR run to keep it fast.
+  are otherwise skipped on a normal push/PR run to keep it fast. Same scope
+  as `name_filter`: only the three self-hosted GPU jobs read it;
+  `platform=mock` ignores it.
 
 A manual dispatch skips the hosted `build-and-test` job for a faster loop; the
 E2E jobs run directly against the dispatched ref.
