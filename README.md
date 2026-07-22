@@ -31,14 +31,12 @@ Lemonade and vLLM.
 |---|---|---|
 | Linux (x86_64) | Yes | Full support, including the live dashboard and both inference engines |
 | Windows (x86_64) | Yes | Full support |
-| WSL2 (x86_64) | Yes (Linux binary) | Full support, including the live dashboard, except Lemonade (see [docs/engine-plugins.md](docs/engine-plugins.md)); see [docs/wsl.md](docs/wsl.md) for setup |
+| WSL2 (x86_64) | Yes (Linux binary) | Full support, including the live dashboard; see [docs/wsl.md](docs/wsl.md) for setup |
 | macOS | No | No official installer, release, CI, or QA coverage |
 
 Live dashboard telemetry requires Linux or WSL2 (see
 [Interactive interfaces](#interactive-interfaces)). vLLM serving is Linux/WSL2
-only (see [docs/vllm.md](docs/vllm.md)). Lemonade serving works on Windows and
-Linux, but is currently blocked on WSL2 by a documented upstream Lemonade
-GPU-detector issue (see [docs/engine-plugins.md](docs/engine-plugins.md)).
+only (see [docs/vllm.md](docs/vllm.md)).
 
 > [!IMPORTANT]
 > **Tech Preview** -- This software is provided as-is, without warranty or
