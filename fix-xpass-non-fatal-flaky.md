@@ -182,3 +182,5 @@ Scenario: Non-flaky XPASS remains fatal
 - PR #138 now `MERGEABLE`, gated only on `REVIEW_REQUIRED` (human approving review).
 - Non-required E2E lanes (GPU, Strix-Windows) are advisory, do not block merge.
 - Concurrency-group root cause & recommended fix (split self-hosted E2E into separate workflow) captured in WIP CI status section for later work-ledger item.
+
+**2026-07-22 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
