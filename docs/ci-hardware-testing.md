@@ -4,7 +4,7 @@ Copyright © Advanced Micro Devices, Inc., or its affiliates.
 SPDX-License-Identifier: MIT
 -->
 
-# CI hardware (GPU / WSL) testing
+# CI hardware (GPU) testing
 
 The hosted CI (`ubuntu-latest`, `windows-latest`) builds and unit-tests every
 shipping target natively, but GitHub-hosted runners have no AMD GPU. A
