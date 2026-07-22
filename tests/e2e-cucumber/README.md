@@ -92,6 +92,7 @@ Scenarios carry stable-id and capability tags:
 | `@id:<slug>` | Stable scenario id. Keys the expectation matrix and the report grid; every scenario has one. |
 | `@requires-gpu` | Needs a real AMD GPU. Resolves to **skip** (n/a) on a host with none (e.g. the mock or hosted WSL job). |
 | `@requires-wsl` | Needs a real WSL host. Resolves to **skip** on native Linux, native Windows, and other environments. |
+| `@requires-no-wsl` | Needs native host behavior that WSL deliberately routes around. Resolves to **skip** on WSL. |
 | `@requires-engine:<vllm\|lemonade>` | Pins the serve engine. Resolves to skip where that engine can't start (e.g. vLLM on a lemonade-only Strix host). |
 | `@requires-os:<linux\|windows>` | Premise is OS-specific; skip on other OSes. |
 | `@serve-timeout:<secs>` | Lengthen the serve-readiness wait for a genuinely slow serve (e.g. a large model). |

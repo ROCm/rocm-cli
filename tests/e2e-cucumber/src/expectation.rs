@@ -25,6 +25,7 @@ const REQUIRES_OS_PREFIX: &str = "requires-os:";
 const REQUIRES_GPU_TAG: &str = "requires-gpu";
 const REQUIRES_NO_GPU_TAG: &str = "requires-no-gpu";
 const REQUIRES_WSL_TAG: &str = "requires-wsl";
+const REQUIRES_NO_WSL_TAG: &str = "requires-no-wsl";
 const SERVE_TIMEOUT_PREFIX: &str = "serve-timeout:";
 const NIGHTLY_TAG: &str = "nightly";
 
@@ -53,6 +54,9 @@ pub struct ScenarioDecl {
     /// `@requires-wsl`: the scenario's premise requires a real WSL host. Skipped
     /// on native Linux, native Windows, and other environments.
     pub requires_wsl: bool,
+    /// `@requires-no-wsl`: the scenario's premise requires native Linux or
+    /// Windows behavior that the product deliberately routes around on WSL.
+    pub requires_no_wsl: bool,
     /// Engine the scenario pins via `@requires-engine:<e>` (if any).
     pub requires_engine: Option<String>,
     /// OS the scenario requires via `@requires-os:<os>` (e.g. "linux"), if any —
@@ -78,12 +82,15 @@ impl ScenarioDecl {
         let mut requires_gpu = false;
         let mut requires_no_gpu = false;
         let mut requires_wsl = false;
+        let mut requires_no_wsl = false;
         let mut requires_engine = None;
         let mut requires_os = None;
         let mut serve_timeout_secs = None;
         let mut nightly = false;
         for tag in tags {
-            let tag = tag.as_ref();
+            // cucumber's parsed Tag displays with a leading `@`, while direct unit
+            // tests and some callers pass the bare tag. Accept both forms.
+            let tag = tag.as_ref().trim_start_matches('@');
             if let Some(rest) = tag.strip_prefix(ID_PREFIX) {
                 id = Some(rest.to_owned());
             } else if let Some(rest) = tag.strip_prefix(REQUIRES_ENGINE_PREFIX) {
@@ -98,6 +105,8 @@ impl ScenarioDecl {
                 requires_no_gpu = true;
             } else if tag == REQUIRES_WSL_TAG {
                 requires_wsl = true;
+            } else if tag == REQUIRES_NO_WSL_TAG {
+                requires_no_wsl = true;
             } else if tag == NIGHTLY_TAG {
                 nightly = true;
             }
@@ -107,6 +116,7 @@ impl ScenarioDecl {
             requires_gpu,
             requires_no_gpu,
             requires_wsl,
+            requires_no_wsl,
             requires_engine,
             requires_os,
             serve_timeout_secs,
@@ -311,6 +321,11 @@ pub fn resolve(
             reason: "requires WSL; this host is not running under WSL".to_owned(),
         };
     }
+    if decl.requires_no_wsl && cap.is_wsl {
+        return Expectation::Skip {
+            reason: "requires a native host; this host is running under WSL".to_owned(),
+        };
+    }
     if let Some(os) = &decl.requires_os
         && !os.eq_ignore_ascii_case(&cap.os_family)
     {
@@ -466,6 +481,13 @@ serve_timeout_secs = 90
     }
 
     #[test]
+    fn tags_parse_with_at_prefix() {
+        let d = decl(&["@id:examine-detects-wsl", "@requires-wsl"]);
+        assert_eq!(d.id.as_deref(), Some("examine-detects-wsl"));
+        assert!(d.requires_wsl);
+    }
+
+    #[test]
     fn serve_timeout_tag_parses_seconds() {
         let d = decl(&["id:serve-large-model-inference", "serve-timeout:2400"]);
         assert_eq!(d.serve_timeout_secs, Some(2400));
@@ -573,6 +595,23 @@ serve_timeout_secs = 90
                 resolve(&d, &cap(platform), &m, false),
                 Expectation::Skip { .. }
             ));
+        }
+    }
+
+    #[test]
+    fn requires_no_wsl_skips_only_on_wsl_hosts() {
+        let m = Expectations::default();
+        let d = decl(&["id:diagnose-known-symptom", "requires-no-wsl"]);
+        assert!(d.requires_no_wsl);
+        assert!(matches!(
+            resolve(&d, &cap("wsl"), &m, false),
+            Expectation::Skip { .. }
+        ));
+        for platform in ["mock", "strix-ubuntu", "strix-windows"] {
+            assert_eq!(
+                resolve(&d, &cap(platform), &m, false),
+                Expectation::ExpectPass
+            );
         }
     }
 

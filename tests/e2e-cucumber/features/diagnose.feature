@@ -5,12 +5,14 @@ Feature: Diagnosing failures and listing fixes
   # remediations. Both are black-box and GPU-independent (no serve, no download,
   # no mutation), so every scenario here runs on the mock lane / per-PR tier.
   #
-  # The catalog is OS-gated (the checkers only run on linux/windows), so these
-  # scenarios do NOT assert a specific fix-id — the top match is environment-
-  # dependent. They assert the SHAPE of a diagnosis (a scored match with an id
-  # and a plan) and the query/refusal contracts.
+  # The catalog is OS-gated (the checkers only run on native linux/windows), so
+  # match-shape scenarios are not applicable on WSL, where diagnose deliberately
+  # routes to platform-specific guidance without scoring the bare-metal catalog.
+  # On applicable hosts they do NOT assert a specific fix-id — the top match is
+  # environment-dependent. They assert the SHAPE of a diagnosis (a scored match
+  # with an id and a plan) and the query/refusal contracts.
 
-  @id:diagnose-matches-known-symptom
+  @id:diagnose-matches-known-symptom @requires-no-wsl
   Scenario: 1 - Diagnosing a recognised failure reports a likely cause and a fix
     Given a user who hit a known ROCm failure
     When the user asks the CLI to diagnose that symptom
@@ -22,7 +24,7 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI to diagnose that symptom in machine-readable form
     Then the CLI always points to somewhere the problem can be reported
 
-  @id:diagnose-json-has-match-flag
+  @id:diagnose-json-has-match-flag @requires-no-wsl
   Scenario: 3 - A diagnosis is available in machine-readable form for tooling
     Given a user who hit a known ROCm failure
     When the user asks the CLI to diagnose that symptom in machine-readable form
