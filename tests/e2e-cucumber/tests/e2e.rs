@@ -822,18 +822,29 @@ async fn main() {
         let _ = std::fs::write(dir.join("platform.json"), json);
     }
 
-    // Classify: XPASS (expected xfail but passed) and unexpected-fail (expected
-    // pass but failed) are failures; expected outcomes are fine. Scenarios that
-    // ran but have no id, or ran without a recorded resolution, are treated as
-    // expect-pass (a bare failure then fails the run).
-    let mut xpass = Vec::new();
+    // Classify each scenario's actual result against its resolved expectation.
+    // Unexpected-fail (expected pass but failed) is always fatal. XPASS (expected
+    // xfail but passed) splits by the entry's `flaky` flag:
+    //   - non-flaky XPASS  → FATAL: a deterministic known-bug that now passes is a
+    //     stale entry to remove.
+    //   - flaky XPASS      → NON-FATAL: a non-deterministic bug that happened to
+    //     pass this run; expected, must not fail the run (see EAI-7456). Reported
+    //     for visibility but excluded from the exit decision.
+    // Scenarios that ran but have no id / no recorded resolution → expect-pass.
+    let mut xpass_stale = Vec::new();
+    let mut xpass_flaky = Vec::new();
     let mut unexpected_fail = Vec::new();
     let mut xfail_count = 0u32;
     for (id, passed) in &actual {
         match resolutions.get(id).map(|(exp, _)| exp) {
-            Some(Expectation::ExpectXfail { bug, .. }) => {
+            Some(Expectation::ExpectXfail { bug, flaky, .. }) => {
                 if *passed {
-                    xpass.push(format!("{id} ({bug})"));
+                    let label = format!("{id} ({bug})");
+                    if *flaky {
+                        xpass_flaky.push(label);
+                    } else {
+                        xpass_stale.push(label);
+                    }
                 } else {
                     xfail_count += 1;
                 }
@@ -848,12 +859,21 @@ async fn main() {
     }
 
     eprintln!(
-        "Reconciliation: {xfail_count} xfail (failed as expected), {} XPASS, {} unexpected failure(s).",
-        xpass.len(),
+        "Reconciliation: {xfail_count} xfail (failed as expected), {} XPASS ({} flaky, {} stale), {} unexpected failure(s).",
+        xpass_stale.len() + xpass_flaky.len(),
+        xpass_flaky.len(),
+        xpass_stale.len(),
         unexpected_fail.len(),
     );
-    if !xpass.is_empty() || !unexpected_fail.is_empty() {
-        for x in &xpass {
+    // Flaky XPASS is expected — report but do not fail the run.
+    for x in &xpass_flaky {
+        eprintln!(
+            "XPASS (flaky, tolerated): '{x}' is a non-deterministic known bug that passed this \
+             run — no action needed."
+        );
+    }
+    if !xpass_stale.is_empty() || !unexpected_fail.is_empty() {
+        for x in &xpass_stale {
             eprintln!(
                 "XPASS: '{x}' is expected to fail on this host but PASSED \u{2014} the bug appears \
                  fixed here; update expectations.toml.",

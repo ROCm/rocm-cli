@@ -1194,6 +1194,40 @@ jobs:
             Write-Host "shared runtime already present at $env:E2E_SHARED_RUNTIMES_DIR - skipping pre-warm"
           }
 
+          # Pre-warm the lemonade engine into the shared runtime tree, with a RETRY.
+          # On native Windows serves route to lemonade, whose ~4.6 GiB llama.cpp/
+          # TheRock backend installs UNDER the runtime tree (lemonade self-manages
+          # its runtime); pre-warming it once here means scenarios find it already
+          # installed instead of each re-downloading it and overrunning the serve
+          # timeout. RETRY because `engines install lemonade` starts the embedded
+          # lemonade server then immediately fires config-set + backend-install RPCs
+          # before it is always listening, so the first install can fail ("Could not
+          # connect to Lemonade server") though a retry succeeds (EAI-7455). Gate on
+          # the install's own exit code — the marker dir is created before the backend
+          # RPC, so Test-Path is not proof of success.
+          $lemonadeReady = $false
+          for ($i=1; $i -le 4; $i++) {
+            New-Item -ItemType Directory -Force -Path "$prewarm\data","$prewarm\config","$prewarm\cache" | Out-Null
+            $env:ROCM_CLI_CONFIG_DIR = "$prewarm\config"
+            $env:ROCM_CLI_DATA_DIR   = "$prewarm\data"
+            $env:ROCM_CLI_CACHE_DIR  = "$prewarm\cache"
+            Write-Host "pre-warming shared lemonade engine (attempt $i/4)..."
+            & $env:ROCM_CLI_BINARY engines install lemonade
+            $installRc = $LASTEXITCODE
+            Remove-Item Env:\ROCM_CLI_CONFIG_DIR,Env:\ROCM_CLI_DATA_DIR,Env:\ROCM_CLI_CACHE_DIR -ErrorAction SilentlyContinue
+            if ($installRc -eq 0) {
+              Write-Host "shared lemonade engine pre-warmed into $prewarm (attempt $i)"
+              $lemonadeReady = $true
+              break
+            }
+            Write-Host "lemonade pre-warm attempt $i failed (rc=$installRc); killing stray lemonade and retrying..."
+            Get-Process lemond,llama-server,lemonade -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 5
+          }
+          if (-not $lemonadeReady) {
+            Write-Host "lemonade pre-warm did not succeed after retries; scenarios will install their own"
+          }
+
           # Optional scenario-name filter for a scoped manual dispatch.
           $nameFilter = "${{ github.event.inputs.name_filter }}"
           if ($nameFilter) {

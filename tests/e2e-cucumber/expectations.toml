@@ -67,6 +67,14 @@ bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so the endpoint never becomes reachable."
 serve_timeout_secs = 90
 
+# EAI-7455: native-Windows lemonade daemon RPC flake (see serve-lemonade-inference).
+[["serve-default-engine-working-endpoint"]]
+when = { effective_engine = "lemonade", os = "windows", therock_family = "gfx*" }
+bug = "EAI-7455"
+reason = "Lemonade daemon on native Windows intermittently refuses the backend-install/config RPC, so the default-engine serve fails non-deterministically."
+serve_timeout_secs = 90
+flaky = true
+
 [["serve-default-engine-inference"]]
 when = { effective_engine = "vllm" }
 bug = "EAI-7052"
@@ -82,6 +90,14 @@ when = { effective_engine = "lemonade", os = "linux" }
 bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so inference never succeeds."
 serve_timeout_secs = 90
+
+# EAI-7455: native-Windows lemonade daemon RPC flake (see serve-lemonade-inference).
+[["serve-default-engine-inference"]]
+when = { effective_engine = "lemonade", os = "windows", therock_family = "gfx*" }
+bug = "EAI-7455"
+reason = "Lemonade daemon on native Windows intermittently refuses the backend-install/config RPC, so inference never succeeds non-deterministically."
+serve_timeout_secs = 90
+flaky = true
 
 # EAI-7333 (CLI healthcheck reports ready off /v1/models before inference works)
 # on the vLLM path. This scenario is FLAKY, not fixed: it XPASS'd on MI300X once
@@ -105,6 +121,14 @@ bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so the ready-to-serve contract fails."
 serve_timeout_secs = 90
 
+# EAI-7455: native-Windows lemonade daemon RPC flake (see serve-lemonade-inference).
+[["serve-readiness-contract"]]
+when = { effective_engine = "lemonade", os = "windows", therock_family = "gfx*" }
+bug = "EAI-7455"
+reason = "Lemonade daemon on native Windows intermittently refuses the backend-install/config RPC, so the ready-to-serve contract fails non-deterministically."
+serve_timeout_secs = 90
+flaky = true
+
 # --- EAI-7423: on a lemonade LINUX host the managed serve reaches ready then is
 # shut down immediately, so inference never happens (root-caused on the box
 # 2026-07-15; previously mis-attributed to the EAI-7052 Vulkan hang). os=linux:
@@ -115,6 +139,20 @@ when = { effective_engine = "lemonade", os = "linux" }
 bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so inference never succeeds."
 serve_timeout_secs = 90
+
+# EAI-7455: on native Windows the lemonade daemon intermittently refuses the
+# backend-install/config RPC ("Could not connect to Lemonade server"), so the serve
+# fails NON-DETERMINISTICALLY — worse under full-suite load. A product-side race, not
+# fixable in the harness (pre-warm/serve-retry/backoff all tried, insufficient; see
+# ticket). flaky=true: it fails often but occasionally passes, so an XPASS here is
+# expected and tolerated (does not fail the run). therock_family=gfx* scopes to a real
+# GPU host (the no-GPU mock lane uses MockServer, not a real lemonade serve).
+[["serve-lemonade-inference"]]
+when = { effective_engine = "lemonade", os = "windows", therock_family = "gfx*" }
+bug = "EAI-7455"
+reason = "Lemonade daemon on native Windows intermittently refuses the backend-install/config RPC, so the serve fails non-deterministically."
+serve_timeout_secs = 90
+flaky = true
 
 # --- EAI-7223: chat requests with tool definitions rejected (vLLM path) ---
 [["chat-tool-definitions-accepted"]]
@@ -135,6 +173,15 @@ bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so the chat request never reaches a live model."
 serve_timeout_secs = 90
 
+# EAI-7455: native-Windows lemonade daemon RPC flake (see serve-lemonade-inference).
+# This chat scenario needs a live lemonade serve, so it hits the same flake.
+[["chat-tool-definitions-accepted"]]
+when = { effective_engine = "lemonade", os = "windows", therock_family = "gfx*" }
+bug = "EAI-7455"
+reason = "Lemonade daemon on native Windows intermittently refuses the backend-install/config RPC, so the chat request never reaches a live model."
+serve_timeout_secs = 90
+flaky = true
+
 # EAI-7221 (TUI chat sends hardcoded 'local-model' instead of querying /v1/models)
 # was previously mapped here as a vLLM-path xfail, but that bug is TUI-only and this
 # scenario exercises the CLI `rocm chat --prompt` path (which correctly discovers the
@@ -150,6 +197,15 @@ when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*" }
 bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so the chat request never reaches a live model."
 serve_timeout_secs = 90
+
+# EAI-7455: native-Windows lemonade daemon RPC flake (see serve-lemonade-inference).
+# This chat scenario needs a live lemonade serve, so it hits the same flake.
+[["chat-end-to-end-local-model"]]
+when = { effective_engine = "lemonade", os = "windows", therock_family = "gfx*" }
+bug = "EAI-7455"
+reason = "Lemonade daemon on native Windows intermittently refuses the backend-install/config RPC, so the chat request never reaches a live model."
+serve_timeout_secs = 90
+flaky = true
 
 # --- EAI-7383: `rocm help` lists subcommands in declaration order, not
 # alphabetically. Platform-independent (pure CLI help output). ---
