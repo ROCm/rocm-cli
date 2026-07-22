@@ -6,7 +6,7 @@
 **PR:** #138 — https://github.com/ROCm/rocm-cli/pull/138 (commit 5ee8341, signed)
 **Pre-PR-check:** passed — opencode (independent reviewer), 2026-07-22 (reviewed after PR open)
 **Jira:** EAI-7456 (In Progress, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-22
+**Last Updated:** 2026-07-22 (idle flush)
 
 **Token Usage:** in=902 out=202457 cache_create=3011459 cache_read=55791233 calls=416
 
@@ -155,3 +155,5 @@ Scenario: Non-flaky XPASS remains fatal
 - Reconciliation line on GPU run proves feature works: `"Reconciliation: 7 xfail, 3 XPASS (2 flaky, non-fatal), 1 unexpected failure(s)."` — the 2 EAI-7333 entries correctly printed as "(flaky, non-fatal)" and non-fatal (exit would be 1 only on the non-flaky XPASS + unexpected-FAIL, not the flaky ones).
 - **Blocker (awaiting user):** amend commit with DCO (`git commit -s --amend`) and force-push to re-trigger clean CI.
 - **Note on GPU failures:** orthogonal to this PR; recommend either (a) re-run to confirm flake vs. real, or (b) mark `serve-default-engine-working-endpoint (EAI-7052)` flaky too (separate follow-up PR, or include here if user wants).
+
+**2026-07-22 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
