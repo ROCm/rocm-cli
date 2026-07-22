@@ -169,6 +169,22 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 /// Copy `source` to `destination`, failing with a clear message if the source
 /// file is missing (the old scripts hard-failed on a missing required file).
 fn copy_required(source: &Path, destination: &Path) -> Result<()> {
+    // Refuse a `..` traversal segment on either endpoint before any filesystem
+    // access. The source is derived from an environment override (`ROCM_BIN_DIR`
+    // / `CARGO_TARGET_DIR`) and the destination from the CLI `output_dir`/
+    // `dist_name`; a `..` segment could escape the workspace or output tree. The
+    // validated strings are what build the paths used below, so absolute
+    // overrides stay valid — only `..` traversal is refused.
+    let source = source.to_string_lossy();
+    if source.contains("..") {
+        bail!("refusing a source path with a `..` traversal segment: {source}");
+    }
+    let destination = destination.to_string_lossy();
+    if destination.contains("..") {
+        bail!("refusing a destination path with a `..` traversal segment: {destination}");
+    }
+    let source = Path::new(source.as_ref());
+    let destination = Path::new(destination.as_ref());
     if !source.is_file() {
         bail!("required file not found: {}", source.display());
     }
@@ -329,8 +345,15 @@ fn signing_private_key_pem() -> Result<Option<String>> {
     if let Some(path) = std::env::var_os("ROCM_CLI_SIGNING_PRIVATE_KEY_PATH") {
         let path = PathBuf::from(path);
         if !path.as_os_str().is_empty() {
-            let pem = fs::read_to_string(&path)
-                .with_context(|| format!("failed to read signing key {}", path.display()))?;
+            // Refuse a `..` traversal segment in the configured key path before
+            // reading it. The validated string is what opens the file, so an
+            // absolute key path anywhere stays valid — only `..` is refused.
+            let path = path.to_string_lossy();
+            if path.contains("..") {
+                bail!("refusing a signing key path with a `..` traversal segment: {path}");
+            }
+            let pem = fs::read_to_string(Path::new(path.as_ref()))
+                .with_context(|| format!("failed to read signing key {path}"))?;
             return Ok(Some(pem));
         }
     }
@@ -456,6 +479,30 @@ mod tests {
         let dest = dir.path().join("dest.txt");
         let error = copy_required(&missing, &dest).unwrap_err();
         assert!(error.to_string().contains("required file not found"));
+    }
+
+    #[test]
+    fn copy_required_rejects_parent_dir_traversal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("real.txt");
+        fs::write(&source, b"data").expect("write source");
+        let dest = dir.path().join("bin.txt");
+
+        // A `..` in the source is refused before the file is even read.
+        let via_source = Path::new("bundle/../../etc/passwd");
+        let error = copy_required(via_source, &dest).unwrap_err();
+        assert!(
+            error.to_string().contains("traversal"),
+            "unexpected error: {error}"
+        );
+
+        // A `..` in the destination is refused too, even with a real source.
+        let via_dest = dir.path().join("out/../../escape.txt");
+        let error = copy_required(&source, &via_dest).unwrap_err();
+        assert!(
+            error.to_string().contains("traversal"),
+            "unexpected error: {error}"
+        );
     }
 
     #[cfg(not(windows))]
