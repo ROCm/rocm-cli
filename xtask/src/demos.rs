@@ -206,6 +206,15 @@ fn unique_demo_root() -> PathBuf {
 }
 
 fn require_file(path: &Path) -> Result<()> {
+    // Refuse a `..` traversal segment before touching the filesystem so a path
+    // derived from an environment override (e.g. `ROCM_BIN_DIR`) cannot escape
+    // its intended location. The validated string is what builds the path used
+    // below; absolute paths remain valid, only `..` traversal is refused.
+    let path = path.to_string_lossy();
+    if path.contains("..") {
+        bail!("refusing a path with a `..` traversal segment: {path}");
+    }
+    let path = Path::new(path.as_ref());
     if !path.is_file() {
         bail!("required file not found: {}", path.display());
     }
@@ -226,6 +235,15 @@ mod tests {
     fn selection_rejects_unknown_demo() {
         let error = select_demos(&["unknown".to_string()]).unwrap_err();
         assert!(error.to_string().contains("unknown demo `unknown`"));
+    }
+
+    #[test]
+    fn require_file_rejects_parent_dir_traversal() {
+        let error = require_file(Path::new("bin/../../etc/passwd")).unwrap_err();
+        assert!(
+            error.to_string().contains("traversal"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
