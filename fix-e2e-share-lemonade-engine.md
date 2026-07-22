@@ -4,6 +4,22 @@
 **Pipeline:** standard
 **Branch:** fix-e2e-share-lemonade-engine → **PR #129** (https://github.com/ROCm/rocm-cli/pull/129). Rebased onto current main, squashed to ONE clean commit (40bbf19), 3 files. State: OPEN, MERGEABLE.
 **Last Updated:** 2026-07-22
+**Pre-PR-check:** changes-requested — opencode/claude-opus reviewer, 2026-07-22
+
+---
+
+## Pre-PR review findings (2026-07-22, changes-requested) — 2 blocking
+
+Reviewed LOCAL tree, not PR #129. Branch is **20 commits behind origin/main** (rev-list left-right `20 1`), so line 5's "Rebased onto current main" is stale.
+
+1. **Stale base drops the `verify-pinned-keys` CI security gate** (conf ~90). `git diff origin/main...HEAD` (base = merge-base) shows commit 40bbf19 removes the `Pinned key consistency check` steps (Linux + Windows heavy jobs) and the `docs/keys/**` heavy-trigger — because it was built on an old base. origin/main HAS these; merging as-is deletes a signing/security gate that landed on main. FIX: rebase 40bbf19 onto current origin/main, re-verify the diff is only the intended 3 files (per AGENTS.md §4/§11: prove no-conflict by doing the rebase locally).
+
+2. **Staged working-tree edits revert two of the three shipped fixes** (conf ~85). Two files are staged (index vs HEAD) that undo WIP-stated final fixes:
+   - `.github/workflows/ci.yml` staged edit DELETES the entire lemonade engine pre-warm-with-retry block (WIP fix #1) — and re-adds `verify-pinned-keys` (which would resolve finding #1, but only in the index, not the commit).
+   - `tests/e2e-cucumber/tests/e2e/serving_steps.rs` staged edit REVERTS the STDERR-in-assert (WIP fix #3) on setup_gpu_model / setup_lemonade_model / user_serves_default_engine back to stdout-only asserts, and reverts the VRAM-floor code shape.
+   If committed, PR #129 no longer matches its own description (loses download-once pre-warm + diagnosability). FIX: reconcile — if intentional, update this WIP + state rationale; if stray, `git restore --staged --worktree <files>`. As-is the recorded intent and the tree disagree.
+
+Note: the huge 63-file / -8577-line delta vs origin/main is entirely the stale base (main moved on 20 commits), NOT staged content — only 2 files are staged. Re-review after rebase + reconcile.
 
 ---
 
@@ -224,6 +240,8 @@ runtime; local `cargo build` + `cargo clippy --locked -p e2e-cucumber --test e2e
 both clean; ci.yml valid YAML.
 
 ## Work Log
+
+**2026-07-22 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
 **2026-07-22 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
