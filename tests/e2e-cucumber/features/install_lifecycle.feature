@@ -105,10 +105,12 @@ Feature: Release install lifecycle
     Given a freshly built release tree
     And a generated signing keypair
     And a signed bundle installed with the public key file
-    When the installed rocm opens interactive chat through a pseudo-terminal
+    When the default engine is set to vllm in the installed config
+    And the installed rocm opens interactive chat through a pseudo-terminal
     Then the installed interactive chat surface is displayed
     When the user quits the installed interactive chat
     Then the installed interactive chat exits successfully
+    And the installed config still selects the vllm default engine
 
   @id:lifecycle-linux-uninstall-full-purge @lifecycle @requires-os:linux
   Scenario: Linux - uninstall removes binaries, manifest, and XDG state
@@ -260,4 +262,5 @@ Feature: Release install lifecycle
     Then examine reads only the isolated config, data, and cache directories
     When the user uninstalls from the installed binary keeping config data and cache
     Then uninstall reports skipping the running executable on Windows
+    And the non-running installed rocmd binary is gone
     And the install manifest is gone

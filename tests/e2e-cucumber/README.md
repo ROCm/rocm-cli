@@ -100,12 +100,10 @@ Scenarios carry stable-id and capability tags:
 | `@id:<slug>` | Stable scenario id. Keys the expectation matrix and the report grid; every scenario has one. |
 | `@requires-gpu` | Needs a real AMD GPU. Resolves to **skip** (n/a) on a host with none (e.g. the mock job). |
 | `@requires-engine:<vllm\|lemonade>` | Pins the serve engine. Resolves to skip where that engine can't start (e.g. vLLM on a lemonade-only Strix host). |
-| `@requires-os:<linux\|windows>` | Runs only on the matching host OS. |
-| `@lifecycle` | Expensive install lifecycle; skipped unless `E2E_INCLUDE_LIFECYCLE=1`. `E2E_ONLY_LIFECYCLE=1` selects only this set without bypassing expectation resolution. |
 | `@requires-os:<linux\|windows>` | Premise is OS-specific; skip on other OSes. |
 | `@serve-timeout:<secs>` | Lengthen the serve-readiness wait for a genuinely slow serve (e.g. a large model). |
 | `@nightly` | Expensive scenario skipped by default; included when `E2E_INCLUDE_NIGHTLY=1`. |
-| `@lifecycle` | Expensive, OS-mutating release-lifecycle scenario (packaging + real installer + install/uninstall). Skipped by default; included when `E2E_INCLUDE_LIFECYCLE=1`. |
+| `@lifecycle` | Expensive, OS-mutating release-lifecycle scenario (packaging + real installer + install/uninstall). Skipped by default; included when `E2E_INCLUDE_LIFECYCLE=1`. `E2E_ONLY_LIFECYCLE=1` selects only this set without bypassing expectation resolution. |
 
 Known bugs are **not** tagged in the `.feature` files — they live in
 `expectations.toml`, keyed by `@id`, each with a `when = { ... }` condition (e.g.

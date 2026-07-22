@@ -16,6 +16,7 @@
 //! PATH, which `install.ps1`'s default install mutates — is captured and restored
 //! by [`LifecycleState`]'s `Drop`, even when a step fails.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -90,14 +91,14 @@ fn root(world: &E2eWorld) -> PathBuf {
 
 /// Mutable access to the scenario's lifecycle state, panicking with a clear
 /// message if a step ran out of order without initializing it.
-fn state_mut(world: &mut E2eWorld) -> &mut LifecycleState {
+const fn state_mut(world: &mut E2eWorld) -> &mut LifecycleState {
     world
         .lifecycle
         .as_mut()
         .expect("lifecycle state not initialized; a Given step must run first")
 }
 
-fn state(world: &E2eWorld) -> &LifecycleState {
+const fn state(world: &E2eWorld) -> &LifecycleState {
     world
         .lifecycle
         .as_ref()
@@ -143,9 +144,10 @@ fn run_package(world: &E2eWorld, sign_env: &[(&str, String)]) -> (String, bool) 
 fn release_bin_dir() -> PathBuf {
     let binary = crate::rocm_binary();
     let path = PathBuf::from(&binary);
-    path.parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| workspace_root().join("target/release"))
+    path.parent().map_or_else(
+        || workspace_root().join("target/release"),
+        Path::to_path_buf,
+    )
 }
 
 /// Run the platform installer (`install.sh` / `install.ps1`) with the given
@@ -259,14 +261,38 @@ fn capture_user_path() -> String {
 }
 
 /// Restore the Windows user PATH to a previously captured value.
+///
+/// Runs during `Drop`, so it must not panic; a failed restore is loud on stderr
+/// instead, because a botched restore leaves the runner's real user PATH
+/// polluted with the test's temp install dir and that must be diagnosable.
 #[cfg(windows)]
 fn restore_user_path(value: &str) {
-    let script =
-        format!("[Environment]::SetEnvironmentVariable('Path', $env:ROCM_E2E_PREV_PATH, 'User')");
-    let _ = Command::new("powershell")
-        .args(["-NoProfile", "-Command", &script])
+    let script = "[Environment]::SetEnvironmentVariable('Path', $env:ROCM_E2E_PREV_PATH, 'User')";
+    let status = Command::new("powershell")
+        .args(["-NoProfile", "-Command", script])
         .env("ROCM_E2E_PREV_PATH", value)
         .status();
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => eprintln!(
+            "warning: failed to restore Windows user PATH (exit {status}); the runner PATH may still reference the test install dir"
+        ),
+        Err(error) => eprintln!(
+            "warning: could not run PowerShell to restore Windows user PATH ({error}); the runner PATH may still reference the test install dir"
+        ),
+    }
+}
+
+/// The real (non-isolated) user rocm state dir, `~/.rocm`, if a home dir is
+/// resolvable. Used only for the negative isolation assertion: the installed
+/// binary under isolated `ROCM_CLI_*_DIR` env must never read this.
+fn real_user_rocm_dir() -> Option<PathBuf> {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
+    let home = PathBuf::from(home);
+    if home.as_os_str().is_empty() {
+        return None;
+    }
+    Some(home.join(".rocm"))
 }
 
 /// The installer's per-user config file under the isolated HOME.
@@ -701,7 +727,7 @@ async fn when_record_stale(world: &mut E2eWorld) {
     std::fs::write(&stale, b"stale").expect("failed to write stale engine");
     let manifest = install_dir.join(".rocm-cli-manifest");
     let mut contents = std::fs::read_to_string(&manifest).unwrap_or_default();
-    contents.push_str(&format!("{}\n", stale.display()));
+    let _ = writeln!(contents, "{}", stale.display());
     std::fs::write(&manifest, contents).expect("failed to append to manifest");
 }
 
@@ -759,6 +785,46 @@ async fn when_installed_chat_pty(world: &mut E2eWorld) {
     let session = TuiSession::spawn_binary(world, &rocm, &["chat", "--chat-mock"])
         .unwrap_or_else(|e| panic!("failed to open installed interactive chat: {e}"));
     world.tui = Some(session);
+}
+
+#[when("the default engine is set to vllm in the installed config")]
+async fn when_set_engine_installed(world: &mut E2eWorld) {
+    let rocm = installed_binary(&state(world).install_dir, "rocm");
+    let mut cmd = Command::new(&rocm);
+    cmd.args(["config", "set-default-engine", "vllm"]);
+    // Use the same isolated config dir the PTY chat inherits, so setting the
+    // engine here and reading it back after the session exercises one config.
+    for (key, value) in world.isolate_env() {
+        cmd.env(key, value);
+    }
+    let output = cmd
+        .output()
+        .expect("failed to run installed rocm config set-default-engine");
+    assert!(
+        output.status.success(),
+        "setting the default engine failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[then("the installed config still selects the vllm default engine")]
+async fn then_installed_config_survives(world: &mut E2eWorld) {
+    // The PTY chat inherits isolate_env, whose ROCM_CLI_CONFIG_DIR is
+    // `<isolated_root>/config`; config.json lives directly under it.
+    let config_dir = world
+        .isolate_env()
+        .into_iter()
+        .find(|(key, _)| *key == "ROCM_CLI_CONFIG_DIR")
+        .map(|(_, value)| PathBuf::from(value))
+        .expect("isolate_env did not set ROCM_CLI_CONFIG_DIR");
+    let config = config_dir.join("config.json");
+    let contents = std::fs::read_to_string(&config)
+        .unwrap_or_else(|e| panic!("installed config {} not readable: {e}", config.display()));
+    assert!(
+        contents.contains("\"vllm\""),
+        "interactive chat clobbered the default engine config:\n{contents}"
+    );
 }
 
 #[when("the user quits the installed interactive chat")]
@@ -1075,6 +1141,15 @@ async fn then_examine_isolated(world: &mut E2eWorld) {
             "examine did not reference the isolated {label} dir {needle}:\n{out}"
         );
     }
+    // The negative half is what actually proves isolation: examine must not read
+    // the real user's rocm state. Mirrors the old acceptance script's check.
+    if let Some(real) = real_user_rocm_dir() {
+        let real = real.to_string_lossy();
+        assert!(
+            !out.contains(real.as_ref()),
+            "examine referenced the real user rocm dir {real}:\n{out}"
+        );
+    }
 }
 
 #[then("uninstall reports skipping the running executable on Windows")]
@@ -1099,16 +1174,25 @@ async fn then_manifest_gone(world: &mut E2eWorld) {
     assert_missing(&st.install_dir.join(".rocm-cli-manifest"));
 }
 
+#[then("the non-running installed rocmd binary is gone")]
+async fn then_rocmd_gone(world: &mut E2eWorld) {
+    // The keep-config uninstall skips the running rocm executable on Windows but
+    // must still remove the non-running rocmd binary (old acceptance-script check).
+    let st = state(world);
+    assert_missing(&installed_binary(&st.install_dir, "rocmd"));
+}
+
 #[then("the isolated XDG config, data, and cache state is gone")]
 async fn then_xdg_gone(world: &mut E2eWorld) {
     let st = state(world);
-    for dir in [&st.smoke_config, &st.smoke_data, &st.smoke_cache] {
-        if let Some(dir) = dir {
-            // Uninstall purges the CLI's own state; the top-level isolated dir may
-            // remain but its rocm-cli subtree must be gone.
-            let rocm_cli = dir.join("rocm-cli");
-            assert_missing(&rocm_cli);
-        }
+    for dir in [&st.smoke_config, &st.smoke_data, &st.smoke_cache]
+        .into_iter()
+        .flatten()
+    {
+        // Uninstall purges the CLI's own state; the top-level isolated dir may
+        // remain but its rocm-cli subtree must be gone.
+        let rocm_cli = dir.join("rocm-cli");
+        assert_missing(&rocm_cli);
     }
 }
 
