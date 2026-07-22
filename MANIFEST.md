@@ -48,6 +48,7 @@ repository.
 | anyhow | 1.0.102 | MIT OR Apache-2.0 |
 | apple-native-keyring-store | 1.0.0 | MIT OR Apache-2.0 |
 | approx | 0.5.1 | Apache-2.0 |
+| arbitrary | 1.4.2 | MIT OR Apache-2.0 |
 | arrayvec | 0.7.8 | MIT OR Apache-2.0 |
 | as-any | 0.3.2 | MIT OR Apache-2.0 |
 | assert-json-diff | 2.0.2 | MIT |
@@ -143,6 +144,7 @@ repository.
 | der | 0.7.10 | Apache-2.0 OR MIT |
 | deranged | 0.5.8 | MIT OR Apache-2.0 |
 | derive-getters | 0.5.0 | MIT |
+| derive_arbitrary | 1.4.2 | MIT OR Apache-2.0 |
 | derive_more | 2.1.1 | MIT |
 | derive_more-impl | 2.1.1 | MIT |
 | digest | 0.10.7 | MIT OR Apache-2.0 |
@@ -609,7 +611,9 @@ repository.
 | zerotrie | 0.2.4 | Unicode-3.0 |
 | zerovec | 0.11.6 | Unicode-3.0 |
 | zerovec-derive | 0.11.3 | Unicode-3.0 |
+| zip | 2.4.2 | MIT |
 | zmij | 1.0.21 | MIT |
+| zopfli | 0.8.3 | Apache-2.0 |
 | zvariant | 5.12.0 | MIT |
 | zvariant_derive | 5.12.0 | MIT |
 | zvariant_utils | 3.4.0 | MIT |

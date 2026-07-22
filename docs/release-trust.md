@@ -15,6 +15,11 @@ rocm-cli release packages are protected in two layers:
 
 ## Signing Inputs
 
+Release packaging is produced by `cargo xtask package <dist-name>`, a
+cross-platform command that builds the bundle (`.tar.gz` on Unix, `.zip` on
+Windows), writes the `.sha256` sidecar, and emits the detached `.sig` when a
+signing key is configured.
+
 Set one of these secrets or environment variables before release packaging:
 
 ```text
@@ -66,8 +71,9 @@ publish job downloads and re-verifies the combined Linux plus Windows asset set
 before replacing the public `nightly` release. If Windows fails, the previous
 public nightly remains available and the temporary staging release is removed.
 
-Developer acceptance covers both path and PEM signing inputs with generated
-local keys. Those keys are test material only; they are not trust roots.
+The opt-in `@lifecycle` install-lifecycle E2E scenarios cover both path and PEM
+signing inputs with generated local keys. Those keys are test material only;
+they are not trust roots.
 
 ## Installer Verification
 
@@ -101,12 +107,14 @@ $env:ROCM_CLI_REQUIRE_SIGNATURE = "1"
 .\install.ps1 release -SigningPublicKeyPath C:\path\to\rocm-cli-signing-public-key.pem
 ```
 
-Developer acceptance covers public-key path and PEM installer inputs, bad
-checksums, bad detached signatures, missing required `.sig` sidecars, and
-required-signature mode without a public key. Windows acceptance additionally
-runs a full signed install and a bad-signature rejection with `openssl` scrubbed
-from `PATH`, proving `install.ps1` verifies with native .NET crypto and still
-rejects invalid signatures. All of those checks happen before activation.
+The `@lifecycle` install-lifecycle E2E scenarios cover public-key path and PEM
+installer inputs, bad checksums, bad detached signatures, missing required
+`.sig` sidecars, and required-signature mode without a public key. The Windows
+scenarios additionally run a full signed install over a loopback HTTP download,
+proving `install.ps1` verifies with native .NET crypto. All of those checks
+happen before activation. Run the current host's set with
+`E2E_INCLUDE_LIFECYCLE=1 E2E_ONLY_LIFECYCLE=1 cargo xtask e2e` (see
+`docs/testing.md`).
 
 ## WSL ROCDXG Package Verification
 

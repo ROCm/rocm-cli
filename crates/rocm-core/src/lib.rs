@@ -8014,8 +8014,9 @@ Class Name:                Display
     }
 
     /// Produce a `(private-key PEM, SPKI public-key PEM, payload, signature)`
-    /// tuple with the OpenSSL CLI, the same tool the installers and release
-    /// signing use (`install.sh`, `scripts/package-linux-release.sh`). Returns
+    /// tuple with the OpenSSL CLI, cross-checking the pure-Rust sign/verify path
+    /// against the same RSASSA-PKCS#1 v1.5 over SHA-256 scheme the installer
+    /// (`install.sh`) and release packaging (`cargo xtask package`) use. Returns
     /// `None` when openssl is unavailable or its spawn fails, so this interop
     /// guard never reintroduces the build-failing flake we removed: the pure-Rust
     /// sign/verify path is fully covered by the round-trip test, and this only
