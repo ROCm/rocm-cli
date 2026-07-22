@@ -124,7 +124,9 @@ Feature: Model serving
 
   # Honest device selection: a `--gpu` index that does not exist on the host is
   # rejected outright, never silently remapped to another device (no device-0
-  # fallback). Runs on GPU hardware.
+  # fallback). Runs on GPU hardware: on a no-GPU host the GPU-required pre-flight
+  # refuses ("no usable AMD GPU") before the index is ever validated, so the
+  # index-specific rejection can only be observed where a real device is present.
   @id:serve-absent-gpu-index-rejected @requires-gpu @requires-os:linux
   Scenario: 13 - Serving pinned to a GPU that does not exist is refused
     When the user serves a model pinned to a GPU index that does not exist

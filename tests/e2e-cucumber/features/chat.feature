@@ -41,14 +41,22 @@ Feature: Chat and endpoint detection
     When the user lists running services
     Then the served model endpoint is listed
 
-  @id:chat-tool-definitions-accepted @requires-gpu
+  # Runs on every lane: on a GPU host `a model is served in the background` does a
+  # real `rocm serve`, on the no-GPU mock lane it's backed by MockServer. The
+  # assertion (a tools-bearing request is accepted) is engine-agnostic, so no GPU
+  # is required — dropping @requires-gpu gives this per-PR mock-lane coverage.
+  @id:chat-tool-definitions-accepted
   Scenario: 5 - Chat requests that include tool definitions are accepted
     Given a managed runtime is active
     And a model is served in the background
     When a chat request with tool definitions is sent
     Then the chat response is successful
 
-  @id:chat-end-to-end-local-model @requires-gpu
+  # Runs on every lane (see scenario 5): real serve on a GPU host, MockServer on
+  # the no-GPU mock lane. Asserts only that a served model returns a non-empty
+  # reply, which is engine-agnostic — real generation is covered by the
+  # @requires-gpu serve-*-inference scenarios.
+  @id:chat-end-to-end-local-model
   Scenario: 6 - End-to-end chat through a locally served model
     Given a managed runtime is active
     And a model is served in the background

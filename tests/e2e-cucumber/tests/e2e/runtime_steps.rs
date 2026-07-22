@@ -20,6 +20,15 @@ async fn setup_standard_rocm(_world: &mut E2eWorld) {}
 
 #[given("a managed runtime is active")]
 async fn setup_active_runtime(world: &mut E2eWorld) {
+    // On a no-GPU host this is a no-op: a managed TheRock SDK runtime can only be
+    // installed where there's a GPU family to select wheels for (see
+    // `runtime-install-active`, @requires-gpu). The only scenarios that reach this
+    // step without `@requires-gpu` are the mock-lane chat scenarios, whose serve
+    // is backed by MockServer and needs no runtime at all — so skip the install
+    // rather than attempt a multi-GiB SDK pull that can't succeed here.
+    if !e2e_cucumber::capability::host_capability().has_amd_gpu {
+        return;
+    }
     // This precondition only needs *a* runtime present — it does not assert a
     // clean slate — so opt into the shared runtimes tree: the first scenario to
     // hit an empty shared tree installs once, and every later scenario finds the

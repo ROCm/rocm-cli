@@ -126,9 +126,11 @@ serve_timeout_secs = 90
 # On a lemonade LINUX host this needs a live lemonade serve, which reaches ready
 # then shuts down immediately (EAI-7423). os=linux: passes on native Windows
 # lemonade (run 29354305288 XPASS'd it), consistent with the other lemonade
-# serve scenarios.
+# serve scenarios. therock_family=gfx* scopes this to a REAL GPU host: the
+# scenario now also runs on the no-GPU mock lane (backed by MockServer, not a
+# real lemonade serve), where EAI-7423 does not apply and it must expect-pass.
 [["chat-tool-definitions-accepted"]]
-when = { effective_engine = "lemonade", os = "linux" }
+when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*" }
 bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so the chat request never reaches a live model."
 serve_timeout_secs = 90
@@ -140,9 +142,11 @@ serve_timeout_secs = 90
 # then 3/3 green re-runs), so there is NO vLLM xfail for this scenario — the CLI chat
 # path works. Only the lemonade LINUX path stays xfail: it needs a live lemonade
 # serve, which reaches ready then shuts down immediately (EAI-7423); native Windows
-# lemonade serve works (run 29338475133 XPASS).
+# lemonade serve works (run 29338475133 XPASS). therock_family=gfx* scopes this to
+# a REAL GPU host: the scenario also runs on the no-GPU mock lane (MockServer, not
+# a real lemonade serve), where EAI-7423 does not apply and it must expect-pass.
 [["chat-end-to-end-local-model"]]
-when = { effective_engine = "lemonade", os = "linux" }
+when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*" }
 bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so the chat request never reaches a live model."
 serve_timeout_secs = 90
