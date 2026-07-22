@@ -8,6 +8,8 @@
 **Jira:** EAI-7456 (QA, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
 **Last Updated:** 2026-07-22
 
+**2026-07-22 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+
 ## CI status
 - ✅ **First run (commit 5ee8341)**: All green EXCEPT: (1) missing DCO trailer (fixed below); (2) GPU lane showed 2 EAI-7333 flaky XPASS now correctly non-fatal, but 1 non-flaky XPASS (EAI-7052) + 1 unexpected-FAIL (chat) → exit 1 (orthogonal flake).
 - ✅ **Second run (commit 3dd423a)**: Amended with `Signed-off-by`, re-signed, force-pushed. DCO check will pass. GPU lane still pending (runner queue); feature works per first run's reconciliation output.
