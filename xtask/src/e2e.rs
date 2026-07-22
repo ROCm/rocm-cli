@@ -62,6 +62,17 @@ pub fn run(args: &[String]) -> Result<()> {
     cmd.args(["test", "-p", "e2e-cucumber", "--test", "e2e"])
         .current_dir(&root)
         .env("ROCM_CLI_BINARY", &binary);
+    // Hand the lifecycle E2E steps the path to this already-built `xtask`
+    // executable (the running process). Those steps drive `xtask package` and
+    // `xtask keygen` as subprocesses; they must run this prebuilt binary
+    // directly instead of re-entering cargo (`cargo xtask …`). On Windows cargo
+    // cannot rebuild `xtask.exe` while it is still running as the harness — it
+    // fails to replace the locked file with "Access is denied", which broke
+    // every lifecycle scenario. Executing the existing binary needs no rebuild
+    // and takes no such lock.
+    if let Ok(xtask_bin) = std::env::current_exe() {
+        cmd.env("ROCM_XTASK_BINARY", xtask_bin);
+    }
     if !args.is_empty() {
         cmd.arg("--").args(args);
     }

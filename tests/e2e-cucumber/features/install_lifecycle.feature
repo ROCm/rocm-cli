@@ -2,7 +2,7 @@ Feature: Release install lifecycle
 
   # The full release lifecycle — packaging, signature-verified install, tamper
   # rejection, reinstall, PATH handling, and uninstall — expressed as black-box
-  # scenarios that drive `cargo xtask package`, the real root installer
+  # scenarios that drive `xtask package`, the real root installer
   # (install.sh / install.ps1), and the installed binaries. These replace the
   # former scripts/acceptance-install-upgrade-tui-uninstall.{sh,ps1}.
   #

@@ -4,7 +4,7 @@
 
 //! Black-box steps for the release install lifecycle (`@lifecycle`).
 //!
-//! These drive the real release surface end to end: `cargo xtask package` to
+//! These drive the real release surface end to end: `xtask package` to
 //! build a signed bundle, the root installer (`install.sh` / `install.ps1`) to
 //! verify and activate it, and the installed binaries for the smoke and
 //! uninstall phases. They replace the former
@@ -114,12 +114,33 @@ fn archive_name(dist_name: &str) -> String {
     }
 }
 
-/// Run `cargo xtask package <dist> <dist_dir>` from the workspace root, with the
+/// Build a command that runs the `xtask` release tool, ready for its subcommand
+/// arguments to be appended.
+///
+/// Prefers the already-built `xtask` executable the harness exports via
+/// `ROCM_XTASK_BINARY` (see `xtask::e2e`), running it directly. Re-entering cargo
+/// from inside the test (`cargo xtask …`) triggers a rebuild of `xtask`, and on
+/// Windows cargo cannot replace `xtask.exe` while it is still running as the
+/// harness — it fails with "Access is denied", breaking every scenario. Running
+/// the prebuilt binary needs no rebuild and takes no such lock. Falls back to
+/// `cargo xtask` for standalone local runs where no harness set the path (there
+/// no `xtask` process is running, so the rebuild is safe).
+fn xtask_command() -> Command {
+    if let Some(bin) = std::env::var_os("ROCM_XTASK_BINARY") {
+        Command::new(bin)
+    } else {
+        let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+        cmd.arg("xtask");
+        cmd
+    }
+}
+
+/// Run `xtask package <dist> <dist_dir>` from the workspace root, with the
 /// given signing environment, and return combined stdout+stderr.
 fn run_package(world: &E2eWorld, sign_env: &[(&str, String)]) -> (String, bool) {
     let st = state(world);
-    let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-    cmd.args(["xtask", "package", &st.dist_name])
+    let mut cmd = xtask_command();
+    cmd.args(["package", &st.dist_name])
         .arg(&st.dist_dir)
         .current_dir(workspace_root());
     // Point packaging at the already-built release binaries so a scenario does
@@ -129,7 +150,7 @@ fn run_package(world: &E2eWorld, sign_env: &[(&str, String)]) -> (String, bool) 
     for (key, value) in sign_env {
         cmd.env(key, value);
     }
-    let output = cmd.output().expect("failed to run cargo xtask package");
+    let output = cmd.output().expect("failed to run xtask package");
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -370,15 +391,15 @@ async fn given_keypair(world: &mut E2eWorld) {
     let root = root(world);
     let private_key = root.join("signing-private.pem");
     let public_key = root.join("signing-public.pem");
-    let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-        .args(["xtask", "keygen"])
+    let status = xtask_command()
+        .args(["keygen"])
         .arg("--private-out")
         .arg(&private_key)
         .arg("--public-out")
         .arg(&public_key)
         .current_dir(workspace_root())
         .status()
-        .expect("failed to run cargo xtask keygen");
+        .expect("failed to run xtask keygen");
     assert!(status.success(), "keygen failed");
     let st = state_mut(world);
     st.private_key = private_key;
