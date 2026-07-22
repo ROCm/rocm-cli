@@ -23,9 +23,22 @@ SPDX-License-Identifier: MIT
 ROCm CLI is a command-line tool for setting up and running local AI on AMD GPUs, with a
 full-screen TUI dashboard for GPU telemetry, model serving, and chat.
 
-A single prebuilt binary for Linux and Windows. No Python, Rust, or existing
-ROCm install required. Ships with inference engine adapters for Lemonade and
-vLLM.
+A single prebuilt binary for Linux and Windows (x86_64). No Python, Rust, or
+existing ROCm install required. Ships with inference engine adapters for
+Lemonade and vLLM.
+
+| Platform | Prebuilt binary | Notes |
+|---|---|---|
+| Linux (x86_64) | Yes | Full support, including the live dashboard and both inference engines |
+| Windows (x86_64) | Yes | Full support |
+| WSL2 (x86_64) | Yes (Linux binary) | Full support, including the live dashboard, except Lemonade (see [docs/engine-plugins.md](docs/engine-plugins.md)); see [docs/wsl.md](docs/wsl.md) for setup |
+| macOS | No | No official installer, release, CI, or QA coverage |
+
+Live dashboard telemetry requires Linux or WSL2 (see
+[Interactive interfaces](#interactive-interfaces)). vLLM serving is Linux/WSL2
+only (see [docs/vllm.md](docs/vllm.md)). Lemonade serving works on Windows and
+Linux, but is currently blocked on WSL2 by a documented upstream Lemonade
+GPU-detector issue (see [docs/engine-plugins.md](docs/engine-plugins.md)).
 
 > [!IMPORTANT]
 > **Tech Preview** -- This software is provided as-is, without warranty or
@@ -60,12 +73,6 @@ The installer downloads a prebuilt bundle, verifies its SHA-256 checksum,
 installs the `rocm` and `rocmd` binaries into `~/.local/bin`, and adds that
 directory to your shell `PATH`. Rerun it any time to upgrade.
 
-> [!NOTE]
-> This repository is currently private, so the `curl | sh` one-liner only works
-> once the repo and its release assets are public. Until then, use the
-> **GitHub CLI fallback** in each section, which downloads through your
-> authenticated session.
-
 ### Linux / WSL (x86_64)
 
 Only nightly builds are published today, so pass the `nightly` channel:
@@ -81,29 +88,6 @@ channel instead:
 curl -fsSL https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.sh | sh
 ```
 
-<details>
-<summary>Fallback while the repo is private (GitHub CLI)</summary>
-
-Install the [GitHub CLI](https://cli.github.com/), authenticate once, then pull
-the release bundle through your authenticated session and install both binaries:
-
-```bash
-gh auth login
-gh release download nightly --repo ROCm/rocm-cli \
-  --pattern 'rocm-cli-nightly-linux-amd64.tar.gz' --output /tmp/rocm-cli.tar.gz --clobber
-tar -xzf /tmp/rocm-cli.tar.gz -C /tmp
-mkdir -p ~/.local/bin
-find /tmp -path '*/bin/rocm*' -type f -exec install -m 0755 {} ~/.local/bin/ \;
-```
-
-If `~/.local/bin` is not already on your `PATH`, add it (and persist it):
-
-```bash
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
-```
-</details>
-
 ### Windows (x86_64, PowerShell)
 
 ```powershell
@@ -113,22 +97,6 @@ irm https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.ps1 | iex
 
 Drop the `ROCM_CLI_CHANNEL` line to track the default `release` channel once a
 stable release is published.
-
-<details>
-<summary>Fallback while the repo is private (GitHub CLI)</summary>
-
-```powershell
-gh auth login
-gh release download nightly --repo ROCm/rocm-cli `
-  --pattern "rocm-cli-nightly-windows-amd64.zip" --output "$env:TEMP\rocm-cli.zip" --clobber
-Expand-Archive "$env:TEMP\rocm-cli.zip" "$env:TEMP\rocm-cli" -Force
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.local\bin" | Out-Null
-Get-ChildItem "$env:TEMP\rocm-cli" -Recurse -Filter "rocm*.exe" |
-  Copy-Item -Destination "$env:USERPROFILE\.local\bin"
-```
-
-Add `%USERPROFILE%\.local\bin` to your user `PATH` if it is not already there.
-</details>
 
 ## Build from source
 
@@ -332,8 +300,8 @@ engine (Ryzen AI / Radeon) serves llama.cpp **GGUF** models — pass a GGUF repo
 with an explicit quantization variant, e.g.
 `rocm serve unsloth/Qwen3-0.6B-GGUF:Q4_0`. The vLLM engine (Instinct) serves
 **safetensors** repos, e.g. `rocm serve Qwen/Qwen2.5-1.5B-Instruct`. A
-safetensors-only id has no GGUF build, so serving it through Lemonade fails with
-a clear message rather than silently substituting a different model. Short
+safetensors-only id has no GGUF build, so serving it through Lemonade fails
+rather than silently substituting a different model. Short
 aliases from `rocm model` may not resolve with all engines.
 
 Some models (e.g., Llama) are gated and require HuggingFace authentication.
