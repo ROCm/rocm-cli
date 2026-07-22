@@ -31,3 +31,10 @@ Feature: GPU detection and system inspection
     When the user inspects the system
     Then the inspection reports the install as pre-existing
     And the inspection suggests setting up a CLI-managed install
+
+  @id:examine-detects-wsl @requires-wsl
+  Scenario: 6 - System inspection recognizes a WSL host
+    Given the CLI is running in WSL
+    When the user inspects the system
+    Then the inspection reports Linux as the operating system
+    And the inspection reports that the host is WSL

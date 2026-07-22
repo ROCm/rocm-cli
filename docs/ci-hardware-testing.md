@@ -4,59 +4,55 @@ Copyright © Advanced Micro Devices, Inc., or its affiliates.
 SPDX-License-Identifier: MIT
 -->
 
-# CI hardware (GPU / WSL) testing — planned
+# CI hardware (GPU / WSL) testing
 
-The hosted CI (`ubuntu-latest`, `windows-latest`) builds and unit-tests every
-shipping target natively. By design it cannot exercise two things:
+The E2E matrix covers native Linux, native Windows, and hosted WSL2. GitHub-hosted
+runners have no AMD GPU, so real GPU execution remains on dedicated self-hosted
+runners.
 
-- **Real AMD GPU execution** — GitHub-hosted runners have no AMD GPU.
-- **Real WSL behaviour** — the Windows↔WSL interop path needs an actual WSL host.
+## Platforms
 
-A dedicated hardware-test layer covers exactly those gaps. It is **not** part of
-the CI workflow yet; it will be introduced in a follow-up PR. This document
-records the intended design so it can be reviewed and wired up as a unit.
+Each job runs the same cucumber-rs suite. Capability tags resolve scenarios to
+pass, expected failure, or not applicable for that host, and `e2e-report`
+consolidates the resulting platform reports.
 
-## Design
-
-1. **Build once on hosted runners.** The hosted `build-and-test` (Linux) and
-   `windows-build-and-test` (Windows) jobs publish their per-OS binaries
-   (`rocm`, `rocmd`, `rocm-engine-*`) as workflow artifacts.
-2. **Test on dedicated self-hosted runners.** Hardware-test jobs download those
-   exact artifacts and run only the checks hosted runners cannot: `rocm examine`
-   host/GPU detection, engine `detect`/`capabilities`, the no-CPU-fallback
-   smoke (`scripts/smoke_local.py --skip-build`), and the
-   `scripts/*_therock_gpu_test.py` end-to-end GPU harnesses.
-
-### Targets
-
-| Target | Runner | Notes |
+| Job | Platform | Runner |
 |---|---|---|
-| Pure Windows 11 (gfx1151) | self-hosted Windows + AMD GPU | consumes the Windows artifact |
-| AMD Instinct, bare-metal | self-hosted Linux + Instinct GPU | consumes the Linux artifact |
-| Ubuntu on WSL (primary) | self-hosted Windows + WSL | consumes the Linux artifact in WSL |
-| Fedora on WSL (secondary) | self-hosted Windows + WSL | builds in-WSL to match the distro's glibc |
+| `e2e` | Mock (no GPU) | GitHub-hosted Ubuntu |
+| `e2e-wsl` | Ubuntu on WSL2 (no GPU) | GitHub-hosted Windows |
+| `e2e-gpu` | MI300X | self-hosted Linux + AMD GPU |
+| `e2e-gpu-strix-ubuntu` | Strix Halo (gfx1151) on Ubuntu | self-hosted Linux + AMD GPU |
+| `e2e-gpu-strix-windows` | Strix Halo (gfx1151) on native Windows 11 | self-hosted Windows + AMD GPU |
 
-### Guards
+The hosted `e2e-wsl` job registers an Ubuntu distro under WSL2, builds the CLI
+inside it, and runs the black-box suite. It exercises real WSL detection and the
+Windows-to-WSL execution boundary. GPU-only scenarios skip because the hosted
+runner has no AMD GPU.
 
-Each hardware-test job is:
+This is intentionally distinct from GPU-on-WSL validation. The hosted job cannot
+exercise `/dev/dxg`, the Windows AMD driver, ROCDXG, or live model serving on an
+AMD GPU. Those paths require a self-hosted Windows machine with both an AMD GPU
+and a configured WSL distro.
 
-- **Opt-in** via a repository/org variable (`ENABLE_WIN11_GPU_CI`,
-  `ENABLE_INSTINCT_CI`, `ENABLE_WSL_UBUNTU_CI`, `ENABLE_WSL_FEDORA_CI`) so it is
-  enabled per target as each runner is wired into the repo.
-- **Non-blocking** (`continue-on-error: true`) — a hardware result never gates a PR.
-- **Fork-safe** — self-hosted runners do not execute untrusted fork PRs.
+## Triggers and blocking behavior
+
+The hosted WSL and hardware jobs run automatically for heavy changes after the
+hosted build succeeds. They can also be selected with `workflow_dispatch` using
+`platform=wsl`, `app-dev-gpu`, `strix-ubuntu`, or `strix-windows`.
+
+Only the hosted Linux `e2e` job is blocking. `e2e-wsl` and all three hardware
+jobs use `continue-on-error: true`, so they provide advisory platform coverage
+while their failures remain visible in the consolidated report.
+
+Self-hosted runners are not used for untrusted fork pull requests. Manual
+workflow dispatch requires repository write access.
 
 ## Notes
 
-- These jobs run **debug** binaries: they assert functional behaviour (device
-  detection, engine launch, policy enforcement), not performance, so the
-  debug-vs-release difference does not affect what they check. Release-fidelity,
-  optimized validation already lives in the nightly/release pipeline, which
-  builds `manylinux2014` (glibc 2.17) binaries.
-- Linux artifacts are built on `ubuntu-latest`; a consuming runner on an older
-  distro must have a compatible (≥) glibc, otherwise it should build in-place
-  (as the Fedora-on-WSL target does).
-
-The layer will be enabled end-to-end in a follow-up PR once the self-hosted
-runners are connected to the repository and each path has been validated against
-real hardware.
+- E2E jobs build and run release binaries. They assert functional behavior such
+  as host detection, engine launch, and policy enforcement; they are not
+  performance benchmarks.
+- `e2e-wsl` has its own platform slug even without a GPU, so its results do not
+  collide with the ordinary mock report.
+- A future GPU-on-WSL lane should remain a separate, non-blocking platform until
+  its runner, distro, and GPU access have been validated end to end.

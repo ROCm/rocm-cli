@@ -24,6 +24,7 @@ const REQUIRES_ENGINE_PREFIX: &str = "requires-engine:";
 const REQUIRES_OS_PREFIX: &str = "requires-os:";
 const REQUIRES_GPU_TAG: &str = "requires-gpu";
 const REQUIRES_NO_GPU_TAG: &str = "requires-no-gpu";
+const REQUIRES_WSL_TAG: &str = "requires-wsl";
 const SERVE_TIMEOUT_PREFIX: &str = "serve-timeout:";
 const NIGHTLY_TAG: &str = "nightly";
 
@@ -49,6 +50,9 @@ pub struct ScenarioDecl {
     /// GPU — the inverse of `requires_gpu`. This is how the no-GPU fail-fast path
     /// gets live coverage: it runs on the GitHub-hosted mock job.
     pub requires_no_gpu: bool,
+    /// `@requires-wsl`: the scenario's premise requires a real WSL host. Skipped
+    /// on native Linux, native Windows, and other environments.
+    pub requires_wsl: bool,
     /// Engine the scenario pins via `@requires-engine:<e>` (if any).
     pub requires_engine: Option<String>,
     /// OS the scenario requires via `@requires-os:<os>` (e.g. "linux"), if any —
@@ -73,6 +77,7 @@ impl ScenarioDecl {
         let mut id = None;
         let mut requires_gpu = false;
         let mut requires_no_gpu = false;
+        let mut requires_wsl = false;
         let mut requires_engine = None;
         let mut requires_os = None;
         let mut serve_timeout_secs = None;
@@ -91,6 +96,8 @@ impl ScenarioDecl {
                 requires_gpu = true;
             } else if tag == REQUIRES_NO_GPU_TAG {
                 requires_no_gpu = true;
+            } else if tag == REQUIRES_WSL_TAG {
+                requires_wsl = true;
             } else if tag == NIGHTLY_TAG {
                 nightly = true;
             }
@@ -99,6 +106,7 @@ impl ScenarioDecl {
             id,
             requires_gpu,
             requires_no_gpu,
+            requires_wsl,
             requires_engine,
             requires_os,
             serve_timeout_secs,
@@ -298,6 +306,11 @@ pub fn resolve(
             reason: "requires a host with no AMD GPU; this host has one".to_owned(),
         };
     }
+    if decl.requires_wsl && !cap.is_wsl {
+        return Expectation::Skip {
+            reason: "requires WSL; this host is not running under WSL".to_owned(),
+        };
+    }
     if let Some(os) = &decl.requires_os
         && !os.eq_ignore_ascii_case(&cap.os_family)
     {
@@ -400,6 +413,15 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo".into(),
+            },
+            "wsl" => HostCapability {
+                os_family: "linux".into(),
+                is_wsl: true,
+                gfx_target: None,
+                has_amd_gpu: false,
+                available_engines: vec!["lemonade".into(), "vllm".into()],
+                effective_serve_engine: "lemonade".into(),
+                platform_slug: "wsl".into(),
             },
             _ => HostCapability {
                 os_family: "other".into(),
@@ -538,6 +560,20 @@ serve_timeout_secs = 90
             resolve(&d, &cap("strix-ubuntu"), &m, false),
             Expectation::Skip { .. }
         ));
+    }
+
+    #[test]
+    fn requires_wsl_runs_only_on_wsl_hosts() {
+        let m = Expectations::default();
+        let d = decl(&["id:examine-detects-wsl", "requires-wsl"]);
+        assert!(d.requires_wsl);
+        assert_eq!(resolve(&d, &cap("wsl"), &m, false), Expectation::ExpectPass);
+        for platform in ["mock", "strix-ubuntu", "strix-windows"] {
+            assert!(matches!(
+                resolve(&d, &cap(platform), &m, false),
+                Expectation::Skip { .. }
+            ));
+        }
     }
 
     #[test]

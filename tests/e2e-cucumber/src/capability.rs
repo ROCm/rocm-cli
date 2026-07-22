@@ -332,7 +332,8 @@ fn probe_host_capability() -> HostCapability {
     let has_amd_gpu = gfx_target.is_some();
     let available_engines = parse_engines_list(&engines);
     let effective_serve_engine = effective_serve_engine(gfx_target.as_deref(), &os_family);
-    let platform_slug = derive_platform_slug(has_amd_gpu, gfx_target.as_deref(), &os_family);
+    let platform_slug =
+        derive_platform_slug(has_amd_gpu, gfx_target.as_deref(), &os_family, is_wsl);
 
     HostCapability {
         os_family,
@@ -402,29 +403,51 @@ fn parse_engines_list(text: &str) -> Vec<String> {
     engines
 }
 
-/// Stable platform identity from hardware. No AMD GPU → "mock". Otherwise a
+/// Stable platform identity from hardware and host environment. WSL is a
+/// distinct platform even without a GPU, so its report never collides with the
+/// ordinary hosted mock column. Otherwise no AMD GPU → "mock"; GPU hosts use a
 /// coarse slug from the gfx family (data-center → "mi300x"; Strix gfx115x →
 /// "strix-halo"), falling back to the normalized family. The OS is appended for
 /// families that ship on more than one OS (Strix Halo runs both Ubuntu and
 /// Windows on the same gfx1151), so those become distinct grid columns rather
 /// than colliding into one.
-fn derive_platform_slug(has_amd_gpu: bool, gfx_target: Option<&str>, os_family: &str) -> String {
+fn derive_platform_slug(
+    has_amd_gpu: bool,
+    gfx_target: Option<&str>,
+    os_family: &str,
+    is_wsl: bool,
+) -> String {
+    if is_wsl {
+        return match gfx_target {
+            Some(t) => format!("{}-wsl", platform_hardware_slug(t)),
+            None => "wsl".to_owned(),
+        };
+    }
     if !has_amd_gpu {
         return "mock".to_owned();
     }
     match gfx_target {
         Some(t) => {
-            let f = normalize_family(t);
-            if f.ends_with("-dcgpu") {
-                "mi300x".to_owned()
-            } else if f.starts_with("gfx115") {
+            let hardware = platform_hardware_slug(t);
+            if hardware == "strix-halo" {
                 // Same silicon on Ubuntu and Windows — disambiguate by OS.
-                format!("strix-halo-{}", os_normalized(os_family))
+                format!("{hardware}-{}", os_normalized(os_family))
             } else {
-                f
+                hardware
             }
         }
         None => "mock".to_owned(),
+    }
+}
+
+fn platform_hardware_slug(gfx_target: &str) -> String {
+    let family = normalize_family(gfx_target);
+    if family.ends_with("-dcgpu") {
+        "mi300x".to_owned()
+    } else if family.starts_with("gfx115") {
+        "strix-halo".to_owned()
+    } else {
+        family
     }
 }
 
@@ -568,20 +591,27 @@ Local model engines
 
     #[test]
     fn platform_slug_derivation() {
-        assert_eq!(derive_platform_slug(false, None, "other"), "mock");
+        assert_eq!(derive_platform_slug(false, None, "other", false), "mock");
         assert_eq!(
-            derive_platform_slug(true, Some("gfx942"), "linux"),
+            derive_platform_slug(true, Some("gfx942"), "linux", false),
             "mi300x"
         );
         // Strix Halo: same gfx1151 silicon on both OSes → distinct slugs so the
         // report grid gets a column per platform, not a collision.
         assert_eq!(
-            derive_platform_slug(true, Some("gfx1151"), "linux"),
+            derive_platform_slug(true, Some("gfx1151"), "linux", false),
             "strix-halo-linux"
         );
         assert_eq!(
-            derive_platform_slug(true, Some("gfx1151"), "windows"),
+            derive_platform_slug(true, Some("gfx1151"), "windows", false),
             "strix-halo-windows"
+        );
+        // Hosted WSL has no GPU but must not collide with the ordinary mock
+        // column. A future WSL GPU lane also remains distinct from native Linux.
+        assert_eq!(derive_platform_slug(false, None, "linux", true), "wsl");
+        assert_eq!(
+            derive_platform_slug(true, Some("gfx1151"), "linux", true),
+            "strix-halo-wsl"
         );
     }
 }

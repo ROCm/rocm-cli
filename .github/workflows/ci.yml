@@ -25,7 +25,7 @@ on:
         description: Which runner(s) to target
         type: choice
         default: all
-        options: [all, mock, app-dev-gpu, strix-ubuntu, strix-windows]
+        options: [all, mock, wsl, app-dev-gpu, strix-ubuntu, strix-windows]
         # No tier input: the harness resolves pass/xfail/skip per scenario, so a
         # platform runs one job covering everything applicable to it.
       # Scenario-name regex forwarded to the cucumber harness
@@ -708,6 +708,69 @@ jobs:
           name: e2e-report
           path: tests/e2e-cucumber/results/
 
+  # Hosted WSL2 coverage: runs the black-box suite in a real Ubuntu distro on a
+  # windows-latest VM. GitHub-hosted runners have no AMD GPU, so GPU scenarios
+  # resolve to skip; this job covers the WSL host boundary, build, and CLI paths.
+  # Advisory while the hosted WSL image path is proven out.
+  e2e-wsl:
+    name: E2E tests (WSL2, no GPU)
+    timeout-minutes: 30
+    runs-on: windows-latest
+    needs: [changes, build-and-test]
+    if: >-
+      always()
+      && needs.changes.result == 'success'
+      && (
+        (github.event_name != 'workflow_dispatch'
+          && needs.build-and-test.result == 'success'
+          && needs.changes.outputs.heavy == 'true')
+        || (github.event_name == 'workflow_dispatch'
+          && (inputs.platform == 'all' || inputs.platform == 'wsl'))
+      )
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Ubuntu on WSL2
+        uses: Vampire/setup-wsl@d1da7f2c0322a5ee4f24975344f67fc0f5baf364 # v7.0.0
+        with:
+          distribution: Ubuntu-24.04
+          wsl-version: 2
+          use-cache: false
+          additional-packages: build-essential ca-certificates curl libcap-dev pkg-config
+
+      - name: Verify WSL2 host
+        shell: wsl-bash {0}
+        run: |
+          set -euo pipefail
+          grep -qi microsoft /proc/sys/kernel/osrelease
+          test -n "${WSL_INTEROP:-}"
+          printf 'WSL kernel: %s\n' "$(uname -r)"
+
+      - name: Ensure Rust toolchain in WSL2
+        shell: wsl-bash {0}
+        run: |
+          set -euo pipefail
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --default-toolchain none
+          fi
+          "$HOME/.cargo/bin/rustup" show active-toolchain
+
+      - name: Run E2E tests in WSL2
+        shell: wsl-bash {0}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo xtask e2e
+
+      - name: Upload WSL2 E2E report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-wsl-report
+          path: tests/e2e-cucumber/results/
+
   # app-dev MI300X (Instinct data-center GPU, `amd-gpu` label). Non-blocking.
   # One job runs every applicable scenario (tiers collapsed). Cost drivers:
   # `install sdk` re-running per scenario (isolated data dirs), several vLLM
@@ -1228,6 +1291,7 @@ jobs:
     needs:
       - changes
       - e2e
+      - e2e-wsl
       - e2e-gpu
       - e2e-gpu-strix-ubuntu
       - e2e-gpu-strix-windows
