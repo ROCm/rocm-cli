@@ -2,7 +2,7 @@
 
 # WIP: Close the xfail-cleanup gap for code-only bug fixes (EAI-7478)
 
-**Stage:** 7-PR-open (PR #134, driving CI green)
+**Stage:** done
 **Pipeline:** standard
 **Branch:** fix-xfail-cleanup-gap
 **Jira:** EAI-7478 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7478
