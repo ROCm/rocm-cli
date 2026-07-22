@@ -33,8 +33,14 @@ pub enum Expectation {
     /// Must pass; a failure is a real regression.
     ExpectPass,
     /// Declared known bug that reproduces on this host; failing is the expected
-    /// outcome, passing is an XPASS (stale entry).
-    ExpectXfail { bug: String, reason: String },
+    /// outcome, passing is an XPASS (stale entry). `flaky` marks a bug that is
+    /// NON-DETERMINISTIC on this host: it fails often but occasionally passes, so
+    /// an XPASS is expected and must NOT fail the run (only unexpected FAILs do).
+    ExpectXfail {
+        bug: String,
+        reason: String,
+        flaky: bool,
+    },
     /// Not applicable on this host (e.g. required engine can't start); skipped.
     Skip { reason: String },
 }
@@ -173,6 +179,11 @@ pub struct XfailEntry {
     pub reason: String,
     #[serde(default)]
     pub serve_timeout_secs: Option<u64>,
+    /// Mark a NON-DETERMINISTIC known bug: it fails often but occasionally passes
+    /// on this host, so an XPASS is expected and must not fail the run. Default
+    /// false (a normal xfail whose XPASS signals a stale entry to remove).
+    #[serde(default)]
+    pub flaky: bool,
 }
 
 /// The parsed `expectations.toml`: scenario-id → list of xfail conditions (OR).
@@ -241,7 +252,9 @@ pub struct ResolvedScenario {
 impl ResolvedScenario {
     pub fn new(id: &str, effective_engine: &str, expectation: &Expectation) -> Self {
         let (bug, reason) = match expectation {
-            Expectation::ExpectXfail { bug, reason } => (Some(bug.clone()), Some(reason.clone())),
+            Expectation::ExpectXfail { bug, reason, .. } => {
+                (Some(bug.clone()), Some(reason.clone()))
+            }
             Expectation::Skip { reason } => (None, Some(reason.clone())),
             Expectation::ExpectPass => (None, None),
         };
@@ -325,6 +338,7 @@ pub fn resolve(
                 return Expectation::ExpectXfail {
                     bug: entry.bug.clone(),
                     reason: entry.reason.clone(),
+                    flaky: entry.flaky,
                 };
             }
         }
@@ -617,6 +631,45 @@ reason = "short-name not surfaced"
         assert!(matches!(
             resolve(&d, &cap("mi300x"), &m, false),
             Expectation::ExpectXfail { .. }
+        ));
+    }
+
+    #[test]
+    fn flaky_marker_flows_into_resolved_xfail() {
+        // A `flaky = true` entry resolves to an ExpectXfail carrying flaky=true
+        // (the reconciler uses this to tolerate an XPASS); default is false.
+        let m = Expectations::parse(
+            r#"
+[["serve-lemonade-inference"]]
+when = { effective_engine = "lemonade", os = "windows" }
+bug = "EAI-7455"
+reason = "flaky lemonade daemon on native windows"
+flaky = true
+
+[["serve-readiness-contract"]]
+when = { effective_engine = "lemonade", os = "windows" }
+bug = "EAI-7455"
+reason = "not marked flaky"
+"#,
+        )
+        .unwrap();
+        let flaky = decl(&[
+            "id:serve-lemonade-inference",
+            "requires-gpu",
+            "requires-engine:lemonade",
+        ]);
+        assert!(matches!(
+            resolve(&flaky, &cap("strix-windows"), &m, false),
+            Expectation::ExpectXfail { flaky: true, .. }
+        ));
+        let normal = decl(&[
+            "id:serve-readiness-contract",
+            "requires-gpu",
+            "requires-engine:lemonade",
+        ]);
+        assert!(matches!(
+            resolve(&normal, &cap("strix-windows"), &m, false),
+            Expectation::ExpectXfail { flaky: false, .. }
         ));
     }
 

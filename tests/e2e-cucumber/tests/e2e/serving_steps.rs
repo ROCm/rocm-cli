@@ -328,9 +328,12 @@ async fn setup_gpu_model(world: &mut E2eWorld) {
     // until the job times out).
     let (model, engine, ready_substr) = host_serve_target();
     ensure_serve_port_free().await;
-    let (stdout, _, rc) =
+    let (stdout, stderr, rc) =
         crate::run_rocm(world, &["serve", model, "--engine", engine, "--managed"]);
-    assert!(rc == 0, "rocm serve failed:\n{stdout}");
+    assert!(
+        rc == 0,
+        "rocm serve failed (rc={rc}):\n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}"
+    );
     world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
     world.model_name = Some(model.to_string());
     // Wait for THIS model specifically: the shared port 11435 may still be
@@ -353,11 +356,14 @@ async fn setup_lemonade_model(world: &mut E2eWorld) {
     // serve+inference coverage. Qwen3-0.6B-GGUF is the smallest lemonade recipe.
     let model = "Qwen3-0.6B-GGUF";
     ensure_serve_port_free().await;
-    let (stdout, _, rc) = crate::run_rocm(
+    let (stdout, stderr, rc) = crate::run_rocm(
         world,
         &["serve", model, "--engine", "lemonade", "--managed"],
     );
-    assert!(rc == 0, "rocm serve failed:\n{stdout}");
+    assert!(
+        rc == 0,
+        "rocm serve failed (rc={rc}):\n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}"
+    );
     world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
     world.model_name = Some(model.to_string());
     // Wait for this lemonade model specifically (see setup_gpu_model): guards
@@ -397,9 +403,12 @@ async fn setup_large_gpu_model(world: &mut E2eWorld) {
             ("Qwen/Qwen3.6-27B", "vllm", "Qwen3.6-27B")
         };
     ensure_serve_port_free().await;
-    let (stdout, _, rc) =
+    let (stdout, stderr, rc) =
         crate::run_rocm(world, &["serve", model, "--engine", engine, "--managed"]);
-    assert!(rc == 0, "rocm serve failed:\n{stdout}");
+    assert!(
+        rc == 0,
+        "rocm serve failed (rc={rc}):\n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}"
+    );
     world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
     world.model_name = Some(model.to_string());
     wait_for_model(
@@ -488,7 +497,12 @@ async fn user_serves_default_engine(world: &mut E2eWorld) {
     // fn's doc comment.
     let model = default_engine_serve_target();
     ensure_serve_port_free().await;
-    let (stdout, _, rc) = crate::run_rocm(world, &["serve", model, "--managed"]);
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["serve", model, "--managed"]);
+    if rc != 0 {
+        eprintln!(
+            "default-engine serve failed (rc={rc}):\n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}"
+        );
+    }
     // The model the CLI resolved (what actually gets served) can differ from the
     // requested id, so downstream reachability/readiness checks must look for the
     // resolved model on the shared port; fall back to the requested id.
