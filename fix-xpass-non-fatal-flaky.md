@@ -6,7 +6,7 @@
 **PR:** #138 — https://github.com/ROCm/rocm-cli/pull/138 (commit 5ee8341, signed)
 **Pre-PR-check:** passed — opencode (independent reviewer), 2026-07-22 (reviewed after PR open)
 **Jira:** EAI-7456 (In Progress, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-22
+**Last Updated:** 2026-07-22 (idle flush)
 
 **Token Usage:** in=874 out=196297 cache_create=2789807 cache_read=53159288 calls=402
 
@@ -153,3 +153,5 @@ Scenario: Non-flaky XPASS remains fatal
 - Findings: reconcile() extracted as pure testable fn with 4 bucket tests; is_fatal() gates only on non-flaky xpass + unexpected_fail; flaky defaults false via serde(default); Scenarios sketch (flaky-XPASS non-fatal / unexpected-FAIL fatal / non-flaky-XPASS fatal) all map to a passing test. Nit (non-blocking): BTreeMap rebuilt via clone in e2e.rs — minor, acceptable for testability.
 - Not re-run locally this session: cargo test / clippy / container gate (WIP records them green on 2026-07-21).
 - Posted the review to tmux window 0 of this session per user request.
+
+**2026-07-22 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
