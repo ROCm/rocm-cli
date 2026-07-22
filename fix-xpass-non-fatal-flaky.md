@@ -5,10 +5,11 @@
 **Branch:** fix-xpass-non-fatal-flaky (worktree active)
 **PR:** #138 — https://github.com/ROCm/rocm-cli/pull/138 (commit 3dd423a, signed + Signed-off-by)
 **Pre-PR-check:** passed — opencode (independent reviewer), 2026-07-22 (reviewed after PR open)
+**Resume:** re-poll #138 approval — OPEN/MERGEABLE, mergeStateStatus BLOCKED, reviewDecision REVIEW_REQUIRED, head 3dd423a, all required checks green; gated ONLY on a human approving review. Nothing actionable until then.
 **Jira:** EAI-7456 (QA, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
 **Last Updated:** 2026-07-22
 
-**Token Usage:** in=1094 out=245705 cache_create=4573243 cache_read=75810976 calls=513
+**Token Usage:** in=1102 out=246858 cache_create=4816361 cache_read=76537345 calls=517
 
 ---
 
@@ -101,7 +102,7 @@ Scenario: Non-flaky XPASS remains fatal
 
 ## Blockers / Open Questions
 
-- PR #138 awaiting approving review (all required checks green; feature gated only on human review per branch protection).
+- **BLOCKED (awaiting user):** PR #138 awaiting human approving review (all 8 merge-required checks green; `MERGEABLE` but `mergeStateStatus: BLOCKED` on `REVIEW_REQUIRED`). Nothing more can progress until approval.
 
 ## Notes
 
@@ -184,3 +185,8 @@ Scenario: Non-flaky XPASS remains fatal
 - Concurrency-group root cause & recommended fix (split self-hosted E2E into separate workflow) captured in WIP CI status section for later work-ledger item.
 
 **2026-07-22 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+
+**2026-07-22 (final session close):**
+- Re-polled PR #138: OPEN/MERGEABLE, mergeStateStatus BLOCKED, reviewDecision REVIEW_REQUIRED, 0 reviews, head 3dd423a, all 8 required checks green.
+- No further progress until human approval. WIP stage remains 7-PR-open; blocker set to BLOCKED (awaiting user).
+- Concurrency-group finding (split self-hosted E2E into separate workflow) captured for later work-ledger item.
