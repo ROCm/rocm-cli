@@ -6,9 +6,9 @@
 **PR:** #138 — https://github.com/ROCm/rocm-cli/pull/138 (commit 5ee8341, signed)
 **Pre-PR-check:** passed — opencode (independent reviewer), 2026-07-22 (reviewed after PR open)
 **Jira:** EAI-7456 (In Progress, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-22 (idle flush)
+**Last Updated:** 2026-07-22
 
-**Token Usage:** in=874 out=196297 cache_create=2789807 cache_read=53159288 calls=402
+**Token Usage:** in=902 out=202457 cache_create=3011459 cache_read=55791233 calls=416
 
 ---
 
@@ -90,12 +90,8 @@ Scenario: Non-flaky XPASS remains fatal
 
 ## Blockers / Open Questions
 
-- **Delivery decision (yours):** separate focused PR first vs. bundle into the
-  lemonade branch. **Recommendation: separate PR first** — it's a cross-cutting
-  reconciliation-semantics change (affects all platforms/xfails), distinct from
-  either feature branch's scope. Landing it first unblocks #127 independently
-  (right dependency direction) and makes the lemonade branch robust against its
-  own flaky xfails.
+- **BLOCKED (awaiting user):** PR #138 awaiting DCO sign-off amendment. Amend commit `5ee8341` with `git commit -s --amend`, force-push, re-trigger CI. (Signature verified fine; only missing the DCO trailer.)
+- **Optional follow-up:** GPU lane failure on `serve-default-engine-working-endpoint (EAI-7052)` + `chat-end-to-end-local-model` is orthogonal flake drift. Either (a) re-run to confirm flake, (b) mark EAI-7052 flaky here before merge (if pattern repeats), or (c) address separately. User's call.
 
 ## Notes
 
@@ -154,4 +150,8 @@ Scenario: Non-flaky XPASS remains fatal
 - Not re-run locally this session: cargo test / clippy / container gate (WIP records them green on 2026-07-21).
 - Posted the review to tmux window 0 of this session per user request.
 
-**2026-07-22 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+**2026-07-22 (post-push CI analysis):**
+- PR #138 pushed; CI kicked off. Two check failures: (1) missing DCO `Signed-off-by` trailer (code signed fine, just missing sign-off flag); (2) E2E GPU lane exited 1 on unrelated flake (2 flaky-XPASS of EAI-7333 vLLM now correctly non-fatal per my change; 1 non-flaky XPASS on EAI-7052 + 1 unexpected-FAIL on chat scenario — orthogonal flake drift, not caused by this PR).
+- Reconciliation line on GPU run proves feature works: `"Reconciliation: 7 xfail, 3 XPASS (2 flaky, non-fatal), 1 unexpected failure(s)."` — the 2 EAI-7333 entries correctly printed as "(flaky, non-fatal)" and non-fatal (exit would be 1 only on the non-flaky XPASS + unexpected-FAIL, not the flaky ones).
+- **Blocker (awaiting user):** amend commit with DCO (`git commit -s --amend`) and force-push to re-trigger clean CI.
+- **Note on GPU failures:** orthogonal to this PR; recommend either (a) re-run to confirm flake vs. real, or (b) mark `serve-default-engine-working-endpoint (EAI-7052)` flaky too (separate follow-up PR, or include here if user wants).
