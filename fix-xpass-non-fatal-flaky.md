@@ -8,6 +8,8 @@
 **Jira:** EAI-7456 (QA, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
 **Last Updated:** 2026-07-22
 
+**2026-07-22 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+
 **Token Usage:** in=1010 out=223153 cache_create=3874430 cache_read=66536950 calls=470
 
 ---
@@ -160,3 +162,5 @@ Scenario: Non-flaky XPASS remains fatal
 - CI re-triggered (run 29910874741); CodeQL green; main CI (sign-off + GPU) pending. Old run 29901541610 holds shared concurrency group (GPU job stuck on offline `app-dev-gpu`); cancelled old run but GitHub slow to reap.
 - Feature confirmed working from first run: reconciliation `7 xfail, 3 XPASS (2 flaky, non-fatal), 1 unexpected failure` — EAI-7333 flaky entries correctly non-fatal.
 - **BLOCKED**: runner concurrency deadlock awaiting user action (bring runner online or wait for GitHub timeout).
+
+**2026-07-22 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
