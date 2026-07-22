@@ -6,7 +6,7 @@
 **PR:** #138 — https://github.com/ROCm/rocm-cli/pull/138 (commit 3dd423a, signed + Signed-off-by)
 **Pre-PR-check:** passed — opencode (independent reviewer), 2026-07-22 (reviewed after PR open)
 **Jira:** EAI-7456 (QA, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-22
+**Last Updated:** 2026-07-22 (idle flush)
 
 **Token Usage:** in=1034 out=233516 cache_create=4558402 cache_read=68812726 calls=483
 
@@ -164,3 +164,5 @@ Scenario: Non-flaky XPASS remains fatal
 - Investigated CI deadlock: old run's GPU job completed (failure), but Windows job (`strix-halo-windows`) still queued on offline runner; cannot be cancelled → holds shared concurrency group → new run stuck pending 54+ min.
 - `restore-app-dev-runner` skill checked but not applicable: bottleneck is `strix-halo-windows` (offline), not `app-dev-gpu`.
 - No further progress until Windows runner back online or GitHub times out offline job.
+
+**2026-07-22 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
