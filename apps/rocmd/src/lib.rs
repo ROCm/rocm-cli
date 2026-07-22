@@ -3360,8 +3360,10 @@ fn local_webhook_event_from_request(
     if let Some(service_id) = service_id
         && !service_id.is_empty()
     {
-        rocm_core::ServiceId::new(service_id)
-            .with_context(|| format!("invalid service_id `{service_id}`"))?;
+        // Propagate ServiceId's own message verbatim (e.g. "... must not contain
+        // path separators") rather than wrapping it in context, which anyhow's
+        // top-level Display would otherwise hide.
+        rocm_core::ServiceId::new(service_id)?;
     }
     match watcher_hint {
         "server-recover" if service_id.unwrap_or_default().is_empty() => {
