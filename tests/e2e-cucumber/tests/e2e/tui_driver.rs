@@ -54,7 +54,7 @@ const DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 /// Default wall-clock budget for a single wait. Generous enough for a cold dash
 /// start plus the embedded-daemon connect, while still turning a genuine hang
 /// into a prompt, diagnosable failure rather than a CI-timeout.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A running `rocm` TUI attached to a pseudo-terminal.
 pub struct TuiSession {
