@@ -42,24 +42,31 @@ fn serve_timeout_for(world: &E2eWorld) -> u64 {
 /// scenario A's `rocm` has no record of scenario B's managed service and can't
 /// stop it; a plain 200 check would then proceed against the WRONG model. Wait
 /// for the expected model so the readiness signal reflects this scenario's serve.
-async fn wait_for_model(models_url: &str, expect_model: Option<&str>, timeout_secs: u64) {
+async fn model_is_ready(models_url: &str, expect_model: Option<&str>, timeout_secs: u64) -> bool {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     while Instant::now() < deadline {
         if let Ok(resp) = reqwest::get(models_url).await
             && resp.status().is_success()
         {
             match expect_model {
-                None => return,
+                None => return true,
                 Some(model) => {
                     if let Ok(body) = resp.text().await
                         && body.contains(model)
                     {
-                        return;
+                        return true;
                     }
                 }
             }
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    false
+}
+
+async fn wait_for_model(models_url: &str, expect_model: Option<&str>, timeout_secs: u64) {
+    if model_is_ready(models_url, expect_model, timeout_secs).await {
+        return;
     }
     match expect_model {
         Some(m) => panic!("endpoint {models_url} did not serve model {m} within {timeout_secs}s"),
@@ -327,22 +334,32 @@ async fn setup_gpu_model(world: &mut E2eWorld) {
     // linger on the GPU and oversubscribe it (which otherwise piles up serves
     // until the job times out).
     let (model, engine, ready_substr) = host_serve_target();
-    ensure_serve_port_free().await;
-    let (stdout, _, rc) =
-        crate::run_rocm(world, &["serve", model, "--engine", engine, "--managed"]);
-    assert!(rc == 0, "rocm serve failed:\n{stdout}");
-    world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
-    world.model_name = Some(model.to_string());
-    // Wait for THIS model specifically: the shared port 11435 may still be
-    // answering from a prior scenario's leaked serve (isolated data dirs mean
-    // this scenario can't stop it), so a plain readiness check could pass against
-    // the wrong model.
-    wait_for_model(
-        "http://127.0.0.1:11435/v1/models",
-        Some(ready_substr),
-        serve_timeout_for(world),
-    )
-    .await;
+    let models_url = "http://127.0.0.1:11435/v1/models";
+    let timeout_secs = serve_timeout_for(world);
+    let mut diagnostics = Vec::new();
+    // A managed vLLM launch can return `status: starting` without publishing the
+    // model within this scenario's readiness budget. Qwen3.5 has both timed out
+    // and served successfully in the same MI300X run, so preserve that coverage
+    // and allow one clean relaunch rather than replacing the model fixture.
+    for attempt in 1..=2 {
+        ensure_serve_port_free().await;
+        let (stdout, stderr, rc) =
+            crate::run_rocm(world, &["serve", model, "--engine", engine, "--managed"]);
+        let diagnostic = format!(
+            "attempt {attempt} (rc={rc}):\n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}"
+        );
+        assert!(rc == 0, "rocm serve failed:\n{diagnostic}");
+        diagnostics.push(diagnostic);
+        if model_is_ready(models_url, Some(ready_substr), timeout_secs).await {
+            world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
+            world.model_name = Some(model.to_string());
+            return;
+        }
+    }
+    panic!(
+        "endpoint {models_url} did not serve model {ready_substr} after 2 attempts of {timeout_secs}s each:\n{}",
+        diagnostics.join("\n\n")
+    );
 }
 
 #[given("a GGUF model is being served on lemonade")]
