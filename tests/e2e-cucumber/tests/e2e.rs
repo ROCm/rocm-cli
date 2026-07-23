@@ -19,6 +19,7 @@ mod e2e {
     pub mod dash_steps;
     pub mod diagnose_steps;
     pub mod examine_steps;
+    pub mod lifecycle_steps;
     pub mod runtime_steps;
     pub mod serving_steps;
     pub mod tui_driver;
@@ -65,6 +66,10 @@ pub struct E2eWorld {
     /// launch step knows to pass `--chat-mock` (deterministic offline agent, no
     /// endpoint detection) instead of driving the real detection/consent path.
     pub chat_use_mock: bool,
+    /// Per-scenario release-lifecycle state (packaging dirs, signing keys, install
+    /// dir, captured logs). `Some` only for `@lifecycle` scenarios; all its paths
+    /// are rooted in `isolated_root` so teardown removes them with the temp dir.
+    pub lifecycle: Option<e2e::lifecycle_steps::LifecycleState>,
 }
 
 /// Resolve a CI-provided shared-directory env var to a validated, existing path.
@@ -168,6 +173,7 @@ impl Default for E2eWorld {
             serve_timeout_override: None,
             tui: None,
             chat_use_mock: false,
+            lifecycle: None,
         }
     }
 }
@@ -342,6 +348,13 @@ impl E2eWorld {
 
 impl Drop for E2eWorld {
     fn drop(&mut self) {
+        // Restore any release-lifecycle side effects FIRST — most importantly the
+        // Windows user PATH a scenario may have mutated — even if a step panicked
+        // and left the scenario mid-way. `LifecycleState`'s own Drop does the
+        // restoration; taking it here makes the ordering explicit.
+        if let Some(lifecycle) = self.lifecycle.take() {
+            drop(lifecycle);
+        }
         // Kill/reap any interactive TUI child FIRST — before the mock server it
         // may be talking to stops and before the isolated dir it reads is
         // removed — so it never outlives the scenario or races teardown.
@@ -684,6 +697,15 @@ async fn main() {
     // unless the nightly workflow opts in via `E2E_INCLUDE_NIGHTLY`, keeping the
     // per-PR / on-demand GPU run fast.
     let include_nightly = std::env::var_os("E2E_INCLUDE_NIGHTLY").is_some_and(|v| v == "1");
+    // Expensive, OS-mutating `@lifecycle` scenarios (packaging + real installer +
+    // install/uninstall) are skipped unless the caller opts in via
+    // `E2E_INCLUDE_LIFECYCLE`, so the default `cargo xtask e2e` stays fast.
+    let include_lifecycle = std::env::var_os("E2E_INCLUDE_LIFECYCLE").is_some_and(|v| v == "1");
+    // CI runs just the lifecycle set after opting in. Keep this selection inside
+    // our custom filter instead of cucumber's `--tags`/`-n`: cucumber 0.23 uses
+    // either its CLI filter OR this closure, so CLI selection would bypass OS,
+    // nightly/lifecycle, ID, and expectation resolution entirely.
+    let only_lifecycle = std::env::var_os("E2E_ONLY_LIFECYCLE").is_some_and(|v| v == "1");
     eprintln!(
         "Host capability: platform={} os={} gpu={} effective_engine={}",
         cap.platform_slug, cap.os_family, cap.has_amd_gpu, cap.effective_serve_engine,
@@ -751,8 +773,9 @@ async fn main() {
         .filter_run(concat!(env!("CARGO_MANIFEST_DIR"), "/features/"), {
             move |_feature, _rule, scenario| {
                 let decl = ScenarioDecl::from_tags(&scenario.tags);
-                let expectation = resolve(&decl, cap, matrix, include_nightly);
-                let run = !matches!(expectation, Expectation::Skip { .. });
+                let expectation = resolve(&decl, cap, matrix, include_nightly, include_lifecycle);
+                let run = (!only_lifecycle || decl.lifecycle)
+                    && !matches!(expectation, Expectation::Skip { .. });
                 if let Some(id) = &decl.id {
                     let engine = decl.effective_engine(cap).to_owned();
                     let prev = resolutions

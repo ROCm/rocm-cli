@@ -18,6 +18,18 @@ rocm-core = { path = "../crates/rocm-core" }
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+# `cargo xtask package` builds `.tar.gz` on Unix and `.zip` on Windows, so each
+# archive backend is pulled in only for the platform that emits that format.
+[target.'cfg(not(windows))'.dependencies]
+flate2 = "1.1"
+tar = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+# Narrow to the deflate backend only; the default `zip` features pull in several
+# extra compression codecs the bundle does not need.
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "3"
