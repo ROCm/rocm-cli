@@ -100,8 +100,10 @@ Known bugs are **not** tagged in the `.feature` files — they live in
 `expectations.toml`, keyed by `@id`, each with a `when = { ... }` condition (e.g.
 `effective_engine = "vllm"`), a `bug` reference, and a `reason`. A scenario that
 matches a condition is expected to fail (xfail); if it then passes, that is an
-**XPASS** (stale entry — remove it). See `src/expectation.rs` for the resolver
-and `expectations.toml`'s header for the condition grammar.
+**XPASS**. Deterministic XPASS is stale and must be removed; entries marked
+`flaky = true` tolerate either outcome while still reporting the intermittent
+bug. See `src/expectation.rs` for the resolver and `expectations.toml`'s header
+for the condition grammar.
 
 CI runs one job per platform, each executing the full suite:
 
