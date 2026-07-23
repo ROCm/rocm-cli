@@ -28,9 +28,9 @@ only the built-in `lemonade` and `vllm` engines. Discovery still lists external
 plugins under the search directories above, but selecting one by name from the
 CLI is not supported while the engine set is limited to the two built-ins.
 
-The `lemonade` adapter uses Lemonade embeddable and requires Lemonade's
-`llamacpp:rocm` backend. rocm-cli does not use a CPU or Vulkan fallback for
-this path.
+The `lemonade` adapter uses Lemonade embeddable and prefers Lemonade's
+`llamacpp:rocm` backend, falling back to `llamacpp:vulkan` when ROCm is
+unsupported. rocm-cli does not use a CPU fallback for this path.
 
 `rocm engines list` shows the exact plugin directories for the current host.
 The same output is available in the TUI with `/engine`.
