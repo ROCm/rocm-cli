@@ -4,6 +4,7 @@
 **Pipeline:** standard
 **Branch:** test-e2e-tui-cucumber
 **Last Updated:** 2026-07-20
+**Pre-PR-check:** passed — pre-pr-reviewer (opencode), 2026-07-23
 
 **Token Usage:** in=6 out=1856 cache_create=206168 cache_read=192584 calls=4
 

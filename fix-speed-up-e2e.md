@@ -7,6 +7,7 @@
 **Ticket:** [EAI-7484](https://amd.atlassian.net/browse/EAI-7484) — "Speed up E2E suite - mock/real split for GPU serve scenarios" (In Progress, assignee Fredrik Espinoza, component rocm-cli) — tracks Tasks #5–#7 (PR #136)
 **Branch:** test-e2e-mock-real-split (Tasks #5–#7, PR #136). Shipped: test-e2e-smallest-serve-model (#128), fix-speed-up-e2e (#126)
 **Last Updated:** 2026-07-21
+**Pre-PR-check:** passed — claude-opus-4.8 (reviewer agent), 2026-07-23
 
 **Token Usage:** in=1006 out=301808 cache_create=5512288 cache_read=94907267 calls=509
 

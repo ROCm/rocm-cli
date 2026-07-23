@@ -7,6 +7,7 @@
 **Branch:** fix-nightly-27b-preseed
 **Jira:** EAI-7477 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7477
 **Last Updated:** 2026-07-21
+**Pre-PR-check:** passed — pre-PR reviewer (fix-nightly-27b-preseed worktree), 2026-07-23
 
 **Token Usage:** in=0 out=0 cache_create=0 cache_read=0 calls=0
 
