@@ -7,9 +7,9 @@
 **Pre-PR-check:** passed — opencode (independent reviewer), 2026-07-22 (reviewed after PR open)
 **Resume:** re-poll #138 approval — OPEN/MERGEABLE, mergeStateStatus BLOCKED, reviewDecision REVIEW_REQUIRED, head 3dd423a, all required checks green; gated ONLY on a human approving review. Nothing actionable until then.
 **Jira:** EAI-7456 (QA, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-23 (idle flush)
+**Last Updated:** 2026-07-23
 
-**Token Usage:** in=1816 out=404156 cache_create=9416811 cache_read=130443049 calls=858
+**Token Usage:** in=1824 out=405303 cache_create=10181989 cache_read=130698006 calls=862
 
 ---
 
@@ -205,4 +205,7 @@ Scenario: Non-flaky XPASS remains fatal
 - **Blockers (awaiting user):** (1) human approving review; (2) branch rebase/update (after approval, before merge).
 - No merge possible until approval; no action items for agent.
 
-**2026-07-23 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+**2026-07-23 (final nudge + merge decision):**
+- PR #138 state: OPEN/MERGEABLE, mergeStateStatus BEHIND (main advanced), reviewDecision REVIEW_REQUIRED, 0 reviews, head 3dd423a, all 8 merge-required checks green.
+- Asked fres: approval gate + need for rebase (held branch update until after approval to avoid re-running CI for unmergeable PR).
+- **Blockers (awaiting user):** (1) human approving review on PR #138; (2) branch update/rebase (after approval, before merge). No merge possible until approval lands.
