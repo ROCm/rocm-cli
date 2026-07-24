@@ -6,9 +6,9 @@
 **PR:** #138 — https://github.com/ROCm/rocm-cli/pull/138 (**READY** for review; rebased 2026-07-24 → HEAD `5393392` signed w/ amd fallback key + Signed-off-by; container gate green)
 **Pre-PR-check:** passed — opencode (independent reviewer), 2026-07-22
 **Jira:** EAI-7456 (QA, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-24 (idle flush)
+**Last Updated:** 2026-07-24
 
-**Token Usage:** in=1978 out=459585 cache_create=12393770 cache_read=149576247 calls=939
+**Token Usage:** in=2020 out=472610 cache_create=13286602 cache_read=154905403 calls=960
 
 ---
 
@@ -107,7 +107,8 @@ Scenario: Non-flaky XPASS remains fatal
 
 ## Blockers / Open Questions
 
-- **EAI-7052 decision pending**: two entries XPASS'd on MI300X runs (advisory GPU lane, non-merge-blocking). Call: flip to expect-pass (bug fixed) / mark flaky (bug intermittent) / defer to follow-up PR.
+- **BLOCKED (awaiting user)**: PR #138/#142 collision. PR #142 ("ci: stabilize GPU E2E and merge queue", rominf, OPEN) rewrites the same 3 files with parallel flaky-XPASS implementation (adds `flaky: bool`, `CellOutcome::reconcile()`, `FlakyXpass` variant). Whichever lands first, the other conflicts hard + becomes redundant. Resolution needed: close #138 in favor of #142, close #142 in favor of #138, or coordinate with rominf.
+- **EAI-7052 mis-attribution + intermittent evidence**: EAI-7052 = "Lemonade should use installed ROCm version" (Done/Resolved 2026-07-16 by Eugene Volen) — unrelated to "Vulkan hangs on Instinct" symptom the xfail attributes. Two scenarios (serve-default-engine-working-endpoint, serve-default-engine-inference) XPASS'd on my runs (07-24) but xfail'd on #142 merge-queue runs (07-23) → intermittent, not cleanly fixed. Recommendation: mark-flaky OR defer, NOT flip-to-expect-pass. Decision depends on #138/#142 resolution above.
 
 ## Notes
 
@@ -231,3 +232,8 @@ Scenario: Non-flaky XPASS remains fatal
 - **Open**: EAI-7052 decision (flip-expect-pass / mark-flaky / defer) — advisory lane, non-blocking.
 
 **2026-07-24 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+
+**2026-07-24 (EAI-7052 evidence + PR collision discovery):**
+- Gathered EAI-7052 evidence per fres: mis-attribution confirmed (EAI-7052 = "Lemonade use installed ROCm", Done/Resolved 2026-07-16, unrelated to Vulkan hang). Two scenarios XPASS'd on my runs (07-24) but xfail'd on #142 merge-queue (07-23) → intermittent, not fixed.
+- **Critical discovery**: PR #142 ("ci: stabilize GPU E2E and merge queue", rominf) rewrites the same 3 files as #138 with parallel flaky-XPASS implementation. Whichever lands first, other conflicts hard + becomes redundant.
+- **Blockers (awaiting user)**: (1) #138/#142 resolution (close one, coordinate, or merge both); (2) EAI-7052 call (mark-flaky / defer) depends on (1). No further progress on #138 until (1) is decided.
