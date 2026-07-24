@@ -6,6 +6,13 @@ use cucumber::{given, then, when};
 
 use crate::E2eWorld;
 
+fn field_value<'a>(output: &'a str, field: &str) -> Option<&'a str> {
+    output.lines().find_map(|line| {
+        let (name, value) = line.trim().split_once(':')?;
+        (name == field).then(|| value.trim())
+    })
+}
+
 #[given("a machine with an AMD GPU")]
 async fn setup_gpu_machine(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["examine"]);
@@ -18,6 +25,15 @@ async fn setup_gpu_machine(world: &mut E2eWorld) {
 #[given("a machine with a ROCm install that was not set up by the CLI")]
 async fn setup_unmanaged_rocm(world: &mut E2eWorld) {
     world.plant_unmanaged_rocm();
+}
+
+#[given("the CLI is running in WSL")]
+async fn setup_wsl_host(world: &mut E2eWorld) {
+    let (stdout, _, _) = crate::run_rocm(world, &["examine"]);
+    assert!(
+        field_value(&stdout, "wsl").is_some_and(|value| value.eq_ignore_ascii_case("true")),
+        "CLI did not detect WSL:\n{stdout}"
+    );
 }
 
 #[when("the user asks for the version")]
@@ -98,6 +114,26 @@ async fn assert_all_engines_listed(world: &mut E2eWorld) {
             "engine '{engine}' not found in:\n{output}"
         );
     }
+}
+
+#[then("the inspection reports Linux as the operating system")]
+async fn assert_linux_host(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert_eq!(
+        field_value(output, "os"),
+        Some("linux"),
+        "expected Linux in examine output:\n{output}"
+    );
+}
+
+#[then("the inspection reports that the host is WSL")]
+async fn assert_wsl_host(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert_eq!(
+        field_value(output, "wsl"),
+        Some("true"),
+        "expected WSL in examine output:\n{output}"
+    );
 }
 
 #[then("the inspection reports which GPU is installed")]
