@@ -28,11 +28,9 @@ only the built-in `lemonade` and `vllm` engines. Discovery still lists external
 plugins under the search directories above, but selecting one by name from the
 CLI is not supported while the engine set is limited to the two built-ins.
 
-The `lemonade` adapter uses Lemonade embeddable and requires Lemonade's
-`llamacpp:rocm` backend. Windows ROCm serving is validated. WSL is currently
-blocked by Lemonade v10.6.0 reporting no AMD GPU through its own detector even
-when TheRock/librocdxg works; rocm-cli does not use CPU or Vulkan fallback for
-that path.
+The `lemonade` adapter uses Lemonade embeddable and prefers Lemonade's
+`llamacpp:rocm` backend, falling back to `llamacpp:vulkan` when ROCm is
+unsupported. rocm-cli does not use a CPU fallback for this path.
 
 `rocm engines list` shows the exact plugin directories for the current host.
 The same output is available in the TUI with `/engine`.

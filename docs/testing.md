@@ -84,9 +84,9 @@ cargo build --workspace --release
 cargo test --workspace
 ```
 
-On WSL/Linux, build and run the native Linux binary directly (no APE launcher
-prefix is required). The examine output on WSL must include `os: linux` and
-`wsl: true`, and must not include `os: windows`.
+On WSL/Linux, build and run the native Linux binary directly. The examine
+output on WSL must include `os: linux` and `wsl: true`, and must not include
+`os: windows`.
 
 Use isolated `ROCM_CLI_CONFIG_DIR`, `ROCM_CLI_DATA_DIR`, and
 `ROCM_CLI_CACHE_DIR` roots for smoke tests, then delete those roots after the
