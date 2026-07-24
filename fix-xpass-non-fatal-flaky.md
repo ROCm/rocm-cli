@@ -6,7 +6,7 @@
 **PR:** #138 — https://github.com/ROCm/rocm-cli/pull/138 (**READY** for review; rebased 2026-07-24 → HEAD `5393392` signed w/ amd fallback key + Signed-off-by; container gate green)
 **Pre-PR-check:** passed — opencode (independent reviewer), 2026-07-22
 **Jira:** EAI-7456 (QA, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-24
+**Last Updated:** 2026-07-24 (idle flush)
 
 **Token Usage:** in=1978 out=459585 cache_create=12393770 cache_read=149576247 calls=939
 
@@ -229,3 +229,5 @@ Scenario: Non-flaky XPASS remains fatal
 - **Force-pushed** rebased branch; **`gh pr ready 138`** (out of draft). CI re-triggered (run 30070568396).
 - **PR state**: OPEN/MERGEABLE, BLOCKED on genuine REVIEW_REQUIRED (0 reviews). All 8 merge-required checks green. Awaiting human approval.
 - **Open**: EAI-7052 decision (flip-expect-pass / mark-flaky / defer) — advisory lane, non-blocking.
+
+**2026-07-24 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
