@@ -6,7 +6,7 @@
 **PR:** #138 — https://github.com/ROCm/rocm-cli/pull/138 (**DRAFT**; rebased 2026-07-24 → HEAD `5393392` signed w/ amd fallback key + Signed-off-by)
 **Pre-PR-check:** passed — opencode (independent reviewer), 2026-07-22
 **Jira:** EAI-7456 (QA, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-24
+**Last Updated:** 2026-07-24 (idle flush)
 
 **Token Usage:** in=1944 out=454522 cache_create=11531850 cache_read=145586504 calls=922
 
@@ -221,3 +221,5 @@ Scenario: Non-flaky XPASS remains fatal
 - **GPU E2E triage (from failed run 29910874741)**: reconciliation proved my feature works correctly — `8 xfail, 2 XPASS (0 flaky, non-fatal), 0 unexpected failure`. The 2 EAI-7333 flaky entries xfailed as expected this run (bug reproduced), 0 flaky XPASS, **0 unexpected failures** (earlier chat FAIL confirmed cold-cache flake, gone on re-run). Red lane is **NOT** my change and **NOT** the EAI-7333 flaky-xfail; it's **two EAI-7052 entries XPASS'd** (non-flaky, correctly fatal by existing rule): `serve-default-engine-working-endpoint (EAI-7052)` + `serve-default-engine-inference (EAI-7052)`. This is a separate call (fres to decide: flip to expect-pass vs. mark flaky vs. leave for follow-up). EAI-7052 lane is advisory/non-merge-blocking.
 - **Container gate re-run**: daemon XPC dropped mid-run (infra abort, not code failure); restarted daemon, gate running again.
 - **Decision points for fres**: (1) force-push rebased branch (overwrites remote); (2) call on EAI-7052 (flip/flaky/defer); (3) `gh pr ready 138` once above done. All irreversible/externally-visible — awaiting direct confirmation before proceeding.
+
+**2026-07-24 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
