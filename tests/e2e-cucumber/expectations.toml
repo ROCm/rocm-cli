@@ -20,6 +20,11 @@
 #   bug = "EAI-NNNN"                  ticket reference (shown in the report)
 #   reason = "..."                    human explanation (shown in the report)
 #   serve_timeout_secs = 90          optional: shorter serve wait for a known bug
+#   flaky = true                     optional: the bug is intermittent, so an XPASS
+#                                     (lucky run where it didn't reproduce) is
+#                                     reported but NON-FATAL. Unexpected-FAIL stays
+#                                     fatal. Use only for genuinely intermittent
+#                                     bugs, never to mask a fixed/stale entry.
 #
 # An empty `when = {}` means "always xfail" (platform-independent bug).
 
@@ -43,6 +48,9 @@ when = { effective_engine = "vllm" }
 bug = "EAI-7333"
 reason = "vLLM service reports ready (/v1/models 200) but POST /v1/chat/completions is refused."
 serve_timeout_secs = 90
+# EAI-7333 is intermittent (flipped across MI300X runs 29404668327 pass / 29413321046 fail);
+# an XPASS is expected noise, not a fix, so keep it xfail'd but non-fatal.
+flaky = true
 
 # Default-engine serve is RECIPE-driven, not host-driven: `rocm serve <model>`
 # with no --engine resolves to the recipe's preferred model+engine. On an Instinct
@@ -94,6 +102,8 @@ when = { effective_engine = "vllm" }
 bug = "EAI-7333"
 reason = "CLI reports the vLLM service ready, but an immediate inference request races the model load and intermittently fails."
 serve_timeout_secs = 90
+# Intermittent (see serve-vllm-inference): XPASS is expected noise, non-fatal.
+flaky = true
 
 # On a lemonade LINUX host this scenario does a real lemonade serve, which reaches
 # ready then shuts down immediately (EAI-7423, see serve-lemonade-inference).

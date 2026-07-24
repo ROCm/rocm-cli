@@ -826,44 +826,37 @@ async fn main() {
     // pass but failed) are failures; expected outcomes are fine. Scenarios that
     // ran but have no id, or ran without a recorded resolution, are treated as
     // expect-pass (a bare failure then fails the run).
-    let mut xpass = Vec::new();
-    let mut unexpected_fail = Vec::new();
-    let mut xfail_count = 0u32;
-    for (id, passed) in &actual {
-        match resolutions.get(id).map(|(exp, _)| exp) {
-            Some(Expectation::ExpectXfail { bug, .. }) => {
-                if *passed {
-                    xpass.push(format!("{id} ({bug})"));
-                } else {
-                    xfail_count += 1;
-                }
-            }
-            // ExpectPass, or no recorded resolution (untagged) → must pass.
-            _ => {
-                if !passed {
-                    unexpected_fail.push(id.clone());
-                }
-            }
-        }
-    }
+    let by_id: BTreeMap<String, Expectation> = resolutions
+        .iter()
+        .map(|(id, (exp, _))| (id.clone(), exp.clone()))
+        .collect();
+    let recon = e2e_cucumber::expectation::reconcile(actual.iter().map(|(id, p)| (id, p)), &by_id);
 
     eprintln!(
-        "Reconciliation: {xfail_count} xfail (failed as expected), {} XPASS, {} unexpected failure(s).",
-        xpass.len(),
-        unexpected_fail.len(),
+        "Reconciliation: {} xfail (failed as expected), {} XPASS ({} flaky, non-fatal), {} unexpected failure(s).",
+        recon.xfail_count,
+        recon.xpass.len() + recon.flaky_xpass.len(),
+        recon.flaky_xpass.len(),
+        recon.unexpected_fail.len(),
     );
-    if !xpass.is_empty() || !unexpected_fail.is_empty() {
-        for x in &xpass {
-            eprintln!(
-                "XPASS: '{x}' is expected to fail on this host but PASSED \u{2014} the bug appears \
-                 fixed here; update expectations.toml.",
-            );
-        }
-        for f in &unexpected_fail {
-            eprintln!(
-                "FAIL: '{f}' was expected to pass on this host but FAILED \u{2014} a regression."
-            );
-        }
+    for x in &recon.flaky_xpass {
+        eprintln!(
+            "XPASS (flaky, non-fatal): '{x}' is a known-flaky xfail that passed this run \u{2014} \
+             the intermittent bug did not reproduce; leaving expectations.toml unchanged.",
+        );
+    }
+    for x in &recon.xpass {
+        eprintln!(
+            "XPASS: '{x}' is expected to fail on this host but PASSED \u{2014} the bug appears \
+             fixed here; update expectations.toml.",
+        );
+    }
+    for f in &recon.unexpected_fail {
+        eprintln!(
+            "FAIL: '{f}' was expected to pass on this host but FAILED \u{2014} a regression."
+        );
+    }
+    if recon.is_fatal() {
         std::process::exit(1);
     }
 }
