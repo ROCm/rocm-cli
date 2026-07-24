@@ -3,12 +3,12 @@
 **Stage:** 7-PR-open (PR #138)
 **Pipeline:** standard
 **Branch:** fix-xpass-non-fatal-flaky (worktree active)
-**PR:** #138 — https://github.com/ROCm/rocm-cli/pull/138 (**DRAFT**; rebased 2026-07-24 → HEAD `5393392` signed w/ amd fallback key + Signed-off-by)
+**PR:** #138 — https://github.com/ROCm/rocm-cli/pull/138 (**READY** for review; rebased 2026-07-24 → HEAD `5393392` signed w/ amd fallback key + Signed-off-by; container gate green)
 **Pre-PR-check:** passed — opencode (independent reviewer), 2026-07-22
 **Jira:** EAI-7456 (QA, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-24 (idle flush)
+**Last Updated:** 2026-07-24
 
-**Token Usage:** in=1944 out=454522 cache_create=11531850 cache_read=145586504 calls=922
+**Token Usage:** in=1978 out=459585 cache_create=12393770 cache_read=149576247 calls=939
 
 ---
 
@@ -82,8 +82,14 @@ Scenario: Non-flaky XPASS remains fatal
 - ✅ DCO fix: amended `5ee8341` → `3dd423a` (added `Signed-off-by`, re-signed), force-pushed.
 - ✅ CI re-triggered (run 29910874741); all 8 merge-required checks green (including `Commit signatures + sign-off`); PR `MERGEABLE` but awaiting approving review.
 - ✅ CI deadlock diagnosed: old run's Windows job (`strix-halo-windows` runner, offline) held shared concurrency group; resolved via `gh api -X POST .../force-cancel` (plain cancel cannot reap offline-runner jobs).
+- ✅ PR #138 rebased onto current main (was 20 behind); my changes intact, merged cleanly with main's new e2e code, no conflicts. HEAD `5393392`, signed (amd fallback key) + Signed-off-by.
+- ✅ GPU E2E triage: feature verified working (`0 XPASS (0 flaky), 0 unexpected failures`). Orthogonal EAI-7052 XPASS'es are a separate decision (flip-expect-pass / mark-flaky / defer).
+- ✅ Container gate re-run (post-rebase): green (31 scenarios, 0 XPASS, 0 unexpected failures).
+- ✅ Force-pushed rebased branch `5393392` to origin.
+- ✅ `gh pr ready 138` — flipped out of draft to ready-for-review. CI re-triggered (run 30070568396).
 
 ### Todo 📋
+- 📋 EAI-7052 decision (flip-expect-pass / mark-flaky / defer) — advisory GPU lane, non-merge-blocking.
 - 📋 EAI-7455 lemonade-Windows entries: N/A here — they live on `fix-e2e-share-lemonade-engine`; that branch marks them flaky after this lands.
 - 📋 PR #138 awaiting human approving review (all required checks green).
 
@@ -101,7 +107,7 @@ Scenario: Non-flaky XPASS remains fatal
 
 ## Blockers / Open Questions
 
-- **BLOCKED (awaiting user):** (1) Container gate re-run ongoing after rebase+daemon restart — awaiting green before force-push. (2) Force-push rebased branch `5393392` to origin (overwrites remote `3dd423a`). (3) Call on EAI-7052 XPASS entries (separate from #138's EAI-7333 flaky-xfail; advisory lane, non-merge-blocking): flip to expect-pass (bug fixed on MI300X) vs. mark flaky (bug intermittent) vs. leave (handle in follow-up). (4) `gh pr ready 138` to flip out of DRAFT once approved above. All irreversible/externally-visible; awaiting fres's direct confirmation before proceeding.
+- **EAI-7052 decision pending**: two entries XPASS'd on MI300X runs (advisory GPU lane, non-merge-blocking). Call: flip to expect-pass (bug fixed) / mark flaky (bug intermittent) / defer to follow-up PR.
 
 ## Notes
 
@@ -215,11 +221,11 @@ Scenario: Non-flaky XPASS remains fatal
 - Concurrency-group gap identified: shared per-ref group with `cancel-in-progress: true` cannot reap jobs stuck on offline self-hosted runners → blocks merge-required lanes. Recommended fix: split self-hosted E2E into separate workflow with unique per-run concurrency group. Captured for work-ledger CI redesign item (separate from #138).
 - **Blocker (final):** PR #138 awaiting human approving review (all required checks green, mergeable, but mergeState BLOCKED on REVIEW_REQUIRED). Branch now BEHIND main; will update-branch after approval, before merge. No further progress possible until approval.
 
-**2026-07-24 (rebase + triage + decision-point):**
-- **Corrected misreading**: PR #138 is a DRAFT (`isDraft: True`), not review-gated — drafts can't be approved regardless. Ball was with me, not a reviewer.
-- **Rebased** branch onto current main (was 20 commits behind). My `reconcile()`/`flaky` changes survived intact; merged cleanly with main's new e2e code (no conflicts). New HEAD `5393392`, signed w/ amd fallback key (1Password locked headless) + Signed-off-by.
-- **GPU E2E triage (from failed run 29910874741)**: reconciliation proved my feature works correctly — `8 xfail, 2 XPASS (0 flaky, non-fatal), 0 unexpected failure`. The 2 EAI-7333 flaky entries xfailed as expected this run (bug reproduced), 0 flaky XPASS, **0 unexpected failures** (earlier chat FAIL confirmed cold-cache flake, gone on re-run). Red lane is **NOT** my change and **NOT** the EAI-7333 flaky-xfail; it's **two EAI-7052 entries XPASS'd** (non-flaky, correctly fatal by existing rule): `serve-default-engine-working-endpoint (EAI-7052)` + `serve-default-engine-inference (EAI-7052)`. This is a separate call (fres to decide: flip to expect-pass vs. mark flaky vs. leave for follow-up). EAI-7052 lane is advisory/non-merge-blocking.
-- **Container gate re-run**: daemon XPC dropped mid-run (infra abort, not code failure); restarted daemon, gate running again.
-- **Decision points for fres**: (1) force-push rebased branch (overwrites remote); (2) call on EAI-7052 (flip/flaky/defer); (3) `gh pr ready 138` once above done. All irreversible/externally-visible — awaiting direct confirmation before proceeding.
-
-**2026-07-24 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+**2026-07-24 (full implementation → PR ready):**
+- **Corrected misreading**: PR #138 is a DRAFT, not review-gated. Ball was with me.
+- **Rebased** onto current main (20 behind). My changes intact, merged cleanly, no conflicts. HEAD `5393392`, signed (amd fallback key) + Signed-off-by.
+- **GPU E2E triage**: feature verified — `8 xfail, 2 XPASS (0 flaky, non-fatal), 0 unexpected failure`. EAI-7333 flaky entries correct. Two EAI-7052 entries XPASS'd (separate call, non-merge-blocking).
+- **Container gate green** (31 scenarios, 0 XPASS, 0 unexpected).
+- **Force-pushed** rebased branch; **`gh pr ready 138`** (out of draft). CI re-triggered (run 30070568396).
+- **PR state**: OPEN/MERGEABLE, BLOCKED on genuine REVIEW_REQUIRED (0 reviews). All 8 merge-required checks green. Awaiting human approval.
+- **Open**: EAI-7052 decision (flip-expect-pass / mark-flaky / defer) — advisory lane, non-blocking.
