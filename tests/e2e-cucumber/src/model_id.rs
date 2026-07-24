@@ -22,10 +22,24 @@ pub fn model_ids_match(response: &str, expected: &str) -> bool {
 }
 
 fn normalize_model_id(id: &str) -> (Option<String>, String) {
-    let without_variant = id.split_once(':').map_or(id, |(model, _)| model);
-    let (org, model) = without_variant
-        .rsplit_once('/')
-        .map_or((None, without_variant), |(org, model)| (Some(org), model));
+    // Lemonade may return the absolute cache path to the concrete GGUF rather
+    // than a model id. Normalize Windows separators and treat paths as basename-
+    // only: their parent directories are cache internals, not model organizations.
+    let normalized = id.replace('\\', "/");
+    let slash_count = normalized.matches('/').count();
+    let is_absolute_path = normalized.starts_with('/')
+        || normalized.as_bytes().get(1) == Some(&b':')
+        || slash_count > 1;
+    let (org, model) = if is_absolute_path {
+        (None, normalized.rsplit('/').next().unwrap_or(&normalized))
+    } else {
+        let without_variant = normalized
+            .split_once(':')
+            .map_or(normalized.as_str(), |(model, _)| model);
+        without_variant
+            .rsplit_once('/')
+            .map_or((None, without_variant), |(org, model)| (Some(org), model))
+    };
     let mut base = model.to_ascii_lowercase();
     if let Some(stripped) = base.strip_suffix(".gguf") {
         base = stripped.to_owned();
@@ -58,6 +72,14 @@ mod tests {
         assert!(model_ids_match(
             "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
             "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL"
+        ));
+    }
+
+    #[test]
+    fn matches_windows_cache_path_to_catalog_model() {
+        assert!(model_ids_match(
+            r"C:\WINDOWS\ServiceProfiles\NetworkService\.cache\huggingface\hub\models--unsloth--Qwen3-0.6B-GGUF\snapshots\50968a\Qwen3-0.6B-Q4_0.gguf",
+            "Qwen3-0.6B-GGUF"
         ));
     }
 
