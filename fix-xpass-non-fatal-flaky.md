@@ -6,9 +6,9 @@
 **PR:** #138 — https://github.com/ROCm/rocm-cli/pull/138 (**READY** for review; rebased 2026-07-24 → HEAD `5393392` signed w/ amd fallback key + Signed-off-by; container gate green)
 **Pre-PR-check:** passed — opencode (independent reviewer), 2026-07-22
 **Jira:** EAI-7456 (QA, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-24 (idle flush)
+**Last Updated:** 2026-07-24
 
-**Token Usage:** in=2020 out=472610 cache_create=13286602 cache_read=154905403 calls=960
+**Token Usage:** in=2024 out=473121 cache_create=13588081 cache_read=155206574 calls=962
 
 ---
 
@@ -235,7 +235,6 @@ Scenario: Non-flaky XPASS remains fatal
 
 **2026-07-24 (EAI-7052 evidence + PR collision discovery):**
 - Gathered EAI-7052 evidence per fres: mis-attribution confirmed (EAI-7052 = "Lemonade use installed ROCm", Done/Resolved 2026-07-16, unrelated to Vulkan hang). Two scenarios XPASS'd on my runs (07-24) but xfail'd on #142 merge-queue (07-23) → intermittent, not fixed.
-- **Critical discovery**: PR #142 ("ci: stabilize GPU E2E and merge queue", rominf) rewrites the same 3 files as #138 with parallel flaky-XPASS implementation. Whichever lands first, other conflicts hard + becomes redundant.
-- **Blockers (awaiting user)**: (1) #138/#142 resolution (close one, coordinate, or merge both); (2) EAI-7052 call (mark-flaky / defer) depends on (1). No further progress on #138 until (1) is decided.
-
-**2026-07-24 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+- **Critical discovery**: PR #142 ("ci: stabilize GPU E2E and merge queue", rominf, OPEN) rewrites the same 3 files as #138 with parallel flaky-XPASS implementation. Created 2026-07-23 09:10Z (one day after #138 2026-07-22 07:48Z). Whichever lands first, other conflicts hard + becomes redundant.
+- Verified: #138 is first (2026-07-22); #142 created second (2026-07-23) but cycling through merge queue, may be closer to landing.
+- **Blockers (awaiting user)**: (1) #138/#142 collision resolution (close #138 in favor of #142 / close #142 in favor of #138 / coordinate with rominf); (2) EAI-7052 call (mark-flaky / flip-expect-pass / defer) depends on (1). No further progress on #138 until (1) decided.
