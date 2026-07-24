@@ -33,8 +33,13 @@ pub enum Expectation {
     /// Must pass; a failure is a real regression.
     ExpectPass,
     /// Declared known bug that reproduces on this host; failing is the expected
-    /// outcome, passing is an XPASS (stale entry).
-    ExpectXfail { bug: String, reason: String },
+    /// outcome. A deterministic pass is a stale XPASS; a `flaky` expectation
+    /// tolerates either result while the intermittent bug remains open.
+    ExpectXfail {
+        bug: String,
+        reason: String,
+        flaky: bool,
+    },
     /// Not applicable on this host (e.g. required engine can't start); skipped.
     Skip { reason: String },
 }
@@ -173,6 +178,9 @@ pub struct XfailEntry {
     pub reason: String,
     #[serde(default)]
     pub serve_timeout_secs: Option<u64>,
+    /// Non-deterministic known bug: an XPASS is expected and non-fatal.
+    #[serde(default)]
+    pub flaky: bool,
 }
 
 /// The parsed `expectations.toml`: scenario-id → list of xfail conditions (OR).
@@ -236,14 +244,18 @@ pub struct ResolvedScenario {
     pub bug: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub flaky: bool,
 }
 
 impl ResolvedScenario {
     pub fn new(id: &str, effective_engine: &str, expectation: &Expectation) -> Self {
-        let (bug, reason) = match expectation {
-            Expectation::ExpectXfail { bug, reason } => (Some(bug.clone()), Some(reason.clone())),
-            Expectation::Skip { reason } => (None, Some(reason.clone())),
-            Expectation::ExpectPass => (None, None),
+        let (bug, reason, flaky) = match expectation {
+            Expectation::ExpectXfail { bug, reason, flaky } => {
+                (Some(bug.clone()), Some(reason.clone()), *flaky)
+            }
+            Expectation::Skip { reason } => (None, Some(reason.clone()), false),
+            Expectation::ExpectPass => (None, None, false),
         };
         Self {
             id: id.to_owned(),
@@ -251,6 +263,7 @@ impl ResolvedScenario {
             expected: expectation.label().to_owned(),
             bug,
             reason,
+            flaky,
         }
     }
 }
@@ -325,6 +338,7 @@ pub fn resolve(
                 return Expectation::ExpectXfail {
                     bug: entry.bug.clone(),
                     reason: entry.reason.clone(),
+                    flaky: entry.flaky,
                 };
             }
         }

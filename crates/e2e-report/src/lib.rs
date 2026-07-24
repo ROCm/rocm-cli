@@ -617,6 +617,9 @@ struct ManifestExpectation {
     bug: Option<String>,
     #[serde(default)]
     reason: Option<String>,
+    /// Non-deterministic known bug: an XPASS is expected and non-fatal.
+    #[serde(default)]
+    flaky: bool,
 }
 
 /// Read a platform's `platform.json` (sibling of `report.json`). Missing =
@@ -639,8 +642,10 @@ enum CellOutcome {
     Skip,
     /// Expected pass, but FAILED — a real regression.
     UnexpectedFail,
-    /// Expected xfail, but PASSED — stale entry (bug fixed here?).
+    /// Expected deterministic xfail, but PASSED — stale entry (bug fixed here?).
     Xpass,
+    /// Flaky xfail passed this run — expected for a non-deterministic known bug.
+    FlakyXpass,
     /// Expected skip, yet a result exists — harness/resolver disagreement.
     RanWhenNa,
     /// Expected to run (pass or xfail) but NO result was recorded — the scenario
@@ -655,12 +660,13 @@ impl CellOutcome {
     /// Reconcile one scenario's expectation against its actual result.
     /// `actual` is `Some(passed)` when the scenario ran, `None` when it did not
     /// appear in `report.json` (filtered out / skipped).
-    fn reconcile(expected: &str, actual: Option<bool>) -> Self {
+    fn reconcile(expected: &str, flaky: bool, actual: Option<bool>) -> Self {
         match (expected, actual) {
             ("pass", Some(true)) => Self::Pass,
             ("pass", Some(false)) => Self::UnexpectedFail,
             ("pass", None) => Self::Absent,
             ("xfail", Some(false)) => Self::Xfail,
+            ("xfail", Some(true)) if flaky => Self::FlakyXpass,
             ("xfail", Some(true)) => Self::Xpass,
             ("xfail", None) => Self::Absent,
             ("skip", None) => Self::Skip,
@@ -686,6 +692,7 @@ impl CellOutcome {
             Self::Skip => "n/a",
             Self::UnexpectedFail => "❌FAIL",
             Self::Xpass => "⚠️XPASS",
+            Self::FlakyXpass => "✅XPASS (flaky)",
             Self::RanWhenNa => "⚠️n/a-ran",
             Self::Absent => "⚠️no-result",
             Self::Missing => "·",
@@ -765,7 +772,8 @@ impl Grid {
                 if !ids.contains(&exp.id) {
                     ids.push(exp.id.clone());
                 }
-                let outcome = CellOutcome::reconcile(&exp.expected, actual.get(&exp.id).copied());
+                let outcome =
+                    CellOutcome::reconcile(&exp.expected, exp.flaky, actual.get(&exp.id).copied());
                 // A real result supersedes a defensive Missing on merge.
                 columns[col_idx]
                     .outcomes
@@ -853,10 +861,11 @@ fn reconciled_tally(json_path: &Path) -> Option<ReconciledTally> {
     let actual = id_pass_map(json_path);
     let mut t = ReconciledTally::default();
     for exp in &manifest.expectations {
-        match CellOutcome::reconcile(&exp.expected, actual.get(&exp.id).copied()) {
+        match CellOutcome::reconcile(&exp.expected, exp.flaky, actual.get(&exp.id).copied()) {
             CellOutcome::Pass => t.pass += 1,
             CellOutcome::Xfail => t.xfail += 1,
             CellOutcome::Skip => t.skip += 1,
+            CellOutcome::FlakyXpass => t.pass += 1,
             CellOutcome::UnexpectedFail
             | CellOutcome::Xpass
             | CellOutcome::RanWhenNa
@@ -2281,18 +2290,20 @@ mod tests {
     #[test]
     fn cell_outcome_reconciliation() {
         use CellOutcome as C;
-        assert_eq!(C::reconcile("pass", Some(true)), C::Pass);
-        assert_eq!(C::reconcile("pass", Some(false)), C::UnexpectedFail);
-        assert_eq!(C::reconcile("xfail", Some(false)), C::Xfail);
-        assert_eq!(C::reconcile("xfail", Some(true)), C::Xpass);
-        assert_eq!(C::reconcile("skip", None), C::Skip);
-        assert_eq!(C::reconcile("skip", Some(true)), C::RanWhenNa);
+        assert_eq!(C::reconcile("pass", false, Some(true)), C::Pass);
+        assert_eq!(C::reconcile("pass", false, Some(false)), C::UnexpectedFail);
+        assert_eq!(C::reconcile("xfail", false, Some(false)), C::Xfail);
+        assert_eq!(C::reconcile("xfail", false, Some(true)), C::Xpass);
+        assert_eq!(C::reconcile("xfail", true, Some(true)), C::FlakyXpass);
+        assert_eq!(C::reconcile("skip", false, None), C::Skip);
+        assert_eq!(C::reconcile("skip", false, Some(true)), C::RanWhenNa);
         // A declared expect-pass/xfail with NO result is Absent (a problem), so a
         // hung/lost-results run reds the platform instead of greenwashing to PASS.
-        assert_eq!(C::reconcile("pass", None), C::Absent);
-        assert_eq!(C::reconcile("xfail", None), C::Absent);
+        assert_eq!(C::reconcile("pass", false, None), C::Absent);
+        assert_eq!(C::reconcile("xfail", true, None), C::Absent);
         assert!(C::UnexpectedFail.is_problem());
         assert!(C::Xpass.is_problem());
+        assert!(!C::FlakyXpass.is_problem());
         assert!(C::RanWhenNa.is_problem());
         assert!(C::Absent.is_problem());
         assert!(!C::Pass.is_problem());
@@ -2360,6 +2371,29 @@ mod tests {
         assert!(
             md.contains("**XPASS** on `strix-halo`: `serve-default` (EAI-7333)"),
             "needs-attention should list the XPASS with bug:\n{md}"
+        );
+    }
+
+    #[test]
+    fn grid_tolerates_flaky_xpass() {
+        let report = feature_json(&[(&["id:serve-flaky"], &["passed"])]);
+        let platform = r#"{
+            "platform_slug": "mi300x",
+            "capability": {"effective_serve_engine": "vllm"},
+            "expectations": [
+                {"id":"serve-flaky","effective_engine":"vllm","expected":"xfail","bug":"EAI-7333","reason":"readiness race","flaky":true}
+            ]
+        }"#;
+        let (_d, path) = write_platform(&report, platform);
+        let inputs = vec![("mi300x".to_string(), path)];
+        let md = consolidated_summary_markdown(&inputs);
+        assert!(
+            md.contains("✅XPASS (flaky)"),
+            "grid should show tolerated flaky XPASS:\n{md}"
+        );
+        assert!(
+            !md.contains("**XPASS** on"),
+            "flaky XPASS must not need attention:\n{md}"
         );
     }
 

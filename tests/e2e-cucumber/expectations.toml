@@ -41,19 +41,9 @@ reason = "Engines do not report a consistent resolved model name for a short nam
 [["serve-vllm-inference"]]
 when = { effective_engine = "vllm" }
 bug = "EAI-7333"
-reason = "vLLM service reports ready (/v1/models 200) but POST /v1/chat/completions is refused."
+reason = "vLLM service reports ready (/v1/models 200) but POST /v1/chat/completions is refused intermittently."
 serve_timeout_secs = 90
-
-# Default-engine serve is RECIPE-driven, not host-driven: `rocm serve <model>`
-# with no --engine resolves to the recipe's preferred model+engine. On an Instinct
-# host (effective_engine=vllm) the request resolves to a GGUF recipe on lemonade,
-# whose llama.cpp Vulkan backend hangs on Instinct (EAI-7052) → the endpoint never
-# becomes ready. (Not EAI-7333: the default serve doesn't use vLLM at all here.)
-[["serve-default-engine-working-endpoint"]]
-when = { effective_engine = "vllm" }
-bug = "EAI-7052"
-reason = "Default serve resolves to a GGUF recipe on lemonade; its Vulkan backend hangs on Instinct, so the endpoint never reaches ready."
-serve_timeout_secs = 90
+flaky = true
 
 # On a lemonade-native LINUX host (Strix Halo Ubuntu) the lemonade managed serve
 # loads the model and reaches ready on :8001, then is shut down ~0.08s later, so
@@ -65,12 +55,6 @@ serve_timeout_secs = 90
 when = { effective_engine = "lemonade", os = "linux" }
 bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so the endpoint never becomes reachable."
-serve_timeout_secs = 90
-
-[["serve-default-engine-inference"]]
-when = { effective_engine = "vllm" }
-bug = "EAI-7052"
-reason = "Default serve resolves to a GGUF recipe on lemonade; its Vulkan backend hangs on Instinct, so inference never succeeds."
 serve_timeout_secs = 90
 
 # On a lemonade-native LINUX host the served model's endpoint drops before
@@ -94,6 +78,7 @@ when = { effective_engine = "vllm" }
 bug = "EAI-7333"
 reason = "CLI reports the vLLM service ready, but an immediate inference request races the model load and intermittently fails."
 serve_timeout_secs = 90
+flaky = true
 
 # On a lemonade LINUX host this scenario does a real lemonade serve, which reaches
 # ready then shuts down immediately (EAI-7423, see serve-lemonade-inference).

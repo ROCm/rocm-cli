@@ -822,18 +822,23 @@ async fn main() {
         let _ = std::fs::write(dir.join("platform.json"), json);
     }
 
-    // Classify: XPASS (expected xfail but passed) and unexpected-fail (expected
-    // pass but failed) are failures; expected outcomes are fine. Scenarios that
-    // ran but have no id, or ran without a recorded resolution, are treated as
-    // expect-pass (a bare failure then fails the run).
-    let mut xpass = Vec::new();
+    // Classify actual results against the matrix. A deterministic XPASS is
+    // fatal because its expectation is stale. A flaky expectation deliberately
+    // accepts either outcome while keeping the intermittent bug visible.
+    let mut stale_xpass = Vec::new();
+    let mut flaky_xpass = Vec::new();
     let mut unexpected_fail = Vec::new();
     let mut xfail_count = 0u32;
     for (id, passed) in &actual {
         match resolutions.get(id).map(|(exp, _)| exp) {
-            Some(Expectation::ExpectXfail { bug, .. }) => {
+            Some(Expectation::ExpectXfail { bug, flaky, .. }) => {
                 if *passed {
-                    xpass.push(format!("{id} ({bug})"));
+                    let label = format!("{id} ({bug})");
+                    if *flaky {
+                        flaky_xpass.push(label);
+                    } else {
+                        stale_xpass.push(label);
+                    }
                 } else {
                     xfail_count += 1;
                 }
@@ -848,12 +853,19 @@ async fn main() {
     }
 
     eprintln!(
-        "Reconciliation: {xfail_count} xfail (failed as expected), {} XPASS, {} unexpected failure(s).",
-        xpass.len(),
+        "Reconciliation: {xfail_count} xfail (failed as expected), {} XPASS ({} flaky, {} stale), {} unexpected failure(s).",
+        flaky_xpass.len() + stale_xpass.len(),
+        flaky_xpass.len(),
+        stale_xpass.len(),
         unexpected_fail.len(),
     );
-    if !xpass.is_empty() || !unexpected_fail.is_empty() {
-        for x in &xpass {
+    for x in &flaky_xpass {
+        eprintln!(
+            "XPASS (flaky, tolerated): '{x}' passed this run; the intermittent bug remains tracked."
+        );
+    }
+    if !stale_xpass.is_empty() || !unexpected_fail.is_empty() {
+        for x in &stale_xpass {
             eprintln!(
                 "XPASS: '{x}' is expected to fail on this host but PASSED \u{2014} the bug appears \
                  fixed here; update expectations.toml.",
