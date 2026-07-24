@@ -9,7 +9,7 @@
 **Jira:** EAI-7456 (QA, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
 **Last Updated:** 2026-07-24
 
-**Token Usage:** in=1824 out=405303 cache_create=10181989 cache_read=130698006 calls=862
+**Token Usage:** in=1830 out=406050 cache_create=10693852 cache_read=130953792 calls=865
 
 ---
 
@@ -210,4 +210,8 @@ Scenario: Non-flaky XPASS remains fatal
 - Asked fres: approval gate + need for rebase (held branch update until after approval to avoid re-running CI for unmergeable PR).
 - **Blockers (awaiting user):** (1) human approving review on PR #138; (2) branch update/rebase (after approval, before merge). No merge possible until approval lands.
 
-**2026-07-24 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+**2026-07-24 (final session):**
+- Re-polled PR #138 thrice: OPEN/MERGEABLE, mergeStateStatus BLOCKED then BEHIND, reviewDecision REVIEW_REQUIRED, 0 reviews, head 3dd423a, all 8 merge-required checks green.
+- Diagnosed CI queue deadlock: old run 29901541610 held shared concurrency group on Windows job queued to offline `strix-halo-windows` runner (GitHub cannot cancel); used `gh api -X POST .../force-cancel` to reap it (plain cancel fails on offline-runner jobs). Freed new run 29910874741 to create/complete all required checks.
+- Concurrency-group gap identified: shared per-ref group with `cancel-in-progress: true` cannot reap jobs stuck on offline self-hosted runners → blocks merge-required lanes. Recommended fix: split self-hosted E2E into separate workflow with unique per-run concurrency group. Captured for work-ledger CI redesign item (separate from #138).
+- **Blocker (final):** PR #138 awaiting human approving review (all required checks green, mergeable, but mergeState BLOCKED on REVIEW_REQUIRED). Branch now BEHIND main; will update-branch after approval, before merge. No further progress possible until approval.
