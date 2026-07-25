@@ -3,7 +3,7 @@
 **Stage:** 7-PR-open (awaiting review)
 **Pipeline:** standard
 **Branch:** fix-e2e-share-lemonade-engine → **PR #129** (https://github.com/ROCm/rocm-cli/pull/129). Rebased onto current main, squashed to ONE clean commit (40bbf19), 3 files. State: OPEN, MERGEABLE.
-**Last Updated:** 2026-07-24
+**Last Updated:** 2026-07-25
 **Pre-PR-check:** changes-requested — opencode/claude-opus reviewer, 2026-07-22
 
 ---
@@ -240,6 +240,8 @@ runtime; local `cargo build` + `cargo clippy --locked -p e2e-cucumber --test e2e
 both clean; ci.yml valid YAML.
 
 ## Work Log
+
+**2026-07-25 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
 **2026-07-24 (idle flush, 4th flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
