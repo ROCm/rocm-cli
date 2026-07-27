@@ -67,7 +67,7 @@ pub struct TuiSession {
     /// Set by the reader thread if `vt100::Parser::process` ever panics, before
     /// the thread exits. `wait_for_screen`/`wait_for_exit` check this every poll
     /// so a reader panic (which would otherwise just stop screen updates and
-    /// poison `parser`) is reported directly instead of surfacing as a 20s
+    /// poison `parser`) is reported directly instead of surfacing as a 30s
     /// timeout over an unexplained blank/stale screen.
     reader_panic: Arc<Mutex<Option<String>>>,
     /// Kept alive for the lifetime of the session: the reader/writer are cloned
@@ -219,7 +219,7 @@ impl TuiSession {
     /// Take the reader thread's recorded panic message, if any, clearing it so
     /// it's only reported once. Checked on every poll in `wait_for_screen`/
     /// `wait_for_exit` so a reader-thread fault surfaces immediately with a
-    /// direct diagnostic instead of a 20s timeout over a screen that stopped
+    /// direct diagnostic instead of a 30s timeout over a screen that stopped
     /// updating for an unexplained reason.
     fn take_reader_panic(&self) -> Option<String> {
         self.reader_panic
