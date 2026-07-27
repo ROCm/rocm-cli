@@ -21,17 +21,36 @@ pub fn model_ids_match(response: &str, expected: &str) -> bool {
     response_base.contains(&expected_base) || expected_base.contains(&response_base)
 }
 
+/// The organization a HuggingFace cache path encodes, if any.
+///
+/// The hub stores the repo id `<org>/<model>` as one `models--<org>--<model>`
+/// directory, so a cache path still names the organization even though its own
+/// path separators are cache internals. Recovering it keeps the wrong-org guard
+/// live for path-shaped ids. `None` when no such segment exists, or when the
+/// repo has no organization (`models--gpt2`).
+fn path_organization(path: &str) -> Option<&str> {
+    path.split('/')
+        .find_map(|segment| segment.strip_prefix("models--"))
+        .and_then(|repo| repo.split_once("--"))
+        .map(|(org, _model)| org)
+}
+
 fn normalize_model_id(id: &str) -> (Option<String>, String) {
     // Lemonade may return the absolute cache path to the concrete GGUF rather
-    // than a model id. Normalize Windows separators and treat paths as basename-
-    // only: their parent directories are cache internals, not model organizations.
+    // than a model id. Normalize Windows separators and take the basename as the
+    // model: the parent directories are cache internals. The organization is the
+    // exception — the `models--<org>--<model>` segment carries it, so recover it
+    // rather than dropping the wrong-org check for every path-shaped id.
     let normalized = id.replace('\\', "/");
     let slash_count = normalized.matches('/').count();
     let is_absolute_path = normalized.starts_with('/')
         || normalized.as_bytes().get(1) == Some(&b':')
         || slash_count > 1;
     let (org, model) = if is_absolute_path {
-        (None, normalized.rsplit('/').next().unwrap_or(&normalized))
+        (
+            path_organization(&normalized),
+            normalized.rsplit('/').next().unwrap_or(&normalized),
+        )
     } else {
         let without_variant = normalized
             .split_once(':')
@@ -96,6 +115,35 @@ mod tests {
         assert!(!model_ids_match(
             "another-owner/Qwen3.6-35B-A3B-Q4_K_M.gguf",
             "unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M"
+        ));
+    }
+
+    #[test]
+    fn rejects_wrong_organization_named_by_a_cache_path() {
+        // The hub encodes the repo id in the `models--<org>--<model>` segment, so
+        // a path-shaped response still names its organization and must be held to
+        // it — otherwise any path would bypass the check above.
+        assert!(!model_ids_match(
+            r"C:\WINDOWS\ServiceProfiles\NetworkService\.cache\huggingface\hub\models--another-owner--Qwen3-0.6B-GGUF\snapshots\50968a\Qwen3-0.6B-Q4_0.gguf",
+            "unsloth/Qwen3-0.6B-GGUF"
+        ));
+    }
+
+    #[test]
+    fn accepts_matching_organization_named_by_a_cache_path() {
+        assert!(model_ids_match(
+            "/home/runner/.cache/huggingface/hub/models--unsloth--Qwen3-0.6B-GGUF/snapshots/50968a/Qwen3-0.6B-Q4_0.gguf",
+            "unsloth/Qwen3-0.6B-GGUF"
+        ));
+    }
+
+    #[test]
+    fn cache_path_without_an_organization_keeps_matching() {
+        // `models--<model>` (no organization) leaves the org unknown rather than
+        // inventing one, so the basename comparison still decides.
+        assert!(model_ids_match(
+            "/root/.cache/huggingface/hub/models--Qwen3-0.6B-GGUF/snapshots/50968a/Qwen3-0.6B-Q4_0.gguf",
+            "unsloth/Qwen3-0.6B-GGUF"
         ));
     }
 }
