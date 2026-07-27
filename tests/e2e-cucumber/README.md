@@ -100,8 +100,18 @@ Known bugs are **not** tagged in the `.feature` files — they live in
 `expectations.toml`, keyed by `@id`, each with a `when = { ... }` condition (e.g.
 `effective_engine = "vllm"`), a `bug` reference, and a `reason`. A scenario that
 matches a condition is expected to fail (xfail); if it then passes, that is an
-**XPASS** (stale entry — remove it). See `src/expectation.rs` for the resolver
-and `expectations.toml`'s header for the condition grammar.
+**XPASS**. Deterministic XPASS is stale and must be removed; entries marked
+`flaky = true` tolerate either outcome while still reporting the intermittent
+bug. See `src/expectation.rs` for the resolver and `expectations.toml`'s header
+for the condition grammar.
+
+On a GPU host, a `serve` precondition that never publishes its model is
+relaunched once — but only for a scenario expected to pass; a known bug keeps its
+shortened `serve_timeout_secs` and fails on the first attempt. The stalled
+service is stopped (whole engine process tree) before the relaunch, so the second
+serve does not compete with the first for device memory, and the failure quotes
+the service log tail plus the device's free-VRAM state, which is where the
+engine's own reason for the stall is recorded.
 
 CI runs one job per platform, each executing the full suite:
 

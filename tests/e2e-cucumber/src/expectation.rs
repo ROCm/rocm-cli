@@ -33,8 +33,13 @@ pub enum Expectation {
     /// Must pass; a failure is a real regression.
     ExpectPass,
     /// Declared known bug that reproduces on this host; failing is the expected
-    /// outcome, passing is an XPASS (stale entry).
-    ExpectXfail { bug: String, reason: String },
+    /// outcome. A deterministic pass is a stale XPASS; a `flaky` expectation
+    /// tolerates either result while the intermittent bug remains open.
+    ExpectXfail {
+        bug: String,
+        reason: String,
+        flaky: bool,
+    },
     /// Not applicable on this host (e.g. required engine can't start); skipped.
     Skip { reason: String },
 }
@@ -173,6 +178,9 @@ pub struct XfailEntry {
     pub reason: String,
     #[serde(default)]
     pub serve_timeout_secs: Option<u64>,
+    /// Non-deterministic known bug: an XPASS is expected and non-fatal.
+    #[serde(default)]
+    pub flaky: bool,
 }
 
 /// The parsed `expectations.toml`: scenario-id → list of xfail conditions (OR).
@@ -209,6 +217,20 @@ impl Expectations {
             .filter_map(|e| e.serve_timeout_secs)
             .min()
     }
+
+    /// Whether any declared condition for this scenario matches this host — the
+    /// scenario is a known bug here and failing is its expected outcome.
+    ///
+    /// This is the same test [`resolve`] applies in its xfail step, exposed on
+    /// its own so a step can ask "is this run expected to fail?" without
+    /// re-deriving applicability. Steps use it to spend effort where it changes
+    /// a result: a serve backing an expect-pass scenario is worth relaunching
+    /// after a stall, one backing a known bug is not.
+    pub fn is_xfail(&self, id: &str, cap: &HostCapability, effective_engine: &str) -> bool {
+        self.entries_for(id)
+            .iter()
+            .any(|e| e.when.matches(cap, effective_engine))
+    }
 }
 
 /// Serializable outcome label for a resolved scenario (for `platform.json`).
@@ -236,14 +258,18 @@ pub struct ResolvedScenario {
     pub bug: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub flaky: bool,
 }
 
 impl ResolvedScenario {
     pub fn new(id: &str, effective_engine: &str, expectation: &Expectation) -> Self {
-        let (bug, reason) = match expectation {
-            Expectation::ExpectXfail { bug, reason } => (Some(bug.clone()), Some(reason.clone())),
-            Expectation::Skip { reason } => (None, Some(reason.clone())),
-            Expectation::ExpectPass => (None, None),
+        let (bug, reason, flaky) = match expectation {
+            Expectation::ExpectXfail { bug, reason, flaky } => {
+                (Some(bug.clone()), Some(reason.clone()), *flaky)
+            }
+            Expectation::Skip { reason } => (None, Some(reason.clone()), false),
+            Expectation::ExpectPass => (None, None, false),
         };
         Self {
             id: id.to_owned(),
@@ -251,6 +277,7 @@ impl ResolvedScenario {
             expected: expectation.label().to_owned(),
             bug,
             reason,
+            flaky,
         }
     }
 }
@@ -325,6 +352,7 @@ pub fn resolve(
                 return Expectation::ExpectXfail {
                     bug: entry.bug.clone(),
                     reason: entry.reason.clone(),
+                    flaky: entry.flaky,
                 };
             }
         }
@@ -677,6 +705,28 @@ serve_timeout_secs = 90
         );
         // Unknown id → no override.
         assert_eq!(m.serve_timeout_for("nope", &cap("mi300x"), "vllm"), None);
+    }
+
+    #[test]
+    fn is_xfail_follows_the_matching_condition() {
+        let m = Expectations::parse(
+            r#"
+[["serve-default-engine-inference"]]
+when = { effective_engine = "vllm" }
+bug = "EAI-7333"
+reason = "vLLM readiness gap"
+"#,
+        )
+        .unwrap();
+        assert!(m.is_xfail("serve-default-engine-inference", &cap("mi300x"), "vllm"));
+        // A condition that doesn't match this host leaves the scenario expect-pass.
+        assert!(!m.is_xfail(
+            "serve-default-engine-inference",
+            &cap("strix-windows"),
+            "lemonade"
+        ));
+        // No entry at all → expect-pass.
+        assert!(!m.is_xfail("nope", &cap("mi300x"), "vllm"));
     }
 
     #[test]

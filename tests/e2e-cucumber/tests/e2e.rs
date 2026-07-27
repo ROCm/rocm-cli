@@ -56,6 +56,11 @@ pub struct E2eWorld {
     /// fail fast instead of burning the full cold-start window. `None` → the
     /// step's default / `E2E_SERVE_TIMEOUT_SECS`.
     pub serve_timeout_override: Option<u64>,
+    /// Whether `expectations.toml` marks this scenario a known bug on this host,
+    /// set by the `before` hook. Steps use it to avoid spending real GPU time on
+    /// a run whose failure is already the expected outcome — see the relaunch
+    /// budget in `setup_gpu_model`.
+    pub expect_xfail: bool,
     /// The interactive dash/chat TUI spawned under a pseudo-terminal for this
     /// scenario, if any (see `e2e::tui_driver`). Torn down in `Drop` before the
     /// mock server and isolated directory so the child process never outlives
@@ -166,6 +171,7 @@ impl Default for E2eWorld {
             isolated_root: Some(root),
             legacy_rocm_path: None,
             serve_timeout_override: None,
+            expect_xfail: false,
             tui: None,
             chat_use_mock: false,
         }
@@ -357,7 +363,9 @@ impl Drop for E2eWorld {
         // processes, so on a persistent runner they accumulate and hold the GPU.
         // Stop every managed service recorded in this scenario's isolated root
         // before the directory is removed. Best-effort: this is teardown, so any
-        // failure is ignored rather than panicking (which would abort the run).
+        // failure is ignored rather than panicking (which would abort the run) —
+        // hence the returned status is discarded here. The serve retry, where a
+        // failed stop changes the next attempt's meaning, does read it.
         if let Some(root) = &self.isolated_root {
             stop_managed_services(root.path());
         }
@@ -369,23 +377,37 @@ impl Drop for E2eWorld {
 /// `data/services/*.json`, so detached engine processes don't leak past the
 /// scenario. Black-box: reads the service_id from each on-disk record and calls
 /// `rocm services stop <id> --yes` with the same isolated env the scenario used.
-fn stop_managed_services(root: &std::path::Path) {
+///
+/// Returns a one-line account of what it found and how each stop went. Teardown
+/// discards it — there, a failure to stop is unfortunate but has no reader. The
+/// serve retry quotes it, because there this is the load-bearing step: if no
+/// record existed yet, or the stop failed, the next attempt runs against a device
+/// the previous one still owns, and the run must say so rather than let it look
+/// like a genuinely broken serve.
+fn stop_managed_services(root: &std::path::Path) -> String {
     let services_dir = root.join("data").join("services");
-    let Ok(entries) = std::fs::read_dir(&services_dir) else {
-        return;
+    let entries = match std::fs::read_dir(&services_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return format!("no service records: {} ({error})", services_dir.display());
+        }
     };
+    let mut outcomes = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
         let Ok(bytes) = std::fs::read(&path) else {
+            outcomes.push(format!("{}: UNREADABLE record", path.display()));
             continue;
         };
         let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            outcomes.push(format!("{}: UNPARSABLE record", path.display()));
             continue;
         };
         let Some(service_id) = record.get("service_id").and_then(|v| v.as_str()) else {
+            outcomes.push(format!("{}: record has no service_id", path.display()));
             continue;
         };
         // The planted mock record has no real process to stop; skip it.
@@ -397,9 +419,34 @@ fn stop_managed_services(root: &std::path::Path) {
         cmd.env("ROCM_CLI_CONFIG_DIR", root.join("config"));
         cmd.env("ROCM_CLI_DATA_DIR", root.join("data"));
         cmd.env("ROCM_CLI_CACHE_DIR", root.join("cache"));
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-        let _ = cmd.status();
+        outcomes.push(match cmd.output() {
+            Ok(out) if out.status.success() => format!("{service_id}: stopped"),
+            Ok(out) => format!(
+                "{service_id}: STOP FAILED (rc={}) {}",
+                out.status.code().unwrap_or(-1),
+                last_line(&String::from_utf8_lossy(&out.stderr))
+            ),
+            Err(error) => format!("{service_id}: STOP NOT RUN ({error})"),
+        });
+    }
+    if outcomes.is_empty() {
+        return format!("no services recorded in {}", services_dir.display());
+    }
+    outcomes.join("; ")
+}
+
+/// The last non-blank line of `text`, clipped, for a one-line failure summary.
+fn last_line(text: &str) -> String {
+    let line = text
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if line.chars().count() > 200 {
+        format!("{}…", line.chars().take(200).collect::<String>())
+    } else {
+        line.to_owned()
     }
 }
 
@@ -734,6 +781,7 @@ async fn main() {
                 world.serve_timeout_override = decl
                     .serve_timeout_secs
                     .or_else(|| matrix.serve_timeout_for(id, cap, engine));
+                world.expect_xfail = matrix.is_xfail(id, cap, engine);
             }
             Box::pin(async {})
         })
@@ -822,18 +870,23 @@ async fn main() {
         let _ = std::fs::write(dir.join("platform.json"), json);
     }
 
-    // Classify: XPASS (expected xfail but passed) and unexpected-fail (expected
-    // pass but failed) are failures; expected outcomes are fine. Scenarios that
-    // ran but have no id, or ran without a recorded resolution, are treated as
-    // expect-pass (a bare failure then fails the run).
-    let mut xpass = Vec::new();
+    // Classify actual results against the matrix. A deterministic XPASS is
+    // fatal because its expectation is stale. A flaky expectation deliberately
+    // accepts either outcome while keeping the intermittent bug visible.
+    let mut stale_xpass = Vec::new();
+    let mut flaky_xpass = Vec::new();
     let mut unexpected_fail = Vec::new();
     let mut xfail_count = 0u32;
     for (id, passed) in &actual {
         match resolutions.get(id).map(|(exp, _)| exp) {
-            Some(Expectation::ExpectXfail { bug, .. }) => {
+            Some(Expectation::ExpectXfail { bug, flaky, .. }) => {
                 if *passed {
-                    xpass.push(format!("{id} ({bug})"));
+                    let label = format!("{id} ({bug})");
+                    if *flaky {
+                        flaky_xpass.push(label);
+                    } else {
+                        stale_xpass.push(label);
+                    }
                 } else {
                     xfail_count += 1;
                 }
@@ -848,12 +901,19 @@ async fn main() {
     }
 
     eprintln!(
-        "Reconciliation: {xfail_count} xfail (failed as expected), {} XPASS, {} unexpected failure(s).",
-        xpass.len(),
+        "Reconciliation: {xfail_count} xfail (failed as expected), {} XPASS ({} flaky, {} stale), {} unexpected failure(s).",
+        flaky_xpass.len() + stale_xpass.len(),
+        flaky_xpass.len(),
+        stale_xpass.len(),
         unexpected_fail.len(),
     );
-    if !xpass.is_empty() || !unexpected_fail.is_empty() {
-        for x in &xpass {
+    for x in &flaky_xpass {
+        eprintln!(
+            "XPASS (flaky, tolerated): '{x}' passed this run; the intermittent bug remains tracked."
+        );
+    }
+    if !stale_xpass.is_empty() || !unexpected_fail.is_empty() {
+        for x in &stale_xpass {
             eprintln!(
                 "XPASS: '{x}' is expected to fail on this host but PASSED \u{2014} the bug appears \
                  fixed here; update expectations.toml.",
