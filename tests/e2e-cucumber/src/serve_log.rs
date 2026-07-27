@@ -40,9 +40,19 @@ pub fn service_log_tail(serve_stdout: &str) -> String {
     let Some(path) = parse_log_path(serve_stdout) else {
         return "<no log_path in serve output>".to_owned();
     };
-    match std::fs::read_to_string(path) {
-        Ok(log) if log.trim().is_empty() => format!("<{path} is empty>"),
-        Ok(log) => tail_lines(&log, DEFAULT_TAIL_LINES),
+    // Read bytes, not a `String`: an engine log carries progress bars and ANSI
+    // and can hold a partially written multi-byte sequence, so a strict UTF-8
+    // read would discard the whole tail over one bad byte — in precisely the
+    // failure this exists to explain. Replace the bad bytes and quote the rest.
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let log = String::from_utf8_lossy(&bytes);
+            if log.trim().is_empty() {
+                format!("<{path} is empty>")
+            } else {
+                tail_lines(&log, DEFAULT_TAIL_LINES)
+            }
+        }
         Err(error) => format!("<failed to read {path}: {error}>"),
     }
 }
@@ -95,6 +105,27 @@ managed service launched
         assert_eq!(
             service_log_tail(&stdout),
             "boot\nENGINE ERROR: out of memory"
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_still_yields_the_tail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("service.log");
+        // A truncated multi-byte sequence, as a killed engine's part-written
+        // progress bar leaves behind. The readable lines must survive it.
+        let mut bytes = b"loading weights \xff\xfe\nENGINE ERROR: out of memory\n".to_vec();
+        bytes.extend_from_slice(b"\xe2\x82");
+        std::fs::write(&path, &bytes).expect("write log");
+        let stdout = format!("  log_path: {}\n", path.display());
+        let reported = service_log_tail(&stdout);
+        assert!(
+            reported.contains("ENGINE ERROR: out of memory"),
+            "tail lost to invalid UTF-8: {reported}"
+        );
+        assert!(
+            reported.starts_with("loading weights "),
+            "unexpected tail: {reported}"
         );
     }
 
