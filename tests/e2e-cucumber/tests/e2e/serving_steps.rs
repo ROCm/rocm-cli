@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: MIT
 
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use cucumber::{given, then, when};
@@ -350,10 +352,50 @@ fn default_engine_serve_target() -> &'static str {
 /// Stop every managed service this scenario launched, tree-killing the engine
 /// processes that hold the GPU. Used between serve attempts; the World's `Drop`
 /// runs the same teardown at scenario end.
-fn stop_scenario_services(world: &E2eWorld) {
-    if let Some(root) = &world.isolated_root {
-        crate::stop_managed_services(root.path());
-    }
+///
+/// Returns the stop's own account of itself (see [`crate::stop_managed_services`]),
+/// which the retry quotes: a stop that found no record or failed means the next
+/// attempt shares the device with this one, and that must be visible in the
+/// failure rather than inferred from a serve that looks broken.
+fn stop_scenario_services(world: &E2eWorld) -> String {
+    world.isolated_root.as_ref().map_or_else(
+        || "not attempted: scenario has no isolated root".to_owned(),
+        |root| crate::stop_managed_services(root.path()),
+    )
+}
+
+/// How many stalled serves one RUN may relaunch, in total.
+///
+/// A relaunch costs a full cold start: the readiness budget
+/// (`E2E_SERVE_TIMEOUT_SECS`, 300s on the GPU lanes) behind the port-free and
+/// VRAM-drain waits ahead of it — roughly eight minutes. Those lanes cap the
+/// whole job at 35 minutes, and a job killed by that cap writes no
+/// `platform.json`: the entire run is lost, including the service-log
+/// diagnostics this step collects. Budgeting relaunches per RUN is what bounds
+/// the added wall clock — a per-scenario cap still multiplies by however many
+/// scenarios stall, which is exactly the double-stall case that would blow the
+/// job. One rescue matches the observed failure (a single scenario stalling in a
+/// run); a run that stalls twice is not one relaunch away from healthy, and is
+/// worth more as a report than as an unfinished job.
+fn relaunch_budget() -> &'static AtomicUsize {
+    static BUDGET: LazyLock<AtomicUsize> = LazyLock::new(|| {
+        AtomicUsize::new(
+            std::env::var("E2E_SERVE_RELAUNCH_BUDGET")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1),
+        )
+    });
+    &BUDGET
+}
+
+/// Take one relaunch from the run's budget, reporting whether one was left.
+fn claim_relaunch() -> bool {
+    relaunch_budget()
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+            left.checked_sub(1)
+        })
+        .is_ok()
 }
 
 #[given("a model is being served on GPU")]
@@ -383,28 +425,33 @@ async fn setup_gpu_model(world: &mut E2eWorld) {
     // outcome and the deliberately shortened `serve_timeout_secs` says to fail
     // fast — a second cold start there buys no signal and spends minutes of
     // serial GPU time (plus another engine load) that the scenarios which do
-    // carry a result have to wait behind.
+    // carry a result have to wait behind. The relaunch is additionally drawn
+    // from a budget shared by the whole run (see `relaunch_budget`), so several
+    // stalling scenarios cannot together push the job past its timeout.
+    //
+    // A failing launch (rc != 0) goes down the same path as a stall rather than
+    // asserting out: the case worth retrying most is vLLM's own free-memory
+    // check rejecting a device the previous attempt has not finished releasing,
+    // and that one exits non-zero. It also gains the service-log tail below,
+    // which an assert would have skipped.
     let attempts = if world.expect_xfail { 1 } else { 2 };
+    let mut made = 0;
     for attempt in 1..=attempts {
+        made = attempt;
         let device_state = ensure_serve_port_free().await;
         let (stdout, stderr, rc) =
             crate::run_rocm(world, &["serve", model, "--engine", engine, "--managed"]);
-        assert!(
-            rc == 0,
-            "rocm serve failed:\nattempt {attempt} (rc={rc}), {device_state}\
-             \n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}"
-        );
-        if model_is_ready(models_url, Some(ready_substr), timeout_secs).await {
+        if rc == 0 && model_is_ready(models_url, Some(ready_substr), timeout_secs).await {
             world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
             world.model_name = Some(model.to_string());
             return;
         }
-        diagnostics.push(format!(
+        let mut report = format!(
             "attempt {attempt} (rc={rc}), {device_state}\
              \n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}\
              \n--- SERVICE LOG (tail) ---\n{}",
             service_log_tail(&stdout)
-        ));
+        );
         // Stop THIS attempt's stalled service before doing anything else. A vLLM
         // still in engine init has not bound the serve port yet, so the port kill
         // in `ensure_serve_port_free` cannot see it — it would survive into the
@@ -413,11 +460,28 @@ async fn setup_gpu_model(world: &mut E2eWorld) {
         // services stop` is what actually clears it: that path signals the whole
         // process tree (the EngineCore worker pins the allocation, not the parent)
         // and escalates past the grace period. Without this the retry is not a
-        // retry — it is a second serve competing with the first.
-        stop_scenario_services(world);
+        // retry — it is a second serve competing with the first, which is why its
+        // outcome is quoted: a stop that found no record (the launch had not yet
+        // written one) or failed means the next attempt did NOT get a clean
+        // device, and the failure says so instead of looking like a broken serve.
+        let stop_status = stop_scenario_services(world);
+        report.push_str(&format!("\n--- STOP ---\n{stop_status}"));
+        diagnostics.push(report);
+        if attempt == attempts {
+            break;
+        }
+        if !claim_relaunch() {
+            diagnostics.push(
+                "relaunch not attempted: this run's serve-relaunch budget is spent \
+                 (see E2E_SERVE_RELAUNCH_BUDGET). A second cold start here risks the \
+                 job timeout, which would kill the run before it writes any report."
+                    .to_owned(),
+            );
+            break;
+        }
     }
     panic!(
-        "endpoint {models_url} did not serve model {ready_substr} after {attempts} attempt(s) of {timeout_secs}s each:\n{}",
+        "endpoint {models_url} did not serve model {ready_substr} after {made} attempt(s) of {timeout_secs}s each:\n{}",
         diagnostics.join("\n\n")
     );
 }

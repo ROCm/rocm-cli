@@ -363,7 +363,9 @@ impl Drop for E2eWorld {
         // processes, so on a persistent runner they accumulate and hold the GPU.
         // Stop every managed service recorded in this scenario's isolated root
         // before the directory is removed. Best-effort: this is teardown, so any
-        // failure is ignored rather than panicking (which would abort the run).
+        // failure is ignored rather than panicking (which would abort the run) —
+        // hence the returned status is discarded here. The serve retry, where a
+        // failed stop changes the next attempt's meaning, does read it.
         if let Some(root) = &self.isolated_root {
             stop_managed_services(root.path());
         }
@@ -375,23 +377,37 @@ impl Drop for E2eWorld {
 /// `data/services/*.json`, so detached engine processes don't leak past the
 /// scenario. Black-box: reads the service_id from each on-disk record and calls
 /// `rocm services stop <id> --yes` with the same isolated env the scenario used.
-fn stop_managed_services(root: &std::path::Path) {
+///
+/// Returns a one-line account of what it found and how each stop went. Teardown
+/// discards it — there, a failure to stop is unfortunate but has no reader. The
+/// serve retry quotes it, because there this is the load-bearing step: if no
+/// record existed yet, or the stop failed, the next attempt runs against a device
+/// the previous one still owns, and the run must say so rather than let it look
+/// like a genuinely broken serve.
+fn stop_managed_services(root: &std::path::Path) -> String {
     let services_dir = root.join("data").join("services");
-    let Ok(entries) = std::fs::read_dir(&services_dir) else {
-        return;
+    let entries = match std::fs::read_dir(&services_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return format!("no service records: {} ({error})", services_dir.display());
+        }
     };
+    let mut outcomes = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
         let Ok(bytes) = std::fs::read(&path) else {
+            outcomes.push(format!("{}: UNREADABLE record", path.display()));
             continue;
         };
         let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            outcomes.push(format!("{}: UNPARSABLE record", path.display()));
             continue;
         };
         let Some(service_id) = record.get("service_id").and_then(|v| v.as_str()) else {
+            outcomes.push(format!("{}: record has no service_id", path.display()));
             continue;
         };
         // The planted mock record has no real process to stop; skip it.
@@ -403,9 +419,34 @@ fn stop_managed_services(root: &std::path::Path) {
         cmd.env("ROCM_CLI_CONFIG_DIR", root.join("config"));
         cmd.env("ROCM_CLI_DATA_DIR", root.join("data"));
         cmd.env("ROCM_CLI_CACHE_DIR", root.join("cache"));
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-        let _ = cmd.status();
+        outcomes.push(match cmd.output() {
+            Ok(out) if out.status.success() => format!("{service_id}: stopped"),
+            Ok(out) => format!(
+                "{service_id}: STOP FAILED (rc={}) {}",
+                out.status.code().unwrap_or(-1),
+                last_line(&String::from_utf8_lossy(&out.stderr))
+            ),
+            Err(error) => format!("{service_id}: STOP NOT RUN ({error})"),
+        });
+    }
+    if outcomes.is_empty() {
+        return format!("no services recorded in {}", services_dir.display());
+    }
+    outcomes.join("; ")
+}
+
+/// The last non-blank line of `text`, clipped, for a one-line failure summary.
+fn last_line(text: &str) -> String {
+    let line = text
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if line.chars().count() > 200 {
+        format!("{}…", line.chars().take(200).collect::<String>())
+    } else {
+        line.to_owned()
     }
 }
 
