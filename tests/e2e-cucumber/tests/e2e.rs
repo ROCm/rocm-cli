@@ -56,6 +56,11 @@ pub struct E2eWorld {
     /// fail fast instead of burning the full cold-start window. `None` → the
     /// step's default / `E2E_SERVE_TIMEOUT_SECS`.
     pub serve_timeout_override: Option<u64>,
+    /// Whether `expectations.toml` marks this scenario a known bug on this host,
+    /// set by the `before` hook. Steps use it to avoid spending real GPU time on
+    /// a run whose failure is already the expected outcome — see the relaunch
+    /// budget in `setup_gpu_model`.
+    pub expect_xfail: bool,
     /// The interactive dash/chat TUI spawned under a pseudo-terminal for this
     /// scenario, if any (see `e2e::tui_driver`). Torn down in `Drop` before the
     /// mock server and isolated directory so the child process never outlives
@@ -166,6 +171,7 @@ impl Default for E2eWorld {
             isolated_root: Some(root),
             legacy_rocm_path: None,
             serve_timeout_override: None,
+            expect_xfail: false,
             tui: None,
             chat_use_mock: false,
         }
@@ -734,6 +740,7 @@ async fn main() {
                 world.serve_timeout_override = decl
                     .serve_timeout_secs
                     .or_else(|| matrix.serve_timeout_for(id, cap, engine));
+                world.expect_xfail = matrix.is_xfail(id, cap, engine);
             }
             Box::pin(async {})
         })

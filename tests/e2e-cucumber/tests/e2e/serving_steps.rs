@@ -8,6 +8,7 @@ use cucumber::{given, then, when};
 
 use crate::E2eWorld;
 use e2e_cucumber::mock_server::MockServer;
+use e2e_cucumber::serve_log::service_log_tail;
 
 /// How long to wait for a freshly served model's endpoint to become ready.
 ///
@@ -93,7 +94,12 @@ const ASSISTANT_PORT: u16 = 8001;
 /// Best-effort: ensure the shared serve port is free before starting a new
 /// serve, so a leaked server from a prior scenario can't linger on the GPU.
 /// Polls until nothing answers on the port (bounded), killing any listener.
-async fn ensure_serve_port_free() {
+///
+/// Returns a one-line description of the device state the next serve starts on
+/// (see [`wait_for_free_vram`]). Callers that only need the reset can ignore it;
+/// a serve that then fails to become ready reports it, because "the previous
+/// engine had not released the GPU yet" is otherwise invisible in the log.
+async fn ensure_serve_port_free() -> String {
     // Always kill any listener on the shared port — NOT just one that already
     // answers /v1/models. A prior scenario's vLLM that is still LOADING holds the
     // port and GPU memory without yet serving /v1/models; if we only checked HTTP
@@ -126,7 +132,7 @@ async fn ensure_serve_port_free() {
     // request, so the next serve dies with "Free memory ... less than desired GPU
     // memory utilization" (engine core init failed). Wait for the device to
     // actually drain before returning.
-    wait_for_free_vram().await;
+    wait_for_free_vram().await
 }
 
 /// Upper bound on the free-VRAM floor (MiB). Sized so the largest single
@@ -147,24 +153,45 @@ fn required_free_vram_mib(total_mib: u64) -> u64 {
     MAX_FREE_VRAM_FLOOR_MIB.min(total_mib / 100 * 90)
 }
 
+/// How long to wait for a stopped engine to hand its device memory back.
+const VRAM_DRAIN_DEADLINE: Duration = Duration::from_mins(2);
+
 /// Best-effort: wait until the GPU reports enough free VRAM (see
 /// [`required_free_vram_mib`]), so a just-killed serve's memory is actually
 /// reclaimed before the next serve starts. Queries `amd-smi` then `rocm-smi`;
 /// if neither is present (mock/local, no ROCm), returns immediately so non-GPU
 /// runs are unaffected.
-async fn wait_for_free_vram() {
+///
+/// The wait is bounded and best-effort: on timeout the serve still starts,
+/// because a stale reading must not turn a slow drain into a hard failure. The
+/// returned line records which of the two happened — an undrained device is the
+/// single most likely reason the serve that follows never becomes ready, and
+/// without it the failure looks identical to a genuinely broken serve.
+async fn wait_for_free_vram() -> String {
     // No GPU tooling → nothing to wait on (mock/local). Probe once up front.
     let Some(total) = total_vram_mib() else {
-        return;
+        return "device state: no GPU tooling (mock/local run)".to_owned();
     };
     let floor = required_free_vram_mib(total);
-    let deadline = Instant::now() + Duration::from_mins(2);
+    let deadline = Instant::now() + VRAM_DRAIN_DEADLINE;
     loop {
-        match free_vram_mib() {
-            Some(free) if free >= floor => return,
-            _ if Instant::now() >= deadline => return,
-            _ => tokio::time::sleep(Duration::from_secs(3)).await,
+        let free = free_vram_mib();
+        if let Some(free) = free
+            && free >= floor
+        {
+            return format!(
+                "device state: drained ({free} MiB free of {total} MiB, floor {floor} MiB)"
+            );
         }
+        if Instant::now() >= deadline {
+            let free = free.map_or_else(|| "unreadable".to_owned(), |mib| format!("{mib} MiB"));
+            return format!(
+                "device state: NOT drained after {}s ({free} free of {total} MiB, floor \
+                 {floor} MiB) — a previous engine is still holding the GPU",
+                VRAM_DRAIN_DEADLINE.as_secs()
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
     }
 }
 
@@ -320,6 +347,15 @@ fn default_engine_serve_target() -> &'static str {
     }
 }
 
+/// Stop every managed service this scenario launched, tree-killing the engine
+/// processes that hold the GPU. Used between serve attempts; the World's `Drop`
+/// runs the same teardown at scenario end.
+fn stop_scenario_services(world: &E2eWorld) {
+    if let Some(root) = &world.isolated_root {
+        crate::stop_managed_services(root.path());
+    }
+}
+
 #[given("a model is being served on GPU")]
 async fn setup_gpu_model(world: &mut E2eWorld) {
     // Serve by the canonical HuggingFace ID (not the `qwen2.5` alias) with an
@@ -341,23 +377,47 @@ async fn setup_gpu_model(world: &mut E2eWorld) {
     // model within this scenario's readiness budget. Qwen3.5 has both timed out
     // and served successfully in the same MI300X run, so preserve that coverage
     // and allow one clean relaunch rather than replacing the model fixture.
-    for attempt in 1..=2 {
-        ensure_serve_port_free().await;
+    //
+    // Only a scenario that is expected to PASS gets that relaunch. Where the
+    // matrix already declares a known bug, the run's failure is the expected
+    // outcome and the deliberately shortened `serve_timeout_secs` says to fail
+    // fast — a second cold start there buys no signal and spends minutes of
+    // serial GPU time (plus another engine load) that the scenarios which do
+    // carry a result have to wait behind.
+    let attempts = if world.expect_xfail { 1 } else { 2 };
+    for attempt in 1..=attempts {
+        let device_state = ensure_serve_port_free().await;
         let (stdout, stderr, rc) =
             crate::run_rocm(world, &["serve", model, "--engine", engine, "--managed"]);
-        let diagnostic = format!(
-            "attempt {attempt} (rc={rc}):\n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}"
+        assert!(
+            rc == 0,
+            "rocm serve failed:\nattempt {attempt} (rc={rc}), {device_state}\
+             \n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}"
         );
-        assert!(rc == 0, "rocm serve failed:\n{diagnostic}");
-        diagnostics.push(diagnostic);
         if model_is_ready(models_url, Some(ready_substr), timeout_secs).await {
             world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
             world.model_name = Some(model.to_string());
             return;
         }
+        diagnostics.push(format!(
+            "attempt {attempt} (rc={rc}), {device_state}\
+             \n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}\
+             \n--- SERVICE LOG (tail) ---\n{}",
+            service_log_tail(&stdout)
+        ));
+        // Stop THIS attempt's stalled service before doing anything else. A vLLM
+        // still in engine init has not bound the serve port yet, so the port kill
+        // in `ensure_serve_port_free` cannot see it — it would survive into the
+        // next attempt, hold its ~0.8-of-device memory reservation, and guarantee
+        // the relaunch dies on vLLM's free-memory check. Going through `rocm
+        // services stop` is what actually clears it: that path signals the whole
+        // process tree (the EngineCore worker pins the allocation, not the parent)
+        // and escalates past the grace period. Without this the retry is not a
+        // retry — it is a second serve competing with the first.
+        stop_scenario_services(world);
     }
     panic!(
-        "endpoint {models_url} did not serve model {ready_substr} after 2 attempts of {timeout_secs}s each:\n{}",
+        "endpoint {models_url} did not serve model {ready_substr} after {attempts} attempt(s) of {timeout_secs}s each:\n{}",
         diagnostics.join("\n\n")
     );
 }

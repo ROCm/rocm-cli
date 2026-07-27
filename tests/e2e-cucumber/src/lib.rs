@@ -7,6 +7,7 @@ pub mod expectation;
 pub mod mock_server;
 pub mod model_id;
 pub mod panic_capture;
+pub mod serve_log;
 
 pub fn chat_response_is_successful(response: &serde_json::Value) -> bool {
     response

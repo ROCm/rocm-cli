@@ -217,6 +217,20 @@ impl Expectations {
             .filter_map(|e| e.serve_timeout_secs)
             .min()
     }
+
+    /// Whether any declared condition for this scenario matches this host — the
+    /// scenario is a known bug here and failing is its expected outcome.
+    ///
+    /// This is the same test [`resolve`] applies in its xfail step, exposed on
+    /// its own so a step can ask "is this run expected to fail?" without
+    /// re-deriving applicability. Steps use it to spend effort where it changes
+    /// a result: a serve backing an expect-pass scenario is worth relaunching
+    /// after a stall, one backing a known bug is not.
+    pub fn is_xfail(&self, id: &str, cap: &HostCapability, effective_engine: &str) -> bool {
+        self.entries_for(id)
+            .iter()
+            .any(|e| e.when.matches(cap, effective_engine))
+    }
 }
 
 /// Serializable outcome label for a resolved scenario (for `platform.json`).
@@ -691,6 +705,28 @@ serve_timeout_secs = 90
         );
         // Unknown id → no override.
         assert_eq!(m.serve_timeout_for("nope", &cap("mi300x"), "vllm"), None);
+    }
+
+    #[test]
+    fn is_xfail_follows_the_matching_condition() {
+        let m = Expectations::parse(
+            r#"
+[["serve-default-engine-inference"]]
+when = { effective_engine = "vllm" }
+bug = "EAI-7333"
+reason = "vLLM readiness gap"
+"#,
+        )
+        .unwrap();
+        assert!(m.is_xfail("serve-default-engine-inference", &cap("mi300x"), "vllm"));
+        // A condition that doesn't match this host leaves the scenario expect-pass.
+        assert!(!m.is_xfail(
+            "serve-default-engine-inference",
+            &cap("strix-windows"),
+            "lemonade"
+        ));
+        // No entry at all → expect-pass.
+        assert!(!m.is_xfail("nope", &cap("mi300x"), "vllm"));
     }
 
     #[test]
