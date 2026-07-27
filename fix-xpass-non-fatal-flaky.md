@@ -6,9 +6,9 @@
 **PR:** #138 — https://github.com/ROCm/rocm-cli/pull/138 (**READY** for review; rebased 2026-07-24 → HEAD `5393392` signed w/ amd fallback key + Signed-off-by; container gate green)
 **Pre-PR-check:** passed — opencode (independent reviewer), 2026-07-22
 **Jira:** EAI-7456 (QA, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-24 (idle flush)
+**Last Updated:** 2026-07-28
 
-**Token Usage:** in=2024 out=473121 cache_create=13588081 cache_read=155206574 calls=962
+**Token Usage:** in=2046 out=479118 cache_create=14500191 cache_read=157629599 calls=973
 
 ---
 
@@ -107,8 +107,8 @@ Scenario: Non-flaky XPASS remains fatal
 
 ## Blockers / Open Questions
 
-- **BLOCKED (awaiting user)**: PR #138/#142 collision. PR #142 ("ci: stabilize GPU E2E and merge queue", rominf, OPEN) rewrites the same 3 files with parallel flaky-XPASS implementation (adds `flaky: bool`, `CellOutcome::reconcile()`, `FlakyXpass` variant). Whichever lands first, the other conflicts hard + becomes redundant. Resolution needed: close #138 in favor of #142, close #142 in favor of #138, or coordinate with rominf.
-- **EAI-7052 mis-attribution + intermittent evidence**: EAI-7052 = "Lemonade should use installed ROCm version" (Done/Resolved 2026-07-16 by Eugene Volen) — unrelated to "Vulkan hangs on Instinct" symptom the xfail attributes. Two scenarios (serve-default-engine-working-endpoint, serve-default-engine-inference) XPASS'd on my runs (07-24) but xfail'd on #142 merge-queue runs (07-23) → intermittent, not cleanly fixed. Recommendation: mark-flaky OR defer, NOT flip-to-expect-pass. Decision depends on #138/#142 resolution above.
+- **RESOLVED: #138 superseded by #142 (merged 2026-07-27)**. PR #142 merged on main with identical flaky feature (same `flaky: bool` field, same two EAI-7333 entries marked flaky, same non-fatal exit gate). #138 is now fully redundant — all behavior + markers + test coverage on main. Recommendation: close #138 as superseded.
+- **EAI-7052 mis-attribution** (independent of #138/#142): EAI-7052 = "Lemonade should use installed ROCm" (Resolved 2026-07-16) — unrelated to xfail symptom. Two scenarios XPASS'd on #138 runs but xfail'd on #142 runs → intermittent. Separate cleanup issue, not urgent.
 
 ## Notes
 
@@ -240,3 +240,11 @@ Scenario: Non-flaky XPASS remains fatal
 - **Blockers (awaiting user)**: (1) #138/#142 collision resolution (close #138 in favor of #142 / close #142 in favor of #138 / coordinate with rominf); (2) EAI-7052 call (mark-flaky / flip-expect-pass / defer) depends on (1). No further progress on #138 until (1) decided.
 
 **2026-07-24 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+
+### 2026-07-28
+
+**Session: #142 merged, #138 collision resolved.**
+- Verified: PR #142 merged 2026-07-27 (commit `a1a8079`). #138 now CONFLICTING/DIRTY (was READY, now MERGING off-plan).
+- **Full redundancy confirmed**: main now has `flaky: bool` field (both XfailEntry + ExpectXfail), same two EAI-7333 entries marked flaky, same exit-gate logic (flaky XPASS non-fatal), unit tests in e2e-report.
+- #138 fully redundant — all behavior + markers now on main. Recommendation: **close #138 as superseded by #142**.
+- EAI-7052 mis-attribution remains (separate cleanup, independent of both PRs).
