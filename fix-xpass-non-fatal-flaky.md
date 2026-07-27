@@ -6,7 +6,7 @@
 **PR:** #138 — https://github.com/ROCm/rocm-cli/pull/138 (**READY** for review; rebased 2026-07-24 → HEAD `5393392` signed w/ amd fallback key + Signed-off-by; container gate green)
 **Pre-PR-check:** passed — opencode (independent reviewer), 2026-07-22
 **Jira:** EAI-7456 (QA, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-28
+**Last Updated:** 2026-07-28 (idle flush at 2026-07-28)
 
 **Token Usage:** in=2046 out=479118 cache_create=14500191 cache_read=157629599 calls=973
 
@@ -248,3 +248,5 @@ Scenario: Non-flaky XPASS remains fatal
 - **Full redundancy confirmed**: main now has `flaky: bool` field (both XfailEntry + ExpectXfail), same two EAI-7333 entries marked flaky, same exit-gate logic (flaky XPASS non-fatal), unit tests in e2e-report.
 - #138 fully redundant — all behavior + markers now on main. Recommendation: **close #138 as superseded by #142**.
 - EAI-7052 mis-attribution remains (separate cleanup, independent of both PRs).
+
+**2026-07-28 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
