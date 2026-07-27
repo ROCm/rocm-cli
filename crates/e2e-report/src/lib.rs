@@ -2300,6 +2300,9 @@ mod tests {
         // A declared expect-pass/xfail with NO result is Absent (a problem), so a
         // hung/lost-results run reds the platform instead of greenwashing to PASS.
         assert_eq!(C::reconcile("pass", false, None), C::Absent);
+        assert_eq!(C::reconcile("xfail", false, None), C::Absent);
+        // Flaky does not excuse a missing result either: it licenses an XPASS,
+        // not the absence of any outcome for a scenario the matrix declares.
         assert_eq!(C::reconcile("xfail", true, None), C::Absent);
         assert!(C::UnexpectedFail.is_problem());
         assert!(C::Xpass.is_problem());
