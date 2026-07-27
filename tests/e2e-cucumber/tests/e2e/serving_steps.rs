@@ -446,12 +446,9 @@ async fn setup_gpu_model(world: &mut E2eWorld) {
             world.model_name = Some(model.to_string());
             return;
         }
-        let mut report = format!(
-            "attempt {attempt} (rc={rc}), {device_state}\
-             \n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}\
-             \n--- SERVICE LOG (tail) ---\n{}",
-            service_log_tail(&stdout)
-        );
+        // Read the log before stopping the service, so the tail reflects what the
+        // engine wrote on its own rather than anything the stop provokes.
+        let log_tail = service_log_tail(&stdout);
         // Stop THIS attempt's stalled service before doing anything else. A vLLM
         // still in engine init has not bound the serve port yet, so the port kill
         // in `ensure_serve_port_free` cannot see it — it would survive into the
@@ -465,8 +462,12 @@ async fn setup_gpu_model(world: &mut E2eWorld) {
         // written one) or failed means the next attempt did NOT get a clean
         // device, and the failure says so instead of looking like a broken serve.
         let stop_status = stop_scenario_services(world);
-        report.push_str(&format!("\n--- STOP ---\n{stop_status}"));
-        diagnostics.push(report);
+        diagnostics.push(format!(
+            "attempt {attempt} (rc={rc}), {device_state}\
+             \n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}\
+             \n--- SERVICE LOG (tail) ---\n{log_tail}\
+             \n--- STOP ---\n{stop_status}"
+        ));
         if attempt == attempts {
             break;
         }
