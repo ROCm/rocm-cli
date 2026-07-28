@@ -243,6 +243,8 @@ both clean; ci.yml valid YAML.
 
 **2026-07-28 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
+**2026-07-28 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+
 **2026-07-25 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
 **2026-07-24 (idle flush, 4th flush):** Session idle for 10 minutes, auto-flushing WIP state.
