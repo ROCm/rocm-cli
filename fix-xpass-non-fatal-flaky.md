@@ -1,14 +1,14 @@
 # WIP: Make XPASS non-fatal for known-flaky xfails (flaky marker)
 
-**Stage:** 7-PR-open (PR #138)
+**Stage:** 9-done (PR #142 merged 2026-07-27 with identical feature; #138 closed as superseded)
 **Pipeline:** standard
-**Branch:** fix-xpass-non-fatal-flaky (worktree active)
-**PR:** #138 — https://github.com/ROCm/rocm-cli/pull/138 (**READY** for review; rebased 2026-07-24 → HEAD `5393392` signed w/ amd fallback key + Signed-off-by; container gate green)
+**Branch:** fix-xpass-non-fatal-flaky (worktree archived)
+**PR:** #138 — **CLOSED** (superseded by #142 merged 2026-07-27). Feature shipped via #142 on main.
 **Pre-PR-check:** passed — opencode (independent reviewer), 2026-07-22
-**Jira:** EAI-7456 (QA, assigned Fredrik) — https://amd.atlassian.net/browse/EAI-7456
-**Last Updated:** 2026-07-28 (idle flush at 2026-07-28)
+**Jira:** EAI-7456 (QA) — feature complete via #142; ticket remains (can be closed separately)
+**Last Updated:** 2026-07-28
 
-**Token Usage:** in=2046 out=479118 cache_create=14500191 cache_read=157629599 calls=973
+**Token Usage:** in=2062 out=481977 cache_create=15115072 cache_read=159467295 calls=981
 
 ---
 
@@ -87,6 +87,8 @@ Scenario: Non-flaky XPASS remains fatal
 - ✅ Container gate re-run (post-rebase): green (31 scenarios, 0 XPASS, 0 unexpected failures).
 - ✅ Force-pushed rebased branch `5393392` to origin.
 - ✅ `gh pr ready 138` — flipped out of draft to ready-for-review. CI re-triggered (run 30070568396).
+- ✅ Collision detected: PR #142 (rominf, broader "stabilize GPU E2E and merge queue") landed identical flaky-XPASS feature on same 3 files. #138 is now fully redundant. PR #142 merged 2026-07-27 (commit `a1a8079`).
+- ✅ Closed #138 as superseded by #142 (all behavior + markers + tests now on main via #142).
 
 ### Todo 📋
 - 📋 EAI-7052 decision (flip-expect-pass / mark-flaky / defer) — advisory GPU lane, non-merge-blocking.
@@ -249,4 +251,9 @@ Scenario: Non-flaky XPASS remains fatal
 - #138 fully redundant — all behavior + markers now on main. Recommendation: **close #138 as superseded by #142**.
 - EAI-7052 mis-attribution remains (separate cleanup, independent of both PRs).
 
-**2026-07-28 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+**2026-07-28 (collision resolution + PR close):**
+- PR #142 ("ci: stabilize GPU E2E and merge queue", rominf) merged 2026-07-27 (commit `a1a8079`).
+- Verified: main now has identical `flaky: bool` field (XfailEntry + ExpectXfail), same two EAI-7333 entries marked flaky, same non-fatal exit gate + unit tests.
+- #138 fully redundant — all feature behavior + markers + test coverage shipped on main via #142.
+- **Closed #138** with superseded note. EAI-7052 mis-attribution fixed on main (now EAI-7423, not EAI-7052).
+- Task complete — feature shipped (via #142, not #138).
