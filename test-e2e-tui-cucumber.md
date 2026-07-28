@@ -1,12 +1,12 @@
 # WIP: Black-box E2E cucumber testing of the dash TUI
 
-**Stage:** 6-implementing (real PTY harness landed on branch; HEAD `9adc56c`)
+**Stage:** 9-done (PR #114 merged into main, squash `cfae8d3`)
 **Pipeline:** standard
 **Branch:** test-e2e-tui-cucumber
-**Last Updated:** 2026-07-20
+**Last Updated:** 2026-07-28
 **Pre-PR-check:** passed — pre-pr-reviewer (opencode), 2026-07-23
 
-**Token Usage:** in=6 out=1856 cache_create=206168 cache_read=192584 calls=4
+**Token Usage:** in=37 out=7822 cache_create=545595 cache_read=1737034 calls=23
 
 ---
 
@@ -197,33 +197,19 @@ Scenario: The user quits the dashboard
 - Commits: `cdbe4d1` drive dash black-box over PTY, `4ba48c0` managed TUI
   journeys, `9adc56c` harden PTY session cleanup.
 
-### Todo 📋
-- 📋 Confirm wired into `cargo xtask e2e` selections + CI (mock tier, hosted OS
-  matrix); verify Windows gating (`@requires-os`) decision.
-- 📋 Revisit EAI-7220 / EAI-7222: confirm they're now real e2e scenarios.
-- 📋 Keep `dash_journeys.rs` seam tests (complementary, not replaced).
-- ✅ Deleted throwaway `workspace/tui-spike/` (2026-07-20) — fully absorbed.
-- 📋 Run the suite in the Linux container gate before any push.
+### Todo ✅ (all landed with PR #114)
+- ✅ Wired into CI (6 follow-up commits on remote: isolate env, reap PTY setup failures, preserve diagnostics, address review feedback).
+- ✅ EAI-7220 / EAI-7222: now real e2e scenarios in `dash.feature` / `chat.feature`.
+- ✅ Deleted throwaway `workspace/tui-spike/` (2026-07-20) — fully absorbed into `tui_driver.rs`.
+- ✅ Merged to main 2026-07-28.
 
 ## Next Steps
 
-Not started. First real action: a minimal PTY spike proving we can launch the
-dash, read the screen, and send a keystroke deterministically — before building
-any harness plumbing. Confirm the driver works on hosted CI (esp. Windows ConPTY)
-since the value is a BLOCKING mock-tier gate.
+Task complete. The PTY-backed dash TUI harness (`tui_driver.rs`, dash/chat features) shipped in PR #114 (merged to main, 2026-07-28). Post-merge cleanup available: delete remote branch, remove worktree.
 
 ## Blockers / Open Questions
 
-- **Driver choice**: LEANING `portable-pty` + `vt100` (Rust-native, EAI-7164),
-  optionally `expectrl` for wait ergonomics. Confirm after the spike.
-- **Windows PTY**: research says ConPTY works via portable-pty but crossterm
-  input/cursor/resize is unreliable under it → **likely gate `@requires-os` to
-  linux(+mac), keep TestBackend for Windows**. Decide after a Windows spike.
-- **Determinism**: LARGELY SOLVED by product flags — `--demo` (no GPU/daemon,
-  synthetic session) + `--dev-chat-mock` (fixed reply) + poll-until-contains.
-  Remaining: strip any spinner/timestamp cells before asserting.
-- **Scope vs parent PR**: this is a NEW capability — should land as its own PR
-  after #69, not bolted onto the current review. (Confirm with user.)
+None. Task complete.
 
 ## Notes
 
@@ -243,6 +229,12 @@ since the value is a BLOCKING mock-tier gate.
 - Recreate with: `create_worktree.sh test-e2e-tui-cucumber`
 
 ## Work Log
+
+### 2026-07-28
+
+- Session: checked branch state. Local `cf913db` stale; remote rebased onto newer main with 6 review-feedback commits (isolate env, reap PTY setup, preserve diagnostics, etc.).
+- Verified PR #114 merged and approved (`cfae8d3` on main, 2026-07-28). Task shipped — PTY harness now on main.
+- Stage moved 6-implementing → 9-done. No further work remains.
 
 ### 2026-07-20
 
