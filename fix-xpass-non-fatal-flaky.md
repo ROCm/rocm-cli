@@ -6,7 +6,7 @@
 **PR:** #138 — **CLOSED** (superseded by #142 merged 2026-07-27). Feature shipped via #142 on main.
 **Pre-PR-check:** passed — opencode (independent reviewer), 2026-07-22
 **Jira:** EAI-7456 (**Done**, 2026-07-28) — commented referencing PR #142 as delivery; #138 closed as redundant.
-**Last Updated:** 2026-07-28
+**Last Updated:** 2026-07-28 (idle flush)
 
 **Token Usage:** in=2062 out=481977 cache_create=15115072 cache_read=159467295 calls=981
 
@@ -257,3 +257,5 @@ Scenario: Non-flaky XPASS remains fatal
 - #138 fully redundant — all feature behavior + markers + test coverage shipped on main via #142.
 - **Closed #138** with superseded note. EAI-7052 mis-attribution fixed on main (now EAI-7423, not EAI-7052).
 - Task complete — feature shipped (via #142, not #138).
+
+**2026-07-28 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
