@@ -4,6 +4,12 @@
 **Pipeline:** standard
 **Branch:** fix-e2e-share-lemonade-engine → **PR #129** (https://github.com/ROCm/rocm-cli/pull/129). Rebased onto current main, squashed to ONE clean commit (40bbf19), 3 files. State: OPEN, MERGEABLE.
 **Last Updated:** 2026-07-28
+
+---
+
+## Work Log
+
+**2026-07-28 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 **Pre-PR-check:** changes-requested — opencode/claude-opus reviewer, 2026-07-22
 
 ---
