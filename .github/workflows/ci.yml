@@ -909,7 +909,9 @@ jobs:
     # 35min: see e2e-gpu — one collapsed job runs all serves + per-scenario
     # install sdk; the cap must exceed the run so the job writes platform.json.
     timeout-minutes: 35
-    runs-on: [self-hosted, linux, strix-halo]
+    # `native` disambiguates the two Linux Strix runners: the WSL host also
+    # carries `strix-halo`, but the paths below exist only on the native one.
+    runs-on: [self-hosted, linux, strix-halo, native]
     needs: [changes, build-and-test]
     # See `e2e`: dispatch tolerates skipped build-and-test; strix-ubuntu.
     if: >-
@@ -929,7 +931,8 @@ jobs:
     # ~/.cache/pip, ~/.config, and any other $HOME writer — pip's cache under the
     # real /home/ubuntu is what previously failed `install sdk` with ENOSPC),
     # plus the toolchain, temp, and pip cache. The rustup bootstrap still uses
-    # --no-modify-path so it doesn't touch $HOME/.profile.
+    # --no-modify-path so it doesn't touch $HOME/.profile. These paths are
+    # specific to that host, which is why `runs-on` pins `native` above.
     env:
       HOME: /home/ubuntu/actions-runner/e2e-home
       CARGO_HOME: /home/ubuntu/actions-runner/.cargo
@@ -1065,7 +1068,7 @@ jobs:
     # 35min: see e2e-gpu — one collapsed job runs all serves + per-scenario
     # install sdk; the cap must exceed the run so the job writes platform.json.
     timeout-minutes: 35
-    runs-on: [self-hosted, windows, strix-halo]
+    runs-on: [self-hosted, windows, strix-halo, native]
     needs: [changes, build-and-test]
     # See `e2e`: dispatch tolerates skipped build-and-test; strix-windows.
     if: >-
