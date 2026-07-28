@@ -417,7 +417,9 @@ jobs:
   e2e-gpu-nightly-strix:
     name: E2E tests (Strix Halo, incl. nightly-only)
     timeout-minutes: 90
-    runs-on: [self-hosted, linux, strix-halo]
+    # `native` disambiguates the two Linux Strix runners: the WSL host also
+    # carries `strix-halo`, but the paths below exist only on the native one.
+    runs-on: [self-hosted, linux, strix-halo, native]
     continue-on-error: true
     env:
       HOME: /home/ubuntu/actions-runner/e2e-home
@@ -517,7 +519,7 @@ jobs:
   e2e-gpu-nightly-strix-windows:
     name: E2E tests (Strix Halo, Windows, incl. nightly-only)
     timeout-minutes: 90
-    runs-on: [self-hosted, windows, strix-halo]
+    runs-on: [self-hosted, windows, strix-halo, native]
     continue-on-error: true
     env:
       E2E_INCLUDE_NIGHTLY: "1"
