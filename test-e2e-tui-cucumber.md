@@ -6,7 +6,7 @@
 **Last Updated:** 2026-07-28
 **Pre-PR-check:** passed — pre-pr-reviewer (opencode), 2026-07-23
 
-**Token Usage:** in=59 out=14910 cache_create=895006 cache_read=2655144 calls=34
+**Token Usage:** in=81 out=19560 cache_create=1256181 cache_read=3594075 calls=45
 
 ---
 
@@ -230,13 +230,12 @@ None. Task complete.
 
 ## Work Log
 
-### 2026-07-28
+### 2026-07-28 (continued)
 
-- Session: checked branch state. Local `cf913db` stale; remote rebased onto newer main with 6 review-feedback commits (isolate env, reap PTY setup, preserve diagnostics, etc.).
-- Verified PR #114 merged and approved (`cfae8d3` on main, 2026-07-28). Task shipped — PTY harness now on main.
-- Stage moved 6-implementing → 9-done. No further work remains.
-
-**2026-07-28 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+- Checked branch state: local `cf913db` stale; remote has 6 review-feedback commits (isolate env, reap PTY setup, preserve diagnostics, address review, exit privacy chat cleanly).
+- Confirmed PR #114 merged and approved (`cfae8d3` on main). Task complete.
+- Rebased local onto origin/main: three commits hit `add/add` conflicts (tui_driver.rs, dash_steps.rs, dash.feature already on main in review-hardened form). Nothing local-only to keep.
+- Reset `test-e2e-tui-cucumber` branch to `origin/main` (`d2662d5`). Worktree clean. Post-merge cleanup available when ready.
 
 ### 2026-07-20
 
