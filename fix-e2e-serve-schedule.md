@@ -4,6 +4,7 @@
 **Pipeline:** standard
 **Ticket:** none yet — file when work starts.
 **Branch:** not yet created (will re-branch off fresh main; child of [[fix-speed-up-e2e]])
+**Parent:** fix-speed-up-e2e
 **Pre-PR-check:** none
 **Last Updated:** 2026-07-28
 

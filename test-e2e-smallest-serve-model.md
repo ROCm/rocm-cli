@@ -4,6 +4,7 @@
 **Pipeline:** standard
 **Ticket:** none — shipped without a dedicated Jira ticket (part of the speed-up effort).
 **Branch:** test-e2e-smallest-serve-model (merged; child of the [[fix-speed-up-e2e]] container)
+**Parent:** fix-speed-up-e2e
 **Pre-PR-check:** passed
 **Last Updated:** 2026-07-20
 
