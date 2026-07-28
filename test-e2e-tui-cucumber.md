@@ -236,6 +236,8 @@ None. Task complete.
 - Verified PR #114 merged and approved (`cfae8d3` on main, 2026-07-28). Task shipped — PTY harness now on main.
 - Stage moved 6-implementing → 9-done. No further work remains.
 
+**2026-07-28 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+
 ### 2026-07-20
 
 - Pulled branch: fast-forward `74ee17d` → `9adc56c` (3 new commits). The real PTY

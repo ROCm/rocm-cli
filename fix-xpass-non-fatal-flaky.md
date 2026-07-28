@@ -5,7 +5,7 @@
 **Branch:** fix-xpass-non-fatal-flaky (worktree archived)
 **PR:** #138 — **CLOSED** (superseded by #142 merged 2026-07-27). Feature shipped via #142 on main.
 **Pre-PR-check:** passed — opencode (independent reviewer), 2026-07-22
-**Jira:** EAI-7456 (QA) — feature complete via #142; ticket remains (can be closed separately)
+**Jira:** EAI-7456 (**Done**, 2026-07-28) — commented referencing PR #142 as delivery; #138 closed as redundant.
 **Last Updated:** 2026-07-28
 
 **Token Usage:** in=2062 out=481977 cache_create=15115072 cache_read=159467295 calls=981
