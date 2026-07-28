@@ -4,7 +4,7 @@
 
 **Stage:** 6-implementing — STAGED TASK, NOT done (PR #126 + #128 + #136 merged; Tasks #8–#11 remain — re-branch in place off fresh main)
 **Pipeline:** standard
-**Ticket:** [EAI-7484](https://amd.atlassian.net/browse/EAI-7484) — "Speed up E2E suite - mock/real split for GPU serve scenarios" (assignee Fredrik Espinoza, component rocm-cli) — tracked Tasks #5–#7 (PR #136, MERGED)
+**Ticket:** none yet — the remaining tasks are unticketed.
 **Branch:** next chunk (Tasks #8–#11) re-branches off fresh main. Shipped: test-e2e-mock-real-split (#136), test-e2e-smallest-serve-model (#128), fix-speed-up-e2e (#126)
 **Last Updated:** 2026-07-22
 **Pre-PR-check:** passed — claude-opus-4.8 (reviewer agent), 2026-07-23

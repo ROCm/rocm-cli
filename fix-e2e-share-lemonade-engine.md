@@ -1,9 +1,32 @@
 # WIP: Fix flaky Strix-Halo Windows E2E — share the lemonade engine across scenarios
 
-**Stage:** 7-PR-open (awaiting review)
+**Stage:** 9-CLOSED (superseded by #142)
 **Pipeline:** standard
-**Branch:** fix-e2e-share-lemonade-engine → **PR #129** (https://github.com/ROCm/rocm-cli/pull/129). Rebased onto current main, squashed to ONE clean commit (40bbf19), 3 files. State: OPEN, MERGEABLE.
+**Branch:** fix-e2e-share-lemonade-engine → **PR #129 CLOSED 2026-07-28** (superseded). EAI-7455 stays open in backlog.
 **Last Updated:** 2026-07-28
+
+---
+
+## OUTCOME: PR #129 CLOSED — superseded by #142 (2026-07-28)
+
+Roman's PR #142 ("stabilize GPU E2E and merge queue", merged) took over this space:
+- It landed the **`flaky` expectation marker** (== our EAI-7456 idea) — so that part of #129 was redundant.
+- It handled EAI-7455 too, but with a DIFFERENT root cause: a **borrowed org runner** (the real
+  Windows runner was broken) hitting an SSL `CURL code 35` on Lemonade's GitHub release download.
+  Roman ADDED then intentionally REVERTED the 6 Windows lemonade xfails, to re-add only if a bad
+  runner recurs — so main has the `flaky` field but 0 EAI-7455 entries by design.
+- Empirical check: fresh full Strix-Windows run on current main (run 30342563245) = GREEN,
+  27 scenarios / 0 unexpected failures, all 6 lemonade scenarios PASSED with one clean backend
+  download. The flake is not firing now.
+
+Re-adding our xfails would contradict Roman's deliberate revert and xfail currently-passing
+scenarios. So #129 closed as superseded. Our investigation + the flaky-marker concept already
+delivered value via #142. **EAI-7455 remains open (Backlog)** to track the flake if it resurfaces
+on the real runner; our full diagnosis is in that ticket.
+
+Lesson: when a long-lived branch stalls on review, a parallel owner PR can supersede it — re-check
+main before reworking. (This branch churned through a stale-base clobber + rebuild before we
+discovered #142 had landed the same work.)
 
 ---
 
