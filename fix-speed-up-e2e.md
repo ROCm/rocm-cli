@@ -2,16 +2,34 @@
 
 # WIP: Speed up E2E test suite
 
-**Stage:** 6-implementing — STAGED TASK, NOT done (PR #126 + #128 + #136 merged; Tasks #8–#11 remain — re-branch in place off fresh main)
+**Stage:** 6-implementing — CONTAINER task (parents several child tasks; see below)
 **Pipeline:** standard
-**Ticket:** none yet — the remaining tasks are unticketed.
-**Branch:** next chunk (Tasks #8–#11) re-branches off fresh main. Shipped: test-e2e-mock-real-split (#136), test-e2e-smallest-serve-model (#128), fix-speed-up-e2e (#126)
-**Last Updated:** 2026-07-22
-**Pre-PR-check:** passed — claude-opus-4.8 (reviewer agent), 2026-07-23
+**Ticket:** none — this is the umbrella; each child task carries its own ticket.
+**Branch:** container worktree; children re-branch in place off fresh main.
+**Last Updated:** 2026-07-28
+**Pre-PR-check:** n/a (per-child)
 
 **Token Usage:** in=1006 out=301808 cache_create=5512288 cache_read=94907267 calls=509
 
 ---
+
+## Child tasks
+
+This is a CONTAINER: the E2E speed-up effort split into several tasks, each with its
+own branch, WIP, and ticket. This file holds the shared problem framing, the
+command-coverage/priority plan, and cross-cutting decisions; per-chunk detail lives
+in the child WIPs.
+
+| Child WIP | Ticket | PR | Status |
+|-----------|--------|----|--------|
+| VRAM-floor fix (Task #1) | — | #126 | ✅ merged (milestone; branch `fix-speed-up-e2e`, gone — recorded here, no separate WIP) |
+| [[test-e2e-smallest-serve-model]] (Tasks #2–#4) | — | #128 | ✅ merged |
+| [[test-e2e-mock-real-split]] (Tasks #5–#7) | EAI-7484 | #136 | ✅ merged |
+| [[test-e2e-diagnose]] (Task #3-diagnose) | — | #127 | ✅ merged |
+| [[fix-e2e-serve-schedule]] (Tasks #8–#10) | none yet | — | 📋 design |
+
+Task #11 (dry-run panic — `fix fix-2-unset-override --dry-run` panics rc=101) is a
+separate correctness bug, filed to the work-ledger inbox (not a speedup task).
 
 ## Problem
 
