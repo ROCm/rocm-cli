@@ -5,6 +5,7 @@
 pub mod capability;
 pub mod expectation;
 pub mod installer_fixture;
+pub mod loopback_http;
 pub mod mock_server;
 pub mod model_id;
 pub mod panic_capture;

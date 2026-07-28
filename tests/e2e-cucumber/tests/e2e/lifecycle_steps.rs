@@ -1220,7 +1220,7 @@ async fn then_xdg_gone(world: &mut E2eWorld) {
 // ── Loopback HTTP server (Windows HTTP install) ─────────────────────────
 
 pub mod http {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::{TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -1283,14 +1283,13 @@ pub mod http {
     }
 
     fn handle_conn(mut stream: TcpStream, root: &Path) -> std::io::Result<()> {
-        let mut buf = [0u8; 4096];
-        let n = stream.read(&mut buf)?;
-        let request = String::from_utf8_lossy(&buf[..n]);
-        let path = request
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .unwrap_or("/");
+        // Read until the full request head arrives, not just whatever a single
+        // read() call happened to return: a client (or the OS network stack)
+        // is free to deliver the request across more than one TCP segment, and
+        // a one-shot read previously misparsed a split request as `GET /`,
+        // 404-ing a legitimate download. See `e2e_cucumber::loopback_http`.
+        let head = e2e_cucumber::loopback_http::read_request_head(&mut stream)?;
+        let path = e2e_cucumber::loopback_http::parse_request_path(&head);
         let relative = path.trim_start_matches('/');
         let file = safe_join(root, relative);
         match file.and_then(|f| std::fs::read(&f).ok()) {
