@@ -392,6 +392,18 @@ fn looks_like_a_diagnosis_position(value: &str) -> bool {
     !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
 }
 
+/// Whether the CLI will apply `fix_id` itself, or `None` if it isn't a known
+/// fix. `RECIPES` is the authority: `apply()` dispatches on it, so this is the
+/// value any other surface describing a fix has to agree with.
+///
+/// Test-only: the one production consumer is `apply()`, which reads the recipe
+/// directly. This exists so `diagnose`'s tests can assert the two surfaces
+/// agree without exposing `RECIPES`.
+#[cfg(test)]
+pub(crate) fn auto_applicable_for(fix_id: &str) -> Option<bool> {
+    find_recipe(fix_id).map(|r| r.auto_applicable)
+}
+
 /// List every fix-id (id, kind, OS scope, title).
 #[must_use]
 pub fn list_recipes() -> String {
