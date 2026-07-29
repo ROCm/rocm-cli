@@ -168,6 +168,7 @@ When changing assistant-adjacent behavior, keep consistency with:
 
 - `docs/llm-tool-use.md`
 - `skills/rocm-cli-assistant/SKILL.md`
+- `skills/rocm-doctor/SKILL.md` and `skills/rocm-doctor/reference.md`
 
 Required consistency points:
 
@@ -175,6 +176,26 @@ Required consistency points:
 - mutating actions require approval flow
 - avoid invented shell/package-manager commands in assistant behavior paths
 - preserve built-in assistant constraints and no-CPU-fallback policy
+
+### `skills/rocm-doctor/` — a mirror, and a test fixture
+
+`skills/rocm-cli-assistant/SKILL.md` is compiled into the binary
+(`include_str!` in `apps/rocm/src/main.rs`). `skills/rocm-doctor/` is different
+on two counts, and both change how you edit it:
+
+- **It is a byte-verbatim mirror** of the skill published in
+  [`amd/skills`](https://github.com/amd/skills/tree/main/skills/rocm-doctor).
+  Change both copies together. The advisory `skill-mirror-drift` CI job diffs
+  them on every PR and reports in the step summary; it never blocks. Because the
+  files must stay byte-identical to upstream they carry no AMD licence header,
+  which is why `licenserc.toml` force-includes markdown per scope rather than
+  with one blanket `!**/*.md` — read the note at the top of that file before
+  changing it.
+- **`reference.md` is an e2e fixture.** `tests/e2e-cucumber/features/rocm_doctor_skill.feature`
+  parses its closed-catalog table and compares it to what `rocm fix` reports.
+  The catalog is authoritative in `crates/rocm-core/src/fix.rs` — adding,
+  renaming, or re-scoping a failure mode means changing the CLI **first**, then
+  the two docs. That feature is what catches you if you forget.
 
 ## 8) Verification Matrix For This Repo
 

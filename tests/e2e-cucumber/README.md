@@ -35,6 +35,7 @@ tests/e2e-cucumber/
 │   ├── chat.feature
 │   ├── examine.feature
 │   ├── model_serving.feature
+│   ├── rocm_doctor_skill.feature # skill↔CLI contract (see below)
 │   └── runtime_setup.feature
 │
 ├── tests/                        # test binary + step modules
@@ -43,7 +44,8 @@ tests/e2e-cucumber/
 │       ├── chat_steps.rs
 │       ├── examine_steps.rs
 │       ├── runtime_steps.rs
-│       └── serving_steps.rs
+│       ├── serving_steps.rs
+│       └── skill_steps.rs
 │
 └── src/                          # shared test infrastructure
     ├── lib.rs
@@ -213,3 +215,33 @@ The `.feature` file is both the spec and the test input — cucumber reads it at
 - **Isolated state.** Each scenario uses isolated config, data, and cache directories. Tests never touch `~/.rocm`.
 - **Behavioral language.** Feature files describe what users care about, not implementation details. How steps are implemented (mock vs real, which port, which API) stays in the step functions.
 - **OS-assigned ports.** The mock server binds to `127.0.0.1:0` to avoid port conflicts between tests.
+
+## The rocm-doctor skill contract
+
+`rocm_doctor_skill.feature` is the one feature that treats a file in this repo as
+an expected value. `skills/rocm-doctor/` is a byte-verbatim mirror of a skill
+published in [`amd/skills`](https://github.com/amd/skills); the skill owns no
+probe, no catalog and no fixes — all of that ships inside the binary — so what it
+does own is a **contract**: which fix-ids exist, which ones the CLI applies
+itself, which machines each is for, what a diagnosis carries, what the exit codes
+mean. Nothing else tests that seam. `diagnose.feature` deliberately asserts only
+the *shape* of a diagnosis so it stays host-independent, and the `rocm-core` unit
+tests cannot see a document that lives outside the crate.
+
+So `skill_steps.rs` parses the closed-catalog table out of
+`skills/rocm-doctor/reference.md` and diffs it against `rocm fix`. That is a
+deliberate, narrow exception to **Black-box only** above: nothing is imported
+from the rocm-cli codebase — a *documentation artifact* is read as test data, and
+that artifact is the thing under test.
+
+Two rules follow:
+
+- The catalog is authoritative in `crates/rocm-core/src/fix.rs`. When one of
+  these scenarios fails, the CLI is right and the docs are what change.
+- A skill-only edit must still run this job, so `skills/**` is in the `heavy`
+  paths filter that gates the `e2e` job.
+
+None of the scenarios assert that a symptom actually matched: on a host the
+catalog rules out of scope (WSL2) an empty `matched` list is the correct answer.
+They assert the coupling — out of scope implies no causes offered — so the
+feature is clean on WSL2, the no-GPU lane, and the GPU lanes alike.

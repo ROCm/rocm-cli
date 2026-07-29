@@ -2,13 +2,18 @@
 ## Run locally: hawkeye check
 ## Docs: https://github.com/korandoru/hawkeye
 ##
-## Note: `!**/*.md` is a force-include that overrides hawkeye's built-in
-## default exclusion of *.md. It also overrides the positive excludes below
-## for .md files — there is no way to subsequently re-exclude a subset of
-## .md paths once the negation is in effect. In practice this is harmless
-## because hawkeye's git integration skips untracked directories, but any
-## tracked *.md file (e.g. in third_party/) would be required to carry a
-## copyright header.
+## Note on *.md: hawkeye excludes markdown by default, so each scope we DO want
+## header-checked is force-included with a `!` negation below. A negation cannot
+## be narrowed afterwards — a positive exclude never wins against it, and a
+## pattern with no slash (`!*.md`) matches at every depth — so the scopes are
+## enumerated and anchored instead of using one blanket `!**/*.md`. Adding a new
+## top-level directory that holds tracked markdown means adding it to that list;
+## otherwise its headers go unchecked.
+##
+## `skills/rocm-doctor/` is deliberately absent: it is a byte-verbatim mirror of
+## the published skill in amd/skills (MIT there too), and its SKILL.md must open
+## with YAML frontmatter for the skill loader, which pushes any header out of
+## hawkeye's detection window. See AGENTS.md §7.
 
 inlineHeader = """
 Copyright © Advanced Micro Devices, Inc., or its affiliates.
@@ -26,7 +31,11 @@ includes = [
 ]
 
 excludes = [
-  "!**/*.md",
+  "!/*.md",
+  "!.github/**/*.md",
+  "!docs/**/*.md",
+  "!skills/rocm-cli-assistant/*.md",
+  "!tests/**/*.md",
   "target/**",
   ".claude/**",
   ".tmp-*/**",

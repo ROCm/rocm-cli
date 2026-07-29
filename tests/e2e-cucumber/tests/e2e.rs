@@ -27,6 +27,7 @@ mod e2e {
     pub mod lifecycle_steps;
     pub mod runtime_steps;
     pub mod serving_steps;
+    pub mod skill_steps;
     pub mod tui_driver;
 }
 
@@ -84,6 +85,10 @@ pub struct E2eWorld {
     /// dir, captured logs). `Some` only for `@lifecycle` scenarios; all its paths
     /// are rooted in `isolated_root` so teardown removes them with the temp dir.
     pub lifecycle: Option<e2e::lifecycle_steps::LifecycleState>,
+    /// Raw text of `skills/rocm-doctor/reference.md`, loaded by the rocm-doctor
+    /// skill scenarios. That document is the EXPECTED-value fixture for the
+    /// skill↔CLI contract checks — see `e2e::skill_steps`.
+    pub skill_reference: Option<String>,
 }
 
 /// Resolve a CI-provided shared-directory env var to a validated, existing path.
@@ -190,6 +195,7 @@ impl Default for E2eWorld {
             tui: None,
             chat_use_mock: false,
             lifecycle: None,
+            skill_reference: None,
         }
     }
 }
