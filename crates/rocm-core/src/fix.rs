@@ -505,13 +505,30 @@ pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
 // Consent / environment helpers
 // ---------------------------------------------------------------------------
 
-fn confirm(prompt: &str, assume_yes: bool) -> bool {
+/// The half of the consent decision that needs no I/O: `Some(verdict)` when the
+/// answer is already determined, `None` when the user must actually be asked.
+///
+/// Split out from [`confirm`] so the two rules that matter — `--yes` approves,
+/// and a non-interactive shell *refuses* rather than silently proceeding — are
+/// testable without a controlled stdin. A test that drove `confirm` directly
+/// would block on `read_line` whenever the suite happened to run with a terminal
+/// attached.
+const fn consent_without_prompt(assume_yes: bool, stdin_is_terminal: bool) -> Option<bool> {
     if assume_yes {
-        return true;
+        return Some(true);
     }
-    if !std::io::stdin().is_terminal() {
-        println!("Non-interactive shell and --yes not passed; refusing to apply.");
-        return false;
+    if !stdin_is_terminal {
+        return Some(false);
+    }
+    None
+}
+
+fn confirm(prompt: &str, assume_yes: bool) -> bool {
+    if let Some(verdict) = consent_without_prompt(assume_yes, std::io::stdin().is_terminal()) {
+        if !verdict {
+            println!("Non-interactive shell and --yes not passed; refusing to apply.");
+        }
+        return verdict;
     }
     print!("{prompt} [y/N]: ");
     let _ = std::io::stdout().flush();
@@ -871,8 +888,29 @@ fn run_hip_visible_devices_linux(opts: &FixOptions) -> i32 {
         println!("Could not determine your home directory.");
         return 3;
     };
+    pin_device_in_rc_file(&rc_file, idx, opts, || {
+        confirm(&format!("Append to {}?", rc_file.display()), opts.yes)
+    })
+}
+
+/// The part of fix-9 that actually touches the user's machine: decide whether
+/// the rc file already pins a device, honour `--dry-run`, ask for consent, and
+/// append.
+///
+/// Taking the rc path and the consent decision as parameters keeps this — the
+/// one auto-fix path on Linux that really mutates a file — testable end to end
+/// against a temp file, with no `$HOME` mutation and no dependency on whether
+/// stdin happens to be a terminal. Exit codes are the contract documented in
+/// `skills/rocm-doctor/reference.md`: 0 applied/dry-run/already-set, 4 write
+/// failed, 5 declined.
+fn pin_device_in_rc_file(
+    rc_file: &Path,
+    idx: i64,
+    opts: &FixOptions,
+    consent: impl FnOnce() -> bool,
+) -> i32 {
     let export_line = format!("export HIP_VISIBLE_DEVICES={idx}");
-    if let Ok(existing) = std::fs::read_to_string(&rc_file)
+    if let Ok(existing) = std::fs::read_to_string(rc_file)
         && existing.contains("HIP_VISIBLE_DEVICES=")
     {
         println!(
@@ -887,11 +925,11 @@ fn run_hip_visible_devices_linux(opts: &FixOptions) -> i32 {
         println!("(dry-run; not executed)");
         return 0;
     }
-    if !confirm(&format!("Append to {}?", rc_file.display()), opts.yes) {
+    if !consent() {
         return 5;
     }
     if let Err(exc) = append_line(
-        &rc_file,
+        rc_file,
         "# Added by rocm examine (fix-9-igpu-dgpu)",
         &export_line,
     ) {
@@ -1196,5 +1234,181 @@ mod tests {
         // behaviour that a script could start depending on.
         assert_eq!(apply("#1", &FixOptions::default()), 2);
         assert_eq!(apply("bogus", &FixOptions::default()), 2);
+    }
+
+    // ── Consent and mutation contract ──────────────────────────────
+    //
+    // `skills/rocm-doctor/reference.md` documents six exit codes, and the skill
+    // tells an agent it may run an auto-fix because the CLI "refuses on a
+    // non-interactive shell without --yes" and "confirms before mutating".
+    // Before these tests, codes 1, 4 and 5 were asserted nowhere in the repo and
+    // no test ever reached a runner that writes to disk: the two that look like
+    // they cover it don't — `dry_run_never_mutates_...` picks fix-2, whose Linux
+    // runner takes no FixOptions and never prompts, and diagnose.feature's
+    // preview scenario picks print-only fix-1, which returns before any runner.
+    //
+    // fix-9 is the auto-fix used here because its Linux runner is the one that
+    // genuinely appends to a file, and `pin_device_in_rc_file` lets that run
+    // against a temp path with an injected consent verdict.
+
+    /// A unique scratch path under the workspace's test-artifact dir, following
+    /// the convention in `lib.rs`'s tests (no `tempfile` dev-dependency here).
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("core")
+            .join(format!(
+                "fix-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+        std::fs::create_dir_all(&dir).expect("failed to create scratch dir");
+        dir
+    }
+
+    fn pinning_opts() -> FixOptions {
+        FixOptions {
+            device_index: Some(1),
+            ..FixOptions::default()
+        }
+    }
+
+    #[test]
+    fn yes_flag_approves_without_prompting() {
+        assert_eq!(consent_without_prompt(true, false), Some(true));
+        assert_eq!(consent_without_prompt(true, true), Some(true));
+    }
+
+    #[test]
+    fn non_interactive_shell_refuses_instead_of_proceeding() {
+        // The rule the skill relies on: without --yes and with nothing to prompt,
+        // the answer is a definite NO, never an implicit yes.
+        assert_eq!(consent_without_prompt(false, false), Some(false));
+    }
+
+    #[test]
+    fn interactive_shell_without_yes_must_actually_ask() {
+        assert_eq!(consent_without_prompt(false, true), None);
+    }
+
+    #[test]
+    fn declining_consent_returns_5_and_writes_nothing() {
+        let rc = scratch_dir("declined").join(".bashrc");
+        std::fs::write(&rc, "# existing\n").expect("seed rc file");
+
+        let code = pin_device_in_rc_file(&rc, 1, &pinning_opts(), || false);
+
+        assert_eq!(code, 5, "a declined fix must exit 5");
+        assert_eq!(
+            std::fs::read_to_string(&rc).expect("read rc"),
+            "# existing\n",
+            "a declined fix must not touch the file"
+        );
+        std::fs::remove_dir_all(rc.parent().expect("parent")).ok();
+    }
+
+    #[test]
+    fn dry_run_returns_0_and_writes_nothing_even_with_consent() {
+        let rc = scratch_dir("dryrun").join(".bashrc");
+        std::fs::write(&rc, "# existing\n").expect("seed rc file");
+        let opts = FixOptions {
+            dry_run: true,
+            ..pinning_opts()
+        };
+
+        // Consent would be granted; --dry-run must short-circuit before it.
+        let code = pin_device_in_rc_file(&rc, 1, &opts, || {
+            panic!("dry-run must not reach the consent gate")
+        });
+
+        assert_eq!(code, 0);
+        assert_eq!(
+            std::fs::read_to_string(&rc).expect("read rc"),
+            "# existing\n",
+            "a dry-run must not touch the file"
+        );
+        std::fs::remove_dir_all(rc.parent().expect("parent")).ok();
+    }
+
+    #[test]
+    fn granting_consent_appends_the_export_and_returns_0() {
+        let rc = scratch_dir("granted").join(".bashrc");
+        std::fs::write(&rc, "# existing\n").expect("seed rc file");
+
+        let code = pin_device_in_rc_file(&rc, 3, &pinning_opts(), || true);
+
+        assert_eq!(code, 0);
+        let body = std::fs::read_to_string(&rc).expect("read rc");
+        assert!(
+            body.starts_with("# existing\n"),
+            "existing rc content must be preserved:\n{body}"
+        );
+        assert!(
+            body.contains("export HIP_VISIBLE_DEVICES=3"),
+            "expected the export line to be appended:\n{body}"
+        );
+        std::fs::remove_dir_all(rc.parent().expect("parent")).ok();
+    }
+
+    #[test]
+    fn an_rc_file_that_already_pins_a_device_is_left_alone() {
+        let rc = scratch_dir("already-pinned").join(".bashrc");
+        let original = "export HIP_VISIBLE_DEVICES=0\n";
+        std::fs::write(&rc, original).expect("seed rc file");
+
+        let code = pin_device_in_rc_file(&rc, 1, &pinning_opts(), || {
+            panic!("an already-pinned rc file must not reach the consent gate")
+        });
+
+        assert_eq!(code, 0, "already-pinned is success, not failure");
+        assert_eq!(
+            std::fs::read_to_string(&rc).expect("read rc"),
+            original,
+            "must not append a second, conflicting pin"
+        );
+        std::fs::remove_dir_all(rc.parent().expect("parent")).ok();
+    }
+
+    #[test]
+    fn a_failed_write_returns_4_rather_than_reporting_success() {
+        // A directory where the rc file should be: the append fails at open().
+        // This is the only way the documented "attempted but the command
+        // failed" code is reachable for this fix.
+        let dir = scratch_dir("write-fails");
+        let rc = dir.join(".bashrc");
+        std::fs::create_dir_all(&rc).expect("create dir in place of rc file");
+
+        let code = pin_device_in_rc_file(&rc, 1, &pinning_opts(), || true);
+
+        assert_eq!(code, 4, "a failed write must exit 4, not 0");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pinning_without_a_device_index_is_not_applicable() {
+        if !runtime_is_linux() {
+            return;
+        }
+        // Reached through the real runner: the missing --device-index guard sits
+        // ahead of any home-directory lookup, so this needs no scratch state.
+        let code = run_hip_visible_devices_linux(&FixOptions::default());
+        assert_eq!(code, 3, "a missing --device-index is 'not applicable' (3)");
+    }
+
+    #[test]
+    fn exit_code_1_is_unreachable_by_construction() {
+        // apply() returns 1 only for an auto_applicable recipe with no runner.
+        // `auto_applicable_recipes_have_a_runner` keeps that impossible; assert
+        // the reachability argument here so reference.md's row 1 is accounted
+        // for rather than silently untested.
+        assert!(
+            RECIPES
+                .iter()
+                .all(|r| !r.auto_applicable || r.runner.is_some()),
+            "an auto-applicable recipe without a runner would make exit 1 reachable"
+        );
     }
 }
