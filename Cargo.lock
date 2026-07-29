@@ -3715,13 +3715,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "flate2",
  "rocm-core",
  "rocm-engine-protocol",
  "serde",
  "serde_json",
  "sha2",
+ "tar",
  "tempfile",
  "ureq",
+ "zip",
 ]
 
 [[package]]

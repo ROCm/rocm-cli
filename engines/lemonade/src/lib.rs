@@ -56,7 +56,17 @@ const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
 /// Maximum bytes to read from the end of a log file when extracting tail lines.
 /// Prevents reading entire gigabyte-sized logs on startup timeout.
 const MAX_TAIL_READ: u64 = 4 * 1024 * 1024; // 4MB
-static EMBEDDABLE_ARCHIVE_CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Archive paths currently being validated, published, or extracted by this
+/// process, with a condvar to wake waiters. Keyed per archive so an install of
+/// one archive does not serialize behind an unrelated one — the download window
+/// is minutes long, and the cross-process guarantee comes from the per-archive
+/// file lock, not from this set.
+static ARCHIVE_CACHE_BUSY: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+static ARCHIVE_CACHE_BUSY_SIGNAL: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Deepest archive tree the embeddable layout is searched and copied through.
+const MAX_ARCHIVE_TREE_DEPTH: usize = 4;
 
 const EMBEDDABLE_WINDOWS_ARCHIVE_NAME: &str = "lemonade-embeddable-10.10.0-windows-x64.zip";
 const EMBEDDABLE_LINUX_ARCHIVE_NAME: &str = "lemonade-embeddable-10.10.0-ubuntu-x64.tar.gz";
@@ -982,7 +992,9 @@ fn prepare_embeddable(
     let downloads = root.join("downloads");
     let archive = downloads.join(archive_name);
     fs::create_dir_all(&downloads)?;
-    ensure_cached_archive(
+    // Held until the archive bytes have been extracted and copied out: the
+    // verified bytes and the extracted bytes must be the same read.
+    let archive_guard = ensure_cached_archive(
         archive_url,
         &archive,
         embeddable_archive_sha256(),
@@ -1003,6 +1015,7 @@ fn prepare_embeddable(
         copy_tree(&embeddable_root, &runtime_dir)?;
         fs::remove_dir_all(&extract_root).ok();
     }
+    drop(archive_guard);
     let lemond = lemond_path_in(&runtime_dir);
     let lemonade = lemonade_path_in(&runtime_dir);
     if !lemond.is_file() || !lemonade.is_file() {
@@ -1301,13 +1314,14 @@ fn ensure_cached_archive<F>(
     archive: &Path,
     expected_sha256: &str,
     download: F,
-) -> Result<()>
+) -> Result<ArchiveCacheGuard>
 where
     F: FnMut(&str, &Path) -> Result<()>,
 {
     ensure_cached_archive_after_invalid(url, archive, expected_sha256, download, || {})
 }
 
+#[derive(Debug)]
 struct ArchiveCacheLock {
     file: fs::File,
 }
@@ -1316,6 +1330,49 @@ impl Drop for ArchiveCacheLock {
     fn drop(&mut self) {
         let _ = self.file.unlock();
     }
+}
+
+/// In-process exclusion for one archive path.
+#[derive(Debug)]
+struct ArchiveCacheProcessLock {
+    key: PathBuf,
+}
+
+impl Drop for ArchiveCacheProcessLock {
+    fn drop(&mut self) {
+        let mut busy = ARCHIVE_CACHE_BUSY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        busy.remove(&self.key);
+        drop(busy);
+        ARCHIVE_CACHE_BUSY_SIGNAL.notify_all();
+    }
+}
+
+fn lock_archive_cache_in_process(archive: &Path) -> ArchiveCacheProcessLock {
+    let key = archive.to_path_buf();
+    let mut busy = ARCHIVE_CACHE_BUSY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while busy.contains(&key) {
+        busy = ARCHIVE_CACHE_BUSY_SIGNAL
+            .wait(busy)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    busy.insert(key.clone());
+    ArchiveCacheProcessLock { key }
+}
+
+/// Exclusive access to one cached archive, held by the caller for as long as
+/// the verified bytes are relied upon.
+///
+/// Verification and use have to happen under the same lock: releasing it at the
+/// end of verification would leave a window in which a co-resident writer could
+/// swap the archive before it is read again for extraction.
+#[derive(Debug)]
+struct ArchiveCacheGuard {
+    _process: ArchiveCacheProcessLock,
+    _file: ArchiveCacheLock,
 }
 
 fn archive_lock_path(archive: &Path) -> Result<PathBuf> {
@@ -1393,7 +1450,7 @@ fn ensure_cached_archive_after_invalid<F, I>(
     expected_sha256: &str,
     mut download: F,
     after_invalid: I,
-) -> Result<()>
+) -> Result<ArchiveCacheGuard>
 where
     F: FnMut(&str, &Path) -> Result<()>,
     I: FnOnce(),
@@ -1407,16 +1464,18 @@ where
             parent.display()
         )
     })?;
-    let _process_guard = EMBEDDABLE_ARCHIVE_CACHE_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _archive_guard = lock_archive_cache(archive)?;
+    let process_guard = lock_archive_cache_in_process(archive);
+    let archive_guard = lock_archive_cache(archive)?;
+    let guard = ArchiveCacheGuard {
+        _process: process_guard,
+        _file: archive_guard,
+    };
 
     match fs::symlink_metadata(archive) {
         Ok(metadata) if metadata.file_type().is_file() => {
             if verify_sha256(archive, expected_sha256).is_ok() {
                 eprintln!("Using verified cached {}.", archive.display());
-                return Ok(());
+                return Ok(guard);
             }
             after_invalid();
             match fs::remove_file(archive) {
@@ -1442,7 +1501,10 @@ where
         .tempfile_in(parent)
         .with_context(|| {
             format!(
-                "failed to create private download beside {}",
+                // Owner-only permissions are a Unix guarantee: `tempfile`
+                // creates with mode 0600 there, while on Windows the file
+                // inherits the parent directory's DACL.
+                "failed to create temporary download beside {}",
                 archive.display()
             )
         })?;
@@ -1450,32 +1512,197 @@ where
     eprintln!("Downloading {}...", archive.display());
     download(url, &temporary_path)?;
     verify_sha256(&temporary_path, expected_sha256)?;
-    publish_verified_archive(temporary, archive, expected_sha256)
+    publish_verified_archive(temporary, archive, expected_sha256)?;
+    Ok(guard)
 }
 
-fn extract_archive(archive: &Path, destination: &Path) -> Result<()> {
-    let stderr_path = destination.join("extract-stderr.txt");
-    let stderr_file = fs::File::create(&stderr_path)
-        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
-    let mut command = ProcessCommand::new("tar");
-    command.arg(if runtime_is_windows() { "-xf" } else { "-xzf" });
-    command.arg(archive).arg("-C").arg(destination);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_file));
-    let status = command.status().context("failed to run tar")?;
-    if status.success() {
-        let _ = fs::remove_file(stderr_path);
-        Ok(())
-    } else {
-        let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
-        let _ = fs::remove_file(stderr_path);
+/// Resolves an archive entry name to a path inside `destination`.
+///
+/// Entry names come from the archive, so they are untrusted: this rejects
+/// absolute paths, drive-relative and UNC names, `..` traversal, and anything
+/// else that is not a plain sequence of normal components. The returned path is
+/// built component-by-component, so it cannot leave `destination`.
+fn archive_entry_destination(destination: &Path, name: &Path) -> Result<PathBuf> {
+    let mut resolved = destination.to_path_buf();
+    let mut components = 0usize;
+    for component in name.components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                // Reject separators smuggled through a single component (a
+                // Windows-style `a\..\b` read on Unix is one component).
+                let text = part.to_string_lossy();
+                if text.contains('/') || text.contains('\\') || text == ".." {
+                    bail!("archive entry has an unsafe name: {}", name.display());
+                }
+                resolved.push(part);
+                components += 1;
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                bail!(
+                    "archive entry escapes the extraction root: {}",
+                    name.display()
+                );
+            }
+        }
+    }
+    if components == 0 {
+        bail!("archive entry has an empty name");
+    }
+    Ok(resolved)
+}
+
+/// Creates the parent directories for an extracted entry, inside `destination`.
+fn create_entry_parent(destination: &Path, path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    if !parent.starts_with(destination) {
         bail!(
-            "tar extraction failed with status {}; stderr: {}",
-            status,
-            stderr.trim()
-        )
+            "archive entry escapes the extraction root: {}",
+            path.display()
+        );
+    }
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    Ok(())
+}
+
+/// Writes one extracted regular file, refusing to follow an existing entry.
+///
+/// `create_new` matters: without it a directory entry extracted earlier — or a
+/// symlink planted by a co-resident process between entries — would be written
+/// through rather than rejected.
+fn write_entry_file(path: &Path, reader: &mut dyn Read) -> Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    std::io::copy(reader, &mut file)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_entry_mode(path: &Path, mode: Option<u32>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(mode) = mode else {
+        return Ok(());
+    };
+    // Keep the executable bit the runtime needs; drop setuid/setgid/sticky and
+    // any group/other write bit the archive happened to carry.
+    let mode = mode & 0o755;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .with_context(|| format!("failed to set permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "mirrors the Unix signature; Windows has no mode bits to apply"
+)]
+const fn set_entry_mode(_path: &Path, _mode: Option<u32>) -> Result<()> {
+    Ok(())
+}
+
+/// Extracts a gzip-compressed tar archive in-process.
+fn extract_tar_gz(archive: &Path, destination: &Path) -> Result<()> {
+    let file =
+        fs::File::open(archive).with_context(|| format!("failed to open {}", archive.display()))?;
+    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(std::io::BufReader::new(file)));
+    for entry in tar
+        .entries()
+        .with_context(|| format!("failed to read {}", archive.display()))?
+    {
+        let mut entry = entry.with_context(|| format!("failed to read {}", archive.display()))?;
+        let name = entry
+            .path()
+            .with_context(|| {
+                format!(
+                    "archive entry has an undecodable name in {}",
+                    archive.display()
+                )
+            })?
+            .into_owned();
+        let kind = entry.header().entry_type();
+        let path = archive_entry_destination(destination, &name)?;
+        match kind {
+            tar::EntryType::Directory => {
+                fs::create_dir_all(&path)
+                    .with_context(|| format!("failed to create {}", path.display()))?;
+            }
+            tar::EntryType::Regular | tar::EntryType::Continuous => {
+                create_entry_parent(destination, &path)?;
+                let mode = entry.header().mode().ok();
+                write_entry_file(&path, &mut entry)?;
+                set_entry_mode(&path, mode)?;
+            }
+            // Links, devices, fifos and sockets are the entry kinds that let an
+            // archive reach outside its own tree; the official artifacts carry
+            // none of them.
+            other => bail!(
+                "archive contains an unsupported entry ({other:?}) at {}",
+                name.display()
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Extracts a zip archive in-process.
+fn extract_zip(archive: &Path, destination: &Path) -> Result<()> {
+    let file =
+        fs::File::open(archive).with_context(|| format!("failed to open {}", archive.display()))?;
+    let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))
+        .with_context(|| format!("failed to read {}", archive.display()))?;
+    for index in 0..zip.len() {
+        let mut entry = zip
+            .by_index(index)
+            .with_context(|| format!("failed to read entry {index} of {}", archive.display()))?;
+        // `enclosed_name` returns None for absolute or `..`-bearing names; the
+        // raw name is still used for diagnostics and for the trailing-slash
+        // directory convention.
+        let raw = entry.name().to_owned();
+        if entry.is_symlink() {
+            bail!("archive contains symlink at {raw}");
+        }
+        let name = entry
+            .enclosed_name()
+            .with_context(|| format!("archive entry escapes the extraction root: {raw}"))?;
+        let path = archive_entry_destination(destination, &name)?;
+        if entry.is_dir() {
+            fs::create_dir_all(&path)
+                .with_context(|| format!("failed to create {}", path.display()))?;
+            continue;
+        }
+        if !entry.is_file() {
+            bail!("archive contains an unsupported entry at {raw}");
+        }
+        create_entry_parent(destination, &path)?;
+        let mode = entry.unix_mode();
+        write_entry_file(&path, &mut entry)?;
+        set_entry_mode(&path, mode)?;
+    }
+    Ok(())
+}
+
+/// Extracts the embeddable archive into `destination`.
+///
+/// Extraction is done in-process rather than by shelling out to `tar`: the
+/// external binary was resolved from `PATH` (so the extractor unpacking
+/// untrusted bytes was itself unpinned), and its traversal behaviour varied
+/// between GNU tar, the bsdtar shipped as Windows `tar.exe`, and busybox tar.
+fn extract_archive(archive: &Path, destination: &Path) -> Result<()> {
+    let is_zip = archive
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"));
+    if is_zip {
+        extract_zip(archive, destination)
+    } else {
+        extract_tar_gz(archive, destination)
     }
 }
 
@@ -1514,7 +1741,7 @@ fn collect_embeddable_roots(
     candidates: &mut Vec<PathBuf>,
     depth: usize,
 ) -> Result<()> {
-    if depth > 4 {
+    if depth > MAX_ARCHIVE_TREE_DEPTH {
         return Ok(());
     }
     let metadata = fs::symlink_metadata(path)?;
@@ -1596,7 +1823,7 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
         .with_context(|| format!("failed to create {}", destination.display()))?;
     let destination = fs::canonicalize(destination)
         .with_context(|| format!("failed to canonicalize {}", destination.display()))?;
-    copy_tree_entries(&source, &source, &destination, &destination)
+    copy_tree_entries(&source, &source, &destination, &destination, 0)
 }
 
 fn copy_tree_entries(
@@ -1604,7 +1831,14 @@ fn copy_tree_entries(
     source: &Path,
     destination_root: &Path,
     destination: &Path,
+    depth: usize,
 ) -> Result<()> {
+    if depth > MAX_ARCHIVE_TREE_DEPTH {
+        bail!(
+            "archive tree is deeper than {MAX_ARCHIVE_TREE_DEPTH} levels at {}",
+            source.display()
+        );
+    }
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let source_path = entry.path();
@@ -1647,6 +1881,7 @@ fn copy_tree_entries(
                 &canonical_source,
                 destination_root,
                 &canonical_destination,
+                depth + 1,
             )?;
         } else {
             fs::copy(&canonical_source, &destination_path).with_context(|| {
@@ -3448,7 +3683,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_valid_archive_publication_succeeds_for_both_installers() {
+    fn repeated_valid_archive_publication_is_idempotent() {
         let dir = scratch_dir("valid-publication-race");
         let archive = dir.join("archive");
         let content = b"verified archive";
@@ -3467,7 +3702,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_invalid_archive_publication_fails_closed() {
+    fn archive_publication_conflict_with_foreign_bytes_fails_closed() {
         let dir = scratch_dir("invalid-publication-race");
         let archive = dir.join("archive");
         let content = b"verified archive";
@@ -3512,9 +3747,80 @@ mod tests {
     }
 
     #[test]
+    fn download_with_wrong_content_is_rejected_and_leaves_no_archive() {
+        let dir = scratch_dir("bad-content-download");
+        let archive = dir.join("archive");
+        let expected = format!("{:x}", Sha256::digest(b"fresh archive"));
+
+        // A download that succeeds at the transport level but returns the wrong
+        // bytes must not be published, even though nothing errored.
+        let error = ensure_cached_archive("test://archive", &archive, &expected, |_, path| {
+            fs::write(path, b"attacker archive")?;
+            Ok(())
+        })
+        .unwrap_err();
+
+        let error = format!("{error:#}");
+        assert!(error.contains("SHA-256 mismatch"), "{error}");
+        assert!(!archive.exists(), "unverified bytes were published");
+        // Only the lock file may remain; the temporary download must be gone.
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != ".archive.lock")
+            .collect();
+        assert!(leftovers.is_empty(), "leftovers: {leftovers:?}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn archive_guard_outlives_verification_and_is_scoped_to_one_archive() {
+        let dir = scratch_dir("archive-guard-scope");
+        let archive = dir.join("archive");
+        let other = dir.join("other-archive");
+        let content = b"fresh archive";
+        let expected = format!("{:x}", Sha256::digest(content));
+
+        // The guard returned by verification is what callers hold across
+        // extraction; while it is alive the same archive must not be lockable.
+        let guard = ensure_cached_archive("test://archive", &archive, &expected, |_, path| {
+            fs::write(path, content)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let blocked = std::thread::spawn(move || {
+            let _second = lock_archive_cache_in_process(&archive);
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !blocked.is_finished(),
+            "a second in-process lock on the held archive was granted"
+        );
+
+        // A different archive must not queue behind it.
+        let unrelated = std::thread::spawn(move || {
+            let _other = lock_archive_cache_in_process(&other);
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !unrelated.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "an unrelated archive serialized behind the held one"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        unrelated.join().unwrap();
+
+        drop(guard);
+        blocked.join().unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn poisoned_process_mutex_is_recovered_before_digest_validation() {
         let _ = std::thread::spawn(|| {
-            let _guard = EMBEDDABLE_ARCHIVE_CACHE_LOCK.lock().unwrap();
+            let _guard = ARCHIVE_CACHE_BUSY.lock().unwrap();
             panic!("poison archive cache process mutex");
         })
         .join();
@@ -3745,6 +4051,52 @@ mod tests {
         let found = find_embeddable_root(&extract).unwrap();
         let error = copy_tree(&found, &dir.join("runtime")).unwrap_err();
         assert!(error.to_string().contains("symlink"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Windows counterpart to the Unix symlink rejection tests.
+    ///
+    /// Creating a symlink on Windows needs privilege, but `mklink /J` creates a
+    /// directory junction unelevated, and Rust reports junctions as symlinks
+    /// (the reparse tag carries the name-surrogate bit) — so this exercises the
+    /// same rejection branch on the platform where the zip artifact is
+    /// first-class.
+    #[cfg(windows)]
+    #[test]
+    fn embeddable_tree_rejects_external_directory_junction() {
+        let dir = scratch_dir("external-directory-junction");
+        let extract = dir.join("extract");
+        let package = extract.join("package");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(lemond_path_in(&package), b"lemond").unwrap();
+        fs::write(lemonade_path_in(&package), b"lemonade").unwrap();
+        let outside = dir.join("outside-directory");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), b"secret").unwrap();
+
+        let junction = package.join("linked-directory");
+        let status = ProcessCommand::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&outside)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J failed");
+        assert!(
+            fs::symlink_metadata(&junction)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "junction was not reported as a symlink"
+        );
+
+        let found = find_embeddable_root(&extract).unwrap();
+        let error = copy_tree(&found, &dir.join("runtime")).unwrap_err();
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert!(!dir.join("runtime").join("linked-directory").exists());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -4036,5 +4388,215 @@ vllm                rocm        unsupported     Requires Linux                  
         });
         assert!(health_has_loaded_model(&loaded, "lemonade-qwen", "vulkan"));
         assert!(!health_has_loaded_model(&loaded, "lemonade-qwen", "rocm"));
+    }
+    /// Writes a `.tar.gz` whose single entry carries `entry_name` verbatim.
+    ///
+    /// The name is stamped into the raw header bytes because `tar::Builder`
+    /// refuses to serialize `..` or absolute paths — the archives this guards
+    /// against are hostile ones, which no well-behaved writer would produce.
+    fn write_raw_named_tar_gz(path: &Path, entry_name: &str, body: &[u8]) {
+        let file = fs::File::create(path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_ustar();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        let name = header.as_old_mut();
+        let bytes = entry_name.as_bytes();
+        assert!(bytes.len() < name.name.len());
+        name.name[..bytes.len()].copy_from_slice(bytes);
+        header.set_cksum();
+        builder.append(&header, body).unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+    }
+
+    const EXTRACT_PATH_TEST_DIR: &str = "ROCM_LEMONADE_EXTRACT_PATH_TEST_DIR";
+
+    /// Child half of [`extract_archive_does_not_execute_a_path_supplied_tar`].
+    ///
+    /// Runs in its own process so the hostile `PATH` can be set with
+    /// `Command::env` — mutating `PATH` in-process would need `unsafe`, which
+    /// the workspace denies.
+    #[test]
+    fn extract_path_subprocess_helper() {
+        let Some(dir) = std::env::var_os(EXTRACT_PATH_TEST_DIR) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let _ = extract_archive(&dir.join("archive.tar.gz"), &dir.join("extract"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_archive_does_not_execute_a_path_supplied_tar() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir("path-supplied-tar");
+        let archive = dir.join("archive.tar.gz");
+        fs::create_dir_all(dir.join("extract")).unwrap();
+        write_raw_named_tar_gz(&archive, "payload.txt", b"real");
+
+        let fake_bin = dir.join("bin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let marker = dir.join("impostor-ran");
+        let fake_tar = fake_bin.join("tar");
+        fs::write(
+            &fake_tar,
+            format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&fake_tar, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut entries = vec![fake_bin];
+        entries.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let status = ProcessCommand::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::extract_path_subprocess_helper",
+                "--nocapture",
+            ])
+            .env(EXTRACT_PATH_TEST_DIR, &dir)
+            .env("PATH", std::env::join_paths(entries).unwrap())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "helper subprocess failed");
+
+        assert!(
+            !marker.exists(),
+            "extraction executed a PATH-supplied tar instead of a pinned in-process extractor"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    fn extract_hostile_tar_entry(tag: &str, entry_name: &str) -> String {
+        let dir = scratch_dir(tag);
+        let archive = dir.join("hostile.tar.gz");
+        let destination = dir.join("extract");
+        fs::create_dir_all(&destination).unwrap();
+        write_raw_named_tar_gz(&archive, entry_name, b"pwned");
+
+        let error = extract_archive(&archive, &destination).unwrap_err();
+        assert_eq!(
+            fs::read_dir(&destination).unwrap().count(),
+            0,
+            "hostile entry was written into the extraction root"
+        );
+        fs::remove_dir_all(&dir).ok();
+        format!("{error:#}")
+    }
+
+    #[test]
+    fn extract_archive_rejects_parent_traversal_entry() {
+        let error = extract_hostile_tar_entry("traversal-parent", "../escaped.txt");
+        assert!(error.contains("escapes the extraction root"), "{error}");
+    }
+
+    #[test]
+    fn extract_archive_rejects_nested_parent_traversal_entry() {
+        let error = extract_hostile_tar_entry("traversal-nested", "inner/../../escaped.txt");
+        assert!(error.contains("escapes the extraction root"), "{error}");
+    }
+
+    #[test]
+    fn extract_archive_rejects_absolute_entry() {
+        let error = extract_hostile_tar_entry("traversal-absolute", "/etc/escaped.txt");
+        assert!(error.contains("escapes the extraction root"), "{error}");
+    }
+
+    #[test]
+    fn extract_archive_rejects_symlink_entry() {
+        let dir = scratch_dir("traversal-symlink");
+        let archive = dir.join("hostile.tar.gz");
+        let destination = dir.join("extract");
+        fs::create_dir_all(&destination).unwrap();
+
+        let file = fs::File::create(&archive).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_ustar();
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_link_name("/etc/passwd").unwrap();
+        header.set_path("escape-link").unwrap();
+        header.set_cksum();
+        builder.append(&header, std::io::empty()).unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        let error = format!("{:#}", extract_archive(&archive, &destination).unwrap_err());
+        assert!(error.contains("unsupported entry"), "{error}");
+        assert!(!destination.join("escape-link").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn extract_archive_writes_a_well_formed_tree() {
+        let dir = scratch_dir("extract-well-formed");
+        let archive = dir.join("good.tar.gz");
+        let destination = dir.join("extract");
+        fs::create_dir_all(&destination).unwrap();
+
+        let file = fs::File::create(&archive).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_ustar();
+        header.set_size(5);
+        header.set_mode(0o755);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_path("embeddable/bin/lemond").unwrap();
+        header.set_cksum();
+        builder.append(&header, &b"hello"[..]).unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        extract_archive(&archive, &destination).unwrap();
+        let extracted = destination.join("embeddable").join("bin").join("lemond");
+        assert_eq!(fs::read(&extracted).unwrap(), b"hello");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&extracted).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "executable bit was not preserved");
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn extract_archive_rejects_hostile_zip_entry() {
+        let dir = scratch_dir("traversal-zip");
+        let archive = dir.join("hostile.zip");
+        let destination = dir.join("extract");
+        fs::create_dir_all(&destination).unwrap();
+
+        let file = fs::File::create(&archive).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        // `add_directory`/`start_file` normalize names, so the traversal name is
+        // written through the raw entry API a hostile producer would use.
+        writer
+            .start_file("../escaped.txt", options)
+            .or_else(|_| writer.start_file("placeholder.txt", options))
+            .unwrap();
+        writer.write_all(b"pwned").unwrap();
+        writer.finish().unwrap();
+
+        // If the zip writer refused to emit the traversal name there is nothing
+        // hostile to assert on; the tar cases cover the shared validator.
+        let mut zip = zip::ZipArchive::new(fs::File::open(&archive).unwrap()).unwrap();
+        let hostile = zip.by_index(0).unwrap().name().to_owned();
+        if hostile == "../escaped.txt" {
+            let error = format!("{:#}", extract_archive(&archive, &destination).unwrap_err());
+            assert!(error.contains("escapes the extraction root"), "{error}");
+            assert!(!dir.join("escaped.txt").exists());
+        } else {
+            extract_archive(&archive, &destination).unwrap();
+            assert!(destination.join("placeholder.txt").is_file());
+        }
+        fs::remove_dir_all(&dir).ok();
     }
 }
