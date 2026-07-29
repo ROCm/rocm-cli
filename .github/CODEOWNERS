@@ -1,0 +1,10 @@
+# Code owners for ROCm CLI.
+#
+# The last matching pattern wins, so the catch-all below must stay first if any
+# path-specific overrides are added later.
+#
+# @ROCm/rocm-cli-maintainers is requested for review automatically on every pull
+# request, and `main` requires an approval from that team before merge. Manage
+# who reviews by editing the team membership, not this file.
+
+* @ROCm/rocm-cli-maintainers
