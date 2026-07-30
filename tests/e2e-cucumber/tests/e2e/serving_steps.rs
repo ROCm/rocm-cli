@@ -129,8 +129,9 @@ async fn ensure_serve_port_free() -> String {
     // The port closing does NOT mean the prior serve's VRAM is back: a killed
     // vLLM releases ~tens of GiB of device memory only as the process fully
     // exits, which lags the socket close. The next `rocm serve` reads free VRAM
-    // at startup and demands `gpu-memory-utilization` of the TOTAL — after a large
-    // model (e.g. 27B ~54 GiB) the residue can drop free memory below that
+    // at startup and demands vLLM's `gpu-memory-utilization` fraction of the
+    // TOTAL (rocm-cli passes no value, so vLLM's own default applies) — after a
+    // large model (e.g. 27B ~54 GiB) the residue can drop free memory below that
     // request, so the next serve dies with "Free memory ... less than desired GPU
     // memory utilization" (engine core init failed). Wait for the device to
     // actually drain before returning.
@@ -139,11 +140,12 @@ async fn ensure_serve_port_free() -> String {
 
 /// Upper bound on the free-VRAM floor (MiB). Sized so the largest single
 /// scenario model can allocate its engine's memory share without tripping its
-/// startup check: Qwen3.6-27B plus vLLM's ~0.8-of-total KV reservation needs the
-/// MI300X mostly clear. Only a data-center GPU has this much, so on smaller
-/// cards (e.g. Strix Halo's smaller unified-memory pool) the floor is capped to
-/// 90% of the device total (see [`required_free_vram_mib`]) — otherwise the
-/// check could never pass.
+/// startup check: Qwen3.6-27B plus vLLM's default fraction-of-total KV
+/// reservation needs the MI300X mostly clear. Only a data-center GPU has this
+/// much, so on smaller cards (e.g. Strix Halo's smaller unified-memory pool) the
+/// floor is capped to 90% of the device total (see [`required_free_vram_mib`]) —
+/// otherwise the check could never pass. That cap is deliberately at vLLM's own
+/// default utilization, so a drained device still just satisfies the request.
 const MAX_FREE_VRAM_FLOOR_MIB: u64 = 150_000;
 
 /// The free-VRAM floor to wait for on this host: the model-sized ceiling, but

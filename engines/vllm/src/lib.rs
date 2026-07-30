@@ -31,7 +31,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const ENGINE_NAME: &str = "vllm";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const HEALTHCHECK_TIMEOUT_MS: u64 = 700;
-const DEFAULT_GPU_MEMORY_UTILIZATION: &str = "0.80";
 const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
 const MAX_TAIL_READ: u64 = 4 * 1024 * 1024;
 /// How long a stop waits for the server to actually exit after each signal
@@ -496,8 +495,7 @@ fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelRe
         launch_defaults: json!({
             "endpoint_mode": "openai",
             "host": DEFAULT_HOST,
-            "port": DEFAULT_LOCAL_PORT,
-            "gpu_memory_utilization": DEFAULT_GPU_MEMORY_UTILIZATION
+            "port": DEFAULT_LOCAL_PORT
         }),
         engine_recipe,
         warnings: vec![
@@ -698,23 +696,13 @@ the ROCm SDK's bundled numa uses renamed symbol versions and cannot satisfy it, 
 
     let mut command = ProcessCommand::new(&runtime.command);
     command
-        .arg("serve")
-        .arg(&request.model_ref)
-        .arg("--host")
-        .arg(&request.host)
-        .arg("--port")
-        .arg(request.port.to_string())
-        .arg("--gpu-memory-utilization")
-        .arg(DEFAULT_GPU_MEMORY_UTILIZATION);
-    // vLLM's FULL CUDA-graph replay hangs ROCm gfx94x GPUs on the first decode
-    // (surfaces as `HW Exception ... reason :GPU Hang`, which kills the engine and
-    // drops every inference request). Eager mode disables CUDA graphs and keeps
-    // inference stable. Allow opting back in via env once a runtime ships a fix.
-    if vllm_enforce_eager_enabled() {
-        command.arg("--enforce-eager");
-    }
-    command
-        .args(engine_recipe_launch_args(request.engine_recipe.as_ref()))
+        .args(vllm_serve_args(
+            &request.model_ref,
+            &request.host,
+            request.port,
+            vllm_enforce_eager_enabled(),
+            request.engine_recipe.as_ref(),
+        ))
         .stdin(Stdio::null());
     // When `rocm serve` protects a public endpoint, the key arrives via the
     // environment / key file (never argv). Hand it to vLLM as `VLLM_API_KEY` so
@@ -1295,6 +1283,42 @@ fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRuntime) -> Res
         );
     }
     Ok(())
+}
+
+/// Full argument vector for `vllm serve`, as spawned by [`spawn_vllm_server`].
+///
+/// Kept as a pure function so the exact argv can be asserted in tests: memory
+/// and graph-mode flags materially change how much VRAM vLLM claims, and a
+/// wiring mistake there is invisible until a live GPU launch.
+///
+/// Notably absent: `--gpu-memory-utilization`. rocm-cli deliberately does not
+/// supply a default — vLLM's own default applies unless the user asks for a
+/// specific fraction via `rocm serve --gpu-memory-utilization`, which arrives
+/// here through the engine recipe's `required_flags`.
+fn vllm_serve_args(
+    model_ref: &str,
+    host: &str,
+    port: u16,
+    enforce_eager: bool,
+    engine_recipe: Option<&EngineRecipeHint>,
+) -> Vec<String> {
+    let mut args = vec![
+        "serve".to_owned(),
+        model_ref.to_owned(),
+        "--host".to_owned(),
+        host.to_owned(),
+        "--port".to_owned(),
+        port.to_string(),
+    ];
+    // vLLM's FULL CUDA-graph replay hangs ROCm gfx94x GPUs on the first decode
+    // (surfaces as `HW Exception ... reason :GPU Hang`, which kills the engine and
+    // drops every inference request). Eager mode disables CUDA graphs and keeps
+    // inference stable. Allow opting back in via env once a runtime ships a fix.
+    if enforce_eager {
+        args.push("--enforce-eager".to_owned());
+    }
+    args.extend(engine_recipe_launch_args(engine_recipe));
+    args
 }
 
 fn engine_recipe_launch_args(engine_recipe: Option<&EngineRecipeHint>) -> Vec<String> {
@@ -2070,7 +2094,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_model_surfaces_conservative_vram_default() -> Result<()> {
+    fn resolve_model_omits_gpu_memory_utilization_default() -> Result<()> {
         let response = resolve_model_response(ResolveModelRequest {
             model_ref: "facebook/opt-125m".to_owned(),
             runtime_id: None,
@@ -2079,14 +2103,55 @@ mod tests {
             engine_recipe: None,
         })?;
 
-        assert_eq!(
+        assert!(
             response
                 .launch_defaults
                 .get("gpu_memory_utilization")
-                .and_then(Value::as_str),
-            Some(DEFAULT_GPU_MEMORY_UTILIZATION)
+                .is_none(),
+            "rocm-cli defers to vLLM's own default, so it must not advertise one: {}",
+            response.launch_defaults
         );
         Ok(())
+    }
+
+    #[test]
+    fn vllm_serve_args_omit_gpu_memory_utilization_without_override() {
+        let args = vllm_serve_args("facebook/opt-125m", "127.0.0.1", 8000, false, None);
+
+        assert_eq!(
+            args,
+            vec![
+                "serve",
+                "facebook/opt-125m",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8000"
+            ]
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--gpu-memory-utilization"),
+            "vLLM must apply its own default when the user asked for nothing: {args:?}"
+        );
+    }
+
+    #[test]
+    fn vllm_serve_args_forward_recipe_gpu_memory_utilization() {
+        let hint = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: ENGINE_NAME.to_owned(),
+            required_flags: vec!["--gpu-memory-utilization".to_owned(), "0.35".to_owned()],
+            ..EngineRecipeHint::default()
+        };
+
+        let args = vllm_serve_args("facebook/opt-125m", "127.0.0.1", 8000, true, Some(&hint));
+
+        let position = args
+            .iter()
+            .position(|arg| arg == "--gpu-memory-utilization")
+            .expect("explicit utilization must reach the spawned argv");
+        assert_eq!(args.get(position + 1).map(String::as_str), Some("0.35"));
+        assert!(args.contains(&"--enforce-eager".to_owned()));
     }
 
     #[test]
