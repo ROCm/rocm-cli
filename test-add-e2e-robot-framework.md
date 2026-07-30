@@ -232,43 +232,7 @@ default-engine), rominf re-review pending.
 
 ## 📋 Work Log
 
-**2026-07-16 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-16 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-16 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-16 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-16 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-16 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-16 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-15 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-15 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-15 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-15 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-15 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-15 (idle flush — auto-sync):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-15 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-15 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-15 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state. PR #69 all-blocking checks green (commit e21297d on scratch, equivalent to PR tree post-cherry-pick); strix-windows 0 XPASS confirmed via run 29356345254. Version feature + os=linux xfail scoping + @nightly-install-tag remain on scratch only — bring to PR after strix-windows validation completes. VOLEN-silo review fully triaged (5B+6NB items fixed in worktree). Task #22 (share-one-runtime) validated by hand, #23 (strix lemonade probe) returned 2 unexpected failures (backend-install masking engine line, Vulkan instability) requiring xfail or deeper fix. Full 4-platform CI report exists (run 29354305288, all columns live, version headings present, reconciliation all-green with 0 XPASS/0 unexp except strix-windows 1 XPASS on chat-tool-definitions).
-
-**2026-07-15 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+**2026-07-15:** PR #69 all-blocking checks green (commit e21297d on scratch, equivalent to PR tree post-cherry-pick); strix-windows 0 XPASS confirmed via run 29356345254. Version feature + os=linux xfail scoping + @nightly-install-tag remain on scratch only — bring to PR after strix-windows validation completes. VOLEN-silo review fully triaged (5B+6NB items fixed in worktree). Task #22 (share-one-runtime) validated by hand, #23 (strix lemonade probe) returned 2 unexpected failures (backend-install masking engine line, Vulkan instability) requiring xfail or deeper fix. Full 4-platform CI report exists (run 29354305288, all columns live, version headings present, reconciliation all-green with 0 XPASS/0 unexp except strix-windows 1 XPASS on chat-tool-definitions).
 
 **2026-07-14 (report polish + version-probe diagnosis):**
 - ✅ Grey-✗ xfail grid cells: expectation grid now renders xfail as grey cross (status-xfail) with legend; fixed latent maud double-class bug dropping cell colors.
@@ -276,32 +240,16 @@ default-engine), rominf re-review pending.
 - ✅ OS-aware version probe (option 1): `collect_versions` now finds vllm dist-info + lemond across Windows/Unix venv layouts, with `site_packages_dirs` glob + lemond/lemond.exe detection. Committed b38b50d + c0d1fc2 (diagnostic) to scratch.
 - 🔄 Nightly scenarios validation (tasks #1–2): 27B serve manually running on app-dev (recipe correct, vLLM 0.23.0 loading weights from seeded HF cache via shared prewarm runtime); diagnostic probe 29364419058 queued (strix-ubuntu runtime-path-not-nested, no serve, to reveal where lemond/vllm actually live in Strix tree).
 
-**2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
 **2026-07-14 (late — all report fixes committed, version fix diagnosed):**
 - ✅ **Report changes merged to scratch** (`b38b50d`): grey-✗ xfail grid cells (`.status-xfail` CSS), `n/a` coverage blanks + legends (HTML + markdown), fixed maud dual-class bug.
 - ✅ **Version collection redesigned** (OS-aware `site_packages_dirs()` + `lemond`/`lemond.exe`). Container gate full green (report lib 33, e2e-cucumber lib 23, mock E2E 0 unexpected, all under `-D warnings`).
 - ✅ **Diagnostic probe run 29363255225**: strix-ubuntu, scenario 7 lemonade-serve, `name_filter` scoped. **RESULT: vllm + lemonade still `None`**, not fixed. Root cause: scenario 7 serve failed (90s timeout during backend download); lemonade installs lazily on-serve, never reached the shared tree. vllm legitimately absent (strix-ubuntu=lemonade-native, no vllm install). **Decision needed:** read lemonade version without serve completion (e.g., backend-install probe step), or accept lemonade=n/a on Strix. 
 
-**2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state. #23 Strix probe result: both serve-default-engine scenarios still fail on lemonade-native path (backend-install masking engine line, Vulkan instability). Needs xfail or deeper fix. PR #69 all-blocking checks green. VOLEN bot review fully triaged (5B+6NB items addressed in worktree, see section above). Task #22 (share-one-runtime) validated by hand — redesigned without redundant cargo rebuild, with persistence at E2E_SHARED_RUNTIMES_DIR; full GPU suite under 90min cap achieved (run 29322186691, 24 scenarios, 11 xfail as expected, 0 unexpected). Commits on scratch: ebc00b1, 021b14c, 72c6457, fc4687b. Pending: bring #22 to PR after rominf re-review, finalize #23 decision, remove temp name_filter commit.
+**2026-07-14:** #23 Strix probe result: both serve-default-engine scenarios still fail on lemonade-native path (backend-install masking engine line, Vulkan instability). Needs xfail or deeper fix. PR #69 all-blocking checks green. VOLEN bot review fully triaged (5B+6NB items addressed in worktree, see section above). Task #22 (share-one-runtime) validated by hand — redesigned without redundant cargo rebuild, with persistence at E2E_SHARED_RUNTIMES_DIR; full GPU suite under 90min cap achieved (run 29322186691, 24 scenarios, 11 xfail as expected, 0 unexpected). Commits on scratch: ebc00b1, 021b14c, 72c6457, fc4687b. Pending: bring #22 to PR after rominf re-review, finalize #23 decision, remove temp name_filter commit.
 
-**2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
+**2026-07-14:** #23 Strix probe validated; both serve-default-engine scenarios still fail on lemonade path (backend-install masks engine line, Vulkan instability). Needs xfail or deeper fix. PR #69 all-blocking green, rominf re-review pending, 4 work-in-progress commits signed/pushed. VOLEN bot review triaged + fixed (5 blocking + 6 non-blocking addressed in scratch worktree). Task #22 (share-one-runtime) validated hand-proof → rebuilt correctly with pre-warm in-place + persistence; full GPU suite under cap achieved run 29322186691 (24 scenarios, 11 xfail as expected, 0 unexpected). Commits on scratch: ebc00b1 (harness+CI), 021b14c (pre-warm fix), 72c6457 (remove probe filter), fc4687b (drop mismapped EAI-7221 vLLM block). Bring #22 + these to PR after rominf re-review completes.
 
-**2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state. #23 Strix probe validated; both serve-default-engine scenarios still fail on lemonade path (backend-install masks engine line, Vulkan instability). Needs xfail or deeper fix. PR #69 all-blocking green, rominf re-review pending, 4 work-in-progress commits signed/pushed. VOLEN bot review triaged + fixed (5 blocking + 6 non-blocking addressed in scratch worktree). Task #22 (share-one-runtime) validated hand-proof → rebuilt correctly with pre-warm in-place + persistence; full GPU suite under cap achieved run 29322186691 (24 scenarios, 11 xfail as expected, 0 unexpected). Commits on scratch: ebc00b1 (harness+CI), 021b14c (pre-warm fix), 72c6457 (remove probe filter), fc4687b (drop mismapped EAI-7221 vLLM block). Bring #22 + these to PR after rominf re-review completes.
-
-**2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-14 (idle flush — auto):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state. Full GPU suite under 90-min cap achieved and validated (run 29322186691). Share-one-runtime works end-to-end with install-once + reuse pattern. 1 XPASS (EAI-7221 chat-end-to-end-local-model on MI300X) needs triage before closing — appears fixed but needs confirmation. Commits on scratch: ebc00b1 (share-one-runtime harness+CI), 021b14c (pre-warm in-place), 72c6457 (remove temp filter). All signed, pushed. Next: triage XPASS, bring #22 + share-one-runtime to PR, rominf re-review pending, #23 still open.
+**2026-07-14:** Full GPU suite under 90-min cap achieved and validated (run 29322186691). Share-one-runtime works end-to-end with install-once + reuse pattern. 1 XPASS (EAI-7221 chat-end-to-end-local-model on MI300X) needs triage before closing — appears fixed but needs confirmation. Commits on scratch: ebc00b1 (share-one-runtime harness+CI), 021b14c (pre-warm in-place), 72c6457 (remove temp filter). All signed, pushed. Next: triage XPASS, bring #22 + share-one-runtime to PR, rominf re-review pending, #23 still open.
 
 **2026-07-14 — Task #22 redesign iteration #3: libraries-only rejected, share-one-runtime rebuilt correctly**
 - Tested `ROCM_CLI_THEROCK_EXTRAS=libraries` fix by hand on MI300X: **disproven** — `devel` is load-bearing (torch/amdsmi need it), not just build-time. Dropped env-knob entirely.
@@ -507,8 +455,6 @@ the GPU cap.
 ---
 
 ## 📋 WORK LOG (2026-07-14 — TUI E2E spike + parent WIP research)
-
-**2026-07-14 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
 - **Created new WIP `test-e2e-tui-cucumber`** (test-e2e-tui-cucumber.md on progress branch): the dash TUI is NOT untestable black-box; can be driven via PTY (portable-pty + vt100) like any terminal app. Spike proven by hand: drove `rocm dash --demo` under 80×24 PTY, asserted on screen grid, sent Tab, saw redraw, quit cleanly.
 - **Research findings into TUI e2e WIP:** portable-pty 0.9 + vt100 0.16 is the standard Rust-native stack (honors EAI-7164 one-toolchain). Product already has determinism knobs: `--demo` (no GPU/daemon), `--dev-chat-mock` (fixed reply), `interactive_terminal()` requires TTY (PTY satisfies). Windows ConPTY support exists but crossterm input is flaky; likely gate to linux(+mac).
@@ -1277,7 +1223,7 @@ Framework/harness/CI issues to fix fast via the scratch-branch + manual-dispatch
 - ✅ Added EAI-7052 lemonade+linux xfail conditions to avoid false-fail on Strix-Ubuntu where lemonade inference hangs.
 - ✅ Committed both clean to scratch (2 commits: report presentation `d9d3adb`, engine-agnostic `f63ca2c`). Cherry-picked 5 keepers to PR branch, held push. Container suite fully green.
 
-**2026-07-13 (idle flush):** Session idle for 1 hour, auto-flushing WIP state. Goal remains complete: 4-platform E2E report (run 29209242248) with all platforms producing platform.json + report.json; report defect fixed in `afbabc8` committed to origin/ci-e2e-framework-fixes. Outstanding: 2 known Strix-Ubuntu test-bug fails (task #23, same root cause as EAI-7333). No active work.
+**2026-07-13:** Goal remains complete: 4-platform E2E report (run 29209242248) with all platforms producing platform.json + report.json; report defect fixed in `afbabc8` committed to origin/ci-e2e-framework-fixes. Outstanding: 2 known Strix-Ubuntu test-bug fails (task #23, same root cause as EAI-7333). No active work.
 
 **2026-07-12 (final session update):**
 - ✅ **ALL 4 PLATFORMS VERIFIED GREEN** — **expect-pass goal fully met**.
@@ -1421,9 +1367,6 @@ addressed here with the exit-code fix + dedicated known-bugs job.
 - Set up local-only progress branch for WIP storage (push-guarded against
   upstream). Next: await CI + re-review.
 
-### 2026-07-09 (idle flush)
-- **2026-07-09 (idle flush):** Session idle for 1 hour, auto-flushing WIP state.
-
 ### 2026-07-09..07-10 (CI correctness, multi-runner, consolidated report)
 - Rebased on main (picked up #84 catalog curation, #87 const stubs, #88 dash port).
 - Diagnosed why CI jobs "started failing": they were previously SKIPPED behind a
@@ -1516,14 +1459,6 @@ addressed here with the exit-code fix + dedicated known-bugs job.
 - ✅ **Harness leak fix `b967d26`** (signed, pushed): E2E `Drop` now calls `rocm services stop <id> --yes` on all managed services recorded in scenario's isolated root before temp dir removed. Prevents vLLM/llama-server detached processes leaking on persistent runners. Container suite (mock 8/8) green pre-push.
 - ✅ **Box recovery**: app-dev pod accumulated 51 e2e roots + ~24 orphaned GPU processes from pre-leak-fix jobs. User ran cleanup (`pkill -f '/tmp/rocm-e2e...'`, `rm -rf /tmp/rocm-e2e-*`). Runner restarted with `RUNNER_ALLOW_RUNASROOT=1 nohup ./run.sh` (PowerShell guard requires explicit env var; original session had it set).
 - 📋 **Next run** (`b967d26`, pending): waiting for stale `0d5645e` PR run to drain off serial `app-dev-gpu` runner. Once it finishes/cancels, `b967d26` picks up with all fixes (Strix Windows/Linux bootstrap + teardown leak prevention).
-
-### 2026-07-10 (idle flush)
-**2026-07-10 (idle flush):** Session idle for 1 hour, auto-flushing WIP state.
-
-### 2026-07-11 (idle flush)
-**2026-07-11 (idle flush):** Session idle for 1 hour, auto-flushing WIP state.
-
-**2026-07-11 (idle flush):** Session idle for 1 hour, auto-flushing WIP state.
 
 ### 2026-07-12 (Stages 1–3: per-scenario expectation matrix system, COMPLETED)
 - ✅ **Stage 1 (Capability probe)**: `src/capability.rs` (~480 lines, 10 unit tests all green).
@@ -1652,8 +1587,6 @@ addressed here with the exit-code fix + dedicated known-bugs job.
 - Run #544 verification exposed 2 probe bugs: (1) parsed examine --json (reported has_amd_gpu:false on real MI300X); fixed to parse human examine text. (2) Strix Ubuntu+Windows collided in grid (both gfx1151); fixed by appending OS to slugs → "strix-halo-linux"/"strix-halo-windows".
 - Committed 5 changesets: `2327f74` (stages 1-3), `8d5f9e4` (clippy), `c4c7a6c` (stage 5), `99d5890` (probe fix), `61f6d1f` (docs). Run 29195892270 dispatched to re-verify with probe fix. Grid now correctly surfaces real findings (e.g. lemonade failures on Strix platforms).
 - **DECISION IMPLEMENTED**: MI300X job timeout addressed by (a) raising timeout to 35min (GPU non-blocking, commit caeab96), (b) wiring serve_timeout_secs from expectations.toml for xfail serves (fail-fast, commit a5dd8dd). Also widen EAI-7052 condition to include Windows (currently os=linux only, commit 89312ed).
-
-**2026-07-12 (idle flush):** Session idle for 1 hour, auto-flushing WIP state.
 
 **2026-07-12 (Report delivery focus — final session checkpoint):**
 - ✅ **Run 29209242248 status verified**: Mock / Strix-Ubuntu / Strix-Windows complete (3 of 4 platform columns); MI300X (~37min) still in progress. Consolidated report renderable from available 3 platforms.

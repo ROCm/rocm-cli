@@ -173,5 +173,3 @@ avoid drift, per the agreed lifecycle):
 - CI run completed: all 21 required checks pass (green). E2E GPU lane (non-required) shows 2 stale XPASS (EAI-7052, EAI-7333) + 1 unrelated chat regression. PR mergeable.
 - opencode agent reviewed independently: ready/solid. All logic verified, no code changes needed.
 - PR #134 fully approved (rominf + opencode), mergeable, awaiting user merge signal.
-
-**2026-07-22 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.

@@ -6,7 +6,7 @@
 **PR:** #138 — **CLOSED** (superseded by #142 merged 2026-07-27). Feature shipped via #142 on main.
 **Pre-PR-check:** passed — opencode (independent reviewer), 2026-07-22
 **Jira:** EAI-7456 (**Done**, 2026-07-28) — commented referencing PR #142 as delivery; #138 closed as redundant.
-**Last Updated:** 2026-07-28 (idle flush)
+**Last Updated:** 2026-07-28
 
 **Token Usage:** in=2062 out=481977 cache_create=15115072 cache_read=159467295 calls=981
 
@@ -233,15 +233,11 @@ Scenario: Non-flaky XPASS remains fatal
 - **PR state**: OPEN/MERGEABLE, BLOCKED on genuine REVIEW_REQUIRED (0 reviews). All 8 merge-required checks green. Awaiting human approval.
 - **Open**: EAI-7052 decision (flip-expect-pass / mark-flaky / defer) — advisory lane, non-blocking.
 
-**2026-07-24 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
 **2026-07-24 (EAI-7052 evidence + PR collision discovery):**
 - Gathered EAI-7052 evidence per fres: mis-attribution confirmed (EAI-7052 = "Lemonade use installed ROCm", Done/Resolved 2026-07-16, unrelated to Vulkan hang). Two scenarios XPASS'd on my runs (07-24) but xfail'd on #142 merge-queue (07-23) → intermittent, not fixed.
 - **Critical discovery**: PR #142 ("ci: stabilize GPU E2E and merge queue", rominf, OPEN) rewrites the same 3 files as #138 with parallel flaky-XPASS implementation. Created 2026-07-23 09:10Z (one day after #138 2026-07-22 07:48Z). Whichever lands first, other conflicts hard + becomes redundant.
 - Verified: #138 is first (2026-07-22); #142 created second (2026-07-23) but cycling through merge queue, may be closer to landing.
 - **Blockers (awaiting user)**: (1) #138/#142 collision resolution (close #138 in favor of #142 / close #142 in favor of #138 / coordinate with rominf); (2) EAI-7052 call (mark-flaky / flip-expect-pass / defer) depends on (1). No further progress on #138 until (1) decided.
-
-**2026-07-24 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
 ### 2026-07-28
 
@@ -257,5 +253,3 @@ Scenario: Non-flaky XPASS remains fatal
 - #138 fully redundant — all feature behavior + markers + test coverage shipped on main via #142.
 - **Closed #138** with superseded note. EAI-7052 mis-attribution fixed on main (now EAI-7423, not EAI-7052).
 - Task complete — feature shipped (via #142, not #138).
-
-**2026-07-28 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.

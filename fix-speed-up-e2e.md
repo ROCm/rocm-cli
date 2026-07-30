@@ -333,14 +333,6 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persist-app-dev-ci
 - **Fixed done-detection:** Updated Stage line to flag "STAGED TASK, NOT done"; PR #126 shipped as milestone; re-branch in place for next chunk per wip-management skill protocol.
 - **Next actionable:** R2 decision gate (latest vs smallest serve model); then R4–R6 (mock/real split, biggest structural win).
 
-### 2026-07-17 (idle flush) — [IDLE FLUSH 7]
-
-**Session idle for 10 minutes, auto-flushing WIP state.**
-
-### 2026-07-17 (idle flush) — [IDLE FLUSH 6]
-
-**Session idle for 10 minutes, auto-flushing WIP state.**
-
 ### 2026-07-17 — Session review: verified PR #126 merge, reconciled overlaps between Task list and Efficiency roadmap
 
 - **PR #126 verified MERGED** (2026-07-17 01:02 UTC, merge commit `e9a4b154`, main branch). Strix-Ubuntu lane 28.4m → 15.6m; VRAM-floor fix live.
@@ -352,26 +344,6 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persist-app-dev-ci
 - Created `/Users/fres/Developer/rocm-cli-progress/test-e2e-diagnose.md` (Stage `8-awaiting-pr-approval`).
 - Moved Task #3 context out of [[fix-speed-up-e2e]] into dedicated branch WIP: scenarios, technical mapping, env-dependence saga, process notes.
 - Trimmed parent WIP (fix-speed-up-e2e) down to `[[test-e2e-diagnose]]` pointers; Task #3 full detail now lives in its own file.
-
-### 2026-07-17 (idle flush) — [IDLE FLUSH 5]
-
-**Session idle for 10 minutes, auto-flushing WIP state.**
-
-### 2026-07-17 (idle flush) — [IDLE FLUSH 4]
-
-**Session idle for 10 minutes, auto-flushing WIP state.**
-
-### 2026-07-17 (idle flush) — [IDLE FLUSH 3]
-
-**Session idle for 10 minutes, auto-flushing WIP state.**
-
-### 2026-07-17 (idle flush) — [IDLE FLUSH 2]
-
-**Session idle for 10 minutes, auto-flushing WIP state.**
-
-### 2026-07-17 (idle flush)
-
-**Session idle for 10 minutes, auto-flushing WIP state.**
 
 ### 2026-07-17 — Container gate validated, Task #3 live-probed, methods saved, Task #4 + #2 scoped
 

@@ -3,7 +3,7 @@
 **Stage:** 9-CLOSED (superseded by #142)
 **Pipeline:** standard
 **Branch:** fix-e2e-share-lemonade-engine → **PR #129 CLOSED 2026-07-28** (superseded). EAI-7455 stays open in backlog.
-**Last Updated:** 2026-07-28 (idle flush)
+**Last Updated:** 2026-07-28
 
 ---
 
@@ -32,7 +32,6 @@ discovered #142 had landed the same work.)
 
 ## Work Log
 
-**2026-07-28 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 **Pre-PR-check:** changes-requested — opencode/claude-opus reviewer, 2026-07-22
 
 ---
@@ -269,40 +268,6 @@ runtime; local `cargo build` + `cargo clippy --locked -p e2e-cucumber --test e2e
 both clean; ci.yml valid YAML.
 
 ## Work Log
-
-**2026-07-28 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-28 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-25 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-24 (idle flush, 4th flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-24 (idle flush, 3rd flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-24 (idle flush, 2nd flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-24 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-23 (idle flush, 2nd flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-23 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-22 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-22 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-22 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-18 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-17 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-17 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-17 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
-
-**2026-07-16 (idle flush):** Session idle for 10 minutes, auto-flushing WIP state.
 
 **2026-07-16:** Diagnosed root cause from failing job 87668414041 logs (4.6 GB
 per-scenario re-download → 300s serve timeout). Traced lemonade backend install path
