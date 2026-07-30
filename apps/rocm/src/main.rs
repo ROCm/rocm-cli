@@ -4392,8 +4392,11 @@ fn validate_bind_host(host: &str, allow_public_bind: bool) -> Result<()> {
     Ok(())
 }
 
+/// Inverse of [`rocm_engine_protocol::is_public_bind_host`], which owns the
+/// policy so `rocmd` classifies a recorded `host` identically when it respawns
+/// the service.
 fn is_loopback_host(host: &str) -> bool {
-    matches!(host, "127.0.0.1" | "localhost" | "::1")
+    !rocm_engine_protocol::is_public_bind_host(host)
 }
 
 /// Resolve the API key that will guard this endpoint, applying the
@@ -4469,6 +4472,37 @@ fn ensure_public_bind_engine_supported(
             "public binding with the lemonade engine is not supported on Windows: the endpoint \
              API key cannot be enforced there. Use `--engine vllm`, or bind a loopback host \
              (the default 127.0.0.1)."
+        );
+    }
+    Ok(())
+}
+
+/// Refuse to (re)spawn a managed service recorded on a public host when its
+/// endpoint API key is gone, so a respawn cannot reopen the endpoint anonymously.
+///
+/// `serve()` applies the loopback-vs-public policy once, via
+/// [`resolve_endpoint_auth`], and persists the resulting key. Every later spawn
+/// — `rocm services restart`, and `rocmd`'s recovery supervisor — reads that key
+/// file back and would otherwise treat "no key file" as "no auth wanted",
+/// silently downgrading a protected public endpoint to an open one. The real
+/// invariant is a property of the *host*, not of the file: a non-loopback bind
+/// must always be authenticated.
+///
+/// The gap is reachable through ordinary commands, because a stop deletes the
+/// key file and `rocm services restart` accepts a stopped service id (its help
+/// points at `rocm services list --all`).
+///
+/// `key_present` is a plain `bool` rather than a path so both branches are
+/// unit-testable without touching the filesystem, mirroring `is_windows` in
+/// [`ensure_public_bind_engine_supported`].
+fn ensure_public_service_has_endpoint_key(host: &str, key_present: bool) -> Result<()> {
+    if rocm_engine_protocol::is_public_bind_host(host) && !key_present {
+        bail!(
+            "managed service is bound to the public host `{host}` but has no endpoint API key, \
+             so restarting it would reopen it without authentication. The key is dropped when a \
+             service stops and cannot be recovered. Launch it again with \
+             `rocm serve --host {host} --allow-public-bind` (add `--api-key <key>`, or set \
+             ROCM_SERVE_API_KEY, to choose the key instead of generating one)."
         );
     }
     Ok(())
@@ -4687,6 +4721,11 @@ fn spawn_managed_engine_child(
     // primitives accept as an env override, and it keeps the key off both the argv
     // and the environment block. `serve()` wrote the file before spawning.
     let endpoint_key_file = endpoint_keys::endpoint_key_file_if_present(paths, service_id);
+    // `serve()` already resolved and stored the key for a public bind, so this
+    // cannot fire on the fresh-launch path today. It is the shared choke point
+    // for managed spawns, so enforce the invariant here too rather than relying
+    // on every future caller having done so.
+    ensure_public_service_has_endpoint_key(host, endpoint_key_file.is_some())?;
     #[cfg(windows)]
     let child_pid = {
         let env_values = app_path_env_var_values(paths, engine_envs_root.as_deref());
@@ -12817,7 +12856,14 @@ fn stop_internal_managed_service(paths: &AppPaths, service_id: &str) -> Result<s
     // Drop the endpoint key with the service by deleting its 0600 key file.
     // Best-effort — a stopped service must not fail to stop just because key
     // cleanup did.
-    endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
+    //
+    // Gated on `all_stopped` for the same reason the status is: an unconfirmed
+    // stop may have left the engine alive and still enforcing the key, and
+    // discarding our only copy would lock the CLI's own probes, chat, and
+    // service discovery out of a service that is otherwise fine.
+    if all_stopped {
+        endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
+    }
     let engine_stop = match engine_stop {
         Ok(response) => serde_json::json!({
             "attempted": true,
@@ -12866,6 +12912,9 @@ fn restart_internal_managed_service(
     // service back on the same public host with the same auth. Capture it first and
     // re-store it after the stop so the spawn below hands the child the same key.
     let preserved_endpoint_key = endpoint_keys::endpoint_api_key(paths, service_id);
+    // Checked before the stop, so a refused restart leaves a running service
+    // running instead of stopping it and then failing to bring it back.
+    ensure_public_service_has_endpoint_key(&record.host, preserved_endpoint_key.is_some())?;
     let _ = stop_internal_managed_service(paths, service_id);
     if let Some(key) = preserved_endpoint_key.as_deref() {
         endpoint_keys::store_endpoint_api_key(paths, service_id, key)?;
@@ -20720,6 +20769,68 @@ install therock";
         ensure_public_bind_engine_supported("vllm", true, true).unwrap(); // vLLM enforces auth on Windows
         ensure_public_bind_engine_supported("lemonade", true, false).unwrap(); // non-Windows
         ensure_public_bind_engine_supported("lemonade", false, true).unwrap(); // loopback needs no key
+    }
+
+    #[test]
+    fn respawn_fails_closed_for_a_public_service_whose_key_is_gone() {
+        // A stop deletes the key file, so a later restart of a public service
+        // would otherwise respawn it with no auth at all.
+        let error = ensure_public_service_has_endpoint_key("0.0.0.0", false).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("0.0.0.0"), "{error:#}");
+        assert!(message.contains("without authentication"), "{error:#}");
+        // Actionable: name the command that mints a fresh key.
+        assert!(message.contains("--allow-public-bind"), "{error:#}");
+
+        // A public service that still has its key restarts normally.
+        ensure_public_service_has_endpoint_key("0.0.0.0", true).unwrap();
+    }
+
+    #[test]
+    fn respawn_allows_loopback_services_without_an_endpoint_key() {
+        // Loopback stays credential-free, so every accepted spelling must pass
+        // the guard with no key present.
+        for host in ["127.0.0.1", "localhost", "::1"] {
+            ensure_public_service_has_endpoint_key(host, false)
+                .unwrap_or_else(|error| panic!("{host} must not require a key: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn restart_refuses_a_public_service_without_a_key_before_stopping_it() {
+        // The guard runs before the stop, so a refused restart must leave the
+        // record exactly as it was rather than taking down a running service.
+        let (root, paths) = test_paths("restart-public-no-key");
+        let service_id = "svc-public-nokey";
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            service_id,
+            "vllm",
+            "model-ref",
+            "canonical/model",
+            "0.0.0.0",
+            11435,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        record.status = "running".to_owned();
+        record.write().unwrap();
+
+        let error = restart_internal_managed_service(&paths, service_id).unwrap_err();
+        assert!(
+            error.to_string().contains("without authentication"),
+            "{error:#}"
+        );
+
+        let after = load_managed_service(&paths, service_id).unwrap();
+        assert_ne!(
+            after.status, "stopped",
+            "a refused restart must not stop the service"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

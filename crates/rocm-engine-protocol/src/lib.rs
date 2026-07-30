@@ -30,6 +30,24 @@ pub const DEFAULT_LOG_TAIL_LINES: usize = 80;
 /// (e.g. a loopback bind).
 pub const ENDPOINT_API_KEY_FILE_ENV: &str = "ROCM_SERVE_API_KEY_FILE";
 
+/// Whether `host` names a public (non-loopback) bind, i.e. one that must be
+/// protected by an endpoint API key.
+///
+/// Shared so `rocm` (which decides at `serve` time whether to mint a key) and
+/// `rocmd` (which respawns recorded services during recovery) apply the same
+/// policy to the same `ManagedServiceRecord::host` value.
+///
+/// Deliberately an exact match against the three loopback spellings the CLI
+/// accepts, so anything unrecognized — an IPv6 loopback alias, a differently
+/// cased `localhost`, a hostname that happens to resolve locally — is treated
+/// as public and therefore *requires* a key. Misclassifying a loopback bind as
+/// public costs a key nobody needed; the reverse would open an unauthenticated
+/// network listener.
+#[must_use]
+pub fn is_public_bind_host(host: &str) -> bool {
+    !matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
 /// Resolve the endpoint API key an engine adapter must enforce, if any.
 ///
 /// Reads the key file named by [`ENDPOINT_API_KEY_FILE_ENV`]. Returns `None` when
@@ -662,6 +680,27 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert_eq!(endpoint_key_file_if_present(&paths, service_id), None);
         std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    #[test]
+    fn is_public_bind_host_recognizes_only_the_accepted_loopback_spellings() {
+        for host in ["127.0.0.1", "localhost", "::1"] {
+            assert!(!is_public_bind_host(host), "{host} must be loopback");
+        }
+        for host in [
+            "0.0.0.0",
+            "::",
+            "192.168.1.10",
+            "example.internal",
+            // Conservative on purpose: an unrecognized spelling of a loopback
+            // address is classified public, so it requires a key rather than
+            // opening an unauthenticated listener.
+            "LOCALHOST",
+            "127.0.0.2",
+            "[::1]",
+        ] {
+            assert!(is_public_bind_host(host), "{host} must be public");
+        }
     }
 
     #[test]
