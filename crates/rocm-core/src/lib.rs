@@ -3747,15 +3747,21 @@ fn parse_linux_kfd_gfx_target(value: &str) -> Option<String> {
     }
     match digits.len() {
         3 | 4 => Some(format!("gfx{digits}")),
+        // A 5/6-digit value is KFD's *packed* version (major·10000 + minor·100 +
+        // step), not a target name, so there is no `gfx{digits}` fallback here.
+        // Fabricating one from a version that failed to decode fed
+        // `gfx90010`-shaped tokens into `normalize_therock_family`, where the
+        // loose `gfx90` arm mapped them to a plausible-looking but wrong family.
+        // Yielding `None` instead lets detection try the next KFD node and then
+        // `ip_discovery`, and otherwise report the target as unknown — which is
+        // recoverable with `--family`, where a wrong family silently installs
+        // the wrong runtime wheel.
         5 | 6 => {
             let raw: u32 = digits.parse().ok()?;
             let major = raw / 10_000;
             let minor = (raw / 100) % 100;
             let revision = raw % 100;
-            if let Some(token) = gfx_target_from_gc_version(major, minor, revision) {
-                return Some(token);
-            }
-            Some(format!("gfx{digits}"))
+            gfx_target_from_gc_version(major, minor, revision)
         }
         _ => None,
     }
@@ -3835,11 +3841,26 @@ fn detect_ip_discovery_gc_target(ip_discovery_dir: &Path) -> Option<String> {
 }
 
 #[cfg(any(target_os = "linux", test))]
+/// Build the LLVM gfx target for a GC (Graphics Core) IP version.
+///
+/// The target is `gfx` + major in decimal + minor and revision as **single hex
+/// digits** — `gfx90a` is GC 9.0.**10** (`10 == 0xa`), and `gfx1250` is GC
+/// 12.5.0. Concatenating the components as decimal agrees with hex only while
+/// every component is below 10, so it silently produced `gfx9010` for gfx90a
+/// hardware (MI210/MI250), which then normalized to the wrong TheRock family.
+///
+/// A minor or revision that cannot be a single hex digit does not describe any
+/// gfx target, so it yields `None` rather than a fabricated token: the caller
+/// tries the next detection source and otherwise reports the target as unknown,
+/// which is recoverable with `--family`, where a fabricated one silently
+/// installs the wrong runtime wheel. `major` is only checked for zero — it is
+/// printed in decimal and has no single-digit bound (`gfx1030`, `gfx1250`), so
+/// an implausible major still concatenates into a token.
 fn gfx_target_from_gc_version(major: u32, minor: u32, revision: u32) -> Option<String> {
-    if major == 0 {
+    if major == 0 || minor > 0xf || revision > 0xf {
         return None;
     }
-    Some(format!("gfx{major}{minor}{revision}"))
+    Some(format!("gfx{major}{minor:x}{revision:x}"))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
@@ -6891,6 +6912,42 @@ Class Name:                Display
             gfx_target_from_gc_version(11, 0, 3),
             Some("gfx1103".to_owned())
         );
+        // Two digits of major stay decimal.
+        assert_eq!(
+            gfx_target_from_gc_version(12, 5, 0),
+            Some("gfx1250".to_owned())
+        );
+    }
+
+    #[test]
+    fn gc_version_encodes_components_above_nine_as_hex_digits() {
+        // GC 9.0.10 is gfx90a (MI210/MI250), not "gfx9010": minor and revision
+        // are single hex digits. Decimal concatenation agreed with hex only
+        // while every component stayed below 10.
+        assert_eq!(
+            gfx_target_from_gc_version(9, 0, 10),
+            Some("gfx90a".to_owned())
+        );
+        assert_eq!(
+            gfx_target_from_gc_version(9, 4, 12),
+            Some("gfx94c".to_owned())
+        );
+
+        // A component that is not a single hex digit describes no gfx target,
+        // so detection falls through rather than acting on a fabricated one.
+        assert_eq!(gfx_target_from_gc_version(12, 16, 0), None);
+        assert_eq!(gfx_target_from_gc_version(12, 0, 16), None);
+        assert_eq!(gfx_target_from_gc_version(0, 0, 1), None);
+    }
+
+    #[test]
+    fn gfx90a_gc_version_normalizes_to_its_own_therock_family() {
+        // The point of the fix, end to end: "gfx9010" missed every specific arm
+        // of `normalize_therock_family` and fell through to the loose `gfx90`
+        // one, yielding "gfx90X-dcgpu" — the wrong runtime wheel, and outside
+        // `VLLM_PREFERRED_THEROCK_FAMILIES`, so engine selection changed too.
+        let target = gfx_target_from_gc_version(9, 0, 10).expect("gfx90a target");
+        assert_eq!(normalize_therock_family(&target), Some("gfx90a".to_owned()));
     }
 
     #[test]
@@ -6907,6 +6964,15 @@ Class Name:                Display
             parse_linux_kfd_gfx_target("gfx1103"),
             Some("gfx1103".to_owned())
         );
+        // KFD packs gfx90a as 9·10000 + 0·100 + 10.
+        assert_eq!(
+            parse_linux_kfd_gfx_target("90010"),
+            Some("gfx90a".to_owned())
+        );
+        // A packed version whose components are not single hex digits is not a
+        // target; it must not be passed through as `gfx{digits}`, which used to
+        // normalize to a plausible-looking but wrong family.
+        assert_eq!(parse_linux_kfd_gfx_target("121600"), None);
         assert_eq!(parse_linux_kfd_gfx_target("not-a-target"), None);
     }
 
@@ -6927,6 +6993,15 @@ Class Name:                Display
         assert_eq!(
             detect_ip_discovery_gc_target(&root.join("ip_discovery")),
             Some("gfx1103".to_owned())
+        );
+
+        // The same defect reached this fallback path, not just the KFD one.
+        fs::write(gc.join("major"), "9")?;
+        fs::write(gc.join("minor"), "0")?;
+        fs::write(gc.join("revision"), "10")?;
+        assert_eq!(
+            detect_ip_discovery_gc_target(&root.join("ip_discovery")),
+            Some("gfx90a".to_owned())
         );
         fs::remove_dir_all(root).ok();
         Ok(())
