@@ -8,7 +8,7 @@
 **Pre-PR-check:** passed — claude-opus-4.8 (reviewer agent), 2026-07-23
 **Last Updated:** 2026-07-30
 
-**Token Usage:** in=481 out=110661 cache_create=4573562 cache_read=29653085 calls=243
+**Token Usage:** in=509 out=116543 cache_create=4977785 cache_read=31996026 calls=257
 
 ---
 
