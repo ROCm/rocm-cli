@@ -426,8 +426,14 @@ cargo test -p rocm --bin rocm resolve_endpoint_auth
 cargo test -p rocm --bin rocm endpoint_client_config
 cargo test -p rocm --bin rocm api_key_client_config
 cargo test -p rocm --bin rocm public_bind_fails_closed
+cargo test -p rocm --bin rocm respawn_fails_closed
+cargo test -p rocm --bin rocm respawn_allows_loopback
+cargo test -p rocm --bin rocm restart_refuses_a_public_service
 cargo test -p rocm-core generate_endpoint_api_key
 cargo test -p rocm-engine-protocol endpoint_api_key
+cargo test -p rocm-engine-protocol is_public_bind_host
+cargo test -p rocmd recovery_respawn_fails_closed
+cargo test -p rocmd apply_endpoint_key_env
 ```
 
 A loopback bind (`rocm serve <model>`, default `127.0.0.1`) stays
@@ -441,7 +447,18 @@ audit log. Verifying that the running server actually *rejects* an
 unauthenticated request requires a live engine; that end-to-end assertion is a
 deferred follow-up and is **not yet** exercised by the GPU acceptance scripts
 (`scripts/vllm_therock_gpu_test.py`). The unit tests cover key policy,
-generation, the 0600 key file, key-file resolution, and cleanup on stop.
+generation, the 0600 key file, and key-file resolution.
+
+The same requirement holds across respawns, because the invariant belongs to the
+recorded *host*, not to the key file: a service recorded on a public host refuses
+to respawn once its key is gone, rather than coming back unauthenticated. That
+covers `rocm services restart` and `rocmd`'s recovery supervisor, and the refusal
+happens before anything is stopped, so it cannot take down a running service. A
+stop therefore drops the key only once it has confirmed the engine is gone —
+otherwise the CLI would lock itself out of a service that is still running and
+still enforcing the key — and the deferred cleanup lands on the liveness refresh
+that later observes the process dead. There is no e2e coverage of `services
+stop`/`restart` or endpoint auth; these paths are unit-tested only.
 
 Windows + Lemonade note: the Windows *managed* native-Lemonade server is launched
 via `spawn_hidden_console_with_log`, whose env-override API is path-valued only,

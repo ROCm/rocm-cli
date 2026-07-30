@@ -691,7 +691,7 @@ mod tests {
             "0.0.0.0",
             "::",
             "192.168.1.10",
-            "example.internal",
+            "example.test",
             // Conservative on purpose: an unrecognized spelling of a loopback
             // address is classified public, so it requires a key rather than
             // opening an unauthenticated listener.

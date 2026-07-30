@@ -4720,7 +4720,12 @@ fn spawn_managed_engine_child(
     // environment. A path — not the secret value — is what the detached-spawn
     // primitives accept as an env override, and it keeps the key off both the argv
     // and the environment block. `serve()` wrote the file before spawning.
-    let endpoint_key_file = endpoint_keys::endpoint_key_file_if_present(paths, service_id);
+    // Validity, not mere existence: the engine adapters resolve the key with
+    // `endpoint_api_key_from_file` and enforce nothing when it yields `None`, so
+    // an empty or malformed key file would otherwise satisfy the guard below and
+    // still produce an unauthenticated public listener.
+    let endpoint_key_file = endpoint_keys::endpoint_key_file_if_present(paths, service_id)
+        .filter(|path| rocm_engine_protocol::endpoint_api_key_from_file(path).is_some());
     // `serve()` already resolved and stored the key for a public bind, so this
     // cannot fire on the fresh-launch path today. It is the shared choke point
     // for managed spawns, so enforce the invariant here too rather than relying
@@ -13821,6 +13826,11 @@ fn refresh_managed_service_runtime_liveness(
     let has_tracked_pid = !tracked_pids.is_empty();
     let has_live_pid = tracked_pids.iter().any(|pid| process_is_running(*pid));
     if has_tracked_pid && !has_live_pid {
+        // Confirmed dead, so the endpoint key can finally go. `stop` only drops
+        // it when it could verify termination; this is where an unconfirmed stop
+        // (or a crash) gets its deferred cleanup, so a plaintext secret is not
+        // stranded on disk for a service that no longer exists.
+        endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
         if record.status != "stopped" {
             record.status = "stopped".to_owned();
             return true;
@@ -20825,6 +20835,11 @@ install therock";
             "{error:#}"
         );
 
+        // Proves the *ordering*, not just the refusal: had the guard run after
+        // `stop_internal_managed_service`, the stop would have written
+        // "stopped". It reaches that state here because the record's only pid is
+        // the test's own (`engine_pid` is None and `terminate_recorded_service_pids`
+        // skips the caller's pid), so the stop confirms termination trivially.
         let after = load_managed_service(&paths, service_id).unwrap();
         assert_ne!(
             after.status, "stopped",
