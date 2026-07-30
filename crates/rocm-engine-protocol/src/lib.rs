@@ -543,7 +543,17 @@ pub struct LaunchResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthcheckResponse {
+    /// Engine-reported service state. `ready` is reserved for a service that has
+    /// served inference; an engine whose model is listed but not yet able to
+    /// answer should report `loading`. Do not report `failed`, `unreachable`, or
+    /// `exited` for a model that is merely still coming up — the supervisor
+    /// treats those as recoverable and will restart the service mid-load.
     pub status: String,
+    /// Whether the model can actually serve requests **now**. This must reflect a
+    /// completed inference request, not the model appearing in `/v1/models`: an
+    /// engine typically lists a model within seconds of accepting its name, while
+    /// the weights can take minutes to become usable, and callers wait on this
+    /// field before sending traffic.
     pub model_loaded: bool,
     pub device: String,
     pub uptime_sec: u64,

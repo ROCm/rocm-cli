@@ -747,14 +747,31 @@ fn healthcheck_service(request: HealthcheckRequest) -> Result<HealthcheckRespons
     let model_ref = state
         .as_ref()
         .and_then(|value| value_string(value, "model_ref"));
-    let ready = endpoint_url
+    let listed = endpoint_url
         .as_deref()
         .map(|endpoint| query_loaded_model_endpoint(endpoint, model_ref.as_deref()))
         .transpose()
         .unwrap_or(None)
         .unwrap_or(false);
+    // `/v1/models` lists a model as soon as the server accepts its name, which can
+    // be minutes before the weights are resident. Confirm inference once before
+    // reporting ready.
+    let ready = listed
+        && endpoint_url.as_deref().is_some_and(|endpoint| {
+            inference_verified(
+                &files.state_path,
+                state.as_ref(),
+                endpoint,
+                model_ref.as_deref().unwrap_or_default(),
+            )
+        });
     let status = if ready {
         "ready".to_owned()
+    } else if listed {
+        // Listing but not yet serving. Reported as still coming up rather than as
+        // a failure, so the supervisor lets the model finish loading instead of
+        // restarting it mid-load.
+        "loading".to_owned()
     } else {
         state
             .as_ref()
@@ -1582,6 +1599,62 @@ fn query_loaded_model_endpoint(endpoint_url: &str, model_ref: Option<&str>) -> R
     )
 }
 
+/// Whether the endpoint can actually complete a chat request, as opposed to
+/// merely listing the model.
+fn query_inference_probe_endpoint(endpoint_url: &str, model_ref: &str) -> Result<bool> {
+    if model_ref.trim().is_empty() {
+        return Ok(false);
+    }
+    // Send the endpoint key for the same reason the models query does: a 401 from
+    // a correctly-protected server must not read as "cannot serve".
+    let endpoint_api_key = rocm_engine_protocol::resolve_endpoint_api_key();
+    rocm_core::openai_chat_completion_probe(
+        endpoint_url,
+        model_ref,
+        endpoint_api_key.as_deref(),
+        rocm_core::INFERENCE_PROBE_TIMEOUT,
+    )
+}
+
+/// Whether a real inference request has succeeded against this service, probing
+/// at most once and latching the verdict into the state file.
+///
+/// Readiness is polled repeatedly — by `services list`, the dash, and the
+/// supervisor — so re-probing every time would queue a generation request behind
+/// the user's own traffic. A service that degrades after start therefore keeps
+/// reporting ready, which is no worse than the pre-probe behavior.
+fn inference_verified(
+    state_path: &Path,
+    state: Option<&Value>,
+    endpoint_url: &str,
+    model_ref: &str,
+) -> bool {
+    if state
+        .and_then(|value| value.get(rocm_core::INFERENCE_VERIFIED_STATE_KEY))
+        .and_then(Value::as_u64)
+        .is_some()
+    {
+        return true;
+    }
+    if !query_inference_probe_endpoint(endpoint_url, model_ref).unwrap_or(false) {
+        return false;
+    }
+    let _ = record_inference_verified(state_path);
+    true
+}
+
+fn record_inference_verified(state_path: &Path) -> Result<()> {
+    let mut state = read_service_state(state_path).unwrap_or_else(|_| json!({}));
+    let Some(object) = state.as_object_mut() else {
+        return Ok(());
+    };
+    object.insert(
+        rocm_core::INFERENCE_VERIFIED_STATE_KEY.to_owned(),
+        Value::from(current_unix_millis() as u64),
+    );
+    write_state(state_path, &state)
+}
+
 fn pid_from_state(state: &Value) -> Option<u32> {
     state
         .get("pid")?
@@ -1700,9 +1773,14 @@ fn wait_for_vllm_ready(
             );
         }
 
+        // Listing the model is not enough to hand the endpoint to a caller: vLLM
+        // advertises it well before the first request can be served. Only return
+        // once inference has actually answered.
         match query_loaded_model_endpoint(&endpoint, Some(model_ref)) {
-            Ok(true) => return Ok(()),
-            Ok(false) | Err(_) => std::thread::sleep(poll_interval),
+            Ok(true) if query_inference_probe_endpoint(&endpoint, model_ref).unwrap_or(false) => {
+                return Ok(());
+            }
+            _ => std::thread::sleep(poll_interval),
         }
     }
 }
@@ -1767,6 +1845,113 @@ fn tail_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Answer `count` chat requests on a loopback port with the given status,
+    /// reporting how many arrived.
+    fn spawn_chat_endpoint(
+        status_line: &'static str,
+        count: usize,
+    ) -> (u16, std::thread::JoinHandle<usize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let handle = std::thread::spawn(move || {
+            let mut served = 0;
+            for _ in 0..count {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buffer = [0_u8; 1024];
+                let _ = stream.read(&mut buffer);
+                let body = r#"{"choices":[{"message":{"content":"ok"}}]}"#;
+                let _ = write!(
+                    stream,
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                served += 1;
+            }
+            served
+        });
+        (port, handle)
+    }
+
+    fn probe_state_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "rocm-vllm-probe-{tag}-{}-{}.json",
+            std::process::id(),
+            current_unix_millis()
+        ))
+    }
+
+    #[test]
+    fn inference_verification_latches_into_the_state_file() -> Result<()> {
+        // First check probes and records the verdict; the second reads the latch
+        // and leaves the model alone.
+        let (port, server) = spawn_chat_endpoint("HTTP/1.1 200 OK", 1);
+        let state_path = probe_state_path("latch");
+        write_state(&state_path, &json!({"status": "running"}))?;
+        let endpoint = endpoint_url("127.0.0.1", port);
+
+        let state = read_service_state(&state_path).ok();
+        assert!(inference_verified(
+            &state_path,
+            state.as_ref(),
+            &endpoint,
+            "facebook/opt-125m"
+        ));
+
+        let state = read_service_state(&state_path)?;
+        assert!(
+            state
+                .get(rocm_core::INFERENCE_VERIFIED_STATE_KEY)
+                .and_then(Value::as_u64)
+                .is_some(),
+            "a passing probe is latched so later healthchecks skip it"
+        );
+        assert!(inference_verified(
+            &state_path,
+            Some(&state),
+            &endpoint,
+            "facebook/opt-125m"
+        ));
+
+        assert_eq!(
+            server.join().expect("server thread"),
+            1,
+            "the latched check must not send a second inference request"
+        );
+        fs::remove_file(&state_path).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn inference_verification_withheld_while_the_model_is_still_loading() -> Result<()> {
+        // The reported failure: `/v1/models` answers but inference does not.
+        let (port, server) = spawn_chat_endpoint("HTTP/1.1 503 Service Unavailable", 1);
+        let state_path = probe_state_path("loading");
+        write_state(&state_path, &json!({"status": "running"}))?;
+        let endpoint = endpoint_url("127.0.0.1", port);
+
+        let state = read_service_state(&state_path).ok();
+        assert!(!inference_verified(
+            &state_path,
+            state.as_ref(),
+            &endpoint,
+            "facebook/opt-125m"
+        ));
+        assert!(
+            read_service_state(&state_path)?
+                .get(rocm_core::INFERENCE_VERIFIED_STATE_KEY)
+                .is_none(),
+            "nothing is latched until inference actually answers"
+        );
+
+        server.join().expect("server thread");
+        fs::remove_file(&state_path).ok();
+        Ok(())
+    }
 
     fn test_engine_recipe(engine: &str, contract_version: &str) -> EngineRecipeHint {
         EngineRecipeHint {

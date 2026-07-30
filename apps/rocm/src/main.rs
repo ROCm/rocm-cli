@@ -26,7 +26,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use rocm_core::{
     AppPaths, AuditEventRecord, AutomationEventRecord, AutomationProposalRecord,
     AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot,
-    DEFAULT_LOCAL_HOST, ExamineSummary, ManagedServiceRecord, ModelRecipeRecord,
+    DEFAULT_LOCAL_HOST, EndpointReadiness, ExamineSummary, ManagedServiceRecord, ModelRecipeRecord,
     ModelRecipeRegistry, ModelRecipeRegistrySource, PERMISSIONS_MODE_ASK,
     PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF,
     WatcherMode, append_audit_event, builtin_model_recipes, builtin_watcher, builtin_watchers,
@@ -35,7 +35,7 @@ use rocm_core::{
     engine_binary_path, engine_plugin_dirs, format_host_port, format_http_base_url,
     generate_service_id, interactive_terminal, load_model_recipe_registry,
     load_recent_audit_events, load_recent_automation_events, load_recent_automation_proposals,
-    managed_pip_cache_dir, managed_service_endpoint_model_ready, model_artifact_cache_status,
+    managed_pip_cache_dir, managed_service_endpoint_readiness, model_artifact_cache_status,
     model_catalog_platforms, model_recipe_featured, model_recipe_target_platform_label,
     normalize_therock_family, platform_matches_gfx_family,
     preferred_serve_engine_for_host_gpu_summary, prepend_runtime_path, process_is_running,
@@ -4831,7 +4831,13 @@ fn start_managed_service(
         Duration::from_secs(45),
         on_wait_tick,
     );
-    record.status = if readiness { "ready" } else { "starting" }.to_owned();
+    let launch_status = status_for_readiness(readiness);
+    record.status = launch_status.to_owned();
+    if readiness == EndpointReadiness::Serving {
+        // Latch the verification the wait just performed, so the readiness checks
+        // behind `services list` and chat read it instead of re-probing.
+        record.inference_verified_at_unix_ms = Some(rocm_core::unix_time_millis() as u64);
+    }
     record.write()?;
     let endpoint_url = format!("{}/v1", format_http_base_url(host, port));
     record_cli_audit_event(
@@ -4841,17 +4847,14 @@ fn start_managed_service(
         "info",
         format!(
             "launched managed service engine={} model={} endpoint={} readiness={}",
-            engine,
-            resolve.canonical_model_id,
-            endpoint_url,
-            if readiness { "ready" } else { "starting" }
+            engine, resolve.canonical_model_id, endpoint_url, launch_status
         ),
         Some(service_id),
     );
     Ok(ManagedLaunchReport {
         service_id: service_id.to_owned(),
         endpoint_url,
-        status: if readiness { "ready" } else { "starting" }.to_owned(),
+        status: launch_status.to_owned(),
         already_running: false,
         child_pid: Some(child_pid),
         log_path: Some(record.log_path),
@@ -13023,20 +13026,22 @@ fn restart_internal_managed_service(
     record.engine_pid = Some(child_pid);
     // Refresh the identity token in lockstep with the restarted child's PID.
     record.supervisor_start_ticks = rocm_core::process_start_ticks(child_pid);
-    record.restart_count = record.restart_count.saturating_add(1);
-    record.last_restart_unix_ms = Some(rocm_core::unix_time_millis());
-    record.status = if wait_for_service_http_ready(
+    // Counts the restart and drops the previous run's inference verification —
+    // the new child has an unloaded model, so the old verdict says nothing about
+    // it.
+    record.reset_for_restart();
+    let readiness = wait_for_service_http_ready(
         &record.engine,
         &record.host,
         record.port,
         &record.canonical_model_id,
         endpoint_api_key.as_deref(),
         Duration::from_secs(45),
-    ) {
-        "ready".to_owned()
-    } else {
-        "starting".to_owned()
-    };
+    );
+    record.status = status_for_readiness(readiness).to_owned();
+    if readiness == EndpointReadiness::Serving {
+        record.inference_verified_at_unix_ms = Some(rocm_core::unix_time_millis() as u64);
+    }
     record.write()?;
     Ok(record)
 }
@@ -13859,20 +13864,34 @@ fn refresh_managed_service_runtime_liveness(
     // Probe with the service's key so a protected public service is not mistaken
     // for dead (an anonymous /v1/models would 401).
     let endpoint_api_key = endpoint_keys::endpoint_api_key(paths, &record.service_id);
-    let endpoint_ready = matches!(record.status.as_str(), "ready" | "running")
-        && managed_service_endpoint_model_ready(
+    let was_verified = record.inference_verified_at_unix_ms.is_some();
+    let readiness = if matches!(record.status.as_str(), "ready" | "running") {
+        managed_service_endpoint_readiness(
             record,
             endpoint_api_key.as_deref(),
             SERVICE_LIVENESS_CHECK_TIMEOUT,
+            rocm_core::INFERENCE_PROBE_TIMEOUT,
         )
-        .unwrap_or(false);
-    if endpoint_ready {
+    } else {
+        EndpointReadiness::Unreachable
+    };
+    if readiness == EndpointReadiness::Serving {
         // Mirror `providers.rs::ready_local_services()`: a live, probe-passing
         // service should be persisted as "ready", not left stuck at "running".
         if record.status == "running" {
             record.status = "ready".to_owned();
             return true;
         }
+        // A newly latched verification is itself worth persisting, so the next
+        // check reads it instead of sending another inference request.
+        return settled_pending_stop || !was_verified;
+    }
+    if readiness == EndpointReadiness::Listing {
+        // The server is up and advertising the model; the weights are simply not
+        // usable yet. Leave the status alone rather than demoting to "starting" —
+        // `rocmd` restarts a service that sits in "starting" past its stale
+        // window, which for a slow-loading model would restart it mid-load and
+        // begin the wait all over again.
         return settled_pending_stop;
     }
 
@@ -16170,7 +16189,7 @@ fn wait_for_service_http_ready(
     canonical_model_id: &str,
     endpoint_api_key: Option<&str>,
     timeout: Duration,
-) -> bool {
+) -> EndpointReadiness {
     wait_for_service_http_ready_with_progress(
         engine,
         host,
@@ -16188,6 +16207,13 @@ fn wait_for_service_http_ready(
 /// each engine to the right health path and normalizes the response to ready/not.
 /// `endpoint_api_key` is sent as a bearer token so the probe still succeeds against
 /// a public endpoint that now requires authentication.
+/// Wait until the service can actually serve, reporting how far it got.
+///
+/// A health or model-listing endpoint answering is not enough to call a service
+/// ready: engines advertise a model within seconds of accepting its name, while
+/// the weights can take minutes to become usable, so a caller that sends its
+/// first request on that signal gets a hang. Only [`EndpointReadiness::Serving`]
+/// — an inference request that came back — means ready.
 fn wait_for_service_http_ready_with_progress(
     engine: &str,
     host: &str,
@@ -16196,30 +16222,59 @@ fn wait_for_service_http_ready_with_progress(
     endpoint_api_key: Option<&str>,
     timeout: Duration,
     on_tick: &mut dyn FnMut(Duration),
-) -> bool {
+) -> EndpointReadiness {
     let start = std::time::Instant::now();
+    let endpoint = format_http_base_url(host, port);
+    let mut best = EndpointReadiness::Unreachable;
     while start.elapsed() < timeout {
-        for path in service_http_readiness_paths(engine) {
-            if let Ok((status, body)) = http_get_local_service(
+        let listed = service_http_readiness_paths(engine).iter().any(|path| {
+            http_get_local_service(
                 host,
                 port,
                 path,
                 endpoint_api_key,
                 Duration::from_millis(750),
-            ) && service_http_readiness_response_ready(
-                engine,
-                path,
-                status,
-                &body,
+            )
+            .is_ok_and(|(status, body)| {
+                service_http_readiness_response_ready(
+                    engine,
+                    path,
+                    status,
+                    &body,
+                    canonical_model_id,
+                )
+            })
+        });
+        if listed {
+            best = EndpointReadiness::Listing;
+            if rocm_core::openai_chat_completion_probe(
+                &endpoint,
                 canonical_model_id,
-            ) {
-                return true;
+                endpoint_api_key,
+                rocm_core::INFERENCE_PROBE_TIMEOUT,
+            )
+            .unwrap_or(false)
+            {
+                return EndpointReadiness::Serving;
             }
         }
         on_tick(start.elapsed());
         thread::sleep(Duration::from_millis(250));
     }
-    false
+    best
+}
+
+/// The record status matching how far the endpoint got.
+///
+/// `Listing` maps to `running`, not `starting`: the engine is up and loading
+/// normally, and `rocmd` restarts a service left in `starting` past its stale
+/// window, which would kill a slow-loading model mid-load.
+const fn status_for_readiness(readiness: EndpointReadiness) -> &'static str {
+    match readiness {
+        EndpointReadiness::Serving => "ready",
+        EndpointReadiness::Listing => "running",
+        EndpointReadiness::Unreachable => "starting",
+    }
 }
 
 fn service_http_readiness_paths(engine: &str) -> &'static [&'static str] {
@@ -17057,17 +17112,199 @@ mod tests {
     }
 
     #[test]
+    fn serve_readiness_wait_withholds_ready_while_the_model_only_lists() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // This is the wait behind `rocm serve`, and its verdict is what
+        // `services list` later prints. A model listing on `/v1/models` while
+        // inference still fails must come back as `Listing` — reporting it ready
+        // is the false positive users and automation trip over.
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        let server = thread::spawn(move || -> Result<()> {
+            // Serve until the wait below gives up and the test drops the socket.
+            while let Ok((mut stream, _)) = listener.accept() {
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buffer = [0_u8; 1024];
+                let Ok(read) = stream.read(&mut buffer) else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                let (status_line, body) = if request.starts_with("POST /v1/chat/completions ") {
+                    ("HTTP/1.1 503 Service Unavailable", r#"{"error":"loading"}"#)
+                } else {
+                    ("HTTP/1.1 200 OK", r#"{"data":[{"id":"Qwen3-0.6B-GGUF"}]}"#)
+                };
+                let _ = write!(
+                    stream,
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+            Ok(())
+        });
+
+        let readiness = wait_for_service_http_ready(
+            "vllm",
+            "127.0.0.1",
+            port,
+            "Qwen3-0.6B-GGUF",
+            None,
+            Duration::from_millis(600),
+        );
+
+        assert_eq!(
+            readiness,
+            EndpointReadiness::Listing,
+            "a listed-but-unservable model is not ready"
+        );
+        assert_eq!(
+            status_for_readiness(readiness),
+            "running",
+            "a loading service must not be recorded as `starting`, which rocmd \
+             restarts once stale"
+        );
+        drop(server);
+        Ok(())
+    }
+
+    #[test]
+    fn serve_readiness_wait_reports_ready_once_inference_answers() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        let server = thread::spawn(move || -> Result<()> {
+            while let Ok((mut stream, _)) = listener.accept() {
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buffer = [0_u8; 1024];
+                let Ok(read) = stream.read(&mut buffer) else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                let body = if request.starts_with("POST /v1/chat/completions ") {
+                    r#"{"choices":[{"message":{"content":"ok"}}]}"#
+                } else {
+                    r#"{"data":[{"id":"Qwen3-0.6B-GGUF"}]}"#
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+            Ok(())
+        });
+
+        let readiness = wait_for_service_http_ready(
+            "vllm",
+            "127.0.0.1",
+            port,
+            "Qwen3-0.6B-GGUF",
+            None,
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(readiness, EndpointReadiness::Serving);
+        assert_eq!(status_for_readiness(readiness), "ready");
+        drop(server);
+        Ok(())
+    }
+
+    #[test]
+    fn a_loading_service_keeps_its_status_instead_of_being_demoted() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // A model that is listed but cannot serve yet is coming up normally. It
+        // must not be demoted to "starting": `rocmd` restarts a service that sits
+        // in "starting" past its stale window, which would kill a slow-loading
+        // model mid-load and start the wait over.
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        let server = thread::spawn(move || -> Result<()> {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buffer = [0_u8; 1024];
+                let read = stream.read(&mut buffer)?;
+                let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                if request.starts_with("POST /v1/chat/completions ") {
+                    let body = r#"{"error":"loading model"}"#;
+                    write!(
+                        stream,
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )?;
+                } else {
+                    let body = r#"{"data":[{"id":"Qwen3-0.6B-GGUF"}]}"#;
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )?;
+                }
+            }
+            Ok(())
+        });
+
+        let (root, paths) = test_paths("liveness-loading-service");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-loading",
+            "vllm",
+            "Qwen3-0.6B-GGUF",
+            "Qwen3-0.6B-GGUF",
+            "127.0.0.1",
+            port,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = "running".to_owned();
+        record.write()?;
+
+        let changed = refresh_managed_service_runtime_liveness(&paths, &mut record);
+
+        assert!(!changed, "a service that is still loading is not a change");
+        assert_eq!(
+            record.status, "running",
+            "a loading service keeps its status rather than being demoted"
+        );
+        assert!(
+            record.inference_verified_at_unix_ms.is_none(),
+            "nothing is latched until inference actually answers"
+        );
+
+        drop(server);
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
     fn load_managed_services_promotes_running_to_ready_once_probe_passes() -> Result<()> {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let port = listener.local_addr()?.port();
-        // Two probes hit this mock: one from `load_managed_services`, another
-        // from the `load_managed_service` re-read below that verifies the
-        // promotion was actually persisted, not just returned in-memory.
-        let server = thread::spawn(move || -> Result<()> {
-            for _ in 0..2 {
+        // Three requests hit this mock. `load_managed_services` lists the model
+        // and then confirms inference, which promotes the record and latches the
+        // verification; the `load_managed_service` re-read below (which proves the
+        // promotion was persisted, not just returned in-memory) reads that latch
+        // and so only re-lists.
+        let server = thread::spawn(move || -> Result<Vec<String>> {
+            let mut requests = Vec::new();
+            for _ in 0..3 {
                 let (mut stream, _) = listener.accept()?;
                 stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
                 let mut request_bytes = Vec::new();
@@ -17082,15 +17319,21 @@ mod tests {
                         break;
                     }
                 }
-                let body = r#"{"data":[{"id":"Qwen3-0.6B-GGUF"}]}"#;
+                let request = String::from_utf8_lossy(&request_bytes).into_owned();
+                let body = if request.starts_with("POST /v1/chat/completions ") {
+                    r#"{"choices":[{"message":{"content":"ok"}}]}"#
+                } else {
+                    r#"{"data":[{"id":"Qwen3-0.6B-GGUF"}]}"#
+                };
                 write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 )?;
+                requests.push(request);
             }
-            Ok(())
+            Ok(requests)
         });
 
         let (root, paths) = test_paths("load-managed-services-promote-ready");
@@ -17136,8 +17379,25 @@ mod tests {
         // in-memory, since chat's `pick_managed_chat_endpoint` re-reads it.
         let reloaded = load_managed_service(&paths, "svc-qwen-promote")?;
         assert_eq!(reloaded.status, "ready");
+        assert!(
+            reloaded.inference_verified_at_unix_ms.is_some(),
+            "the inference verification is persisted with the promotion"
+        );
 
-        server.join().expect("server thread should not panic")?;
+        let requests = server.join().expect("server thread should not panic")?;
+        let lines: Vec<&str> = requests
+            .iter()
+            .filter_map(|request| request.lines().next())
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "GET /v1/models HTTP/1.1",
+                "POST /v1/chat/completions HTTP/1.1",
+                "GET /v1/models HTTP/1.1",
+            ],
+            "promotion confirms inference once; the re-read reads the latch"
+        );
         fs::remove_dir_all(root).ok();
         Ok(())
     }
@@ -20253,18 +20513,27 @@ install therock";
         paths.ensure()?;
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let ready_port = listener.local_addr()?.port();
+        // The ready service is listed and then asked to complete a request:
+        // readiness is not granted on the model listing alone.
         let server = thread::spawn(move || -> Result<()> {
-            let (mut stream, _) = listener.accept()?;
-            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-            let mut request = [0_u8; 512];
-            let _ = stream.read(&mut request)?;
-            let body = r#"{"data":[{"id":"Qwen/Qwen3.5"}]}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )?;
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                let mut request = [0_u8; 512];
+                let read = stream.read(&mut request)?;
+                let request = String::from_utf8_lossy(&request[..read]).into_owned();
+                let body = if request.starts_with("POST /v1/chat/completions ") {
+                    r#"{"choices":[{"message":{"content":"ok"}}]}"#
+                } else {
+                    r#"{"data":[{"id":"Qwen/Qwen3.5"}]}"#
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )?;
+            }
             Ok(())
         });
         let current_pid = std::process::id();

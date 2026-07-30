@@ -7048,6 +7048,29 @@ mod tests {
 
         response.status = "loading_model".to_owned();
         assert!(!healthcheck_response_recoverable(&response));
+
+        // The status the engines report for a model that is listed but has not
+        // yet served an inference request. Restarting it would kill a model
+        // mid-load and start the wait over.
+        response.status = "loading".to_owned();
+        assert!(!healthcheck_response_recoverable(&response));
+    }
+
+    #[test]
+    fn healthcheck_readiness_withheld_while_the_model_only_lists() {
+        // What an engine reports once `/v1/models` answers but inference has not:
+        // not ready, so `rocm serve` keeps waiting instead of handing the caller
+        // an endpoint that will hang on its first request.
+        let listing_only = HealthcheckResponse {
+            status: "loading".to_owned(),
+            model_loaded: false,
+            device: "unknown".to_owned(),
+            uptime_sec: 1,
+            queue_depth: 0,
+            last_error: None,
+            tokens_per_sec: None,
+        };
+        assert!(!healthcheck_response_ready(&listing_only));
     }
 
     #[test]

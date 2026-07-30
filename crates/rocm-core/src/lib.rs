@@ -190,6 +190,125 @@ pub fn http_get_text_with_auth(
     Ok(body.to_owned())
 }
 
+/// POST a JSON body and return the response status line plus body.
+///
+/// The POST sibling of [`http_get_text_with_auth`]. Unlike the GET helper this
+/// does not treat a non-200 as an error: callers that probe an endpoint need to
+/// tell "the server answered, with a refusal" apart from "the server never
+/// answered", and only the former proves the request path is alive.
+pub fn http_post_json_with_auth(
+    endpoint_url: &str,
+    path: &str,
+    body: &serde_json::Value,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<HttpResponseParts> {
+    let (host, port) = parse_http_endpoint(endpoint_url)
+        .with_context(|| format!("unsupported endpoint URL `{endpoint_url}`"))?;
+    let mut stream = connect_tcp_stream(&host, port, timeout)?;
+    let host_header = format_host_port(&host, port);
+    let auth_header = match endpoint_api_key {
+        Some(key) => format!("Authorization: Bearer {key}\r\n"),
+        None => String::new(),
+    };
+    let payload = serde_json::to_string(body).context("failed to serialize HTTP JSON body")?;
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\n{auth_header}Connection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    write_all_tcp_stream(&mut stream, request.as_bytes())
+        .with_context(|| format!("failed to write HTTP POST {path}"))?;
+    let response = read_tcp_stream_to_string(&mut stream)
+        .with_context(|| format!("failed to read HTTP POST {path}"))?;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .context("HTTP response was missing a body")?;
+    let status_line = headers.lines().next().unwrap_or_default();
+    let status = http_status_code(status_line)
+        .with_context(|| format!("unparsable HTTP status line `{status_line}`"))?;
+    Ok(HttpResponseParts {
+        status,
+        body: body.to_owned(),
+    })
+}
+
+/// Budget for the single-token chat request that proves a service can serve.
+///
+/// Generously longer than a model-listing timeout: the probe is a real inference
+/// request, and a first request against a freshly loaded model pays for prompt
+/// processing before it answers.
+pub const INFERENCE_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Engine state-file key recording when inference was first confirmed.
+///
+/// Written by the engine healthchecks and adopted by
+/// [`ManagedServiceRecord::refresh_from_engine_state`], so the CLI side does not
+/// re-probe what an engine already verified.
+pub const INFERENCE_VERIFIED_STATE_KEY: &str = "inference_verified_at_unix_ms";
+
+/// The parts of an HTTP response a probe needs: the status code and the body.
+#[derive(Debug, Clone)]
+pub struct HttpResponseParts {
+    pub status: u16,
+    pub body: String,
+}
+
+fn http_status_code(status_line: &str) -> Option<u16> {
+    status_line.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Ask the endpoint for a single token and report whether it answered.
+///
+/// This is the readiness signal that `/v1/models` cannot give: an engine lists a
+/// model as soon as it accepts the name, which can be minutes before the weights
+/// are resident and the first chat request stops hanging.
+///
+/// "Answered" means a complete HTTP response with a status below 500, not a
+/// successful generation. A `4xx` still proves the inference path is up and the
+/// model is loaded — the request was understood and refused on its merits — while
+/// the failure this guards against is a hang, a dropped connection, or the `5xx`
+/// an engine returns while it is still warming up. Insisting on `200` with
+/// non-empty content would also wrongly fail a reasoning model, which can spend
+/// its whole (tiny) token budget before emitting any content.
+pub fn openai_chat_completion_probe(
+    endpoint_url: &str,
+    model_ref: &str,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<bool> {
+    let status = openai_chat_completion_status(endpoint_url, model_ref, endpoint_api_key, timeout)?;
+    Ok(status < 500)
+}
+
+/// Send the smallest possible chat request and return the HTTP status.
+///
+/// Callers pick their own bar. Readiness ([`openai_chat_completion_probe`]) only
+/// needs to know the inference path answers at all, while a post-load smoke test
+/// wants a real `200` — there, a `4xx` means the model that came up is not the
+/// one that was asked for, which is a failure worth surfacing rather than
+/// tolerating.
+pub fn openai_chat_completion_status(
+    endpoint_url: &str,
+    model_ref: &str,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<u16> {
+    let body = serde_json::json!({
+        "model": model_ref,
+        "messages": [{"role": "user", "content": "Say ok."}],
+        "max_tokens": 2,
+        "stream": false,
+    });
+    let response = http_post_json_with_auth(
+        endpoint_url,
+        "/v1/chat/completions",
+        &body,
+        endpoint_api_key,
+        timeout,
+    )?;
+    Ok(response.status)
+}
+
 pub fn openai_models_endpoint_has_model(
     endpoint_url: &str,
     expected_model: Option<&str>,
@@ -227,6 +346,70 @@ pub fn managed_service_endpoint_model_ready(
         None
     };
     openai_models_endpoint_has_model(&record.endpoint_url, expected, endpoint_api_key, timeout)
+}
+
+/// How far along a managed service's endpoint is.
+///
+/// The middle state is the one that matters: an engine lists a model within
+/// seconds of accepting its name, while the weights can take minutes to become
+/// usable. Callers must not treat `Listing` as ready — nor as dead, since the
+/// service is coming up normally and restarting it would start the wait over.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum EndpointReadiness {
+    /// Not answering at all: wrong port, process gone, or nothing bound yet.
+    Unreachable,
+    /// Answering and advertising the model, but inference has not come back.
+    Listing,
+    /// A real inference request has succeeded.
+    Serving,
+}
+
+/// How far along the service's endpoint is, probing inference at most once.
+///
+/// Stronger than [`managed_service_endpoint_model_ready`], which only asks
+/// whether the endpoint lists the model. A service reaches [`Serving`] once a
+/// real inference request has come back, and that verdict is **latched** into
+/// `record.inference_verified_at_unix_ms`: readiness is polled repeatedly (by
+/// `services list`, the dash, and the supervisor), and re-probing on every poll
+/// would queue a generation request behind the user's own traffic. The trade-off
+/// is that a service which degrades after start still reports ready — the same
+/// as before this check existed.
+///
+/// Mutates `record` on first success; the caller is responsible for persisting it
+/// with [`ManagedServiceRecord::write`].
+///
+/// [`Serving`]: EndpointReadiness::Serving
+pub fn managed_service_endpoint_readiness(
+    record: &mut ManagedServiceRecord,
+    endpoint_api_key: Option<&str>,
+    listing_timeout: Duration,
+    probe_timeout: Duration,
+) -> EndpointReadiness {
+    let listed = managed_service_endpoint_model_ready(record, endpoint_api_key, listing_timeout)
+        .unwrap_or(false);
+    if !listed {
+        return EndpointReadiness::Unreachable;
+    }
+    if record.inference_verified_at_unix_ms.is_some() {
+        return EndpointReadiness::Serving;
+    }
+    let model_ref = if record.canonical_model_id.trim().is_empty() {
+        record.model_ref.as_str()
+    } else {
+        record.canonical_model_id.as_str()
+    };
+    if !openai_chat_completion_probe(
+        &record.endpoint_url,
+        model_ref,
+        endpoint_api_key,
+        probe_timeout,
+    )
+    .unwrap_or(false)
+    {
+        return EndpointReadiness::Listing;
+    }
+    record.inference_verified_at_unix_ms = Some(unix_time_millis() as u64);
+    EndpointReadiness::Serving
 }
 
 fn openai_loaded_model_ids(value: &serde_json::Value) -> Vec<String> {
@@ -306,8 +489,11 @@ pub fn connect_tcp_stream(host: &str, port: u16, timeout: Duration) -> Result<Tc
         .with_context(|| format!("failed to resolve {host}:{port}"))?
         .next()
         .with_context(|| format!("no socket addresses resolved for {host}:{port}"))?;
-    let stream =
-        TcpStream::connect(addr).with_context(|| format!("failed to connect to {host}:{port}"))?;
+    // Bound the connect as well as the reads: a probe against an engine that is
+    // pinned solid must fail within the caller's timeout, not sit in the OS
+    // default SYN retry window.
+    let stream = TcpStream::connect_timeout(&addr, timeout)
+        .with_context(|| format!("failed to connect to {host}:{port}"))?;
     stream.set_read_timeout(Some(timeout)).ok();
     stream.set_write_timeout(Some(timeout)).ok();
     Ok(stream)
@@ -5836,6 +6022,13 @@ pub struct ManagedServiceRecord {
     /// the service reaches `ready`, and absent on older on-disk records.
     #[serde(default)]
     pub startup_phase: Option<String>,
+    /// When a real inference request first succeeded against this service. Once
+    /// set, readiness checks stop re-probing and fall back to the cheap endpoint
+    /// query — see [`managed_service_endpoint_readiness`]. Adopted from the
+    /// engine state file when present, and absent on records written before
+    /// readiness was gated on inference.
+    #[serde(default)]
+    pub inference_verified_at_unix_ms: Option<u64>,
     pub manifest_path: PathBuf,
     pub log_path: PathBuf,
     pub engine_state_path: PathBuf,
@@ -5887,11 +6080,28 @@ impl ManagedServiceRecord {
             last_restart_unix_ms: None,
             stop_requested_unix_ms: None,
             startup_phase: None,
+            inference_verified_at_unix_ms: None,
             manifest_path,
             log_path,
             engine_state_path,
             created_at_unix_ms: unix_time_millis(),
         }
+    }
+
+    /// Drop the per-run state that a restart invalidates, and count the restart.
+    ///
+    /// A restart reuses this manifest but spawns a different server with an
+    /// unloaded model, so anything describing the previous run has to go. Chiefly
+    /// the inference verification: left set, it short-circuits readiness straight
+    /// back to "ready" as soon as the new server lists the model, reinstating the
+    /// false positive the probe exists to prevent. The engine's own state file is
+    /// rewritten from scratch on restart, so only this copy needs clearing — and
+    /// [`Self::refresh_from_engine_state`] only ever adopts a verification, never
+    /// clears one, so a stale value here would survive indefinitely.
+    pub fn reset_for_restart(&mut self) {
+        self.inference_verified_at_unix_ms = None;
+        self.restart_count = self.restart_count.saturating_add(1);
+        self.last_restart_unix_ms = Some(unix_time_millis());
     }
 
     pub fn normalize_paths_for_host(&mut self) {
@@ -5965,6 +6175,15 @@ impl ManagedServiceRecord {
         {
             self.engine_pid = Some(pid);
             self.engine_start_ticks = state.get(ticks_key).and_then(serde_json::Value::as_u64);
+        }
+        // Adopt the engine's inference verification so the CLI side does not
+        // re-probe a service the engine healthcheck already confirmed.
+        if self.inference_verified_at_unix_ms.is_none()
+            && let Some(verified_at) = state
+                .get(INFERENCE_VERIFIED_STATE_KEY)
+                .and_then(serde_json::Value::as_u64)
+        {
+            self.inference_verified_at_unix_ms = Some(verified_at);
         }
         Ok(self.status != previous)
     }
@@ -6502,15 +6721,13 @@ mod tests {
         Ok(())
     }
 
-    // EAI-7333: the service healthcheck marks a model "ready" purely from
-    // `/v1/models` listing it (via `openai_models_endpoint_has_model`), without
-    // verifying inference. This test pins that gap: a server that lists the model
-    // on `/v1/models` but is NOT able to serve `/v1/chat/completions` still
-    // reports the model as present. The readiness signal is therefore a false
-    // positive for inference-readiness — a caller must additionally probe
-    // inference before treating a service as usable. When EAI-7333 is fixed
-    // (readiness gated on an inference probe, not just `/v1/models`), the
-    // healthcheck path should no longer rely on this signal alone.
+    // Why readiness is gated on an inference probe (EAI-7333): a server that
+    // lists the model on `/v1/models` but cannot yet serve
+    // `/v1/chat/completions` still reports the model as present. This test pins
+    // that `openai_models_endpoint_has_model` alone is a false positive for
+    // inference-readiness, which is why callers must additionally probe
+    // inference — see `openai_chat_completion_probe` and
+    // `managed_service_endpoint_readiness`.
     #[test]
     fn models_endpoint_readiness_does_not_imply_inference_ready() -> Result<()> {
         // A server that answers `/v1/models` with the model listed, but would
@@ -6552,6 +6769,298 @@ mod tests {
         // models response and closed, so a chat request would not succeed.
         // Readiness based on this signal alone is a false positive (EAI-7333).
         server.join().expect("server thread should not panic")?;
+        Ok(())
+    }
+
+    /// Serve `count` canned HTTP responses on a loopback port, returning the port
+    /// and a handle yielding the requests that were received. Each response is
+    /// `(status_line, body)`; a `None` response accepts the connection and never
+    /// answers, standing in for an engine that hangs.
+    fn spawn_canned_http_server(
+        responses: Vec<Option<(&'static str, &'static str)>>,
+    ) -> Result<(u16, std::thread::JoinHandle<Result<Vec<String>>>)> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let handle = std::thread::spawn(move || -> Result<Vec<String>> {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut request_bytes = Vec::new();
+                let mut buffer = [0_u8; 512];
+                while let Ok(read) = stream.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    request_bytes.extend_from_slice(&buffer[..read]);
+                    let text = String::from_utf8_lossy(&request_bytes);
+                    // Requests with a body (POST) are complete once the declared
+                    // content length has arrived after the header terminator.
+                    if let Some((headers, body)) = text.split_once("\r\n\r\n") {
+                        let declared = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("Content-Length: ")?.trim().parse().ok()
+                            })
+                            .unwrap_or(0_usize);
+                        if body.len() >= declared {
+                            break;
+                        }
+                    }
+                }
+                requests.push(String::from_utf8_lossy(&request_bytes).into_owned());
+                let Some((status_line, body)) = response else {
+                    // Hang: hold the connection open without answering until the
+                    // client's read timeout fires, then drop it.
+                    std::thread::sleep(Duration::from_millis(1500));
+                    continue;
+                };
+                write!(
+                    stream,
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )?;
+            }
+            Ok(requests)
+        });
+        Ok((port, handle))
+    }
+
+    const CHAT_OK_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#;
+    const MODELS_OK_BODY: &str = r#"{"data":[{"id":"Qwen/Qwen3-0.6B"}]}"#;
+
+    #[test]
+    fn chat_completion_probe_passes_when_the_endpoint_answers() -> Result<()> {
+        let (port, server) =
+            spawn_canned_http_server(vec![Some(("HTTP/1.1 200 OK", CHAT_OK_BODY))])?;
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        assert!(openai_chat_completion_probe(
+            &endpoint,
+            "Qwen/Qwen3-0.6B",
+            None,
+            Duration::from_secs(2)
+        )?);
+
+        let requests = server.join().expect("server thread should not panic")?;
+        let request = requests.first().expect("the probe sends one request");
+        assert!(
+            request.starts_with("POST /v1/chat/completions HTTP/1.1"),
+            "probe must exercise the inference path, got: {request}"
+        );
+        assert!(
+            request.contains("\"model\":\"Qwen/Qwen3-0.6B\"") && request.contains("\"max_tokens\""),
+            "probe asks the served model for a token-capped completion, got: {request}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn chat_completion_probe_separates_a_refusal_from_a_warmup_failure() -> Result<()> {
+        // A refusal proves the inference path is up and the model is resident:
+        // the request was understood and rejected on its merits. A 5xx is what an
+        // engine returns while it is still warming up, which is not ready.
+        let (port, server) = spawn_canned_http_server(vec![
+            Some(("HTTP/1.1 400 Bad Request", r#"{"error":"unsupported"}"#)),
+            Some((
+                "HTTP/1.1 503 Service Unavailable",
+                r#"{"error":"loading model"}"#,
+            )),
+        ])?;
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        assert!(openai_chat_completion_probe(
+            &endpoint,
+            "qwen",
+            None,
+            Duration::from_secs(2)
+        )?);
+        assert!(!openai_chat_completion_probe(
+            &endpoint,
+            "qwen",
+            None,
+            Duration::from_secs(2)
+        )?);
+
+        server.join().expect("server thread should not panic")?;
+        Ok(())
+    }
+
+    #[test]
+    fn chat_completion_probe_fails_on_a_hung_endpoint() -> Result<()> {
+        // The reported symptom: the endpoint accepts the connection and never
+        // answers. The probe must give up within its timeout, not wait forever.
+        let (port, server) = spawn_canned_http_server(vec![None])?;
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        let started = Instant::now();
+        assert!(
+            openai_chat_completion_probe(&endpoint, "qwen", None, Duration::from_millis(300))
+                .is_err(),
+            "a hung endpoint is not inference-ready"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the probe must be bounded by its timeout"
+        );
+
+        server.join().expect("server thread should not panic")?;
+        Ok(())
+    }
+
+    fn probe_test_record(port: u16) -> ManagedServiceRecord {
+        let root = PathBuf::from("/tmp/rocm-inference-probe-test");
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        ManagedServiceRecord::new(
+            &paths,
+            "svc-probe",
+            "vllm",
+            "Qwen/Qwen3-0.6B",
+            "Qwen/Qwen3-0.6B",
+            "127.0.0.1",
+            port,
+            "serve",
+            4242,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn inference_readiness_latches_after_the_first_successful_probe() -> Result<()> {
+        // First check: list the model, then probe inference. Second check: the
+        // verdict is latched, so only the cheap listing is re-issued — repeated
+        // `services list` polls must not queue generation work behind real
+        // traffic.
+        let (port, server) = spawn_canned_http_server(vec![
+            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
+            Some(("HTTP/1.1 200 OK", CHAT_OK_BODY)),
+            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
+        ])?;
+        let mut record = probe_test_record(port);
+
+        assert_eq!(
+            managed_service_endpoint_readiness(
+                &mut record,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(2)
+            ),
+            EndpointReadiness::Serving
+        );
+        assert!(
+            record.inference_verified_at_unix_ms.is_some(),
+            "a passing probe is recorded so later checks can skip it"
+        );
+
+        assert_eq!(
+            managed_service_endpoint_readiness(
+                &mut record,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(2)
+            ),
+            EndpointReadiness::Serving
+        );
+
+        let requests = server.join().expect("server thread should not panic")?;
+        let paths: Vec<&str> = requests
+            .iter()
+            .filter_map(|request| request.lines().next())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "GET /v1/models HTTP/1.1",
+                "POST /v1/chat/completions HTTP/1.1",
+                "GET /v1/models HTTP/1.1",
+            ],
+            "the second readiness check must not re-probe inference"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn restarting_drops_the_previous_runs_inference_verification() {
+        // The restarted child is a different server with an unloaded model. If the
+        // verification carried over, readiness would short-circuit to "ready" the
+        // moment the new server listed the model — the original false positive,
+        // reinstated. `refresh_from_engine_state` only ever adopts a verification,
+        // so nothing downstream would clear it.
+        let mut record = probe_test_record(11435);
+        record.inference_verified_at_unix_ms = Some(1);
+        record.restart_count = 2;
+
+        record.reset_for_restart();
+
+        assert_eq!(record.inference_verified_at_unix_ms, None);
+        assert_eq!(record.restart_count, 3);
+        assert!(record.last_restart_unix_ms.is_some());
+    }
+
+    #[test]
+    fn inference_readiness_is_withheld_while_the_model_only_lists() -> Result<()> {
+        // The bug: `/v1/models` answers within seconds while the model loads for
+        // minutes and inference returns nothing. That service is not ready.
+        let (port, server) = spawn_canned_http_server(vec![
+            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
+            Some((
+                "HTTP/1.1 503 Service Unavailable",
+                r#"{"error":"loading model"}"#,
+            )),
+        ])?;
+        let mut record = probe_test_record(port);
+
+        assert_eq!(
+            managed_service_endpoint_readiness(
+                &mut record,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(2)
+            ),
+            EndpointReadiness::Listing,
+            "a listed-but-unservable model is coming up, not dead"
+        );
+        assert!(
+            record.inference_verified_at_unix_ms.is_none(),
+            "nothing is latched until inference actually succeeds"
+        );
+
+        server.join().expect("server thread should not panic")?;
+        Ok(())
+    }
+
+    #[test]
+    fn inference_probe_sends_the_service_key_to_a_protected_endpoint() -> Result<()> {
+        let (port, server) = spawn_canned_http_server(vec![
+            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
+            Some(("HTTP/1.1 200 OK", CHAT_OK_BODY)),
+        ])?;
+        let mut record = probe_test_record(port);
+
+        assert_eq!(
+            managed_service_endpoint_readiness(
+                &mut record,
+                Some("test-key"),
+                Duration::from_secs(2),
+                Duration::from_secs(2)
+            ),
+            EndpointReadiness::Serving
+        );
+
+        let requests = server.join().expect("server thread should not panic")?;
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.contains("Authorization: Bearer test-key")),
+            "a protected service must not read as unready for want of its own key"
+        );
         Ok(())
     }
 

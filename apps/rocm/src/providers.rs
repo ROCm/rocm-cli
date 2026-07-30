@@ -4,8 +4,8 @@
 
 use anyhow::{Context, Result, bail};
 use rocm_core::{
-    AppPaths, AuditEventRecord, ManagedServiceRecord, RocmCliConfig, append_audit_event,
-    connect_tcp_stream, format_host_port, managed_service_endpoint_model_ready,
+    AppPaths, AuditEventRecord, EndpointReadiness, ManagedServiceRecord, RocmCliConfig,
+    append_audit_event, connect_tcp_stream, format_host_port, managed_service_endpoint_readiness,
     read_tcp_stream_to_string, unix_time_millis, write_all_tcp_stream,
 };
 use std::fs;
@@ -529,16 +529,22 @@ fn ready_local_services(paths: &AppPaths) -> Result<Vec<ManagedServiceRecord>> {
         // filtered out here (an anonymous /v1/models would 401) before
         // `LocalProvider` can send the bearer token.
         let endpoint_api_key = crate::endpoint_keys::endpoint_api_key(paths, &record.service_id);
+        let was_verified = record.inference_verified_at_unix_ms.is_some();
         if matches!(record.status.as_str(), "ready" | "running")
-            && managed_service_endpoint_model_ready(
-                &record,
+            && managed_service_endpoint_readiness(
+                &mut record,
                 endpoint_api_key.as_deref(),
                 LOCAL_SERVICE_READY_TIMEOUT,
-            )
-            .unwrap_or(false)
+                rocm_core::INFERENCE_PROBE_TIMEOUT,
+            ) == EndpointReadiness::Serving
         {
-            if record.status != "ready" {
+            let status_changed = record.status != "ready";
+            if status_changed {
                 record.status = "ready".to_owned();
+            }
+            // Persist a newly latched verification too, so the next listing reads
+            // it instead of sending another inference request.
+            if status_changed || !was_verified {
                 let _ = record.write();
             }
             services.push(record);
@@ -1604,9 +1610,12 @@ mod tests {
         paths.ensure()?;
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
+        // Three requests: the first readiness check lists the model and then
+        // confirms inference, latching the verdict; the second check reads the
+        // latch and only re-lists.
         let server = thread::spawn(move || -> Result<Vec<String>> {
             let mut requests = Vec::new();
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let (mut stream, _) = listener.accept()?;
                 stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
                 let mut request_bytes = Vec::new();
@@ -1623,7 +1632,11 @@ mod tests {
                     }
                 }
                 let request = String::from_utf8_lossy(&request_bytes).into_owned();
-                let body = format!(r#"{{"data":[{{"id":"{LEMONADE_ASSISTANT_MODEL_ID}"}}]}}"#);
+                let body = if request.starts_with("POST /v1/chat/completions ") {
+                    r#"{"choices":[{"message":{"content":"ok"}}]}"#.to_owned()
+                } else {
+                    format!(r#"{{"data":[{{"id":"{LEMONADE_ASSISTANT_MODEL_ID}"}}]}}"#)
+                };
                 write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1667,11 +1680,18 @@ mod tests {
         let requests = server.join().expect("server thread should not panic")?;
         fs::remove_dir_all(root).ok();
 
-        assert_eq!(requests.len(), 2);
-        assert!(
-            requests
-                .iter()
-                .all(|request| request.starts_with("GET /v1/models HTTP/1.1"))
+        let request_lines: Vec<&str> = requests
+            .iter()
+            .filter_map(|request| request.lines().next())
+            .collect();
+        assert_eq!(
+            request_lines,
+            vec![
+                "GET /v1/models HTTP/1.1",
+                "POST /v1/chat/completions HTTP/1.1",
+                "GET /v1/models HTTP/1.1",
+            ],
+            "readiness confirms inference once, then reads the latch"
         );
         assert_eq!(selected.service_id, "svc-lemonade-ready");
         assert_eq!(selected.status, "ready");
@@ -2066,6 +2086,9 @@ mod tests {
             None,
         );
         ready.status = "ready".to_owned();
+        // Already served inference, so readiness checks read the latch
+        // instead of probing this stub for a completion.
+        ready.inference_verified_at_unix_ms = Some(1);
         ready.write()?;
 
         let response = provider_chat(
@@ -2300,6 +2323,9 @@ mod tests {
             None,
         );
         ready.status = "ready".to_owned();
+        // Already served inference, so readiness checks read the latch
+        // instead of probing this stub for a completion.
+        ready.inference_verified_at_unix_ms = Some(1);
         ready.write()?;
 
         let response = provider_chat(
@@ -2363,6 +2389,9 @@ mod tests {
             None,
         );
         ready.status = "ready".to_owned();
+        // Already served inference, so readiness checks read the latch
+        // instead of probing this stub for a completion.
+        ready.inference_verified_at_unix_ms = Some(1);
         ready.write()?;
 
         let events = provider_stream_chat(
@@ -2466,6 +2495,9 @@ mod tests {
             None,
         );
         ready.status = "ready".to_owned();
+        // Already served inference, so readiness checks read the latch
+        // instead of probing this stub for a completion.
+        ready.inference_verified_at_unix_ms = Some(1);
         ready.write()?;
         let mut events = Vec::new();
 
@@ -2551,6 +2583,9 @@ mod tests {
             None,
         );
         ready.status = "ready".to_owned();
+        // Already served inference, so readiness checks read the latch
+        // instead of probing this stub for a completion.
+        ready.inference_verified_at_unix_ms = Some(1);
         ready.write()?;
 
         let events = provider_stream_chat(
