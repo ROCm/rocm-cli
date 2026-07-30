@@ -6,7 +6,7 @@
 **Branch:** test-e2e-mock-real-split (merged; child of the [[fix-speed-up-e2e]] container)
 **Parent:** fix-speed-up-e2e
 **Pre-PR-check:** passed — claude-opus-4.8 (reviewer agent), 2026-07-23
-**Last Updated:** 2026-07-30
+**Last Updated:** 2026-07-30 (post-merge wrap-up)
 
 **Token Usage:** in=509 out=116543 cache_create=4977785 cache_read=31996026 calls=257
 
