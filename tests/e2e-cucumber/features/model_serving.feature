@@ -64,8 +64,8 @@ Feature: Model serving
     And the response identifies the correct model
 
   # Default-engine serve (no --engine): the effective engine is the platform
-  # default from the capability probe. xfail only where that resolves to vLLM
-  # (EAI-7333) — see expectations.toml.
+  # default from the capability probe, so this covers whichever engine the host
+  # would actually pick.
   @id:serve-default-engine-working-endpoint @requires-gpu
   Scenario: 6 - Serving a model without specifying an engine produces a working endpoint
     Given a managed runtime is active
@@ -95,7 +95,8 @@ Feature: Model serving
   # Readiness contract: when the CLI reports a service ready, inference must work.
   # Engine-agnostic — the served model+engine follow the host (see
   # `a model is being served on GPU`), so this holds the contract on every GPU
-  # platform. Where it resolves to vLLM, EAI-7333 makes it xfail (expectations.toml).
+  # platform. Readiness is gated on a real inference probe, which is what makes
+  # this contract hold rather than race the model load.
   @id:serve-readiness-contract @requires-gpu
   Scenario: 8 - A service reported ready can immediately serve inference
     Given a managed runtime is active

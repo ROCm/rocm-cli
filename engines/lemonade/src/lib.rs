@@ -925,37 +925,27 @@ fn healthcheck_service(request: HealthcheckRequest) -> Result<HealthcheckRespons
     })
 }
 
-/// Whether a real inference request has succeeded against this service, probing
-/// at most once and latching the verdict into the state file.
+/// Whether a real inference request has succeeded against this service.
 ///
-/// Readiness is polled repeatedly — by `services list`, the dash, and the
-/// supervisor — so re-probing every time would queue a generation request behind
-/// the user's own traffic. A service that degrades after start therefore keeps
-/// reporting ready, which is no worse than the pre-probe behavior.
+/// Latch and backoff bookkeeping lives in `rocm-core` so both engines share one
+/// implementation — what counts as *listed* differs per engine, what counts as
+/// *serving* does not.
 fn inference_verified(
     state_path: &Path,
     state: Option<&Value>,
     endpoint_url: &str,
     model_ref: &str,
 ) -> bool {
-    if state
-        .and_then(|value| value.get(rocm_core::INFERENCE_VERIFIED_STATE_KEY))
-        .and_then(Value::as_u64)
-        .is_some()
-    {
-        return true;
-    }
     let Some((host, port)) = parse_http_endpoint(endpoint_url) else {
         return false;
     };
-    if !query_inference_probe_endpoint(&host, port, model_ref).unwrap_or(false) {
-        return false;
-    }
-    let _ = merge_json_state(
+    rocm_core::engine_state_inference_verified(
         state_path,
-        &json!({ rocm_core::INFERENCE_VERIFIED_STATE_KEY: current_unix_millis() as u64 }),
-    );
-    true
+        state,
+        &format_http_base_url(&host, port),
+        model_ref,
+        rocm_engine_protocol::resolve_endpoint_api_key().as_deref(),
+    )
 }
 
 /// The device string reported once a model is loaded. Reflects the backend that
@@ -2920,20 +2910,6 @@ fn query_chat_smoke_endpoint(host: &str, port: u16, model_ref: &str) -> Result<b
         rocm_core::INFERENCE_PROBE_TIMEOUT,
     )?;
     Ok(status == 200)
-}
-
-/// Whether the endpoint can serve inference right now, as opposed to merely
-/// listing the model. Accepts any answered request (see
-/// [`rocm_core::openai_chat_completion_probe`]); the failure this catches is the
-/// endpoint that lists a model within seconds while the weights load for minutes
-/// and every chat request hangs.
-fn query_inference_probe_endpoint(host: &str, port: u16, model_ref: &str) -> Result<bool> {
-    rocm_core::openai_chat_completion_probe(
-        &format_http_base_url(host, port),
-        model_ref,
-        rocm_engine_protocol::resolve_endpoint_api_key().as_deref(),
-        rocm_core::INFERENCE_PROBE_TIMEOUT,
-    )
 }
 
 fn health_has_loaded_model(health: &Value, model_ref: &str, backend: &str) -> bool {

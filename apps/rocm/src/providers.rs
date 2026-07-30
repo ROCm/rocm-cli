@@ -4,9 +4,10 @@
 
 use anyhow::{Context, Result, bail};
 use rocm_core::{
-    AppPaths, AuditEventRecord, EndpointReadiness, ManagedServiceRecord, RocmCliConfig,
-    append_audit_event, connect_tcp_stream, format_host_port, managed_service_endpoint_readiness,
-    read_tcp_stream_to_string, unix_time_millis, write_all_tcp_stream,
+    AppPaths, AuditEventRecord, EndpointReadiness, EndpointReadinessOutcome, ManagedServiceRecord,
+    RocmCliConfig, append_audit_event, connect_tcp_stream, format_host_port,
+    managed_service_endpoint_readiness, read_tcp_stream_to_string, unix_time_millis,
+    write_all_tcp_stream,
 };
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
@@ -529,24 +530,31 @@ fn ready_local_services(paths: &AppPaths) -> Result<Vec<ManagedServiceRecord>> {
         // filtered out here (an anonymous /v1/models would 401) before
         // `LocalProvider` can send the bearer token.
         let endpoint_api_key = crate::endpoint_keys::endpoint_api_key(paths, &record.service_id);
-        let was_verified = record.inference_verified_at_unix_ms.is_some();
-        if matches!(record.status.as_str(), "ready" | "running")
-            && managed_service_endpoint_readiness(
+        let outcome = if matches!(record.status.as_str(), "ready" | "running") {
+            managed_service_endpoint_readiness(
                 &mut record,
                 endpoint_api_key.as_deref(),
                 LOCAL_SERVICE_READY_TIMEOUT,
                 rocm_core::INFERENCE_PROBE_TIMEOUT,
-            ) == EndpointReadiness::Serving
-        {
-            let status_changed = record.status != "ready";
-            if status_changed {
-                record.status = "ready".to_owned();
+            )
+        } else {
+            EndpointReadinessOutcome {
+                readiness: EndpointReadiness::Unreachable,
+                record_changed: false,
             }
-            // Persist a newly latched verification too, so the next listing reads
-            // it instead of sending another inference request.
-            if status_changed || !was_verified {
-                let _ = record.write();
-            }
+        };
+        let serving = outcome.readiness == EndpointReadiness::Serving;
+        let status_changed = serving && record.status != "ready";
+        if status_changed {
+            record.status = "ready".to_owned();
+        }
+        // Persist the probe bookkeeping even for a service that is not ready:
+        // the retry throttle is stored on the record, and each CLI invocation is
+        // a fresh process, so an unwritten attempt throttles nothing.
+        if status_changed || outcome.record_changed {
+            let _ = record.write();
+        }
+        if serving {
             services.push(record);
         }
     }

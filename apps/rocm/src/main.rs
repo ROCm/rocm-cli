@@ -26,11 +26,11 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use rocm_core::{
     AppPaths, AuditEventRecord, AutomationEventRecord, AutomationProposalRecord,
     AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot,
-    DEFAULT_LOCAL_HOST, EndpointReadiness, ExamineSummary, ManagedServiceRecord, ModelRecipeRecord,
-    ModelRecipeRegistry, ModelRecipeRegistrySource, PERMISSIONS_MODE_ASK,
-    PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF,
-    WatcherMode, append_audit_event, builtin_model_recipes, builtin_watcher, builtin_watchers,
-    connect_tcp_stream, daemon_binary_path, default_engine_for_platform,
+    DEFAULT_LOCAL_HOST, EndpointReadiness, EndpointReadinessOutcome, ExamineSummary,
+    ManagedServiceRecord, ModelRecipeRecord, ModelRecipeRegistry, ModelRecipeRegistrySource,
+    PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL,
+    TELEMETRY_MODE_OFF, WatcherMode, append_audit_event, builtin_model_recipes, builtin_watcher,
+    builtin_watchers, connect_tcp_stream, daemon_binary_path, default_engine_for_platform,
     default_interactive_shell_program, detect_host_gfx_target, detect_host_gpu_summary,
     engine_binary_path, engine_plugin_dirs, format_host_port, format_http_base_url,
     generate_service_id, interactive_terminal, load_model_recipe_registry,
@@ -4592,7 +4592,9 @@ struct ManagedLaunchReport {
     service_id: String,
     /// `http://host:port/v1`.
     endpoint_url: String,
-    /// `"ready"`, `"starting"`, or the existing service's status.
+    /// `"ready"` (inference confirmed), `"running"` (model listed but not serving
+    /// yet), `"starting"` (endpoint not answering), or the existing service's
+    /// status when nothing was spawned.
     status: String,
     /// True when an equivalent service was already live and nothing was spawned.
     already_running: bool,
@@ -13864,8 +13866,7 @@ fn refresh_managed_service_runtime_liveness(
     // Probe with the service's key so a protected public service is not mistaken
     // for dead (an anonymous /v1/models would 401).
     let endpoint_api_key = endpoint_keys::endpoint_api_key(paths, &record.service_id);
-    let was_verified = record.inference_verified_at_unix_ms.is_some();
-    let readiness = if matches!(record.status.as_str(), "ready" | "running") {
+    let outcome = if matches!(record.status.as_str(), "ready" | "running") {
         managed_service_endpoint_readiness(
             record,
             endpoint_api_key.as_deref(),
@@ -13873,8 +13874,12 @@ fn refresh_managed_service_runtime_liveness(
             rocm_core::INFERENCE_PROBE_TIMEOUT,
         )
     } else {
-        EndpointReadiness::Unreachable
+        EndpointReadinessOutcome {
+            readiness: EndpointReadiness::Unreachable,
+            record_changed: false,
+        }
     };
+    let readiness = outcome.readiness;
     if readiness == EndpointReadiness::Serving {
         // Mirror `providers.rs::ready_local_services()`: a live, probe-passing
         // service should be persisted as "ready", not left stuck at "running".
@@ -13884,15 +13889,17 @@ fn refresh_managed_service_runtime_liveness(
         }
         // A newly latched verification is itself worth persisting, so the next
         // check reads it instead of sending another inference request.
-        return settled_pending_stop || !was_verified;
+        return settled_pending_stop || outcome.record_changed;
     }
     if readiness == EndpointReadiness::Listing {
         // The server is up and advertising the model; the weights are simply not
         // usable yet. Leave the status alone rather than demoting to "starting" —
         // `rocmd` restarts a service that sits in "starting" past its stale
         // window, which for a slow-loading model would restart it mid-load and
-        // begin the wait all over again.
-        return settled_pending_stop;
+        // begin the wait all over again. Still report a change when the probe
+        // bookkeeping moved, so the retry throttle is persisted and the next
+        // process does not spend another full probe timeout.
+        return settled_pending_stop || outcome.record_changed;
     }
 
     let tracked_pids = recorded_service_pids(record);
@@ -17226,32 +17233,38 @@ mod tests {
         // model mid-load and start the wait over.
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let port = listener.local_addr()?.port();
-        let server = thread::spawn(move || -> Result<()> {
-            for _ in 0..2 {
-                let (mut stream, _) = listener.accept()?;
+        // Keeps listing the model for as long as the test asks, so a second
+        // readiness check reaches the probe throttle rather than an unanswered
+        // socket. Counts the inference requests that actually got sent.
+        let probes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_probes = std::sync::Arc::clone(&probes);
+        let server = thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
                 stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
                 let mut buffer = [0_u8; 1024];
-                let read = stream.read(&mut buffer)?;
+                let Ok(read) = stream.read(&mut buffer) else {
+                    continue;
+                };
                 let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
                 if request.starts_with("POST /v1/chat/completions ") {
+                    server_probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let body = r#"{"error":"loading model"}"#;
-                    write!(
+                    let _ = write!(
                         stream,
                         "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
                         body
-                    )?;
+                    );
                 } else {
                     let body = r#"{"data":[{"id":"Qwen3-0.6B-GGUF"}]}"#;
-                    write!(
+                    let _ = write!(
                         stream,
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
                         body
-                    )?;
+                    );
                 }
             }
-            Ok(())
         });
 
         let (root, paths) = test_paths("liveness-loading-service");
@@ -17275,7 +17288,6 @@ mod tests {
 
         let changed = refresh_managed_service_runtime_liveness(&paths, &mut record);
 
-        assert!(!changed, "a service that is still loading is not a change");
         assert_eq!(
             record.status, "running",
             "a loading service keeps its status rather than being demoted"
@@ -17283,6 +17295,22 @@ mod tests {
         assert!(
             record.inference_verified_at_unix_ms.is_none(),
             "nothing is latched until inference actually answers"
+        );
+        assert!(
+            changed && record.inference_probe_attempted_at_unix_ms.is_some(),
+            "the probe attempt is recorded and reported so the caller persists \
+             the retry throttle"
+        );
+
+        // Second pass, inside the retry interval: the throttle holds, so the
+        // model is not asked to generate again just because someone re-listed.
+        let changed_again = refresh_managed_service_runtime_liveness(&paths, &mut record);
+        assert!(!changed_again, "a throttled check changes nothing");
+        assert_eq!(record.status, "running");
+        assert_eq!(
+            probes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a warming service must not be re-probed by every poll"
         );
 
         drop(server);

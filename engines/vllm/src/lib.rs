@@ -1616,43 +1616,24 @@ fn query_inference_probe_endpoint(endpoint_url: &str, model_ref: &str) -> Result
     )
 }
 
-/// Whether a real inference request has succeeded against this service, probing
-/// at most once and latching the verdict into the state file.
+/// Whether a real inference request has succeeded against this service.
 ///
-/// Readiness is polled repeatedly — by `services list`, the dash, and the
-/// supervisor — so re-probing every time would queue a generation request behind
-/// the user's own traffic. A service that degrades after start therefore keeps
-/// reporting ready, which is no worse than the pre-probe behavior.
+/// Latch and backoff bookkeeping lives in `rocm-core` so both engines share one
+/// implementation — what counts as *listed* differs per engine, what counts as
+/// *serving* does not.
 fn inference_verified(
     state_path: &Path,
     state: Option<&Value>,
     endpoint_url: &str,
     model_ref: &str,
 ) -> bool {
-    if state
-        .and_then(|value| value.get(rocm_core::INFERENCE_VERIFIED_STATE_KEY))
-        .and_then(Value::as_u64)
-        .is_some()
-    {
-        return true;
-    }
-    if !query_inference_probe_endpoint(endpoint_url, model_ref).unwrap_or(false) {
-        return false;
-    }
-    let _ = record_inference_verified(state_path);
-    true
-}
-
-fn record_inference_verified(state_path: &Path) -> Result<()> {
-    let mut state = read_service_state(state_path).unwrap_or_else(|_| json!({}));
-    let Some(object) = state.as_object_mut() else {
-        return Ok(());
-    };
-    object.insert(
-        rocm_core::INFERENCE_VERIFIED_STATE_KEY.to_owned(),
-        Value::from(current_unix_millis() as u64),
-    );
-    write_state(state_path, &state)
+    rocm_core::engine_state_inference_verified(
+        state_path,
+        state,
+        endpoint_url,
+        model_ref,
+        rocm_engine_protocol::resolve_endpoint_api_key().as_deref(),
+    )
 }
 
 fn pid_from_state(state: &Value) -> Option<u32> {

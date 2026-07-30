@@ -4823,8 +4823,13 @@ fn restart_managed_service(_paths: &AppPaths, record: &mut ManagedServiceRecord)
         .context("failed to clone service log file handle")?;
 
     record.status = "recovering".to_owned();
-    record.restart_count = record.restart_count.saturating_add(1);
-    record.last_restart_unix_ms = Some(unix_time_millis());
+    // Counts the restart and drops the previous run's inference verification.
+    // The respawned child writes a fresh record of its own, and "recovering" is
+    // outside the statuses that probe, so a stale verdict would not currently be
+    // acted on — but this record is written again below, after the spawn, and
+    // that write can land after the child's. Clearing here keeps the invariant
+    // true at the one site that reuses a record across restarts.
+    record.reset_for_restart();
     record.supervisor_pid = std::process::id();
     record.write()?;
 

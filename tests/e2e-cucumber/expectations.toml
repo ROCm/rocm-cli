@@ -38,24 +38,6 @@ when = {}
 bug = "EAI-7219"
 reason = "Engines do not report a consistent resolved model name for a short name."
 
-# --- EAI-7333: vLLM reports /v1/models ready but refuses inference. vLLM-only. ---
-# Applies wherever the effective serve engine is vLLM. On lemonade-default hosts
-# (e.g. Strix Halo gfx1151, native Windows) these resolve to expected-pass, which
-# is what fixes the Strix-Windows XPASS from run #543.
-#
-# Readiness is now gated on a real inference probe rather than a `/v1/models`
-# listing, which should close this. Held as xfail until a GPU lane confirms it on
-# hardware — the fix is verified by unit tests only, and this bug has already
-# produced one stale "fixed" call (an MI300X XPASS in run 29404668327 that failed
-# again the next run). `flaky = true`, so a pass here is non-fatal: the lane stays
-# green either way, and these entries come out once the hardware run confirms.
-[["serve-vllm-inference"]]
-when = { effective_engine = "vllm" }
-bug = "EAI-7333"
-reason = "vLLM service reports ready (/v1/models 200) but POST /v1/chat/completions is refused intermittently."
-serve_timeout_secs = 90
-flaky = true
-
 # EAI-7423 was INTERMITTENT on Strix Halo Ubuntu as of 2026-08-05, not fixed:
 # which of its scenarios pass varied run to run (run 30995473578: 2 XPASS; run
 # 30993213188: 3 XPASS; run 30939967076: all 6). A deterministic-XPASS row fails
@@ -87,19 +69,6 @@ flaky = true
 when = { effective_engine = "lemonade", os = "linux" }
 bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so inference never succeeds."
-serve_timeout_secs = 90
-flaky = true
-
-# EAI-7333 (CLI healthcheck reports ready off /v1/models before inference works)
-# on the vLLM path. Readiness now requires an inference request to have come back,
-# which should close this, but it is held as xfail until a GPU lane confirms it:
-# the scenario is intermittent (XPASS on MI300X in run 29404668327, FAILED in
-# 29413321046), and an intermittent known-bug scenario stays xfail while
-# `flaky = true` makes the XPASS a fixed gate would produce harmless.
-[["serve-readiness-contract"]]
-when = { effective_engine = "vllm" }
-bug = "EAI-7333"
-reason = "CLI reports the vLLM service ready, but an immediate inference request races the model load and intermittently fails."
 serve_timeout_secs = 90
 flaky = true
 
