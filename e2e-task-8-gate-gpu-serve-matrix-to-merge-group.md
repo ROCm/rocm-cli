@@ -1,6 +1,6 @@
 # WIP: E2E Task #8: gate GPU serve matrix to merge_group + keep a PR canary
 
-**Stage:** 2-implementing
+**Stage:** 2-implementing — ON HOLD
 **Pipeline:** lightweight
 **Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group
 **Pre-PR-check:** pending container gate + GPU dispatch
