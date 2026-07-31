@@ -65,8 +65,15 @@ static ARCHIVE_CACHE_BUSY: std::sync::Mutex<std::collections::BTreeSet<PathBuf>>
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 static ARCHIVE_CACHE_BUSY_SIGNAL: std::sync::Condvar = std::sync::Condvar::new();
 
-/// Deepest archive tree the embeddable layout is searched and copied through.
-const MAX_ARCHIVE_TREE_DEPTH: usize = 4;
+/// How deep the extracted tree is searched for the embeddable root before the
+/// search gives up. Official archives place the root at the top level, so this
+/// only bounds the work spent looking; exceeding it is not an error.
+const MAX_EMBEDDABLE_SEARCH_DEPTH: usize = 4;
+
+/// Recursion backstop for copying the embeddable tree. Containment is enforced
+/// per entry, so this exists only to fail loudly instead of overflowing the
+/// stack on a pathological tree; it is far above any plausible archive layout.
+const MAX_COPY_RECURSION_DEPTH: usize = 64;
 
 const EMBEDDABLE_WINDOWS_ARCHIVE_NAME: &str = "lemonade-embeddable-10.10.0-windows-x64.zip";
 const EMBEDDABLE_LINUX_ARCHIVE_NAME: &str = "lemonade-embeddable-10.10.0-ubuntu-x64.tar.gz";
@@ -1741,7 +1748,7 @@ fn collect_embeddable_roots(
     candidates: &mut Vec<PathBuf>,
     depth: usize,
 ) -> Result<()> {
-    if depth > MAX_ARCHIVE_TREE_DEPTH {
+    if depth > MAX_EMBEDDABLE_SEARCH_DEPTH {
         return Ok(());
     }
     let metadata = fs::symlink_metadata(path)?;
@@ -1833,9 +1840,9 @@ fn copy_tree_entries(
     destination: &Path,
     depth: usize,
 ) -> Result<()> {
-    if depth > MAX_ARCHIVE_TREE_DEPTH {
+    if depth > MAX_COPY_RECURSION_DEPTH {
         bail!(
-            "archive tree is deeper than {MAX_ARCHIVE_TREE_DEPTH} levels at {}",
+            "archive tree is deeper than {MAX_COPY_RECURSION_DEPTH} levels at {}",
             source.display()
         );
     }
@@ -4029,6 +4036,41 @@ mod tests {
         assert_eq!(
             fs::read(destination.join("lib").join("backend")).unwrap(),
             b"backend"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deeply_nested_embeddable_tree_is_copied() {
+        let dir = scratch_dir("deep-embeddable-tree");
+        let extract = dir.join("extract");
+        let package = extract.join("package");
+        let nested = package
+            .join("lib")
+            .join("site-packages")
+            .join("backend")
+            .join("kernels")
+            .join("gfx");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(lemond_path_in(&package), b"lemond").unwrap();
+        fs::write(lemonade_path_in(&package), b"lemonade").unwrap();
+        fs::write(nested.join("kernel.so"), b"kernel").unwrap();
+
+        let found = find_embeddable_root(&extract).unwrap();
+        let destination = dir.join("runtime");
+        copy_tree(&found, &destination).unwrap();
+        assert_eq!(
+            fs::read(
+                destination
+                    .join("lib")
+                    .join("site-packages")
+                    .join("backend")
+                    .join("kernels")
+                    .join("gfx")
+                    .join("kernel.so")
+            )
+            .unwrap(),
+            b"kernel"
         );
         fs::remove_dir_all(&dir).ok();
     }
