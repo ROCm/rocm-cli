@@ -1,6 +1,6 @@
 # WIP: E2E Task #9: narrow 'serve' paths-filter so non-serve Rust PRs skip the GPU matrix
 
-**Stage:** 6-implementing — pre-PR review findings, awaiting user fix authorization
+**Stage:** 6-implementing — awaiting user authorization for three pre-PR fixes
 **Pipeline:** lightweight
 **Branch:** e2e-task-9-narrow-serve-paths-filter-so-non
 **Jira:** EAI-7746 (Task, rocm-cli, unassigned)
@@ -8,10 +8,10 @@
   - Canary mode still runs two non-canary real GPU serves — expectation.rs:338 only skips non-canary @requires-gpu, but chat.feature:48 & :59 are untagged and serving_steps.rs:555-568 real-serves on GPU. Add/use a tag for scenarios that may real-serve on GPU so they stay mock-covered but skip in PR canary mode. → Awaiting user authorization to fix (relay gate blocks agent Edit).
   - Root Cargo.toml can bypass the serve filter — ci.yml:137-150 omits root Cargo.toml even though workspace deps affect serving crates without necessarily changing Cargo.lock. Add root Cargo.toml (not **/Cargo.toml, preserving dash exclusions). → Awaiting user authorization to fix.
   - GPU E2E can run while its consolidated report skips — ci.yml:1281 gates only on heavy, but serve includes paths not covered by heavy. Gate the report on heavy || serve || workflow_dispatch. → Awaiting user authorization to fix.
-**Last Updated:** 2026-07-31 (pre-PR review findings identified; awaiting user authorization for three fixes)
+**Last Updated:** 2026-07-31
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=528 out=319791 cache_create=2656210 cache_read=41098790 calls=271
+**Token Usage:** in=530 out=319947 cache_create=2890172 cache_read=41098790 calls=272
 
 ---
 
