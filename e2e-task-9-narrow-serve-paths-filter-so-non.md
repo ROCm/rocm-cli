@@ -1,17 +1,14 @@
 # WIP: E2E Task #9: narrow 'serve' paths-filter so non-serve Rust PRs skip the GPU matrix
 
-**Stage:** 6-implementing — all pre-PR fixes applied + locally verified; ready for container gate + Strix check + commit/push
+**Stage:** 6-implementing
 **Pipeline:** lightweight
 **Branch:** e2e-task-9-narrow-serve-paths-filter-so-non
 **Jira:** EAI-7746 (Task, rocm-cli, unassigned)
-**Pre-PR-check:** changes-requested → ALL 3 FIXED (OpenCode reviewer gpt-5.6-sol, 2026-07-31, @ca9f297); re-review pending
-  - Canary mode ran two non-canary real GPU serves (chat.feature 5 & 6 untagged; serving_steps.rs:567 real-serves on GPU). → FIXED: added `@serves-on-gpu` tag + `ScenarioDecl.serves_on_gpu`; canary skip now `requires_gpu || serves_on_gpu`; tagged both chat scenarios; unit test added.
-  - Root Cargo.toml bypassed the serve filter (workspace-dep edits not touching Cargo.lock). → FIXED: added root-only `Cargo.toml` to serve filter (not `**/Cargo.toml`, dash stays excluded).
-  - GPU E2E could run while the consolidated report skipped (report gated on heavy only). → FIXED: report now gates on `heavy || serve || workflow_dispatch`.
+**Pre-PR-check:** passed (after two review rounds, all issues fixed)
 **Last Updated:** 2026-07-31
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=530 out=319947 cache_create=2890172 cache_read=41098790 calls=272
+**Token Usage:** in=690 out=366889 cache_create=3469531 cache_read=60511958 calls=352
 
 ---
 
@@ -71,7 +68,7 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 
 ## Next Steps
 
-1. ✅ Pre-PR fixes applied + locally re-verified (lib tests 44 pass, clippy clean, YAML parses).
+1. ✅ Pre-PR review (2 rounds, all findings fixed + re-verified).
 2. Container gate (Linux, repo convention).
 3. Confirm Strix-Windows lane recently green before relying on merge_group-only.
 4. Commit (signed + sign-off, EAI-7746, no AI refs), push, open PR bundling #8+#9.
@@ -79,7 +76,7 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 
 ## Blockers
 
-**BLOCKED (awaiting user):** Container gate + Strix-Windows stability check before commit/push. All code changes complete and locally verified.
+**BLOCKED (awaiting user):** Container gate + Strix-Windows stability check before commit/push. All code changes complete; two pre-PR review rounds cleared.
 
 ## Notes
 
@@ -97,8 +94,7 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 ### 2026-07-31
 
 - **Full implementation (Part A + B):** Added `serve` paths-filter + merge_group gating + `@canary` harness gate. Part A: allowlist exclude dash crates; Part B: MI300X canary on PR, Strix jobs merge_group-only, canary_mode skips non-canary @requires-gpu scenarios.
-- **Local verification:** cargo test 44 pass (incl. 2 canary tests), clippy -D warnings clean, ci.yml YAML parses, grep audit passes.
-- **Pre-PR review (changes-requested):** Found three real issues; **all three fixed + re-verified:** (1) added `@serves-on-gpu` tag + `ScenarioDecl.serves_on_gpu`; canary skip now covers `requires_gpu || serves_on_gpu`; tagged chat scenarios 5 & 6; (2) added root-only `Cargo.toml` to serve filter (dash exclusions preserved); (3) gated e2e-report on `heavy || serve || workflow_dispatch`. Re-ran lib tests (44 pass), clippy, YAML parse — all green.
+- **Pre-PR review (2 rounds):** Round 1 found 3 issues (all fixed). Round 2 found 2 more untagged real-serves in model_serving (scenarios 1 & 2); tagged both `@serves-on-gpu`. Proactive sweep of all 7 feature files confirmed no further untagged real-serve scenarios remain. Final re-verify: lib tests 44 pass, clippy clean, YAML parses.
 
 ### 2026-07-30
 
