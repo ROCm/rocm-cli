@@ -76,7 +76,7 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 
 ## Blockers
 
-**BLOCKED (awaiting user):** Container gate background task (b135xn1oq) stopped without completion record — check output file `/private/tmp/claude-501/-Users-fres-Developer-rocm-cli-wt-e2e-task-9-narrow-serve-paths-filter-so-non/8c1b9f63-96ee-4631-a78f-1b22c9c40b6d/tasks/b135xn1oq.output`. Once gate is confirmed green, user authorization needed to commit/signed push. All code changes complete; pre-PR review passed.
+**BLOCKED (awaiting user):** Container gate background task (b135xn1oq) stopped without completion record (may have been killed/timed out on session teardown). Output file at `/private/tmp/claude-501/-Users-fres-Developer-rocm-cli-wt-e2e-task-9-narrow-serve-paths-filter-so-non/8c1b9f63-96ee-4631-a78f-1b22c9c40b6d/tasks/b135xn1oq.output` — check if partial output shows the status (was downloading crates at stop). Once gate is confirmed green locally or output reviewed, user authorization needed to commit/signed push. All code changes complete; pre-PR review passed.
 
 ## Notes
 
