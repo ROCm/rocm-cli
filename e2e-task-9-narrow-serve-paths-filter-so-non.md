@@ -77,6 +77,10 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 6. ✅ PR #156 opened: https://github.com/ROCm/rocm-cli/pull/156 (bundles #8+#9).
 7. On PR: confirm all required GPU checks PRODUCED; scoped dispatch validates canary serves only 6b.
 
+## Blockers
+
+**BLOCKED (awaiting user):** PR #156 is open; asked whether to actively watch its required GPU checks (Next Step #7) — no instruction yet to proceed.
+
 ## Notes
 
 - Promoted from WL-176 (rocm-cli, +ci +task). Created EAI-7746 as canonical Jira ticket.
