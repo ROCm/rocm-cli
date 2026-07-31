@@ -24,37 +24,37 @@ PAIRS WITH Task #8 (#99): both are ci.yml trigger/paths edits — likely one bra
 
 ## Solution
 
-**Approach (awaiting user decisions):**
+**Approach (user decisions made 2026-07-31):**
 
-1. Add a narrow `serve` paths-filter to ci.yml's `changes` job (dorny/paths-filter @v4)
-   - **Contents:** `engines/**`, `apps/rocm/src/therock.rs`, `apps/rocm/src/serve_summary.rs`, `crates/rocm-core/**`, `crates/rocm-engine-protocol/**`, `tests/e2e-cucumber/**`, `crates/e2e-report/**`, `xtask/**`, `**/*.feature`, `Cargo.lock`, `.github/workflows/**`
-   - **Rationale:** GPU e2e jobs' unique value is `@requires-gpu` scenarios (serve + GPU chat/examine/runtime-setup). Non-GPU scenarios already covered by blocking mock lane. Dash-only changes (rocm-dash-tui/core/collectors/daemon) cannot affect serve behavior → safe to exclude. Xtask/e2e-report included because consolidation job + harness depend on them.
+1. **Add a conservative `serve` paths-filter** to ci.yml's `changes` job (dorny/paths-filter @v4)
+   - **Contents (inclusive, err-toward-inclusion):** `**/*.rs`, `**/Cargo.toml`, `Cargo.lock`, `rust-toolchain*`, `engines/**`, `apps/rocm/**`, `crates/rocm-core/**`, `crates/rocm-engine-protocol/**`, `crates/e2e-report/**`, `tests/e2e-cucumber/**`, `**/*.feature`, `xtask/**`, `.github/workflows/**`
+   - **Note:** Includes all `**/*.rs` to stay conservative (do not exclude dash crates). False skip worse than extra run; when in doubt, run.
+   - **Rationale:** GPU e2e jobs' unique value is `@requires-gpu` scenarios. Compile/test coverage stays on always-run lanes (build-and-test, test, windows-build-and-test).
 
-2. Repoint the 3 GPU jobs from `needs.changes.outputs.heavy` to `needs.changes.outputs.serve`:
+2. **Bundle with Task #8 (#99):** both in one branch/PR
+   - Add `serve` filter here
+   - Add merge_group gating + PR canary in same PR
+   - One coherent ci.yml edit, no rebase collision
+
+3. **Repoint the 3 GPU jobs** from `needs.changes.outputs.heavy` to `needs.changes.outputs.serve`:
    - `e2e-gpu` (MI300X, line ~732)
    - `e2e-gpu-strix-ubuntu` (line ~923)
    - `e2e-gpu-strix-windows` (line ~1080)
-
-3. Pair with Task #8 (#99): both edit the same GPU-job `if:` guards. **User choice:** land #9 alone (then rebase #8) or bundle both in one PR (merge_group gating + serve filter).
+   - Add `|| steps.all.outputs.forced` fallback to ensure merge_group still fires them (required check safety)
 
 ## Next Steps
 
-1. Clarify: bundle Task #8+#9 or land #9 separately then rebase #8?
-2. Confirm excluding dash crates (max speedup) vs. conservative keep-all-Rust (minimal win)?
-3. Design the ci.yml paths-filter entries (line-by-line, validate no typos).
-4. Implement, test (manual ci.yml syntax validation), and open PR.
+1. Read Task #8 WIP to coordinate merge_group gating design (both edit same GPU-job `if:` guards).
+2. Design the full ci.yml patch: add `serve` output, consolidate GPU job guards with merge_group + serve logic.
+3. Implement, validate ci.yml syntax, test manually on branch.
+4. Open PR bundling both tasks.
 
 ## Notes
 
-- Promoted from WL-176 (rocm-cli, +ci +task).
-- Verified on 2026-07-31: main has no `serve` filter (only `heavy`). No open PRs touch GPU gating or add serve filters. Work is undone and ready.
-- Adjacency: PR #141 will add `e2e-gpu-wsl` job on `heavy` — when #9 lands, #141's serve filter will need update too (trivial rebase).
-
-## Blockers
-
-**BLOCKED (awaiting user):** Two decisions needed before implementation:
-1. **PR scope:** Task #9 alone (then rebase Task #8 later) or bundle both #8+#9 (merge_group gating + serve filter in one PR)?
-2. **Exclusion:** Exclude dash crates for max speedup, or keep conservative (any `**/*.rs` fires GPU jobs, same as today)?
+- Promoted from WL-176 (rocm-cli, +ci +task). Created EAI-7746 as canonical Jira ticket.
+- Verified 2026-07-31: main has no `serve` filter (only `heavy`). No open PRs touch GPU gating. Work is undone.
+- Adjacency: PR #141 will add `e2e-gpu-wsl` job on `heavy` — when this lands, PR #141 will need a trivial rebase to use `serve` filter.
+- Constraint: all 3 GPU jobs are required status checks on main → merge_group gating must ensure they still run on merge_group (via `|| steps.all.outputs.forced` fallback).
 
 ## Worktree Context
 
@@ -64,12 +64,10 @@ PAIRS WITH Task #8 (#99): both are ci.yml trigger/paths edits — likely one bra
 
 ### 2026-07-31
 
-- Mapped LIVE-MAIN state: ci.yml 'heavy' filter is coarse (`**/*.rs`, etc.); GPU jobs (3 self-hosted, non-blocking) fire on every PR even when serve code untouched.
-- Verified work is undone: main has no `serve` filter, no open PRs add GPU gating or paths-filter narrowing.
-- Analyzed scope: GPU e2e jobs' unique value = `@requires-gpu` scenarios (serve, GPU chat/examine/runtime-setup); non-GPU already covered by blocking mock lane.
-- Identified serve-affecting paths: `engines/` (vllm/lemonade), `apps/rocm/src/{therock,serve_summary}.rs`, `crates/rocm-core`, protocol/xtask/e2e crates, `.feature` files.
-- Confirmed dash crates (tui/core/collectors/daemon) build into rocm binary but cannot affect serve behavior → safe exclusion candidate for max speedup.
-- Awaiting user decision on PR scope (bundle #8 or land alone) and exclusion strategy (exclude dash or stay conservative).
+- Mapped LIVE-MAIN state: ci.yml `heavy` filter is coarse (`**/*.rs`, etc.); all 3 GPU jobs (self-hosted, required checks) fire on every PR.
+- Verified work undone: main has no `serve` filter, no open PRs add GPU gating or paths-filter. Created EAI-7746 as canonical ticket.
+- Confirmed bundling: Task #8+#9 in one PR (both edit same GPU-job `if:` guards). User chose conservative/inclusive filter (keep `**/*.rs`, don't exclude dash).
+- Found critical constraint: all 3 GPU jobs are required status checks → merge_group gating must use `|| steps.all.outputs.forced` fallback to ensure they still run in queue.
 
 ### 2026-07-30
 
