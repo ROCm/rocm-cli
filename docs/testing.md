@@ -896,7 +896,7 @@ vLLM TheRock GPU acceptance:
 ```bash
 cargo test -p rocm-engine-vllm running_state_records_managed_therock_env_for_gpu_verification
 cargo test -p rocm-engine-vllm managed_env_reflects_managed_runtime_manifest_source
-cargo test -p rocm-engine-vllm resolve_model_surfaces_conservative_vram_default
+cargo test -p rocm-engine-vllm resolve_model_omits_gpu_memory_utilization_default
 python -m py_compile scripts/vllm_therock_gpu_test.py
 python scripts/vllm_therock_gpu_test.py --self-test
 

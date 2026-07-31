@@ -105,8 +105,9 @@ async fn ensure_serve_port_free() -> String {
     // Always kill any listener on the shared port — NOT just one that already
     // answers /v1/models. A prior scenario's vLLM that is still LOADING holds the
     // port and GPU memory without yet serving /v1/models; if we only checked HTTP
-    // readiness we'd start a second server, overcommit GPU memory (each asks for
-    // 0.80), and the collision crashes a server → the next chat POST fails with
+    // readiness we'd start a second server, overcommit GPU memory (each claims
+    // vLLM's default fraction of the device), and the collision crashes a server
+    // → the next chat POST fails with
     // "error sending request". Killing by port (fuser/lsof) catches the starting
     // server too. Best-effort; then wait for the socket to actually close.
     // Also kill the CLI's auto-started lemonade assistant — it hogs a GPU core on
@@ -458,7 +459,7 @@ async fn setup_gpu_model(world: &mut E2eWorld) {
         // Stop THIS attempt's stalled service before doing anything else. A vLLM
         // still in engine init has not bound the serve port yet, so the port kill
         // in `ensure_serve_port_free` cannot see it — it would survive into the
-        // next attempt, hold its ~0.8-of-device memory reservation, and guarantee
+        // next attempt, hold its fraction-of-device memory reservation, and guarantee
         // the relaunch dies on vLLM's free-memory check. Going through `rocm
         // services stop` is what actually clears it: that path signals the whole
         // process tree (the EngineCore worker pins the allocation, not the parent)

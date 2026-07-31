@@ -21986,10 +21986,25 @@ install therock";
 
     #[test]
     fn gpu_memory_utilization_override_leaves_non_vllm_engines_untouched() {
+        // The override is vLLM-specific: other engines are never rewritten, with
+        // or without a recipe of their own.
         assert!(
             engine_recipe_with_gpu_memory_utilization_override("lemonade", None, Some(0.5))
                 .is_none()
         );
+        let existing = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "lemonade".to_owned(),
+            required_flags: vec!["--some-flag".to_owned()],
+            ..EngineRecipeHint::default()
+        };
+        let hint = engine_recipe_with_gpu_memory_utilization_override(
+            "lemonade",
+            Some(existing.clone()),
+            Some(0.5),
+        )
+        .unwrap();
+        assert_eq!(hint.required_flags, existing.required_flags);
     }
 
     #[test]
