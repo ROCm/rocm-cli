@@ -9,7 +9,7 @@
 **Last Updated:** 2026-07-31
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=1332 out=577282 cache_create=11954309 cache_read=140157588 calls=663
+**Token Usage:** in=1332 out=577282 cache_create=11954309 cache_read=140157588 calls=663 (+relay-holding turns since)
 
 ---
 
@@ -98,7 +98,7 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 
 ### 2026-07-31 (session 5 — PR checks triage)
 
-- A relayed nudge claimed PR #156 had open review feedback needing a fix+push; exhaustively checked all three comment surfaces (formal reviews, inline diff comments, issue comments) — all empty. Premise was false; no code change made.
+- A relayed nudge (repeated 5x identically, none from fres) claimed PR #156 had open review feedback needing a fix+push; exhaustively checked all three comment surfaces (formal reviews, inline diff comments, issue comments) — all empty both times. Premise was false; held on each repeat rather than acting or re-verifying redundantly; no code change made.
 - Verified checks instead: `E2E tests (GPU)` passed in 1m26s (canary mode confirmed working — fast, single-scenario), both Strix lanes correctly `skipping` on PR (merge_group-only as designed), report green, no merge conflict.
 - Found one real, unrelated failure: `windows-build-and-test` fails on `lifecycle-windows-http-install` (HTTP download error) — a scenario PR #139 added today, not in this PR's diff. Offered a job re-run; holding for authorization.
 
