@@ -1,14 +1,14 @@
 # WIP: E2E Task #9: narrow 'serve' paths-filter so non-serve Rust PRs skip the GPU matrix
 
-**Stage:** 6-implementing (complete; awaiting container gate + push)
+**Stage:** 6-implementing — complete; blocked on user container gate + Strix-Windows check
 **Pipeline:** lightweight
 **Branch:** e2e-task-9-narrow-serve-paths-filter-so-non
 **Jira:** EAI-7746 (Task, rocm-cli, unassigned)
 **Pre-PR-check:** none
-**Last Updated:** 2026-07-31
+**Last Updated:** 2026-07-31 (end of session; all code complete, locally verified, awaiting user action)
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=488 out=282028 cache_create=1970397 cache_read=37258699 calls=244
+**Token Usage:** in=488 out=288631 cache_create=1970397 cache_read=37258699 calls=251
 
 ---
 
