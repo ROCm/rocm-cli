@@ -8,6 +8,17 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Wait out the window in which a compromised release is typically found and
+    # yanked before adopting it. Bumping a pinned SHA is the one moment the pin
+    # stops protecting us: the bump PR itself runs the new action's code on CI —
+    # including the self-hosted GPU lanes, which every Dependabot PR reaches
+    # because each path filter in ci.yml folds in `.github/workflows/**` — before
+    # a human has read the diff. Those runners keep state across jobs, so the
+    # blast radius outlives the run. GitHub already applies 3 days by default;
+    # published Actions compromises have gone unnoticed for longer than that, so
+    # widen it. Cooldown delays only version updates, never security updates.
+    cooldown:
+      default-days: 7
     groups:
       github-actions:
         patterns:
