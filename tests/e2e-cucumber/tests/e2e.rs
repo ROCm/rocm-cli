@@ -661,43 +661,112 @@ fn inference_timeout_for(world: &E2eWorld) -> u64 {
     inference_timeout_secs().max(world.serve_timeout_override.unwrap_or(0))
 }
 
-pub async fn send_chat(world: &mut E2eWorld) {
-    let endpoint = world.endpoint.as_ref().expect("no endpoint configured");
+/// A transport failure spelled out well enough to triage from a CI log alone.
+///
+/// `reqwest::Error`'s `Display` prints only its KIND — a client timeout and a
+/// refused/reset connection both read as "error sending request for url (…)",
+/// with the real cause reachable only through `source()`. That ambiguity cost a
+/// full log archaeology once (a 10s client timeout that read as a dead server),
+/// so classify the error and unwind the source chain into the panic message.
+fn describe_request_error(error: &reqwest::Error) -> String {
+    use std::error::Error as _;
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(inference_timeout_for(world)))
-        .build()
-        .expect("failed to build HTTP client");
+    let kind = if error.is_timeout() {
+        " [client timeout — the harness gave up, the server may still be working]"
+    } else if error.is_connect() {
+        " [connect failure — nothing accepted the connection]"
+    } else {
+        ""
+    };
+    let mut detail = format!("{error}{kind}");
+    let mut source = error.source();
+    while let Some(cause) = source {
+        detail.push_str(&format!("\n  caused by: {cause}"));
+        source = cause.source();
+    }
+    detail
+}
 
+/// Discover the served model id over `/models` and POST one chat completion to
+/// it, returning the decoded response. `tools` is merged into the request body
+/// for the tool-definitions scenario.
+///
+/// Retries once on a transport failure, but only for a scenario expected to
+/// PASS — the same rule the serve relaunch uses. The FIRST inference after a
+/// serve pays a cold start (weights paged in on demand), and on a busy runner
+/// that has exceeded the flat inference timeout even though the steady-state
+/// request on the very same host takes ~1s: run 30614673685 (Strix-Windows)
+/// failed this at exactly 10.000s while the next scenario's chat answered in
+/// 1.4s. The aborted attempt still leaves the model resident, so the retry runs
+/// warm. A known-bug scenario keeps its single attempt so hang detection stays
+/// as prompt as `inference_timeout_secs` documents.
+pub async fn request_chat_completion(
+    world: &mut E2eWorld,
+    prompt: &str,
+    tools: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let endpoint = world.endpoint.clone().expect("no endpoint configured");
+    let timeout_secs = inference_timeout_for(world);
+    let attempts = if world.expect_xfail { 1 } else { 2 };
     let models_url = format!("{endpoint}/models");
-    let resp: serde_json::Value = client
-        .get(&models_url)
-        .send()
-        .await
-        .unwrap_or_else(|e| panic!("GET {models_url} failed: {e}"))
-        .json()
-        .await
-        .unwrap_or_else(|e| panic!("GET {models_url} returned non-JSON: {e}"));
-    let model = resp["data"][0]["id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no model id in response: {resp}"))
-        .to_string();
-    world.discovered_model = Some(model.clone());
-
     let chat_url = format!("{endpoint}/chat/completions");
-    let chat_resp: serde_json::Value = client
-        .post(&chat_url)
-        .json(&serde_json::json!({
+    let mut diagnostics = Vec::new();
+
+    for attempt in 1..=attempts {
+        // A fresh client per attempt: the pooled connection of a timed-out
+        // attempt is not worth reusing.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .expect("failed to build HTTP client");
+
+        let models: serde_json::Value = client
+            .get(&models_url)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("GET {models_url} failed: {}", describe_request_error(&e)))
+            .json()
+            .await
+            .unwrap_or_else(|e| panic!("GET {models_url} returned non-JSON: {e}"));
+        let model = models["data"][0]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no model id in response: {models}"))
+            .to_string();
+        world.discovered_model = Some(model.clone());
+
+        let mut body = serde_json::json!({
             "model": model,
-            "messages": [{"role": "user", "content": "Hello"}]
-        }))
-        .send()
-        .await
-        .unwrap_or_else(|e| panic!("POST {chat_url} failed: {e}"))
-        .json()
-        .await
-        .unwrap_or_else(|e| panic!("POST {chat_url} returned non-JSON: {e}"));
-    world.chat_response = Some(chat_resp);
+            "messages": [{"role": "user", "content": prompt}]
+        });
+        if let Some(tools) = tools.clone() {
+            body["tools"] = tools;
+        }
+
+        let started = std::time::Instant::now();
+        match client.post(&chat_url).json(&body).send().await {
+            Ok(response) => {
+                return response
+                    .json()
+                    .await
+                    .unwrap_or_else(|e| panic!("POST {chat_url} returned non-JSON: {e}"));
+            }
+            Err(error) => diagnostics.push(format!(
+                "attempt {attempt} failed after {:.1}s: {}",
+                started.elapsed().as_secs_f64(),
+                describe_request_error(&error)
+            )),
+        }
+    }
+
+    panic!(
+        "POST {chat_url} failed after {attempts} attempt(s) of {timeout_secs}s each:\n{}",
+        diagnostics.join("\n")
+    );
+}
+
+pub async fn send_chat(world: &mut E2eWorld) {
+    let response = request_chat_completion(world, "Hello", None).await;
+    world.chat_response = Some(response);
 }
 
 // ── Runner ─────────────────────────────────────────────────────────
