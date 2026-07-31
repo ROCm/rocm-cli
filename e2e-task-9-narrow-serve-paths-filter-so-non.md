@@ -1,6 +1,6 @@
 # WIP: E2E Task #9: narrow 'serve' paths-filter so non-serve Rust PRs skip the GPU matrix
 
-**Stage:** 6-implementing — code complete; pre-PR review passed; container gate GREEN; rebase needed (main advanced); awaiting rebase → commit/push
+**Stage:** 6-implementing — code complete + rebased onto latest main; container re-verification pending; awaiting commit/push
 **Pipeline:** lightweight
 **Branch:** e2e-task-9-narrow-serve-paths-filter-so-non
 **Jira:** EAI-7746 (Task, rocm-cli, unassigned)
@@ -8,7 +8,7 @@
 **Last Updated:** 2026-07-31
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=1050 out=483200 cache_create=6541300 cache_read=98750000 calls=520
+**Token Usage:** in=1230 out=551709 cache_create=7530125 cache_read=126413705 calls=610
 
 ---
 
@@ -70,13 +70,14 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 
 1. ✅ Pre-PR review (2 rounds, all findings fixed + re-verified).
 2. ✅ Confirm Strix-Windows lane recently green (verified: green on last 3 main runs 07-28/07-29/07-31).
-3. ✅ Container gate (Linux, repo convention): GREEN (exit 0 + marker; clippy/workspace tests/e2e lib/e2e mock all passed; mock reconciliation 3 xfail/0 XPASS/0 unexpected).
-4. Commit (signed + sign-off, EAI-7746 + WL-175?, no AI refs), push via git-push-fallback --no-verify, open PR bundling #8+#9.
-5. On PR: confirm all required GPU checks PRODUCED; scoped dispatch validates canary serves only 6b.
+3. ✅ Rebase onto latest main (d17fc0c): PR #139's `@lifecycle` work merged with my `@canary`/`@serves-on-gpu` work in expectation.rs + tests/e2e.rs (resolve() now 6-arg); ci.yml + both feature files auto-merged clean. Mac-side lib tests pass (57).
+4. Container gate re-run on the rebased tree: last run's completion record was lost (session/background-task teardown); re-run and confirm GREEN before push.
+5. Commit (signed + sign-off, EAI-7746 only — no internal WL-xx refs per user), push via git-push-fallback --no-verify, open PR bundling #8+#9.
+6. On PR: confirm all required GPU checks PRODUCED; scoped dispatch validates canary serves only 6b.
 
 ## Blockers
 
-**BLOCKED:** Main advanced (PR #139 merged today, d17fc0c); branch is 1 commit behind and overlaps 3 of 5 changed files (ci.yml, expectation.rs, tests/e2e.rs). Uncommitted work backed up as patch (workspace/wip/task9-backup-*.patch). Awaiting rebase onto d17fc0c + reconcile, then signed commit (EAI-7746 only, no WL-175) + push via git-push-fallback --no-verify + PR create bundling #8+#9.
+**BLOCKED (awaiting user/next session):** rebase is done and mac-side tests pass, but the container-gate re-run against the rebased tree has no confirmed completion record — must re-run `workspace/wip/container-test.sh all` and see the GREEN marker before commit/push. User said "go" to proceed with commit/push once green.
 
 ## Notes
 
@@ -90,6 +91,11 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 **Worktree directory**: created on start under `~/Developer/rocm-cli-wt/e2e-task-9-narrow-serve-paths-filter-so-non`.
 
 ## Work Log
+
+### 2026-07-31 (session 3 — rebase onto latest main)
+
+- Stashed uncommitted work, fast-forwarded branch to origin/main (d17fc0c), popped stash: ci.yml + both feature files auto-merged clean; expectation.rs + tests/e2e.rs had conflicts (main's new `@lifecycle`/`include_lifecycle` vs my `@canary`/`@serves-on-gpu`/`canary_mode`) — merged both feature sets, `resolve()` now takes 6 args (nightly, lifecycle, canary_mode), fixed all ~30 call sites.
+- Mac-side `cargo test -p e2e-cucumber --lib` passes (57, up from 44 — main's lifecycle tests + mine). Started a full container-gate re-run on the rebased tree; no completion record survived to confirm it (background task/session teardown) — needs re-running next.
 
 ### 2026-07-31 (session 2 — pre-PR, container, & rebase discovery)
 
