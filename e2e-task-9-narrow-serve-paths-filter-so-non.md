@@ -1,6 +1,6 @@
 # WIP: E2E Task #9: narrow 'serve' paths-filter so non-serve Rust PRs skip the GPU matrix
 
-**Stage:** 6-implementing — code complete; pre-PR review passed; container gate GREEN; awaiting user authorization for commit/push
+**Stage:** 6-implementing — code complete; pre-PR review passed; container gate GREEN; rebase needed (main advanced); awaiting rebase → commit/push
 **Pipeline:** lightweight
 **Branch:** e2e-task-9-narrow-serve-paths-filter-so-non
 **Jira:** EAI-7746 (Task, rocm-cli, unassigned)
@@ -8,7 +8,7 @@
 **Last Updated:** 2026-07-31
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=790 out=388230 cache_create=5471885 cache_read=72651547 calls=402
+**Token Usage:** in=1050 out=483200 cache_create=6541300 cache_read=98750000 calls=520
 
 ---
 
@@ -76,7 +76,7 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 
 ## Blockers
 
-**BLOCKED (awaiting user):** Authorization to commit/signed push. Container gate is GREEN. User must confirm: (1) reference both EAI-7746 + WL-175 in commit or only EAI-7746?, (2) proceed with commit → push → PR open.
+**BLOCKED:** Main advanced (PR #139 merged today, d17fc0c); branch is 1 commit behind and overlaps 3 of 5 changed files (ci.yml, expectation.rs, tests/e2e.rs). Uncommitted work backed up as patch (workspace/wip/task9-backup-*.patch). Awaiting rebase onto d17fc0c + reconcile, then signed commit (EAI-7746 only, no WL-175) + push via git-push-fallback --no-verify + PR create bundling #8+#9.
 
 ## Notes
 
@@ -91,12 +91,12 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 
 ## Work Log
 
-### 2026-07-31 (session 2 — pre-PR & push)
+### 2026-07-31 (session 2 — pre-PR, container, & rebase discovery)
 
-- **Pre-PR fixes (3 review rounds, all passed):** Round 1: 3 issues (canary leak chat 5&6, root Cargo.toml, report gate). Round 2: 2 more untagged real-serves (model_serving 1&2), tagged @serves-on-gpu. Round 3: PASSED; proactive sweep of all 7 feature files confirmed no other escapes.
-- **Container gate:** GREEN. Script recreated (PATH fix for rust image), retry resumed downloads + compiled. Exit 0 + marker; clippy/workspace tests/lib tests/e2e mock all passed. Mock reconciliation: 3 xfail / 0 XPASS / 0 unexpected.
-- **Strix-Windows:** Verified green on last 3 main runs (07-28, 07-29, 07-31); safe for merge_group-only.
-- **Awaiting:** User go-ahead to commit/signed push (questions: single-ticket EAI-7746 or include WL-175?).
+- **Pre-PR fixes (3 review rounds, PASSED):** Round 1: 3 issues (canary leak chat 5&6, root Cargo.toml, report gate). Round 2: 2 more untagged real-serves (model_serving 1&2), tagged @serves-on-gpu. Round 3: PASSED; proactive sweep of all 7 feature files confirmed no other escapes.
+- **Container gate:** GREEN (exit 0 + marker). Recreated script (PATH fix for rust image), retry resumed + compiled. Clippy/workspace/lib/e2e mock all passed; mock reconciliation 3 xfail / 0 XPASS / 0 unexpected.
+- **Strix-Windows:** Green on last 3 runs (07-28, 07-29, 07-31); safe for merge_group-only.
+- **Rebase blocker:** PR #139 merged today (d17fc0c); branch 1 behind, overlaps 3 of 5 files. Backed up work as patch; awaiting rebase + reconcile before signed commit.
 
 ### 2026-07-30
 
