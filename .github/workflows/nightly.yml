@@ -129,8 +129,8 @@ jobs:
           SHORT_SHA="${{ steps.meta.outputs.short_sha }}"
           DIST="rocm-cli-nightly-${DATE}-${SHORT_SHA}-linux-amd64"
 
-          chmod +x install.sh scripts/package-linux-release.sh
-          ./scripts/package-linux-release.sh "${DIST}"
+          chmod +x install.sh
+          cargo xtask package "${DIST}"
 
           cp "dist/${DIST}.tar.gz" dist/rocm-cli-nightly-linux-amd64.tar.gz
           (cd dist && sha256sum rocm-cli-nightly-linux-amd64.tar.gz > rocm-cli-nightly-linux-amd64.tar.gz.sha256)
@@ -216,7 +216,7 @@ jobs:
           $date = "${{ needs.nightly.outputs.date }}"
           $shortSha = "${{ needs.nightly.outputs.short_sha }}"
           $dist = "rocm-cli-nightly-$date-$shortSha-windows-amd64"
-          .\scripts\package-windows-release.ps1 $dist
+          cargo xtask package $dist
           Copy-Item "dist\$dist.zip" "dist\rocm-cli-nightly-windows-amd64.zip"
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath "dist\rocm-cli-nightly-windows-amd64.zip").Hash.ToLowerInvariant()
           Set-Content -LiteralPath "dist\rocm-cli-nightly-windows-amd64.zip.sha256" -Value "$hash  rocm-cli-nightly-windows-amd64.zip" -Encoding ascii

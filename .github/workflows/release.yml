@@ -125,8 +125,8 @@ jobs:
           VERSION="${{ steps.version.outputs.value }}"
           DIST="rocm-cli-${VERSION}-linux-amd64"
 
-          chmod +x install.sh scripts/package-linux-release.sh
-          ./scripts/package-linux-release.sh "${DIST}"
+          chmod +x install.sh
+          cargo xtask package "${DIST}"
 
           cp "dist/${DIST}.tar.gz" dist/rocm-cli-linux-amd64.tar.gz
           (cd dist && sha256sum rocm-cli-linux-amd64.tar.gz > rocm-cli-linux-amd64.tar.gz.sha256)
@@ -199,7 +199,7 @@ jobs:
         run: |
           $version = "${{ needs.release.outputs.version }}"
           $dist = "rocm-cli-$version-windows-amd64"
-          .\scripts\package-windows-release.ps1 $dist
+          cargo xtask package $dist
           Copy-Item "dist\$dist.zip" "dist\rocm-cli-windows-amd64.zip"
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath "dist\rocm-cli-windows-amd64.zip").Hash.ToLowerInvariant()
           Set-Content -LiteralPath "dist\rocm-cli-windows-amd64.zip.sha256" -Value "$hash  rocm-cli-windows-amd64.zip" -Encoding ascii

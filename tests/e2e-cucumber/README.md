@@ -69,6 +69,14 @@ cargo xtask e2e -- --fail-fast
 ROCM_CLI_BINARY=./target/release/rocm cargo xtask e2e
 ```
 
+The default run is fast: it excludes the expensive, OS-mutating `@lifecycle`
+release-install scenarios (packaging + the real installer + install/uninstall).
+Run only the matching lifecycle set for the current host through the harness:
+
+```bash
+E2E_INCLUDE_LIFECYCLE=1 E2E_ONLY_LIFECYCLE=1 cargo xtask e2e
+```
+
 ## Environment variables
 
 | Variable | Default | Description |
@@ -95,6 +103,7 @@ Scenarios carry stable-id and capability tags:
 | `@requires-os:<linux\|windows>` | Premise is OS-specific; skip on other OSes. |
 | `@serve-timeout:<secs>` | Lengthen the serve-readiness wait for a genuinely slow serve (e.g. a large model). |
 | `@nightly` | Expensive scenario skipped by default; included when `E2E_INCLUDE_NIGHTLY=1`. |
+| `@lifecycle` | Expensive, OS-mutating release-lifecycle scenario (packaging + real installer + install/uninstall). Skipped by default; included when `E2E_INCLUDE_LIFECYCLE=1`. `E2E_ONLY_LIFECYCLE=1` selects only this set without bypassing expectation resolution. |
 
 Known bugs are **not** tagged in the `.feature` files — they live in
 `expectations.toml`, keyed by `@id`, each with a `when = { ... }` condition (e.g.
