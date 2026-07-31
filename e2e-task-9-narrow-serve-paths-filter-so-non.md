@@ -1,6 +1,7 @@
 # WIP: E2E Task #9: narrow 'serve' paths-filter so non-serve Rust PRs skip the GPU matrix
 
-**Stage:** 6-implementing — code complete, rebased onto latest main, container gate re-verified GREEN; committing/pushing now
+**Stage:** 8-in-review — PR #156 open (https://github.com/ROCm/rocm-cli/pull/156); commit d7896c6 signed+signoff, rebased on main d17fc0c, container gate GREEN
+**PR:** https://github.com/ROCm/rocm-cli/pull/156
 **Pipeline:** lightweight
 **Branch:** e2e-task-9-narrow-serve-paths-filter-so-non
 **Jira:** EAI-7746 (Task, rocm-cli, unassigned)
@@ -8,7 +9,7 @@
 **Last Updated:** 2026-07-31
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=1230 out=551709 cache_create=7530125 cache_read=126413705 calls=610
+**Token Usage:** in=1296 out=565162 cache_create=8949613 cache_read=136497698 calls=645
 
 ---
 
@@ -72,8 +73,9 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 2. ✅ Confirm Strix-Windows lane recently green (verified: green on last 3 main runs 07-28/07-29/07-31).
 3. ✅ Rebase onto latest main (d17fc0c): PR #139's `@lifecycle` work merged with my `@canary`/`@serves-on-gpu` work in expectation.rs + tests/e2e.rs (resolve() now 6-arg); ci.yml + both feature files auto-merged clean. Mac-side lib tests pass (57).
 4. ✅ Container gate re-run on the rebased tree: GREEN (exit 0 + marker; reconciliation 3 xfail / 0 XPASS / 0 unexpected).
-5. Commit (signed + sign-off, EAI-7746 only — no internal WL-xx refs per user), push via git-push-fallback --no-verify, open PR bundling #8+#9. IN PROGRESS.
-6. On PR: confirm all required GPU checks PRODUCED; scoped dispatch validates canary serves only 6b.
+5. ✅ Commit d7896c6 (signed + sign-off, EAI-7746 only), pre-commit hook required a rustfmt pass (2 canary tests reformatted), recommitted clean. Pushed via git-push-fallback --no-verify.
+6. ✅ PR #156 opened: https://github.com/ROCm/rocm-cli/pull/156 (bundles #8+#9).
+7. On PR: confirm all required GPU checks PRODUCED; scoped dispatch validates canary serves only 6b.
 
 ## Notes
 
@@ -87,6 +89,11 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 **Worktree directory**: created on start under `~/Developer/rocm-cli-wt/e2e-task-9-narrow-serve-paths-filter-so-non`.
 
 ## Work Log
+
+### 2026-07-31 (session 4 — commit, push, PR)
+
+- Committed d7896c6 (signed + signed-off, EAI-7746 only, no AI/WL refs); first attempt was reformatted by the cargo-fmt pre-commit hook (2 canary tests in expectation.rs), reran `cargo fmt`, recommitted clean — all hooks passed.
+- Pushed via git-push-fallback --no-verify (green container gate is the justification); opened PR #156 bundling Task #8 + #9.
 
 ### 2026-07-31 (session 3 — rebase onto latest main)
 
