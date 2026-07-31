@@ -97,8 +97,9 @@ vLLM claims a fixed fraction of each GPU's **total** VRAM — not of the free
 VRAM, and not scaled to the model — for weights plus KV cache. On a large card
 a small model therefore still reserves a large slice.
 
-rocm-cli passes no `--gpu-memory-utilization` of its own, so vLLM's own default
-applies. Override it when you want a different share:
+rocm-cli sets no `--gpu-memory-utilization` of its own, so vLLM's own default
+applies unless a value comes from somewhere else — either a model's catalog
+recipe or, taking precedence over it, the flag below:
 
 ```bash
 rocm serve <model> --engine vllm --gpu-memory-utilization 0.3 --managed

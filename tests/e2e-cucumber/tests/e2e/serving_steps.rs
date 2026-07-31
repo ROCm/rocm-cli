@@ -144,8 +144,12 @@ async fn ensure_serve_port_free() -> String {
 /// reservation needs the MI300X mostly clear. Only a data-center GPU has this
 /// much, so on smaller cards (e.g. Strix Halo's smaller unified-memory pool) the
 /// floor is capped to 90% of the device total (see [`required_free_vram_mib`]) —
-/// otherwise the check could never pass. That cap is deliberately at vLLM's own
-/// default utilization, so a drained device still just satisfies the request.
+/// otherwise the check could never pass. Note the cap no longer sits above what
+/// vLLM asks for: rocm-cli used to pin utilization below it, and now defers to
+/// vLLM's own (higher) default, so the wait has little headroom left and can
+/// time out on a device that is merely holding display memory. The wait is
+/// best-effort and the serve proceeds regardless, so this costs time rather
+/// than correctness; sizing a deliberate margin is follow-up work.
 const MAX_FREE_VRAM_FLOOR_MIB: u64 = 150_000;
 
 /// The free-VRAM floor to wait for on this host: the model-sized ceiling, but

@@ -4240,7 +4240,7 @@ fn parse_gpu_memory_utilization(value: Option<&str>) -> Result<Option<f64>> {
     if !parsed.is_finite() || parsed <= 0.0 || parsed > 1.0 {
         bail!(
             "--gpu-memory-utilization must be greater than 0 and at most 1 (a fraction of \
-             the GPU's TOTAL VRAM); got `{trimmed}`"
+             the GPU's TOTAL VRAM, e.g. 0.5); got `{trimmed}`"
         );
     }
     Ok(Some(parsed))
