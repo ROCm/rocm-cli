@@ -1,6 +1,6 @@
 # WIP: E2E Task #9: narrow 'serve' paths-filter so non-serve Rust PRs skip the GPU matrix
 
-**Stage:** 6-implementing — code complete; pre-PR review passed; awaiting container gate completion + push
+**Stage:** 6-implementing — code complete; pre-PR review passed; container gate GREEN; awaiting user authorization for commit/push
 **Pipeline:** lightweight
 **Branch:** e2e-task-9-narrow-serve-paths-filter-so-non
 **Jira:** EAI-7746 (Task, rocm-cli, unassigned)
@@ -8,7 +8,7 @@
 **Last Updated:** 2026-07-31
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=766 out=382753 cache_create=4888263 cache_read=69752956 calls=390
+**Token Usage:** in=790 out=388230 cache_create=5471885 cache_read=72651547 calls=402
 
 ---
 
@@ -70,13 +70,13 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 
 1. ✅ Pre-PR review (2 rounds, all findings fixed + re-verified).
 2. ✅ Confirm Strix-Windows lane recently green (verified: green on last 3 main runs 07-28/07-29/07-31).
-3. Container gate (Linux, repo convention) — IN PROGRESS: script recreated + running in background (transient crates.io timeout on 1st attempt; task b135xn1oq, status unknown — no completion record; check output file).
-4. Commit (signed + sign-off, EAI-7746, no AI refs), push, open PR bundling #8+#9.
+3. ✅ Container gate (Linux, repo convention): GREEN (exit 0 + marker; clippy/workspace tests/e2e lib/e2e mock all passed; mock reconciliation 3 xfail/0 XPASS/0 unexpected).
+4. Commit (signed + sign-off, EAI-7746 + WL-175?, no AI refs), push via git-push-fallback --no-verify, open PR bundling #8+#9.
 5. On PR: confirm all required GPU checks PRODUCED; scoped dispatch validates canary serves only 6b.
 
 ## Blockers
 
-**BLOCKED (awaiting user):** Container gate background task (b135xn1oq) stopped without completion record (may have been killed/timed out on session teardown). Output file at `/private/tmp/claude-501/-Users-fres-Developer-rocm-cli-wt-e2e-task-9-narrow-serve-paths-filter-so-non/8c1b9f63-96ee-4631-a78f-1b22c9c40b6d/tasks/b135xn1oq.output` — check if partial output shows the status (was downloading crates at stop). Once gate is confirmed green locally or output reviewed, user authorization needed to commit/signed push. All code changes complete; pre-PR review passed.
+**BLOCKED (awaiting user):** Authorization to commit/signed push. Container gate is GREEN. User must confirm: (1) reference both EAI-7746 + WL-175 in commit or only EAI-7746?, (2) proceed with commit → push → PR open.
 
 ## Notes
 
@@ -91,12 +91,12 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 
 ## Work Log
 
-### 2026-07-31 (continued)
+### 2026-07-31 (session 2 — pre-PR & push)
 
-- **Pre-PR-review fixes (3 rounds, all passed):** Round 1: 3 issues found/fixed (canary leak on chat 5&6, root Cargo.toml gap, report gate mismatch). Round 2: 2 more untagged real-serves in model_serving (scenarios 1&2); tagged @serves-on-gpu. Round 3: PASSED after proactive sweep of all 7 feature files + serving_steps.rs confirmed no other real GPU serves escape canary gating.
-- **Container gate:** Script recreated from memory (path issues on rust image); background task started but stopped without completion record. Output at `/private/tmp/claude-501/...`. Awaiting completion confirmation.
-- **Strix-Windows stability:** Verified green on last 3 main runs (07-28, 07-29, 07-31); safe to move merge_group-only.
-- **Awaiting:** container gate completion confirmation + user sign-off to commit/push.
+- **Pre-PR fixes (3 review rounds, all passed):** Round 1: 3 issues (canary leak chat 5&6, root Cargo.toml, report gate). Round 2: 2 more untagged real-serves (model_serving 1&2), tagged @serves-on-gpu. Round 3: PASSED; proactive sweep of all 7 feature files confirmed no other escapes.
+- **Container gate:** GREEN. Script recreated (PATH fix for rust image), retry resumed downloads + compiled. Exit 0 + marker; clippy/workspace tests/lib tests/e2e mock all passed. Mock reconciliation: 3 xfail / 0 XPASS / 0 unexpected.
+- **Strix-Windows:** Verified green on last 3 main runs (07-28, 07-29, 07-31); safe for merge_group-only.
+- **Awaiting:** User go-ahead to commit/signed push (questions: single-ticket EAI-7746 or include WL-175?).
 
 ### 2026-07-30
 
