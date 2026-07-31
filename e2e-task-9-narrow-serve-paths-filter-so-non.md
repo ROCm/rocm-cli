@@ -9,7 +9,7 @@
 **Last Updated:** 2026-07-31
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=1296 out=565162 cache_create=8949613 cache_read=136497698 calls=645
+**Token Usage:** in=1322 out=576699 cache_create=10071831 cache_read=140157588 calls=658
 
 ---
 
@@ -75,11 +75,13 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 4. ✅ Container gate re-run on the rebased tree: GREEN (exit 0 + marker; reconciliation 3 xfail / 0 XPASS / 0 unexpected).
 5. ✅ Commit d7896c6 (signed + sign-off, EAI-7746 only), pre-commit hook required a rustfmt pass (2 canary tests reformatted), recommitted clean. Pushed via git-push-fallback --no-verify.
 6. ✅ PR #156 opened: https://github.com/ROCm/rocm-cli/pull/156 (bundles #8+#9).
-7. On PR: confirm all required GPU checks PRODUCED; scoped dispatch validates canary serves only 6b.
+7. ✅ Confirmed all required GPU checks PRODUCED on PR #156: `E2E tests (GPU)` passed 1m26s (canary mode working as designed), both Strix lanes correctly `skipping` (merge_group-only), report gate green. No review comments anywhere (0 formal reviews/inline/issue comments) — `REVIEW_REQUIRED` is just the pending maintainer-team gate, not feedback.
+8. `windows-build-and-test` (required) is failing on `lifecycle-windows-http-install` — an HTTP download flake in PR #139's new install-lifecycle test, NOT in this PR's diff. Offered to re-run the job; awaiting go-ahead.
+9. Scoped dispatch to validate canary serves only 6b — still open.
 
 ## Blockers
 
-**BLOCKED (awaiting user):** PR #156 is open; asked whether to actively watch its required GPU checks (Next Step #7) — no instruction yet to proceed.
+**BLOCKED (awaiting user):** offered to re-run the failing `windows-build-and-test` job (unrelated flake, not caused by this PR) — no instruction yet to proceed.
 
 ## Notes
 
@@ -93,6 +95,12 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 **Worktree directory**: created on start under `~/Developer/rocm-cli-wt/e2e-task-9-narrow-serve-paths-filter-so-non`.
 
 ## Work Log
+
+### 2026-07-31 (session 5 — PR checks triage)
+
+- A relayed nudge claimed PR #156 had open review feedback needing a fix+push; exhaustively checked all three comment surfaces (formal reviews, inline diff comments, issue comments) — all empty. Premise was false; no code change made.
+- Verified checks instead: `E2E tests (GPU)` passed in 1m26s (canary mode confirmed working — fast, single-scenario), both Strix lanes correctly `skipping` on PR (merge_group-only as designed), report green, no merge conflict.
+- Found one real, unrelated failure: `windows-build-and-test` fails on `lifecycle-windows-http-install` (HTTP download error) — a scenario PR #139 added today, not in this PR's diff. Offered a job re-run; holding for authorization.
 
 ### 2026-07-31 (session 4 — commit, push, PR)
 
