@@ -4,7 +4,7 @@
 **Pipeline:** lightweight
 **Branch:** e2e-task-9-narrow-serve-paths-filter-so-non
 **Jira:** EAI-7746 (Task, rocm-cli, unassigned)
-**Pre-PR-check:** passed (after two review rounds, all issues fixed)
+**Pre-PR-check:** review-done — OpenCode reviewer (gpt-5.6-sol), 2026-07-31, @ca9f297+e2748ac0b92b8d83 — PASSED after two review rounds (all issues fixed); short-name scenarios now @serves-on-gpu, full serve-step/feature sweep found no other real GPU serve escaping canary gating; focused tests + harness compile + clippy + git diff --check all pass.
 **Last Updated:** 2026-07-31
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
@@ -69,14 +69,14 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 ## Next Steps
 
 1. ✅ Pre-PR review (2 rounds, all findings fixed + re-verified).
-2. Container gate (Linux, repo convention).
+2. Container gate (Linux, repo convention) — IN PROGRESS: script recreated + running (transient crates.io timeout on first attempt, retrying).
 3. Confirm Strix-Windows lane recently green before relying on merge_group-only.
 4. Commit (signed + sign-off, EAI-7746, no AI refs), push, open PR bundling #8+#9.
 5. On PR: confirm all required GPU checks PRODUCED; scoped dispatch validates canary serves only 6b.
 
 ## Blockers
 
-**BLOCKED (awaiting user):** Container gate + Strix-Windows stability check before commit/push. All code changes complete; two pre-PR review rounds cleared.
+**BLOCKED (awaiting user):** Container gate (transient network timeout, retry in progress) + Strix-Windows stability check + user authorization to commit/push. All code changes complete; pre-PR review passed.
 
 ## Notes
 
