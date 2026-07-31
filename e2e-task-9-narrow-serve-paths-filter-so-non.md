@@ -1,13 +1,13 @@
 # WIP: E2E Task #9: narrow 'serve' paths-filter so non-serve Rust PRs skip the GPU matrix
 
-**Stage:** 6-implementing — awaiting user authorization for three pre-PR fixes
+**Stage:** 6-implementing — all pre-PR fixes applied + locally verified; ready for container gate + Strix check + commit/push
 **Pipeline:** lightweight
 **Branch:** e2e-task-9-narrow-serve-paths-filter-so-non
 **Jira:** EAI-7746 (Task, rocm-cli, unassigned)
-**Pre-PR-check:** changes-requested — OpenCode reviewer (gpt-5.6-sol), 2026-07-31, @ca9f297 (dirty)
-  - Canary mode still runs two non-canary real GPU serves — expectation.rs:338 only skips non-canary @requires-gpu, but chat.feature:48 & :59 are untagged and serving_steps.rs:555-568 real-serves on GPU. Add/use a tag for scenarios that may real-serve on GPU so they stay mock-covered but skip in PR canary mode. → Awaiting user authorization to fix (relay gate blocks agent Edit).
-  - Root Cargo.toml can bypass the serve filter — ci.yml:137-150 omits root Cargo.toml even though workspace deps affect serving crates without necessarily changing Cargo.lock. Add root Cargo.toml (not **/Cargo.toml, preserving dash exclusions). → Awaiting user authorization to fix.
-  - GPU E2E can run while its consolidated report skips — ci.yml:1281 gates only on heavy, but serve includes paths not covered by heavy. Gate the report on heavy || serve || workflow_dispatch. → Awaiting user authorization to fix.
+**Pre-PR-check:** changes-requested → ALL 3 FIXED (OpenCode reviewer gpt-5.6-sol, 2026-07-31, @ca9f297); re-review pending
+  - Canary mode ran two non-canary real GPU serves (chat.feature 5 & 6 untagged; serving_steps.rs:567 real-serves on GPU). → FIXED: added `@serves-on-gpu` tag + `ScenarioDecl.serves_on_gpu`; canary skip now `requires_gpu || serves_on_gpu`; tagged both chat scenarios; unit test added.
+  - Root Cargo.toml bypassed the serve filter (workspace-dep edits not touching Cargo.lock). → FIXED: added root-only `Cargo.toml` to serve filter (not `**/Cargo.toml`, dash stays excluded).
+  - GPU E2E could run while the consolidated report skipped (report gated on heavy only). → FIXED: report now gates on `heavy || serve || workflow_dispatch`.
 **Last Updated:** 2026-07-31
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
@@ -69,12 +69,9 @@ canary tests); `--test e2e --no-run` compiles; `cargo clippy -p e2e-cucumber
 --all-targets -D warnings` clean; ci.yml YAML parses; grep audit — `serve` on
 exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repointed).
 
-## Next Steps (awaiting user authorization)
+## Next Steps
 
-1. **Pre-PR fixes (three code changes required):**
-   - Fix 1: Add `@serves-on-gpu` tag; canary_mode skips scenarios that may real-serve on GPU (requires_gpu OR serves_on_gpu). Tag chat scenarios 5 & 6.
-   - Fix 2: Add root-only `Cargo.toml` to serve filter (not `**/Cargo.toml`, to preserve dash exclusions).
-   - Fix 3: Gate e2e-report on `heavy || serve || workflow_dispatch` instead of just `heavy`.
+1. ✅ Pre-PR fixes applied + locally re-verified (lib tests 44 pass, clippy clean, YAML parses).
 2. Container gate (Linux, repo convention).
 3. Confirm Strix-Windows lane recently green before relying on merge_group-only.
 4. Commit (signed + sign-off, EAI-7746, no AI refs), push, open PR bundling #8+#9.
@@ -82,7 +79,7 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 
 ## Blockers
 
-**BLOCKED (awaiting user):** Pre-PR-check findings (changes-requested) require three code edits before proceeding to commit/push. User must authorize edits (relay gate blocks Edit from agent).
+**BLOCKED (awaiting user):** Container gate + Strix-Windows stability check before commit/push. All code changes complete and locally verified.
 
 ## Notes
 
@@ -101,8 +98,7 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 
 - **Full implementation (Part A + B):** Added `serve` paths-filter + merge_group gating + `@canary` harness gate. Part A: allowlist exclude dash crates; Part B: MI300X canary on PR, Strix jobs merge_group-only, canary_mode skips non-canary @requires-gpu scenarios.
 - **Local verification:** cargo test 44 pass (incl. 2 canary tests), clippy -D warnings clean, ci.yml YAML parses, grep audit passes.
-- **Pre-PR review (changes-requested):** Found three real issues: (1) canary skips non-canary @requires-gpu but chat scenarios 5&6 are untagged + real-serve on GPU → need @serves-on-gpu tag + canary skip both tags; (2) `serve` filter omits root Cargo.toml (to preserve dash exclusions) → transitive workspace-dep edit can bypass filter; (3) e2e-report gates only on `heavy` but `serve` matches paths `heavy` doesn't → GPU can run while report skips.
-- **Three fixes needed** before user can authorize commit: (1) add @serves-on-gpu, tag chat 5&6, update canary skip logic; (2) add root Cargo.toml to serve filter; (3) gate report on heavy || serve || workflow_dispatch.
+- **Pre-PR review (changes-requested):** Found three real issues; **all three fixed + re-verified:** (1) added `@serves-on-gpu` tag + `ScenarioDecl.serves_on_gpu`; canary skip now covers `requires_gpu || serves_on_gpu`; tagged chat scenarios 5 & 6; (2) added root-only `Cargo.toml` to serve filter (dash exclusions preserved); (3) gated e2e-report on `heavy || serve || workflow_dispatch`. Re-ran lib tests (44 pass), clippy, YAML parse — all green.
 
 ### 2026-07-30
 
