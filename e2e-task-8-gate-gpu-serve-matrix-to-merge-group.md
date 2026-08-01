@@ -6,7 +6,7 @@
 **PR:** https://github.com/ROCm/rocm-cli/pull/157 (OPEN; all 21 CI checks PASSING, awaiting maintainer review)
 **Pre-PR-check:** ✅ PASSED — container gate GREEN ×2 (pre/post-rebase); GPU dispatch #920 grid VERIFIED on MI300X (6/6b/8→skip on PR path, 5/7→run+served, 0 unexpected failures); all 21 CI checks on PR #157 PASSING.
 **Last Updated:** 2026-08-01
-**Token Usage:** in=1568 out=487792 cache_create=9573911 cache_read=143352011 calls=790
+**Token Usage:** in=1568 out=491920 cache_create=9573911 cache_read=148485491 calls=798
 
 ---
 
