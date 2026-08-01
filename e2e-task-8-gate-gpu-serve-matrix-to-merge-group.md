@@ -1,11 +1,11 @@
 # WIP: E2E Task #8: gate GPU serve matrix to merge_group + keep a PR canary
 
-**Stage:** 2-implementing — ON HOLD
+**Stage:** 2-implementing
 **Pipeline:** lightweight
-**Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group
-**Pre-PR-check:** pending container gate + GPU dispatch
-**Last Updated:** 2026-07-30
-**Token Usage:** in=1214 out=375991 cache_create=5605365 cache_read=110069614 calls=613
+**Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group (uncommitted, code + ci.yml + features ready)
+**Pre-PR-check:** pending (container gate interrupted; needs restart + commit)
+**Last Updated:** 2026-08-01
+**Token Usage:** in=1278 out=386214 cache_create=6125235 cache_read=115048755 calls=645
 
 ---
 
@@ -60,7 +60,8 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 - fmt check ✓ (applied, clean).
 - clippy ✓ (no issues, `-D warnings`).
 - e2e-cucumber lib tests ✓ (43/43 pass, incl. new `merge_queue_scenario_skips_unless_included`).
-- Full container pre-push gate (Linux CI simulation) remains: needs Apple container apiserver restart; no GPU dispatch possible without self-hosted runner access.
+- Full container pre-push gate: started (dependencies downloading); interrupted before completion.
+- GPU dispatch: not yet attempted.
 
 ## Next Steps
 
@@ -79,7 +80,7 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 
 ## Blockers
 
-**BLOCKED (awaiting user):** Container apiserver not running (needed for Linux gate). Restart container system and run `workspace/wip/container-test.sh` before push. Also need GPU dispatch on app-dev-gpu (manual workflow) to verify merge_group branching.
+**BLOCKED (awaiting user):** Full container gate interrupted mid-run (cold build, dependency download phase). Need to restart `workspace/wip/container-test.sh all` and let it complete (est. 5+ min). Then run scoped GPU dispatch on app-dev-gpu (manual workflow: `--ref e2e-task-8-gate-gpu-serve-matrix-to-merge-group -f platform=app-dev-gpu`) to verify merge_group branching before commit/push.
 
 ## Work Log
 
@@ -97,3 +98,10 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 - ✅ Tagged 3 redundant serves (6, 6b, 8) with `@merge-queue`; documented 2 canary serves (5, 7) with comments.
 - ✅ Wired `E2E_MERGE_QUEUE` env to all 3 GPU jobs in ci.yml; YAML validates.
 - ✅ Local verification: fmt clean, clippy `-D warnings` clean, lib tests 43/43 pass. Diff: 102 insertions, 30 deletions (4 files).
+
+### 2026-08-01 (Morning)
+
+- Created `workspace/wip/container-test.sh` (git-ignored gate script, mirrors CI clippy/test jobs).
+- Fixed PATH issue in script (login shell was dropping `/usr/local/cargo/bin`; switched to `bash -c` explicit export).
+- Started full container gate (`clippy + workspace test + e2e lib + e2e mock`); interrupted mid-run at dependency download phase (cold build, est. 5+ min to completion).
+- Code changes all in place (4 files modified as intended); awaiting container gate + GPU dispatch before commit.
