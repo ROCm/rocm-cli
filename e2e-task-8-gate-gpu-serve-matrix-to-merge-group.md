@@ -3,7 +3,7 @@
 **Stage:** 6-implementing
 **Pipeline:** lightweight
 **Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group (committed 83f223d, signed + rebased onto origin/main, PUSHED to origin)
-**Pre-PR-check:** container gate GREEN twice (pre- and post-rebase); scoped GPU dispatch still pending (fres's call — verifies real PR-vs-merge_group serve selection on hardware)
+**Pre-PR-check:** container gate GREEN twice (pre- and post-rebase); scoped GPU dispatch still pending (fres's call)
 **Last Updated:** 2026-08-01
 **Token Usage:** in=1454 out=452512 cache_create=6601347 cache_read=132483662 calls=733
 
