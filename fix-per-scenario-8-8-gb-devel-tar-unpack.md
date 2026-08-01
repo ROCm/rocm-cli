@@ -1,12 +1,12 @@
 # WIP: Fix per-scenario 8.8 GB devel-tar unpack blowing E2E 90-min CI cap
 
-**Stage:** 3-test-proof — ON HOLD
+**Stage:** 4-dispatch-probe
 **Pipeline:** lightweight
 **Branch:** fix-per-scenario-8-8-gb-devel-tar-unpack
 **Pre-PR-check:** none
-**Last Updated:** 2026-07-30
+**Last Updated:** 2026-08-01
 
-**Token Usage:** in=1186 out=107614 cache_create=371292 cache_read=9927916 calls=88
+**Token Usage:** in=1368 out=225297 cache_create=1510468 cache_read=25177468 calls=179
 
 ---
 
@@ -22,15 +22,20 @@ Fix the per-scenario 8.8 GB devel-tar unpack that blows the E2E 90-min CI cap. R
 
 ✅ **Verify probe fallback**: Confirmed from `ROCM_SDK_PROBE_SCRIPT` that `root_path`/`bin_path` fall back to package-derived roots when absent, and required `amdhip64`/`hipblas` resolve from `libraries` alone — devel not needed for serve/chat scenarios.
 
+✅ **Gate GPU pre-warms**: Updated both `app-dev-gpu` and `strix-halo-ubuntu` pre-warm blocks in `.github/workflows/ci.yml` to set `ROCM_CLI_THEROCK_EXTRAS=libraries`, so the shared venv skips 8.8→12 GB devel unpack and the fix actually takes effect on CI runners.
+
+✅ **Commit + sign**: All 3 files committed with signed commit (msg: "perf(e2e): gate TheRock devel extra behind ROCM_CLI_THEROCK_EXTRAS"). Pre-push hook blocks on known macOS-only pid tests; confirmed identical failures on clean base (not caused by diff).
+
 ## Blockers
 
-**BLOCKED (awaiting user):** Ready to prove with 2-scenario `@probe` GPU dispatch. Implementation complete and locally verified (both crates build; 50/50 therock unit tests pass, 5 new). Awaiting go-ahead to burn shared GPU CI (~30–75 min) for real-GPU timing proof before full dispatch.
+**BLOCKED (awaiting infrastructure):** Container Linux gate running (cold build ~5+ min). Pre-push macOS hook blocks due to known OS-only pid tests (`managed_stop_*`). Once container gate passes (clippy + workspace tests + e2e lib with `-D warnings`), will push `--no-verify` (justified by container gate per standing rule) and dispatch 2-scenario `app-dev-gpu` probe.
 
 ## Next Steps
 
-1. *User to approve*: Run 2-scenario `@probe` GPU dispatch to confirm devel tar is skipped and timing improves.
-2. Full dispatch and monitor E2E runtime against 90-min cap.
-3. Consider GH Actions `timeout-minutes` self-cancellation delay (~95 min vs. spec).
+1. Wait for container gate (clippy + workspace tests + e2e lib, `-D warnings`) to complete.
+2. Once green, push `--no-verify` (justified by container gate) and dispatch scoped 2-scenario `app-dev-gpu` probe on `serve-vllm-inference` + `serve-default-engine-inference` (both hit the precondition).
+3. Monitor pre-warm log to detect if shared tree was skipped (would mean no timing proof, need to manually reset `/RUNNER_WORKSPACE/e2e-prewarm`); confirm devel tar NOT unpacked and scenario timing improves.
+4. If probe succeeds, full dispatch (all scenarios, all platforms) and verify E2E total is under 90 min.
 
 ## Notes
 
@@ -48,3 +53,9 @@ Fix the per-scenario 8.8 GB devel-tar unpack that blows the E2E 90-min CI cap. R
 - Added 5 unit tests: default/explicit/blank parsing, library-only rocm spec, all pass.
 - Wired `ROCM_CLI_THEROCK_EXTRAS=libraries` into `a managed runtime is active` precondition (runtime_steps.rs) via `run_rocm_with_env()`, skipping 8.8→12 GB devel unpack in shared-tree scenarios. `runtime-install-sdk-active` unchanged (full devel).
 - Both crates build; 50/50 therock tests pass; awaiting user go-ahead for 2-scenario GPU `@probe` dispatch proof.
+
+### 2026-08-01 — Push Preparation & Dispatch Setup
+
+- Discovered CI confound: GPU pre-warm (not precondition) creates the shared venv that all scenarios reuse. Updated both `app-dev-gpu` and `strix-halo-ubuntu` pre-warm blocks to gate via `ROCM_CLI_THEROCK_EXTRAS=libraries`, so fix actually takes effect on CI runners.
+- Committed all 3 files (therock.rs, runtime_steps.rs, ci.yml) with signed commit. Pre-push macOS hook fails on 3 known OS-only pid tests (`managed_stop_*`), confirmed identical failures on clean base (not caused by this diff).
+- Created container-test.sh Linux gate (clippy + workspace tests + e2e lib, `-D warnings` to match CI). Running cold build (expected ~5+ min). Once green, will push `--no-verify` (justified by container gate per standing rule) and dispatch 2-scenario `app-dev-gpu` probe on `serve-vllm-inference` + `serve-default-engine-inference`.
