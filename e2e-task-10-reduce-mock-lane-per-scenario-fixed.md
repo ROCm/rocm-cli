@@ -1,12 +1,12 @@
 # WIP: E2E Task #10: reduce mock-lane per-scenario fixed overhead
 
-**Stage:** 5-investigating — awaiting user decision
+**Stage:** 5-investigating — ON HOLD (awaiting user decision on WL-177)
 **Pipeline:** lightweight
 **Branch:** e2e-task-10-reduce-mock-lane-per-scenario-fixed
 **Pre-PR-check:** none
-**Last Updated:** 2026-07-30
+**Last Updated:** 2026-08-01
 
-**Token Usage:** in=326 out=142851 cache_create=869256 cache_read=24871324 calls=174
+**Token Usage:** in=334 out=144401 cache_create=1461307 cache_read=25068470 calls=178
 
 ---
 
@@ -63,14 +63,9 @@ to build caching, or drop as P3.
 
 ## Blockers
 
-**BLOCKED (awaiting user):** WL-177 profiling complete. Decision needed:
-1. Close ticket as won't-fix/obsolete (premise refuted; ~40ms per-scenario cost
-   is not addressable without breaking test isolation).
-2. Re-scope to mock-job build-caching strategy (cache/reuse release `rocm` build
-   across scenarios; overlaps Tasks #8/#9 territory).
-3. Drop as lowest-priority P3 (leave for future consideration).
-
-See **PROFILING RESULT** section above for data.
+**BLOCKED (awaiting user):** WL-177 was closed by user (2026-08-01) as obsolete.
+Decision executed: ticket resolved with full profiling explanation. No further
+action required — premise refuted; no per-scenario cost to cut.
 
 ## Notes
 
