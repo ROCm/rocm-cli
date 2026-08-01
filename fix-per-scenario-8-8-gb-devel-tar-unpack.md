@@ -6,7 +6,7 @@
 **Pre-PR-check:** passed (opencode-reviewer, 2026-08-01, @e9e9fb8+169f13be85104885)
 **Last Updated:** 2026-08-01
 
-**Token Usage:** in=1567 out=290189 cache_create=3472693 cache_read=42658287 calls=267
+**Token Usage:** in=1675 out=338635 cache_create=3994326 cache_read=54767504 calls=321
 
 ---
 
@@ -28,14 +28,14 @@ Fix the per-scenario 8.8 GB devel-tar unpack that blows the E2E 90-min CI cap. R
 
 ## Blockers
 
-**BLOCKED (awaiting user):** GPU pre-warm tree on both runners (github-runner-0 and -1) holds 25GB venv from Jul 28 with full `libraries,devel`. Workflow skips pre-warm when registry exists, so dispatch now would reuse old devel venv and prove nothing. Need to reset `/RUNNER_WORKSPACE/e2e-prewarm` registry on both pods so fresh `libraries`-only pre-warm runs. Confirm proceed before wiping shared CI state.
+**AWAITING USER:** Probe run #922 queued on gpu runners. Monitor `gh run view 30716967820 --json status,jobs` when convenient; check pre-warm log line to confirm fresh `libraries`-only install (no `rocm_sdk_devel`, no 8.8GB unpack) and both scenarios passed. Post-probe: clean up `e2e-prewarm.wl88-bak` on both runner pods (backups at `/home/runner/_work/rocm-cli/e2e-prewarm.wl88-bak` on github-runner-0 and -1) or restore if probe fails. Then proceed to full-suite dispatch + PR or report any issues.
 
 ## Next Steps
 
-1. **User decision:** Reset `/RUNNER_WORKSPACE/e2e-prewarm/data/runtimes/registry` on both GPU pods (github-runner-0, github-runner-1) to force fresh pre-warm on next dispatch.
-2. Once cleared, dispatch scoped 2-scenario `app-dev-gpu` probe: `--name 'vllm|default-engine-inference'` to run `serve-vllm-inference` + `serve-default-engine-inference` (both hit `a managed runtime is active` precondition).
-3. Monitor pre-warm log to confirm `libraries`-only install runs (no devel tar unpack) and scenarios complete under baseline timing.
-4. If probe succeeds, full dispatch (all scenarios, all platforms) and verify E2E total is under 90 min.
+1. **IN FLIGHT:** Scoped probe dispatched — CI run **#922** (databaseId 30716967820), `app-dev-gpu`, `--name 'responds to inference requests on vLLM|default-engine served model responds'`. Branch pushed at `d014bae`; Linux container gate green (clippy+tests+e2e-lib, offline seeded). Both GPU runners' stale 25GB devel pre-warm trees moved aside to `e2e-prewarm.wl88-bak` (reversible) so a fresh `libraries`-only pre-warm runs.
+2. Monitor #922: confirm pre-warm log shows `libraries`-only install (NO `rocm_sdk_devel` in venv, no 8.8GB devel unpack) and both scenarios pass.
+3. **Cleanup after probe:** either delete `e2e-prewarm.wl88-bak` on both pods once the new libraries-only tree is validated, or restore it if the probe fails. Backups at `/home/runner/_work/rocm-cli/e2e-prewarm.wl88-bak` on github-runner-0 and -1.
+4. If probe succeeds, full dispatch (all scenarios, all platforms) and verify E2E total is under 90 min, then open PR.
 
 ## Notes
 
@@ -59,4 +59,4 @@ Fix the per-scenario 8.8 GB devel-tar unpack that blows the E2E 90-min CI cap. R
 - Discovered CI confound: GPU pre-warm (not precondition) creates shared venv. Updated all 3 GPU-lane pre-warm blocks (app-dev, strix-ubuntu, strix-windows) to gate via `ROCM_CLI_THEROCK_EXTRAS=libraries`. Amended commit message to reflect "all three" gates.
 - Container Linux gate (`workspace/wip/container-test.sh`): cold build hit transient cargo network timeouts. Seeded container CARGO_HOME from host (1010 crates, 1.1 GB) and re-ran offline. Gate completed green: clippy 0 warnings, workspace tests 0 failures (incl. 5 new therock tests), e2e-cucumber lib 42/42.
 - Pushed branch with `--no-verify` (justified by offline gate green + known macOS pid tests unrelated). Commit d014bae signed and on origin.
-- Detected runner state confound: both GPU runners hold 25GB pre-warm registry from Jul 28 (pre-change, full devel). Workflow skips pre-warm when registry exists, so dispatch now would reuse old devel venv. Awaiting user OK to reset `/RUNNER_WORKSPACE/e2e-prewarm` registries on both pods.
+- Detected runner state confound: both GPU runners hold 25GB pre-warm registry from Jul 28 (pre-change, full devel). Workflow skips pre-warm when registry exists, so dispatch now would reuse old devel venv. User approved move-aside approach: moved `/home/runner/_work/rocm-cli/e2e-prewarm` → `e2e-prewarm.wl88-bak` on both runners (reversible). Dispatched scoped probe (run #922, `app-dev-gpu`, filtered to 2 precondition scenarios). Pre-warm expected to run fresh `libraries`-only install with no devel tar unpack.
