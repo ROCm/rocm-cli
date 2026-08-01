@@ -80,6 +80,10 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 9. Scoped dispatch to validate canary serves only 6b — still open.
 10. Watch the re-run to green; then PR #156 is fully clear pending only the maintainer-team review.
 
+## Blockers
+
+**BLOCKED (awaiting user):** Windows re-run kicked off and `pending`; asked whether to watch it to completion and report, or leave it running unattended — no answer yet.
+
 ## Notes
 
 - Promoted from WL-176 (rocm-cli, +ci +task). Created EAI-7746 as canonical Jira ticket.
