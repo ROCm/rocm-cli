@@ -4,7 +4,7 @@
 **Pipeline:** lightweight
 **Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group (committed 83f223d, signed + rebased onto origin/main, PUSHED to origin)
 **PR:** https://github.com/ROCm/rocm-cli/pull/157 (OPEN; CI running, awaiting review)
-**Pre-PR-check:** review-done — opencode-reviewer, 2026-08-01, @83f223d+9699affe1a604bb8. No findings ≥80. Change mirrors @nightly/@lifecycle precedent exactly: new @merge-queue axis (const+field+parse+resolve skip branch), all 29 resolve() callers updated, dedicated unit test (skip-on-PR / run-in-queue / nightly-independent / cheapest-first GPU gate) passes, 64/64 lib tests green, ci.yml YAML valid, canaries 5/7 stay untagged so required GPU checks still produced on PRs, leak scan clean, no conflict markers. Container gate GREEN twice; GPU dispatch #920 grid VERIFIED (MI300X: 6/6b/8 skip, 5/7 serve, 0 unexpected).
+**Pre-PR-check:** ✅ PASSED — container gate GREEN ×2 (pre/post-rebase); GPU dispatch #920 grid VERIFIED on MI300X (6/6b/8→skip on PR path, 5/7→run+served, 0 unexpected failures).
 **Last Updated:** 2026-08-01
 **Token Usage:** in=1550 out=485138 cache_create=8289408 cache_read=142327141 calls=781
 
