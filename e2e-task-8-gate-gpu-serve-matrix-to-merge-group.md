@@ -1,6 +1,6 @@
 # WIP: E2E Task #8: gate GPU serve matrix to merge_group + keep a PR canary
 
-**Stage:** 8-review
+**Stage:** 8-review — awaiting maintainer approval
 **Pipeline:** lightweight
 **Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group (committed 83f223d, signed + rebased onto origin/main, PUSHED to origin)
 **PR:** https://github.com/ROCm/rocm-cli/pull/157 (OPEN; all 21 CI checks PASSING, awaiting maintainer review)
@@ -78,7 +78,7 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 
 ## Blockers
 
-None — PR #157 is open with all 21 CI checks passing; waiting on maintainer review approval to merge.
+**BLOCKED (awaiting maintainer):** PR #157 has all 21 CI checks PASSING. Waiting on ROCm codeowner/maintainer review approval to merge.
 
 ## Work Log
 
