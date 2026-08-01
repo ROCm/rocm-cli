@@ -9,7 +9,7 @@
 **Last Updated:** 2026-08-01
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=2553 out=1065492 cache_create=33861358 cache_read=266248796 calls=1260
+**Token Usage:** in=2561 out=1066826 cache_create=34257310 cache_read=267432950 calls=1264
 
 ---
 
@@ -77,12 +77,12 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 6. ✅ PR #156 opened: https://github.com/ROCm/rocm-cli/pull/156 (bundles #8+#9).
 7. ✅ Confirmed all required GPU checks PRODUCED on PR #156: `E2E tests (GPU)` passed 1m26s (canary mode working as designed), both Strix lanes correctly `skipping` (merge_group-only), report gate green. No review comments anywhere (0 formal reviews/inline/issue comments) — `REVIEW_REQUIRED` is just the pending maintainer-team gate, not feedback.
 8. ✅ `windows-build-and-test` re-run authorized by user and kicked off (job now `pending`) to clear the unrelated PR #139 flake.
-9. Scoped dispatch to validate canary serves only 6b — still open.
-10. Watch the re-run to green; then PR #156 is fully clear pending only the maintainer-team review.
+9. Scoped dispatch to validate canary serves only 6b — still open (optional extra verification).
+10. ✅ Windows re-run watched to completion: PASSED (12m20s) — confirmed it was the #139 flake, not this PR.
 
 ## Blockers
 
-**BLOCKED (awaiting user):** Windows re-run kicked off and `pending`; asked whether to watch it to completion and report, or leave it running unattended — no answer yet.
+**BLOCKED (awaiting maintainer review):** PR #156 — every check now green/passing (windows-build-and-test re-run confirmed PASS). merge=BLOCKED / review=REVIEW_REQUIRED is only the ROCm CLI Maintainers team review — a human gate, nothing left to do until they review.
 
 ## Notes
 
@@ -96,6 +96,10 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 **Worktree directory**: created on start under `~/Developer/rocm-cli-wt/e2e-task-9-narrow-serve-paths-filter-so-non`.
 
 ## Work Log
+
+### 2026-08-01 (session 7 — Windows re-run confirmed green)
+
+- User asked to check on the Windows re-run: `windows-build-and-test` PASSED (12m20s), confirming the earlier failure was the unrelated #139 flake. No fail/pending checks remain on PR #156 — fully green, waiting only on maintainer-team review.
 
 ### 2026-08-01 (session 6 — Windows re-run)
 
