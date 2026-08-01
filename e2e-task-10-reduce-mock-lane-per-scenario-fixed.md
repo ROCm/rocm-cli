@@ -1,6 +1,6 @@
 # WIP: E2E Task #10: reduce mock-lane per-scenario fixed overhead
 
-**Stage:** 5-investigating — ON HOLD (awaiting user decision on WL-177)
+**Stage:** 5-investigating ✅ complete
 **Pipeline:** lightweight
 **Branch:** e2e-task-10-reduce-mock-lane-per-scenario-fixed
 **Pre-PR-check:** none
@@ -58,14 +58,12 @@ per-scenario. See **Blockers** below.
 
 ## Next Steps
 
-Blocked pending fres decision on ticket direction: close as won't-fix, re-scope
-to build caching, or drop as P3.
+Task complete. WL-177 closed as obsolete. Profiling delivered; no per-scenario
+overhead found.
 
 ## Blockers
 
-**BLOCKED (awaiting user):** WL-177 was closed by user (2026-08-01) as obsolete.
-Decision executed: ticket resolved with full profiling explanation. No further
-action required — premise refuted; no per-scenario cost to cut.
+None. WL-177 closed as obsolete (2026-08-01). Profiling investigation complete.
 
 ## Notes
 
@@ -77,13 +75,19 @@ action required — premise refuted; no per-scenario cost to cut.
 
 ## Work Log
 
+### 2026-08-01 (session 3 — final)
+
+- Profiling investigation complete on Linux (authoritative env). Confirmed 1.38s total for all 31 scenarios; ~40ms per-scenario; no fixed overhead.
+- User decided: WL-177 closed as obsolete (premise refuted; no per-scenario cost to cut).
+- Cleanup: removed profiling scratch (23G Linux build cache, helper, results); git clean; no source changes.
+
 ### 2026-07-30 (session 2)
 
 - Profiled mock-lane per-scenario cost on Linux (Apple `container`; Mac runtime is OS-gated and misleading).
 - Built Linux release `rocm` + prebuilt cucumber harness; ran all 31 scenarios in isolation and full suite.
 - Measured: harness binary direct = 1.38s total; per-scenario ~40ms; scenario 11 ("no-GPU fails fast") = 0.07s.
 - Measured: `cargo test` wrapper = 72.7s (build-only = 25.4s, re-run = 2.1s); CI step = 98–345s (includes release `rocm` build).
-- **Conclusion:** no meaningful per-scenario fixed cost. Ticket premise (4.8s overhead) = build cost misattributed to per-scenario. Awaiting user decision on ticket direction.
+- **Conclusion:** no meaningful per-scenario fixed cost. Ticket premise (4.8s overhead) = build cost misattributed to per-scenario. User decision pending.
 
 ### 2026-07-30
 
