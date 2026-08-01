@@ -6,7 +6,7 @@
 **Pre-PR-check:** none
 **Last Updated:** 2026-08-01
 
-**Token Usage:** in=1368 out=225297 cache_create=1510468 cache_read=25177468 calls=179
+**Token Usage:** in=1412 out=234854 cache_create=2325943 cache_read=28841869 calls=201
 
 ---
 
@@ -28,7 +28,7 @@ Fix the per-scenario 8.8 GB devel-tar unpack that blows the E2E 90-min CI cap. R
 
 ## Blockers
 
-**BLOCKED (awaiting user):** Container Linux gate failed mid-download (cargo network timeouts retrying); session ended before task completed. Gate script created at `workspace/wip/container-test.sh` and can be re-run from any shell. Once complete and green, push `--no-verify` (justified by container gate per standing rule) and dispatch 2-scenario `app-dev-gpu` probe on `serve-vllm-inference` + `serve-default-engine-inference`.
+**BLOCKED (awaiting user):** Container Linux gate: first run hit transient cargo download timeouts to crates.io (container networking flaky). Seeded container's CARGO_HOME from host registry (1010 crates, 1.1 GB) and re-running offline (`CARGO_OFFLINE=1`). Gate script at `workspace/wip/container-test.sh` can be retried. Branch committed+signed; ready to push `--no-verify` once gate clears. Then dispatch 2-scenario `app-dev-gpu` probe on `serve-vllm-inference` + `serve-default-engine-inference`.
 
 ## Next Steps
 
@@ -58,4 +58,4 @@ Fix the per-scenario 8.8 GB devel-tar unpack that blows the E2E 90-min CI cap. R
 
 - Discovered CI confound: GPU pre-warm (not precondition) creates the shared venv that all scenarios reuse. Updated both `app-dev-gpu` and `strix-halo-ubuntu` pre-warm blocks to gate via `ROCM_CLI_THEROCK_EXTRAS=libraries`, so fix actually takes effect on CI runners.
 - Committed all 3 files (therock.rs, runtime_steps.rs, ci.yml) with signed commit. Pre-push macOS hook fails on 3 known OS-only pid tests (`managed_stop_*`), confirmed identical failures on clean base (not caused by this diff).
-- Created container-test.sh Linux gate (clippy + workspace tests + e2e lib, `-D warnings` to match CI); ran cold build (cargo hit transient network timeouts mid-download). Gate script persists in `workspace/wip/container-test.sh` for retry. Awaiting user to re-run gate once green, then push `--no-verify` and dispatch scoped 2-scenario `app-dev-gpu` probe.
+- Created container-test.sh Linux gate (clippy + workspace tests + e2e lib, `-D warnings` to match CI). Cold build hit transient cargo download timeouts to crates.io (container networking flaky). Seeded container CARGO_HOME from host registry (1010 platform-independent crates) and re-ran with `CARGO_OFFLINE=1`; gate now compiling cleanly offline. Script persists at `workspace/wip/container-test.sh` for final retry. Blocked awaiting gate completion, then push `--no-verify` and dispatch scoped 2-scenario `app-dev-gpu` probe.
