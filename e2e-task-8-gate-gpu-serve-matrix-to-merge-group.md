@@ -3,9 +3,9 @@
 **Stage:** 6-implementing
 **Pipeline:** lightweight
 **Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group (committed 83f223d, signed + rebased onto origin/main, PUSHED to origin)
-**Pre-PR-check:** container gate GREEN twice (pre- and post-rebase); scoped GPU dispatch run #920 IN PROGRESS on app-dev-gpu (MI300X runner online + picked up)
+**Pre-PR-check:** container gate GREEN twice (pre- and post-rebase); scoped GPU dispatch run #920 COMPLETED SUCCESS on app-dev-gpu. Awaiting platform.json grid download to verify 6/6b/8 skip, 5/7 run.
 **Last Updated:** 2026-08-01
-**Token Usage:** in=1484 out=467251 cache_create=7302924 cache_read=135283259 calls=748
+**Token Usage:** in=1494 out=469572 cache_create=7774554 cache_read=135990614 calls=753
 
 ---
 
@@ -61,7 +61,7 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 - clippy ✓ (no issues, `-D warnings`).
 - e2e-cucumber lib tests ✓ (64/64 pass, incl. new `merge_queue_scenario_skips_unless_included`).
 - Full container pre-push gate (post-rebase) ✓ (exit 0: clippy clean, workspace tests green, e2e mock reconciliation: 3 xfail/0 XPASS/0 unexpected).
-- GPU dispatch ✓ (run #920 on app-dev-gpu, queued and picked up by MI300X runner; awaiting completion).
+- GPU dispatch ✓ (run #920 on app-dev-gpu COMPLETED SUCCESS; awaiting platform.json grid download to verify scenario resolution).
 
 ## Next Steps
 
@@ -78,7 +78,7 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 
 ## Blockers
 
-**BLOCKED (awaiting GPU dispatch):** run #920 (id 30697549543) on app-dev-gpu queued and picked up by MI300X runner. Awaiting completion to verify platform.json grid: scenarios 6/6b/8 skip (N/A, merge-queue-only), canaries 5/7 run/serve. After dispatch green + grid verified: open PR against main.
+**BLOCKED (awaiting fres):** GPU dispatch run #920 completed success. Download e2e-gpu-report artifact (run 30697549543) and verify platform.json grid: scenarios 6/6b/8 resolved to N/A/skip (merge-queue-only), canaries 5/7 resolved to pass/served. After grid verified: open PR against main.
 
 ## Work Log
 
@@ -104,4 +104,4 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 - Committed signed + signed-off (83f223d): `test(e2e): gate heavy GPU serves to the merge queue`. Rebased onto origin/main (PR #139 added parallel `@lifecycle` axis); resolved 10 conflicts (kept both axes; `resolve()` now takes 3 include-bools).
 - Re-ran container gate on rebased tree (warm caches, incremental): exit 0 (clippy clean, workspace tests pass, e2e-cucumber lib 64/64, e2e mock reconciliation 3 xfail/0 XPASS/0 unexpected).
 - Pushed branch to origin via `git-push-fallback --no-verify` (HTTPS, keychain auth). Branch now 1 ahead of origin/main, 0 behind.
-- Dispatched scoped GPU E2E: `gh workflow run ci.yml --ref e2e-task-8-gate-gpu-serve-matrix-to-merge-group -f platform=app-dev-gpu` → run #920 queued on MI300X runner. Verifies PR-path gating: scenarios 6/6b/8 (merge-queue) skip N/A, canaries 5/7 run/serve.
+- Dispatched scoped GPU E2E: `gh workflow run ci.yml --ref e2e-task-8-gate-gpu-serve-matrix-to-merge-group -f platform=app-dev-gpu` → run #920 on MI300X runner. COMPLETED SUCCESS. Awaiting platform.json artifact download to verify PR-path gating: 6/6b/8 skip (N/A, merge-queue), 5/7 run/serve.
