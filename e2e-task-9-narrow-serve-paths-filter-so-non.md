@@ -6,7 +6,7 @@
 **Branch:** e2e-task-9-narrow-serve-paths-filter-so-non
 **Jira:** EAI-7746 (Task, rocm-cli, unassigned)
 **Pre-PR-check:** review-done — OpenCode reviewer (gpt-5.6-sol), 2026-07-31, @ca9f297+e2748ac0b92b8d83 — PASSED after two review rounds (all issues fixed); short-name scenarios now @serves-on-gpu, full serve-step/feature sweep found no other real GPU serve escaping canary gating; focused tests + harness compile + clippy + git diff --check all pass.
-**Last Updated:** 2026-08-01
+**Last Updated:** 2026-08-01 (re-verified next day: no new review feedback, same unrelated flake)
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
 **Token Usage:** in=1346 out=579403 cache_create=14223013 cache_read=140535190 calls=670
