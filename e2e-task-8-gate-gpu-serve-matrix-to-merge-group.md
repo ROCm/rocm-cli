@@ -3,9 +3,9 @@
 **Stage:** 6-implementing
 **Pipeline:** lightweight
 **Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group (committed 83f223d, signed + rebased onto origin/main, PUSHED to origin)
-**Pre-PR-check:** container gate GREEN twice (pre- and post-rebase); scoped GPU dispatch still pending (fres's call)
+**Pre-PR-check:** container gate GREEN twice (pre- and post-rebase); scoped GPU dispatch run #920 (id 30697549543) queued on app-dev-gpu
 **Last Updated:** 2026-08-01
-**Token Usage:** in=1454 out=452512 cache_create=6601347 cache_read=132483662 calls=733
+**Token Usage:** in=1484 out=467251 cache_create=7302924 cache_read=135283259 calls=748
 
 ---
 
@@ -61,14 +61,12 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 - clippy ✓ (no issues, `-D warnings`).
 - e2e-cucumber lib tests ✓ (64/64 pass, incl. new `merge_queue_scenario_skips_unless_included`).
 - Full container pre-push gate (post-rebase) ✓ (exit 0: clippy clean, workspace tests green, e2e mock reconciliation: 3 xfail/0 XPASS/0 unexpected).
-- GPU dispatch: not yet attempted (pending fres authorization).
+- GPU dispatch ✓ (run #920 on app-dev-gpu, queued and picked up by MI300X runner; awaiting completion).
 
 ## Next Steps
 
-1. ⏸ Restart Apple container, run full Linux container gate locally (clippy + cargo test --workspace + lib tests + e2e mock).
-2. Run scoped GPU dispatch on app-dev-gpu (manual workflow: `--ref e2e-task-8-gate-gpu-serve-matrix-to-merge-group -f platform=app-dev-gpu`).
-3. Verify: PR event skips 6/6b/8, keeps 5/7; merge_group runs all. Confirm no required checks are removed.
-4. Open PR against main.
+1. ⏸ Await GPU dispatch completion (run #920 running on MI300X, ~30–60 min). Download platform.json grid and verify scenarios 6/6b/8 skip (N/A, merge-queue-only) while canaries 5/7 run (serve successfully).
+2. Open PR against main (after dispatch green and grid verified).
 
 ## Notes
 
@@ -80,7 +78,7 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 
 ## Blockers
 
-**BLOCKED (awaiting user):** Scoped GPU dispatch to verify real PR-vs-merge_group serve behavior on hardware (fres's call: run `gh workflow run ci.yml --ref e2e-task-8-gate-gpu-serve-matrix-to-merge-group -f platform=app-dev-gpu` to confirm 6/6b/8 skip on pull_request event, 5/7 run). After dispatch green: open PR against main.
+**BLOCKED (awaiting GPU dispatch):** run #920 (id 30697549543) on app-dev-gpu queued and picked up by MI300X runner. Awaiting completion to verify platform.json grid: scenarios 6/6b/8 skip (N/A, merge-queue-only), canaries 5/7 run/serve. After dispatch green + grid verified: open PR against main.
 
 ## Work Log
 
@@ -106,3 +104,4 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 - Committed signed + signed-off (83f223d): `test(e2e): gate heavy GPU serves to the merge queue`. Rebased onto origin/main (PR #139 added parallel `@lifecycle` axis); resolved 10 conflicts (kept both axes; `resolve()` now takes 3 include-bools).
 - Re-ran container gate on rebased tree (warm caches, incremental): exit 0 (clippy clean, workspace tests pass, e2e-cucumber lib 64/64, e2e mock reconciliation 3 xfail/0 XPASS/0 unexpected).
 - Pushed branch to origin via `git-push-fallback --no-verify` (HTTPS, keychain auth). Branch now 1 ahead of origin/main, 0 behind.
+- Dispatched scoped GPU E2E: `gh workflow run ci.yml --ref e2e-task-8-gate-gpu-serve-matrix-to-merge-group -f platform=app-dev-gpu` → run #920 queued on MI300X runner. Verifies PR-path gating: scenarios 6/6b/8 (merge-queue) skip N/A, canaries 5/7 run/serve.
