@@ -3,7 +3,7 @@
 **Stage:** 4-dispatch-probe
 **Pipeline:** lightweight
 **Branch:** fix-per-scenario-8-8-gb-devel-tar-unpack
-**Pre-PR-check:** none
+**Pre-PR-check:** passed (opencode-reviewer, 2026-08-01, @e9e9fb8+169f13be85104885)
 **Last Updated:** 2026-08-01
 
 **Token Usage:** in=1412 out=234854 cache_create=2325943 cache_read=28841869 calls=201
@@ -22,13 +22,13 @@ Fix the per-scenario 8.8 GB devel-tar unpack that blows the E2E 90-min CI cap. R
 
 ✅ **Verify probe fallback**: Confirmed from `ROCM_SDK_PROBE_SCRIPT` that `root_path`/`bin_path` fall back to package-derived roots when absent, and required `amdhip64`/`hipblas` resolve from `libraries` alone — devel not needed for serve/chat scenarios.
 
-✅ **Gate GPU pre-warms**: Updated both `app-dev-gpu` and `strix-halo-ubuntu` pre-warm blocks in `.github/workflows/ci.yml` to set `ROCM_CLI_THEROCK_EXTRAS=libraries`, so the shared venv skips 8.8→12 GB devel unpack and the fix actually takes effect on CI runners.
+✅ **Gate GPU pre-warms**: Updated `app-dev-gpu`, `strix-halo-ubuntu`, and `strix-halo-windows` pre-warm blocks in `.github/workflows/ci.yml` to set `ROCM_CLI_THEROCK_EXTRAS=libraries` (PowerShell cleanup added), so the shared venv skips 8.8→12 GB devel unpack and the fix takes effect on CI runners.
 
 ✅ **Commit + sign**: All 3 files committed with signed commit (msg: "perf(e2e): gate TheRock devel extra behind ROCM_CLI_THEROCK_EXTRAS"). Pre-push hook blocks on known macOS-only pid tests; confirmed identical failures on clean base (not caused by diff).
 
 ## Blockers
 
-**BLOCKED (awaiting user):** Container Linux gate: first run hit transient cargo download timeouts to crates.io (container networking flaky). Seeded container's CARGO_HOME from host registry (1010 crates, 1.1 GB) and re-running offline (`CARGO_OFFLINE=1`). Gate script at `workspace/wip/container-test.sh` can be retried. Branch committed+signed; ready to push `--no-verify` once gate clears. Then dispatch 2-scenario `app-dev-gpu` probe on `serve-vllm-inference` + `serve-default-engine-inference`.
+**BLOCKED (awaiting user):** Container Linux gate offline build was stopped (background task). Seeded container CARGO_HOME from host (1010 crates, 1.1 GB) and has offline script at `workspace/wip/container-test.sh`. Can retry: `CARGO_OFFLINE=1 workspace/wip/container-test.sh all`. Branch committed+signed; ready to push `--no-verify` once gate clears. Then dispatch 2-scenario `app-dev-gpu` probe.
 
 ## Next Steps
 
@@ -56,6 +56,7 @@ Fix the per-scenario 8.8 GB devel-tar unpack that blows the E2E 90-min CI cap. R
 
 ### 2026-08-01 — Push Preparation & Dispatch Setup
 
-- Discovered CI confound: GPU pre-warm (not precondition) creates the shared venv that all scenarios reuse. Updated both `app-dev-gpu` and `strix-halo-ubuntu` pre-warm blocks to gate via `ROCM_CLI_THEROCK_EXTRAS=libraries`, so fix actually takes effect on CI runners.
-- Committed all 3 files (therock.rs, runtime_steps.rs, ci.yml) with signed commit. Pre-push macOS hook fails on 3 known OS-only pid tests (`managed_stop_*`), confirmed identical failures on clean base (not caused by this diff).
-- Created container-test.sh Linux gate (clippy + workspace tests + e2e lib, `-D warnings` to match CI). Cold build hit transient cargo download timeouts to crates.io (container networking flaky). Seeded container CARGO_HOME from host registry (1010 platform-independent crates) and re-ran with `CARGO_OFFLINE=1`; gate now compiling cleanly offline. Script persists at `workspace/wip/container-test.sh` for final retry. Blocked awaiting gate completion, then push `--no-verify` and dispatch scoped 2-scenario `app-dev-gpu` probe.
+- Discovered CI confound: GPU pre-warm (not precondition) creates the shared venv that all scenarios reuse. Updated `app-dev-gpu`, `strix-halo-ubuntu`, and `strix-halo-windows` pre-warm blocks to gate via `ROCM_CLI_THEROCK_EXTRAS=libraries`, so fix takes effect on CI.
+- Committed all 3 files (therock.rs, runtime_steps.rs, ci.yml) with signed commit. Pre-push macOS hook fails on 3 known OS-only pid tests (`managed_stop_*`), confirmed not caused by this diff.
+- Created container-test.sh Linux gate (clippy + workspace tests + e2e lib, `-D warnings`). Cold build hit transient cargo download timeouts (container networking flaky). Seeded container CARGO_HOME from host (1010 crates) and re-ran with `CARGO_OFFLINE=1`. Background build task stopped; script saved for retry.
+- Added Windows strix pre-warm gating (PowerShell env var + cleanup) per pre-PR reviewer feedback. Branch ready for push `--no-verify` once container gate completes.
