@@ -5,8 +5,8 @@
 **Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group (committed 83f223d, signed + rebased onto origin/main, PUSHED to origin)
 **PR:** https://github.com/ROCm/rocm-cli/pull/157 (OPEN; all 21 CI checks PASSING, awaiting maintainer review)
 **Pre-PR-check:** ✅ PASSED — container gate GREEN ×2 (pre/post-rebase); GPU dispatch #920 grid VERIFIED on MI300X (6/6b/8→skip on PR path, 5/7→run+served, 0 unexpected failures); all 21 CI checks on PR #157 PASSING.
-**Last Updated:** 2026-08-01
-**Token Usage:** in=1570 out=492067 cache_create=9832143 cache_read=148485491 calls=799
+**Last Updated:** 2026-08-02
+**Token Usage:** in=1582 out=494457 cache_create=10611352 cache_read=149263678 calls=805
 
 ---
 
@@ -78,7 +78,7 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 
 ## Blockers
 
-**BLOCKED (awaiting maintainer):** PR #157 has all 21 CI checks PASSING. Waiting on ROCm codeowner/maintainer review approval to merge.
+**BLOCKED (awaiting user):** PR #157 has all 21 CI checks PASSING and has been open a day with no reviewer assigned. fres: would you like agent to request a review from CODEOWNERS, or leave it as-is?
 
 ## Work Log
 
