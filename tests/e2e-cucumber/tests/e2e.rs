@@ -863,6 +863,10 @@ async fn main() {
     // either its CLI filter OR this closure, so CLI selection would bypass OS,
     // nightly/lifecycle, ID, and expectation resolution entirely.
     let only_lifecycle = std::env::var_os("E2E_ONLY_LIFECYCLE").is_some_and(|v| v == "1");
+    // Heavy `@merge-queue` serves run only in the merge queue (a cheaper
+    // per-engine canary covers them on the PR fast path); set by ci.yml on the
+    // `merge_group` event.
+    let include_merge_queue = std::env::var_os("E2E_MERGE_QUEUE").is_some_and(|v| v == "1");
     eprintln!(
         "Host capability: platform={} os={} gpu={} effective_engine={}",
         cap.platform_slug, cap.os_family, cap.has_amd_gpu, cap.effective_serve_engine,
@@ -931,7 +935,14 @@ async fn main() {
         .filter_run(concat!(env!("CARGO_MANIFEST_DIR"), "/features/"), {
             move |_feature, _rule, scenario| {
                 let decl = ScenarioDecl::from_tags(&scenario.tags);
-                let expectation = resolve(&decl, cap, matrix, include_nightly, include_lifecycle);
+                let expectation = resolve(
+                    &decl,
+                    cap,
+                    matrix,
+                    include_nightly,
+                    include_lifecycle,
+                    include_merge_queue,
+                );
                 let run = (!only_lifecycle || decl.lifecycle)
                     && !matches!(expectation, Expectation::Skip { .. });
                 if let Some(id) = &decl.id {

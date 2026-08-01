@@ -130,6 +130,12 @@ jobs:
       # workflow sets this unconditionally; here it lets a scoped dispatch confirm
       # a single nightly scenario (e.g. the 27B serve) without the full nightly run.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
+      # Opt-in @merge-queue serves: the heavy real serves (default-engine +
+      # readiness) run only in the merge queue, where a cheaper per-engine canary
+      # (scenarios 5 vLLM / 7 lemonade) has already guarded the PR. This keeps the
+      # per-PR GPU run short while still exercising the full serve matrix before a
+      # change lands. Only set on the `merge_group` event.
+      E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -327,6 +333,8 @@ jobs:
       # Match the MI300X dispatch path: opt into the platform-adaptive large-model
       # scenario only when the manual include_nightly input is enabled.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
+      # Heavy @merge-queue serves run only in the merge queue; see e2e-gpu.
+      E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -469,6 +477,8 @@ jobs:
       # Match the Linux Strix dispatch path: opt into the platform-adaptive
       # large-model scenario only when the manual input is enabled.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
+      # Heavy @merge-queue serves run only in the merge queue; see e2e-gpu.
+      E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
