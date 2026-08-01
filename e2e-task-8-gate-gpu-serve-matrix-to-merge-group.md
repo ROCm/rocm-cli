@@ -1,9 +1,9 @@
 # WIP: E2E Task #8: gate GPU serve matrix to merge_group + keep a PR canary
 
-**Stage:** 6-implementing
+**Stage:** 7-pr
 **Pipeline:** lightweight
 **Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group (committed 83f223d, signed + rebased onto origin/main, PUSHED to origin)
-**Pre-PR-check:** container gate GREEN twice (pre- and post-rebase); scoped GPU dispatch run #920 COMPLETED SUCCESS on app-dev-gpu. Awaiting platform.json grid download to verify 6/6b/8 skip, 5/7 run.
+**Pre-PR-check:** review-done — opencode-reviewer, 2026-08-01, @83f223d+9699affe1a604bb8. No findings ≥80. Change mirrors @nightly/@lifecycle precedent exactly: new @merge-queue axis (const+field+parse+resolve skip branch), all 29 resolve() callers updated, dedicated unit test (skip-on-PR / run-in-queue / nightly-independent / cheapest-first GPU gate) passes, 56/56 lib tests green, ci.yml YAML valid, canaries 5/7 stay untagged so required GPU checks still produced on PRs, leak scan clean, no conflict markers. Container gate GREEN twice; GPU dispatch #920 grid VERIFIED (6/6b/8 skip, 5/7 serve).
 **Last Updated:** 2026-08-01
 **Token Usage:** in=1494 out=469572 cache_create=7774554 cache_read=135990614 calls=753
 
@@ -61,12 +61,11 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 - clippy ✓ (no issues, `-D warnings`).
 - e2e-cucumber lib tests ✓ (64/64 pass, incl. new `merge_queue_scenario_skips_unless_included`).
 - Full container pre-push gate (post-rebase) ✓ (exit 0: clippy clean, workspace tests green, e2e mock reconciliation: 3 xfail/0 XPASS/0 unexpected).
-- GPU dispatch ✓ (run #920 on app-dev-gpu COMPLETED SUCCESS; awaiting platform.json grid download to verify scenario resolution).
+- GPU dispatch ✓ (run #920 on app-dev-gpu COMPLETED SUCCESS; platform.json grid verified: scenarios 6/6b/8 skip as N/A, canaries 5/7 run and serve, reconciliation 0 unexpected).
 
 ## Next Steps
 
-1. ⏸ Await GPU dispatch completion (run #920 running on MI300X, ~30–60 min). Download platform.json grid and verify scenarios 6/6b/8 skip (N/A, merge-queue-only) while canaries 5/7 run (serve successfully).
-2. Open PR against main (after dispatch green and grid verified).
+1. Open PR against main (no Jira ID; reference-free body).
 
 ## Notes
 
@@ -78,7 +77,7 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 
 ## Blockers
 
-**BLOCKED (awaiting fres):** GPU dispatch run #920 completed success. Download e2e-gpu-report artifact (run 30697549543) and verify platform.json grid: scenarios 6/6b/8 resolved to N/A/skip (merge-queue-only), canaries 5/7 resolved to pass/served. After grid verified: open PR against main.
+**BLOCKED (awaiting fres):** Open PR against main.
 
 ## Work Log
 
@@ -104,4 +103,4 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 - Committed signed + signed-off (83f223d): `test(e2e): gate heavy GPU serves to the merge queue`. Rebased onto origin/main (PR #139 added parallel `@lifecycle` axis); resolved 10 conflicts (kept both axes; `resolve()` now takes 3 include-bools).
 - Re-ran container gate on rebased tree (warm caches, incremental): exit 0 (clippy clean, workspace tests pass, e2e-cucumber lib 64/64, e2e mock reconciliation 3 xfail/0 XPASS/0 unexpected).
 - Pushed branch to origin via `git-push-fallback --no-verify` (HTTPS, keychain auth). Branch now 1 ahead of origin/main, 0 behind.
-- Dispatched scoped GPU E2E: `gh workflow run ci.yml --ref e2e-task-8-gate-gpu-serve-matrix-to-merge-group -f platform=app-dev-gpu` → run #920 on MI300X runner. COMPLETED SUCCESS. Awaiting platform.json artifact download to verify PR-path gating: 6/6b/8 skip (N/A, merge-queue), 5/7 run/serve.
+- Dispatched scoped GPU E2E: `gh workflow run ci.yml --ref e2e-task-8-gate-gpu-serve-matrix-to-merge-group -f platform=app-dev-gpu` → run #920 on MI300X runner. COMPLETED SUCCESS. Downloaded and verified platform.json grid: serve-default-engine-working-endpoint/inference/readiness-contract (6/6b/8) resolved to skip (merge-queue-only); serve-vllm-inference/lemonade-inference (5/7) ran and served (canaries). Reconciliation: 6 xfail (pre-existing EAI-7333, short-name, lemonade), 1 XPASS flaky (vLLM 5, tolerated), 0 unexpected.
