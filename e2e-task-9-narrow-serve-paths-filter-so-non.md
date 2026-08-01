@@ -82,7 +82,7 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 
 ## Blockers
 
-**BLOCKED (awaiting maintainer review):** PR #156 — every check now green/passing (windows-build-and-test re-run confirmed PASS). merge=BLOCKED / review=REVIEW_REQUIRED is only the ROCm CLI Maintainers team review — a human gate, nothing left to do until they review.
+**BLOCKED (external, not user):** PR #156 — every check now green/passing (windows-build-and-test re-run confirmed PASS). merge=BLOCKED / review=REVIEW_REQUIRED is only the ROCm CLI Maintainers team review — a human gate outside this session; nothing left for the agent or fres to do until they review.
 
 ## Notes
 
