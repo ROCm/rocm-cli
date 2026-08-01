@@ -6,7 +6,7 @@
 **Pre-PR-check:** passed (opencode-reviewer, 2026-08-01, @e9e9fb8+169f13be85104885)
 **Last Updated:** 2026-08-01
 
-**Token Usage:** in=1412 out=234854 cache_create=2325943 cache_read=28841869 calls=201
+**Token Usage:** in=1480 out=248444 cache_create=2979660 cache_read=35535371 calls=235
 
 ---
 
@@ -22,13 +22,15 @@ Fix the per-scenario 8.8 GB devel-tar unpack that blows the E2E 90-min CI cap. R
 
 ✅ **Verify probe fallback**: Confirmed from `ROCM_SDK_PROBE_SCRIPT` that `root_path`/`bin_path` fall back to package-derived roots when absent, and required `amdhip64`/`hipblas` resolve from `libraries` alone — devel not needed for serve/chat scenarios.
 
-✅ **Gate GPU pre-warms**: Updated `app-dev-gpu`, `strix-halo-ubuntu`, and `strix-halo-windows` pre-warm blocks in `.github/workflows/ci.yml` to set `ROCM_CLI_THEROCK_EXTRAS=libraries` (PowerShell cleanup added), so the shared venv skips 8.8→12 GB devel unpack and the fix takes effect on CI runners.
+✅ **Gate GPU pre-warms**: Updated `app-dev-gpu` and `strix-halo-ubuntu` pre-warm blocks in `.github/workflows/ci.yml` to set `ROCM_CLI_THEROCK_EXTRAS=libraries`, so the shared venv skips 8.8→12 GB devel unpack and the fix takes effect on CI runners.
+
+⏳ **Gate Windows strix pre-warm** (staged, not committed): Added `ROCM_CLI_THEROCK_EXTRAS=libraries` to `strix-halo-windows` pre-warm with PowerShell cleanup, for symmetry (per pre-PR reviewer feedback).
 
 ✅ **Commit + sign**: All 3 files committed with signed commit (msg: "perf(e2e): gate TheRock devel extra behind ROCM_CLI_THEROCK_EXTRAS"). Pre-push hook blocks on known macOS-only pid tests; confirmed identical failures on clean base (not caused by diff).
 
 ## Blockers
 
-**BLOCKED (awaiting user):** Container Linux gate offline build was stopped (background task). Seeded container CARGO_HOME from host (1010 crates, 1.1 GB) and has offline script at `workspace/wip/container-test.sh`. Can retry: `CARGO_OFFLINE=1 workspace/wip/container-test.sh all`. Branch committed+signed; ready to push `--no-verify` once gate clears. Then dispatch 2-scenario `app-dev-gpu` probe.
+**BLOCKED (awaiting user):** Container Linux gate offline build stopped mid-compile (background task). Offline seed (1010 crates, 1.1 GB) was working; script at `workspace/wip/container-test.sh`. Retry: `CARGO_OFFLINE=1 workspace/wip/container-test.sh all`. Branch committed+signed; Windows strix pre-warm gating staged locally (uncommitted). Push `--no-verify` + dispatch 2-scenario `app-dev-gpu` probe once gate green.
 
 ## Next Steps
 
