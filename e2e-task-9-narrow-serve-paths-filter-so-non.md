@@ -9,7 +9,7 @@
 **Last Updated:** 2026-08-01
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=1421 out=581822 cache_create=16323951 cache_read=147892310 calls=692
+**Token Usage:** in=1431 out=582686 cache_create=17085000 cache_read=149032808 calls=697
 
 ---
 
@@ -76,12 +76,9 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 5. ✅ Commit d7896c6 (signed + sign-off, EAI-7746 only), pre-commit hook required a rustfmt pass (2 canary tests reformatted), recommitted clean. Pushed via git-push-fallback --no-verify.
 6. ✅ PR #156 opened: https://github.com/ROCm/rocm-cli/pull/156 (bundles #8+#9).
 7. ✅ Confirmed all required GPU checks PRODUCED on PR #156: `E2E tests (GPU)` passed 1m26s (canary mode working as designed), both Strix lanes correctly `skipping` (merge_group-only), report gate green. No review comments anywhere (0 formal reviews/inline/issue comments) — `REVIEW_REQUIRED` is just the pending maintainer-team gate, not feedback.
-8. `windows-build-and-test` (required) is failing on `lifecycle-windows-http-install` — an HTTP download flake in PR #139's new install-lifecycle test, NOT in this PR's diff. Offered to re-run the job; awaiting go-ahead.
+8. ✅ `windows-build-and-test` re-run authorized by user and kicked off (job now `pending`) to clear the unrelated PR #139 flake.
 9. Scoped dispatch to validate canary serves only 6b — still open.
-
-## Blockers
-
-**BLOCKED (awaiting user):** offered to re-run the failing `windows-build-and-test` job (unrelated flake, not caused by this PR) — no instruction yet to proceed.
+10. Watch the re-run to green; then PR #156 is fully clear pending only the maintainer-team review.
 
 ## Notes
 
@@ -95,6 +92,11 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 **Worktree directory**: created on start under `~/Developer/rocm-cli-wt/e2e-task-9-narrow-serve-paths-filter-so-non`.
 
 ## Work Log
+
+### 2026-08-01 (session 6 — Windows re-run)
+
+- Same relayed nudge repeated ~15x identically (none from fres); held each time without re-verifying redundantly, re-checked PR state twice across the repeats (still no review feedback on any surface, same single flake) then continued holding.
+- User authorized directly ("yes rerun the windows job"); kicked off `gh run rerun --job 91206499499`, confirmed `windows-build-and-test` is now `pending`.
 
 ### 2026-07-31 (session 5 — PR checks triage)
 
