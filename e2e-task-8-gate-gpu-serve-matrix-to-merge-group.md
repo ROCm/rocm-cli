@@ -4,7 +4,7 @@
 **Pipeline:** lightweight
 **Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group (uncommitted, code + ci.yml + features ready)
 **Pre-PR-check:** pending (container gate interrupted; needs restart + commit)
-**Last Updated:** 2026-08-01
+**Last Updated:** 2026-08-01 (morning)
 **Token Usage:** in=1278 out=386214 cache_create=6125235 cache_read=115048755 calls=645
 
 ---
@@ -80,7 +80,7 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 
 ## Blockers
 
-**BLOCKED (awaiting user):** Full container gate interrupted mid-run (cold build, dependency download phase). Need to restart `workspace/wip/container-test.sh all` and let it complete (est. 5+ min). Then run scoped GPU dispatch on app-dev-gpu (manual workflow: `--ref e2e-task-8-gate-gpu-serve-matrix-to-merge-group -f platform=app-dev-gpu`) to verify merge_group branching before commit/push.
+**BLOCKED (awaiting user):** Full container gate backgrounded; running cold build (estimated 5–10 min). After completion: verify log for green `clippy + cargo test + e2e-cucumber lib + xtask e2e` results. Then run scoped GPU dispatch on app-dev-gpu (manual workflow: `--ref e2e-task-8-gate-gpu-serve-matrix-to-merge-group -f platform=app-dev-gpu`) to verify merge_group env branching. After both gates green: commit (no refs) + push to origin.
 
 ## Work Log
 
@@ -101,7 +101,6 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 
 ### 2026-08-01 (Morning)
 
-- Created `workspace/wip/container-test.sh` (git-ignored gate script, mirrors CI clippy/test jobs).
-- Fixed PATH issue in script (login shell was dropping `/usr/local/cargo/bin`; switched to `bash -c` explicit export).
-- Started full container gate (`clippy + workspace test + e2e lib + e2e mock`); interrupted mid-run at dependency download phase (cold build, est. 5+ min to completion).
-- Code changes all in place (4 files modified as intended); awaiting container gate + GPU dispatch before commit.
+- Created `workspace/wip/container-test.sh` (git-ignored gate script, mirrors CI clippy/test jobs). Fixed PATH issue (login shell drops `/usr/local/cargo/bin`; switched to explicit export).
+- Started full container gate (cold build ~5+ min); backgrounded to avoid blocking. Awaiting completion + GPU dispatch before commit/push.
+- Code changes complete: 4 files modified (102 insertions, 30 deletions); locally verified via `cargo test -p e2e-cucumber --lib` + mac-local clippy (43/43 tests pass, clippy `-D warnings` clean).
