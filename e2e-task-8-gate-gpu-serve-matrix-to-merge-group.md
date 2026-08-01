@@ -6,7 +6,7 @@
 **PR:** https://github.com/ROCm/rocm-cli/pull/157 (OPEN; CI running, awaiting review)
 **Pre-PR-check:** ✅ PASSED — container gate GREEN ×2 (pre/post-rebase); GPU dispatch #920 grid VERIFIED on MI300X (6/6b/8→skip on PR path, 5/7→run+served, 0 unexpected failures).
 **Last Updated:** 2026-08-01
-**Token Usage:** in=1550 out=485138 cache_create=8289408 cache_read=142327141 calls=781
+**Token Usage:** in=1564 out=487429 cache_create=9059310 cache_read=143352011 calls=788
 
 ---
 
@@ -66,7 +66,7 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 
 ## Next Steps
 
-1. Merge PR #157 after review + CI green.
+1. Merge PR #157 after maintainer review approval.
 
 ## Notes
 
@@ -76,6 +76,9 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 
 **Worktree directory**: created on start under `~/Developer/rocm-cli-wt/e2e-task-8-gate-gpu-serve-matrix-to-merge-group`.
 
+## Blockers
+
+None — PR #157 is open and CI green (21/21 checks passing). Awaiting maintainer review approval.
 
 ## Work Log
 
