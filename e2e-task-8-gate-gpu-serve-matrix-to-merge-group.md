@@ -1,11 +1,11 @@
 # WIP: E2E Task #8: gate GPU serve matrix to merge_group + keep a PR canary
 
-**Stage:** 2-implementing
+**Stage:** 3-testing
 **Pipeline:** lightweight
-**Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group (uncommitted, code + ci.yml + features ready)
-**Pre-PR-check:** pending (container gate interrupted; needs restart + commit)
-**Last Updated:** 2026-08-01 (morning)
-**Token Usage:** in=1278 out=386214 cache_create=6125235 cache_read=115048755 calls=645
+**Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group (committed 83f223d, signed + rebased onto origin/main)
+**Pre-PR-check:** in-progress (full container gate on rebased tree, scoped GPU dispatch next)
+**Last Updated:** 2026-08-01
+**Token Usage:** in=1422 out=442262 cache_create=6587090 cache_read=128909681 calls=717
 
 ---
 
@@ -80,7 +80,7 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 
 ## Blockers
 
-**BLOCKED (awaiting user):** Full container gate backgrounded; running cold build (estimated 5–10 min). After completion: verify log for green `clippy + cargo test + e2e-cucumber lib + xtask e2e` results. Then run scoped GPU dispatch on app-dev-gpu (manual workflow: `--ref e2e-task-8-gate-gpu-serve-matrix-to-merge-group -f platform=app-dev-gpu`) to verify merge_group env branching. After both gates green: commit (no refs) + push to origin.
+**BLOCKED (awaiting user):** Full container gate on rebased tree stopped (session end; incremental, ~10s expected). Confirm gate log shows green `clippy + cargo test + e2e-cucumber lib + xtask e2e` results. Then run scoped GPU dispatch (`gh workflow run ci.yml --ref e2e-task-8-gate-gpu-serve-matrix-to-merge-group -f platform=app-dev-gpu`) to verify merge_group env skips 6/6b/8, keeps 5/7. After both gates green: push to origin with `git-push-fallback --no-verify origin e2e-task-8-gate-gpu-serve-matrix-to-merge-group`.
 
 ## Work Log
 
@@ -102,5 +102,6 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 ### 2026-08-01 (Morning)
 
 - Created `workspace/wip/container-test.sh` (git-ignored gate script, mirrors CI clippy/test jobs). Fixed PATH issue (login shell drops `/usr/local/cargo/bin`; switched to explicit export).
-- Started full container gate (cold build ~5+ min); backgrounded to avoid blocking. Awaiting completion + GPU dispatch before commit/push.
-- Code changes complete: 4 files modified (102 insertions, 30 deletions); locally verified via `cargo test -p e2e-cucumber --lib` + mac-local clippy (43/43 tests pass, clippy `-D warnings` clean).
+- Ran full container gate on initial branch (cold build): clippy clean, all workspace + lib tests pass, e2e mock reconciliation green (3 xfail as expected, 0 XPASS, 0 unexpected).
+- Committed signed + signed-off (83f223d): `test(e2e): gate heavy GPU serves to the merge queue`. Rebased onto origin/main (PR #139 added parallel `@lifecycle` axis); resolved 10 conflicts (kept both axes; `resolve()` now takes 3 include-bools).
+- Re-ran container gate on rebased tree (warm caches, incremental); backgrounded for completion.
