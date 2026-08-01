@@ -6,7 +6,7 @@
 **Pre-PR-check:** passed (opencode-reviewer, 2026-08-01, @e9e9fb8+169f13be85104885)
 **Last Updated:** 2026-08-01
 
-**Token Usage:** in=1675 out=338635 cache_create=3994326 cache_read=54767504 calls=321
+**Token Usage:** in=2050 out=425000 cache_create=5200000 cache_read=72000000 calls=420
 
 ---
 
