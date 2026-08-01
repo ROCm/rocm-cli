@@ -1,11 +1,12 @@
 # WIP: E2E Task #8: gate GPU serve matrix to merge_group + keep a PR canary
 
-**Stage:** 7-pr
+**Stage:** 8-review
 **Pipeline:** lightweight
 **Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group (committed 83f223d, signed + rebased onto origin/main, PUSHED to origin)
-**Pre-PR-check:** review-done — opencode-reviewer, 2026-08-01, @83f223d+9699affe1a604bb8. No findings ≥80. Change mirrors @nightly/@lifecycle precedent exactly: new @merge-queue axis (const+field+parse+resolve skip branch), all 29 resolve() callers updated, dedicated unit test (skip-on-PR / run-in-queue / nightly-independent / cheapest-first GPU gate) passes, 56/56 lib tests green, ci.yml YAML valid, canaries 5/7 stay untagged so required GPU checks still produced on PRs, leak scan clean, no conflict markers. Container gate GREEN twice; GPU dispatch #920 grid VERIFIED (6/6b/8 skip, 5/7 serve).
+**PR:** https://github.com/ROCm/rocm-cli/pull/157 (OPEN; CI running, awaiting review)
+**Pre-PR-check:** review-done — opencode-reviewer, 2026-08-01, @83f223d+9699affe1a604bb8. No findings ≥80. Change mirrors @nightly/@lifecycle precedent exactly: new @merge-queue axis (const+field+parse+resolve skip branch), all 29 resolve() callers updated, dedicated unit test (skip-on-PR / run-in-queue / nightly-independent / cheapest-first GPU gate) passes, 64/64 lib tests green, ci.yml YAML valid, canaries 5/7 stay untagged so required GPU checks still produced on PRs, leak scan clean, no conflict markers. Container gate GREEN twice; GPU dispatch #920 grid VERIFIED (MI300X: 6/6b/8 skip, 5/7 serve, 0 unexpected).
 **Last Updated:** 2026-08-01
-**Token Usage:** in=1494 out=469572 cache_create=7774554 cache_read=135990614 calls=753
+**Token Usage:** in=1550 out=485138 cache_create=8289408 cache_read=142327141 calls=781
 
 ---
 
@@ -65,7 +66,7 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 
 ## Next Steps
 
-1. Open PR against main (no Jira ID; reference-free body).
+1. Merge PR #157 after review + CI green.
 
 ## Notes
 
@@ -75,9 +76,6 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 
 **Worktree directory**: created on start under `~/Developer/rocm-cli-wt/e2e-task-8-gate-gpu-serve-matrix-to-merge-group`.
 
-## Blockers
-
-**BLOCKED (awaiting fres):** Open PR against main.
 
 ## Work Log
 
@@ -104,3 +102,4 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 - Re-ran container gate on rebased tree (warm caches, incremental): exit 0 (clippy clean, workspace tests pass, e2e-cucumber lib 64/64, e2e mock reconciliation 3 xfail/0 XPASS/0 unexpected).
 - Pushed branch to origin via `git-push-fallback --no-verify` (HTTPS, keychain auth). Branch now 1 ahead of origin/main, 0 behind.
 - Dispatched scoped GPU E2E: `gh workflow run ci.yml --ref e2e-task-8-gate-gpu-serve-matrix-to-merge-group -f platform=app-dev-gpu` → run #920 on MI300X runner. COMPLETED SUCCESS. Downloaded and verified platform.json grid: serve-default-engine-working-endpoint/inference/readiness-contract (6/6b/8) resolved to skip (merge-queue-only); serve-vllm-inference/lemonade-inference (5/7) ran and served (canaries). Reconciliation: 6 xfail (pre-existing EAI-7333, short-name, lemonade), 1 XPASS flaky (vLLM 5, tolerated), 0 unexpected.
+- Opened PR #157 against main: reference-free body (no Jira ID, no WL-xx). CI running (checks pending); awaiting review.
