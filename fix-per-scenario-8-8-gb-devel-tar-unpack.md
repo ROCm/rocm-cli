@@ -28,7 +28,7 @@ Fix the per-scenario 8.8 GB devel-tar unpack that blows the E2E 90-min CI cap. R
 
 ## Blockers
 
-**BLOCKED (awaiting infrastructure):** Container Linux gate running (cold build ~5+ min). Pre-push macOS hook blocks due to known OS-only pid tests (`managed_stop_*`). Once container gate passes (clippy + workspace tests + e2e lib with `-D warnings`), will push `--no-verify` (justified by container gate per standing rule) and dispatch 2-scenario `app-dev-gpu` probe.
+**BLOCKED (awaiting user):** Container Linux gate failed mid-download (cargo network timeouts retrying); session ended before task completed. Gate script created at `workspace/wip/container-test.sh` and can be re-run from any shell. Once complete and green, push `--no-verify` (justified by container gate per standing rule) and dispatch 2-scenario `app-dev-gpu` probe on `serve-vllm-inference` + `serve-default-engine-inference`.
 
 ## Next Steps
 
@@ -58,4 +58,4 @@ Fix the per-scenario 8.8 GB devel-tar unpack that blows the E2E 90-min CI cap. R
 
 - Discovered CI confound: GPU pre-warm (not precondition) creates the shared venv that all scenarios reuse. Updated both `app-dev-gpu` and `strix-halo-ubuntu` pre-warm blocks to gate via `ROCM_CLI_THEROCK_EXTRAS=libraries`, so fix actually takes effect on CI runners.
 - Committed all 3 files (therock.rs, runtime_steps.rs, ci.yml) with signed commit. Pre-push macOS hook fails on 3 known OS-only pid tests (`managed_stop_*`), confirmed identical failures on clean base (not caused by this diff).
-- Created container-test.sh Linux gate (clippy + workspace tests + e2e lib, `-D warnings` to match CI). Running cold build (expected ~5+ min). Once green, will push `--no-verify` (justified by container gate per standing rule) and dispatch 2-scenario `app-dev-gpu` probe on `serve-vllm-inference` + `serve-default-engine-inference`.
+- Created container-test.sh Linux gate (clippy + workspace tests + e2e lib, `-D warnings` to match CI); ran cold build (cargo hit transient network timeouts mid-download). Gate script persists in `workspace/wip/container-test.sh` for retry. Awaiting user to re-run gate once green, then push `--no-verify` and dispatch scoped 2-scenario `app-dev-gpu` probe.
