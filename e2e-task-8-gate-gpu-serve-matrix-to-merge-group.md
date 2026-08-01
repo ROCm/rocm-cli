@@ -3,7 +3,7 @@
 **Stage:** 6-implementing
 **Pipeline:** lightweight
 **Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group (committed 83f223d, signed + rebased onto origin/main, PUSHED to origin)
-**Pre-PR-check:** container gate GREEN twice (pre- and post-rebase); scoped GPU dispatch run #920 (id 30697549543) queued on app-dev-gpu
+**Pre-PR-check:** container gate GREEN twice (pre- and post-rebase); scoped GPU dispatch run #920 IN PROGRESS on app-dev-gpu (MI300X runner online + picked up)
 **Last Updated:** 2026-08-01
 **Token Usage:** in=1484 out=467251 cache_create=7302924 cache_read=135283259 calls=748
 
