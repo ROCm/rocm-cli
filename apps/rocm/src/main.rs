@@ -569,6 +569,9 @@ rocm install sdk --family gfx110X-all --dry-run")]
         /// TheRock GPU package family to install, such as gfx110X-all.
         #[arg(long)]
         family: Option<String>,
+        /// Also install the ROCm compiler and headers, for building GPU code.
+        #[arg(long)]
+        devel: bool,
         /// Resolve the install plan without changing files.
         #[arg(long)]
         dry_run: bool,
@@ -2320,6 +2323,7 @@ fn install(target: InstallTarget) -> Result<()> {
             channel,
             format,
             prefix,
+            devel,
             version,
             build_date,
             family,
@@ -2340,12 +2344,15 @@ fn install(target: InstallTarget) -> Result<()> {
                 .map_or_else(|| "<managed>".to_owned(), |path| path.display().to_string());
             match therock::install_sdk(
                 &paths,
-                &channel,
-                format_name,
-                prefix,
-                version_selector,
-                family.as_deref(),
-                dry_run,
+                therock::SdkInstallRequest {
+                    channel: &channel,
+                    format: format_name,
+                    prefix,
+                    version_selector,
+                    family_override: family.as_deref(),
+                    dry_run,
+                    include_devel: devel,
+                },
             ) {
                 Ok(output) => {
                     let finalized = if dry_run {
@@ -7319,6 +7326,9 @@ fn adopt_runtime_from_probe(
         python_launcher: None,
         python_executable: Some(python_executable.display().to_string()),
         pip_cache_dir: None,
+        // The probe only reports a CMake path when the `devel` packages are
+        // present, so it tells us what this pre-existing environment has.
+        devel: probe.cmake_path.is_some(),
         rocm_sdk: Some(probe),
         read_only: true,
         imported_from: Some(install_root),
@@ -11170,7 +11180,19 @@ fn render_install_sdk_dry_run_for_args(paths: &AppPaths, args: &[String]) -> Res
     let version = chat_cli_arg_value(args, "--version").map(str::to_owned);
     let build_date = chat_cli_arg_value(args, "--build-date").map(str::to_owned);
     let selector = therock_install_version_selector(version, build_date)?;
-    therock::install_sdk(paths, channel, format, prefix, selector, None, true)
+    let devel = args.iter().any(|arg| arg == "--devel");
+    therock::install_sdk(
+        paths,
+        therock::SdkInstallRequest {
+            channel,
+            format,
+            prefix,
+            version_selector: selector,
+            dry_run: true,
+            include_devel: devel,
+            ..therock::SdkInstallRequest::default()
+        },
+    )
 }
 
 fn run_command_with_timeout(
@@ -13898,12 +13920,13 @@ fn apply_runtime_update(
         let _ = writeln!(output, "  mode: dry-run");
         let install_plan = therock::install_sdk(
             paths,
-            &source.channel,
-            &source.format,
-            None,
-            None,
-            None,
-            true,
+            therock::SdkInstallRequest {
+                channel: &source.channel,
+                format: &source.format,
+                dry_run: true,
+                include_devel: source.devel,
+                ..therock::SdkInstallRequest::default()
+            },
         )?;
         let _ = writeln!(output, "  install_plan:");
         for line in install_plan.lines() {
@@ -13914,12 +13937,14 @@ fn apply_runtime_update(
 
     let install_output = therock::install_sdk(
         paths,
-        &source.channel,
-        &source.format,
-        None,
-        None,
-        None,
-        false,
+        therock::SdkInstallRequest {
+            channel: &source.channel,
+            format: &source.format,
+            // Reinstall what the user originally chose rather than silently
+            // adding or dropping the compiler toolchain on update.
+            include_devel: source.devel,
+            ..therock::SdkInstallRequest::default()
+        },
     )?;
     let manifests_after = therock::load_runtime_manifests(paths)?;
     let installed = select_installed_update_runtime(&manifests_after, source, &plan.latest_version)
@@ -25857,6 +25882,7 @@ ID_LIKE="suse opensuse"
             }),
             read_only: false,
             imported_from: None,
+            devel: true,
             installed_at_unix_ms,
         };
         fs::create_dir_all(runtime_registry_dir(paths))?;
@@ -25895,6 +25921,7 @@ ID_LIKE="suse opensuse"
             rocm_sdk: None,
             read_only: false,
             imported_from: None,
+            devel: true,
             installed_at_unix_ms: 1,
         }
     }

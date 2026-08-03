@@ -123,15 +123,17 @@ Omit `--prefix` if you want rocm-cli to choose its standard managed folder.
 Expected result:
 
 - rocm-cli creates or reuses a rocm-cli managed Python venv.
-- pip installs pinned `rocm[libraries,devel]`, `torch`, `torchvision`, and
-  `torchaudio` versions from the TheRock index.
+- pip installs pinned `rocm[libraries]`, `torch`, `torchvision`, and
+  `torchaudio` versions from the TheRock index. Passing `--devel` also
+  installs the compiler toolchain, giving `rocm[libraries,devel]`.
 - rocm-cli chooses the newest exact ROCm build suffix common to the SDK package
   and the PyTorch stack for the current Python/platform wheel tags, then pins
   all four packages in one pip transaction.
 - The install does not ask for an external Python venv.
-- Runtime validation uses TheRock's runtime/devel package roots and
+- Runtime validation uses TheRock's runtime package roots and
   `rocm_sdk.find_libraries`; `rocm-sdk path --root` is expected after the
-  pinned `rocm[libraries,devel]` install succeeds.
+  pinned `rocm[libraries]` install succeeds. The compiler toolchain is not
+  required for validation to pass.
 - `rocm examine` reports the active runtime as ready.
 
 Developer-only deterministic override:

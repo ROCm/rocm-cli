@@ -1939,6 +1939,7 @@ mod tests {
             }),
             read_only: false,
             imported_from: None,
+            devel: true,
             installed_at_unix_ms: 100,
         };
 
@@ -2004,6 +2005,7 @@ mod tests {
             }),
             read_only: false,
             imported_from: None,
+            devel: true,
             installed_at_unix_ms: 100,
         };
 
@@ -2100,6 +2102,7 @@ mod tests {
             }),
             read_only: false,
             imported_from: None,
+            devel: true,
             installed_at_unix_ms: 100,
         })
     }

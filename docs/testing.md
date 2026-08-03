@@ -164,8 +164,9 @@ Then it verifies:
   explicit `--prefix` folders
 - the installer does not pre-create that pip cache during dry-run or setup;
   pip creates it inside the ROCm folder when packages are downloaded
-- a single TheRock-index pip install plan for pinned `rocm[libraries,devel]`,
-  `torch`, `torchvision`, and `torchaudio` versions
+- a single TheRock-index pip install plan for pinned `rocm[libraries]`,
+  `torch`, `torchvision`, and `torchaudio` versions (`--devel` adds the
+  compiler toolchain, giving `rocm[libraries,devel]`)
 - package selection uses the newest exact ROCm build suffix common to the SDK
   package and the PyTorch stack for the current Python/platform wheel tags
 - `python -m rocm_sdk version`
