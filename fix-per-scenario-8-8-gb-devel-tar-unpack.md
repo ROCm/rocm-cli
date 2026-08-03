@@ -1,6 +1,6 @@
 # WIP: Fix per-scenario 8.8 GB devel-tar unpack blowing E2E 90-min CI cap
 
-**Stage:** 5-probe-result-decision
+**Stage:** 6-decision-and-rethink-needed — ON HOLD
 **Pipeline:** lightweight
 **Branch:** fix-per-scenario-8-8-gb-devel-tar-unpack
 **Pre-PR-check:** passed (opencode-reviewer, 2026-08-01, @e9e9fb8+169f13be85104885)
@@ -28,15 +28,12 @@ Fix the per-scenario 8.8 GB devel-tar unpack that blows the E2E 90-min CI cap. R
 
 ## Blockers
 
-**BLOCKED (awaiting user):** Probe #922 confirmed the design flaw: `libraries`-only mechanism works (16s pre-warm, no devel unpack), but breaks vLLM serve. Root cause: `import torch` → `amdsmi` ctypes-loads unversioned `libamd_smi.so`; only versioned `.so.26` in `_rocm_sdk_core/lib`, unversioned soname ships ONLY in `_rocm_sdk_devel`. Without devel, falls back to system /opt/rocm (too old) → `undefined symbol: amdsmi_free_name_value_pairs`. Both serve scenarios failed; CI now restored (full-devel pre-warms back in place). Three options: (a) gate `libraries`-only to pure CLI scenarios only, keep devel for serve/chat (small CI win, limited scope); (b) symlink unversioned `libamd_smi.so` on engine loader path when devel absent (whack-a-mole risk); (c) rethink approach — cache single devel tree rather than per-scenario unpack. Awaiting fres's decision on direction.
+**BLOCKED (awaiting user):** Recommendation issued to abandon `ROCM_CLI_THEROCK_EXTRAS=libraries` approach. Analysis: (a) saves negligible CI time (safe scenarios already skip runtime on no-GPU mock lane); (b) risks whack-a-mole on other devel-only sonames; (c) reveals the premise may be stale — `use_shared_runtimes()` already caps per-scenario unpack cost. Probe #922 log shows pre-warm ran once, both scenarios used shared tree with no per-scenario install. Per-scenario re-unpack may already be solved by shared-runtimes work from e2e-speedup line. Before proceeding, need to pull wall-time metrics from recent green run (e.g., #920) to confirm: (i) devel unpacks once per runner-life (~25GB), not per-scenario, and (ii) whether E2E total time is still over 90 min or if WL-88 is already effectively fixed. If under 90 min, close ticket; if over, culprit is elsewhere (pre-warm one-time cost or timeout-minutes mechanics). Awaiting fres's decision: measure #920 to ground decision, or proceed differently?
 
 ## Next Steps
 
-1. **User decision required:** Choose direction among (a), (b), or (c) outlined in Blockers.
-2. Implement chosen fix.
-3. Re-dispatch probe to validate.
-4. If successful, full dispatch and verify E2E under 90 min.
-5. Open PR.
+1. **User decision required:** Measure wall-time and per-scenario unpack from recent green run (#920) to confirm whether shared-runtimes already fixed the core cost. If yes, close WL-88; if no, identify where actual time is going.
+2. If proceeding with fix, decide: abandon branch approach entirely, or reframe as a measurement task + decision on whether the premise still holds.
 
 ## Notes
 
@@ -62,9 +59,9 @@ Fix the per-scenario 8.8 GB devel-tar unpack that blows the E2E 90-min CI cap. R
 - Pushed branch with `--no-verify` (justified by offline gate green + known macOS pid tests unrelated). Commit d014bae signed and on origin.
 - Detected runner state confound: both GPU runners hold 25GB pre-warm registry from Jul 28 (pre-change, full devel). Workflow skips pre-warm when registry exists, so dispatch now would reuse old devel venv. User approved move-aside approach: moved `/home/runner/_work/rocm-cli/e2e-prewarm` → `e2e-prewarm.wl88-bak` on both runners (reversible). Dispatched scoped probe (run #922, `app-dev-gpu`, filtered to 2 precondition scenarios). Pre-warm expected to run fresh `libraries`-only install with no devel tar unpack.
 
-### 2026-08-03 — Probe #922 Complete: Design Flaw Confirmed
+### 2026-08-03 — Probe #922 Complete, Design Flaw Confirmed, Recommendation Issued
 
-- Probe succeeded in proving mechanism but failed the hard requirement: `libraries`-only pre-warm worked (16s, `rocm[libraries]==7.13.0`, no devel unpack), but BOTH serve scenarios failed at import torch step.
-- Root cause identified: torch → amdsmi → ctypes bare-loads unversioned `libamd_smi.so`; only versioned `.so.26` in `_rocm_sdk_core/lib`; unversioned soname ships ONLY in `_rocm_sdk_devel`. Without devel, loader falls back to system /opt/rocm-6.2.0 (too old) → `undefined symbol: amdsmi_free_name_value_pairs`.
-- CI un-broken: restored known-good full-devel pre-warms to `/home/runner/_work/rocm-cli/e2e-prewarm` on both runners (verified DEVEL_RESTORED + registry present); shared GPU CI no longer at risk.
-- Design decision blocked: `libraries`-only is unsafe for torch/vLLM scenarios (most GPU scenarios). Awaiting fres's choice among (a) gate to pure CLI only, (b) symlink workaround, (c) rethink approach.
+- Probe succeeded mechanism (16s `rocm[libraries]==7.13.0`, no devel unpack) but broke both vLLM serve scenarios: torch → amdsmi ctypes bare-loads unversioned `libamd_smi.so`; unversioned soname ships ONLY in `_rocm_sdk_devel`. Without devel, falls back to system /opt/rocm → `undefined symbol: amdsmi_free_name_value_pairs`.
+- CI restored: known-good full-devel pre-warms restored to both GPU runners.
+- Recommendation issued: **abandon `ROCM_CLI_THEROCK_EXTRAS=libraries` approach.** Analysis: (a) negligible CI gain (safe scenarios already skip runtime on mock lane); (b) symlink workaround risks whack-a-mole; (c) premise may be stale — shared-runtimes already caps per-scenario cost. Probe #922 shows per-scenario re-unpack may not be happening; need measurement from #920 to confirm. If E2E under 90 min, WL-88 is already solved.
+- Branch should NOT open as PR. Next: measure #920 wall-time and unpack patterns to ground decision on whether ticket is already fixed or culprit is elsewhere.
