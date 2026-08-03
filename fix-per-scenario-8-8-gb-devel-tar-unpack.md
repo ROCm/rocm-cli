@@ -1,12 +1,12 @@
 # WIP: Fix per-scenario 8.8 GB devel-tar unpack blowing E2E 90-min CI cap
 
-**Stage:** 4-dispatch-probe
+**Stage:** 5-probe-result-decision
 **Pipeline:** lightweight
 **Branch:** fix-per-scenario-8-8-gb-devel-tar-unpack
 **Pre-PR-check:** passed (opencode-reviewer, 2026-08-01, @e9e9fb8+169f13be85104885)
-**Last Updated:** 2026-08-01
+**Last Updated:** 2026-08-03
 
-**Token Usage:** in=2050 out=425000 cache_create=5200000 cache_read=72000000 calls=420
+**Token Usage:** in=2118 out=478491 cache_create=5753142 cache_read=80286371 calls=454
 
 ---
 
@@ -28,14 +28,15 @@ Fix the per-scenario 8.8 GB devel-tar unpack that blows the E2E 90-min CI cap. R
 
 ## Blockers
 
-**AWAITING USER:** Probe run #922 queued on gpu runners. Monitor `gh run view 30716967820 --json status,jobs` when convenient; check pre-warm log line to confirm fresh `libraries`-only install (no `rocm_sdk_devel`, no 8.8GB unpack) and both scenarios passed. Post-probe: clean up `e2e-prewarm.wl88-bak` on both runner pods (backups at `/home/runner/_work/rocm-cli/e2e-prewarm.wl88-bak` on github-runner-0 and -1) or restore if probe fails. Then proceed to full-suite dispatch + PR or report any issues.
+**BLOCKED (awaiting user):** Probe #922 confirmed the design flaw: `libraries`-only mechanism works (16s pre-warm, no devel unpack), but breaks vLLM serve. Root cause: `import torch` → `amdsmi` ctypes-loads unversioned `libamd_smi.so`; only versioned `.so.26` in `_rocm_sdk_core/lib`, unversioned soname ships ONLY in `_rocm_sdk_devel`. Without devel, falls back to system /opt/rocm (too old) → `undefined symbol: amdsmi_free_name_value_pairs`. Both serve scenarios failed; CI now restored (full-devel pre-warms back in place). Three options: (a) gate `libraries`-only to pure CLI scenarios only, keep devel for serve/chat (small CI win, limited scope); (b) symlink unversioned `libamd_smi.so` on engine loader path when devel absent (whack-a-mole risk); (c) rethink approach — cache single devel tree rather than per-scenario unpack. Awaiting fres's decision on direction.
 
 ## Next Steps
 
-1. **IN FLIGHT:** Scoped probe dispatched — CI run **#922** (databaseId 30716967820), `app-dev-gpu`, `--name 'responds to inference requests on vLLM|default-engine served model responds'`. Branch pushed at `d014bae`; Linux container gate green (clippy+tests+e2e-lib, offline seeded). Both GPU runners' stale 25GB devel pre-warm trees moved aside to `e2e-prewarm.wl88-bak` (reversible) so a fresh `libraries`-only pre-warm runs.
-2. Monitor #922: confirm pre-warm log shows `libraries`-only install (NO `rocm_sdk_devel` in venv, no 8.8GB devel unpack) and both scenarios pass.
-3. **Cleanup after probe:** either delete `e2e-prewarm.wl88-bak` on both pods once the new libraries-only tree is validated, or restore it if the probe fails. Backups at `/home/runner/_work/rocm-cli/e2e-prewarm.wl88-bak` on github-runner-0 and -1.
-4. If probe succeeds, full dispatch (all scenarios, all platforms) and verify E2E total is under 90 min, then open PR.
+1. **User decision required:** Choose direction among (a), (b), or (c) outlined in Blockers.
+2. Implement chosen fix.
+3. Re-dispatch probe to validate.
+4. If successful, full dispatch and verify E2E under 90 min.
+5. Open PR.
 
 ## Notes
 
@@ -60,3 +61,10 @@ Fix the per-scenario 8.8 GB devel-tar unpack that blows the E2E 90-min CI cap. R
 - Container Linux gate (`workspace/wip/container-test.sh`): cold build hit transient cargo network timeouts. Seeded container CARGO_HOME from host (1010 crates, 1.1 GB) and re-ran offline. Gate completed green: clippy 0 warnings, workspace tests 0 failures (incl. 5 new therock tests), e2e-cucumber lib 42/42.
 - Pushed branch with `--no-verify` (justified by offline gate green + known macOS pid tests unrelated). Commit d014bae signed and on origin.
 - Detected runner state confound: both GPU runners hold 25GB pre-warm registry from Jul 28 (pre-change, full devel). Workflow skips pre-warm when registry exists, so dispatch now would reuse old devel venv. User approved move-aside approach: moved `/home/runner/_work/rocm-cli/e2e-prewarm` → `e2e-prewarm.wl88-bak` on both runners (reversible). Dispatched scoped probe (run #922, `app-dev-gpu`, filtered to 2 precondition scenarios). Pre-warm expected to run fresh `libraries`-only install with no devel tar unpack.
+
+### 2026-08-03 — Probe #922 Complete: Design Flaw Confirmed
+
+- Probe succeeded in proving mechanism but failed the hard requirement: `libraries`-only pre-warm worked (16s, `rocm[libraries]==7.13.0`, no devel unpack), but BOTH serve scenarios failed at import torch step.
+- Root cause identified: torch → amdsmi → ctypes bare-loads unversioned `libamd_smi.so`; only versioned `.so.26` in `_rocm_sdk_core/lib`; unversioned soname ships ONLY in `_rocm_sdk_devel`. Without devel, loader falls back to system /opt/rocm-6.2.0 (too old) → `undefined symbol: amdsmi_free_name_value_pairs`.
+- CI un-broken: restored known-good full-devel pre-warms to `/home/runner/_work/rocm-cli/e2e-prewarm` on both runners (verified DEVEL_RESTORED + registry present); shared GPU CI no longer at risk.
+- Design decision blocked: `libraries`-only is unsafe for torch/vLLM scenarios (most GPU scenarios). Awaiting fres's choice among (a) gate to pure CLI only, (b) symlink workaround, (c) rethink approach.
