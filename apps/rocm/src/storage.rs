@@ -971,6 +971,7 @@ mod tests {
             sdk_torch: None,
             read_only: false,
             imported_from: None,
+            devel: true,
             installed_at_unix_ms,
         }
     }

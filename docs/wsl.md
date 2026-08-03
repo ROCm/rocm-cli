@@ -110,7 +110,7 @@ created venv such as `D:\ROCm\venv`.
 
 The WSL activation environment for HIP applications that do not preload ROCm
 the way PyTorch does must include the managed TheRock runtime package paths and
-WSL DXCore path. With the managed `rocm[libraries,devel]` install, these paths
+WSL DXCore path. With the managed `rocm[libraries]` install, these paths
 come from the rocm-cli runtime manifest, `rocm-sdk path --root`, and
 `rocm_sdk.find_libraries(...)`.
 
