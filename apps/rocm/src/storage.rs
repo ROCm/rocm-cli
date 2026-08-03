@@ -772,7 +772,7 @@ fn approved(action: &str, yes: bool) -> Result<bool> {
     if !interactive_terminal() {
         bail!("{action} requires --yes outside an interactive terminal");
     }
-    Ok(confirm_uninstall()?)
+    confirm_uninstall()
 }
 
 pub(crate) fn storage(command: Option<StorageCommand>) -> Result<()> {
