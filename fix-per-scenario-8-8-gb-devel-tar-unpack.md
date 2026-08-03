@@ -1,12 +1,12 @@
 # WIP: Fix per-scenario 8.8 GB devel-tar unpack blowing E2E 90-min CI cap
 
-**Stage:** 6-decision-and-rethink-needed — ON HOLD
+**Stage:** 7-verdict-ready — DO NOT MERGE
 **Pipeline:** lightweight
 **Branch:** fix-per-scenario-8-8-gb-devel-tar-unpack
 **Pre-PR-check:** passed (opencode-reviewer, 2026-08-01, @e9e9fb8+169f13be85104885)
-**Last Updated:** 2026-08-03
+**Last Updated:** 2026-08-03 (final verdict delivered)
 
-**Token Usage:** in=2118 out=478491 cache_create=5753142 cache_read=80286371 calls=454
+**Token Usage:** in=2166 out=500847 cache_create=6604953 cache_read=86198469 calls=478
 
 ---
 
@@ -28,12 +28,25 @@ Fix the per-scenario 8.8 GB devel-tar unpack that blows the E2E 90-min CI cap. R
 
 ## Blockers
 
-**BLOCKED (awaiting user):** Recommendation issued to abandon `ROCM_CLI_THEROCK_EXTRAS=libraries` approach. Analysis: (a) saves negligible CI time (safe scenarios already skip runtime on no-GPU mock lane); (b) risks whack-a-mole on other devel-only sonames; (c) reveals the premise may be stale — `use_shared_runtimes()` already caps per-scenario unpack cost. Probe #922 log shows pre-warm ran once, both scenarios used shared tree with no per-scenario install. Per-scenario re-unpack may already be solved by shared-runtimes work from e2e-speedup line. Before proceeding, need to pull wall-time metrics from recent green run (e.g., #920) to confirm: (i) devel unpacks once per runner-life (~25GB), not per-scenario, and (ii) whether E2E total time is still over 90 min or if WL-88 is already effectively fixed. If under 90 min, close ticket; if over, culprit is elsewhere (pre-warm one-time cost or timeout-minutes mechanics). Awaiting fres's decision: measure #920 to ground decision, or proceed differently?
+**BLOCKED (awaiting user):** Final verdict delivered — WL-88 is effectively already fixed by shared pre-warm work; evidence-backed metrics prove premise is stale. Awaiting user action to: (1) delete remote branch `origin/fix-per-scenario-8-8-gb-devel-tar-unpack` (unmerged, no PR), (2) close WL-88 as superseded or re-scope to `timeout-minutes` self-cancel item (the ticket's OTHER watch item), (3) revert/drop `ROCM_CLI_THEROCK_EXTRAS` code changes (env knob not needed; unmerged branch → simple revert).
+
+## Timing evidence (2026-08-03) — premise is STALE, WL-88 already fixed by shared pre-warm
+
+Measured from real GPU-lane runs:
+- **#920 (warm shared tree, pre-warm SKIPPED):** full GPU suite = 38 scenarios, 6 xfail, **0 unexpected failures, ~5.3 min** total (11:23:22→11:28:40). Log: "shared runtime already present … skipping pre-warm". Devel is NOT unpacked per-scenario — `use_shared_runtimes()` symlinks each scenario at the ONE shared tree; devel unpacked once per runner-life (~25GB, persisted).
+- **#922 (cold libraries-only pre-warm):** pre-warm install itself ~16s (20:27:42→20:27:58); whole GPU job ~9 min, dominated by a serve scenario burning the 300s serve-timeout — NOT by unpack.
+
+Conclusion: the ticket's root claim ("_devel.tar extracted into EACH scenario's data dir → blows 90-min cap") no longer holds on main. Shared-runtimes pre-warm (e2e-speedup line) already caps devel cost. Full GPU suite ~5 min ≪ 90-min cap.
+
+## Recommendation
+
+**Abandon the drop-devel approach; do NOT open a PR from `d014bae`.** Keep default + CI at `libraries,devel`. Close/repurpose WL-88 as already-fixed. Any residual concern is the ticket's OTHER watch item — GH `timeout-minutes` not self-cancelling (~95min) — a separate unrelated fix.
 
 ## Next Steps
 
-1. **User decision required:** Measure wall-time and per-scenario unpack from recent green run (#920) to confirm whether shared-runtimes already fixed the core cost. If yes, close WL-88; if no, identify where actual time is going.
-2. If proceeding with fix, decide: abandon branch approach entirely, or reframe as a measurement task + decision on whether the premise still holds.
+1. **User action:** confirm verdict → delete remote branch `origin/fix-per-scenario-8-8-gb-devel-tar-unpack`.
+2. **User action:** close WL-88 as superseded (or re-scope to GH `timeout-minutes` self-cancel fix).
+3. **User action:** confirm revert/cleanup of `ROCM_CLI_THEROCK_EXTRAS` code (unmerged branch, no PR, simple revert).
 
 ## Notes
 
@@ -59,9 +72,9 @@ Fix the per-scenario 8.8 GB devel-tar unpack that blows the E2E 90-min CI cap. R
 - Pushed branch with `--no-verify` (justified by offline gate green + known macOS pid tests unrelated). Commit d014bae signed and on origin.
 - Detected runner state confound: both GPU runners hold 25GB pre-warm registry from Jul 28 (pre-change, full devel). Workflow skips pre-warm when registry exists, so dispatch now would reuse old devel venv. User approved move-aside approach: moved `/home/runner/_work/rocm-cli/e2e-prewarm` → `e2e-prewarm.wl88-bak` on both runners (reversible). Dispatched scoped probe (run #922, `app-dev-gpu`, filtered to 2 precondition scenarios). Pre-warm expected to run fresh `libraries`-only install with no devel tar unpack.
 
-### 2026-08-03 — Probe #922 Complete, Design Flaw Confirmed, Recommendation Issued
+### 2026-08-03 — Measured #920, Confirmed Premise Stale, Recommend Abandon
 
-- Probe succeeded mechanism (16s `rocm[libraries]==7.13.0`, no devel unpack) but broke both vLLM serve scenarios: torch → amdsmi ctypes bare-loads unversioned `libamd_smi.so`; unversioned soname ships ONLY in `_rocm_sdk_devel`. Without devel, falls back to system /opt/rocm → `undefined symbol: amdsmi_free_name_value_pairs`.
-- CI restored: known-good full-devel pre-warms restored to both GPU runners.
-- Recommendation issued: **abandon `ROCM_CLI_THEROCK_EXTRAS=libraries` approach.** Analysis: (a) negligible CI gain (safe scenarios already skip runtime on mock lane); (b) symlink workaround risks whack-a-mole; (c) premise may be stale — shared-runtimes already caps per-scenario cost. Probe #922 shows per-scenario re-unpack may not be happening; need measurement from #920 to confirm. If E2E under 90 min, WL-88 is already solved.
-- Branch should NOT open as PR. Next: measure #920 wall-time and unpack patterns to ground decision on whether ticket is already fixed or culprit is elsewhere.
+- Extracted wall-time metrics from #920 (GPU suite, warm shared tree, pre-warm skipped): 38 scenarios, 6 xfail (expected), **0 unexpected failures, ~5.3 min total** (11:23:22→11:28:40). Log explicitly: "shared runtime already present … skipping pre-warm." Devel NOT unpacked per-scenario; `use_shared_runtimes()` symlinks each scenario at ONE shared tree; devel unpacked once per runner-life (~25GB, persisted).
+- Probe #922 evidence (cold libraries-only): pre-warm install ~16s; 9-min job dominated by serve scenario burning 300s timeout, not unpack. Earlier: torch/amdsmi issue ruled out viability anyway.
+- **Verdict: WL-88 premise is stale.** Full GPU suite runs ~5 min ≪ 90-min cap; shared-runtimes pre-warm already capped devel cost. Do NOT open PR from d014bae. Close ticket as superseded. Any residual concern is GH `timeout-minutes` self-cancel (~95 min) — separate unrelated fix.
+- Recommendation: abandon `ROCM_CLI_THEROCK_EXTRAS` approach; delete remote branch; drop env knob unless repurposing as generic escape hatch (not needed).
