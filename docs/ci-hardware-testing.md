@@ -4,59 +4,98 @@ Copyright © Advanced Micro Devices, Inc., or its affiliates.
 SPDX-License-Identifier: MIT
 -->
 
-# CI hardware (GPU / WSL) testing — planned
+# CI hardware (GPU) testing
 
 The hosted CI (`ubuntu-latest`, `windows-latest`) builds and unit-tests every
-shipping target natively. By design it cannot exercise two things:
+shipping target natively, but GitHub-hosted runners have no AMD GPU. A
+dedicated hardware layer in `.github/workflows/ci.yml` covers that gap by
+running the same cucumber-rs E2E suite on dedicated self-hosted runners with
+real AMD GPUs.
 
-- **Real AMD GPU execution** — GitHub-hosted runners have no AMD GPU.
-- **Real WSL behaviour** — the Windows↔WSL interop path needs an actual WSL host.
+## Platforms
 
-A dedicated hardware-test layer covers exactly those gaps. It is **not** part of
-the CI workflow yet; it will be introduced in a follow-up PR. This document
-records the intended design so it can be reviewed and wired up as a unit.
+The E2E suite (BDD scenarios in Gherkin `.feature` files backed by Rust step
+functions) runs as one job per platform. Each job's harness resolves every
+scenario to pass / xfail / skip for that host from its `@id` and
+`@requires-*` tags, a capability probe, and `expectations.toml` — there is no
+separate tier flag or tag filter to maintain.
 
-## Design
-
-1. **Build once on hosted runners.** The hosted `build-and-test` (Linux) and
-   `windows-build-and-test` (Windows) jobs publish their per-OS binaries
-   (`rocm`, `rocmd`, `rocm-engine-*`) as workflow artifacts.
-2. **Test on dedicated self-hosted runners.** Hardware-test jobs download those
-   exact artifacts and run only the checks hosted runners cannot: `rocm examine`
-   host/GPU detection, engine `detect`/`capabilities`, the no-CPU-fallback
-   smoke (`scripts/smoke_local.py --skip-build`), and the
-   `scripts/*_therock_gpu_test.py` end-to-end GPU harnesses.
-
-### Targets
-
-| Target | Runner | Notes |
+| Job | Platform | Runner labels |
 |---|---|---|
-| Pure Windows 11 (gfx1151) | self-hosted Windows + AMD GPU | consumes the Windows artifact |
-| AMD Instinct, bare-metal | self-hosted Linux + Instinct GPU | consumes the Linux artifact |
-| Ubuntu on WSL (primary) | self-hosted Windows + WSL | consumes the Linux artifact in WSL |
-| Fedora on WSL (secondary) | self-hosted Windows + WSL | builds in-WSL to match the distro's glibc |
+| `e2e` | Mock (no GPU) | GitHub-hosted `ubuntu-latest` |
+| `e2e-gpu` | MI300X (AMD Instinct, bare-metal Linux) | self-hosted `[self-hosted, linux, amd-gpu]` |
+| `e2e-gpu-strix-ubuntu` | Strix Halo (gfx1151) on Ubuntu | self-hosted `[self-hosted, linux, strix-halo]` |
+| `e2e-gpu-strix-windows` | Strix Halo (gfx1151) on native Windows 11 | self-hosted `[self-hosted, windows, strix-halo]` |
 
-### Guards
+`e2e` is the blocking, GitHub-hosted mock job: `@requires-gpu` scenarios
+resolve to skip here, and known bugs resolve to xfail from
+`expectations.toml`. It is a required check and must stay green.
 
-Each hardware-test job is:
+The three GPU jobs (`e2e-gpu`, `e2e-gpu-strix-ubuntu`, `e2e-gpu-strix-windows`)
+run on dedicated self-hosted runners with a real AMD GPU attached, so they
+exercise host/GPU detection, engine `detect`/`capabilities`, and live serving
+scenarios that the mock job cannot.
 
-- **Opt-in** via a repository/org variable (`ENABLE_WIN11_GPU_CI`,
-  `ENABLE_INSTINCT_CI`, `ENABLE_WSL_UBUNTU_CI`, `ENABLE_WSL_FEDORA_CI`) so it is
-  enabled per target as each runner is wired into the repo.
-- **Non-blocking** (`continue-on-error: true`) — a hardware result never gates a PR.
-- **Fork-safe** — self-hosted runners do not execute untrusted fork PRs.
+An `e2e-report` job consolidates every platform's report — including partial
+or failed runs — into one HTML report and GitHub step summary, joined by
+scenario id, so the (scenario × platform) expectation grid is visible in one
+place.
+
+## Triggers
+
+The GPU jobs run automatically on `push`, `pull_request`, and `merge_group`
+when both of the following hold:
+
+- the `changes` job's `heavy` path filter is `true` (the change touches code
+  that can affect runtime behavior, not just docs or unrelated files), and
+- the hosted `build-and-test` job succeeded.
+
+They can also be triggered manually via `workflow_dispatch`, independent of
+the `heavy` gate, with these inputs:
+
+- `platform` (choice: `all`, `mock`, `app-dev-gpu`, `strix-ubuntu`,
+  `strix-windows`) — which job(s) to run. `mock` maps to `e2e`,
+  `app-dev-gpu` to `e2e-gpu`, `strix-ubuntu` to `e2e-gpu-strix-ubuntu`, and
+  `strix-windows` to `e2e-gpu-strix-windows`.
+- `name_filter` (string) — a scenario-name regex forwarded to the cucumber
+  harness (`cargo xtask e2e -- --name <regex>`) so a dispatch can run a
+  single scenario instead of the full suite. Only wired into the three
+  self-hosted GPU jobs (`e2e-gpu`, `e2e-gpu-strix-ubuntu`,
+  `e2e-gpu-strix-windows`); `platform=mock` always runs the full mock suite
+  and ignores it. Empty runs everything applicable to the selected
+  platform(s).
+- `include_nightly` (boolean, default `false`) — opts a dispatch into
+  `@nightly`-tagged scenarios (e.g. large-model serves, cold installs) that
+  are otherwise skipped on a normal push/PR run to keep it fast. Same scope
+  as `name_filter`: only the three self-hosted GPU jobs read it;
+  `platform=mock` ignores it.
+
+A manual dispatch skips the hosted `build-and-test` job for a faster loop; the
+E2E jobs run directly against the dispatched ref.
+
+## Blocking vs. non-blocking
+
+Only `e2e` (the GitHub-hosted mock job) is a required, blocking check. The
+three hardware jobs — `e2e-gpu`, `e2e-gpu-strix-ubuntu`, and
+`e2e-gpu-strix-windows` — all run with `continue-on-error: true`, so a
+hardware failure never gates a PR merge. Their results still surface in the
+consolidated `e2e-report` for visibility.
+
+## Fork safety
+
+Self-hosted runners are not used for untrusted fork pull requests: GitHub
+does not dispatch self-hosted-runner jobs from an external fork's
+`pull_request` event without explicit approval. The hardware jobs only run
+against branches and PRs within the repository (and on `workflow_dispatch`,
+which requires write access to trigger).
 
 ## Notes
 
-- These jobs run **debug** binaries: they assert functional behaviour (device
-  detection, engine launch, policy enforcement), not performance, so the
-  debug-vs-release difference does not affect what they check. Release-fidelity,
-  optimized validation already lives in the nightly/release pipeline, which
-  builds `manylinux2014` (glibc 2.17) binaries.
-- Linux artifacts are built on `ubuntu-latest`; a consuming runner on an older
-  distro must have a compatible (≥) glibc, otherwise it should build in-place
-  (as the Fedora-on-WSL target does).
-
-The layer will be enabled end-to-end in a follow-up PR once the self-hosted
-runners are connected to the repository and each path has been validated against
-real hardware.
+- The hardware jobs build and run **release** binaries: they assert
+  functional behavior (device detection, engine launch, policy enforcement),
+  not performance, so this is not a performance benchmark. Release-fidelity,
+  `manylinux2014` (glibc 2.17) packaging validation is handled separately by
+  the nightly/release pipeline.
+- `e2e-report` collects whatever ran, including partial results from a
+  cancelled or failed job, and renders one HTML report plus a step summary so
+  all platforms are visible together.
