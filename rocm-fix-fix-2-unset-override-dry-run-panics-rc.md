@@ -4,9 +4,9 @@
 **Pipeline:** lightweight
 **Branch:** rocm-fix-fix-2-unset-override-dry-run-panics-rc
 **Pre-PR-check:** none
-**Last Updated:** 2026-08-03
+**Last Updated:** 2026-08-03 (sync completed)
 
-**Token Usage:** in=378 out=136779 cache_create=1178981 cache_read=27599710 calls=191
+**Token Usage:** in=6814 out=143051 cache_create=1734404 cache_read=27906560 calls=225
 
 ---
 

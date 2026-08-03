@@ -1,13 +1,12 @@
 # WIP: Fix CI self-hosted E2E lane timeout (offline runner holds concurrency group)
 
-**Stage:** 4-design
+**Stage:** 4-design (design gate resolved — planned fix INVALID, see below; awaiting scope decision)
 **Pipeline:** lightweight
 **Branch:** fix-ci-selfhosted-lane-timeout
 **Pre-PR-check:** none
 **Ticket:** EAI-7548 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7548
-**Last Updated:** 2026-07-22
-
-**Token Usage:** in=0 out=0 cache_create=0 cache_read=0 calls=0
+**Last Updated:** 2026-08-03
+**Token Usage:** in=94 out=71486 cache_create=845666 cache_read=4939709 calls=49
 
 ---
 
@@ -26,22 +25,55 @@ superseded while a self-hosted runner is offline.
 
 ## Solution
 
-**Preferred fix:** add job-level `timeout-minutes` to the self-hosted E2E lanes in
-`ci.yml`, so a job queued on an offline runner self-expires instead of hanging
-forever — which releases the concurrency group. Small, robust, self-clears
-regardless of a lane being required or advisory, and survives a lane later becoming
-merge-required.
+### DESIGN GATE RESOLVED (2026-08-03) — the planned "preferred fix" is INVALID
 
-**Follow-up option (larger, separate — NOT this PR):** split the self-hosted E2E
-lanes into their own workflow with their own concurrency group so an offline runner
-can never stall the merge-required checks (keep `cancel-in-progress: true`). Captured
-in the ticket as the bigger alternative.
+Two findings from the design investigation kill the original plan and reshape the task:
 
-Key design point: `timeout-minutes` counts from when the job starts *running*, but a
-job stuck **queued** on an offline runner is what we need to reap — confirm whether
-GH's job timeout applies to the queued/pending phase, or whether a separate
-queue-timeout mechanism is needed. This is the main open question to resolve in
-design before writing the change.
+1. **`timeout-minutes` does NOT reap a job stuck in the QUEUED phase.** GitHub's job
+   timeout timer only starts once a runner picks the job up and it is *running*; it
+   never fires while a job sits "Waiting for a runner to pick up this job…" on an
+   OFFLINE self-hosted runner. That queued-and-uncancellable state is exactly the
+   stall we saw on PR #138, so adding/relying on `timeout-minutes` cannot clear it.
+   (Sources: GitHub community discussion #50926; actions/runner #4312 — both confirm
+   the timer covers running time only, not queue wait.)
+2. **The lanes already have `timeout-minutes` AND dispatch is already isolated.** All
+   three self-hosted E2E lanes already carry a cap (`e2e-gpu`: 90, `e2e-gpu-strix-
+   ubuntu`: 35, `e2e-gpu-strix-windows`: 35) and `workflow_dispatch` already gets a
+   UNIQUE concurrency group (`…-<run_id>`). Both landed in #69, before this WIP was
+   written. So there is nothing to add there — the WIP's snapshot was stale.
+
+**Remaining real exposure:** push / pull_request / merge_group still share the group
+`CI-<ref>-shared` with `cancel-in-progress: true`. When a newer run supersedes an
+older one whose self-hosted job is queued on an offline runner, GitHub can't cancel
+that job, so the superseded run keeps holding the shared group and the new run sits
+pending with 0 jobs — the #138 stall.
+
+### Only mechanism that actually works: structural separation
+
+Because a job queued on an offline runner is fundamentally uncancellable, the fix is
+to make sure such a job never shares a run / concurrency group with the merge-required
+checks. Options (scope decision needed — see Blockers):
+
+- **(A) Split the self-hosted E2E lanes into their own workflow** with their own
+  concurrency group (its own `-<ref>` key, `cancel-in-progress: true`). An offline
+  runner can then only stall *that* workflow's own supersession, never the required
+  lanes in `ci.yml`. Larger diff (new workflow file, move 3 jobs + the report's
+  `needs`, re-wire artifact consolidation), but it's the robust structural fix.
+- **(B) Scope `cancel-in-progress` so it never supersedes on the shared group in a way
+  that can strand a queued self-hosted job** — e.g. keep supersession for the
+  GitHub-hosted required lanes but give the self-hosted lanes a non-cancelling group.
+  Requires per-job concurrency (job-level `concurrency:`), which interacts subtly with
+  required-check reporting; needs careful design.
+- **(C) Accept the manual force-cancel** as the documented operational remedy (the
+  `gh api -X POST .../force-cancel` we already used) and close EAI-7548 as
+  won't-fix-in-CI-config, since the true root cause is runner offline-ness (addressed
+  by the runner-persistence work, EAI-7447 / persist-app-dev-ci-runner).
+
+Recommendation: **(A)** is the only change that structurally guarantees the required
+checks can't be stalled by an offline self-hosted runner, and it composes cleanly with
+the existing report job (artifacts glob already auto-discovers platforms). But it's a
+bigger diff than the ticket's original framing, so the scope needs a human call before
+implementation.
 
 ## Scenarios
 
@@ -58,25 +90,34 @@ Scenario: A superseded run does not hang on an offline self-hosted runner
 
 ## Implementation Steps
 
-### Todo 📋
-- 📋 Confirm whether `timeout-minutes` reaps a job stuck in the QUEUED phase on an
-  offline runner (the core mechanism question), or whether GH only times out
-  running jobs — determines if this fix is sufficient.
-- 📋 Identify the self-hosted E2E lane jobs in `ci.yml` (1232 lines).
-- 📋 Add `timeout-minutes` to those jobs with an appropriate cap.
-- 📋 Validate (probe run) that a superseded run no longer hangs.
+### Done ✅
+- ✅ Resolved the design gate: `timeout-minutes` does NOT reap a QUEUED job on an
+  offline runner (timer covers running time only). Planned fix invalid.
+- ✅ Confirmed all 3 self-hosted lanes already have `timeout-minutes` and dispatch
+  already has a unique concurrency group (landed in #69).
+
+### Pending scope decision 📋
+- 📋 Human call: pursue (A) split-workflow, (B) per-job concurrency, or (C) close as
+  won't-fix-in-CI (root cause is runner offline-ness, owned by EAI-7447).
+- 📋 (If A chosen) create new workflow, move the 3 self-hosted jobs + report `needs`,
+  wire its own concurrency group; validate a superseded shared-group run no longer hangs.
 
 ## Next Steps
 
-Resolve the queued-vs-running timeout question first (design gate), then locate the
-self-hosted lanes in `ci.yml` and add `timeout-minutes`.
+**Awaiting scope decision** (see Blockers) — the original one-line `timeout-minutes`
+fix is off the table; the real fix is structural (split workflow) and a bigger diff
+than the ticket framed, so it needs a human go-ahead on scope before implementation.
 
 ## Blockers / Open Questions
 
-- **Does `timeout-minutes` cancel a job still QUEUED on an offline runner?** If GH's
-  job timeout only starts once a job is running, this fix won't reap the exact stuck
-  state we saw — need to verify before committing to the approach (may push toward
-  the workflow-split follow-up).
+- **RESOLVED:** Does `timeout-minutes` cancel a job still QUEUED on an offline runner?
+  → **No.** The timer only starts once the job is running. Confirmed via GitHub
+  community #50926 and actions/runner #4312.
+- **OPEN (scope):** Which remedy — (A) split self-hosted lanes into their own
+  workflow (robust, bigger diff), (B) per-job concurrency on the shared group
+  (subtle, required-check interactions), or (C) close as won't-fix-in-CI since the
+  true root cause is the runner being offline (EAI-7447 / persist-app-dev-ci-runner)?
+  Needs a human decision before implementation.
 
 ## Notes
 
@@ -95,3 +136,13 @@ self-hosted lanes in `ci.yml` and add `timeout-minutes`.
 - Filed EAI-7548 (Bug, component rocm-cli) for the offline-runner concurrency-group stall.
 - Created this WIP (lightweight pipeline) and the worktree; promoted inbox item 12.
 - Next: resolve the queued-vs-running `timeout-minutes` question, then edit `ci.yml`.
+
+### 2026-08-03
+
+- Resolved the design gate. `timeout-minutes` does NOT reap a QUEUED job on an offline
+  runner (timer covers running time only) — the planned "preferred fix" is invalid.
+- Found the 3 self-hosted lanes ALREADY have `timeout-minutes` and dispatch already has
+  a unique concurrency group (both from #69) — WIP snapshot was stale; nothing to add.
+- Real fix is structural (split self-hosted lanes into their own workflow, option A) —
+  bigger diff than the ticket framed. Surfaced to human for a scope decision; did NOT
+  start implementation (design-gate stage, scope call is a human decision).
