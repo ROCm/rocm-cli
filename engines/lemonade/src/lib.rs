@@ -1361,6 +1361,14 @@ fn lock_archive_cache_in_process(archive: &Path) -> ArchiveCacheProcessLock {
     let mut busy = ARCHIVE_CACHE_BUSY
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if busy.contains(&key) {
+        // The holder may be inside a download window minutes long; without this
+        // the command sits silent and looks hung.
+        eprintln!(
+            "Waiting for another install in this process to finish with {}...",
+            archive.display()
+        );
+    }
     while busy.contains(&key) {
         busy = ARCHIVE_CACHE_BUSY_SIGNAL
             .wait(busy)
@@ -1433,12 +1441,21 @@ fn lock_archive_cache(archive: &Path) -> Result<ArchiveCacheLock> {
     mark_archive_lock_test_stage("before-lock");
     #[cfg(test)]
     let heartbeat = start_archive_lock_test_heartbeat();
-    file.lock().with_context(|| {
-        format!(
-            "failed to acquire archive cache lock {}",
-            lock_path.display()
-        )
-    })?;
+    // `lock` blocks with no timeout, and the holder may be minutes into a
+    // download, so announce the wait instead of leaving the command silent.
+    // Probing first keeps the common uncontended case quiet.
+    if file.try_lock().is_err() {
+        eprintln!(
+            "Waiting for another process to finish with {}...",
+            archive.display()
+        );
+        file.lock().with_context(|| {
+            format!(
+                "failed to acquire archive cache lock {}",
+                lock_path.display()
+            )
+        })?;
+    }
     #[cfg(test)]
     {
         mark_archive_lock_test_stage("after-lock");
@@ -1635,6 +1652,15 @@ fn extract_tar_gz(archive: &Path, destination: &Path) -> Result<()> {
             })?
             .into_owned();
         let kind = entry.header().entry_type();
+        // A pax *global* header carries archive-wide metadata, not a member: its
+        // name (`pax_global_header` by convention) is not a path to create. The
+        // `tar` crate consumes long-name, long-link and pax *local* headers
+        // itself, but hands this one to the caller, so it has to be skipped
+        // explicitly — `git archive` and `tar --format=pax` both emit it, and
+        // treating it as a member would reject an otherwise valid archive.
+        if kind == tar::EntryType::XGlobalHeader {
+            continue;
+        }
         let path = archive_entry_destination(destination, &name)?;
         match kind {
             tar::EntryType::Directory => {
@@ -1647,9 +1673,19 @@ fn extract_tar_gz(archive: &Path, destination: &Path) -> Result<()> {
                 write_entry_file(&path, &mut entry)?;
                 set_entry_mode(&path, mode)?;
             }
+            // A sparse entry would expand correctly — the crate resolves the
+            // sparse map — but a few-byte header can declare a multi-gigabyte
+            // logical size, so accepting one turns a digest-pinned archive into
+            // an unbounded write. No Lemonade artifact stores files sparsely, so
+            // this stays rejected until one needs it.
+            tar::EntryType::GNUSparse => bail!(
+                "archive contains a sparse entry at {}, which is not supported",
+                name.display()
+            ),
             // Links, devices, fifos and sockets are the entry kinds that let an
             // archive reach outside its own tree; the official artifacts carry
-            // none of them.
+            // none of them. See the link policy on `extract_archive` for what
+            // to do if a future release ships one.
             other => bail!(
                 "archive contains an unsupported entry ({other:?}) at {}",
                 name.display()
@@ -1673,6 +1709,7 @@ fn extract_zip(archive: &Path, destination: &Path) -> Result<()> {
         // raw name is still used for diagnostics and for the trailing-slash
         // directory convention.
         let raw = entry.name().to_owned();
+        // See the link policy on `extract_archive`.
         if entry.is_symlink() {
             bail!("archive contains symlink at {raw}");
         }
@@ -1685,9 +1722,8 @@ fn extract_zip(archive: &Path, destination: &Path) -> Result<()> {
                 .with_context(|| format!("failed to create {}", path.display()))?;
             continue;
         }
-        if !entry.is_file() {
-            bail!("archive contains an unsupported entry at {raw}");
-        }
+        // No third entry kind to reject here: `zip` defines `is_file` as
+        // "neither a directory nor a symlink", and both are handled above.
         create_entry_parent(destination, &path)?;
         let mode = entry.unix_mode();
         write_entry_file(&path, &mut entry)?;
@@ -1702,6 +1738,21 @@ fn extract_zip(archive: &Path, destination: &Path) -> Result<()> {
 /// external binary was resolved from `PATH` (so the extractor unpacking
 /// untrusted bytes was itself unpinned), and its traversal behaviour varied
 /// between GNU tar, the bsdtar shipped as Windows `tar.exe`, and busybox tar.
+///
+/// # Link policy
+///
+/// Extraction writes directories and regular files and nothing else: a link
+/// entry is rejected rather than resolved, here and again when the extracted
+/// tree is searched and copied out. That is deliberately conservative. The
+/// v10.10.0 artifacts contain no links, and refusing them removes the whole
+/// class of "entry points outside the tree" bugs instead of trying to reason
+/// about each one.
+///
+/// The cost is that it fails closed on an authentic archive: if a future
+/// Lemonade release ships, say, `libfoo.so -> libfoo.so.1`, installs stop with
+/// "archive contains symlink at ...". That is a signal to widen the policy
+/// deliberately — resolve the target and accept it only if it stays inside the
+/// extraction root — not to drop the check.
 fn extract_archive(archive: &Path, destination: &Path) -> Result<()> {
     let is_zip = archive
         .extension()
@@ -1752,6 +1803,7 @@ fn collect_embeddable_roots(
         return Ok(());
     }
     let metadata = fs::symlink_metadata(path)?;
+    // See the link policy on `extract_archive`.
     if metadata.file_type().is_symlink() {
         bail!("archive contains symlink at {}", path.display());
     }
@@ -1850,6 +1902,7 @@ fn copy_tree_entries(
         let entry = entry?;
         let source_path = entry.path();
         let file_type = entry.file_type()?;
+        // See the link policy on `extract_archive`.
         if file_type.is_symlink() {
             bail!("refusing to copy symlink {}", source_path.display());
         }
@@ -4639,6 +4692,77 @@ vllm                rocm        unsupported     Requires Linux                  
             extract_archive(&archive, &destination).unwrap();
             assert!(destination.join("placeholder.txt").is_file());
         }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A pax global header is archive-wide metadata, not a member, and the
+    /// `tar` crate hands it to the caller rather than consuming it the way it
+    /// consumes long-name and pax local headers. Treating it as a member
+    /// rejects any archive written by `git archive` or `tar --format=pax`.
+    #[test]
+    fn extract_archive_skips_pax_global_header() {
+        let dir = scratch_dir("pax-global-header");
+        let archive = dir.join("pax.tar.gz");
+        let destination = dir.join("extract");
+        fs::create_dir_all(&destination).unwrap();
+
+        let file = fs::File::create(&archive).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+
+        let record = b"52 comment=0000000000000000000000000000000000000000\n";
+        let mut global = tar::Header::new_ustar();
+        global.set_size(record.len() as u64);
+        global.set_mode(0o644);
+        global.set_entry_type(tar::EntryType::XGlobalHeader);
+        global.set_path("pax_global_header").unwrap();
+        global.set_cksum();
+        builder.append(&global, &record[..]).unwrap();
+
+        let mut header = tar::Header::new_ustar();
+        header.set_size(5);
+        header.set_mode(0o755);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_path("embeddable/bin/lemond").unwrap();
+        header.set_cksum();
+        builder.append(&header, &b"hello"[..]).unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        extract_archive(&archive, &destination).unwrap();
+        assert_eq!(
+            fs::read(destination.join("embeddable").join("bin").join("lemond")).unwrap(),
+            b"hello"
+        );
+        assert!(
+            !destination.join("pax_global_header").exists(),
+            "the global header was written out as a member"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Zip counterpart to `extract_archive_rejects_symlink_entry`: the zip path
+    /// has its own link check, keyed on the entry's unix mode.
+    #[test]
+    fn extract_archive_rejects_zip_symlink_entry() {
+        let dir = scratch_dir("zip-symlink");
+        let archive = dir.join("hostile.zip");
+        let destination = dir.join("extract");
+        fs::create_dir_all(&destination).unwrap();
+
+        let file = fs::File::create(&archive).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        writer
+            .add_symlink(
+                "escape-link",
+                "/etc/passwd",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        let error = format!("{:#}", extract_archive(&archive, &destination).unwrap_err());
+        assert!(error.contains("symlink"), "{error}");
+        assert!(!destination.join("escape-link").exists());
         fs::remove_dir_all(&dir).ok();
     }
 }
