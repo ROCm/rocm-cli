@@ -1,15 +1,15 @@
 # WIP: E2E Task #9: narrow 'serve' paths-filter so non-serve Rust PRs skip the GPU matrix
 
-**Stage:** 8-in-review — PR #156 open (https://github.com/ROCm/rocm-cli/pull/156); commit d7896c6 signed+signoff, rebased on main d17fc0c, container gate GREEN
+**Stage:** 8-in-review — PR #156 open (https://github.com/ROCm/rocm-cli/pull/156); commit d7896c6 signed+signoff, rebased on main d17fc0c, all checks GREEN, maintainer review pending
 **PR:** https://github.com/ROCm/rocm-cli/pull/156
 **Pipeline:** lightweight
 **Branch:** e2e-task-9-narrow-serve-paths-filter-so-non
 **Jira:** EAI-7746 (Task, rocm-cli, unassigned)
 **Pre-PR-check:** review-done — OpenCode reviewer (gpt-5.6-sol), 2026-07-31, @ca9f297+e2748ac0b92b8d83 — PASSED after two review rounds (all issues fixed); short-name scenarios now @serves-on-gpu, full serve-step/feature sweep found no other real GPU serve escaping canary gating; focused tests + harness compile + clippy + git diff --check all pass.
-**Last Updated:** 2026-08-01
+**Last Updated:** 2026-08-03
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=2561 out=1066826 cache_create=34257310 cache_read=267432950 calls=1264
+**Token Usage:** in=2569 out=1068817 cache_create=35458942 cache_read=267833276 calls=1268
 
 ---
 
@@ -77,12 +77,12 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 6. ✅ PR #156 opened: https://github.com/ROCm/rocm-cli/pull/156 (bundles #8+#9).
 7. ✅ Confirmed all required GPU checks PRODUCED on PR #156: `E2E tests (GPU)` passed 1m26s (canary mode working as designed), both Strix lanes correctly `skipping` (merge_group-only), report gate green. No review comments anywhere (0 formal reviews/inline/issue comments) — `REVIEW_REQUIRED` is just the pending maintainer-team gate, not feedback.
 8. ✅ `windows-build-and-test` re-run authorized by user and kicked off (job now `pending`) to clear the unrelated PR #139 flake.
-9. Scoped dispatch to validate canary serves only 6b — still open (optional extra verification).
-10. ✅ Windows re-run watched to completion: PASSED (12m20s) — confirmed it was the #139 flake, not this PR.
+9. ✅ Windows re-run watched to completion: PASSED (12m20s) — confirmed it was the #139 flake, not this PR.
+10. ✅ Re-checked PR #156 on 2026-08-03: all checks remain green; still awaiting maintainer review (no new feedback).
 
 ## Blockers
 
-**BLOCKED (external, not user):** PR #156 — every check now green/passing (windows-build-and-test re-run confirmed PASS). merge=BLOCKED / review=REVIEW_REQUIRED is only the ROCm CLI Maintainers team review — a human gate outside this session; nothing left for the agent or fres to do until they review.
+None. PR #156 is fully green (all required checks pass, no conflicts); waiting on maintainer-team review (human gate).
 
 ## Notes
 
