@@ -1060,7 +1060,7 @@ fn install_tarball_runtime(
     }
 
     download_file(&artifact.url, &cache_path)?;
-    extract_tarball(&cache_path, &install_root)?;
+    extract_tarball_and_discard_archive(&cache_path, &install_root)?;
 
     let manifest = InstalledRuntimeManifest {
         runtime_key: runtime_key.clone(),
@@ -2214,6 +2214,25 @@ fn extract_tarball(archive_path: &Path, target_dir: &Path) -> Result<()> {
     )
 }
 
+/// Unpack the SDK archive and then delete it.
+///
+/// Only the extracted tree is used from here on, so keeping the archive would
+/// double the disk cost of every installed version. This mirrors the cleanup
+/// `ensure_uv_binary` already performs after unpacking its own download.
+///
+/// Removing the archive is best-effort: the install has already succeeded by
+/// this point, so a cleanup failure is reported rather than raised.
+fn extract_tarball_and_discard_archive(archive_path: &Path, target_dir: &Path) -> Result<()> {
+    extract_tarball(archive_path, target_dir)?;
+    if let Err(error) = fs::remove_file(archive_path) {
+        progress_line(format!(
+            "Could not remove the downloaded archive {}: {error}",
+            archive_path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_uv_venv(uv: &Path, python_launcher: &Path, install_root: &Path) -> Result<()> {
     let env_python = venv_python_path(install_root);
     if env_python.is_file() {
@@ -3242,6 +3261,50 @@ mod tests {
                 "torchaudio==2.10.0+rocm7.13.0a20260513".to_owned(),
             ]
         );
+    }
+
+    /// The downloaded archive is removed once it has been unpacked; keeping it
+    /// would double the disk cost of every installed SDK version.
+    #[test]
+    fn extracting_the_sdk_archive_removes_it() -> Result<()> {
+        let (root, _paths) = test_paths("discard-archive");
+        let cache = root.join("cache");
+        let payload_dir = root.join("payload");
+        fs::create_dir_all(&cache)?;
+        fs::create_dir_all(&payload_dir)?;
+        fs::write(payload_dir.join("marker.txt"), b"sdk")?;
+
+        let archive = cache.join("therock-sdk.tar.gz");
+        let tar = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&payload_dir)
+            .arg("marker.txt")
+            .status()?;
+        if !tar.success() {
+            eprintln!("skipping: tar unavailable on this host");
+            let _ = fs::remove_dir_all(&root);
+            return Ok(());
+        }
+        assert!(archive.is_file(), "archive fixture should exist");
+
+        let target = root.join("install");
+        fs::create_dir_all(&target)?;
+        extract_tarball_and_discard_archive(&archive, &target)?;
+
+        assert!(
+            target.join("marker.txt").is_file(),
+            "the archive contents should have been extracted"
+        );
+        assert!(
+            !archive.exists(),
+            "the archive should be removed once unpacked, found {}",
+            archive.display()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
