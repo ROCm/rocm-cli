@@ -113,11 +113,11 @@ than the ticket framed, so it needs a human go-ahead on scope before implementat
 - **RESOLVED:** Does `timeout-minutes` cancel a job still QUEUED on an offline runner?
   → **No.** The timer only starts once the job is running. Confirmed via GitHub
   community #50926 and actions/runner #4312.
-- **OPEN (scope):** Which remedy — (A) split self-hosted lanes into their own
-  workflow (robust, bigger diff), (B) per-job concurrency on the shared group
-  (subtle, required-check interactions), or (C) close as won't-fix-in-CI since the
-  true root cause is the runner being offline (EAI-7447 / persist-app-dev-ci-runner)?
-  Needs a human decision before implementation.
+- **BLOCKED (awaiting user):** Scope decision on remedy — (A) split self-hosted lanes
+  into their own workflow (robust, bigger diff), (B) per-job concurrency on the shared
+  group (subtle, required-check interactions), or (C) close as won't-fix-in-CI since
+  the true root cause is the runner being offline (EAI-7447 / persist-app-dev-ci-runner)?
+  Awaiting human go-ahead before implementation.
 
 ## Notes
 
@@ -137,7 +137,7 @@ than the ticket framed, so it needs a human go-ahead on scope before implementat
 - Created this WIP (lightweight pipeline) and the worktree; promoted inbox item 12.
 - Next: resolve the queued-vs-running `timeout-minutes` question, then edit `ci.yml`.
 
-### 2026-08-03
+### 2026-08-03 (first session)
 
 - Resolved the design gate. `timeout-minutes` does NOT reap a QUEUED job on an offline
   runner (timer covers running time only) — the planned "preferred fix" is invalid.
@@ -146,3 +146,10 @@ than the ticket framed, so it needs a human go-ahead on scope before implementat
 - Real fix is structural (split self-hosted lanes into their own workflow, option A) —
   bigger diff than the ticket framed. Surfaced to human for a scope decision; did NOT
   start implementation (design-gate stage, scope call is a human decision).
+
+### 2026-08-03 (second session)
+
+- Summarized the problem, remaining work, and three candidate remedies with recommendation.
+- Clarified the design-gate findings and why options (A), (B), (C) each have different
+  tradeoffs (robustness vs. diff size vs. root-cause remediation elsewhere).
+- Awaiting user's scope decision on which remedy to implement before proceeding.
