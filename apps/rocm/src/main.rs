@@ -1415,9 +1415,17 @@ fn render_freeform_comfyui_status_answer(
 }
 
 fn dispatch(cli: Cli) -> Result<()> {
+    // `storage` is excluded alongside the other self-referential commands: it
+    // reports and reclaims disk, and the startup update check can provision a
+    // managed Python, which downloads instead of freeing.
     if !matches!(
         cli.command,
-        Some(Command::Update { .. } | Command::Bootstrap { .. } | Command::Completions { .. })
+        Some(
+            Command::Update { .. }
+                | Command::Bootstrap { .. }
+                | Command::Completions { .. }
+                | Command::Storage { .. }
+        )
     ) {
         refresh_startup_update_check_quietly();
     }
