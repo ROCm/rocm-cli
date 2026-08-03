@@ -13,11 +13,14 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use crate::runtime::{managed_tools_dir, runtime_is_windows, runtime_os_name};
+use crate::runtime::{
+    managed_tools_dir, managed_uv_cache_dir, runtime_is_windows, runtime_os_name,
+};
 use crate::{AppPaths, download_file_to_path, unix_time_millis};
 
 /// Default network timeout, in seconds, applied to `uv` HTTP operations.
@@ -58,13 +61,42 @@ pub fn uv_http_timeout_secs() -> u64 {
         .unwrap_or(DEFAULT_UV_TIMEOUT_SECS)
 }
 
-/// Environment pairs to apply when spawning `uv` so network behavior is configured
-/// consistently (uv reads `UV_HTTP_TIMEOUT` rather than accepting a `--timeout` flag).
-pub fn uv_command_env() -> Vec<(String, String)> {
-    vec![(
+/// Environment variable `uv` reads to locate its content-addressed cache.
+pub const UV_CACHE_DIR_ENV: &str = "UV_CACHE_DIR";
+
+/// Environment pairs to apply when spawning `uv`.
+///
+/// Network behavior is configured consistently (uv reads `UV_HTTP_TIMEOUT` rather than
+/// accepting a `--timeout` flag) and the cache lives beside the managed environments it
+/// populates.
+///
+/// Without a cache inside the managed root, `uv` caches under `$HOME/.cache/uv`; when
+/// that is on a different filesystem from the data directory, `uv` cannot hardlink and
+/// silently copies every file, so each environment carries a full duplicate of the SDK
+/// and torch stack. An `UV_CACHE_DIR` already present in the environment is a deliberate
+/// choice (the e2e harness shares one cache across scenarios) and is left alone.
+pub fn uv_command_env(paths: &AppPaths) -> Vec<(String, String)> {
+    let inherited = std::env::var_os(UV_CACHE_DIR_ENV).filter(|value| !value.is_empty());
+    uv_command_env_with_inherited_cache(paths, inherited.as_deref())
+}
+
+fn uv_command_env_with_inherited_cache(
+    paths: &AppPaths,
+    inherited_cache_dir: Option<&OsStr>,
+) -> Vec<(String, String)> {
+    let mut env = vec![(
         "UV_HTTP_TIMEOUT".to_owned(),
         uv_http_timeout_secs().to_string(),
-    )]
+    )];
+    if inherited_cache_dir.is_none() {
+        env.push((
+            UV_CACHE_DIR_ENV.to_owned(),
+            managed_uv_cache_dir(&paths.data_dir)
+                .to_string_lossy()
+                .into_owned(),
+        ));
+    }
+    env
 }
 
 /// Arguments for `uv venv`, creating an environment at `env_root` using `python`.
@@ -364,6 +396,54 @@ mod tests {
         assert_eq!(
             args,
             vec!["pip", "install", "--python", "/envs/run/bin/python"]
+        );
+    }
+
+    fn test_paths(root: &str) -> AppPaths {
+        AppPaths {
+            config_dir: PathBuf::from(root).join("config"),
+            data_dir: PathBuf::from(root),
+            cache_dir: PathBuf::from(root).join("cache"),
+        }
+    }
+
+    fn cache_dir_in(env: &[(String, String)]) -> Option<String> {
+        env.iter()
+            .find(|(key, _)| key == UV_CACHE_DIR_ENV)
+            .map(|(_, value)| value.clone())
+    }
+
+    #[test]
+    fn command_env_cache_dir_is_derived_from_data_dir() {
+        let paths = test_paths("/managed/root");
+        let env = uv_command_env_with_inherited_cache(&paths, None);
+        assert_eq!(
+            cache_dir_in(&env),
+            Some(
+                managed_uv_cache_dir(&paths.data_dir)
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+        assert!(env.iter().any(|(key, _)| key == "UV_HTTP_TIMEOUT"));
+    }
+
+    #[test]
+    fn command_env_keeps_an_explicit_cache_dir() {
+        // The e2e harness sets UV_CACHE_DIR to share one cache across scenarios; a user can
+        // do the same. Such a choice must be inherited, not overridden.
+        let paths = test_paths("/managed/root");
+        let env = uv_command_env_with_inherited_cache(&paths, Some(OsStr::new("/shared/uv-cache")));
+        assert_eq!(cache_dir_in(&env), None);
+    }
+
+    #[test]
+    fn command_env_cache_dir_follows_a_relocated_data_dir() {
+        let default_root = test_paths("/home/user/.rocm");
+        let moved_root = test_paths("/mnt/big/rocm");
+        assert_ne!(
+            cache_dir_in(&uv_command_env_with_inherited_cache(&default_root, None)),
+            cache_dir_in(&uv_command_env_with_inherited_cache(&moved_root, None))
         );
     }
 

@@ -945,7 +945,7 @@ fn install_vllm_with_uv(python: &Path, reinstall: bool) -> Result<()> {
     args.push(index_url.clone());
     let output = ProcessCommand::new(&uv)
         .args(args)
-        .envs(uv_command_env())
+        .envs(uv_command_env(&paths))
         .output()
         .context("failed to launch uv pip install for vLLM")?;
     if output.status.success() {

@@ -55,7 +55,7 @@ use runtime::home_rocm_dir;
 pub use runtime::{
     RuntimeHost, RuntimePlatform, current_executable_path, default_cache_dir, default_config_dir,
     default_data_dir, default_interactive_shell_program, managed_logs_dir, managed_pip_cache_dir,
-    managed_runtime_cache_dir, managed_runtime_data_root, managed_tools_dir,
+    managed_runtime_cache_dir, managed_runtime_data_root, managed_tools_dir, managed_uv_cache_dir,
     normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
     normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_platform,
     normalize_runtime_path_text_for_storage, platform_binary_name, prepend_runtime_path,
@@ -70,7 +70,7 @@ pub use runtime::{
     runtime_rocm_library_filename, shell_command_for_host,
 };
 pub use uv::{
-    DEFAULT_UV_TIMEOUT_SECS, ensure_uv_binary, uv_binary_name, uv_command_env,
+    DEFAULT_UV_TIMEOUT_SECS, UV_CACHE_DIR_ENV, ensure_uv_binary, uv_binary_name, uv_command_env,
     uv_http_timeout_secs, uv_pip_freeze_args, uv_pip_install_base, uv_venv_args,
 };
 
