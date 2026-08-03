@@ -3625,6 +3625,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sysinfo",
  "toml",
  "ureq",
  "windows-sys 0.61.2",

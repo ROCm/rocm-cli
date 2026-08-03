@@ -27,6 +27,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 pub mod diagnose;
+pub mod disk_space;
 pub mod examine;
 pub mod fix;
 pub mod openmpi;
@@ -36,6 +37,11 @@ pub mod uv;
 pub use diagnose::{
     DiagnoseReport, Diagnosis, Fix, diagnose as run_diagnose,
     render_report_text as render_diagnose_text,
+};
+pub use disk_space::{
+    SpaceCheck, available_space_for_path, check_space_for_path, ensure_space_for,
+    estimated_extracted_size, format_bytes, insufficient_space_message, map_write_error,
+    mount_for_path, on_same_filesystem, warn_if_low_space, with_margin,
 };
 pub use examine::{Examination, FrameworkProbe, WSL_ROUTE_OUT_NOTE};
 pub use fix::{FixOptions, apply as apply_fix, list_recipes as list_fix_recipes};
@@ -124,11 +130,23 @@ pub fn download_file_to_path(url: &str, destination: &Path, timeout: Duration) -
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
+    // Free-space preflight: `Content-Length` is an exact size where the server
+    // sends it, so refuse upfront rather than failing partway through the write.
+    if let Some(content_length) = response
+        .header("Content-Length")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        disk_space::ensure_space_for(
+            &format!("download {url}"),
+            destination,
+            disk_space::with_margin(content_length),
+        )?;
+    }
     let mut reader = response.into_reader();
     let mut file = fs::File::create(destination)
         .with_context(|| format!("failed to create {}", destination.display()))?;
     std::io::copy(&mut reader, &mut file)
-        .with_context(|| format!("failed to write {}", destination.display()))?;
+        .map_err(|error| disk_space::map_write_error(error, destination))?;
     Ok(())
 }
 

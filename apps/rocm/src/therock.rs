@@ -5,7 +5,7 @@
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_gpu_diagnostics,
-    detect_host_therock_family, detect_managed_therock_family, ensure_uv_binary,
+    detect_host_therock_family, detect_managed_therock_family, disk_space, ensure_uv_binary,
     known_therock_families, managed_tools_dir, normalize_runtime_path_for_host,
     normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
     normalize_runtime_path_text_for_storage, normalize_therock_family, runtime_is_windows,
@@ -32,6 +32,8 @@ const THEROCK_NIGHTLY_TARBALL_BASE: &str = "https://rocm.nightlies.amd.com/tarba
 const DEFAULT_MANAGED_PYTHON_VERSION: &str = "3.12";
 const STARTUP_UPDATE_CHECK_INTERVAL_MS: u128 = 12 * 60 * 60 * 1_000;
 const STARTUP_UPDATE_CHECK_TIMEOUT_SECS: u64 = 2;
+/// Timeout for the best-effort HEAD probe that sizes a download before starting it.
+const THEROCK_HEAD_PROBE_TIMEOUT_SECS: u64 = 10;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TheRockChannel {
     Release,
@@ -1059,6 +1061,8 @@ fn install_tarball_runtime(
         );
     }
 
+    preflight_tarball_space(&artifact.url, &cache_path, &install_root)?;
+
     download_file(&artifact.url, &cache_path)?;
     extract_tarball(&cache_path, &install_root)?;
 
@@ -2084,7 +2088,64 @@ fn download_file(url: &str, destination: &Path) -> Result<()> {
     if response.status != 200 {
         bail!("HTTP {} while fetching {url}", response.status);
     }
+    // The body is already buffered, so this requirement is exact: refuse before
+    // writing rather than leaving a truncated file behind on a full disk.
+    disk_space::ensure_space_for(
+        &format!("save the download from {url}"),
+        destination,
+        disk_space::with_margin(response.body.len() as u64),
+    )?;
     write_file_atomically(destination, &response.body)
+}
+
+/// Content length of `url` from a HEAD request, when the server reports one.
+///
+/// Best effort: any failure yields `None`, so a server that rejects HEAD or
+/// omits `Content-Length` simply skips the preflight instead of blocking the
+/// install.
+fn head_content_length(url: &str) -> Option<u64> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(THEROCK_HEAD_PROBE_TIMEOUT_SECS))
+        .build();
+    let response = agent.head(url).set("User-Agent", "rocm-cli").call().ok()?;
+    if response.status() != 200 {
+        return None;
+    }
+    response.header("Content-Length")?.trim().parse().ok()
+}
+
+/// Refuse (or warn) before a multi-GB SDK tarball download and extraction.
+///
+/// The download requirement comes from `Content-Length` and is exact, so a
+/// shortfall is a hard error — it saves the user a long download that cannot
+/// possibly succeed. The extraction requirement is only an estimate (see
+/// [`disk_space::EXTRACTED_SIZE_MULTIPLIER`]), so a shortfall there is a
+/// warning: a false refusal that blocks a valid install would be worse than a
+/// late failure.
+fn preflight_tarball_space(url: &str, cache_path: &Path, install_root: &Path) -> Result<()> {
+    let Some(download_bytes) = head_content_length(url) else {
+        return Ok(());
+    };
+    disk_space::ensure_space_for(
+        "download the SDK tarball",
+        cache_path,
+        disk_space::with_margin(download_bytes),
+    )?;
+
+    // When the cache and the install root share a filesystem, the archive and
+    // the extracted tree must both fit at the same time.
+    let mut extract_estimate = disk_space::estimated_extracted_size(download_bytes);
+    if disk_space::on_same_filesystem(cache_path, install_root) == Some(true) {
+        extract_estimate = extract_estimate.saturating_add(download_bytes);
+    }
+    if let Some(warning) = disk_space::warn_if_low_space(
+        "extract the SDK tarball",
+        install_root,
+        disk_space::with_margin(extract_estimate),
+    ) {
+        progress_line(warning);
+    }
+    Ok(())
 }
 
 fn http_get(
@@ -2192,7 +2253,7 @@ fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
         let mut file = fs::File::create(&tmp)
             .with_context(|| format!("failed to create {}", tmp.display()))?;
         file.write_all(bytes)
-            .with_context(|| format!("failed to write {}", tmp.display()))?;
+            .map_err(|error| disk_space::map_write_error(error, &tmp))?;
     }
     fs::rename(&tmp, path).or_else(|_| {
         let _ = fs::remove_file(path);
@@ -3183,6 +3244,45 @@ mod tests {
     use super::*;
 
     static PYTHON_RESOLVER_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn tarball_space_preflight_skips_when_the_download_size_is_unknown() {
+        // No HEAD response (unroutable host) must not block an install.
+        let temp = std::env::temp_dir();
+        preflight_tarball_space("http://127.0.0.1:1/rocm.tar.gz", &temp, &temp)
+            .expect("an unknown download size must not fail the preflight");
+    }
+
+    #[test]
+    fn download_space_requirement_includes_the_safety_margin() {
+        let archive = 2 * 1024 * 1024 * 1024;
+        assert_eq!(
+            disk_space::with_margin(archive),
+            archive + disk_space::SPACE_MARGIN_BYTES
+        );
+    }
+
+    #[test]
+    fn extraction_estimate_exceeds_the_compressed_archive() {
+        let archive = 3 * 1024 * 1024 * 1024;
+        let estimate = disk_space::estimated_extracted_size(archive);
+        assert!(
+            estimate > archive,
+            "extraction must reserve headroom beyond the archive: {estimate} vs {archive}"
+        );
+        assert_eq!(estimate, archive * disk_space::EXTRACTED_SIZE_MULTIPLIER);
+    }
+
+    #[test]
+    fn write_file_atomically_reports_a_full_disk_clearly() {
+        // Exercise the mapping the write path uses, without filling a disk.
+        let error = disk_space::map_write_error(
+            std::io::Error::from(std::io::ErrorKind::StorageFull),
+            Path::new("/cache/rocm.tar.gz.tmp"),
+        );
+        let text = format!("{error:#}");
+        assert!(text.contains("ran out of disk space"), "{text}");
+    }
 
     #[test]
     fn normalize_therock_family_maps_gfx1103_to_gfx110x_all() {
