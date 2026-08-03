@@ -829,3 +829,297 @@ pub(crate) fn storage(command: Option<StorageCommand>) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(
+        runtime_key: &str,
+        family: &str,
+        version: &str,
+        installed_at_unix_ms: u128,
+    ) -> therock::InstalledRuntimeManifest {
+        therock::InstalledRuntimeManifest {
+            runtime_key: runtime_key.to_owned(),
+            runtime_id: format!("therock-release:{family}"),
+            channel: "release".to_owned(),
+            format: "wheel".to_owned(),
+            family: family.to_owned(),
+            family_source: "test".to_owned(),
+            version: version.to_owned(),
+            install_root: PathBuf::from("rocm-storage-test").join(runtime_key),
+            selected_artifact_url: "https://example.invalid/therock".to_owned(),
+            index_url: None,
+            tarball_file_name: None,
+            python_launcher: None,
+            python_executable: None,
+            pip_cache_dir: None,
+            rocm_sdk: None,
+            read_only: false,
+            imported_from: None,
+            installed_at_unix_ms,
+        }
+    }
+
+    fn test_paths(name: &str) -> (PathBuf, AppPaths) {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("storage")
+            .join(format!(
+                "rocm-cli-storage-test-{name}-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let _ = std::fs::remove_dir_all(&root);
+        (
+            root.clone(),
+            AppPaths {
+                config_dir: root.join("config"),
+                data_dir: root.join("data"),
+                cache_dir: root.join("cache"),
+            },
+        )
+    }
+
+    /// Write a manifest pair (registry + in-tree copy) plus a payload file, so
+    /// the runtime looks exactly like one ROCm CLI installed itself.
+    fn install_fixture(
+        paths: &AppPaths,
+        mut record: therock::InstalledRuntimeManifest,
+        payload_bytes: usize,
+    ) -> Result<therock::InstalledRuntimeManifest> {
+        let install_root = paths
+            .data_dir
+            .join("runtimes")
+            .join("wheel")
+            .join(&record.runtime_key);
+        record.install_root = install_root.clone();
+        std::fs::create_dir_all(install_root.join("lib"))?;
+        std::fs::write(
+            install_root.join("lib").join("payload.bin"),
+            vec![0_u8; payload_bytes],
+        )?;
+        let registry_dir = paths.data_dir.join("runtimes").join("registry");
+        std::fs::create_dir_all(&registry_dir)?;
+        let encoded = serde_json::to_vec_pretty(&record)?;
+        std::fs::write(
+            registry_dir.join(format!("{}.json", record.runtime_key)),
+            &encoded,
+        )?;
+        std::fs::write(install_root.join(".rocm-cli-runtime.json"), &encoded)?;
+        Ok(record)
+    }
+
+    #[test]
+    fn keeps_the_most_recent_installs_per_family_and_removes_the_rest() {
+        let manifests = vec![
+            manifest("release-wheel-gfx110x-1", "gfx110X-all", "7.10.0", 10),
+            manifest("release-wheel-gfx110x-2", "gfx110X-all", "7.11.0", 20),
+            manifest("release-wheel-gfx110x-3", "gfx110X-all", "7.12.0", 30),
+            // A second GPU family keeps its own N rather than competing with
+            // the first: a multi-GPU machine needs one install per family.
+            manifest("release-wheel-gfx120x-1", "gfx120X-all", "7.12.0", 5),
+        ];
+
+        let (removable, held) =
+            select_runtimes_to_remove(&manifests, &RetentionInputs::default(), DEFAULT_KEEP);
+
+        assert_eq!(removable, vec!["release-wheel-gfx110x-1".to_owned()]);
+        let kept: Vec<&str> = held.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec![
+                "release-wheel-gfx110x-2",
+                "release-wheel-gfx110x-3",
+                "release-wheel-gfx120x-1",
+            ]
+        );
+        assert!(
+            held.iter()
+                .all(|(_, reason)| *reason == HoldReason::WithinKeepLimit)
+        );
+    }
+
+    #[test]
+    fn never_selects_the_active_previous_default_or_marked_install() {
+        let manifests = vec![
+            manifest("active", "gfx110X-all", "7.10.0", 1),
+            manifest("previous", "gfx110X-all", "7.10.0", 2),
+            manifest("marked", "gfx110X-all", "7.10.0", 3),
+            manifest("by-default-id", "gfx120X-all", "7.10.0", 4),
+            manifest("plain-old", "gfx110X-all", "7.10.0", 5),
+            manifest("plain-new", "gfx110X-all", "7.11.0", 6),
+        ];
+        let inputs = RetentionInputs {
+            // Deliberately a different case: keys compare case-insensitively
+            // everywhere else in the runtime code.
+            active_runtime_key: Some("ACTIVE".to_owned()),
+            previous_runtime_key: Some("previous".to_owned()),
+            default_runtime_id: Some("therock-release:gfx120X-all".to_owned()),
+            marker_runtime_keys: vec!["marked".to_owned()],
+        };
+
+        // keep = 0 so nothing survives on recency alone; only hard holds do.
+        let (removable, held) = select_runtimes_to_remove(&manifests, &inputs, 0);
+
+        assert_eq!(
+            removable,
+            vec!["plain-new".to_owned(), "plain-old".to_owned()]
+        );
+        let reason = |key: &str| {
+            held.iter()
+                .find(|(held_key, _)| held_key == key)
+                .map(|(_, reason)| reason.clone())
+        };
+        assert_eq!(reason("active"), Some(HoldReason::Active));
+        assert_eq!(reason("previous"), Some(HoldReason::Previous));
+        assert_eq!(reason("by-default-id"), Some(HoldReason::Default));
+        assert_eq!(reason("marked"), Some(HoldReason::Marker));
+    }
+
+    #[test]
+    fn never_selects_adopted_imported_or_read_only_installs() {
+        let mut adopted = manifest("adopted", "gfx110X-all", "7.10.0", 1);
+        adopted.read_only = true;
+        let mut imported = manifest("imported", "gfx110X-all", "7.10.0", 2);
+        imported.imported_from = Some(PathBuf::from("elsewhere/manifest.json"));
+        let manifests = vec![adopted, imported];
+
+        let (removable, held) =
+            select_runtimes_to_remove(&manifests, &RetentionInputs::default(), 0);
+
+        assert!(removable.is_empty());
+        assert!(
+            held.iter()
+                .all(|(_, reason)| *reason == HoldReason::NotOwned)
+        );
+    }
+
+    #[test]
+    fn prune_plan_skips_installs_without_a_matching_in_tree_manifest() -> Result<()> {
+        let (root, paths) = test_paths("prune-plan");
+        install_fixture(&paths, manifest("old", "gfx110X-all", "7.10.0", 10), 2048)?;
+        install_fixture(&paths, manifest("newer", "gfx110X-all", "7.11.0", 20), 1024)?;
+        // Strip the in-tree copy from a third install: ROCm CLI can no longer
+        // prove it owns that folder, so removal must be refused.
+        let unowned = install_fixture(&paths, manifest("unowned", "gfx110X-all", "7.9.0", 5), 512)?;
+        std::fs::remove_file(unowned.install_root.join(".rocm-cli-runtime.json"))?;
+
+        let plan = build_prune_plan(&paths, &RocmCliConfig::default(), 1)?;
+
+        let removed: Vec<&str> = plan
+            .remove
+            .iter()
+            .map(|entry| entry.runtime_key.as_str())
+            .collect();
+        assert_eq!(removed, vec!["old"]);
+        assert!(plan.remove[0].size_bytes >= 2048);
+        assert!(
+            plan.skipped
+                .iter()
+                .any(|line| line.starts_with("unowned: ROCm CLI did not create this folder")),
+            "unowned install must be reported as left alone: {:?}",
+            plan.skipped
+        );
+        assert!(
+            plan.skipped.iter().any(|line| line.starts_with("newer:")),
+            "kept install must be reported: {:?}",
+            plan.skipped
+        );
+
+        let rendered = render_prune_plan(&plan, 1, true);
+        assert!(rendered.contains("1 install(s) would be removed"));
+        assert!(rendered.contains("Left alone:"));
+        assert!(rendered.contains("Nothing was changed."));
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn report_lists_install_sizes_and_labels_shared_caches() -> Result<()> {
+        let (root, paths) = test_paths("report");
+        install_fixture(
+            &paths,
+            manifest("in-use", "gfx110X-all", "7.12.0", 20),
+            4096,
+        )?;
+        let config = RocmCliConfig {
+            active_runtime_key: Some("in-use".to_owned()),
+            ..RocmCliConfig::default()
+        };
+
+        let report = build_report(&paths, &config)?;
+        assert_eq!(report.runtimes.len(), 1);
+        assert!(report.runtimes[0].active);
+        assert_eq!(report.runtimes[0].hold_reason, Some(HoldReason::Active));
+        assert!(report.runtimes_total_bytes >= 4096);
+
+        let rendered = render_report(&report);
+        assert!(rendered.contains("in-use version=7.12.0"));
+        assert!(rendered.contains("status: in use"));
+        assert!(rendered.contains("Shared with other tools (never removed by ROCm CLI):"));
+        assert!(rendered.contains("downloaded models"));
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn report_survives_a_missing_install_folder() -> Result<()> {
+        let (root, paths) = test_paths("report-missing");
+        let gone = install_fixture(&paths, manifest("gone", "gfx110X-all", "7.12.0", 20), 16)?;
+        std::fs::remove_dir_all(&gone.install_root)?;
+
+        let rendered = render_report(&build_report(&paths, &RocmCliConfig::default())?);
+        assert!(rendered.contains("unknown size (folder missing or unreadable)"));
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn measuring_a_missing_path_reports_an_incomplete_zero() {
+        let measurement = measure_path(Path::new("definitely-not-here-rocm-storage"));
+        assert_eq!(
+            measurement,
+            Measurement {
+                bytes: 0,
+                complete: false
+            }
+        );
+    }
+
+    #[test]
+    fn downloads_plan_collects_cached_archives_and_never_model_files() -> Result<()> {
+        let (root, paths) = test_paths("downloads");
+        let archives = paths.cache_dir.join("therock");
+        std::fs::create_dir_all(archives.join("metadata"))?;
+        std::fs::write(archives.join("sdk.tar.gz"), b"tarball")?;
+        std::fs::write(archives.join("metadata").join("index.body"), b"index")?;
+        std::fs::create_dir_all(paths.data_dir.join("models"))?;
+        std::fs::write(
+            paths.data_dir.join("models").join("weights.bin"),
+            b"weights",
+        )?;
+
+        let plan = build_downloads_plan(&paths);
+
+        let names: Vec<String> = plan
+            .actions
+            .iter()
+            .map(|entry| entry.path.display().to_string())
+            .collect();
+        assert_eq!(plan.actions.len(), 2, "{names:?}");
+        assert!(names.iter().all(|name| !name.contains("models")));
+        let rendered = render_downloads_plan(&plan, true);
+        assert!(rendered.contains("2 downloaded file(s) would be removed"));
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+}
