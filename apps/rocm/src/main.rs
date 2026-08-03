@@ -11933,10 +11933,20 @@ fn artifact_source_policy_label(policy: &str) -> &str {
     }
 }
 
+/// Human-readable size. `rocm storage` reports caches that are routinely tens
+/// of megabytes, so the intermediate tiers matter: a bare byte count is
+/// unreadable at the sizes this reports.
 fn format_bytes(bytes: u64) -> String {
-    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-    if bytes >= 1024 * 1024 * 1024 {
-        format!("{:.1} GiB", bytes as f64 / GIB)
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * KIB;
+    const GIB: f64 = 1024.0 * MIB;
+    let value = bytes as f64;
+    if value >= GIB {
+        format!("{:.1} GiB", value / GIB)
+    } else if value >= MIB {
+        format!("{:.1} MiB", value / MIB)
+    } else if value >= KIB {
+        format!("{:.1} KiB", value / KIB)
     } else {
         format!("{bytes} bytes")
     }
@@ -16685,6 +16695,7 @@ fn treat_as_natural_language(args: &[String]) -> bool {
         "install",
         "update",
         "runtimes",
+        "storage",
         "engines",
         "model",
         "models",
@@ -21095,6 +21106,7 @@ install therock";
             "install",
             "update",
             "runtimes",
+            "storage",
             "engines",
             "model",
             "models",
