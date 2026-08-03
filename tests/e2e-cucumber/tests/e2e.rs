@@ -667,7 +667,7 @@ fn inference_timeout_for(world: &E2eWorld) -> u64 {
 /// full log archaeology once (a 10s client timeout that read as a dead server),
 /// so classify the error and unwind the source chain into the panic message.
 fn describe_request_error(error: &reqwest::Error) -> String {
-    use std::error::Error as _;
+    use std::{error::Error as _, fmt::Write as _};
 
     let kind = if error.is_timeout() {
         " [client timeout — the harness gave up, the server may still be working]"
@@ -679,7 +679,8 @@ fn describe_request_error(error: &reqwest::Error) -> String {
     let mut detail = format!("{error}{kind}");
     let mut source = error.source();
     while let Some(cause) = source {
-        detail.push_str(&format!("\n  caused by: {cause}"));
+        // Infallible: writing into a String never errors.
+        let _ = write!(detail, "\n  caused by: {cause}");
         source = cause.source();
     }
     detail
