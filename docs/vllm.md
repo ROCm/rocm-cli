@@ -107,9 +107,13 @@ rocm serve <model> --engine vllm --gpu-memory-utilization 0.3 --managed
 
 The value is a fraction in `(0, 1]` of total device VRAM. Lower it to leave room
 for a display, another workload, or a second server; raise it to give a large
-model more KV cache. Applies to vLLM only — it is ignored (with a note) for
-other engines. An out-of-range or unparsable value fails the command rather than
-falling back silently.
+model more KV cache. Applies to vLLM only — it is ignored, with a note in the
+serve output, for other engines. An out-of-range or unparsable value fails the
+command rather than falling back silently.
+
+Earlier releases pinned this to `0.80` to leave display/WSL headroom. That pin is
+gone, so an unchanged command now reserves vLLM's own (higher) default. Pass
+`--gpu-memory-utilization 0.8` to restore the previous reservation.
 
 ### Tool calling
 

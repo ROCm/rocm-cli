@@ -340,6 +340,11 @@ rocm serve qwen2.5-7b-instruct --verbose --device gpu_required")]
         /// KV cache (`0.0 < value <= 1.0`). Omitted by default, so vLLM applies
         /// its own default. Lower it when a small model should not reserve most
         /// of a large card. Applies to vLLM only.
+        // Taken as a string with `allow_hyphen_values` rather than a clap `f64` so a
+        // negative fraction reaches `parse_gpu_memory_utilization` and gets the domain
+        // error naming the valid range, instead of clap rejecting `-0.2` as an unknown
+        // flag. The cost is that a missing value swallows the next argument
+        // (`--gpu-memory-utilization --verbose`), which then fails loudly on parse.
         #[arg(long, value_name = "FRACTION", allow_hyphen_values = true)]
         gpu_memory_utilization: Option<String>,
         /// API key that clients must present to a public (non-loopback) endpoint.
@@ -4362,10 +4367,12 @@ fn serve(args: ServeArgs) -> Result<()> {
         engine_recipe,
         gpu_memory_utilization,
     );
+    // Stored without a `note:` prefix so it can feed both output paths: the plan
+    // path adds the prefix inline, the interactive summary adds it when rendering.
     let gpu_memory_utilization_note = (gpu_memory_utilization.is_some() && !engine_serves_vllm)
         .then(|| {
             format!(
-                "note: --gpu-memory-utilization applies only to vLLM; ignored for engine '{selected_engine}'"
+                "--gpu-memory-utilization applies only to vLLM; ignored for engine '{selected_engine}'"
             )
         });
     let tool_call_note = if tool_call_parser.is_some() && !engine_serves_vllm {
@@ -4515,7 +4522,7 @@ fn serve(args: ServeArgs) -> Result<()> {
             println!("  {note}");
         }
         if let Some(note) = &gpu_memory_utilization_note {
-            println!("  {note}");
+            println!("  note: {note}");
         }
     }
 
@@ -4590,6 +4597,7 @@ fn serve(args: ServeArgs) -> Result<()> {
                 rocr_visible_devices_set,
                 &gpu_indices,
                 gpu_vram.as_deref(),
+                gpu_memory_utilization_note.as_deref(),
             );
             let summary = serve_summary::DeploymentSummary {
                 engine: selected_engine.clone(),
@@ -4633,8 +4641,15 @@ fn collect_serve_notes(
     rocr_visible_devices_set: bool,
     gpu_indices: &[u32],
     gpu_vram: Option<&[GpuVramUsage]>,
+    engine_flag_note: Option<&str>,
 ) -> Vec<String> {
     let mut notes = Vec::new();
+    // An engine-scoped flag the selected engine cannot honor must be reported here
+    // too: the summary path is what an interactive `rocm serve` actually prints, so
+    // a note only emitted on the plan path would never reach that user.
+    if let Some(note) = engine_flag_note {
+        notes.push(note.to_owned());
+    }
     if cpu_only {
         if matches!(gpu_selection, GpuSelection::Index(_)) {
             notes.push(
@@ -22026,6 +22041,27 @@ install therock";
             Some(0.5)
         );
         assert_eq!(parse_gpu_memory_utilization(Some("1")).unwrap(), Some(1.0));
+    }
+
+    #[test]
+    fn serve_notes_surface_the_ignored_engine_flag_in_summary_mode() {
+        // The interactive summary is what a default `rocm serve` prints, so a flag
+        // the selected engine cannot honor has to be reported through this path —
+        // not only on the plan path that an interactive run never takes.
+        let note = "--gpu-memory-utilization applies only to vLLM; ignored for engine 'lemonade'";
+        let notes = collect_serve_notes(false, &GpuSelection::Auto, false, &[0], None, Some(note));
+        assert!(
+            notes.iter().any(|entry| entry == note),
+            "the ignored-flag note must reach the summary: {notes:?}"
+        );
+
+        let quiet = collect_serve_notes(false, &GpuSelection::Auto, false, &[0], None, None);
+        assert!(
+            !quiet
+                .iter()
+                .any(|entry| entry.contains("--gpu-memory-utilization")),
+            "nothing to report when the flag was honored: {quiet:?}"
+        );
     }
 
     #[test]
