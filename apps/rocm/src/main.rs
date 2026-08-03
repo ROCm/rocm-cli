@@ -12,6 +12,7 @@ mod logging;
 mod provider_keys;
 mod providers;
 mod serve_summary;
+mod storage;
 mod therock;
 mod uninstall;
 
@@ -260,6 +261,11 @@ rocm update --apply --dry-run")]
     Runtimes {
         #[command(subcommand)]
         command: Option<RuntimesCommand>,
+    },
+    /// Show what ROCm CLI is storing on disk, and free space it no longer needs.
+    Storage {
+        #[command(subcommand)]
+        command: Option<StorageCommand>,
     },
     /// List, install, or open shells for local model engines.
     Engines {
@@ -625,6 +631,39 @@ enum RuntimesCommand {
         /// Replace an existing record with the same key.
         #[arg(long)]
         replace: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum StorageCommand {
+    /// Show what is using disk space.
+    Report {
+        /// Emit the machine-readable storage JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove older ROCm installs, keeping the most recent ones.
+    #[command(name = "remove-old-installs", alias = "remove-old-runtimes")]
+    RemoveOldInstalls {
+        /// How many recent installs to keep for each channel, format, and GPU family.
+        #[arg(long, default_value_t = storage::DEFAULT_KEEP)]
+        keep: usize,
+        /// Show what would happen without changing files.
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Remove downloaded files that ROCm CLI can fetch again.
+    #[command(name = "remove-downloads", alias = "remove-downloaded-files")]
+    RemoveDownloads {
+        /// Show what would happen without changing files.
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -1597,6 +1636,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Command::Runtimes { command }) => runtimes(command),
+        Some(Command::Storage { command }) => storage::storage(command),
         Some(Command::Engines { command }) => engines(command),
         Some(Command::Model { verbose }) => {
             let paths = AppPaths::discover()?;
@@ -11893,7 +11933,6 @@ fn artifact_source_policy_label(policy: &str) -> &str {
     }
 }
 
-#[allow(dead_code)]
 fn format_bytes(bytes: u64) -> String {
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     if bytes >= 1024 * 1024 * 1024 {
