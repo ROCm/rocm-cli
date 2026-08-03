@@ -193,7 +193,8 @@ Then it verifies:
   pip creates it inside the ROCm folder when packages are downloaded
 - a single TheRock-index pip install plan for pinned `rocm`, `torch`, and
   `torchvision` requirements with exactly one `device-<detected-gfx-target>`
-  extra (`rocm` also requests `libraries,devel`), plus pinned `torchaudio`
+  extra (`rocm` also requests `libraries`; `--devel` adds `devel` to them),
+  plus pinned `torchaudio`
 - on a host with no detectable AMD GPU the preview reports `device_target:
   undetermined` and renders the device extra as a placeholder; a real install
   refuses rather than falling back to every published device payload
