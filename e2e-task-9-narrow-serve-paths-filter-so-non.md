@@ -9,7 +9,7 @@
 **Last Updated:** 2026-08-03
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=2573 out=1068987 cache_create=36204659 cache_read=267895667 calls=1270 (session 8+)
+**Token Usage:** in=2575 out=1069072 cache_create=36614177 cache_read=267895667 calls=1271
 
 ---
 
