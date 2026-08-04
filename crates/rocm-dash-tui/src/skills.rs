@@ -257,17 +257,17 @@ pub fn auto_config_change(detected_endpoint: Option<&str>) -> Option<ConfigChang
 pub const LEMONADE_GITHUB_REPO: &str = "lemonade-sdk/lemonade";
 /// Pinned embeddable version used as the offline fallback when the GitHub
 /// releases API is unreachable. Bump deliberately. (Latest at authoring time.)
-pub const LEMONADE_EMBEDDABLE_FALLBACK_VERSION: &str = "10.6.0";
+pub const LEMONADE_EMBEDDABLE_FALLBACK_VERSION: &str = "11.5.1";
 
 /// A selected embeddable archive for a host triple — enough to download, extract,
 /// and locate the server binary. Pure data; no I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddableArtifact {
-    /// Version without a leading `v`, e.g. `10.6.0`.
+    /// Version without a leading `v`, e.g. `11.5.1`.
     pub version: String,
     /// The archive's `browser_download_url`.
     pub url: String,
-    /// The archive file name, e.g. `lemonade-embeddable-10.6.0-ubuntu-x64.tar.gz`.
+    /// The archive file name, e.g. `lemonade-embeddable-11.5.1-ubuntu-x64.tar.gz`.
     pub archive_name: String,
     /// The unpacked server executable name (`lemond` / `lemond.exe`).
     pub server_bin: String,
@@ -275,7 +275,8 @@ pub struct EmbeddableArtifact {
 
 /// Map a host (os, arch) — `std::env::consts::{OS, ARCH}` values — to the
 /// embeddable asset's `<os-arch>` token + archive extension. `None` for an
-/// unsupported triple (the release ships only these three).
+/// unsupported triple (only these three are supported here; the release also
+/// ships `ubuntu-arm64`, which we do not select).
 fn embeddable_os_arch(os: &str, arch: &str) -> Option<(&'static str, &'static str)> {
     match (os, arch) {
         ("linux", "x86_64") => Some(("ubuntu-x64", "tar.gz")),
@@ -294,7 +295,7 @@ fn server_bin_for(os: &str) -> &'static str {
     }
 }
 
-/// Strip a leading `v` from a release tag (`v10.6.0` → `10.6.0`).
+/// Strip a leading `v` from a release tag (`v11.5.1` → `11.5.1`).
 fn strip_v(tag: &str) -> &str {
     tag.strip_prefix('v').unwrap_or(tag)
 }
