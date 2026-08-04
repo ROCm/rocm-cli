@@ -1,6 +1,6 @@
 # WIP: E2E Task #9: narrow 'serve' paths-filter so non-serve Rust PRs skip the GPU matrix
 
-**Stage:** 9-resolved-review-feedback — ON HOLD — PR #156 rebased + fixed for rominf feedback (commit ffbbc03: all 3 actionable fixes applied + validated; container gate GREEN); awaiting force-push authorization + user decision on judgment calls (#3, #6)
+**Stage:** 8-in-review
 **PR:** https://github.com/ROCm/rocm-cli/pull/156
 **Pipeline:** lightweight
 **Branch:** e2e-task-9-narrow-serve-paths-filter-so-non
@@ -80,8 +80,9 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 9. ✅ Windows re-run watched to completion: PASSED (12m20s) — confirmed it was the #139 flake, not this PR.
 10. ✅ Re-checked PR #156 on 2026-08-03: all checks remain green; still awaiting maintainer review (no new feedback).
 11. ✅ Rominf review feedback discovered (6 findings, 2026-08-03 13:14). Triaged: 3 actionable in this PR, 2 judgment calls for user.
-12. ✅ Applied all 3 in-PR fixes (README tag table + canary cardinality test + gate ordering) + full validation (lib tests, clippy, fmt, container gate GREEN).
-13. ⧴ Container gate re-validation on rebased tree confirms all gates GREEN post-fix; awaiting user decision on judgment calls (#3 merge_group continue-on-error trade-off, #6 cross-PR RunMode refactor).
+12. ✅ Applied all 3 in-PR fixes (README tag table + canary cardinality test + gate ordering) + full validation (lib tests 58 pass, clippy, fmt, container gate GREEN).
+13. ✅ Rebased onto current main (ad12ac7, PR #140 docs — clean, comment-only ci.yml overlap), committed ffbbc03 (signed+signoff, EAI-7746), force-pushed (--force-with-lease, user-authorized) to PR #156. Reply comment posted (#issuecomment-5179269962) summarizing addressed (1/2/5) vs deferred (#3 documented-not-changed, #4 no-action, #6 cross-PR). CI re-triggered on ffbbc03.
+14. ✅ Force-push completed; PR head now ffbbc03, CI re-triggered, reply comment visible to reviewer. Awaiting: CI green on the new head + maintainer-team review. #3 (drop continue-on-error on merge_group?) and #6 (shared RunMode across #155/#156/#157) remain open judgment calls for fres, not blocking this PR.
 
 ## Review Feedback (rominf, 2026-08-03)
 
@@ -101,8 +102,7 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 ## Blockers
 
 **BLOCKED (awaiting user action):**
-- **Force-push authorization:** Commit ffbbc03 (fixes + review feedback applied) is rebased onto main (ad12ac7), but remote branch still has pre-rebase history (d7896c6). A plain push is rejected (non-fast-forward). Force-push with lease (`git push --force-with-lease origin e2e-task-9-narrow-serve-paths-filter-so-non`) is needed to land the rebase + fixes; it only rewrites my own branch's history (no shared commits involved). Awaiting explicit go-ahead.
-- **Judgment calls #3/#6** (fixes #1/#2/#5 completed):
+- **Judgment calls #3/#6** (all in-PR fixes completed and force-pushed):
   - #3: continue-on-error trade-off on merge_group (Strix regression can land before nightly catches it) — document trade-off or drop continue-on-error?
   - #6: cross-PR RunMode struct refactor (#155/#156/#157) — pursue now or defer to shared decision?
 
@@ -180,6 +180,12 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 - **Commit ffbbc03 created & signed:** fixes + signed-off applied (EAI-7746), all hooks passed; staged & committed locally.
 - **Full container gate re-run:** GREEN (exit 0 + marker; 3 xfail / 0 XPASS / 0 unexpected). Cold build (~5min) after local rebase onto ad12ac7.
 - **Status:** remote branch still has pre-rebase d7896c6; local is rebased + ffbbc03. Non-fast-forward reject on plain push → force-push-with-lease required (safe, rewrites only own feature branch, no shared commits). Awaiting user authorization.
+
+### 2026-08-04 (session 12 — force-push complete, reply posted)
+
+- **Force-push succeeded:** `git push --force-with-lease` rebased ffbbc03 (d7896c6→ffbbc03) onto main (ad12ac7), updated PR head, CI re-triggered.
+- **Reply comment posted:** replied to rominf's review (#issuecomment-5179269962) summarizing what was fixed in this PR (#1 README tag table, #2 @canary cardinality test, #5 gate ordering) vs deferred/no-action (#3 continue-on-error trade-off documented but not changed, #4 dash exclusion verified sound, #6 cross-PR RunMode refactor).
+- **Waiting on:** CI green on the new head ffbbc03 + maintainer-team review. Judgment calls #3 and #6 remain for user decision.
 
 ### 2026-07-30
 
