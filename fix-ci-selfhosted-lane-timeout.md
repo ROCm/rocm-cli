@@ -3,7 +3,7 @@
 **Stage:** 6-implementing (option A chosen: split self-hosted lanes into own workflow; "Split only" — branch protection left as-is)
 **Pipeline:** lightweight
 **Branch:** fix-ci-selfhosted-lane-timeout
-**Pre-PR-check:** none
+**Pre-PR-check:** pending — requested 2026-08-04, commit 6976c7e (author: this session; awaiting a second-agent reviewer)
 **Ticket:** EAI-7548 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7548
 **Last Updated:** 2026-08-03
 **Token Usage:** in=94 out=71486 cache_create=845666 cache_read=4939709 calls=49
@@ -96,15 +96,27 @@ Scenario: A superseded run does not hang on an offline self-hosted runner
 - ✅ Confirmed all 3 self-hosted lanes already have `timeout-minutes` and dispatch
   already has a unique concurrency group (landed in #69).
 
-### Implementing (option A, "Split only") 📋
+### Implementing (option A, "Split only") ✅ code complete
 - ✅ Scope decided: **A — split self-hosted lanes into their own workflow.** "Split only":
   branch protection left as-is (user handles the required-check list separately).
-- 📋 Create `.github/workflows/e2e-selfhosted.yml`: move the 3 self-hosted jobs +
-  `e2e-report`; give it its own concurrency group and its own `changes` gate (cross-
-  workflow `needs` is impossible, so replicate the `changes` filter job).
-- 📋 Remove those 4 jobs from `ci.yml`; keep the mock `e2e` (hosted, required) there.
-- 📋 Validate: yaml lint + a scoped `workflow_dispatch` probe that the new workflow runs
-  and the shared ci.yml group no longer contains a self-hosted job.
+- ✅ Created `.github/workflows/e2e-selfhosted.yml` (652 lines): the 3 self-hosted jobs
+  (`e2e-gpu`, `e2e-gpu-strix-ubuntu`, `e2e-gpu-strix-windows`) + a self-hosted-side
+  `e2e-report` (renamed check `E2E consolidated report (self-hosted)` to avoid colliding
+  with ci.yml's required one). Own concurrency group (`${{ github.workflow }}-…`), own
+  trimmed `changes` gate (cross-workflow `needs` impossible), triggers mirror ci.yml
+  (push/PR/merge_group/dispatch). Dropped the `build-and-test` dep (cross-workflow); the
+  jobs `cargo build` themselves and are `continue-on-error`.
+- ✅ Removed those 3 jobs from `ci.yml` (1281→750 lines); mock `e2e` (hosted, required)
+  stays. Repointed `e2e-report.needs` to just `[changes, e2e]`; kept its required name
+  `E2E consolidated report`. Trimmed dead dispatch inputs (GPU platform options,
+  name_filter, include_nightly — mock lane uses none).
+- ✅ Validated: both files `yaml.safe_load` OK; all 5 required check names still produced,
+  each by exactly one workflow (no collision, no orphaned required check); ci.yml clean of
+  self-hosted refs; actionlint clean except the pre-existing custom-label warnings (main's
+  ci.yml already emits 8). e2e_report.rs renders whatever artifacts it finds (no hardcoded
+  platform requirement), so the per-workflow report split is safe.
+- 📋 NEXT: pre-PR review (mandatory gate) before opening the PR. Then user handles the
+  branch-protection de-require separately (the "Split only" caveat).
 
 ## KEY FINDING — required-check contradiction (drives "Split only" caveat)
 
@@ -161,6 +173,20 @@ Implement the split (option A). Leave branch protection alone (user's call).
 - Real fix is structural (split self-hosted lanes into their own workflow, option A) —
   bigger diff than the ticket framed. Surfaced to human for a scope decision; did NOT
   start implementation (design-gate stage, scope call is a human decision).
+
+### 2026-08-04
+
+- User chose option A, "Split only". Discovered a required-check contradiction: all 4
+  self-hosted checks are in main's REQUIRED list yet coded continue-on-error — so the
+  split fixes hosted-check STARVATION but an offline runner can still block via
+  missing-required-check until they're de-required (user's separate task). Captured in the
+  "KEY FINDING" section above.
+- Implemented the split: new `.github/workflows/e2e-selfhosted.yml`; removed the 3
+  self-hosted jobs from `ci.yml`; repointed the hosted report. Validated YAML, required-
+  check name coverage, and actionlint (only pre-existing custom-label warnings). Also
+  confirmed nightly.yml has its OWN independent self-hosted jobs (no concurrency coupling),
+  so it's unaffected by the split.
+- Next: pre-PR review gate, then open PR.
 
 ### 2026-08-03 (second session)
 
