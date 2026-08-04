@@ -1,6 +1,6 @@
 # WIP: Fix CI self-hosted E2E lane timeout (offline runner holds concurrency group)
 
-**Stage:** 4-design (design gate resolved — planned fix INVALID, see below; awaiting scope decision)
+**Stage:** 6-implementing (option A chosen: split self-hosted lanes into own workflow; "Split only" — branch protection left as-is)
 **Pipeline:** lightweight
 **Branch:** fix-ci-selfhosted-lane-timeout
 **Pre-PR-check:** none
@@ -96,28 +96,43 @@ Scenario: A superseded run does not hang on an offline self-hosted runner
 - ✅ Confirmed all 3 self-hosted lanes already have `timeout-minutes` and dispatch
   already has a unique concurrency group (landed in #69).
 
-### Pending scope decision 📋
-- 📋 Human call: pursue (A) split-workflow, (B) per-job concurrency, or (C) close as
-  won't-fix-in-CI (root cause is runner offline-ness, owned by EAI-7447).
-- 📋 (If A chosen) create new workflow, move the 3 self-hosted jobs + report `needs`,
-  wire its own concurrency group; validate a superseded shared-group run no longer hangs.
+### Implementing (option A, "Split only") 📋
+- ✅ Scope decided: **A — split self-hosted lanes into their own workflow.** "Split only":
+  branch protection left as-is (user handles the required-check list separately).
+- 📋 Create `.github/workflows/e2e-selfhosted.yml`: move the 3 self-hosted jobs +
+  `e2e-report`; give it its own concurrency group and its own `changes` gate (cross-
+  workflow `needs` is impossible, so replicate the `changes` filter job).
+- 📋 Remove those 4 jobs from `ci.yml`; keep the mock `e2e` (hosted, required) there.
+- 📋 Validate: yaml lint + a scoped `workflow_dispatch` probe that the new workflow runs
+  and the shared ci.yml group no longer contains a self-hosted job.
+
+## KEY FINDING — required-check contradiction (drives "Split only" caveat)
+
+Branch protection on `main` (`strict:true`, `enforce_admins:true`) lists all FOUR
+self-hosted checks as **required**: `E2E tests (GPU)`, `(Strix Halo, Ubuntu)`,
+`(Strix Halo, Windows)`, `E2E consolidated report`. But the jobs are coded
+`continue-on-error: true` ("non-blocking"), and PRs #114/#124/#131/#134 all merged with
+`E2E tests (GPU)` = FAILURE (one CANCELLED). Both are true because `continue-on-error`
+neutralizes a job that RAN-and-failed, but does nothing for a job that NEVER RAN
+(offline runner) — a missing required check blocks the merge.
+
+Consequence for "Split only": the split fixes the concurrency STARVATION of the hosted
+required checks (they start immediately instead of pending-with-0-jobs). It does NOT by
+itself unblock merges when the GPU runner is offline — those 4 checks would still be
+required-but-missing. Fully closing that needs them removed from the required list (an
+admin branch-protection change), which the user opted to handle separately.
 
 ## Next Steps
 
-**Awaiting scope decision** (see Blockers) — the original one-line `timeout-minutes`
-fix is off the table; the real fix is structural (split workflow) and a bigger diff
-than the ticket framed, so it needs a human go-ahead on scope before implementation.
+Implement the split (option A). Leave branch protection alone (user's call).
 
 ## Blockers / Open Questions
 
 - **RESOLVED:** Does `timeout-minutes` cancel a job still QUEUED on an offline runner?
   → **No.** The timer only starts once the job is running. Confirmed via GitHub
   community #50926 and actions/runner #4312.
-- **BLOCKED (awaiting user):** Scope decision on remedy — (A) split self-hosted lanes
-  into their own workflow (robust, bigger diff), (B) per-job concurrency on the shared
-  group (subtle, required-check interactions), or (C) close as won't-fix-in-CI since
-  the true root cause is the runner being offline (EAI-7447 / persist-app-dev-ci-runner)?
-  Awaiting human go-ahead before implementation.
+- **RESOLVED (scope):** A — split into own workflow, "Split only" (no branch-protection
+  change in this PR).
 
 ## Notes
 

@@ -1,6 +1,6 @@
 # WIP: E2E Task #9: narrow 'serve' paths-filter so non-serve Rust PRs skip the GPU matrix
 
-**Stage:** 9-resolved-review-feedback — PR #156 open (https://github.com/ROCm/rocm-cli/pull/156); commit d7896c6 rebased + fixed for rominf feedback (all 3 actionable fixes applied + validated); container gate GREEN; awaiting user decision on judgment calls (#3 merge_group trade-off, #6 cross-PR RunMode refactor)
+**Stage:** 9-resolved-review-feedback — PR #156 open (https://github.com/ROCm/rocm-cli/pull/156); commit d7896c6 rebased + fixed for rominf feedback (all 3 actionable fixes applied + validated; container gate GREEN); awaiting user decision on judgment calls (#3 merge_group trade-off, #6 cross-PR RunMode refactor)
 **PR:** https://github.com/ROCm/rocm-cli/pull/156
 **Pipeline:** lightweight
 **Branch:** e2e-task-9-narrow-serve-paths-filter-so-non
@@ -9,7 +9,7 @@
 **Last Updated:** 2026-08-04
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=2729 out=1120422 cache_create=38333588 cache_read=299002591 calls=1348
+**Token Usage:** in=4618 out=1127084 cache_create=38333588 cache_read=299313264 calls=1360
 
 ---
 
@@ -81,7 +81,7 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 10. ✅ Re-checked PR #156 on 2026-08-03: all checks remain green; still awaiting maintainer review (no new feedback).
 11. ✅ Rominf review feedback discovered (6 findings, 2026-08-03 13:14). Triaged: 3 actionable in this PR, 2 judgment calls for user.
 12. ✅ Applied all 3 in-PR fixes (README tag table + canary cardinality test + gate ordering) + full validation (lib tests, clippy, fmt, container gate GREEN).
-13. ⧴ Await user decision on judgment calls (#3 merge_group continue-on-error trade-off, #6 cross-PR RunMode refactor).
+13. ⧴ Container gate re-validation on rebased tree confirms all gates GREEN post-fix; awaiting user decision on judgment calls (#3 merge_group continue-on-error trade-off, #6 cross-PR RunMode refactor).
 
 ## Review Feedback (rominf, 2026-08-03)
 
@@ -167,6 +167,12 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 - **All 3 in-PR fixes applied** (README.md tag table corrected + canary cardinality unit test added + gate ordering swapped).
 - **All validations passed:** 58 lib tests (incl. new cardinality canary test), clippy clean, fmt clean, container gate GREEN (full rebase invalidated cache; ~5min).
 - **Status:** awaiting user decision on judgment calls #3 and #6.
+
+### 2026-08-04 (session 10 — final validation, fix holdover)
+
+- **All fixes validated:** 58 lib tests (incl. new `exactly_one_canary_scenario_across_feature_files` cardinality test), clippy clean, fmt clean, full container gate GREEN on rebased tree. All in-PR actionable items complete.
+- **Summary of rominf fixes applied:** README tag table documents `@canary`/`@serves-on-gpu` + corrected job table for PR canary mode; new unit test guards against silent `@canary` tag decay; gate ordering moved canary skip after GPU/OS applicability checks for accurate skip reasons.
+- **Judgment calls documented (user decision needed):** #3 merge_group `continue-on-error` trade-off (Strix regression can land before nightly catches it — document trade-off or drop `continue-on-error`?); #6 cross-PR `RunMode` struct refactor (#155/#156/#157) — pursue now or defer?
 
 ### 2026-07-30
 
