@@ -1,12 +1,12 @@
 # WIP: E2E Task #9: narrow 'serve' paths-filter so non-serve Rust PRs skip the GPU matrix
 
-**Stage:** 8-in-review
+**Stage:** 8-in-review — ON HOLD
 **PR:** https://github.com/ROCm/rocm-cli/pull/156
 **Pipeline:** lightweight
 **Branch:** e2e-task-9-narrow-serve-paths-filter-so-non
 **Jira:** EAI-7746 (Task, rocm-cli, unassigned)
 **Pre-PR-check:** review-done — OpenCode reviewer (gpt-5.6-sol), 2026-07-31, @ca9f297+e2748ac0b92b8d83 — PASSED after two review rounds (all issues fixed); short-name scenarios now @serves-on-gpu, full serve-step/feature sweep found no other real GPU serve escaping canary gating; focused tests + harness compile + clippy + git diff --check all pass.
-**Last Updated:** 2026-08-04
+**Last Updated:** 2026-08-04 (session 14, on hold pending user decision)
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
 **Token Usage:** in=4684 out=1140692 cache_create=39664749 cache_read=312939560 calls=1393
@@ -103,7 +103,7 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 ## Blockers
 
 **BLOCKED (awaiting user action):**
-- **Re-run `windows-build-and-test`?** — failed again on ffbbc03 with the same confirmed PR #139 flake signature (`lifecycle-windows-http-install` HTTP fixture download), outside this PR's diff and green on main. Re-run was authorized once before for this exact lane; asking again rather than assuming for a repeat CI action on a shared PR.
+- **Re-run `windows-build-and-test`?** — failed again on ffbbc03 (22m36s) with the same confirmed PR #139 flake signature (`lifecycle-windows-http-install` HTTP fixture download), outside this PR's diff and green on main. Re-run was authorized once before for this exact lane; asking again rather than assuming for a repeat CI action on a shared PR. Everything else green, awaiting maintainer-team review.
 - **Judgment calls #3/#6** (all in-PR fixes completed and force-pushed):
   - #3: continue-on-error trade-off on merge_group (Strix regression can land before nightly catches it) — document trade-off or drop continue-on-error?
   - #6: cross-PR RunMode struct refactor (#155/#156/#157) — pursue now or defer to shared decision?
