@@ -9,7 +9,7 @@
 **Last Updated:** 2026-08-04
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=4638 out=1131495 cache_create=38723146 cache_read=303395660 calls=1370
+**Token Usage:** in=4684 out=1140692 cache_create=39664749 cache_read=312939560 calls=1393
 
 ---
 
@@ -83,6 +83,7 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 12. ✅ Applied all 3 in-PR fixes (README tag table + canary cardinality test + gate ordering) + full validation (lib tests 58 pass, clippy, fmt, container gate GREEN).
 13. ✅ Rebased onto current main (ad12ac7, PR #140 docs — clean, comment-only ci.yml overlap), committed ffbbc03 (signed+signoff, EAI-7746), force-pushed (--force-with-lease, user-authorized) to PR #156. Reply comment posted (#issuecomment-5179269962) summarizing addressed (1/2/5) vs deferred (#3 documented-not-changed, #4 no-action, #6 cross-PR). CI re-triggered on ffbbc03.
 14. ✅ Force-push completed; PR head now ffbbc03, CI re-triggered, reply comment visible to reviewer. Awaiting: CI green on the new head + maintainer-team review. #3 (drop continue-on-error on merge_group?) and #6 (shared RunMode across #155/#156/#157) remain open judgment calls for fres, not blocking this PR.
+15. `windows-build-and-test` failed again on ffbbc03 with the same PR #139 `lifecycle-windows-http-install` flake signature — confirmed outside this PR's diff and green on main. Asked user for authorization to re-run the job again.
 
 ## Review Feedback (rominf, 2026-08-03)
 
@@ -102,6 +103,7 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 ## Blockers
 
 **BLOCKED (awaiting user action):**
+- **Re-run `windows-build-and-test`?** — failed again on ffbbc03 with the same confirmed PR #139 flake signature (`lifecycle-windows-http-install` HTTP fixture download), outside this PR's diff and green on main. Re-run was authorized once before for this exact lane; asking again rather than assuming for a repeat CI action on a shared PR.
 - **Judgment calls #3/#6** (all in-PR fixes completed and force-pushed):
   - #3: continue-on-error trade-off on merge_group (Strix regression can land before nightly catches it) — document trade-off or drop continue-on-error?
   - #6: cross-PR RunMode struct refactor (#155/#156/#157) — pursue now or defer to shared decision?
@@ -186,6 +188,19 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 - **Force-push succeeded:** `git push --force-with-lease` rebased ffbbc03 (d7896c6→ffbbc03) onto main (ad12ac7), updated PR head, CI re-triggered.
 - **Reply comment posted:** replied to rominf's review (#issuecomment-5179269962) summarizing what was fixed in this PR (#1 README tag table, #2 @canary cardinality test, #5 gate ordering) vs deferred/no-action (#3 continue-on-error trade-off documented but not changed, #4 dash exclusion verified sound, #6 cross-PR RunMode refactor).
 - **Waiting on:** CI green on the new head ffbbc03 + maintainer-team review. Judgment calls #3 and #6 remain for user decision.
+
+### 2026-08-04 (session 13 — idle follow-up: CI flake diagnosis & hold)
+
+- **Windows failure re-examined:** `windows-build-and-test` failed again (22m36s), same signature as session 6 (PR #139's `lifecycle-windows-http-install` scenario, local HTTP fixture download). Second failure on same lane after a passing re-run = confirmed flaky test, not caused by this PR's changes.
+- **Causality verified:** failing scenario is outside this PR's diff (serve-filter/canary/README only); same scenario passed on latest main runs → intermittent issue in #139's install-lifecycle code (out of scope).
+- **Action deferred:** per previous pattern, a re-run is safe for this confirmed flake; held for user's repeated authorization rather than assuming (same judgment call as session 6).
+- **Main findings:** all other checks remain green (GPU canary passing 1m23s, Strix skipping, build-and-test + changes + report green); no new review feedback since ffbbc03 force-push. Awaiting maintainer-team review + resolved CI on new head.
+
+### 2026-08-04 (session 14 — Windows flake re-confirmed, re-run authorization requested)
+
+- Re-checked PR #156 on the new head (ffbbc03) instead of answering from a stale conclusion: gating still correct (`E2E tests (GPU)` 1m23s, Strix skipping, `changes`/`E2E tests`/`build-and-test` green, no new review comments).
+- `windows-build-and-test` failed again (22m36s) with the identical `lifecycle-windows-http-install` HTTP-fixture-download signature as session 6/13 — confirmed not in this PR's diff and green on latest main, so it's a genuine repeat flake in PR #139's code, not caused by this branch.
+- Asked user whether to re-run `windows-build-and-test` again (same reversible action already authorized once for this lane) rather than assume; everything else on PR #156 remains green, still awaiting maintainer-team review.
 
 ### 2026-07-30
 
