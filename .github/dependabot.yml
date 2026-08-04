@@ -12,3 +12,27 @@ updates:
       github-actions:
         patterns:
           - "*"
+
+  # Cargo dependencies were previously untracked, so the workspace could drift
+  # onto crate versions carrying published advisories with nothing to surface
+  # them. `directory: /` is the workspace root: Dependabot resolves the whole
+  # member graph from the root manifest and `Cargo.lock`, so one entry covers
+  # every crate. Minor and patch bumps are grouped into a single weekly PR --
+  # they are almost always drop-in for a workspace this wide, and one PR per
+  # crate would bury real review signal. Major bumps stay ungrouped so each
+  # breaking change is reviewed, and eventually merged, on its own.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # Above the default of 5 so a backlog of separate major bumps cannot starve
+    # the grouped minor/patch PR, but still bounded so the queue stays readable.
+    open-pull-requests-limit: 10
+    groups:
+      cargo-minor-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
