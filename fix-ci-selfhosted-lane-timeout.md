@@ -1,12 +1,12 @@
 # WIP: Fix CI self-hosted E2E lane timeout (offline runner holds concurrency group)
 
-**Stage:** 6-implementing (option A chosen: split self-hosted lanes into own workflow; "Split only" — branch protection left as-is)
+**Stage:** 7-pre-pr-review (option A: split complete; code signed & committed as 6976c7e; mandatory pre-PR review pending)
 **Pipeline:** lightweight
 **Branch:** fix-ci-selfhosted-lane-timeout
 **Pre-PR-check:** pending — requested 2026-08-04, commit 6976c7e (author: this session; awaiting a second-agent reviewer)
 **Ticket:** EAI-7548 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7548
-**Last Updated:** 2026-08-03
-**Token Usage:** in=94 out=71486 cache_create=845666 cache_read=4939709 calls=49
+**Last Updated:** 2026-08-04
+**Token Usage:** in=286 out=366741 cache_create=1551651 cache_read=22112503 calls=145
 
 ---
 
@@ -115,8 +115,9 @@ Scenario: A superseded run does not hang on an offline self-hosted runner
   self-hosted refs; actionlint clean except the pre-existing custom-label warnings (main's
   ci.yml already emits 8). e2e_report.rs renders whatever artifacts it finds (no hardcoded
   platform requirement), so the per-workflow report split is safe.
-- 📋 NEXT: pre-PR review (mandatory gate) before opening the PR. Then user handles the
-  branch-protection de-require separately (the "Split only" caveat).
+- ✅ Committed + signed as 6976c7e (commit-signing hook passed).
+- 📋 NEXT: pre-PR review (mandatory gate by second-agent reviewer) before opening the PR.
+  Then user handles the branch-protection de-require separately (the "Split only" caveat).
 
 ## KEY FINDING — required-check contradiction (drives "Split only" caveat)
 
@@ -188,9 +189,13 @@ Implement the split (option A). Leave branch protection alone (user's call).
   so it's unaffected by the split.
 - Next: pre-PR review gate, then open PR.
 
-### 2026-08-03 (second session)
+### 2026-08-04 (second session)
 
-- Summarized the problem, remaining work, and three candidate remedies with recommendation.
-- Clarified the design-gate findings and why options (A), (B), (C) each have different
-  tradeoffs (robustness vs. diff size vs. root-cause remediation elsewhere).
-- Awaiting user's scope decision on which remedy to implement before proceeding.
+- Code complete: `.github/workflows/e2e-selfhosted.yml` created (652 lines, 3 self-hosted jobs
+  + self-hosted-side report with dedicated concurrency group and trimmed `changes` gate); the
+  3 jobs removed from `ci.yml` (1281→750 lines); hosted report repointed to `[changes, e2e]`.
+- Validation passed: both files parse; all 5 required checks produced (one per workflow, no
+  collision); actionlint clean except pre-existing custom-label warnings.
+- Signed and committed as **6976c7e** (commit-signing hook passed). Now awaiting mandatory
+  pre-PR review gate (second-agent reviewer must run `pre-pr-review` skill and write verdict
+  to WIP `Pre-PR-check` field). Author does not self-review.
