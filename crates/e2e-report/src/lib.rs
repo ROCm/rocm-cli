@@ -2443,7 +2443,7 @@ mod tests {
         let platform = r#"{
             "platform_slug": "mi300x",
             "capability": {"effective_serve_engine": "vllm"},
-            "versions": {"os":"Ubuntu 24.04.3 LTS","rocm":"7.13.0","vllm":"0.23.0+rocm723","lemonade":"10.6.0"},
+            "versions": {"os":"Ubuntu 24.04.3 LTS","rocm":"7.13.0","vllm":"0.23.0+rocm723","lemonade":"11.5.1"},
             "expectations": [
                 {"id":"serve-x","effective_engine":"vllm","expected":"pass"}
             ]
@@ -2455,7 +2455,7 @@ mod tests {
             "Ubuntu 24.04.3 LTS",
             "ROCm 7.13.0",
             "vLLM 0.23.0+rocm723",
-            "lemonade 10.6.0",
+            "lemonade 11.5.1",
         ] {
             assert!(md.contains(token), "matrix cell missing {token:?}:\n{md}");
         }

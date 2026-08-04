@@ -32,7 +32,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const ENGINE_NAME: &str = "lemonade";
-const LEMONADE_VERSION: &str = "10.10.0";
+const LEMONADE_VERSION: &str = "11.5.1";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_MODEL: &str = "Qwen3-4B-Instruct-2507-GGUF";
 const DEFAULT_MODEL_REPO_DIR: &str = "models--unsloth--Qwen3-4B-Instruct-2507-GGUF";
@@ -75,14 +75,14 @@ const MAX_EMBEDDABLE_SEARCH_DEPTH: usize = 4;
 /// stack on a pathological tree; it is far above any plausible archive layout.
 const MAX_COPY_RECURSION_DEPTH: usize = 64;
 
-const EMBEDDABLE_WINDOWS_ARCHIVE_NAME: &str = "lemonade-embeddable-10.10.0-windows-x64.zip";
-const EMBEDDABLE_LINUX_ARCHIVE_NAME: &str = "lemonade-embeddable-10.10.0-ubuntu-x64.tar.gz";
-const EMBEDDABLE_WINDOWS_URL: &str = "https://github.com/lemonade-sdk/lemonade/releases/download/v10.10.0/lemonade-embeddable-10.10.0-windows-x64.zip";
-const EMBEDDABLE_LINUX_URL: &str = "https://github.com/lemonade-sdk/lemonade/releases/download/v10.10.0/lemonade-embeddable-10.10.0-ubuntu-x64.tar.gz";
+const EMBEDDABLE_WINDOWS_ARCHIVE_NAME: &str = "lemonade-embeddable-11.5.1-windows-x64.zip";
+const EMBEDDABLE_LINUX_ARCHIVE_NAME: &str = "lemonade-embeddable-11.5.1-ubuntu-x64.tar.gz";
+const EMBEDDABLE_WINDOWS_URL: &str = "https://github.com/lemonade-sdk/lemonade/releases/download/v11.5.1/lemonade-embeddable-11.5.1-windows-x64.zip";
+const EMBEDDABLE_LINUX_URL: &str = "https://github.com/lemonade-sdk/lemonade/releases/download/v11.5.1/lemonade-embeddable-11.5.1-ubuntu-x64.tar.gz";
 const EMBEDDABLE_WINDOWS_SHA256: &str =
-    "3bbbf755b438ba016a9cb828c71833156b3f64feba9e65b3514857b4183c1026";
+    "50a133bbc35c4f3f8971eafef2c9fe56c4bbbfb0f1032bf8728324d8d8c8a0e1";
 const EMBEDDABLE_LINUX_SHA256: &str =
-    "22962975980b6f1aa90201de93859d21214c84787ad4476bdc843dcdd19ac160";
+    "bdfd3c3e5d6eda5101c8a32f36e6dd9236ceb9ab2eb66734c32628e6e86e18ac";
 
 #[derive(Parser)]
 #[command(name = "rocm-engine-lemonade")]
