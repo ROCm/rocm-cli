@@ -3619,8 +3619,14 @@ fn ensure_self_managed_engine_ready(
         },
     )
     .ok();
+    // For a self-managing engine the runtime id *is* the env id its adapter
+    // reports for the pinned version, so a version bump leaves an older
+    // install detected-but-not-current. Requiring the ids to match makes the
+    // bump trigger an install instead of silently keeping the old runtime.
     let installed = detect.as_ref().is_some_and(|detect| {
-        detect.installed && detect_runtime_matches_env_root(detect, env_root.as_deref())
+        detect.installed
+            && detect.env_id.as_deref() == Some(runtime_id.as_str())
+            && detect_runtime_matches_env_root(detect, env_root.as_deref())
     });
     let response = if installed {
         None

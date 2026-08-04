@@ -1024,6 +1024,19 @@ fn stop_service(request: StopRequest) -> Result<StopResponse> {
     Ok(StopResponse { stopped, graceful })
 }
 
+/// Whether the embeddable archive must be extracted over the runtime tree.
+///
+/// Pure so the upgrade case is testable without a real archive. `installed`
+/// is the version recorded for the tree already on disk, if any.
+fn needs_extraction(
+    reinstall: bool,
+    installed: Option<&str>,
+    wanted: &str,
+    server_present: bool,
+) -> bool {
+    reinstall || !server_present || installed != Some(wanted)
+}
+
 fn prepare_embeddable(
     paths: &AppPaths,
     env_root: Option<&Path>,
@@ -1045,7 +1058,20 @@ fn prepare_embeddable(
         download_file,
     )?;
     let runtime_dir = runtime_dir_in(&root);
-    if reinstall || !lemond_path_in(&runtime_dir).is_file() {
+    // The runtime directory is not version-scoped, so a bump downloads a new
+    // archive into a tree that already holds `lemond` from the previous
+    // version. Without comparing versions the extraction would be skipped and
+    // the old binaries reported as the new version.
+    let installed_version = read_manifest(paths)
+        .ok()
+        .filter(|manifest| manifest.runtime_dir == runtime_dir)
+        .map(|manifest| manifest.version);
+    if needs_extraction(
+        reinstall,
+        installed_version.as_deref(),
+        &version,
+        lemond_path_in(&runtime_dir).is_file(),
+    ) {
         if runtime_dir.exists() {
             fs::remove_dir_all(&runtime_dir)
                 .with_context(|| format!("failed to clear {}", runtime_dir.display()))?;
@@ -4332,6 +4358,19 @@ mod tests {
         assert!(destination_child(destination, std::ffi::OsStr::new("..")).is_err());
         assert!(destination_child(destination, std::ffi::OsStr::new(".")).is_err());
         assert!(destination_child(destination, std::ffi::OsStr::new("a/b")).is_err());
+    }
+
+    #[test]
+    fn a_version_change_forces_re_extraction_over_the_existing_runtime() {
+        let pin = rocm_deps::LEMONADE_VERSION;
+        // Same version already unpacked: nothing to do.
+        assert!(!needs_extraction(false, Some(pin), pin, true));
+        // A bump must not be silently skipped just because `lemond` exists.
+        assert!(needs_extraction(false, Some("10.10.0"), pin, true));
+        // Nothing recorded, nothing unpacked, or an explicit reinstall.
+        assert!(needs_extraction(false, None, pin, true));
+        assert!(needs_extraction(false, Some(pin), pin, false));
+        assert!(needs_extraction(true, Some(pin), pin, true));
     }
 
     #[test]
