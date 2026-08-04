@@ -1,6 +1,6 @@
 # WIP: Fix CI self-hosted E2E lane timeout (offline runner holds concurrency group)
 
-**Stage:** 7-pre-pr-review (option A: split complete; code signed & committed as 6976c7e; mandatory pre-PR review pending)
+**Stage:** 7-pre-pr-review — ON HOLD (option A: split complete; code signed & committed as 6976c7e; mandatory pre-PR review pending)
 **Pipeline:** lightweight
 **Branch:** fix-ci-selfhosted-lane-timeout
 **Pre-PR-check:** pending — requested 2026-08-04, commit 6976c7e (author: this session; awaiting a second-agent reviewer)
@@ -141,10 +141,13 @@ Implement the split (option A). Leave branch protection alone (user's call).
 
 ## Blockers / Open Questions
 
-- **RESOLVED:** Does `timeout-minutes` cancel a job still QUEUED on an offline runner?
+- **ON HOLD:** Mandatory pre-PR review gate. A second-agent reviewer must run the `pre-pr-review` skill and write the verdict to WIP `Pre-PR-check` field. Author does not self-review. Once verdict is `passed`/`review-done`, PR will be opened.
+
+## RESOLVED
+- Does `timeout-minutes` cancel a job still QUEUED on an offline runner?
   → **No.** The timer only starts once the job is running. Confirmed via GitHub
   community #50926 and actions/runner #4312.
-- **RESOLVED (scope):** A — split into own workflow, "Split only" (no branch-protection
+- **(scope):** A — split into own workflow, "Split only" (no branch-protection
   change in this PR).
 
 ## Notes
