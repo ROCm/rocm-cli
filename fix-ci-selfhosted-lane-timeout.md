@@ -6,7 +6,7 @@
 **Pre-PR-check:** changes-requested → in review (post-amendment)
 **Ticket:** EAI-7548 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7548
 **Last Updated:** 2026-08-04
-**Token Usage:** in=520 out=447612 cache_create=2142379 cache_read=50789971 calls=262
+**Token Usage:** in=520 out=448k cache_create=2142379 cache_read=50790k calls=263
 
 ---
 
