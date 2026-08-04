@@ -25,6 +25,15 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Let a bad release be found and yanked before we adopt it. A crate bump is
+    # not inert data waiting for review: `cargo build` runs the new version's
+    # `build.rs` and expands its proc macros on the CI runner, so the bump PR
+    # executes third-party code the moment it opens — before a human reads the
+    # lockfile diff. A week is long enough for the common case of a malicious or
+    # backdoored release being yanked from crates.io to play out off our
+    # runners. Cooldown delays only version updates, never security updates.
+    cooldown:
+      default-days: 7
     # Above the default of 5 so a backlog of separate major bumps cannot starve
     # the grouped minor/patch PR, but still bounded so the queue stays readable.
     open-pull-requests-limit: 10
