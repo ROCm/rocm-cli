@@ -1,15 +1,15 @@
 # WIP: E2E Task #9: narrow 'serve' paths-filter so non-serve Rust PRs skip the GPU matrix
 
-**Stage:** 8-in-review — PR #156 open (https://github.com/ROCm/rocm-cli/pull/156); commit d7896c6 signed+signoff, rebased on main d17fc0c, all checks GREEN, maintainer review pending
+**Stage:** 8-in-review — PR #156 open (https://github.com/ROCm/rocm-cli/pull/156); commit d7896c6 signed+signoff, rebased on main d17fc0c, all checks GREEN, maintainer review pending; rominf review posted 2026-08-03 13:14 (6 findings, no hard blockers)
 **PR:** https://github.com/ROCm/rocm-cli/pull/156
 **Pipeline:** lightweight
 **Branch:** e2e-task-9-narrow-serve-paths-filter-so-non
 **Jira:** EAI-7746 (Task, rocm-cli, unassigned)
 **Pre-PR-check:** review-done — OpenCode reviewer (gpt-5.6-sol), 2026-07-31, @ca9f297+e2748ac0b92b8d83 — PASSED after two review rounds (all issues fixed); short-name scenarios now @serves-on-gpu, full serve-step/feature sweep found no other real GPU serve escaping canary gating; focused tests + harness compile + clippy + git diff --check all pass.
-**Last Updated:** 2026-08-03 (no action — idle, awaiting maintainer review)
+**Last Updated:** 2026-08-04
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=2577 out=1069149 cache_create=37023870 cache_read=267895667 calls=1272
+**Token Usage:** in=2603 out=1079319 cache_create=38267950 cache_read=272040768 calls=1285
 
 ---
 
@@ -80,9 +80,24 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 9. ✅ Windows re-run watched to completion: PASSED (12m20s) — confirmed it was the #139 flake, not this PR.
 10. ✅ Re-checked PR #156 on 2026-08-03: all checks remain green; still awaiting maintainer review (no new feedback).
 
+## Review Feedback (rominf, 2026-08-03)
+
+**6 findings, no hard blockers.** Triaged by actionability in this PR:
+
+**Worth fixing here (3):**
+1. **README tag table stale** — `tests/e2e-cucumber/README.md` missing `@canary`/`@serves-on-gpu` from vocabulary table; job table inaccurate (PR canary runs one scenario, Strix skips on PR). Reviewer explicitly requests fix in this PR.
+2. **No enforcement of "exactly one `@canary`"** — if refactor drops the tag, canary mode silently skips everything. Suggests unit test parsing `.feature` files asserting cardinality.
+5. **Gate ordering** — canary skip gate sits before no-GPU check, so a `@requires-gpu` scenario on GPU-less host would report wrong skip reason. Harmless today, defensive one-line swap suggested.
+
+**Judgment calls (fres decision needed):**
+3. **`continue-on-error` on merge_group path** — Strix lanes skip on PR, run non-blocking in merge queue; a Strix regression can land on main before nightly catches it. Reviewer suggests: either document this trade-off plainly or drop `continue-on-error` on merge_group.
+6. **`resolve()` has 3 trailing bools** — cross-PR concern (#155/#156/#157 all growing it); reviewer suggests shared `RunMode` struct agreed across PRs rather than each adding a bool. Explicitly not a this-PR fix.
+
+**No action:** #4 (dash-crate exclusion verified sound).
+
 ## Blockers
 
-None. PR #156 is fully green (all required checks pass, no conflicts); waiting on maintainer-team review (human gate).
+**BLOCKED (awaiting user decision):** Judgment calls #3 and #6 (see Review Feedback above). Once decided (fix #1/#2/#5 + handle #3/#6), can proceed with commits.
 
 ## Notes
 
@@ -130,6 +145,12 @@ None. PR #156 is fully green (all required checks pass, no conflicts); waiting o
 - **Container gate:** GREEN (exit 0 + marker). Recreated script (PATH fix for rust image), retry resumed + compiled. Clippy/workspace/lib/e2e mock all passed; mock reconciliation 3 xfail / 0 XPASS / 0 unexpected.
 - **Strix-Windows:** Green on last 3 runs (07-28, 07-29, 07-31); safe for merge_group-only.
 - **Rebase blocker:** PR #139 merged today (d17fc0c); branch 1 behind, overlaps 3 of 5 files. Backed up work as patch; awaiting rebase + reconcile before signed commit.
+
+### 2026-08-04 (session 8 — rominf review found, actionable items identified)
+
+- Previous session had failed to re-check PR surfaces for new feedback; rominf posted 6-finding review on 2026-08-03 13:14 (after last check). Review verified: no hard blockers, automated pass.
+- Triaged all 6 findings: 3 worth fixing in this PR (stale README tag table, missing unit test for "exactly one @canary" cardinality, gate ordering swap), 2 judgment calls for user (continue-on-error trade-off on merge_group, cross-PR RunMode refactor), 1 no-action (dash-crate exclusion verified sound).
+- Documented findings in Review Feedback section; awaiting user decision on #3 and #6 before proceeding with fixes.
 
 ### 2026-07-30
 
