@@ -6,7 +6,7 @@
 **Branch:** e2e-task-9-narrow-serve-paths-filter-so-non
 **Jira:** EAI-7746 (Task, rocm-cli, unassigned)
 **Pre-PR-check:** review-done — OpenCode reviewer (gpt-5.6-sol), 2026-07-31, @ca9f297+e2748ac0b92b8d83 — PASSED after two review rounds (all issues fixed); short-name scenarios now @serves-on-gpu, full serve-step/feature sweep found no other real GPU serve escaping canary gating; focused tests + harness compile + clippy + git diff --check all pass.
-**Last Updated:** 2026-08-04
+**Last Updated:** 2026-08-04 (session 9 — review-finding recovery)
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
 **Token Usage:** in=2603 out=1079319 cache_create=38267950 cache_read=272040768 calls=1285
@@ -97,7 +97,9 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 
 ## Blockers
 
-**BLOCKED (awaiting user decision):** Judgment calls #3 and #6 (see Review Feedback above). Once decided (fix #1/#2/#5 + handle #3/#6), can proceed with commits.
+**BLOCKED (awaiting user decision):** 
+- Fix #1/#2/#5 (actionable review items) — update README tag table, add unit test for "exactly one @canary", swap gate ordering.
+- Judgment calls #3/#6 — decide: continue-on-error trade-off on merge_group, and cross-PR RunMode refactor strategy.
 
 ## Notes
 
@@ -151,6 +153,13 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 - Previous session had failed to re-check PR surfaces for new feedback; rominf posted 6-finding review on 2026-08-03 13:14 (after last check). Review verified: no hard blockers, automated pass.
 - Triaged all 6 findings: 3 worth fixing in this PR (stale README tag table, missing unit test for "exactly one @canary" cardinality, gate ordering swap), 2 judgment calls for user (continue-on-error trade-off on merge_group, cross-PR RunMode refactor), 1 no-action (dash-crate exclusion verified sound).
 - Documented findings in Review Feedback section; awaiting user decision on #3 and #6 before proceeding with fixes.
+
+### 2026-08-04 (session 9 — review-finding recovery)
+
+- **Failure diagnosed:** previous session (idle state) failed to re-check PR review surfaces despite nudges; rominf's 6-finding review had posted 2026-08-03 13:14 but went unread for ~1 day.
+- **Root cause:** anchored on stale "no comments" conclusion, treated subsequent nudges as repeats without re-verifying, and stopped following the standing instruction to "exhaustively enumerate all review surfaces."
+- **Safeguard designed:** mechanical rule — PR open + any nudge → read-only surface sweep runs first, before answering. Prevents substituting canned replies for time-decaying state checks.
+- **Actionable items triaged:** 3 fixes for this PR (README tag table, @canary cardinality unit test, gate ordering swap); 2 judgment calls awaiting user decision (merge_group continue-on-error trade-off, cross-PR RunMode refactor).
 
 ### 2026-07-30
 
