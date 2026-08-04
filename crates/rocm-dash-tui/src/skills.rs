@@ -254,10 +254,18 @@ pub fn auto_config_change(detected_endpoint: Option<&str>) -> Option<ConfigChang
 // ---------------------------------------------------------------------------
 
 /// GitHub repo that publishes the Lemonade embeddable archives.
-pub const LEMONADE_GITHUB_REPO: &str = "lemonade-sdk/lemonade";
-/// Pinned embeddable version used as the offline fallback when the GitHub
-/// releases API is unreachable. Bump deliberately. (Latest at authoring time.)
-pub const LEMONADE_EMBEDDABLE_FALLBACK_VERSION: &str = "11.5.1";
+pub use rocm_deps::LEMONADE_GITHUB_REPO;
+
+/// Embeddable version used as the offline fallback when the GitHub releases API
+/// is unreachable.
+///
+/// This is the same pin the `lemonade` engine adapter installs, resolved from
+/// `runtime-deps.toml` rather than restated here — the two used to be separate
+/// constants and silently drifted five minor versions apart.
+#[must_use]
+pub fn lemonade_embeddable_fallback_version() -> String {
+    rocm_deps::LEMONADE_VERSION.to_owned()
+}
 
 /// A selected embeddable archive for a host triple — enough to download, extract,
 /// and locate the server binary. Pure data; no I/O.
@@ -297,7 +305,7 @@ fn server_bin_for(os: &str) -> &'static str {
 
 /// Strip a leading `v` from a release tag (`v11.5.1` → `11.5.1`).
 fn strip_v(tag: &str) -> &str {
-    tag.strip_prefix('v').unwrap_or(tag)
+    rocm_deps::strip_v(tag)
 }
 
 /// PURE: build the canonical embeddable artifact for `(os, arch, version)` with no
@@ -305,10 +313,8 @@ fn strip_v(tag: &str) -> &str {
 pub fn embeddable_artifact(os: &str, arch: &str, version: &str) -> Option<EmbeddableArtifact> {
     let (os_arch, ext) = embeddable_os_arch(os, arch)?;
     let ver = strip_v(version);
-    let archive_name = format!("lemonade-embeddable-{ver}-{os_arch}.{ext}");
-    let url = format!(
-        "https://github.com/{LEMONADE_GITHUB_REPO}/releases/download/v{ver}/{archive_name}"
-    );
+    let archive_name = rocm_deps::lemonade_archive_name(ver, os_arch, ext);
+    let url = rocm_deps::lemonade_download_url(ver, &archive_name);
     Some(EmbeddableArtifact {
         version: ver.to_string(),
         url,
@@ -507,9 +513,26 @@ mod tests {
         assert_eq!(b.server_bin, "lemond.exe");
         // Unsupported triple → None.
         assert!(embeddable_artifact("linux", "aarch64", "10.6.0").is_none());
-        // The fallback const resolves for the common host.
+    }
+
+    /// The offline fallback and the version the `lemonade` engine adapter
+    /// installs must never disagree. They cannot: both come from the single
+    /// `runtime-deps.toml` pin, and this pins that down against a regression
+    /// that reintroduces a second constant.
+    #[test]
+    fn fallback_version_is_the_single_pinned_version() {
+        let fallback = lemonade_embeddable_fallback_version();
+        assert_eq!(fallback, rocm_deps::LEMONADE_VERSION);
+        let artifact = embeddable_artifact("linux", "x86_64", &fallback).expect("linux");
+        assert_eq!(artifact.version, fallback);
+        assert_eq!(
+            artifact.archive_name,
+            rocm_deps::lemonade_archive_name(&fallback, "ubuntu-x64", "tar.gz")
+        );
         assert!(
-            embeddable_artifact("linux", "x86_64", LEMONADE_EMBEDDABLE_FALLBACK_VERSION).is_some()
+            artifact.url.contains(&format!("/download/v{fallback}/")),
+            "url {} does not carry the pinned version",
+            artifact.url
         );
     }
 

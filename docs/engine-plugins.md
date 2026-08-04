@@ -32,6 +32,15 @@ The `lemonade` adapter uses Lemonade embeddable and prefers Lemonade's
 `llamacpp:rocm` backend, falling back to `llamacpp:vulkan` when ROCm is
 unsupported. rocm-cli does not use a CPU fallback for this path.
 
+## Pinned runtime versions
+
+The versions of the third-party runtimes rocm-cli downloads are pinned in
+`runtime-deps.toml` at the repository root — one `[runtime.<name>]` table per
+runtime. That file is the only place a runtime version is written down:
+archive names, download URLs, and the dashboard's offline fallback are all
+derived from it, so a bump is a one-line edit and the tree cannot end up
+holding two different versions of the same runtime.
+
 `rocm engines list` shows the exact plugin directories for the current host.
 The same output is available in the TUI with `/engine`.
 

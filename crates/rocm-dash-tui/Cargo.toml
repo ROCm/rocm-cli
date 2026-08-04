@@ -16,6 +16,7 @@ path = "src/lib.rs"
 
 [dependencies]
 rocm-dash-core = { path = "../rocm-dash-core" }
+rocm-deps = { path = "../rocm-deps" }
 # Unified dashboard TUI base: ratatui 0.30 + crossterm 0.28. This is the only
 # ratatui in the workspace — the `rocm` binary no longer carries a (dead) 0.29
 # dependency, so no second major is pulled in. Exact wrapped-row counts must

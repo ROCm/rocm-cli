@@ -32,7 +32,6 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const ENGINE_NAME: &str = "lemonade";
-const LEMONADE_VERSION: &str = "11.5.1";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_MODEL: &str = "Qwen3-4B-Instruct-2507-GGUF";
 const DEFAULT_MODEL_REPO_DIR: &str = "models--unsloth--Qwen3-4B-Instruct-2507-GGUF";
@@ -75,14 +74,25 @@ const MAX_EMBEDDABLE_SEARCH_DEPTH: usize = 4;
 /// stack on a pathological tree; it is far above any plausible archive layout.
 const MAX_COPY_RECURSION_DEPTH: usize = 64;
 
-const EMBEDDABLE_WINDOWS_ARCHIVE_NAME: &str = "lemonade-embeddable-11.5.1-windows-x64.zip";
-const EMBEDDABLE_LINUX_ARCHIVE_NAME: &str = "lemonade-embeddable-11.5.1-ubuntu-x64.tar.gz";
-const EMBEDDABLE_WINDOWS_URL: &str = "https://github.com/lemonade-sdk/lemonade/releases/download/v11.5.1/lemonade-embeddable-11.5.1-windows-x64.zip";
-const EMBEDDABLE_LINUX_URL: &str = "https://github.com/lemonade-sdk/lemonade/releases/download/v11.5.1/lemonade-embeddable-11.5.1-ubuntu-x64.tar.gz";
+/// Digests of the pinned embeddable archives. Unlike the archive names and
+/// URLs, these cannot be derived from the version in `runtime-deps.toml`: each
+/// release has its own digest, so bumping the pin means recording the new pair
+/// here as well.
 const EMBEDDABLE_WINDOWS_SHA256: &str =
     "50a133bbc35c4f3f8971eafef2c9fe56c4bbbfb0f1032bf8728324d8d8c8a0e1";
 const EMBEDDABLE_LINUX_SHA256: &str =
     "bdfd3c3e5d6eda5101c8a32f36e6dd9236ceb9ab2eb66734c32628e6e86e18ac";
+
+/// Embeddable asset token and archive extension for the host this adapter runs
+/// on. Only `windows-x64` and `ubuntu-x64` are wired up here; the release also
+/// publishes `macos-arm64` and `ubuntu-arm64`, which this adapter never selects.
+const fn embeddable_os_arch() -> (&'static str, &'static str) {
+    if runtime_is_windows() {
+        ("windows-x64", "zip")
+    } else {
+        ("ubuntu-x64", "tar.gz")
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "rocm-engine-lemonade")]
@@ -414,7 +424,10 @@ fn detect_response() -> DetectResponse {
 fn install_response(request: InstallRequest) -> Result<InstallResponse> {
     let paths = AppPaths::discover()?;
     paths.ensure()?;
-    eprintln!("Preparing Lemonade embeddable {LEMONADE_VERSION}...");
+    eprintln!(
+        "Preparing Lemonade embeddable {}...",
+        rocm_deps::LEMONADE_VERSION
+    );
     let env_root = request
         .env_root
         .as_deref()
@@ -1017,15 +1030,16 @@ fn prepare_embeddable(
     reinstall: bool,
 ) -> Result<LemonadeInstallManifest> {
     let root = lemonade_root(paths, env_root);
-    let archive_name = embeddable_archive_name();
-    let archive_url = embeddable_url();
+    let version = rocm_deps::LEMONADE_VERSION.to_owned();
+    let archive_name = embeddable_archive_name(&version);
+    let archive_url = embeddable_url(&version);
     let downloads = root.join("downloads");
-    let archive = downloads.join(archive_name);
+    let archive = downloads.join(&archive_name);
     fs::create_dir_all(&downloads)?;
     // Held until the archive bytes have been extracted and copied out: the
     // verified bytes and the extracted bytes must be the same read.
     let archive_guard = ensure_cached_archive(
-        archive_url,
+        &archive_url,
         &archive,
         embeddable_archive_sha256(),
         download_file,
@@ -1055,8 +1069,8 @@ fn prepare_embeddable(
         );
     }
     Ok(LemonadeInstallManifest {
-        env_id: format!("lemonade-embeddable-{LEMONADE_VERSION}"),
-        version: LEMONADE_VERSION.to_owned(),
+        env_id: format!("lemonade-embeddable-{version}"),
+        version,
         runtime_dir,
         lemond,
         lemonade,
@@ -1274,20 +1288,13 @@ fn platform_binary_name(name: &str) -> String {
     }
 }
 
-const fn embeddable_archive_name() -> &'static str {
-    if runtime_is_windows() {
-        EMBEDDABLE_WINDOWS_ARCHIVE_NAME
-    } else {
-        EMBEDDABLE_LINUX_ARCHIVE_NAME
-    }
+fn embeddable_archive_name(version: &str) -> String {
+    let (os_arch, extension) = embeddable_os_arch();
+    rocm_deps::lemonade_archive_name(version, os_arch, extension)
 }
 
-const fn embeddable_url() -> &'static str {
-    if runtime_is_windows() {
-        EMBEDDABLE_WINDOWS_URL
-    } else {
-        EMBEDDABLE_LINUX_URL
-    }
+fn embeddable_url(version: &str) -> String {
+    rocm_deps::lemonade_download_url(version, &embeddable_archive_name(version))
 }
 
 const fn embeddable_archive_sha256() -> &'static str {
@@ -3789,7 +3796,7 @@ mod tests {
     fn test_manifest(runtime_dir: PathBuf) -> LemonadeInstallManifest {
         LemonadeInstallManifest {
             env_id: "test".to_owned(),
-            version: LEMONADE_VERSION.to_owned(),
+            version: rocm_deps::LEMONADE_VERSION.to_owned(),
             runtime_dir,
             lemond: PathBuf::from("lemond"),
             lemonade: PathBuf::from("lemonade"),
@@ -3816,13 +3823,16 @@ mod tests {
 
     #[test]
     fn embeddable_package_matches_runtime_os() {
+        let version = rocm_deps::LEMONADE_VERSION;
+        let (os_arch, extension) = embeddable_os_arch();
+        let suffix = format!("{os_arch}.{extension}");
+        assert!(embeddable_archive_name(version).ends_with(&suffix));
+        assert!(embeddable_url(version).ends_with(&suffix));
         if runtime_is_windows() {
-            assert!(embeddable_archive_name().ends_with("windows-x64.zip"));
-            assert!(embeddable_url().ends_with("windows-x64.zip"));
+            assert_eq!(suffix, "windows-x64.zip");
             assert_eq!(platform_binary_name("lemond"), "lemond.exe");
         } else {
-            assert!(embeddable_archive_name().ends_with("ubuntu-x64.tar.gz"));
-            assert!(embeddable_url().ends_with("ubuntu-x64.tar.gz"));
+            assert_eq!(suffix, "ubuntu-x64.tar.gz");
             assert_eq!(platform_binary_name("lemond"), "lemond");
         }
     }

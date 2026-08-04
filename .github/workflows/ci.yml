@@ -90,6 +90,9 @@ jobs:
               - 'rust-toolchain*'
               # clippy runs `cargo xtask manifest --check` against this file.
               - 'MANIFEST.md'
+              # rocm-deps compiles the pins into constants, so a pin change is a
+              # source change even though no *.rs file moved.
+              - 'runtime-deps.toml'
               - '.github/workflows/**'
             # build-and-test runs cargo AND the python/shell smoke steps plus the
             # install-lifecycle E2E (`cargo xtask package` + the real installer),
@@ -100,6 +103,7 @@ jobs:
               - '**/Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain*'
+              - 'runtime-deps.toml'
               - 'scripts/**'
               - 'xtask/**'
               - 'engines/**'
