@@ -1,15 +1,15 @@
 # WIP: E2E Task #9: narrow 'serve' paths-filter so non-serve Rust PRs skip the GPU matrix
 
-**Stage:** 8-in-review — PR #156 open (https://github.com/ROCm/rocm-cli/pull/156); commit d7896c6 signed+signoff, rebased on main d17fc0c, all checks GREEN, maintainer review pending; rominf review posted 2026-08-03 13:14 (6 findings, no hard blockers)
+**Stage:** 9-resolved-review-feedback — PR #156 open (https://github.com/ROCm/rocm-cli/pull/156); commit d7896c6 rebased + fixed for rominf feedback (all 3 actionable fixes applied + validated); container gate GREEN; awaiting user decision on judgment calls (#3 merge_group trade-off, #6 cross-PR RunMode refactor)
 **PR:** https://github.com/ROCm/rocm-cli/pull/156
 **Pipeline:** lightweight
 **Branch:** e2e-task-9-narrow-serve-paths-filter-so-non
 **Jira:** EAI-7746 (Task, rocm-cli, unassigned)
 **Pre-PR-check:** review-done — OpenCode reviewer (gpt-5.6-sol), 2026-07-31, @ca9f297+e2748ac0b92b8d83 — PASSED after two review rounds (all issues fixed); short-name scenarios now @serves-on-gpu, full serve-step/feature sweep found no other real GPU serve escaping canary gating; focused tests + harness compile + clippy + git diff --check all pass.
-**Last Updated:** 2026-08-04 (session 9 — review-finding recovery)
+**Last Updated:** 2026-08-04
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=2603 out=1079319 cache_create=38267950 cache_read=272040768 calls=1285
+**Token Usage:** in=2729 out=1120422 cache_create=38333588 cache_read=299002591 calls=1348
 
 ---
 
@@ -79,6 +79,9 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 8. ✅ `windows-build-and-test` re-run authorized by user and kicked off (job now `pending`) to clear the unrelated PR #139 flake.
 9. ✅ Windows re-run watched to completion: PASSED (12m20s) — confirmed it was the #139 flake, not this PR.
 10. ✅ Re-checked PR #156 on 2026-08-03: all checks remain green; still awaiting maintainer review (no new feedback).
+11. ✅ Rominf review feedback discovered (6 findings, 2026-08-03 13:14). Triaged: 3 actionable in this PR, 2 judgment calls for user.
+12. ✅ Applied all 3 in-PR fixes (README tag table + canary cardinality test + gate ordering) + full validation (lib tests, clippy, fmt, container gate GREEN).
+13. ⧴ Await user decision on judgment calls (#3 merge_group continue-on-error trade-off, #6 cross-PR RunMode refactor).
 
 ## Review Feedback (rominf, 2026-08-03)
 
@@ -98,8 +101,9 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 ## Blockers
 
 **BLOCKED (awaiting user decision):** 
-- Fix #1/#2/#5 (actionable review items) — update README tag table, add unit test for "exactly one @canary", swap gate ordering.
-- Judgment calls #3/#6 — decide: continue-on-error trade-off on merge_group, and cross-PR RunMode refactor strategy.
+- Judgment calls #3/#6 only (fixes #1/#2/#5 completed):
+  - #3: continue-on-error trade-off on merge_group (Strix regression can land before nightly catches it) — document trade-off or drop continue-on-error?
+  - #6: cross-PR RunMode struct refactor (#155/#156/#157) — pursue now or defer to shared decision?
 
 ## Notes
 
@@ -160,6 +164,9 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 - **Root cause:** anchored on stale "no comments" conclusion, treated subsequent nudges as repeats without re-verifying, and stopped following the standing instruction to "exhaustively enumerate all review surfaces."
 - **Safeguard designed:** mechanical rule — PR open + any nudge → read-only surface sweep runs first, before answering. Prevents substituting canned replies for time-decaying state checks.
 - **Actionable items triaged:** 3 fixes for this PR (README tag table, @canary cardinality unit test, gate ordering swap); 2 judgment calls awaiting user decision (merge_group continue-on-error trade-off, cross-PR RunMode refactor).
+- **All 3 in-PR fixes applied** (README.md tag table corrected + canary cardinality unit test added + gate ordering swapped).
+- **All validations passed:** 58 lib tests (incl. new cardinality canary test), clippy clean, fmt clean, container gate GREEN (full rebase invalidated cache; ~5min).
+- **Status:** awaiting user decision on judgment calls #3 and #6.
 
 ### 2026-07-30
 
