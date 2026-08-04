@@ -44,7 +44,17 @@ const STOP_SCOPE: rocm_core::KillScope = rocm_core::KillScope::Tree;
 /// This pins both the vLLM release and the ROCm ABI tag, so it can drift from
 /// the resolved runtime. Override it with `ROCM_CLI_VLLM_ROCM_INDEX_URL` to
 /// match a different vLLM/ROCm combination without rebuilding.
-const VLLM_ROCM_EXTRA_INDEX_URL: &str = "https://wheels.vllm.ai/rocm/0.23.0/rocm723";
+///
+/// Keep the release and ABI tag here in sync with [`VLLM_PINNED_SPEC`] below.
+const VLLM_ROCM_EXTRA_INDEX_URL: &str = "https://wheels.vllm.ai/rocm/0.26.0/rocm723";
+/// Exact requirement handed to `uv pip install`.
+///
+/// The index URL alone is not a pin: it only constrains where wheels are
+/// fetched from, so a bare `vllm` requirement would install whatever version
+/// that path happens to serve (or fall back to PyPI when no wheel on the index
+/// matches the interpreter). Spelling the version and local ABI tag out here
+/// makes the pin real.
+const VLLM_PINNED_SPEC: &str = "vllm==0.26.0+rocm723";
 /// Default time to wait for vLLM to report readiness before giving up.
 const DEFAULT_VLLM_READY_TIMEOUT: Duration = Duration::from_mins(5);
 
@@ -940,7 +950,7 @@ fn install_vllm_with_uv(python: &Path, reinstall: bool) -> Result<()> {
     if reinstall {
         args.push("--reinstall".to_owned());
     }
-    args.push("vllm".to_owned());
+    args.push(VLLM_PINNED_SPEC.to_owned());
     args.push("--extra-index-url".to_owned());
     args.push(index_url.clone());
     let output = ProcessCommand::new(&uv)
