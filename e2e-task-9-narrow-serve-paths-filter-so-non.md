@@ -1,6 +1,6 @@
 # WIP: E2E Task #9: narrow 'serve' paths-filter so non-serve Rust PRs skip the GPU matrix
 
-**Stage:** 9-resolved-review-feedback — PR #156 open (https://github.com/ROCm/rocm-cli/pull/156); commit d7896c6 rebased + fixed for rominf feedback (all 3 actionable fixes applied + validated; container gate GREEN); awaiting user decision on judgment calls (#3 merge_group trade-off, #6 cross-PR RunMode refactor)
+**Stage:** 9-resolved-review-feedback — ON HOLD — PR #156 rebased + fixed for rominf feedback (commit ffbbc03: all 3 actionable fixes applied + validated; container gate GREEN); awaiting force-push authorization + user decision on judgment calls (#3, #6)
 **PR:** https://github.com/ROCm/rocm-cli/pull/156
 **Pipeline:** lightweight
 **Branch:** e2e-task-9-narrow-serve-paths-filter-so-non
@@ -9,7 +9,7 @@
 **Last Updated:** 2026-08-04
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=4618 out=1127084 cache_create=38333588 cache_read=299313264 calls=1360
+**Token Usage:** in=4638 out=1131495 cache_create=38723146 cache_read=303395660 calls=1370
 
 ---
 
@@ -100,8 +100,9 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 
 ## Blockers
 
-**BLOCKED (awaiting user decision):** 
-- Judgment calls #3/#6 only (fixes #1/#2/#5 completed):
+**BLOCKED (awaiting user action):**
+- **Force-push authorization:** Commit ffbbc03 (fixes + review feedback applied) is rebased onto main (ad12ac7), but remote branch still has pre-rebase history (d7896c6). A plain push is rejected (non-fast-forward). Force-push with lease (`git push --force-with-lease origin e2e-task-9-narrow-serve-paths-filter-so-non`) is needed to land the rebase + fixes; it only rewrites my own branch's history (no shared commits involved). Awaiting explicit go-ahead.
+- **Judgment calls #3/#6** (fixes #1/#2/#5 completed):
   - #3: continue-on-error trade-off on merge_group (Strix regression can land before nightly catches it) — document trade-off or drop continue-on-error?
   - #6: cross-PR RunMode struct refactor (#155/#156/#157) — pursue now or defer to shared decision?
 
@@ -173,6 +174,12 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 - **All fixes validated:** 58 lib tests (incl. new `exactly_one_canary_scenario_across_feature_files` cardinality test), clippy clean, fmt clean, full container gate GREEN on rebased tree. All in-PR actionable items complete.
 - **Summary of rominf fixes applied:** README tag table documents `@canary`/`@serves-on-gpu` + corrected job table for PR canary mode; new unit test guards against silent `@canary` tag decay; gate ordering moved canary skip after GPU/OS applicability checks for accurate skip reasons.
 - **Judgment calls documented (user decision needed):** #3 merge_group `continue-on-error` trade-off (Strix regression can land before nightly catches it — document trade-off or drop `continue-on-error`?); #6 cross-PR `RunMode` struct refactor (#155/#156/#157) — pursue now or defer?
+
+### 2026-08-04 (session 11 — rebase + fixes complete, force-push hold)
+
+- **Commit ffbbc03 created & signed:** fixes + signed-off applied (EAI-7746), all hooks passed; staged & committed locally.
+- **Full container gate re-run:** GREEN (exit 0 + marker; 3 xfail / 0 XPASS / 0 unexpected). Cold build (~5min) after local rebase onto ad12ac7.
+- **Status:** remote branch still has pre-rebase d7896c6; local is rebased + ffbbc03. Non-fast-forward reject on plain push → force-push-with-lease required (safe, rewrites only own feature branch, no shared commits). Awaiting user authorization.
 
 ### 2026-07-30
 
