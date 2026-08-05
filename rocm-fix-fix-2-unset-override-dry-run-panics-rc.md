@@ -5,7 +5,7 @@
 **Branch:** rocm-fix-fix-2-unset-override-dry-run-panics-rc
 **Pre-PR-check:** none
 **Last Updated:** 2026-08-05
-**Token Usage:** in=6820 out=144482 cache_create=1967506 cache_read=28016544 calls=228
+**Token Usage:** in=6952 out=166408 cache_create=2386652 cache_read=36748415 calls=295
 
 ---
 
@@ -48,8 +48,8 @@ Files:
 
 ## Next Steps
 
-1. Commit (concise, no AI/WL refs), then request pre-PR review before opening PR.
-2. Rebuild release binary in container, re-run e2e (unblocked; self-contained within this review cycle).
+1. Confirm e2e re-run is green (release build + cucumber suite running in container).
+2. Request independent pre-PR review; do NOT open the PR (fres's action).
 
 ## Notes
 
@@ -69,5 +69,6 @@ Files:
 
 ### 2026-08-05
 
-- Gate log reviewed: clippy + all unit/lib tests passed (green); e2e stage failed on missing release binary (gate invocation gap, not code regression).
-- Moved to review-ready stage; e2e rebuild + re-run is unblocked and can proceed within review cycle.
+- Gate log reviewed: clippy + all unit/lib tests passed (green); e2e stage failed on missing release binary — root-caused to the disk-full interruption during the earlier release build (`cargo xtask e2e` does build the release binaries itself, e2e.rs:45-49), not a gate-invocation gap.
+- Committed the fix to the feature branch: `6b50809` (signed), 27 lines (main.rs + Cargo.toml + Cargo.lock + broken_pipe.rs).
+- Re-running the container e2e gate (release build + cucumber suite) now that disk is free; pre-PR review to follow once green.
