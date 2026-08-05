@@ -1,12 +1,12 @@
 # WIP: E2E Task #8: gate GPU serve matrix to merge_group + keep a PR canary
 
-**Stage:** 8-review
+**Stage:** 7-gate — INVESTIGATING REGRESSION
 **Pipeline:** lightweight
-**Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group (committed 0fd0aed, signed, rebased onto ad12ac7/main, PUSHED to origin)
-**PR:** https://github.com/ROCm/rocm-cli/pull/157 (OPEN; all 21 CI checks PASSING, awaiting maintainer review)
-**Pre-PR-check:** ✅ PASSED — container gate GREEN ×3 (pre/post-rebase, post-rebase-onto-#140); GPU dispatch #920 grid VERIFIED on MI300X (6/6b/8→skip on PR path, 5/7→run+served, 0 unexpected failures); all 21 CI checks on PR #157 PASSING; branch 1-ahead/0-behind origin/main.
+**Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group (committed 0fd0aed, signed, rebased onto ad12ac7/main, NOT PUSHED)
+**PR:** https://github.com/ROCm/rocm-cli/pull/157 (OPEN; awaiting maintainer review; note: branch head is NOT yet force-pushed with latest rebase)
+**Pre-PR-check:** ⚠️  REGRESSION DETECTED post-rebase — container gate shows 1 unexpected failure (dash-managed-service-metrics scenario failed when expected to pass; gate3.log reconciliation: 3 xfail / 0 XPASS / 1 unexpected). Pre-rebase gates (gate.log 2026-08-01, gate2.log 2026-08-01) both showed 0 unexpected. Not yet pushed; investigating root cause.
 **Last Updated:** 2026-08-05
-**Token Usage:** in=1686 out=524771 cache_create=13028446 cache_read=161037227 calls=858 (session refresh pending gate completion)
+**Token Usage:** in=1700 out=527858 cache_create=13895466 cache_read=162190194 calls=865
 
 ---
 
@@ -78,7 +78,7 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 
 ## Blockers
 
-None.
+BLOCKED (investigation): Container gate post-rebase onto ad12ac7 (#140) shows 1 unexpected failure (dash-managed-service-metrics test failing when expected to pass). Pre-rebase gates passed with 0 unexpected. Root cause unknown; diff touches zero dash code; may be environment flake or test isolation issue from #140 merge. Re-running gate to confirm determinism.
 
 ## Work Log
 
@@ -114,3 +114,9 @@ None.
 - Commit 0fd0aed landed signed with hooks passing; branch now 1-ahead/0-behind origin/main, clean diffs (4-file).
 - Re-ran container gate on rebased tree (incremental, warm caches): exit 0 (clippy clean, workspace/lib tests green, e2e mock reconciliation clean).
 - Container gate re-running in background to completion; CI on PR #157 remains green (21/21 checks passing); awaiting gate completion before force-push and maintainer review.
+
+### 2026-08-05 (Afternoon)
+
+- Monitored backgrounded gate (gate3.log); gate completed with e2e-cucumber failure: dash-managed-service-metrics test failed unexpectedly (1 regression).
+- Pre-rebase gates (gate.log, gate2.log) both showed 0 unexpected failures; regression introduced by rebase onto ad12ac7 (#140) or environment flake.
+- Diff touches zero dash code (only e2e-cucumber features, expectation.rs, ci.yml, e2e.rs); suspect test isolation or environment issue from #140 merge. Not yet force-pushed pending root cause analysis.
