@@ -5,7 +5,7 @@
 **Branch:** rocm-fix-fix-2-unset-override-dry-run-panics-rc
 **Pre-PR-check:** none
 **Last Updated:** 2026-08-05
-**Token Usage:** in=6952 out=166408 cache_create=2386652 cache_read=36748415 calls=295
+**Token Usage:** in=9457 out=166908 cache_create=2386652 cache_read=36748415 calls=298
 
 ---
 
