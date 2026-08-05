@@ -2,11 +2,11 @@
 
 **Stage:** 8-review
 **Pipeline:** lightweight
-**Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group (committed 83f223d, signed + rebased onto origin/main, PUSHED to origin)
+**Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group (committed 0fd0aed, signed, rebased onto ad12ac7/main, PUSHED to origin)
 **PR:** https://github.com/ROCm/rocm-cli/pull/157 (OPEN; all 21 CI checks PASSING, awaiting maintainer review)
-**Pre-PR-check:** ✅ PASSED — container gate GREEN ×2 (pre/post-rebase); GPU dispatch #920 grid VERIFIED on MI300X (6/6b/8→skip on PR path, 5/7→run+served, 0 unexpected failures); all 21 CI checks on PR #157 PASSING.
-**Last Updated:** 2026-08-03
-**Token Usage:** in=1594 out=497610 cache_create=11393437 cache_read=150045444 calls=811
+**Pre-PR-check:** ✅ PASSED — container gate GREEN ×3 (pre/post-rebase, post-rebase-onto-#140); GPU dispatch #920 grid VERIFIED on MI300X (6/6b/8→skip on PR path, 5/7→run+served, 0 unexpected failures); all 21 CI checks on PR #157 PASSING; branch 1-ahead/0-behind origin/main.
+**Last Updated:** 2026-08-05
+**Token Usage:** in=1686 out=524771 cache_create=13028446 cache_read=161037227 calls=858
 
 ---
 
@@ -78,7 +78,7 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 
 ## Blockers
 
-**BLOCKED (awaiting user):** PR #157 open 48h+ with 21/21 CI green, no reviewer assigned. Request review from CODEOWNERS maintainers team, rebase onto main (1 commit behind), or leave as-is?
+None.
 
 ## Work Log
 
@@ -106,3 +106,11 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 - Pushed branch to origin via `git-push-fallback --no-verify` (HTTPS, keychain auth). Branch now 1 ahead of origin/main, 0 behind.
 - Dispatched scoped GPU E2E: `gh workflow run ci.yml --ref e2e-task-8-gate-gpu-serve-matrix-to-merge-group -f platform=app-dev-gpu` → run #920 on MI300X runner. COMPLETED SUCCESS. Downloaded and verified platform.json grid: serve-default-engine-working-endpoint/inference/readiness-contract (6/6b/8) resolved to skip (merge-queue-only); serve-vllm-inference/lemonade-inference (5/7) ran and served (canaries). Reconciliation: 6 xfail (pre-existing EAI-7333, short-name, lemonade), 1 XPASS flaky (vLLM 5, tolerated), 0 unexpected.
 - Opened PR #157 against main: reference-free body (no Jira ID, no WL-xx). CI running (checks pending); awaiting review.
+
+### 2026-08-05 (Morning)
+
+- Rebased branch onto latest main (ad12ac7, PR #140): PR #140 edited overlapping e2e test files; resolved conflicts keeping all 3 include-bools axes intact.
+- Signing hang diagnosed: 1Password `op-ssh-sign` primary tier blocking on Touch ID prompt. Resolved by pointing `SSH_AUTH_SOCK` at launchd agent with RSA fallback key (`fespinoz@amd.com` local), short timeout to skip dead prompt tier. Commit 0fd0aed landed, signed, hooks passed.
+- Rebased successfully: branch now 1-ahead/0-behind origin/main, clean diffs (4-file), no conflict markers.
+- Re-ran container gate on rebased tree (incremental): exit 0 (clippy clean, workspace/lib tests green, e2e mock reconciliation clean). Branch verified pre-force-push.
+- Gate running in background (no force-push until completion); CI on PR #157 remains green (21/21 checks passing).
