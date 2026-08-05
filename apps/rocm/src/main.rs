@@ -878,7 +878,30 @@ impl PermissionsModeArg {
     }
 }
 
+/// Restore the default SIGPIPE disposition on Unix.
+///
+/// Rust installs `SIG_IGN` for SIGPIPE at startup, so a downstream reader
+/// closing the pipe early (e.g. `rocm fix … --dry-run | head`) turns the next
+/// `println!` into a panic (`failed printing to stdout: Broken pipe`, exit 101)
+/// instead of the conventional quiet exit. Resetting to `SIG_DFL` makes the
+/// process terminate on SIGPIPE like every other Unix CLI. Socket writes are
+/// unaffected: std uses `MSG_NOSIGNAL`, so the serve/daemon paths still see a
+/// normal `BrokenPipe` error rather than a signal.
+#[cfg(unix)]
+#[allow(unsafe_code)] // libc FFI
+fn reset_sigpipe() {
+    // SAFETY: installing the default handler for a signal is always safe.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_sigpipe() {}
+
 fn main() -> Result<()> {
+    reset_sigpipe();
+
     // Held for the whole process lifetime: dropping it flushes and stops the
     // non-blocking file writer, so an early drop would silently truncate the
     // log. A failed/missing `AppPaths::discover()` degrades to no logging

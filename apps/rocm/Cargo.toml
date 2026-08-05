@@ -38,6 +38,9 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ureq = { version = "2.12", features = ["native-certs"] }
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-native-keyring-store = "1.1"
 
