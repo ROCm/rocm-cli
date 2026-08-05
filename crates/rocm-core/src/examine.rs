@@ -44,14 +44,16 @@ const TRACKED_ENV_VARS: &[&str] = &[
     "PATH",
 ];
 
-/// Repo files dropped by the `amdgpu-install` pipeline; their presence marks an
-/// amdgpu-install-managed ROCm.
-const AMDGPU_INSTALL_MARKERS: &[&str] = &[
+/// Repo files dropped by rocm-cli's repo-native package-manager install flow;
+/// their presence marks a repo-native-managed ROCm.
+const REPO_NATIVE_INSTALL_MARKERS: &[&str] = &[
     "/etc/apt/sources.list.d/amdgpu.list",
     "/etc/apt/sources.list.d/rocm.list",
     "/etc/apt/sources.list.d/radeon.list",
     "/etc/yum.repos.d/amdgpu.repo",
     "/etc/yum.repos.d/rocm.repo",
+    "/etc/zypp/repos.d/amdgpu.repo",
+    "/etc/zypp/repos.d/rocm.repo",
 ];
 
 /// Marketing-name fragments that identify an AMD APU when `rocminfo` is absent.
@@ -973,9 +975,9 @@ fn probe_rocm_install(e: &mut Examination) {
         .and_then(|install| install.version)
         .unwrap_or_default();
 
-    for marker in AMDGPU_INSTALL_MARKERS {
+    for marker in REPO_NATIVE_INSTALL_MARKERS {
         if Path::new(marker).exists() {
-            e.rocm_install_method = "amdgpu-install".to_owned();
+            e.rocm_install_method = "repo-native".to_owned();
             e.rocm_repos_seen.push((*marker).to_owned());
         }
     }
@@ -998,11 +1000,15 @@ fn probe_rocm_install(e: &mut Examination) {
         e.rocm_install_method = if rocm_dir.is_empty() {
             "none".to_owned()
         } else {
-            "tarball-or-other".to_owned()
+            "runfile-or-tarball".to_owned()
         };
     }
 
-    for dir in ["/etc/apt/sources.list.d", "/etc/yum.repos.d"] {
+    for dir in [
+        "/etc/apt/sources.list.d",
+        "/etc/yum.repos.d",
+        "/etc/zypp/repos.d",
+    ] {
         let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
