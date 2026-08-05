@@ -163,11 +163,22 @@ function Save-File {
     if ($PSVersionTable.PSVersion.Major -lt 6) {
         $parameters.UseBasicParsing = $true
     }
-    try {
-        Invoke-WebRequest @parameters
-    } catch {
-        Remove-Item -LiteralPath $OutputPath -Force -ErrorAction SilentlyContinue
-        Fail "${FailureMessage}: $($_.Exception.Message)"
+
+    # An HTTP transfer can fail transiently (a momentary connection reset, or
+    # the server-side listener still finishing setup) even though a retry a
+    # moment later succeeds; give it a couple of chances before giving up.
+    $maxAttempts = 3
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        try {
+            Invoke-WebRequest @parameters
+            return
+        } catch {
+            Remove-Item -LiteralPath $OutputPath -Force -ErrorAction SilentlyContinue
+            if ($attempt -eq $maxAttempts) {
+                Fail "${FailureMessage}: $($_.Exception.Message)"
+            }
+            Start-Sleep -Milliseconds (250 * $attempt)
+        }
     }
 }
 
