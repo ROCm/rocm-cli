@@ -846,9 +846,18 @@ impl Grid {
                 let entry = identity
                     .entry(exp.id.clone())
                     .or_insert_with(|| (String::new(), String::new()));
-                if entry.0.is_empty() {
-                    entry.0 =
-                        feature_of(exp, features_from_reports.get(&exp.id).map(String::as_str));
+                // An artifact that names the feature itself is authoritative and
+                // OVERWRITES whatever a fallback guessed — `feature_of` always
+                // yields something (worst case the id's prefix), so a mere
+                // is-empty check would let the first input's guess stick and the
+                // later, better-informed artifact be ignored.
+                if exp.feature.is_empty() {
+                    if entry.0.is_empty() {
+                        entry.0 =
+                            feature_of(exp, features_from_reports.get(&exp.id).map(String::as_str));
+                    }
+                } else {
+                    entry.0.clone_from(&exp.feature);
                 }
                 if entry.1.is_empty() {
                     entry.1.clone_from(&exp.scenario);
@@ -1527,12 +1536,23 @@ fn scenario_reference_markdown(
     // matching the tables that link into it. Every grid row gets an entry — a
     // scenario skipped on every platform has no steps to show, but still needs
     // its anchor or the grid's link to it dangles.
+    //
+    // Scoped to grid rows deliberately: this section exists to back the grid's
+    // links, so it documents exactly what the grid shows. A scenario present only
+    // in an artifact with no `platform.json` sidecar has no grid row and so gets
+    // no entry — nothing links to it either.
     let mut out = String::from("\n### Scenario reference\n\n");
     for group in &grid.groups {
         let _ = writeln!(out, "#### {}\n", group.feature);
         for row in &group.rows {
             let entry = scenarios.get(&row.id);
-            let name = entry.map_or(row.name.as_str(), |(n, _)| n.as_str());
+            // Prefer the platform.json name, as the grid does — it is the only
+            // source that covers a scenario which ran nowhere.
+            let name = if row.name.is_empty() {
+                entry.map_or("", |(n, _)| n.as_str())
+            } else {
+                row.name.as_str()
+            };
             let _ = writeln!(out, "##### {}\n", row.id);
             if !name.is_empty() {
                 let _ = writeln!(out, "_{name}_\n");
@@ -2613,6 +2633,51 @@ mod tests {
                 ("dash".to_string(), "dash-y".to_string()),
             ],
             "an artifact with no feature field must still group, not vanish",
+        );
+    }
+
+    #[test]
+    fn a_named_feature_overrides_an_older_artifact_s_guess() {
+        // Mixing artifact vintages: the old one has no `feature` field, so the
+        // id prefix is all there is to go on; the new one names the feature.
+        // The named one must win regardless of input order, or the scenario
+        // splits across two groups sorted far apart.
+        let old = r#"{
+            "platform_slug": "mi300x",
+            "capability": {"effective_serve_engine": "vllm"},
+            "expectations": [{"id":"serve-x","expected":"skip"}]
+        }"#;
+        let new = r#"{
+            "platform_slug": "mock",
+            "capability": {"effective_serve_engine": "none"},
+            "expectations": [
+                {"id":"serve-x","feature":"Model serving","scenario":"serve-01 - a","expected":"skip"}
+            ]
+        }"#;
+        let report = feature_json(&[]);
+        let (_d1, old_path) = write_platform(&report, old);
+        let (_d2, new_path) = write_platform(&report, new);
+
+        // Old artifact first: its id-prefix guess must not stick.
+        let inputs = vec![
+            ("mi300x".to_string(), old_path.clone()),
+            ("mock".to_string(), new_path.clone()),
+        ];
+        assert_eq!(
+            grid_order(&inputs),
+            vec![("Model serving".to_string(), "serve-x".to_string())],
+            "a later artifact that names the feature must override the guess",
+        );
+
+        // And the reverse order must not regress it back to the guess.
+        let inputs = vec![
+            ("mock".to_string(), new_path),
+            ("mi300x".to_string(), old_path),
+        ];
+        assert_eq!(
+            grid_order(&inputs),
+            vec![("Model serving".to_string(), "serve-x".to_string())],
+            "an older artifact must not overwrite a named feature",
         );
     }
 
