@@ -149,8 +149,13 @@ impl MockServer {
         }
     }
 
+    /// The OpenAI-compatible API root (`.../v1`) the CLI is pointed at.
     pub fn base_url(&self) -> String {
-        format!("{}/v1", self.server.base_url())
+        self.server
+            .url()
+            .join("v1")
+            .expect("v1 is a valid relative path")
+            .to_string()
     }
 
     pub const fn port(&self) -> u16 {
@@ -256,7 +261,10 @@ pub fn write_service_record_with(
         "canonical_model_id": model,
         "host": "127.0.0.1",
         "port": port,
-        "endpoint_url": format!("http://127.0.0.1:{port}/v1"),
+        "endpoint_url": http_server::loopback_url(port)
+            .join("v1")
+            .expect("v1 is a valid relative path")
+            .to_string(),
         "mode": "managed",
         "status": options.status,
         "startup_phase": options.startup_phase,

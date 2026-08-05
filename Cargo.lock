@@ -1280,6 +1280,7 @@ dependencies = [
  "tokio",
  "toml",
  "tower-http",
+ "url",
  "vt100",
 ]
 

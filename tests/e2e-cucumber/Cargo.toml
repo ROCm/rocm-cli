@@ -36,6 +36,7 @@ toml = "0.8"
 # socket-mode handling, or path-traversal defence. 0.6 is the version reqwest
 # already pulls in, so this adds no second copy to the tree.
 tower-http = { version = "0.6", features = ["fs"] }
+url = "2"
 vt100 = "0.16"
 
 [[test]]

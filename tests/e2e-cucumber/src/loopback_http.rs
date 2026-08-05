@@ -45,14 +45,32 @@ impl LoopbackServer {
         }
     }
 
+    /// The served root, without a trailing slash: the installer appends
+    /// `/<file>` to `ROCM_CLI_DOWNLOAD_BASE` itself.
     pub fn base_url(&self) -> String {
         self.server.base_url()
+    }
+
+    /// The served root as a URL, for callers that build request URLs in Rust.
+    pub const fn url(&self) -> &url::Url {
+        self.server.url()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GET `path` from `server`, resolved against its root URL.
+    async fn get(server: &LoopbackServer, path: &str) -> reqwest::Response {
+        let url = server
+            .url()
+            .join(path)
+            .unwrap_or_else(|e| panic!("{path} is not a valid relative URL: {e}"));
+        reqwest::get(url)
+            .await
+            .unwrap_or_else(|e| panic!("request for {path} failed: {e}"))
+    }
 
     /// Serve a directory of the given `(name, contents)` files.
     fn serve(files: &[(&str, &[u8])]) -> (tempfile::TempDir, LoopbackServer) {
@@ -70,9 +88,7 @@ mod tests {
         let bundle: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
         let (_dir, server) = serve(&[("rocm-cli-windows-amd64.zip", &bundle)]);
 
-        let response = reqwest::get(format!("{}/rocm-cli-windows-amd64.zip", server.base_url()))
-            .await
-            .expect("request failed");
+        let response = get(&server, "rocm-cli-windows-amd64.zip").await;
         assert!(response.status().is_success());
         assert_eq!(
             response.bytes().await.expect("no body").as_ref(),
@@ -99,9 +115,7 @@ mod tests {
             ("bundle.zip.sha256", "checksum"),
             ("bundle.zip", "bundle"),
         ] {
-            let response = reqwest::get(format!("{}/{name}", server.base_url()))
-                .await
-                .unwrap_or_else(|e| panic!("request for {name} failed: {e}"));
+            let response = get(&server, name).await;
             assert!(response.status().is_success(), "{name} was not served");
             assert_eq!(response.text().await.expect("no body"), expected);
         }
@@ -111,9 +125,7 @@ mod tests {
     async fn missing_file_is_a_404() {
         let (_dir, server) = serve(&[("bundle.zip", b"bundle".as_slice())]);
 
-        let response = reqwest::get(format!("{}/absent.zip", server.base_url()))
-            .await
-            .expect("request failed");
+        let response = get(&server, "absent.zip").await;
         assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
     }
 
@@ -126,9 +138,7 @@ mod tests {
         std::fs::create_dir(&served).expect("failed to create served dir");
         let server = LoopbackServer::start(&served);
 
-        let response = reqwest::get(format!("{}/../secret.txt", server.base_url()))
-            .await
-            .expect("request failed");
+        let response = get(&server, "../secret.txt").await;
         assert_ne!(
             response.text().await.unwrap_or_default(),
             "secret",

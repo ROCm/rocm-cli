@@ -10,36 +10,48 @@
 //! routes, so the bind/serve/shutdown lifecycle lives here once rather than
 //! being re-derived (and re-diverged) per server.
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 use axum::Router;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use url::Url;
 
-/// A running server: its bound address, plus the shutdown signal and (when the
-/// server owns a thread) the thread to join. Shuts the server down on drop.
+/// A running server: where it is reachable, plus the shutdown signal and (when
+/// the server owns a thread) the thread to join. Shuts the server down on drop.
 pub struct ServerHandle {
-    addr: SocketAddr,
+    url: Url,
+    port: u16,
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl ServerHandle {
     pub const fn port(&self) -> u16 {
-        self.addr.port()
+        self.port
     }
 
+    /// The server's root URL. Derive paths from it with [`Url::join`] rather
+    /// than string concatenation, which has to get separators and escaping
+    /// right by hand.
+    pub const fn url(&self) -> &Url {
+        &self.url
+    }
+
+    /// The root URL as a string with no trailing slash, for handing to a
+    /// process that appends its own `/<path>` — notably the installer, whose
+    /// `ROCM_CLI_DOWNLOAD_BASE` is used as `<base>/<file>`.
     pub fn base_url(&self) -> String {
-        format!("http://{}", self.addr)
+        self.url.as_str().trim_end_matches('/').to_string()
     }
 }
 
 impl std::fmt::Debug for ServerHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServerHandle")
-            .field("addr", &self.addr)
+            .field("url", &self.url.as_str())
             .finish_non_exhaustive()
     }
 }
@@ -69,7 +81,8 @@ pub async fn spawn(app: Router) -> ServerHandle {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     tokio::spawn(serve(listener, app, shutdown_rx));
     ServerHandle {
-        addr,
+        url: root_url(addr),
+        port: addr.port(),
         shutdown: Some(shutdown_tx),
         thread: None,
     }
@@ -102,10 +115,28 @@ pub fn spawn_on_own_thread(app: Router) -> ServerHandle {
 
     let addr = addr_rx.recv().expect("test server failed to bind");
     ServerHandle {
-        addr,
+        url: root_url(addr),
+        port: addr.port(),
         shutdown: Some(shutdown_tx),
         thread: Some(thread),
     }
+}
+
+/// The `http://<ip>:<port>/` root for a bound address, assembled through
+/// `Url`'s setters so host and port are never formatted into a string by hand.
+fn root_url(addr: SocketAddr) -> Url {
+    let mut url = Url::parse("http://host").expect("static base URL is valid");
+    url.set_ip_host(addr.ip())
+        .expect("a socket address is a valid URL host");
+    url.set_port(Some(addr.port()))
+        .expect("an http URL accepts a port");
+    url
+}
+
+/// The `http://127.0.0.1:<port>/` root, for callers that know a port but hold
+/// no [`ServerHandle`] — e.g. building a service record for a planted mock.
+pub fn loopback_url(port: u16) -> Url {
+    root_url(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
 }
 
 async fn bind() -> TcpListener {
@@ -127,4 +158,33 @@ async fn serve(listener: TcpListener, app: Router, shutdown: oneshot::Receiver<(
         })
         .await
         .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_url_is_the_server_root() {
+        assert_eq!(loopback_url(8080).as_str(), "http://127.0.0.1:8080/");
+    }
+
+    #[test]
+    fn joining_a_path_yields_one_separator() {
+        let url = loopback_url(8080).join("v1").expect("valid relative path");
+        assert_eq!(url.as_str(), "http://127.0.0.1:8080/v1");
+    }
+
+    #[test]
+    fn base_url_string_has_no_trailing_slash() {
+        // The installer appends `/<file>` to this, so a trailing slash here
+        // would send it after a doubled separator.
+        let handle = ServerHandle {
+            url: loopback_url(8080),
+            port: 8080,
+            shutdown: None,
+            thread: None,
+        };
+        assert_eq!(handle.base_url(), "http://127.0.0.1:8080");
+    }
 }
