@@ -6,7 +6,7 @@
 **PR:** https://github.com/ROCm/rocm-cli/pull/157 (OPEN; all 21 CI checks PASSING, awaiting maintainer review)
 **Pre-PR-check:** ✅ PASSED — container gate GREEN ×3 (pre/post-rebase, post-rebase-onto-#140); GPU dispatch #920 grid VERIFIED on MI300X (6/6b/8→skip on PR path, 5/7→run+served, 0 unexpected failures); all 21 CI checks on PR #157 PASSING; branch 1-ahead/0-behind origin/main.
 **Last Updated:** 2026-08-05
-**Token Usage:** in=1686 out=524771 cache_create=13028446 cache_read=161037227 calls=858
+**Token Usage:** in=1686 out=524771 cache_create=13028446 cache_read=161037227 calls=858 (session refresh pending gate completion)
 
 ---
 
@@ -109,8 +109,8 @@ None.
 
 ### 2026-08-05 (Morning)
 
-- Rebased branch onto latest main (ad12ac7, PR #140): PR #140 edited overlapping e2e test files; resolved conflicts keeping all 3 include-bools axes intact.
-- Signing hang diagnosed: 1Password `op-ssh-sign` primary tier blocking on Touch ID prompt. Resolved by pointing `SSH_AUTH_SOCK` at launchd agent with RSA fallback key (`fespinoz@amd.com` local), short timeout to skip dead prompt tier. Commit 0fd0aed landed, signed, hooks passed.
-- Rebased successfully: branch now 1-ahead/0-behind origin/main, clean diffs (4-file), no conflict markers.
-- Re-ran container gate on rebased tree (incremental): exit 0 (clippy clean, workspace/lib tests green, e2e mock reconciliation clean). Branch verified pre-force-push.
-- Gate running in background (no force-push until completion); CI on PR #157 remains green (21/21 checks passing).
+- Rebased branch onto latest main (ad12ac7, PR #140): resolved conflicts in overlapping e2e test files; all 3 include-bools axes intact.
+- Diagnosed and resolved signing hang: 1Password `op-ssh-sign` primary tier blocking on Touch ID prompt. Resolved by pointing `SSH_AUTH_SOCK` at launchd agent with RSA fallback key, short timeout to skip dead prompt.
+- Commit 0fd0aed landed signed with hooks passing; branch now 1-ahead/0-behind origin/main, clean diffs (4-file).
+- Re-ran container gate on rebased tree (incremental, warm caches): exit 0 (clippy clean, workspace/lib tests green, e2e mock reconciliation clean).
+- Container gate re-running in background to completion; CI on PR #157 remains green (21/21 checks passing); awaiting gate completion before force-push and maintainer review.
