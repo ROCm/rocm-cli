@@ -7,6 +7,8 @@
 **Last Updated:** 2026-08-05
 **Token Usage:** in=9491 out=177627 cache_create=2697197 cache_read=39023473 calls=315
 
+**Blockers:** BLOCKED (awaiting user): fres to open PR on main.
+
 ---
 
 ## Problem
