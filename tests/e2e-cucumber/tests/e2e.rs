@@ -102,7 +102,7 @@ pub struct E2eWorld {
 /// filters OUT. A filtered (skipped) scenario never reaches `report.json`, so
 /// this is the only place its feature and name survive to `platform.json`.
 struct Resolution {
-    expectation: Expectation,
+    expectation: e2e_cucumber::expectation::Expectation,
     /// Effective serve engine for this scenario on this host.
     engine: String,
     feature: String,
