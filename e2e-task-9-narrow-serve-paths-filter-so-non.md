@@ -6,10 +6,10 @@
 **Branch:** e2e-task-9-narrow-serve-paths-filter-so-non
 **Jira:** EAI-7746 (Task, rocm-cli, unassigned)
 **Pre-PR-check:** review-done — OpenCode reviewer (gpt-5.6-sol), 2026-07-31, @ca9f297+e2748ac0b92b8d83 — PASSED after two review rounds (all issues fixed); short-name scenarios now @serves-on-gpu, full serve-step/feature sweep found no other real GPU serve escaping canary gating; focused tests + harness compile + clippy + git diff --check all pass.
-**Last Updated:** 2026-08-05T16:45:00Z
+**Last Updated:** 2026-08-05
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=4744 out=1172816 cache_create=42316338 cache_read=324505212 calls=1423
+**Token Usage:** in=4756 out=1175750 cache_create=43577899 cache_read=326137756 calls=1429
 
 ---
 
@@ -104,6 +104,7 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 
 **BLOCKED (awaiting user action):**
 - **Canary mechanism reduction authorization** — relay-gate hook blocks source file edits on coordinator-tier relay (only permits own-branch commit/push, not Edit). Reduction is fully scoped and ready (keep serve paths-filter + ci.yml honesty; drop @canary/@serves-on-gpu tags, canary_mode 6th bool, E2E_PR_CANARY, canary unit tests, merge_group-only Strix gating, README canary docs; defer scenario 6b @merge-queue flag to post-#157 rebase). Need either: (a) your direct "go" here (bypassing relay), or (b) separate force-push authorization if scope changes.
+  - **Confirmed independently:** rominf's 2026-08-05 13:49 re-review approves substance and recommends identical reduction (keep serve paths-filter, drop canary mechanism, scenario 6b stays `@merge-queue` after #157 lands). Cross-PR #157 must land first or #156 becomes retag delta. #156 now `BEHIND` main (23f14a3), needs rebase regardless.
 - **Re-run `windows-build-and-test`?** — failed again on ffbbc03 (22m36s) with the same confirmed PR #139 flake signature (`lifecycle-windows-http-install` HTTP fixture download), outside this PR's diff and green on main. Re-run was authorized once before for this exact lane; asking again rather than assuming for a repeat CI action on a shared PR. Everything else green, awaiting maintainer-team review.
 - **Judgment calls #3/#6** (all in-PR fixes completed and force-pushed):
   - #3: continue-on-error trade-off on merge_group (Strix regression can land before nightly catches it) — document trade-off or drop continue-on-error?
@@ -216,6 +217,13 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 
 - Coordinator relay confirmed canary mechanism reduction is authorized own-branch work (fres's decision relayed); identified complete scope (keep serve paths-filter + ci.yml honesty; drop @canary/@serves-on-gpu tags, canary_mode 6th bool, E2E_PR_CANARY env, canary unit tests, merge_group-only Strix gating, README canary docs; defer scenario 6b @merge-queue flag to post-#157 rebase).
 - **Blocker:** relay-gate hook forbids source file edits on coordinator tier (only permits own-branch commit/push, not Edit); reduction cannot proceed via relay. Requires either (a) fres's direct "go" here (bypassing relay), or (b) separate force-push authorization if scope changes.
+
+### 2026-08-05 (session 18 — canary reduction verified, relay-gate blocker confirmed)
+
+- Relay confirmed canary reduction is authorized own-branch work (fres's decision relayed); complete scope verified (keep serve paths-filter + ci.yml honesty; drop @canary/@serves-on-gpu tags, canary_mode 6th bool, E2E_PR_CANARY, canary unit tests, merge_group-only Strix gating, README canary docs; defer scenario 6b @merge-queue flag to post-#157 rebase).
+- Mechanical blocker confirmed: relay-gate hook forbids source file edits on coordinator tier (only permits own-branch commit/push, not Edit). Reduction cannot proceed via relay.
+- rominf's 2026-08-05 13:49 re-review independently confirms recommendation (keep serve paths-filter, drop canary mechanism), approves substance, notes #157 must land first (cross-PR clash) or #156 becomes retag delta. PR #156 now `BEHIND` main and needs rebase anyway.
+- Awaiting fres's direct "go" to proceed with source edits and subsequent rebase + commit + push (fast-forward, no force-push needed unless scope changes).
 
 ### 2026-07-30
 
