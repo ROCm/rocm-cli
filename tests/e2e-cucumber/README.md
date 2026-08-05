@@ -106,11 +106,28 @@ There is no tag-filter tiering. Each CI job runs the **whole** suite
 **pass / xfail / skip** at runtime from its capability tags plus the known-bug
 matrix, then reconciles the actual result against that expectation.
 
+### Naming
+
+Each feature file has a short **key** (`chat`, `dash`, `diagnose`, `examine`,
+`lifecycle`, `serve`, `networking`, `runtime`) that prefixes both its scenario
+names and its ids:
+
+- **Scenario name** — `Scenario: <key>-<NN> - <description>`, numbered
+  sequentially in declaration order. The report sorts the grid's rows by this
+  index, so it must match the order in the file. Without the key the index names
+  nothing: every file used to number from 1, so "1" meant eight different
+  scenarios.
+- **`@id:`** — `<key>-<slug>`, so an id alone says which feature it belongs to.
+
+`tests/feature_naming.rs` enforces all of this (sequential, unique suite-wide,
+feature-qualified ids) in the ordinary `cargo test` run. Adding a feature file
+means adding its key to `FEATURE_KEYS` there.
+
 Scenarios carry stable-id and capability tags:
 
 | Tag | Meaning |
 |---|---|
-| `@id:<slug>` | Stable scenario id. Keys the expectation matrix and the report grid; every scenario has one. |
+| `@id:<key>-<slug>` | Stable scenario id, prefixed with its feature's key. Keys the expectation matrix and the report grid; every scenario has one. |
 | `@requires-gpu` | Needs a usable AMD GPU. Resolves to **skip** (n/a) on a host with none — the mock job, or a WSL host whose ROCm passthrough is incomplete (`driver_status` other than `wsl_rocdxg_ready`), where the gfx target is reported but unreachable. |
 | `@requires-bare-metal` | Premise is a host running the in-tree amdgpu driver, so it does not hold under WSL2. Resolves to **skip** there. `@requires-os:linux` cannot express this: WSL2 reports an `os_family` of `linux`. |
 | `@requires-wsl` | The inverse: premise **is** a WSL2 host. Resolves to **skip** on native Linux, native Windows, and everything else. |
