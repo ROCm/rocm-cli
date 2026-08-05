@@ -10,7 +10,9 @@
 #   1. A scenario whose @requires-gpu / @requires-engine can't be satisfied on
 #      this host is SKIPPED (not-applicable) — never listed here.
 #   2. Otherwise, the FIRST matching condition below marks it expected-fail
-#      (xfail); a scenario that then PASSES is an XPASS (stale entry — remove it).
+#      (xfail); a scenario that then PASSES is an XPASS — a stale entry to be
+#      removed, UNLESS the row is `flaky = true`, which tolerates either result
+#      while the bug stays open (see the grammar below).
 #   3. No matching condition → expected-pass.
 #
 # Condition predicate grammar (deliberately tiny):
@@ -20,6 +22,8 @@
 #   bug = "EAI-NNNN"                  ticket reference (shown in the report)
 #   reason = "..."                    human explanation (shown in the report)
 #   serve_timeout_secs = 90          optional: shorter serve wait for a known bug
+#   flaky = true                     optional: bug reproduces only intermittently,
+#                                    so an XPASS is tolerated (reported, not stale)
 #
 # An empty `when = {}` means "always xfail" (platform-independent bug).
 
@@ -45,14 +49,16 @@ reason = "vLLM service reports ready (/v1/models 200) but POST /v1/chat/completi
 serve_timeout_secs = 90
 flaky = true
 
-# EAI-7423 is INTERMITTENT on this host as of 2026-08-05, not fixed: which of its
-# scenarios pass varies run to run (run 30995473578: 2 XPASS; run 30993213188:
-# 3 XPASS; run 30939967076: all 6). A deterministic-XPASS row fails the lane on
-# unrelated PRs, so every EAI-7423 lemonade-linux row below is `flaky = true` —
-# either outcome is tolerated while the bug stays open. See EAI-7853; if the
-# lemonade 11.5.1 upgrade turns out to fix EAI-7423, drop these rows outright
-# rather than leaving them flaky.
-
+# EAI-7423 was INTERMITTENT on Strix Halo Ubuntu as of 2026-08-05, not fixed:
+# which of its scenarios pass varied run to run (run 30995473578: 2 XPASS; run
+# 30993213188: 3 XPASS; run 30939967076: all 6). A deterministic-XPASS row fails
+# that lane on unrelated PRs, so the EAI-7423 lemonade-linux rows below carry
+# `flaky = true` — either outcome is tolerated while the bug stays open. The flag
+# is per-row and is NOT derived from `bug`, so a new EAI-7423 row needs it added
+# explicitly. Revisit under EAI-7853 before deleting any of them: which lemonade
+# build a given run used cannot currently be read back from this lane, so an
+# XPASS streak here is not by itself evidence that the bug is fixed.
+#
 # On a lemonade-native LINUX host (Strix Halo Ubuntu) the lemonade managed serve
 # loads the model and reaches ready on :8001, then is shut down ~0.08s later, so
 # the endpoint never becomes reachable (EAI-7423, root-caused on the box
