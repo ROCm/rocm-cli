@@ -1,24 +1,24 @@
 Feature: GPU detection and system inspection
 
   @id:examine-version
-  Scenario: 1 - The CLI reports its version
+  Scenario: examine-01 - The CLI reports its version
     When the user asks for the version
     Then a version string is returned
 
   @id:examine-engines-list
-  Scenario: 2 - The CLI lists all supported engines
+  Scenario: examine-02 - The CLI lists all supported engines
     When the user lists available engines
     Then all supported engines are listed
 
   # EAI-7383: keep the top-level command list alphabetized so it remains easy to
   # scan as commands are added or reordered in the source declaration.
-  @id:help-lists-subcommands-alphabetically
-  Scenario: 5 - The help output lists subcommands in alphabetical order
+  @id:examine-help-lists-subcommands-alphabetically
+  Scenario: examine-03 - The help output lists subcommands in alphabetical order
     When the user asks for help
     Then the subcommands are listed in alphabetical order
 
   @id:examine-detects-gpu-and-driver @requires-gpu
-  Scenario: 3 - System inspection detects the GPU and driver
+  Scenario: examine-04 - System inspection detects the GPU and driver
     Given a machine with an AMD GPU
     When the user inspects the system
     Then the inspection reports which GPU is installed
@@ -32,7 +32,7 @@ Feature: GPU detection and system inspection
   # naming either. The harness derives its answer from the GPU probe rather than
   # from `examine`, so this is a cross-check and not a tautology.
   @id:examine-reports-host-default-engine
-  Scenario: 6 - System inspection names the engine this machine serves on
+  Scenario: examine-05 - System inspection names the engine this machine serves on
     When the user inspects the system
     Then the inspection names the engine this host serves on by default
 
@@ -42,7 +42,7 @@ Feature: GPU detection and system inspection
   # hardware. Dropping `@requires-gpu` gains per-PR mock-lane coverage for the
   # reporting this scenario exists to pin.
   @id:examine-distinguishes-unmanaged-rocm
-  Scenario: 4 - System inspection distinguishes CLI-managed from pre-existing ROCm
+  Scenario: examine-06 - System inspection distinguishes CLI-managed from pre-existing ROCm
     Given a machine with a ROCm install that was not set up by the CLI
     When the user inspects the system
     Then the inspection reports the install as pre-existing
@@ -59,7 +59,7 @@ Feature: GPU detection and system inspection
   # level: tooling reads this one, and it must not drift back into being the
   # weaker of the two.
   @id:examine-machine-readable-report
-  Scenario: 7 - What the inspection tells a tool matches what it tells a person
+  Scenario: examine-07 - What the inspection tells a tool matches what it tells a person
     When the user inspects the system both for reading and for scripting
     Then the machine-readable form states everything the readable one does
 
@@ -72,7 +72,7 @@ Feature: GPU detection and system inspection
   # expectation silently resolves against the wrong host. Since fixed; this is
   # the guard that keeps it fixed.
   @id:examine-both-forms-agree-on-gpu
-  Scenario: 8 - Both forms of the inspection agree about the GPU
+  Scenario: examine-08 - Both forms of the inspection agree about the GPU
     When the user inspects the system both for reading and for scripting
     Then both reports agree on whether this machine has an AMD GPU
     And both reports agree on whether this platform is in scope
@@ -81,7 +81,7 @@ Feature: GPU detection and system inspection
   # whether it liked what it saw. Finding no GPU is a finding, not a failure.
   # This is the mock lane's to prove — it is the one lane with nothing to find.
   @id:examine-reports-without-failing
-  Scenario: 9 - Inspecting a machine reports what it finds without failing
+  Scenario: examine-09 - Inspecting a machine reports what it finds without failing
     When the user inspects the system
     Then the inspection completes successfully
     And it states a verdict for this machine
@@ -97,7 +97,7 @@ Feature: GPU detection and system inspection
   # the choice is reachable, and it cannot answer that where no choice is acted
   # on at all.
   @id:examine-can-skip-framework-probing @requires-bare-metal
-  Scenario: 10 - The user can leave the frameworks out of the inspection
+  Scenario: examine-10 - The user can leave the frameworks out of the inspection
     When the user inspects the system without probing frameworks
     Then the inspection reports that it skipped the frameworks
     And it still states a verdict for this machine
@@ -106,7 +106,7 @@ Feature: GPU detection and system inspection
   # so `@requires-os:linux` cannot express "only where the host really is WSL".
   # Runs only on the WSL lane; everywhere else the premise does not exist.
   @id:examine-detects-wsl @requires-wsl
-  Scenario: 11 - System inspection recognizes a WSL host
+  Scenario: examine-11 - System inspection recognizes a WSL host
     Given the CLI is running in WSL
     When the user inspects the system
     Then the inspection reports Linux as the operating system
