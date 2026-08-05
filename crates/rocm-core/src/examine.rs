@@ -44,8 +44,11 @@ const TRACKED_ENV_VARS: &[&str] = &[
     "PATH",
 ];
 
-/// Repo files dropped by rocm-cli's repo-native package-manager install flow;
-/// their presence marks a repo-native-managed ROCm.
+/// AMD ROCm/AMDGPU repo files: `amdgpu.list` / `amdgpu.repo` are written by
+/// rocm-cli's own repo-native install flow; `rocm.list` / `radeon.list` /
+/// `rocm.repo` are names from AMD's documented manual/legacy setup steps that
+/// rocm-cli itself never creates. Either kind marks a package-manager-repo-
+/// managed ROCm.
 const REPO_NATIVE_INSTALL_MARKERS: &[&str] = &[
     "/etc/apt/sources.list.d/amdgpu.list",
     "/etc/apt/sources.list.d/rocm.list",
@@ -892,6 +895,23 @@ fn probe_secure_boot(e: &mut Examination) {
 // ROCm install probe (Linux)
 // ---------------------------------------------------------------------------
 
+/// Pure marker-path -> install-method mapping, split out from
+/// `probe_rocm_install` so it's testable without touching the real
+/// filesystem. `existing` is the subset of `REPO_NATIVE_INSTALL_MARKERS`
+/// found present on the host; returns `None` when none are present.
+fn repo_native_method_from_markers(existing: &[&str]) -> Option<(&'static str, Vec<String>)> {
+    let seen: Vec<String> = REPO_NATIVE_INSTALL_MARKERS
+        .iter()
+        .filter(|m| existing.contains(m))
+        .map(|m| (*m).to_owned())
+        .collect();
+    if seen.is_empty() {
+        None
+    } else {
+        Some(("repo-native", seen))
+    }
+}
+
 fn probe_rocm_install(e: &mut Examination) {
     let mut rocm_dir = String::new();
     let rocm_path_env = std::env::var("ROCM_PATH").unwrap_or_default();
@@ -919,11 +939,14 @@ fn probe_rocm_install(e: &mut Examination) {
         }
     }
 
-    for marker in REPO_NATIVE_INSTALL_MARKERS {
-        if Path::new(marker).exists() {
-            e.rocm_install_method = "repo-native".to_owned();
-            e.rocm_repos_seen.push((*marker).to_owned());
-        }
+    let existing_markers: Vec<&str> = REPO_NATIVE_INSTALL_MARKERS
+        .iter()
+        .copied()
+        .filter(|m| Path::new(m).exists())
+        .collect();
+    if let Some((method, seen)) = repo_native_method_from_markers(&existing_markers) {
+        e.rocm_install_method = method.to_owned();
+        e.rocm_repos_seen.extend(seen);
     }
 
     if e.rocm_install_method.is_empty() {
@@ -1685,5 +1708,46 @@ mod tests {
             Some("6.4.1".to_owned())
         );
         assert_eq!(extract_rocm_version("/opt/rocm"), None);
+    }
+
+    #[test]
+    fn no_markers_present_yields_no_repo_native_method() {
+        assert!(repo_native_method_from_markers(&[]).is_none());
+    }
+
+    #[test]
+    fn every_declared_marker_individually_maps_to_repo_native() {
+        for marker in REPO_NATIVE_INSTALL_MARKERS {
+            let (method, seen) =
+                repo_native_method_from_markers(&[marker]).expect("marker should match");
+            assert_eq!(method, "repo-native");
+            assert_eq!(seen, vec![(*marker).to_owned()]);
+        }
+    }
+
+    #[test]
+    fn multiple_markers_all_recorded_in_declaration_order() {
+        // Passed in reverse of REPO_NATIVE_INSTALL_MARKERS' declared order to
+        // confirm the output order tracks the constant, not the input.
+        let existing = [
+            "/etc/zypp/repos.d/amdgpu.repo",
+            "/etc/apt/sources.list.d/amdgpu.list",
+        ];
+        let (method, seen) = repo_native_method_from_markers(&existing).expect("some");
+        assert_eq!(method, "repo-native");
+        assert_eq!(
+            seen,
+            vec![
+                "/etc/apt/sources.list.d/amdgpu.list".to_owned(),
+                "/etc/zypp/repos.d/amdgpu.repo".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unrelated_paths_do_not_match_any_marker() {
+        assert!(
+            repo_native_method_from_markers(&["/etc/apt/sources.list.d/some-other.list"]).is_none()
+        );
     }
 }

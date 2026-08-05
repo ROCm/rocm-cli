@@ -106,7 +106,7 @@ const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "fix-3-rocm-kernel",
         title: "ROCm/distro/kernel triple unsupported",
-        rationale: "ROCm is installed but your kernel/distro combination is outside the supported matrix. Match the kernel to the matrix before reinstalling, or rerun with --no-dkms and accept the risk.",
+        rationale: "ROCm is installed but your kernel/distro combination is outside the supported matrix. Match the kernel to the matrix before reinstalling, or rerun `rocm install driver --dkms` and accept the risk.",
         auto_applicable: false,
         commands: &[
             "# Cross-check the live AMD matrix before changing anything:",
@@ -286,17 +286,23 @@ const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "fix-12-installer",
         title: "Reset repo-native install state and reinstall",
-        rationale: "The repo-native package-manager install left a half-configured DKMS / repo state. Quarantine the repo files rocm-cli's install wrote, let the package manager forget the broken state, then reinstall via rocm-cli's own repo-native flow.",
+        rationale: "The repo-native package-manager install left a half-configured DKMS / repo state. Clear the broken package state, quarantine the repo files rocm-cli's install wrote, let the package manager forget the broken state, then reinstall via rocm-cli's own repo-native flow.",
         auto_applicable: false,
         commands: &[
-            "# sudo mv /etc/apt/sources.list.d/amdgpu.list /etc/apt/sources.list.d/amdgpu.list.bak   # or the yum/zypp equivalent",
-            "sudo apt update 2>/dev/null || sudo dnf clean all 2>/dev/null || sudo zypper refresh 2>/dev/null",
+            "# Run only the block matching your package manager:",
+            "sudo dpkg --configure -a && sudo apt-get install -f && sudo apt-get purge -y amdgpu-dkms   # Debian/Ubuntu",
+            "sudo dnf remove -y amdgpu-dkms                                                             # RHEL/Fedora/Rocky/Alma/Oracle",
+            "sudo zypper remove -y amdgpu-dkms                                                          # SLES/openSUSE",
+            "# sudo mv /etc/apt/sources.list.d/amdgpu.list /etc/apt/sources.list.d/amdgpu.list.bak       # or the yum/zypp equivalent; quarantine, do not delete yet",
+            "sudo apt update      # Debian/Ubuntu",
+            "sudo dnf clean all   # RHEL/Fedora/Rocky/Alma/Oracle",
+            "sudo zypper refresh  # SLES/openSUSE",
             "rocm install driver",
         ],
         needs_sudo: true,
         needs_reboot: true,
         needs_relogin: false,
-        verify: "rocm examine --json | grep -E 'rocm_install_method|rocm_version' && rocminfo | head -n 5",
+        verify: "rocm examine --json | grep -q '\"rocm_install_method\": \"repo-native\"' && rocminfo | head -n 5",
         notes: &[
             "If the package-manager update/refresh warns it will remove unrelated packages, stop and resolve those by hand before continuing.",
         ],
