@@ -80,3 +80,9 @@ None — task closed. Worktree pending removal.
 - Probe #922 evidence (cold libraries-only): pre-warm install ~16s; 9-min job dominated by serve scenario burning 300s timeout, not unpack. Earlier: torch/amdsmi issue ruled out viability anyway.
 - **Verdict: WL-88 premise is stale.** Full GPU suite runs ~5 min ≪ 90-min cap; shared-runtimes pre-warm already capped devel cost. Do NOT open PR from d014bae. Close ticket as superseded. Any residual concern is GH `timeout-minutes` self-cancel (~95 min) — separate unrelated fix.
 - Recommendation: abandon `ROCM_CLI_THEROCK_EXTRAS` approach; delete remote branch; drop env knob unless repurposing as generic escape hatch (not needed).
+
+### 2026-08-05 — Abandoned & Cleaned Up (won't-fix)
+
+- User confirmed won't-fix. Deleted remote branch `origin/fix-per-scenario-8-8-gb-devel-tar-unpack` (was `d014bae`, unmerged, no PR) via `git-push-fallback`.
+- Resolved WL-88 with the full stale-premise rationale in the ticket note; ticket moved to `resolved/`.
+- `ROCM_CLI_THEROCK_EXTRAS` changes discarded with the branch (never merged). Worktree slated for removal.
