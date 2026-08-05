@@ -6,7 +6,7 @@
 **Branch:** e2e-task-9-narrow-serve-paths-filter-so-non
 **Jira:** EAI-7746 (Task, rocm-cli, unassigned)
 **Pre-PR-check:** review-done — OpenCode reviewer (gpt-5.6-sol), 2026-07-31, @ca9f297+e2748ac0b92b8d83 — PASSED after two review rounds (all issues fixed); short-name scenarios now @serves-on-gpu, full serve-step/feature sweep found no other real GPU serve escaping canary gating; focused tests + harness compile + clippy + git diff --check all pass.
-**Last Updated:** 2026-08-05
+**Last Updated:** 2026-08-05 (end of session 19)
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
 **Token Usage:** in=4756 out=1175750 cache_create=43577899 cache_read=326137756 calls=1429
@@ -224,6 +224,14 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 - Mechanical blocker confirmed: relay-gate hook forbids source file edits on coordinator tier (only permits own-branch commit/push, not Edit). Reduction cannot proceed via relay.
 - rominf's 2026-08-05 13:49 re-review independently confirms recommendation (keep serve paths-filter, drop canary mechanism), approves substance, notes #157 must land first (cross-PR clash) or #156 becomes retag delta. PR #156 now `BEHIND` main and needs rebase anyway.
 - Awaiting fres's direct "go" to proceed with source edits and subsequent rebase + commit + push (fast-forward, no force-push needed unless scope changes).
+
+### 2026-08-05 (session 19 — cross-PR confirmation + sequencing clarity)
+
+- Relay nudge triggered live state re-check per standing rule (PR open + nudge → surface sweep first).
+- PR #156 merge state changed to `BEHIND` (main advanced to 23f14a3); all checks remain passing (GPU canary 1m26s, Strix skipping, `changes`/`report` green, no new review feedback).
+- rominf posted new review comment (2026-08-05 13:49) confirming findings independently: approves substance of fixes (1/2/3/5 in prior session), agrees with #4/#6 deferred judgment, and independently recommends identical canary reduction (keep serve paths-filter, drop canary mechanism; scenario 6b stays `@merge-queue` post-#157 rebase).
+- **Cross-PR sequencing:** #157 is still OPEN; rominf notes whichever lands first (156 or 157) determines the path forward — if #156 lands first, #157 becomes a retag delta. Both PRs now `BEHIND` main (23f14a3).
+- **Canary reduction status:** fully scoped and triple-confirmed (fres's decision, coordinator relay, rominf's independent review), but mechanically blocked on relay via relay-gate hook (forbids Edit on coordinator tier). Awaiting fres's direct "go" to proceed with source edits.
 
 ### 2026-07-30
 
