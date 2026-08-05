@@ -48,8 +48,7 @@ Files:
 
 ## Next Steps
 
-1. Confirm e2e re-run is green (release build + cucumber suite running in container).
-2. Request independent pre-PR review; do NOT open the PR (fres's action).
+1. Pre-PR review requested — awaiting reviewer verdict; do NOT open the PR (fres's action).
 
 ## Notes
 
@@ -71,4 +70,5 @@ Files:
 
 - Gate log reviewed: clippy + all unit/lib tests passed (green); e2e stage failed on missing release binary — root-caused to the disk-full interruption during the earlier release build (`cargo xtask e2e` does build the release binaries itself, e2e.rs:45-49), not a gate-invocation gap.
 - Committed the fix to the feature branch: `6b50809` (signed), 27 lines (main.rs + Cargo.toml + Cargo.lock + broken_pipe.rs).
-- Re-running the container e2e gate (release build + cucumber suite) now that disk is free; pre-PR review to follow once green.
+- Re-ran the container e2e gate (release build + cucumber suite) — GREEN: 28 passed, 3 xfail (expected), 0 unexpected failures, exit 0. The prior 20-scenario failure is gone now that the release binary builds.
+- Requested independent pre-PR review.
