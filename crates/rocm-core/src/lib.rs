@@ -5804,6 +5804,15 @@ pub struct ManagedServiceRecord {
     pub restart_count: u32,
     #[serde(default)]
     pub last_restart_unix_ms: Option<u128>,
+    /// When a stop was requested but could not confirm that every recorded
+    /// process died. It records *intent*: the operator asked for this service to
+    /// go away, so once the processes are observed gone the endpoint key may be
+    /// dropped. A service that merely crashed carries no such intent and keeps
+    /// its key, so it stays restartable/recoverable. Cleared on a confirmed stop
+    /// and on a successful respawn. `None` on records written before this field
+    /// existed, which is the safe default (keep the key).
+    #[serde(default)]
+    pub stop_requested_unix_ms: Option<u128>,
     /// Coarse startup stage (`downloading`/`loading`/`warmup`) parsed from the
     /// serve process's own log output while it is coming up. Set to `None` once
     /// the service reaches `ready`, and absent on older on-disk records.
@@ -5858,6 +5867,7 @@ impl ManagedServiceRecord {
             engine_recipe_json: None,
             restart_count: 0,
             last_restart_unix_ms: None,
+            stop_requested_unix_ms: None,
             startup_phase: None,
             manifest_path,
             log_path,

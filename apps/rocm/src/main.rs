@@ -12856,6 +12856,13 @@ fn stop_internal_managed_service(paths: &AppPaths, service_id: &str) -> Result<s
     // that did not happen.
     if all_stopped {
         record.status = "stopped".to_owned();
+        record.stop_requested_unix_ms = None;
+    } else {
+        // Record that a stop was *asked for* even though it could not be
+        // confirmed. `refresh_managed_service_runtime_liveness` needs this to
+        // tell a service the operator stopped from one that merely crashed: only
+        // the former should lose its endpoint key once its processes are gone.
+        record.stop_requested_unix_ms = Some(rocm_core::unix_time_millis());
     }
     record.write()?;
     // Drop the endpoint key with the service by deleting its 0600 key file.
@@ -12865,7 +12872,8 @@ fn stop_internal_managed_service(paths: &AppPaths, service_id: &str) -> Result<s
     // Gated on `all_stopped` for the same reason the status is: an unconfirmed
     // stop may have left the engine alive and still enforcing the key, and
     // discarding our only copy would lock the CLI's own probes, chat, and
-    // service discovery out of a service that is otherwise fine.
+    // service discovery out of a service that is otherwise fine. The marker
+    // written above hands that cleanup to the liveness refresh instead.
     if all_stopped {
         endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
     }
@@ -12924,6 +12932,12 @@ fn restart_internal_managed_service(
     if let Some(key) = preserved_endpoint_key.as_deref() {
         endpoint_keys::store_endpoint_api_key(paths, service_id, key)?;
     }
+    // The stop above may have recorded an unconfirmed-stop marker; a successful
+    // restart supersedes it. Leaving it set would let the next liveness refresh
+    // delete the key of the service we are bringing back up. Reaches disk with
+    // the record writes below; if the restart bails before one of those, the
+    // marker stays set on disk — correct, since then the stop is what stands.
+    record.stop_requested_unix_ms = None;
     let policy = parse_device_policy(record.device_policy.as_deref())?;
     fs::OpenOptions::new()
         .create(true)
@@ -13790,12 +13804,56 @@ fn managed_service_running_state(status: &str) -> &'static str {
 
 const SERVICE_LIVENESS_CHECK_TIMEOUT: Duration = Duration::from_millis(750);
 
+/// The real process ids a record tracks.
+///
+/// The launcher pid is always recorded; `engine_pid` is adopted once the engine
+/// state file reports one. A `0` pid is a placeholder, never a real process.
+fn recorded_service_pids(record: &ManagedServiceRecord) -> Vec<u32> {
+    [record.engine_pid, Some(record.supervisor_pid)]
+        .into_iter()
+        .flatten()
+        .filter(|pid| *pid != 0)
+        .collect()
+}
+
+/// Complete a stop that was requested but could not confirm termination, once
+/// the processes are actually observed gone: drop the endpoint key and clear the
+/// marker. Returns whether the record changed.
+///
+/// This is deliberately keyed on `stop_requested_unix_ms` rather than on "the
+/// tracked pids are dead". A *crashed* service also has dead pids, but its
+/// operator never asked for it to go away and will want it back: dropping the
+/// key there would make `rocm services restart` and daemon recovery refuse it
+/// permanently — fail-closed guards have no way to re-mint a key. The cost of
+/// this choice is that a crashed public service's 0600 key file outlives the
+/// process until the service is stopped or successfully restarted.
+///
+/// Called before the liveness gate in
+/// [`refresh_managed_service_runtime_liveness`], so a record that reached
+/// "stopped" by another route still gets its deferred cleanup rather than
+/// stranding the key.
+fn settle_pending_stop_key_cleanup(paths: &AppPaths, record: &mut ManagedServiceRecord) -> bool {
+    if record.stop_requested_unix_ms.is_none() {
+        return false;
+    }
+    if recorded_service_pids(record)
+        .iter()
+        .any(|pid| process_is_running(*pid))
+    {
+        return false;
+    }
+    endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
+    record.stop_requested_unix_ms = None;
+    true
+}
+
 fn refresh_managed_service_runtime_liveness(
     paths: &AppPaths,
     record: &mut ManagedServiceRecord,
 ) -> bool {
+    let settled_pending_stop = settle_pending_stop_key_cleanup(paths, record);
     if !managed_service_is_live(record) {
-        return false;
+        return settled_pending_stop;
     }
 
     // Probe with the service's key so a protected public service is not mistaken
@@ -13815,27 +13873,23 @@ fn refresh_managed_service_runtime_liveness(
             record.status = "ready".to_owned();
             return true;
         }
-        return false;
+        return settled_pending_stop;
     }
 
-    let tracked_pids = [record.engine_pid, Some(record.supervisor_pid)]
-        .into_iter()
-        .flatten()
-        .filter(|pid| *pid != 0)
-        .collect::<Vec<_>>();
+    let tracked_pids = recorded_service_pids(record);
     let has_tracked_pid = !tracked_pids.is_empty();
     let has_live_pid = tracked_pids.iter().any(|pid| process_is_running(*pid));
     if has_tracked_pid && !has_live_pid {
-        // Confirmed dead, so the endpoint key can finally go. `stop` only drops
-        // it when it could verify termination; this is where an unconfirmed stop
-        // (or a crash) gets its deferred cleanup, so a plaintext secret is not
-        // stranded on disk for a service that no longer exists.
-        endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
+        // Reconcile the status only. The endpoint key is *not* dropped here:
+        // dead pids alone do not distinguish a stopped service from a crashed
+        // one, and a crashed public service needs its key to be restartable.
+        // `settle_pending_stop_key_cleanup` above owns that cleanup, gated on a
+        // stop having actually been requested.
         if record.status != "stopped" {
             record.status = "stopped".to_owned();
             return true;
         }
-        return false;
+        return settled_pending_stop;
     }
 
     if matches!(record.status.as_str(), "ready" | "running") {
@@ -13846,7 +13900,7 @@ fn refresh_managed_service_runtime_liveness(
         }
     }
 
-    false
+    settled_pending_stop
 }
 
 fn local_server_sidebar_status(counts: &ManagedServiceSidebarCounts) -> String {
@@ -20845,6 +20899,112 @@ install therock";
             after.status, "stopped",
             "a refused restart must not stop the service"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A public record with a dead pid and a stored endpoint key, for the
+    /// liveness-refresh cases below. The port is one nothing listens on, so the
+    /// refresh's endpoint probe fails and it falls through to the pid check.
+    fn dead_public_service_with_key(
+        paths: &AppPaths,
+        service_id: &str,
+        port: u16,
+    ) -> ManagedServiceRecord {
+        paths.ensure().unwrap();
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            service_id,
+            "vllm",
+            "model-ref",
+            "canonical/model",
+            "0.0.0.0",
+            port,
+            "managed",
+            // A pid far above any plausible live process, as in
+            // `dead_managed_service_allows_relaunch`.
+            999_999_999,
+            None,
+            None,
+            None,
+        );
+        record.status = "running".to_owned();
+        record.write().unwrap();
+        endpoint_keys::store_endpoint_api_key(paths, service_id, "secret-key").unwrap();
+        record
+    }
+
+    #[test]
+    fn crashed_public_service_keeps_its_endpoint_key() {
+        // A crash (OOM kill, host reboot, panic) leaves the record at "running"
+        // with dead pids and no stop marker. Dropping the key here would make
+        // the fail-closed respawn guards refuse every later `rocm services
+        // restart` and every daemon recovery attempt — permanently, because
+        // nothing can re-mint the key. The refresh happens on every read
+        // (`rocm services list`), so this must survive it.
+        let (root, paths) = test_paths("liveness-crash-keeps-key");
+        let service_id = "svc-crashed-public";
+        let mut record = dead_public_service_with_key(&paths, service_id, 11982);
+
+        let changed = refresh_managed_service_runtime_liveness(&paths, &mut record);
+
+        assert!(changed, "a dead service must be demoted to stopped");
+        assert_eq!(record.status, "stopped");
+        assert_eq!(
+            endpoint_keys::endpoint_api_key(&paths, service_id).as_deref(),
+            Some("secret-key"),
+            "a crashed public service must stay restartable"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unconfirmed_stop_clears_the_endpoint_key_once_the_processes_are_gone() {
+        // The other half: a stop that could not confirm termination leaves the
+        // key in place (the engine may still be alive and enforcing it) and
+        // records the intent. Once the processes are observed gone, the deferred
+        // cleanup runs, so no plaintext secret is stranded for a service the
+        // operator did ask to stop.
+        let (root, paths) = test_paths("liveness-pending-stop-clears-key");
+        let service_id = "svc-pending-stop";
+        let mut record = dead_public_service_with_key(&paths, service_id, 11983);
+        record.stop_requested_unix_ms = Some(1);
+
+        let changed = refresh_managed_service_runtime_liveness(&paths, &mut record);
+
+        assert!(changed);
+        assert_eq!(record.status, "stopped");
+        assert_eq!(
+            endpoint_keys::endpoint_api_key(&paths, service_id),
+            None,
+            "a requested stop must still drop the key"
+        );
+        assert_eq!(
+            record.stop_requested_unix_ms, None,
+            "the marker is consumed, so the cleanup does not run again"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_stop_cleanup_runs_even_once_the_record_reads_stopped() {
+        // Proves the cleanup sits *before* the `managed_service_is_live` gate:
+        // a record that reached "stopped" by another route (an engine state
+        // refresh, a concurrent writer) would otherwise early-return and strand
+        // the key of a service the operator stopped.
+        let (root, paths) = test_paths("liveness-pending-stop-when-stopped");
+        let service_id = "svc-pending-stop-stopped";
+        let mut record = dead_public_service_with_key(&paths, service_id, 11984);
+        record.status = "stopped".to_owned();
+        record.stop_requested_unix_ms = Some(1);
+
+        let changed = refresh_managed_service_runtime_liveness(&paths, &mut record);
+
+        assert!(
+            changed,
+            "consuming the marker is a record change worth writing"
+        );
+        assert_eq!(endpoint_keys::endpoint_api_key(&paths, service_id), None);
+        assert_eq!(record.stop_requested_unix_ms, None);
         let _ = fs::remove_dir_all(root);
     }
 
