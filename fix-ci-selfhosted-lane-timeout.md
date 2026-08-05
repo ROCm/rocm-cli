@@ -3,9 +3,9 @@
 **Stage:** 7-pre-pr-review — all review findings addressed; committed as 0c884da (signed + signed-off); awaiting re-review
 **Pipeline:** lightweight
 **Branch:** fix-ci-selfhosted-lane-timeout
-**Pre-PR-check:** changes-requested → awaiting re-review @0c884da (all 6 findings addressed; F2 refuted with evidence)
+**Pre-PR-check:** changes-requested → awaiting re-review @0c884da (all 6 findings addressed; verified signatures + sign-off + tests pass)
 **Ticket:** EAI-7548 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7548
-**Last Updated:** 2026-08-04
+**Last Updated:** 2026-08-05
 **Token Usage:** in=520 out=448k cache_create=2142379 cache_read=50790k calls=263
 
 ---
@@ -105,7 +105,7 @@ change).
 - ✅ Confirmed all 3 self-hosted lanes already have `timeout-minutes` and dispatch
   already has a unique concurrency group (landed in #69).
 
-### Implementing (option A, "Split only") ✅ code complete
+### Implementing (option A, "Split only") ✅ COMPLETE
 - ✅ Scope decided: **A — split self-hosted lanes into their own workflow.** "Split only":
   branch protection left as-is (user handles the required-check list separately).
 - ✅ Created `.github/workflows/e2e-selfhosted.yml` (652 lines): the 3 self-hosted jobs
@@ -124,9 +124,16 @@ change).
   self-hosted refs; actionlint clean except the pre-existing custom-label warnings (main's
   ci.yml already emits 8). e2e_report.rs renders whatever artifacts it finds (no hardcoded
   platform requirement), so the per-workflow report split is safe.
-- ✅ Committed + signed as 6976c7e (commit-signing hook passed).
-- 📋 NEXT: pre-PR review (mandatory gate by second-agent reviewer) before opening the PR.
-  Then user handles the branch-protection de-require separately (the "Split only" caveat).
+- ✅ Pre-PR review findings (6 total) all addressed and verified:
+  - F1 (native label): rebased to main + rebuilt e2e-selfhosted.yml from current jobs
+  - F2 (empty report): refuted with actions/download-artifact docs + clarifying comment
+  - F3 (stale README): updated GPU dispatch commands and job table
+  - F4 (missing sign-off): commit amended with `-s` flag
+  - F5 (no regression test): added xtask/src/workflow_contract.rs (3 tests pass here, fail on main)
+  - F6 (stale scenario): Gherkin rewritten to implemented guarantee
+- ✅ Committed + signed as **0c884da** (all hooks passed: fmt, license-header, signing).
+- ✅ Verification complete: signature valid (G), sign-off present, 3 contract tests pass, both workflows parse, clean tree.
+- 📋 Awaiting re-review by second-agent reviewer.
 
 ## KEY FINDING — required-check contradiction (drives "Split only" caveat)
 
@@ -146,11 +153,11 @@ admin branch-protection change), which the user opted to handle separately.
 
 ## Next Steps
 
-Implement the split (option A). Leave branch protection alone (user's call).
+Await re-review by second-agent reviewer. Do not open PR until `Pre-PR-check` is `passed` or `review-done`. User to handle branch-protection de-require separately (the "Split only" caveat).
 
 ## Blockers / Open Questions
 
-- **BLOCKED (awaiting user):** Run `git-commit-with-fallback --amend -s` to finalize the DCO sign-off, then request re-review. The previous turn's relay-gate blocked commits; this direct session can proceed with the amendment.
+None — commit finalized. Awaiting re-review by second-agent reviewer.
 
 ## RESOLVED
 - Does `timeout-minutes` cancel a job still QUEUED on an offline runner?
@@ -248,3 +255,10 @@ Implement the split (option A). Leave branch protection alone (user's call).
 - All 6 review findings addressed: rebased to main's HEAD (F1/native label + #139 E2E changes restored), clarified artifact extraction (F2), updated README (F3), staged amended commit for `-s` sign-off (F4), added regression test contract (F5), rewrote scenario (F6).
 - All fixes staged; commit pending direct session (previous relay-gate blocked `git commit`).
 - Ready for amendment and re-review once user runs `git-commit-with-fallback --amend -s`.
+
+### 2026-08-05 (commit finalization + verification)
+
+- Amended commit with `-s` sign-off flag; all hooks passed (fmt, license-header, signing).
+- Verified final tree: signature valid, sign-off present, 3 contract tests pass, both workflows parse, clean worktree.
+- Commit finalized as **0c884da**; all 6 pre-PR review findings confirmed resolved.
+- Awaiting re-review by second-agent reviewer before opening PR. "Split only" caveat remains — user to handle branch-protection de-require separately.
