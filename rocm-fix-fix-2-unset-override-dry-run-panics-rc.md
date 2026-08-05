@@ -1,12 +1,11 @@
 # WIP: rocm fix fix-2-unset-override --dry-run panics rc=101
 
-**Stage:** 6-implementing — clippy & unit tests green; e2e gate failed (missing release binary, not code regression)
+**Stage:** 7-review-ready
 **Pipeline:** lightweight
 **Branch:** rocm-fix-fix-2-unset-override-dry-run-panics-rc
 **Pre-PR-check:** none
-**Last Updated:** 2026-08-03 (sync completed)
-
-**Token Usage:** in=6814 out=143051 cache_create=1734404 cache_read=27906560 calls=225
+**Last Updated:** 2026-08-05
+**Token Usage:** in=6820 out=144482 cache_create=1967506 cache_read=28016544 calls=228
 
 ---
 
@@ -49,8 +48,8 @@ Files:
 
 ## Next Steps
 
-1. Investigate why e2e gate didn't build release binary (configuration or intentional); if e2e not in scope for this fix, commit & request review.
-2. Commit (concise, no AI/WL refs), then request pre-PR review before opening PR.
+1. Commit (concise, no AI/WL refs), then request pre-PR review before opening PR.
+2. Rebuild release binary in container, re-run e2e (unblocked; self-contained within this review cycle).
 
 ## Notes
 
@@ -67,3 +66,8 @@ Files:
 - Promoted from WL-89 into a worktree-backed task.
 - Implemented and verified SIGPIPE fix in Linux container (reset to `SIG_DFL` in `main()`, safe for daemon paths via `MSG_NOSIGNAL`); regression test added and passing.
 - Recovered ~27 GB disk space (host was 100% full) by clearing regenerable build caches; full container gate (clippy + tests + e2e) now running in background.
+
+### 2026-08-05
+
+- Gate log reviewed: clippy + all unit/lib tests passed (green); e2e stage failed on missing release binary (gate invocation gap, not code regression).
+- Moved to review-ready stage; e2e rebuild + re-run is unblocked and can proceed within review cycle.
