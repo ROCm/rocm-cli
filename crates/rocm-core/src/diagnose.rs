@@ -86,7 +86,6 @@ fn upstream_tracker(target: &str) -> &'static str {
         "lemonade" => "https://github.com/lemonade-sdk/lemonade/issues",
         "ollama" => "https://github.com/ollama/ollama/issues",
         "lm-studio" => "https://lmstudio.ai/docs/app  (use in-app support; no public repo)",
-        "amdgpu-install" => "https://repo.radeon.com  (raise via your AMD support contact)",
         _ => "https://github.com/ROCm/ROCm/issues",
     }
 }
@@ -503,7 +502,7 @@ fn check_3_rocm_kernel_unsupported(e: &Examination, symptom: &str) -> Diagnosis 
             "# Compare to the live AMD matrix:".to_owned(),
             "#   https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html".to_owned(),
             "# If your kernel is above the supported range, install the HWE".to_owned(),
-            "# kernel that matches ROCm, or rerun amdgpu-install with --no-dkms.".to_owned(),
+            "# kernel that matches ROCm, or rerun `rocm install driver --dkms`.".to_owned(),
         ],
         fix_id: "fix-3-rocm-kernel".to_owned(),
         auto_applicable: false,
@@ -752,11 +751,8 @@ fn check_7_stale_repos(e: &Examination, symptom: &str) -> Diagnosis {
         ));
     }
     commands.push("sudo apt update".to_owned());
-    commands.push("# If apt now resolves, reinstall via the correct method only:".to_owned());
-    commands.push(
-        "#   amdgpu-install --usecase=rocm,hip --no-dkms   # if you want amdgpu-install".to_owned(),
-    );
-    commands.push("#   or use the distro packages exclusively".to_owned());
+    commands.push("# If apt now resolves, reinstall via the repo-native flow only:".to_owned());
+    commands.push("#   rocm install driver".to_owned());
     let fix = Fix {
         summary: "Quarantine duplicate ROCm/AMDGPU repo files and resolve apt before re-running any installer.".to_owned(),
         commands,
@@ -1050,44 +1046,57 @@ fn check_11_iommu_hang(e: &Examination, symptom: &str) -> Diagnosis {
     )
 }
 
-fn check_12_amdgpu_install_broken(e: &Examination, symptom: &str) -> Diagnosis {
+fn check_12_repo_native_broken(e: &Examination, symptom: &str) -> Diagnosis {
     let mut score = 0;
     let mut evidence = Vec::new();
     let method = &e.rocm_install_method;
-    if method == "amdgpu-install" {
-        evidence.push("ROCm was installed via amdgpu-install".to_owned());
+    if method == "repo-native" {
+        evidence.push("ROCm was installed via the repo-native package-manager flow".to_owned());
     }
     let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_DPKG_BROKEN);
     score += kw_score;
     evidence.extend(kw_ev);
-    if method == "amdgpu-install" && kw_score > 0 {
+    if method == "repo-native" && kw_score > 0 {
         score += 20;
     }
 
     if score <= 0 {
-        return zero("fix-12-installer", "amdgpu-install broken state");
+        return zero("fix-12-installer", "repo-native install broken state");
     }
+    let mut commands = vec![
+        "# Quarantine the repo files rocm-cli's install wrote, then let the package".to_owned(),
+        "# manager forget the broken state before reinstalling.".to_owned(),
+    ];
+    if e.rocm_repos_seen.is_empty() {
+        commands.push(
+            "# sudo mv /etc/apt/sources.list.d/amdgpu.list /etc/apt/sources.list.d/amdgpu.list.bak   # or the yum/zypp equivalent".to_owned(),
+        );
+    } else {
+        for r in &e.rocm_repos_seen {
+            commands.push(format!("sudo mv {r} {r}.bak"));
+        }
+    }
+    commands.push(
+        "sudo apt update 2>/dev/null || sudo dnf clean all 2>/dev/null || sudo zypper refresh 2>/dev/null"
+            .to_owned(),
+    );
+    commands.push("# Reinstall via rocm-cli's repo-native flow:".to_owned());
+    commands.push("rocm install driver".to_owned());
+
     let fix = Fix {
-        summary: "Run amdgpu-install's documented uninstall sequence to clear the half-configured state, THEN reinstall without the flag that broke it.".to_owned(),
-        commands: vec![
-            "sudo amdgpu-install --uninstall".to_owned(),
-            "sudo apt autoremove --purge -y".to_owned(),
-            "sudo apt update".to_owned(),
-            "# Reinstall. Drop --accept-eula if you used it previously; the".to_owned(),
-            "# newer installer rejects it and leaves a half-configured repo.".to_owned(),
-            "sudo amdgpu-install --usecase=rocm,hip".to_owned(),
-        ],
+        summary: "Quarantine the repo-native install's repo files to clear the half-configured state, THEN reinstall via `rocm install driver`.".to_owned(),
+        commands,
         needs_sudo: true,
         needs_reboot: true,
         fix_id: "fix-12-installer".to_owned(),
         auto_applicable: false,
-        verify: "dpkg -l | grep -E 'rocm|amdgpu' | head -n 20 && rocminfo | head -n 5".to_owned(),
-        notes: vec!["If `apt autoremove` warns it will remove unrelated packages, stop and resolve those by hand before continuing.".to_owned()],
+        verify: "rocm examine --json | grep -E 'rocm_install_method|rocm_version' && rocminfo | head -n 5".to_owned(),
+        notes: vec!["If the package-manager update/refresh warns it will remove unrelated packages, stop and resolve those by hand before continuing.".to_owned()],
         ..Fix::default()
     };
     finalize(
         "fix-12-installer",
-        "amdgpu-install left a broken state (repo regression / partial DKMS)",
+        "Repo-native install left a broken state (repo regression / partial DKMS)",
         score,
         evidence,
         fix,
@@ -1255,7 +1264,7 @@ const CHECKERS: &[Checker] = &[
     (check_9_igpu_dgpu_collision, &["linux", "windows"]),
     (check_10_container_devices, &["linux"]),
     (check_11_iommu_hang, &["linux"]),
-    (check_12_amdgpu_install_broken, &["linux"]),
+    (check_12_repo_native_broken, &["linux"]),
     (check_13_hip_sdk_missing, &["windows"]),
     (check_14_adrenalin_too_old, &["windows"]),
     (check_15_msvc_redist, &["windows"]),
