@@ -49,11 +49,16 @@ fn feature_files() -> Vec<String> {
     names
 }
 
-/// The `@id:` tags and `Scenario:` names in one feature file, paired in
-/// declaration order. Tags precede their scenario, so the most recent id seen
-/// belongs to the next scenario line.
+/// The `@id:` tags and scenario names in one feature file, paired in declaration
+/// order. Tags precede their scenario, so the most recent id seen belongs to the
+/// next scenario line.
+///
+/// `Scenario Outline:` counts too — the suite has none today, but an outline
+/// added later would otherwise slip past every check in this file silently.
 fn scenarios_of(file: &str) -> Vec<(Option<String>, String)> {
-    let text = std::fs::read_to_string(features_dir().join(file)).expect("read feature");
+    let path = features_dir().join(file);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{}: {e} — stale FEATURE_KEYS entry?", path.display()));
     let mut pending_id = None;
     let mut out = Vec::new();
     for line in text.lines() {
@@ -64,7 +69,10 @@ fn scenarios_of(file: &str) -> Vec<(Option<String>, String)> {
                     pending_id = Some(id.to_owned());
                 }
             }
-        } else if let Some(name) = line.strip_prefix("Scenario: ") {
+        } else if let Some(name) = line
+            .strip_prefix("Scenario: ")
+            .or_else(|| line.strip_prefix("Scenario Outline: "))
+        {
             out.push((pending_id.take(), name.to_owned()));
         }
     }
@@ -72,13 +80,22 @@ fn scenarios_of(file: &str) -> Vec<(Option<String>, String)> {
 }
 
 #[test]
-fn every_feature_file_has_a_declared_key() {
+fn feature_files_and_declared_keys_agree() {
     let declared: Vec<&str> = FEATURE_KEYS.iter().map(|(f, _)| *f).collect();
-    for file in feature_files() {
+    let present = feature_files();
+    for file in &present {
         assert!(
             declared.contains(&file.as_str()),
             "{file} has no key in FEATURE_KEYS — add one so its scenarios are \
              indexed and its ids are qualified like every other feature",
+        );
+    }
+    // The reciprocal: a key left behind after its file was deleted or renamed
+    // would otherwise surface as an unexplained read error deep in another test.
+    for file in declared {
+        assert!(
+            present.iter().any(|p| p == file),
+            "FEATURE_KEYS lists {file}, which does not exist — drop the entry",
         );
     }
 }
