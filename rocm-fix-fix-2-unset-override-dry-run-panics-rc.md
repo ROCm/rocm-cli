@@ -1,9 +1,9 @@
 # WIP: rocm fix fix-2-unset-override --dry-run panics rc=101
 
-**Stage:** 7-review-ready
+**Stage:** 8-pre-pr-passed — ready for fres to open PR
 **Pipeline:** lightweight
 **Branch:** rocm-fix-fix-2-unset-override-dry-run-panics-rc
-**Pre-PR-check:** none
+**Pre-PR-check:** passed — reviewer(opus pre-pr agent), 2026-08-05, @6b50809+1ab80552cd4d971a
 **Last Updated:** 2026-08-05
 **Token Usage:** in=9491 out=177627 cache_create=2697197 cache_read=39023473 calls=315
 
@@ -48,7 +48,7 @@ Files:
 
 ## Next Steps
 
-1. Pre-PR review requested — awaiting reviewer verdict; do NOT open the PR (fres's action).
+1. Pre-PR review PASSED. Ready for fres to open the PR (author does not open it).
 
 ## Notes
 
@@ -71,4 +71,4 @@ Files:
 - Gate log reviewed: clippy + all unit/lib tests passed (green); e2e stage failed on missing release binary — root-caused to the disk-full interruption during the earlier release build (`cargo xtask e2e` does build the release binaries itself, e2e.rs:45-49), not a gate-invocation gap.
 - Committed the fix to the feature branch: `6b50809` (signed), 27 lines (main.rs + Cargo.toml + Cargo.lock + broken_pipe.rs).
 - Re-ran the container e2e gate (release build + cucumber suite) — GREEN: 28 passed, 3 xfail (expected), 0 unexpected failures, exit 0. The prior 20-scenario failure is gone now that the release binary builds.
-- Requested independent pre-PR review.
+- Requested independent pre-PR review — verdict PASSED (reviewer opus pre-pr agent, @6b50809+1ab80552cd4d971a): reset_sigpipe() placement/FFI/cfg-gating, workspace libc dep, and regression test all check out; no serve/daemon regression (no project code sets its own SIGPIPE handler); commit message clean. No findings ≥80.
