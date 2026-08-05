@@ -6,10 +6,10 @@
 **Branch:** e2e-task-9-narrow-serve-paths-filter-so-non
 **Jira:** EAI-7746 (Task, rocm-cli, unassigned)
 **Pre-PR-check:** review-done — OpenCode reviewer (gpt-5.6-sol), 2026-07-31, @ca9f297+e2748ac0b92b8d83 — PASSED after two review rounds (all issues fixed); short-name scenarios now @serves-on-gpu, full serve-step/feature sweep found no other real GPU serve escaping canary gating; focused tests + harness compile + clippy + git diff --check all pass.
-**Last Updated:** 2026-08-04 (session 14, on hold pending user decision)
+**Last Updated:** 2026-08-05
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=4684 out=1140692 cache_create=39664749 cache_read=312939560 calls=1393
+**Token Usage:** in=4704 out=1144921 cache_create=41068907 cache_read=316212583 calls=1403
 
 ---
 
@@ -201,6 +201,10 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 - Re-checked PR #156 on the new head (ffbbc03) instead of answering from a stale conclusion: gating still correct (`E2E tests (GPU)` 1m23s, Strix skipping, `changes`/`E2E tests`/`build-and-test` green, no new review comments).
 - `windows-build-and-test` failed again (22m36s) with the identical `lifecycle-windows-http-install` HTTP-fixture-download signature as session 6/13 — confirmed not in this PR's diff and green on latest main, so it's a genuine repeat flake in PR #139's code, not caused by this branch.
 - Asked user whether to re-run `windows-build-and-test` again (same reversible action already authorized once for this lane) rather than assume; everything else on PR #156 remains green, still awaiting maintainer-team review.
+
+### 2026-08-05 (session 15 — WIP stage corrected)
+
+- Removed "— ON HOLD" suffix from Stage line (was muting re-check loop for a PR awaiting human review that self-resolves). PR #156 still awaiting maintainer-team review; all other checks green. Windows test flake (PR #139 code, outside this diff, green on main) remains unre-run pending user authorization.
 
 ### 2026-07-30
 
