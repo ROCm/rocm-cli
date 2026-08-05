@@ -317,6 +317,16 @@ impl Expectation {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ResolvedScenario {
     pub id: String,
+    /// The `Feature:` this scenario belongs to. Recorded here because a SKIPPED
+    /// scenario never reaches `report.json`, so the report has no other way to
+    /// place it under its feature in the grouped grid.
+    #[serde(default)]
+    pub feature: String,
+    /// The scenario's own name (`<key>-<NN> - <description>`). Carries the
+    /// per-feature index the report sorts rows by, and gives skipped scenarios a
+    /// human label they'd otherwise lack.
+    #[serde(default)]
+    pub scenario: String,
     pub effective_engine: String,
     /// "pass" | "xfail" | "skip".
     pub expected: String,
@@ -329,7 +339,13 @@ pub struct ResolvedScenario {
 }
 
 impl ResolvedScenario {
-    pub fn new(id: &str, effective_engine: &str, expectation: &Expectation) -> Self {
+    pub fn new(
+        id: &str,
+        feature: &str,
+        scenario: &str,
+        effective_engine: &str,
+        expectation: &Expectation,
+    ) -> Self {
         let (bug, reason, flaky) = match expectation {
             Expectation::ExpectXfail { bug, reason, flaky } => {
                 (Some(bug.clone()), Some(reason.clone()), *flaky)
@@ -339,6 +355,8 @@ impl ResolvedScenario {
         };
         Self {
             id: id.to_owned(),
+            feature: feature.to_owned(),
+            scenario: scenario.to_owned(),
             effective_engine: effective_engine.to_owned(),
             expected: expectation.label().to_owned(),
             bug,
