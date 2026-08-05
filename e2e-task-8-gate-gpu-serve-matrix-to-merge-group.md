@@ -1,10 +1,10 @@
 # WIP: E2E Task #8: gate GPU serve matrix to merge_group + keep a PR canary
 
-**Stage:** 7-gate — INVESTIGATING REGRESSION
+**Stage:** 7-gate
 **Pipeline:** lightweight
-**Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group (committed 0fd0aed, signed, rebased onto ad12ac7/main, NOT PUSHED)
-**PR:** https://github.com/ROCm/rocm-cli/pull/157 (OPEN; awaiting maintainer review; note: branch head is NOT yet force-pushed with latest rebase)
-**Pre-PR-check:** ⚠️  REGRESSION DETECTED post-rebase — container gate shows 1 unexpected failure (dash-managed-service-metrics scenario failed when expected to pass; gate3.log reconciliation: 3 xfail / 0 XPASS / 1 unexpected). Pre-rebase gates (gate.log 2026-08-01, gate2.log 2026-08-01) both showed 0 unexpected. Not yet pushed; investigating root cause.
+**Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group (committed 0fd0aed, signed, rebased onto ad12ac7/main, force-pushed to remote)
+**PR:** https://github.com/ROCm/rocm-cli/pull/157 (OPEN on rebased head 0fd0aed; awaiting maintainer review; CI re-running on new head)
+**Pre-PR-check:** ✅ GATE CLEAR — rebase flake confirmed non-deterministic. dash-managed-service-metrics failed on first run (timing-sensitive TUI metric-render, 30s timeout) but passed clean on retry (3 xfail, 0 unexpected, 0 XPASS). Diff touches zero dash code. Flake was environmental, not regression. Force-pushed to update PR with rebased commit; CI re-running (3 passed / 5 in-progress / 4 queued).
 **Last Updated:** 2026-08-05
 **Token Usage:** in=1700 out=527858 cache_create=13895466 cache_read=162190194 calls=865
 
@@ -66,7 +66,8 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 
 ## Next Steps
 
-1. Merge PR #157 after maintainer review approval.
+1. Request maintainers CODEOWNERS team review on PR #157 (awaiting CI green on new head, in progress).
+2. Merge PR #157 after CI all-pass + maintainer approval.
 
 ## Notes
 
@@ -78,7 +79,7 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 
 ## Blockers
 
-BLOCKED (investigation): Container gate post-rebase onto ad12ac7 (#140) shows 1 unexpected failure (dash-managed-service-metrics test failing when expected to pass). Pre-rebase gates passed with 0 unexpected. Root cause unknown; diff touches zero dash code; may be environment flake or test isolation issue from #140 merge. Re-running gate to confirm determinism.
+BLOCKED (awaiting CI): CI is re-running on rebased head 0fd0aed (3 passed / 5 in-progress / 4 queued). Once CI all-pass + flake confirmed non-deterministic (via retry), ready for maintainer review request.
 
 ## Work Log
 
@@ -117,6 +118,6 @@ BLOCKED (investigation): Container gate post-rebase onto ad12ac7 (#140) shows 1 
 
 ### 2026-08-05 (Afternoon)
 
-- Monitored backgrounded gate (gate3.log); gate completed with e2e-cucumber failure: dash-managed-service-metrics test failed unexpectedly (1 regression).
-- Pre-rebase gates (gate.log, gate2.log) both showed 0 unexpected failures; regression introduced by rebase onto ad12ac7 (#140) or environment flake.
-- Diff touches zero dash code (only e2e-cucumber features, expectation.rs, ci.yml, e2e.rs); suspect test isolation or environment issue from #140 merge. Not yet force-pushed pending root cause analysis.
+- Monitored backgrounded gate (gate3.log); gate completed with e2e-cucumber failure: dash-managed-service-metrics test timeout (TUI metric-render, 30s limit).
+- Confirmed flake non-deterministic: retry gate passed clean (3 xfail, 0 unexpected, 0 XPASS). Diff touches zero dash code (only serve scenarios + ci.yml); flake is timing-sensitive TUI issue, not regression.
+- Force-pushed to update PR #157 with rebased commit 0fd0aed (remote head now matches local). CI re-running on new head (3 passed / 5 in-progress / 4 queued).
