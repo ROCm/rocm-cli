@@ -1221,7 +1221,8 @@ async fn then_xdg_gone(world: &mut E2eWorld) {
 
 pub mod http {
     // The server itself lives in the library crate so it can be exercised by
-    // unit tests (including the non-blocking-socket regression test) rather
-    // than only through the full E2E scenario.
+    // unit tests over real loopback sockets — including on Windows, where
+    // `cargo test --workspace` runs them — rather than only through the full
+    // E2E scenario.
     pub use e2e_cucumber::loopback_http::LoopbackServer;
 }

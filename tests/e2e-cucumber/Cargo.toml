@@ -31,6 +31,11 @@ serde_json.workspace = true
 tempfile = "3"
 tokio.workspace = true
 toml = "0.8"
+# `ServeDir` backs the install scenario's loopback download server (see
+# `src/loopback_http.rs`), so the E2E suite does not hand-roll HTTP framing,
+# socket-mode handling, or path-traversal defence. 0.6 is the version reqwest
+# already pulls in, so this adds no second copy to the tree.
+tower-http = { version = "0.6", features = ["fs"] }
 vt100 = "0.16"
 
 [[test]]
