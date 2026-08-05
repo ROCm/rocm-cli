@@ -8,98 +8,45 @@
 //! native HTTP download path, so the server's only job is to serve one
 //! directory correctly and unremarkably.
 //!
-//! It is built from `axum` + `tower_http`'s `ServeDir` — the same stack as
-//! [`crate::mock_server`] — rather than a hand-rolled `TcpListener` loop. A
+//! It is `tower_http`'s `ServeDir` on the suite's shared server plumbing
+//! ([`crate::http_server`]), rather than a hand-rolled `TcpListener` loop. A
 //! hand-rolled server has to reimplement HTTP/1.x framing (a request may
 //! arrive split across any number of TCP segments), socket-mode handling
 //! (`accept()` on Windows returns a socket that inherits the listener's
 //! non-blocking mode, so reads fail outright whenever the request bytes have
 //! not landed yet), and path-traversal defence. Each of those was a real
 //! defect here, and each is an HTTP library's job — hence this one.
-//!
-//! The server owns a dedicated runtime on its own thread, so it keeps
-//! answering while the calling step blocks on the installer subprocess.
 
-use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::thread::JoinHandle;
+use std::path::Path;
 
 use axum::Router;
-use tokio::sync::oneshot;
 use tower_http::services::ServeDir;
+
+use crate::http_server::{self, ServerHandle};
 
 /// A minimal loopback HTTP file server serving one directory, for the Windows
 /// native-HTTP install scenario. Shuts down on drop.
+#[derive(Debug)]
 pub struct LoopbackServer {
-    port: u16,
-    shutdown: Option<oneshot::Sender<()>>,
-    handle: Option<JoinHandle<()>>,
+    server: ServerHandle,
 }
 
 impl LoopbackServer {
     /// Bind an ephemeral loopback port and serve `root` until dropped.
     ///
     /// Blocks until the port is bound, so [`Self::base_url`] is immediately
-    /// usable and a client can never race the bind.
+    /// usable and a client can never race the bind. The server runs on its own
+    /// thread because the scenario step that starts it then blocks on the
+    /// installer subprocess.
     pub fn start(root: &Path) -> Self {
-        let root: PathBuf = root.to_path_buf();
-        let (port_tx, port_rx) = mpsc::channel();
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-
-        // A dedicated single-thread runtime, not the caller's: the step that
-        // starts this server then blocks its own thread on the installer
-        // subprocess, and the server must keep serving throughout.
-        let handle = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build loopback server runtime");
-            runtime.block_on(async move {
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                    .await
-                    .expect("failed to bind loopback listener");
-                let port = listener
-                    .local_addr()
-                    .expect("no local addr for loopback listener")
-                    .port();
-                // A receiver dropped before this point means the starter gave
-                // up; nothing left to serve, so just fall through and exit.
-                if port_tx.send(port).is_err() {
-                    return;
-                }
-                let app = Router::new().fallback_service(ServeDir::new(&root));
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(async {
-                        shutdown_rx.await.ok();
-                    })
-                    .await
-                    .ok();
-            });
-        });
-
-        let port = port_rx.recv().expect("loopback server failed to bind");
+        let app = Router::new().fallback_service(ServeDir::new(root));
         Self {
-            port,
-            shutdown: Some(shutdown_tx),
-            handle: Some(handle),
+            server: http_server::spawn_on_own_thread(app),
         }
     }
 
     pub fn base_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
-    }
-}
-
-impl Drop for LoopbackServer {
-    fn drop(&mut self) {
-        // Dropping the sender also triggers the graceful shutdown; sending is
-        // just the explicit form of it.
-        if let Some(shutdown) = self.shutdown.take() {
-            shutdown.send(()).ok();
-        }
-        if let Some(handle) = self.handle.take() {
-            handle.join().ok();
-        }
+        self.server.base_url()
     }
 }
 
