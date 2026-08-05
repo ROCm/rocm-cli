@@ -9,7 +9,7 @@
 **Last Updated:** 2026-08-05
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=4704 out=1144921 cache_create=41068907 cache_read=316212583 calls=1403
+**Token Usage:** in=4744 out=1172816 cache_create=42316338 cache_read=324505212 calls=1423
 
 ---
 
@@ -103,6 +103,7 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 ## Blockers
 
 **BLOCKED (awaiting user action):**
+- **Canary mechanism reduction authorization** — relay-gate hook blocks source file edits on coordinator-tier relay (only permits own-branch commit/push, not Edit). Reduction is fully scoped and ready (keep serve paths-filter + ci.yml honesty; drop @canary/@serves-on-gpu tags, canary_mode 6th bool, E2E_PR_CANARY, canary unit tests, merge_group-only Strix gating, README canary docs; defer scenario 6b @merge-queue flag to post-#157 rebase). Need either: (a) your direct "go" here (bypassing relay), or (b) separate force-push authorization if needed.
 - **Re-run `windows-build-and-test`?** — failed again on ffbbc03 (22m36s) with the same confirmed PR #139 flake signature (`lifecycle-windows-http-install` HTTP fixture download), outside this PR's diff and green on main. Re-run was authorized once before for this exact lane; asking again rather than assuming for a repeat CI action on a shared PR. Everything else green, awaiting maintainer-team review.
 - **Judgment calls #3/#6** (all in-PR fixes completed and force-pushed):
   - #3: continue-on-error trade-off on merge_group (Strix regression can land before nightly catches it) — document trade-off or drop continue-on-error?
@@ -205,6 +206,11 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 ### 2026-08-05 (session 15 — WIP stage corrected)
 
 - Removed "— ON HOLD" suffix from Stage line (was muting re-check loop for a PR awaiting human review that self-resolves). PR #156 still awaiting maintainer-team review; all other checks green. Windows test flake (PR #139 code, outside this diff, green on main) remains unre-run pending user authorization.
+
+### 2026-08-05 (session 16 — relay-gated canary reduction decision point)
+
+- Coordinator relay confirmed canary mechanism reduction is authorized own-branch work (fres's decision relayed); identified complete scope (keep serve paths-filter + ci.yml honesty, drop @canary/@serves-on-gpu tags, canary_mode bool, E2E_PR_CANARY env, canary unit tests, merge_group-only Strix gating, README canary docs). Reduction commits cleanly as fast-forward on current head (no force-push needed unless scope changes).
+- **Blocker:** relay-gate hook forbids source file edits on coordinator tier (only permits own-branch commit/push, not Edit); standard Edit calls rejected. Method constraint means reduction cannot proceed via relay — needs either (a) fres's direct authorization here, or (b) separate force-push authorization if circumstances change.
 
 ### 2026-07-30
 
