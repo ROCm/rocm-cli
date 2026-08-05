@@ -622,6 +622,14 @@ impl PlatformVersions {
 #[derive(Deserialize, Clone)]
 struct ManifestExpectation {
     id: String,
+    /// The `Feature:` this scenario belongs to. Absent in artifacts predating
+    /// the grouped grid — see [`feature_of`] for the fallback.
+    #[serde(default)]
+    feature: String,
+    /// The scenario's own name (`<key>-<NN> - <description>`), carrying the
+    /// per-feature index rows are sorted by. Absent in older artifacts.
+    #[serde(default)]
+    scenario: String,
     #[serde(default)]
     effective_engine: String,
     /// "pass" | "xfail" | "skip".
@@ -739,19 +747,72 @@ struct GridColumn {
     details: std::collections::BTreeMap<String, ManifestExpectation>,
 }
 
-/// The reconciled grid: ordered scenario ids × platform columns. Built from each
-/// input's `platform.json` (expected) joined with its `report.json` (actual) by
-/// stable `@id`. Inputs without a `platform.json` (pre-expectation artifacts) are
-/// skipped here — they still appear in the legacy platform×tier matrix.
+/// One row of the grid: a scenario, with the identity used to place and order it.
+struct GridRow {
+    id: String,
+    /// The scenario's human name, or empty when unknown (an artifact predating
+    /// the `scenario` field whose scenario ran nowhere).
+    name: String,
+    /// Per-feature index parsed from the `<key>-<NN>` name prefix. `None` when
+    /// the name is absent or unindexed — those rows sort last, by id.
+    index: Option<u32>,
+}
+
+/// Scenarios of one `Feature:`, in display order.
+struct FeatureGroup {
+    feature: String,
+    rows: Vec<GridRow>,
+}
+
+/// The reconciled grid: scenario rows grouped by feature × platform columns.
+/// Built from each input's `platform.json` (expected) joined with its
+/// `report.json` (actual) by stable `@id`. Inputs without a `platform.json`
+/// (pre-expectation artifacts) are skipped here — they still appear in the legacy
+/// platform×tier matrix.
 struct Grid {
-    /// Scenario ids in first-seen order across all columns.
-    ids: Vec<String>,
+    /// Feature groups, alphabetical by feature name; rows within a group ordered
+    /// by their `<key>-<NN>` index (i.e. feature-file order).
+    groups: Vec<FeatureGroup>,
     columns: Vec<GridColumn>,
+}
+
+/// The per-feature index in a scenario name like `serve-07 - Something happens`.
+/// `None` for a name that doesn't carry one (older artifact, or a scenario
+/// renamed out of the convention).
+fn scenario_index(name: &str) -> Option<u32> {
+    let head = name.split(" - ").next()?;
+    let (_key, digits) = head.rsplit_once('-')?;
+    digits.parse().ok()
+}
+
+/// The feature a scenario belongs to, best-effort.
+///
+/// 1. `platform.json`'s own `feature` — the honest source, and the only one that
+///    covers a scenario skipped on every platform.
+/// 2. The feature name from a `report.json` that ran it.
+/// 3. Failing both, the id's leading segment (`serve-vllm-inference` → `serve`),
+///    so a pre-expectation artifact still groups sensibly instead of collapsing
+///    into one bucket.
+fn feature_of(exp: &ManifestExpectation, from_reports: Option<&str>) -> String {
+    if !exp.feature.is_empty() {
+        return exp.feature.clone();
+    }
+    if let Some(name) = from_reports.filter(|n| !n.is_empty()) {
+        return name.to_owned();
+    }
+    exp.id
+        .split_once('-')
+        .map_or_else(|| exp.id.clone(), |(key, _)| key.to_owned())
 }
 
 impl Grid {
     fn build(inputs: &[(String, PathBuf)]) -> Self {
-        let mut ids: Vec<String> = Vec::new();
+        // Feature names for ids that ran somewhere, as a fallback for artifacts
+        // whose platform.json predates the `feature` field.
+        let features_from_reports = id_features(inputs);
+        // id → (feature, scenario name), merged across inputs. A later input can
+        // fill in identity an earlier (older) artifact lacked.
+        let mut identity: BTreeMap<String, (String, String)> = BTreeMap::new();
         let mut columns: Vec<GridColumn> = Vec::new();
 
         for (_label, json_path) in inputs {
@@ -782,8 +843,15 @@ impl Grid {
                 });
 
             for exp in &manifest.expectations {
-                if !ids.contains(&exp.id) {
-                    ids.push(exp.id.clone());
+                let entry = identity
+                    .entry(exp.id.clone())
+                    .or_insert_with(|| (String::new(), String::new()));
+                if entry.0.is_empty() {
+                    entry.0 =
+                        feature_of(exp, features_from_reports.get(&exp.id).map(String::as_str));
+                }
+                if entry.1.is_empty() {
+                    entry.1.clone_from(&exp.scenario);
                 }
                 let outcome =
                     CellOutcome::reconcile(&exp.expected, exp.flaky, actual.get(&exp.id).copied());
@@ -801,8 +869,27 @@ impl Grid {
             }
         }
 
-        ids.sort();
-        Self { ids, columns }
+        // Group by feature, then order rows by their per-feature index so the
+        // grid reads in feature-file order rather than the alphabetical-by-id
+        // mash the flat table used to show. Unindexed rows sort last, by id.
+        let mut by_feature: BTreeMap<String, Vec<GridRow>> = BTreeMap::new();
+        for (id, (feature, name)) in identity {
+            let index = scenario_index(&name);
+            by_feature
+                .entry(feature)
+                .or_default()
+                .push(GridRow { id, name, index });
+        }
+        let groups = by_feature
+            .into_iter()
+            .map(|(feature, mut rows)| {
+                rows.sort_by(|a, b| {
+                    (a.index.is_none(), a.index, &a.id).cmp(&(b.index.is_none(), b.index, &b.id))
+                });
+                FeatureGroup { feature, rows }
+            })
+            .collect();
+        Self { groups, columns }
     }
 
     /// Every problem cell across the grid, as `(slug, id, outcome, detail)`.
@@ -823,9 +910,26 @@ impl Grid {
         out
     }
 
-    const fn is_empty(&self) -> bool {
-        self.columns.is_empty() || self.ids.is_empty()
+    fn is_empty(&self) -> bool {
+        self.columns.is_empty() || self.groups.is_empty()
     }
+}
+
+/// Map each scenario `@id` → the name of the feature that ran it, from every
+/// input's `report.json`. The fallback used when a `platform.json` predates the
+/// `feature` field.
+fn id_features(inputs: &[(String, PathBuf)]) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for (_label, json_path) in inputs {
+        for f in parse_features(json_path) {
+            for el in &f.elements {
+                if let Some(id) = scenario_id(el) {
+                    map.entry(id).or_insert_with(|| f.name.clone());
+                }
+            }
+        }
+    }
+    map
 }
 
 /// Map each scenario's stable `@id` → whether it passed, from a `report.json`.
@@ -1236,31 +1340,39 @@ fn expectation_grid_html(inputs: &[(String, PathBuf)]) -> Markup {
             span.status-fail { "❌FAIL" } " regression · "
             "⚠️XPASS bug fixed here (stale entry) · · no data."
         }
-        table.stats {
-            thead {
-                tr {
-                    th { "Scenario" }
-                    @for col in &grid.columns {
-                        @let versions = col.versions.summary();
-                        th {
-                            (col.slug)
-                            @if !col.engine.is_empty() { br; small { (col.engine) } }
-                            @if !versions.is_empty() { br; small.versions { (versions) } }
+        // One table per feature, so a reader can scan a single area of the CLI
+        // instead of one undivided 60-row block.
+        @for group in &grid.groups {
+            h3.feature-heading { (group.feature) }
+            table.stats {
+                thead {
+                    tr {
+                        th { "Scenario" }
+                        @for col in &grid.columns {
+                            @let versions = col.versions.summary();
+                            th {
+                                (col.slug)
+                                @if !col.engine.is_empty() { br; small { (col.engine) } }
+                                @if !versions.is_empty() { br; small.versions { (versions) } }
+                            }
                         }
                     }
                 }
-            }
-            tbody {
-                @for id in &grid.ids {
-                    tr {
-                        td { code { (id) } }
-                        @for col in &grid.columns {
-                            @let outcome = col.outcomes.get(id).copied().unwrap_or(CellOutcome::Missing);
-                            // One combined class attr — `td.num class=(..)` would emit
-                            // two `class` attributes, and the browser keeps only the
-                            // first ("num"), dropping the status colour.
-                            td class=(format!("num {}", outcome.grid_class())) {
-                                (outcome.glyph())
+                tbody {
+                    @for row in &group.rows {
+                        tr {
+                            td {
+                                @if !row.name.is_empty() { (row.name) br; }
+                                code { (row.id) }
+                            }
+                            @for col in &grid.columns {
+                                @let outcome = col.outcomes.get(&row.id).copied().unwrap_or(CellOutcome::Missing);
+                                // One combined class attr — `td.num class=(..)` would emit
+                                // two `class` attributes, and the browser keeps only the
+                                // first ("num"), dropping the status colour.
+                                td class=(format!("num {}", outcome.grid_class())) {
+                                    (outcome.glyph())
+                                }
                             }
                         }
                     }
@@ -1313,36 +1425,52 @@ fn expectation_grid_markdown(
          ❌FAIL regression · ⚠️XPASS bug fixed here (stale entry) · · no data._\n\n",
     );
 
-    // Header: one column per platform, with its effective engine. Component
-    // versions live in the summary matrix above, not here.
-    out.push_str("| Scenario |");
-    for col in &grid.columns {
-        let eng = if col.engine.is_empty() {
-            String::new()
-        } else {
-            format!("<br><sub>{}</sub>", col.engine)
-        };
-        let _ = write!(out, " {}{} |", col.slug, eng);
-    }
-    out.push('\n');
-    out.push_str("|---|");
-    for _ in &grid.columns {
-        out.push_str(":--:|");
-    }
-    out.push('\n');
+    // One table per feature, under its own heading — a single undivided table of
+    // every scenario in the suite is unreadable, and gives no clue where one area
+    // of the CLI ends and the next begins.
+    for group in &grid.groups {
+        let _ = writeln!(out, "#### {}\n", group.feature);
 
-    for id in &grid.ids {
-        // Scenario cell: human name on top, the @id below as a link to its entry
-        // in the Scenario reference section (GitHub anchors `#### <id>` to `#<id>`).
-        let name = scenarios.get(id).map_or("", |(n, _)| n.as_str());
-        let _ = write!(out, "| {name}<br>[`{id}`](#{id}) |");
+        // Header: one column per platform, with its effective engine. Component
+        // versions live in the summary matrix above, not here.
+        out.push_str("| Scenario |");
         for col in &grid.columns {
-            let g = col
-                .outcomes
-                .get(id)
-                .copied()
-                .unwrap_or(CellOutcome::Missing);
-            let _ = write!(out, " {} |", g.glyph());
+            let eng = if col.engine.is_empty() {
+                String::new()
+            } else {
+                format!("<br><sub>{}</sub>", col.engine)
+            };
+            let _ = write!(out, " {}{} |", col.slug, eng);
+        }
+        out.push('\n');
+        out.push_str("|---|");
+        for _ in &grid.columns {
+            out.push_str(":--:|");
+        }
+        out.push('\n');
+
+        for row in &group.rows {
+            // Scenario cell: human name on top, the @id below as a link to its
+            // entry in the Scenario reference section (GitHub anchors
+            // `#### <id>` to `#<id>`). Prefer the name recorded in platform.json
+            // — it covers a scenario that was skipped everywhere and so has no
+            // report.json entry to read a name from.
+            let name = if row.name.is_empty() {
+                scenarios.get(&row.id).map_or("", |(n, _)| n.as_str())
+            } else {
+                row.name.as_str()
+            };
+            let id = &row.id;
+            let _ = write!(out, "| {name}<br>[`{id}`](#{id}) |");
+            for col in &grid.columns {
+                let g = col
+                    .outcomes
+                    .get(id)
+                    .copied()
+                    .unwrap_or(CellOutcome::Missing);
+                let _ = write!(out, " {} |", g.glyph());
+            }
+            out.push('\n');
         }
         out.push('\n');
     }
@@ -1379,9 +1507,9 @@ fn expectation_grid_markdown(
 }
 
 /// Render the Scenario reference section: each scenario `@id` with its actual
-/// Gherkin scenario (name + steps), anchored by the id (`#### <id>` → GitHub
-/// anchor `#<id>`) so the grid's id links resolve. Ordered by id for stability.
-/// Empty when no scenarios are known.
+/// Gherkin scenario (name + steps), anchored by the id (`##### <id>` → GitHub
+/// anchor `#<id>`) so the grid's id links resolve. Grouped by feature and ordered
+/// like the grid. Empty when no scenarios are known.
 fn scenario_reference_markdown(
     inputs: &[(String, PathBuf)],
     scenarios: &std::collections::BTreeMap<String, (String, Vec<String>)>,
@@ -1390,18 +1518,36 @@ fn scenario_reference_markdown(
 
     // Only emit when there is a grid to reference (platform.json sidecars present),
     // matching where the id links are generated.
-    if scenarios.is_empty() || Grid::build(inputs).is_empty() {
+    let grid = Grid::build(inputs);
+    if scenarios.is_empty() || grid.is_empty() {
         return String::new();
     }
 
+    // Walk the grid's own order so the reference is laid out feature by feature,
+    // matching the tables that link into it. Every grid row gets an entry — a
+    // scenario skipped on every platform has no steps to show, but still needs
+    // its anchor or the grid's link to it dangles.
     let mut out = String::from("\n### Scenario reference\n\n");
-    for (id, (name, steps)) in scenarios {
-        let _ = writeln!(out, "#### {id}\n");
-        let _ = writeln!(out, "_{name}_\n");
-        for step in steps {
-            let _ = writeln!(out, "- {step}");
+    for group in &grid.groups {
+        let _ = writeln!(out, "#### {}\n", group.feature);
+        for row in &group.rows {
+            let entry = scenarios.get(&row.id);
+            let name = entry.map_or(row.name.as_str(), |(n, _)| n.as_str());
+            let _ = writeln!(out, "##### {}\n", row.id);
+            if !name.is_empty() {
+                let _ = writeln!(out, "_{name}_\n");
+            }
+            match entry {
+                Some((_, steps)) => {
+                    for step in steps {
+                        let _ = writeln!(out, "- {step}");
+                    }
+                }
+                // Ran nowhere (n/a on every platform), so no steps were recorded.
+                None => out.push_str("_Not run on any platform in this run._\n"),
+            }
+            out.push('\n');
         }
-        out.push('\n');
     }
     out
 }
@@ -1914,6 +2060,9 @@ const STYLE: &str = r#"
   /* xfail: a known bug that failed as expected — a muted grey ✗, sibling to the red ✗. */
   .status-xfail { color: #9e9e9e; font-weight: 600; }
   .grid-legend { font-size: 0.82rem; color: #555; margin: -0.5rem 0 0.75rem; }
+  /* Feature heading above each sub-table of the expectation grid. */
+  .feature-heading { margin: 1.25rem 0 0.4rem; padding-bottom: 0.2rem; border-bottom: 1px solid #e0e0e0;
+                     color: #1565c0; }
 
   table.stats { width: 100%; border-collapse: collapse; margin-bottom: 1.5rem; font-size: 0.9rem; }
   table.stats th { background: #f5f5f5; padding: 6px 12px; text-align: left; border: 1px solid #ddd;
