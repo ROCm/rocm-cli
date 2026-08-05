@@ -909,7 +909,7 @@ impl Grid {
         out
     }
 
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.columns.is_empty() || self.groups.is_empty()
     }
 }
@@ -2514,6 +2514,130 @@ mod tests {
         std::fs::write(&report, report_json).expect("write report");
         std::fs::write(dir.path().join("platform.json"), platform_json).expect("write platform");
         (dir, report)
+    }
+
+    /// The order the grid renders rows in, flattened across feature groups.
+    fn grid_order(inputs: &[(String, PathBuf)]) -> Vec<(String, String)> {
+        Grid::build(inputs)
+            .groups
+            .iter()
+            .flat_map(|g| g.rows.iter().map(|r| (g.feature.clone(), r.id.clone())))
+            .collect()
+    }
+
+    #[test]
+    fn scenario_index_parses_the_per_feature_number() {
+        assert_eq!(scenario_index("serve-07 - A model responds"), Some(7));
+        assert_eq!(scenario_index("lifecycle-01 - Linux - a bundle"), Some(1));
+        // Unindexed names (older artifacts) have no number to sort by.
+        assert_eq!(scenario_index("A model responds"), None);
+        assert_eq!(scenario_index(""), None);
+    }
+
+    #[test]
+    fn grid_groups_by_feature_and_orders_by_index() {
+        // Declared deliberately out of order (and interleaved across features)
+        // so a passing assertion can only come from real grouping + sorting,
+        // not from the input order.
+        let report = feature_json(&[
+            (&["id:serve-b"], &["passed"]),
+            (&["id:examine-a"], &["passed"]),
+        ]);
+        let platform = r#"{
+            "platform_slug": "mock",
+            "capability": {"effective_serve_engine": "none"},
+            "expectations": [
+                {"id":"serve-b","feature":"Serving","scenario":"serve-02 - second","expected":"pass"},
+                {"id":"examine-a","feature":"Examine","scenario":"examine-09 - ninth","expected":"pass"},
+                {"id":"serve-a","feature":"Serving","scenario":"serve-01 - first","expected":"skip"},
+                {"id":"examine-b","feature":"Examine","scenario":"examine-10 - tenth","expected":"skip"}
+            ]
+        }"#;
+        let (_d, path) = write_platform(&report, platform);
+        let inputs = vec![("mock".to_string(), path)];
+
+        assert_eq!(
+            grid_order(&inputs),
+            vec![
+                ("Examine".to_string(), "examine-a".to_string()),
+                ("Examine".to_string(), "examine-b".to_string()),
+                ("Serving".to_string(), "serve-a".to_string()),
+                ("Serving".to_string(), "serve-b".to_string()),
+            ],
+            "rows must group by feature and sort by index (09 before 10, not \
+             lexically), regardless of declaration order",
+        );
+
+        // Each feature gets its own table under its own heading.
+        let md = consolidated_summary_markdown(&inputs);
+        assert!(
+            md.contains("#### Examine"),
+            "missing feature heading:\n{md}"
+        );
+        assert!(
+            md.contains("#### Serving"),
+            "missing feature heading:\n{md}"
+        );
+        // The human name is shown alongside the id, sourced from platform.json —
+        // serve-a was skipped everywhere, so report.json has no name for it.
+        assert!(
+            md.contains("serve-01 - first<br>[`serve-a`](#serve-a)"),
+            "skipped scenario should still show its name:\n{md}"
+        );
+    }
+
+    #[test]
+    fn grid_falls_back_to_report_feature_then_id_prefix() {
+        // A platform.json predating the `feature`/`scenario` fields. `serve-x`
+        // ran (so report.json knows its feature); `dash-y` was skipped
+        // everywhere, leaving only its id to group by.
+        let report = feature_json(&[(&["id:serve-x"], &["passed"])]);
+        let platform = r#"{
+            "platform_slug": "mock",
+            "capability": {"effective_serve_engine": "none"},
+            "expectations": [
+                {"id":"serve-x","effective_engine":"","expected":"pass"},
+                {"id":"dash-y","effective_engine":"","expected":"skip"}
+            ]
+        }"#;
+        let (_d, path) = write_platform(&report, platform);
+        let inputs = vec![("mock".to_string(), path)];
+
+        // `feature_json` names its feature "F"; the id prefix covers the rest.
+        assert_eq!(
+            grid_order(&inputs),
+            vec![
+                ("F".to_string(), "serve-x".to_string()),
+                ("dash".to_string(), "dash-y".to_string()),
+            ],
+            "an artifact with no feature field must still group, not vanish",
+        );
+    }
+
+    #[test]
+    fn scenario_reference_anchors_every_grid_row() {
+        // A scenario that is n/a everywhere has no report.json entry — it still
+        // needs an anchor, or the grid's link to it dangles.
+        let report = feature_json(&[(&["id:serve-x"], &["passed"])]);
+        let platform = r#"{
+            "platform_slug": "mock",
+            "capability": {"effective_serve_engine": "none"},
+            "expectations": [
+                {"id":"serve-x","feature":"Serving","scenario":"serve-01 - ran","expected":"pass"},
+                {"id":"serve-z","feature":"Serving","scenario":"serve-02 - skipped","expected":"skip"}
+            ]
+        }"#;
+        let (_d, path) = write_platform(&report, platform);
+        let md = consolidated_summary_markdown(&[("mock".to_string(), path)]);
+        assert!(md.contains("##### serve-x"), "missing anchor:\n{md}");
+        assert!(
+            md.contains("##### serve-z"),
+            "a never-run scenario still needs its anchor:\n{md}"
+        );
+        assert!(
+            md.contains("_Not run on any platform in this run._"),
+            "a never-run scenario should say so instead of showing no steps:\n{md}"
+        );
     }
 
     #[test]
