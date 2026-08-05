@@ -1,9 +1,9 @@
 # WIP: Fix CI self-hosted E2E lane timeout (offline runner holds concurrency group)
 
-**Stage:** 7-pre-pr-review — all review findings addressed & amended; awaiting re-review
+**Stage:** 7-pre-pr-review — all review findings addressed; committed as 0c884da (signed + signed-off); awaiting re-review
 **Pipeline:** lightweight
 **Branch:** fix-ci-selfhosted-lane-timeout
-**Pre-PR-check:** changes-requested → in review (post-amendment)
+**Pre-PR-check:** changes-requested → awaiting re-review @0c884da (all 6 findings addressed; F2 refuted with evidence)
 **Ticket:** EAI-7548 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7548
 **Last Updated:** 2026-08-04
 **Token Usage:** in=520 out=448k cache_create=2142379 cache_read=50790k calls=263

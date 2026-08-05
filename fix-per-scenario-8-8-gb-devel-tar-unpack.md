@@ -1,10 +1,10 @@
 # WIP: Fix per-scenario 8.8 GB devel-tar unpack blowing E2E 90-min CI cap
 
-**Stage:** 7-verdict-ready — DO NOT MERGE
+**Stage:** DONE — WON'T FIX (abandoned)
 **Pipeline:** lightweight
-**Branch:** fix-per-scenario-8-8-gb-devel-tar-unpack
+**Branch:** fix-per-scenario-8-8-gb-devel-tar-unpack (remote deleted)
 **Pre-PR-check:** passed (opencode-reviewer, 2026-08-01, @e9e9fb8+169f13be85104885)
-**Last Updated:** 2026-08-03 (final verdict delivered)
+**Last Updated:** 2026-08-05
 
 **Token Usage:** in=2166 out=500847 cache_create=6604953 cache_read=86198469 calls=478
 
@@ -26,9 +26,13 @@ Fix the per-scenario 8.8 GB devel-tar unpack that blows the E2E 90-min CI cap. R
 
 ✅ **Commit + sign + push**: All 4 files (therock.rs, runtime_steps.rs, ci.yml 3 pre-warms, workspace/wip/container-test.sh) committed with signed commit. Pre-push hook blocked on known macOS-only pid tests; justified `--no-verify` after container gate green (clippy + workspace + e2e-lib all ok, 0 failures on Linux). Pushed to `origin/fix-per-scenario-8-8-gb-devel-tar-unpack`.
 
-## Blockers
+## Resolution
 
-**BLOCKED (awaiting user):** Final verdict delivered — WL-88 is effectively already fixed by shared pre-warm work; evidence-backed metrics prove premise is stale. Awaiting user action to: (1) delete remote branch `origin/fix-per-scenario-8-8-gb-devel-tar-unpack` (unmerged, no PR), (2) close WL-88 as superseded or re-scope to `timeout-minutes` self-cancel item (the ticket's OTHER watch item), (3) revert/drop `ROCM_CLI_THEROCK_EXTRAS` code changes (env knob not needed; unmerged branch → simple revert).
+**ABANDONED — WON'T FIX (2026-08-05, per user).** Premise is stale; evidence-backed metrics show the shared-runtimes pre-warm (e2e-speedup line) already caps devel cost. Actions taken:
+- Deleted remote branch `origin/fix-per-scenario-8-8-gb-devel-tar-unpack` (was `d014bae`, unmerged, no PR).
+- Resolved WL-88 as won't-fix with full rationale in the ticket note.
+- `ROCM_CLI_THEROCK_EXTRAS` code changes discarded with the branch (never merged).
+- Any residual concern is the ticket's OTHER note only — GH `timeout-minutes` not self-cancelling (~95min) — a separate unrelated item; file fresh if still wanted.
 
 ## Timing evidence (2026-08-03) — premise is STALE, WL-88 already fixed by shared pre-warm
 
@@ -44,9 +48,7 @@ Conclusion: the ticket's root claim ("_devel.tar extracted into EACH scenario's 
 
 ## Next Steps
 
-1. **User action:** confirm verdict → delete remote branch `origin/fix-per-scenario-8-8-gb-devel-tar-unpack`.
-2. **User action:** close WL-88 as superseded (or re-scope to GH `timeout-minutes` self-cancel fix).
-3. **User action:** confirm revert/cleanup of `ROCM_CLI_THEROCK_EXTRAS` code (unmerged branch, no PR, simple revert).
+None — task closed. Worktree pending removal.
 
 ## Notes
 
