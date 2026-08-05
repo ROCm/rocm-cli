@@ -1,6 +1,6 @@
 # WIP: rocm fix fix-2-unset-override --dry-run panics rc=101
 
-**Stage:** 8-pre-pr-passed — ready for fres to open PR
+**Stage:** 8-pre-pr-passed
 **Pipeline:** lightweight
 **Branch:** rocm-fix-fix-2-unset-override-dry-run-panics-rc
 **Pre-PR-check:** passed — reviewer(opus pre-pr agent), 2026-08-05, @6b50809+1ab80552cd4d971a
