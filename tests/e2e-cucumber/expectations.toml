@@ -45,6 +45,14 @@ reason = "vLLM service reports ready (/v1/models 200) but POST /v1/chat/completi
 serve_timeout_secs = 90
 flaky = true
 
+# EAI-7423 is INTERMITTENT on this host as of 2026-08-05, not fixed: which of its
+# scenarios pass varies run to run (run 30995473578: 2 XPASS; run 30993213188:
+# 3 XPASS; run 30939967076: all 6). A deterministic-XPASS row fails the lane on
+# unrelated PRs, so every EAI-7423 lemonade-linux row below is `flaky = true` —
+# either outcome is tolerated while the bug stays open. See EAI-7853; if the
+# lemonade 11.5.1 upgrade turns out to fix EAI-7423, drop these rows outright
+# rather than leaving them flaky.
+
 # On a lemonade-native LINUX host (Strix Halo Ubuntu) the lemonade managed serve
 # loads the model and reaches ready on :8001, then is shut down ~0.08s later, so
 # the endpoint never becomes reachable (EAI-7423, root-caused on the box
@@ -56,6 +64,7 @@ when = { effective_engine = "lemonade", os = "linux" }
 bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so the endpoint never becomes reachable."
 serve_timeout_secs = 90
+flaky = true
 
 # On a lemonade-native LINUX host the served model's endpoint drops before
 # inference: the lemonade managed serve reaches ready then is shut down ~0.08s
@@ -66,6 +75,7 @@ when = { effective_engine = "lemonade", os = "linux" }
 bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so inference never succeeds."
 serve_timeout_secs = 90
+flaky = true
 
 # EAI-7333 (CLI healthcheck reports ready off /v1/models before inference works)
 # on the vLLM path. This scenario is FLAKY, not fixed: it XPASS'd on MI300X once
@@ -89,6 +99,7 @@ when = { effective_engine = "lemonade", os = "linux" }
 bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so the ready-to-serve contract fails."
 serve_timeout_secs = 90
+flaky = true
 
 # --- EAI-7423: on a lemonade LINUX host the managed serve reaches ready then is
 # shut down immediately, so inference never happens (root-caused on the box
@@ -100,6 +111,7 @@ when = { effective_engine = "lemonade", os = "linux" }
 bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so inference never succeeds."
 serve_timeout_secs = 90
+flaky = true
 
 # --- EAI-7223: chat requests with tool definitions rejected (vLLM path) ---
 [["chat-tool-definitions-accepted"]]
@@ -119,6 +131,7 @@ when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*" }
 bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so the chat request never reaches a live model."
 serve_timeout_secs = 90
+flaky = true
 
 # EAI-7221 (TUI chat sends hardcoded 'local-model' instead of querying /v1/models)
 # was previously mapped here as a vLLM-path xfail, but that bug is TUI-only and this
@@ -135,6 +148,7 @@ when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*" }
 bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so the chat request never reaches a live model."
 serve_timeout_secs = 90
+flaky = true
 
 # --- EAI-7383: `rocm help` lists subcommands in declaration order, not
 # alphabetically. Platform-independent (pure CLI help output). ---
