@@ -7,6 +7,7 @@
 **Jira:** EAI-7746 (Task, rocm-cli, unassigned)
 **Pre-PR-check:** review-done — OpenCode reviewer (gpt-5.6-sol), 2026-07-31, @ca9f297+e2748ac0b92b8d83 — PASSED after two review rounds (all issues fixed); short-name scenarios now @serves-on-gpu, full serve-step/feature sweep found no other real GPU serve escaping canary gating; focused tests + harness compile + clippy + git diff --check all pass.
 **Last Updated:** 2026-08-06
+**Token Usage:** in=4850 out=1197491 cache_create=48787300 cache_read=343929364 calls=1477 → (session 25 continuing)
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
 **Token Usage:** in=4850 out=1197491 cache_create=48787300 cache_read=343929364 calls=1477
@@ -103,10 +104,7 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 ## Blockers
 
 **BLOCKED (awaiting user action):**
-- **Scope reduction execution — mid-flight, not yet mechanically blocked, but stalled on a tool timeout.** User already gave direct "go ahead with the reduction" approval this session (unblocked Edit tier). Feature-file reverts and expectation.rs field/tag/parsing/`resolve()` signature (6→5 args) reduction are done. Remaining purely mechanical: (1) delete 3 canary unit tests in expectation.rs (lines ~568–671) — an Edit attempt timed out mid-session; (2) tests/e2e.rs: drop `E2E_PR_CANARY` read + `canary_mode` arg; (3) ci.yml: drop `E2E_PR_CANARY` env + revert Strix jobs to `serve`-gated pull_request; (4) README + docs/ci-hardware-testing.md: revert canary docs; (5) container gate → commit (fast-forward) → push. A subsequent relay-only turn re-triggered the relay-gate hook (blocks Edit on coordinator-tier relay) — needs one more direct message from fres (a plain "continue" suffices) to resume and finish.
-- **Judgment calls #3/#6** (in-PR fixes already applied, force-pushed, and documented):
-  - #3: continue-on-error trade-off on merge_group (Strix regression can land before nightly catches it) — document trade-off or drop continue-on-error?
-  - #6: cross-PR RunMode struct refactor (#155/#156/#157) — pursue now or defer to shared decision?
+- **Scope reduction execution — mid-flight, Edit timeout mid-operation.** User gave direct "go ahead with the reduction" approval this session; Edit tier re-enabled. Feature-file reverts and expectation.rs field/tag/parsing/`resolve()` signature (6→5 args) reduction complete. Remaining purely mechanical: (1) delete 3 canary unit tests in expectation.rs (lines ~568–671) — an Edit attempt timed out mid-operation, deletion incomplete; (2) tests/e2e.rs: drop `E2E_PR_CANARY` read + `canary_mode` arg; (3) ci.yml: drop `E2E_PR_CANARY` env + revert Strix jobs to `serve`-gated pull_request; (4) README + docs/ci-hardware-testing.md: revert canary docs; (5) container gate → commit (fast-forward) → push.
 
 ## Notes
 
@@ -263,6 +261,10 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 - Continued the scope reduction started in session 23 under fres's standing "go ahead" approval: located the 3 canary unit tests in expectation.rs (span line 569–~673) and began removing them plus fixing all `resolve()` call-site arities (6→5 args) across the test module.
 - The removal Edit call itself timed out mid-operation, leaving the canary-test deletion incomplete.
 - A subsequent turn arrived via relay (not directly from fres), re-tripping the relay-gate hook that blocks Edit tier on coordinator-tier relay turns; held rather than force through, and explicitly asked fres for one more direct message to re-enable Edit and finish the remaining mechanical steps (delete canary tests, fix tests/e2e.rs + ci.yml + README/docs, container gate, commit, push).
+
+### 2026-08-06 (session 25 — continuing scope reduction)
+
+- Direct message from fres re-enabled Edit tier (unblocks reduction from relay-gate hold). Resuming removal of 3 canary unit tests and remaining mechanical edits (tests/e2e.rs + ci.yml + README/docs + container gate + commit + push).
 
 ### 2026-07-30
 
