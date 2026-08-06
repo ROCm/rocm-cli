@@ -1,10 +1,10 @@
 # WIP: rocm fix fix-2-unset-override --dry-run panics rc=101
 
-**Stage:** 9-pr-opened-sign-off-pending — ON HOLD
+**Stage:** 9-pr-opened-sign-off-pending
 **Pipeline:** lightweight
 **Branch:** rocm-fix-fix-2-unset-override-dry-run-panics-rc
 **Pre-PR-check:** review-done (terminal) — reviewer(gpt-5.6-sol pre-PR agent), 2026-08-06, @09e1c08
-**Last Updated:** 2026-08-06
+**Last Updated:** 2026-08-06 (session 5)
 **Token Usage:** in=2793705 out=587718 cache_create=5825482 cache_read=91217817 calls=603
 
 **Gate Status:** GREEN. clippy clean, workspace/lib tests pass, and the full e2e suite ran; the single unexpected failure (`dash-managed-service-metrics`, a 30s-TTFT TUI timing scenario) was CONFIRMED a flake — it passes in isolation (scoped container re-run: 1 passed, 0 unexpected). Unrelated to the SIGPIPE change (touches only the engine-stdin write path). Revised fix committed `09e1c08` (signed) and pushed to origin.
@@ -108,3 +108,7 @@ Files:
 - fres opened PR #185 for this branch. CI checks: approved by juhovainio, all CI passing (e2e still pending), mergeable but 2 commits behind main.
 - Diagnosed blocking check failure: "Commit signatures + sign-off" failed. Both commits are GPG/SSH-signed but missing `Signed-off-by:` trailers; this repo requires both. 
 - Prepared rebase command (`git rebase --signoff origin/main`) to add trailers and clear BEHIND state. Confirmed force-push is fres's call (irreversible, externally visible); not running without explicit go-ahead. Task parked on hold awaiting fres's instruction.
+
+### 2026-08-06 (session 5)
+
+- Agent nudge: PR #185's blocking check finished and CI run completed. Re-verified status — nothing changed materially. Sign-off check still blocking; GPU E2E now finished (all green). Still awaiting fres's go-ahead to force-push the rebase.
