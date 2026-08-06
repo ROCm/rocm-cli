@@ -767,7 +767,10 @@ async fn when_install_http(world: &mut E2eWorld) {
     let dist_dir = st.dist_dir.clone();
     let install_dir = st.install_dir.clone();
     let public_key = st.public_key.clone();
-    let server = crate::e2e::lifecycle_steps::http::LoopbackServer::start(&dist_dir);
+    // The server lives in the library crate so it can be exercised by unit
+    // tests over real loopback sockets — including on Windows, where
+    // `cargo test --workspace` runs them — not only through this scenario.
+    let server = e2e_cucumber::loopback_http::LoopbackServer::start(&dist_dir);
     let base = server.base_url();
     let key_env = [(
         "ROCM_CLI_SIGNING_PUBLIC_KEY_PATH",
@@ -1215,14 +1218,4 @@ async fn then_xdg_gone(world: &mut E2eWorld) {
         let rocm_cli = dir.join("rocm-cli");
         assert_missing(&rocm_cli);
     }
-}
-
-// ── Loopback HTTP server (Windows HTTP install) ─────────────────────────
-
-pub mod http {
-    // The server itself lives in the library crate so it can be exercised by
-    // unit tests over real loopback sockets — including on Windows, where
-    // `cargo test --workspace` runs them — rather than only through the full
-    // E2E scenario.
-    pub use e2e_cucumber::loopback_http::LoopbackServer;
 }
