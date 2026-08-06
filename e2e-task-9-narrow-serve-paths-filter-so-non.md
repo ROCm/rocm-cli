@@ -9,7 +9,7 @@
 **Last Updated:** 2026-08-06 (session 21)
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=4764 out=1177645 cache_create=44851841 cache_read=326811778 calls=1433
+**Token Usage:** in=4786 out=1182373 cache_create=46320252 cache_read=330720842 calls=1444
 
 ---
 
@@ -103,8 +103,7 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 ## Blockers
 
 **BLOCKED (awaiting user action):**
-- **Canary mechanism reduction authorization** — Relay + rominf's independent re-review (2026-08-05 13:49) both confirm the same reduction is authorized: keep serve paths-filter + ci.yml honesty, drop @canary/@serves-on-gpu tags, canary_mode 6th bool, E2E_PR_CANARY, canary unit tests, merge_group-only Strix gating, README canary docs (defer scenario 6b @merge-queue flag to post-#157 rebase). Relay-gate hook blocks Edit tier on coordinator-tier relay (only permits own-branch commit/push, not Edit). Need your direct "go" here (not via relay) to proceed with source edits.
-  - **Cross-PR sequencing confirmed:** #157 still OPEN; whichever of #156/#157 lands first determines path forward (if #156 first, #157 becomes retag delta). Both now BEHIND main (23f14a3), need rebase regardless.
+- **Scope reduction execution** — Branch rebased onto current main (ec2bcb3); awaiting your direct word to proceed with source edits (canary mechanism reduction: keep serve paths-filter + ci.yml honesty, drop @canary/@serves-on-gpu tags, canary_mode 6th bool, E2E_PR_CANARY, canary unit tests, merge_group-only Strix gating, README canary docs). Relay-gate hook forbids Edit tier on coordinator-tier relay. Once you approve, will reduce scope, commit (fast-forward), and push.
 - **Judgment calls #3/#6** (in-PR fixes already applied, force-pushed, and documented):
   - #3: continue-on-error trade-off on merge_group (Strix regression can land before nightly catches it) — document trade-off or drop continue-on-error?
   - #6: cross-PR RunMode struct refactor (#155/#156/#157) — pursue now or defer to shared decision?
@@ -239,6 +238,11 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 - **Triply-confirmed:** fres's decision + relay + rominf's independent review all align on scope (keep paths-filter, drop canary tags/bool/env/tests/Strix merge_group gating/README docs). Reduction is fully scoped, ready to commit fast-forward (no force-push needed unless scope changes).
 - **Mechanical blocker:** relay-gate hook forbids source file edits on coordinator-tier relay; requires fres's direct "go" here (not via relay, which only permits commit/push tier).
 - Awaiting fres's direct authorization to proceed with source edits + rebase onto 23f14a3 + commit + push.
+
+### 2026-08-06 (session 21 — rebase onto current main)
+
+- Checked local tree state: clean, 2 commits ahead of remote (d7896c6 + ffbbc03), 2 behind main (current main tip is ec2bcb3 — #174 Windows loopback fix landed). Verified no overlap with new main commits on the 6 modified files.
+- Rebased branch cleanly onto ec2bcb3; both commits intact + signed. Updated branch state: 0 behind / 2 ahead, serve edits present. Did not push (would need force-push authorization on remote; rebase alone is not worth forcing; push deferred pending scope reduction decision).
 
 ### 2026-07-30
 
