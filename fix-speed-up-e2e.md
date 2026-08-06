@@ -9,7 +9,7 @@
 **Last Updated:** 2026-08-06
 **Pre-PR-check:** n/a (per-child)
 
-**Token Usage:** in=1032 out=319371 cache_create=5519110 cache_read=98238696 calls=522
+**Token Usage:** in=4128 out=420018 cache_create=7196842 cache_read=103854522 calls=629
 
 ---
 

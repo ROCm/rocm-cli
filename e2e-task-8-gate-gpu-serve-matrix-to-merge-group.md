@@ -1,10 +1,10 @@
 # WIP: E2E Task #8: gate GPU serve matrix to merge_group + keep a PR canary
 
-**Stage:** 8-await-review
+**Stage:** 7-gate
 **Pipeline:** lightweight
-**Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group (committed 0fd0aed, signed, rebased onto ad12ac7/main, force-pushed to remote)
-**PR:** https://github.com/ROCm/rocm-cli/pull/157 (OPEN on rebased head 0fd0aed; awaiting maintainer review; CI re-running on new head)
-**Pre-PR-check:** ✅ GATE CLEAR — rebase flake confirmed non-deterministic. dash-managed-service-metrics failed on first run (timing-sensitive TUI metric-render, 30s timeout) but passed clean on retry (3 xfail, 0 unexpected, 0 XPASS). Diff touches zero dash code. Flake was environmental, not regression. Force-pushed to update PR with rebased commit; CI re-running.
+**Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group (committed f308366, signed, rebased onto ec2bcb3/main incl. #174, force-pushed to remote)
+**PR:** https://github.com/ROCm/rocm-cli/pull/157 (OPEN on rebased head f308366; CI re-running (8 queued); reviewer request paused until CI green)
+**Pre-PR-check:** ✅ GATE CLEAR post-rebase-onto-#174 — container gate green (3 xfail, 0 XPASS, 0 unexpected; lib 64 pass; dash flake did NOT recur). Prior red was windows-build-and-test on 0fd0aed, which predated #174's loopback-server fix (now on main via ec2bcb3) — rebased onto it to clear that stale failure. My 4 files byte-identical across rebase; only base moved.
 **Last Updated:** 2026-08-06
 **Token Usage:** in=1788 out=546282 cache_create=14855253 cache_read=174513171 calls=909
 
