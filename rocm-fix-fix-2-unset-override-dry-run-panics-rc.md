@@ -1,13 +1,13 @@
 # WIP: rocm fix fix-2-unset-override --dry-run panics rc=101
 
-**Stage:** 8-pre-pr-passed
+**Stage:** 8-pre-pr-revise
 **Pipeline:** lightweight
 **Branch:** rocm-fix-fix-2-unset-override-dry-run-panics-rc
 **Pre-PR-check:** changes-requested — reviewer(gpt-5.6-sol pre-PR agent), 2026-08-06, @6b50809+1ab80552cd4d971a
 **Last Updated:** 2026-08-06
 **Token Usage:** in=2793297 out=228624 cache_create=3216985 cache_read=49097307 calls=399
 
-**Blockers:** BLOCKED (awaiting user): fres to open PR on main. Branch pushed to origin at 6b50809 (PR-createable).
+**Blockers:** None — revising per feedback in working tree.
 
 ---
 
@@ -79,3 +79,4 @@ Files:
 ### 2026-08-06
 
 - Guidance compliance review (Check guidance compliance agent) completed: no findings ≥80 confidence. Confirmed unsafe_code usage matches project convention (libc FFI with documented exception), workspace-level libc dependency correctly resolved, test file matches integration-test conventions, build/clippy/test all pass in clean clone. No AI/Claude references introduced; commit author verified. Four independent review passes remain (scheduled background).
+- Pre-PR reviewer (gpt-5.6-sol agent) issued `changes-requested` at 90 confidence. Implemented requested enhancement: `with_sigpipe_ignored()` helper to wrap engine stdin writes, allowing SIGPIPE to be temporarily ignored so stdout/stderr writes abort with SIGPIPE but stdin writes surface as `BrokenPipe` errors instead of signals. Applied to engine subprocess stdin path. Changes in working tree pending commit and re-review.
