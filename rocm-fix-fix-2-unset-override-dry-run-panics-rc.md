@@ -4,12 +4,12 @@
 **Pipeline:** lightweight
 **Branch:** rocm-fix-fix-2-unset-override-dry-run-panics-rc
 **Pre-PR-check:** review-done (terminal) — reviewer(gpt-5.6-sol pre-PR agent), 2026-08-06, @09e1c08
-**Last Updated:** 2026-08-06 (session 5)
-**Token Usage:** in=2793705 out=587718 cache_create=5825482 cache_read=91217817 calls=603
+**Last Updated:** 2026-08-06
+**Token Usage:** in=2793773 out=607550 cache_create=6658396 cache_read=99756391 calls=637
 
 **Gate Status:** GREEN. clippy clean, workspace/lib tests pass, and the full e2e suite ran; the single unexpected failure (`dash-managed-service-metrics`, a 30s-TTFT TUI timing scenario) was CONFIRMED a flake — it passes in isolation (scoped container re-run: 1 passed, 0 unexpected). Unrelated to the SIGPIPE change (touches only the engine-stdin write path). Revised fix committed `09e1c08` (signed) and pushed to origin.
 
-**Blockers:** None. fres authorized the rebase; done: `git rebase --signoff --gpg-sign origin/main` (both commits now signed AND signed-off, rebased onto current main → no longer BEHIND) then `--force-with-lease` push. New HEAD `9291469` (was 09e1c08); commits e075ace + 9291469. Approval PRESERVED (still APPROVED post-force-push). CI re-running on the new commits; the sign-off check should now pass. Merge remains fres's call.
+**Status:** Sign-off check now **PASSES** ✓. Approval PRESERVED post-force-push. Remaining CI (Coverage, Analyze/rust, TPN, clippy) still pending — none failing. PR #185 will be fully mergeable once final jobs finish. Merge remains fres's call.
 
 ---
 
@@ -69,7 +69,7 @@ Files:
 
 ## Next Steps
 
-1. fres rebase + force-push to add sign-off trailers: `git rebase --signoff origin/main && git push --force-with-lease origin rocm-fix-fix-2-unset-override-dry-run-panics-rc` (this also clears the BEHIND state). Then PR #185 will be mergeable.
+1. Wait for final CI jobs to finish (all pending, none failing). Once complete, PR #185 is fully mergeable and ready for fres to merge.
 
 ## Notes
 
@@ -113,3 +113,7 @@ Files:
 
 - Agent nudge: PR #185's blocking check finished and CI run completed. Re-verified status — nothing changed materially. Sign-off check still blocking; GPU E2E now finished (all green). Still awaiting fres's go-ahead to force-push the rebase.
 - fres said "rebase" → authorized. Verified clean tree + responsive signer (op-ssh-sign probe OK), then `git rebase --signoff --gpg-sign origin/main`: both commits re-signed AND stamped `Signed-off-by: fredespi`, replayed onto current main (0 behind). New SHAs e075ace + 9291469 (HEAD). Force-pushed with `--force-with-lease`; remote at 9291469. Confirmed juhovainio's APPROVED review survived the force-push. CI re-triggered on the new commits (sign-off check pending → expected to pass now). Merge stays fres's call.
+
+### 2026-08-06 (session 6)
+
+- Polled CI status on #185 after rebase — **sign-off check now PASSES** ✓. Remaining checks (Coverage, Analyze/rust, TPN, clippy) still pending, none red. Approval preserved. PR fully mergeable once final jobs finish; merge timing remains fres's decision.
