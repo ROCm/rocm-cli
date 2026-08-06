@@ -214,6 +214,7 @@ repository.
 | http | 1.4.2 | MIT OR Apache-2.0 |
 | http-body | 1.0.1 | MIT |
 | http-body-util | 0.1.3 | MIT |
+| http-range-header | 0.4.2 | MIT |
 | httparse | 1.10.1 | MIT OR Apache-2.0 |
 | httpdate | 1.0.3 | MIT OR Apache-2.0 |
 | humantime | 2.4.0 | MIT OR Apache-2.0 |

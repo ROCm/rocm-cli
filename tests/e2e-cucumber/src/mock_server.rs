@@ -2,7 +2,6 @@
 //
 // SPDX-License-Identifier: MIT
 
-use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,7 +12,8 @@ use axum::extract::State;
 use axum::response::Json;
 use axum::routing::{get, post};
 use serde_json::{Value, json};
-use tokio::net::TcpListener;
+
+use crate::http_server::{self, ServerHandle};
 
 /// How often [`MockServer::wait_for_chat_request`] re-checks the captured
 /// request while waiting for the client to POST.
@@ -103,19 +103,11 @@ vllm:time_per_output_token_seconds_count{{model=\"mock\"}} {tpot_count}
     }
 }
 
+#[derive(Debug)]
 pub struct MockServer {
-    addr: SocketAddr,
-    shutdown: tokio::sync::oneshot::Sender<()>,
+    server: ServerHandle,
     /// Shared with the running server's `ServerState`; see the field doc there.
     last_chat_request: Arc<Mutex<Option<Value>>>,
-}
-
-impl std::fmt::Debug for MockServer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MockServer")
-            .field("addr", &self.addr)
-            .finish_non_exhaustive()
-    }
 }
 
 impl MockServer {
@@ -151,33 +143,23 @@ impl MockServer {
         }
         let app = app.with_state(state);
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-
-        tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    rx.await.ok();
-                })
-                .await
-                .ok();
-        });
-
         Self {
-            addr,
-            shutdown: tx,
+            server: http_server::spawn(app).await,
             last_chat_request,
         }
     }
 
+    /// The OpenAI-compatible API root (`.../v1`) the CLI is pointed at.
     pub fn base_url(&self) -> String {
-        format!("http://{}/v1", self.addr)
+        self.server
+            .url()
+            .join("v1")
+            .expect("v1 is a valid relative path")
+            .to_string()
     }
 
     pub const fn port(&self) -> u16 {
-        self.addr.port()
+        self.server.port()
     }
 
     /// The most recently received `/v1/chat/completions` request body, if any
@@ -209,8 +191,10 @@ impl MockServer {
         }
     }
 
+    /// Shut the server down explicitly. Equivalent to dropping it — the
+    /// handle stops the server on drop — but says so at the call site.
     pub fn stop(self) {
-        self.shutdown.send(()).ok();
+        drop(self);
     }
 }
 
@@ -277,7 +261,10 @@ pub fn write_service_record_with(
         "canonical_model_id": model,
         "host": "127.0.0.1",
         "port": port,
-        "endpoint_url": format!("http://127.0.0.1:{port}/v1"),
+        "endpoint_url": http_server::loopback_url(port)
+            .join("v1")
+            .expect("v1 is a valid relative path")
+            .to_string(),
         "mode": "managed",
         "status": options.status,
         "startup_phase": options.startup_phase,

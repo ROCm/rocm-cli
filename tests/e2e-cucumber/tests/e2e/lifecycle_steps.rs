@@ -767,7 +767,10 @@ async fn when_install_http(world: &mut E2eWorld) {
     let dist_dir = st.dist_dir.clone();
     let install_dir = st.install_dir.clone();
     let public_key = st.public_key.clone();
-    let server = crate::e2e::lifecycle_steps::http::LoopbackServer::start(&dist_dir);
+    // The server lives in the library crate so it can be exercised by unit
+    // tests over real loopback sockets — including on Windows, where
+    // `cargo test --workspace` runs them — not only through this scenario.
+    let server = e2e_cucumber::loopback_http::LoopbackServer::start(&dist_dir);
     let base = server.base_url();
     let key_env = [(
         "ROCM_CLI_SIGNING_PUBLIC_KEY_PATH",
@@ -1214,111 +1217,5 @@ async fn then_xdg_gone(world: &mut E2eWorld) {
         // remain but its rocm-cli subtree must be gone.
         let rocm_cli = dir.join("rocm-cli");
         assert_missing(&rocm_cli);
-    }
-}
-
-// ── Loopback HTTP server (Windows HTTP install) ─────────────────────────
-
-pub mod http {
-    use std::io::Write;
-    use std::net::{TcpListener, TcpStream};
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::thread::JoinHandle;
-
-    /// A minimal loopback HTTP file server serving one directory, for the Windows
-    /// native-HTTP install scenario. Shuts down on drop.
-    pub struct LoopbackServer {
-        port: u16,
-        stop: Arc<AtomicBool>,
-        handle: Option<JoinHandle<()>>,
-    }
-
-    impl LoopbackServer {
-        pub fn start(root: &Path) -> Self {
-            let listener =
-                TcpListener::bind("127.0.0.1:0").expect("failed to bind loopback listener");
-            listener
-                .set_nonblocking(true)
-                .expect("failed to set non-blocking");
-            let port = listener.local_addr().expect("no local addr").port();
-            let stop = Arc::new(AtomicBool::new(false));
-            let root = root.to_path_buf();
-            let stop_thread = Arc::clone(&stop);
-            let handle = std::thread::spawn(move || serve(&listener, &root, &stop_thread));
-            Self {
-                port,
-                stop,
-                handle: Some(handle),
-            }
-        }
-
-        pub fn base_url(&self) -> String {
-            format!("http://127.0.0.1:{}", self.port)
-        }
-    }
-
-    impl Drop for LoopbackServer {
-        fn drop(&mut self) {
-            self.stop.store(true, Ordering::Relaxed);
-            if let Some(handle) = self.handle.take() {
-                let _ = handle.join();
-            }
-        }
-    }
-
-    fn serve(listener: &TcpListener, root: &Path, stop: &Arc<AtomicBool>) {
-        while !stop.load(Ordering::Relaxed) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let _ = handle_conn(stream, root);
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                Err(_) => break,
-            }
-        }
-    }
-
-    fn handle_conn(mut stream: TcpStream, root: &Path) -> std::io::Result<()> {
-        // Read until the full request head arrives, not just whatever a single
-        // read() call happened to return: a client (or the OS network stack)
-        // is free to deliver the request across more than one TCP segment, and
-        // a one-shot read previously misparsed a split request as `GET /`,
-        // 404-ing a legitimate download. See `e2e_cucumber::loopback_http`.
-        let head = e2e_cucumber::loopback_http::read_request_head(&mut stream)?;
-        let path = e2e_cucumber::loopback_http::parse_request_path(&head);
-        let relative = path.trim_start_matches('/');
-        let file = safe_join(root, relative);
-        match file.and_then(|f| std::fs::read(&f).ok()) {
-            Some(bytes) => {
-                let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    bytes.len()
-                );
-                stream.write_all(header.as_bytes())?;
-                stream.write_all(&bytes)?;
-            }
-            None => {
-                stream.write_all(
-                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )?;
-            }
-        }
-        stream.flush()
-    }
-
-    /// Join a request path under `root`, rejecting any traversal so a malformed
-    /// request cannot read outside the served directory.
-    fn safe_join(root: &Path, relative: &str) -> Option<PathBuf> {
-        if relative.is_empty() {
-            return None;
-        }
-        let candidate = root.join(relative);
-        let root = root.canonicalize().ok()?;
-        let candidate = candidate.canonicalize().ok()?;
-        candidate.starts_with(&root).then_some(candidate)
     }
 }
