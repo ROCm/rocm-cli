@@ -123,3 +123,7 @@ Files:
 - Monitored final CI jobs. All standard checks (Coverage, Analyze/rust, TPN, clippy) passed GREEN ✓. "E2E tests (GPU)" initially FAILED in 1s with runner infra error (`System.ArgumentNullException: configuredSettings`), not a code issue — self-hosted GPU runner misconfigured/unregistered.
 - Waited for full run to complete, then re-ran failed GPU job (`--failed` flag). GPU E2E now re-queued/pending for retry.
 - If re-run fails with same infra error again, indicates runner-provisioning issue (not this fix) — flagged for manual investigation, not a code regression.
+
+### 2026-08-06 (session 8)
+
+- Confirmed GPU E2E re-run progressed past the transient infra failure (now pending/running, not instant 1s fail). Multi-minute self-hosted job in flight. PR mergeable upon completion with green GPU result. Awaiting job to finish.
