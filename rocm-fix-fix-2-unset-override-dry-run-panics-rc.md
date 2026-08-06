@@ -4,7 +4,7 @@
 **Pipeline:** lightweight
 **Branch:** rocm-fix-fix-2-unset-override-dry-run-panics-rc
 **Pre-PR-check:** review-done (terminal) — reviewer(gpt-5.6-sol pre-PR agent), 2026-08-06, @09e1c08
-**Last Updated:** 2026-08-06
+**Last Updated:** 2026-08-06 (session 10)
 **Token Usage:** in=2793837 out=619301 cache_create=7720260 cache_read=108033802 calls=669
 
 **Gate Status:** GREEN. clippy clean, workspace/lib tests pass, and the full e2e suite ran; the single unexpected failure (`dash-managed-service-metrics`, a 30s-TTFT TUI timing scenario) was CONFIRMED a flake — it passes in isolation (scoped container re-run: 1 passed, 0 unexpected). Unrelated to the SIGPIPE change (touches only the engine-stdin write path). Revised fix committed `09e1c08` (signed) and pushed to origin.
@@ -135,3 +135,7 @@ Files:
 - GPU E2E failed again (0s) with the identical infra error (`System.ArgumentNullException: configuredSettings` in GitHub.Runner ConfigurationStore.GetSettings). Same failure signature twice = persistent runner-provisioning issue, not transient or code-related. Confirmed retrying again is pointless.
 - Documented blocker: app-dev-gpu self-hosted runner is unregistered/misconfigured; requires restore-app-dev-runner skill (shared cluster infra, fres's decision). Once runner is healthy, GPU job can be re-run.
 - All other PR #185 status remains green: sign-off ✓, standard CI ✓, approval ✓, mergeable. Merge timing is fres's call.
+
+### 2026-08-06 (session 10)
+
+- Agent nudge received while waiting on GPU runner. No new progress possible without fres's action on the runner setup. Confirmed blocker status unchanged; WIP synced.
