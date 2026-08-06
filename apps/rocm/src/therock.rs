@@ -34,6 +34,12 @@ const STARTUP_UPDATE_CHECK_INTERVAL_MS: u128 = 12 * 60 * 60 * 1_000;
 const STARTUP_UPDATE_CHECK_TIMEOUT_SECS: u64 = 2;
 /// Timeout for the best-effort HEAD probe that sizes a download before starting it.
 const THEROCK_HEAD_PROBE_TIMEOUT_SECS: u64 = 10;
+/// Largest `Content-Length` accepted as a real SDK tarball size.
+///
+/// SDK tarballs are single-digit gigabytes; anything past this is a
+/// misconfigured proxy or a hostile header rather than a real artifact, and
+/// must not be allowed to refuse an install on its own authority.
+const THEROCK_MAX_PLAUSIBLE_TARBALL_BYTES: u64 = 256 * 1024 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TheRockChannel {
     Release,
@@ -1061,7 +1067,9 @@ fn install_tarball_runtime(
         );
     }
 
-    preflight_tarball_space(&artifact.url, &cache_path, &install_root)?;
+    if let Some(warning) = preflight_tarball_space(&artifact.url, &cache_path, &install_root)? {
+        let _ = writeln!(output, "  {warning}");
+    }
 
     download_file(&artifact.url, &cache_path)?;
     extract_tarball(&cache_path, &install_root)?;
@@ -2104,14 +2112,25 @@ fn download_file(url: &str, destination: &Path) -> Result<()> {
 /// omits `Content-Length` simply skips the preflight instead of blocking the
 /// install.
 fn head_content_length(url: &str) -> Option<u64> {
+    let timeout = Duration::from_secs(THEROCK_HEAD_PROBE_TIMEOUT_SECS);
     let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(THEROCK_HEAD_PROBE_TIMEOUT_SECS))
+        // `timeout_connect` takes precedence over `timeout` and defaults to 30s,
+        // so without it a host that blackholes rather than refuses would stall
+        // the probe well past the intended ceiling.
+        .timeout_connect(timeout)
+        .timeout(timeout)
         .build();
     let response = agent.head(url).set("User-Agent", "rocm-cli").call().ok()?;
     if response.status() != 200 {
         return None;
     }
-    response.header("Content-Length")?.trim().parse().ok()
+    let length: u64 = response.header("Content-Length")?.trim().parse().ok()?;
+    // The header is unauthenticated and is never cross-checked against the body
+    // the subsequent GET delivers, so an inflated value from a proxy or CDN
+    // would refuse an install that would in fact succeed. Treat an implausible
+    // size as no answer at all: the preflight is skipped and `download_file`
+    // still checks the real, buffered body length before writing.
+    (length <= THEROCK_MAX_PLAUSIBLE_TARBALL_BYTES).then_some(length)
 }
 
 /// Refuse (or warn) before a multi-GB SDK tarball download and extraction.
@@ -2122,9 +2141,17 @@ fn head_content_length(url: &str) -> Option<u64> {
 /// [`disk_space::EXTRACTED_SIZE_MULTIPLIER`]), so a shortfall there is a
 /// warning: a false refusal that blocks a valid install would be worse than a
 /// late failure.
-fn preflight_tarball_space(url: &str, cache_path: &Path, install_root: &Path) -> Result<()> {
+///
+/// Any extraction warning is returned rather than printed, so the caller can
+/// place it in the same accumulated output block as the rest of the install
+/// report instead of having it appear ahead of that block.
+fn preflight_tarball_space(
+    url: &str,
+    cache_path: &Path,
+    install_root: &Path,
+) -> Result<Option<String>> {
     let Some(download_bytes) = head_content_length(url) else {
-        return Ok(());
+        return Ok(None);
     };
     disk_space::ensure_space_for(
         "download the SDK tarball",
@@ -2138,14 +2165,11 @@ fn preflight_tarball_space(url: &str, cache_path: &Path, install_root: &Path) ->
     if disk_space::on_same_filesystem(cache_path, install_root) == Some(true) {
         extract_estimate = extract_estimate.saturating_add(download_bytes);
     }
-    if let Some(warning) = disk_space::warn_if_low_space(
+    Ok(disk_space::warn_if_low_space(
         "extract the SDK tarball",
         install_root,
         disk_space::with_margin(extract_estimate),
-    ) {
-        progress_line(warning);
-    }
-    Ok(())
+    ))
 }
 
 fn http_get(
@@ -2273,6 +2297,14 @@ fn extract_tarball(archive_path: &Path, target_dir: &Path) -> Result<()> {
         ],
         "extract TheRock tarball artifact",
     )
+    .map_err(|error| {
+        // The extraction preflight only warns, because the extracted size is an
+        // estimate. When that warning turns out to be right, the failure arrives
+        // as `tar` stderr rather than an `io::Error`, so it never reaches
+        // `map_write_error` — without this the user gets the raw
+        // "tar: ...: No space left on device" this feature exists to replace.
+        disk_space::subprocess_full_disk_error(&format!("{error:#}"), target_dir).unwrap_or(error)
+    })
 }
 
 fn ensure_uv_venv(uv: &Path, python_launcher: &Path, install_root: &Path) -> Result<()> {
@@ -3249,8 +3281,12 @@ mod tests {
     fn tarball_space_preflight_skips_when_the_download_size_is_unknown() {
         // No HEAD response (unroutable host) must not block an install.
         let temp = std::env::temp_dir();
-        preflight_tarball_space("http://127.0.0.1:1/rocm.tar.gz", &temp, &temp)
+        let warning = preflight_tarball_space("http://127.0.0.1:1/rocm.tar.gz", &temp, &temp)
             .expect("an unknown download size must not fail the preflight");
+        assert_eq!(
+            warning, None,
+            "an unknown download size must not produce an extraction warning either"
+        );
     }
 
     #[test]
@@ -3258,8 +3294,9 @@ mod tests {
         let archive = 2 * 1024 * 1024 * 1024;
         assert_eq!(
             disk_space::with_margin(archive),
-            archive + disk_space::SPACE_MARGIN_BYTES
+            archive + archive / disk_space::SPACE_MARGIN_DIVISOR
         );
+        assert!(disk_space::with_margin(archive) > archive);
     }
 
     #[test]
