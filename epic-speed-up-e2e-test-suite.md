@@ -6,7 +6,7 @@
 **Pre-PR-check:** none
 **Last Updated:** 2026-08-06
 
-**Token Usage:** in=120 out=82581 cache_create=450428 cache_read=7697262 calls=63
+**Token Usage:** in=120 out=82581 cache_create=450428 cache_read=7697262 calls=63 → refreshed 2026-08-06
 
 ---
 
