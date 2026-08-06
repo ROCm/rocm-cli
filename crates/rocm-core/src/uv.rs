@@ -64,6 +64,82 @@ pub fn uv_http_timeout_secs() -> u64 {
 /// Environment variable `uv` reads to locate its content-addressed cache.
 pub const UV_CACHE_DIR_ENV: &str = "UV_CACHE_DIR";
 
+/// Environment variable used to place the `uv` cache explicitly.
+///
+/// Namespaced like the other rocm-cli knobs in this module so that a `UV_CACHE_DIR` a
+/// developer exported for unrelated Python work is distinguishable from a deliberate
+/// choice about rocm-cli.
+pub const UV_CACHE_DIR_OVERRIDE_ENV: &str = "ROCM_CLI_UV_CACHE_DIR";
+
+/// Where the `uv` cache for a spawned command comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UvCacheSource {
+    /// Derived from the managed data directory.
+    Managed(PathBuf),
+    /// Set explicitly via [`UV_CACHE_DIR_OVERRIDE_ENV`].
+    Override(PathBuf),
+    /// Inherited from an ambient [`UV_CACHE_DIR_ENV`] in the environment.
+    Inherited(PathBuf),
+}
+
+impl UvCacheSource {
+    /// The cache directory this source resolves to.
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Managed(path) | Self::Override(path) | Self::Inherited(path) => path,
+        }
+    }
+
+    /// Whether the managed colocation was bypassed, so callers can report it.
+    pub const fn is_override(&self) -> bool {
+        !matches!(self, Self::Managed(_))
+    }
+}
+
+/// Resolve the `uv` cache directory from the managed paths and the two override
+/// variables.
+///
+/// Precedence: [`UV_CACHE_DIR_OVERRIDE_ENV`] (a deliberate rocm-cli choice), then an
+/// ambient [`UV_CACHE_DIR_ENV`] (kept so the e2e harness can share one cache across
+/// scenarios), then the managed location beside the environments `uv` populates.
+///
+/// Blank and whitespace-only values are ignored in both cases, matching `uv_version` and
+/// `env_secs` in this module — `UV_CACHE_DIR="   "` is a leftover, not a choice.
+pub fn uv_cache_source(paths: &AppPaths) -> UvCacheSource {
+    resolve_uv_cache_source(
+        paths,
+        std::env::var_os(UV_CACHE_DIR_OVERRIDE_ENV).as_deref(),
+        std::env::var_os(UV_CACHE_DIR_ENV).as_deref(),
+    )
+}
+
+fn resolve_uv_cache_source(
+    paths: &AppPaths,
+    override_dir: Option<&OsStr>,
+    inherited_dir: Option<&OsStr>,
+) -> UvCacheSource {
+    if let Some(value) = meaningful_cache_dir(override_dir) {
+        return UvCacheSource::Override(value);
+    }
+    if let Some(value) = meaningful_cache_dir(inherited_dir) {
+        return UvCacheSource::Inherited(value);
+    }
+    UvCacheSource::Managed(managed_uv_cache_dir(&paths.data_dir))
+}
+
+/// A cache path is meaningful only when it is present and not blank. `OsStr` has no
+/// `trim`, so trimming is done on the lossy view and the original value is kept when it
+/// survives — a path is never silently rewritten.
+fn meaningful_cache_dir(value: Option<&OsStr>) -> Option<PathBuf> {
+    let value = value?;
+    let trimmed = value.to_string_lossy();
+    let trimmed = trimmed.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
 /// Environment pairs to apply when spawning `uv`.
 ///
 /// Network behavior is configured consistently (uv reads `UV_HTTP_TIMEOUT` rather than
@@ -73,30 +149,25 @@ pub const UV_CACHE_DIR_ENV: &str = "UV_CACHE_DIR";
 /// Without a cache inside the managed root, `uv` caches under `$HOME/.cache/uv`; when
 /// that is on a different filesystem from the data directory, `uv` cannot hardlink and
 /// silently copies every file, so each environment carries a full duplicate of the SDK
-/// and torch stack. An `UV_CACHE_DIR` already present in the environment is a deliberate
-/// choice (the e2e harness shares one cache across scenarios) and is left alone.
+/// and torch stack.
+///
+/// Note this colocates with the *data directory*, not with a `--prefix` install root; see
+/// the `--prefix` caveat in `docs/manual-testing.md`.
 pub fn uv_command_env(paths: &AppPaths) -> Vec<(String, String)> {
-    let inherited = std::env::var_os(UV_CACHE_DIR_ENV).filter(|value| !value.is_empty());
-    uv_command_env_with_inherited_cache(paths, inherited.as_deref())
+    uv_command_env_for_cache(uv_cache_source(paths))
 }
 
-fn uv_command_env_with_inherited_cache(
-    paths: &AppPaths,
-    inherited_cache_dir: Option<&OsStr>,
-) -> Vec<(String, String)> {
-    let mut env = vec![(
-        "UV_HTTP_TIMEOUT".to_owned(),
-        uv_http_timeout_secs().to_string(),
-    )];
-    if inherited_cache_dir.is_none() {
-        env.push((
+fn uv_command_env_for_cache(cache: UvCacheSource) -> Vec<(String, String)> {
+    vec![
+        (
+            "UV_HTTP_TIMEOUT".to_owned(),
+            uv_http_timeout_secs().to_string(),
+        ),
+        (
             UV_CACHE_DIR_ENV.to_owned(),
-            managed_uv_cache_dir(&paths.data_dir)
-                .to_string_lossy()
-                .into_owned(),
-        ));
-    }
-    env
+            cache.path().to_string_lossy().into_owned(),
+        ),
+    ]
 }
 
 /// Arguments for `uv venv`, creating an environment at `env_root` using `python`.
@@ -416,7 +487,7 @@ mod tests {
     #[test]
     fn command_env_cache_dir_is_derived_from_data_dir() {
         let paths = test_paths("/managed/root");
-        let env = uv_command_env_with_inherited_cache(&paths, None);
+        let env = uv_command_env_for_cache(resolve_uv_cache_source(&paths, None, None));
         assert_eq!(
             cache_dir_in(&env),
             Some(
@@ -429,21 +500,82 @@ mod tests {
     }
 
     #[test]
-    fn command_env_keeps_an_explicit_cache_dir() {
+    fn command_env_keeps_an_inherited_cache_dir() {
         // The e2e harness sets UV_CACHE_DIR to share one cache across scenarios; a user can
         // do the same. Such a choice must be inherited, not overridden.
         let paths = test_paths("/managed/root");
-        let env = uv_command_env_with_inherited_cache(&paths, Some(OsStr::new("/shared/uv-cache")));
-        assert_eq!(cache_dir_in(&env), None);
+        let source = resolve_uv_cache_source(&paths, None, Some(OsStr::new("/shared/uv-cache")));
+        assert_eq!(
+            source,
+            UvCacheSource::Inherited(PathBuf::from("/shared/uv-cache"))
+        );
+        assert_eq!(
+            cache_dir_in(&uv_command_env_for_cache(source)),
+            Some("/shared/uv-cache".to_owned())
+        );
     }
 
     #[test]
-    fn command_env_cache_dir_follows_a_relocated_data_dir() {
-        let default_root = test_paths("/home/user/.rocm");
-        let moved_root = test_paths("/mnt/big/rocm");
-        assert_ne!(
-            cache_dir_in(&uv_command_env_with_inherited_cache(&default_root, None)),
-            cache_dir_in(&uv_command_env_with_inherited_cache(&moved_root, None))
+    fn namespaced_override_wins_over_an_ambient_uv_cache_dir() {
+        // ROCM_CLI_UV_CACHE_DIR is the rocm-cli knob; a bare UV_CACHE_DIR may just be
+        // exported for unrelated Python work, so the namespaced one takes precedence.
+        let paths = test_paths("/managed/root");
+        let source = resolve_uv_cache_source(
+            &paths,
+            Some(OsStr::new("/chosen/uv-cache")),
+            Some(OsStr::new("/ambient/uv-cache")),
+        );
+        assert_eq!(
+            source,
+            UvCacheSource::Override(PathBuf::from("/chosen/uv-cache"))
+        );
+        assert!(source.is_override());
+    }
+
+    #[test]
+    fn blank_cache_overrides_fall_back_to_the_managed_location() {
+        // The boundary the env read actually has to survive: unset, empty, and
+        // whitespace-only all mean "no choice was made".
+        let paths = test_paths("/managed/root");
+        let managed = UvCacheSource::Managed(managed_uv_cache_dir(&paths.data_dir));
+        for blank in ["", "   ", "\t\n"] {
+            assert_eq!(
+                resolve_uv_cache_source(&paths, Some(OsStr::new(blank)), None),
+                managed,
+                "blank ROCM_CLI_UV_CACHE_DIR {blank:?} should not count as an override"
+            );
+            assert_eq!(
+                resolve_uv_cache_source(&paths, None, Some(OsStr::new(blank))),
+                managed,
+                "blank UV_CACHE_DIR {blank:?} should not count as an override"
+            );
+        }
+        assert!(!managed.is_override());
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed_from_a_cache_override() {
+        let paths = test_paths("/managed/root");
+        assert_eq!(
+            resolve_uv_cache_source(&paths, Some(OsStr::new("  /chosen/uv-cache \n")), None),
+            UvCacheSource::Override(PathBuf::from("/chosen/uv-cache"))
+        );
+    }
+
+    #[test]
+    fn managed_cache_dir_tracks_rocm_cli_data_dir() {
+        // AppPaths::with_managed_root is how ROCM_CLI_DATA_DIR reaches the cache, so
+        // exercise that path rather than two hand-built AppPaths.
+        let moved = test_paths("/home/user/.rocm").with_managed_root("/mnt/big/rocm", false);
+        let source = resolve_uv_cache_source(&moved, None, None);
+        assert_eq!(
+            source,
+            UvCacheSource::Managed(managed_uv_cache_dir(&moved.data_dir))
+        );
+        assert!(
+            source.path().starts_with("/mnt/big/rocm"),
+            "cache {} should sit under the relocated data dir",
+            source.path().display()
         );
     }
 

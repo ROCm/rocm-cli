@@ -42,7 +42,7 @@ use rocm_core::{
     read_tcp_stream_to_string, resolve_builtin_model_recipe, resolve_model_recipe,
     runtime_install_root_is_protected, runtime_path_is_same_or_inside,
     runtime_python_activation_hint, runtime_python_env_bin_dir, runtime_python_executable_in_env,
-    shell_command_for_host, write_all_tcp_stream,
+    shell_command_for_host, uv_cache_source, write_all_tcp_stream,
 };
 use rocm_engine_protocol::{
     DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy,
@@ -435,10 +435,12 @@ rocm logs --search error timeout")]
         /// Keep saved settings.
         #[arg(long)]
         keep_config: bool,
-        /// Keep app data such as logs, services, and engines.
+        /// Keep app data such as logs, services, engines, and the uv package cache
+        /// (often the largest directory rocm-cli manages).
         #[arg(long)]
         keep_data: bool,
-        /// Keep caches.
+        /// Keep caches under the cache directory. Does not cover the uv package cache,
+        /// which lives under the data directory; use --keep-data for that.
         #[arg(long)]
         keep_cache: bool,
         /// Allow removing development binaries inside the current build tree.
@@ -938,6 +940,7 @@ fn main() -> Result<()> {
         .and_then(|paths| logging::init(&paths));
 
     maybe_migrate_legacy_dashboard_config();
+    maybe_notice_legacy_uv_cache();
 
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     if raw_args.is_empty() {
@@ -966,6 +969,54 @@ fn main() -> Result<()> {
     }
 
     dispatch(Cli::parse())
+}
+
+/// Legacy `uv` cache location, used before the cache was colocated with the managed
+/// data directory. Kept relative so the check works on every platform's home dir.
+const LEGACY_UV_CACHE_RELATIVE: [&str; 2] = [".cache", "uv"];
+
+/// One-shot notice that a pre-colocation `uv` cache is still occupying space at the
+/// default `uv` location. Nothing is migrated or deleted: the cache is
+/// content-addressed and may be shared with unrelated `uv` projects on the machine, so
+/// removing it is the user's call. Silent when the managed cache does not exist yet
+/// (nothing has moved) or when an override is in effect.
+fn maybe_notice_legacy_uv_cache() {
+    let Ok(paths) = AppPaths::discover() else {
+        return;
+    };
+    let cache = uv_cache_source(&paths);
+    if cache.is_override() {
+        return;
+    }
+    // Only worth mentioning once the managed cache is actually in use; otherwise the
+    // legacy directory is simply the cache still being used by other tools.
+    if !cache.path().is_dir() {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+    else {
+        return;
+    };
+    let legacy = LEGACY_UV_CACHE_RELATIVE
+        .iter()
+        .fold(home, |dir, part| dir.join(part));
+    if !legacy.is_dir() {
+        return;
+    }
+    // One-shot: a standing reminder on every invocation would be noise, and the user may
+    // reasonably decide to keep the legacy cache for other uv projects.
+    let marker = paths.data_dir.join(".legacy-uv-cache-notice");
+    if marker.exists() {
+        return;
+    }
+    eprintln!(
+        "rocm: the uv cache now lives at {}; the previous cache at {} is no longer used by rocm-cli and can be removed if no other uv project needs it",
+        cache.path().display(),
+        legacy.display()
+    );
+    let _ = fs::write(&marker, b"");
 }
 
 /// One-shot, best-effort migration of a legacy rocm-dash `config.toml` into the

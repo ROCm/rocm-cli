@@ -14,7 +14,9 @@ use rocm_core::{
     uv_venv_args, verify_rsa_pkcs1_sha256_signature,
 };
 #[cfg(test)]
-use rocm_core::{generate_rsa_signing_keypair, sign_rsa_pkcs1_sha256_signature};
+use rocm_core::{
+    generate_rsa_signing_keypair, managed_uv_cache_dir, sign_rsa_pkcs1_sha256_signature,
+};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fmt::Write as _;
@@ -3606,12 +3608,32 @@ mod tests {
     }
 
     #[test]
-    fn managed_uv_cache_defaults_inside_generated_runtime_folder() {
+    fn managed_uv_cache_sits_under_the_data_dir_for_generated_runtime_folders() {
         let (_root, paths) = test_paths("managed-uv-cache");
         let runtime_key = "release-wheel-gfx120x-all-7-14-0";
         let install_root = managed_runtime_root(&paths, "wheel", runtime_key);
-        // uv caches live beside the venv; verify the wheel root path structure
         assert!(install_root.starts_with(&paths.data_dir));
+        // Without --prefix the generated runtime folder is itself under the data dir, so
+        // the uv cache shares a filesystem with the environment it populates.
+        assert!(managed_uv_cache_dir(&paths.data_dir).starts_with(&paths.data_dir));
+    }
+
+    #[test]
+    fn uv_cache_does_not_follow_a_prefix_install_root() {
+        // Documents a known gap rather than an intended behavior: `--prefix` relocates
+        // install_root only, while the uv cache stays keyed off the data dir. When the two
+        // land on different filesystems uv falls back to copying. Tracked separately; see
+        // the `--prefix` non-goal on the PR that introduced the colocation.
+        let (_root, paths) = test_paths("prefix-uv-cache");
+        let prefix_root = PathBuf::from("/mnt/elsewhere/envs/my-env");
+        let cache = managed_uv_cache_dir(&paths.data_dir);
+
+        assert!(
+            !cache.starts_with(&prefix_root),
+            "cache {} unexpectedly followed the --prefix root",
+            cache.display()
+        );
+        assert!(cache.starts_with(&paths.data_dir));
     }
 
     #[test]
