@@ -6,10 +6,10 @@
 **Branch:** e2e-task-9-narrow-serve-paths-filter-so-non
 **Jira:** EAI-7746 (Task, rocm-cli, unassigned)
 **Pre-PR-check:** review-done — OpenCode reviewer (gpt-5.6-sol), 2026-07-31, @ca9f297+e2748ac0b92b8d83 — PASSED after two review rounds (all issues fixed); short-name scenarios now @serves-on-gpu, full serve-step/feature sweep found no other real GPU serve escaping canary gating; focused tests + harness compile + clippy + git diff --check all pass.
-**Last Updated:** 2026-08-05 (end of session 19)
+**Last Updated:** 2026-08-06
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=4756 out=1175750 cache_create=43577899 cache_read=326137756 calls=1429
+**Token Usage:** in=4764 out=1177645 cache_create=44851841 cache_read=326811778 calls=1433
 
 ---
 
@@ -103,10 +103,9 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 ## Blockers
 
 **BLOCKED (awaiting user action):**
-- **Canary mechanism reduction authorization** — relay-gate hook blocks source file edits on coordinator-tier relay (only permits own-branch commit/push, not Edit). Reduction is fully scoped and ready (keep serve paths-filter + ci.yml honesty; drop @canary/@serves-on-gpu tags, canary_mode 6th bool, E2E_PR_CANARY, canary unit tests, merge_group-only Strix gating, README canary docs; defer scenario 6b @merge-queue flag to post-#157 rebase). Need either: (a) your direct "go" here (bypassing relay), or (b) separate force-push authorization if scope changes.
-  - **Confirmed independently:** rominf's 2026-08-05 13:49 re-review approves substance and recommends identical reduction (keep serve paths-filter, drop canary mechanism, scenario 6b stays `@merge-queue` after #157 lands). Cross-PR #157 must land first or #156 becomes retag delta. #156 now `BEHIND` main (23f14a3), needs rebase regardless.
-- **Re-run `windows-build-and-test`?** — failed again on ffbbc03 (22m36s) with the same confirmed PR #139 flake signature (`lifecycle-windows-http-install` HTTP fixture download), outside this PR's diff and green on main. Re-run was authorized once before for this exact lane; asking again rather than assuming for a repeat CI action on a shared PR. Everything else green, awaiting maintainer-team review.
-- **Judgment calls #3/#6** (all in-PR fixes completed and force-pushed):
+- **Canary mechanism reduction authorization** — Relay + rominf's independent re-review (2026-08-05 13:49) both confirm the same reduction is authorized: keep serve paths-filter + ci.yml honesty, drop @canary/@serves-on-gpu tags, canary_mode 6th bool, E2E_PR_CANARY, canary unit tests, merge_group-only Strix gating, README canary docs (defer scenario 6b @merge-queue flag to post-#157 rebase). Relay-gate hook blocks Edit tier on coordinator-tier relay (only permits own-branch commit/push, not Edit). Need your direct "go" here (not via relay) to proceed with source edits.
+  - **Cross-PR sequencing confirmed:** #157 still OPEN; whichever of #156/#157 lands first determines path forward (if #156 first, #157 becomes retag delta). Both now BEHIND main (23f14a3), need rebase regardless.
+- **Judgment calls #3/#6** (in-PR fixes already applied, force-pushed, and documented):
   - #3: continue-on-error trade-off on merge_group (Strix regression can land before nightly catches it) — document trade-off or drop continue-on-error?
   - #6: cross-PR RunMode struct refactor (#155/#156/#157) — pursue now or defer to shared decision?
 
@@ -232,6 +231,14 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 - rominf posted new review comment (2026-08-05 13:49) confirming findings independently: approves substance of fixes (1/2/3/5 in prior session), agrees with #4/#6 deferred judgment, and independently recommends identical canary reduction (keep serve paths-filter, drop canary mechanism; scenario 6b stays `@merge-queue` post-#157 rebase).
 - **Cross-PR sequencing:** #157 is still OPEN; rominf notes whichever lands first (156 or 157) determines the path forward — if #156 lands first, #157 becomes a retag delta. Both PRs now `BEHIND` main (23f14a3).
 - **Canary reduction status:** fully scoped and triple-confirmed (fres's decision, coordinator relay, rominf's independent review), but mechanically blocked on relay via relay-gate hook (forbids Edit on coordinator tier). Awaiting fres's direct "go" to proceed with source edits.
+
+### 2026-08-06 (session 20 — confirmation & mechanically-blocked hold)
+
+- Relay nudge triggered live PR state re-check per standing rule: #156 still BEHIND main (23f14a3), all checks remain passing (GPU canary 1m26s, Strix skipping, no new review feedback). Relay delivered fres's decision (canary reduction authorized) but is coordinator-tier, which forbids Edit tier edits.
+- rominf's 2026-08-05 13:49 re-review independently confirmed: approves substance of fixes (#1/2/3/5 complete), same 4 judgment calls (#3 continue-on-error documented but not changed, #4 no-action, #6 cross-PR RunMode deferred), recommends identical canary reduction (keep serve paths-filter, drop canary mechanism, scenario 6b stays `@merge-queue` post-#157).
+- **Triply-confirmed:** fres's decision + relay + rominf's independent review all align on scope (keep paths-filter, drop canary tags/bool/env/tests/Strix merge_group gating/README docs). Reduction is fully scoped, ready to commit fast-forward (no force-push needed unless scope changes).
+- **Mechanical blocker:** relay-gate hook forbids source file edits on coordinator-tier relay; requires fres's direct "go" here (not via relay, which only permits commit/push tier).
+- Awaiting fres's direct authorization to proceed with source edits + rebase onto 23f14a3 + commit + push.
 
 ### 2026-07-30
 
