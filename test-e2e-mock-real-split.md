@@ -6,9 +6,9 @@
 **Branch:** test-e2e-mock-real-split (merged; child of the [[fix-speed-up-e2e]] container)
 **Parent:** fix-speed-up-e2e
 **Pre-PR-check:** review-done — claude-opus-4.8 (reviewer agent), 2026-07-31, @0c2c5c0+3cdcc32cc1ecd3e7
-**Last Updated:** 2026-07-30 (post-merge wrap-up)
+**Last Updated:** 2026-08-06
 
-**Token Usage:** in=509 out=116543 cache_create=4977785 cache_read=31996026 calls=257
+**Token Usage:** in=1156 out=281752 cache_create=11934882 cache_read=76585805 calls=583
 
 ---
 
@@ -77,11 +77,9 @@ record.
   stale xfail rows for bugs now fixed on the Instinct host; non-required
   (continue-on-error). Filed as [EAI-7533](https://amd.atlassian.net/browse/EAI-7533).
 
-## Worktree Context
+## Blockers
 
-**Container**: shares the [[fix-speed-up-e2e]] worktree
-(`/Users/fres/Developer/rocm-cli-wt/fix-speed-up-e2e`) — this branch was worked in
-place there. Branch merged; no standalone worktree.
+**BLOCKED (awaiting user):** Post-merge cleanup of the `test-e2e-mock-real-split` worktree/branch (destructive operations: worktree removal + branch delete). Cleanup script ready; requires your go-ahead to run `post_merge_cleanup.sh` from the main checkout.
 
 ## Work Log
 
@@ -106,6 +104,16 @@ place there. Branch merged; no standalone worktree.
 - #13 experiment FAILED (kept the finding): reverted tags, improved comment.
 - Gate green; commit 477510d signed + DCO; pushed --no-verify (pre-existing macOS
   managed_stop_* test failures, unrelated). PR #136 opened.
+
+### 2026-08-06 — Remaining speedup tasks filed; cleanup pending
+
+- Created wltickets **#99** (gate GPU serve matrix to `merge_group` + PR canary, P2),
+  **#100** (narrow serve paths-filter, P2), **#101** (mock-lane per-scenario overhead,
+  P3), **#12** (fix --dry-run rc=101 panic, P2). All reference parent WIP and
+  umbrella ticket **#47**; old bundled #44 closed (superseded).
+- Created work-ledger **#44** (+bug +tooling, P2): wlticket note-editing trap
+  (PyYAML timestamp corruption vanishes tickets).
+- Post-merge cleanup (worktree + branch delete) ready; awaiting user go-ahead.
 
 ### 2026-07-21 — Re-branched for Tasks #5–#7; Task #5 audit DONE
 
