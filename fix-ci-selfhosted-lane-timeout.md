@@ -1,6 +1,6 @@
 # WIP: Fix CI self-hosted E2E lane timeout (offline runner holds concurrency group)
 
-**Stage:** 7-pre-pr-review-terminal
+**Stage:** 8-awaiting-user-commit
 **Pipeline:** lightweight
 **Branch:** fix-ci-selfhosted-lane-timeout
 **Pre-PR-check:** review-done — OpenCode gpt-5.6-sol reviewer, 2026-08-06, @0c884da+bfd0fb8bbaea934a
@@ -228,11 +228,10 @@ admin branch-protection change), which the user opted to handle separately.
 
 ## Next Steps
 
-**BLOCKER (awaiting user):** All review findings fixed and verified (terminal verdict: **review-done**). All changes staged on top of commit 0c884da. To proceed to PR opening, user must drive a direct session and run:
-```
-git-commit-with-fallback --amend -s
-```
-(to fold all four rounds of review-response changes into the commit, then the branch is PR-ready). Separately, user to de-require the four self-hosted checks in branch protection (the "Split only" caveat).
+**BLOCKED (awaiting user):**
+1. Run `git-commit-with-fallback --amend -s` in the worktree (fold all four rounds of review-response changes into commit 0c884da).
+2. After commit succeeds, open the PR.
+3. Separately: de-require the four self-hosted checks in branch protection (the "Split only" caveat — hosted required checks can run independently, but offline GPU runners no longer stall them).
 
 ## RESOLVED
 - Does `timeout-minutes` cancel a job still QUEUED on an offline runner?
