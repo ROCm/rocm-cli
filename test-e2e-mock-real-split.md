@@ -8,7 +8,7 @@
 **Pre-PR-check:** review-done — claude-opus-4.8 (reviewer agent), 2026-07-31, @0c2c5c0+3cdcc32cc1ecd3e7
 **Last Updated:** 2026-08-06
 
-**Token Usage:** in=1156 out=281752 cache_create=11934882 cache_read=76585805 calls=583
+**Token Usage:** in=1219 out=300882 cache_create=12720063 cache_read=83636980 calls=616
 
 ---
 
@@ -79,7 +79,7 @@ record.
 
 ## Blockers
 
-**BLOCKED (awaiting user):** Post-merge cleanup of the `test-e2e-mock-real-split` worktree/branch (destructive operations: worktree removal + branch delete). Cleanup script ready; requires your go-ahead to run `post_merge_cleanup.sh` from the main checkout.
+None. Cleanup deferred: this worktree (checked out on `test-e2e-mock-real-split`) serves as the live home of the umbrella container task WL-123, not a dedicated leaf for WL-129. Cleanup would incorrectly resolve the active container and remove the umbrella's working base. Will revisit when WL-123 is complete.
 
 ## Work Log
 
@@ -114,6 +114,14 @@ record.
 - Created work-ledger **#44** (+bug +tooling, P2): wlticket note-editing trap
   (PyYAML timestamp corruption vanishes tickets).
 - Post-merge cleanup (worktree + branch delete) ready; awaiting user go-ahead.
+
+### 2026-08-06 — Cleanup deferred; umbrella context clarified
+
+- Verified tmux session maps to **WL-123** (umbrella container), not WL-129
+  (merged leaf). This worktree serves as the active home of the whole speed-up effort.
+- Deferred `post_merge_cleanup.sh`: would incorrectly resolve the live container
+  (WL-123 still has open children #8/#9/#11) and remove the umbrella's working base.
+  Cleanup only correct when WL-123 is complete.
 
 ### 2026-07-21 — Re-branched for Tasks #5–#7; Task #5 audit DONE
 
