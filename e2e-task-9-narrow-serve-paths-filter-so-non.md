@@ -6,7 +6,7 @@
 **Branch:** e2e-task-9-narrow-serve-paths-filter-so-non
 **Jira:** EAI-7746 (Task, rocm-cli, unassigned)
 **Pre-PR-check:** review-done — OpenCode reviewer (gpt-5.6-sol), 2026-07-31, @ca9f297+e2748ac0b92b8d83 — PASSED after two review rounds (all issues fixed); short-name scenarios now @serves-on-gpu, full serve-step/feature sweep found no other real GPU serve escaping canary gating; focused tests + harness compile + clippy + git diff --check all pass.
-**Last Updated:** 2026-08-06 (session 21)
+**Last Updated:** 2026-08-06
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
 **Token Usage:** in=4786 out=1182373 cache_create=46320252 cache_read=330720842 calls=1444
@@ -103,7 +103,7 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 ## Blockers
 
 **BLOCKED (awaiting user action):**
-- **Scope reduction execution** — Branch rebased onto current main (ec2bcb3); awaiting your direct word to proceed with source edits (canary mechanism reduction: keep serve paths-filter + ci.yml honesty, drop @canary/@serves-on-gpu tags, canary_mode 6th bool, E2E_PR_CANARY, canary unit tests, merge_group-only Strix gating, README canary docs). Relay-gate hook forbids Edit tier on coordinator-tier relay. Once you approve, will reduce scope, commit (fast-forward), and push.
+- **Scope reduction execution** — Branch rebased onto current main (ec2bcb3 → now 2026-08-06 ec2bcb3); awaiting your direct word to proceed with source edits (canary mechanism reduction: keep serve paths-filter + ci.yml honesty, drop @canary/@serves-on-gpu tags, canary_mode 6th bool, E2E_PR_CANARY, canary unit tests, merge_group-only Strix gating, README canary docs). Relay-gate hook forbids Edit tier on coordinator-tier relay. Once you approve, will reduce scope, commit (fast-forward), and push.
 - **Judgment calls #3/#6** (in-PR fixes already applied, force-pushed, and documented):
   - #3: continue-on-error trade-off on merge_group (Strix regression can land before nightly catches it) — document trade-off or drop continue-on-error?
   - #6: cross-PR RunMode struct refactor (#155/#156/#157) — pursue now or defer to shared decision?
@@ -243,6 +243,13 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 
 - Checked local tree state: clean, 2 commits ahead of remote (d7896c6 + ffbbc03), 2 behind main (current main tip is ec2bcb3 — #174 Windows loopback fix landed). Verified no overlap with new main commits on the 6 modified files.
 - Rebased branch cleanly onto ec2bcb3; both commits intact + signed. Updated branch state: 0 behind / 2 ahead, serve edits present. Did not push (would need force-push authorization on remote; rebase alone is not worth forcing; push deferred pending scope reduction decision).
+
+### 2026-08-06 (session 22 — rebase command + scope reduction hold)
+
+- User issued direct "rebase on main" command. Verified clean local tree (2 commits ahead of remote, 2 behind main tip ec2bcb3 from #174 Windows loopback fix).
+- Rebased cleanly onto ec2bcb3 (no conflicts; 6 modified files untouched by new main commits). Both commits intact + signed. Branch now 0 behind / 2 ahead.
+- Did not push (rebase alone doesn't warrant force-push authorization; deferred with scope reduction decision pending).
+- Awaiting direct user approval to proceed with scope reduction edits (keep serve paths-filter, drop canary tags/bool/env/tests/Strix merge_group gating/README docs).
 
 ### 2026-07-30
 
