@@ -320,12 +320,15 @@ pub struct ResolvedScenario {
     /// The `Feature:` this scenario belongs to. Recorded here because a SKIPPED
     /// scenario never reaches `report.json`, so the report has no other way to
     /// place it under its feature in the grouped grid.
-    #[serde(default)]
+    ///
+    /// No `#[serde(default)]` here: this struct only derives `Serialize`, so a
+    /// deserialization attribute would be dead. Backward compatibility for
+    /// artifacts written before these fields existed lives entirely on the
+    /// consuming side — `ManifestExpectation` in the `e2e-report` crate.
     pub feature: String,
     /// The scenario's own name (`<key>-<NN> - <description>`). Carries the
     /// per-feature index the report sorts rows by, and gives skipped scenarios a
     /// human label they'd otherwise lack.
-    #[serde(default)]
     pub scenario: String,
     pub effective_engine: String,
     /// "pass" | "xfail" | "skip".

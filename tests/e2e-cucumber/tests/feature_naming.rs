@@ -63,8 +63,15 @@ fn scenarios_of(file: &str) -> Vec<(Option<String>, String)> {
     let mut out = Vec::new();
     for line in text.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix('@') {
-            for tag in rest.split_whitespace() {
+        if line.starts_with('@') {
+            // Strip the `@` per TAG, not just off the head of the line: on a
+            // multi-tag line every token after the first keeps its own `@`, so
+            // `@requires-os:linux @id:x` would hide the id. This mirrors
+            // `ScenarioDecl::from_tags` in src/expectation.rs — the guard must
+            // read tags exactly as the harness does, or it rejects Gherkin the
+            // harness accepts.
+            for tag in line.split_whitespace() {
+                let tag = tag.strip_prefix('@').unwrap_or(tag);
                 if let Some(id) = tag.strip_prefix("id:") {
                     pending_id = Some(id.to_owned());
                 }
@@ -96,6 +103,18 @@ fn feature_files_and_declared_keys_agree() {
         assert!(
             present.iter().any(|p| p == file),
             "FEATURE_KEYS lists {file}, which does not exist — drop the entry",
+        );
+    }
+    // Every other check in this file is a `for … in scenarios_of(file)` loop, so
+    // a file the parser reads as having NO scenarios passes them all vacuously.
+    // A mangled `Scenario:` keyword — precisely what a bad bulk find-replace
+    // does — would then hide a whole feature from the guard while the report
+    // silently renders its rows unsorted.
+    for file in &present {
+        assert!(
+            !scenarios_of(file).is_empty(),
+            "{file}: no scenarios parsed — the naming checks would pass \
+             vacuously. Is a `Scenario:` keyword malformed?",
         );
     }
 }

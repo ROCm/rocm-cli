@@ -858,7 +858,15 @@ impl Grid {
                 } else {
                     entry.0.clone_from(&exp.feature);
                 }
-                if entry.1.is_empty() {
+                // The display name needs no fallback — unlike `feature` it is
+                // never synthesized, so an absent one is simply empty and the
+                // first artifact that HAS a name supplies it either way.
+                // The only case the two rules differ on is two artifacts naming
+                // the same id differently (mixing vintages across a rename):
+                // take the last, matching `feature` above. The name carries the
+                // sort index, so the rule should at least be stated rather than
+                // falling out of map iteration order.
+                if !exp.scenario.is_empty() {
                     entry.1.clone_from(&exp.scenario);
                 }
                 let outcome =
@@ -1460,7 +1468,7 @@ fn expectation_grid_markdown(
         for row in &group.rows {
             // Scenario cell: human name on top, the @id below as a link to its
             // entry in the Scenario reference section (GitHub anchors
-            // `#### <id>` to `#<id>`). Prefer the name recorded in platform.json
+            // `##### <id>` to `#<id>`). Prefer the name recorded in platform.json
             // — it covers a scenario that was skipped everywhere and so has no
             // report.json entry to read a name from.
             let name = if row.name.is_empty() {
@@ -2676,6 +2684,46 @@ mod tests {
             grid_order(&inputs),
             vec![("Model serving".to_string(), "serve-x".to_string())],
             "an older artifact must not overwrite a named feature",
+        );
+    }
+
+    #[test]
+    fn the_last_naming_artifact_sets_the_sort_position() {
+        // Two artifacts naming the same ids differently — a `Scenario:` renamed
+        // between vintages. The name carries the sort index, so which one wins
+        // decides row order; pin the documented rule (last wins) rather than
+        // leaving it to fall out of iteration order.
+        let older = r#"{
+            "platform_slug": "mi300x",
+            "capability": {"effective_serve_engine": "vllm"},
+            "expectations": [
+                {"id":"serve-a","feature":"Model serving","scenario":"serve-01 - a","expected":"skip"},
+                {"id":"serve-b","feature":"Model serving","scenario":"serve-02 - b","expected":"skip"}
+            ]
+        }"#;
+        let newer = r#"{
+            "platform_slug": "mock",
+            "capability": {"effective_serve_engine": "none"},
+            "expectations": [
+                {"id":"serve-a","feature":"Model serving","scenario":"serve-02 - a moved","expected":"skip"},
+                {"id":"serve-b","feature":"Model serving","scenario":"serve-01 - b moved","expected":"skip"}
+            ]
+        }"#;
+        let report = feature_json(&[]);
+        let (_d1, older_path) = write_platform(&report, older);
+        let (_d2, newer_path) = write_platform(&report, newer);
+
+        let inputs = vec![
+            ("mi300x".to_string(), older_path),
+            ("mock".to_string(), newer_path),
+        ];
+        assert_eq!(
+            grid_order(&inputs)
+                .into_iter()
+                .map(|(_, id)| id)
+                .collect::<Vec<_>>(),
+            vec!["serve-b".to_string(), "serve-a".to_string()],
+            "the last artifact to name a scenario sets its sort position",
         );
     }
 

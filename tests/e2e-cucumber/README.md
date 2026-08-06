@@ -108,9 +108,10 @@ matrix, then reconciles the actual result against that expectation.
 
 ### Naming
 
-Each feature file has a short **key** (`chat`, `dash`, `diagnose`, `examine`,
-`lifecycle`, `serve`, `networking`, `runtime`) that prefixes both its scenario
-names and its ids:
+Each feature file has a short **key** that prefixes both its scenario names and
+its ids. The key is usually the file's stem, but not always — `install_lifecycle`
+uses `lifecycle` and `model_serving` uses `serve` — so `FEATURE_KEYS` in
+`tests/feature_naming.rs` is the list, not this page:
 
 - **Scenario name** — `Scenario: <key>-<NN> - <description>`, numbered
   sequentially in declaration order. The report sorts the grid's rows by this
