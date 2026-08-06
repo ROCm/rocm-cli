@@ -5,8 +5,8 @@
 **Branch:** fix-ci-selfhosted-lane-timeout
 **Pre-PR-check:** review-done — OpenCode gpt-5.6-sol reviewer, 2026-08-06, @0c884da+bfd0fb8bbaea934a
 **Ticket:** EAI-7548 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7548
-**Last Updated:** 2026-08-06T16:45Z
-**Token Usage:** in=520k out=449k cache_create=2142379 cache_read=50790k calls=264
+**Last Updated:** 2026-08-06
+**Token Usage:** in=625k out=532k cache_create=2142379 cache_read=71648k calls=288
 
 ---
 
