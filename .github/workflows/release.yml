@@ -8,6 +8,14 @@ on:
       tag:
         description: "Release tag (e.g. v0.1.0)"
         required: true
+      pypi_repository:
+        description: "PyPI index for the publish job (defaults to a TestPyPI rehearsal)"
+        required: false
+        default: testpypi
+        type: choice
+        options:
+          - testpypi
+          - pypi
 
 permissions:
   contents: write
@@ -144,6 +152,62 @@ jobs:
             --asset "${DIST}.tar.gz" \
             --asset rocm-cli-linux-amd64.tar.gz
 
+      - name: Build Python wheel
+        run: |
+          # Reuse the exact target/release binaries that were just packaged and
+          # signed — the wheel payload must stay byte-identical to the binaries
+          # inside the signed archive, so nothing is rebuilt here.
+          python scripts/build_wheel.py \
+            --bin-dir target/release \
+            --platform linux-amd64 \
+            --tag "${{ steps.version.outputs.value }}" \
+            --out-dir dist/wheels
+
+      - name: Smoke test the Python wheel
+        run: |
+          shopt -s nullglob
+          wheels=(dist/wheels/*.whl)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "expected exactly one linux wheel, found ${#wheels[@]}" >&2
+            exit 1
+          fi
+          venv="${RUNNER_TEMP}/wheel-smoke"
+          rm -rf "${venv}"
+          python -m venv "${venv}"
+          "${venv}/bin/python" -m pip install --no-index --disable-pip-version-check "${wheels[0]}"
+          # The wheel ships the real ELF binaries in its .data/scripts
+          # directory rather than console-script shims, so these must be the
+          # native executables themselves and must report their own version.
+          for binary in rocm rocmd; do
+            magic="$(head -c 4 "${venv}/bin/${binary}" | od -An -tx1 | tr -d ' \n')"
+            if [ "${magic}" != "7f454c46" ]; then
+              echo "${binary} is not an ELF executable (magic ${magic}); a shim would break current_exe()" >&2
+              exit 1
+            fi
+          done
+          # Assert the installed binaries are the version the wheel claims, so
+          # a stale target/release tree (for example from a restored build
+          # cache) cannot ship binaries that disagree with the release tag.
+          wheel_version="$(basename "${wheels[0]}")"
+          wheel_version="${wheel_version#rocm_cli-}"
+          wheel_version="${wheel_version%%-py3-none-*}"
+          release="$(printf '%s' "${wheel_version}" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+          for binary in rocm rocmd; do
+            reported="$("${venv}/bin/${binary}" --version)"
+            if [ "${reported}" != "${binary} ${release}" ]; then
+              echo "${binary} reports '${reported}', expected '${binary} ${release}' from wheel ${wheel_version}" >&2
+              exit 1
+            fi
+          done
+          rm -rf "${venv}"
+
+      - name: Upload Python wheel
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheel-linux-amd64
+          path: dist/wheels/
+          if-no-files-found: error
+
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -222,8 +286,86 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $version = "${{ needs.release.outputs.version }}"
-          $assets = Get-ChildItem dist -File -Include *.zip,*.sha256,*.sig -Recurse | ForEach-Object { $_.FullName }
+          # `dist\*` plus -Include, never -Recurse: with -Recurse this glob also
+          # matches the wheel checksum sidecars under dist\wheels, which are not
+          # GitHub release assets. Without a path wildcard, -Include silently
+          # matches nothing at all.
+          $assets = Get-ChildItem dist\* -File -Include *.zip,*.sha256,*.sig | ForEach-Object { $_.FullName }
           gh release upload $version @assets --clobber
+
+      # The wheel steps run after the release upload so the release asset set
+      # is produced from a tree that has no wheels in it yet. The upload glob
+      # above is non-recursive, so this ordering is defence in depth rather
+      # than the only thing keeping the asset set correct.
+      - name: Build Python wheel
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # Reuse the exact target\release binaries that were just packaged and
+          # signed — the wheel payload must stay byte-identical to the binaries
+          # inside the signed archive, so nothing is rebuilt here.
+          python .\scripts\build_wheel.py `
+            --bin-dir target\release `
+            --platform windows-amd64 `
+            --tag "${{ needs.release.outputs.version }}" `
+            --out-dir dist\wheels
+
+      - name: Smoke test the Python wheel
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          function Invoke-Checked {
+            param([string]$Exe, [string[]]$Arguments)
+            & $Exe @Arguments
+            if ($LASTEXITCODE -ne 0) {
+              throw "$Exe $($Arguments -join ' ') failed with exit code $LASTEXITCODE"
+            }
+          }
+          $wheels = @(Get-ChildItem dist\wheels -File -Filter *.whl)
+          if ($wheels.Count -ne 1) {
+            throw "expected exactly one windows wheel, found $($wheels.Count)"
+          }
+          $venv = Join-Path $env:RUNNER_TEMP "wheel-smoke"
+          if (Test-Path -LiteralPath $venv) {
+            Remove-Item -Recurse -Force -LiteralPath $venv
+          }
+          Invoke-Checked python @("-m", "venv", $venv)
+          Invoke-Checked "$venv\Scripts\python.exe" @("-m", "pip", "install", "--no-index", "--disable-pip-version-check", $wheels[0].FullName)
+          # The wheel ships the real PE binaries in its .data/scripts directory
+          # rather than console-script shims, so these must be the native
+          # executables themselves and must report their own version.
+          foreach ($binary in @("rocm.exe", "rocmd.exe")) {
+            $path = Join-Path "$venv\Scripts" $binary
+            $magic = [System.IO.File]::ReadAllBytes($path)[0..1]
+            if ($magic[0] -ne 0x4D -or $magic[1] -ne 0x5A) {
+              throw "$binary is not a PE executable; a shim would break current_exe()"
+            }
+          }
+          # Assert the installed binaries are the version the wheel claims, so
+          # a stale target\release tree cannot ship binaries that disagree with
+          # the release tag.
+          $wheelVersion = $wheels[0].Name -replace '^rocm_cli-', '' -replace '-py3-none-.*$', ''
+          if ($wheelVersion -notmatch '^(?<release>\d+\.\d+\.\d+)') {
+            throw "cannot read a release segment out of wheel version '$wheelVersion'"
+          }
+          $release = $Matches['release']
+          foreach ($binary in @("rocm", "rocmd")) {
+            $reported = (& "$venv\Scripts\$binary.exe" "--version") -join ""
+            if ($LASTEXITCODE -ne 0) {
+              throw "$binary --version failed with exit code $LASTEXITCODE"
+            }
+            if ($reported.Trim() -ne "$binary $release") {
+              throw "$binary reports '$reported', expected '$binary $release' from wheel $wheelVersion"
+            }
+          }
+          Remove-Item -Recurse -Force -LiteralPath $venv
+
+      - name: Upload Python wheel
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheel-windows-amd64
+          path: dist/wheels/
+          if-no-files-found: error
 
   publish-release:
     name: Publish release
@@ -240,3 +382,110 @@ jobs:
           VERSION="${{ needs.release.outputs.version }}"
           RELEASE_ID="$(gh release view "${VERSION}" --json databaseId -q .databaseId)"
           gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" -f draft=false
+
+  publish-pypi:
+    name: Publish wheels to PyPI
+    runs-on: ubuntu-latest
+    needs:
+      - release
+      - windows-release
+      # Sequenced after publish-release so wheels never reach an index before
+      # the GitHub release they correspond to is out of draft.
+      - publish-release
+    # PyPI publication gate — dormant until the owner sets the repository
+    # variable ROCM_CLI_PUBLISH_PYPI to "1" or "true", mirroring the
+    # ROCM_CLI_REQUIRE_PRODUCTION_TRUST gate in the env block above. It stays
+    # unset until the project owns the PyPI `rocm-cli` project and has
+    # registered this workflow as its Trusted Publisher. The gate is an
+    # allowlist rather than a not-falsy test so that any other value —
+    # including "FALSE", "no", or "off" — leaves the job dormant. While it is
+    # dormant this job is skipped and nothing reaches any index; the wheels are
+    # still built, smoke-tested, and retained as workflow artifacts, and the
+    # GitHub release asset set is unchanged.
+    if: vars.ROCM_CLI_PUBLISH_PYPI == '1' || vars.ROCM_CLI_PUBLISH_PYPI == 'true'
+    environment: pypi
+    permissions:
+      # Trusted Publishing mints a short-lived OIDC token instead of using a
+      # stored API token, so this job needs id-token: write and no upload
+      # secrets. Declaring permissions here also keeps the workflow-level
+      # `contents: write` from applying to a job that writes nothing back.
+      contents: read
+      id-token: write
+    steps:
+      - name: Resolve publication target
+        id: target
+        env:
+          # Empty on tag pushes, which always mean the real index. A manual
+          # dispatch defaults to testpypi so that the irreversible action —
+          # a real upload burns that version forever — is always opt-in.
+          REQUESTED: ${{ github.event.inputs.pypi_repository }}
+        run: |
+          TARGET="${REQUESTED:-pypi}"
+          case "${TARGET}" in
+            pypi|testpypi) ;;
+            *)
+              echo "unknown pypi_repository input: ${TARGET}" >&2
+              exit 1
+              ;;
+          esac
+          echo "value=${TARGET}" >> "$GITHUB_OUTPUT"
+
+      - name: Download built wheels
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: wheel-*
+          path: dist/wheels
+          merge-multiple: true
+
+      - name: Verify wheel checksums and stage the upload directory
+        run: |
+          shopt -s nullglob
+          wheels=(dist/wheels/*.whl)
+          if [ "${#wheels[@]}" -ne 2 ]; then
+            echo "expected 2 wheels (linux + windows), found ${#wheels[@]}" >&2
+            exit 1
+          fi
+
+          # Re-verify each wheel against the sidecar written beside it on the
+          # builder runner. The sidecar travels in the same artifact, so this
+          # catches a file corrupted or truncated in artifact storage transit,
+          # not a compromised builder that wrote both files consistently.
+          for wheel in "${wheels[@]}"; do
+            sidecar="${wheel}.sha256"
+            if [ ! -f "${sidecar}" ]; then
+              echo "missing checksum sidecar: ${sidecar}" >&2
+              exit 1
+            fi
+            expected="$(awk 'NR == 1 { print $1 }' "${sidecar}")"
+            actual="$(sha256sum "${wheel}" | awk '{ print $1 }')"
+            if [ -z "${expected}" ] || [ "${expected}" != "${actual}" ]; then
+              echo "checksum mismatch for ${wheel}: expected '${expected}', got '${actual}'" >&2
+              exit 1
+            fi
+            echo "verified $(basename "${wheel}") ${actual}"
+          done
+
+          # The publish action uploads every file in packages-dir, so stage the
+          # wheels on their own — the .sha256 sidecars are not distributions.
+          mkdir -p dist/pypi
+          cp "${wheels[@]}" dist/pypi/
+
+      # Exactly one of the two steps below runs. A rehearsal resolves to
+      # testpypi and therefore cannot reach the real index, and any other
+      # value already failed in "Resolve publication target". Neither step
+      # passes credentials (Trusted Publishing only), and both leave PEP 740
+      # attestations at the action's enabled default.
+      - name: Publish to TestPyPI (rehearsal)
+        if: steps.target.outputs.value == 'testpypi'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist/pypi
+          repository-url: https://test.pypi.org/legacy/
+          print-hash: true
+
+      - name: Publish to PyPI
+        if: steps.target.outputs.value == 'pypi'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist/pypi
+          print-hash: true

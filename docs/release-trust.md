@@ -116,6 +116,74 @@ happen before activation. Run the current host's set with
 `E2E_INCLUDE_LIFECYCLE=1 E2E_ONLY_LIFECYCLE=1 cargo xtask e2e` (see
 `docs/testing.md`).
 
+## PyPI Wheel Channel
+
+`pip install rocm-cli` distributes the same binaries through a second channel
+with a *different trust root*. PyPI stores only the uploaded distribution
+files, so it cannot carry the detached `.sig` sidecar described above: there is
+nowhere for a wheel consumer to fetch `<wheel>.sig` from, and `pip` would not
+check it. Do not describe the wheel channel as detached-signature verified.
+
+What the wheel channel does provide:
+
+- **Trusted Publishing (OIDC).** The `publish-pypi` job in
+  `.github/workflows/release.yml` authenticates with a short-lived OpenID
+  Connect token minted for this repository's release workflow and its `pypi`
+  environment, so PyPI accepts `rocm-cli` uploads only from that identity.
+  There is no long-lived upload token to leak or rotate.
+- **PEP 740 attestations.** `pypa/gh-action-pypi-publish` publishes a signed
+  attestation with each wheel, binding the file digest to the workflow that
+  produced it. Attestations stay enabled; the publish steps do not opt out.
+  Note what this is and is not: `pip` does not verify attestations at install
+  time and offers no flag to require them, so for a plain `pip install` this is
+  an auditable provenance record rather than an install-time gate. Fetch it
+  from PyPI's integrity API,
+  `https://pypi.org/integrity/rocm-cli/<version>/<filename>/provenance`.
+- **In-pipeline verification.** Each wheel is built in the same job that
+  packaged and signed the release archive, from the same `target/release`
+  binaries, smoke-tested by installing it into a throwaway virtualenv, and
+  re-checked against its `.sha256` sidecar in the publish job before upload.
+  The sidecar is written next to the wheel on the builder runner and travels in
+  the same artifact, so that check catches a file corrupted or truncated in
+  artifact storage transit. It cannot detect a compromised builder that wrote a
+  consistent wheel and sidecar together; the control against that is the
+  attestation's binding to the workflow identity, not the checksum.
+
+The GitHub release assets remain the signature-bearing artifacts. The `.tar.gz`
+and `.zip` bundles and their detached `.sig` files are the only place the RSA
+release signature is published, and they are what the installers verify — see
+[Installer Verification](#installer-verification) for the verification inputs
+and commands. `cargo xtask package` copies the release binaries verbatim, so
+the `rocm` and `rocmd` payload in the wheel is byte-identical to the copy
+inside the signed archive for the same tag; anyone who needs the detached
+signature as their trust root should install from the release with `install.sh`
+or `install.ps1` and verify there.
+
+Publication is gated on the repository variable `ROCM_CLI_PUBLISH_PYPI`, which
+must be set to `1` or `true`; every other value, including unset, leaves the
+job dormant. While it is dormant, release CI still builds, smoke-tests, and
+retains the wheels as workflow artifacts, but nothing is uploaded to any index.
+The wheel build and its smoke test do run on every release, so a wheel
+regression fails the release job even while publication is off — the uploaded
+GitHub asset set is unchanged, the pipeline is not.
+
+### Version mapping is one-way and unrepeatable
+
+`scripts/build_wheel.py` maps the git tag onto a PEP 440 version: `vX.Y.Z` to
+`X.Y.Z`, `-alpha.N` and `-experimental.N` to `X.Y.ZaN`, `-beta.N` to `X.Y.ZbN`,
+`-rc.N` to `X.Y.ZrcN`. Any other tag shape, and any version carrying a local,
+dev, post, or epoch segment, is refused rather than published. The mapped
+release segment must also equal `[workspace.package] version` in the root
+`Cargo.toml`, so a tag can never publish a wheel whose binaries report a
+different version.
+
+PyPI never lets a version be re-uploaded, even after deletion. Two consequences
+bind the tagging policy: a botched release must be yanked and superseded by a
+new version rather than replaced, and because `-alpha.N` and `-experimental.N`
+both map to `X.Y.ZaN`, only one of those two spellings may be used for a given
+serial. Tagging both `v1.2.3-experimental.1` and `v1.2.3-alpha.1` makes the
+second release fail at upload.
+
 ## WSL ROCDXG Package Verification
 
 `scripts/wsl_setup_rocdxg.sh` does not bake in a production checksum for the

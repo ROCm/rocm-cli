@@ -729,6 +729,7 @@ Release trust checks:
 cargo test -p rocm --bin rocm metadata_signature_verification_accepts_generated_key_and_rejects_tamper
 cargo test -p rocm-core model_recipe_index_signature_accepts_generated_key_and_rejects_tamper
 python scripts/release_readiness.py --self-test
+python scripts/build_wheel.py --self-test
 ROCDXG_CHECKSUM_SELF_TEST=1 bash scripts/wsl_setup_rocdxg.sh
 bash scripts/setup-wsl-portable-build-deps.sh --self-test
 ```
@@ -739,6 +740,16 @@ release asset sets, so stale archives and orphan checksum/signature sidecars in
 `dist` fail before upload, and it validates both missing and explicitly
 configured production trust inputs. Normal Linux and Windows CI run this
 self-test before the install-lifecycle E2E scenarios.
+
+The wheel self-test is offline and cross-platform too. It runs entirely inside
+a system temporary directory, building a wheel from a synthetic workspace and
+throwaway binaries, and covers the git-tag-to-PEP-440 mapping (including the
+rejected tag shapes), the cross-check against the `[workspace.package]`
+version, both platform tags, the exact wheel member set, `RECORD` hashes and
+sizes, byte-identical rebuilds, the `.sha256` sidecar text, and the
+regular-file plus executable mode bits on the packed `rocm`/`rocmd` entries —
+without those bits `pip install rocm-cli` yields non-executable binaries. See
+`docs/release-trust.md` for how the PyPI channel is secured.
 
 ### Packaging
 
