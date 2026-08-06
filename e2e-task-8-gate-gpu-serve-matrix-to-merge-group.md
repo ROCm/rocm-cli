@@ -1,12 +1,12 @@
 # WIP: E2E Task #8: gate GPU serve matrix to merge_group + keep a PR canary
 
-**Stage:** 7-gate
+**Stage:** 8-await-review
 **Pipeline:** lightweight
 **Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group (committed f308366, signed, rebased onto ec2bcb3/main incl. #174, force-pushed to remote)
 **PR:** https://github.com/ROCm/rocm-cli/pull/157 (OPEN on rebased head f308366; CI re-running (8 queued); reviewer request paused until CI green)
-**Pre-PR-check:** ✅ GATE CLEAR post-rebase-onto-#174 — container gate green (3 xfail, 0 XPASS, 0 unexpected; lib 64 pass; dash flake did NOT recur). Prior red was windows-build-and-test on 0fd0aed, which predated #174's loopback-server fix (now on main via ec2bcb3) — rebased onto it to clear that stale failure. My 4 files byte-identical across rebase; only base moved.
+**Pre-PR-check:** ✅ GATE CLEAR post-rebase-onto-#174 (ec2bcb3) — container gate green (3 xfail, 0 XPASS, 0 unexpected; lib 64 pass; dash flake did NOT recur on re-run). Prior red was windows-build-and-test on 0fd0aed, which predated #174's loopback-server fix (now on main via ec2bcb3) — rebased onto it to clear that stale failure. My 4 files byte-identical across rebase; only base moved. Force-pushed f308366 to remote; CI re-running (8 checks queued). Windows check expected to pass now that #174's loopback fix is in the base.
 **Last Updated:** 2026-08-06
-**Token Usage:** in=1788 out=546282 cache_create=14855253 cache_read=174513171 calls=909
+**Token Usage:** in=1864 out=554618 cache_create=14855253 cache_read=174869747 calls=914
 
 ---
 
@@ -79,7 +79,7 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 
 ## Blockers
 
-BLOCKED (awaiting CI + maintainer): PR #157 gated + force-pushed with rebased commit 0fd0aed (Windows loopback fix from #174 included). CI re-running post-rebase. Once all-pass, request CODEOWNERS review.
+BLOCKED (awaiting CI + maintainer): PR #157 force-pushed with rebased commit f308366 (now includes #174's loopback fix from ec2bcb3). CI re-running (8 checks queued). Once all-pass (especially `windows-build-and-test`), request CODEOWNERS review. Reviewer request paused until CI is green.
 
 ## Work Log
 
@@ -124,7 +124,7 @@ BLOCKED (awaiting CI + maintainer): PR #157 gated + force-pushed with rebased co
 
 ### 2026-08-06 (Morning)
 
-- Coordinator handoff verified: rebase + own-branch force-push authorized; `windows-build-and-test` check expected to be fixed by #174 (loopback server rewrite). My diff touches zero install/loopback code.
-- Clean rebase onto ec2bcb3 (main, includes #174 loopback fix). No conflicts (my e2e serve files unchanged by #174). Verified state: 1-ahead/0-behind, signed commit f308366.
-- Ran container gate post-rebase on combined tree (since #174 reworked e2e-cucumber crate files my code compiles alongside). Gate pending completion before maintainer review request.
-- Stage advanced to 8-await-review; PR #157 gated, rebased, force-pushed, CI re-running.
+- Coordinator handoff verified: rebase + own-branch force-push authorized; `windows-build-and-test` check expected to be fixed by #174 (loopback server rewrite).
+- Clean rebase onto ec2bcb3 (main, includes #174 loopback fix). No conflicts; verified state: 1-ahead/0-behind, signed commit f308366.
+- Ran container gate post-rebase on combined tree (since #174 reworked e2e-cucumber crate files). Gate ran clean: exit 0 (3 xfail, 0 XPASS, 0 unexpected, lib 64 pass, clippy clean).
+- Force-pushed f308366 to remote; CI re-running (8 checks queued). Paused reviewer request until CI all-pass, particularly Windows check which #174 should fix.
