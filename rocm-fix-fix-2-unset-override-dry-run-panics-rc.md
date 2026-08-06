@@ -33,13 +33,30 @@ this is SAFE for the serve/daemon paths: Rust std uses `MSG_NOSIGNAL` on socket
 writes, so a dropped connection still yields a normal `BrokenPipe` error, not a
 signal (probe in container confirmed clean EPIPE under `SIG_DFL`).
 
+**Follow-up (2nd pre-PR reviewer, gpt-5.6-sol, 90 conf — CONFIRMED against code):**
+the process-wide `SIG_DFL` regresses the ONE place rocm writes to a spawned
+child's stdin — the engine stdio path (`engine_request_with_env_root`,
+main.rs:15230-15237). If the engine child exits/crashes before reading, that
+write would now kill rocm with SIGPIPE/141 *before* the existing exit-status
+diagnostics (bail! at ~15288-15293) can run. Socket `MSG_NOSIGNAL` does NOT
+cover `ChildStdin` pipes. Verified all other stdin sites are `Stdio::null()`/
+`inherit()` (parent never writes), so this is the only at-risk write.
+**Fix:** wrap that write in `with_sigpipe_ignored()` (temp `SIG_IGN` + restore),
+so a dead engine yields EPIPE (surfaced as "failed to write engine request",
+then `wait()` reports why) instead of a signal.
+
 Files:
 - `apps/rocm/src/main.rs` — `reset_sigpipe()` (cfg(unix) libc FFI + no-op
-  elsewhere), called first in `main()`.
+  elsewhere), called first in `main()`; NEW `with_sigpipe_ignored()` helper
+  wrapping the engine child-stdin write.
 - `apps/rocm/Cargo.toml` — `libc.workspace = true` under `[target.'cfg(unix)']`.
 - `apps/rocm/tests/broken_pipe.rs` — regression test: close stdout early on a
   large-output command (`completions bash`, ~120 KB > 64 KB pipe buf), assert no
   panic / not exit 101.
+- `apps/rocm/src/main.rs` `mod tests` — NEW `engine_stdin_write_under_sig_dfl_is_guarded_not_fatal`:
+  re-execs itself under `SIG_DFL` and asserts BOTH that an unguarded write to a
+  dead child's stdin is killed by SIGPIPE (sanity) AND that the guarded write
+  survives with an error. Mutation-checked: removing the guard fails the test.
 
 ## Verification (Linux container)
 
@@ -50,7 +67,8 @@ Files:
 
 ## Next Steps
 
-1. Pre-PR review PASSED. Ready for fres to open the PR (author does not open it).
+1. Container gate (clippy+tests+e2e) running on the revised fix; on green, commit and push, then send re-review request back to the reviewer (agent-msg --rereview-request).
+2. Do NOT open the PR (fres's action) — only after re-review passes.
 
 ## Notes
 
@@ -80,3 +98,4 @@ Files:
 
 - Guidance compliance review (Check guidance compliance agent) completed: no findings ≥80 confidence. Confirmed unsafe_code usage matches project convention (libc FFI with documented exception), workspace-level libc dependency correctly resolved, test file matches integration-test conventions, build/clippy/test all pass in clean clone. No AI/Claude references introduced; commit author verified. Four independent review passes remain (scheduled background).
 - Pre-PR reviewer (gpt-5.6-sol agent) issued `changes-requested` at 90 confidence. Implemented requested enhancement: `with_sigpipe_ignored()` helper to wrap engine stdin writes, allowing SIGPIPE to be temporarily ignored so stdout/stderr writes abort with SIGPIPE but stdin writes surface as `BrokenPipe` errors instead of signals. Applied to engine subprocess stdin path. Changes in working tree pending commit and re-review.
+- Confirmed the finding against the code (engine write at main.rs:15230-15237; diagnostics after wait() at ~15288-15293) and verified every other stdin site is null/inherit, so the engine path is the only at-risk write. Added a re-exec'd regression test proving both directions (unguarded write killed by SIGPIPE; guarded write survives with an error). Mutation-checked: reverting the guard to a passthrough makes the test FAIL (wait_status 13 = SIGPIPE), so it is load-bearing. Test passes on Mac; running the full container gate next.
