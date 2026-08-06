@@ -9,7 +9,7 @@
 **Last Updated:** 2026-08-06
 **Bundles:** Task #8 (WL-175, merge_group gating + PR canary) — same branch/PR.
 
-**Token Usage:** in=4786 out=1182373 cache_create=46320252 cache_read=330720842 calls=1444
+**Token Usage:** in=4850 out=1197491 cache_create=48787300 cache_read=343929364 calls=1477
 
 ---
 
@@ -250,6 +250,13 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 - Rebased cleanly onto ec2bcb3 (no conflicts; 6 modified files untouched by new main commits). Both commits intact + signed. Branch now 0 behind / 2 ahead.
 - Did not push (rebase alone doesn't warrant force-push authorization; deferred with scope reduction decision pending).
 - Awaiting direct user approval to proceed with scope reduction edits (keep serve paths-filter, drop canary tags/bool/env/tests/Strix merge_group gating/README docs).
+
+### 2026-08-06 (session 23 — scope reduction in progress)
+
+- User issued direct "go ahead with the reduction" approval (unblocks Edit tier on relay-gated agent).
+- Feature files reverted: `tests/e2e-cucumber/features/chat.feature` + `tests/e2e-cucumber/features/model_serving.feature` (removed `@serves-on-gpu` tags added in scope).
+- **expectation.rs reductions:** removed `ScenarioDecl.canary` field + `ScenarioDecl.is_canary()` method, removed `canary` variant from tag enum, removed all `@canary` tag-parsing branches, updated `resolve()` signature (6→5 args: removed `canary_mode` bool), fixed ~30 resolve() call sites throughout the test module. Three canary unit tests deletion attempted (Edit timed out).
+- **Reduction scope remainder:** delete 3 canary unit tests (lines 568–671 in expectation.rs), update tests/e2e.rs (drop `E2E_PR_CANARY` read + `canary_mode` arg), update ci.yml (drop `E2E_PR_CANARY` env + revert Strix jobs to `serve`-gated pull_request), update README + docs/ci-hardware-testing.md (revert canary docs), then container gate + commit + push.
 
 ### 2026-07-30
 
