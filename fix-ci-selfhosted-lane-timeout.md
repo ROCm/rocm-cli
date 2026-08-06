@@ -1,11 +1,11 @@
 # WIP: Fix CI self-hosted E2E lane timeout (offline runner holds concurrency group)
 
-**Stage:** 7-pre-pr-review
+**Stage:** 7-pre-pr-review-terminal
 **Pipeline:** lightweight
 **Branch:** fix-ci-selfhosted-lane-timeout
-**Pre-PR-check:** changes-requested — OpenCode gpt-5.6-sol reviewer, 2026-08-06, @0c884da+cdb96a899b298ac8
+**Pre-PR-check:** review-done — OpenCode gpt-5.6-sol reviewer, 2026-08-06, @0c884da+bfd0fb8bbaea934a
 **Ticket:** EAI-7548 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7548
-**Last Updated:** 2026-08-06
+**Last Updated:** 2026-08-06T16:45Z
 **Token Usage:** in=520k out=449k cache_create=2142379 cache_read=50790k calls=264
 
 ---
@@ -199,6 +199,17 @@ branch-protection change.
 - Reviewer confirmed all prior-round fixes verify. **No open findings remain.**
 - 📋 Ready to amend-commit (blocked only by the reviewer-relay gate on this turn) then reopen.
 
+### Pre-PR review — TERMINAL verdict (2026-08-06): review-done
+- Reviewer returned **review-done** @0c884da+bfd0fb8bbaea934a — terminal, distinct from
+  `passed`, recorded verbatim. No findings ≥80 confidence remain after the full-scope pass.
+  Verified: 36 e2e-report + 72 xtask tests, fmt, YAML, hawkeye, diff checks all pass; the
+  unknown descriptor renders Unknown/Unknown. Pre-PR gate is SATISFIED.
+- NEXT (needs a fres-driven turn — reviewer relay blocks commits, and opening a PR is an
+  externally-visible action): `git-commit-with-fallback --amend -s` to fold all four rounds of
+  review-response changes into commit 0c884da, then open the PR. All changes are staged; the
+  identity stays gmail (finding withdrawn). Separately, fres de-requires the 4 self-hosted
+  checks in branch protection (the "Split only" caveat).
+
 ## KEY FINDING — required-check contradiction (drives "Split only" caveat)
 
 Branch protection on `main` (`strict:true`, `enforce_admins:true`) lists all FOUR
@@ -217,7 +228,11 @@ admin branch-protection change), which the user opted to handle separately.
 
 ## Next Steps
 
-Ready to amend-commit and open PR. All findings fixed and verified. User to handle branch-protection de-require separately (the "Split only" caveat). Next: run `git-commit-with-fallback --amend -s` (or open PR directly if amend was already auto-applied in the previous session) then proceed to pre-PR opening.
+**BLOCKER (awaiting user):** All review findings fixed and verified (terminal verdict: **review-done**). All changes staged on top of commit 0c884da. To proceed to PR opening, user must drive a direct session and run:
+```
+git-commit-with-fallback --amend -s
+```
+(to fold all four rounds of review-response changes into the commit, then the branch is PR-ready). Separately, user to de-require the four self-hosted checks in branch protection (the "Split only" caveat).
 
 ## RESOLVED
 - Does `timeout-minutes` cancel a job still QUEUED on an offline runner?
@@ -333,4 +348,5 @@ Ready to amend-commit and open PR. All findings fixed and verified. User to hand
 
 - **R4-F1 (unknown label still hardcoding Linux): VALID, fixed.** Discovered round-3 neutral label `e2e-unknown-report` still went through `fallback_descriptor`, which hardcodes OS="Linux" — so a Windows GPU run that errored before writing platform.json would render as Linux. FIX: added explicit `"unknown"` arm in `parse_descriptor` (crates/e2e-report/src/lib.rs) → renders **Unknown / Unknown**. Added two descriptor unit tests (known-artifact mapping; unknown → Unknown/Unknown case). **36 e2e-report + 72 xtask tests pass; fmt clean; workflows parse.**
 - **R3-F2 (identity): WITHDRAWN by reviewer.** Confirmed AGENTS.md §2 qualifies "when required" + merged repo history (user's own prior commit uses gmail identity). Commit stays as-is.
-- **Reviewer verdict: all prior-round fixes verify; no open findings remain.** All changes staged on top of commit 0c884da; ready to amend-commit.
+- **Terminal verdict: review-done** (verbatim, 2026-08-06, @0c884da+bfd0fb8bbaea934a). All prior-round fixes verified; no findings ≥80 confidence remain. Pre-PR gate SATISFIED. All changes staged on top of commit 0c884da.
+- NEXT: User to drive a direct turn and run `git-commit-with-fallback --amend -s` (fold review-response changes into commit, then PR-ready). Separately, de-require the four self-hosted checks in branch protection.
