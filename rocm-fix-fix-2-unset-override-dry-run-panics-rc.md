@@ -3,9 +3,9 @@
 **Stage:** 8-pre-pr-passed
 **Pipeline:** lightweight
 **Branch:** rocm-fix-fix-2-unset-override-dry-run-panics-rc
-**Pre-PR-check:** passed — reviewer(opus pre-pr agent), 2026-08-05, @6b50809+1ab80552cd4d971a
+**Pre-PR-check:** changes-requested — reviewer(gpt-5.6-sol pre-PR agent), 2026-08-06, @6b50809+1ab80552cd4d971a
 **Last Updated:** 2026-08-06
-**Token Usage:** in=935795 out=225401 cache_create=3216985 cache_read=49097307 calls=381
+**Token Usage:** in=2793297 out=228624 cache_create=3216985 cache_read=49097307 calls=399
 
 **Blockers:** BLOCKED (awaiting user): fres to open PR on main. Branch pushed to origin at 6b50809 (PR-createable).
 
