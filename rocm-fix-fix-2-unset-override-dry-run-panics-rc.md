@@ -5,7 +5,7 @@
 **Branch:** rocm-fix-fix-2-unset-override-dry-run-panics-rc
 **Pre-PR-check:** review-done (terminal) — reviewer(gpt-5.6-sol pre-PR agent), 2026-08-06, @09e1c08
 **Last Updated:** 2026-08-06
-**Token Usage:** in=2793697 out=586370 cache_create=5202241 cache_read=90760693 calls=599
+**Token Usage:** in=2793705 out=587718 cache_create=5825482 cache_read=91217817 calls=603
 
 **Gate Status:** GREEN. clippy clean, workspace/lib tests pass, and the full e2e suite ran; the single unexpected failure (`dash-managed-service-metrics`, a 30s-TTFT TUI timing scenario) was CONFIRMED a flake — it passes in isolation (scoped container re-run: 1 passed, 0 unexpected). Unrelated to the SIGPIPE change (touches only the engine-stdin write path). Revised fix committed `09e1c08` (signed) and pushed to origin.
 
