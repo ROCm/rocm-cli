@@ -1,6 +1,6 @@
 # WIP: rocm fix fix-2-unset-override --dry-run panics rc=101
 
-**Stage:** 9-pr-opened-sign-off-pending
+**Stage:** 9-pr-open-ci-rerunning
 **Pipeline:** lightweight
 **Branch:** rocm-fix-fix-2-unset-override-dry-run-panics-rc
 **Pre-PR-check:** review-done (terminal) — reviewer(gpt-5.6-sol pre-PR agent), 2026-08-06, @09e1c08
@@ -9,7 +9,7 @@
 
 **Gate Status:** GREEN. clippy clean, workspace/lib tests pass, and the full e2e suite ran; the single unexpected failure (`dash-managed-service-metrics`, a 30s-TTFT TUI timing scenario) was CONFIRMED a flake — it passes in isolation (scoped container re-run: 1 passed, 0 unexpected). Unrelated to the SIGPIPE change (touches only the engine-stdin write path). Revised fix committed `09e1c08` (signed) and pushed to origin.
 
-**Blockers:** BLOCKED (awaiting user): PR #185 open but mergeability held on "Commit signatures + sign-off" check. Both commits are GPG/SSH-signed but missing `Signed-off-by:` trailers. Requires: `git fetch origin main && git rebase --signoff origin/main && git push --force-with-lease origin rocm-fix-fix-2-unset-override-dry-run-panics-rc` (force-push of fres's decision; then everything green + mergeable).
+**Blockers:** None. fres authorized the rebase; done: `git rebase --signoff --gpg-sign origin/main` (both commits now signed AND signed-off, rebased onto current main → no longer BEHIND) then `--force-with-lease` push. New HEAD `9291469` (was 09e1c08); commits e075ace + 9291469. Approval PRESERVED (still APPROVED post-force-push). CI re-running on the new commits; the sign-off check should now pass. Merge remains fres's call.
 
 ---
 
@@ -112,3 +112,4 @@ Files:
 ### 2026-08-06 (session 5)
 
 - Agent nudge: PR #185's blocking check finished and CI run completed. Re-verified status — nothing changed materially. Sign-off check still blocking; GPU E2E now finished (all green). Still awaiting fres's go-ahead to force-push the rebase.
+- fres said "rebase" → authorized. Verified clean tree + responsive signer (op-ssh-sign probe OK), then `git rebase --signoff --gpg-sign origin/main`: both commits re-signed AND stamped `Signed-off-by: fredespi`, replayed onto current main (0 behind). New SHAs e075ace + 9291469 (HEAD). Force-pushed with `--force-with-lease`; remote at 9291469. Confirmed juhovainio's APPROVED review survived the force-push. CI re-triggered on the new commits (sign-off check pending → expected to pass now). Merge stays fres's call.
