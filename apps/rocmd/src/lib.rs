@@ -2380,6 +2380,9 @@ fn ensure_rocm_command_is_read_only(args: &[String]) -> Result<()> {
             .as_deref()
             .is_none_or(|value| matches!(value, "status" | "logs" | "log")),
         Some("uninstall") => args.iter().any(|arg| arg == "--dry-run"),
+        // `storage report` (the default subcommand) only measures folders. The
+        // two `remove-*` verbs delete, so they stay off the read-only list.
+        Some("storage") => second.as_deref().is_none_or(|value| value == "report"),
         // `setup status` reports first-time setup state (read-only); `setup reset`
         // re-arms it and is mutating. Mirrors the bin's rocm_command classifier so
         // the read-only allowlist is consistent across binaries.
@@ -5402,6 +5405,31 @@ mod tests {
         let error = ensure_rocm_command_is_read_only(&reset_args)
             .expect_err("setup reset must go through approval");
         assert!(error.to_string().contains("approval UI"));
+        Ok(())
+    }
+
+    #[test]
+    fn storage_report_is_read_only_but_removal_is_not() -> Result<()> {
+        for args in [vec!["storage"], vec!["storage", "report"]] {
+            let normalized = normalized_rocm_command_args(
+                serde_json::json!({ "args": args })
+                    .as_object()
+                    .expect("json object"),
+            )?;
+            ensure_rocm_command_is_read_only(&normalized)
+                .unwrap_or_else(|_| panic!("storage {args:?} only measures folders"));
+        }
+
+        for verb in ["remove-old-installs", "remove-downloads"] {
+            let normalized = normalized_rocm_command_args(
+                serde_json::json!({ "args": ["storage", verb] })
+                    .as_object()
+                    .expect("json object"),
+            )?;
+            let error = ensure_rocm_command_is_read_only(&normalized)
+                .expect_err("storage removal must go through approval");
+            assert!(error.to_string().contains("approval UI"));
+        }
         Ok(())
     }
 

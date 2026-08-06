@@ -646,6 +646,11 @@ enum StorageCommand {
     #[command(name = "remove-old-installs", alias = "remove-old-runtimes")]
     RemoveOldInstalls {
         /// How many recent installs to keep for each channel, format, and GPU family.
+        ///
+        /// "Recent" means most recently installed, not highest version, so
+        /// after a deliberate downgrade the older version counts as the newer
+        /// install. The one in use and the rollback target are always kept on
+        /// top of this count, whatever it is set to.
         #[arg(long, default_value_t = storage::DEFAULT_KEEP)]
         keep: usize,
         /// Show what would happen without changing files.
@@ -1973,7 +1978,7 @@ fn fix(fix_id: Option<String>, yes: bool, dry_run: bool, device_index: Option<i6
     Ok(())
 }
 
-fn record_cli_audit_event(
+pub(crate) fn record_cli_audit_event(
     paths: &AppPaths,
     category: &str,
     action: &str,
@@ -9460,6 +9465,20 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
                 command_title: "Uninstall".to_owned(),
             })
         }
+        // `storage report` (the default subcommand) only measures folders, so
+        // the assistant can run it directly. The two `remove-*` verbs delete
+        // multi-gigabyte trees and go through the approval UI.
+        Some("storage") if second.as_deref().is_none_or(|value| value == "report") => {
+            Ok(ChatRocmCommandAction::ReadOnly(args))
+        }
+        Some("storage") => {
+            ensure_flag(&mut args, "--yes");
+            Ok(ChatRocmCommandAction::Approval {
+                args,
+                pending_title: "Free up disk space".to_owned(),
+                command_title: "Storage".to_owned(),
+            })
+        }
         Some("comfyui") if second.as_deref() == Some("install") => {
             Ok(ChatRocmCommandAction::Approval {
                 args,
@@ -11946,18 +11965,23 @@ fn artifact_source_policy_label(policy: &str) -> &str {
 /// unreadable at the sizes this reports.
 fn format_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
-    const MIB: f64 = 1024.0 * KIB;
-    const GIB: f64 = 1024.0 * MIB;
+    // `{:.1}` rounds, so from 1023.95 of a unit upwards the text already reads
+    // as a full 1024 of it. Step up there rather than printing "1024.0 KiB".
+    const ROUNDS_UP_TO_NEXT_UNIT: f64 = 1023.95;
+
     let value = bytes as f64;
-    if value >= GIB {
-        format!("{:.1} GiB", value / GIB)
-    } else if value >= MIB {
-        format!("{:.1} MiB", value / MIB)
-    } else if value >= KIB {
-        format!("{:.1} KiB", value / KIB)
-    } else {
-        format!("{bytes} bytes")
+    if value < KIB {
+        return format!("{bytes} bytes");
     }
+    let kib = value / KIB;
+    if kib < ROUNDS_UP_TO_NEXT_UNIT {
+        return format!("{kib:.1} KiB");
+    }
+    let mib = kib / KIB;
+    if mib < ROUNDS_UP_TO_NEXT_UNIT {
+        return format!("{mib:.1} MiB");
+    }
+    format!("{:.1} GiB", mib / KIB)
 }
 
 #[allow(dead_code)]
@@ -19036,6 +19060,48 @@ model recipes
                 "setup {args:?} should be read-only, got {action:?}"
             );
         }
+    }
+
+    #[test]
+    fn storage_report_is_read_only_and_removal_requires_approval() {
+        for args in [
+            vec!["storage".to_owned()],
+            vec!["storage".to_owned(), "report".to_owned()],
+        ] {
+            let action = chat_rocm_command_action_from_args(args.clone())
+                .expect("storage report classifies");
+            assert!(
+                matches!(action, ChatRocmCommandAction::ReadOnly(_)),
+                "storage {args:?} only measures folders, so it should be read-only, got {action:?}"
+            );
+        }
+
+        for verb in ["remove-old-installs", "remove-downloads"] {
+            let action =
+                chat_rocm_command_action_from_args(vec!["storage".to_owned(), verb.to_owned()])
+                    .expect("storage removal classifies");
+            match action {
+                ChatRocmCommandAction::Approval { args, .. } => {
+                    assert!(
+                        args.iter().any(|arg| arg == "--yes"),
+                        "approved removal runs non-interactively: {args:?}"
+                    );
+                }
+                other @ ChatRocmCommandAction::ReadOnly(_) => {
+                    panic!("storage {verb} must require approval, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn format_bytes_steps_up_instead_of_printing_1024_of_the_smaller_unit() {
+        assert_eq!(format_bytes(1023), "1023 bytes");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        // One byte short of the next unit used to round to "1024.0 KiB".
+        assert_eq!(format_bytes(1_048_575), "1.0 MiB");
+        assert_eq!(format_bytes(1_048_576), "1.0 MiB");
+        assert_eq!(format_bytes(1_073_741_823), "1.0 GiB");
     }
 
     #[test]

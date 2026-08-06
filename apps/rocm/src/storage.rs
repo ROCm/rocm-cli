@@ -55,10 +55,16 @@ pub(crate) struct Measurement {
 
 /// Walk `path` and total the apparent size of every regular file below it.
 ///
-/// Symlinks are counted as their own (tiny) size and never followed, so a
-/// symlinked-in model folder is not attributed to the runtime that points at it.
+/// Symlinks *below* the root are counted as their own (tiny) size and never
+/// followed, so a symlinked-in model folder is not attributed to the runtime
+/// that points at it. The root itself is resolved with `metadata` rather than
+/// `symlink_metadata`: relocating a cache to a bigger disk by symlinking it is
+/// normal, and measuring the link instead of its target reported a multi-gigabyte
+/// cache as a few bytes, marked complete. This also keeps sizing consistent with
+/// the `Path::exists` gates in [`PathUsage::measure`] and [`build_report`],
+/// which follow the link too.
 pub(crate) fn measure_path(path: &Path) -> Measurement {
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+    let Ok(metadata) = std::fs::metadata(path) else {
         return Measurement {
             bytes: 0,
             complete: false,
@@ -205,12 +211,38 @@ fn matches_ignore_case(value: Option<&str>, other: &str) -> bool {
     value.is_some_and(|value| value.eq_ignore_ascii_case(other))
 }
 
+/// The install the configured default actually resolves to, if any.
+///
+/// `default_runtime_id` carries no version — it is `therock-<channel>:<family>`
+/// — so every install of one channel and family shares it, and installing or
+/// updating sets it on every real machine. Holding every id match would
+/// therefore hold the whole family and make `--keep` inert. The default only
+/// holds an install when it names exactly one, which is the same
+/// "matches exactly one" rule `current_runtime_manifest` applies when it
+/// resolves the default everywhere else. When it is ambiguous the install that
+/// is genuinely in use is still held by [`HoldReason::Active`].
+pub(crate) fn resolved_default_runtime_key(
+    manifests: &[therock::InstalledRuntimeManifest],
+    inputs: &RetentionInputs,
+) -> Option<String> {
+    let default_runtime_id = inputs.default_runtime_id.as_deref()?;
+    let mut matches = manifests
+        .iter()
+        .filter(|manifest| manifest.runtime_id.eq_ignore_ascii_case(default_runtime_id));
+    let first = matches.next()?;
+    matches.next().is_none().then(|| first.runtime_key.clone())
+}
+
 /// The hold that applies to a runtime regardless of how recent it is.
+///
+/// `default_key` is the output of [`resolved_default_runtime_key`] for the same
+/// manifest set.
 ///
 /// Ordered most-specific first so the reported reason is the most useful one.
 pub(crate) fn unconditional_hold(
     manifest: &therock::InstalledRuntimeManifest,
     inputs: &RetentionInputs,
+    default_key: Option<&str>,
 ) -> Option<HoldReason> {
     let key = manifest.runtime_key.as_str();
     if matches_ignore_case(inputs.active_runtime_key.as_deref(), key) {
@@ -219,7 +251,7 @@ pub(crate) fn unconditional_hold(
     if matches_ignore_case(inputs.previous_runtime_key.as_deref(), key) {
         return Some(HoldReason::Previous);
     }
-    if matches_ignore_case(inputs.default_runtime_id.as_deref(), &manifest.runtime_id) {
+    if matches_ignore_case(default_key, key) {
         return Some(HoldReason::Default);
     }
     if inputs
@@ -259,9 +291,10 @@ pub(crate) fn select_runtimes_to_remove(
     let mut held: Vec<(String, HoldReason)> = Vec::new();
     let mut groups: BTreeMap<(String, String, String), Vec<&therock::InstalledRuntimeManifest>> =
         BTreeMap::new();
+    let default_key = resolved_default_runtime_key(manifests, inputs);
 
     for manifest in manifests {
-        if let Some(reason) = unconditional_hold(manifest, inputs) {
+        if let Some(reason) = unconditional_hold(manifest, inputs, default_key.as_deref()) {
             held.push((manifest.runtime_key.clone(), reason));
             continue;
         }
@@ -370,6 +403,7 @@ pub(crate) fn build_report(paths: &AppPaths, config: &RocmCliConfig) -> Result<S
     let manifests = therock::load_runtime_manifests(paths)?;
     let marker = read_active_runtime_marker(paths);
     let inputs = RetentionInputs::from_config(config, marker.as_ref());
+    let default_key = resolved_default_runtime_key(&manifests, &inputs);
 
     let mut runtimes = Vec::new();
     let mut runtimes_total_bytes = 0_u64;
@@ -390,11 +424,8 @@ pub(crate) fn build_report(paths: &AppPaths, config: &RocmCliConfig) -> Result<S
                 inputs.previous_runtime_key.as_deref(),
                 &manifest.runtime_key,
             ),
-            default_runtime: matches_ignore_case(
-                inputs.default_runtime_id.as_deref(),
-                &manifest.runtime_id,
-            ),
-            hold_reason: unconditional_hold(manifest, &inputs),
+            default_runtime: matches_ignore_case(default_key.as_deref(), &manifest.runtime_key),
+            hold_reason: unconditional_hold(manifest, &inputs, default_key.as_deref()),
             runtime_key: manifest.runtime_key.clone(),
             runtime_id: manifest.runtime_id.clone(),
             channel: manifest.channel.clone(),
@@ -674,16 +705,33 @@ pub(crate) fn render_prune_plan(plan: &PrunePlan, keep: usize, dry_run: bool) ->
 ///
 /// Reuses [`UninstallPlan`] so the review output and the removal loop stay the
 /// same shape as `rocm uninstall`.
+///
+/// Both walk roots are checked with `symlink_metadata` before anything is
+/// collected. Relocating the cache to a bigger disk with a symlink is a normal
+/// thing for exactly the user running a disk-space command, and following the
+/// link would collect real files outside the cache and delete them — with a
+/// dry-run that shows them as ordinary cache paths, so nothing looks wrong.
+/// Entries *below* the root were already handled correctly and still are.
 pub(crate) fn build_downloads_plan(paths: &AppPaths) -> UninstallPlan {
     let mut plan = UninstallPlan::default();
     for (kind, dir) in [
         ("ROCm archive", download_cache_dir(paths)),
         ("helper tool archive", tool_download_cache_dir(paths)),
     ] {
-        if !dir.exists() {
-            plan.skipped
-                .push(format!("nothing downloaded in {}", dir.display()));
-            continue;
+        match std::fs::symlink_metadata(&dir) {
+            Ok(metadata) if metadata.is_symlink() => {
+                plan.skipped.push(format!(
+                    "{} is a link to somewhere else, so its contents are left alone",
+                    dir.display()
+                ));
+                continue;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                plan.skipped
+                    .push(format!("nothing downloaded in {}", dir.display()));
+                continue;
+            }
         }
         let mut found = false;
         let mut stack = vec![dir.clone()];
@@ -777,7 +825,12 @@ fn approved(action: &str, yes: bool) -> Result<bool> {
 
 pub(crate) fn storage(command: Option<StorageCommand>) -> Result<()> {
     let paths = AppPaths::discover()?;
-    let mut config = RocmCliConfig::load(&paths).unwrap_or_default();
+    // Deliberately not `unwrap_or_default()`. `load` already returns the
+    // default for an absent file; an *unparseable* file returns an error, and
+    // defaulting it away would silently drop the active, previous and default
+    // runtime — every force-keep at once — on the one command here that
+    // deletes. Failing loudly is the only safe reading of a corrupt config.
+    let mut config = RocmCliConfig::load(&paths)?;
 
     match command.unwrap_or(StorageCommand::Report { json: false }) {
         StorageCommand::Report { json } => {
@@ -799,13 +852,64 @@ pub(crate) fn storage(command: Option<StorageCommand>) -> Result<()> {
                 return Ok(());
             }
             for entry in &plan.remove {
+                // The plan was built before the confirmation prompt blocked on
+                // stdin, so a runtime could have been activated in another
+                // terminal meanwhile. Re-check the holds against config as it
+                // is now, immediately before deleting. (The ownership guard is
+                // already re-checked inside `uninstall_runtime`.)
+                let manifests = therock::load_runtime_manifests(&paths)?;
+                let marker = read_active_runtime_marker(&paths);
+                let inputs = RetentionInputs::from_config(&config, marker.as_ref());
+                let default_key = resolved_default_runtime_key(&manifests, &inputs);
+                if let Some(manifest) = manifests
+                    .iter()
+                    .find(|manifest| manifest.runtime_key == entry.runtime_key)
+                    && let Some(reason) =
+                        unconditional_hold(manifest, &inputs, default_key.as_deref())
+                {
+                    println!("left {} alone: {}", entry.runtime_key, reason.describe());
+                    continue;
+                }
+
                 // Per-key delegation keeps config/marker cleanup in one place.
                 let result = crate::uninstall_runtime(&paths, &mut config, &entry.runtime_key)
                     .with_context(|| format!("failed to remove {}", entry.runtime_key))?;
-                println!(
-                    "removed {} ({})",
-                    result.runtime_key,
-                    format_bytes(entry.size_bytes)
+                // `uninstall_runtime` re-evaluates ownership itself and can
+                // decline to delete the folder while still clearing the
+                // registry entry. Reporting the space as reclaimed then would
+                // be a lie the user cannot check: the tree stays, and with its
+                // registry record gone it is invisible to `rocm storage report`
+                // and un-prunable. Report what actually happened, as
+                // `rocm runtimes uninstall` already does.
+                if let Some(path) = result.removed_install_root.as_ref() {
+                    println!(
+                        "removed {} ({}) from {}",
+                        result.runtime_key,
+                        format_bytes(entry.size_bytes),
+                        path.display()
+                    );
+                } else {
+                    println!(
+                        "removed the registry entry for {}, but left its folder {} in place",
+                        result.runtime_key,
+                        entry.install_root.display()
+                    );
+                    println!(
+                        "  nothing was freed; remove that folder by hand if you want the space"
+                    );
+                }
+                crate::record_cli_audit_event(
+                    &paths,
+                    "runtime",
+                    "storage_remove_old_installs",
+                    "info",
+                    format!(
+                        "removed runtime_key={} runtime_id={} folder_removed={}",
+                        result.runtime_key,
+                        result.runtime_id,
+                        result.removed_install_root.is_some()
+                    ),
+                    None,
                 );
             }
             println!("old ROCm installs removed");
@@ -825,6 +929,14 @@ pub(crate) fn storage(command: Option<StorageCommand>) -> Result<()> {
                     .with_context(|| format!("failed to remove {}", entry.path.display()))?;
             }
             println!("{} downloaded file(s) removed", plan.actions.len());
+            crate::record_cli_audit_event(
+                &paths,
+                "runtime",
+                "storage_remove_downloads",
+                "info",
+                format!("removed {} downloaded file(s)", plan.actions.len()),
+                None,
+            );
         }
     }
     Ok(())
@@ -981,6 +1093,144 @@ mod tests {
         assert_eq!(reason("marked"), Some(HoldReason::Marker));
     }
 
+    /// Regression test for the state every real machine is actually in.
+    ///
+    /// `runtime_id` is `therock-<channel>:<family>` with no version in it, and
+    /// `activate_runtime` sets `default_runtime_id` on every install and every
+    /// update — so a machine that has accumulated installs has one id shared by
+    /// the whole family. Holding every id match held all of them, which made
+    /// `--keep` (including `--keep 0`) do nothing at all. The earlier suite
+    /// missed this because its `default_runtime_id` named a *different* family
+    /// from the manifests under test, so the Default hold never fired.
+    #[test]
+    fn keep_still_applies_when_the_default_id_covers_a_whole_family() {
+        // Six accumulated installs of one family, as `rocm update --apply`
+        // leaves them.
+        let manifests = vec![
+            manifest("release-wheel-gfx110x-7-10-0", "gfx110X-all", "7.10.0", 10),
+            manifest("release-wheel-gfx110x-7-11-0", "gfx110X-all", "7.11.0", 20),
+            manifest("release-wheel-gfx110x-7-12-0", "gfx110X-all", "7.12.0", 30),
+            manifest("release-wheel-gfx110x-7-13-0", "gfx110X-all", "7.13.0", 40),
+            manifest("release-wheel-gfx110x-7-14-0", "gfx110X-all", "7.14.0", 50),
+            manifest("release-wheel-gfx110x-7-15-0", "gfx110X-all", "7.15.0", 60),
+        ];
+        // Written exactly as `activate_runtime` writes it: the active key and
+        // the default id both point into the same family.
+        let inputs = RetentionInputs {
+            active_runtime_key: Some("release-wheel-gfx110x-7-15-0".to_owned()),
+            previous_runtime_key: Some("release-wheel-gfx110x-7-14-0".to_owned()),
+            default_runtime_id: Some("therock-release:gfx110X-all".to_owned()),
+            marker_runtime_keys: Vec::new(),
+        };
+
+        // The default id matches all four, so it identifies none of them and
+        // must not hold anything; Active and Previous still hold the two the
+        // user actually depends on.
+        assert_eq!(resolved_default_runtime_key(&manifests, &inputs), None);
+
+        let (removable, held) = select_runtimes_to_remove(&manifests, &inputs, DEFAULT_KEEP);
+        assert_eq!(
+            removable,
+            vec![
+                "release-wheel-gfx110x-7-10-0".to_owned(),
+                "release-wheel-gfx110x-7-11-0".to_owned(),
+            ]
+        );
+        let reason = |key: &str| {
+            held.iter()
+                .find(|(held_key, _)| held_key == key)
+                .map(|(_, reason)| reason.clone())
+        };
+        assert_eq!(
+            reason("release-wheel-gfx110x-7-15-0"),
+            Some(HoldReason::Active)
+        );
+        assert_eq!(
+            reason("release-wheel-gfx110x-7-14-0"),
+            Some(HoldReason::Previous)
+        );
+        assert!(
+            held.iter()
+                .all(|(_, reason)| *reason != HoldReason::Default),
+            "an ambiguous default must not hold anything: {held:?}"
+        );
+
+        // `--keep 0` must now be a real button rather than a no-op, while the
+        // in-use and rollback installs stay held regardless.
+        let (removable, _) = select_runtimes_to_remove(&manifests, &inputs, 0);
+        assert_eq!(
+            removable,
+            vec![
+                "release-wheel-gfx110x-7-10-0".to_owned(),
+                "release-wheel-gfx110x-7-11-0".to_owned(),
+                "release-wheel-gfx110x-7-12-0".to_owned(),
+                "release-wheel-gfx110x-7-13-0".to_owned(),
+            ]
+        );
+    }
+
+    /// The other half of the same rule: when the default id names exactly one
+    /// install it is a real, specific reference and still holds it.
+    #[test]
+    fn an_unambiguous_default_still_holds_its_install() {
+        let manifests = vec![
+            manifest("only-gfx120x", "gfx120X-all", "7.12.0", 10),
+            manifest("other-family", "gfx110X-all", "7.12.0", 20),
+        ];
+        let inputs = RetentionInputs {
+            default_runtime_id: Some("therock-release:gfx120X-all".to_owned()),
+            ..RetentionInputs::default()
+        };
+
+        assert_eq!(
+            resolved_default_runtime_key(&manifests, &inputs).as_deref(),
+            Some("only-gfx120x")
+        );
+        let (removable, held) = select_runtimes_to_remove(&manifests, &inputs, 0);
+        assert_eq!(removable, vec!["other-family".to_owned()]);
+        assert_eq!(
+            held.iter()
+                .find(|(key, _)| key == "only-gfx120x")
+                .map(|(_, reason)| reason.clone()),
+            Some(HoldReason::Default)
+        );
+    }
+
+    /// Every force-keep compares case-insensitively, not just the active one.
+    /// Replacing any of these `eq_ignore_ascii_case` calls with `==` must fail
+    /// a test.
+    #[test]
+    fn all_force_keeps_compare_case_insensitively() {
+        let manifests = vec![
+            manifest("active", "gfx110X-all", "7.10.0", 1),
+            manifest("previous", "gfx110X-all", "7.10.0", 2),
+            manifest("marked", "gfx110X-all", "7.10.0", 3),
+            manifest("by-default-id", "gfx120X-all", "7.10.0", 4),
+        ];
+        let inputs = RetentionInputs {
+            active_runtime_key: Some("ACTIVE".to_owned()),
+            previous_runtime_key: Some("PreVioUs".to_owned()),
+            default_runtime_id: Some("THEROCK-RELEASE:GFX120X-ALL".to_owned()),
+            marker_runtime_keys: vec!["MARKED".to_owned()],
+        };
+
+        let (removable, held) = select_runtimes_to_remove(&manifests, &inputs, 0);
+
+        assert!(
+            removable.is_empty(),
+            "case differences must not defeat a force-keep: {removable:?}"
+        );
+        let reason = |key: &str| {
+            held.iter()
+                .find(|(held_key, _)| held_key == key)
+                .map(|(_, reason)| reason.clone())
+        };
+        assert_eq!(reason("active"), Some(HoldReason::Active));
+        assert_eq!(reason("previous"), Some(HoldReason::Previous));
+        assert_eq!(reason("by-default-id"), Some(HoldReason::Default));
+        assert_eq!(reason("marked"), Some(HoldReason::Marker));
+    }
+
     #[test]
     fn never_selects_adopted_imported_or_read_only_installs() {
         let mut adopted = manifest("adopted", "gfx110X-all", "7.10.0", 1);
@@ -1121,5 +1371,136 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
         Ok(())
+    }
+
+    /// Relocating the cache to a bigger disk with a symlink is a normal thing
+    /// for exactly the user running a disk-space command. Following the link
+    /// collected real files outside the cache and deleted them, and the
+    /// dry-run showed them as ordinary cache paths so nothing looked wrong.
+    #[cfg(unix)]
+    #[test]
+    fn downloads_plan_refuses_to_reach_through_a_symlinked_cache_root() -> Result<()> {
+        let (root, paths) = test_paths("downloads-symlink-root");
+        let outside = root.join("somewhere-else");
+        std::fs::create_dir_all(&outside)?;
+        std::fs::write(outside.join("not-a-download.bin"), b"precious")?;
+        std::fs::create_dir_all(&paths.cache_dir)?;
+        std::os::unix::fs::symlink(&outside, paths.cache_dir.join("therock"))?;
+
+        let plan = build_downloads_plan(&paths);
+
+        assert!(
+            plan.actions.is_empty(),
+            "nothing behind the link may be collected: {:?}",
+            plan.actions
+        );
+        assert!(
+            plan.skipped
+                .iter()
+                .any(|line| line.contains("is a link to somewhere else")),
+            "the user must be told why it was skipped: {:?}",
+            plan.skipped
+        );
+        // The plan is what the removal loop iterates, so an empty plan is what
+        // keeps the file on disk.
+        assert!(outside.join("not-a-download.bin").is_file());
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// A symlinked cache used to measure as the length of the link itself —
+    /// about 17 bytes, reported as a complete measurement — which is exactly
+    /// backwards for the caches this feature exists to surface.
+    #[cfg(unix)]
+    #[test]
+    fn measuring_a_symlinked_directory_reports_the_target_size() -> Result<()> {
+        let (root, paths) = test_paths("measure-symlink-root");
+        let target = root.join("real-cache");
+        std::fs::create_dir_all(&target)?;
+        std::fs::write(target.join("payload.bin"), vec![0_u8; 4096])?;
+        std::fs::create_dir_all(&paths.cache_dir)?;
+        let link = paths.cache_dir.join("linked");
+        std::os::unix::fs::symlink(&target, &link)?;
+
+        let measurement = measure_path(&link);
+
+        assert!(
+            measurement.bytes >= 4096,
+            "a symlinked cache must measure its target, got {measurement:?}"
+        );
+        assert!(measurement.complete);
+
+        // Symlinks *below* the root are still counted as themselves and never
+        // followed, so a linked-in model folder is not attributed to the
+        // runtime pointing at it.
+        let runtime_root = root.join("runtime");
+        std::fs::create_dir_all(&runtime_root)?;
+        std::os::unix::fs::symlink(&target, runtime_root.join("models"))?;
+        assert!(measure_path(&runtime_root).bytes < 4096);
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// The whole removal path end to end: plan, ownership guard, deletion,
+    /// and the config/registry cleanup `uninstall_runtime` owns.
+    #[test]
+    fn removing_old_installs_deletes_only_the_planned_folders() -> Result<()> {
+        let (root, paths) = test_paths("remove-executes");
+        let old = install_fixture(&paths, manifest("old", "gfx110X-all", "7.10.0", 10), 2048)?;
+        let kept = install_fixture(&paths, manifest("kept", "gfx110X-all", "7.11.0", 20), 2048)?;
+        let active = install_fixture(
+            &paths,
+            manifest("active", "gfx110X-all", "7.12.0", 30),
+            2048,
+        )?;
+        let mut config = RocmCliConfig {
+            active_runtime_key: Some("active".to_owned()),
+            // The real-machine state: a family-wide default id alongside the
+            // active key.
+            default_runtime_id: Some("therock-release:gfx110X-all".to_owned()),
+            ..RocmCliConfig::default()
+        };
+
+        let plan = build_prune_plan(&paths, &config, 1)?;
+        let planned: Vec<&str> = plan
+            .remove
+            .iter()
+            .map(|entry| entry.runtime_key.as_str())
+            .collect();
+        assert_eq!(planned, vec!["old"]);
+
+        for entry in &plan.remove {
+            crate::uninstall_runtime(&paths, &mut config, &entry.runtime_key)?;
+        }
+
+        assert!(!old.install_root.exists(), "planned folder must be gone");
+        assert!(kept.install_root.is_dir(), "kept folder must survive");
+        assert!(active.install_root.is_dir(), "active folder must survive");
+        assert!(
+            !paths
+                .data_dir
+                .join("runtimes")
+                .join("registry")
+                .join("old.json")
+                .exists()
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// `--yes` is required when there is nobody to answer the prompt. This is
+    /// the gate standing between a scripted invocation and a multi-gigabyte
+    /// deletion, so it is worth a test of its own.
+    #[test]
+    fn removal_requires_yes_when_there_is_no_terminal_to_prompt() {
+        assert!(approved("removing old ROCm installs", true).is_ok_and(|approved| approved));
+        if !interactive_terminal() {
+            let error = approved("removing old ROCm installs", false)
+                .expect_err("must refuse without --yes outside a terminal");
+            assert!(error.to_string().contains("requires --yes"));
+        }
     }
 }
