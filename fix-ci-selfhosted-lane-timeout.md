@@ -1,11 +1,11 @@
 # WIP: Fix CI self-hosted E2E lane timeout (offline runner holds concurrency group)
 
-**Stage:** 7-pre-pr-review — all review findings addressed; committed as 0c884da (signed + signed-off); awaiting re-review
+**Stage:** 7-pre-pr-review — ON HOLD
 **Pipeline:** lightweight
 **Branch:** fix-ci-selfhosted-lane-timeout
-**Pre-PR-check:** changes-requested → awaiting re-review @0c884da (all 6 findings addressed; verified signatures + sign-off + tests pass)
+**Pre-PR-check:** changes-requested — OpenCode gpt-5.6-sol reviewer, 2026-08-06, @0c884da+dc5b71443fb42413
 **Ticket:** EAI-7548 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7548
-**Last Updated:** 2026-08-05
+**Last Updated:** 2026-08-06
 **Token Usage:** in=520 out=448k cache_create=2142379 cache_read=50790k calls=263
 
 ---
@@ -80,22 +80,24 @@ implementation.
 (Lightweight — activate bdd-scenarios skill before finalizing.)
 
 ```gherkin
-Scenario: An offline self-hosted runner cannot stall the merge-required checks
-  Given a self-hosted GPU E2E lane has a job queued on an offline runner
-  And that lane now lives in the e2e-selfhosted.yml workflow, not ci.yml
-  When a newer commit supersedes the current ci.yml run
-  Then ci.yml's shared concurrency group holds only cancellable GitHub-hosted jobs
-  And the newer ci.yml run's merge-required checks start immediately
-  And the still-queued self-hosted job only affects e2e-selfhosted.yml's own group
+Scenario: Hosted CI is not held hostage by unavailable GPU hardware
+  Given the GPU hardware for a pull request's E2E check is unavailable
+  And that check is still waiting to run
+  When a contributor pushes a newer commit to the pull request
+  Then hosted CI supersedes its previous run for that commit
+  And the pull request's hosted required checks run for the new commit
+  Without waiting on the unavailable GPU hardware
 ```
 
-Note: the queued self-hosted job itself is NOT reaped — it stays queued until the
-runner returns or GitHub reaps it — but it can no longer stall ci.yml. The stale
-row that this replaced wrongly claimed a timeout releases the group; the design
-gate proved `timeout-minutes` never fires on a queued job. Caveat unchanged: while
-the 4 self-hosted checks remain required, an offline runner can still block a MERGE
-via a missing required check until they are de-required (separate branch-protection
-change).
+Note (implementation, kept out of the scenario): the waiting GPU job itself is
+NOT reaped — it stays queued until the runner returns or GitHub reaps it — but it
+can no longer hold up hosted CI, because the two now run in separate workflows
+with separate concurrency groups. The stale row this replaced wrongly claimed a
+timeout releases the group; the design gate proved `timeout-minutes` never fires
+on a queued job. Caveat unchanged: while the self-hosted checks remain in the
+required list, an offline runner can still block a MERGE (not the hosted checks'
+execution) via a missing required check until they are de-required — a separate
+branch-protection change.
 
 ## Implementation Steps
 
@@ -133,7 +135,55 @@ change).
   - F6 (stale scenario): Gherkin rewritten to implemented guarantee
 - ✅ Committed + signed as **0c884da** (all hooks passed: fmt, license-header, signing).
 - ✅ Verification complete: signature valid (G), sign-off present, 3 contract tests pass, both workflows parse, clean tree.
-- 📋 Awaiting re-review by second-agent reviewer.
+
+### Pre-PR review — ROUND 2 (reviewer @0c884da, 2026-08-06) — findings addressed (STAGED, not committed)
+- **R2-F1 (empty report — I WAS WRONG in round 1): VALID, fixed.** Verified in the ACTUAL
+  pinned v8.0.1 source (`src/download-artifact.ts` line 190-192): when `artifacts.length === 1`
+  the artifact extracts into `resolvedPath` (the dir root) regardless of `pattern`/
+  `merge-multiple` — my round-1 docs-based refutation was wrong. After the split each report
+  job has exactly one artifact, so `discover()` (immediate-subdir scan) would find nothing →
+  empty report. FIX: taught `discover()` to also handle a root-level `report.json`, labeling
+  it from the sibling `platform.json`'s `platform_slug` (slug→artifact-name map). Added 2
+  tests (root-level w/ slug for all 4 platforms; sidecar-absent → mock fallback). Removed the
+  incorrect per-artifact-singleton comment in BOTH workflows.
+- **R2-F2 (contract test can false-pass): VALID, fixed.** Rewrote workflow_contract.rs to
+  EXTRACT the complete `runs-on` value (joins block/flow multiline forms) and the actual
+  top-level `concurrency.group` value (joins folded `>-` lines, stops at next key, ignores
+  comments) — then assert on those, not whole-file substrings. Added 2 extractor-guard tests
+  proving the multiline parsing works. 5 tests pass.
+- **R2-F3 (docs/ci-hardware-testing.md stale): VALID, fixed.** Rewrote for the split: intro
+  names e2e-selfhosted.yml + the offline-stall rationale; platform table has a workflow column
+  + `native` labels; triggers section drops the build-and-test dep and uses the new dispatch;
+  blocking section documents the required-check/offline caveat; report note covers the two
+  report jobs + the v8 single-artifact flatten.
+- **R2-F4 (WIP scenario overclaims/implementation-centric): VALID, fixed.** Rewrote the
+  Gherkin behaviorally ("hosted CI is not held hostage by unavailable GPU hardware"); moved
+  filenames/concurrency mechanics into a following note.
+- Reviewer confirmed round-1 DCO, license header, native labels, README fixes are verified.
+- ✅ Re-validated: all 71 xtask tests pass; fmt clean; both workflows parse.
+- 📋 BLOCKER (same as before): this turn arrived via the reviewer's `--pre-pr-review` relay,
+  whose gate blocks `git commit`. The amend must run in a turn driven directly by fres.
+  Next: `git-commit-with-fallback --amend -s` (re-using the message), then request re-review.
+
+### Pre-PR review — ROUND 3 (reviewer @0c884da, 2026-08-06) — findings assessed (STAGED)
+- **R3-F1 (no-sidecar GPU failure misattributed to Mock): VALID, fixed.** Confirmed the exact
+  path: e2e.rs writes report.json (line 849) then, on a parsing/hook error, exits (line 862)
+  BEFORE writing platform.json (line 893). So a GPU run that errors leaves report.json with NO
+  sidecar → my round-2 fallback labeled it `e2e-report` (Mock/Linux) → hardware failure shown
+  as Mock in the grid. FIX: `label_for_root_report` now maps ONLY an explicit `mock` slug to
+  the mock artifact; a missing/unknown slug returns a neutral `e2e-unknown-report` (renders as
+  "Unknown", never a false real platform). Updated the no-sidecar test to assert neutral (not
+  mock) and added an unknown-slug test. 72 xtask tests pass.
+- **R3-F2 (commit uses gmail, not employer, identity): DEFERRED TO FRES — not an agent call.**
+  AGENTS.md §2 says "employer's author/committer identity **(when required)**". The empirical
+  signal contradicts a hard requirement: fres's OWN prior merged commit on this repo
+  (#124-era) is authored `Fredrik Espinoza <fredrik.espinoza@gmail.com>` — the same identity
+  as HEAD — and fres has been merging under it; only one other contributor uses @amd.com. My
+  standing rules forbid changing git identity/config without explicit direction. So this is
+  fres's decision: keep the established gmail identity, or re-author under an @amd.com identity
+  (author + committer + Signed-off-by + signing key). Flagging, not switching.
+- Reviewer confirmed all four round-2 fixes verify.
+- ✅ Re-validated: 72 xtask tests pass; fmt clean; both workflows parse.
 
 ## KEY FINDING — required-check contradiction (drives "Split only" caveat)
 
@@ -157,7 +207,9 @@ Await re-review by second-agent reviewer. Do not open PR until `Pre-PR-check` is
 
 ## Blockers / Open Questions
 
-None — commit finalized. Awaiting re-review by second-agent reviewer.
+**BLOCKED (awaiting user):** Round-3 review returned with 2 findings. R3-F1 (neutral slug for missing platform.json) is fixed and verified (72 tests pass). **R3-F2 requires your decision on git identity:** the reviewer wants the commit re-authored under an `@amd.com` employer identity (author + committer + Signed-off-by + signing key), but my standing rules forbid changing git identity without explicit direction. The empirical signal contradicts a hard requirement — your own prior merged commit on this repo is authored under `Fredrik Espinoza <fredrik.espinoza@gmail.com>` (the same gmail identity HEAD currently uses), and AGENTS.md §2 says "when required", not unconditionally.
+
+**User decision needed:** Do you want the commit re-authored under an `@amd.com` identity, or keep the established gmail identity? Once decided, I'll amend and request re-review.
 
 ## RESOLVED
 - Does `timeout-minutes` cancel a job still QUEUED on an offline runner?
@@ -262,3 +314,9 @@ None — commit finalized. Awaiting re-review by second-agent reviewer.
 - Verified final tree: signature valid, sign-off present, 3 contract tests pass, both workflows parse, clean worktree.
 - Commit finalized as **0c884da**; all 6 pre-PR review findings confirmed resolved.
 - Awaiting re-review by second-agent reviewer before opening PR. "Split only" caveat remains — user to handle branch-protection de-require separately.
+
+### 2026-08-06 (round-3 review findings assessment)
+
+- **R3-F1 (neutral slug for missing platform.json): VALID, fixed.** Confirmed e2e.rs writes report.json before platform.json and exits on error without writing the sidecar. Updated `label_for_root_report` to map only explicit `mock` slug to mock artifact; missing/unknown slug → neutral `e2e-unknown-report` (renders "Unknown", never false platform). Updated no-sidecar test assertion to expect neutral, added unknown-slug test. **72 xtask tests pass; fmt clean; workflows parse.**
+- **R3-F2 (commit uses gmail vs employer identity): DEFERRED — user decision required.** Empirical signal contradicts hard requirement: user's own prior merged commit on repo uses `Fredrik Espinoza <fredrik.espinoza@gmail.com>` (same identity as HEAD); AGENTS.md §2 says "when required", not unconditionally. My rules forbid changing git identity without explicit direction. Flagging for user judgment: keep gmail (established practice) or re-author under `@amd.com`?
+- Changes staged; commitment pending identity decision from user.
