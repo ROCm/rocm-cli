@@ -5,7 +5,7 @@
 **Branch:** rocm-fix-fix-2-unset-override-dry-run-panics-rc
 **Pre-PR-check:** review-done (terminal) — reviewer(gpt-5.6-sol pre-PR agent), 2026-08-06, @09e1c08
 **Last Updated:** 2026-08-06
-**Token Usage:** in=2793773 out=607550 cache_create=6658396 cache_read=99756391 calls=637
+**Token Usage:** in=2793813 out=614761 cache_create=7240762 cache_read=104954320 calls=657
 
 **Gate Status:** GREEN. clippy clean, workspace/lib tests pass, and the full e2e suite ran; the single unexpected failure (`dash-managed-service-metrics`, a 30s-TTFT TUI timing scenario) was CONFIRMED a flake — it passes in isolation (scoped container re-run: 1 passed, 0 unexpected). Unrelated to the SIGPIPE change (touches only the engine-stdin write path). Revised fix committed `09e1c08` (signed) and pushed to origin.
 
@@ -117,3 +117,9 @@ Files:
 ### 2026-08-06 (session 6)
 
 - Polled CI status on #185 after rebase — **sign-off check now PASSES** ✓. Remaining checks (Coverage, Analyze/rust, TPN, clippy) still pending, none red. Approval preserved. PR fully mergeable once final jobs finish; merge timing remains fres's decision.
+
+### 2026-08-06 (session 7)
+
+- Monitored final CI jobs. All standard checks (Coverage, Analyze/rust, TPN, clippy) passed GREEN ✓. "E2E tests (GPU)" initially FAILED in 1s with runner infra error (`System.ArgumentNullException: configuredSettings`), not a code issue — self-hosted GPU runner misconfigured/unregistered.
+- Waited for full run to complete, then re-ran failed GPU job (`--failed` flag). GPU E2E now re-queued/pending for retry.
+- If re-run fails with same infra error again, indicates runner-provisioning issue (not this fix) — flagged for manual investigation, not a code regression.
