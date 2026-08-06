@@ -255,6 +255,31 @@ If your shell can't find the `rocm` command, for example with
 The directory is `~/.local/bin` on Linux, `%USERPROFILE%\.local\bin` on Windows,
 or the folder you set with `ROCM_CLI_INSTALL_DIR`.
 
+### Python package (x86_64 Linux and Windows)
+
+No wheels are published yet; once the first release ships, `rocm-cli` on PyPI
+is the supported install path for Python-packaging workflows. It carries the
+same prebuilt `rocm` and `rocmd` binaries as the installers above. Because
+these are command-line tools rather than a library, install them into their own
+isolated environment:
+
+```bash
+pipx install rocm-cli
+```
+
+```bash
+uv tool install rocm-cli
+```
+
+A plain `pip install rocm-cli` also works, but it only puts `rocm` and `rocmd`
+on `PATH` while that virtual environment is active.
+
+Wheels are built for Linux x86_64 and Windows x86_64 only, and there is no
+source distribution — the wheel ships the same binaries that are inside the
+signed release archives, not a Python reimplementation. It cannot carry the
+release `.sig` sidecar, so see `docs/release-trust.md` for what secures this
+channel instead.
+
 ## Build from source
 
 Building requires [Rust](https://rustup.rs/); the pinned toolchain in
