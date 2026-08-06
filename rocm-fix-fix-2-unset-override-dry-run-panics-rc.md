@@ -9,7 +9,9 @@
 
 **Gate Status:** GREEN. clippy clean, workspace/lib tests pass, and the full e2e suite ran; the single unexpected failure (`dash-managed-service-metrics`, a 30s-TTFT TUI timing scenario) was CONFIRMED a flake — it passes in isolation (scoped container re-run: 1 passed, 0 unexpected). Unrelated to the SIGPIPE change (touches only the engine-stdin write path). Revised fix committed `09e1c08` (signed) and pushed to origin.
 
-**Status:** Sign-off check now **PASSES** ✓; all standard CI green; approval PRESERVED. "E2E tests (GPU)" first FAILED in 1s with a runner INFRA error (`System.ArgumentNullException: configuredSettings` in GitHub.Runner ConfigurationStore.GetSettings) — self-hosted GPU runner misconfigured/unregistered, NOT a code failure. Once the overall run completed I re-ran the failed job (`gh run rerun 31102600401 --failed`); GPU E2E is now re-queued/pending. Waiting on that re-run. If it fails again with the same infra error, the GPU runner needs standing up (restore-app-dev-runner skill) — surface to fres, not a code issue. Merge remains fres's call.
+**Status:** Sign-off check **PASSES** ✓; all standard CI green; approval PRESERVED. ONLY blocker is "E2E tests (GPU)", which has now failed TWICE (original + one re-run) with the SAME runner INFRA error — `System.ArgumentNullException: configuredSettings` in GitHub.Runner ConfigurationStore.GetSettings, 0s before any test runs. This is NOT the code: the self-hosted app-dev-gpu runner is unregistered/misconfigured. A retry already failed identically, so retrying again is pointless.
+
+**BLOCKED (awaiting user): the app-dev-gpu self-hosted runner needs standing up (restore-app-dev-runner skill) — it touches shared cluster infra, so it's fres's call, not an agent-nudge action.** Once the runner is healthy, re-run the GPU job; everything else on #185 is green + approved + mergeable. Merge remains fres's call.
 
 ---
 
