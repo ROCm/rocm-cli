@@ -1,12 +1,12 @@
 # WIP: Fix CI self-hosted E2E lane timeout (offline runner holds concurrency group)
 
-**Stage:** 7-pre-pr-review — ON HOLD
+**Stage:** 7-pre-pr-review
 **Pipeline:** lightweight
 **Branch:** fix-ci-selfhosted-lane-timeout
-**Pre-PR-check:** changes-requested — OpenCode gpt-5.6-sol reviewer, 2026-08-06, @0c884da+dc5b71443fb42413
+**Pre-PR-check:** changes-requested — OpenCode gpt-5.6-sol reviewer, 2026-08-06, @0c884da+cdb96a899b298ac8
 **Ticket:** EAI-7548 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7548
 **Last Updated:** 2026-08-06
-**Token Usage:** in=520 out=448k cache_create=2142379 cache_read=50790k calls=263
+**Token Usage:** in=520k out=449k cache_create=2142379 cache_read=50790k calls=264
 
 ---
 
@@ -185,6 +185,20 @@ branch-protection change.
 - Reviewer confirmed all four round-2 fixes verify.
 - ✅ Re-validated: 72 xtask tests pass; fmt clean; both workflows parse.
 
+### Pre-PR review — ROUND 4 (reviewer @0c884da, 2026-08-06) — final finding fixed (STAGED)
+- **R4-F1 (unknown label still falsely Linux): VALID, fixed.** My round-3 neutral label
+  `e2e-unknown-report` still went through `fallback_descriptor`, which hardcodes OS = "Linux"
+  — so a Windows GPU run that errored before writing platform.json would be reported as Linux.
+  FIX: added an explicit `"unknown"` arm in `parse_descriptor` (crates/e2e-report/src/lib.rs)
+  that renders **Unknown / Unknown** (OS not defaulted to Linux). Added two descriptor unit
+  tests in the e2e-report crate: known-artifact mapping, and the unknown → Unknown/Unknown
+  assertion. 36 e2e-report + 72 xtask tests pass; fmt clean.
+- **Identity finding WITHDRAWN by reviewer** — confirmed my assessment: AGENTS.md qualifies it
+  "when required", and merged repo history establishes the gmail identity as accepted. So the
+  commit stays as-is (`Fredrik Espinoza <fredrik.espinoza@gmail.com>`).
+- Reviewer confirmed all prior-round fixes verify. **No open findings remain.**
+- 📋 Ready to amend-commit (blocked only by the reviewer-relay gate on this turn) then reopen.
+
 ## KEY FINDING — required-check contradiction (drives "Split only" caveat)
 
 Branch protection on `main` (`strict:true`, `enforce_admins:true`) lists all FOUR
@@ -203,13 +217,7 @@ admin branch-protection change), which the user opted to handle separately.
 
 ## Next Steps
 
-Await re-review by second-agent reviewer. Do not open PR until `Pre-PR-check` is `passed` or `review-done`. User to handle branch-protection de-require separately (the "Split only" caveat).
-
-## Blockers / Open Questions
-
-**BLOCKED (awaiting user):** Round-3 review returned with 2 findings. R3-F1 (neutral slug for missing platform.json) is fixed and verified (72 tests pass). **R3-F2 requires your decision on git identity:** the reviewer wants the commit re-authored under an `@amd.com` employer identity (author + committer + Signed-off-by + signing key), but my standing rules forbid changing git identity without explicit direction. The empirical signal contradicts a hard requirement — your own prior merged commit on this repo is authored under `Fredrik Espinoza <fredrik.espinoza@gmail.com>` (the same gmail identity HEAD currently uses), and AGENTS.md §2 says "when required", not unconditionally.
-
-**User decision needed:** Do you want the commit re-authored under an `@amd.com` identity, or keep the established gmail identity? Once decided, I'll amend and request re-review.
+Ready to amend-commit and open PR. All findings fixed and verified. User to handle branch-protection de-require separately (the "Split only" caveat). Next: run `git-commit-with-fallback --amend -s` (or open PR directly if amend was already auto-applied in the previous session) then proceed to pre-PR opening.
 
 ## RESOLVED
 - Does `timeout-minutes` cancel a job still QUEUED on an offline runner?
@@ -320,3 +328,9 @@ Await re-review by second-agent reviewer. Do not open PR until `Pre-PR-check` is
 - **R3-F1 (neutral slug for missing platform.json): VALID, fixed.** Confirmed e2e.rs writes report.json before platform.json and exits on error without writing the sidecar. Updated `label_for_root_report` to map only explicit `mock` slug to mock artifact; missing/unknown slug → neutral `e2e-unknown-report` (renders "Unknown", never false platform). Updated no-sidecar test assertion to expect neutral, added unknown-slug test. **72 xtask tests pass; fmt clean; workflows parse.**
 - **R3-F2 (commit uses gmail vs employer identity): DEFERRED — user decision required.** Empirical signal contradicts hard requirement: user's own prior merged commit on repo uses `Fredrik Espinoza <fredrik.espinoza@gmail.com>` (same identity as HEAD); AGENTS.md §2 says "when required", not unconditionally. My rules forbid changing git identity without explicit direction. Flagging for user judgment: keep gmail (established practice) or re-author under `@amd.com`?
 - Changes staged; commitment pending identity decision from user.
+
+### 2026-08-06 (round-4 review — final findings round)
+
+- **R4-F1 (unknown label still hardcoding Linux): VALID, fixed.** Discovered round-3 neutral label `e2e-unknown-report` still went through `fallback_descriptor`, which hardcodes OS="Linux" — so a Windows GPU run that errored before writing platform.json would render as Linux. FIX: added explicit `"unknown"` arm in `parse_descriptor` (crates/e2e-report/src/lib.rs) → renders **Unknown / Unknown**. Added two descriptor unit tests (known-artifact mapping; unknown → Unknown/Unknown case). **36 e2e-report + 72 xtask tests pass; fmt clean; workflows parse.**
+- **R3-F2 (identity): WITHDRAWN by reviewer.** Confirmed AGENTS.md §2 qualifies "when required" + merged repo history (user's own prior commit uses gmail identity). Commit stays as-is.
+- **Reviewer verdict: all prior-round fixes verify; no open findings remain.** All changes staged on top of commit 0c884da; ready to amend-commit.
