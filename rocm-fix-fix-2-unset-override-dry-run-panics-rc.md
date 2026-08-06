@@ -1,15 +1,15 @@
 # WIP: rocm fix fix-2-unset-override --dry-run panics rc=101
 
-**Stage:** 8-pre-pr-passed — ready for fres to open PR (review-done + gate green, pushed at 09e1c08)
+**Stage:** 9-pr-opened-sign-off-pending — ON HOLD
 **Pipeline:** lightweight
 **Branch:** rocm-fix-fix-2-unset-override-dry-run-panics-rc
-**Pre-PR-check:** review-done — reviewer(gpt-5.6-sol pre-PR agent), 2026-08-06, @6b50809+58d5504736651358
-**Last Updated:** 2026-08-06 (session 3)
-**Token Usage:** in=2793613 out=567499 cache_create=4375863 cache_read=80758510 calls=557
+**Pre-PR-check:** review-done (terminal) — reviewer(gpt-5.6-sol pre-PR agent), 2026-08-06, @6b50809+58d5504736651358
+**Last Updated:** 2026-08-06 (session 4)
+**Token Usage:** in=2793697 out=586370 cache_create=5202241 cache_read=90760693 calls=599
 
 **Gate Status:** GREEN. clippy clean, workspace/lib tests pass, and the full e2e suite ran; the single unexpected failure (`dash-managed-service-metrics`, a 30s-TTFT TUI timing scenario) was CONFIRMED a flake — it passes in isolation (scoped container re-run: 1 passed, 0 unexpected). Unrelated to the SIGPIPE change (touches only the engine-stdin write path). Revised fix committed `09e1c08` (signed) and pushed to origin.
 
-**Blockers:** BLOCKED (awaiting user): fres to open PR on main. Branch pushed to origin at 09e1c08 (2 commits: 6b50809 + 09e1c08). review-done + gate green.
+**Blockers:** BLOCKED (awaiting user): PR #185 open but mergeability held on "Commit signatures + sign-off" check. Both commits are GPG/SSH-signed but missing `Signed-off-by:` trailers. Requires: `git fetch origin main && git rebase --signoff origin/main && git push --force-with-lease origin rocm-fix-fix-2-unset-override-dry-run-panics-rc` (force-push of fres's decision; then everything green + mergeable).
 
 ---
 
@@ -69,7 +69,7 @@ Files:
 
 ## Next Steps
 
-1. Ready for fres to open the PR from branch `rocm-fix-fix-2-unset-override-dry-run-panics-rc` (2 commits, HEAD 09e1c08). Author does not open it.
+1. fres rebase + force-push to add sign-off trailers: `git rebase --signoff origin/main && git push --force-with-lease origin rocm-fix-fix-2-unset-override-dry-run-panics-rc` (this also clears the BEHIND state). Then PR #185 will be mergeable.
 
 ## Notes
 
@@ -102,3 +102,9 @@ Files:
 - Confirmed the finding against the code (engine write at main.rs:15230-15237; diagnostics after wait() at ~15288-15293) and verified every other stdin site is null/inherit, so the engine path is the only at-risk write. Added a re-exec'd regression test proving both directions (unguarded write killed by SIGPIPE; guarded write survives with an error). Mutation-checked: reverting the guard to a passthrough makes the test FAIL (wait_status 13 = SIGPIPE), so it is load-bearing. Test passes on Mac; running the full container gate next.
 - Full container gate completed: clippy clean, all unit/lib tests passed. E2E gate hit 1 unexpected failure: `dash-managed-service-metrics` (timing-sensitive TUI metrics test, "TTFT metrics did not appear: timed out after 30s"). Confirmed this is a suspected flake, not a regression: 2026-08-05 e2e was green (0 unexpected failures) on `6b50809` which already had the global `SIG_DFL` reset; the new narrower guard only wraps the engine-stdin write path, which the dashboard metrics scenario does not exercise. Scoped container re-run of just that one scenario in progress to confirm flake vs. regression (cheapest verification).
 - Scoped container re-run of that scenario PASSED (1 passed, 0 unexpected) → confirmed flake. A first clippy `large_stack_arrays` error on the 64 KB test buffer (passed on Mac, caught by container `-D warnings`) was fixed by moving it to the heap. Committed revised fix `09e1c08` (signed) and pushed to origin (`git-push-fallback --no-verify`; remote now at 09e1c08, 2 commits on the branch). Pre-PR verdict `review-done` is terminal, gate green — ready for fres to open the PR.
+
+### 2026-08-06 (session 4)
+
+- fres opened PR #185 for this branch. CI checks: approved by juhovainio, all CI passing (e2e still pending), mergeable but 2 commits behind main.
+- Diagnosed blocking check failure: "Commit signatures + sign-off" failed. Both commits are GPG/SSH-signed but missing `Signed-off-by:` trailers; this repo requires both. 
+- Prepared rebase command (`git rebase --signoff origin/main`) to add trailers and clear BEHIND state. Confirmed force-push is fres's call (irreversible, externally visible); not running without explicit go-ahead. Task parked on hold awaiting fres's instruction.
