@@ -1,6 +1,6 @@
 # WIP: E2E mock/real split for GPU serve scenarios
 
-**Stage:** done
+**Stage:** done — ON HOLD
 **Pipeline:** standard
 **Ticket:** [EAI-7484](https://amd.atlassian.net/browse/EAI-7484) — "Speed up E2E suite - mock/real split for GPU serve scenarios" (assignee Fredrik Espinoza, component rocm-cli)
 **Branch:** test-e2e-mock-real-split (merged; child of the [[fix-speed-up-e2e]] container)
@@ -79,7 +79,7 @@ record.
 
 ## Blockers
 
-None. Cleanup deferred: this worktree (checked out on `test-e2e-mock-real-split`) serves as the live home of the umbrella container task WL-123, not a dedicated leaf for WL-129. Cleanup would incorrectly resolve the active container and remove the umbrella's working base. Will revisit when WL-123 is complete.
+BLOCKED (awaiting user): Delete stale remote branch `test-e2e-mock-real-split` only (leaving worktree/session intact for WL-123), or leave everything untouched? This worktree serves as the live home of WL-123 (umbrella container); full cleanup would incorrectly resolve the active container and remove the umbrella's working base.
 
 ## Work Log
 
@@ -123,8 +123,3 @@ None. Cleanup deferred: this worktree (checked out on `test-e2e-mock-real-split`
   (WL-123 still has open children #8/#9/#11) and remove the umbrella's working base.
   Cleanup only correct when WL-123 is complete.
 
-### 2026-07-21 — Re-branched for Tasks #5–#7; Task #5 audit DONE
-
-- Re-branched in place: test-e2e-mock-real-split reset onto fresh origin/main.
-- Task #5 done (subagent audit vs live assertions): 14 GPU-tagged → 8 real, 6
-  mockable. Hypothesis wrong on chat #4/#5; missed #12/#13.
