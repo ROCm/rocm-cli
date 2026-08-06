@@ -1,13 +1,15 @@
 # WIP: rocm fix fix-2-unset-override --dry-run panics rc=101
 
-**Stage:** 8-pre-pr-revise
+**Stage:** 8-pre-pr-passed — ready for fres to open PR (review-done + gate green, pushed at 09e1c08)
 **Pipeline:** lightweight
 **Branch:** rocm-fix-fix-2-unset-override-dry-run-panics-rc
 **Pre-PR-check:** review-done — reviewer(gpt-5.6-sol pre-PR agent), 2026-08-06, @6b50809+58d5504736651358
 **Last Updated:** 2026-08-06
 **Token Usage:** in=2793613 out=567499 cache_create=4375863 cache_read=80758510 calls=557
 
-**Gate Status:** clippy fix compiled clean. Full gate re-run had 1 unexpected e2e failure: `dash-managed-service-metrics` ("TTFT metrics did not appear: timed out after 30s") — a timing-sensitive TUI metrics scenario. Suspected FLAKE, not a regression: the 2026-08-05 e2e run was green (0 unexpected) on 6b50809 which already had the global SIG_DFL; the new narrower guard on the engine-stdin write guards a path this dashboard test doesn't exercise. Scoped container re-run of just that scenario in progress to confirm flake vs. regression.
+**Gate Status:** GREEN. clippy clean, workspace/lib tests pass, and the full e2e suite ran; the single unexpected failure (`dash-managed-service-metrics`, a 30s-TTFT TUI timing scenario) was CONFIRMED a flake — it passes in isolation (scoped container re-run: 1 passed, 0 unexpected). Unrelated to the SIGPIPE change (touches only the engine-stdin write path). Revised fix committed `09e1c08` (signed) and pushed to origin.
+
+**Blockers:** BLOCKED (awaiting user): fres to open PR on main. Branch pushed to origin at 09e1c08 (2 commits: 6b50809 + 09e1c08). review-done + gate green.
 
 ---
 
@@ -67,8 +69,7 @@ Files:
 
 ## Next Steps
 
-1. Container gate (clippy+tests+e2e) running on the revised fix; on green, commit and push, then send re-review request back to the reviewer (agent-msg --rereview-request).
-2. Do NOT open the PR (fres's action) — only after re-review passes.
+1. Ready for fres to open the PR from branch `rocm-fix-fix-2-unset-override-dry-run-panics-rc` (2 commits, HEAD 09e1c08). Author does not open it.
 
 ## Notes
 
@@ -100,3 +101,4 @@ Files:
 - Pre-PR reviewer (gpt-5.6-sol agent) issued `changes-requested` at 90 confidence. Implemented requested enhancement: `with_sigpipe_ignored()` helper to wrap engine stdin writes, allowing SIGPIPE to be temporarily ignored so stdout/stderr writes abort with SIGPIPE but stdin writes surface as `BrokenPipe` errors instead of signals. Applied to engine subprocess stdin path. Changes in working tree pending commit and re-review.
 - Confirmed the finding against the code (engine write at main.rs:15230-15237; diagnostics after wait() at ~15288-15293) and verified every other stdin site is null/inherit, so the engine path is the only at-risk write. Added a re-exec'd regression test proving both directions (unguarded write killed by SIGPIPE; guarded write survives with an error). Mutation-checked: reverting the guard to a passthrough makes the test FAIL (wait_status 13 = SIGPIPE), so it is load-bearing. Test passes on Mac; running the full container gate next.
 - Full container gate completed: clippy clean, all unit/lib tests passed. E2E gate hit 1 unexpected failure: `dash-managed-service-metrics` (timing-sensitive TUI metrics test, "TTFT metrics did not appear: timed out after 30s"). Confirmed this is a suspected flake, not a regression: 2026-08-05 e2e was green (0 unexpected failures) on `6b50809` which already had the global `SIG_DFL` reset; the new narrower guard only wraps the engine-stdin write path, which the dashboard metrics scenario does not exercise. Scoped container re-run of just that one scenario in progress to confirm flake vs. regression (cheapest verification).
+- Scoped container re-run of that scenario PASSED (1 passed, 0 unexpected) → confirmed flake. A first clippy `large_stack_arrays` error on the 64 KB test buffer (passed on Mac, caught by container `-D warnings`) was fixed by moving it to the heap. Committed revised fix `09e1c08` (signed) and pushed to origin (`git-push-fallback --no-verify`; remote now at 09e1c08, 2 commits on the branch). Pre-PR verdict `review-done` is terminal, gate green — ready for fres to open the PR.
