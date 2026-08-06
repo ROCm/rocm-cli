@@ -1,6 +1,6 @@
 # WIP: E2E mock/real split for GPU serve scenarios
 
-**Stage:** 9-done (PR #136 MERGED — squash cae7781 on main, 2026-07-22 18:13 CEST)
+**Stage:** done
 **Pipeline:** standard
 **Ticket:** [EAI-7484](https://amd.atlassian.net/browse/EAI-7484) — "Speed up E2E suite - mock/real split for GPU serve scenarios" (assignee Fredrik Espinoza, component rocm-cli)
 **Branch:** test-e2e-mock-real-split (merged; child of the [[fix-speed-up-e2e]] container)
