@@ -103,7 +103,7 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 ## Blockers
 
 **BLOCKED (awaiting user action):**
-- **Scope reduction execution** — Branch rebased onto current main (ec2bcb3 → now 2026-08-06 ec2bcb3); awaiting your direct word to proceed with source edits (canary mechanism reduction: keep serve paths-filter + ci.yml honesty, drop @canary/@serves-on-gpu tags, canary_mode 6th bool, E2E_PR_CANARY, canary unit tests, merge_group-only Strix gating, README canary docs). Relay-gate hook forbids Edit tier on coordinator-tier relay. Once you approve, will reduce scope, commit (fast-forward), and push.
+- **Scope reduction execution — mid-flight, not yet mechanically blocked, but stalled on a tool timeout.** User already gave direct "go ahead with the reduction" approval this session (unblocked Edit tier). Feature-file reverts and expectation.rs field/tag/parsing/`resolve()` signature (6→5 args) reduction are done. Remaining purely mechanical: (1) delete 3 canary unit tests in expectation.rs (lines ~568–671) — an Edit attempt timed out mid-session; (2) tests/e2e.rs: drop `E2E_PR_CANARY` read + `canary_mode` arg; (3) ci.yml: drop `E2E_PR_CANARY` env + revert Strix jobs to `serve`-gated pull_request; (4) README + docs/ci-hardware-testing.md: revert canary docs; (5) container gate → commit (fast-forward) → push. A subsequent relay-only turn re-triggered the relay-gate hook (blocks Edit on coordinator-tier relay) — needs one more direct message from fres (a plain "continue" suffices) to resume and finish.
 - **Judgment calls #3/#6** (in-PR fixes already applied, force-pushed, and documented):
   - #3: continue-on-error trade-off on merge_group (Strix regression can land before nightly catches it) — document trade-off or drop continue-on-error?
   - #6: cross-PR RunMode struct refactor (#155/#156/#157) — pursue now or defer to shared decision?
@@ -257,6 +257,12 @@ exactly the 3 GPU guards + output line, `heavy` count 24→21 (only the 3 repoin
 - Feature files reverted: `tests/e2e-cucumber/features/chat.feature` + `tests/e2e-cucumber/features/model_serving.feature` (removed `@serves-on-gpu` tags added in scope).
 - **expectation.rs reductions:** removed `ScenarioDecl.canary` field + `ScenarioDecl.is_canary()` method, removed `canary` variant from tag enum, removed all `@canary` tag-parsing branches, updated `resolve()` signature (6→5 args: removed `canary_mode` bool), fixed ~30 resolve() call sites throughout the test module. Three canary unit tests deletion attempted (Edit timed out).
 - **Reduction scope remainder:** delete 3 canary unit tests (lines 568–671 in expectation.rs), update tests/e2e.rs (drop `E2E_PR_CANARY` read + `canary_mode` arg), update ci.yml (drop `E2E_PR_CANARY` env + revert Strix jobs to `serve`-gated pull_request), update README + docs/ci-hardware-testing.md (revert canary docs), then container gate + commit + push.
+
+### 2026-08-06 (session 24 — reduction continued, stalled on Edit timeout + relay re-gate)
+
+- Continued the scope reduction started in session 23 under fres's standing "go ahead" approval: located the 3 canary unit tests in expectation.rs (span line 569–~673) and began removing them plus fixing all `resolve()` call-site arities (6→5 args) across the test module.
+- The removal Edit call itself timed out mid-operation, leaving the canary-test deletion incomplete.
+- A subsequent turn arrived via relay (not directly from fres), re-tripping the relay-gate hook that blocks Edit tier on coordinator-tier relay turns; held rather than force through, and explicitly asked fres for one more direct message to re-enable Edit and finish the remaining mechanical steps (delete canary tests, fix tests/e2e.rs + ci.yml + README/docs, container gate, commit, push).
 
 ### 2026-07-30
 
