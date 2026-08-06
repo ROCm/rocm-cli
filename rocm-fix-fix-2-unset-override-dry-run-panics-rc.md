@@ -3,7 +3,7 @@
 **Stage:** 8-pre-pr-revise
 **Pipeline:** lightweight
 **Branch:** rocm-fix-fix-2-unset-override-dry-run-panics-rc
-**Pre-PR-check:** changes-requested — reviewer(gpt-5.6-sol pre-PR agent), 2026-08-06, @6b50809+1ab80552cd4d971a
+**Pre-PR-check:** review-done — reviewer(gpt-5.6-sol pre-PR agent), 2026-08-06, @6b50809+58d5504736651358
 **Last Updated:** 2026-08-06
 **Token Usage:** in=2793539 out=547470 cache_create=3866463 cache_read=72545963 calls=520
 
