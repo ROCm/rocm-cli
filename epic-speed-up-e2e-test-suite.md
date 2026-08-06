@@ -1,12 +1,12 @@
 # WIP: EPIC: Speed up E2E test suite
 
-**Stage:** 0-idea
+**Stage:** 1-active
 **Pipeline:** lightweight
 **Branch:** epic-speed-up-e2e-test-suite
 **Pre-PR-check:** none
 **Last Updated:** 2026-08-06
 
-**Token Usage:** in=0 out=0 cache_create=0 cache_read=0 calls=0
+**Token Usage:** in=120 out=82581 cache_create=450428 cache_read=7697262 calls=63
 
 ---
 
@@ -27,11 +27,26 @@ COORDINATOR NOTE: WL-175 (#157) and WL-176 (#156) are open PRs that have collide
 
 ## Solution
 
-_TBD — design the approach._
+Coordinator sequences the three children by file-collision + dependency.
+
+### Wave plan (as of 2026-08-06)
+
+All three children are LIVE (adopted, not restarted) with open PRs:
+
+| Child | PR | State | Wave | Gate |
+|-------|-----|-------|------|------|
+| WL-175 | #157 | OPEN, review-required, BEHIND main | 1 (foundation) | stale `windows-build-and-test` red on head 0fd0aed (predates #174) → nudged to rebase onto ec2bcb3 |
+| WL-89  | #185 | OPEN, **APPROVED**, BLOCKED | 1 (disjoint) | `E2E tests (GPU)` 0s infra-fail — **both MI300X runners offline** (mi300x-0/1). REAL gate: needs runner stood up (restore-app-dev-runner) |
+| WL-176 | #156 | OPEN, review-required, rebased locally | 2 (held) | Collides with #157 on ci.yml. Per fres 2026-08-05: #157 lands first, then #156 reduces to paths-filter-only delta. Reduction = source Edit → blocked by relay-gate on any relay; needs fres directly. Held behind #157. |
+
+- **Collision:** #157 (WL-175) and #156 (WL-176) both edit `ci.yml` + e2e scenario files → serialized. #157 is foundation; #156 rebases to a delta after.
+- **Disjoint:** #185 (WL-89) touches only the `rocm fix` SIGPIPE path → parallel-safe.
 
 ## Next Steps
 
-1. Design the solution, then implement.
+1. WL-175/#157: await rebase result; if Windows goes green, foundation is ready → surface for merge (fres).
+2. WL-89/#185: MI300X runners offline — surface to manager; the GPU E2E can't pass until a runner is online. Code is approved + otherwise green.
+3. WL-176/#156: hold until #157 lands; the scope-reduction needs fres's direct go-ahead (relay-gate blocks source edits on relay).
 
 ## Notes
 
@@ -46,3 +61,7 @@ _TBD — design the approach._
 ### 2026-08-06
 
 - Promoted from WL-366 into a worktree-backed task.
+- Coordinator session started. Reconciled epic: all 3 children (WL-175/#157, WL-176/#156, WL-89/#185) are ALREADY LIVE with open PRs → adopted, not restarted. Ownership precondition confirmed all 3 still `parent:wl-366`.
+- Built wave plan (see Solution). Nudged WL-175/#157 (`--coordinator`) to rebase onto ec2bcb3 to clear the stale `windows-build-and-test` red (predates #174's Windows fix).
+- Diagnosed WL-89/#185 gate: `E2E tests (GPU)` 0s instant-fail = MI300X runners offline (mi300x-0/1 both `offline`; re-runs can't clear it). Real gate → escalating.
+- WL-176/#156 correctly held behind #157 per fres's 2026-08-05 cross-PR decision.
