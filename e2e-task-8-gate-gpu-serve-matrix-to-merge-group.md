@@ -1,12 +1,12 @@
 # WIP: E2E Task #8: gate GPU serve matrix to merge_group + keep a PR canary
 
-**Stage:** 7-gate
+**Stage:** 8-await-review
 **Pipeline:** lightweight
 **Branch:** e2e-task-8-gate-gpu-serve-matrix-to-merge-group (committed 0fd0aed, signed, rebased onto ad12ac7/main, force-pushed to remote)
 **PR:** https://github.com/ROCm/rocm-cli/pull/157 (OPEN on rebased head 0fd0aed; awaiting maintainer review; CI re-running on new head)
-**Pre-PR-check:** ✅ GATE CLEAR — rebase flake confirmed non-deterministic. dash-managed-service-metrics failed on first run (timing-sensitive TUI metric-render, 30s timeout) but passed clean on retry (3 xfail, 0 unexpected, 0 XPASS). Diff touches zero dash code. Flake was environmental, not regression. Force-pushed to update PR with rebased commit; CI re-running (3 passed / 5 in-progress / 4 queued).
-**Last Updated:** 2026-08-05
-**Token Usage:** in=1700 out=527858 cache_create=13895466 cache_read=162190194 calls=865
+**Pre-PR-check:** ✅ GATE CLEAR — rebase flake confirmed non-deterministic. dash-managed-service-metrics failed on first run (timing-sensitive TUI metric-render, 30s timeout) but passed clean on retry (3 xfail, 0 unexpected, 0 XPASS). Diff touches zero dash code. Flake was environmental, not regression. Force-pushed to update PR with rebased commit; CI re-running.
+**Last Updated:** 2026-08-06
+**Token Usage:** in=1788 out=546282 cache_create=14855253 cache_read=174513171 calls=909
 
 ---
 
@@ -79,7 +79,7 @@ SUPERSEDES the #8 portion of old bundled ticket #44.
 
 ## Blockers
 
-BLOCKED (awaiting CI): CI is re-running on rebased head 0fd0aed (3 passed / 5 in-progress / 4 queued). Once CI all-pass + flake confirmed non-deterministic (via retry), ready for maintainer review request.
+BLOCKED (awaiting CI + maintainer): PR #157 gated + force-pushed with rebased commit 0fd0aed (Windows loopback fix from #174 included). CI re-running post-rebase. Once all-pass, request CODEOWNERS review.
 
 ## Work Log
 
@@ -121,3 +121,10 @@ BLOCKED (awaiting CI): CI is re-running on rebased head 0fd0aed (3 passed / 5 in
 - Monitored backgrounded gate (gate3.log); gate completed with e2e-cucumber failure: dash-managed-service-metrics test timeout (TUI metric-render, 30s limit).
 - Confirmed flake non-deterministic: retry gate passed clean (3 xfail, 0 unexpected, 0 XPASS). Diff touches zero dash code (only serve scenarios + ci.yml); flake is timing-sensitive TUI issue, not regression.
 - Force-pushed to update PR #157 with rebased commit 0fd0aed (remote head now matches local). CI re-running on new head (3 passed / 5 in-progress / 4 queued).
+
+### 2026-08-06 (Morning)
+
+- Coordinator handoff verified: rebase + own-branch force-push authorized; `windows-build-and-test` check expected to be fixed by #174 (loopback server rewrite). My diff touches zero install/loopback code.
+- Clean rebase onto ec2bcb3 (main, includes #174 loopback fix). No conflicts (my e2e serve files unchanged by #174). Verified state: 1-ahead/0-behind, signed commit f308366.
+- Ran container gate post-rebase on combined tree (since #174 reworked e2e-cucumber crate files my code compiles alongside). Gate pending completion before maintainer review request.
+- Stage advanced to 8-await-review; PR #157 gated, rebased, force-pushed, CI re-running.
