@@ -6,10 +6,10 @@
 **Pipeline:** standard
 **Ticket:** none — this is the umbrella; each child task carries its own ticket.
 **Branch:** container worktree; children re-branch in place off fresh main.
-**Last Updated:** 2026-07-28
+**Last Updated:** 2026-08-06
 **Pre-PR-check:** n/a (per-child)
 
-**Token Usage:** in=1006 out=301808 cache_create=5512288 cache_read=94907267 calls=509
+**Token Usage:** in=1032 out=319371 cache_create=5519110 cache_read=98238696 calls=522
 
 ---
 
@@ -237,6 +237,12 @@ Related WIPs: [[test-e2e-tui-cucumber]], [[ci-manual-e2e]], [[persist-app-dev-ci
 - Recreate with: `create_worktree.sh fix-speed-up-e2e`
 
 ## Work Log
+
+### 2026-08-06 — Cleaned up child task WL-129 and stale local branch
+
+- **WL-129 (mock/real split child) resolved:** PR #136 already merged; marked ticket inactive.
+- **Local branch `test-e2e-mock-real-split` deleted:** was stale after merge-queue cleanup of remote.
+- **Worktree re-branched in place:** moved onto `fix-speed-up-e2e` reset to fresh main (`ec2bcb3`), aligning worktree slug with branch name and keeping the umbrella home (WL-123) active for next child tasks (Tasks #8–#11).
 
 ### 2026-07-22 — PR #136 MERGED (Tasks #5–#7); rebase-conflict resolved, GPU red = EAI-7533
 
