@@ -108,6 +108,11 @@ pub struct Examination {
     pub os_version: String,
     pub distro_id: String,
     pub distro_version: String,
+    /// `/etc/os-release` `ID_LIKE`, for `openmpi::resolve_package_manager`
+    /// fallback matching. Not part of the examine.py wire contract, so it's
+    /// excluded from JSON.
+    #[serde(skip)]
+    pub distro_id_like: String,
     pub kernel_release: String,
     pub kernel_cmdline: String,
     pub is_wsl: bool,
@@ -185,6 +190,7 @@ impl Default for Examination {
             os_version: String::new(),
             distro_id: String::new(),
             distro_version: String::new(),
+            distro_id_like: String::new(),
             kernel_release: String::new(),
             kernel_cmdline: String::new(),
             is_wsl: false,
@@ -423,6 +429,7 @@ fn probe_os(e: &mut Examination) {
             let value = value.trim().trim_matches('"');
             match key {
                 "ID" => e.distro_id = value.to_owned(),
+                "ID_LIKE" => e.distro_id_like = value.to_owned(),
                 "VERSION_ID" => e.distro_version = value.to_owned(),
                 _ => {}
             }

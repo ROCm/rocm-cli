@@ -294,6 +294,7 @@ const RECIPES: &[FixRecipe] = &[
             "sudo dnf remove -y amdgpu-dkms                                                             # RHEL/Fedora/Rocky/Alma/Oracle",
             "sudo zypper remove -y amdgpu-dkms                                                          # SLES/openSUSE",
             "# sudo mv /etc/apt/sources.list.d/amdgpu.list /etc/apt/sources.list.d/amdgpu.list.bak       # or the yum/zypp equivalent; quarantine, do not delete yet",
+            "# Run only the line matching your package manager:",
             "sudo apt update      # Debian/Ubuntu",
             "sudo dnf clean all   # RHEL/Fedora/Rocky/Alma/Oracle",
             "sudo zypper refresh  # SLES/openSUSE",
@@ -1044,5 +1045,27 @@ mod tests {
         for r in RECIPES {
             assert!(listing.contains(r.fix_id), "listing missing {}", r.fix_id);
         }
+    }
+
+    #[test]
+    fn fix_12_recipe_clears_state_before_reinstall_and_keeps_mv_commented() {
+        let recipe = RECIPES
+            .iter()
+            .find(|r| r.fix_id == "fix-12-installer")
+            .expect("fix-12-installer recipe must exist");
+        let commands = recipe.commands.join("\n");
+        assert!(
+            commands.contains("dpkg --configure -a"),
+            "must clear the half-configured dpkg state before reinstalling: {commands}"
+        );
+        assert!(
+            commands.contains("purge -y amdgpu-dkms"),
+            "must purge the broken driver package: {commands}"
+        );
+        assert!(
+            commands.contains("# sudo mv /etc/apt/sources.list.d/amdgpu.list"),
+            "repo quarantine command must be commented out, not ready-to-run: {commands}"
+        );
+        assert!(recipe.verify.contains("repo-native"));
     }
 }
