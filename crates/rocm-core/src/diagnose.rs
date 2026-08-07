@@ -1074,9 +1074,9 @@ fn check_11_iommu_hang(e: &Examination, symptom: &str) -> Diagnosis {
 }
 
 /// Best-effort package-manager family for this host: prefer the family
-/// implied by which repo dir the marker/seen files live under (we already
-/// know that with certainty), and fall back to `distro_id` only when no repo
-/// file was found.
+/// implied by the repo dir the marker files live under, since that's the
+/// config these commands act on, and fall back to the same `ID_LIKE`-aware
+/// resolver `openmpi` uses only when no repo file was found.
 fn repo_pkg_family(e: &Examination) -> &'static str {
     if e.rocm_repos_seen.iter().any(|r| r.contains("/etc/apt/")) {
         return "apt";
@@ -1090,11 +1090,11 @@ fn repo_pkg_family(e: &Examination) -> &'static str {
     if e.rocm_repos_seen.iter().any(|r| r.contains("/etc/zypp/")) {
         return "zypper";
     }
-    match e.distro_id.as_str() {
-        "sles" | "sled" | "opensuse-leap" | "opensuse-tumbleweed" => "zypper",
-        "rhel" | "centos" | "fedora" | "rocky" | "almalinux" | "ol" => "dnf",
-        _ => "apt",
-    }
+    crate::openmpi::resolve_package_manager(
+        &e.distro_id.to_ascii_lowercase(),
+        &e.distro_id_like.to_ascii_lowercase(),
+    )
+    .map_or("apt", crate::openmpi::PackageManager::as_str)
 }
 
 fn check_12_repo_native_broken(e: &Examination, symptom: &str) -> Diagnosis {
@@ -2025,6 +2025,22 @@ mod tests {
     }
 
     #[test]
+    fn repo_pkg_family_fallback_is_id_like_aware() {
+        // Amazon Linux has no ROCm repo file in this scenario and isn't in
+        // the old hardcoded list; it must not default to "apt".
+        let mut e = linux_base();
+        e.distro_id = "amzn".to_owned();
+        assert_eq!(repo_pkg_family(&e), "dnf");
+
+        // A RHEL rebuild with an unrecognized ID must still resolve via
+        // ID_LIKE, same as openmpi's resolver.
+        let mut e = linux_base();
+        e.distro_id = "some-rhel-rebuild".to_owned();
+        e.distro_id_like = "rhel fedora".to_owned();
+        assert_eq!(repo_pkg_family(&e), "dnf");
+    }
+
+    #[test]
     fn repo_native_broken_fires_and_clears_state_before_reinstall() {
         let mut e = linux_base();
         e.rocm_install_method = "repo-native".to_owned();
@@ -2061,5 +2077,30 @@ mod tests {
         e.rocm_install_method = "runfile-or-tarball".to_owned();
         let report = diagnose(&e, "");
         assert!(report.matched.iter().all(|d| d.id != "fix-12-installer"));
+    }
+
+    #[test]
+    fn repo_native_broken_fires_on_dpkg_symptom_regardless_of_install_method() {
+        // The keyword score alone (half-configured + generic dpkg error = 75)
+        // clears MIN_SCORE_FOR_MATCH without the +20 repo-native bonus, so
+        // fix-12 still fires even when rocm_install_method isn't
+        // "repo-native" -- the method only adds confidence, it doesn't gate
+        // whether the check fires at all.
+        let mut e = linux_base();
+        e.rocm_install_method = "runfile-or-tarball".to_owned();
+        let report = diagnose(
+            &e,
+            "dpkg: error processing package amdgpu-dkms (half-configured)",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-12-installer")
+            .expect("dpkg keyword evidence alone should still surface fix-12");
+        assert!(
+            !hit.evidence.iter().any(|l| l.contains("repo-native")),
+            "the repo-native install-method evidence line must not appear for a non-repo-native install: {:?}",
+            hit.evidence
+        );
     }
 }
