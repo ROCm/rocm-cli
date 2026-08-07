@@ -2,14 +2,14 @@
 
 # WIP: Pre-seed Qwen3.6-27B weights for nightly E2E (EAI-7477)
 
-**Stage:** 6-implementing (pre-seed written; scratch dispatch run 29756582721 BLOCKED — runners offline)
+**Stage:** 7-decision (obsolete — scenario 10 now passes on recent nightlies; pre-seed unproven)
 **Pipeline:** standard
 **Branch:** fix-nightly-27b-preseed
 **Jira:** EAI-7477 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7477
-**Last Updated:** 2026-07-21
+**Last Updated:** 2026-08-07
 **Pre-PR-check:** passed — pre-PR reviewer (fix-nightly-27b-preseed worktree), 2026-07-23
 
-**Token Usage:** in=0 out=0 cache_create=0 cache_read=0 calls=0
+**Token Usage:** in=72 out=22056 cache_create=253791 cache_read=4225838 calls=39
 
 ---
 
@@ -74,13 +74,13 @@ scenario is warranted or this is pure test-infra hardening._
 
 ## Next Steps
 
-Start at stage 4-design: pin the pre-seed command + token sourcing, then move to scenarios/impl.
+**Waiting for decision**: Close as won't-fix (obsolete) or rebase + re-prove as insurance against cache wipe? See Work Log 2026-08-07.
 
 ## Blockers / Open Questions
 
-- **HF_TOKEN in CI**: is an authenticated token available to the self-hosted runner? Needed to dodge rate limits.
-- **Cache persistence**: fix depends on `$E2E_SHARED_CACHE_DIR` (under `$RUNNER_WORKSPACE`) genuinely persisting on the self-hosted runner — inherit the runtime pre-warm's guarantee but confirm.
-- **Residual caveat**: harness doesn't capture vLLM stderr, so a slow engine-init/OOM stacked on the download isn't 100% excluded. Note at `e2e.rs:192+` says 27B was verified on MI300X to reach ready given a longer window, which supports weights-availability (not timeout) as the fix — but confirm on a real run.
+- **RESOLVED**: scenario 10 now passes on Aug 3–6 nightlies (was failing 07-16 → 07-19). Pre-seed not in main; recovery happened on its own.
+- **Proof gap**: branch pre-seed (commit 12721fa) was never verified (dispatch run 29756582721 cancelled, not run).
+- **Decision point**: close as obsolete (timeout was transient cold-cache condition) or land as insurance (rebase + dispatch needed).
 
 ## Notes
 
@@ -101,3 +101,9 @@ Start at stage 4-design: pin the pre-seed command + token sourcing, then move to
 - Verified harness `HF_HOME` shared-cache plumbing and cross-run persistence assumption in code.
 - Set up worktree off fresh origin/main and this WIP at stage 4-design.
 - Next: pin pre-seed mechanism + HF_TOKEN sourcing, then scenarios/impl.
+
+### 2026-08-07
+
+- **Key finding**: scenario 10 (27B serve) passes on recent nightlies (Aug 3–6, all green); Aug 6 took only 126s (load-only) vs. 2400s timeout previously.
+- **Root resolution**: 27B weights now resident in shared cache — cold 54 GiB pull is gone. Pre-seed not in main; recovery self-resolved.
+- **Status**: branch is 20 commits behind main; pre-seed commit unproven (dispatch run cancelled); no open PR. Options: (1) close as obsolete (timeout transient), or (2) rebase + dispatch to prove as insurance. Recommending option 1 — awaiting user decision.
