@@ -16208,19 +16208,21 @@ fn wait_for_service_http_ready(
     )
 }
 
-/// Poll the engine's health endpoints until the server answers ready or `timeout`
-/// elapses, invoking `on_tick(elapsed)` once per polling iteration so a caller can
-/// animate a spinner. Engine-neutral: `service_http_readiness_paths` already maps
-/// each engine to the right health path and normalizes the response to ready/not.
-/// `endpoint_api_key` is sent as a bearer token so the probe still succeeds against
-/// a public endpoint that now requires authentication.
 /// Wait until the service can actually serve, reporting how far it got.
 ///
 /// A health or model-listing endpoint answering is not enough to call a service
 /// ready: engines advertise a model within seconds of accepting its name, while
 /// the weights can take minutes to become usable, so a caller that sends its
 /// first request on that signal gets a hang. Only [`EndpointReadiness::Serving`]
-/// — an inference request that came back — means ready.
+/// — an inference request that came back — means ready; a service that lists the
+/// model without answering one is [`EndpointReadiness::Listing`], and the best
+/// result seen before `timeout` is what gets returned.
+///
+/// Polls until `timeout` elapses, invoking `on_tick(elapsed)` once per iteration
+/// so a caller can animate a spinner. Engine-neutral: `service_http_readiness_paths`
+/// maps each engine to the right listing path. `endpoint_api_key` is sent as a
+/// bearer token so both the listing check and the inference probe still succeed
+/// against a public endpoint that requires authentication.
 fn wait_for_service_http_ready_with_progress(
     engine: &str,
     host: &str,

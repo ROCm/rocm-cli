@@ -900,29 +900,17 @@ fn healthcheck_service(request: HealthcheckRequest) -> Result<HealthcheckRespons
         && endpoint_url.as_deref().is_some_and(|endpoint| {
             inference_verified(&files.state_path, state.as_ref(), endpoint, &model_ref)
         });
-    let status = if ready {
-        "ready".to_owned()
-    } else if listed {
-        // Loaded enough to list the model, not yet able to serve it. Reported as
-        // still coming up rather than as a failure, so the supervisor lets it
-        // finish instead of restarting a model mid-load.
-        "loading".to_owned()
+    let device = if ready {
+        reported_device(state.as_ref(), &backend)
     } else {
-        state_status
+        "unknown".to_owned()
     };
-    Ok(HealthcheckResponse {
-        status,
-        model_loaded: ready,
-        device: if ready {
-            reported_device(state.as_ref(), &backend)
-        } else {
-            "unknown".to_owned()
-        },
-        uptime_sec: 0,
-        queue_depth: 0,
-        last_error: None,
-        tokens_per_sec: None,
-    })
+    Ok(HealthcheckResponse::for_readiness(
+        listed,
+        ready,
+        &state_status,
+        &device,
+    ))
 }
 
 /// Whether a real inference request has succeeded against this service.

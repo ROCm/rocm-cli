@@ -765,32 +765,21 @@ fn healthcheck_service(request: HealthcheckRequest) -> Result<HealthcheckRespons
                 model_ref.as_deref().unwrap_or_default(),
             )
         });
-    let status = if ready {
-        "ready".to_owned()
-    } else if listed {
-        // Listing but not yet serving. Reported as still coming up rather than as
-        // a failure, so the supervisor lets the model finish loading instead of
-        // restarting it mid-load.
-        "loading".to_owned()
+    let state_status = state
+        .as_ref()
+        .and_then(|value| value_string(value, "status"))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let device = if state.is_some() {
+        "rocm_gpu"
     } else {
-        state
-            .as_ref()
-            .and_then(|value| value_string(value, "status"))
-            .unwrap_or_else(|| "unknown".to_owned())
+        "unknown"
     };
-    Ok(HealthcheckResponse {
-        status,
-        model_loaded: ready,
-        device: if state.is_some() {
-            "rocm_gpu".to_owned()
-        } else {
-            "unknown".to_owned()
-        },
-        uptime_sec: 0,
-        queue_depth: 0,
-        last_error: None,
-        tokens_per_sec: None,
-    })
+    Ok(HealthcheckResponse::for_readiness(
+        listed,
+        ready,
+        &state_status,
+        device,
+    ))
 }
 
 fn endpoint_response(request: EndpointRequest) -> Result<EndpointResponse> {
