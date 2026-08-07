@@ -2,7 +2,7 @@
 
 # WIP: Pre-seed Qwen3.6-27B weights for nightly E2E (EAI-7477)
 
-**Stage:** 7-decision (obsolete — scenario 10 now passes on recent nightlies; pre-seed unproven)
+**Stage:** 9-CLOSED — WON'T FIX (obsolete; premise resolved on its own, 2026-08-07)
 **Pipeline:** standard
 **Branch:** fix-nightly-27b-preseed
 **Jira:** EAI-7477 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7477
@@ -106,4 +106,6 @@ scenario is warranted or this is pure test-infra hardening._
 
 - **Key finding**: scenario 10 (27B serve) passes on recent nightlies (Aug 3–6, all green); Aug 6 took only 126s (load-only) vs. 2400s timeout previously.
 - **Root resolution**: 27B weights now resident in shared cache — cold 54 GiB pull is gone. Pre-seed not in main; recovery self-resolved.
-- **Status**: branch is 20 commits behind main; pre-seed commit unproven (dispatch run cancelled); no open PR. Options: (1) close as obsolete (timeout transient), or (2) rebase + dispatch to prove as insurance. Recommending option 1 — awaiting user decision.
+- **Status**: branch was 20 commits behind main; pre-seed commit unproven (dispatch run 29756582721 cancelled); no open PR.
+- **Decision (user)**: CLOSE as won't-fix / obsolete. Timeout was a transient cold-cache condition that resolved on its own; the guarded pre-seed guards a condition no longer occurring and was never verified. Reopen EAI-7477 if the 27B serve times out again.
+- Closed out: WIP → 9-CLOSED, wlticket WL-122 resolved, EAI-7477 closed, scratch branch `scratch-27b-preseed` deleted, worktree removed.
