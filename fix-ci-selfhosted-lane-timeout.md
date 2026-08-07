@@ -6,6 +6,7 @@
 **Pre-PR-check:** review-done — OpenCode gpt-5.6-sol reviewer, 2026-08-06, @0c884da+bfd0fb8bbaea934a
 **Ticket:** EAI-7548 (Bug, component rocm-cli) — https://amd.atlassian.net/browse/EAI-7548
 **Last Updated:** 2026-08-07
+**Token Usage (cumulative):** in=625k→635k out=532k→535k cache_create=2142379 cache_read=71648k→71850k calls=288→292
 **Token Usage:** in=625k out=532k cache_create=2142379 cache_read=71648k calls=288
 
 ---
@@ -229,9 +230,7 @@ admin branch-protection change), which the user opted to handle separately.
 ## Next Steps
 
 **BLOCKED (awaiting user):**
-1. Run `git-commit-with-fallback --amend -s` in the worktree (fold all four rounds of review-response changes into commit 0c884da).
-2. After commit succeeds, open the PR.
-3. Separately: de-require the four self-hosted checks in branch protection (the "Split only" caveat — hosted required checks can run independently, but offline GPU runners no longer stall them).
+- De-require the four self-hosted checks in branch protection (`E2E tests (GPU)`, `E2E tests (Strix Halo, Ubuntu)`, `E2E tests (Strix Halo, Windows)`, `E2E consolidated report (self-hosted)`). The "Split only" caveat: this PR fixes hosted-check starvation (they start immediately instead of pending-with-0-jobs), but an offline runner can still block a MERGE via missing-required-check until these four are removed from the required list (separate admin branch-protection change).
 
 ## RESOLVED
 - Does `timeout-minutes` cancel a job still QUEUED on an offline runner?
@@ -349,3 +348,9 @@ admin branch-protection change), which the user opted to handle separately.
 - **R3-F2 (identity): WITHDRAWN by reviewer.** Confirmed AGENTS.md §2 qualifies "when required" + merged repo history (user's own prior commit uses gmail identity). Commit stays as-is.
 - **Terminal verdict: review-done** (verbatim, 2026-08-06, @0c884da+bfd0fb8bbaea934a). All prior-round fixes verified; no findings ≥80 confidence remain. Pre-PR gate SATISFIED. All changes staged on top of commit 0c884da.
 - NEXT: User to drive a direct turn and run `git-commit-with-fallback --amend -s` (fold review-response changes into commit, then PR-ready). Separately, de-require the four self-hosted checks in branch protection.
+
+### 2026-08-07
+
+- Explored alternative to legion (`docker context` native-Linux target) for running `e2e` mode locally. Diagnosed blockers: acer's SSH key not accepted, and cannot confirm acer is bare-metal Linux vs another Docker-Desktop/WSL2 host. Verified WSL2 kernel detection is hardcoded (`/proc/version` read, "microsoft" match) with no override mechanism.
+- Clarified the split's guarantee: it blocks e2e-selfhosted workflow's own supersession but does NOT undo the required-check contradiction (offline runner can still block merge via missing-required-check until de-required). Documented under KEY FINDING.
+- PR #193 remains open, commit 9087896 is CI-live on legion. No further action by agent; awaiting user to de-require the four self-hosted checks in branch protection per "Split only" caveat.
