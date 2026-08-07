@@ -3841,13 +3841,23 @@ fn detect_ip_discovery_gc_target(ip_discovery_dir: &Path) -> Option<String> {
 }
 
 #[cfg(any(target_os = "linux", test))]
-/// Build the LLVM gfx target for a GC (Graphics Core) IP version.
+/// Render gfx target *components* as an LLVM target token.
 ///
-/// The target is `gfx` + major in decimal + minor and revision as **single hex
-/// digits** — `gfx90a` is GC 9.0.**10** (`10 == 0xa`), and `gfx1250` is GC
-/// 12.5.0. Concatenating the components as decimal agrees with hex only while
-/// every component is below 10, so it silently produced `gfx9010` for gfx90a
-/// hardware (MI210/MI250), which then normalized to the wrong TheRock family.
+/// The token is `gfx` + major in decimal + minor and revision as **single hex
+/// digits** — the `a` in `gfx90a` is revision `10`. Concatenating the components
+/// as decimal agrees with hex only while every component is below 10, so it
+/// silently produced `gfx9010` for gfx90a hardware (MI210/MI250), which then
+/// normalized to the wrong TheRock family.
+///
+/// **The caller owns whether its numbers are target components at all.** KFD's
+/// `gfx_target_version` packs exactly this triple, so decoding it and calling
+/// here is sound. A GC (Graphics Core) IP version is a *different* quantity that
+/// merely coincides with the target on many parts: it does not on the GC 9.4.x
+/// line, where GC 9.4.0/9.4.1/9.4.2/9.4.3 are gfx906/gfx908/gfx90a/gfx942. So
+/// [`detect_ip_discovery_gc_target`] can still yield a wrong-but-plausible token
+/// for those parts — pre-existing, unchanged by the hex encoding, and not
+/// something this function can detect, since the components it receives are
+/// well-formed either way.
 ///
 /// A minor or revision that cannot be a single hex digit does not describe any
 /// gfx target, so it yields `None` rather than a fabricated token: the caller
@@ -6995,14 +7005,24 @@ Class Name:                Display
             Some("gfx1103".to_owned())
         );
 
-        // The same defect reached this fallback path, not just the KFD one.
+        // KNOWN WRONG, and pinned so the gap stays visible: on the GC 9.4.x line
+        // the GC IP version is not the LLVM target. Aldebaran (MI200/MI250)
+        // reports GC 9.4.2 here but is gfx90a, so this path yields MI300's target
+        // instead and resolves to the wrong TheRock family — the right wheel for
+        // this host is `gfx90a`. Pre-existing: the decimal encoding produced
+        // `gfx942` for 9/4/2 too, so the hex fix neither caused nor closes it.
+        // Fixing it needs a GC-IP-version → target table for GC 9.4.x
+        // (9.4.0/9.4.1/9.4.3 are gfx906/gfx908/gfx942), not a different encoding.
         fs::write(gc.join("major"), "9")?;
-        fs::write(gc.join("minor"), "0")?;
-        fs::write(gc.join("revision"), "10")?;
+        fs::write(gc.join("minor"), "4")?;
+        fs::write(gc.join("revision"), "2")?;
+        let aldebaran = detect_ip_discovery_gc_target(&root.join("ip_discovery"));
+        assert_eq!(aldebaran, Some("gfx942".to_owned()));
         assert_eq!(
-            detect_ip_discovery_gc_target(&root.join("ip_discovery")),
-            Some("gfx90a".to_owned())
+            normalize_therock_family(&aldebaran.expect("target")),
+            Some("gfx94X-dcgpu".to_owned())
         );
+
         fs::remove_dir_all(root).ok();
         Ok(())
     }
