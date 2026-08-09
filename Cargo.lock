@@ -3599,6 +3599,7 @@ dependencies = [
  "crossterm 0.29.0",
  "flate2",
  "keyring-core",
+ "libc",
  "rocm-core",
  "rocm-dash-daemon",
  "rocm-dash-tui",

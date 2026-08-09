@@ -878,7 +878,57 @@ impl PermissionsModeArg {
     }
 }
 
+/// Restore the default SIGPIPE disposition on Unix.
+///
+/// Rust installs `SIG_IGN` for SIGPIPE at startup, so a downstream reader
+/// closing the pipe early (e.g. `rocm fix … --dry-run | head`) turns the next
+/// `println!` into a panic (`failed printing to stdout: Broken pipe`, exit 101)
+/// instead of the conventional quiet exit. Resetting to `SIG_DFL` makes the
+/// process terminate on SIGPIPE like every other Unix CLI. Socket writes are
+/// unaffected: std uses `MSG_NOSIGNAL`, so the serve/daemon paths still see a
+/// normal `BrokenPipe` error rather than a signal.
+#[cfg(unix)]
+#[allow(unsafe_code)] // libc FFI
+fn reset_sigpipe() {
+    // SAFETY: installing the default handler for a signal is always safe.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_sigpipe() {}
+
+/// Run `f` with SIGPIPE temporarily ignored, restoring the previous
+/// disposition afterwards.
+///
+/// [`reset_sigpipe`] sets `SIG_DFL` process-wide so stdout/stderr pipe writes
+/// terminate the process conventionally. But a write to a spawned child's stdin
+/// whose reader has already exited would then kill `rocm` with SIGPIPE before
+/// the caller can turn the resulting `EPIPE` into a diagnostic. Wrap such writes
+/// in this helper so the failure surfaces as an `io::Error` (`BrokenPipe`)
+/// instead of a signal.
+#[cfg(unix)]
+#[allow(unsafe_code)] // libc FFI
+fn with_sigpipe_ignored<T>(f: impl FnOnce() -> T) -> T {
+    // SAFETY: reading/installing a signal disposition is always safe.
+    let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+    let result = f();
+    // SAFETY: restoring the disposition captured above is always safe.
+    unsafe {
+        libc::signal(libc::SIGPIPE, previous);
+    }
+    result
+}
+
+#[cfg(not(unix))]
+fn with_sigpipe_ignored<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}
+
 fn main() -> Result<()> {
+    reset_sigpipe();
+
     // Held for the whole process lifetime: dropping it flushes and stops the
     // non-blocking file writer, so an early drop would silently truncate the
     // log. A failed/missing `AppPaths::discover()` degrades to no logging
@@ -15209,8 +15259,18 @@ where
             .stdin
             .take()
             .context("engine stdio child did not expose stdin")?;
-        serde_json::to_writer(&mut stdin, &envelope).context("failed to write engine request")?;
-        stdin.write_all(b"\n")?;
+        // Ignore SIGPIPE for the duration of the write: with SIG_DFL in effect
+        // process-wide, an engine that exits before reading its stdin would
+        // otherwise kill `rocm` with SIGPIPE before the exit-status diagnostics
+        // below can run. Under SIG_IGN the write returns EPIPE instead, which we
+        // surface as the normal "failed to write engine request" error and then
+        // let `wait()` report why the engine exited.
+        with_sigpipe_ignored(|| {
+            serde_json::to_writer(&mut stdin, &envelope)
+                .context("failed to write engine request")?;
+            stdin.write_all(b"\n")?;
+            Ok::<(), anyhow::Error>(())
+        })?;
     }
 
     let stderr_handle = child.stderr.take().map(|stderr| {
@@ -16282,6 +16342,89 @@ mod tests {
     #[test]
     fn cli_command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// Regression test for the engine child-stdin write under the process-wide
+    /// `SIG_DFL` that `main` installs via [`reset_sigpipe`]. If an engine child
+    /// exits before reading its stdin, the parent's write to that pipe must
+    /// surface as a `BrokenPipe` error — handled by the caller's diagnostics —
+    /// rather than killing `rocm` with SIGPIPE before those diagnostics run.
+    ///
+    /// The bug only reproduces under `SIG_DFL`; the test harness leaves SIGPIPE
+    /// at Rust's default `SIG_IGN`, and flipping it process-wide would race
+    /// sibling tests. So this re-execs itself in fresh processes that install
+    /// `SIG_DFL` first, and checks BOTH directions:
+    /// - unguarded write to a dead child's stdin is fatal (killed by SIGPIPE) —
+    ///   this is the regression the plain `SIG_DFL` reset introduced;
+    /// - the same write wrapped in [`with_sigpipe_ignored`] survives and returns
+    ///   an error instead — this is the fix.
+    ///
+    /// Each child reaps its short-lived grandchild before writing, so the read
+    /// end is closed deterministically and the outcome does not race.
+    #[cfg(unix)]
+    #[test]
+    fn engine_stdin_write_under_sig_dfl_is_guarded_not_fatal() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        // Grandchild helper: reproduce main()'s SIG_DFL, spawn a process that
+        // exits immediately, reap it, then write to its now-closed stdin. The
+        // "guarded" arm wraps the write; the "unguarded" arm does not.
+        if let Some(mode) = std::env::var_os("ROCM_TEST_SIGPIPE_ARM") {
+            reset_sigpipe();
+            let mut grandchild = ProcessCommand::new("true")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn a process that exits immediately");
+            let mut stdin = grandchild.stdin.take().expect("grandchild stdin");
+            grandchild.wait().expect("reap grandchild");
+            // Heap-allocated so the buffer doesn't trip clippy::large-stack-arrays;
+            // it must exceed the pipe buffer so the write actually reaches the
+            // closed read end rather than being swallowed by kernel buffering.
+            let payload = vec![b'x'; 64 * 1024];
+            if mode == "guarded" {
+                let result = with_sigpipe_ignored(|| stdin.write_all(&payload));
+                assert!(
+                    result.is_err(),
+                    "guarded write to a dead pipe should return BrokenPipe, not succeed"
+                );
+            } else {
+                // Unguarded: under SIG_DFL this write delivers SIGPIPE and never
+                // returns. If the process somehow survives, exit 0 so the parent's
+                // "should have been signalled" assertion fails loudly.
+                let _ = stdin.write_all(&payload);
+            }
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("current test executable");
+        let run_arm = |mode: &str| -> ExitStatus {
+            ProcessCommand::new(&exe)
+                .args([
+                    "tests::engine_stdin_write_under_sig_dfl_is_guarded_not_fatal",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env("ROCM_TEST_SIGPIPE_ARM", mode)
+                .status()
+                .expect("re-exec the test arm in a child process")
+        };
+
+        let unguarded = run_arm("unguarded");
+        assert_eq!(
+            unguarded.signal(),
+            Some(libc::SIGPIPE),
+            "sanity check: an unguarded stdin write under SIG_DFL must be killed by \
+             SIGPIPE (got {unguarded:?}); if not, the test no longer proves the guard matters"
+        );
+
+        let guarded = run_arm("guarded");
+        assert!(
+            guarded.success(),
+            "guarded child-stdin write was fatal under SIG_DFL ({guarded:?}) — \
+             SIGPIPE reached the process instead of surfacing as an error"
+        );
     }
 
     #[test]
