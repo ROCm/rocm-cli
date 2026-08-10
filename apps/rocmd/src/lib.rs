@@ -33,6 +33,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::json;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 use std::ffi::OsString;
@@ -834,22 +835,28 @@ fn prefetch_artifact_value_with_policy(
         ));
     }
 
-    let bytes = download_artifact_bytes(&artifact.uri, max_bytes, &request_headers)?;
-    if bytes.len() as u64 != size_bytes {
-        bail!(
-            "artifact download size mismatch for `{artifact_ref}`: expected {size_bytes} bytes, got {}",
-            bytes.len()
-        );
-    }
-    let actual_sha256 = sha256_hex(&bytes);
-    if actual_sha256 != expected_sha256 {
-        bail!(
-            "artifact sha256 mismatch for `{artifact_ref}`: expected {expected_sha256}, got {actual_sha256}"
-        );
-    }
-
+    // Streamed straight to its final path: model artifacts run to gigabytes, so
+    // buffering one to hash it would hold the whole file in memory. The size and
+    // digest from the recipe are enforced inside the download, which also gives
+    // this path a free-space preflight and resume on a dropped connection.
     let artifact_path = artifact_bytes_path_for_marker(&cache.marker_path);
-    write_file_atomically(&artifact_path, &bytes)?;
+    let mut headers: Vec<(&str, &str)> = vec![("User-Agent", "rocm-cli")];
+    headers.extend(
+        request_headers
+            .iter()
+            .map(|(name, value)| (*name, value.as_str())),
+    );
+    let outcome = rocm_core::download_file_streaming(&rocm_core::DownloadRequest {
+        url: &artifact.uri,
+        destination: &artifact_path,
+        timeout: ARTIFACT_PREFETCH_TIMEOUT,
+        headers: &headers,
+        max_bytes: Some(max_bytes),
+        expected_len: Some(size_bytes),
+        expected_sha256: Some(&expected_sha256),
+    })
+    .with_context(|| format!("failed to prefetch artifact `{artifact_ref}`"))?;
+    let actual_sha256 = outcome.sha256;
     write_file_atomically(
         &cache.marker_path,
         &serde_json::to_vec_pretty(&json!({
@@ -1023,42 +1030,11 @@ fn artifact_bytes_path_for_marker(marker_path: &Path) -> PathBuf {
     marker_path.with_extension("bin")
 }
 
-fn download_artifact_bytes(
-    url: &str,
-    max_bytes: u64,
-    headers: &[(&str, String)],
-) -> Result<Vec<u8>> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(ARTIFACT_PREFETCH_TIMEOUT)
-        .build();
-    let mut request = agent.get(url).set("User-Agent", "rocm-cli");
-    for (name, value) in headers {
-        request = request.set(name, value);
-    }
-    let response = request.call().map_err(|error| match error {
-        ureq::Error::Status(status, _) => anyhow::anyhow!("HTTP {status} while fetching {url}"),
-        other @ ureq::Error::Transport(_) => {
-            anyhow::anyhow!("HTTP request failed for {url}: {other}")
-        }
-    })?;
-    let mut reader = response.into_reader().take(max_bytes.saturating_add(1));
-    let mut bytes = Vec::new();
-    reader
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read artifact response for {url}"))?;
-    if bytes.len() as u64 > max_bytes {
-        bail!("artifact download exceeded approved byte limit of {max_bytes}");
-    }
-    Ok(bytes)
-}
-
+/// Hex digest of a buffer. Production hashing happens incrementally inside the
+/// streaming download; this exists only so tests can state an expected digest.
+#[cfg(test)]
 fn sha256_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let digest = Sha256::digest(bytes);
-    digest.iter().fold(String::new(), |mut acc, byte| {
-        let _ = write!(acc, "{byte:02x}");
-        acc
-    })
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
