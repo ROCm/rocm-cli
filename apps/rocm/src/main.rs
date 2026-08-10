@@ -4639,7 +4639,11 @@ fn serve(args: ServeArgs) -> Result<()> {
                      selected GPU or unset ROCR_VISIBLE_DEVICES."
                 );
             }
-            if let Some(warning) = gpu_low_memory_warning(&gpu_indices, gpu_vram.as_deref()) {
+            if let Some(warning) = serve_gpu_low_memory_warning(
+                &gpu_indices,
+                gpu_vram.as_deref(),
+                host_gpu_summary.as_ref(),
+            ) {
                 println!("  {warning}");
             }
         }
@@ -4726,6 +4730,7 @@ fn serve(args: ServeArgs) -> Result<()> {
                 &gpu_indices,
                 gpu_vram.as_deref(),
                 gpu_memory_utilization_note.as_deref(),
+                host_gpu_summary.as_ref(),
             );
             let summary = serve_summary::DeploymentSummary {
                 engine: selected_engine.clone(),
@@ -4770,6 +4775,7 @@ fn collect_serve_notes(
     gpu_indices: &[u32],
     gpu_vram: Option<&[GpuVramUsage]>,
     engine_flag_note: Option<&str>,
+    host_gpu_summary: Option<&rocm_core::HostGpuSummary>,
 ) -> Vec<String> {
     let mut notes = Vec::new();
     // An engine-scoped flag the selected engine cannot honor must be reported here
@@ -4793,7 +4799,8 @@ fn collect_serve_notes(
                     .to_owned(),
             );
         }
-        if let Some(warning) = gpu_low_memory_warning(gpu_indices, gpu_vram) {
+        if let Some(warning) = serve_gpu_low_memory_warning(gpu_indices, gpu_vram, host_gpu_summary)
+        {
             notes.push(warning);
         }
     }
@@ -16484,6 +16491,51 @@ fn gpu_low_memory_warning(gpu_indices: &[u32], vram: Option<&[GpuVramUsage]>) ->
     None
 }
 
+/// Whether the reported VRAM capacity describes the memory the engine will
+/// actually draw on.
+///
+/// An APU has no private VRAM. `amd-smi` reports the fixed BIOS carveout (often
+/// ~4 GiB) as `total_vram`, while the allocator serves the model out of
+/// GTT-backed system RAM — so on a 128 GiB Strix Halo, "only 1.6 GiB of 4.0 GiB
+/// free" is measuring the wrong pool. It fires on healthy machines and would
+/// stay quiet on a genuinely starved one, so a low-memory warning built on it
+/// carries no information and is better withheld.
+///
+/// The single-GPU condition is what keeps this honest.
+/// [`rocm_core::gfx_is_apu_family`] classifies a *part*, and host detection
+/// yields one target for the whole machine, so on a laptop pairing an APU with
+/// a discrete card an APU verdict would otherwise suppress a legitimate warning
+/// about the discrete card. When more than one GPU is present we cannot
+/// attribute the target to the selected ordinal, so the warning stands.
+fn vram_capacity_is_meaningful(gfx_target: Option<&str>, gpu_count: usize) -> bool {
+    if gpu_count != 1 {
+        return true;
+    }
+    !gfx_target.is_some_and(rocm_core::gfx_is_apu_family)
+}
+
+/// The serve plan's low-VRAM warning, withheld on hosts where the VRAM figures
+/// do not describe the memory the engine uses (see
+/// [`vram_capacity_is_meaningful`]).
+///
+/// Resolves the gfx target only once a warning would actually be emitted. Host
+/// GPU detection can probe sysfs/WSL — `serve` deliberately gates its own call
+/// on whether engine selection needs it — so the quiet path must not start
+/// paying for a lookup it will never use.
+fn serve_gpu_low_memory_warning(
+    gpu_indices: &[u32],
+    vram: Option<&[GpuVramUsage]>,
+    host_gpu_summary: Option<&rocm_core::HostGpuSummary>,
+) -> Option<String> {
+    let warning = gpu_low_memory_warning(gpu_indices, vram)?;
+    let gpu_count = vram.map_or(0, <[GpuVramUsage]>::len);
+    let gfx_target = match host_gpu_summary {
+        Some(summary) => summary.gfx_target.clone(),
+        None => rocm_core::detect_host_gfx_target(),
+    };
+    vram_capacity_is_meaningful(gfx_target.as_deref(), gpu_count).then_some(warning)
+}
+
 /// GPU ordinals currently pinned by running rocm-cli managed/foreground
 /// services, used to skip busy devices during `--gpu auto` selection.
 fn busy_gpu_indices(paths: &AppPaths) -> Vec<u32> {
@@ -22593,13 +22645,22 @@ install therock";
         // the selected engine cannot honor has to be reported through this path —
         // not only on the plan path that an interactive run never takes.
         let note = "--gpu-memory-utilization applies only to vLLM; ignored for engine 'lemonade'";
-        let notes = collect_serve_notes(false, &GpuSelection::Auto, false, &[0], None, Some(note));
+        let notes = collect_serve_notes(
+            false,
+            &GpuSelection::Auto,
+            false,
+            &[0],
+            None,
+            Some(note),
+            None,
+        );
         assert!(
             notes.iter().any(|entry| entry == note),
             "the ignored-flag note must reach the summary: {notes:?}"
         );
 
-        let quiet = collect_serve_notes(false, &GpuSelection::Auto, false, &[0], None, None);
+        let quiet =
+            collect_serve_notes(false, &GpuSelection::Auto, false, &[0], None, None, None);
         assert!(
             !quiet
                 .iter()
@@ -22736,6 +22797,62 @@ install therock";
         assert!(warning.contains("free"));
         assert!(gpu_low_memory_warning(&[1], Some(&usage)).is_none());
         assert!(gpu_low_memory_warning(&[0], None).is_none());
+    }
+
+    fn host_gpu(gfx_target: &str) -> rocm_core::HostGpuSummary {
+        rocm_core::HostGpuSummary {
+            gfx_target: Some(gfx_target.to_owned()),
+            ..rocm_core::HostGpuSummary::default()
+        }
+    }
+
+    #[test]
+    fn unified_memory_apu_suppresses_the_vram_capacity_warning() {
+        // Strix Halo as reported by amd-smi: a 4 GiB BIOS carveout with 1.6 GiB
+        // free (40%, under the 90% bar) on a machine whose engine actually
+        // serves out of ~128 GiB of shared system RAM. The old reading —
+        // "only 1.6 GiB of 4.0 GiB free" — describes a pool the allocator does
+        // not use, so it must not reach the user.
+        let carveout = [vram(0, 2_458, 4_096)];
+        assert!(
+            gpu_low_memory_warning(&[0], Some(&carveout)).is_some(),
+            "the underlying threshold still trips; only the serve-plan wrapper withholds it"
+        );
+        assert_eq!(
+            serve_gpu_low_memory_warning(&[0], Some(&carveout), Some(&host_gpu("gfx1151"))),
+            None
+        );
+    }
+
+    #[test]
+    fn discrete_gpu_still_warns_when_genuinely_busy() {
+        let busy = [vram(0, 182_000, 192_000)];
+        let warning = serve_gpu_low_memory_warning(&[0], Some(&busy), Some(&host_gpu("gfx1100")))
+            .expect("a discrete card that is 95% full still warrants a warning");
+        assert!(warning.contains("GPU 0"));
+        assert!(warning.contains("`--gpu <index|auto>`"));
+
+        // Baseline: the same discrete card, mostly free, stays quiet.
+        let idle = [vram(0, 1_000, 192_000)];
+        assert_eq!(
+            serve_gpu_low_memory_warning(&[0], Some(&idle), Some(&host_gpu("gfx1100"))),
+            None
+        );
+    }
+
+    #[test]
+    fn apu_verdict_does_not_silence_a_second_gpu() {
+        // `gfx_is_apu_family` classifies a part, while host detection reports one
+        // target for the whole machine. On an APU+dGPU laptop that target cannot
+        // be attributed to the selected ordinal, so the warning must survive
+        // rather than be suppressed on the discrete card's behalf.
+        let hybrid = [vram(0, 2_458, 4_096), vram(1, 182_000, 192_000)];
+        assert!(
+            serve_gpu_low_memory_warning(&[1], Some(&hybrid), Some(&host_gpu("gfx1151"))).is_some()
+        );
+        assert!(vram_capacity_is_meaningful(Some("gfx1151"), 2));
+        // An unknown target is never treated as unified memory.
+        assert!(vram_capacity_is_meaningful(None, 1));
     }
 
     #[test]

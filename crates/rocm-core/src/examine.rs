@@ -559,7 +559,7 @@ fn classify_amd_marketing_name(name: &str) -> (String, bool) {
     (String::new(), APU_KEYWORDS.iter().any(|kw| n.contains(kw)))
 }
 
-/// Whether a gfx target belongs to an AMD APU family the doctor cares about.
+/// Whether a gfx target belongs to an AMD APU family.
 ///
 /// APUs: gfx1103 (Phoenix / Hawk Point) and the gfx115x parts (Strix Point /
 /// Strix Halo). Their neighbors gfx1100 / gfx1101 / gfx1102 (Navi 31 / 32 / 33)
@@ -567,7 +567,18 @@ fn classify_amd_marketing_name(name: &str) -> (String, bool) {
 /// match — otherwise they inflate `has_apu` and suppress `has_discrete_amd`,
 /// which gates the iGPU+dGPU collision fix. (Target -> product per LLVM
 /// AMDGPUUsage.)
-fn gfx_is_apu_family(gfx: &str) -> bool {
+///
+/// Two consumers rely on this, for different reasons:
+///
+/// - the doctor, to tell an integrated GPU from a discrete one when diagnosing
+///   iGPU+dGPU device-visibility collisions;
+/// - serve's VRAM reporting, because an APU has no private VRAM — see
+///   `vram_capacity_is_meaningful` in the `rocm` binary.
+///
+/// This answers a question about the *part*, not about the host: a machine can
+/// pair an APU with a discrete card, so a true verdict here does not mean every
+/// GPU on the host is integrated.
+pub fn gfx_is_apu_family(gfx: &str) -> bool {
     let g = gfx.to_lowercase();
     // gfx115x: every Strix part is an APU.
     if gfx_model_digit(&g, "gfx115").is_some() {
@@ -1689,6 +1700,7 @@ mod tests {
         assert!(gfx_is_apu_family("gfx1150"));
         assert!(gfx_is_apu_family("gfx1151"));
         assert!(gfx_is_apu_family("gfx1152"));
+        assert!(gfx_is_apu_family("gfx1153"));
         // Unrelated families are never APUs.
         assert!(!gfx_is_apu_family("gfx1200"));
         assert!(!gfx_is_apu_family("gfx942"));

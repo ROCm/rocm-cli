@@ -44,7 +44,7 @@ pub use disk_space::{
     mount_for_path, on_same_filesystem, warn_if_low_space, with_margin,
 };
 use examine::extract_rocm_version;
-pub use examine::{Examination, FrameworkProbe, WSL_ROUTE_OUT_NOTE};
+pub use examine::{Examination, FrameworkProbe, WSL_ROUTE_OUT_NOTE, gfx_is_apu_family};
 pub use fix::{FixOptions, apply as apply_fix, list_recipes as list_fix_recipes};
 pub use proc_lifecycle::{
     IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
