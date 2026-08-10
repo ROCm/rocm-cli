@@ -2900,7 +2900,13 @@ fn build_driver_install_plan(
     os_release_text: &str,
     dkms: bool,
 ) -> DriverInstallPlan {
-    let repo_version_expr = "${ROCM_CLI_AMDGPU_DRIVER_VERSION:-latest}".to_owned();
+    // Resolved here rather than left as a shell `${VAR:-default}` expression:
+    // these commands are built with `printf '%s\n' '...'` (single-quoted) so the
+    // written repo file has a working baseurl regardless of shell.
+    let repo_version_expr = std::env::var("ROCM_CLI_AMDGPU_DRIVER_VERSION")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "latest".to_owned());
     if examine.os == "windows" {
         return DriverInstallPlan {
             supported: false,
@@ -24186,9 +24192,9 @@ VERSION_ID="9.7"
         assert!(rendered.contains("kernel-devel-$(uname -r)"));
         assert!(rendered.contains("kernel-devel-matched-$(uname -r)"));
         assert!(rendered.contains("sudo rpm --import https://repo.radeon.com/rocm/rocm.gpg.key"));
-        assert!(rendered.contains(
-            "baseurl=https://repo.radeon.com/amdgpu/${ROCM_CLI_AMDGPU_DRIVER_VERSION:-latest}/rhel/9.7/main/x86_64"
-        ));
+        assert!(
+            rendered.contains("baseurl=https://repo.radeon.com/amdgpu/latest/rhel/9.7/main/x86_64")
+        );
         assert!(rendered.contains("/etc/yum.repos.d/amdgpu.repo"));
         assert!(rendered.contains("Execute: sudo dnf install -y amdgpu-dkms"));
         assert!(rendered.contains("approval: required"));
@@ -24207,9 +24213,7 @@ VERSION_ID="10.1"
         assert!(rendered.contains("approval: not required"));
         assert!(rendered.contains("kernel-uek-devel-$(uname -r)"));
         assert!(
-            rendered.contains(
-                "baseurl=https://repo.radeon.com/amdgpu/${ROCM_CLI_AMDGPU_DRIVER_VERSION:-latest}/el/10/main/x86_64"
-            )
+            rendered.contains("baseurl=https://repo.radeon.com/amdgpu/latest/el/10/main/x86_64")
         );
         assert!(rendered.contains("dry run only"));
     }
@@ -24229,9 +24233,7 @@ VERSION_ID="9.7"
                 .contains("sudo dnf install -y kernel-headers kernel-devel kernel-devel-matched")
         );
         assert!(
-            rendered.contains(
-                "baseurl=https://repo.radeon.com/amdgpu/${ROCM_CLI_AMDGPU_DRIVER_VERSION:-latest}/el/9.7/main/x86_64"
-            )
+            rendered.contains("baseurl=https://repo.radeon.com/amdgpu/latest/el/9.7/main/x86_64")
         );
         assert!(rendered.contains("Execute: sudo dnf install -y amdgpu-dkms"));
     }
@@ -24249,9 +24251,7 @@ VERSION_ID="9.4"
         assert!(plan.supported);
         assert!(plan.mutating);
         assert!(
-            rendered.contains(
-                "baseurl=https://repo.radeon.com/amdgpu/${ROCM_CLI_AMDGPU_DRIVER_VERSION:-latest}/el/9.4/main/x86_64"
-            )
+            rendered.contains("baseurl=https://repo.radeon.com/amdgpu/latest/el/9.4/main/x86_64")
         );
         assert!(rendered.contains("Execute: sudo dnf install -y amdgpu-dkms"));
     }
@@ -24286,9 +24286,7 @@ VERSION_CODENAME=bookworm
 
         assert!(plan.supported);
         assert_eq!(plan.codename, "jammy");
-        assert!(rendered.contains(
-            "https://repo.radeon.com/amdgpu/${ROCM_CLI_AMDGPU_DRIVER_VERSION:-latest}/ubuntu jammy main"
-        ));
+        assert!(rendered.contains("https://repo.radeon.com/amdgpu/latest/ubuntu jammy main"));
         assert!(
             plan.reason
                 .contains("intentionally uses AMD's Ubuntu-suite repository")
@@ -24310,9 +24308,9 @@ VERSION_ID="15.7"
         assert!(rendered.contains("sle-module-desktop-applications/15.7/x86_64"));
         assert!(rendered.contains("sudo zypper install -y kernel-default-devel"));
         assert!(rendered.contains("sudo rpm --import https://repo.radeon.com/rocm/rocm.gpg.key"));
-        assert!(rendered.contains(
-            "baseurl=https://repo.radeon.com/amdgpu/${ROCM_CLI_AMDGPU_DRIVER_VERSION:-latest}/sle/15.7/main/x86_64"
-        ));
+        assert!(
+            rendered.contains("baseurl=https://repo.radeon.com/amdgpu/latest/sle/15.7/main/x86_64")
+        );
         assert!(rendered.contains("/etc/zypp/repos.d/amdgpu.repo"));
         assert!(rendered.contains("Execute: sudo zypper install -y amdgpu-dkms"));
         assert!(rendered.contains("approval: required"));
@@ -24386,9 +24384,7 @@ ID_LIKE="ubuntu debian"
         assert_eq!(plan.policy, "linux_official_amd_dkms_wrapper");
         // Ubuntu-family derivatives ship the Ubuntu kernel, so linux-modules-extra applies.
         assert!(rendered.contains("linux-modules-extra-$(uname -r)"));
-        assert!(rendered.contains(
-            "https://repo.radeon.com/amdgpu/${ROCM_CLI_AMDGPU_DRIVER_VERSION:-latest}/ubuntu jammy main"
-        ));
+        assert!(rendered.contains("https://repo.radeon.com/amdgpu/latest/ubuntu jammy main"));
         assert!(rendered.contains("Execute: sudo apt-get install -y amdgpu-dkms"));
     }
 
@@ -24405,9 +24401,7 @@ ID_LIKE=debian
 
         assert!(plan.supported);
         // Debian-family maps to the Ubuntu jammy repo and omits linux-modules-extra.
-        assert!(rendered.contains(
-            "https://repo.radeon.com/amdgpu/${ROCM_CLI_AMDGPU_DRIVER_VERSION:-latest}/ubuntu jammy main"
-        ));
+        assert!(rendered.contains("https://repo.radeon.com/amdgpu/latest/ubuntu jammy main"));
         assert!(!rendered.contains("linux-modules-extra-$(uname -r)"));
         assert!(rendered.contains("amdgpu-dkms"));
     }
@@ -24428,9 +24422,7 @@ ID_LIKE="rhel centos fedora"
         assert_eq!(plan.policy, "linux_official_amd_dkms_wrapper");
         // EL rebuilds use the vendor-neutral el/ repo path, not rhel/.
         assert!(
-            rendered.contains(
-                "baseurl=https://repo.radeon.com/amdgpu/${ROCM_CLI_AMDGPU_DRIVER_VERSION:-latest}/el/9.6/main/x86_64"
-            )
+            rendered.contains("baseurl=https://repo.radeon.com/amdgpu/latest/el/9.6/main/x86_64")
         );
         assert!(!rendered.contains("/rhel/9.6/"));
         // el9 uses the version-aware standard-kernel prepare commands.
@@ -24450,9 +24442,9 @@ ID_LIKE="rhel centos fedora"
 
         assert!(plan.supported);
         // EL 8 is served from the major-version path (el/8), matching AMD docs.
-        assert!(rendered.contains(
-            "baseurl=https://repo.radeon.com/amdgpu/${ROCM_CLI_AMDGPU_DRIVER_VERSION:-latest}/el/8/main/x86_64"
-        ));
+        assert!(
+            rendered.contains("baseurl=https://repo.radeon.com/amdgpu/latest/el/8/main/x86_64")
+        );
         // el8 has no kernel-devel-matched package.
         assert!(!rendered.contains("kernel-devel-matched"));
         assert!(rendered.contains("kernel-devel-$(uname -r)"));
@@ -24488,9 +24480,9 @@ ID_LIKE=fedora
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(plan.supported);
-        assert!(rendered.contains(
-            "baseurl=https://repo.radeon.com/amdgpu/${ROCM_CLI_AMDGPU_DRIVER_VERSION:-latest}/rhel/9.7/main/x86_64"
-        ));
+        assert!(
+            rendered.contains("baseurl=https://repo.radeon.com/amdgpu/latest/rhel/9.7/main/x86_64")
+        );
         assert!(!rendered.contains("/el/9.7/"));
     }
 

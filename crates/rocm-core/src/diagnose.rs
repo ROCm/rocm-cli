@@ -1150,10 +1150,10 @@ fn check_12_repo_native_broken(e: &Examination, symptom: &str) -> Diagnosis {
         .to_owned(),
     );
     commands.push("# Reinstall via rocm-cli's repo-native flow:".to_owned());
-    commands.push("rocm install driver".to_owned());
+    commands.push("rocm install driver --dkms --yes".to_owned());
 
     let fix = Fix {
-        summary: "Clear the half-configured package/DKMS state, quarantine the repo-native install's repo files, THEN reinstall via `rocm install driver`.".to_owned(),
+        summary: "Clear the half-configured package/DKMS state, quarantine the repo-native install's repo files, THEN reinstall via `rocm install driver --dkms --yes`.".to_owned(),
         commands,
         needs_sudo: true,
         needs_reboot: true,
@@ -2067,6 +2067,10 @@ mod tests {
         assert!(
             commands.contains("# sudo mv /etc/apt/sources.list.d/amdgpu.list"),
             "repo quarantine command must be commented out, not ready-to-run: {commands}"
+        );
+        assert!(
+            commands.contains("rocm install driver --dkms --yes"),
+            "reinstall command must actually install (bare 'rocm install driver' is a non-mutating preflight no-op): {commands}"
         );
         assert!(fix.verify.contains("repo-native"));
     }
