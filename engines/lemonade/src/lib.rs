@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use rocm_core::{
     AppPaths, DEFAULT_LOCAL_PORT, RocmCliConfig, active_managed_therock_environment,
-    download_file_to_path, format_host_port, format_http_base_url, http_get_text_with_auth,
+    download_file_to_path, format_http_base_url, http_get_text_with_auth,
     normalize_runtime_path_for_host, prepend_runtime_paths, require_nonempty, runtime_is_linux,
     runtime_is_windows,
 };
@@ -26,7 +26,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, Read, Seek, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -885,7 +885,7 @@ fn healthcheck_service(request: HealthcheckRequest) -> Result<HealthcheckRespons
         .as_ref()
         .and_then(|value| value_string(value, "backend_requested"))
         .unwrap_or_else(|| ROCM_BACKEND_NAME.to_owned());
-    let ready = state_status == "ready"
+    let listed = state_status == "ready"
         && !model_ref.is_empty()
         && endpoint_url
             .as_deref()
@@ -893,24 +893,47 @@ fn healthcheck_service(request: HealthcheckRequest) -> Result<HealthcheckRespons
             .transpose()
             .unwrap_or(None)
             .unwrap_or(false);
-    let status = if ready {
-        "ready".to_owned()
+    // Listing a model is not the same as being able to serve it: the endpoint can
+    // answer within seconds while the weights load for minutes. Confirm inference
+    // once before reporting ready.
+    let ready = listed
+        && endpoint_url.as_deref().is_some_and(|endpoint| {
+            inference_verified(&files.state_path, state.as_ref(), endpoint, &model_ref)
+        });
+    let device = if ready {
+        reported_device(state.as_ref(), &backend)
     } else {
-        state_status
+        "unknown".to_owned()
     };
-    Ok(HealthcheckResponse {
-        status,
-        model_loaded: ready,
-        device: if ready {
-            reported_device(state.as_ref(), &backend)
-        } else {
-            "unknown".to_owned()
-        },
-        uptime_sec: 0,
-        queue_depth: 0,
-        last_error: None,
-        tokens_per_sec: None,
-    })
+    Ok(HealthcheckResponse::for_readiness(
+        listed,
+        ready,
+        &state_status,
+        &device,
+    ))
+}
+
+/// Whether a real inference request has succeeded against this service.
+///
+/// Latch and backoff bookkeeping lives in `rocm-core` so both engines share one
+/// implementation — what counts as *listed* differs per engine, what counts as
+/// *serving* does not.
+fn inference_verified(
+    state_path: &Path,
+    state: Option<&Value>,
+    endpoint_url: &str,
+    model_ref: &str,
+) -> bool {
+    let Some((host, port)) = parse_http_endpoint(endpoint_url) else {
+        return false;
+    };
+    rocm_core::engine_state_inference_verified(
+        state_path,
+        state,
+        &format_http_base_url(&host, port),
+        model_ref,
+        rocm_engine_protocol::resolve_endpoint_api_key().as_deref(),
+    )
 }
 
 /// The device string reported once a model is loaded. Reflects the backend that
@@ -2863,42 +2886,18 @@ fn query_loaded_model_endpoint(endpoint_url: &str, model_ref: &str, backend: &st
     Ok(models_payload_has_ready_model(&models, model_ref, backend))
 }
 
+/// Post-load smoke test: the freshly loaded model must actually complete a chat
+/// request. Deliberately stricter than the readiness probe — only a `200` counts,
+/// so a refusal (wrong model name, unsupported request) fails the serve instead
+/// of being reported as a working service.
 fn query_chat_smoke_endpoint(host: &str, port: u16, model_ref: &str) -> Result<bool> {
-    let addr = (host, port)
-        .to_socket_addrs()
-        .with_context(|| format!("failed to resolve {host}:{port}"))?
-        .next()
-        .with_context(|| format!("no socket addresses resolved for {host}:{port}"))?;
-    let timeout = Duration::from_secs(8);
-    let mut stream = TcpStream::connect_timeout(&addr, timeout)
-        .with_context(|| format!("failed to connect to {host}:{port}"))?;
-    stream.set_read_timeout(Some(timeout)).ok();
-    stream.set_write_timeout(Some(timeout)).ok();
-    let body = json!({
-        "model": model_ref,
-        "messages": [{"role": "user", "content": "Say ok."}],
-        "max_tokens": 2,
-        "stream": false
-    });
-    let body = serde_json::to_string(&body).context("failed to serialize chat smoke request")?;
-    let host_header = format_host_port(host, port);
-    let auth_header = match rocm_engine_protocol::resolve_endpoint_api_key() {
-        Some(key) => format!("Authorization: Bearer {key}\r\n"),
-        None => String::new(),
-    };
-    write!(
-        stream,
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{auth_header}Connection: close\r\n\r\n{}",
-        body.len(),
-        body
-    )
-    .context("failed to write chat smoke request")?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .context("failed to read chat smoke response")?;
-    let status_line = response.lines().next().unwrap_or_default();
-    Ok(status_line.contains(" 200 "))
+    let status = rocm_core::openai_chat_completion_status(
+        &format_http_base_url(host, port),
+        model_ref,
+        rocm_engine_protocol::resolve_endpoint_api_key().as_deref(),
+        rocm_core::INFERENCE_PROBE_TIMEOUT,
+    )?;
+    Ok(status == 200)
 }
 
 fn health_has_loaded_model(health: &Value, model_ref: &str, backend: &str) -> bool {
@@ -3673,6 +3672,105 @@ mod tests {
             .collect::<Vec<_>>();
         names.sort();
         assert_eq!(names, vec!["model-Q4_0.gguf", "model-Q8_0.gguf"]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Answer `count` chat requests on a loopback port with the given status,
+    /// recording how many arrived.
+    fn spawn_chat_endpoint(
+        status_line: &'static str,
+        count: usize,
+    ) -> (u16, std::thread::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let handle = std::thread::spawn(move || {
+            let mut served = 0;
+            for _ in 0..count {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buffer = [0_u8; 1024];
+                let _ = stream.read(&mut buffer);
+                let body = r#"{"choices":[{"message":{"content":"ok"}}]}"#;
+                let _ = write!(
+                    stream,
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                served += 1;
+            }
+            served
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn inference_verification_latches_into_the_state_file() {
+        // First check probes and records the verdict; the second reads the latch
+        // and leaves the model alone.
+        let (port, server) = spawn_chat_endpoint("HTTP/1.1 200 OK", 1);
+        let dir = scratch_dir("inference-latch");
+        let state_path = dir.join("state.json");
+        fs::write(&state_path, json!({"status": "ready"}).to_string()).expect("seed state");
+        let endpoint = format_http_base_url("127.0.0.1", port);
+
+        let state = read_service_state(&state_path).ok();
+        assert!(inference_verified(
+            &state_path,
+            state.as_ref(),
+            &endpoint,
+            DEFAULT_MODEL
+        ));
+
+        let state = read_service_state(&state_path).expect("state readable");
+        assert!(
+            state
+                .get(rocm_core::INFERENCE_VERIFIED_STATE_KEY)
+                .and_then(Value::as_u64)
+                .is_some(),
+            "a passing probe is latched so later healthchecks skip it"
+        );
+        assert!(inference_verified(
+            &state_path,
+            Some(&state),
+            &endpoint,
+            DEFAULT_MODEL
+        ));
+
+        assert_eq!(
+            server.join().expect("server thread"),
+            1,
+            "the latched check must not send a second inference request"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn inference_verification_withheld_while_the_endpoint_cannot_serve() {
+        // The reported failure: the model is listed but inference still 5xxs.
+        let (port, server) = spawn_chat_endpoint("HTTP/1.1 503 Service Unavailable", 1);
+        let dir = scratch_dir("inference-unverified");
+        let state_path = dir.join("state.json");
+        fs::write(&state_path, json!({"status": "ready"}).to_string()).expect("seed state");
+        let endpoint = format_http_base_url("127.0.0.1", port);
+
+        let state = read_service_state(&state_path).ok();
+        assert!(!inference_verified(
+            &state_path,
+            state.as_ref(),
+            &endpoint,
+            DEFAULT_MODEL
+        ));
+
+        let state = read_service_state(&state_path).expect("state readable");
+        assert!(
+            state.get(rocm_core::INFERENCE_VERIFIED_STATE_KEY).is_none(),
+            "nothing is latched until inference actually answers"
+        );
+
+        server.join().expect("server thread");
         fs::remove_dir_all(&dir).ok();
     }
 

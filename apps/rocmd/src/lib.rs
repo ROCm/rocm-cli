@@ -4823,8 +4823,13 @@ fn restart_managed_service(_paths: &AppPaths, record: &mut ManagedServiceRecord)
         .context("failed to clone service log file handle")?;
 
     record.status = "recovering".to_owned();
-    record.restart_count = record.restart_count.saturating_add(1);
-    record.last_restart_unix_ms = Some(unix_time_millis());
+    // Counts the restart and drops the previous run's inference verification.
+    // The respawned child writes a fresh record of its own, and "recovering" is
+    // outside the statuses that probe, so a stale verdict would not currently be
+    // acted on — but this record is written again below, after the spawn, and
+    // that write can land after the child's. Clearing here keeps the invariant
+    // true at the one site that reuses a record across restarts.
+    record.reset_for_restart();
     record.supervisor_pid = std::process::id();
     record.write()?;
 
@@ -7048,6 +7053,29 @@ mod tests {
 
         response.status = "loading_model".to_owned();
         assert!(!healthcheck_response_recoverable(&response));
+
+        // The status the engines report for a model that is listed but has not
+        // yet served an inference request. Restarting it would kill a model
+        // mid-load and start the wait over.
+        response.status = "loading".to_owned();
+        assert!(!healthcheck_response_recoverable(&response));
+    }
+
+    #[test]
+    fn healthcheck_readiness_withheld_while_the_model_only_lists() {
+        // What an engine reports once `/v1/models` answers but inference has not:
+        // not ready, so `rocm serve` keeps waiting instead of handing the caller
+        // an endpoint that will hang on its first request.
+        let listing_only = HealthcheckResponse {
+            status: "loading".to_owned(),
+            model_loaded: false,
+            device: "unknown".to_owned(),
+            uptime_sec: 1,
+            queue_depth: 0,
+            last_error: None,
+            tokens_per_sec: None,
+        };
+        assert!(!healthcheck_response_ready(&listing_only));
     }
 
     #[test]
