@@ -1,4 +1,6 @@
 /target
+# Crate-local target/ dirs (the Lemonade tests write scratch trees there).
+**/target/
 /target-codex-*
 /target-rocm-*
 /.worktrees/
