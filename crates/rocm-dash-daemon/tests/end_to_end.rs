@@ -258,3 +258,64 @@ async fn socket_is_created_with_restricted_permissions() {
     let _ = handle.await;
     assert_eq!(mode, 0o600, "socket must not be group- or world-accessible");
 }
+
+/// Regression: a scrape warning must persist on the ticks BETWEEN scrapes.
+/// The vLLM scrape runs on the slower `instance_tick` cadence, so rebuilding
+/// `warnings` per tick made the header ⚠ badge appear and vanish alternately.
+#[tokio::test]
+async fn scrape_warning_persists_between_scrape_ticks() {
+    let dir = tempfile::tempdir().unwrap();
+    // A "running" managed vLLM service on a port nothing listens on: every
+    // scrape fails, so the warning must be present on EVERY snapshot.
+    std::fs::write(
+        dir.path().join("svc.json"),
+        r#"{"service_id":"svc-dead","engine":"vllm","model_ref":"m","canonical_model_id":"m",
+            "host":"127.0.0.1","port":1,"endpoint_url":"http://127.0.0.1:1/v1","mode":"managed",
+            "status":"running","created_at_unix_ms":1}"#,
+    )
+    .unwrap();
+
+    let (tx, mut rx) = broadcast::channel::<Event>(64);
+    let services_dir = dir.path().to_path_buf();
+    let handle = tokio::spawn(async move {
+        let opts = runner::RunnerOptions {
+            services_dir: Some(services_dir),
+            ..Default::default()
+        };
+        runner::run_loop(
+            Some(Duration::from_millis(100)),
+            tx,
+            Arc::new(Mutex::new(SnapshotRing::new(32))),
+            Arc::new(Mutex::new(BenchRing::new(4))),
+            None,
+            opts,
+        )
+        .await;
+    });
+
+    // Collect snapshots after the first failed scrape and require an unbroken
+    // run of warnings — the pre-fix behavior alternated warned/clean.
+    let mut seen_warned = false;
+    let mut checked = 0;
+    while checked < 6 {
+        let ev = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("event timeout")
+            .expect("recv");
+        let Event::Snapshot(snap) = ev else { continue };
+        let warned = snap.warnings.iter().any(|w| w.starts_with("vllm scrape:"));
+        if !seen_warned {
+            seen_warned = warned;
+            continue;
+        }
+        assert!(
+            warned,
+            "vllm scrape warning dropped on a non-scrape tick: {:?}",
+            snap.warnings
+        );
+        checked += 1;
+    }
+
+    handle.abort();
+    let _ = handle.await;
+}
