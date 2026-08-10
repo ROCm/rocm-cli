@@ -4824,16 +4824,37 @@ fn start_managed_service(
     #[cfg(windows)]
     thread::sleep(Duration::from_millis(200));
 
+    // Wait on the engine's own readiness budget, not a shorter CLI-side one: a
+    // cold vLLM start (torch import, aiter/triton JIT, KV-cache warmup) routinely
+    // runs past a minute, and reporting "not ready" for a server that answers ten
+    // seconds later reads as a failed launch. Watching the engine's own state file
+    // keeps a genuine crash fast instead of spinning out the whole budget: the
+    // supervisor is our child, so `process_is_running` still reports it alive
+    // while it sits unreaped as a zombie, but the engine writes a terminal status
+    // before it exits.
     let readiness = wait_for_service_http_ready_with_progress(
         engine,
         host,
         port,
         &resolve.canonical_model_id,
         endpoint_api_key,
-        Duration::from_secs(45),
-        on_wait_tick,
+        managed_ready_timeout(engine),
+        &mut |elapsed| {
+            on_wait_tick(elapsed);
+            let _ = record.refresh_from_engine_state();
+            managed_service_running_state(&record.status) != "not_running"
+        },
     );
-    let launch_status = status_for_readiness(readiness);
+    // A launch the engine already gave up on is failed, not merely slow — but a
+    // reachable endpoint still wins, since a service that answers is serving
+    // whatever its state file last claimed.
+    let launch_status = if readiness == EndpointReadiness::Unreachable
+        && managed_service_running_state(&record.status) == "not_running"
+    {
+        "failed"
+    } else {
+        status_for_readiness(readiness)
+    };
     record.status = launch_status.to_owned();
     if readiness == EndpointReadiness::Serving {
         // Latch the verification the wait just performed, so the readiness checks
@@ -13038,7 +13059,7 @@ fn restart_internal_managed_service(
         record.port,
         &record.canonical_model_id,
         endpoint_api_key.as_deref(),
-        Duration::from_secs(45),
+        managed_ready_timeout(&record.engine),
     );
     record.status = status_for_readiness(readiness).to_owned();
     if readiness == EndpointReadiness::Serving {
@@ -16189,6 +16210,17 @@ fn apply_app_path_env(command: &mut ProcessCommand, paths: &AppPaths) {
     }
 }
 
+/// Readiness budget for a managed launch, taken from the engine's own startup
+/// timeout so the CLI never contradicts it. vLLM's is 5 minutes by default and
+/// tunable via `ROCM_CLI_VLLM_READY_TIMEOUT_SECS`; other engines start fast
+/// enough that the historical 45 s is still generous.
+fn managed_ready_timeout(engine: &str) -> Duration {
+    match engine {
+        "vllm" => rocm_engine_vllm::ready_timeout(),
+        _ => Duration::from_secs(45),
+    }
+}
+
 fn wait_for_service_http_ready(
     engine: &str,
     host: &str,
@@ -16204,7 +16236,7 @@ fn wait_for_service_http_ready(
         canonical_model_id,
         endpoint_api_key,
         timeout,
-        &mut |_elapsed| {},
+        &mut |_elapsed| true,
     )
 }
 
@@ -16219,10 +16251,12 @@ fn wait_for_service_http_ready(
 /// result seen before `timeout` is what gets returned.
 ///
 /// Polls until `timeout` elapses, invoking `on_tick(elapsed)` once per iteration
-/// so a caller can animate a spinner. Engine-neutral: `service_http_readiness_paths`
-/// maps each engine to the right listing path. `endpoint_api_key` is sent as a
-/// bearer token so both the listing check and the inference probe still succeed
-/// against a public endpoint that requires authentication.
+/// so a caller can animate a spinner and, by returning `false`, abandon a wait it
+/// knows is hopeless (e.g. the engine died) rather than burn the whole budget.
+/// Engine-neutral: `service_http_readiness_paths` maps each engine to the right
+/// listing path. `endpoint_api_key` is sent as a bearer token so both the listing
+/// check and the inference probe still succeed against a public endpoint that
+/// requires authentication.
 fn wait_for_service_http_ready_with_progress(
     engine: &str,
     host: &str,
@@ -16230,7 +16264,7 @@ fn wait_for_service_http_ready_with_progress(
     canonical_model_id: &str,
     endpoint_api_key: Option<&str>,
     timeout: Duration,
-    on_tick: &mut dyn FnMut(Duration),
+    on_tick: &mut dyn FnMut(Duration) -> bool,
 ) -> EndpointReadiness {
     let start = std::time::Instant::now();
     let endpoint = format_http_base_url(host, port);
@@ -16267,7 +16301,9 @@ fn wait_for_service_http_ready_with_progress(
                 return EndpointReadiness::Serving;
             }
         }
-        on_tick(start.elapsed());
+        if !on_tick(start.elapsed()) {
+            return best;
+        }
         thread::sleep(Duration::from_millis(250));
     }
     best
@@ -16519,6 +16555,44 @@ mod tests {
     #[test]
     fn cli_command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// Regression: the managed launch used a hardcoded 45 s wait while vLLM's own
+    /// startup budget is minutes, so every cold vLLM start was reported as "not
+    /// ready" seconds before the server came up.
+    #[test]
+    fn managed_ready_timeout_follows_the_engine_budget() {
+        assert_eq!(
+            managed_ready_timeout("vllm"),
+            rocm_engine_vllm::ready_timeout()
+        );
+        assert!(managed_ready_timeout("vllm") > Duration::from_secs(45));
+        assert_eq!(managed_ready_timeout("lemonade"), Duration::from_secs(45));
+    }
+
+    /// A caller that knows the engine is gone can end the wait early instead of
+    /// burning the whole (now much longer) budget, and still reports how far the
+    /// endpoint actually got.
+    #[test]
+    fn readiness_wait_stops_when_the_tick_gives_up() {
+        let start = std::time::Instant::now();
+        let mut ticks = 0u32;
+        let readiness = wait_for_service_http_ready_with_progress(
+            "vllm",
+            "127.0.0.1",
+            // Port 9 (discard) refuses locally, so the probe just fails.
+            9,
+            "model",
+            None,
+            Duration::from_mins(2),
+            &mut |_elapsed| {
+                ticks += 1;
+                false
+            },
+        );
+        assert_eq!(readiness, EndpointReadiness::Unreachable);
+        assert_eq!(ticks, 1, "the wait must stop at the first refusal");
+        assert!(start.elapsed() < Duration::from_secs(30));
     }
 
     /// Regression test for the engine child-stdin write under the process-wide
