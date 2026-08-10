@@ -19,7 +19,7 @@ regex = "1"
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
-sysinfo = "0.34"
+sysinfo.workspace = true
 bollard = "0.17"
 tokio = { version = "1", features = ["full"] }
 # HTTP partition: collectors keep reqwest 0.12 (vLLM Prometheus scrape, plain
