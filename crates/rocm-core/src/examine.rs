@@ -891,31 +891,18 @@ fn probe_secure_boot(e: &mut Examination) {
 // ---------------------------------------------------------------------------
 
 fn probe_rocm_install(e: &mut Examination) {
-    let mut rocm_dir = String::new();
-    let rocm_path_env = std::env::var("ROCM_PATH").unwrap_or_default();
-    for candidate in ["/opt/rocm", rocm_path_env.as_str()] {
-        if !candidate.is_empty() && Path::new(candidate).is_dir() {
-            rocm_dir = candidate.to_owned();
-            break;
-        }
-    }
+    // Shared with the human `rocm examine` report and the fix-6 PATH runner so
+    // all three agree on which install is the active one. Handles versioned
+    // roots (`/opt/rocm-6.4.1`) as well as the conventional `/opt/rocm`.
+    let install = crate::discover_rocm_installs().into_iter().next();
+    let rocm_dir = install
+        .as_ref()
+        .map(|install| install.path.to_string_lossy().into_owned())
+        .unwrap_or_default();
     e.rocm_path = rocm_dir.clone();
-
-    if !rocm_dir.is_empty() {
-        for fname in ["version", "version-utils", "version-libs"] {
-            let f = Path::new(&rocm_dir).join(".info").join(fname);
-            if f.exists() {
-                e.rocm_version = read_text(&f.to_string_lossy()).trim().to_owned();
-                break;
-            }
-        }
-        if e.rocm_version.is_empty()
-            && let Ok(real) = std::fs::canonicalize(&rocm_dir)
-            && let Some(version) = extract_rocm_version(&real.to_string_lossy())
-        {
-            e.rocm_version = version;
-        }
-    }
+    e.rocm_version = install
+        .and_then(|install| install.version)
+        .unwrap_or_default();
 
     for marker in AMDGPU_INSTALL_MARKERS {
         if Path::new(marker).exists() {
@@ -963,7 +950,7 @@ fn probe_rocm_install(e: &mut Examination) {
 }
 
 /// Pull `X.Y[.Z]` out of a `rocm-X.Y.Z` path component.
-fn extract_rocm_version(path: &str) -> Option<String> {
+pub(crate) fn extract_rocm_version(path: &str) -> Option<String> {
     let idx = path.find("rocm-")?;
     let tail = &path[idx + "rocm-".len()..];
     let version: String = tail
