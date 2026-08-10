@@ -37,51 +37,19 @@ async fn user_checks_services(world: &mut E2eWorld) {
 
 #[when("a chat request with tool definitions is sent")]
 async fn send_chat_with_tools(world: &mut E2eWorld) {
-    let endpoint = world.endpoint.as_ref().expect("no endpoint configured");
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(
-            crate::inference_timeout_for(world),
-        ))
-        .build()
-        .expect("failed to build HTTP client");
-
-    let models_url = format!("{endpoint}/models");
-    let resp: serde_json::Value = client
-        .get(&models_url)
-        .send()
-        .await
-        .unwrap_or_else(|e| panic!("GET {models_url} failed: {e}"))
-        .json()
-        .await
-        .unwrap_or_else(|e| panic!("GET {models_url} returned non-JSON: {e}"));
-    let model = resp["data"][0]["id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no model id in response: {resp}"))
-        .to_string();
-
-    let chat_url = format!("{endpoint}/chat/completions");
-    let chat_resp: serde_json::Value = client
-        .post(&chat_url)
-        .json(&serde_json::json!({
-            "model": model,
-            "messages": [{"role": "user", "content": "What GPUs are available?"}],
-            "tools": [{
-                "type": "function",
-                "function": {
-                    "name": "gpu_status",
-                    "description": "Get GPU status",
-                    "parameters": {"type": "object", "properties": {}}
-                }
-            }]
-        }))
-        .send()
-        .await
-        .unwrap_or_else(|e| panic!("POST {chat_url} failed: {e}"))
-        .json()
-        .await
-        .unwrap_or_else(|e| panic!("POST {chat_url} returned non-JSON: {e}"));
-    world.chat_response = Some(chat_resp);
+    // Same discover-then-POST path as a plain chat (including its cold-start
+    // retry and transport diagnostics), with a tool definition attached.
+    let tools = serde_json::json!([{
+        "type": "function",
+        "function": {
+            "name": "gpu_status",
+            "description": "Get GPU status",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    }]);
+    let response =
+        crate::request_chat_completion(world, "What GPUs are available?", Some(tools)).await;
+    world.chat_response = Some(response);
 }
 
 #[when("the user sends a chat message")]
