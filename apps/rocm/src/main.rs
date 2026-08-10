@@ -22,7 +22,7 @@ use crate::automations::automations;
 use crate::uninstall::uninstall;
 
 use anyhow::{Context, Result, bail};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use rocm_core::{
     AppPaths, AuditEventRecord, AutomationEventRecord, AutomationProposalRecord,
     AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot,
@@ -965,7 +965,33 @@ fn main() -> Result<()> {
         );
     }
 
-    dispatch(Cli::parse())
+    dispatch(parse_cli())
+}
+
+/// Build the root `rocm` command with its top-level subcommands ordered
+/// alphabetically in `--help` output (EAI-7362).
+///
+/// clap assigns each subcommand an incrementing display order in declaration
+/// order and renders the command list sorted by `(display_order, name)`.
+/// Resetting every subcommand to the same display order collapses that first
+/// sort key, so the visible list falls back to alphabetical name order.
+///
+/// The value used is clap's own default display order (999, i.e.
+/// `Command::get_display_order`'s `unwrap_or`). clap appends its implicit `help`
+/// subcommand *after* this runs and leaves it at that default, so matching the
+/// default here lets `help` sort into its alphabetical position instead of being
+/// pinned last. The regression test guards this if clap's default ever changes.
+fn cli_command() -> clap::Command {
+    Cli::command().mut_subcommands(|sc| sc.display_order(999usize))
+}
+
+/// Parse process arguments through [`cli_command`] so `rocm --help` and
+/// `rocm help` list subcommands alphabetically. Mirrors the derived
+/// `Cli::parse()`, which builds from `Cli::command()` directly and therefore
+/// cannot pick up the reordering.
+fn parse_cli() -> Cli {
+    let matches = cli_command().get_matches();
+    Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit())
 }
 
 /// One-shot, best-effort migration of a legacy rocm-dash `config.toml` into the
@@ -16342,6 +16368,51 @@ mod tests {
     #[test]
     fn cli_command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// EAI-7362: the top-level `rocm --help` command list must be alphabetical,
+    /// including clap's implicit `help` entry (it must sort into place, not be
+    /// pinned last).
+    ///
+    /// Renders the real help text (not just the command model) so the assertion
+    /// covers what clap actually prints.
+    #[test]
+    fn top_level_help_lists_commands_alphabetically() {
+        let help = cli_command().render_long_help().to_string();
+
+        let commands_section = help
+            .split_once("Commands:")
+            .expect("help output has a Commands section")
+            .1;
+
+        // Each command entry starts at a fixed two-space indent; wrapped
+        // description lines are indented further, so a non-space third column
+        // uniquely identifies a command row. Stop at the blank line that ends
+        // the section.
+        let names: Vec<String> = commands_section
+            .lines()
+            .skip_while(|line| line.trim().is_empty())
+            .take_while(|line| !line.trim().is_empty())
+            .filter(|line| line.starts_with("  ") && !line.starts_with("   "))
+            .filter_map(|line| line.split_whitespace().next())
+            .map(str::to_owned)
+            .collect();
+
+        assert!(
+            names.iter().any(|name| name == "help"),
+            "expected the implicit `help` entry to appear in the list, got {names:?}"
+        );
+        assert!(
+            names.len() > 1,
+            "expected several visible subcommands, got {names:?}"
+        );
+
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(
+            names, sorted,
+            "top-level `rocm --help` commands are not alphabetized"
+        );
     }
 
     /// Regression test for the engine child-stdin write under the process-wide
