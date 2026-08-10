@@ -298,7 +298,7 @@ const RECIPES: &[FixRecipe] = &[
             "sudo apt update      # Debian/Ubuntu",
             "sudo dnf clean all   # RHEL/Fedora/Rocky/Alma/Oracle",
             "sudo zypper refresh  # SLES/openSUSE",
-            "rocm install driver",
+            "rocm install driver --dkms --yes",
         ],
         needs_sudo: true,
         needs_reboot: true,
@@ -1065,6 +1065,10 @@ mod tests {
         assert!(
             commands.contains("# sudo mv /etc/apt/sources.list.d/amdgpu.list"),
             "repo quarantine command must be commented out, not ready-to-run: {commands}"
+        );
+        assert!(
+            commands.contains("rocm install driver --dkms --yes"),
+            "reinstall command must actually install (bare 'rocm install driver' is a non-mutating preflight no-op): {commands}"
         );
         assert!(recipe.verify.contains("repo-native"));
     }
