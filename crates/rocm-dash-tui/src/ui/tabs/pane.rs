@@ -422,7 +422,10 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> Vec<Line<'s
                         Span::styled(i.model_name.clone(), Style::default().fg(theme.fg)),
                         Span::styled(port, Style::default().fg(theme.muted)),
                         Span::styled(
-                            format!("  gen {}", format::tps_opt(i.gen_tps)),
+                            format!(
+                                "  gen {}",
+                                format::gen_tps_compact(i.gen_tps, i.gen_tps_observation.as_ref())
+                            ),
                             Style::default().fg(theme.muted),
                         ),
                     ]));

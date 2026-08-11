@@ -256,13 +256,26 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         lh[2],
     );
     // Tokens/watt: summed across running instances when available.
+    // Mark held if any contributing instance has a held gen_tps observation
+    // (tok/W derives from gen_tps; aggregate inherits held status).
     let tpw: f64 = state
         .instances
         .values()
         .filter_map(|i| i.tokens_per_watt)
         .sum();
+    let any_tpw_held = state.instances.values().any(|i| {
+        i.tokens_per_watt.is_some()
+            && i.gen_tps_observation
+                .as_ref()
+                .is_some_and(|m| m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held)
+    });
     let tpw_label = if tpw > 0.0 {
-        format!("⎓ {tpw:.1} tokens / watt")
+        let marker = if any_tpw_held {
+            crate::ui::format::HELD_MARKER
+        } else {
+            ""
+        };
+        format!("⎓ {tpw:.1} tokens / watt{marker}")
     } else {
         "⎓ tokens / watt —".to_string()
     };
@@ -350,7 +363,18 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         theme,
     );
     let tps: f64 = state.instances.values().filter_map(|i| i.gen_tps).sum();
-    mini_spark(f, rh[4], "T/S  ", &format!("{tps:.0}"), &[], true, theme);
+    let any_tps_held = state.instances.values().any(|i| {
+        i.gen_tps.is_some()
+            && i.gen_tps_observation
+                .as_ref()
+                .is_some_and(|m| m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held)
+    });
+    let tps_str = if any_tps_held {
+        format!("{:.0}{}", tps, crate::ui::format::HELD_MARKER)
+    } else {
+        format!("{tps:.0}")
+    };
+    mini_spark(f, rh[4], "T/S  ", &tps_str, &[], true, theme);
 }
 
 fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {

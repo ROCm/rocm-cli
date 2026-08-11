@@ -24,7 +24,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
-use rocm_dash_core::metrics::Instance;
+use rocm_dash_core::metrics::{Instance, ObservationMetadata};
 use rocm_dash_core::state::{SideEffect, State, StateEvent};
 
 use crate::ui::approval::{
@@ -74,7 +74,10 @@ pub struct ServicesManagerState {
     pub active_job: Option<String>,
 }
 
-/// A render-ready row derived from an `Instance`.
+/// A render-ready row derived from an [`Instance`].
+///
+/// `gen_tps_observation` carries the freshness metadata alongside the numeric
+/// value so the renderer can mark held observations — no value duplication.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServiceRow {
     pub id: String,
@@ -82,6 +85,8 @@ pub struct ServiceRow {
     pub port: Option<u16>,
     pub status: String,
     pub gen_tps: Option<f64>,
+    /// Freshness metadata for `gen_tps`; `None` for legacy snapshots.
+    pub gen_tps_observation: Option<ObservationMetadata>,
 }
 
 /// Build the sorted service list from the daemon-surfaced instances.
@@ -98,6 +103,7 @@ pub fn service_rows<S: ::std::hash::BuildHasher>(
             // when the instance is `Starting`; never a raw `{:?}` debug string.
             status: i.status.label().to_owned(),
             gen_tps: i.gen_tps,
+            gen_tps_observation: i.gen_tps_observation.clone(),
         })
         .collect();
     rows.sort_by(|a, b| a.id.cmp(&b.id));
@@ -281,7 +287,10 @@ pub fn draw_services_manager<S: ::std::hash::BuildHasher>(
                     ),
                     Span::styled(format!("{:<10}", r.status), Style::default().fg(theme.ok)),
                     Span::styled(
-                        format!("gen {}", format::tps_opt(r.gen_tps)),
+                        format!(
+                            "gen {}",
+                            format::gen_tps_compact(r.gen_tps, r.gen_tps_observation.as_ref())
+                        ),
                         Style::default().fg(theme.fg),
                     ),
                 ]))
