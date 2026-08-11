@@ -37,9 +37,16 @@ Feature: GPU detection and system inspection
     When the user inspects the system
     Then the inspection names the engine this host serves on by default
 
-  @id:examine-distinguishes-unmanaged-rocm @requires-gpu
+  # No GPU needed: the install is planted by the harness (`plant_unmanaged_rocm`,
+  # written precisely so this does not depend on an ambient `/opt/rocm`), and
+  # every assertion here is about how a detected install is reported, not about
+  # hardware. Dropping `@requires-gpu` gains per-PR mock-lane coverage for the
+  # reporting this scenario exists to pin.
+  @id:examine-distinguishes-unmanaged-rocm
   Scenario: 4 - System inspection distinguishes CLI-managed from pre-existing ROCm
     Given a machine with a ROCm install that was not set up by the CLI
     When the user inspects the system
     Then the inspection reports the install as pre-existing
+    And the inspection names that install's version
+    And the inspection does not claim nothing is installed
     And the inspection suggests setting up a CLI-managed install
