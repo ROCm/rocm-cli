@@ -901,20 +901,10 @@ fn probe_rocm_install(e: &mut Examination) {
     }
     e.rocm_path = rocm_dir.clone();
 
-    if !rocm_dir.is_empty() {
-        for fname in ["version", "version-utils", "version-libs"] {
-            let f = Path::new(&rocm_dir).join(".info").join(fname);
-            if f.exists() {
-                e.rocm_version = read_text(&f.to_string_lossy()).trim().to_owned();
-                break;
-            }
-        }
-        if e.rocm_version.is_empty()
-            && let Ok(real) = std::fs::canonicalize(&rocm_dir)
-            && let Some(version) = extract_rocm_version(&real.to_string_lossy())
-        {
-            e.rocm_version = version;
-        }
+    if !rocm_dir.is_empty()
+        && let Some(version) = detect_rocm_version_at(Path::new(&rocm_dir))
+    {
+        e.rocm_version = version;
     }
 
     for marker in AMDGPU_INSTALL_MARKERS {
@@ -963,8 +953,40 @@ fn probe_rocm_install(e: &mut Examination) {
 }
 
 /// Pull `X.Y[.Z]` out of a `rocm-X.Y.Z` path component.
+/// The ROCm version of the install rooted at `dir`, if it can be established.
+///
+/// Tries the `.info` version files a packaged ROCm writes, then falls back to a
+/// version embedded in the resolved directory name (`/opt/rocm` is commonly a
+/// symlink to `/opt/rocm-7.14.0`).
+///
+/// Shared deliberately: the human `rocm examine` report and the `--json`
+/// `Examination` used to detect ROCm installs independently, and the human one
+/// only ever checked *existence* — so a machine with ROCm 7.14 was reported
+/// without a version while `--json` had it all along. One implementation means
+/// the two cannot disagree again.
+#[must_use]
+pub fn detect_rocm_version_at(dir: &Path) -> Option<String> {
+    for fname in ["version", "version-utils", "version-libs"] {
+        let file = dir.join(".info").join(fname);
+        if file.exists() {
+            let version = read_text(&file.to_string_lossy()).trim().to_owned();
+            if !version.is_empty() {
+                return Some(version);
+            }
+        }
+    }
+
+    std::fs::canonicalize(dir)
+        .ok()
+        .and_then(|real| extract_rocm_version(&real.to_string_lossy()))
+}
+
 fn extract_rocm_version(path: &str) -> Option<String> {
-    let idx = path.find("rocm-")?;
+    // Search from the right: the version belongs to the ROCm directory itself,
+    // which is the last `rocm-` in the path. Matching the first one lets an
+    // unrelated earlier component (`/home/rocm-user/opt/rocm-7.14.0`) swallow the
+    // match and report no version for an install that plainly declares one.
+    let idx = path.rfind("rocm-")?;
     let tail = &path[idx + "rocm-".len()..];
     let version: String = tail
         .chars()
@@ -1679,5 +1701,96 @@ mod tests {
             Some("6.4.1".to_owned())
         );
         assert_eq!(extract_rocm_version("/opt/rocm"), None);
+        // An unrelated earlier `rocm-` must not swallow the match.
+        assert_eq!(
+            extract_rocm_version("/home/rocm-user/opt/rocm-7.14.0"),
+            Some("7.14.0".to_owned())
+        );
+    }
+
+    /// A unique scratch directory for the version-probe tests.
+    fn version_probe_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rocm-core-version-probe-{}-{name}-{}",
+            std::process::id(),
+            crate::unix_time_millis()
+        ));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    fn write_info_version(root: &Path, fname: &str, contents: &str) {
+        let info = root.join(".info");
+        std::fs::create_dir_all(&info).expect("create .info");
+        std::fs::write(info.join(fname), contents).expect("write version file");
+    }
+
+    #[test]
+    fn rocm_version_read_from_the_info_marker() {
+        // The packaged-install case, and the one that was being ignored: the
+        // detector already stats this file to decide an install exists.
+        let root = version_probe_dir("info-version");
+        write_info_version(&root, "version", "7.14.0-abc123\n");
+
+        assert_eq!(
+            detect_rocm_version_at(&root),
+            Some("7.14.0-abc123".to_owned()),
+            "trailing newline must be trimmed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rocm_version_falls_back_through_the_other_info_files() {
+        for fname in ["version-utils", "version-libs"] {
+            let root = version_probe_dir(fname);
+            write_info_version(&root, fname, "6.4.1");
+            assert_eq!(
+                detect_rocm_version_at(&root),
+                Some("6.4.1".to_owned()),
+                "{fname} should be consulted when `version` is absent"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn rocm_version_falls_back_to_the_resolved_directory_name() {
+        // `/opt/rocm` is commonly a symlink to `/opt/rocm-<version>`, which is
+        // the only version source on installs that ship no `.info` files.
+        let base = version_probe_dir("symlink");
+        let real = base.join("rocm-7.14.0");
+        std::fs::create_dir_all(&real).expect("create versioned dir");
+
+        // Each branch binds `probe` exactly once: a `let` that only one platform
+        // consumes trips `unused_variables` on the other.
+        #[cfg(unix)]
+        let probe = {
+            let link = base.join("rocm");
+            std::os::unix::fs::symlink(&real, &link).expect("symlink");
+            link
+        };
+        // Creating a symlink on Windows needs a privilege CI does not grant, so
+        // probe the versioned directory directly. What is under test is parsing
+        // the version out of the resolved name, not the symlink itself.
+        #[cfg(not(unix))]
+        let probe = real;
+
+        assert_eq!(detect_rocm_version_at(&probe), Some("7.14.0".to_owned()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn rocm_version_is_absent_when_nothing_declares_one() {
+        // Must degrade to `None` rather than guessing: a wrong version in a
+        // diagnostic report is worse than an admitted unknown.
+        let root = version_probe_dir("bare");
+        std::fs::create_dir_all(root.join("bin")).expect("create bin");
+        assert_eq!(detect_rocm_version_at(&root), None);
+
+        // An empty marker file is not a version either.
+        write_info_version(&root, "version", "   \n");
+        assert_eq!(detect_rocm_version_at(&root), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

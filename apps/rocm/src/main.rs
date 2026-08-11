@@ -11097,10 +11097,27 @@ fn render_examine_plain_header(summary: &ExamineSummary) -> String {
     } else {
         "AMD GPU not detected yet"
     };
-    let runtime = match summary.managed_runtime_count {
-        0 => "No ROCm installs saved yet".to_owned(),
-        1 => "1 ROCm install saved".to_owned(),
-        count => format!("{count} ROCm installs saved"),
+    // This line used to count only CLI-managed runtimes, so a machine with ROCm
+    // already installed at /opt/rocm was greeted with "No ROCm installs saved
+    // yet" -- read, reasonably, as "nothing is installed". Account for what is
+    // actually on the machine, and say plainly that a pre-existing install is
+    // left alone on purpose rather than missed.
+    let managed = match summary.managed_runtime_count {
+        0 => None,
+        1 => Some("1 ROCm install saved".to_owned()),
+        count => Some(format!("{count} ROCm installs saved")),
+    };
+    let existing = (summary.legacy_rocm.status != "not_detected").then(|| {
+        summary.legacy_rocm.version.as_deref().map_or_else(
+            || "existing ROCm install found, left unmanaged by design".to_owned(),
+            |version| format!("existing ROCm {version} found, left unmanaged by design"),
+        )
+    });
+    let runtime = match (managed, existing) {
+        (Some(managed), Some(existing)) => format!("{managed}; {existing}"),
+        (Some(managed), None) => managed,
+        (None, Some(existing)) => format!("No ROCm installs saved yet; {existing}"),
+        (None, None) => "No ROCm installs saved yet".to_owned(),
     };
     format!(
         "ROCm setup check\n  {gpu}\n  {runtime}\n  Driver: {}\n\nDetails\n",
@@ -16521,6 +16538,112 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    /// An `ExamineSummary` with the legacy-install fields under test and
+    /// everything else inert.
+    fn summary_with_legacy(
+        managed_runtime_count: usize,
+        legacy_status: &str,
+        legacy_version: Option<&str>,
+    ) -> ExamineSummary {
+        ExamineSummary {
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            kernel: None,
+            distro: None,
+            cpu: None,
+            system_ram_gib: None,
+            interactive_terminal: false,
+            default_engine: "vllm".to_owned(),
+            detected_gfx_target: None,
+            compatible_therock_family: None,
+            detected_therock_family: None,
+            driver: rocm_core::DriverSummary {
+                policy: "linux_official_amd_dkms_wrapper".to_owned(),
+                status: "amdgpu_available".to_owned(),
+                detail: None,
+            },
+            legacy_rocm: rocm_core::LegacyRocmSummary {
+                status: legacy_status.to_owned(),
+                paths: Vec::new(),
+                detail: None,
+                version: legacy_version.map(str::to_owned),
+            },
+            wsl: None,
+            managed_runtime_count,
+            managed_service_count: 0,
+            model_cache_entries: 0,
+            config_dir: PathBuf::from("config"),
+            data_dir: PathBuf::from("data"),
+            cache_dir: PathBuf::from("cache"),
+        }
+    }
+
+    #[test]
+    fn header_does_not_claim_nothing_is_installed_when_rocm_is_present() {
+        // The reported case: ROCm on the machine, none of it CLI-managed. The
+        // header counted only managed runtimes, so it said "No ROCm installs
+        // saved yet" — read as "nothing is installed".
+        let header = render_examine_plain_header(&summary_with_legacy(
+            0,
+            "detected_unmanaged",
+            Some("7.14.0"),
+        ));
+        assert!(
+            header.contains("existing ROCm 7.14.0 found"),
+            "the detected install and its version must appear:\n{header}"
+        );
+        assert!(
+            header.contains("left unmanaged by design"),
+            "it must read as a deliberate choice, not an oversight:\n{header}"
+        );
+    }
+
+    #[test]
+    fn header_reports_a_detected_install_whose_version_is_unknown() {
+        // Degrades to naming the install without inventing a version.
+        let header =
+            render_examine_plain_header(&summary_with_legacy(0, "detected_unmanaged", None));
+        assert!(
+            header.contains("existing ROCm install found"),
+            "the install must still be reported:\n{header}"
+        );
+        assert!(
+            !header.contains("ROCm  found") && !header.contains("<unknown>"),
+            "an unknown version must not leak a placeholder into the summary:\n{header}"
+        );
+    }
+
+    #[test]
+    fn header_accounts_for_managed_and_existing_installs_together() {
+        let header = render_examine_plain_header(&summary_with_legacy(
+            2,
+            "detected_unmanaged",
+            Some("6.4.1"),
+        ));
+        assert!(
+            header.contains("2 ROCm installs saved"),
+            "the managed count must survive:\n{header}"
+        );
+        assert!(
+            header.contains("existing ROCm 6.4.1 found"),
+            "the unmanaged install must be reported alongside it:\n{header}"
+        );
+    }
+
+    #[test]
+    fn header_still_says_nothing_is_installed_when_nothing_is() {
+        // The wording only changes when there is something to report.
+        let header = render_examine_plain_header(&summary_with_legacy(0, "not_detected", None));
+        assert!(
+            header.contains("No ROCm installs saved yet"),
+            "an empty machine must keep the original wording:\n{header}"
+        );
+        assert!(
+            !header.contains("existing ROCm"),
+            "nothing should be claimed on an empty machine:\n{header}"
+        );
+    }
+
     /// Regression test for the engine child-stdin write under the process-wide
     /// `SIG_DFL` that `main` installs via [`reset_sigpipe`]. If an engine child
     /// exits before reading its stdin, the parent's write to that pipe must
@@ -17454,6 +17577,7 @@ mod tests {
                 status: "not_detected".to_owned(),
                 paths: Vec::new(),
                 detail: None,
+                version: None,
             },
             wsl: wsl.then_some(rocm_core::WslSummary {
                 is_wsl: true,

@@ -1447,6 +1447,16 @@ pub struct LegacyRocmSummary {
     pub status: String,
     pub paths: Vec<PathBuf>,
     pub detail: Option<String>,
+    /// Version of the first detected install, when it could be established.
+    ///
+    /// `None` on a machine with no pre-existing ROCm, and on installs whose
+    /// layout carries no version we can read — notably Windows, where the
+    /// version lives in a directory name below the path we detect.
+    ///
+    /// Optional and defaulted so the daemon's serialised snapshot
+    /// (`apps/rocmd/src/lib.rs`) written before this field existed still loads.
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1643,7 +1653,7 @@ impl ExamineSummary {
         };
         let wsl = self.wsl.as_ref();
         format!(
-            "rocm examine\n  os: {}\n  arch: {}\n  kernel: {}\n  distro: {}\n  cpu: {}\n  system_ram: {}\n  interactive_terminal: {}\n  default_engine: {}\n  detected_gfx_target: {}\n  compatible_therock_family: {}\n  detected_therock_family: {}\n  driver_policy: {}\n  driver_status: {}\n  driver_detail: {}\n  legacy_rocm_status: {}\n  legacy_rocm_paths: {}\n  legacy_rocm_detail: {}\n  legacy_rocm_guidance: {}\n  wsl: {}\n  wsl_dxg_device: {}\n  wsl_dxcore: {}\n  wsl_librocdxg: {}\n  wsl_rocdxg_dids: {}\n  wsl_ldconfig_librocdxg: {}\n  wsl_global_rocminfo: {}\n  wsl_cargo: {}\n  wsl_detail: {}\n  managed_runtimes: {}\n  managed_services: {}\n  model_cache_entries: {}\n  config_dir: {}\n  data_dir: {}\n  cache_dir: {}\n",
+            "rocm examine\n  os: {}\n  arch: {}\n  kernel: {}\n  distro: {}\n  cpu: {}\n  system_ram: {}\n  interactive_terminal: {}\n  default_engine: {}\n  detected_gfx_target: {}\n  compatible_therock_family: {}\n  detected_therock_family: {}\n  driver_policy: {}\n  driver_status: {}\n  driver_detail: {}\n  legacy_rocm_status: {}\n  legacy_rocm_paths: {}\n  legacy_rocm_version: {}\n  legacy_rocm_detail: {}\n  legacy_rocm_guidance: {}\n  wsl: {}\n  wsl_dxg_device: {}\n  wsl_dxcore: {}\n  wsl_librocdxg: {}\n  wsl_rocdxg_dids: {}\n  wsl_ldconfig_librocdxg: {}\n  wsl_global_rocminfo: {}\n  wsl_cargo: {}\n  wsl_detail: {}\n  managed_runtimes: {}\n  managed_services: {}\n  model_cache_entries: {}\n  config_dir: {}\n  data_dir: {}\n  cache_dir: {}\n",
             self.os,
             self.arch,
             self.kernel.as_deref().unwrap_or("<unknown>"),
@@ -1665,6 +1675,7 @@ impl ExamineSummary {
             self.driver.detail.as_deref().unwrap_or("<unknown>"),
             self.legacy_rocm.status,
             legacy_paths,
+            self.legacy_rocm.version.as_deref().unwrap_or("<unknown>"),
             self.legacy_rocm.detail.as_deref().unwrap_or("<unknown>"),
             self.legacy_rocm_guidance(),
             wsl.is_some_and(|summary| summary.is_wsl),
@@ -2051,11 +2062,19 @@ fn detect_legacy_rocm_summary() -> LegacyRocmSummary {
     } else {
         Some("legacy ROCm installs are reported for compatibility only; rocm-cli manages TheRock runtimes separately".to_owned())
     };
+    // Reuse the probe that already backs `examine --json` rather than reading
+    // the marker files again here. `legacy_rocm_candidate_exists` above already
+    // *stats* `.info/version` to decide an install is present; not reading it was
+    // why a machine with ROCm 7.14 was reported without a version.
+    let version = paths
+        .first()
+        .and_then(|path| crate::examine::detect_rocm_version_at(path));
 
     LegacyRocmSummary {
         status: status.to_owned(),
         paths,
         detail,
+        version,
     }
 }
 
@@ -8224,6 +8243,9 @@ Class Name:                Display
                 status: "detected_unmanaged".to_owned(),
                 paths: vec![PathBuf::from("C:\\Program Files\\AMD\\ROCm")],
                 detail: Some("legacy install".to_owned()),
+                // Windows keeps the version in a directory below the detected
+                // base path, so this stays unknown there for now.
+                version: None,
             },
             wsl: None,
             managed_runtime_count: 2,
@@ -8276,6 +8298,7 @@ Class Name:                Display
                 status: "detected_unmanaged".to_owned(),
                 paths: vec![PathBuf::from("/opt/rocm")],
                 detail: Some("legacy install".to_owned()),
+                version: Some("7.14.0".to_owned()),
             },
             wsl: None,
             managed_runtime_count: 0,

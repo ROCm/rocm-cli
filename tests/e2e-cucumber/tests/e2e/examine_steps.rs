@@ -136,6 +136,32 @@ async fn assert_rocm_unmanaged(world: &mut E2eWorld) {
     );
 }
 
+#[then("the inspection names that install's version")]
+async fn assert_reports_legacy_version(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    // `plant_unmanaged_rocm` writes `.info/version` containing this, which is the
+    // same marker file the detector already stats to decide an install exists —
+    // it just never read it, so a machine with ROCm reported no version at all.
+    assert!(
+        output.contains("legacy_rocm_version: 6.0.0"),
+        "the pre-existing install's version must be reported:\n{output}"
+    );
+}
+
+#[then("the inspection does not claim nothing is installed")]
+async fn assert_does_not_claim_empty(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    // The summary line counted only CLI-managed runtimes, so a machine with ROCm
+    // already installed was greeted with a bare "No ROCm installs saved yet".
+    let claims_empty = output
+        .lines()
+        .any(|line| line.trim() == "No ROCm installs saved yet");
+    assert!(
+        !claims_empty,
+        "an install was detected, so the summary must not say there is none:\n{output}"
+    );
+}
+
 #[then("the inspection suggests setting up a CLI-managed install")]
 async fn assert_suggests_managed_runtime(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no command was run");
