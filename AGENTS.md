@@ -85,6 +85,21 @@ Every bug fix ships with a regression test in the same change:
 - choose unit/integration/e2e level based on where the bug lives
 - if an e2e cannot run in default CI, state the gap in PR text and cover at another CI level
 
+**User-observable behavior needs a scenario, not only a unit test.** This applies to
+features as well as fixes. If the change alters what a user of the CLI can observe —
+command output, exit codes, files or paths the CLI creates, or which runtime/engine it
+selects — then the same change must also add or update a Gherkin scenario in
+`tests/e2e-cucumber/features/` and its step definitions:
+
+- a unit test asserting the internal helper does NOT discharge this; it proves the
+  function, not the behavior
+- if a scenario for the behavior already exists, say in the PR text which `@id:` it is
+  and that the change makes it pass — do not silently rely on it
+- if the scenario can only run on a gated lane (`@requires-gpu`, `@nightly`), say so in
+  the PR text and name the lane that will exercise it
+- purely internal changes (refactors, CI plumbing, docs) do not need one; say why in the
+  PR text rather than leaving it unexplained
+
 ## 4) Live State Verification Before Any External Claim
 
 Before each stateful decision or public status update:
@@ -239,12 +254,13 @@ Run this checklist before any upstream push, PR update, issue update, or public 
 2. Project conventions re-checked for touched area — *§5*
 3. Issue reproduced; fix validated against same repro plus boundaries — *§3*
 4. Regression test added and passing at the appropriate level — *§3*
-5. Required local gates run (or explicitly documented gaps) — *§8*
-6. Leak scan completed across diff and non-diff text surfaces — *§2*
-7. Employer identity (if required), DCO sign-off, and commit-signing requirements preserved — *§2*
-8. Scope remains one logical change at correct layer — *§11*
-9. CI watched to completion and driven to green — *§12*
-10. User approval obtained for any high-blast-radius external action — *§1*
+5. User-observable behavior covered by a scenario (or its absence justified) — *§3*
+6. Required local gates run (or explicitly documented gaps) — *§8*
+7. Leak scan completed across diff and non-diff text surfaces — *§2*
+8. Employer identity (if required), DCO sign-off, and commit-signing requirements preserved — *§2*
+9. Scope remains one logical change at correct layer — *§11*
+10. CI watched to completion and driven to green — *§12*
+11. User approval obtained for any high-blast-radius external action — *§1*
 
 ## 14) Related Internal Workflows
 
