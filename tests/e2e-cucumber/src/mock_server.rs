@@ -34,6 +34,14 @@ struct ServerState {
     /// CLI sent — not just on the (fixed) canned reply, which would silently
     /// mask a corrupted or missing prompt. `None` until a chat request arrives.
     last_chat_request: Arc<Mutex<Option<Value>>>,
+    /// Every URI path a chat request has arrived on, in order.
+    ///
+    /// This server answers chat on BOTH `/v1/chat/completions` and the
+    /// unversioned `/chat/completions`, so a scenario that only checks "did the
+    /// request succeed" cannot tell the two apart — and a client that drops the
+    /// `/v1` prefix would pass while 404ing against a real engine. Recording the
+    /// path lets a scenario assert the versioned route was the one used.
+    chat_paths: Arc<Mutex<Vec<String>>>,
 }
 
 /// Deterministic, monotonically-advancing state behind the mock `/metrics`
@@ -108,6 +116,8 @@ pub struct MockServer {
     server: ServerHandle,
     /// Shared with the running server's `ServerState`; see the field doc there.
     last_chat_request: Arc<Mutex<Option<Value>>>,
+    /// Shared with the running server's `ServerState`; see the field doc there.
+    chat_paths: Arc<Mutex<Vec<String>>>,
 }
 
 impl MockServer {
@@ -127,10 +137,12 @@ impl MockServer {
 
     async fn spawn(model_name: &str, with_metrics: bool) -> Self {
         let last_chat_request = Arc::new(Mutex::new(None));
+        let chat_paths = Arc::new(Mutex::new(Vec::new()));
         let state = ServerState {
             model_name: model_name.to_string(),
             metrics: with_metrics.then(|| Arc::new(MetricsCounter::new())),
             last_chat_request: Arc::clone(&last_chat_request),
+            chat_paths: Arc::clone(&chat_paths),
         };
 
         let mut app = Router::new()
@@ -146,6 +158,44 @@ impl MockServer {
         Self {
             server: http_server::spawn(app).await,
             last_chat_request,
+            chat_paths,
+        }
+    }
+
+    /// Every URI path a chat request has arrived on, in order.
+    ///
+    /// Use this to assert the client used the versioned `/v1/chat/completions`
+    /// route: this server also answers the unversioned `/chat/completions`, so
+    /// a bare "the request succeeded" assertion cannot tell them apart and would
+    /// pass for a client that 404s against a real engine.
+    #[must_use]
+    pub fn chat_paths(&self) -> Vec<String> {
+        self.chat_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// A server that is reachable but rejects every request with `503`.
+    ///
+    /// Models an engine that is listening but cannot serve — the case a client
+    /// must report rather than quietly recording zero measurements. Its
+    /// `/v1/models` route rejects too, so callers must pass an explicit model.
+    pub async fn start_rejecting() -> Self {
+        async fn reject() -> axum::http::StatusCode {
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        }
+
+        let app = Router::new()
+            .route("/v1/models", get(reject))
+            .route("/models", get(reject))
+            .route("/v1/chat/completions", post(reject))
+            .route("/chat/completions", post(reject));
+
+        Self {
+            server: http_server::spawn(app).await,
+            last_chat_request: Arc::new(Mutex::new(None)),
+            chat_paths: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -304,7 +354,19 @@ async fn handle_metrics(State(state): State<ServerState>) -> String {
         .scrape()
 }
 
-async fn handle_chat(State(state): State<ServerState>, Json(body): Json<Value>) -> Json<Value> {
+async fn handle_chat(
+    State(state): State<ServerState>,
+    uri: axum::http::Uri,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    // Record which of the two chat routes the client actually used, so a
+    // scenario can distinguish the versioned path from the unversioned one.
+    state
+        .chat_paths
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(uri.path().to_string());
+
     let model = body
         .get("model")
         .and_then(Value::as_str)

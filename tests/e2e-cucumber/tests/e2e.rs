@@ -15,6 +15,7 @@ use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_
 use tempfile::TempDir;
 
 mod e2e {
+    pub mod bench_steps;
     pub mod chat_steps;
     pub mod dash_steps;
     pub mod diagnose_steps;

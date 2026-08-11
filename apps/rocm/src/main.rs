@@ -457,10 +457,11 @@ enum BenchCommand {
     /// long-context tool traffic and is not comparable to the *-agent-bench quality
     /// harnesses.
     Load {
-        /// Base URL of the OpenAI-compatible endpoint, e.g. http://127.0.0.1:8000
+        /// OpenAI-compatible endpoint, e.g. http://127.0.0.1:8000/v1 (as shown by
+        /// `rocm services list`). A plain host address without /v1 also works.
         #[arg(long, value_name = "URL")]
         endpoint: String,
-        /// Model name (defaults to the first model returned by GET {endpoint}/v1/models)
+        /// Model name (defaults to the first model the endpoint reports)
         #[arg(long)]
         model: Option<String>,
         /// Concurrency levels to sweep, comma-separated
