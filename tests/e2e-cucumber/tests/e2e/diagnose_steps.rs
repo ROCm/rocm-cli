@@ -44,6 +44,14 @@ async fn user_named_unknown_fix(world: &mut E2eWorld) {
     world.model_name = Some("fix-does-not-exist".to_string());
 }
 
+#[given("a user who refers to a cause by its position in the diagnosis")]
+async fn user_named_diagnosis_position(world: &mut E2eWorld) {
+    // Quoted deliberately: unquoted, the shell treats `#1` as a comment and the
+    // CLI never sees it. The product behaviour under test is what happens when
+    // the argument does arrive.
+    world.model_name = Some("#1".to_string());
+}
+
 // ── When ───────────────────────────────────────────────────────────
 
 #[when("the user asks the CLI to diagnose that symptom")]
@@ -106,6 +114,35 @@ async fn assert_reports_cause_and_fix(world: &mut E2eWorld) {
     assert!(
         output.contains("plan:"),
         "expected a suggested fix plan:\n{output}"
+    );
+}
+
+#[then("every reported cause comes with a command that applies it")]
+async fn assert_every_cause_has_a_command(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    // A plan alone is not actionable: the report used to name a `rocm fix`
+    // command only when some match cleared the confidence threshold, so a report
+    // of low-confidence causes left the user with nothing to run.
+    let causes = output.lines().filter(|l| l.contains("score=")).count();
+    let commands = output
+        .lines()
+        .filter(|l| l.trim().starts_with("apply with: rocm fix "))
+        .count();
+    assert!(causes > 0, "no scored causes to check:\n{output}");
+    assert_eq!(
+        commands, causes,
+        "each of the {causes} causes needs its own apply command:\n{output}"
+    );
+}
+
+#[then("the listing explains what those indicators mean")]
+async fn assert_markers_explained(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix list output");
+    // The markers were printed with no legend, so a reader could not tell
+    // whether PRINT-ONLY meant "advisory" or "not implemented yet".
+    assert!(
+        output.contains("AUTO =") && output.contains("PRINT-ONLY ="),
+        "expected the listing to explain its AUTO/PRINT-ONLY markers:\n{output}"
     );
 }
 
@@ -235,5 +272,30 @@ async fn assert_unknown_fix_refused(world: &mut E2eWorld) {
     assert!(
         combined.contains("Unknown fix-id"),
         "expected an 'Unknown fix-id' message:\n{combined}"
+    );
+}
+
+#[then("the CLI refuses and explains that a position is not a fix-id")]
+async fn assert_position_argument_corrected(world: &mut E2eWorld) {
+    // Same exit code as any unknown id — this is clearer wording on an existing
+    // refusal, not a new outcome a script could come to depend on.
+    assert_eq!(
+        world.cli_rc,
+        Some(2),
+        "a position argument should exit 2 like any unknown id"
+    );
+    let combined = format!(
+        "{}{}",
+        world.cli_output.as_deref().unwrap_or(""),
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
+    assert!(
+        combined.contains("position"),
+        "the refusal must say the argument was read as a position:\n{combined}"
+    );
+    // And it must point at what to use instead, or the correction is useless.
+    assert!(
+        combined.contains("id:"),
+        "the refusal must name the identifier to use instead:\n{combined}"
     );
 }
