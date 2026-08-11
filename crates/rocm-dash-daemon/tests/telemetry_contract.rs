@@ -109,6 +109,39 @@ const INSTANCE_TICK: Duration = Duration::from_millis(400);
 const SCENARIO_DEADLINE: Duration = Duration::from_secs(15);
 const SVC_ID: &str = "contract-svc";
 
+/// Observation validity window derived from the contract formula.
+/// `clamp(3 × INSTANCE_TICK, 6 s, 30 s)` — with `INSTANCE_TICK = 400 ms`
+/// this evaluates to `max(1.2 s, 6 s) = 6 s`, matching the spec lower bound.
+fn observation_validity_window() -> Duration {
+    (3 * INSTANCE_TICK).clamp(Duration::from_secs(6), Duration::from_secs(30))
+}
+
+/// Drain all snapshot events already buffered in the broadcast receiver so
+/// that subsequent `wait_for_snapshot` calls return only snapshots assembled
+/// **after** the next mode switch. Must be called immediately before setting
+/// `MockMode::Failure` to avoid a stale-snapshot false pass.
+fn drain_snapshots(rx: &mut broadcast::Receiver<Event>) {
+    while rx.try_recv().is_ok() {}
+}
+
+/// Poll the mock's `failure_count` until it reaches `>= expected_min`, bounded
+/// by `SCENARIO_DEADLINE`. Guarantees that at least `expected_min` HTTP 503
+/// responses were actually served by the mock before the caller reads the next
+/// broadcast snapshot — eliminating the sleep-based race in M4.
+async fn await_failure_served(failure_count: &AtomicU64, expected_min: u64) {
+    let deadline = tokio::time::Instant::now() + SCENARIO_DEADLINE;
+    loop {
+        if failure_count.load(Ordering::Relaxed) >= expected_min {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "mock failure was never served within {SCENARIO_DEADLINE:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 // ── Scriptable mock HTTP server ─────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -209,6 +242,7 @@ const HTTP_503: &str =
 async fn spawn_mock_server(
     mode: Arc<Mutex<MockMode>>,
     ticks: Arc<AtomicU64>,
+    failure_count: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
 ) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -226,6 +260,7 @@ async fn spawn_mock_server(
             }
             let mode = Arc::clone(&mode);
             let ticks = Arc::clone(&ticks);
+            let failure_count = Arc::clone(&failure_count);
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 4096];
                 let _ = sock.read(&mut buf).await;
@@ -264,7 +299,10 @@ vllm:time_per_output_token_seconds_count{{model=\"mock\"}} {gen_tokens_total}\n"
                     }
                     MockMode::Frozen(n) => http_ok(&prom_body(n, n.max(1))),
                     MockMode::Reset(n) => http_ok(&prom_body(n, 1)),
-                    MockMode::Failure => HTTP_503.to_string(),
+                    MockMode::Failure => {
+                        failure_count.fetch_add(1, Ordering::Relaxed);
+                        HTTP_503.to_string()
+                    }
                     MockMode::Omitted => {
                         let tick = ticks.fetch_add(1, Ordering::Relaxed) + 1;
                         http_ok(&prom_body_omitted(tick))
@@ -370,7 +408,14 @@ async fn zero_gen_tps_after_frozen_counter() {
     let mode = Arc::new(Mutex::new(MockMode::Frozen(1_000)));
     let ticks = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
-    let port = spawn_mock_server(Arc::clone(&mode), Arc::clone(&ticks), Arc::clone(&stop)).await;
+    let failure_count = Arc::new(AtomicU64::new(0));
+    let port = spawn_mock_server(
+        Arc::clone(&mode),
+        Arc::clone(&ticks),
+        Arc::clone(&failure_count),
+        Arc::clone(&stop),
+    )
+    .await;
 
     write_service_record(&services_dir, port);
     let (tx, mut rx) = broadcast::channel::<Event>(64);
@@ -405,7 +450,14 @@ async fn counter_reset_invalidates_baseline_immediately() {
     let mode = Arc::new(Mutex::new(MockMode::Growing));
     let ticks = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
-    let port = spawn_mock_server(Arc::clone(&mode), Arc::clone(&ticks), Arc::clone(&stop)).await;
+    let failure_count = Arc::new(AtomicU64::new(0));
+    let port = spawn_mock_server(
+        Arc::clone(&mode),
+        Arc::clone(&ticks),
+        Arc::clone(&failure_count),
+        Arc::clone(&stop),
+    )
+    .await;
 
     write_service_record(&services_dir, port);
     let (tx, mut rx) = broadcast::channel::<Event>(64);
@@ -461,7 +513,14 @@ async fn service_removal_fires_instance_gone() {
     let mode = Arc::new(Mutex::new(MockMode::Growing));
     let ticks = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
-    let port = spawn_mock_server(Arc::clone(&mode), Arc::clone(&ticks), Arc::clone(&stop)).await;
+    let failure_count = Arc::new(AtomicU64::new(0));
+    let port = spawn_mock_server(
+        Arc::clone(&mode),
+        Arc::clone(&ticks),
+        Arc::clone(&failure_count),
+        Arc::clone(&stop),
+    )
+    .await;
 
     let sdir = services_dir.clone();
     write_service_record(&services_dir, port);
@@ -531,7 +590,14 @@ async fn gen_tps_held_for_validity_window_after_single_failure() {
     let mode = Arc::new(Mutex::new(MockMode::Growing));
     let ticks = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
-    let port = spawn_mock_server(Arc::clone(&mode), Arc::clone(&ticks), Arc::clone(&stop)).await;
+    let failure_count = Arc::new(AtomicU64::new(0));
+    let port = spawn_mock_server(
+        Arc::clone(&mode),
+        Arc::clone(&ticks),
+        Arc::clone(&failure_count),
+        Arc::clone(&stop),
+    )
+    .await;
 
     write_service_record(&services_dir, port);
     let (tx, mut rx) = broadcast::channel::<Event>(64);
@@ -545,16 +611,18 @@ async fn gen_tps_held_for_validity_window_after_single_failure() {
     .unwrap_or_else(|e| panic!("positive gen_tps never established: {e}"));
     assert!(baseline > 0.0);
 
-    // Step 2: inject one failure.
+    // Step 2: drain buffered pre-failure snapshots, then inject failure.
+    // Draining ensures wait_for_snapshot below only sees post-failure events.
+    drain_snapshots(&mut rx);
     *mode
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = MockMode::Failure;
 
-    // Step 3: allow one instance_tick for the failure scrape to complete, then
-    // read the very first post-failure Snapshot.
-    tokio::time::sleep(INSTANCE_TICK + Duration::from_millis(50)).await;
+    // Step 3: poll until the mock confirms ≥ 1 HTTP 503 was served — guarantees
+    // the runner has processed the failure before we read the next snapshot.
+    await_failure_served(&failure_count, 1).await;
 
-    let post_failure_gen_tps = wait_for_snapshot(&mut rx, |snap| svc_gen_tps(snap).map(|g| g))
+    let post_failure_gen_tps = wait_for_snapshot(&mut rx, svc_gen_tps)
         .await
         .unwrap_or_else(|e| panic!("no snapshot arrived after failure: {e}"));
 
@@ -589,7 +657,14 @@ async fn omitted_counter_yields_none_not_zero() {
     let mode = Arc::new(Mutex::new(MockMode::Omitted));
     let ticks = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
-    let port = spawn_mock_server(Arc::clone(&mode), Arc::clone(&ticks), Arc::clone(&stop)).await;
+    let failure_count = Arc::new(AtomicU64::new(0));
+    let port = spawn_mock_server(
+        Arc::clone(&mode),
+        Arc::clone(&ticks),
+        Arc::clone(&failure_count),
+        Arc::clone(&stop),
+    )
+    .await;
 
     write_service_record(&services_dir, port);
     let (tx, mut rx) = broadcast::channel::<Event>(64);
@@ -599,7 +674,7 @@ async fn omitted_counter_yields_none_not_zero() {
     // Two consecutive omitted scrapes are sufficient.
     let mut got_none = false;
     let mut got_zero = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    let deadline = tokio::time::Instant::now() + SCENARIO_DEADLINE;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -650,7 +725,14 @@ async fn omitted_preserves_baseline_so_recovery_is_immediate() {
     let mode = Arc::new(Mutex::new(MockMode::Growing));
     let ticks = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
-    let port = spawn_mock_server(Arc::clone(&mode), Arc::clone(&ticks), Arc::clone(&stop)).await;
+    let failure_count = Arc::new(AtomicU64::new(0));
+    let port = spawn_mock_server(
+        Arc::clone(&mode),
+        Arc::clone(&ticks),
+        Arc::clone(&failure_count),
+        Arc::clone(&stop),
+    )
+    .await;
 
     write_service_record(&services_dir, port);
     let (tx, mut rx) = broadcast::channel::<Event>(64);
@@ -664,10 +746,19 @@ async fn omitted_preserves_baseline_so_recovery_is_immediate() {
     .unwrap_or_else(|e| panic!("positive gen_tps never established: {e}"));
 
     // Step 2: one omitted-counter scrape (success path, prev_gen_tokens preserved).
+    // Drain buffered pre-step snapshots, record ticks baseline, then switch to Omitted.
+    drain_snapshots(&mut rx);
+    let omit_baseline = ticks.load(Ordering::Relaxed);
     *mode
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = MockMode::Omitted;
-    tokio::time::sleep(INSTANCE_TICK + Duration::from_millis(50)).await;
+    // Poll until the mock confirms ≥ 1 Omitted response was served (ticks advances in Omitted mode).
+    loop {
+        if ticks.load(Ordering::Relaxed) > omit_baseline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     // Step 3: recover immediately — Growing again with preserved prev_gen_tokens.
     // A single successful scrape with a counter > prev_val should yield positive rate.
@@ -708,7 +799,14 @@ async fn malformed_payload_yields_none_not_zero() {
     let mode = Arc::new(Mutex::new(MockMode::Malformed));
     let ticks = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
-    let port = spawn_mock_server(Arc::clone(&mode), Arc::clone(&ticks), Arc::clone(&stop)).await;
+    let failure_count = Arc::new(AtomicU64::new(0));
+    let port = spawn_mock_server(
+        Arc::clone(&mode),
+        Arc::clone(&ticks),
+        Arc::clone(&failure_count),
+        Arc::clone(&stop),
+    )
+    .await;
 
     write_service_record(&services_dir, port);
     let (tx, mut rx) = broadcast::channel::<Event>(64);
@@ -716,7 +814,7 @@ async fn malformed_payload_yields_none_not_zero() {
 
     let mut saw_none = false;
     let mut saw_zero = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    let deadline = tokio::time::Instant::now() + SCENARIO_DEADLINE;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -765,7 +863,14 @@ async fn running_idle_yields_gen_tps_and_zero_running_reqs() {
     let mode = Arc::new(Mutex::new(MockMode::RunningIdle));
     let ticks = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
-    let port = spawn_mock_server(Arc::clone(&mode), Arc::clone(&ticks), Arc::clone(&stop)).await;
+    let failure_count = Arc::new(AtomicU64::new(0));
+    let port = spawn_mock_server(
+        Arc::clone(&mode),
+        Arc::clone(&ticks),
+        Arc::clone(&failure_count),
+        Arc::clone(&stop),
+    )
+    .await;
 
     write_service_record(&services_dir, port);
     let (tx, mut rx) = broadcast::channel::<Event>(64);
@@ -826,7 +931,14 @@ async fn gen_tps_expiry_boundary_held_then_unavailable() {
     let mode = Arc::new(Mutex::new(MockMode::Growing));
     let ticks = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
-    let port = spawn_mock_server(Arc::clone(&mode), Arc::clone(&ticks), Arc::clone(&stop)).await;
+    let failure_count = Arc::new(AtomicU64::new(0));
+    let port = spawn_mock_server(
+        Arc::clone(&mode),
+        Arc::clone(&ticks),
+        Arc::clone(&failure_count),
+        Arc::clone(&stop),
+    )
+    .await;
 
     write_service_record(&services_dir, port);
     let (tx, mut rx) = broadcast::channel::<Event>(64);
@@ -841,26 +953,30 @@ async fn gen_tps_expiry_boundary_held_then_unavailable() {
     assert!(baseline > 0.0);
 
     // Inject sustained failure — keep the mode locked to Failure.
+    // Drain buffered pre-failure snapshots so boundary-1 sees only post-failure events.
+    drain_snapshots(&mut rx);
     *mode
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = MockMode::Failure;
 
     // ── BOUNDARY 1 ──────────────────────────────────────────────────────────
-    // Allow one instance_tick for the failure scrape to propagate, then capture
+    // Poll until the mock confirms ≥ 1 HTTP 503 was served, then capture
     // the very first post-failure snapshot.  Contract: gen_tps must be Some(_).
     // Current: None (immediate clear). → RED assertion below.
-    tokio::time::sleep(INSTANCE_TICK + Duration::from_millis(50)).await;
-    let boundary1_gen_tps = wait_for_snapshot(&mut rx, |snap| svc_gen_tps(snap).map(|g| g))
+    await_failure_served(&failure_count, 1).await;
+    let boundary1_gen_tps = wait_for_snapshot(&mut rx, svc_gen_tps)
         .await
         .unwrap_or_else(|e| panic!("no snapshot for boundary-1 check: {e}"));
 
     // ── BOUNDARY 2 ──────────────────────────────────────────────────────────
     // Wait for the full validity window + two instance-tick buffer to elapse.
     // Contract: gen_tps must then be None (expired/unavailable).
+    // NOTE: this sleep is necessary — the validity window is a real wall-clock
+    // duration that cannot be shortened without touching production code (non-goal).
     // This code is unreachable today because boundary-1 fails first.
-    let validity_window = Duration::from_secs(6); // clamp(3×400ms, 6s, 30s) = 6s
+    let validity_window = observation_validity_window(); // clamp(3×INSTANCE_TICK, 6s, 30s)
     tokio::time::sleep(validity_window + 2 * INSTANCE_TICK + Duration::from_millis(500)).await;
-    let boundary2_gen_tps = wait_for_snapshot(&mut rx, |snap| svc_gen_tps(snap).map(|g| g))
+    let boundary2_gen_tps = wait_for_snapshot(&mut rx, svc_gen_tps)
         .await
         .unwrap_or_else(|e| panic!("no snapshot for boundary-2 check: {e}"));
 
