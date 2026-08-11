@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{get, post};
 use serde_json::{Value, json};
@@ -19,6 +20,327 @@ use crate::http_server::{self, ServerHandle};
 /// request while waiting for the client to POST.
 const CHAT_REQUEST_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// Controls what each `/metrics` scrape returns in a [`ScriptedMetrics`]-backed
+/// mock. Every variant is a deterministic primitive that tests can switch to at
+/// runtime without restarting the server, covering all EAI-7960 contract states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsMode {
+    /// Every scrape increments the cumulative counter by 20 tok/scrape; yields a
+    /// positive `gen_tps` from the second scrape onward (busy/running instance).
+    Growing,
+    /// Counter frozen at the given cumulative value; `gen_tps` approaches 0.0
+    /// after the rate window (idle instance still reporting a counter).
+    Unchanged(u64),
+    /// HTTP 200 with a valid Prometheus body that omits
+    /// `vllm:generation_tokens_total` entirely. The runner's parser returns
+    /// `sample.gen_tokens_total = None`; `gen_tps` stays `None` and the
+    /// validity timer is NOT refreshed (missing ≠ failure, ≠ zero).
+    Omitted,
+    /// HTTP 200 with a structurally invalid (unparseable) body. All sample
+    /// fields come back `None`; semantically equivalent to `Omitted` at the
+    /// runner level but triggered by a parse failure rather than a missing key.
+    Malformed,
+    /// HTTP 503 transport failure. The runner's failure path clears
+    /// `prev_gen_tokens` and sets `gen_tps = None` immediately (EAI-7960 bug).
+    ///
+    /// Under the EAI-7960 contract, `gen_tps` **must** remain held at its last
+    /// observed value for `clamp(3 × instance_tick, 6 s, 30 s)` before clearing.
+    Failure,
+    /// Counter resets to the given value, which must be below the accumulated
+    /// Growing total. `gen_tps_from_delta` returns `None` (cur < prev_val guard)
+    /// and re-baselines to the new lower value for recovery.
+    Reset(u64),
+    /// Growing counter but `running_reqs = 0` — engine is alive but idle,
+    /// no in-flight requests. Distinct from `Unchanged` (counter still grows)
+    /// and `Omitted` (counter is present but running_reqs shows idle load).
+    RunningIdle,
+}
+
+/// Scriptable state for a mock `/metrics` endpoint. Unlike [`MetricsCounter`],
+/// the mode can be switched at runtime so a single test can drive the full
+/// Growing → Failure → Growing lifecycle without restarting the server.
+#[derive(Debug)]
+struct ScriptedMetrics {
+    /// Monotonically-advancing tick for Growing mode; mirrors [`MetricsCounter`].
+    ticks: AtomicU64,
+    /// Current mode; swapped by the test thread, read by the Axum handler thread.
+    mode: Mutex<MetricsMode>,
+    /// How many HTTP 503 failure responses have been served. Used by
+    /// `MockServer::metrics_failure_count` so tests can poll deterministically
+    /// (confirm the failure actually landed) instead of sleeping a fixed wall time.
+    failure_count: AtomicU64,
+}
+
+impl ScriptedMetrics {
+    fn new() -> Self {
+        Self {
+            ticks: AtomicU64::new(0),
+            mode: Mutex::new(MetricsMode::Growing),
+            failure_count: AtomicU64::new(0),
+        }
+    }
+
+    fn set_mode(&self, mode: MetricsMode) {
+        *self
+            .mode
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = mode;
+    }
+
+    fn failure_count(&self) -> u64 {
+        self.failure_count.load(Ordering::Relaxed)
+    }
+
+    /// Advance one scrape. Returns `Some(body)` for 200-OK modes,
+    /// `None` for `Failure` (the handler maps `None` → HTTP 503).
+    fn scrape(&self) -> Option<String> {
+        let mode = *self
+            .mode
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match mode {
+            MetricsMode::Growing | MetricsMode::RunningIdle => {
+                let tick = self.ticks.fetch_add(1, Ordering::Relaxed) + 1;
+                let gen_tokens_total = tick * 20;
+                let running = if mode == MetricsMode::RunningIdle {
+                    0
+                } else {
+                    1
+                };
+                let ttft_sum_s = tick as f64 * 0.050;
+                let tpot_sum_s = tick as f64 * 20.0 * 0.020;
+                let tpot_count = gen_tokens_total;
+                Some(format!(
+                    "\
+# HELP vllm:num_requests_running Number of requests currently running on GPU.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{{model=\"mock\"}} {running}
+# HELP vllm:num_requests_waiting Number of requests waiting to be processed.
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting{{model=\"mock\"}} 0
+# HELP vllm:gpu_cache_usage_perc GPU KV-cache usage. 1 means 100 percent usage.
+# TYPE vllm:gpu_cache_usage_perc gauge
+vllm:gpu_cache_usage_perc{{model=\"mock\"}} 0.25
+# HELP vllm:generation_tokens_total Number of generation tokens processed.
+# TYPE vllm:generation_tokens_total counter
+vllm:generation_tokens_total{{model=\"mock\"}} {gen_tokens_total}
+# HELP vllm:time_to_first_token_seconds Histogram of time to first token.
+# TYPE vllm:time_to_first_token_seconds histogram
+vllm:time_to_first_token_seconds_sum{{model=\"mock\"}} {ttft_sum_s}
+vllm:time_to_first_token_seconds_count{{model=\"mock\"}} {tick}
+# HELP vllm:time_per_output_token_seconds Histogram of time per output token.
+# TYPE vllm:time_per_output_token_seconds histogram
+vllm:time_per_output_token_seconds_sum{{model=\"mock\"}} {tpot_sum_s}
+vllm:time_per_output_token_seconds_count{{model=\"mock\"}} {tpot_count}
+"
+                ))
+            }
+            MetricsMode::Unchanged(n) => {
+                let tick = n.max(1);
+                let ttft_sum_s = tick as f64 * 0.050;
+                let tpot_sum_s = tick as f64 * 20.0 * 0.020;
+                let tpot_count = n;
+                Some(format!(
+                    "\
+# HELP vllm:num_requests_running Number of requests currently running on GPU.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{{model=\"mock\"}} 1
+# HELP vllm:generation_tokens_total Number of generation tokens processed.
+# TYPE vllm:generation_tokens_total counter
+vllm:generation_tokens_total{{model=\"mock\"}} {n}
+# HELP vllm:time_to_first_token_seconds Histogram of time to first token.
+# TYPE vllm:time_to_first_token_seconds histogram
+vllm:time_to_first_token_seconds_sum{{model=\"mock\"}} {ttft_sum_s}
+vllm:time_to_first_token_seconds_count{{model=\"mock\"}} {tick}
+# HELP vllm:time_per_output_token_seconds Histogram of time per output token.
+# TYPE vllm:time_per_output_token_seconds histogram
+vllm:time_per_output_token_seconds_sum{{model=\"mock\"}} {tpot_sum_s}
+vllm:time_per_output_token_seconds_count{{model=\"mock\"}} {tpot_count}
+"
+                ))
+            }
+            MetricsMode::Omitted => {
+                // Valid Prometheus body with no generation_tokens_total line.
+                // runner: sample.gen_tokens_total = None → gen_tps stays None,
+                // prev_gen_tokens is NOT cleared (success path, not failure path).
+                Some(
+                    "\
+# HELP vllm:num_requests_running Number of requests currently running on GPU.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{model=\"mock\"} 1
+# HELP vllm:num_requests_waiting Number of requests waiting to be processed.
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting{model=\"mock\"} 0
+# HELP vllm:gpu_cache_usage_perc GPU KV-cache usage. 1 means 100 percent usage.
+# TYPE vllm:gpu_cache_usage_perc gauge
+vllm:gpu_cache_usage_perc{model=\"mock\"} 0.25
+"
+                    .to_string(),
+                )
+            }
+            MetricsMode::Malformed => {
+                // HTTP 200 with structurally invalid body; parser returns all-None.
+                Some(
+                    "# malformed: not valid prometheus exposition format\n!!!invalid!!!\n"
+                        .to_string(),
+                )
+            }
+            MetricsMode::Failure => {
+                self.failure_count.fetch_add(1, Ordering::Relaxed);
+                None // handler maps None → HTTP 503
+            }
+            MetricsMode::Reset(n) => {
+                // Counter explicitly lower than any Growing accumulation.
+                let tick = n.max(1);
+                let ttft_sum_s = tick as f64 * 0.050;
+                let tpot_sum_s = tick as f64 * 20.0 * 0.020;
+                Some(format!(
+                    "\
+# HELP vllm:generation_tokens_total Number of generation tokens processed.
+# TYPE vllm:generation_tokens_total counter
+vllm:generation_tokens_total{{model=\"mock\"}} {n}
+# HELP vllm:time_to_first_token_seconds Histogram of time to first token.
+# TYPE vllm:time_to_first_token_seconds histogram
+vllm:time_to_first_token_seconds_sum{{model=\"mock\"}} {ttft_sum_s}
+vllm:time_to_first_token_seconds_count{{model=\"mock\"}} {tick}
+# HELP vllm:time_per_output_token_seconds Histogram of time per output token.
+# TYPE vllm:time_per_output_token_seconds histogram
+vllm:time_per_output_token_seconds_sum{{model=\"mock\"}} {tpot_sum_s}
+vllm:time_per_output_token_seconds_count{{model=\"mock\"}} {tick}
+"
+                ))
+            }
+        }
+    }
+}
+
+/// Unit tests for [`ScriptedMetrics`] body generation — verify the raw payload
+/// each mode produces matches the contract before the runner even sees it.
+#[cfg(test)]
+mod scripted_metrics_tests {
+    use super::{MetricsMode, ScriptedMetrics};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn growing_increments_counter_and_running_reqs_is_1() {
+        let s = ScriptedMetrics::new();
+        let body = s.scrape().expect("Growing must return Some");
+        assert!(
+            body.contains("generation_tokens_total"),
+            "counter line absent"
+        );
+        assert!(body.contains("} 20"), "first tick should be 20 tokens");
+        assert!(
+            body.contains("num_requests_running") && body.contains("} 1"),
+            "running_reqs must be 1 for Growing"
+        );
+        assert_eq!(s.ticks.load(Ordering::Relaxed), 1, "tick counter advanced");
+    }
+
+    #[test]
+    fn running_idle_counter_grows_but_running_reqs_is_0() {
+        let s = ScriptedMetrics::new();
+        s.set_mode(MetricsMode::RunningIdle);
+        let body = s.scrape().expect("RunningIdle must return Some");
+        assert!(
+            body.contains("generation_tokens_total"),
+            "counter line absent"
+        );
+        // running_reqs = 0 distinguishes idle from busy
+        let running_line = body
+            .lines()
+            .find(|l| l.starts_with("vllm:num_requests_running"))
+            .unwrap_or("");
+        assert!(
+            running_line.ends_with("} 0"),
+            "running_reqs must be 0 for RunningIdle, got: {running_line}"
+        );
+    }
+
+    #[test]
+    fn unchanged_always_returns_same_counter() {
+        let s = ScriptedMetrics::new();
+        s.set_mode(MetricsMode::Unchanged(1_000));
+        let b1 = s.scrape().expect("Unchanged must return Some");
+        let b2 = s.scrape().expect("Unchanged must return Some on 2nd call");
+        // Both should reference the same fixed value
+        assert!(b1.contains("} 1000"), "first scrape counter mismatch");
+        assert!(b2.contains("} 1000"), "second scrape counter mismatch");
+        assert_eq!(
+            s.ticks.load(Ordering::Relaxed),
+            0,
+            "ticks must not advance for Unchanged"
+        );
+    }
+
+    #[test]
+    fn omitted_body_has_no_generation_tokens_total_line() {
+        let s = ScriptedMetrics::new();
+        s.set_mode(MetricsMode::Omitted);
+        let body = s.scrape().expect("Omitted returns HTTP 200");
+        assert!(
+            !body.contains("generation_tokens_total"),
+            "Omitted body must not contain the counter key"
+        );
+        // But other gauge lines are present (valid subset of a Prometheus payload).
+        assert!(
+            body.contains("num_requests_running"),
+            "gauge lines must be present"
+        );
+    }
+
+    #[test]
+    fn malformed_body_is_returned_with_some_not_none() {
+        let s = ScriptedMetrics::new();
+        s.set_mode(MetricsMode::Malformed);
+        // Malformed is HTTP 200 — scrape() must return Some, not None.
+        let body = s.scrape().expect("Malformed returns HTTP 200 (Some)");
+        assert!(!body.is_empty(), "Malformed body must be non-empty");
+        assert!(
+            !body.contains("generation_tokens_total"),
+            "Malformed body must not accidentally contain the counter key"
+        );
+    }
+
+    #[test]
+    fn failure_returns_none_and_increments_failure_count() {
+        let s = ScriptedMetrics::new();
+        s.set_mode(MetricsMode::Failure);
+        assert!(s.scrape().is_none(), "Failure must return None → HTTP 503");
+        assert_eq!(s.failure_count(), 1, "failure_count must increment");
+        let _ = s.scrape();
+        assert_eq!(s.failure_count(), 2, "failure_count accumulates");
+    }
+
+    #[test]
+    fn reset_returns_specified_low_counter() {
+        let s = ScriptedMetrics::new();
+        s.set_mode(MetricsMode::Reset(3));
+        let body = s.scrape().expect("Reset returns HTTP 200");
+        assert!(
+            body.contains("} 3"),
+            "Reset body must carry the specified low counter value"
+        );
+    }
+
+    #[test]
+    fn mode_switch_growing_to_failure_to_growing() {
+        let s = ScriptedMetrics::new();
+        // Growing → positive counter
+        assert!(s.scrape().is_some());
+        // Failure → HTTP 503
+        s.set_mode(MetricsMode::Failure);
+        assert!(s.scrape().is_none());
+        assert_eq!(s.failure_count(), 1);
+        // Recovery (back to Growing) → resumes ticking
+        s.set_mode(MetricsMode::Growing);
+        let body = s.scrape().expect("recovery scrape must succeed");
+        assert!(
+            body.contains("generation_tokens_total"),
+            "counter resumes after recovery"
+        );
+    }
+}
 #[derive(Clone)]
 struct ServerState {
     model_name: String,
@@ -29,6 +351,9 @@ struct ServerState {
     /// dashboard metrics — gets a 404 for `/metrics`, matching a vLLM instance
     /// that scenario never asked to simulate.
     metrics: Option<Arc<MetricsCounter>>,
+    /// `Some` only when started via [`MockServer::start_with_scripted_metrics`];
+    /// drives the scriptable `/metrics` route. Mutually exclusive with `metrics`.
+    scripted_metrics: Option<Arc<ScriptedMetrics>>,
     /// The most recently received `/v1/chat/completions` request body, shared
     /// with the `MockServer` handle so scenarios can assert on exactly what the
     /// CLI sent — not just on the (fixed) canned reply, which would silently
@@ -118,6 +443,8 @@ pub struct MockServer {
     last_chat_request: Arc<Mutex<Option<Value>>>,
     /// Shared with the running server's `ServerState`; see the field doc there.
     chat_paths: Arc<Mutex<Vec<String>>>,
+    /// `Some` only when started with [`MockServer::start_with_scripted_metrics`].
+    scripted: Option<Arc<ScriptedMetrics>>,
 }
 
 impl MockServer {
@@ -135,12 +462,70 @@ impl MockServer {
         Self::spawn(model_name, true).await
     }
 
+    /// Like [`Self::start_with_metrics`] but the `/metrics` endpoint starts in
+    /// [`MetricsMode::Growing`] and can be switched to [`MetricsMode::Failure`]
+    /// (and back) at runtime via [`Self::set_metrics_mode`] while the server is
+    /// live. Use this for EAI-7960 scenarios that need to exercise the
+    /// validity-window holding behaviour or the recovery path.
+    pub async fn start_with_scripted_metrics(model_name: &str) -> Self {
+        let last_chat_request = Arc::new(Mutex::new(None));
+        let chat_paths = Arc::new(Mutex::new(Vec::new()));
+        let scripted = Arc::new(ScriptedMetrics::new());
+        let state = ServerState {
+            model_name: model_name.to_string(),
+            metrics: None,
+            scripted_metrics: Some(Arc::clone(&scripted)),
+            last_chat_request: Arc::clone(&last_chat_request),
+            chat_paths: Arc::clone(&chat_paths),
+        };
+        let app = Router::new()
+            .route("/v1/models", get(handle_models))
+            .route("/models", get(handle_models))
+            .route("/v1/chat/completions", post(handle_chat))
+            .route("/chat/completions", post(handle_chat))
+            .route("/metrics", get(handle_scripted_metrics))
+            .with_state(state);
+        Self {
+            server: http_server::spawn(app).await,
+            last_chat_request,
+            scripted: Some(scripted),
+            chat_paths,
+        }
+    }
+
+    /// Switch the scripted `/metrics` endpoint mode while the server is running.
+    ///
+    /// # Panics
+    /// Panics when the server was not started with
+    /// [`Self::start_with_scripted_metrics`].
+    pub fn set_metrics_mode(&self, mode: MetricsMode) {
+        self.scripted
+            .as_ref()
+            .expect("set_metrics_mode requires start_with_scripted_metrics")
+            .set_mode(mode);
+    }
+
+    /// How many HTTP 503 failure responses the scripted endpoint has served.
+    /// Lets tests poll deterministically — confirm the failure landed — without
+    /// relying on a fixed wall-time sleep.
+    ///
+    /// # Panics
+    /// Panics when the server was not started with
+    /// [`Self::start_with_scripted_metrics`].
+    pub fn metrics_failure_count(&self) -> u64 {
+        self.scripted
+            .as_ref()
+            .expect("metrics_failure_count requires start_with_scripted_metrics")
+            .failure_count()
+    }
+
     async fn spawn(model_name: &str, with_metrics: bool) -> Self {
         let last_chat_request = Arc::new(Mutex::new(None));
         let chat_paths = Arc::new(Mutex::new(Vec::new()));
         let state = ServerState {
             model_name: model_name.to_string(),
             metrics: with_metrics.then(|| Arc::new(MetricsCounter::new())),
+            scripted_metrics: None,
             last_chat_request: Arc::clone(&last_chat_request),
             chat_paths: Arc::clone(&chat_paths),
         };
@@ -157,6 +542,7 @@ impl MockServer {
 
         Self {
             server: http_server::spawn(app).await,
+            scripted: None,
             last_chat_request,
             chat_paths,
         }
@@ -196,6 +582,7 @@ impl MockServer {
             server: http_server::spawn(app).await,
             last_chat_request: Arc::new(Mutex::new(None)),
             chat_paths: Arc::new(Mutex::new(Vec::new())),
+            scripted: None,
         }
     }
 
@@ -354,6 +741,18 @@ async fn handle_metrics(State(state): State<ServerState>) -> String {
         .scrape()
 }
 
+async fn handle_scripted_metrics(State(state): State<ServerState>) -> (StatusCode, String) {
+    match state
+        .scripted_metrics
+        .as_ref()
+        .expect("scripted_metrics route requires scripted_metrics state")
+        .scrape()
+    {
+        Some(body) => (StatusCode::OK, body),
+        None => (StatusCode::SERVICE_UNAVAILABLE, String::new()),
+    }
+}
+
 async fn handle_chat(
     State(state): State<ServerState>,
     uri: axum::http::Uri,
@@ -366,7 +765,6 @@ async fn handle_chat(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(uri.path().to_string());
-
     let model = body
         .get("model")
         .and_then(Value::as_str)
