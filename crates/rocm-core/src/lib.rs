@@ -1416,6 +1416,13 @@ pub struct ExamineSummary {
     pub distro: Option<String>,
     pub cpu: Option<String>,
     pub system_ram_gib: Option<f64>,
+    /// Whether *this* `rocm` process was given a terminal — not a property of
+    /// the machine, unlike every other field here.
+    ///
+    /// False whenever stdout is captured, which includes the dashboard running
+    /// `rocm examine` as a child process. That is why the same machine reports
+    /// `true` from a shell and `false` from the dashboard: both are correct.
+    /// See [`interactive_terminal`] for what it gates.
     pub interactive_terminal: bool,
     pub default_engine: String,
     pub detected_gfx_target: Option<String>,
@@ -1642,6 +1649,15 @@ impl ExamineSummary {
                 .join(", ")
         };
         let wsl = self.wsl.as_ref();
+        // Every other field here describes the MACHINE; this one describes the
+        // invocation, which is what made it ambiguous -- `true` from a terminal
+        // and `false` under the dashboard both look like claims about the host.
+        // Say which it is on the line itself, so pasted output explains itself.
+        let interactive_terminal = if self.interactive_terminal {
+            "true (this run has a terminal; the CLI may prompt)"
+        } else {
+            "false (this run's output is captured, so the CLI will not prompt)"
+        };
         format!(
             "rocm examine\n  os: {}\n  arch: {}\n  kernel: {}\n  distro: {}\n  cpu: {}\n  system_ram: {}\n  interactive_terminal: {}\n  default_engine: {}\n  detected_gfx_target: {}\n  compatible_therock_family: {}\n  detected_therock_family: {}\n  driver_policy: {}\n  driver_status: {}\n  driver_detail: {}\n  legacy_rocm_status: {}\n  legacy_rocm_paths: {}\n  legacy_rocm_detail: {}\n  legacy_rocm_guidance: {}\n  wsl: {}\n  wsl_dxg_device: {}\n  wsl_dxcore: {}\n  wsl_librocdxg: {}\n  wsl_rocdxg_dids: {}\n  wsl_ldconfig_librocdxg: {}\n  wsl_global_rocminfo: {}\n  wsl_cargo: {}\n  wsl_detail: {}\n  managed_runtimes: {}\n  managed_services: {}\n  model_cache_entries: {}\n  config_dir: {}\n  data_dir: {}\n  cache_dir: {}\n",
             self.os,
@@ -1651,7 +1667,7 @@ impl ExamineSummary {
             self.cpu.as_deref().unwrap_or("<unknown>"),
             self.system_ram_gib
                 .map_or_else(|| "<unknown>".to_owned(), format_gib_value),
-            self.interactive_terminal,
+            interactive_terminal,
             self.default_engine,
             self.detected_gfx_target.as_deref().unwrap_or("<unknown>"),
             self.compatible_therock_family
@@ -1697,6 +1713,15 @@ impl ExamineSummary {
     }
 }
 
+/// Whether this process can hold an interactive exchange with a user.
+///
+/// Both streams must be a terminal: stdin so an answer can be read, stdout so
+/// the question is seen. Anything that captures either — a pipe, a CI step, the
+/// dashboard spawning `rocm` as a child — makes this false, and callers then
+/// skip the prompt rather than block on input nobody can supply.
+///
+/// A property of the invocation, not of the host. `rocm examine` reports it so a
+/// pasted report explains why prompts were skipped.
 pub fn interactive_terminal() -> bool {
     stdin().is_terminal() && stdout().is_terminal()
 }
@@ -8251,6 +8276,62 @@ Class Name:                Display
         assert!(rendered.contains("managed_runtimes: 2"));
         assert!(rendered.contains("managed_services: 1"));
         assert!(rendered.contains("model_cache_entries: 3"));
+    }
+
+    #[test]
+    fn examine_render_explains_what_interactive_terminal_means() {
+        // The same machine reports `true` from a shell and `false` under the
+        // dashboard, because the field describes the invocation rather than the
+        // host. Both are correct, and the line has to say so on its own — a
+        // pasted report is usually all a reader gets.
+        let mut summary = ExamineSummary {
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            kernel: None,
+            distro: None,
+            cpu: None,
+            system_ram_gib: None,
+            interactive_terminal: true,
+            default_engine: "vllm".to_owned(),
+            detected_gfx_target: None,
+            compatible_therock_family: None,
+            detected_therock_family: None,
+            driver: DriverSummary {
+                policy: "linux_official_amd_dkms_wrapper".to_owned(),
+                status: "amdgpu_available".to_owned(),
+                detail: None,
+            },
+            legacy_rocm: LegacyRocmSummary {
+                status: "not_detected".to_owned(),
+                paths: Vec::new(),
+                detail: None,
+            },
+            wsl: None,
+            managed_runtime_count: 0,
+            managed_service_count: 0,
+            model_cache_entries: 0,
+            config_dir: PathBuf::from("config"),
+            data_dir: PathBuf::from("data"),
+            cache_dir: PathBuf::from("cache"),
+        };
+
+        let interactive = summary.render_text();
+        assert!(
+            interactive.contains("interactive_terminal: true (this run has a terminal"),
+            "the true case must say it is about this run:\n{interactive}"
+        );
+
+        summary.interactive_terminal = false;
+        let captured = summary.render_text();
+        assert!(
+            captured.contains("interactive_terminal: false (this run's output is captured"),
+            "the false case must explain why, not just report it:\n{captured}"
+        );
+        // The reason it matters to the reader: it is why they saw no prompt.
+        assert!(
+            captured.contains("will not prompt"),
+            "the false case must connect to the visible consequence:\n{captured}"
+        );
     }
 
     #[test]
