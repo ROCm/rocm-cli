@@ -14,6 +14,7 @@ pub mod bench_schema;
 pub mod config;
 pub mod efficiency;
 pub mod metrics;
+pub mod observation;
 pub mod partition;
 pub mod persist;
 pub mod protocol;
@@ -26,6 +27,7 @@ pub use bench_schema::BenchmarkRow;
 pub use metrics::{
     GpuMetrics, Instance, ObservationFreshness, ObservationMetadata, Snapshot, SystemMetrics,
 };
+pub use observation::{GenerationObservationTracker, observation_validity, rate_window};
 pub use partition::{ComputePartitionMode, MemoryPartitionMode};
 pub use protocol::{Command, Event};
 pub use state::{SideEffect, State, StateEvent};
