@@ -972,10 +972,16 @@ async fn gen_tps_expiry_boundary_held_then_unavailable() {
     // Wait for the full validity window + two instance-tick buffer to elapse.
     // Contract: gen_tps must then be None (expired/unavailable).
     // NOTE: this sleep is necessary — the validity window is a real wall-clock
-    // duration that cannot be shortened without touching production code (non-goal).
-    // This code is unreachable today because boundary-1 fails first.
+    // duration that cannot be shortened without touching production code.
+    // After the sleep, drain the broadcast backlog: the channel has accumulated
+    // held-gen_tps snapshots from the sleep period; we want the NEXT snapshot
+    // (from after the drain) which must be from after the validity window.
     let validity_window = observation_validity_window(); // clamp(3×INSTANCE_TICK, 6s, 30s)
     tokio::time::sleep(validity_window + 2 * INSTANCE_TICK + Duration::from_millis(500)).await;
+    // Discard held-period snapshots buffered during the sleep; the immediately
+    // following wait_for_snapshot will read the first post-drain tick, which
+    // is by construction past the validity deadline.
+    drain_snapshots(&mut rx);
     let boundary2_gen_tps = wait_for_snapshot(&mut rx, svc_gen_tps)
         .await
         .unwrap_or_else(|e| panic!("no snapshot for boundary-2 check: {e}"));

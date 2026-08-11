@@ -23,6 +23,7 @@ use rocm_dash_collectors::lemonade::LemonadeCollector;
 use rocm_dash_collectors::parallel::parallel_scrape;
 use rocm_dash_collectors::vllm_prom::VllmPrometheusCollector;
 use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo, Instance, InstanceStatus, Snapshot};
+use rocm_dash_core::observation::GenerationObservationTracker;
 use rocm_dash_core::protocol::Event;
 use rocm_dash_core::state::{State, StateEvent};
 use rocm_dash_core::traits::{BenchTailer, DiscoveredService, InstanceSample, merge_instance};
@@ -186,8 +187,10 @@ pub async fn run_loop(
     // the vLLM Prometheus scrape so they aren't mis-parsed).
     let mut known_services: HashSet<String> = HashSet::new();
     let mut managed_non_vllm: HashSet<String> = HashSet::new();
-    // Previous `generation_tokens_total` reading per instance, for rate calc.
-    let mut prev_gen_tokens: HashMap<String, (f64, DateTime<Utc>)> = HashMap::new();
+    // Per-instance generation-throughput tracker. Keyed by container_id.
+    // Constructed lazily from opts.instance_tick; survives scrape failures so
+    // the last-observed rate is held for the validity window before clearing.
+    let mut gen_trackers: HashMap<String, GenerationObservationTracker> = HashMap::new();
     // Previous TTFT / TPOT histogram readings (sum_s, count, at) per instance,
     // for the windowed avg-ms derivation (mirrors `prev_gen_tokens`).
     let mut prev_ttft: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
@@ -221,6 +224,10 @@ pub async fn run_loop(
     loop {
         ticker.tick().await;
         tick_count += 1;
+        // Single wall-clock anchor for this loop iteration. All counter/direct
+        // observations and the assembled Snapshot timestamp share this instant so
+        // every instance refreshed in this cycle serialises Fresh deterministically.
+        let cycle_at = Utc::now();
 
         let mut warnings = Vec::new();
         let gpus = if let Some(g) = &gpu {
@@ -254,7 +261,21 @@ pub async fn run_loop(
                     let seen: HashSet<String> =
                         svcs.iter().map(|s| s.container_id.clone()).collect();
                     for svc in &svcs {
-                        let inst = instance_from_discovered(svc);
+                        let existing = runner.state.instances.get(&svc.container_id).cloned();
+                        // Endpoint change: same id, new port → new logical service.
+                        if existing.as_ref().map_or(false, |ex| ex.port != svc.port) {
+                            if let Some(t) = gen_trackers.get_mut(&svc.container_id) {
+                                t.invalidate();
+                            }
+                        }
+                        let inst = merge_discovery_refresh(
+                            svc,
+                            if existing.as_ref().map_or(false, |ex| ex.port != svc.port) {
+                                None
+                            } else {
+                                existing.as_ref()
+                            },
+                        );
                         runner
                             .state
                             .apply(StateEvent::InstanceUpserted(inst.clone()));
@@ -274,7 +295,7 @@ pub async fn run_loop(
                     }
                     for gone in known_instances.difference(&seen) {
                         info!(id = %gone, "instance gone");
-                        prev_gen_tokens.remove(gone);
+                        gen_trackers.remove(gone);
                         prev_ttft.remove(gone);
                         prev_tpot.remove(gone);
                         runner
@@ -302,11 +323,23 @@ pub async fn run_loop(
         {
             match l.discover().await {
                 Some(svc) => {
-                    let inst = instance_from_discovered(&svc);
+                    let is_new_id = lemonade_id.as_deref() != Some(svc.container_id.as_str());
+                    if is_new_id {
+                        // New identity: remove old tracker so stale telemetry
+                        // is not carried into the new instance.
+                        if let Some(old_id) = lemonade_id.as_deref() {
+                            gen_trackers.remove(old_id);
+                        }
+                    }
+                    let existing = runner.state.instances.get(&svc.container_id).cloned();
+                    let inst = merge_discovery_refresh(
+                        &svc,
+                        if is_new_id { None } else { existing.as_ref() },
+                    );
                     runner
                         .state
                         .apply(StateEvent::InstanceUpserted(inst.clone()));
-                    if lemonade_id.as_deref() != Some(svc.container_id.as_str()) {
+                    if is_new_id {
                         info!(
                             id = %svc.container_id,
                             model = %svc.model_name,
@@ -323,7 +356,7 @@ pub async fn run_loop(
                 None => {
                     if let Some(id) = lemonade_id.take() {
                         info!(id = %id, "lemonade instance gone");
-                        prev_gen_tokens.remove(&id);
+                        gen_trackers.remove(&id);
                         prev_ttft.remove(&id);
                         prev_tpot.remove(&id);
                         runner.state.apply(StateEvent::InstanceRemoved(id.clone()));
@@ -348,9 +381,25 @@ pub async fn run_loop(
             let records = crate::registry::load_service_records(services_dir);
             let disc = crate::registry::discover_managed_services(&records);
             managed_non_vllm = disc.non_vllm;
-            for inst in disc.instances {
-                let is_new = !known_services.contains(&inst.container_id);
-                let id = inst.container_id.clone();
+            for svc in disc.svcs {
+                let id = svc.container_id.clone();
+                let is_new = !known_services.contains(&id);
+                let existing = runner.state.instances.get(&id).cloned();
+                // Endpoint change → new logical service; invalidate tracker immediately.
+                let same_endpoint = existing.as_ref().map_or(true, |ex| ex.port == svc.port);
+                if !same_endpoint {
+                    if let Some(t) = gen_trackers.get_mut(&id) {
+                        t.invalidate();
+                    }
+                }
+                let inst = merge_discovery_refresh(
+                    &svc,
+                    if same_endpoint {
+                        existing.as_ref()
+                    } else {
+                        None
+                    },
+                );
                 runner
                     .state
                     .apply(StateEvent::InstanceUpserted(inst.clone()));
@@ -361,7 +410,7 @@ pub async fn run_loop(
             }
             for gone in known_services.difference(&disc.seen) {
                 info!(id = %gone, "managed service gone");
-                prev_gen_tokens.remove(gone);
+                gen_trackers.remove(gone);
                 prev_ttft.remove(gone);
                 prev_tpot.remove(gone);
                 runner
@@ -412,13 +461,20 @@ pub async fn run_loop(
             for ((id, _port), fetch) in results {
                 match fetch {
                     Ok(sample) => {
-                        // Difference the cumulative token counter into a live
-                        // rate; first reading (or a restart) yields None.
-                        let now = Utc::now();
-                        let gen_tps = sample.gen_tokens_total.and_then(|cur| {
-                            let prev = prev_gen_tokens.insert(id.clone(), (cur, now));
-                            gen_tps_from_delta(prev, cur, now)
-                        });
+                        // EAI-7960: drive the per-instance tracker with the
+                        // cumulative counter when present; omitted counter leaves
+                        // the tracker (and its held value) untouched.
+                        if let Some(cur) = sample.gen_tokens_total {
+                            gen_trackers
+                                .entry(id.clone())
+                                .or_insert_with(|| {
+                                    GenerationObservationTracker::new(opts.instance_tick)
+                                })
+                                .observe_counter(cur, cycle_at);
+                        }
+                        // gen_tps is written to the instance in the snapshot
+                        // assembly below (tracker.snapshot per cycle_at).
+                        //
                         // Windowed avg latency (ms) from the cumulative TTFT/TPOT
                         // histograms; cumulative-average fallback on first scrape.
                         let ttft_ms = avg_ms_from_histogram(
@@ -426,20 +482,19 @@ pub async fn run_loop(
                             &id,
                             sample.ttft_sum_s,
                             sample.ttft_count,
-                            now,
+                            cycle_at,
                         );
                         let tpot_ms = avg_ms_from_histogram(
                             &mut prev_tpot,
                             &id,
                             sample.tpot_sum_s,
                             sample.tpot_count,
-                            now,
+                            cycle_at,
                         );
                         if let Some(mut inst) = runner.state.instances.get(&id).cloned() {
                             inst.kv_cache_usage_pct = sample.kv_cache_usage_pct;
                             inst.running_reqs = sample.running_reqs;
                             inst.waiting_reqs = sample.waiting_reqs;
-                            inst.gen_tps = gen_tps;
                             inst.ttft_ms = ttft_ms;
                             inst.tpot_ms = tpot_ms;
                             // Docker-discovered instances have no
@@ -459,18 +514,19 @@ pub async fn run_loop(
                         let msg = format!("{e}");
                         trace!(id = %id, error = %msg, "vllm scrape failed");
                         last_err = Some(msg);
-                        // Don't let a dead instance show a frozen rate/latency:
-                        // clear throughput + latency and drop the baselines so
-                        // recovery re-bases.
-                        prev_gen_tokens.remove(&id);
+                        // EAI-7960: do NOT clear or remove gen_trackers on failure.
+                        // The tracker holds the last-observed rate for the validity
+                        // window (clamp(3×instance_tick, 6s, 30s)) and only clears
+                        // it after expiry — satisfying the "held" contract.
+                        //
+                        // Clear TTFT/TPOT baselines so recovery re-baselines from
+                        // the next successful scrape (latency clearing semantics
+                        // are unchanged; freshness generalization is out of scope).
                         prev_ttft.remove(&id);
                         prev_tpot.remove(&id);
                         if let Some(mut inst) = runner.state.instances.get(&id).cloned()
-                            && (inst.gen_tps.is_some()
-                                || inst.ttft_ms.is_some()
-                                || inst.tpot_ms.is_some())
+                            && (inst.ttft_ms.is_some() || inst.tpot_ms.is_some())
                         {
-                            inst.gen_tps = None;
                             inst.ttft_ms = None;
                             inst.tpot_ms = None;
                             runner.state.apply(StateEvent::InstanceUpserted(inst));
@@ -494,14 +550,27 @@ pub async fn run_loop(
         {
             match l.fetch_stats().await {
                 Ok(sample) => {
+                    // EAI-7960: drive the tracker with a direct rate reading when
+                    // the sample carries one. A missing direct rate (None) does not
+                    // erase or refresh the tracker; the held value stays valid until
+                    // the validity window expires.
+                    if let Some(rate) = sample.gen_tps {
+                        gen_trackers
+                            .entry(id.clone())
+                            .or_insert_with(|| {
+                                GenerationObservationTracker::new(opts.instance_tick)
+                            })
+                            .observe_direct(rate, cycle_at);
+                    }
                     if let Some(mut inst) = runner.state.instances.get(&id).cloned() {
-                        inst.gen_tps = sample.gen_tps;
+                        // gen_tps is written in the snapshot assembly below;
+                        // set the KV/request fields immediately so they are
+                        // present in state for subsequent snapshots.
                         inst.kv_cache_usage_pct = sample.kv_cache_usage_pct;
                         inst.running_reqs = sample.running_reqs;
                         inst.waiting_reqs = sample.waiting_reqs;
-                        // See the vLLM scrape-success handler above: a
-                        // successful stats fetch is proof the Lemonade
-                        // instance is serving, so promote it out of Starting.
+                        // See the vLLM scrape-success handler: a successful stats
+                        // fetch proves the instance is serving; promote out of Starting.
                         if matches!(inst.status, InstanceStatus::Starting { .. }) {
                             inst.status = InstanceStatus::Ready;
                         }
@@ -511,6 +580,9 @@ pub async fn run_loop(
                 Err(e) => {
                     trace!(id = %id, error = %e, "lemonade scrape failed");
                     warnings.push(format!("lemonade scrape: {e}"));
+                    // EAI-7960: retain tracker during validity window on failure.
+                    // gen_tps is assembled from the tracker snapshot below;
+                    // no explicit clearing needed here.
                 }
             }
         }
@@ -541,7 +613,19 @@ pub async fn run_loop(
         }
 
         let mut instances: Vec<Instance> = runner.state.instances.values().cloned().collect();
-        // Derive per-instance efficiency now that this tick's GPU power is known.
+        // EAI-7960: apply per-instance tracker snapshots (gen_tps + observation
+        // metadata) before computing tokens_per_watt so the efficiency field
+        // always derives from the current cycle's valid/held/expired rate.
+        for inst in &mut instances {
+            let (gen_tps, meta) = gen_trackers
+                .get_mut(&inst.container_id)
+                .map(|t| t.snapshot(cycle_at))
+                .unwrap_or((None, None));
+            inst.gen_tps = gen_tps;
+            inst.gen_tps_observation = meta;
+        }
+        // Derive per-instance efficiency now that this tick's GPU power is known
+        // and gen_tps reflects the tracker state for this cycle.
         // Count instances that have throughput + live GPUs but whose gpu_ids
         // don't line up with any amd-smi device_id — the silent-None failure
         // mode on real hardware, surfaced via the header ⚠ badge.
@@ -585,7 +669,7 @@ pub async fn run_loop(
             }
         }
         let snap = Snapshot {
-            timestamp: Utc::now(),
+            timestamp: cycle_at,
             host: host.tick(),
             gpus,
             gpu_system_info: gpu_system_info.clone(),
@@ -632,6 +716,38 @@ pub async fn run_loop(
 /// scraping fills the KV/req sample fields in a later collector tick.
 pub(crate) fn instance_from_discovered(svc: &DiscoveredService) -> Instance {
     merge_instance(svc, &InstanceSample::default(), 0, 0)
+}
+
+/// Merge a rediscovered service's identity/metadata into a fresh Instance,
+/// preserving live collector-owned fields from the existing state when the
+/// identity is unchanged.
+///
+/// **Discovery metadata wins** (model name, GPU ids, port, status, launch args).
+/// **Collector-owned fields survive** (KV/running/waiting, gen_tps, observation
+/// metadata, tokens_per_watt, TTFT/TPOT). Passing `existing = None` — on a new
+/// identity or after an endpoint change — starts the instance with all-None live
+/// fields (correct baseline).
+///
+/// This is the sole point for merging discovery and collector state; call it
+/// from every discovery source (Docker, managed registry, Lemonade) to keep
+/// per-service telemetry visible across rediscovery without stale telemetry
+/// leaking across identity boundaries.
+pub(crate) fn merge_discovery_refresh(
+    svc: &DiscoveredService,
+    existing: Option<&Instance>,
+) -> Instance {
+    let mut inst = instance_from_discovered(svc);
+    if let Some(ex) = existing {
+        inst.kv_cache_usage_pct = ex.kv_cache_usage_pct;
+        inst.running_reqs = ex.running_reqs;
+        inst.waiting_reqs = ex.waiting_reqs;
+        inst.gen_tps = ex.gen_tps;
+        inst.gen_tps_observation = ex.gen_tps_observation.clone();
+        inst.tokens_per_watt = ex.tokens_per_watt;
+        inst.ttft_ms = ex.ttft_ms;
+        inst.tpot_ms = ex.tpot_ms;
+    }
+    inst
 }
 
 /// Set `vram_used_mb`/`vram_total_mb` on each instance from the per-process
@@ -685,33 +801,13 @@ fn ticks_per(period: Duration, tick: Duration) -> u64 {
 /// wall-clock jump (NTP, VM resume), so we re-baseline instead.
 const MAX_RATE_INTERVAL_S: f64 = 60.0;
 
-/// Instantaneous generation tok/s from two cumulative counter readings.
-///
-/// Returns `None` on the first reading (`prev` is `None`), a non-positive or
-/// stale interval (backwards/forward clock jump, scrape outage), or a counter
-/// reset (`cur < prev`, e.g. the vLLM process restarted) — so the rate is
-/// never negative, stale, or otherwise bogus.
-pub(crate) fn gen_tps_from_delta(
-    prev: Option<(f64, DateTime<Utc>)>,
-    cur: f64,
-    now: DateTime<Utc>,
-) -> Option<f64> {
-    let (prev_val, prev_at) = prev?;
-    let dt = (now - prev_at).num_milliseconds() as f64 / 1000.0;
-    if dt <= 0.0 || dt > MAX_RATE_INTERVAL_S || cur < prev_val {
-        return None;
-    }
-    Some((cur - prev_val) / dt)
-}
-
 /// Average latency (ms) from a cumulative histogram's `_sum` (seconds) and
 /// `_count` series, windowed over successive scrapes: `(Δsum / Δcount) × 1000`.
 /// Updates the per-instance baseline in `prev`. On the FIRST reading (or after a
 /// counter reset / stale interval / no new requests) it falls back to the
 /// cumulative average `sum/count × 1000`, so a single scrape already yields a
 /// value. Returns `None` when the histogram is absent (`sum`/`count` `None`) or
-/// `count == 0` — Observe then shows `—` (never a fabricated number). Mirrors
-/// [`gen_tps_from_delta`] (the proven counter-windowing template).
+/// `count == 0` — Observe then shows `—` (never a fabricated number).
 fn avg_ms_from_histogram(
     prev: &mut HashMap<String, (f64, f64, DateTime<Utc>)>,
     id: &str,
@@ -747,11 +843,6 @@ mod tests {
     }
 
     #[test]
-    fn gen_tps_none_on_first_reading() {
-        assert_eq!(gen_tps_from_delta(None, 100.0, at(10)), None);
-    }
-
-    #[test]
     fn avg_ms_first_scrape_uses_cumulative_then_windows() {
         let mut prev = HashMap::new();
         // First scrape: cumulative average = 2.0s / 4 × 1000 = 500 ms.
@@ -781,41 +872,6 @@ mod tests {
             avg_ms_from_histogram(&mut p2, "d", Some(0.2), Some(2.0), at(12)),
             Some(100.0),
             "reset falls back to cumulative 0.2/2×1000"
-        );
-    }
-
-    #[test]
-    fn gen_tps_computes_rate() {
-        // 200 tokens accumulated over 2 s → 100 tok/s.
-        assert_eq!(
-            gen_tps_from_delta(Some((100.0, at(10))), 300.0, at(12)),
-            Some(100.0)
-        );
-    }
-
-    #[test]
-    fn gen_tps_none_on_stale_interval() {
-        // Gap beyond MAX_RATE_INTERVAL_S → re-baseline rather than a bogus avg.
-        assert_eq!(
-            gen_tps_from_delta(Some((100.0, at(10))), 9000.0, at(10 + 120)),
-            None
-        );
-    }
-
-    #[test]
-    fn gen_tps_none_on_counter_reset() {
-        // Process restarted: cur < prev → no negative rate.
-        assert_eq!(
-            gen_tps_from_delta(Some((500.0, at(10))), 20.0, at(12)),
-            None
-        );
-    }
-
-    #[test]
-    fn gen_tps_none_on_nonpositive_interval() {
-        assert_eq!(
-            gen_tps_from_delta(Some((100.0, at(12))), 300.0, at(12)),
-            None
         );
     }
 
