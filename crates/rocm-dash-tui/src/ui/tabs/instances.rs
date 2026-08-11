@@ -768,6 +768,7 @@ mod tests {
             running_reqs: None,
             waiting_reqs: None,
             gen_tps: None,
+            gen_tps_observation: None,
             tokens_per_watt: None,
             ttft_ms: None,
             tpot_ms: None,

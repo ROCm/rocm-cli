@@ -155,6 +155,9 @@ pub fn merge_instance(
         // fills `gen_tps` from the `gen_tokens_total` delta. `tokens_per_watt`
         // is derived at snapshot assembly.
         gen_tps: sample.gen_tps,
+        // Freshness provenance: unknown at merge time; set by the runner when
+        // a counter-rate delta is computed.
+        gen_tps_observation: None,
         tokens_per_watt: None,
         // Derived at the runner by windowing the sample's cumulative histogram
         // readings (mirrors gen_tps); left None at merge time.
