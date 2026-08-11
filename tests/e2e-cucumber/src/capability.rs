@@ -10,14 +10,17 @@
 //! by spawning the real binary (`rocm examine` + `rocm engines list`) once at
 //! startup and caching the result.
 //!
-//! IMPORTANT — the effective serve engine is currently RE-IMPLEMENTED here (see
-//! [`effective_serve_engine`]) because no `rocm` command exposes it directly
-//! (`examine`'s `default_engine` is a constant `"lemonade"` decoy, not what
-//! `serve` selects). This duplicates the product's `select_serve_engine` /
-//! `preferred_serve_engine_for_therock_family` logic and WILL drift if the
-//! product changes engine support. Task #16 tracks adding a product probe
-//! (`examine --json` → `effective_serve_engine`) so the harness can read the
-//! product's own decision instead. Until then, the unit tests below guard drift.
+//! IMPORTANT — the effective serve engine is RE-IMPLEMENTED here (see
+//! [`effective_serve_engine`]), duplicating the product's `select_serve_engine` /
+//! `preferred_serve_engine_for_therock_family` logic. It will drift if the product
+//! changes engine support, so the unit tests below guard it.
+//!
+//! `examine`'s `default_engine` now reports the host's real engine rather than the
+//! old hardcoded `"lemonade"` constant, so this could in principle be replaced by
+//! reading the product's own answer. Deliberately KEEP the re-implementation: the
+//! `examine-reports-host-default-engine` scenario asserts the product's value
+//! against this one, and that check is only meaningful while the two are derived
+//! independently. Reading the product value here would turn it into a tautology.
 
 use std::sync::OnceLock;
 

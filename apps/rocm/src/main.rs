@@ -11087,7 +11087,7 @@ fn examine_human_report(
     let mut output = render_examine_plain_header(&summary);
     output.push_str(&summary.render_text());
     append_examine_runtime_state(&mut output, paths, config)?;
-    append_examine_engine_inventory(&mut output, paths, config);
+    append_examine_engine_inventory(&mut output, paths, config, &summary.default_engine);
     Ok((output, summary))
 }
 
@@ -11118,7 +11118,10 @@ pub(crate) fn render_engine_inventory_text() -> String {
 }
 
 fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) -> String {
-    let default_engine = default_engine_for_platform();
+    // Mark the engine this GPU actually serves on as primary. Using the platform
+    // constant put the `*` on Lemonade even on Instinct, where `serve` picks vLLM.
+    let host_gpu = rocm_core::detect_host_gpu_summary(paths);
+    let default_engine = rocm_core::default_engine_for_host(&host_gpu);
     let mut output = String::new();
     let _ = writeln!(output, "Local model engines");
     let _ = writeln!(
@@ -11243,13 +11246,23 @@ fn append_examine_runtime_state(
     Ok(())
 }
 
-fn append_examine_engine_inventory(output: &mut String, paths: &AppPaths, config: &RocmCliConfig) {
+/// `host_default_engine` is the engine this GPU serves on, already resolved by
+/// the caller from the `ExamineSummary` it holds — passed in rather than
+/// re-probed so the two halves of one `rocm examine` run cannot disagree.
+fn append_examine_engine_inventory(
+    output: &mut String,
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+    host_default_engine: &str,
+) {
     let configured_default = config.default_engine.as_deref();
-    let effective_default = match configured_default {
-        Some(engine) => engine,
-        None => default_engine_for_platform(),
-    };
+    // A configured value still wins, mirroring `select_serve_engine`. Only the
+    // fallback becomes GPU-aware: it used to be the platform constant, which
+    // reported Lemonade on Instinct where serve picks vLLM.
+    let effective_default = configured_default.unwrap_or(host_default_engine);
     let _ = writeln!(output, "engine_inventory:");
+    // Unchanged on purpose: this line means "what the user configured", so an
+    // unset value must keep reading as unset rather than borrowing the host default.
     let _ = writeln!(
         output,
         "  configured_default_engine: {}",
@@ -24109,7 +24122,9 @@ ID_LIKE="suse opensuse"
             Some("therock-release:gfx120X-all".to_owned());
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config);
+        // Host default deliberately disagrees with the configured value: an
+        // engine the user chose must outrank whatever the GPU would prefer.
+        append_examine_engine_inventory(&mut output, &paths, &config, "lemonade");
 
         assert!(output.contains("engine_inventory:"));
         assert!(output.contains("configured_default_engine: vllm"));
@@ -24117,6 +24132,28 @@ ID_LIKE="suse opensuse"
         assert!(output.contains("* vllm"));
         assert!(output.contains("runtime_pref=therock-release:gfx120X-all"));
         assert!(output.contains("plugin_dirs:"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn examine_engine_inventory_falls_back_to_the_host_engine_when_unconfigured() {
+        // With nothing configured, the reported default must be the engine this
+        // GPU actually serves on. On an Instinct host that is vLLM; reporting the
+        // platform constant here is what made `examine` contradict `serve`.
+        let (root, paths) = test_paths("examine-engine-inventory-host");
+        let config = RocmCliConfig::default();
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+
+        // The configured line still reads as unset — the host default must not be
+        // mistaken for something the user chose.
+        assert!(output.contains("configured_default_engine: <platform default>"));
+        assert!(output.contains("effective_default_engine: vllm"));
+        assert!(
+            output.contains("* vllm"),
+            "the primary marker should follow the host engine:\n{output}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

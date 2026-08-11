@@ -1599,6 +1599,17 @@ impl ExamineSummary {
             .as_deref()
             .and_then(normalize_therock_family);
         let detected_therock_family = detect_managed_therock_family(&paths);
+        // Report the engine this GPU actually serves on, not the platform
+        // constant. `compatible_therock_family` is the right input: it is
+        // normalised from the real GPU, whereas `detected_therock_family`
+        // describes the installed managed runtime and is absent before one
+        // exists — which would silently downgrade the answer to the constant on
+        // a fresh machine.
+        let host_gpu = HostGpuSummary {
+            name: None,
+            gfx_target: detected_gfx_target.clone(),
+            therock_family: compatible_therock_family.clone(),
+        };
         Ok(Self {
             os: runtime_os_name().to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
@@ -1609,7 +1620,7 @@ impl ExamineSummary {
                 windows_inventory.as_ref(),
             ),
             interactive_terminal: interactive_terminal(),
-            default_engine: default_engine_for_platform().to_owned(),
+            default_engine: default_engine_for_host(&host_gpu).to_owned(),
             detected_gfx_target,
             compatible_therock_family,
             detected_therock_family,
@@ -1703,6 +1714,22 @@ pub fn interactive_terminal() -> bool {
 
 pub const fn default_engine_for_platform() -> &'static str {
     "lemonade"
+}
+
+/// The engine this host serves on by default, absent an explicit choice.
+///
+/// [`default_engine_for_platform`] alone answers "what does this OS fall back
+/// to", which is not the same question: on Instinct data-center parts serving
+/// goes through vLLM, and reporting the platform constant there contradicts what
+/// `serve` actually selects. Use this wherever the CLI *tells the user* what the
+/// default engine is; `default_engine_for_platform` remains correct as the
+/// last-resort fallback once GPU and recipe preferences have been exhausted.
+///
+/// A value the user configured still outranks this — callers that have a
+/// configured engine must prefer it, mirroring `select_serve_engine`.
+#[must_use]
+pub fn default_engine_for_host(summary: &HostGpuSummary) -> &'static str {
+    preferred_serve_engine_for_host_gpu_summary(summary).unwrap_or_else(default_engine_for_platform)
 }
 
 const VLLM_PREFERRED_THEROCK_FAMILIES: &[&str] = &["gfx906", "gfx908", "gfx90a"];
@@ -7507,6 +7534,79 @@ mod tests {
         } else {
             assert_eq!(preferred, Some("vllm"));
         }
+    }
+
+    #[test]
+    fn host_default_engine_is_vllm_on_instinct() {
+        // What `rocm examine` and `rocm engines list` report on an MI300X. The
+        // platform constant said "lemonade" here while serve picked vLLM, so the
+        // reported default contradicted the actual behaviour.
+        let summary = HostGpuSummary {
+            name: Some("AMD Instinct MI300X".to_owned()),
+            gfx_target: Some("gfx942".to_owned()),
+            therock_family: Some("gfx94X-dcgpu".to_owned()),
+        };
+        if cfg!(windows) {
+            assert_eq!(default_engine_for_host(&summary), "lemonade");
+        } else {
+            assert_eq!(default_engine_for_host(&summary), "vllm");
+        }
+    }
+
+    #[test]
+    fn host_default_engine_covers_every_vllm_preferred_family() {
+        // Guards the whole preferred set, not just the dcgpu branch, so adding a
+        // family to VLLM_PREFERRED_THEROCK_FAMILIES cannot leave the reported
+        // default behind.
+        for family in VLLM_PREFERRED_THEROCK_FAMILIES {
+            let summary = HostGpuSummary {
+                name: None,
+                gfx_target: Some((*family).to_owned()),
+                therock_family: Some((*family).to_owned()),
+            };
+            let expected = if cfg!(windows) { "lemonade" } else { "vllm" };
+            assert_eq!(
+                default_engine_for_host(&summary),
+                expected,
+                "unexpected default for {family}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_default_engine_is_lemonade_without_a_vllm_preference() {
+        // Strix Halo (gfx1151), a consumer family, and a machine whose GPU has not
+        // been identified at all must all keep the platform default.
+        for summary in [
+            HostGpuSummary {
+                name: Some("AMD Radeon 8060S".to_owned()),
+                gfx_target: Some("gfx1151".to_owned()),
+                therock_family: Some("gfx1151".to_owned()),
+            },
+            HostGpuSummary {
+                name: Some("AMD Radeon".to_owned()),
+                gfx_target: Some("gfx1100".to_owned()),
+                therock_family: Some("gfx110X-all".to_owned()),
+            },
+            HostGpuSummary::default(),
+        ] {
+            assert_eq!(default_engine_for_host(&summary), "lemonade");
+        }
+    }
+
+    #[test]
+    fn host_default_engine_never_reports_vllm_on_native_windows() {
+        // The vLLM adapter bails on native Windows, so no GPU may talk the
+        // reported default into vLLM there — including an Instinct part.
+        if !cfg!(windows) {
+            return;
+        }
+        let summary = HostGpuSummary {
+            name: Some("AMD Instinct MI300X".to_owned()),
+            gfx_target: Some("gfx942".to_owned()),
+            therock_family: Some("gfx94X-dcgpu".to_owned()),
+        };
+        assert_eq!(default_engine_for_host(&summary), "lemonade");
     }
 
     #[test]

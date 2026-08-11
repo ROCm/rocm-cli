@@ -25,6 +25,18 @@ Feature: GPU detection and system inspection
     Then the inspection reports which GPU is installed
     And the inspection reports that the driver is available
 
+  # `examine` used to report a hardcoded platform constant as the default engine,
+  # so on Instinct it named Lemonade while `serve` selected vLLM. The assertion is
+  # host-agnostic: it compares what `examine` reports against the engine the
+  # harness works out for this host from the GPU family and OS, so it resolves to
+  # vLLM on Instinct and Lemonade on Strix Halo and on the no-GPU lane without
+  # naming either. The harness derives its answer from the GPU probe rather than
+  # from `examine`, so this is a cross-check and not a tautology.
+  @id:examine-reports-host-default-engine
+  Scenario: 6 - System inspection names the engine this machine serves on
+    When the user inspects the system
+    Then the inspection names the engine this host serves on by default
+
   @id:examine-distinguishes-unmanaged-rocm @requires-gpu
   Scenario: 4 - System inspection distinguishes CLI-managed from pre-existing ROCm
     Given a machine with a ROCm install that was not set up by the CLI

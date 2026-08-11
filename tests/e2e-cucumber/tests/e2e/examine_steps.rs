@@ -89,6 +89,38 @@ async fn assert_subcommands_alphabetical(world: &mut E2eWorld) {
     );
 }
 
+#[then("the inspection names the engine this host serves on by default")]
+async fn assert_host_default_engine_reported(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    let Some(reported) = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("default_engine:"))
+        .map(str::trim)
+    else {
+        panic!("no default_engine line in examine output:\n{output}");
+    };
+
+    // Independently derived by the harness from the GPU family + OS (see
+    // `capability::effective_serve_engine`), NOT read back out of `examine` — so
+    // a product that reports a constant fails here rather than agreeing with
+    // itself.
+    let expected = &e2e_cucumber::capability::host_capability().effective_serve_engine;
+    assert_eq!(
+        reported, expected,
+        "examine reports '{reported}' as the default engine, but this host serves on \
+         '{expected}':\n{output}"
+    );
+
+    // The same value must appear in the engine inventory block, which is what the
+    // `*` primary marker follows — the two used to be able to disagree.
+    assert!(
+        output
+            .lines()
+            .any(|line| line.trim() == format!("effective_default_engine: {expected}")),
+        "engine_inventory did not report '{expected}' as the effective default:\n{output}"
+    );
+}
+
 #[then("all supported engines are listed")]
 async fn assert_all_engines_listed(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no command was run");
