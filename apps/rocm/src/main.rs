@@ -11271,6 +11271,20 @@ fn append_examine_engine_inventory(
         configured_default.unwrap_or("<platform default>")
     );
     let _ = writeln!(output, "  effective_default_engine: {effective_default}");
+    // Say so when a configured engine is holding this host off the one its GPU
+    // would pick. Installs provisioned before the installer stopped seeding
+    // `default_engine` still carry `lemonade` on disk, and nothing distinguishes
+    // that seed from a deliberate choice -- so point at the fix rather than
+    // rewriting a file the user owns on a guess. This also catches a genuinely
+    // stale choice made by hand, which no migration would have covered.
+    if let Some(configured) = configured_default
+        && configured != host_default_engine
+    {
+        let _ = writeln!(
+            output,
+            "  configured_default_note: overrides this host's {host_default_engine} preference; run `rocm config clear-default-engine` to follow the host"
+        );
+    }
     let _ = writeln!(
         output,
         "  plugin_policy: first-party engines are built in; external data-dir plugins are optional overrides"
@@ -24249,6 +24263,60 @@ ID_LIKE="suse opensuse"
         assert!(
             output.contains("* vllm"),
             "the primary marker should follow the host engine:\n{output}"
+        );
+        // Nothing is being overridden, so there is nothing to warn about.
+        assert!(
+            !output.contains("configured_default_note"),
+            "an unconfigured host must not be warned about an override:\n{output}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn examine_flags_a_configured_engine_that_overrides_the_host() {
+        // Installs provisioned before the installer stopped seeding
+        // `default_engine` still carry `lemonade` on disk. That seed is
+        // indistinguishable from a deliberate choice, so it is not rewritten --
+        // but the user is told why their Instinct box is not on vLLM, and how to
+        // change it.
+        let (root, paths) = test_paths("examine-engine-inventory-override");
+        let config = RocmCliConfig {
+            default_engine: Some("lemonade".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+
+        assert!(
+            output.contains("effective_default_engine: lemonade"),
+            "the configured engine still wins:\n{output}"
+        );
+        assert!(
+            output.contains("configured_default_note:"),
+            "the override must be called out:\n{output}"
+        );
+        assert!(
+            output.contains("rocm config clear-default-engine"),
+            "the note must name the remedy, not just the problem:\n{output}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn examine_is_silent_when_the_configured_engine_agrees_with_the_host() {
+        let (root, paths) = test_paths("examine-engine-inventory-agrees");
+        let config = RocmCliConfig {
+            default_engine: Some("vllm".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+
+        assert!(
+            !output.contains("configured_default_note"),
+            "there is no override to report when the two agree:\n{output}"
         );
         let _ = fs::remove_dir_all(root);
     }
