@@ -55,18 +55,19 @@ use runtime::home_rocm_dir;
 pub use runtime::{
     RuntimeHost, RuntimePlatform, current_executable_path, default_cache_dir, default_config_dir,
     default_data_dir, default_interactive_shell_program, managed_logs_dir, managed_pip_cache_dir,
-    managed_runtime_cache_dir, managed_tools_dir, normalize_runtime_path_for_host,
-    normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
-    normalize_runtime_path_text_for_platform, normalize_runtime_path_text_for_storage,
-    platform_binary_name, prepend_runtime_path, runtime_directory_label,
-    runtime_drive_root_for_key, runtime_drive_roots, runtime_exe_suffix, runtime_home_dir,
-    runtime_install_root_is_protected, runtime_is_linux, runtime_is_windows, runtime_os_name,
-    runtime_path_for_child, runtime_path_for_windows_child, runtime_path_is_same_or_inside,
-    runtime_path_list_join, runtime_path_list_split, runtime_path_sort_key,
-    runtime_path_text_is_absolute_for_host, runtime_path_text_is_absolute_for_platform,
-    runtime_paths_equivalent, runtime_python_activation_hint, runtime_python_activation_script,
-    runtime_python_bin_dir_name, runtime_python_env_bin_dir, runtime_python_executable_in_env,
-    runtime_python_executable_name, runtime_rocm_library_filename, shell_command_for_host,
+    managed_runtime_cache_dir, managed_runtime_data_root, managed_tools_dir,
+    normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
+    normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_platform,
+    normalize_runtime_path_text_for_storage, platform_binary_name, prepend_runtime_path,
+    runtime_directory_label, runtime_drive_root_for_key, runtime_drive_roots, runtime_exe_suffix,
+    runtime_home_dir, runtime_install_root_is_protected, runtime_is_linux, runtime_is_windows,
+    runtime_os_name, runtime_path_for_child, runtime_path_for_windows_child,
+    runtime_path_is_same_or_inside, runtime_path_list_join, runtime_path_list_split,
+    runtime_path_sort_key, runtime_path_text_is_absolute_for_host,
+    runtime_path_text_is_absolute_for_platform, runtime_paths_equivalent,
+    runtime_python_activation_hint, runtime_python_activation_script, runtime_python_bin_dir_name,
+    runtime_python_env_bin_dir, runtime_python_executable_in_env, runtime_python_executable_name,
+    runtime_rocm_library_filename, shell_command_for_host,
 };
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, ensure_uv_binary, uv_binary_name, uv_command_env,
@@ -1245,7 +1246,7 @@ impl AppPaths {
 
     #[must_use]
     pub fn with_managed_root(mut self, root: impl Into<PathBuf>, keep_cache_dir: bool) -> Self {
-        self.data_dir = normalize_runtime_path_for_host(&root.into());
+        self.data_dir = managed_runtime_data_root(&root.into());
         if !keep_cache_dir {
             self.cache_dir = managed_runtime_cache_dir(&self.data_dir);
         }
@@ -9335,6 +9336,38 @@ Class Name:                Display
         assert!(tool.managed);
         assert_eq!(tool.path.as_deref(), Some(python.as_path()));
         Ok(())
+    }
+
+    #[test]
+    fn with_managed_root_keeps_reprovisioning_flat_from_runtime_leaf() {
+        let data_root = PathBuf::from("/tmp/rocm-cli-reprovision");
+        let paths = AppPaths {
+            config_dir: data_root.clone(),
+            data_dir: data_root.clone(),
+            cache_dir: data_root.join("cache"),
+        };
+        // A prior install persisted the runtime's own install_root as the managed
+        // root; rebasing onto it must recover the canonical data root, not append
+        // a second `runtimes/wheel` when the next runtime is provisioned.
+        let leaf = data_root
+            .join("runtimes")
+            .join("wheel")
+            .join("release-wheel-gfx942-7-0");
+        let rebased = paths.with_managed_root(leaf, false);
+
+        assert_eq!(rebased.data_dir, data_root);
+        let next_root = rebased
+            .data_dir
+            .join("runtimes")
+            .join("wheel")
+            .join("nightly-wheel-gfx942-7-1");
+        // Count path components, not a literal separator, so the assertion holds
+        // on Windows too.
+        let runtimes_segments = next_root
+            .components()
+            .filter(|component| component.as_os_str() == std::ffi::OsStr::new("runtimes"))
+            .count();
+        assert_eq!(runtimes_segments, 1);
     }
 
     #[test]
