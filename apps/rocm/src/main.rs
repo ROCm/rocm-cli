@@ -2902,10 +2902,17 @@ fn build_driver_install_plan(
 ) -> DriverInstallPlan {
     // Resolved here rather than left as a shell `${VAR:-default}` expression:
     // these commands are built with `printf '%s\n' '...'` (single-quoted) so the
-    // written repo file has a working baseurl regardless of shell.
+    // written repo file has a working baseurl regardless of shell. The value is
+    // interpolated straight into that single-quoted command, so it's restricted
+    // to a safe URL path segment here rather than trusted verbatim: a value
+    // containing `'` would otherwise close the quoting and inject shell.
     let repo_version_expr = std::env::var("ROCM_CLI_AMDGPU_DRIVER_VERSION")
         .ok()
-        .filter(|v| !v.is_empty())
+        .filter(|v| {
+            !v.is_empty()
+                && v.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+        })
         .unwrap_or_else(|| "latest".to_owned());
     if examine.os == "windows" {
         return DriverInstallPlan {
@@ -24331,6 +24338,37 @@ VERSION_ID="41"
         assert!(rendered.contains("approval: not required"));
         assert!(rendered.contains("no driver commands will be executed"));
         assert!(!rendered.contains("sudo dnf install -y amdgpu-dkms"));
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // std::env::set_var/remove_var are unsafe in edition 2024
+    fn driver_plan_rejects_shell_metacharacters_in_version_override() {
+        let os_release = r#"
+ID=ubuntu
+VERSION_ID="24.04"
+VERSION_CODENAME=noble
+"#;
+        let previous = std::env::var_os("ROCM_CLI_AMDGPU_DRIVER_VERSION");
+        unsafe {
+            std::env::set_var(
+                "ROCM_CLI_AMDGPU_DRIVER_VERSION",
+                "'; touch /tmp/pwned; echo '",
+            );
+        }
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("ROCM_CLI_AMDGPU_DRIVER_VERSION", value),
+                None => std::env::remove_var("ROCM_CLI_AMDGPU_DRIVER_VERSION"),
+            }
+        }
+
+        assert_eq!(plan.repo_version_expr, "latest");
+        assert!(
+            plan.commands
+                .iter()
+                .all(|command| !command.command.contains("pwned"))
+        );
     }
 
     #[test]
