@@ -106,6 +106,15 @@ enum Command {
         json: bool,
     },
     /// Diagnose known ROCm/PyTorch/llama.cpp failure modes against a closed catalog.
+    ///
+    /// Matches this machine against a fixed catalog of known misconfigurations and
+    /// ranks what it finds. It can only recognise failure modes that are in the
+    /// catalog: no match means "not recognised", not "nothing is wrong" — in that
+    /// case it points you at where to report the symptom.
+    ///
+    /// Each cause is printed with an `id:` and an `apply with:` command. The
+    /// leading `#1`, `#2` are ranking positions for reading order only; `rocm fix`
+    /// takes the id, not the position.
     Diagnose {
         /// Raw error text from the user; sharpens keyword scoring.
         #[arg(long)]
@@ -118,6 +127,15 @@ enum Command {
         json: bool,
     },
     /// Apply a known fix by id (see `rocm diagnose`); run with no id to list fixes.
+    ///
+    /// Takes the `id:` that `rocm diagnose` reports against a cause — not the
+    /// `#1`/`#2` ranking position, which belongs to one report and is not a name.
+    /// With no id it lists the whole catalog.
+    ///
+    /// Fixes are marked AUTO or PRINT-ONLY: AUTO means this command carries the
+    /// change out, PRINT-ONLY means it prints the steps for you to run yourself
+    /// (typically because they need sudo or a reboot). Use `--dry-run` to see any
+    /// fix's plan without changing anything.
     Fix {
         /// Fix id, e.g. fix-4-render-group. Omit to list available fixes.
         fix_id: Option<String>,
