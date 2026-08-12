@@ -7459,10 +7459,12 @@ fn read_provider_key_from_user(provider: &str) -> Result<String> {
 }
 
 pub(crate) fn render_launch_summary(paths: &AppPaths, config: &RocmCliConfig) -> String {
+    // User-facing text, so it must agree with what `serve` would pick — the same
+    // contradiction `examine` used to show on Instinct.
     let selected_default_engine = config
         .default_engine
         .as_deref()
-        .unwrap_or(default_engine_for_platform());
+        .unwrap_or_else(|| host_default_engine(Some(paths)));
     let mut output = String::new();
     let _ = writeln!(output, "rocm interactive shell");
     let _ = writeln!(output, "  terminal: non-interactive");
@@ -11282,7 +11284,7 @@ fn examine_human_report(
     let mut output = render_examine_plain_header(&summary);
     output.push_str(&summary.render_text());
     append_examine_runtime_state(&mut output, paths, config)?;
-    append_examine_engine_inventory(&mut output, paths, config);
+    append_examine_engine_inventory(&mut output, paths, config, &summary.default_engine);
     Ok((output, summary))
 }
 
@@ -11313,7 +11315,10 @@ pub(crate) fn render_engine_inventory_text() -> String {
 }
 
 fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) -> String {
-    let default_engine = default_engine_for_platform();
+    // Mark the engine this GPU actually serves on as primary. Using the platform
+    // constant put the `*` on Lemonade even on Instinct, where `serve` picks vLLM.
+    let host_gpu = rocm_core::detect_host_gpu_summary(paths);
+    let default_engine = rocm_core::default_engine_for_host(&host_gpu);
     let mut output = String::new();
     let _ = writeln!(output, "Local model engines");
     let _ = writeln!(
@@ -11438,19 +11443,43 @@ fn append_examine_runtime_state(
     Ok(())
 }
 
-fn append_examine_engine_inventory(output: &mut String, paths: &AppPaths, config: &RocmCliConfig) {
+/// `host_default_engine` is the engine this GPU serves on, already resolved by
+/// the caller from the `ExamineSummary` it holds — passed in rather than
+/// re-probed so the two halves of one `rocm examine` run cannot disagree.
+fn append_examine_engine_inventory(
+    output: &mut String,
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+    host_default_engine: &str,
+) {
     let configured_default = config.default_engine.as_deref();
-    let effective_default = match configured_default {
-        Some(engine) => engine,
-        None => default_engine_for_platform(),
-    };
+    // A configured value still wins, mirroring `select_serve_engine`. Only the
+    // fallback becomes GPU-aware: it used to be the platform constant, which
+    // reported Lemonade on Instinct where serve picks vLLM.
+    let effective_default = configured_default.unwrap_or(host_default_engine);
     let _ = writeln!(output, "engine_inventory:");
+    // Unchanged on purpose: this line means "what the user configured", so an
+    // unset value must keep reading as unset rather than borrowing the host default.
     let _ = writeln!(
         output,
         "  configured_default_engine: {}",
         configured_default.unwrap_or("<platform default>")
     );
     let _ = writeln!(output, "  effective_default_engine: {effective_default}");
+    // Say so when a configured engine is holding this host off the one its GPU
+    // would pick. Installs provisioned before the installer stopped seeding
+    // `default_engine` still carry `lemonade` on disk, and nothing distinguishes
+    // that seed from a deliberate choice -- so point at the fix rather than
+    // rewriting a file the user owns on a guess. This also catches a genuinely
+    // stale choice made by hand, which no migration would have covered.
+    if let Some(configured) = configured_default
+        && configured != host_default_engine
+    {
+        let _ = writeln!(
+            output,
+            "  configured_default_note: overrides this host's {host_default_engine} preference; run `rocm config clear-default-engine` to follow the host"
+        );
+    }
     let _ = writeln!(
         output,
         "  plugin_policy: first-party engines are built in; external data-dir plugins are optional overrides"
@@ -14291,20 +14320,41 @@ impl PlannedToolCall {
 
 #[cfg(test)]
 fn build_freeform_plan(request: &str, config: &RocmCliConfig) -> StructuredRequestPlan {
-    build_freeform_plan_with_recipes(request, config, None)
+    build_freeform_plan_with_recipes(request, config, None, host_default_engine(None))
 }
 
+/// The engine this host serves on, for callers that need it as an owned default.
+///
+/// Kept separate from the planner so the planner stays a pure function of its
+/// inputs: it bakes the engine into a `rocm serve --engine <engine>` command, and
+/// an explicit `--engine` outranks every other signal in [`select_serve_engine`],
+/// so a probe hidden inside it would make that command silently host-dependent
+/// and its tests unreproducible.
+fn host_default_engine(paths: Option<&AppPaths>) -> &'static str {
+    rocm_core::default_engine_for_host(&rocm_core::detect_host_gpu_summary(paths))
+}
+
+/// `host_default_engine` is the engine this GPU serves on, resolved by the
+/// caller. It is the last resort: an engine named in the request wins, then the
+/// configured default, then the matched recipe's preference.
+///
+/// It must NOT be [`default_engine_for_platform`]. The value chosen here is
+/// written into a literal `--engine` argument, which outranks even the
+/// configured default when the generated command runs — so a GPU-blind constant
+/// here forces Lemonade onto an Instinct host through the strongest override
+/// available, which is the defect this whole path is meant to avoid.
 fn build_freeform_plan_with_recipes(
     request: &str,
     config: &RocmCliConfig,
     recipes: Option<&[ModelRecipeRecord]>,
+    host_default_engine: &str,
 ) -> StructuredRequestPlan {
     let trimmed = request.trim();
     let lower = trimmed.to_ascii_lowercase();
     let default_engine = config
         .default_engine
         .as_deref()
-        .unwrap_or(default_engine_for_platform());
+        .unwrap_or(host_default_engine);
 
     if planner_is_serve_request(&lower) {
         let requested_model = infer_model_from_request(trimmed)
@@ -14764,10 +14814,14 @@ fn build_freeform_plan_with_context(
     paths: &AppPaths,
     config: &RocmCliConfig,
 ) -> StructuredRequestPlan {
+    // Resolved once here, where `paths` is in scope, so the generated
+    // `rocm serve --engine <engine>` names the engine this GPU actually serves on.
+    let host_engine = host_default_engine(Some(paths));
     let registry = match load_model_recipe_registry() {
         Ok(registry) => Some(registry),
         Err(error) => {
-            let mut plan = build_freeform_plan_with_recipes(request, config, Some(&[]));
+            let mut plan =
+                build_freeform_plan_with_recipes(request, config, Some(&[]), host_engine);
             plan.confidence = "medium";
             plan.notes.push(format!(
                 "Model recipe registry could not be loaded: {error}. Fix the recipe index before using registry aliases."
@@ -14781,6 +14835,7 @@ fn build_freeform_plan_with_context(
         registry
             .as_ref()
             .map(|registry| registry.recipes.as_slice()),
+        host_engine,
     );
     if !freeform_plan_needs_ambiguity_resolution(&deterministic) {
         return deterministic;
@@ -17794,6 +17849,7 @@ mod tests {
             "serve signedtiny",
             &RocmCliConfig::default(),
             Some(&[recipe]),
+            "lemonade",
         );
 
         assert_eq!(plan.intent, PlannerIntent::Serve);
@@ -17929,8 +17985,75 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_planner_bakes_the_host_engine_into_the_generated_serve_command() {
+        // The generated command carries an explicit `--engine`, which outranks
+        // every other signal in `select_serve_engine` -- including the configured
+        // default. So whatever this planner picks IS what runs, and on an Instinct
+        // host that must be vLLM. A GPU-blind constant here reintroduced the very
+        // bug this PR fixes, through the strongest override available.
+        //
+        // An empty recipe set is what reaches the host default: a request naming
+        // an engine, or a matched recipe that prefers one, is answered before the
+        // fallback -- correctly, since a GGUF model only Lemonade can serve must
+        // not be forced onto vLLM by the host.
+        let plan = build_freeform_plan_with_recipes(
+            "serve some/unmatched-model",
+            &RocmCliConfig::default(),
+            Some(&[]),
+            "vllm",
+        );
+
+        let engine_arg = plan
+            .actions
+            .iter()
+            .find_map(|action| {
+                let index = action.args.iter().position(|arg| arg == "--engine")?;
+                action.args.get(index + 1).cloned()
+            })
+            .expect("the generated serve command must name an engine");
+        assert_eq!(
+            engine_arg, "vllm",
+            "the host's engine must reach the generated command:\n{:?}",
+            plan.actions
+        );
+    }
+
+    #[test]
+    fn hybrid_planner_lets_a_configured_engine_outrank_the_host_default() {
+        let config = RocmCliConfig {
+            default_engine: Some("lemonade".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        let plan = build_freeform_plan_with_recipes(
+            "serve some/unmatched-model",
+            &config,
+            Some(&[]),
+            "vllm",
+        );
+
+        let engine_arg = plan
+            .actions
+            .iter()
+            .find_map(|action| {
+                let index = action.args.iter().position(|arg| arg == "--engine")?;
+                action.args.get(index + 1).cloned()
+            })
+            .expect("the generated serve command must name an engine");
+        assert_eq!(
+            engine_arg, "lemonade",
+            "an engine the user configured must still win:\n{:?}",
+            plan.actions
+        );
+    }
+
+    #[test]
     fn hybrid_planner_defaults_generic_local_assistant_to_validated_qwen() {
-        let plan = build_freeform_plan("start a local model", &RocmCliConfig::default());
+        let plan = build_freeform_plan_with_recipes(
+            "start a local model",
+            &RocmCliConfig::default(),
+            None,
+            "lemonade",
+        );
 
         assert_eq!(plan.intent, PlannerIntent::Serve);
         assert_eq!(plan.confidence, "high");
@@ -24341,7 +24464,9 @@ ID_LIKE="suse opensuse"
             Some("therock-release:gfx120X-all".to_owned());
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config);
+        // Host default deliberately disagrees with the configured value: an
+        // engine the user chose must outrank whatever the GPU would prefer.
+        append_examine_engine_inventory(&mut output, &paths, &config, "lemonade");
 
         assert!(output.contains("engine_inventory:"));
         assert!(output.contains("configured_default_engine: vllm"));
@@ -24491,6 +24616,82 @@ ID_LIKE="suse opensuse"
                 "{shell} should resolve to bash"
             );
         }
+    }
+
+    #[test]
+    fn examine_engine_inventory_falls_back_to_the_host_engine_when_unconfigured() {
+        // With nothing configured, the reported default must be the engine this
+        // GPU actually serves on. On an Instinct host that is vLLM; reporting the
+        // platform constant here is what made `examine` contradict `serve`.
+        let (root, paths) = test_paths("examine-engine-inventory-host");
+        let config = RocmCliConfig::default();
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+
+        // The configured line still reads as unset — the host default must not be
+        // mistaken for something the user chose.
+        assert!(output.contains("configured_default_engine: <platform default>"));
+        assert!(output.contains("effective_default_engine: vllm"));
+        assert!(
+            output.contains("* vllm"),
+            "the primary marker should follow the host engine:\n{output}"
+        );
+        // Nothing is being overridden, so there is nothing to warn about.
+        assert!(
+            !output.contains("configured_default_note"),
+            "an unconfigured host must not be warned about an override:\n{output}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn examine_flags_a_configured_engine_that_overrides_the_host() {
+        // Installs provisioned before the installer stopped seeding
+        // `default_engine` still carry `lemonade` on disk. That seed is
+        // indistinguishable from a deliberate choice, so it is not rewritten --
+        // but the user is told why their Instinct box is not on vLLM, and how to
+        // change it.
+        let (root, paths) = test_paths("examine-engine-inventory-override");
+        let config = RocmCliConfig {
+            default_engine: Some("lemonade".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+
+        assert!(
+            output.contains("effective_default_engine: lemonade"),
+            "the configured engine still wins:\n{output}"
+        );
+        assert!(
+            output.contains("configured_default_note:"),
+            "the override must be called out:\n{output}"
+        );
+        assert!(
+            output.contains("rocm config clear-default-engine"),
+            "the note must name the remedy, not just the problem:\n{output}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn examine_is_silent_when_the_configured_engine_agrees_with_the_host() {
+        let (root, paths) = test_paths("examine-engine-inventory-agrees");
+        let config = RocmCliConfig {
+            default_engine: Some("vllm".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+
+        assert!(
+            !output.contains("configured_default_note"),
+            "there is no override to report when the two agree:\n{output}"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
