@@ -99,6 +99,11 @@ async fn plant_destructive_apt(world: &mut E2eWorld) {
     );
     write_shim(&shim.join("apt-get"), &apt_body);
     write_shim(&shim.join("ldconfig"), "#!/bin/sh\nexit 0\n");
+    // The CLI prepends `sudo` whenever it is not already root, so whether the
+    // real `sudo` exists would otherwise decide if this scenario reaches the
+    // guard at all (it runs as root in a container, as a normal user in CI).
+    // Standing in for it too makes the run identical either way.
+    write_shim(&shim.join("sudo"), "#!/bin/sh\nexec \"$@\"\n");
 }
 
 #[when("the user installs the vLLM engine and approves system changes")]
