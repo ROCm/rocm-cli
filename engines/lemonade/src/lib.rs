@@ -2599,22 +2599,43 @@ const DIRECT_LLAMA_SERVER_BACKENDS: [&str; 4] = ["rocm-stable", "rocm-nightly", 
 /// Find an installed Lemonade `llama-server` binary under `bin/llamacpp/<backend>/`,
 /// checking known backends in priority order. This lets direct serving work wherever
 /// Lemonade installed a backend (e.g. `vulkan` on WSL2), not just the ROCm build.
+///
+/// Lemonade's backend installer extracts some llama.cpp releases straight into
+/// `<backend>/`, but others land one level deeper under a build-numbered directory
+/// (e.g. `rocm-stable/llama-b9752/llama-server`), so both layouts are checked.
 fn find_llama_server_binary(manifest: &LemonadeInstallManifest) -> Option<PathBuf> {
     let llamacpp_dir = manifest.runtime_dir.join("bin").join("llamacpp");
     let binary = platform_binary_name("llama-server");
     DIRECT_LLAMA_SERVER_BACKENDS
         .into_iter()
-        .map(|backend| llamacpp_dir.join(backend).join(&binary))
+        .find_map(|backend| find_binary_in(&llamacpp_dir.join(backend), &binary))
+}
+
+/// Look for `binary` directly in `dir`, then one level down in each subdirectory.
+fn find_binary_in(dir: &Path, binary: &str) -> Option<PathBuf> {
+    let direct = dir.join(binary);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .map(|subdir| subdir.join(binary))
         .find(|candidate| candidate.is_file())
 }
 
-/// The backend label for a packaged llama-server, taken from its parent directory name
-/// (e.g. `vulkan`, `rocm-stable`); falls back to the ROCm backend name.
+/// The backend label for a packaged llama-server, taken from the nearest ancestor
+/// directory matching a known backend name (e.g. `vulkan`, `rocm-stable`) so it still
+/// resolves correctly when Lemonade nests the binary under a build-numbered
+/// subdirectory; falls back to the ROCm backend name.
 fn llama_server_backend_label(server: &Path) -> String {
     server
-        .parent()
-        .and_then(|dir| dir.file_name())
-        .and_then(|name| name.to_str())
+        .ancestors()
+        .filter_map(|dir| dir.file_name())
+        .filter_map(|name| name.to_str())
+        .find(|name| DIRECT_LLAMA_SERVER_BACKENDS.contains(name))
         .unwrap_or(ROCM_BACKEND_NAME)
         .to_owned()
 }
@@ -3655,6 +3676,23 @@ mod tests {
         // With only cpu present, nothing is returned (no silent CPU fallback).
         fs::remove_dir_all(llamacpp.join("vulkan")).unwrap();
         assert_eq!(find_llama_server_binary(&manifest), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn find_llama_server_binary_finds_build_numbered_nesting() {
+        // Some Lemonade llama.cpp releases extract one level deeper than
+        // `<backend>/llama-server`, e.g. `rocm-stable/llama-b9752/llama-server`.
+        let dir = scratch_dir("find-server-nested");
+        let runtime_dir = dir.join("runtime");
+        let llamacpp = runtime_dir.join("bin").join("llamacpp");
+        let nested = llamacpp.join("rocm-stable").join("llama-b9752");
+        fs::create_dir_all(&nested).unwrap();
+        let server = nested.join(platform_binary_name("llama-server"));
+        fs::write(&server, b"x").unwrap();
+        let manifest = test_manifest(runtime_dir);
+        assert_eq!(find_llama_server_binary(&manifest), Some(server.clone()));
+        assert_eq!(llama_server_backend_label(&server), "rocm-stable");
         fs::remove_dir_all(&dir).ok();
     }
 
