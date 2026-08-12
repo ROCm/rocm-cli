@@ -26,9 +26,17 @@ import time
 from pathlib import Path
 from typing import Any
 
-THEROCK_SDK_PACKAGE_SPEC = "rocm[libraries,devel]"
 THEROCK_TORCH_PACKAGES = ["torch", "torchvision", "torchaudio"]
 THEROCK_RUNTIME_PACKAGES = ["rocm", "rocm-sdk-core"]
+
+
+def therock_sdk_package_spec(include_devel: bool) -> str:
+    """The `rocm` wheel spec `rocm install sdk` is expected to plan for.
+
+    The compiler toolchain is opt-in, so a default install asks for the runtime
+    libraries alone and only `--devel` adds `devel`.
+    """
+    return "rocm[libraries,devel]" if include_devel else "rocm[libraries]"
 
 
 def fail(message: str) -> None:
@@ -363,6 +371,19 @@ def verify_rocm_manifest_packages(manifest: dict[str, Any]) -> None:
         fail("manifest rocm_sdk packages missed the family-specific ROCm library wheel")
 
 
+def verify_manifest_devel(manifest: dict[str, Any], expected: bool) -> None:
+    """The manifest must record whether the toolchain was installed.
+
+    `rocm update` reinstalls from this field, so a wrong value silently adds or
+    drops the compiler toolchain on the next update.
+    """
+    recorded = manifest.get("devel")
+    if not isinstance(recorded, bool):
+        fail(f"manifest did not record a boolean devel flag: {recorded!r}")
+    if recorded != expected:
+        fail(f"manifest recorded devel={recorded}, expected {expected}")
+
+
 def verify_rocm_runtime_libraries(
     python: Path,
     env: dict[str, str],
@@ -421,6 +442,11 @@ def main() -> int:
     )
     parser.add_argument("--check-windows-tools", action="store_true")
     parser.add_argument(
+        "--devel",
+        action="store_true",
+        help="install the compiler toolchain too, as `rocm install sdk --devel` does",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="resolve the install plan without downloading wheels",
@@ -476,6 +502,8 @@ def main() -> int:
     ]
     if args.prefix is not None:
         install_argv.extend(["--prefix", str(args.prefix)])
+    if args.devel:
+        install_argv.append("--devel")
     if args.dry_run:
         install_argv.append("--dry-run")
     install_output = run(
@@ -496,7 +524,14 @@ def main() -> int:
     assert_contains(install_output, "python_wheel_tag:", "sdk install")
     assert_contains(install_output, "platform_wheel_tags:", "sdk install")
     assert_contains(install_output, "package_specs:", "sdk install")
-    assert_contains(install_output, f"{THEROCK_SDK_PACKAGE_SPEC}==", "sdk install")
+    assert_contains(
+        install_output, f"{therock_sdk_package_spec(args.devel)}==", "sdk install"
+    )
+    if args.devel:
+        assert_not_contains(install_output, "rocm[libraries]==", "sdk install")
+    else:
+        # The toolchain is opt-in: a plain install must not plan for it.
+        assert_not_contains(install_output, "rocm[libraries,devel]", "sdk install")
     for package in THEROCK_TORCH_PACKAGES:
         assert_contains(install_output, f"{package}==", "sdk install")
     assert_not_contains(install_output, "rocm[devel]", "sdk install")
@@ -560,6 +595,7 @@ def main() -> int:
         runtime_python, THEROCK_RUNTIME_PACKAGES, env
     )
     verify_rocm_manifest_packages(manifest)
+    verify_manifest_devel(manifest, args.devel)
 
     vllm_detect = run(
         "vLLM adapter detects the managed TheRock runtime",
