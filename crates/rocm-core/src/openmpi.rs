@@ -964,34 +964,43 @@ pub fn parse_apt_simulate_removals(output: &str) -> Vec<String> {
 
 /// Whether an apt package belongs to the ROCm/AMDGPU system stack and must not
 /// be removed as a side effect of automatic dependency setup.
+///
+/// Matching is by *family prefix* rather than an exhaustive package list: ROCm
+/// ships hundreds of packages and adds more every release, so enumerating exact
+/// names would silently stop protecting whatever was added last. The prefixes
+/// below cover the component families ROCm publishes — note that many are
+/// dashless (`hipblas`, `rocminfo`, `hsakmt-roct`, `llvm-amdgpu`), so a
+/// dash-separated match would miss them.
+///
+/// This deliberately favors recall over precision. A false positive only makes
+/// the CLI refuse an automatic install and ask the user to resolve it by hand,
+/// whereas a false negative silently breaks their ROCm installation. The
+/// prefixes are still specific enough not to match the packages these plans
+/// legitimately install or replace (`openmpi-bin`, `libnuma1`, `mpich`, ...).
 pub fn is_protected_rocm_package(package: &str) -> bool {
     const PREFIXES: &[&str] = &[
         "amd-smi",
         "amdgpu",
         "comgr",
+        // hip, hipcc, hipblas, hipfft, hipsolver, hip-runtime-amd, hipify-clang
         "hip",
+        // hsa-rocr, hsakmt-roct, hsa-amd-aqlprofile
         "hsa",
+        "llvm-amdgpu",
         "migraphx",
         "miopen",
         "mivisionx",
+        "openmp-extras",
         "rccl",
-        "rocblas",
-        "rocfft",
-        "rocprofiler",
-        "rocm",
-        "rocprim",
-        "rocrand",
-        "rocsolver",
-        "rocsparse",
-        "rocthrust",
-        "roctracer",
+        // rocm*, plus the dashless libraries: rocblas, rocfft, rocrand,
+        // rocsolver, rocsparse, rocthrust, rocprim, rocprofiler, roctracer,
+        // rocalution, rocwmma, rocdecode, rocjpeg, rocdbgapi, rocminfo, rocr-runtime
+        "roc",
         "rpp",
     ];
     // Strip any architecture qualifier (`amdgpu-core:amd64`) before matching.
     let package = package.split(':').next().unwrap_or(package);
-    PREFIXES
-        .iter()
-        .any(|prefix| package == *prefix || package.starts_with(&format!("{prefix}-")))
+    PREFIXES.iter().any(|prefix| package.starts_with(prefix))
 }
 
 fn resolve_package_manager(os_id: &str, id_like: &str) -> Option<PackageManager> {
@@ -1434,10 +1443,25 @@ Inst openmpi-bin (4.1.6 Ubuntu:24.04 [amd64])
     #[test]
     fn protects_rocm_stack_packages_only() {
         for package in [
+            // The packages the EAI-7957 report saw apt mark for removal.
             "rocm",
+            "rocm-hip",
             "rocm-hip-runtime-dev",
             "mivisionx-dev",
             "rpp-dev",
+            // Core packages whose names do not follow a `<family>-` shape, so a
+            // dash-separated match would miss them and let apt remove the ROCm
+            // stack anyway.
+            "hsakmt-roct",
+            "llvm-amdgpu",
+            "rocminfo",
+            "hipblas",
+            "rocblas",
+            "hipcc",
+            "comgr",
+            "hsa-rocr",
+            "openmp-extras-runtime",
+            // Driver packages and architecture-qualified names.
             "amdgpu-dkms",
             "hip-runtime-amd",
             "amdgpu-core:amd64",
@@ -1447,15 +1471,18 @@ Inst openmpi-bin (4.1.6 Ubuntu:24.04 [amd64])
                 "{package} must be protected"
             );
         }
-        // Packages the plans legitimately install/replace must stay removable,
-        // including names that merely start with a protected prefix's letters.
+        // The packages these plans legitimately install, and the MPI
+        // implementation apt may swap out to satisfy them, must stay removable
+        // or the guard would block its own install.
         for package in [
             "openmpi-bin",
             "libopenmpi-dev",
+            "openmpi4",
+            "mpich",
+            "libmpich-dev",
             "libnuma1",
+            "numactl",
             "libatomic1",
-            "hipster",
-            "rocmap",
         ] {
             assert!(
                 !is_protected_rocm_package(package),
