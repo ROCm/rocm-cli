@@ -201,19 +201,6 @@ Feature: Model serving
     When the user serves a model without choosing an address
     Then the new server does not try to use the taken address
 
-  # Expected to FAIL on Instinct. The engine inventory tells the user Lemonade is
-  # ready to serve on their AMD GPU; that claim is only worth making if a model
-  # served through Lemonade then answers. Where the claim is not made this
-  # scenario does not run, so it never reads as a failure on a host that was
-  # honest about it.
-  @id:lemonade-serves-on-the-gpu-it-claims @requires-gpu @requires-engine:lemonade
-  Scenario: 19 - Lemonade serves on the GPU the engine inventory says it is ready on
-    Given a managed runtime is active
-    And the engine inventory says Lemonade is ready on this GPU
-    And a GGUF model is being served on lemonade
-    When the user sends a chat completion request
-    Then the response contains a model reply
-
   # Honest device selection: a `--gpu` index that does not exist on the host is
   # rejected outright, never silently remapped to another device (no device-0
   # fallback). Runs on GPU hardware: on a no-GPU host the GPU-required pre-flight

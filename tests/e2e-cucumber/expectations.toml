@@ -279,17 +279,12 @@ when = {}
 bug = "EAI-8021"
 reason = "A device the user can already read and write is still offered as a group-permission cause."
 
-# --- EAI-8006: MEASURE. `--gpu auto` reports `selected none` on a machine that
-# has a GPU, because the bundled `amd-smi` cannot execute (its `#!/usr/bin/env
-# python3` shebang finds no interpreter on PATH) — even though the CLI has
-# already recorded a working one in its own config. Scoped to any GPU host for
-# the first run; narrow to the family that reproduces it if the dispatch
-# disagrees. ---
-[["serve-auto-gpu-selection-names-a-device"]]
-when = {}
-bug = "EAI-8006"
-reason = "Letting the CLI choose a GPU reports that it selected none on a machine that has one."
-serve_timeout_secs = 180
+# EAI-8006 has NO row on purpose. `--gpu auto` reported `selected none` on the
+# pod, where the bundled `amd-smi` could not execute (its `#!/usr/bin/env
+# python3` shebang found no interpreter). The MI300X runner's `amd-smi` runs, so
+# the CLI names a device there and the scenario passes (measured, runs 190/191).
+# It ships as a guard instead: a row would be a stale XPASS and would fail the
+# lane.
 
 # --- EAI-8016: MEASURE. The serve path has no address-availability check: the
 # default port is used whether or not something already holds it, so a second
@@ -301,25 +296,12 @@ bug = "EAI-8016"
 reason = "A server started without an address is given the default one even when it is already in use."
 serve_timeout_secs = 120
 
-# --- EAI-8018: MEASURE. On Instinct the Lemonade install selects a Vulkan
-# llama.cpp backend and the engine inventory then says Lemonade is ready on the
-# AMD GPU, but the packaged server enumerates only the host CPU under a
-# GPU-required policy and answers 503. Expected to be family-scoped
-# (`gfx94*`) — the first dispatch decides, and the precedent for narrowing is
-# `examine-both-forms-agree-on-gpu`. ---
-[["lemonade-serves-on-the-gpu-it-claims"]]
-when = {}
-bug = "EAI-8018"
-reason = "The engine inventory says Lemonade is ready on this GPU, but a model served through it never answers."
-serve_timeout_secs = 180
-
-# --- EAI-8017: MEASURE. The CLI resolves a writable scratch directory for its
-# own directories but passes none to the engine process it launches, so an
-# install from a session without one fails before it starts. GPU lane: the
-# engine's launcher needs the AMD userspace libraries to get as far as looking
-# for a scratch directory, so on a plain runner it dies earlier for an unrelated
-# reason and proves nothing. ---
-[["engines-install-without-a-session-runtime-dir"]]
-when = {}
-bug = "EAI-8017"
-reason = "Installing an engine fails when the session provides no scratch directory, because the CLI passes none to the engine it launches."
+# EAI-8017 and EAI-8018 have NO rows and NO scenarios, because neither can be
+# exercised on any lane available here. Both need a working Lemonade install,
+# and Lemonade's own launcher cannot start on either lane: on the MI300X runner
+# `lemond` wants GLIBC_2.38 / GLIBCXX_3.4.32, which that OS does not have
+# (measured, runs 190/191), and in a plain container it wants
+# libdrm_amdgpu.so.1. Both die before reaching the behaviour under test, so a
+# scenario would pass vacuously — worse than no scenario, because it would read
+# as coverage. They were reproduced by hand on the pod (ubuntu 24.04) and stay
+# on their tickets until a lane can run Lemonade.
