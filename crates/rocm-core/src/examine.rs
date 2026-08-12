@@ -252,10 +252,18 @@ impl Examination {
         let mut e = Self::default();
         probe_os(&mut e);
         if e.is_wsl {
-            // WSL2 is out of scope: it uses /dev/dxg + the Windows host driver,
-            // not the in-tree amdgpu module or /dev/kfd. Running the Linux probe
-            // set would only mislead, so add the route-out note and stop here
-            // (mirrors examine.py). The "wsl" status carries the verdict.
+            // WSL2 is out of scope for the *driver* probes: it uses /dev/dxg and
+            // the Windows host driver, not the in-tree amdgpu module or
+            // /dev/kfd, so asking about modprobe, the render group or /dev/kfd
+            // would only mislead. The "wsl" status carries that verdict.
+            //
+            // The frameworks are a different matter. PyTorch on WSL2 is a
+            // supported, documented configuration, and stopping before the
+            // framework probe meant `--json` could never tell a WSL user which
+            // ROCm build their torch was compiled against -- a question that has
+            // nothing to do with the kernel module. So run that one, and only
+            // that one, before routing out.
+            probe_framework(&mut e, framework);
             e.notes.push(WSL_ROUTE_OUT_NOTE.to_owned());
             e.status = "wsl".to_owned();
             return e;
@@ -439,13 +447,10 @@ fn probe_os(e: &mut Examination) {
         if let Some(param) = parse_iommu_param(&e.kernel_cmdline) {
             e.iommu_kernel_param = param;
         }
-        let proc_version = read_text("/proc/version").to_lowercase();
-        if proc_version.contains("microsoft")
-            || proc_version.contains("wsl")
-            || std::env::var_os("WSL_DISTRO_NAME").is_some()
-        {
-            e.is_wsl = true;
-        }
+        // One shared answer. This used to be its own predicate, and it differed
+        // from the install summary's — so `rocm examine` and `rocm examine
+        // --json` could disagree about the platform they were describing.
+        e.is_wsl = crate::is_wsl_host();
     } else if runtime_is_windows() {
         e.os_family = "windows".to_owned();
     } else {
