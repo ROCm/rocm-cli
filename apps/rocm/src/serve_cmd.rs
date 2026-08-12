@@ -38,6 +38,7 @@ use rocm_engine_protocol::{
 use crate::DevicePolicyArg;
 use crate::endpoint_keys;
 use crate::engines_cmd::{engine_manages_own_runtime, ensure_self_managed_engine_ready};
+use crate::serve_port;
 use crate::serve_summary;
 use crate::service_launch::{
     drop_orphaned_endpoint_key_on_already_running, ensure_background_helper_running_quiet,
@@ -501,7 +502,7 @@ pub(crate) struct ServeArgs {
     pub(crate) runtime_id: Option<String>,
     pub(crate) env_id: Option<String>,
     pub(crate) host: String,
-    pub(crate) port: u16,
+    pub(crate) port: Option<u16>,
     pub(crate) foreground: bool,
     pub(crate) managed: bool,
     pub(crate) verbose: bool,
@@ -539,6 +540,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         max_tokens,
         api_key,
     } = args;
+    let port_request = serve_port::PortRequest::from_flag(port);
     let _ = managed; // background is now the default; --managed is accepted as an explicit synonym.
     validate_bind_host(&host, allow_public_bind)?;
     // Loopback stays credential-free; a public bind must be authenticated. Resolve
@@ -780,7 +782,10 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         println!("  engine: {selected_engine}");
         println!("{}", serve_engine_selection_line(&serve_engine));
         println!("  host: {host}");
-        println!("  port: {port}");
+        match port {
+            Some(port) => println!("  port: {port}"),
+            None => println!("  {}", serve_port::AUTOMATIC_PORT_DISCLOSURE),
+        }
         if let Some(runtime_id) = resolved_selection.runtime_id.as_deref() {
             println!("  runtime_id: {runtime_id}");
         }
@@ -863,7 +868,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             &model,
             &resolve,
             &host,
-            port,
+            port_request,
             &resolve.device_policy,
             &gpu_indices,
             managed_runtime_id.as_deref(),
@@ -949,7 +954,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         &model,
         &resolve,
         &host,
-        port,
+        port_request,
         &gpu_indices,
         resolved_selection.runtime_id.as_deref(),
         resolved_selection.env_id.as_deref(),
