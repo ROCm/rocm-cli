@@ -232,6 +232,15 @@ pub fn managed_uv_cache_dir(root: &Path) -> PathBuf {
     normalize_runtime_path_for_host(root).join("uv-cache")
 }
 
+/// Standalone CPython interpreters downloaded by `uv python install`, kept under the managed
+/// root for the same reason as `managed_uv_cache_dir`.
+///
+/// Without this, `uv` falls back to `$HOME/.local/share/uv/python/`, leaking outside the
+/// managed root.
+pub fn managed_uv_python_install_dir(root: &Path) -> PathBuf {
+    normalize_runtime_path_for_host(root).join("uv-python")
+}
+
 pub fn managed_logs_dir(root: &Path) -> PathBuf {
     normalize_runtime_path_for_host(root).join("logs")
 }
