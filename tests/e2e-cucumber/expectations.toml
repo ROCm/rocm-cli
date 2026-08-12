@@ -169,4 +169,3 @@ bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so the benchmark never reaches a live model."
 serve_timeout_secs = 90
 flaky = true
-
