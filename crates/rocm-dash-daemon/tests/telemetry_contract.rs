@@ -17,15 +17,15 @@
 //! | 1  | Frozen counter → zero rate                        | `gen_tps ≈ 0.0`    | `≈ 0.0`     | GREEN |
 //! | 2  | Counter reset → invalidation + re-baseline        | None then positive | same        | GREEN |
 //! | 3  | Service removal → `InstanceGone` event            | fired next disc    | same        | GREEN |
-//! | 4  | Single failure → gen_tps held for validity window | Some(…) held       | None immed. | RED   |
+//! | 4  | Single failure → gen_tps held for validity window | Some(…) held       | same        | GREEN |
 //! | 5  | Omitted counter → None (not zero, not panic)      | None, baseline kept| None, kept  | GREEN |
 //! | 6  | Omitted → success path preserves baseline (≠ Fail)| immediate recovery | same        | GREEN |
 //! | 7  | Malformed payload → None (not zero, not panic)    | None               | None        | GREEN |
 //! | 8  | RunningIdle → gen_tps present + running_reqs = 0  | Some(+), req=0     | same        | GREEN |
-//! | 9  | Expiry boundary: held inside window, gone after   | B1 held, B2 none   | B1 RED      | RED   |
+//! | 9  | Expiry boundary: held inside window, gone after   | B1 held, B2 none   | same        | GREEN |
 //!
 //! Scenarios 1–3, 5–8 verify already-correct or distinguishably-observable
-//! behaviour.  Scenarios 4 and 9 reproduce the EAI-7960 root cause.
+//! behaviour.  All scenarios now serve as regression guards.
 //!
 //! Timing: `tick_override = 200 ms`, `discovery_tick = 200 ms`,
 //! `instance_tick = 400 ms` (scrape every 2nd base tick).
@@ -77,11 +77,11 @@
 //!   `clamp(3 × instance_tick, 6 s, 30 s)`.
 //! - Successful scrape: `gen_tps` is recomputed (Fresh), validity clock resets.
 //! - Missing / unparseable counter (HTTP 200, field absent): gen_tps holds,
-//!   validity clock NOT reset, `prev_gen_tokens` preserved.
+//!   validity clock NOT reset, tracker baseline preserved.
 //! - Unchanged valid counter after full rate window: `gen_tps = Some(0.0)`
 //!   (Fresh — idle is not unknown).
 //! - Scrape failure (HTTP non-200): gen_tps holds (Held) until validity expires,
-//!   then `None`.  `prev_gen_tokens` cleared on failure so recovery re-baselines.
+//!   then `None`.  Tracker baseline cleared on failure so recovery re-baselines.
 //! - Counter reset (`cur < prev_val`): immediate `None`, new baseline set.
 //! - Identity change (host:port reassigned): treated as reset.
 //! - Service removal / non-serving terminal state: immediate `None`, no hold.
@@ -407,7 +407,8 @@ fn svc_gen_tps(snap: &rocm_dash_core::metrics::Snapshot) -> Option<Option<f64>> 
 /// distinct from `None` ("no data").  An idle engine is not the same as an
 /// unknown engine.
 ///
-/// GREEN: `gen_tps_from_delta` computes `0 / dt = 0.0` (runner.rs:704).
+/// GREEN: `GenerationObservationTracker` yields `Some(0.0)` when the counter is
+/// unchanged after the full rate window.
 #[tokio::test]
 async fn zero_gen_tps_after_frozen_counter() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -449,8 +450,8 @@ async fn zero_gen_tps_after_frozen_counter() {
 /// immediately yields `gen_tps = None` for that tick, and the new lower value
 /// becomes the baseline so recovery to a positive rate is possible.
 ///
-/// GREEN: `gen_tps_from_delta` has an explicit guard `cur < prev_val → None`
-/// (runner.rs:701), and re-inserts the new value as the baseline.
+/// GREEN: `GenerationObservationTracker` detects `cur < prev_val` and immediately
+/// yields `None`, re-inserting the new lower value as the baseline.
 #[tokio::test]
 async fn counter_reset_invalidates_baseline_immediately() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -512,7 +513,7 @@ async fn counter_reset_invalidates_baseline_immediately() {
 /// event on the next discovery tick and the instance is absent from subsequent
 /// Snapshots.
 ///
-/// GREEN: runner.rs:362-377 computes `known_services.difference(&disc.seen)`
+/// GREEN: runner.rs:446-460 computes `known_services.difference(&disc.seen)`
 /// and fires `InstanceGone` for each absent id.
 #[tokio::test]
 async fn service_removal_fires_instance_gone() {
@@ -579,18 +580,17 @@ async fn service_removal_fires_instance_gone() {
     stop.store(true, Ordering::Relaxed);
 }
 
-// ── Scenario 4: Single failure → gen_tps held for validity window (RED) ────
+// ── Scenario 4: Single failure → gen_tps held for validity window ───────────
 
 /// Contract: after a single failed `/metrics` scrape, `gen_tps` must remain
 /// held at its last positive value for the validity window
 /// `clamp(3 × instance_tick, 6 s, 30 s)` before clearing.
 ///
-/// **Current behaviour — RED:** `runner.rs:462-477` clears `gen_tps` to `None`
-/// and removes `prev_gen_tokens` on the very tick of the failure.  The first
-/// Snapshot after the failure already shows `gen_tps = None`.
+/// This is now a GREEN regression guard: the fix in `GenerationObservationTracker`
+/// holds the last observed value for `clamp(3 × instance_tick, 6 s, 30 s)` before
+/// clearing.  The assertion below will FAIL if the hold-window is regressed.
 ///
-/// This reproduces the same root cause as cucumber Scenario 8 at the daemon
-/// broadcast seam (no PTY / TUI layer).
+/// Complements cucumber Scenario 8 at the daemon broadcast seam (no PTY / TUI).
 #[tokio::test]
 async fn gen_tps_held_for_validity_window_after_single_failure() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -637,16 +637,15 @@ async fn gen_tps_held_for_validity_window_after_single_failure() {
 
     stop.store(true, Ordering::Relaxed);
 
-    // CONTRACT: the held value must still be present.
-    // CURRENT: None — immediate clear.  This assertion FAILS (RED).
+    // CONTRACT: the held value must still be present (regression guard).
+    // If this fails, GenerationObservationTracker no longer holds gen_tps on failure.
     assert!(
         post_failure_gen_tps.is_some(),
         "EAI-7960 REGRESSION (daemon broadcast seam): gen_tps was cleared to None \
-         immediately after the first failed /metrics scrape.\n\
+         immediately after the first failed /metrics scrape — regression detected.\n\
          Contract: hold for clamp(3 × {INSTANCE_TICK:?}, 6 s, 30 s).\n\
-         Root cause: runner.rs:462-477 clears gen_tps on the same tick as the failure.\n\
          Baseline was {baseline:.2} tok/s; post-failure was None.\n\
-         This test must FAIL (RED) until the EAI-7960 fix is applied."
+         This is a GREEN regression guard: if it fires, the EAI-7960 fix was reverted."
     );
 }
 
@@ -654,10 +653,11 @@ async fn gen_tps_held_for_validity_window_after_single_failure() {
 
 /// Contract: when the `/metrics` endpoint returns HTTP 200 but the body omits
 /// `vllm:generation_tokens_total`, `gen_tps` is `None` — not `Some(0.0)`.
-/// `prev_gen_tokens` must NOT be removed (success path, not failure path).
+/// The tracker baseline must NOT be reset (success path, not failure path).
 ///
-/// GREEN: `gen_tps_from_delta` is only reached when `gen_tokens_total.is_some()`;
-/// an absent counter falls straight to `None` without touching `prev_gen_tokens`.
+/// GREEN: `GenerationObservationTracker::observe()` is only called when
+/// `gen_tokens_total` is `Some`; an absent counter is not forwarded and leaves
+/// the tracker baseline untouched.
 #[tokio::test]
 async fn omitted_counter_yields_none_not_zero() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -720,12 +720,12 @@ async fn omitted_counter_yields_none_not_zero() {
 
 /// Contract: after an omitted-counter scrape (HTTP 200, counter absent),
 /// switching back to Growing gives an immediate positive `gen_tps` on the
-/// very next scrape — because `prev_gen_tokens` was preserved on the success
-/// path. This distinguishes `Omitted` from `Failure`, which removes the baseline.
+/// very next scrape — because the tracker baseline was preserved on the success
+/// path. This distinguishes `Omitted` from `Failure`, which resets the baseline.
 ///
-/// GREEN: the success path in runner.rs only calls
-/// `prev_gen_tokens.insert(id, (cur, now))` inside `and_then`, so an absent
-/// counter leaves `prev_gen_tokens` untouched.
+/// GREEN: the success path only forwards `gen_tokens_total` to the tracker when
+/// it is `Some`; an absent counter is not forwarded and leaves the tracker
+/// baseline untouched.
 #[tokio::test]
 async fn omitted_preserves_baseline_so_recovery_is_immediate() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -754,7 +754,7 @@ async fn omitted_preserves_baseline_so_recovery_is_immediate() {
     .await
     .unwrap_or_else(|e| panic!("positive gen_tps never established: {e}"));
 
-    // Step 2: one omitted-counter scrape (success path, prev_gen_tokens preserved).
+    // Step 2: one omitted-counter scrape (success path, tracker baseline preserved).
     // Drain buffered pre-step snapshots, record ticks baseline, then switch to Omitted.
     drain_snapshots(&mut rx);
     let omit_baseline = ticks.load(Ordering::Relaxed);
@@ -769,7 +769,7 @@ async fn omitted_preserves_baseline_so_recovery_is_immediate() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // Step 3: recover immediately — Growing again with preserved prev_gen_tokens.
+    // Step 3: recover immediately — Growing again with preserved tracker baseline.
     // A single successful scrape with a counter > prev_val should yield positive rate.
     *mode
         .lock()
@@ -921,17 +921,17 @@ async fn running_idle_yields_gen_tps_and_zero_running_reqs() {
 /// Pins both boundaries of the EAI-7960 validity-window contract at the daemon
 /// broadcast seam.
 ///
-/// **BOUNDARY 1 (held assertion — RED today):** immediately after the first
+/// **BOUNDARY 1 (held assertion — regression guard):** immediately after the first
 /// failed scrape, `gen_tps` must still be `Some(_)` (held at its last observed
-/// value).  Current code clears it to `None` immediately — this assertion FAILS.
+/// value).  If this fails, `GenerationObservationTracker` no longer holds on
+/// failure — the EAI-7960 fix was regressed.
 ///
-/// **BOUNDARY 2 (expired assertion — unreachable today):** after the full
-/// validity window `clamp(3 × instance_tick, 6 s, 30 s)` = 6 s elapses, the
-/// held value must be cleared and `gen_tps` must be `None`.
+/// **BOUNDARY 2 (expiry assertion):** after the full validity window
+/// `clamp(3 × instance_tick, 6 s, 30 s)` = 6 s elapses, the held value must be
+/// cleared and `gen_tps` must be `None`.
 ///
-/// Both snapshots are captured before any assertion runs, so the test documents
-/// both boundaries even though only boundary 1 is checked by the final
-/// `assert!`. The boundary 2 assertion becomes GREEN once the fix is applied.
+/// Both snapshots are captured before any assertion runs so both boundaries are
+/// documented.  Both assertions are GREEN regression guards.
 #[tokio::test]
 async fn gen_tps_expiry_boundary_held_then_unavailable() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1000,12 +1000,11 @@ async fn gen_tps_expiry_boundary_held_then_unavailable() {
     // Assert BOUNDARY 1 first; failure here prevents boundary-2 from running.
     assert!(
         boundary1_gen_tps.is_some(),
-        "EAI-7960 BOUNDARY-1 FAILED (daemon broadcast seam): gen_tps cleared to None \
-         immediately after first failure instead of being held.\n\
+        "EAI-7960 BOUNDARY-1 REGRESSION (daemon broadcast seam): gen_tps cleared to None \
+         immediately after first failure — regression detected.\n\
          Contract: hold for clamp(3 × {INSTANCE_TICK:?}, 6 s, 30 s).\n\
-         Root cause: runner.rs clears gen_tps on the same tick as the failure.\n\
          Baseline was {baseline:.2} tok/s; post-failure was None.\n\
-         This assertion must FAIL (RED) until the EAI-7960 fix is applied."
+         This is a GREEN regression guard: if it fires, the EAI-7960 fix was reverted."
     );
 
     // Assert BOUNDARY 2 (reachable only after boundary-1 is fixed).
