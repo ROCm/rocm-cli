@@ -15,6 +15,7 @@ Feature: Diagnosing failures and listing fixes
     Given a user who hit a known ROCm failure
     When the user asks the CLI to diagnose that symptom
     Then the CLI reports a likely cause with a suggested fix
+    And every reported cause comes with a command that applies it
 
   @id:diagnose-always-offers-a-way-forward
   Scenario: 2 - Diagnosing any failure always gives the user a way to escalate
@@ -33,6 +34,7 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI which fixes it offers
     Then the CLI lists the fixes it can apply
     And each fix indicates whether the CLI can apply it automatically
+    And the listing explains what those indicators mean
 
   @id:fix-dry-run-changes-nothing
   Scenario: 5 - Previewing a fix explains the change without making it
@@ -46,3 +48,11 @@ Feature: Diagnosing failures and listing fixes
     Given a user who names a fix the CLI does not offer
     When the user asks the CLI to apply that fix
     Then the CLI refuses and explains that the fix is not recognised
+
+  # A diagnosis ranks causes `#1`, `#2`; reaching for that number here is the
+  # natural mistake, and it used to get the same bare "unknown id" as a typo.
+  @id:fix-position-argument-rejected
+  Scenario: 7 - Asking for a fix by its position in the diagnosis is corrected
+    Given a user who refers to a cause by its position in the diagnosis
+    When the user asks the CLI to apply that fix
+    Then the CLI refuses and explains that a position is not a fix-id

@@ -161,9 +161,12 @@ write_minimal_config_if_missing() {
 
   mkdir -p "${config_dir}"
   config_tmp="${tmp_dir}/config.json"
+  # Deliberately no "default_engine": the CLI picks the serving engine from the
+  # host GPU (vLLM on Instinct data-center parts, Lemonade elsewhere). Seeding a
+  # value here would be treated as an explicit user choice and short-circuit that
+  # detection -- which is how every installed Instinct box ended up on Lemonade.
   cat > "${config_tmp}" <<'JSON'
 {
-  "default_engine": "lemonade",
   "telemetry": {
     "mode": "local"
   },

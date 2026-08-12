@@ -30,6 +30,24 @@ pub const DEFAULT_LOG_TAIL_LINES: usize = 80;
 /// (e.g. a loopback bind).
 pub const ENDPOINT_API_KEY_FILE_ENV: &str = "ROCM_SERVE_API_KEY_FILE";
 
+/// Whether `host` names a public (non-loopback) bind, i.e. one that must be
+/// protected by an endpoint API key.
+///
+/// Shared so `rocm` (which decides at `serve` time whether to mint a key) and
+/// `rocmd` (which respawns recorded services during recovery) apply the same
+/// policy to the same `ManagedServiceRecord::host` value.
+///
+/// Deliberately an exact match against the three loopback spellings the CLI
+/// accepts, so anything unrecognized — an IPv6 loopback alias, a differently
+/// cased `localhost`, a hostname that happens to resolve locally — is treated
+/// as public and therefore *requires* a key. Misclassifying a loopback bind as
+/// public costs a key nobody needed; the reverse would open an unauthenticated
+/// network listener.
+#[must_use]
+pub fn is_public_bind_host(host: &str) -> bool {
+    !matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
 /// Resolve the endpoint API key an engine adapter must enforce, if any.
 ///
 /// Reads the key file named by [`ENDPOINT_API_KEY_FILE_ENV`]. Returns `None` when
@@ -525,13 +543,61 @@ pub struct LaunchResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthcheckResponse {
+    /// Engine-reported service state. `ready` is reserved for a service that has
+    /// served inference; an engine whose model is listed but not yet able to
+    /// answer should report `loading`. Do not report `failed`, `unreachable`, or
+    /// `exited` for a model that is merely still coming up — the supervisor
+    /// treats those as recoverable and will restart the service mid-load.
     pub status: String,
+    /// Whether the model can actually serve requests **now**. This must reflect a
+    /// completed inference request, not the model appearing in `/v1/models`: an
+    /// engine typically lists a model within seconds of accepting its name, while
+    /// the weights can take minutes to become usable, and callers wait on this
+    /// field before sending traffic.
     pub model_loaded: bool,
     pub device: String,
     pub uptime_sec: u64,
     pub queue_depth: u32,
     pub last_error: Option<String>,
     pub tokens_per_sec: Option<f32>,
+}
+
+impl HealthcheckResponse {
+    /// Report a service by how far its endpoint got, applying the [`status`] and
+    /// [`model_loaded`] contract above.
+    ///
+    /// `listed` means the endpoint advertises the model; `ready` means an inference
+    /// request has actually come back. The gap between the two is the point: a model
+    /// that lists but cannot yet serve is still coming up, so it reports `loading`
+    /// and never the engine's own status — reporting `failed`/`exited` there would
+    /// have the supervisor restart the service mid-load, which is exactly the
+    /// slow-loading case this signal exists for. `state_status` is therefore
+    /// consulted only when the endpoint is not listing at all, which is where a
+    /// genuine crash surfaces.
+    ///
+    /// Both engines share this mapping; only what counts as *listed*, and how the
+    /// device is named, differ.
+    ///
+    /// [`status`]: Self::status
+    /// [`model_loaded`]: Self::model_loaded
+    pub fn for_readiness(listed: bool, ready: bool, state_status: &str, device: &str) -> Self {
+        let status = if ready {
+            "ready"
+        } else if listed {
+            "loading"
+        } else {
+            state_status
+        };
+        Self {
+            status: status.to_owned(),
+            model_loaded: ready,
+            device: device.to_owned(),
+            uptime_sec: 0,
+            queue_depth: 0,
+            last_error: None,
+            tokens_per_sec: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -556,6 +622,47 @@ pub struct LogsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn healthcheck_reports_ready_only_once_inference_has_answered() {
+        let response = HealthcheckResponse::for_readiness(true, true, "running", "rocm_gpu");
+        assert_eq!(response.status, "ready");
+        assert!(
+            response.model_loaded,
+            "a service that answered inference must set model_loaded"
+        );
+    }
+
+    #[test]
+    fn healthcheck_reports_a_listed_but_unservable_model_as_loading() {
+        // The restart-loop hazard: `rocmd` restarts a service left in a recoverable
+        // state, so a model that lists while its weights load must not surface the
+        // engine's own status here — it would be restarted mid-load.
+        let response = HealthcheckResponse::for_readiness(true, false, "failed", "unknown");
+        assert_eq!(
+            response.status, "loading",
+            "a listed-but-unservable model must read as still coming up"
+        );
+        assert!(
+            !response.model_loaded,
+            "listing a model is not being able to serve it"
+        );
+    }
+
+    #[test]
+    fn healthcheck_surfaces_the_engine_status_when_the_endpoint_is_not_listing() {
+        // Not listing at all is where a genuine crash shows up, so the engine's own
+        // status has to survive rather than be masked as `loading`.
+        for state_status in ["failed", "exited", "starting", "unknown"] {
+            let response =
+                HealthcheckResponse::for_readiness(false, false, state_status, "unknown");
+            assert_eq!(
+                response.status, state_status,
+                "a non-listing service must report its engine status verbatim"
+            );
+            assert!(!response.model_loaded);
+        }
+    }
 
     #[test]
     fn endpoint_api_key_from_file_reads_and_trims() {
@@ -662,6 +769,27 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert_eq!(endpoint_key_file_if_present(&paths, service_id), None);
         std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    #[test]
+    fn is_public_bind_host_recognizes_only_the_accepted_loopback_spellings() {
+        for host in ["127.0.0.1", "localhost", "::1"] {
+            assert!(!is_public_bind_host(host), "{host} must be loopback");
+        }
+        for host in [
+            "0.0.0.0",
+            "::",
+            "192.168.1.10",
+            "example.test",
+            // Conservative on purpose: an unrecognized spelling of a loopback
+            // address is classified public, so it requires a key rather than
+            // opening an unauthenticated listener.
+            "LOCALHOST",
+            "127.0.0.2",
+            "[::1]",
+        ] {
+            assert!(is_public_bind_host(host), "{host} must be public");
+        }
     }
 
     #[test]

@@ -122,18 +122,22 @@ serve does not compete with the first for device memory, and the failure quotes
 the service log tail plus the device's free-VRAM state, which is where the
 engine's own reason for the stall is recorded.
 
-CI runs one job per platform, each executing the full suite:
+CI runs one job per platform, each executing the full suite. The mock job lives
+in the `CI` workflow (`ci.yml`); the self-hosted GPU jobs live in a separate
+`E2E self-hosted` workflow (`e2e-selfhosted.yml`) so a job queued on an offline
+self-hosted runner can never stall `ci.yml`'s merge-required checks:
 
-| Job | Platform | Blocking |
-|---|---|---|
-| `e2e` | Mock (no GPU, GitHub-hosted) | yes |
-| `e2e-gpu` | MI300X (self-hosted) | no |
-| `e2e-gpu-strix-ubuntu` | Strix Halo / Ubuntu (self-hosted) | no |
-| `e2e-gpu-strix-windows` | Strix Halo / Windows (self-hosted) | no |
+| Job | Workflow | Platform | Blocking |
+|---|---|---|---|
+| `e2e` | `ci.yml` | Mock (no GPU, GitHub-hosted) | yes |
+| `e2e-gpu` | `e2e-selfhosted.yml` | MI300X (self-hosted) | no |
+| `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo / Ubuntu (self-hosted) | no |
+| `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo / Windows (self-hosted) | no |
 
 The blocking mock job passes when every applicable scenario is pass-or-xfail with
-no XPASS or unexpected failure; the GPU jobs are non-blocking. The `e2e-report`
-job consolidates all platforms' results into one cross-platform report.
+no XPASS or unexpected failure; the GPU jobs are non-blocking. Each workflow has
+its own `e2e-report` job: `ci.yml`'s consolidates the mock platform, and
+`e2e-selfhosted.yml`'s consolidates the self-hosted platforms.
 
 The nightly workflow runs three non-blocking jobs — the existing MI300X job and
 new Strix Halo jobs on Ubuntu and Windows — with `E2E_INCLUDE_NIGHTLY=1`. The
@@ -141,23 +145,25 @@ shared large-model scenario serves `Qwen/Qwen3.6-27B` through vLLM on MI300X and
 the hardware-verified `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL` checkpoint
 through Lemonade on Strix Halo.
 
-Use the CI workflow dispatch to run either model independently on a ref:
+Use the self-hosted E2E workflow dispatch to run either model independently on a
+ref (the GPU platform / `include_nightly` / `name_filter` inputs live on
+`e2e-selfhosted.yml`, not `ci.yml`):
 
 ```bash
 # MI300X / vLLM / Qwen3.6-27B
-gh workflow run ci.yml --ref <ref> \
+gh workflow run e2e-selfhosted.yml --ref <ref> \
   -f platform=app-dev-gpu \
   -f include_nightly=true \
   -f name_filter='large platform-specific model'
 
 # Strix Halo Linux / Lemonade / Qwen3.6-35B-A3B-GGUF (UD-Q4_K_XL)
-gh workflow run ci.yml --ref <ref> \
+gh workflow run e2e-selfhosted.yml --ref <ref> \
   -f platform=strix-ubuntu \
   -f include_nightly=true \
   -f name_filter='large platform-specific model'
 
 # Strix Halo Windows / Lemonade / Qwen3.6-35B-A3B-GGUF (UD-Q4_K_XL)
-gh workflow run ci.yml --ref <ref> \
+gh workflow run e2e-selfhosted.yml --ref <ref> \
   -f platform=strix-windows \
   -f include_nightly=true \
   -f name_filter='large platform-specific model'

@@ -28,7 +28,7 @@ Feature: Release install lifecycle
     And the installer reports the shell profile updated
     And the installed rocm and rocmd binaries are present
     And the install manifest is present
-    And a minimal config is seeded with the lemonade default engine
+    And the seeded config does not pin a serving engine
     And the shell profile lists the install directory
 
   @id:lifecycle-linux-install-signed-pem @lifecycle @requires-os:linux

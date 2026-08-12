@@ -18,6 +18,7 @@ mod e2e {
     pub mod chat_steps;
     pub mod dash_steps;
     pub mod diagnose_steps;
+    pub mod engines_steps;
     pub mod examine_steps;
     pub mod lifecycle_steps;
     pub mod runtime_steps;
@@ -32,7 +33,6 @@ pub struct E2eWorld {
     pub mock: Option<MockServer>,
     pub endpoint: Option<String>,
     pub model_name: Option<String>,
-    pub discovered_model: Option<String>,
     pub chat_response: Option<serde_json::Value>,
     pub cli_output: Option<String>,
     pub cli_outputs: Option<Vec<String>>,
@@ -166,7 +166,6 @@ impl Default for E2eWorld {
             mock: None,
             endpoint: None,
             model_name: None,
-            discovered_model: None,
             chat_response: None,
             cli_output: None,
             cli_outputs: None,
@@ -661,43 +660,155 @@ fn inference_timeout_for(world: &E2eWorld) -> u64 {
     inference_timeout_secs().max(world.serve_timeout_override.unwrap_or(0))
 }
 
-pub async fn send_chat(world: &mut E2eWorld) {
-    let endpoint = world.endpoint.as_ref().expect("no endpoint configured");
+/// A transport failure spelled out well enough to triage from a CI log alone.
+///
+/// `reqwest::Error`'s `Display` prints only its KIND — a client timeout and a
+/// refused/reset connection both read as "error sending request for url (…)",
+/// with the real cause reachable only through `source()`. That ambiguity cost a
+/// full log archaeology once (a 10s client timeout that read as a dead server),
+/// so classify the error and unwind the source chain into the panic message.
+fn describe_request_error(error: &reqwest::Error) -> String {
+    use std::{error::Error as _, fmt::Write as _};
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(inference_timeout_for(world)))
-        .build()
-        .expect("failed to build HTTP client");
+    let kind = if error.is_timeout() {
+        " [client timeout — the harness gave up, the server may still be working]"
+    } else if error.is_connect() {
+        " [connect failure — nothing accepted the connection]"
+    } else {
+        ""
+    };
+    let mut detail = format!("{error}{kind}");
+    let mut source = error.source();
+    while let Some(cause) = source {
+        // Infallible: writing into a String never errors.
+        let _ = write!(detail, "\n  caused by: {cause}");
+        source = cause.source();
+    }
+    detail
+}
 
+/// Discover the served model id over `/models` and POST one chat completion to
+/// it, returning the decoded response. `tools` is merged into the request body
+/// for the tool-definitions scenario.
+///
+/// Retries once on a TRANSPORT failure of either request (the `send`, not the
+/// decode), and only for a scenario expected to PASS — the same rule the serve
+/// relaunch uses. A malformed reply is a server-contract violation rather than
+/// a flake, so it still fails on the spot. The FIRST inference after a serve
+/// pays a cold start (weights paged in on demand), and on a busy runner that
+/// has exceeded the flat inference timeout even though the steady-state request
+/// on the very same host takes ~1s: run 30614673685 (Strix-Windows) failed this
+/// at exactly 10.000s while the next scenario's chat answered in 1.4s. The
+/// aborted attempt still leaves the model resident, so the retry runs warm. A
+/// known-bug scenario keeps its single attempt so hang detection stays as
+/// prompt as `inference_timeout_secs` documents.
+pub async fn request_chat_completion(
+    world: &mut E2eWorld,
+    prompt: &str,
+    tools: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let endpoint = world.endpoint.clone().expect("no endpoint configured");
+    // Only the FIRST attempt gets this scenario's full (possibly `@serve-timeout`
+    // -inflated) budget; the retry is capped at the flat default. The retry's
+    // whole premise is that it runs WARM, so it has no use for headroom that
+    // exists solely to cover a cold first token — and granting it would let one
+    // step spend 2x2400s on the large-model nightly scenario and blow the job's
+    // 90-minute limit, losing the results of every scenario behind it. This is
+    // the same job-level protection the serve relaunch gets from its run-wide
+    // `relaunch_budget`, expressed as a per-attempt cap instead of a shared one.
+    let first_timeout_secs = inference_timeout_for(world);
+    let retry_timeout_secs = inference_timeout_secs();
+    let attempts = if world.expect_xfail { 1 } else { 2 };
     let models_url = format!("{endpoint}/models");
-    let resp: serde_json::Value = client
-        .get(&models_url)
-        .send()
-        .await
-        .unwrap_or_else(|e| panic!("GET {models_url} failed: {e}"))
-        .json()
-        .await
-        .unwrap_or_else(|e| panic!("GET {models_url} returned non-JSON: {e}"));
-    let model = resp["data"][0]["id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no model id in response: {resp}"))
-        .to_string();
-    world.discovered_model = Some(model.clone());
-
     let chat_url = format!("{endpoint}/chat/completions");
-    let chat_resp: serde_json::Value = client
-        .post(&chat_url)
-        .json(&serde_json::json!({
+    let mut diagnostics = Vec::new();
+
+    for attempt in 1..=attempts {
+        let timeout_secs = if attempt == 1 {
+            first_timeout_secs
+        } else {
+            retry_timeout_secs
+        };
+        // A fresh client per attempt: the pooled connection of a timed-out
+        // attempt is not worth reusing.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .expect("failed to build HTTP client");
+
+        let started = std::time::Instant::now();
+        let models = match client.get(&models_url).send().await {
+            Ok(response) => response,
+            // Fall through to the next attempt rather than panicking here: a
+            // panic would also throw away the diagnostics of the attempts
+            // already recorded, which is the whole point of collecting them.
+            Err(error) => {
+                diagnostics.push(format!(
+                    "attempt {attempt} (budget {timeout_secs}s): GET {models_url} failed after \
+                     {:.1}s: {}",
+                    started.elapsed().as_secs_f64(),
+                    describe_request_error(&error)
+                ));
+                continue;
+            }
+        };
+        let models: serde_json::Value = models
+            .json()
+            .await
+            .unwrap_or_else(|e| panic!("GET {models_url} returned non-JSON: {e}"));
+        let model = models["data"][0]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no model id in response: {models}"))
+            .to_string();
+
+        let mut body = serde_json::json!({
             "model": model,
-            "messages": [{"role": "user", "content": "Hello"}]
-        }))
-        .send()
-        .await
-        .unwrap_or_else(|e| panic!("POST {chat_url} failed: {e}"))
-        .json()
-        .await
-        .unwrap_or_else(|e| panic!("POST {chat_url} returned non-JSON: {e}"));
-    world.chat_response = Some(chat_resp);
+            "messages": [{"role": "user", "content": prompt}]
+        });
+        if let Some(tools) = tools.clone() {
+            body["tools"] = tools;
+        }
+
+        // Time the POST on its own: the discovery round trip ahead of it is
+        // cheap and constant, and mixing it in would blur the number that
+        // actually gets compared against the timeout.
+        let started = std::time::Instant::now();
+        match client.post(&chat_url).json(&body).send().await {
+            Ok(response) => {
+                // Say so when an earlier attempt failed. A rescued flake is
+                // otherwise invisible — the scenario just goes green — and then
+                // nobody can tell from the logs whether cold starts are getting
+                // slower until the retry stops being enough.
+                if !diagnostics.is_empty() {
+                    eprintln!(
+                        "chat request succeeded on attempt {attempt} of {attempts} after an \
+                         earlier failure:\n{}",
+                        diagnostics.join("\n")
+                    );
+                }
+                return response
+                    .json()
+                    .await
+                    .unwrap_or_else(|e| panic!("POST {chat_url} returned non-JSON: {e}"));
+            }
+            Err(error) => diagnostics.push(format!(
+                "attempt {attempt} (budget {timeout_secs}s): POST {chat_url} failed after {:.1}s: \
+                 {}",
+                started.elapsed().as_secs_f64(),
+                describe_request_error(&error)
+            )),
+        }
+    }
+
+    panic!(
+        "chat request failed after {attempts} attempt(s):\n{}",
+        diagnostics.join("\n")
+    );
+}
+
+pub async fn send_chat(world: &mut E2eWorld) {
+    let response = request_chat_completion(world, "Hello", None).await;
+    world.chat_response = Some(response);
 }
 
 // ── Runner ─────────────────────────────────────────────────────────
@@ -753,6 +864,10 @@ async fn main() {
     // either its CLI filter OR this closure, so CLI selection would bypass OS,
     // nightly/lifecycle, ID, and expectation resolution entirely.
     let only_lifecycle = std::env::var_os("E2E_ONLY_LIFECYCLE").is_some_and(|v| v == "1");
+    // Heavy `@merge-queue` serves run only in the merge queue (a cheaper
+    // per-engine canary covers them on the PR fast path); set by ci.yml on the
+    // `merge_group` event.
+    let include_merge_queue = std::env::var_os("E2E_MERGE_QUEUE").is_some_and(|v| v == "1");
     eprintln!(
         "Host capability: platform={} os={} gpu={} effective_engine={}",
         cap.platform_slug, cap.os_family, cap.has_amd_gpu, cap.effective_serve_engine,
@@ -821,7 +936,14 @@ async fn main() {
         .filter_run(concat!(env!("CARGO_MANIFEST_DIR"), "/features/"), {
             move |_feature, _rule, scenario| {
                 let decl = ScenarioDecl::from_tags(&scenario.tags);
-                let expectation = resolve(&decl, cap, matrix, include_nightly, include_lifecycle);
+                let expectation = resolve(
+                    &decl,
+                    cap,
+                    matrix,
+                    include_nightly,
+                    include_lifecycle,
+                    include_merge_queue,
+                );
                 let run = (!only_lifecycle || decl.lifecycle)
                     && !matches!(expectation, Expectation::Skip { .. });
                 if let Some(id) = &decl.id {

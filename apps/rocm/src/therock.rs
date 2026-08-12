@@ -5,7 +5,7 @@
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_gpu_diagnostics,
-    detect_host_therock_family, detect_managed_therock_family, ensure_uv_binary,
+    detect_host_therock_family, detect_managed_therock_family, disk_space, ensure_uv_binary,
     known_therock_families, managed_tools_dir, normalize_runtime_path_for_host,
     normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
     normalize_runtime_path_text_for_storage, normalize_therock_family, runtime_is_windows,
@@ -32,6 +32,14 @@ const THEROCK_NIGHTLY_TARBALL_BASE: &str = "https://rocm.nightlies.amd.com/tarba
 const DEFAULT_MANAGED_PYTHON_VERSION: &str = "3.12";
 const STARTUP_UPDATE_CHECK_INTERVAL_MS: u128 = 12 * 60 * 60 * 1_000;
 const STARTUP_UPDATE_CHECK_TIMEOUT_SECS: u64 = 2;
+/// Timeout for the best-effort HEAD probe that sizes a download before starting it.
+const THEROCK_HEAD_PROBE_TIMEOUT_SECS: u64 = 10;
+/// Largest `Content-Length` accepted as a real SDK tarball size.
+///
+/// SDK tarballs are single-digit gigabytes; anything past this is a
+/// misconfigured proxy or a hostile header rather than a real artifact, and
+/// must not be allowed to refuse an install on its own authority.
+const THEROCK_MAX_PLAUSIBLE_TARBALL_BYTES: u64 = 256 * 1024 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TheRockChannel {
     Release,
@@ -1059,8 +1067,12 @@ fn install_tarball_runtime(
         );
     }
 
+    if let Some(warning) = preflight_tarball_space(&artifact.url, &cache_path, &install_root)? {
+        let _ = writeln!(output, "  {warning}");
+    }
+
     download_file(&artifact.url, &cache_path)?;
-    extract_tarball(&cache_path, &install_root)?;
+    extract_tarball_and_discard_archive(&cache_path, &install_root)?;
 
     let manifest = InstalledRuntimeManifest {
         runtime_key: runtime_key.clone(),
@@ -2084,7 +2096,80 @@ fn download_file(url: &str, destination: &Path) -> Result<()> {
     if response.status != 200 {
         bail!("HTTP {} while fetching {url}", response.status);
     }
+    // The body is already buffered, so this requirement is exact: refuse before
+    // writing rather than leaving a truncated file behind on a full disk.
+    disk_space::ensure_space_for(
+        &format!("save the download from {url}"),
+        destination,
+        disk_space::with_margin(response.body.len() as u64),
+    )?;
     write_file_atomically(destination, &response.body)
+}
+
+/// Content length of `url` from a HEAD request, when the server reports one.
+///
+/// Best effort: any failure yields `None`, so a server that rejects HEAD or
+/// omits `Content-Length` simply skips the preflight instead of blocking the
+/// install.
+fn head_content_length(url: &str) -> Option<u64> {
+    let timeout = Duration::from_secs(THEROCK_HEAD_PROBE_TIMEOUT_SECS);
+    let agent = ureq::AgentBuilder::new()
+        // `timeout_connect` takes precedence over `timeout` and defaults to 30s,
+        // so without it a host that blackholes rather than refuses would stall
+        // the probe well past the intended ceiling.
+        .timeout_connect(timeout)
+        .timeout(timeout)
+        .build();
+    let response = agent.head(url).set("User-Agent", "rocm-cli").call().ok()?;
+    if response.status() != 200 {
+        return None;
+    }
+    let length: u64 = response.header("Content-Length")?.trim().parse().ok()?;
+    // The header is unauthenticated and is never cross-checked against the body
+    // the subsequent GET delivers, so an inflated value from a proxy or CDN
+    // would refuse an install that would in fact succeed. Treat an implausible
+    // size as no answer at all: the preflight is skipped and `download_file`
+    // still checks the real, buffered body length before writing.
+    (length <= THEROCK_MAX_PLAUSIBLE_TARBALL_BYTES).then_some(length)
+}
+
+/// Refuse (or warn) before a multi-GB SDK tarball download and extraction.
+///
+/// The download requirement comes from `Content-Length` and is exact, so a
+/// shortfall is a hard error — it saves the user a long download that cannot
+/// possibly succeed. The extraction requirement is only an estimate (see
+/// [`disk_space::EXTRACTED_SIZE_MULTIPLIER`]), so a shortfall there is a
+/// warning: a false refusal that blocks a valid install would be worse than a
+/// late failure.
+///
+/// Any extraction warning is returned rather than printed, so the caller can
+/// place it in the same accumulated output block as the rest of the install
+/// report instead of having it appear ahead of that block.
+fn preflight_tarball_space(
+    url: &str,
+    cache_path: &Path,
+    install_root: &Path,
+) -> Result<Option<String>> {
+    let Some(download_bytes) = head_content_length(url) else {
+        return Ok(None);
+    };
+    disk_space::ensure_space_for(
+        "download the SDK tarball",
+        cache_path,
+        disk_space::with_margin(download_bytes),
+    )?;
+
+    // When the cache and the install root share a filesystem, the archive and
+    // the extracted tree must both fit at the same time.
+    let mut extract_estimate = disk_space::estimated_extracted_size(download_bytes);
+    if disk_space::on_same_filesystem(cache_path, install_root) == Some(true) {
+        extract_estimate = extract_estimate.saturating_add(download_bytes);
+    }
+    Ok(disk_space::warn_if_low_space(
+        "extract the SDK tarball",
+        install_root,
+        disk_space::with_margin(extract_estimate),
+    ))
 }
 
 fn http_get(
@@ -2192,7 +2277,7 @@ fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
         let mut file = fs::File::create(&tmp)
             .with_context(|| format!("failed to create {}", tmp.display()))?;
         file.write_all(bytes)
-            .with_context(|| format!("failed to write {}", tmp.display()))?;
+            .map_err(|error| disk_space::map_write_error(error, &tmp))?;
     }
     fs::rename(&tmp, path).or_else(|_| {
         let _ = fs::remove_file(path);
@@ -2212,6 +2297,33 @@ fn extract_tarball(archive_path: &Path, target_dir: &Path) -> Result<()> {
         ],
         "extract TheRock tarball artifact",
     )
+    .map_err(|error| {
+        // The extraction preflight only warns, because the extracted size is an
+        // estimate. When that warning turns out to be right, the failure arrives
+        // as `tar` stderr rather than an `io::Error`, so it never reaches
+        // `map_write_error` — without this the user gets the raw
+        // "tar: ...: No space left on device" this feature exists to replace.
+        disk_space::subprocess_full_disk_error(&format!("{error:#}"), target_dir).unwrap_or(error)
+    })
+}
+
+/// Unpack the SDK archive and then delete it.
+///
+/// Only the extracted tree is used from here on, so keeping the archive would
+/// double the disk cost of every installed version. This mirrors the cleanup
+/// `ensure_uv_binary` already performs after unpacking its own download.
+///
+/// Removing the archive is best-effort: the install has already succeeded by
+/// this point, so a cleanup failure is reported rather than raised.
+fn extract_tarball_and_discard_archive(archive_path: &Path, target_dir: &Path) -> Result<()> {
+    extract_tarball(archive_path, target_dir)?;
+    if let Err(error) = fs::remove_file(archive_path) {
+        progress_line(format!(
+            "Could not remove the downloaded archive {}: {error}",
+            archive_path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_uv_venv(uv: &Path, python_launcher: &Path, install_root: &Path) -> Result<()> {
@@ -3185,6 +3297,50 @@ mod tests {
     static PYTHON_RESOLVER_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn tarball_space_preflight_skips_when_the_download_size_is_unknown() {
+        // No HEAD response (unroutable host) must not block an install.
+        let temp = std::env::temp_dir();
+        let warning = preflight_tarball_space("http://127.0.0.1:1/rocm.tar.gz", &temp, &temp)
+            .expect("an unknown download size must not fail the preflight");
+        assert_eq!(
+            warning, None,
+            "an unknown download size must not produce an extraction warning either"
+        );
+    }
+
+    #[test]
+    fn download_space_requirement_includes_the_safety_margin() {
+        let archive = 2 * 1024 * 1024 * 1024;
+        assert_eq!(
+            disk_space::with_margin(archive),
+            archive + archive / disk_space::SPACE_MARGIN_DIVISOR
+        );
+        assert!(disk_space::with_margin(archive) > archive);
+    }
+
+    #[test]
+    fn extraction_estimate_exceeds_the_compressed_archive() {
+        let archive = 3 * 1024 * 1024 * 1024;
+        let estimate = disk_space::estimated_extracted_size(archive);
+        assert!(
+            estimate > archive,
+            "extraction must reserve headroom beyond the archive: {estimate} vs {archive}"
+        );
+        assert_eq!(estimate, archive * disk_space::EXTRACTED_SIZE_MULTIPLIER);
+    }
+
+    #[test]
+    fn write_file_atomically_reports_a_full_disk_clearly() {
+        // Exercise the mapping the write path uses, without filling a disk.
+        let error = disk_space::map_write_error(
+            std::io::Error::from(std::io::ErrorKind::StorageFull),
+            Path::new("/cache/rocm.tar.gz.tmp"),
+        );
+        let text = format!("{error:#}");
+        assert!(text.contains("ran out of disk space"), "{text}");
+    }
+
+    #[test]
     fn normalize_therock_family_maps_gfx1103_to_gfx110x_all() {
         assert_eq!(
             normalize_therock_family("gfx1103"),
@@ -3242,6 +3398,50 @@ mod tests {
                 "torchaudio==2.10.0+rocm7.13.0a20260513".to_owned(),
             ]
         );
+    }
+
+    /// The downloaded archive is removed once it has been unpacked; keeping it
+    /// would double the disk cost of every installed SDK version.
+    #[test]
+    fn extracting_the_sdk_archive_removes_it() -> Result<()> {
+        let (root, _paths) = test_paths("discard-archive");
+        let cache = root.join("cache");
+        let payload_dir = root.join("payload");
+        fs::create_dir_all(&cache)?;
+        fs::create_dir_all(&payload_dir)?;
+        fs::write(payload_dir.join("marker.txt"), b"sdk")?;
+
+        let archive = cache.join("therock-sdk.tar.gz");
+        let tar = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&payload_dir)
+            .arg("marker.txt")
+            .status()?;
+        if !tar.success() {
+            eprintln!("skipping: tar unavailable on this host");
+            let _ = fs::remove_dir_all(&root);
+            return Ok(());
+        }
+        assert!(archive.is_file(), "archive fixture should exist");
+
+        let target = root.join("install");
+        fs::create_dir_all(&target)?;
+        extract_tarball_and_discard_archive(&archive, &target)?;
+
+        assert!(
+            target.join("marker.txt").is_file(),
+            "the archive contents should have been extracted"
+        );
+        assert!(
+            !archive.exists(),
+            "the archive should be removed once unpacked, found {}",
+            archive.display()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]

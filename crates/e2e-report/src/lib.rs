@@ -414,6 +414,12 @@ fn parse_descriptor(name: &str) -> Descriptor {
         "gpu" => ("MI300X", "Linux"),
         "gpu-strix-ubuntu" => ("Strix Halo", "Ubuntu"),
         "gpu-strix-windows" => ("Strix Halo", "Windows"),
+        // `e2e-unknown-report`: a report whose platform.json sidecar was missing
+        // or unrecognized (e.g. a GPU run that errored before writing it). The OS
+        // is genuinely unknown here — a Windows GPU run that erupted early must NOT
+        // be reported as Linux — so render Unknown / Unknown rather than defaulting
+        // OS to Linux the way `fallback_descriptor` does for a titlecased platform.
+        "unknown" => ("Unknown", "Unknown"),
         other => return fallback_descriptor(other, known_bugs),
     };
 
@@ -1997,6 +2003,34 @@ mod tests {
         s.add("pending", 0);
         assert_eq!(s.failed, 4);
         assert_eq!(s.passed, 0);
+    }
+
+    #[test]
+    fn parse_descriptor_maps_known_artifacts() {
+        for (name, platform, os) in [
+            ("e2e-report", "Mock", "Linux"),
+            ("e2e-gpu-report", "MI300X", "Linux"),
+            ("e2e-gpu-strix-ubuntu-report", "Strix Halo", "Ubuntu"),
+            ("e2e-gpu-strix-windows-report", "Strix Halo", "Windows"),
+        ] {
+            let d = parse_descriptor(name);
+            assert_eq!(
+                (d.platform.as_str(), d.os.as_str()),
+                (platform, os),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_descriptor_unknown_is_not_falsely_linux() {
+        // A report whose platform.json was missing (e.g. a GPU run that errored
+        // before writing the sidecar) is labeled `e2e-unknown-report`. Its OS is
+        // genuinely unknown — a Windows GPU run must NOT be reported as Linux — so
+        // both platform AND os render "Unknown", never a default "Linux".
+        let d = parse_descriptor("e2e-unknown-report");
+        assert_eq!(d.platform, "Unknown");
+        assert_eq!(d.os, "Unknown");
     }
 
     #[test]

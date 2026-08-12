@@ -45,6 +45,15 @@ semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = { version = "0.10", features = ["oid"] }
+# `linux-tmpfs` makes tmpfs mounts visible to the free-space preflight, so a
+# cache or install root under a tmpfs `/tmp` (the Fedora and Arch default)
+# reports its real size instead of being invisible. `linux-netdevs` is
+# deliberately left off: it would also enumerate NFS and CIFS mounts, but
+# `statvfs` on a hard-mounted share can block indefinitely, which is not an
+# acceptable cost for a preflight check. Unlisted mounts are detected by the
+# device-ID cross-check in `rocm-core::disk_space` and reported as unknown,
+# which never blocks an install.
+sysinfo = { version = "0.34", features = ["linux-tmpfs"] }
 tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
 [workspace.lints.rust]

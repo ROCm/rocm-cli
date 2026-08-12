@@ -386,11 +386,27 @@ const fn current_os() -> &'static str {
     }
 }
 
+/// Whether `value` is a `rocm diagnose` ranking position (`#2`, or a bare `2`)
+/// rather than a fix-id.
+///
+/// Used only to turn an unknown-id refusal into a corrective one; it never
+/// selects a fix, because a position is meaningful only within the report that
+/// produced it and `fix` has no memory of that report.
+fn looks_like_a_diagnosis_position(value: &str) -> bool {
+    let trimmed = value.trim();
+    let digits = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+}
+
 /// List every fix-id (id, kind, OS scope, title).
 #[must_use]
 pub fn list_recipes() -> String {
     use std::fmt::Write as _;
     let mut out = String::from("Available fix-ids (mirror the diagnosis catalog):\n");
+    // The markers were printed with nothing saying what they mean.
+    out.push_str(
+        "  AUTO = `rocm fix <id>` can carry it out; PRINT-ONLY = it prints the steps for you to run.\n",
+    );
     for r in RECIPES {
         let kind = if r.auto_applicable {
             "AUTO"
@@ -446,7 +462,20 @@ fn print_recipe(r: &FixRecipe) {
 pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
     let Some(recipe) = find_recipe(fix_id) else {
         eprintln!("Unknown fix-id: {fix_id}");
-        eprintln!("Run `rocm diagnose` to see which fix-id applies.");
+        if looks_like_a_diagnosis_position(fix_id) {
+            // `rocm diagnose` ranks findings `#1`, `#2`, and users reach for that
+            // number here. It is a position in one report, not a name -- and it
+            // does not line up with the catalog's `fix-1 … fix-15` either, so a
+            // bare "unknown id" left them with nothing to correct.
+            eprintln!(
+                "`{fix_id}` looks like a position in a `rocm diagnose` report, not a fix-id."
+            );
+            eprintln!(
+                "Use the `id:` shown against that cause — `rocm diagnose` prints an `apply with:` line you can copy."
+            );
+        } else {
+            eprintln!("Run `rocm diagnose` to see which fix-id applies.");
+        }
         return 2;
     };
     print_recipe(recipe);
@@ -1071,5 +1100,51 @@ mod tests {
             "reinstall command must actually install (bare 'rocm install driver' is a non-mutating preflight no-op): {commands}"
         );
         assert!(recipe.verify.contains("repo-native"));
+    }
+
+    #[test]
+    fn listing_explains_its_applicability_markers() {
+        // The markers were emitted with nothing saying what they mean, leaving
+        // the reader to guess whether PRINT-ONLY was a debug flag.
+        let listing = list_recipes();
+        assert!(
+            listing.contains("AUTO =") && listing.contains("PRINT-ONLY ="),
+            "the listing must explain its markers:\n{listing}"
+        );
+    }
+
+    #[test]
+    fn diagnosis_positions_are_recognised_as_positions() {
+        // What `rocm diagnose` shows as `#1`/`#2`, plus the bare number a user
+        // might type instead.
+        for value in ["#1", "#2", "1", "12", " #3 "] {
+            assert!(
+                looks_like_a_diagnosis_position(value),
+                "{value} should read as a ranking position"
+            );
+        }
+        // Real ids and other typos must keep the generic refusal — claiming a
+        // fix-id is a "position" would be worse than saying nothing.
+        for value in [
+            "fix-4-render-group",
+            "fix-1-arch",
+            "bogus",
+            "#",
+            "",
+            "fix-#1",
+        ] {
+            assert!(
+                !looks_like_a_diagnosis_position(value),
+                "{value} should NOT read as a ranking position"
+            );
+        }
+    }
+
+    #[test]
+    fn a_position_argument_is_refused_with_the_same_exit_code() {
+        // Still 2: this is clearer wording on an existing refusal, not a new
+        // behaviour that a script could start depending on.
+        assert_eq!(apply("#1", &FixOptions::default()), 2);
+        assert_eq!(apply("bogus", &FixOptions::default()), 2);
     }
 }

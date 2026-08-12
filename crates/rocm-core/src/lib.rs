@@ -27,6 +27,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 pub mod diagnose;
+pub mod disk_space;
 pub mod examine;
 pub mod fix;
 pub mod openmpi;
@@ -36,6 +37,11 @@ pub mod uv;
 pub use diagnose::{
     DiagnoseReport, Diagnosis, Fix, diagnose as run_diagnose,
     render_report_text as render_diagnose_text,
+};
+pub use disk_space::{
+    SpaceCheck, available_space_for_path, check_space_for_path, ensure_space_for,
+    estimated_extracted_size, format_bytes, insufficient_space_message, map_write_error,
+    mount_for_path, on_same_filesystem, warn_if_low_space, with_margin,
 };
 pub use examine::{Examination, FrameworkProbe, WSL_ROUTE_OUT_NOTE};
 pub use fix::{FixOptions, apply as apply_fix, list_recipes as list_fix_recipes};
@@ -49,18 +55,19 @@ use runtime::home_rocm_dir;
 pub use runtime::{
     RuntimeHost, RuntimePlatform, current_executable_path, default_cache_dir, default_config_dir,
     default_data_dir, default_interactive_shell_program, managed_logs_dir, managed_pip_cache_dir,
-    managed_runtime_cache_dir, managed_tools_dir, normalize_runtime_path_for_host,
-    normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
-    normalize_runtime_path_text_for_platform, normalize_runtime_path_text_for_storage,
-    platform_binary_name, prepend_runtime_path, runtime_directory_label,
-    runtime_drive_root_for_key, runtime_drive_roots, runtime_exe_suffix, runtime_home_dir,
-    runtime_install_root_is_protected, runtime_is_linux, runtime_is_windows, runtime_os_name,
-    runtime_path_for_child, runtime_path_for_windows_child, runtime_path_is_same_or_inside,
-    runtime_path_list_join, runtime_path_list_split, runtime_path_sort_key,
-    runtime_path_text_is_absolute_for_host, runtime_path_text_is_absolute_for_platform,
-    runtime_paths_equivalent, runtime_python_activation_hint, runtime_python_activation_script,
-    runtime_python_bin_dir_name, runtime_python_env_bin_dir, runtime_python_executable_in_env,
-    runtime_python_executable_name, runtime_rocm_library_filename, shell_command_for_host,
+    managed_runtime_cache_dir, managed_runtime_data_root, managed_tools_dir,
+    normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
+    normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_platform,
+    normalize_runtime_path_text_for_storage, platform_binary_name, prepend_runtime_path,
+    runtime_directory_label, runtime_drive_root_for_key, runtime_drive_roots, runtime_exe_suffix,
+    runtime_home_dir, runtime_install_root_is_protected, runtime_is_linux, runtime_is_windows,
+    runtime_os_name, runtime_path_for_child, runtime_path_for_windows_child,
+    runtime_path_is_same_or_inside, runtime_path_list_join, runtime_path_list_split,
+    runtime_path_sort_key, runtime_path_text_is_absolute_for_host,
+    runtime_path_text_is_absolute_for_platform, runtime_paths_equivalent,
+    runtime_python_activation_hint, runtime_python_activation_script, runtime_python_bin_dir_name,
+    runtime_python_env_bin_dir, runtime_python_executable_in_env, runtime_python_executable_name,
+    runtime_rocm_library_filename, shell_command_for_host,
 };
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, ensure_uv_binary, uv_binary_name, uv_command_env,
@@ -124,11 +131,23 @@ pub fn download_file_to_path(url: &str, destination: &Path, timeout: Duration) -
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
+    // Free-space preflight: `Content-Length` is an exact size where the server
+    // sends it, so refuse upfront rather than failing partway through the write.
+    if let Some(content_length) = response
+        .header("Content-Length")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        disk_space::ensure_space_for(
+            &format!("download {url}"),
+            destination,
+            disk_space::with_margin(content_length),
+        )?;
+    }
     let mut reader = response.into_reader();
     let mut file = fs::File::create(destination)
         .with_context(|| format!("failed to create {}", destination.display()))?;
     std::io::copy(&mut reader, &mut file)
-        .with_context(|| format!("failed to write {}", destination.display()))?;
+        .map_err(|error| disk_space::map_write_error(error, destination))?;
     Ok(())
 }
 
@@ -147,6 +166,7 @@ pub fn http_get_text_with_auth(
     endpoint_api_key: Option<&str>,
     timeout: Duration,
 ) -> Result<String> {
+    let deadline = Instant::now() + timeout;
     let (host, port) = parse_http_endpoint(endpoint_url)
         .with_context(|| format!("unsupported endpoint URL `{endpoint_url}`"))?;
     let mut stream = connect_tcp_stream(&host, port, timeout)?;
@@ -160,7 +180,7 @@ pub fn http_get_text_with_auth(
     );
     write_all_tcp_stream(&mut stream, request.as_bytes())
         .with_context(|| format!("failed to write HTTP GET {path}"))?;
-    let response = read_tcp_stream_to_string(&mut stream)
+    let response = read_http_response_bounded(&mut stream, deadline)
         .with_context(|| format!("failed to read HTTP GET {path}"))?;
     let (headers, body) = response
         .split_once("\r\n\r\n")
@@ -170,6 +190,230 @@ pub fn http_get_text_with_auth(
         bail!("HTTP endpoint returned {status_line}");
     }
     Ok(body.to_owned())
+}
+
+/// POST a JSON body and return the response status line plus body.
+///
+/// The POST sibling of [`http_get_text_with_auth`]. Unlike the GET helper this
+/// does not treat a non-200 as an error: callers that probe an endpoint need to
+/// tell "the server answered, with a refusal" apart from "the server never
+/// answered", and only the former proves the request path is alive.
+pub fn http_post_json_with_auth(
+    endpoint_url: &str,
+    path: &str,
+    body: &serde_json::Value,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<HttpResponseParts> {
+    let deadline = Instant::now() + timeout;
+    let (host, port) = parse_http_endpoint(endpoint_url)
+        .with_context(|| format!("unsupported endpoint URL `{endpoint_url}`"))?;
+    let mut stream = connect_tcp_stream(&host, port, timeout)?;
+    let host_header = format_host_port(&host, port);
+    let auth_header = match endpoint_api_key {
+        Some(key) => format!("Authorization: Bearer {key}\r\n"),
+        None => String::new(),
+    };
+    let payload = serde_json::to_string(body).context("failed to serialize HTTP JSON body")?;
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\n{auth_header}Connection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    write_all_tcp_stream(&mut stream, request.as_bytes())
+        .with_context(|| format!("failed to write HTTP POST {path}"))?;
+    let response = read_http_response_bounded(&mut stream, deadline)
+        .with_context(|| format!("failed to read HTTP POST {path}"))?;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .context("HTTP response was missing a body")?;
+    let status_line = headers.lines().next().unwrap_or_default();
+    let status = http_status_code(status_line)
+        .with_context(|| format!("unparsable HTTP status line `{status_line}`"))?;
+    Ok(HttpResponseParts {
+        status,
+        body: body.to_owned(),
+    })
+}
+
+/// Budget for the single-token chat request that proves a service can serve.
+///
+/// Generously longer than a model-listing timeout: the probe is a real inference
+/// request, and a first request against a freshly loaded model pays for prompt
+/// processing before it answers.
+pub const INFERENCE_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Engine state-file key recording when inference was first confirmed.
+///
+/// Written by the engine healthchecks and adopted by
+/// [`ManagedServiceRecord::refresh_from_engine_state`], so the CLI side does not
+/// re-probe what an engine already verified.
+pub const INFERENCE_VERIFIED_STATE_KEY: &str = "inference_verified_at_unix_ms";
+
+/// Engine state-file key recording the last inference probe attempt.
+pub const INFERENCE_PROBE_ATTEMPTED_STATE_KEY: &str = "inference_probe_attempted_at_unix_ms";
+
+/// Minimum gap between inference probes against a service that is still loading.
+///
+/// Only a *successful* probe latches, so without this a warming model would be
+/// re-probed by every readiness poll — and each attempt costs up to
+/// [`INFERENCE_PROBE_TIMEOUT`], which is the whole poll's latency. The
+/// supervisor ticks every few seconds and `services list` sits in front of a
+/// user, so the unthrottled cost lands exactly where it is most visible. The
+/// price of throttling is that readiness can be noticed up to this late.
+pub const INFERENCE_PROBE_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Merge `patch`'s top-level keys into the JSON object stored at `path`.
+///
+/// Creates the file (and its parent) when absent, and replaces a non-object
+/// document rather than failing — the caller is recording a fact about a live
+/// service, not validating an existing file.
+pub fn merge_json_state_file(path: &Path, patch: &serde_json::Value) -> Result<()> {
+    let mut value = fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !value.is_object() {
+        value = serde_json::json!({});
+    }
+    let object = value.as_object_mut().expect("object checked above");
+    if let Some(patch) = patch.as_object() {
+        for (key, patch_value) in patch {
+            object.insert(key.clone(), patch_value.clone());
+        }
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&value).context("failed to serialize service state")?,
+    )
+    .with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// Whether inference has been confirmed for a service, from its engine state
+/// file — probing at most once, and at most once per
+/// [`INFERENCE_PROBE_RETRY_INTERVAL`] while it is still loading.
+///
+/// Shared by the engine adapters so the latch and backoff bookkeeping has one
+/// implementation: the engines differ in how they decide a model is *listed*,
+/// but not in what confirming inference means.
+///
+/// The attempt is recorded before the probe runs, so a caller killed mid-probe
+/// still leaves the throttle in place instead of freeing the next poll to spend
+/// another full timeout.
+pub fn engine_state_inference_verified(
+    state_path: &Path,
+    state: Option<&serde_json::Value>,
+    endpoint_url: &str,
+    model_ref: &str,
+    endpoint_api_key: Option<&str>,
+) -> bool {
+    let state_u64 = |key: &str| {
+        state
+            .and_then(|value| value.get(key))
+            .and_then(serde_json::Value::as_u64)
+    };
+    if state_u64(INFERENCE_VERIFIED_STATE_KEY).is_some() {
+        return true;
+    }
+    if model_ref.trim().is_empty() {
+        return false;
+    }
+    let now = unix_time_millis() as u64;
+    if let Some(attempted_at) = state_u64(INFERENCE_PROBE_ATTEMPTED_STATE_KEY)
+        && now.saturating_sub(attempted_at) < INFERENCE_PROBE_RETRY_INTERVAL.as_millis() as u64
+    {
+        return false;
+    }
+    let _ = merge_json_state_file(
+        state_path,
+        &serde_json::json!({ INFERENCE_PROBE_ATTEMPTED_STATE_KEY: now }),
+    );
+    if !openai_chat_completion_probe(
+        endpoint_url,
+        model_ref,
+        endpoint_api_key,
+        INFERENCE_PROBE_TIMEOUT,
+    )
+    .unwrap_or(false)
+    {
+        return false;
+    }
+    let _ = merge_json_state_file(
+        state_path,
+        &serde_json::json!({ INFERENCE_VERIFIED_STATE_KEY: unix_time_millis() as u64 }),
+    );
+    true
+}
+
+/// The parts of an HTTP response a probe needs: the status code and the body.
+#[derive(Debug, Clone)]
+pub struct HttpResponseParts {
+    pub status: u16,
+    pub body: String,
+}
+
+fn http_status_code(status_line: &str) -> Option<u16> {
+    status_line.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Ask the endpoint for a single token and report whether it answered.
+///
+/// This is the readiness signal that `/v1/models` cannot give: an engine lists a
+/// model as soon as it accepts the name, which can be minutes before the weights
+/// are resident and the first chat request stops hanging.
+///
+/// "Answered" means a complete HTTP response with a status below 500, not a
+/// successful generation. A `4xx` still proves the inference path is up and the
+/// model is loaded — the request was understood and refused on its merits — while
+/// the failure this guards against is a hang, a dropped connection, or the `5xx`
+/// an engine returns while it is still warming up. Insisting on `200` with
+/// non-empty content would also wrongly fail a reasoning model, which can spend
+/// its whole (tiny) token budget before emitting any content.
+///
+/// The rule does mean a `404` reads as serving. That is harmless for the engines
+/// shipped today — both implement `/v1/chat/completions`, and a wrong key fails
+/// the model listing that gates this call — but an engine that does not expose an
+/// OpenAI-shaped chat route would need a different signal rather than this one.
+pub fn openai_chat_completion_probe(
+    endpoint_url: &str,
+    model_ref: &str,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<bool> {
+    let status = openai_chat_completion_status(endpoint_url, model_ref, endpoint_api_key, timeout)?;
+    Ok(status < 500)
+}
+
+/// Send the smallest possible chat request and return the HTTP status.
+///
+/// Callers pick their own bar. Readiness ([`openai_chat_completion_probe`]) only
+/// needs to know the inference path answers at all, while a post-load smoke test
+/// wants a real `200` — there, a `4xx` means the model that came up is not the
+/// one that was asked for, which is a failure worth surfacing rather than
+/// tolerating.
+pub fn openai_chat_completion_status(
+    endpoint_url: &str,
+    model_ref: &str,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<u16> {
+    let body = serde_json::json!({
+        "model": model_ref,
+        "messages": [{"role": "user", "content": "Say ok."}],
+        "max_tokens": 2,
+        "stream": false,
+    });
+    let response = http_post_json_with_auth(
+        endpoint_url,
+        "/v1/chat/completions",
+        &body,
+        endpoint_api_key,
+        timeout,
+    )?;
+    Ok(response.status)
 }
 
 pub fn openai_models_endpoint_has_model(
@@ -209,6 +453,96 @@ pub fn managed_service_endpoint_model_ready(
         None
     };
     openai_models_endpoint_has_model(&record.endpoint_url, expected, endpoint_api_key, timeout)
+}
+
+/// How far along a managed service's endpoint is.
+///
+/// The middle state is the one that matters: an engine lists a model within
+/// seconds of accepting its name, while the weights can take minutes to become
+/// usable. Callers must not treat `Listing` as ready — nor as dead, since the
+/// service is coming up normally and restarting it would start the wait over.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum EndpointReadiness {
+    /// Not answering at all: wrong port, process gone, or nothing bound yet.
+    Unreachable,
+    /// Answering and advertising the model, but inference has not come back.
+    Listing,
+    /// A real inference request has succeeded.
+    Serving,
+}
+
+/// The result of a readiness check, plus whether it left the record dirty.
+#[derive(Debug, Clone, Copy)]
+pub struct EndpointReadinessOutcome {
+    pub readiness: EndpointReadiness,
+    /// The check updated the record's probe bookkeeping. Persist it with
+    /// [`ManagedServiceRecord::write`] — the throttle in
+    /// [`managed_service_endpoint_readiness`] only works if the attempt survives
+    /// the process, since each CLI invocation starts fresh.
+    pub record_changed: bool,
+}
+
+/// How far along the service's endpoint is, probing inference at most once.
+///
+/// Stronger than [`managed_service_endpoint_model_ready`], which only asks
+/// whether the endpoint lists the model. A service reaches [`Serving`] once a
+/// real inference request has come back, and that verdict is **latched** into
+/// `record.inference_verified_at_unix_ms`: readiness is polled repeatedly (by
+/// `services list`, the dash, and the supervisor), and re-probing on every poll
+/// would queue a generation request behind the user's own traffic. The trade-off
+/// is that a service which degrades after start still reports ready — the same
+/// as before this check existed.
+///
+/// A *failed* probe cannot latch, so those are throttled instead: a still-loading
+/// service is re-probed at most once per [`INFERENCE_PROBE_RETRY_INTERVAL`],
+/// which keeps a warming model from costing every caller a full
+/// `probe_timeout`.
+///
+/// Mutates `record` when it probes; persist it when `record_changed` is set.
+///
+/// [`Serving`]: EndpointReadiness::Serving
+pub fn managed_service_endpoint_readiness(
+    record: &mut ManagedServiceRecord,
+    endpoint_api_key: Option<&str>,
+    listing_timeout: Duration,
+    probe_timeout: Duration,
+) -> EndpointReadinessOutcome {
+    let outcome = |readiness, record_changed| EndpointReadinessOutcome {
+        readiness,
+        record_changed,
+    };
+    let listed = managed_service_endpoint_model_ready(record, endpoint_api_key, listing_timeout)
+        .unwrap_or(false);
+    if !listed {
+        return outcome(EndpointReadiness::Unreachable, false);
+    }
+    if record.inference_verified_at_unix_ms.is_some() {
+        return outcome(EndpointReadiness::Serving, false);
+    }
+    let now = unix_time_millis() as u64;
+    if let Some(attempted_at) = record.inference_probe_attempted_at_unix_ms
+        && now.saturating_sub(attempted_at) < INFERENCE_PROBE_RETRY_INTERVAL.as_millis() as u64
+    {
+        return outcome(EndpointReadiness::Listing, false);
+    }
+    let model_ref = if record.canonical_model_id.trim().is_empty() {
+        record.model_ref.as_str()
+    } else {
+        record.canonical_model_id.as_str()
+    };
+    record.inference_probe_attempted_at_unix_ms = Some(now);
+    if !openai_chat_completion_probe(
+        &record.endpoint_url,
+        model_ref,
+        endpoint_api_key,
+        probe_timeout,
+    )
+    .unwrap_or(false)
+    {
+        return outcome(EndpointReadiness::Listing, true);
+    }
+    record.inference_verified_at_unix_ms = Some(unix_time_millis() as u64);
+    outcome(EndpointReadiness::Serving, true)
 }
 
 fn openai_loaded_model_ids(value: &serde_json::Value) -> Vec<String> {
@@ -288,8 +622,11 @@ pub fn connect_tcp_stream(host: &str, port: u16, timeout: Duration) -> Result<Tc
         .with_context(|| format!("failed to resolve {host}:{port}"))?
         .next()
         .with_context(|| format!("no socket addresses resolved for {host}:{port}"))?;
-    let stream =
-        TcpStream::connect(addr).with_context(|| format!("failed to connect to {host}:{port}"))?;
+    // Bound the connect as well as the reads: a probe against an engine that is
+    // pinned solid must fail within the caller's timeout, not sit in the OS
+    // default SYN retry window.
+    let stream = TcpStream::connect_timeout(&addr, timeout)
+        .with_context(|| format!("failed to connect to {host}:{port}"))?;
     stream.set_read_timeout(Some(timeout)).ok();
     stream.set_write_timeout(Some(timeout)).ok();
     Ok(stream)
@@ -307,6 +644,75 @@ pub fn read_tcp_stream_to_string(stream: &mut TcpStream) -> Result<String> {
         .read_to_string(&mut response)
         .context("failed to read TCP stream")?;
     Ok(response)
+}
+
+/// Read one HTTP response, bounded by a wall-clock deadline.
+///
+/// Two problems with reading to end-of-stream instead. A response is only
+/// complete at EOF if the peer actually closes: `Connection: close` asks for
+/// that, but nothing obliges a server or an intervening proxy to honor it, so a
+/// service that writes a perfectly good response and holds the socket open would
+/// stall until the read timeout and have its answer thrown away. And a socket
+/// read timeout bounds each `read` call, not the sequence of them, so a
+/// slow-drip responder could stretch the total wait to an arbitrary multiple of
+/// what the caller asked for. This returns as soon as the response is complete by
+/// its own framing, and never runs past `deadline` in total.
+fn read_http_response_bounded(stream: &mut TcpStream, deadline: Instant) -> Result<String> {
+    let mut response = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    while !http_response_is_complete(&response) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("timed out reading HTTP response");
+        }
+        stream.set_read_timeout(Some(remaining)).ok();
+        match stream.read(&mut chunk) {
+            // Peer closed: whatever arrived is the whole response.
+            Ok(0) => break,
+            Ok(read) => response.extend_from_slice(&chunk[..read]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                bail!("timed out reading HTTP response");
+            }
+            Err(error) => return Err(error).context("failed to read TCP stream"),
+        }
+    }
+    Ok(String::from_utf8_lossy(&response).into_owned())
+}
+
+/// Whether the bytes so far are a complete HTTP response by their own framing.
+///
+/// `false` for a response that declares neither a length nor chunked encoding —
+/// those are delimited by the connection closing, so the caller must keep reading
+/// until EOF.
+fn http_response_is_complete(response: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(response);
+    let Some((headers, body)) = text.split_once("\r\n\r\n") else {
+        return false;
+    };
+    let header_value = |name: &str| {
+        headers.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_owned())
+        })
+    };
+    if let Some(length) =
+        header_value("Content-Length").and_then(|value| value.parse::<usize>().ok())
+    {
+        return body.len() >= length;
+    }
+    if header_value("Transfer-Encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
+    {
+        return body.ends_with("0\r\n\r\n");
+    }
+    false
 }
 
 #[cfg(windows)]
@@ -840,7 +1246,7 @@ impl AppPaths {
 
     #[must_use]
     pub fn with_managed_root(mut self, root: impl Into<PathBuf>, keep_cache_dir: bool) -> Self {
-        self.data_dir = normalize_runtime_path_for_host(&root.into());
+        self.data_dir = managed_runtime_data_root(&root.into());
         if !keep_cache_dir {
             self.cache_dir = managed_runtime_cache_dir(&self.data_dir);
         }
@@ -1011,6 +1417,13 @@ pub struct ExamineSummary {
     pub distro: Option<String>,
     pub cpu: Option<String>,
     pub system_ram_gib: Option<f64>,
+    /// Whether *this* `rocm` process was given a terminal — not a property of
+    /// the machine, unlike every other field here.
+    ///
+    /// False whenever stdout is captured, which includes the dashboard running
+    /// `rocm examine` as a child process. That is why the same machine reports
+    /// `true` from a shell and `false` from the dashboard: both are correct.
+    /// See [`interactive_terminal`] for what it gates.
     pub interactive_terminal: bool,
     pub default_engine: String,
     pub detected_gfx_target: Option<String>,
@@ -1194,6 +1607,17 @@ impl ExamineSummary {
             .as_deref()
             .and_then(normalize_therock_family);
         let detected_therock_family = detect_managed_therock_family(&paths);
+        // Report the engine this GPU actually serves on, not the platform
+        // constant. `compatible_therock_family` is the right input: it is
+        // normalised from the real GPU, whereas `detected_therock_family`
+        // describes the installed managed runtime and is absent before one
+        // exists — which would silently downgrade the answer to the constant on
+        // a fresh machine.
+        let host_gpu = HostGpuSummary {
+            name: None,
+            gfx_target: detected_gfx_target.clone(),
+            therock_family: compatible_therock_family.clone(),
+        };
         Ok(Self {
             os: runtime_os_name().to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
@@ -1204,7 +1628,7 @@ impl ExamineSummary {
                 windows_inventory.as_ref(),
             ),
             interactive_terminal: interactive_terminal(),
-            default_engine: default_engine_for_platform().to_owned(),
+            default_engine: default_engine_for_host(&host_gpu).to_owned(),
             detected_gfx_target,
             compatible_therock_family,
             detected_therock_family,
@@ -1237,6 +1661,15 @@ impl ExamineSummary {
                 .join(", ")
         };
         let wsl = self.wsl.as_ref();
+        // Every other field here describes the MACHINE; this one describes the
+        // invocation, which is what made it ambiguous -- `true` from a terminal
+        // and `false` under the dashboard both look like claims about the host.
+        // Say which it is on the line itself, so pasted output explains itself.
+        let interactive_terminal = if self.interactive_terminal {
+            "true (this run has a terminal; the CLI may prompt)"
+        } else {
+            "false (this run's output is captured, so the CLI will not prompt)"
+        };
         format!(
             "rocm examine\n  os: {}\n  arch: {}\n  kernel: {}\n  distro: {}\n  cpu: {}\n  system_ram: {}\n  interactive_terminal: {}\n  default_engine: {}\n  detected_gfx_target: {}\n  compatible_therock_family: {}\n  detected_therock_family: {}\n  driver_policy: {}\n  driver_status: {}\n  driver_detail: {}\n  legacy_rocm_status: {}\n  legacy_rocm_paths: {}\n  legacy_rocm_detail: {}\n  legacy_rocm_guidance: {}\n  wsl: {}\n  wsl_dxg_device: {}\n  wsl_dxcore: {}\n  wsl_librocdxg: {}\n  wsl_rocdxg_dids: {}\n  wsl_ldconfig_librocdxg: {}\n  wsl_global_rocminfo: {}\n  wsl_cargo: {}\n  wsl_detail: {}\n  managed_runtimes: {}\n  managed_services: {}\n  model_cache_entries: {}\n  config_dir: {}\n  data_dir: {}\n  cache_dir: {}\n",
             self.os,
@@ -1246,7 +1679,7 @@ impl ExamineSummary {
             self.cpu.as_deref().unwrap_or("<unknown>"),
             self.system_ram_gib
                 .map_or_else(|| "<unknown>".to_owned(), format_gib_value),
-            self.interactive_terminal,
+            interactive_terminal,
             self.default_engine,
             self.detected_gfx_target.as_deref().unwrap_or("<unknown>"),
             self.compatible_therock_family
@@ -1292,12 +1725,37 @@ impl ExamineSummary {
     }
 }
 
+/// Whether this process can hold an interactive exchange with a user.
+///
+/// Both streams must be a terminal: stdin so an answer can be read, stdout so
+/// the question is seen. Anything that captures either — a pipe, a CI step, the
+/// dashboard spawning `rocm` as a child — makes this false, and callers then
+/// skip the prompt rather than block on input nobody can supply.
+///
+/// A property of the invocation, not of the host. `rocm examine` reports it so a
+/// pasted report explains why prompts were skipped.
 pub fn interactive_terminal() -> bool {
     stdin().is_terminal() && stdout().is_terminal()
 }
 
 pub const fn default_engine_for_platform() -> &'static str {
     "lemonade"
+}
+
+/// The engine this host serves on by default, absent an explicit choice.
+///
+/// [`default_engine_for_platform`] alone answers "what does this OS fall back
+/// to", which is not the same question: on Instinct data-center parts serving
+/// goes through vLLM, and reporting the platform constant there contradicts what
+/// `serve` actually selects. Use this wherever the CLI *tells the user* what the
+/// default engine is; `default_engine_for_platform` remains correct as the
+/// last-resort fallback once GPU and recipe preferences have been exhausted.
+///
+/// A value the user configured still outranks this — callers that have a
+/// configured engine must prefer it, mirroring `select_serve_engine`.
+#[must_use]
+pub fn default_engine_for_host(summary: &HostGpuSummary) -> &'static str {
+    preferred_serve_engine_for_host_gpu_summary(summary).unwrap_or_else(default_engine_for_platform)
 }
 
 const VLLM_PREFERRED_THEROCK_FAMILIES: &[&str] = &["gfx906", "gfx908", "gfx90a"];
@@ -3747,15 +4205,21 @@ fn parse_linux_kfd_gfx_target(value: &str) -> Option<String> {
     }
     match digits.len() {
         3 | 4 => Some(format!("gfx{digits}")),
+        // A 5/6-digit value is KFD's *packed* version (major·10000 + minor·100 +
+        // step), not a target name, so there is no `gfx{digits}` fallback here.
+        // Fabricating one from a version that failed to decode fed
+        // `gfx90010`-shaped tokens into `normalize_therock_family`, where the
+        // loose `gfx90` arm mapped them to a plausible-looking but wrong family.
+        // Yielding `None` instead lets detection try the next KFD node and then
+        // `ip_discovery`, and otherwise report the target as unknown — which is
+        // recoverable with `--family`, where a wrong family silently installs
+        // the wrong runtime wheel.
         5 | 6 => {
             let raw: u32 = digits.parse().ok()?;
             let major = raw / 10_000;
             let minor = (raw / 100) % 100;
             let revision = raw % 100;
-            if let Some(token) = gfx_target_from_gc_version(major, minor, revision) {
-                return Some(token);
-            }
-            Some(format!("gfx{digits}"))
+            gfx_target_from_gc_version(major, minor, revision)
         }
         _ => None,
     }
@@ -3835,11 +4299,36 @@ fn detect_ip_discovery_gc_target(ip_discovery_dir: &Path) -> Option<String> {
 }
 
 #[cfg(any(target_os = "linux", test))]
+/// Render gfx target *components* as an LLVM target token.
+///
+/// The token is `gfx` + major in decimal + minor and revision as **single hex
+/// digits** — the `a` in `gfx90a` is revision `10`. Concatenating the components
+/// as decimal agrees with hex only while every component is below 10, so it
+/// silently produced `gfx9010` for gfx90a hardware (MI210/MI250), which then
+/// normalized to the wrong TheRock family.
+///
+/// **The caller owns whether its numbers are target components at all.** KFD's
+/// `gfx_target_version` packs exactly this triple, so decoding it and calling
+/// here is sound. A GC (Graphics Core) IP version is a *different* quantity that
+/// merely coincides with the target on many parts: it does not on the GC 9.4.x
+/// line, where GC 9.4.0/9.4.1/9.4.2/9.4.3 are gfx906/gfx908/gfx90a/gfx942. So
+/// [`detect_ip_discovery_gc_target`] can still yield a wrong-but-plausible token
+/// for those parts — pre-existing, unchanged by the hex encoding, and not
+/// something this function can detect, since the components it receives are
+/// well-formed either way.
+///
+/// A minor or revision that cannot be a single hex digit does not describe any
+/// gfx target, so it yields `None` rather than a fabricated token: the caller
+/// tries the next detection source and otherwise reports the target as unknown,
+/// which is recoverable with `--family`, where a fabricated one silently
+/// installs the wrong runtime wheel. `major` is only checked for zero — it is
+/// printed in decimal and has no single-digit bound (`gfx1030`, `gfx1250`), so
+/// an implausible major still concatenates into a token.
 fn gfx_target_from_gc_version(major: u32, minor: u32, revision: u32) -> Option<String> {
-    if major == 0 {
+    if major == 0 || minor > 0xf || revision > 0xf {
         return None;
     }
-    Some(format!("gfx{major}{minor}{revision}"))
+    Some(format!("gfx{major}{minor:x}{revision:x}"))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
@@ -5773,11 +6262,33 @@ pub struct ManagedServiceRecord {
     pub restart_count: u32,
     #[serde(default)]
     pub last_restart_unix_ms: Option<u128>,
+    /// When a stop was requested but could not confirm that every recorded
+    /// process died. It records *intent*: the operator asked for this service to
+    /// go away, so once the processes are observed gone the endpoint key may be
+    /// dropped. A service that merely crashed carries no such intent and keeps
+    /// its key, so it stays restartable/recoverable. Cleared on a confirmed stop
+    /// and on a successful respawn. `None` on records written before this field
+    /// existed, which is the safe default (keep the key).
+    #[serde(default)]
+    pub stop_requested_unix_ms: Option<u128>,
+    /// When the last inference probe was attempted. Throttles re-probing of a
+    /// service that is listed but still loading — see
+    /// [`INFERENCE_PROBE_RETRY_INTERVAL`]. Absent on records written before
+    /// readiness was gated on inference.
+    #[serde(default)]
+    pub inference_probe_attempted_at_unix_ms: Option<u64>,
     /// Coarse startup stage (`downloading`/`loading`/`warmup`) parsed from the
     /// serve process's own log output while it is coming up. Set to `None` once
     /// the service reaches `ready`, and absent on older on-disk records.
     #[serde(default)]
     pub startup_phase: Option<String>,
+    /// When a real inference request first succeeded against this service. Once
+    /// set, readiness checks stop re-probing and fall back to the cheap endpoint
+    /// query — see [`managed_service_endpoint_readiness`]. Adopted from the
+    /// engine state file when present, and absent on records written before
+    /// readiness was gated on inference.
+    #[serde(default)]
+    pub inference_verified_at_unix_ms: Option<u64>,
     pub manifest_path: PathBuf,
     pub log_path: PathBuf,
     pub engine_state_path: PathBuf,
@@ -5827,12 +6338,32 @@ impl ManagedServiceRecord {
             engine_recipe_json: None,
             restart_count: 0,
             last_restart_unix_ms: None,
+            stop_requested_unix_ms: None,
             startup_phase: None,
+            inference_verified_at_unix_ms: None,
+            inference_probe_attempted_at_unix_ms: None,
             manifest_path,
             log_path,
             engine_state_path,
             created_at_unix_ms: unix_time_millis(),
         }
+    }
+
+    /// Drop the per-run state that a restart invalidates, and count the restart.
+    ///
+    /// A restart reuses this manifest but spawns a different server with an
+    /// unloaded model, so anything describing the previous run has to go. Chiefly
+    /// the inference verification: left set, it short-circuits readiness straight
+    /// back to "ready" as soon as the new server lists the model, reinstating the
+    /// false positive the probe exists to prevent. The engine's own state file is
+    /// rewritten from scratch on restart, so only this copy needs clearing — and
+    /// [`Self::refresh_from_engine_state`] only ever adopts a verification, never
+    /// clears one, so a stale value here would survive indefinitely.
+    pub fn reset_for_restart(&mut self) {
+        self.inference_verified_at_unix_ms = None;
+        self.inference_probe_attempted_at_unix_ms = None;
+        self.restart_count = self.restart_count.saturating_add(1);
+        self.last_restart_unix_ms = Some(unix_time_millis());
     }
 
     pub fn normalize_paths_for_host(&mut self) {
@@ -5906,6 +6437,15 @@ impl ManagedServiceRecord {
         {
             self.engine_pid = Some(pid);
             self.engine_start_ticks = state.get(ticks_key).and_then(serde_json::Value::as_u64);
+        }
+        // Adopt the engine's inference verification so the CLI side does not
+        // re-probe a service the engine healthcheck already confirmed.
+        if self.inference_verified_at_unix_ms.is_none()
+            && let Some(verified_at) = state
+                .get(INFERENCE_VERIFIED_STATE_KEY)
+                .and_then(serde_json::Value::as_u64)
+        {
+            self.inference_verified_at_unix_ms = Some(verified_at);
         }
         Ok(self.status != previous)
     }
@@ -6443,15 +6983,13 @@ mod tests {
         Ok(())
     }
 
-    // EAI-7333: the service healthcheck marks a model "ready" purely from
-    // `/v1/models` listing it (via `openai_models_endpoint_has_model`), without
-    // verifying inference. This test pins that gap: a server that lists the model
-    // on `/v1/models` but is NOT able to serve `/v1/chat/completions` still
-    // reports the model as present. The readiness signal is therefore a false
-    // positive for inference-readiness — a caller must additionally probe
-    // inference before treating a service as usable. When EAI-7333 is fixed
-    // (readiness gated on an inference probe, not just `/v1/models`), the
-    // healthcheck path should no longer rely on this signal alone.
+    // Why readiness is gated on an inference probe (EAI-7333): a server that
+    // lists the model on `/v1/models` but cannot yet serve
+    // `/v1/chat/completions` still reports the model as present. This test pins
+    // that `openai_models_endpoint_has_model` alone is a false positive for
+    // inference-readiness, which is why callers must additionally probe
+    // inference — see `openai_chat_completion_probe` and
+    // `managed_service_endpoint_readiness`.
     #[test]
     fn models_endpoint_readiness_does_not_imply_inference_ready() -> Result<()> {
         // A server that answers `/v1/models` with the model listed, but would
@@ -6493,6 +7031,444 @@ mod tests {
         // models response and closed, so a chat request would not succeed.
         // Readiness based on this signal alone is a false positive (EAI-7333).
         server.join().expect("server thread should not panic")?;
+        Ok(())
+    }
+
+    /// Serve `count` canned HTTP responses on a loopback port, returning the port
+    /// and a handle yielding the requests that were received. Each response is
+    /// `(status_line, body)`; a `None` response accepts the connection and never
+    /// answers, standing in for an engine that hangs.
+    fn spawn_canned_http_server(
+        responses: Vec<Option<(&'static str, &'static str)>>,
+    ) -> Result<(u16, std::thread::JoinHandle<Result<Vec<String>>>)> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let handle = std::thread::spawn(move || -> Result<Vec<String>> {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut request_bytes = Vec::new();
+                let mut buffer = [0_u8; 512];
+                while let Ok(read) = stream.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    request_bytes.extend_from_slice(&buffer[..read]);
+                    let text = String::from_utf8_lossy(&request_bytes);
+                    // Requests with a body (POST) are complete once the declared
+                    // content length has arrived after the header terminator.
+                    if let Some((headers, body)) = text.split_once("\r\n\r\n") {
+                        let declared = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("Content-Length: ")?.trim().parse().ok()
+                            })
+                            .unwrap_or(0_usize);
+                        if body.len() >= declared {
+                            break;
+                        }
+                    }
+                }
+                requests.push(String::from_utf8_lossy(&request_bytes).into_owned());
+                let Some((status_line, body)) = response else {
+                    // Hang: hold the connection open without answering until the
+                    // client's read timeout fires, then drop it.
+                    std::thread::sleep(Duration::from_millis(1500));
+                    continue;
+                };
+                write!(
+                    stream,
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )?;
+            }
+            Ok(requests)
+        });
+        Ok((port, handle))
+    }
+
+    const CHAT_OK_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#;
+    const MODELS_OK_BODY: &str = r#"{"data":[{"id":"Qwen/Qwen3-0.6B"}]}"#;
+
+    #[test]
+    fn chat_completion_probe_passes_when_the_endpoint_answers() -> Result<()> {
+        let (port, server) =
+            spawn_canned_http_server(vec![Some(("HTTP/1.1 200 OK", CHAT_OK_BODY))])?;
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        assert!(openai_chat_completion_probe(
+            &endpoint,
+            "Qwen/Qwen3-0.6B",
+            None,
+            Duration::from_secs(2)
+        )?);
+
+        let requests = server.join().expect("server thread should not panic")?;
+        let request = requests.first().expect("the probe sends one request");
+        assert!(
+            request.starts_with("POST /v1/chat/completions HTTP/1.1"),
+            "probe must exercise the inference path, got: {request}"
+        );
+        assert!(
+            request.contains("\"model\":\"Qwen/Qwen3-0.6B\"") && request.contains("\"max_tokens\""),
+            "probe asks the served model for a token-capped completion, got: {request}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn chat_completion_probe_separates_a_refusal_from_a_warmup_failure() -> Result<()> {
+        // A refusal proves the inference path is up and the model is resident:
+        // the request was understood and rejected on its merits. A 5xx is what an
+        // engine returns while it is still warming up, which is not ready.
+        let (port, server) = spawn_canned_http_server(vec![
+            Some(("HTTP/1.1 400 Bad Request", r#"{"error":"unsupported"}"#)),
+            Some((
+                "HTTP/1.1 503 Service Unavailable",
+                r#"{"error":"loading model"}"#,
+            )),
+        ])?;
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        assert!(openai_chat_completion_probe(
+            &endpoint,
+            "qwen",
+            None,
+            Duration::from_secs(2)
+        )?);
+        assert!(!openai_chat_completion_probe(
+            &endpoint,
+            "qwen",
+            None,
+            Duration::from_secs(2)
+        )?);
+
+        server.join().expect("server thread should not panic")?;
+        Ok(())
+    }
+
+    #[test]
+    fn chat_completion_probe_accepts_a_response_from_a_server_that_holds_the_socket() -> Result<()>
+    {
+        // `Connection: close` is a request, not a guarantee — a server or an
+        // intervening proxy may answer in full and keep the socket open. Reading
+        // to EOF would stall until the timeout and throw the answer away, leaving
+        // a perfectly healthy service stuck reporting "not ready".
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let body = CHAT_OK_BODY;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )?;
+            stream.flush()?;
+            // Hold the connection open past the probe's timeout.
+            std::thread::sleep(Duration::from_secs(3));
+            Ok(())
+        });
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        let started = Instant::now();
+        assert!(
+            openai_chat_completion_probe(&endpoint, "qwen", None, Duration::from_secs(2))?,
+            "a complete response counts even when the peer keeps the socket open"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the framed response is complete, so the probe must not wait for EOF"
+        );
+
+        server.join().expect("server thread should not panic")?;
+        Ok(())
+    }
+
+    #[test]
+    fn http_read_is_bounded_across_reads_not_just_per_read() -> Result<()> {
+        // A socket read timeout bounds each `read`, not the sequence of them. A
+        // server that dribbles bytes forever, each within the per-read timeout,
+        // must still hit the caller's overall budget.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            // Never declares a length and never finishes: one byte at a time,
+            // comfortably inside any per-read timeout.
+            for _ in 0..200 {
+                if stream.write_all(b"x").is_err() || stream.flush().is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(())
+        });
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        let started = Instant::now();
+        assert!(
+            openai_chat_completion_probe(&endpoint, "qwen", None, Duration::from_millis(500))
+                .is_err(),
+            "a response that never completes is not a passing probe"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the call must honor its own budget, not a multiple of it: took {:?}",
+            started.elapsed()
+        );
+
+        let _ = server.join();
+        Ok(())
+    }
+
+    #[test]
+    fn chat_completion_probe_fails_on_a_hung_endpoint() -> Result<()> {
+        // The reported symptom: the endpoint accepts the connection and never
+        // answers. The probe must give up within its timeout, not wait forever.
+        let (port, server) = spawn_canned_http_server(vec![None])?;
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        let started = Instant::now();
+        assert!(
+            openai_chat_completion_probe(&endpoint, "qwen", None, Duration::from_millis(300))
+                .is_err(),
+            "a hung endpoint is not inference-ready"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the probe must be bounded by its timeout"
+        );
+
+        server.join().expect("server thread should not panic")?;
+        Ok(())
+    }
+
+    fn probe_test_record(port: u16) -> ManagedServiceRecord {
+        let root = PathBuf::from("/tmp/rocm-inference-probe-test");
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        ManagedServiceRecord::new(
+            &paths,
+            "svc-probe",
+            "vllm",
+            "Qwen/Qwen3-0.6B",
+            "Qwen/Qwen3-0.6B",
+            "127.0.0.1",
+            port,
+            "serve",
+            4242,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn inference_readiness_latches_after_the_first_successful_probe() -> Result<()> {
+        // First check: list the model, then probe inference. Second check: the
+        // verdict is latched, so only the cheap listing is re-issued — repeated
+        // `services list` polls must not queue generation work behind real
+        // traffic.
+        let (port, server) = spawn_canned_http_server(vec![
+            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
+            Some(("HTTP/1.1 200 OK", CHAT_OK_BODY)),
+            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
+        ])?;
+        let mut record = probe_test_record(port);
+
+        assert_eq!(
+            managed_service_endpoint_readiness(
+                &mut record,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(2)
+            )
+            .readiness,
+            EndpointReadiness::Serving
+        );
+        assert!(
+            record.inference_verified_at_unix_ms.is_some(),
+            "a passing probe is recorded so later checks can skip it"
+        );
+
+        assert_eq!(
+            managed_service_endpoint_readiness(
+                &mut record,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(2)
+            )
+            .readiness,
+            EndpointReadiness::Serving
+        );
+
+        let requests = server.join().expect("server thread should not panic")?;
+        let paths: Vec<&str> = requests
+            .iter()
+            .filter_map(|request| request.lines().next())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "GET /v1/models HTTP/1.1",
+                "POST /v1/chat/completions HTTP/1.1",
+                "GET /v1/models HTTP/1.1",
+            ],
+            "the second readiness check must not re-probe inference"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_warming_service_is_not_re_probed_on_every_poll() -> Result<()> {
+        // Only a successful probe latches, so a model that is listed but still
+        // loading would otherwise be re-probed by every poll — and each attempt
+        // costs the full probe timeout, paid by `services list` and the dash in
+        // front of a user. The second check must cost a listing and nothing more.
+        let (port, server) = spawn_canned_http_server(vec![
+            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
+            Some((
+                "HTTP/1.1 503 Service Unavailable",
+                r#"{"error":"loading model"}"#,
+            )),
+            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
+        ])?;
+        let mut record = probe_test_record(port);
+
+        let first = managed_service_endpoint_readiness(
+            &mut record,
+            None,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        );
+        assert_eq!(first.readiness, EndpointReadiness::Listing);
+        assert!(
+            first.record_changed && record.inference_probe_attempted_at_unix_ms.is_some(),
+            "the attempt must be recorded, and persisted by the caller — each CLI \
+             run is a fresh process, so an unwritten attempt throttles nothing"
+        );
+
+        let second = managed_service_endpoint_readiness(
+            &mut record,
+            None,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        );
+        assert_eq!(second.readiness, EndpointReadiness::Listing);
+        assert!(!second.record_changed);
+
+        let requests = server.join().expect("server thread should not panic")?;
+        let paths: Vec<&str> = requests
+            .iter()
+            .filter_map(|request| request.lines().next())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "GET /v1/models HTTP/1.1",
+                "POST /v1/chat/completions HTTP/1.1",
+                "GET /v1/models HTTP/1.1",
+            ],
+            "the second check must not re-probe inside the retry interval"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn restarting_drops_the_previous_runs_inference_verification() {
+        // The restarted child is a different server with an unloaded model. If the
+        // verification carried over, readiness would short-circuit to "ready" the
+        // moment the new server listed the model — the original false positive,
+        // reinstated. `refresh_from_engine_state` only ever adopts a verification,
+        // so nothing downstream would clear it.
+        let mut record = probe_test_record(11435);
+        record.inference_verified_at_unix_ms = Some(1);
+        record.inference_probe_attempted_at_unix_ms = Some(1);
+        record.restart_count = 2;
+
+        record.reset_for_restart();
+
+        assert_eq!(record.inference_verified_at_unix_ms, None);
+        assert_eq!(
+            record.inference_probe_attempted_at_unix_ms, None,
+            "the retry throttle is per-run too; the new child deserves an              immediate first probe"
+        );
+        assert_eq!(record.restart_count, 3);
+        assert!(record.last_restart_unix_ms.is_some());
+    }
+
+    #[test]
+    fn inference_readiness_is_withheld_while_the_model_only_lists() -> Result<()> {
+        // The bug: `/v1/models` answers within seconds while the model loads for
+        // minutes and inference returns nothing. That service is not ready.
+        let (port, server) = spawn_canned_http_server(vec![
+            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
+            Some((
+                "HTTP/1.1 503 Service Unavailable",
+                r#"{"error":"loading model"}"#,
+            )),
+        ])?;
+        let mut record = probe_test_record(port);
+
+        assert_eq!(
+            managed_service_endpoint_readiness(
+                &mut record,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(2)
+            )
+            .readiness,
+            EndpointReadiness::Listing,
+            "a listed-but-unservable model is coming up, not dead"
+        );
+        assert!(
+            record.inference_verified_at_unix_ms.is_none(),
+            "nothing is latched until inference actually succeeds"
+        );
+
+        server.join().expect("server thread should not panic")?;
+        Ok(())
+    }
+
+    #[test]
+    fn inference_probe_sends_the_service_key_to_a_protected_endpoint() -> Result<()> {
+        let (port, server) = spawn_canned_http_server(vec![
+            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
+            Some(("HTTP/1.1 200 OK", CHAT_OK_BODY)),
+        ])?;
+        let mut record = probe_test_record(port);
+
+        assert_eq!(
+            managed_service_endpoint_readiness(
+                &mut record,
+                Some("test-key"),
+                Duration::from_secs(2),
+                Duration::from_secs(2)
+            )
+            .readiness,
+            EndpointReadiness::Serving
+        );
+
+        let requests = server.join().expect("server thread should not panic")?;
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.contains("Authorization: Bearer test-key")),
+            "a protected service must not read as unready for want of its own key"
+        );
         Ok(())
     }
 
@@ -6584,6 +7560,79 @@ mod tests {
         } else {
             assert_eq!(preferred, Some("vllm"));
         }
+    }
+
+    #[test]
+    fn host_default_engine_is_vllm_on_instinct() {
+        // What `rocm examine` and `rocm engines list` report on an MI300X. The
+        // platform constant said "lemonade" here while serve picked vLLM, so the
+        // reported default contradicted the actual behaviour.
+        let summary = HostGpuSummary {
+            name: Some("AMD Instinct MI300X".to_owned()),
+            gfx_target: Some("gfx942".to_owned()),
+            therock_family: Some("gfx94X-dcgpu".to_owned()),
+        };
+        if cfg!(windows) {
+            assert_eq!(default_engine_for_host(&summary), "lemonade");
+        } else {
+            assert_eq!(default_engine_for_host(&summary), "vllm");
+        }
+    }
+
+    #[test]
+    fn host_default_engine_covers_every_vllm_preferred_family() {
+        // Guards the whole preferred set, not just the dcgpu branch, so adding a
+        // family to VLLM_PREFERRED_THEROCK_FAMILIES cannot leave the reported
+        // default behind.
+        for family in VLLM_PREFERRED_THEROCK_FAMILIES {
+            let summary = HostGpuSummary {
+                name: None,
+                gfx_target: Some((*family).to_owned()),
+                therock_family: Some((*family).to_owned()),
+            };
+            let expected = if cfg!(windows) { "lemonade" } else { "vllm" };
+            assert_eq!(
+                default_engine_for_host(&summary),
+                expected,
+                "unexpected default for {family}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_default_engine_is_lemonade_without_a_vllm_preference() {
+        // Strix Halo (gfx1151), a consumer family, and a machine whose GPU has not
+        // been identified at all must all keep the platform default.
+        for summary in [
+            HostGpuSummary {
+                name: Some("AMD Radeon 8060S".to_owned()),
+                gfx_target: Some("gfx1151".to_owned()),
+                therock_family: Some("gfx1151".to_owned()),
+            },
+            HostGpuSummary {
+                name: Some("AMD Radeon".to_owned()),
+                gfx_target: Some("gfx1100".to_owned()),
+                therock_family: Some("gfx110X-all".to_owned()),
+            },
+            HostGpuSummary::default(),
+        ] {
+            assert_eq!(default_engine_for_host(&summary), "lemonade");
+        }
+    }
+
+    #[test]
+    fn host_default_engine_never_reports_vllm_on_native_windows() {
+        // The vLLM adapter bails on native Windows, so no GPU may talk the
+        // reported default into vLLM there — including an Instinct part.
+        if !cfg!(windows) {
+            return;
+        }
+        let summary = HostGpuSummary {
+            name: Some("AMD Instinct MI300X".to_owned()),
+            gfx_target: Some("gfx942".to_owned()),
+            therock_family: Some("gfx94X-dcgpu".to_owned()),
+        };
+        assert_eq!(default_engine_for_host(&summary), "lemonade");
     }
 
     #[test]
@@ -6891,6 +7940,42 @@ Class Name:                Display
             gfx_target_from_gc_version(11, 0, 3),
             Some("gfx1103".to_owned())
         );
+        // Two digits of major stay decimal.
+        assert_eq!(
+            gfx_target_from_gc_version(12, 5, 0),
+            Some("gfx1250".to_owned())
+        );
+    }
+
+    #[test]
+    fn gc_version_encodes_components_above_nine_as_hex_digits() {
+        // GC 9.0.10 is gfx90a (MI210/MI250), not "gfx9010": minor and revision
+        // are single hex digits. Decimal concatenation agreed with hex only
+        // while every component stayed below 10.
+        assert_eq!(
+            gfx_target_from_gc_version(9, 0, 10),
+            Some("gfx90a".to_owned())
+        );
+        assert_eq!(
+            gfx_target_from_gc_version(9, 4, 12),
+            Some("gfx94c".to_owned())
+        );
+
+        // A component that is not a single hex digit describes no gfx target,
+        // so detection falls through rather than acting on a fabricated one.
+        assert_eq!(gfx_target_from_gc_version(12, 16, 0), None);
+        assert_eq!(gfx_target_from_gc_version(12, 0, 16), None);
+        assert_eq!(gfx_target_from_gc_version(0, 0, 1), None);
+    }
+
+    #[test]
+    fn gfx90a_gc_version_normalizes_to_its_own_therock_family() {
+        // The point of the fix, end to end: "gfx9010" missed every specific arm
+        // of `normalize_therock_family` and fell through to the loose `gfx90`
+        // one, yielding "gfx90X-dcgpu" — the wrong runtime wheel, and outside
+        // `VLLM_PREFERRED_THEROCK_FAMILIES`, so engine selection changed too.
+        let target = gfx_target_from_gc_version(9, 0, 10).expect("gfx90a target");
+        assert_eq!(normalize_therock_family(&target), Some("gfx90a".to_owned()));
     }
 
     #[test]
@@ -6907,6 +7992,15 @@ Class Name:                Display
             parse_linux_kfd_gfx_target("gfx1103"),
             Some("gfx1103".to_owned())
         );
+        // KFD packs gfx90a as 9·10000 + 0·100 + 10.
+        assert_eq!(
+            parse_linux_kfd_gfx_target("90010"),
+            Some("gfx90a".to_owned())
+        );
+        // A packed version whose components are not single hex digits is not a
+        // target; it must not be passed through as `gfx{digits}`, which used to
+        // normalize to a plausible-looking but wrong family.
+        assert_eq!(parse_linux_kfd_gfx_target("121600"), None);
         assert_eq!(parse_linux_kfd_gfx_target("not-a-target"), None);
     }
 
@@ -6928,6 +8022,25 @@ Class Name:                Display
             detect_ip_discovery_gc_target(&root.join("ip_discovery")),
             Some("gfx1103".to_owned())
         );
+
+        // KNOWN WRONG, and pinned so the gap stays visible: on the GC 9.4.x line
+        // the GC IP version is not the LLVM target. Aldebaran (MI200/MI250)
+        // reports GC 9.4.2 here but is gfx90a, so this path yields MI300's target
+        // instead and resolves to the wrong TheRock family — the right wheel for
+        // this host is `gfx90a`. Pre-existing: the decimal encoding produced
+        // `gfx942` for 9/4/2 too, so the hex fix neither caused nor closes it.
+        // Fixing it needs a GC-IP-version → target table for GC 9.4.x
+        // (9.4.0/9.4.1/9.4.3 are gfx906/gfx908/gfx942), not a different encoding.
+        fs::write(gc.join("major"), "9")?;
+        fs::write(gc.join("minor"), "4")?;
+        fs::write(gc.join("revision"), "2")?;
+        let aldebaran = detect_ip_discovery_gc_target(&root.join("ip_discovery"));
+        assert_eq!(aldebaran, Some("gfx942".to_owned()));
+        assert_eq!(
+            normalize_therock_family(&aldebaran.expect("target")),
+            Some("gfx94X-dcgpu".to_owned())
+        );
+
         fs::remove_dir_all(root).ok();
         Ok(())
     }
@@ -7264,6 +8377,62 @@ Class Name:                Display
         assert!(rendered.contains("managed_runtimes: 2"));
         assert!(rendered.contains("managed_services: 1"));
         assert!(rendered.contains("model_cache_entries: 3"));
+    }
+
+    #[test]
+    fn examine_render_explains_what_interactive_terminal_means() {
+        // The same machine reports `true` from a shell and `false` under the
+        // dashboard, because the field describes the invocation rather than the
+        // host. Both are correct, and the line has to say so on its own — a
+        // pasted report is usually all a reader gets.
+        let mut summary = ExamineSummary {
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            kernel: None,
+            distro: None,
+            cpu: None,
+            system_ram_gib: None,
+            interactive_terminal: true,
+            default_engine: "vllm".to_owned(),
+            detected_gfx_target: None,
+            compatible_therock_family: None,
+            detected_therock_family: None,
+            driver: DriverSummary {
+                policy: "linux_official_amd_dkms_wrapper".to_owned(),
+                status: "amdgpu_available".to_owned(),
+                detail: None,
+            },
+            legacy_rocm: LegacyRocmSummary {
+                status: "not_detected".to_owned(),
+                paths: Vec::new(),
+                detail: None,
+            },
+            wsl: None,
+            managed_runtime_count: 0,
+            managed_service_count: 0,
+            model_cache_entries: 0,
+            config_dir: PathBuf::from("config"),
+            data_dir: PathBuf::from("data"),
+            cache_dir: PathBuf::from("cache"),
+        };
+
+        let interactive = summary.render_text();
+        assert!(
+            interactive.contains("interactive_terminal: true (this run has a terminal"),
+            "the true case must say it is about this run:\n{interactive}"
+        );
+
+        summary.interactive_terminal = false;
+        let captured = summary.render_text();
+        assert!(
+            captured.contains("interactive_terminal: false (this run's output is captured"),
+            "the false case must explain why, not just report it:\n{captured}"
+        );
+        // The reason it matters to the reader: it is why they saw no prompt.
+        assert!(
+            captured.contains("will not prompt"),
+            "the false case must connect to the visible consequence:\n{captured}"
+        );
     }
 
     #[test]
@@ -8267,6 +9436,38 @@ Class Name:                Display
         assert!(tool.managed);
         assert_eq!(tool.path.as_deref(), Some(python.as_path()));
         Ok(())
+    }
+
+    #[test]
+    fn with_managed_root_keeps_reprovisioning_flat_from_runtime_leaf() {
+        let data_root = PathBuf::from("/tmp/rocm-cli-reprovision");
+        let paths = AppPaths {
+            config_dir: data_root.clone(),
+            data_dir: data_root.clone(),
+            cache_dir: data_root.join("cache"),
+        };
+        // A prior install persisted the runtime's own install_root as the managed
+        // root; rebasing onto it must recover the canonical data root, not append
+        // a second `runtimes/wheel` when the next runtime is provisioned.
+        let leaf = data_root
+            .join("runtimes")
+            .join("wheel")
+            .join("release-wheel-gfx942-7-0");
+        let rebased = paths.with_managed_root(leaf, false);
+
+        assert_eq!(rebased.data_dir, data_root);
+        let next_root = rebased
+            .data_dir
+            .join("runtimes")
+            .join("wheel")
+            .join("nightly-wheel-gfx942-7-1");
+        // Count path components, not a literal separator, so the assertion holds
+        // on Windows too.
+        let runtimes_segments = next_root
+            .components()
+            .filter(|component| component.as_os_str() == std::ffi::OsStr::new("runtimes"))
+            .count();
+        assert_eq!(runtimes_segments, 1);
     }
 
     #[test]
