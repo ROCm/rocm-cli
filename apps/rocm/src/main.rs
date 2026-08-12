@@ -360,6 +360,17 @@ rocm serve qwen2.5-7b-instruct --verbose --device gpu_required")]
         /// and implies `--enable-auto-tool-choice`. Applies to vLLM only.
         #[arg(long, value_name = "NAME")]
         tool_call_parser: Option<String>,
+        /// Fraction of each GPU's TOTAL VRAM that vLLM may claim for weights and
+        /// KV cache (`0.0 < value <= 1.0`). Omitted by default, so vLLM applies
+        /// its own default. Lower it when a small model should not reserve most
+        /// of a large card. Applies to vLLM only.
+        // Taken as a string with `allow_hyphen_values` rather than a clap `f64` so a
+        // negative fraction reaches `parse_gpu_memory_utilization` and gets the domain
+        // error naming the valid range, instead of clap rejecting `-0.2` as an unknown
+        // flag. The cost is that a missing value swallows the next argument
+        // (`--gpu-memory-utilization --verbose`), which then fails loudly on parse.
+        #[arg(long, value_name = "FRACTION", allow_hyphen_values = true)]
+        gpu_memory_utilization: Option<String>,
         /// API key that clients must present to a public (non-loopback) endpoint.
         /// When binding a public interface and this is omitted, a strong key is
         /// generated automatically. Prefer the `ROCM_SERVE_API_KEY` environment
@@ -1648,6 +1659,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             no_smoke_test,
             allow_public_bind,
             tool_call_parser,
+            gpu_memory_utilization,
             api_key,
         }) => serve(ServeArgs {
             model,
@@ -1664,6 +1676,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             no_smoke_test,
             allow_public_bind,
             tool_call_parser,
+            gpu_memory_utilization,
             api_key,
         }),
         Some(Command::Comfyui { command }) => comfyui(command),
@@ -4187,6 +4200,82 @@ fn set_vllm_tool_call_parser(flags: &mut Vec<String>, parser: &str) {
     *flags = rewritten;
 }
 
+/// Applies an explicit `--gpu-memory-utilization` to the vLLM engine recipe.
+///
+/// rocm-cli intentionally ships no default for this: vLLM sizes its KV cache as
+/// a fraction of the device's TOTAL VRAM, and any number rocm-cli picked would
+/// silently override upstream's and drift from it. So the flag is passed through
+/// only when the user asked for one, via `required_flags` (the same channel the
+/// `--tool-call-parser` override uses — no protocol change needed).
+///
+/// Only vLLM is affected. An explicit value wins over any recipe-authored one,
+/// and a minimal hint is synthesized when none exists.
+fn engine_recipe_with_gpu_memory_utilization_override(
+    engine: &str,
+    hint: Option<EngineRecipeHint>,
+    gpu_memory_utilization: Option<f64>,
+) -> Option<EngineRecipeHint> {
+    if !engine.eq_ignore_ascii_case("vllm") {
+        return hint;
+    }
+    let Some(value) = gpu_memory_utilization else {
+        return hint;
+    };
+    let mut hint = hint.unwrap_or_else(|| EngineRecipeHint {
+        contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+        engine: engine.to_owned(),
+        ..EngineRecipeHint::default()
+    });
+    set_vllm_gpu_memory_utilization(&mut hint.required_flags, value);
+    Some(hint)
+}
+
+/// Rewrites `flags` so vLLM receives exactly one `--gpu-memory-utilization
+/// <value>` pair: drops any existing pair, then appends the new one.
+fn set_vllm_gpu_memory_utilization(flags: &mut Vec<String>, value: f64) {
+    let existing = std::mem::take(flags);
+    let mut rewritten: Vec<String> = Vec::with_capacity(existing.len() + 2);
+    let mut skip_value = false;
+    for flag in existing {
+        if skip_value {
+            // Drop the value that followed the removed flag.
+            skip_value = false;
+            continue;
+        }
+        if flag == "--gpu-memory-utilization" {
+            skip_value = true;
+            continue;
+        }
+        rewritten.push(flag);
+    }
+    rewritten.push("--gpu-memory-utilization".to_owned());
+    rewritten.push(format!("{value}"));
+    *flags = rewritten;
+}
+
+/// Parse `rocm serve --gpu-memory-utilization`. Unlike the env-var overrides
+/// elsewhere in this file, an explicit CLI value is never silently ignored: a
+/// user who types a bad fraction is told so.
+fn parse_gpu_memory_utilization(value: Option<&str>) -> Result<Option<f64>> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    let parsed: f64 = trimmed.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "--gpu-memory-utilization expects a fraction greater than 0 and at most 1 \
+             (e.g. 0.5); got `{trimmed}`"
+        )
+    })?;
+    if !parsed.is_finite() || parsed <= 0.0 || parsed > 1.0 {
+        bail!(
+            "--gpu-memory-utilization must be greater than 0 and at most 1 (a fraction of \
+             the GPU's TOTAL VRAM, e.g. 0.5); got `{trimmed}`"
+        );
+    }
+    Ok(Some(parsed))
+}
+
 /// Whether the resolved engine recipe launches vLLM with tool calling enabled.
 fn engine_recipe_enables_tool_choice(hint: Option<&EngineRecipeHint>) -> bool {
     hint.is_some_and(|hint| {
@@ -4213,6 +4302,7 @@ struct ServeArgs {
     no_smoke_test: bool,
     allow_public_bind: bool,
     tool_call_parser: Option<String>,
+    gpu_memory_utilization: Option<String>,
     api_key: Option<String>,
 }
 
@@ -4232,6 +4322,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         no_smoke_test,
         allow_public_bind,
         tool_call_parser,
+        gpu_memory_utilization,
         api_key,
     } = args;
     let _ = managed; // background is now the default; --managed is accepted as an explicit synonym.
@@ -4293,6 +4384,22 @@ fn serve(args: ServeArgs) -> Result<()> {
         recipe_hint,
         tool_call_parser.as_deref(),
     );
+    // Validated before anything is launched so a typo fails immediately rather
+    // than surfacing as a vLLM argparse error deep in the engine log.
+    let gpu_memory_utilization = parse_gpu_memory_utilization(gpu_memory_utilization.as_deref())?;
+    let engine_recipe = engine_recipe_with_gpu_memory_utilization_override(
+        &selected_engine,
+        engine_recipe,
+        gpu_memory_utilization,
+    );
+    // Stored without a `note:` prefix so it can feed both output paths: the plan
+    // path adds the prefix inline, the interactive summary adds it when rendering.
+    let gpu_memory_utilization_note = (gpu_memory_utilization.is_some() && !engine_serves_vllm)
+        .then(|| {
+            format!(
+                "--gpu-memory-utilization applies only to vLLM; ignored for engine '{selected_engine}'"
+            )
+        });
     let tool_call_note = if tool_call_parser.is_some() && !engine_serves_vllm {
         Some(format!(
             "note: --tool-call-parser applies only to vLLM; ignored for engine '{selected_engine}'"
@@ -4439,6 +4546,9 @@ fn serve(args: ServeArgs) -> Result<()> {
         if let Some(note) = &tool_call_note {
             println!("  {note}");
         }
+        if let Some(note) = &gpu_memory_utilization_note {
+            println!("  note: {note}");
+        }
     }
 
     let managed_runtime_id = resolved_selection.runtime_id.clone();
@@ -4512,6 +4622,7 @@ fn serve(args: ServeArgs) -> Result<()> {
                 rocr_visible_devices_set,
                 &gpu_indices,
                 gpu_vram.as_deref(),
+                gpu_memory_utilization_note.as_deref(),
             );
             let summary = serve_summary::DeploymentSummary {
                 engine: selected_engine.clone(),
@@ -4555,8 +4666,15 @@ fn collect_serve_notes(
     rocr_visible_devices_set: bool,
     gpu_indices: &[u32],
     gpu_vram: Option<&[GpuVramUsage]>,
+    engine_flag_note: Option<&str>,
 ) -> Vec<String> {
     let mut notes = Vec::new();
+    // An engine-scoped flag the selected engine cannot honor must be reported here
+    // too: the summary path is what an interactive `rocm serve` actually prints, so
+    // a note only emitted on the plan path would never reach that user.
+    if let Some(note) = engine_flag_note {
+        notes.push(note.to_owned());
+    }
     if cpu_only {
         if matches!(gpu_selection, GpuSelection::Index(_)) {
             notes.push(
@@ -22119,6 +22237,140 @@ install therock";
         )
         .unwrap();
         assert_eq!(hint.required_flags, existing.required_flags);
+    }
+
+    #[test]
+    fn gpu_memory_utilization_absent_without_explicit_flag() {
+        // rocm-cli ships no default: with nothing supplied the recipe is left
+        // alone, so vLLM applies its own default rather than one rocm-cli owns.
+        assert_eq!(parse_gpu_memory_utilization(None).unwrap(), None);
+        assert!(engine_recipe_with_gpu_memory_utilization_override("vllm", None, None).is_none());
+        let authored = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "vllm".to_owned(),
+            required_flags: vec!["--enable-auto-tool-choice".to_owned()],
+            ..EngineRecipeHint::default()
+        };
+        let hint = engine_recipe_with_gpu_memory_utilization_override("vllm", Some(authored), None)
+            .unwrap();
+        assert!(
+            !hint
+                .required_flags
+                .iter()
+                .any(|flag| flag == "--gpu-memory-utilization"),
+            "no default may be injected: {:?}",
+            hint.required_flags
+        );
+    }
+
+    #[test]
+    fn gpu_memory_utilization_override_reaches_required_flags() {
+        let value = parse_gpu_memory_utilization(Some("0.35")).unwrap();
+        let hint = engine_recipe_with_gpu_memory_utilization_override("vllm", None, value)
+            .expect("an explicit value should synthesize a vllm hint");
+        assert_eq!(hint.engine, "vllm");
+        assert_eq!(hint.contract_version, ENGINE_RECIPE_CONTRACT_VERSION);
+        assert_eq!(
+            hint.required_flags,
+            vec!["--gpu-memory-utilization".to_owned(), "0.35".to_owned()]
+        );
+    }
+
+    #[test]
+    fn gpu_memory_utilization_override_replaces_authored_value_and_keeps_others() {
+        let existing = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "vllm".to_owned(),
+            required_flags: vec![
+                "--enable-auto-tool-choice".to_owned(),
+                "--gpu-memory-utilization".to_owned(),
+                "0.8".to_owned(),
+                "--tool-call-parser".to_owned(),
+                "hermes".to_owned(),
+            ],
+            ..EngineRecipeHint::default()
+        };
+        let hint = engine_recipe_with_gpu_memory_utilization_override(
+            "vllm",
+            Some(existing),
+            parse_gpu_memory_utilization(Some("1.0")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            hint.required_flags,
+            vec![
+                "--enable-auto-tool-choice".to_owned(),
+                "--tool-call-parser".to_owned(),
+                "hermes".to_owned(),
+                "--gpu-memory-utilization".to_owned(),
+                "1".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn gpu_memory_utilization_override_leaves_non_vllm_engines_untouched() {
+        // The override is vLLM-specific: other engines are never rewritten, with
+        // or without a recipe of their own.
+        assert!(
+            engine_recipe_with_gpu_memory_utilization_override("lemonade", None, Some(0.5))
+                .is_none()
+        );
+        let existing = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "lemonade".to_owned(),
+            required_flags: vec!["--some-flag".to_owned()],
+            ..EngineRecipeHint::default()
+        };
+        let hint = engine_recipe_with_gpu_memory_utilization_override(
+            "lemonade",
+            Some(existing.clone()),
+            Some(0.5),
+        )
+        .unwrap();
+        assert_eq!(hint.required_flags, existing.required_flags);
+    }
+
+    #[test]
+    fn gpu_memory_utilization_rejects_out_of_range_and_unparsable_values() {
+        // An explicit CLI value is never silently ignored (unlike the env-var
+        // overrides elsewhere): each bad value must produce an actionable error.
+        for bad in ["0", "0.0", "1.5", "-0.2", "abc", "", "NaN", "inf"] {
+            let Err(error) = parse_gpu_memory_utilization(Some(bad)) else {
+                panic!("`{bad}` must be rejected, not silently ignored");
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains("--gpu-memory-utilization"),
+                "error for `{bad}` should name the flag: {message}"
+            );
+        }
+        assert_eq!(
+            parse_gpu_memory_utilization(Some(" 0.5 ")).unwrap(),
+            Some(0.5)
+        );
+        assert_eq!(parse_gpu_memory_utilization(Some("1")).unwrap(), Some(1.0));
+    }
+
+    #[test]
+    fn serve_notes_surface_the_ignored_engine_flag_in_summary_mode() {
+        // The interactive summary is what a default `rocm serve` prints, so a flag
+        // the selected engine cannot honor has to be reported through this path —
+        // not only on the plan path that an interactive run never takes.
+        let note = "--gpu-memory-utilization applies only to vLLM; ignored for engine 'lemonade'";
+        let notes = collect_serve_notes(false, &GpuSelection::Auto, false, &[0], None, Some(note));
+        assert!(
+            notes.iter().any(|entry| entry == note),
+            "the ignored-flag note must reach the summary: {notes:?}"
+        );
+
+        let quiet = collect_serve_notes(false, &GpuSelection::Auto, false, &[0], None, None);
+        assert!(
+            !quiet
+                .iter()
+                .any(|entry| entry.contains("--gpu-memory-utilization")),
+            "nothing to report when the flag was honored: {quiet:?}"
+        );
     }
 
     #[test]

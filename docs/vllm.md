@@ -53,9 +53,7 @@ runtime key or an unambiguous runtime id.
 
 On WSL, the tested source build needed vLLM ROCm platform detection to use
 TheRock PyTorch device data when `amdsmi` is unavailable, and needed vLLM's
-ROCm GPTQ half-atomic compatibility path enabled for TheRock 7.13 headers. The
-adapter passes `--gpu-memory-utilization 0.80` by default so display/WSL VRAM
-use does not prevent a small GPU model from starting.
+ROCm GPTQ half-atomic compatibility path enabled for TheRock 7.13 headers.
 
 On the MI300X/gfx942 TheRock 7.13 runtime, current vLLM source required the
 GPTQ compatibility guard in
@@ -92,6 +90,30 @@ rocm serve Qwen/Qwen3.5-4B --engine vllm --gpu 1 --managed
 
 rocm-cli pins the device via `HIP_VISIBLE_DEVICES`. Serving one model across
 multiple GPUs is not supported.
+
+### GPU memory
+
+vLLM claims a fixed fraction of each GPU's **total** VRAM — not of the free
+VRAM, and not scaled to the model — for weights plus KV cache. On a large card
+a small model therefore still reserves a large slice.
+
+rocm-cli sets no `--gpu-memory-utilization` of its own, so vLLM's own default
+applies unless a value comes from somewhere else — either a model's catalog
+recipe or, taking precedence over it, the flag below:
+
+```bash
+rocm serve <model> --engine vllm --gpu-memory-utilization 0.3 --managed
+```
+
+The value is a fraction in `(0, 1]` of total device VRAM. Lower it to leave room
+for a display, another workload, or a second server; raise it to give a large
+model more KV cache. Applies to vLLM only — it is ignored, with a note in the
+serve output, for other engines. An out-of-range or unparsable value fails the
+command rather than falling back silently.
+
+Earlier releases pinned this to `0.80` to leave display/WSL headroom. That pin is
+gone, so an unchanged command now reserves vLLM's own (higher) default. Pass
+`--gpu-memory-utilization 0.8` to restore the previous reservation.
 
 ### Tool calling
 
