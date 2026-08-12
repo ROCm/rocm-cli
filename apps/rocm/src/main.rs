@@ -83,13 +83,19 @@ and run OpenAI-compatible model servers on AMD GPUs.\n\n\
 Run `rocm` with no subcommand to open the interactive dashboard (TUI). Use `rocm examine` \
 to check that your GPU and ROCm install are ready, then `rocm serve <model>` to start a server.",
     version,
+    // The `chat` example was dropped from this list when `chat` became
+    // `[preview]`: promoting a command as a headline example while marking it
+    // preview elsewhere contradicts itself. `engines list` keeps the six-step
+    // narrative and is in scope.
     after_help = "EXAMPLES:\n  \
 rocm examine                      Check GPU, ROCm install, and engines\n  \
 rocm install sdk                  Install ROCm wheels into a managed environment\n  \
+rocm engines list                 Show the local inference engines available\n  \
 rocm model                        List models this machine can run\n  \
 rocm serve qwen2.5-7b-instruct    Start a local OpenAI-compatible server\n  \
-rocm services list                Show running model servers\n  \
-rocm chat --prompt \"Hi\"           Chat with a configured assistant provider\n\n\
+rocm services list                Show running model servers\n\n\
+Commands marked [preview] work but are outside the Tech Preview's supported\n\
+scope: treat them as unfinished and do not depend on their behaviour yet.\n\n\
 Run `rocm <command> --help` for details and examples on any command."
 )]
 struct Cli {
@@ -219,7 +225,7 @@ enum Command {
         #[arg(long)]
         allow_mutation: bool,
     },
-    /// Send a one-shot chat prompt to a configured assistant provider.
+    /// [preview] Send a one-shot chat prompt to a configured assistant provider.
     ///
     /// Reads the prompt from --prompt or, if omitted, from standard input. Use
     /// `rocm config enable-provider` and `rocm config set-provider-key` first to
@@ -363,7 +369,7 @@ rocm serve qwen2.5-7b-instruct --verbose --device gpu_required")]
         #[arg(long)]
         api_key: Option<String>,
     },
-    /// Install, start, stop, or inspect ComfyUI.
+    /// [preview] Install, start, stop, or inspect ComfyUI.
     #[command(alias = "comfy")]
     Comfyui {
         #[command(subcommand)]
@@ -374,7 +380,7 @@ rocm serve qwen2.5-7b-instruct --verbose --device gpu_required")]
         #[command(subcommand)]
         command: Option<ServicesCommand>,
     },
-    /// Manage optional background checks and review requests.
+    /// [preview] Manage optional background checks and review requests.
     Automations {
         #[command(subcommand)]
         command: Option<AutomationsCommand>,
@@ -16708,6 +16714,43 @@ mod tests {
     #[test]
     fn cli_command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn out_of_scope_commands_are_marked_preview_in_help() {
+        let help = Cli::command().render_long_help().to_string();
+        for command in ["chat", "comfyui", "automations"] {
+            let line = help
+                .lines()
+                .find(|line| line.trim_start().starts_with(command))
+                .unwrap_or_else(|| panic!("`{command}` missing from help:\n{help}"));
+            assert!(
+                line.contains("[preview]"),
+                "`{command}` is outside the Tech Preview scope and must say so:\n{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_preview_marker_is_explained_and_not_contradicted() {
+        let help = Cli::command().render_long_help().to_string();
+        // A marker nobody can interpret is no better than no marker.
+        assert!(
+            help.contains("Commands marked [preview]"),
+            "the marker must be explained in the help footer:\n{help}"
+        );
+        // A command cannot be promoted as a headline example while being marked
+        // unfinished — that is the contradiction this pairing exists to prevent.
+        let examples = help
+            .split_once("EXAMPLES:")
+            .map(|(_, rest)| rest)
+            .unwrap_or_default();
+        for command in ["chat", "comfyui", "automations"] {
+            assert!(
+                !examples.contains(&format!("rocm {command}")),
+                "`{command}` is marked preview, so it must not headline the examples:\n{examples}"
+            );
+        }
     }
 
     /// Regression test for the engine child-stdin write under the process-wide
