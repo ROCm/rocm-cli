@@ -62,3 +62,19 @@ Feature: Diagnosing failures and listing fixes
     Given a user who refers to a cause by its position in the diagnosis
     When the user asks the CLI to apply that fix
     Then the CLI refuses and explains that a position is not a fix-id
+
+  # The one gate standing between `rocm fix` and an edited machine, and until now
+  # it had no end-to-end coverage. The scenario gives the CLI a home directory it
+  # owns, so the file the fix would edit is one the scenario can read back: the
+  # refusal must not depend on what is in the runner's dotfiles, and a regression
+  # here must not be able to reach them.
+  # Linux-only because the assertion is "the file is untouched": on Windows the
+  # same recipe persists through `setx` into the user environment, which the
+  # suite cannot plant or read back safely. The gate itself is shared code, so
+  # this still guards it — just not the Windows persistence step.
+  @id:fix-requires-agreement-before-changing-anything @requires-os:linux
+  Scenario: 8 - A fix that changes the machine is not applied without agreement
+    Given a user who has chosen a fix that would change the machine
+    When the user asks the CLI to apply it without agreeing to the change
+    Then the CLI refuses and explains that it needs agreement
+    And the file the fix would have changed is untouched

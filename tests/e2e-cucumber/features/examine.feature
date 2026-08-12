@@ -50,3 +50,46 @@ Feature: GPU detection and system inspection
     And the inspection names that install's version
     And the inspection does not claim nothing is installed
     And the inspection suggests setting up a CLI-managed install
+
+  # Expected to FAIL. The machine-readable form is a separate code path, not a
+  # re-rendering of the human one: it answers before the CLI has loaded its paths
+  # or config, so every CLI-side fact is out of reach. Eleven things the human
+  # report states have no field in it at all — among them which engine this host
+  # will serve on and whether an existing ROCm install was found. Tooling reads
+  # this form; it should not be the weaker of the two.
+  @id:examine-machine-readable-report
+  Scenario: 7 - What the inspection tells a tool matches what it tells a person
+    When the user inspects the system both for reading and for scripting
+    Then the machine-readable form states everything the readable one does
+
+  # Expected to FAIL wherever a GPU is actually present. The harness parses the
+  # human text rather than this form precisely because of this defect, and says
+  # so in capability.rs — on a real MI300X the machine-readable form reported no
+  # AMD GPU on a machine that has one. That workaround makes the disagreement
+  # load-bearing: every host capability the suite resolves comes from scraped
+  # text because this form could not be trusted.
+  @id:examine-both-forms-agree-on-gpu
+  Scenario: 8 - Both forms of the inspection agree about the GPU
+    When the user inspects the system both for reading and for scripting
+    Then both reports agree on whether this machine has an AMD GPU
+    And both reports agree on whether this platform is in scope
+
+  # `examine` is an inspector: the outcome says whether it managed to look, not
+  # whether it liked what it saw. Finding no GPU is a finding, not a failure.
+  # This is the mock lane's to prove — it is the one lane with nothing to find.
+  @id:examine-reports-without-failing
+  Scenario: 9 - Inspecting a machine reports what it finds without failing
+    When the user inspects the system
+    Then the inspection completes successfully
+    And it states a verdict for this machine
+
+  # Expected to FAIL until the framework choice is reachable from the command
+  # line. The library can already scope the probe, but every caller passes the
+  # default, so the user cannot. Leaving the frameworks out is the variant worth
+  # pinning here: the outcome is identical on every host, whereas asserting that
+  # a *named* framework was probed would depend on what happens to be installed.
+  @id:examine-can-skip-framework-probing
+  Scenario: 10 - The user can leave the frameworks out of the inspection
+    When the user inspects the system without probing frameworks
+    Then the inspection reports that it skipped the frameworks
+    And it still states a verdict for this machine
