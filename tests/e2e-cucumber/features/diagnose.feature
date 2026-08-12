@@ -78,3 +78,43 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI to apply it without agreeing to the change
     Then the CLI refuses and explains that it needs agreement
     And the file the fix would have changed is untouched
+
+  # Expected to FAIL. `diagnose` and `fix` are two views of the same remedy: the
+  # first tells the user what will put the machine right, while the second is the
+  # command they are told to run. They must not leave the user with two different
+  # definitions of what proves the remedy worked.
+  @id:diagnose-and-fix-agree-on-how-to-verify @requires-os:linux
+  Scenario: 9 - Diagnosing a problem and previewing its fix agree on how to verify it
+    Given a user who hit a device-permission failure
+    When the user compares the diagnosis with the matching fix preview
+    Then both give the same way to verify that the fix worked
+
+  # Expected to FAIL on a bare-metal GPU host. When the device belongs to a
+  # group that is not named in the local group database, the diagnosis prints
+  # that lookup failure as if it were a group the user could join. A proposed
+  # remedy has to name a group that actually exists on the machine.
+  @id:diagnose-commands-name-a-real-group @requires-gpu @requires-bare-metal @requires-os:linux
+  Scenario: 10 - Every group named in a diagnosis is one the machine recognises
+    Given the GPU device belongs to a group the machine cannot name
+    When the user asks the CLI to diagnose a device-permission failure
+    Then every group named in the remedy exists on the machine
+
+  # Expected to FAIL on a bare-metal GPU host whose device group is not the
+  # hard-coded default. The diagnosis promises one command and its matching fix
+  # previews another. This is distinct from scenario 9: even after the verify
+  # text agrees, the actual change must agree too.
+  @id:diagnose-and-fix-agree-on-the-remedy-command @requires-gpu @requires-bare-metal @requires-os:linux
+  Scenario: 11 - Diagnosing a problem and previewing its fix agree on the remedy command
+    Given the GPU device belongs to a recognised non-default group
+    When the user compares the diagnosis with the matching fix preview
+    Then both give the same command for applying the remedy
+
+  # Expected to FAIL on a bare-metal GPU host where direct access already works.
+  # Membership in one conventional group is only a means to access the device,
+  # not the outcome. A diagnosis should credit the observable access the user
+  # has instead of recommending a permission repair for a usable device.
+  @id:diagnose-credits-a-usable-device @requires-gpu @requires-bare-metal @requires-os:linux
+  Scenario: 12 - A usable GPU device is not diagnosed as a permission failure
+    Given the user can already read and write the GPU device
+    When the user asks the CLI to diagnose the machine
+    Then adding the user to a device group is not the leading remedy

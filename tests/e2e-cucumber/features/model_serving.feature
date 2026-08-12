@@ -144,6 +144,78 @@ Feature: Model serving
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
 
+  # Expected to FAIL. `serve` advertises a set of device policies and then
+  # refuses one of them outright, so the list the user is offered is not the list
+  # the command accepts. Runs on the no-GPU lane, where a refusal that names the
+  # policy itself is cleanly distinguishable from the ordinary "this machine has
+  # no GPU" refusal every policy gets there.
+  @id:serve-rejects-no-advertised-device-policy @requires-no-gpu
+  Scenario: 14 - Every device policy the serve command offers is one it accepts
+    When the user serves a model under each device policy the command offers
+    Then no policy is refused for being that policy
+
+  # Expected to FAIL on a GPU host. Stopping a running server does stop it, but
+  # the account it gives of what it did says it stopped nothing — so an operator
+  # cannot tell a stop that worked from one that found nothing to do.
+  #
+  # This needs a real served model, which is why it is on the GPU lane. A plain
+  # process registered as a managed service was tried first and reported the stop
+  # correctly (measured on the no-GPU lane), so the fixture would have pinned
+  # nothing: what differs about a real engine is that the CLI records identity
+  # tokens for its processes and reasons about them.
+  @id:services-stop-reports-what-it-stopped @requires-gpu
+  Scenario: 15 - Stopping a running server reports that it stopped it
+    Given a managed runtime is active
+    And a model is being served on GPU
+    When the user stops the server that is running
+    Then the CLI reports that it stopped a process
+
+  # Expected to FAIL. Removing the CLI's managed files reports completion while
+  # the server it was managing is left running — and with the records gone, the
+  # supported way to stop it has been removed along with them. Nothing here
+  # touches the installed program: the removal is scoped to this scenario's own
+  # directories and keeps the binaries.
+  @id:uninstall-stops-what-it-manages @requires-os:linux
+  Scenario: 16 - Removing the CLI's managed files stops the servers it manages
+    Given a local server this machine manages is running
+    When the user removes the CLI's managed files
+    Then the removal is reported as complete
+    And the server is no longer running
+
+  # Expected to FAIL on a GPU host. Asking the CLI to choose a GPU on a machine
+  # that has one must end with a device chosen: reporting that it selected none
+  # and carrying on leaves the user unable to tell which GPU their model will
+  # run on, or whether it will run on one at all.
+  @id:serve-auto-gpu-selection-names-a-device @requires-gpu
+  Scenario: 17 - Letting the CLI choose the GPU names the device it chose
+    Given a machine with an AMD GPU
+    When the user serves a model letting the CLI choose the GPU
+    Then the plan names the device it chose
+
+  # Expected to FAIL on a GPU host. A second server started while the usual
+  # address is already taken is handed that same address anyway, so it collides
+  # with the server already there. Either outcome is fine — pick a free address,
+  # or say the usual one is busy — but silently reusing it is not.
+  @id:serve-second-server-gets-a-free-port @requires-gpu
+  Scenario: 18 - A second server does not take an address already in use
+    Given a managed runtime is active
+    And the address a new server would use is already taken
+    When the user serves a model without choosing an address
+    Then the new server does not try to use the taken address
+
+  # Expected to FAIL on Instinct. The engine inventory tells the user Lemonade is
+  # ready to serve on their AMD GPU; that claim is only worth making if a model
+  # served through Lemonade then answers. Where the claim is not made this
+  # scenario does not run, so it never reads as a failure on a host that was
+  # honest about it.
+  @id:lemonade-serves-on-the-gpu-it-claims @requires-gpu @requires-engine:lemonade
+  Scenario: 19 - Lemonade serves on the GPU the engine inventory says it is ready on
+    Given a managed runtime is active
+    And the engine inventory says Lemonade is ready on this GPU
+    And a GGUF model is being served on lemonade
+    When the user sends a chat completion request
+    Then the response contains a model reply
+
   # Honest device selection: a `--gpu` index that does not exist on the host is
   # rejected outright, never silently remapped to another device (no device-0
   # fallback). Runs on GPU hardware: on a no-GPU host the GPU-required pre-flight
