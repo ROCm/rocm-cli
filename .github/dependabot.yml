@@ -56,3 +56,24 @@ updates:
         update-types:
           - minor
           - patch
+
+  # The hook pins in `.pre-commit-config.yaml` were bumped by hand, so they
+  # drifted. Dependabot resolves each `rev` against the hook repository's tags
+  # and leaves the `builtin` and `local` blocks alone -- prek's native hooks and
+  # the `cargo xtask` hooks have no upstream release to track. Grouped into one
+  # PR: this is a short list of linters whose individual bumps carry no review
+  # signal worth a PR each.
+  - package-ecosystem: pre-commit
+    directory: /
+    schedule:
+      interval: weekly
+    # Same reasoning as the two blocks above, and it lands harder here: a hook is
+    # executable code that runs on every contributor's machine at commit time and
+    # in the `prek` CI job, so a compromised release executes before anyone has
+    # read the bump. Cooldown delays only version updates, never security updates.
+    cooldown:
+      default-days: 7
+    groups:
+      pre-commit:
+        patterns:
+          - "*"
