@@ -20,8 +20,9 @@ use crate::http_server::{self, ServerHandle};
 /// request while waiting for the client to POST.
 const CHAT_REQUEST_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// Controls what each `/metrics` scrape returns in a [`ScriptedMetrics`]-backed
-/// mock. Every variant is a deterministic primitive that tests can switch to at
+/// Controls what each `/metrics` scrape returns in a [`ScriptedMetrics`]-backed mock.
+///
+/// Every variant is a deterministic primitive that tests can switch to at
 /// runtime without restarting the server, covering all EAI-7960 contract states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricsMode {
@@ -72,7 +73,7 @@ struct ScriptedMetrics {
 }
 
 impl ScriptedMetrics {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             ticks: AtomicU64::new(0),
             mode: Mutex::new(MetricsMode::Growing),
@@ -102,11 +103,7 @@ impl ScriptedMetrics {
             MetricsMode::Growing | MetricsMode::RunningIdle => {
                 let tick = self.ticks.fetch_add(1, Ordering::Relaxed) + 1;
                 let gen_tokens_total = tick * 20;
-                let running = if mode == MetricsMode::RunningIdle {
-                    0
-                } else {
-                    1
-                };
+                let running = i32::from(mode != MetricsMode::RunningIdle);
                 let ttft_sum_s = tick as f64 * 0.050;
                 let tpot_sum_s = tick as f64 * 20.0 * 0.020;
                 let tpot_count = gen_tokens_total;
