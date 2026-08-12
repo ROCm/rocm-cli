@@ -49,11 +49,19 @@ run on dedicated self-hosted runners with a real AMD GPU attached, so they
 exercise host/GPU detection, engine `detect`/`capabilities`, and live serving
 scenarios that the mock job cannot.
 
-Each workflow has its own consolidated report job (both named `e2e-report`
-internally). `ci.yml`'s `E2E consolidated report` covers the mock platform;
-`e2e-selfhosted.yml`'s `E2E consolidated report (self-hosted)` covers the three
-GPU platforms. Each joins its platforms' reports — including partial or failed
-runs — by scenario id into one HTML report and GitHub step summary.
+Each workflow has its own consolidated report job. `ci.yml`'s `e2e-report`
+covers the mock platform; `e2e-selfhosted.yml`'s `e2e-report` covers the three
+GPU platforms; `nightly.yml`'s `e2e-report-nightly` covers the same three
+platforms with the `@nightly` scenarios included. Each joins its platforms'
+reports — including partial or failed runs — by scenario id into one HTML report
+and GitHub step summary.
+
+The lane artifacts are named canonically (`e2e-report`, `e2e-gpu-report`,
+`e2e-gpu-strix-ubuntu-report`, `e2e-gpu-strix-windows-report`) in every workflow,
+because the report derives each platform's name and OS from the artifact name.
+An unrecognised name renders as a guessed platform on Linux, which would report
+a Windows lane as Linux; `xtask`'s
+`every_uploaded_e2e_artifact_has_a_name_the_report_can_label` guards against it.
 
 ## Triggers
 

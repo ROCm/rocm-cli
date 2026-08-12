@@ -135,12 +135,14 @@ self-hosted runner can never stall `ci.yml`'s merge-required checks:
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo / Windows (self-hosted) | no |
 
 The blocking mock job passes when every applicable scenario is pass-or-xfail with
-no XPASS or unexpected failure; the GPU jobs are non-blocking. Each workflow has
-its own `e2e-report` job: `ci.yml`'s consolidates the mock platform, and
-`e2e-selfhosted.yml`'s consolidates the self-hosted platforms.
+no XPASS or unexpected failure; the GPU jobs are non-blocking. Each workflow
+consolidates its own platforms: `ci.yml`'s `e2e-report` the mock platform,
+`e2e-selfhosted.yml`'s `e2e-report` the self-hosted platforms, and
+`nightly.yml`'s `e2e-report-nightly` the nightly lanes below.
 
 The nightly workflow runs three non-blocking jobs — the existing MI300X job and
-new Strix Halo jobs on Ubuntu and Windows — with `E2E_INCLUDE_NIGHTLY=1`. The
+new Strix Halo jobs on Ubuntu and Windows — with `E2E_INCLUDE_NIGHTLY=1`, then
+consolidates them into the same cross-platform grid. The
 shared large-model scenario serves `Qwen/Qwen3.6-27B` through vLLM on MI300X and
 the hardware-verified `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL` checkpoint
 through Lemonade on Strix Halo.

@@ -634,6 +634,11 @@ jobs:
     name: E2E consolidated report (nightly)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Narrower than the workflow-level `contents: write`, which exists for the
+    # release-publishing jobs. This one checks out, downloads artifacts, runs an
+    # xtask and uploads; it has no business being able to write to the repo.
+    permissions:
+      contents: read
     needs:
       - e2e-gpu-nightly
       - e2e-gpu-nightly-strix
