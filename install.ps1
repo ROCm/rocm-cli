@@ -575,9 +575,12 @@ if ([string]::IsNullOrWhiteSpace($InstallDir)) {
 }
 $InstallDir = Resolve-InstallerPath $InstallDir
 
-$architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+$architecture = $env:PROCESSOR_ARCHITEW6432
+if ([string]::IsNullOrWhiteSpace($architecture)) {
+    $architecture = $env:PROCESSOR_ARCHITECTURE
+}
 switch ($architecture) {
-    "X64" { $platformArch = "amd64" }
+    "AMD64" { $platformArch = "amd64" }
     default { Fail "unsupported architecture: $architecture (installer currently supports Windows x86_64 only)" }
 }
 
