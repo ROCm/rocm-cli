@@ -1,0 +1,17 @@
+[package]
+name = "rocm-deps"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+# Turns the workspace-root `runtime-deps.toml` pins into constants. Declared
+# explicitly so the file is not mistaken for a stray script.
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[build-dependencies]
+toml = "0.8"

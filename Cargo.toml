@@ -3,6 +3,8 @@ members = [
   "apps/rocm",
   "apps/rocmd",
   "crates/rocm-core",
+  # Pinned third-party runtime versions, generated from `runtime-deps.toml`.
+  "crates/rocm-deps",
   "crates/rocm-engine-protocol",
   # rocm-dash telemetry/dashboard libraries (rocm-dash merge).
   "crates/rocm-dash-core",

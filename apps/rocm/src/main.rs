@@ -3599,7 +3599,7 @@ fn resolve_engine_install_runtime_id(
     runtime_id: Option<String>,
 ) -> Result<String> {
     if engine_manages_own_runtime(engine) {
-        return Ok(runtime_id.unwrap_or_else(|| managed_engine_runtime_id(engine).to_owned()));
+        return Ok(runtime_id.unwrap_or_else(|| managed_engine_runtime_id(engine)));
     }
     let Some(selector) = runtime_id
         .or_else(|| config.active_runtime_key.clone())
@@ -3703,10 +3703,15 @@ fn env_root_for_service(
     }
 }
 
-fn managed_engine_runtime_id(engine: &str) -> &'static str {
+/// Label recorded for the runtime a self-managing engine installs for itself.
+///
+/// For `lemonade` this must be the `env_id` its adapter reports, which is
+/// derived from the single Lemonade pin — it was previously a hand-written
+/// literal and had drifted several minor versions behind what is installed.
+fn managed_engine_runtime_id(engine: &str) -> String {
     match engine {
-        "lemonade" => "lemonade-embeddable-10.6.0",
-        _ => "managed-engine-runtime",
+        "lemonade" => format!("lemonade-embeddable-{}", rocm_deps::LEMONADE_VERSION),
+        _ => "managed-engine-runtime".to_owned(),
     }
 }
 
@@ -3718,7 +3723,7 @@ fn ensure_self_managed_engine_ready(
     if !engine_manages_own_runtime(engine) {
         return Ok(());
     }
-    let runtime_id = managed_engine_runtime_id(engine).to_owned();
+    let runtime_id = managed_engine_runtime_id(engine);
     let env_root = env_root_for_self_managed_engine(paths, config)?;
     let detect = engine_request::<_, DetectResponse>(
         Some(paths),
@@ -3730,8 +3735,14 @@ fn ensure_self_managed_engine_ready(
         },
     )
     .ok();
+    // For a self-managing engine the runtime id *is* the env id its adapter
+    // reports for the pinned version, so a version bump leaves an older
+    // install detected-but-not-current. Requiring the ids to match makes the
+    // bump trigger an install instead of silently keeping the old runtime.
     let installed = detect.as_ref().is_some_and(|detect| {
-        detect.installed && detect_runtime_matches_env_root(detect, env_root.as_deref())
+        detect.installed
+            && detect.env_id.as_deref() == Some(runtime_id.as_str())
+            && detect_runtime_matches_env_root(detect, env_root.as_deref())
     });
     let response = if installed {
         None
@@ -23460,7 +23471,7 @@ ID_LIKE="suse opensuse"
         assert!(error.contains("no active ROCm runtime is configured"));
         assert_eq!(
             resolve_engine_install_runtime_id(&paths, &RocmCliConfig::default(), "lemonade", None)?,
-            "lemonade-embeddable-10.6.0"
+            format!("lemonade-embeddable-{}", rocm_deps::LEMONADE_VERSION),
         );
         write_test_pip_runtime(
             &paths,

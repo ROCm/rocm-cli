@@ -19,6 +19,7 @@ anyhow.workspace = true
 clap.workspace = true
 flate2 = "1"
 rocm-core = { path = "../../crates/rocm-core" }
+rocm-deps = { path = "../../crates/rocm-deps" }
 rocm-engine-protocol = { path = "../../crates/rocm-engine-protocol" }
 serde.workspace = true
 serde_json.workspace = true
