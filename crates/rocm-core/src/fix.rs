@@ -160,7 +160,7 @@ const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "fix-6-path",
         title: "Add the ROCm/HIP bin directory to PATH",
-        rationale: "Linux: ROCm is installed at /opt/rocm but its bin directory isn't on PATH, so `rocminfo` / `hipcc` aren't visible to the shell. Windows: the HIP SDK is installed but its bin directory isn't on the User PATH, so `hipInfo.exe` and the runtime DLLs can't be found.",
+        rationale: "Linux: ROCm is installed but its bin directory isn't on PATH, so `rocminfo` / `hipcc` aren't visible to the shell. Windows: the HIP SDK is installed but its bin directory isn't on the User PATH, so `hipInfo.exe` and the runtime DLLs can't be found.",
         auto_applicable: true,
         commands: &[
             "# Linux:",
@@ -740,11 +740,22 @@ fn run_path_export(opts: &FixOptions) -> i32 {
 }
 
 fn run_path_export_linux(opts: &FixOptions) -> i32 {
-    let bin_dir = "/opt/rocm/bin";
-    if !Path::new(bin_dir).is_dir() {
-        println!("{bin_dir} does not exist; nothing to add to PATH.");
+    // Same resolver `examine` uses, so the line we append names the install the
+    // report pointed at -- including a versioned root like /opt/rocm-6.4.1.
+    let Some(install) = crate::discover_rocm_installs().into_iter().next() else {
+        println!("No ROCm install found; nothing to add to PATH.");
+        return 3;
+    };
+    let bin_path = install.path.join("bin");
+    if !bin_path.is_dir() {
+        println!(
+            "{} does not exist; nothing to add to PATH.",
+            bin_path.display()
+        );
         return 3;
     }
+    let bin_dir_owned = bin_path.to_string_lossy().into_owned();
+    let bin_dir = bin_dir_owned.as_str();
     let Some(rc_file) = shell_rc_file() else {
         println!("Could not determine your home directory.");
         return 3;

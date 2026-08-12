@@ -1594,6 +1594,55 @@ mod tests {
     }
 
     #[test]
+    fn path_missing_names_the_versioned_rocm_root() {
+        // A box whose only ROCm is a versioned root used to report an empty
+        // rocm_path, so both structural signals here scored zero and the fix
+        // could only fire on symptom keywords -- and then named /opt/rocm/bin,
+        // which does not exist on that machine.
+        //
+        // Drive the real resolver rather than hand-setting rocm_path, so this
+        // fails if versioned discovery regresses and not just if the check does.
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-diagnose-versioned-{}-{}",
+            std::process::id(),
+            crate::unix_time_millis()
+        ));
+        let opt = root.join("opt");
+        let install = opt.join("rocm-6.4.1");
+        std::fs::create_dir_all(install.join("bin")).expect("plant a fake versioned install");
+        std::fs::write(install.join("bin").join("rocminfo"), "").expect("plant the install marker");
+
+        let discovered = crate::discover_rocm_installs_in(std::slice::from_ref(&opt), None);
+        let found = discovered
+            .first()
+            .expect("the resolver must find a versioned-only install");
+
+        let mut e = linux_base();
+        e.rocm_path = found.path.to_string_lossy().into_owned();
+        e.rocminfo_present = false;
+        e.env.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+
+        let report = diagnose(&e, "");
+        let top = &report.matched[0];
+
+        assert_eq!(top.id, "fix-6-path");
+        assert_eq!(top.score, 70, "50 (rocminfo absent) + 20 (bin not on PATH)");
+        let fix = top.fix.as_ref().expect("fix-6 carries a fix");
+        assert!(
+            fix.summary.contains("rocm-6.4.1/bin"),
+            "guidance must name the versioned root the resolver found: {}",
+            fix.summary
+        );
+        assert!(
+            !fix.summary.contains("/opt/rocm/bin"),
+            "guidance must not name the conventional root that is absent here: {}",
+            fix.summary
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn igpu_dgpu_collision_fires_for_rdna3_apu_plus_discrete() {
         // End-to-end guard for EAI-7412: a gfx1103 (Phoenix APU) + gfx1100
         // (Navi 31 dGPU) box must now trigger the iGPU+dGPU collision fix,
