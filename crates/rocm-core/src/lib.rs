@@ -329,12 +329,23 @@ fn download_attempt(
             url = request.url
         )));
     }
+    // A `206` that does not confirm continuing from `resume_from` cannot be
+    // treated as a fresh full download either: its `Content-Length` is the
+    // length of whatever slice the server chose to send, not the whole
+    // artifact, so accepting it as complete would silently rename a truncated
+    // body into place. Discard the partial file and restart clean with a
+    // plain `GET` instead of reinterpreting the mismatched slice.
+    if status == 206 && resume_from > 0 && content_range_start(&response) != Some(resume_from) {
+        let _ = fs::remove_file(partial_path);
+        return Err(transient(anyhow::anyhow!(
+            "{url} resumed from an unexpected byte offset; restarting the download",
+            url = request.url
+        )));
+    }
     // Only append when the server confirmed it is continuing from exactly where
     // we stopped. A server that ignores `Range` answers 200 with the whole body,
-    // and one that honours it differently than asked would have us append at the
-    // wrong offset — both restart cleanly instead.
-    let resuming =
-        status == 206 && resume_from > 0 && content_range_start(&response) == Some(resume_from);
+    // which restarts cleanly too.
+    let resuming = status == 206 && resume_from > 0;
     let remaining_len = header_u64(&response, "Content-Length");
     let total_len =
         remaining_len.map(|len| len.saturating_add(if resuming { resume_from } else { 0 }));
@@ -7385,6 +7396,11 @@ mod tests {
         },
         /// Honour `Range` and serve the remainder as `206`.
         Resume,
+        /// Answer `206` but from `start` regardless of what `Range` asked for,
+        /// as a non-compliant server or a broken caching proxy might.
+        ResumeAtWrongOffset {
+            start: usize,
+        },
         /// Ignore `Range` and answer `200` with the whole body, as a server
         /// without range support does.
         IgnoreRange,
@@ -7444,6 +7460,16 @@ mod tests {
                     }
                     DownloadReply::Resume => {
                         let start = range_start.min(total);
+                        write!(
+                            stream,
+                            "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            total.saturating_sub(1),
+                            total - start
+                        )?;
+                        stream.write_all(&body[start..])?;
+                    }
+                    DownloadReply::ResumeAtWrongOffset { start } => {
+                        let start = start.min(total);
                         write!(
                             stream,
                             "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -7598,6 +7624,62 @@ mod tests {
             "the retry must ask to continue from byte 5000: {}",
             requests[1]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn download_restarts_cleanly_when_resume_lands_at_the_wrong_offset() -> Result<()> {
+        // The second reply answers `206` from byte 8000, not the byte 5000 we
+        // asked to resume from. Accepting that slice's own `Content-Length` as
+        // the whole artifact would silently rename a corrupt file into place;
+        // instead the third attempt must be a plain `GET` that refetches the
+        // whole thing.
+        let body = download_body();
+        let (port, server) = spawn_download_server(
+            body.clone(),
+            vec![
+                DownloadReply::Truncated { sent: 5000 },
+                DownloadReply::ResumeAtWrongOffset { start: 8000 },
+                DownloadReply::Complete,
+            ],
+        )?;
+        let dir = download_scratch("wrong-offset");
+        let destination = dir.join("artifact.bin");
+
+        let outcome = download_file_streaming(&DownloadRequest::new(
+            &format!("http://127.0.0.1:{port}/artifact.bin"),
+            &destination,
+            Duration::from_secs(10),
+        ))?;
+
+        let written = fs::read(&destination)?;
+        let requests = server.join().expect("server thread")?;
+        let leftovers: Vec<_> = fs::read_dir(&dir)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .filter(|name| name.to_string_lossy().contains(".part"))
+            .collect();
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            written, body,
+            "a mismatched-offset resume must not be accepted as a complete artifact"
+        );
+        assert_eq!(
+            outcome.sha256,
+            format!("{:x}", Sha256::digest(&body)),
+            "the digest must cover the whole artifact from the clean restart"
+        );
+        assert_eq!(
+            requests.len(),
+            3,
+            "the wrong-offset reply must be discarded and retried, not accepted"
+        );
+        assert!(
+            !requests[2].contains("Range:"),
+            "the restart after a wrong-offset resume must be a plain GET: {}",
+            requests[2]
+        );
+        assert!(leftovers.is_empty(), "the .part file must not survive");
         Ok(())
     }
 
