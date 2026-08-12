@@ -1353,11 +1353,11 @@ struct VllmInstallTarget {
     requirement: String,
 }
 
-/// ROCm wheel index passed to `uv pip install vllm`.
+/// Pure resolution of the ROCm wheel index from an optional override value.
 ///
-/// Defaults to [`VLLM_ROCM_EXTRA_INDEX_URL`]; override with
-/// `ROCM_CLI_VLLM_ROCM_INDEX_URL` (non-empty) to target a different
-/// vLLM/ROCm combination.
+/// Falls back to [`VLLM_ROCM_EXTRA_INDEX_URL`] when the override is absent or
+/// blank; a usable one is trimmed. The caller supplies the value (see
+/// [`vllm_install_target`] for the environment read) so this stays testable.
 fn resolve_vllm_rocm_extra_index_url(override_value: Option<String>) -> String {
     override_value
         .map(|value| value.trim().to_owned())
