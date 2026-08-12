@@ -59,15 +59,22 @@ runs — by scenario id into one HTML report and GitHub step summary.
 
 The GPU jobs (in `e2e-selfhosted.yml`) run automatically on `push`,
 `pull_request`, and `merge_group` when the workflow's own `changes` job's
-`heavy` path filter is `true` (the change touches code that can affect runtime
-behavior, not just docs or unrelated files). Unlike the pre-split layout they do
-**not** gate on the hosted `build-and-test` job — cross-workflow `needs` is not
-possible, so each GPU job builds the `rocm` binary itself as its first real step
-(a broken build fails that job fast and non-fatally). `ci.yml`'s required
-`build-and-test` and mock `e2e` remain the authoritative pre-merge build gate.
+`serve` path filter is `true`. `serve` is narrower than `heavy`: it matches only
+paths that can change serve *behaviour* or the GPU E2E harness (the engines, the
+serve code path in `apps/rocm`/`apps/rocmd`, `rocm-core`, the e2e-cucumber crate,
+plus broad-dependency safety nets), **not** a blanket `**/*.rs`. So a Rust change
+that cannot affect serving — e.g. a dashboard-only or unrelated-crate PR — skips
+the heavy GPU matrix, while compile coverage for every crate still runs on
+`ci.yml`'s always-on build/test lanes. Off `pull_request` (push/merge_group) the
+filter is forced `true`, so the full matrix always runs there. Unlike the
+pre-split layout the GPU jobs do **not** gate on the hosted `build-and-test` job
+— cross-workflow `needs` is not possible, so each GPU job builds the `rocm`
+binary itself as its first real step (a broken build fails that job fast and
+non-fatally). `ci.yml`'s required `build-and-test` and mock `e2e` remain the
+authoritative pre-merge build gate.
 
 They can also be triggered manually via `e2e-selfhosted.yml`'s
-`workflow_dispatch`, independent of the `heavy` gate, with these inputs:
+`workflow_dispatch`, independent of the `serve` gate, with these inputs:
 
 - `platform` (choice: `all`, `app-dev-gpu`, `strix-ubuntu`, `strix-windows`) —
   which self-hosted job(s) to run. `app-dev-gpu` maps to `e2e-gpu`,

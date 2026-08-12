@@ -69,6 +69,9 @@ jobs:
       pull-requests: read
     outputs:
       heavy: ${{ steps.filter.outputs.heavy || steps.all.outputs.forced }}
+      # Narrow GPU-serve gate; forced true off-PR so the merge queue always runs
+      # the full matrix and its required checks are never starved.
+      serve: ${{ steps.filter.outputs.serve || steps.all.outputs.forced }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -95,6 +98,33 @@ jobs:
               - 'install*'
               - 'docs/keys/**'
               - '.github/workflows/**'
+            # The real-GPU serve matrix (e2e-gpu*). Narrower than `heavy`: only
+            # paths that can change serve BEHAVIOUR or the GPU E2E harness — NOT a
+            # blanket `**/*.rs`. Compile coverage for every crate already runs on
+            # ci.yml's always-on build/test lanes, so a dash-only or unrelated-
+            # crate Rust PR need not fire the heavy serve matrix. Err toward
+            # inclusion — Cargo.lock, the toolchain, and the workflow itself are
+            # broad safety nets so a transitive-dep or CI change still runs the
+            # matrix. (Excluded on purpose: crates/rocm-dash-* — they build into
+            # `rocm` but cannot change serve behaviour.)
+            serve:
+              - 'engines/**'
+              - 'crates/rocm-core/**'
+              - 'crates/rocm-engine-protocol/**'
+              - 'apps/rocm/**'
+              - 'apps/rocmd/**'
+              - 'tests/e2e-cucumber/**'
+              - 'crates/e2e-report/**'
+              - 'xtask/**'
+              - '**/*.feature'
+              - 'scripts/**'
+              # Root manifest only (NOT `**/Cargo.toml` — that would re-include
+              # the excluded dash crates): `[workspace.dependencies]` edits here
+              # can change a serving crate's deps without touching Cargo.lock.
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain*'
+              - '.github/workflows/**'
 
       - name: Force full run off pull requests
         id: all
@@ -114,7 +144,7 @@ jobs:
       && needs.changes.result == 'success'
       && (
         (github.event_name != 'workflow_dispatch'
-          && needs.changes.outputs.heavy == 'true')
+          && needs.changes.outputs.serve == 'true')
         || (github.event_name == 'workflow_dispatch'
           && (inputs.platform == 'all' || inputs.platform == 'app-dev-gpu'))
       )
@@ -310,7 +340,7 @@ jobs:
       && needs.changes.result == 'success'
       && (
         (github.event_name != 'workflow_dispatch'
-          && needs.changes.outputs.heavy == 'true')
+          && needs.changes.outputs.serve == 'true')
         || (github.event_name == 'workflow_dispatch'
           && (inputs.platform == 'all' || inputs.platform == 'strix-ubuntu'))
       )
@@ -468,7 +498,7 @@ jobs:
       && needs.changes.result == 'success'
       && (
         (github.event_name != 'workflow_dispatch'
-          && needs.changes.outputs.heavy == 'true')
+          && needs.changes.outputs.serve == 'true')
         || (github.event_name == 'workflow_dispatch'
           && (inputs.platform == 'all' || inputs.platform == 'strix-windows'))
       )
@@ -621,9 +651,13 @@ jobs:
       - e2e-gpu
       - e2e-gpu-strix-ubuntu
       - e2e-gpu-strix-windows
+    # Gate on `serve`: every lane this report consolidates (the GPU jobs) is now
+    # serve-gated, so a serve-only change runs them and their report must still be
+    # produced. On dispatch `serve` is unset, so also run when the trigger was
+    # manual; `always()` still lets it collect partial/failed tiers.
     if: >-
       always()
-      && (needs.changes.outputs.heavy == 'true'
+      && (needs.changes.outputs.serve == 'true'
         || github.event_name == 'workflow_dispatch')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
