@@ -1304,30 +1304,34 @@ fn probe_gpus_windows(e: &mut Examination) {
 }
 
 fn probe_hip_sdk_windows(e: &mut Examination) {
+    // `$HIP_PATH` still wins: it names the SDK specifically, where the resolver
+    // answers the broader "which ROCm installs are on this machine".
     let mut root = std::env::var("HIP_PATH").unwrap_or_default();
     if root.is_empty() || !Path::new(&root).is_dir() {
-        // Scan the conventional install location for the newest ROCm dir.
-        let base = Path::new(r"C:\Program Files\AMD\ROCm");
-        if let Ok(entries) = std::fs::read_dir(base) {
-            let mut versions: Vec<String> = entries
-                .flatten()
-                .filter(|entry| entry.path().is_dir())
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .collect();
-            versions.sort();
-            if let Some(latest) = versions.last() {
-                root = base.join(latest).to_string_lossy().into_owned();
-            }
-        }
+        // Was a hand-rolled scan of one directory with `versions.sort()`, so
+        // `6.2` outranked `6.10` and any directory whose name looked plausible
+        // counted as an install. The shared resolver orders by numeric
+        // component, searches the same roots as everything else, honours
+        // `$ROCM_PATH`, and requires an install marker before believing a
+        // directory.
+        root = crate::discover_rocm_installs()
+            .into_iter()
+            .next()
+            .map(|install| install.path.to_string_lossy().into_owned())
+            .unwrap_or_default();
     }
     if root.is_empty() || !Path::new(&root).is_dir() {
         return;
     }
     e.hip_sdk_path = root.clone();
-    e.hip_sdk_version = Path::new(&root)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    // Prefer what the install says about itself; the directory name is only a
+    // fallback for a `$HIP_PATH` pointing somewhere unversioned.
+    e.hip_sdk_version = crate::rocm_install_version(Path::new(&root)).unwrap_or_else(|| {
+        Path::new(&root)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
 
     let hipinfo = Path::new(&root).join("bin").join("hipInfo.exe");
     if hipinfo.is_file() {
