@@ -102,7 +102,9 @@ pub struct HostCapability {
     /// First AMD GPU's gfx target from `examine`'s `detected_gfx_target:` line
     /// (e.g. "gfx942", "gfx1151"), if a real one was reported.
     pub gfx_target: Option<String>,
-    /// Whether an AMD GPU was detected (a real `detected_gfx_target` is present).
+    /// Whether an AMD GPU is present AND usable here, so `@requires-gpu`
+    /// scenarios can run. A real `detected_gfx_target`, plus a ready ROCm
+    /// driver path on WSL — see [`host_has_usable_gpu`].
     pub has_amd_gpu: bool,
     /// Engine adapters the binary reports as present. Both builtins are always
     /// "built-in", so this is NOT the same as "can start here" — use
@@ -331,8 +333,13 @@ fn probe_host_capability() -> HostCapability {
     let examine = run_probe(root, &["examine"]);
     let engines = run_probe(root, &["engines", "list"]);
 
-    let (os_family, is_wsl, gfx_target) = parse_examine_text(&examine);
-    let has_amd_gpu = gfx_target.is_some();
+    let ExamineFacts {
+        os_family,
+        is_wsl,
+        gfx_target,
+        driver_status,
+    } = parse_examine_text(&examine);
+    let has_amd_gpu = host_has_usable_gpu(gfx_target.as_deref(), is_wsl, &driver_status);
     let available_engines = parse_engines_list(&engines);
     let effective_serve_engine = effective_serve_engine(gfx_target.as_deref(), &os_family);
     let platform_slug =
@@ -363,15 +370,34 @@ fn run_probe(root: &std::path::Path, args: &[&str]) -> String {
     }
 }
 
-/// Extract `(os_family, is_wsl, first_gfx_target)` from the human `rocm examine`
-/// text (format string in rocm-core `ExamineSummary`): lines like `  os: linux`,
-/// `  detected_gfx_target: gfx942`, `  wsl: false`. A missing/placeholder
-/// (`<unknown>`, empty, `none`) gfx target yields `None` (→ treated as no GPU).
-/// Tolerant: an unrecognized dump degrades to a mock-like host.
-fn parse_examine_text(text: &str) -> (String, bool, Option<String>) {
+/// The `examine` fields the capability probe reads.
+struct ExamineFacts {
+    os_family: String,
+    is_wsl: bool,
+    gfx_target: Option<String>,
+    /// `driver_status:` — the CLI's own verdict on whether the runtime can
+    /// reach the device. Only consulted on WSL (see [`host_has_usable_gpu`]).
+    driver_status: String,
+}
+
+/// `driver_status` value meaning ROCm's WSL passthrough path is complete.
+///
+/// The CLI sets this only when `/dev/dxg`, dxcore, `librocdxg.so` and its
+/// ldconfig entry are all present; the other WSL states (`wsl_rocdxg_missing`,
+/// `wsl_gpu_plumbing_missing`) mean the runtime cannot reach the GPU.
+const WSL_DRIVER_READY: &str = "wsl_rocdxg_ready";
+
+/// Extract the probe's facts from the human `rocm examine` text (format string
+/// in rocm-core `ExamineSummary`): lines like `  os: linux`,
+/// `  detected_gfx_target: gfx942`, `  wsl: false`, `  driver_status: ...`. A
+/// missing/placeholder (`<unknown>`, empty, `none`) gfx target yields `None`
+/// (→ treated as no GPU). Tolerant: an unrecognized dump degrades to a
+/// mock-like host.
+fn parse_examine_text(text: &str) -> ExamineFacts {
     let mut os_family = "other".to_owned();
     let mut is_wsl = false;
     let mut gfx_target = None;
+    let mut driver_status = String::new();
     for line in text.lines() {
         let line = line.trim();
         if let Some(v) = line.strip_prefix("os:") {
@@ -383,9 +409,29 @@ fn parse_examine_text(text: &str) -> (String, bool, Option<String>) {
             }
         } else if let Some(v) = line.strip_prefix("wsl:") {
             is_wsl = matches!(v.trim(), "true" | "yes" | "1");
+        } else if let Some(v) = line.strip_prefix("driver_status:") {
+            driver_status = v.trim().to_owned();
         }
     }
-    (os_family, is_wsl, gfx_target)
+    ExamineFacts {
+        os_family,
+        is_wsl,
+        gfx_target,
+        driver_status,
+    }
+}
+
+/// Whether `@requires-gpu` scenarios can actually run on this host.
+///
+/// A detected gfx target is enough on a native host. It is NOT enough under
+/// WSL: the target is reported from the Windows-side driver even when ROCm has
+/// no path to the device, so a distro missing `librocdxg.so` advertises
+/// `gfx1151` while `rocm serve` refuses with "no usable AMD GPU". Taking the
+/// target at face value there runs every GPU scenario against a host that
+/// cannot serve one — they fail on their premise rather than resolving to
+/// not-applicable, which is exactly what the capability probe exists to avoid.
+fn host_has_usable_gpu(gfx_target: Option<&str>, is_wsl: bool, driver_status: &str) -> bool {
+    gfx_target.is_some() && (!is_wsl || driver_status == WSL_DRIVER_READY)
 }
 
 /// Parse engine names from `rocm engines list`. Engine rows are the lines whose
@@ -556,10 +602,11 @@ rocm examine
   wsl: false
   driver_status: ok
 ";
-        let (os, wsl, gfx) = parse_examine_text(text);
-        assert_eq!(os, "linux");
-        assert!(!wsl);
-        assert_eq!(gfx.as_deref(), Some("gfx942"));
+        let facts = parse_examine_text(text);
+        assert_eq!(facts.os_family, "linux");
+        assert!(!facts.is_wsl);
+        assert_eq!(facts.gfx_target.as_deref(), Some("gfx942"));
+        assert_eq!(facts.driver_status, "ok");
     }
 
     #[test]
@@ -571,9 +618,41 @@ rocm examine
   detected_gfx_target: <unknown>
   wsl: false
 ";
-        let (os, _, gfx) = parse_examine_text(text);
-        assert_eq!(os, "other");
-        assert_eq!(gfx, None);
+        let facts = parse_examine_text(text);
+        assert_eq!(facts.os_family, "other");
+        assert_eq!(facts.gfx_target, None);
+    }
+
+    /// A WSL distro advertises the Windows-side gfx target whether or not ROCm
+    /// can reach it, so the driver verdict is what decides. Without this, every
+    /// `@requires-gpu` scenario runs on a host where `serve` cannot start and
+    /// fails on its premise instead of resolving to not-applicable.
+    #[test]
+    fn wsl_gpu_requires_a_ready_rocdxg_path() {
+        // Real values from the self-hosted WSL runner before librocdxg was
+        // installed: /dev/dxg present, the ROCm passthrough library missing.
+        assert!(!host_has_usable_gpu(
+            Some("gfx1151"),
+            true,
+            "wsl_rocdxg_missing"
+        ));
+        assert!(!host_has_usable_gpu(
+            Some("gfx1151"),
+            true,
+            "wsl_gpu_plumbing_missing"
+        ));
+        // Complete passthrough: the GPU is usable and the scenarios must run.
+        assert!(host_has_usable_gpu(Some("gfx1151"), true, WSL_DRIVER_READY));
+        // A native host is unaffected by the driver verdict.
+        assert!(host_has_usable_gpu(
+            Some("gfx942"),
+            false,
+            "amdgpu_available"
+        ));
+        assert!(host_has_usable_gpu(Some("gfx942"), false, ""));
+        // No gfx target is still no GPU, WSL or not.
+        assert!(!host_has_usable_gpu(None, true, WSL_DRIVER_READY));
+        assert!(!host_has_usable_gpu(None, false, "amdgpu_available"));
     }
 
     #[test]
