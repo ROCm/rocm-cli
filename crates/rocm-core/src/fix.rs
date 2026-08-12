@@ -964,35 +964,106 @@ fn ps_env_scope(var: &str, scope: &str) -> String {
     }
 }
 
-/// Newest `C:\Program Files\AMD\ROCm\<version>` install dir, or empty.
+/// Newest ROCm/HIP SDK install root on this host, or empty if there is none.
+///
+/// This was the third independent Windows install scan in the codebase, and it
+/// disagreed with the other two on every axis that matters: it searched
+/// `C:\Program Files (x86)\AMD\ROCm` where the resolver searches
+/// `C:\Program Files\ROCm`, it sorted with a plain `versions.sort()` so `6.2`
+/// outranked `6.10`, and it accepted any directory whose name began with a
+/// digit without checking for an install marker. So `fix-6-path` could put an
+/// older SDK — or an empty directory — on the user's PATH.
+///
+/// It now asks the same resolver as `examine`, which also means `$ROCM_PATH` is
+/// honoured here for the first time.
 fn newest_rocm_install_dir() -> String {
-    for root in [
-        r"C:\Program Files\AMD\ROCm",
-        r"C:\Program Files (x86)\AMD\ROCm",
-    ] {
-        if let Ok(entries) = std::fs::read_dir(root) {
-            let mut versions: Vec<PathBuf> = entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.is_dir()
-                        && p.file_name()
-                            .and_then(|n| n.to_str())
-                            .is_some_and(|n| n.chars().next().is_some_and(|c| c.is_ascii_digit()))
-                })
-                .collect();
-            versions.sort();
-            if let Some(latest) = versions.last() {
-                return latest.to_string_lossy().into_owned();
-            }
-        }
-    }
-    String::new()
+    crate::discover_rocm_installs()
+        .into_iter()
+        .next()
+        .map(|install| install.path.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plant a directory the shared resolver will accept as a ROCm install.
+    /// `bin/rocminfo` is one of the markers it gates on; a bare directory is
+    /// deliberately not enough.
+    fn plant_install(root: &std::path::Path) {
+        std::fs::create_dir_all(root.join("bin")).expect("create planted install");
+        std::fs::write(root.join("bin").join("rocminfo"), "").expect("write marker");
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+    fn the_path_fix_finds_the_install_the_rest_of_the_cli_found() {
+        // Discriminating on purpose: the scanner this replaces looked only in
+        // two hardcoded `C:\Program Files` directories and ignored $ROCM_PATH
+        // outright, so it returned nothing here no matter what was planted.
+        // Going through the shared resolver is what makes this pass -- and is
+        // what stops fix-6-path putting 6.2 on PATH when 6.10 is installed.
+        let root = std::env::temp_dir().join(format!(
+            "rocm-fix-path-resolver-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let install = root.join("rocm-6.10.0");
+        plant_install(&install);
+
+        let previous = std::env::var_os("ROCM_PATH");
+        unsafe {
+            std::env::set_var("ROCM_PATH", &install);
+        }
+        let found = newest_rocm_install_dir();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("ROCM_PATH", value),
+                None => std::env::remove_var("ROCM_PATH"),
+            }
+        }
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(
+            found,
+            install.to_string_lossy(),
+            "fix-6-path must resolve installs the same way examine does"
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+    fn the_path_fix_reports_nothing_rather_than_a_directory_with_no_install_in_it() {
+        // The old scan accepted any directory whose name started with a digit,
+        // so an empty leftover could be put on PATH. The resolver requires a
+        // marker.
+        let root = std::env::temp_dir().join(format!(
+            "rocm-fix-path-empty-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let empty = root.join("6.10");
+        std::fs::create_dir_all(&empty).expect("create empty dir");
+
+        let previous = std::env::var_os("ROCM_PATH");
+        unsafe {
+            std::env::set_var("ROCM_PATH", &empty);
+        }
+        let found = newest_rocm_install_dir();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("ROCM_PATH", value),
+                None => std::env::remove_var("ROCM_PATH"),
+            }
+        }
+        std::fs::remove_dir_all(&root).ok();
+
+        assert!(
+            found.is_empty(),
+            "an empty directory is not an install, but {found:?} was returned"
+        );
+    }
 
     #[test]
     fn every_recipe_id_is_unique_and_covers_the_catalog() {
