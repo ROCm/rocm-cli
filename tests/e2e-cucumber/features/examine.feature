@@ -62,12 +62,15 @@ Feature: GPU detection and system inspection
     When the user inspects the system both for reading and for scripting
     Then the machine-readable form states everything the readable one does
 
-  # Expected to FAIL wherever a GPU is actually present. The harness parses the
-  # human text rather than this form precisely because of this defect, and says
-  # so in capability.rs — on a real MI300X the machine-readable form reported no
-  # AMD GPU on a machine that has one. That workaround makes the disagreement
-  # load-bearing: every host capability the suite resolves comes from scraped
-  # text because this form could not be trusted.
+  # Expected to FAIL on Instinct. The harness parses the human text rather than
+  # this form precisely because of this defect, and says so in capability.rs —
+  # on a real MI300X the machine-readable form reported no AMD GPU on a machine
+  # that has one. That workaround makes the disagreement load-bearing: every
+  # host capability the suite resolves comes from scraped text because this form
+  # could not be trusted.
+  #
+  # It is narrower than "any host with a GPU": Strix Halo (gfx1151) agrees,
+  # MI300X (gfx943) does not. The expectations row is scoped to match.
   @id:examine-both-forms-agree-on-gpu
   Scenario: 8 - Both forms of the inspection agree about the GPU
     When the user inspects the system both for reading and for scripting
