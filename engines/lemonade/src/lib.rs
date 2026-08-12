@@ -2619,7 +2619,7 @@ fn find_binary_in(dir: &Path, binary: &str) -> Option<PathBuf> {
     }
     fs::read_dir(dir)
         .ok()?
-        .filter_map(|entry| entry.ok())
+        .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.is_dir())
         .map(|subdir| subdir.join(binary))
