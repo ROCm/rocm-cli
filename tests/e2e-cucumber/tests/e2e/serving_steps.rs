@@ -740,6 +740,306 @@ async fn user_serves_absent_gpu_index(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+// ── Device policies the command offers ─────────────────────────────
+
+/// The device policies `serve --help` advertises, read out of the help rather
+/// than listed here so the check follows whatever the command currently offers.
+fn advertised_device_policies(help: &str) -> Vec<String> {
+    help.lines()
+        .find_map(|line| {
+            let (_, rest) = line.split_once("[possible values:")?;
+            let (values, _) = rest.split_once(']')?;
+            Some(
+                values
+                    .split(',')
+                    .map(|value| value.trim().to_owned())
+                    .filter(|value| !value.is_empty())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .unwrap_or_default()
+}
+
+#[when("the user serves a model under each device policy the command offers")]
+async fn user_serves_under_each_device_policy(world: &mut E2eWorld) {
+    let (help, _, _) = crate::run_rocm(world, &["serve", "--help"]);
+    let policies = advertised_device_policies(&help);
+    assert!(
+        !policies.is_empty(),
+        "`serve --help` advertises no device policies to check:\n{help}"
+    );
+    let (model, engine, _) = host_serve_target();
+    // One line per policy, so a failure names which one was refused. This runs
+    // only where there is no GPU, so no serve can actually start and each of
+    // these returns promptly.
+    let mut transcript = Vec::new();
+    for policy in &policies {
+        let (stdout, stderr, rc) = crate::run_rocm(
+            world,
+            &["serve", model, "--engine", engine, "--device", policy],
+        );
+        transcript.push(format!("{policy}\t{rc}\t{stdout}{stderr}"));
+    }
+    world.cli_outputs = Some(transcript);
+}
+
+#[then("no policy is refused for being that policy")]
+async fn assert_no_policy_refused(world: &mut E2eWorld) {
+    let transcript = world
+        .cli_outputs
+        .as_ref()
+        .expect("no serve attempts recorded");
+    // On this lane every policy is refused for the same host-level reason — the
+    // machine has no GPU — and that refusal is not what this scenario is about.
+    // What it must not find is a refusal aimed at the POLICY: a command that
+    // offers a choice and then rejects the user for making it.
+    let rejected: Vec<&String> = transcript
+        .iter()
+        .filter(|line| {
+            let lower = line.to_lowercase();
+            lower.contains("cpu mode is not a fallback path")
+                || lower.contains("unsupported device policy")
+        })
+        .collect();
+    assert!(
+        rejected.is_empty(),
+        "`serve --help` offers these device policies, but the command refuses one for being \
+         what it is:\n{}",
+        rejected
+            .iter()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+// ── A local server this scenario owns ──────────────────────────────
+
+/// The recorded id of the server a scenario starts for itself. Distinct from the
+/// planted mock's id so the suite's teardown treats it as a real service and
+/// tries to stop it too, as a backstop behind the scenario's own assertion.
+const OWNED_SERVICE_ID: &str = "e2e-owned-server";
+
+#[given("a local server this machine manages is running")]
+async fn given_owned_managed_server(world: &mut E2eWorld) {
+    let pid = world.start_managed_service_process(OWNED_SERVICE_ID, "TestModel/E2E-1B");
+    // The CLI must agree the server is there before anything is asked of it,
+    // otherwise a later "it is gone" would prove nothing.
+    let (listing, _, _) = crate::run_rocm(world, &["services", "list"]);
+    assert!(
+        listing.contains(OWNED_SERVICE_ID),
+        "the CLI does not list the running server (pid {pid}), so there is nothing to \
+         stop:\n{listing}"
+    );
+}
+
+#[when("the user stops the server that is running")]
+async fn user_stops_running_server(world: &mut E2eWorld) {
+    // Whichever service this scenario's serve registered. Read from the record
+    // the CLI wrote in its own (isolated) services directory — the same on-disk
+    // schema the suite's teardown reads — rather than assuming an id.
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    let service_id = std::fs::read_dir(&root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|e| e == "json"))
+        .find_map(|entry| {
+            let bytes = std::fs::read(entry.path()).ok()?;
+            let record: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            Some(record.get("service_id")?.as_str()?.to_owned())
+        })
+        .unwrap_or_else(|| panic!("no managed service recorded under {}", root.display()));
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["services", "stop", &service_id, "--yes"]);
+    world.cli_output = Some(format!("{stdout}{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user removes the CLI's managed files")]
+async fn user_removes_managed_files(world: &mut E2eWorld) {
+    // `--keep-binaries` is what keeps this safe to run on a shared runner: the
+    // config, data and cache directories are this scenario's own temporary ones,
+    // so the removal is real but reaches nothing outside the scenario. It does
+    // not weaken the scenario — whether the CLI stops what it manages has
+    // nothing to do with whether it also deletes the program.
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["uninstall", "--yes", "--keep-binaries"]);
+    world.cli_output = Some(format!("{stdout}{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
+#[then("the removal is reported as complete")]
+async fn assert_removal_complete(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no uninstall output");
+    assert_eq!(world.cli_rc, Some(0), "removal did not succeed:\n{output}");
+    assert!(
+        output.contains("uninstall complete"),
+        "removal did not report completion:\n{output}"
+    );
+}
+
+#[then("the server is no longer running")]
+async fn assert_owned_server_stopped(world: &mut E2eWorld) {
+    let output = world.cli_output.clone().unwrap_or_default();
+    // Asked of the OS, and asked HERE — before this scenario's teardown, which
+    // also kills what it owns. Deferring the question until after teardown would
+    // report the harness's own cleanup as the product's work, turning the very
+    // defect under test into a pass.
+    let mut still_running = Vec::new();
+    for process in &mut world.owned_processes {
+        if process.is_running() {
+            still_running.push(process.pid());
+        }
+    }
+    assert!(
+        still_running.is_empty(),
+        "the CLI reported success but the server it manages is still running (pid \
+         {still_running:?}):\n{output}"
+    );
+}
+
+#[then("the CLI reports that it stopped a process")]
+async fn assert_stop_count_reported(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no stop output");
+    assert_eq!(world.cli_rc, Some(0), "stopping did not succeed:\n{output}");
+    let reported = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("stopped processes:"))
+        .map_or_else(
+            || panic!("the stop gave no account of what it stopped:\n{output}"),
+            str::trim,
+        );
+    let count: u32 = reported
+        .parse()
+        .unwrap_or_else(|_| panic!("could not read the reported count {reported:?}:\n{output}"));
+    // An operator reading "0" has been told the stop found nothing to do, which
+    // is the opposite of what happened.
+    assert!(
+        count >= 1,
+        "the server was running and is now stopped, but the CLI reports it stopped \
+         {count}:\n{output}"
+    );
+}
+
+// ── Choosing a device and an address ───────────────────────────────
+
+#[when("the user serves a model letting the CLI choose the GPU")]
+async fn user_serves_with_auto_gpu(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    // `--gpu auto` is the default, named here so the scenario is about the
+    // choice rather than about what happens to be configured. The plan the CLI
+    // prints on its way to launching is where it says which device it picked,
+    // and that line is all this scenario reads — whether the serve then goes on
+    // to succeed is a different scenario's business.
+    ensure_serve_port_free().await;
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "serve",
+            model,
+            "--engine",
+            engine,
+            "--gpu",
+            "auto",
+            "--managed",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the plan names the device it chose")]
+async fn assert_auto_gpu_named(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    let chosen = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("gpu: auto (selected "))
+        .and_then(|rest| rest.split(')').next())
+        .map_or_else(
+            || panic!("the plan does not say which GPU was chosen:\n{output}"),
+            str::trim,
+        );
+    // "none" on a machine that has a GPU leaves the user unable to tell whether
+    // their model is about to run on the device at all.
+    assert_ne!(
+        chosen, "none",
+        "this machine has an AMD GPU, but letting the CLI choose one selected \
+         nothing:\n{output}"
+    );
+}
+
+#[given("the address a new server would use is already taken")]
+async fn given_default_serve_address_taken(world: &mut E2eWorld) {
+    // Hold the address a server started without `--port` would take, so the next
+    // serve meets exactly the situation a user's second server meets.
+    ensure_serve_port_free().await;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", SERVE_PORT))
+        .unwrap_or_else(|e| panic!("could not take the default serve address: {e}"));
+    // Held on the World so it stays taken for the whole scenario and is released
+    // with it.
+    world.occupied_address = Some(listener);
+}
+
+#[when("the user serves a model without choosing an address")]
+async fn user_serves_without_choosing_address(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    // No `--port`, so the CLI picks the address itself — which is the whole
+    // question. The serve is expected not to come up (something else holds the
+    // address), so nothing here waits for readiness; the planned address is
+    // printed before the engine is launched.
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["serve", model, "--engine", engine, "--managed"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the new server does not try to use the taken address")]
+async fn assert_new_server_avoids_taken_address(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    let planned = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("port:"))
+        .map(str::trim);
+    // Two honest outcomes: pick somewhere else, or say the usual address is
+    // busy. Planning to use it anyway is the one that collides with the server
+    // already there.
+    match planned {
+        None => assert!(
+            world.cli_rc != Some(0),
+            "the CLI neither planned an address nor refused:\n{output}"
+        ),
+        Some(port) => assert_ne!(
+            port,
+            SERVE_PORT.to_string(),
+            "the address is already taken, but the new server plans to use it \
+             anyway:\n{output}"
+        ),
+    }
+}
+
+#[given("the engine inventory says Lemonade is ready on this GPU")]
+async fn given_lemonade_claims_gpu_readiness(world: &mut E2eWorld) {
+    let (listing, _, _) = crate::run_rocm(world, &["engines", "list"]);
+    // Where the claim is not made, there is nothing to hold the CLI to, so the
+    // scenario stops here rather than reading as a failure on a host that was
+    // honest about what it can do.
+    let claims = listing
+        .lines()
+        .any(|line| line.contains("Lemonade is ready") && line.contains("GPU"));
+    assert!(
+        claims,
+        "the engine inventory does not claim Lemonade is ready on this GPU, so there is no \
+         claim to hold it to:\n{listing}"
+    );
+}
+
 #[when("the CLI reports the service as ready")]
 async fn when_cli_reports_ready(world: &mut E2eWorld) {
     // Read readiness from the CLI's own view (`services list`), not a direct

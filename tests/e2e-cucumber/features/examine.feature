@@ -17,6 +17,25 @@ Feature: GPU detection and system inspection
     When the user asks for help
     Then the subcommands are listed in alphabetical order
 
+  # Expected to FAIL. The help's own worked examples are the first thing a new
+  # user copies, so a model named there has to be one this CLI can actually
+  # serve. The check accepts either form the README documents — a name the model
+  # listing knows, or an explicit `owner/repo` reference — and so does not
+  # prescribe which model the examples should use.
+  @id:help-serve-example-names-a-resolvable-model
+  Scenario: 11 - Every model the help offers as an example is one the CLI can resolve
+    When the user reads the serve examples the help offers
+    Then every model named there is one the CLI can resolve
+
+  # Expected to FAIL. Running the CLI with no subcommand and running its
+  # dashboard command are two different things, and the help describes them as
+  # the same one — so a reader has no way to learn what the plain command does
+  # or that there is anything else to reach.
+  @id:help-describes-the-default-command
+  Scenario: 12 - The help tells the two ways of opening a screen apart
+    When the user asks for help
+    Then running the CLI with no subcommand is not described as the dashboard command
+
   @id:examine-detects-gpu-and-driver @requires-gpu
   Scenario: 3 - System inspection detects the GPU and driver
     Given a machine with an AMD GPU

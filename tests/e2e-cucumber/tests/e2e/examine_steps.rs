@@ -47,6 +47,119 @@ async fn user_asks_help(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
 }
 
+// ── What the help itself promises ──────────────────────────────────
+
+/// Model references named after `rocm serve ` in an examples block, from both
+/// the top-level help and `serve`'s own. A worked example is copied verbatim, so
+/// the name in it is the one that has to work.
+fn serve_example_models(help: &str) -> Vec<String> {
+    help.lines()
+        .filter_map(|line| line.trim().strip_prefix("rocm serve "))
+        .filter_map(|rest| rest.split_whitespace().next())
+        // The generic placeholders the help uses to describe the FORM of a model
+        // reference are not names anyone is expected to run.
+        .filter(|model| !model.starts_with('<'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Every name the CLI's own model listing answers to: each recipe's canonical id
+/// plus its aliases, as `rocm model --verbose` prints them.
+fn known_model_names(listing: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in listing.lines() {
+        let Some((head, rest)) = line.trim().split_once(" aliases=[") else {
+            continue;
+        };
+        names.push(head.trim().to_owned());
+        if let Some((aliases, _)) = rest.split_once(']') {
+            names.extend(aliases.split(',').map(|alias| alias.trim().to_owned()));
+        }
+    }
+    names
+}
+
+#[when("the user reads the serve examples the help offers")]
+async fn user_reads_serve_examples(world: &mut E2eWorld) {
+    // Both example blocks that name a model: the top-level one a new user meets
+    // first, and `serve`'s own.
+    let (general, _, _) = crate::run_rocm(world, &["help"]);
+    let (serve, _, _) = crate::run_rocm(world, &["serve", "--help"]);
+    let (listing, _, _) = crate::run_rocm(world, &["model", "--verbose"]);
+    world.cli_output = Some(format!("{general}\n{serve}"));
+    world.cli_stderr = Some(listing);
+}
+
+#[then("every model named there is one the CLI can resolve")]
+async fn assert_example_models_resolve(world: &mut E2eWorld) {
+    let help = world.cli_output.as_ref().expect("no help output");
+    let listing = world.cli_stderr.as_ref().expect("no model listing");
+    let examples = serve_example_models(help);
+    assert!(
+        !examples.is_empty(),
+        "no `rocm serve <model>` example found in the help:\n{help}"
+    );
+    let known = known_model_names(listing);
+    assert!(
+        !known.is_empty(),
+        "could not read any model name out of the listing:\n{listing}"
+    );
+    // Two forms are legitimate, and the README documents both: a name this CLI's
+    // own catalog answers to, or an explicit `owner/repo` reference to fetch. The
+    // check accepts either, so it says the example must WORK without dictating
+    // which model it should be.
+    let unresolvable: Vec<&String> = examples
+        .iter()
+        .filter(|model| {
+            !model.contains('/') && !known.iter().any(|name| name.eq_ignore_ascii_case(model))
+        })
+        .collect();
+    assert!(
+        unresolvable.is_empty(),
+        "the help offers {unresolvable:?} as models to serve, but they are neither a name the \
+         model listing knows nor an `owner/repo` reference — copying the example verbatim \
+         cannot work.\nmodel listing knows: {known:?}"
+    );
+}
+
+#[then("running the CLI with no subcommand is not described as the dashboard command")]
+async fn assert_default_command_described_distinctly(world: &mut E2eWorld) {
+    let help = world.cli_output.as_ref().expect("no help output");
+    // What the help says the dedicated dashboard command does. Taken from the
+    // help itself rather than hardcoded, so this stays true if the wording
+    // changes.
+    let dash_row = help
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("dash "))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(
+        dash_row.contains("dashboard"),
+        "expected the help to list a `dash` command that opens the dashboard:\n{help}"
+    );
+    // The sentence describing what running the CLI with no subcommand does.
+    let default_sentence = help
+        .lines()
+        .map(str::trim)
+        .find(|line| line.contains("with no subcommand"))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(
+        !default_sentence.is_empty(),
+        "the help does not say what running the CLI with no subcommand does:\n{help}"
+    );
+    // Two commands, two different screens. Describing the plain command as the
+    // dashboard leaves the reader unable to tell them apart, and unaware that
+    // the plain command opens something else entirely.
+    assert!(
+        !default_sentence.contains("dashboard"),
+        "the help describes running the CLI with no subcommand as opening the dashboard, which \
+         is what it also says `dash` does — the two are different screens:\n  \
+         default: {default_sentence}\n  dash:    {dash_row}"
+    );
+}
+
 #[then("a version string is returned")]
 async fn assert_version_returned(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no command was run");

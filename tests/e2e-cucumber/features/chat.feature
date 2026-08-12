@@ -75,3 +75,14 @@ Feature: Chat and endpoint detection
     And the model is registered with the CLI
     When the user sends a one-shot chat prompt through the CLI
     Then the CLI prints the assistant's reply
+
+  # Expected to FAIL. Scenario 7 names the model and works; this one leaves the
+  # choice to the CLI and is told nothing is running — on the very machine whose
+  # services list shows a ready local server. Asking to chat locally should use
+  # the local server that is there, whichever model the user chose to serve.
+  @id:chat-local-uses-the-running-server
+  Scenario: 8 - Chatting locally uses the local server that is already running
+    Given a model is being served
+    And the model is registered with the CLI
+    When the user sends a one-shot chat prompt without naming a model
+    Then the CLI prints the assistant's reply
