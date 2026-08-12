@@ -61,12 +61,18 @@ pub struct ScenarioDecl {
     pub requires_no_gpu: bool,
     /// `@requires-bare-metal`: the scenario's premise is a host running the
     /// in-tree amdgpu driver, so it does not hold under WSL2 — which uses
-    /// `/dev/dxg` and the Windows host driver instead. `rocm diagnose` skips its
-    /// bare-metal catalog there *by design* rather than emitting Linux diagnoses
-    /// that cannot apply, so a scenario needing a catalog match has no premise on
-    /// WSL2. This is a SKIP and not an xfail row: the behaviour is deliberate and
+    /// `/dev/dxg` and the Windows host driver instead.
+    ///
+    /// Two things stop short there. `rocm diagnose` skips its bare-metal catalog
+    /// *by design* rather than emitting Linux diagnoses that cannot apply, so a
+    /// scenario needing a catalog match has no premise. And `examine`'s probe
+    /// returns as soon as it recognises WSL2, before most of its steps run, so a
+    /// scenario asserting anything those steps populate has none either.
+    ///
+    /// This is a SKIP and not an xfail row: the diagnose half is deliberate and
     /// separately unit-tested, and recording it as a known bug would tell every
-    /// later reader the opposite.
+    /// later reader the opposite. (How much the probe gives up on WSL2 is a
+    /// separate question, and a separate ticket.)
     ///
     /// `@requires-os:linux` cannot express this — WSL2 reports an os_family of
     /// `linux`, so it matches.
