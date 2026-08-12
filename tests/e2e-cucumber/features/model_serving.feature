@@ -179,10 +179,11 @@ Feature: Model serving
     Then the removal is reported as complete
     And the server is no longer running
 
-  # Expected to FAIL on a GPU host. Asking the CLI to choose a GPU on a machine
-  # that has one must end with a device chosen: reporting that it selected none
-  # and carrying on leaves the user unable to tell which GPU their model will
-  # run on, or whether it will run on one at all.
+  # Expected to FAIL on Windows. Asking the CLI to choose a GPU on a machine that
+  # has one must end with a device chosen: reporting that it selected none and
+  # carrying on leaves the user unable to tell which GPU their model will run on,
+  # or whether it will run on one at all. Both Linux lanes name the device, so
+  # this scenario also guards them.
   @id:serve-auto-gpu-selection-names-a-device @requires-gpu
   Scenario: 18 - Letting the CLI choose the GPU names the device it chose
     Given a managed runtime is active

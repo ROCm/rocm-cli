@@ -279,12 +279,26 @@ when = {}
 bug = "EAI-8021"
 reason = "A device the user can already read and write is still offered as a group-permission cause."
 
-# EAI-8006 has NO row on purpose. `--gpu auto` reported `selected none` on the
-# pod, where the bundled `amd-smi` could not execute (its `#!/usr/bin/env
-# python3` shebang found no interpreter). The MI300X runner's `amd-smi` runs, so
-# the CLI names a device there and the scenario passes (measured, runs 190/191).
-# It ships as a guard instead: a row would be a stale XPASS and would fail the
-# lane.
+# --- EAI-8006: `--gpu auto` reports `selected none` on a machine that has a GPU,
+# because the CLI cannot get an answer out of `amd-smi` — on the pod the bundled
+# copy could not execute at all (its `#!/usr/bin/env python3` shebang found no
+# interpreter), even though the CLI has a working interpreter recorded in its own
+# config.
+#
+# os = "windows" is MEASURED, not guessed, and the three lanes separate the two
+# candidate explanations cleanly:
+#   MI300X            gfx943  linux    PASSES (runs 190/191/192)
+#   Strix Halo Ubuntu gfx1151 linux    PASSES (run 196)
+#   Strix Halo Windows gfx1151 windows FAILS  (run 196) — `gpu: auto (selected none)`
+# Same GPU family on both Strix lanes, so this is the OS, not the family — which
+# is why the row is not scoped with therock_family the way
+# `examine-both-forms-agree-on-gpu` is. Remove it when a Windows host names the
+# device it picked. ---
+[["serve-auto-gpu-selection-names-a-device"]]
+when = { os = "windows" }
+bug = "EAI-8006"
+reason = "Letting the CLI choose a GPU reports that it selected none on a Windows machine that has one."
+serve_timeout_secs = 180
 
 # --- EAI-8016: MEASURE. The serve path has no address-availability check: the
 # default port is used whether or not something already holds it, so a second
