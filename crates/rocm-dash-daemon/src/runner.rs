@@ -220,6 +220,11 @@ pub async fn run_loop(
 
     let mut tick_count: u64 = 0;
     let mut last_sysinfo_refresh: u64 = 0;
+    // Discovery/scrape warnings are produced on their own (slower) cadences, so
+    // holding them only for the tick that produced them makes the header ⚠ badge
+    // blink on and off. Keep the last result until that cadence runs again.
+    let mut docker_warn: Option<String> = None;
+    let mut scrape_warns: Vec<String> = Vec::new();
 
     loop {
         ticker.tick().await;
@@ -321,8 +326,9 @@ pub async fn run_loop(
                         );
                     }
                     known_instances = seen;
+                    docker_warn = None;
                 }
-                Err(e) => warnings.push(format!("docker discover: {e}")),
+                Err(e) => docker_warn = Some(format!("docker discover: {e}")),
             }
         }
 
@@ -459,6 +465,9 @@ pub async fn run_loop(
             }
             known_services = disc.seen;
         }
+        if tick_count.is_multiple_of(instance_ticks) {
+            scrape_warns.clear();
+        }
 
         // Per-instance vLLM metric scrape, parallel, on its own cadence. The
         // Lemonade instance (if any) is scraped via its own collector below, so
@@ -568,7 +577,7 @@ pub async fn run_loop(
                 }
             }
             if fail_count > 0 {
-                warnings.push(match last_err {
+                scrape_warns.push(match last_err {
                     Some(e) => format!("vllm scrape: {fail_count} failed (last: {e})"),
                     None => format!("vllm scrape: {fail_count} failed"),
                 });
@@ -612,7 +621,7 @@ pub async fn run_loop(
                 }
                 Err(e) => {
                     trace!(id = %id, error = %e, "lemonade scrape failed");
-                    warnings.push(format!("lemonade scrape: {e}"));
+                    scrape_warns.push(format!("lemonade scrape: {e}"));
                     // EAI-7960: retain tracker during validity window on failure.
                     // gen_tps is assembled from the tracker snapshot below;
                     // no explicit clearing needed here.
@@ -704,12 +713,14 @@ pub async fn run_loop(
                 })
                 .count();
             if vram_fallbacks > 0 {
-                warnings.push(format!(
+                scrape_warns.push(format!(
                     "vram attribution: {vram_fallbacks} instance(s) fell back to device-summed \
                      VRAM (no per-process cgroup match; check /proc access)"
                 ));
             }
         }
+        warnings.extend(docker_warn.iter().cloned());
+        warnings.extend(scrape_warns.iter().cloned());
         let snap = Snapshot {
             timestamp: cycle_at,
             host: host.tick(),
