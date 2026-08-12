@@ -2867,6 +2867,13 @@ mod tests {
                 }
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // The listener is non-blocking so the accept loop can
+                        // poll for the stop signal, but on Windows the accepted
+                        // socket inherits that mode and the read below then
+                        // fails with WSAEWOULDBLOCK instead of waiting for the
+                        // request. Put the connection back into blocking mode;
+                        // the read timeout is what bounds it.
+                        stream.set_nonblocking(false)?;
                         stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
                         let request = read_http_request(&mut stream)?;
                         if request.starts_with("GET /v1/models ") {
