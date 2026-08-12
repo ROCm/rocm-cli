@@ -10,7 +10,13 @@ Feature: Diagnosing failures and listing fixes
   # dependent. They assert the SHAPE of a diagnosis (a scored match with an id
   # and a plan) and the query/refusal contracts.
 
-  @id:diagnose-matches-known-symptom
+  # @requires-bare-metal: these two need the catalog to actually produce a match.
+  # On WSL2 the catalog is deliberately not run at all — that platform uses
+  # /dev/dxg and the Windows host driver, so bare-metal Linux diagnoses would be
+  # false positives — which leaves these scenarios with no premise there. That is
+  # designed behaviour with its own unit test, not a bug, so they are skipped
+  # rather than xfail'd. `@requires-os:linux` would not do it: WSL2 is linux.
+  @id:diagnose-matches-known-symptom @requires-bare-metal
   Scenario: 1 - Diagnosing a recognised failure reports a likely cause and a fix
     Given a user who hit a known ROCm failure
     When the user asks the CLI to diagnose that symptom
@@ -23,7 +29,7 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI to diagnose that symptom in machine-readable form
     Then the CLI always points to somewhere the problem can be reported
 
-  @id:diagnose-json-has-match-flag
+  @id:diagnose-json-has-match-flag @requires-bare-metal
   Scenario: 3 - A diagnosis is available in machine-readable form for tooling
     Given a user who hit a known ROCm failure
     When the user asks the CLI to diagnose that symptom in machine-readable form

@@ -7,8 +7,12 @@
 # host capability probe (see src/capability.rs) and is NOT encoded here.
 #
 # Resolution at runtime (see tests/e2e-cucumber/src/expectation.rs):
-#   1. A scenario whose @requires-gpu / @requires-engine can't be satisfied on
-#      this host is SKIPPED (not-applicable) — never listed here.
+#   1. A scenario whose @requires-gpu / @requires-engine / @requires-bare-metal
+#      can't be satisfied on this host is SKIPPED (not-applicable) — never listed
+#      here. Reach for a tag, not a row, whenever the scenario simply has no
+#      premise on that host: a row here says "known BUG", so using one for
+#      designed-in behaviour (e.g. diagnose not running its bare-metal catalog on
+#      WSL2) tells every later reader the opposite of the truth.
 #   2. Otherwise, the FIRST matching condition below marks it expected-fail
 #      (xfail); a scenario that then PASSES is an XPASS — a stale entry to be
 #      removed, UNLESS the row is `flaky = true`, which tolerates either result

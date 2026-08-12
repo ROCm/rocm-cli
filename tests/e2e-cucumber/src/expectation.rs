@@ -26,6 +26,7 @@ const REQUIRES_ENGINE_PREFIX: &str = "requires-engine:";
 const REQUIRES_OS_PREFIX: &str = "requires-os:";
 const REQUIRES_GPU_TAG: &str = "requires-gpu";
 const REQUIRES_NO_GPU_TAG: &str = "requires-no-gpu";
+const REQUIRES_BARE_METAL_TAG: &str = "requires-bare-metal";
 const SERVE_TIMEOUT_PREFIX: &str = "serve-timeout:";
 const NIGHTLY_TAG: &str = "nightly";
 const LIFECYCLE_TAG: &str = "lifecycle";
@@ -58,6 +59,18 @@ pub struct ScenarioDecl {
     /// GPU — the inverse of `requires_gpu`. This is how the no-GPU fail-fast path
     /// gets live coverage: it runs on the GitHub-hosted mock job.
     pub requires_no_gpu: bool,
+    /// `@requires-bare-metal`: the scenario's premise is a host running the
+    /// in-tree amdgpu driver, so it does not hold under WSL2 — which uses
+    /// `/dev/dxg` and the Windows host driver instead. `rocm diagnose` skips its
+    /// bare-metal catalog there *by design* rather than emitting Linux diagnoses
+    /// that cannot apply, so a scenario needing a catalog match has no premise on
+    /// WSL2. This is a SKIP and not an xfail row: the behaviour is deliberate and
+    /// separately unit-tested, and recording it as a known bug would tell every
+    /// later reader the opposite.
+    ///
+    /// `@requires-os:linux` cannot express this — WSL2 reports an os_family of
+    /// `linux`, so it matches.
+    pub requires_bare_metal: bool,
     /// Engine the scenario pins via `@requires-engine:<e>` (if any).
     pub requires_engine: Option<String>,
     /// OS the scenario requires via `@requires-os:<os>` (e.g. "linux"), if any —
@@ -94,6 +107,7 @@ impl ScenarioDecl {
         let mut id = None;
         let mut requires_gpu = false;
         let mut requires_no_gpu = false;
+        let mut requires_bare_metal = false;
         let mut requires_engine = None;
         let mut requires_os = None;
         let mut serve_timeout_secs = None;
@@ -117,6 +131,8 @@ impl ScenarioDecl {
                 requires_gpu = true;
             } else if tag == REQUIRES_NO_GPU_TAG {
                 requires_no_gpu = true;
+            } else if tag == REQUIRES_BARE_METAL_TAG {
+                requires_bare_metal = true;
             } else if tag == NIGHTLY_TAG {
                 nightly = true;
             } else if tag == LIFECYCLE_TAG {
@@ -129,6 +145,7 @@ impl ScenarioDecl {
             id,
             requires_gpu,
             requires_no_gpu,
+            requires_bare_metal,
             requires_engine,
             requires_os,
             serve_timeout_secs,
@@ -323,8 +340,9 @@ pub struct PlatformManifest<'a> {
 ///
 /// 1. Not-applicable → `Skip`: a `@nightly` scenario when nightly isn't included,
 ///    a `@merge-queue` scenario outside the merge queue, a `@requires-gpu`
-///    scenario on a host with no AMD GPU, a `@requires-os:<os>` scenario on a
-///    different OS, or a scenario whose effective engine can't start.
+///    scenario on a host with no AMD GPU, a `@requires-bare-metal` scenario on
+///    WSL2, a `@requires-os:<os>` scenario on a different OS, or a scenario whose
+///    effective engine can't start.
 /// 2. First matching `expectations.toml` condition → `ExpectXfail`.
 /// 3. Otherwise → `ExpectPass`.
 ///
@@ -368,6 +386,11 @@ pub fn resolve(
     if decl.requires_no_gpu && cap.has_amd_gpu {
         return Expectation::Skip {
             reason: "requires a host with no AMD GPU; this host has one".to_owned(),
+        };
+    }
+    if decl.requires_bare_metal && cap.is_wsl {
+        return Expectation::Skip {
+            reason: "requires a bare-metal host; this one is WSL2".to_owned(),
         };
     }
     if let Some(os) = &decl.requires_os
@@ -474,6 +497,19 @@ mod tests {
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo".into(),
             },
+            // A WSL2 dev box: `os_family` is `linux` and a GPU is visible through
+            // /dev/dxg, so nothing but `is_wsl` distinguishes it from bare metal.
+            // That is precisely why `@requires-os:linux` cannot stand in for
+            // `@requires-bare-metal`.
+            "wsl2" => HostCapability {
+                os_family: "linux".into(),
+                is_wsl: true,
+                gfx_target: Some("gfx1151".into()),
+                has_amd_gpu: true,
+                available_engines: vec!["lemonade".into(), "vllm".into()],
+                effective_serve_engine: "lemonade".into(),
+                platform_slug: "wsl2".into(),
+            },
             _ => HostCapability {
                 os_family: "other".into(),
                 is_wsl: false,
@@ -526,6 +562,14 @@ serve_timeout_secs = 90
         assert_eq!(d.id.as_deref(), Some("lifecycle-linux-install"));
         assert_eq!(d.requires_os.as_deref(), Some("linux"));
         assert!(d.lifecycle);
+    }
+
+    #[test]
+    fn bare_metal_tag_parses_in_both_shapes() {
+        assert!(decl(&["id:x", "requires-bare-metal"]).requires_bare_metal);
+        assert!(decl(&["@id:x", "@requires-bare-metal"]).requires_bare_metal);
+        // Absent by default, so no existing scenario changes meaning.
+        assert!(!decl(&["id:x", "requires-gpu"]).requires_bare_metal);
     }
 
     #[test]
@@ -679,6 +723,59 @@ serve_timeout_secs = 90
         ));
         assert!(matches!(
             resolve(&d, &cap("strix-ubuntu"), &m, false, false, false),
+            Expectation::Skip { .. }
+        ));
+    }
+
+    #[test]
+    fn requires_bare_metal_skips_on_wsl_and_runs_everywhere_else() {
+        let m = Expectations::default();
+        let d = decl(&["id:diagnose-matches-known-symptom", "requires-bare-metal"]);
+        assert!(matches!(
+            resolve(&d, &cap("wsl2"), &m, false, false, false),
+            Expectation::Skip { .. }
+        ));
+        // Bare-metal hosts of every shape still run it — including the mock lane,
+        // which is where these scenarios earn their keep as a required check.
+        for host in ["mock", "mi300x", "strix-ubuntu", "strix-windows"] {
+            assert_eq!(
+                resolve(&d, &cap(host), &m, false, false, false),
+                Expectation::ExpectPass,
+                "{host} is bare metal and must still run the scenario"
+            );
+        }
+    }
+
+    #[test]
+    fn requires_os_linux_does_not_stand_in_for_requires_bare_metal() {
+        // The reason the tag has to exist: WSL2 reports os_family "linux", so an
+        // `@requires-os:linux` scenario runs there. If this ever starts skipping,
+        // the two tags have collapsed into one and the new one is redundant.
+        let m = Expectations::default();
+        let d = decl(&["id:some-linux-scenario", "requires-os:linux"]);
+        assert_eq!(
+            resolve(&d, &cap("wsl2"), &m, false, false, false),
+            Expectation::ExpectPass
+        );
+    }
+
+    #[test]
+    fn bare_metal_skip_is_not_recorded_as_a_known_bug() {
+        // WSL2 out-of-scope is deliberate product behaviour, so it must resolve to
+        // Skip even when the scenario also carries an xfail row — otherwise the
+        // report would call a designed-in limitation a defect.
+        let m = Expectations::parse(
+            r#"
+[["diagnose-matches-known-symptom"]]
+when = {}
+bug = "EAI-0000"
+reason = "unrelated open bug"
+"#,
+        )
+        .unwrap();
+        let d = decl(&["id:diagnose-matches-known-symptom", "requires-bare-metal"]);
+        assert!(matches!(
+            resolve(&d, &cap("wsl2"), &m, false, false, false),
             Expectation::Skip { .. }
         ));
     }
