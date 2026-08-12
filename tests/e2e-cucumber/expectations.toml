@@ -170,11 +170,3 @@ reason = "Lemonade managed serve reaches ready then shuts down immediately, so t
 serve_timeout_secs = 90
 flaky = true
 
-# --- EAI-7193: the framework probe can be scoped in the library, but no call
-# site passes anything but the default, so `--framework` does not exist on the
-# command line and the choice is unreachable. Platform-independent (pure
-# argument parsing). Remove this row when the flag lands. ---
-[["examine-can-skip-framework-probing"]]
-when = {}
-bug = "EAI-7193"
-reason = "`examine` has no --framework flag, so the framework probe cannot be scoped from the command line."

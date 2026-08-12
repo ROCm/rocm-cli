@@ -110,6 +110,17 @@ enum Command {
         /// Emit the machine-readable Examination JSON (for diagnosis tooling).
         #[arg(long)]
         json: bool,
+        /// Which machine-learning framework to inspect (affects --json only).
+        ///
+        /// The probe imports the framework to read its ROCm build and the GPU
+        /// architectures it was compiled for, which costs an interpreter start.
+        /// Left alone it tries PyTorch and falls back to llama.cpp; name one to
+        /// go straight there, or `skip` to leave frameworks out entirely.
+        ///
+        /// Only the machine-readable form reports framework state, so this has
+        /// no effect on the human report.
+        #[arg(long, value_enum, default_value_t = FrameworkArg::Auto)]
+        framework: FrameworkArg,
     },
     /// Diagnose known ROCm/PyTorch/llama.cpp failure modes against a closed catalog.
     ///
@@ -838,6 +849,37 @@ enum SetupCommand {
     Reset,
 }
 
+/// Which framework `rocm examine` should probe.
+///
+/// The CLI-facing mirror of [`rocm_core::FrameworkProbe`], which cannot derive
+/// `ValueEnum` itself without pulling clap into `rocm-core`. Every variant of
+/// that enum existed and was reachable in the library, but no caller ever passed
+/// anything but the default, so the choice could not be made from the command
+/// line at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum FrameworkArg {
+    /// Try PyTorch first, then llama.cpp (the default).
+    Auto,
+    /// Probe PyTorch only.
+    Pytorch,
+    /// Probe llama.cpp only.
+    #[value(name = "llama-cpp", alias = "llamacpp")]
+    LlamaCpp,
+    /// Probe no framework at all — fastest, and enough for GPU and driver questions.
+    Skip,
+}
+
+impl From<FrameworkArg> for rocm_core::FrameworkProbe {
+    fn from(value: FrameworkArg) -> Self {
+        match value {
+            FrameworkArg::Auto => Self::Auto,
+            FrameworkArg::Pytorch => Self::PyTorch,
+            FrameworkArg::LlamaCpp => Self::LlamaCpp,
+            FrameworkArg::Skip => Self::Skip,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum InstallFormat {
     /// Python wheel packages (recommended; smaller, pip-installable).
@@ -1471,7 +1513,7 @@ fn dispatch(cli: Cli) -> Result<()> {
     }
 
     match cli.command {
-        Some(Command::Examine { json }) => examine(json),
+        Some(Command::Examine { json, framework }) => examine(json, framework.into()),
         Some(Command::Diagnose { symptom, top, json }) => diagnose(symptom, top, json),
         Some(Command::Fix {
             fix_id,
@@ -1996,7 +2038,7 @@ struct ExamineJsonSummary<'a> {
     previous_runtime_key: Option<&'a str>,
 }
 
-fn examine(json: bool) -> Result<()> {
+fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
     // `rocm examine` is the general system inspector: the exit code reports
     // whether it RAN, not what it found. Any finding (no GPU, WSL, degraded) is
     // surfaced in the output and the `--json` `status` field, and the command
@@ -2004,7 +2046,7 @@ fn examine(json: bool) -> Result<()> {
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths).unwrap_or_default();
     if json {
-        let examination = rocm_core::Examination::probe(rocm_core::FrameworkProbe::Auto);
+        let examination = rocm_core::Examination::probe(framework);
         // `gather` rather than `examine_human_report`: the latter first runs
         // `recover_setup_runtime_registration`, which writes. Asking a machine a
         // question should not change it, and `--json` is the form tooling calls
@@ -17140,6 +17182,47 @@ mod tests {
     #[test]
     fn cli_command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn every_framework_choice_reaches_the_library() {
+        // The defect this flag fixes was not a missing enum -- the library had
+        // all four variants -- but that no caller could select one. Pin the
+        // mapping so a renamed variant cannot silently fall back to the default.
+        use rocm_core::FrameworkProbe;
+        assert_eq!(
+            FrameworkProbe::from(FrameworkArg::Auto),
+            FrameworkProbe::Auto
+        );
+        assert_eq!(
+            FrameworkProbe::from(FrameworkArg::Pytorch),
+            FrameworkProbe::PyTorch
+        );
+        assert_eq!(
+            FrameworkProbe::from(FrameworkArg::LlamaCpp),
+            FrameworkProbe::LlamaCpp
+        );
+        assert_eq!(
+            FrameworkProbe::from(FrameworkArg::Skip),
+            FrameworkProbe::Skip
+        );
+    }
+
+    #[test]
+    fn the_framework_choice_is_offered_on_the_command_line() {
+        // Guards the actual regression: the variants existed in the library and
+        // were unreachable from here. A user must be able to see and pass them.
+        let help = Cli::command()
+            .find_subcommand_mut("examine")
+            .expect("examine subcommand")
+            .render_long_help()
+            .to_string();
+        for choice in ["auto", "pytorch", "llama-cpp", "skip"] {
+            assert!(
+                help.contains(choice),
+                "`{choice}` must be offered by `rocm examine --help`:\n{help}"
+            );
+        }
     }
 
     #[test]

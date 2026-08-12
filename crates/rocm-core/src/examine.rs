@@ -1554,6 +1554,30 @@ mod tests {
     }
 
     #[test]
+    fn asking_to_skip_the_frameworks_is_recorded_as_skipped() {
+        // Host-independent on purpose: every other variant depends on what is
+        // installed, so this is the one the CLI flag can be pinned against
+        // anywhere. "skipped" is a distinct answer from "unknown" -- the latter
+        // means the probe ran and found nothing.
+        let mut e = Examination::default();
+        probe_framework(&mut e, FrameworkProbe::Skip);
+        assert_eq!(e.framework, "skipped");
+    }
+
+    #[test]
+    fn a_skipped_framework_probe_runs_no_interpreter() {
+        // The reason to offer `skip` at all: the other variants start Python to
+        // read the framework's ROCm build. Nothing else on the Examination may
+        // move, or "skip" would be quietly doing work.
+        let mut e = Examination::default();
+        probe_framework(&mut e, FrameworkProbe::Skip);
+        assert!(e.framework_version.is_empty());
+        assert!(e.framework_rocm_version.is_empty());
+        assert!(e.framework_arch_list.is_empty());
+        assert!(e.framework_notes.is_empty());
+    }
+
+    #[test]
     fn the_sysfs_fallback_leaves_a_real_pci_enumeration_alone() {
         // lspci carries the PCI id, the marketing name and the APU/discrete
         // distinction; the topology read carries none of those. So the fallback
