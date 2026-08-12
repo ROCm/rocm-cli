@@ -88,8 +88,9 @@ Every bug fix ships with a regression test in the same change:
 **User-observable behavior needs a scenario, not only a unit test.** This applies to
 features as well as fixes. If the change alters what a user of the CLI can observe —
 command output, exit codes, files or paths the CLI creates, or which runtime/engine it
-selects — then the same change must also add or update a Gherkin scenario in
-`tests/e2e-cucumber/features/` and its step definitions:
+selects — then that behavior must be covered by a Gherkin scenario in
+`tests/e2e-cucumber/features/`, adding or updating the scenario and its step
+definitions when no existing scenario already covers it:
 
 - a unit test asserting the internal helper does NOT discharge this; it proves the
   function, not the behavior
