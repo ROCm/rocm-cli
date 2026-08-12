@@ -36,6 +36,10 @@ const STARTUP_UPDATE_CHECK_INTERVAL_MS: u128 = 12 * 60 * 60 * 1_000;
 const STARTUP_UPDATE_CHECK_TIMEOUT_SECS: u64 = 2;
 /// Timeout for the best-effort HEAD probe that sizes a download before starting it.
 const THEROCK_HEAD_PROBE_TIMEOUT_SECS: u64 = 10;
+/// Whole-transfer budget for an artifact download. A single-digit-gigabyte SDK
+/// tarball on a slow link needs well past the ten minutes the metadata fetches
+/// use; a retry that resumes cannot help if the attempt itself is cut short.
+const THEROCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_hours(1);
 /// Largest `Content-Length` accepted as a real SDK tarball size.
 ///
 /// SDK tarballs are single-digit gigabytes; anything past this is a
@@ -2090,23 +2094,25 @@ fn http_header_value(headers: &str, name: &str) -> Option<String> {
     value
 }
 
+/// Fetch an artifact to `destination`.
+///
+/// Streams rather than buffers: SDK tarballs are single-digit gigabytes, and
+/// holding one in memory to write it out again costs that much RAM on top of
+/// the same amount of disk. The primitive also handles the free-space
+/// preflight, retry with resume, and the length cross-check that catches a
+/// transfer the server ended early.
 fn download_file(url: &str, destination: &Path) -> Result<()> {
     let parent = destination
         .parent()
         .context("download destination has no parent directory")?;
     fs::create_dir_all(parent)?;
-    let response = http_get(url, &[], None)?;
-    if response.status != 200 {
-        bail!("HTTP {} while fetching {url}", response.status);
-    }
-    // The body is already buffered, so this requirement is exact: refuse before
-    // writing rather than leaving a truncated file behind on a full disk.
-    disk_space::ensure_space_for(
-        &format!("save the download from {url}"),
+    rocm_core::download_file_streaming(&rocm_core::DownloadRequest::new(
+        url,
         destination,
-        disk_space::with_margin(response.body.len() as u64),
-    )?;
-    write_file_atomically(destination, &response.body)
+        THEROCK_DOWNLOAD_TIMEOUT,
+    ))
+    .with_context(|| format!("failed to fetch {url}"))?;
+    Ok(())
 }
 
 /// Content length of `url` from a HEAD request, when the server reports one.
