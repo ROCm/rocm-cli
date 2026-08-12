@@ -10,7 +10,13 @@ Feature: Diagnosing failures and listing fixes
   # dependent. They assert the SHAPE of a diagnosis (a scored match with an id
   # and a plan) and the query/refusal contracts.
 
-  @id:diagnose-matches-known-symptom
+  # @requires-bare-metal: these two need the catalog to actually produce a match.
+  # On WSL2 the catalog is deliberately not run at all — that platform uses
+  # /dev/dxg and the Windows host driver, so bare-metal Linux diagnoses would be
+  # false positives — which leaves these scenarios with no premise there. That is
+  # designed behaviour with its own unit test, not a bug, so they are skipped
+  # rather than xfail'd. `@requires-os:linux` would not do it: WSL2 is linux.
+  @id:diagnose-matches-known-symptom @requires-bare-metal
   Scenario: 1 - Diagnosing a recognised failure reports a likely cause and a fix
     Given a user who hit a known ROCm failure
     When the user asks the CLI to diagnose that symptom
@@ -23,7 +29,7 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI to diagnose that symptom in machine-readable form
     Then the CLI always points to somewhere the problem can be reported
 
-  @id:diagnose-json-has-match-flag
+  @id:diagnose-json-has-match-flag @requires-bare-metal
   Scenario: 3 - A diagnosis is available in machine-readable form for tooling
     Given a user who hit a known ROCm failure
     When the user asks the CLI to diagnose that symptom in machine-readable form
@@ -56,3 +62,19 @@ Feature: Diagnosing failures and listing fixes
     Given a user who refers to a cause by its position in the diagnosis
     When the user asks the CLI to apply that fix
     Then the CLI refuses and explains that a position is not a fix-id
+
+  # The one gate standing between `rocm fix` and an edited machine, and until now
+  # it had no end-to-end coverage. The scenario gives the CLI a home directory it
+  # owns, so the file the fix would edit is one the scenario can read back: the
+  # refusal must not depend on what is in the runner's dotfiles, and a regression
+  # here must not be able to reach them.
+  # Linux-only because the assertion is "the file is untouched": on Windows the
+  # same recipe persists through `setx` into the user environment, which the
+  # suite cannot plant or read back safely. The gate itself is shared code, so
+  # this still guards it — just not the Windows persistence step.
+  @id:fix-requires-agreement-before-changing-anything @requires-os:linux
+  Scenario: 8 - A fix that changes the machine is not applied without agreement
+    Given a user who has chosen a fix that would change the machine
+    When the user asks the CLI to apply it without agreeing to the change
+    Then the CLI refuses and explains that it needs agreement
+    And the file the fix would have changed is untouched
