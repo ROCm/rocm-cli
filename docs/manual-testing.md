@@ -45,6 +45,14 @@ pip create it when downloads start. If you omit `--prefix`, rocm-cli should
 choose a managed runtime folder and still place the pip cache inside that
 runtime folder at `<managed-runtime-folder>\pip-cache`.
 
+The `uv` package cache is separate from that pip cache and does **not** follow
+`--prefix`. It lives at `<data-dir>\uv-cache` so it shares a filesystem with the
+managed environments and `uv` can hardlink into them. With `--prefix` pointing at
+a different filesystem from `ROCM_CLI_DATA_DIR`, `uv` falls back to copying
+packages; set `ROCM_CLI_UV_CACHE_DIR` to a folder on the prefix filesystem to
+restore hardlinking. Making `--prefix` do this automatically is tracked
+separately.
+
 ## 1. First-Time Setup
 
 Start rocm-cli:

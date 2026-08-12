@@ -14,7 +14,9 @@ use rocm_core::{
     uv_venv_args, verify_rsa_pkcs1_sha256_signature,
 };
 #[cfg(test)]
-use rocm_core::{generate_rsa_signing_keypair, sign_rsa_pkcs1_sha256_signature};
+use rocm_core::{
+    generate_rsa_signing_keypair, managed_uv_cache_dir, sign_rsa_pkcs1_sha256_signature,
+};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fmt::Write as _;
@@ -913,7 +915,7 @@ fn install_wheel_runtime(
         "Creating Python environment at {}.",
         install_root.display()
     ));
-    ensure_uv_venv(&uv, &python_launcher.executable, &install_root)?;
+    ensure_uv_venv(paths, &uv, &python_launcher.executable, &install_root)?;
     let env_python = venv_python_path(&install_root);
 
     progress_line(format!(
@@ -928,6 +930,7 @@ fn install_wheel_runtime(
     }
     install_args.extend(therock_pip_package_specs(&resolution.package_versions));
     run_uv_progress_command(
+        paths,
         &uv,
         install_args
             .iter()
@@ -2326,7 +2329,12 @@ fn extract_tarball_and_discard_archive(archive_path: &Path, target_dir: &Path) -
     Ok(())
 }
 
-fn ensure_uv_venv(uv: &Path, python_launcher: &Path, install_root: &Path) -> Result<()> {
+fn ensure_uv_venv(
+    paths: &AppPaths,
+    uv: &Path,
+    python_launcher: &Path,
+    install_root: &Path,
+) -> Result<()> {
     let env_python = venv_python_path(install_root);
     if env_python.is_file() {
         if run_command(
@@ -2353,7 +2361,7 @@ fn ensure_uv_venv(uv: &Path, python_launcher: &Path, install_root: &Path) -> Res
             .map(String::as_str)
             .collect::<Vec<_>>()
             .as_slice(),
-        &uv_command_env(),
+        &uv_command_env(paths),
         "create managed TheRock runtime virtual environment",
     )?;
     if !env_python.is_file() {
@@ -2738,10 +2746,15 @@ fn run_command_with_env(
     bail!("{context_text}: {detail}")
 }
 
-fn run_uv_progress_command(uv: &Path, args: &[&str], context_text: &str) -> Result<()> {
+fn run_uv_progress_command(
+    paths: &AppPaths,
+    uv: &Path,
+    args: &[&str],
+    context_text: &str,
+) -> Result<()> {
     let mut command = Command::new(uv);
     command.args(args);
-    for (key, value) in &uv_command_env() {
+    for (key, value) in &uv_command_env(paths) {
         command.env(key, value);
     }
     let status = command
@@ -2845,7 +2858,7 @@ fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
     progress_line(format!("Installing Python {version} via uv..."));
     let status = Command::new(&uv)
         .args(["python", "install", &version])
-        .envs(uv_command_env())
+        .envs(uv_command_env(paths))
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -2858,7 +2871,7 @@ fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
     progress_line(format!("Finding Python {version}..."));
     let output = Command::new(&uv)
         .args(["python", "find", &version])
-        .envs(uv_command_env())
+        .envs(uv_command_env(paths))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -3595,12 +3608,32 @@ mod tests {
     }
 
     #[test]
-    fn managed_uv_cache_defaults_inside_generated_runtime_folder() {
+    fn managed_uv_cache_sits_under_the_data_dir_for_generated_runtime_folders() {
         let (_root, paths) = test_paths("managed-uv-cache");
         let runtime_key = "release-wheel-gfx120x-all-7-14-0";
         let install_root = managed_runtime_root(&paths, "wheel", runtime_key);
-        // uv caches live beside the venv; verify the wheel root path structure
         assert!(install_root.starts_with(&paths.data_dir));
+        // Without --prefix the generated runtime folder is itself under the data dir, so
+        // the uv cache shares a filesystem with the environment it populates.
+        assert!(managed_uv_cache_dir(&paths.data_dir).starts_with(&paths.data_dir));
+    }
+
+    #[test]
+    fn uv_cache_does_not_follow_a_prefix_install_root() {
+        // Documents a known gap rather than an intended behavior: `--prefix` relocates
+        // install_root only, while the uv cache stays keyed off the data dir. When the two
+        // land on different filesystems uv falls back to copying. Tracked separately; see
+        // the `--prefix` non-goal on the PR that introduced the colocation.
+        let (_root, paths) = test_paths("prefix-uv-cache");
+        let prefix_root = PathBuf::from("/mnt/elsewhere/envs/my-env");
+        let cache = managed_uv_cache_dir(&paths.data_dir);
+
+        assert!(
+            !cache.starts_with(&prefix_root),
+            "cache {} unexpectedly followed the --prefix root",
+            cache.display()
+        );
+        assert!(cache.starts_with(&paths.data_dir));
     }
 
     #[test]
