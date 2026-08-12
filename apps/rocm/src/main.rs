@@ -24425,6 +24425,13 @@ ID_LIKE="suse opensuse"
         );
         assert!(!external_root.join(".rocm-cli-runtime.json").exists());
         assert!(runtime_manifest_path(&paths, &adopted.runtime_key).is_file());
+        // No CMake path in the probe means no compiler toolchain in that
+        // environment. `rocm update` reinstalls from this field, so recording
+        // it wrongly would add a toolchain the user never had.
+        assert!(
+            !adopted.devel,
+            "a probe without a CMake path must not claim the toolchain"
+        );
 
         let mut config = RocmCliConfig::default();
         activate_runtime(&paths, &mut config, &adopted.runtime_key)?;
@@ -24436,6 +24443,84 @@ ID_LIKE="suse opensuse"
         let rendered = render_runtimes_text(&paths, &config)?;
         assert!(rendered.contains("* adopted-release-pip-gfx120x-all-7-13-0"));
         assert!(rendered.contains("mode=read-only"));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// The other half of the same derivation: an adopted environment that does
+    /// expose a CMake path has the toolchain, and the manifest must say so or
+    /// the next `rocm update` would quietly reinstall without it.
+    #[test]
+    fn runtime_adopt_records_devel_when_the_probe_finds_cmake() -> Result<()> {
+        let (root, paths) = test_paths("runtime-adopt-devel");
+        let external_root = root.join("external-therock-venv");
+        let scripts_dir = external_root.join(if cfg!(windows) { "Scripts" } else { "bin" });
+        let python_executable = scripts_dir.join(if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python"
+        });
+        let sdk_root = external_root
+            .join("Lib")
+            .join("site-packages")
+            .join("rocm_sdk");
+        let sdk_bin = sdk_root.join("bin");
+        let cmake_path = sdk_root.join("lib").join("cmake");
+        fs::create_dir_all(&scripts_dir)?;
+        fs::create_dir_all(&sdk_bin)?;
+        fs::create_dir_all(&cmake_path)?;
+        let amdhip = sdk_bin.join(if cfg!(windows) {
+            "amdhip64_7.dll"
+        } else {
+            "libamdhip64.so"
+        });
+        let hipblas = sdk_bin.join(if cfg!(windows) {
+            "hipblas.dll"
+        } else {
+            "libhipblas.so"
+        });
+        fs::write(&python_executable, "python")?;
+        fs::write(&amdhip, "amdhip")?;
+        fs::write(&hipblas, "hipblas")?;
+
+        let adopted = adopt_runtime_from_probe(
+            &paths,
+            AdoptRuntimeRequest {
+                python_executable,
+                install_root: external_root,
+                runtime_id: "therock-release:gfx120X-all".to_owned(),
+                runtime_key: "adopted-release-pip-gfx120x-all-7-13-0".to_owned(),
+                replace: false,
+            },
+            therock::RocmSdkPythonProbe {
+                import_ok: true,
+                rocm_sdk_version: Some("7.13.0".to_owned()),
+                root_path: Some(sdk_root.clone()),
+                bin_path: Some(sdk_bin.clone()),
+                cmake_path: Some(cmake_path),
+                runtime_roots: vec![sdk_root],
+                bin_paths: vec![sdk_bin.clone()],
+                library_paths: vec![sdk_bin],
+                resolved_libraries: vec![
+                    therock::RocmSdkLibraryProbe {
+                        shortname: "amdhip64".to_owned(),
+                        paths: vec![amdhip],
+                    },
+                    therock::RocmSdkLibraryProbe {
+                        shortname: "hipblas".to_owned(),
+                        paths: vec![hipblas],
+                    },
+                ],
+                resolved_target_family: Some("gfx120X-all".to_owned()),
+                ..therock::RocmSdkPythonProbe::default()
+            },
+        )?;
+
+        assert!(
+            adopted.devel,
+            "a probe reporting a CMake path must record the toolchain"
+        );
 
         let _ = fs::remove_dir_all(root);
         Ok(())

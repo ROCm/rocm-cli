@@ -143,7 +143,8 @@ python scripts\therock_sdk_install_test.py --dry-run --family gfx120X-all
 ```
 
 Use `--family` only when a test needs a fixed package family. Do not use it for
-normal user setup.
+normal user setup. The script checks the default install; add `--devel` to check
+the opt-in compiler toolchain path instead.
 
 ## 3. Lemonade GPU Verification
 

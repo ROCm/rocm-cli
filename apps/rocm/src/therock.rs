@@ -645,13 +645,19 @@ fn resolve_latest_for_manifest(
             };
             let wheel_compatibility =
                 wheel_compatibility_for_python(&python_executable.executable)?;
-            let resolution = resolve_pip_runtime_with_timeout(
+            let resolution = resolve_pip_runtime(
                 paths,
-                channel,
                 Some(manifest.family.as_str()),
-                &wheel_compatibility,
-                None,
-                download_timeout_secs,
+                &PipRuntimeQuery {
+                    channel,
+                    wheel_compatibility: &wheel_compatibility,
+                    version_selector: None,
+                    download_timeout_secs,
+                    // Report against what this install actually has, so an
+                    // update check never names a toolchain the user does not
+                    // have installed.
+                    include_devel: manifest.devel,
+                },
             )?;
             Ok((
                 resolution.latest_version,
@@ -844,10 +850,14 @@ fn install_wheel_runtime(
     ));
     let resolution = resolve_pip_runtime(
         paths,
-        channel,
         family_override,
-        &wheel_compatibility,
-        version_selector,
+        &PipRuntimeQuery {
+            channel,
+            wheel_compatibility: &wheel_compatibility,
+            version_selector,
+            download_timeout_secs: None,
+            include_devel,
+        },
     )?;
     progress_line(format!(
         "Found TheRock package family {} version {} with a matching PyTorch stack.",
@@ -912,11 +922,7 @@ fn install_wheel_runtime(
     let _ = writeln!(
         output,
         "  package_policy: find the newest TheRock ROCm SDK version that has a matching PyTorch stack in the same index, then install pinned rocm[{}], torch, torchvision, and torchaudio versions in one uv transaction",
-        if include_devel {
-            "libraries,devel"
-        } else {
-            "libraries"
-        }
+        therock_sdk_extras(include_devel)
     );
     if dry_run {
         let env_python = venv_python_path(&install_root);
@@ -1055,20 +1061,43 @@ fn install_wheel_runtime(
     Ok(output)
 }
 
-/// Package specs for a wheel SDK install.
+/// The `rocm` wheel extras a given install asks for.
 ///
 /// `devel` adds the compiler, headers, and static libraries — roughly doubling
 /// the download — and is only needed to *build* GPU code. Running models needs
 /// `libraries` alone, so the toolchain is installed only when asked for.
+///
+/// Shared so the install plan, the progress text, and the resolution failure all
+/// name the same extras instead of drifting apart.
+const fn therock_sdk_extras(include_devel: bool) -> &'static str {
+    if include_devel {
+        "libraries,devel"
+    } else {
+        "libraries"
+    }
+}
+
+/// What the user sees when no index has a mutually compatible package set.
+///
+/// Names only the extras that were actually asked for: someone who never passed
+/// `--devel` should not be told a compiler toolchain could not be resolved.
+fn no_compatible_pip_versions_message(
+    include_devel: bool,
+    requested: &str,
+    index_url: &str,
+) -> String {
+    format!(
+        "no mutually compatible TheRock rocm[{}], torch, torchvision, and torchaudio versions were found for {requested} in {index_url}",
+        therock_sdk_extras(include_devel)
+    )
+}
+
+/// Package specs for a wheel SDK install.
 fn therock_pip_package_specs(
     package_versions: &TheRockPipPackageVersions,
     include_devel: bool,
 ) -> Vec<String> {
-    let extras = if include_devel {
-        "libraries,devel"
-    } else {
-        "libraries"
-    };
+    let extras = therock_sdk_extras(include_devel);
     vec![
         format!("rocm[{extras}]=={}", package_versions.rocm),
         format!("torch=={}", package_versions.torch),
@@ -1175,56 +1204,39 @@ fn install_tarball_runtime(
     Ok(output)
 }
 
-fn resolve_pip_runtime(
-    paths: &AppPaths,
+/// What to resolve, held fixed while each candidate index is tried in turn.
+struct PipRuntimeQuery<'a> {
     channel: TheRockChannel,
-    family_override: Option<&str>,
-    wheel_compatibility: &WheelCompatibility,
-    version_selector: Option<&RuntimeVersionSelector>,
-) -> Result<PipRuntimeResolution> {
-    resolve_pip_runtime_with_timeout(
-        paths,
-        channel,
-        family_override,
-        wheel_compatibility,
-        version_selector,
-        None,
-    )
+    wheel_compatibility: &'a WheelCompatibility,
+    version_selector: Option<&'a RuntimeVersionSelector>,
+    download_timeout_secs: Option<u64>,
+    /// Only describes the install in user-facing text — resolution itself is
+    /// the same either way, since `devel` is an extra on the `rocm` wheel.
+    include_devel: bool,
 }
 
-fn resolve_pip_runtime_with_timeout(
+fn resolve_pip_runtime(
     paths: &AppPaths,
-    channel: TheRockChannel,
     family_override: Option<&str>,
-    wheel_compatibility: &WheelCompatibility,
-    version_selector: Option<&RuntimeVersionSelector>,
-    download_timeout_secs: Option<u64>,
+    query: &PipRuntimeQuery<'_>,
 ) -> Result<PipRuntimeResolution> {
     let family_resolution = resolve_family(paths, family_override)?;
-    let index_urls = therock_index_urls(channel, &family_resolution.family);
+    let index_urls = therock_index_urls(query.channel, &family_resolution.family);
     let mut errors = Vec::new();
     for index_url in index_urls {
-        match resolve_pip_runtime_from_index(
-            paths,
-            channel,
-            &family_resolution,
-            &index_url,
-            wheel_compatibility,
-            version_selector,
-            download_timeout_secs,
-        ) {
+        match resolve_pip_runtime_from_index(paths, &family_resolution, &index_url, query) {
             Ok(resolution) => return Ok(resolution),
             Err(error) => errors.push(format!("{index_url}: {error}")),
         }
     }
     bail!(
         "failed to resolve TheRock {} wheel runtime from candidate indexes:\n  - {}\n\n{}",
-        channel.as_str(),
+        query.channel.as_str(),
         errors.join("\n  - "),
         family_resolution_hint(
             &family_resolution.source,
             &family_resolution.family,
-            channel,
+            query.channel,
             "wheel",
         )
     )
@@ -1232,13 +1244,17 @@ fn resolve_pip_runtime_with_timeout(
 
 fn resolve_pip_runtime_from_index(
     paths: &AppPaths,
-    channel: TheRockChannel,
     family_resolution: &FamilyResolution,
     index_url: &str,
-    wheel_compatibility: &WheelCompatibility,
-    version_selector: Option<&RuntimeVersionSelector>,
-    download_timeout_secs: Option<u64>,
+    query: &PipRuntimeQuery<'_>,
 ) -> Result<PipRuntimeResolution> {
+    let &PipRuntimeQuery {
+        channel,
+        wheel_compatibility,
+        version_selector,
+        download_timeout_secs,
+        include_devel,
+    } = query;
     let rocm_versions =
         load_simple_index_versions(paths, index_url, "rocm", None, download_timeout_secs)?;
     if matches!(channel, TheRockChannel::Release)
@@ -1281,10 +1297,11 @@ fn resolve_pip_runtime_from_index(
         version_selector,
     )
     .with_context(|| {
-        let requested = version_selector.map_or_else(|| "latest compatible version".to_owned(), RuntimeVersionSelector::describe);
-        format!(
-            "no mutually compatible TheRock rocm[libraries,devel], torch, torchvision, and torchaudio versions were found for {requested} in {index_url}"
-        )
+        let requested = version_selector.map_or_else(
+            || "latest compatible version".to_owned(),
+            RuntimeVersionSelector::describe,
+        );
+        no_compatible_pip_versions_message(include_devel, &requested, index_url)
     })?;
     let latest_version = package_versions.rocm.clone();
     Ok(PipRuntimeResolution {
@@ -4176,6 +4193,36 @@ mod tests {
         assert!(
             !package_specs[0].contains("devel"),
             "default install must not request the toolchain: {package_specs:?}"
+        );
+    }
+
+    /// A resolution failure must describe the install that was actually asked
+    /// for. Naming `devel` to someone who never passed `--devel` sends them
+    /// looking for a toolchain problem they do not have.
+    #[test]
+    fn no_compatible_versions_message_names_only_the_requested_extras() {
+        let without_devel = no_compatible_pip_versions_message(
+            false,
+            "latest compatible version",
+            "https://example.invalid/simple/",
+        );
+        assert!(
+            !without_devel.contains("devel"),
+            "default install failure must not mention the toolchain: {without_devel}"
+        );
+        assert!(
+            without_devel.contains("rocm[libraries],"),
+            "default install failure should name the runtime extras: {without_devel}"
+        );
+
+        let with_devel = no_compatible_pip_versions_message(
+            true,
+            "latest compatible version",
+            "https://example.invalid/simple/",
+        );
+        assert!(
+            with_devel.contains("rocm[libraries,devel],"),
+            "--devel failure should name the toolchain: {with_devel}"
         );
     }
 

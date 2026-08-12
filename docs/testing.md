@@ -165,8 +165,9 @@ Then it verifies:
 - the installer does not pre-create that pip cache during dry-run or setup;
   pip creates it inside the ROCm folder when packages are downloaded
 - a single TheRock-index pip install plan for pinned `rocm[libraries]`,
-  `torch`, `torchvision`, and `torchaudio` versions (`--devel` adds the
-  compiler toolchain, giving `rocm[libraries,devel]`)
+  `torch`, `torchvision`, and `torchaudio` versions, and that the toolchain is
+  not planned for unless asked (pass the script `--devel` to check the opt-in
+  path instead, giving `rocm[libraries,devel]`)
 - package selection uses the newest exact ROCm build suffix common to the SDK
   package and the PyTorch stack for the current Python/platform wheel tags
 - `python -m rocm_sdk version`
@@ -914,7 +915,9 @@ it must be an exact runtime key or an unambiguous runtime id. It requires
 TheRock SDK wheel directories.
 For TheRock 7.13, patch vLLM's GPTQ ROCm compatibility guard to include HIP
 7.13 before building from source; otherwise `q_gemm.hip` can fail on missing
-`half`/`half2` `atomicAdd` overloads.
+`half`/`half2` `atomicAdd` overloads. Building from source needs the compiler
+toolchain, so install the runtime with `rocm install sdk --devel` (see
+[vllm.md](vllm.md)).
 On native Windows this script prints a JSON skip result; run it from WSL/Linux
 for live ROCm GPU acceptance.
 
