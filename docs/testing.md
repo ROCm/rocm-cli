@@ -746,7 +746,6 @@ Release trust checks:
 cargo test -p rocm --bin rocm metadata_signature_verification_accepts_generated_key_and_rejects_tamper
 cargo test -p rocm-core model_recipe_index_signature_accepts_generated_key_and_rejects_tamper
 python scripts/release_readiness.py --self-test
-ROCDXG_CHECKSUM_SELF_TEST=1 bash scripts/wsl_setup_rocdxg.sh
 bash scripts/setup-wsl-portable-build-deps.sh --self-test
 ```
 
@@ -944,10 +943,11 @@ and library registration. Source-build tools such as Windows SDK headers,
 CMake, and compilers are optional for runtime acceptance; add
 `--require-build-tools` only when validating a WSL source-build environment.
 
-Interactive ROCDXG install inside WSL:
+ROCDXG install inside WSL:
 
 ```bash
-bash scripts/wsl_setup_rocdxg.sh
+rocm install driver            # review the plan
+rocm install driver --yes      # run it
 python scripts/wsl_preflight.py --require-ready
 ```
 
@@ -955,5 +955,10 @@ To require checksum verification for the downloaded ROCDXG `.deb`, provide the
 expected package digest from a trusted release source:
 
 ```bash
-ROCDXG_SHA256=<64-hex-sha256> bash scripts/wsl_setup_rocdxg.sh
+ROCM_CLI_ROCDXG_SHA256=<64-hex-sha256> rocm install driver --yes
 ```
+
+The install is covered by unit tests over the generated plan (`cargo test -p
+rocm --bin rocm wsl_rocdxg`). Running it end to end needs a WSL2 host with
+`/dev/dxg` and dxcore present, since the plan refuses before installing
+otherwise.
