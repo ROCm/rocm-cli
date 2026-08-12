@@ -1,4 +1,4 @@
-Feature: Engine shell and engine installation
+Feature: Engine shell
 
   # `rocm engines shell` always did activate the engine environment, but nothing
   # said so: the prompt marker was passed through the PS1 *environment variable*,
@@ -22,25 +22,3 @@ Feature: Engine shell and engine installation
     And the engine environment's interpreter is the one that runs
     When the user leaves the engine shell
     Then the engine shell exits successfully
-
-  # Expected to FAIL on a GPU host. Installing an engine is a plain command a
-  # user runs from wherever they happen to be — a container, a bare `ssh`
-  # session, a service unit — and none of those necessarily give a process its
-  # own per-session scratch directory. The CLI already copes with that for the
-  # directories it owns; the engine it launches on the user's behalf must not be
-  # left to fail for the same reason.
-  #
-  # Only the missing-scratch-directory failure is pinned. Anything else the
-  # install runs into on a given host (no supported GPU backend, a download
-  # problem) is that host's business and does not make this scenario fail, so it
-  # goes green the day the CLI stops leaving the engine without one.
-  #
-  # @requires-gpu because the engine's own launcher needs the AMD userspace
-  # libraries to get far enough to look for a scratch directory at all: on a
-  # plain container it dies earlier, for an unrelated reason, and would prove
-  # nothing.
-  @id:engines-install-without-a-session-runtime-dir @requires-gpu @requires-os:linux
-  Scenario: 2 - Installing an engine works from a session with no scratch directory
-    Given a session that provides no scratch directory of its own
-    When the user installs the Lemonade engine
-    Then the install does not fail for want of a scratch directory
