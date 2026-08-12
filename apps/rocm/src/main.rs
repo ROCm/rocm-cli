@@ -2548,14 +2548,14 @@ fn install_driver(
         .driver;
     state.executed_at_unix_ms = Some(rocm_core::unix_time_millis());
     state.post_driver = Some(post_driver);
-    state.reboot_required = true;
+    state.reboot_required = plan.reboot_required;
     state.reboot_observed = driver_reboot_observed(state.boot_id_at_execution.as_deref());
     write_driver_install_state(paths, &state)
         .map_err(|source| DriverInstallError::new(source, true))?;
 
     let _ = writeln!(output, "execution:");
     let _ = writeln!(output, "  status: completed");
-    let _ = writeln!(output, "  reboot_required: true");
+    let _ = writeln!(output, "  reboot_required: {}", plan.reboot_required);
     let _ = writeln!(
         output,
         "  state: {}",
@@ -2786,6 +2786,13 @@ struct DriverInstallPlan {
     preflight_checks: Vec<String>,
     commands: Vec<DriverPlanCommand>,
     checks: Vec<String>,
+    /// Whether the host must reboot before the verification steps mean anything.
+    ///
+    /// True for the kernel-module paths: an amdgpu DKMS build is not live until
+    /// the machine comes back up. False on WSL2, where nothing kernel-side
+    /// changes — ROCDXG is a userspace library and `ldconfig` publishes it
+    /// immediately, so telling the user to reboot would be wrong.
+    reboot_required: bool,
 }
 
 impl DriverInstallPlan {
@@ -2856,6 +2863,103 @@ struct DriverPassiveCheck {
     detail: String,
 }
 
+/// Release of ROCDXG installed on WSL2, overridable for trying another build.
+///
+/// Shell-expanded in the emitted commands so the printed plan shows both the
+/// variable and the default, matching how `ROCM_CLI_AMDGPU_VERSION` is handled
+/// for the bare-metal repository pin.
+const ROCDXG_VERSION_EXPR: &str = "${ROCM_CLI_ROCDXG_VERSION:-1.2.0}";
+
+/// The `rocm install driver` plan for a WSL2 host.
+///
+/// WSL2 has no in-tree amdgpu driver to install: the GPU comes from the Windows
+/// host driver through `/dev/dxg`, and what ROCm needs on the Linux side is
+/// ROCDXG (`librocdxg`), which bridges the runtime to it. Without that library
+/// `rocm examine` reports `wsl_rocdxg_missing` and `rocm serve` refuses with
+/// "no usable AMD GPU detected", even though a gfx target is detected — the
+/// target is read from the Windows-side driver.
+///
+/// This used to be a refusal pointing at a shell script under `scripts/`, which
+/// ships only in a git checkout — never in the release bundle — so it was a dead
+/// end for anyone who installed the CLI normally. These are that script's steps;
+/// it has been removed rather than left as a second, untested copy of them.
+fn wsl_rocdxg_driver_plan() -> DriverInstallPlan {
+    let deb = format!("rocdxg-roct_{ROCDXG_VERSION_EXPR}_amd64.deb");
+    let url =
+        format!("https://github.com/ROCm/librocdxg/releases/download/v{ROCDXG_VERSION_EXPR}/{deb}");
+    let deb_path = format!("/tmp/{deb}");
+    DriverInstallPlan {
+        supported: true,
+        mutating: true,
+        policy: "wsl_rocdxg".to_owned(),
+        os_id: "wsl".to_owned(),
+        version_id: String::new(),
+        codename: String::new(),
+        repo_version_expr: ROCDXG_VERSION_EXPR.to_owned(),
+        reason:
+            "WSL2 uses the Windows host driver plus ROCDXG, not Linux DKMS; this installs ROCDXG."
+                .to_owned(),
+        // Read, not run: the GPU plumbing belongs to the WSL platform, so if it
+        // is absent the fix is on the Windows side and no Linux package helps.
+        // The Execute phase fails on the same two paths rather than installing
+        // a library with nothing to bind to.
+        preflight_checks: vec![
+            "/dev/dxg (WSL GPU device)".to_owned(),
+            "/usr/lib/wsl/lib/libdxcore.so (WSL dxcore runtime)".to_owned(),
+        ],
+        commands: vec![
+            driver_command(
+                DriverCommandPhase::Prepare,
+                "test -e /dev/dxg || { echo 'error: /dev/dxg is missing; WSL GPU plumbing is not available' >&2; exit 1; }",
+            ),
+            driver_command(
+                DriverCommandPhase::Prepare,
+                "test -e /usr/lib/wsl/lib/libdxcore.so || { echo 'error: /usr/lib/wsl/lib/libdxcore.so is missing' >&2; exit 1; }",
+            ),
+            // Say why up front rather than letting the first privileged step die
+            // with `sudo: command not found`, which reads like a broken plan.
+            driver_command(
+                DriverCommandPhase::Prepare,
+                "command -v sudo >/dev/null 2>&1 || { echo 'error: sudo is required to install ROCDXG under /opt/rocm' >&2; exit 1; }",
+            ),
+            driver_command(DriverCommandPhase::Prepare, "sudo apt-get update"),
+            driver_command(
+                DriverCommandPhase::Prepare,
+                "sudo apt-get install -y ca-certificates curl",
+            ),
+            driver_command(
+                DriverCommandPhase::Execute,
+                &format!("curl -L --fail --show-error --output {deb_path} {url}"),
+            ),
+            // Opt-in, exactly as the script has it: no digest is baked in
+            // because the release is not reproducible from here, so an
+            // unset variable must not silently become "verified".
+            driver_command(
+                DriverCommandPhase::Execute,
+                &format!(
+                    "if [ -n \"${{ROCM_CLI_ROCDXG_SHA256:-}}\" ]; then printf '%s  %s\\n' \"$ROCM_CLI_ROCDXG_SHA256\" {deb_path} | sha256sum -c -; else echo 'ROCM_CLI_ROCDXG_SHA256 unset; skipping checksum verification'; fi"
+                ),
+            ),
+            driver_command(
+                DriverCommandPhase::Execute,
+                &format!("sudo apt-get install -y {deb_path}"),
+            ),
+            driver_command(DriverCommandPhase::Execute, "sudo ldconfig"),
+            driver_command(
+                DriverCommandPhase::Verify,
+                "test -e /opt/rocm/lib/librocdxg.so",
+            ),
+            driver_command(
+                DriverCommandPhase::Verify,
+                "ldconfig -p | grep -q 'librocdxg\\.so'",
+            ),
+        ],
+        checks: vec!["rocm examine".to_owned()],
+        // Userspace only: `ldconfig` publishes the library in this boot.
+        reboot_required: false,
+    }
+}
+
 fn build_driver_install_plan(
     examine: &ExamineSummary,
     os_release_text: &str,
@@ -2875,22 +2979,11 @@ fn build_driver_install_plan(
             preflight_checks: Vec::new(),
             commands: Vec::new(),
             checks: vec!["rocm examine".to_owned()],
+            reboot_required: true,
         };
     }
     if examine.wsl.as_ref().is_some_and(|wsl| wsl.is_wsl) {
-        return DriverInstallPlan {
-            supported: false,
-            mutating: false,
-            policy: "wsl_rocdxg".to_owned(),
-            os_id: "wsl".to_owned(),
-            version_id: String::new(),
-            codename: String::new(),
-            repo_version_expr,
-            reason: "WSL uses the Windows host driver plus ROCDXG; run `scripts/wsl_setup_rocdxg.sh` inside WSL instead of installing Linux DKMS.".to_owned(),
-            preflight_checks: Vec::new(),
-            commands: Vec::new(),
-            checks: vec!["rocm examine".to_owned(), "scripts/wsl_preflight.py".to_owned()],
-        };
+        return wsl_rocdxg_driver_plan();
     }
 
     let os_id = parse_os_release_field(os_release_text, "ID").unwrap_or_default();
@@ -2978,6 +3071,8 @@ fn build_driver_install_plan(
             preflight_checks: Vec::new(),
             commands: Vec::new(),
             checks: vec!["rocm examine".to_owned()],
+            // Kernel module: not live until the machine comes back up.
+            reboot_required: true,
         }),
     }
 }
@@ -3176,6 +3271,8 @@ fn apt_driver_plan(
             "amd-smi version if present".to_owned(),
             "rocminfo if present".to_owned(),
         ],
+        // Kernel module: not live until the machine comes back up.
+        reboot_required: true,
     }
 }
 
@@ -3270,6 +3367,8 @@ fn dnf_driver_plan(
             "amd-smi version if present".to_owned(),
             "rocminfo if present".to_owned(),
         ],
+        // Kernel module: not live until the machine comes back up.
+        reboot_required: true,
     }
 }
 
@@ -3355,6 +3454,8 @@ fn sles_driver_plan(
             "amd-smi version if present".to_owned(),
             "rocminfo if present".to_owned(),
         ],
+        // Kernel module: not live until the machine comes back up.
+        reboot_required: true,
     }
 }
 
@@ -3468,14 +3569,23 @@ fn render_driver_install_plan(plan: &DriverInstallPlan, yes: bool, dry_run: bool
         .iter()
         .filter(|command| command.phase == DriverCommandPhase::Verify)
         .collect::<Vec<_>>();
+    // A plan that changes nothing kernel-side is live as soon as it finishes, so
+    // labelling its checks "post_reboot" would tell the user to reboot for
+    // nothing — and would contradict the `reboot_required: false` this same plan
+    // reports after executing.
+    let checks_label = if plan.reboot_required {
+        "post_reboot"
+    } else {
+        "post_install"
+    };
     if !verification_commands.is_empty() {
-        let _ = writeln!(output, "  post_reboot_check_commands:");
+        let _ = writeln!(output, "  {checks_label}_check_commands:");
         for command in verification_commands {
             let _ = writeln!(output, "    {}", command.command);
         }
     }
     if !plan.checks.is_empty() {
-        let _ = writeln!(output, "  post_reboot_checks:");
+        let _ = writeln!(output, "  {checks_label}_checks:");
         for check in &plan.checks {
             let _ = writeln!(output, "    {check}");
         }
@@ -23530,16 +23640,129 @@ VERSION_ID="41"
     }
 
     #[test]
-    fn wsl_install_driver_uses_rocdxg_guidance_without_dkms() {
+    fn wsl_install_driver_installs_rocdxg_without_dkms() {
+        // `dkms: true` is passed deliberately: WSL2 has no kernel module to
+        // build, so the flag must not pull in the bare-metal path.
         let plan = build_driver_install_plan(&test_examine("linux", true), "", true);
         let rendered = render_driver_install_plan(&plan, false, false);
 
-        assert!(!plan.supported);
+        assert!(plan.supported);
+        assert!(plan.mutating);
         assert_eq!(plan.policy, "wsl_rocdxg");
-        assert!(rendered.contains("approval: not required"));
-        assert!(rendered.contains("execution_commands: <none>"));
-        assert!(rendered.contains("scripts/wsl_setup_rocdxg.sh"));
         assert!(!rendered.contains("amdgpu-dkms"));
+        // The whole point of the bug: the plan must be runnable, and must not
+        // send the user to a file that only exists in a git checkout.
+        assert!(!rendered.contains("execution_commands: <none>"));
+        assert!(!rendered.contains("scripts/"));
+        assert!(rendered.contains("approval: required"));
+    }
+
+    #[test]
+    fn wsl_rocdxg_plan_installs_the_library_and_publishes_it() {
+        let plan = wsl_rocdxg_driver_plan();
+        let commands = plan.execution_commands().join("\n");
+
+        // Fetches the release artifact, installs it, and makes the linker see
+        // it. Any one of these missing leaves `wsl_rocdxg_ready` unreachable.
+        assert!(commands.contains("https://github.com/ROCm/librocdxg/releases/download/"));
+        assert!(commands.contains("rocdxg-roct_"));
+        assert!(commands.contains("sudo apt-get install -y /tmp/rocdxg-roct_"));
+        assert!(commands.contains("sudo ldconfig"));
+
+        // Verification asserts the two things `examine` keys `wsl_rocdxg_ready`
+        // on, so a silently partial install cannot report success.
+        let verify = plan
+            .commands
+            .iter()
+            .filter(|c| c.phase == DriverCommandPhase::Verify)
+            .map(|c| c.command.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(verify.contains("/opt/rocm/lib/librocdxg.so"));
+        assert!(verify.contains("ldconfig -p"));
+    }
+
+    #[test]
+    fn wsl_rocdxg_plan_refuses_before_installing_when_the_gpu_plumbing_is_absent() {
+        // /dev/dxg and dxcore come from the Windows side. If they are missing,
+        // installing the bridge library accomplishes nothing, so the plan must
+        // stop rather than report a successful install of something inert.
+        let plan = wsl_rocdxg_driver_plan();
+        let prepare = plan
+            .commands
+            .iter()
+            .filter(|c| c.phase == DriverCommandPhase::Prepare)
+            .map(|c| c.command.clone())
+            .collect::<Vec<_>>();
+        let joined = prepare.join("\n");
+        assert!(joined.contains("/dev/dxg"));
+        assert!(joined.contains("/usr/lib/wsl/lib/libdxcore.so"));
+        // Named explicitly, rather than surfacing as `sudo: command not found`
+        // from whichever privileged step happened to run first.
+        assert!(joined.contains("command -v sudo"));
+        // Both guards run before anything is fetched or installed.
+        let first_mutation = plan
+            .execution_commands()
+            .iter()
+            .position(|c| c.contains("apt-get") || c.contains("curl"))
+            .expect("plan installs something");
+        let last_guard = plan
+            .execution_commands()
+            .iter()
+            .rposition(|c| c.contains("is missing"))
+            .expect("plan guards the plumbing");
+        assert!(
+            last_guard < first_mutation,
+            "plumbing guards must precede the first mutating command"
+        );
+    }
+
+    #[test]
+    fn wsl_rocdxg_checksum_is_opt_in_but_enforced_when_supplied() {
+        // No digest is baked in (the release is not reproducible from here), so
+        // an unset variable must read as "not verified" rather than silently
+        // passing — and a supplied one must actually be checked.
+        let commands = wsl_rocdxg_driver_plan().execution_commands().join("\n");
+        assert!(commands.contains("ROCM_CLI_ROCDXG_SHA256"));
+        assert!(commands.contains("sha256sum -c -"));
+        assert!(commands.contains("skipping checksum verification"));
+    }
+
+    #[test]
+    fn wsl_rocdxg_install_does_not_ask_for_a_reboot() {
+        // ROCDXG is userspace: `ldconfig` publishes it in this boot. The
+        // bare-metal DKMS path is the one that needs a reboot.
+        let wsl = wsl_rocdxg_driver_plan();
+        assert!(!wsl.reboot_required);
+        let rendered = render_driver_install_plan(&wsl, false, false);
+        assert!(rendered.contains("post_install_checks:"));
+        assert!(!rendered.contains("post_reboot"));
+
+        let bare_metal = build_driver_install_plan(
+            &test_examine("linux", false),
+            "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n",
+            true,
+        );
+        assert!(bare_metal.reboot_required);
+        assert!(render_driver_install_plan(&bare_metal, false, false).contains("post_reboot"));
+    }
+
+    #[test]
+    fn wsl_rocdxg_version_is_overridable_and_reaches_every_reference() {
+        // One expression drives the archive name and the URL, so an override
+        // cannot leave a URL pointing at the default.
+        let plan = wsl_rocdxg_driver_plan();
+        assert_eq!(plan.repo_version_expr, ROCDXG_VERSION_EXPR);
+        let commands = plan.execution_commands().join("\n");
+        let occurrences = commands.matches(ROCDXG_VERSION_EXPR).count();
+        assert!(
+            occurrences >= 3,
+            "version expression should drive the deb name, the tag and the path; saw {occurrences}"
+        );
+        assert!(
+            !commands.contains("1.2.0_amd64.deb"),
+            "version is hardcoded"
+        );
     }
 
     // EAI-7406: distro selection must honor `/etc/os-release` `ID_LIKE`, so that

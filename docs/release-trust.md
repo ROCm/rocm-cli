@@ -118,16 +118,16 @@ happen before activation. Run the current host's set with
 
 ## WSL ROCDXG Package Verification
 
-`scripts/wsl_setup_rocdxg.sh` does not bake in a production checksum for the
-ROCDXG `.deb`. Operators can require verification by providing the expected
-digest:
+No production checksum is baked in for the ROCDXG `.deb`. Operators can require
+verification by providing the expected digest:
 
 ```bash
-ROCDXG_SHA256=<64-hex-sha256> bash scripts/wsl_setup_rocdxg.sh
+ROCM_CLI_ROCDXG_SHA256=<64-hex-sha256> rocm install driver --yes
 ```
 
-When `ROCDXG_SHA256` is set, the script verifies the downloaded `.deb` before
-`apt install` and fails on malformed or mismatched digests.
+When the variable is set, `rocm install driver` verifies the downloaded `.deb`
+before `apt install` and fails on a mismatch; when it is unset the plan says so
+explicitly rather than reporting an unverified download as verified.
 
 ## Runtime Metadata Verification
 
