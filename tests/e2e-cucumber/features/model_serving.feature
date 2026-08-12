@@ -150,7 +150,7 @@ Feature: Model serving
   # policy itself is cleanly distinguishable from the ordinary "this machine has
   # no GPU" refusal every policy gets there.
   @id:serve-rejects-no-advertised-device-policy @requires-no-gpu
-  Scenario: 14 - Every device policy the serve command offers is one it accepts
+  Scenario: 15 - Every device policy the serve command offers is one it accepts
     When the user serves a model under each device policy the command offers
     Then no policy is refused for being that policy
 
@@ -161,7 +161,7 @@ Feature: Model serving
   # (measured on MI300X, run 188). So this carries no expected-failure row — it
   # holds the contract the pod violated, and goes red if CI ever meets it.
   @id:services-stop-reports-what-it-stopped @requires-gpu
-  Scenario: 15 - Stopping a running server reports that it stopped it
+  Scenario: 16 - Stopping a running server reports that it stopped it
     Given a managed runtime is active
     And a model is being served on GPU
     When the user stops the server that is running
@@ -173,7 +173,7 @@ Feature: Model serving
   # touches the installed program: the removal is scoped to this scenario's own
   # directories and keeps the binaries.
   @id:uninstall-stops-what-it-manages @requires-os:linux
-  Scenario: 16 - Removing the CLI's managed files stops the servers it manages
+  Scenario: 17 - Removing the CLI's managed files stops the servers it manages
     Given a local server this machine manages is running
     When the user removes the CLI's managed files
     Then the removal is reported as complete
@@ -184,7 +184,7 @@ Feature: Model serving
   # and carrying on leaves the user unable to tell which GPU their model will
   # run on, or whether it will run on one at all.
   @id:serve-auto-gpu-selection-names-a-device @requires-gpu
-  Scenario: 17 - Letting the CLI choose the GPU names the device it chose
+  Scenario: 18 - Letting the CLI choose the GPU names the device it chose
     Given a managed runtime is active
     And a machine with an AMD GPU
     When the user serves a model letting the CLI choose the GPU
@@ -195,7 +195,7 @@ Feature: Model serving
   # with the server already there. Either outcome is fine — pick a free address,
   # or say the usual one is busy — but silently reusing it is not.
   @id:serve-second-server-gets-a-free-port @requires-gpu
-  Scenario: 18 - A second server does not take an address already in use
+  Scenario: 19 - A second server does not take an address already in use
     Given a managed runtime is active
     And the address a new server would use is already taken
     When the user serves a model without choosing an address
