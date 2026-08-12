@@ -142,6 +142,16 @@ The four self-hosted jobs — `e2e-gpu`, `e2e-gpu-strix-ubuntu`,
 hardware failure that RUNS never gates a PR merge. Their results still surface
 in the self-hosted consolidated report for visibility.
 
+### Timeouts on the shared Strix box
+
+Three of those lanes — the two native Strix ones and `e2e-wsl` — run on the same
+physical machine and can be in flight together, so a wait that is comfortable on
+an idle runner can expire while a sibling lane loads a model. Two budgets are
+raised there rather than letting contention read as a product failure:
+`E2E_SERVE_TIMEOUT_SECS` for serve readiness, and `E2E_TUI_TIMEOUT_SECS` for the
+PTY-driven dashboard waits. Both only lengthen how long a wait may take; a
+genuine hang still fails, just later.
+
 **Required-check caveat.** These three job names (plus, historically, a
 consolidated-report name) are still in `main`'s required-status-check list.
 `continue-on-error` neutralizes a job that ran and failed, but a required check

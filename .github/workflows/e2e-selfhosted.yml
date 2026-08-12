@@ -360,6 +360,12 @@ jobs:
       TMPDIR: /home/ubuntu/actions-runner/tmp
       PIP_CACHE_DIR: /home/ubuntu/actions-runner/pip-cache
       E2E_SERVE_TIMEOUT_SECS: "300"
+      # The three Strix lanes share one physical machine, and this workflow now
+      # runs a third of them, so a TUI frame that renders well inside the 30s
+      # default on an idle runner can miss it while a sibling lane loads a model.
+      # Raise the wait budget rather than let that read as a product failure; a
+      # genuine hang still fails, just later.
+      E2E_TUI_TIMEOUT_SECS: "90"
       # Match the MI300X dispatch path: opt into the platform-adaptive large-model
       # scenario only when the manual include_nightly input is enabled.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
@@ -504,6 +510,12 @@ jobs:
       )
     continue-on-error: true
     env:
+      # The three Strix lanes share one physical machine, and this workflow now
+      # runs a third of them, so a TUI frame that renders well inside the 30s
+      # default on an idle runner can miss it while a sibling lane loads a model.
+      # Raise the wait budget rather than let that read as a product failure; a
+      # genuine hang still fails, just later.
+      E2E_TUI_TIMEOUT_SECS: "90"
       # Match the Linux Strix dispatch path: opt into the platform-adaptive
       # large-model scenario only when the manual input is enabled.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
@@ -667,6 +679,12 @@ jobs:
     continue-on-error: true
     env:
       E2E_SERVE_TIMEOUT_SECS: "300"
+      # The three Strix lanes share one physical machine, and this workflow now
+      # runs a third of them, so a TUI frame that renders well inside the 30s
+      # default on an idle runner can miss it while a sibling lane loads a model.
+      # Raise the wait budget rather than let that read as a product failure; a
+      # genuine hang still fails, just later.
+      E2E_TUI_TIMEOUT_SECS: "90"
       # Match the other hardware lanes: opt into the platform-adaptive
       # large-model scenario only when the manual include_nightly input is on.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
