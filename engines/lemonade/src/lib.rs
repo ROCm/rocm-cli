@@ -622,6 +622,7 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
         request.port,
         &request.model_ref,
         &backend,
+        request.engine_recipe.as_ref(),
         log_path,
         &process_env,
     );
@@ -864,6 +865,7 @@ fn ensure_direct_llama_model_available(
             download_port,
             &request.model_ref,
             ROCM_BACKEND_NAME,
+            None,
             log_path,
             process_env,
         );
@@ -2835,12 +2837,19 @@ fn run_lemonade_model_load(
     port: u16,
     model_ref: &str,
     backend: &str,
+    engine_recipe: Option<&EngineRecipeHint>,
     log_path: Option<&Path>,
     process_env: &LemonadeProcessEnvironment,
 ) -> Result<()> {
     let mut command = ProcessCommand::new(&manifest.lemonade);
     command
-        .args(lemonade_model_load_args(host, port, model_ref, backend))
+        .args(lemonade_model_load_args(
+            host,
+            port,
+            model_ref,
+            backend,
+            engine_recipe,
+        ))
         .stdin(Stdio::null());
     if let Some(log_path) = log_path {
         let log = fs::OpenOptions::new()
@@ -2925,6 +2934,9 @@ fn serve_direct_llama_server(
         .arg("--alias")
         .arg(&request.model_ref)
         .stdin(Stdio::null());
+    if let Some(engine_recipe) = request.engine_recipe.as_ref() {
+        command.args(&engine_recipe.required_flags);
+    }
     // Packaged llama-server is raw llama.cpp — it does not read `LEMONADE_API_KEY`.
     // When `rocm serve` protects a public endpoint, hand llama-server the *existing*
     // CLI-managed 0600 key file via `--api-key-file` (a path, not the value, so the
@@ -3368,8 +3380,14 @@ fn model_reports_ready_backend(model: &Value, backend: &str) -> bool {
     }
 }
 
-fn lemonade_model_load_args(host: &str, port: u16, model_ref: &str, backend: &str) -> Vec<String> {
-    vec![
+fn lemonade_model_load_args(
+    host: &str,
+    port: u16,
+    model_ref: &str,
+    backend: &str,
+    engine_recipe: Option<&EngineRecipeHint>,
+) -> Vec<String> {
+    let mut args = vec![
         "--host".to_owned(),
         host.to_owned(),
         "--port".to_owned(),
@@ -3379,7 +3397,14 @@ fn lemonade_model_load_args(host: &str, port: u16, model_ref: &str, backend: &st
         "--llamacpp".to_owned(),
         backend.to_owned(),
         "--save-options".to_owned(),
-    ]
+    ];
+    if let Some(engine_recipe) = engine_recipe.filter(|recipe| !recipe.required_flags.is_empty()) {
+        args.extend([
+            "--llamacpp-args".to_owned(),
+            engine_recipe.required_flags.join(" "),
+        ]);
+    }
+    args
 }
 
 fn query_health_json(host: &str, port: u16) -> Result<Value> {
@@ -4918,7 +4943,7 @@ mod tests {
 
     #[test]
     fn lemonade_model_load_uses_selected_backend() {
-        let args = lemonade_model_load_args("127.0.0.1", 11435, DEFAULT_MODEL, "vulkan");
+        let args = lemonade_model_load_args("127.0.0.1", 11435, DEFAULT_MODEL, "vulkan", None);
         assert_eq!(
             args,
             vec![
@@ -4931,6 +4956,30 @@ mod tests {
                 "--llamacpp",
                 "vulkan",
                 "--save-options",
+            ]
+        );
+    }
+
+    #[test]
+    fn lemonade_model_load_forwards_llamacpp_recipe_flags() {
+        let recipe = EngineRecipeHint {
+            required_flags: vec![
+                "--temperature".to_owned(),
+                "0.5".to_owned(),
+                "--top-p".to_owned(),
+                "0.25".to_owned(),
+                "--n-predict".to_owned(),
+                "128".to_owned(),
+            ],
+            ..EngineRecipeHint::default()
+        };
+        let args =
+            lemonade_model_load_args("127.0.0.1", 11435, DEFAULT_MODEL, "vulkan", Some(&recipe));
+        assert_eq!(
+            args[args.len() - 2..],
+            [
+                "--llamacpp-args",
+                "--temperature 0.5 --top-p 0.25 --n-predict 128"
             ]
         );
     }
