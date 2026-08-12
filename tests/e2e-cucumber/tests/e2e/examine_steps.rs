@@ -255,10 +255,35 @@ const FACTS_A_TOOL_ALSO_NEEDS: &[(&str, &[&str])] = &[
         &["detected_gfx_target", "gfx_target"],
     ),
     ("effective_default_engine", &["effective_default_engine"]),
-    ("legacy_rocm_status", &["legacy_rocm_status"]),
-    ("managed_runtimes", &["managed_runtimes"]),
+    ("legacy_rocm_status", &["legacy_rocm_status", "legacy_rocm"]),
+    (
+        "managed_runtimes",
+        &["managed_runtimes", "managed_runtime_count"],
+    ),
     ("config_dir", &["config_dir"]),
 ];
+
+/// Every field name appearing anywhere in the document, at any depth.
+///
+/// The assertion is that the fact is *reachable*, not that it sits at the root:
+/// where the machine-readable form chooses to put something is its business, and
+/// pinning a path here would turn a presentation choice into a test failure.
+fn field_names(value: &serde_json::Value, into: &mut std::collections::HashSet<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                into.insert(key.clone());
+                field_names(child, into);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                field_names(item, into);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// Whether the human report printed a `<label>:` line with a real value.
 /// `<unknown>`, `<none>` and `<unset>` are the text form's own placeholders for
@@ -279,12 +304,14 @@ async fn assert_json_states_what_human_does(world: &mut E2eWorld) {
         .as_ref()
         .expect("the human report was not captured");
     let value = parsed_json(world);
+    let mut present = std::collections::HashSet::new();
+    field_names(&value, &mut present);
     let mut withheld = Vec::new();
     for (label, json_fields) in FACTS_A_TOOL_ALSO_NEEDS {
         let Some(stated) = human_states(human, label) else {
             continue;
         };
-        if !json_fields.iter().any(|field| value.get(*field).is_some()) {
+        if !json_fields.iter().any(|field| present.contains(*field)) {
             withheld.push(format!("  {label} (the human report says {stated:?})"));
         }
     }

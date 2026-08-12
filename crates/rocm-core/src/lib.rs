@@ -4219,7 +4219,7 @@ fn marketing_name_contains(normalized_name: &str, pattern: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn detect_linux_sysfs_gfx_target() -> Option<String> {
+pub(crate) fn detect_linux_sysfs_gfx_target() -> Option<String> {
     if !runtime_is_linux() {
         return None;
     }
@@ -4228,24 +4228,58 @@ fn detect_linux_sysfs_gfx_target() -> Option<String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-const fn detect_linux_sysfs_gfx_target() -> Option<String> {
+pub(crate) const fn detect_linux_sysfs_gfx_target() -> Option<String> {
     None
 }
 
 #[cfg(target_os = "linux")]
 fn detect_linux_kfd_gfx_target() -> Option<String> {
-    let nodes_dir = Path::new("/sys/class/kfd/kfd/topology/nodes");
-    let entries = fs::read_dir(nodes_dir).ok()?;
-    for entry in entries.flatten() {
-        let Some(value) = fs::read_to_string(entry.path().join("gfx_target_version")).ok() else {
-            continue;
-        };
-        let Some(token) = parse_linux_kfd_gfx_target(value.trim()) else {
-            continue;
-        };
-        return Some(token);
-    }
-    None
+    detect_kfd_gfx_target_in(Path::new("/sys/class/kfd/kfd/topology/nodes"))
+}
+
+/// The KFD-topology read, against a caller-supplied nodes directory.
+///
+/// Split out so it can be driven against a planted directory: the hosts where
+/// this matters most (an Instinct box with no `lspci`) are exactly the ones a
+/// test cannot run on. Same seam as `discover_rocm_installs_in`.
+///
+/// Gated the same way as `parse_linux_kfd_gfx_target`, which it calls: present
+/// on Linux and under `cfg(test)` everywhere, so the tests run on every platform
+/// without the function existing in a Windows release build that can never use
+/// it. (`target_os` alone would have left the tests Linux-only; `test` alone
+/// would not compile on Windows CI, which is how this was found.)
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn detect_kfd_gfx_target_in(nodes_dir: &Path) -> Option<String> {
+    let mut targets: Vec<(String, String)> = fs::read_dir(nodes_dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let value = fs::read_to_string(entry.path().join("gfx_target_version")).ok()?;
+            let token = parse_linux_kfd_gfx_target(value.trim())?;
+            Some((entry.file_name().to_string_lossy().into_owned(), token))
+        })
+        .collect();
+    // `read_dir` order is filesystem-defined, so a multi-node box could report a
+    // different GPU run to run. Node names are `node0`, `node1`, ...; sorting by
+    // name makes the answer stable and picks the lowest-numbered node, which is
+    // the one HIP ordinal 0 refers to.
+    targets.sort_by_key(|(name, _)| natural_node_order(name));
+    targets.into_iter().next().map(|(_, token)| token)
+}
+
+/// Sort key for a KFD node directory name: its trailing number when it has one,
+/// so `node9` precedes `node10` rather than following it lexicographically.
+#[cfg(any(target_os = "linux", test))]
+fn natural_node_order(name: &str) -> (u64, String) {
+    let digits: String = name
+        .chars()
+        .skip_while(|ch| !ch.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
+        .collect();
+    (
+        digits.parse::<u64>().unwrap_or(u64::MAX),
+        name.to_ascii_lowercase(),
+    )
 }
 
 /// AMD GPU device ordinals usable for a GPU-required launch on this host, after
@@ -8867,6 +8901,69 @@ Class Name:                Display
 
         fs::remove_dir_all(root).ok();
         Ok(())
+    }
+
+    #[test]
+    fn kfd_topology_names_the_gpu_when_no_tooling_is_installed() -> Result<()> {
+        // The MI300X case. `Examination` enumerates GPUs by shelling out to
+        // lspci and rocminfo; where neither is reachable it reported no AMD GPU
+        // on a machine that has one, while the human report -- which reads this
+        // topology instead -- named the target correctly. Planted here because
+        // the hosts where it matters are the ones a test cannot run on.
+        let (root, _) = temp_app_paths("kfd-topology");
+        let nodes = root.join("nodes");
+        fs::create_dir_all(nodes.join("node0"))?;
+        fs::write(nodes.join("node0").join("gfx_target_version"), "90402\n")?;
+
+        let found = detect_kfd_gfx_target_in(&nodes);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(found.as_deref(), Some("gfx942"));
+        Ok(())
+    }
+
+    #[test]
+    fn kfd_topology_answer_does_not_depend_on_directory_order() -> Result<()> {
+        // `read_dir` order is filesystem-defined, so a multi-node box could name
+        // a different GPU run to run. node9 must not beat node10 lexically
+        // either -- the lowest-numbered node is the one HIP ordinal 0 means.
+        let (root, _) = temp_app_paths("kfd-topology-order");
+        let nodes = root.join("nodes");
+        for (node, version) in [("node10", "110100"), ("node9", "90402"), ("node0", "90400")] {
+            fs::create_dir_all(nodes.join(node))?;
+            fs::write(nodes.join(node).join("gfx_target_version"), version)?;
+        }
+
+        let found = detect_kfd_gfx_target_in(&nodes);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(found.as_deref(), Some("gfx940"));
+        Ok(())
+    }
+
+    #[test]
+    fn kfd_topology_skips_nodes_that_name_no_target() -> Result<()> {
+        // A CPU node carries a zero version. Reporting `gfx0` off the first
+        // directory encountered would be worse than reporting nothing.
+        let (root, _) = temp_app_paths("kfd-topology-cpu-node");
+        let nodes = root.join("nodes");
+        fs::create_dir_all(nodes.join("node0"))?;
+        fs::write(nodes.join("node0").join("gfx_target_version"), "0\n")?;
+        fs::create_dir_all(nodes.join("node1"))?;
+        fs::write(nodes.join("node1").join("gfx_target_version"), "110000\n")?;
+
+        let found = detect_kfd_gfx_target_in(&nodes);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(found.as_deref(), Some("gfx1100"));
+        Ok(())
+    }
+
+    #[test]
+    fn absent_kfd_topology_names_nothing_rather_than_guessing() {
+        let missing = workspace_test_artifact_dir().join("rocm-core-kfd-absent-nodes");
+        fs::remove_dir_all(&missing).ok();
+        assert_eq!(detect_kfd_gfx_target_in(&missing), None);
     }
 
     #[test]
