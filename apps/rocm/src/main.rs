@@ -22659,8 +22659,7 @@ install therock";
             "the ignored-flag note must reach the summary: {notes:?}"
         );
 
-        let quiet =
-            collect_serve_notes(false, &GpuSelection::Auto, false, &[0], None, None, None);
+        let quiet = collect_serve_notes(false, &GpuSelection::Auto, false, &[0], None, None, None);
         assert!(
             !quiet
                 .iter()
