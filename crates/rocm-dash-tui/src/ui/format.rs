@@ -15,6 +15,9 @@
 //! - Percentages always with 1 decimal unless < 0.1, then 2 decimals.
 //! - Optional values render `-`.
 
+use chrono::{DateTime, Utc};
+use rocm_dash_core::metrics::{ObservationFreshness, ObservationMetadata};
+
 /// Format a byte count that's already in mebibytes (e.g. amd-smi `vram_used_mb`).
 /// Promotes to GiB at 1024, TiB at 1024², with one decimal.
 pub fn mib(value: u64) -> String {
@@ -164,6 +167,114 @@ pub fn mhz(value: u64) -> String {
     }
 }
 
+// ── EAI-7960: observation-aware formatters ───────────────────────────────────
+
+/// Held-observation marker. Appended to compact values when freshness is Held.
+/// Every surface that shows a held indicator MUST use this constant so the
+/// rendered character and the legend text stay in sync.
+pub const HELD_MARKER: &str = "*";
+
+/// Legend text for [`HELD_MARKER`]. Re-use in tab footers, tooltips, and help
+/// panels rather than inventing view-specific descriptions.
+pub const HELD_LEGEND: &str = "* = held (prior scrape window)";
+
+/// Compact gen_tps for narrow table cells (matches the existing bare-number format).
+///
+/// - `None` → `"—"` (unavailable; em-dash matches the rest of the table)
+/// - Non-finite → `"—"` (NaN/Inf never rendered)
+/// - `Some(v)`, Held → `"{v:.0}*"`
+/// - `Some(v)`, Fresh or unknown metadata → `"{v:.0}"`
+/// - Real `0.0` → `"0"` (zero is a real measurement, never dash)
+pub fn gen_tps_cell(tps: Option<f64>, obs: Option<&ObservationMetadata>) -> String {
+    match tps {
+        None => "—".to_string(),
+        Some(v) if !v.is_finite() => "—".to_string(),
+        Some(v) => {
+            let base = format!("{v:.0}");
+            if obs.is_some_and(|m| m.freshness == ObservationFreshness::Held) {
+                format!("{base}{HELD_MARKER}")
+            } else {
+                base
+            }
+        }
+    }
+}
+
+/// Full-unit gen_tps for cards, pane rows, and services views.
+/// Mirrors [`tps_opt`] format and appends [`HELD_MARKER`] when metadata is Held.
+///
+/// - `None` → `"-"`
+/// - Non-finite → `"-"` (NaN/Inf never rendered)
+/// - `Some(v)`, Held → `"N.N tok/s*"` (or SI-scaled)
+/// - `Some(v)`, Fresh or unknown → `"N.N tok/s"`
+/// - Real `0.0` → `"0.0 tok/s"` — never `"-"`
+pub fn gen_tps_compact(tps: Option<f64>, obs: Option<&ObservationMetadata>) -> String {
+    match tps {
+        None => "-".to_string(),
+        Some(v) if !v.is_finite() => "-".to_string(),
+        Some(v) => {
+            let base = if v >= 1_000.0 {
+                format!("{} tok/s", si(v))
+            } else {
+                format!("{v:.1} tok/s")
+            };
+            if obs.is_some_and(|m| m.freshness == ObservationFreshness::Held) {
+                format!("{base}{HELD_MARKER}")
+            } else {
+                base
+            }
+        }
+    }
+}
+
+/// Freshness label for the detail pane. Age is computed from the snapshot
+/// timestamp minus `observed_at` — **never** from the local wall-clock.
+///
+/// - `None` metadata → `"unknown"` (legacy; freshness never fabricated)
+/// - `Fresh` → `"fresh"`
+/// - `Held`, snap known → `"held · {age}s ago"` (age clamped ≥ 0)
+/// - `Held`, snap unknown → `"held"`
+pub fn gen_tps_detail_freshness(
+    obs: Option<&ObservationMetadata>,
+    snap_ts: Option<DateTime<Utc>>,
+) -> String {
+    match obs {
+        None => "unknown".to_string(),
+        Some(m) => match m.freshness {
+            ObservationFreshness::Fresh => "fresh".to_string(),
+            ObservationFreshness::Held => match snap_ts {
+                Some(ts) => {
+                    let age_s = (ts - m.observed_at).num_seconds().max(0);
+                    format!("held · {age_s}s ago")
+                }
+                None => "held".to_string(),
+            },
+        },
+    }
+}
+
+/// Aggregate gen_tps display for hero panels: formats a sum of instance
+/// throughputs and appends [`HELD_MARKER`] when any contributing instance is Held.
+///
+/// - `None` → `"—"` (no contributing instances with valid gen_tps)
+/// - Non-finite → `"—"` (guards the same sentinel as the per-instance formatters)
+/// - `Some(v)`, `any_held` → `"N.N tok/s*"` (SI-scaled via [`tps_opt`])
+/// - `Some(v)`, fresh/unknown → `"N.N tok/s"`
+pub fn gen_tps_aggregate(tps: Option<f64>, any_held: bool) -> String {
+    match tps {
+        None => "—".to_string(),
+        Some(v) if !v.is_finite() => "—".to_string(),
+        Some(v) => {
+            let base = tps_opt(Some(v));
+            if any_held {
+                format!("{base}{HELD_MARKER}")
+            } else {
+                base
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +368,211 @@ mod tests {
         assert_eq!(celsius(67.0), "67.0°C");
         assert_eq!(mhz(2400), "2.40 GHz");
         assert_eq!(mhz(800), "800 MHz");
+    }
+
+    // ── EAI-7960: observation-aware formatter tests (RED until impl added) ──
+    use chrono::{DateTime, Utc};
+    use rocm_dash_core::metrics::{ObservationFreshness, ObservationMetadata};
+
+    fn fresh_obs() -> ObservationMetadata {
+        ObservationMetadata {
+            observed_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            freshness: ObservationFreshness::Fresh,
+        }
+    }
+
+    fn held_obs() -> ObservationMetadata {
+        ObservationMetadata {
+            observed_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            freshness: ObservationFreshness::Held,
+        }
+    }
+
+    #[test]
+    fn held_marker_and_legend_are_non_empty_and_consistent() {
+        assert!(!HELD_MARKER.is_empty());
+        assert!(!HELD_LEGEND.is_empty());
+        assert!(
+            HELD_LEGEND.contains(HELD_MARKER),
+            "legend must contain the marker"
+        );
+    }
+
+    #[test]
+    fn gen_tps_cell_none_is_em_dash() {
+        assert_eq!(gen_tps_cell(None, None), "—");
+    }
+
+    #[test]
+    fn gen_tps_cell_fresh_has_no_marker() {
+        let obs = fresh_obs();
+        let out = gen_tps_cell(Some(100.0), Some(&obs));
+        assert_eq!(out, "100");
+        assert!(!out.contains(HELD_MARKER));
+    }
+
+    #[test]
+    fn gen_tps_cell_held_appends_marker() {
+        let obs = held_obs();
+        let out = gen_tps_cell(Some(100.0), Some(&obs));
+        assert!(
+            out.ends_with(HELD_MARKER),
+            "held cell must end with HELD_MARKER: {out:?}"
+        );
+        assert!(out.starts_with("100"));
+    }
+
+    #[test]
+    fn gen_tps_cell_legacy_none_meta_no_marker() {
+        let out = gen_tps_cell(Some(100.0), None);
+        assert_eq!(out, "100");
+        assert!(!out.contains(HELD_MARKER));
+    }
+
+    #[test]
+    fn gen_tps_cell_real_zero_is_not_dash() {
+        assert_eq!(gen_tps_cell(Some(0.0), None), "0");
+        let obs = held_obs();
+        let out = gen_tps_cell(Some(0.0), Some(&obs));
+        assert!(out.starts_with('0') && out.contains(HELD_MARKER));
+    }
+
+    #[test]
+    fn gen_tps_compact_none_is_dash() {
+        assert_eq!(gen_tps_compact(None, None), "-");
+    }
+
+    #[test]
+    fn gen_tps_compact_fresh_has_unit_no_marker() {
+        let obs = fresh_obs();
+        let out = gen_tps_compact(Some(45.6), Some(&obs));
+        assert!(out.contains("tok/s") && !out.contains(HELD_MARKER));
+    }
+
+    #[test]
+    fn gen_tps_compact_held_appends_marker_with_unit() {
+        let obs = held_obs();
+        let out = gen_tps_compact(Some(45.6), Some(&obs));
+        assert!(out.contains("tok/s") && out.ends_with(HELD_MARKER));
+    }
+
+    #[test]
+    fn gen_tps_compact_legacy_no_marker() {
+        let out = gen_tps_compact(Some(45.6), None);
+        assert!(out.contains("tok/s") && !out.contains(HELD_MARKER));
+    }
+
+    #[test]
+    fn gen_tps_compact_zero_renders_as_zero_not_dash() {
+        let out = gen_tps_compact(Some(0.0), None);
+        assert_ne!(out, "-");
+        assert!(out.contains("0.0 tok/s"), "zero with unit: {out:?}");
+    }
+
+    #[test]
+    fn gen_tps_cell_nonfinite_is_em_dash() {
+        assert_eq!(
+            gen_tps_cell(Some(f64::NAN), None),
+            "—",
+            "NaN must render as em-dash"
+        );
+        assert_eq!(
+            gen_tps_cell(Some(f64::INFINITY), None),
+            "—",
+            "+Inf must render as em-dash"
+        );
+        assert_eq!(
+            gen_tps_cell(Some(f64::NEG_INFINITY), None),
+            "—",
+            "-Inf must render as em-dash"
+        );
+        // Held marker must not be appended to a non-finite sentinel.
+        let obs = held_obs();
+        assert_eq!(gen_tps_cell(Some(f64::NAN), Some(&obs)), "—");
+    }
+
+    #[test]
+    fn gen_tps_compact_nonfinite_is_dash() {
+        assert_eq!(
+            gen_tps_compact(Some(f64::NAN), None),
+            "-",
+            "NaN must render as dash"
+        );
+        assert_eq!(
+            gen_tps_compact(Some(f64::INFINITY), None),
+            "-",
+            "+Inf must render as dash"
+        );
+        assert_eq!(
+            gen_tps_compact(Some(f64::NEG_INFINITY), None),
+            "-",
+            "-Inf must render as dash"
+        );
+        let obs = held_obs();
+        assert_eq!(gen_tps_compact(Some(f64::NAN), Some(&obs)), "-");
+    }
+
+    #[test]
+    fn gen_tps_aggregate_none_is_em_dash() {
+        assert_eq!(gen_tps_aggregate(None, false), "—");
+        assert_eq!(gen_tps_aggregate(None, true), "—");
+    }
+
+    #[test]
+    fn gen_tps_aggregate_fresh_has_no_marker() {
+        let out = gen_tps_aggregate(Some(200.0), false);
+        assert!(out.contains("tok/s") && !out.contains(HELD_MARKER));
+    }
+
+    #[test]
+    fn gen_tps_aggregate_held_appends_marker() {
+        let out = gen_tps_aggregate(Some(200.0), true);
+        assert!(
+            out.contains("tok/s") && out.ends_with(HELD_MARKER),
+            "aggregate held must end with HELD_MARKER: {out:?}"
+        );
+    }
+
+    #[test]
+    fn gen_tps_aggregate_nonfinite_is_em_dash() {
+        assert_eq!(gen_tps_aggregate(Some(f64::NAN), false), "—");
+        assert_eq!(gen_tps_aggregate(Some(f64::INFINITY), true), "—");
+    }
+
+    #[test]
+    fn gen_tps_aggregate_zero_is_not_dash() {
+        let out = gen_tps_aggregate(Some(0.0), false);
+        assert_ne!(out, "—", "zero is a real value, not unavailable");
+    }
+
+    #[test]
+    fn gen_tps_detail_freshness_fresh() {
+        let obs = fresh_obs();
+        let ts: Option<DateTime<Utc>> = Some(DateTime::from_timestamp(1_700_000_060, 0).unwrap());
+        assert_eq!(gen_tps_detail_freshness(Some(&obs), ts), "fresh");
+    }
+
+    #[test]
+    fn gen_tps_detail_freshness_held_with_age() {
+        let obs = held_obs();
+        let ts = Some(DateTime::from_timestamp(1_700_000_060, 0).unwrap());
+        let out = gen_tps_detail_freshness(Some(&obs), ts);
+        assert!(
+            out.starts_with("held") && out.contains("60"),
+            "age in output: {out:?}"
+        );
+    }
+
+    #[test]
+    fn gen_tps_detail_freshness_held_no_snapshot_ts() {
+        let obs = held_obs();
+        let out = gen_tps_detail_freshness(Some(&obs), None);
+        assert_eq!(out, "held");
+    }
+
+    #[test]
+    fn gen_tps_detail_freshness_legacy_says_unknown() {
+        let out = gen_tps_detail_freshness(None, None);
+        assert_eq!(out, "unknown");
     }
 }

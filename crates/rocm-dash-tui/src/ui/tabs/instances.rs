@@ -5,6 +5,7 @@
 //! Instances Observe sub-panel — full-screen instance grid with kv-cache / requests / args,
 //! plus a detail modal showing model / partition / launch_args / env / log.
 
+use chrono::{DateTime, Utc};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -91,9 +92,7 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let dash = "—";
     let rows = instances.iter().enumerate().map(|(i, inst)| {
         let model = trunc(&inst.model_name, 22);
-        let tps = inst
-            .gen_tps
-            .map_or_else(|| dash.to_string(), |v| format!("{v:.0}"));
+        let tps = format::gen_tps_cell(inst.gen_tps, inst.gen_tps_observation.as_ref());
         let tpw = inst
             .tokens_per_watt
             .filter(|v| v.is_finite())
@@ -420,7 +419,10 @@ fn draw_card(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, selected
             Style::default().fg(theme.accent),
         ),
         Span::styled(" · gen ", Style::default().fg(theme.muted)),
-        Span::styled(format::tps_opt(inst.gen_tps), Style::default().fg(theme.fg)),
+        Span::styled(
+            format::gen_tps_compact(inst.gen_tps, inst.gen_tps_observation.as_ref()),
+            Style::default().fg(theme.fg),
+        ),
     ]));
 
     // 5. vram (only if total > 0)
@@ -590,22 +592,30 @@ pub fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         return;
     }
 
-    // Vertical: summary (3) | body (min) | footer (1)
+    // Vertical: summary (4 lines: status/id/port/tp · model/gpus/tpw/gen · partition/quant/vram · freshness)
+    // | body (min) | footer (1)
+    let snap_ts = state.latest.as_ref().map(|s| s.timestamp);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(4),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
         .split(inner);
 
-    render_summary(f, chunks[0], inst, theme);
+    render_summary(f, chunks[0], inst, snap_ts, theme);
     render_body(f, chunks[1], inst, theme);
     render_footer(f, chunks[2], inst, theme);
 }
 
-fn render_summary(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme) {
+fn render_summary(
+    f: &mut Frame,
+    area: Rect,
+    inst: &Instance,
+    snap_ts: Option<DateTime<Utc>>,
+    theme: &Theme,
+) {
     let (status_color, status_text) = status_meta(inst.status, theme);
     let muted = Style::default().fg(theme.muted);
     let fg = Style::default().fg(theme.fg);
@@ -620,6 +630,14 @@ fn render_summary(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme) {
     } else {
         inst.gpu_ids.join(",")
     };
+
+    // Freshness label: age = snapshot_ts − observed_at (never wall-clock).
+    let freshness_str =
+        format::gen_tps_detail_freshness(inst.gen_tps_observation.as_ref(), snap_ts);
+    let observed_str = inst.gen_tps_observation.as_ref().map_or_else(
+        || "-".to_string(),
+        |m| m.observed_at.format("%H:%M:%S UTC").to_string(),
+    );
 
     let lines = vec![
         Line::from(vec![
@@ -654,7 +672,10 @@ fn render_summary(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme) {
             ),
             Span::raw("  "),
             Span::styled("gen: ", muted),
-            Span::styled(format::tps_opt(inst.gen_tps), fg),
+            Span::styled(
+                format::gen_tps_compact(inst.gen_tps, inst.gen_tps_observation.as_ref()),
+                fg,
+            ),
         ]),
         Line::from(vec![
             Span::styled("partition: ", muted),
@@ -665,6 +686,14 @@ fn render_summary(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme) {
             Span::raw("  "),
             Span::styled("vram: ", muted),
             Span::styled(format::mib_pair(inst.vram_used_mb, inst.vram_total_mb), fg),
+        ]),
+        // 4th line: gen_tps freshness and deterministic age (snapshot-time, never wall-clock).
+        Line::from(vec![
+            Span::styled("gen freshness: ", muted),
+            Span::styled(freshness_str, fg),
+            Span::raw("  "),
+            Span::styled("observed: ", muted),
+            Span::styled(observed_str, Style::default().fg(theme.muted)),
         ]),
     ];
 
@@ -768,6 +797,7 @@ mod tests {
             running_reqs: None,
             waiting_reqs: None,
             gen_tps: None,
+            gen_tps_observation: None,
             tokens_per_watt: None,
             ttft_ms: None,
             tpot_ms: None,
@@ -1189,6 +1219,204 @@ mod tests {
         assert!(
             out.contains('—'),
             "non-finite metrics must render the em-dash placeholder:\n{out}"
+        );
+    }
+
+    // ── EAI-7960: observation-aware renderer tests ───────────────────────────
+    // RED: assert held marker "*" in table/card output, freshness in detail.
+    // These fail until draw_table / draw_card / render_summary use the new
+    // gen_tps_cell / gen_tps_compact / gen_tps_detail_freshness formatters.
+
+    use chrono::{TimeZone, Utc};
+    use rocm_dash_core::metrics::{ObservationFreshness, ObservationMetadata};
+
+    fn mk_inst_obs(name: &str, gen_tps: Option<f64>, obs: Option<ObservationMetadata>) -> Instance {
+        let mut i = mk_inst(name);
+        i.gen_tps = gen_tps;
+        i.gen_tps_observation = obs;
+        i
+    }
+
+    fn obs(freshness: ObservationFreshness, secs_before_snap: i64) -> ObservationMetadata {
+        // snap_ts will be SNAP_TS; this obs was secs_before_snap seconds earlier.
+        let snap_secs = 1_700_000_060_i64;
+        ObservationMetadata {
+            observed_at: Utc.timestamp_opt(snap_secs - secs_before_snap, 0).unwrap(),
+            freshness,
+        }
+    }
+
+    const SNAP_SECS: i64 = 1_700_000_060;
+
+    fn state_with_snap(inst: Instance) -> AppState {
+        let mut m = HashMap::new();
+        m.insert(inst.container_id.clone(), inst.clone());
+        let mut state = mk_state(m, 0);
+        let snap = rocm_dash_core::metrics::Snapshot {
+            timestamp: Utc.timestamp_opt(SNAP_SECS, 0).unwrap(),
+            instances: vec![inst],
+            ..Default::default()
+        };
+        state.latest = Some(snap);
+        state
+    }
+
+    #[test]
+    fn table_held_gen_tps_shows_held_marker() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let inst = mk_inst_obs(
+            "held",
+            Some(123.0),
+            Some(obs(ObservationFreshness::Held, 30)),
+        );
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("123*"),
+            "held gen_tps must show '123*' in table; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn table_fresh_gen_tps_has_no_held_marker() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let inst = mk_inst_obs(
+            "fresh",
+            Some(456.0),
+            Some(obs(ObservationFreshness::Fresh, 5)),
+        );
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("456"),
+            "fresh gen_tps value must appear; got:\n{out}"
+        );
+        assert!(
+            !out.contains("456*"),
+            "fresh must NOT have held marker; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn table_legacy_meta_none_has_no_held_marker() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let inst = mk_inst_obs("legacy", Some(789.0), None);
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("789") && !out.contains("789*"),
+            "legacy (no metadata) must NOT show held marker; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn table_none_gen_tps_shows_em_dash() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let inst = mk_inst_obs("none-tps", None, None);
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains('—'),
+            "missing gen_tps must render em-dash; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn table_zero_gen_tps_is_not_dash() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Real zero gen_tps (counter is active but rate is zero) must NOT collapse to dash.
+        let inst = mk_inst_obs("zero-tps", Some(0.0), None);
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        // "0" appears in the TOK/S column; the em-dash should NOT appear in that slot.
+        // (em-dash may appear for other missing cols, so we check the tok/s specific cell)
+        assert!(
+            out.contains("0 ") || out.contains("0\n") || out.contains("0*"),
+            "zero gen_tps must render as '0', not '—'; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn detail_held_shows_held_freshness_label() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let inst = mk_inst_obs(
+            "held-detail",
+            Some(100.0),
+            Some(obs(ObservationFreshness::Held, 30)),
+        );
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| draw_detail(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("held"),
+            "detail for held instance must show 'held' freshness; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn detail_fresh_shows_fresh_label() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let inst = mk_inst_obs(
+            "fresh-detail",
+            Some(100.0),
+            Some(obs(ObservationFreshness::Fresh, 0)),
+        );
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| draw_detail(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("fresh"),
+            "detail for fresh instance must show 'fresh'; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn detail_legacy_meta_none_shows_unknown() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let inst = mk_inst_obs("legacy-detail", Some(100.0), None);
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| draw_detail(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("unknown"),
+            "detail for legacy (None metadata) must say 'unknown'; got:\n{out}"
         );
     }
 }
