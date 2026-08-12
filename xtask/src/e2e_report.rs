@@ -143,6 +143,71 @@ fn label_for_root_report(dir: &Path) -> String {
 mod tests {
     use super::*;
 
+    /// Artifact names `label_for_root_report` and the e2e-report crate's
+    /// `parse_descriptor` both recognise. Anything else falls back to a
+    /// titlecased platform with the OS hardcoded to Linux.
+    const CANONICAL_REPORT_ARTIFACTS: &[&str] = &[
+        "e2e-report",
+        "e2e-gpu-report",
+        "e2e-gpu-strix-ubuntu-report",
+        "e2e-gpu-strix-windows-report",
+    ];
+
+    /// Every `name: e2e-…-report` an upload step in `file` publishes.
+    fn uploaded_report_artifacts(file: &str) -> Vec<String> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(".github")
+            .join("workflows")
+            .join(file);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        text.lines()
+            .filter_map(|line| line.trim().strip_prefix("name: "))
+            .map(str::trim)
+            .filter(|name| name.starts_with("e2e-") && name.ends_with("-report"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn every_uploaded_e2e_artifact_has_a_name_the_report_can_label() {
+        // A misnamed artifact does not fail anything -- it renders under a
+        // titlecased platform with the OS defaulted to Linux, so a Windows lane
+        // silently reports as Linux. That is how the nightly artifacts were
+        // named before they fed a consolidated report, and renaming them is
+        // what makes the nightly grid correct rather than merely present.
+        for file in ["ci.yml", "e2e-selfhosted.yml", "nightly.yml"] {
+            for name in uploaded_report_artifacts(file) {
+                // The consolidated artifacts are outputs, not inputs, and are
+                // never parsed back into a platform.
+                if name.starts_with("e2e-consolidated-report") {
+                    continue;
+                }
+                assert!(
+                    CANONICAL_REPORT_ARTIFACTS.contains(&name.as_str()),
+                    "{file} uploads `{name}`, which the report cannot map to a \
+                     platform; it would render as a guessed name on Linux. Use one \
+                     of {CANONICAL_REPORT_ARTIFACTS:?} or teach parse_descriptor."
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_nightly_lanes_publish_the_same_platforms_as_the_per_pr_lanes() {
+        // The nightly workflow exists to run *more* scenarios on the *same*
+        // three platforms. If the two ever diverge, the nightly grid is
+        // comparing different hardware than the PR grid without saying so.
+        let mut nightly = uploaded_report_artifacts("nightly.yml");
+        let mut per_pr = uploaded_report_artifacts("e2e-selfhosted.yml");
+        nightly.retain(|n| !n.starts_with("e2e-consolidated-report"));
+        per_pr.retain(|n| !n.starts_with("e2e-consolidated-report"));
+        nightly.sort();
+        per_pr.sort();
+        assert_eq!(nightly, per_pr);
+    }
+
     #[test]
     fn discover_missing_dir_is_empty() {
         let got = discover(Path::new("/no/such/dir")).expect("ok");
