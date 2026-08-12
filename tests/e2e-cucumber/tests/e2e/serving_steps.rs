@@ -520,6 +520,29 @@ async fn setup_lemonade_model(world: &mut E2eWorld) {
     .await;
 }
 
+#[given("a canonical Hugging Face GGUF checkpoint is being served on lemonade")]
+async fn setup_lemonade_hf_checkpoint_model(world: &mut E2eWorld) {
+    // Forces the `owner/repo:variant` direct-serve path (`serve_hf_checkpoint`,
+    // EAI-8026) instead of the short-recipe-name router that `setup_lemonade_model`
+    // exercises. Same underlying checkpoint (unsloth/Qwen3-0.6B-GGUF, Q4_0), so the
+    // GGUF is already warm in the HF cache when both scenarios run in one job.
+    let model = "unsloth/Qwen3-0.6B-GGUF:Q4_0";
+    ensure_serve_port_free().await;
+    let (stdout, _, rc) = crate::run_rocm(
+        world,
+        &["serve", model, "--engine", "lemonade", "--managed"],
+    );
+    assert!(rc == 0, "rocm serve failed:\n{stdout}");
+    world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
+    world.model_name = Some(model.to_string());
+    wait_for_model(
+        "http://127.0.0.1:11435/v1/models",
+        Some("Qwen3-0.6B"),
+        serve_timeout_for(world),
+    )
+    .await;
+}
+
 #[given("a large model is being served on GPU")]
 async fn setup_large_gpu_model(world: &mut E2eWorld) {
     // Large-model nightly coverage follows the host's serving path. MI300X uses
