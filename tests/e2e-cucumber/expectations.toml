@@ -170,26 +170,6 @@ reason = "Lemonade managed serve reaches ready then shuts down immediately, so t
 serve_timeout_secs = 90
 flaky = true
 
-# --- EAI-7998: `examine --json` is not the equal of the human report. It
-# answers before the CLI has loaded its paths or config, so eleven facts the
-# text form states have no field in it at all. Platform-independent — the
-# missing fields are missing everywhere. ---
-[["examine-machine-readable-report"]]
-when = {}
-bug = "EAI-7998"
-reason = "`examine --json` withholds CLI-side facts (engine, install status, managed runtimes, paths) that the human report states."
-
-# --- EAI-7998: the same form also disagrees with the human report about GPU
-# detection — but only on Instinct. Measured, not assumed: this row first ran
-# scoped to `gfx*`, which xfailed correctly on MI300X (gfx943) and XPASSed on
-# Strix Halo (gfx1151), where the two forms agree. Narrowed to the family where
-# it actually reproduces; the mock lane and a WSL2 box correctly agree there is
-# no GPU at all, so they stay expected-pass. ---
-[["examine-both-forms-agree-on-gpu"]]
-when = { therock_family = "gfx94*" }
-bug = "EAI-7998"
-reason = "On Instinct the JSON form reports has_amd_gpu:false while the human report names the gfx target."
-
 # --- EAI-7193: the framework probe can be scoped in the library, but no call
 # site passes anything but the default, so `--framework` does not exist on the
 # command line and the choice is unreachable. Platform-independent (pure

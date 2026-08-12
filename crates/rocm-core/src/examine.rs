@@ -264,6 +264,7 @@ impl Examination {
             probe_cpu_linux(&mut e);
             probe_gpus_lspci(&mut e);
             probe_gpus_rocminfo(&mut e);
+            probe_gpus_sysfs_fallback(&mut e);
             summarise_gpu_categories(&mut e);
             probe_modules(&mut e);
             probe_user(&mut e);
@@ -738,6 +739,45 @@ fn probe_gpus_rocminfo(e: &mut Examination) {
             });
         }
     }
+}
+
+/// Last-resort GPU discovery from sysfs, for hosts where neither `lspci` nor
+/// `rocminfo` is reachable.
+///
+/// Both preceding probes shell out, so on a machine with no `lspci` installed
+/// and ROCm's `bin` off PATH they enumerate nothing and `has_amd_gpu` comes back
+/// false — on a machine that plainly has a GPU. That is not hypothetical: it is
+/// what the MI300X runner reports, and it is why the e2e harness reads the human
+/// text form rather than this one (`capability.rs`). The human report never had
+/// the problem because it asks the kernel directly, via
+/// [`crate::detect_linux_sysfs_gfx_target`].
+///
+/// So ask the kernel here too, but only as a fallback: `lspci` carries PCI ids,
+/// vendor strings and the APU/discrete distinction that sysfs does not, and
+/// those are worth keeping whenever they are available.
+fn probe_gpus_sysfs_fallback(e: &mut Examination) {
+    if e.gpus.iter().any(|gpu| gpu.is_amd) {
+        return;
+    }
+    let Some(gfx_target) = crate::detect_linux_sysfs_gfx_target() else {
+        return;
+    };
+    // `is_apu` is left unset rather than guessed: sysfs gives the target, not
+    // the packaging, and `summarise_gpu_categories` reads `Some(true)` /
+    // `Some(false)` to populate has_apu / has_discrete_amd. Claiming either
+    // would be inventing a fact, so both stay false and only has_amd_gpu moves.
+    e.gpus.push(Gpu {
+        name: "AMD GPU (from kernel topology)".to_owned(),
+        gfx_target,
+        is_amd: true,
+        is_apu: None,
+        ..Gpu::default()
+    });
+    e.notes.push(
+        "GPU discovered from the kernel topology because neither lspci nor rocminfo was \
+         available; PCI id and marketing name are unknown."
+            .to_owned(),
+    );
 }
 
 fn summarise_gpu_categories(e: &mut Examination) {
@@ -1511,6 +1551,55 @@ mod tests {
         assert!(value.get("in_render_group").expect("present").is_null());
         assert!(value.get("amdgpu_loaded").expect("present").is_null());
         assert!(value.get("kfd").expect("present").is_null());
+    }
+
+    #[test]
+    fn the_sysfs_fallback_leaves_a_real_pci_enumeration_alone() {
+        // lspci carries the PCI id, the marketing name and the APU/discrete
+        // distinction; the topology read carries none of those. So the fallback
+        // must only fill a gap, never overwrite a richer answer.
+        let mut e = Examination {
+            os_family: "linux".to_owned(),
+            gpus: vec![Gpu {
+                name: "Instinct MI300X".to_owned(),
+                gfx_target: "gfx942".to_owned(),
+                pci_id: "1002:74a1".to_owned(),
+                is_amd: true,
+                is_apu: Some(false),
+            }],
+            ..Examination::default()
+        };
+        probe_gpus_sysfs_fallback(&mut e);
+        assert_eq!(e.gpus.len(), 1, "the fallback must not add a second entry");
+        assert_eq!(e.gpus[0].pci_id, "1002:74a1");
+        assert!(
+            e.notes.is_empty(),
+            "a no-op fallback should not annotate the report"
+        );
+    }
+
+    #[test]
+    fn a_topology_sourced_gpu_counts_as_present_without_claiming_a_package() {
+        // What the fallback produces: enough to stop reporting "no AMD GPU",
+        // and no more. `is_apu: None` is deliberate -- the topology says which
+        // target, not whether it is integrated -- so the APU and discrete
+        // tallies must both stay false rather than guess.
+        let mut e = Examination {
+            os_family: "linux".to_owned(),
+            gpus: vec![Gpu {
+                name: "AMD GPU (from kernel topology)".to_owned(),
+                gfx_target: "gfx942".to_owned(),
+                is_amd: true,
+                is_apu: None,
+                ..Gpu::default()
+            }],
+            ..Examination::default()
+        };
+        summarise_gpu_categories(&mut e);
+        assert!(e.has_amd_gpu, "the machine has a GPU and must say so");
+        assert!(!e.has_apu);
+        assert!(!e.has_discrete_amd);
+        assert_eq!(e.compute_status(), "ok");
     }
 
     #[test]

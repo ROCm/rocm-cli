@@ -1961,18 +1961,70 @@ const fn builtin_engine_inventory() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
+/// The `--json` document.
+///
+/// `Examination` stays at the top level, verbatim: its field names deliberately
+/// mirror `examine.py`'s dataclass so the JSON contract is identical, and moving
+/// them would break every consumer written against it.
+///
+/// Everything the CLI knows but the probe cannot is added under `summary`. The
+/// probe runs before any config is read, so it has no idea which engine this
+/// host will serve on, whether an existing ROCm install was found, or where the
+/// CLI keeps its files — all of which the human report prints. A tool reading
+/// `--json` used to have to scrape that text to find out.
+#[derive(serde::Serialize)]
+struct ExamineJson<'a> {
+    #[serde(flatten)]
+    examination: &'a rocm_core::Examination,
+    summary: ExamineJsonSummary<'a>,
+}
+
+/// The human report's own view, plus the few facts it derives from config while
+/// rendering rather than storing on the summary.
+#[derive(serde::Serialize)]
+struct ExamineJsonSummary<'a> {
+    #[serde(flatten)]
+    host: &'a ExamineSummary,
+    /// What the user configured — `None` means unset, exactly as the text form's
+    /// `<platform default>` does. Distinct from `effective_default_engine`.
+    configured_default_engine: Option<&'a str>,
+    /// What `serve` will actually pick: the configured engine if there is one,
+    /// else the host default. Mirrors `select_serve_engine`.
+    effective_default_engine: &'a str,
+    active_runtime_id: Option<&'a str>,
+    active_runtime_key: Option<&'a str>,
+    previous_runtime_key: Option<&'a str>,
+}
+
 fn examine(json: bool) -> Result<()> {
     // `rocm examine` is the general system inspector: the exit code reports
     // whether it RAN, not what it found. Any finding (no GPU, WSL, degraded) is
     // surfaced in the output and the `--json` `status` field, and the command
     // exits 0; a genuine inability to examine propagates as an error via `?`.
-    if json {
-        let examination = rocm_core::Examination::probe(rocm_core::FrameworkProbe::Auto);
-        println!("{}", serde_json::to_string_pretty(&examination)?);
-        return Ok(());
-    }
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths).unwrap_or_default();
+    if json {
+        let examination = rocm_core::Examination::probe(rocm_core::FrameworkProbe::Auto);
+        // `gather` rather than `examine_human_report`: the latter first runs
+        // `recover_setup_runtime_registration`, which writes. Asking a machine a
+        // question should not change it, and `--json` is the form tooling calls
+        // in a loop.
+        let host = ExamineSummary::gather()?;
+        let configured_default_engine = config.default_engine.as_deref();
+        let document = ExamineJson {
+            examination: &examination,
+            summary: ExamineJsonSummary {
+                configured_default_engine,
+                effective_default_engine: configured_default_engine.unwrap_or(&host.default_engine),
+                active_runtime_id: config.default_runtime_id.as_deref(),
+                active_runtime_key: config.active_runtime_key.as_deref(),
+                previous_runtime_key: config.previous_runtime_key.as_deref(),
+                host: &host,
+            },
+        };
+        println!("{}", serde_json::to_string_pretty(&document)?);
+        return Ok(());
+    }
     let (text, summary) = examine_human_report(&paths, &config)?;
     print!("{text}");
     if summary.wsl.as_ref().is_some_and(|w| w.is_wsl) {
