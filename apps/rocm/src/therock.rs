@@ -1898,25 +1898,49 @@ fn install_wheel_runtime(
     Ok(output)
 }
 
-/// Package specs for a wheel SDK install.
+/// The `rocm` wheel extras a given install asks for, excluding the device payload.
 ///
 /// `devel` adds the compiler, headers, and static libraries — roughly doubling
 /// the download — and is only needed to *build* GPU code. Running models needs
 /// `libraries` alone, so the toolchain is installed only when asked for.
 ///
-/// The `device-<target>` extra is separate and always present: it selects which
-/// GPU payload the wheels carry, not whether the toolchain comes with them.
+/// Shared so the install plan, the progress text, and the resolution failure all
+/// name the same extras instead of drifting apart.
+const fn therock_sdk_extras(include_devel: bool) -> &'static str {
+    if include_devel {
+        "libraries,devel"
+    } else {
+        "libraries"
+    }
+}
+
+/// What the user sees when no index has a mutually compatible package set.
+///
+/// Names only the extras that were actually asked for: someone who never passed
+/// `--devel` should not be told a compiler toolchain could not be resolved.
+fn no_compatible_pip_versions_message(
+    include_devel: bool,
+    requested: &str,
+    index_url: &str,
+) -> String {
+    format!(
+        "no mutually compatible TheRock rocm[{}], torch, torchvision, and torchaudio versions were found for {requested} in {index_url}",
+        therock_sdk_extras(include_devel)
+    )
+}
+
+/// Package specs for a wheel SDK install.
+///
+/// The `device-<target>` extra is separate from [`therock_sdk_extras`] and
+/// always present: it selects which GPU payload the wheels carry, not whether
+/// the toolchain comes with them.
 fn therock_pip_package_specs(
     package_versions: &TheRockPipPackageVersions,
     device_target: &str,
     include_devel: bool,
 ) -> Vec<String> {
     let device_extra = format!("device-{device_target}");
-    let rocm_extras = if include_devel {
-        format!("libraries,devel,{device_extra}")
-    } else {
-        format!("libraries,{device_extra}")
-    };
+    let rocm_extras = format!("{},{device_extra}", therock_sdk_extras(include_devel));
     vec![
         format!("rocm[{rocm_extras}]=={}", package_versions.rocm),
         format!("torch[{device_extra}]=={}", package_versions.torch),
@@ -2134,7 +2158,6 @@ fn resolve_pip_runtime(
 #[allow(clippy::too_many_arguments)]
 fn resolve_pip_runtime_with_timeout(
     paths: &AppPaths,
-    channel: TheRockChannel,
     family_override: Option<&str>,
     wheel_compatibility: &WheelCompatibility,
     version_selector: Option<&RuntimeVersionSelector>,
@@ -2204,7 +2227,6 @@ fn resolve_pip_runtime_with_timeout(
 
 fn resolve_pip_runtime_from_index(
     paths: &AppPaths,
-    channel: TheRockChannel,
     family_resolution: &FamilyResolution,
     source: &ResolvedAggregateWheelSource,
     wheel_compatibility: &WheelCompatibility,
@@ -7251,6 +7273,36 @@ mod tests {
         assert!(
             !package_specs[0].contains("devel"),
             "default install must not request the toolchain: {package_specs:?}"
+        );
+    }
+
+    /// A resolution failure must describe the install that was actually asked
+    /// for. Naming `devel` to someone who never passed `--devel` sends them
+    /// looking for a toolchain problem they do not have.
+    #[test]
+    fn no_compatible_versions_message_names_only_the_requested_extras() {
+        let without_devel = no_compatible_pip_versions_message(
+            false,
+            "latest compatible version",
+            "https://example.invalid/simple/",
+        );
+        assert!(
+            !without_devel.contains("devel"),
+            "default install failure must not mention the toolchain: {without_devel}"
+        );
+        assert!(
+            without_devel.contains("rocm[libraries],"),
+            "default install failure should name the runtime extras: {without_devel}"
+        );
+
+        let with_devel = no_compatible_pip_versions_message(
+            true,
+            "latest compatible version",
+            "https://example.invalid/simple/",
+        );
+        assert!(
+            with_devel.contains("rocm[libraries,devel],"),
+            "--devel failure should name the toolchain: {with_devel}"
         );
     }
 
