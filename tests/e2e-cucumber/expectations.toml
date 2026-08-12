@@ -145,3 +145,23 @@ reason = "rocm help lists subcommands in declaration order, not alphabetically."
 when = {}
 bug = "EAI-7384"
 reason = "Managed runtime path nests recursively (runtimes/wheel/...) on re-provisioning."
+
+# The GPU-backed bench scenario benchmarks a really served model, so on a
+# lemonade LINUX host it inherits the same managed-serve bug as the sibling
+# serve/chat rows below `serve-default-engine-working-endpoint`: the serve
+# reaches ready then shuts down immediately, so this scenario's `a model is
+# being served on GPU` precondition never yields a live endpoint. Scoped
+# identically — os=linux only, because native Windows lemonade serve works, and
+# therock_family=gfx* so it applies only on a real GPU host. `flaky = true`
+# matches those rows too: which of them pass varies run to run on that lane, and
+# a deterministic-XPASS row would fail the lane on unrelated PRs.
+#
+# This does NOT weaken the coverage the bench fix relies on: the three
+# MockServer-backed bench scenarios run unxfail'd on every lane, including this
+# one, and they are what pin the request path and the failure reporting.
+[["bench-load-real-serve"]]
+when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*" }
+bug = "EAI-7423"
+reason = "Lemonade managed serve reaches ready then shuts down immediately, so the benchmark never reaches a live model."
+serve_timeout_secs = 90
+flaky = true

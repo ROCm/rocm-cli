@@ -430,7 +430,7 @@ fn ensure_bench_csv_parent(csv_path: &std::path::Path) -> Result<()> {
 /// aggregate CSV row per concurrency level. Output defaults to the daemon's
 /// tailed `<data_dir>/bench/results.csv` unless `--out` is specified explicitly.
 pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
-    use rocm_dash_daemon::bench_load::{LoadSpec, run_and_append_csv, run_auto_ramp};
+    use rocm_dash_daemon::bench_load::{LoadSpec, run_and_append_csv, run_auto_ramp, v1_base};
 
     let BenchLoadArgs {
         endpoint,
@@ -451,19 +451,26 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
         );
     }
 
-    // Resolve the model: use the provided value or probe GET {endpoint}/v1/models.
+    // Normalise once, here, so the model probe and the load generator agree on
+    // where the API root is. They used to disagree — the probe appended
+    // `/v1/models` while the generator appended `/chat/completions` — so
+    // whichever form the user supplied, one of the two 404'd.
+    let endpoint = v1_base(&endpoint);
+
+    // Resolve the model: use the provided value or probe GET {endpoint}/models.
     let model = if let Some(m) = model {
         m
     } else {
-        let models_url = format!("{}/v1/models", endpoint.trim_end_matches('/'));
+        let models_url = format!("{endpoint}/models");
         let resp = ureq::get(&models_url)
             .timeout(std::time::Duration::from_secs(5))
             .call()
-            .context("fetching /v1/models to detect the default model")?;
-        let body: serde_json::Value = resp.into_json().context("parsing /v1/models response")?;
-        rocm_dash_tui::llm::pick_first_model(&body).with_context(|| {
-            format!("no model found at {endpoint}/v1/models — pass --model explicitly")
-        })?
+            .with_context(|| format!("fetching {models_url} to detect the default model"))?;
+        let body: serde_json::Value = resp
+            .into_json()
+            .with_context(|| format!("parsing the {models_url} response"))?;
+        rocm_dash_tui::llm::pick_first_model(&body)
+            .with_context(|| format!("no model found at {models_url} — pass --model explicitly"))?
     };
 
     // Resolve the output path: default to the same `<data_dir>/bench/results.csv`
@@ -500,7 +507,7 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
     }
 
     let rt = build_dashboard_runtime()?;
-    let rows = if auto_ramp {
+    let reports = if auto_ramp {
         rt.block_on(run_auto_ramp(&spec, &csv_path))
             .context("running bench auto-ramp")?
     } else {
@@ -508,7 +515,8 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
             .context("running bench load sweep")?
     };
 
-    for row in &rows {
+    for report in &reports {
+        let row = &report.row;
         let conc = row
             .concurrency
             .map_or_else(|| "-".to_string(), |v| v.to_string());
@@ -528,11 +536,38 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
             "cell={} concurrency={conc} gen_tps={gen_tps} prompt_tps={prompt_tps} wall={wall}s n={n}",
             row.cell
         );
+        // Name the failures. A cell that measured nothing used to print the same
+        // dashes as an idle one, leaving the user no way to tell a broken
+        // endpoint from a slow model.
+        if report.failed > 0 {
+            let reason = report
+                .first_error
+                .as_deref()
+                .unwrap_or("no reason recorded");
+            eprintln!(
+                "warning: {}/{} requests failed in {} — first failure: {reason}",
+                report.failed, report.attempted, row.cell
+            );
+        }
     }
     println!(
         "note: local saturation smoke-test — client-measured throughput, not an official ROCm/AMD benchmark."
     );
-    println!("wrote {} row(s) to {}", rows.len(), csv_path.display());
+    println!("wrote {} row(s) to {}", reports.len(), csv_path.display());
+
+    // Nothing measured anywhere is a failed benchmark, not a clean run. Exiting 0
+    // here is what let a wrong request path look like a successful empty result.
+    // The emptiness guard matters: `all` is vacuously true for no cells at all,
+    // which would report "every request failed" for a run that sent none.
+    if !reports.is_empty() && reports.iter().all(|report| report.succeeded == 0) {
+        let reason = reports
+            .iter()
+            .find_map(|report| report.first_error.as_deref())
+            .unwrap_or("no reason recorded");
+        anyhow::bail!(
+            "every benchmark request failed against {endpoint} — first failure: {reason}"
+        );
+    }
 
     Ok(())
 }

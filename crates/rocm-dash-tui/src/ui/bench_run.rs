@@ -258,7 +258,7 @@ pub fn draw_bench_run(f: &mut Frame, area: Rect, state: &BenchRunState, theme: &
         rows[1],
         "endpoint",
         &state.endpoint,
-        "(http://127.0.0.1:8000)",
+        "(http://127.0.0.1:8000/v1)",
         state.active_field == Field::Endpoint,
         theme,
     );
