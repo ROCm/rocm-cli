@@ -1951,17 +1951,46 @@ fn normalize_cpu_model(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Whether this host is WSL2 — the one answer, for every caller.
+///
+/// There were three of these, and they disagreed. The install summary asked for
+/// `/dev/dxg` or `microsoft` in `/proc/version`; the JSON probe asked for
+/// `microsoft` or `wsl` in `/proc/version`, or `$WSL_DISTRO_NAME`. So a host
+/// with `/dev/dxg` but a kernel string naming neither was WSL to one and not the
+/// other, and the same command could contradict itself between its two output
+/// forms. Worse, the e2e harness derives `is_wsl` for its whole expectation
+/// matrix by reading one of them.
+///
+/// This is the union of every signal any of them used: a false positive costs a
+/// route-out note, a false negative runs bare-metal driver checks against a
+/// platform that has no amdgpu module and reports nonsense.
+#[must_use]
+pub(crate) fn is_wsl_host() -> bool {
+    runtime_is_linux()
+        && wsl_signals_indicate_wsl(
+            Path::new("/dev/dxg").exists(),
+            std::env::var_os("WSL_DISTRO_NAME").is_some(),
+            &fs::read_to_string("/proc/version").unwrap_or_default(),
+        )
+}
+
+/// The predicate itself, separated from reading the machine so the union can be
+/// tested — including the two cases that used to split the old implementations.
+fn wsl_signals_indicate_wsl(dxg_device: bool, distro_name_set: bool, proc_version: &str) -> bool {
+    if dxg_device || distro_name_set {
+        return true;
+    }
+    let proc_version = proc_version.to_ascii_lowercase();
+    proc_version.contains("microsoft") || proc_version.contains("wsl")
+}
+
 fn detect_wsl_summary() -> Option<WslSummary> {
-    if !runtime_is_linux() {
+    if !runtime_is_linux() || !is_wsl_host() {
         return None;
     }
 
-    let proc_version = fs::read_to_string("/proc/version").unwrap_or_default();
     let dxg_device = Path::new("/dev/dxg").exists();
-    let is_wsl = dxg_device || proc_version.to_ascii_lowercase().contains("microsoft");
-    if !is_wsl {
-        return None;
-    }
+    let is_wsl = true;
 
     let dxcore = Path::new("/usr/lib/wsl/lib/libdxcore.so").exists();
     let librocdxg = Path::new("/opt/rocm/lib/librocdxg.so").exists();
@@ -2058,8 +2087,21 @@ fn detect_driver_summary() -> DriverSummary {
     }
 }
 
+impl WslSummary {
+    /// Whether the ROCDXG plumbing a GPU workload needs is actually in place.
+    ///
+    /// Extracted so `serve` can act on the same answer `examine` prints, rather
+    /// than reaching its own conclusion from a different source. That split is
+    /// what let `examine` report `wsl_rocdxg_ready` while `serve` refused on the
+    /// same machine for want of a GPU.
+    #[must_use]
+    pub const fn rocdxg_ready(&self) -> bool {
+        self.dxg_device && self.dxcore && self.librocdxg && self.ldconfig_librocdxg
+    }
+}
+
 fn wsl_driver_summary(wsl: &WslSummary) -> DriverSummary {
-    let ready = wsl.dxg_device && wsl.dxcore && wsl.librocdxg && wsl.ldconfig_librocdxg;
+    let ready = wsl.rocdxg_ready();
     let status = if ready {
         "wsl_rocdxg_ready"
     } else if wsl.dxg_device && wsl.dxcore {
@@ -4273,6 +4315,23 @@ pub fn has_usable_amd_gpu() -> bool {
 
 #[cfg(target_os = "linux")]
 fn probe_usable_amd_gpu_indices() -> Option<Vec<u32>> {
+    // WSL2 reaches the GPU through /dev/dxg and the Windows host driver. It has
+    // no KFD topology and no amdgpu DRM card, and `linux_kfd_gpu_node_count`
+    // reads "topology unreadable AND no /dev/kfd" as an authoritative zero
+    // rather than as unknown -- which is exactly the WSL2 shape. So a machine
+    // whose `examine` said `wsl_rocdxg_ready` was refused a GPU-required launch
+    // for having none.
+    //
+    // Answer from the plumbing that platform actually uses, so `serve` and
+    // `examine` cannot contradict each other in either direction: ready means a
+    // device, not-ready means none, and both match what the report prints.
+    if is_wsl_host() {
+        let ready = detect_wsl_summary().is_some_and(|wsl| wsl.rocdxg_ready());
+        // One device: WSL2 exposes no per-device topology to enumerate, and the
+        // visibility mask still applies on top so an explicit
+        // HIP_VISIBLE_DEVICES="" is honoured.
+        return usable_amd_gpu_indices_from(usize::from(ready), visibility_mask_from_env());
+    }
     let present =
         combine_amd_gpu_counts(linux_kfd_gpu_node_count(), linux_drm_amdgpu_card_count())?;
     usable_amd_gpu_indices_from(present, visibility_mask_from_env())
@@ -10296,6 +10355,112 @@ last_installed_runtime_id = "therock-release"
         assert!(!kfd_gfx_target_version_is_gpu("not-a-number"));
         assert!(kfd_gfx_target_version_is_gpu("90402"));
         assert!(kfd_gfx_target_version_is_gpu("110000"));
+    }
+
+    #[test]
+    fn every_wsl_signal_is_believed_by_the_one_predicate() {
+        // The union. Each of these was decisive to at least one of the three
+        // implementations this replaces.
+        assert!(wsl_signals_indicate_wsl(true, false, ""), "/dev/dxg");
+        assert!(
+            wsl_signals_indicate_wsl(false, true, ""),
+            "$WSL_DISTRO_NAME"
+        );
+        assert!(
+            wsl_signals_indicate_wsl(
+                false,
+                false,
+                "Linux version 6.6.87.2-microsoft-standard-WSL2"
+            ),
+            "microsoft in /proc/version"
+        );
+        assert!(
+            wsl_signals_indicate_wsl(false, false, "Linux version 5.15.0 wsl2"),
+            "wsl in /proc/version"
+        );
+        assert!(
+            !wsl_signals_indicate_wsl(false, false, "Linux version 6.8.0-51-generic"),
+            "an ordinary kernel is not WSL"
+        );
+    }
+
+    #[test]
+    fn the_two_old_predicates_disagreed_and_this_one_does_not() {
+        // The install summary asked for /dev/dxg or "microsoft"; the JSON probe
+        // asked for "microsoft"/"wsl" or $WSL_DISTRO_NAME. These are the two
+        // shapes that split them, and the reason `examine` could contradict
+        // `examine --json` about the platform it was describing.
+        let only_the_summary_saw_it = (true, false, "Linux version 6.8.0-generic");
+        let only_the_probe_saw_it = (false, true, "Linux version 6.8.0-generic");
+        for (dxg, distro, version) in [only_the_summary_saw_it, only_the_probe_saw_it] {
+            assert!(
+                wsl_signals_indicate_wsl(dxg, distro, version),
+                "one predicate already believed this host was WSL: \
+                 dxg={dxg} distro_name={distro} {version:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wsl_case_folding_does_not_depend_on_the_kernel_string_casing() {
+        assert!(wsl_signals_indicate_wsl(
+            false,
+            false,
+            "MICROSOFT-STANDARD-WSL2"
+        ));
+    }
+
+    #[test]
+    fn rocdxg_is_ready_only_when_the_whole_chain_is_present() {
+        let ready = WslSummary {
+            is_wsl: true,
+            dxg_device: true,
+            dxcore: true,
+            librocdxg: true,
+            rocdxg_dids: false,
+            ldconfig_librocdxg: true,
+            rocminfo: false,
+            cargo: false,
+            detail: None,
+        };
+        assert!(ready.rocdxg_ready());
+        // Each link is load-bearing: drop any one and a GPU launch cannot work,
+        // so `serve` must not be told it can.
+        for break_one in 0..4 {
+            let mut partial = ready.clone();
+            match break_one {
+                0 => partial.dxg_device = false,
+                1 => partial.dxcore = false,
+                2 => partial.librocdxg = false,
+                _ => partial.ldconfig_librocdxg = false,
+            }
+            assert!(
+                !partial.rocdxg_ready(),
+                "a broken link at {break_one} must not read as ready"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ready_wsl_host_offers_a_device_and_an_unready_one_does_not() {
+        // The EAI-7944 shape. `serve` used to count KFD nodes and DRM cards,
+        // neither of which exists on WSL2, and read the result as an
+        // authoritative zero -- refusing to launch on a machine whose own
+        // `examine` reported the GPU ready.
+        assert_eq!(
+            usable_amd_gpu_indices_from(usize::from(true), None),
+            Some(vec![0])
+        );
+        assert_eq!(
+            usable_amd_gpu_indices_from(usize::from(false), None),
+            Some(vec![])
+        );
+        // An explicit empty mask still wins, so a user can opt out on WSL as
+        // anywhere — HIP_VISIBLE_DEVICES="" hides the device.
+        assert_eq!(
+            usable_amd_gpu_indices_from(usize::from(true), Some(String::new())),
+            Some(vec![])
+        );
     }
 
     #[test]
