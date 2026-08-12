@@ -4243,8 +4243,12 @@ fn detect_linux_kfd_gfx_target() -> Option<String> {
 /// this matters most (an Instinct box with no `lspci`) are exactly the ones a
 /// test cannot run on. Same seam as `discover_rocm_installs_in`.
 ///
-/// Not `cfg`-gated, unlike its caller: the parsing is platform-independent, and
-/// gating it would make the tests Linux-only for no reason.
+/// Gated the same way as `parse_linux_kfd_gfx_target`, which it calls: present
+/// on Linux and under `cfg(test)` everywhere, so the tests run on every platform
+/// without the function existing in a Windows release build that can never use
+/// it. (`target_os` alone would have left the tests Linux-only; `test` alone
+/// would not compile on Windows CI, which is how this was found.)
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn detect_kfd_gfx_target_in(nodes_dir: &Path) -> Option<String> {
     let mut targets: Vec<(String, String)> = fs::read_dir(nodes_dir)
         .ok()?
@@ -4265,6 +4269,7 @@ pub(crate) fn detect_kfd_gfx_target_in(nodes_dir: &Path) -> Option<String> {
 
 /// Sort key for a KFD node directory name: its trailing number when it has one,
 /// so `node9` precedes `node10` rather than following it lexicographically.
+#[cfg(any(target_os = "linux", test))]
 fn natural_node_order(name: &str) -> (u64, String) {
     let digits: String = name
         .chars()
