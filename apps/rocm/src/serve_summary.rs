@@ -166,11 +166,15 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
         );
     }
     if !ready && !summary.already_running {
-        // Two different ways to miss "ready", and conflating them misleads: a
+        // Three different ways to miss "ready", and conflating them misleads: a
+        // `failed` service is over and needs its engine error read, while a
         // `running` service answered and advertised the model but could not serve
         // a request yet, which is also why the metrics rows are empty — the smoke
         // test only runs against a service that can actually serve.
-        let explanation = if summary.status == "running" {
+        let explanation = if summary.status == "failed" {
+            "the server exited during startup, so the launch is over; the engine error is \
+             at the end of its log"
+        } else if summary.status == "running" {
             "the server is up and lists the model, but it could not serve a request yet, \
              so no smoke test was run; it is most likely still loading"
         } else {
@@ -338,6 +342,32 @@ mod tests {
         assert_eq!(format_ttft(Some(Duration::from_millis(180))), "180 ms");
         assert_eq!(format_ttft(Some(Duration::from_millis(1500))), "1.50 s");
         assert_eq!(format_ttft(None), "n/a");
+    }
+
+    /// A launch whose engine died must not be described as "may still be
+    /// loading" — the wait ended because the server is gone, not because it is
+    /// slow, and the next action is reading the engine error.
+    #[test]
+    fn failed_launch_note_points_at_the_engine_error() {
+        let summary = DeploymentSummary {
+            status: "failed".to_owned(),
+            ..base_summary()
+        };
+        let rendered = render_summary(&summary);
+        assert!(rendered.contains("exited during startup"), "{rendered}");
+        assert!(!rendered.contains("may still be loading"), "{rendered}");
+    }
+
+    /// A launch that merely ran out of wait keeps the "give it more time" wording.
+    #[test]
+    fn starting_launch_note_says_it_may_still_be_loading() {
+        let summary = DeploymentSummary {
+            status: "starting".to_owned(),
+            ..base_summary()
+        };
+        let rendered = render_summary(&summary);
+        assert!(rendered.contains("may still be loading"), "{rendered}");
+        assert!(!rendered.contains("exited during startup"), "{rendered}");
     }
 
     #[test]
