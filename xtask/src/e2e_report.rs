@@ -143,6 +143,114 @@ fn label_for_root_report(dir: &Path) -> String {
 mod tests {
     use super::*;
 
+    /// The artifact names a **workflow may statically upload** and have
+    /// `parse_descriptor` resolve to a real platform and OS. Anything outside
+    /// this set falls through to a titlecased platform with the OS hardcoded to
+    /// Linux, which is how a Windows lane comes to be reported as Linux.
+    ///
+    /// `e2e-unknown-report` is deliberately absent despite being recognised.
+    /// It is a runtime-only sentinel: [`label_for_root_report`] emits it for a
+    /// report whose `platform.json` was missing or carried an unknown slug, and
+    /// `parse_descriptor` maps it to Unknown/Unknown precisely so it escapes the
+    /// Linux default. No workflow can name it, so a workflow that did would be
+    /// claiming an identity it has no business asserting.
+    const CANONICAL_REPORT_ARTIFACTS: &[&str] = &[
+        "e2e-report",
+        "e2e-gpu-report",
+        "e2e-gpu-strix-ubuntu-report",
+        "e2e-gpu-strix-windows-report",
+    ];
+
+    /// Every `e2e-`-prefixed artifact name an upload step in `file` publishes.
+    ///
+    /// Deliberately not filtered to `-report`: that is the shape the caller
+    /// asserts, so filtering on it first would make the population and the
+    /// assertion the same condition, and an artifact named `e2e-gpu-results`
+    /// would be invisible to a test claiming to check every e2e artifact.
+    fn uploaded_e2e_artifacts(path: &Path) -> Vec<String> {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        text.lines()
+            .filter_map(|line| line.trim().strip_prefix("name: "))
+            .map(str::trim)
+            // Job and step display names are titlecased (`E2E tests …`), so the
+            // lowercase prefix picks out artifact names only.
+            .filter(|name| name.starts_with("e2e-"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Every workflow in `.github/workflows`, so a new one cannot upload under a
+    /// name nothing checks — the exact hole this guard exists to close.
+    fn workflow_files() -> Vec<PathBuf> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(".github")
+            .join("workflows");
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e == "yml" || e == "yaml")
+            })
+            .collect();
+        assert!(
+            !files.is_empty(),
+            "no workflows found under {}",
+            dir.display()
+        );
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn every_uploaded_e2e_artifact_has_a_name_the_report_can_label() {
+        // A misnamed artifact does not fail anything -- it renders under a
+        // titlecased platform with the OS defaulted to Linux, so a Windows lane
+        // silently reports as Linux. That is how the nightly artifacts were
+        // named before they fed a consolidated report, and renaming them is
+        // what makes the nightly grid correct rather than merely present.
+        for path in workflow_files() {
+            let file = path.file_name().unwrap_or_default().to_string_lossy();
+            for name in uploaded_e2e_artifacts(&path) {
+                // The consolidated artifacts are outputs, not inputs: nothing
+                // parses them back into a platform.
+                if name.starts_with("e2e-consolidated-report") {
+                    continue;
+                }
+                assert!(
+                    CANONICAL_REPORT_ARTIFACTS.contains(&name.as_str()),
+                    "{file} uploads `{name}`, which the report cannot map to a \
+                     platform; it would render as a guessed name on Linux. Use one \
+                     of {CANONICAL_REPORT_ARTIFACTS:?} or teach parse_descriptor."
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_nightly_lanes_publish_the_same_platforms_as_the_per_pr_lanes() {
+        // The nightly workflow exists to run *more* scenarios on the *same*
+        // three platforms. If the two ever diverge, the nightly grid is
+        // comparing different hardware than the PR grid without saying so.
+        let lanes = |file: &str| {
+            let mut names = uploaded_e2e_artifacts(
+                &Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("..")
+                    .join(".github")
+                    .join("workflows")
+                    .join(file),
+            );
+            names.retain(|n| !n.starts_with("e2e-consolidated-report"));
+            names.sort();
+            names
+        };
+        assert_eq!(lanes("nightly.yml"), lanes("e2e-selfhosted.yml"));
+    }
+
     #[test]
     fn discover_missing_dir_is_empty() {
         let got = discover(Path::new("/no/such/dir")).expect("ok");
