@@ -405,7 +405,20 @@ const MEDIUM: Duration = Duration::from_secs(8);
 // ---------------------------------------------------------------------------
 
 fn probe_os(e: &mut Examination) {
-    e.os_version = std::env::consts::OS.to_owned();
+    // The OS *version*, mirroring examine.py's `platform.version()`. This used
+    // to hold `std::env::consts::OS`, which is the OS *name* and so merely
+    // repeated `os_family`, telling a reader of the report nothing.
+    //
+    // Left empty on platforms the CLI does not support rather than guessed at:
+    // an empty field reads as "not collected", while a wrong one would be
+    // reasoned over by the diagnosis catalog.
+    e.os_version = if runtime_is_linux() {
+        run("uname", &["-v"], SHORT).1.trim().to_owned()
+    } else if runtime_is_windows() {
+        run("cmd", &["/C", "ver"], SHORT).1.trim().to_owned()
+    } else {
+        String::new()
+    };
     if runtime_is_linux() {
         e.os_family = "linux".to_owned();
         e.kernel_release = run("uname", &["-r"], SHORT).1.trim().to_owned();
@@ -1679,5 +1692,37 @@ mod tests {
             Some("6.4.1".to_owned())
         );
         assert_eq!(extract_rocm_version("/opt/rocm"), None);
+    }
+
+    #[test]
+    fn os_version_carries_a_version_not_the_os_name() {
+        // This field used to hold `std::env::consts::OS`, so it repeated
+        // `os_family` and told a reader of the report nothing.
+        let mut e = Examination::default();
+        probe_os(&mut e);
+
+        // Holds on every platform: a real version on the supported ones, and
+        // empty on the rest -- neither of which is the OS name.
+        assert_ne!(
+            e.os_version,
+            std::env::consts::OS,
+            "os_version must not merely repeat the OS name"
+        );
+
+        if runtime_is_linux() || runtime_is_windows() {
+            assert!(
+                !e.os_version.is_empty(),
+                "a supported host must report an OS version"
+            );
+            assert_ne!(e.os_version, e.os_family);
+        } else {
+            // Blank by choice on a host the CLI does not support, rather than
+            // a guess the diagnosis catalog would then reason over.
+            assert!(
+                e.os_version.is_empty(),
+                "unsupported hosts report no version, got {:?}",
+                e.os_version
+            );
+        }
     }
 }
