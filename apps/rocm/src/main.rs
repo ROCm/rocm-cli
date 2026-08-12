@@ -2962,6 +2962,40 @@ fn build_driver_install_plan(
             dkms,
             true,
         ),
+        // TODO: AMD had not published a repo.radeon.com/amdgpu "resolute"
+        // suite as of 2026-08; re-check
+        // https://repo.radeon.com/amdgpu/latest/ubuntu/dists/ and switch this
+        // to apt_driver_plan(..., true) once it exists, the same way
+        // 22.04/24.04 are handled.
+        ("ubuntu", "26.04") => {
+            let codename = if codename.is_empty() {
+                "resolute".to_owned()
+            } else {
+                codename
+            };
+            DriverInstallPlan {
+                supported: false,
+                mutating: false,
+                policy: "ubuntu_native_archive".to_owned(),
+                os_id,
+                version_id,
+                codename,
+                repo_version_expr,
+                reason: "Ubuntu 26.04 LTS ships ROCm natively via the standard archive and \
+                    includes the amdgpu kernel driver in-tree; AMD's repo.radeon.com/amdgpu \
+                    tree does not yet publish a 'resolute' suite, so no third-party DKMS repo \
+                    commands are planned. Run `sudo apt install rocm` for the userspace ROCm \
+                    stack instead."
+                    .to_owned(),
+                preflight_checks: Vec::new(),
+                commands: Vec::new(),
+                checks: vec![
+                    "rocm examine".to_owned(),
+                    "sudo apt install rocm".to_owned(),
+                    "rocminfo".to_owned(),
+                ],
+            }
+        }
         ("debian", "12" | "13") => {
             let repo_codename = if version_id == "13" { "noble" } else { "jammy" };
             let mut plan = apt_driver_plan(
@@ -3589,6 +3623,7 @@ fn codename_for_version(os_id: &str, version_id: &str) -> Option<&'static str> {
     match (os_id, version_id) {
         ("ubuntu", "22.04") => Some("jammy"),
         ("ubuntu", "24.04") => Some("noble"),
+        ("ubuntu", "26.04") => Some("resolute"),
         ("debian", "12") => Some("jammy"),
         ("debian", "13") => Some("noble"),
         _ => None,
@@ -24031,6 +24066,38 @@ VERSION_CODENAME=noble
         assert!(rendered.contains("post_reboot_check_commands:"));
         assert!(rendered.contains("dkms status amdgpu"));
         assert!(rendered.contains("rerun with --yes"));
+    }
+
+    #[test]
+    fn driver_plan_ubuntu_2604_uses_native_archive_guidance() {
+        let os_release = r#"
+ID=ubuntu
+VERSION_ID="26.04"
+VERSION_CODENAME=resolute
+"#;
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert!(!plan.supported);
+        assert!(!plan.mutating);
+        assert_eq!(plan.policy, "ubuntu_native_archive");
+        assert_eq!(plan.codename, "resolute");
+        assert!(rendered.contains("approval: not required"));
+        assert!(rendered.contains("execution_commands: <none>"));
+        assert!(rendered.contains("sudo apt install rocm"));
+        assert!(!rendered.contains("amdgpu-dkms"));
+        assert!(plan.commands.is_empty());
+    }
+
+    #[test]
+    fn driver_plan_ubuntu_2604_falls_back_to_resolute_codename() {
+        let os_release = r#"
+ID=ubuntu
+VERSION_ID="26.04"
+"#;
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+
+        assert_eq!(plan.codename, "resolute");
     }
 
     #[test]
