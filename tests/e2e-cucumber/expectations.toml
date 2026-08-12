@@ -229,17 +229,13 @@ when = {}
 bug = "EAI-8009"
 reason = "The local chat provider only accepts the built-in assistant model, so a ready local server running any other model is not used."
 
-# --- EAI-8007: MEASURE. `services stop` reports the count of PIDs it signalled,
-# which on the pod was 0 for a service it did in fact stop. First tried on the
-# no-GPU lane with a plain child process standing in for the engine, and it
-# XPASSed there: a record carrying no start-time token takes the legacy
-# best-effort path and the child is signalled and counted correctly. So the
-# scenario now serves a real model (GPU lane), where the CLI records identity
-# tokens for the processes it launches — which is the path the pod exercised. ---
-[["services-stop-reports-what-it-stopped"]]
-when = {}
-bug = "EAI-8007"
-reason = "Stopping a running managed service reports that it stopped no processes."
+# EAI-8007 has NO row on purpose. `services stop` reported stopping 0 processes
+# for a service it did in fact stop on the pod, but neither fixture reproduces it
+# here: a plain child process registered as a managed service is counted
+# correctly (no-GPU lane), and so is a real vLLM serve (MI300X, run 188). Its
+# scenario therefore ships as a guard rather than an expected failure — a row
+# would be a stale XPASS on both lanes and would fail them. The ticket keeps the
+# pod observation; what distinguishes that host is still unknown.
 
 # --- EAI-8014: `uninstall` removes the managed files and reports completion
 # without stopping the servers it manages — and takes the service records with

@@ -411,6 +411,23 @@ fn labelled(text: &str, label: &str) -> Option<String> {
         .next()
 }
 
+/// The part of a diagnosis that belongs to one cause.
+///
+/// A diagnosis reports several causes, each with its own plan and its own way to
+/// verify it, and which one comes first depends on the machine. Narrowing to the
+/// named cause first is what keeps the comparison about the remedy under test
+/// rather than about whichever cause happened to rank highest here.
+fn section_for(report: &str, fix_id: &str) -> Option<String> {
+    let start = report.lines().position(|line| line.contains(fix_id))?;
+    // Causes are separated by a blank line, so the next one ends this section.
+    let body: Vec<&str> = report
+        .lines()
+        .skip(start)
+        .take_while(|line| !line.trim().is_empty())
+        .collect();
+    Some(body.join("\n"))
+}
+
 /// The `usermod` invocation a report proposes, wherever it prints it. Both
 /// commands render it differently — one as a shell line under the plan, the
 /// other as the command it is about to run — so match on the invocation itself.
@@ -471,13 +488,14 @@ async fn user_compares_diagnosis_with_fix(world: &mut E2eWorld) {
 async fn assert_verification_agrees(world: &mut E2eWorld) {
     let diagnosis = world.cli_output.as_ref().expect("no diagnosis output");
     let preview = world.cli_stderr.as_ref().expect("no fix preview output");
-    assert!(
-        diagnosis.contains(DEVICE_PERMISSION_FIX_ID),
-        "the symptom did not produce the device-permission cause, so there is nothing to \
-         compare:\n{diagnosis}"
-    );
-    let from_diagnosis = labelled(diagnosis, DIAGNOSE_VERIFY_PREFIX)
-        .unwrap_or_else(|| panic!("the diagnosis gave no way to verify the fix:\n{diagnosis}"));
+    let cause = section_for(diagnosis, DEVICE_PERMISSION_FIX_ID).unwrap_or_else(|| {
+        panic!(
+            "the symptom did not produce the device-permission cause, so there is nothing to \
+             compare:\n{diagnosis}"
+        )
+    });
+    let from_diagnosis = labelled(&cause, DIAGNOSE_VERIFY_PREFIX)
+        .unwrap_or_else(|| panic!("the diagnosis gave no way to verify the fix:\n{cause}"));
     let from_preview = labelled(preview, FIX_VERIFY_PREFIX)
         .unwrap_or_else(|| panic!("the fix preview gave no way to verify itself:\n{preview}"));
     // A user told two different things to run cannot know which one settles it.
@@ -491,9 +509,14 @@ async fn assert_verification_agrees(world: &mut E2eWorld) {
 async fn assert_remedy_command_agrees(world: &mut E2eWorld) {
     let diagnosis = world.cli_output.as_ref().expect("no diagnosis output");
     let preview = world.cli_stderr.as_ref().expect("no fix preview output");
-    let from_diagnosis = proposed_group_command(diagnosis).unwrap_or_else(|| {
-        panic!("the diagnosis proposed no group command:\n{diagnosis}");
+    let cause = section_for(diagnosis, DEVICE_PERMISSION_FIX_ID).unwrap_or_else(|| {
+        panic!(
+            "the symptom did not produce the device-permission cause, so there is nothing to \
+             compare:\n{diagnosis}"
+        )
     });
+    let from_diagnosis = proposed_group_command(&cause)
+        .unwrap_or_else(|| panic!("the diagnosis proposed no group command:\n{cause}"));
     let from_preview = proposed_group_command(preview)
         .unwrap_or_else(|| panic!("the fix preview proposed no group command:\n{preview}"));
     // Compare the groups rather than the whole line: the two renderings name the
@@ -543,7 +566,14 @@ async fn given_non_default_device_group(world: &mut E2eWorld) {
 
 #[given("the user can already read and write the GPU device")]
 async fn given_usable_device(world: &mut E2eWorld) {
-    let path = crate::stat_shim_path(world, GPU_DEVICE, "crw-rw-rw-", "root", "root");
+    // Two halves of one situation: the device is open to everyone, AND the user
+    // is in none of the groups conventionally used to reach it. Both are
+    // substituted rather than hoped for — the GPU runner's user IS in those
+    // groups, which makes the finding score zero there for a reason that has
+    // nothing to do with the access the scenario is about (measured: it passed
+    // on MI300X until the group answer was substituted too).
+    crate::stat_shim_path(world, GPU_DEVICE, "crw-rw-rw-", "root", "root");
+    let path = crate::id_shim_path(world, &["users"]);
     // Prove the premise through the CLI's own eyes before relying on it: if the
     // inspection does not agree the device is usable, the scenario would be
     // measuring something else.
@@ -610,8 +640,11 @@ async fn user_diagnoses_machine(world: &mut E2eWorld) {
 #[then("every group named in the remedy exists on the machine")]
 async fn assert_named_groups_exist(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no diagnose output");
-    let command = proposed_group_command(output)
-        .unwrap_or_else(|| panic!("the diagnosis proposed no group command:\n{output}"));
+    let cause = section_for(output, DEVICE_PERMISSION_FIX_ID).unwrap_or_else(|| {
+        panic!("the symptom did not produce the device-permission cause:\n{output}")
+    });
+    let command = proposed_group_command(&cause)
+        .unwrap_or_else(|| panic!("the diagnosis proposed no group command:\n{cause}"));
     let known = crate::machine_group_names();
     let unknown: Vec<String> = groups_in_command(&command)
         .into_iter()

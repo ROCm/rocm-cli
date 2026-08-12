@@ -697,6 +697,47 @@ pub fn stat_shim_path(
     unreachable!("the stat shim is only reached by @requires-os:linux scenarios")
 }
 
+/// Add an `id` shim to the same directory [`stat_shim_path`] uses, reporting the
+/// current user as belonging to `groups` instead of their real ones, and return
+/// the `PATH` carrying both shims.
+///
+/// The CLI reads group membership by shelling out to `id -Gn`. Whether the user
+/// running the suite belongs to a device group is a property of the runner, and
+/// on the GPU runner they already do — so a contract about what the CLI concludes
+/// for a user who does NOT can only be measured by substituting the answer. Call
+/// after [`stat_shim_path`], whose directory this reuses.
+#[cfg(unix)]
+pub fn id_shim_path(world: &E2eWorld, groups: &[&str]) -> String {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let bin = root.path().join("stat-shim");
+    std::fs::create_dir_all(&bin).expect("failed to create the shim directory");
+
+    let real = ["/usr/bin/id", "/bin/id"]
+        .into_iter()
+        .find(|candidate| std::path::Path::new(candidate).is_file())
+        .expect("no real `id` binary to delegate to");
+    // `-Gn` is the only form the CLI asks for; every other invocation is the real
+    // binary's business.
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"-Gn\" ]; then\n  echo '{}'\n  exit 0\nfi\nexec {real} \"$@\"\n",
+        groups.join(" ")
+    );
+    let shim = bin.join("id");
+    std::fs::write(&shim, script).expect("failed to write the id shim");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+        .expect("failed to mark the id shim executable");
+
+    let existing = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{existing}", bin.display())
+}
+
+#[cfg(not(unix))]
+pub fn id_shim_path(_world: &E2eWorld, _groups: &[&str]) -> String {
+    unreachable!("the id shim is only reached by @requires-os:linux scenarios")
+}
+
 /// Every group name the machine's own group database knows.
 ///
 /// Read from `/etc/group` rather than asked of a tool, so the check does not
