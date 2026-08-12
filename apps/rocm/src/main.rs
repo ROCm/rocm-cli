@@ -15498,6 +15498,10 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
         }
     }
 
+    for note in shared_cache_notes(paths) {
+        plan.warnings.push(note);
+    }
+
     let managed_services = load_managed_services(paths).unwrap_or_default();
     if !managed_services.is_empty() {
         plan.warnings.push(format!(
@@ -15553,6 +15557,76 @@ fn render_uninstall_plan(plan: &UninstallPlan, options: &UninstallOptions) -> St
         let _ = writeln!(output, "Choose Review uninstall to approve removal.");
     }
     output
+}
+
+/// Caches that ROCm CLI causes to be filled but does not own, so uninstall
+/// leaves them in place.
+///
+/// These are usually the largest things on disk after an install, so a plan
+/// that stays silent about them reads as a clean slate it does not deliver.
+/// Only paths that exist and sit outside everything already being removed are
+/// reported, so the notes stay truthful as caches move under the data
+/// directory.
+fn shared_cache_notes(paths: &AppPaths) -> Vec<String> {
+    let removed_roots = [
+        paths.config_dir.clone(),
+        paths.data_dir.clone(),
+        paths.cache_dir.clone(),
+    ];
+    shared_cache_notes_for(&removed_roots, &shared_cache_candidates())
+}
+
+/// The pure part of [`shared_cache_notes`], so the filtering is testable without
+/// depending on the caller's real environment.
+fn shared_cache_notes_for(
+    removed_roots: &[PathBuf],
+    candidates: &[(PathBuf, &'static str)],
+) -> Vec<String> {
+    candidates
+        .iter()
+        .filter(|(path, _)| path.exists())
+        .filter(|(path, _)| !removed_roots.iter().any(|root| path.starts_with(root)))
+        .map(|(path, description)| format!("{description} not removed: {}", path.display()))
+        .collect()
+}
+
+/// The shared caches worth reporting, with why each is left alone.
+fn shared_cache_candidates() -> Vec<(PathBuf, &'static str)> {
+    let mut candidates = Vec::new();
+
+    // `uv` writes to `UV_CACHE_DIR` when set, otherwise its own default. Read it
+    // rather than assuming a location, so this stays correct wherever the cache
+    // has been pointed.
+    let uv_cache = env_path("UV_CACHE_DIR")
+        .or_else(|| rocm_core::runtime_home_dir().map(|home| home.join(".cache").join("uv")));
+    if let Some(path) = uv_cache {
+        candidates.push((
+            path,
+            "the uv package cache is shared with other uv projects on this computer and is",
+        ));
+    }
+
+    let hf_cache = env_path("HF_HOME")
+        .map(|home| home.join("hub"))
+        .or_else(|| env_path("HUGGINGFACE_HUB_CACHE"))
+        .or_else(|| {
+            rocm_core::runtime_home_dir()
+                .map(|home| home.join(".cache").join("huggingface").join("hub"))
+        });
+    if let Some(path) = hf_cache {
+        candidates.push((
+            path,
+            "downloaded model files are slow to fetch again and may include your own, so they are",
+        ));
+    }
+
+    candidates
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 fn confirm_uninstall() -> Result<bool> {
@@ -16888,6 +16962,64 @@ fn treat_as_natural_language(args: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A cache that has moved inside a directory uninstall already removes must
+    /// not be reported as "not removed" — the note would be false.
+    #[test]
+    fn shared_cache_notes_skip_paths_already_being_removed() {
+        let root = std::env::temp_dir().join(format!("rocm-shared-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("data");
+        let inside = data.join("uv-cache");
+        std::fs::create_dir_all(&inside).unwrap();
+
+        let notes = super::shared_cache_notes_for(
+            &[root.join("config"), data, root.join("cache")],
+            &[(inside, "the uv package cache")],
+        );
+
+        assert!(
+            notes.is_empty(),
+            "a cache inside a removed directory must not be reported: {notes:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A cache that exists outside everything being removed is reported, with
+    /// its path, so the plan does not imply a clean slate it will not deliver.
+    #[test]
+    fn shared_cache_notes_report_paths_left_behind() {
+        let root = std::env::temp_dir().join(format!("rocm-shared-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let outside = root.join("elsewhere").join("uv");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let notes = super::shared_cache_notes_for(
+            &[root.join("data")],
+            &[(outside.clone(), "the uv package cache")],
+        );
+
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("not removed"), "{notes:?}");
+        assert!(
+            notes[0].contains(&outside.display().to_string()),
+            "{notes:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A cache that does not exist is not worth mentioning.
+    #[test]
+    fn shared_cache_notes_ignore_missing_paths() {
+        let missing = std::env::temp_dir().join("rocm-definitely-not-here-12345");
+        let notes = super::shared_cache_notes_for(
+            &[std::env::temp_dir()],
+            &[(missing, "the uv package cache")],
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
     use super::*;
     use serde_json::json;
 
