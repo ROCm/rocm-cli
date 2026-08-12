@@ -262,18 +262,24 @@ pub async fn run_loop(
                         svcs.iter().map(|s| s.container_id.clone()).collect();
                     for svc in &svcs {
                         let existing = runner.state.instances.get(&svc.container_id).cloned();
-                        // Endpoint change: same id, new port → new logical service.
-                        if existing.as_ref().map_or(false, |ex| ex.port != svc.port) {
-                            if let Some(t) = gen_trackers.get_mut(&svc.container_id) {
-                                t.invalidate();
-                            }
+                        // Endpoint change: same container-id, new port → new logical service.
+                        // Invalidate the rate baseline and latency windows so the new
+                        // scrape address starts fresh.
+                        let same_endpoint = existing.as_ref().is_none_or(|ex| ex.port == svc.port);
+                        if !same_endpoint {
+                            invalidate_on_endpoint_change(
+                                &svc.container_id,
+                                &mut gen_trackers,
+                                &mut prev_ttft,
+                                &mut prev_tpot,
+                            );
                         }
                         let inst = merge_discovery_refresh(
                             svc,
-                            if existing.as_ref().map_or(false, |ex| ex.port != svc.port) {
-                                None
-                            } else {
+                            if same_endpoint {
                                 existing.as_ref()
+                            } else {
+                                None
                             },
                         );
                         runner
@@ -286,18 +292,23 @@ pub async fn run_loop(
                                 model = %svc.model_name,
                                 "instance discovered"
                             );
+                            // InstanceDiscovered is a discovery-metadata event; broadcast
+                            // a clean instance (no prior collector-owned telemetry).
                             broadcast_and_persist(
                                 &tx,
                                 persist.as_ref(),
-                                Event::InstanceDiscovered(inst),
+                                Event::InstanceDiscovered(instance_from_discovered(svc)),
                             );
                         }
                     }
                     for gone in known_instances.difference(&seen) {
                         info!(id = %gone, "instance gone");
-                        gen_trackers.remove(gone);
-                        prev_ttft.remove(gone);
-                        prev_tpot.remove(gone);
+                        purge_telemetry_state(
+                            gone,
+                            &mut gen_trackers,
+                            &mut prev_ttft,
+                            &mut prev_tpot,
+                        );
                         runner
                             .state
                             .apply(StateEvent::InstanceRemoved(gone.clone()));
@@ -318,6 +329,10 @@ pub async fn run_loop(
         // Lemonade discovery — probe the endpoint on the discovery cadence; add a
         // Lemonade Instance when reachable, emit Gone when it disappears, and stay
         // a clean no-op (no warning/panic) when no endpoint is configured.
+        //
+        // The Lemonade `container_id` encodes the host and port
+        // (`<host>:<port>`), so a port or host change produces a new id string
+        // and is treated as a full identity change (old gone, new discovered).
         if let Some(l) = lemonade.as_ref()
             && (tick_count == 1 || tick_count.is_multiple_of(discovery_ticks))
         {
@@ -325,10 +340,15 @@ pub async fn run_loop(
                 Some(svc) => {
                     let is_new_id = lemonade_id.as_deref() != Some(svc.container_id.as_str());
                     if is_new_id {
-                        // New identity: remove old tracker so stale telemetry
-                        // is not carried into the new instance.
+                        // New identity: purge all telemetry state for the old id so
+                        // stale rate baseline, TTFT, and TPOT do not bleed across.
                         if let Some(old_id) = lemonade_id.as_deref() {
-                            gen_trackers.remove(old_id);
+                            purge_telemetry_state(
+                                old_id,
+                                &mut gen_trackers,
+                                &mut prev_ttft,
+                                &mut prev_tpot,
+                            );
                         }
                     }
                     let existing = runner.state.instances.get(&svc.container_id).cloned();
@@ -345,10 +365,12 @@ pub async fn run_loop(
                             model = %svc.model_name,
                             "lemonade instance discovered"
                         );
+                        // InstanceDiscovered is a discovery-metadata event; broadcast
+                        // a clean instance (no prior collector-owned telemetry).
                         broadcast_and_persist(
                             &tx,
                             persist.as_ref(),
-                            Event::InstanceDiscovered(inst),
+                            Event::InstanceDiscovered(instance_from_discovered(&svc)),
                         );
                         lemonade_id = Some(svc.container_id.clone());
                     }
@@ -356,9 +378,12 @@ pub async fn run_loop(
                 None => {
                     if let Some(id) = lemonade_id.take() {
                         info!(id = %id, "lemonade instance gone");
-                        gen_trackers.remove(&id);
-                        prev_ttft.remove(&id);
-                        prev_tpot.remove(&id);
+                        purge_telemetry_state(
+                            &id,
+                            &mut gen_trackers,
+                            &mut prev_ttft,
+                            &mut prev_tpot,
+                        );
                         runner.state.apply(StateEvent::InstanceRemoved(id.clone()));
                         broadcast_and_persist(
                             &tx,
@@ -385,12 +410,16 @@ pub async fn run_loop(
                 let id = svc.container_id.clone();
                 let is_new = !known_services.contains(&id);
                 let existing = runner.state.instances.get(&id).cloned();
-                // Endpoint change → new logical service; invalidate tracker immediately.
-                let same_endpoint = existing.as_ref().map_or(true, |ex| ex.port == svc.port);
+                // Endpoint change → new logical service; reset rate baseline and
+                // latency windows so the new port starts fresh.
+                let same_endpoint = existing.as_ref().is_none_or(|ex| ex.port == svc.port);
                 if !same_endpoint {
-                    if let Some(t) = gen_trackers.get_mut(&id) {
-                        t.invalidate();
-                    }
+                    invalidate_on_endpoint_change(
+                        &id,
+                        &mut gen_trackers,
+                        &mut prev_ttft,
+                        &mut prev_tpot,
+                    );
                 }
                 let inst = merge_discovery_refresh(
                     &svc,
@@ -405,14 +434,18 @@ pub async fn run_loop(
                     .apply(StateEvent::InstanceUpserted(inst.clone()));
                 if is_new {
                     info!(id = %id, "managed service discovered");
-                    broadcast_and_persist(&tx, persist.as_ref(), Event::InstanceDiscovered(inst));
+                    // InstanceDiscovered is a discovery-metadata event; broadcast
+                    // a clean instance (no prior collector-owned telemetry).
+                    broadcast_and_persist(
+                        &tx,
+                        persist.as_ref(),
+                        Event::InstanceDiscovered(instance_from_discovered(&svc)),
+                    );
                 }
             }
             for gone in known_services.difference(&disc.seen) {
                 info!(id = %gone, "managed service gone");
-                gen_trackers.remove(gone);
-                prev_ttft.remove(gone);
-                prev_tpot.remove(gone);
+                purge_telemetry_state(gone, &mut gen_trackers, &mut prev_ttft, &mut prev_tpot);
                 runner
                     .state
                     .apply(StateEvent::InstanceRemoved(gone.clone()));
@@ -619,8 +652,7 @@ pub async fn run_loop(
         for inst in &mut instances {
             let (gen_tps, meta) = gen_trackers
                 .get_mut(&inst.container_id)
-                .map(|t| t.snapshot(cycle_at))
-                .unwrap_or((None, None));
+                .map_or((None, None), |t| t.snapshot(cycle_at));
             inst.gen_tps = gen_tps;
             inst.gen_tps_observation = meta;
         }
@@ -646,6 +678,16 @@ pub async fn run_loop(
                 "tokens_per_watt: gpu_ids matched no GPU for {id_join_misses} instance(s) \
                  (check HIP_VISIBLE_DEVICES vs amd-smi device_id)"
             ));
+        }
+        // Write tracker-derived gen_tps, observation metadata, and TPW back into
+        // runner.state.instances so that the next discovery merge reads current
+        // values (not stale pre-snapshot values from the last upsert).
+        for inst in &instances {
+            if let Some(entry) = runner.state.instances.get_mut(&inst.container_id) {
+                entry.gen_tps = inst.gen_tps;
+                entry.gen_tps_observation = inst.gen_tps_observation.clone();
+                entry.tokens_per_watt = inst.tokens_per_watt;
+            }
         }
         // Attribute per-instance VRAM (per-process where the cgroup join hit,
         // device-summed otherwise). Pure; uses this tick's `gpus` for totals.
@@ -705,6 +747,37 @@ pub async fn run_loop(
             }
         }
     }
+}
+
+/// Remove all per-service telemetry state for `id`: tracker, TTFT, and TPOT
+/// baselines.  Call on explicit removal (Docker Gone, Lemonade Gone, managed
+/// Gone) and whenever an identity change requires a clean slate.
+pub(crate) fn purge_telemetry_state(
+    id: &str,
+    gen_trackers: &mut HashMap<String, GenerationObservationTracker>,
+    prev_ttft: &mut HashMap<String, (f64, f64, DateTime<Utc>)>,
+    prev_tpot: &mut HashMap<String, (f64, f64, DateTime<Utc>)>,
+) {
+    gen_trackers.remove(id);
+    prev_ttft.remove(id);
+    prev_tpot.remove(id);
+}
+
+/// Invalidate the generation tracker for `id` (reset baseline without
+/// removing the map entry) and clear the TTFT/TPOT latency windows.
+/// Called when an endpoint changes within the same container/service id so
+/// the new scrape address starts with a fresh rate baseline.
+pub(crate) fn invalidate_on_endpoint_change(
+    id: &str,
+    gen_trackers: &mut HashMap<String, GenerationObservationTracker>,
+    prev_ttft: &mut HashMap<String, (f64, f64, DateTime<Utc>)>,
+    prev_tpot: &mut HashMap<String, (f64, f64, DateTime<Utc>)>,
+) {
+    if let Some(t) = gen_trackers.get_mut(id) {
+        t.invalidate();
+    }
+    prev_ttft.remove(id);
+    prev_tpot.remove(id);
 }
 
 /// Build an `Instance` from a `DiscoveredService` with no live KV/req sample yet.
@@ -796,9 +869,12 @@ fn ticks_per(period: Duration, tick: Duration) -> u64 {
     n.max(1) as u64
 }
 
-/// A gap longer than this between counter readings makes the baseline stale —
-/// the rate would be a misleadingly low average across an outage or a forward
-/// wall-clock jump (NTP, VM resume), so we re-baseline instead.
+/// Upper bound on the scrape interval accepted by `avg_ms_from_histogram`.
+/// Applies to TTFT/TPOT latency histograms only; generation-counter staleness
+/// is managed by `GenerationObservationTracker` (see `rocm-dash-core`).
+/// A gap longer than this makes the windowed delta stale (outage or forward
+/// wall-clock jump / NTP / VM resume), so the histogram falls back to the
+/// cumulative average for that sample.
 const MAX_RATE_INTERVAL_S: f64 = 60.0;
 
 /// Average latency (ms) from a cumulative histogram's `_sum` (seconds) and
@@ -985,6 +1061,76 @@ mod tests {
         assert_eq!(
             ticks_per(Duration::from_secs(30), Duration::from_millis(250)),
             120
+        );
+    }
+
+    // -- Identity/endpoint cleanup helper tests -----------------------------------
+
+    fn make_tracker(tick_secs: u64) -> GenerationObservationTracker {
+        GenerationObservationTracker::new(Duration::from_secs(tick_secs))
+    }
+
+    /// `purge_telemetry_state` removes the tracker entry, TTFT baseline, and
+    /// TPOT baseline for the target id and leaves other ids untouched.
+    #[test]
+    fn purge_telemetry_state_removes_all_three_maps_for_id() {
+        let mut trackers: HashMap<String, GenerationObservationTracker> = HashMap::new();
+        let mut ttft: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
+        let mut tpot: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
+
+        // Populate two ids.
+        trackers.insert("a".into(), make_tracker(2));
+        trackers.insert("b".into(), make_tracker(2));
+        ttft.insert("a".into(), (1.0, 1.0, at(10)));
+        ttft.insert("b".into(), (2.0, 2.0, at(10)));
+        tpot.insert("a".into(), (3.0, 3.0, at(10)));
+        tpot.insert("b".into(), (4.0, 4.0, at(10)));
+
+        purge_telemetry_state("a", &mut trackers, &mut ttft, &mut tpot);
+
+        // "a" must be gone from all maps.
+        assert!(!trackers.contains_key("a"), "tracker for a must be removed");
+        assert!(!ttft.contains_key("a"), "ttft for a must be removed");
+        assert!(!tpot.contains_key("a"), "tpot for a must be removed");
+        // "b" must be unaffected.
+        assert!(trackers.contains_key("b"), "tracker for b must survive");
+        assert!(ttft.contains_key("b"), "ttft for b must survive");
+        assert!(tpot.contains_key("b"), "tpot for b must survive");
+    }
+
+    /// `invalidate_on_endpoint_change` invalidates the tracker (resets its
+    /// window so subsequent snapshots return None) and removes the latency
+    /// baselines, without removing the tracker entry itself.
+    #[test]
+    fn invalidate_on_endpoint_change_resets_tracker_and_clears_latency() {
+        let mut trackers: HashMap<String, GenerationObservationTracker> = HashMap::new();
+        let mut ttft: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
+        let mut tpot: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
+
+        let mut tracker = make_tracker(2);
+        // Give the tracker a reading so it has a non-None baseline.
+        tracker.observe_counter(100.0, at(10));
+        tracker.observe_counter(200.0, at(12));
+        trackers.insert("svc".into(), tracker);
+        ttft.insert("svc".into(), (1.0, 10.0, at(10)));
+        tpot.insert("svc".into(), (0.5, 8.0, at(10)));
+
+        invalidate_on_endpoint_change("svc", &mut trackers, &mut ttft, &mut tpot);
+
+        // Tracker still exists but its window is reset: snapshot returns None.
+        let (rate, _meta) = trackers
+            .get_mut("svc")
+            .expect("tracker entry must remain")
+            .snapshot(at(12));
+        assert!(rate.is_none(), "invalidated tracker must yield None rate");
+        // Latency baselines must be cleared.
+        assert!(
+            !ttft.contains_key("svc"),
+            "ttft baseline must be cleared on endpoint change"
+        );
+        assert!(
+            !tpot.contains_key("svc"),
+            "tpot baseline must be cleared on endpoint change"
         );
     }
 }

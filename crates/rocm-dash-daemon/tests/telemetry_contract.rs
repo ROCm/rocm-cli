@@ -342,6 +342,11 @@ fn fast_opts(services_dir: std::path::PathBuf) -> RunnerOptions {
     }
 }
 
+// `spawn_runner` is called with `.await` at every call-site (awaiting the
+// returned JoinHandle would block forever); keep `async` so the call-sites
+// read `spawn_runner(...).await` consistently and the JoinHandle is obtained
+// without needing a separate let-binding.
+#[allow(clippy::unused_async)]
 async fn spawn_runner(
     tx: broadcast::Sender<Event>,
     opts: RunnerOptions,
@@ -375,7 +380,7 @@ async fn wait_for_snapshot<T>(
                     return Ok(v);
                 }
             }
-            Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Ok(_) | Err(broadcast::error::RecvError::Lagged(_))) => {}
             Ok(Err(broadcast::error::RecvError::Closed)) => {
                 return Err("broadcast channel closed".into());
             }
@@ -385,6 +390,10 @@ async fn wait_for_snapshot<T>(
 }
 
 /// Extract the `contract-svc` instance's `gen_tps` from a snapshot.
+/// `Some(None)` = instance present with `gen_tps` not yet computed;
+/// `Some(Some(v))` = instance present with rate `v`; `None` = instance absent.
+// The double Option is intentional: outer = found-instance, inner = gen_tps.
+#[allow(clippy::option_option)]
 fn svc_gen_tps(snap: &rocm_dash_core::metrics::Snapshot) -> Option<Option<f64>> {
     snap.instances
         .iter()
@@ -550,9 +559,9 @@ async fn service_removal_fires_instance_gone() {
         );
         match timeout(remaining, rx.recv()).await {
             Ok(Ok(Event::InstanceGone { container_id })) if container_id == SVC_ID => break,
-            Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Ok(_) | Err(broadcast::error::RecvError::Lagged(_))) => {}
             Ok(Err(broadcast::error::RecvError::Closed)) => panic!("broadcast closed"),
-            Err(_) => panic!("timed out waiting for InstanceGone"),
+            Err(e) => panic!("timed out waiting for InstanceGone: {e}"),
         }
     }
 
@@ -680,16 +689,16 @@ async fn omitted_counter_yields_none_not_zero() {
         if remaining.is_zero() {
             break;
         }
-        if let Ok(Ok(Event::Snapshot(snap))) = timeout(remaining, rx.recv()).await {
-            if let Some(gen_tps_opt) = svc_gen_tps(&snap) {
-                match gen_tps_opt {
-                    None => got_none = true,
-                    Some(v) if v < 0.01 => got_zero = true,
-                    _ => {}
-                }
-                if got_none {
-                    break; // contract satisfied
-                }
+        if let Ok(Ok(Event::Snapshot(snap))) = timeout(remaining, rx.recv()).await
+            && let Some(gen_tps_opt) = svc_gen_tps(&snap)
+        {
+            match gen_tps_opt {
+                None => got_none = true,
+                Some(v) if v < 0.01 => got_zero = true,
+                _ => {}
+            }
+            if got_none {
+                break; // contract satisfied
             }
         }
     }
@@ -820,16 +829,16 @@ async fn malformed_payload_yields_none_not_zero() {
         if remaining.is_zero() {
             break;
         }
-        if let Ok(Ok(Event::Snapshot(snap))) = timeout(remaining, rx.recv()).await {
-            if let Some(gen_tps_opt) = svc_gen_tps(&snap) {
-                match gen_tps_opt {
-                    None => {
-                        saw_none = true;
-                        break;
-                    }
-                    Some(v) if v < 0.01 => saw_zero = true,
-                    _ => {}
+        if let Ok(Ok(Event::Snapshot(snap))) = timeout(remaining, rx.recv()).await
+            && let Some(gen_tps_opt) = svc_gen_tps(&snap)
+        {
+            match gen_tps_opt {
+                None => {
+                    saw_none = true;
+                    break;
                 }
+                Some(v) if v < 0.01 => saw_zero = true,
+                _ => {}
             }
         }
     }
@@ -883,7 +892,7 @@ async fn running_idle_yields_gen_tps_and_zero_running_reqs() {
             .find(|i| i.container_id == SVC_ID)
             .and_then(|i| {
                 // Both conditions must hold: counter-derived rate AND idle reqs.
-                let has_gen_tps = i.gen_tps.map_or(false, |v| v > 0.0);
+                let has_gen_tps = i.gen_tps.is_some_and(|v| v > 0.0);
                 let is_idle = i.running_reqs == Some(0);
                 if has_gen_tps && is_idle {
                     Some((i.gen_tps.unwrap(), i.running_reqs.unwrap()))
@@ -1002,9 +1011,8 @@ async fn gen_tps_expiry_boundary_held_then_unavailable() {
     // Assert BOUNDARY 2 (reachable only after boundary-1 is fixed).
     assert!(
         boundary2_gen_tps.is_none(),
-        "EAI-7960 BOUNDARY-2 FAILED: gen_tps is still Some({:?}) after the \
+        "EAI-7960 BOUNDARY-2 FAILED: gen_tps is still Some({boundary2_gen_tps:?}) after the \
          validity window ({validity_window:?}) elapsed.\n\
-         Contract: held value must expire to None after the window.",
-        boundary2_gen_tps
+         Contract: held value must expire to None after the window."
     );
 }
