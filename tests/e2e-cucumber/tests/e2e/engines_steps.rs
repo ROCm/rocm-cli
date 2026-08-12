@@ -163,10 +163,13 @@ async fn assert_engine_shell_exited(world: &mut E2eWorld) {
 /// one all present the same way: neither is set.
 const SESSION_SCRATCH_VARS: [&str; 2] = ["XDG_RUNTIME_DIR", "RUNTIME_DIRECTORY"];
 
-/// How the failure under test reads when it happens. Matched loosely — on the
-/// two words that identify it — so a reworded message still counts as the same
-/// failure and does not quietly turn this scenario green.
-const SCRATCH_DIR_FAILURE: [&str; 2] = ["runtime directory", "RUNTIME_DIRECTORY"];
+/// How the failure under test reads when it happens: the engine's launcher says
+/// it could not resolve a writable runtime directory and names the variables it
+/// looked in. Matched on the distinctive phrase and on the variable names rather
+/// than the whole sentence, so a reworded message still counts as the same
+/// failure and does not quietly turn this scenario green — but not on the bare
+/// words "runtime directory", which appear in ordinary path output.
+const SCRATCH_DIR_FAILURE: [&str; 2] = ["writable runtime directory", "RUNTIME_DIRECTORY"];
 
 #[given("a session that provides no scratch directory of its own")]
 async fn given_no_session_scratch_dir(world: &mut E2eWorld) {
@@ -190,21 +193,31 @@ async fn user_installs_lemonade(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// What the install prints once it is genuinely under way. Reaching this is what
+/// makes the rest of the assertion mean anything.
+const INSTALL_STARTED: &str = "Preparing Lemonade";
+
 #[then("the install does not fail for want of a scratch directory")]
 async fn assert_install_not_blocked_by_scratch_dir(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no install output");
+    // An install that stops before it gets going cannot say anything about what
+    // the engine needs once it is running, and letting that count as a pass
+    // would make this scenario green while proving nothing.
+    assert!(
+        output.contains(INSTALL_STARTED),
+        "the install never got under way, so this scenario cannot say whether the engine was \
+         left without a scratch directory:\n{output}"
+    );
     // Deliberately not "the install succeeded". What an engine install runs into
     // on a given machine — no supported GPU backend, a download that did not
     // come through — is that machine's business and no business of this
     // scenario's. The one outcome pinned here is the CLI leaving the engine it
     // launched without somewhere to work, which it already knows how to solve
     // for the directories it owns.
-    let blocked = SESSION_SCRATCH_VARS
+    let blocked = SCRATCH_DIR_FAILURE
         .iter()
-        .chain(SCRATCH_DIR_FAILURE.iter())
-        .filter(|needle| output.contains(**needle))
-        .count()
-        > 0;
+        .chain(SESSION_SCRATCH_VARS.iter())
+        .any(|needle| output.contains(needle));
     assert!(
         !blocked,
         "installing the engine failed because the session gave it no scratch directory — the \

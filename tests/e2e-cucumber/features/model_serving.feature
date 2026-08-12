@@ -154,15 +154,12 @@ Feature: Model serving
     When the user serves a model under each device policy the command offers
     Then no policy is refused for being that policy
 
-  # Expected to FAIL on a GPU host. Stopping a running server does stop it, but
-  # the account it gives of what it did says it stopped nothing — so an operator
-  # cannot tell a stop that worked from one that found nothing to do.
-  #
-  # This needs a real served model, which is why it is on the GPU lane. A plain
-  # process registered as a managed service was tried first and reported the stop
-  # correctly (measured on the no-GPU lane), so the fixture would have pinned
-  # nothing: what differs about a real engine is that the CLI records identity
-  # tokens for its processes and reasons about them.
+  # A guard, not a finding. Stopping a running server was reported as having
+  # stopped nothing on the pod this set came from, but neither fixture tried here
+  # reproduces that: a plain process registered as a managed service is counted
+  # correctly (measured on the no-GPU lane), and so is a real vLLM serve
+  # (measured on MI300X, run 188). So this carries no expected-failure row — it
+  # holds the contract the pod violated, and goes red if CI ever meets it.
   @id:services-stop-reports-what-it-stopped @requires-gpu
   Scenario: 15 - Stopping a running server reports that it stopped it
     Given a managed runtime is active
@@ -188,7 +185,8 @@ Feature: Model serving
   # run on, or whether it will run on one at all.
   @id:serve-auto-gpu-selection-names-a-device @requires-gpu
   Scenario: 17 - Letting the CLI choose the GPU names the device it chose
-    Given a machine with an AMD GPU
+    Given a managed runtime is active
+    And a machine with an AMD GPU
     When the user serves a model letting the CLI choose the GPU
     Then the plan names the device it chose
 

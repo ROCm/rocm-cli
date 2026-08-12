@@ -886,6 +886,13 @@ async fn assert_removal_complete(world: &mut E2eWorld) {
 #[then("the server is no longer running")]
 async fn assert_owned_server_stopped(world: &mut E2eWorld) {
     let output = world.cli_output.clone().unwrap_or_default();
+    // Guards the assertion below against passing vacuously: with no process
+    // registered there is nothing that could still be running, and the scenario
+    // would go green having proved nothing.
+    assert!(
+        !world.owned_processes.is_empty(),
+        "this scenario registered no server, so there is nothing to have stopped"
+    );
     // Asked of the OS, and asked HERE — before this scenario's teardown, which
     // also kills what it owns. Deferring the question until after teardown would
     // report the harness's own cleanup as the product's work, turning the very
@@ -1026,7 +1033,15 @@ async fn assert_new_server_avoids_taken_address(world: &mut E2eWorld) {
 
 #[given("the engine inventory says Lemonade is ready on this GPU")]
 async fn given_lemonade_claims_gpu_readiness(world: &mut E2eWorld) {
+    // The claim is only made once the engine is installed, so install it first —
+    // into this scenario's own isolated directories, not the runner's.
+    let (install, install_err, _) = crate::run_rocm(world, &["engines", "install", "lemonade"]);
     let (listing, _, _) = crate::run_rocm(world, &["engines", "list"]);
+    assert!(
+        !listing.contains("Lemonade is not installed"),
+        "Lemonade could not be installed here, so the claim this scenario holds the CLI to is \
+         never made:\n--- install ---\n{install}{install_err}\n--- inventory ---\n{listing}"
+    );
     // Where the claim is not made, there is nothing to hold the CLI to, so the
     // scenario stops here rather than reading as a failure on a host that was
     // honest about what it can do.
