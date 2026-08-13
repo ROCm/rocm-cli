@@ -136,13 +136,6 @@ reason = "Lemonade managed serve reaches ready then shuts down immediately, so t
 serve_timeout_secs = 90
 flaky = true
 
-# --- EAI-7383: `rocm help` lists subcommands in declaration order, not
-# alphabetically. Platform-independent (pure CLI help output). ---
-[["help-lists-subcommands-alphabetically"]]
-when = {}
-bug = "EAI-7383"
-reason = "rocm help lists subcommands in declaration order, not alphabetically."
-
 # --- EAI-7384: re-provisioning nests the managed runtime path recursively
 # (runtimes/wheel/.../runtimes/wheel/). Surfaces wherever a real install runs. ---
 [["runtime-path-not-nested"]]
