@@ -1717,7 +1717,14 @@ fn dispatch(cli: Cli) -> Result<()> {
                         "note: launching the dash chat; switch providers with /provider <name>"
                     );
                 }
-                return dash::run_chat(chat_mock);
+                return dash::run_chat(
+                    chat_mock,
+                    ChatInferenceParams {
+                        temperature,
+                        top_p,
+                        max_tokens,
+                    },
+                );
             }
             match prompt {
                 Some(prompt) => print!(
@@ -26805,7 +26812,7 @@ ID_LIKE="suse opensuse"
         // interactive target). Coercing to the fn pointer fails to compile if
         // the entrypoint is removed or its signature drifts; casting the pointer
         // to an address gives the binding a real effect (no underscore-bind).
-        let target: fn(bool) -> Result<()> = dash::run_chat;
+        let target: fn(bool, ChatInferenceParams) -> Result<()> = dash::run_chat;
         assert_ne!(target as usize, 0);
     }
 
@@ -26828,8 +26835,8 @@ ID_LIKE="suse opensuse"
         let src = main_rs_source();
         let body = strip_line_comments(&command_chat_handler_body(&src));
         assert!(
-            body.contains("dash::run_chat(chat_mock)"),
-            "interactive `rocm chat` must route to dash::run_chat(chat_mock); body:\n{body}"
+            body.contains("dash::run_chat("),
+            "interactive `rocm chat` must route to dash::run_chat(...); body:\n{body}"
         );
         assert!(
             !body.contains("tui::run"),
@@ -26865,8 +26872,15 @@ ID_LIKE="suse opensuse"
             "Command::Chat must destructure the --chat-mock field; body:\n{body}"
         );
         assert!(
-            body.contains("dash::run_chat(chat_mock)"),
-            "--chat-mock must drive run_chat(chat_mock); body:\n{body}"
+            body.contains("dash::run_chat(") && body.contains("chat_mock,"),
+            "--chat-mock must be forwarded to run_chat; body:\n{body}"
+        );
+        assert!(
+            body.contains("ChatInferenceParams")
+                && body.contains("temperature,")
+                && body.contains("top_p,")
+                && body.contains("max_tokens,"),
+            "sampling controls must be forwarded to interactive dash chat; body:\n{body}"
         );
         // The scriptable prompt passthrough stays on the text render path,
         // NOT the dash/TUI.

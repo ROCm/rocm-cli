@@ -5370,10 +5370,49 @@ impl DashboardDaemonConfig {
     }
 }
 
+fn deserialize_optional_chat_temperature<'de, D>(deserializer: D) -> Result<Option<f32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<f32>::deserialize(deserializer)?;
+    if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
+        return Err(serde::de::Error::custom(
+            "dashboard.tui.chat_temperature must be a finite value >= 0.0",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_optional_chat_top_p<'de, D>(deserializer: D) -> Result<Option<f32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<f32>::deserialize(deserializer)?;
+    if value.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+        return Err(serde::de::Error::custom(
+            "dashboard.tui.chat_top_p must be a finite value between 0.0 and 1.0",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_optional_chat_max_tokens<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<u32>::deserialize(deserializer)?;
+    if value == Some(0) {
+        return Err(serde::de::Error::custom(
+            "dashboard.tui.chat_max_tokens must be greater than 0",
+        ));
+    }
+    Ok(value)
+}
+
 /// Dashboard TUI spec. The chat endpoint URL / model / auth-header *name* are
 /// plain data; the auth-header *value* (API key) is always env-only and never
 /// stored here (AMD gateway invariant).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DashboardTuiConfig {
     #[serde(default = "default_dashboard_connect")]
     pub connect: String,
@@ -5385,6 +5424,31 @@ pub struct DashboardTuiConfig {
     pub chat_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_auth_header: Option<String>,
+    /// Sampling temperature applied to chat requests (parity with the
+    /// `rocm chat` / `rocm serve` `--temperature` flag). `None` leaves the
+    /// endpoint default untouched; a CLI flag overrides this.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_chat_temperature",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub chat_temperature: Option<f32>,
+    /// Nucleus-sampling `top_p` applied to chat requests (parity with
+    /// `--top-p`). `None` leaves the endpoint default untouched.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_chat_top_p",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub chat_top_p: Option<f32>,
+    /// Upper bound on generated tokens for chat requests (parity with
+    /// `--max-tokens`). `None` uses the built-in dashboard default.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_chat_max_tokens",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub chat_max_tokens: Option<u32>,
 }
 
 impl Default for DashboardTuiConfig {
@@ -5395,6 +5459,9 @@ impl Default for DashboardTuiConfig {
             chat_url: None,
             chat_model: None,
             chat_auth_header: None,
+            chat_temperature: None,
+            chat_top_p: None,
+            chat_max_tokens: None,
         }
     }
 }
@@ -11131,6 +11198,48 @@ Class Name:                Display
             "default listen must use unix scheme"
         );
         assert_eq!(relisten.daemon.listen, "tcp:127.0.0.1:9000");
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn dashboard_tui_inference_params_round_trip_and_default_absent() {
+        // Defaults leave the sampling knobs unset and out of the serialized JSON
+        // (skip_serializing_if), so a stock config carries no sampling override.
+        let default_json = serde_json::to_value(DashboardTuiConfig::default()).unwrap();
+        assert!(default_json.get("chat_temperature").is_none());
+        assert!(default_json.get("chat_top_p").is_none());
+        assert!(default_json.get("chat_max_tokens").is_none());
+
+        // When set, all three round-trip through JSON unchanged.
+        let cfg = DashboardTuiConfig {
+            chat_temperature: Some(0.25),
+            chat_top_p: Some(0.5),
+            chat_max_tokens: Some(512),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: DashboardTuiConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.chat_temperature, Some(0.25));
+        assert_eq!(back.chat_top_p, Some(0.5));
+        assert_eq!(back.chat_max_tokens, Some(512));
+    }
+
+    #[test]
+    fn dashboard_tui_rejects_invalid_inference_params() {
+        for (field, value, expected) in [
+            ("chat_temperature", "-0.1", "chat_temperature"),
+            ("chat_top_p", "1.1", "chat_top_p"),
+            ("chat_max_tokens", "0", "chat_max_tokens"),
+        ] {
+            let json = format!(r#"{{"{field}":{value}}}"#);
+            let error = serde_json::from_str::<DashboardTuiConfig>(&json)
+                .expect_err("invalid inference parameter must be rejected")
+                .to_string();
+            assert!(
+                error.contains(expected),
+                "unexpected error for {field}: {error}"
+            );
+        }
     }
 
     #[test]
