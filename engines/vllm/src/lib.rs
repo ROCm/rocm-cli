@@ -31,7 +31,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const ENGINE_NAME: &str = "vllm";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const HEALTHCHECK_TIMEOUT_MS: u64 = 700;
-const DEFAULT_GPU_MEMORY_UTILIZATION: &str = "0.80";
 const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
 const MAX_TAIL_READ: u64 = 4 * 1024 * 1024;
 /// How long a stop waits for the server to actually exit after each signal
@@ -496,8 +495,7 @@ fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelRe
         launch_defaults: json!({
             "endpoint_mode": "openai",
             "host": DEFAULT_HOST,
-            "port": DEFAULT_LOCAL_PORT,
-            "gpu_memory_utilization": DEFAULT_GPU_MEMORY_UTILIZATION
+            "port": DEFAULT_LOCAL_PORT
         }),
         engine_recipe,
         warnings: vec![
@@ -698,23 +696,13 @@ the ROCm SDK's bundled numa uses renamed symbol versions and cannot satisfy it, 
 
     let mut command = ProcessCommand::new(&runtime.command);
     command
-        .arg("serve")
-        .arg(&request.model_ref)
-        .arg("--host")
-        .arg(&request.host)
-        .arg("--port")
-        .arg(request.port.to_string())
-        .arg("--gpu-memory-utilization")
-        .arg(DEFAULT_GPU_MEMORY_UTILIZATION);
-    // vLLM's FULL CUDA-graph replay hangs ROCm gfx94x GPUs on the first decode
-    // (surfaces as `HW Exception ... reason :GPU Hang`, which kills the engine and
-    // drops every inference request). Eager mode disables CUDA graphs and keeps
-    // inference stable. Allow opting back in via env once a runtime ships a fix.
-    if vllm_enforce_eager_enabled() {
-        command.arg("--enforce-eager");
-    }
-    command
-        .args(engine_recipe_launch_args(request.engine_recipe.as_ref()))
+        .args(vllm_serve_args(
+            &request.model_ref,
+            &request.host,
+            request.port,
+            vllm_enforce_eager_enabled(),
+            request.engine_recipe.as_ref(),
+        ))
         .stdin(Stdio::null());
     // When `rocm serve` protects a public endpoint, the key arrives via the
     // environment / key file (never argv). Hand it to vLLM as `VLLM_API_KEY` so
@@ -747,33 +735,39 @@ fn healthcheck_service(request: HealthcheckRequest) -> Result<HealthcheckRespons
     let model_ref = state
         .as_ref()
         .and_then(|value| value_string(value, "model_ref"));
-    let ready = endpoint_url
+    let listed = endpoint_url
         .as_deref()
         .map(|endpoint| query_loaded_model_endpoint(endpoint, model_ref.as_deref()))
         .transpose()
         .unwrap_or(None)
         .unwrap_or(false);
-    let status = if ready {
-        "ready".to_owned()
+    // `/v1/models` lists a model as soon as the server accepts its name, which can
+    // be minutes before the weights are resident. Confirm inference once before
+    // reporting ready.
+    let ready = listed
+        && endpoint_url.as_deref().is_some_and(|endpoint| {
+            inference_verified(
+                &files.state_path,
+                state.as_ref(),
+                endpoint,
+                model_ref.as_deref().unwrap_or_default(),
+            )
+        });
+    let state_status = state
+        .as_ref()
+        .and_then(|value| value_string(value, "status"))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let device = if state.is_some() {
+        "rocm_gpu"
     } else {
-        state
-            .as_ref()
-            .and_then(|value| value_string(value, "status"))
-            .unwrap_or_else(|| "unknown".to_owned())
+        "unknown"
     };
-    Ok(HealthcheckResponse {
-        status,
-        model_loaded: ready,
-        device: if state.is_some() {
-            "rocm_gpu".to_owned()
-        } else {
-            "unknown".to_owned()
-        },
-        uptime_sec: 0,
-        queue_depth: 0,
-        last_error: None,
-        tokens_per_sec: None,
-    })
+    Ok(HealthcheckResponse::for_readiness(
+        listed,
+        ready,
+        &state_status,
+        device,
+    ))
 }
 
 fn endpoint_response(request: EndpointRequest) -> Result<EndpointResponse> {
@@ -939,7 +933,7 @@ fn install_vllm_with_uv(python: &Path, reinstall: bool) -> Result<()> {
     args.push(index_url.clone());
     let output = ProcessCommand::new(&uv)
         .args(args)
-        .envs(uv_command_env())
+        .envs(uv_command_env(&paths))
         .output()
         .context("failed to launch uv pip install for vLLM")?;
     if output.status.success() {
@@ -1291,6 +1285,42 @@ fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRuntime) -> Res
     Ok(())
 }
 
+/// Full argument vector for `vllm serve`, as spawned by [`spawn_vllm_server`].
+///
+/// Kept as a pure function so the exact argv can be asserted in tests: memory
+/// and graph-mode flags materially change how much VRAM vLLM claims, and a
+/// wiring mistake there is invisible until a live GPU launch.
+///
+/// Notably absent: `--gpu-memory-utilization`. rocm-cli deliberately does not
+/// supply a default — vLLM's own default applies unless the user asks for a
+/// specific fraction via `rocm serve --gpu-memory-utilization`, which arrives
+/// here through the engine recipe's `required_flags`.
+fn vllm_serve_args(
+    model_ref: &str,
+    host: &str,
+    port: u16,
+    enforce_eager: bool,
+    engine_recipe: Option<&EngineRecipeHint>,
+) -> Vec<String> {
+    let mut args = vec![
+        "serve".to_owned(),
+        model_ref.to_owned(),
+        "--host".to_owned(),
+        host.to_owned(),
+        "--port".to_owned(),
+        port.to_string(),
+    ];
+    // vLLM's FULL CUDA-graph replay hangs ROCm gfx94x GPUs on the first decode
+    // (surfaces as `HW Exception ... reason :GPU Hang`, which kills the engine and
+    // drops every inference request). Eager mode disables CUDA graphs and keeps
+    // inference stable. Allow opting back in via env once a runtime ships a fix.
+    if enforce_eager {
+        args.push("--enforce-eager".to_owned());
+    }
+    args.extend(engine_recipe_launch_args(engine_recipe));
+    args
+}
+
 fn engine_recipe_launch_args(engine_recipe: Option<&EngineRecipeHint>) -> Vec<String> {
     engine_recipe
         .map(|hint| hint.required_flags.clone())
@@ -1582,6 +1612,43 @@ fn query_loaded_model_endpoint(endpoint_url: &str, model_ref: Option<&str>) -> R
     )
 }
 
+/// Whether the endpoint can actually complete a chat request, as opposed to
+/// merely listing the model.
+fn query_inference_probe_endpoint(endpoint_url: &str, model_ref: &str) -> Result<bool> {
+    if model_ref.trim().is_empty() {
+        return Ok(false);
+    }
+    // Send the endpoint key for the same reason the models query does: a 401 from
+    // a correctly-protected server must not read as "cannot serve".
+    let endpoint_api_key = rocm_engine_protocol::resolve_endpoint_api_key();
+    rocm_core::openai_chat_completion_probe(
+        endpoint_url,
+        model_ref,
+        endpoint_api_key.as_deref(),
+        rocm_core::INFERENCE_PROBE_TIMEOUT,
+    )
+}
+
+/// Whether a real inference request has succeeded against this service.
+///
+/// Latch and backoff bookkeeping lives in `rocm-core` so both engines share one
+/// implementation — what counts as *listed* differs per engine, what counts as
+/// *serving* does not.
+fn inference_verified(
+    state_path: &Path,
+    state: Option<&Value>,
+    endpoint_url: &str,
+    model_ref: &str,
+) -> bool {
+    rocm_core::engine_state_inference_verified(
+        state_path,
+        state,
+        endpoint_url,
+        model_ref,
+        rocm_engine_protocol::resolve_endpoint_api_key().as_deref(),
+    )
+}
+
 fn pid_from_state(state: &Value) -> Option<u32> {
     state
         .get("pid")?
@@ -1700,9 +1767,14 @@ fn wait_for_vllm_ready(
             );
         }
 
+        // Listing the model is not enough to hand the endpoint to a caller: vLLM
+        // advertises it well before the first request can be served. Only return
+        // once inference has actually answered.
         match query_loaded_model_endpoint(&endpoint, Some(model_ref)) {
-            Ok(true) => return Ok(()),
-            Ok(false) | Err(_) => std::thread::sleep(poll_interval),
+            Ok(true) if query_inference_probe_endpoint(&endpoint, model_ref).unwrap_or(false) => {
+                return Ok(());
+            }
+            _ => std::thread::sleep(poll_interval),
         }
     }
 }
@@ -1767,6 +1839,113 @@ fn tail_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Answer `count` chat requests on a loopback port with the given status,
+    /// reporting how many arrived.
+    fn spawn_chat_endpoint(
+        status_line: &'static str,
+        count: usize,
+    ) -> (u16, std::thread::JoinHandle<usize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let handle = std::thread::spawn(move || {
+            let mut served = 0;
+            for _ in 0..count {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buffer = [0_u8; 1024];
+                let _ = stream.read(&mut buffer);
+                let body = r#"{"choices":[{"message":{"content":"ok"}}]}"#;
+                let _ = write!(
+                    stream,
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                served += 1;
+            }
+            served
+        });
+        (port, handle)
+    }
+
+    fn probe_state_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "rocm-vllm-probe-{tag}-{}-{}.json",
+            std::process::id(),
+            current_unix_millis()
+        ))
+    }
+
+    #[test]
+    fn inference_verification_latches_into_the_state_file() -> Result<()> {
+        // First check probes and records the verdict; the second reads the latch
+        // and leaves the model alone.
+        let (port, server) = spawn_chat_endpoint("HTTP/1.1 200 OK", 1);
+        let state_path = probe_state_path("latch");
+        write_state(&state_path, &json!({"status": "running"}))?;
+        let endpoint = endpoint_url("127.0.0.1", port);
+
+        let state = read_service_state(&state_path).ok();
+        assert!(inference_verified(
+            &state_path,
+            state.as_ref(),
+            &endpoint,
+            "facebook/opt-125m"
+        ));
+
+        let state = read_service_state(&state_path)?;
+        assert!(
+            state
+                .get(rocm_core::INFERENCE_VERIFIED_STATE_KEY)
+                .and_then(Value::as_u64)
+                .is_some(),
+            "a passing probe is latched so later healthchecks skip it"
+        );
+        assert!(inference_verified(
+            &state_path,
+            Some(&state),
+            &endpoint,
+            "facebook/opt-125m"
+        ));
+
+        assert_eq!(
+            server.join().expect("server thread"),
+            1,
+            "the latched check must not send a second inference request"
+        );
+        fs::remove_file(&state_path).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn inference_verification_withheld_while_the_model_is_still_loading() -> Result<()> {
+        // The reported failure: `/v1/models` answers but inference does not.
+        let (port, server) = spawn_chat_endpoint("HTTP/1.1 503 Service Unavailable", 1);
+        let state_path = probe_state_path("loading");
+        write_state(&state_path, &json!({"status": "running"}))?;
+        let endpoint = endpoint_url("127.0.0.1", port);
+
+        let state = read_service_state(&state_path).ok();
+        assert!(!inference_verified(
+            &state_path,
+            state.as_ref(),
+            &endpoint,
+            "facebook/opt-125m"
+        ));
+        assert!(
+            read_service_state(&state_path)?
+                .get(rocm_core::INFERENCE_VERIFIED_STATE_KEY)
+                .is_none(),
+            "nothing is latched until inference actually answers"
+        );
+
+        server.join().expect("server thread");
+        fs::remove_file(&state_path).ok();
+        Ok(())
+    }
 
     fn test_engine_recipe(engine: &str, contract_version: &str) -> EngineRecipeHint {
         EngineRecipeHint {
@@ -1915,7 +2094,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_model_surfaces_conservative_vram_default() -> Result<()> {
+    fn resolve_model_omits_gpu_memory_utilization_default() -> Result<()> {
         let response = resolve_model_response(ResolveModelRequest {
             model_ref: "facebook/opt-125m".to_owned(),
             runtime_id: None,
@@ -1924,14 +2103,55 @@ mod tests {
             engine_recipe: None,
         })?;
 
-        assert_eq!(
+        assert!(
             response
                 .launch_defaults
                 .get("gpu_memory_utilization")
-                .and_then(Value::as_str),
-            Some(DEFAULT_GPU_MEMORY_UTILIZATION)
+                .is_none(),
+            "rocm-cli defers to vLLM's own default, so it must not advertise one: {}",
+            response.launch_defaults
         );
         Ok(())
+    }
+
+    #[test]
+    fn vllm_serve_args_omit_gpu_memory_utilization_without_override() {
+        let args = vllm_serve_args("facebook/opt-125m", "127.0.0.1", 8000, false, None);
+
+        assert_eq!(
+            args,
+            vec![
+                "serve",
+                "facebook/opt-125m",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8000"
+            ]
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--gpu-memory-utilization"),
+            "vLLM must apply its own default when the user asked for nothing: {args:?}"
+        );
+    }
+
+    #[test]
+    fn vllm_serve_args_forward_recipe_gpu_memory_utilization() {
+        let hint = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: ENGINE_NAME.to_owned(),
+            required_flags: vec!["--gpu-memory-utilization".to_owned(), "0.35".to_owned()],
+            ..EngineRecipeHint::default()
+        };
+
+        let args = vllm_serve_args("facebook/opt-125m", "127.0.0.1", 8000, true, Some(&hint));
+
+        let position = args
+            .iter()
+            .position(|arg| arg == "--gpu-memory-utilization")
+            .expect("explicit utilization must reach the spawned argv");
+        assert_eq!(args.get(position + 1).map(String::as_str), Some("0.35"));
+        assert!(args.contains(&"--enforce-eager".to_owned()));
     }
 
     #[test]

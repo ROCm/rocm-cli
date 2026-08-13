@@ -22,6 +22,39 @@ const KNOWN_SYMPTOM: &str = "HSA_STATUS_ERROR_INVALID_ISA";
 /// dry-run, which would make the assertion host-dependent.
 const PREVIEW_FIX_ID: &str = "fix-1-arch";
 
+/// A recipe that would really change the machine, used to prove the CLI asks
+/// first. Of the four AUTO recipes this is the only one that reaches the
+/// confirmation gate on a host with nothing installed: `fix-2-unset-override`
+/// never calls it on Linux, `fix-4-render-group` exits early once the user is
+/// already in the groups, and `fix-6-path` exits early with "no ROCm install
+/// found". This one needs only `--device-index`, which the scenario supplies.
+const MUTATING_FIX_ID: &str = "fix-9-igpu-dgpu";
+
+/// Contents planted in the scenario's own shell rc file. The assertion is that
+/// this survives the run byte for byte.
+const PLANTED_RC: &str = "# planted by the e2e suite; the fix must not touch this\n";
+
+/// The home directory handed to the fix under test, inside the scenario's
+/// isolated root. `fix-9` appends to a shell rc file under `$HOME`, and the
+/// piped harness otherwise lets the CLI inherit the runner's real one — so
+/// without this the scenario would read (and a regression could edit) the
+/// dotfiles of whoever is running the suite.
+fn fix_home(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("fix-home")
+}
+
+/// The rc file `fix-9` resolves to under [`fix_home`]. `shell_rc_file` picks
+/// `.zshrc` when `$SHELL` names zsh, so the scenario pins `$SHELL` to bash and
+/// this stays `.bashrc` regardless of the runner's login shell.
+fn fix_rc_file(world: &E2eWorld) -> std::path::PathBuf {
+    fix_home(world).join(".bashrc")
+}
+
 // ── Given ──────────────────────────────────────────────────────────
 
 #[given("a user who hit a known ROCm failure")]
@@ -42,6 +75,22 @@ async fn user_chose_known_fix(world: &mut E2eWorld) {
 #[given("a user who names a fix the CLI does not offer")]
 async fn user_named_unknown_fix(world: &mut E2eWorld) {
     world.model_name = Some("fix-does-not-exist".to_string());
+}
+
+#[given("a user who has chosen a fix that would change the machine")]
+async fn user_chose_mutating_fix(world: &mut E2eWorld) {
+    let rc_file = fix_rc_file(world);
+    std::fs::create_dir_all(fix_home(world)).expect("failed to create the scenario's home dir");
+    std::fs::write(&rc_file, PLANTED_RC).expect("failed to plant the shell rc file");
+    world.model_name = Some(MUTATING_FIX_ID.to_string());
+}
+
+#[given("a user who refers to a cause by its position in the diagnosis")]
+async fn user_named_diagnosis_position(world: &mut E2eWorld) {
+    // Quoted deliberately: unquoted, the shell treats `#1` as a comment and the
+    // CLI never sees it. The product behaviour under test is what happens when
+    // the argument does arrive.
+    world.model_name = Some("#1".to_string());
 }
 
 // ── When ───────────────────────────────────────────────────────────
@@ -86,6 +135,23 @@ async fn user_applies_fix(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+#[when("the user asks the CLI to apply it without agreeing to the change")]
+async fn user_applies_fix_without_agreeing(world: &mut E2eWorld) {
+    let fix_id = world.model_name.clone().expect("no fix id set");
+    let home = fix_home(world).display().to_string();
+    // No `--yes`, and the harness pipes stdin, so this is the non-interactive
+    // case the gate exists for. `--device-index` is what carries `fix-9` past
+    // its own "tell me which GPU" branch and up to the gate.
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["fix", &fix_id, "--device-index", "1"],
+        &[("HOME", home.as_str()), ("SHELL", "/bin/bash")],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 // ── Then ───────────────────────────────────────────────────────────
 
 #[then("the CLI reports a likely cause with a suggested fix")]
@@ -106,6 +172,35 @@ async fn assert_reports_cause_and_fix(world: &mut E2eWorld) {
     assert!(
         output.contains("plan:"),
         "expected a suggested fix plan:\n{output}"
+    );
+}
+
+#[then("every reported cause comes with a command that applies it")]
+async fn assert_every_cause_has_a_command(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    // A plan alone is not actionable: the report used to name a `rocm fix`
+    // command only when some match cleared the confidence threshold, so a report
+    // of low-confidence causes left the user with nothing to run.
+    let causes = output.lines().filter(|l| l.contains("score=")).count();
+    let commands = output
+        .lines()
+        .filter(|l| l.trim().starts_with("apply with: rocm fix "))
+        .count();
+    assert!(causes > 0, "no scored causes to check:\n{output}");
+    assert_eq!(
+        commands, causes,
+        "each of the {causes} causes needs its own apply command:\n{output}"
+    );
+}
+
+#[then("the listing explains what those indicators mean")]
+async fn assert_markers_explained(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix list output");
+    // The markers were printed with no legend, so a reader could not tell
+    // whether PRINT-ONLY meant "advisory" or "not implemented yet".
+    assert!(
+        output.contains("AUTO =") && output.contains("PRINT-ONLY ="),
+        "expected the listing to explain its AUTO/PRINT-ONLY markers:\n{output}"
     );
 }
 
@@ -235,5 +330,73 @@ async fn assert_unknown_fix_refused(world: &mut E2eWorld) {
     assert!(
         combined.contains("Unknown fix-id"),
         "expected an 'Unknown fix-id' message:\n{combined}"
+    );
+}
+
+#[then("the CLI refuses and explains that a position is not a fix-id")]
+async fn assert_position_argument_corrected(world: &mut E2eWorld) {
+    // Same exit code as any unknown id — this is clearer wording on an existing
+    // refusal, not a new outcome a script could come to depend on.
+    assert_eq!(
+        world.cli_rc,
+        Some(2),
+        "a position argument should exit 2 like any unknown id"
+    );
+    let combined = format!(
+        "{}{}",
+        world.cli_output.as_deref().unwrap_or(""),
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
+    assert!(
+        combined.contains("position"),
+        "the refusal must say the argument was read as a position:\n{combined}"
+    );
+    // And it must point at what to use instead, or the correction is useless.
+    assert!(
+        combined.contains("id:"),
+        "the refusal must name the identifier to use instead:\n{combined}"
+    );
+}
+
+#[then("the CLI refuses and explains that it needs agreement")]
+async fn assert_refuses_without_agreement(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix output");
+    // The refusal has to say *why* and how to proceed. A bare non-zero exit
+    // reads as a broken fix rather than a deliberate stop.
+    assert!(
+        output.contains("--yes"),
+        "the refusal must name what to pass to proceed:\n{output}"
+    );
+    assert!(
+        output.contains("refusing to apply"),
+        "the refusal must say it did not apply the fix:\n{output}"
+    );
+    // Distinct from the unknown-id refusal (2), so a script can tell "you did
+    // not agree" apart from "no such fix".
+    assert_eq!(
+        world.cli_rc,
+        Some(5),
+        "declining to apply is its own outcome, not an error:\n{output}"
+    );
+}
+
+#[then("the file the fix would have changed is untouched")]
+async fn assert_rc_file_untouched(world: &mut E2eWorld) {
+    let rc_file = fix_rc_file(world);
+    let output = world.cli_output.as_ref().expect("no fix output");
+    // The fix names its target before asking. If it ever stops naming this file
+    // the scenario would be reading back a file the CLI never intended to edit,
+    // and would pass without proving anything.
+    assert!(
+        output.contains(&rc_file.display().to_string()),
+        "the fix must name {} as what it would change:\n{output}",
+        rc_file.display()
+    );
+    let after = std::fs::read_to_string(&rc_file).expect("the planted rc file should still exist");
+    assert_eq!(
+        after,
+        PLANTED_RC,
+        "declining the fix must leave {} byte-for-byte unchanged",
+        rc_file.display()
     );
 }

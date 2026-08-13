@@ -526,6 +526,41 @@ mod tests {
         reap(child);
     }
 
+    /// A terminated child that has not been reaped yet is a zombie: it still has
+    /// a PID, so `kill(pid, 0)` succeeds and `process_is_running` reports `true`.
+    /// Termination checks must therefore go through `identity_state`, which
+    /// treats `Z` as gone. Asserting on `process_is_running` instead makes a test
+    /// depend on how quickly the host reaps, which varies between environments.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zombie_is_gone_to_identity_state_but_still_running_to_a_bare_pid_check() {
+        let (mut child, _) = spawn_ready("echo ready");
+        let id = ProcessIdentity::capture(child.id());
+
+        // Wait for exit without reaping, so the process is parked as a zombie.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !process_has_exited(id.pid) {
+            std::thread::sleep(POLL_INTERVAL);
+        }
+
+        assert!(
+            process_has_exited(id.pid),
+            "child should be an unreaped zombie by now"
+        );
+        assert!(
+            crate::process_is_running(id.pid),
+            "a bare PID check cannot tell a zombie from a live process"
+        );
+        assert_eq!(
+            identity_state(&id),
+            IdentityState::Gone,
+            "a zombie has exited and must not count as running"
+        );
+        assert!(is_exited(identity_state(&id)));
+
+        let _ = child.wait();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn tree_stop_waits_for_descendants() {
@@ -533,9 +568,10 @@ mod tests {
         // test) must be terminated too — a graceful Tree stop that only confirmed
         // the root would leave it alive.
         let (child, gpid_line) = spawn_ready("sleep 300 & echo $!; wait");
-        let grandchild: u32 = gpid_line.parse().expect("grandchild pid");
-        assert!(
-            crate::process_is_running(grandchild),
+        let grandchild = ProcessIdentity::capture(gpid_line.parse().expect("grandchild pid"));
+        assert_eq!(
+            identity_state(&grandchild),
+            IdentityState::Matches,
             "grandchild should be running before stop"
         );
         let id = ProcessIdentity::capture(child.id());
@@ -544,7 +580,7 @@ mod tests {
         assert_eq!(outcome, TerminationOutcome::Graceful);
         assert_eq!(identity_state(&id), IdentityState::Gone);
         assert!(
-            !crate::process_is_running(grandchild),
+            is_exited(identity_state(&grandchild)),
             "Tree stop must terminate the descendant, not just the root"
         );
         reap(child);
@@ -558,14 +594,14 @@ mod tests {
         // stop must SIGKILL that reparented descendant after the root exits.
         let (child, gpid_line) =
             spawn_ready(r#"sh -c "trap '' TERM; echo \$\$; exec sleep 300" & wait"#);
-        let grandchild: u32 = gpid_line.parse().expect("grandchild pid");
-        assert!(crate::process_is_running(grandchild));
+        let grandchild = ProcessIdentity::capture(gpid_line.parse().expect("grandchild pid"));
+        assert_eq!(identity_state(&grandchild), IdentityState::Matches);
         let id = ProcessIdentity::capture(child.id());
 
         let outcome = terminate_verified(&id, KillScope::Tree, Duration::from_millis(300), true);
         assert_eq!(outcome, TerminationOutcome::Forced);
         assert!(
-            !crate::process_is_running(grandchild),
+            is_exited(identity_state(&grandchild)),
             "forced Tree stop must SIGKILL the SIGTERM-ignoring descendant"
         );
         reap(child);

@@ -414,6 +414,12 @@ fn parse_descriptor(name: &str) -> Descriptor {
         "gpu" => ("MI300X", "Linux"),
         "gpu-strix-ubuntu" => ("Strix Halo", "Ubuntu"),
         "gpu-strix-windows" => ("Strix Halo", "Windows"),
+        // `e2e-unknown-report`: a report whose platform.json sidecar was missing
+        // or unrecognized (e.g. a GPU run that errored before writing it). The OS
+        // is genuinely unknown here — a Windows GPU run that erupted early must NOT
+        // be reported as Linux — so render Unknown / Unknown rather than defaulting
+        // OS to Linux the way `fallback_descriptor` does for a titlecased platform.
+        "unknown" => ("Unknown", "Unknown"),
         other => return fallback_descriptor(other, known_bugs),
     };
 
@@ -2000,6 +2006,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_descriptor_maps_known_artifacts() {
+        for (name, platform, os) in [
+            ("e2e-report", "Mock", "Linux"),
+            ("e2e-gpu-report", "MI300X", "Linux"),
+            ("e2e-gpu-strix-ubuntu-report", "Strix Halo", "Ubuntu"),
+            ("e2e-gpu-strix-windows-report", "Strix Halo", "Windows"),
+        ] {
+            let d = parse_descriptor(name);
+            assert_eq!(
+                (d.platform.as_str(), d.os.as_str()),
+                (platform, os),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_descriptor_unknown_is_not_falsely_linux() {
+        // A report whose platform.json was missing (e.g. a GPU run that errored
+        // before writing the sidecar) is labeled `e2e-unknown-report`. Its OS is
+        // genuinely unknown — a Windows GPU run must NOT be reported as Linux — so
+        // both platform AND os render "Unknown", never a default "Linux".
+        let d = parse_descriptor("e2e-unknown-report");
+        assert_eq!(d.platform, "Unknown");
+        assert_eq!(d.os, "Unknown");
+    }
+
+    #[test]
     fn scenario_status_undefined_step_is_not_passed() {
         // Regression: an undefined step must fail the scenario, not pass it.
         assert_eq!(
@@ -2409,7 +2443,7 @@ mod tests {
         let platform = r#"{
             "platform_slug": "mi300x",
             "capability": {"effective_serve_engine": "vllm"},
-            "versions": {"os":"Ubuntu 24.04.3 LTS","rocm":"7.13.0","vllm":"0.23.0+rocm723","lemonade":"10.6.0"},
+            "versions": {"os":"Ubuntu 24.04.3 LTS","rocm":"7.13.0","vllm":"0.23.0+rocm723","lemonade":"11.5.1"},
             "expectations": [
                 {"id":"serve-x","effective_engine":"vllm","expected":"pass"}
             ]
@@ -2421,7 +2455,7 @@ mod tests {
             "Ubuntu 24.04.3 LTS",
             "ROCm 7.13.0",
             "vLLM 0.23.0+rocm723",
-            "lemonade 10.6.0",
+            "lemonade 11.5.1",
         ] {
             assert!(md.contains(token), "matrix cell missing {token:?}:\n{md}");
         }

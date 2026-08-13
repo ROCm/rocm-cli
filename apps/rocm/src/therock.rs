@@ -5,7 +5,7 @@
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_gpu_diagnostics,
-    detect_host_therock_family, detect_managed_therock_family, ensure_uv_binary,
+    detect_host_therock_family, detect_managed_therock_family, disk_space, ensure_uv_binary,
     known_therock_families, managed_tools_dir, normalize_runtime_path_for_host,
     normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
     normalize_runtime_path_text_for_storage, normalize_therock_family, runtime_is_windows,
@@ -14,7 +14,9 @@ use rocm_core::{
     uv_venv_args, verify_rsa_pkcs1_sha256_signature,
 };
 #[cfg(test)]
-use rocm_core::{generate_rsa_signing_keypair, sign_rsa_pkcs1_sha256_signature};
+use rocm_core::{
+    generate_rsa_signing_keypair, managed_uv_cache_dir, sign_rsa_pkcs1_sha256_signature,
+};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fmt::Write as _;
@@ -32,6 +34,18 @@ const THEROCK_NIGHTLY_TARBALL_BASE: &str = "https://rocm.nightlies.amd.com/tarba
 const DEFAULT_MANAGED_PYTHON_VERSION: &str = "3.12";
 const STARTUP_UPDATE_CHECK_INTERVAL_MS: u128 = 12 * 60 * 60 * 1_000;
 const STARTUP_UPDATE_CHECK_TIMEOUT_SECS: u64 = 2;
+/// Timeout for the best-effort HEAD probe that sizes a download before starting it.
+const THEROCK_HEAD_PROBE_TIMEOUT_SECS: u64 = 10;
+/// Whole-transfer budget for an artifact download. A single-digit-gigabyte SDK
+/// tarball on a slow link needs well past the ten minutes the metadata fetches
+/// use; a retry that resumes cannot help if the attempt itself is cut short.
+const THEROCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_hours(1);
+/// Largest `Content-Length` accepted as a real SDK tarball size.
+///
+/// SDK tarballs are single-digit gigabytes; anything past this is a
+/// misconfigured proxy or a hostile header rather than a real artifact, and
+/// must not be allowed to refuse an install on its own authority.
+const THEROCK_MAX_PLAUSIBLE_TARBALL_BYTES: u64 = 256 * 1024 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TheRockChannel {
     Release,
@@ -905,7 +919,7 @@ fn install_wheel_runtime(
         "Creating Python environment at {}.",
         install_root.display()
     ));
-    ensure_uv_venv(&uv, &python_launcher.executable, &install_root)?;
+    ensure_uv_venv(paths, &uv, &python_launcher.executable, &install_root)?;
     let env_python = venv_python_path(&install_root);
 
     progress_line(format!(
@@ -920,6 +934,7 @@ fn install_wheel_runtime(
     }
     install_args.extend(therock_pip_package_specs(&resolution.package_versions));
     run_uv_progress_command(
+        paths,
         &uv,
         install_args
             .iter()
@@ -1059,8 +1074,12 @@ fn install_tarball_runtime(
         );
     }
 
+    if let Some(warning) = preflight_tarball_space(&artifact.url, &cache_path, &install_root)? {
+        let _ = writeln!(output, "  {warning}");
+    }
+
     download_file(&artifact.url, &cache_path)?;
-    extract_tarball(&cache_path, &install_root)?;
+    extract_tarball_and_discard_archive(&cache_path, &install_root)?;
 
     let manifest = InstalledRuntimeManifest {
         runtime_key: runtime_key.clone(),
@@ -2075,16 +2094,91 @@ fn http_header_value(headers: &str, name: &str) -> Option<String> {
     value
 }
 
+/// Fetch an artifact to `destination`.
+///
+/// Streams rather than buffers: SDK tarballs are single-digit gigabytes, and
+/// holding one in memory to write it out again costs that much RAM on top of
+/// the same amount of disk. The primitive also handles the free-space
+/// preflight, retry with resume, and the length cross-check that catches a
+/// transfer the server ended early.
 fn download_file(url: &str, destination: &Path) -> Result<()> {
     let parent = destination
         .parent()
         .context("download destination has no parent directory")?;
     fs::create_dir_all(parent)?;
-    let response = http_get(url, &[], None)?;
-    if response.status != 200 {
-        bail!("HTTP {} while fetching {url}", response.status);
+    rocm_core::download_file_streaming(&rocm_core::DownloadRequest::new(
+        url,
+        destination,
+        THEROCK_DOWNLOAD_TIMEOUT,
+    ))
+    .with_context(|| format!("failed to fetch {url}"))?;
+    Ok(())
+}
+
+/// Content length of `url` from a HEAD request, when the server reports one.
+///
+/// Best effort: any failure yields `None`, so a server that rejects HEAD or
+/// omits `Content-Length` simply skips the preflight instead of blocking the
+/// install.
+fn head_content_length(url: &str) -> Option<u64> {
+    let timeout = Duration::from_secs(THEROCK_HEAD_PROBE_TIMEOUT_SECS);
+    let agent = ureq::AgentBuilder::new()
+        // `timeout_connect` takes precedence over `timeout` and defaults to 30s,
+        // so without it a host that blackholes rather than refuses would stall
+        // the probe well past the intended ceiling.
+        .timeout_connect(timeout)
+        .timeout(timeout)
+        .build();
+    let response = agent.head(url).set("User-Agent", "rocm-cli").call().ok()?;
+    if response.status() != 200 {
+        return None;
     }
-    write_file_atomically(destination, &response.body)
+    let length: u64 = response.header("Content-Length")?.trim().parse().ok()?;
+    // The header is unauthenticated and is never cross-checked against the body
+    // the subsequent GET delivers, so an inflated value from a proxy or CDN
+    // would refuse an install that would in fact succeed. Treat an implausible
+    // size as no answer at all: the preflight is skipped and `download_file`
+    // still checks the real, buffered body length before writing.
+    (length <= THEROCK_MAX_PLAUSIBLE_TARBALL_BYTES).then_some(length)
+}
+
+/// Refuse (or warn) before a multi-GB SDK tarball download and extraction.
+///
+/// The download requirement comes from `Content-Length` and is exact, so a
+/// shortfall is a hard error — it saves the user a long download that cannot
+/// possibly succeed. The extraction requirement is only an estimate (see
+/// [`disk_space::EXTRACTED_SIZE_MULTIPLIER`]), so a shortfall there is a
+/// warning: a false refusal that blocks a valid install would be worse than a
+/// late failure.
+///
+/// Any extraction warning is returned rather than printed, so the caller can
+/// place it in the same accumulated output block as the rest of the install
+/// report instead of having it appear ahead of that block.
+fn preflight_tarball_space(
+    url: &str,
+    cache_path: &Path,
+    install_root: &Path,
+) -> Result<Option<String>> {
+    let Some(download_bytes) = head_content_length(url) else {
+        return Ok(None);
+    };
+    disk_space::ensure_space_for(
+        "download the SDK tarball",
+        cache_path,
+        disk_space::with_margin(download_bytes),
+    )?;
+
+    // When the cache and the install root share a filesystem, the archive and
+    // the extracted tree must both fit at the same time.
+    let mut extract_estimate = disk_space::estimated_extracted_size(download_bytes);
+    if disk_space::on_same_filesystem(cache_path, install_root) == Some(true) {
+        extract_estimate = extract_estimate.saturating_add(download_bytes);
+    }
+    Ok(disk_space::warn_if_low_space(
+        "extract the SDK tarball",
+        install_root,
+        disk_space::with_margin(extract_estimate),
+    ))
 }
 
 fn http_get(
@@ -2192,7 +2286,7 @@ fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
         let mut file = fs::File::create(&tmp)
             .with_context(|| format!("failed to create {}", tmp.display()))?;
         file.write_all(bytes)
-            .with_context(|| format!("failed to write {}", tmp.display()))?;
+            .map_err(|error| disk_space::map_write_error(error, &tmp))?;
     }
     fs::rename(&tmp, path).or_else(|_| {
         let _ = fs::remove_file(path);
@@ -2212,9 +2306,41 @@ fn extract_tarball(archive_path: &Path, target_dir: &Path) -> Result<()> {
         ],
         "extract TheRock tarball artifact",
     )
+    .map_err(|error| {
+        // The extraction preflight only warns, because the extracted size is an
+        // estimate. When that warning turns out to be right, the failure arrives
+        // as `tar` stderr rather than an `io::Error`, so it never reaches
+        // `map_write_error` — without this the user gets the raw
+        // "tar: ...: No space left on device" this feature exists to replace.
+        disk_space::subprocess_full_disk_error(&format!("{error:#}"), target_dir).unwrap_or(error)
+    })
 }
 
-fn ensure_uv_venv(uv: &Path, python_launcher: &Path, install_root: &Path) -> Result<()> {
+/// Unpack the SDK archive and then delete it.
+///
+/// Only the extracted tree is used from here on, so keeping the archive would
+/// double the disk cost of every installed version. This mirrors the cleanup
+/// `ensure_uv_binary` already performs after unpacking its own download.
+///
+/// Removing the archive is best-effort: the install has already succeeded by
+/// this point, so a cleanup failure is reported rather than raised.
+fn extract_tarball_and_discard_archive(archive_path: &Path, target_dir: &Path) -> Result<()> {
+    extract_tarball(archive_path, target_dir)?;
+    if let Err(error) = fs::remove_file(archive_path) {
+        progress_line(format!(
+            "Could not remove the downloaded archive {}: {error}",
+            archive_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_uv_venv(
+    paths: &AppPaths,
+    uv: &Path,
+    python_launcher: &Path,
+    install_root: &Path,
+) -> Result<()> {
     let env_python = venv_python_path(install_root);
     if env_python.is_file() {
         if run_command(
@@ -2241,7 +2367,7 @@ fn ensure_uv_venv(uv: &Path, python_launcher: &Path, install_root: &Path) -> Res
             .map(String::as_str)
             .collect::<Vec<_>>()
             .as_slice(),
-        &uv_command_env(),
+        &uv_command_env(paths),
         "create managed TheRock runtime virtual environment",
     )?;
     if !env_python.is_file() {
@@ -2626,10 +2752,15 @@ fn run_command_with_env(
     bail!("{context_text}: {detail}")
 }
 
-fn run_uv_progress_command(uv: &Path, args: &[&str], context_text: &str) -> Result<()> {
+fn run_uv_progress_command(
+    paths: &AppPaths,
+    uv: &Path,
+    args: &[&str],
+    context_text: &str,
+) -> Result<()> {
     let mut command = Command::new(uv);
     command.args(args);
-    for (key, value) in &uv_command_env() {
+    for (key, value) in &uv_command_env(paths) {
         command.env(key, value);
     }
     let status = command
@@ -2733,7 +2864,7 @@ fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
     progress_line(format!("Installing Python {version} via uv..."));
     let status = Command::new(&uv)
         .args(["python", "install", &version])
-        .envs(uv_command_env())
+        .envs(uv_command_env(paths))
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -2746,7 +2877,7 @@ fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
     progress_line(format!("Finding Python {version}..."));
     let output = Command::new(&uv)
         .args(["python", "find", &version])
-        .envs(uv_command_env())
+        .envs(uv_command_env(paths))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -3185,6 +3316,50 @@ mod tests {
     static PYTHON_RESOLVER_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn tarball_space_preflight_skips_when_the_download_size_is_unknown() {
+        // No HEAD response (unroutable host) must not block an install.
+        let temp = std::env::temp_dir();
+        let warning = preflight_tarball_space("http://127.0.0.1:1/rocm.tar.gz", &temp, &temp)
+            .expect("an unknown download size must not fail the preflight");
+        assert_eq!(
+            warning, None,
+            "an unknown download size must not produce an extraction warning either"
+        );
+    }
+
+    #[test]
+    fn download_space_requirement_includes_the_safety_margin() {
+        let archive = 2 * 1024 * 1024 * 1024;
+        assert_eq!(
+            disk_space::with_margin(archive),
+            archive + archive / disk_space::SPACE_MARGIN_DIVISOR
+        );
+        assert!(disk_space::with_margin(archive) > archive);
+    }
+
+    #[test]
+    fn extraction_estimate_exceeds_the_compressed_archive() {
+        let archive = 3 * 1024 * 1024 * 1024;
+        let estimate = disk_space::estimated_extracted_size(archive);
+        assert!(
+            estimate > archive,
+            "extraction must reserve headroom beyond the archive: {estimate} vs {archive}"
+        );
+        assert_eq!(estimate, archive * disk_space::EXTRACTED_SIZE_MULTIPLIER);
+    }
+
+    #[test]
+    fn write_file_atomically_reports_a_full_disk_clearly() {
+        // Exercise the mapping the write path uses, without filling a disk.
+        let error = disk_space::map_write_error(
+            std::io::Error::from(std::io::ErrorKind::StorageFull),
+            Path::new("/cache/rocm.tar.gz.tmp"),
+        );
+        let text = format!("{error:#}");
+        assert!(text.contains("ran out of disk space"), "{text}");
+    }
+
+    #[test]
     fn normalize_therock_family_maps_gfx1103_to_gfx110x_all() {
         assert_eq!(
             normalize_therock_family("gfx1103"),
@@ -3242,6 +3417,50 @@ mod tests {
                 "torchaudio==2.10.0+rocm7.13.0a20260513".to_owned(),
             ]
         );
+    }
+
+    /// The downloaded archive is removed once it has been unpacked; keeping it
+    /// would double the disk cost of every installed SDK version.
+    #[test]
+    fn extracting_the_sdk_archive_removes_it() -> Result<()> {
+        let (root, _paths) = test_paths("discard-archive");
+        let cache = root.join("cache");
+        let payload_dir = root.join("payload");
+        fs::create_dir_all(&cache)?;
+        fs::create_dir_all(&payload_dir)?;
+        fs::write(payload_dir.join("marker.txt"), b"sdk")?;
+
+        let archive = cache.join("therock-sdk.tar.gz");
+        let tar = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&payload_dir)
+            .arg("marker.txt")
+            .status()?;
+        if !tar.success() {
+            eprintln!("skipping: tar unavailable on this host");
+            let _ = fs::remove_dir_all(&root);
+            return Ok(());
+        }
+        assert!(archive.is_file(), "archive fixture should exist");
+
+        let target = root.join("install");
+        fs::create_dir_all(&target)?;
+        extract_tarball_and_discard_archive(&archive, &target)?;
+
+        assert!(
+            target.join("marker.txt").is_file(),
+            "the archive contents should have been extracted"
+        );
+        assert!(
+            !archive.exists(),
+            "the archive should be removed once unpacked, found {}",
+            archive.display()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
@@ -3395,12 +3614,32 @@ mod tests {
     }
 
     #[test]
-    fn managed_uv_cache_defaults_inside_generated_runtime_folder() {
+    fn managed_uv_cache_sits_under_the_data_dir_for_generated_runtime_folders() {
         let (_root, paths) = test_paths("managed-uv-cache");
         let runtime_key = "release-wheel-gfx120x-all-7-14-0";
         let install_root = managed_runtime_root(&paths, "wheel", runtime_key);
-        // uv caches live beside the venv; verify the wheel root path structure
         assert!(install_root.starts_with(&paths.data_dir));
+        // Without --prefix the generated runtime folder is itself under the data dir, so
+        // the uv cache shares a filesystem with the environment it populates.
+        assert!(managed_uv_cache_dir(&paths.data_dir).starts_with(&paths.data_dir));
+    }
+
+    #[test]
+    fn uv_cache_does_not_follow_a_prefix_install_root() {
+        // Documents a known gap rather than an intended behavior: `--prefix` relocates
+        // install_root only, while the uv cache stays keyed off the data dir. When the two
+        // land on different filesystems uv falls back to copying. Tracked separately; see
+        // the `--prefix` non-goal on the PR that introduced the colocation.
+        let (_root, paths) = test_paths("prefix-uv-cache");
+        let prefix_root = PathBuf::from("/mnt/elsewhere/envs/my-env");
+        let cache = managed_uv_cache_dir(&paths.data_dir);
+
+        assert!(
+            !cache.starts_with(&prefix_root),
+            "cache {} unexpectedly followed the --prefix root",
+            cache.display()
+        );
+        assert!(cache.starts_with(&paths.data_dir));
     }
 
     #[test]

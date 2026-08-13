@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 #[cfg(windows)]
 use std::ffi::OsStr;
@@ -27,6 +28,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 pub mod diagnose;
+pub mod disk_space;
 pub mod examine;
 pub mod fix;
 pub mod openmpi;
@@ -37,7 +39,13 @@ pub use diagnose::{
     DiagnoseReport, Diagnosis, Fix, diagnose as run_diagnose,
     render_report_text as render_diagnose_text,
 };
-pub use examine::{Examination, FrameworkProbe, WSL_ROUTE_OUT_NOTE};
+pub use disk_space::{
+    SpaceCheck, available_space_for_path, check_space_for_path, ensure_space_for,
+    estimated_extracted_size, format_bytes, insufficient_space_message, map_write_error,
+    mount_for_path, on_same_filesystem, warn_if_low_space, with_margin,
+};
+use examine::extract_rocm_version;
+pub use examine::{Examination, FrameworkProbe, WSL_ROUTE_OUT_NOTE, gfx_is_apu_family};
 pub use fix::{FixOptions, apply as apply_fix, list_recipes as list_fix_recipes};
 pub use proc_lifecycle::{
     IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
@@ -49,22 +57,24 @@ use runtime::home_rocm_dir;
 pub use runtime::{
     RuntimeHost, RuntimePlatform, current_executable_path, default_cache_dir, default_config_dir,
     default_data_dir, default_interactive_shell_program, managed_logs_dir, managed_pip_cache_dir,
-    managed_runtime_cache_dir, managed_tools_dir, normalize_runtime_path_for_host,
-    normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
-    normalize_runtime_path_text_for_platform, normalize_runtime_path_text_for_storage,
-    platform_binary_name, prepend_runtime_path, runtime_directory_label,
-    runtime_drive_root_for_key, runtime_drive_roots, runtime_exe_suffix, runtime_home_dir,
-    runtime_install_root_is_protected, runtime_is_linux, runtime_is_windows, runtime_os_name,
-    runtime_path_for_child, runtime_path_for_windows_child, runtime_path_is_same_or_inside,
-    runtime_path_list_join, runtime_path_list_split, runtime_path_sort_key,
-    runtime_path_text_is_absolute_for_host, runtime_path_text_is_absolute_for_platform,
-    runtime_paths_equivalent, runtime_python_activation_hint, runtime_python_activation_script,
-    runtime_python_bin_dir_name, runtime_python_env_bin_dir, runtime_python_executable_in_env,
-    runtime_python_executable_name, runtime_rocm_library_filename, shell_command_for_host,
+    managed_runtime_cache_dir, managed_runtime_data_root, managed_tools_dir, managed_uv_cache_dir,
+    normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
+    normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_platform,
+    normalize_runtime_path_text_for_storage, platform_binary_name, prepend_runtime_path,
+    runtime_directory_label, runtime_drive_root_for_key, runtime_drive_roots, runtime_exe_suffix,
+    runtime_home_dir, runtime_install_root_is_protected, runtime_is_linux, runtime_is_windows,
+    runtime_os_name, runtime_path_for_child, runtime_path_for_windows_child,
+    runtime_path_is_same_or_inside, runtime_path_list_join, runtime_path_list_split,
+    runtime_path_sort_key, runtime_path_text_is_absolute_for_host,
+    runtime_path_text_is_absolute_for_platform, runtime_paths_equivalent,
+    runtime_python_activation_hint, runtime_python_activation_script, runtime_python_bin_dir_name,
+    runtime_python_env_bin_dir, runtime_python_executable_in_env, runtime_python_executable_name,
+    runtime_rocm_library_filename, shell_command_for_host,
 };
 pub use uv::{
-    DEFAULT_UV_TIMEOUT_SECS, ensure_uv_binary, uv_binary_name, uv_command_env,
-    uv_http_timeout_secs, uv_pip_freeze_args, uv_pip_install_base, uv_venv_args,
+    DEFAULT_UV_TIMEOUT_SECS, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV, UvCacheSource,
+    ensure_uv_binary, uv_binary_name, uv_cache_source, uv_command_env, uv_http_timeout_secs,
+    uv_pip_freeze_args, uv_pip_install_base, uv_venv_args,
 };
 
 pub const DEFAULT_LOCAL_PORT: u16 = 11_435;
@@ -112,23 +122,382 @@ pub fn parse_http_endpoint(endpoint_url: &str) -> Option<(String, u16)> {
     Some((host.to_owned(), port.parse().ok()?))
 }
 
-pub fn download_file_to_path(url: &str, destination: &Path, timeout: Duration) -> Result<()> {
-    let response = ureq::get(url)
-        .timeout(timeout)
-        .call()
-        .with_context(|| format!("failed to download {url}"))?;
-    if response.status() != 200 {
-        bail!("HTTP {} while downloading {url}", response.status());
+/// Attempts a download makes before giving up. The first attempt is not a
+/// retry, so this is one initial try plus two retries.
+pub const DOWNLOAD_MAX_ATTEMPTS: u32 = 3;
+
+/// Chunk size for the streaming copy. Fixed, so peak memory is independent of
+/// the artifact size — the whole point of streaming a multi-gigabyte tarball.
+const DOWNLOAD_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Exponential backoff between download attempts.
+///
+/// A copy of the shape used by the dashboard's reconnect loop rather than a
+/// shared dependency: `rocm-core` sits below the dash crates, so it cannot
+/// import theirs.
+#[derive(Debug, Clone, Copy)]
+pub struct Backoff {
+    current: Duration,
+    max: Duration,
+    factor: u32,
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self::new(Duration::from_millis(500), Duration::from_secs(8), 2)
     }
-    if let Some(parent) = destination.parent() {
+}
+
+impl Backoff {
+    pub const fn new(initial: Duration, max: Duration, factor: u32) -> Self {
+        Self {
+            current: initial,
+            max,
+            factor,
+        }
+    }
+
+    /// The delay to wait before the next attempt, then grow toward `max`.
+    pub fn next_delay(&mut self) -> Duration {
+        let delay = self.current;
+        self.current = self.current.saturating_mul(self.factor).min(self.max);
+        delay
+    }
+}
+
+/// A download of a single artifact to a single path.
+#[derive(Debug, Clone, Copy)]
+pub struct DownloadRequest<'a> {
+    pub url: &'a str,
+    pub destination: &'a Path,
+    pub timeout: Duration,
+    pub headers: &'a [(&'a str, &'a str)],
+    /// Refuse a body larger than this, so an unexpected response cannot fill
+    /// the disk. `None` accepts whatever the server sends.
+    pub max_bytes: Option<u64>,
+    /// Size the caller already knows from a manifest. Checked in addition to
+    /// the server's own `Content-Length`.
+    pub expected_len: Option<u64>,
+    pub expected_sha256: Option<&'a str>,
+}
+
+impl<'a> DownloadRequest<'a> {
+    pub const fn new(url: &'a str, destination: &'a Path, timeout: Duration) -> Self {
+        Self {
+            url,
+            destination,
+            timeout,
+            headers: &[],
+            max_bytes: None,
+            expected_len: None,
+            expected_sha256: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DownloadOutcome {
+    pub bytes_written: u64,
+    pub sha256: String,
+}
+
+/// Stream `request.url` to `request.destination`, retrying transient failures
+/// and resuming where the server allows it.
+///
+/// Bytes go through a fixed [`DOWNLOAD_CHUNK_BYTES`] buffer into a sibling
+/// `.part` file and are hashed on the way past, so peak memory does not scale
+/// with the artifact — a multi-gigabyte SDK tarball costs the same as a small
+/// one. The `.part` file is a sibling of the destination so the final rename
+/// stays within one filesystem and is atomic: a caller that finds the
+/// destination present knows it holds a complete download, and an interrupted
+/// run never leaves a truncated file that a later run would treat as cached.
+///
+/// # Integrity
+///
+/// With `expected_sha256` the content is authenticated. Without it the only
+/// integrity signal is the byte count, cross-checked against `Content-Length`
+/// and `expected_len`. That catches truncation and interrupted transfers, which
+/// is what this guards against, but `Content-Length` is unauthenticated and a
+/// matching length proves nothing about the bytes — do not read a successful
+/// return as "the artifact is genuine" unless a digest was supplied.
+pub fn download_file_streaming(request: &DownloadRequest<'_>) -> Result<DownloadOutcome> {
+    if let Some(parent) = request.destination.parent()
+        && !parent.as_os_str().is_empty()
+    {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
+    let partial_path = partial_download_path(request.destination);
+    // Resume is scoped to retries within this call. A `.part` file found at
+    // entry is debris from an earlier run — process ids get reused, so its
+    // contents cannot be attributed to this URL and appending to it would
+    // silently produce a corrupt artifact.
+    let _ = fs::remove_file(&partial_path);
+    let mut backoff = Backoff::default();
+    let mut attempt = 1;
+    let outcome = loop {
+        match download_attempt(request, &partial_path) {
+            Ok(outcome) => break outcome,
+            Err(error) => {
+                let retryable = error.retryable && attempt < DOWNLOAD_MAX_ATTEMPTS;
+                if !retryable {
+                    let _ = fs::remove_file(&partial_path);
+                    return Err(error.error);
+                }
+                thread::sleep(backoff.next_delay());
+                attempt += 1;
+            }
+        }
+    };
+    fs::rename(&partial_path, request.destination).map_err(|error| {
+        let _ = fs::remove_file(&partial_path);
+        anyhow::Error::new(error).context(format!(
+            "failed to move the completed download into {}",
+            request.destination.display()
+        ))
+    })?;
+    Ok(outcome)
+}
+
+/// Where the in-progress bytes live. Keyed by process id so two processes
+/// downloading the same destination cannot append into each other's file.
+fn partial_download_path(destination: &Path) -> PathBuf {
+    let mut name = destination.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".part-{}", std::process::id()));
+    destination.with_file_name(name)
+}
+
+/// A failed attempt, and whether trying again could plausibly help.
+struct DownloadAttemptError {
+    error: anyhow::Error,
+    retryable: bool,
+}
+
+const fn transient(error: anyhow::Error) -> DownloadAttemptError {
+    DownloadAttemptError {
+        error,
+        retryable: true,
+    }
+}
+
+const fn permanent(error: anyhow::Error) -> DownloadAttemptError {
+    DownloadAttemptError {
+        error,
+        retryable: false,
+    }
+}
+
+/// Whether a status is worth another attempt. Server-side and rate-limit
+/// responses can succeed later; the rest of `4xx` means the request itself is
+/// wrong, and repeating it just wastes the user's time.
+const fn status_is_retryable(status: u16) -> bool {
+    status == 408 || status == 429 || status >= 500
+}
+
+fn download_attempt(
+    request: &DownloadRequest<'_>,
+    partial_path: &Path,
+) -> Result<DownloadOutcome, DownloadAttemptError> {
+    // Resume from whatever a previous attempt already wrote. A missing file is
+    // simply a fresh start.
+    let resume_from = fs::metadata(partial_path).map_or(0, |meta| meta.len());
+    let mut call = ureq::get(request.url).timeout(request.timeout);
+    for (name, value) in request.headers {
+        call = call.set(name, value);
+    }
+    if resume_from > 0 {
+        call = call.set("Range", &format!("bytes={resume_from}-"));
+    }
+    let response = match call.call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(status, _)) => {
+            let error = anyhow::anyhow!("HTTP {status} while downloading {url}", url = request.url);
+            return Err(if status_is_retryable(status) {
+                transient(error)
+            } else {
+                permanent(error)
+            });
+        }
+        // Transport failures are exactly the interruptions worth retrying.
+        Err(error) => {
+            return Err(transient(
+                anyhow::Error::new(error).context(format!("failed to download {}", request.url)),
+            ));
+        }
+    };
+    let status = response.status();
+    if status != 200 && status != 206 {
+        return Err(permanent(anyhow::anyhow!(
+            "HTTP {status} while downloading {url}",
+            url = request.url
+        )));
+    }
+    // A `206` that does not confirm continuing from `resume_from` cannot be
+    // treated as a fresh full download either: its `Content-Length` is the
+    // length of whatever slice the server chose to send, not the whole
+    // artifact, so accepting it as complete would silently rename a truncated
+    // body into place. Discard the partial file and restart clean with a
+    // plain `GET` instead of reinterpreting the mismatched slice.
+    if status == 206 && resume_from > 0 && content_range_start(&response) != Some(resume_from) {
+        let _ = fs::remove_file(partial_path);
+        return Err(transient(anyhow::anyhow!(
+            "{url} resumed from an unexpected byte offset; restarting the download",
+            url = request.url
+        )));
+    }
+    // Only append when the server confirmed it is continuing from exactly where
+    // we stopped. A server that ignores `Range` answers 200 with the whole body,
+    // which restarts cleanly too.
+    let resuming = status == 206 && resume_from > 0;
+    let remaining_len = header_u64(&response, "Content-Length");
+    let total_len =
+        remaining_len.map(|len| len.saturating_add(if resuming { resume_from } else { 0 }));
+    if let Some(total) = total_len.or(request.expected_len) {
+        if let Some(max_bytes) = request.max_bytes
+            && total > max_bytes
+        {
+            return Err(permanent(anyhow::anyhow!(
+                "{url} is {total} bytes, over the approved limit of {max_bytes}",
+                url = request.url
+            )));
+        }
+        // Free-space preflight, before a single byte is read: an exact size
+        // means we can refuse upfront instead of failing partway through. Only
+        // the bytes still to come need room; a resumed prefix already has it.
+        let still_needed = total.saturating_sub(if resuming { resume_from } else { 0 });
+        if let Err(error) = disk_space::ensure_space_for(
+            &format!("download {}", request.url),
+            request.destination,
+            disk_space::with_margin(still_needed),
+        ) {
+            return Err(permanent(error));
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    let mut written = 0_u64;
+    let mut file = if resuming {
+        // Re-hash the prefix so the digest covers the whole artifact, not just
+        // the bytes this attempt happened to fetch.
+        let mut existing =
+            fs::File::open(partial_path).map_err(|error| permanent(anyhow::Error::new(error)))?;
+        written = std::io::copy(&mut existing, &mut hasher)
+            .map_err(|error| permanent(anyhow::Error::new(error)))?;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(partial_path)
+            .map_err(|error| permanent(anyhow::Error::new(error)))?
+    } else {
+        fs::File::create(partial_path).map_err(|error| {
+            permanent(
+                anyhow::Error::new(error)
+                    .context(format!("failed to create {}", partial_path.display())),
+            )
+        })?
+    };
+
     let mut reader = response.into_reader();
-    let mut file = fs::File::create(destination)
-        .with_context(|| format!("failed to create {}", destination.display()))?;
-    std::io::copy(&mut reader, &mut file)
-        .with_context(|| format!("failed to write {}", destination.display()))?;
+    let mut buffer = vec![0_u8; DOWNLOAD_CHUNK_BYTES];
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            // A mid-body failure keeps the partial file: the next attempt
+            // resumes from it. A server that drops the connection early and one
+            // that closes cleanly after a short body are the same problem to
+            // the user, so report the shortfall either way rather than a bare
+            // transport error.
+            Err(error) => {
+                let reason = total_len.or(request.expected_len).map_or_else(
+                    || format!("failed while downloading {}", request.url),
+                    |expected| {
+                        format!(
+                            "incomplete download of {}: expected {expected} bytes, got {written}",
+                            request.url
+                        )
+                    },
+                );
+                return Err(transient(anyhow::Error::new(error).context(reason)));
+            }
+        };
+        written = written.saturating_add(read as u64);
+        if let Some(max_bytes) = request.max_bytes
+            && written > max_bytes
+        {
+            return Err(permanent(anyhow::anyhow!(
+                "{url} exceeded the approved limit of {max_bytes} bytes",
+                url = request.url
+            )));
+        }
+        hasher.update(&buffer[..read]);
+        if let Err(error) = file.write_all(&buffer[..read]) {
+            return Err(permanent(disk_space::map_write_error(error, partial_path)));
+        }
+    }
+    if let Err(error) = file.sync_all() {
+        return Err(permanent(disk_space::map_write_error(error, partial_path)));
+    }
+    drop(file);
+
+    // Two independent length contracts, checked separately because they fail
+    // for different reasons and deserve different handling.
+    //
+    // The server's own `Content-Length`: a shortfall means the transfer was cut
+    // short, so the bytes on disk are good as far as they go and the next
+    // attempt resumes from them.
+    if let Some(expected) = total_len
+        && written != expected
+    {
+        return Err(transient(anyhow::anyhow!(
+            "incomplete download of {url}: expected {expected} bytes, got {written}",
+            url = request.url
+        )));
+    }
+    // A size the caller knew in advance: the server delivered a complete body
+    // that is not the artifact the manifest describes. Refetching returns the
+    // same wrong thing, so do not spend the remaining attempts on it.
+    if let Some(expected) = request.expected_len
+        && written != expected
+    {
+        return Err(permanent(anyhow::anyhow!(
+            "{url} is {written} bytes, but {expected} were expected",
+            url = request.url
+        )));
+    }
+    let sha256 = format!("{:x}", hasher.finalize());
+    if let Some(expected) = request.expected_sha256
+        && !sha256.eq_ignore_ascii_case(expected)
+    {
+        // The bytes are wrong, not merely incomplete; resuming would append to
+        // a corrupt prefix, so discard it and fail.
+        let _ = fs::remove_file(partial_path);
+        return Err(permanent(anyhow::anyhow!(
+            "SHA-256 mismatch for {url}: expected {expected}, got {sha256}",
+            url = request.url
+        )));
+    }
+    Ok(DownloadOutcome {
+        bytes_written: written,
+        sha256,
+    })
+}
+
+fn header_u64(response: &ureq::Response, name: &str) -> Option<u64> {
+    response
+        .header(name)
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+/// First byte offset from a `Content-Range: bytes <start>-<end>/<total>` header.
+fn content_range_start(response: &ureq::Response) -> Option<u64> {
+    let value = response.header("Content-Range")?;
+    let range = value.trim().strip_prefix("bytes")?.trim_start();
+    let start = range.split('-').next()?.trim();
+    start.parse::<u64>().ok()
+}
+
+pub fn download_file_to_path(url: &str, destination: &Path, timeout: Duration) -> Result<()> {
+    download_file_streaming(&DownloadRequest::new(url, destination, timeout))?;
     Ok(())
 }
 
@@ -147,6 +516,7 @@ pub fn http_get_text_with_auth(
     endpoint_api_key: Option<&str>,
     timeout: Duration,
 ) -> Result<String> {
+    let deadline = Instant::now() + timeout;
     let (host, port) = parse_http_endpoint(endpoint_url)
         .with_context(|| format!("unsupported endpoint URL `{endpoint_url}`"))?;
     let mut stream = connect_tcp_stream(&host, port, timeout)?;
@@ -160,7 +530,7 @@ pub fn http_get_text_with_auth(
     );
     write_all_tcp_stream(&mut stream, request.as_bytes())
         .with_context(|| format!("failed to write HTTP GET {path}"))?;
-    let response = read_tcp_stream_to_string(&mut stream)
+    let response = read_http_response_bounded(&mut stream, deadline)
         .with_context(|| format!("failed to read HTTP GET {path}"))?;
     let (headers, body) = response
         .split_once("\r\n\r\n")
@@ -170,6 +540,230 @@ pub fn http_get_text_with_auth(
         bail!("HTTP endpoint returned {status_line}");
     }
     Ok(body.to_owned())
+}
+
+/// POST a JSON body and return the response status line plus body.
+///
+/// The POST sibling of [`http_get_text_with_auth`]. Unlike the GET helper this
+/// does not treat a non-200 as an error: callers that probe an endpoint need to
+/// tell "the server answered, with a refusal" apart from "the server never
+/// answered", and only the former proves the request path is alive.
+pub fn http_post_json_with_auth(
+    endpoint_url: &str,
+    path: &str,
+    body: &serde_json::Value,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<HttpResponseParts> {
+    let deadline = Instant::now() + timeout;
+    let (host, port) = parse_http_endpoint(endpoint_url)
+        .with_context(|| format!("unsupported endpoint URL `{endpoint_url}`"))?;
+    let mut stream = connect_tcp_stream(&host, port, timeout)?;
+    let host_header = format_host_port(&host, port);
+    let auth_header = match endpoint_api_key {
+        Some(key) => format!("Authorization: Bearer {key}\r\n"),
+        None => String::new(),
+    };
+    let payload = serde_json::to_string(body).context("failed to serialize HTTP JSON body")?;
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\n{auth_header}Connection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    write_all_tcp_stream(&mut stream, request.as_bytes())
+        .with_context(|| format!("failed to write HTTP POST {path}"))?;
+    let response = read_http_response_bounded(&mut stream, deadline)
+        .with_context(|| format!("failed to read HTTP POST {path}"))?;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .context("HTTP response was missing a body")?;
+    let status_line = headers.lines().next().unwrap_or_default();
+    let status = http_status_code(status_line)
+        .with_context(|| format!("unparsable HTTP status line `{status_line}`"))?;
+    Ok(HttpResponseParts {
+        status,
+        body: body.to_owned(),
+    })
+}
+
+/// Budget for the single-token chat request that proves a service can serve.
+///
+/// Generously longer than a model-listing timeout: the probe is a real inference
+/// request, and a first request against a freshly loaded model pays for prompt
+/// processing before it answers.
+pub const INFERENCE_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Engine state-file key recording when inference was first confirmed.
+///
+/// Written by the engine healthchecks and adopted by
+/// [`ManagedServiceRecord::refresh_from_engine_state`], so the CLI side does not
+/// re-probe what an engine already verified.
+pub const INFERENCE_VERIFIED_STATE_KEY: &str = "inference_verified_at_unix_ms";
+
+/// Engine state-file key recording the last inference probe attempt.
+pub const INFERENCE_PROBE_ATTEMPTED_STATE_KEY: &str = "inference_probe_attempted_at_unix_ms";
+
+/// Minimum gap between inference probes against a service that is still loading.
+///
+/// Only a *successful* probe latches, so without this a warming model would be
+/// re-probed by every readiness poll — and each attempt costs up to
+/// [`INFERENCE_PROBE_TIMEOUT`], which is the whole poll's latency. The
+/// supervisor ticks every few seconds and `services list` sits in front of a
+/// user, so the unthrottled cost lands exactly where it is most visible. The
+/// price of throttling is that readiness can be noticed up to this late.
+pub const INFERENCE_PROBE_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Merge `patch`'s top-level keys into the JSON object stored at `path`.
+///
+/// Creates the file (and its parent) when absent, and replaces a non-object
+/// document rather than failing — the caller is recording a fact about a live
+/// service, not validating an existing file.
+pub fn merge_json_state_file(path: &Path, patch: &serde_json::Value) -> Result<()> {
+    let mut value = fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !value.is_object() {
+        value = serde_json::json!({});
+    }
+    let object = value.as_object_mut().expect("object checked above");
+    if let Some(patch) = patch.as_object() {
+        for (key, patch_value) in patch {
+            object.insert(key.clone(), patch_value.clone());
+        }
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&value).context("failed to serialize service state")?,
+    )
+    .with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// Whether inference has been confirmed for a service, from its engine state
+/// file — probing at most once, and at most once per
+/// [`INFERENCE_PROBE_RETRY_INTERVAL`] while it is still loading.
+///
+/// Shared by the engine adapters so the latch and backoff bookkeeping has one
+/// implementation: the engines differ in how they decide a model is *listed*,
+/// but not in what confirming inference means.
+///
+/// The attempt is recorded before the probe runs, so a caller killed mid-probe
+/// still leaves the throttle in place instead of freeing the next poll to spend
+/// another full timeout.
+pub fn engine_state_inference_verified(
+    state_path: &Path,
+    state: Option<&serde_json::Value>,
+    endpoint_url: &str,
+    model_ref: &str,
+    endpoint_api_key: Option<&str>,
+) -> bool {
+    let state_u64 = |key: &str| {
+        state
+            .and_then(|value| value.get(key))
+            .and_then(serde_json::Value::as_u64)
+    };
+    if state_u64(INFERENCE_VERIFIED_STATE_KEY).is_some() {
+        return true;
+    }
+    if model_ref.trim().is_empty() {
+        return false;
+    }
+    let now = unix_time_millis() as u64;
+    if let Some(attempted_at) = state_u64(INFERENCE_PROBE_ATTEMPTED_STATE_KEY)
+        && now.saturating_sub(attempted_at) < INFERENCE_PROBE_RETRY_INTERVAL.as_millis() as u64
+    {
+        return false;
+    }
+    let _ = merge_json_state_file(
+        state_path,
+        &serde_json::json!({ INFERENCE_PROBE_ATTEMPTED_STATE_KEY: now }),
+    );
+    if !openai_chat_completion_probe(
+        endpoint_url,
+        model_ref,
+        endpoint_api_key,
+        INFERENCE_PROBE_TIMEOUT,
+    )
+    .unwrap_or(false)
+    {
+        return false;
+    }
+    let _ = merge_json_state_file(
+        state_path,
+        &serde_json::json!({ INFERENCE_VERIFIED_STATE_KEY: unix_time_millis() as u64 }),
+    );
+    true
+}
+
+/// The parts of an HTTP response a probe needs: the status code and the body.
+#[derive(Debug, Clone)]
+pub struct HttpResponseParts {
+    pub status: u16,
+    pub body: String,
+}
+
+fn http_status_code(status_line: &str) -> Option<u16> {
+    status_line.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Ask the endpoint for a single token and report whether it answered.
+///
+/// This is the readiness signal that `/v1/models` cannot give: an engine lists a
+/// model as soon as it accepts the name, which can be minutes before the weights
+/// are resident and the first chat request stops hanging.
+///
+/// "Answered" means a complete HTTP response with a status below 500, not a
+/// successful generation. A `4xx` still proves the inference path is up and the
+/// model is loaded — the request was understood and refused on its merits — while
+/// the failure this guards against is a hang, a dropped connection, or the `5xx`
+/// an engine returns while it is still warming up. Insisting on `200` with
+/// non-empty content would also wrongly fail a reasoning model, which can spend
+/// its whole (tiny) token budget before emitting any content.
+///
+/// The rule does mean a `404` reads as serving. That is harmless for the engines
+/// shipped today — both implement `/v1/chat/completions`, and a wrong key fails
+/// the model listing that gates this call — but an engine that does not expose an
+/// OpenAI-shaped chat route would need a different signal rather than this one.
+pub fn openai_chat_completion_probe(
+    endpoint_url: &str,
+    model_ref: &str,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<bool> {
+    let status = openai_chat_completion_status(endpoint_url, model_ref, endpoint_api_key, timeout)?;
+    Ok(status < 500)
+}
+
+/// Send the smallest possible chat request and return the HTTP status.
+///
+/// Callers pick their own bar. Readiness ([`openai_chat_completion_probe`]) only
+/// needs to know the inference path answers at all, while a post-load smoke test
+/// wants a real `200` — there, a `4xx` means the model that came up is not the
+/// one that was asked for, which is a failure worth surfacing rather than
+/// tolerating.
+pub fn openai_chat_completion_status(
+    endpoint_url: &str,
+    model_ref: &str,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<u16> {
+    let body = serde_json::json!({
+        "model": model_ref,
+        "messages": [{"role": "user", "content": "Say ok."}],
+        "max_tokens": 2,
+        "stream": false,
+    });
+    let response = http_post_json_with_auth(
+        endpoint_url,
+        "/v1/chat/completions",
+        &body,
+        endpoint_api_key,
+        timeout,
+    )?;
+    Ok(response.status)
 }
 
 pub fn openai_models_endpoint_has_model(
@@ -209,6 +803,96 @@ pub fn managed_service_endpoint_model_ready(
         None
     };
     openai_models_endpoint_has_model(&record.endpoint_url, expected, endpoint_api_key, timeout)
+}
+
+/// How far along a managed service's endpoint is.
+///
+/// The middle state is the one that matters: an engine lists a model within
+/// seconds of accepting its name, while the weights can take minutes to become
+/// usable. Callers must not treat `Listing` as ready — nor as dead, since the
+/// service is coming up normally and restarting it would start the wait over.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum EndpointReadiness {
+    /// Not answering at all: wrong port, process gone, or nothing bound yet.
+    Unreachable,
+    /// Answering and advertising the model, but inference has not come back.
+    Listing,
+    /// A real inference request has succeeded.
+    Serving,
+}
+
+/// The result of a readiness check, plus whether it left the record dirty.
+#[derive(Debug, Clone, Copy)]
+pub struct EndpointReadinessOutcome {
+    pub readiness: EndpointReadiness,
+    /// The check updated the record's probe bookkeeping. Persist it with
+    /// [`ManagedServiceRecord::write`] — the throttle in
+    /// [`managed_service_endpoint_readiness`] only works if the attempt survives
+    /// the process, since each CLI invocation starts fresh.
+    pub record_changed: bool,
+}
+
+/// How far along the service's endpoint is, probing inference at most once.
+///
+/// Stronger than [`managed_service_endpoint_model_ready`], which only asks
+/// whether the endpoint lists the model. A service reaches [`Serving`] once a
+/// real inference request has come back, and that verdict is **latched** into
+/// `record.inference_verified_at_unix_ms`: readiness is polled repeatedly (by
+/// `services list`, the dash, and the supervisor), and re-probing on every poll
+/// would queue a generation request behind the user's own traffic. The trade-off
+/// is that a service which degrades after start still reports ready — the same
+/// as before this check existed.
+///
+/// A *failed* probe cannot latch, so those are throttled instead: a still-loading
+/// service is re-probed at most once per [`INFERENCE_PROBE_RETRY_INTERVAL`],
+/// which keeps a warming model from costing every caller a full
+/// `probe_timeout`.
+///
+/// Mutates `record` when it probes; persist it when `record_changed` is set.
+///
+/// [`Serving`]: EndpointReadiness::Serving
+pub fn managed_service_endpoint_readiness(
+    record: &mut ManagedServiceRecord,
+    endpoint_api_key: Option<&str>,
+    listing_timeout: Duration,
+    probe_timeout: Duration,
+) -> EndpointReadinessOutcome {
+    let outcome = |readiness, record_changed| EndpointReadinessOutcome {
+        readiness,
+        record_changed,
+    };
+    let listed = managed_service_endpoint_model_ready(record, endpoint_api_key, listing_timeout)
+        .unwrap_or(false);
+    if !listed {
+        return outcome(EndpointReadiness::Unreachable, false);
+    }
+    if record.inference_verified_at_unix_ms.is_some() {
+        return outcome(EndpointReadiness::Serving, false);
+    }
+    let now = unix_time_millis() as u64;
+    if let Some(attempted_at) = record.inference_probe_attempted_at_unix_ms
+        && now.saturating_sub(attempted_at) < INFERENCE_PROBE_RETRY_INTERVAL.as_millis() as u64
+    {
+        return outcome(EndpointReadiness::Listing, false);
+    }
+    let model_ref = if record.canonical_model_id.trim().is_empty() {
+        record.model_ref.as_str()
+    } else {
+        record.canonical_model_id.as_str()
+    };
+    record.inference_probe_attempted_at_unix_ms = Some(now);
+    if !openai_chat_completion_probe(
+        &record.endpoint_url,
+        model_ref,
+        endpoint_api_key,
+        probe_timeout,
+    )
+    .unwrap_or(false)
+    {
+        return outcome(EndpointReadiness::Listing, true);
+    }
+    record.inference_verified_at_unix_ms = Some(unix_time_millis() as u64);
+    outcome(EndpointReadiness::Serving, true)
 }
 
 fn openai_loaded_model_ids(value: &serde_json::Value) -> Vec<String> {
@@ -288,8 +972,11 @@ pub fn connect_tcp_stream(host: &str, port: u16, timeout: Duration) -> Result<Tc
         .with_context(|| format!("failed to resolve {host}:{port}"))?
         .next()
         .with_context(|| format!("no socket addresses resolved for {host}:{port}"))?;
-    let stream =
-        TcpStream::connect(addr).with_context(|| format!("failed to connect to {host}:{port}"))?;
+    // Bound the connect as well as the reads: a probe against an engine that is
+    // pinned solid must fail within the caller's timeout, not sit in the OS
+    // default SYN retry window.
+    let stream = TcpStream::connect_timeout(&addr, timeout)
+        .with_context(|| format!("failed to connect to {host}:{port}"))?;
     stream.set_read_timeout(Some(timeout)).ok();
     stream.set_write_timeout(Some(timeout)).ok();
     Ok(stream)
@@ -307,6 +994,75 @@ pub fn read_tcp_stream_to_string(stream: &mut TcpStream) -> Result<String> {
         .read_to_string(&mut response)
         .context("failed to read TCP stream")?;
     Ok(response)
+}
+
+/// Read one HTTP response, bounded by a wall-clock deadline.
+///
+/// Two problems with reading to end-of-stream instead. A response is only
+/// complete at EOF if the peer actually closes: `Connection: close` asks for
+/// that, but nothing obliges a server or an intervening proxy to honor it, so a
+/// service that writes a perfectly good response and holds the socket open would
+/// stall until the read timeout and have its answer thrown away. And a socket
+/// read timeout bounds each `read` call, not the sequence of them, so a
+/// slow-drip responder could stretch the total wait to an arbitrary multiple of
+/// what the caller asked for. This returns as soon as the response is complete by
+/// its own framing, and never runs past `deadline` in total.
+fn read_http_response_bounded(stream: &mut TcpStream, deadline: Instant) -> Result<String> {
+    let mut response = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    while !http_response_is_complete(&response) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("timed out reading HTTP response");
+        }
+        stream.set_read_timeout(Some(remaining)).ok();
+        match stream.read(&mut chunk) {
+            // Peer closed: whatever arrived is the whole response.
+            Ok(0) => break,
+            Ok(read) => response.extend_from_slice(&chunk[..read]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                bail!("timed out reading HTTP response");
+            }
+            Err(error) => return Err(error).context("failed to read TCP stream"),
+        }
+    }
+    Ok(String::from_utf8_lossy(&response).into_owned())
+}
+
+/// Whether the bytes so far are a complete HTTP response by their own framing.
+///
+/// `false` for a response that declares neither a length nor chunked encoding —
+/// those are delimited by the connection closing, so the caller must keep reading
+/// until EOF.
+fn http_response_is_complete(response: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(response);
+    let Some((headers, body)) = text.split_once("\r\n\r\n") else {
+        return false;
+    };
+    let header_value = |name: &str| {
+        headers.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_owned())
+        })
+    };
+    if let Some(length) =
+        header_value("Content-Length").and_then(|value| value.parse::<usize>().ok())
+    {
+        return body.len() >= length;
+    }
+    if header_value("Transfer-Encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
+    {
+        return body.ends_with("0\r\n\r\n");
+    }
+    false
 }
 
 #[cfg(windows)]
@@ -840,7 +1596,7 @@ impl AppPaths {
 
     #[must_use]
     pub fn with_managed_root(mut self, root: impl Into<PathBuf>, keep_cache_dir: bool) -> Self {
-        self.data_dir = normalize_runtime_path_for_host(&root.into());
+        self.data_dir = managed_runtime_data_root(&root.into());
         if !keep_cache_dir {
             self.cache_dir = managed_runtime_cache_dir(&self.data_dir);
         }
@@ -1011,6 +1767,13 @@ pub struct ExamineSummary {
     pub distro: Option<String>,
     pub cpu: Option<String>,
     pub system_ram_gib: Option<f64>,
+    /// Whether *this* `rocm` process was given a terminal — not a property of
+    /// the machine, unlike every other field here.
+    ///
+    /// False whenever stdout is captured, which includes the dashboard running
+    /// `rocm examine` as a child process. That is why the same machine reports
+    /// `true` from a shell and `false` from the dashboard: both are correct.
+    /// See [`interactive_terminal`] for what it gates.
     pub interactive_terminal: bool,
     pub default_engine: String,
     pub detected_gfx_target: Option<String>,
@@ -1042,6 +1805,19 @@ pub struct LegacyRocmSummary {
     pub status: String,
     pub paths: Vec<PathBuf>,
     pub detail: Option<String>,
+    /// Version of the best-ranked detected install, when one could be read.
+    ///
+    /// The resolver establishes this already; without carrying it here the human
+    /// report named a path but never a version, so a machine with ROCm 7.14
+    /// installed could not tell you which ROCm it had.
+    ///
+    /// `None` when no install was found, or when one was found whose layout
+    /// declares no version anywhere.
+    ///
+    /// Optional and defaulted so the daemon's serialised snapshot
+    /// (`apps/rocmd/src/lib.rs`) written before this field existed still loads.
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1194,6 +1970,17 @@ impl ExamineSummary {
             .as_deref()
             .and_then(normalize_therock_family);
         let detected_therock_family = detect_managed_therock_family(&paths);
+        // Report the engine this GPU actually serves on, not the platform
+        // constant. `compatible_therock_family` is the right input: it is
+        // normalised from the real GPU, whereas `detected_therock_family`
+        // describes the installed managed runtime and is absent before one
+        // exists — which would silently downgrade the answer to the constant on
+        // a fresh machine.
+        let host_gpu = HostGpuSummary {
+            name: None,
+            gfx_target: detected_gfx_target.clone(),
+            therock_family: compatible_therock_family.clone(),
+        };
         Ok(Self {
             os: runtime_os_name().to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
@@ -1204,7 +1991,7 @@ impl ExamineSummary {
                 windows_inventory.as_ref(),
             ),
             interactive_terminal: interactive_terminal(),
-            default_engine: default_engine_for_platform().to_owned(),
+            default_engine: default_engine_for_host(&host_gpu).to_owned(),
             detected_gfx_target,
             compatible_therock_family,
             detected_therock_family,
@@ -1237,8 +2024,17 @@ impl ExamineSummary {
                 .join(", ")
         };
         let wsl = self.wsl.as_ref();
+        // Every other field here describes the MACHINE; this one describes the
+        // invocation, which is what made it ambiguous -- `true` from a terminal
+        // and `false` under the dashboard both look like claims about the host.
+        // Say which it is on the line itself, so pasted output explains itself.
+        let interactive_terminal = if self.interactive_terminal {
+            "true (this run has a terminal; the CLI may prompt)"
+        } else {
+            "false (this run's output is captured, so the CLI will not prompt)"
+        };
         format!(
-            "rocm examine\n  os: {}\n  arch: {}\n  kernel: {}\n  distro: {}\n  cpu: {}\n  system_ram: {}\n  interactive_terminal: {}\n  default_engine: {}\n  detected_gfx_target: {}\n  compatible_therock_family: {}\n  detected_therock_family: {}\n  driver_policy: {}\n  driver_status: {}\n  driver_detail: {}\n  legacy_rocm_status: {}\n  legacy_rocm_paths: {}\n  legacy_rocm_detail: {}\n  legacy_rocm_guidance: {}\n  wsl: {}\n  wsl_dxg_device: {}\n  wsl_dxcore: {}\n  wsl_librocdxg: {}\n  wsl_rocdxg_dids: {}\n  wsl_ldconfig_librocdxg: {}\n  wsl_global_rocminfo: {}\n  wsl_cargo: {}\n  wsl_detail: {}\n  managed_runtimes: {}\n  managed_services: {}\n  model_cache_entries: {}\n  config_dir: {}\n  data_dir: {}\n  cache_dir: {}\n",
+            "rocm examine\n  os: {}\n  arch: {}\n  kernel: {}\n  distro: {}\n  cpu: {}\n  system_ram: {}\n  interactive_terminal: {}\n  default_engine: {}\n  detected_gfx_target: {}\n  compatible_therock_family: {}\n  detected_therock_family: {}\n  driver_policy: {}\n  driver_status: {}\n  driver_detail: {}\n  legacy_rocm_status: {}\n  legacy_rocm_paths: {}\n  legacy_rocm_version: {}\n  legacy_rocm_detail: {}\n  legacy_rocm_guidance: {}\n  wsl: {}\n  wsl_dxg_device: {}\n  wsl_dxcore: {}\n  wsl_librocdxg: {}\n  wsl_rocdxg_dids: {}\n  wsl_ldconfig_librocdxg: {}\n  wsl_global_rocminfo: {}\n  wsl_cargo: {}\n  wsl_detail: {}\n  managed_runtimes: {}\n  managed_services: {}\n  model_cache_entries: {}\n  config_dir: {}\n  data_dir: {}\n  cache_dir: {}\n",
             self.os,
             self.arch,
             self.kernel.as_deref().unwrap_or("<unknown>"),
@@ -1246,7 +2042,7 @@ impl ExamineSummary {
             self.cpu.as_deref().unwrap_or("<unknown>"),
             self.system_ram_gib
                 .map_or_else(|| "<unknown>".to_owned(), format_gib_value),
-            self.interactive_terminal,
+            interactive_terminal,
             self.default_engine,
             self.detected_gfx_target.as_deref().unwrap_or("<unknown>"),
             self.compatible_therock_family
@@ -1260,6 +2056,7 @@ impl ExamineSummary {
             self.driver.detail.as_deref().unwrap_or("<unknown>"),
             self.legacy_rocm.status,
             legacy_paths,
+            self.legacy_rocm.version.as_deref().unwrap_or("<unknown>"),
             self.legacy_rocm.detail.as_deref().unwrap_or("<unknown>"),
             self.legacy_rocm_guidance(),
             wsl.is_some_and(|summary| summary.is_wsl),
@@ -1292,12 +2089,37 @@ impl ExamineSummary {
     }
 }
 
+/// Whether this process can hold an interactive exchange with a user.
+///
+/// Both streams must be a terminal: stdin so an answer can be read, stdout so
+/// the question is seen. Anything that captures either — a pipe, a CI step, the
+/// dashboard spawning `rocm` as a child — makes this false, and callers then
+/// skip the prompt rather than block on input nobody can supply.
+///
+/// A property of the invocation, not of the host. `rocm examine` reports it so a
+/// pasted report explains why prompts were skipped.
 pub fn interactive_terminal() -> bool {
     stdin().is_terminal() && stdout().is_terminal()
 }
 
 pub const fn default_engine_for_platform() -> &'static str {
     "lemonade"
+}
+
+/// The engine this host serves on by default, absent an explicit choice.
+///
+/// [`default_engine_for_platform`] alone answers "what does this OS fall back
+/// to", which is not the same question: on Instinct data-center parts serving
+/// goes through vLLM, and reporting the platform constant there contradicts what
+/// `serve` actually selects. Use this wherever the CLI *tells the user* what the
+/// default engine is; `default_engine_for_platform` remains correct as the
+/// last-resort fallback once GPU and recipe preferences have been exhausted.
+///
+/// A value the user configured still outranks this — callers that have a
+/// configured engine must prefer it, mirroring `select_serve_engine`.
+#[must_use]
+pub fn default_engine_for_host(summary: &HostGpuSummary) -> &'static str {
+    preferred_serve_engine_for_host_gpu_summary(summary).unwrap_or_else(default_engine_for_platform)
 }
 
 const VLLM_PREFERRED_THEROCK_FAMILIES: &[&str] = &["gfx906", "gfx908", "gfx90a"];
@@ -1478,17 +2300,46 @@ fn normalize_cpu_model(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Whether this host is WSL2 — the one answer, for every caller.
+///
+/// There were three of these, and they disagreed. The install summary asked for
+/// `/dev/dxg` or `microsoft` in `/proc/version`; the JSON probe asked for
+/// `microsoft` or `wsl` in `/proc/version`, or `$WSL_DISTRO_NAME`. So a host
+/// with `/dev/dxg` but a kernel string naming neither was WSL to one and not the
+/// other, and the same command could contradict itself between its two output
+/// forms. Worse, the e2e harness derives `is_wsl` for its whole expectation
+/// matrix by reading one of them.
+///
+/// This is the union of every signal any of them used: a false positive costs a
+/// route-out note, a false negative runs bare-metal driver checks against a
+/// platform that has no amdgpu module and reports nonsense.
+#[must_use]
+pub(crate) fn is_wsl_host() -> bool {
+    runtime_is_linux()
+        && wsl_signals_indicate_wsl(
+            Path::new("/dev/dxg").exists(),
+            std::env::var_os("WSL_DISTRO_NAME").is_some(),
+            &fs::read_to_string("/proc/version").unwrap_or_default(),
+        )
+}
+
+/// The predicate itself, separated from reading the machine so the union can be
+/// tested — including the two cases that used to split the old implementations.
+fn wsl_signals_indicate_wsl(dxg_device: bool, distro_name_set: bool, proc_version: &str) -> bool {
+    if dxg_device || distro_name_set {
+        return true;
+    }
+    let proc_version = proc_version.to_ascii_lowercase();
+    proc_version.contains("microsoft") || proc_version.contains("wsl")
+}
+
 fn detect_wsl_summary() -> Option<WslSummary> {
-    if !runtime_is_linux() {
+    if !runtime_is_linux() || !is_wsl_host() {
         return None;
     }
 
-    let proc_version = fs::read_to_string("/proc/version").unwrap_or_default();
     let dxg_device = Path::new("/dev/dxg").exists();
-    let is_wsl = dxg_device || proc_version.to_ascii_lowercase().contains("microsoft");
-    if !is_wsl {
-        return None;
-    }
+    let is_wsl = true;
 
     let dxcore = Path::new("/usr/lib/wsl/lib/libdxcore.so").exists();
     let librocdxg = Path::new("/opt/rocm/lib/librocdxg.so").exists();
@@ -1585,8 +2436,21 @@ fn detect_driver_summary() -> DriverSummary {
     }
 }
 
+impl WslSummary {
+    /// Whether the ROCDXG plumbing a GPU workload needs is actually in place.
+    ///
+    /// Extracted so `serve` can act on the same answer `examine` prints, rather
+    /// than reaching its own conclusion from a different source. That split is
+    /// what let `examine` report `wsl_rocdxg_ready` while `serve` refused on the
+    /// same machine for want of a GPU.
+    #[must_use]
+    pub const fn rocdxg_ready(&self) -> bool {
+        self.dxg_device && self.dxcore && self.librocdxg && self.ldconfig_librocdxg
+    }
+}
+
 fn wsl_driver_summary(wsl: &WslSummary) -> DriverSummary {
-    let ready = wsl.dxg_device && wsl.dxcore && wsl.librocdxg && wsl.ldconfig_librocdxg;
+    let ready = wsl.rocdxg_ready();
     let status = if ready {
         "wsl_rocdxg_ready"
     } else if wsl.dxg_device && wsl.dxcore {
@@ -1613,28 +2477,224 @@ fn windows_driver_summary(detail: Option<String>) -> DriverSummary {
     }
 }
 
-fn detect_legacy_rocm_summary() -> LegacyRocmSummary {
-    let mut paths = Vec::new();
-    let mut candidates = Vec::new();
+/// Directories that hold conventional unmanaged ROCm install roots on Linux.
+///
+/// Each is searched for both the unversioned `rocm` root and the versioned
+/// `rocm-X.Y[.Z]` siblings that a side-by-side install produces.
+const LINUX_ROCM_SEARCH_DIRS: &[&str] = &["/opt", "/usr/local"];
 
-    if let Some(path) = std::env::var_os("ROCM_PATH") {
-        candidates.push(PathBuf::from(path));
-    }
+/// Directories the Windows HIP SDK installer writes into.
+///
+/// Each is an install root in its own right and also the parent of versioned
+/// installs — see [`RocmLayout::Children`].
+const WINDOWS_ROCM_SEARCH_DIRS: &[&str] = &[r"C:\Program Files\AMD\ROCm", r"C:\Program Files\ROCm"];
 
-    if runtime_is_windows() {
-        candidates.push(PathBuf::from(r"C:\Program Files\AMD\ROCm"));
-        candidates.push(PathBuf::from(r"C:\Program Files\ROCm"));
+/// How versioned installs are arranged under a search directory.
+///
+/// The two platforms disagree, so the resolver has to be told which shape it is
+/// walking rather than assuming one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RocmLayout {
+    /// `<dir>/rocm` alongside `rocm-X.Y[.Z]` siblings, e.g. `/opt/rocm` and
+    /// `/opt/rocm-6.4.1`.
+    Siblings,
+    /// `<dir>` itself, with versions as bare `X.Y[.Z]` children, e.g.
+    /// `C:\Program Files\AMD\ROCm` and `C:\Program Files\AMD\ROCm\6.4`.
+    Children,
+}
+
+/// An unmanaged ("legacy") ROCm install root found on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RocmInstall {
+    pub(crate) path: PathBuf,
+    pub(crate) version: Option<String>,
+}
+
+/// Every unmanaged ROCm install on this host, best candidate first.
+///
+/// Supplies the platform's search roots, layout, and `$ROCM_PATH` to
+/// [`discover_rocm_installs_in_layout`].
+pub(crate) fn discover_rocm_installs() -> Vec<RocmInstall> {
+    let env_override = std::env::var_os("ROCM_PATH").map(PathBuf::from);
+    let (dirs, layout) = if runtime_is_windows() {
+        (WINDOWS_ROCM_SEARCH_DIRS, RocmLayout::Children)
     } else {
-        candidates.push(PathBuf::from("/opt/rocm"));
-        candidates.push(PathBuf::from("/usr/local/rocm"));
+        (LINUX_ROCM_SEARCH_DIRS, RocmLayout::Siblings)
+    };
+    let search_dirs: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
+    discover_rocm_installs_in_layout(&search_dirs, env_override.as_deref(), layout)
+}
+
+/// [`discover_rocm_installs_in_layout`] for the Linux sibling layout.
+///
+/// Production callers go through [`discover_rocm_installs`], which picks the
+/// layout for the host; this spares the sibling-layout tests from restating it.
+#[cfg(test)]
+pub(crate) fn discover_rocm_installs_in(
+    search_dirs: &[PathBuf],
+    env_override: Option<&Path>,
+) -> Vec<RocmInstall> {
+    discover_rocm_installs_in_layout(search_dirs, env_override, RocmLayout::Siblings)
+}
+
+/// Rank the ROCm installs reachable from `search_dirs`, best candidate first.
+///
+/// Precedence, highest first:
+///
+/// 1. `env_override` (`$ROCM_PATH`) — an install the user named explicitly wins
+///    over anything found by convention.
+/// 2. The conventional active root, which is what lands on `PATH` and in the
+///    linker cache on a normal install: `<dir>/rocm` under [`RocmLayout::Siblings`],
+///    or `<dir>` itself under [`RocmLayout::Children`].
+/// 3. Versioned installs, newest first.
+///
+/// Versions are ordered by numeric component, not lexically, so `6.10` beats
+/// `6.2` — on both layouts. Candidates are deduplicated by canonical path, so
+/// the common `/opt/rocm -> /opt/rocm-6.4.1` symlink yields one install rather
+/// than two.
+pub(crate) fn discover_rocm_installs_in_layout(
+    search_dirs: &[PathBuf],
+    env_override: Option<&Path>,
+    layout: RocmLayout,
+) -> Vec<RocmInstall> {
+    let mut found: Vec<RocmInstall> = Vec::new();
+    let mut seen: Vec<PathBuf> = Vec::new();
+
+    if let Some(path) = env_override {
+        push_rocm_candidate(path.to_path_buf(), &mut found, &mut seen);
     }
 
-    for candidate in candidates {
-        if legacy_rocm_candidate_exists(&candidate) && !paths.iter().any(|path| path == &candidate)
-        {
-            paths.push(candidate);
+    for dir in search_dirs {
+        let root = match layout {
+            RocmLayout::Siblings => dir.join("rocm"),
+            RocmLayout::Children => dir.clone(),
+        };
+        push_rocm_candidate(root, &mut found, &mut seen);
+    }
+
+    for dir in search_dirs {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        let version_of = |path: &Path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| versioned_dir_version(name, layout))
+        };
+        let mut versioned: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| version_of(path).is_some())
+            .collect();
+        // Newest first, by numeric version component.
+        versioned.sort_by(|a, b| {
+            let key = |path: &Path| {
+                version_of(path)
+                    .map(|version| rocm_version_sort_key(&version))
+                    .unwrap_or_default()
+            };
+            key(b).cmp(&key(a))
+        });
+        for candidate in versioned {
+            push_rocm_candidate(candidate, &mut found, &mut seen);
         }
     }
+
+    found
+}
+
+/// Record `candidate` as an install when it looks like one and is not already
+/// recorded under another name (a symlink to a root already seen).
+fn push_rocm_candidate(candidate: PathBuf, found: &mut Vec<RocmInstall>, seen: &mut Vec<PathBuf>) {
+    if !legacy_rocm_candidate_exists(&candidate) {
+        return;
+    }
+    let key = fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+    if seen.contains(&key) {
+        return;
+    }
+    seen.push(key);
+    let version = rocm_install_version(&candidate);
+    found.push(RocmInstall {
+        path: candidate,
+        version,
+    });
+}
+
+/// The ROCm version an install root reports, if it reports one.
+///
+/// Prefers the `.info/version*` files the packaged installs ship, and falls
+/// back to the version embedded in the resolved directory name — either a
+/// `rocm-X.Y[.Z]` root (or the symlink pointing at one) or the bare `X.Y` the
+/// Windows installer uses.
+pub(crate) fn rocm_install_version(root: &Path) -> Option<String> {
+    for name in ["version", "version-utils", "version-libs"] {
+        let file = root.join(".info").join(name);
+        if let Ok(text) = fs::read_to_string(&file) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_owned());
+            }
+        }
+    }
+    // Only the final component: an ancestor directory may itself contain
+    // "rocm-" (a checkout, a home directory) and must not be mistaken for the
+    // install's version. Canonicalizing first resolves `/opt/rocm` to the
+    // `rocm-X.Y.Z` it points at.
+    let resolved = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let name = resolved.file_name().and_then(|name| name.to_str())?;
+    extract_rocm_version(name).or_else(|| bare_version(name))
+}
+
+/// The version a directory *name* advertises, for the given layout, or `None`
+/// when the name is not a versioned install directory at all.
+///
+/// The two layouts name their versioned directories differently: Linux uses
+/// `rocm-6.4.1` siblings, while the Windows installer uses a bare `6.4` under
+/// its ROCm root. Matching the wrong shape is not harmless — accepting a bare
+/// number on Linux would sweep in unrelated `/opt` and `/usr/local` entries.
+fn versioned_dir_version(name: &str, layout: RocmLayout) -> Option<String> {
+    match layout {
+        RocmLayout::Siblings => extract_rocm_version(name),
+        RocmLayout::Children => bare_version(name),
+    }
+}
+
+/// `X.Y[.Z]` when `name` is exactly a dotted numeric version, else `None`.
+///
+/// Requires at least one dot so a lone number cannot pass, and every component
+/// to be numeric so a directory such as `6.4-beta` or `docs` is rejected.
+fn bare_version(name: &str) -> Option<String> {
+    let mut parts = name.split('.');
+    let mut count = 0;
+    for part in &mut parts {
+        if part.is_empty() || !part.chars().all(|ch| ch.is_ascii_digit()) {
+            return None;
+        }
+        count += 1;
+    }
+    (count >= 2).then(|| name.to_owned())
+}
+
+/// Sort key that orders ROCm versions numerically: `6.10` outranks `6.2`.
+fn rocm_version_sort_key(version: &str) -> Vec<u32> {
+    version
+        .split('.')
+        .map(|part| part.parse::<u32>().unwrap_or(0))
+        .collect()
+}
+
+fn detect_legacy_rocm_summary() -> LegacyRocmSummary {
+    // One resolver on both platforms, so the human report, the JSON probe and
+    // the fix-6 runner cannot disagree about which installs exist or which one
+    // is active. `discover_rocm_installs` picks the search roots and layout for
+    // the host.
+    let installs = discover_rocm_installs();
+    // The resolver ranks best-first, so the leading install's version is the one
+    // that describes this machine. Keeping it costs nothing here and is the
+    // difference between naming a path and naming the ROCm the user has.
+    let version = installs.first().and_then(|install| install.version.clone());
+    let paths: Vec<PathBuf> = installs.into_iter().map(|install| install.path).collect();
 
     let status = if paths.is_empty() {
         "not_detected"
@@ -1651,6 +2711,7 @@ fn detect_legacy_rocm_summary() -> LegacyRocmSummary {
         status: status.to_owned(),
         paths,
         detail,
+        version,
     }
 }
 
@@ -3548,7 +4609,7 @@ fn marketing_name_contains(normalized_name: &str, pattern: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn detect_linux_sysfs_gfx_target() -> Option<String> {
+pub(crate) fn detect_linux_sysfs_gfx_target() -> Option<String> {
     if !runtime_is_linux() {
         return None;
     }
@@ -3557,24 +4618,58 @@ fn detect_linux_sysfs_gfx_target() -> Option<String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-const fn detect_linux_sysfs_gfx_target() -> Option<String> {
+pub(crate) const fn detect_linux_sysfs_gfx_target() -> Option<String> {
     None
 }
 
 #[cfg(target_os = "linux")]
 fn detect_linux_kfd_gfx_target() -> Option<String> {
-    let nodes_dir = Path::new("/sys/class/kfd/kfd/topology/nodes");
-    let entries = fs::read_dir(nodes_dir).ok()?;
-    for entry in entries.flatten() {
-        let Some(value) = fs::read_to_string(entry.path().join("gfx_target_version")).ok() else {
-            continue;
-        };
-        let Some(token) = parse_linux_kfd_gfx_target(value.trim()) else {
-            continue;
-        };
-        return Some(token);
-    }
-    None
+    detect_kfd_gfx_target_in(Path::new("/sys/class/kfd/kfd/topology/nodes"))
+}
+
+/// The KFD-topology read, against a caller-supplied nodes directory.
+///
+/// Split out so it can be driven against a planted directory: the hosts where
+/// this matters most (an Instinct box with no `lspci`) are exactly the ones a
+/// test cannot run on. Same seam as `discover_rocm_installs_in`.
+///
+/// Gated the same way as `parse_linux_kfd_gfx_target`, which it calls: present
+/// on Linux and under `cfg(test)` everywhere, so the tests run on every platform
+/// without the function existing in a Windows release build that can never use
+/// it. (`target_os` alone would have left the tests Linux-only; `test` alone
+/// would not compile on Windows CI, which is how this was found.)
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn detect_kfd_gfx_target_in(nodes_dir: &Path) -> Option<String> {
+    let mut targets: Vec<(String, String)> = fs::read_dir(nodes_dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let value = fs::read_to_string(entry.path().join("gfx_target_version")).ok()?;
+            let token = parse_linux_kfd_gfx_target(value.trim())?;
+            Some((entry.file_name().to_string_lossy().into_owned(), token))
+        })
+        .collect();
+    // `read_dir` order is filesystem-defined, so a multi-node box could report a
+    // different GPU run to run. Node names are `node0`, `node1`, ...; sorting by
+    // name makes the answer stable and picks the lowest-numbered node, which is
+    // the one HIP ordinal 0 refers to.
+    targets.sort_by_key(|(name, _)| natural_node_order(name));
+    targets.into_iter().next().map(|(_, token)| token)
+}
+
+/// Sort key for a KFD node directory name: its trailing number when it has one,
+/// so `node9` precedes `node10` rather than following it lexicographically.
+#[cfg(any(target_os = "linux", test))]
+fn natural_node_order(name: &str) -> (u64, String) {
+    let digits: String = name
+        .chars()
+        .skip_while(|ch| !ch.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
+        .collect();
+    (
+        digits.parse::<u64>().unwrap_or(u64::MAX),
+        name.to_ascii_lowercase(),
+    )
 }
 
 /// AMD GPU device ordinals usable for a GPU-required launch on this host, after
@@ -3603,6 +4698,23 @@ pub fn has_usable_amd_gpu() -> bool {
 
 #[cfg(target_os = "linux")]
 fn probe_usable_amd_gpu_indices() -> Option<Vec<u32>> {
+    // WSL2 reaches the GPU through /dev/dxg and the Windows host driver. It has
+    // no KFD topology and no amdgpu DRM card, and `linux_kfd_gpu_node_count`
+    // reads "topology unreadable AND no /dev/kfd" as an authoritative zero
+    // rather than as unknown -- which is exactly the WSL2 shape. So a machine
+    // whose `examine` said `wsl_rocdxg_ready` was refused a GPU-required launch
+    // for having none.
+    //
+    // Answer from the plumbing that platform actually uses, so `serve` and
+    // `examine` cannot contradict each other in either direction: ready means a
+    // device, not-ready means none, and both match what the report prints.
+    if is_wsl_host() {
+        let ready = detect_wsl_summary().is_some_and(|wsl| wsl.rocdxg_ready());
+        // One device: WSL2 exposes no per-device topology to enumerate, and the
+        // visibility mask still applies on top so an explicit
+        // HIP_VISIBLE_DEVICES="" is honoured.
+        return usable_amd_gpu_indices_from(usize::from(ready), visibility_mask_from_env());
+    }
     let present =
         combine_amd_gpu_counts(linux_kfd_gpu_node_count(), linux_drm_amdgpu_card_count())?;
     usable_amd_gpu_indices_from(present, visibility_mask_from_env())
@@ -3747,15 +4859,21 @@ fn parse_linux_kfd_gfx_target(value: &str) -> Option<String> {
     }
     match digits.len() {
         3 | 4 => Some(format!("gfx{digits}")),
+        // A 5/6-digit value is KFD's *packed* version (major·10000 + minor·100 +
+        // step), not a target name, so there is no `gfx{digits}` fallback here.
+        // Fabricating one from a version that failed to decode fed
+        // `gfx90010`-shaped tokens into `normalize_therock_family`, where the
+        // loose `gfx90` arm mapped them to a plausible-looking but wrong family.
+        // Yielding `None` instead lets detection try the next KFD node and then
+        // `ip_discovery`, and otherwise report the target as unknown — which is
+        // recoverable with `--family`, where a wrong family silently installs
+        // the wrong runtime wheel.
         5 | 6 => {
             let raw: u32 = digits.parse().ok()?;
             let major = raw / 10_000;
             let minor = (raw / 100) % 100;
             let revision = raw % 100;
-            if let Some(token) = gfx_target_from_gc_version(major, minor, revision) {
-                return Some(token);
-            }
-            Some(format!("gfx{digits}"))
+            gfx_target_from_gc_version(major, minor, revision)
         }
         _ => None,
     }
@@ -3835,11 +4953,36 @@ fn detect_ip_discovery_gc_target(ip_discovery_dir: &Path) -> Option<String> {
 }
 
 #[cfg(any(target_os = "linux", test))]
+/// Render gfx target *components* as an LLVM target token.
+///
+/// The token is `gfx` + major in decimal + minor and revision as **single hex
+/// digits** — the `a` in `gfx90a` is revision `10`. Concatenating the components
+/// as decimal agrees with hex only while every component is below 10, so it
+/// silently produced `gfx9010` for gfx90a hardware (MI210/MI250), which then
+/// normalized to the wrong TheRock family.
+///
+/// **The caller owns whether its numbers are target components at all.** KFD's
+/// `gfx_target_version` packs exactly this triple, so decoding it and calling
+/// here is sound. A GC (Graphics Core) IP version is a *different* quantity that
+/// merely coincides with the target on many parts: it does not on the GC 9.4.x
+/// line, where GC 9.4.0/9.4.1/9.4.2/9.4.3 are gfx906/gfx908/gfx90a/gfx942. So
+/// [`detect_ip_discovery_gc_target`] can still yield a wrong-but-plausible token
+/// for those parts — pre-existing, unchanged by the hex encoding, and not
+/// something this function can detect, since the components it receives are
+/// well-formed either way.
+///
+/// A minor or revision that cannot be a single hex digit does not describe any
+/// gfx target, so it yields `None` rather than a fabricated token: the caller
+/// tries the next detection source and otherwise reports the target as unknown,
+/// which is recoverable with `--family`, where a fabricated one silently
+/// installs the wrong runtime wheel. `major` is only checked for zero — it is
+/// printed in decimal and has no single-digit bound (`gfx1030`, `gfx1250`), so
+/// an implausible major still concatenates into a token.
 fn gfx_target_from_gc_version(major: u32, minor: u32, revision: u32) -> Option<String> {
-    if major == 0 {
+    if major == 0 || minor > 0xf || revision > 0xf {
         return None;
     }
-    Some(format!("gfx{major}{minor}{revision}"))
+    Some(format!("gfx{major}{minor:x}{revision:x}"))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
@@ -5773,11 +6916,33 @@ pub struct ManagedServiceRecord {
     pub restart_count: u32,
     #[serde(default)]
     pub last_restart_unix_ms: Option<u128>,
+    /// When a stop was requested but could not confirm that every recorded
+    /// process died. It records *intent*: the operator asked for this service to
+    /// go away, so once the processes are observed gone the endpoint key may be
+    /// dropped. A service that merely crashed carries no such intent and keeps
+    /// its key, so it stays restartable/recoverable. Cleared on a confirmed stop
+    /// and on a successful respawn. `None` on records written before this field
+    /// existed, which is the safe default (keep the key).
+    #[serde(default)]
+    pub stop_requested_unix_ms: Option<u128>,
+    /// When the last inference probe was attempted. Throttles re-probing of a
+    /// service that is listed but still loading — see
+    /// [`INFERENCE_PROBE_RETRY_INTERVAL`]. Absent on records written before
+    /// readiness was gated on inference.
+    #[serde(default)]
+    pub inference_probe_attempted_at_unix_ms: Option<u64>,
     /// Coarse startup stage (`downloading`/`loading`/`warmup`) parsed from the
     /// serve process's own log output while it is coming up. Set to `None` once
     /// the service reaches `ready`, and absent on older on-disk records.
     #[serde(default)]
     pub startup_phase: Option<String>,
+    /// When a real inference request first succeeded against this service. Once
+    /// set, readiness checks stop re-probing and fall back to the cheap endpoint
+    /// query — see [`managed_service_endpoint_readiness`]. Adopted from the
+    /// engine state file when present, and absent on records written before
+    /// readiness was gated on inference.
+    #[serde(default)]
+    pub inference_verified_at_unix_ms: Option<u64>,
     pub manifest_path: PathBuf,
     pub log_path: PathBuf,
     pub engine_state_path: PathBuf,
@@ -5827,12 +6992,32 @@ impl ManagedServiceRecord {
             engine_recipe_json: None,
             restart_count: 0,
             last_restart_unix_ms: None,
+            stop_requested_unix_ms: None,
             startup_phase: None,
+            inference_verified_at_unix_ms: None,
+            inference_probe_attempted_at_unix_ms: None,
             manifest_path,
             log_path,
             engine_state_path,
             created_at_unix_ms: unix_time_millis(),
         }
+    }
+
+    /// Drop the per-run state that a restart invalidates, and count the restart.
+    ///
+    /// A restart reuses this manifest but spawns a different server with an
+    /// unloaded model, so anything describing the previous run has to go. Chiefly
+    /// the inference verification: left set, it short-circuits readiness straight
+    /// back to "ready" as soon as the new server lists the model, reinstating the
+    /// false positive the probe exists to prevent. The engine's own state file is
+    /// rewritten from scratch on restart, so only this copy needs clearing — and
+    /// [`Self::refresh_from_engine_state`] only ever adopts a verification, never
+    /// clears one, so a stale value here would survive indefinitely.
+    pub fn reset_for_restart(&mut self) {
+        self.inference_verified_at_unix_ms = None;
+        self.inference_probe_attempted_at_unix_ms = None;
+        self.restart_count = self.restart_count.saturating_add(1);
+        self.last_restart_unix_ms = Some(unix_time_millis());
     }
 
     pub fn normalize_paths_for_host(&mut self) {
@@ -5906,6 +7091,15 @@ impl ManagedServiceRecord {
         {
             self.engine_pid = Some(pid);
             self.engine_start_ticks = state.get(ticks_key).and_then(serde_json::Value::as_u64);
+        }
+        // Adopt the engine's inference verification so the CLI side does not
+        // re-probe a service the engine healthcheck already confirmed.
+        if self.inference_verified_at_unix_ms.is_none()
+            && let Some(verified_at) = state
+                .get(INFERENCE_VERIFIED_STATE_KEY)
+                .and_then(serde_json::Value::as_u64)
+        {
+            self.inference_verified_at_unix_ms = Some(verified_at);
         }
         Ok(self.status != previous)
     }
@@ -6443,15 +7637,13 @@ mod tests {
         Ok(())
     }
 
-    // EAI-7333: the service healthcheck marks a model "ready" purely from
-    // `/v1/models` listing it (via `openai_models_endpoint_has_model`), without
-    // verifying inference. This test pins that gap: a server that lists the model
-    // on `/v1/models` but is NOT able to serve `/v1/chat/completions` still
-    // reports the model as present. The readiness signal is therefore a false
-    // positive for inference-readiness — a caller must additionally probe
-    // inference before treating a service as usable. When EAI-7333 is fixed
-    // (readiness gated on an inference probe, not just `/v1/models`), the
-    // healthcheck path should no longer rely on this signal alone.
+    // Why readiness is gated on an inference probe (EAI-7333): a server that
+    // lists the model on `/v1/models` but cannot yet serve
+    // `/v1/chat/completions` still reports the model as present. This test pins
+    // that `openai_models_endpoint_has_model` alone is a false positive for
+    // inference-readiness, which is why callers must additionally probe
+    // inference — see `openai_chat_completion_probe` and
+    // `managed_service_endpoint_readiness`.
     #[test]
     fn models_endpoint_readiness_does_not_imply_inference_ready() -> Result<()> {
         // A server that answers `/v1/models` with the model listed, but would
@@ -6493,6 +7685,879 @@ mod tests {
         // models response and closed, so a chat request would not succeed.
         // Readiness based on this signal alone is a false positive (EAI-7333).
         server.join().expect("server thread should not panic")?;
+        Ok(())
+    }
+
+    /// Serve `count` canned HTTP responses on a loopback port, returning the port
+    /// and a handle yielding the requests that were received. Each response is
+    /// `(status_line, body)`; a `None` response accepts the connection and never
+    /// answers, standing in for an engine that hangs.
+    fn spawn_canned_http_server(
+        responses: Vec<Option<(&'static str, &'static str)>>,
+    ) -> Result<(u16, std::thread::JoinHandle<Result<Vec<String>>>)> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let handle = std::thread::spawn(move || -> Result<Vec<String>> {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut request_bytes = Vec::new();
+                let mut buffer = [0_u8; 512];
+                while let Ok(read) = stream.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    request_bytes.extend_from_slice(&buffer[..read]);
+                    let text = String::from_utf8_lossy(&request_bytes);
+                    // Requests with a body (POST) are complete once the declared
+                    // content length has arrived after the header terminator.
+                    if let Some((headers, body)) = text.split_once("\r\n\r\n") {
+                        let declared = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("Content-Length: ")?.trim().parse().ok()
+                            })
+                            .unwrap_or(0_usize);
+                        if body.len() >= declared {
+                            break;
+                        }
+                    }
+                }
+                requests.push(String::from_utf8_lossy(&request_bytes).into_owned());
+                let Some((status_line, body)) = response else {
+                    // Hang: hold the connection open without answering until the
+                    // client's read timeout fires, then drop it.
+                    std::thread::sleep(Duration::from_millis(1500));
+                    continue;
+                };
+                write!(
+                    stream,
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )?;
+            }
+            Ok(requests)
+        });
+        Ok((port, handle))
+    }
+
+    /// How a scripted download server answers one request.
+    #[derive(Clone, Copy)]
+    enum DownloadReply {
+        /// The whole body with a matching `Content-Length`.
+        Complete,
+        /// Declare the full length, send only `sent` bytes, then close —
+        /// an interrupted transfer.
+        Truncated {
+            sent: usize,
+        },
+        /// Honour `Range` and serve the remainder as `206`.
+        Resume,
+        /// Answer `206` but from `start` regardless of what `Range` asked for,
+        /// as a non-compliant server or a broken caching proxy might.
+        ResumeAtWrongOffset {
+            start: usize,
+        },
+        /// Ignore `Range` and answer `200` with the whole body, as a server
+        /// without range support does.
+        IgnoreRange,
+        Status(&'static str),
+    }
+
+    /// Serve `body` over loopback, answering each request per `replies`.
+    /// Returns the port and a handle yielding the raw requests received.
+    fn spawn_download_server(
+        body: Vec<u8>,
+        replies: Vec<DownloadReply>,
+    ) -> Result<(u16, std::thread::JoinHandle<Result<Vec<String>>>)> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let handle = std::thread::spawn(move || -> Result<Vec<String>> {
+            let mut requests = Vec::new();
+            for reply in replies {
+                let (mut stream, _) = listener.accept()?;
+                // An accepted socket inherits the listener's mode on Windows,
+                // where a non-blocking read fails with `WSAEWOULDBLOCK` instead
+                // of waiting. Be explicit rather than rely on the platform.
+                stream.set_nonblocking(false)?;
+                stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                let mut request_bytes = Vec::new();
+                let mut buffer = [0_u8; 512];
+                while let Ok(read) = stream.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    request_bytes.extend_from_slice(&buffer[..read]);
+                    if request_bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request_bytes).into_owned();
+                let range_start = request
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Range: bytes="))
+                    .and_then(|value| value.trim().split('-').next()?.parse::<usize>().ok())
+                    .unwrap_or(0);
+                requests.push(request);
+                let total = body.len();
+                match reply {
+                    DownloadReply::Complete | DownloadReply::IgnoreRange => {
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
+                        )?;
+                        stream.write_all(&body)?;
+                    }
+                    DownloadReply::Truncated { sent } => {
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
+                        )?;
+                        stream.write_all(&body[..sent.min(total)])?;
+                    }
+                    DownloadReply::Resume => {
+                        let start = range_start.min(total);
+                        write!(
+                            stream,
+                            "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            total.saturating_sub(1),
+                            total - start
+                        )?;
+                        stream.write_all(&body[start..])?;
+                    }
+                    DownloadReply::ResumeAtWrongOffset { start } => {
+                        let start = start.min(total);
+                        write!(
+                            stream,
+                            "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            total.saturating_sub(1),
+                            total - start
+                        )?;
+                        stream.write_all(&body[start..])?;
+                    }
+                    DownloadReply::Status(status_line) => {
+                        write!(
+                            stream,
+                            "{status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )?;
+                    }
+                }
+                stream.flush()?;
+            }
+            Ok(requests)
+        });
+        Ok((port, handle))
+    }
+
+    /// A body large enough to span many `DOWNLOAD_CHUNK_BYTES` reads, so the
+    /// streaming loop is genuinely exercised rather than fitting in one chunk.
+    fn download_body() -> Vec<u8> {
+        (0..DOWNLOAD_CHUNK_BYTES * 3 + 1234)
+            .map(|index| (index % 251) as u8)
+            .collect()
+    }
+
+    fn download_scratch(tag: &str) -> PathBuf {
+        let dir = workspace_test_artifact_dir().join(format!(
+            "download-{tag}-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("failed to create scratch dir");
+        dir
+    }
+
+    #[test]
+    fn download_streams_a_large_body_and_reports_its_digest() -> Result<()> {
+        let body = download_body();
+        let (port, server) = spawn_download_server(body.clone(), vec![DownloadReply::Complete])?;
+        let dir = download_scratch("complete");
+        let destination = dir.join("artifact.bin");
+
+        let outcome = download_file_streaming(&DownloadRequest::new(
+            &format!("http://127.0.0.1:{port}/artifact.bin"),
+            &destination,
+            Duration::from_secs(10),
+        ))?;
+
+        let written = fs::read(&destination)?;
+        let expected_digest = format!("{:x}", Sha256::digest(&body));
+        server.join().expect("server thread")?;
+        let leftovers: Vec<_> = fs::read_dir(&dir)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .filter(|name| name.to_string_lossy().contains(".part"))
+            .collect();
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(written, body, "the saved file must match the served bytes");
+        assert_eq!(outcome.bytes_written, body.len() as u64);
+        assert_eq!(outcome.sha256, expected_digest);
+        assert!(leftovers.is_empty(), "the .part file must not survive");
+        Ok(())
+    }
+
+    #[test]
+    fn download_interrupted_beyond_recovery_leaves_no_destination_file() -> Result<()> {
+        // Every attempt ends early, so the download never completes and the
+        // user is left with the truncation as the reported reason.
+        let body = download_body();
+        let (port, server) = spawn_download_server(
+            body,
+            vec![DownloadReply::Truncated { sent: 4096 }; DOWNLOAD_MAX_ATTEMPTS as usize],
+        )?;
+        let dir = download_scratch("interrupted");
+        let destination = dir.join("artifact.bin");
+
+        let error = download_file_streaming(&DownloadRequest::new(
+            &format!("http://127.0.0.1:{port}/artifact.bin"),
+            &destination,
+            Duration::from_secs(5),
+        ))
+        .expect_err("a download that never completes must fail");
+
+        let requests = server.join().expect("server thread")?;
+        let entries: Vec<_> = fs::read_dir(&dir)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .collect();
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            requests.len(),
+            DOWNLOAD_MAX_ATTEMPTS as usize,
+            "a truncated transfer is transient, so every attempt should be spent"
+        );
+        assert!(
+            !destination.exists(),
+            "a partial download must never appear at the destination, where a \
+             later run would treat it as a complete cached artifact"
+        );
+        assert!(
+            entries.is_empty(),
+            "the .part file must be cleaned up, found {entries:?}"
+        );
+        assert!(
+            error.to_string().contains("incomplete download"),
+            "the user should be told the transfer was short: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn download_resumes_from_where_the_transfer_stopped() -> Result<()> {
+        let body = download_body();
+        let (port, server) = spawn_download_server(
+            body.clone(),
+            vec![
+                DownloadReply::Truncated { sent: 5000 },
+                DownloadReply::Resume,
+            ],
+        )?;
+        let dir = download_scratch("resume");
+        let destination = dir.join("artifact.bin");
+
+        let outcome = download_file_streaming(&DownloadRequest::new(
+            &format!("http://127.0.0.1:{port}/artifact.bin"),
+            &destination,
+            Duration::from_secs(10),
+        ))?;
+
+        let written = fs::read(&destination)?;
+        let requests = server.join().expect("server thread")?;
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            written, body,
+            "a resumed download must reconstruct the artifact exactly"
+        );
+        assert_eq!(
+            outcome.sha256,
+            format!("{:x}", Sha256::digest(&body)),
+            "the digest must cover the resumed prefix too, not just the second attempt"
+        );
+        assert_eq!(requests.len(), 2, "one retry, not a full restart");
+        assert!(
+            requests[1].contains("Range: bytes=5000-"),
+            "the retry must ask to continue from byte 5000: {}",
+            requests[1]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn download_restarts_cleanly_when_resume_lands_at_the_wrong_offset() -> Result<()> {
+        // The second reply answers `206` from byte 8000, not the byte 5000 we
+        // asked to resume from. Accepting that slice's own `Content-Length` as
+        // the whole artifact would silently rename a corrupt file into place;
+        // instead the third attempt must be a plain `GET` that refetches the
+        // whole thing.
+        let body = download_body();
+        let (port, server) = spawn_download_server(
+            body.clone(),
+            vec![
+                DownloadReply::Truncated { sent: 5000 },
+                DownloadReply::ResumeAtWrongOffset { start: 8000 },
+                DownloadReply::Complete,
+            ],
+        )?;
+        let dir = download_scratch("wrong-offset");
+        let destination = dir.join("artifact.bin");
+
+        let outcome = download_file_streaming(&DownloadRequest::new(
+            &format!("http://127.0.0.1:{port}/artifact.bin"),
+            &destination,
+            Duration::from_secs(10),
+        ))?;
+
+        let written = fs::read(&destination)?;
+        let requests = server.join().expect("server thread")?;
+        let leftovers: Vec<_> = fs::read_dir(&dir)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .filter(|name| name.to_string_lossy().contains(".part"))
+            .collect();
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            written, body,
+            "a mismatched-offset resume must not be accepted as a complete artifact"
+        );
+        assert_eq!(
+            outcome.sha256,
+            format!("{:x}", Sha256::digest(&body)),
+            "the digest must cover the whole artifact from the clean restart"
+        );
+        assert_eq!(
+            requests.len(),
+            3,
+            "the wrong-offset reply must be discarded and retried, not accepted"
+        );
+        assert!(
+            !requests[2].contains("Range:"),
+            "the restart after a wrong-offset resume must be a plain GET: {}",
+            requests[2]
+        );
+        assert!(leftovers.is_empty(), "the .part file must not survive");
+        Ok(())
+    }
+
+    #[test]
+    fn download_restarts_cleanly_when_the_server_ignores_range() -> Result<()> {
+        // A server without range support answers 200 with the whole body.
+        // Appending that onto the bytes already written would double the file.
+        let body = download_body();
+        let (port, server) = spawn_download_server(
+            body.clone(),
+            vec![
+                DownloadReply::Truncated { sent: 3000 },
+                DownloadReply::IgnoreRange,
+            ],
+        )?;
+        let dir = download_scratch("ignore-range");
+        let destination = dir.join("artifact.bin");
+
+        download_file_streaming(&DownloadRequest::new(
+            &format!("http://127.0.0.1:{port}/artifact.bin"),
+            &destination,
+            Duration::from_secs(10),
+        ))?;
+
+        let written = fs::read(&destination)?;
+        server.join().expect("server thread")?;
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(written, body, "the restart must not append onto the prefix");
+        Ok(())
+    }
+
+    #[test]
+    fn download_rejects_a_digest_mismatch_without_retrying() -> Result<()> {
+        let body = download_body();
+        let (port, server) = spawn_download_server(body, vec![DownloadReply::Complete])?;
+        let dir = download_scratch("digest");
+        let destination = dir.join("artifact.bin");
+        let url = format!("http://127.0.0.1:{port}/artifact.bin");
+        let wrong_digest = "a".repeat(64);
+        let mut request = DownloadRequest::new(&url, &destination, Duration::from_secs(10));
+        request.expected_sha256 = Some(&wrong_digest);
+
+        let error = download_file_streaming(&request).expect_err("wrong digest must fail");
+
+        let requests = server.join().expect("server thread")?;
+        let leftovers = fs::read_dir(&dir)?.count();
+        fs::remove_dir_all(&dir).ok();
+
+        assert!(error.to_string().contains("SHA-256 mismatch"), "{error}");
+        assert!(!destination.exists());
+        assert_eq!(
+            requests.len(),
+            1,
+            "corrupt bytes are not a transient failure; retrying would re-fetch the same thing"
+        );
+        assert_eq!(leftovers, 0, "the corrupt prefix must be discarded");
+        Ok(())
+    }
+
+    #[test]
+    fn download_does_not_retry_a_client_error() -> Result<()> {
+        let body = download_body();
+        let (port, server) =
+            spawn_download_server(body, vec![DownloadReply::Status("HTTP/1.1 404 Not Found")])?;
+        let dir = download_scratch("not-found");
+        let destination = dir.join("artifact.bin");
+
+        let error = download_file_streaming(&DownloadRequest::new(
+            &format!("http://127.0.0.1:{port}/artifact.bin"),
+            &destination,
+            Duration::from_secs(5),
+        ))
+        .expect_err("404 must fail");
+
+        let requests = server.join().expect("server thread")?;
+        fs::remove_dir_all(&dir).ok();
+
+        assert!(error.to_string().contains("404"), "{error}");
+        assert_eq!(requests.len(), 1, "a 404 will not become a 200 on retry");
+        Ok(())
+    }
+
+    #[test]
+    fn download_refuses_a_body_over_the_approved_limit() -> Result<()> {
+        let body = download_body();
+        let total = body.len() as u64;
+        let (port, server) = spawn_download_server(body, vec![DownloadReply::Complete])?;
+        let dir = download_scratch("max-bytes");
+        let destination = dir.join("artifact.bin");
+        let url = format!("http://127.0.0.1:{port}/artifact.bin");
+        let mut request = DownloadRequest::new(&url, &destination, Duration::from_secs(5));
+        request.max_bytes = Some(total - 1);
+
+        let error = download_file_streaming(&request).expect_err("over-limit must fail");
+
+        server.join().expect("server thread")?;
+        fs::remove_dir_all(&dir).ok();
+
+        assert!(error.to_string().contains("approved limit"), "{error}");
+        assert!(!destination.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn download_enforces_a_caller_declared_size_the_server_agrees_with() -> Result<()> {
+        // The server sends a complete, self-consistent body — it just is not
+        // the artifact the manifest described. A digest would catch this too,
+        // but the size contract is independent and must hold on its own.
+        let body = download_body();
+        let (port, server) = spawn_download_server(body.clone(), vec![DownloadReply::Complete])?;
+        let dir = download_scratch("expected-len");
+        let destination = dir.join("artifact.bin");
+        let url = format!("http://127.0.0.1:{port}/artifact.bin");
+        let mut request = DownloadRequest::new(&url, &destination, Duration::from_secs(10));
+        request.expected_len = Some(body.len() as u64 + 1);
+
+        let error = download_file_streaming(&request).expect_err("wrong size must fail");
+
+        let requests = server.join().expect("server thread")?;
+        fs::remove_dir_all(&dir).ok();
+
+        assert!(error.to_string().contains("were expected"), "{error}");
+        assert!(!destination.exists());
+        assert_eq!(
+            requests.len(),
+            1,
+            "a manifest disagreement will not resolve itself on retry"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn download_backoff_grows_then_settles_at_its_ceiling() {
+        let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_millis(800), 2);
+        let delays: Vec<u128> = (0..5).map(|_| backoff.next_delay().as_millis()).collect();
+        assert_eq!(delays, vec![100, 200, 400, 800, 800]);
+    }
+
+    const CHAT_OK_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#;
+    const MODELS_OK_BODY: &str = r#"{"data":[{"id":"Qwen/Qwen3-0.6B"}]}"#;
+
+    #[test]
+    fn chat_completion_probe_passes_when_the_endpoint_answers() -> Result<()> {
+        let (port, server) =
+            spawn_canned_http_server(vec![Some(("HTTP/1.1 200 OK", CHAT_OK_BODY))])?;
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        assert!(openai_chat_completion_probe(
+            &endpoint,
+            "Qwen/Qwen3-0.6B",
+            None,
+            Duration::from_secs(2)
+        )?);
+
+        let requests = server.join().expect("server thread should not panic")?;
+        let request = requests.first().expect("the probe sends one request");
+        assert!(
+            request.starts_with("POST /v1/chat/completions HTTP/1.1"),
+            "probe must exercise the inference path, got: {request}"
+        );
+        assert!(
+            request.contains("\"model\":\"Qwen/Qwen3-0.6B\"") && request.contains("\"max_tokens\""),
+            "probe asks the served model for a token-capped completion, got: {request}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn chat_completion_probe_separates_a_refusal_from_a_warmup_failure() -> Result<()> {
+        // A refusal proves the inference path is up and the model is resident:
+        // the request was understood and rejected on its merits. A 5xx is what an
+        // engine returns while it is still warming up, which is not ready.
+        let (port, server) = spawn_canned_http_server(vec![
+            Some(("HTTP/1.1 400 Bad Request", r#"{"error":"unsupported"}"#)),
+            Some((
+                "HTTP/1.1 503 Service Unavailable",
+                r#"{"error":"loading model"}"#,
+            )),
+        ])?;
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        assert!(openai_chat_completion_probe(
+            &endpoint,
+            "qwen",
+            None,
+            Duration::from_secs(2)
+        )?);
+        assert!(!openai_chat_completion_probe(
+            &endpoint,
+            "qwen",
+            None,
+            Duration::from_secs(2)
+        )?);
+
+        server.join().expect("server thread should not panic")?;
+        Ok(())
+    }
+
+    #[test]
+    fn chat_completion_probe_accepts_a_response_from_a_server_that_holds_the_socket() -> Result<()>
+    {
+        // `Connection: close` is a request, not a guarantee — a server or an
+        // intervening proxy may answer in full and keep the socket open. Reading
+        // to EOF would stall until the timeout and throw the answer away, leaving
+        // a perfectly healthy service stuck reporting "not ready".
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let body = CHAT_OK_BODY;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )?;
+            stream.flush()?;
+            // Hold the connection open past the probe's timeout.
+            std::thread::sleep(Duration::from_secs(3));
+            Ok(())
+        });
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        let started = Instant::now();
+        assert!(
+            openai_chat_completion_probe(&endpoint, "qwen", None, Duration::from_secs(2))?,
+            "a complete response counts even when the peer keeps the socket open"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the framed response is complete, so the probe must not wait for EOF"
+        );
+
+        server.join().expect("server thread should not panic")?;
+        Ok(())
+    }
+
+    #[test]
+    fn http_read_is_bounded_across_reads_not_just_per_read() -> Result<()> {
+        // A socket read timeout bounds each `read`, not the sequence of them. A
+        // server that dribbles bytes forever, each within the per-read timeout,
+        // must still hit the caller's overall budget.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            // Never declares a length and never finishes: one byte at a time,
+            // comfortably inside any per-read timeout.
+            for _ in 0..200 {
+                if stream.write_all(b"x").is_err() || stream.flush().is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(())
+        });
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        let started = Instant::now();
+        assert!(
+            openai_chat_completion_probe(&endpoint, "qwen", None, Duration::from_millis(500))
+                .is_err(),
+            "a response that never completes is not a passing probe"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the call must honor its own budget, not a multiple of it: took {:?}",
+            started.elapsed()
+        );
+
+        let _ = server.join();
+        Ok(())
+    }
+
+    #[test]
+    fn chat_completion_probe_fails_on_a_hung_endpoint() -> Result<()> {
+        // The reported symptom: the endpoint accepts the connection and never
+        // answers. The probe must give up within its timeout, not wait forever.
+        let (port, server) = spawn_canned_http_server(vec![None])?;
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        let started = Instant::now();
+        assert!(
+            openai_chat_completion_probe(&endpoint, "qwen", None, Duration::from_millis(300))
+                .is_err(),
+            "a hung endpoint is not inference-ready"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the probe must be bounded by its timeout"
+        );
+
+        server.join().expect("server thread should not panic")?;
+        Ok(())
+    }
+
+    fn probe_test_record(port: u16) -> ManagedServiceRecord {
+        let root = PathBuf::from("/tmp/rocm-inference-probe-test");
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        ManagedServiceRecord::new(
+            &paths,
+            "svc-probe",
+            "vllm",
+            "Qwen/Qwen3-0.6B",
+            "Qwen/Qwen3-0.6B",
+            "127.0.0.1",
+            port,
+            "serve",
+            4242,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn inference_readiness_latches_after_the_first_successful_probe() -> Result<()> {
+        // First check: list the model, then probe inference. Second check: the
+        // verdict is latched, so only the cheap listing is re-issued — repeated
+        // `services list` polls must not queue generation work behind real
+        // traffic.
+        let (port, server) = spawn_canned_http_server(vec![
+            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
+            Some(("HTTP/1.1 200 OK", CHAT_OK_BODY)),
+            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
+        ])?;
+        let mut record = probe_test_record(port);
+
+        assert_eq!(
+            managed_service_endpoint_readiness(
+                &mut record,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(2)
+            )
+            .readiness,
+            EndpointReadiness::Serving
+        );
+        assert!(
+            record.inference_verified_at_unix_ms.is_some(),
+            "a passing probe is recorded so later checks can skip it"
+        );
+
+        assert_eq!(
+            managed_service_endpoint_readiness(
+                &mut record,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(2)
+            )
+            .readiness,
+            EndpointReadiness::Serving
+        );
+
+        let requests = server.join().expect("server thread should not panic")?;
+        let paths: Vec<&str> = requests
+            .iter()
+            .filter_map(|request| request.lines().next())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "GET /v1/models HTTP/1.1",
+                "POST /v1/chat/completions HTTP/1.1",
+                "GET /v1/models HTTP/1.1",
+            ],
+            "the second readiness check must not re-probe inference"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_warming_service_is_not_re_probed_on_every_poll() -> Result<()> {
+        // Only a successful probe latches, so a model that is listed but still
+        // loading would otherwise be re-probed by every poll — and each attempt
+        // costs the full probe timeout, paid by `services list` and the dash in
+        // front of a user. The second check must cost a listing and nothing more.
+        let (port, server) = spawn_canned_http_server(vec![
+            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
+            Some((
+                "HTTP/1.1 503 Service Unavailable",
+                r#"{"error":"loading model"}"#,
+            )),
+            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
+        ])?;
+        let mut record = probe_test_record(port);
+
+        let first = managed_service_endpoint_readiness(
+            &mut record,
+            None,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        );
+        assert_eq!(first.readiness, EndpointReadiness::Listing);
+        assert!(
+            first.record_changed && record.inference_probe_attempted_at_unix_ms.is_some(),
+            "the attempt must be recorded, and persisted by the caller — each CLI \
+             run is a fresh process, so an unwritten attempt throttles nothing"
+        );
+
+        let second = managed_service_endpoint_readiness(
+            &mut record,
+            None,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        );
+        assert_eq!(second.readiness, EndpointReadiness::Listing);
+        assert!(!second.record_changed);
+
+        let requests = server.join().expect("server thread should not panic")?;
+        let paths: Vec<&str> = requests
+            .iter()
+            .filter_map(|request| request.lines().next())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "GET /v1/models HTTP/1.1",
+                "POST /v1/chat/completions HTTP/1.1",
+                "GET /v1/models HTTP/1.1",
+            ],
+            "the second check must not re-probe inside the retry interval"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn restarting_drops_the_previous_runs_inference_verification() {
+        // The restarted child is a different server with an unloaded model. If the
+        // verification carried over, readiness would short-circuit to "ready" the
+        // moment the new server listed the model — the original false positive,
+        // reinstated. `refresh_from_engine_state` only ever adopts a verification,
+        // so nothing downstream would clear it.
+        let mut record = probe_test_record(11435);
+        record.inference_verified_at_unix_ms = Some(1);
+        record.inference_probe_attempted_at_unix_ms = Some(1);
+        record.restart_count = 2;
+
+        record.reset_for_restart();
+
+        assert_eq!(record.inference_verified_at_unix_ms, None);
+        assert_eq!(
+            record.inference_probe_attempted_at_unix_ms, None,
+            "the retry throttle is per-run too; the new child deserves an              immediate first probe"
+        );
+        assert_eq!(record.restart_count, 3);
+        assert!(record.last_restart_unix_ms.is_some());
+    }
+
+    #[test]
+    fn inference_readiness_is_withheld_while_the_model_only_lists() -> Result<()> {
+        // The bug: `/v1/models` answers within seconds while the model loads for
+        // minutes and inference returns nothing. That service is not ready.
+        let (port, server) = spawn_canned_http_server(vec![
+            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
+            Some((
+                "HTTP/1.1 503 Service Unavailable",
+                r#"{"error":"loading model"}"#,
+            )),
+        ])?;
+        let mut record = probe_test_record(port);
+
+        assert_eq!(
+            managed_service_endpoint_readiness(
+                &mut record,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(2)
+            )
+            .readiness,
+            EndpointReadiness::Listing,
+            "a listed-but-unservable model is coming up, not dead"
+        );
+        assert!(
+            record.inference_verified_at_unix_ms.is_none(),
+            "nothing is latched until inference actually succeeds"
+        );
+
+        server.join().expect("server thread should not panic")?;
+        Ok(())
+    }
+
+    #[test]
+    fn inference_probe_sends_the_service_key_to_a_protected_endpoint() -> Result<()> {
+        let (port, server) = spawn_canned_http_server(vec![
+            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
+            Some(("HTTP/1.1 200 OK", CHAT_OK_BODY)),
+        ])?;
+        let mut record = probe_test_record(port);
+
+        assert_eq!(
+            managed_service_endpoint_readiness(
+                &mut record,
+                Some("test-key"),
+                Duration::from_secs(2),
+                Duration::from_secs(2)
+            )
+            .readiness,
+            EndpointReadiness::Serving
+        );
+
+        let requests = server.join().expect("server thread should not panic")?;
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.contains("Authorization: Bearer test-key")),
+            "a protected service must not read as unready for want of its own key"
+        );
         Ok(())
     }
 
@@ -6584,6 +8649,79 @@ mod tests {
         } else {
             assert_eq!(preferred, Some("vllm"));
         }
+    }
+
+    #[test]
+    fn host_default_engine_is_vllm_on_instinct() {
+        // What `rocm examine` and `rocm engines list` report on an MI300X. The
+        // platform constant said "lemonade" here while serve picked vLLM, so the
+        // reported default contradicted the actual behaviour.
+        let summary = HostGpuSummary {
+            name: Some("AMD Instinct MI300X".to_owned()),
+            gfx_target: Some("gfx942".to_owned()),
+            therock_family: Some("gfx94X-dcgpu".to_owned()),
+        };
+        if cfg!(windows) {
+            assert_eq!(default_engine_for_host(&summary), "lemonade");
+        } else {
+            assert_eq!(default_engine_for_host(&summary), "vllm");
+        }
+    }
+
+    #[test]
+    fn host_default_engine_covers_every_vllm_preferred_family() {
+        // Guards the whole preferred set, not just the dcgpu branch, so adding a
+        // family to VLLM_PREFERRED_THEROCK_FAMILIES cannot leave the reported
+        // default behind.
+        for family in VLLM_PREFERRED_THEROCK_FAMILIES {
+            let summary = HostGpuSummary {
+                name: None,
+                gfx_target: Some((*family).to_owned()),
+                therock_family: Some((*family).to_owned()),
+            };
+            let expected = if cfg!(windows) { "lemonade" } else { "vllm" };
+            assert_eq!(
+                default_engine_for_host(&summary),
+                expected,
+                "unexpected default for {family}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_default_engine_is_lemonade_without_a_vllm_preference() {
+        // Strix Halo (gfx1151), a consumer family, and a machine whose GPU has not
+        // been identified at all must all keep the platform default.
+        for summary in [
+            HostGpuSummary {
+                name: Some("AMD Radeon 8060S".to_owned()),
+                gfx_target: Some("gfx1151".to_owned()),
+                therock_family: Some("gfx1151".to_owned()),
+            },
+            HostGpuSummary {
+                name: Some("AMD Radeon".to_owned()),
+                gfx_target: Some("gfx1100".to_owned()),
+                therock_family: Some("gfx110X-all".to_owned()),
+            },
+            HostGpuSummary::default(),
+        ] {
+            assert_eq!(default_engine_for_host(&summary), "lemonade");
+        }
+    }
+
+    #[test]
+    fn host_default_engine_never_reports_vllm_on_native_windows() {
+        // The vLLM adapter bails on native Windows, so no GPU may talk the
+        // reported default into vLLM there — including an Instinct part.
+        if !cfg!(windows) {
+            return;
+        }
+        let summary = HostGpuSummary {
+            name: Some("AMD Instinct MI300X".to_owned()),
+            gfx_target: Some("gfx942".to_owned()),
+            therock_family: Some("gfx94X-dcgpu".to_owned()),
+        };
+        assert_eq!(default_engine_for_host(&summary), "lemonade");
     }
 
     #[test]
@@ -6891,6 +9029,42 @@ Class Name:                Display
             gfx_target_from_gc_version(11, 0, 3),
             Some("gfx1103".to_owned())
         );
+        // Two digits of major stay decimal.
+        assert_eq!(
+            gfx_target_from_gc_version(12, 5, 0),
+            Some("gfx1250".to_owned())
+        );
+    }
+
+    #[test]
+    fn gc_version_encodes_components_above_nine_as_hex_digits() {
+        // GC 9.0.10 is gfx90a (MI210/MI250), not "gfx9010": minor and revision
+        // are single hex digits. Decimal concatenation agreed with hex only
+        // while every component stayed below 10.
+        assert_eq!(
+            gfx_target_from_gc_version(9, 0, 10),
+            Some("gfx90a".to_owned())
+        );
+        assert_eq!(
+            gfx_target_from_gc_version(9, 4, 12),
+            Some("gfx94c".to_owned())
+        );
+
+        // A component that is not a single hex digit describes no gfx target,
+        // so detection falls through rather than acting on a fabricated one.
+        assert_eq!(gfx_target_from_gc_version(12, 16, 0), None);
+        assert_eq!(gfx_target_from_gc_version(12, 0, 16), None);
+        assert_eq!(gfx_target_from_gc_version(0, 0, 1), None);
+    }
+
+    #[test]
+    fn gfx90a_gc_version_normalizes_to_its_own_therock_family() {
+        // The point of the fix, end to end: "gfx9010" missed every specific arm
+        // of `normalize_therock_family` and fell through to the loose `gfx90`
+        // one, yielding "gfx90X-dcgpu" — the wrong runtime wheel, and outside
+        // `VLLM_PREFERRED_THEROCK_FAMILIES`, so engine selection changed too.
+        let target = gfx_target_from_gc_version(9, 0, 10).expect("gfx90a target");
+        assert_eq!(normalize_therock_family(&target), Some("gfx90a".to_owned()));
     }
 
     #[test]
@@ -6907,6 +9081,15 @@ Class Name:                Display
             parse_linux_kfd_gfx_target("gfx1103"),
             Some("gfx1103".to_owned())
         );
+        // KFD packs gfx90a as 9·10000 + 0·100 + 10.
+        assert_eq!(
+            parse_linux_kfd_gfx_target("90010"),
+            Some("gfx90a".to_owned())
+        );
+        // A packed version whose components are not single hex digits is not a
+        // target; it must not be passed through as `gfx{digits}`, which used to
+        // normalize to a plausible-looking but wrong family.
+        assert_eq!(parse_linux_kfd_gfx_target("121600"), None);
         assert_eq!(parse_linux_kfd_gfx_target("not-a-target"), None);
     }
 
@@ -6928,6 +9111,25 @@ Class Name:                Display
             detect_ip_discovery_gc_target(&root.join("ip_discovery")),
             Some("gfx1103".to_owned())
         );
+
+        // KNOWN WRONG, and pinned so the gap stays visible: on the GC 9.4.x line
+        // the GC IP version is not the LLVM target. Aldebaran (MI200/MI250)
+        // reports GC 9.4.2 here but is gfx90a, so this path yields MI300's target
+        // instead and resolves to the wrong TheRock family — the right wheel for
+        // this host is `gfx90a`. Pre-existing: the decimal encoding produced
+        // `gfx942` for 9/4/2 too, so the hex fix neither caused nor closes it.
+        // Fixing it needs a GC-IP-version → target table for GC 9.4.x
+        // (9.4.0/9.4.1/9.4.3 are gfx906/gfx908/gfx942), not a different encoding.
+        fs::write(gc.join("major"), "9")?;
+        fs::write(gc.join("minor"), "4")?;
+        fs::write(gc.join("revision"), "2")?;
+        let aldebaran = detect_ip_discovery_gc_target(&root.join("ip_discovery"));
+        assert_eq!(aldebaran, Some("gfx942".to_owned()));
+        assert_eq!(
+            normalize_therock_family(&aldebaran.expect("target")),
+            Some("gfx94X-dcgpu".to_owned())
+        );
+
         fs::remove_dir_all(root).ok();
         Ok(())
     }
@@ -7237,6 +9439,7 @@ Class Name:                Display
                 status: "detected_unmanaged".to_owned(),
                 paths: vec![PathBuf::from("C:\\Program Files\\AMD\\ROCm")],
                 detail: Some("legacy install".to_owned()),
+                version: Some("6.4.1".to_owned()),
             },
             wsl: None,
             managed_runtime_count: 2,
@@ -7267,6 +9470,63 @@ Class Name:                Display
     }
 
     #[test]
+    fn examine_render_explains_what_interactive_terminal_means() {
+        // The same machine reports `true` from a shell and `false` under the
+        // dashboard, because the field describes the invocation rather than the
+        // host. Both are correct, and the line has to say so on its own — a
+        // pasted report is usually all a reader gets.
+        let mut summary = ExamineSummary {
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            kernel: None,
+            distro: None,
+            cpu: None,
+            system_ram_gib: None,
+            interactive_terminal: true,
+            default_engine: "vllm".to_owned(),
+            detected_gfx_target: None,
+            compatible_therock_family: None,
+            detected_therock_family: None,
+            driver: DriverSummary {
+                policy: "linux_official_amd_dkms_wrapper".to_owned(),
+                status: "amdgpu_available".to_owned(),
+                detail: None,
+            },
+            legacy_rocm: LegacyRocmSummary {
+                status: "not_detected".to_owned(),
+                paths: Vec::new(),
+                detail: None,
+                version: None,
+            },
+            wsl: None,
+            managed_runtime_count: 0,
+            managed_service_count: 0,
+            model_cache_entries: 0,
+            config_dir: PathBuf::from("config"),
+            data_dir: PathBuf::from("data"),
+            cache_dir: PathBuf::from("cache"),
+        };
+
+        let interactive = summary.render_text();
+        assert!(
+            interactive.contains("interactive_terminal: true (this run has a terminal"),
+            "the true case must say it is about this run:\n{interactive}"
+        );
+
+        summary.interactive_terminal = false;
+        let captured = summary.render_text();
+        assert!(
+            captured.contains("interactive_terminal: false (this run's output is captured"),
+            "the false case must explain why, not just report it:\n{captured}"
+        );
+        // The reason it matters to the reader: it is why they saw no prompt.
+        assert!(
+            captured.contains("will not prompt"),
+            "the false case must connect to the visible consequence:\n{captured}"
+        );
+    }
+
+    #[test]
     fn examine_render_guides_managed_runtime_install_when_only_legacy_rocm_exists() {
         let summary = ExamineSummary {
             os: "linux".to_owned(),
@@ -7289,6 +9549,7 @@ Class Name:                Display
                 status: "detected_unmanaged".to_owned(),
                 paths: vec![PathBuf::from("/opt/rocm")],
                 detail: Some("legacy install".to_owned()),
+                version: Some("7.14.0".to_owned()),
             },
             wsl: None,
             managed_runtime_count: 0,
@@ -7345,6 +9606,304 @@ Class Name:                Display
         fs::create_dir_all(rocm.join("bin"))?;
         fs::write(rocm.join("bin").join("rocminfo"), "")?;
         assert!(legacy_rocm_candidate_exists(&rocm));
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    /// Plant a directory that `legacy_rocm_candidate_exists` accepts as a real
+    /// install, optionally shipping the `.info/version` a packaged install has.
+    fn fake_rocm_install(root: &Path, info_version: Option<&str>) -> Result<()> {
+        fs::create_dir_all(root.join("bin"))?;
+        fs::write(root.join("bin").join("rocminfo"), "")?;
+        if let Some(version) = info_version {
+            fs::create_dir_all(root.join(".info"))?;
+            fs::write(root.join(".info").join("version"), version)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn discovers_versioned_rocm_install_without_a_default_root() -> Result<()> {
+        // A box whose only ROCm lives at /opt/rocm-6.4.1: before the shared
+        // resolver this reported nothing at all, which silently disabled the
+        // structural scoring in fix-3, fix-6 and fix-8.
+        let (root, _) = temp_app_paths("rocm-versioned-only");
+        let opt = root.join("opt");
+        fake_rocm_install(&opt.join("rocm-6.4.1"), None)?;
+
+        let found = discover_rocm_installs_in(std::slice::from_ref(&opt), None);
+
+        assert_eq!(found.len(), 1, "expected exactly one install: {found:?}");
+        assert_eq!(found[0].path, opt.join("rocm-6.4.1"));
+        assert_eq!(
+            found[0].version.as_deref(),
+            Some("6.4.1"),
+            "version must fall back to the directory name"
+        );
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn newest_rocm_install_is_chosen_numerically_not_lexically() -> Result<()> {
+        // 6.10 outranks 6.2. A lexicographic sort -- the bug still live in the
+        // Windows scans -- would pick 6.2 here.
+        let (root, _) = temp_app_paths("rocm-newest");
+        let opt = root.join("opt");
+        fake_rocm_install(&opt.join("rocm-6.2.0"), None)?;
+        fake_rocm_install(&opt.join("rocm-6.10.0"), None)?;
+
+        let found = discover_rocm_installs_in(std::slice::from_ref(&opt), None);
+
+        assert_eq!(
+            found.len(),
+            2,
+            "both installs should be reported: {found:?}"
+        );
+        assert_eq!(
+            found[0].path,
+            opt.join("rocm-6.10.0"),
+            "6.10 must outrank 6.2"
+        );
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn explicitly_selected_rocm_install_outranks_the_default_root() -> Result<()> {
+        // $ROCM_PATH is the user naming an install; it must beat the
+        // conventional root, which is the precedence examine had inverted.
+        let (root, _) = temp_app_paths("rocm-env-override");
+        let opt = root.join("opt");
+        fake_rocm_install(&opt.join("rocm"), None)?;
+        let chosen = root.join("elsewhere").join("rocm-6.4.1");
+        fake_rocm_install(&chosen, None)?;
+
+        let found = discover_rocm_installs_in(&[opt], Some(&chosen));
+
+        assert_eq!(found[0].path, chosen);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn conventional_rocm_root_outranks_versioned_siblings() -> Result<()> {
+        // Guards the claim that versioned support is purely additive: on a
+        // conventional box the answer must not change.
+        let (root, _) = temp_app_paths("rocm-conventional");
+        let opt = root.join("opt");
+        fake_rocm_install(&opt.join("rocm"), None)?;
+        fake_rocm_install(&opt.join("rocm-6.2.0"), None)?;
+
+        let found = discover_rocm_installs_in(std::slice::from_ref(&opt), None);
+
+        assert_eq!(found[0].path, opt.join("rocm"));
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_default_root_symlinked_to_a_versioned_one_is_reported_once() -> Result<()> {
+        // The common packaged layout: /opt/rocm -> /opt/rocm-6.4.1. One
+        // install, reported once, carrying the version from the target.
+        let (root, _) = temp_app_paths("rocm-symlink");
+        let opt = root.join("opt");
+        let versioned = opt.join("rocm-6.4.1");
+        fake_rocm_install(&versioned, None)?;
+        std::os::unix::fs::symlink(&versioned, opt.join("rocm"))?;
+
+        let found = discover_rocm_installs_in(std::slice::from_ref(&opt), None);
+
+        assert_eq!(
+            found.len(),
+            1,
+            "symlink and target are one install: {found:?}"
+        );
+        assert_eq!(found[0].path, opt.join("rocm"));
+        assert_eq!(found[0].version.as_deref(), Some("6.4.1"));
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn a_host_without_rocm_reports_no_installs() -> Result<()> {
+        let (root, _) = temp_app_paths("rocm-absent");
+        let opt = root.join("opt");
+        fs::create_dir_all(opt.join("rocm-6.4.1"))?; // no marker files
+        fs::create_dir_all(&opt)?;
+
+        assert!(discover_rocm_installs_in(&[opt], None).is_empty());
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn kfd_topology_names_the_gpu_when_no_tooling_is_installed() -> Result<()> {
+        // The MI300X case. `Examination` enumerates GPUs by shelling out to
+        // lspci and rocminfo; where neither is reachable it reported no AMD GPU
+        // on a machine that has one, while the human report -- which reads this
+        // topology instead -- named the target correctly. Planted here because
+        // the hosts where it matters are the ones a test cannot run on.
+        let (root, _) = temp_app_paths("kfd-topology");
+        let nodes = root.join("nodes");
+        fs::create_dir_all(nodes.join("node0"))?;
+        fs::write(nodes.join("node0").join("gfx_target_version"), "90402\n")?;
+
+        let found = detect_kfd_gfx_target_in(&nodes);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(found.as_deref(), Some("gfx942"));
+        Ok(())
+    }
+
+    #[test]
+    fn kfd_topology_answer_does_not_depend_on_directory_order() -> Result<()> {
+        // `read_dir` order is filesystem-defined, so a multi-node box could name
+        // a different GPU run to run. node9 must not beat node10 lexically
+        // either -- the lowest-numbered node is the one HIP ordinal 0 means.
+        let (root, _) = temp_app_paths("kfd-topology-order");
+        let nodes = root.join("nodes");
+        for (node, version) in [("node10", "110100"), ("node9", "90402"), ("node0", "90400")] {
+            fs::create_dir_all(nodes.join(node))?;
+            fs::write(nodes.join(node).join("gfx_target_version"), version)?;
+        }
+
+        let found = detect_kfd_gfx_target_in(&nodes);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(found.as_deref(), Some("gfx940"));
+        Ok(())
+    }
+
+    #[test]
+    fn kfd_topology_skips_nodes_that_name_no_target() -> Result<()> {
+        // A CPU node carries a zero version. Reporting `gfx0` off the first
+        // directory encountered would be worse than reporting nothing.
+        let (root, _) = temp_app_paths("kfd-topology-cpu-node");
+        let nodes = root.join("nodes");
+        fs::create_dir_all(nodes.join("node0"))?;
+        fs::write(nodes.join("node0").join("gfx_target_version"), "0\n")?;
+        fs::create_dir_all(nodes.join("node1"))?;
+        fs::write(nodes.join("node1").join("gfx_target_version"), "110000\n")?;
+
+        let found = detect_kfd_gfx_target_in(&nodes);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(found.as_deref(), Some("gfx1100"));
+        Ok(())
+    }
+
+    #[test]
+    fn absent_kfd_topology_names_nothing_rather_than_guessing() {
+        let missing = workspace_test_artifact_dir().join("rocm-core-kfd-absent-nodes");
+        fs::remove_dir_all(&missing).ok();
+        assert_eq!(detect_kfd_gfx_target_in(&missing), None);
+    }
+
+    #[test]
+    fn discovers_windows_versioned_installs_under_the_rocm_root() -> Result<()> {
+        // The Windows installer nests versions under its ROCm directory as bare
+        // `X.Y` children, rather than the `rocm-X.Y` siblings Linux uses. Before
+        // the layout split, only Linux was searched, so a Windows box with no
+        // ROCM_PATH reported no install at all.
+        let (root, _) = temp_app_paths("rocm-windows-versioned");
+        let base = root.join("ROCm");
+        fake_rocm_install(&base.join("6.2"), None)?;
+        fake_rocm_install(&base.join("6.10"), None)?;
+
+        let found = discover_rocm_installs_in_layout(
+            std::slice::from_ref(&base),
+            None,
+            RocmLayout::Children,
+        );
+
+        let paths: Vec<_> = found.iter().map(|install| install.path.clone()).collect();
+        let versions: Vec<_> = found
+            .iter()
+            .map(|install| install.version.clone())
+            .collect();
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(
+            paths,
+            vec![base.join("6.10"), base.join("6.2")],
+            "newest first, and 6.10 outranks 6.2 numerically rather than lexically"
+        );
+        assert_eq!(
+            versions,
+            vec![Some("6.10".to_owned()), Some("6.2".to_owned())],
+            "the bare directory name is the version on this layout"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn windows_layout_treats_the_rocm_root_itself_as_an_install() -> Result<()> {
+        // A single-version HIP SDK puts the install directly in the ROCm root
+        // with no version subdirectory, and it must outrank any versioned child.
+        let (root, _) = temp_app_paths("rocm-windows-root");
+        let base = root.join("ROCm");
+        fake_rocm_install(&base, None)?;
+        fake_rocm_install(&base.join("6.4"), None)?;
+
+        let found = discover_rocm_installs_in_layout(
+            std::slice::from_ref(&base),
+            None,
+            RocmLayout::Children,
+        );
+        let first = found.first().map(|install| install.path.clone());
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(first, Some(base), "the conventional root wins");
+        Ok(())
+    }
+
+    #[test]
+    fn a_bare_version_directory_is_not_an_install_on_the_linux_layout() -> Result<()> {
+        // Guard the layouts against each other: accepting bare numbers under the
+        // sibling layout would sweep in unrelated /opt and /usr/local entries.
+        let (root, _) = temp_app_paths("rocm-bare-version-linux");
+        let opt = root.join("opt");
+        fake_rocm_install(&opt.join("6.4"), None)?;
+
+        let found = discover_rocm_installs_in(std::slice::from_ref(&opt), None);
+        fs::remove_dir_all(root).ok();
+
+        assert!(found.is_empty(), "expected no installs, got {found:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn bare_version_accepts_only_dotted_numbers() {
+        assert_eq!(bare_version("6.4"), Some("6.4".to_owned()));
+        assert_eq!(bare_version("6.4.1"), Some("6.4.1".to_owned()));
+        // A lone number is a directory name, not a version.
+        assert_eq!(bare_version("6"), None);
+        // Anything non-numeric in any component disqualifies it.
+        assert_eq!(bare_version("6.4-beta"), None);
+        assert_eq!(bare_version("docs"), None);
+        assert_eq!(bare_version("6."), None);
+        assert_eq!(bare_version(".4"), None);
+        assert_eq!(bare_version(""), None);
+    }
+
+    #[test]
+    fn packaged_version_file_wins_over_the_directory_name() -> Result<()> {
+        // A repackaged tree can sit in a differently-named directory; the
+        // shipped .info/version is authoritative.
+        let (root, _) = temp_app_paths("rocm-info-version");
+        let install = root.join("opt").join("rocm-6.2.0");
+        fake_rocm_install(&install, Some("6.4.1\n"))?;
+
+        assert_eq!(rocm_install_version(&install).as_deref(), Some("6.4.1"));
 
         fs::remove_dir_all(root).ok();
         Ok(())
@@ -8270,6 +10829,38 @@ Class Name:                Display
     }
 
     #[test]
+    fn with_managed_root_keeps_reprovisioning_flat_from_runtime_leaf() {
+        let data_root = PathBuf::from("/tmp/rocm-cli-reprovision");
+        let paths = AppPaths {
+            config_dir: data_root.clone(),
+            data_dir: data_root.clone(),
+            cache_dir: data_root.join("cache"),
+        };
+        // A prior install persisted the runtime's own install_root as the managed
+        // root; rebasing onto it must recover the canonical data root, not append
+        // a second `runtimes/wheel` when the next runtime is provisioned.
+        let leaf = data_root
+            .join("runtimes")
+            .join("wheel")
+            .join("release-wheel-gfx942-7-0");
+        let rebased = paths.with_managed_root(leaf, false);
+
+        assert_eq!(rebased.data_dir, data_root);
+        let next_root = rebased
+            .data_dir
+            .join("runtimes")
+            .join("wheel")
+            .join("nightly-wheel-gfx942-7-1");
+        // Count path components, not a literal separator, so the assertion holds
+        // on Windows too.
+        let runtimes_segments = next_root
+            .components()
+            .filter(|component| component.as_os_str() == std::ffi::OsStr::new("runtimes"))
+            .count();
+        assert_eq!(runtimes_segments, 1);
+    }
+
+    #[test]
     fn app_paths_discover_defaults_to_home_rocm_when_unoverridden() -> Result<()> {
         if env_path_override("ROCM_CLI_CONFIG_DIR").is_some()
             || env_path_override("ROCM_CLI_DATA_DIR").is_some()
@@ -8645,6 +11236,112 @@ last_installed_runtime_id = "therock-release"
         assert!(!kfd_gfx_target_version_is_gpu("not-a-number"));
         assert!(kfd_gfx_target_version_is_gpu("90402"));
         assert!(kfd_gfx_target_version_is_gpu("110000"));
+    }
+
+    #[test]
+    fn every_wsl_signal_is_believed_by_the_one_predicate() {
+        // The union. Each of these was decisive to at least one of the three
+        // implementations this replaces.
+        assert!(wsl_signals_indicate_wsl(true, false, ""), "/dev/dxg");
+        assert!(
+            wsl_signals_indicate_wsl(false, true, ""),
+            "$WSL_DISTRO_NAME"
+        );
+        assert!(
+            wsl_signals_indicate_wsl(
+                false,
+                false,
+                "Linux version 6.6.87.2-microsoft-standard-WSL2"
+            ),
+            "microsoft in /proc/version"
+        );
+        assert!(
+            wsl_signals_indicate_wsl(false, false, "Linux version 5.15.0 wsl2"),
+            "wsl in /proc/version"
+        );
+        assert!(
+            !wsl_signals_indicate_wsl(false, false, "Linux version 6.8.0-51-generic"),
+            "an ordinary kernel is not WSL"
+        );
+    }
+
+    #[test]
+    fn the_two_old_predicates_disagreed_and_this_one_does_not() {
+        // The install summary asked for /dev/dxg or "microsoft"; the JSON probe
+        // asked for "microsoft"/"wsl" or $WSL_DISTRO_NAME. These are the two
+        // shapes that split them, and the reason `examine` could contradict
+        // `examine --json` about the platform it was describing.
+        let only_the_summary_saw_it = (true, false, "Linux version 6.8.0-generic");
+        let only_the_probe_saw_it = (false, true, "Linux version 6.8.0-generic");
+        for (dxg, distro, version) in [only_the_summary_saw_it, only_the_probe_saw_it] {
+            assert!(
+                wsl_signals_indicate_wsl(dxg, distro, version),
+                "one predicate already believed this host was WSL: \
+                 dxg={dxg} distro_name={distro} {version:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wsl_case_folding_does_not_depend_on_the_kernel_string_casing() {
+        assert!(wsl_signals_indicate_wsl(
+            false,
+            false,
+            "MICROSOFT-STANDARD-WSL2"
+        ));
+    }
+
+    #[test]
+    fn rocdxg_is_ready_only_when_the_whole_chain_is_present() {
+        let ready = WslSummary {
+            is_wsl: true,
+            dxg_device: true,
+            dxcore: true,
+            librocdxg: true,
+            rocdxg_dids: false,
+            ldconfig_librocdxg: true,
+            rocminfo: false,
+            cargo: false,
+            detail: None,
+        };
+        assert!(ready.rocdxg_ready());
+        // Each link is load-bearing: drop any one and a GPU launch cannot work,
+        // so `serve` must not be told it can.
+        for break_one in 0..4 {
+            let mut partial = ready.clone();
+            match break_one {
+                0 => partial.dxg_device = false,
+                1 => partial.dxcore = false,
+                2 => partial.librocdxg = false,
+                _ => partial.ldconfig_librocdxg = false,
+            }
+            assert!(
+                !partial.rocdxg_ready(),
+                "a broken link at {break_one} must not read as ready"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ready_wsl_host_offers_a_device_and_an_unready_one_does_not() {
+        // The EAI-7944 shape. `serve` used to count KFD nodes and DRM cards,
+        // neither of which exists on WSL2, and read the result as an
+        // authoritative zero -- refusing to launch on a machine whose own
+        // `examine` reported the GPU ready.
+        assert_eq!(
+            usable_amd_gpu_indices_from(usize::from(true), None),
+            Some(vec![0])
+        );
+        assert_eq!(
+            usable_amd_gpu_indices_from(usize::from(false), None),
+            Some(vec![])
+        );
+        // An explicit empty mask still wins, so a user can opt out on WSL as
+        // anywhere — HIP_VISIBLE_DEVICES="" hides the device.
+        assert_eq!(
+            usable_amd_gpu_indices_from(usize::from(true), Some(String::new())),
+            Some(vec![])
+        );
     }
 
     #[test]

@@ -3603,6 +3603,7 @@ dependencies = [
  "rocm-core",
  "rocm-dash-daemon",
  "rocm-dash-tui",
+ "rocm-deps",
  "rocm-engine-lemonade",
  "rocm-engine-protocol",
  "rocm-engine-vllm",
@@ -3634,6 +3635,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sysinfo",
  "toml",
  "ureq",
  "windows-sys 0.61.2",
@@ -3708,6 +3710,7 @@ dependencies = [
  "reqwest 0.13.4",
  "rig-core",
  "rocm-dash-core",
+ "rocm-deps",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3719,16 +3722,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "rocm-deps"
+version = "0.1.0"
+dependencies = [
+ "toml",
+]
+
+[[package]]
 name = "rocm-engine-lemonade"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "flate2",
  "rocm-core",
+ "rocm-deps",
  "rocm-engine-protocol",
  "serde",
  "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
  "ureq",
+ "zip",
 ]
 
 [[package]]

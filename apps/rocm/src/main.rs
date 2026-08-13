@@ -12,6 +12,7 @@ mod logging;
 mod provider_keys;
 mod providers;
 mod serve_summary;
+mod storage;
 mod therock;
 mod uninstall;
 
@@ -26,23 +27,23 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use rocm_core::{
     AppPaths, AuditEventRecord, AutomationEventRecord, AutomationProposalRecord,
     AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot,
-    DEFAULT_LOCAL_HOST, ExamineSummary, ManagedServiceRecord, ModelRecipeRecord,
-    ModelRecipeRegistry, ModelRecipeRegistrySource, PERMISSIONS_MODE_ASK,
-    PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF,
-    WatcherMode, append_audit_event, builtin_model_recipes, builtin_watcher, builtin_watchers,
-    connect_tcp_stream, daemon_binary_path, default_engine_for_platform,
+    DEFAULT_LOCAL_HOST, EndpointReadiness, EndpointReadinessOutcome, ExamineSummary,
+    ManagedServiceRecord, ModelRecipeRecord, ModelRecipeRegistry, ModelRecipeRegistrySource,
+    PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL,
+    TELEMETRY_MODE_OFF, WatcherMode, append_audit_event, builtin_model_recipes, builtin_watcher,
+    builtin_watchers, connect_tcp_stream, daemon_binary_path, default_engine_for_platform,
     default_interactive_shell_program, detect_host_gfx_target, detect_host_gpu_summary,
     engine_binary_path, engine_plugin_dirs, format_host_port, format_http_base_url,
     generate_service_id, interactive_terminal, load_model_recipe_registry,
     load_recent_audit_events, load_recent_automation_events, load_recent_automation_proposals,
-    managed_pip_cache_dir, managed_service_endpoint_model_ready, model_artifact_cache_status,
+    managed_pip_cache_dir, managed_service_endpoint_readiness, model_artifact_cache_status,
     model_catalog_platforms, model_recipe_featured, model_recipe_target_platform_label,
     normalize_therock_family, platform_matches_gfx_family,
     preferred_serve_engine_for_host_gpu_summary, prepend_runtime_path, process_is_running,
     read_tcp_stream_to_string, resolve_builtin_model_recipe, resolve_model_recipe,
     runtime_install_root_is_protected, runtime_path_is_same_or_inside,
     runtime_python_activation_hint, runtime_python_env_bin_dir, runtime_python_executable_in_env,
-    shell_command_for_host, write_all_tcp_stream,
+    shell_command_for_host, uv_cache_source, write_all_tcp_stream,
 };
 use rocm_engine_protocol::{
     DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy,
@@ -83,13 +84,19 @@ and run OpenAI-compatible model servers on AMD GPUs.\n\n\
 Run `rocm` with no subcommand to open the interactive dashboard (TUI). Use `rocm examine` \
 to check that your GPU and ROCm install are ready, then `rocm serve <model>` to start a server.",
     version,
+    // The `chat` example was dropped from this list when `chat` became
+    // `[preview]`: promoting a command as a headline example while marking it
+    // preview elsewhere contradicts itself. `engines list` keeps the six-step
+    // narrative and is in scope.
     after_help = "EXAMPLES:\n  \
 rocm examine                      Check GPU, ROCm install, and engines\n  \
 rocm install sdk                  Install ROCm wheels into a managed environment\n  \
+rocm engines list                 Show the local inference engines available\n  \
 rocm model                        List models this machine can run\n  \
 rocm serve qwen2.5-7b-instruct    Start a local OpenAI-compatible server\n  \
-rocm services list                Show running model servers\n  \
-rocm chat --prompt \"Hi\"           Chat with a configured assistant provider\n\n\
+rocm services list                Show running model servers\n\n\
+Commands marked [preview] work but are outside the Tech Preview's supported\n\
+scope: treat them as unfinished and do not depend on their behaviour yet.\n\n\
 Run `rocm <command> --help` for details and examples on any command."
 )]
 struct Cli {
@@ -104,8 +111,28 @@ enum Command {
         /// Emit the machine-readable Examination JSON (for diagnosis tooling).
         #[arg(long)]
         json: bool,
+        /// Which machine-learning framework to inspect (affects --json only).
+        ///
+        /// The probe imports the framework to read its ROCm build and the GPU
+        /// architectures it was compiled for, which costs an interpreter start.
+        /// Left alone it tries PyTorch and falls back to llama.cpp; name one to
+        /// go straight there, or `skip` to leave frameworks out entirely.
+        ///
+        /// Only the machine-readable form reports framework state, so this has
+        /// no effect on the human report.
+        #[arg(long, value_enum, default_value_t = FrameworkArg::Auto)]
+        framework: FrameworkArg,
     },
     /// Diagnose known ROCm/PyTorch/llama.cpp failure modes against a closed catalog.
+    ///
+    /// Matches this machine against a fixed catalog of known misconfigurations and
+    /// ranks what it finds. It can only recognise failure modes that are in the
+    /// catalog: no match means "not recognised", not "nothing is wrong" — in that
+    /// case it points you at where to report the symptom.
+    ///
+    /// Each cause is printed with an `id:` and an `apply with:` command. The
+    /// leading `#1`, `#2` are ranking positions for reading order only; `rocm fix`
+    /// takes the id, not the position.
     Diagnose {
         /// Raw error text from the user; sharpens keyword scoring.
         #[arg(long)]
@@ -118,6 +145,15 @@ enum Command {
         json: bool,
     },
     /// Apply a known fix by id (see `rocm diagnose`); run with no id to list fixes.
+    ///
+    /// Takes the `id:` that `rocm diagnose` reports against a cause — not the
+    /// `#1`/`#2` ranking position, which belongs to one report and is not a name.
+    /// With no id it lists the whole catalog.
+    ///
+    /// Fixes are marked AUTO or PRINT-ONLY: AUTO means this command carries the
+    /// change out, PRINT-ONLY means it prints the steps for you to run yourself
+    /// (typically because they need sudo or a reboot). Use `--dry-run` to see any
+    /// fix's plan without changing anything.
     Fix {
         /// Fix id, e.g. fix-4-render-group. Omit to list available fixes.
         fix_id: Option<String>,
@@ -201,7 +237,7 @@ enum Command {
         #[arg(long)]
         allow_mutation: bool,
     },
-    /// Send a one-shot chat prompt to a configured assistant provider.
+    /// [preview] Send a one-shot chat prompt to a configured assistant provider.
     ///
     /// Reads the prompt from --prompt or, if omitted, from standard input. Use
     /// `rocm config enable-provider` and `rocm config set-provider-key` first to
@@ -260,6 +296,11 @@ rocm update --apply --dry-run")]
     Runtimes {
         #[command(subcommand)]
         command: Option<RuntimesCommand>,
+    },
+    /// Show what ROCm CLI is storing on disk, and free space it no longer needs.
+    Storage {
+        #[command(subcommand)]
+        command: Option<StorageCommand>,
     },
     /// List, install, or open shells for local model engines.
     Engines {
@@ -336,6 +377,17 @@ rocm serve qwen2.5-7b-instruct --verbose --device gpu_required")]
         /// and implies `--enable-auto-tool-choice`. Applies to vLLM only.
         #[arg(long, value_name = "NAME")]
         tool_call_parser: Option<String>,
+        /// Fraction of each GPU's TOTAL VRAM that vLLM may claim for weights and
+        /// KV cache (`0.0 < value <= 1.0`). Omitted by default, so vLLM applies
+        /// its own default. Lower it when a small model should not reserve most
+        /// of a large card. Applies to vLLM only.
+        // Taken as a string with `allow_hyphen_values` rather than a clap `f64` so a
+        // negative fraction reaches `parse_gpu_memory_utilization` and gets the domain
+        // error naming the valid range, instead of clap rejecting `-0.2` as an unknown
+        // flag. The cost is that a missing value swallows the next argument
+        // (`--gpu-memory-utilization --verbose`), which then fails loudly on parse.
+        #[arg(long, value_name = "FRACTION", allow_hyphen_values = true)]
+        gpu_memory_utilization: Option<String>,
         /// API key that clients must present to a public (non-loopback) endpoint.
         /// When binding a public interface and this is omitted, a strong key is
         /// generated automatically. Prefer the `ROCM_SERVE_API_KEY` environment
@@ -345,7 +397,7 @@ rocm serve qwen2.5-7b-instruct --verbose --device gpu_required")]
         #[arg(long)]
         api_key: Option<String>,
     },
-    /// Install, start, stop, or inspect ComfyUI.
+    /// [preview] Install, start, stop, or inspect ComfyUI.
     #[command(alias = "comfy")]
     Comfyui {
         #[command(subcommand)]
@@ -356,7 +408,7 @@ rocm serve qwen2.5-7b-instruct --verbose --device gpu_required")]
         #[command(subcommand)]
         command: Option<ServicesCommand>,
     },
-    /// Manage optional background checks and review requests.
+    /// [preview] Manage optional background checks and review requests.
     Automations {
         #[command(subcommand)]
         command: Option<AutomationsCommand>,
@@ -435,10 +487,12 @@ rocm logs --search error timeout")]
         /// Keep saved settings.
         #[arg(long)]
         keep_config: bool,
-        /// Keep app data such as logs, services, and engines.
+        /// Keep app data such as logs, services, engines, and the uv package cache
+        /// (often the largest directory rocm-cli manages).
         #[arg(long)]
         keep_data: bool,
-        /// Keep caches.
+        /// Keep caches under the cache directory. Does not cover the uv package cache,
+        /// which lives under the data directory; use --keep-data for that.
         #[arg(long)]
         keep_cache: bool,
         /// Allow removing development binaries inside the current build tree.
@@ -457,10 +511,11 @@ enum BenchCommand {
     /// long-context tool traffic and is not comparable to the *-agent-bench quality
     /// harnesses.
     Load {
-        /// Base URL of the OpenAI-compatible endpoint, e.g. http://127.0.0.1:8000
+        /// OpenAI-compatible endpoint, e.g. http://127.0.0.1:8000/v1 (as shown by
+        /// `rocm services list`). A plain host address without /v1 also works.
         #[arg(long, value_name = "URL")]
         endpoint: String,
-        /// Model name (defaults to the first model returned by GET {endpoint}/v1/models)
+        /// Model name (defaults to the first model the endpoint reports)
         #[arg(long)]
         model: Option<String>,
         /// Concurrency levels to sweep, comma-separated
@@ -625,6 +680,44 @@ enum RuntimesCommand {
         /// Replace an existing record with the same key.
         #[arg(long)]
         replace: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum StorageCommand {
+    /// Show what is using disk space.
+    Report {
+        /// Emit the machine-readable storage JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove older ROCm installs, keeping the most recent ones.
+    #[command(name = "remove-old-installs", alias = "remove-old-runtimes")]
+    RemoveOldInstalls {
+        /// How many recent installs to keep for each channel, format, and GPU family.
+        ///
+        /// "Recent" means most recently installed, not highest version, so
+        /// after a deliberate downgrade the older version counts as the newer
+        /// install. The one in use and the rollback target are always kept on
+        /// top of this count, whatever it is set to.
+        #[arg(long, default_value_t = storage::DEFAULT_KEEP)]
+        keep: usize,
+        /// Show what would happen without changing files.
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Remove downloaded files that ROCm CLI can fetch again.
+    #[command(name = "remove-downloads", alias = "remove-downloaded-files")]
+    RemoveDownloads {
+        /// Show what would happen without changing files.
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -800,6 +893,37 @@ enum SetupCommand {
     Reset,
 }
 
+/// Which framework `rocm examine` should probe.
+///
+/// The CLI-facing mirror of [`rocm_core::FrameworkProbe`], which cannot derive
+/// `ValueEnum` itself without pulling clap into `rocm-core`. Every variant of
+/// that enum existed and was reachable in the library, but no caller ever passed
+/// anything but the default, so the choice could not be made from the command
+/// line at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum FrameworkArg {
+    /// Try PyTorch first, then llama.cpp (the default).
+    Auto,
+    /// Probe PyTorch only.
+    Pytorch,
+    /// Probe llama.cpp only.
+    #[value(name = "llama-cpp", alias = "llamacpp")]
+    LlamaCpp,
+    /// Probe no framework at all — fastest, and enough for GPU and driver questions.
+    Skip,
+}
+
+impl From<FrameworkArg> for rocm_core::FrameworkProbe {
+    fn from(value: FrameworkArg) -> Self {
+        match value {
+            FrameworkArg::Auto => Self::Auto,
+            FrameworkArg::Pytorch => Self::PyTorch,
+            FrameworkArg::LlamaCpp => Self::LlamaCpp,
+            FrameworkArg::Skip => Self::Skip,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum InstallFormat {
     /// Python wheel packages (recommended; smaller, pip-installable).
@@ -938,6 +1062,7 @@ fn main() -> Result<()> {
         .and_then(|paths| logging::init(&paths));
 
     maybe_migrate_legacy_dashboard_config();
+    maybe_notice_legacy_uv_cache();
 
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     if raw_args.is_empty() {
@@ -992,6 +1117,54 @@ fn cli_command() -> clap::Command {
 fn parse_cli() -> Cli {
     let matches = cli_command().get_matches();
     Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit())
+}
+
+/// Legacy `uv` cache location, used before the cache was colocated with the managed
+/// data directory. Kept relative so the check works on every platform's home dir.
+const LEGACY_UV_CACHE_RELATIVE: [&str; 2] = [".cache", "uv"];
+
+/// One-shot notice that a pre-colocation `uv` cache is still occupying space at the
+/// default `uv` location. Nothing is migrated or deleted: the cache is
+/// content-addressed and may be shared with unrelated `uv` projects on the machine, so
+/// removing it is the user's call. Silent when the managed cache does not exist yet
+/// (nothing has moved) or when an override is in effect.
+fn maybe_notice_legacy_uv_cache() {
+    let Ok(paths) = AppPaths::discover() else {
+        return;
+    };
+    let cache = uv_cache_source(&paths);
+    if cache.is_override() {
+        return;
+    }
+    // Only worth mentioning once the managed cache is actually in use; otherwise the
+    // legacy directory is simply the cache still being used by other tools.
+    if !cache.path().is_dir() {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+    else {
+        return;
+    };
+    let legacy = LEGACY_UV_CACHE_RELATIVE
+        .iter()
+        .fold(home, |dir, part| dir.join(part));
+    if !legacy.is_dir() {
+        return;
+    }
+    // One-shot: a standing reminder on every invocation would be noise, and the user may
+    // reasonably decide to keep the legacy cache for other uv projects.
+    let marker = paths.data_dir.join(".legacy-uv-cache-notice");
+    if marker.exists() {
+        return;
+    }
+    eprintln!(
+        "rocm: the uv cache now lives at {}; the previous cache at {} is no longer used by rocm-cli and can be removed if no other uv project needs it",
+        cache.path().display(),
+        legacy.display()
+    );
+    let _ = fs::write(&marker, b"");
 }
 
 /// One-shot, best-effort migration of a legacy rocm-dash `config.toml` into the
@@ -1402,15 +1575,23 @@ fn render_freeform_comfyui_status_answer(
 }
 
 fn dispatch(cli: Cli) -> Result<()> {
+    // `storage` is excluded alongside the other self-referential commands: it
+    // reports and reclaims disk, and the startup update check can provision a
+    // managed Python, which downloads instead of freeing.
     if !matches!(
         cli.command,
-        Some(Command::Update { .. } | Command::Bootstrap { .. } | Command::Completions { .. })
+        Some(
+            Command::Update { .. }
+                | Command::Bootstrap { .. }
+                | Command::Completions { .. }
+                | Command::Storage { .. }
+        )
     ) {
         refresh_startup_update_check_quietly();
     }
 
     match cli.command {
-        Some(Command::Examine { json }) => examine(json),
+        Some(Command::Examine { json, framework }) => examine(json, framework.into()),
         Some(Command::Diagnose { symptom, top, json }) => diagnose(symptom, top, json),
         Some(Command::Fix {
             fix_id,
@@ -1623,6 +1804,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Command::Runtimes { command }) => runtimes(command),
+        Some(Command::Storage { command }) => storage::storage(command),
         Some(Command::Engines { command }) => engines(command),
         Some(Command::Model { verbose }) => {
             let paths = AppPaths::discover()?;
@@ -1649,6 +1831,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             no_smoke_test,
             allow_public_bind,
             tool_call_parser,
+            gpu_memory_utilization,
             api_key,
         }) => serve(ServeArgs {
             model,
@@ -1665,6 +1848,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             no_smoke_test,
             allow_public_bind,
             tool_call_parser,
+            gpu_memory_utilization,
             api_key,
         }),
         Some(Command::Comfyui { command }) => comfyui(command),
@@ -1898,18 +2082,70 @@ const fn builtin_engine_inventory() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
-fn examine(json: bool) -> Result<()> {
+/// The `--json` document.
+///
+/// `Examination` stays at the top level, verbatim: its field names deliberately
+/// mirror `examine.py`'s dataclass so the JSON contract is identical, and moving
+/// them would break every consumer written against it.
+///
+/// Everything the CLI knows but the probe cannot is added under `summary`. The
+/// probe runs before any config is read, so it has no idea which engine this
+/// host will serve on, whether an existing ROCm install was found, or where the
+/// CLI keeps its files — all of which the human report prints. A tool reading
+/// `--json` used to have to scrape that text to find out.
+#[derive(serde::Serialize)]
+struct ExamineJson<'a> {
+    #[serde(flatten)]
+    examination: &'a rocm_core::Examination,
+    summary: ExamineJsonSummary<'a>,
+}
+
+/// The human report's own view, plus the few facts it derives from config while
+/// rendering rather than storing on the summary.
+#[derive(serde::Serialize)]
+struct ExamineJsonSummary<'a> {
+    #[serde(flatten)]
+    host: &'a ExamineSummary,
+    /// What the user configured — `None` means unset, exactly as the text form's
+    /// `<platform default>` does. Distinct from `effective_default_engine`.
+    configured_default_engine: Option<&'a str>,
+    /// What `serve` will actually pick: the configured engine if there is one,
+    /// else the host default. Mirrors `select_serve_engine`.
+    effective_default_engine: &'a str,
+    active_runtime_id: Option<&'a str>,
+    active_runtime_key: Option<&'a str>,
+    previous_runtime_key: Option<&'a str>,
+}
+
+fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
     // `rocm examine` is the general system inspector: the exit code reports
     // whether it RAN, not what it found. Any finding (no GPU, WSL, degraded) is
     // surfaced in the output and the `--json` `status` field, and the command
     // exits 0; a genuine inability to examine propagates as an error via `?`.
-    if json {
-        let examination = rocm_core::Examination::probe(rocm_core::FrameworkProbe::Auto);
-        println!("{}", serde_json::to_string_pretty(&examination)?);
-        return Ok(());
-    }
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths).unwrap_or_default();
+    if json {
+        let examination = rocm_core::Examination::probe(framework);
+        // `gather` rather than `examine_human_report`: the latter first runs
+        // `recover_setup_runtime_registration`, which writes. Asking a machine a
+        // question should not change it, and `--json` is the form tooling calls
+        // in a loop.
+        let host = ExamineSummary::gather()?;
+        let configured_default_engine = config.default_engine.as_deref();
+        let document = ExamineJson {
+            examination: &examination,
+            summary: ExamineJsonSummary {
+                configured_default_engine,
+                effective_default_engine: configured_default_engine.unwrap_or(&host.default_engine),
+                active_runtime_id: config.default_runtime_id.as_deref(),
+                active_runtime_key: config.active_runtime_key.as_deref(),
+                previous_runtime_key: config.previous_runtime_key.as_deref(),
+                host: &host,
+            },
+        };
+        println!("{}", serde_json::to_string_pretty(&document)?);
+        return Ok(());
+    }
     let (text, summary) = examine_human_report(&paths, &config)?;
     print!("{text}");
     if summary.wsl.as_ref().is_some_and(|w| w.is_wsl) {
@@ -1951,7 +2187,7 @@ fn fix(fix_id: Option<String>, yes: bool, dry_run: bool, device_index: Option<i6
     Ok(())
 }
 
-fn record_cli_audit_event(
+pub(crate) fn record_cli_audit_event(
     paths: &AppPaths,
     category: &str,
     action: &str,
@@ -3484,7 +3720,7 @@ fn resolve_engine_install_runtime_id(
     runtime_id: Option<String>,
 ) -> Result<String> {
     if engine_manages_own_runtime(engine) {
-        return Ok(runtime_id.unwrap_or_else(|| managed_engine_runtime_id(engine).to_owned()));
+        return Ok(runtime_id.unwrap_or_else(|| managed_engine_runtime_id(engine)));
     }
     let Some(selector) = runtime_id
         .or_else(|| config.active_runtime_key.clone())
@@ -3588,10 +3824,15 @@ fn env_root_for_service(
     }
 }
 
-fn managed_engine_runtime_id(engine: &str) -> &'static str {
+/// Label recorded for the runtime a self-managing engine installs for itself.
+///
+/// For `lemonade` this must be the `env_id` its adapter reports, which is
+/// derived from the single Lemonade pin — it was previously a hand-written
+/// literal and had drifted several minor versions behind what is installed.
+fn managed_engine_runtime_id(engine: &str) -> String {
     match engine {
-        "lemonade" => "lemonade-embeddable-10.6.0",
-        _ => "managed-engine-runtime",
+        "lemonade" => format!("lemonade-embeddable-{}", rocm_deps::LEMONADE_VERSION),
+        _ => "managed-engine-runtime".to_owned(),
     }
 }
 
@@ -3603,7 +3844,7 @@ fn ensure_self_managed_engine_ready(
     if !engine_manages_own_runtime(engine) {
         return Ok(());
     }
-    let runtime_id = managed_engine_runtime_id(engine).to_owned();
+    let runtime_id = managed_engine_runtime_id(engine);
     let env_root = env_root_for_self_managed_engine(paths, config)?;
     let detect = engine_request::<_, DetectResponse>(
         Some(paths),
@@ -3615,8 +3856,14 @@ fn ensure_self_managed_engine_ready(
         },
     )
     .ok();
+    // For a self-managing engine the runtime id *is* the env id its adapter
+    // reports for the pinned version, so a version bump leaves an older
+    // install detected-but-not-current. Requiring the ids to match makes the
+    // bump trigger an install instead of silently keeping the old runtime.
     let installed = detect.as_ref().is_some_and(|detect| {
-        detect.installed && detect_runtime_matches_env_root(detect, env_root.as_deref())
+        detect.installed
+            && detect.env_id.as_deref() == Some(runtime_id.as_str())
+            && detect_runtime_matches_env_root(detect, env_root.as_deref())
     });
     let response = if installed {
         None
@@ -3677,6 +3924,123 @@ struct ResolvedEngineEnv {
     source: String,
 }
 
+/// Extra argv, environment, and files needed to make a spawned shell *look*
+/// like a managed engine shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellPromptShim {
+    /// Appended to the shell's argv.
+    args: Vec<String>,
+    /// Added to the child environment.
+    envs: Vec<(String, String)>,
+    /// Written before the shell starts, as (path, contents).
+    files: Vec<(PathBuf, String)>,
+}
+
+/// Work out how to mark `shell_program`'s prompt with `prompt`.
+///
+/// Passing the marker through the `PS1` *environment variable* does not work:
+/// bash assigns `PS1` from `/etc/bash.bashrc` and `~/.bashrc` on every
+/// interactive start, so the inherited value is overwritten and the engine shell
+/// ends up looking exactly like the shell it was launched from. The marker has to
+/// be applied from inside the shell's own startup, after the user's files have
+/// run — which is what these shims do.
+///
+/// Pure: decides *what* to write and *how* to invoke, and leaves the I/O to the
+/// caller so the decision can be unit-tested. Returns `None` for shells that
+/// cannot be marked safely; the caller's handover banner covers those instead of
+/// this failing.
+///
+/// `original_zdotdir` is the caller's `ZDOTDIR`, if it had one, so the zsh shim
+/// can still find the user's real startup files after we redirect `ZDOTDIR` at
+/// our own directory.
+fn engine_shell_prompt_shim(
+    shell_program: &str,
+    prompt: &str,
+    shim_dir: &Path,
+    original_zdotdir: Option<&str>,
+) -> Option<ShellPromptShim> {
+    // Match on the file stem so `--shell /usr/bin/zsh` and a bare `bash` behave
+    // the same. `bash5`-style names are deliberately not matched: guessing wrong
+    // is worse than falling back to the banner.
+    let stem = Path::new(shell_program)
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)?
+        .to_ascii_lowercase();
+
+    match stem.as_str() {
+        "bash" => {
+            let rcfile = shim_dir.join("engine-shell.bash");
+            // `--rcfile` replaces ~/.bashrc ONLY -- bash still sources
+            // /etc/bash.bashrc itself, so sourcing that here would apply it twice.
+            let contents = format!(
+                "# Generated by `rocm engines shell`. Sources your own startup file\n\
+                 # first, then marks the prompt so this shell is distinguishable.\n\
+                 if [ -r \"$HOME/.bashrc\" ]; then . \"$HOME/.bashrc\"; fi\n\
+                 PS1='{prompt}'\"$PS1\"\n"
+            );
+            Some(ShellPromptShim {
+                args: vec![
+                    "--rcfile".to_owned(),
+                    rcfile.display().to_string(),
+                    "-i".to_owned(),
+                ],
+                envs: Vec::new(),
+                files: vec![(rcfile, contents)],
+            })
+        }
+        "zsh" => {
+            // Redirecting ZDOTDIR makes zsh skip the user's `.zshenv` AND their
+            // `.zshrc`. Losing `.zshenv` would silently strip their PATH and
+            // exports -- a worse bug than the unmarked prompt -- so both are
+            // restored, and the original location is passed through for the shim
+            // to read at startup.
+            let user_zdotdir = "${ROCM_CLI_ORIG_ZDOTDIR:-$HOME}";
+            let zshenv = format!(
+                "# Generated by `rocm engines shell`; restores your own .zshenv.\n\
+                 __rocm_zdotdir=\"{user_zdotdir}\"\n\
+                 [ -r \"$__rocm_zdotdir/.zshenv\" ] && . \"$__rocm_zdotdir/.zshenv\"\n"
+            );
+            let zshrc = format!(
+                "# Generated by `rocm engines shell`. Sources your own .zshrc first,\n\
+                 # then marks the prompt so this shell is distinguishable.\n\
+                 __rocm_zdotdir=\"{user_zdotdir}\"\n\
+                 [ -r \"$__rocm_zdotdir/.zshrc\" ] && . \"$__rocm_zdotdir/.zshrc\"\n\
+                 PROMPT='{prompt}'$PROMPT\n"
+            );
+            let mut envs = vec![("ZDOTDIR".to_owned(), shim_dir.display().to_string())];
+            if let Some(original) = original_zdotdir.filter(|value| !value.trim().is_empty()) {
+                envs.push(("ROCM_CLI_ORIG_ZDOTDIR".to_owned(), original.to_owned()));
+            }
+            Some(ShellPromptShim {
+                args: Vec::new(),
+                envs,
+                files: vec![
+                    (shim_dir.join(".zshenv"), zshenv),
+                    (shim_dir.join(".zshrc"), zshrc),
+                ],
+            })
+        }
+        // fish, sh, dash, cmd, PowerShell, anything else: no safe way to inject a
+        // marker without taking over startup, so the banner carries the message.
+        _ => None,
+    }
+}
+
+/// Write a [`ShellPromptShim`]'s files, creating the directory if needed.
+///
+/// The files live under the app's own engine state directory rather than a temp
+/// dir: they must outlive this process's setup and stay readable for the whole
+/// life of the spawned shell, and a fixed path is regenerated on every run
+/// instead of accumulating.
+fn write_engine_shell_shim(shim_dir: &Path, shim: &ShellPromptShim) -> Result<()> {
+    fs::create_dir_all(shim_dir)
+        .with_context(|| format!("failed to create {}", shim_dir.display()))?;
+    for (path, contents) in &shim.files {
+        fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn engine_shell(
     engine: &str,
     runtime_id: Option<&str>,
@@ -3723,11 +4087,65 @@ fn engine_shell(
         .env("ROCM_CLI_PYTHON", &resolved.python_executable);
     apply_app_path_env(&mut command, &paths);
 
+    let prompt = format!("(rocm:{engine}) ");
+    let mut prompt_marked = false;
     if !rocm_core::runtime_is_windows() {
-        let prompt = format!("(rocm:{engine}) ");
+        // Kept for prompt frameworks (starship, powerlevel10k, oh-my-posh) that
+        // read this directly -- that is why the missing marker went unnoticed by
+        // anyone using one. Plain bash/zsh need the shim below.
         command.env("VIRTUAL_ENV_PROMPT", &prompt);
-        command.env("PS1", format!("{prompt}${{PS1:-}}"));
+
+        let shim_dir = paths.engine_state_dir(engine).join("shell");
+        // `engine` is constrained by clap to the supported-engine list, so the
+        // prompt cannot carry shell metacharacters into the generated files.
+        if let Some(shim) = engine_shell_prompt_shim(
+            &shell_program,
+            &prompt,
+            &shim_dir,
+            std::env::var("ZDOTDIR").ok().as_deref(),
+        ) {
+            // A shim that cannot be written is not worth failing the command over
+            // -- the shell still works, it just looks unmarked, and the banner
+            // below adapts to say so.
+            match write_engine_shell_shim(&shim_dir, &shim) {
+                Ok(()) => {
+                    command.args(&shim.args);
+                    for (key, value) in &shim.envs {
+                        command.env(key, value);
+                    }
+                    prompt_marked = true;
+                }
+                Err(error) => {
+                    eprintln!("warning: could not prepare the engine shell prompt: {error}");
+                }
+            }
+        }
+
+        if !prompt_marked {
+            // Shells we have no shim for (sh, dash) do honour an inherited PS1, so
+            // this is still worth setting -- but as a self-contained value. The
+            // previous `{prompt}${PS1:-}` referred to the variable being assigned,
+            // which dash expanded into itself and rendered as
+            // `(rocm:vllm) (rocm:vllm) ${PS1:-}`. Shells that ignore PS1 entirely
+            // (fish) are unaffected either way.
+            command.env("PS1", format!("{prompt}$ "));
+        }
     }
+
+    // The block above describes the environment; this is the handover. Without
+    // it, a shell we could not mark is indistinguishable from the parent and
+    // reads as "the command only printed information" -- which is how this was
+    // reported.
+    println!();
+    if prompt_marked {
+        println!("Entering the {engine} engine shell — your prompt is now prefixed {prompt}");
+    } else {
+        println!(
+            "Entering the {engine} engine shell — your prompt may look unchanged; \
+             run `echo $ROCM_CLI_ENGINE` to confirm you are inside it."
+        );
+    }
+    println!("Run `exit` (or Ctrl-D) to return to your previous shell.");
 
     let status = command
         .status()
@@ -4017,6 +4435,82 @@ fn set_vllm_tool_call_parser(flags: &mut Vec<String>, parser: &str) {
     *flags = rewritten;
 }
 
+/// Applies an explicit `--gpu-memory-utilization` to the vLLM engine recipe.
+///
+/// rocm-cli intentionally ships no default for this: vLLM sizes its KV cache as
+/// a fraction of the device's TOTAL VRAM, and any number rocm-cli picked would
+/// silently override upstream's and drift from it. So the flag is passed through
+/// only when the user asked for one, via `required_flags` (the same channel the
+/// `--tool-call-parser` override uses — no protocol change needed).
+///
+/// Only vLLM is affected. An explicit value wins over any recipe-authored one,
+/// and a minimal hint is synthesized when none exists.
+fn engine_recipe_with_gpu_memory_utilization_override(
+    engine: &str,
+    hint: Option<EngineRecipeHint>,
+    gpu_memory_utilization: Option<f64>,
+) -> Option<EngineRecipeHint> {
+    if !engine.eq_ignore_ascii_case("vllm") {
+        return hint;
+    }
+    let Some(value) = gpu_memory_utilization else {
+        return hint;
+    };
+    let mut hint = hint.unwrap_or_else(|| EngineRecipeHint {
+        contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+        engine: engine.to_owned(),
+        ..EngineRecipeHint::default()
+    });
+    set_vllm_gpu_memory_utilization(&mut hint.required_flags, value);
+    Some(hint)
+}
+
+/// Rewrites `flags` so vLLM receives exactly one `--gpu-memory-utilization
+/// <value>` pair: drops any existing pair, then appends the new one.
+fn set_vllm_gpu_memory_utilization(flags: &mut Vec<String>, value: f64) {
+    let existing = std::mem::take(flags);
+    let mut rewritten: Vec<String> = Vec::with_capacity(existing.len() + 2);
+    let mut skip_value = false;
+    for flag in existing {
+        if skip_value {
+            // Drop the value that followed the removed flag.
+            skip_value = false;
+            continue;
+        }
+        if flag == "--gpu-memory-utilization" {
+            skip_value = true;
+            continue;
+        }
+        rewritten.push(flag);
+    }
+    rewritten.push("--gpu-memory-utilization".to_owned());
+    rewritten.push(format!("{value}"));
+    *flags = rewritten;
+}
+
+/// Parse `rocm serve --gpu-memory-utilization`. Unlike the env-var overrides
+/// elsewhere in this file, an explicit CLI value is never silently ignored: a
+/// user who types a bad fraction is told so.
+fn parse_gpu_memory_utilization(value: Option<&str>) -> Result<Option<f64>> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    let parsed: f64 = trimmed.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "--gpu-memory-utilization expects a fraction greater than 0 and at most 1 \
+             (e.g. 0.5); got `{trimmed}`"
+        )
+    })?;
+    if !parsed.is_finite() || parsed <= 0.0 || parsed > 1.0 {
+        bail!(
+            "--gpu-memory-utilization must be greater than 0 and at most 1 (a fraction of \
+             the GPU's TOTAL VRAM, e.g. 0.5); got `{trimmed}`"
+        );
+    }
+    Ok(Some(parsed))
+}
+
 /// Whether the resolved engine recipe launches vLLM with tool calling enabled.
 fn engine_recipe_enables_tool_choice(hint: Option<&EngineRecipeHint>) -> bool {
     hint.is_some_and(|hint| {
@@ -4043,6 +4537,7 @@ struct ServeArgs {
     no_smoke_test: bool,
     allow_public_bind: bool,
     tool_call_parser: Option<String>,
+    gpu_memory_utilization: Option<String>,
     api_key: Option<String>,
 }
 
@@ -4062,6 +4557,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         no_smoke_test,
         allow_public_bind,
         tool_call_parser,
+        gpu_memory_utilization,
         api_key,
     } = args;
     let _ = managed; // background is now the default; --managed is accepted as an explicit synonym.
@@ -4123,6 +4619,22 @@ fn serve(args: ServeArgs) -> Result<()> {
         recipe_hint,
         tool_call_parser.as_deref(),
     );
+    // Validated before anything is launched so a typo fails immediately rather
+    // than surfacing as a vLLM argparse error deep in the engine log.
+    let gpu_memory_utilization = parse_gpu_memory_utilization(gpu_memory_utilization.as_deref())?;
+    let engine_recipe = engine_recipe_with_gpu_memory_utilization_override(
+        &selected_engine,
+        engine_recipe,
+        gpu_memory_utilization,
+    );
+    // Stored without a `note:` prefix so it can feed both output paths: the plan
+    // path adds the prefix inline, the interactive summary adds it when rendering.
+    let gpu_memory_utilization_note = (gpu_memory_utilization.is_some() && !engine_serves_vllm)
+        .then(|| {
+            format!(
+                "--gpu-memory-utilization applies only to vLLM; ignored for engine '{selected_engine}'"
+            )
+        });
     let tool_call_note = if tool_call_parser.is_some() && !engine_serves_vllm {
         Some(format!(
             "note: --tool-call-parser applies only to vLLM; ignored for engine '{selected_engine}'"
@@ -4259,7 +4771,11 @@ fn serve(args: ServeArgs) -> Result<()> {
                      selected GPU or unset ROCR_VISIBLE_DEVICES."
                 );
             }
-            if let Some(warning) = gpu_low_memory_warning(&gpu_indices, gpu_vram.as_deref()) {
+            if let Some(warning) = serve_gpu_low_memory_warning(
+                &gpu_indices,
+                gpu_vram.as_deref(),
+                host_gpu_summary.as_ref(),
+            ) {
                 println!("  {warning}");
             }
         }
@@ -4268,6 +4784,9 @@ fn serve(args: ServeArgs) -> Result<()> {
         }
         if let Some(note) = &tool_call_note {
             println!("  {note}");
+        }
+        if let Some(note) = &gpu_memory_utilization_note {
+            println!("  note: {note}");
         }
     }
 
@@ -4342,6 +4861,8 @@ fn serve(args: ServeArgs) -> Result<()> {
                 rocr_visible_devices_set,
                 &gpu_indices,
                 gpu_vram.as_deref(),
+                gpu_memory_utilization_note.as_deref(),
+                host_gpu_summary.as_ref(),
             );
             let summary = serve_summary::DeploymentSummary {
                 engine: selected_engine.clone(),
@@ -4385,8 +4906,16 @@ fn collect_serve_notes(
     rocr_visible_devices_set: bool,
     gpu_indices: &[u32],
     gpu_vram: Option<&[GpuVramUsage]>,
+    engine_flag_note: Option<&str>,
+    host_gpu_summary: Option<&rocm_core::HostGpuSummary>,
 ) -> Vec<String> {
     let mut notes = Vec::new();
+    // An engine-scoped flag the selected engine cannot honor must be reported here
+    // too: the summary path is what an interactive `rocm serve` actually prints, so
+    // a note only emitted on the plan path would never reach that user.
+    if let Some(note) = engine_flag_note {
+        notes.push(note.to_owned());
+    }
     if cpu_only {
         if matches!(gpu_selection, GpuSelection::Index(_)) {
             notes.push(
@@ -4402,7 +4931,8 @@ fn collect_serve_notes(
                     .to_owned(),
             );
         }
-        if let Some(warning) = gpu_low_memory_warning(gpu_indices, gpu_vram) {
+        if let Some(warning) = serve_gpu_low_memory_warning(gpu_indices, gpu_vram, host_gpu_summary)
+        {
             notes.push(warning);
         }
     }
@@ -4418,8 +4948,11 @@ fn validate_bind_host(host: &str, allow_public_bind: bool) -> Result<()> {
     Ok(())
 }
 
+/// Inverse of [`rocm_engine_protocol::is_public_bind_host`], which owns the
+/// policy so `rocmd` classifies a recorded `host` identically when it respawns
+/// the service.
 fn is_loopback_host(host: &str) -> bool {
-    matches!(host, "127.0.0.1" | "localhost" | "::1")
+    !rocm_engine_protocol::is_public_bind_host(host)
 }
 
 /// Resolve the API key that will guard this endpoint, applying the
@@ -4495,6 +5028,37 @@ fn ensure_public_bind_engine_supported(
             "public binding with the lemonade engine is not supported on Windows: the endpoint \
              API key cannot be enforced there. Use `--engine vllm`, or bind a loopback host \
              (the default 127.0.0.1)."
+        );
+    }
+    Ok(())
+}
+
+/// Refuse to (re)spawn a managed service recorded on a public host when its
+/// endpoint API key is gone, so a respawn cannot reopen the endpoint anonymously.
+///
+/// `serve()` applies the loopback-vs-public policy once, via
+/// [`resolve_endpoint_auth`], and persists the resulting key. Every later spawn
+/// — `rocm services restart`, and `rocmd`'s recovery supervisor — reads that key
+/// file back and would otherwise treat "no key file" as "no auth wanted",
+/// silently downgrading a protected public endpoint to an open one. The real
+/// invariant is a property of the *host*, not of the file: a non-loopback bind
+/// must always be authenticated.
+///
+/// The gap is reachable through ordinary commands, because a stop deletes the
+/// key file and `rocm services restart` accepts a stopped service id (its help
+/// points at `rocm services list --all`).
+///
+/// `key_present` is a plain `bool` rather than a path so both branches are
+/// unit-testable without touching the filesystem, mirroring `is_windows` in
+/// [`ensure_public_bind_engine_supported`].
+fn ensure_public_service_has_endpoint_key(host: &str, key_present: bool) -> Result<()> {
+    if rocm_engine_protocol::is_public_bind_host(host) && !key_present {
+        bail!(
+            "managed service is bound to the public host `{host}` but has no endpoint API key, \
+             so restarting it would reopen it without authentication. The key is dropped when a \
+             service stops and cannot be recovered. Launch it again with \
+             `rocm serve --host {host} --allow-public-bind` (add `--api-key <key>`, or set \
+             ROCM_SERVE_API_KEY, to choose the key instead of generating one)."
         );
     }
     Ok(())
@@ -4584,7 +5148,9 @@ struct ManagedLaunchReport {
     service_id: String,
     /// `http://host:port/v1`.
     endpoint_url: String,
-    /// `"ready"`, `"starting"`, or the existing service's status.
+    /// `"ready"` (inference confirmed), `"running"` (model listed but not serving
+    /// yet), `"starting"` (endpoint not answering), or the existing service's
+    /// status when nothing was spawned.
     status: String,
     /// True when an equivalent service was already live and nothing was spawned.
     already_running: bool,
@@ -4712,7 +5278,17 @@ fn spawn_managed_engine_child(
     // environment. A path — not the secret value — is what the detached-spawn
     // primitives accept as an env override, and it keeps the key off both the argv
     // and the environment block. `serve()` wrote the file before spawning.
-    let endpoint_key_file = endpoint_keys::endpoint_key_file_if_present(paths, service_id);
+    // Validity, not mere existence: the engine adapters resolve the key with
+    // `endpoint_api_key_from_file` and enforce nothing when it yields `None`, so
+    // an empty or malformed key file would otherwise satisfy the guard below and
+    // still produce an unauthenticated public listener.
+    let endpoint_key_file = endpoint_keys::endpoint_key_file_if_present(paths, service_id)
+        .filter(|path| rocm_engine_protocol::endpoint_api_key_from_file(path).is_some());
+    // `serve()` already resolved and stored the key for a public bind, so this
+    // cannot fire on the fresh-launch path today. It is the shared choke point
+    // for managed spawns, so enforce the invariant here too rather than relying
+    // on every future caller having done so.
+    ensure_public_service_has_endpoint_key(host, endpoint_key_file.is_some())?;
     #[cfg(windows)]
     let child_pid = {
         let env_values = app_path_env_var_values(paths, engine_envs_root.as_deref());
@@ -4813,7 +5389,13 @@ fn start_managed_service(
         Duration::from_secs(45),
         on_wait_tick,
     );
-    record.status = if readiness { "ready" } else { "starting" }.to_owned();
+    let launch_status = status_for_readiness(readiness);
+    record.status = launch_status.to_owned();
+    if readiness == EndpointReadiness::Serving {
+        // Latch the verification the wait just performed, so the readiness checks
+        // behind `services list` and chat read it instead of re-probing.
+        record.inference_verified_at_unix_ms = Some(rocm_core::unix_time_millis() as u64);
+    }
     record.write()?;
     let endpoint_url = format!("{}/v1", format_http_base_url(host, port));
     record_cli_audit_event(
@@ -4823,17 +5405,14 @@ fn start_managed_service(
         "info",
         format!(
             "launched managed service engine={} model={} endpoint={} readiness={}",
-            engine,
-            resolve.canonical_model_id,
-            endpoint_url,
-            if readiness { "ready" } else { "starting" }
+            engine, resolve.canonical_model_id, endpoint_url, launch_status
         ),
         Some(service_id),
     );
     Ok(ManagedLaunchReport {
         service_id: service_id.to_owned(),
         endpoint_url,
-        status: if readiness { "ready" } else { "starting" }.to_owned(),
+        status: launch_status.to_owned(),
         already_running: false,
         child_pid: Some(child_pid),
         log_path: Some(record.log_path),
@@ -7241,10 +7820,12 @@ fn read_provider_key_from_user(provider: &str) -> Result<String> {
 }
 
 pub(crate) fn render_launch_summary(paths: &AppPaths, config: &RocmCliConfig) -> String {
+    // User-facing text, so it must agree with what `serve` would pick — the same
+    // contradiction `examine` used to show on Instinct.
     let selected_default_engine = config
         .default_engine
         .as_deref()
-        .unwrap_or(default_engine_for_platform());
+        .unwrap_or_else(|| host_default_engine(Some(paths)));
     let mut output = String::new();
     let _ = writeln!(output, "rocm interactive shell");
     let _ = writeln!(output, "  terminal: non-interactive");
@@ -9218,6 +9799,20 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
                 command_title: "Uninstall".to_owned(),
             })
         }
+        // `storage report` (the default subcommand) only measures folders, so
+        // the assistant can run it directly. The two `remove-*` verbs delete
+        // multi-gigabyte trees and go through the approval UI.
+        Some("storage") if second.as_deref().is_none_or(|value| value == "report") => {
+            Ok(ChatRocmCommandAction::ReadOnly(args))
+        }
+        Some("storage") => {
+            ensure_flag(&mut args, "--yes");
+            Ok(ChatRocmCommandAction::Approval {
+                args,
+                pending_title: "Free up disk space".to_owned(),
+                command_title: "Storage".to_owned(),
+            })
+        }
         Some("comfyui") if second.as_deref() == Some("install") => {
             Ok(ChatRocmCommandAction::Approval {
                 args,
@@ -11064,7 +11659,7 @@ fn examine_human_report(
     let mut output = render_examine_plain_header(&summary);
     output.push_str(&summary.render_text());
     append_examine_runtime_state(&mut output, paths, config)?;
-    append_examine_engine_inventory(&mut output, paths, config);
+    append_examine_engine_inventory(&mut output, paths, config, &summary.default_engine);
     Ok((output, summary))
 }
 
@@ -11074,10 +11669,27 @@ fn render_examine_plain_header(summary: &ExamineSummary) -> String {
     } else {
         "AMD GPU not detected yet"
     };
-    let runtime = match summary.managed_runtime_count {
-        0 => "No ROCm installs saved yet".to_owned(),
-        1 => "1 ROCm install saved".to_owned(),
-        count => format!("{count} ROCm installs saved"),
+    // This line counted only CLI-managed runtimes, so a machine with ROCm
+    // already installed was greeted with "No ROCm installs saved yet" -- read,
+    // reasonably, as "nothing is installed". Now that the resolver finds those
+    // installs and their versions, say what is actually on the machine, and that
+    // a pre-existing install is left alone on purpose rather than missed.
+    let managed = match summary.managed_runtime_count {
+        0 => None,
+        1 => Some("1 ROCm install saved".to_owned()),
+        count => Some(format!("{count} ROCm installs saved")),
+    };
+    let existing = (summary.legacy_rocm.status != "not_detected").then(|| {
+        summary.legacy_rocm.version.as_deref().map_or_else(
+            || "existing ROCm install found, left unmanaged by design".to_owned(),
+            |version| format!("existing ROCm {version} found, left unmanaged by design"),
+        )
+    });
+    let runtime = match (managed, existing) {
+        (Some(managed), Some(existing)) => format!("{managed}; {existing}"),
+        (Some(managed), None) => managed,
+        (None, Some(existing)) => format!("No ROCm installs saved yet; {existing}"),
+        (None, None) => "No ROCm installs saved yet".to_owned(),
     };
     format!(
         "ROCm setup check\n  {gpu}\n  {runtime}\n  Driver: {}\n\nDetails\n",
@@ -11095,7 +11707,10 @@ pub(crate) fn render_engine_inventory_text() -> String {
 }
 
 fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) -> String {
-    let default_engine = default_engine_for_platform();
+    // Mark the engine this GPU actually serves on as primary. Using the platform
+    // constant put the `*` on Lemonade even on Instinct, where `serve` picks vLLM.
+    let host_gpu = rocm_core::detect_host_gpu_summary(paths);
+    let default_engine = rocm_core::default_engine_for_host(&host_gpu);
     let mut output = String::new();
     let _ = writeln!(output, "Local model engines");
     let _ = writeln!(
@@ -11220,19 +11835,43 @@ fn append_examine_runtime_state(
     Ok(())
 }
 
-fn append_examine_engine_inventory(output: &mut String, paths: &AppPaths, config: &RocmCliConfig) {
+/// `host_default_engine` is the engine this GPU serves on, already resolved by
+/// the caller from the `ExamineSummary` it holds — passed in rather than
+/// re-probed so the two halves of one `rocm examine` run cannot disagree.
+fn append_examine_engine_inventory(
+    output: &mut String,
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+    host_default_engine: &str,
+) {
     let configured_default = config.default_engine.as_deref();
-    let effective_default = match configured_default {
-        Some(engine) => engine,
-        None => default_engine_for_platform(),
-    };
+    // A configured value still wins, mirroring `select_serve_engine`. Only the
+    // fallback becomes GPU-aware: it used to be the platform constant, which
+    // reported Lemonade on Instinct where serve picks vLLM.
+    let effective_default = configured_default.unwrap_or(host_default_engine);
     let _ = writeln!(output, "engine_inventory:");
+    // Unchanged on purpose: this line means "what the user configured", so an
+    // unset value must keep reading as unset rather than borrowing the host default.
     let _ = writeln!(
         output,
         "  configured_default_engine: {}",
         configured_default.unwrap_or("<platform default>")
     );
     let _ = writeln!(output, "  effective_default_engine: {effective_default}");
+    // Say so when a configured engine is holding this host off the one its GPU
+    // would pick. Installs provisioned before the installer stopped seeding
+    // `default_engine` still carry `lemonade` on disk, and nothing distinguishes
+    // that seed from a deliberate choice -- so point at the fix rather than
+    // rewriting a file the user owns on a guess. This also catches a genuinely
+    // stale choice made by hand, which no migration would have covered.
+    if let Some(configured) = configured_default
+        && configured != host_default_engine
+    {
+        let _ = writeln!(
+            output,
+            "  configured_default_note: overrides this host's {host_default_engine} preference; run `rocm config clear-default-engine` to follow the host"
+        );
+    }
     let _ = writeln!(
         output,
         "  plugin_policy: first-party engines are built in; external data-dir plugins are optional overrides"
@@ -11699,14 +12338,28 @@ fn artifact_source_policy_label(policy: &str) -> &str {
     }
 }
 
-#[allow(dead_code)]
+/// Human-readable size. `rocm storage` reports caches that are routinely tens
+/// of megabytes, so the intermediate tiers matter: a bare byte count is
+/// unreadable at the sizes this reports.
 fn format_bytes(bytes: u64) -> String {
-    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-    if bytes >= 1024 * 1024 * 1024 {
-        format!("{:.1} GiB", bytes as f64 / GIB)
-    } else {
-        format!("{bytes} bytes")
+    const KIB: f64 = 1024.0;
+    // `{:.1}` rounds, so from 1023.95 of a unit upwards the text already reads
+    // as a full 1024 of it. Step up there rather than printing "1024.0 KiB".
+    const ROUNDS_UP_TO_NEXT_UNIT: f64 = 1023.95;
+
+    let value = bytes as f64;
+    if value < KIB {
+        return format!("{bytes} bytes");
     }
+    let kib = value / KIB;
+    if kib < ROUNDS_UP_TO_NEXT_UNIT {
+        return format!("{kib:.1} KiB");
+    }
+    let mib = kib / KIB;
+    if mib < ROUNDS_UP_TO_NEXT_UNIT {
+        return format!("{mib:.1} MiB");
+    }
+    format!("{:.1} GiB", mib / KIB)
 }
 
 #[allow(dead_code)]
@@ -12838,12 +13491,27 @@ fn stop_internal_managed_service(paths: &AppPaths, service_id: &str) -> Result<s
     // that did not happen.
     if all_stopped {
         record.status = "stopped".to_owned();
+        record.stop_requested_unix_ms = None;
+    } else {
+        // Record that a stop was *asked for* even though it could not be
+        // confirmed. `refresh_managed_service_runtime_liveness` needs this to
+        // tell a service the operator stopped from one that merely crashed: only
+        // the former should lose its endpoint key once its processes are gone.
+        record.stop_requested_unix_ms = Some(rocm_core::unix_time_millis());
     }
     record.write()?;
     // Drop the endpoint key with the service by deleting its 0600 key file.
     // Best-effort — a stopped service must not fail to stop just because key
     // cleanup did.
-    endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
+    //
+    // Gated on `all_stopped` for the same reason the status is: an unconfirmed
+    // stop may have left the engine alive and still enforcing the key, and
+    // discarding our only copy would lock the CLI's own probes, chat, and
+    // service discovery out of a service that is otherwise fine. The marker
+    // written above hands that cleanup to the liveness refresh instead.
+    if all_stopped {
+        endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
+    }
     let engine_stop = match engine_stop {
         Ok(response) => serde_json::json!({
             "attempted": true,
@@ -12892,10 +13560,19 @@ fn restart_internal_managed_service(
     // service back on the same public host with the same auth. Capture it first and
     // re-store it after the stop so the spawn below hands the child the same key.
     let preserved_endpoint_key = endpoint_keys::endpoint_api_key(paths, service_id);
+    // Checked before the stop, so a refused restart leaves a running service
+    // running instead of stopping it and then failing to bring it back.
+    ensure_public_service_has_endpoint_key(&record.host, preserved_endpoint_key.is_some())?;
     let _ = stop_internal_managed_service(paths, service_id);
     if let Some(key) = preserved_endpoint_key.as_deref() {
         endpoint_keys::store_endpoint_api_key(paths, service_id, key)?;
     }
+    // The stop above may have recorded an unconfirmed-stop marker; a successful
+    // restart supersedes it. Leaving it set would let the next liveness refresh
+    // delete the key of the service we are bringing back up. Reaches disk with
+    // the record writes below; if the restart bails before one of those, the
+    // marker stays set on disk — correct, since then the stop is what stands.
+    record.stop_requested_unix_ms = None;
     let policy = parse_device_policy(record.device_policy.as_deref())?;
     fs::OpenOptions::new()
         .create(true)
@@ -12981,20 +13658,22 @@ fn restart_internal_managed_service(
     record.engine_pid = Some(child_pid);
     // Refresh the identity token in lockstep with the restarted child's PID.
     record.supervisor_start_ticks = rocm_core::process_start_ticks(child_pid);
-    record.restart_count = record.restart_count.saturating_add(1);
-    record.last_restart_unix_ms = Some(rocm_core::unix_time_millis());
-    record.status = if wait_for_service_http_ready(
+    // Counts the restart and drops the previous run's inference verification —
+    // the new child has an unloaded model, so the old verdict says nothing about
+    // it.
+    record.reset_for_restart();
+    let readiness = wait_for_service_http_ready(
         &record.engine,
         &record.host,
         record.port,
         &record.canonical_model_id,
         endpoint_api_key.as_deref(),
         Duration::from_secs(45),
-    ) {
-        "ready".to_owned()
-    } else {
-        "starting".to_owned()
-    };
+    );
+    record.status = status_for_readiness(readiness).to_owned();
+    if readiness == EndpointReadiness::Serving {
+        record.inference_verified_at_unix_ms = Some(rocm_core::unix_time_millis() as u64);
+    }
     record.write()?;
     Ok(record)
 }
@@ -13762,47 +14441,111 @@ fn managed_service_running_state(status: &str) -> &'static str {
 
 const SERVICE_LIVENESS_CHECK_TIMEOUT: Duration = Duration::from_millis(750);
 
+/// The real process ids a record tracks.
+///
+/// The launcher pid is always recorded; `engine_pid` is adopted once the engine
+/// state file reports one. A `0` pid is a placeholder, never a real process.
+fn recorded_service_pids(record: &ManagedServiceRecord) -> Vec<u32> {
+    [record.engine_pid, Some(record.supervisor_pid)]
+        .into_iter()
+        .flatten()
+        .filter(|pid| *pid != 0)
+        .collect()
+}
+
+/// Complete a stop that was requested but could not confirm termination, once
+/// the processes are actually observed gone: drop the endpoint key and clear the
+/// marker. Returns whether the record changed.
+///
+/// This is deliberately keyed on `stop_requested_unix_ms` rather than on "the
+/// tracked pids are dead". A *crashed* service also has dead pids, but its
+/// operator never asked for it to go away and will want it back: dropping the
+/// key there would make `rocm services restart` and daemon recovery refuse it
+/// permanently — fail-closed guards have no way to re-mint a key. The cost of
+/// this choice is that a crashed public service's 0600 key file outlives the
+/// process until the service is stopped or successfully restarted.
+///
+/// Called before the liveness gate in
+/// [`refresh_managed_service_runtime_liveness`], so a record that reached
+/// "stopped" by another route still gets its deferred cleanup rather than
+/// stranding the key.
+fn settle_pending_stop_key_cleanup(paths: &AppPaths, record: &mut ManagedServiceRecord) -> bool {
+    if record.stop_requested_unix_ms.is_none() {
+        return false;
+    }
+    if recorded_service_pids(record)
+        .iter()
+        .any(|pid| process_is_running(*pid))
+    {
+        return false;
+    }
+    endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
+    record.stop_requested_unix_ms = None;
+    true
+}
+
 fn refresh_managed_service_runtime_liveness(
     paths: &AppPaths,
     record: &mut ManagedServiceRecord,
 ) -> bool {
+    let settled_pending_stop = settle_pending_stop_key_cleanup(paths, record);
     if !managed_service_is_live(record) {
-        return false;
+        return settled_pending_stop;
     }
 
     // Probe with the service's key so a protected public service is not mistaken
     // for dead (an anonymous /v1/models would 401).
     let endpoint_api_key = endpoint_keys::endpoint_api_key(paths, &record.service_id);
-    let endpoint_ready = matches!(record.status.as_str(), "ready" | "running")
-        && managed_service_endpoint_model_ready(
+    let outcome = if matches!(record.status.as_str(), "ready" | "running") {
+        managed_service_endpoint_readiness(
             record,
             endpoint_api_key.as_deref(),
             SERVICE_LIVENESS_CHECK_TIMEOUT,
+            rocm_core::INFERENCE_PROBE_TIMEOUT,
         )
-        .unwrap_or(false);
-    if endpoint_ready {
+    } else {
+        EndpointReadinessOutcome {
+            readiness: EndpointReadiness::Unreachable,
+            record_changed: false,
+        }
+    };
+    let readiness = outcome.readiness;
+    if readiness == EndpointReadiness::Serving {
         // Mirror `providers.rs::ready_local_services()`: a live, probe-passing
         // service should be persisted as "ready", not left stuck at "running".
         if record.status == "running" {
             record.status = "ready".to_owned();
             return true;
         }
-        return false;
+        // A newly latched verification is itself worth persisting, so the next
+        // check reads it instead of sending another inference request.
+        return settled_pending_stop || outcome.record_changed;
+    }
+    if readiness == EndpointReadiness::Listing {
+        // The server is up and advertising the model; the weights are simply not
+        // usable yet. Leave the status alone rather than demoting to "starting" —
+        // `rocmd` restarts a service that sits in "starting" past its stale
+        // window, which for a slow-loading model would restart it mid-load and
+        // begin the wait all over again. Still report a change when the probe
+        // bookkeeping moved, so the retry throttle is persisted and the next
+        // process does not spend another full probe timeout.
+        return settled_pending_stop || outcome.record_changed;
     }
 
-    let tracked_pids = [record.engine_pid, Some(record.supervisor_pid)]
-        .into_iter()
-        .flatten()
-        .filter(|pid| *pid != 0)
-        .collect::<Vec<_>>();
+    let tracked_pids = recorded_service_pids(record);
     let has_tracked_pid = !tracked_pids.is_empty();
     let has_live_pid = tracked_pids.iter().any(|pid| process_is_running(*pid));
     if has_tracked_pid && !has_live_pid {
+        // Reconcile the status only. The endpoint key is *not* dropped here:
+        // dead pids alone do not distinguish a stopped service from a crashed
+        // one, and a crashed public service needs its key to be restartable.
+        // `settle_pending_stop_key_cleanup` above owns that cleanup, gated on a
+        // stop having actually been requested.
         if record.status != "stopped" {
             record.status = "stopped".to_owned();
             return true;
         }
-        return false;
+        return settled_pending_stop;
     }
 
     if matches!(record.status.as_str(), "ready" | "running") {
@@ -13813,7 +14556,7 @@ fn refresh_managed_service_runtime_liveness(
         }
     }
 
-    false
+    settled_pending_stop
 }
 
 fn local_server_sidebar_status(counts: &ManagedServiceSidebarCounts) -> String {
@@ -13983,20 +14726,41 @@ impl PlannedToolCall {
 
 #[cfg(test)]
 fn build_freeform_plan(request: &str, config: &RocmCliConfig) -> StructuredRequestPlan {
-    build_freeform_plan_with_recipes(request, config, None)
+    build_freeform_plan_with_recipes(request, config, None, host_default_engine(None))
 }
 
+/// The engine this host serves on, for callers that need it as an owned default.
+///
+/// Kept separate from the planner so the planner stays a pure function of its
+/// inputs: it bakes the engine into a `rocm serve --engine <engine>` command, and
+/// an explicit `--engine` outranks every other signal in [`select_serve_engine`],
+/// so a probe hidden inside it would make that command silently host-dependent
+/// and its tests unreproducible.
+fn host_default_engine(paths: Option<&AppPaths>) -> &'static str {
+    rocm_core::default_engine_for_host(&rocm_core::detect_host_gpu_summary(paths))
+}
+
+/// `host_default_engine` is the engine this GPU serves on, resolved by the
+/// caller. It is the last resort: an engine named in the request wins, then the
+/// configured default, then the matched recipe's preference.
+///
+/// It must NOT be [`default_engine_for_platform`]. The value chosen here is
+/// written into a literal `--engine` argument, which outranks even the
+/// configured default when the generated command runs — so a GPU-blind constant
+/// here forces Lemonade onto an Instinct host through the strongest override
+/// available, which is the defect this whole path is meant to avoid.
 fn build_freeform_plan_with_recipes(
     request: &str,
     config: &RocmCliConfig,
     recipes: Option<&[ModelRecipeRecord]>,
+    host_default_engine: &str,
 ) -> StructuredRequestPlan {
     let trimmed = request.trim();
     let lower = trimmed.to_ascii_lowercase();
     let default_engine = config
         .default_engine
         .as_deref()
-        .unwrap_or(default_engine_for_platform());
+        .unwrap_or(host_default_engine);
 
     if planner_is_serve_request(&lower) {
         let requested_model = infer_model_from_request(trimmed)
@@ -14456,10 +15220,14 @@ fn build_freeform_plan_with_context(
     paths: &AppPaths,
     config: &RocmCliConfig,
 ) -> StructuredRequestPlan {
+    // Resolved once here, where `paths` is in scope, so the generated
+    // `rocm serve --engine <engine>` names the engine this GPU actually serves on.
+    let host_engine = host_default_engine(Some(paths));
     let registry = match load_model_recipe_registry() {
         Ok(registry) => Some(registry),
         Err(error) => {
-            let mut plan = build_freeform_plan_with_recipes(request, config, Some(&[]));
+            let mut plan =
+                build_freeform_plan_with_recipes(request, config, Some(&[]), host_engine);
             plan.confidence = "medium";
             plan.notes.push(format!(
                 "Model recipe registry could not be loaded: {error}. Fix the recipe index before using registry aliases."
@@ -14473,6 +15241,7 @@ fn build_freeform_plan_with_context(
         registry
             .as_ref()
             .map(|registry| registry.recipes.as_slice()),
+        host_engine,
     );
     if !freeform_plan_needs_ambiguity_resolution(&deterministic) {
         return deterministic;
@@ -14999,6 +15768,10 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
         }
     }
 
+    for note in shared_cache_notes(paths) {
+        plan.warnings.push(note);
+    }
+
     let managed_services = load_managed_services(paths).unwrap_or_default();
     if !managed_services.is_empty() {
         plan.warnings.push(format!(
@@ -15054,6 +15827,76 @@ fn render_uninstall_plan(plan: &UninstallPlan, options: &UninstallOptions) -> St
         let _ = writeln!(output, "Choose Review uninstall to approve removal.");
     }
     output
+}
+
+/// Caches that ROCm CLI causes to be filled but does not own, so uninstall
+/// leaves them in place.
+///
+/// These are usually the largest things on disk after an install, so a plan
+/// that stays silent about them reads as a clean slate it does not deliver.
+/// Only paths that exist and sit outside everything already being removed are
+/// reported, so the notes stay truthful as caches move under the data
+/// directory.
+fn shared_cache_notes(paths: &AppPaths) -> Vec<String> {
+    let removed_roots = [
+        paths.config_dir.clone(),
+        paths.data_dir.clone(),
+        paths.cache_dir.clone(),
+    ];
+    shared_cache_notes_for(&removed_roots, &shared_cache_candidates())
+}
+
+/// The pure part of [`shared_cache_notes`], so the filtering is testable without
+/// depending on the caller's real environment.
+fn shared_cache_notes_for(
+    removed_roots: &[PathBuf],
+    candidates: &[(PathBuf, &'static str)],
+) -> Vec<String> {
+    candidates
+        .iter()
+        .filter(|(path, _)| path.exists())
+        .filter(|(path, _)| !removed_roots.iter().any(|root| path.starts_with(root)))
+        .map(|(path, description)| format!("{description} not removed: {}", path.display()))
+        .collect()
+}
+
+/// The shared caches worth reporting, with why each is left alone.
+fn shared_cache_candidates() -> Vec<(PathBuf, &'static str)> {
+    let mut candidates = Vec::new();
+
+    // `uv` writes to `UV_CACHE_DIR` when set, otherwise its own default. Read it
+    // rather than assuming a location, so this stays correct wherever the cache
+    // has been pointed.
+    let uv_cache = env_path("UV_CACHE_DIR")
+        .or_else(|| rocm_core::runtime_home_dir().map(|home| home.join(".cache").join("uv")));
+    if let Some(path) = uv_cache {
+        candidates.push((
+            path,
+            "the uv package cache is shared with other uv projects on this computer and is",
+        ));
+    }
+
+    let hf_cache = env_path("HF_HOME")
+        .map(|home| home.join("hub"))
+        .or_else(|| env_path("HUGGINGFACE_HUB_CACHE"))
+        .or_else(|| {
+            rocm_core::runtime_home_dir()
+                .map(|home| home.join(".cache").join("huggingface").join("hub"))
+        });
+    if let Some(path) = hf_cache {
+        candidates.push((
+            path,
+            "downloaded model files are slow to fetch again and may include your own, so they are",
+        ));
+    }
+
+    candidates
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 fn confirm_uninstall() -> Result<bool> {
@@ -15808,6 +16651,51 @@ fn gpu_low_memory_warning(gpu_indices: &[u32], vram: Option<&[GpuVramUsage]>) ->
     None
 }
 
+/// Whether the reported VRAM capacity describes the memory the engine will
+/// actually draw on.
+///
+/// An APU has no private VRAM. `amd-smi` reports the fixed BIOS carveout (often
+/// ~4 GiB) as `total_vram`, while the allocator serves the model out of
+/// GTT-backed system RAM — so on a 128 GiB Strix Halo, "only 1.6 GiB of 4.0 GiB
+/// free" is measuring the wrong pool. It fires on healthy machines and would
+/// stay quiet on a genuinely starved one, so a low-memory warning built on it
+/// carries no information and is better withheld.
+///
+/// The single-GPU condition is what keeps this honest.
+/// [`rocm_core::gfx_is_apu_family`] classifies a *part*, and host detection
+/// yields one target for the whole machine, so on a laptop pairing an APU with
+/// a discrete card an APU verdict would otherwise suppress a legitimate warning
+/// about the discrete card. When more than one GPU is present we cannot
+/// attribute the target to the selected ordinal, so the warning stands.
+fn vram_capacity_is_meaningful(gfx_target: Option<&str>, gpu_count: usize) -> bool {
+    if gpu_count != 1 {
+        return true;
+    }
+    !gfx_target.is_some_and(rocm_core::gfx_is_apu_family)
+}
+
+/// The serve plan's low-VRAM warning, withheld on hosts where the VRAM figures
+/// do not describe the memory the engine uses (see
+/// [`vram_capacity_is_meaningful`]).
+///
+/// Resolves the gfx target only once a warning would actually be emitted. Host
+/// GPU detection can probe sysfs/WSL — `serve` deliberately gates its own call
+/// on whether engine selection needs it — so the quiet path must not start
+/// paying for a lookup it will never use.
+fn serve_gpu_low_memory_warning(
+    gpu_indices: &[u32],
+    vram: Option<&[GpuVramUsage]>,
+    host_gpu_summary: Option<&rocm_core::HostGpuSummary>,
+) -> Option<String> {
+    let warning = gpu_low_memory_warning(gpu_indices, vram)?;
+    let gpu_count = vram.map_or(0, <[GpuVramUsage]>::len);
+    let gfx_target = match host_gpu_summary {
+        Some(summary) => summary.gfx_target.clone(),
+        None => rocm_core::detect_host_gfx_target(),
+    };
+    vram_capacity_is_meaningful(gfx_target.as_deref(), gpu_count).then_some(warning)
+}
+
 /// GPU ordinals currently pinned by running rocm-cli managed/foreground
 /// services, used to skip busy devices during `--gpu auto` selection.
 fn busy_gpu_indices(paths: &AppPaths) -> Vec<u32> {
@@ -16083,7 +16971,7 @@ fn wait_for_service_http_ready(
     canonical_model_id: &str,
     endpoint_api_key: Option<&str>,
     timeout: Duration,
-) -> bool {
+) -> EndpointReadiness {
     wait_for_service_http_ready_with_progress(
         engine,
         host,
@@ -16095,12 +16983,21 @@ fn wait_for_service_http_ready(
     )
 }
 
-/// Poll the engine's health endpoints until the server answers ready or `timeout`
-/// elapses, invoking `on_tick(elapsed)` once per polling iteration so a caller can
-/// animate a spinner. Engine-neutral: `service_http_readiness_paths` already maps
-/// each engine to the right health path and normalizes the response to ready/not.
-/// `endpoint_api_key` is sent as a bearer token so the probe still succeeds against
-/// a public endpoint that now requires authentication.
+/// Wait until the service can actually serve, reporting how far it got.
+///
+/// A health or model-listing endpoint answering is not enough to call a service
+/// ready: engines advertise a model within seconds of accepting its name, while
+/// the weights can take minutes to become usable, so a caller that sends its
+/// first request on that signal gets a hang. Only [`EndpointReadiness::Serving`]
+/// — an inference request that came back — means ready; a service that lists the
+/// model without answering one is [`EndpointReadiness::Listing`], and the best
+/// result seen before `timeout` is what gets returned.
+///
+/// Polls until `timeout` elapses, invoking `on_tick(elapsed)` once per iteration
+/// so a caller can animate a spinner. Engine-neutral: `service_http_readiness_paths`
+/// maps each engine to the right listing path. `endpoint_api_key` is sent as a
+/// bearer token so both the listing check and the inference probe still succeed
+/// against a public endpoint that requires authentication.
 fn wait_for_service_http_ready_with_progress(
     engine: &str,
     host: &str,
@@ -16109,30 +17006,59 @@ fn wait_for_service_http_ready_with_progress(
     endpoint_api_key: Option<&str>,
     timeout: Duration,
     on_tick: &mut dyn FnMut(Duration),
-) -> bool {
+) -> EndpointReadiness {
     let start = std::time::Instant::now();
+    let endpoint = format_http_base_url(host, port);
+    let mut best = EndpointReadiness::Unreachable;
     while start.elapsed() < timeout {
-        for path in service_http_readiness_paths(engine) {
-            if let Ok((status, body)) = http_get_local_service(
+        let listed = service_http_readiness_paths(engine).iter().any(|path| {
+            http_get_local_service(
                 host,
                 port,
                 path,
                 endpoint_api_key,
                 Duration::from_millis(750),
-            ) && service_http_readiness_response_ready(
-                engine,
-                path,
-                status,
-                &body,
+            )
+            .is_ok_and(|(status, body)| {
+                service_http_readiness_response_ready(
+                    engine,
+                    path,
+                    status,
+                    &body,
+                    canonical_model_id,
+                )
+            })
+        });
+        if listed {
+            best = EndpointReadiness::Listing;
+            if rocm_core::openai_chat_completion_probe(
+                &endpoint,
                 canonical_model_id,
-            ) {
-                return true;
+                endpoint_api_key,
+                rocm_core::INFERENCE_PROBE_TIMEOUT,
+            )
+            .unwrap_or(false)
+            {
+                return EndpointReadiness::Serving;
             }
         }
         on_tick(start.elapsed());
         thread::sleep(Duration::from_millis(250));
     }
-    false
+    best
+}
+
+/// The record status matching how far the endpoint got.
+///
+/// `Listing` maps to `running`, not `starting`: the engine is up and loading
+/// normally, and `rocmd` restarts a service left in `starting` past its stale
+/// window, which would kill a slow-loading model mid-load.
+const fn status_for_readiness(readiness: EndpointReadiness) -> &'static str {
+    match readiness {
+        EndpointReadiness::Serving => "ready",
+        EndpointReadiness::Listing => "running",
+        EndpointReadiness::Unreachable => "starting",
+    }
 }
 
 fn service_http_readiness_paths(engine: &str) -> &'static [&'static str] {
@@ -16324,6 +17250,7 @@ fn treat_as_natural_language(args: &[String]) -> bool {
         "install",
         "update",
         "runtimes",
+        "storage",
         "engines",
         "model",
         "models",
@@ -16351,6 +17278,64 @@ fn treat_as_natural_language(args: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A cache that has moved inside a directory uninstall already removes must
+    /// not be reported as "not removed" — the note would be false.
+    #[test]
+    fn shared_cache_notes_skip_paths_already_being_removed() {
+        let root = std::env::temp_dir().join(format!("rocm-shared-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("data");
+        let inside = data.join("uv-cache");
+        std::fs::create_dir_all(&inside).unwrap();
+
+        let notes = super::shared_cache_notes_for(
+            &[root.join("config"), data, root.join("cache")],
+            &[(inside, "the uv package cache")],
+        );
+
+        assert!(
+            notes.is_empty(),
+            "a cache inside a removed directory must not be reported: {notes:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A cache that exists outside everything being removed is reported, with
+    /// its path, so the plan does not imply a clean slate it will not deliver.
+    #[test]
+    fn shared_cache_notes_report_paths_left_behind() {
+        let root = std::env::temp_dir().join(format!("rocm-shared-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let outside = root.join("elsewhere").join("uv");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let notes = super::shared_cache_notes_for(
+            &[root.join("data")],
+            &[(outside.clone(), "the uv package cache")],
+        );
+
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("not removed"), "{notes:?}");
+        assert!(
+            notes[0].contains(&outside.display().to_string()),
+            "{notes:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A cache that does not exist is not worth mentioning.
+    #[test]
+    fn shared_cache_notes_ignore_missing_paths() {
+        let missing = std::env::temp_dir().join("rocm-definitely-not-here-12345");
+        let notes = super::shared_cache_notes_for(
+            &[std::env::temp_dir()],
+            &[(missing, "the uv package cache")],
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -16412,6 +17397,190 @@ mod tests {
         assert_eq!(
             names, sorted,
             "top-level `rocm --help` commands are not alphabetized"
+        );
+    }
+
+    #[test]
+    fn every_framework_choice_reaches_the_library() {
+        // The defect this flag fixes was not a missing enum -- the library had
+        // all four variants -- but that no caller could select one. Pin the
+        // mapping so a renamed variant cannot silently fall back to the default.
+        use rocm_core::FrameworkProbe;
+        assert_eq!(
+            FrameworkProbe::from(FrameworkArg::Auto),
+            FrameworkProbe::Auto
+        );
+        assert_eq!(
+            FrameworkProbe::from(FrameworkArg::Pytorch),
+            FrameworkProbe::PyTorch
+        );
+        assert_eq!(
+            FrameworkProbe::from(FrameworkArg::LlamaCpp),
+            FrameworkProbe::LlamaCpp
+        );
+        assert_eq!(
+            FrameworkProbe::from(FrameworkArg::Skip),
+            FrameworkProbe::Skip
+        );
+    }
+
+    #[test]
+    fn the_framework_choice_is_offered_on_the_command_line() {
+        // Guards the actual regression: the variants existed in the library and
+        // were unreachable from here. A user must be able to see and pass them.
+        let help = Cli::command()
+            .find_subcommand_mut("examine")
+            .expect("examine subcommand")
+            .render_long_help()
+            .to_string();
+        for choice in ["auto", "pytorch", "llama-cpp", "skip"] {
+            assert!(
+                help.contains(choice),
+                "`{choice}` must be offered by `rocm examine --help`:\n{help}"
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_scope_commands_are_marked_preview_in_help() {
+        let help = Cli::command().render_long_help().to_string();
+        for command in ["chat", "comfyui", "automations"] {
+            let line = help
+                .lines()
+                .find(|line| line.trim_start().starts_with(command))
+                .unwrap_or_else(|| panic!("`{command}` missing from help:\n{help}"));
+            assert!(
+                line.contains("[preview]"),
+                "`{command}` is outside the Tech Preview scope and must say so:\n{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_preview_marker_is_explained_and_not_contradicted() {
+        let help = Cli::command().render_long_help().to_string();
+        // A marker nobody can interpret is no better than no marker.
+        assert!(
+            help.contains("Commands marked [preview]"),
+            "the marker must be explained in the help footer:\n{help}"
+        );
+        // A command cannot be promoted as a headline example while being marked
+        // unfinished — that is the contradiction this pairing exists to prevent.
+        let examples = help
+            .split_once("EXAMPLES:")
+            .map(|(_, rest)| rest)
+            .unwrap_or_default();
+        for command in ["chat", "comfyui", "automations"] {
+            assert!(
+                !examples.contains(&format!("rocm {command}")),
+                "`{command}` is marked preview, so it must not headline the examples:\n{examples}"
+            );
+        }
+    }
+
+    /// An `ExamineSummary` with the install-reporting fields under test and
+    /// everything else inert.
+    fn summary_with_legacy(
+        managed_runtime_count: usize,
+        legacy_status: &str,
+        legacy_version: Option<&str>,
+    ) -> ExamineSummary {
+        ExamineSummary {
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            kernel: None,
+            distro: None,
+            cpu: None,
+            system_ram_gib: None,
+            interactive_terminal: false,
+            default_engine: "lemonade".to_owned(),
+            detected_gfx_target: None,
+            compatible_therock_family: None,
+            detected_therock_family: None,
+            driver: rocm_core::DriverSummary {
+                policy: "linux_official_amd_dkms_wrapper".to_owned(),
+                status: "amdgpu_available".to_owned(),
+                detail: None,
+            },
+            legacy_rocm: rocm_core::LegacyRocmSummary {
+                status: legacy_status.to_owned(),
+                paths: Vec::new(),
+                detail: None,
+                version: legacy_version.map(str::to_owned),
+            },
+            wsl: None,
+            managed_runtime_count,
+            managed_service_count: 0,
+            model_cache_entries: 0,
+            config_dir: PathBuf::from("config"),
+            data_dir: PathBuf::from("data"),
+            cache_dir: PathBuf::from("cache"),
+        }
+    }
+
+    #[test]
+    fn header_does_not_claim_nothing_is_installed_when_rocm_is_present() {
+        // The reported case: ROCm on the machine, none of it CLI-managed. The
+        // header counted only managed runtimes, so it said "No ROCm installs
+        // saved yet" — read as "nothing is installed".
+        let header = render_examine_plain_header(&summary_with_legacy(
+            0,
+            "detected_unmanaged",
+            Some("7.14.0"),
+        ));
+        assert!(
+            header.contains("existing ROCm 7.14.0 found"),
+            "the detected install and its version must appear:\n{header}"
+        );
+        assert!(
+            header.contains("left unmanaged by design"),
+            "it must read as a deliberate choice, not an oversight:\n{header}"
+        );
+    }
+
+    #[test]
+    fn header_reports_a_detected_install_whose_version_is_unknown() {
+        // Degrades to naming the install without inventing a version.
+        let header =
+            render_examine_plain_header(&summary_with_legacy(0, "detected_unmanaged", None));
+        assert!(
+            header.contains("existing ROCm install found"),
+            "the install must still be reported:\n{header}"
+        );
+        assert!(
+            !header.contains("<unknown>"),
+            "an unknown version must not leak a placeholder into the summary:\n{header}"
+        );
+    }
+
+    #[test]
+    fn header_accounts_for_managed_and_existing_installs_together() {
+        let header = render_examine_plain_header(&summary_with_legacy(
+            2,
+            "detected_unmanaged",
+            Some("6.4.1"),
+        ));
+        assert!(
+            header.contains("2 ROCm installs saved"),
+            "the managed count must survive:\n{header}"
+        );
+        assert!(
+            header.contains("existing ROCm 6.4.1 found"),
+            "the unmanaged install must be reported alongside it:\n{header}"
+        );
+    }
+
+    #[test]
+    fn header_still_says_nothing_is_installed_when_nothing_is() {
+        // The wording only changes when there is something to report.
+        let header = render_examine_plain_header(&summary_with_legacy(0, "not_detected", None));
+        assert!(
+            header.contains("No ROCm installs saved yet"),
+            "an empty machine must keep the original wording:\n{header}"
+        );
+        assert!(
+            !header.contains("existing ROCm"),
+            "nothing should be claimed on an empty machine:\n{header}"
         );
     }
 
@@ -17015,17 +18184,220 @@ mod tests {
     }
 
     #[test]
+    fn serve_readiness_wait_withholds_ready_while_the_model_only_lists() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // This is the wait behind `rocm serve`, and its verdict is what
+        // `services list` later prints. A model listing on `/v1/models` while
+        // inference still fails must come back as `Listing` — reporting it ready
+        // is the false positive users and automation trip over.
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        let server = thread::spawn(move || -> Result<()> {
+            // Serve until the wait below gives up and the test drops the socket.
+            while let Ok((mut stream, _)) = listener.accept() {
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buffer = [0_u8; 1024];
+                let Ok(read) = stream.read(&mut buffer) else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                let (status_line, body) = if request.starts_with("POST /v1/chat/completions ") {
+                    ("HTTP/1.1 503 Service Unavailable", r#"{"error":"loading"}"#)
+                } else {
+                    ("HTTP/1.1 200 OK", r#"{"data":[{"id":"Qwen3-0.6B-GGUF"}]}"#)
+                };
+                let _ = write!(
+                    stream,
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+            Ok(())
+        });
+
+        let readiness = wait_for_service_http_ready(
+            "vllm",
+            "127.0.0.1",
+            port,
+            "Qwen3-0.6B-GGUF",
+            None,
+            Duration::from_millis(600),
+        );
+
+        assert_eq!(
+            readiness,
+            EndpointReadiness::Listing,
+            "a listed-but-unservable model is not ready"
+        );
+        assert_eq!(
+            status_for_readiness(readiness),
+            "running",
+            "a loading service must not be recorded as `starting`, which rocmd \
+             restarts once stale"
+        );
+        drop(server);
+        Ok(())
+    }
+
+    #[test]
+    fn serve_readiness_wait_reports_ready_once_inference_answers() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        let server = thread::spawn(move || -> Result<()> {
+            while let Ok((mut stream, _)) = listener.accept() {
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buffer = [0_u8; 1024];
+                let Ok(read) = stream.read(&mut buffer) else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                let body = if request.starts_with("POST /v1/chat/completions ") {
+                    r#"{"choices":[{"message":{"content":"ok"}}]}"#
+                } else {
+                    r#"{"data":[{"id":"Qwen3-0.6B-GGUF"}]}"#
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+            Ok(())
+        });
+
+        let readiness = wait_for_service_http_ready(
+            "vllm",
+            "127.0.0.1",
+            port,
+            "Qwen3-0.6B-GGUF",
+            None,
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(readiness, EndpointReadiness::Serving);
+        assert_eq!(status_for_readiness(readiness), "ready");
+        drop(server);
+        Ok(())
+    }
+
+    #[test]
+    fn a_loading_service_keeps_its_status_instead_of_being_demoted() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // A model that is listed but cannot serve yet is coming up normally. It
+        // must not be demoted to "starting": `rocmd` restarts a service that sits
+        // in "starting" past its stale window, which would kill a slow-loading
+        // model mid-load and start the wait over.
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        // Keeps listing the model for as long as the test asks, so a second
+        // readiness check reaches the probe throttle rather than an unanswered
+        // socket. Counts the inference requests that actually got sent.
+        let probes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_probes = std::sync::Arc::clone(&probes);
+        let server = thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buffer = [0_u8; 1024];
+                let Ok(read) = stream.read(&mut buffer) else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                if request.starts_with("POST /v1/chat/completions ") {
+                    server_probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let body = r#"{"error":"loading model"}"#;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                } else {
+                    let body = r#"{"data":[{"id":"Qwen3-0.6B-GGUF"}]}"#;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                }
+            }
+        });
+
+        let (root, paths) = test_paths("liveness-loading-service");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-loading",
+            "vllm",
+            "Qwen3-0.6B-GGUF",
+            "Qwen3-0.6B-GGUF",
+            "127.0.0.1",
+            port,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = "running".to_owned();
+        record.write()?;
+
+        let changed = refresh_managed_service_runtime_liveness(&paths, &mut record);
+
+        assert_eq!(
+            record.status, "running",
+            "a loading service keeps its status rather than being demoted"
+        );
+        assert!(
+            record.inference_verified_at_unix_ms.is_none(),
+            "nothing is latched until inference actually answers"
+        );
+        assert!(
+            changed && record.inference_probe_attempted_at_unix_ms.is_some(),
+            "the probe attempt is recorded and reported so the caller persists \
+             the retry throttle"
+        );
+
+        // Second pass, inside the retry interval: the throttle holds, so the
+        // model is not asked to generate again just because someone re-listed.
+        let changed_again = refresh_managed_service_runtime_liveness(&paths, &mut record);
+        assert!(!changed_again, "a throttled check changes nothing");
+        assert_eq!(record.status, "running");
+        assert_eq!(
+            probes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a warming service must not be re-probed by every poll"
+        );
+
+        drop(server);
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
     fn load_managed_services_promotes_running_to_ready_once_probe_passes() -> Result<()> {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let port = listener.local_addr()?.port();
-        // Two probes hit this mock: one from `load_managed_services`, another
-        // from the `load_managed_service` re-read below that verifies the
-        // promotion was actually persisted, not just returned in-memory.
-        let server = thread::spawn(move || -> Result<()> {
-            for _ in 0..2 {
+        // Three requests hit this mock. `load_managed_services` lists the model
+        // and then confirms inference, which promotes the record and latches the
+        // verification; the `load_managed_service` re-read below (which proves the
+        // promotion was persisted, not just returned in-memory) reads that latch
+        // and so only re-lists.
+        let server = thread::spawn(move || -> Result<Vec<String>> {
+            let mut requests = Vec::new();
+            for _ in 0..3 {
                 let (mut stream, _) = listener.accept()?;
                 stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
                 let mut request_bytes = Vec::new();
@@ -17040,15 +18412,21 @@ mod tests {
                         break;
                     }
                 }
-                let body = r#"{"data":[{"id":"Qwen3-0.6B-GGUF"}]}"#;
+                let request = String::from_utf8_lossy(&request_bytes).into_owned();
+                let body = if request.starts_with("POST /v1/chat/completions ") {
+                    r#"{"choices":[{"message":{"content":"ok"}}]}"#
+                } else {
+                    r#"{"data":[{"id":"Qwen3-0.6B-GGUF"}]}"#
+                };
                 write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 )?;
+                requests.push(request);
             }
-            Ok(())
+            Ok(requests)
         });
 
         let (root, paths) = test_paths("load-managed-services-promote-ready");
@@ -17094,8 +18472,25 @@ mod tests {
         // in-memory, since chat's `pick_managed_chat_endpoint` re-reads it.
         let reloaded = load_managed_service(&paths, "svc-qwen-promote")?;
         assert_eq!(reloaded.status, "ready");
+        assert!(
+            reloaded.inference_verified_at_unix_ms.is_some(),
+            "the inference verification is persisted with the promotion"
+        );
 
-        server.join().expect("server thread should not panic")?;
+        let requests = server.join().expect("server thread should not panic")?;
+        let lines: Vec<&str> = requests
+            .iter()
+            .filter_map(|request| request.lines().next())
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "GET /v1/models HTTP/1.1",
+                "POST /v1/chat/completions HTTP/1.1",
+                "GET /v1/models HTTP/1.1",
+            ],
+            "promotion confirms inference once; the re-read reads the latch"
+        );
         fs::remove_dir_all(root).ok();
         Ok(())
     }
@@ -17122,6 +18517,7 @@ mod tests {
                 status: "not_detected".to_owned(),
                 paths: Vec::new(),
                 detail: None,
+                version: None,
             },
             wsl: wsl.then_some(rocm_core::WslSummary {
                 is_wsl: true,
@@ -17230,6 +18626,7 @@ mod tests {
             "serve signedtiny",
             &RocmCliConfig::default(),
             Some(&[recipe]),
+            "lemonade",
         );
 
         assert_eq!(plan.intent, PlannerIntent::Serve);
@@ -17365,8 +18762,75 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_planner_bakes_the_host_engine_into_the_generated_serve_command() {
+        // The generated command carries an explicit `--engine`, which outranks
+        // every other signal in `select_serve_engine` -- including the configured
+        // default. So whatever this planner picks IS what runs, and on an Instinct
+        // host that must be vLLM. A GPU-blind constant here reintroduced the very
+        // bug this PR fixes, through the strongest override available.
+        //
+        // An empty recipe set is what reaches the host default: a request naming
+        // an engine, or a matched recipe that prefers one, is answered before the
+        // fallback -- correctly, since a GGUF model only Lemonade can serve must
+        // not be forced onto vLLM by the host.
+        let plan = build_freeform_plan_with_recipes(
+            "serve some/unmatched-model",
+            &RocmCliConfig::default(),
+            Some(&[]),
+            "vllm",
+        );
+
+        let engine_arg = plan
+            .actions
+            .iter()
+            .find_map(|action| {
+                let index = action.args.iter().position(|arg| arg == "--engine")?;
+                action.args.get(index + 1).cloned()
+            })
+            .expect("the generated serve command must name an engine");
+        assert_eq!(
+            engine_arg, "vllm",
+            "the host's engine must reach the generated command:\n{:?}",
+            plan.actions
+        );
+    }
+
+    #[test]
+    fn hybrid_planner_lets_a_configured_engine_outrank_the_host_default() {
+        let config = RocmCliConfig {
+            default_engine: Some("lemonade".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        let plan = build_freeform_plan_with_recipes(
+            "serve some/unmatched-model",
+            &config,
+            Some(&[]),
+            "vllm",
+        );
+
+        let engine_arg = plan
+            .actions
+            .iter()
+            .find_map(|action| {
+                let index = action.args.iter().position(|arg| arg == "--engine")?;
+                action.args.get(index + 1).cloned()
+            })
+            .expect("the generated serve command must name an engine");
+        assert_eq!(
+            engine_arg, "lemonade",
+            "an engine the user configured must still win:\n{:?}",
+            plan.actions
+        );
+    }
+
+    #[test]
     fn hybrid_planner_defaults_generic_local_assistant_to_validated_qwen() {
-        let plan = build_freeform_plan("start a local model", &RocmCliConfig::default());
+        let plan = build_freeform_plan_with_recipes(
+            "start a local model",
+            &RocmCliConfig::default(),
+            None,
+            "lemonade",
+        );
 
         assert_eq!(plan.intent, PlannerIntent::Serve);
         assert_eq!(plan.confidence, "high");
@@ -18475,6 +19939,48 @@ model recipes
                 "setup {args:?} should be read-only, got {action:?}"
             );
         }
+    }
+
+    #[test]
+    fn storage_report_is_read_only_and_removal_requires_approval() {
+        for args in [
+            vec!["storage".to_owned()],
+            vec!["storage".to_owned(), "report".to_owned()],
+        ] {
+            let action = chat_rocm_command_action_from_args(args.clone())
+                .expect("storage report classifies");
+            assert!(
+                matches!(action, ChatRocmCommandAction::ReadOnly(_)),
+                "storage {args:?} only measures folders, so it should be read-only, got {action:?}"
+            );
+        }
+
+        for verb in ["remove-old-installs", "remove-downloads"] {
+            let action =
+                chat_rocm_command_action_from_args(vec!["storage".to_owned(), verb.to_owned()])
+                    .expect("storage removal classifies");
+            match action {
+                ChatRocmCommandAction::Approval { args, .. } => {
+                    assert!(
+                        args.iter().any(|arg| arg == "--yes"),
+                        "approved removal runs non-interactively: {args:?}"
+                    );
+                }
+                other @ ChatRocmCommandAction::ReadOnly(_) => {
+                    panic!("storage {verb} must require approval, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn format_bytes_steps_up_instead_of_printing_1024_of_the_smaller_unit() {
+        assert_eq!(format_bytes(1023), "1023 bytes");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        // One byte short of the next unit used to round to "1024.0 KiB".
+        assert_eq!(format_bytes(1_048_575), "1.0 MiB");
+        assert_eq!(format_bytes(1_048_576), "1.0 MiB");
+        assert_eq!(format_bytes(1_073_741_823), "1.0 GiB");
     }
 
     #[test]
@@ -20211,18 +21717,27 @@ install therock";
         paths.ensure()?;
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let ready_port = listener.local_addr()?.port();
+        // The ready service is listed and then asked to complete a request:
+        // readiness is not granted on the model listing alone.
         let server = thread::spawn(move || -> Result<()> {
-            let (mut stream, _) = listener.accept()?;
-            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-            let mut request = [0_u8; 512];
-            let _ = stream.read(&mut request)?;
-            let body = r#"{"data":[{"id":"Qwen/Qwen3.5"}]}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )?;
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                let mut request = [0_u8; 512];
+                let read = stream.read(&mut request)?;
+                let request = String::from_utf8_lossy(&request[..read]).into_owned();
+                let body = if request.starts_with("POST /v1/chat/completions ") {
+                    r#"{"choices":[{"message":{"content":"ok"}}]}"#
+                } else {
+                    r#"{"data":[{"id":"Qwen/Qwen3.5"}]}"#
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )?;
+            }
             Ok(())
         });
         let current_pid = std::process::id();
@@ -20544,6 +22059,7 @@ install therock";
             "install",
             "update",
             "runtimes",
+            "storage",
             "engines",
             "model",
             "models",
@@ -20791,6 +22307,179 @@ install therock";
         ensure_public_bind_engine_supported("vllm", true, true).unwrap(); // vLLM enforces auth on Windows
         ensure_public_bind_engine_supported("lemonade", true, false).unwrap(); // non-Windows
         ensure_public_bind_engine_supported("lemonade", false, true).unwrap(); // loopback needs no key
+    }
+
+    #[test]
+    fn respawn_fails_closed_for_a_public_service_whose_key_is_gone() {
+        // A stop deletes the key file, so a later restart of a public service
+        // would otherwise respawn it with no auth at all.
+        let error = ensure_public_service_has_endpoint_key("0.0.0.0", false).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("0.0.0.0"), "{error:#}");
+        assert!(message.contains("without authentication"), "{error:#}");
+        // Actionable: name the command that mints a fresh key.
+        assert!(message.contains("--allow-public-bind"), "{error:#}");
+
+        // A public service that still has its key restarts normally.
+        ensure_public_service_has_endpoint_key("0.0.0.0", true).unwrap();
+    }
+
+    #[test]
+    fn respawn_allows_loopback_services_without_an_endpoint_key() {
+        // Loopback stays credential-free, so every accepted spelling must pass
+        // the guard with no key present.
+        for host in ["127.0.0.1", "localhost", "::1"] {
+            ensure_public_service_has_endpoint_key(host, false)
+                .unwrap_or_else(|error| panic!("{host} must not require a key: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn restart_refuses_a_public_service_without_a_key_before_stopping_it() {
+        // The guard runs before the stop, so a refused restart must leave the
+        // record exactly as it was rather than taking down a running service.
+        let (root, paths) = test_paths("restart-public-no-key");
+        let service_id = "svc-public-nokey";
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            service_id,
+            "vllm",
+            "model-ref",
+            "canonical/model",
+            "0.0.0.0",
+            11435,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        record.status = "running".to_owned();
+        record.write().unwrap();
+
+        let error = restart_internal_managed_service(&paths, service_id).unwrap_err();
+        assert!(
+            error.to_string().contains("without authentication"),
+            "{error:#}"
+        );
+
+        // Proves the *ordering*, not just the refusal: had the guard run after
+        // `stop_internal_managed_service`, the stop would have written
+        // "stopped". It reaches that state here because the record's only pid is
+        // the test's own (`engine_pid` is None and `terminate_recorded_service_pids`
+        // skips the caller's pid), so the stop confirms termination trivially.
+        let after = load_managed_service(&paths, service_id).unwrap();
+        assert_ne!(
+            after.status, "stopped",
+            "a refused restart must not stop the service"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A public record with a dead pid and a stored endpoint key, for the
+    /// liveness-refresh cases below. The port is one nothing listens on, so the
+    /// refresh's endpoint probe fails and it falls through to the pid check.
+    fn dead_public_service_with_key(
+        paths: &AppPaths,
+        service_id: &str,
+        port: u16,
+    ) -> ManagedServiceRecord {
+        paths.ensure().unwrap();
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            service_id,
+            "vllm",
+            "model-ref",
+            "canonical/model",
+            "0.0.0.0",
+            port,
+            "managed",
+            // A pid far above any plausible live process, as in
+            // `dead_managed_service_allows_relaunch`.
+            999_999_999,
+            None,
+            None,
+            None,
+        );
+        record.status = "running".to_owned();
+        record.write().unwrap();
+        endpoint_keys::store_endpoint_api_key(paths, service_id, "secret-key").unwrap();
+        record
+    }
+
+    #[test]
+    fn crashed_public_service_keeps_its_endpoint_key() {
+        // A crash (OOM kill, host reboot, panic) leaves the record at "running"
+        // with dead pids and no stop marker. Dropping the key here would make
+        // the fail-closed respawn guards refuse every later `rocm services
+        // restart` and every daemon recovery attempt — permanently, because
+        // nothing can re-mint the key. The refresh happens on every read
+        // (`rocm services list`), so this must survive it.
+        let (root, paths) = test_paths("liveness-crash-keeps-key");
+        let service_id = "svc-crashed-public";
+        let mut record = dead_public_service_with_key(&paths, service_id, 11982);
+
+        let changed = refresh_managed_service_runtime_liveness(&paths, &mut record);
+
+        assert!(changed, "a dead service must be demoted to stopped");
+        assert_eq!(record.status, "stopped");
+        assert_eq!(
+            endpoint_keys::endpoint_api_key(&paths, service_id).as_deref(),
+            Some("secret-key"),
+            "a crashed public service must stay restartable"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unconfirmed_stop_clears_the_endpoint_key_once_the_processes_are_gone() {
+        // The other half: a stop that could not confirm termination leaves the
+        // key in place (the engine may still be alive and enforcing it) and
+        // records the intent. Once the processes are observed gone, the deferred
+        // cleanup runs, so no plaintext secret is stranded for a service the
+        // operator did ask to stop.
+        let (root, paths) = test_paths("liveness-pending-stop-clears-key");
+        let service_id = "svc-pending-stop";
+        let mut record = dead_public_service_with_key(&paths, service_id, 11983);
+        record.stop_requested_unix_ms = Some(1);
+
+        let changed = refresh_managed_service_runtime_liveness(&paths, &mut record);
+
+        assert!(changed);
+        assert_eq!(record.status, "stopped");
+        assert_eq!(
+            endpoint_keys::endpoint_api_key(&paths, service_id),
+            None,
+            "a requested stop must still drop the key"
+        );
+        assert_eq!(
+            record.stop_requested_unix_ms, None,
+            "the marker is consumed, so the cleanup does not run again"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_stop_cleanup_runs_even_once_the_record_reads_stopped() {
+        // Proves the cleanup sits *before* the `managed_service_is_live` gate:
+        // a record that reached "stopped" by another route (an engine state
+        // refresh, a concurrent writer) would otherwise early-return and strand
+        // the key of a service the operator stopped.
+        let (root, paths) = test_paths("liveness-pending-stop-when-stopped");
+        let service_id = "svc-pending-stop-stopped";
+        let mut record = dead_public_service_with_key(&paths, service_id, 11984);
+        record.status = "stopped".to_owned();
+        record.stop_requested_unix_ms = Some(1);
+
+        let changed = refresh_managed_service_runtime_liveness(&paths, &mut record);
+
+        assert!(
+            changed,
+            "consuming the marker is a record change worth writing"
+        );
+        assert_eq!(endpoint_keys::endpoint_api_key(&paths, service_id), None);
+        assert_eq!(record.stop_requested_unix_ms, None);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -21128,6 +22817,148 @@ install therock";
     }
 
     #[test]
+    fn gpu_memory_utilization_absent_without_explicit_flag() {
+        // rocm-cli ships no default: with nothing supplied the recipe is left
+        // alone, so vLLM applies its own default rather than one rocm-cli owns.
+        assert_eq!(parse_gpu_memory_utilization(None).unwrap(), None);
+        assert!(engine_recipe_with_gpu_memory_utilization_override("vllm", None, None).is_none());
+        let authored = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "vllm".to_owned(),
+            required_flags: vec!["--enable-auto-tool-choice".to_owned()],
+            ..EngineRecipeHint::default()
+        };
+        let hint = engine_recipe_with_gpu_memory_utilization_override("vllm", Some(authored), None)
+            .unwrap();
+        assert!(
+            !hint
+                .required_flags
+                .iter()
+                .any(|flag| flag == "--gpu-memory-utilization"),
+            "no default may be injected: {:?}",
+            hint.required_flags
+        );
+    }
+
+    #[test]
+    fn gpu_memory_utilization_override_reaches_required_flags() {
+        let value = parse_gpu_memory_utilization(Some("0.35")).unwrap();
+        let hint = engine_recipe_with_gpu_memory_utilization_override("vllm", None, value)
+            .expect("an explicit value should synthesize a vllm hint");
+        assert_eq!(hint.engine, "vllm");
+        assert_eq!(hint.contract_version, ENGINE_RECIPE_CONTRACT_VERSION);
+        assert_eq!(
+            hint.required_flags,
+            vec!["--gpu-memory-utilization".to_owned(), "0.35".to_owned()]
+        );
+    }
+
+    #[test]
+    fn gpu_memory_utilization_override_replaces_authored_value_and_keeps_others() {
+        let existing = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "vllm".to_owned(),
+            required_flags: vec![
+                "--enable-auto-tool-choice".to_owned(),
+                "--gpu-memory-utilization".to_owned(),
+                "0.8".to_owned(),
+                "--tool-call-parser".to_owned(),
+                "hermes".to_owned(),
+            ],
+            ..EngineRecipeHint::default()
+        };
+        let hint = engine_recipe_with_gpu_memory_utilization_override(
+            "vllm",
+            Some(existing),
+            parse_gpu_memory_utilization(Some("1.0")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            hint.required_flags,
+            vec![
+                "--enable-auto-tool-choice".to_owned(),
+                "--tool-call-parser".to_owned(),
+                "hermes".to_owned(),
+                "--gpu-memory-utilization".to_owned(),
+                "1".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn gpu_memory_utilization_override_leaves_non_vllm_engines_untouched() {
+        // The override is vLLM-specific: other engines are never rewritten, with
+        // or without a recipe of their own.
+        assert!(
+            engine_recipe_with_gpu_memory_utilization_override("lemonade", None, Some(0.5))
+                .is_none()
+        );
+        let existing = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "lemonade".to_owned(),
+            required_flags: vec!["--some-flag".to_owned()],
+            ..EngineRecipeHint::default()
+        };
+        let hint = engine_recipe_with_gpu_memory_utilization_override(
+            "lemonade",
+            Some(existing.clone()),
+            Some(0.5),
+        )
+        .unwrap();
+        assert_eq!(hint.required_flags, existing.required_flags);
+    }
+
+    #[test]
+    fn gpu_memory_utilization_rejects_out_of_range_and_unparsable_values() {
+        // An explicit CLI value is never silently ignored (unlike the env-var
+        // overrides elsewhere): each bad value must produce an actionable error.
+        for bad in ["0", "0.0", "1.5", "-0.2", "abc", "", "NaN", "inf"] {
+            let Err(error) = parse_gpu_memory_utilization(Some(bad)) else {
+                panic!("`{bad}` must be rejected, not silently ignored");
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains("--gpu-memory-utilization"),
+                "error for `{bad}` should name the flag: {message}"
+            );
+        }
+        assert_eq!(
+            parse_gpu_memory_utilization(Some(" 0.5 ")).unwrap(),
+            Some(0.5)
+        );
+        assert_eq!(parse_gpu_memory_utilization(Some("1")).unwrap(), Some(1.0));
+    }
+
+    #[test]
+    fn serve_notes_surface_the_ignored_engine_flag_in_summary_mode() {
+        // The interactive summary is what a default `rocm serve` prints, so a flag
+        // the selected engine cannot honor has to be reported through this path —
+        // not only on the plan path that an interactive run never takes.
+        let note = "--gpu-memory-utilization applies only to vLLM; ignored for engine 'lemonade'";
+        let notes = collect_serve_notes(
+            false,
+            &GpuSelection::Auto,
+            false,
+            &[0],
+            None,
+            Some(note),
+            None,
+        );
+        assert!(
+            notes.iter().any(|entry| entry == note),
+            "the ignored-flag note must reach the summary: {notes:?}"
+        );
+
+        let quiet = collect_serve_notes(false, &GpuSelection::Auto, false, &[0], None, None, None);
+        assert!(
+            !quiet
+                .iter()
+                .any(|entry| entry.contains("--gpu-memory-utilization")),
+            "nothing to report when the flag was honored: {quiet:?}"
+        );
+    }
+
+    #[test]
     fn engine_recipe_enables_tool_choice_reflects_flags() {
         assert!(!engine_recipe_enables_tool_choice(None));
         let without = EngineRecipeHint {
@@ -21255,6 +23086,62 @@ install therock";
         assert!(warning.contains("free"));
         assert!(gpu_low_memory_warning(&[1], Some(&usage)).is_none());
         assert!(gpu_low_memory_warning(&[0], None).is_none());
+    }
+
+    fn host_gpu(gfx_target: &str) -> rocm_core::HostGpuSummary {
+        rocm_core::HostGpuSummary {
+            gfx_target: Some(gfx_target.to_owned()),
+            ..rocm_core::HostGpuSummary::default()
+        }
+    }
+
+    #[test]
+    fn unified_memory_apu_suppresses_the_vram_capacity_warning() {
+        // Strix Halo as reported by amd-smi: a 4 GiB BIOS carveout with 1.6 GiB
+        // free (40%, under the 90% bar) on a machine whose engine actually
+        // serves out of ~128 GiB of shared system RAM. The old reading —
+        // "only 1.6 GiB of 4.0 GiB free" — describes a pool the allocator does
+        // not use, so it must not reach the user.
+        let carveout = [vram(0, 2_458, 4_096)];
+        assert!(
+            gpu_low_memory_warning(&[0], Some(&carveout)).is_some(),
+            "the underlying threshold still trips; only the serve-plan wrapper withholds it"
+        );
+        assert_eq!(
+            serve_gpu_low_memory_warning(&[0], Some(&carveout), Some(&host_gpu("gfx1151"))),
+            None
+        );
+    }
+
+    #[test]
+    fn discrete_gpu_still_warns_when_genuinely_busy() {
+        let busy = [vram(0, 182_000, 192_000)];
+        let warning = serve_gpu_low_memory_warning(&[0], Some(&busy), Some(&host_gpu("gfx1100")))
+            .expect("a discrete card that is 95% full still warrants a warning");
+        assert!(warning.contains("GPU 0"));
+        assert!(warning.contains("`--gpu <index|auto>`"));
+
+        // Baseline: the same discrete card, mostly free, stays quiet.
+        let idle = [vram(0, 1_000, 192_000)];
+        assert_eq!(
+            serve_gpu_low_memory_warning(&[0], Some(&idle), Some(&host_gpu("gfx1100"))),
+            None
+        );
+    }
+
+    #[test]
+    fn apu_verdict_does_not_silence_a_second_gpu() {
+        // `gfx_is_apu_family` classifies a part, while host detection reports one
+        // target for the whole machine. On an APU+dGPU laptop that target cannot
+        // be attributed to the selected ordinal, so the warning must survive
+        // rather than be suppressed on the discrete card's behalf.
+        let hybrid = [vram(0, 2_458, 4_096), vram(1, 182_000, 192_000)];
+        assert!(
+            serve_gpu_low_memory_warning(&[1], Some(&hybrid), Some(&host_gpu("gfx1151"))).is_some()
+        );
+        assert!(vram_capacity_is_meaningful(Some("gfx1151"), 2));
+        // An unknown target is never treated as unified memory.
+        assert!(vram_capacity_is_meaningful(None, 1));
     }
 
     #[test]
@@ -21979,7 +23866,7 @@ ID_LIKE="suse opensuse"
         assert!(error.contains("no active ROCm runtime is configured"));
         assert_eq!(
             resolve_engine_install_runtime_id(&paths, &RocmCliConfig::default(), "lemonade", None)?,
-            "lemonade-embeddable-10.6.0"
+            format!("lemonade-embeddable-{}", rocm_deps::LEMONADE_VERSION),
         );
         write_test_pip_runtime(
             &paths,
@@ -23595,7 +25482,9 @@ ID_LIKE="suse opensuse"
             Some("therock-release:gfx120X-all".to_owned());
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config);
+        // Host default deliberately disagrees with the configured value: an
+        // engine the user chose must outrank whatever the GPU would prefer.
+        append_examine_engine_inventory(&mut output, &paths, &config, "lemonade");
 
         assert!(output.contains("engine_inventory:"));
         assert!(output.contains("configured_default_engine: vllm"));
@@ -23603,6 +25492,223 @@ ID_LIKE="suse opensuse"
         assert!(output.contains("* vllm"));
         assert!(output.contains("runtime_pref=therock-release:gfx120X-all"));
         assert!(output.contains("plugin_dirs:"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---------- engine shell prompt shim ----------
+
+    #[test]
+    fn bash_shim_sources_the_user_rc_and_prefixes_the_prompt() {
+        let dir = PathBuf::from("/tmp/shim");
+        let shim = engine_shell_prompt_shim("/bin/bash", "(rocm:vllm) ", &dir, None)
+            .expect("bash must be shimmable");
+
+        // `--rcfile` is what makes bash run our file at all; `-i` keeps it
+        // interactive even if stdin is not a terminal in some caller.
+        assert_eq!(
+            shim.args,
+            vec![
+                "--rcfile".to_owned(),
+                dir.join("engine-shell.bash").display().to_string(),
+                "-i".to_owned(),
+            ]
+        );
+        assert!(shim.envs.is_empty(), "bash needs no extra env");
+
+        let (path, contents) = shim.files.first().expect("one rc file");
+        assert_eq!(path, &dir.join("engine-shell.bash"));
+        assert!(
+            contents.contains("$HOME/.bashrc"),
+            "must restore the user's own rc:\n{contents}"
+        );
+        // bash sources the system file itself even with --rcfile, so sourcing it
+        // here too would apply it twice.
+        assert!(
+            !contents.contains("/etc/bash.bashrc"),
+            "must not re-source the system rc:\n{contents}"
+        );
+        assert!(
+            contents.contains("PS1='(rocm:vllm) '\"$PS1\""),
+            "must prefix rather than replace the prompt:\n{contents}"
+        );
+    }
+
+    #[test]
+    fn zsh_shim_restores_both_startup_files() {
+        let dir = PathBuf::from("/tmp/shim");
+        let shim = engine_shell_prompt_shim("/usr/bin/zsh", "(rocm:vllm) ", &dir, None)
+            .expect("zsh must be shimmable");
+
+        assert!(shim.args.is_empty(), "zsh is redirected via env, not argv");
+        assert!(
+            shim.envs
+                .contains(&("ZDOTDIR".to_owned(), dir.display().to_string())),
+            "zsh needs ZDOTDIR pointed at the shim dir: {:?}",
+            shim.envs
+        );
+
+        let names: Vec<_> = shim
+            .files
+            .iter()
+            .map(|(path, _)| path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        // Redirecting ZDOTDIR hides BOTH of the user's files. Missing `.zshenv`
+        // would strip their exports — worse than the unmarked prompt this fixes.
+        assert!(
+            names.contains(&".zshenv") && names.contains(&".zshrc"),
+            "both startup files must be restored, got {names:?}"
+        );
+        for (path, contents) in &shim.files {
+            assert!(
+                contents.contains("ROCM_CLI_ORIG_ZDOTDIR:-$HOME"),
+                "{} must fall back to $HOME:\n{contents}",
+                path.display()
+            );
+        }
+        let zshrc = shim
+            .files
+            .iter()
+            .find(|(path, _)| path.ends_with(".zshrc"))
+            .map(|(_, contents)| contents)
+            .expect(".zshrc present");
+        assert!(
+            zshrc.contains("PROMPT='(rocm:vllm) '$PROMPT"),
+            "must prefix rather than replace the prompt:\n{zshrc}"
+        );
+    }
+
+    #[test]
+    fn zsh_shim_passes_through_an_existing_zdotdir() {
+        let dir = PathBuf::from("/tmp/shim");
+        let shim = engine_shell_prompt_shim("zsh", "(rocm:vllm) ", &dir, Some("/home/u/.zsh"))
+            .expect("zsh must be shimmable");
+        assert!(
+            shim.envs.contains(&(
+                "ROCM_CLI_ORIG_ZDOTDIR".to_owned(),
+                "/home/u/.zsh".to_owned()
+            )),
+            "a caller's ZDOTDIR must survive so the shim can find their files: {:?}",
+            shim.envs
+        );
+
+        // A blank value is not a location; the shim's $HOME fallback must win.
+        let blank = engine_shell_prompt_shim("zsh", "(rocm:vllm) ", &dir, Some("   "))
+            .expect("zsh must be shimmable");
+        assert!(
+            !blank
+                .envs
+                .iter()
+                .any(|(key, _)| key == "ROCM_CLI_ORIG_ZDOTDIR"),
+            "a blank ZDOTDIR must not be passed through: {:?}",
+            blank.envs
+        );
+    }
+
+    #[test]
+    fn shells_without_a_safe_shim_are_left_alone() {
+        // Guessing at an unknown shell's startup is worse than the banner: these
+        // must opt out rather than have a marker forced on them.
+        let dir = PathBuf::from("/tmp/shim");
+        for shell in [
+            "/bin/sh",
+            "/bin/dash",
+            "/usr/bin/fish",
+            "cmd",
+            "powershell",
+            "pwsh",
+            "",
+        ] {
+            assert!(
+                engine_shell_prompt_shim(shell, "(rocm:vllm) ", &dir, None).is_none(),
+                "{shell} should not be shimmed"
+            );
+        }
+    }
+
+    #[test]
+    fn shim_matches_on_the_shell_name_not_the_full_path() {
+        let dir = PathBuf::from("/tmp/shim");
+        for shell in ["bash", "/bin/bash", "/usr/local/bin/bash"] {
+            assert!(
+                engine_shell_prompt_shim(shell, "(rocm:x) ", &dir, None).is_some(),
+                "{shell} should resolve to bash"
+            );
+        }
+    }
+
+    #[test]
+    fn examine_engine_inventory_falls_back_to_the_host_engine_when_unconfigured() {
+        // With nothing configured, the reported default must be the engine this
+        // GPU actually serves on. On an Instinct host that is vLLM; reporting the
+        // platform constant here is what made `examine` contradict `serve`.
+        let (root, paths) = test_paths("examine-engine-inventory-host");
+        let config = RocmCliConfig::default();
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+
+        // The configured line still reads as unset — the host default must not be
+        // mistaken for something the user chose.
+        assert!(output.contains("configured_default_engine: <platform default>"));
+        assert!(output.contains("effective_default_engine: vllm"));
+        assert!(
+            output.contains("* vllm"),
+            "the primary marker should follow the host engine:\n{output}"
+        );
+        // Nothing is being overridden, so there is nothing to warn about.
+        assert!(
+            !output.contains("configured_default_note"),
+            "an unconfigured host must not be warned about an override:\n{output}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn examine_flags_a_configured_engine_that_overrides_the_host() {
+        // Installs provisioned before the installer stopped seeding
+        // `default_engine` still carry `lemonade` on disk. That seed is
+        // indistinguishable from a deliberate choice, so it is not rewritten --
+        // but the user is told why their Instinct box is not on vLLM, and how to
+        // change it.
+        let (root, paths) = test_paths("examine-engine-inventory-override");
+        let config = RocmCliConfig {
+            default_engine: Some("lemonade".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+
+        assert!(
+            output.contains("effective_default_engine: lemonade"),
+            "the configured engine still wins:\n{output}"
+        );
+        assert!(
+            output.contains("configured_default_note:"),
+            "the override must be called out:\n{output}"
+        );
+        assert!(
+            output.contains("rocm config clear-default-engine"),
+            "the note must name the remedy, not just the problem:\n{output}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn examine_is_silent_when_the_configured_engine_agrees_with_the_host() {
+        let (root, paths) = test_paths("examine-engine-inventory-agrees");
+        let config = RocmCliConfig {
+            default_engine: Some("vllm".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+
+        assert!(
+            !output.contains("configured_default_note"),
+            "there is no override to report when the two agree:\n{output}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

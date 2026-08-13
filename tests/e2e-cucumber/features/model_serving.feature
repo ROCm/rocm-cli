@@ -31,7 +31,10 @@ Feature: Model serving
 
   # vLLM serve + inference (safetensors model). Engine coverage: vLLM. This is the
   # deliberate vLLM half of a per-engine pair with `serve-lemonade-inference`
-  # below, so it stays pinned to vLLM (the slug names the engine).
+  # below, so it stays pinned to vLLM (the slug names the engine). It is also the
+  # vLLM per-PR canary: one real vLLM serve runs on every PR so a broken serve is
+  # caught before merge, while the heavier `@merge-queue` serves (6, 6b, 8) run
+  # only in the merge queue.
   @id:serve-vllm-inference @requires-gpu @requires-engine:vllm
   Scenario: 5 - A served model responds to inference requests on vLLM
     Given a managed runtime is active
@@ -54,7 +57,9 @@ Feature: Model serving
     Then the response contains a model reply
     And the response identifies the correct model
 
-  # Lemonade serve + inference (GGUF model). Engine coverage: Lemonade.
+  # Lemonade serve + inference (GGUF model). Engine coverage: Lemonade. The
+  # lemonade per-PR canary: one real lemonade serve runs on every PR (the
+  # counterpart to the vLLM canary above).
   @id:serve-lemonade-inference @requires-gpu @requires-engine:lemonade
   Scenario: 7 - A model served on lemonade responds to inference requests
     Given a managed runtime is active
@@ -63,10 +68,26 @@ Feature: Model serving
     Then the response contains a model reply
     And the response identifies the correct model
 
+  # HF-checkpoint direct-serve canary (EAI-8026). An `owner/repo:variant` ref
+  # bypasses Lemonade's model router and runs a packaged llama-server directly
+  # (`serve_hf_checkpoint`), which bails explicitly if no backend binary is found
+  # under bin/llamacpp/<backend>/ — unlike the short-recipe-name path above, whose
+  # managed-lemonade fallback would mask the identical failure behind the
+  # unrelated EAI-7423 xfail. Reuses the same small Qwen3-0.6B-GGUF checkpoint as
+  # `serve-lemonade-inference` (cache-shared, no extra download) so this stays a
+  # fast per-PR canary rather than needing the @nightly large-checkpoint path.
+  @id:serve-hf-checkpoint-inference @requires-gpu @requires-engine:lemonade
+  Scenario: 14 - A canonical Hugging Face checkpoint serves and responds to inference
+    Given a managed runtime is active
+    And a canonical Hugging Face GGUF checkpoint is being served on lemonade
+    When the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
+
   # Default-engine serve (no --engine): the effective engine is the platform
-  # default from the capability probe. xfail only where that resolves to vLLM
-  # (EAI-7333) — see expectations.toml.
-  @id:serve-default-engine-working-endpoint @requires-gpu
+  # default from the capability probe, so this covers whichever engine the host
+  # would actually pick.
+  @id:serve-default-engine-working-endpoint @requires-gpu @merge-queue
   Scenario: 6 - Serving a model without specifying an engine produces a working endpoint
     Given a managed runtime is active
     When the user serves a model without specifying an engine
@@ -74,7 +95,7 @@ Feature: Model serving
     And the model is reachable
 
   # The inference half of scenario 6.
-  @id:serve-default-engine-inference @requires-gpu
+  @id:serve-default-engine-inference @requires-gpu @merge-queue
   Scenario: 6b - A default-engine served model responds to inference requests
     Given a managed runtime is active
     When the user serves a model without specifying an engine
@@ -95,8 +116,9 @@ Feature: Model serving
   # Readiness contract: when the CLI reports a service ready, inference must work.
   # Engine-agnostic — the served model+engine follow the host (see
   # `a model is being served on GPU`), so this holds the contract on every GPU
-  # platform. Where it resolves to vLLM, EAI-7333 makes it xfail (expectations.toml).
-  @id:serve-readiness-contract @requires-gpu
+  # platform. Readiness is gated on a real inference probe, which is what makes
+  # this contract hold rather than race the model load.
+  @id:serve-readiness-contract @requires-gpu @merge-queue
   Scenario: 8 - A service reported ready can immediately serve inference
     Given a managed runtime is active
     And a model is being served on GPU

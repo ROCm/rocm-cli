@@ -33,6 +33,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::json;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 use std::ffi::OsString;
@@ -834,22 +835,28 @@ fn prefetch_artifact_value_with_policy(
         ));
     }
 
-    let bytes = download_artifact_bytes(&artifact.uri, max_bytes, &request_headers)?;
-    if bytes.len() as u64 != size_bytes {
-        bail!(
-            "artifact download size mismatch for `{artifact_ref}`: expected {size_bytes} bytes, got {}",
-            bytes.len()
-        );
-    }
-    let actual_sha256 = sha256_hex(&bytes);
-    if actual_sha256 != expected_sha256 {
-        bail!(
-            "artifact sha256 mismatch for `{artifact_ref}`: expected {expected_sha256}, got {actual_sha256}"
-        );
-    }
-
+    // Streamed straight to its final path: model artifacts run to gigabytes, so
+    // buffering one to hash it would hold the whole file in memory. The size and
+    // digest from the recipe are enforced inside the download, which also gives
+    // this path a free-space preflight and resume on a dropped connection.
     let artifact_path = artifact_bytes_path_for_marker(&cache.marker_path);
-    write_file_atomically(&artifact_path, &bytes)?;
+    let mut headers: Vec<(&str, &str)> = vec![("User-Agent", "rocm-cli")];
+    headers.extend(
+        request_headers
+            .iter()
+            .map(|(name, value)| (*name, value.as_str())),
+    );
+    let outcome = rocm_core::download_file_streaming(&rocm_core::DownloadRequest {
+        url: &artifact.uri,
+        destination: &artifact_path,
+        timeout: ARTIFACT_PREFETCH_TIMEOUT,
+        headers: &headers,
+        max_bytes: Some(max_bytes),
+        expected_len: Some(size_bytes),
+        expected_sha256: Some(&expected_sha256),
+    })
+    .with_context(|| format!("failed to prefetch artifact `{artifact_ref}`"))?;
+    let actual_sha256 = outcome.sha256;
     write_file_atomically(
         &cache.marker_path,
         &serde_json::to_vec_pretty(&json!({
@@ -1023,42 +1030,11 @@ fn artifact_bytes_path_for_marker(marker_path: &Path) -> PathBuf {
     marker_path.with_extension("bin")
 }
 
-fn download_artifact_bytes(
-    url: &str,
-    max_bytes: u64,
-    headers: &[(&str, String)],
-) -> Result<Vec<u8>> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(ARTIFACT_PREFETCH_TIMEOUT)
-        .build();
-    let mut request = agent.get(url).set("User-Agent", "rocm-cli");
-    for (name, value) in headers {
-        request = request.set(name, value);
-    }
-    let response = request.call().map_err(|error| match error {
-        ureq::Error::Status(status, _) => anyhow::anyhow!("HTTP {status} while fetching {url}"),
-        other @ ureq::Error::Transport(_) => {
-            anyhow::anyhow!("HTTP request failed for {url}: {other}")
-        }
-    })?;
-    let mut reader = response.into_reader().take(max_bytes.saturating_add(1));
-    let mut bytes = Vec::new();
-    reader
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read artifact response for {url}"))?;
-    if bytes.len() as u64 > max_bytes {
-        bail!("artifact download exceeded approved byte limit of {max_bytes}");
-    }
-    Ok(bytes)
-}
-
+/// Hex digest of a buffer. Production hashing happens incrementally inside the
+/// streaming download; this exists only so tests can state an expected digest.
+#[cfg(test)]
 fn sha256_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let digest = Sha256::digest(bytes);
-    digest.iter().fold(String::new(), |mut acc, byte| {
-        let _ = write!(acc, "{byte:02x}");
-        acc
-    })
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -2380,6 +2356,9 @@ fn ensure_rocm_command_is_read_only(args: &[String]) -> Result<()> {
             .as_deref()
             .is_none_or(|value| matches!(value, "status" | "logs" | "log")),
         Some("uninstall") => args.iter().any(|arg| arg == "--dry-run"),
+        // `storage report` (the default subcommand) only measures folders. The
+        // two `remove-*` verbs delete, so they stay off the read-only list.
+        Some("storage") => second.as_deref().is_none_or(|value| value == "report"),
         // `setup status` reports first-time setup state (read-only); `setup reset`
         // re-arms it and is mutating. Mirrors the bin's rocm_command classifier so
         // the read-only allowlist is consistent across binaries.
@@ -2553,8 +2532,10 @@ fn build_watcher_enable_args(arguments: &serde_json::Map<String, Value>) -> Resu
     Ok(argv)
 }
 
+/// Inverse of [`rocm_engine_protocol::is_public_bind_host`], which owns the
+/// policy so `rocm` and `rocmd` never classify the same host differently.
 fn is_loopback_host(host: &str) -> bool {
-    matches!(host, "127.0.0.1" | "localhost" | "::1")
+    !rocm_engine_protocol::is_public_bind_host(host)
 }
 
 fn system_prefix_requires_ack(prefix: &std::path::Path) -> bool {
@@ -3081,6 +3062,16 @@ fn supervise_service(
     );
     record.gpu_indices = gpu_indices;
     record.engine_recipe_json = engine_recipe_json.clone();
+    // Refuse a keyless public respawn before the manifest write, so a refused
+    // attempt leaves the recorded restart_count and timestamps intact instead of
+    // clobbering them with a record no live process will ever back. The spawn
+    // site below re-checks against the key actually threaded onto the command.
+    ensure_public_service_has_endpoint_key(
+        &record.host,
+        rocm_engine_protocol::endpoint_key_file_if_present(paths, &record.service_id)
+            .and_then(|path| rocm_engine_protocol::endpoint_api_key_file_if_valid(&path))
+            .is_some(),
+    )?;
     record.write()?;
 
     let log_file = fs::File::create(&record.log_path)
@@ -3114,7 +3105,11 @@ fn supervise_service(
     // recovery (`restart_managed_service` re-execs `rocmd supervise`), so
     // without this a previously-authenticated public service would come back
     // up anonymous after a crash/recover cycle.
-    apply_endpoint_key_env(&mut command, paths, &record.service_id);
+    // If the key is gone the child would listen on the recorded public host with
+    // no auth, so fail closed instead — an unreachable service is recoverable,
+    // an anonymous public one is not.
+    let endpoint_key_applied = apply_endpoint_key_env(&mut command, paths, &record.service_id);
+    ensure_public_service_has_endpoint_key(&record.host, endpoint_key_applied)?;
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn engine supervisor child for {engine}"))?;
@@ -4622,6 +4617,31 @@ fn handle_server_recover_event_with_record(
             {
                 return Ok(());
             }
+            // A public service whose endpoint key is gone can never be recovered:
+            // the respawn guard in `supervise_service` refuses it by design.
+            // Report it and stop, rather than letting a permanent failure
+            // propagate out of `evaluate_watchers` and take the whole daemon —
+            // and every other watcher — down on each 30s recovery tick.
+            if let Err(error) = ensure_public_service_has_endpoint_key(
+                &record.host,
+                rocm_engine_protocol::endpoint_key_file_if_present(paths, &record.service_id)
+                    .and_then(|path| rocm_engine_protocol::endpoint_api_key_file_if_valid(&path))
+                    .is_some(),
+            ) {
+                return record_event(
+                    paths,
+                    state,
+                    "server-recover",
+                    "error",
+                    "restart_managed_service_refused",
+                    &format!(
+                        "cannot recover managed service {} on {}:{} after \
+                         {recovery_reason_display}: {error}",
+                        record.service_id, record.host, record.port
+                    ),
+                    Some(record.service_id.clone()),
+                );
+            }
             restart_managed_service(paths, &mut *record)?;
             record_event(
                 paths,
@@ -4782,8 +4802,13 @@ fn restart_managed_service(_paths: &AppPaths, record: &mut ManagedServiceRecord)
         .context("failed to clone service log file handle")?;
 
     record.status = "recovering".to_owned();
-    record.restart_count = record.restart_count.saturating_add(1);
-    record.last_restart_unix_ms = Some(unix_time_millis());
+    // Counts the restart and drops the previous run's inference verification.
+    // The respawned child writes a fresh record of its own, and "recovering" is
+    // outside the statuses that probe, so a stale verdict would not currently be
+    // acted on — but this record is written again below, after the spawn, and
+    // that write can land after the child's. Clearing here keeps the invariant
+    // true at the one site that reuses a record across restarts.
+    record.reset_for_restart();
     record.supervisor_pid = std::process::id();
     record.write()?;
 
@@ -5356,6 +5381,31 @@ mod tests {
         let error = ensure_rocm_command_is_read_only(&reset_args)
             .expect_err("setup reset must go through approval");
         assert!(error.to_string().contains("approval UI"));
+        Ok(())
+    }
+
+    #[test]
+    fn storage_report_is_read_only_but_removal_is_not() -> Result<()> {
+        for args in [vec!["storage"], vec!["storage", "report"]] {
+            let normalized = normalized_rocm_command_args(
+                serde_json::json!({ "args": args })
+                    .as_object()
+                    .expect("json object"),
+            )?;
+            ensure_rocm_command_is_read_only(&normalized)
+                .unwrap_or_else(|_| panic!("storage {args:?} only measures folders"));
+        }
+
+        for verb in ["remove-old-installs", "remove-downloads"] {
+            let normalized = normalized_rocm_command_args(
+                serde_json::json!({ "args": ["storage", verb] })
+                    .as_object()
+                    .expect("json object"),
+            )?;
+            let error = ensure_rocm_command_is_read_only(&normalized)
+                .expect_err("storage removal must go through approval");
+            assert!(error.to_string().contains("approval UI"));
+        }
         Ok(())
     }
 
@@ -7007,6 +7057,29 @@ mod tests {
 
         response.status = "loading_model".to_owned();
         assert!(!healthcheck_response_recoverable(&response));
+
+        // The status the engines report for a model that is listed but has not
+        // yet served an inference request. Restarting it would kill a model
+        // mid-load and start the wait over.
+        response.status = "loading".to_owned();
+        assert!(!healthcheck_response_recoverable(&response));
+    }
+
+    #[test]
+    fn healthcheck_readiness_withheld_while_the_model_only_lists() {
+        // What an engine reports once `/v1/models` answers but inference has not:
+        // not ready, so `rocm serve` keeps waiting instead of handing the caller
+        // an endpoint that will hang on its first request.
+        let listing_only = HealthcheckResponse {
+            status: "loading".to_owned(),
+            model_loaded: false,
+            device: "unknown".to_owned(),
+            uptime_sec: 1,
+            queue_depth: 0,
+            last_error: None,
+            tokens_per_sec: None,
+        };
+        assert!(!healthcheck_response_ready(&listing_only));
     }
 
     #[test]
@@ -7017,7 +7090,7 @@ mod tests {
         // Loopback service: no key file has ever been written, so the child's
         // environment must be left untouched.
         let mut command = ProcessCommand::new("true");
-        apply_endpoint_key_env(&mut command, &paths, service_id);
+        assert!(!apply_endpoint_key_env(&mut command, &paths, service_id));
         assert!(
             command
                 .get_envs()
@@ -7032,7 +7105,7 @@ mod tests {
         fs::create_dir_all(paths.services_dir()).unwrap();
         fs::write(&key_path, "secret-key").unwrap();
         let mut command = ProcessCommand::new("true");
-        apply_endpoint_key_env(&mut command, &paths, service_id);
+        assert!(apply_endpoint_key_env(&mut command, &paths, service_id));
         let env_value = command
             .get_envs()
             .find_map(|(key, value)| {
@@ -7042,6 +7115,37 @@ mod tests {
             })
             .expect("endpoint key env var must be set once the key file exists");
         assert_eq!(env_value, key_path.as_os_str());
+
+        // An empty (or otherwise unusable) key file is not a key: the engine
+        // adapters would enforce nothing, so reporting `true` here would let the
+        // respawn guard pass and still open an anonymous public listener.
+        fs::write(&key_path, "   \n").unwrap();
+        let mut command = ProcessCommand::new("true");
+        assert!(!apply_endpoint_key_env(&mut command, &paths, service_id));
+        assert!(
+            command
+                .get_envs()
+                .all(|(key, _)| key != rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV),
+            "an unusable key file must not be threaded onto the child"
+        );
+    }
+
+    #[test]
+    fn recovery_respawn_fails_closed_for_a_public_service_without_a_key() {
+        // Daemon recovery re-execs `rocmd supervise` for the recorded host. With
+        // the key gone the child would listen on that public host anonymously,
+        // so the spawn must be refused instead.
+        let error = ensure_public_service_has_endpoint_key("0.0.0.0", false).unwrap_err();
+        assert!(
+            error.to_string().contains("without authentication"),
+            "{error:#}"
+        );
+
+        ensure_public_service_has_endpoint_key("0.0.0.0", true).unwrap();
+        for host in ["127.0.0.1", "localhost", "::1"] {
+            ensure_public_service_has_endpoint_key(host, false)
+                .unwrap_or_else(|error| panic!("{host} must not require a key: {error:#}"));
+        }
     }
 
     #[test]
@@ -8924,13 +9028,49 @@ fn healthcheck_response_recoverable(response: &HealthcheckResponse) -> bool {
 }
 
 /// Re-thread the endpoint key file (public bind only) onto an engine child's
-/// environment, mirroring the initial `rocm serve` spawn. `None` for a
-/// loopback service with no stored key leaves the command's environment
-/// untouched, matching the unauthenticated default.
-fn apply_endpoint_key_env(command: &mut ProcessCommand, paths: &AppPaths, service_id: &str) {
-    if let Some(key_file) = rocm_engine_protocol::endpoint_key_file_if_present(paths, service_id) {
+/// environment, mirroring the initial `rocm serve` spawn. A loopback service
+/// with no stored key leaves the command's environment untouched, matching the
+/// unauthenticated default.
+///
+/// Returns whether a key was applied. Callers that spawn a *listener* must
+/// check it against the service's host — a public bind with no key would come
+/// up anonymous (see [`ensure_public_service_has_endpoint_key`]). Callers that
+/// only make a stdio plugin call can ignore it.
+///
+/// The file must hold a *usable* key, not merely exist: the engine adapters
+/// resolve it with `endpoint_api_key_from_file` and enforce nothing when that
+/// yields `None`, so treating an empty or malformed file as "protected" would
+/// let the guard pass while the endpoint served anonymously.
+#[must_use]
+fn apply_endpoint_key_env(
+    command: &mut ProcessCommand,
+    paths: &AppPaths,
+    service_id: &str,
+) -> bool {
+    if let Some(key_file) = rocm_engine_protocol::endpoint_key_file_if_present(paths, service_id)
+        .and_then(|path| rocm_engine_protocol::endpoint_api_key_file_if_valid(&path))
+    {
         command.env(rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file);
+        return true;
     }
+    false
+}
+
+/// Refuse to respawn a recorded service on a public host without its endpoint
+/// API key, so daemon recovery cannot reopen a protected endpoint anonymously.
+///
+/// Mirrors the guard of the same name in `rocm`; the shared
+/// [`rocm_engine_protocol::is_public_bind_host`] keeps the two classifications
+/// identical for a given `ManagedServiceRecord::host`.
+fn ensure_public_service_has_endpoint_key(host: &str, key_present: bool) -> Result<()> {
+    if rocm_engine_protocol::is_public_bind_host(host) && !key_present {
+        bail!(
+            "refusing to respawn a service bound to the public host `{host}` without an endpoint \
+             API key: it would come back up without authentication. Relaunch it with \
+             `rocm serve --host {host} --allow-public-bind` to issue a new key."
+        );
+    }
+    Ok(())
 }
 
 fn engine_request<T, R>(
@@ -8962,7 +9102,10 @@ where
     // adapter's HTTP probe is unauthenticated and the endpoint looks
     // unreachable, which would misclassify a healthy protected service as
     // recoverable.
-    apply_endpoint_key_env(&mut command, paths, service_id);
+    //
+    // No host to check here: this is a stdio plugin call, not a listener, so a
+    // missing key only weakens this probe rather than opening a port.
+    let _ = apply_endpoint_key_env(&mut command, paths, service_id);
     let mut child = command.spawn().with_context(|| {
         format!(
             "failed to spawn engine stdio process {}",

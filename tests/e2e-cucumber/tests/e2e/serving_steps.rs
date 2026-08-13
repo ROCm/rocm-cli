@@ -105,8 +105,9 @@ async fn ensure_serve_port_free() -> String {
     // Always kill any listener on the shared port — NOT just one that already
     // answers /v1/models. A prior scenario's vLLM that is still LOADING holds the
     // port and GPU memory without yet serving /v1/models; if we only checked HTTP
-    // readiness we'd start a second server, overcommit GPU memory (each asks for
-    // 0.80), and the collision crashes a server → the next chat POST fails with
+    // readiness we'd start a second server, overcommit GPU memory (each claims
+    // vLLM's default fraction of the device), and the collision crashes a server
+    // → the next chat POST fails with
     // "error sending request". Killing by port (fuser/lsof) catches the starting
     // server too. Best-effort; then wait for the socket to actually close.
     // Also kill the CLI's auto-started lemonade assistant — it hogs a GPU core on
@@ -129,8 +130,9 @@ async fn ensure_serve_port_free() -> String {
     // The port closing does NOT mean the prior serve's VRAM is back: a killed
     // vLLM releases ~tens of GiB of device memory only as the process fully
     // exits, which lags the socket close. The next `rocm serve` reads free VRAM
-    // at startup and demands `gpu-memory-utilization` of the TOTAL — after a large
-    // model (e.g. 27B ~54 GiB) the residue can drop free memory below that
+    // at startup and demands vLLM's `gpu-memory-utilization` fraction of the
+    // TOTAL (rocm-cli passes no value, so vLLM's own default applies) — after a
+    // large model (e.g. 27B ~54 GiB) the residue can drop free memory below that
     // request, so the next serve dies with "Free memory ... less than desired GPU
     // memory utilization" (engine core init failed). Wait for the device to
     // actually drain before returning.
@@ -139,11 +141,16 @@ async fn ensure_serve_port_free() -> String {
 
 /// Upper bound on the free-VRAM floor (MiB). Sized so the largest single
 /// scenario model can allocate its engine's memory share without tripping its
-/// startup check: Qwen3.6-27B plus vLLM's ~0.8-of-total KV reservation needs the
-/// MI300X mostly clear. Only a data-center GPU has this much, so on smaller
-/// cards (e.g. Strix Halo's smaller unified-memory pool) the floor is capped to
-/// 90% of the device total (see [`required_free_vram_mib`]) — otherwise the
-/// check could never pass.
+/// startup check: Qwen3.6-27B plus vLLM's default fraction-of-total KV
+/// reservation needs the MI300X mostly clear. Only a data-center GPU has this
+/// much, so on smaller cards (e.g. Strix Halo's smaller unified-memory pool) the
+/// floor is capped to 90% of the device total (see [`required_free_vram_mib`]) —
+/// otherwise the check could never pass. Note the cap no longer sits above what
+/// vLLM asks for: rocm-cli used to pin utilization below it, and now defers to
+/// vLLM's own (higher) default, so the wait has little headroom left and can
+/// time out on a device that is merely holding display memory. The wait is
+/// best-effort and the serve proceeds regardless, so this costs time rather
+/// than correctness; sizing a deliberate margin is follow-up work.
 const MAX_FREE_VRAM_FLOOR_MIB: u64 = 150_000;
 
 /// The free-VRAM floor to wait for on this host: the model-sized ceiling, but
@@ -452,7 +459,7 @@ async fn setup_gpu_model(world: &mut E2eWorld) {
         // Stop THIS attempt's stalled service before doing anything else. A vLLM
         // still in engine init has not bound the serve port yet, so the port kill
         // in `ensure_serve_port_free` cannot see it — it would survive into the
-        // next attempt, hold its ~0.8-of-device memory reservation, and guarantee
+        // next attempt, hold its fraction-of-device memory reservation, and guarantee
         // the relaunch dies on vLLM's free-memory check. Going through `rocm
         // services stop` is what actually clears it: that path signals the whole
         // process tree (the EngineCore worker pins the allocation, not the parent)
@@ -505,6 +512,29 @@ async fn setup_lemonade_model(world: &mut E2eWorld) {
     // Wait for this lemonade model specifically (see setup_gpu_model): guards
     // against a leaked serve on the shared port. "Qwen3-0.6B" is the distinctive
     // substring (the endpoint reports it as e.g. Qwen3-0.6B-Q4_0.gguf).
+    wait_for_model(
+        "http://127.0.0.1:11435/v1/models",
+        Some("Qwen3-0.6B"),
+        serve_timeout_for(world),
+    )
+    .await;
+}
+
+#[given("a canonical Hugging Face GGUF checkpoint is being served on lemonade")]
+async fn setup_lemonade_hf_checkpoint_model(world: &mut E2eWorld) {
+    // Forces the `owner/repo:variant` direct-serve path (`serve_hf_checkpoint`,
+    // EAI-8026) instead of the short-recipe-name router that `setup_lemonade_model`
+    // exercises. Same underlying checkpoint (unsloth/Qwen3-0.6B-GGUF, Q4_0), so the
+    // GGUF is already warm in the HF cache when both scenarios run in one job.
+    let model = "unsloth/Qwen3-0.6B-GGUF:Q4_0";
+    ensure_serve_port_free().await;
+    let (stdout, _, rc) = crate::run_rocm(
+        world,
+        &["serve", model, "--engine", "lemonade", "--managed"],
+    );
+    assert!(rc == 0, "rocm serve failed:\n{stdout}");
+    world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
+    world.model_name = Some(model.to_string());
     wait_for_model(
         "http://127.0.0.1:11435/v1/models",
         Some("Qwen3-0.6B"),

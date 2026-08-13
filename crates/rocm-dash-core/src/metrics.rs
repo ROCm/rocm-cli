@@ -146,6 +146,36 @@ impl InstanceStatus {
     }
 }
 
+/// Whether a sampled metric value originated in the current scrape window or
+/// was carried forward from a prior one.
+///
+/// A `gen_tps` paired with `Held` means the counter did not advance during the
+/// last window; the value is shown for continuity. A `gen_tps` with no metadata
+/// (i.e. `gen_tps_observation == None`) means the freshness is unknown —
+/// typically a legacy snapshot recorded before this field was introduced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationFreshness {
+    /// Value measured during the most recent scrape window.
+    Fresh,
+    /// Value carried forward from a prior scrape; the source counter did not
+    /// advance in the last window.
+    Held,
+}
+
+/// Provenance metadata for a sampled observation.
+///
+/// Attached to an `Option<ObservationMetadata>` field alongside the numeric
+/// value. Absent metadata (`None`) means freshness is unknown — never fabricated
+/// as `Fresh` for legacy payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ObservationMetadata {
+    /// UTC instant at which this value was recorded.
+    pub observed_at: DateTime<Utc>,
+    /// Whether the value is from the current scrape or held from a prior one.
+    pub freshness: ObservationFreshness,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Instance {
     pub container_id: String,
@@ -166,6 +196,11 @@ pub struct Instance {
     /// `generation_tokens_total` counter rate. `None` until two scrapes seen.
     #[serde(default)]
     pub gen_tps: Option<f64>,
+    /// Freshness provenance for [`Instance::gen_tps`]. `None` when unknown
+    /// (legacy snapshots) — absence is never interpreted as `Fresh`.
+    /// Omitted from JSON when `None` to preserve wire back-compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gen_tps_observation: Option<ObservationMetadata>,
     /// Efficiency: `gen_tps` ÷ summed power (W) of the GPUs this instance
     /// occupies. `None` when throughput or GPU power telemetry is unavailable.
     #[serde(default)]
@@ -303,5 +338,132 @@ mod tests {
             assert_eq!(StartupPhase::from_token(&token), Some(phase));
         }
         assert_eq!(StartupPhase::from_token("nonsense"), None);
+    }
+
+    // ── Observation metadata tests (EAI-7960) ────────────────────────────────
+
+    fn fixed_ts() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2024-01-15T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn instance_legacy_gen_tps_deserializes_without_observation() {
+        // Legacy JSON with gen_tps but no observation metadata must deserialize
+        // with gen_tps_observation == None (unknown freshness, numeric value preserved).
+        let legacy = r#"{
+            "container_id": "c1", "container_name": "vllm-a", "status": "running",
+            "model_name": "deepseek-r1", "gpu_ids": ["0"], "partition_info": null,
+            "quantization": null, "tensor_parallel_size": 1, "port": 8000,
+            "vram_used_mb": 0, "vram_total_mb": 0, "gen_tps": 42.5,
+            "launch_args": [], "env_vars": {}, "log_file": null
+        }"#;
+        let inst: Instance = serde_json::from_str(legacy).expect("legacy instance must parse");
+        assert_eq!(inst.gen_tps, Some(42.5), "numeric value must be preserved");
+        assert!(
+            inst.gen_tps_observation.is_none(),
+            "legacy JSON must not fabricate a freshness claim"
+        );
+    }
+
+    #[test]
+    fn observation_freshness_fresh_round_trips() {
+        let ts = fixed_ts();
+        let meta = ObservationMetadata {
+            observed_at: ts,
+            freshness: ObservationFreshness::Fresh,
+        };
+        let json = serde_json::to_string(&meta).expect("serialize");
+        let back: ObservationMetadata = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.observed_at, ts, "UTC timestamp must be preserved");
+        assert_eq!(back.freshness, ObservationFreshness::Fresh);
+    }
+
+    #[test]
+    fn observation_freshness_held_round_trips() {
+        let ts = fixed_ts();
+        let meta = ObservationMetadata {
+            observed_at: ts,
+            freshness: ObservationFreshness::Held,
+        };
+        let json = serde_json::to_string(&meta).expect("serialize");
+        let back: ObservationMetadata = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.observed_at, ts, "UTC timestamp must be preserved");
+        assert_eq!(back.freshness, ObservationFreshness::Held);
+    }
+
+    #[test]
+    fn freshness_serializes_as_snake_case_strings() {
+        let fresh_json = serde_json::to_string(&ObservationFreshness::Fresh).expect("serialize");
+        let held_json = serde_json::to_string(&ObservationFreshness::Held).expect("serialize");
+        assert_eq!(fresh_json, "\"fresh\"");
+        assert_eq!(held_json, "\"held\"");
+    }
+
+    #[test]
+    fn instance_gen_tps_observation_none_omitted_in_serialization() {
+        // skip_serializing_if = "Option::is_none" must suppress the field entirely.
+        let inst = Instance {
+            gen_tps: Some(10.0),
+            gen_tps_observation: None,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&inst).expect("serialize");
+        assert!(
+            !json.contains("gen_tps_observation"),
+            "None observation must be omitted, not encoded as null; got: {json}"
+        );
+    }
+
+    #[test]
+    fn instance_gen_tps_observation_some_round_trips() {
+        let ts = fixed_ts();
+        let inst = Instance {
+            gen_tps: Some(10.0),
+            gen_tps_observation: Some(ObservationMetadata {
+                observed_at: ts,
+                freshness: ObservationFreshness::Fresh,
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&inst).expect("serialize");
+        assert!(
+            json.contains("gen_tps_observation"),
+            "metadata must be present when Some"
+        );
+        assert!(json.contains("\"fresh\""), "freshness must be present");
+        let back: Instance = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.gen_tps, Some(10.0));
+        let obs = back.gen_tps_observation.expect("must deserialize metadata");
+        assert_eq!(obs.observed_at, ts);
+        assert_eq!(obs.freshness, ObservationFreshness::Fresh);
+    }
+
+    #[test]
+    fn instance_held_observation_round_trips() {
+        // gen_tps is the sole numeric carrier; Held metadata accompanies the same
+        // value without duplicating it into a separate held field.
+        let ts = fixed_ts();
+        let inst = Instance {
+            gen_tps: Some(5.0),
+            gen_tps_observation: Some(ObservationMetadata {
+                observed_at: ts,
+                freshness: ObservationFreshness::Held,
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&inst).expect("serialize");
+        let back: Instance = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            back.gen_tps,
+            Some(5.0),
+            "numeric value preserved through held round-trip"
+        );
+        let obs = back
+            .gen_tps_observation
+            .expect("held metadata must survive round-trip");
+        assert_eq!(obs.observed_at, ts);
+        assert_eq!(obs.freshness, ObservationFreshness::Held);
     }
 }

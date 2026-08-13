@@ -1,0 +1,18 @@
+# Pinned versions of the third-party runtimes rocm-cli downloads and manages.
+#
+# This file is the SINGLE SOURCE OF TRUTH for those pins. Nothing else in the
+# tree may spell a runtime version literal: archive names, download URLs, and
+# offline fallbacks are all derived from the values below by the `rocm-deps`
+# crate, whose build script turns each entry into a Rust constant. Editing a
+# version here is the whole bump.
+#
+# Schema: one `[runtime.<name>]` table per managed runtime, with one or more
+# string fields. Every field becomes a `pub const <NAME>_<FIELD>: &str` in
+# `rocm-deps` (uppercased, `-` and `.` folded to `_`), so a runtime that needs
+# more than a version — say a version plus an ABI tag — just adds a field.
+
+[runtime.lemonade]
+# Lemonade embeddable release, published as
+# `lemonade-embeddable-<version>-<os-arch>.{tar.gz|zip}` under the
+# `v<version>` tag of the lemonade-sdk/lemonade GitHub releases.
+version = "11.5.1"

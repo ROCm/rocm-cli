@@ -348,6 +348,7 @@ pub(crate) fn install(
         let uv = ensure_uv_binary(paths)
             .context("failed to acquire uv binary for ComfyUI dependency install")?;
         run_uv_logged_command(
+            paths,
             &uv,
             uv_install_args(&runtime.python, &packages),
             Some(&runtime_env),
@@ -1400,6 +1401,7 @@ fn uv_install_args(venv_python: &Path, packages: &[String]) -> Vec<String> {
 }
 
 fn run_uv_logged_command(
+    paths: &AppPaths,
     uv: &Path,
     args: Vec<String>,
     runtime_env: Option<&ComfyUiRuntimeEnvironment>,
@@ -1421,7 +1423,7 @@ fn run_uv_logged_command(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for (key, value) in uv_command_env() {
+    for (key, value) in uv_command_env(paths) {
         command.env(key, value);
     }
     if let Some(runtime_env) = runtime_env {

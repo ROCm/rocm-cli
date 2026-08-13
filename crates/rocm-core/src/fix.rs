@@ -160,7 +160,7 @@ const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "fix-6-path",
         title: "Add the ROCm/HIP bin directory to PATH",
-        rationale: "Linux: ROCm is installed at /opt/rocm but its bin directory isn't on PATH, so `rocminfo` / `hipcc` aren't visible to the shell. Windows: the HIP SDK is installed but its bin directory isn't on the User PATH, so `hipInfo.exe` and the runtime DLLs can't be found.",
+        rationale: "Linux: ROCm is installed but its bin directory isn't on PATH, so `rocminfo` / `hipcc` aren't visible to the shell. Windows: the HIP SDK is installed but its bin directory isn't on the User PATH, so `hipInfo.exe` and the runtime DLLs can't be found.",
         auto_applicable: true,
         commands: &[
             "# Linux:",
@@ -380,11 +380,27 @@ const fn current_os() -> &'static str {
     }
 }
 
+/// Whether `value` is a `rocm diagnose` ranking position (`#2`, or a bare `2`)
+/// rather than a fix-id.
+///
+/// Used only to turn an unknown-id refusal into a corrective one; it never
+/// selects a fix, because a position is meaningful only within the report that
+/// produced it and `fix` has no memory of that report.
+fn looks_like_a_diagnosis_position(value: &str) -> bool {
+    let trimmed = value.trim();
+    let digits = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+}
+
 /// List every fix-id (id, kind, OS scope, title).
 #[must_use]
 pub fn list_recipes() -> String {
     use std::fmt::Write as _;
     let mut out = String::from("Available fix-ids (mirror the diagnosis catalog):\n");
+    // The markers were printed with nothing saying what they mean.
+    out.push_str(
+        "  AUTO = `rocm fix <id>` can carry it out; PRINT-ONLY = it prints the steps for you to run.\n",
+    );
     for r in RECIPES {
         let kind = if r.auto_applicable {
             "AUTO"
@@ -440,7 +456,20 @@ fn print_recipe(r: &FixRecipe) {
 pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
     let Some(recipe) = find_recipe(fix_id) else {
         eprintln!("Unknown fix-id: {fix_id}");
-        eprintln!("Run `rocm diagnose` to see which fix-id applies.");
+        if looks_like_a_diagnosis_position(fix_id) {
+            // `rocm diagnose` ranks findings `#1`, `#2`, and users reach for that
+            // number here. It is a position in one report, not a name -- and it
+            // does not line up with the catalog's `fix-1 … fix-15` either, so a
+            // bare "unknown id" left them with nothing to correct.
+            eprintln!(
+                "`{fix_id}` looks like a position in a `rocm diagnose` report, not a fix-id."
+            );
+            eprintln!(
+                "Use the `id:` shown against that cause — `rocm diagnose` prints an `apply with:` line you can copy."
+            );
+        } else {
+            eprintln!("Run `rocm diagnose` to see which fix-id applies.");
+        }
         return 2;
     };
     print_recipe(recipe);
@@ -711,11 +740,22 @@ fn run_path_export(opts: &FixOptions) -> i32 {
 }
 
 fn run_path_export_linux(opts: &FixOptions) -> i32 {
-    let bin_dir = "/opt/rocm/bin";
-    if !Path::new(bin_dir).is_dir() {
-        println!("{bin_dir} does not exist; nothing to add to PATH.");
+    // Same resolver `examine` uses, so the line we append names the install the
+    // report pointed at -- including a versioned root like /opt/rocm-6.4.1.
+    let Some(install) = crate::discover_rocm_installs().into_iter().next() else {
+        println!("No ROCm install found; nothing to add to PATH.");
+        return 3;
+    };
+    let bin_path = install.path.join("bin");
+    if !bin_path.is_dir() {
+        println!(
+            "{} does not exist; nothing to add to PATH.",
+            bin_path.display()
+        );
         return 3;
     }
+    let bin_dir_owned = bin_path.to_string_lossy().into_owned();
+    let bin_dir = bin_dir_owned.as_str();
     let Some(rc_file) = shell_rc_file() else {
         println!("Could not determine your home directory.");
         return 3;
@@ -924,35 +964,106 @@ fn ps_env_scope(var: &str, scope: &str) -> String {
     }
 }
 
-/// Newest `C:\Program Files\AMD\ROCm\<version>` install dir, or empty.
+/// Newest ROCm/HIP SDK install root on this host, or empty if there is none.
+///
+/// This was the third independent Windows install scan in the codebase, and it
+/// disagreed with the other two on every axis that matters: it searched
+/// `C:\Program Files (x86)\AMD\ROCm` where the resolver searches
+/// `C:\Program Files\ROCm`, it sorted with a plain `versions.sort()` so `6.2`
+/// outranked `6.10`, and it accepted any directory whose name began with a
+/// digit without checking for an install marker. So `fix-6-path` could put an
+/// older SDK — or an empty directory — on the user's PATH.
+///
+/// It now asks the same resolver as `examine`, which also means `$ROCM_PATH` is
+/// honoured here for the first time.
 fn newest_rocm_install_dir() -> String {
-    for root in [
-        r"C:\Program Files\AMD\ROCm",
-        r"C:\Program Files (x86)\AMD\ROCm",
-    ] {
-        if let Ok(entries) = std::fs::read_dir(root) {
-            let mut versions: Vec<PathBuf> = entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.is_dir()
-                        && p.file_name()
-                            .and_then(|n| n.to_str())
-                            .is_some_and(|n| n.chars().next().is_some_and(|c| c.is_ascii_digit()))
-                })
-                .collect();
-            versions.sort();
-            if let Some(latest) = versions.last() {
-                return latest.to_string_lossy().into_owned();
-            }
-        }
-    }
-    String::new()
+    crate::discover_rocm_installs()
+        .into_iter()
+        .next()
+        .map(|install| install.path.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plant a directory the shared resolver will accept as a ROCm install.
+    /// `bin/rocminfo` is one of the markers it gates on; a bare directory is
+    /// deliberately not enough.
+    fn plant_install(root: &std::path::Path) {
+        std::fs::create_dir_all(root.join("bin")).expect("create planted install");
+        std::fs::write(root.join("bin").join("rocminfo"), "").expect("write marker");
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+    fn the_path_fix_finds_the_install_the_rest_of_the_cli_found() {
+        // Discriminating on purpose: the scanner this replaces looked only in
+        // two hardcoded `C:\Program Files` directories and ignored $ROCM_PATH
+        // outright, so it returned nothing here no matter what was planted.
+        // Going through the shared resolver is what makes this pass -- and is
+        // what stops fix-6-path putting 6.2 on PATH when 6.10 is installed.
+        let root = std::env::temp_dir().join(format!(
+            "rocm-fix-path-resolver-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let install = root.join("rocm-6.10.0");
+        plant_install(&install);
+
+        let previous = std::env::var_os("ROCM_PATH");
+        unsafe {
+            std::env::set_var("ROCM_PATH", &install);
+        }
+        let found = newest_rocm_install_dir();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("ROCM_PATH", value),
+                None => std::env::remove_var("ROCM_PATH"),
+            }
+        }
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(
+            found,
+            install.to_string_lossy(),
+            "fix-6-path must resolve installs the same way examine does"
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+    fn the_path_fix_reports_nothing_rather_than_a_directory_with_no_install_in_it() {
+        // The old scan accepted any directory whose name started with a digit,
+        // so an empty leftover could be put on PATH. The resolver requires a
+        // marker.
+        let root = std::env::temp_dir().join(format!(
+            "rocm-fix-path-empty-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let empty = root.join("6.10");
+        std::fs::create_dir_all(&empty).expect("create empty dir");
+
+        let previous = std::env::var_os("ROCM_PATH");
+        unsafe {
+            std::env::set_var("ROCM_PATH", &empty);
+        }
+        let found = newest_rocm_install_dir();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("ROCM_PATH", value),
+                None => std::env::remove_var("ROCM_PATH"),
+            }
+        }
+        std::fs::remove_dir_all(&root).ok();
+
+        assert!(
+            found.is_empty(),
+            "an empty directory is not an install, but {found:?} was returned"
+        );
+    }
 
     #[test]
     fn every_recipe_id_is_unique_and_covers_the_catalog() {
@@ -1039,5 +1150,51 @@ mod tests {
         for r in RECIPES {
             assert!(listing.contains(r.fix_id), "listing missing {}", r.fix_id);
         }
+    }
+
+    #[test]
+    fn listing_explains_its_applicability_markers() {
+        // The markers were emitted with nothing saying what they mean, leaving
+        // the reader to guess whether PRINT-ONLY was a debug flag.
+        let listing = list_recipes();
+        assert!(
+            listing.contains("AUTO =") && listing.contains("PRINT-ONLY ="),
+            "the listing must explain its markers:\n{listing}"
+        );
+    }
+
+    #[test]
+    fn diagnosis_positions_are_recognised_as_positions() {
+        // What `rocm diagnose` shows as `#1`/`#2`, plus the bare number a user
+        // might type instead.
+        for value in ["#1", "#2", "1", "12", " #3 "] {
+            assert!(
+                looks_like_a_diagnosis_position(value),
+                "{value} should read as a ranking position"
+            );
+        }
+        // Real ids and other typos must keep the generic refusal — claiming a
+        // fix-id is a "position" would be worse than saying nothing.
+        for value in [
+            "fix-4-render-group",
+            "fix-1-arch",
+            "bogus",
+            "#",
+            "",
+            "fix-#1",
+        ] {
+            assert!(
+                !looks_like_a_diagnosis_position(value),
+                "{value} should NOT read as a ranking position"
+            );
+        }
+    }
+
+    #[test]
+    fn a_position_argument_is_refused_with_the_same_exit_code() {
+        // Still 2: this is clearer wording on an existing refusal, not a new
+        // behaviour that a script could start depending on.
+        assert_eq!(apply("#1", &FixOptions::default()), 2);
+        assert_eq!(apply("bogus", &FixOptions::default()), 2);
     }
 }

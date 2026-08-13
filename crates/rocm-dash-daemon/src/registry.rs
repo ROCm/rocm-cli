@@ -34,9 +34,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-use crate::runner::instance_from_discovered;
 use rocm_dash_collectors::engine_registry::EngineKind;
-use rocm_dash_core::metrics::{Instance, InstanceStatus, StartupPhase};
+use rocm_dash_core::metrics::{InstanceStatus, StartupPhase};
 use rocm_dash_core::traits::DiscoveredService;
 use serde::Deserialize;
 
@@ -187,7 +186,7 @@ pub fn engine_kind_for(record: &ServiceRecord) -> Option<EngineKind> {
 /// not mis-parsed). Pure — the runner applies it (upsert/broadcast/Gone-diff).
 #[derive(Debug, Default)]
 pub struct ManagedDiscovery {
-    pub instances: Vec<Instance>,
+    pub svcs: Vec<DiscoveredService>,
     pub seen: HashSet<String>,
     pub non_vllm: HashSet<String>,
 }
@@ -211,7 +210,7 @@ pub fn discover_managed_services(records: &[ServiceRecord]) -> ManagedDiscovery 
         if engine_kind_for(record) != Some(EngineKind::Vllm) {
             out.non_vllm.insert(svc.container_id.clone());
         }
-        out.instances.push(instance_from_discovered(&svc));
+        out.svcs.push(svc);
     }
     out
 }
@@ -219,9 +218,10 @@ pub fn discover_managed_services(records: &[ServiceRecord]) -> ManagedDiscovery 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::gen_tps_from_delta;
     use chrono::{DateTime, TimeZone, Utc};
+    use rocm_dash_core::observation::GenerationObservationTracker;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     fn at(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(secs, 0).unwrap()
@@ -566,7 +566,7 @@ mod tests {
 
         let disc = discover_managed_services(&records);
         // Two live, scrapeable instances (dead + zero-port dropped).
-        assert_eq!(disc.instances.len(), 2);
+        assert_eq!(disc.svcs.len(), 2);
         assert!(disc.seen.contains("svc-vllm"));
         assert!(disc.seen.contains("svc-lemon"));
         assert!(!disc.seen.contains("svc-dead"));
@@ -576,9 +576,9 @@ mod tests {
         assert!(!disc.non_vllm.contains("svc-vllm"));
         // Instances carry the registry port + Running status.
         let vllm = disc
-            .instances
+            .svcs
             .iter()
-            .find(|i| i.container_id == "svc-vllm")
+            .find(|s| s.container_id == "svc-vllm")
             .unwrap();
         assert_eq!(vllm.port, Some(8000));
         assert_eq!(
@@ -591,7 +591,7 @@ mod tests {
     /// GPU required): a `rocm serve`-style managed record on disk → loaded →
     /// converted to a scrape target on the **registry port** → the engine-kind
     /// parser turns two successive vLLM Prometheus bodies into a cumulative
-    /// counter → the runner's delta yields a live `gen_tps`. This is the
+    /// counter → the tracker yields a live `gen_tps`. This is the
     /// test-level proof for Phase-2 acceptance criterion 3 (no ROCm GPU here).
     #[test]
     fn serve_record_to_live_gen_tps_end_to_end() {
@@ -621,8 +621,11 @@ mod tests {
         let c0 = s0.gen_tokens_total.expect("counter at t0");
         let c1 = s1.gen_tokens_total.expect("counter at t1");
 
-        // 4. Runner delta → live gen_tps: 400 tokens over 2 s = 200 tok/s.
-        let gen_tps = gen_tps_from_delta(Some((c0, at(10))), c1, at(12));
+        // 4. Tracker-based delta → live gen_tps: 400 tokens over 2 s = 200 tok/s.
+        let mut tracker = GenerationObservationTracker::new(Duration::from_secs(2));
+        tracker.observe_counter(c0, at(10));
+        tracker.observe_counter(c1, at(12));
+        let (gen_tps, _meta) = tracker.snapshot(at(12));
         assert_eq!(gen_tps, Some(200.0));
         let _ = fs::remove_dir_all(&dir);
     }

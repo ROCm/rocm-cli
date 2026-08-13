@@ -414,9 +414,14 @@ function Write-MinimalConfigIfMissing {
     }
 
     New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+    # Deliberately no "default_engine": the CLI picks the serving engine from the
+    # host GPU (vLLM on Instinct data-center parts, Lemonade elsewhere). Seeding a
+    # value here would be treated as an explicit user choice and short-circuit that
+    # detection -- which is how every installed Instinct box ended up on Lemonade.
+    # On native Windows the detection resolves to Lemonade anyway, so nothing
+    # changes there; the key is dropped on both platforms to keep them identical.
     $json = @'
 {
-  "default_engine": "lemonade",
   "telemetry": {
     "mode": "local"
   },
@@ -570,9 +575,12 @@ if ([string]::IsNullOrWhiteSpace($InstallDir)) {
 }
 $InstallDir = Resolve-InstallerPath $InstallDir
 
-$architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+$architecture = $env:PROCESSOR_ARCHITEW6432
+if ([string]::IsNullOrWhiteSpace($architecture)) {
+    $architecture = $env:PROCESSOR_ARCHITECTURE
+}
 switch ($architecture) {
-    "X64" { $platformArch = "amd64" }
+    "AMD64" { $platformArch = "amd64" }
     default { Fail "unsupported architecture: $architecture (installer currently supports Windows x86_64 only)" }
 }
 

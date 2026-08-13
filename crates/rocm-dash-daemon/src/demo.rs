@@ -625,6 +625,7 @@ fn build_instances(t_s: f64, seed: &mut u64) -> Vec<Instance> {
                 running_reqs: Some(running),
                 waiting_reqs: Some(waiting),
                 gen_tps: Some(gen_tps),
+                gen_tps_observation: None,
                 tokens_per_watt: None,
                 ttft_ms,
                 tpot_ms,

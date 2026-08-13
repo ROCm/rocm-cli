@@ -1068,14 +1068,23 @@ async fn then_manifest_present(world: &mut E2eWorld) {
     assert_exists(&st.install_dir.join(".rocm-cli-manifest"));
 }
 
-#[then("a minimal config is seeded with the lemonade default engine")]
+#[then("the seeded config does not pin a serving engine")]
 async fn then_config_seeded(world: &mut E2eWorld) {
     let config = installed_config_file(world);
     let contents = std::fs::read_to_string(&config)
         .unwrap_or_else(|_| panic!("installed config not found: {}", config.display()));
+    // The installer used to write `"default_engine": "lemonade"` here on every
+    // platform. A configured engine outranks the GPU-family preference, so that
+    // seed silently forced Lemonade onto Instinct machines where serve should
+    // pick vLLM. Leaving the key out lets the CLI decide from the host.
     assert!(
-        contents.contains("\"default_engine\"") && contents.contains("\"lemonade\""),
-        "config did not seed the lemonade default engine:\n{contents}"
+        !contents.contains("\"default_engine\""),
+        "the seeded config must not pin a serving engine:\n{contents}"
+    );
+    // Still a real config, not an empty file — the rest of the seed must survive.
+    assert!(
+        contents.contains("\"telemetry\""),
+        "the seeded config lost its other defaults:\n{contents}"
     );
 }
 

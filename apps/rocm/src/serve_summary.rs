@@ -166,10 +166,19 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
         );
     }
     if !ready && !summary.already_running {
+        // Two different ways to miss "ready", and conflating them misleads: a
+        // `running` service answered and advertised the model but could not serve
+        // a request yet, which is also why the metrics rows are empty — the smoke
+        // test only runs against a service that can actually serve.
+        let explanation = if summary.status == "running" {
+            "the server is up and lists the model, but it could not serve a request yet, \
+             so no smoke test was run; it is most likely still loading"
+        } else {
+            "the server did not report ready before the startup timeout; it may still be loading"
+        };
         let _ = writeln!(
             out,
-            "  note: the server did not report ready before the startup timeout; \
-             it may still be loading — check `rocm logs --service {}` or `rocm services list`",
+            "  note: {explanation} — check `rocm logs --service {}` or `rocm services list`",
             summary.service_id
         );
     }
@@ -439,6 +448,28 @@ mod tests {
         assert!(rendered.contains("not ready yet"), "heading: {rendered}");
         assert!(rendered.contains("did not report ready"));
         assert!(rendered.contains("rocm logs --service"));
+    }
+
+    #[test]
+    fn a_still_loading_launch_explains_the_missing_smoke_test() {
+        // A launch whose model lists but cannot serve yet lands at "running". The
+        // smoke test is skipped by design (there is nothing to measure), so the
+        // empty metrics rows must be explained rather than left to read as a
+        // failed measurement against a healthy server.
+        let mut summary = base_summary();
+        summary.status = "running".to_owned();
+        summary.metrics = SmokeMetrics::default();
+        let rendered = render_summary(&summary);
+        assert!(rendered.contains("not ready yet"), "heading: {rendered}");
+        assert!(
+            rendered.contains("no smoke test was run"),
+            "the skipped smoke test must be explained: {rendered}"
+        );
+        assert!(
+            rendered.contains("still loading"),
+            "the user needs to know this resolves on its own: {rendered}"
+        );
+        assert!(rendered.contains("rocm services list"));
     }
 
     #[test]

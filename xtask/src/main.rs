@@ -22,6 +22,7 @@ mod signing;
 mod tpn;
 mod verify_commits;
 mod verify_pinned_keys;
+mod workflow_contract;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

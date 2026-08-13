@@ -39,7 +39,10 @@ pub const CSV_HEADER: &str = "cell,run,concurrency,model,engine,input_len,output
 /// Parameters for a single concurrency-level load cell.
 #[derive(Debug, Clone)]
 pub struct LoadSpec {
-    /// Base URL of the OpenAI-compatible endpoint, e.g. `http://127.0.0.1:8000`.
+    /// OpenAI-compatible endpoint, e.g. `http://127.0.0.1:8000/v1` — the same
+    /// form `rocm services list` prints. A plain host address without the `/v1`
+    /// suffix is also accepted: request URLs are built through [`v1_base`],
+    /// which supplies the suffix when it is missing.
     pub endpoint: String,
     /// Model name to pass in the request body.
     pub model: String,
@@ -56,6 +59,33 @@ struct Outcome {
     prompt_tokens: u64,
     completion_tokens: u64,
 }
+
+/// One cell's [`BenchmarkRow`] plus the delivery facts the row cannot carry.
+///
+/// [`BenchmarkRow`] is the CSV schema and is guarded by a header check, so
+/// per-request failure detail cannot live there. It travels alongside instead,
+/// so the CLI can warn about a partially-failed cell and refuse to report a
+/// run in which nothing succeeded as a success.
+#[derive(Debug, Clone)]
+pub struct CellReport {
+    /// The aggregate row for this cell, as appended to the CSV.
+    pub row: BenchmarkRow,
+    /// Requests dispatched for this cell.
+    pub attempted: u32,
+    /// Requests that returned usable token counts.
+    pub succeeded: u32,
+    /// Requests that failed for any reason.
+    pub failed: u32,
+    /// Reason from the first failure observed, for the operator-facing warning.
+    pub first_error: Option<String>,
+}
+
+/// Why a single benchmark request produced no usable measurement.
+///
+/// Kept as a short human-readable string rather than a typed enum: it is only
+/// ever rendered into a warning line, and the underlying causes (transport,
+/// status, malformed body) have no distinct programmatic handling.
+type RequestFailure = String;
 
 /// Error type for the bench load writer.
 #[derive(Debug, thiserror::Error)]
@@ -82,9 +112,35 @@ pub enum BenchLoadError {
     },
 }
 
+/// Normalise an endpoint to the OpenAI-compatible `/v1` API root that request
+/// paths are built relative to.
+///
+/// Everything else in the product treats an "endpoint" as already carrying the
+/// `/v1` suffix — `rocm services list` prints one (see `endpoint_url`, built as
+/// `{base}/v1`), and the chat client appends `chat/completions` to it. Bench
+/// used to be split-brained: it POSTed to `{endpoint}/chat/completions` (which
+/// assumes the suffix is present) while probing `{endpoint}/v1/models` (which
+/// assumes it is absent), so whichever form the user supplied, one of the two
+/// 404'd. Routing both through here removes the ambiguity and lets a user paste
+/// either form.
+///
+/// Idempotent: an endpoint already ending in `/v1` is returned unchanged apart
+/// from trailing-slash trimming.
+#[must_use]
+pub fn v1_base(endpoint: &str) -> String {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    if trimmed.ends_with("/v1") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/v1")
+    }
+}
+
 /// Build the `/metrics` URL from an OpenAI-compatible endpoint base URL.
 ///
 /// Returns `None` if the endpoint cannot be parsed (no host:port component).
+/// Unaffected by the `/v1` suffix: the path is discarded and `/metrics` is
+/// resolved against `host:port`, which is where the engine serves it.
 fn metrics_url(endpoint: &str) -> Option<String> {
     let url_base = endpoint.trim_end_matches('/');
     let (scheme, rest) = if let Some(r) = url_base.strip_prefix("https://") {
@@ -153,14 +209,16 @@ impl BenchClients {
     }
 }
 
-/// Send `spec.requests` POST `/chat/completions` requests with `concurrency`
+/// Send `spec.requests` POST `/v1/chat/completions` requests with `concurrency`
 /// in-flight at a time.
 ///
-/// Returns one aggregate `BenchmarkRow` with client-side `gen_tps` and
+/// Returns one aggregate [`CellReport`] with client-side `gen_tps` and
 /// `prompt_tps`. Per-request failures are isolated: a non-2xx response or
 /// missing `usage` fields excludes that request from the sums but does not
-/// abort the cell.
-pub async fn run_cell(spec: &LoadSpec, concurrency: u32) -> Result<BenchmarkRow, BenchLoadError> {
+/// abort the cell. Unlike earlier revisions, such failures are *counted and
+/// reported* rather than silently dropped — a cell where every request failed
+/// used to be indistinguishable from a cell that was never asked to do work.
+pub async fn run_cell(spec: &LoadSpec, concurrency: u32) -> Result<CellReport, BenchLoadError> {
     run_cell_with_clients(spec, concurrency, &BenchClients::new()?).await
 }
 
@@ -168,12 +226,12 @@ async fn run_cell_with_clients(
     spec: &LoadSpec,
     concurrency: u32,
     clients: &BenchClients,
-) -> Result<BenchmarkRow, BenchLoadError> {
+) -> Result<CellReport, BenchLoadError> {
     if concurrency == 0 {
         return Err(BenchLoadError::InvalidConcurrency(concurrency));
     }
     let sem = Arc::new(Semaphore::new(concurrency as usize));
-    let url = format!("{}/chat/completions", spec.endpoint.trim_end_matches('/'));
+    let url = format!("{}/chat/completions", v1_base(&spec.endpoint));
 
     // Before scrape: used only for TTFT/TPOT histogram deltas.
     let prom_before = try_scrape_prom(&clients.metrics, &spec.endpoint).await;
@@ -209,7 +267,11 @@ async fn run_cell_with_clients(
     // Capture makespan BEFORE spawning so the clock includes queue wait time.
     let t0 = Instant::now();
 
-    let mut js: JoinSet<Option<Outcome>> = JoinSet::new();
+    // Each request reports *why* it produced no measurement rather than
+    // collapsing to `None`. A cell whose every request 404'd used to be
+    // indistinguishable from a healthy cell that measured nothing, which is how
+    // a wrong request path reached users as a silent empty result.
+    let mut js: JoinSet<Result<Outcome, RequestFailure>> = JoinSet::new();
     for _ in 0..spec.requests {
         let client = clients.post.clone();
         let sem = Arc::clone(&sem);
@@ -220,7 +282,10 @@ async fn run_cell_with_clients(
 
         js.spawn(async move {
             // Named binding: permit is held for the entire request.
-            let _permit = sem.acquire_owned().await.ok()?;
+            let _permit = sem
+                .acquire_owned()
+                .await
+                .map_err(|_| "load generator stopped before the request started".to_owned())?;
 
             let body = serde_json::json!({
                 "model": model,
@@ -236,25 +301,38 @@ async fn run_cell_with_clients(
                 .body(body.to_string())
                 .send()
                 .await
-                .ok()?;
+                .map_err(|error| format!("POST {url} failed: {error}"))?;
 
-            if !resp.status().is_success() {
-                return None;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(format!("POST {url} returned HTTP {status}"));
             }
 
-            let text = resp.text().await.ok()?;
-            let v: Value = serde_json::from_str(&text).ok()?;
-            let usage = v.get("usage")?;
+            let text = resp
+                .text()
+                .await
+                .map_err(|error| format!("reading the response body failed: {error}"))?;
+            let value: Value = serde_json::from_str(&text)
+                .map_err(|error| format!("the response was not JSON: {error}"))?;
+            let usage = value
+                .get("usage")
+                .ok_or_else(|| "the response carried no `usage` object".to_owned())?;
 
-            let prompt_tokens = usage.get("prompt_tokens")?.as_u64()?;
-            let completion_tokens = usage.get("completion_tokens")?;
-            // Treat missing/zero completion_tokens as failure (excluded from sums).
-            let completion_tokens = completion_tokens.as_u64()?;
+            let prompt_tokens = usage
+                .get("prompt_tokens")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "`usage` carried no numeric `prompt_tokens`".to_owned())?;
+            let completion_tokens = usage
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "`usage` carried no numeric `completion_tokens`".to_owned())?;
+            // A response that generated nothing measures nothing: exclude it from
+            // the sums rather than crediting a makespan it did not earn.
             if completion_tokens == 0 {
-                return None;
+                return Err("the response reported zero completion_tokens".to_owned());
             }
 
-            Some(Outcome {
+            Ok(Outcome {
                 prompt_tokens,
                 completion_tokens,
             })
@@ -264,12 +342,25 @@ async fn run_cell_with_clients(
     let mut sum_prompt: u64 = 0;
     let mut sum_completion: u64 = 0;
     let mut n_success: u32 = 0;
+    let mut n_failed: u32 = 0;
+    let mut first_error: Option<String> = None;
 
     while let Some(res) = js.join_next().await {
-        if let Ok(Some(outcome)) = res {
-            sum_prompt += outcome.prompt_tokens;
-            sum_completion += outcome.completion_tokens;
-            n_success += 1;
+        let failure = match res {
+            Ok(Ok(outcome)) => {
+                sum_prompt += outcome.prompt_tokens;
+                sum_completion += outcome.completion_tokens;
+                n_success += 1;
+                continue;
+            }
+            Ok(Err(reason)) => reason,
+            // A panicked request task is still a request that did not measure
+            // anything, so it counts as a failure rather than vanishing.
+            Err(join_error) => format!("the request task did not complete: {join_error}"),
+        };
+        n_failed += 1;
+        if first_error.is_none() {
+            first_error = Some(failure);
         }
     }
 
@@ -302,7 +393,7 @@ async fn run_cell_with_clients(
     // TTFT/TPOT deltas come from the before/after histogram scrapes (unchanged).
     let (_, _, ttft_ms, tpot_ms) = prom_deltas(prom_before.as_ref(), prom_after.as_ref());
 
-    Ok(BenchmarkRow {
+    let row = BenchmarkRow {
         cell: format!("bench-c{concurrency}"),
         run: 1,
         model: Some(spec.model.clone()),
@@ -321,6 +412,14 @@ async fn run_cell_with_clients(
         ttft_ms,
         tpot_ms,
         ..Default::default()
+    };
+
+    Ok(CellReport {
+        row,
+        attempted: spec.requests,
+        succeeded: n_success,
+        failed: n_failed,
+        first_error,
     })
 }
 
@@ -409,22 +508,24 @@ fn append_one_row(row: &BenchmarkRow, csv_path: &Path) -> Result<(), BenchLoadEr
 /// serialized into a `Vec<u8>` ending in `\n` and written with a single
 /// `write_all` call (O_APPEND safe on regular files).
 ///
-/// Returns the rows appended (one per concurrency level).
+/// Returns the reports for the rows appended (one per concurrency level).
 pub async fn run_and_append_csv(
     spec: &LoadSpec,
     concurrency_levels: &[u32],
     csv_path: &Path,
-) -> Result<Vec<BenchmarkRow>, BenchLoadError> {
+) -> Result<Vec<CellReport>, BenchLoadError> {
     let clients = BenchClients::new()?;
 
-    let mut rows = Vec::with_capacity(concurrency_levels.len());
+    let mut reports = Vec::with_capacity(concurrency_levels.len());
     for &conc in concurrency_levels {
-        let row = run_cell_with_clients(spec, conc, &clients).await?;
-        append_one_row(&row, csv_path)?;
-        rows.push(row);
+        let report = run_cell_with_clients(spec, conc, &clients).await?;
+        // A fully-failed cell is still appended: the dashboard tailer expects one
+        // row per cell, and the caller reports the failure separately.
+        append_one_row(&report.row, csv_path)?;
+        reports.push(report);
     }
 
-    Ok(rows)
+    Ok(reports)
 }
 
 /// Decide whether the auto-ramp should stop after `row`.
@@ -476,30 +577,30 @@ fn next_prev_gen_tps(previous: Option<f64>, current: Option<f64>) -> Option<f64>
 /// daemon tailer shows progress live. Stops after a cell when
 /// [`should_stop_ramp`] returns `true`.
 ///
-/// Returns the rows appended (one per concurrency level run).
+/// Returns the reports for the rows appended (one per concurrency level run).
 pub async fn run_auto_ramp(
     spec: &LoadSpec,
     csv_path: &Path,
-) -> Result<Vec<BenchmarkRow>, BenchLoadError> {
-    let mut rows = Vec::new();
+) -> Result<Vec<CellReport>, BenchLoadError> {
+    let mut reports = Vec::new();
     let mut prev_gen_tps: Option<f64> = None;
     let clients = BenchClients::new()?;
 
     for &conc in RAMP_SEQUENCE {
-        let row = run_cell_with_clients(spec, conc, &clients).await?;
-        append_one_row(&row, csv_path)?;
+        let report = run_cell_with_clients(spec, conc, &clients).await?;
+        append_one_row(&report.row, csv_path)?;
 
         let is_last = conc == *RAMP_SEQUENCE.last().unwrap_or(&conc);
-        let stop = should_stop_ramp(prev_gen_tps, &row, is_last);
-        prev_gen_tps = next_prev_gen_tps(prev_gen_tps, row.gen_tps);
-        rows.push(row);
+        let stop = should_stop_ramp(prev_gen_tps, &report.row, is_last);
+        prev_gen_tps = next_prev_gen_tps(prev_gen_tps, report.row.gen_tps);
+        reports.push(report);
 
         if stop {
             break;
         }
     }
 
-    Ok(rows)
+    Ok(reports)
 }
 
 /// Serialize one `BenchmarkRow` to the 18-column CSV line (with trailing `\n`).
@@ -617,7 +718,7 @@ mod tests {
     async fn t1_run_cell_fields_and_tps() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .respond_with(stub_response(100, 50))
             .expect(4)
             .mount(&server)
@@ -627,7 +728,7 @@ mod tests {
         // requests=4, each returns prompt=100 completion=50
         let mut spec4 = spec.clone();
         spec4.requests = 4;
-        let row = run_cell(&spec4, 2).await.unwrap();
+        let row = run_cell(&spec4, 2).await.unwrap().row;
 
         assert_eq!(row.cell, "bench-c2");
         assert_eq!(row.run, 1);
@@ -683,7 +784,7 @@ mod tests {
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .respond_with(
                 stub_response(10, 5).set_delay(std::time::Duration::from_millis(DELAY_MS)),
             )
@@ -693,7 +794,7 @@ mod tests {
 
         let mut spec = make_spec(&server.uri());
         spec.requests = REQUESTS;
-        let row = run_cell(&spec, N).await.unwrap();
+        let row = run_cell(&spec, N).await.unwrap().row;
 
         // Structural check: concurrency column matches N.
         assert_eq!(row.concurrency, Some(N));
@@ -726,7 +827,7 @@ mod tests {
     async fn t3_csv_round_trip() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .respond_with(stub_response(50, 25))
             .mount(&server)
             .await;
@@ -766,7 +867,7 @@ mod tests {
     async fn d2_header_mismatch_returns_error_without_modifying_file() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .respond_with(stub_response(50, 25))
             .mount(&server)
             .await;
@@ -883,7 +984,7 @@ mod tests {
 
         // /chat/completions returns token data.
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .respond_with(stub_response(100, 50))
             .expect(4)
             .mount(&server)
@@ -909,7 +1010,7 @@ mod tests {
 
         let mut spec = make_spec(&server.uri());
         spec.requests = 4;
-        let row = run_cell(&spec, 2).await.unwrap();
+        let row = run_cell(&spec, 2).await.unwrap().row;
 
         // Peaks come from the poller (which only sees the catch-all stub).
         assert_eq!(
@@ -940,7 +1041,7 @@ mod tests {
 
         // Normal chat completions succeed.
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .respond_with(stub_response(100, 50))
             .mount(&server)
             .await;
@@ -954,7 +1055,7 @@ mod tests {
 
         let mut spec = make_spec(&server.uri());
         spec.requests = 4;
-        let row = run_cell(&spec, 2).await.unwrap();
+        let row = run_cell(&spec, 2).await.unwrap().row;
 
         assert_eq!(
             row.max_running_reqs, None,
@@ -978,7 +1079,7 @@ mod tests {
     async fn t8_csv_round_trip_18_cols() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .respond_with(stub_response(50, 25))
             .mount(&server)
             .await;
@@ -1025,7 +1126,7 @@ mod tests {
     async fn t9_old_14col_file_returns_header_mismatch() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .respond_with(stub_response(50, 25))
             .mount(&server)
             .await;
@@ -1067,7 +1168,7 @@ mod tests {
         let server = MockServer::start().await;
         // Same token counts for all requests → flat gen_tps.
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .respond_with(stub_response(50, 25))
             .mount(&server)
             .await;
@@ -1093,7 +1194,7 @@ mod tests {
             RAMP_SEQUENCE.len()
         );
         // Last concurrency must not be 128.
-        let last_conc = rows.last().and_then(|r| r.concurrency).unwrap_or(0);
+        let last_conc = rows.last().and_then(|r| r.row.concurrency).unwrap_or(0);
         assert_ne!(last_conc, 128, "should not have reached concurrency=128");
         // Must have appended at least the first cell.
         assert!(!rows.is_empty(), "at least one row must be produced");
@@ -1232,5 +1333,177 @@ mod tests {
         update_peak_pair(&peak, 8, 1);
 
         assert_eq!(peak_pair(&peak), Some((8, 1)));
+    }
+
+    // ---------- endpoint normalisation ----------
+
+    #[test]
+    fn v1_base_supplies_the_suffix_when_it_is_missing() {
+        // The form `--endpoint`'s help used to advertise, and the form a user
+        // types from memory. Both must reach the versioned API root.
+        assert_eq!(v1_base("http://127.0.0.1:8000"), "http://127.0.0.1:8000/v1");
+        assert_eq!(
+            v1_base("http://127.0.0.1:8000/"),
+            "http://127.0.0.1:8000/v1"
+        );
+        assert_eq!(
+            v1_base("  http://127.0.0.1:8000  "),
+            "http://127.0.0.1:8000/v1"
+        );
+    }
+
+    #[test]
+    fn v1_base_is_idempotent_for_an_already_versioned_endpoint() {
+        // The canonical form — what `rocm services list` prints. Appending a
+        // second `/v1` here is the mirror-image bug of omitting the first.
+        assert_eq!(
+            v1_base("http://127.0.0.1:8000/v1"),
+            "http://127.0.0.1:8000/v1"
+        );
+        assert_eq!(
+            v1_base("http://127.0.0.1:8000/v1/"),
+            "http://127.0.0.1:8000/v1"
+        );
+        assert_eq!(
+            v1_base(&v1_base("http://127.0.0.1:8000")),
+            "http://127.0.0.1:8000/v1"
+        );
+    }
+
+    #[test]
+    fn v1_base_preserves_a_gateway_path_prefix() {
+        // A reverse-proxied endpoint keeps its prefix; only the API root is added.
+        assert_eq!(
+            v1_base("http://gw.example.com/openai"),
+            "http://gw.example.com/openai/v1"
+        );
+        assert_eq!(
+            v1_base("http://gw.example.com/openai/v1"),
+            "http://gw.example.com/openai/v1"
+        );
+    }
+
+    /// The regression guard for the reported bug: requests must land on the
+    /// versioned path even when the caller supplies a bare host address. A mock
+    /// that answers ONLY `/v1/chat/completions` fails this if the `/v1` is
+    /// dropped, which is exactly what shipped.
+    #[tokio::test]
+    async fn plain_host_endpoint_still_reaches_the_versioned_chat_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(stub_response(100, 50))
+            .mount(&server)
+            .await;
+
+        // Deliberately NOT `{uri}/v1` — the bare form the old help text taught.
+        let spec = make_spec(&server.uri());
+        let report = run_cell(&spec, 2).await.unwrap();
+
+        assert_eq!(report.succeeded, 4, "every request should have been served");
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.row.n_requests, Some(4));
+    }
+
+    // ---------- failures are reported, not swallowed ----------
+
+    #[tokio::test]
+    async fn a_cell_whose_every_request_is_rejected_reports_the_failures() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let spec = make_spec(&server.uri());
+        let report = run_cell(&spec, 2).await.unwrap();
+
+        assert_eq!(report.succeeded, 0);
+        assert_eq!(report.failed, 4, "all four requests must be counted failed");
+        assert_eq!(report.attempted, 4);
+        let reason = report
+            .first_error
+            .expect("a failure reason must be recorded");
+        assert!(
+            reason.contains("500"),
+            "the reason should name the status the server returned, got: {reason}"
+        );
+        // The row still reports nothing measured — the point is that the caller
+        // can now tell that apart from a healthy idle cell.
+        assert_eq!(report.row.gen_tps, None);
+        assert_eq!(report.row.n_requests, Some(0));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_endpoint_reports_a_transport_failure() {
+        // Port 1 on loopback: reserved and never listening, so every send errors.
+        let spec = make_spec("http://127.0.0.1:1");
+        let report = run_cell(&spec, 1).await.unwrap();
+
+        assert_eq!(report.succeeded, 0);
+        assert_eq!(report.failed, 4);
+        let reason = report
+            .first_error
+            .expect("a failure reason must be recorded");
+        assert!(
+            reason.contains("POST") && reason.contains("failed"),
+            "the reason should describe the failed request, got: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partially_failing_cell_reports_both_throughput_and_failures() {
+        let server = MockServer::start().await;
+        // First two requests succeed, the rest are rejected.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(stub_response(100, 50))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let spec = make_spec(&server.uri());
+        let report = run_cell(&spec, 1).await.unwrap();
+
+        assert_eq!(report.succeeded, 2);
+        assert_eq!(report.failed, 2);
+        assert!(
+            report.row.gen_tps.unwrap_or(0.0) > 0.0,
+            "throughput from the successful requests must still be reported"
+        );
+        assert_eq!(report.row.completion_tokens, Some(100), "2 * 50");
+        assert!(report.first_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_response_without_usage_counts_as_a_named_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+
+        let spec = make_spec(&server.uri());
+        let report = run_cell(&spec, 2).await.unwrap();
+
+        assert_eq!(report.succeeded, 0);
+        assert_eq!(report.failed, 4);
+        let reason = report
+            .first_error
+            .expect("a failure reason must be recorded");
+        assert!(
+            reason.contains("usage"),
+            "the reason should name the missing field, got: {reason}"
+        );
     }
 }

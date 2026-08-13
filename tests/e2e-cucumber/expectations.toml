@@ -7,8 +7,12 @@
 # host capability probe (see src/capability.rs) and is NOT encoded here.
 #
 # Resolution at runtime (see tests/e2e-cucumber/src/expectation.rs):
-#   1. A scenario whose @requires-gpu / @requires-engine can't be satisfied on
-#      this host is SKIPPED (not-applicable) — never listed here.
+#   1. A scenario whose @requires-gpu / @requires-engine / @requires-bare-metal
+#      can't be satisfied on this host is SKIPPED (not-applicable) — never listed
+#      here. Reach for a tag, not a row, whenever the scenario simply has no
+#      premise on that host: a row here says "known BUG", so using one for
+#      designed-in behaviour (e.g. diagnose not running its bare-metal catalog on
+#      WSL2) tells every later reader the opposite of the truth.
 #   2. Otherwise, the FIRST matching condition below marks it expected-fail
 #      (xfail); a scenario that then PASSES is an XPASS — a stale entry to be
 #      removed, UNLESS the row is `flaky = true`, which tolerates either result
@@ -37,17 +41,6 @@ reason = "Serve output does not surface the expanded full model name for a short
 when = {}
 bug = "EAI-7219"
 reason = "Engines do not report a consistent resolved model name for a short name."
-
-# --- EAI-7333: vLLM reports /v1/models ready but refuses inference. vLLM-only. ---
-# Applies wherever the effective serve engine is vLLM. On lemonade-default hosts
-# (e.g. Strix Halo gfx1151, native Windows) these resolve to expected-pass, which
-# is what fixes the Strix-Windows XPASS from run #543.
-[["serve-vllm-inference"]]
-when = { effective_engine = "vllm" }
-bug = "EAI-7333"
-reason = "vLLM service reports ready (/v1/models 200) but POST /v1/chat/completions is refused intermittently."
-serve_timeout_secs = 90
-flaky = true
 
 # EAI-7423 was INTERMITTENT on Strix Halo Ubuntu as of 2026-08-05, not fixed:
 # which of its scenarios pass varied run to run (run 30995473578: 2 XPASS; run
@@ -80,19 +73,6 @@ flaky = true
 when = { effective_engine = "lemonade", os = "linux" }
 bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so inference never succeeds."
-serve_timeout_secs = 90
-flaky = true
-
-# EAI-7333 (CLI healthcheck reports ready off /v1/models before inference works)
-# on the vLLM path. This scenario is FLAKY, not fixed: it XPASS'd on MI300X once
-# (run 29404668327) but FAILED the next run (29413321046) — a race between the
-# CLI reporting ready and the vLLM model actually being inference-ready. EAI-7333
-# is still OPEN, so keep it xfail'd on the vLLM path; an intermittent known-bug
-# scenario stays xfail (an occasional XPASS is expected and harmless here).
-[["serve-readiness-contract"]]
-when = { effective_engine = "vllm" }
-bug = "EAI-7333"
-reason = "CLI reports the vLLM service ready, but an immediate inference request races the model load and intermittently fails."
 serve_timeout_secs = 90
 flaky = true
 
@@ -162,3 +142,23 @@ flaky = true
 when = {}
 bug = "EAI-7384"
 reason = "Managed runtime path nests recursively (runtimes/wheel/...) on re-provisioning."
+
+# The GPU-backed bench scenario benchmarks a really served model, so on a
+# lemonade LINUX host it inherits the same managed-serve bug as the sibling
+# serve/chat rows below `serve-default-engine-working-endpoint`: the serve
+# reaches ready then shuts down immediately, so this scenario's `a model is
+# being served on GPU` precondition never yields a live endpoint. Scoped
+# identically — os=linux only, because native Windows lemonade serve works, and
+# therock_family=gfx* so it applies only on a real GPU host. `flaky = true`
+# matches those rows too: which of them pass varies run to run on that lane, and
+# a deterministic-XPASS row would fail the lane on unrelated PRs.
+#
+# This does NOT weaken the coverage the bench fix relies on: the three
+# MockServer-backed bench scenarios run unxfail'd on every lane, including this
+# one, and they are what pin the request path and the failure reporting.
+[["bench-load-real-serve"]]
+when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*" }
+bug = "EAI-7423"
+reason = "Lemonade managed serve reaches ready then shuts down immediately, so the benchmark never reaches a live model."
+serve_timeout_secs = 90
+flaky = true

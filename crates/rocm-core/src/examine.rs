@@ -252,10 +252,18 @@ impl Examination {
         let mut e = Self::default();
         probe_os(&mut e);
         if e.is_wsl {
-            // WSL2 is out of scope: it uses /dev/dxg + the Windows host driver,
-            // not the in-tree amdgpu module or /dev/kfd. Running the Linux probe
-            // set would only mislead, so add the route-out note and stop here
-            // (mirrors examine.py). The "wsl" status carries the verdict.
+            // WSL2 is out of scope for the *driver* probes: it uses /dev/dxg and
+            // the Windows host driver, not the in-tree amdgpu module or
+            // /dev/kfd, so asking about modprobe, the render group or /dev/kfd
+            // would only mislead. The "wsl" status carries that verdict.
+            //
+            // The frameworks are a different matter. PyTorch on WSL2 is a
+            // supported, documented configuration, and stopping before the
+            // framework probe meant `--json` could never tell a WSL user which
+            // ROCm build their torch was compiled against -- a question that has
+            // nothing to do with the kernel module. So run that one, and only
+            // that one, before routing out.
+            probe_framework(&mut e, framework);
             e.notes.push(WSL_ROUTE_OUT_NOTE.to_owned());
             e.status = "wsl".to_owned();
             return e;
@@ -264,6 +272,7 @@ impl Examination {
             probe_cpu_linux(&mut e);
             probe_gpus_lspci(&mut e);
             probe_gpus_rocminfo(&mut e);
+            probe_gpus_sysfs_fallback(&mut e);
             summarise_gpu_categories(&mut e);
             probe_modules(&mut e);
             probe_user(&mut e);
@@ -405,7 +414,20 @@ const MEDIUM: Duration = Duration::from_secs(8);
 // ---------------------------------------------------------------------------
 
 fn probe_os(e: &mut Examination) {
-    e.os_version = std::env::consts::OS.to_owned();
+    // The OS *version*, mirroring examine.py's `platform.version()`. This used
+    // to hold `std::env::consts::OS`, which is the OS *name* and so merely
+    // repeated `os_family`, telling a reader of the report nothing.
+    //
+    // Left empty on platforms the CLI does not support rather than guessed at:
+    // an empty field reads as "not collected", while a wrong one would be
+    // reasoned over by the diagnosis catalog.
+    e.os_version = if runtime_is_linux() {
+        run("uname", &["-v"], SHORT).1.trim().to_owned()
+    } else if runtime_is_windows() {
+        run("cmd", &["/C", "ver"], SHORT).1.trim().to_owned()
+    } else {
+        String::new()
+    };
     if runtime_is_linux() {
         e.os_family = "linux".to_owned();
         e.kernel_release = run("uname", &["-r"], SHORT).1.trim().to_owned();
@@ -425,13 +447,10 @@ fn probe_os(e: &mut Examination) {
         if let Some(param) = parse_iommu_param(&e.kernel_cmdline) {
             e.iommu_kernel_param = param;
         }
-        let proc_version = read_text("/proc/version").to_lowercase();
-        if proc_version.contains("microsoft")
-            || proc_version.contains("wsl")
-            || std::env::var_os("WSL_DISTRO_NAME").is_some()
-        {
-            e.is_wsl = true;
-        }
+        // One shared answer. This used to be its own predicate, and it differed
+        // from the install summary's — so `rocm examine` and `rocm examine
+        // --json` could disagree about the platform they were describing.
+        e.is_wsl = crate::is_wsl_host();
     } else if runtime_is_windows() {
         e.os_family = "windows".to_owned();
     } else {
@@ -545,7 +564,7 @@ fn classify_amd_marketing_name(name: &str) -> (String, bool) {
     (String::new(), APU_KEYWORDS.iter().any(|kw| n.contains(kw)))
 }
 
-/// Whether a gfx target belongs to an AMD APU family the doctor cares about.
+/// Whether a gfx target belongs to an AMD APU family.
 ///
 /// APUs: gfx1103 (Phoenix / Hawk Point) and the gfx115x parts (Strix Point /
 /// Strix Halo). Their neighbors gfx1100 / gfx1101 / gfx1102 (Navi 31 / 32 / 33)
@@ -553,7 +572,18 @@ fn classify_amd_marketing_name(name: &str) -> (String, bool) {
 /// match — otherwise they inflate `has_apu` and suppress `has_discrete_amd`,
 /// which gates the iGPU+dGPU collision fix. (Target -> product per LLVM
 /// AMDGPUUsage.)
-fn gfx_is_apu_family(gfx: &str) -> bool {
+///
+/// Two consumers rely on this, for different reasons:
+///
+/// - the doctor, to tell an integrated GPU from a discrete one when diagnosing
+///   iGPU+dGPU device-visibility collisions;
+/// - serve's VRAM reporting, because an APU has no private VRAM — see
+///   `vram_capacity_is_meaningful` in the `rocm` binary.
+///
+/// This answers a question about the *part*, not about the host: a machine can
+/// pair an APU with a discrete card, so a true verdict here does not mean every
+/// GPU on the host is integrated.
+pub fn gfx_is_apu_family(gfx: &str) -> bool {
     let g = gfx.to_lowercase();
     // gfx115x: every Strix part is an APU.
     if gfx_model_digit(&g, "gfx115").is_some() {
@@ -727,6 +757,45 @@ fn probe_gpus_rocminfo(e: &mut Examination) {
     }
 }
 
+/// Last-resort GPU discovery from sysfs, for hosts where neither `lspci` nor
+/// `rocminfo` is reachable.
+///
+/// Both preceding probes shell out, so on a machine with no `lspci` installed
+/// and ROCm's `bin` off PATH they enumerate nothing and `has_amd_gpu` comes back
+/// false — on a machine that plainly has a GPU. That is not hypothetical: it is
+/// what the MI300X runner reports, and it is why the e2e harness reads the human
+/// text form rather than this one (`capability.rs`). The human report never had
+/// the problem because it asks the kernel directly, via
+/// [`crate::detect_linux_sysfs_gfx_target`].
+///
+/// So ask the kernel here too, but only as a fallback: `lspci` carries PCI ids,
+/// vendor strings and the APU/discrete distinction that sysfs does not, and
+/// those are worth keeping whenever they are available.
+fn probe_gpus_sysfs_fallback(e: &mut Examination) {
+    if e.gpus.iter().any(|gpu| gpu.is_amd) {
+        return;
+    }
+    let Some(gfx_target) = crate::detect_linux_sysfs_gfx_target() else {
+        return;
+    };
+    // `is_apu` is left unset rather than guessed: sysfs gives the target, not
+    // the packaging, and `summarise_gpu_categories` reads `Some(true)` /
+    // `Some(false)` to populate has_apu / has_discrete_amd. Claiming either
+    // would be inventing a fact, so both stay false and only has_amd_gpu moves.
+    e.gpus.push(Gpu {
+        name: "AMD GPU (from kernel topology)".to_owned(),
+        gfx_target,
+        is_amd: true,
+        is_apu: None,
+        ..Gpu::default()
+    });
+    e.notes.push(
+        "GPU discovered from the kernel topology because neither lspci nor rocminfo was \
+         available; PCI id and marketing name are unknown."
+            .to_owned(),
+    );
+}
+
 fn summarise_gpu_categories(e: &mut Examination) {
     e.has_amd_gpu = e.gpus.iter().any(|g| g.is_amd);
     e.has_apu = e.gpus.iter().any(|g| g.is_amd && g.is_apu == Some(true));
@@ -891,31 +960,18 @@ fn probe_secure_boot(e: &mut Examination) {
 // ---------------------------------------------------------------------------
 
 fn probe_rocm_install(e: &mut Examination) {
-    let mut rocm_dir = String::new();
-    let rocm_path_env = std::env::var("ROCM_PATH").unwrap_or_default();
-    for candidate in ["/opt/rocm", rocm_path_env.as_str()] {
-        if !candidate.is_empty() && Path::new(candidate).is_dir() {
-            rocm_dir = candidate.to_owned();
-            break;
-        }
-    }
+    // Shared with the human `rocm examine` report and the fix-6 PATH runner so
+    // all three agree on which install is the active one. Handles versioned
+    // roots (`/opt/rocm-6.4.1`) as well as the conventional `/opt/rocm`.
+    let install = crate::discover_rocm_installs().into_iter().next();
+    let rocm_dir = install
+        .as_ref()
+        .map(|install| install.path.to_string_lossy().into_owned())
+        .unwrap_or_default();
     e.rocm_path = rocm_dir.clone();
-
-    if !rocm_dir.is_empty() {
-        for fname in ["version", "version-utils", "version-libs"] {
-            let f = Path::new(&rocm_dir).join(".info").join(fname);
-            if f.exists() {
-                e.rocm_version = read_text(&f.to_string_lossy()).trim().to_owned();
-                break;
-            }
-        }
-        if e.rocm_version.is_empty()
-            && let Ok(real) = std::fs::canonicalize(&rocm_dir)
-            && let Some(version) = extract_rocm_version(&real.to_string_lossy())
-        {
-            e.rocm_version = version;
-        }
-    }
+    e.rocm_version = install
+        .and_then(|install| install.version)
+        .unwrap_or_default();
 
     for marker in AMDGPU_INSTALL_MARKERS {
         if Path::new(marker).exists() {
@@ -963,7 +1019,7 @@ fn probe_rocm_install(e: &mut Examination) {
 }
 
 /// Pull `X.Y[.Z]` out of a `rocm-X.Y.Z` path component.
-fn extract_rocm_version(path: &str) -> Option<String> {
+pub(crate) fn extract_rocm_version(path: &str) -> Option<String> {
     let idx = path.find("rocm-")?;
     let tail = &path[idx + "rocm-".len()..];
     let version: String = tail
@@ -1304,30 +1360,34 @@ fn probe_gpus_windows(e: &mut Examination) {
 }
 
 fn probe_hip_sdk_windows(e: &mut Examination) {
+    // `$HIP_PATH` still wins: it names the SDK specifically, where the resolver
+    // answers the broader "which ROCm installs are on this machine".
     let mut root = std::env::var("HIP_PATH").unwrap_or_default();
     if root.is_empty() || !Path::new(&root).is_dir() {
-        // Scan the conventional install location for the newest ROCm dir.
-        let base = Path::new(r"C:\Program Files\AMD\ROCm");
-        if let Ok(entries) = std::fs::read_dir(base) {
-            let mut versions: Vec<String> = entries
-                .flatten()
-                .filter(|entry| entry.path().is_dir())
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .collect();
-            versions.sort();
-            if let Some(latest) = versions.last() {
-                root = base.join(latest).to_string_lossy().into_owned();
-            }
-        }
+        // Was a hand-rolled scan of one directory with `versions.sort()`, so
+        // `6.2` outranked `6.10` and any directory whose name looked plausible
+        // counted as an install. The shared resolver orders by numeric
+        // component, searches the same roots as everything else, honours
+        // `$ROCM_PATH`, and requires an install marker before believing a
+        // directory.
+        root = crate::discover_rocm_installs()
+            .into_iter()
+            .next()
+            .map(|install| install.path.to_string_lossy().into_owned())
+            .unwrap_or_default();
     }
     if root.is_empty() || !Path::new(&root).is_dir() {
         return;
     }
     e.hip_sdk_path = root.clone();
-    e.hip_sdk_version = Path::new(&root)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    // Prefer what the install says about itself; the directory name is only a
+    // fallback for a `$HIP_PATH` pointing somewhere unversioned.
+    e.hip_sdk_version = crate::rocm_install_version(Path::new(&root)).unwrap_or_else(|| {
+        Path::new(&root)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
 
     let hipinfo = Path::new(&root).join("bin").join("hipInfo.exe");
     if hipinfo.is_file() {
@@ -1514,6 +1574,79 @@ mod tests {
     }
 
     #[test]
+    fn asking_to_skip_the_frameworks_is_recorded_as_skipped() {
+        // Host-independent on purpose: every other variant depends on what is
+        // installed, so this is the one the CLI flag can be pinned against
+        // anywhere. "skipped" is a distinct answer from "unknown" -- the latter
+        // means the probe ran and found nothing.
+        let mut e = Examination::default();
+        probe_framework(&mut e, FrameworkProbe::Skip);
+        assert_eq!(e.framework, "skipped");
+    }
+
+    #[test]
+    fn a_skipped_framework_probe_runs_no_interpreter() {
+        // The reason to offer `skip` at all: the other variants start Python to
+        // read the framework's ROCm build. Nothing else on the Examination may
+        // move, or "skip" would be quietly doing work.
+        let mut e = Examination::default();
+        probe_framework(&mut e, FrameworkProbe::Skip);
+        assert!(e.framework_version.is_empty());
+        assert!(e.framework_rocm_version.is_empty());
+        assert!(e.framework_arch_list.is_empty());
+        assert!(e.framework_notes.is_empty());
+    }
+
+    #[test]
+    fn the_sysfs_fallback_leaves_a_real_pci_enumeration_alone() {
+        // lspci carries the PCI id, the marketing name and the APU/discrete
+        // distinction; the topology read carries none of those. So the fallback
+        // must only fill a gap, never overwrite a richer answer.
+        let mut e = Examination {
+            os_family: "linux".to_owned(),
+            gpus: vec![Gpu {
+                name: "Instinct MI300X".to_owned(),
+                gfx_target: "gfx942".to_owned(),
+                pci_id: "1002:74a1".to_owned(),
+                is_amd: true,
+                is_apu: Some(false),
+            }],
+            ..Examination::default()
+        };
+        probe_gpus_sysfs_fallback(&mut e);
+        assert_eq!(e.gpus.len(), 1, "the fallback must not add a second entry");
+        assert_eq!(e.gpus[0].pci_id, "1002:74a1");
+        assert!(
+            e.notes.is_empty(),
+            "a no-op fallback should not annotate the report"
+        );
+    }
+
+    #[test]
+    fn a_topology_sourced_gpu_counts_as_present_without_claiming_a_package() {
+        // What the fallback produces: enough to stop reporting "no AMD GPU",
+        // and no more. `is_apu: None` is deliberate -- the topology says which
+        // target, not whether it is integrated -- so the APU and discrete
+        // tallies must both stay false rather than guess.
+        let mut e = Examination {
+            os_family: "linux".to_owned(),
+            gpus: vec![Gpu {
+                name: "AMD GPU (from kernel topology)".to_owned(),
+                gfx_target: "gfx942".to_owned(),
+                is_amd: true,
+                is_apu: None,
+                ..Gpu::default()
+            }],
+            ..Examination::default()
+        };
+        summarise_gpu_categories(&mut e);
+        assert!(e.has_amd_gpu, "the machine has a GPU and must say so");
+        assert!(!e.has_apu);
+        assert!(!e.has_discrete_amd);
+        assert_eq!(e.compute_status(), "ok");
+    }
+
+    #[test]
     fn status_reflects_scope_precedence() {
         let mut e = Examination {
             os_family: "linux".to_owned(),
@@ -1600,6 +1733,7 @@ mod tests {
         assert!(gfx_is_apu_family("gfx1150"));
         assert!(gfx_is_apu_family("gfx1151"));
         assert!(gfx_is_apu_family("gfx1152"));
+        assert!(gfx_is_apu_family("gfx1153"));
         // Unrelated families are never APUs.
         assert!(!gfx_is_apu_family("gfx1200"));
         assert!(!gfx_is_apu_family("gfx942"));
@@ -1679,5 +1813,37 @@ mod tests {
             Some("6.4.1".to_owned())
         );
         assert_eq!(extract_rocm_version("/opt/rocm"), None);
+    }
+
+    #[test]
+    fn os_version_carries_a_version_not_the_os_name() {
+        // This field used to hold `std::env::consts::OS`, so it repeated
+        // `os_family` and told a reader of the report nothing.
+        let mut e = Examination::default();
+        probe_os(&mut e);
+
+        // Holds on every platform: a real version on the supported ones, and
+        // empty on the rest -- neither of which is the OS name.
+        assert_ne!(
+            e.os_version,
+            std::env::consts::OS,
+            "os_version must not merely repeat the OS name"
+        );
+
+        if runtime_is_linux() || runtime_is_windows() {
+            assert!(
+                !e.os_version.is_empty(),
+                "a supported host must report an OS version"
+            );
+            assert_ne!(e.os_version, e.os_family);
+        } else {
+            // Blank by choice on a host the CLI does not support, rather than
+            // a guess the diagnosis catalog would then reason over.
+            assert!(
+                e.os_version.is_empty(),
+                "unsupported hosts report no version, got {:?}",
+                e.os_version
+            );
+        }
     }
 }

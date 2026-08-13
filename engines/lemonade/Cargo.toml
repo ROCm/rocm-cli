@@ -17,8 +17,18 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+flate2 = "1"
 rocm-core = { path = "../../crates/rocm-core" }
+rocm-deps = { path = "../../crates/rocm-deps" }
 rocm-engine-protocol = { path = "../../crates/rocm-engine-protocol" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+tar = "0.4"
+tempfile = "3"
 ureq = { version = "2.12", features = ["json", "native-certs"] }
+# Same major and backend as `xtask`, so the workspace carries one `zip` and one
+# deflate implementation. Only `deflate` is needed: the embeddable zip stores
+# entries with deflate or no compression, and the narrow feature set keeps the
+# extractor's dependency surface small.
+zip = { version = "2.2", default-features = false, features = ["deflate"] }

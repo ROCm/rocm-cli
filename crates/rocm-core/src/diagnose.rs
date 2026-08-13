@@ -1360,7 +1360,18 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
         } else {
             "WEAK"
         };
-        let _ = writeln!(out, "#{} [{tier} score={}/100] {}", i + 1, d.score, d.title);
+        // The ordinal is a ranking position, not a handle -- naming the fix-id on
+        // the same line stops it reading like something `rocm fix` would accept.
+        // Users were typing `rocm fix #1` because the two were shown apart, with
+        // only the ordinal looking like an identifier.
+        let _ = writeln!(
+            out,
+            "#{} ({}) [{tier} score={}/100] {}",
+            i + 1,
+            d.id,
+            d.score,
+            d.title
+        );
         let _ = writeln!(out, "   id: {}", d.id);
         for ev in &d.evidence {
             let _ = writeln!(out, "   - {ev}");
@@ -1393,12 +1404,42 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
                 let _ = writeln!(out, "   verify after fix: {}", fix.verify);
             }
         }
+        // Every finding carries the command that acts on it. Previously only the
+        // summary at the end named one, and only when some match cleared
+        // HIGH_CONFIDENCE -- so a report of low-confidence matches showed ids but
+        // never said what to run, which is what sent users guessing at the
+        // ordinal.
+        let _ = writeln!(out, "   apply with: rocm fix {}", d.id);
         out.push('\n');
     }
+
+    // A truncated list must say so: otherwise the matches shown read as
+    // everything the CLI found.
+    let shown = report.matched.len().min(top);
+    if report.matched.len() > shown {
+        let _ = writeln!(
+            out,
+            "Showing {shown} of {} matches; pass `--top {}` to see the rest.\n",
+            report.matched.len(),
+            report.matched.len()
+        );
+    }
+
     if let Some(high) = report.matched.iter().find(|d| d.score >= HIGH_CONFIDENCE) {
         let _ = writeln!(out, "Next step: run `rocm fix {}`.", high.id);
-    } else {
-        out.push_str("Highest-scoring match is below the HIGH_CONFIDENCE threshold. Confirm one more piece of evidence before applying.\n");
+    } else if let Some(best) = report.matched.first() {
+        // Below the threshold the caution still stands, but it is advice about
+        // confidence -- not a reason to withhold the command. Ending here was the
+        // bug: the user was told to confirm more evidence and given nothing to
+        // run once they had.
+        out.push_str(
+            "Highest-scoring match is below the HIGH_CONFIDENCE threshold. Confirm one more piece of evidence before applying.\n",
+        );
+        let _ = writeln!(
+            out,
+            "When you are ready, run `rocm fix {}` (the highest-scoring match), or use the `apply with:` line of whichever cause fits.",
+            best.id
+        );
     }
     out
 }
@@ -1425,6 +1466,85 @@ mod tests {
         assert_eq!(top.id, "fix-4-render-group");
         assert_eq!(top.score, 45); // 35 render + 10 video
         assert!(top.fix.as_ref().unwrap().auto_applicable);
+    }
+
+    #[test]
+    fn a_low_confidence_report_still_names_a_command_to_run() {
+        // The reported case: every match below HIGH_CONFIDENCE. The report used
+        // to end at "confirm one more piece of evidence" and never say what to
+        // run, so users guessed at the `#1` ordinal.
+        let mut e = linux_base();
+        e.in_render_group = Some(false);
+        e.in_video_group = Some(false);
+        let report = diagnose(&e, "");
+        assert!(
+            report.matched.iter().all(|d| d.score < HIGH_CONFIDENCE),
+            "fixture must stay below the threshold for this test to mean anything"
+        );
+
+        let out = render_report_text(&report, 5);
+        assert!(
+            out.contains("below the HIGH_CONFIDENCE threshold"),
+            "the confidence caution must survive:\n{out}"
+        );
+        assert!(
+            out.contains("rocm fix fix-4-render-group"),
+            "a below-threshold report must still name a runnable command:\n{out}"
+        );
+    }
+
+    #[test]
+    fn every_reported_cause_carries_its_own_apply_command() {
+        let mut e = linux_base();
+        e.in_render_group = Some(false);
+        e.in_video_group = Some(false);
+        let report = diagnose(&e, "");
+        let out = render_report_text(&report, 5);
+
+        let applies = out.matches("apply with: rocm fix ").count();
+        let shown = report.matched.len().min(5);
+        assert_eq!(
+            applies, shown,
+            "each of the {shown} shown causes needs its own command:\n{out}"
+        );
+        for d in report.matched.iter().take(shown) {
+            assert!(
+                out.contains(&format!("apply with: rocm fix {}", d.id)),
+                "no command for {}:\n{out}",
+                d.id
+            );
+        }
+    }
+
+    #[test]
+    fn the_ranking_position_is_shown_with_the_id_it_stands_for() {
+        // `#1` alone looked like a handle `rocm fix` would take. Pairing it with
+        // the id on the same line is what stops that read.
+        let mut e = linux_base();
+        e.in_render_group = Some(false);
+        let report = diagnose(&e, "");
+        let out = render_report_text(&report, 5);
+        let top = &report.matched[0];
+        assert!(
+            out.contains(&format!("#1 ({})", top.id)),
+            "the ordinal must name the id it refers to:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_truncated_report_says_it_was_truncated() {
+        let mut e = linux_base();
+        e.in_render_group = Some(false);
+        e.in_video_group = Some(false);
+        let report = diagnose(&e, "");
+        if report.matched.len() < 2 {
+            return; // nothing to truncate on this fixture
+        }
+        let out = render_report_text(&report, 1);
+        assert!(
+            out.contains("Showing 1 of"),
+            "a truncated list must not read as the complete set:\n{out}"
+        );
     }
 
     #[test]
@@ -1471,6 +1591,55 @@ mod tests {
         assert_eq!(top.id, "fix-1-arch");
         // 50 (keyword) + 55 (missing arch), clamped to 100.
         assert_eq!(top.score, 100);
+    }
+
+    #[test]
+    fn path_missing_names_the_versioned_rocm_root() {
+        // A box whose only ROCm is a versioned root used to report an empty
+        // rocm_path, so both structural signals here scored zero and the fix
+        // could only fire on symptom keywords -- and then named /opt/rocm/bin,
+        // which does not exist on that machine.
+        //
+        // Drive the real resolver rather than hand-setting rocm_path, so this
+        // fails if versioned discovery regresses and not just if the check does.
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-diagnose-versioned-{}-{}",
+            std::process::id(),
+            crate::unix_time_millis()
+        ));
+        let opt = root.join("opt");
+        let install = opt.join("rocm-6.4.1");
+        std::fs::create_dir_all(install.join("bin")).expect("plant a fake versioned install");
+        std::fs::write(install.join("bin").join("rocminfo"), "").expect("plant the install marker");
+
+        let discovered = crate::discover_rocm_installs_in(std::slice::from_ref(&opt), None);
+        let found = discovered
+            .first()
+            .expect("the resolver must find a versioned-only install");
+
+        let mut e = linux_base();
+        e.rocm_path = found.path.to_string_lossy().into_owned();
+        e.rocminfo_present = false;
+        e.env.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+
+        let report = diagnose(&e, "");
+        let top = &report.matched[0];
+
+        assert_eq!(top.id, "fix-6-path");
+        assert_eq!(top.score, 70, "50 (rocminfo absent) + 20 (bin not on PATH)");
+        let fix = top.fix.as_ref().expect("fix-6 carries a fix");
+        assert!(
+            fix.summary.contains("rocm-6.4.1/bin"),
+            "guidance must name the versioned root the resolver found: {}",
+            fix.summary
+        );
+        assert!(
+            !fix.summary.contains("/opt/rocm/bin"),
+            "guidance must not name the conventional root that is absent here: {}",
+            fix.summary
+        );
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

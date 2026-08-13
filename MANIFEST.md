@@ -672,6 +672,15 @@ official uv GitHub releases at `https://github.com/astral-sh/uv/releases/`.
 The binary is cached in the rocm-cli managed data directory and reused for
 subsequent operations. The version may be pinned via `ROCM_CLI_UV_VERSION`.
 
+`uv`'s own content-addressed package cache is also kept in the managed data
+directory (at `<data-dir>/uv-cache`), so that it shares a filesystem with the
+environments `uv` populates and packages can be hardlinked into them instead of
+copied. This cache holds every wheel `uv` downloads — the ROCm SDK and the
+torch stack included — so it is typically the largest directory rocm-cli
+manages, on the order of several GB per SDK version installed. It is removed by
+`rocm uninstall` unless `--keep-data` is passed, and its location can be
+overridden with `ROCM_CLI_UV_CACHE_DIR`.
+
 ### Lemonade Embeddable Runtime
 
 When `rocm engines install lemonade` is run, the CLI downloads a prebuilt

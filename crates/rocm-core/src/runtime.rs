@@ -226,6 +226,12 @@ pub fn managed_pip_cache_dir(root: &Path) -> PathBuf {
     normalize_runtime_path_for_host(root).join("pip-cache")
 }
 
+/// `uv`'s content-addressed cache, kept under the managed root so it shares a filesystem
+/// with the environments `uv` populates and hardlinking keeps working (see issue #160).
+pub fn managed_uv_cache_dir(root: &Path) -> PathBuf {
+    normalize_runtime_path_for_host(root).join("uv-cache")
+}
+
 pub fn managed_logs_dir(root: &Path) -> PathBuf {
     normalize_runtime_path_for_host(root).join("logs")
 }
@@ -360,6 +366,30 @@ pub fn runtime_path_is_same_or_inside(path: &Path, base: &Path) -> bool {
     path.ancestors()
         .skip(1)
         .any(|ancestor| runtime_paths_equivalent(ancestor, &base))
+}
+
+const MANAGED_RUNTIME_FORMATS: [&str; 2] = ["wheel", "tarball"];
+
+/// Strip trailing managed runtime leaves to recover the canonical data root.
+pub fn managed_runtime_data_root(root: &Path) -> PathBuf {
+    let mut root = normalize_runtime_path_for_host(root);
+    while let Some(parent) = strip_managed_runtime_leaf(&root) {
+        root = parent;
+    }
+    root
+}
+
+fn strip_managed_runtime_leaf(path: &Path) -> Option<PathBuf> {
+    let format_dir = path.parent()?;
+    let format = format_dir.file_name()?.to_str()?;
+    if !MANAGED_RUNTIME_FORMATS.contains(&format) {
+        return None;
+    }
+    let runtimes_dir = format_dir.parent()?;
+    if runtimes_dir.file_name()? != std::ffi::OsStr::new("runtimes") {
+        return None;
+    }
+    runtimes_dir.parent().map(Path::to_path_buf)
 }
 
 pub fn runtime_install_root_is_protected(path: &Path) -> bool {
@@ -763,6 +793,29 @@ mod tests {
             r"\\server\share\rocm",
             RuntimePlatform::Windows
         ));
+    }
+
+    #[test]
+    fn managed_runtime_data_root_strips_runtime_leaf_nesting() {
+        let data_root = PathBuf::from("/tmp/rocm-cli");
+        let release_root = data_root
+            .join("runtimes")
+            .join("wheel")
+            .join("release-wheel-gfx942-7-0");
+        let nested_root = release_root
+            .join("runtimes")
+            .join("wheel")
+            .join("nightly-wheel-gfx942-7-1");
+
+        assert_eq!(managed_runtime_data_root(&release_root), data_root);
+        assert_eq!(managed_runtime_data_root(&nested_root), data_root);
+    }
+
+    #[test]
+    fn managed_runtime_data_root_preserves_custom_prefix() {
+        let custom_prefix = PathBuf::from("/tmp/therock_venvs");
+
+        assert_eq!(managed_runtime_data_root(&custom_prefix), custom_prefix);
     }
 
     #[test]

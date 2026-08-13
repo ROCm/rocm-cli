@@ -8,7 +8,51 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Wait out the window in which a compromised release is typically found and
+    # yanked before adopting it. Bumping a pinned SHA is the one moment the pin
+    # stops protecting us: the bump PR itself runs the new action's code on CI —
+    # including the self-hosted GPU lanes, which every Dependabot PR reaches
+    # because each path filter in ci.yml folds in `.github/workflows/**` — before
+    # a human has read the diff. Those runners keep state across jobs, so the
+    # blast radius outlives the run. GitHub already applies 3 days by default;
+    # published Actions compromises have gone unnoticed for longer than that, so
+    # widen it. Cooldown delays only version updates, never security updates.
+    cooldown:
+      default-days: 7
     groups:
       github-actions:
         patterns:
           - "*"
+
+  # Cargo dependencies were previously untracked, so the workspace could drift
+  # onto crate versions carrying published advisories with nothing to surface
+  # them. `directory: /` is the workspace root: Dependabot resolves the whole
+  # member graph from the root manifest and `Cargo.lock`, so one entry covers
+  # every crate. Minor and patch bumps are grouped into a single weekly PR --
+  # they are almost always drop-in for a workspace this wide, and one PR per
+  # crate would bury real review signal. Major bumps stay ungrouped so each
+  # breaking change is reviewed, and eventually merged, on its own.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # Let a bad release be found and yanked before we adopt it. A crate bump is
+    # not inert data waiting for review: `cargo build` runs the new version's
+    # `build.rs` and expands its proc macros on the CI runner, so the bump PR
+    # executes third-party code the moment it opens — before a human reads the
+    # lockfile diff. A week is long enough for the common case of a malicious or
+    # backdoored release being yanked from crates.io to play out off our
+    # runners. Cooldown delays only version updates, never security updates.
+    cooldown:
+      default-days: 7
+    # Above the default of 5 so a backlog of separate major bumps cannot starve
+    # the grouped minor/patch PR, but still bounded so the queue stays readable.
+    open-pull-requests-limit: 10
+    groups:
+      cargo-minor-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
