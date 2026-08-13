@@ -160,7 +160,11 @@ Feature: Model serving
   # correctly (measured on the no-GPU lane), and so is a real vLLM serve
   # (measured on MI300X, run 188). So this carries no expected-failure row — it
   # holds the contract the pod violated, and goes red if CI ever meets it.
-  @id:services-stop-reports-what-it-stopped @requires-gpu
+  # @merge-queue: this serves a real model, and the Strix Halo lanes already run
+  # at 32 of their 35 allotted minutes on main alone. Three new real serves would
+  # put them over, so they follow scenarios 6/6b/8 onto the merge-queue path,
+  # where the budget for heavy serves lives.
+  @id:services-stop-reports-what-it-stopped @requires-gpu @merge-queue
   Scenario: 16 - Stopping a running server reports that it stopped it
     Given a managed runtime is active
     And a model is being served on GPU
@@ -184,7 +188,8 @@ Feature: Model serving
   # carrying on leaves the user unable to tell which GPU their model will run on,
   # or whether it will run on one at all. Both Linux lanes name the device, so
   # this scenario also guards them.
-  @id:serve-auto-gpu-selection-names-a-device @requires-gpu
+  # @merge-queue for the serve-cost reason on scenario 16.
+  @id:serve-auto-gpu-selection-names-a-device @requires-gpu @merge-queue
   Scenario: 18 - Letting the CLI choose the GPU names the device it chose
     Given a managed runtime is active
     And a machine with an AMD GPU
@@ -195,7 +200,8 @@ Feature: Model serving
   # address is already taken is handed that same address anyway, so it collides
   # with the server already there. Either outcome is fine — pick a free address,
   # or say the usual one is busy — but silently reusing it is not.
-  @id:serve-second-server-gets-a-free-port @requires-gpu
+  # @merge-queue for the serve-cost reason on scenario 16.
+  @id:serve-second-server-gets-a-free-port @requires-gpu @merge-queue
   Scenario: 19 - A second server does not take an address already in use
     Given a managed runtime is active
     And the address a new server would use is already taken
