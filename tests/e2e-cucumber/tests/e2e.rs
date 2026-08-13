@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 use cucumber::{World as _, WriterExt as _};
+use e2e_cucumber::cli_failure_report;
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use tempfile::TempDir;
 
@@ -489,6 +490,21 @@ pub fn run_rocm(world: &E2eWorld, args: &[&str]) -> (String, String, i32) {
         String::from_utf8_lossy(&output.stderr).to_string(),
         rc,
     )
+}
+
+/// Run `rocm`, returning stdout, and panic with the full diagnostic bundle
+/// ([`cli_failure_report`]) if it exits non-zero.
+///
+/// Use this instead of asserting on [`run_rocm`]'s `rc` by hand — that idiom is
+/// what left a failed step undiagnosable in EAI-8031.
+pub fn run_rocm_ok(world: &E2eWorld, args: &[&str]) -> String {
+    let (stdout, stderr, rc) = run_rocm(world, args);
+    assert!(
+        rc == 0,
+        "{}",
+        cli_failure_report(args, rc, &stdout, &stderr)
+    );
+    stdout
 }
 
 /// Like [`run_rocm`], but with extra environment variables set on the child.
