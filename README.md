@@ -253,6 +253,32 @@ rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
 runtime. It does not work with standard ROCm package installs (e.g.
 `/opt/rocm`); use `rocm install sdk` instead.
 
+### Disk space
+
+Each ROCm install keeps its own multi-gigabyte folder, so installing or
+updating a few times adds up. `rocm storage` shows where the space went and
+frees the parts that are safe to remove:
+
+```
+rocm storage [report] [--json]
+rocm storage remove-old-installs [--keep N] [--dry-run] [--yes]
+rocm storage remove-downloads [--dry-run] [--yes]
+```
+
+`remove-old-installs` keeps the two most recent installs for each channel,
+format, and GPU family, and never touches the install in use, the rollback
+target, or a folder rocm-cli did not create. "Most recent" means most recently
+installed rather than highest version, so after a deliberate downgrade the
+older version counts as the newer install. Because the count applies per
+channel, format, and GPU family, a machine that has tried several channels
+keeps `--keep` installs for each of them. Anything it declines to remove is
+listed with the reason, and `--dry-run` shows the whole plan without changing
+anything. `remove-downloads` clears cached archives that rocm-cli can download
+again; a cache folder that is a link to somewhere else is left alone rather
+than followed. The report also lists the
+`uv` package cache and downloaded models; those are shared with other tools
+and are never removed by rocm-cli.
+
 ### Inference engines
 
 ```
