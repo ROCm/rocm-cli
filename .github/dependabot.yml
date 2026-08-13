@@ -48,6 +48,24 @@ updates:
     # Above the default of 5 so a backlog of separate major bumps cannot starve
     # the grouped minor/patch PR, but still bounded so the queue stays readable.
     open-pull-requests-limit: 10
+    ignore:
+      # sha2 0.11 is built on `digest` 0.11, and `rsa` 0.9 -- the newest stable
+      # release; 0.10 is still a release candidate -- is built on `digest` 0.10.
+      # The two generic trait sets are not interchangeable, so under sha2 0.11
+      # `SigningKey::<Sha256>` and `VerifyingKey::<Sha256>` in rocm-core stop
+      # satisfying rsa's bounds and the release-signing path fails to compile.
+      # Nothing on our side fixes that, and putting signing on a release
+      # candidate is not a trade worth making, so the major is held rather than
+      # reopened every week. Revisit when rsa 0.10 ships stable: bump both
+      # together and drop this entry.
+      #
+      # Scoped to the major on purpose. An unscoped `ignore` would also suppress
+      # security updates for the dependency; restricting it to a
+      # `version-update:` type does not, because those types never match a
+      # security-driven update. Minor and patch bumps keep flowing too.
+      - dependency-name: sha2
+        update-types:
+          - version-update:semver-major
     groups:
       cargo-minor-patch:
         applies-to: version-updates
