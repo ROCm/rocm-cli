@@ -229,6 +229,27 @@ when = {}
 bug = "EAI-8009"
 reason = "The local chat provider only accepts the built-in assistant model, so a ready local server running any other model is not used."
 
+# --- EAI-7423, not EAI-8007. This scenario's premise is a REAL serve on whatever
+# engine the host defaults to, so on a lemonade LINUX host it inherits the same
+# managed-serve bug as its siblings above: the serve reaches ready and is shut
+# down ~0.08s later, so the endpoint never becomes reachable and the precondition
+# — not the contract under test — is what fails. Measured on Strix Halo Ubuntu:
+# passed in run 196, failed in run 210 with "endpoint did not serve model
+# Qwen3-0.6B after 2 attempt(s) of 300s", which is that signature exactly.
+#
+# Scoped and flagged identically to the other EAI-7423 rows: os=linux because
+# native Windows lemonade serve works (it passes on Strix Windows), gfx* because
+# a real GPU host is needed at all, and `flaky = true` because which of these
+# pass varies run to run — a deterministic-XPASS row would fail that lane on
+# unrelated PRs. Delete this row with the other EAI-7423 ones, not with EAI-8007.
+[["services-stop-reports-what-it-stopped"]]
+when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*" }
+bug = "EAI-7423"
+reason = "Lemonade managed serve reaches ready then shuts down immediately, so the service this scenario needs to stop never comes up."
+serve_timeout_secs = 90
+flaky = true
+
+# For the contract this scenario actually exists to hold:
 # EAI-8007 has NO row on purpose. `services stop` reported stopping 0 processes
 # for a service it did in fact stop on the pod, but neither fixture reproduces it
 # here: a plain child process registered as a managed service is counted
