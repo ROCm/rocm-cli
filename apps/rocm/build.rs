@@ -9,12 +9,17 @@
 //! build back to its branch), plus the commit hash either way.
 
 use std::env;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    // Rebuild when HEAD moves (checkout/commit), not on every build.
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    // Watch both HEAD and its resolved ref because HEAD itself does not change
+    // when a commit advances the current branch. Resolve the per-worktree and
+    // common Git directories instead of assuming `.git` is a directory.
+    for path in git_watch_paths(Path::new(".")) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
     println!("cargo:rerun-if-env-changed=GITHUB_REF_TYPE");
     println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
     println!("cargo:rerun-if-env-changed=GITHUB_HEAD_REF");
@@ -35,10 +40,10 @@ fn main() {
 fn ref_descriptor() -> String {
     let env_var = |name| env::var(name).ok().filter(|value| !value.is_empty());
 
-    if env_var("GITHUB_REF_TYPE").as_deref() == Some("tag") {
-        if let Some(tag) = env_var("GITHUB_REF_NAME") {
-            return tag;
-        }
+    if env_var("GITHUB_REF_TYPE").as_deref() == Some("tag")
+        && let Some(tag) = env_var("GITHUB_REF_NAME")
+    {
+        return tag;
     }
     if let Some(branch) = env_var("GITHUB_HEAD_REF").or_else(|| env_var("GITHUB_REF_NAME")) {
         return branch;
@@ -53,8 +58,44 @@ fn ref_descriptor() -> String {
     }
 }
 
+fn git_watch_paths(cwd: &Path) -> Vec<PathBuf> {
+    let Some(git_dir) = run_git_at(cwd, &["rev-parse", "--absolute-git-dir"]).map(PathBuf::from)
+    else {
+        return Vec::new();
+    };
+    let common_dir = run_git_at(cwd, &["rev-parse", "--git-common-dir"])
+        .map(PathBuf::from)
+        .map_or_else(
+            || git_dir.clone(),
+            |path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    cwd.join(path)
+                }
+            },
+        );
+
+    let mut paths = vec![git_dir.join("HEAD")];
+    if let Some(reference) = run_git_at(cwd, &["symbolic-ref", "-q", "HEAD"]) {
+        paths.push(common_dir.join(reference));
+    }
+    paths.push(common_dir.join("packed-refs"));
+    paths
+}
+
 fn run_git(args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
+    run_git_at(Path::new("."), args)
+}
+
+fn run_git_at(cwd: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -64,5 +105,50 @@ fn run_git(args: &[&str]) -> Option<String> {
         None
     } else {
         Some(value.to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::git_watch_paths;
+    use std::fs;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn git_watch_paths_include_head_branch_and_packed_refs() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before Unix epoch")
+            .as_nanos();
+        let repo = std::env::temp_dir().join(format!("rocm-build-metadata-{nonce}"));
+        fs::create_dir_all(&repo).expect("create temporary repository directory");
+        let status = Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .arg("init")
+            .arg(&repo)
+            .status()
+            .expect("run git init");
+        assert!(status.success(), "git init failed");
+        let status = Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .current_dir(&repo)
+            .args(["symbolic-ref", "HEAD", "refs/heads/main"])
+            .status()
+            .expect("set initial branch");
+        assert!(status.success(), "setting initial branch failed");
+
+        let paths = git_watch_paths(&repo);
+        fs::remove_dir_all(&repo).expect("remove temporary repository");
+        assert_eq!(
+            paths,
+            vec![
+                repo.join(".git/HEAD"),
+                repo.join(".git/refs/heads/main"),
+                repo.join(".git/packed-refs"),
+            ]
+        );
     }
 }
