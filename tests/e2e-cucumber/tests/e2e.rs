@@ -63,6 +63,10 @@ pub struct E2eWorld {
     /// a run whose failure is already the expected outcome — see the relaunch
     /// budget in `setup_gpu_model`.
     pub expect_xfail: bool,
+    /// Extra environment for this scenario's next `rocm` invocation. A Given step
+    /// records a behavioral precondition here; the When step remains a plain user
+    /// action and consumes the fixture without exposing its mechanism in Gherkin.
+    pub command_env: Vec<(&'static str, std::ffi::OsString)>,
     /// The interactive dash/chat TUI spawned under a pseudo-terminal for this
     /// scenario, if any (see `e2e::tui_driver`). Torn down in `Drop` before the
     /// mock server and isolated directory so the child process never outlives
@@ -177,6 +181,7 @@ impl Default for E2eWorld {
             legacy_rocm_path: None,
             serve_timeout_override: None,
             expect_xfail: false,
+            command_env: Vec::new(),
             tui: None,
             chat_use_mock: false,
             lifecycle: None,
@@ -507,6 +512,29 @@ pub fn run_rocm_with_env(
     cmd.args(args);
     world.isolate_cmd(&mut cmd);
     for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    let rc = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    record_command(world.current_scenario.as_deref(), args, rc, &stdout);
+    (
+        stdout,
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        rc,
+    )
+}
+
+/// Run `rocm` with the behavioral fixture established by a Given step, then
+/// consume it so it cannot leak into a later action in the same scenario.
+pub fn run_rocm_with_scenario_env(world: &mut E2eWorld, args: &[&str]) -> (String, String, i32) {
+    let binary = rocm_binary();
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(args);
+    world.isolate_cmd(&mut cmd);
+    for (key, value) in std::mem::take(&mut world.command_env) {
         cmd.env(key, value);
     }
     let output = cmd

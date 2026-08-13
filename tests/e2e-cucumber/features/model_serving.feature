@@ -154,3 +154,15 @@ Feature: Model serving
     When the user serves a model pinned to a GPU index that does not exist
     Then serving is refused before any engine starts
     And the user is told that GPU index is unavailable
+
+  # The failure is injected at Lemonade's backend-install boundary in debug/test
+  # builds, after the CLI has selected Lemonade but before any runtime download or
+  # machine mutation. That makes the user-visible retry and final recovery command
+  # deterministic on the blocking no-GPU lane rather than relying on a real 3 GiB
+  # transfer to fail at just the right moment.
+  @id:serve-lemonade-preparation-recovery @requires-no-gpu
+  Scenario: 15 - Repeated Lemonade preparation failure gives the user a recovery path
+    Given Lemonade preparation cannot complete
+    When the user serves a model with Lemonade
+    Then serving stops after one automatic retry
+    And the user is told how to reinstall Lemonade and retry serving

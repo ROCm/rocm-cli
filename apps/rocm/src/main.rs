@@ -4630,8 +4630,13 @@ fn serve(args: ServeArgs) -> Result<()> {
     // BEFORE preparing or launching any engine (no wasted engine download, and an
     // actionable message instead of a late engine crash). The engine enforces the
     // same rule as a backstop. Skipped for cpu_only; permissive when availability
-    // cannot be probed on this platform (probe returns `None`).
+    // cannot be probed on this platform (probe returns `None`). The E2E-only
+    // backend-failure scenario bypasses this host precondition so the black-box
+    // test reaches Lemonade's backend boundary without real GPU hardware.
+    let scripted_backend_failure = cfg!(feature = "e2e-test-hooks")
+        && std::env::var_os("ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE").is_some();
     if !cpu_only
+        && !scripted_backend_failure
         && let Some(usable) = rocm_core::usable_amd_gpu_indices()
         && usable.is_empty()
     {

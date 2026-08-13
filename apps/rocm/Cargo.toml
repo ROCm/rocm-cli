@@ -10,6 +10,9 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+e2e-test-hooks = ["rocm-engine-lemonade/e2e-test-hooks"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
