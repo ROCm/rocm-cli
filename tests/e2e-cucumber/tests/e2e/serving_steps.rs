@@ -744,9 +744,28 @@ async fn user_serves_absent_gpu_index(world: &mut E2eWorld) {
 
 /// The device policies `serve --help` advertises, read out of the help rather
 /// than listed here so the check follows whatever the command currently offers.
+///
+/// Scoped to `--device`'s own block. `serve --help` advertises possible values
+/// for more than one option — `--engine` renders its list first, from clap's
+/// `value_parser` — so taking the first `[possible values:` in the help returns
+/// the engines and this scenario would then serve `--device lemonade`, meeting an
+/// unrelated rejection that happens to read like the one under test.
 fn advertised_device_policies(help: &str) -> Vec<String> {
-    help.lines()
-        .find_map(|line| {
+    let lines: Vec<&str> = help.lines().collect();
+    let device = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("--device"));
+    let Some(device) = device else {
+        return Vec::new();
+    };
+    lines
+        .iter()
+        .skip(device)
+        .enumerate()
+        // Stop at the next option, so a `--device` with no advertised values
+        // cannot borrow the following option's list.
+        .take_while(|(offset, line)| *offset == 0 || !line.trim_start().starts_with("--"))
+        .find_map(|(_, line)| {
             let (_, rest) = line.split_once("[possible values:")?;
             let (values, _) = rest.split_once(']')?;
             Some(

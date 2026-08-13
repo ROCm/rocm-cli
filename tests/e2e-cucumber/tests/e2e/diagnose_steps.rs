@@ -394,6 +394,9 @@ const DEVICE_PERMISSION_SYMPTOM: &str = "unable to open /dev/kfd";
 /// The device whose owning group the remedy is about.
 const GPU_DEVICE: &str = "/dev/kfd";
 
+/// The field the machine-readable inspection describes [`GPU_DEVICE`] under.
+const GPU_DEVICE_FIELD: &str = "kfd";
+
 /// The group the fix recipe is hard-coded to add the user to.
 const DEFAULT_DEVICE_GROUP: &str = "render";
 
@@ -581,31 +584,24 @@ async fn given_usable_device(world: &mut E2eWorld) {
         crate::run_rocm_with_env(world, &["examine", "--json"], &[("PATH", path.as_str())]);
     let json: serde_json::Value = serde_json::from_str(&report)
         .unwrap_or_else(|e| panic!("`examine --json` did not emit valid JSON ({e}):\n{report}"));
+    // Read the GPU device the scenario shimmed, by name. The report describes
+    // several devices — the single `kfd` and each entry of `render_devices` —
+    // and they all carry these same field names, so a search for the first one
+    // anywhere in the document would be answered by whichever device happened to
+    // come first rather than by the one under test.
+    let device = json.get(GPU_DEVICE_FIELD).unwrap_or_else(|| {
+        panic!("`examine --json` describes no `{GPU_DEVICE_FIELD}` device:\n{report}")
+    });
     for field in ["user_can_read", "user_can_write"] {
-        let stated = find_bool(&json, field);
+        let stated = device.get(field).and_then(serde_json::Value::as_bool);
         assert_eq!(
             stated,
             Some(true),
-            "the inspection does not report the device as {field}, so the premise this scenario \
+            "the inspection does not report {GPU_DEVICE} as {field}, so the premise this scenario \
              needs is absent:\n{report}"
         );
     }
     world.path_override = Some(path);
-}
-
-/// The first value of `field` anywhere in the document. The inspection nests the
-/// device it describes, and where exactly is its own business.
-fn find_bool(value: &serde_json::Value, field: &str) -> Option<bool> {
-    match value {
-        serde_json::Value::Object(map) => {
-            if let Some(found) = map.get(field).and_then(serde_json::Value::as_bool) {
-                return Some(found);
-            }
-            map.values().find_map(|child| find_bool(child, field))
-        }
-        serde_json::Value::Array(items) => items.iter().find_map(|item| find_bool(item, field)),
-        _ => None,
-    }
 }
 
 #[when("the user asks the CLI to diagnose a device-permission failure")]
