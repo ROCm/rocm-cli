@@ -380,7 +380,7 @@ const fn current_os() -> &'static str {
     }
 }
 
-/// Whether `value` is a `rocm diagnose` ranking position (`#2`, or a bare `2`)
+/// Whether `value` is a `rocm doctor` ranking position (`#2`, or a bare `2`)
 /// rather than a fix-id.
 ///
 /// Used only to turn an unknown-id refusal into a corrective one; it never
@@ -457,18 +457,16 @@ pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
     let Some(recipe) = find_recipe(fix_id) else {
         eprintln!("Unknown fix-id: {fix_id}");
         if looks_like_a_diagnosis_position(fix_id) {
-            // `rocm diagnose` ranks findings `#1`, `#2`, and users reach for that
+            // `rocm doctor` ranks findings `#1`, `#2`, and users reach for that
             // number here. It is a position in one report, not a name -- and it
             // does not line up with the catalog's `fix-1 … fix-15` either, so a
             // bare "unknown id" left them with nothing to correct.
+            eprintln!("`{fix_id}` looks like a position in a `rocm doctor` report, not a fix-id.");
             eprintln!(
-                "`{fix_id}` looks like a position in a `rocm diagnose` report, not a fix-id."
-            );
-            eprintln!(
-                "Use the `id:` shown against that cause — `rocm diagnose` prints an `apply with:` line you can copy."
+                "Use the `id:` shown against that cause — `rocm doctor` prints an `apply with:` line you can copy."
             );
         } else {
-            eprintln!("Run `rocm diagnose` to see which fix-id applies.");
+            eprintln!("Run `rocm doctor` to see which fix-id applies.");
         }
         return 2;
     };
@@ -781,11 +779,7 @@ fn run_path_export_linux(opts: &FixOptions) -> i32 {
     if !confirm(&format!("Append to {}?", rc_file.display()), opts.yes) {
         return 5;
     }
-    if let Err(exc) = append_line(
-        &rc_file,
-        "# Added by rocm examine (fix-6-path)",
-        &export_line,
-    ) {
+    if let Err(exc) = append_line(&rc_file, "# Added by rocm fix (fix-6-path)", &export_line) {
         println!("Failed to write {}: {exc}", rc_file.display());
         return 4;
     }
@@ -892,7 +886,7 @@ fn run_hip_visible_devices_linux(opts: &FixOptions) -> i32 {
     }
     if let Err(exc) = append_line(
         &rc_file,
-        "# Added by rocm examine (fix-9-igpu-dgpu)",
+        "# Added by rocm fix (fix-9-igpu-dgpu)",
         &export_line,
     ) {
         println!("Failed to write {}: {exc}", rc_file.display());
@@ -1165,7 +1159,7 @@ mod tests {
 
     #[test]
     fn diagnosis_positions_are_recognised_as_positions() {
-        // What `rocm diagnose` shows as `#1`/`#2`, plus the bare number a user
+        // What `rocm doctor` shows as `#1`/`#2`, plus the bare number a user
         // might type instead.
         for value in ["#1", "#2", "1", "12", " #3 "] {
             assert!(

@@ -126,7 +126,7 @@ and apply that environment before launching HIP apps such as Lemonade's bundled
 
 ## Examine And Install UX Recommendations
 
-`rocm examine` should detect WSL cheaply and report:
+`rocm doctor` should detect WSL cheaply and report:
 
 - `wsl: true`
 - WSL distro/version

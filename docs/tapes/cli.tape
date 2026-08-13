@@ -14,7 +14,7 @@ Set Padding 20
 Set Theme "Catppuccin Mocha"
 Set TypingSpeed 35ms
 
-Type "rocm examine"
+Type "rocm doctor"
 Sleep 500ms
 Enter
 Sleep 4s

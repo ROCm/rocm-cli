@@ -1015,7 +1015,7 @@ fn openai_chat_request_body_with_stream(
 fn rocm_openai_tool_definitions() -> Vec<serde_json::Value> {
     vec![
         rocm_openai_tool(
-            "examine",
+            "doctor",
             "Read the current ROCm host, GPU, runtime, driver, and engine status.",
             serde_json::json!({
                 "type": "object",
@@ -2354,7 +2354,7 @@ mod tests {
 
         assert!(request.contains("\"tools\""));
         assert!(request.contains("\"tool_choice\":\"auto\""));
-        assert!(request.contains("\"name\":\"examine\""));
+        assert!(request.contains("\"name\":\"doctor\""));
         assert_eq!(response.content, "I will check first.");
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].name, "examine");

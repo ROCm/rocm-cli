@@ -103,7 +103,7 @@ cargo test -p rocm --bin rocm permissions_
 ```
 
 Self-hosted GPU CI smoke is intentionally non-mutating. The MI300X job builds
-the workspace, runs `rocm examine`, then runs `detect` and `capabilities` for
+the workspace, runs `rocm doctor`, then runs `detect` and `capabilities` for
 all first-party engine adapters: Lemonade and vLLM.
 Live serving acceptance remains separate because it needs engine-specific
 runtime installs, model artifacts, and supported upstream GPU targets.
@@ -113,7 +113,7 @@ WSL live examine sanity after building with a Linux target directory:
 ```bash
 export CARGO_TARGET_DIR=/home/user/.cache/rocm-cli-target
 cargo build --workspace
-rocm examine
+rocm doctor
 ```
 
 Expected WSL fields when a managed TheRock runtime is registered and ROCDXG is
@@ -800,7 +800,7 @@ generated public-key PEM installer verification; verify first-install PATH setup
 (Windows persists the install folder to the user PATH and restores it afterward;
 Linux writes the shell profile); reinstall stale-manifest purge and config
 preservation; a Windows loopback-HTTP install; isolated installed-binary
-directory smoke checks (`rocm examine` must read only the isolated
+directory smoke checks (`rocm doctor` must read only the isolated
 config/data/cache, never the real user `.rocm` state); and full-purge uninstall.
 Each scenario generates its own local keys, package, and install root under a
 per-scenario temp directory, so they are independent and use generated local

@@ -232,7 +232,13 @@ impl Default for Examination {
 
 /// Route-out guidance shown when WSL2 is detected (out of scope for this
 /// catalog, which targets bare-metal Linux). Mirrors `examine.py`.
-pub const WSL_ROUTE_OUT_NOTE: &str = "Detected WSL2. rocm examine does not cover the ROCm-on-WSL flow (it requires Adrenalin Pro + the WSL kernel update on the Windows host). Either run `rocm examine` on the native Linux host, or follow AMD's WSL guide directly: https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installryz/wsl/howto_wsl.html";
+/// Why WSL2 is routed out, and where to go instead.
+///
+/// One text, shared by the host report and the diagnosis catalog. These used to
+/// be two independently-written explanations of the same verdict — one blamed
+/// the Adrenalin driver, the other explained `/dev/dxg` — with the same doc URL
+/// duplicated in both files. They had already drifted apart.
+pub const WSL_ROUTE_OUT_NOTE: &str = "ROCm on WSL2 is a distinct platform: it uses /dev/dxg and the Windows host driver (dxgkrnl), not the in-tree amdgpu kernel module or /dev/kfd. The bare-metal Linux checks (render group, /dev/kfd, modprobe amdgpu) cannot apply here, so they are not run. Either run `rocm doctor` on a native Linux host, or follow AMD's ROCm-on-WSL2 guide: https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installryz/wsl/howto_wsl.html";
 
 /// Which framework probe to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,7 +300,7 @@ impl Examination {
             probe_framework(&mut e, framework);
         } else {
             e.notes.push(format!(
-                "rocm examine supports Linux and Windows; got {}. This skill cannot help on this platform.",
+                "rocm doctor supports Linux and Windows; got {}. This platform is not covered.",
                 e.os_family
             ));
         }

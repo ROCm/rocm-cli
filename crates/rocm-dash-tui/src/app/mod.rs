@@ -57,7 +57,7 @@ pub enum Focus {
     Setup,
     /// The serve-a-model wizard — the launcher's `Serve a model` row.
     Serve,
-    /// Read-only `rocm examine` environment check — the launcher's
+    /// Read-only `rocm doctor` environment check — the launcher's
     /// `Diagnose & fix` row. Auto-runs on open.
     Examine,
 }
@@ -1561,7 +1561,7 @@ fn focused_close_key_blocked(state: &AppState, focus: Option<Focus>, code: KeyCo
 }
 
 /// Open the single overlay a focused host should host, returning any initial
-/// job-bridge side effects to pump (Examine auto-runs `rocm examine` on open;
+/// job-bridge side effects to pump (Doctor auto-runs `rocm doctor` on open;
 /// Setup/Serve open their form and wait for input). Clears any other overlay
 /// first (mutually-exclusive invariant). Pure w.r.t. process I/O — the caller
 /// runs the returned effects through [`crate::jobs::run_effects`].
@@ -1990,7 +1990,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         crate::jobs::run_effects(fx, &job_tx);
                     }
                     // The examine overlay, when open, owns all keys (read-only
-                    // `rocm examine` job through the job-bridge).
+                    // `rocm doctor` job through the job-bridge).
                     Some(Ok(CtEvent::Key(k))) if state.examine_manager.is_some() => {
                         let fx = crate::ui::examine_manager::on_key(
                             &mut state.examine_manager,
@@ -5137,7 +5137,7 @@ mod tests {
             rocm_dash_core::state::SideEffect::SpawnJob { cmd, args, .. } => {
                 assert!(cmd.contains("rocm"), "cmd resolves to the rocm exe: {cmd}");
                 assert!(
-                    args.iter().any(|a| a == "examine"),
+                    args.iter().any(|a| a == "doctor"),
                     "examine in args: {args:?}"
                 );
             }
@@ -5145,7 +5145,7 @@ mod tests {
         }
         assert_eq!(
             s.examine_manager.as_ref().unwrap().active_job.as_deref(),
-            Some("examine"),
+            Some("doctor"),
             "the auto-run wires the active job"
         );
     }
@@ -5167,7 +5167,7 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect();
-        assert!(out.contains("Examine"), "overlay content present: {out:?}");
+        assert!(out.contains("Doctor"), "overlay content present: {out:?}");
         assert!(
             !out.contains("1–5"),
             "no dash tab-shell hint in focused mode"
@@ -5192,7 +5192,7 @@ mod tests {
         // Job terminal → first Esc dismisses the console back to the intro card;
         // the overlay is still open, so the gate stays shut.
         s.jobs.apply(rocm_dash_core::state::StateEvent::JobDone {
-            id: "examine".into(),
+            id: "doctor".into(),
             code: 0,
         });
         let _ = crate::ui::examine_manager::on_key(
@@ -5257,7 +5257,7 @@ mod tests {
 
         // Once the job is terminal, close keys are allowed again → normal exit.
         s.jobs.apply(rocm_dash_core::state::StateEvent::JobDone {
-            id: "examine".into(),
+            id: "doctor".into(),
             code: 0,
         });
         assert!(

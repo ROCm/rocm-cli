@@ -1299,9 +1299,9 @@ fn route_when_no_match(e: &Examination) -> Route {
 #[must_use]
 pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
     // WSL2 is a distinct platform (it uses /dev/dxg + the Windows host driver,
-    // not the in-tree amdgpu module or /dev/kfd), and `examine` already treats
-    // it as out of scope (exit_code() == 2). Mirror that here: skip the
-    // bare-metal Linux catalog entirely so we don't emit false positives like
+    // not the in-tree amdgpu module or /dev/kfd), and the host report already
+    // routes it out via the "wsl" status. Mirror that here: skip the bare-metal
+    // Linux catalog entirely so we don't emit false positives like
     // fix-4-render-group / fix-5-amdgpu-load on a healthy WSL2 box.
     let out_of_scope = wsl_out_of_scope_message(e);
     let matched = if out_of_scope.is_some() {
@@ -1318,38 +1318,34 @@ pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
     }
 }
 
-/// ROCm-on-WSL2 setup guidance (distinct from the bare-metal catalog).
-const WSL_DOCS_URL: &str = "https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installryz/wsl/howto_wsl.html";
-
 fn wsl_out_of_scope_message(e: &Examination) -> Option<String> {
-    e.is_wsl.then(|| {
-        format!(
-            "ROCm on WSL2 is a distinct platform: it uses /dev/dxg and the Windows host \
-             driver (dxgkrnl), not the in-tree amdgpu kernel module or /dev/kfd. This catalog \
-             targets bare-metal Linux, so its checks (render group, /dev/kfd, modprobe amdgpu) \
-             do not apply here. For ROCm-on-WSL2 setup, see {WSL_DOCS_URL}"
-        )
-    })
+    // Shared with the host report rather than restated: this verdict was
+    // previously explained twice, in two wordings, and the two had drifted.
+    e.is_wsl
+        .then(|| crate::examine::WSL_ROUTE_OUT_NOTE.to_owned())
 }
 
 /// Render the human-facing diagnosis view (mirrors `diagnose.py`'s text output).
 #[must_use]
-pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
+pub fn render_report_text(report: &DiagnoseReport, top: usize, command: &str) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     if let Some(reason) = &report.out_of_scope {
-        out.push_str("rocm diagnose: out of scope for this platform.\n\n");
+        let _ = writeln!(out, "{command}: out of scope for this platform.\n");
         out.push_str(reason);
         out.push('\n');
         return out;
     }
     if report.matched.is_empty() {
         let route = &report.route_when_no_match;
-        out.push_str("rocm diagnose: no known misconfiguration matched.\n\n");
+        let _ = writeln!(out, "{command}: no known misconfiguration matched.\n");
         out.push_str("This is the explicit 'I don't recognise this failure mode' case. Do not speculate; file the symptom + this examination output upstream:\n");
         let _ = writeln!(out, "  {:>12}: {}", route.target, route.url);
         out.push('\n');
-        out.push_str("Include the JSON from `rocm examine --json` in your report.\n");
+        let _ = writeln!(
+            out,
+            "Include the JSON from `{command} --json` in your report."
+        );
         return out;
     }
     for (i, d) in report.matched.iter().take(top).enumerate() {
@@ -1482,7 +1478,7 @@ mod tests {
             "fixture must stay below the threshold for this test to mean anything"
         );
 
-        let out = render_report_text(&report, 5);
+        let out = render_report_text(&report, 5, "rocm doctor");
         assert!(
             out.contains("below the HIGH_CONFIDENCE threshold"),
             "the confidence caution must survive:\n{out}"
@@ -1499,7 +1495,7 @@ mod tests {
         e.in_render_group = Some(false);
         e.in_video_group = Some(false);
         let report = diagnose(&e, "");
-        let out = render_report_text(&report, 5);
+        let out = render_report_text(&report, 5, "rocm doctor");
 
         let applies = out.matches("apply with: rocm fix ").count();
         let shown = report.matched.len().min(5);
@@ -1523,7 +1519,7 @@ mod tests {
         let mut e = linux_base();
         e.in_render_group = Some(false);
         let report = diagnose(&e, "");
-        let out = render_report_text(&report, 5);
+        let out = render_report_text(&report, 5, "rocm doctor");
         let top = &report.matched[0];
         assert!(
             out.contains(&format!("#1 ({})", top.id)),
@@ -1540,7 +1536,7 @@ mod tests {
         if report.matched.len() < 2 {
             return; // nothing to truncate on this fixture
         }
-        let out = render_report_text(&report, 1);
+        let out = render_report_text(&report, 1, "rocm doctor");
         assert!(
             out.contains("Showing 1 of"),
             "a truncated list must not read as the complete set:\n{out}"

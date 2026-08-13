@@ -115,7 +115,7 @@ This produces the two binaries under `target/release/`:
 Run without installing:
 
 ```bash
-cargo run --release --bin rocm -- examine
+cargo run --release --bin rocm -- doctor
 ```
 
 Or copy the release binaries onto your `PATH`:
@@ -184,7 +184,7 @@ rocm install sdk
 ```
 
 This downloads TheRock ROCm wheels and a matching PyTorch stack into a managed
-environment. On machines with an existing ROCm install, `rocm examine` will
+environment. On machines with an existing ROCm install, `rocm doctor` will
 show it as `legacy_rocm_status: detected_unmanaged` — running `rocm install sdk`
 creates a separate managed runtime alongside it.
 
@@ -207,7 +207,7 @@ requirements.
 | Command | Description |
 |---|---|
 | `rocm` | Open the launcher menu (setup, serve, diagnose, chat, dashboard) |
-| `rocm examine` | Check GPU, ROCm install, engines, and managed folders |
+| `rocm doctor` | Check GPU, ROCm install, engines, and managed folders, and what looks wrong |
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
 | `rocm install driver` | Install the AMD kernel driver on Linux |
 | `rocm serve <model>` | Start a local OpenAI-compatible model server |

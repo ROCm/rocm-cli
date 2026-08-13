@@ -143,7 +143,7 @@ not append raw command reports to the transcript as the primary experience.
 Hidden compatibility aliases should follow the same navigability rules when
 typed, even when they are intentionally left out of completions and help.
 
-Current navigable surfaces include `/home`, `/examine`, `/setup`, `/permissions`,
+Current navigable surfaces include `/home`, `/doctor`, `/setup`, `/permissions`,
 `/runtimes`, `/engine`, `/model`, `/plan`, `/config`, `/automations`,
 `/reviews`, `/approve`, `/reject`, `/edit`, `/install`, `/services`, `/logs`,
 `/gpu`, `/update`, `/daemon`, `/chat`, `/provider`, `/uninstall`, `/comfyui`,

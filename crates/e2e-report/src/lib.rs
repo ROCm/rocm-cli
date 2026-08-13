@@ -1457,6 +1457,9 @@ struct CommandKey {
 /// coverage % reflects the real surface (a deliberate, reviewable denominator
 /// beats silently drifting).
 const KNOWN_COMMAND_SURFACE: &[&str] = &[
+    "rocm doctor",
+    // Superseded by `rocm doctor` and hidden from the advertised surface, but
+    // still dispatched and still covered, so they stay in the denominator.
     "rocm examine",
     "rocm diagnose",
     "rocm fix",
