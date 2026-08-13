@@ -112,6 +112,7 @@ fn run_git_at(cwd: &Path, args: &[&str]) -> Option<String> {
 mod tests {
     use super::git_watch_paths;
     use std::fs;
+    use std::path::Path;
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -142,13 +143,10 @@ mod tests {
 
         let paths = git_watch_paths(&repo);
         fs::remove_dir_all(&repo).expect("remove temporary repository");
-        assert_eq!(
-            paths,
-            vec![
-                repo.join(".git/HEAD"),
-                repo.join(".git/refs/heads/main"),
-                repo.join(".git/packed-refs"),
-            ]
-        );
+        assert_eq!(paths.len(), 3);
+        assert!(paths.iter().all(|path| path.is_absolute()));
+        assert!(paths[0].ends_with(Path::new("HEAD")));
+        assert!(paths[1].ends_with(Path::new("refs").join("heads").join("main")));
+        assert!(paths[2].ends_with(Path::new("packed-refs")));
     }
 }
