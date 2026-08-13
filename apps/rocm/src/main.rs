@@ -22380,9 +22380,8 @@ install therock";
         );
         let _ = fs::remove_dir_all(root);
 
-        let error = match result {
-            Ok(_) => panic!("mismatched recipe on a live service must be rejected"),
-            Err(error) => error,
+        let Err(error) = result else {
+            panic!("mismatched recipe on a live service must be rejected")
         };
         let message = error.to_string();
         assert!(

@@ -2831,6 +2831,7 @@ fn run_lemonade_pull(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_lemonade_model_load(
     manifest: &LemonadeInstallManifest,
     host: &str,
