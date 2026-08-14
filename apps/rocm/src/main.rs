@@ -5022,6 +5022,15 @@ fn serve(args: ServeArgs) -> Result<()> {
     // `ROCR_VISIBLE_DEVICES`/partitioning is in play, so warn at serve time.
     let rocr_visible_devices_set = std::env::var_os("ROCR_VISIBLE_DEVICES").is_some();
     let gpu_vram = if cpu_only { None } else { gpu_vram_usage() };
+    // Serialize GPU auto-selection with the managed-service claim: the busy-GPU
+    // read inside `resolve_gpu_indices` and the claiming record write inside
+    // `spawn_managed_engine_child` must be atomic, or two concurrent
+    // `rocm serve --gpu auto` can both read the same GPU as free and launch on
+    // it. The guard is held across selection and handed to the launch path, which
+    // drops it once the record is persisted (before the readiness wait) so
+    // unrelated serves are not blocked. Explicit-index and CPU-only launches take
+    // it too; the critical section is only a metadata resolve plus a record write.
+    let launch_lock = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?;
     let gpu_indices = if cpu_only {
         Vec::new()
     } else {
@@ -5165,6 +5174,7 @@ fn serve(args: ServeArgs) -> Result<()> {
             managed_env_id.as_deref(),
             resolve.engine_recipe.as_ref(),
             endpoint_auth.as_deref(),
+            launch_lock,
             &mut |_elapsed| spinner.tick(),
         )?;
         ensure_background_helper_running_quiet(summary_mode)?;
@@ -5243,6 +5253,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         resolved_selection.runtime_id.as_deref(),
         resolved_selection.env_id.as_deref(),
         endpoint_auth.as_deref(),
+        launch_lock,
     )
 }
 
@@ -5712,6 +5723,7 @@ fn start_managed_service(
     env_id: Option<&str>,
     engine_recipe: Option<&EngineRecipeHint>,
     endpoint_api_key: Option<&str>,
+    launch_lock: rocm_core::FileLock,
     on_wait_tick: &mut dyn FnMut(Duration),
 ) -> Result<ManagedLaunchReport> {
     let paths = AppPaths::discover()?;
@@ -5732,6 +5744,11 @@ fn start_managed_service(
         ManagedSpawn::AlreadyRunning(report) => return Ok(report),
         ManagedSpawn::Spawned { record, child_pid } => (*record, child_pid),
     };
+    // The claiming service record is now persisted, so the selected GPU is
+    // visible to any concurrent auto-selection. Release the launch lock before
+    // the readiness wait below, which can block for many seconds — holding it
+    // that long would needlessly serialize unrelated serves.
+    drop(launch_lock);
 
     #[cfg(windows)]
     thread::sleep(Duration::from_millis(200));
@@ -5858,6 +5875,17 @@ pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> 
         return Ok(());
     }
 
+    // The check above and the spawn below are a TOCTOU window: two concurrent
+    // callers (e.g. two `rocm serve`) can both read "not running" and each spawn
+    // a daemon. Serialize the decision on a lock file and re-check under it — the
+    // first holder spawns, later holders observe the now-running daemon and
+    // return without spawning. The unlocked pre-check above keeps the common
+    // already-running case lock-free.
+    let _autostart_lock = rocm_core::FileLock::acquire(paths.automation_autostart_lock_path())?;
+    if background_helper_already_running(&paths)? {
+        return Ok(());
+    }
+
     let exe = managed_service_launcher_path()
         .context("failed to resolve current rocm executable path")?;
     let args = vec!["daemon".to_owned()];
@@ -5916,6 +5944,7 @@ fn run_attached_service(
     runtime_id: Option<&str>,
     env_id: Option<&str>,
     endpoint_api_key: Option<&str>,
+    launch_lock: rocm_core::FileLock,
 ) -> Result<()> {
     let paths = AppPaths::discover()?;
 
@@ -5933,6 +5962,10 @@ fn run_attached_service(
         env_id,
         resolve.engine_recipe.as_ref(),
     )?;
+    // The claiming record is persisted (or an existing service was found), so the
+    // selected GPU is now visible to concurrent auto-selection. Release the launch
+    // lock before streaming logs, which blocks for the whole attached session.
+    drop(launch_lock);
 
     let (service_id, log_path, child_pid) = match spawn {
         // A server for this engine+model is already live. Don't fight it for the
@@ -18302,11 +18335,13 @@ const AUTO_FREE_VRAM_FRACTION: f64 = 0.90;
 /// assuming device 0 — the engine's device probe then pins the first present GPU
 /// or fails fast under the GPU-required policy.
 ///
-/// Selection reads service state without holding a lock, so two near-concurrent
-/// `--gpu auto` launches can race onto the same idle GPU. The VRAM-occupancy
-/// fallback and the start-time low-memory warning keep this from silently
-/// overcommitting in practice; pass an explicit `--gpu <index>` to avoid the
-/// race entirely.
+/// This reads service state (`busy_gpu_indices`) but does not lock on its own.
+/// Concurrency safety is the caller's responsibility: `serve()` holds the
+/// managed-launch lock (`AppPaths::managed_launch_lock_path`) across this
+/// selection and the claiming record write, so two near-concurrent `--gpu auto`
+/// launches are serialized and cannot land on the same idle GPU. Callers that
+/// select outside that lock get only best-effort de-confliction from the
+/// VRAM-occupancy fallback and the start-time low-memory warning.
 fn auto_select_gpu_indices(
     paths: &AppPaths,
     detected: Option<usize>,
@@ -29672,6 +29707,81 @@ ID_LIKE="suse opensuse"
             !background_helper_already_running(&paths).expect("not-running flag ⇒ ok"),
             "running=false ⇒ not running even with a live pid"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Persist a live-looking managed record claiming `gpu` — the same shape a
+    /// real launch writes, with the current process id as the supervisor so the
+    /// liveness refresh in `load_managed_services` keeps it "starting" (and thus
+    /// counted by `busy_gpu_indices`).
+    fn write_claiming_record(paths: &AppPaths, service_id: &str, port: u16, gpu: &[u32]) {
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            service_id,
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            port,
+            "managed",
+            std::process::id(),
+            Some("therock-release".to_owned()),
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        record.status = "starting".to_owned();
+        record.gpu_indices = gpu.to_vec();
+        record.write().expect("write claiming record");
+    }
+
+    #[test]
+    fn launch_lock_makes_gpu_select_and_claim_atomic() {
+        // Regression for the serve read-select-launch race: the busy-GPU read in
+        // `auto_select_gpu_indices` and the claiming record write must happen
+        // under one lock, or two concurrent `--gpu auto` serves both read the
+        // same GPU as free and land on it. This mirrors serve()'s locked
+        // select-then-claim: two threads race the exact sequence, and the launch
+        // lock must force them onto DISTINCT GPUs.
+        let (root, paths) = test_paths("launch-lock-atomic-claim");
+        paths.ensure().expect("prepare paths");
+        let detected = Some(2_usize);
+
+        let barrier = std::sync::Barrier::new(2);
+        let selections = std::thread::scope(|scope| {
+            let handles: Vec<_> = [("svc-race-a", 21001_u16), ("svc-race-b", 21002_u16)]
+                .into_iter()
+                .map(|(service_id, port)| {
+                    let paths = &paths;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let _lock =
+                            rocm_core::FileLock::acquire(paths.managed_launch_lock_path())
+                                .expect("acquire launch lock");
+                        let gpu = auto_select_gpu_indices(paths, detected, None);
+                        // Widen the select→claim window so an unlocked variant
+                        // would deterministically double-book GPU 0; under the
+                        // lock the second thread cannot enter until we claim.
+                        std::thread::sleep(Duration::from_millis(50));
+                        write_claiming_record(paths, service_id, port, &gpu);
+                        gpu
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("selection thread joins"))
+                .collect::<Vec<_>>()
+        });
+
+        let mut picked: Vec<u32> = selections.into_iter().flatten().collect();
+        picked.sort_unstable();
+        assert_eq!(
+            picked,
+            vec![0, 1],
+            "serialized select-then-claim must hand out distinct GPUs, got {picked:?}"
+        );
+
         let _ = fs::remove_dir_all(&root);
     }
 
