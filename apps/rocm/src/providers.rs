@@ -1762,9 +1762,8 @@ mod tests {
                     content: "hello".to_owned(),
                 }],
                 max_tokens: Some(1),
-                temperature: None,
-                top_p: None,
                 rocm_tools: false,
+                ..Default::default()
             },
         )
         .unwrap_err()
@@ -1898,9 +1897,8 @@ mod tests {
                 content: "hello".to_owned(),
             }],
             max_tokens: Some(42),
-            temperature: None,
-            top_p: None,
             rocm_tools: false,
+            ..Default::default()
         };
         let openai = openai_chat_request_body("model-a", &request);
         assert_eq!(openai["model"], "model-a");
@@ -1922,9 +1920,8 @@ mod tests {
                 content: "hello".to_owned(),
             }],
             max_tokens: Some(42),
-            temperature: None,
-            top_p: None,
             rocm_tools: false,
+            ..Default::default()
         };
 
         // Omitted by default so provider/server defaults are preserved.
@@ -1957,9 +1954,8 @@ mod tests {
                 content: "hello".to_owned(),
             }],
             max_tokens: Some(16),
-            temperature: None,
-            top_p: None,
             rocm_tools: false,
+            ..Default::default()
         };
 
         let body = openai_local_chat_request_body("Qwen3-0.6B-GGUF", &request);
@@ -1976,9 +1972,8 @@ mod tests {
                 content: "check this host".to_owned(),
             }],
             max_tokens: Some(42),
-            temperature: None,
-            top_p: None,
             rocm_tools: true,
+            ..Default::default()
         };
         let non_streaming = openai_chat_request_body("model-a", &request);
         assert_eq!(non_streaming["tool_choice"], "auto");
@@ -2042,9 +2037,8 @@ mod tests {
                 },
             ],
             max_tokens: Some(42),
-            temperature: None,
-            top_p: None,
             rocm_tools: true,
+            ..Default::default()
         };
 
         let non_streaming = anthropic_chat_request_body("claude-test", &request);
@@ -2176,9 +2170,8 @@ mod tests {
                     },
                 ],
                 max_tokens: Some(16),
-                temperature: None,
-                top_p: None,
                 rocm_tools: false,
+                ..Default::default()
             },
         )?;
         let request = server.join().expect("server thread should not panic")?;
@@ -2409,9 +2402,8 @@ mod tests {
                     content: "check this host".to_owned(),
                 }],
                 max_tokens: Some(16),
-                temperature: None,
-                top_p: None,
                 rocm_tools: true,
+                ..Default::default()
             },
         )?;
         let request = server.join().expect("server thread should not panic")?;
@@ -2483,9 +2475,8 @@ mod tests {
                     },
                 ],
                 max_tokens: Some(16),
-                temperature: None,
-                top_p: None,
                 rocm_tools: false,
+                ..Default::default()
             },
         )?;
         let request = server.join().expect("server thread should not panic")?;
@@ -2586,9 +2577,8 @@ mod tests {
                     content: "hello".to_owned(),
                 }],
                 max_tokens: Some(16),
-                temperature: None,
-                top_p: None,
                 rocm_tools: false,
+                ..Default::default()
             },
             &mut |event| {
                 if event.content == "hel" {
@@ -2675,9 +2665,8 @@ mod tests {
                     content: "hello".to_owned(),
                 }],
                 max_tokens: Some(16),
-                temperature: None,
-                top_p: None,
                 rocm_tools: false,
+                ..Default::default()
             },
         )?;
         let request = server.join().expect("server thread should not panic")?;
@@ -2750,9 +2739,8 @@ mod tests {
                 content: "hello".to_owned(),
             }],
             max_tokens: Some(16),
-            temperature: None,
-            top_p: None,
             rocm_tools: false,
+            ..Default::default()
         };
         let body = openai_stream_chat_request_body("gpt-test", &chat_request);
         let mut events = Vec::new();
@@ -2853,9 +2841,8 @@ mod tests {
                 content: "hello".to_owned(),
             }],
             max_tokens: Some(16),
-            temperature: None,
-            top_p: None,
             rocm_tools: false,
+            ..Default::default()
         };
         let body = anthropic_stream_chat_request_body("claude-test", &chat_request);
         let mut events = Vec::new();

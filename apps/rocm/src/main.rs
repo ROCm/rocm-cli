@@ -4563,6 +4563,10 @@ fn set_vllm_override_generation_config(
                 for (key, value) in existing_config {
                     merged.insert(key, value);
                 }
+            } else {
+                eprintln!(
+                    "warning: existing --override-generation-config value is not valid JSON; discarding it"
+                );
             }
             continue;
         }

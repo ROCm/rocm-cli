@@ -314,6 +314,14 @@ llama.cpp's `--temperature`, `--top-p`, and `--n-predict` flags. Each control
 is optional and independent — omit any of them to keep the engine's own
 default.
 
+`rocm serve` only reuses an already-running service for the same engine and
+model if its sampling controls (and other recipe settings) match the ones
+requested this time; otherwise it errors out instead of silently serving with
+different settings. If you previously started a service with `--temperature`
+(or another sampling flag) and now run `rocm serve` for the same model without
+flags — or with different ones — stop the existing service first (`rocm
+services stop`) or match the original flags.
+
 By default the server runs in the background under rocm-cli's supervision and
 prints a deployment summary — a progress indicator while it starts, then a table
 with the status, the full inference endpoint, the API-qualified model name, and a
