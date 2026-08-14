@@ -47,6 +47,10 @@ const DETAIL_COLS: u16 = 120;
 /// poll cadence, not a fixed readiness sleep: every wait has a deadline and
 /// returns the instant its condition holds.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// How long [`TuiSession::send_until`] waits for a key to take effect before
+/// sending it again. Long enough that a busy host is not spammed with repeats,
+/// short enough that several attempts fit inside a normal step timeout.
+const KEY_RESEND_INTERVAL: Duration = Duration::from_millis(500);
 /// Maximum time to let the PTY reader consume the child's final frame after the
 /// process exits. This is bounded so a misbehaving PTY cannot stall a scenario.
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
@@ -276,6 +280,63 @@ impl TuiSession {
             .write_all(bytes.as_bytes())
             .and_then(|()| self.writer.flush())
             .map_err(|e| format!("failed to write to pty: {e}"))
+    }
+
+    /// Whether the PTY reader thread has stopped, so the emulated screen can
+    /// never change again. True once the child's slave side closes (normal
+    /// exit) and once the reader catches a parser panic (see `spawn_reader`).
+    fn reader_stopped(&self) -> bool {
+        self.reader
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+    }
+
+    /// Send `bytes` until the screen shows `marker`, re-sending every
+    /// [`KEY_RESEND_INTERVAL`] until the deadline.
+    ///
+    /// A bare [`send`](Self::send) writes into the pseudo-terminal whether or
+    /// not the application is reading yet, so a keystroke typed during startup
+    /// can be consumed by whatever holds the terminal at that moment and never
+    /// reach the event loop. The key is then simply lost — nothing retries it,
+    /// and the scenario fails much later, in an assertion about a view it never
+    /// left. Re-sending until the expected view appears makes the step depend on
+    /// the application having acted on the key rather than on it having been
+    /// ready when the key was written.
+    ///
+    /// Only safe for idempotent keys (a tab jump, not a toggle): the key is
+    /// always sent at least once, and further copies may still be queued in the
+    /// terminal when the marker appears, so the application may act on it again
+    /// after this returns.
+    pub async fn send_until(
+        &mut self,
+        bytes: &str,
+        marker: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.send(bytes)?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let attempt = KEY_RESEND_INTERVAL.min(remaining);
+            let last_error = match self.wait_for_screen(marker, attempt).await {
+                Ok(()) => return Ok(()),
+                Err(e) => e,
+            };
+            // Only a plain marker timeout earns another key. A child exit or a
+            // dead reader thread means the screen can never change again, and
+            // `wait_for_screen` *consumes* the reader's panic message on its way
+            // out — retrying past either would burn the whole deadline and then
+            // report a generic timeout instead of the cause it already had.
+            if self.finished || self.reader_stopped() {
+                return Err(last_error);
+            }
+            if Instant::now() >= deadline {
+                // `last_error` already carries the final screen.
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for {marker:?} while repeating {bytes:?}; last attempt: {last_error}"
+                ));
+            }
+        }
     }
 
     /// Poll the current screen until it contains `marker`, or fail with a
