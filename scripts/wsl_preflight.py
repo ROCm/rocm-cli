@@ -258,8 +258,10 @@ def evaluate(
     sdk_headers = state.get("windows_sdk_headers") or []
 
     version_id = str(os_release.get("VERSION_ID") or "")
+    # 22.04 is deliberately absent: its glibc 2.35 is below the glibc 2.38 /
+    # GLIBCXX_3.4.32 floor every published Lemonade embeddable is linked
+    # against, so the Lemonade engine cannot start on it. See docs/wsl.md.
     supported_ubuntu = os_release.get("ID") == "ubuntu" and version_id in {
-        "22.04",
         "24.04",
         "26.04",
     }
@@ -270,7 +272,9 @@ def evaluate(
     checks = [
         Check("wsl", bool(state.get("is_wsl")), "WSL marker or /dev/dxg detected"),
         Check(
-            "ubuntu", supported_ubuntu, f"Ubuntu VERSION_ID={version_id or '<unknown>'}"
+            "ubuntu",
+            supported_ubuntu,
+            f"Ubuntu 24.04 or newer (VERSION_ID={version_id or '<unknown>'})",
         ),
         Check("dxg_device", bool(paths.get("/dev/dxg")), "/dev/dxg"),
         Check(
@@ -390,6 +394,14 @@ def self_test() -> None:
     ready_state["ldconfig"]["librocdxg"] = True
     checks = evaluate(ready_state, require_rocm_tools=False)
     assert all(check.ok for check in checks if check.required), checks
+
+    # 22.04 is below the Lemonade glibc floor, so an otherwise perfect host
+    # must still fail the ubuntu check rather than report itself ready.
+    jammy_state = json.loads(json.dumps(ready_state))
+    jammy_state["os_release"]["VERSION_ID"] = "22.04"
+    checks = evaluate(jammy_state, require_rocm_tools=False)
+    assert any(check.name == "ubuntu" and not check.ok for check in checks), checks
+    assert not all(check.ok for check in checks if check.required), checks
 
 
 def main() -> int:

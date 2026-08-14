@@ -29,14 +29,21 @@ Lemonade and vLLM.
 
 | Platform | Prebuilt binary | Notes |
 |---|---|---|
-| Linux (x86_64) | Yes | Full support, including the live dashboard and both inference engines |
+| Linux (x86_64) | Yes | Ubuntu 24.04 or newer; full support, including the live dashboard and both inference engines |
 | Windows (x86_64) | Yes | CLI and Lemonade serving; no live dashboard or vLLM |
-| WSL2 (x86_64) | Yes (Linux binary) | Full support, including the live dashboard; see [docs/wsl.md](docs/wsl.md) for setup |
+| WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; full support, including the live dashboard; see [docs/wsl.md](docs/wsl.md) for setup |
 | macOS | No | No official installer, release, CI, or QA coverage |
 
 Live dashboard telemetry requires Linux or WSL2 (see
 [Interactive interfaces](#interactive-interfaces)). vLLM serving is Linux/WSL2
 only (see [docs/vllm.md](docs/vllm.md)).
+
+The minimum supported Linux release, native or under WSL2, is Ubuntu 24.04. On
+other distributions the equivalent requirement is glibc 2.38 with
+`GLIBCXX_3.4.32`: that is what the Lemonade engine is linked against, and every
+published build of it needs those versions, so there is no older release to fall
+back to. Ubuntu 22.04 ships glibc 2.35 and cannot run it; Ubuntu 24.04 provides
+glibc 2.39 and `GLIBCXX_3.4.33`.
 
 > [!IMPORTANT]
 > **Tech Preview** -- This software is provided as-is, without warranty or
