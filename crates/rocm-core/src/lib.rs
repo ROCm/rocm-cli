@@ -1396,6 +1396,63 @@ pub fn process_is_running(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// An advisory, cross-process exclusive lock backed by a lock file.
+///
+/// Wraps the standard-library file lock (`std::fs::File::lock`), so the exclusion
+/// holds between *separate `rocm` processes*, not just threads: each caller opens
+/// the same lock-file path and only one can hold the lock at a time. It exists to
+/// serialize check-then-act sequences over shared on-disk state — the daemon
+/// autostart decision and the managed-serve GPU select-then-claim — so two
+/// concurrent invocations cannot both pass the same TOCTOU check.
+///
+/// The lock is released when the guard is dropped, and by the OS if the process
+/// exits while holding it (so a crashed holder never wedges the next caller).
+#[derive(Debug)]
+pub struct FileLock {
+    file: fs::File,
+    path: PathBuf,
+}
+
+impl FileLock {
+    /// Acquire an exclusive lock on `path`, creating the lock file and any
+    /// missing parent directories first. Blocks until the lock is available.
+    ///
+    /// The lock file itself carries no data; it is a rendezvous point, so an
+    /// existing file is reused (never truncated) and its contents are ignored.
+    pub fn acquire(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create lock directory {}", parent.display())
+            })?;
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("failed to open lock file {}", path.display()))?;
+        file.lock()
+            .with_context(|| format!("failed to acquire lock {}", path.display()))?;
+        Ok(Self { file, path })
+    }
+
+    /// The lock file backing this guard.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // Best-effort: an unlock failure only means the OS releases it slightly
+        // later (at the latest when the file handle closes), never a lost lock.
+        let _ = self.file.unlock();
+    }
+}
+
 #[cfg(unix)]
 #[allow(unsafe_code)] // libc FFI (pre_exec/setsid)
 pub fn detach_command_session(command: &mut Command) {
@@ -1677,6 +1734,14 @@ impl AppPaths {
         self.data_dir.join("services")
     }
 
+    /// Lock file serializing the managed-serve GPU select-then-claim sequence, so
+    /// two concurrent `rocm serve` invocations cannot read the same free GPU and
+    /// both launch on it. Held from auto-selection through the claiming service
+    /// record write (see [`FileLock`]).
+    pub fn managed_launch_lock_path(&self) -> PathBuf {
+        self.services_dir().join("launch.lock")
+    }
+
     pub fn audit_dir(&self) -> PathBuf {
         self.data_dir.join("audit")
     }
@@ -1691,6 +1756,13 @@ impl AppPaths {
 
     pub fn automation_state_path(&self) -> PathBuf {
         self.automations_dir().join("runtime-state.json")
+    }
+
+    /// Lock file serializing the daemon autostart check-then-spawn, so two
+    /// concurrent callers cannot both observe "not running" and each spawn a
+    /// background automation daemon (see [`FileLock`]).
+    pub fn automation_autostart_lock_path(&self) -> PathBuf {
+        self.automations_dir().join("autostart.lock")
     }
 
     pub fn automation_events_path(&self) -> PathBuf {
@@ -7460,6 +7532,82 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
+
+    #[test]
+    fn file_lock_creates_missing_parent_dirs_and_lock_file() {
+        let dir =
+            std::env::temp_dir().join(format!("rocm-core-filelock-create-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let lock_path = dir.join("nested").join("child").join("guard.lock");
+        assert!(!lock_path.exists(), "precondition: lock file absent");
+
+        let guard = FileLock::acquire(&lock_path).expect("acquire creates parents");
+        assert!(lock_path.is_file(), "lock file is created on acquire");
+        assert_eq!(guard.path(), lock_path.as_path());
+        drop(guard);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_lock_serializes_concurrent_holders() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir =
+            std::env::temp_dir().join(format!("rocm-core-filelock-excl-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let lock_path = dir.join("guard.lock");
+
+        // First holder takes the lock and keeps it until we explicitly release it.
+        let held = FileLock::acquire(&lock_path).expect("first acquire");
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let thread_path = lock_path;
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).expect("signal about-to-acquire");
+            // Blocks until the main thread drops `held`.
+            let _guard = FileLock::acquire(&thread_path).expect("second acquire");
+            acquired_tx.send(()).expect("signal acquired");
+        });
+
+        // Ensure the contender has reached its acquire call before we assert it
+        // is blocked, so the negative check below is about the lock, not
+        // scheduling latency.
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("contender started");
+        assert!(
+            acquired_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "second acquire must block while the first lock is still held"
+        );
+
+        // Releasing the first lock lets the contender proceed promptly.
+        drop(held);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second acquire proceeds once the first lock is released");
+        handle.join().expect("contender thread joins");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_lock_distinct_paths_do_not_contend() {
+        let dir =
+            std::env::temp_dir().join(format!("rocm-core-filelock-distinct-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        // Two different lock files are independent; holding one must not block the
+        // other in the same process.
+        let a = FileLock::acquire(dir.join("a.lock")).expect("acquire a");
+        let b = FileLock::acquire(dir.join("b.lock")).expect("acquire b");
+        drop(a);
+        drop(b);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn service_id_accepts_generated_and_plain_ids() {
