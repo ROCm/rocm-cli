@@ -2161,18 +2161,147 @@ fn apply_lemonade_process_environment(
     command: &mut ProcessCommand,
     env: &LemonadeProcessEnvironment,
 ) -> Result<()> {
-    for (key, value) in lemonade_process_environment_vars(env)? {
+    let vars = lemonade_process_environment_vars(env, &ParentRuntimeEnvironment::current())?;
+    apply_environment_vars(command, &vars);
+    Ok(())
+}
+
+/// Apply an already-resolved variable set. Callers that spawn repeatedly (the
+/// readiness poll) resolve once and reuse, so preparing the runtime directory
+/// does not repeat its syscalls on every attempt.
+fn apply_environment_vars(command: &mut ProcessCommand, vars: &[(&'static str, OsString)]) {
+    for (key, value) in vars {
         command.env(key, value);
     }
+}
+
+/// The parts of *this* process's environment that decide where the child's
+/// runtime directory goes.
+///
+/// Captured into a value instead of being read inside
+/// [`lemonade_process_environment_vars`] so the precedence is testable without
+/// mutating process-global env vars, which is `unsafe` and racy under parallel
+/// tests in edition 2024.
+#[derive(Debug, Clone, Default)]
+struct ParentRuntimeEnvironment {
+    xdg_runtime_dir: Option<OsString>,
+    home: Option<OsString>,
+    user: Option<String>,
+    temp_dir: PathBuf,
+}
+
+impl ParentRuntimeEnvironment {
+    fn current() -> Self {
+        Self {
+            xdg_runtime_dir: std::env::var_os("XDG_RUNTIME_DIR"),
+            home: std::env::var_os("HOME"),
+            // An empty `USER` must fall through to `LOGNAME`, not short-circuit it.
+            user: std::env::var("USER")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .or_else(|| std::env::var("LOGNAME").ok().filter(|v| !v.is_empty())),
+            temp_dir: std::env::temp_dir(),
+        }
+    }
+}
+
+/// Leaf directory the engine gets inside a fallback runtime root, so a crashing
+/// or misbehaving server cannot disturb the telemetry socket that shares the
+/// same root.
+const RUNTIME_DIR_LEAF: &str = "lemonade";
+
+/// Guarantee the child a usable `XDG_RUNTIME_DIR`.
+///
+/// `lemond` refuses to start unless it can resolve a writable runtime directory
+/// from `XDG_RUNTIME_DIR` or `RUNTIME_DIRECTORY`. Neither exists on a headless
+/// host: `XDG_RUNTIME_DIR` is populated by `pam_systemd` at login, so it is
+/// absent for every non-login process (cron jobs, CI runners, `systemd-run`, a
+/// bare container exec), and `RUNTIME_DIRECTORY` only exists for a systemd unit
+/// that declares `RuntimeDirectory=`. There, a managed serve failed
+/// deterministically before the server ever came up.
+///
+/// A value already present in the parent environment is passed through
+/// unchanged — an operator's choice always wins, and it is the tier the rest of
+/// this precedence exists to fall back from.
+fn child_runtime_dir_var(
+    parent: &ParentRuntimeEnvironment,
+) -> Result<Option<(&'static str, OsString)>> {
+    if !runtime_is_linux() {
+        return Ok(None);
+    }
+    if let Some(existing) = parent
+        .xdg_runtime_dir
+        .as_ref()
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(Some(("XDG_RUNTIME_DIR", existing.clone())));
+    }
+    let dir = rocm_core::user_runtime_dir(
+        None,
+        parent.home.clone(),
+        parent.user.clone(),
+        parent.temp_dir.clone(),
+        RUNTIME_DIR_LEAF,
+        RUNTIME_DIR_LEAF,
+    );
+    create_private_runtime_dir(&dir).with_context(|| {
+        format!(
+            "preparing a runtime directory for the Lemonade server at {} \
+             (XDG_RUNTIME_DIR is unset in this environment)",
+            dir.display()
+        )
+    })?;
+    Ok(Some(("XDG_RUNTIME_DIR", dir.into_os_string())))
+}
+
+/// Create `dir` (and its parents) restricted to the current user.
+///
+/// The tier-3 fallback lands under a shared temp dir, so a pre-existing path
+/// there may not be ours. Both guards below only matter in that case:
+///
+/// * a symlink is refused outright — `chmod` follows it and would loosen an
+///   unrelated directory;
+/// * `DirBuilder::mode` applies only to directories it creates, so an existing
+///   directory is tightened explicitly. `chmod` needs ownership, so a failure
+///   here is a hard error rather than a warning: the server keeps its sockets
+///   and state in this directory.
+fn create_private_runtime_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
+        if fs::symlink_metadata(dir)?.file_type().is_symlink() {
+            bail!(
+                "{} is a symlink, so it may point somewhere another user controls",
+                dir.display()
+            );
+        }
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!(
+                "restricting {} to mode 0700 — it is most likely owned by another user",
+                dir.display()
+            )
+        })?;
+    }
+    #[cfg(not(unix))]
+    fs::create_dir_all(dir)?;
     Ok(())
 }
 
 fn lemonade_process_environment_vars(
     env: &LemonadeProcessEnvironment,
+    parent: &ParentRuntimeEnvironment,
 ) -> Result<Vec<(&'static str, OsString)>> {
     let mut vars = Vec::new();
     if let Some(rocm_root) = env.rocm_root.as_ref() {
         vars.push(("ROCM_PATH", rocm_root.as_os_str().to_owned()));
+    }
+    if let Some(runtime_dir) = child_runtime_dir_var(parent)? {
+        vars.push(runtime_dir);
     }
     let mut path_entries = env.path_entries.clone();
     if runtime_is_windows() {
@@ -2218,6 +2347,10 @@ fn wait_for_lemonade_cli_status(
 ) -> Result<()> {
     let start = std::time::Instant::now();
     let mut last_status = None;
+    // Resolved once: the poll runs twice a second, and resolving also prepares
+    // the child's runtime directory on disk.
+    let env_vars =
+        lemonade_process_environment_vars(process_env, &ParentRuntimeEnvironment::current())?;
     while start.elapsed() < timeout {
         let mut command = ProcessCommand::new(&manifest.lemonade);
         command
@@ -2229,7 +2362,7 @@ fn wait_for_lemonade_cli_status(
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        apply_lemonade_process_environment(&mut command, process_env)?;
+        apply_environment_vars(&mut command, &env_vars);
         hide_child_console_window(&mut command);
         match command.status() {
             Ok(status) if status.success() => return Ok(()),
@@ -4949,5 +5082,162 @@ vllm                rocm        unsupported     Requires Linux                  
         assert!(error.contains("symlink"), "{error}");
         assert!(!destination.join("escape-link").exists());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // `XDG_RUNTIME_DIR` is a Linux/freedesktop concept and the Lemonade server
+    // only consults it there, so these are Linux-only by construction.
+    #[cfg(target_os = "linux")]
+    mod child_runtime_dir {
+        use super::*;
+
+        fn value_of(vars: &[(&'static str, OsString)], key: &str) -> Option<OsString> {
+            vars.iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.clone())
+        }
+
+        fn vars_for(parent: &ParentRuntimeEnvironment) -> Vec<(&'static str, OsString)> {
+            lemonade_process_environment_vars(&LemonadeProcessEnvironment::default(), parent)
+                .expect("building the child environment must succeed")
+        }
+
+        fn assert_private_dir(dir: &Path) {
+            use std::os::unix::fs::PermissionsExt;
+            assert!(
+                dir.is_dir(),
+                "{} must exist before the server is spawned",
+                dir.display()
+            );
+            let mode = fs::metadata(dir).expect("metadata").permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                0o700,
+                "{} must be private to this user",
+                dir.display()
+            );
+        }
+
+        /// Regression: on a headless host `pam_systemd` never runs, so
+        /// `XDG_RUNTIME_DIR` is unset and the Lemonade server exits during
+        /// startup with "Unable to resolve writable runtime directory". The
+        /// child must be handed a directory that already exists.
+        #[test]
+        fn is_synthesized_when_the_parent_has_none() {
+            let scratch = tempfile::tempdir().expect("scratch");
+            let home = scratch.path().join("home");
+            let parent = ParentRuntimeEnvironment {
+                xdg_runtime_dir: None,
+                home: Some(home.clone().into_os_string()),
+                user: Some("alice".to_owned()),
+                temp_dir: scratch.path().join("tmp"),
+            };
+
+            let value = value_of(&vars_for(&parent), "XDG_RUNTIME_DIR")
+                .expect("the child must be given a runtime directory");
+
+            // Tier 2 of the shared precedence, with a `lemonade` leaf so the
+            // engine never shares a directory with the telemetry socket.
+            let dir = PathBuf::from(value);
+            assert_eq!(dir, home.join(".rocm").join("data").join("lemonade"));
+            assert_private_dir(&dir);
+        }
+
+        /// An exported-but-empty variable is as good as unset, and must not be
+        /// mistaken for an operator's choice.
+        #[test]
+        fn is_synthesized_when_the_parent_value_is_empty() {
+            let scratch = tempfile::tempdir().expect("scratch");
+            let parent = ParentRuntimeEnvironment {
+                xdg_runtime_dir: Some(OsString::new()),
+                home: Some(scratch.path().join("home").into_os_string()),
+                user: Some("alice".to_owned()),
+                temp_dir: scratch.path().join("tmp"),
+            };
+
+            let value = value_of(&vars_for(&parent), "XDG_RUNTIME_DIR")
+                .expect("an empty value must fall through, not be passed on");
+            assert_eq!(
+                PathBuf::from(value),
+                scratch
+                    .path()
+                    .join("home")
+                    .join(".rocm")
+                    .join("data")
+                    .join("lemonade")
+            );
+        }
+
+        /// Tier 3: neither `XDG_RUNTIME_DIR` nor `HOME` — a user-named subdir of
+        /// the temp dir, so the parent is one we create and own, not `/tmp`.
+        #[test]
+        fn falls_back_to_a_user_owned_temp_subdir_without_home() {
+            let scratch = tempfile::tempdir().expect("scratch");
+            let temp_dir = scratch.path().join("tmp");
+            let parent = ParentRuntimeEnvironment {
+                xdg_runtime_dir: None,
+                home: None,
+                user: Some("alice".to_owned()),
+                temp_dir: temp_dir.clone(),
+            };
+
+            let value = value_of(&vars_for(&parent), "XDG_RUNTIME_DIR")
+                .expect("the child must be given a runtime directory");
+
+            let dir = PathBuf::from(value);
+            assert_eq!(dir, temp_dir.join("rocm-alice").join("lemonade"));
+            assert_private_dir(&dir);
+        }
+
+        /// The tier-3 fallback lands under a shared temp dir, so the target may
+        /// already exist as a symlink someone else planted. Chmod would follow
+        /// it, so the resolver refuses rather than loosening another directory.
+        #[test]
+        fn refuses_a_symlinked_runtime_dir() {
+            let scratch = tempfile::tempdir().expect("scratch");
+            let temp_dir = scratch.path().join("tmp");
+            let elsewhere = scratch.path().join("elsewhere");
+            fs::create_dir_all(temp_dir.join("rocm-alice")).expect("runtime root");
+            fs::create_dir_all(&elsewhere).expect("elsewhere");
+            std::os::unix::fs::symlink(&elsewhere, temp_dir.join("rocm-alice").join("lemonade"))
+                .expect("symlink");
+
+            let parent = ParentRuntimeEnvironment {
+                xdg_runtime_dir: None,
+                home: None,
+                user: Some("alice".to_owned()),
+                temp_dir,
+            };
+            let error = format!(
+                "{:#}",
+                lemonade_process_environment_vars(&LemonadeProcessEnvironment::default(), &parent)
+                    .expect_err("a symlinked runtime dir must be refused")
+            );
+            assert!(error.contains("symlink"), "{error}");
+        }
+
+        /// A value the operator (or systemd) already set is handed to the child
+        /// unchanged: we never relocate a working runtime directory, and never
+        /// create anything of our own beside it.
+        #[test]
+        fn passes_an_existing_parent_value_through_unchanged() {
+            let scratch = tempfile::tempdir().expect("scratch");
+            let existing = scratch.path().join("run").join("user").join("1000");
+            let home = scratch.path().join("home");
+            let parent = ParentRuntimeEnvironment {
+                xdg_runtime_dir: Some(existing.clone().into_os_string()),
+                home: Some(home.clone().into_os_string()),
+                user: Some("alice".to_owned()),
+                temp_dir: scratch.path().join("tmp"),
+            };
+
+            let value = value_of(&vars_for(&parent), "XDG_RUNTIME_DIR")
+                .expect("the child must be given a runtime directory");
+
+            assert_eq!(PathBuf::from(value), existing);
+            assert!(
+                !home.exists(),
+                "no fallback directory may be created when the parent already has one"
+            );
+        }
     }
 }

@@ -218,6 +218,80 @@ pub fn default_cache_dir() -> Option<PathBuf> {
         .or_else(|| project_dirs().map(|dirs| dirs.cache_dir().to_path_buf()))
 }
 
+/// Resolve a writable, user-owned directory for per-user runtime state from
+/// explicit environment inputs.
+///
+/// Runtime state (sockets, lock files, an engine's scratch area) needs a
+/// directory whose *parent* is user-owned, so it can be tightened to mode
+/// `0o700` without the `EPERM` that results from trying to `chmod` a shared,
+/// root-owned `/tmp` (mode `1777`). Precedence:
+///
+/// 1. `$XDG_RUNTIME_DIR` — already mode `0700` on systemd systems, ideal.
+/// 2. `$HOME/.rocm/data/<home_subdir>` — standard per-user data dir.
+/// 3. `temp_dir()/rocm-<user>/<temp_subdir>` — user-named subdir so the parent
+///    is something we create and own, not `/tmp` itself.
+///
+/// Tiers 2 and 3 are not exotic: `$XDG_RUNTIME_DIR` is populated by
+/// `pam_systemd` at login, so it is absent for every non-login process (cron
+/// jobs, CI runners, `systemd-run`, a bare container exec).
+///
+/// The environment is taken as arguments rather than read here so the
+/// precedence is testable without mutating process-global env vars, which is
+/// `unsafe` and racy under parallel tests in edition 2024.
+///
+/// `home_subdir` and `temp_subdir` name the caller's own leaf directory in
+/// tiers 2 and 3; either may be empty when the caller owns that whole tier.
+/// They are separate parameters because tier 2 lands inside the shared
+/// `.rocm/data` tree, where every component needs its own leaf, whereas tier 3
+/// is already under a rocm-private `rocm-<user>` directory.
+pub fn user_runtime_dir(
+    xdg_runtime_dir: Option<OsString>,
+    home: Option<OsString>,
+    user: Option<String>,
+    temp_dir: PathBuf,
+    home_subdir: &str,
+    temp_subdir: &str,
+) -> PathBuf {
+    if let Some(runtime_dir) = xdg_runtime_dir.filter(|value| !value.is_empty()) {
+        return PathBuf::from(runtime_dir);
+    }
+    if let Some(home) = home.filter(|value| !value.is_empty()) {
+        return join_subdir(PathBuf::from(home).join(".rocm").join("data"), home_subdir);
+    }
+    let user_dir = format!("rocm-{}", sanitized_user_path_component(user));
+    join_subdir(temp_dir.join(user_dir), temp_subdir)
+}
+
+fn join_subdir(mut base: PathBuf, subdir: &str) -> PathBuf {
+    if !subdir.is_empty() {
+        base.push(subdir);
+    }
+    base
+}
+
+/// Reduce a user name to a single safe path component: keep only alphanumeric,
+/// hyphen, and underscore so a path separator or `..` in the env var cannot
+/// escape the intended subdirectory. An absent or fully-stripped name yields
+/// `user`.
+fn sanitized_user_path_component(user: Option<String>) -> String {
+    let sanitized: String = user
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "user".to_owned()
+    } else {
+        sanitized
+    }
+}
+
 pub fn managed_runtime_cache_dir(root: &Path) -> PathBuf {
     normalize_runtime_path_for_host(root).join("cache")
 }
