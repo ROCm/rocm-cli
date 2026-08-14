@@ -133,6 +133,12 @@ fn label_for_root_report(dir: &Path) -> String {
         Some("mi300x") => "e2e-gpu-report".to_owned(),
         Some("strix-halo-linux") => "e2e-gpu-strix-ubuntu-report".to_owned(),
         Some("strix-halo-windows") => "e2e-gpu-strix-windows-report".to_owned(),
+        Some("strix-halo-wsl") => "e2e-gpu-strix-wsl-report".to_owned(),
+        // Note the deliberate absence of a bare `wsl` arm. `derive_platform_slug`
+        // emits that for a WSL host with no GPU, and mapping it to the Strix WSL
+        // artifact would assert hardware the run never saw; it falls through to
+        // the neutral label below instead.
+        //
         // Missing sidecar (e.g. a GPU run that errored before writing it) or an
         // unrecognized slug → neutral identity, never a false "Mock".
         _ => "e2e-unknown-report".to_owned(),
@@ -159,6 +165,7 @@ mod tests {
         "e2e-gpu-report",
         "e2e-gpu-strix-ubuntu-report",
         "e2e-gpu-strix-windows-report",
+        "e2e-gpu-strix-wsl-report",
     ];
 
     /// Every `e2e-`-prefixed artifact name an upload step in `file` publishes.
@@ -234,8 +241,8 @@ mod tests {
     #[test]
     fn the_nightly_lanes_publish_the_same_platforms_as_the_per_pr_lanes() {
         // The nightly workflow exists to run *more* scenarios on the *same*
-        // three platforms. If the two ever diverge, the nightly grid is
-        // comparing different hardware than the PR grid without saying so.
+        // platforms. If the two ever diverge, the nightly grid is comparing
+        // different hardware than the PR grid without saying so.
         let lanes = |file: &str| {
             let mut names = uploaded_e2e_artifacts(
                 &Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -288,6 +295,7 @@ mod tests {
             ("mi300x", "e2e-gpu-report"),
             ("strix-halo-linux", "e2e-gpu-strix-ubuntu-report"),
             ("strix-halo-windows", "e2e-gpu-strix-windows-report"),
+            ("strix-halo-wsl", "e2e-gpu-strix-wsl-report"),
             ("mock", "e2e-report"),
         ] {
             let tmp = tempfile::tempdir().expect("tempdir");
@@ -326,17 +334,25 @@ mod tests {
     // An unrecognized slug is likewise neutral, never a false real platform.
     #[test]
     fn discover_root_report_unknown_slug_is_neutral() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path();
-        std::fs::write(root.join("report.json"), "[]").unwrap();
-        std::fs::write(
-            root.join("platform.json"),
-            r#"{"platform_slug":"some-future-gpu"}"#,
-        )
-        .unwrap();
+        for slug in [
+            "some-future-gpu",
+            // `derive_platform_slug` emits a bare `wsl` for a WSL host where no
+            // GPU was found. It must NOT collapse into the Strix WSL artifact:
+            // that lane's report would then claim hardware the run never saw.
+            "wsl",
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let root = tmp.path();
+            std::fs::write(root.join("report.json"), "[]").unwrap();
+            std::fs::write(
+                root.join("platform.json"),
+                format!(r#"{{"platform_slug":"{slug}"}}"#),
+            )
+            .unwrap();
 
-        let got = discover(root).expect("discover");
-        let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["e2e-unknown-report"]);
+            let got = discover(root).expect("discover");
+            let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(names, vec!["e2e-unknown-report"], "slug {slug}");
+        }
     }
 }
