@@ -1040,12 +1040,31 @@ fn sha256_hex(bytes: &[u8]) -> String {
 fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("file path has no parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    let tmp = path.with_extension(format!("tmp-{}", unix_time_millis()));
-    fs::write(&tmp, bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
-    fs::rename(&tmp, path).or_else(|_| {
-        let _ = fs::remove_file(path);
-        fs::rename(&tmp, path)
-    })?;
+    // Preserve the full file name so multi-extension paths keep their
+    // extensions, and remove the temp file on every failure path so repeated
+    // attempts cannot accumulate orphans.
+    let file_name = path
+        .file_name()
+        .context("file path has no file name")?
+        .to_string_lossy()
+        .into_owned();
+    let tmp = parent.join(format!(
+        "{file_name}.tmp-{}-{}",
+        std::process::id(),
+        unix_time_millis()
+    ));
+    if let Err(error) = fs::write(&tmp, bytes) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error).with_context(|| format!("failed to write {}", tmp.display()));
+    }
+    fs::rename(&tmp, path)
+        .or_else(|_| {
+            let _ = fs::remove_file(path);
+            fs::rename(&tmp, path)
+        })
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })?;
     Ok(())
 }
 
@@ -5030,6 +5049,104 @@ mod tests {
     use clap::CommandFactory;
     use rocm_core::ModelRecipeArtifactSourcePolicyRecord;
     use std::path::PathBuf;
+
+    /// Regression: a failed write must not leave a `.tmp-*` scratch file
+    /// behind. The name is unique per attempt, so before this an orphan
+    /// accumulated per retry — and when the failure is a full disk, those
+    /// orphans are exactly what keeps it full.
+    ///
+    /// Provokes the failure by pointing the destination at a non-empty
+    /// directory: the temp file is written, then neither the rename nor the
+    /// replace fallback can succeed. Portable, unlike an out-of-space test.
+    #[test]
+    fn write_file_atomically_cleans_up_temp_when_the_rename_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "rocmd-atomic-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        let occupied = root.join("manifest.json");
+        fs::create_dir_all(occupied.join("nested")).unwrap();
+        fs::write(occupied.join("nested").join("keep"), b"x").unwrap();
+
+        write_file_atomically(&occupied, b"payload")
+            .expect_err("renaming onto a non-empty directory should fail");
+
+        let leftovers: Vec<String> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect();
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            leftovers.is_empty(),
+            "failed write left temp files behind: {leftovers:?}"
+        );
+    }
+
+    /// The temp name keeps every extension, so a cleanup sweep over a cache
+    /// directory can still tell what a leftover was going to be.
+    #[test]
+    fn write_file_atomically_temp_name_preserves_multi_dot_file_names() {
+        let root = std::env::temp_dir().join(format!(
+            "rocmd-atomic-name-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        let occupied = root.join("artifact.tar.gz");
+        fs::create_dir_all(occupied.join("nested")).unwrap();
+        fs::write(occupied.join("nested").join("keep"), b"x").unwrap();
+
+        // Fails after the temp file exists, so the observed name is the real one.
+        write_file_atomically(&occupied, b"payload").expect_err("rename should fail");
+
+        let names: Vec<String> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            names,
+            vec!["artifact.tar.gz".to_owned()],
+            "only the occupied destination should remain"
+        );
+    }
+
+    /// Mirrors the `/dev/shm` reproduction from the original report: a genuine
+    /// ENOSPC, not a rename failure standing in for one.
+    ///
+    /// Ignored by default because it fills `/dev/shm`, which is shared with
+    /// anything else on the host, so it is not safe to run concurrently.
+    #[test]
+    #[ignore = "fills /dev/shm to provoke ENOSPC; not safe to run concurrently"]
+    fn write_file_atomically_cleans_up_temp_on_write_failure() {
+        let shm = Path::new("/dev/shm");
+        if !shm.is_dir() {
+            eprintln!("skipping: /dev/shm unavailable");
+            return;
+        }
+        let dir = shm.join(format!("rocmd-enospc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("manifest.json");
+        // Larger than the tmpfs, so the write is guaranteed to hit ENOSPC.
+        let payload = vec![b'x'; 256 * 1024 * 1024];
+
+        write_file_atomically(&dest, &payload)
+            .expect_err("writing past the end of the filesystem should fail");
+        let leftovers: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let destination_exists = dest.exists();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(
+            leftovers.is_empty(),
+            "failed write left files behind: {leftovers:?}"
+        );
+        assert!(!destination_exists);
+    }
 
     #[test]
     fn last_cr_segment_keeps_final_progress_redraw() {

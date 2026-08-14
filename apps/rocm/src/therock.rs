@@ -2278,20 +2278,49 @@ fn windows_child_path(path: &Path) -> String {
     runtime_path_for_windows_child(path)
 }
 
+/// A unique temp path next to `path`, preserving the full file name so a
+/// multi-extension artifact keeps its extensions (`sdk.tar.gz` becomes
+/// `sdk.tar.gz.tmp-<id>`, where `with_extension` would drop `.gz`).
+fn temp_sibling_path(path: &Path) -> Result<PathBuf> {
+    let parent = path.parent().context("file path has no parent directory")?;
+    let file_name = path
+        .file_name()
+        .context("file path has no file name")?
+        .to_string_lossy()
+        .into_owned();
+    Ok(parent.join(format!(
+        "{file_name}.tmp-{}-{}",
+        std::process::id(),
+        unix_time_millis()
+    )))
+}
+
 fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("file path has no parent directory")?;
     fs::create_dir_all(parent)?;
-    let tmp = path.with_extension(format!("tmp-{}", unix_time_millis()));
-    {
+    let tmp = temp_sibling_path(path)?;
+    // Clean up the temp file on every failure path. It carries a unique
+    // name, so leaving it behind would accumulate a fresh orphan per attempt —
+    // and when the failure is a full disk, those orphans are what keep it full.
+    let write_result = (|| -> Result<()> {
         let mut file = fs::File::create(&tmp)
             .with_context(|| format!("failed to create {}", tmp.display()))?;
         file.write_all(bytes)
             .map_err(|error| disk_space::map_write_error(error, &tmp))?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
     }
-    fs::rename(&tmp, path).or_else(|_| {
-        let _ = fs::remove_file(path);
-        fs::rename(&tmp, path)
-    })?;
+    fs::rename(&tmp, path)
+        .or_else(|_| {
+            let _ = fs::remove_file(path);
+            fs::rename(&tmp, path)
+        })
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })?;
     Ok(())
 }
 
@@ -3357,6 +3386,100 @@ mod tests {
         );
         let text = format!("{error:#}");
         assert!(text.contains("ran out of disk space"), "{text}");
+    }
+
+    /// The temp name keeps every extension, so a cleanup sweep over a cache
+    /// directory can still tell what a leftover was going to be.
+    #[test]
+    fn temp_sibling_path_preserves_multi_dot_file_names() {
+        let temp = temp_sibling_path(Path::new("/tmp/cache/sdk.tar.gz")).unwrap();
+        let name = temp.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with("sdk.tar.gz.tmp-"),
+            "expected the full name to be preserved, got {name}"
+        );
+        assert_eq!(temp.parent().unwrap(), Path::new("/tmp/cache"));
+    }
+
+    /// Regression: a failed write must not leave a `.tmp-*` scratch file
+    /// behind. The name is unique per attempt, so before this an orphan
+    /// accumulated per retry — and when the failure is a full disk, those
+    /// orphans are exactly what keeps it full.
+    ///
+    /// Provokes the failure by pointing the destination at a non-empty
+    /// directory: the temp file is written, then neither the rename nor the
+    /// replace fallback can succeed. Portable, unlike an out-of-space test.
+    #[test]
+    fn write_file_atomically_cleans_up_temp_when_the_rename_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-atomic-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        let occupied = root.join("sdk.tar.gz");
+        fs::create_dir_all(occupied.join("nested")).unwrap();
+        fs::write(occupied.join("nested").join("keep"), b"x").unwrap();
+
+        write_file_atomically(&occupied, b"payload")
+            .expect_err("renaming onto a non-empty directory should fail");
+
+        let leftovers: Vec<String> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect();
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            leftovers.is_empty(),
+            "failed write left temp files behind: {leftovers:?}"
+        );
+    }
+
+    /// Mirrors the `/dev/shm` reproduction from the original report: a genuine
+    /// ENOSPC, not a rename failure standing in for one.
+    ///
+    /// Ignored by default because it fills `/dev/shm`, which is shared with
+    /// anything else on the host, so it is not safe to run concurrently. Run
+    /// with `cargo test -p rocm -- --ignored write_file_atomically_cleans_up`.
+    #[test]
+    #[ignore = "fills /dev/shm to provoke ENOSPC; not safe to run concurrently"]
+    fn write_file_atomically_cleans_up_temp_on_write_failure() {
+        let shm = Path::new("/dev/shm");
+        if !shm.is_dir() {
+            eprintln!("skipping: /dev/shm unavailable");
+            return;
+        }
+        let dir = shm.join(format!("rocm-enospc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("artifact.tar.gz");
+        // Larger than the tmpfs, so the write is guaranteed to hit ENOSPC.
+        let payload = vec![0u8; 256 * 1024 * 1024];
+
+        let mut failures = Vec::new();
+        for _ in 0..2 {
+            write_file_atomically(&dest, &payload)
+                .expect_err("writing past the end of the filesystem should fail");
+            failures.push(
+                fs::read_dir(&dir)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let destination_exists = dest.exists();
+        let _ = fs::remove_dir_all(&dir);
+
+        for leftovers in &failures {
+            assert!(
+                leftovers.is_empty(),
+                "failed write left files behind: {leftovers:?}"
+            );
+        }
+        assert!(
+            !destination_exists,
+            "destination must not exist after failure"
+        );
     }
 
     #[test]
