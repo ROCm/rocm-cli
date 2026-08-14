@@ -115,6 +115,12 @@ pub struct DaemonConfig {
 /// 2. `$HOME/.rocm/data/telemetry` — standard per-user data dir.
 /// 3. `temp_dir()/rocm-<user>` — user-named subdir so the parent is something
 ///    the daemon creates and owns, not `/tmp` itself.
+///
+/// In `rocm-core` the tier chain is shared as `runtime::user_runtime_dir`. This
+/// crate keeps its own copy on purpose: it is a standalone library with a
+/// deliberately lean dependency set, and depending on `rocm-core` to share ~30
+/// lines would pull in that crate's whole graph. Keep the two in sync — the
+/// tests below mirror `rocm-core`'s so a divergence is caught.
 fn default_socket() -> String {
     let path = socket_path(
         std::env::var_os("XDG_RUNTIME_DIR"),
