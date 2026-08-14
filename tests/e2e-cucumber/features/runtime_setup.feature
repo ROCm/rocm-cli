@@ -19,6 +19,20 @@ Feature: Runtime configuration
     When the user inspects the system
     Then the managed runtime folder path is not recursively nested
 
+  # The SDK and the engine share one Python environment, so a second
+  # `install sdk` wrote the SDK's torch stack over the build the engine pins. The
+  # engine still resolved, so the install reported success and every health surface
+  # kept saying `ready` — the first signal was a serve failure naming neither. Needs
+  # a real SDK install, a real engine install, and a second SDK install, so it runs
+  # on the nightly GPU lane. `@requires-engine:vllm` because only vLLM shares the
+  # runtime environment; Lemonade manages its own.
+  @id:runtime-sdk-reinstall-keeps-engine-consistent @requires-gpu @requires-engine:vllm @nightly
+  Scenario: 4 - Reinstalling the SDK leaves the installed engine's requirements satisfied
+    Given a managed runtime with an inference engine already installed
+    When the user installs the SDK again
+    Then the install reports the engine's requirements as satisfied
+    And the engine is still ready to serve
+
   # Linux-only: the step adopts a standard `/opt/rocm` install with a Unix python
   # path. On Windows those paths don't exist (the CLI resolves `/usr/bin/python3`
   # to a bogus `C:/usr/bin/python3` and errors on the missing path before it can
