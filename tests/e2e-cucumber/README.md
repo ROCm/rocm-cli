@@ -146,9 +146,9 @@ Ubuntu distro under WSL2 on the Strix Halo box, so it is the only lane that
 exercises `@requires-wsl` scenarios; `@requires-bare-metal` scenarios resolve to
 skip there.
 
-The nightly workflow runs three non-blocking jobs — the existing MI300X job and
-new Strix Halo jobs on Ubuntu and Windows — with `E2E_INCLUDE_NIGHTLY=1`, then
-consolidates them into the same cross-platform grid. The
+The nightly workflow runs four non-blocking jobs — MI300X plus Strix Halo on
+Ubuntu, Windows, and WSL2 — with `E2E_INCLUDE_NIGHTLY=1`, then consolidates them
+into the same cross-platform grid. The
 shared large-model scenario serves `Qwen/Qwen3.6-27B` through vLLM on MI300X and
 the hardware-verified `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL` checkpoint
 through Lemonade on Strix Halo.

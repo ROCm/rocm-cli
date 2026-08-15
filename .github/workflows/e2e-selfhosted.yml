@@ -688,6 +688,8 @@ jobs:
       # Match the other hardware lanes: opt into the platform-adaptive
       # large-model scenario only when the manual include_nightly input is on.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
+      # Heavy @merge-queue serves run only in the merge queue; see e2e-gpu.
+      E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

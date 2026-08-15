@@ -17,6 +17,7 @@
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
     fn repo_root() -> PathBuf {
@@ -127,6 +128,112 @@ mod tests {
             .expect("workflow declares a top-level name:")
     }
 
+    /// Extract one top-level job's complete YAML block by its job id.
+    fn job_block<'a>(text: &'a str, job: &str) -> &'a str {
+        let marker = format!("  {job}:\n");
+        let start = text
+            .find(&marker)
+            .unwrap_or_else(|| panic!("workflow defines job `{job}`"));
+        let rest = &text[start + marker.len()..];
+        let end = rest
+            .match_indices("\n  ")
+            .find_map(|(i, _)| {
+                rest[i + 1..]
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.starts_with("  ") && !line.starts_with("    "))
+                    .then_some(i)
+            })
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// Extract the direct scalar entries from a named job-level mapping such as
+    /// `env:`. Nested step mappings cannot satisfy this extractor.
+    fn job_mapping(block: &str, mapping: &str) -> BTreeMap<String, String> {
+        let marker = format!("{mapping}:");
+        let lines: Vec<&str> = block.lines().collect();
+        let (start, mapping_indent) = lines
+            .iter()
+            .enumerate()
+            .find_map(|(i, line)| {
+                (line.trim() == marker && indent_of(line) == 4).then_some((i, indent_of(line)))
+            })
+            .unwrap_or_else(|| panic!("job defines top-level mapping `{mapping}`"));
+
+        let mut entries = BTreeMap::new();
+        for raw in &lines[start + 1..] {
+            if raw.trim().is_empty() || raw.trim_start().starts_with('#') {
+                continue;
+            }
+            let line = strip_comment(raw);
+            let indent = indent_of(line);
+            if indent <= mapping_indent {
+                break;
+            }
+            if indent != mapping_indent + 2 {
+                continue;
+            }
+            let (key, raw_value) = line
+                .trim()
+                .split_once(':')
+                .unwrap_or_else(|| panic!("mapping entry has a scalar value: `{line}`"));
+            let value = raw_value.trim();
+            let value = value
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+                .unwrap_or(value);
+            assert!(
+                entries.insert(key.to_owned(), value.to_owned()).is_none(),
+                "mapping `{mapping}` contains duplicate key `{key}`"
+            );
+        }
+        entries
+    }
+
+    fn markdown_table_rows(text: &str, header: &str) -> Vec<Vec<String>> {
+        let mut lines = text.lines().skip_while(|line| *line != header);
+        assert_eq!(
+            lines.next(),
+            Some(header),
+            "markdown table `{header}` exists"
+        );
+        let separator = lines.next().expect("markdown table has a separator row");
+        assert!(
+            separator.starts_with("|---"),
+            "markdown table has a separator row"
+        );
+        lines
+            .take_while(|line| line.starts_with('|'))
+            .map(|line| {
+                line.trim_matches('|')
+                    .split('|')
+                    .map(|cell| cell.trim().to_owned())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn backticked_list_between(text: &str, prefix: &str, suffix: &str) -> Vec<String> {
+        let section = text
+            .split_once(prefix)
+            .unwrap_or_else(|| panic!("section starts with `{prefix}`"))
+            .1
+            .split_once(suffix)
+            .unwrap_or_else(|| panic!("section ends with `{suffix}`"))
+            .0;
+        section
+            .split('`')
+            .enumerate()
+            .filter_map(|(i, item)| (i % 2 == 1).then_some(item.to_owned()))
+            .collect()
+    }
+
+    fn normalized_whitespace(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
     #[test]
     fn ci_yml_schedules_no_self_hosted_job() {
         let ci = read_workflow("ci.yml");
@@ -166,6 +273,89 @@ mod tests {
                 "e2e-selfhosted.yml must define the self-hosted job `{job}` (EAI-7548)"
             );
         }
+    }
+
+    #[test]
+    fn self_hosted_wsl_enables_merge_queue_scenarios_only_for_merge_group() {
+        let sh = read_workflow("e2e-selfhosted.yml");
+        let wsl = job_block(&sh, "e2e-wsl");
+        let env = job_mapping(wsl, "env");
+        assert_eq!(
+            env.get("E2E_MERGE_QUEUE").map(String::as_str),
+            Some("${{ github.event_name == 'merge_group' && '1' || '' }}"),
+            "e2e-wsl's job-level env must opt into @merge-queue scenarios for merge_group only"
+        );
+
+        let nightly = read_workflow("nightly.yml");
+        let nightly_wsl = job_block(&nightly, "e2e-wsl-nightly");
+        let nightly_env = job_mapping(nightly_wsl, "env");
+        assert!(
+            !nightly_env.contains_key("E2E_MERGE_QUEUE"),
+            "the nightly WSL job cannot receive merge_group events and must not opt into @merge-queue scenarios"
+        );
+    }
+
+    #[test]
+    fn hardware_testing_docs_cover_all_four_self_hosted_platforms() {
+        let docs = std::fs::read_to_string(repo_root().join("docs/ci-hardware-testing.md"))
+            .expect("read hardware testing docs");
+        let rows = markdown_table_rows(&docs, "| Job | Workflow | Platform | Runner labels |");
+        let self_hosted_job_platforms: Vec<(String, String)> = rows
+            .into_iter()
+            .filter(|row| {
+                row.get(1)
+                    .is_some_and(|workflow| workflow == "`e2e-selfhosted.yml`")
+            })
+            .map(|row| (row[0].clone(), row[2].clone()))
+            .collect();
+        assert_eq!(
+            self_hosted_job_platforms,
+            vec![
+                (
+                    "`e2e-gpu`".to_owned(),
+                    "MI300X (AMD Instinct, bare-metal Linux)".to_owned(),
+                ),
+                (
+                    "`e2e-gpu-strix-ubuntu`".to_owned(),
+                    "Strix Halo (gfx1151) on Ubuntu".to_owned(),
+                ),
+                (
+                    "`e2e-gpu-strix-windows`".to_owned(),
+                    "Strix Halo (gfx1151) on native Windows 11".to_owned(),
+                ),
+                (
+                    "`e2e-wsl`".to_owned(),
+                    "Strix Halo (gfx1151) on Ubuntu under WSL2".to_owned(),
+                ),
+            ],
+            "hardware testing table must document the four actual self-hosted job/platform rows"
+        );
+
+        let artifacts = backticked_list_between(
+            &docs,
+            "The lane artifacts are named canonically (",
+            ") in every workflow",
+        );
+        assert_eq!(
+            artifacts,
+            vec![
+                "e2e-report",
+                "e2e-gpu-report",
+                "e2e-gpu-strix-ubuntu-report",
+                "e2e-gpu-strix-windows-report",
+                "e2e-gpu-strix-wsl-report",
+            ],
+            "the canonical artifact list must enumerate every report platform exactly once"
+        );
+
+        let readme = std::fs::read_to_string(repo_root().join("tests/e2e-cucumber/README.md"))
+            .expect("read E2E README");
+        assert!(
+            normalized_whitespace(&readme).contains(
+                "The nightly workflow runs four non-blocking jobs — MI300X plus Strix Halo on Ubuntu, Windows, and WSL2 — with `E2E_INCLUDE_NIGHTLY=1`"
+            ),
+            "E2E README must identify all four nightly job platforms"
+        );
     }
 
     #[test]
@@ -249,5 +439,28 @@ permissions:
         assert!(g.contains("github.run_id"));
         // Must stop at the next key, not swallow permissions.
         assert!(!g.contains("permissions"));
+    }
+
+    #[test]
+    fn job_mapping_extractor_ignores_nested_step_env() {
+        let block = "    env:\n      TOP_LEVEL: \"expected\"\n    steps:\n      - name: nested\n        env:\n          E2E_MERGE_QUEUE: wrong\n";
+        let env = job_mapping(block, "env");
+        assert_eq!(env.get("TOP_LEVEL").map(String::as_str), Some("expected"));
+        assert!(!env.contains_key("E2E_MERGE_QUEUE"));
+    }
+
+    #[test]
+    fn job_mapping_extractor_ignores_blank_and_full_line_comments() {
+        let block = "    env:\n      BEFORE: one\n\n# a YAML comment may be less indented than the mapping\n      # or aligned with its entries\n      AFTER: two\n    steps:\n";
+        let env = job_mapping(block, "env");
+        assert_eq!(env.get("BEFORE").map(String::as_str), Some("one"));
+        assert_eq!(env.get("AFTER").map(String::as_str), Some("two"));
+    }
+
+    #[test]
+    #[should_panic(expected = "mapping entry has a scalar value")]
+    fn job_mapping_extractor_rejects_malformed_non_comment_rows() {
+        let block = "    env:\n      VALID: one\n      MALFORMED\n    steps:\n";
+        let _ = job_mapping(block, "env");
     }
 }
