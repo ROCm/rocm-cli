@@ -877,7 +877,7 @@ reason = "unrelated open bug"
     #[test]
     fn vllm_pinned_scenario_skips_where_vllm_cannot_start() {
         let m = Expectations::default();
-        // Scenario 5-style: pins vLLM.
+        // The feature-qualified `serve-vllm-inference` scenario pins vLLM.
         let d = decl(&[
             "id:serve-vllm-inference",
             "requires-gpu",
