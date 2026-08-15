@@ -33,8 +33,9 @@ Feature: Model serving
   # deliberate vLLM half of a per-engine pair with `serve-lemonade-inference`
   # below, so it stays pinned to vLLM (the slug names the engine). It is also the
   # vLLM per-PR canary: one real vLLM serve runs on every PR so a broken serve is
-  # caught before merge, while the heavier `@merge-queue` serves (6, 6b, 8) run
-  # only in the merge queue.
+  # caught before merge, while the heavier `@merge-queue` serves
+  # (`serve-default-engine-working-endpoint`, `serve-default-engine-inference`,
+  # and `serve-readiness-contract`) run only in the merge queue.
   @id:serve-vllm-inference @requires-gpu @requires-engine:vllm
   Scenario: serve-05 - A served model responds to inference requests on vLLM
     Given a managed runtime is active

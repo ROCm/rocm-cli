@@ -1525,7 +1525,7 @@ fn expectation_grid_markdown(
 /// Render the Scenario reference section: each scenario `@id` with its actual
 /// Gherkin scenario (name + steps), anchored by the id (`##### <id>` → GitHub
 /// anchor `#<id>`) so the grid's id links resolve. Grouped by feature and ordered
-/// like the grid. Empty when no scenarios are known.
+/// like the grid. Empty when no expectation grid exists.
 fn scenario_reference_markdown(
     inputs: &[(String, PathBuf)],
     scenarios: &std::collections::BTreeMap<String, (String, Vec<String>)>,
@@ -1535,7 +1535,7 @@ fn scenario_reference_markdown(
     // Only emit when there is a grid to reference (platform.json sidecars present),
     // matching where the id links are generated.
     let grid = Grid::build(inputs);
-    if scenarios.is_empty() || grid.is_empty() {
+    if grid.is_empty() {
         return String::new();
     }
 
@@ -2750,6 +2750,40 @@ mod tests {
         assert!(
             md.contains("_Not run on any platform in this run._"),
             "a never-run scenario should say so instead of showing no steps:\n{md}"
+        );
+    }
+
+    #[test]
+    fn scenario_reference_anchors_grid_when_report_has_no_scenarios() {
+        let report = feature_json(&[]);
+        let platform = r#"{
+            "platform_slug": "mock",
+            "capability": {"effective_serve_engine": "none"},
+            "expectations": [
+                {"id":"serve-a","feature":"Serving","scenario":"serve-01 - first skipped","expected":"skip"},
+                {"id":"serve-b","feature":"Serving","scenario":"serve-02 - second skipped","expected":"skip"}
+            ]
+        }"#;
+        let (_d, path) = write_platform(&report, platform);
+        let md = consolidated_summary_markdown(&[("mock".to_string(), path)]);
+
+        for (id, name) in [
+            ("serve-a", "serve-01 - first skipped"),
+            ("serve-b", "serve-02 - second skipped"),
+        ] {
+            assert!(
+                md.contains(&format!("{name}<br>[`{id}`](#{id})")),
+                "grid link should use the manifest name for {id}:\n{md}"
+            );
+            assert!(
+                md.contains(&format!("##### {id}")),
+                "grid link for {id} should have a Scenario reference anchor:\n{md}"
+            );
+        }
+        assert_eq!(
+            md.matches("_Not run on any platform in this run._").count(),
+            2,
+            "each all-skipped reference entry should explain that it was not run:\n{md}"
         );
     }
 
