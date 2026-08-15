@@ -11,10 +11,12 @@
 use std::path::PathBuf;
 
 use cucumber::{World as _, WriterExt as _};
+use e2e_cucumber::loopback_http::LoopbackServer;
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use tempfile::TempDir;
 
 mod e2e {
+    pub mod artifact_steps;
     pub mod bench_steps;
     pub mod chat_steps;
     pub mod dash_steps;
@@ -32,6 +34,11 @@ mod e2e {
 #[derive(Debug, cucumber::World)]
 pub struct E2eWorld {
     pub mock: Option<MockServer>,
+    /// Loopback file server used by artifact-prefetch scenarios. Kept on the
+    /// World so it remains alive while the real `rocmd` subprocess downloads.
+    pub artifact_server: Option<LoopbackServer>,
+    /// Cache-marker destination discovered from `rocmd`'s own JSON report.
+    pub artifact_marker_path: Option<PathBuf>,
     pub endpoint: Option<String>,
     pub model_name: Option<String>,
     pub chat_response: Option<serde_json::Value>,
@@ -165,6 +172,8 @@ impl Default for E2eWorld {
 
         Self {
             mock: None,
+            artifact_server: None,
+            artifact_marker_path: None,
             endpoint: None,
             model_name: None,
             chat_response: None,
@@ -370,6 +379,7 @@ impl Drop for E2eWorld {
         if let Some(mock) = self.mock.take() {
             mock.stop();
         }
+        self.artifact_server.take();
         // A scenario that ran `rocm serve --managed` left a DETACHED supervisor +
         // engine process (vLLM / llama-server) that outlives this harness — the
         // TempDir drop below removes the on-disk record but never kills those
