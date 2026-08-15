@@ -1,0 +1,177 @@
+name: Commit Dependabot manifests
+
+# Privileged half of dependabot-manifests.yml. workflow_run uses the workflow
+# definition from the default branch, so this job never checks out or executes
+# code from the pull request. Its only untrusted input is the completed run's
+# artifact, whose contents are committed to two fixed paths after all PR and
+# artifact provenance checks pass.
+on:
+  workflow_run:
+    workflows:
+      - Dependabot manifests
+    types:
+      - completed
+
+# No ambient access: the single job opts in to the API capabilities it needs.
+permissions: {}
+
+concurrency:
+  group: dependabot-manifests-commit-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
+jobs:
+  commit:
+    name: Commit regenerated manifests
+    if: >-
+      github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.actor.login == 'dependabot[bot]'
+      && github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Validate trigger, pull request, head, and artifact
+        id: guard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_JSON: ${{ toJson(github.event.workflow_run) }}
+        run: |
+          set -euo pipefail
+
+          actor=$(jq -r '.actor.login // empty' <<<"$RUN_JSON")
+          event=$(jq -r '.event // empty' <<<"$RUN_JSON")
+          associated_count=$(jq '.pull_requests | length' <<<"$RUN_JSON")
+          run_id=$(jq -r '.id // empty' <<<"$RUN_JSON")
+          run_sha=$(jq -r '.head_sha // empty' <<<"$RUN_JSON")
+          event_pr=$(jq -r '.pull_requests[0].number // empty' <<<"$RUN_JSON")
+
+          if [[ "$actor" != "dependabot[bot]" || "$event" != "pull_request" ]]; then
+            echo "Refusing non-Dependabot or non-pull_request workflow run." >&2
+            exit 1
+          fi
+          if [[ "$associated_count" -ne 1 || -z "$event_pr" || -z "$run_id" || -z "$run_sha" ]]; then
+            echo "Refusing workflow run without exactly one associated pull request." >&2
+            exit 1
+          fi
+
+          live_prs=$(gh api --paginate --slurp \
+            "repos/$REPO/commits/$run_sha/pulls?per_page=100" \
+            | jq '[.[][] | select(.state == "open")]')
+          if [[ $(jq 'length' <<<"$live_prs") -ne 1 ]]; then
+            echo "Refusing head without exactly one live associated pull request." >&2
+            exit 1
+          fi
+
+          pull=$(jq '.[0]' <<<"$live_prs")
+          pull_number=$(jq -r '.number' <<<"$pull")
+          head_repo=$(jq -r '.head.repo.full_name // empty' <<<"$pull")
+          head_ref=$(jq -r '.head.ref // empty' <<<"$pull")
+          head_sha=$(jq -r '.head.sha // empty' <<<"$pull")
+          if [[ "$pull_number" != "$event_pr" \
+            || "$head_repo" != "$REPO" \
+            || "$head_ref" != dependabot/* \
+            || "$head_sha" != "$run_sha" ]]; then
+            echo "Refusing pull request whose live head does not match the trusted run." >&2
+            exit 1
+          fi
+
+          artifacts=$(gh api \
+            "repos/$REPO/actions/runs/$run_id/artifacts?name=regenerated-manifests&per_page=100" \
+            | jq '[.artifacts[] | select(.name == "regenerated-manifests" and .expired == false)]')
+          artifact_count=$(jq 'length' <<<"$artifacts")
+          if [[ "$artifact_count" -gt 1 ]]; then
+            echo "Refusing workflow run with multiple regenerated-manifests artifacts." >&2
+            exit 1
+          fi
+          if [[ "$artifact_count" -eq 0 ]]; then
+            echo "No changed generated files were uploaded; nothing to commit."
+            echo "has_artifact=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "has_artifact=true" >> "$GITHUB_OUTPUT"
+          echo "artifact_id=$(jq -r '.[0].id' <<<"$artifacts")" >> "$GITHUB_OUTPUT"
+          echo "branch=$head_ref" >> "$GITHUB_OUTPUT"
+          echo "expected_head=$run_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Download the triggering run's artifact
+        if: steps.guard.outputs.has_artifact == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ARTIFACT_ID: ${{ steps.guard.outputs.artifact_id }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/actions/artifacts/$ARTIFACT_ID/zip" > regenerated.zip
+
+      - name: Extract only the two generated files
+        if: steps.guard.outputs.has_artifact == 'true'
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from stat import S_ISREG
+          from zipfile import ZipFile
+
+          expected = {"MANIFEST.md", "THIRD_PARTY_NOTICES.txt"}
+          destination = Path("regenerated")
+          destination.mkdir()
+          with ZipFile("regenerated.zip") as archive:
+              entries = archive.infolist()
+              if len(entries) != 2 or {entry.filename for entry in entries} != expected:
+                  raise SystemExit("artifact must contain exactly the two generated files")
+              for entry in entries:
+                  mode = entry.external_attr >> 16
+                  if (mode != 0 and not S_ISREG(mode)) or entry.file_size > 10 * 1024 * 1024:
+                      raise SystemExit(f"unsafe artifact entry: {entry.filename}")
+                  (destination / entry.filename).write_bytes(archive.read(entry))
+          PY
+
+      # createCommitOnBranch produces a GitHub web-flow-signed commit. The DCO
+      # trailer below covers sign-off, and expectedHeadOid closes the race if
+      # Dependabot updates the branch after the live-head validation.
+      - name: Commit to the pull request branch
+        if: steps.guard.outputs.has_artifact == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ steps.guard.outputs.branch }}
+          EXPECTED_HEAD: ${{ steps.guard.outputs.expected_head }}
+        run: |
+          set -euo pipefail
+
+          base64 -w0 regenerated/MANIFEST.md > manifest.b64
+          base64 -w0 regenerated/THIRD_PARTY_NOTICES.txt > tpn.b64
+
+          jq -n \
+            --arg repo "$REPO" \
+            --arg branch "$BRANCH" \
+            --arg oid "$EXPECTED_HEAD" \
+            --rawfile manifest manifest.b64 \
+            --rawfile tpn tpn.b64 \
+            '{
+              query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",
+              variables: {
+                input: {
+                  branch: {
+                    repositoryNameWithOwner: $repo,
+                    branchName: $branch
+                  },
+                  expectedHeadOid: $oid,
+                  message: {
+                    headline: "build(deps): regenerate MANIFEST.md and THIRD_PARTY_NOTICES.txt",
+                    body: "Generated by `cargo xtask manifest` and `cargo xtask tpn` for the dependency change in this pull request.\n\nSigned-off-by: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+                  },
+                  fileChanges: {
+                    additions: [
+                      { path: "MANIFEST.md", contents: $manifest },
+                      { path: "THIRD_PARTY_NOTICES.txt", contents: $tpn }
+                    ]
+                  }
+                }
+              }
+            }' > payload.json
+
+          gh api graphql --input payload.json

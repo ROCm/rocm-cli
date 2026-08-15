@@ -127,6 +127,160 @@ mod tests {
             .expect("workflow declares a top-level name:")
     }
 
+    /// Extract a top-level YAML value/block, stopping at the next column-zero
+    /// key or comment. This is deliberately small: workflow contract tests
+    /// inspect only checked-in files with the repository's established layout.
+    fn top_level_block(text: &str, key: &str) -> String {
+        let marker = format!("{key}:");
+        let lines: Vec<&str> = text.lines().collect();
+        let start = lines
+            .iter()
+            .position(|line| line.starts_with(&marker))
+            .unwrap_or_else(|| panic!("workflow declares a top-level {marker}"));
+        let end = lines[start + 1..]
+            .iter()
+            .position(|line| !line.is_empty() && !line.starts_with(char::is_whitespace))
+            .map_or(lines.len(), |offset| start + 1 + offset);
+        let mut block = lines[start]
+            .strip_prefix(&marker)
+            .expect("top-level key prefix was just matched")
+            .to_owned();
+        for line in &lines[start + 1..end] {
+            block.push('\n');
+            block.push_str(line);
+        }
+        block
+    }
+
+    #[test]
+    fn dependabot_pull_request_workflow_is_strictly_read_only() {
+        let generator = read_workflow("dependabot-manifests.yml");
+        let trigger = top_level_block(&generator, "on");
+        let permissions = top_level_block(&generator, "permissions");
+        let jobs = top_level_block(&generator, "jobs");
+
+        assert!(trigger.contains("pull_request:"));
+        assert_eq!(permissions.trim(), "{}");
+        assert!(jobs.contains("contents: read"));
+        assert!(jobs.contains("actions/upload-artifact@"));
+        assert!(jobs.contains("MANIFEST.md"));
+        assert!(jobs.contains("THIRD_PARTY_NOTICES.txt"));
+        assert!(
+            !jobs.contains("contents: write")
+                && !jobs.contains("createCommitOnBranch")
+                && !jobs.contains("Commit regenerated manifests"),
+            "a Dependabot pull_request run receives a read-only GITHUB_TOKEN; it must only \
+             generate and upload the bounded manifest artifact, never contain a write job"
+        );
+    }
+
+    #[test]
+    fn dependabot_manifest_commit_is_a_guarded_workflow_run_follow_up() {
+        let follow_up = read_workflow("dependabot-manifests-commit.yml");
+        let trigger = top_level_block(&follow_up, "on");
+        let permissions = top_level_block(&follow_up, "permissions");
+        let jobs = top_level_block(&follow_up, "jobs");
+
+        assert!(trigger.contains("workflow_run:"));
+        assert!(trigger.contains("Dependabot manifests"));
+        assert!(trigger.contains("completed"));
+        assert_eq!(permissions.trim(), "{}");
+        assert!(jobs.contains("actions: read"));
+        assert!(jobs.contains("contents: write"));
+        assert!(jobs.contains("pull-requests: read"));
+        for required_job_gate in [
+            "github.event.workflow_run.conclusion == 'success'",
+            "github.event.workflow_run.actor.login == 'dependabot[bot]'",
+            "github.event.workflow_run.event == 'pull_request'",
+        ] {
+            assert!(
+                jobs.contains(required_job_gate),
+                "privileged job gate is missing semantic clause `{required_job_gate}`"
+            );
+        }
+
+        for required_guard in [
+            "dependabot[bot]",
+            "pull_request",
+            ".pull_requests | length",
+            "commits/$run_sha/pulls",
+            "select(.state == \"open\")",
+            ".head.repo.full_name",
+            "dependabot/*",
+            ".head.sha",
+            "!= \"$run_sha\"",
+        ] {
+            assert!(
+                jobs.contains(required_guard),
+                "follow-up workflow is missing fail-closed guard `{required_guard}`"
+            );
+        }
+
+        assert!(
+            jobs.contains("actions/runs/$run_id/artifacts?name=regenerated-manifests&per_page=100")
+        );
+        assert!(jobs.contains("select(.name == \"regenerated-manifests\""));
+        assert!(jobs.contains("artifact_id=$(jq -r '.[0].id'"));
+        assert!(jobs.contains("actions/artifacts/$ARTIFACT_ID/zip"));
+        assert!(!jobs.contains("actions/download-artifact@"));
+        assert!(jobs.contains("artifact_count\" -gt 1"));
+        assert!(jobs.contains("artifact must contain exactly the two generated files"));
+        assert!(jobs.contains("from stat import S_ISREG"));
+        assert!(jobs.contains("mode != 0 and not S_ISREG(mode)"));
+        assert!(jobs.contains("entry.file_size > 10 * 1024 * 1024"));
+        assert!(jobs.contains("(destination / entry.filename).write_bytes(archive.read(entry))"));
+        assert!(!jobs.contains("archive.extract("));
+        assert!(!jobs.contains("archive.extractall("));
+        assert_eq!(
+            jobs.matches("regenerated/").count(),
+            2,
+            "artifact files may only be read by the two fixed-path base64 commands"
+        );
+        assert!(jobs.contains("base64 -w0 regenerated/MANIFEST.md > manifest.b64"));
+        assert!(jobs.contains("base64 -w0 regenerated/THIRD_PARTY_NOTICES.txt > tpn.b64"));
+        for forbidden_execution in [
+            "bash regenerated/",
+            "sh regenerated/",
+            "python3 regenerated/",
+            "source regenerated/",
+            "chmod +x regenerated/",
+            "./regenerated/",
+            "subprocess",
+            "os.system",
+        ] {
+            assert!(
+                !jobs.contains(forbidden_execution),
+                "the write-scoped follow-up must not execute artifact content via \
+                 `{forbidden_execution}`"
+            );
+        }
+        assert!(jobs.contains("expectedHeadOid"));
+        assert!(jobs.contains("EXPECTED_HEAD"));
+        assert!(jobs.contains("Signed-off-by: github-actions[bot]"));
+        assert!(jobs.contains("{ path: \"MANIFEST.md\", contents: $manifest }"));
+        assert!(jobs.contains("{ path: \"THIRD_PARTY_NOTICES.txt\", contents: $tpn }"));
+        assert_eq!(
+            jobs.matches("{ path:").count(),
+            2,
+            "createCommitOnBranch must add exactly the two generated paths"
+        );
+        assert!(!jobs.contains("deletions:"));
+        assert!(
+            !jobs.contains("actions/checkout@"),
+            "the write-scoped workflow_run follow-up must never check out or execute PR code"
+        );
+        assert!(
+            !follow_up.contains("pull_request_target"),
+            "the privileged follow-up must use workflow_run, never pull_request_target"
+        );
+
+        let generator = read_workflow("dependabot-manifests.yml");
+        assert!(generator.contains(
+            "https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/\
+trigger-a-workflow#triggering-a-workflow-from-a-workflow"
+        ));
+    }
+
     #[test]
     fn ci_yml_schedules_no_self_hosted_job() {
         let ci = read_workflow("ci.yml");
