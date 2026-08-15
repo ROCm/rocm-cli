@@ -19,9 +19,10 @@ use rocm_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
@@ -2281,47 +2282,158 @@ fn windows_child_path(path: &Path) -> String {
 /// A unique temp path next to `path`, preserving the full file name so a
 /// multi-extension artifact keeps its extensions (`sdk.tar.gz` becomes
 /// `sdk.tar.gz.tmp-<id>`, where `with_extension` would drop `.gz`).
-fn temp_sibling_path(path: &Path) -> Result<PathBuf> {
+const ATOMIC_WRITE_TEMP_ATTEMPTS: u32 = 128;
+
+fn temp_sibling_path(path: &Path, suffix: &OsStr) -> Result<PathBuf> {
     let parent = path.parent().context("file path has no parent directory")?;
-    let file_name = path
+    let mut file_name = path
         .file_name()
         .context("file path has no file name")?
-        .to_string_lossy()
-        .into_owned();
-    Ok(parent.join(format!(
-        "{file_name}.tmp-{}-{}",
-        std::process::id(),
-        unix_time_millis()
-    )))
+        .to_os_string();
+    file_name.push(".tmp-");
+    file_name.push(suffix);
+    Ok(parent.join(file_name))
 }
 
 fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temp_id = format!("{}-{}", std::process::id(), unix_time_millis());
+    write_file_atomically_with(
+        path,
+        bytes,
+        |attempt| OsString::from(format!("{temp_id}-{attempt}")),
+        || {},
+    )
+}
+
+fn write_file_atomically_with<S, P>(
+    path: &Path,
+    bytes: &[u8],
+    suffix_for_attempt: S,
+    before_publish: P,
+) -> Result<()>
+where
+    S: FnMut(u32) -> OsString,
+    P: FnOnce(),
+{
+    write_file_atomically_with_publish(
+        path,
+        bytes,
+        suffix_for_attempt,
+        before_publish,
+        publish_temp_file,
+    )
+}
+
+fn write_file_atomically_with_publish<S, P, F>(
+    path: &Path,
+    bytes: &[u8],
+    mut suffix_for_attempt: S,
+    before_publish: P,
+    publish: F,
+) -> Result<()>
+where
+    S: FnMut(u32) -> OsString,
+    P: FnOnce(),
+    F: FnOnce(&Path, &Path) -> io::Result<()>,
+{
     let parent = path.parent().context("file path has no parent directory")?;
     fs::create_dir_all(parent)?;
-    let tmp = temp_sibling_path(path)?;
-    // Clean up the temp file on every failure path. It carries a unique
-    // name, so leaving it behind would accumulate a fresh orphan per attempt —
-    // and when the failure is a full disk, those orphans are what keep it full.
-    let write_result = (|| -> Result<()> {
-        let mut file = fs::File::create(&tmp)
-            .with_context(|| format!("failed to create {}", tmp.display()))?;
-        file.write_all(bytes)
-            .map_err(|error| disk_space::map_write_error(error, &tmp))?;
-        Ok(())
-    })();
-    if let Err(error) = write_result {
-        let _ = fs::remove_file(&tmp);
-        return Err(error);
+
+    let mut reserved = None;
+    for attempt in 0..ATOMIC_WRITE_TEMP_ATTEMPTS {
+        let suffix = suffix_for_attempt(attempt);
+        let tmp = temp_sibling_path(path, &suffix)?;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => {
+                reserved = Some((tmp, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to create {}", tmp.display()));
+            }
+        }
     }
-    fs::rename(&tmp, path)
-        .or_else(|_| {
-            let _ = fs::remove_file(path);
-            fs::rename(&tmp, path)
-        })
-        .inspect_err(|_| {
-            let _ = fs::remove_file(&tmp);
-        })?;
+    let Some((tmp, mut file)) = reserved else {
+        bail!(
+            "failed to reserve a temporary file next to {} after {} attempts",
+            path.display(),
+            ATOMIC_WRITE_TEMP_ATTEMPTS
+        );
+    };
+
+    if let Err(error) = file.write_all(bytes) {
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+        return Err(disk_space::map_write_error(error, &tmp));
+    }
+    drop(file);
+    before_publish();
+
+    publish(&tmp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })?;
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn publish_temp_file(tmp: &Path, path: &Path) -> io::Result<()> {
+    fs::rename(tmp, path)
+}
+
+#[cfg(windows)]
+fn publish_temp_file(tmp: &Path, path: &Path) -> io::Result<()> {
+    if path.try_exists()? {
+        return replace_file_windows(path, tmp);
+    }
+
+    match fs::rename(tmp, path) {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            if path.try_exists()? {
+                replace_file_windows(path, tmp)
+            } else {
+                Err(rename_error)
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn replace_file_windows(path: &Path, replacement: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+    let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let replacement_wide: Vec<u16> = replacement
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+
+    // SAFETY: both path buffers are valid, NUL-terminated UTF-16 strings and
+    // remain alive for the duration of the synchronous Windows API call. The
+    // optional backup, exclude, and reserved pointers are intentionally null.
+    let replaced = unsafe {
+        ReplaceFileW(
+            path_wide.as_ptr(),
+            replacement_wide.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if replaced == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn extract_tarball(archive_path: &Path, target_dir: &Path) -> Result<()> {
@@ -3392,13 +3504,110 @@ mod tests {
     /// directory can still tell what a leftover was going to be.
     #[test]
     fn temp_sibling_path_preserves_multi_dot_file_names() {
-        let temp = temp_sibling_path(Path::new("/tmp/cache/sdk.tar.gz")).unwrap();
+        let temp = temp_sibling_path(
+            Path::new("/tmp/cache/sdk.tar.gz"),
+            std::ffi::OsStr::new("test"),
+        )
+        .unwrap();
         let name = temp.file_name().unwrap().to_string_lossy().into_owned();
-        assert!(
-            name.starts_with("sdk.tar.gz.tmp-"),
-            "expected the full name to be preserved, got {name}"
-        );
+        assert_eq!(name, "sdk.tar.gz.tmp-test");
         assert_eq!(temp.parent().unwrap(), Path::new("/tmp/cache"));
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_do_not_remove_a_published_destination() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-atomic-collision-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("sdk.tar.gz");
+        let before_publish = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let writers: Vec<_> = [b"first".as_slice(), b"second".as_slice()]
+            .into_iter()
+            .enumerate()
+            .map(|(writer, bytes)| {
+                let destination = destination.clone();
+                let before_publish = std::sync::Arc::clone(&before_publish);
+                std::thread::spawn(move || {
+                    write_file_atomically_with(
+                        &destination,
+                        bytes,
+                        |attempt| {
+                            if attempt == 0 {
+                                std::ffi::OsString::from("same-millisecond")
+                            } else {
+                                std::ffi::OsString::from(format!(
+                                    "same-millisecond-{writer}-{attempt}"
+                                ))
+                            }
+                        },
+                        || {
+                            before_publish.wait();
+                        },
+                    )
+                })
+            })
+            .collect();
+
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let published = fs::read(&destination).expect("a writer must remain published");
+        let _ = fs::remove_dir_all(&root);
+        assert!(published == b"first" || published == b"second");
+    }
+
+    #[test]
+    fn failed_atomic_replace_preserves_destination_and_cleans_temp() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-atomic-replace-failure-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("sdk.tar.gz");
+        fs::write(&destination, b"published").unwrap();
+
+        write_file_atomically_with_publish(
+            &destination,
+            b"replacement",
+            |attempt| OsString::from(format!("replace-failure-{attempt}")),
+            || {},
+            |tmp, path| {
+                assert_eq!(fs::read(tmp).unwrap(), b"replacement");
+                assert_eq!(path, destination);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "simulated atomic replacement failure",
+                ))
+            },
+        )
+        .expect_err("simulated replacement failure must be returned");
+
+        assert_eq!(fs::read(&destination).unwrap(), b"published");
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(leftovers, vec![OsString::from("sdk.tar.gz")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_temp_name_preserves_non_unicode_file_name_bytes() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let file_name = std::ffi::OsString::from_vec(b"sdk-\xff.tar.gz".to_vec());
+        let destination = Path::new("/tmp").join(&file_name);
+        let temp = temp_sibling_path(&destination, std::ffi::OsStr::new("collision")).unwrap();
+
+        let mut expected = file_name.into_vec();
+        expected.extend_from_slice(b".tmp-collision");
+        assert_eq!(temp.file_name().unwrap().as_bytes(), expected);
     }
 
     /// Regression: a failed write must not leave a `.tmp-*` scratch file
