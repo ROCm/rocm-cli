@@ -2593,7 +2593,7 @@ fn install_driver(
         pre_driver: examine.driver,
         post_driver: None,
         boot_id_at_execution: boot_id,
-        reboot_required: false,
+        reboot_required: plan.reboot_required,
         reboot_observed: false,
         commands: plan.execution_commands(),
         reconciled_at_unix_ms: None,
@@ -2602,27 +2602,14 @@ fn install_driver(
     write_driver_install_state(paths, &state)
         .map_err(|source| DriverInstallError::new(source, false))?;
 
-    for command in &plan.commands {
-        if !matches!(
-            command.phase,
-            DriverCommandPhase::Prepare | DriverCommandPhase::Execute
-        ) {
-            continue;
-        }
-        run_driver_shell_command(&command.command)
-            .with_context(|| format!("driver command failed: {}", command.command))
-            .map_err(|source| DriverInstallError::new(source, true))?;
-    }
-
-    let post_driver = ExamineSummary::gather()
-        .map_err(|source| DriverInstallError::new(source, true))?
-        .driver;
-    state.executed_at_unix_ms = Some(rocm_core::unix_time_millis());
-    state.post_driver = Some(post_driver);
-    state.reboot_required = plan.reboot_required;
-    state.reboot_observed = driver_reboot_observed(state.boot_id_at_execution.as_deref());
-    write_driver_install_state(paths, &state)
-        .map_err(|source| DriverInstallError::new(source, true))?;
+    execute_driver_install_plan(
+        &plan,
+        &mut state,
+        run_driver_shell_command,
+        |state| write_driver_install_state(paths, state),
+        || ExamineSummary::gather().map(|summary| summary.driver),
+    )
+    .map_err(|source| DriverInstallError::new(source, true))?;
 
     let _ = writeln!(output, "execution:");
     let _ = writeln!(output, "  status: completed");
@@ -2636,6 +2623,37 @@ fn install_driver(
         output,
         executed: true,
     })
+}
+
+fn execute_driver_install_plan<Run, Persist, Gather>(
+    plan: &DriverInstallPlan,
+    state: &mut DriverInstallState,
+    mut run: Run,
+    mut persist: Persist,
+    gather_post_driver: Gather,
+) -> Result<()>
+where
+    Run: FnMut(&str) -> Result<()>,
+    Persist: FnMut(&DriverInstallState) -> Result<()>,
+    Gather: FnOnce() -> Result<rocm_core::DriverSummary>,
+{
+    for command in &plan.commands {
+        if plan.reboot_required && command.phase == DriverCommandPhase::Verify {
+            continue;
+        }
+        run(&command.command)
+            .with_context(|| format!("driver command failed: {}", command.command))?;
+    }
+
+    state.executed_at_unix_ms = Some(rocm_core::unix_time_millis());
+    state.reboot_required = plan.reboot_required;
+    state.reboot_observed = driver_reboot_observed(state.boot_id_at_execution.as_deref());
+    persist(state)?;
+
+    let post_driver = gather_post_driver()?;
+    state.post_driver = Some(post_driver);
+    persist(state)?;
+    Ok(())
 }
 
 fn reconcile_driver_install(paths: &AppPaths) -> Result<String> {
@@ -2674,7 +2692,6 @@ fn reconcile_driver_install_state(
         .zip(current_boot_id.as_deref())
         .is_some_and(|(executed, current)| executed != current);
     state.reboot_observed = reboot_observed;
-    state.reboot_required = state.reboot_required || state.executed_at_unix_ms.is_some();
     state.post_driver = Some(driver.clone());
     let at_unix_ms = rocm_core::unix_time_millis();
     state.reconciled_at_unix_ms = Some(at_unix_ms);
@@ -25610,6 +25627,194 @@ VERSION_CODENAME=noble
     }
 
     #[test]
+    fn driver_plan_executor_runs_verify_after_execute() -> Result<()> {
+        let mut plan = wsl_rocdxg_driver_plan();
+        plan.commands = vec![
+            driver_command(DriverCommandPhase::Prepare, "prepare"),
+            driver_command(DriverCommandPhase::Execute, "execute"),
+            driver_command(DriverCommandPhase::Verify, "verify"),
+        ];
+        let mut state = DriverInstallState {
+            approved_at_unix_ms: 1,
+            executed_at_unix_ms: None,
+            pre_driver: test_examine("linux", true).driver,
+            post_driver: None,
+            boot_id_at_execution: Some("boot".to_owned()),
+            reboot_required: plan.reboot_required,
+            reboot_observed: false,
+            commands: plan.execution_commands(),
+            reconciled_at_unix_ms: None,
+            reconciliation: None,
+        };
+        let mut observed = Vec::new();
+
+        execute_driver_install_plan(
+            &plan,
+            &mut state,
+            |command| {
+                observed.push(command.to_owned());
+                Ok(())
+            },
+            |_| Ok(()),
+            || Ok(test_examine("linux", true).driver),
+        )?;
+
+        assert_eq!(observed, ["prepare", "execute", "verify"]);
+        assert!(state.executed_at_unix_ms.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn driver_plan_executor_defers_verify_when_reboot_is_required() -> Result<()> {
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n",
+            true,
+        );
+        assert!(plan.reboot_required);
+        let expected = plan.execution_commands();
+        let verify_commands = plan
+            .commands
+            .iter()
+            .filter(|command| command.phase == DriverCommandPhase::Verify)
+            .map(|command| command.command.clone())
+            .collect::<Vec<_>>();
+        let mut state = DriverInstallState {
+            approved_at_unix_ms: 1,
+            executed_at_unix_ms: None,
+            pre_driver: test_examine("linux", false).driver,
+            post_driver: None,
+            boot_id_at_execution: Some("boot".to_owned()),
+            reboot_required: plan.reboot_required,
+            reboot_observed: false,
+            commands: plan.execution_commands(),
+            reconciled_at_unix_ms: None,
+            reconciliation: None,
+        };
+        let mut observed = Vec::new();
+
+        execute_driver_install_plan(
+            &plan,
+            &mut state,
+            |command| {
+                observed.push(command.to_owned());
+                Ok(())
+            },
+            |_| Ok(()),
+            || Ok(test_examine("linux", false).driver),
+        )?;
+
+        assert_eq!(observed, expected);
+        assert!(
+            verify_commands
+                .iter()
+                .all(|command| !observed.contains(command)),
+            "reboot-gated Verify commands must be deferred: {verify_commands:?}"
+        );
+        assert!(state.executed_at_unix_ms.is_some());
+        assert!(state.reboot_required);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_driver_verify_does_not_mark_execution_completed() -> Result<()> {
+        let (root, paths) = test_paths("driver-verify-failure-state");
+        let mut plan = wsl_rocdxg_driver_plan();
+        plan.commands = vec![
+            driver_command(DriverCommandPhase::Prepare, "prepare"),
+            driver_command(DriverCommandPhase::Execute, "execute"),
+            driver_command(DriverCommandPhase::Verify, "verify"),
+        ];
+        let mut state = DriverInstallState {
+            approved_at_unix_ms: 1,
+            executed_at_unix_ms: None,
+            pre_driver: test_examine("linux", true).driver,
+            post_driver: None,
+            boot_id_at_execution: Some("boot".to_owned()),
+            reboot_required: plan.reboot_required,
+            reboot_observed: false,
+            commands: plan.execution_commands(),
+            reconciled_at_unix_ms: None,
+            reconciliation: None,
+        };
+        write_driver_install_state(&paths, &state)?;
+        let mut observed = Vec::new();
+        let mut gathered = false;
+
+        let error = execute_driver_install_plan(
+            &plan,
+            &mut state,
+            |command| {
+                observed.push(command.to_owned());
+                if command == "verify" {
+                    bail!("verification rejected the install");
+                }
+                Ok(())
+            },
+            |state| write_driver_install_state(&paths, state),
+            || {
+                gathered = true;
+                Ok(test_examine("linux", true).driver)
+            },
+        )
+        .expect_err("failed verification must fail the install");
+        let saved = read_driver_install_state(&paths)?.expect("state should remain readable");
+
+        assert_eq!(observed, ["prepare", "execute", "verify"]);
+        assert!(error.to_string().contains("driver command failed: verify"));
+        assert!(
+            !gathered,
+            "post-install state must not be gathered after failure"
+        );
+        assert_eq!(state.executed_at_unix_ms, None);
+        assert!(state.post_driver.is_none());
+        assert_eq!(saved.executed_at_unix_ms, None);
+        assert!(saved.post_driver.is_none());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_post_driver_gather_keeps_executed_state_persisted() -> Result<()> {
+        let (root, paths) = test_paths("driver-gather-failure-state");
+        let mut plan = wsl_rocdxg_driver_plan();
+        plan.commands = vec![
+            driver_command(DriverCommandPhase::Prepare, "prepare"),
+            driver_command(DriverCommandPhase::Execute, "execute"),
+            driver_command(DriverCommandPhase::Verify, "verify"),
+        ];
+        let mut state = DriverInstallState {
+            approved_at_unix_ms: 1,
+            executed_at_unix_ms: None,
+            pre_driver: test_examine("linux", true).driver,
+            post_driver: None,
+            boot_id_at_execution: Some("boot".to_owned()),
+            reboot_required: plan.reboot_required,
+            reboot_observed: false,
+            commands: plan.execution_commands(),
+            reconciled_at_unix_ms: None,
+            reconciliation: None,
+        };
+        write_driver_install_state(&paths, &state)?;
+
+        let error = execute_driver_install_plan(
+            &plan,
+            &mut state,
+            |_| Ok(()),
+            |state| write_driver_install_state(&paths, state),
+            || bail!("post-driver gather failed"),
+        )
+        .expect_err("a post-driver gather failure must still fail the install");
+        let saved = read_driver_install_state(&paths)?.expect("state should remain readable");
+
+        assert!(error.to_string().contains("post-driver gather failed"));
+        assert!(saved.executed_at_unix_ms.is_some());
+        assert!(saved.post_driver.is_none());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
     fn driver_reconcile_without_state_gives_non_privileged_guidance() -> Result<()> {
         let (root, paths) = test_paths("driver-reconcile-empty");
 
@@ -25693,6 +25898,48 @@ VERSION_CODENAME=noble
         assert_eq!(reconciliation.check_summary.present, 1);
         assert_eq!(reconciliation.check_summary.missing, 1);
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn driver_reconcile_preserves_explicit_reboot_policy() -> Result<()> {
+        for reboot_required in [false, true] {
+            let (root, paths) = test_paths(if reboot_required {
+                "driver-reconcile-reboot-true"
+            } else {
+                "driver-reconcile-reboot-false"
+            });
+            let driver = rocm_core::DriverSummary {
+                policy: "driver-policy".to_owned(),
+                status: "available".to_owned(),
+                detail: None,
+            };
+            let mut state = DriverInstallState {
+                approved_at_unix_ms: 1,
+                executed_at_unix_ms: Some(2),
+                pre_driver: driver.clone(),
+                post_driver: None,
+                boot_id_at_execution: Some("same-boot".to_owned()),
+                reboot_required,
+                reboot_observed: false,
+                commands: vec!["execute".to_owned()],
+                reconciled_at_unix_ms: None,
+                reconciliation: None,
+            };
+
+            reconcile_driver_install_state(
+                &paths,
+                &mut state,
+                driver,
+                Some("same-boot".to_owned()),
+                Vec::new(),
+            )?;
+            let saved = read_driver_install_state(&paths)?.expect("state should be saved");
+
+            assert_eq!(state.reboot_required, reboot_required);
+            assert_eq!(saved.reboot_required, reboot_required);
+            let _ = fs::remove_dir_all(root);
+        }
         Ok(())
     }
 
