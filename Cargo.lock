@@ -3735,6 +3735,7 @@ dependencies = [
  "anyhow",
  "clap",
  "flate2",
+ "libc",
  "rocm-core",
  "rocm-deps",
  "rocm-engine-protocol",
