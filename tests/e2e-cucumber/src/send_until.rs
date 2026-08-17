@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 /// Borrowing future returned by the wait operation used by [`send_until`].
-pub type WaitFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + 'a>>;
+pub type WaitFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
 /// Deadline and per-attempt wait used by [`send_until`].
 #[derive(Clone, Copy, Debug)]
@@ -18,21 +18,33 @@ pub struct RetryTiming {
     pub resend_interval: Duration,
 }
 
+/// Result of checking whether a failed wait may be retried.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TerminalState {
+    /// The session is still live, so another send is allowed.
+    Running,
+    /// The session stopped, and the failed wait already carries the best error.
+    Stopped,
+    /// A terminal error landed after the wait and supersedes its retryable error.
+    Failed(String),
+}
+
 /// Send `bytes`, wait for `marker`, and retry until success, terminal state, or
 /// the deadline. A terminal state returns the failed wait's exact error.
-pub async fn send_until<S, Send, Wait, Stopped>(
+pub async fn send_until<S, SendInput, Wait, Terminal>(
     state: &mut S,
     bytes: &str,
     marker: &str,
     timing: RetryTiming,
-    mut send: Send,
+    mut send: SendInput,
     mut wait: Wait,
-    stopped: Stopped,
+    mut terminal: Terminal,
 ) -> Result<(), String>
 where
-    Send: FnMut(&mut S, &str) -> Result<(), String>,
-    Wait: for<'a> FnMut(&'a mut S, &'a str, Duration) -> WaitFuture<'a>,
-    Stopped: Fn(&S) -> bool,
+    S: Send,
+    SendInput: FnMut(&mut S, &str) -> Result<(), String> + Send,
+    Wait: for<'a> FnMut(&'a mut S, &'a str, Duration) -> WaitFuture<'a> + Send,
+    Terminal: FnMut(&mut S, &str) -> TerminalState + Send,
 {
     let RetryTiming {
         timeout,
@@ -47,8 +59,10 @@ where
             Ok(()) => return Ok(()),
             Err(error) => error,
         };
-        if stopped(state) {
-            return Err(last_error);
+        match terminal(state, marker) {
+            TerminalState::Running => {}
+            TerminalState::Stopped => return Err(last_error),
+            TerminalState::Failed(error) => return Err(error),
         }
         if Instant::now() >= deadline {
             return Err(format!(
@@ -60,13 +74,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{RetryTiming, send_until};
+    use super::{RetryTiming, TerminalState, send_until};
     use crate::reader_failure::ReaderFailure;
+    use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
     #[derive(Default)]
     struct TestState {
-        failure: ReaderFailure,
+        failure: Arc<ReaderFailure>,
         reader_finished: bool,
         sends: usize,
         waits: usize,
@@ -103,10 +118,83 @@ mod tests {
                     }
                 })
             },
-            |state| state.failure.has_failed() || state.reader_finished,
+            |state, _marker| {
+                if state.failure.has_failed() || state.reader_finished {
+                    TerminalState::Stopped
+                } else {
+                    TerminalState::Running
+                }
+            },
         )
         .await
         .expect_err("reader panic must stop the retry loop");
+
+        assert_eq!(error, PANIC_ERROR);
+        assert_eq!(state.sends, 1, "terminal failure must not resend input");
+        assert_eq!(state.waits, 1, "terminal failure must not wait again");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_error_published_as_wait_times_out_wins_over_marker_timeout() {
+        const PANIC_ERROR: &str = "captured reader panic error";
+        const MARKER_TIMEOUT: &str = "marker timeout";
+
+        let failure = Arc::new(ReaderFailure::default());
+        let reader_failure = Arc::clone(&failure);
+        let (at_boundary_tx, at_boundary_rx) = mpsc::channel();
+        let (published_tx, published_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            at_boundary_rx
+                .recv()
+                .expect("wait should reach its final terminal check");
+            reader_failure.publish(PANIC_ERROR.to_string());
+            published_tx.send(()).expect("test waiter should remain");
+            release_rx.recv().expect("test should release reader");
+        });
+
+        let mut state = TestState {
+            failure: Arc::clone(&failure),
+            ..TestState::default()
+        };
+        let error = send_until(
+            &mut state,
+            "4",
+            "marker",
+            RetryTiming {
+                timeout: Duration::from_millis(30),
+                resend_interval: Duration::from_millis(5),
+            },
+            |state, _bytes| {
+                state.sends += 1;
+                Ok(())
+            },
+            move |state, _marker, _attempt| {
+                state.waits += 1;
+                at_boundary_tx
+                    .send(())
+                    .expect("reader should wait for the boundary");
+                published_rx
+                    .recv()
+                    .expect("reader should publish before wait returns");
+                Box::pin(async { Err(MARKER_TIMEOUT.to_string()) })
+            },
+            |state, _marker| {
+                if let Some(error) = state.failure.take_message() {
+                    TerminalState::Failed(error)
+                } else if state.failure.has_failed() || state.reader_finished {
+                    TerminalState::Stopped
+                } else {
+                    TerminalState::Running
+                }
+            },
+        )
+        .await
+        .expect_err("terminal reader error must stop the retry loop");
+
+        assert!(!reader.is_finished(), "reader must still be finishing");
+        release_tx.send(()).expect("reader should remain blocked");
+        reader.join().expect("test reader should exit cleanly");
 
         assert_eq!(error, PANIC_ERROR);
         assert_eq!(state.sends, 1, "terminal failure must not resend input");

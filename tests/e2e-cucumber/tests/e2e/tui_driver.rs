@@ -31,7 +31,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 
 use e2e_cucumber::panic_capture::panic_message;
 use e2e_cucumber::reader_failure::ReaderFailure;
-use e2e_cucumber::send_until::{RetryTiming, send_until as retry_send_until};
+use e2e_cucumber::send_until::{RetryTiming, TerminalState, send_until as retry_send_until};
 
 use crate::E2eWorld;
 
@@ -290,6 +290,33 @@ impl TuiSession {
                 .is_some_and(std::thread::JoinHandle::is_finished)
     }
 
+    /// Retrieve a terminal failure that landed after a wait's final poll but
+    /// before the retry loop decides whether another key is safe to send.
+    fn terminal_state_after_wait(&mut self, marker: &str) -> TerminalState {
+        if let Some(panic_message) = self.take_reader_panic() {
+            return TerminalState::Failed(format!(
+                "pty reader thread panicked while waiting for {marker:?}: {panic_message}\n{}",
+                self.framed_screen()
+            ));
+        }
+        if self.finished {
+            return TerminalState::Stopped;
+        }
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                self.finished = true;
+                self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
+                TerminalState::Failed(format!(
+                    "process exited ({status:?}) before {marker:?} appeared.\n{}",
+                    self.framed_screen()
+                ))
+            }
+            Ok(None) if self.reader_stopped() => TerminalState::Stopped,
+            Ok(None) => TerminalState::Running,
+            Err(error) => TerminalState::Failed(format!("failed to poll TUI child: {error}")),
+        }
+    }
+
     /// Send `bytes` until the screen shows `marker`, re-sending every
     /// [`KEY_RESEND_INTERVAL`] until the deadline.
     ///
@@ -320,9 +347,9 @@ impl TuiSession {
                 timeout,
                 resend_interval: KEY_RESEND_INTERVAL,
             },
-            TuiSession::send,
+            Self::send,
             |session, marker, attempt| Box::pin(session.wait_for_screen(marker, attempt)),
-            |session| session.finished || session.reader_stopped(),
+            Self::terminal_state_after_wait,
         )
         .await
     }
