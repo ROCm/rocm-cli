@@ -5450,7 +5450,6 @@ vllm                rocm        unsupported     Requires Linux                  
                 .tempdir_in(std::env::current_dir().expect("current directory"))
                 .expect("private-ancestry scratch")
         }
-
         fn vars_for(parent: &ParentRuntimeEnvironment) -> Vec<(&'static str, OsString)> {
             lemonade_process_environment_vars(&LemonadeProcessEnvironment::default(), parent)
                 .expect("building the child environment must succeed")
@@ -5547,7 +5546,6 @@ vllm                rocm        unsupported     Requires Linux                  
             assert_private_dir(&dir);
             assert!(real_home.join(".rocm/data/lemonade").is_dir());
         }
-
         /// Tier 3: neither `XDG_RUNTIME_DIR` nor `HOME` — a user-named subdir of
         /// the temp dir, so the parent is one we create and own, not `/tmp`.
         #[test]
@@ -6006,7 +6004,6 @@ vllm                rocm        unsupported     Requires Linux                  
                 "foreign directory permissions changed before ownership was validated"
             );
         }
-
         /// A value the operator (or systemd) already set is handed to the child
         /// unchanged: we never relocate a working runtime directory, and never
         /// create anything of our own beside it.
