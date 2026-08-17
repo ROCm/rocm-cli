@@ -10,7 +10,9 @@ use cucumber::{given, then, when};
 
 use crate::E2eWorld;
 use e2e_cucumber::mock_server::MockServer;
-use e2e_cucumber::serve_log::service_log_tail;
+use e2e_cucumber::serve_log::{
+    ServeAttempt, archive_service_log, serve_attempt_report, service_log_tail,
+};
 
 /// How long to wait for a freshly served model's endpoint to become ready.
 ///
@@ -67,14 +69,91 @@ async fn model_is_ready(models_url: &str, expect_model: Option<&str>, timeout_se
     false
 }
 
-async fn wait_for_model(models_url: &str, expect_model: Option<&str>, timeout_secs: u64) {
-    if model_is_ready(models_url, expect_model, timeout_secs).await {
+/// The OpenAI-compatible base URL every GPU serve scenario serves on (see
+/// [`SERVE_PORT`]), and the model listing readiness is judged by.
+const SERVE_BASE_URL: &str = "http://127.0.0.1:11435/v1";
+const MODELS_URL: &str = "http://127.0.0.1:11435/v1/models";
+
+/// The one-line verdict on a `--managed` serve that launched cleanly and then
+/// never produced a usable endpoint.
+///
+/// Says "exited 0" out loud because that is the whole difficulty of this failure:
+/// nothing in the exit status, and nothing the CLI printed, distinguishes it from
+/// a healthy serve — the evidence sections below it are the only account there is.
+fn stall_headline(invocation: &str, ready_substr: &str, timeout_secs: u64) -> String {
+    format!(
+        "{invocation} exited 0, but {MODELS_URL} never served `{ready_substr}` within \
+         {timeout_secs}s — the launch reported success and the engine then failed on its own"
+    )
+}
+
+/// Everything a serve attempt left behind, gathered and rendered for a panic.
+///
+/// The ORDER here is the load-bearing part, and it is why this is one function
+/// rather than three calls at each site: the log must be read and copied out
+/// while the service still owns it, because stopping the service both changes
+/// what the log's last lines say and is the step most likely to fail outright.
+///
+/// Mirrors what [`setup_gpu_model`] has always collected, so a stalled serve
+/// reports the same evidence wherever it happens.
+fn serve_failure_evidence(
+    world: &E2eWorld,
+    headline: &str,
+    device_state: &str,
+    stdout: &str,
+    stderr: &str,
+) -> String {
+    let log_tail = service_log_tail(stdout);
+    // Copy the whole log into the results directory before the scenario's
+    // TempDir takes it: the tail below is enough to triage most stalls, but not
+    // one whose cause is in the engine's startup banner (see `archive_service_log`).
+    let archived_log = archive_service_log(
+        stdout,
+        &crate::results_path(),
+        world.current_scenario.as_deref().unwrap_or("scenario"),
+    );
+    let stop_status = stop_scenario_services(world);
+    serve_attempt_report(&ServeAttempt {
+        headline,
+        device_state,
+        stdout,
+        stderr,
+        log_tail: &log_tail,
+        archived_log: &archived_log,
+        stop_status: &stop_status,
+    })
+}
+
+/// Launch a managed serve and wait until the endpoint really serves it, failing
+/// with the full evidence bundle if it does not.
+///
+/// Replaces the `run_rocm_ok` + readiness-poll pair the serve preconditions used
+/// to open with. That pair cannot describe the failure this exists for: with
+/// `--managed`, `rocm serve` returns once the supervisor is launched, so an
+/// engine that dies afterwards exits **0** and the poll times out with nothing
+/// attached — the CLI's output, the engine's log and the device state were all
+/// dropped before the panic, which is why #260 could not be root-caused from a
+/// CI artifact. A non-zero exit is reported the same way rather than through
+/// `run_rocm_ok`, since the engine log explains those launches too.
+async fn serve_and_wait(world: &mut E2eWorld, args: &[&str], model: &str, ready_substr: &str) {
+    let timeout_secs = serve_timeout_for(world);
+    let device_state = ensure_serve_port_free().await;
+    let (stdout, stderr, rc) = crate::run_rocm(world, args);
+    if rc == 0 && model_is_ready(MODELS_URL, Some(ready_substr), timeout_secs).await {
+        world.endpoint = Some(SERVE_BASE_URL.to_string());
+        world.model_name = Some(model.to_string());
         return;
     }
-    match expect_model {
-        Some(m) => panic!("endpoint {models_url} did not serve model {m} within {timeout_secs}s"),
-        None => panic!("endpoint {models_url} not ready after {timeout_secs}s"),
-    }
+    let invocation = format!("`rocm {}`", args.join(" "));
+    let headline = if rc == 0 {
+        stall_headline(&invocation, ready_substr, timeout_secs)
+    } else {
+        format!("{invocation} failed (rc={rc})")
+    };
+    panic!(
+        "{}",
+        serve_failure_evidence(world, &headline, &device_state, &stdout, &stderr)
+    );
 }
 
 /// The shared port every GPU serve scenario uses. Because scenarios run in
@@ -419,7 +498,6 @@ async fn setup_gpu_model(world: &mut E2eWorld) {
     // linger on the GPU and oversubscribe it (which otherwise piles up serves
     // until the job times out).
     let (model, engine, ready_substr) = host_serve_target();
-    let models_url = "http://127.0.0.1:11435/v1/models";
     let timeout_secs = serve_timeout_for(world);
     let mut diagnostics = Vec::new();
     // A managed vLLM launch can return `status: starting` without publishing the
@@ -448,15 +526,15 @@ async fn setup_gpu_model(world: &mut E2eWorld) {
         let device_state = ensure_serve_port_free().await;
         let (stdout, stderr, rc) =
             crate::run_rocm(world, &["serve", model, "--engine", engine, "--managed"]);
-        if rc == 0 && model_is_ready(models_url, Some(ready_substr), timeout_secs).await {
-            world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
+        if rc == 0 && model_is_ready(MODELS_URL, Some(ready_substr), timeout_secs).await {
+            world.endpoint = Some(SERVE_BASE_URL.to_string());
             world.model_name = Some(model.to_string());
             return;
         }
-        // Read the log before stopping the service, so the tail reflects what the
-        // engine wrote on its own rather than anything the stop provokes.
-        let log_tail = service_log_tail(&stdout);
-        // Stop THIS attempt's stalled service before doing anything else. A vLLM
+        // `serve_failure_evidence` reads and copies out the log BEFORE it stops
+        // this attempt's stalled service, which matters twice over here. The tail
+        // then reflects what the engine wrote on its own rather than anything the
+        // stop provokes; and the stop itself is load-bearing for the RETRY. A vLLM
         // still in engine init has not bound the serve port yet, so the port kill
         // in `ensure_serve_port_free` cannot see it — it would survive into the
         // next attempt, hold its fraction-of-device memory reservation, and guarantee
@@ -468,12 +546,12 @@ async fn setup_gpu_model(world: &mut E2eWorld) {
         // outcome is quoted: a stop that found no record (the launch had not yet
         // written one) or failed means the next attempt did NOT get a clean
         // device, and the failure says so instead of looking like a broken serve.
-        let stop_status = stop_scenario_services(world);
-        diagnostics.push(format!(
-            "attempt {attempt} (rc={rc}), {device_state}\
-             \n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}\
-             \n--- SERVICE LOG (tail) ---\n{log_tail}\
-             \n--- STOP ---\n{stop_status}"
+        diagnostics.push(serve_failure_evidence(
+            world,
+            &format!("attempt {attempt} of {attempts} (rc={rc})"),
+            &device_state,
+            &stdout,
+            &stderr,
         ));
         if attempt == attempts {
             break;
@@ -489,7 +567,7 @@ async fn setup_gpu_model(world: &mut E2eWorld) {
         }
     }
     panic!(
-        "endpoint {models_url} did not serve model {ready_substr} after {made} attempt(s) of {timeout_secs}s each:\n{}",
+        "endpoint {MODELS_URL} did not serve model {ready_substr} after {made} attempt(s) of {timeout_secs}s each:\n{}",
         diagnostics.join("\n\n")
     );
 }
@@ -501,20 +579,14 @@ async fn setup_lemonade_model(world: &mut E2eWorld) {
     // the parallel of setup_gpu_model's vLLM path, giving both engines their own
     // serve+inference coverage. Qwen3-0.6B-GGUF is the smallest lemonade recipe.
     let model = "Qwen3-0.6B-GGUF";
-    ensure_serve_port_free().await;
-    crate::run_rocm_ok(
-        world,
-        &["serve", model, "--engine", "lemonade", "--managed"],
-    );
-    world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
-    world.model_name = Some(model.to_string());
     // Wait for this lemonade model specifically (see setup_gpu_model): guards
     // against a leaked serve on the shared port. "Qwen3-0.6B" is the distinctive
     // substring (the endpoint reports it as e.g. Qwen3-0.6B-Q4_0.gguf).
-    wait_for_model(
-        "http://127.0.0.1:11435/v1/models",
-        Some("Qwen3-0.6B"),
-        serve_timeout_for(world),
+    serve_and_wait(
+        world,
+        &["serve", model, "--engine", "lemonade", "--managed"],
+        model,
+        "Qwen3-0.6B",
     )
     .await;
 }
@@ -525,18 +597,17 @@ async fn setup_lemonade_hf_checkpoint_model(world: &mut E2eWorld) {
     // EAI-8026) instead of the short-recipe-name router that `setup_lemonade_model`
     // exercises. Same underlying checkpoint (unsloth/Qwen3-0.6B-GGUF, Q4_0), so the
     // GGUF is already warm in the HF cache when both scenarios run in one job.
+    //
+    // This is the path #260 reports: on Strix Halo Windows the launch exits 0 and
+    // the endpoint never answers. `serve_and_wait` is what makes that outcome
+    // explain itself — the plain readiness poll this used to call reported the
+    // timeout and discarded everything that could say why.
     let model = "unsloth/Qwen3-0.6B-GGUF:Q4_0";
-    ensure_serve_port_free().await;
-    crate::run_rocm_ok(
+    serve_and_wait(
         world,
         &["serve", model, "--engine", "lemonade", "--managed"],
-    );
-    world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
-    world.model_name = Some(model.to_string());
-    wait_for_model(
-        "http://127.0.0.1:11435/v1/models",
-        Some("Qwen3-0.6B"),
-        serve_timeout_for(world),
+        model,
+        "Qwen3-0.6B",
     )
     .await;
 }
@@ -566,14 +637,11 @@ async fn setup_large_gpu_model(world: &mut E2eWorld) {
         } else {
             ("Qwen/Qwen3.6-27B", "vllm", "Qwen3.6-27B")
         };
-    ensure_serve_port_free().await;
-    crate::run_rocm_ok(world, &["serve", model, "--engine", engine, "--managed"]);
-    world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
-    world.model_name = Some(model.to_string());
-    wait_for_model(
-        "http://127.0.0.1:11435/v1/models",
-        Some(ready_substr),
-        serve_timeout_for(world),
+    serve_and_wait(
+        world,
+        &["serve", model, "--engine", engine, "--managed"],
+        model,
+        ready_substr,
     )
     .await;
 }
@@ -655,30 +723,50 @@ async fn user_serves_default_engine(world: &mut E2eWorld) {
     // matrix requires this to resolve to lemonade on Instinct (EAI-7052). See that
     // fn's doc comment.
     let model = default_engine_serve_target();
-    ensure_serve_port_free().await;
+    let device_state = ensure_serve_port_free().await;
     let (stdout, stderr, rc) = crate::run_rocm(world, &["serve", model, "--managed"]);
     // The model the CLI resolved (what actually gets served) can differ from the
     // requested id, so downstream reachability/readiness checks must look for the
     // resolved model on the shared port; fall back to the requested id.
     let served = resolved_model(&stdout).unwrap_or(model).to_string();
     let ready_substr = ready_substr_for(&served).to_string();
+    world.endpoint = Some(SERVE_BASE_URL.to_string());
+    world.model_name = Some(served);
+    // Both streams and the rc are carried on the World so whichever Then step
+    // fires can explain itself: the scenarios behind this step assert on the
+    // engine the plan named and on reachability, and each of those reports the
+    // serve output when it fails.
     world.cli_output = Some(stdout);
-    // rc is asserted by a later Then step, so stderr has to survive with it —
-    // otherwise that deferred assertion reports a failure it cannot explain.
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
-    world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
-    world.model_name = Some(served);
-    if rc == 0 {
-        // Wait for THE RESOLVED model specifically (not just any 200) — the shared
-        // port 11435 may still answer from a prior scenario's leaked serve, and a
-        // model-agnostic wait would then proceed against the wrong server.
-        wait_for_model(
-            "http://127.0.0.1:11435/v1/models",
-            Some(&ready_substr),
-            serve_timeout_for(world),
-        )
-        .await;
+    // A non-zero rc is deliberately NOT failed here. This is a `When`: the CLI
+    // still printed the plan line the scenario is about, so failing on the exit
+    // code would pre-empt the Then step that names the actual disagreement with a
+    // blunter message. The other outcome — an exit-0 serve whose endpoint never
+    // answers — has no Then step to catch it, so this step reports it, with the
+    // same evidence a GPU serve collects rather than the bare timeout line that
+    // left #260 undiagnosable.
+    //
+    // Wait for THE RESOLVED model specifically (not just any 200) — the shared port
+    // 11435 may still answer from a prior scenario's leaked serve, and a
+    // model-agnostic wait would then proceed against the wrong server.
+    let timeout_secs = serve_timeout_for(world);
+    if rc == 0 && !model_is_ready(MODELS_URL, Some(&ready_substr), timeout_secs).await {
+        let headline = stall_headline(
+            &format!("`rocm serve {model} --managed`"),
+            &ready_substr,
+            timeout_secs,
+        );
+        panic!(
+            "{}",
+            serve_failure_evidence(
+                world,
+                &headline,
+                &device_state,
+                world.cli_output.as_deref().unwrap_or_default(),
+                world.cli_stderr.as_deref().unwrap_or_default(),
+            )
+        );
     }
 }
 
@@ -904,7 +992,7 @@ fn resolved_model(output: &str) -> Option<&str> {
 }
 
 /// A distinctive substring of a model id that appears in the served endpoint's
-/// `/v1/models` response, for `wait_for_model`'s containment check. Strips the
+/// `/v1/models` response, for [`model_is_ready`]'s containment check. Strips the
 /// `org/` prefix and the `-GGUF` catalog marker so a resolved catalog id
 /// (`Qwen3-4B-Instruct-2507-GGUF`) matches the concrete artifact the endpoint
 /// reports (`Qwen3-4B-Instruct-2507-Q4_K_M.gguf`) — both share the base

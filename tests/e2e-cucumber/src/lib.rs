@@ -47,6 +47,21 @@ pub fn lifecycle_binary_dir(
     Ok(rocm_dir)
 }
 
+/// One labelled block of a diagnostic bundle.
+///
+/// An empty body is marked `(empty)` rather than omitted, because "the CLI said
+/// nothing" and "the harness lost the output" are different diagnoses and only
+/// an explicit marker tells them apart. Shared by [`cli_failure_report`] and
+/// [`serve_log::serve_attempt_report`] so every bundle reads the same way.
+pub(crate) fn section(label: &str, body: &str) -> String {
+    let body = body.trim_end();
+    if body.is_empty() {
+        format!("--- {label}: (empty) ---")
+    } else {
+        format!("--- {label} ---\n{body}")
+    }
+}
+
 /// Render everything known about a failed `rocm` invocation.
 ///
 /// Both streams are always shown, each labelled and each with an explicit
@@ -58,15 +73,11 @@ pub fn lifecycle_binary_dir(
 /// stdout leaves a failed step undiagnosable: the panic reads `rocm serve
 /// failed:` followed by nothing at all, which is what EAI-8031 hit on the
 /// MI300X lane. The CLI reports its errors on stderr.
+///
+/// Covers only a NON-ZERO exit. A `--managed` serve that exits 0 and then never
+/// serves needs [`serve_log::serve_attempt_report`] instead — same streams, plus
+/// the engine log and device state that are the only evidence in that case.
 pub fn cli_failure_report(args: &[&str], rc: i32, stdout: &str, stderr: &str) -> String {
-    fn section(label: &str, body: &str) -> String {
-        let body = body.trim_end();
-        if body.is_empty() {
-            format!("--- {label}: (empty) ---")
-        } else {
-            format!("--- {label} ---\n{body}")
-        }
-    }
     format!(
         "`rocm {}` failed (rc={rc})\n{}\n{}",
         args.join(" "),
