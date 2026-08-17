@@ -1143,10 +1143,7 @@ fn maybe_notice_legacy_uv_cache() {
     if !cache.path().is_dir() {
         return;
     }
-    let Some(home) = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-    else {
+    let Some(home) = rocm_core::runtime_home_dir() else {
         return;
     };
     let legacy = LEGACY_UV_CACHE_RELATIVE
@@ -1190,10 +1187,7 @@ fn maybe_notice_legacy_uv_python_install_dir() {
     if !install_dir.path().is_dir() {
         return;
     }
-    let Some(home) = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-    else {
+    let Some(home) = rocm_core::runtime_home_dir() else {
         return;
     };
     let legacy = LEGACY_UV_PYTHON_INSTALL_DIR_RELATIVE
@@ -15892,7 +15886,7 @@ fn shared_cache_notes(paths: &AppPaths) -> Vec<String> {
         paths.data_dir.clone(),
         paths.cache_dir.clone(),
     ];
-    shared_cache_notes_for(&removed_roots, &shared_cache_candidates())
+    shared_cache_notes_for(&removed_roots, &shared_cache_candidates(paths))
 }
 
 /// The pure part of [`shared_cache_notes`], so the filtering is testable without
@@ -15910,34 +15904,23 @@ fn shared_cache_notes_for(
 }
 
 /// The shared caches worth reporting, with why each is left alone.
-fn shared_cache_candidates() -> Vec<(PathBuf, &'static str)> {
+fn shared_cache_candidates(paths: &AppPaths) -> Vec<(PathBuf, &'static str)> {
     let mut candidates = Vec::new();
 
-    // `uv` writes to `UV_CACHE_DIR` when set, otherwise its own default. Read it
-    // rather than assuming a location, so this stays correct wherever the cache
-    // has been pointed.
-    let uv_cache = env_path("UV_CACHE_DIR")
-        .or_else(|| rocm_core::runtime_home_dir().map(|home| home.join(".cache").join("uv")));
-    if let Some(path) = uv_cache {
-        candidates.push((
-            path,
-            "the uv package cache is shared with other uv projects on this computer and is",
-        ));
-    }
+    // Resolved through the same precedence `uv` is invoked with, so an override is
+    // reported at the location `uv` actually writes to. The managed location sits
+    // under the data directory and is filtered out by `shared_cache_notes_for`; this
+    // only surfaces when it has been pointed elsewhere.
+    candidates.push((
+        uv_cache_source(paths).path().to_path_buf(),
+        "the uv package cache is shared with other uv projects on this computer and is",
+    ));
 
-    // Same reasoning for the standalone interpreters `uv python install` downloads. The
-    // managed location sits under the data directory and is filtered out by
-    // `shared_cache_notes_for`; this only surfaces when it has been pointed elsewhere.
-    let uv_python = env_path("UV_PYTHON_INSTALL_DIR").or_else(|| {
-        rocm_core::runtime_home_dir()
-            .map(|home| home.join(".local").join("share").join("uv").join("python"))
-    });
-    if let Some(path) = uv_python {
-        candidates.push((
-            path,
-            "uv-managed Python interpreters are shared with other uv projects on this computer and are",
-        ));
-    }
+    // Same reasoning for the standalone interpreters `uv python install` downloads.
+    candidates.push((
+        uv_python_install_dir_source(paths).path().to_path_buf(),
+        "uv-managed Python interpreters are shared with other uv projects on this computer and are",
+    ));
 
     let hf_cache = env_path("HF_HOME")
         .map(|home| home.join("hub"))
@@ -17396,10 +17379,12 @@ mod tests {
     fn shared_cache_candidates_include_the_uv_python_install_dir() {
         let lock = super::BUILTIN_ENGINE_ENV_LOCK.get_or_init(|| Mutex::new(()));
         let _guard = lock.lock().expect("env lock poisoned");
+        let (root, paths) = test_paths("shared-cache-python-ambient");
         let overridden = std::env::temp_dir().join(format!("rocm-uv-py-{}", std::process::id()));
-        let _scoped = super::ScopedEnvVar::set_path("UV_PYTHON_INSTALL_DIR", &overridden);
+        let _scoped =
+            super::ScopedEnvVar::set_path(rocm_core::UV_PYTHON_INSTALL_DIR_ENV, &overridden);
 
-        let candidates = super::shared_cache_candidates();
+        let candidates = super::shared_cache_candidates(&paths);
         let entry = candidates
             .iter()
             .find(|(path, _)| path == &overridden)
@@ -17411,6 +17396,41 @@ mod tests {
             "unexpected description: {}",
             entry.1
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The namespaced override takes precedence over the ambient variable when `uv` is
+    /// actually invoked, so uninstall reporting must resolve through the same
+    /// precedence for both the cache dir and the python install dir, or it reports a
+    /// path `uv` never wrote to.
+    #[test]
+    fn shared_cache_candidates_respect_the_namespaced_override() {
+        let lock = super::BUILTIN_ENGINE_ENV_LOCK.get_or_init(|| Mutex::new(()));
+        let _guard = lock.lock().expect("env lock poisoned");
+        let (root, paths) = test_paths("shared-cache-namespaced-override");
+        let overridden_cache =
+            std::env::temp_dir().join(format!("rocm-uv-cache-override-{}", std::process::id()));
+        let overridden_python =
+            std::env::temp_dir().join(format!("rocm-uv-python-override-{}", std::process::id()));
+        let _cache_scoped =
+            super::ScopedEnvVar::set_path(rocm_core::UV_CACHE_DIR_OVERRIDE_ENV, &overridden_cache);
+        let _python_scoped = super::ScopedEnvVar::set_path(
+            rocm_core::UV_PYTHON_INSTALL_DIR_OVERRIDE_ENV,
+            &overridden_python,
+        );
+
+        let candidates = super::shared_cache_candidates(&paths);
+        assert!(
+            candidates.iter().any(|(path, _)| path == &overridden_cache),
+            "ROCM_CLI_UV_CACHE_DIR override missing from uninstall candidates: {candidates:?}"
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|(path, _)| path == &overridden_python),
+            "ROCM_CLI_UV_PYTHON_INSTALL_DIR override missing from uninstall candidates: {candidates:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// A cache that does not exist is not worth mentioning.
