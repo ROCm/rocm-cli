@@ -6,7 +6,8 @@ use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_gpu_diagnostics,
     detect_host_therock_family, detect_managed_therock_family, disk_space, ensure_uv_binary,
-    known_therock_families, managed_tools_dir, normalize_runtime_path_for_host,
+    known_therock_families, known_therock_family_device_chips, managed_tools_dir,
+    normalize_runtime_path_for_host,
     normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
     normalize_runtime_path_text_for_storage, normalize_therock_family, runtime_is_windows,
     runtime_os_name, runtime_path_for_windows_child, runtime_path_list_split,
@@ -826,6 +827,7 @@ fn install_wheel_runtime(
         "Found TheRock package family {} version {} with a matching PyTorch stack.",
         resolution.family, resolution.latest_version
     ));
+    let rocm_extras = therock_rocm_extras(&resolution.family, &resolution.index_url);
     let runtime_key = runtime_key(
         channel,
         "wheel",
@@ -880,7 +882,7 @@ fn install_wheel_runtime(
     let _ = writeln!(
         output,
         "  package_specs: {}",
-        therock_pip_package_specs(&resolution.package_versions).join(" ")
+        therock_pip_package_specs(&resolution.package_versions, &rocm_extras).join(" ")
     );
     let _ = writeln!(
         output,
@@ -893,7 +895,10 @@ fn install_wheel_runtime(
         if matches!(channel, TheRockChannel::Nightly) {
             install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
         }
-        install_args.extend(therock_pip_package_specs(&resolution.package_versions));
+        install_args.extend(therock_pip_package_specs(
+            &resolution.package_versions,
+            &rocm_extras,
+        ));
         let venv_args = uv_venv_args(&python_launcher.executable, &install_root);
         let venv_args_display = venv_args
             .iter()
@@ -933,7 +938,7 @@ fn install_wheel_runtime(
 
     progress_line(format!(
         "Installing {} from {}",
-        therock_pip_package_specs(&resolution.package_versions).join(" "),
+        therock_pip_package_specs(&resolution.package_versions, &rocm_extras).join(" "),
         resolution.index_url
     ));
     let mut install_args = uv_pip_install_base(&env_python);
@@ -941,7 +946,10 @@ fn install_wheel_runtime(
     if matches!(channel, TheRockChannel::Nightly) {
         install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
     }
-    install_args.extend(therock_pip_package_specs(&resolution.package_versions));
+    install_args.extend(therock_pip_package_specs(
+        &resolution.package_versions,
+        &rocm_extras,
+    ));
     run_uv_progress_command(
         paths,
         &uv,
@@ -1012,13 +1020,40 @@ fn install_wheel_runtime(
     Ok(output)
 }
 
-fn therock_pip_package_specs(package_versions: &TheRockPipPackageVersions) -> Vec<String> {
+fn therock_pip_package_specs(
+    package_versions: &TheRockPipPackageVersions,
+    rocm_extras: &str,
+) -> Vec<String> {
     vec![
-        format!("rocm[libraries,devel]=={}", package_versions.rocm),
+        format!("rocm[{rocm_extras}]=={}", package_versions.rocm),
         format!("torch=={}", package_versions.torch),
         format!("torchvision=={}", package_versions.torchvision),
         format!("torchaudio=={}", package_versions.torchaudio),
     ]
+}
+
+fn is_multi_arch_pip_index(index_url: &str) -> bool {
+    index_url.trim_end_matches('/') == THEROCK_RELEASE_PIP_MULTI_ARCH_INDEX_BASE
+}
+
+/// The `rocm[...]` extras to request for a resolved pip index. The classic
+/// per-family index needs only the base `libraries,devel` extras; the flat
+/// multi-arch index additionally needs an explicit `device-*` extra or no GPU
+/// backend gets installed at all.
+fn therock_rocm_extras(family: &str, index_url: &str) -> String {
+    let mut extras = "libraries,devel".to_owned();
+    if !is_multi_arch_pip_index(index_url) {
+        return extras;
+    }
+    match known_therock_family_device_chips(family) {
+        Some(chips) => {
+            for chip in chips {
+                let _ = write!(extras, ",device-{chip}");
+            }
+        }
+        None => extras.push_str(",device-all"),
+    }
+    extras
 }
 
 fn quote_display_arg(value: &str) -> String {
@@ -3368,9 +3403,12 @@ fn parse_version(value: &str) -> Option<ParsedVersion> {
 
 fn therock_index_urls(channel: TheRockChannel, family: &str) -> Vec<String> {
     match channel {
+        // Multi-arch is flat (no per-family path segment) and is where AMD
+        // publishes current releases; try it first. The classic per-family
+        // index is kept as a fallback so older releases stay installable.
         TheRockChannel::Release => vec![
+            THEROCK_RELEASE_PIP_MULTI_ARCH_INDEX_BASE.to_owned(),
             format!("{THEROCK_RELEASE_PIP_INDEX_BASE}/{family}"),
-            format!("{THEROCK_RELEASE_PIP_MULTI_ARCH_INDEX_BASE}/{family}"),
         ],
         TheRockChannel::Nightly => vec![format!("{THEROCK_NIGHTLY_PIP_INDEX_BASE}/{family}")],
     }
@@ -4065,7 +4103,7 @@ mod tests {
             torchaudio: "2.10.0+rocm7.13.0a20260513".to_owned(),
             compatibility_key: "7.13.0a20260513".to_owned(),
         };
-        let package_specs = therock_pip_package_specs(&package_versions);
+        let package_specs = therock_pip_package_specs(&package_versions, "libraries,devel");
 
         assert_eq!(
             package_specs,
@@ -4075,6 +4113,51 @@ mod tests {
                 "torchvision==0.25.0+rocm7.13.0a20260513".to_owned(),
                 "torchaudio==2.10.0+rocm7.13.0a20260513".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn therock_index_urls_prefers_multi_arch_then_classic_for_release() {
+        let urls = therock_index_urls(TheRockChannel::Release, "gfx110X-all");
+        assert_eq!(
+            urls,
+            vec![
+                "https://repo.amd.com/rocm/whl-multi-arch".to_owned(),
+                "https://repo.amd.com/rocm/whl/gfx110X-all".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn therock_index_urls_nightly_unchanged() {
+        let urls = therock_index_urls(TheRockChannel::Nightly, "gfx110X-all");
+        assert_eq!(
+            urls,
+            vec!["https://rocm.nightlies.amd.com/v2/gfx110X-all".to_owned()]
+        );
+    }
+
+    #[test]
+    fn therock_rocm_extras_classic_index_is_unchanged() {
+        assert_eq!(
+            therock_rocm_extras("gfx110X-all", "https://repo.amd.com/rocm/whl/gfx110X-all"),
+            "libraries,devel"
+        );
+    }
+
+    #[test]
+    fn therock_rocm_extras_multi_arch_adds_exact_device_chips() {
+        assert_eq!(
+            therock_rocm_extras("gfx110X-all", "https://repo.amd.com/rocm/whl-multi-arch"),
+            "libraries,devel,device-gfx1100,device-gfx1101,device-gfx1102,device-gfx1103"
+        );
+    }
+
+    #[test]
+    fn therock_rocm_extras_multi_arch_falls_back_to_device_all_for_ambiguous_bucket() {
+        assert_eq!(
+            therock_rocm_extras("gfx90X-dcgpu", "https://repo.amd.com/rocm/whl-multi-arch"),
+            "libraries,devel,device-all"
         );
     }
 
