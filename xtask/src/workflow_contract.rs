@@ -296,6 +296,53 @@ mod tests {
     }
 
     #[test]
+    fn wsl_jobs_accept_every_canonical_wsl_detection_signal() {
+        for (workflow, job) in [
+            ("e2e-selfhosted.yml", "e2e-wsl"),
+            ("nightly.yml", "e2e-wsl-nightly"),
+        ] {
+            let text = read_workflow(workflow);
+            let block = job_block(&text, job);
+            // Remove shell line-continuation backslashes after whitespace has
+            // been normalized so the assertion describes the effective test.
+            let block = normalized_whitespace(block).replace("\\ ", "");
+            assert!(
+                block.contains("proc_version=$(cat /proc/version 2>/dev/null || true)"),
+                "{workflow} job {job} must read the canonical kernel-version signal"
+            );
+            let distro_signal = ["$", "{", "WSL_DISTRO_NAME:-", "}"].concat();
+            let canonical_union = format!(
+                "if [ ! -e /dev/dxg ] && [ -z \"{distro_signal}\" ] && ! printf '%s\\n' \"$proc_version\" | grep -qiE 'microsoft|wsl'; then"
+            );
+            assert!(
+                block.contains(&canonical_union),
+                "{workflow} job {job} must accept the canonical union of WSL signals"
+            );
+            assert!(
+                !block.contains("/proc/sys/kernel/osrelease"),
+                "{workflow} job {job} must not use the narrower osrelease-only WSL check"
+            );
+        }
+    }
+
+    #[test]
+    fn every_nightly_strix_job_uses_the_shared_machine_tui_budget() {
+        let nightly = read_workflow("nightly.yml");
+        for job in [
+            "e2e-gpu-nightly-strix",
+            "e2e-gpu-nightly-strix-windows",
+            "e2e-wsl-nightly",
+        ] {
+            let env = job_mapping(job_block(&nightly, job), "env");
+            assert_eq!(
+                env.get("E2E_TUI_TIMEOUT_SECS").map(String::as_str),
+                Some("90"),
+                "nightly Strix job {job} must use the shared-machine TUI wait budget"
+            );
+        }
+    }
+
+    #[test]
     fn hardware_testing_docs_cover_all_four_self_hosted_platforms() {
         let docs = std::fs::read_to_string(repo_root().join("docs/ci-hardware-testing.md"))
             .expect("read hardware testing docs");

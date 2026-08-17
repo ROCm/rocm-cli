@@ -697,7 +697,10 @@ jobs:
       # every WSL-tagged scenario would silently resolve to skip instead.
       - name: Verify the host really is WSL2
         run: |
-          if ! grep -qi microsoft /proc/sys/kernel/osrelease; then
+          proc_version=$(cat /proc/version 2>/dev/null || true)
+          if [ ! -e /dev/dxg ] \
+            && [ -z "${WSL_DISTRO_NAME:-}" ] \
+            && ! printf '%s\n' "$proc_version" | grep -qiE 'microsoft|wsl'; then
             echo "::error::runner is not a WSL host: $(uname -r)"
             exit 1
           fi

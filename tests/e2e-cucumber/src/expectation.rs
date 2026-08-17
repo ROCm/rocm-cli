@@ -197,6 +197,8 @@ pub struct Condition {
     #[serde(default)]
     pub therock_family: Option<String>,
     #[serde(default)]
+    pub has_amd_gpu: Option<bool>,
+    #[serde(default)]
     pub is_wsl: Option<bool>,
 }
 
@@ -218,6 +220,11 @@ impl Condition {
             if !glob_match(fam, host_fam) {
                 return false;
             }
+        }
+        if let Some(has_gpu) = self.has_amd_gpu
+            && has_gpu != cap.has_amd_gpu
+        {
+            return false;
         }
         if let Some(w) = self.is_wsl
             && w != cap.is_wsl
@@ -541,6 +548,17 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "wsl".into(),
+            },
+            // The hosted WSL runner before the ROCm passthrough is complete:
+            // Windows still reports the gfx target, but the CLI cannot use it.
+            "wsl-no-passthrough" => HostCapability {
+                os_family: "linux".into(),
+                is_wsl: true,
+                gfx_target: Some("gfx1151".into()),
+                has_amd_gpu: false,
+                available_engines: vec!["lemonade".into(), "vllm".into()],
+                effective_serve_engine: "lemonade".into(),
+                platform_slug: "strix-halo-wsl".into(),
             },
             _ => HostCapability {
                 os_family: "other".into(),
@@ -994,6 +1012,31 @@ reason = "vLLM readiness gap"
         ));
         // No entry at all → expect-pass.
         assert!(!m.is_xfail("nope", &cap("mi300x"), "vllm"));
+    }
+
+    #[test]
+    fn gpu_bug_condition_does_not_match_an_unusable_wsl_gpu() {
+        let m = Expectations::parse(
+            r#"
+[["chat-end-to-end-local-model"]]
+when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*", has_amd_gpu = true }
+bug = "EAI-7423"
+reason = "Applies only when the scenario uses a real Lemonade GPU serve."
+flaky = true
+"#,
+        )
+        .unwrap();
+
+        assert!(m.is_xfail(
+            "chat-end-to-end-local-model",
+            &cap("strix-ubuntu"),
+            "lemonade"
+        ));
+        assert!(!m.is_xfail(
+            "chat-end-to-end-local-model",
+            &cap("wsl-no-passthrough"),
+            "lemonade"
+        ));
     }
 
     #[test]

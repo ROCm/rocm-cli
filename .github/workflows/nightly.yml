@@ -435,6 +435,7 @@ jobs:
       PIP_CACHE_DIR: /home/ubuntu/actions-runner/pip-cache
       E2E_INCLUDE_NIGHTLY: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
+      E2E_TUI_TIMEOUT_SECS: "90"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -530,6 +531,7 @@ jobs:
     env:
       E2E_INCLUDE_NIGHTLY: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
+      E2E_TUI_TIMEOUT_SECS: "90"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -653,7 +655,10 @@ jobs:
       # every WSL-tagged scenario would silently resolve to skip instead.
       - name: Verify the host really is WSL2
         run: |
-          if ! grep -qi microsoft /proc/sys/kernel/osrelease; then
+          proc_version=$(cat /proc/version 2>/dev/null || true)
+          if [ ! -e /dev/dxg ] \
+            && [ -z "${WSL_DISTRO_NAME:-}" ] \
+            && ! printf '%s\n' "$proc_version" | grep -qiE 'microsoft|wsl'; then
             echo "::error::runner is not a WSL host: $(uname -r)"
             exit 1
           fi
