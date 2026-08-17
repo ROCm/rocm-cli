@@ -67,7 +67,7 @@ pub use runtime::{
     runtime_path_text_is_absolute_for_platform, runtime_paths_equivalent,
     runtime_python_activation_hint, runtime_python_activation_script, runtime_python_bin_dir_name,
     runtime_python_env_bin_dir, runtime_python_executable_in_env, runtime_python_executable_name,
-    runtime_rocm_library_filename, shell_command_for_host,
+    runtime_rocm_library_filename, shell_command_for_host, user_runtime_dir,
 };
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV, UvCacheSource,
@@ -5251,8 +5251,8 @@ pub struct RocmCliConfig {
 fn default_dashboard_socket() -> String {
     // Choose a socket location whose *parent* directory is always user-owned so
     // that run_unix can tighten it to 0o700 without EPERM. See
-    // `dashboard_socket_path` for the precedence. This resolver is mirrored in
-    // `rocm-dash-core` so the canonical `rocm` config and a standalone
+    // `runtime::user_runtime_dir` for the precedence. This resolver is mirrored
+    // in `rocm-dash-core` so the canonical `rocm` config and a standalone
     // `rocm-dash` config resolve to the same place; keep the two in sync.
     let path = dashboard_socket_path(
         std::env::var_os("XDG_RUNTIME_DIR"),
@@ -5276,48 +5276,18 @@ fn default_dashboard_socket() -> String {
 /// 2. `$HOME/.rocm/data/telemetry` — standard per-user data dir.
 /// 3. `temp_dir()/rocm-<user>` — user-named subdir so the parent is something we
 ///    create and own, not `/tmp` itself.
+///
+/// The tier chain itself lives in [`user_runtime_dir`], which the Lemonade
+/// engine also uses to synthesize a runtime directory for its child process.
+/// Only tier 2 needs the `telemetry` leaf: tiers 1 and 3 are already per-user
+/// runtime directories, so the socket sits directly in them.
 fn dashboard_socket_path(
     xdg_runtime_dir: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
     user: Option<String>,
     temp_dir: std::path::PathBuf,
 ) -> std::path::PathBuf {
-    use std::path::PathBuf;
-    xdg_runtime_dir
-        .filter(|v| !v.is_empty())
-        .map(|d| PathBuf::from(d).join("rocmdashd.sock"))
-        .or_else(|| {
-            home.filter(|v| !v.is_empty()).map(|h| {
-                PathBuf::from(h)
-                    .join(".rocm")
-                    .join("data")
-                    .join("telemetry")
-                    .join("rocmdashd.sock")
-            })
-        })
-        .unwrap_or_else(|| {
-            let raw = user.unwrap_or_else(|| "user".to_owned());
-            // Sanitize: keep only alphanumeric, hyphen, and underscore so a path
-            // separator or `..` in the env var cannot escape the subdirectory.
-            let sanitized: String = raw
-                .chars()
-                .map(|c| {
-                    if c.is_alphanumeric() || c == '-' || c == '_' {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .collect();
-            let sanitized = if sanitized.is_empty() {
-                "user".to_owned()
-            } else {
-                sanitized
-            };
-            temp_dir
-                .join(format!("rocm-{sanitized}"))
-                .join("rocmdashd.sock")
-        })
+    user_runtime_dir(xdg_runtime_dir, home, user, temp_dir, "telemetry", "").join("rocmdashd.sock")
 }
 
 fn default_dashboard_listen() -> String {
