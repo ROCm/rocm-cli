@@ -1844,14 +1844,9 @@ fn with_metadata_public_key<T>(
         return verify(public_key_path, "path").map(Some);
     }
     if let Some(public_key_pem) = &policy.public_key_pem {
-        let parent = temp_key_path
-            .parent()
-            .context("metadata public key temp path has no parent directory")?;
-        fs::create_dir_all(parent)?;
-        fs::write(temp_key_path, public_key_pem)
-            .with_context(|| format!("failed to write {}", temp_key_path.display()))?;
-        let result = verify(temp_key_path, "env-pem");
-        let _ = fs::remove_file(temp_key_path);
+        let staged_key = stage_file_for_atomic_publish(temp_key_path, public_key_pem.as_bytes())?;
+        let result = verify(&staged_key, "env-pem");
+        let _ = fs::remove_file(staged_key);
         return result.map(Some);
     }
     bail!(
@@ -1874,23 +1869,33 @@ fn fetch_and_verify_metadata_signature(
     signature_path: &Path,
     temp_key_path: &Path,
     max_time_secs: Option<u64>,
-) -> Result<Option<CachedHttpSignatureMetadata>> {
+) -> Result<Option<(CachedHttpSignatureMetadata, PathBuf)>> {
     if !policy.active() {
         return Ok(None);
     }
     let signature_url = metadata_signature_url(url);
-    download_signature_file(&signature_url, signature_path, max_time_secs)?;
-    let public_key_source =
-        with_metadata_public_key(policy, temp_key_path, |public_key, source| {
-            verify_metadata_signature(payload_path, signature_path, public_key)?;
-            Ok(source.to_owned())
-        })?
-        .context("metadata signature policy was active but no public key was resolved")?;
-    Ok(Some(CachedHttpSignatureMetadata {
-        url: signature_url,
-        verified_at_unix_ms: unix_time_millis(),
-        public_key_source,
-    }))
+    let staged_signature = download_signature_file(&signature_url, signature_path, max_time_secs)?;
+    let verification = with_metadata_public_key(policy, temp_key_path, |public_key, source| {
+        verify_metadata_signature(payload_path, &staged_signature, public_key)?;
+        Ok(source.to_owned())
+    });
+    let public_key_source = match verification.and_then(|source| {
+        source.context("metadata signature policy was active but no public key was resolved")
+    }) {
+        Ok(source) => source,
+        Err(error) => {
+            let _ = fs::remove_file(&staged_signature);
+            return Err(error);
+        }
+    };
+    Ok(Some((
+        CachedHttpSignatureMetadata {
+            url: signature_url,
+            verified_at_unix_ms: unix_time_millis(),
+            public_key_source,
+        },
+        staged_signature,
+    )))
 }
 
 fn verify_cached_metadata_signature(
@@ -1918,21 +1923,19 @@ fn download_signature_file(
     url: &str,
     destination: &Path,
     max_time_secs: Option<u64>,
-) -> Result<()> {
+) -> Result<PathBuf> {
     let parent = destination
         .parent()
         .context("metadata signature destination has no parent directory")?;
     fs::create_dir_all(parent)?;
     let response = http_get(url, &[], max_time_secs)?;
     if response.status != 200 {
-        let _ = fs::remove_file(destination);
         bail!(
             "HTTP {} while fetching metadata signature {url}",
             response.status
         );
     }
-    write_file_atomically(destination, &response.body)?;
-    Ok(())
+    stage_file_for_atomic_publish(destination, &response.body)
 }
 
 fn verify_metadata_signature(
@@ -1988,10 +1991,7 @@ fn download_text_cached(
         .context("metadata cache path has no parent directory")?;
     fs::create_dir_all(cache_dir)?;
 
-    let unique = unix_time_millis();
-    let tmp_body = body_path.with_extension(format!("body.tmp-{unique}"));
-    let tmp_signature = body_path.with_extension(format!("sig.tmp-{unique}"));
-    let tmp_public_key = body_path.with_extension(format!("public-key.tmp-{unique}.pem"));
+    let tmp_public_key = body_path.with_extension("public-key.pem");
     let mut headers = Vec::new();
     if let Some(etag) = previous_metadata
         .as_ref()
@@ -2005,7 +2005,6 @@ fn download_text_cached(
 
     let response = http_get(url, &headers, max_time_secs)?;
     if response.status == 304 {
-        let _ = fs::remove_file(&tmp_body);
         verify_cached_metadata_signature(
             &signature_policy,
             &body_path,
@@ -2021,49 +2020,48 @@ fn download_text_cached(
         return Ok(CachedHttpText { text });
     }
     if response.status != 200 {
-        let _ = fs::remove_file(&tmp_body);
         bail!("HTTP {} while fetching {url}", response.status);
     }
 
-    write_file_atomically(&tmp_body, &response.body)?;
-    let signature_metadata = match fetch_and_verify_metadata_signature(
+    let tmp_body = stage_file_for_atomic_publish(&body_path, &response.body)?;
+    let fetched_signature = match fetch_and_verify_metadata_signature(
         &signature_policy,
         url,
         &tmp_body,
-        &tmp_signature,
+        &signature_path,
         &tmp_public_key,
         max_time_secs,
     ) {
-        Ok(signature_metadata) => signature_metadata,
+        Ok(signature) => signature,
         Err(error) => {
             let _ = fs::remove_file(&tmp_body);
-            let _ = fs::remove_file(&tmp_signature);
-            let _ = fs::remove_file(&tmp_public_key);
             return Err(error);
         }
     };
+    let signature_metadata = fetched_signature
+        .as_ref()
+        .map(|(metadata, _)| metadata.clone());
     let metadata = CachedHttpMetadata {
         url: url.to_owned(),
         etag: http_header_value(&response.headers, "etag"),
         last_modified: http_header_value(&response.headers, "last-modified"),
-        signature: signature_metadata.clone(),
+        signature: signature_metadata,
         fetched_at_unix_ms: unix_time_millis(),
     };
-    fs::rename(&tmp_body, &body_path).or_else(|_| {
-        let _ = fs::remove_file(&body_path);
-        fs::rename(&tmp_body, &body_path)
-    })?;
-    if signature_metadata.is_some() {
-        fs::rename(&tmp_signature, &signature_path).or_else(|_| {
-            let _ = fs::remove_file(&signature_path);
-            fs::rename(&tmp_signature, &signature_path)
-        })?;
+    if let Err(error) = publish_staged_file(&tmp_body, &body_path) {
+        if let Some((_, staged_signature)) = &fetched_signature {
+            let _ = fs::remove_file(staged_signature);
+        }
+        return Err(error);
+    }
+    if let Some((_, staged_signature)) = fetched_signature {
+        publish_staged_file(&staged_signature, &signature_path)?;
     } else {
         let _ = fs::remove_file(&signature_path);
     }
-    fs::write(
+    write_file_atomically(
         &metadata_path,
-        serde_json::to_vec_pretty(&metadata)
+        &serde_json::to_vec_pretty(&metadata)
             .context("failed to serialize metadata cache record")?,
     )?;
     let text = fs::read_to_string(&body_path)
@@ -2327,7 +2325,7 @@ where
 fn write_file_atomically_with_publish<S, P, F>(
     path: &Path,
     bytes: &[u8],
-    mut suffix_for_attempt: S,
+    suffix_for_attempt: S,
     before_publish: P,
     publish: F,
 ) -> Result<()>
@@ -2335,6 +2333,26 @@ where
     S: FnMut(u32) -> OsString,
     P: FnOnce(),
     F: FnOnce(&Path, &Path) -> io::Result<()>,
+{
+    let tmp = stage_file_for_atomic_publish_with(path, bytes, suffix_for_attempt)?;
+    before_publish();
+    publish_staged_file_with(&tmp, path, publish)
+}
+
+fn stage_file_for_atomic_publish(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    let temp_id = format!("{}-{}", std::process::id(), unix_time_millis());
+    stage_file_for_atomic_publish_with(path, bytes, |attempt| {
+        OsString::from(format!("{temp_id}-{attempt}"))
+    })
+}
+
+fn stage_file_for_atomic_publish_with<S>(
+    path: &Path,
+    bytes: &[u8],
+    mut suffix_for_attempt: S,
+) -> Result<PathBuf>
+where
+    S: FnMut(u32) -> OsString,
 {
     let parent = path.parent().context("file path has no parent directory")?;
     fs::create_dir_all(parent)?;
@@ -2372,12 +2390,22 @@ where
         return Err(disk_space::map_write_error(error, &tmp));
     }
     drop(file);
-    before_publish();
+    Ok(tmp)
+}
 
-    publish(&tmp, path).inspect_err(|_| {
-        let _ = fs::remove_file(&tmp);
-    })?;
-    Ok(())
+fn publish_staged_file(tmp: &Path, path: &Path) -> Result<()> {
+    publish_staged_file_with(tmp, path, publish_temp_file)
+}
+
+fn publish_staged_file_with<F>(tmp: &Path, path: &Path, publish: F) -> Result<()>
+where
+    F: FnOnce(&Path, &Path) -> io::Result<()>,
+{
+    publish(tmp, path)
+        .inspect_err(|_| {
+            let _ = fs::remove_file(tmp);
+        })
+        .with_context(|| format!("failed to publish {}", path.display()))
 }
 
 #[cfg(not(windows))]
@@ -3584,6 +3612,75 @@ mod tests {
         let published = fs::read(&destination).expect("a writer must remain published");
         let _ = fs::remove_dir_all(&root);
         assert!(published == b"first" || published == b"second");
+    }
+
+    #[test]
+    fn concurrent_cached_publications_use_distinct_staging_files() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cache-publish-collision-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("index.body");
+        let before_publish = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let writers: Vec<_> = [b"first".as_slice(), b"second".as_slice()]
+            .into_iter()
+            .map(|bytes| {
+                let destination = destination.clone();
+                let before_publish = std::sync::Arc::clone(&before_publish);
+                std::thread::spawn(move || {
+                    let staged = stage_file_for_atomic_publish(&destination, bytes)?;
+                    before_publish.wait();
+                    publish_staged_file(&staged, &destination)
+                })
+            })
+            .collect();
+
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let published = fs::read(&destination).expect("a cache writer must remain published");
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().contains(".tmp-"))
+            .collect();
+        let _ = fs::remove_dir_all(&root);
+        assert!(published == b"first" || published == b"second");
+        assert!(
+            leftovers.is_empty(),
+            "staged cache files leaked: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn failed_cached_publication_preserves_destination_and_cleans_staging_file() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cache-publish-failure-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("index.body");
+        fs::write(&destination, b"published").unwrap();
+        let staged = stage_file_for_atomic_publish(&destination, b"replacement").unwrap();
+
+        publish_staged_file_with(&staged, &destination, |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "simulated cache publication failure",
+            ))
+        })
+        .expect_err("simulated cache publication failure must be returned");
+
+        assert_eq!(fs::read(&destination).unwrap(), b"published");
+        assert!(
+            !staged.exists(),
+            "failed publication leaked its staging file"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

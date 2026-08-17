@@ -76,7 +76,10 @@ cargo xtask e2e
 Prebuilt mode requires only `ROCM_CLI_BINARY` for scenarios that invoke
 `rocm`. Scenarios backed by `rocmd`, such as artifact prefetch, additionally
 require an explicit matching `ROCM_CLI_ROCMD_BINARY`; the harness does not
-infer a sibling executable.
+infer a sibling executable. Lifecycle packaging requires both prebuilt binaries
+to be in the same directory because `xtask package` consumes one `ROCM_BIN_DIR`;
+the harness rejects separate directories instead of silently packaging a
+different `rocmd`.
 
 The default run is fast: it excludes the expensive, OS-mutating `@lifecycle`
 release-install scenarios (packaging + the real installer + install/uninstall).
@@ -200,7 +203,7 @@ The `.feature` file is both the spec and the test input — cucumber reads it at
 
 ## Design principles
 
-- **Black-box only.** Step functions interact with `rocm` through its CLI and HTTP endpoints. No imports from the rocm-cli codebase. Where a scenario needs the CLI to know about a running server, it plants a managed-service record as plain JSON matching the on-disk schema (see `register_mock_service`) — the same file `rocm serve --managed` would write — rather than importing the record type.
+- **Black-box only.** Step functions interact with `rocm` and explicitly configured `rocmd` through their CLIs and HTTP endpoints. No imports from the rocm-cli codebase. Where a scenario needs the CLI to know about a running server, it plants a managed-service record as plain JSON matching the on-disk schema (see `register_mock_service`) — the same file `rocm serve --managed` would write — rather than importing the record type.
 - **Isolated state.** Each scenario uses isolated config, data, and cache directories. Tests never touch `~/.rocm`.
 - **Behavioral language.** Feature files describe what users care about, not implementation details. How steps are implemented (mock vs real, which port, which API) stays in the step functions.
 - **OS-assigned ports.** The mock server binds to `127.0.0.1:0` to avoid port conflicts between tests.
