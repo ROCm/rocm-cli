@@ -127,6 +127,87 @@ mod tests {
             .expect("workflow declares a top-level name:")
     }
 
+    fn multiline_run_blocks(text: &str) -> Vec<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut blocks = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if line.trim_start() != "run: |" {
+                continue;
+            }
+            let run_indent = indent_of(line);
+            let mut block = String::new();
+            for body_line in &lines[i + 1..] {
+                if !body_line.trim().is_empty() && indent_of(body_line) <= run_indent {
+                    break;
+                }
+                block.push_str(body_line.trim());
+                block.push('\n');
+            }
+            blocks.push(block);
+        }
+        blocks
+    }
+
+    fn invokes_e2e(block: &str) -> bool {
+        block.lines().any(|line| {
+            let line = line.trim();
+            line == "cargo xtask e2e" || line.starts_with("cargo xtask e2e --")
+        })
+    }
+
+    fn assert_prebuilt_e2e_lanes_export_rocmd(workflow: &str, text: &str) {
+        let blocks: Vec<_> = multiline_run_blocks(text)
+            .into_iter()
+            .filter(|block| block.contains("ROCM_CLI_BINARY") && invokes_e2e(block))
+            .collect();
+        assert!(
+            !blocks.is_empty(),
+            "{workflow} must contain prebuilt E2E run blocks"
+        );
+
+        let mut unix_lanes = 0;
+        let mut powershell_lanes = 0;
+        for block in blocks {
+            assert!(
+                block.contains("cargo build --release -p rocm -p rocmd"),
+                "{workflow} prebuilt E2E lane must build rocm and rocmd together:\n{block}"
+            );
+            assert!(
+                block.contains("ROCM_CLI_ROCMD_BINARY"),
+                "{workflow} prebuilt E2E lane exports ROCM_CLI_BINARY but not \
+                 ROCM_CLI_ROCMD_BINARY:\n{block}"
+            );
+
+            if block.contains("export ROCM_CLI_BINARY=") {
+                unix_lanes += 1;
+                assert!(
+                    block.contains(
+                        "export ROCM_CLI_ROCMD_BINARY=\"$CARGO_TARGET_DIR/release/rocmd\""
+                    ),
+                    "{workflow} Unix E2E lane must export the release rocmd path:\n{block}"
+                );
+            } else if block.contains("$env:ROCM_CLI_BINARY") {
+                powershell_lanes += 1;
+                assert!(
+                    block.contains(
+                        "$env:ROCM_CLI_ROCMD_BINARY = \"$targetDir\\release\\rocmd.exe\""
+                    ),
+                    "{workflow} PowerShell E2E lane must export the release rocmd.exe path:\n{block}"
+                );
+            } else {
+                panic!("{workflow} prebuilt E2E lane uses an unknown shell contract:\n{block}");
+            }
+        }
+        assert!(
+            unix_lanes > 0,
+            "{workflow} must cover at least one Unix E2E lane"
+        );
+        assert!(
+            powershell_lanes > 0,
+            "{workflow} must cover at least one PowerShell E2E lane"
+        );
+    }
+
     #[test]
     fn ci_yml_schedules_no_self_hosted_job() {
         let ci = read_workflow("ci.yml");
@@ -202,6 +283,18 @@ mod tests {
             "the two workflows must have different `name:` values so their \
              github.workflow-keyed concurrency groups are distinct (EAI-7548)"
         );
+    }
+
+    #[test]
+    fn self_hosted_prebuilt_e2e_lanes_export_rocmd() {
+        let workflow = read_workflow("e2e-selfhosted.yml");
+        assert_prebuilt_e2e_lanes_export_rocmd("e2e-selfhosted.yml", &workflow);
+    }
+
+    #[test]
+    fn nightly_prebuilt_e2e_lanes_export_rocmd() {
+        let workflow = read_workflow("nightly.yml");
+        assert_prebuilt_e2e_lanes_export_rocmd("nightly.yml", &workflow);
     }
 
     // Extractor guards: prove the helpers actually parse multiline forms, so the
