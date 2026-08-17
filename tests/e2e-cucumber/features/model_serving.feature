@@ -154,3 +154,19 @@ Feature: Model serving
     When the user serves a model pinned to a GPU index that does not exist
     Then serving is refused before any engine starts
     And the user is told that GPU index is unavailable
+
+  # Visible-ordinal correctness (EAI-7194): a `--gpu` index that physically EXISTS
+  # on the host but is hidden by an active visibility mask
+  # (HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES) must be validated against the
+  # VISIBLE set and refused — never silently remapped onto a visible device. This
+  # is distinct from scenario 13 (an index beyond the device count): here the index
+  # is in range yet masked out. On a multi-GPU host (e.g. MI300X) `--gpu 1` under
+  # `HIP_VISIBLE_DEVICES=0` is in range but masked, exercising the visible-set
+  # rejection directly; on a single-GPU host the same request is simply out of
+  # range. Both are an honest refusal rather than a remap, which is what this
+  # asserts. Runs on GPU hardware.
+  @id:serve-masked-gpu-index-rejected @requires-gpu @requires-os:linux
+  Scenario: 15 - Serving pinned to a GPU hidden by the visibility mask is refused
+    When the user serves a model pinned to a GPU hidden by the visibility mask
+    Then serving is refused before any engine starts
+    And the user is told the pinned GPU is unavailable
