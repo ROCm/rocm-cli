@@ -2922,9 +2922,38 @@ fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
     })
 }
 
+/// The environment inputs [`resolve_python_launcher`] reads.
+///
+/// Passed in rather than read at each use site so a caller can point the
+/// resolver somewhere else without touching the process environment. Tests need
+/// that: `cargo test` runs every test as a thread in one process, so a test that
+/// overwrote `PATH` to steer this resolver also hid every other PATH-resolved
+/// binary from unrelated tests running at the same moment.
+struct PythonResolverEnv {
+    /// `ROCM_CLI_PYTHON`: an explicit interpreter that wins over any search.
+    python_override: Option<String>,
+    /// The directories to search for an interpreter, in `PATH` order.
+    search_dirs: Vec<PathBuf>,
+}
+
+impl PythonResolverEnv {
+    fn from_process_env() -> Self {
+        Self {
+            python_override: std::env::var("ROCM_CLI_PYTHON").ok(),
+            search_dirs: std::env::var_os("PATH")
+                .map(|value| split_runtime_path(&value))
+                .unwrap_or_default(),
+        }
+    }
+}
+
 fn resolve_python_launcher(paths: &AppPaths) -> Result<PythonLauncher> {
-    if let Ok(value) = std::env::var("ROCM_CLI_PYTHON") {
-        python_launcher_install_ready(Path::new(&value))
+    resolve_python_launcher_in(paths, &PythonResolverEnv::from_process_env())
+}
+
+fn resolve_python_launcher_in(paths: &AppPaths, env: &PythonResolverEnv) -> Result<PythonLauncher> {
+    if let Some(value) = env.python_override.as_deref() {
+        python_launcher_install_ready(Path::new(value))
             .with_context(|| format!("ROCM_CLI_PYTHON is not usable for ROCm setup: {value}"))?;
         return Ok(PythonLauncher {
             executable: PathBuf::from(value),
@@ -2933,7 +2962,7 @@ fn resolve_python_launcher(paths: &AppPaths) -> Result<PythonLauncher> {
     }
 
     let mut skipped_path_python = false;
-    for candidate in python_path_candidates() {
+    for candidate in python_path_candidates(&env.search_dirs) {
         match python_launcher_install_ready(&candidate) {
             Ok(()) => {
                 return Ok(PythonLauncher {
@@ -2974,7 +3003,7 @@ fn resolve_python_launcher(paths: &AppPaths) -> Result<PythonLauncher> {
     ensure_managed_python(paths)
 }
 
-fn python_path_candidates() -> Vec<PathBuf> {
+fn python_path_candidates(search_dirs: &[PathBuf]) -> Vec<PathBuf> {
     let program_names: &[&str] = if runtime_is_windows() {
         &["python", "python3", "py"]
     } else {
@@ -2982,17 +3011,14 @@ fn python_path_candidates() -> Vec<PathBuf> {
     };
     program_names
         .iter()
-        .flat_map(|program| resolve_program_on_path(program))
+        .flat_map(|program| resolve_program_on_path(program, search_dirs))
         .collect()
 }
 
-fn resolve_program_on_path(program: &str) -> Vec<PathBuf> {
-    let Some(path_value) = std::env::var_os("PATH") else {
-        return Vec::new();
-    };
+fn resolve_program_on_path(program: &str, search_dirs: &[PathBuf]) -> Vec<PathBuf> {
     let candidates = program_path_candidates(program);
-    split_runtime_path(&path_value)
-        .into_iter()
+    search_dirs
+        .iter()
         .flat_map(|dir| candidates.iter().map(move |candidate| dir.join(candidate)))
         .filter(|path| path.is_file())
         .map(|path| normalize_runtime_path_for_host(&path))
@@ -3671,7 +3697,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     fn python_launcher_prefers_path_python_before_saved_managed_python() -> Result<()> {
         if current_platform_wheel_tags().is_err() {
             // No wheel platform tag for this host (e.g. macOS): every python fails
@@ -3679,7 +3704,6 @@ mod tests {
             // the managed/uv path regardless of PATH. Nothing to assert here.
             return Ok(());
         }
-        let _guard = PYTHON_RESOLVER_TEST_ENV_LOCK.lock().unwrap();
         let (root, paths) = test_paths("python-prefers-path");
         let bin_dir = root.join("bin");
         fs::create_dir_all(&bin_dir)?;
@@ -3693,27 +3717,16 @@ mod tests {
             installed_at_unix_ms: 123,
         };
         save_managed_python_manifest(&paths, &manifest)?;
-        let old_path = std::env::var_os("PATH");
-        let old_rocm_cli_python = std::env::var_os("ROCM_CLI_PYTHON");
-        // Keep PATH hermetic: appending the real PATH lets a genuine cp312
+        // Keep the search hermetic: including the real PATH lets a genuine cp312
         // python (present on CI) win over the fake one and breaks the
-        // executable assertion. The fake on PATH is all this test needs.
-        let joined_path = std::env::join_paths([bin_dir])?;
-        unsafe {
-            std::env::set_var("PATH", joined_path);
-            std::env::remove_var("ROCM_CLI_PYTHON");
-        }
-        let launcher = resolve_python_launcher(&paths)?;
-        unsafe {
-            match old_path {
-                Some(old_path) => std::env::set_var("PATH", old_path),
-                None => std::env::remove_var("PATH"),
-            }
-            match old_rocm_cli_python {
-                Some(value) => std::env::set_var("ROCM_CLI_PYTHON", value),
-                None => std::env::remove_var("ROCM_CLI_PYTHON"),
-            }
-        }
+        // executable assertion. The fake alone is all this test needs.
+        let launcher = resolve_python_launcher_in(
+            &paths,
+            &PythonResolverEnv {
+                python_override: None,
+                search_dirs: vec![bin_dir],
+            },
+        )?;
         assert_eq!(launcher.source, "path");
         assert!(
             launcher.executable.is_absolute(),
@@ -3787,7 +3800,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     fn python_launcher_prefers_path_python_over_managed_when_venv_capable() -> Result<()> {
         if current_platform_wheel_tags().is_err() {
             // No wheel platform tag for this host (e.g. macOS): every python fails
@@ -3795,7 +3807,6 @@ mod tests {
             // the managed/uv path regardless of PATH. Nothing to assert here.
             return Ok(());
         }
-        let _guard = PYTHON_RESOLVER_TEST_ENV_LOCK.lock().unwrap();
         let (root, paths) = test_paths("python-path-over-managed");
         let bin_dir = root.join("bin");
         fs::create_dir_all(&bin_dir)?;
@@ -3809,27 +3820,48 @@ mod tests {
             installed_at_unix_ms: 123,
         };
         save_managed_python_manifest(&paths, &manifest)?;
-        let old_path = std::env::var_os("PATH");
-        let old_rocm_cli_python = std::env::var_os("ROCM_CLI_PYTHON");
-        let joined_path = std::env::join_paths([bin_dir])?;
-        unsafe {
-            std::env::set_var("PATH", joined_path);
-            std::env::remove_var("ROCM_CLI_PYTHON");
-        }
-        let launcher = resolve_python_launcher(&paths)?;
-        unsafe {
-            match old_path {
-                Some(old_path) => std::env::set_var("PATH", old_path),
-                None => std::env::remove_var("PATH"),
-            }
-            match old_rocm_cli_python {
-                Some(value) => std::env::set_var("ROCM_CLI_PYTHON", value),
-                None => std::env::remove_var("ROCM_CLI_PYTHON"),
-            }
-        }
+        let launcher = resolve_python_launcher_in(
+            &paths,
+            &PythonResolverEnv {
+                python_override: None,
+                search_dirs: vec![bin_dir],
+            },
+        )?;
 
         assert_eq!(launcher.source, "path");
         assert!(path_python.exists());
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    /// The interpreter search must look only where it is told to look.
+    ///
+    /// This is the property that keeps the resolver out of the process
+    /// environment. While it read `PATH` itself, the only way to steer it was to
+    /// overwrite `PATH` for the whole process — which, under `cargo test`, also
+    /// hid `tar` and every other PATH-resolved binary from the unrelated tests
+    /// sharing that process.
+    #[cfg(unix)]
+    #[test]
+    fn python_path_search_only_uses_the_given_directories() -> Result<()> {
+        let (root, _paths) = test_paths("python-search-scope");
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&bin_dir)?;
+        write_fake_python_with_venv(&bin_dir, "python3")?;
+
+        assert!(
+            python_path_candidates(&[]).is_empty(),
+            "an empty search list must yield no candidates even though the real PATH has a python"
+        );
+        let candidates = python_path_candidates(std::slice::from_ref(&bin_dir));
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.starts_with(&bin_dir)),
+            "the search must stay inside the given directories: {candidates:?}"
+        );
+        assert_eq!(candidates.len(), 1, "expected exactly the fixture python");
+
         fs::remove_dir_all(root).ok();
         Ok(())
     }
