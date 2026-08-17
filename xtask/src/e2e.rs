@@ -182,7 +182,7 @@ mod tests {
         configure_harness_env(&mut command, &binaries);
         assert_eq!(
             command_env(&command, "ROCM_CLI_ROCMD_BINARY"),
-            Some(OsString::from("/invoked/daemons/rocmd"))
+            binaries.rocmd.map(PathBuf::into_os_string)
         );
     }
 
