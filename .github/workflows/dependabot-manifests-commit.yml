@@ -92,6 +92,17 @@ jobs:
             exit 0
           fi
 
+          # Bound the untrusted download before it reaches the write-scoped
+          # runner's disk. The extracted files are capped at 10 MiB each below;
+          # 25 MiB leaves ample room for ZIP framing and metadata.
+          readonly MAX_ARTIFACT_BYTES=$((25 * 1024 * 1024))
+          artifact_size=$(jq -r '.[0].size_in_bytes // empty' <<<"$artifacts")
+          if [[ ! "$artifact_size" =~ ^[0-9]+$ ]] \
+            || (( artifact_size > MAX_ARTIFACT_BYTES )); then
+            echo "Refusing missing or excessive artifact size: $artifact_size bytes." >&2
+            exit 1
+          fi
+
           echo "has_artifact=true" >> "$GITHUB_OUTPUT"
           echo "artifact_id=$(jq -r '.[0].id' <<<"$artifacts")" >> "$GITHUB_OUTPUT"
           echo "branch=$head_ref" >> "$GITHUB_OUTPUT"

@@ -152,6 +152,22 @@ mod tests {
         block
     }
 
+    /// Extract an exact nested YAML mapping block, including its key line and
+    /// all more-deeply-indented children.
+    fn nested_block(text: &str, marker: &str) -> String {
+        let lines: Vec<&str> = text.lines().collect();
+        let start = lines
+            .iter()
+            .position(|line| *line == marker)
+            .unwrap_or_else(|| panic!("workflow declares nested block `{marker}`"));
+        let marker_indent = indent_of(marker);
+        let end = lines[start + 1..]
+            .iter()
+            .position(|line| !line.trim().is_empty() && indent_of(line) <= marker_indent)
+            .map_or(lines.len(), |offset| start + 1 + offset);
+        lines[start..end].join("\n")
+    }
+
     #[test]
     fn dependabot_pull_request_workflow_is_strictly_read_only() {
         let generator = read_workflow("dependabot-manifests.yml");
@@ -188,16 +204,18 @@ mod tests {
         assert!(jobs.contains("actions: read"));
         assert!(jobs.contains("contents: write"));
         assert!(jobs.contains("pull-requests: read"));
-        for required_job_gate in [
-            "github.event.workflow_run.conclusion == 'success'",
-            "github.event.workflow_run.actor.login == 'dependabot[bot]'",
-            "github.event.workflow_run.event == 'pull_request'",
-        ] {
-            assert!(
-                jobs.contains(required_job_gate),
-                "privileged job gate is missing semantic clause `{required_job_gate}`"
-            );
-        }
+        let commit_job = nested_block(&jobs, "  commit:");
+        let commit_job_if = nested_block(&commit_job, "    if: >-");
+        assert_eq!(
+            commit_job_if,
+            concat!(
+                "    if: >-\n",
+                "      github.event.workflow_run.conclusion == 'success'\n",
+                "      && github.event.workflow_run.actor.login == 'dependabot[bot]'\n",
+                "      && github.event.workflow_run.event == 'pull_request'",
+            ),
+            "the privileged job must reject untrusted actors and events before its write token is allocated"
+        );
 
         for required_guard in [
             "dependabot[bot]",
@@ -224,6 +242,22 @@ mod tests {
         assert!(jobs.contains("actions/artifacts/$ARTIFACT_ID/zip"));
         assert!(!jobs.contains("actions/download-artifact@"));
         assert!(jobs.contains("artifact_count\" -gt 1"));
+        assert!(jobs.contains("MAX_ARTIFACT_BYTES=$((25 * 1024 * 1024))"));
+        assert!(jobs.contains("artifact_size=$(jq -r '.[0].size_in_bytes // empty'"));
+        assert!(jobs.contains("artifact_size > MAX_ARTIFACT_BYTES"));
+        let size_guard = jobs
+            .find("artifact_size=$(jq -r '.[0].size_in_bytes // empty'")
+            .expect("workflow validates artifact size metadata");
+        let artifact_id_export = jobs
+            .find("artifact_id=$(jq -r '.[0].id'")
+            .expect("workflow exports the validated artifact ID");
+        let artifact_download = jobs
+            .find("actions/artifacts/$ARTIFACT_ID/zip")
+            .expect("workflow downloads the validated artifact");
+        assert!(
+            size_guard < artifact_id_export && artifact_id_export < artifact_download,
+            "artifact size must be validated before its ID is exported or downloaded"
+        );
         assert!(jobs.contains("artifact must contain exactly the two generated files"));
         assert!(jobs.contains("from stat import S_ISREG"));
         assert!(jobs.contains("mode != 0 and not S_ISREG(mode)"));
