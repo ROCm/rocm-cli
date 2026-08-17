@@ -52,8 +52,6 @@ pub use proc_lifecycle::{
     process_start_ticks, terminate_verified,
 };
 use runtime::env_path_override;
-#[cfg(test)]
-use runtime::home_rocm_dir;
 pub use runtime::{
     RuntimeHost, RuntimePlatform, current_executable_path, default_cache_dir, default_config_dir,
     default_data_dir, default_interactive_shell_program, managed_logs_dir, managed_pip_cache_dir,
@@ -1565,7 +1563,7 @@ impl AppPaths {
     pub fn discover() -> Result<Self> {
         let data_dir_override = env_path_override("ROCM_CLI_DATA_DIR");
         let cache_dir_override = env_path_override("ROCM_CLI_CACHE_DIR");
-        let mut paths = Self {
+        let paths = Self {
             config_dir: env_path_override("ROCM_CLI_CONFIG_DIR")
                 .or_else(default_config_dir)
                 .context("unable to determine config directory for rocm-cli")?,
@@ -1579,12 +1577,24 @@ impl AppPaths {
                 .context("unable to determine cache directory for rocm-cli")?,
         }
         .normalize_for_host();
-        if data_dir_override.is_none()
+        Ok(Self::discover_from_paths(
+            paths,
+            data_dir_override.is_some(),
+            cache_dir_override.is_some(),
+        ))
+    }
+
+    fn discover_from_paths(
+        mut paths: Self,
+        data_dir_overridden: bool,
+        cache_dir_overridden: bool,
+    ) -> Self {
+        if !data_dir_overridden
             && let Some(managed_root) = configured_managed_root_from_config(&paths)
         {
-            paths = paths.with_managed_root(managed_root, cache_dir_override.is_some());
+            paths = paths.with_managed_root(managed_root, cache_dir_overridden);
         }
-        Ok(paths.normalize_for_host())
+        paths.normalize_for_host()
     }
 
     fn normalize_for_host(mut self) -> Self {
@@ -7736,6 +7746,29 @@ mod tests {
         Status(&'static str),
     }
 
+    impl DownloadReply {
+        fn client_may_disconnect(self) -> bool {
+            matches!(
+                self,
+                Self::ResumeAtWrongOffset { .. } | Self::Truncated { sent: 0 }
+            )
+        }
+    }
+
+    fn allow_expected_peer_disconnect(result: std::io::Result<()>) -> std::io::Result<()> {
+        match result {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
     /// Serve `body` over loopback, answering each request per `replies`.
     /// Returns the port and a handle yielding the raw requests received.
     fn spawn_download_server(
@@ -7772,6 +7805,7 @@ mod tests {
                     .unwrap_or(0);
                 requests.push(request);
                 let total = body.len();
+                let client_may_disconnect = reply.client_may_disconnect();
                 match reply {
                     DownloadReply::Complete | DownloadReply::IgnoreRange => {
                         write!(
@@ -7805,7 +7839,7 @@ mod tests {
                             total.saturating_sub(1),
                             total - start
                         )?;
-                        stream.write_all(&body[start..])?;
+                        allow_expected_peer_disconnect(stream.write_all(&body[start..]))?;
                     }
                     DownloadReply::Status(status_line) => {
                         write!(
@@ -7814,7 +7848,11 @@ mod tests {
                         )?;
                     }
                 }
-                stream.flush()?;
+                if client_may_disconnect {
+                    allow_expected_peer_disconnect(stream.flush())?;
+                } else {
+                    stream.flush()?;
+                }
             }
             Ok(requests)
         });
@@ -7838,6 +7876,27 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("failed to create scratch dir");
         dir
+    }
+
+    #[test]
+    fn download_fixture_tolerates_only_expected_peer_disconnects() {
+        assert!(DownloadReply::ResumeAtWrongOffset { start: 1 }.client_may_disconnect());
+        assert!(DownloadReply::Truncated { sent: 0 }.client_may_disconnect());
+        assert!(!DownloadReply::Truncated { sent: 1 }.client_may_disconnect());
+        assert!(!DownloadReply::Complete.client_may_disconnect());
+
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionReset,
+        ] {
+            allow_expected_peer_disconnect(Err(std::io::Error::from(kind)))
+                .expect("an intentionally rejected response may close its socket");
+        }
+
+        let error =
+            allow_expected_peer_disconnect(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)))
+                .expect_err("unrelated fixture I/O failures must remain visible");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[test]
@@ -8096,7 +8155,8 @@ mod tests {
     fn download_refuses_a_body_over_the_approved_limit() -> Result<()> {
         let body = download_body();
         let total = body.len() as u64;
-        let (port, server) = spawn_download_server(body, vec![DownloadReply::Complete])?;
+        let (port, server) =
+            spawn_download_server(body, vec![DownloadReply::Truncated { sent: 0 }])?;
         let dir = download_scratch("max-bytes");
         let destination = dir.join("artifact.bin");
         let url = format!("http://127.0.0.1:{port}/artifact.bin");
@@ -10831,34 +10891,35 @@ Class Name:                Display
     }
 
     #[test]
-    fn app_paths_discover_defaults_to_home_rocm_when_unoverridden() -> Result<()> {
-        if env_path_override("ROCM_CLI_CONFIG_DIR").is_some()
-            || env_path_override("ROCM_CLI_DATA_DIR").is_some()
-            || env_path_override("ROCM_CLI_CACHE_DIR").is_some()
-        {
-            return Ok(());
-        }
-        let Some(home_rocm) = home_rocm_dir() else {
-            return Ok(());
-        };
+    fn app_paths_apply_configured_managed_root_when_unoverridden() -> Result<()> {
+        let (root, paths) = temp_app_paths("configured-managed-root");
+        let managed_root = root.join("managed");
+        let persisted_runtime = managed_root
+            .join("runtimes")
+            .join("wheel")
+            .join("release-wheel-gfx942-7-0");
+        fs::create_dir_all(&paths.config_dir)?;
+        fs::write(
+            paths.config_path(),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "setup": { "therock_venv": persisted_runtime }
+            }))?,
+        )?;
 
-        let paths = AppPaths::discover()?;
+        let discovered = AppPaths::discover_from_paths(paths.clone(), false, false);
+        assert_eq!(discovered.config_dir, paths.config_dir);
+        assert_eq!(discovered.data_dir, managed_root);
+        assert_eq!(discovered.cache_dir, managed_root.join("cache"));
 
-        assert_eq!(paths.config_dir, home_rocm);
-        let home_paths = AppPaths {
-            config_dir: home_rocm.clone(),
-            data_dir: home_rocm.clone(),
-            cache_dir: home_rocm.join("cache"),
-        };
-        if let Some(managed_root) = configured_managed_root_from_config(&home_paths) {
-            let managed_root = normalize_runtime_path_for_host(&managed_root);
-            assert_eq!(paths.data_dir, managed_root);
-            assert_eq!(paths.cache_dir, managed_root.join("cache"));
-        } else {
-            assert_eq!(paths.data_dir, home_rocm);
-            assert_eq!(paths.cache_dir, home_rocm.join("cache"));
-        }
-        assert_eq!(paths.config_path(), home_rocm.join("config.json"));
+        let data_overridden = AppPaths::discover_from_paths(paths.clone(), true, false);
+        assert_eq!(data_overridden.data_dir, paths.data_dir);
+        assert_eq!(data_overridden.cache_dir, paths.cache_dir);
+
+        let cache_overridden = AppPaths::discover_from_paths(paths.clone(), false, true);
+        assert_eq!(cache_overridden.data_dir, managed_root);
+        assert_eq!(cache_overridden.cache_dir, paths.cache_dir);
+
+        fs::remove_dir_all(root).ok();
         Ok(())
     }
 
