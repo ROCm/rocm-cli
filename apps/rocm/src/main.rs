@@ -23878,8 +23878,14 @@ install therock";
     #[test]
     fn validate_pinned_gpu_index_accepts_in_range_or_unknown_count() {
         // In-range index pins exactly that ordinal.
-        assert_eq!(validate_pinned_gpu_index(0, Some(1), None).unwrap(), vec![0]);
-        assert_eq!(validate_pinned_gpu_index(3, Some(4), None).unwrap(), vec![3]);
+        assert_eq!(
+            validate_pinned_gpu_index(0, Some(1), None).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            validate_pinned_gpu_index(3, Some(4), None).unwrap(),
+            vec![3]
+        );
         // Unknown count (amd-smi unavailable) is allowed through unvalidated.
         assert_eq!(validate_pinned_gpu_index(7, None, None).unwrap(), vec![7]);
     }
@@ -26988,19 +26994,13 @@ ID_LIKE="suse opensuse"
                     let barrier = &barrier;
                     scope.spawn(move || {
                         barrier.wait();
-                        let _lock =
-                            rocm_core::FileLock::acquire(paths.managed_launch_lock_path())
-                                .expect("acquire launch lock");
+                        let _lock = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())
+                            .expect("acquire launch lock");
                         // Same call `serve()` makes under the launch lock. `None`
                         // visibility keeps selection mask-unaware for the test host.
-                        let gpu = resolve_gpu_indices(
-                            paths,
-                            &GpuSelection::Auto,
-                            detected,
-                            None,
-                            None,
-                        )
-                        .expect("auto GPU selection");
+                        let gpu =
+                            resolve_gpu_indices(paths, &GpuSelection::Auto, detected, None, None)
+                                .expect("auto GPU selection");
                         // Widen the select→claim window so an unlocked variant
                         // would deterministically double-book GPU 0; under the
                         // lock the second thread cannot enter until we claim.

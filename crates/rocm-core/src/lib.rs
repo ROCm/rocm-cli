@@ -1422,9 +1422,8 @@ impl FileLock {
     pub fn acquire(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create lock directory {}", parent.display())
-            })?;
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create lock directory {}", parent.display()))?;
         }
         let file = fs::OpenOptions::new()
             .read(true)
@@ -7579,7 +7578,9 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("contender started");
         assert!(
-            acquired_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            acquired_rx
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
             "second acquire must block while the first lock is still held"
         );
 
@@ -7595,8 +7596,10 @@ mod tests {
 
     #[test]
     fn file_lock_distinct_paths_do_not_contend() {
-        let dir =
-            std::env::temp_dir().join(format!("rocm-core-filelock-distinct-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "rocm-core-filelock-distinct-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
 
         // Two different lock files are independent; holding one must not block the
