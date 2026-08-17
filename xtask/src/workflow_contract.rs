@@ -31,7 +31,9 @@ mod tests {
 
     fn read_workflow(name: &str) -> String {
         let p = repo_root().join(".github/workflows").join(name);
-        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
+        std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
+            .replace("\r\n", "\n")
     }
 
     /// The self-hosted runner labels that must not appear in a `runs-on`.
