@@ -139,6 +139,43 @@ Dispatch the GPU lanes with, e.g.:
 gh workflow run e2e-selfhosted.yml --ref <ref> -f platform=app-dev-gpu
 ```
 
+## The shared pre-warmed runtime
+
+Nearly every GPU serve scenario points its `data/runtimes` at one shared,
+pre-warmed managed runtime (`E2E_SHARED_RUNTIMES_DIR`), so a multi-GiB
+`rocm install sdk` happens once per runner instead of once per scenario. The tree
+lives on the runner's persistent workspace and survives `git clean`.
+
+It is a **cache with invalidation**, not a one-shot install. Each self-hosted lane calls
+
+```bash
+cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
+```
+
+before the suite, which asks `rocm update` whether the channel index has published
+a newer version and then:
+
+- installs the SDK when nothing is present for that channel;
+- installs the newer runtime **side-by-side** and activates it
+  (`rocm update --apply --runtime <key> --activate`) when the index is ahead;
+- reuses the existing tree when it is `up_to_date`, when it is `ahead_of_index`
+  (a pinned build newer than the index must not be rolled back), or when freshness
+  cannot be established at all — an unreachable index reuses and warns rather than
+  re-downloading gigabytes or failing the lane;
+- prunes with `rocm storage remove-old-installs` after any install or update, so
+  the multi-version cache stays bounded.
+
+The runtime is always installed **in place**: `install sdk` bakes absolute paths
+into the runtime manifest, so a tree that is moved after installation leaves every
+serve pointing at a path that no longer exists.
+
+This replaced an existence-only guard that never reinstalled, which had frozen both
+MI300X runners on a 16-day-old runtime and left drift from a fresh install untested
+(`EAI-8057`). The decision logic lives in `xtask` rather than the workflows because
+the pre-warm block is duplicated across eight jobs in two shells; `xtask/src/e2e_prewarm.rs`
+carries unit tests for each freshness verdict, and the `runtime-update-reports-freshness`
+scenario pins the `rocm update` output shape those tests assume.
+
 ## Blocking vs. non-blocking
 
 The self-hosted jobs — `e2e-gpu`, `e2e-gpu-strix-ubuntu`,
