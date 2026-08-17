@@ -168,6 +168,55 @@ mod tests {
         lines[start..end].join("\n")
     }
 
+    /// Parse the scalar entries under an exact nested `permissions:` block.
+    /// Returning every entry makes equality assertions fail if any capability
+    /// is added, even when the new permission is not `contents: write`.
+    fn permission_mapping(text: &str, marker: &str) -> std::collections::BTreeMap<String, String> {
+        let block = nested_block(text, marker);
+        let mut permissions = std::collections::BTreeMap::new();
+        for raw in block.lines().skip(1) {
+            let line = strip_comment(raw).trim();
+            if line.is_empty() {
+                continue;
+            }
+            let (name, access) = line
+                .split_once(':')
+                .unwrap_or_else(|| panic!("permission entry is not `name: access`: {line}"));
+            let name = name.trim();
+            let access = access.trim();
+            assert!(
+                !name.is_empty() && !access.is_empty(),
+                "permission entry must have a scalar name and access: {line}"
+            );
+            assert!(
+                permissions
+                    .insert(name.to_owned(), access.to_owned())
+                    .is_none(),
+                "duplicate permission entry: {name}"
+            );
+        }
+        permissions
+    }
+
+    #[test]
+    fn permission_mapping_extractor_preserves_every_declared_permission() {
+        let job = "\
+  example:
+    permissions:
+      # This comment is not a capability.
+      contents: read
+      pull-requests: write
+    steps: []
+";
+        assert_eq!(
+            permission_mapping(job, "    permissions:"),
+            std::collections::BTreeMap::from([
+                ("contents".to_owned(), "read".to_owned()),
+                ("pull-requests".to_owned(), "write".to_owned()),
+            ])
+        );
+    }
+
     #[test]
     fn dependabot_pull_request_workflow_is_strictly_read_only() {
         let generator = read_workflow("dependabot-manifests.yml");
@@ -177,7 +226,12 @@ mod tests {
 
         assert!(trigger.contains("pull_request:"));
         assert_eq!(permissions.trim(), "{}");
-        assert!(jobs.contains("contents: read"));
+        let generate_job = nested_block(&jobs, "  generate:");
+        assert_eq!(
+            permission_mapping(&generate_job, "    permissions:"),
+            std::collections::BTreeMap::from([("contents".to_owned(), "read".to_owned())]),
+            "the untrusted generator job must have exactly contents: read"
+        );
         assert!(jobs.contains("actions/upload-artifact@"));
         assert!(jobs.contains("MANIFEST.md"));
         assert!(jobs.contains("THIRD_PARTY_NOTICES.txt"));
@@ -201,20 +255,30 @@ mod tests {
         assert!(trigger.contains("Dependabot manifests"));
         assert!(trigger.contains("completed"));
         assert_eq!(permissions.trim(), "{}");
-        assert!(jobs.contains("actions: read"));
-        assert!(jobs.contains("contents: write"));
-        assert!(jobs.contains("pull-requests: read"));
         let commit_job = nested_block(&jobs, "  commit:");
-        let commit_job_if = nested_block(&commit_job, "    if: >-");
         assert_eq!(
-            commit_job_if,
-            concat!(
-                "    if: >-\n",
-                "      github.event.workflow_run.conclusion == 'success'\n",
-                "      && github.event.workflow_run.actor.login == 'dependabot[bot]'\n",
-                "      && github.event.workflow_run.event == 'pull_request'",
-            ),
-            "the privileged job must reject untrusted actors and events before its write token is allocated"
+            permission_mapping(&commit_job, "    permissions:"),
+            std::collections::BTreeMap::from([
+                ("actions".to_owned(), "read".to_owned()),
+                ("contents".to_owned(), "write".to_owned()),
+                ("pull-requests".to_owned(), "read".to_owned()),
+            ]),
+            "the privileged follow-up job must have exactly its minimal API permissions"
+        );
+        let commit_job_if = nested_block(&commit_job, "    if: >-");
+        for required_job_gate in [
+            "github.event.workflow_run.conclusion == 'success'",
+            "github.event.workflow_run.actor.login == 'dependabot[bot]'",
+            "github.event.workflow_run.event == 'pull_request'",
+        ] {
+            assert!(
+                commit_job_if.contains(required_job_gate),
+                "privileged commit.if is missing semantic clause `{required_job_gate}`"
+            );
+        }
+        assert!(
+            !commit_job_if.contains("||"),
+            "privileged commit.if must not weaken its required gates with an OR clause"
         );
 
         for required_guard in [
