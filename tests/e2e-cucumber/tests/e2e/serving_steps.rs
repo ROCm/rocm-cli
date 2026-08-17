@@ -908,6 +908,25 @@ async fn user_serves_runtime_and_env(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// Serve pinned to GPU ordinal 1 while an active visibility mask
+/// (`HIP_VISIBLE_DEVICES=0`) hides every device except ordinal 0. On a multi-GPU
+/// host ordinal 1 exists but is masked out, so the CLI must reject it against the
+/// visible set (EAI-7194); on a single-GPU host the same ordinal is simply out of
+/// range. Either way the serve must be refused rather than remapped onto the one
+/// visible device.
+#[when("the user serves a model pinned to a GPU hidden by the visibility mask")]
+async fn user_serves_masked_gpu_index(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["serve", model, "--engine", engine, "--gpu", "1"],
+        &[("HIP_VISIBLE_DEVICES", "0")],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 #[then("the user is told to allow public binding first")]
 async fn assert_public_bind_message(world: &mut E2eWorld) {
     let output = serve_output(world);
@@ -1050,6 +1069,22 @@ async fn assert_absent_index_message(world: &mut E2eWorld) {
         output.contains("99")
             && (output.contains("out of range") || output.contains("not available")),
         "expected the absent GPU index to be reported unavailable, got:\n{}",
+        serve_output(world)
+    );
+}
+
+#[then("the user is told the pinned GPU is unavailable")]
+async fn assert_masked_index_message(world: &mut E2eWorld) {
+    let output = serve_output(world).to_lowercase();
+    // Ordinal 1 must be reported unavailable: rejected against the active
+    // visibility mask ("not available under the active visibility mask") on a
+    // multi-GPU host, or as out of range on a single-GPU host. Never a silent
+    // remap onto the one visible device (ordinal 0).
+    assert!(
+        output.contains("not available under the active visibility mask")
+            || output.contains("out of range")
+            || output.contains("not available"),
+        "expected the masked GPU index to be reported unavailable, got:\n{}",
         serve_output(world)
     );
 }
