@@ -192,6 +192,19 @@ mod tests {
         entries
     }
 
+    fn job_scalar<'a>(block: &'a str, key: &str) -> &'a str {
+        let marker = format!("{key}:");
+        block
+            .lines()
+            .find_map(|line| {
+                (indent_of(line) == 4)
+                    .then(|| line.trim().strip_prefix(&marker))
+                    .flatten()
+                    .map(str::trim)
+            })
+            .unwrap_or_else(|| panic!("job defines top-level scalar `{key}`"))
+    }
+
     fn markdown_table_rows(text: &str, header: &str) -> Vec<Vec<String>> {
         let mut lines = text.lines().skip_while(|line| *line != header);
         assert_eq!(
@@ -310,7 +323,7 @@ mod tests {
                 block.contains("proc_version=$(cat /proc/version 2>/dev/null || true)"),
                 "{workflow} job {job} must read the canonical kernel-version signal"
             );
-            let distro_signal = ["$", "{", "WSL_DISTRO_NAME:-", "}"].concat();
+            let distro_signal = ["$", "{", "WSL_DISTRO_NAME+x", "}"].concat();
             let canonical_union = format!(
                 "if [ ! -e /dev/dxg ] && [ -z \"{distro_signal}\" ] && ! printf '%s\\n' \"$proc_version\" | grep -qiE 'microsoft|wsl'; then"
             );
@@ -340,6 +353,22 @@ mod tests {
                 "nightly Strix job {job} must use the shared-machine TUI wait budget"
             );
         }
+    }
+
+    #[test]
+    fn dispatchable_wsl_nightly_run_has_the_full_nightly_job_budget() {
+        let self_hosted = read_workflow("e2e-selfhosted.yml");
+        let nightly = read_workflow("nightly.yml");
+        let dispatch_timeout = job_scalar(job_block(&self_hosted, "e2e-wsl"), "timeout-minutes");
+        let nightly_timeout = job_scalar(job_block(&nightly, "e2e-wsl-nightly"), "timeout-minutes");
+        assert_eq!(
+            dispatch_timeout, "90",
+            "the 2400s large-model readiness budget needs the established 90-minute job cap for setup and the remaining suite"
+        );
+        assert_eq!(
+            dispatch_timeout, nightly_timeout,
+            "e2e-wsl supports include_nightly, so its job timeout must cover the same 2400s scenario plus setup as e2e-wsl-nightly"
+        );
     }
 
     #[test]

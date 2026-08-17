@@ -169,11 +169,12 @@ flaky = true
 # probes are routed out on WSL because they read KFD and DRM, neither of which
 # exists there, while the summary reads the target from the Windows-side driver.
 #
-# Scoped to WSL because that is where this lane reproduces it. The ticket also
-# records the same disagreement on MI300X, second-hand from the comment in
-# capability.rs; if that is confirmed the row should widen rather than gain a
-# sibling. Remove it when the two forms agree. ---
+# Scoped to WSL hosts whose human report actually names a gfx target: without
+# one both forms correctly report no GPU, so xfail would turn agreement into a
+# stale XPASS. The ticket also records the same disagreement on MI300X,
+# second-hand from the comment in capability.rs; if that is confirmed the row
+# should widen rather than gain a sibling. Remove it when the two forms agree. ---
 [["examine-both-forms-agree-on-gpu"]]
-when = { is_wsl = true }
+when = { is_wsl = true, therock_family = "gfx*" }
 bug = "EAI-7998"
 reason = "`examine --json` reports has_amd_gpu:false on a WSL2 host whose own summary names a gfx target."

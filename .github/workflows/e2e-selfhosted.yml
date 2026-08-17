@@ -657,10 +657,10 @@ jobs:
   # GPU-on-WSL is proven out.
   e2e-wsl:
     name: E2E tests (Strix Halo, WSL2)
-    # 35min: matches the sibling collapsed GPU jobs — one job runs all serves
-    # plus per-scenario `install sdk`, and the cap must exceed the run so the job
-    # still writes platform.json.
-    timeout-minutes: 35
+    # A manual include_nightly dispatch runs the 2400s large-model readiness
+    # scenario, so match the dedicated nightly lane's cap and leave room for
+    # build, runtime pre-warm, the rest of the suite, and platform.json.
+    timeout-minutes: 90
     runs-on: [self-hosted, linux, strix-halo, wsl]
     needs: [changes]
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-wsl. Gated on
@@ -699,7 +699,7 @@ jobs:
         run: |
           proc_version=$(cat /proc/version 2>/dev/null || true)
           if [ ! -e /dev/dxg ] \
-            && [ -z "${WSL_DISTRO_NAME:-}" ] \
+            && [ -z "${WSL_DISTRO_NAME+x}" ] \
             && ! printf '%s\n' "$proc_version" | grep -qiE 'microsoft|wsl'; then
             echo "::error::runner is not a WSL host: $(uname -r)"
             exit 1

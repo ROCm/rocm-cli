@@ -1040,6 +1040,17 @@ flaky = true
     }
 
     #[test]
+    fn gpu_report_disagreement_xfail_requires_a_reported_gfx_target() {
+        let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        assert!(m.is_xfail(
+            "examine-both-forms-agree-on-gpu",
+            &cap("wsl-no-passthrough"),
+            "lemonade"
+        ));
+        assert!(!m.is_xfail("examine-both-forms-agree-on-gpu", &cap("wsl"), "lemonade"));
+    }
+
+    #[test]
     fn glob_matches_family() {
         assert!(glob_match("gfx94*", "gfx942"));
         assert!(glob_match("*dcgpu", "gfx94X-dcgpu"));

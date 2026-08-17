@@ -431,7 +431,40 @@ fn parse_examine_text(text: &str) -> ExamineFacts {
 /// cannot serve one — they fail on their premise rather than resolving to
 /// not-applicable, which is exactly what the capability probe exists to avoid.
 fn host_has_usable_gpu(gfx_target: Option<&str>, is_wsl: bool, driver_status: &str) -> bool {
-    gfx_target.is_some() && (!is_wsl || driver_status == WSL_DRIVER_READY)
+    let hip = std::env::var_os("HIP_VISIBLE_DEVICES");
+    let rocr = std::env::var_os("ROCR_VISIBLE_DEVICES");
+    host_has_usable_gpu_with_mask(
+        gfx_target,
+        is_wsl,
+        driver_status,
+        selected_visibility_mask(hip.as_deref(), rocr.as_deref()),
+    )
+}
+
+/// Match the product's visibility-mask precedence: HIP wins when present,
+/// including an explicitly empty value; ROCR is the fallback.
+fn selected_visibility_mask<'a>(
+    hip: Option<&'a std::ffi::OsStr>,
+    rocr: Option<&'a std::ffi::OsStr>,
+) -> Option<&'a std::ffi::OsStr> {
+    hip.or(rocr)
+}
+
+/// Pure form of [`host_has_usable_gpu`] for contract tests.
+///
+/// The harness knows whether a gfx target exists, but not the product's complete
+/// device topology. As in `rocm_core::has_usable_amd_gpu`, only an authoritative
+/// empty mask proves zero usable devices; nonempty/opaque masks stay eligible and
+/// let the product perform ordinal/UUID validation at launch time.
+fn host_has_usable_gpu_with_mask(
+    gfx_target: Option<&str>,
+    is_wsl: bool,
+    driver_status: &str,
+    visibility_mask: Option<&std::ffi::OsStr>,
+) -> bool {
+    gfx_target.is_some()
+        && (!is_wsl || driver_status == WSL_DRIVER_READY)
+        && visibility_mask.is_none_or(|mask| !mask.is_empty())
 }
 
 /// Parse engine names from `rocm engines list`. Engine rows are the lines whose
@@ -631,28 +664,88 @@ rocm examine
     fn wsl_gpu_requires_a_ready_rocdxg_path() {
         // Real values from the self-hosted WSL runner before librocdxg was
         // installed: /dev/dxg present, the ROCm passthrough library missing.
-        assert!(!host_has_usable_gpu(
+        assert!(!host_has_usable_gpu_with_mask(
             Some("gfx1151"),
             true,
-            "wsl_rocdxg_missing"
+            "wsl_rocdxg_missing",
+            None
         ));
-        assert!(!host_has_usable_gpu(
+        assert!(!host_has_usable_gpu_with_mask(
             Some("gfx1151"),
             true,
-            "wsl_gpu_plumbing_missing"
+            "wsl_gpu_plumbing_missing",
+            None
         ));
         // Complete passthrough: the GPU is usable and the scenarios must run.
-        assert!(host_has_usable_gpu(Some("gfx1151"), true, WSL_DRIVER_READY));
+        assert!(host_has_usable_gpu_with_mask(
+            Some("gfx1151"),
+            true,
+            WSL_DRIVER_READY,
+            None
+        ));
         // A native host is unaffected by the driver verdict.
-        assert!(host_has_usable_gpu(
+        assert!(host_has_usable_gpu_with_mask(
             Some("gfx942"),
             false,
-            "amdgpu_available"
+            "amdgpu_available",
+            None
         ));
-        assert!(host_has_usable_gpu(Some("gfx942"), false, ""));
+        assert!(host_has_usable_gpu_with_mask(
+            Some("gfx942"),
+            false,
+            "",
+            None
+        ));
         // No gfx target is still no GPU, WSL or not.
-        assert!(!host_has_usable_gpu(None, true, WSL_DRIVER_READY));
-        assert!(!host_has_usable_gpu(None, false, "amdgpu_available"));
+        assert!(!host_has_usable_gpu_with_mask(
+            None,
+            true,
+            WSL_DRIVER_READY,
+            None
+        ));
+        assert!(!host_has_usable_gpu_with_mask(
+            None,
+            false,
+            "amdgpu_available",
+            None
+        ));
+    }
+
+    #[test]
+    fn gpu_capability_honors_the_product_visibility_mask_precedence() {
+        use std::ffi::OsStr;
+
+        let empty = OsStr::new("");
+        let device_zero = OsStr::new("0");
+        assert_eq!(
+            selected_visibility_mask(Some(empty), Some(device_zero)),
+            Some(empty),
+            "HIP_VISIBLE_DEVICES must take precedence even when explicitly empty"
+        );
+        assert_eq!(
+            selected_visibility_mask(None, Some(empty)),
+            Some(empty),
+            "ROCR_VISIBLE_DEVICES applies when HIP_VISIBLE_DEVICES is unset"
+        );
+
+        assert!(!host_has_usable_gpu_with_mask(
+            Some("gfx1151"),
+            true,
+            WSL_DRIVER_READY,
+            Some(empty)
+        ));
+        assert!(!host_has_usable_gpu_with_mask(
+            Some("gfx942"),
+            false,
+            "amdgpu_available",
+            Some(empty)
+        ));
+        assert!(host_has_usable_gpu_with_mask(
+            Some("gfx1151"),
+            true,
+            WSL_DRIVER_READY,
+            Some(device_zero)
+        ));
     }
 
     #[test]

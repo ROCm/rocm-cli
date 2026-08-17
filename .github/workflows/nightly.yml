@@ -657,7 +657,7 @@ jobs:
         run: |
           proc_version=$(cat /proc/version 2>/dev/null || true)
           if [ ! -e /dev/dxg ] \
-            && [ -z "${WSL_DISTRO_NAME:-}" ] \
+            && [ -z "${WSL_DISTRO_NAME+x}" ] \
             && ! printf '%s\n' "$proc_version" | grep -qiE 'microsoft|wsl'; then
             echo "::error::runner is not a WSL host: $(uname -r)"
             exit 1
