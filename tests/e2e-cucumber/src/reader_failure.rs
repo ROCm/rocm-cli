@@ -12,6 +12,17 @@ struct State {
     message: Option<String>,
 }
 
+/// Atomic observation of the reader's failure state.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReaderFailureObservation {
+    /// The reader has not published a failure.
+    Running,
+    /// A failure was published, but its diagnostic was already consumed.
+    FailedWithoutMessage,
+    /// A newly observed failure diagnostic.
+    Message(String),
+}
+
 /// Stores persistent reader-failure state and a diagnostic for one-time reporting.
 #[derive(Debug, Default)]
 pub struct ReaderFailure {
@@ -31,25 +42,33 @@ impl ReaderFailure {
 
     /// Take the failure diagnostic, if it has not already been reported.
     pub fn take_message(&self) -> Option<String> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .message
-            .take()
+        match self.observe() {
+            ReaderFailureObservation::Message(message) => Some(message),
+            ReaderFailureObservation::Running | ReaderFailureObservation::FailedWithoutMessage => {
+                None
+            }
+        }
     }
 
-    /// Whether the reader has failed and can no longer update the screen.
-    pub fn has_failed(&self) -> bool {
-        self.state
+    /// Observe failure state and consume its diagnostic under one lock.
+    pub fn observe(&self) -> ReaderFailureObservation {
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .failed
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(message) = state.message.take() {
+            ReaderFailureObservation::Message(message)
+        } else if state.failed {
+            ReaderFailureObservation::FailedWithoutMessage
+        } else {
+            ReaderFailureObservation::Running
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ReaderFailure;
+    use super::{ReaderFailure, ReaderFailureObservation};
     use std::sync::{Arc, mpsc};
 
     #[test]
@@ -70,14 +89,15 @@ mod tests {
             failure.take_message().as_deref(),
             Some("captured reader panic")
         );
-        let remains_failed = failure.has_failed();
+        let observation = failure.observe();
 
         release_tx.send(()).expect("reader should remain blocked");
         reader.join().expect("test reader should exit cleanly");
 
-        assert!(
-            remains_failed,
-            "consuming the diagnostic must not clear terminal failure state"
+        assert_eq!(
+            observation,
+            ReaderFailureObservation::FailedWithoutMessage,
+            "consuming the diagnostic must preserve terminal failure state"
         );
     }
 }

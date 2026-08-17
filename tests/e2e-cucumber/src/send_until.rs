@@ -75,7 +75,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{RetryTiming, TerminalState, send_until};
-    use crate::reader_failure::ReaderFailure;
+    use crate::reader_failure::{ReaderFailure, ReaderFailureObservation};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
@@ -118,12 +118,13 @@ mod tests {
                     }
                 })
             },
-            |state, _marker| {
-                if state.failure.has_failed() || state.reader_finished {
+            |state, _marker| match state.failure.observe() {
+                ReaderFailureObservation::Message(error) => TerminalState::Failed(error),
+                ReaderFailureObservation::FailedWithoutMessage => TerminalState::Stopped,
+                ReaderFailureObservation::Running if state.reader_finished => {
                     TerminalState::Stopped
-                } else {
-                    TerminalState::Running
                 }
+                ReaderFailureObservation::Running => TerminalState::Running,
             },
         )
         .await
@@ -179,13 +180,82 @@ mod tests {
                     .expect("reader should publish before wait returns");
                 Box::pin(async { Err(MARKER_TIMEOUT.to_string()) })
             },
-            |state, _marker| {
-                if let Some(error) = state.failure.take_message() {
-                    TerminalState::Failed(error)
-                } else if state.failure.has_failed() || state.reader_finished {
+            |state, _marker| match state.failure.observe() {
+                ReaderFailureObservation::Message(error) => TerminalState::Failed(error),
+                ReaderFailureObservation::FailedWithoutMessage => TerminalState::Stopped,
+                ReaderFailureObservation::Running if state.reader_finished => {
                     TerminalState::Stopped
-                } else {
-                    TerminalState::Running
+                }
+                ReaderFailureObservation::Running => TerminalState::Running,
+            },
+        )
+        .await
+        .expect_err("terminal reader error must stop the retry loop");
+
+        assert!(!reader.is_finished(), "reader must still be finishing");
+        release_tx.send(()).expect("reader should remain blocked");
+        reader.join().expect("test reader should exit cleanly");
+
+        assert_eq!(error, PANIC_ERROR);
+        assert_eq!(state.sends, 1, "terminal failure must not resend input");
+        assert_eq!(state.waits, 1, "terminal failure must not wait again");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_error_published_between_former_take_and_check_is_preserved() {
+        const PANIC_ERROR: &str = "captured reader panic error";
+        const MARKER_TIMEOUT: &str = "marker timeout";
+
+        let failure = Arc::new(ReaderFailure::default());
+        let reader_failure = Arc::clone(&failure);
+        let (after_take_tx, after_take_rx) = mpsc::channel();
+        let (published_tx, published_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            after_take_rx
+                .recv()
+                .expect("terminal check should pass the former take point");
+            reader_failure.publish(PANIC_ERROR.to_string());
+            published_tx.send(()).expect("test waiter should remain");
+            release_rx.recv().expect("test should release reader");
+        });
+
+        let mut state = TestState {
+            failure: Arc::clone(&failure),
+            ..TestState::default()
+        };
+        let error = send_until(
+            &mut state,
+            "4",
+            "marker",
+            RetryTiming {
+                timeout: Duration::from_millis(30),
+                resend_interval: Duration::from_millis(5),
+            },
+            |state, _bytes| {
+                state.sends += 1;
+                Ok(())
+            },
+            |state, _marker, _attempt| {
+                state.waits += 1;
+                Box::pin(async { Err(MARKER_TIMEOUT.to_string()) })
+            },
+            move |state, _marker| {
+                assert_eq!(
+                    state.failure.take_message(),
+                    None,
+                    "failure must publish after the former take point"
+                );
+                after_take_tx
+                    .send(())
+                    .expect("reader should wait for the boundary");
+                published_rx
+                    .recv()
+                    .expect("reader should publish before atomic observation");
+                match state.failure.observe() {
+                    ReaderFailureObservation::Message(error) => TerminalState::Failed(error),
+                    ReaderFailureObservation::FailedWithoutMessage => TerminalState::Stopped,
+                    ReaderFailureObservation::Running => TerminalState::Running,
                 }
             },
         )

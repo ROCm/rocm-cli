@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use e2e_cucumber::panic_capture::panic_message;
-use e2e_cucumber::reader_failure::ReaderFailure;
+use e2e_cucumber::reader_failure::{ReaderFailure, ReaderFailureObservation};
 use e2e_cucumber::send_until::{RetryTiming, TerminalState, send_until as retry_send_until};
 
 use crate::E2eWorld;
@@ -279,21 +279,15 @@ impl TuiSession {
             .map_err(|e| format!("failed to write to pty: {e}"))
     }
 
-    /// Whether the PTY reader thread has stopped, so the emulated screen can
-    /// never change again. True once the child's slave side closes (normal
-    /// exit) and once the reader catches a parser panic (see `spawn_reader`).
-    fn reader_stopped(&self) -> bool {
-        self.reader_failure.has_failed()
-            || self
-                .reader
-                .as_ref()
-                .is_some_and(std::thread::JoinHandle::is_finished)
-    }
-
     /// Retrieve a terminal failure that landed after a wait's final poll but
     /// before the retry loop decides whether another key is safe to send.
     fn terminal_state_after_wait(&mut self, marker: &str) -> TerminalState {
-        if let Some(panic_message) = self.take_reader_panic() {
+        let reader_finished = self
+            .reader
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished);
+        let reader_failure = self.reader_failure.observe();
+        if let ReaderFailureObservation::Message(panic_message) = &reader_failure {
             return TerminalState::Failed(format!(
                 "pty reader thread panicked while waiting for {marker:?}: {panic_message}\n{}",
                 self.framed_screen()
@@ -311,8 +305,12 @@ impl TuiSession {
                     self.framed_screen()
                 ))
             }
-            Ok(None) if self.reader_stopped() => TerminalState::Stopped,
-            Ok(None) => TerminalState::Running,
+            Ok(None) => match reader_failure {
+                ReaderFailureObservation::FailedWithoutMessage => TerminalState::Stopped,
+                ReaderFailureObservation::Running if reader_finished => TerminalState::Stopped,
+                ReaderFailureObservation::Running => TerminalState::Running,
+                ReaderFailureObservation::Message(_) => unreachable!("handled above"),
+            },
             Err(error) => TerminalState::Failed(format!("failed to poll TUI child: {error}")),
         }
     }
