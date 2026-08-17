@@ -12,6 +12,7 @@ mod logging;
 mod provider_keys;
 mod providers;
 mod serve_summary;
+mod storage;
 mod therock;
 mod uninstall;
 
@@ -22,7 +23,7 @@ use crate::automations::automations;
 use crate::uninstall::uninstall;
 
 use anyhow::{Context, Result, bail};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use rocm_core::{
     AppPaths, AuditEventRecord, AutomationEventRecord, AutomationProposalRecord,
     AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot,
@@ -295,6 +296,11 @@ rocm update --apply --dry-run")]
     Runtimes {
         #[command(subcommand)]
         command: Option<RuntimesCommand>,
+    },
+    /// Show what ROCm CLI is storing on disk, and free space it no longer needs.
+    Storage {
+        #[command(subcommand)]
+        command: Option<StorageCommand>,
     },
     /// List, install, or open shells for local model engines.
     Engines {
@@ -678,6 +684,44 @@ enum RuntimesCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum StorageCommand {
+    /// Show what is using disk space.
+    Report {
+        /// Emit the machine-readable storage JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove older ROCm installs, keeping the most recent ones.
+    #[command(name = "remove-old-installs", alias = "remove-old-runtimes")]
+    RemoveOldInstalls {
+        /// How many recent installs to keep for each channel, format, and GPU family.
+        ///
+        /// "Recent" means most recently installed, not highest version, so
+        /// after a deliberate downgrade the older version counts as the newer
+        /// install. The one in use and the rollback target are always kept on
+        /// top of this count, whatever it is set to.
+        #[arg(long, default_value_t = storage::DEFAULT_KEEP)]
+        keep: usize,
+        /// Show what would happen without changing files.
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Remove downloaded files that ROCm CLI can fetch again.
+    #[command(name = "remove-downloads", alias = "remove-downloaded-files")]
+    RemoveDownloads {
+        /// Show what would happen without changing files.
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum ComfyuiCommand {
     /// Show whether ComfyUI is installed or running.
     Status,
@@ -1046,7 +1090,33 @@ fn main() -> Result<()> {
         );
     }
 
-    dispatch(Cli::parse())
+    dispatch(parse_cli())
+}
+
+/// Build the root `rocm` command with its top-level subcommands ordered
+/// alphabetically in `--help` output (EAI-7362).
+///
+/// clap assigns each subcommand an incrementing display order in declaration
+/// order and renders the command list sorted by `(display_order, name)`.
+/// Resetting every subcommand to the same display order collapses that first
+/// sort key, so the visible list falls back to alphabetical name order.
+///
+/// The value used is clap's own default display order (999, i.e.
+/// `Command::get_display_order`'s `unwrap_or`). clap appends its implicit `help`
+/// subcommand *after* this runs and leaves it at that default, so matching the
+/// default here lets `help` sort into its alphabetical position instead of being
+/// pinned last. The regression test guards this if clap's default ever changes.
+fn cli_command() -> clap::Command {
+    Cli::command().mut_subcommands(|sc| sc.display_order(999usize))
+}
+
+/// Parse process arguments through [`cli_command`] so `rocm --help` and
+/// `rocm help` list subcommands alphabetically. Mirrors the derived
+/// `Cli::parse()`, which builds from `Cli::command()` directly and therefore
+/// cannot pick up the reordering.
+fn parse_cli() -> Cli {
+    let matches = cli_command().get_matches();
+    Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit())
 }
 
 /// Legacy `uv` cache location, used before the cache was colocated with the managed
@@ -1505,9 +1575,17 @@ fn render_freeform_comfyui_status_answer(
 }
 
 fn dispatch(cli: Cli) -> Result<()> {
+    // `storage` is excluded alongside the other self-referential commands: it
+    // reports and reclaims disk, and the startup update check can provision a
+    // managed Python, which downloads instead of freeing.
     if !matches!(
         cli.command,
-        Some(Command::Update { .. } | Command::Bootstrap { .. } | Command::Completions { .. })
+        Some(
+            Command::Update { .. }
+                | Command::Bootstrap { .. }
+                | Command::Completions { .. }
+                | Command::Storage { .. }
+        )
     ) {
         refresh_startup_update_check_quietly();
     }
@@ -1726,6 +1804,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Command::Runtimes { command }) => runtimes(command),
+        Some(Command::Storage { command }) => storage::storage(command),
         Some(Command::Engines { command }) => engines(command),
         Some(Command::Model { verbose }) => {
             let paths = AppPaths::discover()?;
@@ -2108,7 +2187,7 @@ fn fix(fix_id: Option<String>, yes: bool, dry_run: bool, device_index: Option<i6
     Ok(())
 }
 
-fn record_cli_audit_event(
+pub(crate) fn record_cli_audit_event(
     paths: &AppPaths,
     category: &str,
     action: &str,
@@ -9720,6 +9799,20 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
                 command_title: "Uninstall".to_owned(),
             })
         }
+        // `storage report` (the default subcommand) only measures folders, so
+        // the assistant can run it directly. The two `remove-*` verbs delete
+        // multi-gigabyte trees and go through the approval UI.
+        Some("storage") if second.as_deref().is_none_or(|value| value == "report") => {
+            Ok(ChatRocmCommandAction::ReadOnly(args))
+        }
+        Some("storage") => {
+            ensure_flag(&mut args, "--yes");
+            Ok(ChatRocmCommandAction::Approval {
+                args,
+                pending_title: "Free up disk space".to_owned(),
+                command_title: "Storage".to_owned(),
+            })
+        }
         Some("comfyui") if second.as_deref() == Some("install") => {
             Ok(ChatRocmCommandAction::Approval {
                 args,
@@ -12245,14 +12338,28 @@ fn artifact_source_policy_label(policy: &str) -> &str {
     }
 }
 
-#[allow(dead_code)]
+/// Human-readable size. `rocm storage` reports caches that are routinely tens
+/// of megabytes, so the intermediate tiers matter: a bare byte count is
+/// unreadable at the sizes this reports.
 fn format_bytes(bytes: u64) -> String {
-    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-    if bytes >= 1024 * 1024 * 1024 {
-        format!("{:.1} GiB", bytes as f64 / GIB)
-    } else {
-        format!("{bytes} bytes")
+    const KIB: f64 = 1024.0;
+    // `{:.1}` rounds, so from 1023.95 of a unit upwards the text already reads
+    // as a full 1024 of it. Step up there rather than printing "1024.0 KiB".
+    const ROUNDS_UP_TO_NEXT_UNIT: f64 = 1023.95;
+
+    let value = bytes as f64;
+    if value < KIB {
+        return format!("{bytes} bytes");
     }
+    let kib = value / KIB;
+    if kib < ROUNDS_UP_TO_NEXT_UNIT {
+        return format!("{kib:.1} KiB");
+    }
+    let mib = kib / KIB;
+    if mib < ROUNDS_UP_TO_NEXT_UNIT {
+        return format!("{mib:.1} MiB");
+    }
+    format!("{:.1} GiB", mib / KIB)
 }
 
 #[allow(dead_code)]
@@ -17143,6 +17250,7 @@ fn treat_as_natural_language(args: &[String]) -> bool {
         "install",
         "update",
         "runtimes",
+        "storage",
         "engines",
         "model",
         "models",
@@ -17245,6 +17353,51 @@ mod tests {
     #[test]
     fn cli_command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// EAI-7362: the top-level `rocm --help` command list must be alphabetical,
+    /// including clap's implicit `help` entry (it must sort into place, not be
+    /// pinned last).
+    ///
+    /// Renders the real help text (not just the command model) so the assertion
+    /// covers what clap actually prints.
+    #[test]
+    fn top_level_help_lists_commands_alphabetically() {
+        let help = cli_command().render_long_help().to_string();
+
+        let commands_section = help
+            .split_once("Commands:")
+            .expect("help output has a Commands section")
+            .1;
+
+        // Each command entry starts at a fixed two-space indent; wrapped
+        // description lines are indented further, so a non-space third column
+        // uniquely identifies a command row. Stop at the blank line that ends
+        // the section.
+        let names: Vec<String> = commands_section
+            .lines()
+            .skip_while(|line| line.trim().is_empty())
+            .take_while(|line| !line.trim().is_empty())
+            .filter(|line| line.starts_with("  ") && !line.starts_with("   "))
+            .filter_map(|line| line.split_whitespace().next())
+            .map(str::to_owned)
+            .collect();
+
+        assert!(
+            names.iter().any(|name| name == "help"),
+            "expected the implicit `help` entry to appear in the list, got {names:?}"
+        );
+        assert!(
+            names.len() > 1,
+            "expected several visible subcommands, got {names:?}"
+        );
+
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(
+            names, sorted,
+            "top-level `rocm --help` commands are not alphabetized"
+        );
     }
 
     #[test]
@@ -19789,6 +19942,48 @@ model recipes
     }
 
     #[test]
+    fn storage_report_is_read_only_and_removal_requires_approval() {
+        for args in [
+            vec!["storage".to_owned()],
+            vec!["storage".to_owned(), "report".to_owned()],
+        ] {
+            let action = chat_rocm_command_action_from_args(args.clone())
+                .expect("storage report classifies");
+            assert!(
+                matches!(action, ChatRocmCommandAction::ReadOnly(_)),
+                "storage {args:?} only measures folders, so it should be read-only, got {action:?}"
+            );
+        }
+
+        for verb in ["remove-old-installs", "remove-downloads"] {
+            let action =
+                chat_rocm_command_action_from_args(vec!["storage".to_owned(), verb.to_owned()])
+                    .expect("storage removal classifies");
+            match action {
+                ChatRocmCommandAction::Approval { args, .. } => {
+                    assert!(
+                        args.iter().any(|arg| arg == "--yes"),
+                        "approved removal runs non-interactively: {args:?}"
+                    );
+                }
+                other @ ChatRocmCommandAction::ReadOnly(_) => {
+                    panic!("storage {verb} must require approval, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn format_bytes_steps_up_instead_of_printing_1024_of_the_smaller_unit() {
+        assert_eq!(format_bytes(1023), "1023 bytes");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        // One byte short of the next unit used to round to "1024.0 KiB".
+        assert_eq!(format_bytes(1_048_575), "1.0 MiB");
+        assert_eq!(format_bytes(1_048_576), "1.0 MiB");
+        assert_eq!(format_bytes(1_073_741_823), "1.0 GiB");
+    }
+
+    #[test]
     fn setup_reset_requires_approval() {
         let action =
             chat_rocm_command_action_from_args(vec!["setup".to_owned(), "reset".to_owned()])
@@ -21864,6 +22059,7 @@ install therock";
             "install",
             "update",
             "runtimes",
+            "storage",
             "engines",
             "model",
             "models",

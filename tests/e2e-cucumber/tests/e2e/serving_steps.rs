@@ -502,16 +502,37 @@ async fn setup_lemonade_model(world: &mut E2eWorld) {
     // serve+inference coverage. Qwen3-0.6B-GGUF is the smallest lemonade recipe.
     let model = "Qwen3-0.6B-GGUF";
     ensure_serve_port_free().await;
-    let (stdout, _, rc) = crate::run_rocm(
+    crate::run_rocm_ok(
         world,
         &["serve", model, "--engine", "lemonade", "--managed"],
     );
-    assert!(rc == 0, "rocm serve failed:\n{stdout}");
     world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
     world.model_name = Some(model.to_string());
     // Wait for this lemonade model specifically (see setup_gpu_model): guards
     // against a leaked serve on the shared port. "Qwen3-0.6B" is the distinctive
     // substring (the endpoint reports it as e.g. Qwen3-0.6B-Q4_0.gguf).
+    wait_for_model(
+        "http://127.0.0.1:11435/v1/models",
+        Some("Qwen3-0.6B"),
+        serve_timeout_for(world),
+    )
+    .await;
+}
+
+#[given("a canonical Hugging Face GGUF checkpoint is being served on lemonade")]
+async fn setup_lemonade_hf_checkpoint_model(world: &mut E2eWorld) {
+    // Forces the `owner/repo:variant` direct-serve path (`serve_hf_checkpoint`,
+    // EAI-8026) instead of the short-recipe-name router that `setup_lemonade_model`
+    // exercises. Same underlying checkpoint (unsloth/Qwen3-0.6B-GGUF, Q4_0), so the
+    // GGUF is already warm in the HF cache when both scenarios run in one job.
+    let model = "unsloth/Qwen3-0.6B-GGUF:Q4_0";
+    ensure_serve_port_free().await;
+    crate::run_rocm_ok(
+        world,
+        &["serve", model, "--engine", "lemonade", "--managed"],
+    );
+    world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
+    world.model_name = Some(model.to_string());
     wait_for_model(
         "http://127.0.0.1:11435/v1/models",
         Some("Qwen3-0.6B"),
@@ -546,9 +567,7 @@ async fn setup_large_gpu_model(world: &mut E2eWorld) {
             ("Qwen/Qwen3.6-27B", "vllm", "Qwen3.6-27B")
         };
     ensure_serve_port_free().await;
-    let (stdout, _, rc) =
-        crate::run_rocm(world, &["serve", model, "--engine", engine, "--managed"]);
-    assert!(rc == 0, "rocm serve failed:\n{stdout}");
+    crate::run_rocm_ok(world, &["serve", model, "--engine", engine, "--managed"]);
     world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
     world.model_name = Some(model.to_string());
     wait_for_model(
@@ -637,13 +656,16 @@ async fn user_serves_default_engine(world: &mut E2eWorld) {
     // fn's doc comment.
     let model = default_engine_serve_target();
     ensure_serve_port_free().await;
-    let (stdout, _, rc) = crate::run_rocm(world, &["serve", model, "--managed"]);
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["serve", model, "--managed"]);
     // The model the CLI resolved (what actually gets served) can differ from the
     // requested id, so downstream reachability/readiness checks must look for the
     // resolved model on the shared port; fall back to the requested id.
     let served = resolved_model(&stdout).unwrap_or(model).to_string();
     let ready_substr = ready_substr_for(&served).to_string();
     world.cli_output = Some(stdout);
+    // rc is asserted by a later Then step, so stderr has to survive with it —
+    // otherwise that deferred assertion reports a failure it cannot explain.
+    world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
     world.endpoint = Some("http://127.0.0.1:11435/v1".to_string());
     world.model_name = Some(served);
@@ -667,9 +689,12 @@ async fn user_serves_vllm_capable_default(world: &mut E2eWorld) {
     // platform. Qwen2.5-0.5B is the smallest vLLM-preferred catalog entry. Omit
     // `--engine` so the CLI's own default selection is what's exercised.
     ensure_serve_port_free().await;
-    let (stdout, _, rc) =
+    let (stdout, stderr, rc) =
         crate::run_rocm(world, &["serve", "Qwen/Qwen2.5-0.5B-Instruct", "--managed"]);
     world.cli_output = Some(stdout);
+    // See the note in user_serves_default_engine: the rc is asserted later, so
+    // stderr must be carried along to explain a non-zero one.
+    world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
 }
 
@@ -913,7 +938,16 @@ async fn assert_vllm_default(world: &mut E2eWorld) {
     // non-zero rc after a good plan-print (e.g. the engine fails to start) would
     // otherwise go undetected since this scenario only inspected the plan line.
     let rc = world.cli_rc.expect("no serve rc recorded");
-    assert!(rc == 0, "rocm serve failed (rc={rc}):\n{output}");
+    assert!(
+        rc == 0,
+        "{}",
+        e2e_cucumber::cli_failure_report(
+            &["serve", "<default engine>", "--managed"],
+            rc,
+            output,
+            world.cli_stderr.as_deref().unwrap_or(""),
+        )
+    );
     let engine = selected_engine(output);
     assert_eq!(
         engine, "vllm",

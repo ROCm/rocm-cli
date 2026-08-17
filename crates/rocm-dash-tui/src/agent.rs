@@ -28,7 +28,7 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 
 use rocm_dash_core::bench_schema::BenchmarkRow;
-use rocm_dash_core::metrics::{GpuMetrics, Instance, Snapshot};
+use rocm_dash_core::metrics::{GpuMetrics, Instance, ObservationFreshness, Snapshot};
 
 use crate::app::{ChatRole, ChatTurn};
 use crate::client::ClientMsg;
@@ -216,12 +216,32 @@ pub fn gpu_status_json(snap: &StateSnapshot, gpu_index: Option<usize>) -> Value 
     }
 }
 
-/// Discovered serving instances: name, model, status, KV-cache %, req counts.
+/// Discovered serving instances with gen_tps, daemon-provided tok/W,
+/// freshness metadata, and observed_at timestamp.
+///
+/// Fields added by EAI-7960:
+/// - `gen_tps`: live generation throughput from the Instance (same as daemon)
+/// - `tokens_per_watt`: daemon-provided efficiency (never recomputed here)
+/// - `freshness`: `"fresh"` | `"held"` | `null` (null for legacy/unknown)
+/// - `observed_at`: ISO-8601 UTC string when present, `null` when absent
 pub fn list_instances_json(snap: &StateSnapshot) -> Value {
     let arr: Vec<Value> = snap
         .instances
         .iter()
         .map(|i| {
+            let (freshness, observed_at) = match &i.gen_tps_observation {
+                Some(m) => {
+                    let f = match m.freshness {
+                        ObservationFreshness::Fresh => "fresh",
+                        ObservationFreshness::Held => "held",
+                    };
+                    (
+                        serde_json::Value::String(f.into()),
+                        serde_json::Value::String(m.observed_at.to_rfc3339()),
+                    )
+                }
+                None => (serde_json::Value::Null, serde_json::Value::Null),
+            };
             json!({
                 "name": i.container_name,
                 "model": i.model_name,
@@ -229,25 +249,45 @@ pub fn list_instances_json(snap: &StateSnapshot) -> Value {
                 "kv_cache_usage_pct": i.kv_cache_usage_pct,
                 "running_reqs": i.running_reqs,
                 "waiting_reqs": i.waiting_reqs,
+                "gen_tps": i.gen_tps,
+                "tokens_per_watt": i.tokens_per_watt,
+                "freshness": freshness,
+                "observed_at": observed_at,
             })
         })
         .collect();
     json!({ "instances": arr, "instance_count": arr.len() })
 }
 
-/// Per-instance tokens-per-watt: gen tok/s ÷ summed power of its GPUs. Reuses
-/// the core efficiency derivation so it matches the reducer exactly.
+/// Per-instance tokens-per-watt from the daemon-provided field.
+///
+/// Uses `Instance::tokens_per_watt` directly so this tool matches the screen
+/// truth exactly (the daemon computes the same value the TUI displays). Also
+/// includes gen_tps, freshness, and observed_at for completeness.
 pub fn tokens_per_watt_json(snap: &StateSnapshot) -> Value {
-    let gpus = gpus_of(snap);
     let arr: Vec<Value> = snap
         .instances
         .iter()
         .map(|i| {
-            let tpw = rocm_dash_core::efficiency::tokens_per_watt(i.gen_tps, &i.gpu_ids, gpus);
+            let (freshness, observed_at) = match &i.gen_tps_observation {
+                Some(m) => {
+                    let f = match m.freshness {
+                        ObservationFreshness::Fresh => "fresh",
+                        ObservationFreshness::Held => "held",
+                    };
+                    (
+                        serde_json::Value::String(f.into()),
+                        serde_json::Value::String(m.observed_at.to_rfc3339()),
+                    )
+                }
+                None => (serde_json::Value::Null, serde_json::Value::Null),
+            };
             json!({
                 "name": i.container_name,
                 "gen_tps": i.gen_tps,
-                "tokens_per_watt": tpw,
+                "tokens_per_watt": i.tokens_per_watt,
+                "freshness": freshness,
+                "observed_at": observed_at,
             })
         })
         .collect();
@@ -1512,6 +1552,9 @@ mod tests {
             running_reqs: Some(3),
             waiting_reqs: Some(1),
             gen_tps: Some(500.0),
+            // Daemon-computed value: 500 tok/s ÷ 250 W (gpu-2) = 2.0 tok/W.
+            // Set explicitly so tokens_per_watt_json reads the daemon field.
+            tokens_per_watt: Some(2.0),
             ..Default::default()
         };
         let row = BenchmarkRow {
@@ -2225,5 +2268,99 @@ mod tests {
             .expect("oauth reply");
         eprintln!("ChatGPT OAuth reply: {reply}");
         assert!(!reply.is_empty());
+    }
+
+    // ── EAI-7960: agent tool freshness tests ────────────────────────────────
+    // RED: list_instances_json / tokens_per_watt_json must include gen_tps,
+    // tokens_per_watt (daemon-provided), freshness, and observed_at fields.
+
+    fn fixture_with_observation(
+        freshness: rocm_dash_core::metrics::ObservationFreshness,
+    ) -> StateSnapshot {
+        use chrono::Utc;
+        use rocm_dash_core::metrics::{ObservationMetadata, Snapshot};
+        let observed_at = Utc::now();
+        let inst = Instance {
+            container_name: "vllm-obs".into(),
+            model_name: "llama3".into(),
+            gpu_ids: vec!["0".into()],
+            gen_tps: Some(300.0),
+            tokens_per_watt: Some(1.5),
+            gen_tps_observation: Some(ObservationMetadata {
+                observed_at,
+                freshness,
+            }),
+            ..Default::default()
+        };
+        StateSnapshot {
+            latest: Some(Snapshot::default()),
+            instances: vec![inst],
+            bench_rows: vec![],
+        }
+    }
+
+    #[test]
+    fn list_instances_json_includes_gen_tps_and_daemon_tpw() {
+        let snap = fixture_with_observation(rocm_dash_core::metrics::ObservationFreshness::Fresh);
+        let v = list_instances_json(&snap);
+        let i = &v["instances"][0];
+        // Must include gen_tps from Instance.
+        assert_eq!(i["gen_tps"], 300.0, "gen_tps must appear in list_instances");
+        // Must use daemon-provided tokens_per_watt, not recomputed.
+        assert_eq!(i["tokens_per_watt"], 1.5, "daemon tpw must appear");
+        // Must include freshness for non-None metadata.
+        assert!(i["freshness"].is_string(), "freshness must be a string");
+        assert_eq!(i["freshness"], "fresh");
+        // Must include observed_at.
+        assert!(
+            i["observed_at"].is_string(),
+            "observed_at must be an ISO string"
+        );
+    }
+
+    #[test]
+    fn list_instances_json_held_freshness_field() {
+        let snap = fixture_with_observation(rocm_dash_core::metrics::ObservationFreshness::Held);
+        let v = list_instances_json(&snap);
+        let i = &v["instances"][0];
+        assert_eq!(i["freshness"], "held");
+    }
+
+    #[test]
+    fn list_instances_json_legacy_meta_none_freshness_is_null() {
+        // Legacy instance without metadata: freshness must not be fabricated.
+        let inst = Instance {
+            container_name: "vllm-legacy".into(),
+            model_name: "m".into(),
+            gen_tps: Some(100.0),
+            tokens_per_watt: Some(0.5),
+            gen_tps_observation: None,
+            ..Default::default()
+        };
+        let snap = StateSnapshot {
+            latest: Some(rocm_dash_core::metrics::Snapshot::default()),
+            instances: vec![inst],
+            bench_rows: vec![],
+        };
+        let v = list_instances_json(&snap);
+        let i = &v["instances"][0];
+        // freshness must be null (not "fresh" fabricated).
+        assert!(
+            i["freshness"].is_null(),
+            "legacy metadata must yield null freshness, got: {:?}",
+            i["freshness"]
+        );
+    }
+
+    #[test]
+    fn tokens_per_watt_json_uses_daemon_value_not_recomputed() {
+        // Daemon tokens_per_watt=1.5; if re-computed via gen_tps/power it would differ.
+        // The tool must report 1.5, not a recomputed value.
+        let snap = fixture_with_observation(rocm_dash_core::metrics::ObservationFreshness::Fresh);
+        let v = tokens_per_watt_json(&snap);
+        let i = &v["instances"][0];
+        assert_eq!(i["tokens_per_watt"], 1.5, "must use daemon-provided tpw");
+        // freshness also present.
+        assert_eq!(i["freshness"], "fresh");
     }
 }

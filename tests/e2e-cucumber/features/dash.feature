@@ -68,3 +68,45 @@ Feature: Interactive dashboard
     Then the managed model is displayed
     When the user quits the dashboard
     Then the dashboard exits successfully
+
+
+  @id:eai-7960-gen-tps-held-after-scrape-failure @requires-os:linux
+  Scenario: 8 - Gen throughput stays visible for the validity window after a scrape failure
+    # EAI-7960 principal regression: after establishing a positive gen_tps
+    # baseline through the scripted mock, a single /metrics transport failure
+    # must NOT immediately clear the displayed "tok/s" value.  The contract
+    # requires the held value to remain visible for the validity window
+    # clamp(3 x instance_tick, 6 s, 30 s).  Current code has no such window
+    # (runner.rs clears gen_tps on the same tick as the failure), so the
+    # "generation throughput remains visible" step is the RED assertion.
+    Given a managed model exposes scripted serving metrics
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then positive generation throughput is displayed for the managed model
+    When the metrics endpoint fails transiently
+    Then generation throughput remains visible within the validity window
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:eai-7960-gen-tps-expiry-boundary @requires-os:linux
+  Scenario: 9 - Gen throughput expires after the validity window following sustained failure
+    # EAI-7960 expiry-boundary scenario: two contract boundaries are pinned.
+    #
+    # BOUNDARY 1 (held assertion) — immediately after the first failed scrape,
+    # gen_tps must still be visible (Held).  With current code this FAILS (RED)
+    # because runner.rs clears gen_tps immediately.
+    #
+    # BOUNDARY 2 (expired assertion) — after the validity window elapses
+    # (clamp(3 × instance_tick, 6 s, 30 s) = 6 s for the production 2 s tick),
+    # gen_tps must be gone from the screen.  This step is unreachable today
+    # because BOUNDARY 1 fails first; it becomes GREEN once the fix is applied.
+    Given a managed model exposes scripted serving metrics
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then positive generation throughput is displayed for the managed model
+    When the metrics endpoint fails transiently
+    Then generation throughput remains visible within the validity window
+    When the validity window has elapsed
+    Then generation throughput is no longer displayed
+    When the user quits the dashboard
+    Then the dashboard exits successfully

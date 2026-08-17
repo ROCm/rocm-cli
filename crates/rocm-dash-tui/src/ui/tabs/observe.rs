@@ -93,8 +93,23 @@ fn draw_efficiency_hero(f: &mut Frame, area: Rect, state: &AppState, theme: &The
     if inner.height == 0 {
         return;
     }
+    // Track aggregate held: an instance contributes if it has gen_tps AND its
+    // observation metadata says Held. Any contributing Held → whole aggregate is held.
+    let any_held = state.latest.as_ref().is_some_and(|snap| {
+        snap.instances.iter().any(|i| {
+            i.gen_tps.is_some()
+                && i.gen_tps_observation.as_ref().is_some_and(|m| {
+                    m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held
+                })
+        })
+    });
     let eff = state.latest.as_ref().and_then(widgets::node_efficiency);
-    let value = eff.map_or_else(|| "—".to_string(), |v| format!("{v:.2} tok/W"));
+    let value_base = eff.map_or_else(|| "—".to_string(), |v| format!("{v:.2} tok/W"));
+    let value = if any_held && eff.is_some() {
+        format!("{value_base}{}", format::HELD_MARKER)
+    } else {
+        value_base
+    };
     // Trend: node efficiency across recent snapshots (scaled to milli-tok/W so
     // the integer sparkline keeps resolution); empty when no history yet.
     let trend: Vec<u64> = state
@@ -104,6 +119,7 @@ fn draw_efficiency_hero(f: &mut Frame, area: Rect, state: &AppState, theme: &The
         .map(|v| (v * 1000.0).round().max(0.0) as u64)
         .collect();
 
+    // Layout: value | sparkline (min) | label/legend.
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -128,9 +144,15 @@ fn draw_efficiency_hero(f: &mut Frame, area: Rect, state: &AppState, theme: &The
             rows[1],
         );
     }
+    // Show HELD_LEGEND when any contributing instance is held; otherwise label.
+    let label = if any_held {
+        format::HELD_LEGEND
+    } else {
+        "tokens per watt · whole node"
+    };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "tokens per watt · whole node",
+            label,
             Style::default().fg(theme.muted),
         ))),
         rows[2],
@@ -151,33 +173,36 @@ fn draw_throughput_hero(f: &mut Frame, area: Rect, state: &AppState, theme: &The
     if inner.height == 0 {
         return;
     }
-    let (tps, has_tps, power, has_power) =
+    let (tps, has_tps, power, has_power, any_held) =
         state
             .latest
             .as_ref()
-            .map_or((0.0, false, 0.0_f32, false), |snap| {
+            .map_or((0.0, false, 0.0_f32, false, false), |snap| {
                 let mut tps = 0.0;
                 let mut has_tps = false;
+                let mut any_held = false;
                 for inst in &snap.instances {
                     if let Some(v) = inst.gen_tps {
                         tps += v;
                         has_tps = true;
+                        if inst.gen_tps_observation.as_ref().is_some_and(|m| {
+                            m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held
+                        }) {
+                            any_held = true;
+                        }
                     }
                 }
                 let power: f32 = snap.gpus.iter().map(|g| g.power_w).sum();
-                (tps, has_tps, power, !snap.gpus.is_empty())
+                (tps, has_tps, power, !snap.gpus.is_empty(), any_held)
             });
-    let tps_str = if has_tps {
-        format::tps_opt(Some(tps))
-    } else {
-        "—".to_string()
-    };
+    // Aggregate formatted via shared formatter: NaN/Inf guard + held marker.
+    let tps_str = format::gen_tps_aggregate(has_tps.then_some(tps), any_held);
     let power_str = if has_power {
         format::watts(power)
     } else {
         "—".to_string()
     };
-    let lines = vec![
+    let mut lines = vec![
         Line::from(Span::styled(
             tps_str,
             Style::default()
@@ -193,6 +218,14 @@ fn draw_throughput_hero(f: &mut Frame, area: Rect, state: &AppState, theme: &The
             Style::default().fg(theme.muted),
         )),
     ];
+    // Show the shared HELD_LEGEND only when at least one contributing instance
+    // is held — keeps the surface quiet when data is fully fresh.
+    if any_held {
+        lines.push(Line::from(Span::styled(
+            format::HELD_LEGEND,
+            Style::default().fg(theme.muted),
+        )));
+    }
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -219,7 +252,10 @@ mod tests {
     use crate::app::ActiveTab;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use rocm_dash_core::metrics::{GpuMetrics, Instance, InstanceStatus, Snapshot, SystemMetrics};
+    use rocm_dash_core::metrics::{
+        GpuMetrics, Instance, InstanceStatus, ObservationFreshness, ObservationMetadata, Snapshot,
+        SystemMetrics,
+    };
 
     fn render(state: &AppState, cols: u16, rows: u16) -> String {
         let backend = TestBackend::new(cols, rows);
@@ -386,5 +422,99 @@ mod tests {
         for h in [1u16, 2, 3, 5, 8, 12] {
             let _ = render(&s, 80, h);
         }
+    }
+
+    fn instance_with_obs(model: &str, gen_tps: f64, obs: Option<ObservationMetadata>) -> Instance {
+        Instance {
+            container_id: model.into(),
+            container_name: model.into(),
+            status: InstanceStatus::Running,
+            model_name: model.into(),
+            gpu_ids: vec!["0".into()],
+            gen_tps: Some(gen_tps),
+            tokens_per_watt: Some(gen_tps / 300.0),
+            gen_tps_observation: obs,
+            ..Default::default()
+        }
+    }
+
+    fn held_obs() -> ObservationMetadata {
+        ObservationMetadata {
+            observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+            freshness: ObservationFreshness::Held,
+        }
+    }
+
+    fn fresh_obs() -> ObservationMetadata {
+        ObservationMetadata {
+            observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+            freshness: ObservationFreshness::Fresh,
+        }
+    }
+
+    // ── EAI-7960: HELD_LEGEND rendering and efficiency hero held marker ───────
+
+    #[test]
+    fn observe_held_legend_visible_in_throughput_hero_when_held() {
+        use crate::ui::format;
+        let inst = instance_with_obs("m", 200.0, Some(held_obs()));
+        let state = connected_with_instances(vec![inst]);
+        let out = render(&state, 160, 50);
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must be visible when data is held; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn observe_held_legend_absent_when_all_fresh() {
+        use crate::ui::format;
+        let inst = instance_with_obs("m", 200.0, Some(fresh_obs()));
+        let state = connected_with_instances(vec![inst]);
+        let out = render(&state, 160, 50);
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear when all fresh; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn observe_efficiency_hero_appends_held_marker_when_any_held() {
+        use crate::ui::format;
+        let inst = instance_with_obs("m", 300.0, Some(held_obs()));
+        let state = connected_with_instances(vec![inst]);
+        let out = render(&state, 160, 50);
+        assert!(
+            out.contains(format::HELD_MARKER),
+            "HELD_MARKER must appear in efficiency hero when any instance is held; got:\n{out}"
+        );
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must appear in a hero when held; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn observe_efficiency_hero_no_held_marker_for_fresh_instances() {
+        use crate::ui::format;
+        let inst = instance_with_obs("m", 300.0, Some(fresh_obs()));
+        let state = connected_with_instances(vec![inst]);
+        let out = render(&state, 160, 50);
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must be absent when all fresh; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn observe_efficiency_hero_no_held_marker_for_legacy_none_metadata() {
+        use crate::ui::format;
+        let inst = instance_with_obs("m", 300.0, None);
+        let state = connected_with_instances(vec![inst]);
+        let out = render(&state, 160, 50);
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear for legacy None metadata; got:\n{out}"
+        );
     }
 }

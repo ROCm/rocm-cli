@@ -626,4 +626,189 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    // ── EAI-7960: NDJSON backward-compat / round-trip tests ─────────────────
+    //
+    // Issue 3: use a genuinely hardcoded legacy NDJSON line (no gen_tps_observation
+    // field) and parse it through the actual read_entries → spawn playback path.
+    //
+    // Issue 4: write new NDJSON with Held metadata to a temp file and run it
+    // through spawn; receive ClientMsg::Event and assert gen_tps, observed_at,
+    // and Held freshness survive the full read+playback chain.
+
+    /// A real-world-shaped legacy NDJSON snapshot line produced by a daemon that
+    /// pre-dates EAI-7960. Contains gen_tps=88.5 but has NO gen_tps_observation
+    /// field. Freshness must never be fabricated when this is replayed.
+    const LEGACY_SNAPSHOT_LINE: &str = concat!(
+        r#"{"ts_us":1700000000000000,"event":{"kind":"snapshot","#,
+        r#""timestamp":"2023-11-15T00:00:00Z","#,
+        r#""host":{"cpu_overall_pct":0.0,"cpu_per_core_pct":[],"memory_used_mb":0,"#,
+        r#""memory_total_mb":0,"swap_used_mb":0,"swap_total_mb":0,"#,
+        r#""disk_read_bps":0,"disk_write_bps":0,"net_rx_bps":0,"net_tx_bps":0},"#,
+        r#""gpus":[],"gpu_system_info":null,"#,
+        r#""instances":[{"container_id":"c1","container_name":"vllm-legacy","#,
+        r#""status":"running","model_name":"llama3","gpu_ids":["0"],"#,
+        r#""tensor_parallel_size":1,"vram_used_mb":0,"vram_total_mb":0,"#,
+        r#""gen_tps":88.5,"launch_args":[],"env_vars":{}}],"#,
+        r#""warnings":[]}}"#,
+    );
+
+    #[tokio::test]
+    async fn legacy_ndjson_line_parses_via_playback_no_panic_no_fabricated_freshness() {
+        // Write the hardcoded legacy line to a real file and run it through the
+        // full spawn → read_entries → emit path so we exercise the production
+        // code path, not just serde_json::from_str.
+        let path = tmp_file("legacy-ndjson");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(LEGACY_SNAPSHOT_LINE.as_bytes()).unwrap();
+            f.write_all(b"\n").unwrap();
+            f.flush().unwrap();
+        }
+
+        let (tx, mut rx) = unbounded_channel::<ClientMsg>();
+        let _ctl = spawn(path.clone(), tx);
+
+        // Drain Connecting + Connected, then collect until we get a Snapshot event.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut found_snapshot = false;
+        loop {
+            let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await else {
+                break;
+            };
+            if let ClientMsg::Event(ev) = &msg
+                && let Event::Snapshot(snap) = ev.as_ref()
+            {
+                found_snapshot = true;
+                let inst = &snap.instances[0];
+                assert!(
+                    (inst.gen_tps.expect("gen_tps must be present") - 88.5).abs() < 1e-9,
+                    "gen_tps must be preserved from legacy NDJSON: got {:?}",
+                    inst.gen_tps
+                );
+                assert!(
+                    inst.gen_tps_observation.is_none(),
+                    "gen_tps_observation must be None for legacy NDJSON; \
+                     freshness must never be fabricated: got {:?}",
+                    inst.gen_tps_observation
+                );
+                break;
+            }
+        }
+        assert!(
+            found_snapshot,
+            "no Snapshot event received from legacy NDJSON replay"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn held_metadata_survives_full_ndjson_write_then_spawn_playback() {
+        // Write NDJSON to a real file via write_lines, then spawn the replay,
+        // receive the ClientMsg::Event, and assert that gen_tps, observed_at,
+        // and Held freshness all survive the full read+playback chain.
+        use chrono::{DateTime, Utc};
+        use rocm_dash_core::metrics::{
+            Instance, InstanceStatus, ObservationFreshness, ObservationMetadata, Snapshot,
+        };
+
+        let observed_at: DateTime<Utc> = "2023-11-15T12:34:56Z".parse().unwrap();
+        let meta = ObservationMetadata {
+            observed_at,
+            freshness: ObservationFreshness::Held,
+        };
+        let inst = Instance {
+            container_id: "c1".into(),
+            container_name: "vllm-held".into(),
+            status: InstanceStatus::Running,
+            model_name: "llama3".into(),
+            gpu_ids: vec!["0".into()],
+            tensor_parallel_size: 1,
+            gen_tps: Some(456.7),
+            gen_tps_observation: Some(meta),
+            ..Default::default()
+        };
+        let mut snap = Snapshot::default();
+        snap.instances.push(inst);
+        let entries = vec![PersistedEntry {
+            ts_us: 1_700_000_000_000_000,
+            event: Event::Snapshot(snap),
+        }];
+
+        let path = tmp_file("held-ndjson");
+        write_lines(&path, &entries);
+
+        // Verify the wire contains the observation field (non-None must appear).
+        let wire = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            wire.contains("gen_tps_observation"),
+            "Held metadata must appear in NDJSON wire: {wire}"
+        );
+
+        let (tx, mut rx) = unbounded_channel::<ClientMsg>();
+        let _ctl = spawn(path.clone(), tx);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut found = false;
+        loop {
+            let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await else {
+                break;
+            };
+            if let ClientMsg::Event(ev) = &msg
+                && let Event::Snapshot(snap_back) = ev.as_ref()
+            {
+                found = true;
+                let i = &snap_back.instances[0];
+                assert!(
+                    (i.gen_tps.expect("gen_tps must survive") - 456.7).abs() < 1e-9,
+                    "gen_tps must survive full playback chain: got {:?}",
+                    i.gen_tps
+                );
+                let obs = i
+                    .gen_tps_observation
+                    .as_ref()
+                    .expect("Held metadata must survive full playback chain");
+                assert_eq!(
+                    obs.freshness,
+                    ObservationFreshness::Held,
+                    "freshness must be Held after full playback"
+                );
+                assert_eq!(
+                    obs.observed_at,
+                    "2023-11-15T12:34:56Z".parse::<DateTime<Utc>>().unwrap(),
+                    "observed_at must survive full playback chain"
+                );
+                break;
+            }
+        }
+        assert!(
+            found,
+            "no Snapshot event received from held-metadata NDJSON replay"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fresh_metadata_is_absent_from_wire_when_none() {
+        // Instance with gen_tps_observation = None must NOT emit the field in JSON
+        // (skip_serializing_if = None keeps wire back-compat with legacy consumers).
+        use rocm_dash_core::metrics::{Instance, Snapshot};
+        let mut snap = Snapshot::default();
+        snap.instances.push(Instance {
+            container_id: "c2".into(),
+            gen_tps: Some(100.0),
+            gen_tps_observation: None,
+            ..Default::default()
+        });
+        let entry = PersistedEntry {
+            ts_us: 0,
+            event: rocm_dash_core::protocol::Event::Snapshot(snap),
+        };
+        let s = serde_json::to_string(&entry).unwrap();
+        assert!(
+            !s.contains("gen_tps_observation"),
+            "None metadata must be omitted from wire (legacy back-compat); got: {s}"
+        );
+    }
 }

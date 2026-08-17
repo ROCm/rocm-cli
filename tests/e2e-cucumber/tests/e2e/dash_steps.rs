@@ -8,7 +8,8 @@
 //! screen, and clean exit — which the piped-`Command` steps structurally cannot.
 
 use cucumber::{given, then, when};
-use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions};
+use e2e_cucumber::mock_server::{MetricsMode, MockServer, ServiceRecordOptions};
+use std::time::{Duration, Instant};
 
 use crate::E2eWorld;
 use crate::e2e::tui_driver::{DEFAULT_TIMEOUT, TuiSession};
@@ -434,4 +435,126 @@ async fn privacy_notice_shown(world: &mut E2eWorld) {
         )
         .await
         .unwrap_or_else(|e| panic!("the privacy notice was not shown: {e}"));
+}
+
+// ── EAI-7960: scripted metrics / validity-window regression ────────────────
+
+/// Start the mock in Growing mode so the daemon builds a positive gen_tps
+/// baseline before the scenario injects the Failure transition.
+#[given("a managed model exposes scripted serving metrics")]
+async fn managed_model_scripted_metrics(world: &mut E2eWorld) {
+    let model = "TestModel/E2E-1B";
+    let mock = MockServer::start_with_scripted_metrics(model).await;
+    world.endpoint = Some(mock.base_url());
+    world.model_name = Some(model.to_string());
+    world.mock = Some(mock);
+    world.register_mock_service_with(ServiceRecordOptions::default());
+}
+
+/// The Observe tab's node-throughput hero shows the "tok/s" unit whenever
+/// `gen_tps` is `Some(_)`. Wait for it to confirm a positive baseline was
+/// established through at least two successful Growing-mode scrapes.
+#[then("positive generation throughput is displayed for the managed model")]
+async fn positive_gen_tps_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("tok/s", DEFAULT_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| {
+            panic!("positive gen_tps (\"tok/s\") never appeared after Growing-mode scrapes: {e}")
+        });
+}
+
+/// Switch the scripted mock to Failure mode, then poll the mock's own failure
+/// counter until the daemon delivers at least one 503 — confirming the failure
+/// scrape actually landed before the assertion checks the TUI. This avoids a
+/// fixed wall-time sleep while remaining deterministic.
+#[when("the metrics endpoint fails transiently")]
+async fn metrics_endpoint_fails(world: &mut E2eWorld) {
+    let mock = world.mock.as_ref().expect("no mock server running");
+    mock.set_metrics_mode(MetricsMode::Failure);
+
+    // Poll until the daemon delivers at least one 503 to the mock endpoint.
+    // The production instance_tick is 2 s, so this converges in 2–3 s.
+    let deadline = Instant::now() + DEFAULT_TIMEOUT;
+    loop {
+        if mock.metrics_failure_count() >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "scripted failure was never served within {DEFAULT_TIMEOUT:?}; \
+             check instance_tick and scrape cadence"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Allow one TUI render cycle (50 ms >> 20 ms poll) so the failure
+    // snapshot is painted before the assertion reads the screen.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+/// EAI-7960 principal regression assertion (must be RED with current code).
+///
+/// Contract: the Observe tab must still show "tok/s" immediately after the
+/// first failed scrape — the held value must persist for the validity window
+/// `clamp(3 × instance_tick, 6 s, 30 s)` before clearing.
+///
+/// **Current behaviour:** `runner.rs` lines 464-476 clear `gen_tps` on the
+/// very tick that the `/metrics` fetch fails — no holding logic exists. The
+/// TUI therefore renders "—" the moment the failure propagates, and this
+/// assertion **FAILS**, confirming EAI-7960 is reproduced at the PTY seam.
+#[then("generation throughput remains visible within the validity window")]
+async fn gen_tps_held_after_failure(world: &mut E2eWorld) {
+    let screen = session(world).screen_text();
+    assert!(
+        screen.contains("tok/s"),
+        "EAI-7960 REGRESSION: gen throughput (\"tok/s\") was cleared immediately \
+         after the first failed scrape instead of being held for the validity \
+         window (clamp(3 × instance_tick, 6 s, 30 s)).\n\
+         Root cause: runner.rs clears gen_tps on the same tick as the failure; \
+         no held-value / validity-window logic exists yet.\n\
+         This assertion must FAIL (RED) until the fix is applied.\n\n\
+         Last screen:\n{screen}"
+    );
+}
+
+// ── EAI-7960: expiry boundary helpers ───────────────────────────────────────
+
+/// Production validity window: clamp(3 × instance_tick, 6 s, 30 s).
+///
+/// With the daemon's 2 s `instance_tick` the lower bound clamp(6 s, 6 s) = 6 s
+/// is always reached. An additional buffer of two instance-ticks (4 s) ensures
+/// the runner has had enough cycles to propagate the expiry to the TUI.
+const VALIDITY_WINDOW: Duration = Duration::from_secs(6);
+const VALIDITY_WINDOW_BUFFER: Duration = Duration::from_secs(5); // 2 × instance_tick + render
+
+/// Sleep for the full observation validity window so the caller can then assert
+/// that the held gen_tps has expired. Designed to follow
+/// "When the metrics endpoint fails transiently" — at that step's exit at least
+/// one 503 has been served, meaning the validity clock has started.
+#[when("the validity window has elapsed")]
+async fn validity_window_elapsed(_world: &mut E2eWorld) {
+    // Sleep the full window + buffer so the daemon has had enough cycles
+    // after expiry to deliver the snapshot change to the TUI.
+    tokio::time::sleep(VALIDITY_WINDOW + VALIDITY_WINDOW_BUFFER).await;
+}
+
+/// Assert that gen_tps is no longer rendered on screen (BOUNDARY 2 of the
+/// EAI-7960 expiry contract). After the validity window the daemon must clear
+/// the held value and the TUI must show "—" in place of the "tok/s" unit.
+///
+/// With current code this step is unreachable because BOUNDARY 1 (the "remains
+/// visible" assertion) fails first. This step becomes GREEN once the hold/expiry
+/// logic is implemented.
+#[then("generation throughput is no longer displayed")]
+async fn gen_tps_no_longer_displayed(world: &mut E2eWorld) {
+    let screen = session(world).screen_text();
+    assert!(
+        !screen.contains("tok/s"),
+        "EAI-7960 BOUNDARY-2: gen_tps (\"tok/s\") is still visible after the \
+         validity window clamp(3 × instance_tick, 6 s, 30 s) elapsed.\n\
+         Expected the daemon to have cleared the held value and the TUI to \
+         show the unavailable placeholder.\n\n\
+         Last screen:\n{screen}"
+    );
 }

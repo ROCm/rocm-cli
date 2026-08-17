@@ -68,6 +68,22 @@ Feature: Model serving
     Then the response contains a model reply
     And the response identifies the correct model
 
+  # HF-checkpoint direct-serve canary (EAI-8026). An `owner/repo:variant` ref
+  # bypasses Lemonade's model router and runs a packaged llama-server directly
+  # (`serve_hf_checkpoint`), which bails explicitly if no backend binary is found
+  # under bin/llamacpp/<backend>/ — unlike the short-recipe-name path above, whose
+  # managed-lemonade fallback would mask the identical failure behind the
+  # unrelated EAI-7423 xfail. Reuses the same small Qwen3-0.6B-GGUF checkpoint as
+  # `serve-lemonade-inference` (cache-shared, no extra download) so this stays a
+  # fast per-PR canary rather than needing the @nightly large-checkpoint path.
+  @id:serve-hf-checkpoint-inference @requires-gpu @requires-engine:lemonade
+  Scenario: 14 - A canonical Hugging Face checkpoint serves and responds to inference
+    Given a managed runtime is active
+    And a canonical Hugging Face GGUF checkpoint is being served on lemonade
+    When the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
+
   # Default-engine serve (no --engine): the effective engine is the platform
   # default from the capability probe, so this covers whichever engine the host
   # would actually pick.
