@@ -164,7 +164,7 @@ struct CachedHttpText {
     text: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 struct CachedHttpMetadata {
     url: String,
     #[serde(default)]
@@ -176,11 +176,19 @@ struct CachedHttpMetadata {
     fetched_at_unix_ms: u128,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 struct CachedHttpSignatureMetadata {
     url: String,
     verified_at_unix_ms: u128,
     public_key_source: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct CachedHttpCacheEntry {
+    metadata: CachedHttpMetadata,
+    body: String,
+    #[serde(default)]
+    signature_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1865,39 +1873,39 @@ fn metadata_signature_path(body_path: &Path) -> PathBuf {
 fn fetch_and_verify_metadata_signature(
     policy: &MetadataSignaturePolicy,
     url: &str,
-    payload_path: &Path,
-    signature_path: &Path,
+    payload: &[u8],
     temp_key_path: &Path,
     max_time_secs: Option<u64>,
-) -> Result<Option<(CachedHttpSignatureMetadata, PathBuf)>> {
+) -> Result<Option<(CachedHttpSignatureMetadata, Vec<u8>)>> {
     if !policy.active() {
         return Ok(None);
     }
     let signature_url = metadata_signature_url(url);
-    let staged_signature = download_signature_file(&signature_url, signature_path, max_time_secs)?;
-    let verification = with_metadata_public_key(policy, temp_key_path, |public_key, source| {
-        verify_metadata_signature(payload_path, &staged_signature, public_key)?;
-        Ok(source.to_owned())
-    });
-    let public_key_source = match verification.and_then(|source| {
-        source.context("metadata signature policy was active but no public key was resolved")
-    }) {
-        Ok(source) => source,
-        Err(error) => {
-            let _ = fs::remove_file(&staged_signature);
-            return Err(error);
-        }
-    };
+    let response = http_get(&signature_url, &[], max_time_secs)?;
+    if response.status != 200 {
+        bail!(
+            "HTTP {} while fetching metadata signature {signature_url}",
+            response.status
+        );
+    }
+    let signature = response.body;
+    let public_key_source =
+        with_metadata_public_key(policy, temp_key_path, |public_key, source| {
+            verify_metadata_signature_bytes(payload, &signature, public_key)?;
+            Ok(source.to_owned())
+        })?
+        .context("metadata signature policy was active but no public key was resolved")?;
     Ok(Some((
         CachedHttpSignatureMetadata {
             url: signature_url,
             verified_at_unix_ms: unix_time_millis(),
             public_key_source,
         },
-        staged_signature,
+        signature,
     )))
 }
 
+#[cfg(test)]
 fn verify_cached_metadata_signature(
     policy: &MetadataSignaturePolicy,
     payload_path: &Path,
@@ -1919,25 +1927,7 @@ fn verify_cached_metadata_signature(
     Ok(())
 }
 
-fn download_signature_file(
-    url: &str,
-    destination: &Path,
-    max_time_secs: Option<u64>,
-) -> Result<PathBuf> {
-    let parent = destination
-        .parent()
-        .context("metadata signature destination has no parent directory")?;
-    fs::create_dir_all(parent)?;
-    let response = http_get(url, &[], max_time_secs)?;
-    if response.status != 200 {
-        bail!(
-            "HTTP {} while fetching metadata signature {url}",
-            response.status
-        );
-    }
-    stage_file_for_atomic_publish(destination, &response.body)
-}
-
+#[cfg(test)]
 fn verify_metadata_signature(
     payload_path: &Path,
     signature_path: &Path,
@@ -1964,12 +1954,105 @@ fn verify_metadata_signature(
     verify_rsa_pkcs1_sha256_signature(&public_key_pem, &payload, &signature, "metadata")
 }
 
+fn verify_metadata_signature_bytes(
+    payload: &[u8],
+    signature: &[u8],
+    public_key_path: &Path,
+) -> Result<()> {
+    let public_key_pem = fs::read_to_string(public_key_path).with_context(|| {
+        format!(
+            "failed to read metadata public key: {}",
+            public_key_path.display()
+        )
+    })?;
+    verify_rsa_pkcs1_sha256_signature(&public_key_pem, payload, signature, "metadata")
+}
+
+#[cfg(test)]
 fn metadata_cache_can_revalidate(
     metadata: &CachedHttpMetadata,
     policy: &MetadataSignaturePolicy,
     signature_path: &Path,
 ) -> bool {
     !policy.active() || (metadata.signature.is_some() && signature_path.is_file())
+}
+
+fn load_cached_http_entry(
+    metadata_path: &Path,
+    legacy_body_path: &Path,
+    legacy_signature_path: &Path,
+) -> Option<CachedHttpCacheEntry> {
+    let bytes = fs::read(metadata_path).ok()?;
+    if let Ok(entry) = serde_json::from_slice(&bytes) {
+        return Some(entry);
+    }
+
+    let metadata: CachedHttpMetadata = serde_json::from_slice(&bytes).ok()?;
+    let body = fs::read_to_string(legacy_body_path).ok()?;
+    let signature_bytes = metadata
+        .signature
+        .as_ref()
+        .map(|_| fs::read(legacy_signature_path))
+        .transpose()
+        .ok()?;
+    Some(CachedHttpCacheEntry {
+        metadata,
+        body,
+        signature_bytes,
+    })
+}
+
+const fn cached_http_entry_can_revalidate(
+    entry: &CachedHttpCacheEntry,
+    policy: &MetadataSignaturePolicy,
+) -> bool {
+    !policy.active() || (entry.metadata.signature.is_some() && entry.signature_bytes.is_some())
+}
+
+fn verify_cached_http_entry_signature(
+    policy: &MetadataSignaturePolicy,
+    entry: &CachedHttpCacheEntry,
+    temp_key_path: &Path,
+) -> Result<()> {
+    if !policy.active() {
+        return Ok(());
+    }
+    let signature = entry.signature_bytes.as_deref().context(
+        "metadata signature verification requested but cached signature bytes are missing",
+    )?;
+    with_metadata_public_key(policy, temp_key_path, |public_key, _source| {
+        verify_metadata_signature_bytes(entry.body.as_bytes(), signature, public_key)
+    })?;
+    Ok(())
+}
+
+fn write_cached_http_entry(path: &Path, entry: &CachedHttpCacheEntry) -> Result<()> {
+    write_file_atomically(
+        path,
+        &serde_json::to_vec_pretty(entry).context("failed to serialize metadata cache entry")?,
+    )
+}
+
+#[cfg(test)]
+fn write_cached_http_entry_with<S, P, F>(
+    path: &Path,
+    entry: &CachedHttpCacheEntry,
+    suffix_for_attempt: S,
+    before_publish: P,
+    publish: F,
+) -> Result<()>
+where
+    S: FnMut(u32) -> OsString,
+    P: FnOnce(),
+    F: FnOnce(&Path, &Path) -> io::Result<()>,
+{
+    write_file_atomically_with_publish(
+        path,
+        &serde_json::to_vec_pretty(entry).context("failed to serialize metadata cache entry")?,
+        suffix_for_attempt,
+        before_publish,
+        publish,
+    )
 }
 
 fn download_text_cached(
@@ -1982,10 +2065,8 @@ fn download_text_cached(
     let signature_path = metadata_signature_path(&body_path);
     let signature_policy = MetadataSignaturePolicy::from_env();
     signature_policy.validate_configuration()?;
-    let previous_metadata = fs::read(&metadata_path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<CachedHttpMetadata>(&bytes).ok())
-        .filter(|metadata| metadata.url == url);
+    let previous_entry = load_cached_http_entry(&metadata_path, &body_path, &signature_path)
+        .filter(|entry| entry.metadata.url == url);
     let cache_dir = body_path
         .parent()
         .context("metadata cache path has no parent directory")?;
@@ -1993,51 +2074,35 @@ fn download_text_cached(
 
     let tmp_public_key = body_path.with_extension("public-key.pem");
     let mut headers = Vec::new();
-    if let Some(etag) = previous_metadata
+    if let Some(etag) = previous_entry
         .as_ref()
-        .filter(|metadata| {
-            metadata_cache_can_revalidate(metadata, &signature_policy, &signature_path)
-        })
-        .and_then(|metadata| metadata.etag.as_deref())
+        .filter(|entry| cached_http_entry_can_revalidate(entry, &signature_policy))
+        .and_then(|entry| entry.metadata.etag.as_deref())
     {
         headers.push(("If-None-Match", etag));
     }
 
     let response = http_get(url, &headers, max_time_secs)?;
     if response.status == 304 {
-        verify_cached_metadata_signature(
-            &signature_policy,
-            &body_path,
-            &signature_path,
-            &tmp_public_key,
+        let entry = previous_entry.context(
+            "metadata cache returned 304 but no complete cached generation is available",
         )?;
-        let text = fs::read_to_string(&body_path).with_context(|| {
-            format!(
-                "metadata cache returned 304 but cached body is missing: {}",
-                body_path.display()
-            )
-        })?;
-        return Ok(CachedHttpText { text });
+        verify_cached_http_entry_signature(&signature_policy, &entry, &tmp_public_key)?;
+        return Ok(CachedHttpText { text: entry.body });
     }
     if response.status != 200 {
         bail!("HTTP {} while fetching {url}", response.status);
     }
 
-    let tmp_body = stage_file_for_atomic_publish(&body_path, &response.body)?;
-    let fetched_signature = match fetch_and_verify_metadata_signature(
+    let body =
+        String::from_utf8(response.body).context("metadata response body was not valid UTF-8")?;
+    let fetched_signature = fetch_and_verify_metadata_signature(
         &signature_policy,
         url,
-        &tmp_body,
-        &signature_path,
+        body.as_bytes(),
         &tmp_public_key,
         max_time_secs,
-    ) {
-        Ok(signature) => signature,
-        Err(error) => {
-            let _ = fs::remove_file(&tmp_body);
-            return Err(error);
-        }
-    };
+    )?;
     let signature_metadata = fetched_signature
         .as_ref()
         .map(|(metadata, _)| metadata.clone());
@@ -2048,25 +2113,15 @@ fn download_text_cached(
         signature: signature_metadata,
         fetched_at_unix_ms: unix_time_millis(),
     };
-    if let Err(error) = publish_staged_file(&tmp_body, &body_path) {
-        if let Some((_, staged_signature)) = &fetched_signature {
-            let _ = fs::remove_file(staged_signature);
-        }
-        return Err(error);
-    }
-    if let Some((_, staged_signature)) = fetched_signature {
-        publish_staged_file(&staged_signature, &signature_path)?;
-    } else {
-        let _ = fs::remove_file(&signature_path);
-    }
-    write_file_atomically(
-        &metadata_path,
-        &serde_json::to_vec_pretty(&metadata)
-            .context("failed to serialize metadata cache record")?,
-    )?;
-    let text = fs::read_to_string(&body_path)
-        .with_context(|| format!("failed to read cached metadata {}", body_path.display()))?;
-    Ok(CachedHttpText { text })
+    let entry = CachedHttpCacheEntry {
+        metadata,
+        body,
+        signature_bytes: fetched_signature.map(|(_, signature)| signature),
+    };
+    write_cached_http_entry(&metadata_path, &entry)?;
+    let _ = fs::remove_file(&body_path);
+    let _ = fs::remove_file(&signature_path);
+    Ok(CachedHttpText { text: entry.body })
 }
 
 fn metadata_cache_paths(paths: &AppPaths, cache_key: &str) -> (PathBuf, PathBuf) {
@@ -2393,6 +2448,7 @@ where
     Ok(tmp)
 }
 
+#[cfg(test)]
 fn publish_staged_file(tmp: &Path, path: &Path) -> Result<()> {
     publish_staged_file_with(tmp, path, publish_temp_file)
 }
@@ -3683,6 +3739,123 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    fn cached_http_entry(generation: &str) -> CachedHttpCacheEntry {
+        CachedHttpCacheEntry {
+            metadata: CachedHttpMetadata {
+                url: format!("https://example.invalid/{generation}"),
+                etag: Some(format!("etag-{generation}")),
+                last_modified: None,
+                signature: Some(CachedHttpSignatureMetadata {
+                    url: format!("https://example.invalid/{generation}.sig"),
+                    verified_at_unix_ms: 1,
+                    public_key_source: generation.to_owned(),
+                }),
+                fetched_at_unix_ms: 2,
+            },
+            body: format!("body-{generation}"),
+            signature_bytes: Some(generation.as_bytes().to_vec()),
+        }
+    }
+
+    #[test]
+    fn concurrent_cached_http_commits_publish_one_complete_generation() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cache-generation-collision-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("index.json");
+        let before_publish = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let writers: Vec<_> = ["first", "second"]
+            .into_iter()
+            .enumerate()
+            .map(|(writer, generation)| {
+                let destination = destination.clone();
+                let before_publish = std::sync::Arc::clone(&before_publish);
+                std::thread::spawn(move || {
+                    let entry = cached_http_entry(generation);
+                    write_cached_http_entry_with(
+                        &destination,
+                        &entry,
+                        |attempt| {
+                            if attempt == 0 {
+                                OsString::from("same-millisecond")
+                            } else {
+                                OsString::from(format!("same-millisecond-{writer}-{attempt}"))
+                            }
+                        },
+                        || {
+                            before_publish.wait();
+                        },
+                        publish_temp_file,
+                    )
+                })
+            })
+            .collect();
+
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let published: CachedHttpCacheEntry =
+            serde_json::from_slice(&fs::read(&destination).unwrap()).unwrap();
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().contains(".tmp-"))
+            .collect();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            published == cached_http_entry("first") || published == cached_http_entry("second"),
+            "published cache mixed generations: {published:?}"
+        );
+        assert!(leftovers.is_empty(), "cache commit leaked: {leftovers:?}");
+    }
+
+    #[test]
+    fn failed_cached_http_commit_preserves_previous_complete_generation() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cache-generation-failure-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("index.json");
+        let previous = cached_http_entry("previous");
+        write_cached_http_entry(&destination, &previous).unwrap();
+
+        write_cached_http_entry_with(
+            &destination,
+            &cached_http_entry("replacement"),
+            |attempt| OsString::from(format!("commit-failure-{attempt}")),
+            || {},
+            |tmp, path| {
+                let staged: CachedHttpCacheEntry =
+                    serde_json::from_slice(&fs::read(tmp).unwrap()).unwrap();
+                assert_eq!(staged, cached_http_entry("replacement"));
+                assert_eq!(path, destination);
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "simulated cache generation commit failure",
+                ))
+            },
+        )
+        .expect_err("simulated commit failure must be returned");
+
+        let preserved: CachedHttpCacheEntry =
+            serde_json::from_slice(&fs::read(&destination).unwrap()).unwrap();
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(preserved, previous);
+        assert_eq!(leftovers, vec![OsString::from("index.json")]);
+    }
+
     #[test]
     fn failed_atomic_replace_preserves_destination_and_cleans_temp() {
         let root = std::env::temp_dir().join(format!(
@@ -4421,7 +4594,15 @@ echo Python 3.12.10
         })?
         .expect("inline key should be active");
 
-        assert_eq!(observed, temp_key);
+        assert_eq!(observed.parent(), temp_key.parent());
+        assert!(
+            observed
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("metadata-key.pem.tmp-")),
+            "inline key must use a reserved sibling path: {}",
+            observed.display()
+        );
+        assert!(!observed.exists());
         assert!(!temp_key.exists());
         let _ = fs::remove_dir_all(root);
         Ok(())
