@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use rocm_core::{
     AppPaths, DEFAULT_LOCAL_PORT, ensure_uv_binary, format_http_base_url,
@@ -42,8 +42,26 @@ const STOP_SCOPE: rocm_core::KillScope = rocm_core::KillScope::Tree;
 ///
 /// This pins both the vLLM release and the ROCm ABI tag, so it can drift from
 /// the resolved runtime. Override it with `ROCM_CLI_VLLM_ROCM_INDEX_URL` to
-/// match a different vLLM/ROCm combination without rebuilding.
-const VLLM_ROCM_EXTRA_INDEX_URL: &str = "https://wheels.vllm.ai/rocm/0.23.0/rocm723";
+/// match a different vLLM/ROCm combination without rebuilding; see
+/// [`resolve_vllm_install_target`] for how the requirement follows the URL.
+///
+/// Keep the release and ABI tag here in sync with [`VLLM_PINNED_SPEC`] below;
+/// `vllm_pinned_spec_matches_extra_index_url` fails if the two drift apart.
+const VLLM_ROCM_EXTRA_INDEX_URL: &str = "https://wheels.vllm.ai/rocm/0.26.0/rocm723";
+/// Exact requirement handed to `uv pip install` for [`VLLM_ROCM_EXTRA_INDEX_URL`].
+///
+/// The index URL alone is not a pin: it only constrains where wheels are
+/// fetched from, so a bare `vllm` requirement would install whatever version
+/// that path happens to serve (or fall back to PyPI when no wheel on the index
+/// matches the interpreter). Spelling the version and local ABI tag out here
+/// makes the pin real.
+const VLLM_PINNED_SPEC: &str = "vllm==0.26.0+rocm723";
+/// Prefix shared by every published vLLM ROCm wheel index.
+///
+/// Release indexes are `{VLLM_ROCM_INDEX_PREFIX}/<version>/<abi>`, which is
+/// what lets [`vllm_rocm_build_from_index_url`] recover the build a custom
+/// index serves and keep the requirement pinned to it.
+const VLLM_ROCM_INDEX_PREFIX: &str = "https://wheels.vllm.ai/rocm";
 /// Default time to wait for vLLM to report readiness before giving up.
 const DEFAULT_VLLM_READY_TIMEOUT: Duration = Duration::from_mins(5);
 
@@ -920,7 +938,10 @@ fn runtime_from_python(
 fn install_vllm_with_uv(python: &Path, reinstall: bool) -> Result<()> {
     let paths = AppPaths::discover()?;
     let uv = ensure_uv_binary(&paths).context("failed to acquire uv binary for vLLM install")?;
-    let index_url = vllm_rocm_extra_index_url();
+    let VllmInstallTarget {
+        index_url,
+        requirement,
+    } = vllm_install_target()?;
     let mut args = uv_pip_install_base(python);
     // Without `--reinstall`, `uv pip install vllm` is a no-op when the wheel is
     // already present, which would silently turn a requested reinstall into a
@@ -928,7 +949,7 @@ fn install_vllm_with_uv(python: &Path, reinstall: bool) -> Result<()> {
     if reinstall {
         args.push("--reinstall".to_owned());
     }
-    args.push("vllm".to_owned());
+    args.push(requirement.clone());
     args.push("--extra-index-url".to_owned());
     args.push(index_url.clone());
     let output = ProcessCommand::new(&uv)
@@ -949,7 +970,8 @@ fn install_vllm_with_uv(python: &Path, reinstall: bool) -> Result<()> {
         "no output".to_owned()
     };
     bail!(
-        "`uv pip install vllm --extra-index-url {}` failed for {}: {}",
+        "`uv pip install {} --extra-index-url {}` failed for {}: {}",
+        requirement,
         index_url,
         python.display(),
         detail
@@ -1343,20 +1365,91 @@ fn vllm_enforce_eager_enabled() -> bool {
         })
 }
 
-/// ROCm wheel index passed to `uv pip install vllm`.
+/// Wheel index and exact requirement for one `uv pip install vllm`.
 ///
-/// Defaults to [`VLLM_ROCM_EXTRA_INDEX_URL`]; override with
-/// `ROCM_CLI_VLLM_ROCM_INDEX_URL` (non-empty) to target a different
-/// vLLM/ROCm combination.
-fn vllm_rocm_extra_index_url() -> String {
-    resolve_vllm_rocm_extra_index_url(std::env::var("ROCM_CLI_VLLM_ROCM_INDEX_URL").ok())
+/// The two are always derived from the same `<version>+<abi>` build, so the
+/// install can never be pinned to something the index does not serve — and can
+/// never be left unpinned, which would let the resolver fall through to PyPI's
+/// non-ROCm build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VllmInstallTarget {
+    index_url: String,
+    requirement: String,
 }
 
+/// Pure resolution of the ROCm wheel index from an optional override value.
+///
+/// Falls back to [`VLLM_ROCM_EXTRA_INDEX_URL`] when the override is absent or
+/// blank; a usable one is trimmed. The caller supplies the value (see
+/// [`vllm_install_target`] for the environment read) so this stays testable.
 fn resolve_vllm_rocm_extra_index_url(override_value: Option<String>) -> String {
     override_value
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| VLLM_ROCM_EXTRA_INDEX_URL.to_owned())
+}
+
+/// Index URL and requirement for the current environment.
+fn vllm_install_target() -> Result<VllmInstallTarget> {
+    resolve_vllm_install_target(std::env::var("ROCM_CLI_VLLM_ROCM_INDEX_URL").ok())
+}
+
+/// Resolve the wheel index and the exact requirement to install from it.
+///
+/// Without an override, the built-in [`VLLM_ROCM_EXTRA_INDEX_URL`] and
+/// [`VLLM_PINNED_SPEC`] are used. With `ROCM_CLI_VLLM_ROCM_INDEX_URL` set, the
+/// build is recovered from the URL when it has the published
+/// `{VLLM_ROCM_INDEX_PREFIX}/<version>/<abi>` shape — so pointing at another
+/// release of the same index works *and* stays pinned, with no extra
+/// configuration.
+///
+/// A URL of any other shape cannot be pinned automatically, and dropping the
+/// pin is not an option: the install passes `--extra-index-url`, so PyPI stays
+/// in play and a bare `vllm` can silently resolve to the non-ROCm build. Such a
+/// URL is therefore rejected rather than installed unpinned.
+fn resolve_vllm_install_target(index_override: Option<String>) -> Result<VllmInstallTarget> {
+    let index_url = resolve_vllm_rocm_extra_index_url(index_override);
+    if index_url == VLLM_ROCM_EXTRA_INDEX_URL {
+        return Ok(VllmInstallTarget {
+            index_url,
+            requirement: VLLM_PINNED_SPEC.to_owned(),
+        });
+    }
+
+    let (version, abi) = vllm_rocm_build_from_index_url(&index_url).ok_or_else(|| {
+        anyhow!(
+            "cannot determine which vLLM build `{index_url}` serves: it is not a published \
+             release index of the form `{VLLM_ROCM_INDEX_PREFIX}/<version>/<abi>`. Installing an \
+             unpinned `vllm` instead would let the resolver fall back to PyPI's non-ROCm build, \
+             so point ROCM_CLI_VLLM_ROCM_INDEX_URL at a release index, or unset it to use the \
+             built-in one."
+        )
+    })?;
+
+    Ok(VllmInstallTarget {
+        index_url,
+        requirement: format!("vllm=={version}+{abi}"),
+    })
+}
+
+/// Recover the `<version>+<abi>` build a published release index serves.
+///
+/// Returns `None` for anything that is not
+/// `{VLLM_ROCM_INDEX_PREFIX}/<version>/<abi>`, including the rolling top-level
+/// index, which is latest-only and therefore not a pin.
+fn vllm_rocm_build_from_index_url(index_url: &str) -> Option<(String, String)> {
+    let valid = |segment: &str| {
+        !segment.is_empty()
+            && segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    };
+    let rest = index_url
+        .trim_end_matches('/')
+        .strip_prefix(VLLM_ROCM_INDEX_PREFIX)?
+        .strip_prefix('/')?;
+    let (version, abi) = rest.split_once('/')?;
+    (valid(version) && valid(abi)).then(|| (version.to_owned(), abi.to_owned()))
 }
 
 /// Time to wait for vLLM to become ready before terminating the process tree.
@@ -2306,6 +2399,10 @@ mod tests {
         );
     }
 
+    fn install_target(index: Option<&str>) -> Result<VllmInstallTarget> {
+        resolve_vllm_install_target(index.map(ToOwned::to_owned))
+    }
+
     #[test]
     fn vllm_extra_index_url_defaults_to_const() {
         assert_eq!(
@@ -2325,6 +2422,82 @@ mod tests {
                 "  https://example.test/rocm/wheels  ".to_owned()
             )),
             "https://example.test/rocm/wheels"
+        );
+    }
+
+    #[test]
+    fn vllm_install_target_defaults_to_the_built_in_pin() {
+        let target = install_target(None).expect("built-in target resolves");
+        assert_eq!(target.index_url, VLLM_ROCM_EXTRA_INDEX_URL);
+        assert_eq!(target.requirement, VLLM_PINNED_SPEC);
+
+        let blank = install_target(Some("  ")).expect("a blank override is ignored");
+        assert_eq!(blank, target);
+    }
+
+    #[test]
+    fn vllm_install_target_stays_pinned_for_a_same_shape_index_override() {
+        for (index, expected_url) in [
+            (
+                " https://wheels.vllm.ai/rocm/0.27.0/rocm730 ",
+                "https://wheels.vllm.ai/rocm/0.27.0/rocm730",
+            ),
+            (
+                "https://wheels.vllm.ai/rocm/0.27.0/rocm730/",
+                "https://wheels.vllm.ai/rocm/0.27.0/rocm730/",
+            ),
+        ] {
+            let target = install_target(Some(index)).expect("published index shape resolves");
+            assert_eq!(target.index_url, expected_url);
+            assert_eq!(target.requirement, "vllm==0.27.0+rocm730");
+        }
+    }
+
+    #[test]
+    fn vllm_install_target_fails_rather_than_unpinning_an_unknown_index() {
+        for index in [
+            "https://example.test/rocm/wheels",
+            // Rolling latest-only index: no version/ABI to pin to.
+            "https://wheels.vllm.ai/rocm/",
+            "https://wheels.vllm.ai/rocm/0.27.0",
+            "https://wheels.vllm.ai/rocm//rocm730",
+            "https://wheels.vllm.ai/rocm/0.27.0/rocm 730",
+        ] {
+            let error = install_target(Some(index))
+                .expect_err("an unpinnable index must fail")
+                .to_string();
+            assert!(
+                error.contains(index.trim()),
+                "error for {index} should quote the index URL: {error}"
+            );
+            assert!(
+                error.contains(VLLM_ROCM_INDEX_PREFIX),
+                "error for {index} should show the expected index shape: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn vllm_pinned_spec_matches_extra_index_url() {
+        let (version, abi) = VLLM_PINNED_SPEC
+            .strip_prefix("vllm==")
+            .and_then(|rest| rest.split_once('+'))
+            .expect("pinned spec is spelled `vllm==<version>+<abi>`");
+        let expected_suffix = format!("/{version}/{abi}");
+        assert!(
+            VLLM_ROCM_EXTRA_INDEX_URL.ends_with(&expected_suffix),
+            "pinned spec {VLLM_PINNED_SPEC} does not match index {VLLM_ROCM_EXTRA_INDEX_URL}: \
+             expected the index to end with {expected_suffix}"
+        );
+    }
+
+    #[test]
+    fn vllm_default_index_has_the_published_release_shape() {
+        assert_eq!(
+            vllm_rocm_build_from_index_url(VLLM_ROCM_EXTRA_INDEX_URL),
+            Some(("0.26.0".to_owned(), "rocm723".to_owned())),
+            "the built-in index must parse back to its build, or overrides of the same shape \
+             cannot be pinned"
         );
     }
 
