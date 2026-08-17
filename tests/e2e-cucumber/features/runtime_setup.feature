@@ -19,6 +19,21 @@ Feature: Runtime configuration
     When the user inspects the system
     Then the managed runtime folder path is not recursively nested
 
+  # The GPU E2E lanes no longer install the shared runtime once and keep it
+  # forever: `xtask e2e-prewarm` asks `rocm update` whether the channel index has
+  # published a newer version, and installs it side-by-side when it has (EAI-8057).
+  # That makes CI depend on the freshness line this scenario pins. A unit test on a
+  # hand-written fixture cannot catch the renderer drifting away from the parser —
+  # only running the real command can, which is why this is a scenario and not just
+  # an xtask test. Cheap enough for the per-PR lanes: one CLI call against the
+  # already-installed shared runtime. `status=error` is an ACCEPTED outcome, so an
+  # offline runner reports honestly instead of flaking.
+  @id:runtime-update-reports-freshness @requires-gpu
+  Scenario: 4 - The update check reports the active runtime's freshness
+    Given a managed runtime is active
+    When the user checks for runtime updates
+    Then the report states the runtime's freshness against the channel index
+
   # Linux-only: the step adopts a standard `/opt/rocm` install with a Unix python
   # path. On Windows those paths don't exist (the CLI resolves `/usr/bin/python3`
   # to a bogus `C:/usr/bin/python3` and errors on the missing path before it can
