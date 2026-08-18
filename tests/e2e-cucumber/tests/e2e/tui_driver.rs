@@ -60,7 +60,27 @@ const DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 /// Default wall-clock budget for a single wait. Generous enough for a cold dash
 /// start plus the embedded-daemon connect, while still turning a genuine hang
 /// into a prompt, diagnosable failure rather than a CI-timeout.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+/// Wall-clock budget for a single wait, overridable with `E2E_TUI_TIMEOUT_SECS`.
+///
+/// Mirrors `E2E_SERVE_TIMEOUT_SECS` in `serving_steps.rs`: the assertion is
+/// right, the budget is what varies by host. The self-hosted Strix lanes share
+/// one physical machine, so a TUI frame that renders well inside 30s on an idle
+/// runner can miss it when a sibling lane is loading a model on the same box —
+/// which shows up as an unrelated-looking flake, not as a real hang.
+///
+/// Deliberately a wait budget and not a retry: a genuine hang must still fail.
+#[must_use]
+pub fn default_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("E2E_TUI_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|secs| *secs > 0)
+            .unwrap_or(DEFAULT_TIMEOUT_SECS),
+    )
+}
 
 /// A running `rocm` TUI attached to a pseudo-terminal.
 pub struct TuiSession {

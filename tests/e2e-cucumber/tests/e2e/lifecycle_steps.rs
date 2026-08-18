@@ -23,7 +23,7 @@ use std::process::Command;
 use cucumber::{given, then, when};
 
 use crate::E2eWorld;
-use crate::e2e::tui_driver::{DEFAULT_TIMEOUT, TuiSession};
+use crate::e2e::tui_driver::{TuiSession, default_timeout};
 
 /// Per-scenario release-lifecycle state. All paths are rooted in the scenario's
 /// isolated temp dir; `Drop` restores the captured Windows user PATH.
@@ -857,7 +857,7 @@ async fn when_quit_installed_chat(world: &mut E2eWorld) {
         .tui
         .as_mut()
         .expect("no installed interactive chat session is open")
-        .quit_and_wait(DEFAULT_TIMEOUT)
+        .quit_and_wait(default_timeout())
         .await
         .unwrap_or_else(|e| panic!("installed interactive chat did not exit cleanly: {e}"));
 }
@@ -1008,7 +1008,7 @@ async fn then_installed_chat_displayed(world: &mut E2eWorld) {
         .tui
         .as_mut()
         .expect("no installed interactive chat session is open")
-        .wait_for_screen("No messages yet.", DEFAULT_TIMEOUT)
+        .wait_for_screen("No messages yet.", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("installed interactive chat did not become ready: {e}"));
 }

@@ -12,7 +12,7 @@ use e2e_cucumber::mock_server::{MetricsMode, MockServer, ServiceRecordOptions};
 use std::time::{Duration, Instant};
 
 use crate::E2eWorld;
-use crate::e2e::tui_driver::{DEFAULT_TIMEOUT, TuiSession};
+use crate::e2e::tui_driver::{TuiSession, default_timeout};
 
 /// The exact prompt `send_managed_model_message` types, and the string the
 /// corresponding `Then` step (`managed_chat_request_carried_prompt`) asserts
@@ -129,7 +129,7 @@ async fn open_observe_view(world: &mut E2eWorld) {
     // repeat it until the Observe tab is actually selected — the `●` marks the
     // active chip. The step then fails only if the dashboard never gets there,
     // not if it was slow to start.
-    tui.send_until("4", "● Observe", DEFAULT_TIMEOUT)
+    tui.send_until("4", "● Observe", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("failed to switch to the Observe tab: {e}"));
 }
@@ -169,7 +169,7 @@ async fn choose_serving(world: &mut E2eWorld) {
 #[when("the user accepts the local endpoint")]
 async fn accept_local_endpoint(world: &mut E2eWorld) {
     let tui = session(world);
-    tui.wait_for_screen("Your request only leaves this machine", DEFAULT_TIMEOUT)
+    tui.wait_for_screen("Your request only leaves this machine", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("local endpoint consent did not appear: {e}"));
     tui.send("y")
@@ -179,7 +179,7 @@ async fn accept_local_endpoint(world: &mut E2eWorld) {
 #[when("the user sends a message to the managed model")]
 async fn send_managed_model_message(world: &mut E2eWorld) {
     let tui = session(world);
-    tui.wait_for_screen("No messages yet.", DEFAULT_TIMEOUT)
+    tui.wait_for_screen("No messages yet.", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("chat surface never became ready: {e}"));
     // No `i` here: accepting local-endpoint consent (`accept_chat_consent`) already
@@ -197,7 +197,7 @@ async fn send_gpu_message(world: &mut E2eWorld) {
     let tui = session(world);
     // Wait for the accepted, empty chat surface before typing so the input is
     // ready to receive focus.
-    tui.wait_for_screen("No messages yet.", DEFAULT_TIMEOUT)
+    tui.wait_for_screen("No messages yet.", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("chat surface never became ready: {e}"));
     // `i` focuses the input; then the message, then Enter to submit.
@@ -211,7 +211,7 @@ async fn send_gpu_message(world: &mut E2eWorld) {
 
 async fn quit_tui(world: &mut E2eWorld, surface: &str) {
     session(world)
-        .quit_and_wait(DEFAULT_TIMEOUT)
+        .quit_and_wait(default_timeout())
         .await
         .unwrap_or_else(|e| panic!("{surface} did not exit cleanly: {e}"));
 }
@@ -233,7 +233,7 @@ async fn home_view_displayed(world: &mut E2eWorld) {
     let tui = session(world);
     // The Home tab's summary cards (Running / Health / Updates) are drawn at any
     // size; the wider "GPU UTILIZATION" hero is not, so assert on the cards.
-    tui.wait_for_screen("Updates", DEFAULT_TIMEOUT)
+    tui.wait_for_screen("Updates", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the home view did not appear: {e}"));
     let screen = tui.screen_text();
@@ -246,7 +246,7 @@ async fn home_view_displayed(world: &mut E2eWorld) {
 #[then("ROCm setup actions are displayed")]
 async fn rocm_actions_displayed(world: &mut E2eWorld) {
     session(world)
-        .wait_for_screen("Set up / Install ROCm", DEFAULT_TIMEOUT)
+        .wait_for_screen("Set up / Install ROCm", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the ROCm setup actions did not appear: {e}"));
 }
@@ -254,7 +254,7 @@ async fn rocm_actions_displayed(world: &mut E2eWorld) {
 #[then("the assistant's GPU status response is displayed")]
 async fn gpu_response_displayed(world: &mut E2eWorld) {
     session(world)
-        .wait_for_screen("GPU-2 is running hot", DEFAULT_TIMEOUT)
+        .wait_for_screen("GPU-2 is running hot", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the assistant's response did not appear: {e}"));
 }
@@ -262,7 +262,7 @@ async fn gpu_response_displayed(world: &mut E2eWorld) {
 #[then("the managed model's response is displayed")]
 async fn managed_model_response_displayed(world: &mut E2eWorld) {
     session(world)
-        .wait_for_screen("mock response for testing", DEFAULT_TIMEOUT)
+        .wait_for_screen("mock response for testing", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the managed model's response did not appear: {e}"));
 }
@@ -280,7 +280,7 @@ async fn managed_chat_request_carried_prompt(world: &mut E2eWorld) {
         .mock
         .as_ref()
         .expect("no mock server running")
-        .wait_for_chat_request(DEFAULT_TIMEOUT)
+        .wait_for_chat_request(default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the mock never received a chat request: {e}"));
     let messages = body
@@ -304,14 +304,14 @@ async fn managed_chat_request_carried_prompt(world: &mut E2eWorld) {
 async fn managed_model_shown_loading(world: &mut E2eWorld) {
     let model = world.model_name.clone().expect("no model name set");
     let tui = session(world);
-    tui.wait_for_screen(&model, DEFAULT_TIMEOUT)
+    tui.wait_for_screen(&model, default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the managed model did not appear: {e}"));
     // The compact Observe table intentionally omits lifecycle status; opening
     // the selected instance exposes the status a user uses to diagnose startup.
     tui.send("\r")
         .unwrap_or_else(|e| panic!("failed to open instance details: {e}"));
-    tui.wait_for_screen("LOADING", DEFAULT_TIMEOUT)
+    tui.wait_for_screen("LOADING", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the loading state did not appear: {e}"));
     let screen = tui.screen_text();
@@ -328,10 +328,10 @@ async fn managed_model_shown_loading(world: &mut E2eWorld) {
 async fn managed_model_metrics_displayed(world: &mut E2eWorld) {
     let model = world.model_name.clone().expect("no model name set");
     let tui = session(world);
-    tui.wait_for_screen(&model, DEFAULT_TIMEOUT)
+    tui.wait_for_screen(&model, default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the managed model did not appear: {e}"));
-    tui.wait_for_screen("50ms", DEFAULT_TIMEOUT)
+    tui.wait_for_screen("50ms", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("TTFT metrics did not appear: {e}"));
     let screen = tui.screen_text();
@@ -349,7 +349,7 @@ async fn managed_model_metrics_displayed(world: &mut E2eWorld) {
 #[then("navigation and next-step guidance are displayed")]
 async fn navigation_guidance_displayed(world: &mut E2eWorld) {
     let tui = session(world);
-    tui.wait_for_screen("toggle this help", DEFAULT_TIMEOUT)
+    tui.wait_for_screen("toggle this help", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("dashboard help did not appear: {e}"));
     let screen = tui.screen_text();
@@ -362,7 +362,7 @@ async fn navigation_guidance_displayed(world: &mut E2eWorld) {
 #[then("dashboard destinations are displayed")]
 async fn dashboard_destinations_displayed(world: &mut E2eWorld) {
     let tui = session(world);
-    tui.wait_for_screen("Go to", DEFAULT_TIMEOUT)
+    tui.wait_for_screen("Go to", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("command palette did not appear: {e}"));
     let screen = tui.screen_text();
@@ -375,7 +375,7 @@ async fn dashboard_destinations_displayed(world: &mut E2eWorld) {
 #[then("Serving actions are displayed")]
 async fn serving_actions_displayed(world: &mut E2eWorld) {
     session(world)
-        .wait_for_screen("Serving actions", DEFAULT_TIMEOUT)
+        .wait_for_screen("Serving actions", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("Serving actions did not appear: {e}"));
 }
@@ -388,7 +388,7 @@ async fn managed_model_displayed(world: &mut E2eWorld) {
         .expect("no model name set")
         .to_string();
     session(world)
-        .wait_for_screen(&model, DEFAULT_TIMEOUT)
+        .wait_for_screen(&model, default_timeout())
         .await
         .unwrap_or_else(|e| panic!("managed model did not appear: {e}"));
 }
@@ -427,7 +427,7 @@ async fn local_endpoint_shown(world: &mut E2eWorld) {
         .port()
         .to_string();
     session(world)
-        .wait_for_screen(&port, DEFAULT_TIMEOUT)
+        .wait_for_screen(&port, default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the detected endpoint was not shown: {e}"));
 }
@@ -439,7 +439,7 @@ async fn privacy_notice_shown(world: &mut E2eWorld) {
     session(world)
         .wait_for_screen(
             "Your request only leaves this machine after you accept.",
-            DEFAULT_TIMEOUT,
+            default_timeout(),
         )
         .await
         .unwrap_or_else(|e| panic!("the privacy notice was not shown: {e}"));
@@ -465,7 +465,7 @@ async fn managed_model_scripted_metrics(world: &mut E2eWorld) {
 #[then("positive generation throughput is displayed for the managed model")]
 async fn positive_gen_tps_displayed(world: &mut E2eWorld) {
     session(world)
-        .wait_for_screen("tok/s", DEFAULT_TIMEOUT)
+        .wait_for_screen("tok/s", default_timeout())
         .await
         .unwrap_or_else(|e| {
             panic!("positive gen_tps (\"tok/s\") never appeared after Growing-mode scrapes: {e}")
@@ -483,14 +483,15 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
 
     // Poll until the daemon delivers at least one 503 to the mock endpoint.
     // The production instance_tick is 2 s, so this converges in 2–3 s.
-    let deadline = Instant::now() + DEFAULT_TIMEOUT;
+    let budget = default_timeout();
+    let deadline = Instant::now() + budget;
     loop {
         if mock.metrics_failure_count() >= 1 {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "scripted failure was never served within {DEFAULT_TIMEOUT:?}; \
+            "scripted failure was never served within {budget:?}; \
              check instance_tick and scrape cadence"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;

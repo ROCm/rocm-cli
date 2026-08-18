@@ -98,7 +98,9 @@ Scenarios carry stable-id and capability tags:
 | Tag | Meaning |
 |---|---|
 | `@id:<slug>` | Stable scenario id. Keys the expectation matrix and the report grid; every scenario has one. |
-| `@requires-gpu` | Needs a real AMD GPU. Resolves to **skip** (n/a) on a host with none (e.g. the mock job). |
+| `@requires-gpu` | Needs a usable AMD GPU. Resolves to **skip** (n/a) on a host with none — the mock job, or a WSL host whose ROCm passthrough is incomplete (`driver_status` other than `wsl_rocdxg_ready`), where the gfx target is reported but unreachable. |
+| `@requires-bare-metal` | Premise is a host running the in-tree amdgpu driver, so it does not hold under WSL2. Resolves to **skip** there. `@requires-os:linux` cannot express this: WSL2 reports an `os_family` of `linux`. |
+| `@requires-wsl` | The inverse: premise **is** a WSL2 host. Resolves to **skip** on native Linux, native Windows, and everything else. |
 | `@requires-engine:<vllm\|lemonade>` | Pins the serve engine. Resolves to skip where that engine can't start (e.g. vLLM on a lemonade-only Strix host). |
 | `@requires-os:<linux\|windows>` | Premise is OS-specific; skip on other OSes. |
 | `@serve-timeout:<secs>` | Lengthen the serve-readiness wait for a genuinely slow serve (e.g. a large model). |
@@ -133,16 +135,20 @@ self-hosted runner can never stall `ci.yml`'s merge-required checks:
 | `e2e-gpu` | `e2e-selfhosted.yml` | MI300X (self-hosted) | no |
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo / Ubuntu (self-hosted) | no |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo / Windows (self-hosted) | no |
+| `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo / Ubuntu under WSL2 (self-hosted) | no |
 
 The blocking mock job passes when every applicable scenario is pass-or-xfail with
 no XPASS or unexpected failure; the GPU jobs are non-blocking. Each workflow
 consolidates its own platforms: `ci.yml`'s `e2e-report` the mock platform,
 `e2e-selfhosted.yml`'s `e2e-report` the self-hosted platforms, and
-`nightly.yml`'s `e2e-report-nightly` the nightly lanes below.
+`nightly.yml`'s `e2e-report-nightly` the nightly lanes below. `e2e-wsl` runs the suite in an
+Ubuntu distro under WSL2 on the Strix Halo box, so it is the only lane that
+exercises `@requires-wsl` scenarios; `@requires-bare-metal` scenarios resolve to
+skip there.
 
-The nightly workflow runs three non-blocking jobs — the existing MI300X job and
-new Strix Halo jobs on Ubuntu and Windows — with `E2E_INCLUDE_NIGHTLY=1`, then
-consolidates them into the same cross-platform grid. The
+The nightly workflow runs four non-blocking jobs — MI300X plus Strix Halo on
+Ubuntu, Windows, and WSL2 — with `E2E_INCLUDE_NIGHTLY=1`, then consolidates them
+into the same cross-platform grid. The
 shared large-model scenario serves `Qwen/Qwen3.6-27B` through vLLM on MI300X and
 the hardware-verified `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL` checkpoint
 through Lemonade on Strix Halo.
