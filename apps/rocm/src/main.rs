@@ -256,6 +256,15 @@ echo \"Summarize this\" | rocm chat --provider anthropic")]
         /// Prompt to send. If omitted, rocm-cli reads from standard input when possible.
         #[arg(long)]
         prompt: Option<String>,
+        /// Sampling temperature to send with the request (>= 0.0). Higher is more random.
+        #[arg(long, value_parser = parse_non_negative_temperature)]
+        temperature: Option<f32>,
+        /// Nucleus sampling probability to send with the request (0.0-1.0).
+        #[arg(long = "top-p", value_parser = parse_unit_interval)]
+        top_p: Option<f32>,
+        /// Maximum number of tokens to generate in the response.
+        #[arg(long = "max-tokens", value_parser = parse_positive_u32)]
+        max_tokens: Option<u32>,
         #[arg(
             long,
             help = "Allow an OpenAI-compatible provider to request ROCm tool calls."
@@ -388,6 +397,15 @@ rocm serve qwen2.5-7b-instruct --verbose --device gpu_required")]
         // (`--gpu-memory-utilization --verbose`), which then fails loudly on parse.
         #[arg(long, value_name = "FRACTION", allow_hyphen_values = true)]
         gpu_memory_utilization: Option<String>,
+        /// Default sampling temperature for generation (>= 0.0).
+        #[arg(long, value_parser = parse_non_negative_temperature)]
+        temperature: Option<f32>,
+        /// Default nucleus sampling probability for generation (0.0-1.0).
+        #[arg(long = "top-p", value_parser = parse_unit_interval)]
+        top_p: Option<f32>,
+        /// Default maximum number of tokens to generate per response.
+        #[arg(long = "max-tokens", value_parser = parse_positive_u32)]
+        max_tokens: Option<u32>,
         /// API key that clients must present to a public (non-loopback) endpoint.
         /// When binding a public interface and this is omitted, a strong key is
         /// generated automatically. Prefer the `ROCM_SERVE_API_KEY` environment
@@ -1722,6 +1740,9 @@ fn dispatch(cli: Cli) -> Result<()> {
             provider,
             model,
             prompt,
+            temperature,
+            top_p,
+            max_tokens,
             tools,
             chat_mock,
         }) => {
@@ -1739,7 +1760,14 @@ fn dispatch(cli: Cli) -> Result<()> {
                         "note: launching the dash chat; switch providers with /provider <name>"
                     );
                 }
-                return dash::run_chat(chat_mock);
+                return dash::run_chat(
+                    chat_mock,
+                    ChatInferenceParams {
+                        temperature,
+                        top_p,
+                        max_tokens,
+                    },
+                );
             }
             match prompt {
                 Some(prompt) => print!(
@@ -1749,7 +1777,12 @@ fn dispatch(cli: Cli) -> Result<()> {
                         provider.map_or("local", provider_name),
                         model.as_deref(),
                         &prompt,
-                        tools
+                        tools,
+                        ChatInferenceParams {
+                            temperature,
+                            top_p,
+                            max_tokens,
+                        },
                     )?
                 ),
                 None => print!(
@@ -1875,6 +1908,9 @@ fn dispatch(cli: Cli) -> Result<()> {
             allow_public_bind,
             tool_call_parser,
             gpu_memory_utilization,
+            temperature,
+            top_p,
+            max_tokens,
             api_key,
         }) => serve(ServeArgs {
             model,
@@ -1892,6 +1928,9 @@ fn dispatch(cli: Cli) -> Result<()> {
             allow_public_bind,
             tool_call_parser,
             gpu_memory_utilization,
+            temperature,
+            top_p,
+            max_tokens,
             api_key,
         }),
         Some(Command::Comfyui { command }) => comfyui(command),
@@ -4448,6 +4487,146 @@ fn engine_recipe_with_tool_call_override(
     Some(hint)
 }
 
+/// Sampling defaults a `rocm serve` invocation can push into a vLLM launch.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct ServeGenerationDefaults {
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    max_tokens: Option<u32>,
+}
+
+impl ServeGenerationDefaults {
+    const fn is_empty(&self) -> bool {
+        self.temperature.is_none() && self.top_p.is_none() && self.max_tokens.is_none()
+    }
+}
+
+/// Applies `rocm serve` generation defaults (`--temperature`/`--top-p`/`--max-tokens`)
+/// to the selected engine's launch recipe.
+///
+/// vLLM `serve` has no raw `--temperature`/`--top-p` flags; `--override-generation-config`
+/// is the supported way to set server-wide sampling defaults, so `--max-tokens` is
+/// mapped onto vLLM's `max_new_tokens` output cap. Only supplied values are written,
+/// and any values already carried by an authored recipe's
+/// `--override-generation-config` are preserved (the CLI-supplied keys win).
+///
+/// Lemonade's llama.cpp backend accepts the equivalent `--temperature`, `--top-p`,
+/// and `--n-predict` launch flags. A minimal hint is synthesized when none exists.
+/// With no defaults supplied the hint passes through unchanged.
+fn engine_recipe_with_generation_defaults(
+    engine: &str,
+    hint: Option<EngineRecipeHint>,
+    defaults: ServeGenerationDefaults,
+) -> Result<Option<EngineRecipeHint>> {
+    if defaults.is_empty() {
+        return Ok(hint);
+    }
+    let mut hint = hint.unwrap_or_else(|| EngineRecipeHint {
+        contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+        engine: engine.to_owned(),
+        ..EngineRecipeHint::default()
+    });
+    if engine.eq_ignore_ascii_case("vllm") {
+        let mut overrides = serde_json::Map::new();
+        if let Some(temperature) = defaults.temperature {
+            overrides.insert("temperature".to_owned(), serde_json::json!(temperature));
+        }
+        if let Some(top_p) = defaults.top_p {
+            overrides.insert("top_p".to_owned(), serde_json::json!(top_p));
+        }
+        if let Some(max_tokens) = defaults.max_tokens {
+            overrides.insert("max_new_tokens".to_owned(), serde_json::json!(max_tokens));
+        }
+        set_vllm_override_generation_config(&mut hint.required_flags, &overrides);
+    } else if engine.eq_ignore_ascii_case("lemonade") {
+        set_lemonade_generation_defaults(&mut hint.required_flags, defaults);
+    } else {
+        bail!(
+            "generation defaults are not supported by engine `{engine}`; omit --temperature/--top-p/--max-tokens or select vllm/lemonade"
+        );
+    }
+    Ok(Some(hint))
+}
+
+fn set_lemonade_generation_defaults(flags: &mut Vec<String>, defaults: ServeGenerationDefaults) {
+    // Only touch a flag pair when the caller actually supplied that control —
+    // an unset field must leave any authored recipe value in place rather than
+    // deleting it, mirroring the vLLM merge semantics in
+    // `set_vllm_override_generation_config`.
+    for (name, value) in [
+        (
+            "--temperature",
+            defaults.temperature.map(|value| value.to_string()),
+        ),
+        ("--top-p", defaults.top_p.map(|value| value.to_string())),
+        (
+            "--n-predict",
+            defaults.max_tokens.map(|value| value.to_string()),
+        ),
+    ] {
+        let Some(value) = value else {
+            continue;
+        };
+        let mut rewritten = Vec::with_capacity(flags.len() + 2);
+        let mut skip_value = false;
+        for flag in std::mem::take(flags) {
+            if skip_value {
+                skip_value = false;
+                continue;
+            }
+            if flag == name {
+                skip_value = true;
+            } else {
+                rewritten.push(flag);
+            }
+        }
+        rewritten.extend([name.to_owned(), value]);
+        *flags = rewritten;
+    }
+}
+
+/// Rewrites `flags` so vLLM's `--override-generation-config` carries exactly one
+/// merged JSON object: any existing `--override-generation-config <value>` pair is
+/// removed, its keys are used as a base, and `overrides` are layered on top (CLI
+/// values win). Emits a single flag pair with the merged, stably-ordered config.
+fn set_vllm_override_generation_config(
+    flags: &mut Vec<String>,
+    overrides: &serde_json::Map<String, serde_json::Value>,
+) {
+    let existing = std::mem::take(flags);
+    let mut rewritten: Vec<String> = Vec::with_capacity(existing.len() + 2);
+    let mut merged = serde_json::Map::new();
+    let mut take_value = false;
+    for flag in existing {
+        if take_value {
+            take_value = false;
+            if let Ok(serde_json::Value::Object(existing_config)) =
+                serde_json::from_str::<serde_json::Value>(&flag)
+            {
+                for (key, value) in existing_config {
+                    merged.insert(key, value);
+                }
+            } else {
+                eprintln!(
+                    "warning: existing --override-generation-config value is not valid JSON; discarding it"
+                );
+            }
+            continue;
+        }
+        if flag == "--override-generation-config" {
+            take_value = true;
+            continue;
+        }
+        rewritten.push(flag);
+    }
+    for (key, value) in overrides {
+        merged.insert(key.clone(), value.clone());
+    }
+    rewritten.push("--override-generation-config".to_owned());
+    rewritten.push(serde_json::Value::Object(merged).to_string());
+    *flags = rewritten;
+}
+
 /// Rewrites `flags` so vLLM tool calling uses exactly `parser`: drops any existing
 /// `--tool-call-parser <value>` pair, ensures `--enable-auto-tool-choice` is
 /// present, then appends the new parser flag.
@@ -4581,6 +4760,9 @@ struct ServeArgs {
     allow_public_bind: bool,
     tool_call_parser: Option<String>,
     gpu_memory_utilization: Option<String>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    max_tokens: Option<u32>,
     api_key: Option<String>,
 }
 
@@ -4601,6 +4783,9 @@ fn serve(args: ServeArgs) -> Result<()> {
         allow_public_bind,
         tool_call_parser,
         gpu_memory_utilization,
+        temperature,
+        top_p,
+        max_tokens,
         api_key,
     } = args;
     let _ = managed; // background is now the default; --managed is accepted as an explicit synonym.
@@ -4678,6 +4863,18 @@ fn serve(args: ServeArgs) -> Result<()> {
                 "--gpu-memory-utilization applies only to vLLM; ignored for engine '{selected_engine}'"
             )
         });
+    // Translate the engine-neutral CLI controls into each adapter's server-wide
+    // defaults: vLLM generation config or Lemonade llama.cpp launch flags.
+    let generation_defaults = ServeGenerationDefaults {
+        temperature,
+        top_p,
+        max_tokens,
+    };
+    let engine_recipe = engine_recipe_with_generation_defaults(
+        &selected_engine,
+        engine_recipe,
+        generation_defaults,
+    )?;
     let tool_call_note = if tool_call_parser.is_some() && !engine_serves_vllm {
         Some(format!(
             "note: --tool-call-parser applies only to vLLM; ignored for engine '{selected_engine}'"
@@ -5248,9 +5445,20 @@ fn spawn_managed_engine_child(
     // an error. Keyed on engine+canonical model — the freshly generated
     // `service_id` is timestamp-unique and would never match an existing one.
     // Stale/dead services fall through and relaunch normally.
+    let requested_recipe_json = engine_recipe
+        .map(serde_json::to_string)
+        .transpose()
+        .context("failed to encode engine recipe hint")?;
     if let Some(existing) =
         existing_live_managed_service(paths, engine, &resolve.canonical_model_id)
     {
+        if existing.engine_recipe_json != requested_recipe_json {
+            bail!(
+                "managed service `{}` is already running for engine `{engine}` and model `{}` with different serve options (recipe hint, tool-call parser, or generation defaults); stop it and run `rocm serve` again to apply the requested options",
+                existing.service_id,
+                resolve.canonical_model_id
+            );
+        }
         record_cli_audit_event(
             paths,
             "service",
@@ -5288,10 +5496,7 @@ fn spawn_managed_engine_child(
         Some(device_policy_name(device_policy).to_owned()),
     );
     record.gpu_indices = gpu_indices.to_vec();
-    record.engine_recipe_json = engine_recipe
-        .map(serde_json::to_string)
-        .transpose()
-        .context("failed to encode engine recipe hint")?;
+    record.engine_recipe_json = requested_recipe_json;
     record.write()?;
 
     if let Some(parent) = record.engine_state_path.parent() {
@@ -7957,8 +8162,52 @@ pub(crate) fn render_chat_prompt_text(
     model: Option<&str>,
     prompt: &str,
     rocm_tools: bool,
+    params: ChatInferenceParams,
 ) -> Result<String> {
-    Ok(render_chat_prompt_result(paths, provider, model, prompt, rocm_tools)?.rendered)
+    Ok(render_chat_prompt_result_with_progress(
+        paths, provider, model, prompt, rocm_tools, params, None,
+    )?
+    .rendered)
+}
+
+/// Sampling controls a caller can pass through to the underlying chat request.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ChatInferenceParams {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub max_tokens: Option<u32>,
+}
+
+/// Parse a `--temperature` value: a finite number greater than or equal to 0.
+fn parse_non_negative_temperature(value: &str) -> Result<f32, String> {
+    let parsed: f32 = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a valid number"))?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return Err("temperature must be a finite value >= 0.0".to_owned());
+    }
+    Ok(parsed)
+}
+
+/// Parse a `--top-p` value: a finite number in the inclusive range 0.0..=1.0.
+fn parse_unit_interval(value: &str) -> Result<f32, String> {
+    let parsed: f32 = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a valid number"))?;
+    if !parsed.is_finite() || !(0.0..=1.0).contains(&parsed) {
+        return Err("top-p must be between 0.0 and 1.0".to_owned());
+    }
+    Ok(parsed)
+}
+
+fn parse_positive_u32(value: &str) -> Result<u32, String> {
+    let parsed: u32 = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a valid positive integer"))?;
+    if parsed == 0 {
+        return Err("max-tokens must be greater than 0".to_owned());
+    }
+    Ok(parsed)
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -7984,6 +8233,8 @@ struct ChatToolRunResult {
     needs_install_folder: bool,
 }
 
+/// Convenience wrapper used by tests that do not exercise sampling controls.
+#[cfg(test)]
 pub(crate) fn render_chat_prompt_result(
     paths: &AppPaths,
     provider: &str,
@@ -7991,7 +8242,15 @@ pub(crate) fn render_chat_prompt_result(
     prompt: &str,
     rocm_tools: bool,
 ) -> Result<ChatPromptResult> {
-    render_chat_prompt_result_with_progress(paths, provider, model, prompt, rocm_tools, None)
+    render_chat_prompt_result_with_progress(
+        paths,
+        provider,
+        model,
+        prompt,
+        rocm_tools,
+        ChatInferenceParams::default(),
+        None,
+    )
 }
 
 pub(crate) fn render_chat_prompt_result_with_progress(
@@ -8000,6 +8259,7 @@ pub(crate) fn render_chat_prompt_result_with_progress(
     model: Option<&str>,
     prompt: &str,
     rocm_tools: bool,
+    params: ChatInferenceParams,
     progress: Option<&mut dyn FnMut(String)>,
 ) -> Result<ChatPromptResult> {
     let mut progress = progress;
@@ -8053,7 +8313,9 @@ pub(crate) fn render_chat_prompt_result_with_progress(
                 &providers::ChatRequest {
                     model: assistant_model.map(str::to_owned),
                     messages: messages.clone(),
-                    max_tokens: None,
+                    max_tokens: params.max_tokens,
+                    temperature: params.temperature,
+                    top_p: params.top_p,
                     rocm_tools,
                 },
             ) {
@@ -8090,7 +8352,9 @@ pub(crate) fn render_chat_prompt_result_with_progress(
             &providers::ChatRequest {
                 model: assistant_model.map(str::to_owned),
                 messages: messages.clone(),
-                max_tokens: None,
+                max_tokens: params.max_tokens,
+                temperature: params.temperature,
+                top_p: params.top_p,
                 rocm_tools,
             },
         ) {
@@ -8184,7 +8448,9 @@ pub(crate) fn render_chat_prompt_result_with_progress(
             &providers::ChatRequest {
                 model: assistant_model.map(str::to_owned),
                 messages: follow_up_messages,
-                max_tokens: Some(256),
+                max_tokens: params.max_tokens.or(Some(256)),
+                temperature: params.temperature,
+                top_p: params.top_p,
                 rocm_tools: false,
             },
         )?;
@@ -14448,7 +14714,8 @@ pub(crate) fn managed_service_is_live(record: &ManagedServiceRecord) -> bool {
 }
 
 /// Idempotency guard for managed launches: returns an already-live managed
-/// service for this engine+model, if any.
+/// service for this engine+model, if any. The caller compares its effective
+/// launch recipe before deciding whether reuse is safe.
 ///
 /// Keyed on `(engine, canonical_model_id)` — NOT `service_id`. `generate_service_id`
 /// embeds `unix_time_millis()`, so every launch mints a unique id; matching on it
@@ -15350,6 +15617,8 @@ fn resolve_freeform_plan_with_provider(
                 content: prompt,
             }],
             max_tokens: Some(512),
+            temperature: None,
+            top_p: None,
             rocm_tools: false,
         },
     )?;
@@ -17974,6 +18243,93 @@ mod tests {
             }
             other => panic!("expected Serve, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn serve_parses_generation_flags() {
+        let cli = parse_serve(&[
+            "--temperature",
+            "0.5",
+            "--top-p",
+            "0.25",
+            "--max-tokens",
+            "128",
+        ])
+        .expect("generation flags parse");
+        match cli.command {
+            Some(Command::Serve {
+                temperature,
+                top_p,
+                max_tokens,
+                ..
+            }) => {
+                assert_eq!(temperature, Some(0.5));
+                assert_eq!(top_p, Some(0.25));
+                assert_eq!(max_tokens, Some(128));
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_rejects_out_of_range_sampling() {
+        // top-p is a probability; temperature must be non-negative. Both are
+        // validated at the CLI boundary so a bad value never reaches the engine.
+        assert_eq!(
+            parse_serve(&["--top-p=1.5"])
+                .expect_err("top-p above 1.0 is rejected")
+                .kind(),
+            clap::error::ErrorKind::ValueValidation
+        );
+        assert_eq!(
+            parse_serve(&["--temperature=-0.1"])
+                .expect_err("negative temperature is rejected")
+                .kind(),
+            clap::error::ErrorKind::ValueValidation
+        );
+        assert_eq!(
+            parse_serve(&["--max-tokens=0"])
+                .expect_err("zero max-tokens is rejected")
+                .kind(),
+            clap::error::ErrorKind::ValueValidation
+        );
+    }
+
+    #[test]
+    fn chat_parses_generation_flags() {
+        let cli = Cli::try_parse_from([
+            "rocm",
+            "chat",
+            "--prompt",
+            "hello",
+            "--temperature",
+            "0.5",
+            "--top-p",
+            "0.25",
+            "--max-tokens",
+            "64",
+        ])
+        .expect("chat generation flags parse");
+        match cli.command {
+            Some(Command::Chat {
+                temperature,
+                top_p,
+                max_tokens,
+                ..
+            }) => {
+                assert_eq!(temperature, Some(0.5));
+                assert_eq!(top_p, Some(0.25));
+                assert_eq!(max_tokens, Some(64));
+            }
+            other => panic!("expected Chat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chat_rejects_zero_max_tokens() {
+        let error = Cli::try_parse_from(["rocm", "chat", "--prompt", "hello", "--max-tokens", "0"])
+            .expect_err("zero max-tokens is rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
@@ -22066,6 +22422,92 @@ install therock";
     }
 
     #[test]
+    fn spawn_managed_engine_child_blocks_reuse_with_mismatched_recipe() -> Result<()> {
+        // A live service recorded with one recipe (e.g. a tool-call parser flag)
+        // must reject a relaunch requesting a different recipe rather than
+        // silently reusing the old server, and the error must not claim the
+        // mismatch is specifically about generation defaults when it could stem
+        // from any recipe field.
+        let (root, paths) = test_paths("dup-managed-recipe-mismatch");
+        paths.ensure()?;
+        let mut existing = ManagedServiceRecord::new(
+            &paths,
+            "lemonade-qwen-1000",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11510,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        existing.status = "ready".to_owned();
+        existing.engine_pid = Some(std::process::id());
+        existing.engine_recipe_json = Some(serde_json::to_string(&EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "lemonade".to_owned(),
+            required_flags: vec!["--tool-call-parser".to_owned(), "hermes".to_owned()],
+            ..EngineRecipeHint::default()
+        })?);
+        existing.write()?;
+
+        let resolve = ResolveModelResponse {
+            canonical_model_id: "qwen-canonical".to_owned(),
+            task: "chat".to_owned(),
+            source: "hf".to_owned(),
+            revision: "main".to_owned(),
+            loader: "llama.cpp".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: DevicePolicy::GpuPreferred,
+            estimated_memory: "unknown".to_owned(),
+            launch_defaults: serde_json::json!({}),
+            engine_recipe: None,
+            warnings: Vec::new(),
+        };
+        let requested_recipe = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "lemonade".to_owned(),
+            required_flags: vec!["--temperature".to_owned(), "0.5".to_owned()],
+            ..EngineRecipeHint::default()
+        };
+
+        let result = spawn_managed_engine_child(
+            &paths,
+            "lemonade",
+            "lemonade-qwen-2000",
+            "qwen",
+            &resolve,
+            "127.0.0.1",
+            11511,
+            &resolve.device_policy,
+            &[],
+            None,
+            None,
+            Some(&requested_recipe),
+        );
+        let _ = fs::remove_dir_all(root);
+
+        let Err(error) = result else {
+            panic!("mismatched recipe on a live service must be rejected")
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("different serve options"),
+            "message should describe the mismatch generically: {message}"
+        );
+        assert!(
+            message.contains("recipe hint, tool-call parser, or generation defaults"),
+            "message should not single out generation defaults as the sole cause: {message}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn services_tool_result_text_includes_running_interpretation() {
         let (_root, paths) = test_paths("services-tool-text");
         let mut record = ManagedServiceRecord::new(
@@ -23063,6 +23505,173 @@ install therock";
                 .iter()
                 .any(|entry| entry.contains("--gpu-memory-utilization")),
             "nothing to report when the flag was honored: {quiet:?}"
+        );
+    }
+
+    #[test]
+    fn generation_defaults_inject_override_generation_config_for_vllm() {
+        // vLLM has no raw sampling flags: all three controls collapse into a single
+        // `--override-generation-config` JSON with `--max-tokens` mapped to the
+        // engine's `max_new_tokens` output cap.
+        let hint = engine_recipe_with_generation_defaults(
+            "vllm",
+            None,
+            ServeGenerationDefaults {
+                temperature: Some(0.5),
+                top_p: Some(0.25),
+                max_tokens: Some(128),
+            },
+        )
+        .expect("vllm defaults are supported")
+        .expect("supplied defaults should synthesize a vllm hint");
+        assert_eq!(hint.engine, "vllm");
+        assert_eq!(hint.required_flags.len(), 2);
+        assert_eq!(hint.required_flags[0], "--override-generation-config");
+        let config: serde_json::Value =
+            serde_json::from_str(&hint.required_flags[1]).expect("config is valid JSON");
+        assert_eq!(config["temperature"], 0.5);
+        assert_eq!(config["top_p"], 0.25);
+        assert_eq!(config["max_new_tokens"], 128);
+    }
+
+    #[test]
+    fn generation_defaults_include_only_supplied_values() {
+        // Unset controls are omitted so the engine keeps its own defaults.
+        let hint = engine_recipe_with_generation_defaults(
+            "vllm",
+            None,
+            ServeGenerationDefaults {
+                temperature: Some(0.25),
+                top_p: None,
+                max_tokens: None,
+            },
+        )
+        .expect("vllm defaults are supported")
+        .expect("a single supplied default still synthesizes a hint");
+        let config: serde_json::Value =
+            serde_json::from_str(&hint.required_flags[1]).expect("config is valid JSON");
+        assert_eq!(config["temperature"], 0.25);
+        assert!(config.get("top_p").is_none());
+        assert!(config.get("max_new_tokens").is_none());
+    }
+
+    #[test]
+    fn generation_defaults_merge_with_recipe_authored_config() {
+        // CLI values win, but authored keys the CLI does not set are preserved and
+        // exactly one `--override-generation-config` pair remains.
+        let authored = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "vllm".to_owned(),
+            required_flags: vec![
+                "--enable-auto-tool-choice".to_owned(),
+                "--override-generation-config".to_owned(),
+                "{\"temperature\":0.9,\"repetition_penalty\":1.1}".to_owned(),
+            ],
+            ..EngineRecipeHint::default()
+        };
+        let hint = engine_recipe_with_generation_defaults(
+            "vllm",
+            Some(authored),
+            ServeGenerationDefaults {
+                temperature: Some(0.25),
+                top_p: Some(0.5),
+                max_tokens: None,
+            },
+        )
+        .expect("vllm defaults are supported")
+        .unwrap();
+        assert_eq!(
+            hint.required_flags
+                .iter()
+                .filter(|flag| *flag == "--override-generation-config")
+                .count(),
+            1
+        );
+        assert_eq!(hint.required_flags[0], "--enable-auto-tool-choice");
+        let config: serde_json::Value =
+            serde_json::from_str(hint.required_flags.last().unwrap()).unwrap();
+        assert_eq!(config["temperature"], 0.25);
+        assert_eq!(config["top_p"], 0.5);
+        assert_eq!(config["repetition_penalty"], 1.1);
+    }
+
+    #[test]
+    fn generation_defaults_absent_or_non_vllm_pass_through() {
+        // No controls supplied: the hint flows through unchanged.
+        assert!(
+            engine_recipe_with_generation_defaults(
+                "vllm",
+                None,
+                ServeGenerationDefaults::default()
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            engine_recipe_with_generation_defaults(
+                "unknown",
+                None,
+                ServeGenerationDefaults {
+                    temperature: Some(0.5),
+                    top_p: Some(0.5),
+                    max_tokens: Some(64),
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn generation_defaults_translate_to_lemonade_llama_server_flags() {
+        let hint = engine_recipe_with_generation_defaults(
+            "lemonade",
+            None,
+            ServeGenerationDefaults {
+                temperature: Some(0.5),
+                top_p: Some(0.25),
+                max_tokens: Some(128),
+            },
+        )
+        .expect("lemonade defaults are supported")
+        .expect("defaults synthesize a recipe");
+        assert_eq!(
+            hint.required_flags,
+            [
+                "--temperature",
+                "0.5",
+                "--top-p",
+                "0.25",
+                "--n-predict",
+                "128"
+            ]
+        );
+    }
+
+    #[test]
+    fn generation_defaults_preserve_unset_lemonade_recipe_flags() {
+        // Only --temperature is supplied via CLI; an authored --top-p already
+        // present in the recipe must survive untouched, mirroring the vLLM
+        // merge behavior instead of being deleted.
+        let authored = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "lemonade".to_owned(),
+            required_flags: vec!["--top-p".to_owned(), "0.9".to_owned()],
+            ..EngineRecipeHint::default()
+        };
+        let hint = engine_recipe_with_generation_defaults(
+            "lemonade",
+            Some(authored),
+            ServeGenerationDefaults {
+                temperature: Some(0.5),
+                top_p: None,
+                max_tokens: None,
+            },
+        )
+        .expect("lemonade defaults are supported")
+        .expect("supplied defaults should synthesize a hint");
+        assert_eq!(
+            hint.required_flags,
+            ["--top-p", "0.9", "--temperature", "0.5"]
         );
     }
 
@@ -26314,7 +26923,7 @@ ID_LIKE="suse opensuse"
         // interactive target). Coercing to the fn pointer fails to compile if
         // the entrypoint is removed or its signature drifts; casting the pointer
         // to an address gives the binding a real effect (no underscore-bind).
-        let target: fn(bool) -> Result<()> = dash::run_chat;
+        let target: fn(bool, ChatInferenceParams) -> Result<()> = dash::run_chat;
         assert_ne!(target as usize, 0);
     }
 
@@ -26337,8 +26946,8 @@ ID_LIKE="suse opensuse"
         let src = main_rs_source();
         let body = strip_line_comments(&command_chat_handler_body(&src));
         assert!(
-            body.contains("dash::run_chat(chat_mock)"),
-            "interactive `rocm chat` must route to dash::run_chat(chat_mock); body:\n{body}"
+            body.contains("dash::run_chat("),
+            "interactive `rocm chat` must route to dash::run_chat(...); body:\n{body}"
         );
         assert!(
             !body.contains("tui::run"),
@@ -26374,8 +26983,15 @@ ID_LIKE="suse opensuse"
             "Command::Chat must destructure the --chat-mock field; body:\n{body}"
         );
         assert!(
-            body.contains("dash::run_chat(chat_mock)"),
-            "--chat-mock must drive run_chat(chat_mock); body:\n{body}"
+            body.contains("dash::run_chat(") && body.contains("chat_mock,"),
+            "--chat-mock must be forwarded to run_chat; body:\n{body}"
+        );
+        assert!(
+            body.contains("ChatInferenceParams")
+                && body.contains("temperature,")
+                && body.contains("top_p,")
+                && body.contains("max_tokens,"),
+            "sampling controls must be forwarded to interactive dash chat; body:\n{body}"
         );
         // The scriptable prompt passthrough stays on the text render path,
         // NOT the dash/TUI.

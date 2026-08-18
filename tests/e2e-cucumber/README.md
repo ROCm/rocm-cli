@@ -11,10 +11,12 @@ Behavioral end-to-end tests using [cucumber-rs](https://github.com/cucumber-rs/c
 ## Architecture
 
 ```
-.feature files (Gherkin)  →  step functions (Rust)  →  rocm binary / mock server
+.feature files (Gherkin)  →  step functions (Rust)  →  rocm / configured rocmd / mock server
 ```
 
-Tests exercise the `rocm` binary as a black box — no imports from the rocm-cli codebase. Mock-tier tests use an in-process axum server; GPU-tier tests run real model serving.
+Scenarios exercise `rocm` and, where required, an explicitly configured
+`rocmd` as black boxes — no imports from the rocm-cli codebase. Mock-tier tests
+use an in-process axum server; GPU-tier tests run real model serving.
 
 ## Prerequisites
 
@@ -52,8 +54,8 @@ tests/e2e-cucumber/
 
 ## Running tests
 
-The `cargo xtask e2e` task builds the release `rocm` binary and runs the suite.
-Extra arguments after `--` are forwarded to the cucumber CLI.
+The `cargo xtask e2e` task builds the release `rocm` and `rocmd` binaries and
+runs the suite. Extra arguments after `--` are forwarded to the cucumber CLI.
 
 ```bash
 # All features:
@@ -65,9 +67,19 @@ cargo xtask e2e -- -n "model name"
 # Stop on first failure:
 cargo xtask e2e -- --fail-fast
 
-# With a pre-built binary (skips the build step):
-ROCM_CLI_BINARY=./target/release/rocm cargo xtask e2e
+# With pre-built binaries (skips the build step):
+ROCM_CLI_BINARY=./target/release/rocm \
+ROCM_CLI_ROCMD_BINARY=./target/release/rocmd \
+cargo xtask e2e
 ```
+
+Prebuilt mode requires only `ROCM_CLI_BINARY` for scenarios that invoke
+`rocm`. Scenarios backed by `rocmd`, such as artifact prefetch, additionally
+require an explicit matching `ROCM_CLI_ROCMD_BINARY`; the harness does not
+infer a sibling executable. Lifecycle packaging requires both prebuilt binaries
+to be in the same directory because `xtask package` consumes one `ROCM_BIN_DIR`;
+the harness rejects separate directories instead of silently packaging a
+different `rocmd`.
 
 The default run is fast: it excludes the expensive, OS-mutating `@lifecycle`
 release-install scenarios (packaging + the real installer + install/uninstall).
@@ -82,6 +94,7 @@ E2E_INCLUDE_LIFECYCLE=1 E2E_ONLY_LIFECYCLE=1 cargo xtask e2e
 | Variable | Default | Description |
 |---|---|---|
 | `ROCM_CLI_BINARY` | `rocm` (on PATH) | Path to the rocm binary under test |
+| `ROCM_CLI_ROCMD_BINARY` | set by `cargo xtask e2e` after its release build | Path to the rocmd binary required by rocmd-backed scenarios; explicit in prebuilt mode |
 | `ROCM_CLI_CONFIG_DIR` | (temp dir) | Isolated config directory per scenario |
 | `ROCM_CLI_DATA_DIR` | (temp dir) | Isolated data directory per scenario |
 | `ROCM_CLI_CACHE_DIR` | (temp dir) | Isolated cache directory per scenario |
@@ -98,7 +111,9 @@ Scenarios carry stable-id and capability tags:
 | Tag | Meaning |
 |---|---|
 | `@id:<slug>` | Stable scenario id. Keys the expectation matrix and the report grid; every scenario has one. |
-| `@requires-gpu` | Needs a real AMD GPU. Resolves to **skip** (n/a) on a host with none (e.g. the mock job). |
+| `@requires-gpu` | Needs a usable AMD GPU. Resolves to **skip** (n/a) on a host with none — the mock job, or a WSL host whose ROCm passthrough is incomplete (`driver_status` other than `wsl_rocdxg_ready`), where the gfx target is reported but unreachable. |
+| `@requires-bare-metal` | Premise is a host running the in-tree amdgpu driver, so it does not hold under WSL2. Resolves to **skip** there. `@requires-os:linux` cannot express this: WSL2 reports an `os_family` of `linux`. |
+| `@requires-wsl` | The inverse: premise **is** a WSL2 host. Resolves to **skip** on native Linux, native Windows, and everything else. |
 | `@requires-engine:<vllm\|lemonade>` | Pins the serve engine. Resolves to skip where that engine can't start (e.g. vLLM on a lemonade-only Strix host). |
 | `@requires-os:<linux\|windows>` | Premise is OS-specific; skip on other OSes. |
 | `@serve-timeout:<secs>` | Lengthen the serve-readiness wait for a genuinely slow serve (e.g. a large model). |
@@ -133,16 +148,20 @@ self-hosted runner can never stall `ci.yml`'s merge-required checks:
 | `e2e-gpu` | `e2e-selfhosted.yml` | MI300X (self-hosted) | no |
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo / Ubuntu (self-hosted) | no |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo / Windows (self-hosted) | no |
+| `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo / Ubuntu under WSL2 (self-hosted) | no |
 
 The blocking mock job passes when every applicable scenario is pass-or-xfail with
 no XPASS or unexpected failure; the GPU jobs are non-blocking. Each workflow
 consolidates its own platforms: `ci.yml`'s `e2e-report` the mock platform,
 `e2e-selfhosted.yml`'s `e2e-report` the self-hosted platforms, and
-`nightly.yml`'s `e2e-report-nightly` the nightly lanes below.
+`nightly.yml`'s `e2e-report-nightly` the nightly lanes below. `e2e-wsl` runs the suite in an
+Ubuntu distro under WSL2 on the Strix Halo box, so it is the only lane that
+exercises `@requires-wsl` scenarios; `@requires-bare-metal` scenarios resolve to
+skip there.
 
-The nightly workflow runs three non-blocking jobs — the existing MI300X job and
-new Strix Halo jobs on Ubuntu and Windows — with `E2E_INCLUDE_NIGHTLY=1`, then
-consolidates them into the same cross-platform grid. The
+The nightly workflow runs four non-blocking jobs — MI300X plus Strix Halo on
+Ubuntu, Windows, and WSL2 — with `E2E_INCLUDE_NIGHTLY=1`, then consolidates them
+into the same cross-platform grid. The
 shared large-model scenario serves `Qwen/Qwen3.6-27B` through vLLM on MI300X and
 the hardware-verified `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL` checkpoint
 through Lemonade on Strix Halo.
@@ -190,7 +209,7 @@ The `.feature` file is both the spec and the test input — cucumber reads it at
 
 ## Design principles
 
-- **Black-box only.** Step functions interact with `rocm` through its CLI and HTTP endpoints. No imports from the rocm-cli codebase. Where a scenario needs the CLI to know about a running server, it plants a managed-service record as plain JSON matching the on-disk schema (see `register_mock_service`) — the same file `rocm serve --managed` would write — rather than importing the record type.
+- **Black-box only.** Step functions interact with `rocm` and explicitly configured `rocmd` through their CLIs and HTTP endpoints. No imports from the rocm-cli codebase. Where a scenario needs the CLI to know about a running server, it plants a managed-service record as plain JSON matching the on-disk schema (see `register_mock_service`) — the same file `rocm serve --managed` would write — rather than importing the record type.
 - **Isolated state.** Each scenario uses isolated config, data, and cache directories. Tests never touch `~/.rocm`.
 - **Behavioral language.** Feature files describe what users care about, not implementation details. How steps are implemented (mock vs real, which port, which API) stays in the step functions.
 - **OS-assigned ports.** The mock server binds to `127.0.0.1:0` to avoid port conflicts between tests.

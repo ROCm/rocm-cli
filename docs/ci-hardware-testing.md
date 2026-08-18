@@ -4,7 +4,7 @@ Copyright © Advanced Micro Devices, Inc., or its affiliates.
 SPDX-License-Identifier: MIT
 -->
 
-# CI hardware (GPU) testing
+# CI hardware (GPU / WSL) testing
 
 The hosted CI (`ubuntu-latest`, `windows-latest`) builds and unit-tests every
 shipping target natively, but GitHub-hosted runners have no AMD GPU. A
@@ -35,32 +35,66 @@ separate tier flag or tag filter to maintain.
 | `e2e-gpu` | `e2e-selfhosted.yml` | MI300X (AMD Instinct, bare-metal Linux) | self-hosted `[self-hosted, linux, amd-gpu]` |
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu | self-hosted `[self-hosted, linux, strix-halo, native]` |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on native Windows 11 | self-hosted `[self-hosted, windows, strix-halo, native]` |
+| `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu under WSL2 | self-hosted `[self-hosted, linux, strix-halo, wsl]` |
 
 The Strix Halo lanes pin the extra `native` label because two Linux runners
 share the `strix-halo` label (a native host and a WSL host) and the jobs'
-hardcoded `/home/ubuntu/actions-runner` paths exist only on the native one.
+hardcoded `/home/ubuntu/actions-runner` paths exist only on the native one. The
+WSL lane pins `wsl` for the same reason, from the other side.
 
 `e2e` is the blocking, GitHub-hosted mock job: `@requires-gpu` scenarios
 resolve to skip here, and known bugs resolve to xfail from
 `expectations.toml`. It is a required check and must stay green.
 
-The three GPU jobs (`e2e-gpu`, `e2e-gpu-strix-ubuntu`, `e2e-gpu-strix-windows`)
-run on dedicated self-hosted runners with a real AMD GPU attached, so they
-exercise host/GPU detection, engine `detect`/`capabilities`, and live serving
-scenarios that the mock job cannot.
+The four self-hosted jobs (`e2e-gpu`, `e2e-gpu-strix-ubuntu`,
+`e2e-gpu-strix-windows`, and `e2e-wsl`) run on AMD GPU systems, so they exercise
+host/GPU detection, engine `detect`/`capabilities`, and live serving scenarios
+that the mock job cannot. GPU availability is advisory in the WSL lane, as
+described below.
+
+`e2e-wsl` runs on an Ubuntu distro hosted in WSL2 on the Strix Halo Windows box
+and mirrors the sibling Linux lane step for step: stray-serve reclaim, GPU
+preflight, toolchain bootstrap, shared-runtime pre-warm, then the full suite
+with no hand filtering. It covers WSL host detection, the Windows-to-WSL
+execution boundary, and whatever GPU access WSL exposes on that machine. The
+GPU preflight is advisory here precisely because GPU-on-WSL is what the lane is
+proving out: where it is unavailable the capability probe resolves those
+scenarios to not-applicable and the rest of the suite still runs. Scenarios the
+product deliberately routes around on WSL carry `@requires-bare-metal`; the one
+scenario whose premise *is* a WSL host carries `@requires-wsl`, and this is the
+only lane that runs it.
+
+### What the WSL distro needs
+
+The distro needs `pkg-config`, `build-essential` and `libcap-dev` to build the
+workspace; the lane installs them itself where it has passwordless sudo, and
+otherwise fails with the list of what is missing rather than hanging on a
+password prompt.
+
+GPU coverage additionally needs ROCm's WSL passthrough to be complete —
+`/dev/dxg` and dxcore alone are not enough, `librocdxg.so` and its ldconfig
+entry must be present too. `rocm examine` reports the verdict as
+`driver_status: wsl_rocdxg_ready`; anything else (`wsl_rocdxg_missing`,
+`wsl_gpu_plumbing_missing`) means the runtime cannot reach the device even
+though `detected_gfx_target` still names it, because that target is read from
+the Windows-side driver. The capability probe keys `@requires-gpu` on the
+driver verdict rather than the target for exactly this reason, so a distro
+without the passthrough runs the non-GPU suite and reports the GPU scenarios as
+not applicable, instead of failing them on a premise the host cannot meet.
 
 Each workflow has its own consolidated report job. `ci.yml`'s `e2e-report`
-covers the mock platform; `e2e-selfhosted.yml`'s `e2e-report` covers the three
-GPU platforms; `nightly.yml`'s `e2e-report-nightly` covers the same three
-platforms with the `@nightly` scenarios included. Each joins its platforms'
+covers the mock platform;
+`e2e-selfhosted.yml`'s `e2e-report` covers the four GPU platforms;
+`nightly.yml`'s `e2e-report-nightly` covers the same four platforms with the
+`@nightly` scenarios included. Each joins its platforms'
 reports — including partial or failed runs — by scenario id into one HTML report
 and GitHub step summary.
 
 The lane artifacts are named canonically (`e2e-report`, `e2e-gpu-report`,
-`e2e-gpu-strix-ubuntu-report`, `e2e-gpu-strix-windows-report`) in every workflow,
-because the report derives each platform's name and OS from the artifact name.
-An unrecognised name renders as a guessed platform on Linux, which would report
-a Windows lane as Linux; `xtask`'s
+`e2e-gpu-strix-ubuntu-report`, `e2e-gpu-strix-windows-report`,
+`e2e-gpu-strix-wsl-report`) in every workflow, because the report derives each
+platform's name and OS from the artifact name. An unrecognised name renders as a
+guessed platform on Linux, which would report a Windows lane as Linux; `xtask`'s
 `every_uploaded_e2e_artifact_has_a_name_the_report_can_label` guards against it.
 
 ## Triggers
@@ -84,11 +118,11 @@ authoritative pre-merge build gate.
 They can also be triggered manually via `e2e-selfhosted.yml`'s
 `workflow_dispatch`, independent of the `serve` gate, with these inputs:
 
-- `platform` (choice: `all`, `app-dev-gpu`, `strix-ubuntu`, `strix-windows`) —
-  which self-hosted job(s) to run. `app-dev-gpu` maps to `e2e-gpu`,
-  `strix-ubuntu` to `e2e-gpu-strix-ubuntu`, and `strix-windows` to
-  `e2e-gpu-strix-windows`. (The mock lane has its own `platform` input on
-  `ci.yml`; it is not part of this workflow.)
+- `platform` (choice: `all`, `app-dev-gpu`, `strix-ubuntu`, `strix-windows`,
+  `strix-wsl`) — which self-hosted job(s) to run. `app-dev-gpu` maps to
+  `e2e-gpu`, `strix-ubuntu` to `e2e-gpu-strix-ubuntu`, `strix-windows` to
+  `e2e-gpu-strix-windows`, and `strix-wsl` to `e2e-wsl`. (The mock lane has its
+  own `platform` input on `ci.yml`; it is not part of this workflow.)
 - `name_filter` (string) — a scenario-name regex forwarded to the cucumber
   harness (`cargo xtask e2e -- --name <regex>`) so a dispatch can run a
   single scenario instead of the full suite. Empty runs everything applicable
@@ -105,10 +139,20 @@ gh workflow run e2e-selfhosted.yml --ref <ref> -f platform=app-dev-gpu
 
 ## Blocking vs. non-blocking
 
-The three hardware jobs — `e2e-gpu`, `e2e-gpu-strix-ubuntu`, and
-`e2e-gpu-strix-windows` — all run with `continue-on-error: true`, so a
+The four self-hosted jobs — `e2e-gpu`, `e2e-gpu-strix-ubuntu`,
+`e2e-gpu-strix-windows`, and `e2e-wsl` — all run with `continue-on-error: true`, so a
 hardware failure that RUNS never gates a PR merge. Their results still surface
 in the self-hosted consolidated report for visibility.
+
+### Timeouts on the shared Strix box
+
+Three of those lanes — the two native Strix ones and `e2e-wsl` — run on the same
+physical machine and can be in flight together, so a wait that is comfortable on
+an idle runner can expire while a sibling lane loads a model. Two budgets are
+raised there rather than letting contention read as a product failure:
+`E2E_SERVE_TIMEOUT_SECS` for serve readiness, and `E2E_TUI_TIMEOUT_SECS` for the
+PTY-driven dashboard waits. Both only lengthen how long a wait may take; a
+genuine hang still fails, just later.
 
 **Required-check caveat.** These three job names (plus, historically, a
 consolidated-report name) are still in `main`'s required-status-check list.
