@@ -473,6 +473,7 @@ def main() -> int:
         args.channel,
         "--format",
         "wheel",
+        "--yes",
     ]
     if args.prefix is not None:
         install_argv.extend(["--prefix", str(args.prefix)])

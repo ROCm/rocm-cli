@@ -29,3 +29,25 @@ Feature: Runtime configuration
     When the user tries to adopt the existing install
     Then the adoption is refused
     And the error explains which install types can be adopted
+
+  # Reinstalling over an existing managed SDK must not silently clobber the
+  # active runtime. Outside an interactive terminal (as every e2e invocation
+  # is here), `install sdk` without `--yes` must refuse rather than overwrite.
+  # Cheap even though GPU-gated: the precondition needs a GPU to have a runtime
+  # active, but the refusal itself bails before any download.
+  @id:runtime-install-sdk-overwrite-requires-yes @requires-gpu
+  Scenario: 4 - Reinstalling the SDK over an existing runtime without --yes is refused
+    Given a managed runtime is active
+    When the user reinstalls the SDK without confirming
+    Then the reinstall is refused
+    And the error explains that --yes is required
+
+  # Companion to Scenario 4: with --yes the same reinstall proceeds and the
+  # runtime stays registered and active afterward. Nightly-gated in addition to
+  # GPU because, unlike Scenario 4, this exercises a real second SDK install.
+  @id:runtime-install-sdk-overwrite-with-yes @requires-gpu @nightly
+  Scenario: 5 - Reinstalling the SDK over an existing runtime with --yes overwrites it
+    Given a managed runtime is active
+    When the user reinstalls the SDK with --yes
+    Then a runtime is registered
+    And the runtime is set as active

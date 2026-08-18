@@ -296,7 +296,7 @@ jobs:
             ROCM_CLI_CACHE_DIR="$prewarm/cache" \
             HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
             UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
-              "$ROCM_CLI_BINARY" install sdk
+              "$ROCM_CLI_BINARY" install sdk --yes
             if [ -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
               echo "shared runtime pre-warmed at $E2E_SHARED_RUNTIMES_DIR"
             else

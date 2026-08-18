@@ -5,13 +5,13 @@
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_gpu_diagnostics,
-    detect_host_therock_family, detect_managed_therock_family, disk_space, ensure_uv_binary,
-    known_therock_families, managed_tools_dir, normalize_runtime_path_for_host,
-    normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
-    normalize_runtime_path_text_for_storage, normalize_therock_family, runtime_is_windows,
-    runtime_os_name, runtime_path_for_windows_child, runtime_path_list_split,
-    runtime_python_executable_in_env, unix_time_millis, uv_command_env, uv_pip_install_base,
-    uv_venv_args, verify_rsa_pkcs1_sha256_signature,
+    detect_host_therock_family, detect_legacy_rocm_summary, detect_managed_therock_family,
+    disk_space, ensure_uv_binary, interactive_terminal, known_therock_families, managed_tools_dir,
+    normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
+    normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_storage,
+    normalize_therock_family, runtime_is_windows, runtime_os_name, runtime_path_for_windows_child,
+    runtime_path_list_split, runtime_python_executable_in_env, unix_time_millis, uv_command_env,
+    uv_pip_install_base, uv_venv_args, verify_rsa_pkcs1_sha256_signature,
 };
 #[cfg(test)]
 use rocm_core::{
@@ -132,6 +132,12 @@ struct PipRuntimeResolution {
     family_source: String,
     index_url: String,
     latest_version: String,
+    /// Newest `rocm` version offered by the repository for this channel,
+    /// regardless of whether it has a matching PyTorch wheel stack. When this is
+    /// newer than `latest_version`, the repo's newest release could not be
+    /// installed (no wheels) and we warn about it. `None` when a specific version
+    /// was requested (the "latest" concept does not apply).
+    newest_repo_version: Option<String>,
     package_versions: TheRockPipPackageVersions,
 }
 
@@ -459,6 +465,34 @@ enum VersionStage {
     Stable,
 }
 
+/// Outcome of an `install sdk` request.
+///
+/// `mutated` is `false` for dry-run plans and for installs the user declined at
+/// the confirmation prompt, so the caller can skip the post-install activation
+/// and success reporting that only make sense after a real install.
+#[derive(Debug)]
+pub(crate) struct SdkInstallResult {
+    pub output: String,
+    pub mutated: bool,
+}
+
+impl SdkInstallResult {
+    const fn plan(output: String) -> Self {
+        Self {
+            output,
+            mutated: false,
+        }
+    }
+
+    const fn installed(output: String) -> Self {
+        Self {
+            output,
+            mutated: true,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn install_sdk(
     paths: &AppPaths,
     channel: &str,
@@ -467,7 +501,8 @@ pub(crate) fn install_sdk(
     version_selector: Option<RuntimeVersionSelector>,
     family_override: Option<&str>,
     dry_run: bool,
-) -> Result<String> {
+    assume_yes: bool,
+) -> Result<SdkInstallResult> {
     let channel = TheRockChannel::parse(channel)?;
     ensure_install_format_supported(format)?;
     match format {
@@ -478,12 +513,13 @@ pub(crate) fn install_sdk(
             family_override,
             version_selector.as_ref(),
             dry_run,
+            assume_yes,
         ),
         "tarball" => {
             if version_selector.is_some() {
                 bail!("specific TheRock version selection is only supported for wheel installs")
             }
-            install_tarball_runtime(paths, channel, prefix, family_override, dry_run)
+            install_tarball_runtime(paths, channel, prefix, family_override, dry_run, assume_yes)
         }
         other => bail!("unsupported install format: {other}"),
     }
@@ -786,7 +822,8 @@ fn install_wheel_runtime(
     family_override: Option<&str>,
     version_selector: Option<&RuntimeVersionSelector>,
     dry_run: bool,
-) -> Result<String> {
+    assume_yes: bool,
+) -> Result<SdkInstallResult> {
     progress_line(format!(
         "Checking Python for the ROCm install; if needed, ROCm CLI will prepare Python {}.",
         managed_python_version()
@@ -854,6 +891,13 @@ fn install_wheel_runtime(
         "  latest_compatible_version: {}",
         runtime_version_display(&resolution.latest_version)
     );
+    if let Some(host_version) = host_rocm_version_newer_than(&resolution.latest_version) {
+        let _ = writeln!(
+            output,
+            "  version_note: this host reports ROCm {host_version}, but {resolved} is the newest TheRock ROCm with a matching PyTorch stack, so it is selected; pass `--version <VERSION>` to override",
+            resolved = runtime_version_display(&resolution.latest_version)
+        );
+    }
     let _ = writeln!(
         output,
         "  compatibility_key: {}",
@@ -886,6 +930,19 @@ fn install_wheel_runtime(
         output,
         "  package_policy: find the newest TheRock ROCm SDK version that has a matching PyTorch stack in the same index, then install pinned rocm[libraries,devel], torch, torchvision, and torchaudio versions in one uv transaction"
     );
+    let no_wheel_warning = repo_version_without_wheels(
+        resolution.newest_repo_version.as_deref(),
+        &resolution.latest_version,
+    )
+    .map(|newest| {
+        format!(
+            "ROCm {newest} is the newest version in this repository but has no installable PyTorch wheels for this Python and platform; installing ROCm {resolved} instead",
+            resolved = runtime_version_display(&resolution.latest_version)
+        )
+    });
+    if let Some(warning) = no_wheel_warning.as_deref() {
+        let _ = writeln!(output, "  warning: {warning}");
+    }
     if dry_run {
         let env_python = venv_python_path(&install_root);
         let mut install_args = uv_pip_install_base(&env_python);
@@ -915,7 +972,70 @@ fn install_wheel_runtime(
             "  activation: use the managed venv Python; TheRock libraries are resolved from that venv by rocm_sdk.initialize_process"
         );
         let _ = writeln!(output, "  manifest: {}", manifest_path.display());
-        return Ok(output);
+        return Ok(SdkInstallResult::plan(output));
+    }
+
+    // Requirement: surface the "newest version has no wheels" case as a warning
+    // on the real install path too, not only in the dry-run plan.
+    if let Some(warning) = no_wheel_warning.as_deref() {
+        progress_line(format!("Warning: {warning}"));
+    }
+
+    // Explain, in the visible install log, why an older TheRock ROCm is chosen
+    // when this host reports a newer legacy ROCm (the ticket's 7.14 case). The
+    // same note is recorded in the summary block above; surfacing it here keeps
+    // it from being buried at the end of a long key/value dump.
+    if let Some(host_version) = host_rocm_version_newer_than(&resolution.latest_version) {
+        progress_line(format!(
+            "Note: this host reports ROCm {host_version}, but ROCm {resolved} is the newest TheRock ROCm with a matching PyTorch stack for this repository; installing {resolved} (pass `--version <VERSION>` to override).",
+            resolved = runtime_version_display(&resolution.latest_version)
+        ));
+    }
+
+    // Fresh installs proceed with just an informational line; only overwriting an
+    // existing managed SDK asks for confirmation (and needs `--yes` when there is
+    // no terminal to answer the prompt).
+    let existing = existing_runtime_relation(
+        paths,
+        channel,
+        &resolution.family,
+        &resolution.latest_version,
+    )?;
+    match sdk_install_approval(existing.is_some(), assume_yes, interactive_terminal()) {
+        SdkInstallApproval::ProceedFresh => {
+            progress_line(format!(
+                "No existing ROCm SDK found; installing ROCm SDK {} for family {}.",
+                runtime_version_display(&resolution.latest_version),
+                resolution.family
+            ));
+        }
+        SdkInstallApproval::ProceedApproved => {
+            progress_line(format!(
+                "Overwriting existing ROCm SDK ({}) with ROCm {}.",
+                existing.as_deref().unwrap_or_default(),
+                runtime_version_display(&resolution.latest_version)
+            ));
+        }
+        SdkInstallApproval::PromptOverwrite => {
+            if !confirm_overwrite_existing_sdk(
+                channel,
+                &resolution.family,
+                &resolution.latest_version,
+                existing.as_deref().unwrap_or_default(),
+            )? {
+                let _ = writeln!(
+                    output,
+                    "  status: cancelled by user; the existing ROCm SDK was left unchanged"
+                );
+                return Ok(SdkInstallResult::plan(output));
+            }
+        }
+        SdkInstallApproval::RefuseNonInteractive => {
+            bail!(
+                "an existing ROCm SDK ({}) would be overwritten; re-run with --yes to overwrite it non-interactively, for example `rocm install sdk --yes`",
+                existing.as_deref().unwrap_or_default()
+            );
+        }
     }
 
     let uv = ensure_uv_binary(paths)?;
@@ -1009,7 +1129,7 @@ fn install_wheel_runtime(
         let _ = writeln!(output, "  rocm_sdk_target_family: {target_family}");
     }
     let _ = writeln!(output, "  manifest: {}", manifest_path.display());
-    Ok(output)
+    Ok(SdkInstallResult::installed(output))
 }
 
 fn therock_pip_package_specs(package_versions: &TheRockPipPackageVersions) -> Vec<String> {
@@ -1033,13 +1153,149 @@ fn quote_display_arg(value: &str) -> String {
     }
 }
 
+/// Classify how the version rocm-cli is about to install relates to the managed
+/// runtime it would displace as the active default — the newest existing install
+/// for the same GPU family and channel. Returns `None` when no such runtime
+/// exists (a fresh install for this family/channel).
+///
+/// Errors reading the manifest directory are propagated rather than treated as
+/// "no existing runtime": silently falling back to a fresh-install verdict on a
+/// read error would skip the overwrite confirmation gate precisely when we are
+/// least sure whether an existing SDK is present.
+fn existing_runtime_relation(
+    paths: &AppPaths,
+    channel: TheRockChannel,
+    family: &str,
+    resolved_version: &str,
+) -> Result<Option<String>> {
+    let manifests = load_runtime_manifests(paths)?;
+    let mut matching = manifests
+        .into_iter()
+        .filter(|manifest| manifest.family == family && manifest.channel == channel.as_str())
+        .collect::<Vec<_>>();
+    matching.sort_by_key(|manifest| std::cmp::Reverse(manifest.installed_at_unix_ms));
+    let Some(existing) = matching.into_iter().next() else {
+        return Ok(None);
+    };
+    let relation = match compare_version_strings(resolved_version, &existing.version) {
+        Ordering::Greater => "upgrade",
+        Ordering::Less => "downgrade",
+        Ordering::Equal => "reinstall",
+    };
+    Ok(Some(format!(
+        "{relation} from installed {installed} ({key})",
+        installed = runtime_version_display(&existing.version),
+        key = existing.runtime_key
+    )))
+}
+
+/// The host's legacy/system ROCm version when it is strictly newer than the
+/// version rocm-cli is about to install, otherwise `None`. Used to explain why a
+/// seemingly older wheel version is selected over the host's ROCm.
+fn host_rocm_version_newer_than(resolved_version: &str) -> Option<String> {
+    let host_version = detect_legacy_rocm_summary().version?;
+    match compare_version_strings(&host_version, resolved_version) {
+        Ordering::Greater => Some(host_version),
+        _ => None,
+    }
+}
+
+/// The repo's newest version when it is strictly newer than the version we are
+/// about to install — i.e. the newest release exists in the index but has no
+/// installable PyTorch wheels for this Python/platform, so an older one is used.
+/// Returns `None` when the newest version is the one being installed (or is
+/// unknown), so the caller only warns when there is a real gap.
+fn repo_version_without_wheels(
+    newest_repo: Option<&str>,
+    resolved_version: &str,
+) -> Option<String> {
+    let newest = newest_repo?;
+    match compare_version_strings(newest, resolved_version) {
+        Ordering::Greater => Some(newest.to_owned()),
+        _ => None,
+    }
+}
+
+/// Whether a real SDK install needs the user's approval before it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SdkInstallApproval {
+    /// No existing managed SDK for this family+channel — install without asking.
+    ProceedFresh,
+    /// An existing SDK is present and `--yes` was given — overwrite it silently.
+    ProceedApproved,
+    /// An existing SDK is present and there is a terminal — prompt to overwrite.
+    PromptOverwrite,
+    /// An existing SDK is present but there is no terminal and no `--yes` — refuse.
+    RefuseNonInteractive,
+}
+
+/// Decide whether an SDK install proceeds, prompts, or is refused. Fresh installs
+/// (no `existing` runtime) always proceed; only overwriting an existing SDK needs
+/// confirmation, and outside an interactive terminal that confirmation must come
+/// from `--yes`.
+const fn sdk_install_approval(
+    existing: bool,
+    assume_yes: bool,
+    interactive: bool,
+) -> SdkInstallApproval {
+    if !existing {
+        SdkInstallApproval::ProceedFresh
+    } else if assume_yes {
+        SdkInstallApproval::ProceedApproved
+    } else if interactive {
+        SdkInstallApproval::PromptOverwrite
+    } else {
+        SdkInstallApproval::RefuseNonInteractive
+    }
+}
+
+/// Interactive confirmation gate for overwriting an existing managed SDK. Prints
+/// what would be replaced, then reads a yes/no answer from stdin. Only reached
+/// when an existing SDK is present, `--yes` was not passed, and a terminal is
+/// attached (see `sdk_install_approval`).
+fn confirm_overwrite_existing_sdk(
+    channel: TheRockChannel,
+    family: &str,
+    resolved_version: &str,
+    relation: &str,
+) -> Result<bool> {
+    println!("sdk install: an existing ROCm SDK was found");
+    println!("  existing runtime: {relation}");
+    println!(
+        "  replacing with: ROCm {} for family {family} ({} channel)",
+        runtime_version_display(resolved_version),
+        channel.as_str()
+    );
+    println!(
+        "  effect: this install becomes the active default runtime, overriding the current default"
+    );
+    // The host-newer ROCm explanation is already emitted as a visible progress
+    // line before this prompt on the real install path, so it is not repeated
+    // here.
+    prompt_yes_no("Overwrite the existing ROCm SDK? [y/N]: ")
+}
+
+fn prompt_yes_no(prompt: &str) -> Result<bool> {
+    print!("{prompt}");
+    std::io::stdout()
+        .flush()
+        .context("failed to flush confirmation prompt")?;
+    let mut response = String::new();
+    std::io::stdin()
+        .read_line(&mut response)
+        .context("failed to read confirmation response")?;
+    let normalized = response.trim().to_ascii_lowercase();
+    Ok(matches!(normalized.as_str(), "y" | "yes"))
+}
+
 fn install_tarball_runtime(
     paths: &AppPaths,
     channel: TheRockChannel,
     prefix: Option<PathBuf>,
     family_override: Option<&str>,
     dry_run: bool,
-) -> Result<String> {
+    assume_yes: bool,
+) -> Result<SdkInstallResult> {
     let artifact = resolve_tarball_artifact(paths, channel, family_override)?;
     let runtime_key = runtime_key(
         channel,
@@ -1065,13 +1321,71 @@ fn install_tarball_runtime(
         "  latest_version: {}",
         runtime_version_display(&artifact.version)
     );
+    if let Some(host_version) = host_rocm_version_newer_than(&artifact.version) {
+        let _ = writeln!(
+            output,
+            "  version_note: this host reports ROCm {host_version}, but {resolved} is the newest TheRock ROCm tarball for this GPU family, so it is selected",
+            resolved = runtime_version_display(&artifact.version)
+        );
+    }
     let _ = writeln!(output, "  target: {}", install_root.display());
     let _ = writeln!(output, "  cache_path: {}", cache_path.display());
     let _ = writeln!(output, "  runtime_key: {runtime_key}");
     if dry_run {
         let _ = writeln!(output, "  mode: dry-run");
         let _ = writeln!(output, "  manifest: {}", manifest_path.display());
-        return Ok(output);
+        return Ok(SdkInstallResult::plan(output));
+    }
+
+    // Mirror the wheel path: surface the host-newer ROCm explanation as a visible
+    // line so "why this version and not the host's newer ROCm" is in the install
+    // log rather than only in the trailing summary block.
+    if let Some(host_version) = host_rocm_version_newer_than(&artifact.version) {
+        progress_line(format!(
+            "Note: this host reports ROCm {host_version}, but ROCm {resolved} is the newest TheRock ROCm tarball for this GPU family; installing {resolved}.",
+            resolved = runtime_version_display(&artifact.version)
+        ));
+    }
+
+    // Fresh installs proceed with just an informational line; only overwriting an
+    // existing managed SDK asks for confirmation (and needs `--yes` when there is
+    // no terminal to answer the prompt).
+    let existing = existing_runtime_relation(paths, channel, &artifact.family, &artifact.version)?;
+    match sdk_install_approval(existing.is_some(), assume_yes, interactive_terminal()) {
+        SdkInstallApproval::ProceedFresh => {
+            progress_line(format!(
+                "No existing ROCm SDK found; installing ROCm SDK {} for family {}.",
+                runtime_version_display(&artifact.version),
+                artifact.family
+            ));
+        }
+        SdkInstallApproval::ProceedApproved => {
+            progress_line(format!(
+                "Overwriting existing ROCm SDK ({}) with ROCm {}.",
+                existing.as_deref().unwrap_or_default(),
+                runtime_version_display(&artifact.version)
+            ));
+        }
+        SdkInstallApproval::PromptOverwrite => {
+            if !confirm_overwrite_existing_sdk(
+                channel,
+                &artifact.family,
+                &artifact.version,
+                existing.as_deref().unwrap_or_default(),
+            )? {
+                let _ = writeln!(
+                    output,
+                    "  status: cancelled by user; the existing ROCm SDK was left unchanged"
+                );
+                return Ok(SdkInstallResult::plan(output));
+            }
+        }
+        SdkInstallApproval::RefuseNonInteractive => {
+            bail!(
+                "an existing ROCm SDK ({}) would be overwritten; re-run with --yes to overwrite it non-interactively, for example `rocm install sdk --yes`",
+                existing.as_deref().unwrap_or_default()
+            );
+        }
     }
 
     fs::create_dir_all(paths.cache_dir.join("therock"))?;
@@ -1114,7 +1428,7 @@ fn install_tarball_runtime(
 
     let _ = writeln!(output, "  extracted: {}", install_root.display());
     let _ = writeln!(output, "  manifest: {}", manifest_path.display());
-    Ok(output)
+    Ok(SdkInstallResult::installed(output))
 }
 
 fn resolve_pip_runtime(
@@ -1229,11 +1543,22 @@ fn resolve_pip_runtime_from_index(
         )
     })?;
     let latest_version = package_versions.rocm.clone();
+    // The repo's newest version for this channel, ignoring wheel availability.
+    // Only meaningful when we auto-selected "latest" (no explicit request), so a
+    // caller can warn when that newest version has no installable wheels.
+    let newest_repo_version = if version_selector.is_none() {
+        channel_rocm_candidates(&rocm_versions, channel)
+            .into_iter()
+            .last()
+    } else {
+        None
+    };
     Ok(PipRuntimeResolution {
         family: family_resolution.family.clone(),
         family_source: family_resolution.source.clone(),
         index_url: index_url.to_owned(),
         latest_version,
+        newest_repo_version,
         package_versions,
     })
 }
@@ -5119,12 +5444,130 @@ echo Python 3.12.10
             cache_dir: root.join("cache"),
         };
 
-        let error = install_sdk(&paths, "release", "tarball", None, None, None, true)
+        let error = install_sdk(&paths, "release", "tarball", None, None, None, true, true)
             .unwrap_err()
             .to_string();
 
         assert!(error.contains("tarball installs are not supported on Windows"));
         assert!(error.contains("rocm install sdk --format wheel"));
+    }
+
+    #[test]
+    fn existing_runtime_relation_classifies_upgrade_downgrade_reinstall() -> Result<()> {
+        let (root, paths) = test_paths("existing-runtime-relation");
+        let mut manifest = test_runtime_manifest(
+            "release-wheel-gfx120X-all",
+            "therock-release:gfx120X-all",
+            10,
+        );
+        manifest.version = "7.13.0".to_owned();
+        write_test_runtime_manifest(&paths, &manifest)?;
+
+        let upgrade =
+            existing_runtime_relation(&paths, TheRockChannel::Release, "gfx120X-all", "7.14.0")?
+                .expect("relation should be reported for a matching runtime");
+        assert!(upgrade.starts_with("upgrade from"), "got: {upgrade}");
+        assert!(upgrade.contains("7.13.0"));
+
+        let downgrade =
+            existing_runtime_relation(&paths, TheRockChannel::Release, "gfx120X-all", "7.12.0")?
+                .expect("relation should be reported for a matching runtime");
+        assert!(downgrade.starts_with("downgrade from"), "got: {downgrade}");
+
+        let reinstall =
+            existing_runtime_relation(&paths, TheRockChannel::Release, "gfx120X-all", "7.13.0")?
+                .expect("relation should be reported for a matching runtime");
+        assert!(reinstall.starts_with("reinstall from"), "got: {reinstall}");
+
+        // A different family or channel is a fresh install, so no relation applies.
+        assert!(
+            existing_runtime_relation(&paths, TheRockChannel::Release, "gfx110X-all", "7.14.0")?
+                .is_none()
+        );
+        assert!(
+            existing_runtime_relation(&paths, TheRockChannel::Nightly, "gfx120X-all", "7.14.0")?
+                .is_none()
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn existing_runtime_relation_none_without_managed_runtimes() -> Result<()> {
+        let (root, paths) = test_paths("existing-runtime-relation-empty");
+        assert!(
+            existing_runtime_relation(&paths, TheRockChannel::Release, "gfx120X-all", "7.14.0")?
+                .is_none()
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn existing_runtime_relation_propagates_manifest_read_errors() -> Result<()> {
+        // A manifest entry that cannot be read (here, a directory sitting where a
+        // `*.json` manifest file is expected) must surface as an error, not be
+        // silently treated as "no existing runtime" — that would skip the
+        // overwrite confirmation gate exactly when we're least sure whether an
+        // existing SDK is present.
+        let (root, paths) = test_paths("existing-runtime-relation-error");
+        let registry_dir = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(registry_dir.join("broken.json"))?;
+
+        let error =
+            existing_runtime_relation(&paths, TheRockChannel::Release, "gfx120X-all", "7.14.0")
+                .expect_err("a manifest read failure should be propagated, not swallowed");
+        assert!(!error.to_string().is_empty());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_install_approval_only_prompts_when_overwriting_existing() {
+        // Fresh install: no existing SDK -> never prompt, regardless of terminal/--yes.
+        assert_eq!(
+            sdk_install_approval(false, false, false),
+            SdkInstallApproval::ProceedFresh
+        );
+        assert_eq!(
+            sdk_install_approval(false, false, true),
+            SdkInstallApproval::ProceedFresh
+        );
+        assert_eq!(
+            sdk_install_approval(false, true, false),
+            SdkInstallApproval::ProceedFresh
+        );
+
+        // Existing SDK: --yes overwrites silently; a terminal prompts; neither refuses.
+        assert_eq!(
+            sdk_install_approval(true, true, false),
+            SdkInstallApproval::ProceedApproved
+        );
+        assert_eq!(
+            sdk_install_approval(true, false, true),
+            SdkInstallApproval::PromptOverwrite
+        );
+        assert_eq!(
+            sdk_install_approval(true, false, false),
+            SdkInstallApproval::RefuseNonInteractive
+        );
+    }
+
+    #[test]
+    fn repo_version_without_wheels_warns_only_when_newest_is_newer() {
+        // Newest repo version has no wheels (newer than the installable one) -> warn.
+        assert_eq!(
+            repo_version_without_wheels(Some("7.14.0"), "7.13.0").as_deref(),
+            Some("7.14.0")
+        );
+        // Newest repo version is the one being installed -> no warning.
+        assert!(repo_version_without_wheels(Some("7.13.0"), "7.13.0").is_none());
+        // A specific version was requested (no "newest" known) -> no warning.
+        assert!(repo_version_without_wheels(None, "7.13.0").is_none());
+        // Defensive: an older "newest" (should not happen) never warns.
+        assert!(repo_version_without_wheels(Some("7.12.0"), "7.13.0").is_none());
     }
 
     fn test_paths(name: &str) -> (PathBuf, AppPaths) {

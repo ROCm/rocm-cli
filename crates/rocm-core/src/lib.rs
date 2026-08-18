@@ -2694,7 +2694,7 @@ fn rocm_version_sort_key(version: &str) -> Vec<u32> {
         .collect()
 }
 
-fn detect_legacy_rocm_summary() -> LegacyRocmSummary {
+pub fn detect_legacy_rocm_summary() -> LegacyRocmSummary {
     // One resolver on both platforms, so the human report, the JSON probe and
     // the fix-6 runner cannot disagree about which installs exist or which one
     // is active. `discover_rocm_installs` picks the search roots and layout for
