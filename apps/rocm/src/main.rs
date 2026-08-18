@@ -569,7 +569,9 @@ rocm install sdk --family gfx110X-all --dry-run")]
         /// TheRock GPU package family to install, such as gfx110X-all.
         #[arg(long)]
         family: Option<String>,
-        /// Also install the ROCm compiler and headers, for building GPU code.
+        /// Also install the ROCm compiler, headers, and static libraries for
+        /// building GPU code. Roughly doubles the wheel download; already
+        /// included by `--format tarball`.
         #[arg(long)]
         devel: bool,
         /// Resolve the install plan without changing files.

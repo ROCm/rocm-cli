@@ -407,6 +407,19 @@ fn claim_relaunch() -> bool {
 
 #[given("a model is being served on GPU")]
 async fn setup_gpu_model(world: &mut E2eWorld) {
+    serve_gpu_model(world).await;
+}
+
+#[when("the user serves a model on GPU from the installed runtime")]
+async fn user_serves_gpu_model_from_installed_runtime(world: &mut E2eWorld) {
+    // Unlike `setup_active_runtime`, this scenario intentionally keeps the
+    // runtime it just installed in its isolated World. Do not opt into the
+    // persistent E2E_SHARED_RUNTIMES_DIR here: the acceptance criterion is that
+    // vLLM starts from this fresh runtime-only install, not a pre-warmed SDK.
+    serve_gpu_model(world).await;
+}
+
+async fn serve_gpu_model(world: &mut E2eWorld) {
     // Serve by the canonical HuggingFace ID (not the `qwen2.5` alias) with an
     // explicit engine matching this host. This step is a *precondition* for
     // scenarios that test inference/chat behavior, so it must not fail for
