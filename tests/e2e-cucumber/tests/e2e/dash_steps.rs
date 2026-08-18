@@ -122,7 +122,15 @@ async fn open_observe_view(world: &mut E2eWorld) {
     let tui = session(world);
     tui.use_detail_size()
         .unwrap_or_else(|e| panic!("failed to enlarge the dashboard: {e}"));
-    tui.send("4")
+    // Every scenario using this step launches the dashboard and comes straight
+    // here, with no assertion in between to prove the TUI is reading input yet
+    // (unlike the ROCm journey, which asserts the home view first). A key
+    // written that early can be swallowed before the event loop exists, so
+    // repeat it until the Observe tab is actually selected — the `●` marks the
+    // active chip. The step then fails only if the dashboard never gets there,
+    // not if it was slow to start.
+    tui.send_until("4", "● Observe", DEFAULT_TIMEOUT)
+        .await
         .unwrap_or_else(|e| panic!("failed to switch to the Observe tab: {e}"));
 }
 
