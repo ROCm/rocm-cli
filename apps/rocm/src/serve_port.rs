@@ -152,10 +152,7 @@ pub(crate) fn resolve_serve_port(
         // — and it is refused by returning an error, never by panicking.
         let Some(port) = request.explicit() else {
             validate_port_request(host, request)?;
-            bail!(
-                "`--host {host}` needs an explicit `--port <1-65535>`; automatic port \
-                 selection is supported only on {DEFAULT_LOCAL_HOST}."
-            );
+            unreachable!("custom-host automatic requests are rejected above");
         };
         return Ok(LoopbackPortLease::engine_owned(port));
     }
