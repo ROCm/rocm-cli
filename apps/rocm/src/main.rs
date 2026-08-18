@@ -602,7 +602,10 @@ rocm install sdk --family gfx110X-all --dry-run")]
         /// Resolve the install plan without changing files.
         #[arg(long)]
         dry_run: bool,
-        /// Approve required system-package installs (such as OpenMPI for vLLM) without asking.
+        /// Approve overwriting an existing ROCm SDK (and required system-package
+        /// installs such as OpenMPI for vLLM) without prompting; required to
+        /// overwrite an existing SDK outside an interactive terminal. A fresh
+        /// install (no existing SDK) never prompts.
         #[arg(long)]
         yes: bool,
     },
@@ -2436,12 +2439,14 @@ fn install(target: InstallTarget) -> Result<()> {
                 version_selector,
                 family.as_deref(),
                 dry_run,
+                yes,
             ) {
-                Ok(output) => {
-                    let finalized = if dry_run {
-                        None
-                    } else {
+                Ok(result) => {
+                    let therock::SdkInstallResult { output, mutated } = result;
+                    let finalized = if mutated {
                         finalize_successful_sdk_install(&paths)?
+                    } else {
+                        None
                     };
                     print!("{output}");
                     if let Some(finalized) = &finalized {
@@ -12967,7 +12972,7 @@ fn render_install_sdk_dry_run_for_args(paths: &AppPaths, args: &[String]) -> Res
     let version = chat_cli_arg_value(args, "--version").map(str::to_owned);
     let build_date = chat_cli_arg_value(args, "--build-date").map(str::to_owned);
     let selector = therock_install_version_selector(version, build_date)?;
-    therock::install_sdk(paths, channel, format, prefix, selector, None, true)
+    Ok(therock::install_sdk(paths, channel, format, prefix, selector, None, true, true)?.output)
 }
 
 fn run_command_with_timeout(
@@ -15701,9 +15706,10 @@ fn apply_runtime_update(
             None,
             None,
             true,
+            true,
         )?;
         let _ = writeln!(output, "  install_plan:");
-        for line in install_plan.lines() {
+        for line in install_plan.output.lines() {
             let _ = writeln!(output, "    {line}");
         }
         return Ok(output);
@@ -15717,6 +15723,7 @@ fn apply_runtime_update(
         None,
         None,
         false,
+        true,
     )?;
     let manifests_after = therock::load_runtime_manifests(paths)?;
     let installed = select_installed_update_runtime(&manifests_after, source, &plan.latest_version)
@@ -15755,7 +15762,7 @@ fn apply_runtime_update(
         );
     }
     let _ = writeln!(output, "  install_output:");
-    for line in install_output.lines() {
+    for line in install_output.output.lines() {
         let _ = writeln!(output, "    {line}");
     }
     Ok(output)

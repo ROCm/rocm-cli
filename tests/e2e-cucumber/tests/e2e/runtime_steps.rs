@@ -127,7 +127,7 @@ async fn setup_active_runtime(world: &mut E2eWorld) {
     world.use_shared_runtimes();
     let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     if stdout.contains("installed: none") {
-        crate::run_rocm_ok(world, &["install", "sdk"]);
+        crate::run_rocm_ok(world, &["install", "sdk", "--yes"]);
     }
     // Name the runtime rather than leaving the CLI to infer it: the shared tree
     // grows a second runtime whenever the channel index publishes one, and the
@@ -181,14 +181,30 @@ async fn user_installs_sdk(world: &mut E2eWorld) {
     // opt-out is one — without the Gherkin naming an environment variable. The
     // exit code is still asserted here, with the same diagnostic bundle
     // `run_rocm_ok` prints: an install that failed leaves every Then behind it
-    // reading output that was never produced.
-    let args = ["install", "sdk"];
+    // reading output that was never produced. `--yes` keeps the install
+    // non-interactive-safe: the e2e harness runs with null stdin, so an overwrite
+    // prompt would otherwise refuse rather than proceed.
+    let args = ["install", "sdk", "--yes"];
     let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &args);
     assert!(
         rc == 0,
         "{}",
         e2e_cucumber::cli_failure_report(&args, rc, &stdout, &stderr)
     );
+    world.cli_output = Some(stdout);
+}
+
+#[when("the user reinstalls the SDK without confirming")]
+async fn user_reinstalls_sdk_without_yes(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["install", "sdk"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user reinstalls the SDK with --yes")]
+async fn user_reinstalls_sdk_with_yes(world: &mut E2eWorld) {
+    let stdout = crate::run_rocm_ok(world, &["install", "sdk", "--yes"]);
     world.cli_output = Some(stdout);
 }
 
@@ -589,5 +605,22 @@ async fn assert_adopt_error_explains(world: &mut E2eWorld) {
             || combined.contains("rocm_sdk")
             || combined.contains("not supported"),
         "error does not explain TheRock requirement:\n{stdout}\n{stderr}"
+    );
+}
+
+#[then("the reinstall is refused")]
+async fn assert_reinstall_refused(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command was run");
+    assert!(rc != 0, "install sdk unexpectedly succeeded without --yes");
+}
+
+#[then("the error explains that --yes is required")]
+async fn assert_reinstall_error_explains_yes(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    let combined = format!("{stdout}{stderr}").to_lowercase();
+    assert!(
+        combined.contains("--yes"),
+        "error does not mention --yes:\n{stdout}\n{stderr}"
     );
 }
