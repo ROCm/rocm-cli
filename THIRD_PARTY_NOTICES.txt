@@ -873,17 +873,27 @@ The following component(s) are licensed under Apache License 2.0:
   - windows-strings 0.5.1 <https://github.com/microsoft/windows-rs>
   - windows-sys 0.52.0 <https://github.com/microsoft/windows-rs>
   - windows-sys 0.59.0 <https://github.com/microsoft/windows-rs>
+  - windows-sys 0.60.2 <https://github.com/microsoft/windows-rs>
   - windows-sys 0.61.2 <https://github.com/microsoft/windows-rs>
   - windows-targets 0.52.6 <https://github.com/microsoft/windows-rs>
+  - windows-targets 0.53.5 <https://github.com/microsoft/windows-rs>
   - windows 0.57.0 <https://github.com/microsoft/windows-rs>
   - windows_aarch64_gnullvm 0.52.6 <https://github.com/microsoft/windows-rs>
+  - windows_aarch64_gnullvm 0.53.1 <https://github.com/microsoft/windows-rs>
   - windows_aarch64_msvc 0.52.6 <https://github.com/microsoft/windows-rs>
+  - windows_aarch64_msvc 0.53.1 <https://github.com/microsoft/windows-rs>
   - windows_i686_gnu 0.52.6 <https://github.com/microsoft/windows-rs>
+  - windows_i686_gnu 0.53.1 <https://github.com/microsoft/windows-rs>
   - windows_i686_gnullvm 0.52.6 <https://github.com/microsoft/windows-rs>
+  - windows_i686_gnullvm 0.53.1 <https://github.com/microsoft/windows-rs>
   - windows_i686_msvc 0.52.6 <https://github.com/microsoft/windows-rs>
+  - windows_i686_msvc 0.53.1 <https://github.com/microsoft/windows-rs>
   - windows_x86_64_gnu 0.52.6 <https://github.com/microsoft/windows-rs>
+  - windows_x86_64_gnu 0.53.1 <https://github.com/microsoft/windows-rs>
   - windows_x86_64_gnullvm 0.52.6 <https://github.com/microsoft/windows-rs>
+  - windows_x86_64_gnullvm 0.53.1 <https://github.com/microsoft/windows-rs>
   - windows_x86_64_msvc 0.52.6 <https://github.com/microsoft/windows-rs>
+  - windows_x86_64_msvc 0.53.1 <https://github.com/microsoft/windows-rs>
 
                                  Apache License
                            Version 2.0, January 2004
@@ -5809,7 +5819,6 @@ The following component(s) are licensed under Apache License 2.0:
   - js-sys 0.3.102 <https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys>
   - lazy_static 1.5.0 <https://github.com/rust-lang-nursery/lazy-static.rs>
   - linux-raw-sys 0.12.1 <https://github.com/sunfishcode/linux-raw-sys>
-  - linux-raw-sys 0.4.15 <https://github.com/sunfishcode/linux-raw-sys>
   - lock_api 0.4.14 <https://github.com/Amanieu/parking_lot>
   - log 0.4.33 <https://github.com/rust-lang/log>
   - mime 0.3.17 <https://github.com/hyperium/mime>
@@ -5837,7 +5846,6 @@ The following component(s) are licensed under Apache License 2.0:
   - regex 1.12.4 <https://github.com/rust-lang/regex>
   - ring 0.17.14 <https://github.com/briansmith/ring>
   - rustc-demangle 0.1.27 <https://github.com/rust-lang/rustc-demangle>
-  - rustix 0.38.44 <https://github.com/bytecodealliance/rustix>
   - rustix 1.1.4 <https://github.com/bytecodealliance/rustix>
   - rustls-native-certs 0.7.3 <https://github.com/rustls/rustls-native-certs>
   - rustls-native-certs 0.8.4 <https://github.com/rustls/rustls-native-certs>
@@ -10646,7 +10654,6 @@ MIT License
 ================================================================================
 
 The following component(s) are licensed under MIT License:
-  - crossterm 0.28.1 <https://github.com/crossterm-rs/crossterm>
   - crossterm 0.29.0 <https://github.com/crossterm-rs/crossterm>
   - crossterm_winapi 0.9.1 <https://github.com/crossterm-rs/crossterm-winapi>
 
