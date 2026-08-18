@@ -151,6 +151,7 @@ repository.
 | directories | 6.0.0 | MIT OR Apache-2.0 |
 | dirs | 6.0.0 | MIT OR Apache-2.0 |
 | dirs-sys | 0.5.0 | MIT OR Apache-2.0 |
+| dispatch2 | 0.3.1 | Zlib OR Apache-2.0 OR MIT |
 | displaydoc | 0.2.6 | MIT OR Apache-2.0 |
 | document-features | 0.2.12 | MIT OR Apache-2.0 |
 | downcast-rs | 1.2.1 | MIT/Apache-2.0 |
@@ -305,7 +306,12 @@ repository.
 | num-traits | 0.2.19 | MIT OR Apache-2.0 |
 | num_cpus | 1.17.0 | MIT OR Apache-2.0 |
 | num_threads | 0.1.7 | MIT OR Apache-2.0 |
+| objc2 | 0.6.4 | MIT |
 | objc2-core-foundation | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
+| objc2-encode | 4.1.0 | MIT |
+| objc2-foundation | 0.3.2 | MIT |
+| objc2-io-kit | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
+| objc2-open-directory | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
 | object | 0.37.3 | Apache-2.0 OR MIT |
 | once_cell | 1.21.4 | MIT OR Apache-2.0 |
 | once_cell_polyfill | 1.70.2 | MIT OR Apache-2.0 |
@@ -458,7 +464,7 @@ repository.
 | synthez | 0.4.0 | BlueOak-1.0.0 |
 | synthez-codegen | 0.4.0 | BlueOak-1.0.0 |
 | synthez-core | 0.4.0 | BlueOak-1.0.0 |
-| sysinfo | 0.34.2 | MIT |
+| sysinfo | 0.39.6 | MIT |
 | system-configuration | 0.7.0 | MIT OR Apache-2.0 |
 | system-configuration-sys | 0.6.0 | MIT OR Apache-2.0 |
 | tar | 0.4.46 | MIT OR Apache-2.0 |
@@ -556,17 +562,16 @@ repository.
 | winapi-i686-pc-windows-gnu | 0.4.0 | MIT/Apache-2.0 |
 | winapi-util | 0.1.11 | Unlicense OR MIT |
 | winapi-x86_64-pc-windows-gnu | 0.4.0 | MIT/Apache-2.0 |
-| windows | 0.57.0 | MIT OR Apache-2.0 |
-| windows-core | 0.57.0 | MIT OR Apache-2.0 |
+| windows | 0.62.2 | MIT OR Apache-2.0 |
+| windows-collections | 0.3.2 | MIT OR Apache-2.0 |
 | windows-core | 0.62.2 | MIT OR Apache-2.0 |
-| windows-implement | 0.57.0 | MIT OR Apache-2.0 |
+| windows-future | 0.3.2 | MIT OR Apache-2.0 |
 | windows-implement | 0.60.2 | MIT OR Apache-2.0 |
-| windows-interface | 0.57.0 | MIT OR Apache-2.0 |
 | windows-interface | 0.59.3 | MIT OR Apache-2.0 |
 | windows-link | 0.2.1 | MIT OR Apache-2.0 |
 | windows-native-keyring-store | 1.1.0 | MIT OR Apache-2.0 |
+| windows-numerics | 0.3.1 | MIT OR Apache-2.0 |
 | windows-registry | 0.6.1 | MIT OR Apache-2.0 |
-| windows-result | 0.1.2 | MIT OR Apache-2.0 |
 | windows-result | 0.4.1 | MIT OR Apache-2.0 |
 | windows-strings | 0.5.1 | MIT OR Apache-2.0 |
 | windows-sys | 0.52.0 | MIT OR Apache-2.0 |
@@ -575,6 +580,7 @@ repository.
 | windows-sys | 0.61.2 | MIT OR Apache-2.0 |
 | windows-targets | 0.52.6 | MIT OR Apache-2.0 |
 | windows-targets | 0.53.5 | MIT OR Apache-2.0 |
+| windows-threading | 0.2.1 | MIT OR Apache-2.0 |
 | windows_aarch64_gnullvm | 0.52.6 | MIT OR Apache-2.0 |
 | windows_aarch64_gnullvm | 0.53.1 | MIT OR Apache-2.0 |
 | windows_aarch64_msvc | 0.52.6 | MIT OR Apache-2.0 |
