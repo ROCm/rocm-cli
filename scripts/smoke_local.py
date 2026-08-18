@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -83,6 +84,12 @@ def assert_contains_any(text: str, needles: list[str], label: str) -> None:
 def assert_not_contains(text: str, needle: str, label: str) -> None:
     if needle in text:
         fail(f"{label} contained unexpected text: {needle}\n{text}")
+
+
+def assert_version_string(text: str, label: str) -> None:
+    match = re.fullmatch(r"rocm-cli \S+ \([0-9a-f]+\)", text)
+    if match is None:
+        fail(f"{label} did not match 'rocm-cli <ref> (<hash>)':\n{text}")
 
 
 def assert_path_missing(path: Path, label: str) -> None:
@@ -169,8 +176,14 @@ def main() -> int:
     rocmd = str(paths["rocmd"])
     vllm = str(paths["vllm"])
 
-    version = run("rocm version", [rocm, "version"], env=env)
-    assert_contains(version, "rocm ", "rocm version")
+    versions = [
+        run("rocm version", [rocm, "version"], env=env),
+        run("rocm --version", [rocm, "--version"], env=env),
+        run("rocm -V", [rocm, "-V"], env=env),
+    ]
+    if len(set(versions)) != 1:
+        fail(f"version surfaces returned different output: {versions}")
+    assert_version_string(versions[0], "rocm version")
 
     examine = run("rocm examine", [rocm, "examine"], env=env)
     assert_contains(examine, "rocm examine", "rocm examine")

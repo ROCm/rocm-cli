@@ -2,8 +2,8 @@ Feature: GPU detection and system inspection
 
   @id:examine-version
   Scenario: 1 - The CLI reports its version
-    When the user asks for the version
-    Then a version string is returned
+    When the user asks for the version through every CLI surface
+    Then matching traceable version strings are returned
 
   @id:examine-engines-list
   Scenario: 2 - The CLI lists all supported engines

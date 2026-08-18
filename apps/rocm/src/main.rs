@@ -1094,7 +1094,10 @@ fn main() -> Result<()> {
 }
 
 /// Build the root `rocm` command with its top-level subcommands ordered
-/// alphabetically in `--help` output (EAI-7362).
+/// alphabetically in `--help` output (EAI-7362), and its `-V`/`--version`
+/// banner (baked from `Cargo.toml` at derive time otherwise) overridden with
+/// the release tag and commit hash, so it matches the `rocm version`
+/// subcommand exactly.
 ///
 /// clap assigns each subcommand an incrementing display order in declaration
 /// order and renders the command list sorted by `(display_order, name)`.
@@ -1107,16 +1110,28 @@ fn main() -> Result<()> {
 /// default here lets `help` sort into its alphabetical position instead of being
 /// pinned last. The regression test guards this if clap's default ever changes.
 fn cli_command() -> clap::Command {
-    Cli::command().mut_subcommands(|sc| sc.display_order(999usize))
+    Cli::command()
+        .mut_subcommands(|sc| sc.display_order(999usize))
+        .version(cli_version_string())
+        .display_name("rocm-cli")
 }
 
 /// Parse process arguments through [`cli_command`] so `rocm --help` and
-/// `rocm help` list subcommands alphabetically. Mirrors the derived
+/// `rocm help` list subcommands alphabetically and `rocm -V`/`--version`
+/// print the release tag and commit hash. Mirrors the derived
 /// `Cli::parse()`, which builds from `Cli::command()` directly and therefore
-/// cannot pick up the reordering.
+/// cannot pick up either override.
 fn parse_cli() -> Cli {
     let matches = cli_command().get_matches();
     Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit())
+}
+
+fn cli_version_string() -> String {
+    format!(
+        "{} ({})",
+        env!("ROCM_CLI_VERSION_REF"),
+        env!("ROCM_CLI_GIT_HASH")
+    )
 }
 
 /// Legacy `uv` cache location, used before the cache was colocated with the managed
@@ -1600,7 +1615,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             device_index,
         }) => fix(fix_id, yes, dry_run, device_index),
         Some(Command::Version) => {
-            println!("rocm {}", env!("CARGO_PKG_VERSION"));
+            println!("rocm-cli {}", cli_version_string());
             Ok(())
         }
         Some(Command::Setup { command }) => setup(command),
@@ -11009,7 +11024,7 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
                 || command == "--version"
                 || command == "-V" =>
         {
-            Ok(format!("rocm {}\n", env!("CARGO_PKG_VERSION")))
+            Ok(format!("rocm-cli {}\n", cli_version_string()))
         }
         [command]
             if command.eq_ignore_ascii_case("model") || command.eq_ignore_ascii_case("models") =>
@@ -20400,7 +20415,9 @@ model recipes
                 .and_then(serde_json::Value::as_str),
             Some("rocm")
         );
-        assert!(mcp_tool_result_text(&result).contains(env!("CARGO_PKG_VERSION")));
+        let text = mcp_tool_result_text(&result);
+        assert!(text.contains("rocm-cli"));
+        assert!(text.contains(env!("ROCM_CLI_GIT_HASH")));
     }
 
     #[test]

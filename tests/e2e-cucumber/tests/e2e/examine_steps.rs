@@ -20,10 +20,18 @@ async fn setup_unmanaged_rocm(world: &mut E2eWorld) {
     world.plant_unmanaged_rocm();
 }
 
-#[when("the user asks for the version")]
+#[when("the user asks for the version through every CLI surface")]
 async fn user_asks_version(world: &mut E2eWorld) {
-    let (stdout, _, _) = crate::run_rocm(world, &["version"]);
-    world.cli_output = Some(stdout);
+    world.cli_outputs = Some(
+        [
+            ["version"].as_slice(),
+            ["--version"].as_slice(),
+            ["-V"].as_slice(),
+        ]
+        .into_iter()
+        .map(|args| crate::run_rocm(world, args).0)
+        .collect(),
+    );
 }
 
 #[when("the user lists available engines")]
@@ -47,12 +55,27 @@ async fn user_asks_help(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
 }
 
-#[then("a version string is returned")]
+#[then("matching traceable version strings are returned")]
 async fn assert_version_returned(world: &mut E2eWorld) {
-    let output = world.cli_output.as_ref().expect("no command was run");
+    let outputs = world.cli_outputs.as_ref().expect("no commands were run");
+    assert_eq!(outputs.len(), 3, "expected all three version surfaces");
     assert!(
-        output.trim().starts_with("rocm "),
-        "expected version string starting with 'rocm ': {output}"
+        outputs.windows(2).all(|pair| pair[0] == pair[1]),
+        "version surfaces returned different output: {outputs:?}"
+    );
+
+    let output = outputs[0].trim();
+    let version = output
+        .strip_prefix("rocm-cli ")
+        .and_then(|value| value.strip_suffix(')'))
+        .and_then(|value| value.rsplit_once(" ("));
+    let Some((reference, hash)) = version else {
+        panic!("expected 'rocm-cli <ref> (<hash>)': {output}");
+    };
+    assert!(!reference.is_empty(), "version ref is empty: {output}");
+    assert!(
+        !hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "version hash is not hexadecimal: {output}"
     );
 }
 
