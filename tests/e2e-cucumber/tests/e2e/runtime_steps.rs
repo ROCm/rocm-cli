@@ -45,6 +45,21 @@ async fn setup_active_runtime(world: &mut E2eWorld) {
         !stdout.contains("installed: none"),
         "no managed runtime is active:\n{stdout}"
     );
+    let active = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("active_runtime_key:"))
+        .map_or("", str::trim);
+    if active.is_empty() || active == "<unset>" {
+        let runtime_key = stdout
+            .lines()
+            .filter(|line| line.contains(" status=ready"))
+            .find_map(|line| {
+                line.split_whitespace()
+                    .find(|field| *field != "*" && *field != "-")
+            })
+            .unwrap_or_else(|| panic!("no ready managed runtime to activate:\n{stdout}"));
+        crate::run_rocm_ok(world, &["runtimes", "activate", runtime_key]);
+    }
 }
 
 #[when("the user installs the SDK")]
