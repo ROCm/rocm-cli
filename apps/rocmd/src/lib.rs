@@ -2985,6 +2985,12 @@ async fn run_daemon(
         .filter(|watcher| watcher.enabled)
         .count();
     println!("  enabled watchers: {enabled_count}");
+    // This banner is the foreground-loop readiness contract used by callers and
+    // integration tests. Flush it before any persistent work so piped stdout on
+    // Windows cannot retain the line in a userspace buffer indefinitely.
+    io::stdout()
+        .flush()
+        .context("failed to flush rocmd run banner")?;
 
     if !automations_enabled {
         println!(
