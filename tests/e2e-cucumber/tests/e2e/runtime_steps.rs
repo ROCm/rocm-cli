@@ -451,12 +451,67 @@ async fn assert_runtime_active(world: &mut E2eWorld) {
     );
 }
 
-#[then("the runtime includes an inference engine")]
-async fn assert_runtime_has_stack(world: &mut E2eWorld) {
-    let (stdout, _, _) = crate::run_rocm(world, &["examine"]);
+#[then("the runtime excludes the compiler toolchain")]
+async fn assert_runtime_excludes_devel(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated state root")
+        .path();
+    let registry = root.join("data/runtimes/registry");
+    let entries = std::fs::read_dir(&registry).unwrap_or_else(|error| {
+        panic!(
+            "failed to read runtime registry {}: {error}",
+            registry.display()
+        )
+    });
+    let manifests = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        manifests.len(),
+        1,
+        "expected one freshly installed runtime manifest in {}: {manifests:?}",
+        registry.display()
+    );
+
+    let manifest_path = &manifests[0];
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(manifest_path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest_path.display())),
+    )
+    .unwrap_or_else(|error| panic!("failed to parse {}: {error}", manifest_path.display()));
+    assert_eq!(
+        manifest.get("devel").and_then(serde_json::Value::as_bool),
+        Some(false),
+        "default SDK install recorded the compiler toolchain as present: {manifest}"
+    );
+
+    let python = manifest
+        .get("python_executable")
+        .and_then(serde_json::Value::as_str)
+        .expect("wheel runtime manifest has no python_executable");
+    let output = std::process::Command::new(python)
+        .args([
+            "-c",
+            "import importlib.metadata as m; print('present' if any(d.metadata['Name'].lower() == 'rocm-sdk-devel' for d in m.distributions()) else 'absent')",
+        ])
+        .output()
+        .unwrap_or_else(|error| {
+            panic!("failed to inspect the installed runtime with {python}: {error}")
+        });
     assert!(
-        stdout.contains("torch") || stdout.contains("vllm"),
-        "no inference stack found in runtime:\n{stdout}"
+        output.status.success(),
+        "failed to enumerate installed runtime packages:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "absent",
+        "default SDK install pulled rocm-sdk-devel back transitively"
     );
 }
 
