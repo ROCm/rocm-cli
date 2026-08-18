@@ -86,6 +86,13 @@ pub struct ResolvedArgs {
     /// Custom auth header NAME (CLI-flag value merged over config), e.g.
     /// `Ocp-Apim-Subscription-Key` for Azure APIM gateways.
     pub chat_auth_header: Option<String>,
+    /// Sampling temperature for chat requests, CLI-flag value merged over
+    /// config. `None` leaves the endpoint default untouched.
+    pub chat_temperature: Option<f32>,
+    /// Nucleus-sampling `top_p` for chat requests, CLI merged over config.
+    pub chat_top_p: Option<f32>,
+    /// Max generated tokens for chat requests, CLI merged over config.
+    pub chat_max_tokens: Option<u32>,
     /// Chat endpoint base URL from the environment (`OPENAI_BASE_URL`).
     /// A separate, lower-precedence tier than `chat_url`.
     pub chat_env_url: Option<String>,
@@ -121,6 +128,19 @@ pub struct ResolvedArgs {
     /// When `Some`, the bench-run form defaults `--out` to this path so appended
     /// rows appear live in the bench tab. Adapted by the bin (owns `rocm-core`).
     pub bench_results_dir: Option<std::path::PathBuf>,
+}
+
+impl ResolvedArgs {
+    /// The optional sampling controls (temperature/top_p/max_tokens) resolved
+    /// for chat, bundled for the agent builders. CLI-over-config merge already
+    /// happened in the bin, so these are the final values.
+    pub(crate) const fn inference_params(&self) -> crate::agent::InferenceParams {
+        crate::agent::InferenceParams {
+            temperature: self.chat_temperature,
+            top_p: self.chat_top_p,
+            max_tokens: self.chat_max_tokens,
+        }
+    }
 }
 
 type Tui = Terminal<CrosstermBackend<io::Stdout>>;
@@ -1790,6 +1810,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             let oauth_tx = chat_tx.clone();
             crate::agent::ChatGptAgentClient::new(
                 args.chat_model.clone(),
+                args.inference_params(),
                 move |url, code| {
                     let _ = oauth_tx.send(ClientMsg::ChatReply {
                         text: format!(
@@ -1805,10 +1826,13 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         } else {
             // A build failure leaves `agent` None; a submit surfaces an error turn.
             match &state.chat_llm {
-                Some(cfg) => {
-                    build_local_agent(cfg.clone(), state.tool_executor.clone(), chat_tx.clone())
-                        .ok()
-                }
+                Some(cfg) => build_local_agent(
+                    cfg.clone(),
+                    args.inference_params(),
+                    state.tool_executor.clone(),
+                    chat_tx.clone(),
+                )
+                .ok(),
                 None => None,
             }
         }
@@ -2285,7 +2309,12 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             };
             match state.chat_llm.clone() {
                 Some(cfg) => {
-                    match build_local_agent(cfg, state.tool_executor.clone(), chat_tx.clone()) {
+                    match build_local_agent(
+                        cfg,
+                        args.inference_params(),
+                        state.tool_executor.clone(),
+                        chat_tx.clone(),
+                    ) {
                         Ok(arc) => {
                             agent = Some(arc.clone());
                             // Refresh the restore snapshot so a later `/provider
@@ -5516,6 +5545,9 @@ mod tests {
             chat_url: None,
             chat_model: None,
             chat_auth_header: None,
+            chat_temperature: None,
+            chat_top_p: None,
+            chat_max_tokens: None,
             chat_env_url: None,
             chat_api_key: None,
             anthropic_api_key: key.map(str::to_string),
@@ -5527,6 +5559,29 @@ mod tests {
             tool_executor: None,
             bench_results_dir: None,
         }
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn resolved_args_inference_params_maps_and_defaults() {
+        // Bare args carry no sampling override → all three knobs are None, so an
+        // unset endpoint default is never clobbered.
+        let bare = args_with_anthropic_key(None);
+        assert_eq!(
+            bare.inference_params(),
+            crate::agent::InferenceParams::default()
+        );
+
+        // Populated args copy every knob through unchanged (CLI-over-config merge
+        // already happened in the bin).
+        let mut args = args_with_anthropic_key(None);
+        args.chat_temperature = Some(0.25);
+        args.chat_top_p = Some(0.5);
+        args.chat_max_tokens = Some(512);
+        let params = args.inference_params();
+        assert_eq!(params.temperature, Some(0.25));
+        assert_eq!(params.top_p, Some(0.5));
+        assert_eq!(params.max_tokens, Some(512));
     }
 
     #[test]

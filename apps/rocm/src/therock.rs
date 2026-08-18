@@ -3564,7 +3564,11 @@ fn slugify(value: &str) -> String {
 mod tests {
     use super::*;
 
-    static PYTHON_RESOLVER_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Serializes tests that replace process-global `PATH` (or other env vars) while
+    // they run. Because env is shared across all test threads, any test that spawns a
+    // bare-name binary (e.g. `tar`) via `PATH` lookup must also hold this lock, or it
+    // can fail with ENOENT while another test has temporarily narrowed `PATH`.
+    static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn tarball_space_preflight_skips_when_the_download_size_is_unknown() {
@@ -4051,6 +4055,9 @@ mod tests {
     /// would double the disk cost of every installed SDK version.
     #[test]
     fn extracting_the_sdk_archive_removes_it() -> Result<()> {
+        // Extraction spawns bare-name `tar` via `PATH`; hold the shared env lock so a
+        // concurrent test that temporarily narrows `PATH` cannot make it fail to launch.
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
         let (root, _paths) = test_paths("discard-archive");
         let cache = root.join("cache");
         let payload_dir = root.join("payload");
@@ -4306,6 +4313,7 @@ mod tests {
             // the managed/uv path regardless of PATH. Nothing to assert here.
             return Ok(());
         }
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
         let (root, paths) = test_paths("python-prefers-path");
         let bin_dir = root.join("bin");
         fs::create_dir_all(&bin_dir)?;
@@ -4356,7 +4364,7 @@ mod tests {
         if !runtime_is_windows() {
             return Ok(());
         }
-        let _guard = PYTHON_RESOLVER_TEST_ENV_LOCK.lock().unwrap();
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
         let (root, _paths) = test_paths("python-probe-temp-root");
         let temp_root = root.join("Temp");
         fs::create_dir_all(&temp_root)?;
@@ -4409,6 +4417,7 @@ mod tests {
             // the managed/uv path regardless of PATH. Nothing to assert here.
             return Ok(());
         }
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
         let (root, paths) = test_paths("python-path-over-managed");
         let bin_dir = root.join("bin");
         fs::create_dir_all(&bin_dir)?;

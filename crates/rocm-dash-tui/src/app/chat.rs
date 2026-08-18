@@ -67,9 +67,14 @@ pub(super) fn build_chat_agent(
                 api_key: Some(api_key),
                 auth_header: None,
             };
-            crate::agent::RigAgentClient::new(cfg, executor, Some(approval_tx))
-                .ok()
-                .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
+            crate::agent::RigAgentClient::new(
+                cfg,
+                args.inference_params(),
+                executor,
+                Some(approval_tx),
+            )
+            .ok()
+            .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
         }
         ChatProvider::Anthropic => {
             // Leave base_url empty → the Anthropic backend uses rig's default
@@ -80,9 +85,14 @@ pub(super) fn build_chat_agent(
                 api_key: args.anthropic_api_key.clone(),
                 auth_header: None,
             };
-            crate::agent::AnthropicAgentClient::new(cfg, executor, Some(approval_tx))
-                .ok()
-                .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
+            crate::agent::AnthropicAgentClient::new(
+                cfg,
+                args.inference_params(),
+                executor,
+                Some(approval_tx),
+            )
+            .ok()
+            .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
         }
     }
 }
@@ -97,10 +107,11 @@ pub(super) fn build_chat_agent(
 /// turn (the rebuild drain).
 pub(super) fn build_local_agent(
     cfg: crate::llm::LlmConfig,
+    params: crate::agent::InferenceParams,
     executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
     approval_tx: mpsc::UnboundedSender<ClientMsg>,
 ) -> Result<std::sync::Arc<dyn crate::agent::AgentClient>, crate::agent::AgentError> {
-    crate::agent::RigAgentClient::new(cfg, executor, Some(approval_tx))
+    crate::agent::RigAgentClient::new(cfg, params, executor, Some(approval_tx))
         .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
 }
 
