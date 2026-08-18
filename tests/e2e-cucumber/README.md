@@ -11,10 +11,12 @@ Behavioral end-to-end tests using [cucumber-rs](https://github.com/cucumber-rs/c
 ## Architecture
 
 ```
-.feature files (Gherkin)  →  step functions (Rust)  →  rocm binary / mock server
+.feature files (Gherkin)  →  step functions (Rust)  →  rocm / configured rocmd / mock server
 ```
 
-Tests exercise the `rocm` binary as a black box — no imports from the rocm-cli codebase. Mock-tier tests use an in-process axum server; GPU-tier tests run real model serving.
+Scenarios exercise `rocm` and, where required, an explicitly configured
+`rocmd` as black boxes — no imports from the rocm-cli codebase. Mock-tier tests
+use an in-process axum server; GPU-tier tests run real model serving.
 
 ## Prerequisites
 
@@ -52,8 +54,8 @@ tests/e2e-cucumber/
 
 ## Running tests
 
-The `cargo xtask e2e` task builds the release `rocm` binary and runs the suite.
-Extra arguments after `--` are forwarded to the cucumber CLI.
+The `cargo xtask e2e` task builds the release `rocm` and `rocmd` binaries and
+runs the suite. Extra arguments after `--` are forwarded to the cucumber CLI.
 
 ```bash
 # All features:
@@ -65,9 +67,19 @@ cargo xtask e2e -- -n "model name"
 # Stop on first failure:
 cargo xtask e2e -- --fail-fast
 
-# With a pre-built binary (skips the build step):
-ROCM_CLI_BINARY=./target/release/rocm cargo xtask e2e
+# With pre-built binaries (skips the build step):
+ROCM_CLI_BINARY=./target/release/rocm \
+ROCM_CLI_ROCMD_BINARY=./target/release/rocmd \
+cargo xtask e2e
 ```
+
+Prebuilt mode requires only `ROCM_CLI_BINARY` for scenarios that invoke
+`rocm`. Scenarios backed by `rocmd`, such as artifact prefetch, additionally
+require an explicit matching `ROCM_CLI_ROCMD_BINARY`; the harness does not
+infer a sibling executable. Lifecycle packaging requires both prebuilt binaries
+to be in the same directory because `xtask package` consumes one `ROCM_BIN_DIR`;
+the harness rejects separate directories instead of silently packaging a
+different `rocmd`.
 
 The default run is fast: it excludes the expensive, OS-mutating `@lifecycle`
 release-install scenarios (packaging + the real installer + install/uninstall).
@@ -82,6 +94,7 @@ E2E_INCLUDE_LIFECYCLE=1 E2E_ONLY_LIFECYCLE=1 cargo xtask e2e
 | Variable | Default | Description |
 |---|---|---|
 | `ROCM_CLI_BINARY` | `rocm` (on PATH) | Path to the rocm binary under test |
+| `ROCM_CLI_ROCMD_BINARY` | set by `cargo xtask e2e` after its release build | Path to the rocmd binary required by rocmd-backed scenarios; explicit in prebuilt mode |
 | `ROCM_CLI_CONFIG_DIR` | (temp dir) | Isolated config directory per scenario |
 | `ROCM_CLI_DATA_DIR` | (temp dir) | Isolated data directory per scenario |
 | `ROCM_CLI_CACHE_DIR` | (temp dir) | Isolated cache directory per scenario |
@@ -196,7 +209,7 @@ The `.feature` file is both the spec and the test input — cucumber reads it at
 
 ## Design principles
 
-- **Black-box only.** Step functions interact with `rocm` through its CLI and HTTP endpoints. No imports from the rocm-cli codebase. Where a scenario needs the CLI to know about a running server, it plants a managed-service record as plain JSON matching the on-disk schema (see `register_mock_service`) — the same file `rocm serve --managed` would write — rather than importing the record type.
+- **Black-box only.** Step functions interact with `rocm` and explicitly configured `rocmd` through their CLIs and HTTP endpoints. No imports from the rocm-cli codebase. Where a scenario needs the CLI to know about a running server, it plants a managed-service record as plain JSON matching the on-disk schema (see `register_mock_service`) — the same file `rocm serve --managed` would write — rather than importing the record type.
 - **Isolated state.** Each scenario uses isolated config, data, and cache directories. Tests never touch `~/.rocm`.
 - **Behavioral language.** Feature files describe what users care about, not implementation details. How steps are implemented (mock vs real, which port, which API) stays in the step functions.
 - **OS-assigned ports.** The mock server binds to `127.0.0.1:0` to avoid port conflicts between tests.

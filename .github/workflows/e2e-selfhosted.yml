@@ -275,11 +275,12 @@ jobs:
           prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
-          # Build the rocm binary ONCE and reuse it for both the pre-warm and the
-          # suite (via ROCM_CLI_BINARY) so xtask does not rebuild. Honors
+          # Build the rocm and rocmd binaries ONCE and reuse them for both the
+          # pre-warm and suite so xtask does not rebuild. Honors
           # CARGO_TARGET_DIR set above.
-          cargo build --release -p rocm
+          cargo build --release -p rocm -p rocmd
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
+          export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
 
           # Pre-warm the shared runtime ONCE, SERIALLY, before the suite — never
           # lazily inside a concurrent scenario (two multi-GiB installs racing the
@@ -448,10 +449,10 @@ jobs:
           prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
-          # Build the rocm binary once; reuse for pre-warm + suite so xtask doesn't
-          # rebuild.
-          cargo build --release -p rocm
+          # Build the rocm and rocmd binaries once; reuse them for pre-warm + suite.
+          cargo build --release -p rocm -p rocmd
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
+          export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
 
           # Pre-warm once, serially, in place (no mv/symlink). Skipped once the tree
           # is populated (persists across runs on RUNNER_WORKSPACE).
@@ -605,13 +606,14 @@ jobs:
           $prewarm = "$env:RUNNER_WORKSPACE\e2e-prewarm"
           $env:E2E_SHARED_RUNTIMES_DIR = "$prewarm\data\runtimes"
 
-          # Build the rocm binary once; reuse for pre-warm + suite so xtask doesn't
-          # rebuild. This job does not set CARGO_TARGET_DIR, so the binary lands in
+          # Build the rocm and rocmd binaries once; reuse them for pre-warm + suite.
+          # This job does not set CARGO_TARGET_DIR, so the binaries land in
           # the default target\release (fall back to it when the env var is unset).
-          cargo build --release -p rocm
+          cargo build --release -p rocm -p rocmd
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "target" }
           $env:ROCM_CLI_BINARY = "$targetDir\release\rocm.exe"
+          $env:ROCM_CLI_ROCMD_BINARY = "$targetDir\release\rocmd.exe"
 
           # Pre-warm once, in place (no move/symlink). Skipped once the tree is
           # populated (persists across runs on RUNNER_WORKSPACE).
@@ -802,10 +804,10 @@ jobs:
           prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
-          # Build the rocm binary once; reuse for pre-warm + suite so xtask
-          # doesn't rebuild.
-          cargo build --release -p rocm
+          # Build the rocm and rocmd binaries once; reuse them for pre-warm + suite.
+          cargo build --release -p rocm -p rocmd
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
+          export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
 
           # Pre-warm once, serially, in place (no mv/symlink). Skipped once the
           # tree is populated (persists across runs on RUNNER_WORKSPACE).

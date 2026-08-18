@@ -384,9 +384,10 @@ jobs:
           prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
-          # Build once; reuse for pre-warm + suite so xtask doesn't rebuild.
-          cargo build --release -p rocm
+          # Build both binaries once; reuse them for pre-warm + suite.
+          cargo build --release -p rocm -p rocmd
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
+          export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
 
           # Pre-warm the shared runtime once/serially before the suite; skipped
           # once populated (persists across runs). Install in place (no mv) so the
@@ -491,8 +492,9 @@ jobs:
           prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
-          cargo build --release -p rocm
+          cargo build --release -p rocm -p rocmd
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
+          export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
 
           if [ ! -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
             echo "pre-warming shared runtime (first run on this runner)…"
@@ -596,10 +598,11 @@ jobs:
           $prewarm = "$env:RUNNER_WORKSPACE\e2e-prewarm"
           $env:E2E_SHARED_RUNTIMES_DIR = "$prewarm\data\runtimes"
 
-          cargo build --release -p rocm
+          cargo build --release -p rocm -p rocmd
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "target" }
           $env:ROCM_CLI_BINARY = "$targetDir\release\rocm.exe"
+          $env:ROCM_CLI_ROCMD_BINARY = "$targetDir\release\rocmd.exe"
 
           if (-not (Test-Path "$env:E2E_SHARED_RUNTIMES_DIR\registry")) {
             Write-Host "pre-warming shared runtime (first run on this runner)..."
@@ -758,8 +761,9 @@ jobs:
           prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
-          cargo build --release -p rocm
+          cargo build --release -p rocm -p rocmd
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
+          export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
 
           if [ ! -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
             echo "pre-warming shared runtime (first run on this runner)…"

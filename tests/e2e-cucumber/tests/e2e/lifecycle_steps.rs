@@ -164,11 +164,13 @@ fn run_package(world: &E2eWorld, sign_env: &[(&str, String)]) -> (String, bool) 
 /// packaging bundles exactly the binaries under test.
 fn release_bin_dir() -> PathBuf {
     let binary = crate::rocm_binary();
-    let path = PathBuf::from(&binary);
-    path.parent().map_or_else(
-        || workspace_root().join("target/release"),
-        Path::to_path_buf,
+    let rocmd = std::env::var_os("ROCM_CLI_ROCMD_BINARY").map(PathBuf::from);
+    e2e_cucumber::lifecycle_binary_dir(
+        Path::new(&binary),
+        rocmd.as_deref(),
+        &workspace_root().join("target/release"),
     )
+    .expect("lifecycle packaging requires matching rocm and rocmd binaries")
 }
 
 /// Run the platform installer (`install.sh` / `install.ps1`) with the given
