@@ -1,0 +1,100 @@
+name: Dependabot manifests
+
+# MANIFEST.md's dependency table and THIRD_PARTY_NOTICES.txt are generated from
+# the dependency graph (`cargo xtask manifest` / `cargo xtask tpn`), and ci.yml
+# gates both against the committed copies. Dependabot cannot run a generator, so
+# every cargo bump it opens fails those two gates on arrival — a permanently red
+# dependency queue, which trains reviewers to stop reading red. This unprivileged
+# workflow regenerates and uploads both files; dependabot-manifests-commit.yml
+# performs the bounded commit from a separate workflow_run context.
+#
+# ONE MANUAL STEP REMAINS, by design. A commit made with GITHUB_TOKEN does not
+# silently bypass Dependabot's approval policy: updating the PR creates a
+# `synchronize` run in the "approval required" state. A maintainer clicks
+# "Approve workflows to run" in the merge box to run the gates against the
+# regenerated files. That click is the whole remaining cost, down from
+# regenerating two files by hand and pushing them.
+# https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow#triggering-a-workflow-from-a-workflow
+# Removing it needs a non-GITHUB_TOKEN identity (a GitHub App installation
+# token, with its credentials stored as *Dependabot* secrets, since Actions
+# secrets are unavailable on Dependabot-triggered runs) — deliberately not done
+# here: it is org-level setup, not a workflow change.
+#
+# Scoped to Dependabot's own PRs. A human who changes the dependency graph gets
+# the ci.yml failure telling them to regenerate, which is the right signal.
+
+on:
+  pull_request:
+    paths:
+      - Cargo.lock
+      - "**/Cargo.toml"
+
+# No ambient access: each job opts in to exactly what it needs.
+permissions: {}
+
+# A group of its own, never shared with ci.yml — the lesson from EAI-7548 is
+# that a stalled run must not be able to hold a group that merge-required checks
+# depend on.
+concurrency:
+  group: dependabot-manifests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Runs the generators, and therefore compiles the bumped dependency graph:
+  # building xtask executes the new versions' `build.rs` and proc macros. That
+  # is precisely why this job is read-only and why committing is a separate job
+  # — untrusted code and a write-scoped token never coexist here.
+  generate:
+    name: Regenerate manifests
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # The PR head, not the refs/pull/N/merge commit: the regenerated files
+      # have to match the branch that will carry them.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      # Same version and cache key as ci.yml's third-party-notices job: the
+      # notices must be byte-identical to what that job's `--check` regenerates,
+      # and a different cargo-about formats them differently.
+      - name: Cache cargo-about
+        id: cache-cargo-about
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-about
+          key: ${{ runner.os }}-cargo-about-0.9.1
+
+      - name: Install cargo-about
+        if: steps.cache-cargo-about.outputs.cache-hit != 'true'
+        run: cargo install cargo-about@0.9.1 --locked --features cli
+
+      - name: Regenerate
+        id: regen
+        run: |
+          cargo xtask manifest
+          cargo xtask tpn
+          if git diff --quiet -- MANIFEST.md THIRD_PARTY_NOTICES.txt; then
+            echo "Already current; nothing to commit."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git diff --stat -- MANIFEST.md THIRD_PARTY_NOTICES.txt
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload regenerated manifests
+        if: steps.regen.outputs.changed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: regenerated-manifests
+          path: |
+            MANIFEST.md
+            THIRD_PARTY_NOTICES.txt
+          retention-days: 1

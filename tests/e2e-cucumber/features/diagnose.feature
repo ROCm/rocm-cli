@@ -79,12 +79,74 @@ Feature: Diagnosing failures and listing fixes
     Then the CLI refuses and explains that it needs agreement
     And the file the fix would have changed is untouched
 
+  # The other half of scenario 3, and the half every host can prove. A caller
+  # cannot read "did anything match?" off the size of the list: every checker
+  # that fires at all is reported, including ones scoring too low to act on,
+  # and several open with a nonzero score for a situation that is merely
+  # POTENTIALLY relevant — being in a container, having an APU beside a
+  # discrete GPU. So a healthy machine hands back a non-empty list of things
+  # that are not wrong with it. A caller treating that as a diagnosis proposes
+  # a fix for a machine with nothing wrong, and never routes the user onward.
+  @id:diagnose-json-states-when-nothing-matched
+  Scenario: 9 - A tool is told plainly when no cause was established
+    Given a user who hit a failure the CLI does not recognise
+    When the user asks the CLI to diagnose that symptom in machine-readable form
+    Then the result states that no cause was established
+    And the CLI always points to somewhere the problem can be reported
+
+  # Host-agnostic on purpose: the scenario asks the CLI what it makes of this
+  # platform and then holds it to the matching half of the contract. A caller
+  # decides whether to diagnose at all from this verdict, and nothing pinned it
+  # before — the suite only ever SKIPPED the bare-metal scenarios on WSL2, which
+  # proves nothing about what gets reported there.
+  #
+  # Be precise about where each half runs, because the halves are not equal.
+  # There is NO WSL2 lane in CI (every job pins a native runner), so the
+  # route-out half is proven only by a developer running the suite on WSL2.
+  # What CI gets is the covered half plus the cross-check against the host
+  # report — both of which can fail, which is the bar an assertion has to clear
+  # to be worth writing. An earlier version of this scenario returned early on a
+  # covered platform and asserted nothing at all on any lane CI runs.
+  @id:diagnose-states-whether-the-platform-is-covered
+  Scenario: 10 - A platform the catalog does not cover says so and routes onward
+    Given a user who hit a known ROCm failure
+    When the user asks the CLI to diagnose that symptom in machine-readable form
+    Then the result says whether this platform is covered
+    And a platform that is not covered is given no diagnosis
+    And a platform that is covered gets a verdict that follows the evidence
+    And the CLI always points to somewhere the problem can be reported
+
+  # A fix that cannot run here is a different outcome from one that failed, and
+  # from one the user declined — a caller that cannot tell them apart reports a
+  # broken machine when the truth is "wrong operating system". The scenario
+  # picks whichever catalog entry belongs to the OTHER platform, so it carries
+  # the same weight on the Linux and Windows lanes.
+  @id:fix-inapplicable-here-is-declined-not-attempted
+  Scenario: 11 - A fix meant for another operating system is declined, not attempted
+    Given a user who has chosen a fix meant for a different operating system
+    When the user asks the CLI to apply that fix
+    Then the CLI declines because the fix does not apply to this machine
+    And nothing on the machine is changed
+
+  # Scenario 4 proves the listing works; this proves it is COMPLETE. Which
+  # failure modes exist, and which of them the CLI will carry out itself, are
+  # part of the published contract rather than private detail — so a mode added
+  # or removed is a change to what callers were promised, and it should not be
+  # possible to make it quietly. This is deliberately the brittle test that
+  # breaks when the catalog changes; that break is the notification. Do not
+  # loosen it.
+  @id:fix-catalog-is-complete
+  Scenario: 12 - The CLI offers every fix its catalog documents
+    When the user asks the CLI which fixes it offers
+    Then every fix the catalog documents is listed
+    And only the fixes the CLI can carry out itself are marked as such
+
   # Expected to FAIL. `diagnose` and `fix` are two views of the same remedy: the
   # first tells the user what will put the machine right, while the second is the
   # command they are told to run. They must not leave the user with two different
   # definitions of what proves the remedy worked.
   @id:diagnose-and-fix-agree-on-how-to-verify @requires-os:linux
-  Scenario: 9 - Diagnosing a problem and previewing its fix agree on how to verify it
+  Scenario: 13 - Diagnosing a problem and previewing its fix agree on how to verify it
     Given a user who hit a device-permission failure
     When the user compares the diagnosis with the matching fix preview
     Then both give the same way to verify that the fix worked
@@ -94,17 +156,17 @@ Feature: Diagnosing failures and listing fixes
   # that lookup failure as if it were a group the user could join. A proposed
   # remedy has to name a group that actually exists on the machine.
   @id:diagnose-commands-name-a-real-group @requires-gpu @requires-bare-metal @requires-os:linux
-  Scenario: 10 - Every group named in a diagnosis is one the machine recognises
+  Scenario: 14 - Every group named in a diagnosis is one the machine recognises
     Given the GPU device belongs to a group the machine cannot name
     When the user asks the CLI to diagnose a device-permission failure
     Then every group named in the remedy exists on the machine
 
   # Expected to FAIL on a bare-metal GPU host whose device group is not the
   # hard-coded default. The diagnosis promises one command and its matching fix
-  # previews another. This is distinct from scenario 9: even after the verify
+  # previews another. This is distinct from scenario 13: even after the verify
   # text agrees, the actual change must agree too.
   @id:diagnose-and-fix-agree-on-the-remedy-command @requires-gpu @requires-bare-metal @requires-os:linux
-  Scenario: 11 - Diagnosing a problem and previewing its fix agree on the remedy command
+  Scenario: 15 - Diagnosing a problem and previewing its fix agree on the remedy command
     Given the GPU device belongs to a recognised non-default group
     When the user compares the diagnosis with the matching fix preview
     Then both give the same command for applying the remedy
@@ -114,7 +176,7 @@ Feature: Diagnosing failures and listing fixes
   # not the outcome. A diagnosis should credit the observable access the user
   # has instead of recommending a permission repair for a usable device.
   @id:diagnose-credits-a-usable-device @requires-gpu @requires-bare-metal @requires-os:linux
-  Scenario: 12 - A usable GPU device is not diagnosed as a permission failure
+  Scenario: 16 - A usable GPU device is not diagnosed as a permission failure
     Given the user can already read and write the GPU device
     When the user asks the CLI to diagnose the machine
     Then adding the user to a device group is not the leading remedy

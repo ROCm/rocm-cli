@@ -38,8 +38,7 @@ async fn setup_active_runtime(world: &mut E2eWorld) {
     world.use_shared_runtimes();
     let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     if stdout.contains("installed: none") {
-        let (install_out, _, rc) = crate::run_rocm(world, &["install", "sdk"]);
-        assert!(rc == 0, "rocm install sdk failed (rc={rc}):\n{install_out}");
+        crate::run_rocm_ok(world, &["install", "sdk"]);
     }
     let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     assert!(
@@ -50,8 +49,7 @@ async fn setup_active_runtime(world: &mut E2eWorld) {
 
 #[when("the user installs the SDK")]
 async fn user_installs_sdk(world: &mut E2eWorld) {
-    let (stdout, _, rc) = crate::run_rocm(world, &["install", "sdk"]);
-    assert!(rc == 0, "rocm install sdk failed (rc={rc}):\n{stdout}");
+    let stdout = crate::run_rocm_ok(world, &["install", "sdk"]);
     world.cli_output = Some(stdout);
 }
 

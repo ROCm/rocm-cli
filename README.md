@@ -302,7 +302,25 @@ rocm serve <model> [--engine lemonade|vllm]
                    [--verbose] [--foreground | --managed]
                    [--no-smoke-test]
                    [--allow-public-bind]
+                   [--temperature TEMP] [--top-p PROB] [--max-tokens N]
 ```
+
+`--temperature` (>= 0.0), `--top-p` (0.0-1.0), and `--max-tokens` (> 0) set
+server-wide sampling defaults for the launched engine. They apply only to
+`vllm` and `lemonade`; other engines reject them. For vLLM they are folded
+into a single `--override-generation-config` JSON object (`--max-tokens` maps
+to vLLM's `max_new_tokens`); for Lemonade they pass straight through as
+llama.cpp's `--temperature`, `--top-p`, and `--n-predict` flags. Each control
+is optional and independent — omit any of them to keep the engine's own
+default.
+
+`rocm serve` only reuses an already-running service for the same engine and
+model if its sampling controls (and other recipe settings) match the ones
+requested this time; otherwise it errors out instead of silently serving with
+different settings. If you previously started a service with `--temperature`
+(or another sampling flag) and now run `rocm serve` for the same model without
+flags — or with different ones — stop the existing service first (`rocm
+services stop`) or match the original flags.
 
 By default the server runs in the background under rocm-cli's supervision and
 prints a deployment summary — a progress indicator while it starts, then a table
@@ -392,10 +410,13 @@ and a chat tab backed by any configured provider. See
 
 ```
 rocm chat [--provider anthropic|openai|...] [--model NAME] [--prompt TEXT] [--tools]
+          [--temperature TEMP] [--top-p PROB] [--max-tokens N]
 ```
 
 Chat with an AI provider from the terminal. Reads from stdin when `--prompt` is
-omitted.
+omitted. `--temperature`, `--top-p`, and `--max-tokens` are optional sampling
+controls forwarded to the request; each is independent, so omit any of them to
+use the provider's default.
 
 ### ComfyUI
 

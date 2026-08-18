@@ -18,6 +18,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 flate2 = "1"
+libc.workspace = true
 rocm-core = { path = "../../crates/rocm-core" }
 rocm-deps = { path = "../../crates/rocm-deps" }
 rocm-engine-protocol = { path = "../../crates/rocm-engine-protocol" }

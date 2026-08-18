@@ -30,6 +30,56 @@ const PREVIEW_FIX_ID: &str = "fix-1-arch";
 /// found". This one needs only `--device-index`, which the scenario supplies.
 const MUTATING_FIX_ID: &str = "fix-9-igpu-dgpu";
 
+/// Every fix-id in the closed catalog, in the order `rocm fix` lists them.
+///
+/// A duplicate of the catalog, on purpose: a test that derived this list from
+/// the same source it checks could not notice a change to it.
+///
+/// The catalog is a closed list that external tooling reads and reproduces —
+/// the ids, their OS scope, and which four are auto-applicable are all part of
+/// the CLI's published contract, not private detail. Changing the catalog
+/// changes that contract, and this is the assertion that says so out loud.
+/// When it fires, update this list along with whatever documents the catalog;
+/// do not relax it.
+const CATALOG_FIX_IDS: &[&str] = &[
+    "fix-1-arch",
+    "fix-2-unset-override",
+    "fix-3-rocm-kernel",
+    "fix-4-render-group",
+    "fix-5-amdgpu-load",
+    "fix-6-path",
+    "fix-7-stale-repos",
+    "fix-8-wheel-rocm",
+    "fix-9-igpu-dgpu",
+    "fix-10-container",
+    "fix-11-iommu",
+    "fix-12-installer",
+    "fix-13-hip-sdk-missing",
+    "fix-14-adrenalin-too-old",
+    "fix-15-msvc-redist",
+];
+
+/// The fixes the CLI carries out itself. Every other entry only prints a plan.
+/// Pinned exactly: a mode quietly promoted to AUTO would begin changing
+/// machines that callers had been told it only ever advised on.
+const AUTO_APPLICABLE_FIX_IDS: &[&str] = &[
+    "fix-2-unset-override",
+    "fix-4-render-group",
+    "fix-6-path",
+    "fix-9-igpu-dgpu",
+];
+
+/// A catalog entry that cannot apply on the host running the suite, whichever
+/// host that is. Both are print-only, so the run stops at the OS gate without
+/// reaching any recipe that could touch the machine.
+const fn fix_id_for_the_other_os() -> &'static str {
+    if cfg!(windows) {
+        "fix-5-amdgpu-load" // linux-only
+    } else {
+        "fix-13-hip-sdk-missing" // windows-only
+    }
+}
+
 /// Contents planted in the scenario's own shell rc file. The assertion is that
 /// this survives the run byte for byte.
 const PLANTED_RC: &str = "# planted by the e2e suite; the fix must not touch this\n";
@@ -83,6 +133,11 @@ async fn user_chose_mutating_fix(world: &mut E2eWorld) {
     std::fs::create_dir_all(fix_home(world)).expect("failed to create the scenario's home dir");
     std::fs::write(&rc_file, PLANTED_RC).expect("failed to plant the shell rc file");
     world.model_name = Some(MUTATING_FIX_ID.to_string());
+}
+
+#[given("a user who has chosen a fix meant for a different operating system")]
+async fn user_chose_fix_for_another_os(world: &mut E2eWorld) {
+    world.model_name = Some(fix_id_for_the_other_os().to_string());
 }
 
 #[given("a user who refers to a cause by its position in the diagnosis")]
@@ -241,13 +296,225 @@ async fn assert_json_identifies_match(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no diagnose output");
     let report: serde_json::Value =
         serde_json::from_str(output).expect("diagnose --json did not emit valid JSON");
+    // NOT `matched` being non-empty: that list also carries entries scoring too
+    // low to act on, so its size does not answer "was a cause established?".
+    // `has_match` is the field that does, and it is what a caller must read.
+    assert_eq!(
+        report.get("has_match").and_then(serde_json::Value::as_bool),
+        Some(true),
+        "a known symptom must be reported as an established cause:\n{output}"
+    );
+    let top = report
+        .get("matched")
+        .and_then(|m| m.as_array())
+        .and_then(|m| m.first())
+        .expect("a report with a match must name it");
+    // A cause the caller cannot act on is not actionable: it needs an id to
+    // refer to and a fix-id to hand to `rocm fix`.
+    assert!(
+        top.get("id").and_then(serde_json::Value::as_str).is_some(),
+        "the matched cause must carry an id:\n{output}"
+    );
+    assert!(
+        top.pointer("/fix/fix_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "the matched cause must name the fix that applies it:\n{output}"
+    );
+}
+
+/// Hold the report to its own arithmetic: `has_match` is true exactly when some
+/// cause cleared the threshold the report itself declares. Returns the ids that
+/// cleared it.
+///
+/// This is the assertion that survives on any host. Pinning a specific verdict
+/// would make the scenario a test of the runner's health — a CI box with a
+/// genuine fault of its own (a blacklisted amdgpu, a user outside the render
+/// group) produces real causes whatever symptom was passed. Self-consistency
+/// holds regardless, and it is exactly the property that was broken: the
+/// verdict used to be unavailable, so callers inferred it from the list length.
+fn assert_verdict_follows_scores<'a>(report: &'a serde_json::Value, output: &str) -> Vec<&'a str> {
+    let has_match = report
+        .get("has_match")
+        .and_then(serde_json::Value::as_bool)
+        .expect("diagnose JSON must state whether a cause was established");
+    // Read the threshold from the document rather than restating 50 here: the
+    // report publishes it so callers do not have to hardcode it, and a test
+    // that hardcodes it is not exercising that.
+    let threshold = report
+        .get("min_score_for_match")
+        .and_then(serde_json::Value::as_i64)
+        .expect("diagnose JSON must publish its match threshold");
+    let cleared: Vec<&str> = report
+        .get("matched")
+        .and_then(|m| m.as_array())
+        .expect("diagnose JSON has no 'matched' array")
+        .iter()
+        .filter(|d| {
+            d.get("score")
+                .and_then(serde_json::Value::as_i64)
+                .is_some_and(|s| s >= threshold)
+        })
+        .filter_map(|d| d.get("id").and_then(serde_json::Value::as_str))
+        .collect();
+    assert_eq!(
+        has_match,
+        !cleared.is_empty(),
+        "the verdict must follow the scores (threshold {threshold}); \
+         cleared={cleared:?}\n{output}"
+    );
+    cleared
+}
+
+fn parsed_diagnosis(world: &E2eWorld) -> (serde_json::Value, String) {
+    let output = world
+        .cli_output
+        .as_ref()
+        .expect("no diagnose output")
+        .clone();
+    let report = serde_json::from_str(&output).expect("diagnose --json did not emit valid JSON");
+    (report, output)
+}
+
+#[then("the result states that no cause was established")]
+async fn assert_json_states_no_match(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query)"
+    );
+    let (report, output) = parsed_diagnosis(world);
+    let cleared = assert_verdict_follows_scores(&report, &output);
+    if !cleared.is_empty() {
+        // This host has a real fault of its own, so the premise is gone. The
+        // consistency check above still ran, which is what this scenario is for.
+        return;
+    }
+    assert!(
+        !report
+            .get("has_match")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        "an unrecognised symptom on a host with no real fault must not report \
+         an established cause:\n{output}"
+    );
+}
+
+#[then("the result says whether this platform is covered")]
+async fn assert_json_states_platform_scope(world: &mut E2eWorld) {
+    let (report, output) = parsed_diagnosis(world);
+    // NOT "the key is present": `out_of_scope` is an Option with no
+    // skip_serializing_if, so serde emits it either way and its mere presence
+    // proves nothing. Cross-check the verdict against the one the host report
+    // gives for the same machine — the same trick `examine-both-forms-agree-on-gpu`
+    // uses, and the only version of this assertion that can fail on a covered
+    // host. The two are computed by different code paths off the same probe, so
+    // this is a cross-check rather than a tautology.
+    let (examine, _, rc) = crate::run_rocm(world, &["examine", "--json"]);
+    assert_eq!(rc, 0, "examine should exit 0 (it is an inspector)");
+    let host: serde_json::Value =
+        serde_json::from_str(&examine).expect("examine --json did not emit valid JSON");
+    let host_says_uncovered = host
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|status| status == "wsl");
+    let diagnosis_says_uncovered = report.get("out_of_scope").is_some_and(|v| !v.is_null());
+    assert_eq!(
+        diagnosis_says_uncovered, host_says_uncovered,
+        "the diagnosis and the host report disagree about whether this platform \
+         is covered (diagnosis={diagnosis_says_uncovered}, host={host_says_uncovered})\
+         \n{output}\n{examine}"
+    );
+}
+
+#[then("a platform that is not covered is given no diagnosis")]
+async fn assert_uncovered_platform_gets_no_diagnosis(world: &mut E2eWorld) {
+    let (report, output) = parsed_diagnosis(world);
+    let Some(reason) = report
+        .get("out_of_scope")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return; // covered platform — held to its own half by the next step
+    };
+    assert!(
+        !reason.trim().is_empty(),
+        "an out-of-scope verdict must say why:\n{output}"
+    );
+    // The whole point of routing out is to avoid emitting bare-metal findings
+    // that cannot apply. A verdict with findings attached would be worse than
+    // no verdict: the caller would act on them.
     let matched = report
         .get("matched")
         .and_then(|m| m.as_array())
         .expect("diagnose JSON has no 'matched' array");
     assert!(
-        !matched.is_empty(),
-        "expected a non-empty 'matched' array for a known symptom:\n{output}"
+        matched.is_empty(),
+        "an out-of-scope platform must be given no findings:\n{output}"
+    );
+    assert_eq!(
+        report.get("has_match").and_then(serde_json::Value::as_bool),
+        Some(false),
+        "an out-of-scope platform cannot have an established cause:\n{output}"
+    );
+}
+
+#[then("a platform that is covered gets a verdict that follows the evidence")]
+async fn assert_covered_platform_verdict_is_consistent(world: &mut E2eWorld) {
+    let (report, output) = parsed_diagnosis(world);
+    if report.get("out_of_scope").is_some_and(|v| !v.is_null()) {
+        return; // uncovered platform — held to its own half by the previous step
+    }
+    // The covered branch used to return without asserting anything, which left
+    // this scenario proving nothing at all on every lane CI actually runs (there
+    // is no WSL2 runner). This is the half that holds everywhere.
+    assert_verdict_follows_scores(&report, &output);
+}
+
+#[then("the CLI declines because the fix does not apply to this machine")]
+async fn assert_inapplicable_fix_declined(world: &mut E2eWorld) {
+    // 3 is its own outcome: not a usage error (2), not a failed attempt (4),
+    // not a refusal by the user (5). A caller that cannot tell them apart
+    // reports a broken machine when the truth is "wrong operating system".
+    assert_eq!(
+        world.cli_rc,
+        Some(3),
+        "a fix that does not apply here should exit 3, distinct from 2/4/5"
+    );
+    let output = world.cli_output.as_ref().expect("no fix output");
+    assert!(
+        output.contains("This fix only applies on:"),
+        "the refusal must say which platforms the fix is for:\n{output}"
+    );
+}
+
+#[then("every fix the catalog documents is listed")]
+async fn assert_catalog_complete(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix list output");
+    let missing: Vec<_> = CATALOG_FIX_IDS
+        .iter()
+        .filter(|id| !output.contains(**id))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the listing is missing {missing:?}. If the catalog gained or lost a \
+         failure mode, update CATALOG_FIX_IDS here and whatever else documents \
+         the catalog — do not loosen this assertion:\n{output}"
+    );
+}
+
+#[then("only the fixes the CLI can carry out itself are marked as such")]
+async fn assert_auto_set_is_exact(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix list output");
+    let marked_auto: Vec<&str> = output
+        .lines()
+        .filter(|line| line.contains("[      AUTO]"))
+        .filter_map(|line| CATALOG_FIX_IDS.iter().copied().find(|id| line.contains(id)))
+        .collect();
+    // Exact, not "at least": a mode quietly promoted to AUTO would start
+    // changing machines that callers were told it only ever advised.
+    assert_eq!(
+        marked_auto, AUTO_APPLICABLE_FIX_IDS,
+        "the set of fixes the CLI applies itself has changed:\n{output}"
     );
 }
 

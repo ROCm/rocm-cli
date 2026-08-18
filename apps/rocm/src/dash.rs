@@ -26,6 +26,7 @@ use rocm_dash_tui::ui::launcher::LauncherChoice;
 use rocm_dash_tui::ui::model_picker::ModelRecipeSummary;
 use rocm_dash_tui::ui::runtime_manager::RuntimeSummary;
 
+use crate::ChatInferenceParams;
 use crate::therock;
 
 /// Build the telemetry-daemon options from the unified dashboard config.
@@ -192,6 +193,9 @@ pub fn resolved_args(
         chat_url: t.chat_url.clone(),
         chat_model: t.chat_model.clone(),
         chat_auth_header: t.chat_auth_header.clone(),
+        chat_temperature: t.chat_temperature,
+        chat_top_p: t.chat_top_p,
+        chat_max_tokens: t.chat_max_tokens,
         chat_env_url: std::env::var("OPENAI_BASE_URL")
             .ok()
             .filter(|v| !v.is_empty()),
@@ -358,7 +362,7 @@ pub fn run_launcher(chat_mock: bool) -> Result<()> {
             None => return Ok(()),
             Some(choice) => match launcher_route(choice) {
                 LauncherRoute::Focused(focus) => run_focused(focus)?,
-                LauncherRoute::Chat => run_chat(chat_mock)?,
+                LauncherRoute::Chat => run_chat(chat_mock, ChatInferenceParams::default())?,
                 LauncherRoute::Dashboard => run(None, false, chat_mock)?,
             },
         }
@@ -383,13 +387,25 @@ pub fn run_focused(focus: Focus) -> Result<()> {
 
 /// Entry point for interactive `rocm chat`. Opens the unified dashboard with the
 /// Chat tab focused. Thin wrapper over the same runtime/`run_async` path as
-/// [`run`]; no replay/demo, embedded daemon as usual.
-pub fn run_chat(chat_mock: bool) -> Result<()> {
+/// [`run`]; no replay/demo, embedded daemon as usual. `inference` carries the
+/// `--temperature`/`--top-p`/`--max-tokens` CLI flags, which override any
+/// values configured under `[dashboard.tui]`.
+pub fn run_chat(chat_mock: bool, inference: ChatInferenceParams) -> Result<()> {
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths)?;
     // See `run`: resolve args (incl. the keyring lookup) before the runtime so the
     // secure-store `zbus::blocking` path never runs on a runtime worker thread.
-    let args = resolved_args(&config, &paths, ActiveTab::Chat);
+    let mut args = resolved_args(&config, &paths, ActiveTab::Chat);
+    // CLI flags win over the persisted `[dashboard.tui]` chat_* values.
+    if let Some(t) = inference.temperature {
+        args.chat_temperature = Some(t);
+    }
+    if let Some(p) = inference.top_p {
+        args.chat_top_p = Some(p);
+    }
+    if let Some(m) = inference.max_tokens {
+        args.chat_max_tokens = Some(m);
+    }
     let rt = build_dashboard_runtime()?;
     rt.block_on(run_async(config, paths, args, None, chat_mock))
 }

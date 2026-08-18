@@ -21,7 +21,7 @@
 #
 # Condition predicate grammar (deliberately tiny):
 #   [[<scenario-id>]]                 one table per condition (arrays = OR)
-#   when = { effective_engine = "vllm", os = "linux", is_wsl = false }
+#   when = { effective_engine = "vllm", os = "linux", has_amd_gpu = true }
 #                                     all present keys must match (AND)
 #   bug = "EAI-NNNN"                  ticket reference (shown in the report)
 #   reason = "..."                    human explanation (shown in the report)
@@ -113,7 +113,7 @@ serve_timeout_secs = 90
 # scenario now also runs on the no-GPU mock lane (backed by MockServer, not a
 # real lemonade serve), where EAI-7423 does not apply and it must expect-pass.
 [["chat-tool-definitions-accepted"]]
-when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*" }
+when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*", has_amd_gpu = true }
 bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so the chat request never reaches a live model."
 serve_timeout_secs = 90
@@ -130,7 +130,7 @@ flaky = true
 # a REAL GPU host: the scenario also runs on the no-GPU mock lane (MockServer, not
 # a real lemonade serve), where EAI-7423 does not apply and it must expect-pass.
 [["chat-end-to-end-local-model"]]
-when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*" }
+when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*", has_amd_gpu = true }
 bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so the chat request never reaches a live model."
 serve_timeout_secs = 90
@@ -157,7 +157,7 @@ reason = "Managed runtime path nests recursively (runtimes/wheel/...) on re-prov
 # MockServer-backed bench scenarios run unxfail'd on every lane, including this
 # one, and they are what pin the request path and the failure reporting.
 [["bench-load-real-serve"]]
-when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*" }
+when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*", has_amd_gpu = true }
 bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so the benchmark never reaches a live model."
 serve_timeout_secs = 90
@@ -340,3 +340,19 @@ serve_timeout_secs = 120
 # scenario would pass vacuously — worse than no scenario, because it would read
 # as coverage. They were reproduced by hand on the pod (ubuntu 24.04) and stay
 # on their tickets until a lane can run Lemonade.
+
+# --- EAI-7998: `examine --json` disagrees with the human report about the GPU.
+# On WSL2 the JSON contradicts ITSELF: `has_amd_gpu: false` and `gpus: []`
+# alongside a summary carrying `detected_gfx_target: gfx1151`. The driver/GPU
+# probes are routed out on WSL because they read KFD and DRM, neither of which
+# exists there, while the summary reads the target from the Windows-side driver.
+#
+# Scoped to WSL hosts whose human report actually names a gfx target: without
+# one both forms correctly report no GPU, so xfail would turn agreement into a
+# stale XPASS. The ticket also records the same disagreement on MI300X,
+# second-hand from the comment in capability.rs; if that is confirmed the row
+# should widen rather than gain a sibling. Remove it when the two forms agree. ---
+[["examine-both-forms-agree-on-gpu"]]
+when = { is_wsl = true, therock_family = "gfx*" }
+bug = "EAI-7998"
+reason = "`examine --json` reports has_amd_gpu:false on a WSL2 host whose own summary names a gfx target."

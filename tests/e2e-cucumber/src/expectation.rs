@@ -27,6 +27,7 @@ const REQUIRES_OS_PREFIX: &str = "requires-os:";
 const REQUIRES_GPU_TAG: &str = "requires-gpu";
 const REQUIRES_NO_GPU_TAG: &str = "requires-no-gpu";
 const REQUIRES_BARE_METAL_TAG: &str = "requires-bare-metal";
+const REQUIRES_WSL_TAG: &str = "requires-wsl";
 const SERVE_TIMEOUT_PREFIX: &str = "serve-timeout:";
 const NIGHTLY_TAG: &str = "nightly";
 const LIFECYCLE_TAG: &str = "lifecycle";
@@ -77,6 +78,10 @@ pub struct ScenarioDecl {
     /// `@requires-os:linux` cannot express this — WSL2 reports an os_family of
     /// `linux`, so it matches.
     pub requires_bare_metal: bool,
+    /// `@requires-wsl`: the exact inverse — the scenario's premise IS a WSL2
+    /// host, so it is skipped on native Linux, native Windows and everything
+    /// else. Same reason `@requires-os:linux` cannot stand in for it.
+    pub requires_wsl: bool,
     /// Engine the scenario pins via `@requires-engine:<e>` (if any).
     pub requires_engine: Option<String>,
     /// OS the scenario requires via `@requires-os:<os>` (e.g. "linux"), if any —
@@ -114,6 +119,7 @@ impl ScenarioDecl {
         let mut requires_gpu = false;
         let mut requires_no_gpu = false;
         let mut requires_bare_metal = false;
+        let mut requires_wsl = false;
         let mut requires_engine = None;
         let mut requires_os = None;
         let mut serve_timeout_secs = None;
@@ -139,6 +145,8 @@ impl ScenarioDecl {
                 requires_no_gpu = true;
             } else if tag == REQUIRES_BARE_METAL_TAG {
                 requires_bare_metal = true;
+            } else if tag == REQUIRES_WSL_TAG {
+                requires_wsl = true;
             } else if tag == NIGHTLY_TAG {
                 nightly = true;
             } else if tag == LIFECYCLE_TAG {
@@ -152,6 +160,7 @@ impl ScenarioDecl {
             requires_gpu,
             requires_no_gpu,
             requires_bare_metal,
+            requires_wsl,
             requires_engine,
             requires_os,
             serve_timeout_secs,
@@ -188,6 +197,8 @@ pub struct Condition {
     #[serde(default)]
     pub therock_family: Option<String>,
     #[serde(default)]
+    pub has_amd_gpu: Option<bool>,
+    #[serde(default)]
     pub is_wsl: Option<bool>,
 }
 
@@ -209,6 +220,11 @@ impl Condition {
             if !glob_match(fam, host_fam) {
                 return false;
             }
+        }
+        if let Some(has_gpu) = self.has_amd_gpu
+            && has_gpu != cap.has_amd_gpu
+        {
+            return false;
         }
         if let Some(w) = self.is_wsl
             && w != cap.is_wsl
@@ -399,6 +415,11 @@ pub fn resolve(
             reason: "requires a bare-metal host; this one is WSL2".to_owned(),
         };
     }
+    if decl.requires_wsl && !cap.is_wsl {
+        return Expectation::Skip {
+            reason: "requires WSL; this host is not running under WSL".to_owned(),
+        };
+    }
     if let Some(os) = &decl.requires_os
         && !os.eq_ignore_ascii_case(&cap.os_family)
     {
@@ -503,10 +524,10 @@ mod tests {
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo".into(),
             },
-            // A WSL2 dev box: `os_family` is `linux` and a GPU is visible through
-            // /dev/dxg, so nothing but `is_wsl` distinguishes it from bare metal.
-            // That is precisely why `@requires-os:linux` cannot stand in for
-            // `@requires-bare-metal`.
+            // A WSL2 dev box with the ROCm passthrough in place: `os_family` is
+            // `linux` and a GPU is usable, so nothing but `is_wsl` distinguishes
+            // it from bare metal. That is precisely why `@requires-os:linux`
+            // cannot stand in for `@requires-bare-metal`.
             "wsl2" => HostCapability {
                 os_family: "linux".into(),
                 is_wsl: true,
@@ -514,7 +535,30 @@ mod tests {
                 has_amd_gpu: true,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
-                platform_slug: "wsl2".into(),
+                platform_slug: "strix-halo-wsl".into(),
+            },
+            // The same box without the passthrough: the gfx target is reported
+            // by the Windows-side driver but ROCm cannot reach it, so the probe
+            // resolves no usable GPU (see `capability::host_has_usable_gpu`).
+            "wsl" => HostCapability {
+                os_family: "linux".into(),
+                is_wsl: true,
+                gfx_target: None,
+                has_amd_gpu: false,
+                available_engines: vec!["lemonade".into(), "vllm".into()],
+                effective_serve_engine: "lemonade".into(),
+                platform_slug: "wsl".into(),
+            },
+            // The hosted WSL runner before the ROCm passthrough is complete:
+            // Windows still reports the gfx target, but the CLI cannot use it.
+            "wsl-no-passthrough" => HostCapability {
+                os_family: "linux".into(),
+                is_wsl: true,
+                gfx_target: Some("gfx1151".into()),
+                has_amd_gpu: false,
+                available_engines: vec!["lemonade".into(), "vllm".into()],
+                effective_serve_engine: "lemonade".into(),
+                platform_slug: "strix-halo-wsl".into(),
             },
             _ => HostCapability {
                 os_family: "other".into(),
@@ -737,10 +781,12 @@ serve_timeout_secs = 90
     fn requires_bare_metal_skips_on_wsl_and_runs_everywhere_else() {
         let m = Expectations::default();
         let d = decl(&["id:diagnose-matches-known-symptom", "requires-bare-metal"]);
-        assert!(matches!(
-            resolve(&d, &cap("wsl2"), &m, false, false, false),
-            Expectation::Skip { .. }
-        ));
+        for wsl in ["wsl2", "wsl"] {
+            assert!(matches!(
+                resolve(&d, &cap(wsl), &m, false, false, false),
+                Expectation::Skip { .. }
+            ));
+        }
         // Bare-metal hosts of every shape still run it — including the mock lane,
         // which is where these scenarios earn their keep as a required check.
         for host in ["mock", "mi300x", "strix-ubuntu", "strix-windows"] {
@@ -749,6 +795,27 @@ serve_timeout_secs = 90
                 Expectation::ExpectPass,
                 "{host} is bare metal and must still run the scenario"
             );
+        }
+    }
+
+    /// The exact inverse of the tag above: proving both directions keeps the
+    /// pair from silently collapsing into one predicate.
+    #[test]
+    fn requires_wsl_runs_only_on_wsl_hosts() {
+        let m = Expectations::default();
+        let d = decl(&["id:examine-detects-wsl", "requires-wsl"]);
+        assert!(d.requires_wsl);
+        for wsl in ["wsl", "wsl2"] {
+            assert_eq!(
+                resolve(&d, &cap(wsl), &m, false, false, false),
+                Expectation::ExpectPass
+            );
+        }
+        for platform in ["mock", "mi300x", "strix-ubuntu", "strix-windows"] {
+            assert!(matches!(
+                resolve(&d, &cap(platform), &m, false, false, false),
+                Expectation::Skip { .. }
+            ));
         }
     }
 
@@ -945,6 +1012,42 @@ reason = "vLLM readiness gap"
         ));
         // No entry at all → expect-pass.
         assert!(!m.is_xfail("nope", &cap("mi300x"), "vllm"));
+    }
+
+    #[test]
+    fn gpu_bug_condition_does_not_match_an_unusable_wsl_gpu() {
+        let m = Expectations::parse(
+            r#"
+[["chat-end-to-end-local-model"]]
+when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*", has_amd_gpu = true }
+bug = "EAI-7423"
+reason = "Applies only when the scenario uses a real Lemonade GPU serve."
+flaky = true
+"#,
+        )
+        .unwrap();
+
+        assert!(m.is_xfail(
+            "chat-end-to-end-local-model",
+            &cap("strix-ubuntu"),
+            "lemonade"
+        ));
+        assert!(!m.is_xfail(
+            "chat-end-to-end-local-model",
+            &cap("wsl-no-passthrough"),
+            "lemonade"
+        ));
+    }
+
+    #[test]
+    fn gpu_report_disagreement_xfail_requires_a_reported_gfx_target() {
+        let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        assert!(m.is_xfail(
+            "examine-both-forms-agree-on-gpu",
+            &cap("wsl-no-passthrough"),
+            "lemonade"
+        ));
+        assert!(!m.is_xfail("examine-both-forms-agree-on-gpu", &cap("wsl"), "lemonade"));
     }
 
     #[test]

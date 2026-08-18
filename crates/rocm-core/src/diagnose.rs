@@ -59,7 +59,26 @@ pub struct Route {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnoseReport {
     /// All nonzero-score diagnoses, highest score first.
+    ///
+    /// Every checker that fired at all lands here, including ones scoring below
+    /// [`MIN_SCORE_FOR_MATCH`] — so a non-empty `matched` does NOT mean a cause
+    /// was established. Read [`DiagnoseReport::has_match`] for that.
     pub matched: Vec<Diagnosis>,
+    /// Whether any entry in `matched` cleared [`MIN_SCORE_FOR_MATCH`].
+    ///
+    /// Serialized because a JSON consumer cannot otherwise tell a real cause
+    /// from a weak signal, and the obvious substitute — "is `matched` empty?" —
+    /// is wrong. Several checkers open with a nonzero base score for a
+    /// situation that is merely *potentially* relevant (being in a container,
+    /// having an APU alongside a discrete GPU), so a perfectly healthy host
+    /// produces a non-empty `matched` full of sub-threshold entries. A caller
+    /// gating on emptiness proposes a fix for a machine with nothing wrong, and
+    /// never routes the user to `route_when_no_match`.
+    ///
+    /// Computed at construction; [`DiagnoseReport::has_match`] recomputes from
+    /// `matched` and stays the authority for Rust callers.
+    #[serde(default)]
+    pub has_match: bool,
     pub min_score_for_match: i32,
     pub high_confidence_threshold: i32,
     pub route_when_no_match: Route,
@@ -70,11 +89,19 @@ pub struct DiagnoseReport {
     pub out_of_scope: Option<String>,
 }
 
+/// Whether any diagnosis cleared [`MIN_SCORE_FOR_MATCH`].
+///
+/// One place the rule is written, so the serialized `has_match` field and the
+/// [`DiagnoseReport::has_match`] accessor cannot answer differently.
+fn any_cleared_threshold(matched: &[Diagnosis]) -> bool {
+    matched.iter().any(|d| d.score >= MIN_SCORE_FOR_MATCH)
+}
+
 impl DiagnoseReport {
     /// Whether at least one diagnosis cleared [`MIN_SCORE_FOR_MATCH`].
     #[must_use]
     pub fn has_match(&self) -> bool {
-        self.matched.iter().any(|d| d.score >= MIN_SCORE_FOR_MATCH)
+        any_cleared_threshold(&self.matched)
     }
 }
 
@@ -1310,6 +1337,7 @@ pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
         run_all_checks(e, symptom)
     };
     DiagnoseReport {
+        has_match: any_cleared_threshold(&matched),
         matched,
         min_score_for_match: MIN_SCORE_FOR_MATCH,
         high_confidence_threshold: HIGH_CONFIDENCE,
@@ -1741,6 +1769,91 @@ mod tests {
     }
 
     #[test]
+    fn a_healthy_container_reports_no_match_despite_a_nonempty_list() {
+        // The case `has_match` exists for. `check_10_container_devices` opens at
+        // 25 for merely being in a container, before it has looked at anything,
+        // and this fixture adds the 20 for no visible render device (a probe
+        // that found nothing, not a device that is missing) -- 45, short of the
+        // threshold and still in `matched`. A caller reading "is `matched`
+        // empty?" as "did anything match?" would propose re-launching a
+        // container over what is only a thin probe, and would never route the
+        // user upstream.
+        let mut e = linux_base();
+        e.in_container = true;
+        e.container_kind = "docker".to_owned();
+        let report = diagnose(&e, "");
+
+        assert!(
+            !report.matched.is_empty(),
+            "fixture must produce an entry for this test to mean anything"
+        );
+        assert!(
+            report.matched.iter().all(|d| d.score < MIN_SCORE_FOR_MATCH),
+            "fixture must stay below the threshold; got {:?}",
+            report
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !report.has_match,
+            "a list of sub-threshold entries is not a match"
+        );
+    }
+
+    #[test]
+    fn the_serialized_verdict_agrees_with_the_accessor() {
+        // Rust callers read the method, tooling reads the field. They answer the
+        // same question, so a host where they disagree would hand the two
+        // audiences different verdicts.
+        let mut in_container = linux_base();
+        in_container.in_container = true;
+        let mut render_group_missing = linux_base();
+        render_group_missing.in_render_group = Some(false);
+        render_group_missing.in_video_group = Some(false);
+
+        // The fixtures above all land BELOW the threshold, so on their own they
+        // would only ever exercise the `false` branch -- and a field that is
+        // always false serializes correctly by accident. The last one carries a
+        // symptom that pushes the same finding past HIGH_CONFIDENCE, so `true`
+        // reaches the wire here too and not only on a bare-metal e2e lane.
+        let mut real_fault = linux_base();
+        real_fault.in_render_group = Some(false);
+
+        let cases = [
+            (linux_base(), ""),
+            (in_container, ""),
+            (render_group_missing, ""),
+            (real_fault, "RuntimeError: unable to open /dev/kfd"),
+        ];
+        assert!(
+            cases
+                .iter()
+                .any(|(e, symptom)| diagnose(e, symptom).has_match),
+            "at least one fixture must clear the threshold, or this only ever \
+             proves the false branch"
+        );
+
+        for (e, symptom) in cases {
+            let report = diagnose(&e, symptom);
+            assert_eq!(
+                report.has_match,
+                report.has_match(),
+                "field and accessor disagree for {:?}",
+                report.matched.iter().map(|d| &d.id).collect::<Vec<_>>()
+            );
+            let json: serde_json::Value =
+                serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+            assert_eq!(
+                json.get("has_match").and_then(serde_json::Value::as_bool),
+                Some(report.has_match),
+                "the verdict must survive into the emitted document"
+            );
+        }
+    }
+
+    #[test]
     fn no_match_default_route_is_rocm_core() {
         let e = linux_base();
         let report = diagnose(&e, "");
@@ -1818,6 +1931,7 @@ mod tests {
         let v = serde_json::to_value(&report).unwrap();
         for key in [
             "matched",
+            "has_match",
             "min_score_for_match",
             "high_confidence_threshold",
             "route_when_no_match",

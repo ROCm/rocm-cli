@@ -19,9 +19,10 @@ use rocm_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
@@ -163,7 +164,7 @@ struct CachedHttpText {
     text: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 struct CachedHttpMetadata {
     url: String,
     #[serde(default)]
@@ -175,11 +176,19 @@ struct CachedHttpMetadata {
     fetched_at_unix_ms: u128,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 struct CachedHttpSignatureMetadata {
     url: String,
     verified_at_unix_ms: u128,
     public_key_source: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct CachedHttpCacheEntry {
+    metadata: CachedHttpMetadata,
+    body: String,
+    #[serde(default)]
+    signature_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1843,14 +1852,9 @@ fn with_metadata_public_key<T>(
         return verify(public_key_path, "path").map(Some);
     }
     if let Some(public_key_pem) = &policy.public_key_pem {
-        let parent = temp_key_path
-            .parent()
-            .context("metadata public key temp path has no parent directory")?;
-        fs::create_dir_all(parent)?;
-        fs::write(temp_key_path, public_key_pem)
-            .with_context(|| format!("failed to write {}", temp_key_path.display()))?;
-        let result = verify(temp_key_path, "env-pem");
-        let _ = fs::remove_file(temp_key_path);
+        let staged_key = stage_file_for_atomic_publish(temp_key_path, public_key_pem.as_bytes())?;
+        let result = verify(&staged_key, "env-pem");
+        let _ = fs::remove_file(staged_key);
         return result.map(Some);
     }
     bail!(
@@ -1869,29 +1873,39 @@ fn metadata_signature_path(body_path: &Path) -> PathBuf {
 fn fetch_and_verify_metadata_signature(
     policy: &MetadataSignaturePolicy,
     url: &str,
-    payload_path: &Path,
-    signature_path: &Path,
+    payload: &[u8],
     temp_key_path: &Path,
     max_time_secs: Option<u64>,
-) -> Result<Option<CachedHttpSignatureMetadata>> {
+) -> Result<Option<(CachedHttpSignatureMetadata, Vec<u8>)>> {
     if !policy.active() {
         return Ok(None);
     }
     let signature_url = metadata_signature_url(url);
-    download_signature_file(&signature_url, signature_path, max_time_secs)?;
+    let response = http_get(&signature_url, &[], max_time_secs)?;
+    if response.status != 200 {
+        bail!(
+            "HTTP {} while fetching metadata signature {signature_url}",
+            response.status
+        );
+    }
+    let signature = response.body;
     let public_key_source =
         with_metadata_public_key(policy, temp_key_path, |public_key, source| {
-            verify_metadata_signature(payload_path, signature_path, public_key)?;
+            verify_metadata_signature_bytes(payload, &signature, public_key)?;
             Ok(source.to_owned())
         })?
         .context("metadata signature policy was active but no public key was resolved")?;
-    Ok(Some(CachedHttpSignatureMetadata {
-        url: signature_url,
-        verified_at_unix_ms: unix_time_millis(),
-        public_key_source,
-    }))
+    Ok(Some((
+        CachedHttpSignatureMetadata {
+            url: signature_url,
+            verified_at_unix_ms: unix_time_millis(),
+            public_key_source,
+        },
+        signature,
+    )))
 }
 
+#[cfg(test)]
 fn verify_cached_metadata_signature(
     policy: &MetadataSignaturePolicy,
     payload_path: &Path,
@@ -1913,27 +1927,7 @@ fn verify_cached_metadata_signature(
     Ok(())
 }
 
-fn download_signature_file(
-    url: &str,
-    destination: &Path,
-    max_time_secs: Option<u64>,
-) -> Result<()> {
-    let parent = destination
-        .parent()
-        .context("metadata signature destination has no parent directory")?;
-    fs::create_dir_all(parent)?;
-    let response = http_get(url, &[], max_time_secs)?;
-    if response.status != 200 {
-        let _ = fs::remove_file(destination);
-        bail!(
-            "HTTP {} while fetching metadata signature {url}",
-            response.status
-        );
-    }
-    write_file_atomically(destination, &response.body)?;
-    Ok(())
-}
-
+#[cfg(test)]
 fn verify_metadata_signature(
     payload_path: &Path,
     signature_path: &Path,
@@ -1960,12 +1954,105 @@ fn verify_metadata_signature(
     verify_rsa_pkcs1_sha256_signature(&public_key_pem, &payload, &signature, "metadata")
 }
 
+fn verify_metadata_signature_bytes(
+    payload: &[u8],
+    signature: &[u8],
+    public_key_path: &Path,
+) -> Result<()> {
+    let public_key_pem = fs::read_to_string(public_key_path).with_context(|| {
+        format!(
+            "failed to read metadata public key: {}",
+            public_key_path.display()
+        )
+    })?;
+    verify_rsa_pkcs1_sha256_signature(&public_key_pem, payload, signature, "metadata")
+}
+
+#[cfg(test)]
 fn metadata_cache_can_revalidate(
     metadata: &CachedHttpMetadata,
     policy: &MetadataSignaturePolicy,
     signature_path: &Path,
 ) -> bool {
     !policy.active() || (metadata.signature.is_some() && signature_path.is_file())
+}
+
+fn load_cached_http_entry(
+    metadata_path: &Path,
+    legacy_body_path: &Path,
+    legacy_signature_path: &Path,
+) -> Option<CachedHttpCacheEntry> {
+    let bytes = fs::read(metadata_path).ok()?;
+    if let Ok(entry) = serde_json::from_slice(&bytes) {
+        return Some(entry);
+    }
+
+    let metadata: CachedHttpMetadata = serde_json::from_slice(&bytes).ok()?;
+    let body = fs::read_to_string(legacy_body_path).ok()?;
+    let signature_bytes = metadata
+        .signature
+        .as_ref()
+        .map(|_| fs::read(legacy_signature_path))
+        .transpose()
+        .ok()?;
+    Some(CachedHttpCacheEntry {
+        metadata,
+        body,
+        signature_bytes,
+    })
+}
+
+const fn cached_http_entry_can_revalidate(
+    entry: &CachedHttpCacheEntry,
+    policy: &MetadataSignaturePolicy,
+) -> bool {
+    !policy.active() || (entry.metadata.signature.is_some() && entry.signature_bytes.is_some())
+}
+
+fn verify_cached_http_entry_signature(
+    policy: &MetadataSignaturePolicy,
+    entry: &CachedHttpCacheEntry,
+    temp_key_path: &Path,
+) -> Result<()> {
+    if !policy.active() {
+        return Ok(());
+    }
+    let signature = entry.signature_bytes.as_deref().context(
+        "metadata signature verification requested but cached signature bytes are missing",
+    )?;
+    with_metadata_public_key(policy, temp_key_path, |public_key, _source| {
+        verify_metadata_signature_bytes(entry.body.as_bytes(), signature, public_key)
+    })?;
+    Ok(())
+}
+
+fn write_cached_http_entry(path: &Path, entry: &CachedHttpCacheEntry) -> Result<()> {
+    write_file_atomically(
+        path,
+        &serde_json::to_vec_pretty(entry).context("failed to serialize metadata cache entry")?,
+    )
+}
+
+#[cfg(test)]
+fn write_cached_http_entry_with<S, P, F>(
+    path: &Path,
+    entry: &CachedHttpCacheEntry,
+    suffix_for_attempt: S,
+    before_publish: P,
+    publish: F,
+) -> Result<()>
+where
+    S: FnMut(u32) -> OsString,
+    P: FnOnce(),
+    F: FnOnce(&Path, &Path) -> io::Result<()>,
+{
+    write_file_atomically_with_publish(
+        path,
+        &serde_json::to_vec_pretty(entry).context("failed to serialize metadata cache entry")?,
+        suffix_for_attempt,
+        before_publish,
+        publish,
+    )
 }
 
 fn download_text_cached(
@@ -1978,96 +2065,63 @@ fn download_text_cached(
     let signature_path = metadata_signature_path(&body_path);
     let signature_policy = MetadataSignaturePolicy::from_env();
     signature_policy.validate_configuration()?;
-    let previous_metadata = fs::read(&metadata_path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<CachedHttpMetadata>(&bytes).ok())
-        .filter(|metadata| metadata.url == url);
+    let previous_entry = load_cached_http_entry(&metadata_path, &body_path, &signature_path)
+        .filter(|entry| entry.metadata.url == url);
     let cache_dir = body_path
         .parent()
         .context("metadata cache path has no parent directory")?;
     fs::create_dir_all(cache_dir)?;
 
-    let unique = unix_time_millis();
-    let tmp_body = body_path.with_extension(format!("body.tmp-{unique}"));
-    let tmp_signature = body_path.with_extension(format!("sig.tmp-{unique}"));
-    let tmp_public_key = body_path.with_extension(format!("public-key.tmp-{unique}.pem"));
+    let tmp_public_key = body_path.with_extension("public-key.pem");
     let mut headers = Vec::new();
-    if let Some(etag) = previous_metadata
+    if let Some(etag) = previous_entry
         .as_ref()
-        .filter(|metadata| {
-            metadata_cache_can_revalidate(metadata, &signature_policy, &signature_path)
-        })
-        .and_then(|metadata| metadata.etag.as_deref())
+        .filter(|entry| cached_http_entry_can_revalidate(entry, &signature_policy))
+        .and_then(|entry| entry.metadata.etag.as_deref())
     {
         headers.push(("If-None-Match", etag));
     }
 
     let response = http_get(url, &headers, max_time_secs)?;
     if response.status == 304 {
-        let _ = fs::remove_file(&tmp_body);
-        verify_cached_metadata_signature(
-            &signature_policy,
-            &body_path,
-            &signature_path,
-            &tmp_public_key,
+        let entry = previous_entry.context(
+            "metadata cache returned 304 but no complete cached generation is available",
         )?;
-        let text = fs::read_to_string(&body_path).with_context(|| {
-            format!(
-                "metadata cache returned 304 but cached body is missing: {}",
-                body_path.display()
-            )
-        })?;
-        return Ok(CachedHttpText { text });
+        verify_cached_http_entry_signature(&signature_policy, &entry, &tmp_public_key)?;
+        return Ok(CachedHttpText { text: entry.body });
     }
     if response.status != 200 {
-        let _ = fs::remove_file(&tmp_body);
         bail!("HTTP {} while fetching {url}", response.status);
     }
 
-    write_file_atomically(&tmp_body, &response.body)?;
-    let signature_metadata = match fetch_and_verify_metadata_signature(
+    let body =
+        String::from_utf8(response.body).context("metadata response body was not valid UTF-8")?;
+    let fetched_signature = fetch_and_verify_metadata_signature(
         &signature_policy,
         url,
-        &tmp_body,
-        &tmp_signature,
+        body.as_bytes(),
         &tmp_public_key,
         max_time_secs,
-    ) {
-        Ok(signature_metadata) => signature_metadata,
-        Err(error) => {
-            let _ = fs::remove_file(&tmp_body);
-            let _ = fs::remove_file(&tmp_signature);
-            let _ = fs::remove_file(&tmp_public_key);
-            return Err(error);
-        }
-    };
+    )?;
+    let signature_metadata = fetched_signature
+        .as_ref()
+        .map(|(metadata, _)| metadata.clone());
     let metadata = CachedHttpMetadata {
         url: url.to_owned(),
         etag: http_header_value(&response.headers, "etag"),
         last_modified: http_header_value(&response.headers, "last-modified"),
-        signature: signature_metadata.clone(),
+        signature: signature_metadata,
         fetched_at_unix_ms: unix_time_millis(),
     };
-    fs::rename(&tmp_body, &body_path).or_else(|_| {
-        let _ = fs::remove_file(&body_path);
-        fs::rename(&tmp_body, &body_path)
-    })?;
-    if signature_metadata.is_some() {
-        fs::rename(&tmp_signature, &signature_path).or_else(|_| {
-            let _ = fs::remove_file(&signature_path);
-            fs::rename(&tmp_signature, &signature_path)
-        })?;
-    } else {
-        let _ = fs::remove_file(&signature_path);
-    }
-    fs::write(
-        &metadata_path,
-        serde_json::to_vec_pretty(&metadata)
-            .context("failed to serialize metadata cache record")?,
-    )?;
-    let text = fs::read_to_string(&body_path)
-        .with_context(|| format!("failed to read cached metadata {}", body_path.display()))?;
-    Ok(CachedHttpText { text })
+    let entry = CachedHttpCacheEntry {
+        metadata,
+        body,
+        signature_bytes: fetched_signature.map(|(_, signature)| signature),
+    };
+    write_cached_http_entry(&metadata_path, &entry)?;
+    let _ = fs::remove_file(&body_path);
+    let _ = fs::remove_file(&signature_path);
+    Ok(CachedHttpText { text: entry.body })
 }
 
 fn metadata_cache_paths(paths: &AppPaths, cache_key: &str) -> (PathBuf, PathBuf) {
@@ -2278,21 +2332,192 @@ fn windows_child_path(path: &Path) -> String {
     runtime_path_for_windows_child(path)
 }
 
+/// A unique temp path next to `path`, preserving the full file name so a
+/// multi-extension artifact keeps its extensions (`sdk.tar.gz` becomes
+/// `sdk.tar.gz.tmp-<id>`, where `with_extension` would drop `.gz`).
+const ATOMIC_WRITE_TEMP_ATTEMPTS: u32 = 128;
+
+fn temp_sibling_path(path: &Path, suffix: &OsStr) -> Result<PathBuf> {
+    let parent = path.parent().context("file path has no parent directory")?;
+    let mut file_name = path
+        .file_name()
+        .context("file path has no file name")?
+        .to_os_string();
+    file_name.push(".tmp-");
+    file_name.push(suffix);
+    Ok(parent.join(file_name))
+}
+
 fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temp_id = format!("{}-{}", std::process::id(), unix_time_millis());
+    write_file_atomically_with(
+        path,
+        bytes,
+        |attempt| OsString::from(format!("{temp_id}-{attempt}")),
+        || {},
+    )
+}
+
+fn write_file_atomically_with<S, P>(
+    path: &Path,
+    bytes: &[u8],
+    suffix_for_attempt: S,
+    before_publish: P,
+) -> Result<()>
+where
+    S: FnMut(u32) -> OsString,
+    P: FnOnce(),
+{
+    write_file_atomically_with_publish(
+        path,
+        bytes,
+        suffix_for_attempt,
+        before_publish,
+        publish_temp_file,
+    )
+}
+
+fn write_file_atomically_with_publish<S, P, F>(
+    path: &Path,
+    bytes: &[u8],
+    suffix_for_attempt: S,
+    before_publish: P,
+    publish: F,
+) -> Result<()>
+where
+    S: FnMut(u32) -> OsString,
+    P: FnOnce(),
+    F: FnOnce(&Path, &Path) -> io::Result<()>,
+{
+    let tmp = stage_file_for_atomic_publish_with(path, bytes, suffix_for_attempt)?;
+    before_publish();
+    publish_staged_file_with(&tmp, path, publish)
+}
+
+fn stage_file_for_atomic_publish(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    let temp_id = format!("{}-{}", std::process::id(), unix_time_millis());
+    stage_file_for_atomic_publish_with(path, bytes, |attempt| {
+        OsString::from(format!("{temp_id}-{attempt}"))
+    })
+}
+
+fn stage_file_for_atomic_publish_with<S>(
+    path: &Path,
+    bytes: &[u8],
+    mut suffix_for_attempt: S,
+) -> Result<PathBuf>
+where
+    S: FnMut(u32) -> OsString,
+{
     let parent = path.parent().context("file path has no parent directory")?;
     fs::create_dir_all(parent)?;
-    let tmp = path.with_extension(format!("tmp-{}", unix_time_millis()));
-    {
-        let mut file = fs::File::create(&tmp)
-            .with_context(|| format!("failed to create {}", tmp.display()))?;
-        file.write_all(bytes)
-            .map_err(|error| disk_space::map_write_error(error, &tmp))?;
+
+    let mut reserved = None;
+    for attempt in 0..ATOMIC_WRITE_TEMP_ATTEMPTS {
+        let suffix = suffix_for_attempt(attempt);
+        let tmp = temp_sibling_path(path, &suffix)?;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => {
+                reserved = Some((tmp, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to create {}", tmp.display()));
+            }
+        }
     }
-    fs::rename(&tmp, path).or_else(|_| {
-        let _ = fs::remove_file(path);
-        fs::rename(&tmp, path)
-    })?;
-    Ok(())
+    let Some((tmp, mut file)) = reserved else {
+        bail!(
+            "failed to reserve a temporary file next to {} after {} attempts",
+            path.display(),
+            ATOMIC_WRITE_TEMP_ATTEMPTS
+        );
+    };
+
+    if let Err(error) = file.write_all(bytes) {
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+        return Err(disk_space::map_write_error(error, &tmp));
+    }
+    drop(file);
+    Ok(tmp)
+}
+
+#[cfg(test)]
+fn publish_staged_file(tmp: &Path, path: &Path) -> Result<()> {
+    publish_staged_file_with(tmp, path, publish_temp_file)
+}
+
+fn publish_staged_file_with<F>(tmp: &Path, path: &Path, publish: F) -> Result<()>
+where
+    F: FnOnce(&Path, &Path) -> io::Result<()>,
+{
+    publish(tmp, path)
+        .inspect_err(|_| {
+            let _ = fs::remove_file(tmp);
+        })
+        .with_context(|| format!("failed to publish {}", path.display()))
+}
+
+#[cfg(not(windows))]
+fn publish_temp_file(tmp: &Path, path: &Path) -> io::Result<()> {
+    fs::rename(tmp, path)
+}
+
+#[cfg(windows)]
+fn publish_temp_file(tmp: &Path, path: &Path) -> io::Result<()> {
+    if path.try_exists()? {
+        return replace_file_windows(path, tmp);
+    }
+
+    match fs::rename(tmp, path) {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            if path.try_exists()? {
+                replace_file_windows(path, tmp)
+            } else {
+                Err(rename_error)
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn replace_file_windows(path: &Path, replacement: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+    let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let replacement_wide: Vec<u16> = replacement
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+
+    // SAFETY: both path buffers are valid, NUL-terminated UTF-16 strings and
+    // remain alive for the duration of the synchronous Windows API call. The
+    // optional backup, exclude, and reserved pointers are intentionally null.
+    let replaced = unsafe {
+        ReplaceFileW(
+            path_wide.as_ptr(),
+            replacement_wide.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if replaced == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn extract_tarball(archive_path: &Path, target_dir: &Path) -> Result<()> {
@@ -2922,9 +3147,38 @@ fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
     })
 }
 
+/// The environment inputs [`resolve_python_launcher`] reads.
+///
+/// Passed in rather than read at each use site so a caller can point the
+/// resolver somewhere else without touching the process environment. Tests need
+/// that: `cargo test` runs every test as a thread in one process, so a test that
+/// overwrote `PATH` to steer this resolver also hid every other PATH-resolved
+/// binary from unrelated tests running at the same moment.
+struct PythonResolverEnv {
+    /// `ROCM_CLI_PYTHON`: an explicit interpreter that wins over any search.
+    python_override: Option<String>,
+    /// The directories to search for an interpreter, in `PATH` order.
+    search_dirs: Vec<PathBuf>,
+}
+
+impl PythonResolverEnv {
+    fn from_process_env() -> Self {
+        Self {
+            python_override: std::env::var("ROCM_CLI_PYTHON").ok(),
+            search_dirs: std::env::var_os("PATH")
+                .map(|value| split_runtime_path(&value))
+                .unwrap_or_default(),
+        }
+    }
+}
+
 fn resolve_python_launcher(paths: &AppPaths) -> Result<PythonLauncher> {
-    if let Ok(value) = std::env::var("ROCM_CLI_PYTHON") {
-        python_launcher_install_ready(Path::new(&value))
+    resolve_python_launcher_in(paths, &PythonResolverEnv::from_process_env())
+}
+
+fn resolve_python_launcher_in(paths: &AppPaths, env: &PythonResolverEnv) -> Result<PythonLauncher> {
+    if let Some(value) = env.python_override.as_deref() {
+        python_launcher_install_ready(Path::new(value))
             .with_context(|| format!("ROCM_CLI_PYTHON is not usable for ROCm setup: {value}"))?;
         return Ok(PythonLauncher {
             executable: PathBuf::from(value),
@@ -2933,7 +3187,7 @@ fn resolve_python_launcher(paths: &AppPaths) -> Result<PythonLauncher> {
     }
 
     let mut skipped_path_python = false;
-    for candidate in python_path_candidates() {
+    for candidate in python_path_candidates(&env.search_dirs) {
         match python_launcher_install_ready(&candidate) {
             Ok(()) => {
                 return Ok(PythonLauncher {
@@ -2974,7 +3228,7 @@ fn resolve_python_launcher(paths: &AppPaths) -> Result<PythonLauncher> {
     ensure_managed_python(paths)
 }
 
-fn python_path_candidates() -> Vec<PathBuf> {
+fn python_path_candidates(search_dirs: &[PathBuf]) -> Vec<PathBuf> {
     let program_names: &[&str] = if runtime_is_windows() {
         &["python", "python3", "py"]
     } else {
@@ -2982,17 +3236,14 @@ fn python_path_candidates() -> Vec<PathBuf> {
     };
     program_names
         .iter()
-        .flat_map(|program| resolve_program_on_path(program))
+        .flat_map(|program| resolve_program_on_path(program, search_dirs))
         .collect()
 }
 
-fn resolve_program_on_path(program: &str) -> Vec<PathBuf> {
-    let Some(path_value) = std::env::var_os("PATH") else {
-        return Vec::new();
-    };
+fn resolve_program_on_path(program: &str, search_dirs: &[PathBuf]) -> Vec<PathBuf> {
     let candidates = program_path_candidates(program);
-    split_runtime_path(&path_value)
-        .into_iter()
+    search_dirs
+        .iter()
         .flat_map(|dir| candidates.iter().map(move |candidate| dir.join(candidate)))
         .filter(|path| path.is_file())
         .map(|path| normalize_runtime_path_for_host(&path))
@@ -3313,7 +3564,11 @@ fn slugify(value: &str) -> String {
 mod tests {
     use super::*;
 
-    static PYTHON_RESOLVER_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Serializes tests that replace process-global `PATH` (or other env vars) while
+    // they run. Because env is shared across all test threads, any test that spawns a
+    // bare-name binary (e.g. `tar`) via `PATH` lookup must also hold this lock, or it
+    // can fail with ENOENT while another test has temporarily narrowed `PATH`.
+    static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn tarball_space_preflight_skips_when_the_download_size_is_unknown() {
@@ -3357,6 +3612,383 @@ mod tests {
         );
         let text = format!("{error:#}");
         assert!(text.contains("ran out of disk space"), "{text}");
+    }
+
+    /// The temp name keeps every extension, so a cleanup sweep over a cache
+    /// directory can still tell what a leftover was going to be.
+    #[test]
+    fn temp_sibling_path_preserves_multi_dot_file_names() {
+        let temp = temp_sibling_path(
+            Path::new("/tmp/cache/sdk.tar.gz"),
+            std::ffi::OsStr::new("test"),
+        )
+        .unwrap();
+        let name = temp.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name, "sdk.tar.gz.tmp-test");
+        assert_eq!(temp.parent().unwrap(), Path::new("/tmp/cache"));
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_do_not_remove_a_published_destination() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-atomic-collision-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("sdk.tar.gz");
+        let before_publish = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let writers: Vec<_> = [b"first".as_slice(), b"second".as_slice()]
+            .into_iter()
+            .enumerate()
+            .map(|(writer, bytes)| {
+                let destination = destination.clone();
+                let before_publish = std::sync::Arc::clone(&before_publish);
+                std::thread::spawn(move || {
+                    write_file_atomically_with(
+                        &destination,
+                        bytes,
+                        |attempt| {
+                            if attempt == 0 {
+                                std::ffi::OsString::from("same-millisecond")
+                            } else {
+                                std::ffi::OsString::from(format!(
+                                    "same-millisecond-{writer}-{attempt}"
+                                ))
+                            }
+                        },
+                        || {
+                            before_publish.wait();
+                        },
+                    )
+                })
+            })
+            .collect();
+
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let published = fs::read(&destination).expect("a writer must remain published");
+        let _ = fs::remove_dir_all(&root);
+        assert!(published == b"first" || published == b"second");
+    }
+
+    #[test]
+    fn concurrent_cached_publications_use_distinct_staging_files() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cache-publish-collision-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("index.body");
+        let before_publish = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let writers: Vec<_> = [b"first".as_slice(), b"second".as_slice()]
+            .into_iter()
+            .map(|bytes| {
+                let destination = destination.clone();
+                let before_publish = std::sync::Arc::clone(&before_publish);
+                std::thread::spawn(move || {
+                    let staged = stage_file_for_atomic_publish(&destination, bytes)?;
+                    before_publish.wait();
+                    publish_staged_file(&staged, &destination)
+                })
+            })
+            .collect();
+
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let published = fs::read(&destination).expect("a cache writer must remain published");
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().contains(".tmp-"))
+            .collect();
+        let _ = fs::remove_dir_all(&root);
+        assert!(published == b"first" || published == b"second");
+        assert!(
+            leftovers.is_empty(),
+            "staged cache files leaked: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn failed_cached_publication_preserves_destination_and_cleans_staging_file() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cache-publish-failure-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("index.body");
+        fs::write(&destination, b"published").unwrap();
+        let staged = stage_file_for_atomic_publish(&destination, b"replacement").unwrap();
+
+        publish_staged_file_with(&staged, &destination, |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "simulated cache publication failure",
+            ))
+        })
+        .expect_err("simulated cache publication failure must be returned");
+
+        assert_eq!(fs::read(&destination).unwrap(), b"published");
+        assert!(
+            !staged.exists(),
+            "failed publication leaked its staging file"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn cached_http_entry(generation: &str) -> CachedHttpCacheEntry {
+        CachedHttpCacheEntry {
+            metadata: CachedHttpMetadata {
+                url: format!("https://example.invalid/{generation}"),
+                etag: Some(format!("etag-{generation}")),
+                last_modified: None,
+                signature: Some(CachedHttpSignatureMetadata {
+                    url: format!("https://example.invalid/{generation}.sig"),
+                    verified_at_unix_ms: 1,
+                    public_key_source: generation.to_owned(),
+                }),
+                fetched_at_unix_ms: 2,
+            },
+            body: format!("body-{generation}"),
+            signature_bytes: Some(generation.as_bytes().to_vec()),
+        }
+    }
+
+    #[test]
+    fn concurrent_cached_http_commits_publish_one_complete_generation() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cache-generation-collision-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("index.json");
+        let before_publish = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let writers: Vec<_> = ["first", "second"]
+            .into_iter()
+            .enumerate()
+            .map(|(writer, generation)| {
+                let destination = destination.clone();
+                let before_publish = std::sync::Arc::clone(&before_publish);
+                std::thread::spawn(move || {
+                    let entry = cached_http_entry(generation);
+                    write_cached_http_entry_with(
+                        &destination,
+                        &entry,
+                        |attempt| {
+                            if attempt == 0 {
+                                OsString::from("same-millisecond")
+                            } else {
+                                OsString::from(format!("same-millisecond-{writer}-{attempt}"))
+                            }
+                        },
+                        || {
+                            before_publish.wait();
+                        },
+                        publish_temp_file,
+                    )
+                })
+            })
+            .collect();
+
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let published: CachedHttpCacheEntry =
+            serde_json::from_slice(&fs::read(&destination).unwrap()).unwrap();
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().contains(".tmp-"))
+            .collect();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            published == cached_http_entry("first") || published == cached_http_entry("second"),
+            "published cache mixed generations: {published:?}"
+        );
+        assert!(leftovers.is_empty(), "cache commit leaked: {leftovers:?}");
+    }
+
+    #[test]
+    fn failed_cached_http_commit_preserves_previous_complete_generation() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cache-generation-failure-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("index.json");
+        let previous = cached_http_entry("previous");
+        write_cached_http_entry(&destination, &previous).unwrap();
+
+        write_cached_http_entry_with(
+            &destination,
+            &cached_http_entry("replacement"),
+            |attempt| OsString::from(format!("commit-failure-{attempt}")),
+            || {},
+            |tmp, path| {
+                let staged: CachedHttpCacheEntry =
+                    serde_json::from_slice(&fs::read(tmp).unwrap()).unwrap();
+                assert_eq!(staged, cached_http_entry("replacement"));
+                assert_eq!(path, destination);
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "simulated cache generation commit failure",
+                ))
+            },
+        )
+        .expect_err("simulated commit failure must be returned");
+
+        let preserved: CachedHttpCacheEntry =
+            serde_json::from_slice(&fs::read(&destination).unwrap()).unwrap();
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(preserved, previous);
+        assert_eq!(leftovers, vec![OsString::from("index.json")]);
+    }
+
+    #[test]
+    fn failed_atomic_replace_preserves_destination_and_cleans_temp() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-atomic-replace-failure-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("sdk.tar.gz");
+        fs::write(&destination, b"published").unwrap();
+
+        write_file_atomically_with_publish(
+            &destination,
+            b"replacement",
+            |attempt| OsString::from(format!("replace-failure-{attempt}")),
+            || {},
+            |tmp, path| {
+                assert_eq!(fs::read(tmp).unwrap(), b"replacement");
+                assert_eq!(path, destination);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "simulated atomic replacement failure",
+                ))
+            },
+        )
+        .expect_err("simulated replacement failure must be returned");
+
+        assert_eq!(fs::read(&destination).unwrap(), b"published");
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(leftovers, vec![OsString::from("sdk.tar.gz")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_temp_name_preserves_non_unicode_file_name_bytes() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let file_name = std::ffi::OsString::from_vec(b"sdk-\xff.tar.gz".to_vec());
+        let destination = Path::new("/tmp").join(&file_name);
+        let temp = temp_sibling_path(&destination, std::ffi::OsStr::new("collision")).unwrap();
+
+        let mut expected = file_name.into_vec();
+        expected.extend_from_slice(b".tmp-collision");
+        assert_eq!(temp.file_name().unwrap().as_bytes(), expected);
+    }
+
+    /// Regression: a failed write must not leave a `.tmp-*` scratch file
+    /// behind. The name is unique per attempt, so before this an orphan
+    /// accumulated per retry — and when the failure is a full disk, those
+    /// orphans are exactly what keeps it full.
+    ///
+    /// Provokes the failure by pointing the destination at a non-empty
+    /// directory: the temp file is written, then neither the rename nor the
+    /// replace fallback can succeed. Portable, unlike an out-of-space test.
+    #[test]
+    fn write_file_atomically_cleans_up_temp_when_the_rename_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-atomic-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        let occupied = root.join("sdk.tar.gz");
+        fs::create_dir_all(occupied.join("nested")).unwrap();
+        fs::write(occupied.join("nested").join("keep"), b"x").unwrap();
+
+        write_file_atomically(&occupied, b"payload")
+            .expect_err("renaming onto a non-empty directory should fail");
+
+        let leftovers: Vec<String> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect();
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            leftovers.is_empty(),
+            "failed write left temp files behind: {leftovers:?}"
+        );
+    }
+
+    /// Mirrors the `/dev/shm` reproduction from the original report: a genuine
+    /// ENOSPC, not a rename failure standing in for one.
+    ///
+    /// Ignored by default because it fills `/dev/shm`, which is shared with
+    /// anything else on the host, so it is not safe to run concurrently. Run
+    /// with `cargo test -p rocm -- --ignored write_file_atomically_cleans_up`.
+    #[test]
+    #[ignore = "fills /dev/shm to provoke ENOSPC; not safe to run concurrently"]
+    fn write_file_atomically_cleans_up_temp_on_write_failure() {
+        let shm = Path::new("/dev/shm");
+        if !shm.is_dir() {
+            eprintln!("skipping: /dev/shm unavailable");
+            return;
+        }
+        let dir = shm.join(format!("rocm-enospc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("artifact.tar.gz");
+        // Larger than the tmpfs, so the write is guaranteed to hit ENOSPC.
+        let payload = vec![0u8; 256 * 1024 * 1024];
+
+        let mut failures = Vec::new();
+        for _ in 0..2 {
+            write_file_atomically(&dest, &payload)
+                .expect_err("writing past the end of the filesystem should fail");
+            failures.push(
+                fs::read_dir(&dir)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let destination_exists = dest.exists();
+        let _ = fs::remove_dir_all(&dir);
+
+        for leftovers in &failures {
+            assert!(
+                leftovers.is_empty(),
+                "failed write left files behind: {leftovers:?}"
+            );
+        }
+        assert!(
+            !destination_exists,
+            "destination must not exist after failure"
+        );
     }
 
     #[test]
@@ -3423,6 +4055,9 @@ mod tests {
     /// would double the disk cost of every installed SDK version.
     #[test]
     fn extracting_the_sdk_archive_removes_it() -> Result<()> {
+        // Extraction spawns bare-name `tar` via `PATH`; hold the shared env lock so a
+        // concurrent test that temporarily narrows `PATH` cannot make it fail to launch.
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
         let (root, _paths) = test_paths("discard-archive");
         let cache = root.join("cache");
         let payload_dir = root.join("payload");
@@ -3671,7 +4306,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     fn python_launcher_prefers_path_python_before_saved_managed_python() -> Result<()> {
         if current_platform_wheel_tags().is_err() {
             // No wheel platform tag for this host (e.g. macOS): every python fails
@@ -3679,7 +4313,7 @@ mod tests {
             // the managed/uv path regardless of PATH. Nothing to assert here.
             return Ok(());
         }
-        let _guard = PYTHON_RESOLVER_TEST_ENV_LOCK.lock().unwrap();
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
         let (root, paths) = test_paths("python-prefers-path");
         let bin_dir = root.join("bin");
         fs::create_dir_all(&bin_dir)?;
@@ -3693,27 +4327,16 @@ mod tests {
             installed_at_unix_ms: 123,
         };
         save_managed_python_manifest(&paths, &manifest)?;
-        let old_path = std::env::var_os("PATH");
-        let old_rocm_cli_python = std::env::var_os("ROCM_CLI_PYTHON");
-        // Keep PATH hermetic: appending the real PATH lets a genuine cp312
+        // Keep the search hermetic: including the real PATH lets a genuine cp312
         // python (present on CI) win over the fake one and breaks the
-        // executable assertion. The fake on PATH is all this test needs.
-        let joined_path = std::env::join_paths([bin_dir])?;
-        unsafe {
-            std::env::set_var("PATH", joined_path);
-            std::env::remove_var("ROCM_CLI_PYTHON");
-        }
-        let launcher = resolve_python_launcher(&paths)?;
-        unsafe {
-            match old_path {
-                Some(old_path) => std::env::set_var("PATH", old_path),
-                None => std::env::remove_var("PATH"),
-            }
-            match old_rocm_cli_python {
-                Some(value) => std::env::set_var("ROCM_CLI_PYTHON", value),
-                None => std::env::remove_var("ROCM_CLI_PYTHON"),
-            }
-        }
+        // executable assertion. The fake alone is all this test needs.
+        let launcher = resolve_python_launcher_in(
+            &paths,
+            &PythonResolverEnv {
+                python_override: None,
+                search_dirs: vec![bin_dir],
+            },
+        )?;
         assert_eq!(launcher.source, "path");
         assert!(
             launcher.executable.is_absolute(),
@@ -3741,7 +4364,7 @@ mod tests {
         if !runtime_is_windows() {
             return Ok(());
         }
-        let _guard = PYTHON_RESOLVER_TEST_ENV_LOCK.lock().unwrap();
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
         let (root, _paths) = test_paths("python-probe-temp-root");
         let temp_root = root.join("Temp");
         fs::create_dir_all(&temp_root)?;
@@ -3787,7 +4410,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     fn python_launcher_prefers_path_python_over_managed_when_venv_capable() -> Result<()> {
         if current_platform_wheel_tags().is_err() {
             // No wheel platform tag for this host (e.g. macOS): every python fails
@@ -3795,7 +4417,7 @@ mod tests {
             // the managed/uv path regardless of PATH. Nothing to assert here.
             return Ok(());
         }
-        let _guard = PYTHON_RESOLVER_TEST_ENV_LOCK.lock().unwrap();
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
         let (root, paths) = test_paths("python-path-over-managed");
         let bin_dir = root.join("bin");
         fs::create_dir_all(&bin_dir)?;
@@ -3809,27 +4431,48 @@ mod tests {
             installed_at_unix_ms: 123,
         };
         save_managed_python_manifest(&paths, &manifest)?;
-        let old_path = std::env::var_os("PATH");
-        let old_rocm_cli_python = std::env::var_os("ROCM_CLI_PYTHON");
-        let joined_path = std::env::join_paths([bin_dir])?;
-        unsafe {
-            std::env::set_var("PATH", joined_path);
-            std::env::remove_var("ROCM_CLI_PYTHON");
-        }
-        let launcher = resolve_python_launcher(&paths)?;
-        unsafe {
-            match old_path {
-                Some(old_path) => std::env::set_var("PATH", old_path),
-                None => std::env::remove_var("PATH"),
-            }
-            match old_rocm_cli_python {
-                Some(value) => std::env::set_var("ROCM_CLI_PYTHON", value),
-                None => std::env::remove_var("ROCM_CLI_PYTHON"),
-            }
-        }
+        let launcher = resolve_python_launcher_in(
+            &paths,
+            &PythonResolverEnv {
+                python_override: None,
+                search_dirs: vec![bin_dir],
+            },
+        )?;
 
         assert_eq!(launcher.source, "path");
         assert!(path_python.exists());
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    /// The interpreter search must look only where it is told to look.
+    ///
+    /// This is the property that keeps the resolver out of the process
+    /// environment. While it read `PATH` itself, the only way to steer it was to
+    /// overwrite `PATH` for the whole process — which, under `cargo test`, also
+    /// hid `tar` and every other PATH-resolved binary from the unrelated tests
+    /// sharing that process.
+    #[cfg(unix)]
+    #[test]
+    fn python_path_search_only_uses_the_given_directories() -> Result<()> {
+        let (root, _paths) = test_paths("python-search-scope");
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&bin_dir)?;
+        write_fake_python_with_venv(&bin_dir, "python3")?;
+
+        assert!(
+            python_path_candidates(&[]).is_empty(),
+            "an empty search list must yield no candidates even though the real PATH has a python"
+        );
+        let candidates = python_path_candidates(std::slice::from_ref(&bin_dir));
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.starts_with(&bin_dir)),
+            "the search must stay inside the given directories: {candidates:?}"
+        );
+        assert_eq!(candidates.len(), 1, "expected exactly the fixture python");
+
         fs::remove_dir_all(root).ok();
         Ok(())
     }
@@ -3960,7 +4603,15 @@ echo Python 3.12.10
         })?
         .expect("inline key should be active");
 
-        assert_eq!(observed, temp_key);
+        assert_eq!(observed.parent(), temp_key.parent());
+        assert!(
+            observed
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("metadata-key.pem.tmp-")),
+            "inline key must use a reserved sibling path: {}",
+            observed.display()
+        );
+        assert!(!observed.exists());
         assert!(!temp_key.exists());
         let _ = fs::remove_dir_all(root);
         Ok(())
