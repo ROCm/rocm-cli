@@ -10,6 +10,8 @@ pub mod loopback_http;
 pub mod mock_server;
 pub mod model_id;
 pub mod panic_capture;
+pub mod reader_failure;
+pub mod send_until;
 pub mod serve_log;
 
 use std::path::{Path, PathBuf};

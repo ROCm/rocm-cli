@@ -436,6 +436,7 @@ jobs:
       PIP_CACHE_DIR: /home/ubuntu/actions-runner/pip-cache
       E2E_INCLUDE_NIGHTLY: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
+      E2E_TUI_TIMEOUT_SECS: "90"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -532,6 +533,7 @@ jobs:
     env:
       E2E_INCLUDE_NIGHTLY: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
+      E2E_TUI_TIMEOUT_SECS: "90"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -628,11 +630,172 @@ jobs:
           name: e2e-gpu-strix-windows-report
           path: tests/e2e-cucumber/results/
 
+  # WSL2 counterpart to e2e-gpu-nightly-strix: the same Strix Halo box again, but
+  # reached through an Ubuntu distro under WSL2, so this lane exercises the WSL
+  # host boundary AND whatever GPU access WSL exposes. Mirrors the per-PR
+  # `e2e-wsl` lane in e2e-selfhosted.yml, opting into the same @nightly
+  # large-model scenario as the other nightly lanes. `wsl` in `runs-on`
+  # disambiguates it from the `native` Strix Linux runner; the native lane's
+  # /home/ubuntu/actions-runner paths deliberately are NOT reused, since they do
+  # not exist in the WSL distro.
+  e2e-wsl-nightly:
+    name: E2E tests (Strix Halo, WSL2, incl. nightly-only)
+    timeout-minutes: 90
+    runs-on: [self-hosted, linux, strix-halo, wsl]
+    continue-on-error: true
+    env:
+      E2E_INCLUDE_NIGHTLY: "1"
+      E2E_SERVE_TIMEOUT_SECS: "300"
+      # The Strix lanes share one physical machine, so a TUI frame that renders
+      # well inside the 30s default on an idle runner can miss it while a sibling
+      # lane loads a model. Raise the wait budget rather than let that read as a
+      # product failure; a genuine hang still fails, just later.
+      E2E_TUI_TIMEOUT_SECS: "90"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Fail fast and loudly if this job ever lands on a native Linux runner:
+      # every WSL-tagged scenario would silently resolve to skip instead.
+      - name: Verify the host really is WSL2
+        run: |
+          proc_version=$(cat /proc/version 2>/dev/null || true)
+          if [ ! -e /dev/dxg ] \
+            && [ -z "${WSL_DISTRO_NAME+x}" ] \
+            && ! printf '%s\n' "$proc_version" | grep -qiE 'microsoft|wsl'; then
+            echo "::error::runner is not a WSL host: $(uname -r)"
+            exit 1
+          fi
+          printf 'WSL kernel: %s\n' "$(uname -r)"
+
+      # The native Strix runners come pre-provisioned; a WSL distro often does
+      # not. Install the native build deps only when something is missing, and
+      # only if passwordless sudo is available — otherwise say what is missing
+      # instead of hanging on a password prompt.
+      - name: Ensure native build deps
+        run: |
+          missing=""
+          command -v pkg-config >/dev/null 2>&1 || missing="$missing pkg-config"
+          command -v cc >/dev/null 2>&1 || missing="$missing build-essential"
+          pkg-config --exists libcap 2>/dev/null || missing="$missing libcap-dev"
+          if [ -z "$missing" ]; then
+            echo "native build deps present"
+          elif sudo -n true 2>/dev/null; then
+            echo "installing:$missing"
+            sudo -n apt-get update
+            # shellcheck disable=SC2086
+            sudo -n apt-get install -y $missing
+          else
+            echo "::error::missing native build deps:$missing (no passwordless sudo to install them)"
+            exit 1
+          fi
+
+      - name: Reclaim GPU from stray E2E processes
+        run: |
+          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
+          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
+          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
+          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
+          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
+          echo "reclaimed"
+
+      # GPU preflight, bounded like the native lanes — but ADVISORY here. GPU
+      # access under WSL is exactly what this lane is proving out, so an absent
+      # rocm-smi is a reported condition, not a job failure: the capability probe
+      # then resolves @requires-gpu scenarios to skip and the rest still runs. A
+      # GPU that IS present but stays held by a leftover serve still fails, since
+      # that would corrupt the serve scenarios' results.
+      - name: GPU preflight (advisory bounded wait)
+        run: |
+          MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-8}"
+          CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
+          if ! command -v rocm-smi >/dev/null 2>&1; then
+            echo "::warning::rocm-smi not found in this WSL distro — GPU scenarios will resolve to skip"
+            exit 0
+          fi
+          min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
+          deadline=$(( SECONDS + CEILING_SECS ))
+          saw_vram=0
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
+            total=$(printf '%s\n' "$out" | grep -i 'VRAM Total Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            used=$(printf '%s\n' "$out" | grep -i 'VRAM Total Used Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            if [ -z "$total" ] || [ -z "$used" ]; then
+              sleep 5; continue
+            fi
+            saw_vram=1
+            free=$(( total - used ))
+            if [ "$free" -ge "$min_free" ]; then
+              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB free (>= ${MIN_FREE_GIB} GiB)."
+              exit 0
+            fi
+            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB)…"
+            sleep 5
+          done
+          if [ "$saw_vram" -eq 0 ]; then
+            echo "::warning::rocm-smi reported no VRAM figures under WSL — GPU scenarios will resolve to skip"
+            exit 0
+          fi
+          echo "::error::GPU preflight failed after ${CEILING_SECS}s: VRAM never dropped below the floor — a serve is likely still holding the GPU"
+          exit 1
+
+      # Bootstrap rustup with --no-modify-path so it never writes $HOME/.profile
+      # (setup-rust-toolchain doesn't expose that flag). rust-toolchain.toml pins
+      # the exact toolchain, installed on first cargo use. Idempotent.
+      - name: Ensure Rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --default-toolchain none
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Run E2E tests on Strix Halo WSL2 (incl. nightly-only)
+        run: |
+          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
+          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
+          # Share ONE installed managed runtime across serve/chat scenarios and
+          # PRE-WARM it in place (mirrors e2e-gpu-nightly-strix). Required for
+          # correctness, not speed: `install sdk` bakes ABSOLUTE paths into the
+          # runtime manifest, so installing into a per-scenario temp dir leaves
+          # every later serve pointing at a deleted install root.
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
+          export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
+
+          cargo build --release -p rocm -p rocmd
+          export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
+          export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
+
+          if [ ! -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
+            echo "pre-warming shared runtime (first run on this runner)…"
+            mkdir -p "$prewarm"/{data,config,cache}
+            ROCM_CLI_CONFIG_DIR="$prewarm/config" \
+            ROCM_CLI_DATA_DIR="$prewarm/data" \
+            ROCM_CLI_CACHE_DIR="$prewarm/cache" \
+            HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
+              "$ROCM_CLI_BINARY" install sdk
+            if [ -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
+              echo "shared runtime pre-warmed at $E2E_SHARED_RUNTIMES_DIR"
+            else
+              echo "pre-warm did not produce a runtimes registry; scenarios will install their own" >&2
+            fi
+          else
+            echo "shared runtime already present at $E2E_SHARED_RUNTIMES_DIR — skipping pre-warm"
+          fi
+
+          cargo xtask e2e
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-strix-wsl-report
+          path: tests/e2e-cucumber/results/
+
   # The nightly lanes each uploaded a report nobody joined up, so reading a
-  # nightly meant opening three artifacts and comparing them by hand — on the
+  # nightly meant opening every artifact and comparing them by hand — on the
   # run that covers the most scenarios, since only nightly sets
   # E2E_INCLUDE_NIGHTLY. Same consolidation the per-PR self-hosted workflow
-  # already does (e2e-selfhosted.yml), against the three nightly artifacts.
+  # already does (e2e-selfhosted.yml), against the nightly artifacts.
   e2e-report-nightly:
     name: E2E consolidated report (nightly)
     runs-on: ubuntu-latest
@@ -646,6 +809,7 @@ jobs:
       - e2e-gpu-nightly
       - e2e-gpu-nightly-strix
       - e2e-gpu-nightly-strix-windows
+      - e2e-wsl-nightly
     # Unconditional `always()`, unlike the per-PR workflow: there is no paths
     # filter to consult on a schedule, and the lanes are `continue-on-error`, so
     # a failed lane must still be reported. A nightly that broke is precisely
@@ -656,7 +820,7 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
-      # `*-report` matches the three artifacts above, and will pick up any
+      # `*-report` matches the artifacts above, and will pick up any
       # nightly platform added later without a change here — provided it is
       # named canonically (see the rename note on the upload steps).
       # Layout note (same as the per-PR job): download-artifact@v8 uses a

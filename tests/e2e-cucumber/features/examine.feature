@@ -101,3 +101,13 @@ Feature: GPU detection and system inspection
     When the user inspects the system without probing frameworks
     Then the inspection reports that it skipped the frameworks
     And it still states a verdict for this machine
+
+  # The inverse of `@requires-bare-metal`: WSL2 reports an os_family of `linux`,
+  # so `@requires-os:linux` cannot express "only where the host really is WSL".
+  # Runs only on the WSL lane; everywhere else the premise does not exist.
+  @id:examine-detects-wsl @requires-wsl
+  Scenario: 11 - System inspection recognizes a WSL host
+    Given the CLI is running in WSL
+    When the user inspects the system
+    Then the inspection reports Linux as the operating system
+    And the inspection reports that the host is WSL
