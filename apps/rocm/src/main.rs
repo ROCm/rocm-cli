@@ -23056,7 +23056,7 @@ install therock";
             "qwen",
             &resolve,
             "127.0.0.1",
-            11511,
+            serve_port::PortRequest::Explicit(11511),
             &resolve.device_policy,
             &[],
             None,

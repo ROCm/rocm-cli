@@ -81,18 +81,16 @@ pub const CUSTOM_HOST_NEEDS_PORT: &str = "Custom hosts require a custom port; se
 ///
 /// Dash has no public-bind confirmation or endpoint-key UI, so a public bind
 /// must be requested deliberately from the CLI instead.
-pub const LOOPBACK_HOSTS: &[&str] = &["127.0.0.1", "localhost", "::1", "[::1]"];
+pub const LOOPBACK_HOSTS: &[&str] = &["127.0.0.1", "localhost", "::1"];
 
 /// The guidance shown when a public / non-loopback host is typed into Dash.
 pub const PUBLIC_HOST_NEEDS_CLI: &str = "Dash serves on loopback only; for a public bind run \
      `rocm serve --host … --port … --allow-public-bind` from the CLI.";
 
-/// Whether `host` is one of the loopback spellings Dash may bind.
+/// Whether `host` is one of the exact loopback spellings accepted by the CLI.
 #[must_use]
 pub fn is_loopback_host(host: &str) -> bool {
-    LOOPBACK_HOSTS
-        .iter()
-        .any(|known| known.eq_ignore_ascii_case(host))
+    LOOPBACK_HOSTS.contains(&host)
 }
 
 /// The form fields. Not every field is visible at once — see
@@ -1142,8 +1140,8 @@ mod tests {
     }
 
     #[test]
-    fn loopback_host_with_custom_port_is_allowed() {
-        for host in ["localhost", "::1", "[::1]", "LocalHost"] {
+    fn exact_cli_loopback_hosts_with_custom_port_are_allowed() {
+        for host in ["127.0.0.1", "localhost", "::1"] {
             let w = ServeWizardState {
                 model: "m".into(),
                 host: host.into(),
@@ -1151,11 +1149,12 @@ mod tests {
                 port: "9000".into(),
                 ..Default::default()
             };
-            assert_eq!(
-                w.build_args().unwrap(),
-                vec!["serve", "m", "--host", host, "--port", "9000"],
-                "{host}"
-            );
+            let expected = if host == DEFAULT_HOST {
+                vec!["serve", "m", "--port", "9000"]
+            } else {
+                vec!["serve", "m", "--host", host, "--port", "9000"]
+            };
+            assert_eq!(w.build_args().unwrap(), expected, "{host}");
         }
     }
 
@@ -1163,7 +1162,14 @@ mod tests {
     fn public_host_never_reaches_approval_even_with_a_custom_port() {
         // Dash has no --allow-public-bind confirmation and no endpoint-key UI,
         // so a public bind must be requested from the CLI instead.
-        for host in ["0.0.0.0", "192.168.1.5", "::", "example.invalid"] {
+        for host in [
+            "0.0.0.0",
+            "192.168.1.5",
+            "::",
+            "example.invalid",
+            "LocalHost",
+            "[::1]",
+        ] {
             let w = ServeWizardState {
                 model: "m".into(),
                 host: host.into(),
@@ -1199,11 +1205,19 @@ mod tests {
     }
 
     #[test]
-    fn is_loopback_host_matches_the_cli_accepted_spellings() {
-        for ok in ["127.0.0.1", "localhost", "::1", "[::1]", "LOCALHOST"] {
+    fn is_loopback_host_matches_the_cli_exactly() {
+        for ok in ["127.0.0.1", "localhost", "::1"] {
             assert!(is_loopback_host(ok), "{ok}");
         }
-        for bad in ["0.0.0.0", "127.0.0.2", "::", "192.168.1.5", ""] {
+        for bad in [
+            "0.0.0.0",
+            "127.0.0.2",
+            "::",
+            "192.168.1.5",
+            "",
+            "LocalHost",
+            "[::1]",
+        ] {
             assert!(!is_loopback_host(bad), "{bad}");
         }
     }
