@@ -79,7 +79,7 @@ jobs:
       - name: Filter changed paths (pull requests only)
         id: filter
         if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
           filters: |
             # Rust-only checks (fmt, clippy, coverage).
@@ -155,7 +155,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Need the PR range to read its commit messages.
           fetch-depth: 0
@@ -277,7 +277,7 @@ jobs:
 
       - name: Install cargo-nextest
         if: needs.changes.outputs.rust == 'true'
-        uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
+        uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
         with:
           tool: nextest
 
@@ -402,7 +402,7 @@ jobs:
       # it, so a tampered release can't be installed. This commit is past the
       # v2.0.4 tag because it is the one that added prek 0.4.5 to that map — pin
       # an earlier commit and the action would not know 0.4.5 and skip the check.
-      - uses: j178/prek-action@5337cb91e0fa35a7ff31b9ca345126d8bbbcdf16 # prek 0.4.5 checksums
+      - uses: j178/prek-action@4e14d07f9231acabce116ccfca13b13dd9755ece # prek 0.4.5 checksums
         with:
           prek-version: 0.4.5
           extra-args: --all-files --no-group local-tools
@@ -488,7 +488,7 @@ jobs:
 
       - name: Install cargo-llvm-cov
         if: needs.changes.outputs.rust == 'true'
-        uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
+        uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
         with:
           tool: cargo-llvm-cov
 
