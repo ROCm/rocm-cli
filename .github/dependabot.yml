@@ -19,6 +19,17 @@ updates:
     # widen it. Cooldown delays only version updates, never security updates.
     cooldown:
       default-days: 7
+    # `main` no longer requires a branch to be up to date before merging: the
+    # merge queue already builds `main` + PR and runs the full required set
+    # against that merged tree, so an out-of-date branch is not a merge blocker.
+    # Left on `auto`, Dependabot re-pushes every open PR each time `main` moves,
+    # and because every path filter in ci.yml folds in `.github/workflows/**`,
+    # each of those re-pushes drags the whole suite — self-hosted GPU lanes
+    # included — through a full rerun that changes no outcome. Disable it and let
+    # the queue be the thing that reconciles with `main`. Cost: Dependabot also
+    # stops auto-resolving genuine conflicts, so a PR that truly conflicts (most
+    # often on `Cargo.lock`) needs `@dependabot recreate` by hand.
+    rebase-strategy: disabled
     groups:
       github-actions:
         patterns:
@@ -48,6 +59,11 @@ updates:
     # Above the default of 5 so a backlog of separate major bumps cannot starve
     # the grouped minor/patch PR, but still bounded so the queue stays readable.
     open-pull-requests-limit: 10
+    # Same reasoning as the github-actions entry above: the merge queue, not a
+    # rebase, is what reconciles a PR with `main`. This matters more here — a
+    # cargo bump touches `Cargo.lock`, which the `heavy` and `tpn` filters both
+    # match, so every rebase of every open cargo PR re-runs the heavy lanes.
+    rebase-strategy: disabled
     groups:
       cargo-minor-patch:
         applies-to: version-updates
