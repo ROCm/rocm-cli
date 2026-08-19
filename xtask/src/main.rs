@@ -106,6 +106,10 @@ enum Command {
         /// Verify the notices file is up to date without writing; exit non-zero if it would change.
         #[arg(long)]
         check: bool,
+        /// Skip silently when cargo-about is missing or not the pinned version, instead of
+        /// failing. For the local git hook; conflicts with --check so CI's gate always runs.
+        #[arg(long, conflicts_with = "check")]
+        if_available: bool,
     },
     /// Verify that commits in a range are cryptographically signed and carry a
     /// DCO `Signed-off-by` trailer.
@@ -216,7 +220,10 @@ fn run() -> Result<()> {
         Command::VerifyPinnedKeys => verify_pinned_keys::run()?,
         Command::Affected { base } => affected::run(base)?,
         Command::Manifest { check } => manifest::run(check)?,
-        Command::Tpn { check } => tpn::run(check)?,
+        Command::Tpn {
+            check,
+            if_available,
+        } => tpn::run(check, if_available)?,
         Command::VerifyCommits {
             base,
             require_verified,

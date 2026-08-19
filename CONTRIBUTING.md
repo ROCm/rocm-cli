@@ -46,7 +46,13 @@ prek install                # fast checks on every commit
 prek install -t pre-push    # heavier checks on push (clippy + tests)
 ```
 
-`prek` runs the same checks locally that CI enforces: `cargo fmt`, `clippy`, `cargo test`, `ruff` (Python), `shellcheck` (shell), and PowerShell syntax.
+`prek` runs the same checks locally that CI enforces: `cargo fmt`, `clippy`, `cargo test`, `ruff` (Python), `shellcheck` (shell), PowerShell syntax, and the generated manifests (`MANIFEST.md`, `THIRD_PARTY_NOTICES.txt`).
+
+The manifest hooks only run when you change the dependency graph, and they *rewrite* the generated file rather than just reporting it stale — when that happens the commit stops so you can re-stage the refreshed file. `THIRD_PARTY_NOTICES.txt` additionally needs the pinned generator; without it that hook skips and CI remains the gate:
+
+```bash
+cargo install cargo-about@0.9.1 --locked --features cli   # optional, for THIRD_PARTY_NOTICES.txt
+```
 
 ### Workspace layout
 

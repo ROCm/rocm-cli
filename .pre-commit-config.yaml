@@ -134,3 +134,40 @@ repos:
         language: system
         files: \.ps1$
         groups: [local-tools] # runs in the dedicated `powershell-lint` CI job
+
+  # Generated manifests: MANIFEST.md's dependency table and THIRD_PARTY_NOTICES.txt
+  # are derived from the dependency graph and gated byte-for-byte in CI (`cargo
+  # xtask manifest --check` inside the `clippy` job; the `third-party-notices`
+  # job). Nothing regenerated them locally, so a dependency bump could only be
+  # discovered stale a full CI cycle later — between them these two files caused
+  # the large majority of red CI runs. Dependabot already gets this regeneration
+  # via dependabot-manifests.yml; these hooks give contributors the same.
+  #
+  # Both run the WRITE form, not `--check`: prek fails the commit when a hook
+  # modifies a file, so the refreshed file only needs re-staging. They only fire
+  # when the dependency graph (or the generator) actually changes, so ordinary
+  # source edits are unaffected. pre-commit, not pre-push, so the regenerated
+  # file lands in the same commit as the change that invalidated it.
+  - repo: local
+    hooks:
+      - id: cargo-manifest
+        name: MANIFEST.md dependency table is current
+        entry: cargo xtask manifest
+        language: system
+        files: '^((.*/)?Cargo\.(toml|lock)|xtask/.*|MANIFEST\.md)$'
+        pass_filenames: false
+        stages: [pre-commit]
+        groups: [local-tools] # compiles xtask; CI covers it in the `clippy` job
+      - id: cargo-tpn
+        name: THIRD_PARTY_NOTICES.txt is current
+        # `--if-available` skips cleanly when cargo-about is absent or not the
+        # pinned version, so contributors are never blocked from committing by a
+        # missing optional tool — and a mismatched version cannot rewrite the
+        # notices into a format that fails CI. The `third-party-notices` job
+        # remains the hard gate; clap forbids `--if-available` with `--check`.
+        entry: cargo xtask tpn --if-available
+        language: system
+        files: '^((.*/)?Cargo\.(toml|lock)|xtask/.*|about\.(toml|hbs)|THIRD_PARTY_NOTICES\.txt)$'
+        pass_filenames: false
+        stages: [pre-commit]
+        groups: [local-tools] # CI covers it in the `third-party-notices` job

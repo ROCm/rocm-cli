@@ -741,6 +741,10 @@ cargo install cargo-about@0.9.1 --locked --features cli   # one-time
 cargo xtask tpn
 ```
 
+With the prek hooks installed this runs automatically whenever you commit a
+dependency-graph change, so the notices rarely go stale by hand; the hook skips
+if cargo-about is absent or not the pinned version.
+
 CI verifies the committed file is current with `cargo xtask tpn --check`; a new
 dependency under a license not listed in `about.toml` fails the check until the
 license is reviewed and added (or the dependency dropped). CI pins the
