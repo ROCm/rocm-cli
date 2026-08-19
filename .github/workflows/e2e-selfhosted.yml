@@ -32,8 +32,7 @@ on:
         description: Which self-hosted runner(s) to target
         type: choice
         default: all
-        # `rad3` is deliberately absent from `all` — see the e2e-gpu-rad3 job for
-        # why that lane is opt-in only while its runner is being brought up.
+        # Each value also selectable on its own; `all` covers every lane below.
         options: [all, app-dev-gpu, strix-ubuntu, strix-windows, strix-wsl, rad3]
       name_filter:
         description: "Scenario-name regex (cucumber --name); empty = full suite"
@@ -874,14 +873,23 @@ jobs:
     timeout-minutes: 90
     # `r9700` names the hardware rather than reusing a generic `amd-gpu`: GitHub
     # assigns a job to any runner whose labels are a SUPERSET of the job's, so a
-    # shared label would let this 32GB card pick up MI300X-sized work and OOM.
+    # shared label would let this card pick up MI300X-targeted work. Distinct
+    # per-hardware labels keep the pools separately addressable, as the strix
+    # lanes already do.
     runs-on: [self-hosted, linux, r9700]
     needs: [changes]
+    # Same gating as the other self-hosted lanes: runs automatically on
+    # push/PR/merge_queue when the serve set changed, and on dispatch for
+    # `platform=all` or `platform=rad3`. continue-on-error keeps it non-blocking.
     if: >-
       always()
       && needs.changes.result == 'success'
-      && github.event_name == 'workflow_dispatch'
-      && inputs.platform == 'rad3'
+      && (
+        (github.event_name != 'workflow_dispatch'
+          && needs.changes.outputs.serve == 'true')
+        || (github.event_name == 'workflow_dispatch'
+          && (inputs.platform == 'all' || inputs.platform == 'rad3'))
+      )
     continue-on-error: true
     env:
       E2E_SERVE_TIMEOUT_SECS: "300"
