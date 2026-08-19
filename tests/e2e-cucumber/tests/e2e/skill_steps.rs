@@ -15,7 +15,7 @@
 //! rocm-cli codebase — a documentation artifact is read as test data, and that
 //! artifact is the thing under test.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use cucumber::{given, then, when};
@@ -27,6 +27,11 @@ use crate::E2eWorld;
 /// `diagnose_steps::KNOWN_SYMPTOM`.
 const KNOWN_SYMPTOM: &str = "HSA_STATUS_ERROR_INVALID_ISA";
 
+/// Prose with no catalog keyword in it, so nothing scores and the report falls
+/// through to `route_when_no_match` — the branch the skill's "route upstream"
+/// rule depends on.
+const UNMATCHED_SYMPTOM: &str = "the office printer keeps jamming on page three";
+
 /// The four ids the skill names as the ones the CLI will apply itself. Spelled
 /// out here so a rename in the catalog fails loudly rather than being absorbed
 /// by a set comparison that only ever sees the doc and the CLI agree.
@@ -36,14 +41,6 @@ const AUTO_APPLICABLE: [&str; 4] = [
     "fix-6-path",
     "fix-9-igpu-dgpu",
 ];
-
-/// Verdicts `rocm examine` can report, as enumerated by the skill's reference.
-const KNOWN_VERDICTS: [&str; 5] = ["ok", "no-amd-gpu", "wsl", "unsupported-os", "degraded"];
-
-/// Confidence thresholds the skill's workflow reasons about ("`score >= 75` =
-/// high confidence; `50-74` = likely").
-const MIN_SCORE_FOR_MATCH: i64 = 50;
-const HIGH_CONFIDENCE_THRESHOLD: i64 = 75;
 
 /// One catalog row, from either side of the comparison.
 #[derive(Debug, PartialEq, Eq)]
@@ -145,6 +142,225 @@ fn parse_fix_listing(stdout: &str) -> BTreeMap<String, Remediation> {
     out
 }
 
+// ── Reading the rest of the reference as expected values ───────────
+//
+// The catalog table above is not the only claim the skill makes. It also names
+// the fields a diagnosis carries, the confidence thresholds an agent reasons
+// about, the verdicts `examine` can return, and where to send a report nothing
+// matched. Those are parsed out of the document too, rather than restated as
+// constants here: a constant only ever proves this file and the CLI agree,
+// which is not the drift this feature exists to catch. Parsing also means a
+// claim ADDED upstream starts being checked without touching this file.
+//
+// Every parser asserts it found something. A heading or bullet reworded
+// upstream must fail loudly — a silent empty parse turns the assertions it
+// feeds into no-ops, which is the worst outcome available here.
+
+/// The body of one `##`/`###` section, selected by how its heading starts.
+/// Ends at the next heading of any depth.
+fn section<'a>(md: &'a str, heading_starts_with: &str) -> Vec<&'a str> {
+    let mut body = Vec::new();
+    let mut inside = false;
+    for line in md.lines() {
+        if let Some(heading) = line.strip_prefix('#') {
+            if inside {
+                break;
+            }
+            inside = heading
+                .trim_start_matches('#')
+                .trim_start()
+                .starts_with(heading_starts_with);
+            continue;
+        }
+        if inside {
+            body.push(line);
+        }
+    }
+    assert!(
+        !body.is_empty(),
+        "reference.md has no section whose heading starts {heading_starts_with:?}"
+    );
+    body
+}
+
+/// Every backtick-delimited span on a line, in order.
+fn backticked(line: &str) -> Vec<&str> {
+    let mut spans = Vec::new();
+    let mut rest = line;
+    while let Some(open) = rest.find('`') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('`') else { break };
+        spans.push(&after[..close]);
+        rest = &after[close + 1..];
+    }
+    spans
+}
+
+/// Whether a backticked span is a bare JSON field name, as opposed to the other
+/// things the reference puts in backticks (`{ id, ... }` shapes, `>= 75`,
+/// `--json`).
+fn is_field_name(span: &str) -> bool {
+    let name = span.strip_suffix("[]").unwrap_or(span);
+    !name.is_empty()
+        && name.starts_with(|c: char| c.is_ascii_lowercase())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Top-level fields of `diagnose --json` that the reference tells an agent to
+/// read.
+fn documented_diagnose_fields(md: &str) -> BTreeSet<String> {
+    let fields: BTreeSet<String> = section(md, "`rocm diagnose")
+        .iter()
+        .filter(|line| line.trim_start().starts_with("- "))
+        .flat_map(|line| backticked(line))
+        .filter(|span| is_field_name(span))
+        .map(|span| span.strip_suffix("[]").unwrap_or(span).to_owned())
+        .collect();
+    assert!(
+        !fields.is_empty(),
+        "no diagnose fields parsed out of reference.md"
+    );
+    fields
+}
+
+/// The per-cause shape the reference spells out: ``matched[]`` — ranked
+/// `{ id, title, score, evidence[], fix }`.
+fn documented_cause_fields(md: &str) -> BTreeSet<String> {
+    let fields: BTreeSet<String> = section(md, "`rocm diagnose")
+        .iter()
+        .flat_map(|line| backticked(line))
+        .find(|span| span.trim_start().starts_with('{'))
+        .unwrap_or_else(|| panic!("reference.md no longer spells out the shape of a matched cause"))
+        .trim_matches(|c| c == '{' || c == '}')
+        .split(',')
+        .map(|field| {
+            let field = field.trim();
+            field.strip_suffix("[]").unwrap_or(field).to_owned()
+        })
+        .filter(|field| !field.is_empty())
+        .collect();
+    assert!(
+        !fields.is_empty(),
+        "no per-cause fields parsed out of reference.md"
+    );
+    fields
+}
+
+/// Thresholds the reference states inline, as ``name` (50)`.
+fn documented_thresholds(md: &str) -> BTreeMap<String, i64> {
+    let mut out = BTreeMap::new();
+    for line in section(md, "`rocm diagnose") {
+        let mut rest = line;
+        while let Some(open) = rest.find('`') {
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('`') else { break };
+            let (name, tail) = (&after[..close], &after[close + 1..]);
+            rest = tail;
+            if !is_field_name(name) {
+                continue;
+            }
+            let Some(open_paren) = tail.trim_start().strip_prefix('(') else {
+                continue;
+            };
+            let Some((value, _)) = open_paren.split_once(')') else {
+                continue;
+            };
+            if let Ok(parsed) = value.trim().parse::<i64>() {
+                out.insert(name.to_owned(), parsed);
+            }
+        }
+    }
+    assert!(
+        !out.is_empty(),
+        "no confidence thresholds parsed out of reference.md"
+    );
+    out
+}
+
+/// Verdicts the reference enumerates for `examine --json`'s `status`.
+fn documented_verdicts(md: &str) -> BTreeSet<String> {
+    let line = section(md, "`rocm examine")
+        .into_iter()
+        .find(|line| line.contains("`status`"))
+        .unwrap_or_else(|| panic!("reference.md no longer enumerates the `status` verdicts"));
+    let verdicts: BTreeSet<String> = backticked(line)
+        .into_iter()
+        .filter(|span| *span != "status")
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        !verdicts.is_empty(),
+        "no examine verdicts parsed out of reference.md"
+    );
+    verdicts
+}
+
+/// Upstream trackers the reference names, keyed by a normalised target name so
+/// the doc's prose labels (`LM Studio`, `ROCm core`) line up with the CLI's
+/// identifiers (`lm-studio`, `rocm-core`).
+///
+/// The value is the tracker URL where the reference gives one. `None` records a
+/// target the document names without a URL — PyTorch and llama.cpp are listed
+/// as in scope but their trackers are not written down, so there is nothing to
+/// compare against for those.
+fn documented_routes(md: &str) -> BTreeMap<String, Option<String>> {
+    let mut out = BTreeMap::new();
+    for line in section(md, "Framework routing") {
+        if !line.trim_start().starts_with("- ") {
+            continue;
+        }
+        let url = line.find("https://").map(|at| {
+            line[at..]
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        });
+        let mut labels: Vec<String> = line
+            .split("**")
+            .skip(1)
+            .step_by(2)
+            .map(normalise_route_name)
+            .collect();
+        // The fallback row names its target after the arrow rather than in
+        // bold: `Otherwise → ROCm core: <url>`.
+        if labels.is_empty()
+            && let Some((_, after_arrow)) = line.split_once('→')
+            && let Some((name, _)) = after_arrow.split_once(':')
+            && !name.trim().starts_with("http")
+        {
+            labels.push(normalise_route_name(name));
+        }
+        for label in labels {
+            out.insert(label, url.clone());
+        }
+    }
+    assert!(
+        !out.is_empty(),
+        "no upstream trackers parsed out of reference.md"
+    );
+    out
+}
+
+/// Lowercase, alphanumerics only: `LM Studio`, `lm-studio` and `lm.studio` all
+/// collapse to the same key.
+fn normalise_route_name(name: &str) -> String {
+    name.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// The reference text a step loaded, or a panic naming the missing Given.
+fn reference(world: &E2eWorld) -> &str {
+    world
+        .skill_reference
+        .as_deref()
+        .expect("skill reference not loaded")
+}
+
 /// Both sides of a comparison, or a panic explaining which step is missing.
 fn both_sides(world: &E2eWorld) -> (BTreeMap<String, Remediation>, BTreeMap<String, Remediation>) {
     let doc = world
@@ -184,16 +400,9 @@ async fn user_reports_known_failure(world: &mut E2eWorld) {
     world.model_name = Some(KNOWN_SYMPTOM.to_owned());
 }
 
-#[given("an agent that picked a remediation meant for a different kind of machine")]
-async fn agent_picks_wrong_os_fix(world: &mut E2eWorld) {
-    // Chosen from the OTHER OS's set so the scenario needs no @requires-os tag
-    // and behaves the same on every lane.
-    let id = if cfg!(windows) {
-        "fix-5-amdgpu-load"
-    } else {
-        "fix-13-hip-sdk-missing"
-    };
-    world.model_name = Some(id.to_owned());
+#[given("a user who reports a failure the catalog does not cover")]
+async fn user_reports_unmatched_failure(world: &mut E2eWorld) {
+    world.model_name = Some(UNMATCHED_SYMPTOM.to_owned());
 }
 
 // ── When ───────────────────────────────────────────────────────────
@@ -217,15 +426,6 @@ async fn agent_diagnoses_for_tooling(world: &mut E2eWorld) {
 async fn agent_examines_for_tooling(world: &mut E2eWorld) {
     let (stdout, _, rc) = crate::run_rocm(world, &["examine", "--json"]);
     world.cli_output = Some(stdout);
-    world.cli_rc = Some(rc);
-}
-
-#[when("the agent asks the CLI to apply that remediation")]
-async fn agent_applies_remediation(world: &mut E2eWorld) {
-    let fix_id = world.model_name.clone().expect("no fix id set");
-    let (stdout, stderr, rc) = crate::run_rocm(world, &["fix", &fix_id]);
-    world.cli_output = Some(stdout);
-    world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
 }
 
@@ -290,59 +490,104 @@ async fn assert_same_os_scope(world: &mut E2eWorld) {
     }
 }
 
-#[then("the diagnosis carries the confidence thresholds the skill reasons about")]
-async fn assert_thresholds(world: &mut E2eWorld) {
+#[then("the diagnosis carries every field the skill names")]
+async fn assert_documented_fields_present(world: &mut E2eWorld) {
+    let documented = documented_diagnose_fields(reference(world));
+    let per_cause = documented_cause_fields(reference(world));
     let report = diagnosis(world);
-    for (field, expected) in [
-        ("min_score_for_match", MIN_SCORE_FOR_MATCH),
-        ("high_confidence_threshold", HIGH_CONFIDENCE_THRESHOLD),
-    ] {
-        let actual = report
-            .get(field)
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or_else(|| panic!("diagnose JSON has no numeric '{field}'"));
-        assert_eq!(
-            actual, expected,
-            "{field} changed; the skill quotes {expected} in its workflow text"
-        );
-    }
-}
 
-#[then("every cause it offers carries a title, a confidence, its evidence, and a plan")]
-async fn assert_match_shape(world: &mut E2eWorld) {
-    let report = diagnosis(world);
+    let missing: Vec<&String> = documented
+        .iter()
+        .filter(|field| report.get(field.as_str()).is_none())
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "diagnose --json is missing {missing:?}, which skills/rocm-doctor/reference.md \
+         tells an agent to read.\n\
+         The CLI is authoritative: if a field was renamed or dropped, the document \
+         follows it.\n{report:#}"
+    );
+
     let matched = report
         .get("matched")
         .and_then(serde_json::Value::as_array)
         .expect("diagnose JSON has no 'matched' array");
     // Deliberately not asserting `matched` is non-empty: on a host the catalog
-    // rules out of scope (WSL2) an empty list is the correct answer, and
-    // scenario 5 covers that branch. What must hold is that anything offered is
-    // fully readable by an agent following the skill.
+    // rules out of scope (WSL2) an empty list is the correct answer, and the
+    // routing scenario covers that branch. What must hold is that anything
+    // offered is fully readable by an agent following the skill.
+    //
+    // The individual fields of a `fix` plan are NOT checked here. The reference
+    // does not spell them out, so there is no documented claim to compare
+    // against — that is a serialization shape, and `crates/rocm-core` owns it.
     for cause in matched {
-        for field in ["id", "title", "score", "evidence", "fix"] {
-            assert!(
-                cause.get(field).is_some(),
-                "a matched cause is missing '{field}', which the skill reads:\n{cause:#}"
-            );
-        }
-        let fix = &cause["fix"];
-        for field in [
-            "fix_id",
-            "summary",
-            "commands",
-            "verify",
-            "notes",
-            "needs_sudo",
-            "needs_reboot",
-            "needs_relogin",
-            "auto_applicable",
-        ] {
-            assert!(
-                fix.get(field).is_some(),
-                "a fix plan is missing '{field}', which the skill reads:\n{fix:#}"
-            );
-        }
+        let absent: Vec<&String> = per_cause
+            .iter()
+            .filter(|field| cause.get(field.as_str()).is_none())
+            .collect();
+        assert!(
+            absent.is_empty(),
+            "a matched cause is missing {absent:?}, which reference.md documents \
+             a cause as carrying:\n{cause:#}"
+        );
+    }
+}
+
+#[then("its confidence thresholds are the ones the skill reasons about")]
+async fn assert_thresholds(world: &mut E2eWorld) {
+    let documented = documented_thresholds(reference(world));
+    let report = diagnosis(world);
+    for (field, expected) in &documented {
+        let actual = report
+            .get(field.as_str())
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or_else(|| panic!("diagnose JSON has no numeric '{field}'"));
+        assert_eq!(
+            actual, *expected,
+            "{field} is {actual}, but reference.md states {expected} — and the skill's \
+             workflow text reasons about that number when it grades a cause"
+        );
+    }
+}
+
+#[then("the CLI routes the report to a tracker the skill documents")]
+async fn assert_route_is_documented(world: &mut E2eWorld) {
+    let documented = documented_routes(reference(world));
+    let report = diagnosis(world);
+    let route = report
+        .get("route_when_no_match")
+        .expect("diagnose JSON has no 'route_when_no_match'");
+    let target = route
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+        .expect("the route carries no target");
+    let url = route
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .expect("the route carries no url");
+
+    assert!(
+        !url.trim().is_empty(),
+        "the skill's rule is to route upstream when nothing matched, so the route \
+         must name somewhere to go:\n{route:#}"
+    );
+    let known = documented
+        .get(&normalise_route_name(target))
+        .unwrap_or_else(|| {
+            panic!(
+                "the CLI routes to {target:?}, which reference.md's Framework routing \
+                 section does not name. Documented: {:?}",
+                documented.keys().collect::<Vec<_>>()
+            )
+        });
+    // Only where the reference actually writes the tracker down. It names
+    // PyTorch and llama.cpp as in scope without giving their URLs, so for those
+    // there is nothing to compare and the target check above is the whole test.
+    if let Some(expected) = known {
+        assert!(
+            url.starts_with(expected.as_str()),
+            "reference.md sends a {target} report to {expected}, the CLI to {url:?}"
+        );
     }
 }
 
@@ -355,8 +600,9 @@ async fn assert_examine_exits_zero(world: &mut E2eWorld) {
     );
 }
 
-#[then("its verdict is one the skill accounts for")]
+#[then("its verdict is one the skill documents")]
 async fn assert_known_verdict(world: &mut E2eWorld) {
+    let documented = documented_verdicts(reference(world));
     let output = world.cli_output.as_ref().expect("no examine output");
     let report: serde_json::Value =
         serde_json::from_str(output).expect("examine --json did not emit valid JSON");
@@ -365,40 +611,9 @@ async fn assert_known_verdict(world: &mut E2eWorld) {
         .and_then(serde_json::Value::as_str)
         .expect("examine JSON has no 'status'");
     assert!(
-        KNOWN_VERDICTS.contains(&status),
-        "examine reported {status:?}, which the skill does not account for \
-         (it documents {KNOWN_VERDICTS:?})"
+        documented.contains(status),
+        "examine reported {status:?}, which the skill does not account for. \
+         reference.md enumerates {documented:?}, and an agent that meets a verdict \
+         outside that list has no instruction for what to do next."
     );
-}
-
-#[then("the CLI declines because it does not apply here")]
-async fn assert_not_applicable(world: &mut E2eWorld) {
-    assert_eq!(
-        world.cli_rc,
-        Some(3),
-        "a fix scoped to another OS must exit 3 (not applicable on this host)"
-    );
-}
-
-#[then("no managed state is written")]
-async fn assert_no_managed_state(world: &mut E2eWorld) {
-    // Same definition of "changed nothing" the fix-preview scenario uses:
-    // incidental dirs (logging init) don't count, managed state does.
-    let root = world
-        .isolated_root
-        .as_ref()
-        .expect("scenario has no isolated root")
-        .path();
-    for managed in [
-        root.join("data").join("runtimes"),
-        root.join("data").join("services"),
-        root.join("config"),
-    ] {
-        let touched = managed.read_dir().is_ok_and(|mut d| d.next().is_some());
-        assert!(
-            !touched,
-            "a declined fix wrote managed state at {}",
-            managed.display()
-        );
-    }
 }

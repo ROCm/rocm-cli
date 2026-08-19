@@ -223,16 +223,31 @@ an expected value. `skills/rocm-doctor/` is a byte-verbatim mirror of a skill
 published in [`amd/skills`](https://github.com/amd/skills); the skill owns no
 probe, no catalog and no fixes — all of that ships inside the binary — so what it
 does own is a **contract**: which fix-ids exist, which ones the CLI applies
-itself, which machines each is for, what a diagnosis carries, what the exit codes
-mean. Nothing else tests that seam. `diagnose.feature` deliberately asserts only
-the *shape* of a diagnosis so it stays host-independent, and the `rocm-core` unit
-tests cannot see a document that lives outside the crate.
+itself, which machines each is for, which fields a diagnosis carries, which
+confidence thresholds an agent reasons about, which verdicts `examine` can
+return, and where a report goes when nothing matched.
 
-So `skill_steps.rs` parses the closed-catalog table out of
-`skills/rocm-doctor/reference.md` and diffs it against `rocm fix`. That is a
-deliberate, narrow exception to **Black-box only** above: nothing is imported
-from the rocm-cli codebase — a *documentation artifact* is read as test data, and
-that artifact is the thing under test.
+`diagnose.feature` covers the same commands, so the division matters:
+
+|  | expected value lives in | catches |
+|---|---|---|
+| `diagnose.feature` | the test suite (e.g. `CATALOG_FIX_IDS`) | the **CLI** drifting |
+| `rocm_doctor_skill.feature` | `skills/rocm-doctor/reference.md` | the **document** drifting |
+
+Only the second can notice that a published document has gone stale, and that is
+the whole reason the feature exists. So anything already proven by
+`diagnose.feature` — that a fix for another OS is declined without writing
+anything, that the listing is complete, that a report says plainly whether a
+cause was established — stays there and is **not** restated here. If a scenario
+in this feature does not read `reference.md`, it is in the wrong file.
+
+Reading that document as test data is a deliberate, narrow exception to
+**Black-box only** above: nothing is imported from the rocm-cli codebase — a
+*documentation artifact* is read as test data, and that artifact is the thing
+under test. `skill_steps.rs` parses its claims rather than restating them as
+constants, so a claim added upstream starts being checked with no code change,
+and every parser asserts it found something — a heading reworded upstream must
+fail loudly rather than quietly reduce an assertion to a no-op.
 
 Two rules follow:
 
@@ -241,7 +256,7 @@ Two rules follow:
 - A skill-only edit must still run this job, so `skills/**` is in the `heavy`
   paths filter that gates the `e2e` job.
 
-None of the scenarios assert that a symptom actually matched: on a host the
-catalog rules out of scope (WSL2) an empty `matched` list is the correct answer.
-They assert the coupling — out of scope implies no causes offered — so the
-feature is clean on WSL2, the no-GPU lane, and the GPU lanes alike.
+No scenario asserts that a symptom actually matched: on a host the catalog rules
+out of scope (WSL2) an empty `matched` list is the correct answer. What is
+asserted holds either way, so the feature is clean on WSL2, the no-GPU lane, and
+the GPU lanes alike.

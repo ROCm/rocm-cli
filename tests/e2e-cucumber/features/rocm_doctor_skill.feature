@@ -16,13 +16,22 @@ Feature: The ROCm Doctor skill's instructions match the CLI they drive
   # The catalog is authoritative in `crates/rocm-core`. When one of these fails,
   # the CLI is right and `skills/rocm-doctor/reference.md` is what changes.
   #
-  # Scope is deliberately narrow. Claims already proven elsewhere are NOT
-  # restated here: the exit-code and confirm-before-mutating contract is unit
-  # tested in `crates/rocm-core/src/fix.rs` (where a declined consent or a failed
-  # write can be driven directly), the `status` enum in `examine.rs`, and the
-  # WSL2 out-of-scope rule in `diagnose.rs`. This feature covers what only a real
-  # binary can show: that the documented catalog and the shipped one agree, and
-  # that the JSON an agent reads is actually plumbed through.
+  # Scope is deliberately narrow: EVERY scenario here compares the CLI against
+  # the published document, and nothing else belongs. Claims proven elsewhere
+  # are not restated. `diagnose.feature` already owns the CLI's own behaviour —
+  # that a fix meant for another OS is declined without changing anything
+  # (`@id:fix-inapplicable-here-is-declined-not-attempted`), that the catalog
+  # listing is complete against an in-test list
+  # (`@id:fix-catalog-is-complete`), and that a report says plainly whether a
+  # cause was established (`@id:diagnose-json-states-when-nothing-matched`).
+  # The exit-code and confirm-before-mutating contract is unit tested in
+  # `crates/rocm-core/src/fix.rs`, where a declined consent or a failed write
+  # can be driven directly.
+  #
+  # The distinction that earns this feature its place: those tests compare the
+  # CLI against expectations written in the test suite, so they catch the CLI
+  # drifting. Only these scenarios catch the DOCUMENT drifting, because only
+  # here is `reference.md` itself the expected value.
   #
   # Every scenario is a query: no GPU, no serve, no download, no mutation — so
   # they all run on the blocking mock lane and need no capability tags.
@@ -45,22 +54,28 @@ Feature: The ROCm Doctor skill's instructions match the CLI they drive
     When an agent asks the CLI which remediations it knows
     Then the skill and the CLI agree on which machines each remediation is for
 
-  @id:skill-diagnosis-shape-is-readable
-  Scenario: 4 - A diagnosis hands the agent everything the skill tells it to read
-    Given a user who reports a recognised ROCm failure
+  @id:skill-diagnosis-matches-what-the-skill-documents
+  Scenario: 4 - A diagnosis carries everything the skill tells an agent to read
+    Given the ROCm Doctor skill as it is published
+    And a user who reports a recognised ROCm failure
     When an agent asks the CLI to diagnose that report for tooling
-    Then the diagnosis carries the confidence thresholds the skill reasons about
-    And every cause it offers carries a title, a confidence, its evidence, and a plan
+    Then the diagnosis carries every field the skill names
+    And its confidence thresholds are the ones the skill reasons about
 
-  @id:skill-examine-verdict-is-known
-  Scenario: 5 - Inspecting the machine returns a verdict the skill knows how to read
+  @id:skill-examine-verdicts-are-documented
+  Scenario: 5 - Inspecting the machine returns a verdict the skill documents
+    Given the ROCm Doctor skill as it is published
     When an agent inspects the machine for tooling
     Then the inspection succeeds whatever it finds
-    And its verdict is one the skill accounts for
+    And its verdict is one the skill documents
 
-  @id:skill-wrong-os-fix-declined
-  Scenario: 6 - A remediation meant for a different machine is declined without changing anything
-    Given an agent that picked a remediation meant for a different kind of machine
-    When the agent asks the CLI to apply that remediation
-    Then the CLI declines because it does not apply here
-    And no managed state is written
+  # The skill's standing rule is "never invent a fix — if nothing matched, route
+  # the user upstream". That rule is only followable if the address the CLI hands
+  # over is the one the skill's own routing table gives, so this is the last
+  # claim in the document that the binary can be held to.
+  @id:skill-escalation-target-matches-cli
+  Scenario: 6 - A report the catalog cannot explain is routed where the skill says
+    Given the ROCm Doctor skill as it is published
+    And a user who reports a failure the catalog does not cover
+    When an agent asks the CLI to diagnose that report for tooling
+    Then the CLI routes the report to a tracker the skill documents
