@@ -49,6 +49,14 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Every job sets `timeout-minutes`. GitHub's default is 360, so a step that hangs
+# rather than fails — an `apt-get` against an unresponsive mirror, a network call
+# with no timeout — holds a runner for six hours and, in the merge queue, stalls
+# every queued PR behind it with no signal that anything is wrong. The values here
+# are deliberately loose (roughly 4x the observed p100, which is under 3 min for
+# most jobs and ~13 min for the Windows build) so they never fire on a merely slow
+# run; they exist to convert a silent multi-hour stall into a prompt, legible
+# failure. Raise a value if a job legitimately grows into it.
 jobs:
   # Decide which file categories a change touches so unaffected jobs can skip
   # their expensive work. Filtering runs ONLY on pull_request; on push and in the
@@ -59,6 +67,7 @@ jobs:
   # `.github/workflows/**`, so any change to CI itself triggers a full run.
   changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # paths-filter reads the PR's changed-file list from the API on
     # pull_request events; that needs pull-requests:read on top of the
     # workflow-wide contents:read (job-level permissions replace the default
@@ -153,6 +162,7 @@ jobs:
   xfail-hint:
     name: Stale xfail hint (advisory)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -176,6 +186,7 @@ jobs:
 
   build-and-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
     needs: [changes, clippy, prek]
     # A manual E2E dispatch skips this heavy job for a fast loop; the E2E jobs
@@ -249,6 +260,7 @@ jobs:
   test:
     name: Test (affected crates)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Same lint gate as the OS build jobs: don't spend a test cycle until the
     # cheap checks are green.
     needs: [changes, clippy, prek]
@@ -307,6 +319,7 @@ jobs:
 
   windows-build-and-test:
     runs-on: windows-latest
+    timeout-minutes: 45
     env:
       CARGO_INCREMENTAL: "0"
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
@@ -381,6 +394,7 @@ jobs:
     # license-headers, powershell-lint).
     name: prek (lint / hygiene)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Always-on: prek is the cheapest gate (no compile) and its hygiene hooks run
     # on every file type, so it is relevant to any change — including docs-only
     # PRs that match no `changes` category. Like license-headers and
@@ -409,6 +423,7 @@ jobs:
 
   clippy:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: changes
     # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
     if: github.event_name != 'workflow_dispatch'
@@ -437,6 +452,7 @@ jobs:
   third-party-notices:
     name: Third-party notices current
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: changes
     # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
     if: github.event_name != 'workflow_dispatch'
@@ -471,6 +487,7 @@ jobs:
   coverage:
     name: Coverage (rocm-dash crates, ratcheted)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: changes
     # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
     if: github.event_name != 'workflow_dispatch'
@@ -526,6 +543,7 @@ jobs:
     # rather than behind that slow job.
     name: Lint (PowerShell)
     runs-on: windows-latest
+    timeout-minutes: 20
     needs: changes
     # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
     if: github.event_name != 'workflow_dispatch'
@@ -559,6 +577,7 @@ jobs:
   license-headers:
     name: License header check (hawkeye)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       # Install a pinned prebuilt hawkeye binary instead of pulling the
       # korandoru/hawkeye Docker image on every run, and verify it against a
@@ -602,6 +621,7 @@ jobs:
   commit-signatures:
     name: Commit signatures + sign-off
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Runs on pull requests and in the merge queue. Both define a base that
     # bounds the commit range. Handling `merge_group` matters once this is a
     # *required* check: the queue fires `merge_group` (not `pull_request`), so a
