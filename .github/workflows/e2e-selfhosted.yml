@@ -8,11 +8,22 @@ name: E2E self-hosted
 # with their OWN concurrency group — means an offline runner can only ever stall
 # THIS workflow's supersession, never the required checks in ci.yml.
 #
-# These lanes are non-blocking (continue-on-error). NOTE: their check names
-# (`E2E tests (GPU)` etc.) are still in main's required-status-check list, so
-# while a runner is offline they report as missing and can still block a merge;
-# fully closing that requires removing them from the required list (a separate
-# branch-protection change, out of scope for this workflow).
+# These lanes ARE blocking: their check names (`E2E tests (GPU)` etc.) are in
+# main's required-status-check list, and the jobs no longer carry
+# `continue-on-error`. Two consequences worth knowing before editing this file:
+#
+#   * A lane failure now blocks the merge, in the PR and in the merge queue.
+#     That is the point: these lanes had been red continuously, and a
+#     permanently red advisory lane is indistinguishable from a real regression.
+#   * `continue-on-error` never softened this anyway: it suppresses only the
+#     WORKFLOW conclusion, while the per-job check run still reports `failure`.
+#     Removing it just stops the run summary reading green over a red lane.
+#
+# An OFFLINE runner is therefore a merge outage: the job stays queued, its check
+# never reports, and branch protection waits forever (the PR #138 failure mode,
+# which is why these lanes live in their own concurrency group). If a runner is
+# down, expect to either restore it or temporarily drop its check from the
+# required list — there is no in-workflow escape hatch.
 
 on:
   push:
@@ -137,8 +148,9 @@ jobs:
     runs-on: [self-hosted, linux, amd-gpu]
     needs: [changes]
     # No build-and-test gate (cross-workflow needs is unavailable): the job builds
-    # the rocm binary itself and is continue-on-error; ci.yml's required
-    # build-and-test / mock e2e remain the authoritative pre-merge build gate.
+    # the rocm binary itself, and ci.yml's required build-and-test / mock e2e
+    # remain the authoritative pre-merge build gate: they fail faster, on a
+    # hosted runner, so a plain build break is caught there rather than here.
     if: >-
       always()
       && needs.changes.result == 'success'
@@ -148,7 +160,6 @@ jobs:
         || (github.event_name == 'workflow_dispatch'
           && (inputs.platform == 'all' || inputs.platform == 'app-dev-gpu'))
       )
-    continue-on-error: true
     env:
       # Bound serve readiness below the 35-min job cap so a serve that never comes
       # ready fails the scenario with a real error instead of hanging until the
@@ -325,7 +336,7 @@ jobs:
 
   # Second AMD GPU architecture: the Strix Halo (gfx1151) Ubuntu runner, targeted
   # by the `strix-halo` label (app-dev-gpu carries `amd-gpu`, not `strix-halo`).
-  # Non-blocking while this hardware is proven out.
+  # Merge-blocking (see the header).
   e2e-gpu-strix-ubuntu:
     name: E2E tests (Strix Halo, Ubuntu)
     # 35min: see e2e-gpu — one collapsed job runs all serves + per-scenario
@@ -345,7 +356,6 @@ jobs:
         || (github.event_name == 'workflow_dispatch'
           && (inputs.platform == 'all' || inputs.platform == 'strix-ubuntu'))
       )
-    continue-on-error: true
     # On this runner `/`, `/home/ubuntu`, and `/tmp` are ALL on a full root
     # partition; only /home/ubuntu/actions-runner (a 1.7T nvme) has space. So
     # EVERYTHING the job writes must land on the nvme. Point HOME there (catches
@@ -491,7 +501,7 @@ jobs:
 
   # First real Windows GPU coverage: the Strix Halo Windows 11 runner. The
   # existing windows-build-and-test uses GitHub-hosted windows-latest, which has
-  # no GPU. Non-blocking so it never gates the PR.
+  # no GPU. Merge-blocking (see the header).
   e2e-gpu-strix-windows:
     name: E2E tests (Strix Halo, Windows)
     # 35min: see e2e-gpu — one collapsed job runs all serves + per-scenario
@@ -509,7 +519,6 @@ jobs:
         || (github.event_name == 'workflow_dispatch'
           && (inputs.platform == 'all' || inputs.platform == 'strix-windows'))
       )
-    continue-on-error: true
     env:
       # The three Strix lanes share one physical machine, and this workflow now
       # runs a third of them, so a TUI frame that renders well inside the 30s
@@ -655,8 +664,8 @@ jobs:
   # boundary AND whatever GPU access WSL exposes. Same suite as every other
   # platform — scenarios the host cannot satisfy resolve to skip from the
   # capability probe, so nothing is filtered out here. `wsl` in `runs-on`
-  # disambiguates it from the `native` Strix Linux runner. Non-blocking while
-  # GPU-on-WSL is proven out.
+  # disambiguates it from the `native` Strix Linux runner. Merge-blocking (see
+  # the header).
   e2e-wsl:
     name: E2E tests (Strix Halo, WSL2)
     # A manual include_nightly dispatch runs the 2400s large-model readiness
@@ -678,7 +687,6 @@ jobs:
         || (github.event_name == 'workflow_dispatch'
           && (inputs.platform == 'all' || inputs.platform == 'strix-wsl'))
       )
-    continue-on-error: true
     env:
       E2E_SERVE_TIMEOUT_SECS: "300"
       # The three Strix lanes share one physical machine, and this workflow now
@@ -846,10 +854,11 @@ jobs:
 
   # Consolidate this workflow's self-hosted platform reports into one GPU-side
   # cross-platform grid (Summary + merged HTML). Distinct name from ci.yml's
-  # required `E2E consolidated report` so it does NOT collide with that required
-  # check; this one is advisory and lives with the lanes it summarizes. Runs on
-  # GitHub-hosted ubuntu (no GPU needed — it only parses report.json). `always()`
-  # so a failing/skipped self-hosted platform still appears in the grid.
+  # required `E2E consolidated report` so it does NOT collide with that separate
+  # check; this one is required too, and lives with the lanes it summarizes.
+  # Runs on GitHub-hosted ubuntu (no GPU needed — it only parses report.json).
+  # `always()` so a failing/skipped self-hosted platform still appears in the
+  # grid.
   e2e-report:
     name: E2E consolidated report (self-hosted)
     runs-on: ubuntu-latest
