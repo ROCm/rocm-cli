@@ -561,7 +561,11 @@ pub fn run_rocm_with_env(
 /// `sudo` must not. Each requested tool is symlinked from wherever it lives on the
 /// current `PATH`; a tool that cannot be found is skipped (its absence is exactly
 /// what some scenarios want to arrange).
-#[cfg(unix)]
+///
+/// Compiles on every platform (cucumber step functions are registered regardless
+/// of host), but the only scenario that uses it is `@requires-os:linux`, so its
+/// Unix-only symlink path is the only one that runs; on Windows the temp dir is
+/// created empty and the scenario is skipped before reaching this call.
 pub fn run_rocm_with_only_tools(
     world: &E2eWorld,
     args: &[&str],
@@ -570,7 +574,10 @@ pub fn run_rocm_with_only_tools(
     let bin = TempDir::with_prefix("rocm-e2e-path-").expect("failed to create temp PATH dir");
     for tool in tools {
         if let Some(real) = which_on_path(tool) {
+            #[cfg(unix)]
             let _ = std::os::unix::fs::symlink(&real, bin.path().join(tool));
+            #[cfg(not(unix))]
+            let _ = std::fs::copy(&real, bin.path().join(tool));
         }
     }
     let binary = rocm_binary();
@@ -595,7 +602,6 @@ pub fn run_rocm_with_only_tools(
 /// Resolve a bare tool name to its absolute path by scanning the current `PATH`,
 /// following the same first-match rule a shell would. Returns `None` if the tool
 /// is not on `PATH`.
-#[cfg(unix)]
 fn which_on_path(tool: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
