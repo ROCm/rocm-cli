@@ -1303,7 +1303,7 @@ Apache License 2.0
 ================================================================================
 
 The following component(s) are licensed under Apache License 2.0:
-  - bollard 0.17.1 <https://github.com/fussybeaver/bollard>
+  - bollard 0.21.0 <https://github.com/fussybeaver/bollard>
   - hyper-named-pipe 0.1.0 <https://github.com/fussybeaver/hyper-named-pipe>
 
                                  Apache License
@@ -8145,7 +8145,7 @@ The following component(s) are licensed under Apache License 2.0:
   - anyhow 1.0.102 <https://github.com/dtolnay/anyhow>
   - async-trait 0.1.89 <https://github.com/dtolnay/async-trait>
   - aws-lc-sys 0.41.0 <https://github.com/aws/aws-lc-rs>
-  - bollard-stubs 1.45.0-rc.26.0.1
+  - bollard-stubs 1.53.1-rc.29.3.1
   - cucumber-codegen 0.23.0 <https://github.com/cucumber-rs/cucumber>
   - directories 6.0.0 <https://github.com/soc/directories-rs>
   - dirs-sys 0.5.0 <https://github.com/dirs-dev/dirs-sys-rs>
