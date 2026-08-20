@@ -300,7 +300,7 @@ sometimes because it also needs sudo or a reboot).
 ```
 rocm install sdk    [--channel release|nightly] [--format wheel|tarball]
                     [--version x.y.z | --build-date YYYY-MM-DD]
-                    [--family gfx110X-all] [--prefix PATH] [--dry-run]
+                    [--family gfx110X-all] [--prefix PATH] [--devel] [--dry-run]
                     [--approve-replacing-active-default] [--yes]
 
 rocm install driver [--dkms] [--yes] [--dry-run] [--reconcile]
@@ -310,7 +310,9 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 ```
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
-by rocm-cli. An install with no active default runtime never prompts, but once a
+by rocm-cli; pass `--devel` to also install the compiler and headers needed to
+build GPU code, roughly doubling the download.
+An install with no active default runtime never prompts, but once a
 managed runtime is the active default every `install sdk` asks first, because
 the new install takes over as the active default. That gate is not scoped to the
 family or channel you are installing: a `--family` or `--channel` you have never
