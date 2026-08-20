@@ -9,6 +9,8 @@
 //! (which also counts other log sources). Contracts verified against the running
 //! Linux binary (EAI-8072). No GPU or network — mock lane.
 
+use std::fmt::Write as _;
+
 use cucumber::{given, then, when};
 
 use crate::E2eWorld;
@@ -28,12 +30,13 @@ async fn plant_command_logs(world: &mut E2eWorld) {
     // `rocm logs` reads (a few leading non-matching lines are harmless context).
     let mut body = String::new();
     for i in 0..3 {
-        body.push_str(&format!("2026-01-01T00:00:0{i} unrelated startup line\n"));
+        let _ = writeln!(body, "2026-01-01T00:00:0{i} unrelated startup line");
     }
     for i in 1..=MATCH_COUNT {
-        body.push_str(&format!(
-            "2026-01-01T00:01:00 event {TOPIC} occurred number {i}\n"
-        ));
+        let _ = writeln!(
+            body,
+            "2026-01-01T00:01:00 event {TOPIC} occurred number {i}"
+        );
     }
     std::fs::write(cli_logs.join("e2e-probe.log"), body).expect("failed to write log file");
 }
