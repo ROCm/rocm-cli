@@ -109,7 +109,9 @@ The WSL activation environment for HIP applications that do not preload ROCm
 the way PyTorch does must include the managed TheRock runtime package paths and
 WSL DXCore path. With the managed `rocm[libraries]` install, these paths
 come from the rocm-cli runtime manifest, `rocm-sdk path --root`, and
-`rocm_sdk.find_libraries(...)`.
+`rocm_sdk.find_libraries(...)`. `rocm[libraries]` is enough to run a pre-built
+HIP application; compiling one from source under WSL needs the compiler and
+headers, so run `rocm install sdk --devel` instead.
 
 ```bash
 export ROCM_ROOT="<managed _rocm_sdk_core or devel root from the runtime manifest>"
