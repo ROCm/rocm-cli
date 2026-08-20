@@ -22,22 +22,28 @@ const TORCH_HIP_PROBE: &str = "import json,sys\n\
      \x20 out['error']=type(ex).__name__+': '+str(ex)\n\
      sys.stdout.write(json.dumps(out))\n";
 
-/// Locate the active managed runtime's venv interpreter. `rocm examine` prints
-/// `Folder: <install_root>` for the active runtime; the interpreter lives under a
-/// `bin/python` (Unix) / `Scripts/python.exe` (Windows) inside that tree. The
-/// exact env sub-layout is an internal detail, so search for the interpreter
+/// Locate the managed runtime's venv interpreter. `rocm runtimes list` prints an
+/// `install_root: <path>` line for each installed runtime; the interpreter lives
+/// under a `bin/python` (Unix) / `Scripts/python.exe` (Windows) inside that tree.
+/// The exact env sub-layout is an internal detail, so search for the interpreter
 /// rather than reconstruct the path — black-box, and tolerant of layout changes.
+///
+/// Reads `runtimes list` rather than `examine`: examine only prints a `Folder:`
+/// line for the *active* runtime and takes a different branch when none is marked
+/// active, so it is not a reliable source for the install root (this cost a GPU
+/// dispatch — the scenario panicked on a missing `Folder:` there). `runtimes list`
+/// prints `install_root:` for every installed runtime unconditionally.
 fn active_runtime_python(world: &E2eWorld) -> PathBuf {
-    let (examine, _, _) = crate::run_rocm(world, &["examine"]);
-    let folder = examine
+    let (listing, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
+    let root = listing
         .lines()
-        .find_map(|l| l.trim().strip_prefix("Folder:"))
+        .find_map(|l| l.trim().strip_prefix("install_root:"))
         .map_or_else(
-            || panic!("no active-runtime 'Folder:' line in examine:\n{examine}"),
+            || panic!("no 'install_root:' line in `runtimes list`:\n{listing}"),
             str::trim,
         );
-    find_venv_python(Path::new(folder)).unwrap_or_else(|| {
-        panic!("could not locate a venv python under the runtime folder {folder}")
+    find_venv_python(Path::new(root)).unwrap_or_else(|| {
+        panic!("could not locate a venv python under the runtime install_root {root}")
     })
 }
 
