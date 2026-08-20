@@ -377,7 +377,6 @@ repository.
 | regex | 1.12.4 | MIT OR Apache-2.0 |
 | regex-automata | 0.4.14 | MIT OR Apache-2.0 |
 | regex-syntax | 0.8.11 | MIT OR Apache-2.0 |
-| reqwest | 0.12.28 | MIT OR Apache-2.0 |
 | reqwest | 0.13.4 | MIT OR Apache-2.0 |
 | rig-core | 0.38.1 | MIT |
 | ring | 0.17.14 | Apache-2.0 AND ISC |
