@@ -57,6 +57,7 @@ const CATALOG_FIX_IDS: &[&str] = &[
     "fix-13-hip-sdk-missing",
     "fix-14-adrenalin-too-old",
     "fix-15-msvc-redist",
+    "fix-16-vllm-oom",
 ];
 
 /// The fixes the CLI carries out itself. Every other entry only prints a plan.
@@ -115,6 +116,12 @@ async fn user_hit_known_failure(world: &mut E2eWorld) {
 #[given("a user who hit a failure the CLI does not recognise")]
 async fn user_hit_unknown_failure(world: &mut E2eWorld) {
     world.model_name = Some("xyzzy totally unrelated gibberish".to_string());
+}
+
+#[given("a user whose vLLM server ran out of GPU memory")]
+async fn user_hit_vllm_oom(world: &mut E2eWorld) {
+    world.model_name =
+        Some("torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.".to_string());
 }
 
 #[given("a user who has chosen a known fix")]
@@ -320,6 +327,62 @@ async fn assert_json_identifies_match(world: &mut E2eWorld) {
             .and_then(serde_json::Value::as_str)
             .is_some(),
         "the matched cause must name the fix that applies it:\n{output}"
+    );
+}
+
+#[then("the diagnosis identifies the vLLM startup OOM")]
+async fn assert_diagnosis_identifies_vllm_oom(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "diagnose should exit 0");
+    let (report, output) = parsed_diagnosis(world);
+    let oom = report
+        .get("matched")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|matches| {
+            matches.iter().find(|diagnosis| {
+                diagnosis.get("id").and_then(serde_json::Value::as_str) == Some("fix-16-vllm-oom")
+            })
+        })
+        .unwrap_or_else(|| panic!("expected fix-16-vllm-oom in diagnosis:\n{output}"));
+    assert!(
+        oom.get("score")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|score| score >= 75),
+        "the distinctive OOM signature should be high-confidence:\n{output}"
+    );
+    assert_eq!(
+        oom.pointer("/fix/auto_applicable")
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+        "the OOM remedy must remain print-only:\n{output}"
+    );
+}
+
+#[then("the OOM remedy distinguishes a busy GPU from a model that does not fit")]
+async fn assert_oom_remedy_is_conditional(world: &mut E2eWorld) {
+    let (report, output) = parsed_diagnosis(world);
+    let fix = report
+        .get("matched")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|matches| {
+            matches.iter().find(|diagnosis| {
+                diagnosis.get("id").and_then(serde_json::Value::as_str) == Some("fix-16-vllm-oom")
+            })
+        })
+        .and_then(|diagnosis| diagnosis.get("fix"))
+        .unwrap_or_else(|| panic!("expected fix-16-vllm-oom remediation:\n{output}"));
+    let rendered = fix.to_string();
+    assert!(
+        rendered.contains("shared/busy")
+            && rendered.contains("does not fit")
+            && rendered.contains("--gpu-memory-utilization")
+            && rendered.contains("--tensor-parallel-size"),
+        "the remedy must retain both conditional branches:\n{output}"
+    );
+    assert!(
+        !fix.get("verify")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|verify| verify.contains("--gpu-memory-utilization")),
+        "verification must not unconditionally prescribe the tenancy workaround:\n{output}"
     );
 }
 
