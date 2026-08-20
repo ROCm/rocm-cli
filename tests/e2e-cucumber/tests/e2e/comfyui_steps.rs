@@ -81,19 +81,51 @@ fn torch_is_rocm(python: &Path) -> bool {
         .is_some_and(|hip| !hip.is_null() && hip.as_str().is_some_and(|s| !s.is_empty()))
 }
 
-/// The `nvidia-*` CUDA distributions installed in the interpreter's environment,
-/// as reported by `pip list`. A ROCm runtime should have none; ComfyUI's install
-/// dragging any in is the EAI-8051 defect.
+/// Enumerate installed distributions via `importlib.metadata` and emit their names
+/// as a JSON array. Used instead of `pip list` because uv-created managed runtimes
+/// have no `pip` module — `python -m pip` there exits non-zero with empty stdout,
+/// which a naive reader would misread as "no packages installed" and pass the
+/// nvidia check while the runtime is actually corrupted. `importlib.metadata` is in
+/// the stdlib, so it is always present; the probe emits `{names}` on success or
+/// `{error}` on failure so the caller can fail loudly rather than treat a broken
+/// probe as a clean result.
+const DISTRIBUTIONS_PROBE: &str = "import json,sys\n\
+     out={}\n\
+     try:\n\
+     \x20 from importlib import metadata\n\
+     \x20 out['names']=sorted({(d.metadata['Name'] or '') for d in metadata.distributions()})\n\
+     except Exception as ex:\n\
+     \x20 out['error']=type(ex).__name__+': '+str(ex)\n\
+     sys.stdout.write(json.dumps(out))\n";
+
+/// The `nvidia-*` CUDA distributions installed in the interpreter's environment.
+/// A ROCm runtime should have none; ComfyUI's install dragging any in is the
+/// EAI-8051 defect. Panics if the interpreter cannot be run or the probe reports
+/// an error — a probe that cannot enumerate packages must NOT read as "no nvidia
+/// packages", which would pass the contract on a runtime it never actually checked.
 fn nvidia_distributions(python: &Path) -> Vec<String> {
     let output = std::process::Command::new(python)
-        .args(["-m", "pip", "list", "--format=freeze"])
+        .args(["-c", DISTRIBUTIONS_PROBE])
         .output()
-        .unwrap_or_else(|e| panic!("failed to run pip list on {}: {e}", python.display()));
+        .unwrap_or_else(|e| panic!("failed to run runtime python {}: {e}", python.display()));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .lines()
-        .filter_map(|line| line.split("==").next())
-        .map(str::trim)
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let data: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|_| {
+        panic!("distributions probe returned non-JSON:\nstdout: {stdout}\nstderr: {stderr}")
+    });
+    if let Some(error) = data.get("error").and_then(serde_json::Value::as_str) {
+        panic!(
+            "could not enumerate installed distributions on {}: {error}",
+            python.display()
+        );
+    }
+    let names = data
+        .get("names")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("distributions probe returned no 'names' array:\n{stdout}"));
+    names
+        .iter()
+        .filter_map(serde_json::Value::as_str)
         .filter(|name| name.to_ascii_lowercase().starts_with("nvidia-"))
         .map(str::to_owned)
         .collect()

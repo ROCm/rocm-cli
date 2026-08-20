@@ -15,9 +15,14 @@ Feature: ComfyUI application management
   #
   # Genuinely destructive and expensive: it needs a real managed runtime (a
   # multi-GiB SDK install) and mutates it, so it runs ONLY on a GPU host, behind
-  # @lifecycle and @nightly, against this scenario's own isolated runtime prefix
-  # (it must never share a runtime tree with other scenarios — it may corrupt it).
-  @id:comfyui-install-preserves-the-rocm-runtime @requires-gpu @lifecycle @nightly
+  # @nightly, against this scenario's own isolated runtime prefix (it must never
+  # share a runtime tree with other scenarios — it may corrupt it). Gated
+  # @requires-gpu @nightly, matching runtime-install-sdk-active, the other scenario
+  # that does a real `install sdk`. NOT @lifecycle: that tag is for OS-mutating
+  # release scenarios and no lane sets E2E_INCLUDE_LIFECYCLE on a GPU host, so
+  # combining it with @nightly would make this scenario unreachable on every lane;
+  # this mutates only its own isolated runtime prefix, not the OS.
+  @id:comfyui-install-preserves-the-rocm-runtime @requires-gpu @nightly
   Scenario: 1 - Installing ComfyUI does not replace the ROCm runtime with a CUDA one
     Given an isolated machine with a managed ROCm runtime
     And the runtime's torch is a ROCm build

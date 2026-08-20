@@ -226,8 +226,8 @@ reason = "install driver --dkms prefixes sudo even as root, so it fails with `su
 # filtered out, but a transitive dependency can still pull CUDA `nvidia-*` wheels
 # into the runtime and displace its ROCm torch, so installing an optional app
 # leaves the machine's base runtime a CUDA build with no AMD GPU support. Runs only
-# on the nightly GPU lane (@requires-gpu @lifecycle @nightly) against an isolated,
-# throwaway runtime it may corrupt. Unconditional where it runs, so `when = {}`.
+# on the nightly GPU lane (@requires-gpu @nightly) against an isolated, throwaway
+# runtime it may corrupt. Unconditional where it runs, so `when = {}`.
 # Remove when the install can no longer alter the runtime's torch stack. ---
 [["comfyui-install-preserves-the-rocm-runtime"]]
 when = {}
