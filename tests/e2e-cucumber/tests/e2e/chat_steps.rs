@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: MIT
 
+use std::time::Duration;
+
 use cucumber::{given, then, when};
 use e2e_cucumber::mock_server::MockServer;
 
@@ -80,6 +82,24 @@ async fn user_sends_oneshot_chat(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
 }
 
+#[when("the user pipes a chat prompt to the CLI")]
+async fn user_pipes_chat_prompt(world: &mut E2eWorld) {
+    // Keep --model explicit: this scenario pins the stdin contract, not the
+    // default-model discovery defect covered separately by EAI-8009.
+    let model = world.model_name.clone().expect("no model name set");
+    let (stdout, stderr, rc) = crate::run_rocm_with_stdin(
+        world,
+        &["chat", "--provider", "local", "--model", &model],
+        "Hello from standard input\n",
+    );
+    assert_eq!(
+        rc, 0,
+        "piped rocm chat failed (rc={rc}):\n{stdout}\n{stderr}"
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+}
+
 // ── Then ───────────────────────────────────────────────────────────
 
 #[then("the served model is listed")]
@@ -114,6 +134,26 @@ async fn assert_chat_successful(world: &mut E2eWorld) {
     assert!(
         e2e_cucumber::chat_response_is_successful(resp),
         "no non-empty choices array in response: {resp}"
+    );
+}
+
+#[then("the CLI sends the piped prompt to the model")]
+async fn assert_piped_prompt_sent(world: &mut E2eWorld) {
+    // This is the load-bearing assertion. Today the command still exits 0 and
+    // prints an assistant status summary, but the mock receives no completion
+    // at all. Waiting for the actual request prevents any future incidental
+    // output from making the scenario pass for the wrong reason.
+    let request = world
+        .mock
+        .as_ref()
+        .expect("no mock server running")
+        .wait_for_chat_request(Duration::from_secs(2))
+        .await
+        .unwrap_or_else(|e| panic!("the piped prompt never reached the model: {e}"));
+    let content = request["messages"][0]["content"].as_str().unwrap_or("");
+    assert_eq!(
+        content, "Hello from standard input",
+        "the model received the wrong prompt: {request}"
     );
 }
 

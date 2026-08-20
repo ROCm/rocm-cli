@@ -75,3 +75,11 @@ Feature: Chat and endpoint detection
     And the model is registered with the CLI
     When the user sends a one-shot chat prompt through the CLI
     Then the CLI prints the assistant's reply
+
+  @id:chat-cli-stdin-prompt
+  Scenario: 8 - The chat CLI answers a prompt received through standard input
+    Given a model is being served
+    And the model is registered with the CLI
+    When the user pipes a chat prompt to the CLI
+    Then the CLI sends the piped prompt to the model
+    And the CLI prints the assistant's reply

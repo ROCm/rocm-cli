@@ -15,6 +15,7 @@ use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_
 use tempfile::TempDir;
 
 mod e2e {
+    pub mod automations_steps;
     pub mod bench_steps;
     pub mod chat_steps;
     pub mod dash_steps;
@@ -512,6 +513,45 @@ pub fn run_rocm_with_env(
     let output = cmd
         .output()
         .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    let rc = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    record_command(world.current_scenario.as_deref(), args, rc, &stdout);
+    (
+        stdout,
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        rc,
+    )
+}
+
+/// Like [`run_rocm`], but writes `stdin` to the child's standard input.
+///
+/// [`run_rocm`] uses `Command::output`, which gives the child a NULL stdin, so no
+/// scenario could exercise the documented `echo … | rocm chat` path. The pipe is
+/// closed once the input is written, exactly as a shell pipeline does, so a
+/// command that reads to EOF terminates instead of waiting for more.
+pub fn run_rocm_with_stdin(world: &E2eWorld, args: &[&str], stdin: &str) -> (String, String, i32) {
+    use std::io::Write as _;
+
+    let binary = rocm_binary();
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(args);
+    world.isolate_cmd(&mut cmd);
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    // Take the handle so it is dropped (closing the pipe) as soon as the write
+    // finishes; otherwise the child would block reading a pipe we still hold.
+    {
+        let mut pipe = child.stdin.take().expect("stdin was piped");
+        pipe.write_all(stdin.as_bytes())
+            .unwrap_or_else(|e| panic!("failed to write to {binary}'s stdin: {e}"));
+    }
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("failed to wait for {binary}: {e}"));
     let rc = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     record_command(world.current_scenario.as_deref(), args, rc, &stdout);

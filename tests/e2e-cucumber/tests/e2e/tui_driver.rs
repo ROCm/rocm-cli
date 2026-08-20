@@ -215,6 +215,39 @@ impl TuiSession {
         self.screen_snapshot().0
     }
 
+    /// The visible screen as LOGICAL lines: rows the terminal soft-wrapped are
+    /// rejoined into the single line the application actually emitted.
+    ///
+    /// [`Self::screen_text`] is the right lens for "what does the user see", and
+    /// most assertions look for a short marker where wrapping is irrelevant. A
+    /// step that must read a whole VALUE off the screen — a filesystem path, a
+    /// URL — needs this instead: at 80 columns a long path silently splits
+    /// across two rows, and a step parsing the raw rows would then assert
+    /// against a truncated value and fail for a reason that has nothing to do
+    /// with the product.
+    pub fn screen_logical_lines(&self) -> Vec<String> {
+        let parser = self
+            .parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let screen = parser.screen();
+        let (rows, cols) = screen.size();
+        let mut lines: Vec<String> = Vec::new();
+        let mut continuing = false;
+        for row in 0..rows {
+            let text = screen.contents_between(row, 0, row, cols);
+            if continuing {
+                if let Some(last) = lines.last_mut() {
+                    last.push_str(&text);
+                }
+            } else {
+                lines.push(text);
+            }
+            continuing = screen.row_wrapped(row);
+        }
+        lines
+    }
+
     fn screen_snapshot(&self) -> (String, (u16, u16)) {
         // Recover a poisoned lock rather than defaulting to a blank screen: the
         // parser's data is still valid even if some other thread panicked while
@@ -364,20 +397,32 @@ impl TuiSession {
 
     /// Poll until the child exits, asserting a successful (zero) exit code.
     pub async fn wait_for_exit(&mut self, timeout: Duration) -> Result<(), String> {
+        let status = self.wait_for_any_exit(timeout).await?;
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "TUI exited unsuccessfully (exit code {status}).\n{}",
+                self.framed_screen()
+            ))
+        }
+    }
+
+    /// Poll until the child exits, returning its exit code without requiring zero.
+    ///
+    /// Most journeys require a clean exit and use [`Self::wait_for_exit`]. A
+    /// command-rejection scenario needs the inverse contract: it must terminate
+    /// promptly and non-zero. Keeping the deadline/reap/record logic here avoids
+    /// teaching individual steps how to manipulate the PTY child directly.
+    pub async fn wait_for_any_exit(&mut self, timeout: Duration) -> Result<i32, String> {
         let deadline = Instant::now() + timeout;
         loop {
             match self.child.try_wait() {
                 Ok(Some(status)) => {
                     self.finished = true;
-                    self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
-                    return if status.success() {
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "TUI exited unsuccessfully ({status:?}).\n{}",
-                            self.framed_screen()
-                        ))
-                    };
+                    let rc = i32::try_from(status.exit_code()).unwrap_or(-1);
+                    self.record_once(rc);
+                    return Ok(rc);
                 }
                 Ok(None) => {}
                 Err(e) => return Err(format!("failed to poll TUI child: {e}")),
