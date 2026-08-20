@@ -120,7 +120,7 @@ gone, so an unchanged command now reserves vLLM's own (higher) default. Pass
 Because the reservation is a fraction of **total** VRAM, it ignores memory
 already held by other workloads. On a shared multi-GPU node the default can
 collide with in-use memory and the engine fails with `HIP out of memory` even for
-a tiny model. rocm-cli helps in three ways:
+a tiny model. rocm-cli helps in two ways:
 
 - **Auto-selection avoids busy cards.** `--gpu auto` ranks GPUs by free VRAM and
   skips heavily-used ones. When `amd-smi` is not installed it falls back to the

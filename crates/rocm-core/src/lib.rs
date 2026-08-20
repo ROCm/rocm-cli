@@ -7320,6 +7320,23 @@ pub const VLLM_GPU_MEMORY_UTILIZATION_HINT: &str = "vLLM reserves ~90% of the GP
      collide with memory already in use. Lower the reservation with `--gpu-memory-utilization \
      <0-1>` (e.g. 0.1 for a small model), or target a less-busy GPU with `--gpu <index>`.";
 
+/// Whether a vLLM/PyTorch log excerpt carries a startup out-of-memory
+/// signature.
+///
+/// Includes vLLM's wrapper-only initialization failure because some engine logs
+/// omit the underlying allocator message from their retained tail.
+pub fn vllm_log_shows_oom(log: &str) -> bool {
+    const SIGNATURES: &[&str] = &[
+        "torch.outofmemoryerror",
+        "hip out of memory",
+        "out of memory",
+        "engine core initialization failed",
+    ];
+
+    let lower = log.to_ascii_lowercase();
+    SIGNATURES.iter().any(|signature| lower.contains(signature))
+}
+
 /// Locate `amd-smi` inside the bin directories of the newest managed ROCm SDK
 /// runtime recorded in the registry. The binary ships with the TheRock wheel
 /// (under the SDK `bin_path` and/or the venv `install_root/bin`) and is not on
