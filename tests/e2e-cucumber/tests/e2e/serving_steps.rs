@@ -71,8 +71,10 @@ async fn model_is_ready(models_url: &str, expect_model: Option<&str>, timeout_se
 
 /// The OpenAI-compatible base URL every GPU serve scenario serves on (see
 /// [`SERVE_PORT`]), and the model listing readiness is judged by.
-const SERVE_BASE_URL: &str = "http://127.0.0.1:11435/v1";
-const MODELS_URL: &str = "http://127.0.0.1:11435/v1/models";
+static SERVE_BASE_URL: LazyLock<String> =
+    LazyLock::new(|| format!("http://127.0.0.1:{SERVE_PORT}/v1"));
+static MODELS_URL: LazyLock<String> =
+    LazyLock::new(|| format!("http://127.0.0.1:{SERVE_PORT}/v1/models"));
 
 /// The one-line verdict on a `--managed` serve that launched cleanly and then
 /// never produced a usable endpoint.
@@ -81,8 +83,9 @@ const MODELS_URL: &str = "http://127.0.0.1:11435/v1/models";
 /// nothing in the exit status, and nothing the CLI printed, distinguishes it from
 /// a healthy serve — the evidence sections below it are the only account there is.
 fn stall_headline(invocation: &str, ready_substr: &str, timeout_secs: u64) -> String {
+    let models_url = MODELS_URL.as_str();
     format!(
-        "{invocation} exited 0, but {MODELS_URL} never served `{ready_substr}` within \
+        "{invocation} exited 0, but {models_url} never served `{ready_substr}` within \
          {timeout_secs}s — the launch reported success and the engine then failed on its own"
     )
 }
@@ -139,7 +142,7 @@ async fn serve_and_wait(world: &mut E2eWorld, args: &[&str], model: &str, ready_
     let timeout_secs = serve_timeout_for(world);
     let device_state = ensure_serve_port_free().await;
     let (stdout, stderr, rc) = crate::run_rocm(world, args);
-    if rc == 0 && model_is_ready(MODELS_URL, Some(ready_substr), timeout_secs).await {
+    if rc == 0 && model_is_ready(&MODELS_URL, Some(ready_substr), timeout_secs).await {
         world.endpoint = Some(SERVE_BASE_URL.to_string());
         world.model_name = Some(model.to_string());
         return;
@@ -526,7 +529,7 @@ async fn setup_gpu_model(world: &mut E2eWorld) {
         let device_state = ensure_serve_port_free().await;
         let (stdout, stderr, rc) =
             crate::run_rocm(world, &["serve", model, "--engine", engine, "--managed"]);
-        if rc == 0 && model_is_ready(MODELS_URL, Some(ready_substr), timeout_secs).await {
+        if rc == 0 && model_is_ready(&MODELS_URL, Some(ready_substr), timeout_secs).await {
             world.endpoint = Some(SERVE_BASE_URL.to_string());
             world.model_name = Some(model.to_string());
             return;
@@ -566,8 +569,9 @@ async fn setup_gpu_model(world: &mut E2eWorld) {
             break;
         }
     }
+    let models_url = MODELS_URL.as_str();
     panic!(
-        "endpoint {MODELS_URL} did not serve model {ready_substr} after {made} attempt(s) of {timeout_secs}s each:\n{}",
+        "endpoint {models_url} did not serve model {ready_substr} after {made} attempt(s) of {timeout_secs}s each:\n{}",
         diagnostics.join("\n\n")
     );
 }
@@ -751,7 +755,7 @@ async fn user_serves_default_engine(world: &mut E2eWorld) {
     // 11435 may still answer from a prior scenario's leaked serve, and a
     // model-agnostic wait would then proceed against the wrong server.
     let timeout_secs = serve_timeout_for(world);
-    if rc == 0 && !model_is_ready(MODELS_URL, Some(&ready_substr), timeout_secs).await {
+    if rc == 0 && !model_is_ready(&MODELS_URL, Some(&ready_substr), timeout_secs).await {
         let headline = stall_headline(
             &format!("`rocm serve {model} --managed`"),
             &ready_substr,
