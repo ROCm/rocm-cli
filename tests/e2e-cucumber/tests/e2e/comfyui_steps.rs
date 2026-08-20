@@ -85,9 +85,14 @@ fn find_venv_python(root: &Path) -> Option<PathBuf> {
 
 /// The installed torch distribution's version string, or `None` if no torch
 /// distribution is installed. Reads dist metadata without importing torch (see
-/// [`TORCH_DIST_PROBE`]), so it works against a bare interpreter. A ROCm wheel
-/// carries a `+rocm...` local version, a CUDA wheel `+cu...`; callers judge the
-/// build from that label.
+/// [`TORCH_DIST_PROBE`]), so it works against a bare interpreter.
+///
+/// The local-version label identifies the build. A CUDA wheel is unmistakable:
+/// `+cu` (e.g. `2.7.0+cu128`). A ROCm build is NOT reliably `+rocm`, though —
+/// TheRock's managed torch labels the local version with a git hash
+/// (`2.11.0+gitd0c8b1f`, measured on the MI300X lane), so callers judge "ROCm" as
+/// "torch is present and is NOT a CUDA build", which is exactly the flip the
+/// EAI-8051 corruption would cause.
 fn torch_version(python: &Path) -> Option<String> {
     let output = std::process::Command::new(python)
         .args(["-c", TORCH_DIST_PROBE])
@@ -101,6 +106,15 @@ fn torch_version(python: &Path) -> Option<String> {
     data.get("version")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
+}
+
+/// Whether `version` is a CUDA torch build (carries a `+cuNNN` local label). The
+/// EAI-8051 defect replaces the runtime's ROCm/TheRock torch with a CUDA one, so
+/// this turning true is the corruption's signature. A ROCm/TheRock build is
+/// deliberately NOT identified positively (its label is a git hash, not `+rocm`):
+/// "still ROCm" is "torch present and not a CUDA build".
+fn is_cuda_torch(version: &str) -> bool {
+    version.to_ascii_lowercase().contains("+cu")
 }
 
 /// Enumerate installed distributions via `importlib.metadata` and emit their names
@@ -175,10 +189,8 @@ async fn assert_baseline_rocm_torch(world: &mut E2eWorld) {
     let python = active_runtime_python(world);
     let version = torch_version(&python);
     assert!(
-        version
-            .as_deref()
-            .is_some_and(|v| v.to_ascii_lowercase().contains("rocm")),
-        "baseline runtime torch is not a ROCm build; scenario premise absent \
+        version.as_deref().is_some_and(|v| !is_cuda_torch(v)),
+        "baseline runtime torch is absent or already a CUDA build; scenario premise absent \
          (torch version: {version:?}, python: {})",
         python.display()
     );
@@ -204,10 +216,8 @@ async fn assert_torch_still_rocm(world: &mut E2eWorld) {
     let python = active_runtime_python(world);
     let version = torch_version(&python);
     assert!(
-        version
-            .as_deref()
-            .is_some_and(|v| v.to_ascii_lowercase().contains("rocm")),
-        "ComfyUI install replaced the runtime's ROCm torch with a non-ROCm build \
+        version.as_deref().is_some_and(|v| !is_cuda_torch(v)),
+        "ComfyUI install replaced the runtime's ROCm torch with a CUDA build \
          (torch version now: {version:?}, python: {})",
         python.display()
     );
