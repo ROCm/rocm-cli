@@ -178,6 +178,35 @@ flaky = true
 when = { is_wsl = true, therock_family = "gfx*" }
 bug = "EAI-7998"
 reason = "`examine --json` reports has_amd_gpu:false on a WSL2 host whose own summary names a gfx target."
+# --- EAI-8031 (public mirror: ROCm/rocm-cli#260): on a Strix Halo WINDOWS host,
+# serving a canonical Hugging Face checkpoint through the `owner/repo:variant`
+# direct-serve path (`unsloth/Qwen3-0.6B-GGUF:Q4_0`) exits 0 but `/v1/models`
+# never lists the model, so the endpoint never becomes ready. Fails on every run
+# since the scenario was introduced by 37a3b63c (#242, 2026-08-12); it is the
+# lane's only host-independent unexpected failure.
+#
+# os=windows: this is specific to Windows AND to this serve path — the Strix Halo
+# Ubuntu lane passes the scenario, and on Windows the short-recipe-name path
+# (`serve-lemonade-inference`, same checkpoint) passes too. So it is not lemonade
+# managed serve at large, and must not widen to a bare `when = {}`.
+# therock_family/has_amd_gpu mirror the sibling rows and document intent: the
+# scenario is @requires-gpu, so on a no-GPU Windows lane it is SKIPPED, never
+# xfail'd.
+#
+# serve_timeout_secs: the lane leaves `E2E_SERVE_TIMEOUT_SECS` unset, so this
+# waits out the full 600s default on a serve that never arrives — ~10 minutes of
+# every run spent on a known bug. A HEALTHY lemonade serve of this same
+# (cache-warm) checkpoint on this host reaches ready in ~120s: measured on run
+# 32185662513, where the three passing GPU-serve scenarios took 117s, 117s and
+# 120s. 240s therefore keeps ~2x headroom — deliberately NOT the 90s used by the
+# EAI-7423 rows above, which is below a healthy serve here and would mask the
+# fix by keeping the scenario red once the bug is closed. Remove this row when
+# EAI-8031 lands; the resulting XPASS is the signal that it did. ---
+[["serve-hf-checkpoint-inference"]]
+when = { os = "windows", therock_family = "gfx*", has_amd_gpu = true }
+bug = "EAI-8031"
+reason = "Managed lemonade serve of a Hugging Face `owner/repo:variant` checkpoint exits 0 but the endpoint never becomes ready on Windows."
+serve_timeout_secs = 240
 
 # --- EAI-8053: `install driver --dkms` prefixes every plan command with a literal
 # `sudo `, unconditionally. As root that prefix is unnecessary, and on a root host
