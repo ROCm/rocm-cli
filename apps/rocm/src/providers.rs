@@ -35,11 +35,13 @@ pub(crate) struct ChatMessage {
     pub content: String,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ChatRequest {
     pub model: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
     pub rocm_tools: bool,
 }
 
@@ -985,6 +987,8 @@ fn local_openai_compatible_request(request: &ChatRequest) -> ChatRequest {
         model: request.model.clone(),
         messages,
         max_tokens: request.max_tokens,
+        temperature: request.temperature,
+        top_p: request.top_p,
         rocm_tools: request.rocm_tools,
     }
 }
@@ -1005,6 +1009,12 @@ fn openai_chat_request_body_with_stream(
         "stream": stream,
         "max_tokens": request.max_tokens.unwrap_or(512),
     });
+    if let Some(temperature) = request.temperature {
+        body["temperature"] = serde_json::json!(temperature);
+    }
+    if let Some(top_p) = request.top_p {
+        body["top_p"] = serde_json::json!(top_p);
+    }
     if request.rocm_tools && !stream {
         body["tools"] = serde_json::Value::Array(rocm_openai_tool_definitions());
         body["tool_choice"] = serde_json::json!("auto");
@@ -1228,6 +1238,12 @@ fn anthropic_chat_request_body_with_stream(
         .join("\n\n");
     if !system.is_empty() {
         body["system"] = serde_json::Value::String(system);
+    }
+    if let Some(temperature) = request.temperature {
+        body["temperature"] = serde_json::json!(temperature);
+    }
+    if let Some(top_p) = request.top_p {
+        body["top_p"] = serde_json::json!(top_p);
     }
     if request.rocm_tools && !stream {
         body["tools"] = serde_json::Value::Array(rocm_anthropic_tool_definitions());
@@ -1747,6 +1763,7 @@ mod tests {
                 }],
                 max_tokens: Some(1),
                 rocm_tools: false,
+                ..Default::default()
             },
         )
         .unwrap_err()
@@ -1881,6 +1898,7 @@ mod tests {
             }],
             max_tokens: Some(42),
             rocm_tools: false,
+            ..Default::default()
         };
         let openai = openai_chat_request_body("model-a", &request);
         assert_eq!(openai["model"], "model-a");
@@ -1894,6 +1912,40 @@ mod tests {
     }
 
     #[test]
+    fn request_bodies_include_temperature_and_top_p_only_when_set() {
+        let base = ChatRequest {
+            model: Some("model-a".to_owned()),
+            messages: vec![ChatMessage {
+                role: "user".to_owned(),
+                content: "hello".to_owned(),
+            }],
+            max_tokens: Some(42),
+            rocm_tools: false,
+            ..Default::default()
+        };
+
+        // Omitted by default so provider/server defaults are preserved.
+        let openai_default = openai_chat_request_body("model-a", &base);
+        assert!(openai_default.get("temperature").is_none());
+        assert!(openai_default.get("top_p").is_none());
+        let anthropic_default = anthropic_chat_request_body("claude-test", &base);
+        assert!(anthropic_default.get("temperature").is_none());
+        assert!(anthropic_default.get("top_p").is_none());
+
+        let tuned = ChatRequest {
+            temperature: Some(0.25),
+            top_p: Some(0.5),
+            ..base
+        };
+        let openai = openai_chat_request_body("model-a", &tuned);
+        assert_eq!(openai["temperature"], 0.25);
+        assert_eq!(openai["top_p"], 0.5);
+        let anthropic = anthropic_chat_request_body("claude-test", &tuned);
+        assert_eq!(anthropic["temperature"], 0.25);
+        assert_eq!(anthropic["top_p"], 0.5);
+    }
+
+    #[test]
     fn openai_local_qwen3_request_disables_thinking_for_visible_answers() {
         let request = ChatRequest {
             model: Some("Qwen3-0.6B-GGUF".to_owned()),
@@ -1903,6 +1955,7 @@ mod tests {
             }],
             max_tokens: Some(16),
             rocm_tools: false,
+            ..Default::default()
         };
 
         let body = openai_local_chat_request_body("Qwen3-0.6B-GGUF", &request);
@@ -1920,6 +1973,7 @@ mod tests {
             }],
             max_tokens: Some(42),
             rocm_tools: true,
+            ..Default::default()
         };
         let non_streaming = openai_chat_request_body("model-a", &request);
         assert_eq!(non_streaming["tool_choice"], "auto");
@@ -1984,6 +2038,7 @@ mod tests {
             ],
             max_tokens: Some(42),
             rocm_tools: true,
+            ..Default::default()
         };
 
         let non_streaming = anthropic_chat_request_body("claude-test", &request);
@@ -2116,6 +2171,7 @@ mod tests {
                 ],
                 max_tokens: Some(16),
                 rocm_tools: false,
+                ..Default::default()
             },
         )?;
         let request = server.join().expect("server thread should not panic")?;
@@ -2347,6 +2403,7 @@ mod tests {
                 }],
                 max_tokens: Some(16),
                 rocm_tools: true,
+                ..Default::default()
             },
         )?;
         let request = server.join().expect("server thread should not panic")?;
@@ -2419,6 +2476,7 @@ mod tests {
                 ],
                 max_tokens: Some(16),
                 rocm_tools: false,
+                ..Default::default()
             },
         )?;
         let request = server.join().expect("server thread should not panic")?;
@@ -2520,6 +2578,7 @@ mod tests {
                 }],
                 max_tokens: Some(16),
                 rocm_tools: false,
+                ..Default::default()
             },
             &mut |event| {
                 if event.content == "hel" {
@@ -2607,6 +2666,7 @@ mod tests {
                 }],
                 max_tokens: Some(16),
                 rocm_tools: false,
+                ..Default::default()
             },
         )?;
         let request = server.join().expect("server thread should not panic")?;
@@ -2680,6 +2740,7 @@ mod tests {
             }],
             max_tokens: Some(16),
             rocm_tools: false,
+            ..Default::default()
         };
         let body = openai_stream_chat_request_body("gpt-test", &chat_request);
         let mut events = Vec::new();
@@ -2781,6 +2842,7 @@ mod tests {
             }],
             max_tokens: Some(16),
             rocm_tools: false,
+            ..Default::default()
         };
         let body = anthropic_stream_chat_request_body("claude-test", &chat_request);
         let mut events = Vec::new();

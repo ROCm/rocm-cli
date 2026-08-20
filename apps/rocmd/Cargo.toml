@@ -21,3 +21,6 @@ serde_json.workspace = true
 sha2 = "0.10"
 tokio.workspace = true
 ureq = { version = "2.12", features = ["native-certs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

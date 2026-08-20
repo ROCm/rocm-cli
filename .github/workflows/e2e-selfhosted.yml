@@ -32,7 +32,7 @@ on:
         description: Which self-hosted runner(s) to target
         type: choice
         default: all
-        options: [all, app-dev-gpu, strix-ubuntu, strix-windows]
+        options: [all, app-dev-gpu, strix-ubuntu, strix-windows, strix-wsl]
       name_filter:
         description: "Scenario-name regex (cucumber --name); empty = full suite"
         type: string
@@ -78,7 +78,7 @@ jobs:
       - name: Filter changed paths (pull requests only)
         id: filter
         if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
           filters: |
             # Same `heavy` set as ci.yml: anything that can affect the E2E suite.
@@ -275,11 +275,12 @@ jobs:
           prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
-          # Build the rocm binary ONCE and reuse it for both the pre-warm and the
-          # suite (via ROCM_CLI_BINARY) so xtask does not rebuild. Honors
+          # Build the rocm and rocmd binaries ONCE and reuse them for both the
+          # pre-warm and suite so xtask does not rebuild. Honors
           # CARGO_TARGET_DIR set above.
-          cargo build --release -p rocm
+          cargo build --release -p rocm -p rocmd
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
+          export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
 
           # Pre-warm the shared runtime ONCE, SERIALLY, before the suite — never
           # lazily inside a concurrent scenario (two multi-GiB installs racing the
@@ -360,6 +361,12 @@ jobs:
       TMPDIR: /home/ubuntu/actions-runner/tmp
       PIP_CACHE_DIR: /home/ubuntu/actions-runner/pip-cache
       E2E_SERVE_TIMEOUT_SECS: "300"
+      # The three Strix lanes share one physical machine, and this workflow now
+      # runs a third of them, so a TUI frame that renders well inside the 30s
+      # default on an idle runner can miss it while a sibling lane loads a model.
+      # Raise the wait budget rather than let that read as a product failure; a
+      # genuine hang still fails, just later.
+      E2E_TUI_TIMEOUT_SECS: "90"
       # Match the MI300X dispatch path: opt into the platform-adaptive large-model
       # scenario only when the manual include_nightly input is enabled.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
@@ -442,10 +449,10 @@ jobs:
           prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
-          # Build the rocm binary once; reuse for pre-warm + suite so xtask doesn't
-          # rebuild.
-          cargo build --release -p rocm
+          # Build the rocm and rocmd binaries once; reuse them for pre-warm + suite.
+          cargo build --release -p rocm -p rocmd
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
+          export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
 
           # Pre-warm once, serially, in place (no mv/symlink). Skipped once the tree
           # is populated (persists across runs on RUNNER_WORKSPACE).
@@ -504,6 +511,12 @@ jobs:
       )
     continue-on-error: true
     env:
+      # The three Strix lanes share one physical machine, and this workflow now
+      # runs a third of them, so a TUI frame that renders well inside the 30s
+      # default on an idle runner can miss it while a sibling lane loads a model.
+      # Raise the wait budget rather than let that read as a product failure; a
+      # genuine hang still fails, just later.
+      E2E_TUI_TIMEOUT_SECS: "90"
       # Match the Linux Strix dispatch path: opt into the platform-adaptive
       # large-model scenario only when the manual input is enabled.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
@@ -593,13 +606,14 @@ jobs:
           $prewarm = "$env:RUNNER_WORKSPACE\e2e-prewarm"
           $env:E2E_SHARED_RUNTIMES_DIR = "$prewarm\data\runtimes"
 
-          # Build the rocm binary once; reuse for pre-warm + suite so xtask doesn't
-          # rebuild. This job does not set CARGO_TARGET_DIR, so the binary lands in
+          # Build the rocm and rocmd binaries once; reuse them for pre-warm + suite.
+          # This job does not set CARGO_TARGET_DIR, so the binaries land in
           # the default target\release (fall back to it when the env var is unset).
-          cargo build --release -p rocm
+          cargo build --release -p rocm -p rocmd
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "target" }
           $env:ROCM_CLI_BINARY = "$targetDir\release\rocm.exe"
+          $env:ROCM_CLI_ROCMD_BINARY = "$targetDir\release\rocmd.exe"
 
           # Pre-warm once, in place (no move/symlink). Skipped once the tree is
           # populated (persists across runs on RUNNER_WORKSPACE).
@@ -636,6 +650,200 @@ jobs:
           name: e2e-gpu-strix-windows-report
           path: tests/e2e-cucumber/results/
 
+  # WSL2 coverage on real hardware: the runner is an Ubuntu distro running under
+  # WSL2 on the Strix Halo Windows box, so this lane exercises the WSL host
+  # boundary AND whatever GPU access WSL exposes. Same suite as every other
+  # platform — scenarios the host cannot satisfy resolve to skip from the
+  # capability probe, so nothing is filtered out here. `wsl` in `runs-on`
+  # disambiguates it from the `native` Strix Linux runner. Non-blocking while
+  # GPU-on-WSL is proven out.
+  e2e-wsl:
+    name: E2E tests (Strix Halo, WSL2)
+    # A manual include_nightly dispatch runs the 2400s large-model readiness
+    # scenario, so match the dedicated nightly lane's cap and leave room for
+    # build, runtime pre-warm, the rest of the suite, and platform.json.
+    timeout-minutes: 90
+    runs-on: [self-hosted, linux, strix-halo, wsl]
+    needs: [changes]
+    # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-wsl. Gated on
+    # `serve` like the sibling lanes rather than the broader `heavy`: the
+    # consolidated report gates on `serve` too, so a heavy-but-not-serve change
+    # would otherwise run this lane and then discard its artifact unreported.
+    if: >-
+      always()
+      && needs.changes.result == 'success'
+      && (
+        (github.event_name != 'workflow_dispatch'
+          && needs.changes.outputs.serve == 'true')
+        || (github.event_name == 'workflow_dispatch'
+          && (inputs.platform == 'all' || inputs.platform == 'strix-wsl'))
+      )
+    continue-on-error: true
+    env:
+      E2E_SERVE_TIMEOUT_SECS: "300"
+      # The three Strix lanes share one physical machine, and this workflow now
+      # runs a third of them, so a TUI frame that renders well inside the 30s
+      # default on an idle runner can miss it while a sibling lane loads a model.
+      # Raise the wait budget rather than let that read as a product failure; a
+      # genuine hang still fails, just later.
+      E2E_TUI_TIMEOUT_SECS: "90"
+      # Match the other hardware lanes: opt into the platform-adaptive
+      # large-model scenario only when the manual include_nightly input is on.
+      E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
+      # Heavy @merge-queue serves run only in the merge queue; see e2e-gpu.
+      E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Fail fast and loudly if this job ever lands on a native Linux runner:
+      # every WSL-tagged scenario would silently resolve to skip instead.
+      - name: Verify the host really is WSL2
+        run: |
+          proc_version=$(cat /proc/version 2>/dev/null || true)
+          if [ ! -e /dev/dxg ] \
+            && [ -z "${WSL_DISTRO_NAME+x}" ] \
+            && ! printf '%s\n' "$proc_version" | grep -qiE 'microsoft|wsl'; then
+            echo "::error::runner is not a WSL host: $(uname -r)"
+            exit 1
+          fi
+          printf 'WSL kernel: %s\n' "$(uname -r)"
+
+      # The native Strix runners come pre-provisioned; a WSL distro often does
+      # not. Install the native build deps only when something is missing, and
+      # only if passwordless sudo is available — otherwise say what is missing
+      # instead of hanging on a password prompt.
+      - name: Ensure native build deps
+        run: |
+          missing=""
+          command -v pkg-config >/dev/null 2>&1 || missing="$missing pkg-config"
+          command -v cc >/dev/null 2>&1 || missing="$missing build-essential"
+          pkg-config --exists libcap 2>/dev/null || missing="$missing libcap-dev"
+          if [ -z "$missing" ]; then
+            echo "native build deps present"
+          elif sudo -n true 2>/dev/null; then
+            echo "installing:$missing"
+            sudo -n apt-get update
+            # shellcheck disable=SC2086
+            sudo -n apt-get install -y $missing
+          else
+            echo "::error::missing native build deps:$missing (no passwordless sudo to install them)"
+            exit 1
+          fi
+
+      - name: Reclaim GPU from stray E2E processes
+        run: |
+          # Reclaim from any serve leaked by a killed/timed-out prior run
+          # (see e2e-gpu). Scoped to e2e leftovers only.
+          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
+          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
+          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
+          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
+          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
+          echo "reclaimed"
+
+      # GPU preflight, bounded like the native lanes — but ADVISORY here. GPU
+      # access under WSL is exactly what this lane is proving out, so an absent
+      # rocm-smi is a reported condition, not a job failure: the capability probe
+      # then resolves @requires-gpu scenarios to skip and the rest still runs. A
+      # GPU that IS present but stays held by a leftover serve still fails, since
+      # that would corrupt the serve scenarios' results.
+      - name: GPU preflight (advisory bounded wait)
+        run: |
+          MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-8}"
+          CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
+          if ! command -v rocm-smi >/dev/null 2>&1; then
+            echo "::warning::rocm-smi not found in this WSL distro — GPU scenarios will resolve to skip"
+            exit 0
+          fi
+          min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
+          deadline=$(( SECONDS + CEILING_SECS ))
+          saw_vram=0
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
+            total=$(printf '%s\n' "$out" | grep -i 'VRAM Total Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            used=$(printf '%s\n' "$out" | grep -i 'VRAM Total Used Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            if [ -z "$total" ] || [ -z "$used" ]; then
+              sleep 5; continue
+            fi
+            saw_vram=1
+            free=$(( total - used ))
+            if [ "$free" -ge "$min_free" ]; then
+              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB free (>= ${MIN_FREE_GIB} GiB)."
+              exit 0
+            fi
+            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB)…"
+            sleep 5
+          done
+          if [ "$saw_vram" -eq 0 ]; then
+            echo "::warning::rocm-smi reported no VRAM figures under WSL — GPU scenarios will resolve to skip"
+            exit 0
+          fi
+          echo "::error::GPU preflight failed after ${CEILING_SECS}s: VRAM never dropped below the floor — a serve is likely still holding the GPU"
+          exit 1
+
+      # Bootstrap rustup with --no-modify-path so it never writes $HOME/.profile
+      # (setup-rust-toolchain doesn't expose that flag). rust-toolchain.toml pins
+      # the exact toolchain, installed on first cargo use. Idempotent.
+      - name: Ensure Rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --default-toolchain none
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Run E2E tests on Strix Halo WSL2
+        run: |
+          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
+          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
+          # Share ONE installed managed runtime across serve/chat scenarios and
+          # PRE-WARM it in place (mirrors e2e-gpu-strix-ubuntu). Required for
+          # correctness, not speed: `install sdk` bakes ABSOLUTE paths into the
+          # runtime manifest, so installing into a per-scenario temp dir leaves
+          # every later serve pointing at a deleted install root.
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
+          export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
+
+          # Build the rocm and rocmd binaries once; reuse them for pre-warm + suite.
+          cargo build --release -p rocm -p rocmd
+          export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
+          export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
+
+          # Pre-warm once, serially, in place (no mv/symlink). Skipped once the
+          # tree is populated (persists across runs on RUNNER_WORKSPACE).
+          if [ ! -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
+            echo "pre-warming shared runtime (first run on this runner)…"
+            mkdir -p "$prewarm"/{data,config,cache}
+            ROCM_CLI_CONFIG_DIR="$prewarm/config" \
+            ROCM_CLI_DATA_DIR="$prewarm/data" \
+            ROCM_CLI_CACHE_DIR="$prewarm/cache" \
+            HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
+              "$ROCM_CLI_BINARY" install sdk
+            if [ -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
+              echo "shared runtime pre-warmed at $E2E_SHARED_RUNTIMES_DIR"
+            else
+              echo "pre-warm did not produce a runtimes registry; scenarios will install their own" >&2
+            fi
+          else
+            echo "shared runtime already present at $E2E_SHARED_RUNTIMES_DIR — skipping pre-warm"
+          fi
+
+          # Optional scenario-name filter for a scoped manual dispatch.
+          NAME_FILTER="${{ github.event.inputs.name_filter }}"
+          if [ -n "$NAME_FILTER" ]; then
+            echo "name filter active: $NAME_FILTER"
+            cargo xtask e2e -- --name "$NAME_FILTER"
+          else
+            cargo xtask e2e
+          fi
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-strix-wsl-report
+          path: tests/e2e-cucumber/results/
+
   # Consolidate this workflow's self-hosted platform reports into one GPU-side
   # cross-platform grid (Summary + merged HTML). Distinct name from ci.yml's
   # required `E2E consolidated report` so it does NOT collide with that required
@@ -651,6 +859,7 @@ jobs:
       - e2e-gpu
       - e2e-gpu-strix-ubuntu
       - e2e-gpu-strix-windows
+      - e2e-wsl
     # Gate on `serve`: every lane this report consolidates (the GPU jobs) is now
     # serve-gated, so a serve-only change runs them and their report must still be
     # produced. On dispatch `serve` is unset, so also run when the trigger was

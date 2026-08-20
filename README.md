@@ -253,6 +253,32 @@ rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
 runtime. It does not work with standard ROCm package installs (e.g.
 `/opt/rocm`); use `rocm install sdk` instead.
 
+### Disk space
+
+Each ROCm install keeps its own multi-gigabyte folder, so installing or
+updating a few times adds up. `rocm storage` shows where the space went and
+frees the parts that are safe to remove:
+
+```
+rocm storage [report] [--json]
+rocm storage remove-old-installs [--keep N] [--dry-run] [--yes]
+rocm storage remove-downloads [--dry-run] [--yes]
+```
+
+`remove-old-installs` keeps the two most recent installs for each channel,
+format, and GPU family, and never touches the install in use, the rollback
+target, or a folder rocm-cli did not create. "Most recent" means most recently
+installed rather than highest version, so after a deliberate downgrade the
+older version counts as the newer install. Because the count applies per
+channel, format, and GPU family, a machine that has tried several channels
+keeps `--keep` installs for each of them. Anything it declines to remove is
+listed with the reason, and `--dry-run` shows the whole plan without changing
+anything. `remove-downloads` clears cached archives that rocm-cli can download
+again; a cache folder that is a link to somewhere else is left alone rather
+than followed. The report also lists the
+`uv` package cache and downloaded models; those are shared with other tools
+and are never removed by rocm-cli.
+
 ### Inference engines
 
 ```
@@ -276,7 +302,25 @@ rocm serve <model> [--engine lemonade|vllm]
                    [--verbose] [--foreground | --managed]
                    [--no-smoke-test]
                    [--allow-public-bind]
+                   [--temperature TEMP] [--top-p PROB] [--max-tokens N]
 ```
+
+`--temperature` (>= 0.0), `--top-p` (0.0-1.0), and `--max-tokens` (> 0) set
+server-wide sampling defaults for the launched engine. They apply only to
+`vllm` and `lemonade`; other engines reject them. For vLLM they are folded
+into a single `--override-generation-config` JSON object (`--max-tokens` maps
+to vLLM's `max_new_tokens`); for Lemonade they pass straight through as
+llama.cpp's `--temperature`, `--top-p`, and `--n-predict` flags. Each control
+is optional and independent — omit any of them to keep the engine's own
+default.
+
+`rocm serve` only reuses an already-running service for the same engine and
+model if its sampling controls (and other recipe settings) match the ones
+requested this time; otherwise it errors out instead of silently serving with
+different settings. If you previously started a service with `--temperature`
+(or another sampling flag) and now run `rocm serve` for the same model without
+flags — or with different ones — stop the existing service first (`rocm
+services stop`) or match the original flags.
 
 By default the server runs in the background under rocm-cli's supervision and
 prints a deployment summary — a progress indicator while it starts, then a table
@@ -366,10 +410,13 @@ and a chat tab backed by any configured provider. See
 
 ```
 rocm chat [--provider anthropic|openai|...] [--model NAME] [--prompt TEXT] [--tools]
+          [--temperature TEMP] [--top-p PROB] [--max-tokens N]
 ```
 
 Chat with an AI provider from the terminal. Reads from stdin when `--prompt` is
-omitted.
+omitted. `--temperature`, `--top-p`, and `--max-tokens` are optional sampling
+controls forwarded to the request; each is independent, so omit any of them to
+use the provider's default.
 
 ### ComfyUI
 

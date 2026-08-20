@@ -52,8 +52,6 @@ pub use proc_lifecycle::{
     process_start_ticks, terminate_verified,
 };
 use runtime::env_path_override;
-#[cfg(test)]
-use runtime::home_rocm_dir;
 pub use runtime::{
     RuntimeHost, RuntimePlatform, current_executable_path, default_cache_dir, default_config_dir,
     default_data_dir, default_interactive_shell_program, managed_logs_dir, managed_pip_cache_dir,
@@ -69,7 +67,7 @@ pub use runtime::{
     runtime_path_text_is_absolute_for_platform, runtime_paths_equivalent,
     runtime_python_activation_hint, runtime_python_activation_script, runtime_python_bin_dir_name,
     runtime_python_env_bin_dir, runtime_python_executable_in_env, runtime_python_executable_name,
-    runtime_rocm_library_filename, shell_command_for_host,
+    runtime_rocm_library_filename, shell_command_for_host, user_runtime_dir,
 };
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV, UvCacheSource,
@@ -1565,7 +1563,7 @@ impl AppPaths {
     pub fn discover() -> Result<Self> {
         let data_dir_override = env_path_override("ROCM_CLI_DATA_DIR");
         let cache_dir_override = env_path_override("ROCM_CLI_CACHE_DIR");
-        let mut paths = Self {
+        let paths = Self {
             config_dir: env_path_override("ROCM_CLI_CONFIG_DIR")
                 .or_else(default_config_dir)
                 .context("unable to determine config directory for rocm-cli")?,
@@ -1579,12 +1577,24 @@ impl AppPaths {
                 .context("unable to determine cache directory for rocm-cli")?,
         }
         .normalize_for_host();
-        if data_dir_override.is_none()
+        Ok(Self::discover_from_paths(
+            paths,
+            data_dir_override.is_some(),
+            cache_dir_override.is_some(),
+        ))
+    }
+
+    fn discover_from_paths(
+        mut paths: Self,
+        data_dir_overridden: bool,
+        cache_dir_overridden: bool,
+    ) -> Self {
+        if !data_dir_overridden
             && let Some(managed_root) = configured_managed_root_from_config(&paths)
         {
-            paths = paths.with_managed_root(managed_root, cache_dir_override.is_some());
+            paths = paths.with_managed_root(managed_root, cache_dir_overridden);
         }
-        Ok(paths.normalize_for_host())
+        paths.normalize_for_host()
     }
 
     fn normalize_for_host(mut self) -> Self {
@@ -5241,8 +5251,8 @@ pub struct RocmCliConfig {
 fn default_dashboard_socket() -> String {
     // Choose a socket location whose *parent* directory is always user-owned so
     // that run_unix can tighten it to 0o700 without EPERM. See
-    // `dashboard_socket_path` for the precedence. This resolver is mirrored in
-    // `rocm-dash-core` so the canonical `rocm` config and a standalone
+    // `runtime::user_runtime_dir` for the precedence. This resolver is mirrored
+    // in `rocm-dash-core` so the canonical `rocm` config and a standalone
     // `rocm-dash` config resolve to the same place; keep the two in sync.
     let path = dashboard_socket_path(
         std::env::var_os("XDG_RUNTIME_DIR"),
@@ -5266,48 +5276,18 @@ fn default_dashboard_socket() -> String {
 /// 2. `$HOME/.rocm/data/telemetry` — standard per-user data dir.
 /// 3. `temp_dir()/rocm-<user>` — user-named subdir so the parent is something we
 ///    create and own, not `/tmp` itself.
+///
+/// The tier chain itself lives in [`user_runtime_dir`], which the Lemonade
+/// engine also uses to synthesize a runtime directory for its child process.
+/// Only tier 2 needs the `telemetry` leaf: tiers 1 and 3 are already per-user
+/// runtime directories, so the socket sits directly in them.
 fn dashboard_socket_path(
     xdg_runtime_dir: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
     user: Option<String>,
     temp_dir: std::path::PathBuf,
 ) -> std::path::PathBuf {
-    use std::path::PathBuf;
-    xdg_runtime_dir
-        .filter(|v| !v.is_empty())
-        .map(|d| PathBuf::from(d).join("rocmdashd.sock"))
-        .or_else(|| {
-            home.filter(|v| !v.is_empty()).map(|h| {
-                PathBuf::from(h)
-                    .join(".rocm")
-                    .join("data")
-                    .join("telemetry")
-                    .join("rocmdashd.sock")
-            })
-        })
-        .unwrap_or_else(|| {
-            let raw = user.unwrap_or_else(|| "user".to_owned());
-            // Sanitize: keep only alphanumeric, hyphen, and underscore so a path
-            // separator or `..` in the env var cannot escape the subdirectory.
-            let sanitized: String = raw
-                .chars()
-                .map(|c| {
-                    if c.is_alphanumeric() || c == '-' || c == '_' {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .collect();
-            let sanitized = if sanitized.is_empty() {
-                "user".to_owned()
-            } else {
-                sanitized
-            };
-            temp_dir
-                .join(format!("rocm-{sanitized}"))
-                .join("rocmdashd.sock")
-        })
+    user_runtime_dir(xdg_runtime_dir, home, user, temp_dir, "telemetry", "").join("rocmdashd.sock")
 }
 
 fn default_dashboard_listen() -> String {
@@ -5390,10 +5370,49 @@ impl DashboardDaemonConfig {
     }
 }
 
+fn deserialize_optional_chat_temperature<'de, D>(deserializer: D) -> Result<Option<f32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<f32>::deserialize(deserializer)?;
+    if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
+        return Err(serde::de::Error::custom(
+            "dashboard.tui.chat_temperature must be a finite value >= 0.0",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_optional_chat_top_p<'de, D>(deserializer: D) -> Result<Option<f32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<f32>::deserialize(deserializer)?;
+    if value.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+        return Err(serde::de::Error::custom(
+            "dashboard.tui.chat_top_p must be a finite value between 0.0 and 1.0",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_optional_chat_max_tokens<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<u32>::deserialize(deserializer)?;
+    if value == Some(0) {
+        return Err(serde::de::Error::custom(
+            "dashboard.tui.chat_max_tokens must be greater than 0",
+        ));
+    }
+    Ok(value)
+}
+
 /// Dashboard TUI spec. The chat endpoint URL / model / auth-header *name* are
 /// plain data; the auth-header *value* (API key) is always env-only and never
 /// stored here (AMD gateway invariant).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DashboardTuiConfig {
     #[serde(default = "default_dashboard_connect")]
     pub connect: String,
@@ -5405,6 +5424,31 @@ pub struct DashboardTuiConfig {
     pub chat_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_auth_header: Option<String>,
+    /// Sampling temperature applied to chat requests (parity with the
+    /// `rocm chat` / `rocm serve` `--temperature` flag). `None` leaves the
+    /// endpoint default untouched; a CLI flag overrides this.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_chat_temperature",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub chat_temperature: Option<f32>,
+    /// Nucleus-sampling `top_p` applied to chat requests (parity with
+    /// `--top-p`). `None` leaves the endpoint default untouched.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_chat_top_p",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub chat_top_p: Option<f32>,
+    /// Upper bound on generated tokens for chat requests (parity with
+    /// `--max-tokens`). `None` uses the built-in dashboard default.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_chat_max_tokens",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub chat_max_tokens: Option<u32>,
 }
 
 impl Default for DashboardTuiConfig {
@@ -5415,6 +5459,9 @@ impl Default for DashboardTuiConfig {
             chat_url: None,
             chat_model: None,
             chat_auth_header: None,
+            chat_temperature: None,
+            chat_top_p: None,
+            chat_max_tokens: None,
         }
     }
 }
@@ -7766,6 +7813,29 @@ mod tests {
         Status(&'static str),
     }
 
+    impl DownloadReply {
+        fn client_may_disconnect(self) -> bool {
+            matches!(
+                self,
+                Self::ResumeAtWrongOffset { .. } | Self::Truncated { sent: 0 }
+            )
+        }
+    }
+
+    fn allow_expected_peer_disconnect(result: std::io::Result<()>) -> std::io::Result<()> {
+        match result {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
     /// Serve `body` over loopback, answering each request per `replies`.
     /// Returns the port and a handle yielding the raw requests received.
     fn spawn_download_server(
@@ -7802,6 +7872,7 @@ mod tests {
                     .unwrap_or(0);
                 requests.push(request);
                 let total = body.len();
+                let client_may_disconnect = reply.client_may_disconnect();
                 match reply {
                     DownloadReply::Complete | DownloadReply::IgnoreRange => {
                         write!(
@@ -7835,7 +7906,7 @@ mod tests {
                             total.saturating_sub(1),
                             total - start
                         )?;
-                        stream.write_all(&body[start..])?;
+                        allow_expected_peer_disconnect(stream.write_all(&body[start..]))?;
                     }
                     DownloadReply::Status(status_line) => {
                         write!(
@@ -7844,7 +7915,11 @@ mod tests {
                         )?;
                     }
                 }
-                stream.flush()?;
+                if client_may_disconnect {
+                    allow_expected_peer_disconnect(stream.flush())?;
+                } else {
+                    stream.flush()?;
+                }
             }
             Ok(requests)
         });
@@ -7868,6 +7943,27 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("failed to create scratch dir");
         dir
+    }
+
+    #[test]
+    fn download_fixture_tolerates_only_expected_peer_disconnects() {
+        assert!(DownloadReply::ResumeAtWrongOffset { start: 1 }.client_may_disconnect());
+        assert!(DownloadReply::Truncated { sent: 0 }.client_may_disconnect());
+        assert!(!DownloadReply::Truncated { sent: 1 }.client_may_disconnect());
+        assert!(!DownloadReply::Complete.client_may_disconnect());
+
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionReset,
+        ] {
+            allow_expected_peer_disconnect(Err(std::io::Error::from(kind)))
+                .expect("an intentionally rejected response may close its socket");
+        }
+
+        let error =
+            allow_expected_peer_disconnect(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)))
+                .expect_err("unrelated fixture I/O failures must remain visible");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[test]
@@ -8126,7 +8222,8 @@ mod tests {
     fn download_refuses_a_body_over_the_approved_limit() -> Result<()> {
         let body = download_body();
         let total = body.len() as u64;
-        let (port, server) = spawn_download_server(body, vec![DownloadReply::Complete])?;
+        let (port, server) =
+            spawn_download_server(body, vec![DownloadReply::Truncated { sent: 0 }])?;
         let dir = download_scratch("max-bytes");
         let destination = dir.join("artifact.bin");
         let url = format!("http://127.0.0.1:{port}/artifact.bin");
@@ -10861,34 +10958,35 @@ Class Name:                Display
     }
 
     #[test]
-    fn app_paths_discover_defaults_to_home_rocm_when_unoverridden() -> Result<()> {
-        if env_path_override("ROCM_CLI_CONFIG_DIR").is_some()
-            || env_path_override("ROCM_CLI_DATA_DIR").is_some()
-            || env_path_override("ROCM_CLI_CACHE_DIR").is_some()
-        {
-            return Ok(());
-        }
-        let Some(home_rocm) = home_rocm_dir() else {
-            return Ok(());
-        };
+    fn app_paths_apply_configured_managed_root_when_unoverridden() -> Result<()> {
+        let (root, paths) = temp_app_paths("configured-managed-root");
+        let managed_root = root.join("managed");
+        let persisted_runtime = managed_root
+            .join("runtimes")
+            .join("wheel")
+            .join("release-wheel-gfx942-7-0");
+        fs::create_dir_all(&paths.config_dir)?;
+        fs::write(
+            paths.config_path(),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "setup": { "therock_venv": persisted_runtime }
+            }))?,
+        )?;
 
-        let paths = AppPaths::discover()?;
+        let discovered = AppPaths::discover_from_paths(paths.clone(), false, false);
+        assert_eq!(discovered.config_dir, paths.config_dir);
+        assert_eq!(discovered.data_dir, managed_root);
+        assert_eq!(discovered.cache_dir, managed_root.join("cache"));
 
-        assert_eq!(paths.config_dir, home_rocm);
-        let home_paths = AppPaths {
-            config_dir: home_rocm.clone(),
-            data_dir: home_rocm.clone(),
-            cache_dir: home_rocm.join("cache"),
-        };
-        if let Some(managed_root) = configured_managed_root_from_config(&home_paths) {
-            let managed_root = normalize_runtime_path_for_host(&managed_root);
-            assert_eq!(paths.data_dir, managed_root);
-            assert_eq!(paths.cache_dir, managed_root.join("cache"));
-        } else {
-            assert_eq!(paths.data_dir, home_rocm);
-            assert_eq!(paths.cache_dir, home_rocm.join("cache"));
-        }
-        assert_eq!(paths.config_path(), home_rocm.join("config.json"));
+        let data_overridden = AppPaths::discover_from_paths(paths.clone(), true, false);
+        assert_eq!(data_overridden.data_dir, paths.data_dir);
+        assert_eq!(data_overridden.cache_dir, paths.cache_dir);
+
+        let cache_overridden = AppPaths::discover_from_paths(paths.clone(), false, true);
+        assert_eq!(cache_overridden.data_dir, managed_root);
+        assert_eq!(cache_overridden.cache_dir, paths.cache_dir);
+
+        fs::remove_dir_all(root).ok();
         Ok(())
     }
 
@@ -11100,6 +11198,48 @@ Class Name:                Display
             "default listen must use unix scheme"
         );
         assert_eq!(relisten.daemon.listen, "tcp:127.0.0.1:9000");
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn dashboard_tui_inference_params_round_trip_and_default_absent() {
+        // Defaults leave the sampling knobs unset and out of the serialized JSON
+        // (skip_serializing_if), so a stock config carries no sampling override.
+        let default_json = serde_json::to_value(DashboardTuiConfig::default()).unwrap();
+        assert!(default_json.get("chat_temperature").is_none());
+        assert!(default_json.get("chat_top_p").is_none());
+        assert!(default_json.get("chat_max_tokens").is_none());
+
+        // When set, all three round-trip through JSON unchanged.
+        let cfg = DashboardTuiConfig {
+            chat_temperature: Some(0.25),
+            chat_top_p: Some(0.5),
+            chat_max_tokens: Some(512),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: DashboardTuiConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.chat_temperature, Some(0.25));
+        assert_eq!(back.chat_top_p, Some(0.5));
+        assert_eq!(back.chat_max_tokens, Some(512));
+    }
+
+    #[test]
+    fn dashboard_tui_rejects_invalid_inference_params() {
+        for (field, value, expected) in [
+            ("chat_temperature", "-0.1", "chat_temperature"),
+            ("chat_top_p", "1.1", "chat_top_p"),
+            ("chat_max_tokens", "0", "chat_max_tokens"),
+        ] {
+            let json = format!(r#"{{"{field}":{value}}}"#);
+            let error = serde_json::from_str::<DashboardTuiConfig>(&json)
+                .expect_err("invalid inference parameter must be rejected")
+                .to_string();
+            assert!(
+                error.contains(expected),
+                "unexpected error for {field}: {error}"
+            );
+        }
     }
 
     #[test]
