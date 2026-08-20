@@ -579,7 +579,8 @@ enum InstallTarget {
     #[command(after_help = "EXAMPLES:\n  \
 rocm install sdk\n  \
 rocm install sdk --channel nightly --build-date 2025-01-15\n  \
-rocm install sdk --family gfx110X-all --dry-run")]
+rocm install sdk --family gfx110X-all --dry-run\n  \
+rocm install sdk --devel")]
     Sdk {
         /// Package channel to install, such as release or nightly.
         #[arg(long, default_value = "release")]
@@ -12979,7 +12980,7 @@ fn render_install_sdk_dry_run_for_args(paths: &AppPaths, args: &[String]) -> Res
     let version = chat_cli_arg_value(args, "--version").map(str::to_owned);
     let build_date = chat_cli_arg_value(args, "--build-date").map(str::to_owned);
     let selector = therock_install_version_selector(version, build_date)?;
-    let devel = args.iter().any(|arg| arg == "--devel");
+    let devel = chat_cli_has_flag(args, "--devel");
     therock::install_sdk(
         paths,
         therock::SdkInstallRequest {
@@ -24204,6 +24205,27 @@ install therock";
             "gfx110X-all",
         ])
         .expect("install sdk should accept a TheRock family override");
+    }
+
+    #[test]
+    fn install_sdk_devel_flag_defaults_off_and_wires_through_when_passed() {
+        let cli = Cli::try_parse_from(["rocm", "install", "sdk"])
+            .expect("install sdk should parse with no flags");
+        match cli.command {
+            Some(Command::Install {
+                target: InstallTarget::Sdk { devel, .. },
+            }) => assert!(!devel, "--devel should default to false"),
+            other => panic!("expected an install sdk target, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["rocm", "install", "sdk", "--devel"])
+            .expect("install sdk should accept --devel");
+        match cli.command {
+            Some(Command::Install {
+                target: InstallTarget::Sdk { devel, .. },
+            }) => assert!(devel, "--devel should set the flag to true"),
+            other => panic!("expected an install sdk target, got {other:?}"),
+        }
     }
 
     #[test]

@@ -4548,6 +4548,56 @@ mod tests {
         );
     }
 
+    /// A plain reinstall (`rocm install sdk`, no `--devel`) overwrites the
+    /// manifest unconditionally, `devel` included — there is no merge with the
+    /// prior manifest. This pins that behaviour: a user who installed with
+    /// `--devel` and later reinstalls the same runtime key without it keeps
+    /// `hipcc`/headers on disk, but the manifest silently records `devel:
+    /// false`, and `apply_runtime_update` reinstalls from that field on the
+    /// next `rocm update`. Documented as-is rather than fixed here — the flag
+    /// reflects what the most recent install actually asked for, which is
+    /// arguably correct; the drift risk is that neither `rocm runtimes list`
+    /// nor `rocm examine` surfaces `devel`, so the state is invisible.
+    #[test]
+    fn reinstall_without_devel_overwrites_manifest_devel_flag() -> Result<()> {
+        let (root, paths) = test_paths("reinstall-overwrites-devel");
+        let install_root = root.join("install-root");
+        fs::create_dir_all(&install_root)?;
+        let with_devel = InstalledRuntimeManifest {
+            install_root,
+            ..test_runtime_manifest(
+                "release-wheel-gfx110X-all-7.13.0",
+                "therock-release:gfx110X-all",
+                1,
+            )
+        };
+        assert!(
+            with_devel.devel,
+            "test fixture should start with devel: true"
+        );
+        save_runtime_manifest(&paths, &with_devel)?;
+
+        let without_devel = InstalledRuntimeManifest {
+            devel: false,
+            installed_at_unix_ms: 2,
+            ..with_devel.clone()
+        };
+        save_runtime_manifest(&paths, &without_devel)?;
+
+        let manifests = load_runtime_manifests(&paths)?;
+        let reloaded = manifests
+            .iter()
+            .find(|manifest| manifest.runtime_key == with_devel.runtime_key)
+            .expect("manifest should still be registered under the same runtime_key");
+        assert!(
+            !reloaded.devel,
+            "a plain reinstall must overwrite devel, not merge with the prior manifest"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
     /// A resolution failure must describe the install that was actually asked
     /// for. Naming `devel` to someone who never passed `--devel` sends them
     /// looking for a toolchain problem they do not have.

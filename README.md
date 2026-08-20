@@ -250,7 +250,7 @@ the JSON report, not the human-readable one.
 ```
 rocm install sdk    [--channel release|nightly] [--format wheel|tarball]
                     [--version x.y.z | --build-date YYYY-MM-DD]
-                    [--family gfx110X-all] [--prefix PATH] [--dry-run]
+                    [--family gfx110X-all] [--prefix PATH] [--devel] [--dry-run]
 
 rocm install driver [--dkms] [--yes] [--dry-run] [--reconcile]
 
@@ -258,9 +258,10 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 ```
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
-by rocm-cli. `install driver` installs the AMD kernel driver on Linux (DKMS or
-native package). `update` checks for a newer ROCm package; pass `--apply` to
-install it.
+by rocm-cli; pass `--devel` to also install the compiler and headers needed to
+build GPU code, roughly doubling the download. `install driver` installs the
+AMD kernel driver on Linux (DKMS or native package). `update` checks for a
+newer ROCm package; pass `--apply` to install it.
 
 ### Runtime management
 

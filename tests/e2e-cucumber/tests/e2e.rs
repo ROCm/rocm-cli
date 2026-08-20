@@ -147,9 +147,10 @@ fn shared_uv_cache_dir() -> Option<PathBuf> {
 /// persistent disk; unset for local runs, where every scenario installs its own.
 ///
 /// Why opt-in and not global: a cold `rocm install sdk` installs a multi-GiB
-/// TheRock runtime (and its post-install probe unpacks an ~8.8 GiB devel tarball),
-/// and each scenario's isolated data dir made it re-run per scenario — the GPU job
-/// then exceeds its time cap. Scenarios that just need a runtime present
+/// TheRock runtime (`--devel`, when passed, unpacks an additional ~8.8 GiB
+/// compiler/headers tarball), and each scenario's isolated data dir made it
+/// re-run per scenario — the GPU job then exceeds its time cap. Scenarios that
+/// just need a runtime present
 /// ("a managed runtime is active") point their `data/runtimes` at this shared tree
 /// (see [`E2eWorld::use_shared_runtimes`]) so the install happens once per runner.
 /// Scenarios that ASSERT a clean slate ("a machine with no CLI-managed runtimes",
