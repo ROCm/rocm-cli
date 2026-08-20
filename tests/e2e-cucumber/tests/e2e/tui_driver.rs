@@ -569,14 +569,23 @@ impl TuiSession {
     /// once the exited child's slave closes, so this normally returns well
     /// inside the bound; the cap only guards a misbehaving PTY. Idempotent and
     /// safe to call once per exit.
-    async fn drain_reader(&self) {
+    ///
+    /// Takes `&mut self` even though it only reads: a shared `&TuiSession` held
+    /// across an `.await` is not `Send` (the struct holds `!Sync` PTY handles),
+    /// which `-D clippy::future-not-send` rejects and would propagate to every
+    /// awaiting step. `&mut TuiSession` is `Send`, matching the sibling waits.
+    async fn drain_reader(&mut self) {
         let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
         while Instant::now() < drain_deadline {
-            if self
+            // Compute the check and drop every borrow of `self` BEFORE the await:
+            // a reference held across `.await` would make this future `!Send`,
+            // which `-D clippy::future-not-send` rejects (and which propagates to
+            // every step that awaits it).
+            let finished = self
                 .reader
                 .as_ref()
-                .is_none_or(std::thread::JoinHandle::is_finished)
-            {
+                .is_none_or(std::thread::JoinHandle::is_finished);
+            if finished {
                 return;
             }
             tokio::time::sleep(POLL_INTERVAL).await;

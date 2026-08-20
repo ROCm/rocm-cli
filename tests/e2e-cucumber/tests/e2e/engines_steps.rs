@@ -176,8 +176,10 @@ async fn assert_activation_hint_resolves(world: &mut E2eWorld) {
     let hint = lines
         .iter()
         .find_map(|line| line.split_once(HINT_LABEL))
-        .map(|(_, rest)| rest.trim())
-        .unwrap_or_else(|| panic!("no activation hint on screen:\n{screen}"));
+        .map_or_else(
+            || panic!("no activation hint on screen:\n{screen}"),
+            |(_, rest)| rest.trim(),
+        );
     // The hint is the command a user would run, which on Unix is `source <path>`.
     // Take the path it points at, whichever form it came in.
     let path = hint.strip_prefix("source ").unwrap_or(hint).trim();

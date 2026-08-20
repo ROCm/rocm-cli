@@ -56,14 +56,14 @@ fn exposed_identifier(block: &[&str]) -> Option<String> {
     // already been stripped from `header` before this is called.
     let header = block.first()?.trim();
     for (open, close) in [('[', ']'), ('(', ')')] {
-        if let (Some(o), Some(c)) = (header.rfind(open), header.rfind(close)) {
-            if o < c {
-                let inner = header[o + 1..c].trim();
-                // A single token with no spaces is an identifier; a phrase is
-                // still part of the display name, not an id.
-                if !inner.is_empty() && !inner.contains(char::is_whitespace) {
-                    return Some(inner.to_owned());
-                }
+        if let (Some(o), Some(c)) = (header.rfind(open), header.rfind(close))
+            && o < c
+        {
+            let inner = header[o + 1..c].trim();
+            // A single token with no spaces is an identifier; a phrase is
+            // still part of the display name, not an id.
+            if !inner.is_empty() && !inner.contains(char::is_whitespace) {
+                return Some(inner.to_owned());
             }
         }
     }
@@ -179,7 +179,11 @@ async fn assert_listed_checks_enableable(world: &mut E2eWorld) {
         if rc != 0 {
             unreachable.push(format!(
                 "{name:?} → tried {identifier:?}: rc={rc} {}",
-                stderr.trim().lines().next().unwrap_or(stdout.trim())
+                stderr
+                    .trim()
+                    .lines()
+                    .next()
+                    .unwrap_or_else(|| stdout.trim())
             ));
         }
     }
