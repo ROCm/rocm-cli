@@ -533,6 +533,13 @@ impl TuiSession {
                     self.finished = true;
                     let rc = i32::try_from(status.exit_code()).unwrap_or(-1);
                     self.record_once(rc);
+                    // Let the reader consume the child's final bytes before the
+                    // caller inspects post-exit state (e.g. entered_alternate_
+                    // screen). The child exiting closes the slave, so the reader
+                    // sees EOF and finishes; without this wait, an enter sequence
+                    // still buffered in the pipe would be missed. Bounded so a
+                    // misbehaving PTY can't stall the scenario.
+                    self.drain_reader().await;
                     return Ok(rc);
                 }
                 Ok(None) => {}
@@ -552,6 +559,25 @@ impl TuiSession {
                     "timed out after {timeout:?} waiting for the TUI to exit.\n{}",
                     self.framed_screen()
                 ));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Wait, bounded by [`DRAIN_TIMEOUT`], for the reader thread to finish
+    /// consuming the child's final output after it exits. The reader sees EOF
+    /// once the exited child's slave closes, so this normally returns well
+    /// inside the bound; the cap only guards a misbehaving PTY. Idempotent and
+    /// safe to call once per exit.
+    async fn drain_reader(&self) {
+        let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
+        while Instant::now() < drain_deadline {
+            if self
+                .reader
+                .as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished)
+            {
+                return;
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }
@@ -643,8 +669,20 @@ fn spawn_reader(
     reader_failure: Arc<ReaderFailure>,
     entered_alternate_screen: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
+    // The escape sequence a terminal emits to switch to the alternate screen.
+    // Detected in the raw byte stream rather than via the parser's post-process
+    // `alternate_screen()` state: a single read can contain both the enter and
+    // the matching leave (`\x1b[?1049l`), which would leave the parser back on
+    // the primary screen and the evidence erased. Scanning the bytes catches the
+    // enter regardless of what follows it in the same chunk.
+    const ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
+
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
+        // Carry the last few bytes of each read into the next scan so an enter
+        // sequence split across a read boundary is still found. One byte short
+        // of the marker length is all that can overlap.
+        let mut carry: Vec<u8> = Vec::new();
         loop {
             if stop.load(Ordering::Relaxed) {
                 break;
@@ -652,18 +690,27 @@ fn spawn_reader(
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    let chunk = &buf[..n];
+                    if !entered_alternate_screen.load(Ordering::Relaxed) {
+                        let mut window = std::mem::take(&mut carry);
+                        window.extend_from_slice(chunk);
+                        if window
+                            .windows(ALT_SCREEN_ENTER.len())
+                            .any(|w| w == ALT_SCREEN_ENTER)
+                        {
+                            entered_alternate_screen.store(true, Ordering::Relaxed);
+                        }
+                        // Keep just enough tail to bridge a boundary-split marker.
+                        let keep = ALT_SCREEN_ENTER.len().saturating_sub(1);
+                        let start = window.len().saturating_sub(keep);
+                        carry = window[start..].to_vec();
+                    }
                     let mut p = parser
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        p.process(&buf[..n]);
+                        p.process(chunk);
                     }));
-                    // Latch alternate-screen use while the parser reflects THIS
-                    // chunk: the switch back on exit would otherwise erase the
-                    // evidence that the full-screen TUI ever opened.
-                    if result.is_ok() && p.screen().alternate_screen() {
-                        entered_alternate_screen.store(true, Ordering::Relaxed);
-                    }
                     drop(p);
                     if let Err(payload) = result {
                         let message = panic_message(&payload);
