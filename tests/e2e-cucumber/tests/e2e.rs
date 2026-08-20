@@ -550,10 +550,11 @@ pub fn run_rocm_with_env(
     )
 }
 
-/// Run `rocm` with `PATH` pointed at a temp directory that exposes only the given
-/// host tools (by name), so a scenario can prove how the CLI behaves when a tool
-/// it shells out to is absent. Returns `(stdout, stderr, rc)` plus the `TempDir`,
-/// which the caller must keep alive for the duration of the run.
+/// Run `rocm` with `PATH` pointed at a temp dir exposing only the given host tools.
+///
+/// This lets a scenario prove how the CLI behaves when a tool it shells out to is
+/// absent. Returns `(stdout, stderr, rc)` plus the `TempDir`, which the caller must
+/// keep alive for the duration of the run.
 ///
 /// Used by the root-without-`sudo` driver-install scenario (EAI-8053): the driver
 /// plan shells its commands through `sh -c`, so `sh` must stay reachable while

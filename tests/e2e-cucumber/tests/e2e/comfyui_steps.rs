@@ -32,8 +32,10 @@ fn active_runtime_python(world: &E2eWorld) -> PathBuf {
     let folder = examine
         .lines()
         .find_map(|l| l.trim().strip_prefix("Folder:"))
-        .map(str::trim)
-        .unwrap_or_else(|| panic!("no active-runtime 'Folder:' line in examine:\n{examine}"));
+        .map_or_else(
+            || panic!("no active-runtime 'Folder:' line in examine:\n{examine}"),
+            str::trim,
+        );
     find_venv_python(Path::new(folder)).unwrap_or_else(|| {
         panic!("could not locate a venv python under the runtime folder {folder}")
     })
