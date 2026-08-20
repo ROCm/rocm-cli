@@ -8,16 +8,23 @@ use cucumber::{given, then, when};
 
 use crate::E2eWorld;
 
-/// A one-shot Python probe run against the managed runtime's OWN interpreter (not
-/// the ambient one `rocm examine` uses). Emits JSON `{hip, version}` when torch
-/// imports — `hip` is non-null for a ROCm/HIP build and null for a CUDA build — or
-/// `{error}` when torch cannot be imported at all.
-const TORCH_HIP_PROBE: &str = "import json,sys\n\
+/// Report the installed torch distribution's version string via `importlib.metadata`
+/// — WITHOUT importing torch. Emits JSON `{version}` (e.g. `2.7.0+rocm6.4` for a
+/// ROCm build, `2.7.0+cu128` for a CUDA build) or `{error}` when no torch
+/// distribution is installed.
+///
+/// Deliberately does not `import torch`: importing it loads the ROCm/CUDA shared
+/// libraries, which need the runtime's `LD_LIBRARY_PATH`/`ROCM_PATH` set up (the
+/// product runs its own torch probe *with* that env, ours runs the interpreter
+/// bare). The `+rocm` / `+cu` local-version label in the dist metadata is the
+/// definitive ROCm-vs-CUDA discriminator and is readable with no native load — so
+/// a bare interpreter suffices, and a runtime whose torch is present but whose
+/// native libs aren't on our env no longer reads as "not a ROCm build".
+const TORCH_DIST_PROBE: &str = "import json,sys\n\
+     from importlib import metadata\n\
      out={}\n\
      try:\n\
-     \x20 import torch\n\
-     \x20 out['hip']=getattr(torch.version,'hip',None)\n\
-     \x20 out['version']=torch.__version__\n\
+     \x20 out['version']=metadata.version('torch')\n\
      except Exception as ex:\n\
      \x20 out['error']=type(ex).__name__+': '+str(ex)\n\
      sys.stdout.write(json.dumps(out))\n";
@@ -76,17 +83,24 @@ fn find_venv_python(root: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Whether the interpreter's torch is a ROCm/HIP build.
-fn torch_is_rocm(python: &Path) -> bool {
+/// The installed torch distribution's version string, or `None` if no torch
+/// distribution is installed. Reads dist metadata without importing torch (see
+/// [`TORCH_DIST_PROBE`]), so it works against a bare interpreter. A ROCm wheel
+/// carries a `+rocm...` local version, a CUDA wheel `+cu...`; callers judge the
+/// build from that label.
+fn torch_version(python: &Path) -> Option<String> {
     let output = std::process::Command::new(python)
-        .args(["-c", TORCH_HIP_PROBE])
+        .args(["-c", TORCH_DIST_PROBE])
         .output()
         .unwrap_or_else(|e| panic!("failed to run runtime python {}: {e}", python.display()));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let data: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|_| panic!("torch probe returned non-JSON:\n{stdout}"));
-    data.get("hip")
-        .is_some_and(|hip| !hip.is_null() && hip.as_str().is_some_and(|s| !s.is_empty()))
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let data: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|_| {
+        panic!("torch version probe returned non-JSON:\nstdout: {stdout}\nstderr: {stderr}")
+    });
+    data.get("version")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 /// Enumerate installed distributions via `importlib.metadata` and emit their names
@@ -159,9 +173,13 @@ async fn setup_isolated_runtime(world: &mut E2eWorld) {
 #[given("the runtime's torch is a ROCm build")]
 async fn assert_baseline_rocm_torch(world: &mut E2eWorld) {
     let python = active_runtime_python(world);
+    let version = torch_version(&python);
     assert!(
-        torch_is_rocm(&python),
-        "baseline runtime torch is not a ROCm build; scenario premise absent ({})",
+        version
+            .as_deref()
+            .is_some_and(|v| v.to_ascii_lowercase().contains("rocm")),
+        "baseline runtime torch is not a ROCm build; scenario premise absent \
+         (torch version: {version:?}, python: {})",
         python.display()
     );
     assert!(
@@ -184,9 +202,13 @@ async fn user_installs_comfyui(world: &mut E2eWorld) {
 #[then("the runtime's torch is still a ROCm build")]
 async fn assert_torch_still_rocm(world: &mut E2eWorld) {
     let python = active_runtime_python(world);
+    let version = torch_version(&python);
     assert!(
-        torch_is_rocm(&python),
-        "ComfyUI install replaced the runtime's ROCm torch with a non-ROCm build ({})",
+        version
+            .as_deref()
+            .is_some_and(|v| v.to_ascii_lowercase().contains("rocm")),
+        "ComfyUI install replaced the runtime's ROCm torch with a non-ROCm build \
+         (torch version now: {version:?}, python: {})",
         python.display()
     );
 }
