@@ -200,6 +200,8 @@ pub(crate) fn run_smoke_test(paths: &AppPaths, api_model: &str) -> SmokeMetrics 
             content: SMOKE_PROMPT.to_owned(),
         }],
         max_tokens: Some(SMOKE_MAX_TOKENS),
+        temperature: None,
+        top_p: None,
         rocm_tools: false,
     };
 

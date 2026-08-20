@@ -102,7 +102,9 @@ pub struct HostCapability {
     /// First AMD GPU's gfx target from `examine`'s `detected_gfx_target:` line
     /// (e.g. "gfx942", "gfx1151"), if a real one was reported.
     pub gfx_target: Option<String>,
-    /// Whether an AMD GPU was detected (a real `detected_gfx_target` is present).
+    /// Whether an AMD GPU is present AND usable here, so `@requires-gpu`
+    /// scenarios can run. A real `detected_gfx_target`, plus a ready ROCm
+    /// driver path on WSL — see [`host_has_usable_gpu`].
     pub has_amd_gpu: bool,
     /// Engine adapters the binary reports as present. Both builtins are always
     /// "built-in", so this is NOT the same as "can start here" — use
@@ -331,11 +333,17 @@ fn probe_host_capability() -> HostCapability {
     let examine = run_probe(root, &["examine"]);
     let engines = run_probe(root, &["engines", "list"]);
 
-    let (os_family, is_wsl, gfx_target) = parse_examine_text(&examine);
-    let has_amd_gpu = gfx_target.is_some();
+    let ExamineFacts {
+        os_family,
+        is_wsl,
+        gfx_target,
+        driver_status,
+    } = parse_examine_text(&examine);
+    let has_amd_gpu = host_has_usable_gpu(gfx_target.as_deref(), is_wsl, &driver_status);
     let available_engines = parse_engines_list(&engines);
     let effective_serve_engine = effective_serve_engine(gfx_target.as_deref(), &os_family);
-    let platform_slug = derive_platform_slug(has_amd_gpu, gfx_target.as_deref(), &os_family);
+    let platform_slug =
+        derive_platform_slug(has_amd_gpu, gfx_target.as_deref(), &os_family, is_wsl);
 
     HostCapability {
         os_family,
@@ -362,15 +370,34 @@ fn run_probe(root: &std::path::Path, args: &[&str]) -> String {
     }
 }
 
-/// Extract `(os_family, is_wsl, first_gfx_target)` from the human `rocm examine`
-/// text (format string in rocm-core `ExamineSummary`): lines like `  os: linux`,
-/// `  detected_gfx_target: gfx942`, `  wsl: false`. A missing/placeholder
-/// (`<unknown>`, empty, `none`) gfx target yields `None` (→ treated as no GPU).
-/// Tolerant: an unrecognized dump degrades to a mock-like host.
-fn parse_examine_text(text: &str) -> (String, bool, Option<String>) {
+/// The `examine` fields the capability probe reads.
+struct ExamineFacts {
+    os_family: String,
+    is_wsl: bool,
+    gfx_target: Option<String>,
+    /// `driver_status:` — the CLI's own verdict on whether the runtime can
+    /// reach the device. Only consulted on WSL (see [`host_has_usable_gpu`]).
+    driver_status: String,
+}
+
+/// `driver_status` value meaning ROCm's WSL passthrough path is complete.
+///
+/// The CLI sets this only when `/dev/dxg`, dxcore, `librocdxg.so` and its
+/// ldconfig entry are all present; the other WSL states (`wsl_rocdxg_missing`,
+/// `wsl_gpu_plumbing_missing`) mean the runtime cannot reach the GPU.
+const WSL_DRIVER_READY: &str = "wsl_rocdxg_ready";
+
+/// Extract the probe's facts from the human `rocm examine` text (format string
+/// in rocm-core `ExamineSummary`): lines like `  os: linux`,
+/// `  detected_gfx_target: gfx942`, `  wsl: false`, `  driver_status: ...`. A
+/// missing/placeholder (`<unknown>`, empty, `none`) gfx target yields `None`
+/// (→ treated as no GPU). Tolerant: an unrecognized dump degrades to a
+/// mock-like host.
+fn parse_examine_text(text: &str) -> ExamineFacts {
     let mut os_family = "other".to_owned();
     let mut is_wsl = false;
     let mut gfx_target = None;
+    let mut driver_status = String::new();
     for line in text.lines() {
         let line = line.trim();
         if let Some(v) = line.strip_prefix("os:") {
@@ -382,9 +409,62 @@ fn parse_examine_text(text: &str) -> (String, bool, Option<String>) {
             }
         } else if let Some(v) = line.strip_prefix("wsl:") {
             is_wsl = matches!(v.trim(), "true" | "yes" | "1");
+        } else if let Some(v) = line.strip_prefix("driver_status:") {
+            driver_status = v.trim().to_owned();
         }
     }
-    (os_family, is_wsl, gfx_target)
+    ExamineFacts {
+        os_family,
+        is_wsl,
+        gfx_target,
+        driver_status,
+    }
+}
+
+/// Whether `@requires-gpu` scenarios can actually run on this host.
+///
+/// A detected gfx target is enough on a native host. It is NOT enough under
+/// WSL: the target is reported from the Windows-side driver even when ROCm has
+/// no path to the device, so a distro missing `librocdxg.so` advertises
+/// `gfx1151` while `rocm serve` refuses with "no usable AMD GPU". Taking the
+/// target at face value there runs every GPU scenario against a host that
+/// cannot serve one — they fail on their premise rather than resolving to
+/// not-applicable, which is exactly what the capability probe exists to avoid.
+fn host_has_usable_gpu(gfx_target: Option<&str>, is_wsl: bool, driver_status: &str) -> bool {
+    let hip = std::env::var_os("HIP_VISIBLE_DEVICES");
+    let rocr = std::env::var_os("ROCR_VISIBLE_DEVICES");
+    host_has_usable_gpu_with_mask(
+        gfx_target,
+        is_wsl,
+        driver_status,
+        selected_visibility_mask(hip.as_deref(), rocr.as_deref()),
+    )
+}
+
+/// Match the product's visibility-mask precedence: HIP wins when present,
+/// including an explicitly empty value; ROCR is the fallback.
+fn selected_visibility_mask<'a>(
+    hip: Option<&'a std::ffi::OsStr>,
+    rocr: Option<&'a std::ffi::OsStr>,
+) -> Option<&'a std::ffi::OsStr> {
+    hip.or(rocr)
+}
+
+/// Pure form of [`host_has_usable_gpu`] for contract tests.
+///
+/// The harness knows whether a gfx target exists, but not the product's complete
+/// device topology. As in `rocm_core::has_usable_amd_gpu`, only an authoritative
+/// empty mask proves zero usable devices; nonempty/opaque masks stay eligible and
+/// let the product perform ordinal/UUID validation at launch time.
+fn host_has_usable_gpu_with_mask(
+    gfx_target: Option<&str>,
+    is_wsl: bool,
+    driver_status: &str,
+    visibility_mask: Option<&std::ffi::OsStr>,
+) -> bool {
+    gfx_target.is_some()
+        && (!is_wsl || driver_status == WSL_DRIVER_READY)
+        && visibility_mask.is_none_or(|mask| !mask.is_empty())
 }
 
 /// Parse engine names from `rocm engines list`. Engine rows are the lines whose
@@ -405,29 +485,51 @@ fn parse_engines_list(text: &str) -> Vec<String> {
     engines
 }
 
-/// Stable platform identity from hardware. No AMD GPU → "mock". Otherwise a
+/// Stable platform identity from hardware and host environment. WSL is a
+/// distinct platform even without a GPU, so its report never collides with the
+/// ordinary hosted mock column. Otherwise no AMD GPU → "mock"; GPU hosts use a
 /// coarse slug from the gfx family (data-center → "mi300x"; Strix gfx115x →
 /// "strix-halo"), falling back to the normalized family. The OS is appended for
 /// families that ship on more than one OS (Strix Halo runs both Ubuntu and
 /// Windows on the same gfx1151), so those become distinct grid columns rather
 /// than colliding into one.
-fn derive_platform_slug(has_amd_gpu: bool, gfx_target: Option<&str>, os_family: &str) -> String {
+fn derive_platform_slug(
+    has_amd_gpu: bool,
+    gfx_target: Option<&str>,
+    os_family: &str,
+    is_wsl: bool,
+) -> String {
+    if is_wsl {
+        return match gfx_target {
+            Some(t) => format!("{}-wsl", platform_hardware_slug(t)),
+            None => "wsl".to_owned(),
+        };
+    }
     if !has_amd_gpu {
         return "mock".to_owned();
     }
     match gfx_target {
         Some(t) => {
-            let f = normalize_family(t);
-            if f.ends_with("-dcgpu") {
-                "mi300x".to_owned()
-            } else if f.starts_with("gfx115") {
+            let hardware = platform_hardware_slug(t);
+            if hardware == "strix-halo" {
                 // Same silicon on Ubuntu and Windows — disambiguate by OS.
-                format!("strix-halo-{}", os_normalized(os_family))
+                format!("{hardware}-{}", os_normalized(os_family))
             } else {
-                f
+                hardware
             }
         }
         None => "mock".to_owned(),
+    }
+}
+
+fn platform_hardware_slug(gfx_target: &str) -> String {
+    let family = normalize_family(gfx_target);
+    if family.ends_with("-dcgpu") {
+        "mi300x".to_owned()
+    } else if family.starts_with("gfx115") {
+        "strix-halo".to_owned()
+    } else {
+        family
     }
 }
 
@@ -533,10 +635,11 @@ rocm examine
   wsl: false
   driver_status: ok
 ";
-        let (os, wsl, gfx) = parse_examine_text(text);
-        assert_eq!(os, "linux");
-        assert!(!wsl);
-        assert_eq!(gfx.as_deref(), Some("gfx942"));
+        let facts = parse_examine_text(text);
+        assert_eq!(facts.os_family, "linux");
+        assert!(!facts.is_wsl);
+        assert_eq!(facts.gfx_target.as_deref(), Some("gfx942"));
+        assert_eq!(facts.driver_status, "ok");
     }
 
     #[test]
@@ -548,9 +651,101 @@ rocm examine
   detected_gfx_target: <unknown>
   wsl: false
 ";
-        let (os, _, gfx) = parse_examine_text(text);
-        assert_eq!(os, "other");
-        assert_eq!(gfx, None);
+        let facts = parse_examine_text(text);
+        assert_eq!(facts.os_family, "other");
+        assert_eq!(facts.gfx_target, None);
+    }
+
+    /// A WSL distro advertises the Windows-side gfx target whether or not ROCm
+    /// can reach it, so the driver verdict is what decides. Without this, every
+    /// `@requires-gpu` scenario runs on a host where `serve` cannot start and
+    /// fails on its premise instead of resolving to not-applicable.
+    #[test]
+    fn wsl_gpu_requires_a_ready_rocdxg_path() {
+        // Real values from the self-hosted WSL runner before librocdxg was
+        // installed: /dev/dxg present, the ROCm passthrough library missing.
+        assert!(!host_has_usable_gpu_with_mask(
+            Some("gfx1151"),
+            true,
+            "wsl_rocdxg_missing",
+            None
+        ));
+        assert!(!host_has_usable_gpu_with_mask(
+            Some("gfx1151"),
+            true,
+            "wsl_gpu_plumbing_missing",
+            None
+        ));
+        // Complete passthrough: the GPU is usable and the scenarios must run.
+        assert!(host_has_usable_gpu_with_mask(
+            Some("gfx1151"),
+            true,
+            WSL_DRIVER_READY,
+            None
+        ));
+        // A native host is unaffected by the driver verdict.
+        assert!(host_has_usable_gpu_with_mask(
+            Some("gfx942"),
+            false,
+            "amdgpu_available",
+            None
+        ));
+        assert!(host_has_usable_gpu_with_mask(
+            Some("gfx942"),
+            false,
+            "",
+            None
+        ));
+        // No gfx target is still no GPU, WSL or not.
+        assert!(!host_has_usable_gpu_with_mask(
+            None,
+            true,
+            WSL_DRIVER_READY,
+            None
+        ));
+        assert!(!host_has_usable_gpu_with_mask(
+            None,
+            false,
+            "amdgpu_available",
+            None
+        ));
+    }
+
+    #[test]
+    fn gpu_capability_honors_the_product_visibility_mask_precedence() {
+        use std::ffi::OsStr;
+
+        let empty = OsStr::new("");
+        let device_zero = OsStr::new("0");
+        assert_eq!(
+            selected_visibility_mask(Some(empty), Some(device_zero)),
+            Some(empty),
+            "HIP_VISIBLE_DEVICES must take precedence even when explicitly empty"
+        );
+        assert_eq!(
+            selected_visibility_mask(None, Some(empty)),
+            Some(empty),
+            "ROCR_VISIBLE_DEVICES applies when HIP_VISIBLE_DEVICES is unset"
+        );
+
+        assert!(!host_has_usable_gpu_with_mask(
+            Some("gfx1151"),
+            true,
+            WSL_DRIVER_READY,
+            Some(empty)
+        ));
+        assert!(!host_has_usable_gpu_with_mask(
+            Some("gfx942"),
+            false,
+            "amdgpu_available",
+            Some(empty)
+        ));
+        assert!(host_has_usable_gpu_with_mask(
+            Some("gfx1151"),
+            true,
+            WSL_DRIVER_READY,
+            Some(device_zero)
+        ));
     }
 
     #[test]
@@ -571,20 +766,27 @@ Local model engines
 
     #[test]
     fn platform_slug_derivation() {
-        assert_eq!(derive_platform_slug(false, None, "other"), "mock");
+        assert_eq!(derive_platform_slug(false, None, "other", false), "mock");
         assert_eq!(
-            derive_platform_slug(true, Some("gfx942"), "linux"),
+            derive_platform_slug(true, Some("gfx942"), "linux", false),
             "mi300x"
         );
         // Strix Halo: same gfx1151 silicon on both OSes → distinct slugs so the
         // report grid gets a column per platform, not a collision.
         assert_eq!(
-            derive_platform_slug(true, Some("gfx1151"), "linux"),
+            derive_platform_slug(true, Some("gfx1151"), "linux", false),
             "strix-halo-linux"
         );
         assert_eq!(
-            derive_platform_slug(true, Some("gfx1151"), "windows"),
+            derive_platform_slug(true, Some("gfx1151"), "windows", false),
             "strix-halo-windows"
+        );
+        // Hosted WSL has no GPU but must not collide with the ordinary mock
+        // column. A future WSL GPU lane also remains distinct from native Linux.
+        assert_eq!(derive_platform_slug(false, None, "linux", true), "wsl");
+        assert_eq!(
+            derive_platform_slug(true, Some("gfx1151"), "linux", true),
+            "strix-halo-wsl"
         );
     }
 }

@@ -414,6 +414,12 @@ fn parse_descriptor(name: &str) -> Descriptor {
         "gpu" => ("MI300X", "Linux"),
         "gpu-strix-ubuntu" => ("Strix Halo", "Ubuntu"),
         "gpu-strix-windows" => ("Strix Halo", "Windows"),
+        // Same silicon again, third host boundary: an Ubuntu distro under WSL2 on
+        // the Windows box. It is neither the native Ubuntu nor the Windows lane —
+        // GPU access goes through the WSL passthrough — so it needs its own OS
+        // value, not a reuse of "Ubuntu", or the grid would show two rows that
+        // claim to be the same host and disagree.
+        "gpu-strix-wsl" => ("Strix Halo", "WSL2"),
         // `e2e-unknown-report`: a report whose platform.json sidecar was missing
         // or unrecognized (e.g. a GPU run that errored before writing it). The OS
         // is genuinely unknown here — a Windows GPU run that erupted early must NOT
@@ -2012,6 +2018,9 @@ mod tests {
             ("e2e-gpu-report", "MI300X", "Linux"),
             ("e2e-gpu-strix-ubuntu-report", "Strix Halo", "Ubuntu"),
             ("e2e-gpu-strix-windows-report", "Strix Halo", "Windows"),
+            // Must not fall through to `fallback_descriptor`, which would render
+            // "Gpu Strix Wsl" on Linux — a WSL2 host reported as native Linux.
+            ("e2e-gpu-strix-wsl-report", "Strix Halo", "WSL2"),
         ] {
             let d = parse_descriptor(name);
             assert_eq!(

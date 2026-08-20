@@ -30,6 +30,8 @@ use std::time::{Duration, Instant};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use e2e_cucumber::panic_capture::panic_message;
+use e2e_cucumber::reader_failure::{ReaderFailure, ReaderFailureObservation};
+use e2e_cucumber::send_until::{RetryTiming, TerminalState, send_until as retry_send_until};
 
 use crate::E2eWorld;
 
@@ -47,6 +49,10 @@ const DETAIL_COLS: u16 = 120;
 /// poll cadence, not a fixed readiness sleep: every wait has a deadline and
 /// returns the instant its condition holds.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// How long [`TuiSession::send_until`] waits for a key to take effect before
+/// sending it again. Long enough that a busy host is not spammed with repeats,
+/// short enough that several attempts fit inside a normal step timeout.
+const KEY_RESEND_INTERVAL: Duration = Duration::from_millis(500);
 /// Maximum time to let the PTY reader consume the child's final frame after the
 /// process exits. This is bounded so a misbehaving PTY cannot stall a scenario.
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
@@ -54,7 +60,27 @@ const DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 /// Default wall-clock budget for a single wait. Generous enough for a cold dash
 /// start plus the embedded-daemon connect, while still turning a genuine hang
 /// into a prompt, diagnosable failure rather than a CI-timeout.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+/// Wall-clock budget for a single wait, overridable with `E2E_TUI_TIMEOUT_SECS`.
+///
+/// Mirrors `E2E_SERVE_TIMEOUT_SECS` in `serving_steps.rs`: the assertion is
+/// right, the budget is what varies by host. The self-hosted Strix lanes share
+/// one physical machine, so a TUI frame that renders well inside 30s on an idle
+/// runner can miss it when a sibling lane is loading a model on the same box —
+/// which shows up as an unrelated-looking flake, not as a real hang.
+///
+/// Deliberately a wait budget and not a retry: a genuine hang must still fail.
+#[must_use]
+pub fn default_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("E2E_TUI_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|secs| *secs > 0)
+            .unwrap_or(DEFAULT_TIMEOUT_SECS),
+    )
+}
 
 /// A running `rocm` TUI attached to a pseudo-terminal.
 pub struct TuiSession {
@@ -64,12 +90,10 @@ pub struct TuiSession {
     parser: Arc<Mutex<vt100::Parser>>,
     reader_stop: Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
-    /// Set by the reader thread if `vt100::Parser::process` ever panics, before
-    /// the thread exits. `wait_for_screen`/`wait_for_exit` check this every poll
-    /// so a reader panic (which would otherwise just stop screen updates and
-    /// poison `parser`) is reported directly instead of surfacing as a 30s
-    /// timeout over an unexplained blank/stale screen.
-    reader_panic: Arc<Mutex<Option<String>>>,
+    /// Published by the reader thread if `vt100::Parser::process` panics. Keeps
+    /// terminal failure state after the one-time diagnostic is consumed, so a
+    /// retry cannot lose the cause while the reader thread is still finishing.
+    reader_failure: Arc<ReaderFailure>,
     /// Kept alive for the lifetime of the session: the reader/writer are cloned
     /// from it, and dropping it early would close the PTY.
     master: Box<dyn MasterPty + Send>,
@@ -179,12 +203,12 @@ impl TuiSession {
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, 0)));
         let reader_stop = Arc::new(AtomicBool::new(false));
-        let reader_panic: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let reader_failure = Arc::new(ReaderFailure::default());
         let reader = spawn_reader(
             reader,
             Arc::clone(&parser),
             Arc::clone(&reader_stop),
-            Arc::clone(&reader_panic),
+            Arc::clone(&reader_failure),
         );
 
         Ok(Self {
@@ -193,7 +217,7 @@ impl TuiSession {
             parser,
             reader_stop,
             reader: Some(reader),
-            reader_panic,
+            reader_failure,
             master: pair.master,
             finished: false,
             recorded: false,
@@ -273,10 +297,7 @@ impl TuiSession {
     /// direct diagnostic instead of a 30s timeout over a screen that stopped
     /// updating for an unexplained reason.
     fn take_reader_panic(&self) -> Option<String> {
-        self.reader_panic
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+        self.reader_failure.take_message()
     }
 
     /// Resize both the real PTY and the emulated screen. The application receives
@@ -309,6 +330,79 @@ impl TuiSession {
             .write_all(bytes.as_bytes())
             .and_then(|()| self.writer.flush())
             .map_err(|e| format!("failed to write to pty: {e}"))
+    }
+
+    /// Retrieve a terminal failure that landed after a wait's final poll but
+    /// before the retry loop decides whether another key is safe to send.
+    fn terminal_state_after_wait(&mut self, marker: &str) -> TerminalState {
+        let reader_finished = self
+            .reader
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished);
+        let reader_failure = self.reader_failure.observe();
+        if let ReaderFailureObservation::Message(panic_message) = &reader_failure {
+            return TerminalState::Failed(format!(
+                "pty reader thread panicked while waiting for {marker:?}: {panic_message}\n{}",
+                self.framed_screen()
+            ));
+        }
+        if self.finished {
+            return TerminalState::Stopped;
+        }
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                self.finished = true;
+                self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
+                TerminalState::Failed(format!(
+                    "process exited ({status:?}) before {marker:?} appeared.\n{}",
+                    self.framed_screen()
+                ))
+            }
+            Ok(None) => match reader_failure {
+                ReaderFailureObservation::FailedWithoutMessage => TerminalState::Stopped,
+                ReaderFailureObservation::Running if reader_finished => TerminalState::Stopped,
+                ReaderFailureObservation::Running => TerminalState::Running,
+                ReaderFailureObservation::Message(_) => unreachable!("handled above"),
+            },
+            Err(error) => TerminalState::Failed(format!("failed to poll TUI child: {error}")),
+        }
+    }
+
+    /// Send `bytes` until the screen shows `marker`, re-sending every
+    /// [`KEY_RESEND_INTERVAL`] until the deadline.
+    ///
+    /// A bare [`send`](Self::send) writes into the pseudo-terminal whether or
+    /// not the application is reading yet, so a keystroke typed during startup
+    /// can be consumed by whatever holds the terminal at that moment and never
+    /// reach the event loop. The key is then simply lost — nothing retries it,
+    /// and the scenario fails much later, in an assertion about a view it never
+    /// left. Re-sending until the expected view appears makes the step depend on
+    /// the application having acted on the key rather than on it having been
+    /// ready when the key was written.
+    ///
+    /// Only safe for idempotent keys (a tab jump, not a toggle): the key is
+    /// always sent at least once, and further copies may still be queued in the
+    /// terminal when the marker appears, so the application may act on it again
+    /// after this returns.
+    pub async fn send_until(
+        &mut self,
+        bytes: &str,
+        marker: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        retry_send_until(
+            self,
+            bytes,
+            marker,
+            RetryTiming {
+                timeout,
+                resend_interval: KEY_RESEND_INTERVAL,
+            },
+            Self::send,
+            |session, marker, attempt| Box::pin(session.wait_for_screen(marker, attempt)),
+            Self::terminal_state_after_wait,
+        )
+        .await
     }
 
     /// Poll the current screen until it contains `marker`, or fail with a
@@ -479,7 +573,7 @@ impl Drop for TuiSession {
         self.reader_stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.reader.take() {
             // `join` returns `Err` only if the reader thread itself panicked
-            // (distinct from `reader_panic`, which we set *before* the thread
+            // (distinct from `reader_failure`, which we publish *before* the thread
             // exits normally after catching a `p.process` panic — so `join`
             // failing here would mean some other, uncaught panic in the reader).
             // Never re-panic here: if a scenario step already panicked and this
@@ -521,14 +615,15 @@ impl Drop for TuiSession {
 /// inspects the resulting `Screen`, never the reader.
 ///
 /// If `vt100::Parser::process` ever panics, it's caught here (rather than left
-/// to unwind the reader thread silently) and recorded into `reader_panic` before
-/// the thread exits, so `wait_for_screen`/`wait_for_exit` can fail fast with the
-/// actual cause instead of quietly polling a screen that will never update again.
+/// to unwind the reader thread silently) and published through `reader_failure`
+/// before the thread exits, so `wait_for_screen`/`wait_for_exit` can fail fast
+/// with the actual cause instead of quietly polling a screen that will never
+/// update again.
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
     stop: Arc<AtomicBool>,
-    reader_panic: Arc<Mutex<Option<String>>>,
+    reader_failure: Arc<ReaderFailure>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
@@ -548,9 +643,7 @@ fn spawn_reader(
                     drop(p);
                     if let Err(payload) = result {
                         let message = panic_message(&payload);
-                        *reader_panic
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(message);
+                        reader_failure.publish(message);
                         break;
                     }
                 }

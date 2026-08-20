@@ -47,7 +47,59 @@ const MAX_TOOL_TURNS: usize = 5;
 /// Max tokens the model may emit in its final answer. Shared by all three
 /// backends (RigAgentClient, ChatGptAgentClient, AnthropicAgentClient) so the
 /// budget is defined once. `u64` to match rig's `AgentBuilder::max_tokens`.
+/// Used as the fallback when no explicit `--max-tokens` is configured.
 const MAX_AGENT_TOKENS: u64 = 1024;
+
+/// Optional sampling controls forwarded to the chat backend.
+///
+/// Parity with the `rocm chat` / `rocm serve` CLI flags. `None` means "leave
+/// the model / endpoint default untouched", so an unset knob never overrides a
+/// server- or recipe-configured value. Applied uniformly across all three live
+/// backends.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct InferenceParams {
+    /// Sampling temperature (already validated `>= 0.0` by the bin).
+    pub temperature: Option<f32>,
+    /// Nucleus-sampling probability mass (already validated in `0.0..=1.0`).
+    pub top_p: Option<f32>,
+    /// Upper bound on generated tokens; overrides [`MAX_AGENT_TOKENS`] when set.
+    pub max_tokens: Option<u32>,
+}
+
+/// Apply the optional sampling controls to a fresh Rig `AgentBuilder`.
+///
+/// `max_tokens` always resolves to a concrete value (the CLI override or the
+/// shared [`MAX_AGENT_TOKENS`] default). `temperature` maps to the builder's
+/// native `.temperature()`; `top_p` has no dedicated builder method in
+/// rig-core, so it rides in `.additional_params({"top_p": ..})`, which the
+/// provider merges into the request body. Both are set only when supplied, so
+/// an unset knob leaves the request untouched.
+fn apply_inference_params<M, P>(
+    builder: rig::agent::AgentBuilder<M, P>,
+    params: &InferenceParams,
+) -> rig::agent::AgentBuilder<M, P>
+where
+    M: rig::completion::CompletionModel,
+    P: rig::agent::PromptHook<M>,
+{
+    let mut builder = builder.max_tokens(params.max_tokens.map_or(MAX_AGENT_TOKENS, u64::from));
+    if let Some(temperature) = params.temperature {
+        builder = builder.temperature(f64::from(temperature));
+    }
+    if let Some(top_p) = params.top_p {
+        builder = builder.additional_params(serde_json::json!({ "top_p": top_p }));
+    }
+    builder
+}
+
+fn validate_chatgpt_inference_params(params: &InferenceParams) -> Result<(), AgentError> {
+    if params.temperature.is_some() && params.top_p.is_some() {
+        return Err(AgentError::Build(
+            "ChatGPT Responses accepts either temperature or top_p, not both".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 /// Default system preamble for the dashboard assistant.
 const DEFAULT_PREAMBLE: &str = "You are the rocm-dash assistant, embedded in a terminal dashboard for AMD \
@@ -982,6 +1034,8 @@ pub struct RigAgentClient {
     client: rig::providers::openai::CompletionsClient,
     model: String,
     preamble: String,
+    /// Optional sampling controls (temperature/top_p/max_tokens).
+    params: InferenceParams,
     /// Bin-injected tool executor (None for tests / no live seam).
     executor: Option<SharedRocmToolExecutor>,
     /// Channel to surface mutating-tool approval intents to the app (None for
@@ -992,6 +1046,7 @@ pub struct RigAgentClient {
 impl RigAgentClient {
     pub fn new(
         cfg: LlmConfig,
+        params: InferenceParams,
         executor: Option<SharedRocmToolExecutor>,
         approval_tx: Option<UnboundedSender<ClientMsg>>,
     ) -> Result<Self, AgentError> {
@@ -1025,6 +1080,7 @@ impl RigAgentClient {
             client,
             model: cfg.model,
             preamble: DEFAULT_PREAMBLE.to_string(),
+            params,
             executor,
             approval_tx,
         })
@@ -1061,11 +1117,8 @@ impl AgentClient for RigAgentClient {
         let snap = Arc::new(snapshot);
         let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
 
-        let agent = self
-            .client
-            .agent(&self.model)
-            .preamble(&self.preamble)
-            .max_tokens(MAX_AGENT_TOKENS);
+        let agent = self.client.agent(&self.model).preamble(&self.preamble);
+        let agent = apply_inference_params(agent, &self.params);
         // Telemetry + skill registry tools (shared registration site).
         let agent = register_telemetry_tools(agent, &snap, &fired);
         // Read-only ROCm machine-inspection tools (forward across the seam).
@@ -1216,6 +1269,8 @@ pub struct ChatGptAgentClient {
     client: rig::providers::chatgpt::Client,
     model: String,
     preamble: String,
+    /// Optional sampling controls (temperature/top_p/max_tokens).
+    params: InferenceParams,
     /// Bin-injected tool executor (None for tests / no live seam).
     executor: Option<SharedRocmToolExecutor>,
     /// Channel to surface mutating-tool approval intents to the app (None for
@@ -1230,6 +1285,7 @@ impl ChatGptAgentClient {
     /// deferred to the first `complete()`.
     pub fn new<F>(
         model: Option<String>,
+        params: InferenceParams,
         on_device_code: F,
         executor: Option<SharedRocmToolExecutor>,
         approval_tx: Option<UnboundedSender<ClientMsg>>,
@@ -1292,6 +1348,7 @@ impl ChatGptAgentClient {
             client,
             model: model.unwrap_or_else(|| chatgpt::GPT_5_3_CODEX.to_string()),
             preamble: DEFAULT_PREAMBLE.to_string(),
+            params,
             executor,
             approval_tx,
         })
@@ -1313,6 +1370,10 @@ impl AgentClient for ChatGptAgentClient {
             return Err(AgentError::Empty);
         };
 
+        // OpenAI's Responses API defines temperature and top_p as mutually
+        // exclusive. Reject the combination before device login or network I/O.
+        validate_chatgpt_inference_params(&self.params)?;
+
         // Device-code login on first use; the provider caches the token after.
         // A failed/declined sign-in is an Auth error (distinct from a build
         // failure), surfaced as a clear error turn — never leaks the token.
@@ -1324,9 +1385,8 @@ impl AgentClient for ChatGptAgentClient {
         let snap = Arc::new(snapshot);
         let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
         let model = ResponsesCompletionModel::new(self.client.clone(), self.model.clone());
-        let agent = AgentBuilder::new(model)
-            .preamble(&self.preamble)
-            .max_tokens(MAX_AGENT_TOKENS);
+        let agent = AgentBuilder::new(model).preamble(&self.preamble);
+        let agent = apply_inference_params(agent, &self.params);
         // Telemetry + skill registry tools (shared registration site).
         let agent = register_telemetry_tools(agent, &snap, &fired);
         // Read-only ROCm machine-inspection tools (forward across the seam).
@@ -1360,6 +1420,8 @@ pub struct AnthropicAgentClient {
     client: rig::providers::anthropic::Client,
     model: String,
     preamble: String,
+    /// Optional sampling controls (temperature/top_p/max_tokens).
+    params: InferenceParams,
     /// Bin-injected tool executor (None for tests / no live seam).
     executor: Option<SharedRocmToolExecutor>,
     /// Channel to surface mutating-tool approval intents to the app (None for
@@ -1376,6 +1438,7 @@ impl AnthropicAgentClient {
     /// No network I/O happens here — the request is deferred to `complete()`.
     pub fn new(
         cfg: LlmConfig,
+        params: InferenceParams,
         executor: Option<SharedRocmToolExecutor>,
         approval_tx: Option<UnboundedSender<ClientMsg>>,
     ) -> Result<Self, AgentError> {
@@ -1398,6 +1461,7 @@ impl AnthropicAgentClient {
             client,
             model,
             preamble: DEFAULT_PREAMBLE.to_string(),
+            params,
             executor,
             approval_tx,
         })
@@ -1423,11 +1487,8 @@ impl AgentClient for AnthropicAgentClient {
         // Identical tool registration to RigAgentClient / ChatGptAgentClient:
         // the SAME telemetry/skill tools + every ROCm read + mutating tool, so
         // capability and approval behavior are uniform across backends.
-        let agent = self
-            .client
-            .agent(&self.model)
-            .preamble(&self.preamble)
-            .max_tokens(MAX_AGENT_TOKENS);
+        let agent = self.client.agent(&self.model).preamble(&self.preamble);
+        let agent = apply_inference_params(agent, &self.params);
         // Telemetry + skill registry tools (shared registration site).
         let agent = register_telemetry_tools(agent, &snap, &fired);
         // Read-only ROCm machine-inspection tools (forward across the seam).
@@ -2016,6 +2077,59 @@ mod tests {
         assert!(matches!(err, AgentError::Empty));
     }
 
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn rig_client_stores_inference_params() {
+        // Construction is offline (no network until complete()), so this pins
+        // that the sampling knobs survive into the client that applies them to
+        // every request builder. A default (all-None) client leaves them unset.
+        let cfg = LlmConfig {
+            base_url: "http://127.0.0.1:8000/v1".to_string(),
+            model: "local-model".to_string(),
+            api_key: None,
+            auth_header: None,
+        };
+        let params = InferenceParams {
+            temperature: Some(0.25),
+            top_p: Some(0.5),
+            max_tokens: Some(512),
+        };
+        let client =
+            RigAgentClient::new(cfg.clone(), params, None, None).expect("build rig client");
+        assert_eq!(client.params, params);
+        let client_default =
+            RigAgentClient::new(cfg, InferenceParams::default(), None, None).expect("build");
+        assert_eq!(client_default.params, InferenceParams::default());
+    }
+
+    #[test]
+    fn chatgpt_rejects_temperature_and_top_p_together() {
+        let params = InferenceParams {
+            temperature: Some(0.25),
+            top_p: Some(0.5),
+            max_tokens: None,
+        };
+        let error = validate_chatgpt_inference_params(&params)
+            .expect_err("Responses API must reject mutually exclusive controls");
+        assert!(matches!(error, AgentError::Build(_)));
+        assert!(error.to_string().contains("either temperature or top_p"));
+
+        assert!(
+            validate_chatgpt_inference_params(&InferenceParams {
+                temperature: Some(0.25),
+                ..InferenceParams::default()
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_chatgpt_inference_params(&InferenceParams {
+                top_p: Some(0.5),
+                ..InferenceParams::default()
+            })
+            .is_ok()
+        );
+    }
+
     /// Manual-demo verification of the live Rig path (tool-calling) against a
     /// local OpenAI-compatible endpoint. NOT run in CI (no live LLM). Run with:
     /// `cargo test -p rocm-dash-tui --lib rig_round_trip -- --ignored`
@@ -2029,7 +2143,8 @@ mod tests {
             api_key: None,
             auth_header: None,
         };
-        let client = RigAgentClient::new(cfg, None, None).expect("build rig client");
+        let client = RigAgentClient::new(cfg, InferenceParams::default(), None, None)
+            .expect("build rig client");
         let history = vec![ChatTurn::user("What's GPU-2 doing? Use the tools.")];
         let reply = client
             .complete(&history, fixture_snapshot())
@@ -2060,7 +2175,8 @@ mod tests {
             api_key: Some(key),
             auth_header,
         };
-        let client = RigAgentClient::new(cfg, None, None).expect("build rig client");
+        let client = RigAgentClient::new(cfg, InferenceParams::default(), None, None)
+            .expect("build rig client");
         let history = vec![ChatTurn::user("Reply with exactly: gateway ok")];
         let reply = client
             .complete(&history, fixture_snapshot())
@@ -2079,6 +2195,7 @@ mod tests {
         let sink = fired.clone();
         let client = ChatGptAgentClient::new(
             Some("gpt-5.3-codex".to_string()),
+            InferenceParams::default(),
             move |url, code| {
                 // Would surface in the chat tab during a real device-code login.
                 sink.lock().unwrap().push(format!("{url}|{code}"));
@@ -2094,8 +2211,14 @@ mod tests {
 
     #[test]
     fn chatgpt_oauth_client_defaults_model_when_none() {
-        let client = ChatGptAgentClient::new(None, |_url, _code| {}, None, None)
-            .expect("build chatgpt oauth client");
+        let client = ChatGptAgentClient::new(
+            None,
+            InferenceParams::default(),
+            |_url, _code| {},
+            None,
+            None,
+        )
+        .expect("build chatgpt oauth client");
         assert_eq!(
             client.model,
             rig::providers::chatgpt::GPT_5_3_CODEX,
@@ -2114,6 +2237,7 @@ mod tests {
                 api_key: Some("dummy".to_string()),
                 auth_header: None,
             },
+            InferenceParams::default(),
             None,
             None,
         )
@@ -2138,6 +2262,7 @@ mod tests {
                 api_key: None,
                 auth_header: None,
             },
+            InferenceParams::default(),
             None,
             None,
         ) else {
@@ -2159,6 +2284,7 @@ mod tests {
                 api_key: Some("dummy".to_string()),
                 auth_header: None,
             },
+            InferenceParams::default(),
             None,
             None,
         )
@@ -2233,6 +2359,7 @@ mod tests {
                 api_key: Some(key),
                 auth_header: None,
             },
+            InferenceParams::default(),
             None,
             None,
         )
@@ -2254,6 +2381,7 @@ mod tests {
     async fn chatgpt_oauth_round_trip() {
         let client = ChatGptAgentClient::new(
             None,
+            InferenceParams::default(),
             |url, code| {
                 eprintln!("Sign in: open {url} and enter code {code}");
             },

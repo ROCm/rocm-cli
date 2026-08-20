@@ -23,7 +23,7 @@ use std::process::Command;
 use cucumber::{given, then, when};
 
 use crate::E2eWorld;
-use crate::e2e::tui_driver::{DEFAULT_TIMEOUT, TuiSession};
+use crate::e2e::tui_driver::{TuiSession, default_timeout};
 
 /// Per-scenario release-lifecycle state. All paths are rooted in the scenario's
 /// isolated temp dir; `Drop` restores the captured Windows user PATH.
@@ -164,11 +164,13 @@ fn run_package(world: &E2eWorld, sign_env: &[(&str, String)]) -> (String, bool) 
 /// packaging bundles exactly the binaries under test.
 fn release_bin_dir() -> PathBuf {
     let binary = crate::rocm_binary();
-    let path = PathBuf::from(&binary);
-    path.parent().map_or_else(
-        || workspace_root().join("target/release"),
-        Path::to_path_buf,
+    let rocmd = std::env::var_os("ROCM_CLI_ROCMD_BINARY").map(PathBuf::from);
+    e2e_cucumber::lifecycle_binary_dir(
+        Path::new(&binary),
+        rocmd.as_deref(),
+        &workspace_root().join("target/release"),
     )
+    .expect("lifecycle packaging requires matching rocm and rocmd binaries")
 }
 
 /// Run the platform installer (`install.sh` / `install.ps1`) with the given
@@ -857,7 +859,7 @@ async fn when_quit_installed_chat(world: &mut E2eWorld) {
         .tui
         .as_mut()
         .expect("no installed interactive chat session is open")
-        .quit_and_wait(DEFAULT_TIMEOUT)
+        .quit_and_wait(default_timeout())
         .await
         .unwrap_or_else(|e| panic!("installed interactive chat did not exit cleanly: {e}"));
 }
@@ -1008,7 +1010,7 @@ async fn then_installed_chat_displayed(world: &mut E2eWorld) {
         .tui
         .as_mut()
         .expect("no installed interactive chat session is open")
-        .wait_for_screen("No messages yet.", DEFAULT_TIMEOUT)
+        .wait_for_screen("No messages yet.", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("installed interactive chat did not become ready: {e}"));
 }
