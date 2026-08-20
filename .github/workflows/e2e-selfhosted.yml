@@ -846,41 +846,19 @@ jobs:
           path: tests/e2e-cucumber/results/
 
   # Third AMD GPU target: the rad3 cluster's Radeon AI PRO R9700S (gfx1201, 32GB),
-  # targeted by the `r9700` label. Unlike every other lane here, this runner is a
-  # Kubernetes pod that KEDA scales 0<->1 off the job queue, so the card is only
-  # reserved while a job exists (silogen/dev-tooling EAI-8065).
-  #
-  # DISPATCH-ONLY, AND NOT PART OF `all`, ON PURPOSE — two reasons, both worth
-  # keeping until the runner has a track record:
-  #
-  #  - A job queued on an OFFLINE self-hosted runner cannot be cancelled by
-  #    GitHub (see this workflow's header). A scale-to-zero runner is *supposed*
-  #    to have no pod most of the time, so any misconfiguration on the cluster
-  #    side turns an automatic trigger into runs that hang until the job cap.
-  #    Requiring an explicit `platform=rad3` keeps that blast radius to the
-  #    person who asked for it.
-  #  - This repository is public, so `pull_request` would let a fork PR run
-  #    arbitrary code on a node with eight GPUs and cluster pull secrets, on a
-  #    runner whose caches persist between jobs. That needs a fork-approval
-  #    policy decision first; it is not something this lane should assume.
-  #
-  # Widening to `all`, and then to the automatic triggers, is a one-line change
-  # once both are settled.
+  # targeted by the `r9700` label. This runner is a KEDA-scaled pod (0<->1 off the
+  # job queue), so the card is only reserved while a job exists (dev-tooling EAI-8065).
+  # Non-blocking while this hardware is proven out.
   e2e-gpu-rad3:
     name: E2E tests (rad3 R9700)
     # 90min: matches e2e-gpu — same collapsed suite, and the card is smaller, so
     # do not tighten this below the Instinct lane's cap.
     timeout-minutes: 90
-    # `r9700` names the hardware rather than reusing a generic `amd-gpu`: GitHub
-    # assigns a job to any runner whose labels are a SUPERSET of the job's, so a
-    # shared label would let this card pick up MI300X-targeted work. Distinct
-    # per-hardware labels keep the pools separately addressable, as the strix
-    # lanes already do.
+    # `r9700` names the hardware, not a generic `amd-gpu`: GitHub matches a job to
+    # any runner whose labels are a superset, so a shared label would let this card
+    # pick up MI300X-targeted work.
     runs-on: [self-hosted, linux, r9700]
     needs: [changes]
-    # Same gating as the other self-hosted lanes: runs automatically on
-    # push/PR/merge_queue when the serve set changed, and on dispatch for
-    # `platform=all` or `platform=rad3`. continue-on-error keeps it non-blocking.
     if: >-
       always()
       && needs.changes.result == 'success'
@@ -987,8 +965,8 @@ jobs:
             echo "shared runtime already present at $E2E_SHARED_RUNTIMES_DIR — skipping pre-warm"
           fi
 
-          # Optional scenario-name filter for a scoped manual dispatch — the main
-          # way to exercise this lane cheaply while the runner is being proven out.
+          # Optional scenario-name filter for a scoped manual dispatch — a cheap
+          # way to exercise this lane against a single scenario without the full suite.
           NAME_FILTER="${{ github.event.inputs.name_filter }}"
           if [ -n "$NAME_FILTER" ]; then
             echo "name filter active: $NAME_FILTER"
