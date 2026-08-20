@@ -56,7 +56,12 @@ Feature: Configuration mutations
     When the user tries to enable the local provider
     Then the CLI refuses and explains the local provider is always enabled
 
-  @id:config-provider-key-no-secret-storage
+  # @requires-os:linux: the premise is a secure store that cannot save. The Linux
+  # Secret Service is reached over D-Bus, which the step forces unreachable so the
+  # save deterministically fails; the Windows/macOS credential stores are always
+  # present and cannot be disabled the same way, so the failure premise only holds
+  # on Linux. The no-echo property it verifies is the security-relevant contract.
+  @id:config-provider-key-no-secret-storage @requires-os:linux
   Scenario: 8 - Saving a provider key without secure storage fails without leaking the key
     Given a machine with no secure secret storage
     When the user saves a provider API key

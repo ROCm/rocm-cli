@@ -9,7 +9,7 @@
 //! only requiring its `install_root` to be a directory holding a non-dot payload
 //! file — no python, no GPU, no download. That makes the whole state machine
 //! exercisable on the mock lane. Contracts verified against the running Linux
-//! binary (WL-502). Related EAI-7404.
+//! binary (EAI-8072). Related EAI-7404.
 
 use std::path::{Path, PathBuf};
 

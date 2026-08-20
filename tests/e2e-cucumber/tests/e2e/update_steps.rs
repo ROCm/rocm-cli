@@ -7,7 +7,7 @@
 //! index to resolve the latest version). The report's update-feed status block is
 //! host-invariant and is what pins the "distinguishes configured from
 //! not-configured feeds" behaviour. Contracts verified against the running Linux
-//! binary (WL-502). Mock lane.
+//! binary (EAI-8072). Mock lane.
 
 use cucumber::{given, then, when};
 
@@ -39,23 +39,28 @@ async fn no_runtimes_to_update(world: &mut E2eWorld) {
 #[then("it reports each update feed's status, marking unpublished feeds as not configured")]
 async fn reports_feed_status(world: &mut E2eWorld) {
     let out = ok_output(world);
-    // The update_surfaces block reports one line per feed; assert each feed appears
-    // with its host-invariant status. The CLI feed is not published yet, so it must
-    // read not_configured — the "not-configured" side of the distinction; the
-    // engines/recipes feeds report their own stable states.
-    for needle in [
-        "cli: installed=",
-        "status=not_configured",
-        "engines:",
-        "status=package_managed",
-        "model_recipes:",
-        "status=built_in",
-        "runtimes:",
+    // The update_surfaces block reports one line per feed. Assert each feed's status
+    // ON ITS OWN LINE, so a status attributed to the wrong feed fails — a check that
+    // only looked for the substrings anywhere would pass even if `not_configured`
+    // and `package_managed` were swapped between the cli and engines feeds. The CLI
+    // feed is not published yet (the "not configured" side of the distinction);
+    // engines and recipes report their own stable states.
+    for (feed, status) in [
+        ("cli:", "status=not_configured"),
+        ("engines:", "status=package_managed"),
+        ("model_recipes:", "status=built_in"),
     ] {
-        assert!(
-            out.contains(needle),
-            "expected update feed detail {needle:?}, got:\n{out}"
-        );
+        let line = out
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with(feed));
+        match line {
+            Some(line) => assert!(
+                line.contains(status),
+                "update feed {feed:?} did not report {status:?} on its own line; got {line:?}\n\nfull output:\n{out}"
+            ),
+            None => panic!("no update feed line for {feed:?} in:\n{out}"),
+        }
     }
 }
 

@@ -5,7 +5,7 @@
 //! Steps for `rocm config <...>` mutations. Black-box: each runs the real binary
 //! against the scenario's isolated config dir and asserts on the printed
 //! confirmation / exit code. Contracts verified against the running Linux binary
-//! (see WL-502 / EAI-8072). No GPU or network — mock lane.
+//! (see EAI-8072). No GPU or network — mock lane.
 
 use cucumber::{given, then, when};
 
@@ -13,7 +13,7 @@ use crate::E2eWorld;
 
 /// A distinctive fake key we pipe into `set-provider-key`; the negative scenario
 /// asserts it is NEVER echoed back in stdout or stderr.
-const FAKE_PROVIDER_KEY: &str = "wl502-secret-key-must-not-be-echoed";
+const FAKE_PROVIDER_KEY: &str = "e2e-secret-key-must-not-be-echoed";
 
 #[given("a fresh CLI configuration")]
 async fn fresh_config(world: &mut E2eWorld) {
@@ -27,9 +27,12 @@ async fn fresh_config(world: &mut E2eWorld) {
 
 #[given("a machine with no secure secret storage")]
 async fn no_secret_storage(_world: &mut E2eWorld) {
-    // The isolated env has no OS keyring / secret service (the mock lane runs
-    // headless with no D-Bus session), so `set-provider-key` cannot persist a key.
-    // This is the condition the negative scenario needs; no setup required.
+    // The premise is made deterministic in the When step: the CLI is spawned with
+    // DBUS_SESSION_BUS_ADDRESS pointed at an unreachable socket, so the Linux
+    // Secret Service backend cannot connect and the save fails regardless of
+    // whether the runner happens to have a session bus. The scenario is
+    // `@requires-os:linux` because the Windows/macOS credential stores are not
+    // reachable through D-Bus and cannot be disabled the same way.
 }
 
 // ── When ───────────────────────────────────────────────────────────
@@ -115,11 +118,17 @@ async fn enable_local_provider(world: &mut E2eWorld) {
 #[when("the user saves a provider API key")]
 async fn save_provider_key(world: &mut E2eWorld) {
     // `set-provider-key` reads the key from stdin (non-interactive). Pipe a
-    // distinctive fake key so the "no echo" assertion can look for it.
+    // distinctive fake key so the "no echo" assertion can look for it. Force the
+    // Linux Secret Service unreachable by pointing D-Bus at a nonexistent socket,
+    // so the save deterministically fails on any Linux runner (see the Given).
     let (stdout, stderr, rc) = crate::run_rocm_with_stdin(
         world,
         &["config", "set-provider-key", "openai"],
         FAKE_PROVIDER_KEY,
+        &[(
+            "DBUS_SESSION_BUS_ADDRESS",
+            "unix:path=/nonexistent/e2e-no-bus",
+        )],
     );
     record(world, stdout, stderr, rc);
 }

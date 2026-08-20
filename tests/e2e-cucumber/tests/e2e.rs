@@ -522,13 +522,21 @@ pub fn run_rocm_ok(world: &E2eWorld, args: &[&str]) -> String {
     stdout
 }
 
-/// Like [`run_rocm`], but writes `stdin` to the child's standard input.
+/// Like [`run_rocm`], but writes `stdin` to the child's standard input and sets
+/// extra environment variables on the child.
 ///
 /// Used by scenarios that drive a command reading from stdin — e.g. `config
 /// set-provider-key`, which reads the secret from stdin non-interactively. The
 /// scenario can then assert on both the exit code and that the piped secret is
-/// never echoed back.
-pub fn run_rocm_with_stdin(world: &E2eWorld, args: &[&str], stdin: &str) -> (String, String, i32) {
+/// never echoed back. `envs` lets a scenario also control the child's environment
+/// (e.g. point the secret store at an unreachable D-Bus so the save deterministically
+/// fails), applied on top of the scenario's isolated config/data/cache env.
+pub fn run_rocm_with_stdin(
+    world: &E2eWorld,
+    args: &[&str],
+    stdin: &str,
+    envs: &[(&str, &str)],
+) -> (String, String, i32) {
     use std::io::Write as _;
     use std::process::Stdio;
 
@@ -536,6 +544,9 @@ pub fn run_rocm_with_stdin(world: &E2eWorld, args: &[&str], stdin: &str) -> (Str
     let mut cmd = std::process::Command::new(&binary);
     cmd.args(args);
     world.isolate_cmd(&mut cmd);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());

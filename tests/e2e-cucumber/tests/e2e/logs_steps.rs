@@ -7,7 +7,7 @@
 //! file, so the matching lines are planted WITHIN the tail window and the
 //! assertion is on the MATCH COUNT (deterministic), not the recent-line total
 //! (which also counts other log sources). Contracts verified against the running
-//! Linux binary (WL-502). No GPU or network — mock lane.
+//! Linux binary (EAI-8072). No GPU or network — mock lane.
 
 use cucumber::{given, then, when};
 
@@ -15,7 +15,7 @@ use crate::E2eWorld;
 
 /// The topic term planted into the log and searched for. Distinctive so it can't
 /// collide with anything the CLI itself writes into the isolated log dir.
-const TOPIC: &str = "WL502NEEDLE";
+const TOPIC: &str = "E2ENEEDLE";
 /// Number of matching lines planted — asserted exactly in the search result.
 const MATCH_COUNT: usize = 9;
 
@@ -35,7 +35,7 @@ async fn plant_command_logs(world: &mut E2eWorld) {
             "2026-01-01T00:01:00 event {TOPIC} occurred number {i}\n"
         ));
     }
-    std::fs::write(cli_logs.join("wl502-probe.log"), body).expect("failed to write log file");
+    std::fs::write(cli_logs.join("e2e-probe.log"), body).expect("failed to write log file");
 }
 
 // ── When ───────────────────────────────────────────────────────────
@@ -48,7 +48,7 @@ async fn search_topic(world: &mut E2eWorld) {
 
 #[when("the user searches the logs for a term that appears nowhere")]
 async fn search_absent(world: &mut E2eWorld) {
-    let (stdout, stderr, rc) = crate::run_rocm(world, &["logs", "--search", "wl502-no-such-term"]);
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["logs", "--search", "e2e-no-such-term"]);
     record(world, stdout, stderr, rc);
 }
 

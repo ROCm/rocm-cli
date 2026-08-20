@@ -9,8 +9,8 @@
 //! hermetic, every scenario first plants an automation runtime-state marking the
 //! daemon already running under THIS test process's (live) pid, so the CLI's
 //! double-spawn guard skips the spawn. Contracts verified against the running
-//! Linux binary (WL-502). Scoped to the enable/disable/mode slice; WL-474 owns the
-//! broader automations feature.
+//! Linux binary (EAI-8072). Scoped to the enable/disable/mode slice; the broader
+//! automations feature is covered separately.
 
 use cucumber::{given, then, when};
 
@@ -89,7 +89,7 @@ async fn enable_unknown(world: &mut E2eWorld) {
         &[
             "automations",
             "enable",
-            "wl502-no-such-watcher",
+            "e2e-no-such-watcher",
             "--mode",
             "observe",
         ],
@@ -130,7 +130,7 @@ async fn refuse_unknown(world: &mut E2eWorld) {
     let rc = world.cli_rc.expect("no command rc recorded");
     assert!(rc != 0, "expected refusal, got rc=0:\n{}", combined(world));
     assert!(
-        combined(world).contains("unknown watcher: wl502-no-such-watcher"),
+        combined(world).contains("unknown watcher: e2e-no-such-watcher"),
         "expected an unknown-watcher error, got:\n{}",
         combined(world)
     );
