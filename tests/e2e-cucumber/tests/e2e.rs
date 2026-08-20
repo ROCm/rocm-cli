@@ -20,8 +20,10 @@ mod e2e {
     pub mod artifact_steps;
     pub mod bench_steps;
     pub mod chat_steps;
+    pub mod comfyui_steps;
     pub mod dash_steps;
     pub mod diagnose_steps;
+    pub mod driver_steps;
     pub mod engines_steps;
     pub mod examine_steps;
     pub mod lifecycle_steps;
@@ -546,6 +548,58 @@ pub fn run_rocm_with_env(
         String::from_utf8_lossy(&output.stderr).to_string(),
         rc,
     )
+}
+
+/// Run `rocm` with `PATH` pointed at a temp directory that exposes only the given
+/// host tools (by name), so a scenario can prove how the CLI behaves when a tool
+/// it shells out to is absent. Returns `(stdout, stderr, rc)` plus the `TempDir`,
+/// which the caller must keep alive for the duration of the run.
+///
+/// Used by the root-without-`sudo` driver-install scenario (EAI-8053): the driver
+/// plan shells its commands through `sh -c`, so `sh` must stay reachable while
+/// `sudo` must not. Each requested tool is symlinked from wherever it lives on the
+/// current `PATH`; a tool that cannot be found is skipped (its absence is exactly
+/// what some scenarios want to arrange).
+#[cfg(unix)]
+pub fn run_rocm_with_only_tools(
+    world: &E2eWorld,
+    args: &[&str],
+    tools: &[&str],
+) -> (String, String, i32, TempDir) {
+    let bin = TempDir::with_prefix("rocm-e2e-path-").expect("failed to create temp PATH dir");
+    for tool in tools {
+        if let Some(real) = which_on_path(tool) {
+            let _ = std::os::unix::fs::symlink(&real, bin.path().join(tool));
+        }
+    }
+    let binary = rocm_binary();
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(args);
+    world.isolate_cmd(&mut cmd);
+    cmd.env("PATH", bin.path());
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    let rc = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    record_command(world.current_scenario.as_deref(), args, rc, &stdout);
+    (
+        stdout,
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        rc,
+        bin,
+    )
+}
+
+/// Resolve a bare tool name to its absolute path by scanning the current `PATH`,
+/// following the same first-match rule a shell would. Returns `None` if the tool
+/// is not on `PATH`.
+#[cfg(unix)]
+fn which_on_path(tool: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(tool))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Append one `rocm` invocation to `results/commands.jsonl` so the consolidated

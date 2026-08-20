@@ -178,3 +178,29 @@ flaky = true
 when = { is_wsl = true, therock_family = "gfx*" }
 bug = "EAI-7998"
 reason = "`examine --json` reports has_amd_gpu:false on a WSL2 host whose own summary names a gfx target."
+
+# --- EAI-8053: `install driver --dkms` prefixes every plan command with a literal
+# `sudo `, unconditionally. As root that prefix is unnecessary, and on a root host
+# with no `sudo` binary it is fatal: `sh -c "sudo apt-get update"` dies with
+# `sudo: not found` before any driver work. The fix is uid-aware (prepend `sudo`
+# only when NOT root), so the scenario is @requires-root (it SKIPS off root, where
+# the prefix is correct); on a root runner the "no sudo prefix" contract fails
+# today. Unconditional there, so `when = {}`. Remove when the plan stops prefixing
+# `sudo` while already root. ---
+[["driver-install-as-root-does-not-require-sudo"]]
+when = {}
+bug = "EAI-8053"
+reason = "install driver --dkms prefixes sudo even as root, so it fails with `sudo: not found` on a root host without sudo."
+
+# --- EAI-8051: `comfyui install` installs ComfyUI's dependencies into the managed
+# ROCm runtime with no package-index scoping. torch/torchvision/torchaudio are
+# filtered out, but a transitive dependency can still pull CUDA `nvidia-*` wheels
+# into the runtime and displace its ROCm torch, so installing an optional app
+# leaves the machine's base runtime a CUDA build with no AMD GPU support. Runs only
+# on the nightly GPU lane (@requires-gpu @lifecycle @nightly) against an isolated,
+# throwaway runtime it may corrupt. Unconditional where it runs, so `when = {}`.
+# Remove when the install can no longer alter the runtime's torch stack. ---
+[["comfyui-install-preserves-the-rocm-runtime"]]
+when = {}
+bug = "EAI-8051"
+reason = "comfyui install can pull CUDA nvidia-* wheels into the managed ROCm runtime, replacing its ROCm torch."
