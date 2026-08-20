@@ -4196,19 +4196,25 @@ mod tests {
         );
     }
 
-    /// A plain reinstall (`rocm install sdk`, no `--devel`) overwrites the
-    /// manifest unconditionally, `devel` included — there is no merge with the
-    /// prior manifest. This pins that behaviour: a user who installed with
-    /// `--devel` and later reinstalls the same runtime key without it keeps
-    /// `hipcc`/headers on disk, but the manifest silently records `devel:
-    /// false`, and `apply_runtime_update` reinstalls from that field on the
-    /// next `rocm update`. Documented as-is rather than fixed here — the flag
-    /// reflects what the most recent install actually asked for, which is
-    /// arguably correct; the drift risk is that neither `rocm runtimes list`
-    /// nor `rocm examine` surfaces `devel`, so the state is invisible.
+    /// Writing a manifest over an existing one for the same `runtime_key`
+    /// REPLACES it — `devel` included — rather than merging with what was on
+    /// disk. That is the storage half of the reinstall-drift case: a user who
+    /// installed with `--devel` and later reinstalls without it keeps
+    /// `hipcc`/headers on disk while the manifest records `devel: false`, and
+    /// `apply_runtime_update` reinstalls from that field on the next `rocm
+    /// update`. Left as-is rather than fixed — the flag reflects what the most
+    /// recent install asked for, which is arguably correct; the drift risk is
+    /// that neither `rocm runtimes list` nor `rocm examine` surfaces `devel`,
+    /// so the state is invisible.
+    ///
+    /// LIMIT: this covers `save_runtime_manifest` only. It does NOT reach
+    /// `install_sdk`, which is what actually threads `include_devel` into the
+    /// manifest — that call needs `uv`, a live index, and a real `rocm_sdk`
+    /// probe, so it has no unit coverage here. Hardcoding `devel: true` at that
+    /// write site passes this test and the rest of the suite.
     #[test]
-    fn reinstall_without_devel_overwrites_manifest_devel_flag() -> Result<()> {
-        let (root, paths) = test_paths("reinstall-overwrites-devel");
+    fn save_runtime_manifest_replaces_devel_rather_than_merging() -> Result<()> {
+        let (root, paths) = test_paths("manifest-replaces-devel");
         let install_root = root.join("install-root");
         fs::create_dir_all(&install_root)?;
         let with_devel = InstalledRuntimeManifest {
@@ -4239,7 +4245,7 @@ mod tests {
             .expect("manifest should still be registered under the same runtime_key");
         assert!(
             !reloaded.devel,
-            "a plain reinstall must overwrite devel, not merge with the prior manifest"
+            "saving a manifest must replace devel, not merge with the prior one"
         );
 
         let _ = fs::remove_dir_all(&root);
