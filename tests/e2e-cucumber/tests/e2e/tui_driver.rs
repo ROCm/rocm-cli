@@ -94,6 +94,12 @@ pub struct TuiSession {
     /// terminal failure state after the one-time diagnostic is consumed, so a
     /// retry cannot lose the cause while the reader thread is still finishing.
     reader_failure: Arc<ReaderFailure>,
+    /// Latches `true` the first time the child switches the terminal to its
+    /// alternate screen (the full-screen TUI buffer). Set by the reader thread
+    /// after each parse and never cleared, so it survives the exit sequence that
+    /// switches back — a plain `screen().alternate_screen()` snapshot taken after
+    /// the process exits would read `false` and miss that the TUI ever opened.
+    entered_alternate_screen: Arc<AtomicBool>,
     /// Kept alive for the lifetime of the session: the reader/writer are cloned
     /// from it, and dropping it early would close the PTY.
     master: Box<dyn MasterPty + Send>,
@@ -204,11 +210,13 @@ impl TuiSession {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, 0)));
         let reader_stop = Arc::new(AtomicBool::new(false));
         let reader_failure = Arc::new(ReaderFailure::default());
+        let entered_alternate_screen = Arc::new(AtomicBool::new(false));
         let reader = spawn_reader(
             reader,
             Arc::clone(&parser),
             Arc::clone(&reader_stop),
             Arc::clone(&reader_failure),
+            Arc::clone(&entered_alternate_screen),
         );
 
         Ok(Self {
@@ -218,6 +226,7 @@ impl TuiSession {
             reader_stop,
             reader: Some(reader),
             reader_failure,
+            entered_alternate_screen,
             master: pair.master,
             finished: false,
             recorded: false,
@@ -230,6 +239,14 @@ impl TuiSession {
     /// Whether the child has exited and been reaped successfully by a wait.
     pub const fn is_finished(&self) -> bool {
         self.finished
+    }
+
+    /// Whether the child ever switched the terminal to its alternate screen —
+    /// i.e. opened the full-screen interactive view. Latched, so it stays true
+    /// after the child switches back on exit. Lets a "must be refused before the
+    /// TUI opens" contract be asserted, not just "exited non-zero".
+    pub fn entered_alternate_screen(&self) -> bool {
+        self.entered_alternate_screen.load(Ordering::Relaxed)
     }
 
     /// The current visible screen as plain text (one row per line). `vt100` has
@@ -624,6 +641,7 @@ fn spawn_reader(
     parser: Arc<Mutex<vt100::Parser>>,
     stop: Arc<AtomicBool>,
     reader_failure: Arc<ReaderFailure>,
+    entered_alternate_screen: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
@@ -640,6 +658,12 @@ fn spawn_reader(
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         p.process(&buf[..n]);
                     }));
+                    // Latch alternate-screen use while the parser reflects THIS
+                    // chunk: the switch back on exit would otherwise erase the
+                    // evidence that the full-screen TUI ever opened.
+                    if result.is_ok() && p.screen().alternate_screen() {
+                        entered_alternate_screen.store(true, Ordering::Relaxed);
+                    }
                     drop(p);
                     if let Err(payload) = result {
                         let message = panic_message(&payload);

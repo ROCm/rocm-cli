@@ -255,6 +255,15 @@ async fn assert_replay_refused_promptly(world: &mut E2eWorld) {
                  opened the interactive view instead: {e}"
             )
         });
+    // Both halves of the contract. A prompt non-zero exit alone would be
+    // satisfied by an implementation that opens the full-screen TUI, then
+    // notices the unreadable file and exits — which still violates "instead of
+    // entering the TUI". Assert it never switched to the alternate screen too;
+    // that latched flag survives the switch-back an exiting TUI would perform.
+    assert!(
+        !tui.entered_alternate_screen(),
+        "the dashboard opened the interactive view before rejecting the unreadable replay"
+    );
     assert_ne!(
         rc, 0,
         "the dashboard accepted a replay recording that does not exist"

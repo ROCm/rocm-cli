@@ -150,9 +150,23 @@ async fn assert_piped_prompt_sent(world: &mut E2eWorld) {
         .wait_for_chat_request(Duration::from_secs(2))
         .await
         .unwrap_or_else(|e| panic!("the piped prompt never reached the model: {e}"));
-    let content = request["messages"][0]["content"].as_str().unwrap_or("");
+    // Find the user-role message rather than assuming it is index 0: a correct
+    // fix is free to prepend a system prompt, and pinning `messages[0]` would
+    // keep this xfailed against exactly that valid behaviour. Same shape as the
+    // managed-chat assertion in dash_steps.rs.
+    let messages = request
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("chat request had no messages array:\n{request}"));
+    let user_content = messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+        .and_then(|m| m.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("no user message in chat request:\n{request}"));
     assert_eq!(
-        content, "Hello from standard input",
+        user_content, "Hello from standard input",
         "the model received the wrong prompt: {request}"
     );
 }
