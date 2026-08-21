@@ -54,6 +54,7 @@ use rocm_engine_protocol::{
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -16068,6 +16069,11 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
                 "binary removal skipped because {} looks like a cargo target build; pass --force-dev-binaries to remove sibling debug/release binaries",
                 current_exe.display()
             ));
+        } else if is_python_managed_layout(&current_exe) {
+            plan.skipped.push(format!(
+                "binary removal skipped because {} was installed by a Python package manager; remove it with the matching command instead: `pip uninstall rocm-cli`, `pipx uninstall rocm-cli`, or `uv tool uninstall rocm-cli`",
+                current_exe.display()
+            ));
         } else {
             for path in collect_installed_binary_candidates(&current_exe)? {
                 if rocm_core::runtime_is_windows() && path == current_exe {
@@ -16297,6 +16303,225 @@ fn is_dev_binary_layout(path: &Path) -> bool {
         .and_then(|value| value.file_name())
         .and_then(|value| value.to_str())
         == Some("target")
+}
+
+/// Detect an executable that a Python package manager (`pip` inside a virtual
+/// environment, `pipx`, or `uv tool`) installed and still tracks.
+///
+/// Only paths derived from `current_exe` are probed — no environment variables
+/// and no process globals — so the decision is reproducible over a temporary
+/// tree in unit tests.
+///
+/// The probe is deliberately conservative, because the two mistakes do not cost
+/// the same. A false positive only leaves the binaries in place and tells the
+/// user to uninstall through their Python package manager; if that advice is
+/// wrong they simply delete the files themselves. A false negative deletes
+/// files another package manager owns: the wheel `RECORD` is left dangling,
+/// `pip list` keeps reporting `rocm-cli` as installed, and pip can no longer
+/// clean up its own install.
+///
+/// That asymmetry decides how failures resolve. An *absent* marker means "not
+/// Python-managed": no `pyvenv.cfg`, no `lib` directory, and no matching
+/// `RECORD` row is the ordinary shape of an installer-managed `~/.local/bin`
+/// tree, which must stay removable. But a probe that cannot read something that
+/// does exist resolves to "Python-managed" instead of guessing: an unreadable
+/// `lib` directory, an unreadable site-packages directory, a directory listing
+/// that breaks midway, and an existing `RECORD` that cannot be read as text all
+/// report ownership. Nothing here panics.
+///
+/// Known and accepted limitation: the `RECORD` scan is not scoped to the
+/// `rocm-cli` distribution. Any `*.dist-info/RECORD` under the environment that
+/// lists a file named like this executable inside a `bin`/`Scripts` component
+/// claims it, so a foreign distribution shipping a same-named script suppresses
+/// binary removal. The only consequence is that the binaries stay in place and
+/// the user is told to remove them through Python, which is not worth the
+/// fragility of resolving relative `RECORD` paths against the real environment.
+fn is_python_managed_layout(current_exe: &Path) -> bool {
+    let Some(script_dir) = current_exe.parent() else {
+        return false;
+    };
+    let Some(script_dir_name) = script_dir.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    // Python environments place installed scripts directly under the
+    // environment root, in `bin` on unix and `Scripts` on Windows.
+    if script_dir_name != "bin" && script_dir_name != "Scripts" {
+        return false;
+    }
+    let Some(env_root) = script_dir.parent() else {
+        return false;
+    };
+    // `python -m venv`, `pipx`, and `uv tool` all write a real `pyvenv.cfg` at
+    // the environment root.
+    if env_root.join("pyvenv.cfg").is_file() {
+        return true;
+    }
+    // No `pyvenv.cfg`: a `--user` or system-site install still records the
+    // script in the installed distribution's `RECORD`.
+    let Ok(site_packages_dirs) = python_site_packages_dirs(env_root) else {
+        return true;
+    };
+    site_packages_dirs.iter().any(|site_packages| {
+        // An unreadable tree hides whatever owns the script, so claim it.
+        dist_info_record_owns_script(site_packages, current_exe).unwrap_or(true)
+    })
+}
+
+/// A layout probe that could not complete: something that exists on disk could
+/// not be listed or read, so ownership is unknown. Callers must resolve it to
+/// "Python-managed" — see [`is_python_managed_layout`] for why an unknown
+/// answer has to fail closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProbeFailed;
+
+/// Site-packages directories to probe for the wheel `RECORD` that owns an
+/// installed script. Both the unix (`lib/python3.13/site-packages`) and the
+/// Windows (`Lib/site-packages`) layouts are probed on every host: this is pure
+/// path inspection, and a tree must be classified the same way regardless of
+/// which platform is doing the inspecting.
+///
+/// A missing `lib` directory yields an empty list, because that is the ordinary
+/// shape of a plain `~/.local/bin` install. A `lib` directory that exists but
+/// cannot be listed yields [`ProbeFailed`]: its contents could name the
+/// distribution that owns the script.
+fn python_site_packages_dirs(env_root: &Path) -> Result<Vec<PathBuf>, ProbeFailed> {
+    let mut dirs = Vec::new();
+    let windows_layout = env_root.join("Lib").join("site-packages");
+    if windows_layout.is_dir() {
+        dirs.push(windows_layout);
+    }
+    let unix_lib = env_root.join("lib");
+    let entries = match fs::read_dir(&unix_lib) {
+        Ok(entries) => entries,
+        Err(_) if unix_lib.is_dir() => return Err(ProbeFailed),
+        Err(_) => return Ok(dirs),
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return Err(ProbeFailed);
+        };
+        let version_dir = entry.path();
+        if !version_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("python"))
+        {
+            continue;
+        }
+        let candidate = version_dir.join("site-packages");
+        if candidate.is_dir() {
+            dirs.push(candidate);
+        }
+    }
+    Ok(dirs)
+}
+
+/// Whether any installed distribution under `site_packages` lists `current_exe`
+/// in its `RECORD`.
+///
+/// A missing site-packages directory, a `*.dist-info` without a `RECORD`, and a
+/// `RECORD` whose rows never name the script all mean "not owned". A
+/// site-packages directory that exists but cannot be listed, and a `RECORD`
+/// that exists but cannot be read as text, mean [`ProbeFailed`]: the row that
+/// would have claimed the script may be exactly the one that could not be read.
+fn dist_info_record_owns_script(
+    site_packages: &Path,
+    current_exe: &Path,
+) -> Result<bool, ProbeFailed> {
+    let Some(script_name) = current_exe.file_name().and_then(|name| name.to_str()) else {
+        return Ok(false);
+    };
+    let Some(script_dir_name) = current_exe
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+    else {
+        return Ok(false);
+    };
+    let entries = match fs::read_dir(site_packages) {
+        Ok(entries) => entries,
+        Err(_) if site_packages.is_dir() => return Err(ProbeFailed),
+        Err(_) => return Ok(false),
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return Err(ProbeFailed);
+        };
+        let dist_info = entry.path();
+        if !dist_info
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".dist-info"))
+        {
+            continue;
+        }
+        let record_path = dist_info.join("RECORD");
+        let record = match fs::read_to_string(&record_path) {
+            Ok(record) => record,
+            Err(_) if record_path.is_file() => return Err(ProbeFailed),
+            Err(_) => continue,
+        };
+        if record
+            .lines()
+            .any(|row| record_row_targets_script(row, script_name, script_dir_name))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether a wheel `RECORD` row (`<path>,<hash>,<size>`, with `/` separators on
+/// every platform) refers to the installed script.
+///
+/// Wheel records reference installed scripts by a site-packages-relative path
+/// such as `../../../bin/rocm`. Matching on the file name plus a `bin`/`Scripts`
+/// path component is intentional: resolving those relative paths exactly would
+/// mean canonicalizing through the environment's symlinks and junctions, which
+/// is fragile and can fail outright while an uninstall is in progress.
+fn record_row_targets_script(row: &str, script_name: &str, script_dir_name: &str) -> bool {
+    let Some(target) = record_row_target_path(row) else {
+        return false;
+    };
+    let target = Path::new(&*target);
+    if target.file_name().and_then(|name| name.to_str()) != Some(script_name) {
+        return false;
+    }
+    target
+        .components()
+        .any(|component| component.as_os_str().to_str() == Some(script_dir_name))
+}
+
+/// The first (path) field of a wheel `RECORD` row, unquoted and unescaped.
+///
+/// `RECORD` is RFC 4180 CSV, so a path holding a comma or a double quote is
+/// written quoted with every inner quote doubled. Splitting the row on its
+/// first comma would truncate such a path and silently miss the script it
+/// names, so the quoted form is parsed here instead. The common unquoted row
+/// stays borrowed; only a quoted row allocates. A row that opens a quote and
+/// never closes it is malformed and names nothing.
+fn record_row_target_path(row: &str) -> Option<Cow<'_, str>> {
+    let row = row.trim_start();
+    let Some(quoted) = row.strip_prefix('"') else {
+        let target = row.split(',').next().unwrap_or_default().trim_end();
+        return (!target.is_empty()).then_some(Cow::Borrowed(target));
+    };
+    let mut target = String::new();
+    let mut characters = quoted.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '"' {
+            target.push(character);
+        } else if characters.peek() == Some(&'"') {
+            // A doubled quote inside the field is one literal quote.
+            characters.next();
+            target.push('"');
+        } else {
+            // A lone quote closes the field; the rest of the row is the hash
+            // and size columns.
+            return (!target.is_empty()).then_some(Cow::Owned(target));
+        }
+    }
+    None
 }
 
 fn remove_path(path: &Path) -> Result<()> {
@@ -18995,6 +19220,174 @@ mod tests {
     fn uninstall_binary_matcher_includes_packaged_codex_binary() {
         assert!(is_rocm_install_entry_name("rocm-codex"));
         assert!(is_rocm_install_entry_name("rocm-codex.exe"));
+    }
+
+    #[test]
+    fn is_python_managed_layout_detects_virtualenv_bin_script() {
+        // `pip install rocm-cli` inside a venv drops the real binary in
+        // `<env>/bin`, and the env root always carries a `pyvenv.cfg`.
+        let (root, _paths) = test_paths("python-managed-venv");
+        let script_dir = root.join("bin");
+        fs::create_dir_all(&script_dir).expect("create venv bin dir");
+        fs::write(root.join("pyvenv.cfg"), "home = /usr/bin\n").expect("write pyvenv.cfg");
+        let executable = script_dir.join("rocm");
+        fs::write(&executable, b"elf").expect("write rocm script");
+
+        assert!(
+            is_python_managed_layout(&executable),
+            "a wheel-installed script under a venv bin dir is owned by pip"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn is_python_managed_layout_detects_windows_scripts_directory() {
+        // Same environment shape as above, written the way Windows wheels
+        // install it: `<env>\Scripts\rocm.exe`.
+        let (root, _paths) = test_paths("python-managed-scripts");
+        let script_dir = root.join("Scripts");
+        fs::create_dir_all(&script_dir).expect("create venv Scripts dir");
+        fs::write(root.join("pyvenv.cfg"), "home = C:/Python313\n").expect("write pyvenv.cfg");
+        let executable = script_dir.join("rocm.exe");
+        fs::write(&executable, b"pe").expect("write rocm.exe script");
+
+        assert!(
+            is_python_managed_layout(&executable),
+            "the Windows venv layout uses Scripts/ and must be detected the same way"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn is_python_managed_layout_ignores_plain_local_bin_install() {
+        // An installer-managed `~/.local/bin` tree has a `bin` parent but no
+        // Python environment around it, so uninstall must still remove it.
+        let (root, _paths) = test_paths("python-managed-local-bin");
+        let script_dir = root.join(".local").join("bin");
+        fs::create_dir_all(&script_dir).expect("create local bin dir");
+        let executable = script_dir.join("rocm");
+        fs::write(&executable, b"elf").expect("write rocm binary");
+
+        assert!(
+            !is_python_managed_layout(&executable),
+            "an installer-managed ~/.local/bin install keeps today's removal behavior"
+        );
+
+        // The same tree, one file different: adding the marker every venv,
+        // pipx, and `uv tool` environment carries must flip the answer, so the
+        // negative above discriminates instead of matching a constant `false`.
+        fs::write(root.join(".local").join("pyvenv.cfg"), "home = /usr/bin\n")
+            .expect("write pyvenv.cfg");
+
+        assert!(
+            is_python_managed_layout(&executable),
+            "the same tree with a pyvenv.cfg at the environment root is pip-managed"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn is_python_managed_layout_detects_dist_info_record_without_pyvenv_cfg() {
+        // A `--user` or system-site install has no `pyvenv.cfg`, but the
+        // distribution's RECORD still lists the installed script.
+        let (root, _paths) = test_paths("python-managed-record");
+        let script_dir = root.join("bin");
+        fs::create_dir_all(&script_dir).expect("create bin dir");
+        let dist_info = root
+            .join("lib")
+            .join("python3.13")
+            .join("site-packages")
+            .join("rocm_cli-0.1.0a1.dist-info");
+        fs::create_dir_all(&dist_info).expect("create dist-info dir");
+        fs::write(
+            dist_info.join("RECORD"),
+            "rocm_cli-0.1.0a1.dist-info/METADATA,sha256=aaa,512\n\
+             ../../../bin/rocm,sha256=bbb,17000000\n\
+             ../../../bin/rocmd,sha256=ccc,16000000\n",
+        )
+        .expect("write RECORD");
+        let executable = script_dir.join("rocm");
+        fs::write(&executable, b"elf").expect("write rocm script");
+
+        assert!(
+            is_python_managed_layout(&executable),
+            "a wheel RECORD that lists the script owns it even without pyvenv.cfg"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn is_python_managed_layout_ignores_dist_info_record_for_other_scripts() {
+        // Some other distribution owns this environment; nothing in it claims
+        // our executable, so the binary is not pip-managed.
+        let (root, _paths) = test_paths("python-managed-foreign-record");
+        let script_dir = root.join("bin");
+        fs::create_dir_all(&script_dir).expect("create bin dir");
+        let dist_info = root
+            .join("lib")
+            .join("python3.13")
+            .join("site-packages")
+            .join("other_tool-1.2.3.dist-info");
+        fs::create_dir_all(&dist_info).expect("create dist-info dir");
+        fs::write(
+            dist_info.join("RECORD"),
+            "other_tool-1.2.3.dist-info/METADATA,sha256=aaa,512\n\
+             ../../../bin/other-tool,sha256=bbb,4096\n",
+        )
+        .expect("write RECORD");
+        let executable = script_dir.join("rocm");
+        fs::write(&executable, b"elf").expect("write rocm binary");
+
+        assert!(
+            !is_python_managed_layout(&executable),
+            "a RECORD that never mentions the executable must not claim it"
+        );
+
+        // The same tree, one row different: teaching that RECORD to name this
+        // script must flip the answer, so the negative above discriminates
+        // instead of matching a constant `false`.
+        fs::write(
+            dist_info.join("RECORD"),
+            "other_tool-1.2.3.dist-info/METADATA,sha256=aaa,512\n\
+             ../../../bin/other-tool,sha256=bbb,4096\n\
+             ../../../bin/rocm,sha256=ccc,17000000\n",
+        )
+        .expect("rewrite RECORD");
+
+        assert!(
+            is_python_managed_layout(&executable),
+            "the same RECORD does claim the executable once it lists it"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn is_python_managed_layout_parses_quoted_record_rows() {
+        // RECORD is RFC 4180: a path holding a comma is quoted and an inner
+        // quote is doubled. Splitting the row on its first comma truncates the
+        // path to `"../../../bin/nested` — a fragment whose file name is
+        // `nested`, so the script it really names is missed.
+        assert!(
+            record_row_targets_script(
+                "\"../../../bin/nested,dir/rocm\",sha256=aaa,17000000",
+                "rocm",
+                "bin"
+            ),
+            "a quoted path containing a comma still resolves to the script"
+        );
+        assert!(
+            record_row_targets_script("\"../../../bin/ro\"\"cm\",sha256=bbb,4096", "ro\"cm", "bin"),
+            "a doubled inner quote unescapes to one literal quote"
+        );
+        assert!(
+            !record_row_targets_script("\"../../../bin/rocm,sha256=ccc,4096", "rocm", "bin"),
+            "an unterminated quoted field is malformed and names nothing"
+        );
     }
 
     #[test]
