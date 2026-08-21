@@ -53,6 +53,15 @@ async fn user_installs_sdk(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
 }
 
+#[when("the user dry-runs installing the SDK for a known family")]
+async fn user_dry_runs_install_sdk_for_family(world: &mut E2eWorld) {
+    let stdout = crate::run_rocm_ok(
+        world,
+        &["install", "sdk", "--family", "gfx110X-all", "--dry-run"],
+    );
+    world.cli_output = Some(stdout);
+}
+
 #[when("the user tries to adopt the existing install")]
 async fn user_tries_adopt(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(
@@ -122,6 +131,15 @@ async fn assert_runtime_path_not_nested(world: &mut E2eWorld) {
     assert!(
         !nested,
         "managed runtime folder path is recursively nested (dogfooding #17):\n{folder}"
+    );
+}
+
+#[then("the resolved package index is not the broken per-family multi-arch path")]
+async fn assert_index_not_broken_multi_arch(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().expect("no dry-run output");
+    assert!(
+        !stdout.contains("whl-multi-arch/gfx110X-all"),
+        "dry-run resolved the broken per-family multi-arch index shape:\n{stdout}"
     );
 }
 

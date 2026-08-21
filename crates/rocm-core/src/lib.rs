@@ -3968,6 +3968,26 @@ pub const fn known_therock_families() -> &'static [&'static str] {
     ]
 }
 
+/// Exact chip IDs covered by a [`known_therock_families`] bucket.
+///
+/// `None` for the prefix catch-all buckets (e.g. `gfx90X-dgpu`) whose exact
+/// chip membership isn't enumerable from [`normalize_therock_family`] alone.
+pub fn known_therock_family_device_chips(family: &str) -> Option<&'static [&'static str]> {
+    match family {
+        "gfx900" => Some(&["gfx900"]),
+        "gfx906" => Some(&["gfx906"]),
+        "gfx908" => Some(&["gfx908"]),
+        "gfx90a" => Some(&["gfx90a"]),
+        "gfx110X-all" => Some(&["gfx1100", "gfx1101", "gfx1102", "gfx1103"]),
+        "gfx1150" => Some(&["gfx1150"]),
+        "gfx1151" => Some(&["gfx1151"]),
+        "gfx1152" => Some(&["gfx1152"]),
+        "gfx1153" => Some(&["gfx1153"]),
+        "gfx120X-all" => Some(&["gfx1200", "gfx1201"]),
+        _ => None,
+    }
+}
+
 fn capture_optional_command(program: &str, args: &[&str]) -> Option<String> {
     capture_optional_command_with_timeout(program, args, OPTIONAL_COMMAND_TIMEOUT)
 }
@@ -8894,6 +8914,21 @@ mod tests {
     #[test]
     fn known_therock_families_is_not_empty() {
         assert!(!known_therock_families().is_empty());
+    }
+
+    #[test]
+    fn known_therock_family_device_chips_round_trip_to_their_family() {
+        for family in known_therock_families() {
+            if let Some(chips) = known_therock_family_device_chips(family) {
+                for chip in chips {
+                    assert_eq!(
+                        normalize_therock_family(chip).as_deref(),
+                        Some(*family),
+                        "chip `{chip}` must normalize back to family `{family}`"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
