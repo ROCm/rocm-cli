@@ -698,6 +698,31 @@ async fn user_serves_vllm_capable_default(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+#[given("Lemonade preparation cannot complete")]
+async fn lemonade_preparation_cannot_complete(world: &mut E2eWorld) {
+    world.command_env.push((
+        "ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE",
+        "repeated".into(),
+    ));
+}
+
+#[when("the user serves a model with Lemonade")]
+async fn user_serves_with_failing_lemonade_preparation(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "serve",
+            "Qwen3-0.6B-GGUF",
+            "--engine",
+            "lemonade",
+            "--managed",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 #[when("the user sends a chat completion request")]
 async fn user_sends_completion(world: &mut E2eWorld) {
     crate::send_chat(world).await;
@@ -756,6 +781,34 @@ async fn when_cli_reports_ready(world: &mut E2eWorld) {
 }
 
 // ── Then ───────────────────────────────────────────────────────────
+
+#[then("serving stops after one automatic retry")]
+async fn assert_lemonade_preparation_retry_is_bounded(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "serve unexpectedly succeeded:\n{output}"
+    );
+    assert_eq!(
+        output.matches("retrying once").count(),
+        1,
+        "expected exactly one retry announcement:\n{output}"
+    );
+}
+
+#[then("the user is told how to reinstall Lemonade and retry serving")]
+async fn assert_lemonade_recovery_guidance(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("rocm engines install lemonade --reinstall"),
+        "expected a forced-reinstall recovery command:\n{output}"
+    );
+    assert!(
+        output.contains("retry `rocm serve`"),
+        "expected guidance to retry serving:\n{output}"
+    );
+}
 
 #[then("an inference request succeeds immediately")]
 async fn assert_inference_succeeds_now(world: &mut E2eWorld) {
