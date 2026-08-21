@@ -484,8 +484,8 @@ jobs:
           # being scaled away, so the cargo target dir and shared caches stay warm.
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          # Separate PVC mounted at this path by the rad3 overlay; keep in step
-          # with github-runner/overlays/rad3 if you change it.
+          # Separate PVC mounted at exactly this path by the runner's cluster
+          # overlay; if you change this path, change the overlay that mounts it too.
           export E2E_SHARED_UV_CACHE_DIR="/var/tmp/rocm-e2e-uv-cache"
           prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
@@ -503,6 +503,13 @@ jobs:
             HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
             UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
               "$ROCM_CLI_BINARY" install sdk
+            if [ -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
+              echo "shared runtime pre-warmed at $E2E_SHARED_RUNTIMES_DIR"
+            else
+              echo "pre-warm did not produce a runtimes registry; scenarios will install their own" >&2
+            fi
+          else
+            echo "shared runtime already present at $E2E_SHARED_RUNTIMES_DIR — skipping pre-warm"
           fi
 
           cargo xtask e2e

@@ -872,6 +872,8 @@ jobs:
     env:
       E2E_SERVE_TIMEOUT_SECS: "300"
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
+      # Full serve matrix at the merge-queue gate, like every other lane (see e2e-gpu).
+      E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -932,9 +934,9 @@ jobs:
           # still warm on the next job even though the container is not.
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          # A SEPARATE PVC is mounted at exactly this path by the rad3 overlay
-          # (github-runner/overlays/rad3). Keeping the ~23GB uv cache off the work
-          # PVC is deliberate; if you change this path, change the overlay too.
+          # A SEPARATE PVC is mounted at exactly this path by the runner's cluster
+          # overlay. Keeping the ~23GB uv cache off the work PVC is deliberate; if
+          # you change this path, change the overlay that mounts it too.
           export E2E_SHARED_UV_CACHE_DIR="/var/tmp/rocm-e2e-uv-cache"
           # Pre-warm one shared runtime in place before the suite. Not an
           # optimization — `install sdk` bakes absolute paths into the runtime
