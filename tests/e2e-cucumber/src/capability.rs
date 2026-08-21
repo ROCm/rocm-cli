@@ -99,6 +99,10 @@ pub struct HostCapability {
     pub os_family: String,
     /// `examine`'s `wsl:` line.
     pub is_wsl: bool,
+    /// Whether the test process runs as root (effective UID 0). Always false off
+    /// Unix. Gates `@requires-root` scenarios whose contract only holds when the
+    /// runner is root (see [`ScenarioDecl::requires_root`]).
+    pub is_root: bool,
     /// First AMD GPU's gfx target from `examine`'s `detected_gfx_target:` line
     /// (e.g. "gfx942", "gfx1151"), if a real one was reported.
     pub gfx_target: Option<String>,
@@ -348,12 +352,30 @@ fn probe_host_capability() -> HostCapability {
     HostCapability {
         os_family,
         is_wsl,
+        is_root: process_is_root(),
         gfx_target,
         has_amd_gpu,
         available_engines,
         effective_serve_engine,
         platform_slug,
     }
+}
+
+/// Whether the current test process runs as root (effective UID 0). Read from
+/// `/proc/self/status` rather than `geteuid` so the check stays inside this
+/// crate's `deny(unsafe_code)` policy. The `Uid:` line lists real, effective,
+/// saved and filesystem uids; the effective uid (the second field) is the one the
+/// driver-install `sudo`-prefix contract turns on. False on any non-Linux host or
+/// if the status file cannot be read — off Linux the contract does not apply.
+fn process_is_root() -> bool {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return false;
+    };
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|rest| rest.split_whitespace().nth(1))
+        .is_some_and(|euid| euid == "0")
 }
 
 /// Run `rocm <args>` with an isolated config/data/cache root, returning stdout
@@ -600,6 +622,7 @@ mod tests {
         let strix = HostCapability {
             os_family: "windows".to_owned(),
             is_wsl: false,
+            is_root: false,
             gfx_target: Some("gfx1151".to_owned()),
             has_amd_gpu: true,
             available_engines: vec!["lemonade".to_owned(), "vllm".to_owned()],
@@ -613,6 +636,7 @@ mod tests {
         let mi300x = HostCapability {
             os_family: "linux".to_owned(),
             is_wsl: false,
+            is_root: false,
             gfx_target: Some("gfx942".to_owned()),
             has_amd_gpu: true,
             available_engines: vec!["lemonade".to_owned(), "vllm".to_owned()],
