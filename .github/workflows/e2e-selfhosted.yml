@@ -32,7 +32,8 @@ on:
         description: Which self-hosted runner(s) to target
         type: choice
         default: all
-        options: [all, app-dev-gpu, strix-ubuntu, strix-windows, strix-wsl]
+        options: [all, app-dev-gpu, strix-ubuntu, strix-windows, strix-wsl,
+                  strix-ubuntu-ephemeral, strix-windows-ephemeral]
       name_filter:
         description: "Scenario-name regex (cucumber --name); empty = full suite"
         type: string
@@ -850,6 +851,289 @@ jobs:
   # check; this one is advisory and lives with the lanes it summarizes. Runs on
   # GitHub-hosted ubuntu (no GPU needed — it only parses report.json). `always()`
   # so a failing/skipped self-hosted platform still appears in the grid.
+  # ---------------------------------------------------------------------------
+  # DevLab ephemeral lanes — opt-in, dispatch-only.
+  #
+  # Same suite as the two `native` Strix lanes above, but targeting the AMD Ryzen
+  # DevLab ephemeral pool: a runner is registered for ONE job and destroyed with
+  # its working directory afterwards. `all` deliberately does NOT include these,
+  # and they are gated on `workflow_dispatch` with an exact platform match, so
+  # merging this changes nothing about any existing lane on push/PR/merge_group.
+  #
+  # PREREQUISITE — the DevLab orchestrator GitHub App must be installed on this
+  # repository first: https://github.com/apps/amddevlabephemeralorchestrator
+  # (Administration: read & write — to mint a runner registration token per job
+  # and delete the runner after; Actions: read — to see queued jobs; Metadata:
+  # read — mandatory for any App). Until it is installed nothing provisions a
+  # runner and a dispatched job just sits queued. Dispatches get a run_id-scoped
+  # concurrency group (see `concurrency` above), so a job left queued that way
+  # blocks only its own run; cancel the run to clear it.
+  #
+  # Three deliberate differences from the native lanes, all of them forced:
+  #
+  #  1. No host-path pinning. The native Ubuntu lane sets HOME, CARGO_HOME,
+  #     RUSTUP_HOME, TMPDIR and PIP_CACHE_DIR to /home/ubuntu/actions-runner/...
+  #     because on THAT box everything else is on a full root partition. Copying
+  #     those paths here would be actively harmful: the pool's hosts keep / on a
+  #     tmpfs overlay, so a hardcoded /home/ubuntu/... path is either absent or
+  #     resident in RAM on a machine whose iGPU takes its VRAM from the same
+  #     62 GiB. The pool sets TMPDIR, PIP_CACHE_DIR, XDG_CACHE_HOME, HF_HOME and
+  #     the ROCm/MIOpen cache vars itself, pointed at its own persistent nvme,
+  #     and deliberately leaves HOME alone. Inheriting is the correct config.
+  #
+  #  2. No GPU reclaim step. `pkill`-ing serves leaked by a PRIOR job is
+  #     meaningless on a runner that has never run one. This is the property the
+  #     migration is actually buying.
+  #
+  #  3. The pre-warm moves off RUNNER_WORKSPACE. The native lanes keep the shared
+  #     runtime under $RUNNER_WORKSPACE and note it "persists across runs on
+  #     RUNNER_WORKSPACE" — on an ephemeral runner it does not; the work tree is
+  #     wiped with the runner. Without this every run would re-pay `install sdk`.
+  #     Pointing it at the pool's XDG_CACHE_HOME (persistent beside the runner
+  #     installation, surviving both the job and a reboot) keeps the pre-warm a
+  #     once-per-host cost. This is the one change that matters for wall-clock.
+  # ---------------------------------------------------------------------------
+  e2e-gpu-strix-ubuntu-ephemeral:
+    name: E2E tests (Strix Halo, Ubuntu, ephemeral)
+    timeout-minutes: 35
+    # The pool's hosts carry `strix-halo` + `ephemeral` and never `native`; the
+    # persistent runners carry `native` and never `ephemeral`. The two pools
+    # cannot claim each other's jobs, so the label set IS the routing. Note that
+    # [self-hosted, linux] alone would NOT reach the pool: it refuses any job
+    # naming only generic labels, precisely so it never steals untargeted work.
+    runs-on: [self-hosted, linux, strix-halo, ephemeral]
+    needs: [changes]
+    if: >-
+      always()
+      && needs.changes.result == 'success'
+      && github.event_name == 'workflow_dispatch'
+      && inputs.platform == 'strix-ubuntu-ephemeral'
+    continue-on-error: true
+    env:
+      E2E_SERVE_TIMEOUT_SECS: "300"
+      # Kept at the native lanes' raised budget rather than introducing a second
+      # number to explain. One job per host at a time here, so if anything this
+      # is now generous.
+      E2E_TUI_TIMEOUT_SECS: "90"
+      E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
+      # Dispatch-only lane, so it is never the merge queue.
+      E2E_MERGE_QUEUE: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve persistent cache root on the pool host
+        run: |
+          # XDG_CACHE_HOME is set by the pool and points beside the runner
+          # installation on its persistent nvme. The fallback only matters on a
+          # runner that does not set it — it still works, just cold every job.
+          PERSIST="${XDG_CACHE_HOME:-$HOME/.cache}/rocm-e2e"
+          mkdir -p "$PERSIST"
+          {
+            echo "CARGO_HOME=$PERSIST/cargo"
+            echo "RUSTUP_HOME=$PERSIST/rustup"
+            echo "E2E_PERSIST_DIR=$PERSIST"
+          } >> "$GITHUB_ENV"
+          echo "persistent cache root: $PERSIST"
+
+      # Same bounded preflight as the native lane: a missing or wedged GPU fails
+      # fast (~90s) instead of hanging to the job cap. Kept despite the fresh
+      # runner because it also answers "is the GPU visible inside a runner this
+      # pool just provisioned", which is exactly what a first migration run is
+      # trying to establish.
+      - name: GPU preflight (bounded wait for an available GPU)
+        run: |
+          MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-8}"
+          CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
+          min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
+          deadline=$(( SECONDS + CEILING_SECS ))
+          reason="rocm-smi never returned within its timeout (driver wedged or GPU absent)"
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
+            total=$(printf '%s\n' "$out" | grep -i 'VRAM Total Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            used=$(printf '%s\n' "$out" | grep -i 'VRAM Total Used Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            if [ -z "$total" ] || [ -z "$used" ]; then
+              reason="rocm-smi returned no VRAM figures (no AMD GPU detected)"
+              sleep 5; continue
+            fi
+            free=$(( total - used ))
+            if [ "$free" -ge "$min_free" ]; then
+              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB free (>= ${MIN_FREE_GIB} GiB)."
+              exit 0
+            fi
+            reason="VRAM never dropped below the floor: only $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB)"
+            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB)…"
+            sleep 5
+          done
+          echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${reason}"
+          exit 1
+
+      - name: Ensure Rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$CARGO_HOME/bin/cargo" ]; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --default-toolchain none
+          fi
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Run E2E tests on Strix Halo (ephemeral)
+        run: |
+          # CARGO_TARGET_DIR stays on the ephemeral work tree: build output is
+          # per-commit, so persisting it buys little and costs disk that the
+          # pool would have to reclaim. The SHARED RUNTIME is the opposite — see
+          # note 3 above — so it goes to the persistent root.
+          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
+          export E2E_SHARED_CACHE_DIR="$E2E_PERSIST_DIR/e2e-shared"
+          prewarm="$E2E_PERSIST_DIR/e2e-prewarm"
+          export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
+
+          cargo build --release -p rocm -p rocmd
+          export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
+          export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
+
+          # Install in place so `install sdk`'s baked absolute paths stay valid
+          # for every scenario — identical reasoning to the native lane, just
+          # rooted somewhere that outlives this runner.
+          if [ ! -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
+            echo "pre-warming shared runtime (first run on this HOST, not this runner)…"
+            mkdir -p "$prewarm"/{data,config,cache}
+            ROCM_CLI_CONFIG_DIR="$prewarm/config" \
+            ROCM_CLI_DATA_DIR="$prewarm/data" \
+            ROCM_CLI_CACHE_DIR="$prewarm/cache" \
+            HF_HOME="${HF_HOME:-$E2E_SHARED_CACHE_DIR/huggingface}" \
+              "$ROCM_CLI_BINARY" install sdk
+            if [ -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
+              echo "shared runtime pre-warmed at $E2E_SHARED_RUNTIMES_DIR"
+            else
+              echo "pre-warm did not produce a runtimes registry; scenarios will install their own" >&2
+            fi
+          else
+            echo "shared runtime already present at $E2E_SHARED_RUNTIMES_DIR — skipping pre-warm"
+          fi
+
+          NAME_FILTER="${{ github.event.inputs.name_filter }}"
+          if [ -n "$NAME_FILTER" ]; then
+            echo "name filter active: $NAME_FILTER"
+            cargo xtask e2e -- --name "$NAME_FILTER"
+          else
+            cargo xtask e2e
+          fi
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          # `*-report` glob in e2e-report picks this up as a new platform with no
+          # change needed there.
+          name: e2e-gpu-strix-ubuntu-ephemeral-report
+          path: tests/e2e-cucumber/results/
+
+  e2e-gpu-strix-windows-ephemeral:
+    name: E2E tests (Strix Halo, Windows, ephemeral)
+    timeout-minutes: 35
+    runs-on: [self-hosted, windows, strix-halo, ephemeral]
+    needs: [changes]
+    if: >-
+      always()
+      && needs.changes.result == 'success'
+      && github.event_name == 'workflow_dispatch'
+      && inputs.platform == 'strix-windows-ephemeral'
+    continue-on-error: true
+    env:
+      E2E_TUI_TIMEOUT_SECS: "90"
+      E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
+      E2E_MERGE_QUEUE: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The Windows pool host is not tmpfs-rooted and the pool sets no cache
+      # variables there, so LOCALAPPDATA is the persistent root: teardown removes
+      # the runner directory, never the profile. Same purpose as the Linux lane's
+      # XDG_CACHE_HOME — keep the pre-warm across runner lifetimes.
+      - name: Resolve persistent cache root on the pool host
+        shell: powershell
+        run: |
+          $persist = Join-Path $env:LOCALAPPDATA 'rocm-e2e'
+          New-Item -ItemType Directory -Force -Path $persist | Out-Null
+          "E2E_PERSIST_DIR=$persist" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "persistent cache root: $persist"
+
+      - name: GPU preflight (bounded wait for an available GPU)
+        shell: powershell
+        run: |
+          $minFreeGiB = if ($env:GPU_PREFLIGHT_MIN_FREE_GIB) { [int]$env:GPU_PREFLIGHT_MIN_FREE_GIB } else { 8 }
+          $ceilingSecs = if ($env:GPU_PREFLIGHT_CEILING_SECS) { [int]$env:GPU_PREFLIGHT_CEILING_SECS } else { 90 }
+          if (-not (Get-Command rocm-smi -ErrorAction SilentlyContinue)) {
+            Write-Host "rocm-smi not found on this Windows runner; skipping GPU preflight (best-effort)."
+            exit 0
+          }
+          $minFree = [int64]$minFreeGiB * 1GB
+          $deadline = (Get-Date).AddSeconds($ceilingSecs)
+          while ((Get-Date) -lt $deadline) {
+            $out = (rocm-smi --showmeminfo vram 2>$null | Out-String)
+            $total = ([regex]::Matches($out, 'VRAM Total Memory \(B\):\s*(\d+)') | Select-Object -First 1).Groups[1].Value
+            $used  = ([regex]::Matches($out, 'VRAM Total Used Memory \(B\):\s*(\d+)') | Select-Object -First 1).Groups[1].Value
+            if (-not $total -or -not $used) { Start-Sleep -Seconds 5; continue }
+            if (([int64]$total - [int64]$used) -ge $minFree) {
+              Write-Host "GPU ready."
+              exit 0
+            }
+            Start-Sleep -Seconds 5
+          }
+          Write-Host "::error::GPU preflight failed after $ceilingSecs s"
+          exit 1
+
+      - name: Ensure Rust toolchain (PowerShell)
+        shell: powershell
+        run: |
+          if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+            Invoke-WebRequest https://win.rustup.rs/x86_64 -OutFile $env:TEMP\rustup-init.exe
+            & $env:TEMP\rustup-init.exe -y --default-toolchain none
+            "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          }
+
+      - name: Run E2E tests on Strix Halo Windows (ephemeral)
+        shell: powershell
+        run: |
+          # Pre-warm under the persistent root, not RUNNER_WORKSPACE — the work
+          # tree does not survive this runner. Same install-in-place reasoning as
+          # the native lane.
+          $prewarm = Join-Path $env:E2E_PERSIST_DIR 'e2e-prewarm'
+          $env:E2E_SHARED_RUNTIMES_DIR = "$prewarm\data\runtimes"
+          $env:E2E_SHARED_CACHE_DIR = Join-Path $env:E2E_PERSIST_DIR 'e2e-shared'
+
+          cargo build --release -p rocm -p rocmd
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "target" }
+          $env:ROCM_CLI_BINARY = "$targetDir\release\rocm.exe"
+          $env:ROCM_CLI_ROCMD_BINARY = "$targetDir\release\rocmd.exe"
+
+          if (-not (Test-Path "$env:E2E_SHARED_RUNTIMES_DIR\registry")) {
+            Write-Host "pre-warming shared runtime (first run on this HOST, not this runner)..."
+            New-Item -ItemType Directory -Force -Path "$prewarm\data","$prewarm\config","$prewarm\cache" | Out-Null
+            $env:ROCM_CLI_CONFIG_DIR = "$prewarm\config"
+            $env:ROCM_CLI_DATA_DIR   = "$prewarm\data"
+            $env:ROCM_CLI_CACHE_DIR  = "$prewarm\cache"
+            & $env:ROCM_CLI_BINARY install sdk
+            Remove-Item Env:\ROCM_CLI_CONFIG_DIR,Env:\ROCM_CLI_DATA_DIR,Env:\ROCM_CLI_CACHE_DIR -ErrorAction SilentlyContinue
+          } else {
+            Write-Host "shared runtime already present at $env:E2E_SHARED_RUNTIMES_DIR - skipping pre-warm"
+          }
+
+          $nameFilter = "${{ github.event.inputs.name_filter }}"
+          if ($nameFilter) {
+            Write-Host "name filter active: $nameFilter"
+            cargo xtask e2e -- --name "$nameFilter"
+          } else {
+            cargo xtask e2e
+          }
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-strix-windows-ephemeral-report
+          path: tests/e2e-cucumber/results/
+
   e2e-report:
     name: E2E consolidated report (self-hosted)
     runs-on: ubuntu-latest
@@ -860,6 +1144,13 @@ jobs:
       - e2e-gpu-strix-ubuntu
       - e2e-gpu-strix-windows
       - e2e-wsl
+      # Skipped on every event except their own dispatch, which `always()` above
+      # already tolerates. Listed so an ephemeral trial produces a consolidated
+      # report you can diff against the native one — that comparison is the
+      # point of the trial. Caveat: if the App is not yet installed the
+      # ephemeral job stays queued and this report waits with it; cancel the run.
+      - e2e-gpu-strix-ubuntu-ephemeral
+      - e2e-gpu-strix-windows-ephemeral
     # Gate on `serve`: every lane this report consolidates (the GPU jobs) is now
     # serve-gated, so a serve-only change runs them and their report must still be
     # produced. On dispatch `serve` is unset, so also run when the trigger was
