@@ -23,6 +23,7 @@ mod e2e {
     pub mod dash_steps;
     pub mod dependency_guard_steps;
     pub mod diagnose_steps;
+    pub mod driver_steps;
     pub mod engines_steps;
     pub mod examine_steps;
     pub mod lifecycle_steps;
