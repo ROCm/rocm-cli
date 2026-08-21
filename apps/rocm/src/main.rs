@@ -18254,15 +18254,30 @@ fn resolve_gpu_indices(
 ) -> Result<Vec<u32>> {
     let detected = detect_gpu_count();
     match selection {
-        GpuSelection::Index(index) => validate_pinned_gpu_index(*index, detected),
+        GpuSelection::Index(index) => {
+            validate_pinned_gpu_index(*index, effective_gpu_count(detected, vram))
+        }
         GpuSelection::Auto => Ok(auto_select_gpu_indices(paths, detected, vram)),
     }
 }
 
+/// The GPU count to validate `--gpu <index>` against and to rank `--gpu auto`
+/// candidates over. Prefers the `amd-smi` device count; when `amd-smi` is
+/// unavailable (`detected` is `None`) but the DRM sysfs VRAM fallback still
+/// produced rows, its length stands in for the count so an out-of-range index
+/// is caught here rather than accepted and left to fail later inside the
+/// engine. `None` when neither source is available.
+fn effective_gpu_count(detected: Option<usize>, vram: Option<&[GpuVramUsage]>) -> Option<usize> {
+    detected
+        .filter(|&count| count > 0)
+        .or_else(|| vram.map(<[GpuVramUsage]>::len).filter(|&count| count > 0))
+}
+
 /// Validate an explicit `--gpu <index>` against the detected GPU count and
 /// return the single pinned ordinal. Errors when the index is out of range for
-/// a known device count; an unknown count (amd-smi unavailable) is allowed
-/// through so serving can still proceed where GPU probing is not possible.
+/// a known device count; an unknown count (amd-smi unavailable and the DRM
+/// sysfs fallback found no rows either) is allowed through so serving can
+/// still proceed where GPU probing is not possible at all.
 fn validate_pinned_gpu_index(index: u32, detected: Option<usize>) -> Result<Vec<u32>> {
     if let Some(count) = detected
         && (index as usize) >= count
@@ -18339,10 +18354,7 @@ fn select_auto_gpu_index(
     // may still have populated `vram`. Derive the count from those rows in that
     // case so `--gpu auto` can rank GPUs by free VRAM instead of returning no
     // selection and landing on a busy device 0.
-    let count = detected
-        .filter(|&count| count > 0)
-        .or_else(|| vram.map(<[GpuVramUsage]>::len).filter(|&count| count > 0))
-        .unwrap_or(0);
+    let count = effective_gpu_count(detected, vram).unwrap_or(0);
     if count == 0 {
         // No GPU count from amd-smi and no VRAM telemetry (both unavailable, or
         // genuinely zero devices). Do not assume device 0 exists: return no
@@ -18389,11 +18401,13 @@ fn select_auto_gpu_index(
 }
 
 /// Best-effort per-GPU VRAM occupancy. Prefers `amd-smi metric --json`; when
-/// amd-smi is not installed (e.g. a shared multi-GPU node or container that ships
-/// no rocm-smi/amd-smi) it falls back to the amdgpu DRM sysfs VRAM counters so
-/// `--gpu auto` selection and the low-VRAM warning still have telemetry to work
-/// with. Returns `None` only when neither source is readable (callers then fall
-/// back to service-state-only auto-selection).
+/// amd-smi is not installed (e.g. a shared node or container that ships no
+/// amd-smi — this never tries `rocm-smi`) it falls back to the amdgpu DRM sysfs
+/// VRAM counters so `--gpu auto` selection and the low-VRAM warning still have
+/// telemetry to work with on a single-GPU host (see
+/// [`read_drm_vram_usage`] for why the sysfs fallback withholds telemetry on a
+/// multi-GPU one). Returns `None` only when neither source is readable
+/// (callers then fall back to service-state-only auto-selection).
 fn gpu_vram_usage() -> Option<Vec<GpuVramUsage>> {
     gpu_vram_usage_amd_smi().or_else(gpu_vram_usage_sysfs)
 }
@@ -18437,8 +18451,18 @@ fn gpu_vram_usage_sysfs() -> Option<Vec<GpuVramUsage>> {
 /// `drm_dir`. Enumerates primary `card<N>` nodes (skipping connector sub-nodes
 /// like `card0-DP-1`), keeps only AMD (`vendor == 0x1002`) devices exposing the
 /// `mem_info_vram_total` counter, and assigns sequential 0-based ordinals in
-/// ascending card order to mirror HIP device ordering on a standard single-host
-/// install. Split from [`gpu_vram_usage_sysfs`] so it can be tested against a
+/// ascending card order to mirror HIP device ordering on a standard single-GPU
+/// host install.
+///
+/// HIP ordinals come from the KFD *compute* topology, not DRM card numbers, and
+/// the two enumerations are only guaranteed to agree when there is exactly one
+/// AMD DRM card: an APU passes the same vendor + `mem_info_vram_total` filter as
+/// a discrete GPU, so a host pairing an APU with a dGPU can order `card<N>`
+/// differently than HIP's node order, and that ordinal is fed to
+/// `HIP_VISIBLE_DEVICES` downstream. Rather than guess, this returns no rows at
+/// all when more than one AMD card is found — callers then fall back to
+/// service-state-only auto-selection instead of trusting a possibly-wrong
+/// ordinal. Split from [`gpu_vram_usage_sysfs`] so it can be tested against a
 /// planted sysfs layout.
 #[cfg(any(target_os = "linux", test))]
 fn read_drm_vram_usage(drm_dir: &Path) -> Vec<GpuVramUsage> {
@@ -18470,7 +18494,12 @@ fn read_drm_vram_usage(drm_dir: &Path) -> Vec<GpuVramUsage> {
         let Some(total_bytes) = read_sysfs_u64(&device_dir.join("mem_info_vram_total")) else {
             continue;
         };
-        let used_bytes = read_sysfs_u64(&device_dir.join("mem_info_vram_used")).unwrap_or(0);
+        // An unreadable `used` counter is unknown occupancy, not zero: treating
+        // it as `0` would make the card look 100% free, which is exactly what
+        // `--gpu auto` prefers first. Skip the card instead of guessing.
+        let Some(used_bytes) = read_sysfs_u64(&device_dir.join("mem_info_vram_used")) else {
+            continue;
+        };
         cards.push((
             suffix,
             GpuVramUsage {
@@ -18480,6 +18509,12 @@ fn read_drm_vram_usage(drm_dir: &Path) -> Vec<GpuVramUsage> {
                 total_mb: total_bytes / BYTES_PER_MIB,
             },
         ));
+    }
+    // More than one AMD card: ascending card order is not guaranteed to match
+    // HIP's ordinal order (see doc comment above), so do not hand out ordinals
+    // that might feed the wrong device into `HIP_VISIBLE_DEVICES`.
+    if cards.len() > 1 {
+        return Vec::new();
     }
     cards.sort_by_key(|(suffix, _)| *suffix);
     cards
@@ -25561,6 +25596,34 @@ install therock";
     }
 
     #[test]
+    fn effective_gpu_count_prefers_amd_smi_then_falls_back_to_vram_rows() {
+        let usage = [vram(0, 1_000, 192_000), vram(1, 1_000, 192_000)];
+        // amd-smi's count wins when it is known, even over a differing row count.
+        assert_eq!(effective_gpu_count(Some(4), Some(&usage)), Some(4));
+        // amd-smi unavailable (`None`): the sysfs VRAM fallback row count stands in.
+        assert_eq!(effective_gpu_count(None, Some(&usage)), Some(2));
+        // Neither source available.
+        assert_eq!(effective_gpu_count(None, None), None);
+        assert_eq!(effective_gpu_count(None, Some(&[])), None);
+    }
+
+    #[test]
+    fn resolve_gpu_indices_rejects_out_of_range_index_from_sysfs_fallback_count() {
+        // The exact environment this fixes: no amd-smi (`detected` is `None`), but
+        // the DRM sysfs fallback found one GPU. `--gpu 1` must be rejected here
+        // rather than accepted and left to fail later inside the engine.
+        let single_gpu = [vram(0, 1_000, 192_000)];
+        let error = validate_pinned_gpu_index(1, effective_gpu_count(None, Some(&single_gpu)))
+            .expect_err("index 1 is out of range for a single detected GPU");
+        assert!(error.to_string().contains("out of range"));
+        // The in-range index for that same host is still accepted.
+        assert_eq!(
+            validate_pinned_gpu_index(0, effective_gpu_count(None, Some(&single_gpu))).unwrap(),
+            vec![0]
+        );
+    }
+
+    #[test]
     fn parse_gpu_vram_usage_reads_gpu_data_envelope() {
         let value = json!({
             "gpu_data": [
@@ -25577,11 +25640,9 @@ install therock";
     }
 
     #[test]
-    fn read_drm_vram_usage_reads_amdgpu_cards_and_assigns_ordinals() {
-        // Plant a minimal `/sys/class/drm`-shaped tree: two AMD cards, a connector
+    fn read_drm_vram_usage_reads_a_single_amdgpu_card_and_assigns_ordinal_zero() {
+        // Plant a minimal `/sys/class/drm`-shaped tree: one AMD card, a connector
         // sub-node that must be skipped, and a non-AMD card that must be ignored.
-        // Read in reverse-numeric order to prove ordinals follow card index, not
-        // readdir order.
         let root = std::env::temp_dir().join(format!("rocm-drm-vram-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let plant_amd = |card: &str, total: u64, used: u64| {
@@ -25591,13 +25652,12 @@ install therock";
             fs::write(device.join("mem_info_vram_total"), format!("{total}\n")).unwrap();
             fs::write(device.join("mem_info_vram_used"), format!("{used}\n")).unwrap();
         };
-        // 192 GiB total; card1 mostly used, card0 mostly free (values in bytes).
-        plant_amd("card1", 206_158_430_208, 189_284_651_008);
+        // 192 GiB total, mostly free (values in bytes).
         plant_amd("card0", 206_158_430_208, 1_073_741_824);
         // A connector sub-node under card0 — must be skipped, not parsed as a card.
         fs::create_dir_all(root.join("card0-DP-1")).unwrap();
         // A non-AMD primary card — different vendor, must be ignored.
-        let intel = root.join("card2").join("device");
+        let intel = root.join("card1").join("device");
         fs::create_dir_all(&intel).unwrap();
         fs::write(intel.join("vendor"), "0x8086\n").unwrap();
         fs::write(intel.join("mem_info_vram_total"), "1000000\n").unwrap();
@@ -25605,16 +25665,60 @@ install therock";
         let rows = read_drm_vram_usage(&root);
         let _ = fs::remove_dir_all(&root);
 
-        assert_eq!(rows.len(), 2, "only the two AMD cards count: {rows:?}");
-        // Ordinals are assigned in ascending card order (card0 -> 0, card1 -> 1).
+        assert_eq!(rows.len(), 1, "only the one AMD card counts: {rows:?}");
         assert_eq!(rows[0].index, 0);
-        assert_eq!(rows[1].index, 1);
         // 206_158_430_208 bytes / 1 MiB == 196_608 MiB.
         assert_eq!(rows[0].total_mb, 196_608);
-        assert_eq!(rows[1].total_mb, 196_608);
-        // card0 is nearly idle; card1 is nearly full.
         assert!(rows[0].free_fraction().unwrap() > AUTO_FREE_VRAM_FRACTION);
-        assert!(rows[1].free_fraction().unwrap() < AUTO_FREE_VRAM_FRACTION);
+    }
+
+    #[test]
+    fn read_drm_vram_usage_withholds_telemetry_when_multiple_amd_cards_are_present() {
+        // Ascending `card<N>` order is not guaranteed to match HIP's compute
+        // ordinal once more than one AMD card exists (e.g. an APU alongside a
+        // dGPU), so the fallback must not hand out ordinals it cannot vouch for.
+        let root = std::env::temp_dir().join(format!("rocm-drm-vram-multi-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let plant_amd = |card: &str, total: u64, used: u64| {
+            let device = root.join(card).join("device");
+            fs::create_dir_all(&device).unwrap();
+            fs::write(device.join("vendor"), "0x1002\n").unwrap();
+            fs::write(device.join("mem_info_vram_total"), format!("{total}\n")).unwrap();
+            fs::write(device.join("mem_info_vram_used"), format!("{used}\n")).unwrap();
+        };
+        plant_amd("card0", 206_158_430_208, 1_073_741_824);
+        plant_amd("card1", 206_158_430_208, 189_284_651_008);
+
+        let rows = read_drm_vram_usage(&root);
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            rows.is_empty(),
+            "multi-card sysfs telemetry must be withheld: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn read_drm_vram_usage_skips_a_card_with_an_unreadable_used_counter() {
+        // A card whose `mem_info_vram_used` cannot be read must not be treated as
+        // 0 bytes used (100% free) — that would make a broken counter look like
+        // the ideal `--gpu auto` pick. It should be skipped entirely instead.
+        let root =
+            std::env::temp_dir().join(format!("rocm-drm-vram-unreadable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let device = root.join("card0").join("device");
+        fs::create_dir_all(&device).unwrap();
+        fs::write(device.join("vendor"), "0x1002\n").unwrap();
+        fs::write(device.join("mem_info_vram_total"), "206158430208\n").unwrap();
+        // No `mem_info_vram_used` file written at all.
+
+        let rows = read_drm_vram_usage(&root);
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            rows.is_empty(),
+            "a card with no readable used counter must be skipped: {rows:?}"
+        );
     }
 
     #[test]
