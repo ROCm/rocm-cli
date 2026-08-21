@@ -123,10 +123,12 @@ collide with in-use memory and the engine fails with `HIP out of memory` even fo
 a tiny model. rocm-cli helps in three ways:
 
 - **Auto-selection avoids busy cards.** `--gpu auto` ranks GPUs by free VRAM and
-  skips heavily-used ones. When `rocm-smi`/`amd-smi` are not installed it falls
-  back to the amdgpu DRM sysfs counters
+  skips heavily-used ones. When `amd-smi` is not installed it falls back to the
+  amdgpu DRM sysfs counters
   (`/sys/class/drm/card*/device/mem_info_vram_{total,used}`), so selection still
-  works on stripped-down container images.
+  works on stripped-down container images with a single GPU. That fallback
+  withholds telemetry on a multi-GPU host, since its `card<N>` numbering is not
+  guaranteed to match HIP's device ordinal there.
 - **The serve summary warns on low free VRAM.** When the selected GPU is already
   heavily used, `rocm serve` prints a note before launch and, for vLLM, points at
   `--gpu-memory-utilization` as the fix.
