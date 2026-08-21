@@ -29,6 +29,13 @@ on:
         options: [all, mock]
         # No tier input: the harness resolves pass/xfail/skip per scenario, so a
         # platform runs one job covering everything applicable to it.
+      # Opt a dispatch into building the same downloadable Linux + Windows PR
+      # bundles a pull_request push produces (see pr-linux-binaries and the PR
+      # bundle steps on windows-build-and-test), without needing an open PR.
+      build_binaries:
+        description: "Also build downloadable PR-style binaries (Linux + Windows)"
+        type: boolean
+        default: false
 
 concurrency:
   # Manual dispatches get a UNIQUE group (run_id) so a stuck run never holds the
@@ -324,8 +331,10 @@ jobs:
       CARGO_INCREMENTAL: "0"
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
     needs: [changes, clippy, prek]
-    # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
-    if: github.event_name != 'workflow_dispatch'
+    # A manual E2E dispatch only exercises the E2E jobs; skip the rest — unless
+    # the dispatch explicitly asked for PR-style binaries, which this job's
+    # build step produces.
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.build_binaries == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -384,6 +393,142 @@ jobs:
           E2E_INCLUDE_LIFECYCLE: "1"
           E2E_ONLY_LIFECYCLE: "1"
         run: cargo xtask e2e
+
+      # Downloadable PR-testing bundle, reusing the release binaries built
+      # above rather than building Windows twice. Skipped on push-to-main /
+      # merge_group (nightly already covers main) and on an ordinary dispatch
+      # (build_binaries left at its false default).
+      - name: Package PR bundle
+        if: >-
+          needs.changes.outputs.heavy == 'true' &&
+          (github.event_name == 'pull_request' || github.event.inputs.build_binaries == 'true')
+        shell: pwsh
+        run: cargo xtask package rocm-cli-pr-windows-amd64
+
+      - name: Add install instructions to job summary
+        if: >-
+          needs.changes.outputs.heavy == 'true' &&
+          (github.event_name == 'pull_request' || github.event.inputs.build_binaries == 'true')
+        shell: pwsh
+        run: |
+          @'
+          ## Try this PR's build (Windows x86_64)
+
+          Download `rocm-cli-pr-windows-amd64` from this run's **Artifacts**
+          section below, then:
+
+          ```powershell
+          Expand-Archive rocm-cli-pr-windows-amd64.zip -DestinationPath .   # GitHub's wrapper zip
+          Expand-Archive rocm-cli-pr-windows-amd64\rocm-cli-pr-windows-amd64.zip -DestinationPath rocm-cli-pr
+          $dest = "$env:LOCALAPPDATA\rocm-cli\bin"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item rocm-cli-pr\rocm-cli-pr-windows-amd64\bin\rocm.exe,rocm-cli-pr\rocm-cli-pr-windows-amd64\bin\rocmd.exe $dest
+          $env:Path = "$dest;$env:Path"
+          rocm --version
+          ```
+
+          Unsigned build for manual testing only — not for production use.
+          '@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload PR bundle
+        if: >-
+          needs.changes.outputs.heavy == 'true' &&
+          (github.event_name == 'pull_request' || github.event.inputs.build_binaries == 'true')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rocm-cli-pr-windows-amd64
+          path: |
+            dist/rocm-cli-pr-windows-amd64.zip
+            dist/rocm-cli-pr-windows-amd64.zip.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+  # Downloadable Linux PR-testing bundle. No existing Linux job builds a
+  # release binary in the release manylinux2014 container (build-and-test
+  # only does a debug, non-containerized build), so this is a standalone job
+  # rather than an extension. Mirrors release.yml's Linux build minus
+  # versioning/signing/release-upload — these are unsigned, disposable,
+  # per-run artifacts for manual testing, not a publication.
+  pr-linux-binaries:
+    name: Build Linux PR binaries
+    runs-on: ubuntu-latest
+    needs: [changes, clippy, prek]
+    if: >-
+      (github.event_name == 'pull_request' || github.event.inputs.build_binaries == 'true') &&
+      needs.changes.outputs.heavy == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Cache Cargo home and build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/registry/src
+            ~/.cargo/rustup
+            target
+          key: Linux-manylinux-pr-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            Linux-manylinux-pr-
+
+      - name: Build release binaries
+        run: |
+          mkdir -p "$HOME/.cargo"
+          docker run --rm -v "$PWD":/work -w /work quay.io/pypa/manylinux2014_x86_64 /bin/bash -lc '
+            set -euo pipefail
+            yum install -y pkgconfig libcap-devel
+          '
+          docker run --rm \
+            -u "$(id -u):$(id -g)" \
+            -e CARGO_HOME=/host-cargo -e RUSTUP_HOME=/host-cargo/rustup \
+            -v "$HOME/.cargo":/host-cargo -v "$PWD":/work -w /work \
+            quay.io/pypa/manylinux2014_x86_64 \
+            /bin/bash -lc '
+              set -euo pipefail
+              if [ ! -f /host-cargo/bin/cargo ]; then
+                curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+              fi
+              export PATH="/host-cargo/bin:$PATH"
+              cargo build --release -p rocm -p rocmd -p xtask
+            '
+
+      - name: Package PR bundle
+        run: |
+          chmod +x install.sh
+          cargo xtask package rocm-cli-pr-linux-amd64
+
+      - name: Add install instructions to job summary
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## Try this PR's build (Linux x86_64)
+
+          Download `rocm-cli-pr-linux-amd64` from this run's **Artifacts**
+          section below, then:
+
+          ```sh
+          unzip rocm-cli-pr-linux-amd64.zip   # GitHub wraps the artifact in a zip
+          tar -xzf rocm-cli-pr-linux-amd64.tar.gz
+          cd rocm-cli-pr-linux-amd64
+          chmod +x bin/rocm bin/rocmd
+          install -Dm0755 bin/rocm bin/rocmd -t "$HOME/.local/bin"
+          rocm --version
+          ```
+
+          Unsigned build for manual testing only — not for production use.
+          EOF
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rocm-cli-pr-linux-amd64
+          path: |
+            dist/rocm-cli-pr-linux-amd64.tar.gz
+            dist/rocm-cli-pr-linux-amd64.tar.gz.sha256
+          retention-days: 7
+          if-no-files-found: error
 
   prek:
     # The fast lint gate: every toolchain-light lint/hygiene check, run from the
