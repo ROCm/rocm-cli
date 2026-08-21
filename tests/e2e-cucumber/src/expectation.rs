@@ -1050,6 +1050,48 @@ flaky = true
         assert!(!m.is_xfail("examine-both-forms-agree-on-gpu", &cap("wsl"), "lemonade"));
     }
 
+    /// EAI-8031 is the Windows `owner/repo:variant` direct-serve path only. The
+    /// row must not widen: the Strix Halo Ubuntu lane serves the same checkpoint
+    /// correctly, and on Windows the short-recipe-name path still passes, so
+    /// letting either inherit the xfail would turn a real regression into a
+    /// silently expected failure.
+    #[test]
+    fn hf_checkpoint_serve_xfail_is_scoped_to_windows_gpu_hosts() {
+        let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        assert!(m.is_xfail(
+            "serve-hf-checkpoint-inference",
+            &cap("strix-windows"),
+            "lemonade"
+        ));
+        assert!(!m.is_xfail(
+            "serve-hf-checkpoint-inference",
+            &cap("strix-ubuntu"),
+            "lemonade"
+        ));
+        assert!(!m.is_xfail(
+            "serve-lemonade-inference",
+            &cap("strix-windows"),
+            "lemonade"
+        ));
+    }
+
+    /// The shortened wait must stay clear of a HEALTHY serve on this host (~120s
+    /// measured), or a fixed EAI-8031 would keep failing and never surface as the
+    /// XPASS that tells us to delete the row.
+    #[test]
+    fn hf_checkpoint_serve_xfail_shortens_the_wait_with_headroom() {
+        let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        let secs = m
+            .serve_timeout_for(
+                "serve-hf-checkpoint-inference",
+                &cap("strix-windows"),
+                "lemonade",
+            )
+            .expect("the EAI-8031 row shortens the serve wait");
+        assert!(secs < 600, "must be shorter than the global default");
+        assert!(secs >= 240, "must stay well above a ~120s healthy serve");
+    }
+
     #[test]
     fn glob_matches_family() {
         assert!(glob_match("gfx94*", "gfx942"));
