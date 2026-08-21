@@ -108,11 +108,12 @@ fn torch_version(python: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Whether `version` is a CUDA torch build (carries a `+cuNNN` local label). The
-/// EAI-8051 defect replaces the runtime's ROCm/TheRock torch with a CUDA one, so
-/// this turning true is the corruption's signature. A ROCm/TheRock build is
-/// deliberately NOT identified positively (its label is a git hash, not `+rocm`):
-/// "still ROCm" is "torch present and not a CUDA build".
+/// Whether `version` is a CUDA torch build (carries a `+cuNNN` local label). Used
+/// only for the baseline PREMISE check — that the runtime didn't start out on a
+/// CUDA torch. The post-install invariant is stronger: the torch version must be
+/// byte-for-byte unchanged (a ComfyUI install must not replace the runtime's torch
+/// at all), which also catches a swap to a plain non-`+cu` wheel (e.g. the observed
+/// `2.11.0+gitd0c8b1f` → `2.13.0`) that this label check alone would miss.
 fn is_cuda_torch(version: &str) -> bool {
     version.to_ascii_lowercase().contains("+cu")
 }
@@ -198,6 +199,9 @@ async fn assert_baseline_rocm_torch(world: &mut E2eWorld) {
         nvidia_distributions(&python).is_empty(),
         "runtime already has nvidia-* distributions before ComfyUI install; premise absent"
     );
+    // Record the exact baseline version so the post-install step can require it to
+    // be unchanged (see `assert_torch_still_rocm`).
+    world.comfyui_baseline_torch = version;
 }
 
 #[when("the user installs ComfyUI")]
@@ -215,10 +219,15 @@ async fn user_installs_comfyui(world: &mut E2eWorld) {
 async fn assert_torch_still_rocm(world: &mut E2eWorld) {
     let python = active_runtime_python(world);
     let version = torch_version(&python);
-    assert!(
-        version.as_deref().is_some_and(|v| !is_cuda_torch(v)),
-        "ComfyUI install replaced the runtime's ROCm torch with a CUDA build \
-         (torch version now: {version:?}, python: {})",
+    let baseline = world
+        .comfyui_baseline_torch
+        .as_deref()
+        .expect("no baseline torch version was captured");
+    assert_eq!(
+        version.as_deref(),
+        Some(baseline),
+        "ComfyUI install replaced the managed runtime's torch \
+         (before: {baseline}, after: {version:?}, python: {})",
         python.display()
     );
 }

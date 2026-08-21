@@ -82,6 +82,12 @@ pub struct E2eWorld {
     /// launch step knows to pass `--chat-mock` (deterministic offline agent, no
     /// endpoint detection) instead of driving the real detection/consent path.
     pub chat_use_mock: bool,
+    /// The managed runtime's torch distribution version captured BEFORE a ComfyUI
+    /// install (EAI-8051), so the post-install step can require it to be unchanged.
+    /// A ComfyUI install must not replace the runtime's torch at all; comparing the
+    /// exact version catches a swap to any other build (CUDA `+cu`, a plain
+    /// `2.13.0` CPU wheel, etc.), which a "not a CUDA build" check alone would miss.
+    pub comfyui_baseline_torch: Option<String>,
     /// Per-scenario release-lifecycle state (packaging dirs, signing keys, install
     /// dir, captured logs). `Some` only for `@lifecycle` scenarios; all its paths
     /// are rooted in `isolated_root` so teardown removes them with the temp dir.
@@ -191,6 +197,7 @@ impl Default for E2eWorld {
             expect_xfail: false,
             tui: None,
             chat_use_mock: false,
+            comfyui_baseline_torch: None,
             lifecycle: None,
         }
     }
