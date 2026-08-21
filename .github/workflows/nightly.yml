@@ -389,19 +389,13 @@ jobs:
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
 
-          # Pre-warm the shared runtime once/serially before the suite; skipped
-          # once populated (persists across runs). Install in place (no mv) so the
-          # manifest's absolute paths stay valid. See ci.yml e2e-gpu for rationale.
-          if [ ! -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
-            echo "pre-warming shared runtime (first run on this runner)…"
-            mkdir -p "$prewarm"/{data,config,cache}
-            ROCM_CLI_CONFIG_DIR="$prewarm/config" \
-            ROCM_CLI_DATA_DIR="$prewarm/data" \
-            ROCM_CLI_CACHE_DIR="$prewarm/cache" \
-            HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
-            UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
-              "$ROCM_CLI_BINARY" install sdk
-          fi
+          # Pre-warm the shared runtime once/serially before the suite, refreshing
+          # it when the channel index has a newer version. Install in place (no mv)
+          # so the manifest's absolute paths stay valid. See the e2e-selfhosted.yml
+          # e2e-gpu lane and `xtask e2e-prewarm` for the full rationale (EAI-8057).
+          HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
+          UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
+            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
 
           cargo xtask e2e
 
@@ -496,22 +490,10 @@ jobs:
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
 
-          if [ ! -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
-            echo "pre-warming shared runtime (first run on this runner)…"
-            mkdir -p "$prewarm"/{data,config,cache}
-            ROCM_CLI_CONFIG_DIR="$prewarm/config" \
-            ROCM_CLI_DATA_DIR="$prewarm/data" \
-            ROCM_CLI_CACHE_DIR="$prewarm/cache" \
-            HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
-              "$ROCM_CLI_BINARY" install sdk
-            if [ -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
-              echo "shared runtime pre-warmed at $E2E_SHARED_RUNTIMES_DIR"
-            else
-              echo "pre-warm did not produce a runtimes registry; scenarios will install their own" >&2
-            fi
-          else
-            echo "shared runtime already present at $E2E_SHARED_RUNTIMES_DIR — skipping pre-warm"
-          fi
+          # Cache, not a one-shot: refreshed when the channel index has a newer
+          # version. See `xtask e2e-prewarm` (EAI-8057).
+          HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
+            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
 
           cargo xtask e2e
 
@@ -604,22 +586,11 @@ jobs:
           $env:ROCM_CLI_BINARY = "$targetDir\release\rocm.exe"
           $env:ROCM_CLI_ROCMD_BINARY = "$targetDir\release\rocmd.exe"
 
-          if (-not (Test-Path "$env:E2E_SHARED_RUNTIMES_DIR\registry")) {
-            Write-Host "pre-warming shared runtime (first run on this runner)..."
-            New-Item -ItemType Directory -Force -Path "$prewarm\data","$prewarm\config","$prewarm\cache" | Out-Null
-            $env:ROCM_CLI_CONFIG_DIR = "$prewarm\config"
-            $env:ROCM_CLI_DATA_DIR   = "$prewarm\data"
-            $env:ROCM_CLI_CACHE_DIR  = "$prewarm\cache"
-            & $env:ROCM_CLI_BINARY install sdk
-            Remove-Item Env:\ROCM_CLI_CONFIG_DIR,Env:\ROCM_CLI_DATA_DIR,Env:\ROCM_CLI_CACHE_DIR -ErrorAction SilentlyContinue
-            if (Test-Path "$env:E2E_SHARED_RUNTIMES_DIR\registry") {
-              Write-Host "shared runtime pre-warmed at $env:E2E_SHARED_RUNTIMES_DIR"
-            } else {
-              Write-Host "pre-warm did not produce a runtimes registry; scenarios will install their own"
-            }
-          } else {
-            Write-Host "shared runtime already present at $env:E2E_SHARED_RUNTIMES_DIR - skipping pre-warm"
-          }
+          # Cache, not a one-shot: refreshed when the channel index has a newer
+          # version. The decision lives in `xtask e2e-prewarm` so this lane cannot
+          # drift from the Linux ones (EAI-8057).
+          cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           cargo xtask e2e
 
@@ -765,22 +736,10 @@ jobs:
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
 
-          if [ ! -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
-            echo "pre-warming shared runtime (first run on this runner)…"
-            mkdir -p "$prewarm"/{data,config,cache}
-            ROCM_CLI_CONFIG_DIR="$prewarm/config" \
-            ROCM_CLI_DATA_DIR="$prewarm/data" \
-            ROCM_CLI_CACHE_DIR="$prewarm/cache" \
-            HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
-              "$ROCM_CLI_BINARY" install sdk
-            if [ -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
-              echo "shared runtime pre-warmed at $E2E_SHARED_RUNTIMES_DIR"
-            else
-              echo "pre-warm did not produce a runtimes registry; scenarios will install their own" >&2
-            fi
-          else
-            echo "shared runtime already present at $E2E_SHARED_RUNTIMES_DIR — skipping pre-warm"
-          fi
+          # Cache, not a one-shot: refreshed when the channel index has a newer
+          # version. See `xtask e2e-prewarm` (EAI-8057).
+          HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
+            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
 
           cargo xtask e2e
 

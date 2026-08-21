@@ -125,6 +125,62 @@ async fn assert_runtime_path_not_nested(world: &mut E2eWorld) {
     );
 }
 
+#[when("the user checks for runtime updates")]
+async fn user_checks_for_updates(world: &mut E2eWorld) {
+    // Plain `rocm update` — the check-only form. Without `--apply` it never
+    // mutates the runtime tree, so this is safe to run against the shared runtime
+    // the other scenarios serve from.
+    world.use_shared_runtimes();
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["update"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Freshness verdicts `runtime_update_plan` can emit, plus the degraded `error`
+/// form used when the index cannot be reached. `xtask e2e-prewarm` routes on
+/// exactly these, so a rename here must break this scenario rather than silently
+/// turn every pre-warm into a no-op reuse.
+const UPDATE_STATUSES: [&str; 4] = ["up_to_date", "update_available", "ahead_of_index", "error"];
+
+#[then("the report states the runtime's freshness against the channel index")]
+async fn assert_update_reports_freshness(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    let rc = world.cli_rc.expect("no command was run");
+    assert_eq!(rc, 0, "`rocm update` failed:\n{stdout}");
+
+    // The line `xtask e2e-prewarm` parses: `runtime <key> ... status=<verdict>`.
+    let Some(line) = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("runtime "))
+    else {
+        panic!("no `runtime <key> …` line in the update report:\n{stdout}");
+    };
+    let status = line
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("status="));
+    let Some(status) = status else {
+        panic!("update report line carries no `status=` field:\n{line}");
+    };
+    assert!(
+        UPDATE_STATUSES.contains(&status),
+        "unrecognised freshness status `{status}`; `xtask e2e-prewarm` routes on \
+         {UPDATE_STATUSES:?} and would silently reuse a stale runtime:\n{line}"
+    );
+    // The pre-warm selects the line for its own channel, so the field it filters
+    // on must be present too — except on the degraded error line, which the
+    // renderer emits without one.
+    if status != "error" {
+        assert!(
+            line.split_whitespace()
+                .any(|field| field.starts_with("channel=")),
+            "update report line carries no `channel=` field, so a per-channel \
+             pre-warm cannot attribute it:\n{line}"
+        );
+    }
+}
+
 #[then("the adoption is refused")]
 async fn assert_adoption_refused(world: &mut E2eWorld) {
     let rc = world.cli_rc.expect("no command was run");
