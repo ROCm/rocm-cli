@@ -29,6 +29,7 @@ mod e2e {
     pub mod runtime_steps;
     pub mod serving_steps;
     pub mod tui_driver;
+    pub mod update_steps;
 }
 
 // ── World ──────────────────────────────────────────────────────────
@@ -85,6 +86,66 @@ pub struct E2eWorld {
     /// dir, captured logs). `Some` only for `@lifecycle` scenarios; all its paths
     /// are rooted in `isolated_root` so teardown removes them with the temp dir.
     pub lifecycle: Option<e2e::lifecycle_steps::LifecycleState>,
+    /// An address a scenario is deliberately holding, so a serve started without
+    /// one meets an address that is already in use. Released with the World.
+    pub occupied_address: Option<std::net::TcpListener>,
+    /// A `PATH` a scenario prepared for the `rocm` invocations that follow (see
+    /// [`stat_shim_path`]). Carried on the World because the situation it sets up
+    /// belongs to the Given, while the invocations that must see it are in later
+    /// steps.
+    pub path_override: Option<String>,
+    /// Plain child processes a scenario spawned itself and registered with the
+    /// CLI as managed services, so a step can assert the PRODUCT stopped them.
+    ///
+    /// Killed in `Drop` as a panic-path backstop only — never as the thing under
+    /// test. The scenarios that use these assert the child is gone *before*
+    /// teardown runs, because a `Drop` that cleans up after the product failed
+    /// would turn the very defect being pinned into a pass.
+    pub owned_processes: Vec<OwnedProcess>,
+}
+
+/// A child process this scenario owns, kept alive until the product is asked to
+/// stop it (or teardown reaps it).
+#[derive(Debug)]
+pub struct OwnedProcess {
+    pub child: std::process::Child,
+}
+
+impl OwnedProcess {
+    /// The child's PID.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Whether the process is still running.
+    ///
+    /// This handle is the child's parent, so reaping it is what turns "signalled
+    /// and gone" into an observable exit — a terminated child stays a zombie
+    /// until then, and asking the OS whether the PID exists would still say yes.
+    /// Polls briefly: the product signals the process and this only has to
+    /// outlast the moment between the signal landing and the kernel finishing
+    /// with it, not any grace period the product itself waits out.
+    pub fn is_running(&mut self) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return false,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Ok(None) => return true,
+                // Already reaped by an earlier call.
+                Err(_) => return false,
+            }
+        }
+    }
+}
+
+impl Drop for OwnedProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// Resolve a CI-provided shared-directory env var to a validated, existing path.
@@ -191,6 +252,9 @@ impl Default for E2eWorld {
             tui: None,
             chat_use_mock: false,
             lifecycle: None,
+            occupied_address: None,
+            path_override: None,
+            owned_processes: Vec::new(),
         }
     }
 }
@@ -341,6 +405,52 @@ impl E2eWorld {
     /// own lifecycle defaults (a record kept alive by this test process).
     pub fn register_mock_service(&self) {
         self.register_mock_service_with(ServiceRecordOptions::default());
+    }
+
+    /// Spawn a plain, long-lived child process and register it with the CLI as a
+    /// ready managed service, exactly as a real `rocm serve --managed` would
+    /// record its own processes. Returns the child's PID.
+    ///
+    /// The child is a sleeper rather than a server: every scenario that uses
+    /// this asks whether the CLI *stopped the process it recorded*, and a
+    /// listening socket would add a second thing to get wrong without making
+    /// that question any easier to answer. Both PID fields point at the child so
+    /// the record looks like one the CLI itself wrote.
+    ///
+    /// Unix only — Windows has no equivalent one-liner sleeper on PATH, and the
+    /// scenarios that call this are `@requires-os:linux`.
+    pub fn start_managed_service_process(&mut self, service_id: &'static str, model: &str) -> u32 {
+        use std::process::Stdio;
+
+        let root = self.isolated_root.as_ref().expect("no isolated root");
+        let services = root.path().join("data").join("services");
+        // Long enough to outlive any scenario, short enough that a leaked child
+        // on a persistent runner reaps itself rather than lingering forever.
+        let child = std::process::Command::new("sleep")
+            .arg("600")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn the scenario's managed-service process");
+        let pid = child.id();
+        self.owned_processes.push(OwnedProcess { child });
+
+        // The port is never connected to; it only has to be a plausible value in
+        // a well-formed record.
+        write_service_record_with(
+            &services,
+            model,
+            18_765,
+            ServiceRecordOptions {
+                service_id,
+                status: "ready",
+                startup_phase: None,
+                supervisor_pid: pid,
+                engine_pid: Some(pid),
+            },
+        );
+        pid
     }
 
     pub fn register_mock_service_with(&self, options: ServiceRecordOptions) {
@@ -535,6 +645,159 @@ pub fn run_rocm_with_env(
     world.isolate_cmd(&mut cmd);
     for (key, value) in envs {
         cmd.env(key, value);
+    }
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    let rc = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    record_command(world.current_scenario.as_deref(), args, rc, &stdout);
+    (
+        stdout,
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        rc,
+    )
+}
+
+/// Install a `stat` shim on the front of `PATH` that answers for ONE device path
+/// and delegates every other invocation to the real binary, and return the `PATH`
+/// value to hand the child.
+///
+/// The CLI learns a device's mode and owning group by shelling out to `stat`, and
+/// several contracts are about what it then does with unusual answers — an owning
+/// group the machine cannot name, or one that is not the conventional default.
+/// Those states are properties of a machine's device nodes, not something a test
+/// can arrange on a shared runner, so the answer is substituted instead.
+///
+/// What this proves and what it does not: it exercises how the CLI HANDLES such
+/// an answer, not that any particular host produces one. `stat` really does print
+/// `UNKNOWN` for an id with no entry in the group database, which is where the
+/// substituted answer comes from.
+///
+/// Scoped as tightly as possible: only the named path is answered for, so every
+/// other `stat` the CLI makes still reads the real filesystem.
+///
+/// Unix only — panics elsewhere. Every scenario that reaches it is
+/// `@requires-os:linux`, so the panic is unreachable rather than a limitation.
+#[cfg(unix)]
+pub fn stat_shim_path(
+    world: &E2eWorld,
+    device: &str,
+    mode: &str,
+    owner: &str,
+    group: &str,
+) -> String {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let bin = root.path().join("stat-shim");
+    std::fs::create_dir_all(&bin).expect("failed to create the stat shim directory");
+
+    let real = ["/usr/bin/stat", "/bin/stat", "/usr/local/bin/stat"]
+        .into_iter()
+        .find(|candidate| std::path::Path::new(candidate).is_file())
+        .expect("no real `stat` binary to delegate to");
+    // `-c %A|%U|%G` is the only form the CLI asks for, and the shim answers only
+    // when the target path is the one under test; anything else is the real
+    // binary's business.
+    let script = format!(
+        "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"{device}\" ]; then\n    \
+         printf '%s|%s|%s\\n' '{mode}' '{owner}' '{group}'\n    exit 0\n  fi\ndone\nexec {real} \"$@\"\n"
+    );
+    let shim = bin.join("stat");
+    std::fs::write(&shim, script).expect("failed to write the stat shim");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+        .expect("failed to mark the stat shim executable");
+
+    let existing = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{existing}", bin.display())
+}
+
+#[cfg(not(unix))]
+pub fn stat_shim_path(
+    _world: &E2eWorld,
+    _device: &str,
+    _mode: &str,
+    _owner: &str,
+    _group: &str,
+) -> String {
+    unreachable!("the stat shim is only reached by @requires-os:linux scenarios")
+}
+
+/// Add an `id` shim to the same directory [`stat_shim_path`] uses, reporting the
+/// current user as belonging to `groups` instead of their real ones, and return
+/// the `PATH` carrying both shims.
+///
+/// The CLI reads group membership by shelling out to `id -Gn`. Whether the user
+/// running the suite belongs to a device group is a property of the runner, and
+/// on the GPU runner they already do — so a contract about what the CLI concludes
+/// for a user who does NOT can only be measured by substituting the answer. Call
+/// after [`stat_shim_path`], whose directory this reuses.
+#[cfg(unix)]
+pub fn id_shim_path(world: &E2eWorld, groups: &[&str]) -> String {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let bin = root.path().join("stat-shim");
+    std::fs::create_dir_all(&bin).expect("failed to create the shim directory");
+
+    let real = ["/usr/bin/id", "/bin/id"]
+        .into_iter()
+        .find(|candidate| std::path::Path::new(candidate).is_file())
+        .expect("no real `id` binary to delegate to");
+    // `-Gn` is the only form the CLI asks for; every other invocation is the real
+    // binary's business.
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"-Gn\" ]; then\n  echo '{}'\n  exit 0\nfi\nexec {real} \"$@\"\n",
+        groups.join(" ")
+    );
+    let shim = bin.join("id");
+    std::fs::write(&shim, script).expect("failed to write the id shim");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+        .expect("failed to mark the id shim executable");
+
+    let existing = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{existing}", bin.display())
+}
+
+#[cfg(not(unix))]
+pub fn id_shim_path(_world: &E2eWorld, _groups: &[&str]) -> String {
+    unreachable!("the id shim is only reached by @requires-os:linux scenarios")
+}
+
+/// Every group name the machine's own group database knows.
+///
+/// Read from `/etc/group` rather than asked of a tool, so the check does not
+/// depend on `getent` being installed. Unix only, for the same reason as
+/// [`stat_shim_path`].
+pub fn machine_group_names() -> Vec<String> {
+    std::fs::read_to_string("/etc/group")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.split(':').next())
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Like [`run_rocm`], but with environment variables REMOVED from the child.
+///
+/// [`run_rocm_with_env`] can only set variables, and some contracts are about
+/// what the CLI does when something the ambient environment usually provides is
+/// absent. Removing them here — rather than depending on the runner not to have
+/// them — makes the precondition the scenario's own, so the result means the
+/// same thing on a bare container and on a full desktop session.
+pub fn run_rocm_without_env(
+    world: &E2eWorld,
+    args: &[&str],
+    removed: &[&str],
+) -> (String, String, i32) {
+    let binary = rocm_binary();
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(args);
+    world.isolate_cmd(&mut cmd);
+    for key in removed {
+        cmd.env_remove(key);
     }
     let output = cmd
         .output()

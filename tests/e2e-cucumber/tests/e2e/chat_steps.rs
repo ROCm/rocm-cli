@@ -80,6 +80,17 @@ async fn user_sends_oneshot_chat(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
 }
 
+#[when("the user sends a one-shot chat prompt without naming a model")]
+async fn user_sends_oneshot_chat_without_model(world: &mut E2eWorld) {
+    // The same command as the scenario above, minus `--model`. Leaving the model
+    // out is the ordinary way to say "use whatever is running here", and the
+    // services list on this machine shows exactly one ready local server.
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["chat", "--provider", "local", "--prompt", "Hello"]);
+    world.cli_output = Some(format!("{stdout}{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
 // ── Then ───────────────────────────────────────────────────────────
 
 #[then("the served model is listed")]

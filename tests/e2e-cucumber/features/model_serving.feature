@@ -144,6 +144,70 @@ Feature: Model serving
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
 
+  # Expected to FAIL. `serve` advertises a set of device policies and then
+  # refuses one of them outright, so the list the user is offered is not the list
+  # the command accepts. Runs on the no-GPU lane, where a refusal that names the
+  # policy itself is cleanly distinguishable from the ordinary "this machine has
+  # no GPU" refusal every policy gets there.
+  @id:serve-rejects-no-advertised-device-policy @requires-no-gpu
+  Scenario: 15 - Every device policy the serve command offers is one it accepts
+    When the user serves a model under each device policy the command offers
+    Then no policy is refused for being that policy
+
+  # A guard, not a finding. Stopping a running server was reported as having
+  # stopped nothing on the pod this set came from, but neither fixture tried here
+  # reproduces that: a plain process registered as a managed service is counted
+  # correctly (measured on the no-GPU lane), and so is a real vLLM serve
+  # (measured on MI300X, run 188). So this carries no expected-failure row — it
+  # holds the contract the pod violated, and goes red if CI ever meets it.
+  # @merge-queue: this serves a real model, and the Strix Halo lanes already run
+  # at 32 of their 35 allotted minutes on main alone. Three new real serves would
+  # put them over, so they follow scenarios 6/6b/8 onto the merge-queue path,
+  # where the budget for heavy serves lives.
+  @id:services-stop-reports-what-it-stopped @requires-gpu @merge-queue
+  Scenario: 16 - Stopping a running server reports that it stopped it
+    Given a managed runtime is active
+    And a model is being served on GPU
+    When the user stops the server that is running
+    Then the CLI reports that it stopped a process
+
+  # Expected to FAIL. Removing the CLI's managed files reports completion while
+  # the server it was managing is left running — and with the records gone, the
+  # supported way to stop it has been removed along with them. Nothing here
+  # touches the installed program: the removal is scoped to this scenario's own
+  # directories and keeps the binaries.
+  @id:uninstall-stops-what-it-manages @requires-os:linux
+  Scenario: 17 - Removing the CLI's managed files stops the servers it manages
+    Given a local server this machine manages is running
+    When the user removes the CLI's managed files
+    Then the removal is reported as complete
+    And the server is no longer running
+
+  # Expected to FAIL on Windows. Asking the CLI to choose a GPU on a machine that
+  # has one must end with a device chosen: reporting that it selected none and
+  # carrying on leaves the user unable to tell which GPU their model will run on,
+  # or whether it will run on one at all. Both Linux lanes name the device, so
+  # this scenario also guards them.
+  # @merge-queue for the serve-cost reason on scenario 16.
+  @id:serve-auto-gpu-selection-names-a-device @requires-gpu @merge-queue
+  Scenario: 18 - Letting the CLI choose the GPU names the device it chose
+    Given a managed runtime is active
+    And a machine with an AMD GPU
+    When the user serves a model letting the CLI choose the GPU
+    Then the plan names the device it chose
+
+  # Expected to FAIL on a GPU host. A second server started while the usual
+  # address is already taken is handed that same address anyway, so it collides
+  # with the server already there. Either outcome is fine — pick a free address,
+  # or say the usual one is busy — but silently reusing it is not.
+  # @merge-queue for the serve-cost reason on scenario 16.
+  @id:serve-second-server-gets-a-free-port @requires-gpu @merge-queue
+  Scenario: 19 - A second server does not take an address already in use
+    Given a managed runtime is active
+    And the address a new server would use is already taken
+    When the user serves a model without choosing an address
+    Then the new server does not try to use the taken address
+
   # Honest device selection: a `--gpu` index that does not exist on the host is
   # rejected outright, never silently remapped to another device (no device-0
   # fallback). Runs on GPU hardware: on a no-GPU host the GPU-required pre-flight
