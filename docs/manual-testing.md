@@ -96,13 +96,13 @@ Quiet UI rule:
 After setup, check the machine state:
 
 ```powershell
-rocm examine
+rocm doctor
 rocm runtimes list
 ```
 
 Expected result:
 
-- `rocm examine` shows a managed runtime.
+- `rocm doctor` shows a managed runtime.
 - `rocm runtimes list` shows the runtime key for the installed TheRock venv.
 - The active runtime is ready, or the output gives one clear next command.
 
@@ -114,7 +114,7 @@ This tests the command-line install path without using the TUI:
 rocm install sdk --channel release --format wheel --prefix .\.rocm-work\data\envs\default
 rocm runtimes list
 rocm runtimes activate <runtime_key>
-rocm examine
+rocm doctor
 ```
 
 Replace `<runtime_key>` with the exact key printed by `rocm runtimes list`.
@@ -132,7 +132,7 @@ Expected result:
 - Runtime validation uses TheRock's runtime/devel package roots and
   `rocm_sdk.find_libraries`; `rocm-sdk path --root` is expected after the
   pinned `rocm[libraries,devel]` install succeeds.
-- `rocm examine` reports the active runtime as ready.
+- `rocm doctor` reports the active runtime as ready.
 
 Developer-only deterministic override:
 

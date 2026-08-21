@@ -1129,7 +1129,7 @@ fn resolve_gpu_indices_against(requested: &[u32], usable: Option<Vec<u32>>) -> R
     if usable.is_empty() {
         bail!(
             "no usable AMD GPU detected; vLLM requires ROCm GPU execution and does not fall back \
-             to CPU. Check the driver with `rocm examine` and ensure HIP_VISIBLE_DEVICES / \
+             to CPU. Check the driver with `rocm doctor` and ensure HIP_VISIBLE_DEVICES / \
              ROCR_VISIBLE_DEVICES are not masking every device."
         );
     }

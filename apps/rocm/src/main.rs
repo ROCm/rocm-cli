@@ -81,7 +81,7 @@ const SUPPORTED_ENGINES: [&str; 2] = ["lemonade", "vllm"];
     about = "ROCm AI Command Center CLI",
     long_about = "ROCm AI Command Center CLI: install ROCm, manage local inference engines, \
 and run OpenAI-compatible model servers on AMD GPUs.\n\n\
-Run `rocm` with no subcommand to open the interactive dashboard (TUI). Use `rocm examine` \
+Run `rocm` with no subcommand to open the interactive dashboard (TUI). Use `rocm doctor` \
 to check that your GPU and ROCm install are ready, then `rocm serve <model>` to start a server.",
     version,
     // The `chat` example was dropped from this list when `chat` became
@@ -89,7 +89,7 @@ to check that your GPU and ROCm install are ready, then `rocm serve <model>` to 
     // preview elsewhere contradicts itself. `engines list` keeps the six-step
     // narrative and is in scope.
     after_help = "EXAMPLES:\n  \
-rocm examine                      Check GPU, ROCm install, and engines\n  \
+rocm doctor                       Check GPU, ROCm install, and engines, and what looks wrong\n  \
 rocm install sdk                  Install ROCm wheels into a managed environment\n  \
 rocm engines list                 Show the local inference engines available\n  \
 rocm model                        List models this machine can run\n  \
@@ -106,7 +106,53 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Check this computer's health: what ROCm found, and what looks wrong.
+    ///
+    /// One read-only pass over the machine. It reports the GPU, ROCm install,
+    /// engines and setup folders, then matches what it found against a fixed
+    /// catalog of known misconfigurations and ranks them.
+    ///
+    /// This command never changes anything. Each recognised cause is printed
+    /// with an `id:` and an `apply with:` command; `rocm fix` is what carries
+    /// the change out.
+    ///
+    /// The catalog is closed, so no match means "not recognised", not "nothing
+    /// is wrong" -- in that case it points you at where to report the symptom.
+    ///
+    /// Supersedes `rocm examine` and `rocm diagnose`, which still work but are
+    /// no longer advertised.
+    #[command(after_help = "EXAMPLES:\n  \
+rocm doctor\n  \
+rocm doctor --symptom \"hipErrorNoBinaryForGpu\"\n  \
+rocm doctor --json")]
+    Doctor {
+        /// Raw error text from the user; sharpens keyword scoring.
+        #[arg(long)]
+        symptom: Option<String>,
+        /// Show at most this many matches (default 5).
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+        /// Emit the machine-readable report (host state plus findings).
+        #[arg(long)]
+        json: bool,
+        /// Which machine-learning framework to inspect (affects --json only).
+        #[arg(long, value_enum, default_value_t = FrameworkArg::Auto)]
+        framework: FrameworkArg,
+        /// Diagnose a previously captured report instead of inspecting this
+        /// machine. Takes a path, or `-` to read standard input.
+        ///
+        /// The saved report may describe a different machine, so only the
+        /// findings are printed -- this machine's own inventory is left out
+        /// rather than mixed in with someone else's host state.
+        #[arg(long = "from-examination", value_name = "PATH")]
+        from_examination: Option<String>,
+    },
     /// Check this computer's GPU, ROCm install, engines, and setup folders.
+    ///
+    /// Superseded by `rocm doctor`, which reports the same thing and also says
+    /// what looks wrong. Kept working, and kept out of the advertised surface,
+    /// so existing scripts and tooling kept calling it do not break.
+    #[command(hide = true)]
     Examine {
         /// Emit the machine-readable Examination JSON (for diagnosis tooling).
         #[arg(long)]
@@ -133,6 +179,11 @@ enum Command {
     /// Each cause is printed with an `id:` and an `apply with:` command. The
     /// leading `#1`, `#2` are ranking positions for reading order only; `rocm fix`
     /// takes the id, not the position.
+    ///
+    /// Superseded by `rocm doctor`, which runs the same catalog against the same
+    /// probe and reports the host state alongside it. Kept working, and kept out
+    /// of the advertised surface, so existing callers do not break.
+    #[command(hide = true)]
     Diagnose {
         /// Raw error text from the user; sharpens keyword scoring.
         #[arg(long)]
@@ -144,9 +195,9 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Apply a known fix by id (see `rocm diagnose`); run with no id to list fixes.
+    /// Apply a known fix by id (see `rocm doctor`); run with no id to list fixes.
     ///
-    /// Takes the `id:` that `rocm diagnose` reports against a cause — not the
+    /// Takes the `id:` that `rocm doctor` reports against a cause — not the
     /// `#1`/`#2` ranking position, which belongs to one report and is not a name.
     /// With no id it lists the whole catalog.
     ///
@@ -1442,7 +1493,7 @@ fn render_freeform_read_only_answer(
         return Ok(None);
     }
     match plan.actions[0].args.as_slice() {
-        [command] if command == "examine" => {
+        [command] if command == "examine" || command == "doctor" => {
             render_freeform_examine_answer(request, paths, config).map(Some)
         }
         [command, subcommand] if command == "comfyui" && subcommand == "status" => {
@@ -1609,6 +1660,19 @@ fn dispatch(cli: Cli) -> Result<()> {
     }
 
     match cli.command {
+        Some(Command::Doctor {
+            symptom,
+            top,
+            json,
+            framework,
+            from_examination,
+        }) => doctor(
+            symptom,
+            top,
+            json,
+            framework.into(),
+            from_examination.as_deref(),
+        ),
         Some(Command::Examine { json, framework }) => examine(json, framework.into()),
         Some(Command::Diagnose { symptom, top, json }) => diagnose(symptom, top, json),
         Some(Command::Fix {
@@ -2087,7 +2151,7 @@ fn build_codex_bridge_gpu_snapshot(config: &RocmCliConfig) -> CodexBridgeGpuSnap
         amd_smi_available: false,
         static_snapshot: None,
         monitor_snapshot: None,
-        note: Some("Use `rocm examine` for the current local AMD GPU summary.".to_owned()),
+        note: Some("Use `rocm doctor` for the current local AMD GPU summary.".to_owned()),
     }
 }
 
@@ -2156,6 +2220,123 @@ struct ExamineJsonSummary<'a> {
     previous_runtime_key: Option<&'a str>,
 }
 
+/// `doctor --json`: everything `examine --json` reports, plus the findings.
+///
+/// Deliberately a superset. Tooling written against the examine document keeps
+/// reading the same keys at the same places and simply gains `findings`.
+#[derive(serde::Serialize)]
+struct DoctorJson<'a> {
+    #[serde(flatten)]
+    examine: ExamineJson<'a>,
+    findings: &'a rocm_core::DiagnoseReport,
+}
+
+/// Read a previously captured report, or probe this machine.
+///
+/// `from` is a path, or `-` for standard input. Both the bare `Examination`
+/// document and the fuller `doctor --json` document deserialize here — the
+/// latter carries the examination's fields at the top level and the extra keys
+/// are ignored — so a report captured from either form round-trips.
+fn collect_examination(
+    from: Option<&str>,
+    framework: rocm_core::FrameworkProbe,
+) -> Result<rocm_core::Examination> {
+    let Some(source) = from else {
+        return Ok(rocm_core::Examination::probe(framework));
+    };
+    let raw = if source == "-" {
+        let mut buffer = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)
+            .context("failed to read the saved report from standard input")?;
+        buffer
+    } else {
+        std::fs::read_to_string(source)
+            .with_context(|| format!("failed to read the saved report from {source}"))?
+    };
+    serde_json::from_str::<rocm_core::Examination>(&raw)
+        .context("the saved report is not a valid examination document")
+}
+
+fn doctor(
+    symptom: Option<String>,
+    top: usize,
+    json: bool,
+    framework: rocm_core::FrameworkProbe,
+    from_examination: Option<&str>,
+) -> Result<()> {
+    // Read-only, and exits 0 whether or not it found anything: the exit code
+    // reports whether the check RAN. Callers branch on `status`, `has_match` and
+    // `out_of_scope` in `--json`, never on the exit code. A genuine inability to
+    // run propagates as an error via `?`.
+    //
+    // The host probe runs once here and feeds the findings; the inventory half
+    // comes from `ExamineSummary`, which is a different collection. What this
+    // removes is the duplicate `Examination::probe` that `examine` followed by
+    // `diagnose` used to pay for twice, framework interpreter start included.
+    let examination = collect_examination(from_examination, framework)?;
+    let report = rocm_core::run_diagnose(&examination, &symptom.unwrap_or_default());
+
+    // A saved report may describe a different machine, so pairing it with this
+    // machine's inventory would be actively misleading. Findings only.
+    if from_examination.is_some() {
+        if json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            print!(
+                "{}",
+                rocm_core::render_diagnose_text(&report, top, "rocm doctor")
+            );
+        }
+        return Ok(());
+    }
+
+    let paths = AppPaths::discover()?;
+    let config = RocmCliConfig::load(&paths).unwrap_or_default();
+    if json {
+        // `gather` rather than `examine_human_report`, for the reason given in
+        // `examine`: the latter writes, and `--json` is the form tooling calls
+        // in a loop.
+        let host = ExamineSummary::gather()?;
+        let configured_default_engine = config.default_engine.as_deref();
+        let document = DoctorJson {
+            examine: ExamineJson {
+                examination: &examination,
+                summary: ExamineJsonSummary {
+                    configured_default_engine,
+                    effective_default_engine: configured_default_engine
+                        .unwrap_or(&host.default_engine),
+                    active_runtime_id: config.default_runtime_id.as_deref(),
+                    active_runtime_key: config.active_runtime_key.as_deref(),
+                    previous_runtime_key: config.previous_runtime_key.as_deref(),
+                    host: &host,
+                },
+            },
+            findings: &report,
+        };
+        println!("{}", serde_json::to_string_pretty(&document)?);
+        return Ok(());
+    }
+
+    // `recover: false` is what makes the "never changes anything" claim in this
+    // command's help true. The cost is that a setup runtime present on disk but
+    // missing from the registry is reported as missing rather than silently
+    // re-registered; `rocm examine` still repairs it.
+    let (text, summary) = examine_human_report(&paths, &config, "rocm doctor", false)?;
+    print!("{text}");
+    // When the catalog routes the host out, the findings section below already
+    // explains why. Printing the examine-side note as well would say the same
+    // thing twice, in two different wordings.
+    if report.out_of_scope.is_none() && summary.wsl.as_ref().is_some_and(|w| w.is_wsl) {
+        println!("\n{}", rocm_core::WSL_ROUTE_OUT_NOTE);
+    }
+    println!();
+    print!(
+        "{}",
+        rocm_core::render_diagnose_text(&report, top, "rocm doctor")
+    );
+    Ok(())
+}
+
 fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
     // `rocm examine` is the general system inspector: the exit code reports
     // whether it RAN, not what it found. Any finding (no GPU, WSL, degraded) is
@@ -2185,7 +2366,7 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&document)?);
         return Ok(());
     }
-    let (text, summary) = examine_human_report(&paths, &config)?;
+    let (text, summary) = examine_human_report(&paths, &config, "rocm examine", true)?;
     print!("{text}");
     if summary.wsl.as_ref().is_some_and(|w| w.is_wsl) {
         // Informational route-out guidance for humans (the verdict is also in
@@ -2204,7 +2385,10 @@ fn diagnose(symptom: Option<String>, top: usize, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print!("{}", rocm_core::render_diagnose_text(&report, top));
+        print!(
+            "{}",
+            rocm_core::render_diagnose_text(&report, top, "rocm diagnose")
+        );
     }
     Ok(())
 }
@@ -2729,12 +2913,12 @@ fn render_driver_reconciliation(paths: &AppPaths, state: &DriverInstallState) ->
         {
             let _ = writeln!(
                 output,
-                "  action: reconciliation recorded missing passive checks; run `rocm examine` and inspect driver logs"
+                "  action: reconciliation recorded missing passive checks; run `rocm doctor` and inspect driver logs"
             );
         } else {
             let _ = writeln!(
                 output,
-                "  action: reconciliation complete; run `rocm examine` for the full host summary"
+                "  action: reconciliation complete; run `rocm doctor` for the full host summary"
             );
         }
     }
@@ -2910,10 +3094,10 @@ fn build_driver_install_plan(
             version_id: String::new(),
             codename: String::new(),
             repo_version_expr,
-            reason: "Windows driver install is validate-only in rocm-cli; use `rocm examine` to inspect the AMD display driver.".to_owned(),
+            reason: "Windows driver install is validate-only in rocm-cli; use `rocm doctor` to inspect the AMD display driver.".to_owned(),
             preflight_checks: Vec::new(),
             commands: Vec::new(),
-            checks: vec!["rocm examine".to_owned()],
+            checks: vec!["rocm doctor".to_owned()],
         };
     }
     if examine.wsl.as_ref().is_some_and(|wsl| wsl.is_wsl) {
@@ -2928,7 +3112,7 @@ fn build_driver_install_plan(
             reason: "WSL uses the Windows host driver plus ROCDXG; run `scripts/wsl_setup_rocdxg.sh` inside WSL instead of installing Linux DKMS.".to_owned(),
             preflight_checks: Vec::new(),
             commands: Vec::new(),
-            checks: vec!["rocm examine".to_owned(), "scripts/wsl_preflight.py".to_owned()],
+            checks: vec!["rocm doctor".to_owned(), "scripts/wsl_preflight.py".to_owned()],
         };
     }
 
@@ -3016,7 +3200,7 @@ fn build_driver_install_plan(
             reason: "Linux DKMS driver install is currently planned only for AMD-documented Ubuntu, Debian, RHEL, Oracle Linux, SLES, and Rocky versions; no commands were guessed for this distro.".to_owned(),
             preflight_checks: Vec::new(),
             commands: Vec::new(),
-            checks: vec!["rocm examine".to_owned()],
+            checks: vec!["rocm doctor".to_owned()],
         }),
     }
 }
@@ -4860,7 +5044,7 @@ fn serve(args: ServeArgs) -> Result<()> {
     {
         bail!(
             "no usable AMD GPU detected; `rocm serve` requires a GPU under the {policy} \
-             policy and does not fall back to CPU. Check the driver with `rocm examine`, \
+             policy and does not fall back to CPU. Check the driver with `rocm doctor`, \
              confirm /dev/kfd is present, and ensure HIP_VISIBLE_DEVICES / \
              ROCR_VISIBLE_DEVICES are not masking every device.",
             policy = device_policy_name(&device_policy)
@@ -8952,8 +9136,8 @@ fn fallback_rocm_tool_call_for_prompt(prompt: &str) -> Option<providers::ChatToo
     }
     if asks_how && mentions_setup && any_substring(&normalized, &["therock", "rocm"]) {
         return Some(providers::ChatToolCall {
-            id: Some("fallback-therock-examine".to_owned()),
-            name: "examine".to_owned(),
+            id: Some("fallback-therock-doctor".to_owned()),
+            name: "doctor".to_owned(),
             arguments: serde_json::json!({}),
         });
     }
@@ -8995,8 +9179,8 @@ fn fallback_rocm_tool_call_for_prompt(prompt: &str) -> Option<providers::ChatToo
         );
     if asks_status && any_substring(&normalized, &["gpu", "rocm", "therock", "setup"]) {
         return Some(providers::ChatToolCall {
-            id: Some("fallback-examine".to_owned()),
-            name: "examine".to_owned(),
+            id: Some("fallback-doctor".to_owned()),
+            name: "doctor".to_owned(),
             arguments: serde_json::json!({}),
         });
     }
@@ -9425,7 +9609,7 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
         .position(|window| window.eq_ignore_ascii_case(needle))
 }
 
-const ROCM_CHAT_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's local assistant. Speak in simple English for non-technical Windows users. Use the provided ROCm tools when you need to inspect this machine, preview setup, read service logs, check updates, inspect automations, install or start ROCm-managed apps, or request ROCm/TheRock, config, engine, app, and local model server changes. For simple greetings or thanks like hello, hi, hey, ok, or thank you, reply normally; do not inspect ROCm, do not call tools, and do not launch or propose a model server. Tool-use rules: inspect first with read-only tools; call rocm_command only with argv-style args and no shell text; use natural_language_plan for ROCm requests that do not fit another read-only tool; ask for a mutating tool call only after explaining why it is needed; summarize tool results after they are returned. Read-only tools may run immediately. Tools that install, launch, stop, delete, or change state require user approval; request rocm_command and explain why. For 'is X running?', 'what is running?', status, or port questions, inspect before answering and do not start, stop, install, or serve anything. For ComfyUI or port 8188 use [\"comfyui\",\"status\"] or port_status. For vLLM, Lemonade, qwen, or local model servers use [\"services\",\"list\",\"--all\"] for running state and [\"engines\",\"list\"] for installed/available engine state. Treat ready/running as running, starting/recovering as starting, failed/stopped as not running, and no matching record as unknown or not managed by ROCm CLI. Interpret Examine carefully: active_runtime_status=ready means ROCm CLI has an active managed TheRock/ROCm runtime; legacy_rocm_status=not_detected only means no global system ROCm install was found. If active_runtime_status=ready, tell the user ROCm/TheRock is installed and active for ROCm CLI. For 'is TheRock installed', 'is ROCm installed', or 'which GPU is on this machine', use examine or gpu_snapshot before answering. For 'how do I setup TheRock' or install/setup requests, guide the user to choose an install folder first; do not answer with only a status check. For 'which LLMs can this machine support', use rocm_command args [\"model\"] or natural_language_plan before answering. For TheRock installs, always let the user choose the install folder. If the user names a folder or prefix, preserve that exact folder with [\"--prefix\",\"PATH\"]; you may call path_exists first to check whether that user-provided folder or its parent exists. If the user asks you to install TheRock/ROCm but has not named a folder, ask for the folder or let the guided setup folder picker collect it; do not invent a hidden default folder and do not request an install command without --prefix. Use rocm_command args [\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"wheel\",\"--prefix\",\"PATH\"] only when the user asks you to install it and a folder is known; for a requested build date add [\"--build-date\",\"YYYY-MM-DD\"] and for a requested exact version add [\"--version\",\"VERSION\"]. For config changes, inspect with [\"config\",\"show\"] first when useful, then request config subcommands such as [\"config\",\"set-default-engine\",\"lemonade\"], [\"config\",\"set-default-runtime\",\"RUNTIME_KEY\"], or [\"config\",\"set-telemetry\",\"local\"] only after explaining why. For ComfyUI, use rocm_command with args like [\"comfyui\",\"status\"], [\"comfyui\",\"logs\"], [\"comfyui\",\"install\"], [\"comfyui\",\"start\"], or [\"comfyui\",\"stop\"]. First-time setup is the same thing as bootstrap in ROCm CLI; it is a deterministic ROCm setup flow, not a separate model chat. The built-in local assistant is fixed to qwen, which maps to Qwen3-4B-Instruct-2507-GGUF served by Lemonade with gpu_required. vLLM and Lemonade are the general serving engines; inspect or manage them when the user asks about general model serving, but do not switch the built-in assistant away from Lemonade. Use qwen-smoke only for a quick server smoke test. On native Windows, vLLM is skipped; use WSL/Linux for that ROCm GPU engine. For vLLM management, inspect engines first and use [\"engines\",\"install\",\"vllm\"] or [\"serve\",\"MODEL\",\"--engine\",\"vllm\",\"--device\",\"gpu_required\",\"--managed\"] only where the host supports it. Do not invent shell commands and do not request CPU fallback.";
+const ROCM_CHAT_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's local assistant. Speak in simple English for non-technical Windows users. Use the provided ROCm tools when you need to inspect this machine, preview setup, read service logs, check updates, inspect automations, install or start ROCm-managed apps, or request ROCm/TheRock, config, engine, app, and local model server changes. For simple greetings or thanks like hello, hi, hey, ok, or thank you, reply normally; do not inspect ROCm, do not call tools, and do not launch or propose a model server. Tool-use rules: inspect first with read-only tools; call rocm_command only with argv-style args and no shell text; use natural_language_plan for ROCm requests that do not fit another read-only tool; ask for a mutating tool call only after explaining why it is needed; summarize tool results after they are returned. Read-only tools may run immediately. Tools that install, launch, stop, delete, or change state require user approval; request rocm_command and explain why. For 'is X running?', 'what is running?', status, or port questions, inspect before answering and do not start, stop, install, or serve anything. For ComfyUI or port 8188 use [\"comfyui\",\"status\"] or port_status. For vLLM, Lemonade, qwen, or local model servers use [\"services\",\"list\",\"--all\"] for running state and [\"engines\",\"list\"] for installed/available engine state. Treat ready/running as running, starting/recovering as starting, failed/stopped as not running, and no matching record as unknown or not managed by ROCm CLI. Interpret Doctor carefully: active_runtime_status=ready means ROCm CLI has an active managed TheRock/ROCm runtime; legacy_rocm_status=not_detected only means no global system ROCm install was found. If active_runtime_status=ready, tell the user ROCm/TheRock is installed and active for ROCm CLI. For 'is TheRock installed', 'is ROCm installed', or 'which GPU is on this machine', use doctor or gpu_snapshot before answering. For 'how do I setup TheRock' or install/setup requests, guide the user to choose an install folder first; do not answer with only a status check. For 'which LLMs can this machine support', use rocm_command args [\"model\"] or natural_language_plan before answering. For TheRock installs, always let the user choose the install folder. If the user names a folder or prefix, preserve that exact folder with [\"--prefix\",\"PATH\"]; you may call path_exists first to check whether that user-provided folder or its parent exists. If the user asks you to install TheRock/ROCm but has not named a folder, ask for the folder or let the guided setup folder picker collect it; do not invent a hidden default folder and do not request an install command without --prefix. Use rocm_command args [\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"wheel\",\"--prefix\",\"PATH\"] only when the user asks you to install it and a folder is known; for a requested build date add [\"--build-date\",\"YYYY-MM-DD\"] and for a requested exact version add [\"--version\",\"VERSION\"]. For config changes, inspect with [\"config\",\"show\"] first when useful, then request config subcommands such as [\"config\",\"set-default-engine\",\"lemonade\"], [\"config\",\"set-default-runtime\",\"RUNTIME_KEY\"], or [\"config\",\"set-telemetry\",\"local\"] only after explaining why. For ComfyUI, use rocm_command with args like [\"comfyui\",\"status\"], [\"comfyui\",\"logs\"], [\"comfyui\",\"install\"], [\"comfyui\",\"start\"], or [\"comfyui\",\"stop\"]. First-time setup is the same thing as bootstrap in ROCm CLI; it is a deterministic ROCm setup flow, not a separate model chat. The built-in local assistant is fixed to qwen, which maps to Qwen3-4B-Instruct-2507-GGUF served by Lemonade with gpu_required. vLLM and Lemonade are the general serving engines; inspect or manage them when the user asks about general model serving, but do not switch the built-in assistant away from Lemonade. Use qwen-smoke only for a quick server smoke test. On native Windows, vLLM is skipped; use WSL/Linux for that ROCm GPU engine. For vLLM management, inspect engines first and use [\"engines\",\"install\",\"vllm\"] or [\"serve\",\"MODEL\",\"--engine\",\"vllm\",\"--device\",\"gpu_required\",\"--managed\"] only where the host supports it. Do not invent shell commands and do not request CPU fallback.";
 const ROCM_CHAT_TOOL_SKILL: &str = include_str!("../../../skills/rocm-cli-assistant/SKILL.md");
 
 fn rocm_chat_tool_system_prompt() -> String {
@@ -10021,7 +10205,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
     let first = args.first().map(|value| value.to_ascii_lowercase());
     let second = args.get(1).map(|value| value.to_ascii_lowercase());
     match first.as_deref() {
-        Some("examine" | "version" | "model" | "models" | "daemon" | "logs") => {
+        Some("doctor" | "examine" | "version" | "model" | "models" | "daemon" | "logs") => {
             Ok(ChatRocmCommandAction::ReadOnly(args))
         }
         Some("update") if !args.iter().any(|arg| arg == "--apply") => {
@@ -10373,7 +10557,11 @@ pub(crate) fn chat_tool_call_is_read_only(call: &providers::ChatToolCall) -> boo
 }
 
 fn deterministic_rocm_tool_summary(tool_text: &str) -> Option<String> {
-    if !tool_text.contains("examine:") {
+    // The block is labelled with the tool's own name (see the `follow_up_text`
+    // writer). That name is now `doctor`; `examine:` stays accepted because a
+    // model may still issue the superseded name, and silently returning None
+    // would drop the summary rather than fail visibly.
+    if !tool_text.contains("doctor:") && !tool_text.contains("examine:") {
         return None;
     }
     let mut lines = Vec::new();
@@ -10585,7 +10773,7 @@ fn deterministic_model_tool_summary(tool_text: &str) -> Option<String> {
 
     if !lines.is_empty() {
         lines.push(
-            "  Run `rocm examine` to refresh GPU memory details before starting anything large."
+            "  Run `rocm doctor` to refresh GPU memory details before starting anything large."
                 .to_owned(),
         );
     }
@@ -11007,7 +11195,7 @@ pub(crate) fn run_internal_mcp_call(
             } else if gpu.amd_smi_available {
                 "Captured amd-smi GPU snapshot."
             } else {
-                "Use `rocm examine` for the current local AMD GPU summary."
+                "Use `rocm doctor` for the current local AMD GPU summary."
             };
             Ok(internal_mcp_tool_success(
                 status.to_owned(),
@@ -11333,7 +11521,10 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
     let config = RocmCliConfig::load(paths).unwrap_or_default();
     match args {
         [] => bail!("rocm command requires at least one argument"),
-        [command] if command.eq_ignore_ascii_case("examine") => {
+        [command]
+            if command.eq_ignore_ascii_case("doctor")
+                || command.eq_ignore_ascii_case("examine") =>
+        {
             render_examine_text_with_paths(paths, &config)
         }
         [command]
@@ -11779,7 +11970,7 @@ const fn chat_read_only_tool_status_label(is_error: bool) -> &'static str {
 
 fn chat_tool_display_label(name: &str) -> String {
     match name {
-        "examine" => "Checked this computer".to_owned(),
+        "examine" | "doctor" => "Checked this computer".to_owned(),
         "gpu_snapshot" => "Checked GPU status".to_owned(),
         "engines" => "Checked local engines".to_owned(),
         "services" => "Checked model servers".to_owned(),
@@ -11809,7 +12000,12 @@ fn chat_tool_call_display_label(call: &providers::ChatToolCall) -> String {
         return "rocm command".to_owned();
     };
     match args.as_slice() {
-        [command] if command.eq_ignore_ascii_case("examine") => "Checked this computer".to_owned(),
+        [command]
+            if command.eq_ignore_ascii_case("examine")
+                || command.eq_ignore_ascii_case("doctor") =>
+        {
+            "Checked this computer".to_owned()
+        }
         [command]
             if command.eq_ignore_ascii_case("model") || command.eq_ignore_ascii_case("models") =>
         {
@@ -11977,19 +12173,30 @@ pub(crate) fn render_examine_text() -> Result<String> {
 }
 
 fn render_examine_text_with_paths(paths: &AppPaths, config: &RocmCliConfig) -> Result<String> {
-    Ok(examine_human_report(paths, config)?.0)
+    // Reached from the read-only tool surface, so no repair write here either.
+    Ok(examine_human_report(paths, config, "rocm doctor", false)?.0)
 }
 
-/// Build the human examine report and return it alongside the `ExamineSummary`
-/// it was built from, so callers can derive scope/exit-code without re-probing.
+/// Build the human host report and return it alongside the `ExamineSummary` it
+/// was built from, so callers can derive scope/exit-code without re-probing.
+///
+/// `command` labels the output with whichever command produced it. `recover`
+/// controls the one write on this path: re-registering a setup runtime that is
+/// present on disk but missing from the registry. That is a repair, not a
+/// reading, so a command that promises not to change anything must pass `false`
+/// — see the note in `doctor`.
 fn examine_human_report(
     paths: &AppPaths,
     config: &RocmCliConfig,
+    command: &str,
+    recover: bool,
 ) -> Result<(String, ExamineSummary)> {
-    recover_setup_runtime_registration(paths, config)?;
+    if recover {
+        recover_setup_runtime_registration(paths, config)?;
+    }
     let summary = ExamineSummary::gather()?;
     let mut output = render_examine_plain_header(&summary);
-    output.push_str(&summary.render_text());
+    output.push_str(&summary.render_text(command));
     append_examine_runtime_state(&mut output, paths, config)?;
     append_examine_engine_inventory(&mut output, paths, config, &summary.default_engine);
     Ok((output, summary))
@@ -12742,7 +12949,7 @@ fn append_model_host_ram_fit_lines(
             );
             let _ = writeln!(
                 output,
-                "      system_ram_action: run /examine to refresh host telemetry"
+                "      system_ram_action: run /doctor to refresh host telemetry"
             );
         }
     }
@@ -12809,7 +13016,7 @@ fn append_model_fit_lines(
                 );
                 let _ = writeln!(
                     output,
-                    "      action: run /examine or refresh GPU telemetry, then retry /model {}",
+                    "      action: run /doctor or refresh GPU telemetry, then retry /model {}",
                     recipe_display_ref(recipe)
                 );
             }
@@ -15205,7 +15412,7 @@ fn build_freeform_plan_with_recipes(
             actions: vec![
                 PlannedToolCall::read_only(
                     "Inspect host/runtime state",
-                    vec!["examine".to_owned()],
+                    vec!["doctor".to_owned()],
                     "read-only inspection",
                 ),
                 PlannedToolCall::read_only(
@@ -15248,7 +15455,7 @@ fn build_freeform_plan_with_recipes(
             actions: vec![
                 PlannedToolCall::read_only(
                     "Inspect host/driver state",
-                    vec!["examine".to_owned()],
+                    vec!["doctor".to_owned()],
                     "read-only inspection",
                 ),
                 PlannedToolCall::approval_required(
@@ -15393,7 +15600,7 @@ fn build_freeform_plan_with_recipes(
             actions: vec![
                 PlannedToolCall::read_only(
                     "Inspect current runtime",
-                    vec!["examine".to_owned()],
+                    vec!["doctor".to_owned()],
                     "read-only inspection",
                 ),
                 PlannedToolCall::approval_required(
@@ -15477,7 +15684,7 @@ fn build_freeform_plan_with_recipes(
             parsed: vec![("engine".to_owned(), default_engine.to_owned())],
             actions: vec![PlannedToolCall::read_only(
                 "Inspect local ROCm state",
-                vec!["examine".to_owned()],
+                vec!["doctor".to_owned()],
                 "read-only inspection",
             )],
             notes: vec![
@@ -15650,7 +15857,7 @@ fn resolve_freeform_plan_with_provider(
 
 fn build_provider_planner_prompt(request: &str, deterministic: &StructuredRequestPlan) -> String {
     let next_tool_call = deterministic.actions.last().map_or_else(
-        || "rocm examine".to_owned(),
+        || "rocm doctor".to_owned(),
         |action| format_structured_tool_call(action.tool, &action.args),
     );
     format!(
@@ -15659,7 +15866,7 @@ fn build_provider_planner_prompt(request: &str, deterministic: &StructuredReques
 \"confidence\":\"high|medium|low\",\
 \"tool_call\":{{\"tool\":\"rocm\",\"args\":[\"...\"]}},\
 \"notes\":[\"short note\"]}}.\n\
-Allowed rocm actions: examine; engines list; install sdk; install driver; update; serve; uninstall. Install sdk must include --prefix PATH chosen by the user, and may include --build-date YYYY-MM-DD or --version VERSION.\n\
+Allowed rocm actions: doctor; engines list; install sdk; install driver; update; serve; uninstall. Install sdk must include --prefix PATH chosen by the user, and may include --build-date YYYY-MM-DD or --version VERSION.\n\
 Do not invent CPU fallback. Do not include shell commands. Do not include markdown.\n\
 User request: {request}\n\
 Deterministic planner intent: {}\n\
@@ -15777,7 +15984,7 @@ fn validate_provider_planner_tool_call(call: &ProviderPlannerToolCall) -> Result
         .context("provider planner returned a rocm command that is not valid")?;
 
     match call.args.as_slice() {
-        [command] if command == "examine" => {}
+        [command] if command == "examine" || command == "doctor" => {}
         [command, subcommand] if command == "engines" && subcommand == "list" => {}
         [command, subcommand, ..] if command == "install" && subcommand == "sdk" => {
             validate_chat_rocm_command_safety(&call.args)?;
@@ -15821,7 +16028,7 @@ fn planner_intent_from_provider_response(intent: &str, args: &[String]) -> Resul
         "install_driver" | "install driver" => PlannerIntent::InstallDriver,
         "update" => PlannerIntent::Update,
         "uninstall" => PlannerIntent::Uninstall,
-        "inspect" | "examine" => PlannerIntent::Inspect,
+        "inspect" | "examine" | "doctor" => PlannerIntent::Inspect,
         _ => bail!("provider planner returned unsupported intent `{intent}`"),
     };
     if declared != args_intent {
@@ -15845,7 +16052,7 @@ fn planner_intent_from_args(args: &[String]) -> Result<PlannerIntent> {
         }
         Some("update") => Ok(PlannerIntent::Update),
         Some("uninstall") => Ok(PlannerIntent::Uninstall),
-        Some("examine" | "engines") => Ok(PlannerIntent::Inspect),
+        Some("examine" | "doctor" | "engines") => Ok(PlannerIntent::Inspect),
         _ => bail!("unsupported provider planner args"),
     }
 }
@@ -15937,6 +16144,7 @@ fn planner_is_inspect_request(lower: &str) -> bool {
         || contains_planner_word(lower, "check")
         || contains_planner_word(lower, "status")
         || contains_planner_word(lower, "examine")
+        || contains_planner_word(lower, "doctor")
         || contains_planner_word(lower, "which")
         || contains_planner_word(lower, "where")
         || lower.contains("what is installed")
@@ -17569,6 +17777,10 @@ fn service_model_names_match(left: &str, right: &str) -> bool {
 
 fn treat_as_natural_language(args: &[String]) -> bool {
     const STRUCTURED: &[&str] = &[
+        "doctor",
+        // Hidden but still dispatched, so they must stay structured: falling
+        // through to the natural-language planner would silently change what an
+        // existing caller gets back.
         "examine",
         "diagnose",
         "fix",
@@ -17763,16 +17975,21 @@ mod tests {
     fn the_framework_choice_is_offered_on_the_command_line() {
         // Guards the actual regression: the variants existed in the library and
         // were unreachable from here. A user must be able to see and pass them.
-        let help = Cli::command()
-            .find_subcommand_mut("examine")
-            .expect("examine subcommand")
-            .render_long_help()
-            .to_string();
-        for choice in ["auto", "pytorch", "llama-cpp", "skip"] {
-            assert!(
-                help.contains(choice),
-                "`{choice}` must be offered by `rocm examine --help`:\n{help}"
-            );
+        // Both the advertised command and the superseded one must offer the
+        // choices: `doctor` because that is what users are pointed at, `examine`
+        // because hiding it must not have quietly narrowed what it accepts.
+        for command in ["doctor", "examine"] {
+            let help = Cli::command()
+                .find_subcommand_mut(command)
+                .unwrap_or_else(|| panic!("{command} subcommand"))
+                .render_long_help()
+                .to_string();
+            for choice in ["auto", "pytorch", "llama-cpp", "skip"] {
+                assert!(
+                    help.contains(choice),
+                    "`{choice}` must be offered by `rocm {command} --help`:\n{help}"
+                );
+            }
         }
     }
 
@@ -18322,8 +18539,8 @@ mod tests {
             }
             // A known visible subcommand must still be present.
             assert!(
-                output.contains("examine"),
-                "visible subcommand `examine` missing from {shell:?} completions"
+                output.contains("doctor"),
+                "visible subcommand `doctor` missing from {shell:?} completions"
             );
         }
     }
@@ -18336,9 +18553,19 @@ mod tests {
             .collect();
         // Visible subcommands are preserved.
         assert!(
-            names.iter().any(|n| n == "examine"),
+            names.iter().any(|n| n == "doctor"),
             "filtered command tree dropped a visible subcommand; got {names:?}"
         );
+        // `examine` and `diagnose` still dispatch, but `doctor` supersedes them
+        // and they are no longer advertised. Asserting on the name list rather
+        // than a substring search keeps this from tripping over prose in help
+        // text that happens to mention the old names.
+        for superseded in ["examine", "diagnose"] {
+            assert!(
+                !names.iter().any(|n| n == superseded),
+                "superseded subcommand `{superseded}` is still advertised; got {names:?}"
+            );
+        }
         assert!(
             names.iter().any(|n| n == "completions"),
             "filtered command tree dropped `completions`; got {names:?}"
@@ -19449,7 +19676,7 @@ mod tests {
         assert!(
             plan.actions
                 .iter()
-                .all(|action| action.args == vec!["examine".to_owned()])
+                .all(|action| action.args == vec!["doctor".to_owned()])
         );
     }
 
@@ -19466,7 +19693,7 @@ mod tests {
             assert_eq!(plan.approval, "not required for inspection", "{prompt}");
             assert_eq!(plan.actions.len(), 1, "{prompt}");
             assert_eq!(plan.actions[0].approval, "not required", "{prompt}");
-            assert_eq!(plan.actions[0].args, vec!["examine".to_owned()], "{prompt}");
+            assert_eq!(plan.actions[0].args, vec!["doctor".to_owned()], "{prompt}");
         }
     }
 
@@ -20029,7 +20256,7 @@ runtime_state:
     }
 
     #[test]
-    fn fallback_tool_call_routes_where_installed_to_read_only_examine() {
+    fn fallback_tool_call_routes_where_installed_to_read_only_doctor() {
         for prompt in [
             "where is rocm installed?",
             "where is TheRock installed?",
@@ -20037,7 +20264,7 @@ runtime_state:
             "where did rocm install to?",
         ] {
             let call = fallback_rocm_tool_call_for_prompt(prompt).unwrap();
-            assert_eq!(call.name, "examine", "{prompt}");
+            assert_eq!(call.name, "doctor", "{prompt}");
             assert!(chat_tool_call_is_read_only(&call), "{prompt}");
         }
     }
@@ -20112,7 +20339,7 @@ model recipes
         assert!(summary.contains("lemonade, vllm"));
         assert!(summary.contains("Qwen/Qwen3.5-4B asks for 12 GiB"));
         assert!(summary.contains("Native Windows note"));
-        assert!(summary.contains("Run `rocm examine`"));
+        assert!(summary.contains("Run `rocm doctor`"));
     }
 
     #[test]
@@ -21273,7 +21500,7 @@ model recipes
             "Check this ROCm setup.",
         ] {
             let call = fallback_rocm_tool_call_for_prompt(prompt).unwrap();
-            assert_eq!(call.name, "examine");
+            assert_eq!(call.name, "doctor");
             assert_eq!(call.arguments, serde_json::json!({}));
         }
     }
@@ -21445,7 +21672,7 @@ model recipes
         let (_root, paths) = test_paths("chat-install-intent-latest-message");
         let prompt = "\
 Conversation so far:
-Assistant: Use /examine to refresh actual GPU memory fit before starting anything large.
+Assistant: Use /doctor to refresh actual GPU memory fit before starting anything large.
 Assistant: Native Windows note: models may use WSL/Linux through Windows.
 
 New message:
@@ -21766,6 +21993,7 @@ install therock";
         assert_eq!(chat_read_only_tool_status_label(false), "done");
         assert_eq!(chat_read_only_tool_status_label(true), "reported an error");
         assert_eq!(chat_tool_display_label("examine"), "Checked this computer");
+        assert_eq!(chat_tool_display_label("doctor"), "Checked this computer");
         assert_eq!(
             chat_tool_display_label("gpu_snapshot"),
             "Checked GPU status"
@@ -24199,8 +24427,8 @@ VERSION_ID="41"
         assert!(rendered.contains("approval: not required"));
         assert!(rendered.contains("execution_commands: <none>"));
         assert!(rendered.contains("post_reboot_checks:"));
-        assert!(rendered.contains("use `rocm examine`"));
-        assert!(rendered.contains("rocm examine"));
+        assert!(rendered.contains("use `rocm doctor`"));
+        assert!(rendered.contains("rocm doctor"));
         assert!(plan.commands.is_empty());
     }
 

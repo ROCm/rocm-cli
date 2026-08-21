@@ -33,6 +33,8 @@ tests/e2e-cucumber/
 │
 ├── features/                     # .feature files — one per feature area
 │   ├── chat.feature
+│   ├── diagnose.feature
+│   ├── doctor.feature
 │   ├── examine.feature
 │   ├── model_serving.feature
 │   └── runtime_setup.feature
@@ -41,6 +43,7 @@ tests/e2e-cucumber/
 │   ├── e2e.rs                    # World struct, runner, expectation reconciliation, Drop cleanup
 │   └── e2e/                      # step functions — one file per feature area
 │       ├── chat_steps.rs
+│       ├── doctor_steps.rs
 │       ├── examine_steps.rs
 │       ├── runtime_steps.rs
 │       └── serving_steps.rs

@@ -2022,7 +2022,13 @@ impl ExamineSummary {
         })
     }
 
-    pub fn render_text(&self) -> String {
+    /// Render the host summary, labelled with the command that produced it.
+    ///
+    /// `examine` and `diagnose` are superseded but still dispatched, and their
+    /// stdout is a contract that shipped scripts assert on by exact substring.
+    /// So each command names itself rather than sharing one hardcoded label.
+    #[must_use]
+    pub fn render_text(&self, command: &str) -> String {
         let legacy_paths = if self.legacy_rocm.paths.is_empty() {
             "<none>".to_owned()
         } else {
@@ -2044,7 +2050,8 @@ impl ExamineSummary {
             "false (this run's output is captured, so the CLI will not prompt)"
         };
         format!(
-            "rocm examine\n  os: {}\n  arch: {}\n  kernel: {}\n  distro: {}\n  cpu: {}\n  system_ram: {}\n  interactive_terminal: {}\n  default_engine: {}\n  detected_gfx_target: {}\n  compatible_therock_family: {}\n  detected_therock_family: {}\n  driver_policy: {}\n  driver_status: {}\n  driver_detail: {}\n  legacy_rocm_status: {}\n  legacy_rocm_paths: {}\n  legacy_rocm_version: {}\n  legacy_rocm_detail: {}\n  legacy_rocm_guidance: {}\n  wsl: {}\n  wsl_dxg_device: {}\n  wsl_dxcore: {}\n  wsl_librocdxg: {}\n  wsl_rocdxg_dids: {}\n  wsl_ldconfig_librocdxg: {}\n  wsl_global_rocminfo: {}\n  wsl_cargo: {}\n  wsl_detail: {}\n  managed_runtimes: {}\n  managed_services: {}\n  model_cache_entries: {}\n  config_dir: {}\n  data_dir: {}\n  cache_dir: {}\n",
+            "{}\n  os: {}\n  arch: {}\n  kernel: {}\n  distro: {}\n  cpu: {}\n  system_ram: {}\n  interactive_terminal: {}\n  default_engine: {}\n  detected_gfx_target: {}\n  compatible_therock_family: {}\n  detected_therock_family: {}\n  driver_policy: {}\n  driver_status: {}\n  driver_detail: {}\n  legacy_rocm_status: {}\n  legacy_rocm_paths: {}\n  legacy_rocm_version: {}\n  legacy_rocm_detail: {}\n  legacy_rocm_guidance: {}\n  wsl: {}\n  wsl_dxg_device: {}\n  wsl_dxcore: {}\n  wsl_librocdxg: {}\n  wsl_rocdxg_dids: {}\n  wsl_ldconfig_librocdxg: {}\n  wsl_global_rocminfo: {}\n  wsl_cargo: {}\n  wsl_detail: {}\n  managed_runtimes: {}\n  managed_services: {}\n  model_cache_entries: {}\n  config_dir: {}\n  data_dir: {}\n  cache_dir: {}\n",
+            command,
             self.os,
             self.arch,
             self.kernel.as_deref().unwrap_or("<unknown>"),
@@ -9553,7 +9560,7 @@ Class Name:                Display
             cache_dir: PathBuf::from("cache"),
         };
 
-        let rendered = summary.render_text();
+        let rendered = summary.render_text("rocm examine");
         assert!(rendered.contains("distro: Windows"));
         assert!(rendered.contains("cpu: AMD Ryzen"));
         assert!(rendered.contains("system_ram: 64 GiB"));
@@ -9610,14 +9617,14 @@ Class Name:                Display
             cache_dir: PathBuf::from("cache"),
         };
 
-        let interactive = summary.render_text();
+        let interactive = summary.render_text("rocm examine");
         assert!(
             interactive.contains("interactive_terminal: true (this run has a terminal"),
             "the true case must say it is about this run:\n{interactive}"
         );
 
         summary.interactive_terminal = false;
-        let captured = summary.render_text();
+        let captured = summary.render_text("rocm examine");
         assert!(
             captured.contains("interactive_terminal: false (this run's output is captured"),
             "the false case must explain why, not just report it:\n{captured}"
@@ -9663,7 +9670,7 @@ Class Name:                Display
             cache_dir: PathBuf::from("cache"),
         };
 
-        let rendered = summary.render_text();
+        let rendered = summary.render_text("rocm examine");
 
         assert!(rendered.contains(
             "legacy_rocm_guidance: legacy ROCm detected; install a managed TheRock runtime"
