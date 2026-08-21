@@ -508,15 +508,12 @@ mod tests {
 
     #[test]
     fn oom_signatures_are_detected_case_insensitively() {
-        // The three signatures the ticket calls out, plus casing variants the
-        // engine log can emit.
+        // The signatures the ticket calls out, plus casing variants the engine
+        // log can emit.
         assert!(rocm_core::vllm_log_shows_oom(
             "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB."
         ));
         assert!(rocm_core::vllm_log_shows_oom("HIP OUT OF MEMORY"));
-        assert!(rocm_core::vllm_log_shows_oom(
-            "ERROR Engine core initialization failed"
-        ));
         assert!(rocm_core::vllm_log_shows_oom(
             "RuntimeError: CUDA out of memory"
         ));
@@ -528,6 +525,12 @@ mod tests {
             "OSError: model weights not found; check the model id"
         ));
         assert!(!rocm_core::vllm_log_shows_oom(""));
+        // vLLM's generic EngineCore wrapper is the terminal line for *any*
+        // startup crash, not just OOM; treating it as an OOM signature would
+        // misreport unrelated failures as memory exhaustion.
+        assert!(!rocm_core::vllm_log_shows_oom(
+            "ERROR Engine core initialization failed"
+        ));
     }
 
     #[test]

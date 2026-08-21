@@ -761,9 +761,13 @@ async fn plant_oom_managed_serve(world: &mut E2eWorld) {
             engine_pid: Some(std::process::id()),
         },
     );
+    // A real allocator OOM signature (not vLLM's generic EngineCore wrapper,
+    // which is deliberately excluded from detection — see EAI-8059 review). This
+    // log belongs to whatever process is already live, not to the invocation
+    // under test in this scenario.
     std::fs::write(
         services.join("e2e-mock.log"),
-        "ERROR Engine core initialization failed\n",
+        "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
     )
     .expect("failed to plant the OOM startup log");
 }
@@ -867,18 +871,21 @@ async fn assert_absent_index_message(world: &mut E2eWorld) {
     );
 }
 
-#[then("the deployment summary recommends both vLLM memory controls")]
-async fn assert_oom_memory_guidance(world: &mut E2eWorld) {
+#[then("the deployment summary does not blame this invocation for GPU memory")]
+async fn assert_no_oom_memory_guidance(world: &mut E2eWorld) {
     let screen = world
         .tui
         .as_ref()
         .expect("no interactive serve summary")
         .screen_text();
     assert!(
-        screen.contains("ran out of GPU memory")
-            && screen.contains("--gpu-memory-utilization")
-            && screen.contains("--gpu <index>"),
-        "expected both vLLM memory controls in the OOM summary:\n{screen}"
+        screen.contains("already running"),
+        "expected the summary to reflect the reused live service:\n{screen}"
+    );
+    assert!(
+        !screen.contains("ran out of GPU memory"),
+        "reusing an already-running service must not blame this invocation for \
+         another process's OOM:\n{screen}"
     );
 }
 

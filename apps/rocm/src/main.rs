@@ -5072,6 +5072,7 @@ fn serve(args: ServeArgs) -> Result<()> {
             let notes = append_oom_serve_note(
                 notes,
                 engine_serves_vllm,
+                report.already_running,
                 &report.status,
                 report.log_path.as_deref(),
             );
@@ -5164,23 +5165,36 @@ fn collect_serve_notes(
 /// [`collect_serve_notes`]. The reported low-VRAM environment ships no
 /// rocm-smi/amd-smi, so that telemetry-driven warning never fires there; reading
 /// the failed serve's own log tail is the reliable signal that the launch died on
-/// VRAM. Gated on vLLM (the only engine exposing `--gpu-memory-utilization`) and
-/// on a non-ready status so healthy deployments and unrelated failures stay
-/// uncluttered — the OOM-signature check in [`serve_summary::oom_memory_note`]
-/// narrows it further.
+/// VRAM. Gated on vLLM (the only engine exposing `--gpu-memory-utilization`), on
+/// a non-ready status, and on this invocation actually having launched the
+/// process (`already_running` is excluded) so healthy deployments, unrelated
+/// failures, and an unrelated invocation that merely reused an already-live
+/// service are never misattributed — reusing an already-running service reads
+/// whatever log that other invocation left behind, which may predate this
+/// `serve` call entirely or still be mid-startup. The OOM-signature check in
+/// [`serve_summary::oom_memory_note`] narrows it further. Also skips a note
+/// whose hint text is already present in `notes` (the pre-launch low-VRAM
+/// warning may have added it) so the same fix is never printed twice.
 fn append_oom_serve_note(
     mut notes: Vec<String>,
     engine_is_vllm: bool,
+    already_running: bool,
     status: &str,
     log_path: Option<&Path>,
 ) -> Vec<String> {
-    if !engine_is_vllm || status == "ready" {
+    if !engine_is_vllm || already_running || status == "ready" {
         return notes;
     }
     let Some(log_path) = log_path else {
         return notes;
     };
     let log_tail = read_optional_tail_lines(log_path, 80, "service log").join("\n");
+    let already_hinted = notes
+        .iter()
+        .any(|note| note.contains(rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT));
+    if already_hinted {
+        return notes;
+    }
     if let Some(note) = serve_summary::oom_memory_note(status, &log_tail) {
         notes.push(note);
     }
@@ -23612,7 +23626,7 @@ install therock";
             "loading weights\ntorch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
         )
         .expect("write log");
-        let notes = append_oom_serve_note(Vec::new(), true, "starting", Some(&log_path));
+        let notes = append_oom_serve_note(Vec::new(), true, false, "starting", Some(&log_path));
         let _ = fs::remove_file(&log_path);
         assert!(
             notes
@@ -23630,16 +23644,75 @@ install therock";
         fs::write(&log_path, "torch.OutOfMemoryError: HIP out of memory\n").expect("write log");
 
         // A ready serve is healthy even if the log mentions memory.
-        assert!(append_oom_serve_note(Vec::new(), true, "ready", Some(&log_path)).is_empty());
+        assert!(
+            append_oom_serve_note(Vec::new(), true, false, "ready", Some(&log_path)).is_empty()
+        );
         // A non-vLLM engine has no `--gpu-memory-utilization` to reach for.
-        assert!(append_oom_serve_note(Vec::new(), false, "starting", Some(&log_path)).is_empty());
+        assert!(
+            append_oom_serve_note(Vec::new(), false, false, "starting", Some(&log_path)).is_empty()
+        );
         // A missing log gives no signal to branch on.
-        assert!(append_oom_serve_note(Vec::new(), true, "starting", None).is_empty());
+        assert!(append_oom_serve_note(Vec::new(), true, false, "starting", None).is_empty());
 
         // A failure whose log carries no OOM signature is left alone.
         fs::write(&log_path, "OSError: model weights not found\n").expect("rewrite log");
-        assert!(append_oom_serve_note(Vec::new(), true, "starting", Some(&log_path)).is_empty());
+        assert!(
+            append_oom_serve_note(Vec::new(), true, false, "starting", Some(&log_path)).is_empty()
+        );
         let _ = fs::remove_file(&log_path);
+    }
+
+    #[test]
+    fn append_oom_serve_note_ignores_an_already_running_services_log() {
+        // Re-issuing `serve` against a service another invocation already
+        // launched must never blame *this* invocation for that other process's
+        // failure — even when its log carries a real OOM signature and the
+        // reused record's status is not yet "ready".
+        let log_path = std::env::temp_dir().join(format!(
+            "rocm-oom-note-{}-already-running.log",
+            std::process::id()
+        ));
+        fs::write(
+            &log_path,
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
+        )
+        .expect("write log");
+        let notes = append_oom_serve_note(Vec::new(), true, true, "starting", Some(&log_path));
+        let _ = fs::remove_file(&log_path);
+        assert!(
+            notes.is_empty(),
+            "an already-running service's log must not be attributed to this invocation: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn append_oom_serve_note_does_not_repeat_a_hint_already_in_the_notes() {
+        // When the pre-launch low-VRAM warning already carried the shared
+        // utilization hint, a post-failure OOM confirmation must not print the
+        // exact same hint text a second time.
+        let log_path =
+            std::env::temp_dir().join(format!("rocm-oom-note-{}-dedup.log", std::process::id()));
+        fs::write(
+            &log_path,
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
+        )
+        .expect("write log");
+        let pre_launch_notes = vec![
+            "selected GPU 0 has low free VRAM".to_owned(),
+            rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT.to_owned(),
+        ];
+        let notes = append_oom_serve_note(
+            pre_launch_notes.clone(),
+            true,
+            false,
+            "starting",
+            Some(&log_path),
+        );
+        let _ = fs::remove_file(&log_path);
+        assert_eq!(
+            notes, pre_launch_notes,
+            "the hint must not be duplicated once it is already present: {notes:?}"
+        );
     }
 
     #[test]

@@ -155,11 +155,15 @@ Feature: Model serving
     Then serving is refused before any engine starts
     And the user is told that GPU index is unavailable
 
-  # OOM diagnostics (EAI-8059). A planted live managed-service record and log
-  # exercise the real interactive `rocm serve` summary without allocating GPU
+  # Regression test (EAI-8059 review): re-issuing `serve` against an
+  # already-running managed service must never blame *this* invocation for
+  # whatever that other process's log contains, even when it carries a real
+  # OOM signature and the reused record is not yet "ready" — nothing was
+  # launched by this invocation, so there is nothing for it to have OOM'd on.
+  # Exercises the real interactive `rocm serve` summary without allocating GPU
   # memory or relying on a hardware-specific model size.
   @id:serve-oom-memory-guidance @requires-gpu @requires-os:linux
-  Scenario: 15 - A failed vLLM serve names the memory controls to adjust
+  Scenario: 15 - Reusing an already-running serve never blames it for another process's OOM
     Given a live managed vLLM serve has an OOM startup log
     When the user opens its interactive serve summary
-    Then the deployment summary recommends both vLLM memory controls
+    Then the deployment summary does not blame this invocation for GPU memory

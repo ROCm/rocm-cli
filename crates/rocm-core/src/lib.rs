@@ -7323,14 +7323,17 @@ pub const VLLM_GPU_MEMORY_UTILIZATION_HINT: &str = "vLLM reserves ~90% of the GP
 /// Whether a vLLM/PyTorch log excerpt carries a startup out-of-memory
 /// signature.
 ///
-/// Includes vLLM's wrapper-only initialization failure because some engine logs
-/// omit the underlying allocator message from their retained tail.
+/// Deliberately excludes vLLM's generic "engine core initialization failed"
+/// wrapper: vLLM emits that line as the terminal message for *any* EngineCore
+/// startup crash (unsupported architecture, shm size, tensor-parallel
+/// misconfiguration, missing weights, and OOM alike), and being the last line
+/// it reliably lands in a truncated log tail — treating it as an OOM signature
+/// would misreport unrelated startup failures as memory exhaustion.
 pub fn vllm_log_shows_oom(log: &str) -> bool {
     const SIGNATURES: &[&str] = &[
         "torch.outofmemoryerror",
         "hip out of memory",
         "out of memory",
-        "engine core initialization failed",
     ];
 
     let lower = log.to_ascii_lowercase();

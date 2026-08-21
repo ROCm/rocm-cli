@@ -2240,7 +2240,6 @@ mod tests {
         assert!(rocm_core::vllm_log_shows_oom(
             "RuntimeError: CUDA out of memory"
         ));
-        assert!(!oom_utilization_hint("Engine core initialization failed").is_empty());
     }
 
     #[test]
@@ -2250,6 +2249,17 @@ mod tests {
         assert!(
             oom_utilization_hint(unrelated).is_empty(),
             "non-OOM failures must not carry a memory hint"
+        );
+
+        // vLLM's generic EngineCore wrapper is the terminal line for *any*
+        // startup crash (unsupported arch, shm size, TP misconfig, missing
+        // weights, OOM, ...); treating it as an OOM signature would misreport
+        // those unrelated failures as memory exhaustion.
+        let wrapper_only = "ERROR Engine core initialization failed";
+        assert!(!rocm_core::vllm_log_shows_oom(wrapper_only));
+        assert!(
+            oom_utilization_hint(wrapper_only).is_empty(),
+            "the generic EngineCore wrapper alone must not be treated as OOM"
         );
     }
 
