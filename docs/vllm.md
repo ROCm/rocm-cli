@@ -18,6 +18,11 @@ the existing TheRock PyTorch stack. A prebuilt vLLM ROCm wheel can replace the
 TheRock torch packages or target a different ROCm soname set; that is not a
 valid no-fallback setup for rocm-cli GPU serving.
 
+Building from source compiles HIP sources, so it needs the ROCm compiler
+toolchain. That is opt-in: install the runtime with `rocm install sdk --devel`,
+or the build fails on a missing compiler. A runtime installed without `--devel`
+can still *serve* an already-built vLLM.
+
 Supported discovery paths:
 
 - `ROCM_CLI_VLLM_COMMAND=/path/to/vllm`

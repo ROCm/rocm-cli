@@ -1,12 +1,19 @@
 Feature: Runtime configuration
 
-  @id:runtime-install-sdk-active @requires-gpu @nightly
-  Scenario: 1 - Installing the SDK makes it the active runtime
+  # This is the acceptance path for the runtime-only default: the fresh install
+  # must omit the compiler toolchain and still support vLLM's runtime compilation
+  # and inference from that same isolated environment.
+  @id:runtime-install-sdk-active @requires-gpu @requires-engine:vllm @nightly
+  Scenario: 1 - A runtime-only SDK install supports vLLM inference
     Given a machine with no CLI-managed runtimes
     When the user installs the SDK
     Then a runtime is registered
     And the runtime is set as active
-    And the runtime includes an inference engine
+    And the runtime excludes the compiler toolchain
+    When the user serves a model on GPU from the installed runtime
+    And the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
 
   # Dogfooding #17: re-provisioning was observed writing inside the previous
   # runtime, producing a recursively nested `runtimes/wheel/.../runtimes/wheel/`
