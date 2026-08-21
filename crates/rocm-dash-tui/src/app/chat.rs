@@ -303,6 +303,43 @@ pub(super) const fn startup_chat_outcome(
     }
 }
 
+/// Decide whether a persisted `chat_url` should be replaced by a freshly
+/// detected live endpoint (EAI-7360).
+///
+/// Pure — takes the already-computed reachability/detection results rather
+/// than doing I/O itself, so it is unit-testable without a tool executor or a
+/// live socket. The caller only feeds this a `live` detection result when
+/// `chat_url` came from persisted config and neither the managed-services
+/// registry nor a direct TCP probe already confirmed it reachable, so this
+/// never revalidates an explicit env override, and `resolve_llm_config`'s own
+/// CLI>config>env>probe precedence (tested directly in `llm.rs`) is
+/// completely untouched — this only ever supplies a *replacement* config
+/// before that call runs.
+///
+/// Returns `Some(live)` only when the configured endpoint is unreachable and
+/// a *genuinely different*, live endpoint was found; `None` otherwise (nothing
+/// to replace, or detection re-found the same URL modulo a trailing `/`/`/v1`).
+pub(super) fn stale_chat_url_replacement(
+    configured_base_url: &str,
+    configured_probe_ok: bool,
+    live: Option<crate::llm::LlmConfig>,
+) -> Option<crate::llm::LlmConfig> {
+    if configured_probe_ok {
+        return None;
+    }
+    let configured = normalize_base_url(configured_base_url);
+    live.filter(|l| normalize_base_url(&l.base_url) != configured)
+}
+
+/// Normalize an OpenAI-style base URL for change-detection comparison: drop a
+/// trailing `/` and a trailing `/v1` so a formatting-only difference (e.g.
+/// `http://h:8000` vs `http://h:8000/v1/`) is not mistaken for a server change
+/// and does not emit a spurious "server changed" notice.
+fn normalize_base_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string()
+}
+
 /// Persist an accepted local endpoint to the user's `config.toml`: load the
 /// existing config (or defaults), set `tui.chat_url`/`tui.chat_model`, and write
 /// it back. Best-effort — returns a human error string on failure.
@@ -665,5 +702,76 @@ mod tests {
             startup_chat_outcome(false, false),
             StartupChatOutcome::Configured
         );
+    }
+
+    fn live(base_url: &str) -> crate::llm::LlmConfig {
+        crate::llm::detected_llm_config(base_url, "m")
+    }
+
+    #[test]
+    fn stale_chat_url_replacement_none_when_configured_endpoint_reachable() {
+        // Reachable configured endpoint must never be swapped out, regardless
+        // of what a stray `live` detection result would have found.
+        assert_eq!(
+            stale_chat_url_replacement(
+                "http://127.0.0.1:9/v1",
+                true,
+                Some(live("http://127.0.0.1:11435/v1"))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn stale_chat_url_replacement_none_when_nothing_live_found() {
+        assert_eq!(
+            stale_chat_url_replacement("http://127.0.0.1:9/v1", false, None),
+            None
+        );
+    }
+
+    #[test]
+    fn stale_chat_url_replacement_none_when_live_matches_configured() {
+        // Detection simply re-confirming the same (currently-unreachable-by-
+        // TCP-probe-timing) URL is not a "server changed" situation.
+        let url = "http://127.0.0.1:11435/v1";
+        assert_eq!(
+            stale_chat_url_replacement(url, false, Some(live(url))),
+            None
+        );
+    }
+
+    #[test]
+    fn stale_chat_url_replacement_swaps_to_a_different_live_endpoint() {
+        let found = live("http://127.0.0.1:13305/v1");
+        let replacement =
+            stale_chat_url_replacement("http://127.0.0.1:9/v1", false, Some(found.clone()))
+                .expect("a different live endpoint replaces the stale one");
+        assert_eq!(replacement.base_url, found.base_url);
+    }
+
+    #[test]
+    fn stale_chat_url_replacement_ignores_trailing_slash_and_v1_formatting() {
+        // A formatting-only difference (trailing `/`, presence/absence of the
+        // `/v1` suffix) is the SAME endpoint — no spurious "server changed".
+        for (configured, found) in [
+            ("http://127.0.0.1:8000/v1", "http://127.0.0.1:8000/v1/"),
+            ("http://127.0.0.1:8000/v1", "http://127.0.0.1:8000"),
+            ("http://127.0.0.1:8000", "http://127.0.0.1:8000/v1"),
+        ] {
+            assert_eq!(
+                stale_chat_url_replacement(configured, false, Some(live(found))),
+                None,
+                "{configured} vs {found} must be treated as the same endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_base_url_strips_trailing_slash_and_v1() {
+        assert_eq!(normalize_base_url("http://h:8000/v1/"), "http://h:8000");
+        assert_eq!(normalize_base_url("http://h:8000/v1"), "http://h:8000");
+        assert_eq!(normalize_base_url("http://h:8000/"), "http://h:8000");
+        assert_eq!(normalize_base_url("http://h:8000"), "http://h:8000");
     }
 }
