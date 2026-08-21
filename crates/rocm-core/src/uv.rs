@@ -19,7 +19,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use crate::runtime::{
-    managed_tools_dir, managed_uv_cache_dir, runtime_is_windows, runtime_os_name,
+    managed_tools_dir, managed_uv_cache_dir, managed_uv_python_install_dir, runtime_is_windows,
+    runtime_os_name,
 };
 use crate::{AppPaths, download_file_to_path, unix_time_millis};
 
@@ -140,24 +141,88 @@ fn meaningful_cache_dir(value: Option<&OsStr>) -> Option<PathBuf> {
     Some(PathBuf::from(trimmed))
 }
 
+/// Environment variable `uv` reads to locate where it installs standalone CPython
+/// interpreters (`uv python install`).
+pub const UV_PYTHON_INSTALL_DIR_ENV: &str = "UV_PYTHON_INSTALL_DIR";
+
+/// Environment variable used to place the `uv`-managed Python install dir explicitly.
+///
+/// Namespaced like [`UV_CACHE_DIR_OVERRIDE_ENV`] for the same reason: a bare
+/// `UV_PYTHON_INSTALL_DIR` a developer exported for unrelated Python work should not
+/// silently opt a user out of the managed colocation.
+pub const UV_PYTHON_INSTALL_DIR_OVERRIDE_ENV: &str = "ROCM_CLI_UV_PYTHON_INSTALL_DIR";
+
+/// Where the `uv`-managed Python install directory for a spawned command comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UvPythonInstallDirSource {
+    /// Derived from the managed data directory.
+    Managed(PathBuf),
+    /// Set explicitly via [`UV_PYTHON_INSTALL_DIR_OVERRIDE_ENV`].
+    Override(PathBuf),
+    /// Inherited from an ambient [`UV_PYTHON_INSTALL_DIR_ENV`] in the environment.
+    Inherited(PathBuf),
+}
+
+impl UvPythonInstallDirSource {
+    /// The directory this source resolves to.
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Managed(path) | Self::Override(path) | Self::Inherited(path) => path,
+        }
+    }
+
+    /// Whether the managed colocation was bypassed, so callers can report it.
+    pub const fn is_override(&self) -> bool {
+        !matches!(self, Self::Managed(_))
+    }
+}
+
+/// Resolve the `uv` Python install directory from the managed paths and the two override
+/// variables. Same precedence and blank-handling as [`uv_cache_source`].
+pub fn uv_python_install_dir_source(paths: &AppPaths) -> UvPythonInstallDirSource {
+    resolve_uv_python_install_dir_source(
+        paths,
+        std::env::var_os(UV_PYTHON_INSTALL_DIR_OVERRIDE_ENV).as_deref(),
+        std::env::var_os(UV_PYTHON_INSTALL_DIR_ENV).as_deref(),
+    )
+}
+
+fn resolve_uv_python_install_dir_source(
+    paths: &AppPaths,
+    override_dir: Option<&OsStr>,
+    inherited_dir: Option<&OsStr>,
+) -> UvPythonInstallDirSource {
+    if let Some(value) = meaningful_cache_dir(override_dir) {
+        return UvPythonInstallDirSource::Override(value);
+    }
+    if let Some(value) = meaningful_cache_dir(inherited_dir) {
+        return UvPythonInstallDirSource::Inherited(value);
+    }
+    UvPythonInstallDirSource::Managed(managed_uv_python_install_dir(&paths.data_dir))
+}
+
 /// Environment pairs to apply when spawning `uv`.
 ///
 /// Network behavior is configured consistently (uv reads `UV_HTTP_TIMEOUT` rather than
-/// accepting a `--timeout` flag) and the cache lives beside the managed environments it
-/// populates.
+/// accepting a `--timeout` flag), the package cache and the standalone-Python install
+/// directory both live beside the managed environments they populate.
 ///
 /// Without a cache inside the managed root, `uv` caches under `$HOME/.cache/uv`; when
 /// that is on a different filesystem from the data directory, `uv` cannot hardlink and
 /// silently copies every file, so each environment carries a full duplicate of the SDK
-/// and torch stack.
+/// and torch stack. Likewise, without `UV_PYTHON_INSTALL_DIR` pinned, `uv python install`
+/// downloads standalone CPython interpreters to `$HOME/.local/share/uv/python/`.
 ///
 /// Note this colocates with the *data directory*, not with a `--prefix` install root; see
 /// the `--prefix` caveat in `docs/manual-testing.md`.
 pub fn uv_command_env(paths: &AppPaths) -> Vec<(String, String)> {
-    uv_command_env_for_cache(uv_cache_source(paths))
+    uv_command_env_for(uv_cache_source(paths), uv_python_install_dir_source(paths))
 }
 
-fn uv_command_env_for_cache(cache: UvCacheSource) -> Vec<(String, String)> {
+fn uv_command_env_for(
+    cache: UvCacheSource,
+    python_install_dir: UvPythonInstallDirSource,
+) -> Vec<(String, String)> {
     vec![
         (
             "UV_HTTP_TIMEOUT".to_owned(),
@@ -166,6 +231,10 @@ fn uv_command_env_for_cache(cache: UvCacheSource) -> Vec<(String, String)> {
         (
             UV_CACHE_DIR_ENV.to_owned(),
             cache.path().to_string_lossy().into_owned(),
+        ),
+        (
+            UV_PYTHON_INSTALL_DIR_ENV.to_owned(),
+            python_install_dir.path().to_string_lossy().into_owned(),
         ),
     ]
 }
@@ -484,10 +553,23 @@ mod tests {
             .map(|(_, value)| value.clone())
     }
 
+    fn python_install_dir_in(env: &[(String, String)]) -> Option<String> {
+        env.iter()
+            .find(|(key, _)| key == UV_PYTHON_INSTALL_DIR_ENV)
+            .map(|(_, value)| value.clone())
+    }
+
+    fn managed_python_install_dir_source(paths: &AppPaths) -> UvPythonInstallDirSource {
+        resolve_uv_python_install_dir_source(paths, None, None)
+    }
+
     #[test]
     fn command_env_cache_dir_is_derived_from_data_dir() {
         let paths = test_paths("/managed/root");
-        let env = uv_command_env_for_cache(resolve_uv_cache_source(&paths, None, None));
+        let env = uv_command_env_for(
+            resolve_uv_cache_source(&paths, None, None),
+            managed_python_install_dir_source(&paths),
+        );
         assert_eq!(
             cache_dir_in(&env),
             Some(
@@ -510,7 +592,10 @@ mod tests {
             UvCacheSource::Inherited(PathBuf::from("/shared/uv-cache"))
         );
         assert_eq!(
-            cache_dir_in(&uv_command_env_for_cache(source)),
+            cache_dir_in(&uv_command_env_for(
+                source,
+                managed_python_install_dir_source(&paths)
+            )),
             Some("/shared/uv-cache".to_owned())
         );
     }
@@ -575,6 +660,107 @@ mod tests {
         assert!(
             source.path().starts_with("/mnt/big/rocm"),
             "cache {} should sit under the relocated data dir",
+            source.path().display()
+        );
+    }
+
+    #[test]
+    fn command_env_python_install_dir_is_derived_from_data_dir() {
+        let paths = test_paths("/managed/root");
+        let env = uv_command_env_for(
+            resolve_uv_cache_source(&paths, None, None),
+            resolve_uv_python_install_dir_source(&paths, None, None),
+        );
+        assert_eq!(
+            python_install_dir_in(&env),
+            Some(
+                managed_uv_python_install_dir(&paths.data_dir)
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn command_env_keeps_an_inherited_python_install_dir() {
+        let paths = test_paths("/managed/root");
+        let source = resolve_uv_python_install_dir_source(
+            &paths,
+            None,
+            Some(OsStr::new("/shared/uv-python")),
+        );
+        assert_eq!(
+            source,
+            UvPythonInstallDirSource::Inherited(PathBuf::from("/shared/uv-python"))
+        );
+        assert_eq!(
+            python_install_dir_in(&uv_command_env_for(
+                resolve_uv_cache_source(&paths, None, None),
+                source
+            )),
+            Some("/shared/uv-python".to_owned())
+        );
+    }
+
+    #[test]
+    fn namespaced_override_wins_over_an_ambient_uv_python_install_dir() {
+        let paths = test_paths("/managed/root");
+        let source = resolve_uv_python_install_dir_source(
+            &paths,
+            Some(OsStr::new("/chosen/uv-python")),
+            Some(OsStr::new("/ambient/uv-python")),
+        );
+        assert_eq!(
+            source,
+            UvPythonInstallDirSource::Override(PathBuf::from("/chosen/uv-python"))
+        );
+        assert!(source.is_override());
+    }
+
+    #[test]
+    fn blank_python_install_dir_overrides_fall_back_to_the_managed_location() {
+        let paths = test_paths("/managed/root");
+        let managed =
+            UvPythonInstallDirSource::Managed(managed_uv_python_install_dir(&paths.data_dir));
+        for blank in ["", "   ", "\t\n"] {
+            assert_eq!(
+                resolve_uv_python_install_dir_source(&paths, Some(OsStr::new(blank)), None),
+                managed,
+                "blank ROCM_CLI_UV_PYTHON_INSTALL_DIR {blank:?} should not count as an override"
+            );
+            assert_eq!(
+                resolve_uv_python_install_dir_source(&paths, None, Some(OsStr::new(blank))),
+                managed,
+                "blank UV_PYTHON_INSTALL_DIR {blank:?} should not count as an override"
+            );
+        }
+        assert!(!managed.is_override());
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed_from_a_python_install_dir_override() {
+        let paths = test_paths("/managed/root");
+        assert_eq!(
+            resolve_uv_python_install_dir_source(
+                &paths,
+                Some(OsStr::new("  /chosen/uv-python \n")),
+                None
+            ),
+            UvPythonInstallDirSource::Override(PathBuf::from("/chosen/uv-python"))
+        );
+    }
+
+    #[test]
+    fn managed_python_install_dir_tracks_rocm_cli_data_dir() {
+        let moved = test_paths("/home/user/.rocm").with_managed_root("/mnt/big/rocm", false);
+        let source = resolve_uv_python_install_dir_source(&moved, None, None);
+        assert_eq!(
+            source,
+            UvPythonInstallDirSource::Managed(managed_uv_python_install_dir(&moved.data_dir))
+        );
+        assert!(
+            source.path().starts_with("/mnt/big/rocm"),
+            "python install dir {} should sit under the relocated data dir",
             source.path().display()
         );
     }

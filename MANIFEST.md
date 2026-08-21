@@ -677,6 +677,13 @@ manages, on the order of several GB per SDK version installed. It is removed by
 `rocm uninstall` unless `--keep-data` is passed, and its location can be
 overridden with `ROCM_CLI_UV_CACHE_DIR`.
 
+When a managed Python interpreter is needed, `uv python install` downloads a
+standalone CPython build. That download is also kept in the managed data
+directory (at `<data-dir>/uv-python`) rather than `uv`'s own default of
+`$HOME/.local/share/uv/python/`. It is removed by `rocm uninstall` unless
+`--keep-data` is passed, and its location can be overridden with
+`ROCM_CLI_UV_PYTHON_INSTALL_DIR`.
+
 ### Lemonade Embeddable Runtime
 
 When `rocm engines install lemonade` is run, the CLI downloads a prebuilt

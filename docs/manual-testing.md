@@ -53,6 +53,13 @@ packages; set `ROCM_CLI_UV_CACHE_DIR` to a folder on the prefix filesystem to
 restore hardlinking. Making `--prefix` do this automatically is tracked
 separately.
 
+Likewise, the standalone Python interpreters that `uv python install`
+downloads do **not** follow `--prefix` either. They live at
+`<data-dir>\uv-python` rather than `uv`'s own default of
+`%USERPROFILE%\.local\share\uv\python\` (or `$HOME/.local/share/uv/python/` on
+Linux/macOS); override with `ROCM_CLI_UV_PYTHON_INSTALL_DIR` if you need it on
+the prefix filesystem instead.
+
 ## 1. First-Time Setup
 
 Start rocm-cli:

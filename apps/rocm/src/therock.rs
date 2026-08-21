@@ -15,7 +15,8 @@ use rocm_core::{
 };
 #[cfg(test)]
 use rocm_core::{
-    generate_rsa_signing_keypair, managed_uv_cache_dir, sign_rsa_pkcs1_sha256_signature,
+    generate_rsa_signing_keypair, managed_uv_cache_dir, managed_uv_python_install_dir,
+    sign_rsa_pkcs1_sha256_signature,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -4275,6 +4276,23 @@ mod tests {
             cache.display()
         );
         assert!(cache.starts_with(&paths.data_dir));
+    }
+
+    #[test]
+    fn uv_python_install_dir_does_not_follow_a_prefix_install_root() {
+        // Same documented non-goal as `uv_cache_does_not_follow_a_prefix_install_root`:
+        // `--prefix` moves install_root only, while the interpreters stay keyed off the
+        // data dir. Pins the claim `docs/manual-testing.md` makes about `uv-python`.
+        let (_root, paths) = test_paths("prefix-uv-python");
+        let prefix_root = PathBuf::from("/mnt/elsewhere/envs/my-env");
+        let install_dir = managed_uv_python_install_dir(&paths.data_dir);
+
+        assert!(
+            !install_dir.starts_with(&prefix_root),
+            "python install dir {} unexpectedly followed the --prefix root",
+            install_dir.display()
+        );
+        assert!(install_dir.starts_with(&paths.data_dir));
     }
 
     #[test]
