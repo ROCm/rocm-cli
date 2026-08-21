@@ -358,7 +358,12 @@ pub fn run_launcher(chat_mock: bool) -> Result<()> {
     let config = RocmCliConfig::load(&paths).unwrap_or_default();
     let theme = config.dashboard.tui.theme;
     loop {
-        match rocm_dash_tui::ui::launcher::run_launcher(&theme)? {
+        // Re-read the managed-service registry on each pass so the front door
+        // reflects models started (or stopped) during a prior flow. This is a
+        // cheap status-only file read — no telemetry daemon and no network
+        // readiness probes, so the front door stays instant.
+        let serving = launcher_serving_instances(&paths);
+        match rocm_dash_tui::ui::launcher::run_launcher(&theme, serving)? {
             None => return Ok(()),
             Some(choice) => match launcher_route(choice) {
                 LauncherRoute::Focused(focus) => run_focused(focus)?,
@@ -367,6 +372,28 @@ pub fn run_launcher(chat_mock: bool) -> Result<()> {
             },
         }
     }
+}
+
+/// Serving instances for the launcher front door, read from the managed-service
+/// registry (the same authority `rocm services` reads).
+///
+/// Deliberately cheap: a status-only registry read with no network readiness
+/// probes and no telemetry daemon, so the front door renders instantly.
+fn launcher_serving_instances(paths: &AppPaths) -> Vec<rocm_dash_core::metrics::Instance> {
+    use rocm_dash_daemon::registry::{discover_managed_services, load_service_records};
+    let records = load_service_records(&paths.services_dir());
+    discover_managed_services(&records)
+        .svcs
+        .into_iter()
+        .map(|svc| rocm_dash_core::metrics::Instance {
+            container_id: svc.container_id,
+            container_name: svc.container_name,
+            model_name: svc.model_name,
+            status: svc.status,
+            port: svc.port,
+            ..Default::default()
+        })
+        .collect()
 }
 
 /// Entry point for a focused launcher flow (Set up / Serve / Diagnose).
