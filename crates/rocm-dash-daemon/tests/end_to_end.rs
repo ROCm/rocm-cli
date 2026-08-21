@@ -319,3 +319,107 @@ async fn scrape_warning_persists_between_scrape_ticks() {
     handle.abort();
     let _ = handle.await;
 }
+
+/// Regression: a slow `amd-smi` startup must NOT delay managed-service discovery.
+///
+/// GPU detection (`amd-smi version` + the first `system_info()`) can take ~15s on
+/// real hardware. It used to run inline before the loop started, so the very
+/// first managed-service discovery + snapshot were blocked behind it and an
+/// already-running model appeared in the dashboard ~15-20s late (while
+/// `rocm services` already listed it). Detection now runs off the critical path,
+/// so a `ready` service surfaces on the first discovery tick while GPU detection
+/// is still in flight.
+///
+/// This asserts on ORDERING rather than wall-clock timing (delivery to an
+/// in-process subscriber can be starved while the fake subprocess runs, which
+/// would make a pure "arrived within Ns" check flaky): the instance MUST appear
+/// in a snapshot whose `gpu_system_info` is still `None`. Post-fix that window
+/// exists (many ~100ms ticks before the 4s fake detection lands). Pre-fix it
+/// cannot: the loop only starts ticking after detection completes, so the very
+/// first snapshot carrying the instance already has `gpu_system_info == Some`.
+///
+/// On hosts without `/dev/kfd` the fake is never invoked (detection
+/// short-circuits to "no GPU", leaving `gpu_system_info == None` forever), which
+/// is exactly the case where this bug cannot occur — the assertion still holds.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_gpu_detection_does_not_delay_service_discovery() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // A fake amd-smi that is deliberately slow: whatever the subcommand, sleep
+    // well past the discovery deadline, then emit trivially-valid JSON so both
+    // `version` and the `system_info` `--json` calls "succeed".
+    let fake = dir.path().join("amd-smi-slow");
+    std::fs::write(&fake, "#!/bin/sh\nsleep 4\necho '{}'\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // A ready managed vLLM service on disk — the authority `rocm services` reads.
+    std::fs::write(
+        dir.path().join("svc.json"),
+        r#"{"service_id":"vllm-ready-fast","engine":"vllm","model_ref":"m","canonical_model_id":"m",
+            "host":"127.0.0.1","port":11435,"endpoint_url":"http://127.0.0.1:11435/v1",
+            "mode":"managed","status":"ready","created_at_unix_ms":1}"#,
+    )
+    .unwrap();
+
+    // Roomy channel so buffered early snapshots are never dropped (Lagged) even
+    // if the subscriber is briefly starved while the fake subprocess runs.
+    let (tx, mut rx) = broadcast::channel::<Event>(512);
+    let services_dir = dir.path().to_path_buf();
+    let fake_bin = fake.into_os_string();
+    let handle = tokio::spawn(async move {
+        let opts = runner::RunnerOptions {
+            services_dir: Some(services_dir),
+            amd_smi_binary: Some(fake_bin),
+            disable_vllm_metrics: true,
+            ..Default::default()
+        };
+        runner::run_loop(
+            Some(Duration::from_millis(100)),
+            tx,
+            Arc::new(Mutex::new(SnapshotRing::new(512))),
+            Arc::new(Mutex::new(BenchRing::new(4))),
+            None,
+            opts,
+        )
+        .await;
+    });
+
+    // Walk snapshots in order. The FIRST snapshot that carries the instance
+    // decides: post-fix it has no GPU info yet (pass); pre-fix it already has
+    // GPU info because detection ran to completion before the loop started.
+    // The generous timeout covers detection + any subscriber starvation.
+    let mut surfaced_before_gpu = None;
+    let overall = Duration::from_secs(15);
+    loop {
+        let ev = match timeout(overall, rx.recv()).await {
+            Ok(Ok(ev)) => ev,
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Closed)) => break,
+            Err(_) => break,
+        };
+        if let Event::Snapshot(snap) = ev
+            && snap
+                .instances
+                .iter()
+                .any(|i| i.container_id == "vllm-ready-fast")
+        {
+            surfaced_before_gpu = Some(snap.gpu_system_info.is_none());
+            break;
+        }
+    }
+
+    handle.abort();
+    let _ = handle.await;
+
+    match surfaced_before_gpu {
+        Some(true) => {} // instance surfaced while GPU detection was still in flight
+        Some(false) => panic!(
+            "managed service only surfaced after GPU detection completed \
+             (the ~15-20s dashboard startup lag regressed)"
+        ),
+        None => panic!("ready managed service never surfaced in a snapshot"),
+    }
+}
