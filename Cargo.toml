@@ -46,7 +46,7 @@ rsa = "0.9"
 semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = { version = "0.10", features = ["oid"] }
+sha2 = { version = "0.11", features = ["oid"] }
 # `linux-tmpfs` makes tmpfs mounts visible to the free-space preflight, so a
 # cache or install root under a tmpfs `/tmp` (the Fedora and Arch default)
 # reports its real size instead of being invisible. `linux-netdevs` is
