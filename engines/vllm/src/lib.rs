@@ -1831,7 +1831,9 @@ fn startup_log_context(log_path: Option<&Path>) -> String {
 fn oom_utilization_hint(log_tail: &str) -> String {
     if log_tail_shows_oom(log_tail) {
         format!(
-            "\n\nDetected an out-of-memory failure. {}",
+            "\n\nDetected an out-of-memory failure. {}\n\
+             For conditional remediation, run `rocm diagnose --symptom \
+             'vllm: torch.OutOfMemoryError: HIP out of memory'`.",
             rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT
         )
     } else {
@@ -2241,6 +2243,10 @@ mod tests {
             "an OOM tail must surface the utilization workaround: {hint}"
         );
         assert!(hint.contains("--gpu <index>"));
+        assert!(
+            hint.contains("rocm diagnose --symptom"),
+            "an OOM tail must route the user to the conditional catalog entry: {hint}"
+        );
 
         // Detection is case-insensitive and also matches the spaced phrasing.
         assert!(log_tail_shows_oom("HIP OUT OF MEMORY"));
