@@ -742,6 +742,60 @@ async fn user_serves_absent_gpu_index(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// Serve bound to a public (non-loopback) interface without the public-bind
+/// opt-in. The bind-host validation is the first thing `serve` does — before any
+/// engine, model, or GPU work — so this refusal is observable with no GPU (mock
+/// lane). The model name is arbitrary; the refusal happens before it is resolved.
+#[when("the user serves a model bound to a public interface without allowing public binding")]
+async fn user_serves_public_bind_no_optin(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["serve", "some-model", "--host", "0.0.0.0"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Serve naming both a runtime and an environment. These are mutually exclusive
+/// selectors, rejected during argument parsing before any engine or GPU work — so
+/// the refusal is observable with no GPU (mock lane).
+#[when("the user serves a model selecting both a runtime and an environment")]
+async fn user_serves_runtime_and_env(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "serve",
+            "some-model",
+            "--runtime-id",
+            "therock-release:gfx942",
+            "--env-id",
+            "some-env",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the user is told to allow public binding first")]
+async fn assert_public_bind_message(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("--allow-public-bind"),
+        "expected guidance to pass --allow-public-bind, got:\n{output}"
+    );
+}
+
+#[then("the user is told the two selectors cannot be combined")]
+async fn assert_selector_conflict_message(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    // clap's conflict error names both flags; assert both appear so a reworded
+    // message that still identifies the conflict keeps passing.
+    assert!(
+        output.contains("--runtime-id") && output.contains("--env-id"),
+        "expected a conflict naming --runtime-id and --env-id, got:\n{output}"
+    );
+}
+
 #[when("the CLI reports the service as ready")]
 async fn when_cli_reports_ready(world: &mut E2eWorld) {
     // Read readiness from the CLI's own view (`services list`), not a direct
