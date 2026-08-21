@@ -15,6 +15,7 @@ use rocm_core::{AppPaths, interactive_terminal};
 
 use crate::{
     UninstallOptions, build_uninstall_plan, confirm_uninstall, remove_path, render_uninstall_plan,
+    stop_managed_services_before_uninstall, uninstall_removal_gate,
 };
 
 pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
@@ -34,6 +35,16 @@ pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
             println!("uninstall cancelled");
             return Ok(());
         }
+    }
+
+    // Stop managed servers before removing the binaries and service records that
+    // stop them. Uninstall used to report success while a publicly-bound,
+    // GPU-holding endpoint kept serving, then delete the tooling needed to stop
+    // it (EAI-8014). If any cannot be confirmed stopped, the gate aborts without
+    // removing anything so the recovery tooling stays in place.
+    let stop_report = stop_managed_services_before_uninstall(&paths)?;
+    if let Some(line) = uninstall_removal_gate(&stop_report)? {
+        println!("{line}");
     }
 
     for entry in &plan.actions {
