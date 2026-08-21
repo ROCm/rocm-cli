@@ -1829,7 +1829,7 @@ fn startup_log_context(log_path: Option<&Path>) -> String {
 /// with the `rocm` CLI's pre-launch low-VRAM note so both surfaces point the
 /// user at the same fix rather than drifting into different phrasing.
 fn oom_utilization_hint(log_tail: &str) -> String {
-    if log_tail_shows_oom(log_tail) {
+    if rocm_core::vllm_log_shows_oom(log_tail) {
         format!(
             "\n\nDetected an out-of-memory failure. {}",
             rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT
@@ -1837,13 +1837,6 @@ fn oom_utilization_hint(log_tail: &str) -> String {
     } else {
         String::new()
     }
-}
-
-/// Case-insensitive scan for the out-of-memory signatures vLLM/PyTorch emit on a
-/// HIP allocation failure (e.g. `torch.OutOfMemoryError: HIP out of memory`).
-fn log_tail_shows_oom(log_tail: &str) -> bool {
-    let lower = log_tail.to_ascii_lowercase();
-    lower.contains("out of memory") || lower.contains("outofmemory")
 }
 
 /// Polls the vLLM endpoint until it reports the model is loaded, or times out.
@@ -2234,7 +2227,7 @@ mod tests {
     fn oom_utilization_hint_fires_on_out_of_memory_log_tails() {
         // The exact PyTorch/HIP signature from the field report.
         let torch = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
-        assert!(log_tail_shows_oom(torch));
+        assert!(rocm_core::vllm_log_shows_oom(torch));
         let hint = oom_utilization_hint(torch);
         assert!(
             hint.contains("--gpu-memory-utilization"),
@@ -2243,17 +2236,30 @@ mod tests {
         assert!(hint.contains("--gpu <index>"));
 
         // Detection is case-insensitive and also matches the spaced phrasing.
-        assert!(log_tail_shows_oom("HIP OUT OF MEMORY"));
-        assert!(log_tail_shows_oom("RuntimeError: CUDA out of memory"));
+        assert!(rocm_core::vllm_log_shows_oom("HIP OUT OF MEMORY"));
+        assert!(rocm_core::vllm_log_shows_oom(
+            "RuntimeError: CUDA out of memory"
+        ));
     }
 
     #[test]
     fn oom_utilization_hint_stays_quiet_for_unrelated_failures() {
         let unrelated = "ValueError: model architecture 'FooForCausalLM' is not supported";
-        assert!(!log_tail_shows_oom(unrelated));
+        assert!(!rocm_core::vllm_log_shows_oom(unrelated));
         assert!(
             oom_utilization_hint(unrelated).is_empty(),
             "non-OOM failures must not carry a memory hint"
+        );
+
+        // vLLM's generic EngineCore wrapper is the terminal line for *any*
+        // startup crash (unsupported arch, shm size, TP misconfig, missing
+        // weights, OOM, ...); treating it as an OOM signature would misreport
+        // those unrelated failures as memory exhaustion.
+        let wrapper_only = "ERROR Engine core initialization failed";
+        assert!(!rocm_core::vllm_log_shows_oom(wrapper_only));
+        assert!(
+            oom_utilization_hint(wrapper_only).is_empty(),
+            "the generic EngineCore wrapper alone must not be treated as OOM"
         );
     }
 

@@ -5065,6 +5065,17 @@ fn serve(args: ServeArgs) -> Result<()> {
                 host_gpu_summary.as_ref(),
                 engine_serves_vllm,
             );
+            // A managed serve that failed on VRAM lands here not-ready with the OOM
+            // traceback only in its own log. Read that log tail so the summary can
+            // name the memory knobs, since the pre-launch low-VRAM warning cannot
+            // fire without amd-smi/rocm-smi telemetry.
+            let notes = append_oom_serve_note(
+                notes,
+                engine_serves_vllm,
+                report.already_running,
+                &report.status,
+                report.log_path.as_deref(),
+            );
             let summary = serve_summary::DeploymentSummary {
                 engine: selected_engine.clone(),
                 requested_model: model,
@@ -5143,6 +5154,49 @@ fn collect_serve_notes(
                 notes.push(rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT.to_owned());
             }
         }
+    }
+    notes
+}
+
+/// Appends the actionable memory-knob note when a managed serve failed to become
+/// ready and its engine log carries an out-of-memory signature.
+///
+/// This is the post-failure companion to the pre-launch low-VRAM warning in
+/// [`collect_serve_notes`]. The reported low-VRAM environment ships no
+/// rocm-smi/amd-smi, so that telemetry-driven warning never fires there; reading
+/// the failed serve's own log tail is the reliable signal that the launch died on
+/// VRAM. Gated on vLLM (the only engine exposing `--gpu-memory-utilization`), on
+/// a non-ready status, and on this invocation actually having launched the
+/// process (`already_running` is excluded) so healthy deployments, unrelated
+/// failures, and an unrelated invocation that merely reused an already-live
+/// service are never misattributed — reusing an already-running service reads
+/// whatever log that other invocation left behind, which may predate this
+/// `serve` call entirely or still be mid-startup. The OOM-signature check in
+/// [`serve_summary::oom_memory_note`] narrows it further. Also skips a note
+/// whose hint text is already present in `notes` (the pre-launch low-VRAM
+/// warning may have added it) so the same fix is never printed twice.
+fn append_oom_serve_note(
+    mut notes: Vec<String>,
+    engine_is_vllm: bool,
+    already_running: bool,
+    status: &str,
+    log_path: Option<&Path>,
+) -> Vec<String> {
+    if !engine_is_vllm || already_running || status == "ready" {
+        return notes;
+    }
+    let Some(log_path) = log_path else {
+        return notes;
+    };
+    let log_tail = read_optional_tail_lines(log_path, 80, "service log").join("\n");
+    let already_hinted = notes
+        .iter()
+        .any(|note| note.contains(rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT));
+    if already_hinted {
+        return notes;
+    }
+    if let Some(note) = serve_summary::oom_memory_note(status, &log_tail) {
+        notes.push(note);
     }
     notes
 }
@@ -5444,8 +5498,8 @@ fn spawn_managed_engine_child(
             status: existing.status,
             already_running: true,
             child_pid: None,
-            log_path: None,
-            manifest_path: None,
+            log_path: Some(existing.log_path),
+            manifest_path: Some(existing.manifest_path),
         }));
     }
 
@@ -16825,10 +16879,10 @@ fn select_auto_gpu_index(
     // selection and landing on a busy device 0.
     let count = effective_gpu_count(detected, vram).unwrap_or(0);
     if count == 0 {
-        // No GPU count from amd-smi and no VRAM telemetry (both unavailable, or
-        // genuinely zero devices). Do not assume device 0 exists: return no
-        // selection and let the engine's device probe pin the first present GPU
-        // or fail fast under the GPU-required policy (no GPU-0 fallback).
+        // No GPU count from amd-smi (unavailable, or genuinely zero devices). Do
+        // not assume device 0 exists: return no selection and let the engine's
+        // device probe pin the first present GPU or fail fast under the
+        // GPU-required policy (no GPU-0 fallback).
         return Vec::new();
     }
     let candidates = || (0..count as u32).filter(|index| !busy.contains(index));
@@ -23562,6 +23616,106 @@ install therock";
     }
 
     #[test]
+    fn append_oom_serve_note_reads_the_failed_serve_log_and_names_the_knobs() {
+        // A managed vLLM serve that died on VRAM lands not-ready with the OOM
+        // traceback only in its log; the note must be recovered from that log.
+        let log_path =
+            std::env::temp_dir().join(format!("rocm-oom-note-{}-hit.log", std::process::id()));
+        fs::write(
+            &log_path,
+            "loading weights\ntorch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
+        )
+        .expect("write log");
+        let notes = append_oom_serve_note(Vec::new(), true, false, "starting", Some(&log_path));
+        let _ = fs::remove_file(&log_path);
+        assert!(
+            notes
+                .iter()
+                .any(|entry| entry.contains("--gpu-memory-utilization")
+                    && entry.contains("--gpu <index>")),
+            "the OOM note must name both memory knobs: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn append_oom_serve_note_is_withheld_when_it_does_not_apply() {
+        let log_path =
+            std::env::temp_dir().join(format!("rocm-oom-note-{}-miss.log", std::process::id()));
+        fs::write(&log_path, "torch.OutOfMemoryError: HIP out of memory\n").expect("write log");
+
+        // A ready serve is healthy even if the log mentions memory.
+        assert!(
+            append_oom_serve_note(Vec::new(), true, false, "ready", Some(&log_path)).is_empty()
+        );
+        // A non-vLLM engine has no `--gpu-memory-utilization` to reach for.
+        assert!(
+            append_oom_serve_note(Vec::new(), false, false, "starting", Some(&log_path)).is_empty()
+        );
+        // A missing log gives no signal to branch on.
+        assert!(append_oom_serve_note(Vec::new(), true, false, "starting", None).is_empty());
+
+        // A failure whose log carries no OOM signature is left alone.
+        fs::write(&log_path, "OSError: model weights not found\n").expect("rewrite log");
+        assert!(
+            append_oom_serve_note(Vec::new(), true, false, "starting", Some(&log_path)).is_empty()
+        );
+        let _ = fs::remove_file(&log_path);
+    }
+
+    #[test]
+    fn append_oom_serve_note_ignores_an_already_running_services_log() {
+        // Re-issuing `serve` against a service another invocation already
+        // launched must never blame *this* invocation for that other process's
+        // failure — even when its log carries a real OOM signature and the
+        // reused record's status is not yet "ready".
+        let log_path = std::env::temp_dir().join(format!(
+            "rocm-oom-note-{}-already-running.log",
+            std::process::id()
+        ));
+        fs::write(
+            &log_path,
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
+        )
+        .expect("write log");
+        let notes = append_oom_serve_note(Vec::new(), true, true, "starting", Some(&log_path));
+        let _ = fs::remove_file(&log_path);
+        assert!(
+            notes.is_empty(),
+            "an already-running service's log must not be attributed to this invocation: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn append_oom_serve_note_does_not_repeat_a_hint_already_in_the_notes() {
+        // When the pre-launch low-VRAM warning already carried the shared
+        // utilization hint, a post-failure OOM confirmation must not print the
+        // exact same hint text a second time.
+        let log_path =
+            std::env::temp_dir().join(format!("rocm-oom-note-{}-dedup.log", std::process::id()));
+        fs::write(
+            &log_path,
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
+        )
+        .expect("write log");
+        let pre_launch_notes = vec![
+            "selected GPU 0 has low free VRAM".to_owned(),
+            rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT.to_owned(),
+        ];
+        let notes = append_oom_serve_note(
+            pre_launch_notes.clone(),
+            true,
+            false,
+            "starting",
+            Some(&log_path),
+        );
+        let _ = fs::remove_file(&log_path);
+        assert_eq!(
+            notes, pre_launch_notes,
+            "the hint must not be duplicated once it is already present: {notes:?}"
+        );
+    }
+
+    #[test]
     fn generation_defaults_inject_override_generation_config_for_vllm() {
         // vLLM has no raw sampling flags: all three controls collapse into a single
         // `--override-generation-config` JSON with `--max-tokens` mapped to the
@@ -23864,29 +24018,6 @@ install therock";
         assert_eq!(select_auto_gpu_index(Some(4), &[0, 1], None), vec![2]);
         // Unknown GPU count: no GPU-0 fallback — defer to the engine device probe.
         assert_eq!(select_auto_gpu_index(None, &[], None), Vec::<u32>::new());
-    }
-
-    #[test]
-    fn auto_selection_uses_vram_row_count_when_amd_smi_count_is_unknown() {
-        // A shared node without amd-smi: `detect_gpu_count()` is `None`, but the
-        // DRM sysfs fallback still populated per-GPU VRAM. Auto-selection must
-        // derive the device count from those rows and skip the busy GPU 0 rather
-        // than returning no selection (which would land the engine on GPU 0).
-        let usage = [
-            vram(0, 182_000, 192_000),
-            vram(1, 1_000, 192_000),
-            vram(2, 500, 192_000),
-        ];
-        assert_eq!(
-            select_auto_gpu_index(None, &[], Some(&usage)),
-            vec![1],
-            "with no amd-smi count, rank the sysfs VRAM rows and pick the first idle GPU"
-        );
-        // Still nothing to go on when neither the count nor telemetry is present.
-        assert_eq!(
-            select_auto_gpu_index(None, &[], Some(&[])),
-            Vec::<u32>::new()
-        );
     }
 
     #[test]

@@ -9,8 +9,12 @@ use std::time::{Duration, Instant};
 use cucumber::{given, then, when};
 
 use crate::E2eWorld;
-use e2e_cucumber::mock_server::MockServer;
+use crate::e2e::tui_driver::TuiSession;
+use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use e2e_cucumber::serve_log::service_log_tail;
+
+const OOM_GUIDANCE_MODEL: &str = "e2e/oom-model";
+const INTERACTIVE_SUMMARY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long to wait for a freshly served model's endpoint to become ready.
 ///
@@ -742,6 +746,56 @@ async fn user_serves_absent_gpu_index(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+#[given("a live managed vLLM serve has an OOM startup log")]
+async fn plant_oom_managed_serve(world: &mut E2eWorld) {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let services = root.path().join("data").join("services");
+    write_service_record_with(
+        &services,
+        OOM_GUIDANCE_MODEL,
+        65_534,
+        ServiceRecordOptions {
+            status: "starting",
+            startup_phase: Some("initializing"),
+            supervisor_pid: std::process::id(),
+            engine_pid: Some(std::process::id()),
+        },
+    );
+    // A real allocator OOM signature (not vLLM's generic EngineCore wrapper,
+    // which is deliberately excluded from detection — see EAI-8059 review). This
+    // log belongs to whatever process is already live, not to the invocation
+    // under test in this scenario.
+    std::fs::write(
+        services.join("e2e-mock.log"),
+        "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
+    )
+    .expect("failed to plant the OOM startup log");
+}
+
+#[when("the user opens its interactive serve summary")]
+async fn open_oom_serve_summary(world: &mut E2eWorld) {
+    // The synthetic env selection satisfies resolution without installing a
+    // runtime. The planted live service is reused rather than launched, so the
+    // scenario allocates no GPU memory despite running on the GPU lane.
+    let mut session = TuiSession::spawn(
+        world,
+        &[
+            "serve",
+            OOM_GUIDANCE_MODEL,
+            "--engine",
+            "vllm",
+            "--env-id",
+            "e2e-oom",
+        ],
+    )
+    .unwrap_or_else(|error| panic!("failed to open interactive serve summary: {error}"));
+    session
+        .wait_for_exit(INTERACTIVE_SUMMARY_TIMEOUT)
+        .await
+        .unwrap_or_else(|error| panic!("interactive serve summary failed: {error}"));
+    world.tui = Some(session);
+}
+
 #[when("the CLI reports the service as ready")]
 async fn when_cli_reports_ready(world: &mut E2eWorld) {
     // Read readiness from the CLI's own view (`services list`), not a direct
@@ -814,6 +868,24 @@ async fn assert_absent_index_message(world: &mut E2eWorld) {
             && (output.contains("out of range") || output.contains("not available")),
         "expected the absent GPU index to be reported unavailable, got:\n{}",
         serve_output(world)
+    );
+}
+
+#[then("the deployment summary does not blame this invocation for GPU memory")]
+async fn assert_no_oom_memory_guidance(world: &mut E2eWorld) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no interactive serve summary")
+        .screen_text();
+    assert!(
+        screen.contains("already running"),
+        "expected the summary to reflect the reused live service:\n{screen}"
+    );
+    assert!(
+        !screen.contains("ran out of GPU memory"),
+        "reusing an already-running service must not blame this invocation for \
+         another process's OOM:\n{screen}"
     );
 }
 
