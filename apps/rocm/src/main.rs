@@ -4849,13 +4849,25 @@ fn serve(args: ServeArgs) -> Result<()> {
     // surface the explicit `--gpu` as ignored rather than printing a device the
     // server will not use.
     let cpu_only = matches!(device_policy, DevicePolicy::CpuOnly);
+    // Physical AMD GPU ordinals still usable after the active visibility mask
+    // (`HIP_VISIBLE_DEVICES`, then `ROCR_VISIBLE_DEVICES`) is applied. `None` means
+    // availability could not be probed on this platform (e.g. WSL or a non-Linux
+    // target), in which case selection stays permissive and defers device
+    // validation to the engine. Computed once and reused for the fail-fast check
+    // below and for mask-aware GPU selection, so serve never auto-selects — or
+    // accepts an explicit `--gpu` for — a device the mask has hidden.
+    let visible_gpu_indices = if cpu_only {
+        None
+    } else {
+        rocm_core::usable_amd_gpu_indices()
+    };
     // Fail fast under a GPU-required policy when the host has no usable AMD GPU,
     // BEFORE preparing or launching any engine (no wasted engine download, and an
     // actionable message instead of a late engine crash). The engine enforces the
     // same rule as a backstop. Skipped for cpu_only; permissive when availability
     // cannot be probed on this platform (probe returns `None`).
     if !cpu_only
-        && let Some(usable) = rocm_core::usable_amd_gpu_indices()
+        && let Some(usable) = visible_gpu_indices.as_deref()
         && usable.is_empty()
     {
         bail!(
@@ -4871,10 +4883,26 @@ fn serve(args: ServeArgs) -> Result<()> {
     // `ROCR_VISIBLE_DEVICES`/partitioning is in play, so warn at serve time.
     let rocr_visible_devices_set = std::env::var_os("ROCR_VISIBLE_DEVICES").is_some();
     let gpu_vram = if cpu_only { None } else { gpu_vram_usage() };
+    // Serialize GPU auto-selection with the managed-service claim: the busy-GPU
+    // read inside `resolve_gpu_indices` and the claiming record write inside
+    // `spawn_managed_engine_child` must be atomic, or two concurrent
+    // `rocm serve --gpu auto` can both read the same GPU as free and launch on
+    // it. The guard is acquired here and handed to the launch path; it is held
+    // across GPU selection, the serve-plan rendering below, and the claiming
+    // record write, then dropped once the record is persisted (before the
+    // readiness wait) so unrelated serves are not blocked. Explicit-index and
+    // CPU-only launches take it too, so the select-then-claim ordering is uniform.
+    let launch_lock = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?;
     let gpu_indices = if cpu_only {
         Vec::new()
     } else {
-        resolve_gpu_indices(&paths, &gpu_selection, gpu_vram.as_deref())?
+        resolve_gpu_indices(
+            &paths,
+            &gpu_selection,
+            detect_gpu_count(),
+            visible_gpu_indices.as_deref(),
+            gpu_vram.as_deref(),
+        )?
     };
     let resolved_selection = resolve_engine_selection(
         &config,
@@ -4963,8 +4991,9 @@ fn serve(args: ServeArgs) -> Result<()> {
             }
             if rocr_visible_devices_set {
                 println!(
-                    "  warning: ROCR_VISIBLE_DEVICES is set; --gpu selects by the amd-smi ordinal but \
-                     is applied via HIP_VISIBLE_DEVICES, so the chosen device may differ. Verify the \
+                    "  warning: ROCR_VISIBLE_DEVICES is set; the selected amd-smi ordinal is exported \
+                     via HIP_VISIBLE_DEVICES, which the runtime interprets relative to the \
+                     ROCR-visible set, so the device the engine binds may differ. Verify the \
                      selected GPU or unset ROCR_VISIBLE_DEVICES."
                 );
             }
@@ -5014,6 +5043,7 @@ fn serve(args: ServeArgs) -> Result<()> {
             managed_env_id.as_deref(),
             resolve.engine_recipe.as_ref(),
             endpoint_auth.as_deref(),
+            launch_lock,
             &mut |_elapsed| spinner.tick(),
         )?;
         ensure_background_helper_running_quiet(summary_mode)?;
@@ -5092,6 +5122,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         resolved_selection.runtime_id.as_deref(),
         resolved_selection.env_id.as_deref(),
         endpoint_auth.as_deref(),
+        launch_lock,
     )
 }
 
@@ -5122,9 +5153,10 @@ fn collect_serve_notes(
     } else {
         if rocr_visible_devices_set {
             notes.push(
-                "ROCR_VISIBLE_DEVICES is set; --gpu selects by the amd-smi ordinal but is applied \
-                 via HIP_VISIBLE_DEVICES, so the chosen device may differ. Verify the selected GPU \
-                 or unset ROCR_VISIBLE_DEVICES."
+                "ROCR_VISIBLE_DEVICES is set; the selected amd-smi ordinal is exported via \
+                 HIP_VISIBLE_DEVICES, which the runtime interprets relative to the ROCR-visible \
+                 set, so the device the engine binds may differ. Verify the selected GPU or unset \
+                 ROCR_VISIBLE_DEVICES."
                     .to_owned(),
             );
         }
@@ -5561,6 +5593,7 @@ fn start_managed_service(
     env_id: Option<&str>,
     engine_recipe: Option<&EngineRecipeHint>,
     endpoint_api_key: Option<&str>,
+    launch_lock: rocm_core::FileLock,
     on_wait_tick: &mut dyn FnMut(Duration),
 ) -> Result<ManagedLaunchReport> {
     let paths = AppPaths::discover()?;
@@ -5581,6 +5614,11 @@ fn start_managed_service(
         ManagedSpawn::AlreadyRunning(report) => return Ok(report),
         ManagedSpawn::Spawned { record, child_pid } => (*record, child_pid),
     };
+    // The claiming service record is now persisted, so the selected GPU is
+    // visible to any concurrent auto-selection. Release the launch lock before
+    // the readiness wait below, which can block for many seconds — holding it
+    // that long would needlessly serialize unrelated serves.
+    drop(launch_lock);
 
     #[cfg(windows)]
     thread::sleep(Duration::from_millis(200));
@@ -5707,6 +5745,17 @@ pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> 
         return Ok(());
     }
 
+    // The check above and the spawn below are a TOCTOU window: two concurrent
+    // callers (e.g. two `rocm serve`) can both read "not running" and each spawn
+    // a daemon. Serialize the decision on a lock file and re-check under it — the
+    // first holder spawns, later holders observe the now-running daemon and
+    // return without spawning. The unlocked pre-check above keeps the common
+    // already-running case lock-free.
+    let _autostart_lock = rocm_core::FileLock::acquire(paths.automation_autostart_lock_path())?;
+    if background_helper_already_running(&paths)? {
+        return Ok(());
+    }
+
     let exe = managed_service_launcher_path()
         .context("failed to resolve current rocm executable path")?;
     let args = vec!["daemon".to_owned()];
@@ -5765,6 +5814,7 @@ fn run_attached_service(
     runtime_id: Option<&str>,
     env_id: Option<&str>,
     endpoint_api_key: Option<&str>,
+    launch_lock: rocm_core::FileLock,
 ) -> Result<()> {
     let paths = AppPaths::discover()?;
 
@@ -5782,6 +5832,10 @@ fn run_attached_service(
         env_id,
         resolve.engine_recipe.as_ref(),
     )?;
+    // The claiming record is persisted (or an existing service was found), so the
+    // selected GPU is now visible to concurrent auto-selection. Release the launch
+    // lock before streaming logs, which blocks for the whole attached session.
+    drop(launch_lock);
 
     let (service_id, log_path, child_pid) = match spawn {
         // A server for this engine+model is already live. Don't fight it for the
@@ -16771,29 +16825,62 @@ fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
 /// when `ROCR_VISIBLE_DEVICES`, CPX/partition modes, or non-default device
 /// enumeration are in play. Validate on multi-GPU hardware before relying on a
 /// specific `--gpu <index>` mapping in those configurations.
+///
+/// Selection is mask-aware: `visible` is the set of physical ordinals still
+/// usable after the active visibility mask (see [`rocm_core::usable_amd_gpu_indices`]).
+/// Auto-selection is restricted to it and an explicit `--gpu` outside it is
+/// rejected early, so serve never targets a masked-out device. `None` (an
+/// unprobeable host) keeps the previous mask-unaware behavior.
 fn resolve_gpu_indices(
     paths: &AppPaths,
     selection: &GpuSelection,
+    detected: Option<usize>,
+    visible: Option<&[u32]>,
     vram: Option<&[GpuVramUsage]>,
 ) -> Result<Vec<u32>> {
-    let detected = detect_gpu_count();
     match selection {
-        GpuSelection::Index(index) => validate_pinned_gpu_index(*index, detected),
-        GpuSelection::Auto => Ok(auto_select_gpu_indices(paths, detected, vram)),
+        GpuSelection::Index(index) => validate_pinned_gpu_index(*index, detected, visible),
+        GpuSelection::Auto => Ok(auto_select_gpu_indices(paths, detected, visible, vram)),
     }
 }
 
-/// Validate an explicit `--gpu <index>` against the detected GPU count and
-/// return the single pinned ordinal. Errors when the index is out of range for
-/// a known device count; an unknown count (amd-smi unavailable) is allowed
-/// through so serving can still proceed where GPU probing is not possible.
-fn validate_pinned_gpu_index(index: u32, detected: Option<usize>) -> Result<Vec<u32>> {
+/// Validate an explicit `--gpu <index>` against the detected GPU count and the
+/// active visibility mask, returning the single pinned ordinal. Errors when the
+/// index is out of range for a known device count, or when the active mask has
+/// hidden it. An unknown count / unprobeable host (`detected` / `visible` are
+/// `None`) is allowed through so serving can still proceed where GPU probing is
+/// not possible.
+fn validate_pinned_gpu_index(
+    index: u32,
+    detected: Option<usize>,
+    visible: Option<&[u32]>,
+) -> Result<Vec<u32>> {
     if let Some(count) = detected
         && (index as usize) >= count
     {
         bail!(
             "--gpu index {index} is out of range; {count} GPU(s) detected (valid indices 0..{})",
             count - 1
+        );
+    }
+    // Reject a device the active visibility mask has hidden, so the failure is an
+    // early, actionable CLI error rather than a late engine "not available"
+    // reject. Permissive when the host is unprobeable (`visible` is `None`); an
+    // all-masked host is already caught by the no-usable-GPU fail-fast in
+    // `serve()`, so an empty `visible` here means "could not enumerate" and is
+    // left to the count check above.
+    if let Some(visible) = visible
+        && !visible.is_empty()
+        && !visible.contains(&index)
+    {
+        let list = visible
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "--gpu index {index} is not available under the active visibility mask \
+             (HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES); usable GPU indices: [{list}]"
         );
     }
     Ok(vec![index])
@@ -16837,36 +16924,54 @@ const AUTO_FREE_VRAM_FRACTION: f64 = 0.90;
 /// assuming device 0 — the engine's device probe then pins the first present GPU
 /// or fails fast under the GPU-required policy.
 ///
-/// Selection reads service state without holding a lock, so two near-concurrent
-/// `--gpu auto` launches can race onto the same idle GPU. The VRAM-occupancy
-/// fallback and the start-time low-memory warning keep this from silently
-/// overcommitting in practice; pass an explicit `--gpu <index>` to avoid the
-/// race entirely.
+/// Selection is mask-aware: candidates are restricted to `visible`, the physical
+/// ordinals still usable after the active visibility mask (see
+/// [`rocm_core::usable_amd_gpu_indices`]), so auto-select never lands on a
+/// masked-out GPU the engine would then reject. `None` (an unprobeable host)
+/// leaves the detected range unrestricted, as before.
+///
+/// This reads service state (`busy_gpu_indices`) but does not lock on its own.
+/// Concurrency safety is the caller's responsibility: `serve()` holds the
+/// managed-launch lock (`AppPaths::managed_launch_lock_path`) across this
+/// selection and the claiming record write, so two near-concurrent `--gpu auto`
+/// launches are serialized and cannot land on the same idle GPU. Callers that
+/// select outside that lock get only best-effort de-confliction from the
+/// VRAM-occupancy fallback and the start-time low-memory warning.
 fn auto_select_gpu_indices(
     paths: &AppPaths,
     detected: Option<usize>,
+    visible: Option<&[u32]>,
     vram: Option<&[GpuVramUsage]>,
 ) -> Vec<u32> {
     let busy = busy_gpu_indices(paths);
-    select_auto_gpu_index(detected, &busy, vram)
+    select_auto_gpu_index(detected, visible, &busy, vram)
 }
 
 /// Pure auto-selection used by [`auto_select_gpu_indices`], split out so the
 /// preference order can be unit-tested without amd-smi or service state.
 fn select_auto_gpu_index(
     detected: Option<usize>,
+    visible: Option<&[u32]>,
     busy: &[u32],
     vram: Option<&[GpuVramUsage]>,
 ) -> Vec<u32> {
+    // Candidate physical ordinals: the detected device range, narrowed to those
+    // still visible under the active mask so auto-select never targets a
+    // masked-out GPU. When the host is unprobeable (`visible` is `None`) the
+    // range is used unrestricted (mask-unaware, as before).
     let count = detected.unwrap_or(0);
-    if count == 0 {
-        // No GPU count from amd-smi (unavailable, or genuinely zero devices). Do
-        // not assume device 0 exists: return no selection and let the engine's
-        // device probe pin the first present GPU or fail fast under the
-        // GPU-required policy (no GPU-0 fallback).
+    let mut all: Vec<u32> = (0..count as u32).collect();
+    if let Some(visible) = visible {
+        all.retain(|index| visible.contains(index));
+    }
+    if all.is_empty() {
+        // No visible device (amd-smi unavailable, genuinely zero devices, or every
+        // detected device masked out). Do not assume device 0 exists: return no
+        // selection and let the engine's device probe pin the first present GPU or
+        // fail fast under the GPU-required policy (no GPU-0 fallback).
         return Vec::new();
     }
-    let candidates = || (0..count as u32).filter(|index| !busy.contains(index));
+    let candidates = || all.iter().copied().filter(|index| !busy.contains(index));
     let usage_for = |index: u32| vram.and_then(|rows| rows.iter().find(|row| row.index == index));
 
     if vram.is_some() {
@@ -16898,10 +17003,12 @@ fn select_auto_gpu_index(
     if let Some(index) = candidates().next() {
         return vec![index];
     }
-    // Every detected GPU is pinned by a running service. We still return GPU 0
-    // (no CPU fallback is ever used); the caller surfaces a low-memory warning
-    // so the user can free a device or pick another `--gpu`.
-    vec![0]
+    // Every visible GPU is pinned by a running service. Return the lowest visible
+    // ordinal (no CPU fallback is ever used); the caller surfaces a low-memory
+    // warning so the user can free a device or pick another `--gpu`. Using the
+    // lowest *visible* ordinal rather than a hardcoded 0 keeps this correct when
+    // device 0 is masked out.
+    vec![all[0]]
 }
 
 /// Best-effort per-GPU VRAM occupancy via `amd-smi metric --json`. Returns
@@ -23677,7 +23784,7 @@ install therock";
             vram(2, 500, 192_000),
         ];
         assert_eq!(
-            select_auto_gpu_index(Some(3), &[], Some(&usage)),
+            select_auto_gpu_index(Some(3), None, &[], Some(&usage)),
             vec![1],
             "should skip the busy GPU 0 and pick the lowest idle GPU"
         );
@@ -23693,7 +23800,7 @@ install therock";
             vram(2, 60_000, 192_000),
         ];
         assert_eq!(
-            select_auto_gpu_index(Some(3), &[0], Some(&usage)),
+            select_auto_gpu_index(Some(3), None, &[0], Some(&usage)),
             vec![2],
             "with no idle GPU, pick the non-busy GPU with the most free VRAM"
         );
@@ -23707,7 +23814,7 @@ install therock";
         // but far more free memory. Auto-selection must prefer GPU 1.
         let usage = [vram(0, 6_000, 24_000), vram(1, 100_000, 192_000)];
         assert_eq!(
-            select_auto_gpu_index(Some(2), &[], Some(&usage)),
+            select_auto_gpu_index(Some(2), None, &[], Some(&usage)),
             vec![1],
             "pass 2 should rank by absolute free VRAM, not free percentage"
         );
@@ -23715,26 +23822,94 @@ install therock";
 
     #[test]
     fn auto_selection_falls_back_to_first_non_busy_without_vram() {
-        assert_eq!(select_auto_gpu_index(Some(4), &[0, 1], None), vec![2]);
+        assert_eq!(select_auto_gpu_index(Some(4), None, &[0, 1], None), vec![2]);
         // Unknown GPU count: no GPU-0 fallback — defer to the engine device probe.
-        assert_eq!(select_auto_gpu_index(None, &[], None), Vec::<u32>::new());
+        assert_eq!(
+            select_auto_gpu_index(None, None, &[], None),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn auto_selection_restricts_candidates_to_visible_set() {
+        // GPUs 0 and 1 are masked out (only 2 and 3 visible). With no VRAM data
+        // auto-select must pick the lowest *visible* ordinal, never a hidden one.
+        assert_eq!(
+            select_auto_gpu_index(Some(4), Some(&[2, 3]), &[], None),
+            vec![2],
+            "selection must stay inside the visibility mask"
+        );
+        // The lowest visible GPU (2) is busy, so fall through to the next visible.
+        assert_eq!(
+            select_auto_gpu_index(Some(4), Some(&[2, 3]), &[2], None),
+            vec![3]
+        );
+    }
+
+    #[test]
+    fn auto_selection_all_visible_busy_falls_back_to_lowest_visible_not_zero() {
+        // Every visible GPU is pinned; the fallback must be the lowest *visible*
+        // ordinal (2), not a hardcoded 0 that the mask has hidden.
+        assert_eq!(
+            select_auto_gpu_index(Some(4), Some(&[2, 3]), &[2, 3], None),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn auto_selection_returns_none_when_every_device_masked_out() {
+        // An empty visible set means no candidate survives the mask: return no
+        // selection rather than assuming device 0.
+        assert_eq!(
+            select_auto_gpu_index(Some(4), Some(&[]), &[], None),
+            Vec::<u32>::new()
+        );
     }
 
     #[test]
     fn validate_pinned_gpu_index_rejects_out_of_range() {
         // Index equal to or beyond the detected count is rejected.
-        let error = validate_pinned_gpu_index(4, Some(4)).expect_err("index 4 is out of range");
+        let error =
+            validate_pinned_gpu_index(4, Some(4), None).expect_err("index 4 is out of range");
         assert!(error.to_string().contains("out of range"));
-        assert!(validate_pinned_gpu_index(9, Some(2)).is_err());
+        assert!(validate_pinned_gpu_index(9, Some(2), None).is_err());
     }
 
     #[test]
     fn validate_pinned_gpu_index_accepts_in_range_or_unknown_count() {
         // In-range index pins exactly that ordinal.
-        assert_eq!(validate_pinned_gpu_index(0, Some(1)).unwrap(), vec![0]);
-        assert_eq!(validate_pinned_gpu_index(3, Some(4)).unwrap(), vec![3]);
+        assert_eq!(
+            validate_pinned_gpu_index(0, Some(1), None).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            validate_pinned_gpu_index(3, Some(4), None).unwrap(),
+            vec![3]
+        );
         // Unknown count (amd-smi unavailable) is allowed through unvalidated.
-        assert_eq!(validate_pinned_gpu_index(7, None).unwrap(), vec![7]);
+        assert_eq!(validate_pinned_gpu_index(7, None, None).unwrap(), vec![7]);
+    }
+
+    #[test]
+    fn validate_pinned_gpu_index_rejects_masked_out_device() {
+        // Index is within the detected count but hidden by the active mask: reject
+        // early with the usable set, rather than deferring to a late engine error.
+        let error = validate_pinned_gpu_index(0, Some(4), Some(&[2, 3]))
+            .expect_err("masked-out device must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("not available under the active visibility mask"));
+        assert!(message.contains("[2, 3]"));
+        // A visible index still pins exactly that ordinal.
+        assert_eq!(
+            validate_pinned_gpu_index(2, Some(4), Some(&[2, 3])).unwrap(),
+            vec![2]
+        );
+        // An empty visible set means "could not enumerate", so it is not used to
+        // reject; the count check governs instead.
+        assert_eq!(
+            validate_pinned_gpu_index(1, Some(4), Some(&[])).unwrap(),
+            vec![1]
+        );
     }
 
     #[test]
@@ -26769,6 +26944,86 @@ ID_LIKE="suse opensuse"
             !background_helper_already_running(&paths).expect("not-running flag ⇒ ok"),
             "running=false ⇒ not running even with a live pid"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Persist a live-looking managed record claiming `gpu` — the same shape a
+    /// real launch writes, with the current process id as the supervisor so the
+    /// liveness refresh in `load_managed_services` keeps it "starting" (and thus
+    /// counted by `busy_gpu_indices`).
+    fn write_claiming_record(paths: &AppPaths, service_id: &str, port: u16, gpu: &[u32]) {
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            service_id,
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            port,
+            "managed",
+            std::process::id(),
+            Some("therock-release".to_owned()),
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        record.status = "starting".to_owned();
+        record.gpu_indices = gpu.to_vec();
+        record.write().expect("write claiming record");
+    }
+
+    #[test]
+    fn launch_lock_makes_gpu_select_and_claim_atomic() {
+        // Regression for the serve read-select-launch race: the busy-GPU read in
+        // `resolve_gpu_indices` and the claiming record write must happen under
+        // one lock, or two concurrent `--gpu auto` serves both read the same GPU
+        // as free and land on it. Each thread drives the exact entry point
+        // `serve()` uses (`resolve_gpu_indices` with `GpuSelection::Auto`) under
+        // the same launch-lock path, so the test tracks the production
+        // select-then-claim sequence rather than a hand-rolled copy; the lock must
+        // force the two onto DISTINCT GPUs.
+        let (root, paths) = test_paths("launch-lock-atomic-claim");
+        paths.ensure().expect("prepare paths");
+        let detected = Some(2_usize);
+
+        let barrier = std::sync::Barrier::new(2);
+        let selections = std::thread::scope(|scope| {
+            let handles: Vec<_> = [("svc-race-a", 21001_u16), ("svc-race-b", 21002_u16)]
+                .into_iter()
+                .map(|(service_id, port)| {
+                    let paths = &paths;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let _lock = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())
+                            .expect("acquire launch lock");
+                        // Same call `serve()` makes under the launch lock. `None`
+                        // visibility keeps selection mask-unaware for the test host.
+                        let gpu =
+                            resolve_gpu_indices(paths, &GpuSelection::Auto, detected, None, None)
+                                .expect("auto GPU selection");
+                        // Widen the select→claim window so an unlocked variant
+                        // would deterministically double-book GPU 0; under the
+                        // lock the second thread cannot enter until we claim.
+                        std::thread::sleep(Duration::from_millis(50));
+                        write_claiming_record(paths, service_id, port, &gpu);
+                        gpu
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("selection thread joins"))
+                .collect::<Vec<_>>()
+        });
+
+        let mut picked: Vec<u32> = selections.into_iter().flatten().collect();
+        picked.sort_unstable();
+        assert_eq!(
+            picked,
+            vec![0, 1],
+            "serialized select-then-claim must hand out distinct GPUs, got {picked:?}"
+        );
+
         let _ = fs::remove_dir_all(&root);
     }
 
