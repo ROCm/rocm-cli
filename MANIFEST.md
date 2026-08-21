@@ -45,8 +45,8 @@ repository.
 | anstyle-parse | 1.0.0 | MIT OR Apache-2.0 |
 | anstyle-query | 1.1.5 | MIT OR Apache-2.0 |
 | anstyle-wincon | 3.0.11 | MIT OR Apache-2.0 |
-| anyhow | 1.0.102 | MIT OR Apache-2.0 |
-| apple-native-keyring-store | 1.0.0 | MIT OR Apache-2.0 |
+| anyhow | 1.0.104 | MIT OR Apache-2.0 |
+| apple-native-keyring-store | 1.0.2 | MIT OR Apache-2.0 |
 | approx | 0.5.1 | Apache-2.0 |
 | arbitrary | 1.4.2 | MIT OR Apache-2.0 |
 | arrayvec | 0.7.8 | MIT OR Apache-2.0 |
@@ -63,7 +63,7 @@ repository.
 | async-stream | 0.3.6 | MIT |
 | async-stream-impl | 0.3.6 | MIT |
 | async-task | 4.7.1 | Apache-2.0 OR MIT |
-| async-trait | 0.1.89 | MIT OR Apache-2.0 |
+| async-trait | 0.1.92 | MIT OR Apache-2.0 |
 | atomic | 0.6.1 | Apache-2.0/MIT |
 | atomic-waker | 1.1.2 | Apache-2.0 OR MIT |
 | autocfg | 1.5.1 | Apache-2.0 OR MIT |
@@ -92,16 +92,16 @@ repository.
 | bytes | 1.12.0 | MIT |
 | castaway | 0.2.4 | MIT |
 | cbc | 0.1.2 | MIT OR Apache-2.0 |
-| cc | 1.2.65 | MIT OR Apache-2.0 |
+| cc | 1.4.2 | MIT OR Apache-2.0 |
 | cfg-if | 1.0.4 | MIT OR Apache-2.0 |
 | cfg_aliases | 0.1.1 | MIT |
 | cfg_aliases | 0.2.1 | MIT |
 | chrono | 0.4.45 | MIT OR Apache-2.0 |
 | cipher | 0.4.4 | MIT OR Apache-2.0 |
-| clap | 4.6.1 | MIT OR Apache-2.0 |
-| clap_builder | 4.6.0 | MIT OR Apache-2.0 |
-| clap_complete | 4.6.5 | MIT OR Apache-2.0 |
-| clap_derive | 4.6.1 | MIT OR Apache-2.0 |
+| clap | 4.6.6 | MIT OR Apache-2.0 |
+| clap_builder | 4.6.6 | MIT OR Apache-2.0 |
+| clap_complete | 4.6.9 | MIT OR Apache-2.0 |
+| clap_derive | 4.6.4 | MIT OR Apache-2.0 |
 | clap_lex | 1.1.0 | MIT OR Apache-2.0 |
 | cmake | 0.1.58 | MIT OR Apache-2.0 |
 | color-eyre | 0.6.5 | MIT OR Apache-2.0 |
@@ -173,7 +173,7 @@ repository.
 | fastrand | 2.4.1 | Apache-2.0 OR MIT |
 | filedescriptor | 0.8.3 | MIT |
 | filetime | 0.2.29 | MIT/Apache-2.0 |
-| find-msvc-tools | 0.1.9 | MIT OR Apache-2.0 |
+| find-msvc-tools | 0.1.11 | MIT OR Apache-2.0 |
 | finl_unicode | 1.4.0 | (MIT OR Apache-2.0) AND Unicode-DFS-2016 |
 | fixedbitset | 0.4.2 | MIT/Apache-2.0 |
 | flate2 | 1.1.9 | MIT OR Apache-2.0 |
@@ -181,17 +181,17 @@ repository.
 | foldhash | 0.2.0 | Zlib |
 | form_urlencoded | 1.2.2 | MIT OR Apache-2.0 |
 | fs_extra | 1.3.0 | MIT |
-| futures | 0.3.32 | MIT OR Apache-2.0 |
-| futures-channel | 0.3.32 | MIT OR Apache-2.0 |
-| futures-core | 0.3.32 | MIT OR Apache-2.0 |
-| futures-executor | 0.3.32 | MIT OR Apache-2.0 |
-| futures-io | 0.3.32 | MIT OR Apache-2.0 |
+| futures | 0.3.34 | MIT OR Apache-2.0 |
+| futures-channel | 0.3.34 | MIT OR Apache-2.0 |
+| futures-core | 0.3.34 | MIT OR Apache-2.0 |
+| futures-executor | 0.3.34 | MIT OR Apache-2.0 |
+| futures-io | 0.3.34 | MIT OR Apache-2.0 |
 | futures-lite | 2.6.1 | Apache-2.0 OR MIT |
-| futures-macro | 0.3.32 | MIT OR Apache-2.0 |
-| futures-sink | 0.3.32 | MIT OR Apache-2.0 |
-| futures-task | 0.3.32 | MIT OR Apache-2.0 |
+| futures-macro | 0.3.34 | MIT OR Apache-2.0 |
+| futures-sink | 0.3.34 | MIT OR Apache-2.0 |
+| futures-task | 0.3.34 | MIT OR Apache-2.0 |
 | futures-timer | 3.0.4 | MIT/Apache-2.0 |
-| futures-util | 0.3.32 | MIT OR Apache-2.0 |
+| futures-util | 0.3.34 | MIT OR Apache-2.0 |
 | generic-array | 0.14.7 | MIT |
 | getrandom | 0.2.17 | MIT OR Apache-2.0 |
 | getrandom | 0.3.4 | MIT OR Apache-2.0 |
@@ -209,7 +209,7 @@ repository.
 | hex | 0.4.3 | MIT OR Apache-2.0 |
 | hkdf | 0.12.4 | MIT OR Apache-2.0 |
 | hmac | 0.12.1 | MIT OR Apache-2.0 |
-| http | 1.4.2 | MIT OR Apache-2.0 |
+| http | 1.5.0 | MIT OR Apache-2.0 |
 | http-body | 1.0.1 | MIT |
 | http-body-util | 0.1.3 | MIT |
 | http-range-header | 0.4.2 | MIT |
@@ -256,7 +256,7 @@ repository.
 | keyring-core | 1.0.0 | MIT OR Apache-2.0 |
 | lab | 0.11.0 | MIT |
 | lazy_static | 1.5.0 | MIT OR Apache-2.0 |
-| libc | 0.2.186 | MIT OR Apache-2.0 |
+| libc | 0.2.189 | MIT OR Apache-2.0 |
 | libm | 0.2.16 | MIT |
 | libredox | 0.1.17 | MIT |
 | line-clipping | 0.3.7 | MIT OR Apache-2.0 |
@@ -371,8 +371,8 @@ repository.
 | redox_users | 0.5.2 | MIT |
 | ref-cast | 1.0.25 | MIT OR Apache-2.0 |
 | ref-cast-impl | 1.0.25 | MIT OR Apache-2.0 |
-| regex | 1.12.4 | MIT OR Apache-2.0 |
-| regex-automata | 0.4.14 | MIT OR Apache-2.0 |
+| regex | 1.13.1 | MIT OR Apache-2.0 |
+| regex-automata | 0.4.18 | MIT OR Apache-2.0 |
 | regex-syntax | 0.8.11 | MIT OR Apache-2.0 |
 | reqwest | 0.12.28 | MIT OR Apache-2.0 |
 | reqwest | 0.13.4 | MIT OR Apache-2.0 |
@@ -407,11 +407,11 @@ repository.
 | security-framework | 3.7.0 | MIT OR Apache-2.0 |
 | security-framework-sys | 2.17.0 | MIT OR Apache-2.0 |
 | semver | 1.0.28 | MIT OR Apache-2.0 |
-| serde | 1.0.228 | MIT OR Apache-2.0 |
-| serde_core | 1.0.228 | MIT OR Apache-2.0 |
-| serde_derive | 1.0.228 | MIT OR Apache-2.0 |
+| serde | 1.0.229 | MIT OR Apache-2.0 |
+| serde_core | 1.0.229 | MIT OR Apache-2.0 |
+| serde_derive | 1.0.229 | MIT OR Apache-2.0 |
 | serde_derive_internals | 0.29.1 | MIT OR Apache-2.0 |
-| serde_json | 1.0.150 | MIT OR Apache-2.0 |
+| serde_json | 1.0.151 | MIT OR Apache-2.0 |
 | serde_path_to_error | 0.1.20 | MIT OR Apache-2.0 |
 | serde_repr | 0.1.20 | MIT OR Apache-2.0 |
 | serde_spanned | 0.6.9 | MIT OR Apache-2.0 |
@@ -449,6 +449,7 @@ repository.
 | symlink | 0.1.0 | MIT/Apache-2.0 |
 | syn | 1.0.109 | MIT OR Apache-2.0 |
 | syn | 2.0.118 | MIT OR Apache-2.0 |
+| syn | 3.0.3 | MIT OR Apache-2.0 |
 | sync_wrapper | 1.0.2 | Apache-2.0 |
 | synstructure | 0.13.2 | MIT |
 | synthez | 0.4.0 | BlueOak-1.0.0 |
@@ -466,9 +467,9 @@ repository.
 | termwiz | 0.23.3 | MIT |
 | textwrap | 0.16.2 | MIT |
 | thiserror | 1.0.69 | MIT OR Apache-2.0 |
-| thiserror | 2.0.18 | MIT OR Apache-2.0 |
+| thiserror | 2.0.20 | MIT OR Apache-2.0 |
 | thiserror-impl | 1.0.69 | MIT OR Apache-2.0 |
-| thiserror-impl | 2.0.18 | MIT OR Apache-2.0 |
+| thiserror-impl | 2.0.20 | MIT OR Apache-2.0 |
 | thread_local | 1.1.9 | MIT OR Apache-2.0 |
 | time | 0.3.51 | MIT OR Apache-2.0 |
 | time-core | 0.1.9 | MIT OR Apache-2.0 |
@@ -476,11 +477,11 @@ repository.
 | tinystr | 0.8.3 | Unicode-3.0 |
 | tinyvec | 1.11.0 | Zlib OR Apache-2.0 OR MIT |
 | tinyvec_macros | 0.1.1 | MIT OR Apache-2.0 OR Zlib |
-| tokio | 1.52.3 | MIT |
+| tokio | 1.53.1 | MIT |
 | tokio-macros | 2.7.0 | MIT |
 | tokio-rustls | 0.26.4 | MIT OR Apache-2.0 |
 | tokio-tungstenite | 0.28.0 | MIT |
-| tokio-util | 0.7.18 | MIT |
+| tokio-util | 0.7.19 | MIT |
 | toml | 0.8.23 | MIT OR Apache-2.0 |
 | toml_datetime | 0.6.11 | MIT OR Apache-2.0 |
 | toml_datetime | 1.1.1+spec-1.1.0 | MIT OR Apache-2.0 |

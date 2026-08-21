@@ -2993,10 +2993,10 @@ The following component(s) are licensed under Apache License 2.0:
   - anstyle-query 1.1.5 <https://github.com/rust-cli/anstyle.git>
   - anstyle-wincon 3.0.11 <https://github.com/rust-cli/anstyle.git>
   - anstyle 1.0.14 <https://github.com/rust-cli/anstyle.git>
-  - clap 4.6.1 <https://github.com/clap-rs/clap>
-  - clap_builder 4.6.0 <https://github.com/clap-rs/clap>
-  - clap_complete 4.6.5 <https://github.com/clap-rs/clap>
-  - clap_derive 4.6.1 <https://github.com/clap-rs/clap>
+  - clap 4.6.6 <https://github.com/clap-rs/clap>
+  - clap_builder 4.6.6 <https://github.com/clap-rs/clap>
+  - clap_complete 4.6.9 <https://github.com/clap-rs/clap>
+  - clap_derive 4.6.4 <https://github.com/clap-rs/clap>
   - clap_lex 1.1.0 <https://github.com/clap-rs/clap>
   - colorchoice 1.0.5 <https://github.com/rust-cli/anstyle.git>
   - crc32fast 1.5.0 <https://github.com/srijs/rust-crc32fast>
@@ -3633,15 +3633,15 @@ Apache License 2.0
 ================================================================================
 
 The following component(s) are licensed under Apache License 2.0:
-  - futures-channel 0.3.32 <https://github.com/rust-lang/futures-rs>
-  - futures-core 0.3.32 <https://github.com/rust-lang/futures-rs>
-  - futures-executor 0.3.32 <https://github.com/rust-lang/futures-rs>
-  - futures-io 0.3.32 <https://github.com/rust-lang/futures-rs>
-  - futures-macro 0.3.32 <https://github.com/rust-lang/futures-rs>
-  - futures-sink 0.3.32 <https://github.com/rust-lang/futures-rs>
-  - futures-task 0.3.32 <https://github.com/rust-lang/futures-rs>
-  - futures-util 0.3.32 <https://github.com/rust-lang/futures-rs>
-  - futures 0.3.32 <https://github.com/rust-lang/futures-rs>
+  - futures-channel 0.3.34 <https://github.com/rust-lang/futures-rs>
+  - futures-core 0.3.34 <https://github.com/rust-lang/futures-rs>
+  - futures-executor 0.3.34 <https://github.com/rust-lang/futures-rs>
+  - futures-io 0.3.34 <https://github.com/rust-lang/futures-rs>
+  - futures-macro 0.3.34 <https://github.com/rust-lang/futures-rs>
+  - futures-sink 0.3.34 <https://github.com/rust-lang/futures-rs>
+  - futures-task 0.3.34 <https://github.com/rust-lang/futures-rs>
+  - futures-util 0.3.34 <https://github.com/rust-lang/futures-rs>
+  - futures 0.3.34 <https://github.com/rust-lang/futures-rs>
 
                               Apache License
                         Version 2.0, January 2004
@@ -4272,7 +4272,7 @@ Apache License 2.0
 ================================================================================
 
 The following component(s) are licensed under Apache License 2.0:
-  - http 1.4.2 <https://github.com/hyperium/http>
+  - http 1.5.0 <https://github.com/hyperium/http>
 
                               Apache License
                         Version 2.0, January 2004
@@ -5323,7 +5323,7 @@ Apache License 2.0
 ================================================================================
 
 The following component(s) are licensed under Apache License 2.0:
-  - apple-native-keyring-store 1.0.0 <https://github.com/open-source-cooperative/apple-native-keyring-store.git>
+  - apple-native-keyring-store 1.0.2 <https://github.com/open-source-cooperative/apple-native-keyring-store.git>
   - keyring-core 1.0.0 <https://github.com/open-source-cooperative/keyring-core.git>
   - zbus-secret-service-keyring-store 1.0.0 <https://github.com/open-source-cooperative/zbus-secret-service-keyring-store.git>
 
@@ -5832,9 +5832,9 @@ The following component(s) are licensed under Apache License 2.0:
   - percent-encoding 2.3.2 <https://github.com/servo/rust-url/>
   - piper 0.2.5 <https://github.com/smol-rs/piper>
   - polling 3.11.0 <https://github.com/smol-rs/polling>
-  - regex-automata 0.4.14 <https://github.com/rust-lang/regex>
+  - regex-automata 0.4.18 <https://github.com/rust-lang/regex>
   - regex-syntax 0.8.11 <https://github.com/rust-lang/regex>
-  - regex 1.12.4 <https://github.com/rust-lang/regex>
+  - regex 1.13.1 <https://github.com/rust-lang/regex>
   - ring 0.17.14 <https://github.com/briansmith/ring>
   - rustc-demangle 0.1.27 <https://github.com/rust-lang/rustc-demangle>
   - rustix 0.38.44 <https://github.com/bytecodealliance/rustix>
@@ -8146,8 +8146,8 @@ Apache License 2.0
 The following component(s) are licensed under Apache License 2.0:
   - allocator-api2 0.2.21 <https://github.com/zakarumych/allocator-api2>
   - android_system_properties 0.1.5 <https://github.com/nical/android_system_properties>
-  - anyhow 1.0.102 <https://github.com/dtolnay/anyhow>
-  - async-trait 0.1.89 <https://github.com/dtolnay/async-trait>
+  - anyhow 1.0.104 <https://github.com/dtolnay/anyhow>
+  - async-trait 0.1.92 <https://github.com/dtolnay/async-trait>
   - aws-lc-sys 0.41.0 <https://github.com/aws/aws-lc-rs>
   - bollard-stubs 1.53.1-rc.29.3.1
   - cucumber-codegen 0.23.0 <https://github.com/cucumber-rs/cucumber>
@@ -8165,7 +8165,7 @@ The following component(s) are licensed under Apache License 2.0:
   - jni-macros 0.22.4 <https://github.com/jni-rs/jni-rs>
   - jni-sys-macros 0.4.1 <https://github.com/jni-rs/jni-sys>
   - jni 0.22.4 <https://github.com/jni-rs/jni-rs>
-  - libc 0.2.186 <https://github.com/rust-lang/libc>
+  - libc 0.2.189 <https://github.com/rust-lang/libc>
   - litrs 1.0.0 <https://github.com/LukasKalbertodt/litrs>
   - maud 0.27.0 <https://github.com/lambda-fairy/maud>
   - maud_macros 0.27.0 <https://github.com/lambda-fairy/maud>
@@ -8191,22 +8191,23 @@ The following component(s) are licensed under Apache License 2.0:
   - rustversion 1.0.22 <https://github.com/dtolnay/rustversion>
   - ryu 1.0.23 <https://github.com/dtolnay/ryu>
   - semver 1.0.28 <https://github.com/dtolnay/semver>
-  - serde 1.0.228 <https://github.com/serde-rs/serde>
-  - serde_core 1.0.228 <https://github.com/serde-rs/serde>
-  - serde_derive 1.0.228 <https://github.com/serde-rs/serde>
+  - serde 1.0.229 <https://github.com/serde-rs/serde>
+  - serde_core 1.0.229 <https://github.com/serde-rs/serde>
+  - serde_derive 1.0.229 <https://github.com/serde-rs/serde>
   - serde_derive_internals 0.29.1 <https://github.com/serde-rs/serde>
-  - serde_json 1.0.150 <https://github.com/serde-rs/json>
+  - serde_json 1.0.151 <https://github.com/serde-rs/json>
   - serde_path_to_error 0.1.20 <https://github.com/dtolnay/path-to-error>
   - serde_repr 0.1.20 <https://github.com/dtolnay/serde-repr>
   - serde_urlencoded 0.7.1 <https://github.com/nox/serde_urlencoded>
   - serial2 0.2.37 <https://github.com/de-vri-es/serial2-rs>
   - simdutf8 0.1.5 <https://github.com/rusticstuff/simdutf8>
   - syn 2.0.118 <https://github.com/dtolnay/syn>
+  - syn 3.0.3 <https://github.com/dtolnay/syn>
   - sync_wrapper 1.0.2 <https://github.com/Actyx/sync_wrapper>
   - thiserror-impl 1.0.69 <https://github.com/dtolnay/thiserror>
-  - thiserror-impl 2.0.18 <https://github.com/dtolnay/thiserror>
+  - thiserror-impl 2.0.20 <https://github.com/dtolnay/thiserror>
   - thiserror 1.0.69 <https://github.com/dtolnay/thiserror>
-  - thiserror 2.0.18 <https://github.com/dtolnay/thiserror>
+  - thiserror 2.0.20 <https://github.com/dtolnay/thiserror>
   - time-core 0.1.9 <https://github.com/time-rs/time>
   - time-macros 0.2.30 <https://github.com/time-rs/time>
   - time 0.3.51 <https://github.com/time-rs/time>
@@ -10592,8 +10593,8 @@ MIT License
 ================================================================================
 
 The following component(s) are licensed under MIT License:
-  - tokio-util 0.7.18 <https://github.com/tokio-rs/tokio>
-  - tokio 1.52.3 <https://github.com/tokio-rs/tokio>
+  - tokio-util 0.7.19 <https://github.com/tokio-rs/tokio>
+  - tokio 1.53.1 <https://github.com/tokio-rs/tokio>
 
 MIT License
 
