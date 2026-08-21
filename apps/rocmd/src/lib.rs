@@ -4790,7 +4790,25 @@ fn handle_server_recover_event_with_record(
                     Some(record.service_id.clone()),
                 );
             }
-            restart_managed_service(paths, &mut *record)?;
+            // A contended allocation lock or an occupied recorded port is a
+            // recoverable, per-service condition — report it and move on rather
+            // than letting one service take the whole 30s watcher tick (and the
+            // daemon) down.
+            if let Err(error) = restart_managed_service(paths, &mut *record) {
+                return record_event(
+                    paths,
+                    state,
+                    "server-recover",
+                    "error",
+                    "restart_managed_service_failed",
+                    &format!(
+                        "failed to recover managed service {} on {}:{} after \
+                         {recovery_reason_display}: {error:#}",
+                        record.service_id, record.host, record.port
+                    ),
+                    Some(record.service_id.clone()),
+                );
+            }
             record_event(
                 paths,
                 state,
@@ -4937,7 +4955,33 @@ fn manifest_service_recovery_reason(
     }
 }
 
-fn restart_managed_service(_paths: &AppPaths, record: &mut ManagedServiceRecord) -> Result<()> {
+/// Respawn the supervisor for a managed service that needs recovery.
+///
+/// Recovery re-claims the concrete port already written in the record, so it
+/// runs inside the same bounded cross-process allocation lock as a fresh
+/// `rocm serve` launch: a CLI automatic selection and a recovery re-bind can
+/// never interleave, and the CLI sees this record's `recovering` reservation.
+fn restart_managed_service(paths: &AppPaths, record: &mut ManagedServiceRecord) -> Result<()> {
+    let _allocation = rocm_core::lock_service_allocation(paths)?;
+
+    // On the canonical loopback host, prove the recorded port is genuinely free
+    // before publishing `recovering` or spawning anything: a supervisor that
+    // cannot bind would replace a truthful record with a lie. Custom hosts keep
+    // the existing engine-owned bind behavior — the record transition is still
+    // serialized, but the bind is not preflighted.
+    let lease = if rocm_core::is_canonical_loopback_host(&record.host) {
+        Some(
+            rocm_core::lease_loopback_port(record.port).with_context(|| {
+                format!(
+                    "cannot recover managed service {} on {}:{}: its recorded port is in use",
+                    record.service_id, record.host, record.port
+                )
+            })?,
+        )
+    } else {
+        None
+    };
+
     let rocmd_binary =
         std::env::current_exe().context("failed to resolve current rocmd executable path")?;
     let log_file = fs::OpenOptions::new()
@@ -4949,6 +4993,11 @@ fn restart_managed_service(_paths: &AppPaths, record: &mut ManagedServiceRecord)
         .try_clone()
         .context("failed to clone service log file handle")?;
 
+    // The truthful state to fall back to. Any failure below must leave the
+    // operator with this, not a half-applied `recovering` row — and, once the
+    // supervisor exists, must not leave that supervisor running unrecorded.
+    let prior = record.clone();
+
     record.status = "recovering".to_owned();
     // Counts the restart and drops the previous run's inference verification.
     // The respawned child writes a fresh record of its own, and "recovering" is
@@ -4958,7 +5007,18 @@ fn restart_managed_service(_paths: &AppPaths, record: &mut ManagedServiceRecord)
     // true at the one site that reuses a record across restarts.
     record.reset_for_restart();
     record.supervisor_pid = std::process::id();
-    record.write()?;
+    if let Err(error) = record.write() {
+        // Nothing was spawned and the on-disk record was never replaced; just
+        // undo the in-memory transition so the caller does not report recovery
+        // that never happened.
+        *record = prior;
+        return Err(error.context("failed to publish the recovering service record"));
+    }
+    // Hand the port to the supervisor: close the probe socket immediately before
+    // the spawn, still holding the allocation lock.
+    if let Some(lease) = lease {
+        lease.release();
+    }
 
     let mut child = detached_rocmd_command(&rocmd_binary)
         .args(recovery_supervise_args(record))
@@ -4969,7 +5029,26 @@ fn restart_managed_service(_paths: &AppPaths, record: &mut ManagedServiceRecord)
         .context("failed to spawn recovery supervisor")?;
 
     record.supervisor_pid = child.id();
-    record.write()?;
+    if let Err(error) = record.write() {
+        // The supervisor is alive but unrecorded: it would hold the port while
+        // being invisible to every stop/recovery path. Kill it, then put the
+        // prior truthful record back.
+        terminate_recovery_supervisor(&mut child);
+        *record = prior;
+        let error = error.context("failed to publish the recovering service record");
+        if let Err(rollback) = record.write() {
+            // Both writes failed: the on-disk record now still claims
+            // `recovering` for a supervisor that no longer exists. That is worse
+            // than the original failure and must not be swallowed — the watcher
+            // and the manual restart tool both surface whatever comes back.
+            return Err(error.context(format!(
+                "rollback also failed: managed service {} is left recorded as recovering \
+                 with no supervisor ({rollback:#})",
+                record.service_id
+            )));
+        }
+        return Err(error);
+    }
 
     thread::sleep(Duration::from_millis(200));
     if let Some(status) = child
@@ -4985,6 +5064,26 @@ fn restart_managed_service(_paths: &AppPaths, record: &mut ManagedServiceRecord)
     }
 
     Ok(())
+}
+
+/// Grace given to a recovery supervisor that must be terminated because its
+/// record could not be published. Short: it is milliseconds old.
+const RECOVERY_CLEANUP_GRACE: Duration = Duration::from_secs(2);
+
+/// Terminate and reap a recovery supervisor that could not be recorded.
+///
+/// Tree scope, forced: the supervisor may already have started an engine child,
+/// and leaving either alive would keep the recorded port occupied by a process
+/// no stop or recovery path can find. Reaping afterwards keeps the daemon free
+/// of zombies.
+fn terminate_recovery_supervisor(child: &mut std::process::Child) {
+    let _outcome = rocm_core::terminate_verified(
+        &rocm_core::ProcessIdentity::capture(child.id()),
+        rocm_core::KillScope::Tree,
+        RECOVERY_CLEANUP_GRACE,
+        true,
+    );
+    let _ = child.wait();
 }
 
 fn recovery_supervise_args(record: &ManagedServiceRecord) -> Vec<String> {
@@ -5560,6 +5659,167 @@ mod tests {
             args.windows(2)
                 .any(|pair| { pair[0] == "--canonical-model-id" && pair[1] == "Qwen/Qwen3.5-4B" })
         );
+    }
+
+    #[test]
+    fn recovery_waits_for_the_allocation_lock_and_refuses_an_occupied_port() -> Result<()> {
+        use std::net::TcpListener;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (_root, paths) = temp_app_paths("recovery-port-collision");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        // Something else already owns the port this service recorded.
+        let occupant = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = occupant.local_addr()?.port();
+
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "lemonade-recover-1",
+            "lemonade",
+            "qwen",
+            "qwen-canonical".to_owned(),
+            DEFAULT_LOCAL_HOST,
+            port,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.status = "failed".to_owned();
+        record.write()?;
+
+        let guard = rocm_core::lock_service_allocation(&paths)?;
+        let finished = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let paths = paths.clone();
+            let finished = Arc::clone(&finished);
+            let mut record = record.clone();
+            thread::spawn(move || {
+                let result = restart_managed_service(&paths, &mut record);
+                finished.store(true, Ordering::SeqCst);
+                result
+            })
+        };
+
+        thread::sleep(Duration::from_millis(250));
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "recovery must serialize on the shared allocation lock"
+        );
+        drop(guard);
+
+        let error = handle
+            .join()
+            .expect("recovery thread")
+            .expect_err("an occupied recorded port must fail recovery");
+        let message = format!("{error:#}");
+        assert!(message.contains("recorded port is in use"), "{message}");
+
+        // Nothing was spawned and the prior truthful record is untouched: it must
+        // not have been rewritten as `recovering`.
+        let on_disk = load_managed_services(&paths)?
+            .into_iter()
+            .find(|candidate| candidate.service_id == "lemonade-recover-1")
+            .expect("record still present");
+        assert_eq!(on_disk.status, "failed");
+        assert_eq!(on_disk.restart_count, record.restart_count);
+        drop(occupant);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_publication_failure_leaves_the_prior_record_intact() -> Result<()> {
+        use std::net::TcpListener;
+
+        let (_root, paths) = temp_app_paths("recovery-publication-failure");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        // A free recorded port, so the lease succeeds and the failure under test
+        // is the record publication itself.
+        let probe = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = probe.local_addr()?.port();
+        drop(probe);
+
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "lemonade-recover-2",
+            "lemonade",
+            "qwen",
+            "qwen-canonical".to_owned(),
+            DEFAULT_LOCAL_HOST,
+            port,
+            "managed",
+            4242,
+            None,
+            None,
+            None,
+        );
+        record.status = "failed".to_owned();
+        record.write()?;
+
+        // Make the manifest unwritable by replacing it with a directory. The
+        // `recovering` transition can no longer be published.
+        fs::remove_file(&record.manifest_path)?;
+        fs::create_dir_all(&record.manifest_path)?;
+
+        let mut attempt = record.clone();
+        let error = restart_managed_service(&paths, &mut attempt)
+            .expect_err("an unpublishable record must fail recovery");
+        let message = format!("{error:#}");
+        assert!(message.contains("recovering service record"), "{message}");
+        // Nothing was spawned and the on-disk row was never replaced, so the
+        // error must NOT claim a failed rollback: that phrasing is reserved for
+        // the post-spawn case where the record really is left mid-transition.
+        assert!(!message.contains("rollback also failed"), "{message}");
+
+        // The caller's record must not claim a recovery that never happened.
+        assert_eq!(attempt.status, "failed");
+        assert_eq!(attempt.restart_count, record.restart_count);
+        assert_eq!(attempt.supervisor_pid, record.supervisor_pid);
+        fs::remove_dir_all(&record.manifest_path)?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "spawned as a child process by terminate_recovery_supervisor_kills_and_reaps_the_child"]
+    fn recovery_cleanup_sleeper_child() {
+        if std::env::var_os("ROCMD_TEST_SLEEPER_CHILD").is_none() {
+            return;
+        }
+        thread::sleep(Duration::from_mins(2));
+    }
+
+    #[test]
+    fn terminate_recovery_supervisor_kills_and_reaps_the_child() {
+        // A real long-lived process stands in for a supervisor that was spawned
+        // but whose record could not be published.
+        let mut child = ProcessCommand::new(std::env::current_exe().expect("test binary"))
+            .arg("tests::recovery_cleanup_sleeper_child")
+            .arg("--exact")
+            .arg("--ignored")
+            .env("ROCMD_TEST_SLEEPER_CHILD", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleeper child");
+        let child_pid = child.id();
+
+        terminate_recovery_supervisor(&mut child);
+
+        // The helper reaps, so the pid must be gone rather than a zombie.
+        assert!(
+            !rocm_core::process_is_running(child_pid),
+            "an unrecordable supervisor must be terminated and reaped"
+        );
+        // The helper already reaped it; wait again so the child is provably
+        // handled on every path in this function (and reaping is idempotent).
+        assert!(child.wait().is_ok());
     }
 
     #[test]

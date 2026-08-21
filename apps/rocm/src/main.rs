@@ -11,6 +11,7 @@ mod endpoint_keys;
 mod logging;
 mod provider_keys;
 mod providers;
+mod serve_port;
 mod serve_summary;
 mod storage;
 mod therock;
@@ -362,9 +363,16 @@ rocm serve qwen2.5-7b-instruct --verbose --device gpu_required")]
         /// Host address to bind.
         #[arg(long, default_value = DEFAULT_LOCAL_HOST)]
         host: String,
-        /// TCP port to bind.
-        #[arg(long, default_value_t = rocm_core::DEFAULT_LOCAL_PORT)]
-        port: u16,
+        /// TCP port to bind. Omit it to choose an available port automatically,
+        /// starting at 11435, on the default 127.0.0.1 host. Any other --host
+        /// requires an explicit --port: proactive collision detection is claimed
+        /// only for local 127.0.0.1 serving.
+        // `allow_hyphen_values` so a negative value such as `-1` reaches
+        // `parse_serve_port` and gets the domain error naming the valid range,
+        // instead of clap rejecting it as an unknown flag. Mirrors the same
+        // choice made for `--gpu-memory-utilization` below.
+        #[arg(long, value_parser = serve_port::parse_serve_port, allow_hyphen_values = true)]
+        port: Option<u16>,
         /// Attach to the server in this terminal and stream its logs (Ctrl-D to
         /// detach and leave it running, Ctrl-C to stop). Same as --verbose.
         #[arg(long, conflicts_with = "managed")]
@@ -4709,7 +4717,8 @@ struct ServeArgs {
     runtime_id: Option<String>,
     env_id: Option<String>,
     host: String,
-    port: u16,
+    /// `None` when `--port` was omitted: the allocation transaction chooses one.
+    port: Option<u16>,
     foreground: bool,
     managed: bool,
     verbose: bool,
@@ -4747,6 +4756,11 @@ fn serve(args: ServeArgs) -> Result<()> {
     } = args;
     let _ = managed; // background is now the default; --managed is accepted as an explicit synonym.
     validate_bind_host(&host, allow_public_bind)?;
+    // Automatic selection is a canonical-loopback-only capability. Refuse it on a
+    // custom host here — before engine resolution, GPU probing, or any side
+    // effect — so the user gets the `--port` guidance immediately.
+    let port_request = serve_port::PortRequest::from_flag(port);
+    serve_port::validate_port_request(&host, port_request)?;
     // Loopback stays credential-free; a public bind must be authenticated. Resolve
     // (or generate) the endpoint key now so every downstream path — engine spawn,
     // readiness probe, smoke test, and the client-config we print — shares one value.
@@ -4928,7 +4942,13 @@ fn serve(args: ServeArgs) -> Result<()> {
         println!("  engine: {selected_engine}");
         println!("{}", serve_engine_selection_line(&serve_engine));
         println!("  host: {host}");
-        println!("  port: {port}");
+        // The plan is printed before the allocation transaction runs, so an
+        // automatic request cannot honestly name a port yet. The launch output
+        // below prints the resolved endpoint.
+        match port {
+            Some(port) => println!("  port: {port}"),
+            None => println!("  {}", serve_port::AUTOMATIC_PORT_DISCLOSURE),
+        }
         if let Some(runtime_id) = resolved_selection.runtime_id.as_deref() {
             println!("  runtime_id: {runtime_id}");
         }
@@ -5007,7 +5027,7 @@ fn serve(args: ServeArgs) -> Result<()> {
             &model,
             &resolve,
             &host,
-            port,
+            port_request,
             &resolve.device_policy,
             &gpu_indices,
             managed_runtime_id.as_deref(),
@@ -5087,7 +5107,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         &model,
         &resolve,
         &host,
-        port,
+        port_request,
         &gpu_indices,
         resolved_selection.runtime_id.as_deref(),
         resolved_selection.env_id.as_deref(),
@@ -5373,11 +5393,132 @@ enum ManagedSpawn {
     },
 }
 
+/// Outcome of the locked allocation step.
+///
+/// `Debug` so tests can assert on `Result::expect_err`.
+#[derive(Debug)]
+enum ManagedPortDecision {
+    /// An equivalent managed service is already live; nothing may be spawned.
+    /// Boxed to keep the variants a similar size (clippy::large_enum_variant).
+    AlreadyLive(Box<ManagedServiceRecord>),
+    /// The concrete port this launch owns until it hands it to the child.
+    Lease(rocm_core::LoopbackPortLease),
+}
+
+/// Live managed services, with liveness refreshed by [`load_managed_services`]
+/// (dead PIDs demote to "stopped" and therefore neither satisfy the duplicate
+/// check nor reserve a port).
+///
+/// A read failure degrades to "nothing is live": the OS preflight still guards
+/// the port, and refusing to serve because the services directory could not be
+/// listed would be a worse failure than launching.
+fn live_managed_services(paths: &AppPaths) -> Vec<ManagedServiceRecord> {
+    load_managed_services(paths)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(managed_service_is_live)
+        .collect()
+}
+
+/// Ports that live managed services still own.
+///
+/// Conservative by design: a record reserves its port regardless of the host it
+/// recorded, because a `0.0.0.0` (or `localhost`) listener also blocks the
+/// loopback address a new local server would bind. Over-reserving costs one
+/// candidate in a 101-port scan; under-reserving costs a collision.
+fn reserved_service_ports(live: &[ManagedServiceRecord]) -> Vec<serve_port::ReservedPort> {
+    live.iter()
+        .map(|record| serve_port::ReservedPort {
+            port: record.port,
+            service_id: record.service_id.clone(),
+            status: record.status.clone(),
+        })
+        .collect()
+}
+
+/// The decision half of the launch transaction: refresh liveness, apply the
+/// `(engine, canonical_model_id)` idempotency guard, then lease a concrete port
+/// against both live records and the real OS.
+///
+/// Callers MUST hold the shared allocation lock across this call *and* the
+/// record publication that follows, or two launches can pick the same candidate.
+/// `probe` is injected so tests can drive deterministic bind outcomes without a
+/// GPU or a spawn.
+fn resolve_managed_port_in_transaction(
+    paths: &AppPaths,
+    engine: &str,
+    canonical_model_id: &str,
+    host: &str,
+    request: serve_port::PortRequest,
+    probe: &mut dyn FnMut(u16) -> std::io::Result<rocm_core::LoopbackPortLease>,
+) -> Result<ManagedPortDecision> {
+    let live = live_managed_services(paths);
+    // Idempotency first: an already-live equivalent service means no port is
+    // needed at all, so it must be answered before any candidate is leased.
+    if let Some(existing) = existing_live_managed_service_in(&live, engine, canonical_model_id) {
+        return Ok(ManagedPortDecision::AlreadyLive(Box::new(existing.clone())));
+    }
+    let reserved = reserved_service_ports(&live);
+    serve_port::resolve_serve_port(host, request, &reserved, probe).map(ManagedPortDecision::Lease)
+}
+
+/// Grace given to a child that must be terminated because its record could not
+/// be published. Short: the child is milliseconds old and has nothing to flush.
+const MANAGED_LAUNCH_CLEANUP_GRACE: Duration = Duration::from_secs(2);
+
+/// Undo a failed managed launch attempt before the allocation lock is released,
+/// so no failed transaction leaves a live reservation or a stray endpoint key.
+///
+/// Order matters: a spawned child is terminated and confirmed dead *first*, so
+/// nothing is still holding the port or writing to the log when the artifacts —
+/// including the record that reserves the port for other launches — are removed.
+/// Every step is best-effort and idempotent; cleanup must never mask the
+/// original failure with a second one.
+fn abandon_failed_managed_launch(
+    paths: &AppPaths,
+    record: &ManagedServiceRecord,
+    child_pid: Option<u32>,
+) {
+    if let Some(pid) = child_pid.filter(|pid| *pid != 0) {
+        let outcome = rocm_core::terminate_verified(
+            &rocm_core::ProcessIdentity::capture(pid),
+            rocm_core::KillScope::Tree,
+            MANAGED_LAUNCH_CLEANUP_GRACE,
+            true,
+        );
+        record_cli_audit_event(
+            paths,
+            "service",
+            "managed_service_launch_cleanup",
+            "warn",
+            format!(
+                "terminated engine child pid={pid} after a failed launch publication outcome={}",
+                outcome.as_str()
+            ),
+            Some(&record.service_id),
+        );
+    }
+    for path in [
+        record.manifest_path.as_path(),
+        record.log_path.as_path(),
+        record.engine_state_path.as_path(),
+    ] {
+        let _ = fs::remove_file(path);
+    }
+    endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
+}
+
 /// Spawn the detached engine child shared by the managed (background) and
 /// attached (`--verbose`/`--foreground`) serve paths. Returns before the HTTP
 /// readiness wait; callers decide whether to block on readiness
 /// ([`start_managed_service`]) or start tailing the log immediately
 /// ([`run_attached_service`]).
+///
+/// The whole body is one serialized transaction under the shared allocation
+/// lock: duplicate detection, live-reservation refresh, candidate leasing,
+/// manifest/log creation, argv preparation, the bounded immediate-exit check,
+/// and record publication. Readiness deliberately runs after the lock is
+/// released.
 #[allow(clippy::too_many_arguments)]
 fn spawn_managed_engine_child(
     paths: &AppPaths,
@@ -5386,7 +5527,7 @@ fn spawn_managed_engine_child(
     requested_model: &str,
     resolve: &ResolveModelResponse,
     host: &str,
-    port: u16,
+    port_request: serve_port::PortRequest,
     device_policy: &DevicePolicy,
     gpu_indices: &[u32],
     runtime_id: Option<&str>,
@@ -5395,6 +5536,12 @@ fn spawn_managed_engine_child(
 ) -> Result<ManagedSpawn> {
     paths.ensure()?;
     fs::create_dir_all(paths.services_dir())?;
+
+    // Concurrent `rocm serve` launches and `rocmd` recovery all contend here, so
+    // no two of them can choose the same port or publish competing records for
+    // one engine+model. Bounded: a stuck peer produces an actionable error
+    // rather than a hang. Released when this guard drops, and by process death.
+    let _allocation = rocm_core::lock_service_allocation(paths)?;
 
     // Idempotency guard: if a managed service for this engine+model is already
     // alive, surface it and spawn nothing. A second `serve --managed` (e.g. the
@@ -5406,37 +5553,46 @@ fn spawn_managed_engine_child(
         .map(serde_json::to_string)
         .transpose()
         .context("failed to encode engine recipe hint")?;
-    if let Some(existing) =
-        existing_live_managed_service(paths, engine, &resolve.canonical_model_id)
-    {
-        if existing.engine_recipe_json != requested_recipe_json {
-            bail!(
-                "managed service `{}` is already running for engine `{engine}` and model `{}` with different serve options (recipe hint, tool-call parser, or generation defaults); stop it and run `rocm serve` again to apply the requested options",
-                existing.service_id,
-                resolve.canonical_model_id
+    let lease = match resolve_managed_port_in_transaction(
+        paths,
+        engine,
+        &resolve.canonical_model_id,
+        host,
+        port_request,
+        &mut serve_port::loopback_bind_probe,
+    )? {
+        ManagedPortDecision::AlreadyLive(existing) => {
+            let existing = *existing;
+            if existing.engine_recipe_json != requested_recipe_json {
+                bail!(
+                    "managed service `{}` is already running for engine `{engine}` and model `{}` with different serve options (recipe hint, tool-call parser, or generation defaults); stop it and run `rocm serve` again to apply the requested options",
+                    existing.service_id,
+                    resolve.canonical_model_id
+                );
+            }
+            record_cli_audit_event(
+                paths,
+                "service",
+                "managed_service_launch_skipped",
+                "info",
+                format!(
+                    "skipped duplicate managed launch engine={engine} model={} existing_service_id={} status={}",
+                    resolve.canonical_model_id, existing.service_id, existing.status
+                ),
+                Some(&existing.service_id),
             );
+            return Ok(ManagedSpawn::AlreadyRunning(ManagedLaunchReport {
+                service_id: existing.service_id,
+                endpoint_url: existing.endpoint_url,
+                status: existing.status,
+                already_running: true,
+                child_pid: None,
+                log_path: None,
+                manifest_path: None,
+            }));
         }
-        record_cli_audit_event(
-            paths,
-            "service",
-            "managed_service_launch_skipped",
-            "info",
-            format!(
-                "skipped duplicate managed launch engine={engine} model={} existing_service_id={} status={}",
-                resolve.canonical_model_id, existing.service_id, existing.status
-            ),
-            Some(&existing.service_id),
-        );
-        return Ok(ManagedSpawn::AlreadyRunning(ManagedLaunchReport {
-            service_id: existing.service_id,
-            endpoint_url: existing.endpoint_url,
-            status: existing.status,
-            already_running: true,
-            child_pid: None,
-            log_path: None,
-            manifest_path: None,
-        }));
-    }
+        ManagedPortDecision::Lease(lease) => lease,
+    };
 
     let mut record = ManagedServiceRecord::new(
         paths,
@@ -5445,7 +5601,7 @@ fn spawn_managed_engine_child(
         requested_model,
         resolve.canonical_model_id.clone(),
         host,
-        port,
+        lease.port(),
         "managed",
         0,
         runtime_id.map(str::to_owned),
@@ -5454,8 +5610,61 @@ fn spawn_managed_engine_child(
     );
     record.gpu_indices = gpu_indices.to_vec();
     record.engine_recipe_json = requested_recipe_json;
+    // Publishing the record inside the lock is what reserves the leased port for
+    // every other transaction. From here on, any failure must remove it again.
     record.write()?;
 
+    match launch_managed_engine_child_locked(
+        paths,
+        &mut record,
+        lease,
+        engine,
+        service_id,
+        resolve,
+        host,
+        device_policy,
+        gpu_indices,
+        runtime_id,
+        env_id,
+        engine_recipe,
+    ) {
+        Ok(child_pid) => Ok(ManagedSpawn::Spawned {
+            record: Box::new(record),
+            child_pid,
+        }),
+        Err(error) => {
+            // Pre-spawn failures reach here with nothing running; a post-spawn
+            // publication failure already terminated its child, and the removals
+            // are idempotent.
+            abandon_failed_managed_launch(paths, &record, None);
+            Err(error)
+        }
+    }
+}
+
+/// The side-effecting half of the launch transaction: create the log, prepare
+/// concrete argv, hand the leased port to the child, spawn it, reject a child
+/// that has already exited, and publish the running record.
+///
+/// Split out of [`spawn_managed_engine_child`] so that *every* failure below the
+/// record's first write is funnelled through one cleanup path before the
+/// allocation lock is released. Returns the child pid.
+#[allow(clippy::too_many_arguments)]
+fn launch_managed_engine_child_locked(
+    paths: &AppPaths,
+    record: &mut ManagedServiceRecord,
+    lease: rocm_core::LoopbackPortLease,
+    engine: &str,
+    service_id: &str,
+    resolve: &ResolveModelResponse,
+    host: &str,
+    device_policy: &DevicePolicy,
+    gpu_indices: &[u32],
+    runtime_id: Option<&str>,
+    env_id: Option<&str>,
+    engine_recipe: Option<&EngineRecipeHint>,
+) -> Result<u32> {
+    let port = record.port;
     if let Some(parent) = record.engine_state_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -5494,6 +5703,12 @@ fn spawn_managed_engine_child(
     // for managed spawns, so enforce the invariant here too rather than relying
     // on every future caller having done so.
     ensure_public_service_has_endpoint_key(host, endpoint_key_file.is_some())?;
+    // Hand the port over: close the probe socket immediately before the spawn,
+    // still under the allocation lock, so no other ROCm transaction can take it
+    // in the meantime. On a custom host the lease never held a socket and this
+    // is a no-op — the engine owns that bind.
+    debug_assert_eq!(lease.port(), port);
+    lease.release();
     #[cfg(windows)]
     let child_pid = {
         let env_values = app_path_env_var_values(paths, engine_envs_root.as_deref());
@@ -5539,12 +5754,15 @@ fn spawn_managed_engine_child(
     // verifies this exact process rather than a recycled PID.
     record.supervisor_start_ticks = rocm_core::process_start_ticks(child_pid);
     record.status = "running".to_owned();
-    record.write()?;
+    // A surviving child is `running`, never `ready`: it holds a process, not a
+    // proven endpoint. If it cannot be recorded it would be unsupervised and
+    // invisible while holding the port, so terminate it rather than leak it.
+    if let Err(error) = record.write() {
+        abandon_failed_managed_launch(paths, record, Some(child_pid));
+        return Err(error.context("failed to publish the managed service record"));
+    }
 
-    Ok(ManagedSpawn::Spawned {
-        record: Box::new(record),
-        child_pid,
-    })
+    Ok(child_pid)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5554,7 +5772,7 @@ fn start_managed_service(
     requested_model: &str,
     resolve: &ResolveModelResponse,
     host: &str,
-    port: u16,
+    port_request: serve_port::PortRequest,
     device_policy: &DevicePolicy,
     gpu_indices: &[u32],
     runtime_id: Option<&str>,
@@ -5571,7 +5789,7 @@ fn start_managed_service(
         requested_model,
         resolve,
         host,
-        port,
+        port_request,
         device_policy,
         gpu_indices,
         runtime_id,
@@ -5581,6 +5799,9 @@ fn start_managed_service(
         ManagedSpawn::AlreadyRunning(report) => return Ok(report),
         ManagedSpawn::Spawned { record, child_pid } => (*record, child_pid),
     };
+    // The transaction resolved the request to one concrete port; everything
+    // below — readiness, the endpoint URL, the audit line — uses that.
+    let port = record.port;
 
     #[cfg(windows)]
     thread::sleep(Duration::from_millis(200));
@@ -5760,7 +5981,7 @@ fn run_attached_service(
     requested_model: &str,
     resolve: &ResolveModelResponse,
     host: &str,
-    port: u16,
+    port_request: serve_port::PortRequest,
     gpu_indices: &[u32],
     runtime_id: Option<&str>,
     env_id: Option<&str>,
@@ -5775,7 +5996,7 @@ fn run_attached_service(
         requested_model,
         resolve,
         host,
-        port,
+        port_request,
         &resolve.device_policy,
         gpu_indices,
         runtime_id,
@@ -5783,7 +6004,7 @@ fn run_attached_service(
         resolve.engine_recipe.as_ref(),
     )?;
 
-    let (service_id, log_path, child_pid) = match spawn {
+    let (service_id, log_path, port, child_pid) = match spawn {
         // A server for this engine+model is already live. Don't fight it for the
         // port — point the user at the existing one instead of tailing a log we
         // did not start.
@@ -5797,9 +6018,14 @@ fn run_attached_service(
             drop_orphaned_endpoint_key_on_already_running(&paths, service_id, endpoint_api_key);
             return Ok(());
         }
-        ManagedSpawn::Spawned { record, child_pid } => {
-            (service_id.to_owned(), record.log_path.clone(), child_pid)
-        }
+        // Attached mode is a managed record too, so it shares the transaction's
+        // resolved concrete port.
+        ManagedSpawn::Spawned { record, child_pid } => (
+            service_id.to_owned(),
+            record.log_path.clone(),
+            record.port,
+            child_pid,
+        ),
     };
 
     // The child is a managed service that outlives this session once detached, so
@@ -14737,30 +14963,29 @@ pub(crate) fn managed_service_is_live(record: &ManagedServiceRecord) -> bool {
 }
 
 /// Idempotency guard for managed launches: returns an already-live managed
-/// service for this engine+model, if any. The caller compares its effective
-/// launch recipe before deciding whether reuse is safe.
+/// service for this engine+model, if any, from an already-refreshed live set.
+/// The caller compares its effective launch recipe before deciding whether reuse
+/// is safe.
 ///
 /// Keyed on `(engine, canonical_model_id)` — NOT `service_id`. `generate_service_id`
 /// embeds `unix_time_millis()`, so every launch mints a unique id; matching on it
-/// would never catch a duplicate. `load_managed_services` refreshes liveness, so
+/// would never catch a duplicate. [`live_managed_services`] refreshes liveness, so
 /// stale manifests (dead PIDs) demote to "stopped" and are skipped, letting a
 /// genuine relaunch proceed. Records are sorted newest-first, so `find` returns
 /// the newest live match. Prevents a second `serve --managed` for the same
 /// engine+model from spawning a duplicate process once the TUI job-bridge guard
 /// has cleared.
-fn existing_live_managed_service(
-    paths: &AppPaths,
+///
+/// Takes the snapshot rather than the paths so the allocation transaction loads
+/// it once and uses it for both this check and the port reservations: duplicate
+/// detection and candidate selection can never observe different states.
+fn existing_live_managed_service_in<'a>(
+    live: &'a [ManagedServiceRecord],
     engine: &str,
     canonical_model_id: &str,
-) -> Option<ManagedServiceRecord> {
-    load_managed_services(paths)
-        .ok()?
-        .into_iter()
-        .find(|record| {
-            record.engine == engine
-                && record.canonical_model_id == canonical_model_id
-                && managed_service_is_live(record)
-        })
+) -> Option<&'a ManagedServiceRecord> {
+    live.iter()
+        .find(|record| record.engine == engine && record.canonical_model_id == canonical_model_id)
 }
 
 fn managed_service_running_state(status: &str) -> &'static str {
@@ -18159,6 +18384,76 @@ mod tests {
             }
             other => panic!("expected Serve, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn serve_without_port_flag_requests_automatic_selection() {
+        let cli = parse_serve(&[]).expect("bare serve parses");
+        match cli.command {
+            Some(Command::Serve { port, host, .. }) => {
+                assert_eq!(port, None, "omitted --port must stay unresolved");
+                assert_eq!(host, DEFAULT_LOCAL_HOST);
+                assert!(serve_port::PortRequest::from_flag(port).is_auto());
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_with_explicit_port_keeps_it_concrete() {
+        let cli = parse_serve(&["--port", "8000"]).expect("explicit port parses");
+        match cli.command {
+            Some(Command::Serve { port, .. }) => {
+                assert_eq!(port, Some(8000));
+                assert_eq!(
+                    serve_port::PortRequest::from_flag(port),
+                    serve_port::PortRequest::Explicit(8000)
+                );
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_rejects_a_zero_or_out_of_range_port() {
+        for bad in ["0", "65536", "-1", "auto"] {
+            let error = parse_serve(&["--port", bad]).expect_err("must be rejected");
+            assert!(
+                error.to_string().contains("between 1 and 65535"),
+                "unexpected error for --port {bad}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_engine_serve_command_keeps_a_concrete_default_port() {
+        // Only the user-facing verb gained automatic selection; the direct engine
+        // entry point still requires (and defaults to) a concrete port.
+        let cli = Cli::try_parse_from([
+            "rocm",
+            "__engine-serve-http",
+            "lemonade",
+            "svc-1",
+            "qwen",
+            "--state-path",
+            "state.json",
+        ])
+        .expect("hidden engine command parses");
+        match cli.command {
+            Some(Command::EngineServeHttp { port, host, .. }) => {
+                assert_eq!(port, rocm_core::DEFAULT_LOCAL_PORT);
+                assert_eq!(host, DEFAULT_LOCAL_HOST);
+            }
+            other => panic!("expected EngineServeHttp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_port_help_documents_omission_and_the_custom_host_rule() {
+        let help = serve_arg_help("port");
+        assert!(help.contains("11435"), "{help}");
+        assert!(help.contains("automatically"), "{help}");
+        assert!(help.contains("127.0.0.1"), "{help}");
     }
 
     #[test]
@@ -22290,7 +22585,9 @@ install therock";
         live.created_at_unix_ms = 2000;
         live.write()?;
 
-        let found = existing_live_managed_service(&paths, "lemonade", "qwen-canonical");
+        let live_services = live_managed_services(&paths);
+        let found =
+            existing_live_managed_service_in(&live_services, "lemonade", "qwen-canonical").cloned();
         let _ = fs::remove_dir_all(root);
 
         let found = found.expect("a live managed service should be detected by engine+model");
@@ -22326,7 +22623,8 @@ install therock";
         record.engine_pid = Some(999_999_999);
         record.write()?;
 
-        let found = existing_live_managed_service(&paths, "lemonade", "qwen-canonical");
+        let live = live_managed_services(&paths);
+        let found = existing_live_managed_service_in(&live, "lemonade", "qwen-canonical");
         let _ = fs::remove_dir_all(root);
 
         assert!(
@@ -22360,7 +22658,8 @@ install therock";
         record.engine_pid = Some(std::process::id());
         record.write()?;
 
-        let found = existing_live_managed_service(&paths, "lemonade", "qwen-canonical");
+        let live = live_managed_services(&paths);
+        let found = existing_live_managed_service_in(&live, "lemonade", "qwen-canonical");
         let _ = fs::remove_dir_all(root);
 
         assert!(
@@ -22374,9 +22673,391 @@ install therock";
     fn missing_manifest_allows_launch() {
         // No services dir / manifests → nothing to detect, launch proceeds.
         let (root, paths) = test_paths("dup-managed-missing");
-        let found = existing_live_managed_service(&paths, "lemonade", "qwen-canonical");
+        let live = live_managed_services(&paths);
+        let found = existing_live_managed_service_in(&live, "lemonade", "qwen-canonical");
         let _ = fs::remove_dir_all(root);
         assert!(found.is_none());
+    }
+
+    /// A live managed record: own PID + a live status, so liveness refresh keeps
+    /// it (and therefore its port reservation) in place.
+    fn write_live_service_record(
+        paths: &AppPaths,
+        service_id: &str,
+        canonical_model_id: &str,
+        port: u16,
+        status: &str,
+    ) -> Result<ManagedServiceRecord> {
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            service_id,
+            "lemonade",
+            canonical_model_id,
+            canonical_model_id.to_owned(),
+            DEFAULT_LOCAL_HOST,
+            port,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = status.to_owned();
+        record.engine_pid = Some(std::process::id());
+        record.write()?;
+        Ok(record)
+    }
+
+    fn never_probe(_port: u16) -> std::io::Result<rocm_core::LoopbackPortLease> {
+        panic!("no port may be probed on this path")
+    }
+
+    fn always_free(port: u16) -> std::io::Result<rocm_core::LoopbackPortLease> {
+        Ok(rocm_core::LoopbackPortLease::engine_owned(port))
+    }
+
+    #[test]
+    fn allocation_transaction_answers_an_equivalent_live_service_before_leasing() -> Result<()> {
+        let (root, paths) = test_paths("alloc-duplicate-first");
+        paths.ensure()?;
+        write_live_service_record(
+            &paths,
+            "lemonade-qwen-1",
+            "qwen-canonical",
+            11_501,
+            "starting",
+        )?;
+
+        let decision = resolve_managed_port_in_transaction(
+            &paths,
+            "lemonade",
+            "qwen-canonical",
+            DEFAULT_LOCAL_HOST,
+            serve_port::PortRequest::Auto,
+            &mut never_probe,
+        );
+        let _ = fs::remove_dir_all(root);
+
+        match decision? {
+            ManagedPortDecision::AlreadyLive(existing) => {
+                assert_eq!(existing.service_id, "lemonade-qwen-1");
+                assert_eq!(existing.port, 11_501);
+            }
+            ManagedPortDecision::Lease(lease) => {
+                panic!("expected the duplicate guard, leased {}", lease.port())
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn allocation_transaction_skips_ports_reserved_by_other_live_services() -> Result<()> {
+        let (root, paths) = test_paths("alloc-skip-reserved");
+        paths.ensure()?;
+        write_live_service_record(&paths, "lemonade-a-1", "model-a", 11_435, "running")?;
+        write_live_service_record(&paths, "lemonade-b-1", "model-b", 11_436, "recovering")?;
+
+        let decision = resolve_managed_port_in_transaction(
+            &paths,
+            "lemonade",
+            "model-c",
+            DEFAULT_LOCAL_HOST,
+            serve_port::PortRequest::Auto,
+            &mut always_free,
+        );
+        let _ = fs::remove_dir_all(root);
+
+        match decision? {
+            // A `recovering` record owns its port just as firmly as a running
+            // one: CLI automatic selection must not race daemon recovery for it.
+            ManagedPortDecision::Lease(lease) => assert_eq!(lease.port(), 11_437),
+            ManagedPortDecision::AlreadyLive(existing) => {
+                panic!("unexpected duplicate match {}", existing.service_id)
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn allocation_transaction_ignores_stopped_records() -> Result<()> {
+        let (root, paths) = test_paths("alloc-ignore-stopped");
+        paths.ensure()?;
+        let mut stale = ManagedServiceRecord::new(
+            &paths,
+            "lemonade-stale-1",
+            "lemonade",
+            "model-a",
+            "model-a".to_owned(),
+            DEFAULT_LOCAL_HOST,
+            11_435,
+            "managed",
+            999_999_999,
+            None,
+            None,
+            None,
+        );
+        stale.status = "ready".to_owned();
+        stale.engine_pid = Some(999_999_999);
+        stale.write()?;
+
+        let decision = resolve_managed_port_in_transaction(
+            &paths,
+            "lemonade",
+            "model-a",
+            DEFAULT_LOCAL_HOST,
+            serve_port::PortRequest::Auto,
+            &mut always_free,
+        );
+        let _ = fs::remove_dir_all(root);
+
+        match decision? {
+            // Dead PIDs demote to "stopped", so neither the duplicate guard nor
+            // the reservation applies: the first candidate is free again.
+            ManagedPortDecision::Lease(lease) => assert_eq!(lease.port(), 11_435),
+            ManagedPortDecision::AlreadyLive(existing) => {
+                panic!(
+                    "a stopped record must not block relaunch: {}",
+                    existing.service_id
+                )
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn allocation_transaction_rejects_an_explicit_port_a_recovering_service_holds() -> Result<()> {
+        let (root, paths) = test_paths("alloc-explicit-recovering");
+        paths.ensure()?;
+        write_live_service_record(&paths, "lemonade-rec-1", "model-a", 11_435, "recovering")?;
+
+        let decision = resolve_managed_port_in_transaction(
+            &paths,
+            "lemonade",
+            "model-b",
+            DEFAULT_LOCAL_HOST,
+            serve_port::PortRequest::Explicit(11_435),
+            &mut never_probe,
+        );
+        let _ = fs::remove_dir_all(root);
+
+        let error = decision.expect_err("a recovering service still owns its port");
+        let message = format!("{error:#}");
+        assert!(message.contains("lemonade-rec-1"), "{message}");
+        assert!(message.contains("recovering"), "{message}");
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_auto_transactions_publish_distinct_ports() -> Result<()> {
+        use std::sync::{Arc, Barrier};
+
+        let (root, paths) = test_paths("alloc-concurrent-distinct");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+        let barrier = Arc::new(Barrier::new(2));
+
+        let mut handles = Vec::new();
+        for model in ["model-a", "model-b"] {
+            let paths = paths.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || -> Result<u16> {
+                barrier.wait();
+                // Exactly the production transaction: one lock around decision
+                // and publication, real sockets for the preflight.
+                let _allocation = rocm_core::lock_service_allocation(&paths)?;
+                let lease = match resolve_managed_port_in_transaction(
+                    &paths,
+                    "lemonade",
+                    model,
+                    DEFAULT_LOCAL_HOST,
+                    serve_port::PortRequest::Auto,
+                    &mut serve_port::loopback_bind_probe,
+                )? {
+                    ManagedPortDecision::Lease(lease) => lease,
+                    ManagedPortDecision::AlreadyLive(existing) => {
+                        anyhow::bail!("unexpected duplicate {}", existing.service_id)
+                    }
+                };
+                let port =
+                    write_live_service_record(&paths, model, model, lease.port(), "starting")?.port;
+                lease.release();
+                Ok(port)
+            }));
+        }
+
+        let ports: Vec<u16> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("transaction thread"))
+            .collect::<Result<Vec<u16>>>()?;
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(ports.len(), 2);
+        assert_ne!(
+            ports[0], ports[1],
+            "two concurrent automatic launches must not publish the same port"
+        );
+        for port in ports {
+            assert!((serve_port::AUTO_PORT_FIRST..=serve_port::AUTO_PORT_LAST).contains(&port));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_equivalent_transactions_converge_on_one_record() -> Result<()> {
+        use std::sync::{Arc, Barrier};
+
+        let (root, paths) = test_paths("alloc-concurrent-equivalent");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+        let barrier = Arc::new(Barrier::new(2));
+
+        let mut handles = Vec::new();
+        for id in ["lemonade-dup-1", "lemonade-dup-2"] {
+            let paths = paths.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || -> Result<bool> {
+                barrier.wait();
+                let _allocation = rocm_core::lock_service_allocation(&paths)?;
+                match resolve_managed_port_in_transaction(
+                    &paths,
+                    "lemonade",
+                    "shared-model",
+                    DEFAULT_LOCAL_HOST,
+                    serve_port::PortRequest::Auto,
+                    &mut serve_port::loopback_bind_probe,
+                )? {
+                    ManagedPortDecision::Lease(lease) => {
+                        write_live_service_record(
+                            &paths,
+                            id,
+                            "shared-model",
+                            lease.port(),
+                            "starting",
+                        )?;
+                        lease.release();
+                        Ok(true)
+                    }
+                    ManagedPortDecision::AlreadyLive(_) => Ok(false),
+                }
+            }));
+        }
+
+        let launched: Vec<bool> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("transaction thread"))
+            .collect::<Result<Vec<bool>>>()?;
+        let published = live_managed_services(&paths).len();
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(
+            launched.iter().filter(|launched| **launched).count(),
+            1,
+            "exactly one of two equivalent requests may launch"
+        );
+        assert_eq!(published, 1, "the loser must not publish a second record");
+        Ok(())
+    }
+
+    #[test]
+    fn abandoned_launch_leaves_no_record_log_or_endpoint_key() -> Result<()> {
+        let (root, paths) = test_paths("alloc-abandon-artifacts");
+        paths.ensure()?;
+        let record =
+            write_live_service_record(&paths, "lemonade-fail-1", "model-a", 11_435, "starting")?;
+        fs::create_dir_all(record.log_path.parent().expect("log parent"))?;
+        fs::write(&record.log_path, b"engine log")?;
+        if let Some(parent) = record.engine_state_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&record.engine_state_path, b"{}")?;
+        endpoint_keys::store_endpoint_api_key(&paths, &record.service_id, "secret-key")?;
+
+        abandon_failed_managed_launch(&paths, &record, None);
+
+        let manifest_exists = record.manifest_path.exists();
+        let log_exists = record.log_path.exists();
+        let state_exists = record.engine_state_path.exists();
+        let key = endpoint_keys::endpoint_api_key(&paths, &record.service_id);
+        // The reservation must be gone too: nothing may still claim the port.
+        let live = live_managed_services(&paths);
+        let _ = fs::remove_dir_all(root);
+
+        assert!(!manifest_exists, "a failed attempt must not leave a record");
+        assert!(!log_exists, "a failed attempt must not leave a log");
+        assert!(
+            !state_exists,
+            "a failed attempt must not leave engine state"
+        );
+        assert_eq!(key, None, "a failed attempt must not leave an endpoint key");
+        assert!(
+            live.is_empty(),
+            "a failed attempt must leave no reservation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "spawned as a child process by abandoned_launch_terminates_the_spawned_child"]
+    fn managed_launch_cleanup_sleeper_child() {
+        if std::env::var_os("ROCM_TEST_SLEEPER_CHILD").is_none() {
+            return;
+        }
+        thread::sleep(Duration::from_mins(2));
+    }
+
+    #[test]
+    fn abandoned_launch_terminates_the_spawned_child() -> Result<()> {
+        let (root, paths) = test_paths("alloc-abandon-child");
+        paths.ensure()?;
+        let record =
+            write_live_service_record(&paths, "lemonade-fail-2", "model-a", 11_435, "starting")?;
+
+        // A real, long-lived child stands in for an engine process that was
+        // spawned but whose record could not be published.
+        let mut child = ProcessCommand::new(std::env::current_exe().expect("test binary"))
+            .arg("tests::managed_launch_cleanup_sleeper_child")
+            .arg("--exact")
+            .arg("--ignored")
+            .env("ROCM_TEST_SLEEPER_CHILD", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleeper child");
+        let child_pid = child.id();
+
+        abandon_failed_managed_launch(&paths, &record, Some(child_pid));
+
+        // On Unix a killed direct child stays a zombie — and therefore "running"
+        // to a `kill(pid, 0)` probe — until its parent reaps it, so prove death
+        // by reaping, then confirm the pid is gone.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut exited = None;
+        while exited.is_none() && std::time::Instant::now() < deadline {
+            exited = child.try_wait().expect("query sleeper child");
+            if exited.is_none() {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+        let terminated = exited.is_some();
+        if !terminated {
+            // Cleanup did not kill it: do so here rather than leaking a sleeper
+            // for two minutes, and reap it so no zombie outlives the test.
+            let _ = child.kill();
+        }
+        // Reaped on every path, including the deadline path above.
+        let _ = child.wait();
+        let manifest_exists = record.manifest_path.exists();
+        let still_running = !terminated || process_is_running(child_pid);
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            terminated,
+            "a child that could not be published must be terminated"
+        );
+        assert!(!still_running, "the child pid must be gone after cleanup");
+        assert!(!manifest_exists, "its record must be removed as well");
+        Ok(())
     }
 
     #[test]
@@ -22441,7 +23122,7 @@ install therock";
             "qwen",
             &resolve,
             "127.0.0.1",
-            11511,
+            serve_port::PortRequest::Explicit(11511),
             &resolve.device_policy,
             &[],
             None,
