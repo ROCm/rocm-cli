@@ -87,6 +87,19 @@ pub struct E2eWorld {
     pub lifecycle: Option<e2e::lifecycle_steps::LifecycleState>,
 }
 
+/// One scenario's resolved expectation plus the identity needed to report it.
+///
+/// Recorded by `filter_run`, which sees every scenario — including the ones it
+/// filters OUT. A filtered (skipped) scenario never reaches `report.json`, so
+/// this is the only place its feature and name survive to `platform.json`.
+struct Resolution {
+    expectation: e2e_cucumber::expectation::Expectation,
+    /// Effective serve engine for this scenario on this host.
+    engine: String,
+    feature: String,
+    scenario: String,
+}
+
 /// Resolve a CI-provided shared-directory env var to a validated, existing path.
 ///
 /// The value is CI-controlled, but validate it before it reaches a filesystem
@@ -905,8 +918,11 @@ async fn main() {
     // Populated by `filter_run` (which sees every scenario, run or skipped) so
     // the post-run evaluation and platform.json can reconcile by id — including
     // skipped scenarios, which never appear in cucumber's report.json.
-    // id → (resolved expectation, effective engine for that scenario).
-    let resolutions: &'static Mutex<BTreeMap<String, (Expectation, String)>> =
+    // id → (resolved expectation, effective engine, feature name, scenario name).
+    // The feature/scenario names travel with the resolution so platform.json can
+    // place even a SKIPPED scenario under its feature in the report's grouped
+    // grid — a skip never reaches report.json, which is the only other source.
+    let resolutions: &'static Mutex<BTreeMap<String, Resolution>> =
         Box::leak(Box::new(Mutex::new(BTreeMap::new())));
 
     // `.run()` records failures into the writers but never sets a non-zero exit
@@ -962,7 +978,7 @@ async fn main() {
         // host — e.g. a required engine can't start) are filtered out and never
         // run; their resolution is still recorded so platform.json can show N/A.
         .filter_run(concat!(env!("CARGO_MANIFEST_DIR"), "/features/"), {
-            move |_feature, _rule, scenario| {
+            move |feature, _rule, scenario| {
                 let decl = ScenarioDecl::from_tags(&scenario.tags);
                 let expectation = resolve(
                     &decl,
@@ -976,10 +992,15 @@ async fn main() {
                     && !matches!(expectation, Expectation::Skip { .. });
                 if let Some(id) = &decl.id {
                     let engine = decl.effective_engine(cap).to_owned();
-                    let prev = resolutions
-                        .lock()
-                        .expect("resolutions poisoned")
-                        .insert(id.clone(), (expectation, engine));
+                    let prev = resolutions.lock().expect("resolutions poisoned").insert(
+                        id.clone(),
+                        Resolution {
+                            expectation,
+                            engine,
+                            feature: feature.name.clone(),
+                            scenario: scenario.name.clone(),
+                        },
+                    );
                     // Two scenarios sharing an `@id` would silently overwrite each
                     // other's resolution (e.g. a copy-paste with a forgotten id
                     // change) — the report grid keys on @id, so the collision would
@@ -1034,8 +1055,14 @@ async fn main() {
         versions,
         expectations: resolutions
             .iter()
-            .map(|(id, (exp, engine))| {
-                e2e_cucumber::expectation::ResolvedScenario::new(id, engine, exp)
+            .map(|(id, r)| {
+                e2e_cucumber::expectation::ResolvedScenario::new(
+                    id,
+                    &r.feature,
+                    &r.scenario,
+                    &r.engine,
+                    &r.expectation,
+                )
             })
             .collect(),
     };
@@ -1051,7 +1078,7 @@ async fn main() {
     let mut unexpected_fail = Vec::new();
     let mut xfail_count = 0u32;
     for (id, passed) in &actual {
-        match resolutions.get(id).map(|(exp, _)| exp) {
+        match resolutions.get(id).map(|r| &r.expectation) {
             Some(Expectation::ExpectXfail { bug, flaky, .. }) => {
                 if *passed {
                     let label = format!("{id} ({bug})");
