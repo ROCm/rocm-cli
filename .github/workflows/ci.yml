@@ -121,6 +121,11 @@ jobs:
               - '**/*.ps1'
               - '**/*.feature'
               - 'tests/e2e-cucumber/**'
+              # skills/rocm-doctor/reference.md is an e2e FIXTURE: the
+              # rocm_doctor_skill.feature scenarios parse its catalog table and
+              # compare it to `rocm fix`. A skill-only edit must therefore run
+              # the E2E job, which gates on `heavy`.
+              - 'skills/**'
               - 'install*'
               # Pinned-key consistency compares docs/keys/* against the installers,
               # so a canonical-key-only change must trigger the heavy job that runs
@@ -183,6 +188,61 @@ jobs:
             --title "$PR_TITLE" \
             --body "$PR_BODY" \
             --commits-file /tmp/pr-commits.txt >> "$GITHUB_STEP_SUMMARY"
+
+  # Advisory nudge: `skills/rocm-doctor/` is a byte-verbatim mirror of the skill
+  # published in amd/skills, kept here so the e2e suite can test its claims
+  # against the binary it drives. The mirror rots when the UPSTREAM copy moves
+  # and this one doesn't, so the check runs on every PR rather than only when
+  # skills/ is touched — otherwise the case it exists for never fires. Never
+  # blocks: advisory only, fail-open on any fetch problem, and deliberately NOT
+  # a required check.
+  skill-mirror-drift:
+    name: rocm-doctor mirror drift (advisory)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Compare skills/rocm-doctor against amd/skills
+        env:
+          UPSTREAM: https://raw.githubusercontent.com/amd/skills/main/skills/rocm-doctor
+        run: |
+          drifted=0
+          missing=0
+          for f in SKILL.md reference.md skill-card.md; do
+            if ! curl --proto '=https' --tlsv1.2 -fsSL "${UPSTREAM}/${f}" -o "/tmp/upstream-${f}"; then
+              echo "- \`${f}\`: could not fetch from amd/skills (not published yet, or upstream unreachable)" >> /tmp/drift.md
+              missing=$((missing + 1))
+              continue
+            fi
+            if ! diff -u "/tmp/upstream-${f}" "skills/rocm-doctor/${f}" > "/tmp/diff-${f}"; then
+              drifted=$((drifted + 1))
+              {
+                echo "<details><summary><code>${f}</code> differs from amd/skills</summary>"
+                echo
+                echo '```diff'
+                head -c 8000 "/tmp/diff-${f}"
+                echo '```'
+                echo "</details>"
+              } >> /tmp/drift.md
+            fi
+          done
+          {
+            echo "## rocm-doctor skill mirror"
+            echo
+            if [ "${drifted}" -eq 0 ] && [ "${missing}" -eq 0 ]; then
+              echo "In sync with \`amd/skills@main\`."
+            elif [ "${drifted}" -eq 0 ]; then
+              echo "Nothing to compare against yet — the skill is not on \`amd/skills@main\`."
+              echo
+              cat /tmp/drift.md
+            else
+              echo "\`skills/rocm-doctor/\` is a verbatim mirror. Reconcile it with the"
+              echo "published copy in \`amd/skills\` — and remember the failure-mode catalog"
+              echo "itself is authoritative in \`crates/rocm-core\`, so the docs follow the CLI."
+              echo
+              cat /tmp/drift.md
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build-and-test:
     runs-on: ubuntu-latest
