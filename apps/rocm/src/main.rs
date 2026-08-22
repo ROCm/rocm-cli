@@ -7153,6 +7153,70 @@ fn ensure_torch_runtime_dep(approved: bool, dep: &TorchRuntimeDep) {
     }
 }
 
+/// Refuse an `apt-get install` step that would remove ROCm/AMDGPU packages.
+///
+/// `apt-get install -y` assumes yes for *removals* as well as installs, so a
+/// dependency solution that evicts the ROCm stack would otherwise be applied
+/// unattended (this runs automatically under `rocm install sdk` whenever root or
+/// passwordless sudo is available). Simulating first turns that silent breakage
+/// into an actionable error naming every package at risk.
+///
+/// Only apt is gated: the dnf/zypper/pacman plans install additive runtime
+/// packages and have no equivalent assume-yes removal path. A simulation that
+/// cannot be run (apt missing, transient failure) is not treated as a refusal —
+/// the real command reports the failure with better context.
+fn ensure_apt_install_preserves_rocm(argv: &[String]) -> Result<()> {
+    let Some(simulate_argv) = rocm_core::openmpi::apt_simulate_argv(argv) else {
+        return Ok(());
+    };
+    let (program, args) = simulate_argv
+        .split_first()
+        .context("apt simulation has no program to run")?;
+    let Ok(output) = ProcessCommand::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+    else {
+        return Ok(());
+    };
+    if !output.status.success() {
+        return Ok(());
+    }
+
+    let removals =
+        rocm_core::openmpi::parse_apt_simulate_removals(&String::from_utf8_lossy(&output.stdout));
+    let protected: Vec<&String> = removals
+        .iter()
+        .filter(|package| rocm_core::openmpi::is_protected_rocm_package(package))
+        .collect();
+    if protected.is_empty() {
+        return Ok(());
+    }
+
+    let rendered = |packages: &[&String]| {
+        packages
+            .iter()
+            .map(|package| package.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let others: Vec<&String> = removals
+        .iter()
+        .filter(|package| !rocm_core::openmpi::is_protected_rocm_package(package))
+        .collect();
+    let other_detail = if others.is_empty() {
+        String::new()
+    } else {
+        format!("\n  other packages it would remove: {}", rendered(&others))
+    };
+    bail!(
+        "refusing to run `{}`: it would remove ROCm packages and break this installation\n  ROCm packages it would remove: {}{}\n  action: install the dependency manually after resolving the conflict (for example with a package version that does not evict ROCm), then rerun",
+        argv.join(" "),
+        rendered(&protected),
+        other_detail
+    );
+}
+
 fn run_system_package_install_plan(
     plan: &rocm_core::openmpi::SystemPackageInstallPlan,
 ) -> Result<()> {
@@ -7162,6 +7226,8 @@ fn run_system_package_install_plan(
         // are not already root (where `sudo` may be absent); the argv runs
         // directly without a shell.
         let argv = command.resolved_argv(root);
+        // Never let an automatic dependency install evict the ROCm stack.
+        ensure_apt_install_preserves_rocm(&argv)?;
         // Inherit stdin so an interactive `sudo` password prompt (the case the
         // `--yes` approval exists for) can be answered. When already root or
         // passwordless sudo is configured, sudo does not prompt and the inherited

@@ -81,9 +81,8 @@ repository.
 | block-buffer | 0.10.4 | MIT OR Apache-2.0 |
 | block-padding | 0.3.3 | MIT OR Apache-2.0 |
 | blocking | 1.6.2 | Apache-2.0 OR MIT |
-| bollard | 0.17.1 | Apache-2.0 |
-| bollard-stubs | 1.45.0-rc.26.0.1 | Apache-2.0 |
-| bs58 | 0.5.1 | MIT/Apache-2.0 |
+| bollard | 0.21.0 | Apache-2.0 |
+| bollard-stubs | 1.53.1-rc.29.3.1 | Apache-2.0 |
 | bstr | 1.12.3 | MIT OR Apache-2.0 |
 | bumpalo | 3.20.3 | MIT OR Apache-2.0 |
 | by_address | 1.2.1 | MIT OR Apache-2.0 |
@@ -203,7 +202,6 @@ repository.
 | globset | 0.4.18 | Unlicense OR MIT |
 | globwalk | 0.9.1 | MIT |
 | h2 | 0.4.15 | MIT |
-| hashbrown | 0.12.3 | MIT OR Apache-2.0 |
 | hashbrown | 0.16.1 | MIT OR Apache-2.0 |
 | hashbrown | 0.17.1 | MIT OR Apache-2.0 |
 | heck | 0.5.0 | MIT OR Apache-2.0 |
@@ -237,7 +235,6 @@ repository.
 | idna_adapter | 1.2.2 | Apache-2.0 OR MIT |
 | ignore | 0.4.27 | Unlicense OR MIT |
 | indenter | 0.3.4 | MIT OR Apache-2.0 |
-| indexmap | 1.9.3 | Apache-2.0 OR MIT |
 | indexmap | 2.14.0 | Apache-2.0 OR MIT |
 | indoc | 2.0.7 | MIT OR Apache-2.0 |
 | inflections | 1.1.1 | MIT |
@@ -357,7 +354,7 @@ repository.
 | quote | 1.0.46 | MIT OR Apache-2.0 |
 | r-efi | 5.3.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later |
 | r-efi | 6.0.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later |
-| rand | 0.8.6 | MIT OR Apache-2.0 |
+| rand | 0.8.7 | MIT OR Apache-2.0 |
 | rand | 0.9.4 | MIT OR Apache-2.0 |
 | rand_chacha | 0.3.1 | MIT OR Apache-2.0 |
 | rand_chacha | 0.9.0 | MIT OR Apache-2.0 |
@@ -401,7 +398,6 @@ repository.
 | ryu | 1.0.23 | Apache-2.0 OR BSL-1.0 |
 | same-file | 1.0.6 | Unlicense/MIT |
 | schannel | 0.1.29 | MIT |
-| schemars | 0.9.0 | MIT |
 | schemars | 1.2.1 | MIT |
 | schemars_derive | 1.2.1 | MIT |
 | scopeguard | 1.2.0 | MIT OR Apache-2.0 |

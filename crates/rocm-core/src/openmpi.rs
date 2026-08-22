@@ -914,6 +914,95 @@ pub(crate) fn parse_os_release_field(text: &str, key: &str) -> Option<String> {
     None
 }
 
+/// Build a non-mutating apt invocation for a planned `apt-get install` command.
+///
+/// Returns `None` for other commands. Any `sudo` prefix is dropped along with
+/// assume-yes flags: `apt-get -s` changes nothing, so it needs neither root nor
+/// approval, and keeping the resulting argv visibly non-destructive makes it
+/// safe to log and test.
+pub fn apt_simulate_argv(argv: &[String]) -> Option<Vec<String>> {
+    let argv = match argv.split_first() {
+        Some((program, rest)) if program == "sudo" => rest,
+        _ => argv,
+    };
+    if argv.first().map(String::as_str) != Some("apt-get")
+        || !argv.iter().any(|arg| arg == "install")
+    {
+        return None;
+    }
+
+    let mut simulated = Vec::with_capacity(argv.len() + 1);
+    simulated.push("apt-get".to_owned());
+    simulated.push("-s".to_owned());
+    simulated.extend(
+        argv.iter()
+            .skip(1)
+            .filter(|arg| !matches!(arg.as_str(), "-y" | "--yes" | "--assume-yes"))
+            .cloned(),
+    );
+    Some(simulated)
+}
+
+/// Parse package removals from `apt-get -s` output.
+///
+/// Apt emits one `Remv <package> ...` operation per package after its readable
+/// summary. Parsing those operation records avoids depending on summary wrapping
+/// and strips apt's optional trailing `*` marker.
+pub fn parse_apt_simulate_removals(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let package = line
+                .trim_start()
+                .strip_prefix("Remv ")?
+                .split_whitespace()
+                .next()?;
+            Some(package.trim_end_matches('*').to_owned())
+        })
+        .collect()
+}
+
+/// Whether an apt package belongs to the ROCm/AMDGPU system stack and must not
+/// be removed as a side effect of automatic dependency setup.
+///
+/// Matching is by *family prefix* rather than an exhaustive package list: ROCm
+/// ships hundreds of packages and adds more every release, so enumerating exact
+/// names would silently stop protecting whatever was added last. The prefixes
+/// below cover the component families ROCm publishes — note that many are
+/// dashless (`hipblas`, `rocminfo`, `hsakmt-roct`, `llvm-amdgpu`), so a
+/// dash-separated match would miss them.
+///
+/// This deliberately favors recall over precision. A false positive only makes
+/// the CLI refuse an automatic install and ask the user to resolve it by hand,
+/// whereas a false negative silently breaks their ROCm installation. The
+/// prefixes are still specific enough not to match the packages these plans
+/// legitimately install or replace (`openmpi-bin`, `libnuma1`, `mpich`, ...).
+pub fn is_protected_rocm_package(package: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "amd-smi",
+        "amdgpu",
+        "comgr",
+        // hip, hipcc, hipblas, hipfft, hipsolver, hip-runtime-amd, hipify-clang
+        "hip",
+        // hsa-rocr, hsakmt-roct, hsa-amd-aqlprofile
+        "hsa",
+        "llvm-amdgpu",
+        "migraphx",
+        "miopen",
+        "mivisionx",
+        "openmp-extras",
+        "rccl",
+        // rocm*, plus the dashless libraries: rocblas, rocfft, rocrand,
+        // rocsolver, rocsparse, rocthrust, rocprim, rocprofiler, roctracer,
+        // rocalution, rocwmma, rocdecode, rocjpeg, rocdbgapi, rocminfo, rocr-runtime
+        "roc",
+        "rpp",
+    ];
+    // Strip any architecture qualifier (`amdgpu-core:amd64`) before matching.
+    let package = package.split(':').next().unwrap_or(package);
+    PREFIXES.iter().any(|prefix| package.starts_with(prefix))
+}
+
 fn resolve_package_manager(os_id: &str, id_like: &str) -> Option<PackageManager> {
     const APT: &[&str] = &[
         "ubuntu",
@@ -1297,6 +1386,109 @@ mod tests {
         assert!(plan.package_manager.is_none());
         assert!(plan.commands.is_empty());
         assert!(plan.reason.contains("manually"));
+    }
+
+    #[test]
+    fn apt_simulate_argv_drops_assume_yes_and_simulates() {
+        let install = InstallCommand::sudo(&["apt-get", "install", "-y", "openmpi-bin"]);
+        assert_eq!(
+            apt_simulate_argv(&install.argv).unwrap(),
+            vec!["apt-get", "-s", "install", "openmpi-bin"]
+        );
+        // The executor passes the resolved argv, which carries a `sudo` prefix
+        // when not already root; the simulation must still be recognized.
+        assert_eq!(
+            apt_simulate_argv(&install.resolved_argv(false)).unwrap(),
+            vec!["apt-get", "-s", "install", "openmpi-bin"]
+        );
+        // Non-install apt commands and other package managers are not simulated.
+        assert!(apt_simulate_argv(&InstallCommand::sudo(&["apt-get", "update"]).argv).is_none());
+        assert!(
+            apt_simulate_argv(&InstallCommand::sudo(&["dnf", "install", "-y", "openmpi"]).argv)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parses_removals_from_apt_simulation() {
+        // Mirrors the EAI-7957 report: OpenMPI setup pulling older distro
+        // toolchain packages while marking the ROCm stack for removal.
+        let output = "\
+Reading package lists...
+The following packages will be REMOVED:
+  rocm rocm-hip rocm-hip-runtime-dev mivisionx-dev rpp-dev
+The following NEW packages will be installed:
+  openmpi-bin libopenmpi-dev
+Remv rocm [7.14.0]
+Remv rocm-hip [7.14.0]
+Remv rocm-hip-runtime-dev* [7.14.0]
+Remv mivisionx-dev [7.14.0]
+Remv rpp-dev [7.14.0]
+Inst openmpi-bin (4.1.6 Ubuntu:24.04 [amd64])
+";
+        assert_eq!(
+            parse_apt_simulate_removals(output),
+            vec![
+                "rocm",
+                "rocm-hip",
+                "rocm-hip-runtime-dev",
+                "mivisionx-dev",
+                "rpp-dev"
+            ]
+        );
+        // A purely additive transaction removes nothing.
+        assert!(parse_apt_simulate_removals("Inst libnuma1 (2.0.18 [amd64])\n").is_empty());
+    }
+
+    #[test]
+    fn protects_rocm_stack_packages_only() {
+        for package in [
+            // The packages the EAI-7957 report saw apt mark for removal.
+            "rocm",
+            "rocm-hip",
+            "rocm-hip-runtime-dev",
+            "mivisionx-dev",
+            "rpp-dev",
+            // Core packages whose names do not follow a `<family>-` shape, so a
+            // dash-separated match would miss them and let apt remove the ROCm
+            // stack anyway.
+            "hsakmt-roct",
+            "llvm-amdgpu",
+            "rocminfo",
+            "hipblas",
+            "rocblas",
+            "hipcc",
+            "comgr",
+            "hsa-rocr",
+            "openmp-extras-runtime",
+            // Driver packages and architecture-qualified names.
+            "amdgpu-dkms",
+            "hip-runtime-amd",
+            "amdgpu-core:amd64",
+        ] {
+            assert!(
+                is_protected_rocm_package(package),
+                "{package} must be protected"
+            );
+        }
+        // The packages these plans legitimately install, and the MPI
+        // implementation apt may swap out to satisfy them, must stay removable
+        // or the guard would block its own install.
+        for package in [
+            "openmpi-bin",
+            "libopenmpi-dev",
+            "openmpi4",
+            "mpich",
+            "libmpich-dev",
+            "libnuma1",
+            "numactl",
+            "libatomic1",
+        ] {
+            assert!(
+                !is_protected_rocm_package(package),
+                "{package} must not be protected"
+            );
+        }
     }
 
     #[test]
