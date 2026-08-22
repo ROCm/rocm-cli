@@ -587,8 +587,8 @@ jobs:
       # check — pinning the hash here makes that fail instead. To upgrade, bump
       # the version and replace the hash with the new release's published
       # .sha256 (confirm the bytes first).
-      HAWKEYE_VERSION: v6.5.1
-      HAWKEYE_SHA256: d6eb0505a45a15244f4f789158aafe5e3f1a7dc86c9dc1d7651f3cb1e1b321e0
+      HAWKEYE_VERSION: v7.0.0
+      HAWKEYE_SHA256: 2617b43ec6f871511f7b381e3d34544d6aa47c2468541ca67102d69ff7d0f541
       HAWKEYE_INSTALL_DIR: ${{ github.workspace }}/.hawkeye-bin
     # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
     if: github.event_name != 'workflow_dispatch'
@@ -607,7 +607,7 @@ jobs:
         run: |
           tarball="hawkeye-x86_64-unknown-linux-gnu.tar.xz"
           curl --proto '=https' --tlsv1.2 -LsSf \
-            "https://github.com/korandoru/hawkeye/releases/download/${HAWKEYE_VERSION}/${tarball}" \
+            "https://github.com/fast/hawkeye/releases/download/${HAWKEYE_VERSION}/${tarball}" \
             -o "${tarball}"
           echo "${HAWKEYE_SHA256}  ${tarball}" | sha256sum -c -
           mkdir -p "${HAWKEYE_INSTALL_DIR}"
