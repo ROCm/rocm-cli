@@ -586,7 +586,7 @@ jobs:
       - name: Install hawkeye
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
-          tool: hawkeye@7.0.0
+          tool: hawkeye
 
       - name: Check license headers
         run: hawkeye check
