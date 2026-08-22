@@ -22,3 +22,21 @@ Feature: Engine shell
     And the engine environment's interpreter is the one that runs
     When the user leaves the engine shell
     Then the engine shell exits successfully
+
+  # The engine environment here is planted in the shape the vLLM install actually
+  # records — its manifest names the directory holding the engine command, not the
+  # environment root (engines/vllm/src/lib.rs derives it as `command.parent()`).
+  # That distinction is the whole scenario: the shell composes its activation hint
+  # by appending the interpreter directory to whatever the manifest recorded, so a
+  # manifest that already points inside it yields a path nobody can source.
+  #
+  # Phrased as "the file it names is there", not as "the path is not doubled": the
+  # first survives whichever way the mismatch is repaired, the second would go
+  # stale the moment it is.
+  @id:engine-shell-activation-hint-is-usable @requires-os:linux
+  Scenario: 2 - The activation hint an engine shell prints refers to a real file
+    Given a machine with an engine environment installed the way the engine records it
+    When the user opens a shell for that engine
+    Then the printed activation hint names a file that exists
+    When the user leaves the engine shell
+    Then the engine shell exits successfully

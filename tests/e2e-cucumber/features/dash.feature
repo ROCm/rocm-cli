@@ -110,3 +110,16 @@ Feature: Interactive dashboard
     Then generation throughput is no longer displayed
     When the user quits the dashboard
     Then the dashboard exits successfully
+
+  # Driven under a pseudo-terminal like the rest of this feature: the replay path
+  # opens the same interactive event loop, and a piped run is refused before it
+  # gets there (it fails on the terminal, which proves nothing about the file).
+  #
+  # The step imposes its own deadline and treats expiry as a FAILURE rather than
+  # waiting for the scenario timeout. Today the dashboard takes an unreadable
+  # session as far as the alternate screen and then sits waiting for input, so a
+  # plain "assert a non-zero exit" step would hang for as long as CI allowed.
+  @id:dash-replay-rejects-an-unreadable-session @requires-os:linux
+  Scenario: 10 - Replaying a session that cannot be read is refused promptly
+    When the user replays a session recording that does not exist
+    Then the dashboard refuses to start without opening the interactive view
