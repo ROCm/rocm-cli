@@ -58,7 +58,7 @@ Neither demo downloads a model or calls a cloud provider.
 
 `cli.tape` demonstrates:
 
-1. `rocm examine`
+1. `rocm doctor`
 2. `rocm engines list`
 3. `rocm model`
 4. `rocm services list`

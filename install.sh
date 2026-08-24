@@ -468,13 +468,13 @@ case ":${PATH}:" in
     ;;
   *)
     echo "note: rocm is installed but this shell could not update PATH"
-    echo "  run: ${INSTALL_DIR}/rocm examine"
+    echo "  run: ${INSTALL_DIR}/rocm doctor"
     ;;
 esac
 
 echo "next:"
 if [ "${UPDATE_SHELL_PATH}" = "1" ]; then
-  echo "  open a new terminal, then run: rocm examine"
+  echo "  open a new terminal, then run: rocm doctor"
 else
-  echo "  ${INSTALL_DIR}/rocm examine"
+  echo "  ${INSTALL_DIR}/rocm doctor"
 fi

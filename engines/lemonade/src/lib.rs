@@ -1149,7 +1149,7 @@ fn ensure_best_llamacpp_backend(
             "Lemonade reports no supported GPU llama.cpp backend for this host (status: {}). \
              The GPU-required policy does not fall back to CPU; install a ROCm or Vulkan \
              backend (e.g. `rocm engines install lemonade`) or verify the GPU driver with \
-             `rocm examine`.",
+             `rocm doctor`.",
             describe_llamacpp_backends(&backends)
         );
     };
@@ -3796,7 +3796,7 @@ fn resolve_gpu_indices_against(requested: &[u32], usable: Option<Vec<u32>>) -> R
         bail!(
             "no usable AMD GPU detected; `rocm serve` requires a GPU under the default \
              GPU-required policy and does not fall back to CPU. Check the driver with \
-             `rocm examine`, confirm /dev/kfd is present, and ensure HIP_VISIBLE_DEVICES / \
+             `rocm doctor`, confirm /dev/kfd is present, and ensure HIP_VISIBLE_DEVICES / \
              ROCR_VISIBLE_DEVICES are not masking every device."
         );
     }
