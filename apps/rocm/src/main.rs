@@ -81,7 +81,7 @@ const SUPPORTED_ENGINES: [&str; 2] = ["lemonade", "vllm"];
     about = "ROCm AI Command Center CLI",
     long_about = "ROCm AI Command Center CLI: install ROCm, manage local inference engines, \
 and run OpenAI-compatible model servers on AMD GPUs.\n\n\
-Run `rocm` with no subcommand to open the interactive dashboard (TUI). Use `rocm examine` \
+Run `rocm` with no subcommand to open the interactive launcher (TUI). Use `rocm examine` \
 to check that your GPU and ROCm install are ready, then `rocm serve <model>` to start a server.",
     version,
     // The `chat` example was dropped from this list when `chat` became
@@ -93,7 +93,7 @@ rocm examine                      Check GPU, ROCm install, and engines\n  \
 rocm install sdk                  Install ROCm wheels into a managed environment\n  \
 rocm engines list                 Show the local inference engines available\n  \
 rocm model                        List models this machine can run\n  \
-rocm serve qwen2.5-7b-instruct    Start a local OpenAI-compatible server\n  \
+rocm serve qwen                   Start a local OpenAI-compatible server\n  \
 rocm services list                Show running model servers\n\n\
 Commands marked [preview] work but are outside the Tech Preview's supported\n\
 scope: treat them as unfinished and do not depend on their behaviour yet.\n\n\
@@ -244,13 +244,13 @@ enum Command {
     /// configure a remote provider; the `local` provider talks to a running server.
     #[command(after_help = "EXAMPLES:\n  \
 rocm chat --prompt \"Explain ROCm in one sentence\"\n  \
-rocm chat --provider local --model qwen2.5-7b-instruct --prompt \"Hello\"\n  \
+rocm chat --provider local --model qwen --prompt \"Hello\"\n  \
 echo \"Summarize this\" | rocm chat --provider anthropic")]
     Chat {
         /// Assistant provider to use.
         #[arg(long)]
         provider: Option<Provider>,
-        /// Model name to request from the provider, such as qwen2.5-7b-instruct.
+        /// Model name to request from the provider, such as qwen.
         #[arg(long)]
         model: Option<String>,
         /// Prompt to send. If omitted, rocm-cli reads from standard input when possible.
@@ -337,9 +337,9 @@ rocm model --verbose"
     /// server running, or Ctrl-C to stop it. Inspect or stop servers later with
     /// `rocm services`.
     #[command(after_help = "EXAMPLES:\n  \
-rocm serve qwen2.5-7b-instruct\n  \
-rocm serve qwen2.5-7b-instruct --engine vllm --port 8000\n  \
-rocm serve qwen2.5-7b-instruct --verbose --device gpu_required")]
+rocm serve qwen\n  \
+rocm serve qwen --engine vllm --port 8000\n  \
+rocm serve qwen --verbose --device gpu_required")]
     Serve {
         /// Model name, alias, or local model file path.
         model: String,
