@@ -1438,6 +1438,16 @@ const TORCH_STACK_VERSION_PROBE: &str = "import json,sys\n\
 /// each package currently present, so the ComfyUI dependency resolution is pinned
 /// to them and cannot pull a CUDA build. An absent package yields no line — we
 /// only constrain what the runtime actually ships.
+///
+/// Constraining only the installed packages is safe here because the full
+/// torch/torchvision/torchaudio trio is an invariant of a managed runtime:
+/// `therock` installs all three atomically and refuses to install unless it finds
+/// a mutually-compatible set (see `select_compatible_stack` — it bails with "no
+/// mutually compatible ... torch, torchvision, and torchaudio versions"), and
+/// ComfyUI install only ever targets such a runtime (`select_runtime` requires a
+/// managed wheel install). So there is no "torch present, torchvision/torchaudio
+/// absent" runtime in which an unpinned CUDA `torchvision` could resolve against
+/// the release part of the pinned ROCm torch and install a mixed CUDA/ROCm stack.
 fn torch_stack_constraints(
     python: &Path,
     runtime_env: Option<&ComfyUiRuntimeEnvironment>,
