@@ -409,6 +409,39 @@ fn assert_engine_ready(world: &mut E2eWorld) {
         "no engine runtime is ready:\n{stdout}"
     );
 }
+#[when("the user dry-runs a nightly SDK install for a known family")]
+async fn user_dry_runs_nightly_sdk(world: &mut E2eWorld) {
+    let stdout = crate::run_rocm_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "nightly",
+            "--family",
+            "gfx120X-all",
+            "--dry-run",
+        ],
+    );
+    world.cli_output = Some(stdout);
+}
+
+#[then("the SDK preview reports canonical nightly provenance")]
+async fn assert_canonical_nightly_provenance(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no SDK preview output");
+    for expected in [
+        "channel: nightly",
+        "canonical_source: https://rocm.nightlies.amd.com/whl-multi-arch",
+        "selected_rocm_version:",
+        "build_date:",
+        "source_layout_generation: multi-arch-v2",
+    ] {
+        assert!(
+            output.contains(expected),
+            "SDK preview omitted `{expected}`:\n{output}"
+        );
+    }
+}
 
 #[when("the user tries to adopt the existing install")]
 async fn user_tries_adopt(world: &mut E2eWorld) {

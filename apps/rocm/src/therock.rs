@@ -27,11 +27,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
-const THEROCK_NIGHTLY_PIP_INDEX_BASE: &str = "https://rocm.nightlies.amd.com/v2";
-const THEROCK_RELEASE_PIP_INDEX_BASE: &str = "https://repo.amd.com/rocm/whl";
-const THEROCK_RELEASE_PIP_MULTI_ARCH_INDEX_BASE: &str = "https://repo.amd.com/rocm/whl-multi-arch";
+const THEROCK_NIGHTLY_PIP_INDEX_BASE: &str = "https://rocm.nightlies.amd.com/whl-multi-arch";
+const THEROCK_RELEASE_PIP_INDEX_BASE: &str = "https://repo.amd.com/rocm/whl-multi-arch";
 const THEROCK_RELEASE_TARBALL_BASE: &str = "https://repo.amd.com/rocm/tarball/";
 const THEROCK_NIGHTLY_TARBALL_BASE: &str = "https://rocm.nightlies.amd.com/tarball/";
+const THEROCK_SOURCE_LAYOUT_GENERATION: &str = "multi-arch-v2";
 const DEFAULT_MANAGED_PYTHON_VERSION: &str = "3.12";
 const STARTUP_UPDATE_CHECK_INTERVAL_MS: u128 = 12 * 60 * 60 * 1_000;
 const STARTUP_UPDATE_CHECK_TIMEOUT_SECS: u64 = 2;
@@ -51,6 +51,13 @@ const THEROCK_MAX_PLAUSIBLE_TARBALL_BYTES: u64 = 256 * 1024 * 1024 * 1024;
 enum TheRockChannel {
     Release,
     Nightly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CanonicalSource {
+    wheel_index: &'static str,
+    tarball_catalog: &'static str,
+    layout_generation: &'static str,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -112,12 +119,53 @@ impl TheRockChannel {
         }
     }
 
-    const fn tarball_base_url(self) -> &'static str {
-        match self {
-            Self::Release => THEROCK_RELEASE_TARBALL_BASE,
-            Self::Nightly => THEROCK_NIGHTLY_TARBALL_BASE,
-        }
+    const fn canonical_source(self) -> CanonicalSource {
+        canonical_source(self)
     }
+}
+
+const fn canonical_source(channel: TheRockChannel) -> CanonicalSource {
+    match channel {
+        TheRockChannel::Release => CanonicalSource {
+            wheel_index: THEROCK_RELEASE_PIP_INDEX_BASE,
+            tarball_catalog: THEROCK_RELEASE_TARBALL_BASE,
+            layout_generation: THEROCK_SOURCE_LAYOUT_GENERATION,
+        },
+        TheRockChannel::Nightly => CanonicalSource {
+            wheel_index: THEROCK_NIGHTLY_PIP_INDEX_BASE,
+            tarball_catalog: THEROCK_NIGHTLY_TARBALL_BASE,
+            layout_generation: THEROCK_SOURCE_LAYOUT_GENERATION,
+        },
+    }
+}
+
+fn render_canonical_provenance(
+    output: &mut String,
+    channel: TheRockChannel,
+    source_url: &str,
+    layout_generation: &str,
+    version: &str,
+) {
+    let build_date = runtime_version_build_date(version)
+        .unwrap_or_else(|| "<not published by canonical source>".to_owned());
+    let _ = writeln!(output, "  channel: {}", channel.as_str());
+    let _ = writeln!(output, "  canonical_source: {source_url}");
+    let _ = writeln!(output, "  selected_rocm_version: {version}");
+    let _ = writeln!(output, "  build_date: {build_date}");
+    let _ = writeln!(output, "  source_layout_generation: {layout_generation}");
+}
+
+fn validate_aggregate_index_layout(html: &str) -> Result<()> {
+    let required_packages = ["rocm/", "torch/", "torchvision/", "torchaudio/"];
+    if required_packages
+        .iter()
+        .all(|package| html.contains(package))
+    {
+        return Ok(());
+    }
+    bail!(
+        "unknown canonical TheRock aggregate index layout: expected package links for rocm, torch, torchvision, and torchaudio"
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -849,7 +897,14 @@ fn install_wheel_runtime(
         output,
         "  summary: rocm-cli will install the ROCm SDK and matching PyTorch packages for this Python and operating system"
     );
-    let _ = writeln!(output, "  channel: {}", channel.as_str());
+    let source = channel.canonical_source();
+    render_canonical_provenance(
+        &mut output,
+        channel,
+        source.wheel_index,
+        source.layout_generation,
+        &resolution.latest_version,
+    );
     let _ = writeln!(output, "  format: wheel");
     if let Some(selector) = version_selector {
         let _ = writeln!(output, "  requested: {}", selector.describe());
@@ -1062,7 +1117,14 @@ fn install_tarball_runtime(
 
     let mut output = String::new();
     let _ = writeln!(output, "sdk install");
-    let _ = writeln!(output, "  channel: {}", channel.as_str());
+    let source = channel.canonical_source();
+    render_canonical_provenance(
+        &mut output,
+        channel,
+        source.tarball_catalog,
+        source.layout_generation,
+        &artifact.version,
+    );
     let _ = writeln!(output, "  format: tarball");
     let _ = writeln!(output, "  family: {}", artifact.family);
     let _ = writeln!(output, "  family_source: {}", artifact.family_source);
@@ -1152,33 +1214,44 @@ fn resolve_pip_runtime_with_timeout(
     download_timeout_secs: Option<u64>,
 ) -> Result<PipRuntimeResolution> {
     let family_resolution = resolve_family(paths, family_override)?;
-    let index_urls = therock_index_urls(channel, &family_resolution.family);
-    let mut errors = Vec::new();
-    for index_url in index_urls {
-        match resolve_pip_runtime_from_index(
-            paths,
-            channel,
-            &family_resolution,
-            &index_url,
-            wheel_compatibility,
-            version_selector,
-            download_timeout_secs,
-        ) {
-            Ok(resolution) => return Ok(resolution),
-            Err(error) => errors.push(format!("{index_url}: {error}")),
-        }
-    }
-    bail!(
-        "failed to resolve TheRock {} wheel runtime from candidate indexes:\n  - {}\n\n{}",
-        channel.as_str(),
-        errors.join("\n  - "),
-        family_resolution_hint(
-            &family_resolution.source,
-            &family_resolution.family,
-            channel,
-            "wheel",
+    let source = channel.canonical_source();
+    let root_url = format!("{}/", source.wheel_index.trim_end_matches('/'));
+    let root_html = download_text_cached(
+        paths,
+        &format!("canonical-wheel-root-{}", channel.as_str()),
+        &root_url,
+        download_timeout_secs,
+    )?
+    .text;
+    validate_aggregate_index_layout(&root_html).with_context(|| {
+        format!(
+            "failed to resolve TheRock {} wheel runtime from canonical source {}",
+            channel.as_str(),
+            source.wheel_index
         )
+    })?;
+    resolve_pip_runtime_from_index(
+        paths,
+        channel,
+        &family_resolution,
+        source.wheel_index,
+        wheel_compatibility,
+        version_selector,
+        download_timeout_secs,
     )
+    .with_context(|| {
+        format!(
+            "failed to resolve TheRock {} wheel runtime from canonical source {}\n\n{}",
+            channel.as_str(),
+            source.wheel_index,
+            family_resolution_hint(
+                &family_resolution.source,
+                &family_resolution.family,
+                channel,
+                "wheel",
+            )
+        )
+    })
 }
 
 fn resolve_pip_runtime_from_index(
@@ -1262,28 +1335,64 @@ fn resolve_tarball_artifact_with_timeout(
     download_timeout_secs: Option<u64>,
 ) -> Result<TarballArtifact> {
     let family_resolution = resolve_family(paths, family_override)?;
+    let source = channel.canonical_source();
     let html = download_text_cached(
         paths,
         &format!("tarball-index-{}", channel.as_str()),
-        channel.tarball_base_url(),
+        source.tarball_catalog,
         download_timeout_secs,
     )?
     .text;
-    let files = parse_tarball_index_html(&html)?;
-    let prefix = format!(
-        "therock-dist-{}-{}-",
-        platform_tarball_token(),
-        family_resolution.family
-    );
+    let files = parse_tarball_index_html(&html).with_context(|| {
+        format!(
+            "unknown canonical TheRock tarball catalog layout at {}",
+            source.tarball_catalog
+        )
+    })?;
+    let (file, version) = select_tarball_candidate(&files, channel, &family_resolution.family)
+        .with_context(|| {
+            format!(
+                "canonical TheRock {} tarball stream is incomplete for the resolved GPU family\n\n{}",
+                channel.as_str(),
+                family_resolution_hint(
+                    &family_resolution.source,
+                    &family_resolution.family,
+                    channel,
+                    "tarball",
+                )
+            )
+        })?;
+    Ok(TarballArtifact {
+        family: family_resolution.family,
+        family_source: family_resolution.source,
+        url: format!(
+            "{}/{}",
+            source.tarball_catalog.trim_end_matches('/'),
+            file.name
+        ),
+        file_name: file.name,
+        version,
+    })
+}
+
+fn select_tarball_candidate(
+    files: &[TarballIndexFile],
+    channel: TheRockChannel,
+    family: &str,
+) -> Option<(TarballIndexFile, String)> {
+    let prefix = format!("therock-dist-{}-{family}-", platform_tarball_token());
     let mut candidates = files
-        .into_iter()
+        .iter()
         .filter_map(|file| {
             let version = file
                 .name
                 .strip_prefix(&prefix)?
                 .strip_suffix(".tar.gz")?
                 .to_owned();
-            Some((file, version))
+            if matches!(channel, TheRockChannel::Release) && !is_stable_runtime_version(&version) {
+                return None;
+            }
+            Some((file.clone(), version))
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
@@ -1293,28 +1402,7 @@ fn resolve_tarball_artifact_with_timeout(
             .unwrap_or(Ordering::Equal)
             .then_with(|| compare_version_strings(&left.1, &right.1))
     });
-    let (file, version) = candidates.pop().with_context(|| {
-        format!(
-            "no matching TheRock tarball artifact was found for the resolved GPU family\n\n{}",
-            family_resolution_hint(
-                &family_resolution.source,
-                &family_resolution.family,
-                channel,
-                "tarball",
-            )
-        )
-    })?;
-    Ok(TarballArtifact {
-        family: family_resolution.family,
-        family_source: family_resolution.source,
-        url: format!(
-            "{}/{}",
-            channel.tarball_base_url().trim_end_matches('/'),
-            file.name
-        ),
-        file_name: file.name,
-        version,
-    })
+    candidates.pop()
 }
 
 fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<FamilyResolution> {
@@ -3684,16 +3772,6 @@ fn parse_version(value: &str) -> Option<ParsedVersion> {
     })
 }
 
-fn therock_index_urls(channel: TheRockChannel, family: &str) -> Vec<String> {
-    match channel {
-        TheRockChannel::Release => vec![
-            format!("{THEROCK_RELEASE_PIP_INDEX_BASE}/{family}"),
-            format!("{THEROCK_RELEASE_PIP_MULTI_ARCH_INDEX_BASE}/{family}"),
-        ],
-        TheRockChannel::Nightly => vec![format!("{THEROCK_NIGHTLY_PIP_INDEX_BASE}/{family}")],
-    }
-}
-
 /// Recovery guidance appended to family/index resolution failures so a clean
 /// first run can recover without the user having to guess a `--family`.
 ///
@@ -4372,6 +4450,99 @@ mod tests {
             select_latest_version(&versions, TheRockChannel::Release),
             None
         );
+    }
+
+    #[test]
+    fn canonical_channels_use_only_their_aggregate_streams() {
+        let release = canonical_source(TheRockChannel::Release);
+        assert_eq!(
+            release.wheel_index,
+            "https://repo.amd.com/rocm/whl-multi-arch"
+        );
+        assert_eq!(
+            release.tarball_catalog,
+            "https://repo.amd.com/rocm/tarball/"
+        );
+        assert_eq!(release.layout_generation, "multi-arch-v2");
+
+        let nightly = canonical_source(TheRockChannel::Nightly);
+        assert_eq!(
+            nightly.wheel_index,
+            "https://rocm.nightlies.amd.com/whl-multi-arch"
+        );
+        assert_eq!(
+            nightly.tarball_catalog,
+            "https://rocm.nightlies.amd.com/tarball/"
+        );
+        assert_eq!(nightly.layout_generation, "multi-arch-v2");
+    }
+
+    #[test]
+    fn nightly_accepts_future_prerelease_major_without_cli_changes() {
+        let selected = select_matching_pip_package_versions(
+            TheRockChannel::Nightly,
+            &["10.1.0a20260822".to_owned()],
+            &["2.12.0+rocm10.1.0a20260822".to_owned()],
+            &["0.27.0+rocm10.1.0a20260822".to_owned()],
+            &["2.12.0+rocm10.1.0a20260822".to_owned()],
+            None,
+        )
+        .expect("future nightly major should resolve");
+
+        assert_eq!(selected.rocm, "10.1.0a20260822");
+    }
+
+    #[test]
+    fn tarball_selection_never_crosses_channels() {
+        let files = vec![
+            TarballIndexFile {
+                name: "therock-dist-linux-gfx120X-all-7.14.0.tar.gz".to_owned(),
+                mtime: 1.0,
+            },
+            TarballIndexFile {
+                name: "therock-dist-linux-gfx120X-all-10.1.0a20260822.tar.gz".to_owned(),
+                mtime: 2.0,
+            },
+        ];
+
+        assert_eq!(
+            select_tarball_candidate(&files, TheRockChannel::Release, "gfx120X-all")
+                .map(|(_, version)| version),
+            Some("7.14.0".to_owned())
+        );
+        assert_eq!(
+            select_tarball_candidate(&files, TheRockChannel::Nightly, "gfx120X-all")
+                .map(|(_, version)| version),
+            Some("10.1.0a20260822".to_owned())
+        );
+    }
+
+    #[test]
+    fn canonical_provenance_reports_required_dry_run_fields() {
+        let source = canonical_source(TheRockChannel::Nightly);
+        let mut output = String::new();
+        render_canonical_provenance(
+            &mut output,
+            TheRockChannel::Nightly,
+            source.wheel_index,
+            source.layout_generation,
+            "10.1.0a20260822",
+        );
+
+        assert!(output.contains("channel: nightly"));
+        assert!(output.contains("canonical_source: https://rocm.nightlies.amd.com/whl-multi-arch"));
+        assert!(output.contains("selected_rocm_version: 10.1.0a20260822"));
+        assert!(output.contains("build_date: 2026-08-22"));
+        assert!(output.contains("source_layout_generation: multi-arch-v2"));
+    }
+
+    #[test]
+    fn unknown_aggregate_layout_is_rejected_clearly() {
+        let error =
+            validate_aggregate_index_layout("<html><a href=\"gfx120X-all/\">legacy</a></html>")
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("unknown canonical TheRock aggregate index layout"));
     }
 
     #[test]
