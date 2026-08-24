@@ -201,6 +201,124 @@ pub fn uv_pip_freeze_args(venv_python: &Path) -> Vec<String> {
     ]
 }
 
+/// Arguments for `uv pip check` targeting the interpreter `venv_python`.
+///
+/// `--color never` is not cosmetic: this output is parsed, and `uv` colorizes its
+/// findings whenever `FORCE_COLOR` / `CLICOLOR_FORCE` is exported — even when stderr is
+/// a pipe rather than a terminal. The escape prefix would push every finding past the
+/// parser, which reads as "the check could not run" and silently restores the very
+/// behavior the check exists to catch.
+pub fn uv_pip_check_args(venv_python: &Path) -> Vec<String> {
+    vec![
+        "pip".to_owned(),
+        "check".to_owned(),
+        "--color".to_owned(),
+        "never".to_owned(),
+        "--python".to_owned(),
+        venv_python.to_string_lossy().into_owned(),
+    ]
+}
+
+/// One unsatisfied `Requires-Dist` in an environment, as reported by `uv pip check`.
+///
+/// The managed runtime venv has more than one owner: `rocm install sdk` writes the
+/// TheRock torch stack into it, and engines installed against that runtime write their
+/// own pinned dependencies over the top. Either side can leave the other's requirements
+/// unmet without removing any package, so "the distribution is importable" is not
+/// evidence that it can run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyViolation {
+    /// Distribution whose `Requires-Dist` is unsatisfied (the requirer, not the
+    /// package at the wrong version).
+    pub requiring: String,
+    /// The line `uv` reported, kept verbatim so the user sees the requirement and the
+    /// installed version exactly as the resolver saw them.
+    pub detail: String,
+}
+
+/// Opening frame of every line `uv pip check` emits about a distribution.
+const UV_CHECK_VIOLATION_PREFIX: &str = "The package `";
+
+/// What follows the requirer's name on an unsatisfied-requirement line specifically.
+///
+/// The trailing backtick is the whole point: `uv` reports several other conditions under
+/// the same opening frame — a missing `WHEEL`/`METADATA` file, an unsatisfied
+/// `Requires-Python`, a package with multiple installed distributions — and none of them
+/// is a `Requires-Dist` a reinstall of the requirer can resolve. Only a requirement
+/// `uv` quotes is one.
+const UV_CHECK_REQUIREMENT_INFIX: &str = " requires `";
+
+/// Report the unsatisfied `Requires-Dist` entries in the environment at `venv_python`.
+///
+/// An empty vector means every installed distribution's requirements are met. `uv pip
+/// check` writes its findings to stderr and exits non-zero when it finds any, so a
+/// non-zero exit with parsed findings is a successful check — but a non-zero exit with
+/// nothing parsed is a failed invocation (missing interpreter, unusable `uv`) and is
+/// surfaced as an error rather than mistaken for a clean environment.
+pub fn check_dependencies(
+    paths: &AppPaths,
+    venv_python: &Path,
+) -> Result<Vec<DependencyViolation>> {
+    let uv = ensure_uv_binary(paths).context("failed to acquire uv binary for dependency check")?;
+    let output = Command::new(&uv)
+        .args(uv_pip_check_args(venv_python))
+        .envs(uv_command_env(paths))
+        .output()
+        .with_context(|| format!("failed to run {} pip check", uv.display()))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let violations = parse_dependency_violations(&stderr);
+    if output.status.success() {
+        return Ok(Vec::new());
+    }
+    if violations.is_empty() {
+        bail!(
+            "`uv pip check` failed for {}: {}",
+            venv_python.display(),
+            stderr.trim()
+        );
+    }
+    Ok(violations)
+}
+
+/// The violations whose requirer is `distribution`, matched case-insensitively.
+///
+/// Environments that host an inference engine routinely carry unrelated upstream
+/// conflicts between third-party packages. Callers filter to the distribution they own
+/// so those do not bury the one finding they can act on.
+pub fn violations_requiring<'a>(
+    violations: &'a [DependencyViolation],
+    distribution: &str,
+) -> Vec<&'a DependencyViolation> {
+    violations
+        .iter()
+        .filter(|violation| violation.requiring.eq_ignore_ascii_case(distribution))
+        .collect()
+}
+
+/// Pull the unsatisfied-requirement lines out of a `uv pip check` stderr body.
+///
+/// `uv` frames one as ``The package `<requirer>` requires `<spec>`, but `<version>` is
+/// installed`` (or `` but it's not installed``), among progress lines (`Using Python
+/// ...`, `Checked N packages ...`, `Found N incompatibilities`) and reports of other
+/// conditions that share the opening frame. Both halves of the frame are required, so
+/// neither a change in the surrounding chatter nor a differently-shaped `uv` diagnostic
+/// can invent a violation.
+fn parse_dependency_violations(stderr: &str) -> Vec<DependencyViolation> {
+    stderr
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| {
+            let requirer = line.strip_prefix(UV_CHECK_VIOLATION_PREFIX)?;
+            let (requirer, rest) = requirer.split_once('`')?;
+            rest.starts_with(UV_CHECK_REQUIREMENT_INFIX)
+                .then(|| DependencyViolation {
+                    requiring: requirer.to_owned(),
+                    detail: line.to_owned(),
+                })
+        })
+        .collect()
+}
+
 /// Ensure a usable `uv` binary is available, downloading and caching one if needed.
 /// Returns the path to the executable.
 pub fn ensure_uv_binary(paths: &AppPaths) -> Result<PathBuf> {
@@ -459,6 +577,139 @@ mod tests {
             args,
             vec!["venv", "--python", "/py/bin/python3", "/envs/run"]
         );
+    }
+
+    #[test]
+    fn pip_check_args_target_venv_python_and_disable_color() {
+        let args = uv_pip_check_args(Path::new("/envs/run/bin/python"));
+        assert_eq!(
+            args,
+            vec![
+                "pip",
+                "check",
+                "--color",
+                "never",
+                "--python",
+                "/envs/run/bin/python"
+            ],
+            "the output is parsed, so color must be off even under FORCE_COLOR"
+        );
+    }
+
+    #[test]
+    fn a_colorized_finding_is_never_silently_dropped() {
+        // `--color never` is what keeps this out of the real output, but the parser must
+        // not be the only thing standing between a colorized line and a false all-clear:
+        // an escape-prefixed finding must not parse as a clean environment.
+        let stderr = "\u{1b}[1mThe package `vllm` requires `torch==2.10.0+git8514f05`, but `2.9.1` is installed\u{1b}[0m\n";
+
+        assert!(
+            parse_dependency_violations(stderr).is_empty(),
+            "a colorized line does not parse — check_dependencies reports the non-zero \
+             exit as a failed invocation rather than a clean environment"
+        );
+    }
+
+    #[test]
+    fn an_absent_requirement_is_a_violation() {
+        // Verbatim `uv pip check` output for a dependency that is missing outright
+        // rather than present at the wrong version — also an unsatisfied Requires-Dist.
+        let stderr =
+            "The package `vllm` requires `torch==2.10.0+git8514f05`, but it's not installed\n";
+
+        let violations = parse_dependency_violations(stderr);
+
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].requiring, "vllm");
+    }
+
+    #[test]
+    fn other_uv_diagnostics_sharing_the_frame_are_not_violations() {
+        // Verbatim shapes `uv pip check` emits under the same `The package `x`` opening.
+        // None is a Requires-Dist a reinstall of the requirer would resolve, so treating
+        // them as violations would force a futile multi-gigabyte reinstall and print a
+        // remedy that cannot clear the condition.
+        let stderr = "\
+The package `vllm` is broken or incomplete (unable to read `WHEEL` file). Consider recreating the virtualenv, or removing the package directory at: /rocm/site-packages/vllm-0.26.0.dist-info.
+The package `vllm` is broken or incomplete (unable to read `METADATA`). Consider recreating the virtualenv, or removing the package directory at: /rocm/site-packages/vllm-0.26.0.dist-info.
+The package `vllm` requires Python >=3.99, but `3.12.9` is installed
+The package `vllm` has multiple installed distributions: /rocm/site-packages/vllm-0.26.0.dist-info
+";
+
+        assert!(
+            parse_dependency_violations(stderr).is_empty(),
+            "{:?}",
+            parse_dependency_violations(stderr)
+        );
+    }
+
+    #[test]
+    fn dependency_violations_come_only_from_framed_findings() {
+        // Verbatim `uv pip check` stderr for an environment where the SDK torch stack
+        // was written over the engine's pinned torch, plus an unrelated
+        // upstream conflict of the kind these environments routinely carry.
+        let stderr = "\
+Using Python 3.12.9 environment at: /rocm/runtimes/wheel/nightly-gfx94x
+Checked 251 packages in 12ms
+Found 2 incompatibilities
+The package `vllm` requires `torch==2.10.0+git8514f05`, but `2.9.1+rocm7.14.0a20260611` is installed
+The package `tilelang` requires `cloudpickle>=3.0`, but `2.2.1` is installed
+";
+
+        let violations = parse_dependency_violations(stderr);
+
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert_eq!(violations[0].requiring, "vllm");
+        assert!(
+            violations[0].detail.contains("torch==2.10.0+git8514f05"),
+            "the requirement and the installed version are kept verbatim: {}",
+            violations[0].detail
+        );
+        assert_eq!(violations[1].requiring, "tilelang");
+    }
+
+    #[test]
+    fn a_compatible_environment_reports_no_violations() {
+        let stderr = "\
+Using Python 3.12.9 environment at: /rocm/runtimes/wheel/nightly-gfx94x
+Checked 251 packages in 12ms
+All installed packages are compatible
+";
+
+        assert!(parse_dependency_violations(stderr).is_empty());
+        assert!(parse_dependency_violations("").is_empty());
+    }
+
+    #[test]
+    fn unframed_output_never_invents_a_violation() {
+        // An invocation failure (bad interpreter) must not read as a finding; the
+        // caller distinguishes it from a clean environment by the empty result.
+        let stderr = "error: Failed to inspect Python interpreter from /nope/bin/python\n";
+
+        assert!(parse_dependency_violations(stderr).is_empty());
+    }
+
+    #[test]
+    fn violations_are_filtered_to_the_distribution_that_owns_them() {
+        let violations = vec![
+            DependencyViolation {
+                requiring: "vLLM".to_owned(),
+                detail: "The package `vLLM` requires `torch==2.10.0`, but `2.9.1` is installed"
+                    .to_owned(),
+            },
+            DependencyViolation {
+                requiring: "tilelang".to_owned(),
+                detail:
+                    "The package `tilelang` requires `cloudpickle>=3.0`, but `2.2.1` is installed"
+                        .to_owned(),
+            },
+        ];
+
+        let owned = violations_requiring(&violations, "vllm");
+
+        assert_eq!(owned.len(), 1, "match is case-insensitive: {owned:?}");
+        assert_eq!(owned[0].requiring, "vLLM");
+        assert!(violations_requiring(&violations, "torch").is_empty());
     }
 
     #[test]

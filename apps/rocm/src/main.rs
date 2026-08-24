@@ -81,7 +81,7 @@ const SUPPORTED_ENGINES: [&str; 2] = ["lemonade", "vllm"];
     about = "ROCm AI Command Center CLI",
     long_about = "ROCm AI Command Center CLI: install ROCm, manage local inference engines, \
 and run OpenAI-compatible model servers on AMD GPUs.\n\n\
-Run `rocm` with no subcommand to open the interactive dashboard (TUI). Use `rocm examine` \
+Run `rocm` with no subcommand to open the interactive launcher (TUI). Use `rocm examine` \
 to check that your GPU and ROCm install are ready, then `rocm serve <model>` to start a server.",
     version,
     // The `chat` example was dropped from this list when `chat` became
@@ -93,7 +93,7 @@ rocm examine                      Check GPU, ROCm install, and engines\n  \
 rocm install sdk                  Install ROCm wheels into a managed environment\n  \
 rocm engines list                 Show the local inference engines available\n  \
 rocm model                        List models this machine can run\n  \
-rocm serve qwen2.5-7b-instruct    Start a local OpenAI-compatible server\n  \
+rocm serve qwen                   Start a local OpenAI-compatible server\n  \
 rocm services list                Show running model servers\n\n\
 Commands marked [preview] work but are outside the Tech Preview's supported\n\
 scope: treat them as unfinished and do not depend on their behaviour yet.\n\n\
@@ -244,13 +244,13 @@ enum Command {
     /// configure a remote provider; the `local` provider talks to a running server.
     #[command(after_help = "EXAMPLES:\n  \
 rocm chat --prompt \"Explain ROCm in one sentence\"\n  \
-rocm chat --provider local --model qwen2.5-7b-instruct --prompt \"Hello\"\n  \
+rocm chat --provider local --model qwen --prompt \"Hello\"\n  \
 echo \"Summarize this\" | rocm chat --provider anthropic")]
     Chat {
         /// Assistant provider to use.
         #[arg(long)]
         provider: Option<Provider>,
-        /// Model name to request from the provider, such as qwen2.5-7b-instruct.
+        /// Model name to request from the provider, such as qwen.
         #[arg(long)]
         model: Option<String>,
         /// Prompt to send. If omitted, rocm-cli reads from standard input when possible.
@@ -337,9 +337,9 @@ rocm model --verbose"
     /// server running, or Ctrl-C to stop it. Inspect or stop servers later with
     /// `rocm services`.
     #[command(after_help = "EXAMPLES:\n  \
-rocm serve qwen2.5-7b-instruct\n  \
-rocm serve qwen2.5-7b-instruct --engine vllm --port 8000\n  \
-rocm serve qwen2.5-7b-instruct --verbose --device gpu_required")]
+rocm serve qwen\n  \
+rocm serve qwen --engine vllm --port 8000\n  \
+rocm serve qwen --verbose --device gpu_required")]
     Serve {
         /// Model name, alias, or local model file path.
         model: String,
@@ -7153,6 +7153,70 @@ fn ensure_torch_runtime_dep(approved: bool, dep: &TorchRuntimeDep) {
     }
 }
 
+/// Refuse an `apt-get install` step that would remove ROCm/AMDGPU packages.
+///
+/// `apt-get install -y` assumes yes for *removals* as well as installs, so a
+/// dependency solution that evicts the ROCm stack would otherwise be applied
+/// unattended (this runs automatically under `rocm install sdk` whenever root or
+/// passwordless sudo is available). Simulating first turns that silent breakage
+/// into an actionable error naming every package at risk.
+///
+/// Only apt is gated: the dnf/zypper/pacman plans install additive runtime
+/// packages and have no equivalent assume-yes removal path. A simulation that
+/// cannot be run (apt missing, transient failure) is not treated as a refusal —
+/// the real command reports the failure with better context.
+fn ensure_apt_install_preserves_rocm(argv: &[String]) -> Result<()> {
+    let Some(simulate_argv) = rocm_core::openmpi::apt_simulate_argv(argv) else {
+        return Ok(());
+    };
+    let (program, args) = simulate_argv
+        .split_first()
+        .context("apt simulation has no program to run")?;
+    let Ok(output) = ProcessCommand::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+    else {
+        return Ok(());
+    };
+    if !output.status.success() {
+        return Ok(());
+    }
+
+    let removals =
+        rocm_core::openmpi::parse_apt_simulate_removals(&String::from_utf8_lossy(&output.stdout));
+    let protected: Vec<&String> = removals
+        .iter()
+        .filter(|package| rocm_core::openmpi::is_protected_rocm_package(package))
+        .collect();
+    if protected.is_empty() {
+        return Ok(());
+    }
+
+    let rendered = |packages: &[&String]| {
+        packages
+            .iter()
+            .map(|package| package.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let others: Vec<&String> = removals
+        .iter()
+        .filter(|package| !rocm_core::openmpi::is_protected_rocm_package(package))
+        .collect();
+    let other_detail = if others.is_empty() {
+        String::new()
+    } else {
+        format!("\n  other packages it would remove: {}", rendered(&others))
+    };
+    bail!(
+        "refusing to run `{}`: it would remove ROCm packages and break this installation\n  ROCm packages it would remove: {}{}\n  action: install the dependency manually after resolving the conflict (for example with a package version that does not evict ROCm), then rerun",
+        argv.join(" "),
+        rendered(&protected),
+        other_detail
+    );
+}
+
 fn run_system_package_install_plan(
     plan: &rocm_core::openmpi::SystemPackageInstallPlan,
 ) -> Result<()> {
@@ -7162,6 +7226,8 @@ fn run_system_package_install_plan(
         // are not already root (where `sudo` may be absent); the argv runs
         // directly without a shell.
         let argv = command.resolved_argv(root);
+        // Never let an automatic dependency install evict the ROCm stack.
+        ensure_apt_install_preserves_rocm(&argv)?;
         // Inherit stdin so an interactive `sudo` password prompt (the case the
         // `--yes` approval exists for) can be answered. When already root or
         // passwordless sudo is configured, sudo does not prompt and the inherited
@@ -7193,7 +7259,7 @@ fn maybe_auto_install_sdk_preferred_engine(
 
     let mut config = RocmCliConfig::load(paths)?;
     let env_root = env_root_for_engine_install(paths, &config, engine, &finalized.runtime_key)?;
-    let response = engine_request_with_env_root::<_, InstallResponse>(
+    let response = match engine_request_with_env_root::<_, InstallResponse>(
         Some(paths),
         engine,
         EngineMethod::Install,
@@ -7204,7 +7270,23 @@ fn maybe_auto_install_sdk_preferred_engine(
             env_root: env_root.clone(),
         },
         env_root.as_deref(),
-    )?;
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            // A failed engine install is the case most likely to leave the SDK's torch
+            // sitting over the engine's pin, because the install is what would have
+            // restored it. Reporting the check only on success would print nothing here
+            // — and `install sdk` still exits 0 — which is exactly the silent broken
+            // runtime this block exists to prevent.
+            report_engine_dependency_check(
+                paths,
+                engine,
+                runtime_python_for_key(paths, &finalized.runtime_key).as_deref(),
+                &finalized.runtime_key,
+            );
+            return Err(error);
+        }
+    };
     println!("  reinstall: false");
     println!("  env_id: {}", response.env_id);
     println!("  env_path: {}", response.env_path);
@@ -7223,6 +7305,17 @@ fn maybe_auto_install_sdk_preferred_engine(
             engine_config.preferred_env_id = Some(response.env_id.clone());
         }
         config.save(paths)?;
+
+        // The SDK and the engine share this environment, and the SDK's torch stack was
+        // just written into it. Say plainly whether the engine's own requirements
+        // survived that, so a runtime the engine cannot use is never reported only as a
+        // successful install.
+        report_engine_dependency_check(
+            paths,
+            engine,
+            Some(Path::new(&response.python_executable)),
+            &finalized.runtime_key,
+        );
     }
 
     record_cli_audit_event(
@@ -7237,6 +7330,125 @@ fn maybe_auto_install_sdk_preferred_engine(
         None,
     );
     Ok(())
+}
+
+/// Whether an installed engine's declared requirements are met in the environment it
+/// shares with the ROCm SDK.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EngineDependencyCheck {
+    /// Every requirement the engine declares is satisfied.
+    Satisfied,
+    /// The engine declares requirements the environment does not meet, one line each,
+    /// as the resolver reported them.
+    Violated(Vec<String>),
+    /// The check itself could not run (no usable `uv`, unreadable environment).
+    NotVerified(String),
+}
+
+/// Print the dependency check for `engine` and record it in the CLI audit log.
+///
+/// A surviving violation does not fail the install: the SDK itself installed correctly,
+/// and abandoning a multi-gigabyte install would cost the user more than the warning and
+/// the one-line remedy it names.
+fn report_engine_dependency_check(
+    paths: &AppPaths,
+    engine: &str,
+    python: Option<&Path>,
+    runtime_key: &str,
+) {
+    let outcome = engine_dependency_check(paths, engine, python);
+    print!("{}", render_engine_dependency_check(engine, &outcome));
+    let (level, message) = match &outcome {
+        EngineDependencyCheck::Satisfied => (
+            "info",
+            format!("engine={engine} runtime_id={runtime_key} dependency_check=satisfied"),
+        ),
+        EngineDependencyCheck::Violated(details) => (
+            "error",
+            format!(
+                "engine={engine} runtime_id={runtime_key} dependency_check=violated: {}",
+                details.join("; ")
+            ),
+        ),
+        EngineDependencyCheck::NotVerified(reason) => (
+            "info",
+            format!(
+                "engine={engine} runtime_id={runtime_key} dependency_check=not_verified: {reason}"
+            ),
+        ),
+    };
+    record_cli_audit_event(
+        paths,
+        "engine",
+        "engine_dependency_check",
+        level,
+        message,
+        None,
+    );
+}
+
+/// The Python interpreter of the managed runtime `runtime_key`, when its manifest names
+/// one. Used to check an environment whose engine install did not get far enough to
+/// report its own interpreter.
+fn runtime_python_for_key(paths: &AppPaths, runtime_key: &str) -> Option<PathBuf> {
+    let manifests = therock::load_runtime_manifests(paths).ok()?;
+    let manifest = runtime_manifest_for_selector(&manifests, runtime_key)?;
+    manifest.python_executable.as_deref().map(PathBuf::from)
+}
+
+fn engine_dependency_check(
+    paths: &AppPaths,
+    engine: &str,
+    python: Option<&Path>,
+) -> EngineDependencyCheck {
+    let Some(python) = python else {
+        return EngineDependencyCheck::NotVerified(
+            "the runtime's Python environment could not be located".to_owned(),
+        );
+    };
+    match rocm_core::check_dependencies(paths, python) {
+        Ok(violations) => {
+            let owned = rocm_core::violations_requiring(&violations, engine);
+            if owned.is_empty() {
+                EngineDependencyCheck::Satisfied
+            } else {
+                EngineDependencyCheck::Violated(
+                    owned
+                        .iter()
+                        .map(|violation| violation.detail.clone())
+                        .collect(),
+                )
+            }
+        }
+        Err(error) => EngineDependencyCheck::NotVerified(error.to_string()),
+    }
+}
+
+fn render_engine_dependency_check(engine: &str, outcome: &EngineDependencyCheck) -> String {
+    let mut output = String::new();
+    match outcome {
+        EngineDependencyCheck::Satisfied => {
+            let _ = writeln!(output, "  dependency_check: satisfied");
+        }
+        EngineDependencyCheck::NotVerified(reason) => {
+            let _ = writeln!(
+                output,
+                "  dependency_check: not_verified ({})",
+                sanitize_log_value(reason)
+            );
+        }
+        EngineDependencyCheck::Violated(details) => {
+            let _ = writeln!(output, "  dependency_check: violated");
+            for detail in details {
+                let _ = writeln!(output, "  violation: {}", sanitize_log_value(detail));
+            }
+            let _ = writeln!(
+                output,
+                "  action: rocm engines install {engine} --reinstall"
+            );
+        }
+    }
+    output
 }
 
 fn render_sdk_install_success(finalized: &SdkInstallFinalization) -> String {
@@ -25430,6 +25642,65 @@ ID_LIKE="suse opensuse"
 
         assert_eq!(discovered, Some(primary_path));
         Ok(())
+    }
+
+    #[test]
+    fn a_satisfied_dependency_check_is_stated_plainly() {
+        let rendered = render_engine_dependency_check("vllm", &EngineDependencyCheck::Satisfied);
+
+        assert_eq!(rendered, "  dependency_check: satisfied\n");
+    }
+
+    #[test]
+    fn a_violated_dependency_check_names_the_pin_and_the_remedy() {
+        // The SDK torch stack replaced the build vLLM pins. The install
+        // succeeded, so the only signal the user gets is this block.
+        let rendered = render_engine_dependency_check(
+            "vllm",
+            &EngineDependencyCheck::Violated(vec![
+                "The package `vllm` requires `torch==2.10.0+git8514f05`, but `2.9.1+rocm7.14.0a20260611` is installed".to_owned(),
+            ]),
+        );
+
+        assert!(rendered.contains("  dependency_check: violated\n"));
+        assert!(rendered.contains("torch==2.10.0+git8514f05"));
+        assert!(rendered.contains("2.9.1+rocm7.14.0a20260611"));
+        assert!(rendered.contains("  action: rocm engines install vllm --reinstall\n"));
+    }
+
+    #[test]
+    fn an_unlocatable_environment_is_reported_not_assumed_healthy() {
+        // The engine install can fail before it reports its own interpreter. That path
+        // still prints a block, and with no interpreter to check it must say so rather
+        // than fall through to `satisfied`.
+        let (root, paths) = test_paths("engine-dependency-no-python");
+
+        let outcome = engine_dependency_check(&paths, "vllm", None);
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(
+            outcome,
+            EngineDependencyCheck::NotVerified(
+                "the runtime's Python environment could not be located".to_owned()
+            )
+        );
+        assert!(
+            render_engine_dependency_check("vllm", &outcome).contains("not_verified"),
+            "the failure path still prints a dependency_check block"
+        );
+    }
+
+    #[test]
+    fn a_dependency_check_that_could_not_run_says_so_instead_of_claiming_health() {
+        let rendered = render_engine_dependency_check(
+            "vllm",
+            &EngineDependencyCheck::NotVerified("uv binary is unavailable\nofflinehost".to_owned()),
+        );
+
+        assert!(rendered.contains("not_verified"));
+        assert!(!rendered.contains("satisfied"));
+        // A multi-line failure must stay on one reported line.
+        assert_eq!(rendered.lines().count(), 1, "{rendered}");
     }
 
     #[test]

@@ -70,9 +70,10 @@ pub use runtime::{
     runtime_rocm_library_filename, shell_command_for_host, user_runtime_dir,
 };
 pub use uv::{
-    DEFAULT_UV_TIMEOUT_SECS, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV, UvCacheSource,
-    ensure_uv_binary, uv_binary_name, uv_cache_source, uv_command_env, uv_http_timeout_secs,
-    uv_pip_freeze_args, uv_pip_install_base, uv_venv_args,
+    DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,
+    UvCacheSource, check_dependencies, ensure_uv_binary, uv_binary_name, uv_cache_source,
+    uv_command_env, uv_http_timeout_secs, uv_pip_check_args, uv_pip_freeze_args,
+    uv_pip_install_base, uv_venv_args, violations_requiring,
 };
 
 pub const DEFAULT_LOCAL_PORT: u16 = 11_435;
@@ -6538,14 +6539,14 @@ const ENDPOINT_API_KEY_LEN: usize = 48;
 /// verbatim into an `Authorization: Bearer` header, a client config file, or an
 /// environment variable without escaping.
 ///
-/// Uses the same `rand::thread_rng()` CSPRNG as [`generate_rsa_signing_keypair`];
+/// Drawn from `rand::rng()`, a CSPRNG seeded from the operating system;
 /// deliberately *not* derived from `generate_service_id` (a timestamp-based,
 /// guessable identifier — unsuitable as a secret).
 pub fn generate_endpoint_api_key() -> String {
     use rand::Rng;
-    use rand::distributions::Alphanumeric;
+    use rand::distr::Alphanumeric;
 
-    rand::thread_rng()
+    rand::rng()
         .sample_iter(&Alphanumeric)
         .take(ENDPOINT_API_KEY_LEN)
         .map(char::from)
@@ -6572,7 +6573,13 @@ pub fn generate_rsa_signing_keypair() -> Result<(String, String)> {
     use rsa::RsaPrivateKey;
     use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 
-    let mut rng = rand::thread_rng();
+    // `rsa` 0.9 is built against `rand_core` 0.6, while the workspace `rand` is
+    // 0.9 (`rand_core` 0.9) — the two trait sets are not interchangeable, so an
+    // rng from `rand::rng()` does not satisfy `RsaPrivateKey::new`. Use the
+    // `rand_core` that `rsa` itself re-exports, which keeps the versions matched
+    // no matter which one `rand` moves to. `OsRng` draws straight from the
+    // operating system CSPRNG.
+    let mut rng = rsa::rand_core::OsRng;
     let private_key =
         RsaPrivateKey::new(&mut rng, 2048).context("failed to generate RSA signing key")?;
     let private_pem = private_key
