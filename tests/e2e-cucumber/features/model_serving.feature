@@ -154,3 +154,22 @@ Feature: Model serving
     When the user serves a model pinned to a GPU index that does not exist
     Then serving is refused before any engine starts
     And the user is told that GPU index is unavailable
+
+  # An address the user names is a requirement, not a preference. When something
+  # else already holds it, the serve has to stop there — before the model is
+  # loaded and before a service is recorded — instead of letting the engine
+  # discover the collision on its own bind, which fails minutes later and leaves
+  # a dead service behind. Runs on GPU hardware for the same reason as scenario
+  # 13: on a no-GPU host the GPU-required pre-flight refuses before the address
+  # is ever examined, so the address-specific refusal is unobservable there.
+  # Not @merge-queue despite needing a GPU — that tag is for heavy real serves,
+  # and this one never launches an engine: it is refused at the address check,
+  # so it costs a process start and belongs on the per-PR path.
+  @id:serve-named-address-already-taken @requires-gpu
+  Scenario: 14 - Serving on an address something else holds is refused
+    Given a managed runtime is active
+    And another process holds the address the user is going to name
+    When the user serves a model on that address
+    Then serving is refused before any engine starts
+    And the user is told the address is already in use
+    And no service is recorded for the refused launch

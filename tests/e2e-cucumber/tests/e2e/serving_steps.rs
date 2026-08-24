@@ -742,6 +742,34 @@ async fn user_serves_absent_gpu_index(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+#[given("another process holds the address the user is going to name")]
+async fn given_named_address_taken(world: &mut E2eWorld) {
+    // An ephemeral port rather than the default: the point is that a *named*
+    // address which is taken is refused, and borrowing the default would make the
+    // scenario indistinguishable from the automatic-selection one — and would
+    // fight it for the same port when both run on the same host.
+    let listener =
+        std::net::TcpListener::bind(("127.0.0.1", 0)).expect("could not take an address to hold");
+    // Held on the World so it stays taken across the serve, not just this step.
+    world.held_listener = Some(listener);
+}
+
+#[when("the user serves a model on that address")]
+async fn user_serves_on_held_address(world: &mut E2eWorld) {
+    let port = held_port(world).to_string();
+    let (model, engine, _) = host_serve_target();
+    // The serve is expected to stop at the address check, so nothing here waits
+    // for readiness — a refusal that took a model download would be a failure of
+    // this scenario, not a pass.
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &["serve", model, "--engine", engine, "--port", &port],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 #[when("the CLI reports the service as ready")]
 async fn when_cli_reports_ready(world: &mut E2eWorld) {
     // Read readiness from the CLI's own view (`services list`), not a direct
@@ -753,6 +781,18 @@ async fn when_cli_reports_ready(world: &mut E2eWorld) {
         "CLI does not report any service ready:\n{stdout}"
     );
     world.cli_output = Some(stdout);
+}
+
+/// The port of the address this scenario is holding, for the steps that have to
+/// name it in a command or look for it in output.
+fn held_port(world: &E2eWorld) -> u16 {
+    world
+        .held_listener
+        .as_ref()
+        .expect("no address is being held by this scenario")
+        .local_addr()
+        .expect("held listener has no address")
+        .port()
 }
 
 // ── Then ───────────────────────────────────────────────────────────
@@ -800,6 +840,30 @@ async fn assert_no_gpu_message(world: &mut E2eWorld) {
     assert!(
         output.to_lowercase().contains("no usable amd gpu"),
         "expected a no-AMD-GPU message, got:\n{output}"
+    );
+}
+
+#[then("the user is told the address is already in use")]
+async fn assert_address_in_use_message(world: &mut E2eWorld) {
+    let port = held_port(world).to_string();
+    let output = serve_output(world);
+    let lowered = output.to_lowercase();
+    assert!(
+        lowered.contains(&port) && lowered.contains("in use"),
+        "expected the refusal to name the taken address, got:\n{output}"
+    );
+}
+
+#[then("no service is recorded for the refused launch")]
+async fn assert_no_service_recorded(world: &mut E2eWorld) {
+    // The defect this pins left a dead entry behind: the engine was launched, hit
+    // the bind failure, and its manifest stayed in the list. A refusal that stops
+    // before the record is written leaves nothing to clean up.
+    let port = held_port(world).to_string();
+    let (listed, _, _) = crate::run_rocm(world, &["services", "list", "--all"]);
+    assert!(
+        !listed.contains(&port),
+        "a refused launch must not leave a service behind, but one is listed on {port}:\n{listed}"
     );
 }
 

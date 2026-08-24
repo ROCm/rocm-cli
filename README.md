@@ -322,6 +322,16 @@ different settings. If you previously started a service with `--temperature`
 flags — or with different ones — stop the existing service first (`rocm
 services stop`) or match the original flags.
 
+Omit `--port` and the server takes 11435, or the next free port above it when
+11435 is already serving — so a second model starts alongside the first instead
+of colliding with it. The chosen port is reported in the deployment summary and
+by `rocm services`. Pass `--port` explicitly and that exact port is required: if
+something already holds it, `rocm serve` says so and stops before loading the
+model, rather than failing later on the engine's own bind. Reuse follows the
+same rule — when an existing service for this engine and model is reused, its
+own port is what you get, so naming a different one is refused rather than
+quietly ignored.
+
 By default the server runs in the background under rocm-cli's supervision and
 prints a deployment summary — a progress indicator while it starts, then a table
 with the status, the full inference endpoint, the API-qualified model name, and a

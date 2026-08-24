@@ -362,9 +362,13 @@ rocm serve qwen2.5-7b-instruct --verbose --device gpu_required")]
         /// Host address to bind.
         #[arg(long, default_value = DEFAULT_LOCAL_HOST)]
         host: String,
-        /// TCP port to bind.
-        #[arg(long, default_value_t = rocm_core::DEFAULT_LOCAL_PORT)]
-        port: u16,
+        /// TCP port to bind [default: 11435, or the next free port when it is taken].
+        // Deliberately not a clap default: an omitted port means "any free port,
+        // starting at 11435", while naming 11435 explicitly means that port and
+        // nothing else, so a busy one is an error rather than a silent move.
+        // Giving it a clap default would erase that distinction.
+        #[arg(long)]
+        port: Option<u16>,
         /// Attach to the server in this terminal and stream its logs (Ctrl-D to
         /// detach and leave it running, Ctrl-C to stop). Same as --verbose.
         #[arg(long, conflicts_with = "managed")]
@@ -4709,7 +4713,9 @@ struct ServeArgs {
     runtime_id: Option<String>,
     env_id: Option<String>,
     host: String,
-    port: u16,
+    /// `None` when the user did not name a port, which licenses the automatic
+    /// selection in [`resolve_serve_port`].
+    port: Option<u16>,
     foreground: bool,
     managed: bool,
     verbose: bool,
@@ -4732,7 +4738,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         runtime_id,
         env_id,
         host,
-        port,
+        port: requested_port,
         foreground,
         managed,
         verbose,
@@ -4912,6 +4918,21 @@ fn serve(args: ServeArgs) -> Result<()> {
     )?;
     let service_id = generate_service_id(&selected_engine, &resolve.canonical_model_id);
 
+    // Settle the address before anything is announced or launched: the plan below
+    // must print the port this server will actually bind, and an explicitly
+    // requested port that is taken must fail here — while no model has been
+    // loaded and no service record exists — rather than as an engine bind error.
+    let ServePortChoice {
+        port,
+        note: port_note,
+    } = resolve_serve_port(
+        &paths,
+        &host,
+        requested_port,
+        &selected_engine,
+        &resolve.canonical_model_id,
+    )?;
+
     // Attached foreground streaming is the debugging path, selected by `--verbose`
     // or `--foreground`. Everything else backgrounds the server and, when writing
     // to an interactive terminal, shows a progress spinner + deployment summary
@@ -4929,6 +4950,11 @@ fn serve(args: ServeArgs) -> Result<()> {
         println!("{}", serve_engine_selection_line(&serve_engine));
         println!("  host: {host}");
         println!("  port: {port}");
+        // Kept next to the port it explains rather than with the trailing notes,
+        // so a reader scanning for the address sees why it is not the usual one.
+        if let Some(note) = &port_note {
+            println!("  note: {note}");
+        }
         if let Some(runtime_id) = resolved_selection.runtime_id.as_deref() {
             println!("  runtime_id: {runtime_id}");
         }
@@ -5059,6 +5085,7 @@ fn serve(args: ServeArgs) -> Result<()> {
                 &gpu_indices,
                 gpu_vram.as_deref(),
                 gpu_memory_utilization_note.as_deref(),
+                port_note.as_deref(),
                 host_gpu_summary.as_ref(),
             );
             let summary = serve_summary::DeploymentSummary {
@@ -5097,6 +5124,7 @@ fn serve(args: ServeArgs) -> Result<()> {
 
 /// GPU/device warnings folded into the interactive deployment summary. Mirrors the
 /// inline warnings printed in the plain serve plan, in the same order.
+#[allow(clippy::too_many_arguments)]
 fn collect_serve_notes(
     cpu_only: bool,
     gpu_selection: &GpuSelection,
@@ -5104,6 +5132,7 @@ fn collect_serve_notes(
     gpu_indices: &[u32],
     gpu_vram: Option<&[GpuVramUsage]>,
     engine_flag_note: Option<&str>,
+    port_note: Option<&str>,
     host_gpu_summary: Option<&rocm_core::HostGpuSummary>,
 ) -> Vec<String> {
     let mut notes = Vec::new();
@@ -5111,6 +5140,11 @@ fn collect_serve_notes(
     // too: the summary path is what an interactive `rocm serve` actually prints, so
     // a note only emitted on the plan path would never reach that user.
     if let Some(note) = engine_flag_note {
+        notes.push(note.to_owned());
+    }
+    // The summary shows an endpoint, not a plan, so without this an interactive
+    // user would see a port they never asked for and no reason for it.
+    if let Some(note) = port_note {
         notes.push(note.to_owned());
     }
     if cpu_only {
@@ -14763,6 +14797,187 @@ fn existing_live_managed_service(
         })
 }
 
+/// A bind host reduced to the form two records can be compared in: unbracketed,
+/// lowercased, and with the loopback spellings folded together.
+fn normalize_bind_host(host: &str) -> String {
+    let host = host.trim();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host)
+        .to_ascii_lowercase();
+    match host.as_str() {
+        "localhost" => rocm_core::DEFAULT_LOCAL_HOST.to_owned(),
+        _ => host,
+    }
+}
+
+/// Whether a server on `left` and a server on `right` would contend for the same
+/// port. A wildcard bind covers every interface, so it collides with all of them.
+fn bind_hosts_can_collide(left: &str, right: &str) -> bool {
+    let is_wildcard = |host: &str| matches!(host, "" | "0.0.0.0" | "::");
+    let left = normalize_bind_host(left);
+    let right = normalize_bind_host(right);
+    left == right || is_wildcard(&left) || is_wildcard(&right)
+}
+
+/// Ports live managed services have claimed on `host`, each paired with the
+/// service holding it.
+///
+/// Read from the manifests rather than the network because that is the half a
+/// bind probe cannot see: a service in `starting` has already been promised its
+/// port but has not listened on it yet, which is precisely the window a second
+/// `rocm serve` walks into.
+fn managed_service_port_claims(paths: &AppPaths, host: &str) -> Vec<(u16, String)> {
+    load_managed_services(paths)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|record| {
+            managed_service_is_live(record) && bind_hosts_can_collide(&record.host, host)
+        })
+        .map(|record| (record.port, record.service_id))
+        .collect()
+}
+
+/// The port a serve will bind, plus anything the user needs told about it.
+#[derive(Debug)]
+struct ServePortChoice {
+    port: u16,
+    /// Set only when the search had to move off the default, so silence means
+    /// "you got the port you would have expected".
+    note: Option<String>,
+}
+
+/// How far above the default the automatic search will look before giving up.
+/// Bounded so a machine full of servers fails with an explanation rather than
+/// scanning tens of thousands of ports.
+const SERVE_PORT_SEARCH_SPAN: u16 = 100;
+
+/// First port at or above `base` that no live service has claimed and nothing is
+/// listening on. `base` is a parameter rather than a constant so tests can drive
+/// the search from a port they actually hold.
+///
+/// An address that cannot be bound at all — an unresolvable host, an interface
+/// this machine does not own — aborts the search with that reason instead of
+/// being counted as "taken": no other port in the range would work either, and
+/// retrying all of them would turn one clear error into a misleading one.
+fn select_free_serve_port(host: &str, base: u16, claimed: &[u16]) -> Result<Option<u16>> {
+    for port in base..=base.saturating_add(SERVE_PORT_SEARCH_SPAN) {
+        if claimed.contains(&port) {
+            continue;
+        }
+        match rocm_core::local_port_status(host, port) {
+            rocm_core::LocalPortStatus::Free => return Ok(Some(port)),
+            // Taken: keep looking. Every other port in the range is still a
+            // candidate, which is exactly what an unusable host is not.
+            rocm_core::LocalPortStatus::InUse => {}
+            rocm_core::LocalPortStatus::Unusable(error) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "cannot serve on host {host}: it is not bindable here"
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Decide the port this serve will bind, before anything is launched.
+///
+/// The two cases are deliberately different. An omitted `--port` is a request
+/// for *a* server, so a taken default moves to the next free port and says so.
+/// An explicit `--port` names one address and nothing else, so a taken one is an
+/// error raised here — before the model is loaded and before any service record
+/// exists — instead of an engine bind failure minutes later that still leaves a
+/// dead service behind.
+///
+/// CONCURRENCY: this reads the claims and probes the ports, then returns; the
+/// manifest that reserves the chosen port is not written until the spawn further
+/// down `serve()`. Two `rocm serve` commands racing inside that window can still
+/// choose the same port. Closing it needs a lock held across read-select-launch,
+/// which is owned by the separate concurrency-hardening work on the managed
+/// launch path — deliberately not attempted here, so the two changes do not
+/// fight over the same critical section. Note for whoever does it: the section
+/// starts at the claim *read* below, not at the spawn.
+fn resolve_serve_port(
+    paths: &AppPaths,
+    host: &str,
+    requested: Option<u16>,
+    engine: &str,
+    canonical_model_id: &str,
+) -> Result<ServePortChoice> {
+    // Port 0 means "assign me any port" to the kernel, so the probe succeeds and
+    // the engine then binds something else entirely — every port this command
+    // reports would be a lie. Refuse it rather than announce a wrong address.
+    if requested == Some(0) {
+        bail!("--port 0 is not a port a server can be found on; name a port, or omit --port");
+    }
+
+    // An equivalent service is already live, so `spawn_managed_engine_child`'s
+    // idempotency guard will surface that service and spawn nothing. Whatever
+    // this returns is what the plan announces, so it has to be that service's
+    // real address — not the one that was asked for.
+    if let Some(existing) = existing_live_managed_service(paths, engine, canonical_model_id) {
+        // A named port is a requirement, not a preference. Serving the existing
+        // service's address instead would quietly hand back a port the user did
+        // not ask for, so say why nothing was started.
+        if let Some(port) = requested
+            && port != existing.port
+        {
+            bail!(
+                "managed service `{}` is already serving {} on port {}, so port {port} would not \
+                 be used; stop it with `rocm services stop {}`, or drop --port to reuse it",
+                existing.service_id,
+                canonical_model_id,
+                existing.port,
+                existing.service_id
+            );
+        }
+        return Ok(ServePortChoice {
+            port: existing.port,
+            note: None,
+        });
+    }
+
+    let claims = managed_service_port_claims(paths, host);
+
+    if let Some(port) = requested {
+        if let Some((_, service_id)) = claims.iter().find(|(claimed, _)| *claimed == port) {
+            bail!(
+                "port {port} on {host} is already taken by managed service `{service_id}`; \
+                 stop it with `rocm services stop {service_id}`, or serve on a different --port"
+            );
+        }
+        match rocm_core::local_port_status(host, port) {
+            rocm_core::LocalPortStatus::Free => {}
+            rocm_core::LocalPortStatus::InUse => bail!(
+                "port {port} on {host} is already in use by another process; \
+                 free it, or serve on a different --port"
+            ),
+            // Not a collision: a privileged port, an unresolvable host, or an
+            // interface this machine does not own. Quote the reason rather than
+            // blame a server that is not there.
+            rocm_core::LocalPortStatus::Unusable(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("cannot bind {}", format_host_port(host, port))));
+            }
+        }
+        return Ok(ServePortChoice { port, note: None });
+    }
+
+    let base = rocm_core::DEFAULT_LOCAL_PORT;
+    let claimed: Vec<u16> = claims.iter().map(|(port, _)| *port).collect();
+    let Some(port) = select_free_serve_port(host, base, &claimed)? else {
+        bail!(
+            "no free port on {host} between {base} and {last}; stop a server you no longer need \
+             with `rocm services stop <service-id>`, or name a port with --port",
+            last = base.saturating_add(SERVE_PORT_SEARCH_SPAN)
+        );
+    };
+    let note = (port != base)
+        .then(|| format!("port {base} is already in use; serving on port {port} instead"));
+    Ok(ServePortChoice { port, note })
+}
+
 fn managed_service_running_state(status: &str) -> &'static str {
     match status {
         "ready" | "running" => "running",
@@ -23451,19 +23666,248 @@ install therock";
             None,
             Some(note),
             None,
+            None,
         );
         assert!(
             notes.iter().any(|entry| entry == note),
             "the ignored-flag note must reach the summary: {notes:?}"
         );
 
-        let quiet = collect_serve_notes(false, &GpuSelection::Auto, false, &[0], None, None, None);
+        let quiet = collect_serve_notes(
+            false,
+            &GpuSelection::Auto,
+            false,
+            &[0],
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(
             !quiet
                 .iter()
                 .any(|entry| entry.contains("--gpu-memory-utilization")),
             "nothing to report when the flag was honored: {quiet:?}"
         );
+    }
+
+    /// A `starting` service with no tracked pid: `load_managed_services` leaves
+    /// such a record's status alone, so it stays live for the claim scan — which
+    /// is the state the bug's second `rocm serve` actually walks into.
+    fn write_claiming_service(paths: &AppPaths, service_id: &str, host: &str, port: u16) {
+        let record = ManagedServiceRecord::new(
+            paths,
+            service_id,
+            "vllm",
+            "Qwen/Qwen3.5-0.8B",
+            "Qwen/Qwen3.5-0.8B",
+            host,
+            port,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        fs::create_dir_all(paths.services_dir()).unwrap();
+        record.write().unwrap();
+    }
+
+    #[test]
+    fn serve_port_search_takes_the_base_when_it_is_free() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let free = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        assert_eq!(
+            select_free_serve_port(DEFAULT_LOCAL_HOST, free, &[]).unwrap(),
+            Some(free)
+        );
+    }
+
+    #[test]
+    fn serve_port_search_steps_over_a_live_listener() {
+        // The reported collision in miniature: something already holds the port a
+        // second server would take, and it is holding it on the socket, not in a
+        // manifest — so only a bind probe can see it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = listener.local_addr().unwrap().port();
+
+        let chosen = select_free_serve_port(DEFAULT_LOCAL_HOST, taken, &[])
+            .expect("a bindable host must not error")
+            .expect("a free port above the taken one");
+        assert!(
+            chosen > taken,
+            "the search must move past the port that is in use, got {chosen}"
+        );
+    }
+
+    #[test]
+    fn serve_port_search_steps_over_a_port_only_a_manifest_claims() {
+        // Nothing is listening yet — a service that is still starting has been
+        // promised this port but has not bound it. The bind probe would call it
+        // free; the claim list is what keeps the second server off it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let claimed = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let chosen = select_free_serve_port(DEFAULT_LOCAL_HOST, claimed, &[claimed])
+            .expect("a bindable host must not error")
+            .expect("a free port above the claimed one");
+        assert!(
+            chosen > claimed,
+            "a claimed port must be skipped even when nothing is listening, got {chosen}"
+        );
+    }
+
+    #[test]
+    fn serve_port_search_reports_an_unbindable_host_instead_of_scanning() {
+        // The whole range is unusable for the same reason, so the search must say
+        // what that reason is rather than report every port as taken.
+        let error = select_free_serve_port("host.invalid", rocm_core::DEFAULT_LOCAL_PORT, &[])
+            .expect_err("an unresolvable host must be an error, not an exhausted search")
+            .to_string();
+        assert!(
+            error.contains("host.invalid") && !error.contains("no free port"),
+            "the error must name the host and not blame port exhaustion: {error}"
+        );
+    }
+
+    #[test]
+    fn serve_port_resolution_moves_off_a_claimed_default() {
+        let (root, paths) = test_paths("serve-port-moves-off-claimed");
+        // The claim is on the real default, because that is the port the automatic
+        // search starts from and the whole question is whether it moves.
+        write_claiming_service(
+            &paths,
+            "svc-holding-default",
+            DEFAULT_LOCAL_HOST,
+            rocm_core::DEFAULT_LOCAL_PORT,
+        );
+
+        let choice =
+            resolve_serve_port(&paths, DEFAULT_LOCAL_HOST, None, "vllm", "Qwen/Qwen3-0.6B")
+                .expect("an omitted port must resolve, not fail");
+
+        assert_ne!(choice.port, rocm_core::DEFAULT_LOCAL_PORT);
+        let note = choice.note.expect("a moved port must be explained");
+        assert!(
+            note.contains(&rocm_core::DEFAULT_LOCAL_PORT.to_string())
+                && note.contains(&choice.port.to_string()),
+            "the note must name both the taken port and the chosen one: {note}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn serve_port_resolution_refuses_an_explicitly_requested_claimed_port() {
+        let (root, paths) = test_paths("serve-port-explicit-claimed");
+        write_claiming_service(
+            &paths,
+            "svc-holding-8000",
+            DEFAULT_LOCAL_HOST,
+            rocm_core::DEFAULT_LOCAL_PORT,
+        );
+
+        let error = resolve_serve_port(
+            &paths,
+            DEFAULT_LOCAL_HOST,
+            Some(rocm_core::DEFAULT_LOCAL_PORT),
+            "vllm",
+            "Qwen/Qwen3-0.6B",
+        )
+        .expect_err("a port the user named and that is taken must fail, not move")
+        .to_string();
+
+        assert!(
+            error.contains("svc-holding-8000"),
+            "the error must name what holds the port: {error}"
+        );
+        assert!(
+            error.contains(&rocm_core::DEFAULT_LOCAL_PORT.to_string()),
+            "the error must name the port: {error}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn serve_port_resolution_reports_the_live_services_own_port() {
+        // Re-serving the same engine+model is satisfied by the running service, so
+        // resolution must announce that service's real address — not the default,
+        // which is not where it is listening.
+        let (root, paths) = test_paths("serve-port-equivalent-live");
+        let live_port = rocm_core::DEFAULT_LOCAL_PORT + 7;
+        write_claiming_service(&paths, "svc-same-model", DEFAULT_LOCAL_HOST, live_port);
+
+        let choice = resolve_serve_port(
+            &paths,
+            DEFAULT_LOCAL_HOST,
+            None,
+            "vllm",
+            "Qwen/Qwen3.5-0.8B",
+        )
+        .expect("re-serving a live model must not fail");
+
+        assert_eq!(choice.port, live_port);
+        assert_eq!(choice.note, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn serve_port_resolution_refuses_a_named_port_the_live_service_is_not_on() {
+        // The service that would be reused is on another port, so honouring the
+        // request is impossible. Silently serving its address would hand back a
+        // port the user did not ask for.
+        let (root, paths) = test_paths("serve-port-live-elsewhere");
+        let live_port = rocm_core::DEFAULT_LOCAL_PORT + 7;
+        write_claiming_service(&paths, "svc-elsewhere", DEFAULT_LOCAL_HOST, live_port);
+
+        let error = resolve_serve_port(
+            &paths,
+            DEFAULT_LOCAL_HOST,
+            Some(rocm_core::DEFAULT_LOCAL_PORT),
+            "vllm",
+            "Qwen/Qwen3.5-0.8B",
+        )
+        .expect_err("a named port the reused service is not on must fail")
+        .to_string();
+
+        assert!(
+            error.contains("svc-elsewhere") && error.contains(&live_port.to_string()),
+            "the error must name the service and the port it is really on: {error}"
+        );
+
+        // Asking for the port it is actually on is satisfiable, so it must not fail.
+        let choice = resolve_serve_port(
+            &paths,
+            DEFAULT_LOCAL_HOST,
+            Some(live_port),
+            "vllm",
+            "Qwen/Qwen3.5-0.8B",
+        )
+        .expect("asking for the port the service already uses must be accepted");
+        assert_eq!(choice.port, live_port);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn serve_port_resolution_rejects_port_zero() {
+        // The kernel would assign some other port, so every address this command
+        // printed would be wrong.
+        let (root, paths) = test_paths("serve-port-zero");
+        let error = resolve_serve_port(&paths, DEFAULT_LOCAL_HOST, Some(0), "vllm", "some/model")
+            .expect_err("port 0 must be refused")
+            .to_string();
+        assert!(error.contains("--port 0"), "{error}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bind_hosts_collide_across_spellings_and_wildcards() {
+        assert!(bind_hosts_can_collide("127.0.0.1", "localhost"));
+        assert!(bind_hosts_can_collide("0.0.0.0", "127.0.0.1"));
+        assert!(bind_hosts_can_collide("[::1]", "::1"));
+        assert!(!bind_hosts_can_collide("127.0.0.1", "192.168.1.10"));
     }
 
     #[test]

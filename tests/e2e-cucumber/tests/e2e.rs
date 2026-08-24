@@ -85,6 +85,10 @@ pub struct E2eWorld {
     /// dir, captured logs). `Some` only for `@lifecycle` scenarios; all its paths
     /// are rooted in `isolated_root` so teardown removes them with the temp dir.
     pub lifecycle: Option<e2e::lifecycle_steps::LifecycleState>,
+    /// A listener a scenario is deliberately holding, so the address stays taken
+    /// for the whole scenario rather than only for the step that took it. Dropped
+    /// with the World, which releases the port.
+    pub held_listener: Option<std::net::TcpListener>,
 }
 
 /// Resolve a CI-provided shared-directory env var to a validated, existing path.
@@ -191,6 +195,7 @@ impl Default for E2eWorld {
             tui: None,
             chat_use_mock: false,
             lifecycle: None,
+            held_listener: None,
         }
     }
 }

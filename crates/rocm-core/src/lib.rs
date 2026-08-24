@@ -11,7 +11,7 @@ use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{IsTerminal, Read, Write, stdin, stdout};
-use std::net::{IpAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -102,6 +102,57 @@ pub fn format_host_port(host: &str, port: u16) -> String {
 
 pub fn format_http_base_url(host: &str, port: u16) -> String {
     format!("http://{}", format_host_port(host, port))
+}
+
+/// What a bind attempt says about `host:port`.
+///
+/// Three outcomes, not two: "something else is serving here" and "this address
+/// cannot be served at all" call for different messages and different handling.
+/// Collapsing them tells a user whose real problem is a permission or a typo'd
+/// hostname that the port is busy, and sends an automatic port search scanning a
+/// whole range that was never going to work.
+#[derive(Debug)]
+pub enum LocalPortStatus {
+    /// The bind succeeded, so a server can take this address.
+    Free,
+    /// Something already holds this address.
+    InUse,
+    /// The address itself is unusable — the host does not resolve, is not one of
+    /// this machine's, or the port is privileged. Carries the reason so the
+    /// caller can quote it instead of guessing.
+    Unusable(std::io::Error),
+}
+
+/// Whether `host:port` can still be listened on, answered by attempting the bind
+/// a server would attempt and immediately releasing it.
+///
+/// A bind is the only honest answer here: a connect probe cannot distinguish a
+/// free port from one held by a listener that refuses connections, and it says
+/// nothing about the `0.0.0.0` / `127.0.0.1` overlap that actually makes two
+/// servers collide. `host` is the same string the engine will bind, so the probe
+/// sees the same conflicts the engine would.
+///
+/// On Unix std sets `SO_REUSEADDR`, so a socket merely lingering in `TIME_WAIT`
+/// reads as free (correct — a server can bind it), while a live listener still
+/// rejects the bind (also correct). Windows has no such option set and fails the
+/// same way against a live listener.
+pub fn local_port_status(host: &str, port: u16) -> LocalPortStatus {
+    // `format_host_for_url` brackets IPv6 for URLs; the socket API wants the bare
+    // address, so undo that here rather than making callers remember which form
+    // they are holding.
+    let host = host.trim();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host);
+    match TcpListener::bind((host, port)) {
+        Ok(_) => LocalPortStatus::Free,
+        // `AddrInUse` is the only kind that means "taken"; `AddrNotAvailable`
+        // means the address is not this machine's to bind, which no other port
+        // will fix, so it belongs with the unusable cases.
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => LocalPortStatus::InUse,
+        Err(error) => LocalPortStatus::Unusable(error),
+    }
 }
 
 pub fn parse_http_endpoint(endpoint_url: &str) -> Option<(String, u16)> {
@@ -11108,6 +11159,55 @@ Class Name:                Display
         assert_eq!(format_host_port("::1", 11435), "[::1]:11435");
         assert_eq!(format_http_base_url("::1", 11435), "http://[::1]:11435");
         assert_eq!(format_host_port("[::1]", 11435), "[::1]:11435");
+    }
+
+    #[test]
+    fn port_status_follows_a_live_listener() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("read bound address").port();
+        assert!(
+            matches!(local_port_status("127.0.0.1", port), LocalPortStatus::InUse),
+            "a port held by a live listener must read as in use"
+        );
+        drop(listener);
+        assert!(
+            matches!(local_port_status("127.0.0.1", port), LocalPortStatus::Free),
+            "the port must read as free again once the listener is gone"
+        );
+    }
+
+    #[test]
+    fn port_status_accepts_a_bracketed_ipv6_host() {
+        // The URL-facing form is bracketed; the socket API is not. Callers holding
+        // either form must get the same answer.
+        let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
+            // No IPv6 loopback on this host; the bracket handling is unobservable.
+            return;
+        };
+        let port = listener.local_addr().expect("read bound address").port();
+        assert!(matches!(
+            local_port_status("[::1]", port),
+            LocalPortStatus::InUse
+        ));
+        assert!(matches!(
+            local_port_status("::1", port),
+            LocalPortStatus::InUse
+        ));
+    }
+
+    #[test]
+    fn port_status_separates_an_unusable_address_from_a_taken_one() {
+        // A host that cannot be bound at all is not a port collision: reporting it
+        // as one would send the caller looking for a server that is not there, and
+        // would make an automatic search retry every port in its range.
+        assert!(matches!(
+            local_port_status("host.invalid", 11_435),
+            LocalPortStatus::Unusable(_)
+        ));
+        assert!(matches!(
+            local_port_status("203.0.113.1", 11_435),
+            LocalPortStatus::Unusable(_)
+        ));
     }
 
     fn temp_app_paths(name: &str) -> (PathBuf, AppPaths) {

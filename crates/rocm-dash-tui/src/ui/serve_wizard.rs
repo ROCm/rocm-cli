@@ -49,10 +49,16 @@ pub const DEVICES: &[&str] = &[
     "cpu_only",
 ];
 
-/// Mirrors `rocm-core::DEFAULT_LOCAL_HOST` / `DEFAULT_LOCAL_PORT` (TUI-local to
-/// avoid the dep; the CLI re-applies its own defaults if these are cleared).
+/// Mirrors `rocm-core::DEFAULT_LOCAL_HOST` (TUI-local to avoid the dep; the CLI
+/// re-applies its own default if this is cleared).
+///
+/// The port has no counterpart on purpose. Prefilling it would make every wizard
+/// launch an *explicit* port request, and `rocm serve` treats a named port that
+/// is already taken as an error rather than moving off it — so a prefill would
+/// turn "start a second server" into a hard failure. Left empty, the field reads
+/// as `(engine default)` and no `--port` is emitted, which is what lets the CLI
+/// pick a free one.
 const DEFAULT_HOST: &str = "127.0.0.1";
-const DEFAULT_PORT: &str = "11435";
 
 /// The form fields, in vertical order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,7 +125,7 @@ impl Default for ServeWizardState {
             engine_idx: 0,
             device_idx: 0,
             host: DEFAULT_HOST.to_string(),
-            port: DEFAULT_PORT.to_string(),
+            port: String::new(),
             managed: true,
             browser: None,
             picker: None,
@@ -571,7 +577,9 @@ mod tests {
         assert_eq!(ENGINES[w.engine_idx], "lemonade");
         assert_eq!(w.device_idx, 0); // engine default → no --device
         assert_eq!(w.host, "127.0.0.1");
-        assert_eq!(w.port, "11435");
+        // Empty on purpose: an unset port lets `rocm serve` pick a free one, so a
+        // second launch from the wizard does not collide with the first.
+        assert_eq!(w.port, "");
     }
 
     #[test]
@@ -587,6 +595,8 @@ mod tests {
             ..Default::default()
         };
         let args = w.build_args().unwrap();
+        // No `--port`: naming one would make the CLI treat the address as
+        // mandatory and fail when it is taken, instead of choosing a free one.
         assert_eq!(
             args,
             vec![
@@ -596,10 +606,23 @@ mod tests {
                 "lemonade",
                 "--host",
                 "127.0.0.1",
-                "--port",
-                "11435",
                 "--managed",
             ]
+        );
+    }
+
+    #[test]
+    fn build_args_emits_the_port_the_user_typed() {
+        let w = ServeWizardState {
+            model: "qwen".into(),
+            port: "8000".into(),
+            ..Default::default()
+        };
+        let args = w.build_args().unwrap();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--port".to_string(), "8000".to_string()]),
+            "a typed port must still be passed through: {args:?}"
         );
     }
 
