@@ -346,9 +346,9 @@ rocm serve qwen2.5-7b-instruct --verbose --device gpu_required")]
         /// Engine to use.
         #[arg(long, value_parser = SUPPORTED_ENGINES)]
         engine: Option<String>,
-        /// Device policy [possible values: gpu_required, gpu_preferred, cpu_only].
+        /// Device policy.
         #[arg(long)]
-        device: Option<String>,
+        device: Option<DevicePolicyArg>,
         /// GPU device to serve on: `auto` (default; first free GPU) or a single
         /// index like `1`.
         #[arg(long, value_name = "INDEX|auto")]
@@ -976,6 +976,38 @@ enum TelemetryModeArg {
     Local,
     /// Disable telemetry collection entirely.
     Off,
+}
+
+/// User-facing `rocm serve --device` policy.
+///
+/// Modeled as a clap `ValueEnum` so invalid input is rejected by clap's usage
+/// validation (exit code 2, with the valid choices listed) rather than a generic
+/// application error (exit code 1) — matching how every other enum-style CLI
+/// argument behaves. The historical aliases (`auto`/`gpu` for `gpu_required`,
+/// `cpu` for `cpu_only`) stay accepted for backward compatibility but are hidden
+/// from the advertised list.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum DevicePolicyArg {
+    /// Require a ROCm GPU; fail if none is usable (the default).
+    #[value(alias = "auto", alias = "gpu")]
+    GpuRequired,
+    /// Prefer a ROCm GPU when one is available.
+    GpuPreferred,
+    /// Run on CPU only (not a supported fallback path in rocm serve).
+    #[value(alias = "cpu")]
+    CpuOnly,
+}
+
+impl DevicePolicyArg {
+    /// Canonical policy string understood by [`parse_device_policy`].
+    const fn as_policy_str(self) -> &'static str {
+        match self {
+            Self::GpuRequired => "gpu_required",
+            Self::GpuPreferred => "gpu_preferred",
+            Self::CpuOnly => "cpu_only",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -4704,7 +4736,7 @@ fn engine_recipe_enables_tool_choice(hint: Option<&EngineRecipeHint>) -> bool {
 struct ServeArgs {
     model: String,
     engine: Option<String>,
-    device: Option<String>,
+    device: Option<DevicePolicyArg>,
     gpu: Option<String>,
     runtime_id: Option<String>,
     env_id: Option<String>,
@@ -4843,7 +4875,7 @@ fn serve(args: ServeArgs) -> Result<()> {
     } else {
         None
     };
-    let device_policy = parse_device_policy(device.as_deref())?;
+    let device_policy = parse_device_policy(device.as_ref().map(|policy| policy.as_policy_str()))?;
     let gpu_selection = parse_gpu_selection(gpu.as_deref())?;
     // CPU-only serving never pins a GPU, so skip GPU resolution entirely and
     // surface the explicit `--gpu` as ignored rather than printing a device the
@@ -18053,23 +18085,7 @@ mod tests {
         }
     }
 
-    fn possible_values_listed_in_help(help: &str) -> Vec<String> {
-        let marker = "[possible values:";
-        let start = help
-            .find(marker)
-            .unwrap_or_else(|| panic!("help text missing `{marker}`: {help:?}"));
-        let rest = &help[start + marker.len()..];
-        let end = rest
-            .find(']')
-            .unwrap_or_else(|| panic!("unterminated possible-values list in help: {help:?}"));
-        rest[..end]
-            .split(',')
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-            .collect()
-    }
-
-    fn serve_arg_help(arg_id: &str) -> String {
+    fn serve_possible_values(arg_id: &str) -> Vec<String> {
         let cli = Cli::command();
         let serve = cli
             .find_subcommand("serve")
@@ -18078,32 +18094,20 @@ mod tests {
             .get_arguments()
             .find(|arg| arg.get_id().as_str() == arg_id)
             .unwrap_or_else(|| panic!("serve has no `{arg_id}` argument"))
-            .get_help()
-            .map(ToString::to_string)
-            .unwrap_or_default()
-    }
-
-    // `--engine` restricts its input to `SUPPORTED_ENGINES` via a clap
-    // `value_parser`, so the possible values are advertised in `--help` and shell
-    // completion structurally (not a hand-written doc string). `--device` stays
-    // free-form (it accepts aliases such as `auto`/`gpu` plus the intentional
-    // `cpu_only` rejection), so its advertised list is hand-written and guarded
-    // by a sync test below. Both guards keep the advertised lists honest.
-    #[test]
-    fn serve_engine_help_lists_match_engine_inventory() {
-        let cli = Cli::command();
-        let serve = cli
-            .find_subcommand("serve")
-            .expect("serve subcommand exists");
-        let engine_arg = serve
-            .get_arguments()
-            .find(|arg| arg.get_id() == "engine")
-            .expect("serve has an `engine` argument");
-        let mut listed: Vec<String> = engine_arg
             .get_possible_values()
             .iter()
             .map(|value| value.get_name().to_owned())
-            .collect();
+            .collect()
+    }
+
+    // Both `--engine` and `--device` restrict their input to a fixed set via a
+    // clap `value_parser`/`ValueEnum`, so the possible values are advertised in
+    // `--help` and shell completion structurally (not a hand-written doc string)
+    // and invalid input is rejected as a usage error (exit code 2) with the valid
+    // choices listed. The sync tests below keep the advertised lists honest.
+    #[test]
+    fn serve_engine_help_lists_match_engine_inventory() {
+        let mut listed = serve_possible_values("engine");
         let mut expected: Vec<String> = builtin_engine_inventory()
             .iter()
             .map(|(name, _)| (*name).to_owned())
@@ -18118,7 +18122,7 @@ mod tests {
 
     #[test]
     fn serve_device_help_lists_match_device_policy_names() {
-        let mut listed = possible_values_listed_in_help(&serve_arg_help("device"));
+        let mut listed = serve_possible_values("device");
         let mut expected: Vec<String> = [
             DevicePolicy::GpuRequired,
             DevicePolicy::GpuPreferred,
@@ -18131,8 +18135,39 @@ mod tests {
         expected.sort();
         assert_eq!(
             listed, expected,
-            "serve --device help possible-values must stay in sync with DevicePolicy names"
+            "serve --device possible-values must stay in sync with DevicePolicy names"
         );
+    }
+
+    #[test]
+    fn serve_rejects_unknown_device_policy_as_usage_error() {
+        // An invalid `--device` must fail clap's value validation (a usage error,
+        // exit code 2) rather than parsing as a free-form string and failing later
+        // in application logic (exit code 1). This keeps `--device` consistent with
+        // every other enum-style argument and lists the valid choices in the error.
+        let error = parse_serve(&["--device", "bogus"]).expect_err("invalid device rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn serve_accepts_device_policy_values_and_aliases() {
+        for (value, expected) in [
+            ("gpu_required", DevicePolicyArg::GpuRequired),
+            ("gpu_preferred", DevicePolicyArg::GpuPreferred),
+            ("cpu_only", DevicePolicyArg::CpuOnly),
+            // Historical aliases stay accepted for backward compatibility.
+            ("auto", DevicePolicyArg::GpuRequired),
+            ("gpu", DevicePolicyArg::GpuRequired),
+            ("cpu", DevicePolicyArg::CpuOnly),
+        ] {
+            let cli = parse_serve(&["--device", value]).expect("device value parses");
+            match cli.command {
+                Some(Command::Serve { device, .. }) => {
+                    assert_eq!(device, Some(expected), "device value `{value}`");
+                }
+                other => panic!("expected Serve, got {other:?}"),
+            }
+        }
     }
 
     fn parse_serve(args: &[&str]) -> Result<Cli, clap::Error> {
