@@ -2545,7 +2545,10 @@ fn install_driver(
     let examine =
         ExamineSummary::gather().map_err(|source| DriverInstallError::new(source, false))?;
     let os_release = read_os_release().unwrap_or_default();
-    let plan = build_driver_install_plan(&examine, &os_release, dkms);
+    // The only place the real privilege level is read; every builder below takes
+    // it as a parameter so both branches stay testable on any host.
+    let plan =
+        build_driver_install_plan(&examine, &os_release, dkms, PrivilegeEscalation::detect());
     let mut output = render_driver_install_plan(&plan, yes, dry_run);
     if !yes || dry_run || !plan.supported || !plan.mutating {
         return Ok(DriverInstallResult {
@@ -2855,6 +2858,58 @@ struct DriverPlanCommand {
     command: String,
 }
 
+/// How a generated driver command is expected to reach root.
+///
+/// The driver plan is a list of shell lines, so escalation is a text prefix
+/// rather than an argv decision (contrast `openmpi::InstallCommand`, whose
+/// commands are argv vectors and can prepend `sudo` structurally). Prefixing
+/// unconditionally is what made `install driver` unusable on the hosts it is
+/// most needed on: containers and minimal cloud images run as uid 0 with no
+/// `sudo` binary, so every command died with `sudo: not found` before any
+/// driver work happened.
+///
+/// This is resolved when the plan is BUILT, not when it runs, so that the plan
+/// `--dry-run` prints, the plan the approval prompt shows, and the commands
+/// persisted into `state.json` are all the commands that actually execute.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PrivilegeEscalation {
+    /// Not root: privileged commands need a `sudo` prefix.
+    Sudo,
+    /// Already uid 0: `sudo` is unnecessary, and may not even be installed.
+    AlreadyRoot,
+}
+
+impl PrivilegeEscalation {
+    /// Read the current process's privilege level.
+    ///
+    /// Only ever called on the production path; every plan builder takes the
+    /// escalation as a parameter so both branches are testable on any host.
+    fn detect() -> Self {
+        if rocm_core::openmpi::running_as_root() {
+            Self::AlreadyRoot
+        } else {
+            Self::Sudo
+        }
+    }
+
+    /// The prefix to place before a command that must run as root — `"sudo "`,
+    /// or nothing at all when the process already is root. Includes the
+    /// trailing space so it composes directly into a command string.
+    const fn prefix(self) -> &'static str {
+        match self {
+            Self::Sudo => "sudo ",
+            Self::AlreadyRoot => "",
+        }
+    }
+
+    /// Whether a plan built under this escalation depends on `sudo` being
+    /// installed. Drives the preflight list, so it does not claim a
+    /// precondition the plan is not relying on.
+    const fn needs_sudo_binary(self) -> bool {
+        matches!(self, Self::Sudo)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DriverInstallState {
     approved_at_unix_ms: u128,
@@ -2899,6 +2954,7 @@ fn build_driver_install_plan(
     examine: &ExamineSummary,
     os_release_text: &str,
     dkms: bool,
+    escalation: PrivilegeEscalation,
 ) -> DriverInstallPlan {
     let repo_version_expr = "${ROCM_CLI_AMDGPU_VERSION:-7.2.4}".to_owned();
     if examine.os == "windows" {
@@ -2948,6 +3004,7 @@ fn build_driver_install_plan(
             repo_version_expr,
             dkms,
             true,
+            escalation,
         ),
         ("debian", "12" | "13") => {
             let repo_codename = if version_id == "13" { "noble" } else { "jammy" };
@@ -2958,6 +3015,7 @@ fn build_driver_install_plan(
                 repo_version_expr,
                 dkms,
                 false,
+                escalation,
             );
             // Debian deliberately reuses AMD's Ubuntu-suite repository: AMD's
             // documented Debian install maps Debian 12 -> jammy and 13 -> noble
@@ -2977,6 +3035,7 @@ fn build_driver_install_plan(
             repo_version_expr,
             dkms,
             DnfDriverDistro::Rhel,
+            escalation,
         ),
         ("ol", "10.1" | "9.7" | "8.10") => dnf_driver_plan(
             os_id,
@@ -2985,6 +3044,7 @@ fn build_driver_install_plan(
             repo_version_expr,
             dkms,
             DnfDriverDistro::Oracle,
+            escalation,
         ),
         ("rocky", "9.4" | "9.6" | "9.7") => dnf_driver_plan(
             os_id,
@@ -2993,9 +3053,10 @@ fn build_driver_install_plan(
             repo_version_expr,
             dkms,
             DnfDriverDistro::Rocky,
+            escalation,
         ),
         ("sles" | "sle", "15.7") => {
-            sles_driver_plan(os_id, version_id, codename, repo_version_expr, dkms)
+            sles_driver_plan(os_id, version_id, codename, repo_version_expr, dkms, escalation)
         }
         _ => driver_plan_via_id_like(
             &os_id,
@@ -3004,6 +3065,7 @@ fn build_driver_install_plan(
             &codename,
             &repo_version_expr,
             dkms,
+            escalation,
         )
         .unwrap_or_else(|| DriverInstallPlan {
             supported: false,
@@ -3037,6 +3099,7 @@ fn driver_plan_via_id_like(
     codename: &str,
     repo_version_expr: &str,
     dkms: bool,
+    escalation: PrivilegeEscalation,
 ) -> Option<DriverInstallPlan> {
     let likes: Vec<String> = id_like
         .split_whitespace()
@@ -3064,6 +3127,7 @@ fn driver_plan_via_id_like(
             repo_version_expr.to_owned(),
             dkms,
             true,
+            escalation,
         ));
     }
 
@@ -3078,6 +3142,7 @@ fn driver_plan_via_id_like(
             repo_version_expr.to_owned(),
             dkms,
             false,
+            escalation,
         ));
     }
 
@@ -3098,6 +3163,7 @@ fn driver_plan_via_id_like(
             repo_version_expr.to_owned(),
             dkms,
             DnfDriverDistro::Generic,
+            escalation,
         ));
     }
 
@@ -3132,46 +3198,59 @@ fn apt_driver_plan(
     repo_version_expr: String,
     dkms: bool,
     include_linux_modules_extra: bool,
+    escalation: PrivilegeEscalation,
 ) -> DriverInstallPlan {
+    // Empty when already root, so no command depends on a `sudo` binary that a
+    // container or minimal image very likely does not have.
+    let sudo = escalation.prefix();
     let mut commands = Vec::new();
     if dkms {
         commands.extend([
-            driver_command(DriverCommandPhase::Prepare, "sudo apt-get update"),
             driver_command(
                 DriverCommandPhase::Prepare,
-                "sudo apt-get install -y ca-certificates curl gnupg",
+                &format!("{sudo}apt-get update"),
+            ),
+            driver_command(
+                DriverCommandPhase::Prepare,
+                &format!("{sudo}apt-get install -y ca-certificates curl gnupg"),
             ),
         ]);
         let header_command = if include_linux_modules_extra {
-            "sudo apt-get install -y \"linux-headers-$(uname -r)\" \"linux-modules-extra-$(uname -r)\""
+            format!(
+                "{sudo}apt-get install -y \"linux-headers-$(uname -r)\" \"linux-modules-extra-$(uname -r)\""
+            )
         } else {
-            "sudo apt-get install -y \"linux-headers-$(uname -r)\""
+            format!("{sudo}apt-get install -y \"linux-headers-$(uname -r)\"")
         };
-        commands.push(driver_command(DriverCommandPhase::Prepare, header_command));
+        commands.push(driver_command(DriverCommandPhase::Prepare, &header_command));
         commands.extend([
             driver_command(
                 DriverCommandPhase::Prepare,
-                "sudo install -m 0755 -d /etc/apt/keyrings",
-            ),
-            driver_command(
-                DriverCommandPhase::Prepare,
-                "curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/rocm.gpg",
+                &format!("{sudo}install -m 0755 -d /etc/apt/keyrings"),
             ),
             driver_command(
                 DriverCommandPhase::Prepare,
                 &format!(
-                    "printf '%s\\n' 'deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/graphics/{repo_version_expr}/ubuntu {codename} main' | sudo tee /etc/apt/sources.list.d/amdgpu.list >/dev/null"
+                    "curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | {sudo}gpg --dearmor -o /etc/apt/keyrings/rocm.gpg"
                 ),
             ),
             driver_command(
                 DriverCommandPhase::Prepare,
-                "printf '%s\\n' 'Package: *' 'Pin: release o=repo.radeon.com' 'Pin-Priority: 600' | sudo tee /etc/apt/preferences.d/rocm-pin-600 >/dev/null",
+                &format!(
+                    "printf '%s\\n' 'deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/graphics/{repo_version_expr}/ubuntu {codename} main' | {sudo}tee /etc/apt/sources.list.d/amdgpu.list >/dev/null"
+                ),
             ),
-            driver_command(DriverCommandPhase::Prepare, "sudo apt-get update"),
+            driver_command(
+                DriverCommandPhase::Prepare,
+                &format!(
+                    "printf '%s\\n' 'Package: *' 'Pin: release o=repo.radeon.com' 'Pin-Priority: 600' | {sudo}tee /etc/apt/preferences.d/rocm-pin-600 >/dev/null"
+                ),
+            ),
+            driver_command(DriverCommandPhase::Prepare, &format!("{sudo}apt-get update")),
         ]);
         commands.push(driver_command(
             DriverCommandPhase::Execute,
-            "sudo apt-get install -y amdgpu-dkms",
+            &format!("{sudo}apt-get install -y amdgpu-dkms"),
         ));
         commands.extend([
             driver_command(DriverCommandPhase::Verify, "dkms status amdgpu"),
@@ -3198,11 +3277,9 @@ fn apt_driver_plan(
         }
         .to_owned(),
         preflight_checks: if dkms {
-            vec![
-                "root access: run as root, or ensure `sudo -v` succeeds before approval".to_owned(),
-                "`sudo` command is available when not running as root".to_owned(),
-                "`apt-get` package manager is available".to_owned(),
-            ]
+            let mut checks = driver_root_preflight_checks(escalation);
+            checks.push("`apt-get` package manager is available".to_owned());
+            checks
         } else {
             Vec::new()
         },
@@ -3225,44 +3302,50 @@ fn dnf_driver_plan(
     repo_version_expr: String,
     dkms: bool,
     distro: DnfDriverDistro,
+    escalation: PrivilegeEscalation,
 ) -> DriverInstallPlan {
+    // Empty when already root, so no command depends on a `sudo` binary that a
+    // container or minimal image very likely does not have.
+    let sudo = escalation.prefix();
     let mut commands = Vec::new();
     if dkms {
         match distro {
             DnfDriverDistro::Rhel | DnfDriverDistro::Generic => {
                 commands.extend(
-                    rhel_kernel_prepare_commands(&version_id)
+                    rhel_kernel_prepare_commands(&version_id, escalation)
                         .into_iter()
-                        .map(|command| driver_command(DriverCommandPhase::Prepare, command)),
+                        .map(|command| driver_command(DriverCommandPhase::Prepare, &command)),
                 );
             }
             DnfDriverDistro::Oracle => {
                 commands.push(driver_command(
                     DriverCommandPhase::Prepare,
-                    "sudo dnf install -y \"kernel-uek-devel-$(uname -r)\"",
+                    &format!("{sudo}dnf install -y \"kernel-uek-devel-$(uname -r)\""),
                 ));
             }
             DnfDriverDistro::Rocky => {
                 commands.push(driver_command(
                     DriverCommandPhase::Prepare,
-                    "sudo dnf install -y kernel-headers kernel-devel kernel-devel-matched",
+                    &format!(
+                        "{sudo}dnf install -y kernel-headers kernel-devel kernel-devel-matched"
+                    ),
                 ));
             }
         }
         commands.push(driver_command(
             DriverCommandPhase::Prepare,
             &format!(
-                "sudo dnf install -y {}",
+                "{sudo}dnf install -y {}",
                 amdgpu_install_rpm_url(&repo_version_expr, &version_id, distro)
             ),
         ));
         commands.push(driver_command(
             DriverCommandPhase::Prepare,
-            "sudo dnf clean all",
+            &format!("{sudo}dnf clean all"),
         ));
         commands.push(driver_command(
             DriverCommandPhase::Execute,
-            "sudo dnf install -y amdgpu-dkms",
+            &format!("{sudo}dnf install -y amdgpu-dkms"),
         ));
         commands.extend([
             driver_command(DriverCommandPhase::Verify, "dkms status amdgpu"),
@@ -3289,14 +3372,13 @@ fn dnf_driver_plan(
         }
         .to_owned(),
         preflight_checks: if dkms {
-            vec![
-                "root access: run as root, or ensure `sudo -v` succeeds before approval"
-                    .to_owned(),
-                "`sudo` command is available when not running as root".to_owned(),
-                "`dnf` package manager is available".to_owned(),
+            let mut checks = driver_root_preflight_checks(escalation);
+            checks.push("`dnf` package manager is available".to_owned());
+            checks.push(
                 "enterprise Linux repositories are registered and current before approval"
                     .to_owned(),
-            ]
+            );
+            checks
         } else {
             Vec::new()
         },
@@ -3318,38 +3400,50 @@ fn sles_driver_plan(
     codename: String,
     repo_version_expr: String,
     dkms: bool,
+    escalation: PrivilegeEscalation,
 ) -> DriverInstallPlan {
+    // Empty when already root, so no command depends on a `sudo` binary that a
+    // container or minimal image very likely does not have.
+    let sudo = escalation.prefix();
     let mut commands = Vec::new();
     if dkms {
         commands.extend([
             driver_command(
                 DriverCommandPhase::Prepare,
-                &format!("sudo SUSEConnect -p sle-module-desktop-applications/{version_id}/x86_64"),
+                &format!(
+                    "{sudo}SUSEConnect -p sle-module-desktop-applications/{version_id}/x86_64"
+                ),
             ),
             driver_command(
                 DriverCommandPhase::Prepare,
-                &format!("sudo SUSEConnect -p sle-module-development-tools/{version_id}/x86_64"),
+                &format!("{sudo}SUSEConnect -p sle-module-development-tools/{version_id}/x86_64"),
             ),
             driver_command(
                 DriverCommandPhase::Prepare,
-                &format!("sudo SUSEConnect -p PackageHub/{version_id}/x86_64"),
+                &format!("{sudo}SUSEConnect -p PackageHub/{version_id}/x86_64"),
             ),
-            driver_command(DriverCommandPhase::Prepare, "sudo zypper refresh"),
             driver_command(
                 DriverCommandPhase::Prepare,
-                "sudo zypper install -y kernel-default-devel",
+                &format!("{sudo}zypper refresh"),
+            ),
+            driver_command(
+                DriverCommandPhase::Prepare,
+                &format!("{sudo}zypper install -y kernel-default-devel"),
             ),
             driver_command(
                 DriverCommandPhase::Prepare,
                 &format!(
-                    "sudo zypper --no-gpg-checks install -y {}",
+                    "{sudo}zypper --no-gpg-checks install -y {}",
                     amdgpu_install_sles_rpm_url(&repo_version_expr, &version_id)
                 ),
             ),
-            driver_command(DriverCommandPhase::Prepare, "sudo zypper refresh"),
+            driver_command(
+                DriverCommandPhase::Prepare,
+                &format!("{sudo}zypper refresh"),
+            ),
             driver_command(
                 DriverCommandPhase::Execute,
-                "sudo zypper install -y amdgpu-dkms",
+                &format!("{sudo}zypper install -y amdgpu-dkms"),
             ),
             driver_command(DriverCommandPhase::Verify, "dkms status amdgpu"),
             driver_command(DriverCommandPhase::Verify, "test -e /dev/kfd"),
@@ -3375,13 +3469,12 @@ fn sles_driver_plan(
         }
         .to_owned(),
         preflight_checks: if dkms {
-            vec![
-                "root access: run as root, or ensure `sudo -v` succeeds before approval"
-                    .to_owned(),
-                "`sudo` command is available when not running as root".to_owned(),
-                "`zypper` package manager is available".to_owned(),
+            let mut checks = driver_root_preflight_checks(escalation);
+            checks.push("`zypper` package manager is available".to_owned());
+            checks.push(
                 "`SUSEConnect` is available and the host is registered before approval".to_owned(),
-            ]
+            );
+            checks
         } else {
             Vec::new()
         },
@@ -3397,17 +3490,18 @@ fn sles_driver_plan(
     }
 }
 
-fn rhel_kernel_prepare_commands(version_id: &str) -> Vec<&'static str> {
+fn rhel_kernel_prepare_commands(version_id: &str, escalation: PrivilegeEscalation) -> Vec<String> {
+    let sudo = escalation.prefix();
     if version_id.starts_with("8.") {
         vec![
-            "sudo dnf install -y \"kernel-headers-$(uname -r)\"",
-            "sudo dnf install -y \"kernel-devel-$(uname -r)\"",
+            format!("{sudo}dnf install -y \"kernel-headers-$(uname -r)\""),
+            format!("{sudo}dnf install -y \"kernel-devel-$(uname -r)\""),
         ]
     } else {
         vec![
-            "sudo dnf install -y \"kernel-headers-$(uname -r)\"",
-            "sudo dnf install -y \"kernel-devel-$(uname -r)\"",
-            "sudo dnf install -y \"kernel-devel-matched-$(uname -r)\"",
+            format!("{sudo}dnf install -y \"kernel-headers-$(uname -r)\""),
+            format!("{sudo}dnf install -y \"kernel-devel-$(uname -r)\""),
+            format!("{sudo}dnf install -y \"kernel-devel-matched-$(uname -r)\""),
         ]
     }
 }
@@ -3448,6 +3542,22 @@ fn dnf_repo_version_path(version_id: &str) -> String {
 
 fn linux_major_version(version_id: &str) -> &str {
     version_id.split('.').next().unwrap_or(version_id)
+}
+
+/// Preconditions about reaching root for a driver plan.
+///
+/// These differ by escalation: a plan that will prefix `sudo` additionally
+/// depends on a `sudo` binary being installed, while a plan built as root does
+/// not. Listing that precondition when already root would state a requirement
+/// the plan is not relying on — which is exactly the contradiction that made
+/// the unconditional prefix confusing to debug.
+fn driver_root_preflight_checks(escalation: PrivilegeEscalation) -> Vec<String> {
+    let mut checks =
+        vec!["root access: run as root, or ensure `sudo -v` succeeds before approval".to_owned()];
+    if escalation.needs_sudo_binary() {
+        checks.push("`sudo` command is available when not running as root".to_owned());
+    }
+    checks
 }
 
 fn driver_command(phase: DriverCommandPhase, command: &str) -> DriverPlanCommand {
@@ -23819,6 +23929,184 @@ install therock";
         assert!(vram_capacity_is_meaningful(None, 1));
     }
 
+    /// Every distro whose plan actually emits privileged commands, so the
+    /// escalation tests below sweep all of them rather than whichever one was
+    /// remembered. Adding a distro to the planner without adding it here would
+    /// leave its commands unswept.
+    fn dkms_planning_os_releases() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (
+                "ubuntu",
+                "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n",
+            ),
+            ("debian", "ID=debian\nVERSION_ID=\"12\"\n"),
+            ("rhel", "ID=rhel\nVERSION_ID=\"9.7\"\n"),
+            ("rhel-8", "ID=rhel\nVERSION_ID=\"8.10\"\n"),
+            ("oracle", "ID=ol\nVERSION_ID=\"9.7\"\n"),
+            ("rocky", "ID=rocky\nVERSION_ID=\"9.4\"\n"),
+            ("sles", "ID=sles\nVERSION_ID=\"15.7\"\n"),
+            (
+                "almalinux-via-id-like",
+                "ID=almalinux\nVERSION_ID=\"9.4\"\nID_LIKE=\"rhel centos fedora\"\n",
+            ),
+        ]
+    }
+
+    fn plan_commands(os_release: &str, escalation: PrivilegeEscalation) -> Vec<String> {
+        build_driver_install_plan(&test_examine("linux", false), os_release, true, escalation)
+            .commands
+            .into_iter()
+            .map(|command| command.command)
+            .collect()
+    }
+
+    #[test]
+    fn driver_plan_as_root_never_emits_sudo() {
+        // The defect: every command was prefixed `sudo` unconditionally, so on a
+        // root host without the binary the first one died with `sudo: not found`
+        // before any driver work. This asserts the ABSENCE of `sudo` across every
+        // distro rather than checking known commands one by one — a templating
+        // site missed on some distro fails here instead of shipping.
+        for (label, os_release) in dkms_planning_os_releases() {
+            let commands = plan_commands(os_release, PrivilegeEscalation::AlreadyRoot);
+            assert!(
+                !commands.is_empty(),
+                "{label}: expected a dkms plan to emit commands"
+            );
+            for command in &commands {
+                assert!(
+                    !command.contains("sudo"),
+                    "{label}: a plan built as root must not invoke sudo, got `{command}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn driver_plan_off_root_still_escalates_every_privileged_command() {
+        // The other half of the contract: dropping `sudo` when root must not drop
+        // it when a normal user runs the same plan. Verify-phase commands are
+        // read-only probes and are deliberately unprivileged, so only the
+        // mutating phases are required to escalate.
+        for (label, os_release) in dkms_planning_os_releases() {
+            let plan = build_driver_install_plan(
+                &test_examine("linux", false),
+                os_release,
+                true,
+                PrivilegeEscalation::Sudo,
+            );
+            let privileged: Vec<&DriverPlanCommand> = plan
+                .commands
+                .iter()
+                .filter(|command| {
+                    matches!(
+                        command.phase,
+                        DriverCommandPhase::Prepare | DriverCommandPhase::Execute
+                    )
+                })
+                .collect();
+            assert!(!privileged.is_empty(), "{label}: expected privileged steps");
+            for command in privileged {
+                assert!(
+                    command.command.contains("sudo "),
+                    "{label}: a plan built off root must escalate, got `{}`",
+                    command.command
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn driver_plan_as_root_keeps_shell_pipelines_intact() {
+        // `sudo` also appears mid-pipeline (`| sudo tee`, `| sudo gpg`), which a
+        // naive "strip a leading prefix" fix would miss. The pipeline must survive
+        // with the escalation removed from the right-hand side only.
+        let ubuntu = "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n";
+        let commands = plan_commands(ubuntu, PrivilegeEscalation::AlreadyRoot);
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.contains("| tee /etc/apt/sources.list.d/amdgpu.list")),
+            "the apt-source pipeline must still tee, unprefixed: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.contains("| gpg --dearmor -o /etc/apt/keyrings/rocm.gpg")),
+            "the keyring pipeline must still call gpg, unprefixed: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn driver_plan_records_the_commands_it_will_actually_run() {
+        // `execution_commands()` is what lands in state.json. It must agree with
+        // the escalation the plan was built under, or the recorded history
+        // describes commands that never ran.
+        let ubuntu = "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n";
+        let as_root = build_driver_install_plan(
+            &test_examine("linux", false),
+            ubuntu,
+            true,
+            PrivilegeEscalation::AlreadyRoot,
+        );
+        assert!(
+            as_root
+                .execution_commands()
+                .iter()
+                .all(|command| !command.contains("sudo")),
+            "state.json must not record sudo commands for a root run"
+        );
+        let off_root = build_driver_install_plan(
+            &test_examine("linux", false),
+            ubuntu,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert!(
+            off_root
+                .execution_commands()
+                .iter()
+                .all(|command| command.contains("sudo ")),
+            "state.json must record the sudo commands a non-root run performs"
+        );
+    }
+
+    #[test]
+    fn driver_plan_as_root_drops_the_sudo_binary_precondition() {
+        // The preflight claimed `sudo` must be installed even when the plan no
+        // longer uses it — the same contradiction the bug report called out
+        // between the stated preconditions and what execution actually did.
+        for (label, os_release) in dkms_planning_os_releases() {
+            let as_root = build_driver_install_plan(
+                &test_examine("linux", false),
+                os_release,
+                true,
+                PrivilegeEscalation::AlreadyRoot,
+            );
+            assert!(
+                !as_root
+                    .preflight_checks
+                    .iter()
+                    .any(|check| check.contains("`sudo` command is available")),
+                "{label}: a root plan must not require a sudo binary: {:?}",
+                as_root.preflight_checks
+            );
+            let off_root = build_driver_install_plan(
+                &test_examine("linux", false),
+                os_release,
+                true,
+                PrivilegeEscalation::Sudo,
+            );
+            assert!(
+                off_root
+                    .preflight_checks
+                    .iter()
+                    .any(|check| check.contains("`sudo` command is available")),
+                "{label}: a non-root plan still depends on a sudo binary"
+            );
+        }
+    }
+
     #[test]
     fn driver_plan_ubuntu_2404_uses_official_dkms_commands() {
         let os_release = r#"
@@ -23826,7 +24114,12 @@ ID=ubuntu
 VERSION_ID="24.04"
 VERSION_CODENAME=noble
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let commands = plan
             .commands
             .iter()
@@ -23992,7 +24285,12 @@ ID=ubuntu
 VERSION_ID="24.04"
 VERSION_CODENAME=noble
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, false);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            false,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(plan.supported);
@@ -24011,7 +24309,12 @@ ID=debian
 VERSION_ID="12"
 VERSION_CODENAME=bookworm
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, true);
 
         assert!(plan.supported);
@@ -24028,7 +24331,12 @@ VERSION_CODENAME=bookworm
 ID=rhel
 VERSION_ID="9.7"
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(plan.supported);
@@ -24052,7 +24360,12 @@ VERSION_ID="9.7"
 ID=ol
 VERSION_ID="10.1"
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, true);
 
         assert!(plan.supported);
@@ -24073,7 +24386,12 @@ VERSION_ID="10.1"
 ID=rocky
 VERSION_ID="9.7"
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(plan.supported);
@@ -24096,7 +24414,12 @@ VERSION_ID="9.7"
 ID=rocky
 VERSION_ID="9.4"
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(plan.supported);
@@ -24115,7 +24438,12 @@ VERSION_ID="9.4"
         // AMD documents Rocky Linux 9 only; keep the driver matrix scoped to 9.x.
         for version in ["8.10", "10.0"] {
             let os_release = format!("\nID=rocky\nVERSION_ID=\"{version}\"\n");
-            let plan = build_driver_install_plan(&test_examine("linux", false), &os_release, true);
+            let plan = build_driver_install_plan(
+                &test_examine("linux", false),
+                &os_release,
+                true,
+                PrivilegeEscalation::Sudo,
+            );
             assert!(!plan.supported, "rocky {version} should be unsupported");
             assert!(!plan.mutating, "rocky {version} must not mutate");
             assert!(
@@ -24135,7 +24463,12 @@ ID=debian
 VERSION_ID="12"
 VERSION_CODENAME=bookworm
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, true);
 
         assert!(plan.supported);
@@ -24155,7 +24488,12 @@ VERSION_CODENAME=bookworm
 ID=sles
 VERSION_ID="15.7"
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(plan.supported);
@@ -24177,7 +24515,12 @@ VERSION_ID="15.7"
 ID=fedora
 VERSION_ID="41"
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(!plan.supported);
@@ -24190,7 +24533,12 @@ VERSION_ID="41"
 
     #[test]
     fn windows_install_driver_is_validate_only() {
-        let plan = build_driver_install_plan(&test_examine("windows", false), "", true);
+        let plan = build_driver_install_plan(
+            &test_examine("windows", false),
+            "",
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, true);
 
         assert!(!plan.supported);
@@ -24206,7 +24554,12 @@ VERSION_ID="41"
 
     #[test]
     fn wsl_install_driver_uses_rocdxg_guidance_without_dkms() {
-        let plan = build_driver_install_plan(&test_examine("linux", true), "", true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", true),
+            "",
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(!plan.supported);
@@ -24231,7 +24584,12 @@ VERSION_ID="22.04"
 VERSION_CODENAME=jammy
 ID_LIKE="ubuntu debian"
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(plan.supported);
@@ -24253,7 +24611,12 @@ ID=lmde
 VERSION_ID="12"
 ID_LIKE=debian
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(plan.supported);
@@ -24273,7 +24636,12 @@ ID=almalinux
 VERSION_ID="9.6"
 ID_LIKE="rhel centos fedora"
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(plan.supported);
@@ -24299,7 +24667,12 @@ ID=almalinux
 VERSION_ID="8.10"
 ID_LIKE="rhel centos fedora"
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(plan.supported);
@@ -24323,7 +24696,12 @@ ID=lmde
 VERSION_ID="6"
 ID_LIKE=debian
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(!plan.supported);
@@ -24340,7 +24718,12 @@ ID=rhel
 VERSION_ID="9.7"
 ID_LIKE=fedora
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(plan.supported);
@@ -24360,7 +24743,12 @@ ID=ol
 VERSION_ID="9.6"
 ID_LIKE=fedora
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(!plan.supported);
@@ -24379,7 +24767,12 @@ ID=opensuse-leap
 VERSION_ID="15.7"
 ID_LIKE="suse opensuse"
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(!plan.supported);
