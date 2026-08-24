@@ -17,14 +17,26 @@ use cucumber::{given, then, when};
 
 use crate::E2eWorld;
 
-const FIRST_KEY: &str = "therock-release:gfx942";
-const SECOND_KEY: &str = "therock-release:gfx1100";
-const IMPORT_KEY: &str = "therock-release:gfx1151";
+// Runtime KEYS double as registry filenames (`<key>.json`), exactly as production
+// does. Production derives the key by slugifying, so a real key is filename-safe on
+// every OS; the fixtures must use the same shape. A raw `therock-release:gfx942`
+// (the runtime_ID form) contains a `:`, which on Windows names an NTFS alternate
+// data stream instead of a normal file — the planted runtime is then undiscoverable
+// and activate/rollback/uninstall fail with "installed runtime not found". Keep the
+// `:` form only in `runtime_id`, which is a manifest field value, never a filename.
+const FIRST_KEY: &str = "release-tarball-gfx942";
+const SECOND_KEY: &str = "release-tarball-gfx1100";
+const IMPORT_KEY: &str = "release-tarball-gfx1151";
 
 /// Write a read-only `tarball` runtime manifest into the isolated registry and
 /// create its `install_root` (a dir with a payload file) so it validates as usable.
 /// Returns the install_root so a scenario can assert the folder's fate.
 fn plant_runtime(world: &E2eWorld, key: &str, family: &str) -> PathBuf {
+    assert!(
+        key.chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-'),
+        "runtime key must be production-style and safe as a registry filename: {key}"
+    );
     let root = world.isolated_root.as_ref().expect("no isolated root");
     let install_root = root.path().join(format!("runtime-{family}"));
     std::fs::create_dir_all(&install_root).expect("failed to create install root");
@@ -44,7 +56,9 @@ fn plant_runtime(world: &E2eWorld, key: &str, family: &str) -> PathBuf {
 fn runtime_manifest_json(key: &str, family: &str, install_root: &Path) -> String {
     serde_json::to_string_pretty(&serde_json::json!({
         "runtime_key": key,
-        "runtime_id": key,
+        // The human-facing identifier keeps the `therock-release:<family>` form (the
+        // `:` is safe here — this is a field value, never a filename, unlike `key`).
+        "runtime_id": format!("therock-release:{family}"),
         "channel": "release",
         "format": "tarball",
         "family": family,
