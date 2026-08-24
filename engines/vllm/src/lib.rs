@@ -407,11 +407,13 @@ fn capabilities() -> EngineCapabilities {
 }
 
 fn install_response(request: InstallRequest) -> Result<InstallResponse> {
-    let resolved = if request.reinstall {
-        None
-    } else {
-        resolve_vllm_runtime(Some(&request.runtime_id)).ok()
-    };
+    // Resolve regardless of `reinstall`. Resolution answers *which* interpreter holds
+    // vLLM, and a forced reinstall needs that answer just as much as a repair does —
+    // gating it on `reinstall` left `--reinstall` with no assessed environment, so it
+    // fell back to `resolve_managed_runtime_python` (first prefix-matching candidate)
+    // and could reinstall a healthy environment while leaving the broken one broken.
+    // Only the short-circuit below is gated on `reinstall`.
+    let resolved = resolve_vllm_runtime(Some(&request.runtime_id)).ok();
     // A resolvable vLLM is not necessarily a usable one. `rocm install sdk` writes the
     // TheRock torch stack into the same environment vLLM lives in, so a second run
     // replaces the torch build vLLM pins without touching vLLM itself.
@@ -420,7 +422,7 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
     let (already_installed, repair, assessed) = match resolved {
         Some(runtime) => {
             let repair = assess_runtime_repair(&runtime);
-            if repair.needed {
+            if request.reinstall || repair.needed {
                 (None, repair, assessed_python_for_repair(&runtime))
             } else {
                 (Some(runtime), repair, None)
@@ -541,14 +543,19 @@ fn repair_from_violations(violations: &[DependencyViolation]) -> RepairAssessmen
     if owned.is_empty() {
         return RepairAssessment::default();
     }
-    let mut notes = vec![format!(
-        "the runtime environment did not satisfy vLLM's pinned dependencies; vLLM was reinstalled to restore them ({})",
+    let mut notes = vec![
+        "the runtime environment did not satisfy vLLM's pinned dependencies; vLLM was reinstalled to restore them".to_owned(),
+    ];
+    // One note per violation rather than one joined line. The real failure is the whole
+    // torch stack — torch, torchvision and torchaudio move together when the SDK writes
+    // over the engine's pins — so joining them produced a single ~380-character line that
+    // is unreadable in a terminal. Mirrors the per-finding `violation:` lines the
+    // CLI-side renderer already emits.
+    notes.extend(
         owned
             .iter()
-            .map(|violation| violation.detail.as_str())
-            .collect::<Vec<_>>()
-            .join("; ")
-    )];
+            .map(|violation| format!("violation: {}", violation.detail)),
+    );
     notes.push(
         "if this recurs after `rocm install sdk`, the SDK torch stack is being written over vLLM's pinned torch".to_owned(),
     );
@@ -2570,6 +2577,53 @@ mod tests {
                 .iter()
                 .any(|note| note.contains("2.10.0+git8514f05")),
             "the reported note names the pin that was violated: {:?}",
+            assessment.notes
+        );
+    }
+
+    #[test]
+    fn the_whole_replaced_torch_stack_is_reported_one_finding_per_line() {
+        // What the failure actually looks like on hardware: the SDK moves torch,
+        // torchvision and torchaudio together, so all three pins are violated at
+        // once. Joining them into a single note produced one ~380-character line;
+        // each finding gets its own so a terminal can show them.
+        let assessment = repair_from_violations(&[
+            violation(
+                "vllm",
+                "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.11.0+rocm7.13.0` is installed",
+            ),
+            violation(
+                "vllm",
+                "The package `vllm` requires `torchvision==0.24.1+d801a34`, but `0.26.0+rocm7.13.0` is installed",
+            ),
+            violation(
+                "vllm",
+                "The package `vllm` requires `torchaudio==2.9.0+eaa9e4e`, but `2.11.0+rocm7.13.0` is installed",
+            ),
+        ]);
+
+        assert!(assessment.needed);
+        let violation_notes: Vec<&String> = assessment
+            .notes
+            .iter()
+            .filter(|note| note.starts_with("violation: "))
+            .collect();
+        assert_eq!(
+            violation_notes.len(),
+            3,
+            "every violated pin gets its own note: {:?}",
+            assessment.notes
+        );
+        for package in ["torch==", "torchvision==", "torchaudio=="] {
+            assert!(
+                violation_notes.iter().any(|note| note.contains(package)),
+                "{package} is missing from the reported notes: {:?}",
+                assessment.notes
+            );
+        }
+        assert!(
+            assessment.notes.iter().all(|note| note.len() < 200),
+            "no note should be a wall of joined findings: {:?}",
             assessment.notes
         );
     }

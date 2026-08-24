@@ -31,7 +31,6 @@ Feature: Runtime configuration
     Given a managed runtime with an inference engine already installed
     When the user installs the SDK again
     Then the install reports the engine's requirements as satisfied
-    And the engine is still ready to serve
 
   # Linux-only: the step adopts a standard `/opt/rocm` install with a Unix python
   # path. On Windows those paths don't exist (the CLI resolves `/usr/bin/python3`

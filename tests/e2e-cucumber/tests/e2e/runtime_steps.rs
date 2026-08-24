@@ -85,12 +85,15 @@ async fn assert_engine_requirements_satisfied(world: &mut E2eWorld) {
     );
 }
 
-#[then("the engine is still ready to serve")]
-async fn assert_engine_still_ready(world: &mut E2eWorld) {
-    assert_engine_ready(world);
-}
-
 /// The engine inventory reports a usable engine runtime.
+///
+/// A precondition only. It deliberately has no Then counterpart: `engines list`
+/// reports `runtime: ready` even while the engine's pinned dependencies are
+/// violated — that false green is the very thing this feature's scenario exists
+/// to catch — so asserting it afterwards would pass whether or not the fix
+/// works. Teaching that surface to notice a violated pin is tracked separately;
+/// until it does, the `dependency_check: satisfied` assertion is the only
+/// falsifiable signal available.
 fn assert_engine_ready(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["engines", "list"]);
     assert!(
