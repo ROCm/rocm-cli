@@ -70,9 +70,10 @@ pub use runtime::{
     runtime_rocm_library_filename, shell_command_for_host, user_runtime_dir,
 };
 pub use uv::{
-    DEFAULT_UV_TIMEOUT_SECS, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV, UvCacheSource,
-    ensure_uv_binary, uv_binary_name, uv_cache_source, uv_command_env, uv_http_timeout_secs,
-    uv_pip_freeze_args, uv_pip_install_base, uv_venv_args,
+    DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,
+    UvCacheSource, check_dependencies, ensure_uv_binary, uv_binary_name, uv_cache_source,
+    uv_command_env, uv_http_timeout_secs, uv_pip_check_args, uv_pip_freeze_args,
+    uv_pip_install_base, uv_venv_args, violations_requiring,
 };
 
 pub const DEFAULT_LOCAL_PORT: u16 = 11_435;

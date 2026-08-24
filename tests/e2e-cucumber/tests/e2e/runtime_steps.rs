@@ -47,10 +47,59 @@ async fn setup_active_runtime(world: &mut E2eWorld) {
     );
 }
 
+#[given("a managed runtime with an inference engine already installed")]
+async fn setup_runtime_with_engine(world: &mut E2eWorld) {
+    // Share the runtimes tree for the same reason `a managed runtime is active` does:
+    // the first scenario to find it empty pays for the multi-GiB SDK pull, the rest
+    // reuse it. `install sdk` auto-installs the family's preferred engine, so one
+    // install satisfies both halves of this precondition.
+    world.use_shared_runtimes();
+    let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
+    if stdout.contains("installed: none") {
+        crate::run_rocm_ok(world, &["install", "sdk"]);
+    }
+    assert_engine_ready(world);
+}
+
 #[when("the user installs the SDK")]
 async fn user_installs_sdk(world: &mut E2eWorld) {
     let stdout = crate::run_rocm_ok(world, &["install", "sdk"]);
     world.cli_output = Some(stdout);
+}
+
+#[when("the user installs the SDK again")]
+async fn user_reinstalls_sdk(world: &mut E2eWorld) {
+    user_installs_sdk(world).await;
+}
+
+#[then("the install reports the engine's requirements as satisfied")]
+async fn assert_engine_requirements_satisfied(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no install output");
+    assert!(
+        !output.contains("dependency_check: violated"),
+        "the reinstall left the engine's declared requirements unmet:\n{output}"
+    );
+    assert!(
+        output.contains("dependency_check: satisfied"),
+        "the install did not report on the engine's requirements at all:\n{output}"
+    );
+}
+
+/// The engine inventory reports a usable engine runtime.
+///
+/// A precondition only. It deliberately has no Then counterpart: `engines list`
+/// reports `runtime: ready` even while the engine's pinned dependencies are
+/// violated — that false green is the very thing this feature's scenario exists
+/// to catch — so asserting it afterwards would pass whether or not the fix
+/// works. Teaching that surface to notice a violated pin is tracked separately;
+/// until it does, the `dependency_check: satisfied` assertion is the only
+/// falsifiable signal available.
+fn assert_engine_ready(world: &mut E2eWorld) {
+    let (stdout, _, _) = crate::run_rocm(world, &["engines", "list"]);
+    assert!(
+        stdout.contains("runtime: ready"),
+        "no engine runtime is ready:\n{stdout}"
+    );
 }
 
 #[when("the user tries to adopt the existing install")]
