@@ -18,17 +18,22 @@ use tempfile::TempDir;
 
 mod e2e {
     pub mod artifact_steps;
+    pub mod automations_steps;
     pub mod bench_steps;
     pub mod chat_steps;
+    pub mod config_steps;
     pub mod dash_steps;
     pub mod dependency_guard_steps;
     pub mod diagnose_steps;
     pub mod engines_steps;
     pub mod examine_steps;
     pub mod lifecycle_steps;
+    pub mod logs_steps;
+    pub mod runtime_lifecycle_steps;
     pub mod runtime_steps;
     pub mod serving_steps;
     pub mod tui_driver;
+    pub mod update_steps;
 }
 
 // ── World ──────────────────────────────────────────────────────────
@@ -516,6 +521,56 @@ pub fn run_rocm_ok(world: &E2eWorld, args: &[&str]) -> String {
         cli_failure_report(args, rc, &stdout, &stderr)
     );
     stdout
+}
+
+/// Like [`run_rocm`], but writes `stdin` to the child's standard input and sets
+/// extra environment variables on the child.
+///
+/// Used by scenarios that drive a command reading from stdin — e.g. `config
+/// set-provider-key`, which reads the secret from stdin non-interactively. The
+/// scenario can then assert on both the exit code and that the piped secret is
+/// never echoed back. `envs` lets a scenario also control the child's environment
+/// (e.g. point the secret store at an unreachable D-Bus so the save deterministically
+/// fails), applied on top of the scenario's isolated config/data/cache env.
+pub fn run_rocm_with_stdin(
+    world: &E2eWorld,
+    args: &[&str],
+    stdin: &str,
+    envs: &[(&str, &str)],
+) -> (String, String, i32) {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let binary = rocm_binary();
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(args);
+    world.isolate_cmd(&mut cmd);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    child
+        .stdin
+        .take()
+        .expect("child stdin was not piped")
+        .write_all(stdin.as_bytes())
+        .expect("failed to write to child stdin");
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("failed to wait on {binary}: {e}"));
+    let rc = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    record_command(world.current_scenario.as_deref(), args, rc, &stdout);
+    (
+        stdout,
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        rc,
+    )
 }
 
 /// Like [`run_rocm`], but with extra environment variables set on the child.

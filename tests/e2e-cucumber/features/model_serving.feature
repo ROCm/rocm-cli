@@ -154,3 +154,13 @@ Feature: Model serving
     When the user serves a model pinned to a GPU index that does not exist
     Then serving is refused before any engine starts
     And the user is told that GPU index is unavailable
+
+  # A runtime and an environment are two ways to pick what a serve runs against,
+  # and choosing both at once is ambiguous, so the CLI rejects the combination
+  # during argument parsing — before any engine or GPU work. No device needed, so
+  # this runs on the mock lane every PR.
+  @id:serve-runtime-and-env-selectors-conflict
+  Scenario: 15 - Selecting both a runtime and an environment at once is refused
+    When the user serves a model selecting both a runtime and an environment
+    Then serving is refused before any engine starts
+    And the user is told the two selectors cannot be combined
