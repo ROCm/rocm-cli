@@ -447,6 +447,7 @@ pub fn run(channel: &str, keep: usize, prewarm_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
+
     // An install/update that exits 0 without leaving a registry behind is the
     // confusing case the lanes used to call out by hand: every scenario then falls
     // back to installing its own runtime and the job quietly blows its time cap.
@@ -475,6 +476,30 @@ pub fn run(channel: &str, keep: usize, prewarm_dir: &Path) -> Result<()> {
         println!("pre-warm: pruning old installs failed ({error:#}); continuing");
     }
     Ok(())
+}
+fn ensure_default_engine(rocm: &Path, prewarm_dir: &Path) -> Result<()> {
+    let output = rocm_command(rocm, prewarm_dir)
+        .args(["engines", "list"])
+        .output()
+        .context("failed to run `rocm engines list`")?;
+    if !output.status.success() {
+        bail!("`rocm engines list` exited with {}", output.status);
+    }
+    let inventory = String::from_utf8_lossy(&output.stdout);
+    let engine = default_engine_from_inventory(&inventory)
+        .context("`rocm engines list` did not identify a default engine")?;
+    rocm_command(rocm, prewarm_dir)
+        .args(["engines", "install", engine, "--yes"])
+        .status_ok("rocm engines install")
+}
+
+fn default_engine_from_inventory(inventory: &str) -> Option<&str> {
+    inventory.lines().find_map(|line| {
+        line.trim_start()
+            .strip_prefix("* ")?
+            .split_whitespace()
+            .next()
+    })
 }
 
 /// Whether `decision` put a new runtime in the tree, and so whether the registry
@@ -1090,6 +1115,13 @@ Local model engines
         assert!(runtime_changed(&Decision::Update {
             runtime_key: "release-wheel-gfx94x-dcgpu-7-13-0".to_owned()
         }));
+    }
+
+    #[test]
+    fn parses_default_engine_from_inventory() {
+        let inventory =
+            "Local model engines\n* vllm       Linux ROCm engine\n  lemonade   embedded engine\n";
+        assert_eq!(default_engine_from_inventory(inventory), Some("vllm"));
     }
 
     #[test]
