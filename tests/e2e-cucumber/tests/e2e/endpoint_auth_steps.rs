@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 use cucumber::{then, when};
 
 use crate::E2eWorld;
+use e2e_cucumber::serve_log::service_log_tail;
+
 use crate::e2e::serving_steps::{ensure_serve_port_free, host_serve_target, serve_timeout_for};
 
 /// The port every serve scenario shares (see `serving_steps::SERVE_PORT`). A public
@@ -66,18 +68,26 @@ async fn get_models_status(bearer: Option<&str>) -> reqwest::StatusCode {
 /// the engine has not bound the port yet and the connection is simply refused.
 /// That is expected here and must be retried — panicking on the first refusal is
 /// what made this scenario fail before it ever reached its assertions.
-async fn wait_for_authenticated_endpoint(key: &str, timeout_secs: u64) {
+///
+/// On timeout the panic carries the engine's own log tail and the last thing the
+/// endpoint did, because "did not answer in Ns" alone cannot distinguish the three
+/// failures that look identical from outside: the engine never started, it started
+/// but is still loading weights, or it is up and REJECTING the key we were issued
+/// (which would be a real defect in the contract under test, not a slow start).
+async fn wait_for_authenticated_endpoint(key: &str, timeout_secs: u64, serve_stdout: &str) {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
-        if try_models_status(Some(key))
-            .await
-            .is_some_and(|status| status.is_success())
-        {
-            return;
-        }
+        let last_seen = match try_models_status(Some(key)).await {
+            Some(status) if status.is_success() => return,
+            Some(status) => format!("endpoint answered {status} to the issued key"),
+            None => "connection refused / timed out".to_owned(),
+        };
         assert!(
             Instant::now() < deadline,
-            "public endpoint {ENDPOINT_URL} did not answer an authenticated request within {timeout_secs}s"
+            "public endpoint {ENDPOINT_URL} did not answer an authenticated request within \
+             {timeout_secs}s\nlast observed: {last_seen}\n--- SERVE STDOUT ---\n{serve_stdout}\
+             \n--- SERVICE LOG (tail) ---\n{}",
+            service_log_tail(serve_stdout)
         );
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
@@ -105,7 +115,7 @@ async fn serve_public_bind(world: &mut E2eWorld) {
     );
     let key = issued_api_key(&stdout)
         .unwrap_or_else(|| panic!("serve did not print an endpoint api key:\n{stdout}"));
-    wait_for_authenticated_endpoint(&key, serve_timeout_for(world)).await;
+    wait_for_authenticated_endpoint(&key, serve_timeout_for(world), &stdout).await;
     world.endpoint = Some(ENDPOINT_URL.to_owned());
     world.endpoint_api_key = Some(key);
     world.model_name = Some(model.to_owned());
