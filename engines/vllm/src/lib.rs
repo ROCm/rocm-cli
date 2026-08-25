@@ -1833,7 +1833,7 @@ fn oom_utilization_hint(log_tail: &str) -> String {
         format!(
             "\n\nDetected an out-of-memory failure. {}\n\
              For conditional remediation, run `rocm diagnose --symptom \
-             'torch.OutOfMemoryError: HIP out of memory'`.",
+             'vllm: torch.OutOfMemoryError: HIP out of memory'`.",
             rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT
         )
     } else {

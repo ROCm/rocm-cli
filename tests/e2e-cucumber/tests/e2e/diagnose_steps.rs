@@ -120,8 +120,9 @@ async fn user_hit_unknown_failure(world: &mut E2eWorld) {
 
 #[given("a user whose vLLM server ran out of GPU memory")]
 async fn user_hit_vllm_oom(world: &mut E2eWorld) {
-    world.model_name =
-        Some("torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.".to_string());
+    world.model_name = Some(
+        "vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.".to_string(),
+    );
 }
 
 #[given("a user who has chosen a known fix")]
