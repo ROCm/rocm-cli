@@ -4,7 +4,7 @@ Copyright © Advanced Micro Devices, Inc., or its affiliates.
 SPDX-License-Identifier: MIT
 -->
 
-# Release Trust
+# Release trust
 
 rocm-cli release packages are protected in two layers:
 
@@ -13,7 +13,7 @@ rocm-cli release packages are protected in two layers:
 2. Release packaging can emit detached RSA/SHA-256 `.sig` files, and release
    and nightly CI now require those signatures for published assets.
 
-## Signing Inputs
+## Signing inputs
 
 Release packaging is produced by `cargo xtask package <dist-name>`, a
 cross-platform command that builds the bundle (`.tar.gz` on Unix, `.zip` on
@@ -75,7 +75,7 @@ The opt-in `@lifecycle` install-lifecycle E2E scenarios cover both path and PEM
 signing inputs with generated local keys. Those keys are test material only;
 they are not trust roots.
 
-## Installer Verification
+## Installer verification
 
 Installers always verify checksums. Signature verification runs when a public
 key is supplied or `ROCM_CLI_REQUIRE_SIGNATURE=1` is set.
@@ -116,20 +116,21 @@ happen before activation. Run the current host's set with
 `E2E_INCLUDE_LIFECYCLE=1 E2E_ONLY_LIFECYCLE=1 cargo xtask e2e` (see
 `docs/testing.md`).
 
-## WSL ROCDXG Package Verification
+## WSL ROCDXG package verification
 
 `scripts/wsl_setup_rocdxg.sh` does not bake in a production checksum for the
 ROCDXG `.deb`. Operators can require verification by providing the expected
-digest:
+digest, where `<64_hex_sha256_digest>` is the trusted 64-character SHA-256
+digest for that package:
 
 ```bash
-ROCDXG_SHA256=<64-hex-sha256> bash scripts/wsl_setup_rocdxg.sh
+ROCDXG_SHA256=<64_hex_sha256_digest> bash scripts/wsl_setup_rocdxg.sh
 ```
 
 When `ROCDXG_SHA256` is set, the script verifies the downloaded `.deb` before
 `apt install` and fails on malformed or mismatched digests.
 
-## Runtime Metadata Verification
+## Runtime metadata verification
 
 The Rust metadata cache can verify detached metadata signatures when a metadata
 public key is configured:
@@ -149,7 +150,7 @@ metadata fetch fails and does not use unsigned data.
 Developer tests cover this path with generated local RSA keys and tampered
 payload rejection; see `docs/testing.md`.
 
-## Model Recipe Index Verification
+## Model recipe index verification
 
 rocm-cli can read an externally configured model recipe index only when it is
 signed with a detached signature and a local public key is provided:
@@ -185,7 +186,7 @@ sha256 and size metadata, Hugging Face host scoping, Hugging Face token
 approval, or manual-only blocking. Existing signed indexes without
 `source_policy` keep the older explicit-review behavior.
 
-## Remaining Owner Step
+## Remaining owner step
 
 The repo still needs a real project-owned public signing key and matching
 private release secret, plus the public metadata and model recipe index keys,

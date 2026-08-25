@@ -4,7 +4,7 @@ Copyright © Advanced Micro Devices, Inc., or its affiliates.
 SPDX-License-Identifier: MIT
 -->
 
-# vLLM Adapter
+# vLLM adapter
 
 `rocm-engine-vllm` is a first-party adapter around an existing vLLM
 installation. It is intended for Linux and WSL ROCm GPU serving.
@@ -43,7 +43,7 @@ python3 scripts/vllm_therock_gpu_test.py \
   --model facebook/opt-125m
 ```
 
-The acceptance script is Linux/WSL only. It requires vLLM to be discoverable
+The acceptance script is Linux or WSL only. It requires vLLM to be discoverable
 through a rocm-cli managed TheRock runtime manifest, launches with
 `gpu_required`, checks `/health` and `/v1/completions`, and verifies loaded
 ROCm libraries come from the managed TheRock SDK wheel directories. It rejects
@@ -93,12 +93,12 @@ multiple GPUs is not supported.
 
 ### GPU memory
 
-vLLM claims a fixed fraction of each GPU's **total** VRAM — not of the free
-VRAM, and not scaled to the model — for weights plus KV cache. On a large card
+vLLM claims a fixed fraction of each GPU's **total** VRAM (not of the free
+VRAM, and not scaled to the model) for weights plus KV cache. On a large card
 a small model therefore still reserves a large slice.
 
 rocm-cli sets no `--gpu-memory-utilization` of its own, so vLLM's own default
-applies unless a value comes from somewhere else — either a model's catalog
+applies unless a value comes from somewhere else: either a model's catalog
 recipe or, taking precedence over it, the flag below:
 
 ```bash
@@ -107,7 +107,7 @@ rocm serve <model> --engine vllm --gpu-memory-utilization 0.3 --managed
 
 The value is a fraction in `(0, 1]` of total device VRAM. Lower it to leave room
 for a display, another workload, or a second server; raise it to give a large
-model more KV cache. Applies to vLLM only — it is ignored, with a note in the
+model more KV cache. Applies to vLLM only; it is ignored, with a note in the
 serve output, for other engines. An out-of-range or unparsable value fails the
 command rather than falling back silently.
 
@@ -136,10 +136,12 @@ model-specific, so rocm-cli never guesses one:
   default, and applies to vLLM only. Common values: `hermes`, `llama3_json`,
   `mistral`. Without it, plain chat still works but tool calls return HTTP 400.
 
-Native Windows vLLM serving is skipped in this adapter. Use WSL/Linux for vLLM
+Native Windows vLLM serving is skipped in this adapter. Use WSL or Linux for vLLM
 ROCm serving, or choose a different engine explicitly. No CPU fallback is used.
 
-References:
+## Related documentation
 
-- vLLM ROCm installation: https://docs.vllm.ai/en/stable/getting_started/installation/gpu/
-- AMD ROCm vLLM guidance: https://rocmdocs.amd.com/en/latest/how-to/rocm-for-ai/inference/deploy-your-model.html
+For upstream vLLM and ROCm serving guidance, see:
+
+- [vLLM ROCm installation](https://docs.vllm.ai/en/stable/getting_started/installation/gpu/)
+- [AMD ROCm vLLM guidance](https://rocmdocs.amd.com/en/latest/how-to/rocm-for-ai/inference/deploy-your-model.html)

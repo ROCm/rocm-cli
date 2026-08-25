@@ -4,7 +4,7 @@ Copyright © Advanced Micro Devices, Inc., or its affiliates.
 SPDX-License-Identifier: MIT
 -->
 
-# Developer Manual QA
+# Developer manual QA
 
 Use this checklist to verify rocm-cli behavior as a developer or release
 tester. On Windows, run these commands from PowerShell. On Linux or WSL, use
@@ -21,7 +21,7 @@ cargo build --workspace --release
 ```
 
 This writes `target/release/rocm.exe` on Windows and `target/release/rocm` on
-Linux/WSL. Run the binary directly on each platform. On WSL/Linux the examine
+Linux or WSL. Run the binary directly on each platform. On WSL or Linux the examine
 output must report `os: linux` and `wsl: true`.
 
 Do not set `ROCM_CLI_THEROCK_FAMILY` during normal setup tests. rocm-cli should
@@ -53,7 +53,7 @@ packages; set `ROCM_CLI_UV_CACHE_DIR` to a folder on the prefix filesystem to
 restore hardlinking. Making `--prefix` do this automatically is tracked
 separately.
 
-## 1. First-Time Setup
+## 1. First-time setup
 
 Start rocm-cli:
 
@@ -106,7 +106,7 @@ Expected result:
 - `rocm runtimes list` shows the runtime key for the installed TheRock venv.
 - The active runtime is ready, or the output gives one clear next command.
 
-## 2. TheRock SDK Command-Line Install
+## 2. TheRock SDK command-line install
 
 This tests the command-line install path without using the TUI:
 
@@ -143,7 +143,7 @@ python scripts\therock_sdk_install_test.py --dry-run --family gfx120X-all
 Use `--family` only when a test needs a fixed package family. Do not use it for
 normal user setup.
 
-## 3. Lemonade GPU Verification
+## 3. Lemonade GPU verification
 
 Lemonade is the default local assistant/server engine. Serve a small assistant
 model with the managed runtime:
@@ -162,13 +162,13 @@ Expected result:
 While the log stream is attached, verify detach and stop behave differently:
 
 - Press `Ctrl+D`. The stream ends and the shell prompt returns, printing a
-  "detached — server still running" note with the service id. Confirm the server
+  "detached: server still running" note with the service id. Confirm the server
   is still up: `rocm services` lists it and the endpoint still answers a chat
   request. Stop it afterward with `rocm services stop <service-id> --yes`.
 - Re-run the serve command and press `Ctrl+C` instead. The server shuts down and
   `rocm services` no longer lists it as running.
 
-## 4. Local Server Records
+## 4. Local server records
 
 After a managed or foreground serve attempt, inspect local server records:
 
@@ -191,7 +191,7 @@ rocm services stop <service-id> --yes
 rocm services restart <service-id> --yes
 ```
 
-## 5. ComfyUI Verification
+## 5. ComfyUI verification
 
 ComfyUI is managed as an app surface. It should start a local web server and
 show the URL to open:
@@ -219,7 +219,7 @@ python scripts\comfyui_therock_gpu_test.py
 This test may download a small checkpoint and submit a cat image workflow
 through the ComfyUI HTTP API.
 
-## 6. Optional Cloud Provider Key
+## 6. Optional cloud provider key
 
 Local ROCm use does not need a cloud provider key. If you want to test OpenAI or
 Anthropic provider setup, save the key through stdin so it does not land in
@@ -244,7 +244,7 @@ To remove the saved key:
 rocm config clear-provider-key openai
 ```
 
-## 7. Optional Provider-Assisted Planning
+## 7. Optional provider-assisted planning
 
 Most users should leave this off. To test ambiguity resolution with an already
 running local provider service:

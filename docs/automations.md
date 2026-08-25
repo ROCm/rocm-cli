@@ -10,7 +10,7 @@ rocm-cli automations are local watcher events routed through explicit watcher
 policy. A webhook payload is an event input, not an execution API: it cannot
 grant a new action, choose a tool, override watcher mode, or run shell.
 
-## Local Webhook Source
+## Local webhook source
 
 Start the persistent watcher loop with a loopback-only webhook source:
 
@@ -58,7 +58,7 @@ The listener only binds to `127.0.0.1`. There is no LAN or cloud webhook
 listener, and local webhook events still dispatch through the configured
 `observe`, `propose`, or `contained` policy for the target watcher.
 
-## Restricted Tool API
+## Restricted tool API
 
 Automation actions never receive arbitrary shell access. Reviewed requests and
 contained watcher work can only call this restricted tool surface:
@@ -163,7 +163,7 @@ Invoke-RestMethod `
   http://127.0.0.1:18080/automation-events
 ```
 
-## Artifact Prefetch Action
+## Artifact prefetch action
 
 The reviewed artifact-prefetch action keeps downloads disabled unless the caller
 explicitly approves a source policy:

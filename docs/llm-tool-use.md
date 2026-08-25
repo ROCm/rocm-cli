@@ -4,11 +4,11 @@ Copyright © Advanced Micro Devices, Inc., or its affiliates.
 SPDX-License-Identifier: MIT
 -->
 
-# LLM Tool Use
+# LLM tool use
 
 rocm-cli local assistants use structured tools, not shell commands.
 
-## Design Rules
+## Design rules
 
 - The model chooses a tool call from a schema. rocm-cli validates the arguments
   before anything runs.
@@ -28,7 +28,7 @@ rocm-cli local assistants use structured tools, not shell commands.
   serving, but it should not switch its own built-in chat engine away from
   Lemonade.
 - On native Windows, vLLM live serving/install checks are skipped. The assistant
-  should direct those requests to WSL/Linux and should not suggest CPU fallback.
+  should direct those requests to WSL or Linux and should not suggest CPU fallback.
 
 This follows the same shape described by current tool-use docs: the application
 defines tool schemas, the model requests a tool, the application executes the
@@ -36,7 +36,7 @@ tool, and the result is returned to the model for the next response. MCP tool
 annotations such as `readOnlyHint` and `destructiveHint` are useful UI hints,
 but rocm-cli still enforces approval in code.
 
-## Local Assistant Examples
+## Local assistant examples
 
 The assistant can inspect ComfyUI state:
 
@@ -104,8 +104,10 @@ tries to open the browser:
 {"name":"rocm_command","arguments":{"args":["comfyui","start"]}}
 ```
 
-## Sources
+## Related documentation
 
-- OpenAI Function Calling guide: https://platform.openai.com/docs/guides/function-calling
-- Anthropic Tool Use guide: https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/implement-tool-use
-- Model Context Protocol tool annotations: https://modelcontextprotocol.io/specification/draft/schema#toolannotations
+These upstream guides describe the tool-use patterns rocm-cli follows:
+
+- [OpenAI function calling guide](https://platform.openai.com/docs/guides/function-calling)
+- [Anthropic tool use guide](https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/implement-tool-use)
+- [Model Context Protocol tool annotations](https://modelcontextprotocol.io/specification/draft/schema#toolannotations)

@@ -4,7 +4,7 @@ Copyright © Advanced Micro Devices, Inc., or its affiliates.
 SPDX-License-Identifier: MIT
 -->
 
-# WSL Support Notes
+# WSL support notes
 
 This note tracks the WSL path for `rocm-cli` with TheRock-managed Python
 virtual environments and ROCDXG (`librocdxg`).
@@ -32,7 +32,7 @@ From Windows PowerShell, target a specific distro:
 python scripts\wsl_preflight.py --distro Ubuntu
 ```
 
-## Install ROCDXG In WSL
+## Install ROCDXG in WSL
 
 Install build/runtime prerequisites:
 
@@ -58,11 +58,11 @@ python scripts/wsl_preflight.py --require-ready
 ```
 
 To require checksum verification before installing the downloaded `.deb`, set
-`ROCDXG_SHA256` to the trusted 64-character SHA-256 digest for that exact
-ROCDXG package:
+`ROCDXG_SHA256=<64_hex_sha256_digest>`, where `<64_hex_sha256_digest>` is the
+trusted 64-character SHA-256 digest for that exact ROCDXG package:
 
 ```bash
-ROCDXG_SHA256=<64-hex-sha256> bash scripts/wsl_setup_rocdxg.sh
+ROCDXG_SHA256=<64_hex_sha256_digest> bash scripts/wsl_setup_rocdxg.sh
 ```
 
 The wrapper intentionally does not guess or embed a production checksum. If
@@ -100,7 +100,7 @@ export HSA_ENABLE_DXG_DETECTION=1
 ROCK/TheRock 7.13 and newer should not require that variable, but setting it is
 still useful for compatibility checks while the WSL path is being hardened.
 
-## TheRock Runtime Env In WSL
+## TheRock runtime env in WSL
 
 `rocm-cli` should continue to own the Python venv. Do not rely on an externally
 created venv such as `D:\ROCm\venv`.
@@ -124,7 +124,7 @@ For `rocm-cli`, the command itself should resolve the managed runtime manifest
 and apply that environment before launching HIP apps such as Lemonade's bundled
 `llama.cpp` backend. Users should not have to hand-export these values.
 
-## Examine And Install UX Recommendations
+## Examine and install UX recommendations
 
 `rocm examine` should detect WSL cheaply and report:
 
@@ -157,7 +157,7 @@ and apply that environment before launching HIP apps such as Lemonade's bundled
 5. Install a serving engine (Lemonade or vLLM).
 6. Run a tiny GPU smoke test with CPU fallback disabled.
 
-## Non-Destructive Tests
+## Non-destructive tests
 
 Safe tests that do not mutate global WSL state:
 

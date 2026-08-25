@@ -4,7 +4,7 @@ Copyright © Advanced Micro Devices, Inc., or its affiliates.
 SPDX-License-Identifier: MIT
 -->
 
-# Engine Plugins
+# Engine plugins
 
 rocm-cli discovers serving engine adapters as executable files.
 
@@ -15,10 +15,10 @@ Search order:
 3. Packaged sibling binaries installed beside `rocm`
 
 The first directory is the preferred location for external adapters. Use a
-binary name in the form `rocm-engine-<engine>` on Linux/WSL and
+binary name in the form `rocm-engine-<engine>` on Linux or WSL and
 `rocm-engine-<engine>.exe` on Windows.
 
-Packaged first-party adapters are `lemonade` and `vllm`. Linux/WSL-only ROCm GPU
+Packaged first-party adapters are `lemonade` and `vllm`. Linux or WSL-only ROCm GPU
 adapters (such as `vllm`) fail explicitly on native Windows instead of selecting
 a CPU fallback.
 
@@ -35,7 +35,7 @@ unsupported. rocm-cli does not use a CPU fallback for this path.
 ## Pinned runtime versions
 
 The versions of the third-party runtimes rocm-cli downloads are pinned in
-`runtime-deps.toml` at the repository root — one `[runtime.<name>]` table per
+`runtime-deps.toml` at the repository root: one `[runtime.<name>]` table per
 runtime. That file is the only place a runtime version is written down:
 archive names, download URLs, and the dashboard's offline fallback are all
 derived from it, so a bump is a one-line edit and the tree cannot end up

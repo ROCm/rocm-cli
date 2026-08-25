@@ -4,7 +4,7 @@ Copyright © Advanced Micro Devices, Inc., or its affiliates.
 SPDX-License-Identifier: MIT
 -->
 
-# CI hardware (GPU / WSL) testing
+# CI hardware (GPU and WSL) testing
 
 The hosted CI (`ubuntu-latest`, `windows-latest`) builds and unit-tests every
 shipping target natively, but GitHub-hosted runners have no AMD GPU. A
@@ -16,8 +16,8 @@ separate from the main `ci.yml`. The split is deliberate: a job queued on an
 **offline** self-hosted runner cannot be cancelled by GitHub, so if it shared
 `ci.yml`'s concurrency group a superseded run would hold that group and the
 newer run's merge-required (GitHub-hosted) checks would sit pending forever
-(observed on PR #138). Giving the self-hosted lanes their own workflow — and
-thus their own concurrency group — means an offline runner can only ever stall
+(observed on PR #138). Giving the self-hosted lanes their own workflow, and
+thus their own concurrency group, means an offline runner can only ever stall
 that workflow's own supersession, never `ci.yml`'s required checks. See
 `EAI-7548`.
 
@@ -26,7 +26,7 @@ that workflow's own supersession, never `ci.yml`'s required checks. See
 The E2E suite (BDD scenarios in Gherkin `.feature` files backed by Rust step
 functions) runs as one job per platform. Each job's harness resolves every
 scenario to pass / xfail / skip for that host from its `@id` and
-`@requires-*` tags, a capability probe, and `expectations.toml` — there is no
+`@requires-*` tags, a capability probe, and `expectations.toml`; there is no
 separate tier flag or tag filter to maintain.
 
 | Job | Workflow | Platform | Runner labels |
@@ -72,8 +72,8 @@ workspace; the lane installs them itself where it has passwordless sudo, and
 otherwise fails with the list of what is missing rather than hanging on a
 password prompt.
 
-GPU coverage additionally needs ROCm's WSL passthrough to be complete —
-`/dev/dxg` and dxcore alone are not enough, `librocdxg.so` and its ldconfig
+GPU coverage additionally needs ROCm's WSL passthrough to be complete:
+`/dev/dxg` and dxcore alone are not enough; `librocdxg.so` and its ldconfig
 entry must be present too. `rocm examine` reports the verdict as
 `driver_status: wsl_rocdxg_ready`; anything else (`wsl_rocdxg_missing`,
 `wsl_gpu_plumbing_missing`) means the runtime cannot reach the device even
@@ -88,13 +88,13 @@ covers the mock platform;
 `e2e-selfhosted.yml`'s `e2e-report` covers the GPU platforms;
 `nightly.yml`'s `e2e-report-nightly` covers the same platforms with the
 `@nightly` scenarios included. Each joins its platforms'
-reports — including partial or failed runs — by scenario id into one HTML report
+reports, including partial or failed runs, by scenario id into one HTML report
 and GitHub step summary.
 
 The lane artifacts are named canonically (`e2e-report`, `e2e-gpu-report`,
 `e2e-gpu-rad3-report`, `e2e-gpu-strix-ubuntu-report`, `e2e-gpu-strix-windows-report`,
 `e2e-gpu-strix-wsl-report`) in every workflow, because the report derives each
-platform's name and OS from the artifact name. An unrecognised name renders as a
+platform's name and OS from the artifact name. An unrecognized name renders as a
 guessed platform on Linux, which would report a Windows lane as Linux; `xtask`'s
 `every_uploaded_e2e_artifact_has_a_name_the_report_can_label` guards against it.
 
@@ -103,15 +103,15 @@ guessed platform on Linux, which would report a Windows lane as Linux; `xtask`'s
 The GPU jobs (in `e2e-selfhosted.yml`) run automatically on `push`,
 `pull_request`, and `merge_group` when the workflow's own `changes` job's
 `serve` path filter is `true`. `serve` is narrower than `heavy`: it matches only
-paths that can change serve *behaviour* or the GPU E2E harness (the engines, the
+paths that can change serve *behavior* or the GPU E2E harness (the engines, the
 serve code path in `apps/rocm`/`apps/rocmd`, `rocm-core`, the e2e-cucumber crate,
 plus broad-dependency safety nets), **not** a blanket `**/*.rs`. So a Rust change
-that cannot affect serving — e.g. a dashboard-only or unrelated-crate PR — skips
+that cannot affect serving (for example, a dashboard-only or unrelated-crate PR) skips
 the heavy GPU matrix, while compile coverage for every crate still runs on
 `ci.yml`'s always-on build/test lanes. Off `pull_request` (push/merge_group) the
 filter is forced `true`, so the full matrix always runs there. Unlike the
 pre-split layout the GPU jobs do **not** gate on the hosted `build-and-test` job
-— cross-workflow `needs` is not possible, so each GPU job builds the `rocm`
+(cross-workflow `needs` is not possible), so each GPU job builds the `rocm`
 binary itself as its first real step (a broken build fails that job fast and
 non-fatally). `ci.yml`'s required `build-and-test` and mock `e2e` remain the
 authoritative pre-merge build gate.
@@ -120,16 +120,16 @@ They can also be triggered manually via `e2e-selfhosted.yml`'s
 `workflow_dispatch`, independent of the `serve` gate, with these inputs:
 
 - `platform` (choice: `all`, `app-dev-gpu`, `strix-ubuntu`, `strix-windows`,
-  `strix-wsl`, `rad3`) — which self-hosted job(s) to run. `app-dev-gpu` maps to
+  `strix-wsl`, `rad3`): which self-hosted job(s) to run. `app-dev-gpu` maps to
   `e2e-gpu`, `strix-ubuntu` to `e2e-gpu-strix-ubuntu`, `strix-windows` to
   `e2e-gpu-strix-windows`, `strix-wsl` to `e2e-wsl`, and `rad3` to
   `e2e-gpu-rad3`. (The mock lane has its own `platform` input on `ci.yml`; it is
   not part of this workflow.)
-- `name_filter` (string) — a scenario-name regex forwarded to the cucumber
+- `name_filter` (string): a scenario-name regex forwarded to the cucumber
   harness (`cargo xtask e2e -- --name <regex>`) so a dispatch can run a
   single scenario instead of the full suite. Empty runs everything applicable
   to the selected platform(s).
-- `include_nightly` (boolean, default `false`) — opts a dispatch into
+- `include_nightly` (boolean, default `false`): opts a dispatch into
   `@nightly`-tagged scenarios (e.g. large-model serves, cold installs) that
   are otherwise skipped on a normal push/PR run to keep it fast.
 
@@ -178,14 +178,14 @@ the pre-warm block is duplicated across multiple jobs in two shells;
 
 ## Blocking vs. non-blocking
 
-The self-hosted jobs — `e2e-gpu`, `e2e-gpu-strix-ubuntu`,
-`e2e-gpu-strix-windows`, `e2e-wsl`, and `e2e-gpu-rad3` — all run with `continue-on-error: true`, so a
+The self-hosted jobs (`e2e-gpu`, `e2e-gpu-strix-ubuntu`,
+`e2e-gpu-strix-windows`, `e2e-wsl`, and `e2e-gpu-rad3`) all run with `continue-on-error: true`, so a
 hardware failure that RUNS never gates a PR merge. Their results still surface
 in the self-hosted consolidated report for visibility.
 
 ### Timeouts on the shared Strix box
 
-Three of those lanes — the two native Strix ones and `e2e-wsl` — run on the same
+Three of those lanes (the two native Strix ones and `e2e-wsl`) run on the same
 physical machine and can be in flight together, so a wait that is comfortable on
 an idle runner can expire while a sibling lane loads a model. Two budgets are
 raised there rather than letting contention read as a product failure:
@@ -196,12 +196,12 @@ genuine hang still fails, just later.
 **Required-check caveat.** These three job names (plus, historically, a
 consolidated-report name) are still in `main`'s required-status-check list.
 `continue-on-error` neutralizes a job that ran and failed, but a required check
-that *never reports* — because its self-hosted runner is offline — is treated as
+that *never reports* (because its self-hosted runner is offline) is treated as
 missing and still blocks the merge. The workflow split removes the catastrophic
 concurrency stall (an offline runner can no longer freeze `ci.yml`'s hosted
 required checks), but fully unblocking merges while a runner is offline
-additionally requires removing these self-hosted checks from the required list —
-a branch-protection change tracked separately from the workflow split.
+additionally requires removing these self-hosted checks from the required list
+(a branch-protection change tracked separately from the workflow split).
 
 ## Fork safety
 
@@ -218,8 +218,8 @@ which requires write access to trigger).
   not performance, so this is not a performance benchmark. Release-fidelity,
   `manylinux2014` (glibc 2.17) packaging validation is handled separately by
   the nightly/release pipeline.
-- Each workflow's `e2e-report` job collects whatever ran in that workflow —
-  including partial results from a cancelled or failed job — and renders one
+- Each workflow's `e2e-report` job collects whatever ran in that workflow,
+  including partial results from a cancelled or failed job, and renders one
   HTML report plus a step summary. `download-artifact@v8` flattens a
   single-match download straight into the artifacts directory (it uses the root
   path when exactly one artifact matches, regardless of the pattern), so after

@@ -8,7 +8,7 @@ SPDX-License-Identifier: MIT
 
 This page collects developer verification commands. The README stays focused on quick-start usage.
 
-## Local Verification
+## Local verification
 
 Run the Rust test suite:
 
@@ -37,7 +37,7 @@ python scripts/smoke_local.py --skip-build
 ## CI test selection
 
 On pull requests, CI does not test the whole workspace. The `test` job runs
-`cargo nextest run` over only the crates a change can reach — the changed crates
+`cargo nextest run` over only the crates a change can reach (the changed crates
 plus their transitive dependents, derived from the workspace dependency graph by:
 
 ```bash
@@ -49,7 +49,7 @@ or nothing when no crate is affected). It falls back to `--workspace` for any
 change that can't be confined to specific crates (the lockfile, the toolchain
 file, the workspace root manifest, or CI config). On `main` and in the merge
 queue the full workspace always runs. For local verification, keep using
-`cargo test --workspace --all-targets` above — `affected` is a CI optimization.
+`cargo test --workspace --all-targets` above; `affected` is a CI optimization.
 
 The smoke path is the cross-platform local no-fallback acceptance surface. It
 uses an isolated config/data/cache root, does not install TheRock wheels, does
@@ -84,7 +84,7 @@ cargo build --workspace --release
 cargo test --workspace
 ```
 
-On WSL/Linux, build and run the native Linux binary directly. The examine
+On WSL or Linux, build and run the native Linux binary directly. The examine
 output on WSL must include `os: linux` and `wsl: true`, and must not include
 `os: windows`.
 
@@ -148,7 +148,7 @@ cargo test -p rocm --bin rocm http_header_value
 rocm install sdk --channel release --format wheel --dry-run
 ```
 
-## TheRock SDK Install Test
+## TheRock SDK install test
 
 The live SDK acceptance test creates an isolated test root under `target/`, creates a local bootstrap Python venv, runs:
 
@@ -200,7 +200,7 @@ selection:
 python scripts/therock_sdk_install_test.py --root .rocm-work/tests/therock-sdk-install --fresh --family gfx120X-all
 ```
 
-## ComfyUI TheRock GPU Acceptance
+## ComfyUI TheRock GPU acceptance
 
 This opt-in test verifies that rocm-cli can install or reuse its managed
 ComfyUI app, start it through the active TheRock ROCm runtime, reach the local
@@ -276,7 +276,7 @@ python3 scripts/comfyui_therock_gpu_test.py \
   --generate-cat
 ```
 
-## Runtime Selection And Activation
+## Runtime selection and activation
 
 List registered managed or read-only runtimes and their exact side-by-side keys:
 
@@ -347,7 +347,7 @@ cargo test -p rocmd event_collector
 cargo test -p rocmd event_dispatcher
 ```
 
-## Provider-Assisted Planning
+## Provider-assisted planning
 
 The deterministic planner remains the default. Optional LLM/provider ambiguity
 resolution is only used after a user configures a planner provider:
@@ -405,10 +405,10 @@ Engine inventory smoke on native Windows:
 rocm engines list
 ```
 
-The packaged Linux/WSL-only vLLM adapter should render
+The packaged Linux or WSL-only vLLM adapter should render
 `runtime: unsupported_native_windows`, not `runtime: not found`.
 The vLLM live GPU acceptance script should return a clean skip on native
-Windows. It remains a strict GPU-required test on Linux/WSL.
+Windows. It remains a strict GPU-required test on Linux or WSL.
 
 Serve resolver focused tests:
 
@@ -442,7 +442,7 @@ API key: pass one with `--api-key` / the `ROCM_SERVE_API_KEY` environment
 variable, or let one be generated. The key is handed to the engine via a 0600
 key file (never argv), persisted as a 0600 per-service file (not the OS keychain,
 which is unavailable on headless serving hosts), and printed once as client
-configuration — it must never appear in `rocm services`, `rocm logs`, or the
+configuration; it must never appear in `rocm services`, `rocm logs`, or the
 audit log. Verifying that the running server actually *rejects* an
 unauthenticated request requires a live engine; that end-to-end assertion is a
 deferred follow-up and is **not yet** exercised by the GPU acceptance scripts
@@ -454,9 +454,9 @@ recorded *host*, not to the key file: a service recorded on a public host refuse
 to respawn once its key is gone, rather than coming back unauthenticated. That
 covers `rocm services restart` and `rocmd`'s recovery supervisor, and the refusal
 happens before anything is stopped, so it cannot take down a running service. A
-stop therefore drops the key only once it has confirmed the engine is gone —
-otherwise the CLI would lock itself out of a service that is still running and
-still enforcing the key — and the deferred cleanup lands on the liveness refresh
+stop therefore drops the key only once it has confirmed the engine is gone
+(otherwise the CLI would lock itself out of a service that is still running and
+still enforcing the key), and the deferred cleanup lands on the liveness refresh
 that later observes the process dead. There is no e2e coverage of `services
 stop`/`restart` or endpoint auth; these paths are unit-tested only.
 
@@ -551,7 +551,7 @@ rocmd sandbox-run list_servers --allow-native-fallback
 rocmd sandbox-run notify_user --message "ROCm check complete" --allow-native-fallback
 ```
 
-On Linux/WSL with `bubblewrap` installed, these commands should report
+On Linux or WSL with `bubblewrap` installed, these commands should report
 `isolation: bubblewrap`; on native Windows they should report
 `isolation: native_restricted`.
 
@@ -760,8 +760,8 @@ self-test before the install-lifecycle E2E scenarios.
 ### Packaging
 
 `cargo xtask package <dist-name> [output-dir] [--target <triple>]` builds the
-release distribution bundle in pure Rust — a `.tar.gz` on Unix and a `.zip` on
-Windows — with a `sha256` sidecar and, when a signing key is configured, a
+release distribution bundle in pure Rust (a `.tar.gz` on Unix and a `.zip` on
+Windows, with a `sha256` sidecar and, when a signing key is configured, a
 detached `.sig`. It replaces the former `scripts/package-{linux,windows}-release`
 scripts and produces the same external artifact contract (bundle layout,
 checksum syntax, signature presence, and installer compatibility). Signing
@@ -772,8 +772,8 @@ inputs come from the environment for parity with those scripts:
 
 ### Install lifecycle (opt-in `@lifecycle` E2E)
 
-The full install lifecycle — packaging, signature-verified install, tamper
-rejection, reinstall, PATH handling, and uninstall — is expressed as
+The full install lifecycle (packaging, signature-verified install, tamper
+rejection, reinstall, PATH handling, and uninstall) is expressed as
 `@lifecycle` scenarios in the [E2E cucumber suite](../tests/e2e-cucumber/README.md)
 (`features/install_lifecycle.feature`). They drive `cargo xtask package`, the
 real root installer (`install.sh` / `install.ps1`), and the installed binaries
@@ -804,14 +804,14 @@ directory smoke checks (`rocm examine` must read only the isolated
 config/data/cache, never the real user `.rocm` state); and full-purge uninstall.
 Each scenario generates its own local keys, package, and install root under a
 per-scenario temp directory, so they are independent and use generated local
-keys only — project-owned production signing keys remain an owner-controlled
+keys only; project-owned production signing keys remain an owner-controlled
 release step.
 
 If the host does not have `libcap-dev` or `libssl-dev`, run
 `bash scripts/setup-wsl-portable-build-deps.sh` first: it downloads the Ubuntu
 development packages into `.rocm-work/tools/wsl-build-deps`, extracts only the
 headers, libraries, and pkg-config metadata there, and points
-`PKG_CONFIG_PATH`/`PKG_CONFIG_SYSROOT_DIR` at that local copy — no sudo required.
+`PKG_CONFIG_PATH`/`PKG_CONFIG_SYSROOT_DIR` at that local copy (no sudo required).
 Run `bash scripts/setup-wsl-portable-build-deps.sh --self-test` to verify the
 portable sysroot normalization path without apt, network access, or a real WSL
 package download.
@@ -900,7 +900,7 @@ cargo test -p rocm-engine-vllm resolve_model_omits_gpu_memory_utilization_defaul
 python -m py_compile scripts/vllm_therock_gpu_test.py
 python scripts/vllm_therock_gpu_test.py --self-test
 
-# On Linux/WSL with vLLM installed in the active rocm-cli managed TheRock venv:
+# On Linux or WSL with vLLM installed in the active rocm-cli managed TheRock venv:
 python3 scripts/vllm_therock_gpu_test.py \
   --engine /home/user/.cache/rocm-cli-target/debug/rocm-engine-vllm \
   --model facebook/opt-125m
@@ -914,10 +914,10 @@ TheRock SDK wheel directories.
 For TheRock 7.13, patch vLLM's GPTQ ROCm compatibility guard to include HIP
 7.13 before building from source; otherwise `q_gemm.hip` can fail on missing
 `half`/`half2` `atomicAdd` overloads.
-On native Windows this script prints a JSON skip result; run it from WSL/Linux
+On native Windows this script prints a JSON skip result; run it from WSL or Linux
 for live ROCm GPU acceptance.
 
-## Windows Tool Notes
+## Windows tool notes
 
 The TheRock SDK wheel install path should not require users to install global
 Python or curl. rocm-cli uses Rust-native HTTP downloads and can bootstrap a
@@ -930,7 +930,7 @@ SDK wheel setup should avoid global source-build tools.
 
 Reference: [TheRock Windows install tools](https://github.com/ROCm/TheRock/blob/main/docs/development/windows_support.md#install-tools)
 
-## WSL Preflight
+## WSL preflight
 
 Read-only WSL/ROCDXG preflight:
 
@@ -952,8 +952,9 @@ python scripts/wsl_preflight.py --require-ready
 ```
 
 To require checksum verification for the downloaded ROCDXG `.deb`, provide the
-expected package digest from a trusted release source:
+expected package digest from a trusted release source, where
+`<64_hex_sha256_digest>` is the trusted 64-character SHA-256 digest:
 
 ```bash
-ROCDXG_SHA256=<64-hex-sha256> bash scripts/wsl_setup_rocdxg.sh
+ROCDXG_SHA256=<64_hex_sha256_digest> bash scripts/wsl_setup_rocdxg.sh
 ```

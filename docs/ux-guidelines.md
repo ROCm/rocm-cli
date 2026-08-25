@@ -4,11 +4,13 @@ Copyright © Advanced Micro Devices, Inc., or its affiliates.
 SPDX-License-Identifier: MIT
 -->
 
-# ROCm CLI UX Guidelines
+# ROCm CLI UX guidelines
 
 These guidelines are project constraints for user-facing ROCm CLI flows.
 
 ## Audience
+
+Write for users who may not be familiar with ROCm internals.
 
 - Assume most users are non-technical Windows users.
 - Treat Linux users as non-technical unless a workflow explicitly targets
@@ -16,7 +18,9 @@ These guidelines are project constraints for user-facing ROCm CLI flows.
 - Use simple English. Avoid runtime, wheel, environment, adapter, and command
   jargon in first-run UI unless there is no simpler accurate wording.
 
-## First-Time Setup
+## First-time setup
+
+First-run flows should feel guided and deterministic.
 
 - First-time setup must be a dedicated setup prompt/screen before the main TUI.
 - Do not require users to know or type slash commands to complete setup.
@@ -35,12 +39,16 @@ These guidelines are project constraints for user-facing ROCm CLI flows.
 
 ## Persistence
 
+Saved setup choices must survive restarts.
+
 - First-time setup choices must persist across runs.
 - Store user-facing setup settings in JSON under the user's home `.rocm`
   directory, for example `~/.rocm/config.json`.
 - Keep the persisted format readable and recoverable.
 
 ## Permissions
+
+Approval and full-access modes must be explicit and reversible.
 
 - Default mode asks before changing local state.
 - Full access mode is explicit opt-in, explained in plain English, and
@@ -50,8 +58,10 @@ These guidelines are project constraints for user-facing ROCm CLI flows.
 
 ## Main TUI
 
+These rules apply to the primary full-screen interface after setup.
+
 - The normal TUI should be useful after setup, not a setup command cheat sheet.
-- The default feel should be a friendly control room for laymen, not a dry log
+- The default feel should be a friendly control room for non-technical users, not a dry log
   viewer. Use plain labels, color, motion/progress, and focused review cards to
   make the next action obvious.
 - Verbosity is a hard no. First-view command output should be minimal and
@@ -135,7 +145,7 @@ These guidelines are project constraints for user-facing ROCm CLI flows.
   or stopped history belongs behind explicit logs/details or a non-TUI
   `--all` style command.
 
-## Command Navigability Baseline
+## Command navigability baseline
 
 All advertised slash commands should either perform a clear immediate action
 (`/clear`, `/quit`, `/exit`) or open exactly one focused TUI surface. They must

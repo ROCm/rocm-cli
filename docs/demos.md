@@ -19,6 +19,8 @@ to source branches; the README references them by absolute raw URL.
 
 ## Layout
 
+The demo pipeline uses these paths and jobs:
+
 | Path | Purpose |
 | --- | --- |
 | `docs/tapes/cli.tape` | CLI first-use journey. |

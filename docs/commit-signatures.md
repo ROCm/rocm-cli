@@ -4,20 +4,20 @@ Copyright © Advanced Micro Devices, Inc., or its affiliates.
 SPDX-License-Identifier: MIT
 -->
 
-# Commit Signatures and Sign-off
+# Commit signatures and sign-off
 
 Every commit that lands in this repository must be:
 
-1. **Cryptographically signed** — so authorship is verifiable and history
+1. **Cryptographically signed**, so authorship is verifiable and history
    cannot be silently forged or impersonated.
-2. **Signed-off** — a DCO `Signed-off-by:` trailer, certifying you have the
+2. **Signed-off**: a DCO `Signed-off-by:` trailer, certifying you have the
    right to submit the change under the project license.
 
 Both requirements are **enforced**, not advisory: local git hooks reject
 non-conforming commits before they leave your machine, and a blocking CI gate
 rejects them on every pull request.
 
-## Setting Up Signing
+## Setting up signing
 
 You can sign with SSH (simplest if you already have an SSH key) or GPG.
 
@@ -50,7 +50,7 @@ To add sign-off to a range of existing commits:
 git rebase --signoff <base>
 ```
 
-## Registering Your Key on GitHub (required for CI)
+## Registering your key on GitHub (required for CI)
 
 CI uses **strict** verification: it asks GitHub whether each commit's signature
 is `verified`. For GitHub to report a commit as **Verified** you must:
@@ -63,7 +63,7 @@ is `verified`. For GitHub to report a commit as **Verified** you must:
 If either is missing, the signature exists but GitHub will not mark it
 "Verified", and the CI gate will fail.
 
-## How Enforcement Works
+## How enforcement works
 
 ### Local hooks (prek)
 
@@ -74,10 +74,10 @@ prek install                # pre-commit
 prek install -t pre-push    # pre-push
 ```
 
-- **pre-commit**: `cargo xtask verify-commits --check-config` — a fast check
+- **pre-commit**: `cargo xtask verify-commits --check-config`, a fast check
   that commit signing is enabled (`commit.gpgsign`, in any of git's truthy
   spellings) and `user.signingkey` is set, with remediation if not.
-- **pre-push**: `cargo xtask verify-commits` — verifies every outgoing commit
+- **pre-push**: `cargo xtask verify-commits`, which verifies every outgoing commit
   in `origin/main..HEAD` is signed (signature present and not bad) and
   signed-off. The base is fixed at `origin/main`, so keep it fetched
   (`git fetch origin main`); on a branch targeting a different base, run the
@@ -96,13 +96,14 @@ cargo xtask verify-commits --base origin/<base-branch> --require-verified
 CLI). The job checks out with `fetch-depth: 0` so the base ref and all PR
 commits are available. On a `merge_group` event it verifies the queued commits
 against the queue's base (`merge_group.base_sha..head_sha`) instead of a PR
-base — so the check still runs in the queue and can safely be made *required*
+base, so the check still runs in the queue and can safely be made *required*
 without stalling it. Mark it as a required check in branch protection / your
 repository ruleset so it blocks merges.
 
 ### The xtask check
 
-`cargo xtask verify-commits` is the single source of truth for the logic:
+`cargo xtask verify-commits` is the single source of truth for the logic. Its
+flags are:
 
 | Flag                | Meaning                                                           |
 | ------------------- | ---------------------------------------------------------------- |
@@ -112,7 +113,7 @@ repository ruleset so it blocks merges.
 
 An empty commit range is treated as success.
 
-## Native GitHub Ruleset (Complementary)
+## Native GitHub ruleset (complementary)
 
 GitHub can natively **require signed commits** via a repository ruleset. Enable
 it as defense-in-depth alongside the in-repo check:
