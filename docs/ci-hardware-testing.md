@@ -172,9 +172,9 @@ serve pointing at a path that no longer exists.
 This replaced an existence-only guard that never reinstalled, which had frozen both
 MI300X runners on a 16-day-old runtime and left drift from a fresh install untested
 (`EAI-8057`). The decision logic lives in `xtask` rather than the workflows because
-the pre-warm block is duplicated across eight jobs in two shells; `xtask/src/e2e_prewarm.rs`
-carries unit tests for each freshness verdict, and the `runtime-update-reports-freshness`
-scenario pins the `rocm update` output shape those tests assume.
+the pre-warm block is duplicated across multiple jobs in two shells;
+`xtask/src/e2e_prewarm.rs` carries unit tests for each freshness verdict, and the
+`runtime-update-reports-freshness` scenario pins the `rocm update` output shape those tests assume.
 
 ## Blocking vs. non-blocking
 

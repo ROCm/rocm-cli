@@ -35,9 +35,9 @@
 //!   cache with a per-channel/format/family retention policy.
 //!
 //! Living in xtask rather than the workflows is deliberate: the pre-warm block is
-//! duplicated across eight jobs in two shells (bash on the Linux lanes, PowerShell
-//! on Strix Windows), so the decision logic would otherwise exist eight times in two
-//! languages and be untestable. Same reasoning as `e2e.rs` — the recipe belongs in
+//! duplicated across multiple jobs in two shells (bash on the Linux lanes,
+//! PowerShell on Strix Windows), so the decision logic would otherwise drift across
+//! copies and be untestable. Same reasoning as `e2e.rs` — the recipe belongs in
 //! one cross-platform place instead of a shell wrapper.
 
 use std::path::{Path, PathBuf};
@@ -81,18 +81,37 @@ pub fn decide(update_report: &str, channel: &str) -> Decision {
     let runtimes: Vec<RuntimeLine> = update_report
         .lines()
         .filter_map(RuntimeLine::parse)
-        .filter(|line| line.channel.as_deref() == Some(channel))
         .collect();
 
-    // Nothing installed for THIS channel. The tree may still hold another
-    // channel's runtime — that is the normal state once a per-channel pre-warm
-    // directory is shared, and the right response is still a cold install here.
-    if runtimes.is_empty() {
+    // A degraded `status=error` line omits `channel=` because resolution failed
+    // before the renderer had a plan. It proves a runtime exists but cannot be
+    // attributed safely, so the conservative choice is reuse, not a fresh
+    // multi-GiB install. A later healthy probe will identify the channel.
+    // In a mixed-channel tree the error may belong to another channel, but the
+    // report has discarded that identity. Reuse remains the safe floor until a
+    // healthy probe can distinguish "missing channel" from "unknown freshness".
+    if !runtimes
+        .iter()
+        .any(|line| line.channel.as_deref() == Some(channel))
+    {
+        if runtimes
+            .iter()
+            .any(|line| line.channel.is_none() && line.status.as_deref() == Some("error"))
+        {
+            return Decision::Reuse {
+                reason: "could not establish runtime freshness; leaving the shared tree untouched"
+                    .to_owned(),
+            };
+        }
+
+        // Nothing installed for THIS channel. The tree may still hold another
+        // channel's runtime, so install this one.
         return Decision::Install;
     }
 
     if let Some(stale) = runtimes
         .iter()
+        .filter(|line| line.channel.as_deref() == Some(channel))
         .find(|line| line.status.as_deref() == Some("update_available"))
     {
         return Decision::Update {
@@ -105,11 +124,13 @@ pub fn decide(update_report: &str, channel: &str) -> Decision {
     // "updating" backwards.
     let reason = if runtimes
         .iter()
+        .filter(|line| line.channel.as_deref() == Some(channel))
         .any(|line| line.status.as_deref() == Some("up_to_date"))
     {
         "runtime is up to date with the channel index"
     } else if runtimes
         .iter()
+        .filter(|line| line.channel.as_deref() == Some(channel))
         .any(|line| line.status.as_deref() == Some("ahead_of_index"))
     {
         "installed runtime is ahead of the channel index"
@@ -387,16 +408,25 @@ source: index\n"
 
     #[test]
     fn index_error_reuses_rather_than_reinstalling() {
-        // The offline/unreachable-index case. Reinstalling here would download
-        // multiple GiB on every run of an isolated runner, and failing would turn
-        // the lane red for a network blip.
+        // The renderer omits `channel=` when resolving the index fails. That is
+        // unknown freshness, not proof that this channel has no runtime, so the
+        // conservative pre-warm decision must reuse rather than download again.
         let text = "update\n  runtime release-wheel-gfx94x-dcgpu-7-13-0 format=wheel \
 status=error message=failed to reach https://repo.amd.com/rocm/whl after 3 tries\n";
-        // The degraded line carries no `channel=`, so it is not attributable to
-        // this channel and the report reads as "nothing installed for release".
-        // That is the one case where the fallback in `run` (registry on disk?)
-        // decides, not this function.
-        assert_eq!(decide(text, "release"), Decision::Install);
+        let Decision::Reuse { reason } = decide(text, "release") else {
+            panic!("an unattributable index error must reuse the existing tree");
+        };
+        assert!(reason.contains("could not establish"), "{reason}");
+    }
+
+    #[test]
+    fn unattributed_error_wins_over_a_known_other_channel() {
+        let text = format!(
+            "{}  runtime release-wheel-gfx94x-dcgpu-7-13-0 format=wheel \
+status=error message=failed to reach the index\n",
+            report("up_to_date", "nightly")
+        );
+        assert!(matches!(decide(&text, "release"), Decision::Reuse { .. }));
     }
 
     #[test]
