@@ -494,12 +494,9 @@ fn ensure_default_engine(rocm: &Path, prewarm_dir: &Path) -> Result<()> {
 }
 
 fn default_engine_from_inventory(inventory: &str) -> Option<&str> {
-    inventory.lines().find_map(|line| {
-        line.trim_start()
-            .strip_prefix("* ")?
-            .split_whitespace()
-            .next()
-    })
+    inventory
+        .lines()
+        .find_map(|line| line.strip_prefix("* ")?.split_whitespace().next())
 }
 
 /// Whether `decision` put a new runtime in the tree, and so whether the registry

@@ -169,12 +169,7 @@ fn activate_shared_runtime_if_unset(world: &mut E2eWorld, runtimes: &str) {
     if !runtimes.contains("active_runtime_key: <unset>") {
         return;
     }
-    let runtime_key = runtimes
-        .lines()
-        .map(str::trim)
-        .filter_map(|line| line.split_once(" runtime_id=").map(|(key, _)| key))
-        .map(|key| key.trim_start_matches(['*', '-', ' ']))
-        .find(|key| key.contains("-wheel-multi-arch-"))
+    let runtime_key = e2e_cucumber::capability::canonical_wheel_runtime_key(runtimes)
         .unwrap_or_else(|| {
             panic!("shared runtime tree has no canonical wheel runtime:\n{runtimes}")
         });
