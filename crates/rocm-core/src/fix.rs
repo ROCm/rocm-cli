@@ -367,7 +367,7 @@ const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "fix-16-vllm-oom",
         title: "vLLM ran the GPU out of memory at startup",
-        rationale: "vLLM reserves a fixed fraction (~90%) of each GPU's TOTAL VRAM for its KV cache by default, regardless of the model size or how much is currently free. Two different faults surface the same OOM, and they need opposite responses. If the GPU is shared or already busy, that reservation collides with memory in use and lowering it (or moving to a less-busy GPU) is the fix. If the model genuinely does not fit in this GPU's VRAM, lowering the reservation only trades an earlier OOM for a later one -- use a smaller or quantized model, or shard it across more GPUs instead.",
+        rationale: "vLLM reserves a fixed fraction (~90%) of each GPU's TOTAL VRAM for its KV cache by default, regardless of the model size or how much is currently free. Two different faults surface the same OOM, and they need opposite responses. If the GPU is shared or already busy, that reservation collides with memory in use and lowering it (or moving to a less-busy GPU) is the fix. If the model genuinely does not fit in this GPU's VRAM, lowering the reservation only trades an earlier OOM for a later one -- use a smaller or quantized model instead (rocm-cli serves one model on a single GPU; it does not shard a model across GPUs).",
         auto_applicable: false,
         commands: &[
             "# Case 1 -- shared/busy GPU (tenancy collision): lower the reservation,",
@@ -375,8 +375,7 @@ const RECIPES: &[FixRecipe] = &[
             "rocm serve <model> --gpu-memory-utilization 0.5",
             "rocm serve <model> --gpu <index>",
             "# Case 2 -- the model genuinely does not fit: the reservation is not the",
-            "# problem; pick a smaller/quantized model or shard across GPUs:",
-            "rocm serve <model> --tensor-parallel-size <n>",
+            "# problem; pick a smaller or quantized model (single-GPU serving only).",
         ],
         needs_sudo: false,
         needs_reboot: false,

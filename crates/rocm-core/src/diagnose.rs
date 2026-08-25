@@ -301,7 +301,7 @@ const KEYWORDS_PAGE_FAULT: KeywordTable = &[
 // to match before scoring this table at all.
 const KEYWORDS_VLLM_OOM: KeywordTable = &[
     (
-        "torch.outofmemoryerror",
+        r"torch\.outofmemoryerror",
         45,
         "error mentions torch.OutOfMemoryError",
     ),
@@ -327,7 +327,7 @@ const KEYWORDS_VLLM_OOM: KeywordTable = &[
     ),
     ("out of memory", 25, "error mentions 'out of memory'"),
     (
-        "gpu_memory_utilization",
+        r"gpu[-_]memory[-_]utilization",
         20,
         "log mentions gpu_memory_utilization (vLLM VRAM reservation)",
     ),
@@ -1313,10 +1313,13 @@ fn check_15_msvc_redist(e: &Examination, symptom: &str) -> Diagnosis {
 }
 
 /// A required anchor before [`KEYWORDS_VLLM_OOM`] is even scored: the word
-/// "vllm" itself, or one of its distinctive flags/logs. Without one of these,
-/// a generic HIP/CUDA/PyTorch OOM string is not evidence of *this* failure
-/// mode -- see the comment on [`KEYWORDS_VLLM_OOM`].
-const VLLM_ANCHOR_PATTERN: &str = r"vllm|gpu[-_]memory[-_]utilization|tensor[-_]parallel";
+/// "vllm" itself, or its distinctive VRAM-reservation flag. Without one of
+/// these, a generic HIP/CUDA/PyTorch OOM string is not evidence of *this*
+/// failure mode -- see the comment on [`KEYWORDS_VLLM_OOM`]. `tensor[-_]parallel`
+/// is deliberately NOT an anchor: it is a Megatron/DeepSpeed term (rocm-cli does
+/// not serve one model across GPUs), so anchoring on it would misattribute those
+/// frameworks' OOMs to vLLM.
+const VLLM_ANCHOR_PATTERN: &str = r"vllm|gpu[-_]memory[-_]utilization";
 
 /// vLLM ran the GPU out of memory. Keyword-only: an [`Examination`] carries no
 /// per-GPU VRAM or tenancy fields, so nothing structural can corroborate this —
@@ -1339,8 +1342,8 @@ fn check_16_vllm_oom(_e: &Examination, symptom: &str) -> Diagnosis {
     // that case.
     let summary = format!(
         "{} If instead the model genuinely does not fit in this GPU's VRAM, lowering the \
-         reservation will not help — use a smaller or quantized model, or shard it across \
-         more GPUs with `--tensor-parallel-size <n>`.",
+         reservation will not help — use a smaller or quantized model (rocm-cli serves one \
+         model on a single GPU; it does not shard a model across GPUs).",
         crate::VLLM_GPU_MEMORY_UTILIZATION_HINT
     );
     let fix = Fix {
@@ -1351,8 +1354,7 @@ fn check_16_vllm_oom(_e: &Examination, symptom: &str) -> Diagnosis {
             "# ...or steer the server onto a less-busy device:".to_owned(),
             "rocm serve <model> --gpu <index>".to_owned(),
             "# If the model genuinely does not fit, the reservation is not the problem:".to_owned(),
-            "#   pick a smaller or quantized model, or shard across GPUs:".to_owned(),
-            "rocm serve <model> --tensor-parallel-size <n>".to_owned(),
+            "#   pick a smaller or quantized model (single-GPU serving only).".to_owned(),
         ],
         fix_id: "fix-16-vllm-oom".to_owned(),
         auto_applicable: false,
@@ -2093,16 +2095,19 @@ mod tests {
     #[test]
     fn a_bare_out_of_memory_stays_below_the_match_threshold() {
         // Without the vLLM/HIP shape, "out of memory" alone must not claim this
-        // failure mode -- it scores, but below MIN_SCORE_FOR_MATCH.
+        // failure mode -- it scores (the `vllm` anchor is present and "out of
+        // memory" is a keyword), but stays below MIN_SCORE_FOR_MATCH.
         let report = diagnose(&linux_base(), "vllm: the process was killed: out of memory");
-        let oom = report.matched.iter().find(|d| d.id == "fix-16-vllm-oom");
-        if let Some(d) = oom {
-            assert!(
-                d.score < MIN_SCORE_FOR_MATCH,
-                "a bare OOM must stay sub-threshold, got {}",
-                d.score
-            );
-        }
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("the weak `out of memory` keyword signal must remain visible in `matched`");
+        assert!(
+            oom.score < MIN_SCORE_FOR_MATCH,
+            "a bare OOM must stay sub-threshold, got {}",
+            oom.score
+        );
     }
 
     #[test]

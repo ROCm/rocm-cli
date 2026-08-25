@@ -331,11 +331,11 @@ async fn assert_json_identifies_match(world: &mut E2eWorld) {
     );
 }
 
-#[then("the diagnosis identifies the vLLM startup OOM")]
-async fn assert_diagnosis_identifies_vllm_oom(world: &mut E2eWorld) {
-    assert_eq!(world.cli_rc, Some(0), "diagnose should exit 0");
-    let (report, output) = parsed_diagnosis(world);
-    let oom = report
+/// Locate the `fix-16-vllm-oom` diagnosis in a parsed report's `matched` array,
+/// panicking with the raw output if it is absent. Shared by the two `Then`
+/// steps that assert on the vLLM OOM entry.
+fn find_vllm_oom<'a>(report: &'a serde_json::Value, output: &str) -> &'a serde_json::Value {
+    report
         .get("matched")
         .and_then(serde_json::Value::as_array)
         .and_then(|matches| {
@@ -343,11 +343,22 @@ async fn assert_diagnosis_identifies_vllm_oom(world: &mut E2eWorld) {
                 diagnosis.get("id").and_then(serde_json::Value::as_str) == Some("fix-16-vllm-oom")
             })
         })
-        .unwrap_or_else(|| panic!("expected fix-16-vllm-oom in diagnosis:\n{output}"));
+        .unwrap_or_else(|| panic!("expected fix-16-vllm-oom in diagnosis:\n{output}"))
+}
+
+#[then("the diagnosis identifies the vLLM startup OOM")]
+async fn assert_diagnosis_identifies_vllm_oom(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "diagnose should exit 0");
+    let (report, output) = parsed_diagnosis(world);
+    let oom = find_vllm_oom(&report, &output);
+    let high_confidence = report
+        .get("high_confidence_threshold")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_else(|| panic!("report must publish its high_confidence_threshold:\n{output}"));
     assert!(
         oom.get("score")
             .and_then(serde_json::Value::as_i64)
-            .is_some_and(|score| score >= 75),
+            .is_some_and(|score| score >= high_confidence),
         "the distinctive OOM signature should be high-confidence:\n{output}"
     );
     assert_eq!(
@@ -361,23 +372,20 @@ async fn assert_diagnosis_identifies_vllm_oom(world: &mut E2eWorld) {
 #[then("the OOM remedy distinguishes a busy GPU from a model that does not fit")]
 async fn assert_oom_remedy_is_conditional(world: &mut E2eWorld) {
     let (report, output) = parsed_diagnosis(world);
-    let fix = report
-        .get("matched")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|matches| {
-            matches.iter().find(|diagnosis| {
-                diagnosis.get("id").and_then(serde_json::Value::as_str) == Some("fix-16-vllm-oom")
-            })
-        })
-        .and_then(|diagnosis| diagnosis.get("fix"))
+    let fix = find_vllm_oom(&report, &output)
+        .get("fix")
         .unwrap_or_else(|| panic!("expected fix-16-vllm-oom remediation:\n{output}"));
     let rendered = fix.to_string();
     assert!(
         rendered.contains("shared/busy")
             && rendered.contains("does not fit")
             && rendered.contains("--gpu-memory-utilization")
-            && rendered.contains("--tensor-parallel-size"),
+            && rendered.contains("smaller or quantized"),
         "the remedy must retain both conditional branches:\n{output}"
+    );
+    assert!(
+        !rendered.contains("--tensor-parallel-size"),
+        "the remedy must not prescribe the non-existent multi-GPU sharding flag:\n{output}"
     );
     assert!(
         !fix.get("verify")
