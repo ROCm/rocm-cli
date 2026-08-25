@@ -862,10 +862,12 @@ fn run_hip_visible_devices(opts: &FixOptions) -> i32 {
 
 fn run_hip_visible_devices_linux(opts: &FixOptions) -> i32 {
     let Some(idx) = opts.device_index else {
+        // Print-only path: without an index the fix only prints the query that
+        // helps the user identify N, so it succeeds like any other preview.
         println!(
             "Run `rocminfo | grep -E 'Agent |Marketing|gfx'` and identify the row of your DISCRETE GPU (the iGPU is typically Agent 1). Then re-run with --device-index N."
         );
-        return 3;
+        return 0;
     };
     let Some(rc_file) = shell_rc_file() else {
         println!("Could not determine your home directory.");
@@ -907,6 +909,8 @@ fn run_hip_visible_devices_linux(opts: &FixOptions) -> i32 {
 
 fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
     let Some(idx) = opts.device_index else {
+        // Print-only path: without an index the fix only prints the query that
+        // helps the user identify N, so it succeeds like any other preview.
         println!("Run the following to identify the discrete GPU's index:");
         println!(
             "  & \"$env:HIP_PATH\\bin\\hipInfo.exe\" | Select-String \"device#|Name|gcnArchName\""
@@ -914,7 +918,7 @@ fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
         println!(
             "Then re-run with --device-index N (the iGPU is typically device# 0; the dGPU is usually device# 1)."
         );
-        return 3;
+        return 0;
     };
     let existing = ps_env_scope("HIP_VISIBLE_DEVICES", "User");
     if !existing.is_empty() {
@@ -1124,6 +1128,25 @@ mod tests {
         };
         let code = apply("fix-2-unset-override", &opts);
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn fix_9_without_device_index_is_print_only_and_returns_zero() {
+        // Regression: the missing `--device-index` branch only prints the
+        // query that identifies the dGPU, so it is a print-only preview and
+        // must return 0 -- not the environment/OS code 3. A dry-run without the
+        // argument must likewise succeed, since the runner never mutates.
+        for dry_run in [false, true] {
+            let opts = FixOptions {
+                dry_run,
+                ..FixOptions::default()
+            };
+            let code = apply("fix-9-igpu-dgpu", &opts);
+            assert_eq!(
+                code, 0,
+                "fix-9 without --device-index (dry_run={dry_run}) must be a print-only success"
+            );
+        }
     }
 
     #[test]
