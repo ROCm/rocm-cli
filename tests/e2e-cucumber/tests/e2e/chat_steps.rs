@@ -91,6 +91,7 @@ async fn user_pipes_chat_prompt(world: &mut E2eWorld) {
         world,
         &["chat", "--provider", "local", "--model", &model],
         "Hello from standard input\n",
+        &[],
     );
     assert_eq!(
         rc, 0,
