@@ -28,3 +28,14 @@ Feature: Native HTTP networking
     And the model is registered with the CLI
     When the user sends a one-shot chat prompt through the CLI
     Then the CLI prints the assistant's reply
+
+  # The EAI-7409 public-bind contract. Binding the server to a non-loopback
+  # interface exposes it to the network, so the CLI refuses unless the user
+  # explicitly opts in with `--allow-public-bind`. This check is pre-flight — the
+  # first thing `serve` does, before any engine or model work — so it needs no GPU
+  # and runs on the mock lane every PR.
+  @id:networking-public-bind-requires-opt-in
+  Scenario: 3 - Binding to a public interface without opt-in is refused up front
+    When the user serves a model bound to a public interface without allowing public binding
+    Then serving is refused before any engine starts
+    And the user is told to allow public binding first

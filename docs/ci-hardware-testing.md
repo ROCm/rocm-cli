@@ -36,6 +36,7 @@ separate tier flag or tag filter to maintain.
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu | self-hosted `[self-hosted, linux, strix-halo, native]` |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on native Windows 11 | self-hosted `[self-hosted, windows, strix-halo, native]` |
 | `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu under WSL2 | self-hosted `[self-hosted, linux, strix-halo, wsl]` |
+| `e2e-gpu-rad3` | `e2e-selfhosted.yml` | Radeon AI PRO R9700 (gfx1201) on Linux | self-hosted `[self-hosted, linux, r9700]` |
 
 The Strix Halo lanes pin the extra `native` label because two Linux runners
 share the `strix-halo` label (a native host and a WSL host) and the jobs'
@@ -46,8 +47,8 @@ WSL lane pins `wsl` for the same reason, from the other side.
 resolve to skip here, and known bugs resolve to xfail from
 `expectations.toml`. It is a required check and must stay green.
 
-The four self-hosted jobs (`e2e-gpu`, `e2e-gpu-strix-ubuntu`,
-`e2e-gpu-strix-windows`, and `e2e-wsl`) run on AMD GPU systems, so they exercise
+The self-hosted jobs (`e2e-gpu`, `e2e-gpu-strix-ubuntu`,
+`e2e-gpu-strix-windows`, `e2e-wsl`, and `e2e-gpu-rad3`) run on AMD GPU systems, so they exercise
 host/GPU detection, engine `detect`/`capabilities`, and live serving scenarios
 that the mock job cannot. GPU availability is advisory in the WSL lane, as
 described below.
@@ -84,14 +85,14 @@ not applicable, instead of failing them on a premise the host cannot meet.
 
 Each workflow has its own consolidated report job. `ci.yml`'s `e2e-report`
 covers the mock platform;
-`e2e-selfhosted.yml`'s `e2e-report` covers the four GPU platforms;
-`nightly.yml`'s `e2e-report-nightly` covers the same four platforms with the
+`e2e-selfhosted.yml`'s `e2e-report` covers the GPU platforms;
+`nightly.yml`'s `e2e-report-nightly` covers the same platforms with the
 `@nightly` scenarios included. Each joins its platforms'
 reports — including partial or failed runs — by scenario id into one HTML report
 and GitHub step summary.
 
 The lane artifacts are named canonically (`e2e-report`, `e2e-gpu-report`,
-`e2e-gpu-strix-ubuntu-report`, `e2e-gpu-strix-windows-report`,
+`e2e-gpu-rad3-report`, `e2e-gpu-strix-ubuntu-report`, `e2e-gpu-strix-windows-report`,
 `e2e-gpu-strix-wsl-report`) in every workflow, because the report derives each
 platform's name and OS from the artifact name. An unrecognised name renders as a
 guessed platform on Linux, which would report a Windows lane as Linux; `xtask`'s
@@ -119,10 +120,11 @@ They can also be triggered manually via `e2e-selfhosted.yml`'s
 `workflow_dispatch`, independent of the `serve` gate, with these inputs:
 
 - `platform` (choice: `all`, `app-dev-gpu`, `strix-ubuntu`, `strix-windows`,
-  `strix-wsl`) — which self-hosted job(s) to run. `app-dev-gpu` maps to
+  `strix-wsl`, `rad3`) — which self-hosted job(s) to run. `app-dev-gpu` maps to
   `e2e-gpu`, `strix-ubuntu` to `e2e-gpu-strix-ubuntu`, `strix-windows` to
-  `e2e-gpu-strix-windows`, and `strix-wsl` to `e2e-wsl`. (The mock lane has its
-  own `platform` input on `ci.yml`; it is not part of this workflow.)
+  `e2e-gpu-strix-windows`, `strix-wsl` to `e2e-wsl`, and `rad3` to
+  `e2e-gpu-rad3`. (The mock lane has its own `platform` input on `ci.yml`; it is
+  not part of this workflow.)
 - `name_filter` (string) — a scenario-name regex forwarded to the cucumber
   harness (`cargo xtask e2e -- --name <regex>`) so a dispatch can run a
   single scenario instead of the full suite. Empty runs everything applicable
@@ -137,10 +139,47 @@ Dispatch the GPU lanes with, e.g.:
 gh workflow run e2e-selfhosted.yml --ref <ref> -f platform=app-dev-gpu
 ```
 
+## The shared pre-warmed runtime
+
+Nearly every GPU serve scenario points its `data/runtimes` at one shared,
+pre-warmed managed runtime (`E2E_SHARED_RUNTIMES_DIR`), so a multi-GiB
+`rocm install sdk` happens once per runner instead of once per scenario. The tree
+lives on the runner's persistent workspace and survives `git clean`.
+
+It is a **cache with invalidation**, not a one-shot install. Each self-hosted lane calls
+
+```bash
+cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
+```
+
+before the suite, which asks `rocm update` whether the channel index has published
+a newer version and then:
+
+- installs the SDK when nothing is present for that channel;
+- installs the newer runtime **side-by-side** and activates it
+  (`rocm update --apply --runtime <key> --activate`) when the index is ahead;
+- reuses the existing tree when it is `up_to_date`, when it is `ahead_of_index`
+  (a pinned build newer than the index must not be rolled back), or when freshness
+  cannot be established at all — an unreachable index reuses and warns rather than
+  re-downloading gigabytes or failing the lane;
+- prunes with `rocm storage remove-old-installs` after any install or update, so
+  the multi-version cache stays bounded.
+
+The runtime is always installed **in place**: `install sdk` bakes absolute paths
+into the runtime manifest, so a tree that is moved after installation leaves every
+serve pointing at a path that no longer exists.
+
+This replaced an existence-only guard that never reinstalled, which had frozen both
+MI300X runners on a 16-day-old runtime and left drift from a fresh install untested
+(`EAI-8057`). The decision logic lives in `xtask` rather than the workflows because
+the pre-warm block is duplicated across multiple jobs in two shells;
+`xtask/src/e2e_prewarm.rs` carries unit tests for each freshness verdict, and the
+`runtime-update-reports-freshness` scenario pins the `rocm update` output shape those tests assume.
+
 ## Blocking vs. non-blocking
 
-The four self-hosted jobs — `e2e-gpu`, `e2e-gpu-strix-ubuntu`,
-`e2e-gpu-strix-windows`, and `e2e-wsl` — all run with `continue-on-error: true`, so a
+The self-hosted jobs — `e2e-gpu`, `e2e-gpu-strix-ubuntu`,
+`e2e-gpu-strix-windows`, `e2e-wsl`, and `e2e-gpu-rad3` — all run with `continue-on-error: true`, so a
 hardware failure that RUNS never gates a PR merge. Their results still surface
 in the self-hosted consolidated report for visibility.
 
