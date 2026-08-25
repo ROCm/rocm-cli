@@ -412,6 +412,7 @@ fn parse_descriptor(name: &str) -> Descriptor {
         // The bare mock expect-pass artifact is `e2e-report` → core "report" or "".
         "" | "report" => ("Mock", "Linux"),
         "gpu" => ("MI300X", "Linux"),
+        "gpu-rad3" => ("R9700", "Linux"),
         "gpu-strix-ubuntu" => ("Strix Halo", "Ubuntu"),
         "gpu-strix-windows" => ("Strix Halo", "Windows"),
         // Same silicon again, third host boundary: an Ubuntu distro under WSL2 on
@@ -2016,6 +2017,7 @@ mod tests {
         for (name, platform, os) in [
             ("e2e-report", "Mock", "Linux"),
             ("e2e-gpu-report", "MI300X", "Linux"),
+            ("e2e-gpu-rad3-report", "R9700", "Linux"),
             ("e2e-gpu-strix-ubuntu-report", "Strix Halo", "Ubuntu"),
             ("e2e-gpu-strix-windows-report", "Strix Halo", "Windows"),
             // Must not fall through to `fallback_descriptor`, which would render

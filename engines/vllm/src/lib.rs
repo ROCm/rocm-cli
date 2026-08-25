@@ -5,8 +5,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use rocm_core::{
-    AppPaths, DEFAULT_LOCAL_PORT, ensure_uv_binary, format_http_base_url,
-    openai_models_endpoint_has_model, require_nonempty, uv_command_env, uv_pip_install_base,
+    AppPaths, DEFAULT_LOCAL_PORT, DependencyViolation, check_dependencies, ensure_uv_binary,
+    format_http_base_url, openai_models_endpoint_has_model, require_nonempty, uv_command_env,
+    uv_pip_install_base, violations_requiring,
 };
 use rocm_engine_protocol::{
     DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy,
@@ -406,22 +407,49 @@ fn capabilities() -> EngineCapabilities {
 }
 
 fn install_response(request: InstallRequest) -> Result<InstallResponse> {
-    let already_installed = if request.reinstall {
-        None
-    } else {
-        resolve_vllm_runtime(Some(&request.runtime_id)).ok()
+    // Resolve regardless of `reinstall`. Resolution answers *which* interpreter holds
+    // vLLM, and a forced reinstall needs that answer just as much as a repair does —
+    // gating it on `reinstall` left `--reinstall` with no assessed environment, so it
+    // fell back to `resolve_managed_runtime_python` (first prefix-matching candidate)
+    // and could reinstall a healthy environment while leaving the broken one broken.
+    // Only the short-circuit below is gated on `reinstall`.
+    let resolved = resolve_vllm_runtime(Some(&request.runtime_id)).ok();
+    // A resolvable vLLM is not necessarily a usable one. `rocm install sdk` writes the
+    // TheRock torch stack into the same environment vLLM lives in, so a second run
+    // replaces the torch build vLLM pins without touching vLLM itself.
+    // Short-circuiting on "vllm resolves" left that environment unrepaired; short-circuit
+    // on "vllm's own requirements are met" instead, so the install below restores them.
+    let (already_installed, repair, assessed) = match resolved {
+        Some(runtime) => {
+            let repair = assess_runtime_repair(&runtime);
+            if request.reinstall || repair.needed {
+                (None, repair, assessed_python_for_repair(&runtime))
+            } else {
+                (Some(runtime), repair, None)
+            }
+        }
+        None => (None, RepairAssessment::default(), None),
     };
     let runtime = if let Some(runtime) = already_installed {
         runtime
     } else {
-        let managed = resolve_managed_runtime_python(Some(&request.runtime_id))?.with_context(
-            || {
-                format!(
-                    "runtime `{}` did not resolve to a managed TheRock Python environment for automatic vLLM install",
-                    request.runtime_id
-                )
-            },
-        )?;
+        // A repair installs into the environment that was *assessed*. The two resolvers
+        // do not agree: `resolve_vllm_runtime` walks the candidates until one actually
+        // has vLLM beside it, while `resolve_managed_runtime_python` takes the first
+        // candidate unconditionally — and `runtime_id` matches by prefix, so several
+        // candidates routinely qualify. Installing into a different interpreter than the
+        // one found broken would leave the broken one broken and report it fixed.
+        let managed = match assessed {
+            Some(assessed) => assessed,
+            None => resolve_managed_runtime_python(Some(&request.runtime_id))?.with_context(
+                || {
+                    format!(
+                        "runtime `{}` did not resolve to a managed TheRock Python environment for automatic vLLM install",
+                        request.runtime_id
+                    )
+                },
+            )?,
+        };
         install_vllm_with_uv(&managed.python_executable, request.reinstall)?;
         resolve_vllm_runtime(Some(&managed.runtime_id)).with_context(|| {
             format!(
@@ -457,8 +485,93 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
         )],
         capabilities: capabilities(),
         lock_hash: runtime_lock_hash(&runtime),
-        warnings: vllm_runtime_warnings(&runtime),
+        warnings: repair
+            .notes
+            .into_iter()
+            .chain(vllm_runtime_warnings(&runtime))
+            .collect(),
     })
+}
+
+/// Whether a resolvable vLLM environment still needs an install pass, and what to tell
+/// the user about why.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct RepairAssessment {
+    /// The environment holds vLLM but not the dependencies vLLM declares, so the
+    /// install must run even though `reinstall` was not requested.
+    needed: bool,
+    /// Findings to surface with the install response.
+    notes: Vec<String>,
+}
+
+/// The environment a repair must target: the one that was assessed, named by its own
+/// runtime id rather than by the (possibly prefix-matching) id the caller requested.
+fn assessed_python_for_repair(runtime: &VllmRuntime) -> Option<ManagedRuntimePython> {
+    Some(ManagedRuntimePython {
+        runtime_id: runtime.runtime_id.clone(),
+        python_executable: runtime.python_executable.clone()?,
+    })
+}
+
+/// Decide whether an already-resolvable vLLM environment must be reinstalled.
+///
+/// Only managed environments are assessed. An external environment belongs to the user:
+/// rocm-cli reports on it but does not rewrite its packages, which is the very failure
+/// mode this check exists to catch.
+fn assess_runtime_repair(runtime: &VllmRuntime) -> RepairAssessment {
+    if !runtime_is_managed(runtime) {
+        return RepairAssessment::default();
+    }
+    let Some(python) = runtime.python_executable.as_ref() else {
+        return RepairAssessment::default();
+    };
+    let paths = match AppPaths::discover() {
+        Ok(paths) => paths,
+        Err(error) => return unverified_repair(&error.to_string()),
+    };
+    match check_dependencies(&paths, python) {
+        Ok(violations) => repair_from_violations(&violations),
+        // An unusable `uv` or an offline host must not block an install that would
+        // otherwise succeed; report that the check did not run and carry on as before.
+        Err(error) => unverified_repair(&error.to_string()),
+    }
+}
+
+/// The repair decision for a set of violations found in the environment.
+fn repair_from_violations(violations: &[DependencyViolation]) -> RepairAssessment {
+    let owned = violations_requiring(violations, ENGINE_NAME);
+    if owned.is_empty() {
+        return RepairAssessment::default();
+    }
+    let mut notes = vec![
+        "the runtime environment did not satisfy vLLM's pinned dependencies; vLLM was reinstalled to restore them".to_owned(),
+    ];
+    // One note per violation rather than one joined line. The real failure is the whole
+    // torch stack — torch, torchvision and torchaudio move together when the SDK writes
+    // over the engine's pins — so joining them produced a single ~380-character line that
+    // is unreadable in a terminal. Mirrors the per-finding `violation:` lines the
+    // CLI-side renderer already emits.
+    notes.extend(
+        owned
+            .iter()
+            .map(|violation| format!("violation: {}", violation.detail)),
+    );
+    notes.push(
+        "if this recurs after `rocm install sdk`, the SDK torch stack is being written over vLLM's pinned torch".to_owned(),
+    );
+    RepairAssessment {
+        needed: true,
+        notes,
+    }
+}
+
+fn unverified_repair(reason: &str) -> RepairAssessment {
+    RepairAssessment {
+        needed: false,
+        notes: vec![format!(
+            "vLLM's pinned dependencies could not be verified in this environment: {reason}"
+        )],
+    }
 }
 
 fn runtime_is_managed(runtime: &VllmRuntime) -> bool {
@@ -2401,6 +2514,149 @@ mod tests {
 
     fn install_target(index: Option<&str>) -> Result<VllmInstallTarget> {
         resolve_vllm_install_target(index.map(ToOwned::to_owned))
+    }
+
+    fn violation(requiring: &str, detail: &str) -> DependencyViolation {
+        DependencyViolation {
+            requiring: requiring.to_owned(),
+            detail: detail.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_repair_targets_the_environment_that_was_assessed() {
+        // `resolve_managed_runtime_python` returns the first candidate unconditionally,
+        // while the assessment walked on to the candidate that actually has vLLM. Both
+        // match when `runtime_id` matching is by prefix, so the repair must follow the
+        // assessed environment or it fixes an interpreter nobody found broken.
+        let assessed = VllmRuntime {
+            runtime_id: "nightly-wheel-gfx94x-dcgpu-7-14-0a20260611".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("/rocm/runtimes/wheel/nightly-gfx94x/bin/vllm"),
+            python_executable: Some(PathBuf::from(
+                "/rocm/runtimes/wheel/nightly-gfx94x/bin/python",
+            )),
+            version: Some("0.26.0".to_owned()),
+            source: "managed_runtime_manifest:nightly-wheel-gfx94x-dcgpu".to_owned(),
+            sdk_root: None,
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+        };
+
+        let target = assessed_python_for_repair(&assessed).expect("a managed runtime has a python");
+
+        assert_eq!(
+            target.python_executable,
+            PathBuf::from("/rocm/runtimes/wheel/nightly-gfx94x/bin/python")
+        );
+        assert_eq!(
+            target.runtime_id, "nightly-wheel-gfx94x-dcgpu-7-14-0a20260611",
+            "the assessed runtime's own id, not the prefix the caller asked for"
+        );
+    }
+
+    #[test]
+    fn a_consistent_environment_is_not_reinstalled() {
+        assert_eq!(repair_from_violations(&[]), RepairAssessment::default());
+    }
+
+    #[test]
+    fn a_replaced_pinned_torch_forces_a_reinstall() {
+        // A second `rocm install sdk` writes the SDK's torch over the build
+        // vLLM pins. vLLM still imports, so resolution alone cannot see the breakage.
+        let assessment = repair_from_violations(&[violation(
+            "vllm",
+            "The package `vllm` requires `torch==2.10.0+git8514f05`, but `2.9.1+rocm7.14.0a20260611` is installed",
+        )]);
+
+        assert!(assessment.needed);
+        assert!(
+            assessment
+                .notes
+                .iter()
+                .any(|note| note.contains("2.10.0+git8514f05")),
+            "the reported note names the pin that was violated: {:?}",
+            assessment.notes
+        );
+    }
+
+    #[test]
+    fn the_whole_replaced_torch_stack_is_reported_one_finding_per_line() {
+        // What the failure actually looks like on hardware: the SDK moves torch,
+        // torchvision and torchaudio together, so all three pins are violated at
+        // once. Joining them into a single note produced one ~380-character line;
+        // each finding gets its own so a terminal can show them.
+        let assessment = repair_from_violations(&[
+            violation(
+                "vllm",
+                "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.11.0+rocm7.13.0` is installed",
+            ),
+            violation(
+                "vllm",
+                "The package `vllm` requires `torchvision==0.24.1+d801a34`, but `0.26.0+rocm7.13.0` is installed",
+            ),
+            violation(
+                "vllm",
+                "The package `vllm` requires `torchaudio==2.9.0+eaa9e4e`, but `2.11.0+rocm7.13.0` is installed",
+            ),
+        ]);
+
+        assert!(assessment.needed);
+        let violation_notes: Vec<&String> = assessment
+            .notes
+            .iter()
+            .filter(|note| note.starts_with("violation: "))
+            .collect();
+        assert_eq!(
+            violation_notes.len(),
+            3,
+            "every violated pin gets its own note: {:?}",
+            assessment.notes
+        );
+        for package in ["torch==", "torchvision==", "torchaudio=="] {
+            assert!(
+                violation_notes.iter().any(|note| note.contains(package)),
+                "{package} is missing from the reported notes: {:?}",
+                assessment.notes
+            );
+        }
+        assert!(
+            assessment.notes.iter().all(|note| note.len() < 200),
+            "no note should be a wall of joined findings: {:?}",
+            assessment.notes
+        );
+    }
+
+    #[test]
+    fn unrelated_upstream_conflicts_do_not_force_a_reinstall() {
+        // These environments routinely carry conflicts between third-party packages.
+        // Reinstalling vLLM would not resolve them, so they must not trigger one.
+        let assessment = repair_from_violations(&[
+            violation(
+                "tilelang",
+                "The package `tilelang` requires `cloudpickle>=3.0`, but `2.2.1` is installed",
+            ),
+            violation(
+                "torch",
+                "The package `torch` requires `sympy>=1.13`, but `1.12` is installed",
+            ),
+        ]);
+
+        assert_eq!(assessment, RepairAssessment::default());
+    }
+
+    #[test]
+    fn an_unrunnable_check_reports_itself_without_forcing_a_reinstall() {
+        let assessment = unverified_repair("uv binary is unavailable");
+
+        assert!(!assessment.needed);
+        assert_eq!(assessment.notes.len(), 1);
+        assert!(
+            assessment.notes[0].contains("could not be verified"),
+            "{:?}",
+            assessment.notes
+        );
     }
 
     #[test]

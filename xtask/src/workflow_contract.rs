@@ -706,7 +706,7 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     }
 
     #[test]
-    fn hardware_testing_docs_cover_all_four_self_hosted_platforms() {
+    fn hardware_testing_docs_cover_all_self_hosted_platforms() {
         let docs = std::fs::read_to_string(repo_root().join("docs/ci-hardware-testing.md"))
             .expect("read hardware testing docs");
         let rows = markdown_table_rows(&docs, "| Job | Workflow | Platform | Runner labels |");
@@ -737,8 +737,12 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                     "`e2e-wsl`".to_owned(),
                     "Strix Halo (gfx1151) on Ubuntu under WSL2".to_owned(),
                 ),
+                (
+                    "`e2e-gpu-rad3`".to_owned(),
+                    "Radeon AI PRO R9700 (gfx1201) on Linux".to_owned(),
+                ),
             ],
-            "hardware testing table must document the four actual self-hosted job/platform rows"
+            "hardware testing table must document every actual self-hosted job/platform row"
         );
 
         let artifacts = backticked_list_between(
@@ -751,6 +755,7 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             vec![
                 "e2e-report",
                 "e2e-gpu-report",
+                "e2e-gpu-rad3-report",
                 "e2e-gpu-strix-ubuntu-report",
                 "e2e-gpu-strix-windows-report",
                 "e2e-gpu-strix-wsl-report",
@@ -762,9 +767,9 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             .expect("read E2E README");
         assert!(
             normalized_whitespace(&readme).contains(
-                "The nightly workflow runs four non-blocking jobs — MI300X plus Strix Halo on Ubuntu, Windows, and WSL2 — with `E2E_INCLUDE_NIGHTLY=1`"
+                "The nightly workflow runs non-blocking jobs — MI300X, Radeon R9700, and Strix Halo on Ubuntu, Windows, and WSL2 — with `E2E_INCLUDE_NIGHTLY=1`"
             ),
-            "E2E README must identify all four nightly job platforms"
+            "E2E README must identify every nightly job platform"
         );
     }
 

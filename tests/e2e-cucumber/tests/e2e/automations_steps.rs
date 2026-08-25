@@ -2,18 +2,56 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Steps for `rocm automations`.
+//! Steps for `rocm automations enable/disable/list`. Black-box against the
+//! isolated config dir. `automations enable` would otherwise spawn a detached
+//! background daemon (`rocm daemon`) on first enable, which both adds a
+//! nondeterministic `helper:` line and leaks a process past the scenario. To keep
+//! the mock lane hermetic, every scenario first plants an automation
+//! runtime-state marking the daemon already running under THIS test process's
+//! (live) pid, so the CLI's double-spawn guard skips the spawn. Contracts
+//! verified against the running Linux binary (EAI-8072, EAI-8047).
 //!
-//! The scenario asserts a discoverability contract: everything the listing shows
-//! a user must also be able to act on. So these steps deliberately derive each
-//! check's identifier FROM the listing rather than knowing it in advance —
-//! hard-coding the real ids would keep passing against a listing that publishes
-//! none of them, which is the defect being pinned.
+//! Two slices live here. The enable/disable/mode steps act on a watcher id the
+//! test already knows. The listing steps (scenario 4) assert the complementary
+//! discoverability contract: everything the listing shows a user must also be
+//! able to act on, so they derive each check's identifier FROM the listing rather
+//! than knowing it in advance — hard-coding the real ids would keep passing
+//! against a listing that publishes none of them, which is the defect pinned.
 
 use cucumber::{given, then, when};
-use serde_json::json;
 
 use crate::E2eWorld;
+
+/// A built-in watcher id (`BUILTIN_WATCHERS` in rocm-core); stable and always
+/// present, so scenarios can enable/disable it without depending on host state.
+const WATCHER: &str = "therock-update";
+
+/// Plant an automation runtime-state that marks the background daemon already
+/// running under the test harness's own (live) pid. `automations enable` guards
+/// against a second spawn when the recorded daemon pid is a live process, so this
+/// suppresses the detached-daemon spawn — no `helper:` line, no leaked process.
+///
+/// Shared with the `a fresh CLI configuration` Given (in `config_steps`), which
+/// calls this so every automations scenario starting from a fresh config is also
+/// spawn-suppressed. Exposed `pub(crate)` for that single caller.
+pub(crate) fn suppress_daemon_spawn(world: &E2eWorld) {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let dir = root.path().join("data").join("automations");
+    std::fs::create_dir_all(&dir).expect("failed to create automations dir");
+    let state = serde_json::json!({
+        "running": true,
+        "automations_enabled": true,
+        "daemon_pid": std::process::id(),
+        "started_at_unix_ms": 1_700_000_000_000u64,
+        "last_tick_unix_ms": 1_700_000_000_000u64,
+        "active_watchers": [],
+    });
+    std::fs::write(
+        dir.join("runtime-state.json"),
+        serde_json::to_vec_pretty(&state).expect("failed to serialize automation state"),
+    )
+    .expect("failed to write automation runtime state");
+}
 
 /// Slugify a display name: lowercase, words joined by dashes.
 ///
@@ -114,38 +152,66 @@ fn listed_checks(listing: &str) -> Vec<(String, String)> {
 
 // ── Given ──────────────────────────────────────────────────────────
 
+#[given("an enabled automation watcher")]
+async fn enabled_watcher(world: &mut E2eWorld) {
+    suppress_daemon_spawn(world);
+    crate::run_rocm_ok(
+        world,
+        &["automations", "enable", WATCHER, "--mode", "observe"],
+    );
+}
+
 #[given("a machine with no background checks turned on")]
 async fn no_background_checks(world: &mut E2eWorld) {
     // The scenario's isolated config starts empty, so every check is already off
-    // and nothing needs planting for the precondition itself.
-    //
-    // What DOES need planting is a background helper: `automations enable`
-    // launches a detached `rocm daemon` unless the recorded one is alive, and
-    // that child would outlive the scenario, survive its temp dir, and pile up on
-    // a persistent runner. Recording this test process as the running helper
-    // makes the liveness check find one and skip the spawn — the same trick, for
-    // the same reason, as pointing a planted service record's pids at this
-    // process (see `E2eWorld::register_mock_service_with`). Black-box: plain JSON
-    // matching the CLI's on-disk schema, not a typed import from the product.
-    let root = world.isolated_root.as_ref().expect("no isolated root");
-    let automations = root.path().join("data").join("automations");
-    std::fs::create_dir_all(&automations).expect("failed to create the automations dir");
-    let state = json!({
-        "running": true,
-        "automations_enabled": false,
-        "daemon_pid": std::process::id(),
-        "started_at_unix_ms": 1_700_000_000_000_u64,
-        "last_tick_unix_ms": 1_700_000_000_000_u64,
-        "active_watchers": [],
-    });
-    std::fs::write(
-        automations.join("runtime-state.json"),
-        serde_json::to_vec_pretty(&state).expect("runtime state serialises"),
-    )
-    .expect("failed to write the automation runtime state");
+    // and nothing needs planting for the precondition itself. What DOES need
+    // planting is the running-daemon marker, for the same reason the sibling
+    // scenarios plant it: `automations enable` would otherwise launch a detached
+    // `rocm daemon` that outlives the scenario and accumulates on a persistent
+    // runner.
+    suppress_daemon_spawn(world);
 }
 
 // ── When ───────────────────────────────────────────────────────────
+
+#[when("the user enables an automation watcher in observe mode")]
+async fn enable_observe(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &["automations", "enable", WATCHER, "--mode", "observe"],
+    );
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user re-enables the same watcher in propose mode")]
+async fn enable_propose(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &["automations", "enable", WATCHER, "--mode", "propose"],
+    );
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user disables the watcher")]
+async fn disable_watcher(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["automations", "disable", WATCHER]);
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user tries to enable a watcher that does not exist")]
+async fn enable_unknown(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "automations",
+            "enable",
+            "e2e-no-such-watcher",
+            "--mode",
+            "observe",
+        ],
+    );
+    record(world, stdout, stderr, rc);
+}
 
 #[when("the user lists the background checks")]
 async fn user_lists_checks(world: &mut E2eWorld) {
@@ -158,6 +224,43 @@ async fn user_lists_checks(world: &mut E2eWorld) {
 }
 
 // ── Then ───────────────────────────────────────────────────────────
+
+#[then(regex = r"^the CLI confirms the watcher is enabled in (observe|propose) mode$")]
+async fn confirm_enabled(world: &mut E2eWorld, mode: String) {
+    let out = ok_output(world);
+    assert!(
+        out.contains("automation watcher enabled"),
+        "expected an enable confirmation, got:\n{out}"
+    );
+    assert!(
+        out.contains(&format!("watcher: {WATCHER}")),
+        "expected the watcher id, got:\n{out}"
+    );
+    assert!(
+        out.contains(&format!("mode: {mode}")),
+        "expected mode {mode}, got:\n{out}"
+    );
+}
+
+#[then("the CLI confirms the watcher is disabled")]
+async fn confirm_disabled(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert!(
+        out.contains("automation watcher disabled") && out.contains(&format!("watcher: {WATCHER}")),
+        "expected a disable confirmation for {WATCHER}, got:\n{out}"
+    );
+}
+
+#[then("the CLI refuses and names it as unknown")]
+async fn refuse_unknown(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    assert!(rc != 0, "expected refusal, got rc=0:\n{}", combined(world));
+    assert!(
+        combined(world).contains("unknown watcher: e2e-no-such-watcher"),
+        "expected an unknown-watcher error, got:\n{}",
+        combined(world)
+    );
+}
 
 #[then("every listed check can be turned on by name")]
 async fn assert_listed_checks_enableable(world: &mut E2eWorld) {
@@ -194,4 +297,26 @@ async fn assert_listed_checks_enableable(world: &mut E2eWorld) {
         unreachable.len(),
         unreachable.join("\n  "),
     );
+}
+
+// ── Helpers ────────────────────────────────────────────────────────
+
+fn record(world: &mut E2eWorld, stdout: String, stderr: String, rc: i32) {
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+fn combined(world: &E2eWorld) -> String {
+    format!(
+        "{}\n{}",
+        world.cli_output.as_deref().unwrap_or(""),
+        world.cli_stderr.as_deref().unwrap_or("")
+    )
+}
+
+fn ok_output(world: &E2eWorld) -> String {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    assert_eq!(rc, 0, "expected success, got rc={rc}:\n{}", combined(world));
+    world.cli_output.clone().unwrap_or_default()
 }

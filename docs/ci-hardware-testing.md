@@ -36,6 +36,7 @@ separate tier flag or tag filter to maintain.
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu | self-hosted `[self-hosted, linux, strix-halo, native]` |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on native Windows 11 | self-hosted `[self-hosted, windows, strix-halo, native]` |
 | `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu under WSL2 | self-hosted `[self-hosted, linux, strix-halo, wsl]` |
+| `e2e-gpu-rad3` | `e2e-selfhosted.yml` | Radeon AI PRO R9700 (gfx1201) on Linux | self-hosted `[self-hosted, linux, r9700]` |
 
 The Strix Halo lanes pin the extra `native` label because two Linux runners
 share the `strix-halo` label (a native host and a WSL host) and the jobs'
@@ -46,8 +47,8 @@ WSL lane pins `wsl` for the same reason, from the other side.
 resolve to skip here, and known bugs resolve to xfail from
 `expectations.toml`. It is a required check and must stay green.
 
-The four self-hosted jobs (`e2e-gpu`, `e2e-gpu-strix-ubuntu`,
-`e2e-gpu-strix-windows`, and `e2e-wsl`) run on AMD GPU systems, so they exercise
+The self-hosted jobs (`e2e-gpu`, `e2e-gpu-strix-ubuntu`,
+`e2e-gpu-strix-windows`, `e2e-wsl`, and `e2e-gpu-rad3`) run on AMD GPU systems, so they exercise
 host/GPU detection, engine `detect`/`capabilities`, and live serving scenarios
 that the mock job cannot. GPU availability is advisory in the WSL lane, as
 described below.
@@ -84,14 +85,14 @@ not applicable, instead of failing them on a premise the host cannot meet.
 
 Each workflow has its own consolidated report job. `ci.yml`'s `e2e-report`
 covers the mock platform;
-`e2e-selfhosted.yml`'s `e2e-report` covers the four GPU platforms;
-`nightly.yml`'s `e2e-report-nightly` covers the same four platforms with the
+`e2e-selfhosted.yml`'s `e2e-report` covers the GPU platforms;
+`nightly.yml`'s `e2e-report-nightly` covers the same platforms with the
 `@nightly` scenarios included. Each joins its platforms'
 reports — including partial or failed runs — by scenario id into one HTML report
 and GitHub step summary.
 
 The lane artifacts are named canonically (`e2e-report`, `e2e-gpu-report`,
-`e2e-gpu-strix-ubuntu-report`, `e2e-gpu-strix-windows-report`,
+`e2e-gpu-rad3-report`, `e2e-gpu-strix-ubuntu-report`, `e2e-gpu-strix-windows-report`,
 `e2e-gpu-strix-wsl-report`) in every workflow, because the report derives each
 platform's name and OS from the artifact name. An unrecognised name renders as a
 guessed platform on Linux, which would report a Windows lane as Linux; `xtask`'s
@@ -119,10 +120,11 @@ They can also be triggered manually via `e2e-selfhosted.yml`'s
 `workflow_dispatch`, independent of the `serve` gate, with these inputs:
 
 - `platform` (choice: `all`, `app-dev-gpu`, `strix-ubuntu`, `strix-windows`,
-  `strix-wsl`) — which self-hosted job(s) to run. `app-dev-gpu` maps to
+  `strix-wsl`, `rad3`) — which self-hosted job(s) to run. `app-dev-gpu` maps to
   `e2e-gpu`, `strix-ubuntu` to `e2e-gpu-strix-ubuntu`, `strix-windows` to
-  `e2e-gpu-strix-windows`, and `strix-wsl` to `e2e-wsl`. (The mock lane has its
-  own `platform` input on `ci.yml`; it is not part of this workflow.)
+  `e2e-gpu-strix-windows`, `strix-wsl` to `e2e-wsl`, and `rad3` to
+  `e2e-gpu-rad3`. (The mock lane has its own `platform` input on `ci.yml`; it is
+  not part of this workflow.)
 - `name_filter` (string) — a scenario-name regex forwarded to the cucumber
   harness (`cargo xtask e2e -- --name <regex>`) so a dispatch can run a
   single scenario instead of the full suite. Empty runs everything applicable
@@ -139,8 +141,8 @@ gh workflow run e2e-selfhosted.yml --ref <ref> -f platform=app-dev-gpu
 
 ## Blocking vs. non-blocking
 
-The four self-hosted jobs — `e2e-gpu`, `e2e-gpu-strix-ubuntu`,
-`e2e-gpu-strix-windows`, and `e2e-wsl` — all run with `continue-on-error: true`, so a
+The self-hosted jobs — `e2e-gpu`, `e2e-gpu-strix-ubuntu`,
+`e2e-gpu-strix-windows`, `e2e-wsl`, and `e2e-gpu-rad3` — all run with `continue-on-error: true`, so a
 hardware failure that RUNS never gates a PR merge. Their results still surface
 in the self-hosted consolidated report for visibility.
 
