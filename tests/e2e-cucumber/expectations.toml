@@ -221,15 +221,9 @@ when = {}
 bug = "EAI-8053"
 reason = "install driver --dkms prefixes sudo even as root, so it fails with `sudo: not found` on a root host without sudo."
 
-# --- EAI-8051: `comfyui install` installs ComfyUI's dependencies into the managed
-# ROCm runtime with no package-index scoping. torch/torchvision/torchaudio are
-# filtered out, but a transitive dependency can still pull CUDA `nvidia-*` wheels
-# into the runtime and displace its ROCm torch, so installing an optional app
-# leaves the machine's base runtime a CUDA build with no AMD GPU support. Runs only
-# on the nightly GPU lane (@requires-gpu @nightly) against an isolated, throwaway
-# runtime it may corrupt. Unconditional where it runs, so `when = {}`.
-# Remove when the install can no longer alter the runtime's torch stack. ---
-[["comfyui-install-preserves-the-rocm-runtime"]]
-when = {}
-bug = "EAI-8051"
-reason = "comfyui install can pull CUDA nvidia-* wheels into the managed ROCm runtime, replacing its ROCm torch."
+# EAI-8051 had a row here — `comfyui install` pulling CUDA `nvidia-*` wheels into
+# the managed ROCm runtime and displacing its ROCm torch. The fix landed in
+# 3e59435a (#298): the install now pins the runtime's torch stack with a `uv
+# --constraint` file, so a transitive dependency can no longer resolve torch from
+# PyPI. `comfyui-install-preserves-the-rocm-runtime` therefore EXPECT-PASSES now;
+# keeping the row would make it a stale XPASS and fail the lane.
