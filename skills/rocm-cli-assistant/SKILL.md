@@ -27,7 +27,7 @@ Use this skill when answering ROCm CLI local assistant questions.
 - vLLM and Lemonade are serving engines.
 - The built-in assistant is fixed to qwen served by Lemonade with GPU required. Do not switch the built-in assistant to vLLM.
 - Installing an engine and running a model server are different states. Answer each separately when the user asks.
-- `rocm serve` accepts `--gpu auto|<index>` to pick the AMD GPU. `auto` (default) prefers a GPU that looks idle from `amd-smi` VRAM telemetry and is not already used by another rocm-cli server (managed or foreground), falling back to the GPU with the most free memory; a single index pins one GPU. Serving one model across multiple GPUs is not supported. Do not suggest CPU fallback when a GPU is busy or out of range.
+- `rocm serve` accepts `--gpu auto|<index>` to pick the AMD GPU. `auto` (default) prefers a GPU that looks idle from VRAM telemetry (`amd-smi`, or the amdgpu DRM sysfs counters when `amd-smi` is absent) and is not already used by another rocm-cli server (managed or foreground), falling back to the GPU with the most free memory; a single index pins one GPU. Serving one model across multiple GPUs is not supported. Do not suggest CPU fallback when a GPU is busy or out of range.
 - On native Windows, vLLM serving/install live checks are skipped; tell the user to use WSL/Linux for that ROCm GPU engine and do not suggest CPU fallback.
 
 ## ComfyUI
