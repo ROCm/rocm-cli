@@ -77,6 +77,28 @@ async fn running_managed_model(world: &mut E2eWorld) {
     setup_managed_model(world, ServiceRecordOptions::default(), false).await;
 }
 
+#[given("chat has a stale saved endpoint")]
+async fn stale_saved_chat_endpoint(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root");
+    let path = root.path().join("config").join("config.json");
+    let config = serde_json::json!({
+        "dashboard": {
+            "tui": {
+                "chat_url": "http://127.0.0.1:9/v1",
+                "chat_model": "stale-model"
+            }
+        }
+    });
+    std::fs::write(
+        path,
+        serde_json::to_vec_pretty(&config).expect("serialize config"),
+    )
+    .expect("write stale chat config");
+}
+
 // ── When ───────────────────────────────────────────────────────────
 
 #[when("the user opens the dashboard with demo data")]
