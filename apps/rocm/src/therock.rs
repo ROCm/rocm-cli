@@ -147,7 +147,7 @@ fn render_canonical_provenance(
     version: &str,
 ) {
     let build_date = runtime_version_build_date(version)
-        .unwrap_or_else(|| "<not published by canonical source>".to_owned());
+        .unwrap_or_else(|| "not encoded in stable version".to_owned());
     let _ = writeln!(output, "  channel: {}", channel.as_str());
     let _ = writeln!(output, "  canonical_source: {source_url}");
     let _ = writeln!(output, "  selected_rocm_version: {version}");
@@ -879,16 +879,11 @@ fn install_wheel_runtime(
         version_selector,
     )?;
     progress_line(format!(
-        "Found TheRock package family {} version {} with a matching PyTorch stack.",
-        resolution.family, resolution.latest_version
+        "Found canonical TheRock aggregate version {} with a matching PyTorch stack for target family {}.",
+        resolution.latest_version, resolution.family
     ));
-    let runtime_key = runtime_key(
-        channel,
-        "wheel",
-        &resolution.family,
-        Some(&resolution.latest_version),
-    );
-    let install_root = resolved_install_root(paths, "wheel", &runtime_key, prefix);
+    let runtime_key = wheel_runtime_key(channel, &resolution.latest_version);
+    let install_root = prefix.unwrap_or_else(|| managed_runtime_root(paths, "wheel", &runtime_key));
     let manifest_path = runtime_manifest_path(paths, &runtime_key);
 
     let mut output = String::new();
@@ -909,8 +904,12 @@ fn install_wheel_runtime(
     if let Some(selector) = version_selector {
         let _ = writeln!(output, "  requested: {}", selector.describe());
     }
-    let _ = writeln!(output, "  family: {}", resolution.family);
-    let _ = writeln!(output, "  family_source: {}", resolution.family_source);
+    let _ = writeln!(output, "  target_family: {}", resolution.family);
+    let _ = writeln!(
+        output,
+        "  target_family_source: {}",
+        resolution.family_source
+    );
     let _ = writeln!(output, "  index_url: {}", resolution.index_url);
     let _ = writeln!(
         output,
@@ -1244,12 +1243,7 @@ fn resolve_pip_runtime_with_timeout(
             "failed to resolve TheRock {} wheel runtime from canonical source {}\n\n{}",
             channel.as_str(),
             source.wheel_index,
-            family_resolution_hint(
-                &family_resolution.source,
-                &family_resolution.family,
-                channel,
-                "wheel",
-            )
+            canonical_wheel_resolution_hint(channel)
         )
     })
 }
@@ -3781,6 +3775,26 @@ fn parse_version(value: &str) -> Option<ParsedVersion> {
 /// so an auto-detected miss points the user at `--family`, while a user-supplied
 /// miss confirms the family they already named. Both point at the other channel
 /// and, where valid for the platform, the other install format.
+fn canonical_wheel_resolution_hint(channel: TheRockChannel) -> String {
+    let other_channel = match channel {
+        TheRockChannel::Release => "nightly",
+        TheRockChannel::Nightly => "release",
+    };
+    let mut hint = format!(
+        "No complete compatible package stack was found in the canonical {} aggregate stream. Try `--channel {other_channel}`",
+        channel.as_str()
+    );
+    if !runtime_is_windows() {
+        hint.push_str(" or `--format tarball`");
+    }
+    hint.push('.');
+    hint
+}
+
+fn wheel_runtime_key(channel: TheRockChannel, version: &str) -> String {
+    slugify(&format!("{}-wheel-multi-arch-{version}", channel.as_str()))
+}
+
 fn family_resolution_hint(
     source: &str,
     family: &str,
@@ -4870,7 +4884,7 @@ mod tests {
     #[test]
     fn managed_uv_cache_sits_under_the_data_dir_for_generated_runtime_folders() {
         let (_root, paths) = test_paths("managed-uv-cache");
-        let runtime_key = "release-wheel-gfx120x-all-7-14-0";
+        let runtime_key = "release-wheel-multi-arch-7-14-0";
         let install_root = managed_runtime_root(&paths, "wheel", runtime_key);
         assert!(install_root.starts_with(&paths.data_dir));
         // Without --prefix the generated runtime folder is itself under the data dir, so
@@ -5131,16 +5145,36 @@ echo Python 3.12.10
     }
 
     #[test]
-    fn runtime_key_includes_version_for_side_by_side_installs() {
+    fn aggregate_wheel_runtime_key_ignores_target_family() {
         assert_eq!(
-            runtime_key(
-                TheRockChannel::Release,
-                "wheel",
-                "gfx120X-all",
-                Some("7.13.0a20260416")
-            ),
-            "release-wheel-gfx120x-all-7-13-0a20260416"
+            wheel_runtime_key(TheRockChannel::Release, "7.13.0a20260416"),
+            "release-wheel-multi-arch-7-13-0a20260416"
         );
+    }
+
+    #[test]
+    fn aggregate_wheel_resolution_hint_does_not_recommend_family_override() {
+        let hint = canonical_wheel_resolution_hint(TheRockChannel::Release);
+        assert!(!hint.contains("--family"));
+        assert!(hint.contains("--channel nightly"));
+        if !runtime_is_windows() {
+            assert!(hint.contains("--format tarball"));
+        }
+    }
+
+    #[test]
+    fn stable_provenance_uses_neutral_build_date_wording() {
+        let source = canonical_source(TheRockChannel::Release);
+        let mut output = String::new();
+        render_canonical_provenance(
+            &mut output,
+            TheRockChannel::Release,
+            source.wheel_index,
+            source.layout_generation,
+            "7.14.0",
+        );
+        assert!(output.contains("build_date: not encoded in stable version"));
+        assert!(!output.contains("not published"));
     }
 
     #[test]

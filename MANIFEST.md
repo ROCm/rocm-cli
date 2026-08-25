@@ -646,8 +646,8 @@ ROCm distribution. Two install formats are supported:
 - **Wheel format** — Python wheel packages (`rocm`, `torch`, `torchvision`,
   `torchaudio`) are resolved from AMD-hosted PyPI-compatible indexes and
   installed via `uv` into a managed virtual environment. Release channel wheels
-  are served from `https://repo.amd.com/rocm/whl/<gpu-family>/`. Nightly
-  channel wheels are served from `https://rocm.nightlies.amd.com/v2/<gpu-family>/`.
+  are served from `https://repo.amd.com/rocm/whl-multi-arch`. Nightly channel
+  wheels are served from `https://rocm.nightlies.amd.com/whl-multi-arch`.
 - **Tarball format** — Prebuilt SDK tarballs are downloaded from AMD-hosted
   artifact storage. Release channel tarballs are served from
   `https://repo.amd.com/rocm/tarball/`. Nightly tarballs are served from
