@@ -133,6 +133,6 @@ Feature: Runtime configuration
     And the error explains which install types can be adopted
 
   @id:runtime-resolve-canonical-nightly @nightly
-  Scenario: 5 - Previewing a nightly SDK install reports canonical provenance
+  Scenario: 6 - Previewing a nightly SDK install reports canonical provenance
     When the user dry-runs a nightly SDK install for a known family
     Then the SDK preview reports canonical nightly provenance
