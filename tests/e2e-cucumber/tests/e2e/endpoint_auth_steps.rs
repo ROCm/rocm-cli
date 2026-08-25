@@ -33,32 +33,46 @@ fn issued_api_key(output: &str) -> Option<String> {
         .filter(|key| !key.is_empty())
 }
 
-/// GET `<endpoint>/models`, optionally presenting a bearer token. Returns the HTTP
-/// status so a step can assert acceptance vs. refusal.
-async fn get_models_status(bearer: Option<&str>) -> reqwest::StatusCode {
+/// GET `<endpoint>/models`, optionally presenting a bearer token. `None` means the
+/// request never reached a listener (connection refused / timed out), which is
+/// distinct from "answered with a status" — the readiness wait tolerates that while
+/// the engine is still binding, but an assertion must not.
+async fn try_models_status(bearer: Option<&str>) -> Option<reqwest::StatusCode> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .expect("failed to build HTTP client");
-    let url = format!("{ENDPOINT_URL}/models");
-    let mut request = client.get(&url);
+    let mut request = client.get(format!("{ENDPOINT_URL}/models"));
     if let Some(token) = bearer {
         request = request.bearer_auth(token);
     }
-    request
-        .send()
+    request.send().await.ok().map(|response| response.status())
+}
+
+/// As [`try_models_status`], but a transport failure is fatal. Used by the
+/// assertions, which only run once the endpoint has already answered — so at that
+/// point a refused connection is a genuine failure, not a startup race.
+async fn get_models_status(bearer: Option<&str>) -> reqwest::StatusCode {
+    try_models_status(bearer)
         .await
-        .unwrap_or_else(|error| panic!("GET {url} failed: {error}"))
-        .status()
+        .unwrap_or_else(|| panic!("GET {ENDPOINT_URL}/models did not reach the served endpoint"))
 }
 
 /// Wait until the authenticated endpoint answers, so the assertions run against a
 /// loaded model rather than a still-starting one. Polls WITH the key, because an
 /// unauthenticated probe is exactly what the endpoint is meant to reject.
+///
+/// A managed serve returns as soon as the supervisor is up, so for the first while
+/// the engine has not bound the port yet and the connection is simply refused.
+/// That is expected here and must be retried — panicking on the first refusal is
+/// what made this scenario fail before it ever reached its assertions.
 async fn wait_for_authenticated_endpoint(key: &str, timeout_secs: u64) {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
-        if get_models_status(Some(key)).await.is_success() {
+        if try_models_status(Some(key))
+            .await
+            .is_some_and(|status| status.is_success())
+        {
             return;
         }
         assert!(
