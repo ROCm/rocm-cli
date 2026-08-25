@@ -2255,7 +2255,9 @@ mod tests {
             "an OOM tail must route the user to the conditional catalog entry: {hint}"
         );
         assert!(
-            hint.contains("vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB."),
+            hint.contains(
+                "vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB."
+            ),
             "the user's real failing line must be routed into --symptom, not a canned string: {hint}"
         );
 
