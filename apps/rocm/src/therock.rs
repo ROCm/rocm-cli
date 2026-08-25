@@ -4494,13 +4494,14 @@ mod tests {
 
     #[test]
     fn tarball_selection_never_crosses_channels() {
+        let platform = platform_tarball_token();
         let files = vec![
             TarballIndexFile {
-                name: "therock-dist-linux-gfx120X-all-7.14.0.tar.gz".to_owned(),
+                name: format!("therock-dist-{platform}-gfx120X-all-7.14.0.tar.gz"),
                 mtime: 1.0,
             },
             TarballIndexFile {
-                name: "therock-dist-linux-gfx120X-all-10.1.0a20260822.tar.gz".to_owned(),
+                name: format!("therock-dist-{platform}-gfx120X-all-10.1.0a20260822.tar.gz"),
                 mtime: 2.0,
             },
         ];
