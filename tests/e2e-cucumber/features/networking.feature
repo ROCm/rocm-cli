@@ -39,3 +39,23 @@ Feature: Native HTTP networking
     When the user serves a model bound to a public interface without allowing public binding
     Then serving is refused before any engine starts
     And the user is told to allow public binding first
+
+  # The other half of the EAI-7409 contract, and the security property the ticket
+  # calls out first: opting in to a public bind must not produce an open endpoint.
+  # The CLI issues an API key, shows it exactly once, and hands the serving engine
+  # a key file to enforce — so the endpoint must reject callers without the key and
+  # with the wrong key, while accepting the key it just issued.
+  #
+  # GPU lane: the ENGINE enforces the key (the CLI only issues and hands it over),
+  # so proving enforcement needs a real engine serving a real model. `serve` has no
+  # plan-only mode that would let the mock lane observe it. The pure key-resolution
+  # rules (loopback stays credential-free even when a key is passed) are already
+  # unit-tested in the CLI, so this pins only what a unit test cannot: that a live
+  # public endpoint actually authenticates.
+  @id:networking-public-bind-endpoint-enforces-key @requires-gpu
+  Scenario: 4 - A public endpoint issues a key once and then enforces it
+    When the user serves a model on a public interface with public binding allowed
+    Then the CLI shows the endpoint key once and how to send it
+    And a request without the key is refused as unauthorized
+    And a request with the wrong key is refused as unauthorized
+    And a request carrying the issued key is accepted

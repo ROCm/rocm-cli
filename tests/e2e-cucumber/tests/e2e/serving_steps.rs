@@ -32,7 +32,7 @@ fn serve_timeout_secs() -> u64 {
 /// scenario (lengthen a genuinely slow serve, e.g. a large model), else an
 /// `expectations.toml` xfail `serve_timeout_secs` (shorten a known-bug serve so
 /// it fails fast).
-fn serve_timeout_for(world: &E2eWorld) -> u64 {
+pub(crate) fn serve_timeout_for(world: &E2eWorld) -> u64 {
     world
         .serve_timeout_override
         .unwrap_or_else(serve_timeout_secs)
@@ -101,7 +101,7 @@ const ASSISTANT_PORT: u16 = 8001;
 /// (see [`wait_for_free_vram`]). Callers that only need the reset can ignore it;
 /// a serve that then fails to become ready reports it, because "the previous
 /// engine had not released the GPU yet" is otherwise invisible in the log.
-async fn ensure_serve_port_free() -> String {
+pub(crate) async fn ensure_serve_port_free() -> String {
     // Always kill any listener on the shared port — NOT just one that already
     // answers /v1/models. A prior scenario's vLLM that is still LOADING holds the
     // port and GPU memory without yet serving /v1/models; if we only checked HTTP
@@ -326,7 +326,7 @@ async fn setup_mock_custom_port(world: &mut E2eWorld) {
 /// exercised exactly once, in the `@nightly` `serve-large-model-inference`
 /// scenario (Qwen3.6-27B) — never on the per-PR path. Do not raise a serve
 /// scenario's model unless a smaller one genuinely cannot prove the assertion.
-fn host_serve_target() -> (&'static str, &'static str, &'static str) {
+pub(crate) fn host_serve_target() -> (&'static str, &'static str, &'static str) {
     if e2e_cucumber::capability::host_capability().effective_serve_engine == "lemonade" {
         // GGUF via lemonade's llama.cpp backend; endpoint reports e.g.
         // Qwen3-0.6B-Q4_0.gguf, so "Qwen3-0.6B" is the distinctive substring.
