@@ -54,6 +54,7 @@ Feature: Native HTTP networking
   # public endpoint actually authenticates.
   @id:networking-public-bind-endpoint-enforces-key @requires-gpu
   Scenario: 4 - A public endpoint issues a key once and then enforces it
+    Given a managed runtime is active
     When the user serves a model on a public interface with public binding allowed
     Then the CLI shows the endpoint key once and how to send it
     And a request without the key is refused as unauthorized
