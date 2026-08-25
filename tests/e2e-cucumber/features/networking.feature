@@ -52,7 +52,15 @@ Feature: Native HTTP networking
   # rules (loopback stays credential-free even when a key is passed) are already
   # unit-tested in the CLI, so this pins only what a unit test cannot: that a live
   # public endpoint actually authenticates.
-  @id:networking-public-bind-endpoint-enforces-key @requires-gpu
+  #
+  # `@requires-engine:vllm` (same precedent as `serve-vllm-default-on-instinct`) is
+  # load-bearing, not incidental: on a native-Windows host the effective serve engine
+  # is lemonade, and the CLI deliberately REFUSES a public bind there because the
+  # endpoint key cannot be enforced through Windows lemonade. Without this tag the
+  # scenario would drive that refusal and fail on the Strix-Windows lane — a
+  # designed-in behaviour, not a bug, so it wants a tag rather than an xfail row. It
+  # also keeps this cold serve off the time-capped Strix lanes entirely.
+  @id:networking-public-bind-endpoint-enforces-key @requires-gpu @requires-engine:vllm
   Scenario: 4 - A public endpoint issues a key once and then enforces it
     Given a managed runtime is active
     When the user serves a model on a public interface with public binding allowed

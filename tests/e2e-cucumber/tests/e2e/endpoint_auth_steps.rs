@@ -121,15 +121,19 @@ async fn shows_key_once(world: &mut E2eWorld) {
         .endpoint_api_key
         .as_deref()
         .expect("no endpoint api key captured");
-    // Shown exactly once: a key echoed on several lines would widen the window in
-    // which it can be captured from a log.
+    // Exactly one dedicated `api key:` line — this is the launch output's single
+    // disclosure of the secret, matching the "shown only now" promise beneath it.
+    // The key also appears inside the adjacent `example: curl -H "Authorization:
+    // Bearer <key>"` usage line, which is deliberate guidance rather than a second
+    // disclosure, so count only the dedicated line rather than occurrences of the
+    // key itself.
     let shown = output
         .lines()
         .filter(|line| line.trim().starts_with("api key:"))
         .count();
     assert_eq!(
         shown, 1,
-        "expected the key on exactly one line, got {shown}:\n{output}"
+        "expected exactly one dedicated `api key:` line, got {shown}:\n{output}"
     );
     assert!(
         output.contains("shown only now"),
