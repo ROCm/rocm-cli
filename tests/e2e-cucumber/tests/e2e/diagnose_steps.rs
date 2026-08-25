@@ -647,6 +647,308 @@ async fn assert_refuses_without_agreement(world: &mut E2eWorld) {
     );
 }
 
+// ── Diagnosis and fix as two views of one remedy ───────────────────
+
+/// The remedy both commands describe for a device-permission problem: the CLI
+/// can apply it, and both `diagnose` and `fix` have their own copy of what it
+/// does — which is exactly why the two can drift apart.
+const DEVICE_PERMISSION_FIX_ID: &str = "fix-4-render-group";
+
+/// A symptom that makes the device-permission cause score on any host, so the
+/// comparison never depends on what happens to be wrong with the runner.
+const DEVICE_PERMISSION_SYMPTOM: &str = "unable to open /dev/kfd";
+
+/// The device whose owning group the remedy is about.
+const GPU_DEVICE: &str = "/dev/kfd";
+
+/// The field the machine-readable inspection describes [`GPU_DEVICE`] under.
+const GPU_DEVICE_FIELD: &str = "kfd";
+
+/// The group the fix recipe is hard-coded to add the user to.
+const DEFAULT_DEVICE_GROUP: &str = "render";
+
+/// The line a diagnosis prints for how to check the remedy worked.
+const DIAGNOSE_VERIFY_PREFIX: &str = "verify after fix:";
+
+/// The line a fix preview prints for the same thing.
+const FIX_VERIFY_PREFIX: &str = "Verify:";
+
+/// The value after `label` on the first line that carries it.
+fn labelled(text: &str, label: &str) -> Option<String> {
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix(label))
+        .map(|value| value.trim().to_owned())
+        .next()
+}
+
+/// The part of a diagnosis that belongs to one cause.
+///
+/// A diagnosis reports several causes, each with its own plan and its own way to
+/// verify it, and which one comes first depends on the machine. Narrowing to the
+/// named cause first is what keeps the comparison about the remedy under test
+/// rather than about whichever cause happened to rank highest here.
+fn section_for(report: &str, fix_id: &str) -> Option<String> {
+    let start = report.lines().position(|line| line.contains(fix_id))?;
+    // Causes are separated by a blank line, so the next one ends this section.
+    let body: Vec<&str> = report
+        .lines()
+        .skip(start)
+        .take_while(|line| !line.trim().is_empty())
+        .collect();
+    Some(body.join("\n"))
+}
+
+/// The `usermod` invocation a report proposes, wherever it prints it. Both
+/// commands render it differently — one as a shell line under the plan, the
+/// other as the command it is about to run — so match on the invocation itself.
+fn proposed_group_command(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| line.contains("usermod") && line.contains("-G"))
+        .map(|line| {
+            // Strip whichever prefix the renderer used ("$ ", "Will run: ") so the
+            // two are compared as the same kind of thing.
+            line.trim_start_matches("$ ")
+                .trim_start_matches("Will run: ")
+                .to_owned()
+        })
+}
+
+/// The group names in a `-G a,b` argument of a proposed command.
+fn groups_in_command(command: &str) -> Vec<String> {
+    command
+        .split_whitespace()
+        .skip_while(|token| *token != "-G")
+        .nth(1)
+        .unwrap_or_default()
+        .trim_matches('"')
+        .split(',')
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| name.trim().to_owned())
+        .collect()
+}
+
+/// Run the diagnosis and the matching fix preview, and stash both.
+fn compare_diagnosis_with_fix(world: &mut E2eWorld, path_override: Option<&str>) {
+    let args = ["diagnose", "--symptom", DEVICE_PERMISSION_SYMPTOM];
+    let (diagnosis, _, _) = match path_override {
+        Some(path) => crate::run_rocm_with_env(world, &args, &[("PATH", path)]),
+        None => crate::run_rocm(world, &args),
+    };
+    // No `--yes`, so nothing is applied; the preview is the user-facing account
+    // of what the fix would do.
+    let (preview, preview_err, _) =
+        crate::run_rocm(world, &["fix", DEVICE_PERMISSION_FIX_ID, "--dry-run"]);
+    world.cli_output = Some(diagnosis);
+    world.cli_stderr = Some(format!("{preview}{preview_err}"));
+}
+
+#[given("a user who hit a device-permission failure")]
+async fn user_hit_device_permission_failure(world: &mut E2eWorld) {
+    world.model_name = Some(DEVICE_PERMISSION_SYMPTOM.to_string());
+}
+
+#[when("the user compares the diagnosis with the matching fix preview")]
+async fn user_compares_diagnosis_with_fix(world: &mut E2eWorld) {
+    let path_override = world.path_override.clone();
+    compare_diagnosis_with_fix(world, path_override.as_deref());
+}
+
+#[then("both give the same way to verify that the fix worked")]
+async fn assert_verification_agrees(world: &mut E2eWorld) {
+    let diagnosis = world.cli_output.as_ref().expect("no diagnosis output");
+    let preview = world.cli_stderr.as_ref().expect("no fix preview output");
+    let cause = section_for(diagnosis, DEVICE_PERMISSION_FIX_ID).unwrap_or_else(|| {
+        panic!(
+            "the symptom did not produce the device-permission cause, so there is nothing to \
+             compare:\n{diagnosis}"
+        )
+    });
+    let from_diagnosis = labelled(&cause, DIAGNOSE_VERIFY_PREFIX)
+        .unwrap_or_else(|| panic!("the diagnosis gave no way to verify the fix:\n{cause}"));
+    let from_preview = labelled(preview, FIX_VERIFY_PREFIX)
+        .unwrap_or_else(|| panic!("the fix preview gave no way to verify itself:\n{preview}"));
+    // A user told two different things to run cannot know which one settles it.
+    assert_eq!(
+        from_diagnosis, from_preview,
+        "the diagnosis and the fix preview give different ways to verify the same remedy"
+    );
+}
+
+#[then("both give the same command for applying the remedy")]
+async fn assert_remedy_command_agrees(world: &mut E2eWorld) {
+    let diagnosis = world.cli_output.as_ref().expect("no diagnosis output");
+    let preview = world.cli_stderr.as_ref().expect("no fix preview output");
+    let cause = section_for(diagnosis, DEVICE_PERMISSION_FIX_ID).unwrap_or_else(|| {
+        panic!(
+            "the symptom did not produce the device-permission cause, so there is nothing to \
+             compare:\n{diagnosis}"
+        )
+    });
+    let from_diagnosis = proposed_group_command(&cause)
+        .unwrap_or_else(|| panic!("the diagnosis proposed no group command:\n{cause}"));
+    let from_preview = proposed_group_command(preview)
+        .unwrap_or_else(|| panic!("the fix preview proposed no group command:\n{preview}"));
+    // Compare the groups rather than the whole line: the two renderings name the
+    // user differently (one leaves `$USER` for the shell, the other resolves it),
+    // and that difference is presentation, not disagreement about the remedy.
+    assert_eq!(
+        groups_in_command(&from_diagnosis),
+        groups_in_command(&from_preview),
+        "the diagnosis and the fix preview would add the user to different groups:\n  \
+         diagnosis: {from_diagnosis}\n  preview:   {from_preview}"
+    );
+}
+
+// ── Device group states induced for the machine under test ─────────
+
+#[given("the GPU device belongs to a group the machine cannot name")]
+async fn given_unnameable_device_group(world: &mut E2eWorld) {
+    // What `stat` itself prints for an owning id with no entry in the group
+    // database — the state a container inherits when the device's group exists
+    // on the host but not inside.
+    world.path_override = Some(crate::stat_shim_path(
+        world,
+        GPU_DEVICE,
+        "crw-rw----",
+        "root",
+        "UNKNOWN",
+    ));
+}
+
+#[given("the GPU device belongs to a recognised non-default group")]
+async fn given_non_default_device_group(world: &mut E2eWorld) {
+    // Any real group on this machine other than the one the fix recipe assumes.
+    // `video` is excluded too: the remedy adds it alongside, so using it would
+    // make the two sides agree by coincidence.
+    let group = crate::machine_group_names()
+        .into_iter()
+        .find(|name| name != DEFAULT_DEVICE_GROUP && name != "video")
+        .expect("this machine names no group other than the default");
+    world.path_override = Some(crate::stat_shim_path(
+        world,
+        GPU_DEVICE,
+        "crw-rw----",
+        "root",
+        &group,
+    ));
+}
+
+#[given("the user can already read and write the GPU device")]
+async fn given_usable_device(world: &mut E2eWorld) {
+    // Two halves of one situation: the device is open to everyone, AND the user
+    // is in none of the groups conventionally used to reach it. Both are
+    // substituted rather than hoped for — the GPU runner's user IS in those
+    // groups, which makes the finding score zero there for a reason that has
+    // nothing to do with the access the scenario is about (measured: it passed
+    // on MI300X until the group answer was substituted too).
+    crate::stat_shim_path(world, GPU_DEVICE, "crw-rw-rw-", "root", "root");
+    let path = crate::id_shim_path(world, &["users"]);
+    // Prove the premise through the CLI's own eyes before relying on it: if the
+    // inspection does not agree the device is usable, the scenario would be
+    // measuring something else.
+    let (report, _, _) =
+        crate::run_rocm_with_env(world, &["examine", "--json"], &[("PATH", path.as_str())]);
+    let json: serde_json::Value = serde_json::from_str(&report)
+        .unwrap_or_else(|e| panic!("`examine --json` did not emit valid JSON ({e}):\n{report}"));
+    // Read the GPU device the scenario shimmed, by name. The report describes
+    // several devices — the single `kfd` and each entry of `render_devices` —
+    // and they all carry these same field names, so a search for the first one
+    // anywhere in the document would be answered by whichever device happened to
+    // come first rather than by the one under test.
+    let device = json.get(GPU_DEVICE_FIELD).unwrap_or_else(|| {
+        panic!("`examine --json` describes no `{GPU_DEVICE_FIELD}` device:\n{report}")
+    });
+    for field in ["user_can_read", "user_can_write"] {
+        let stated = device.get(field).and_then(serde_json::Value::as_bool);
+        assert_eq!(
+            stated,
+            Some(true),
+            "the inspection does not report {GPU_DEVICE} as {field}, so the premise this scenario \
+             needs is absent:\n{report}"
+        );
+    }
+    world.path_override = Some(path);
+}
+
+#[when("the user asks the CLI to diagnose a device-permission failure")]
+async fn user_diagnoses_device_permission(world: &mut E2eWorld) {
+    let path = world
+        .path_override
+        .clone()
+        .expect("no shimmed PATH prepared");
+    let (stdout, _, rc) = crate::run_rocm_with_env(
+        world,
+        &["diagnose", "--symptom", DEVICE_PERMISSION_SYMPTOM],
+        &[("PATH", path.as_str())],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user asks the CLI to diagnose the machine")]
+async fn user_diagnoses_machine(world: &mut E2eWorld) {
+    let path = world
+        .path_override
+        .clone()
+        .expect("no shimmed PATH prepared");
+    // No symptom: the question is what this machine looks like, not what a
+    // particular error message suggests.
+    let (stdout, _, rc) =
+        crate::run_rocm_with_env(world, &["diagnose", "--json"], &[("PATH", path.as_str())]);
+    world.cli_output = Some(stdout);
+    world.cli_rc = Some(rc);
+}
+
+#[then("every group named in the remedy exists on the machine")]
+async fn assert_named_groups_exist(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let cause = section_for(output, DEVICE_PERMISSION_FIX_ID).unwrap_or_else(|| {
+        panic!("the symptom did not produce the device-permission cause:\n{output}")
+    });
+    let command = proposed_group_command(&cause)
+        .unwrap_or_else(|| panic!("the diagnosis proposed no group command:\n{cause}"));
+    let known = crate::machine_group_names();
+    let unknown: Vec<String> = groups_in_command(&command)
+        .into_iter()
+        .filter(|group| !known.iter().any(|name| name == group))
+        .collect();
+    // Handing the user a command naming a group that does not exist gives them
+    // something that cannot work and no way to see why.
+    assert!(
+        unknown.is_empty(),
+        "the remedy tells the user to join {unknown:?}, which this machine does not \
+         recognise:\n  {command}"
+    );
+}
+
+#[then("adding the user to a device group is not the leading remedy")]
+async fn assert_no_device_group_remedy(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let report: serde_json::Value =
+        serde_json::from_str(output).expect("diagnose --json did not emit valid JSON");
+    let matched = report
+        .get("matched")
+        .and_then(|m| m.as_array())
+        .expect("diagnose JSON has no 'matched' array");
+    let offered = matched.iter().find(|entry| {
+        entry.get("id").and_then(serde_json::Value::as_str) == Some(DEVICE_PERMISSION_FIX_ID)
+    });
+    let score = offered
+        .and_then(|entry| entry.get("score"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    // Belonging to a conventional group is one way to reach the device, not the
+    // point of doing so. With access already demonstrated, repairing permissions
+    // is not a cause of anything, and offering it sends the user to change their
+    // group membership for no reason.
+    assert_eq!(
+        score, 0,
+        "the device is readable and writable, yet the diagnosis still offers \
+         '{DEVICE_PERMISSION_FIX_ID}' as a cause (score {score})"
+    );
+}
+
 #[then("the file the fix would have changed is untouched")]
 async fn assert_rc_file_untouched(world: &mut E2eWorld) {
     let rc_file = fix_rc_file(world);

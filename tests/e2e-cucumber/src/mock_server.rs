@@ -644,6 +644,12 @@ impl MockServer {
 /// record shape.
 #[derive(Debug, Clone, Copy)]
 pub struct ServiceRecordOptions {
+    /// Id of the recorded service, used both as the record's own `service_id`
+    /// and as its file name. Defaults to `e2e-mock`, which the cucumber
+    /// teardown recognises as the planted record with no process behind it and
+    /// leaves alone; a scenario that registers a REAL process it owns passes its
+    /// own id so that teardown also tries to stop it.
+    pub service_id: &'static str,
     pub status: &'static str,
     pub startup_phase: Option<&'static str>,
     pub supervisor_pid: u32,
@@ -653,6 +659,7 @@ pub struct ServiceRecordOptions {
 impl Default for ServiceRecordOptions {
     fn default() -> Self {
         Self {
+            service_id: "e2e-mock",
             status: "ready",
             startup_phase: None,
             supervisor_pid: 0,
@@ -685,11 +692,12 @@ pub fn write_service_record_with(
     options: ServiceRecordOptions,
 ) {
     std::fs::create_dir_all(services_dir).expect("failed to create services dir");
+    let manifest = services_dir.join(format!("{}.json", options.service_id));
 
     // The CLI only extracts host:port from `endpoint_url` and appends
     // `/v1/models` for its readiness probe, which the mock serves.
     let record = json!({
-        "service_id": "e2e-mock",
+        "service_id": options.service_id,
         "engine": "vllm",
         "model_ref": model,
         "canonical_model_id": model,
@@ -711,13 +719,13 @@ pub fn write_service_record_with(
         "engine_recipe_json": null,
         "restart_count": 0,
         "last_restart_unix_ms": null,
-        "manifest_path": services_dir.join("e2e-mock.json"),
-        "log_path": services_dir.join("e2e-mock.log"),
-        "engine_state_path": services_dir.join("e2e-mock.state.json"),
+        "manifest_path": manifest,
+        "log_path": services_dir.join(format!("{}.log", options.service_id)),
+        "engine_state_path": services_dir.join(format!("{}.state.json", options.service_id)),
         "created_at_unix_ms": 1_700_000_000_000_u64,
     });
     std::fs::write(
-        services_dir.join("e2e-mock.json"),
+        &manifest,
         serde_json::to_vec_pretty(&record).expect("failed to serialize record"),
     )
     .expect("failed to write service record");
