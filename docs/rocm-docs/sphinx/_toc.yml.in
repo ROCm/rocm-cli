@@ -3,6 +3,7 @@ subtrees:
   - caption: Demos
     entries:
       - file: demos
+        title: See ROCm CLI in action
   - caption: Install
     entries:
       - file: install/installation
