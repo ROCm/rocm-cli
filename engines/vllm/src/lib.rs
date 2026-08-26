@@ -71,8 +71,13 @@ import sys
 sys.argv[0] = 'vllm'
 import torch
 torch.cuda.set_device(0)
+original_get_device_properties = torch.cuda.get_device_properties
+def managed_get_device_properties(device=None):
+    return original_get_device_properties(0 if device == 'cuda' else device)
+torch.cuda.get_device_properties = managed_get_device_properties
 import vllm.platforms
 from vllm.platforms.rocm import RocmPlatform
+torch.cuda.get_device_properties = original_get_device_properties
 vllm.platforms._current_platform = RocmPlatform()
 from vllm.entrypoints.cli.main import main
 main()
@@ -2771,17 +2776,25 @@ mod tests {
         let device_initialization = script
             .find("torch.cuda.set_device(0)")
             .expect("bootstrap must initialize logical GPU zero");
+        let device_normalization = script
+            .find("0 if device == 'cuda' else device")
+            .expect("bootstrap must normalize vLLM's unindexed CUDA device");
         let rocm_import = script
             .find("from vllm.platforms.rocm import RocmPlatform")
             .expect("bootstrap must import the ROCm platform");
+        let restore = script
+            .find("torch.cuda.get_device_properties = original_get_device_properties")
+            .expect("bootstrap must restore the torch API after importing vLLM");
         let platform_assignment = script
             .find("_current_platform = RocmPlatform()")
             .expect("bootstrap must seed the ROCm platform singleton");
         let main_import = script
             .find("from vllm.entrypoints.cli.main import main")
             .expect("bootstrap must invoke the pinned CLI entry point");
-        assert!(device_initialization < rocm_import);
-        assert!(rocm_import < platform_assignment);
+        assert!(device_initialization < device_normalization);
+        assert!(device_normalization < rocm_import);
+        assert!(rocm_import < restore);
+        assert!(restore < platform_assignment);
         assert!(platform_assignment < main_import);
         assert!(script.contains("sys.argv[0] = 'vllm'"));
     }
