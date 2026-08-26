@@ -946,7 +946,7 @@ fn install_wheel_runtime(
     );
     let _ = writeln!(
         output,
-        "  package_policy: find the newest TheRock ROCm SDK version that has a matching PyTorch stack in the same index, then install pinned rocm[libraries,devel], torch, torchvision, and torchaudio versions in one uv transaction"
+        "  package_policy: find the newest TheRock ROCm SDK version that has a matching PyTorch stack in the same index, then install pinned rocm[libraries,devel,device-all], torch, torchvision, and torchaudio versions in one uv transaction"
     );
     if dry_run {
         let env_python = venv_python_path(&install_root);
@@ -1077,7 +1077,10 @@ fn install_wheel_runtime(
 
 fn therock_pip_package_specs(package_versions: &TheRockPipPackageVersions) -> Vec<String> {
     vec![
-        format!("rocm[libraries,devel]=={}", package_versions.rocm),
+        format!(
+            "rocm[libraries,devel,device-all]=={}",
+            package_versions.rocm
+        ),
         format!("torch=={}", package_versions.torch),
         format!("torchvision=={}", package_versions.torchvision),
         format!("torchaudio=={}", package_versions.torchaudio),
@@ -1301,7 +1304,7 @@ fn resolve_pip_runtime_from_index(
     .with_context(|| {
         let requested = version_selector.map_or_else(|| "latest compatible version".to_owned(), RuntimeVersionSelector::describe);
         format!(
-            "no mutually compatible TheRock rocm[libraries,devel], torch, torchvision, and torchaudio versions were found for {requested} in {index_url}"
+            "no mutually compatible TheRock rocm[libraries,devel,device-all], torch, torchvision, and torchaudio versions were found for {requested} in {index_url}"
         )
     })?;
     let latest_version = package_versions.rocm.clone();
@@ -4574,7 +4577,7 @@ mod tests {
         assert_eq!(
             package_specs,
             vec![
-                "rocm[libraries,devel]==7.13.0a20260513".to_owned(),
+                "rocm[libraries,devel,device-all]==7.13.0a20260513".to_owned(),
                 "torch==2.10.0+rocm7.13.0a20260513".to_owned(),
                 "torchvision==0.25.0+rocm7.13.0a20260513".to_owned(),
                 "torchaudio==2.10.0+rocm7.13.0a20260513".to_owned(),
