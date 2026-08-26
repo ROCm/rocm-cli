@@ -32,9 +32,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const ENGINE_NAME: &str = "vllm";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const HEALTHCHECK_TIMEOUT_MS: u64 = 700;
-// Platform detection diagnostics precede the final Python traceback; retain
-// enough lines to include the actual plugin rejection reason in startup errors.
-const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 300;
+const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
 const MAX_TAIL_READ: u64 = 4 * 1024 * 1024;
 /// How long a stop waits for the server to actually exit after each signal
 /// before reporting a timeout (or, under `force`, escalating to `SIGKILL`).
@@ -65,6 +63,18 @@ const VLLM_PINNED_SPEC: &str = "vllm==0.26.0+rocm723";
 /// what lets [`vllm_rocm_build_from_index_url`] recover the build a custom
 /// index serves and keep the requirement pinned to it.
 const VLLM_ROCM_INDEX_PREFIX: &str = "https://wheels.vllm.ai/rocm";
+/// Managed TheRock runtimes already passed rocm-cli's strict ROCm GPU checks.
+/// Seed vLLM's pinned platform singleton before its CLI builds default configs,
+/// avoiding its separate AMD SMI auto-detection path in the managed environment.
+const MANAGED_ROCM_VLLM_BOOTSTRAP: &str = r"
+import sys
+sys.argv[0] = 'vllm'
+import vllm.platforms
+from vllm.platforms.rocm import RocmPlatform
+vllm.platforms._current_platform = RocmPlatform()
+from vllm.entrypoints.cli.main import main
+main()
+";
 /// Default time to wait for vLLM to report readiness before giving up.
 const DEFAULT_VLLM_READY_TIMEOUT: Duration = Duration::from_mins(5);
 
@@ -916,6 +926,18 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
     }
 }
 
+fn vllm_command_for_runtime(runtime: &VllmRuntime) -> ProcessCommand {
+    if runtime_is_managed(runtime)
+        && let Some(python) = runtime.python_executable.as_ref()
+    {
+        let mut command = ProcessCommand::new(python);
+        command.args(["-c", MANAGED_ROCM_VLLM_BOOTSTRAP]);
+        command
+    } else {
+        ProcessCommand::new(&runtime.command)
+    }
+}
+
 fn spawn_vllm_server(
     request: &ServeHttpRequest,
     runtime: &VllmRuntime,
@@ -982,7 +1004,7 @@ the ROCm SDK's bundled numa uses renamed symbol versions and cannot satisfy it, 
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let mut command = ProcessCommand::new(&runtime.command);
+    let mut command = vllm_command_for_runtime(runtime);
     command
         .args(vllm_serve_args(
             &request.model_ref,
@@ -1673,9 +1695,7 @@ print(json.dumps({"present": spec is not None, "version": version}))
 }
 
 fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRuntime) -> Result<()> {
-    command
-        .env("VLLM_TARGET_DEVICE", "rocm")
-        .env("VLLM_LOGGING_LEVEL", "DEBUG");
+    command.env("VLLM_TARGET_DEVICE", "rocm");
     if let Some(target_family) = therock_device_target(runtime) {
         command.env("ROCM_SDK_TARGET_FAMILY", target_family);
     }
@@ -2722,6 +2742,41 @@ mod tests {
     }
 
     #[test]
+    fn managed_runtime_uses_explicit_rocm_platform_bootstrap() {
+        let python = PathBuf::from("/runtime/bin/python");
+        let runtime = VllmRuntime {
+            runtime_id: "therock-release:gfx94X-dcgpu".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("/runtime/bin/vllm"),
+            python_executable: Some(python.clone()),
+            version: Some("0.26.0+rocm723".to_owned()),
+            source: "managed_runtime_manifest:test".to_owned(),
+            sdk_root: Some(PathBuf::from("/runtime/sdk")),
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+        };
+
+        let command = vllm_command_for_runtime(&runtime);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(command.get_program(), python.as_os_str());
+        assert_eq!(args.first().map(String::as_str), Some("-c"));
+        let script = args.get(1).expect("bootstrap script argument");
+        let platform_assignment = script
+            .find("_current_platform = RocmPlatform()")
+            .expect("bootstrap must seed the ROCm platform singleton");
+        let main_import = script
+            .find("from vllm.entrypoints.cli.main import main")
+            .expect("bootstrap must invoke the pinned CLI entry point");
+        assert!(platform_assignment < main_import);
+        assert!(script.contains("sys.argv[0] = 'vllm'"));
+    }
+
+    #[test]
     fn vllm_serve_args_forward_recipe_gpu_memory_utilization() {
         let hint = EngineRecipeHint {
             contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
@@ -3595,11 +3650,6 @@ mod tests {
         let mut command = ProcessCommand::new("vllm");
 
         apply_therock_env(&mut command, &runtime)?;
-        let logging_level = command
-            .get_envs()
-            .find_map(|(key, value)| (key == "VLLM_LOGGING_LEVEL").then_some(value))
-            .flatten();
-        assert_eq!(logging_level, Some(std::ffi::OsStr::new("DEBUG")));
 
         let target_device = command
             .get_envs()
