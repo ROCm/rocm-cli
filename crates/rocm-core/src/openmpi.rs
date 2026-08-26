@@ -542,7 +542,7 @@ fn scan_libnuma_path() -> Option<PathBuf> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PackageManager {
+pub(crate) enum PackageManager {
     Apt,
     Dnf,
     Zypper,
@@ -550,7 +550,7 @@ enum PackageManager {
 }
 
 impl PackageManager {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Apt => "apt",
             Self::Dnf => "dnf",
@@ -1003,7 +1003,7 @@ pub fn is_protected_rocm_package(package: &str) -> bool {
     PREFIXES.iter().any(|prefix| package.starts_with(prefix))
 }
 
-fn resolve_package_manager(os_id: &str, id_like: &str) -> Option<PackageManager> {
+pub(crate) fn resolve_package_manager(os_id: &str, id_like: &str) -> Option<PackageManager> {
     const APT: &[&str] = &[
         "ubuntu",
         "debian",
