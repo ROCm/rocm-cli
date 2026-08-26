@@ -82,6 +82,7 @@ jobs:
       heavy: ${{ steps.filter.outputs.heavy || steps.all.outputs.forced }}
       lint: ${{ steps.filter.outputs.lint || steps.all.outputs.forced }}
       tpn: ${{ steps.filter.outputs.tpn || steps.all.outputs.forced }}
+      docs: ${{ steps.filter.outputs.docs || steps.all.outputs.forced }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -147,6 +148,15 @@ jobs:
               - '**/*.ps1'
               - 'ruff.toml'
               - 'PSScriptAnalyzerSettings.psd1'
+              - '.github/workflows/**'
+            # Sphinx docs site: the doc sources themselves, plus README.md and
+            # CONTRIBUTING.md, which several pages single-source via MyST
+            # `{include}` directives, plus the build config/toolchain pins.
+            docs:
+              - 'docs/rocm-docs/**'
+              - 'README.md'
+              - 'CONTRIBUTING.md'
+              - '.readthedocs.yaml'
               - '.github/workflows/**'
 
       - name: Force full run off pull requests
@@ -617,6 +627,37 @@ jobs:
       - name: Check license headers
         run: |
           "${HAWKEYE_INSTALL_DIR}/hawkeye" check
+
+  docs-build:
+    name: Sphinx docs build (-W)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [changes]
+    # A manual E2E dispatch only exercises the E2E jobs; skip the rest. Off a
+    # dispatch, `needs.changes` never ran, so short-circuit on event_name first.
+    if: github.event_name != 'workflow_dispatch' && needs.changes.outputs.docs == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Cache pip packages
+        id: cache-pip
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-docs-pip-${{ hashFiles('docs/rocm-docs/sphinx/requirements.txt') }}
+
+      - name: Install Sphinx toolchain
+        run: |
+          python3 -m venv .docs-venv
+          .docs-venv/bin/pip install -q -r docs/rocm-docs/sphinx/requirements.txt
+
+      # Same source Sphinx points at (docs/rocm-docs/conf.py) and the same
+      # -W (warnings-as-errors) mode read-the-docs builds with, so a broken
+      # MyST include, dead xref, or toctree gap fails CI instead of surfacing
+      # as a silent RTD build failure after merge.
+      - name: Build docs (warnings as errors)
+        run: |
+          .docs-venv/bin/sphinx-build -b html docs/rocm-docs /tmp/rocm-cli-docs -W
 
   commit-signatures:
     name: Commit signatures + sign-off
