@@ -240,7 +240,7 @@ impl E2eWorld {
         // CLI's OWN vLLM readiness cap to match. `rocm serve --managed` otherwise
         // SIGTERM-kills a vLLM that isn't ready within its default (5 min,
         // EAI-7393), which a large model's cold load legitimately exceeds — so
-        // extending only the harness's poll (wait_for_model) isn't enough; the CLI
+        // extending only the harness's poll (`model_is_ready`) isn't enough; the CLI
         // would kill the server first. Keeping the two in lockstep makes the
         // big-model serve actually reach ready (verified on MI300X with Qwen3.6-27B).
         if let Some(secs) = self.serve_timeout_override {
@@ -482,6 +482,20 @@ fn last_line(text: &str) -> String {
 
 // ── Shared helpers ─────────────────────────────────────────────────
 
+/// The suite's artifact directory.
+///
+/// This is the ONLY path CI uploads (see the `upload-artifact` steps in
+/// `.github/workflows/e2e-selfhosted.yml`), so anything a failure needs to
+/// survive the run has to be written under here; a scenario's own isolated
+/// `TempDir` is gone by the time the artifact is collected.
+///
+/// Unlike [`results_dir`] this only computes the path and never creates it, so
+/// it is safe to call from a failure path where a second panic would replace the
+/// report being written.
+pub fn results_path() -> PathBuf {
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/results"))
+}
+
 pub fn rocm_binary() -> String {
     std::env::var("ROCM_CLI_BINARY").unwrap_or_else(|_| "rocm".to_string())
 }
@@ -634,7 +648,7 @@ fn record_command(scenario: Option<&str>, args: &[&str], rc: i32, stdout: &str) 
         "engine": engine,
         "engine_is_default": engine_is_default,
     });
-    let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/results"));
+    let dir = results_path();
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
@@ -897,7 +911,7 @@ pub async fn send_chat(world: &mut E2eWorld) {
 // ── Runner ─────────────────────────────────────────────────────────
 
 fn results_dir() -> PathBuf {
-    let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/results"));
+    let dir = results_path();
     std::fs::create_dir_all(&dir).expect("failed to create results directory");
     dir
 }
