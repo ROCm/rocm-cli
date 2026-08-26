@@ -37,12 +37,12 @@ for Lemonade and vLLM.
 <!-- platform-support-table-end -->
 
 Live dashboard telemetry requires Linux or WSL2 (see
-[Interactive interfaces](#interactive-interfaces)). vLLM serving is Linux/WSL2
+[Interactive interfaces](#interactive-interfaces)). vLLM serving is Linux or WSL2
 only (see [docs/vllm.md](docs/vllm.md)).
 
 > [!IMPORTANT]
 > **Tech Preview** -- This software is provided as-is, without warranty or
-> guarantee of stability. APIs, commands, and behavior may change without
+> guarantee of stability. APIs, commands, and behavior might change without
 > notice. Intended for experimentation and early feedback only.
 
 ## Demos
@@ -73,7 +73,7 @@ The installer downloads a prebuilt bundle, verifies its SHA-256 checksum,
 installs the `rocm` and `rocmd` binaries into `~/.local/bin`, and adds that
 directory to your shell `PATH`. Rerun it any time to upgrade.
 
-### Linux / WSL (x86_64)
+### Linux and WSL (x86_64)
 
 Only nightly builds are published today, so pass the `nightly` channel:
 
@@ -226,7 +226,7 @@ requirements.
 
 ```
 rocm install sdk    [--channel release|nightly] [--format wheel|tarball]
-                    [--version X.Y.Z | --build-date YYYY-MM-DD]
+                    [--version x.y.z | --build-date YYYY-MM-DD]
                     [--family gfx110X-all] [--prefix PATH] [--dry-run]
 
 rocm install driver [--dkms] [--yes] [--dry-run] [--reconcile]
@@ -254,7 +254,7 @@ rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
 ```
 
 `adopt` registers an existing TheRock-based Python environment as a managed
-runtime. It does not work with standard ROCm package installs (e.g.
+runtime. It does not work with standard ROCm package installs (for example,
 `/opt/rocm`); use `rocm install sdk` instead.
 
 ### Disk space
@@ -342,15 +342,15 @@ to stop the server instead. `--managed` is the explicit form of the default
 background behavior. `--no-smoke-test` skips the post-startup inference probe.
 
 Which model form to pass depends on the engine your GPU selects. The Lemonade
-engine (Ryzen AI / Radeon) serves llama.cpp **GGUF** models — pass a GGUF repo
-with an explicit quantization variant, e.g.
+engine (Ryzen AI or Radeon) serves llama.cpp **GGUF** models — pass a GGUF repo
+with an explicit quantization variant, for example,
 `rocm serve unsloth/Qwen3-0.6B-GGUF:Q4_0`. The vLLM engine (Instinct) serves
-**safetensors** repos, e.g. `rocm serve Qwen/Qwen2.5-1.5B-Instruct`. A
+**safetensors** repos, such as `rocm serve Qwen/Qwen2.5-1.5B-Instruct`. A
 safetensors-only id has no GGUF build, so serving it through Lemonade fails
 rather than silently substituting a different model. Short
-aliases from `rocm model` may not resolve with all engines.
+aliases from `rocm model` might not resolve with all engines.
 
-Some models (e.g., Llama) are gated and require HuggingFace authentication.
+Some models (such as Llama) are gated and require HuggingFace authentication.
 Log in with `huggingface-cli login` or set `HF_TOKEN` in your environment
 before serving gated models.
 
@@ -375,7 +375,7 @@ rocm model [--verbose]
 the hardware path they target — Strix Halo (Lemonade / llama.cpp) and MI300X
 (vLLM) — using canonical Hugging Face ids, and shows for each the quantization
 that fits a single GPU. Strix Halo entries use the `owner/repo:variant` GGUF form
-(e.g. `unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M`) that `rocm serve` needs; MI300X
+(for example, `unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M`) that `rocm serve` needs; MI300X
 entries serve at BF16. This catalog ships inside the binary, so it is available
 offline; when a recipe index is configured instead, the header names it.
 `--verbose` also lists the other recipes (the default assistant and smoke/test

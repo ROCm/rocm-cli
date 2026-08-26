@@ -12,11 +12,11 @@ Thank you for your interest in contributing. This document explains how to get s
 
 By participating in this project you agree to abide by the [Code of Conduct](https://github.com/ROCm/rocm-cli/blob/main/CODE_OF_CONDUCT.md).
 
-## Issue Tracking
+## Issue tracking
 
 Bug reports and feature requests are tracked as [GitHub Issues](https://github.com/ROCm/rocm-cli/issues). Before opening a new issue, search existing ones to avoid duplicates.
 
-## Branch and Commit Naming
+## Branch and commit naming
 
 Use [Conventional Commits](https://www.conventionalcommits.org/) for commit messages:
 
@@ -34,7 +34,7 @@ feat/vllm-multi-gpu
 fix/vram-probe-fallback
 ```
 
-## Development Setup
+## Development setup
 
 Prerequisites: Rust (see `rust-toolchain.toml` for the pinned version) and [uv](https://github.com/astral-sh/uv) (for prek and scripts).
 
@@ -74,7 +74,7 @@ cargo install cargo-about@0.9.1 --locked --features cli   # optional, for THIRD_
 
 See `docs/testing.md` for the full test guide and `docs/manual-testing.md` for manual QA steps.
 
-## Making Changes
+## Making changes
 
 1. **Fork** the repository and create a branch from `main`.
 2. **Make your changes.** Keep commits focused — one logical change per commit.
@@ -84,7 +84,7 @@ See `docs/testing.md` for the full test guide and `docs/manual-testing.md` for m
 
 ### Commit signing and sign-off
 
-Commits must be both cryptographically **signed** and carry a DCO **`Signed-off-by`** trailer. Use `git commit -s` to add the trailer automatically. This is enforced by the prek hooks and by a blocking CI check.
+Commits must be both cryptographically **signed** and carry a Developer Certificate of Origin (DCO) **`Signed-off-by`** trailer. Use `git commit -s` to add the trailer automatically. This is enforced by the prek hooks and by a blocking CI check.
 
 Enable SSH signing once with:
 
@@ -102,7 +102,7 @@ See `docs/commit-signatures.md` for GPG signing, GitHub "Verified" status, and t
 - No secrets, credentials, or internal hostnames in committed files
 - Third-party dependencies declared in `Cargo.lock`; license headers present on new source files (see `licenserc.toml`)
 
-## Reporting Security Issues
+## Reporting security issues
 
 Do **not** open a public GitHub Issue for security vulnerabilities. See [SECURITY.md](https://github.com/ROCm/rocm-cli/blob/main/SECURITY.md) for the responsible disclosure process.
 
