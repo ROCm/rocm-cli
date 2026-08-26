@@ -1,0 +1,18 @@
+root: index
+subtrees:
+  - caption: Demos
+    entries:
+      - file: demos
+  - caption: Install
+    entries:
+      - file: install/installation
+  - caption: Getting started
+    entries:
+      - file: getting-started
+  - caption: Commands
+    entries:
+      - file: commands
+  - caption: About
+    entries:
+      - file: about/contributing
+      - file: about/license

@@ -124,7 +124,7 @@ Or copy the release binaries onto your `PATH`:
 install -m 0755 target/release/rocm target/release/rocmd ~/.local/bin/
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development setup, test
+See [CONTRIBUTING.md](https://github.com/ROCm/rocm-cli/blob/main/CONTRIBUTING.md) for the full development setup, test
 commands, and commit-signing requirements.
 
 ## First run
@@ -175,7 +175,7 @@ Live mode reads telemetry over a Unix domain socket, so it requires Linux or
 WSL. Use `rocm dash --demo` for a synthetic session that runs anywhere without a
 GPU or daemon.
 
-## Getting started
+## Configure ROCm and serve a model
 
 Before serving a model, ensure a managed ROCm runtime is configured:
 
@@ -196,7 +196,7 @@ rocm serve qwen
 
 `qwen` is a built-in alias for a small assistant model that serves out of the
 box. You can also serve any compatible Hugging Face model directly — see
-[Model serving](#model-serving) for the GGUF-vs-safetensors rule, since which
+[Model serving](https://github.com/ROCm/rocm-cli#model-serving) for the GGUF-vs-safetensors rule, since which
 form works depends on the engine your GPU selects.
 
 Use `rocm model` to see available model recipes and their GPU memory
@@ -399,7 +399,7 @@ rocm dash [--demo] [--replay <file>]
 Full-screen TUI with Home, ROCm, Serving, Observe, and Chat tabs — GPU
 utilization graphs, active serving instances, benchmark results, guided actions,
 and a chat tab backed by any configured provider. See
-[Interactive interfaces](#interactive-interfaces) for the tab breakdown.
+[Interactive interfaces](https://github.com/ROCm/rocm-cli#interactive-interfaces) for the tab breakdown.
 
 - `--demo` runs a deterministic synthetic session with no GPU or daemon needed,
   works on all platforms.
