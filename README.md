@@ -198,7 +198,7 @@ rocm serve qwen
 
 `qwen` is a built-in alias for a small assistant model that serves out of the
 box. You can also serve any compatible Hugging Face model directly — see
-[Model serving](https://github.com/ROCm/rocm-cli#model-serving) for the GGUF-vs-safetensors rule, since which
+[Model serving](#model-serving) for the GGUF-vs-safetensors rule, since which
 form works depends on the engine your GPU selects.
 
 Use `rocm model` to see available model recipes and their GPU memory
@@ -401,7 +401,7 @@ rocm dash [--demo] [--replay <file>]
 Full-screen TUI with Home, ROCm, Serving, Observe, and Chat tabs — GPU
 utilization graphs, active serving instances, benchmark results, guided actions,
 and a chat tab backed by any configured provider. See
-[Interactive interfaces](https://github.com/ROCm/rocm-cli#interactive-interfaces) for the tab breakdown.
+[Interactive interfaces](#interactive-interfaces) for the tab breakdown.
 
 - `--demo` runs a deterministic synthetic session with no GPU or daemon needed,
   works on all platforms.
