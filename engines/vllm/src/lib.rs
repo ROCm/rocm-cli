@@ -69,6 +69,8 @@ const VLLM_ROCM_INDEX_PREFIX: &str = "https://wheels.vllm.ai/rocm";
 const MANAGED_ROCM_VLLM_BOOTSTRAP: &str = r"
 import sys
 sys.argv[0] = 'vllm'
+import torch
+torch.cuda.set_device(0)
 import vllm.platforms
 from vllm.platforms.rocm import RocmPlatform
 vllm.platforms._current_platform = RocmPlatform()
@@ -2766,12 +2768,20 @@ mod tests {
         assert_eq!(command.get_program(), python.as_os_str());
         assert_eq!(args.first().map(String::as_str), Some("-c"));
         let script = args.get(1).expect("bootstrap script argument");
+        let device_initialization = script
+            .find("torch.cuda.set_device(0)")
+            .expect("bootstrap must initialize logical GPU zero");
+        let rocm_import = script
+            .find("from vllm.platforms.rocm import RocmPlatform")
+            .expect("bootstrap must import the ROCm platform");
         let platform_assignment = script
             .find("_current_platform = RocmPlatform()")
             .expect("bootstrap must seed the ROCm platform singleton");
         let main_import = script
             .find("from vllm.entrypoints.cli.main import main")
             .expect("bootstrap must invoke the pinned CLI entry point");
+        assert!(device_initialization < rocm_import);
+        assert!(rocm_import < platform_assignment);
         assert!(platform_assignment < main_import);
         assert!(script.contains("sys.argv[0] = 'vllm'"));
     }
