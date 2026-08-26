@@ -27,12 +27,14 @@ A single prebuilt binary for Linux and Windows (x86_64). No Python, Rust, or
 existing ROCm install required. Ships with inference engine adapters for
 Lemonade and vLLM.
 
+<!-- platform-support-table-start -->
 | Platform | Prebuilt binary | Notes |
 |---|---|---|
 | Linux (x86_64) | Yes | Full support, including the live dashboard and both inference engines |
 | Windows (x86_64) | Yes | CLI and Lemonade serving; no live dashboard or vLLM |
 | WSL2 (x86_64) | Yes (Linux binary) | Full support, including the live dashboard; see [docs/wsl.md](docs/wsl.md) for setup |
 | macOS | No | No official installer, release, CI, or QA coverage |
+<!-- platform-support-table-end -->
 
 Live dashboard telemetry requires Linux or WSL2 (see
 [Interactive interfaces](#interactive-interfaces)). vLLM serving is Linux/WSL2
