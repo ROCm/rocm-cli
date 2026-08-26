@@ -494,28 +494,6 @@ pub fn run(channel: &str, keep: usize, prewarm_dir: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn ensure_default_engine(rocm: &Path, prewarm_dir: &Path) -> Result<()> {
-    let output = rocm_command(rocm, prewarm_dir)
-        .args(["engines", "list"])
-        .output()
-        .context("failed to run `rocm engines list`")?;
-    if !output.status.success() {
-        bail!("`rocm engines list` exited with {}", output.status);
-    }
-    let inventory = String::from_utf8_lossy(&output.stdout);
-    let engine = default_engine_from_inventory(&inventory)
-        .context("`rocm engines list` did not identify a default engine")?;
-    rocm_command(rocm, prewarm_dir)
-        .args(["engines", "install", engine, "--yes"])
-        .status_ok("rocm engines install")
-}
-
-fn default_engine_from_inventory(inventory: &str) -> Option<&str> {
-    inventory
-        .lines()
-        .find_map(|line| line.strip_prefix("* ")?.split_whitespace().next())
-}
-
 /// Whether `decision` put a new runtime in the tree, and so whether the registry
 /// check and the retention prune at the end of [`run`] have anything to do.
 ///

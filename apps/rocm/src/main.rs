@@ -3799,6 +3799,7 @@ fn engines(command: EnginesCommand) -> Result<()> {
             if response.managed_env == Some(false) {
                 println!("  note: external runtime");
             } else {
+                settle_engine_install(&paths, &engine, &runtime_id, &response)?;
                 let engine_config = config.engine_config_mut(&engine);
                 engine_config.last_installed_runtime_id = Some(runtime_id.clone());
                 engine_config.last_installed_env_id = Some(response.env_id.clone());
