@@ -1921,11 +1921,31 @@ fn runtime_bin_paths(runtime: &VllmRuntime) -> Vec<PathBuf> {
     dedupe_paths(entries)
 }
 
-fn therock_library_path_entries(runtime: &VllmRuntime) -> Vec<PathBuf> {
-    let Some(root) = runtime.sdk_root.as_ref() else {
-        return dedupe_paths(runtime.sdk_library_paths.clone());
+fn managed_vllm_library_dirs(runtime: &VllmRuntime) -> Vec<PathBuf> {
+    let Some(site_packages) = runtime.sdk_library_paths.iter().find_map(|path| {
+        path.ancestors().find(|ancestor| {
+            ancestor
+                .file_name()
+                .is_some_and(|name| name == "site-packages")
+        })
+    }) else {
+        return Vec::new();
     };
-    let mut entries = runtime.sdk_library_paths.clone();
+    vec![
+        site_packages.join("torch").join("lib"),
+        site_packages.join("amdsmi"),
+    ]
+}
+
+fn therock_library_path_entries(runtime: &VllmRuntime) -> Vec<PathBuf> {
+    // vLLM pins a self-contained torch/ROCm stack. Its binary directories must
+    // precede the canonical SDK's same-named libraries; mixing those ABIs makes
+    // torch report zero GPUs before vLLM can initialize its ROCm platform.
+    let mut entries = managed_vllm_library_dirs(runtime);
+    entries.extend(runtime.sdk_library_paths.iter().cloned());
+    let Some(root) = runtime.sdk_root.as_ref() else {
+        return dedupe_paths(entries);
+    };
     entries.extend([
         root.join("lib"),
         root.join("lib64"),
@@ -3651,6 +3671,37 @@ mod tests {
             entries
                 .iter()
                 .any(|entry| entry.ends_with(Path::new("lib").join("rocm_sysdeps").join("lib")))
+        );
+    }
+
+    #[test]
+    fn therock_library_paths_prefer_vllms_pinned_binary_stack() {
+        let site_packages = PathBuf::from("/runtime/lib/python3.12/site-packages");
+        let sdk_root = site_packages.join("_rocm_sdk_devel");
+        let runtime = VllmRuntime {
+            runtime_id: "therock-release:gfx94X-dcgpu".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable: Some(PathBuf::from("/runtime/bin/python")),
+            version: Some("0.26.0+rocm723".to_owned()),
+            source: "managed_runtime_manifest:test".to_owned(),
+            sdk_root: Some(sdk_root.clone()),
+            sdk_bin: Some(sdk_root.join("bin")),
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: vec![site_packages.join("_rocm_sdk_core").join("lib")],
+        };
+
+        let entries = therock_library_path_entries(&runtime);
+
+        assert_eq!(
+            entries.get(..2),
+            Some(
+                [
+                    site_packages.join("torch").join("lib"),
+                    site_packages.join("amdsmi")
+                ]
+                .as_slice()
+            )
         );
     }
 
