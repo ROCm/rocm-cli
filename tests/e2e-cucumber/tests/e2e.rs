@@ -44,6 +44,9 @@ pub struct E2eWorld {
     /// Loopback file server used by artifact-prefetch scenarios. Kept on the
     /// World so it remains alive while the real `rocmd` subprocess downloads.
     pub artifact_server: Option<LoopbackServer>,
+    /// Listener that deliberately occupies the default serve port while a real
+    /// `rocm serve` invocation proves automatic allocation advances past it.
+    pub automatic_port_guard: Option<std::net::TcpListener>,
     /// Cache-marker destination discovered from `rocmd`'s own JSON report.
     pub artifact_marker_path: Option<PathBuf>,
     pub endpoint: Option<String>,
@@ -180,6 +183,7 @@ impl Default for E2eWorld {
         Self {
             mock: None,
             artifact_server: None,
+            automatic_port_guard: None,
             artifact_marker_path: None,
             endpoint: None,
             model_name: None,

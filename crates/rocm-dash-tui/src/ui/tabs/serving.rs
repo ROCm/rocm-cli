@@ -25,11 +25,11 @@ pub const VERBS: &[Verb] = &[
         summary: "Launch a model on a serving engine and expose an OpenAI-style endpoint.",
         steps: &[
             "Pick a model",
-            "Choose an engine — Lemonade · vLLM",
-            "Set GPU placement (required / preferred / CPU-only)",
-            "Launch on 127.0.0.1:11435 and watch it come up",
+            "Leave the rest automatic, or open Advanced settings",
+            "GPU is required — ROCm never falls back to CPU",
+            "Launch on a local endpoint picked for you and watch it come up",
         ],
-        cmd: "rocm serve --engine …",
+        cmd: "rocm serve <model>",
         read_only: false,
         badge: None,
     },
@@ -153,6 +153,28 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect()
+    }
+
+    #[test]
+    fn serving_first_view_promises_no_concrete_endpoint() {
+        // The CLI leases the local port at launch time, so the first thing a
+        // user reads must not promise a fixed `127.0.0.1:11435` endpoint.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Serving;
+        s.serving_sel = 0; // "Serve a model"
+        let out = render(&s, 200, 30);
+        assert!(
+            !out.contains("11435"),
+            "first-view copy must not promise a fixed port: {out:?}"
+        );
+        assert!(
+            !out.contains("127.0.0.1"),
+            "first-view copy must not promise a fixed host: {out:?}"
+        );
+        assert!(
+            out.contains("Launch on a local endpoint picked for you"),
+            "automatic endpoint wording missing: {out:?}"
+        );
     }
 
     #[test]

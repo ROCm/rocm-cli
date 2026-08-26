@@ -11,7 +11,7 @@ use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{IsTerminal, Read, Write, stdin, stdout};
-use std::net::{IpAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -7454,6 +7454,189 @@ pub fn unix_time_millis() -> u128 {
         .as_millis()
 }
 
+// ---------------------------------------------------------------------------
+// Managed-service port leasing and the shared allocation lock.
+//
+// Both `rocm serve` and `rocmd` recovery contend for the same local TCP ports
+// and the same service records, so the primitives that arbitrate them live here
+// rather than in either binary.
+// ---------------------------------------------------------------------------
+
+/// True only for the exact canonical default loopback host.
+///
+/// Proactive OS collision detection (leasing a real socket before launch) is
+/// claimed only for this one host. `localhost`, `::1`, `0.0.0.0`, and other
+/// IPv4 addresses are "custom hosts": they require an explicit port and keep the
+/// existing engine-owned bind/error behavior, because an IPv4-loopback probe
+/// would not prove anything about the address the engine will actually bind.
+#[must_use]
+pub fn is_canonical_loopback_host(host: &str) -> bool {
+    host.trim() == DEFAULT_LOCAL_HOST
+}
+
+/// A real, held `127.0.0.1:<port>` listener proving the port is bindable now.
+///
+/// The lease is the collision check: it is acquired before any manifest, log, or
+/// child process exists, and [`LoopbackPortLease::release`] drops the socket
+/// immediately before the engine child is spawned so the child can bind it. The
+/// window between release and the child's bind is unavoidable without engine
+/// socket-passing; it is far narrower than the previous "bind and hope" launch.
+#[derive(Debug)]
+pub struct LoopbackPortLease {
+    port: u16,
+    listener: Option<TcpListener>,
+}
+
+impl LoopbackPortLease {
+    #[must_use]
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// True while this lease still holds the socket open.
+    #[must_use]
+    pub const fn is_held(&self) -> bool {
+        self.listener.is_some()
+    }
+
+    /// Close the socket and hand the port to the caller. Call this immediately
+    /// before spawning the process that will bind it.
+    pub fn release(mut self) -> u16 {
+        self.listener = None;
+        self.port
+    }
+
+    /// A lease over a port this process never probed, for custom hosts where the
+    /// engine — not the CLI — owns bind success or failure.
+    #[must_use]
+    pub const fn engine_owned(port: u16) -> Self {
+        Self {
+            port,
+            listener: None,
+        }
+    }
+}
+
+/// Try to take an exclusive IPv4-loopback lease on `port`.
+///
+/// Errors are returned verbatim so callers can distinguish "occupied"
+/// ([`std::io::ErrorKind::AddrInUse`], the only condition that should advance an
+/// automatic scan) from a privileged or unavailable address, which must fail
+/// immediately rather than silently choosing a different port.
+pub fn lease_loopback_port(port: u16) -> std::io::Result<LoopbackPortLease> {
+    let listener = TcpListener::bind(std::net::SocketAddrV4::new(
+        std::net::Ipv4Addr::LOCALHOST,
+        port,
+    ))?;
+    Ok(LoopbackPortLease {
+        port,
+        listener: Some(listener),
+    })
+}
+
+/// File name of the shared allocation lock, inside [`AppPaths::services_dir`].
+///
+/// Not a `.json` file, so `load_managed_services` never mistakes it for a
+/// service manifest.
+pub const SERVICE_ALLOCATION_LOCK_FILE: &str = "allocation.lock";
+/// Total time a launch or recovery waits for the allocation lock before failing
+/// with an actionable error instead of hanging.
+pub const SERVICE_ALLOCATION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const SERVICE_ALLOCATION_LOCK_POLL: Duration = Duration::from_millis(25);
+
+#[must_use]
+pub fn service_allocation_lock_path(paths: &AppPaths) -> PathBuf {
+    paths.services_dir().join(SERVICE_ALLOCATION_LOCK_FILE)
+}
+
+/// Cross-process guard serializing the managed-service allocation transaction:
+/// duplicate detection, live-reservation refresh, port leasing, child start
+/// confirmation, and record publication.
+///
+/// The lock is an OS advisory file lock, so it is released both by dropping this
+/// guard and by process death — a crashed launcher never wedges the next one.
+/// Full HTTP/model readiness deliberately runs *outside* the guard: it takes up
+/// to 45 seconds and holds no allocation decision.
+#[derive(Debug)]
+pub struct ServiceAllocationLock {
+    file: Option<fs::File>,
+    path: PathBuf,
+}
+
+impl ServiceAllocationLock {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ServiceAllocationLock {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            let _ = file.unlock();
+        }
+    }
+}
+
+/// Acquire the shared allocation lock for `paths`, waiting at most
+/// [`SERVICE_ALLOCATION_LOCK_TIMEOUT`].
+///
+/// # Errors
+/// Fails when the lock file cannot be created/locked, or when another process
+/// held it for the whole timeout.
+pub fn lock_service_allocation(paths: &AppPaths) -> Result<ServiceAllocationLock> {
+    lock_service_allocation_at(
+        &service_allocation_lock_path(paths),
+        SERVICE_ALLOCATION_LOCK_TIMEOUT,
+    )
+}
+
+/// [`lock_service_allocation`] against an explicit path and timeout. Exposed for
+/// tests that need a private lock file or a short deadline.
+///
+/// # Errors
+/// See [`lock_service_allocation`].
+pub fn lock_service_allocation_at(path: &Path, timeout: Duration) -> Result<ServiceAllocationLock> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match file.try_lock() {
+            Ok(()) => {
+                return Ok(ServiceAllocationLock {
+                    file: Some(file),
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(
+                    anyhow::Error::new(error).context(format!("failed to lock {}", path.display()))
+                );
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            bail!(
+                "timed out after {timeout:?} waiting for the managed-service allocation lock at \
+                 {path}; another `rocm serve` launch or `rocmd` recovery is mid-transaction. \
+                 Retry in a moment, and check `rocm services` for a stuck launch.",
+                path = path.display()
+            );
+        }
+        thread::sleep(SERVICE_ALLOCATION_LOCK_POLL.min(deadline - now));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11550,6 +11733,206 @@ last_installed_runtime_id = "therock-release"
         assert_eq!(
             usable_amd_gpu_indices_from(2, Some("GPU-deadbeef".to_owned())),
             None
+        );
+    }
+
+    // -- managed-service allocation lock and loopback leasing ---------------
+
+    const LOCK_CHILD_PATH_ENV: &str = "ROCM_CORE_TEST_LOCK_PATH";
+    const LOCK_CHILD_READY_ENV: &str = "ROCM_CORE_TEST_LOCK_READY";
+    const HANDOFF_PORT_ENV: &str = "ROCM_CORE_TEST_HANDOFF_PORT";
+
+    fn lock_test_dir(label: &str) -> PathBuf {
+        let dir = workspace_test_artifact_dir().join(format!(
+            "{label}-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(&dir).expect("create lock test dir");
+        dir
+    }
+
+    /// Re-run this test binary, executing exactly one `#[ignore]`d helper test in
+    /// a genuinely separate process. Cross-process locking and socket handoff
+    /// cannot be proven inside one process.
+    fn spawn_helper_test(name: &str, envs: &[(&str, String)]) -> std::process::Child {
+        let exe = std::env::current_exe().expect("test binary path");
+        let mut command = Command::new(exe);
+        command
+            .arg(name)
+            .arg("--exact")
+            .arg("--ignored")
+            .arg("--test-threads")
+            .arg("1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        command.spawn().expect("spawn helper test process")
+    }
+
+    #[test]
+    fn canonical_loopback_host_is_only_the_exact_default_address() {
+        assert!(is_canonical_loopback_host(DEFAULT_LOCAL_HOST));
+        assert!(is_canonical_loopback_host("  127.0.0.1  "));
+        // Everything else is a "custom host": explicit port, engine-owned bind.
+        for host in [
+            "localhost",
+            "::1",
+            "0.0.0.0",
+            "127.0.0.2",
+            "192.168.1.4",
+            "",
+        ] {
+            assert!(
+                !is_canonical_loopback_host(host),
+                "{host} must not be treated as the canonical loopback host"
+            );
+        }
+    }
+
+    #[test]
+    fn allocation_lock_path_lives_in_services_dir_and_is_not_a_manifest() {
+        let paths = AppPaths {
+            config_dir: PathBuf::from("/tmp/cfg"),
+            data_dir: PathBuf::from("/tmp/data"),
+            cache_dir: PathBuf::from("/tmp/cache"),
+        };
+        let path = service_allocation_lock_path(&paths);
+        assert_eq!(path.parent(), Some(paths.services_dir().as_path()));
+        // `load_managed_services` only reads `*.json`, so the lock must not be one.
+        assert_ne!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("json")
+        );
+    }
+
+    #[test]
+    fn allocation_lock_excludes_independent_handles_and_fails_closed_on_timeout() {
+        let path = lock_test_dir("core-alloc-lock-exclusive").join("allocation.lock");
+        let held = lock_service_allocation_at(&path, Duration::from_secs(5)).expect("first holder");
+        assert_eq!(held.path(), path.as_path());
+
+        // A second, independent file handle must contend on the OS lock rather
+        // than sail through, and must give up with an actionable error.
+        let started = Instant::now();
+        let error = lock_service_allocation_at(&path, Duration::from_millis(200))
+            .expect_err("a held lock must not be acquired twice");
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "waiter returned before its deadline"
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains("timed out"), "{message}");
+        assert!(message.contains("allocation lock"), "{message}");
+
+        drop(held);
+        lock_service_allocation_at(&path, Duration::from_secs(5))
+            .expect("lock is free once the guard is dropped");
+    }
+
+    #[test]
+    #[ignore = "spawned as a child process by allocation_lock_is_released_when_the_holder_process_exits"]
+    fn allocation_lock_child_holder() {
+        let Ok(path) = std::env::var(LOCK_CHILD_PATH_ENV) else {
+            return;
+        };
+        let ready = std::env::var(LOCK_CHILD_READY_ENV).expect("ready-file path");
+        let guard = lock_service_allocation_at(Path::new(&path), Duration::from_secs(10))
+            .expect("child acquires the shared lock");
+        fs::write(&ready, "held").expect("signal that the child holds the lock");
+        thread::sleep(Duration::from_millis(300));
+        // Leak the guard so the lock is released by process exit alone — that is
+        // the property a crashed launcher depends on.
+        std::mem::forget(guard);
+    }
+
+    #[test]
+    fn allocation_lock_is_released_when_the_holder_process_exits() {
+        let dir = lock_test_dir("core-alloc-lock-crossproc");
+        let path = dir.join("allocation.lock");
+        let ready = dir.join("child-ready");
+        let mut child = spawn_helper_test(
+            "tests::allocation_lock_child_holder",
+            &[
+                (LOCK_CHILD_PATH_ENV, path.display().to_string()),
+                (LOCK_CHILD_READY_ENV, ready.display().to_string()),
+            ],
+        );
+
+        let deadline = Instant::now() + Duration::from_mins(1);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "child never reported holding the lock"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        let busy = lock_service_allocation_at(&path, Duration::from_millis(50))
+            .expect_err("the lock must be exclusive across processes");
+        assert!(format!("{busy:#}").contains("allocation lock"));
+
+        let status = child.wait().expect("child holder exits");
+        assert!(status.success(), "child holder failed: {status}");
+        lock_service_allocation_at(&path, Duration::from_secs(10))
+            .expect("the OS releases the lock when the holding process exits");
+    }
+
+    #[test]
+    fn loopback_lease_blocks_a_second_bind_until_released() {
+        let ephemeral = TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral bind");
+        let port = ephemeral.local_addr().expect("local addr").port();
+        drop(ephemeral);
+
+        let lease = lease_loopback_port(port).expect("free port leases");
+        assert_eq!(lease.port(), port);
+        assert!(lease.is_held());
+        let conflict = lease_loopback_port(port).expect_err("a held port must not lease twice");
+        assert_eq!(conflict.kind(), std::io::ErrorKind::AddrInUse);
+
+        assert_eq!(lease.release(), port);
+        lease_loopback_port(port).expect("the port is bindable again after release");
+    }
+
+    #[test]
+    fn engine_owned_lease_holds_no_socket() {
+        // Custom hosts get a port carrier, never a loopback probe.
+        let lease = LoopbackPortLease::engine_owned(8000);
+        assert_eq!(lease.port(), 8000);
+        assert!(!lease.is_held());
+    }
+
+    #[test]
+    #[ignore = "spawned as a child process by released_loopback_lease_is_immediately_bindable_by_another_process"]
+    fn loopback_handoff_child() {
+        let Ok(port) = std::env::var(HANDOFF_PORT_ENV) else {
+            return;
+        };
+        let port: u16 = port.parse().expect("handoff port");
+        let lease = lease_loopback_port(port).expect("child binds the released port");
+        assert_eq!(lease.port(), port);
+    }
+
+    #[test]
+    fn released_loopback_lease_is_immediately_bindable_by_another_process() {
+        let ephemeral = TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral bind");
+        let port = ephemeral.local_addr().expect("local addr").port();
+        drop(ephemeral);
+        let lease = lease_loopback_port(port).expect("parent leases the port");
+        assert_eq!(lease.release(), port);
+
+        let status = spawn_helper_test(
+            "tests::loopback_handoff_child",
+            &[(HANDOFF_PORT_ENV, port.to_string())],
+        )
+        .wait()
+        .expect("handoff child exits");
+        assert!(
+            status.success(),
+            "a separate process must bind the port immediately after the lease is released"
         );
     }
 }

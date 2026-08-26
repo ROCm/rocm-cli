@@ -29,6 +29,17 @@ Feature: Model serving
     When the user lists running services
     Then the connection details match the actual server port
 
+  # Real CLI coverage for automatic port allocation. A loopback listener holds
+  # the legacy default while one real managed GPU serve starts; the reported
+  # endpoint must advance to the next candidate rather than failing late in the
+  # engine. Runs in the merge queue because it launches a real model server.
+  @id:serve-auto-port-skips-occupied @requires-gpu @merge-queue
+  Scenario: 15 - Automatic serving skips an occupied default port
+    Given a managed runtime is active
+    And the default serve port is occupied
+    When the user serves a model with automatic port selection
+    Then the service uses the next automatic port
+
   # vLLM serve + inference (safetensors model). Engine coverage: vLLM. This is the
   # deliberate vLLM half of a per-engine pair with `serve-lemonade-inference`
   # below, so it stays pinned to vLLM (the slug names the engine). It is also the
