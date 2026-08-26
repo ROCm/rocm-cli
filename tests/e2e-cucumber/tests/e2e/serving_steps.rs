@@ -936,6 +936,18 @@ async fn assert_lemonade_preparation_retry_is_bounded(world: &mut E2eWorld) {
         Some(0),
         "serve unexpectedly succeeded:\n{output}"
     );
+    // The scripted failure seam also waives serve's no-GPU pre-flight, so this
+    // refusal can only appear when the seam is compiled out. Name that cause:
+    // otherwise a lane that pre-builds `rocm` without the feature reports a
+    // baffling "no retry announcement" instead of its real misconfiguration.
+    assert!(
+        !output.contains("no usable AMD GPU detected"),
+        "serve stopped at the no-GPU pre-flight, so the binary under test was \
+         built without the `rocm/e2e-test-hooks` feature and never reached \
+         Lemonade preparation. E2E lanes that pre-build `rocm` and export \
+         ROCM_CLI_BINARY must pass `--features rocm/e2e-test-hooks`, matching \
+         what `cargo xtask e2e` builds for itself:\n{output}"
+    );
     assert_eq!(
         output.matches("retrying once").count(),
         1,

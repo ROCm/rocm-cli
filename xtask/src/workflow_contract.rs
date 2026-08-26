@@ -211,6 +211,39 @@ mod tests {
         );
     }
 
+    /// Every lane that pre-builds `rocm` and hands it to the suite via
+    /// `ROCM_CLI_BINARY` must enable the same test-hook feature `cargo xtask e2e`
+    /// enables when it builds for itself.
+    ///
+    /// The suite's deterministic failure seams (e.g. the scripted Lemonade
+    /// backend-install failure) are `#[cfg(feature = "e2e-test-hooks")]`. A lane
+    /// that omits the feature ships a binary in which those seams do not exist,
+    /// so the scenarios relying on them cannot reach their premise and fail as
+    /// regressions — but only on whichever lane happens to select them, which is
+    /// what made this divergence so hard to read the first time. Pin it here so a
+    /// new lane copying an existing block cannot silently reintroduce it.
+    fn assert_prebuilt_e2e_lanes_enable_test_hooks(workflow: &str, text: &str) {
+        let blocks: Vec<_> = multiline_run_blocks(text)
+            .into_iter()
+            .filter(|block| block.contains("ROCM_CLI_BINARY") && invokes_e2e(block))
+            .collect();
+        assert!(
+            !blocks.is_empty(),
+            "{workflow} must contain prebuilt E2E run blocks"
+        );
+        for block in blocks {
+            assert!(
+                block.contains(
+                    "cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks"
+                ),
+                "{workflow} prebuilt E2E lane must build with \
+                 `--features rocm/e2e-test-hooks`, matching what `cargo xtask e2e` \
+                 builds for itself; without it the suite's scripted failure seams \
+                 are compiled out:\n{block}"
+            );
+        }
+    }
+
     /// Extract one top-level job's complete YAML block by its job id.
     fn job_block<'a>(text: &'a str, job: &str) -> &'a str {
         let marker = format!("  {job}:\n");
@@ -819,6 +852,18 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     fn nightly_prebuilt_e2e_lanes_export_rocmd() {
         let workflow = read_workflow("nightly.yml");
         assert_prebuilt_e2e_lanes_export_rocmd("nightly.yml", &workflow);
+    }
+
+    #[test]
+    fn self_hosted_prebuilt_e2e_lanes_enable_test_hooks() {
+        let workflow = read_workflow("e2e-selfhosted.yml");
+        assert_prebuilt_e2e_lanes_enable_test_hooks("e2e-selfhosted.yml", &workflow);
+    }
+
+    #[test]
+    fn nightly_prebuilt_e2e_lanes_enable_test_hooks() {
+        let workflow = read_workflow("nightly.yml");
+        assert_prebuilt_e2e_lanes_enable_test_hooks("nightly.yml", &workflow);
     }
 
     // Extractor guards: prove the helpers actually parse multiline forms, so the

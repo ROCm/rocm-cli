@@ -385,7 +385,9 @@ jobs:
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # Build both binaries once; reuse them for pre-warm + suite.
-          cargo build --release -p rocm -p rocmd
+          # See the e2e-gpu lane in e2e-selfhosted.yml for why the
+          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
 
@@ -484,7 +486,9 @@ jobs:
           prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
-          cargo build --release -p rocm -p rocmd
+          # See the e2e-gpu lane in e2e-selfhosted.yml for why the
+          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
 
@@ -578,7 +582,9 @@ jobs:
           prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
-          cargo build --release -p rocm -p rocmd
+          # See the e2e-gpu lane in e2e-selfhosted.yml for why the
+          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
 
@@ -672,7 +678,9 @@ jobs:
           $prewarm = "$env:RUNNER_WORKSPACE\e2e-prewarm"
           $env:E2E_SHARED_RUNTIMES_DIR = "$prewarm\data\runtimes"
 
-          cargo build --release -p rocm -p rocmd
+          # See the e2e-gpu lane in e2e-selfhosted.yml for why the
+          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "target" }
           $env:ROCM_CLI_BINARY = "$targetDir\release\rocm.exe"
@@ -824,7 +832,9 @@ jobs:
           prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
-          cargo build --release -p rocm -p rocmd
+          # See the e2e-gpu lane in e2e-selfhosted.yml for why the
+          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
 
