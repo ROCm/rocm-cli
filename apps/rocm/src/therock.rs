@@ -4,14 +4,14 @@
 
 use anyhow::{Context, Result, bail};
 use rocm_core::{
-    AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_gpu_diagnostics,
-    detect_host_therock_family, detect_managed_therock_family, disk_space, ensure_uv_binary,
-    known_therock_families, managed_tools_dir, normalize_runtime_path_for_host,
-    normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
-    normalize_runtime_path_text_for_storage, normalize_therock_family, runtime_is_windows,
-    runtime_os_name, runtime_path_for_windows_child, runtime_path_list_split,
-    runtime_python_executable_in_env, unix_time_millis, uv_command_env, uv_pip_install_base,
-    uv_venv_args, verify_rsa_pkcs1_sha256_signature,
+    AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_gfx_target,
+    detect_host_gpu_diagnostics, detect_host_therock_family, detect_managed_therock_family,
+    disk_space, ensure_uv_binary, known_therock_families, managed_tools_dir,
+    normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
+    normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_storage,
+    normalize_therock_family, runtime_is_windows, runtime_os_name, runtime_path_for_windows_child,
+    runtime_path_list_split, runtime_python_executable_in_env, unix_time_millis, uv_command_env,
+    uv_pip_install_base, uv_venv_args, verify_rsa_pkcs1_sha256_signature,
 };
 #[cfg(test)]
 use rocm_core::{
@@ -878,6 +878,11 @@ fn install_wheel_runtime(
         &wheel_compatibility,
         version_selector,
     )?;
+    let device_target = aggregate_device_target(&resolution.family);
+    let rocm_extras = device_target.as_deref().map_or_else(
+        || "libraries,devel,device-all".to_owned(),
+        |target| format!("libraries,devel,device-{target}"),
+    );
     progress_line(format!(
         "Found canonical TheRock aggregate version {} with a matching PyTorch stack for target family {}.",
         resolution.latest_version, resolution.family
@@ -942,11 +947,11 @@ fn install_wheel_runtime(
     let _ = writeln!(
         output,
         "  package_specs: {}",
-        therock_pip_package_specs(&resolution.package_versions).join(" ")
+        therock_pip_package_specs(&resolution.package_versions, &rocm_extras).join(" ")
     );
     let _ = writeln!(
         output,
-        "  package_policy: find the newest TheRock ROCm SDK version that has a matching PyTorch stack in the same index, then install pinned rocm[libraries,devel,device-all], torch, torchvision, and torchaudio versions in one uv transaction"
+        "  package_policy: find the newest TheRock ROCm SDK version that has a matching PyTorch stack in the same index, then install pinned target-complete rocm, torch, torchvision, and torchaudio versions in one uv transaction"
     );
     if dry_run {
         let env_python = venv_python_path(&install_root);
@@ -955,7 +960,10 @@ fn install_wheel_runtime(
         if matches!(channel, TheRockChannel::Nightly) {
             install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
         }
-        install_args.extend(therock_pip_package_specs(&resolution.package_versions));
+        install_args.extend(therock_pip_package_specs(
+            &resolution.package_versions,
+            &rocm_extras,
+        ));
         let venv_args = uv_venv_args(&python_launcher.executable, &install_root);
         let venv_args_display = venv_args
             .iter()
@@ -995,7 +1003,7 @@ fn install_wheel_runtime(
 
     progress_line(format!(
         "Installing {} from {}",
-        therock_pip_package_specs(&resolution.package_versions).join(" "),
+        therock_pip_package_specs(&resolution.package_versions, &rocm_extras).join(" "),
         resolution.index_url
     ));
     let mut install_args = uv_pip_install_base(&env_python);
@@ -1003,7 +1011,10 @@ fn install_wheel_runtime(
     if matches!(channel, TheRockChannel::Nightly) {
         install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
     }
-    install_args.extend(therock_pip_package_specs(&resolution.package_versions));
+    install_args.extend(therock_pip_package_specs(
+        &resolution.package_versions,
+        &rocm_extras,
+    ));
     run_uv_progress_command(
         paths,
         &uv,
@@ -1016,7 +1027,7 @@ fn install_wheel_runtime(
     )?;
 
     progress_line("Checking the installed ROCm SDK...");
-    let rocm_sdk_probe = probe_rocm_sdk_runtime(&env_python)
+    let rocm_sdk_probe = probe_rocm_sdk_runtime_for_target(&env_python, device_target.as_deref())
         .context("TheRock packages did not expose a usable rocm_sdk runtime")?;
     validate_rocm_sdk_runtime_probe(&rocm_sdk_probe)?;
     let installed_version = rocm_sdk_probe
@@ -1075,16 +1086,37 @@ fn install_wheel_runtime(
     Ok(output)
 }
 
-fn therock_pip_package_specs(package_versions: &TheRockPipPackageVersions) -> Vec<String> {
+fn therock_pip_package_specs(
+    package_versions: &TheRockPipPackageVersions,
+    rocm_extras: &str,
+) -> Vec<String> {
     vec![
-        format!(
-            "rocm[libraries,devel,device-all]=={}",
-            package_versions.rocm
-        ),
+        format!("rocm[{rocm_extras}]=={}", package_versions.rocm),
         format!("torch=={}", package_versions.torch),
         format!("torchvision=={}", package_versions.torchvision),
         format!("torchaudio=={}", package_versions.torchaudio),
     ]
+}
+
+fn aggregate_device_target(family: &str) -> Option<String> {
+    let detected = detect_host_gfx_target()?;
+    canonical_aggregate_device_target(&detected, family)
+}
+
+fn canonical_aggregate_device_target(detected: &str, family: &str) -> Option<String> {
+    if normalize_therock_family(detected).as_deref() != Some(family) {
+        return None;
+    }
+    let target = detected
+        .split(':')
+        .next()
+        .unwrap_or(detected)
+        .to_ascii_lowercase();
+    if target.starts_with("gfx94") {
+        Some("gfx942".to_owned())
+    } else {
+        Some(target)
+    }
 }
 
 fn quote_display_arg(value: &str) -> String {
@@ -2707,17 +2739,28 @@ fn python_venv_args(install_root: &Path) -> Vec<String> {
 }
 
 pub(crate) fn probe_rocm_sdk_runtime(python_executable: &Path) -> Result<RocmSdkPythonProbe> {
-    let text = capture_python_stdout(
-        python_executable,
-        ROCM_SDK_PROBE_SCRIPT,
-        "launch rocm_sdk probe",
-    )
-    .with_context(|| {
-        format!(
-            "failed to launch rocm_sdk probe via {}",
-            python_executable.display()
-        )
-    })?;
+    probe_rocm_sdk_runtime_for_target(python_executable, None)
+}
+
+fn probe_rocm_sdk_runtime_for_target(
+    python_executable: &Path,
+    device_target: Option<&str>,
+) -> Result<RocmSdkPythonProbe> {
+    let script = device_target.map_or_else(
+        || ROCM_SDK_PROBE_SCRIPT.to_owned(),
+        |target| {
+            format!(
+                "import os\nos.environ['ROCM_SDK_TARGET_FAMILY'] = {target:?}\n{ROCM_SDK_PROBE_SCRIPT}"
+            )
+        },
+    );
+    let text = capture_python_stdout(python_executable, &script, "launch rocm_sdk probe")
+        .with_context(|| {
+            format!(
+                "failed to launch rocm_sdk probe via {}",
+                python_executable.display()
+            )
+        })?;
     parse_rocm_sdk_probe(&text)
 }
 
@@ -4555,6 +4598,22 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_device_target_maps_mi300_gfx_alias_to_published_package() {
+        assert_eq!(
+            canonical_aggregate_device_target("gfx943", "gfx94X-dcgpu").as_deref(),
+            Some("gfx942")
+        );
+        assert_eq!(
+            canonical_aggregate_device_target("gfx1151", "gfx1151").as_deref(),
+            Some("gfx1151")
+        );
+        assert_eq!(
+            canonical_aggregate_device_target("gfx1151", "gfx120X-all"),
+            None
+        );
+    }
+
+    #[test]
     fn unknown_aggregate_layout_is_rejected_clearly() {
         let error =
             validate_aggregate_index_layout("<html><a href=\"gfx120X-all/\">legacy</a></html>")
@@ -4564,7 +4623,7 @@ mod tests {
     }
 
     #[test]
-    fn pip_runtime_installs_pinned_devel_and_torch_stack_from_therock_index() {
+    fn pip_runtime_installs_pinned_target_complete_stack_from_aggregate_index() {
         let package_versions = TheRockPipPackageVersions {
             rocm: "7.13.0a20260513".to_owned(),
             torch: "2.10.0+rocm7.13.0a20260513".to_owned(),
@@ -4572,12 +4631,13 @@ mod tests {
             torchaudio: "2.10.0+rocm7.13.0a20260513".to_owned(),
             compatibility_key: "7.13.0a20260513".to_owned(),
         };
-        let package_specs = therock_pip_package_specs(&package_versions);
+        let package_specs =
+            therock_pip_package_specs(&package_versions, "libraries,devel,device-gfx942");
 
         assert_eq!(
             package_specs,
             vec![
-                "rocm[libraries,devel,device-all]==7.13.0a20260513".to_owned(),
+                "rocm[libraries,devel,device-gfx942]==7.13.0a20260513".to_owned(),
                 "torch==2.10.0+rocm7.13.0a20260513".to_owned(),
                 "torchvision==0.25.0+rocm7.13.0a20260513".to_owned(),
                 "torchaudio==2.10.0+rocm7.13.0a20260513".to_owned(),
